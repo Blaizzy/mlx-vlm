@@ -1,5 +1,6 @@
 """Tests for batch generation functionality in mlx_vlm.generate module."""
 
+import contextlib
 import logging
 import sys
 import typing
@@ -26,7 +27,12 @@ from mlx_vlm.generate import (
 from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
-from mlx_vlm.models.cache import BatchKVCache, KVCache
+from mlx_vlm.models.cache import (
+    BatchKVCache,
+    BufferedRotatingKVCache,
+    KVCache,
+    RotatingKVCache,
+)
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
@@ -164,6 +170,20 @@ def mock_model():
 @pytest.fixture
 def mock_processor():
     return MockProcessor()
+
+
+def test_batch_generator_apc_media_token_ids_handles_text_only_model(mock_processor):
+    model = SimpleNamespace(
+        language_model=MockLanguageModel(),
+        make_cache=lambda: [KVCache()],
+    )
+    generator = ar_module.BatchGenerator(
+        model,
+        mock_processor,
+        apc_manager=apc_module.APCManager(num_blocks=1),
+    )
+
+    assert generator._apc_media_token_ids() == set()
 
 
 # ============================================================================
@@ -1976,6 +1996,100 @@ def test_stream_generate_forwards_verbose_to_generate_step():
     assert captured["verbose"] is True
 
 
+def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
+    captured = {}
+    tokenizer = SimpleNamespace(stopping_criteria=SimpleNamespace())
+    processor = SimpleNamespace(tokenizer=tokenizer)
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test"),
+        language_model=SimpleNamespace(),
+    )
+    prepared_mask = mx.ones((1, 4), dtype=mx.int32)
+
+    def capture_hash(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    with (
+        patch.object(
+            dispatch_module,
+            "prepare_inputs",
+            return_value={
+                "input_ids": mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+                "attention_mask": prepared_mask,
+            },
+        ),
+        patch.object(dispatch_module._apc, "model_apc_mode", return_value="block"),
+        patch.object(
+            dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
+        ),
+        patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
+        patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(
+            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
+        ),
+        patch.object(dispatch_module, "make_streaming_detokenizer"),
+        patch.object(dispatch_module, "generate_step", return_value=iter(())),
+    ):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="hello",
+                apc_manager=MagicMock(),
+                max_tokens=0,
+            )
+        )
+
+    assert captured["media"]["embeddings"] is None
+    assert captured["media"]["masks"] is None
+
+
+def test_stream_generate_hashes_explicit_sequence_tensors_for_apc_safety():
+    captured = {}
+    tokenizer = SimpleNamespace(stopping_criteria=SimpleNamespace())
+    processor = SimpleNamespace(tokenizer=tokenizer)
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test"),
+        language_model=SimpleNamespace(),
+    )
+    custom_embeds = mx.ones((1, 4, 3))
+    custom_mask = mx.array([[1, 1, 0, 0]], dtype=mx.int32)
+
+    def capture_hash(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    with (
+        patch.object(dispatch_module._apc, "model_apc_mode", return_value="block"),
+        patch.object(
+            dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
+        ),
+        patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
+        patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(
+            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
+        ),
+        patch.object(dispatch_module, "make_streaming_detokenizer"),
+        patch.object(dispatch_module, "generate_step", return_value=iter(())),
+    ):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="",
+                input_ids=mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+                inputs_embeds=custom_embeds,
+                mask=custom_mask,
+                apc_manager=MagicMock(),
+                max_tokens=0,
+            )
+        )
+
+    assert captured["media"]["embeddings"] is custom_embeds
+    assert captured["media"]["masks"] is custom_mask
+
+
 def test_public_generation_annotations_match_runtime_results():
     hints = typing.get_type_hints(dispatch_module.stream_generate)
 
@@ -2134,7 +2248,13 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
         draft_block_size=None,
     )
     model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4"))
-    processor = SimpleNamespace()
+    # A processor with native video support (a declared ``videos`` kwarg plus a
+    # video_processor component) forwards --video untouched; anything less
+    # diverts into the frames fallback.
+    processor = SimpleNamespace(
+        video_processor=SimpleNamespace(),
+        process=lambda text=None, images=None, videos=None, **kwargs: None,
+    )
 
     with (
         patch.object(dispatch_module, "parse_arguments", return_value=args),
@@ -2155,6 +2275,88 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
     assert mock_generate.call_args.kwargs["video"] == ["clip.mp4"]
     assert mock_generate.call_args.kwargs["fps"] == pytest.approx(1.0)
     assert capsys.readouterr().out.strip() == "done"
+
+
+def test_generate_cli_video_frames_fallback_without_video_processor(capsys):
+    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
+
+    args = Namespace(
+        model="demo",
+        output_modality="text",
+        output=None,
+        size="512x512",
+        steps=4,
+        seed=None,
+        guidance=1.0,
+        adapter_path=None,
+        image=None,
+        audio=None,
+        video=["clip.mp4"],
+        fps=1.0,
+        resize_shape=None,
+        prompt=["Describe this video."],
+        system=None,
+        max_tokens=8,
+        temperature=0.0,
+        repetition_penalty=None,
+        repetition_context_size=20,
+        presence_penalty=None,
+        presence_context_size=20,
+        frequency_penalty=None,
+        frequency_context_size=20,
+        chat=False,
+        verbose=False,
+        eos_tokens=None,
+        max_kv_size=None,
+        kv_bits=None,
+        kv_group_size=64,
+        kv_quant_scheme="uniform",
+        quantized_kv_start=512,
+        skip_special_tokens=False,
+        force_download=False,
+        revision=None,
+        trust_remote_code=False,
+        quantize_activations=False,
+        processor_kwargs={},
+        gen_kwargs={},
+        prefill_step_size=None,
+        enable_thinking=False,
+        thinking_mode=None,
+        thinking_budget=None,
+        thinking_start_token="<think>",
+        thinking_end_token="</think>",
+        draft_model=None,
+        draft_kind=None,
+        draft_block_size=None,
+        video_max_frames=4,
+    )
+    model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4"))
+    processor = SimpleNamespace()
+    frames = [object() for _ in range(6)]
+
+    with (
+        patch.object(dispatch_module, "parse_arguments", return_value=args),
+        patch.object(dispatch_module, "load", return_value=(model, processor)),
+        patch.object(video_module, "sample_video_frames", return_value=(frames, 2.0)),
+        patch.object(
+            dispatch_module, "apply_chat_template", return_value="prompt"
+        ) as mock_apply_chat_template,
+        patch.object(
+            dispatch_module,
+            "generate",
+            return_value=SimpleNamespace(text="done"),
+        ) as mock_generate,
+    ):
+        dispatch_module.main()
+
+    # 6 sampled frames capped to 4, sent as ordered images; --video is spent.
+    assert mock_apply_chat_template.call_args.kwargs["num_images"] == 4
+    assert "video" not in mock_apply_chat_template.call_args.kwargs
+    assert len(mock_generate.call_args.kwargs["image"]) == 4
+    assert mock_generate.call_args.kwargs["video"] is None
+    out = capsys.readouterr().out
+    assert "no native video support" in out
+    assert "4 of 6 sampled frames" in out
 
 
 def test_generate_image_cli_routes_before_vlm_load():
@@ -2228,6 +2430,7 @@ def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
     assert args.output_modality == "text"
     assert args.task == "generate"
     assert args.size is None
+    assert args.verbose is False
 
 
 def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
@@ -2260,6 +2463,129 @@ def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
     assert "falling back to cold prefill" in caplog.text
 
 
+class TestPrefixCacheReuseTrim:
+    """Prompt-cache prefix reuse must trim each cache through its own trim()
+    contract. A raw ``keys[..., :prefix_len, :]`` slice corrupts rotating
+    (sliding-window) ring buffers -- silent wrong output, or a shape crash once
+    speculative decoding wraps them (mlx-vlm issue #1715)."""
+
+    @staticmethod
+    def _fill(cache, n, marker=False, heads=1, dim=4):
+        for i in range(n):
+            v = (
+                mx.full((1, heads, 1, dim), float(i))
+                if marker
+                else mx.zeros((1, heads, 1, dim))
+            )
+            cache.update_and_fetch(v, v)
+        return cache
+
+    def test_flat_cache_trims_to_prefix(self):
+        c = self._fill(KVCache(), 20, marker=True)
+        n_drop = dispatch_module._prefix_cache_trim_amount([c], 8)
+        assert n_drop == 12
+        c.trim(n_drop)
+        keys, _ = c.state
+        assert c.offset == 8 and keys.shape[2] == 8
+        assert bool(mx.array_equal(keys[0, 0, :, 0], mx.arange(8, dtype=keys.dtype)))
+
+    def test_full_prefix_needs_no_trim(self):
+        c = self._fill(KVCache(), 12)
+        assert dispatch_module._prefix_cache_trim_amount([c], 12) == 0
+
+    def test_empty_cache_is_reusable(self):
+        assert dispatch_module._prefix_cache_trim_amount([], 0) == 0
+
+    def test_unwrapped_rotating_trims_and_stays_usable(self):
+        c = self._fill(RotatingKVCache(max_size=512), 100)
+        assert c.offset == 100  # window has not wrapped
+        n_drop = dispatch_module._prefix_cache_trim_amount([c], 40)
+        assert n_drop == 60
+        c.trim(n_drop)
+        assert c.offset == 40 and c._idx == 40
+        c.update_and_fetch(mx.zeros((1, 1, 1, 4)), mx.zeros((1, 1, 1, 4)))
+        assert c.offset == 41
+
+    def test_wrapped_rotating_is_not_reusable(self):
+        c = self._fill(RotatingKVCache(max_size=8), 20)  # ring has wrapped
+        assert c.offset > c.max_size
+        assert dispatch_module._prefix_cache_trim_amount([c], 3) is None
+
+    def test_mixed_flat_and_wrapped_rotating_is_not_reusable(self):
+        flat = self._fill(KVCache(), 20)
+        wrapped = self._fill(RotatingKVCache(max_size=8), 20)
+        assert dispatch_module._prefix_cache_trim_amount([flat, wrapped], 3) is None
+
+    def test_wrapped_buffered_rotating_declined_and_survives_next_step(self):
+        # BufferedRotatingKVCache is what speculative decoding installs; the old
+        # raw slice desynced its ring index and crashed on the next update. When
+        # reuse is declined the cache stays intact, so generation continues.
+        c = BufferedRotatingKVCache.from_cache(
+            self._fill(RotatingKVCache(max_size=8), 20), buffer_size=16
+        )
+        assert dispatch_module._prefix_cache_trim_amount([c], 2) is None
+        c.update_and_fetch(mx.zeros((1, 1, 2, 4)), mx.zeros((1, 1, 2, 4)))
+
+    def test_unwrapped_buffered_rotating_trims(self):
+        # A buffered cache that has not evicted anything (start_position == 0) is
+        # still rollback-able even though is_trimmable() is unconditionally True.
+        c = BufferedRotatingKVCache(max_size=512, buffer_size=16)
+        self._fill(c, 100)
+        assert c.start_position == 0
+        assert dispatch_module._prefix_cache_trim_amount([c], 40) == 60
+        c.trim(60)
+        assert c.offset == 40
+        c.update_and_fetch(mx.zeros((1, 1, 1, 4)), mx.zeros((1, 1, 1, 4)))
+        assert c.offset == 41
+
+
+class TestGemma4LogitsToKeep:
+    class _FakeTextModel:
+        def __init__(self, hidden):
+            self.hidden = hidden
+
+        def __call__(
+            self, inputs=None, inputs_embeds=None, input_embeddings=None, **kwargs
+        ):
+            seq = next(
+                t for t in (inputs, inputs_embeds, input_embeddings) if t is not None
+            )
+            return mx.zeros((1, seq.shape[1], self.hidden))
+
+    def _gemma4_lm(self, hidden):
+        from mlx_vlm.models.gemma4.language import LanguageModel
+
+        lm = LanguageModel.__new__(LanguageModel)
+        lm.model = self._FakeTextModel(hidden)
+        lm.logits_from_hidden = lambda h: h
+        return LanguageModel, lm
+
+    def _gemma4_text_lm(self, hidden):
+        from mlx_vlm.models.gemma4_text.language import LanguageModel
+
+        lm = LanguageModel.__new__(LanguageModel)
+        lm.model = self._FakeTextModel(hidden)
+        lm.tie_word_embeddings = False
+        lm.lm_head = lambda h: h
+        lm.final_logit_softcapping = None
+        return LanguageModel, lm
+
+    def test_gemma4_slices_before_lm_head(self):
+        cls, lm = self._gemma4_lm(hidden=8)
+        ids = mx.zeros((1, 6), dtype=mx.int32)
+        assert cls.supports_logits_to_keep is True
+        assert lm(ids).logits.shape == (1, 6, 8)
+        assert lm(ids, logits_to_keep=1).logits.shape == (1, 1, 8)
+        assert lm(ids, logits_to_keep=3).logits.shape == (1, 3, 8)
+
+    def test_gemma4_text_slices_before_lm_head(self):
+        cls, lm = self._gemma4_text_lm(hidden=8)
+        ids = mx.zeros((1, 6), dtype=mx.int32)
+        assert cls.supports_logits_to_keep is True
+        assert lm(ids).logits.shape == (1, 6, 8)
+        assert lm(ids, logits_to_keep=1).logits.shape == (1, 1, 8)
+
+
 def test_batch_apc_extra_hash_uses_precomputed_image_hash():
     batch_generator = SimpleNamespace(apc_manager=object())
 
@@ -2269,6 +2595,119 @@ def test_batch_apc_extra_hash_uses_precomputed_image_hash():
     )
 
     assert got == apc_module.tenant_scoped_hash("tenant-a", 123)
+
+
+def test_batch_apc_extra_hash_returns_precomputed_semantic_hash():
+    batch_generator = SimpleNamespace(apc_manager=object())
+    semantic_hash = 7088136067003016882
+
+    short_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {
+            "_apc_semantic_hash": semantic_hash,
+            "inputs_embeds": mx.ones((1, 8, 4)),
+            "attention_mask": mx.ones((1, 8), dtype=mx.int32),
+        },
+    )
+    extended_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {
+            "_apc_semantic_hash": semantic_hash,
+            "inputs_embeds": mx.ones((1, 12, 4)),
+            "attention_mask": mx.ones((1, 12), dtype=mx.int32),
+        },
+    )
+
+    assert short_hash == semantic_hash
+    assert extended_hash == semantic_hash
+
+
+def test_batch_apc_extra_hash_still_tracks_non_text_media():
+    batch_generator = SimpleNamespace(apc_manager=object())
+    base = {
+        "_apc_image_hash": 123,
+        "_apc_tenant": "tenant-a",
+        "inputs_embeds": mx.ones((1, 8, 4)),
+        "attention_mask": mx.ones((1, 8), dtype=mx.int32),
+    }
+
+    first_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {**base, "input_features": mx.zeros((1, 4, 8))},
+    )
+    second_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {**base, "input_features": mx.ones((1, 4, 8))},
+    )
+
+    assert first_hash != second_hash
+
+
+def test_batch_apc_extra_hash_tracks_explicit_sequence_tensors():
+    batch_generator = SimpleNamespace(apc_manager=object())
+    base = {
+        "_apc_image_hash": 123,
+        "_apc_tenant": "tenant-a",
+    }
+
+    first_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {
+            **base,
+            "inputs_embeds": mx.zeros((1, 8, 4)),
+            "attention_mask": mx.ones((1, 8), dtype=mx.int32),
+        },
+    )
+    second_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {
+            **base,
+            "inputs_embeds": mx.ones((1, 8, 4)),
+            "attention_mask": mx.ones((1, 8), dtype=mx.int32),
+        },
+    )
+
+    assert first_hash != second_hash
+
+
+def test_precomputed_semantic_hash_reuses_actual_growing_apc_prefix():
+    manager = apc_module.APCManager(num_blocks=4, block_size=4)
+    manager.exact_cache_guard_tokens = 1
+    semantic_hash = 7088136067003016882
+    short_tokens = list(range(8))
+    extended_tokens = [*short_tokens, 8, 9]
+    layer_keys = [mx.ones((1, 1, len(short_tokens), 2))]
+    layer_values = [mx.ones((1, 1, len(short_tokens), 2)) * 2]
+
+    stored = manager.store_kv_blocks(
+        short_tokens,
+        layer_keys,
+        layer_values,
+        extra_hash=semantic_hash,
+    )
+    manager.release(stored)
+
+    batch_generator = object.__new__(BatchGenerator)
+    batch_generator.apc_manager = manager
+    batch_generator.apc_mode = "block"
+    batch_generator.model = SimpleNamespace(config=SimpleNamespace())
+    batch_generator._wire_stack = None
+
+    pick = batch_generator._apc_pick_for(
+        (
+            1,
+            extended_tokens,
+            1,
+            {"_apc_semantic_hash": semantic_hash},
+            [],
+            None,
+        )
+    )
+
+    assert pick is not None
+    assert pick["prefix_len"] == len(short_tokens)
+    assert pick["extra_hash"] == semantic_hash
+    manager.release(pick["matched_blocks"])
 
 
 def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
@@ -2409,6 +2848,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
                 "keep_tensor": mx.ones((1, 1)),
                 "_apc_tenant": "tenant-a",
                 "_apc_image_hash": 123,
+                "_apc_semantic_hash": 7,
             },
             [],
             None,
@@ -2451,6 +2891,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
     assert batch is not None
     assert "_apc_tenant" not in captured["prompt_kwargs"]
     assert "_apc_image_hash" not in captured["prompt_kwargs"]
+    assert "_apc_semantic_hash" not in captured["prompt_kwargs"]
     assert captured["prompt_kwargs"]["keep_tensor"].shape == (2, 1)
 
 

@@ -26,6 +26,7 @@ from ..vision_cache import VisionFeatureCache
 from . import request_normalization as _request_normalization
 from .anthropic import register_routes as register_anthropic_routes
 from .audio import register_routes as register_audio_routes
+from .embeddings import register_routes as register_embeddings_routes
 from .generation import (
     GenerationArguments,
     PromptTooLongError,
@@ -35,11 +36,15 @@ from .generation import (
     get_configured_context_limit,
     get_kv_group_size,
     get_kv_quant_scheme,
+    get_kv_split_schemes,
     get_quantized_kv_bits,
+    get_quantized_kv_split_bits,
     get_quantized_kv_start,
     get_top_logprobs_k,
 )
 from .openai import register_routes as register_openai_routes
+from .reranking import ensure_chat_template as ensure_reranker_chat_template
+from .reranking import register_routes as register_reranking_routes
 from .responses_state import _split_thinking as _split_thinking_text
 from .runtime import ModelCacheRegistry, runtime
 from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
@@ -85,6 +90,10 @@ def _cache_group_for_cache(cache: dict) -> str:
         return "stt"
     if model_kind == "audio":
         return "audio"
+    if model_kind == "embedding":
+        return "embedding"
+    if model_kind == "reranker":
+        return "reranker"
     return "text_generation"
 
 
@@ -148,6 +157,7 @@ def _server_runtime_snapshot() -> dict:
         "continuous_batching_enabled": runtime.response_generator is not None,
         "request_queue_depth": queue_depth,
         "audio_queue_depth": audio_queue_depth,
+        "preload_failures": dict(runtime.preload_failures),
         "apc": (
             {"enabled": False}
             if runtime.apc_manager is None
@@ -255,9 +265,17 @@ def _split_thinking(
     text: str,
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
+    starts_in_thinking: bool = False,
+    processor=None,
 ) -> Tuple[Optional[str], str]:
     """Split thinking tags from content. Returns (reasoning, content)."""
-    return _split_thinking_text(text, thinking_start_token, thinking_end_token)
+    return _split_thinking_text(
+        text,
+        thinking_start_token,
+        thinking_end_token,
+        starts_in_thinking,
+        processor=processor,
+    )
 
 
 def _decode_token(tokenizer, token_id: int) -> Tuple[str, Optional[List[int]]]:
@@ -358,16 +376,44 @@ async def lifespan(app):
             "audio_stt",
             "speech-to-text model",
         ),
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_EMBEDDING_MODEL", None),
+            None,
+            "embedding",
+            "embedding model",
+        ),
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_RERANKER_MODEL", None),
+            None,
+            "reranker",
+            "reranker model",
+        ),
     )
+    runtime.preload_failures.clear()
     for preload_model_path, preload_adapter_path, model_kind, label in preload_models:
         if not preload_model_path:
             continue
         logger.info("Pre-loading %s: %s", label, preload_model_path)
-        get_cached_model(
-            preload_model_path,
-            preload_adapter_path,
-            model_kind=model_kind,
-        )
+        try:
+            get_cached_model(
+                preload_model_path,
+                preload_adapter_path,
+                model_kind=model_kind,
+            )
+        except Exception as e:
+            reason = getattr(e, "detail", None) or str(e)
+            runtime.preload_failures[model_kind] = {
+                "model": preload_model_path,
+                "label": label,
+                "error": str(reason),
+            }
+            logger.error(
+                "Failed to pre-load %s %r: %s. Continuing without it.",
+                label,
+                preload_model_path,
+                reason,
+            )
+            continue
         logger.info("%s ready.", label.capitalize())
     try:
         yield
@@ -460,6 +506,8 @@ def get_cached_model(
     """
     load_as_edit = model_kind == "image_edit"
     load_as_audio = _audio_model_kind(model_kind)
+    load_as_embedding = model_kind == "embedding"
+    load_as_reranker = model_kind == "reranker"
     load_as_image = model_kind == "image_generation" or (
         model_kind == "auto" and is_image_generation_model(model_path)
     )
@@ -469,6 +517,12 @@ def get_cached_model(
     elif load_as_audio:
         cache_group = _audio_cache_group(model_kind)
         effective_model_kind = model_kind
+    elif load_as_embedding:
+        cache_group = "embedding"
+        effective_model_kind = "embedding"
+    elif load_as_reranker:
+        cache_group = "reranker"
+        effective_model_kind = "reranker"
     elif load_as_image:
         cache_group = "image_generation"
         effective_model_kind = "image_generation"
@@ -614,11 +668,113 @@ def get_cached_model(
         registry.set(cache_group, cache)
         return model, None, config
 
+    if load_as_embedding:
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Adapters are not supported for embedding models.",
+            )
+        logger.info("Loading embedding model: %s", model_path)
+        from ..embedding_loader import load_embedding_model
+        from ..models.pooling import read_pooling_config
+        from ..utils import get_model_path, load_processor
+
+        try:
+            model_dir = get_model_path(model_path)
+            model = load_embedding_model(model_dir)
+            processor = load_processor(model_dir, add_detokenizer=False)
+        except RepositoryNotFoundError as e:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Model not found: {model_path!r} is not a known "
+                    "Hugging Face repo or local path"
+                ),
+            ) from e
+        except (FileNotFoundError, ValueError) as e:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported embedding model: {e}"
+            ) from e
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load embedding model: {e}"
+            ) from e
+        model.pooling_config = read_pooling_config(model_dir)
+        config = SimpleNamespace(
+            model_type=getattr(model, "model_type", "embedding"),
+            text_config=None,
+        )
+        cache = {
+            "cache_key": cache_key,
+            "model_path": model_path,
+            "adapter_path": None,
+            "model": model,
+            "processor": processor,
+            "config": config,
+            "model_kind": "embedding",
+        }
+        registry.set(cache_group, cache)
+        return model, processor, config
+
+    if load_as_reranker:
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Adapters are not supported for reranker models.",
+            )
+        logger.info("Loading reranker model: %s", model_path)
+        from ..utils import load
+
+        try:
+            model, processor = load(model_path)
+        except RepositoryNotFoundError as e:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Model not found: {model_path!r} is not a known "
+                    "Hugging Face repo or local path"
+                ),
+            ) from e
+        except (FileNotFoundError, ValueError) as e:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported reranker model: {e}"
+            ) from e
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load reranker model: {e}"
+            ) from e
+        config = model.config
+        model_type = getattr(config, "model_type", None)
+        if model_type not in ("qwen3", "qwen3_vl"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported reranker model type: {model_type!r}.",
+            )
+        try:
+            ensure_reranker_chat_template(processor, model_path)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported reranker model: {e}"
+            ) from e
+        cache = {
+            "cache_key": cache_key,
+            "model_path": model_path,
+            "adapter_path": None,
+            "model": model,
+            "processor": processor,
+            "config": config,
+            "model_kind": "reranker",
+        }
+        registry.set(cache_group, cache)
+        return model, processor, config
+
     vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
 
     # KV cache quantization (uniform or TurboQuant)
     kv_bits = get_quantized_kv_bits(model_path)
+    kv_key_bits, kv_value_bits = get_quantized_kv_split_bits()
+    kv_key_scheme, kv_value_scheme = get_kv_split_schemes()
     kv_group_size = get_kv_group_size()
     quantized_kv_start = get_quantized_kv_start()
     kv_quant_scheme = get_kv_quant_scheme()
@@ -628,6 +784,8 @@ def get_cached_model(
             model_path,
             adapter_path=adapter_path,
             kv_bits=kv_bits,
+            kv_key_bits=kv_key_bits,
+            kv_value_bits=kv_value_bits,
             kv_group_size=kv_group_size,
             kv_quant_scheme=kv_quant_scheme,
             quantized_kv_start=quantized_kv_start,
@@ -639,6 +797,10 @@ def get_cached_model(
         adapter_path=adapter_path,
         vision_cache=vision_cache,
         kv_bits=kv_bits,
+        kv_key_bits=kv_key_bits,
+        kv_value_bits=kv_value_bits,
+        kv_key_scheme=kv_key_scheme,
+        kv_value_scheme=kv_value_scheme,
         kv_group_size=kv_group_size,
         kv_quant_scheme=kv_quant_scheme,
         quantized_kv_start=quantized_kv_start,
@@ -734,6 +896,8 @@ _protocol_deps = SimpleNamespace(
 register_anthropic_routes(inference_router, _protocol_deps)
 register_openai_routes(inference_router, _protocol_deps)
 register_audio_routes(inference_router, _protocol_deps)
+register_embeddings_routes(inference_router, _protocol_deps)
+register_reranking_routes(inference_router, _protocol_deps)
 
 
 @inference_router.get("/models", response_model=ModelsResponse)

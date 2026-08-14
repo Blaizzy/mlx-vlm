@@ -3,6 +3,20 @@
 from mlx_vlm.prompt_utils import apply_chat_template, extract_text_from_content
 
 
+def _assistant_tool_call(content):
+    return {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": {}},
+            }
+        ],
+    }
+
+
 class TestExtractTextFromContent:
     """Tests for the extract_text_from_content function."""
 
@@ -141,6 +155,22 @@ class TestApplyChatTemplateIntegration:
     Uses return_messages=True to inspect intermediate messages without mocking.
     """
 
+    def test_molmo_builds_chat_message_for_processor_template(self):
+        """Molmo must go through its processor's ``User: ... Assistant:`` chat
+        template rather than the raw-prompt shortcut: raw prompts can read as
+        complete documents, making greedy decoding emit EOS immediately."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "molmo"},
+            "Describe this image briefly.",
+            return_messages=True,
+            num_images=1,
+        )
+
+        assert result == [{"role": "user", "content": "Describe this image briefly."}]
+
     def test_nemotron_omni_formats_image_and_audio_messages(self):
         """Nemotron Omni should use typed multimodal content for HF templates."""
         from mlx_vlm.prompt_utils import apply_chat_template
@@ -233,6 +263,40 @@ class TestApplyChatTemplateIntegration:
             }
         ]
 
+    def test_gemma4_unified_formats_video_and_audio_messages(self):
+        """Video prompts should retain audio placeholders when audio is present."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "gemma4_unified"},
+            "Describe the video and audio.",
+            return_messages=True,
+            video=["clip.mp4"],
+            fps=1,
+            num_audios=1,
+        )
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video",
+                        "video": "clip.mp4",
+                        "max_pixels": 224 * 224,
+                        "fps": 1,
+                    },
+                    {"type": "audio"},
+                    {
+                        "type": "text",
+                        "text": "Describe the video and audio.",
+                        "content": "Describe the video and audio.",
+                    },
+                ],
+            }
+        ]
+
     def test_text_only_formats_regular_chat_message(self):
         """Text-only models should use regular role/content messages with no image tokens."""
         from mlx_vlm.prompt_utils import apply_chat_template
@@ -291,6 +355,44 @@ class TestApplyChatTemplateIntegration:
 
         arguments = result[1]["tool_calls"][0]["function"]["arguments"]
         assert arguments == {"method": "monte_carlo", "samples": 1000}
+
+    def test_assistant_tool_call_content_is_preserved(self):
+        """Existing text and structured content should remain unchanged."""
+        for content in [
+            "I will check.",
+            [{"type": "text", "text": "I will check."}],
+        ]:
+            result = apply_chat_template(
+                None,
+                {"model_type": "qwen3_vl"},
+                _assistant_tool_call(content),
+                return_messages=True,
+            )
+
+            assert result[0]["content"] == content
+
+    def test_assistant_tool_call_none_content_reaches_template_as_string(self):
+        """Templates that iterate non-string content should receive a string."""
+
+        class IterableContentTemplate:
+            chat_template = "tool template"
+
+            def apply_chat_template(self, messages, **_):
+                for message in messages:
+                    content = message["content"]
+                    if not isinstance(content, str):
+                        list(content)
+                return messages
+
+        message = _assistant_tool_call(None)
+        result = apply_chat_template(
+            IterableContentTemplate(),
+            {"model_type": "qwen3_vl"},
+            message,
+        )
+
+        assert message["content"] is None
+        assert result[0]["content"] == ""
 
     def test_single_tool_call_dict_is_preserved(self):
         """A single assistant message with tool_calls should keep tool metadata."""

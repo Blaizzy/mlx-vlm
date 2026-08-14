@@ -578,6 +578,10 @@ class TestModels(unittest.TestCase):
         )
 
         model = lfm2.Model(config)
+        self.assertEqual(
+            model.language_model.model.layers[0].feed_forward.w1.weight.shape,
+            (96, 64),
+        )
 
         self.language_test_runner(
             model.language_model,
@@ -593,6 +597,51 @@ class TestModels(unittest.TestCase):
         cache = model.make_cache()
         self.assertEqual(type(cache[0]).__name__, "ArraysCache")
         self.assertEqual(type(cache[1]).__name__, "KVCache")
+
+    def test_lfm2_config_feed_forward_dim_compatibility(self):
+        from mlx_vlm.models import lfm2
+
+        base_config = {
+            "model_type": "lfm2",
+            "vocab_size": 128,
+            "hidden_size": 64,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 128,
+            "norm_eps": 1e-5,
+            "conv_bias": False,
+            "conv_L_cache": 3,
+            "block_dim": 64,
+            "block_multiple_of": 16,
+            "block_ffn_dim_multiplier": 1.0,
+            "block_auto_adjust_ff_dim": False,
+            "layer_types": ["full_attention"],
+        }
+
+        current_config = lfm2.ModelConfig.from_dict(
+            {**base_config, "intermediate_size": 192}
+        )
+        self.assertEqual(current_config.block_ff_dim, 192)
+        current_model = lfm2.Model(current_config)
+        self.assertEqual(
+            current_model.language_model.model.layers[0].feed_forward.w1.weight.shape,
+            (192, 64),
+        )
+
+        legacy_config = lfm2.ModelConfig.from_dict(
+            {
+                **base_config,
+                "intermediate_size": 192,
+                "block_ff_dim": 128,
+            }
+        )
+        self.assertEqual(legacy_config.block_ff_dim, 128)
+        legacy_model = lfm2.Model(legacy_config)
+        self.assertEqual(
+            legacy_model.language_model.model.layers[0].feed_forward.w1.weight.shape,
+            (128, 64),
+        )
 
     def test_lfm2_moe_language_model(self):
         from mlx_vlm.models import lfm2_moe
@@ -747,6 +796,36 @@ class TestModels(unittest.TestCase):
         config, projector = make_projector(False)
         self.assertNotIn("layer_norm", projector.parameters())
         self.assertEqual(projector(x).shape, (1, 4, config.text_config.hidden_size))
+
+    def test_lfm2_vl_uses_intermediate_size_when_block_ff_dim_is_omitted(self):
+        from mlx_vlm.models import lfm2_vl
+
+        config = lfm2_vl.TextConfig.from_dict(
+            {
+                "intermediate_size": 10752,
+                "layer_types": ["full_attention"],
+            }
+        )
+
+        self.assertEqual(config.block_ff_dim, 10752)
+
+    def test_lfm2_vl_uses_image_token_id_when_index_is_omitted(self):
+        from mlx_vlm.models import lfm2_vl
+
+        current = lfm2_vl.ModelConfig(
+            text_config=lfm2_vl.TextConfig(layer_types=["full_attention"]),
+            vision_config=lfm2_vl.VisionConfig(),
+            image_token_id=124907,
+        )
+        legacy = lfm2_vl.ModelConfig(
+            text_config=lfm2_vl.TextConfig(layer_types=["full_attention"]),
+            vision_config=lfm2_vl.VisionConfig(),
+            image_token_id=124907,
+            image_token_index=396,
+        )
+
+        self.assertEqual(current.image_token_index, 124907)
+        self.assertEqual(legacy.image_token_index, 396)
 
     def test_deepseek_v4_language_model(self):
         from mlx_vlm.models import deepseek_v4
@@ -2658,6 +2737,81 @@ class TestModels(unittest.TestCase):
         )
         self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, 64))
 
+    def test_mage_vl(self):
+        from mlx_vlm.models import mage_vl
+
+        text_config = mage_vl.TextConfig(
+            model_type="qwen3",
+            hidden_size=128,
+            num_hidden_layers=4,
+            intermediate_size=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            rms_norm_eps=1e-6,
+            vocab_size=10_000,
+            rope_theta=1000.0,
+            max_position_embeddings=1000,
+            tie_word_embeddings=False,
+        )
+        # hidden_size / heads must satisfy the 4:6:6 rope split (head_dim % 32 == 0).
+        vision_config = mage_vl.VisionConfig(
+            model_type="mage_vl_vision",
+            hidden_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            intermediate_size=256,
+            patch_size=16,
+            num_channels=3,
+            spatial_merge_size=2,
+            out_hidden_size=128,
+            frame_windows_size=4,
+            use_head=False,
+        )
+        config = mage_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="mage_vl",
+            image_token_id=151655,
+            video_token_id=151656,
+        )
+
+        model = mage_vl.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        # Image case: patches arrive pre-extracted in 2x2 block order,
+        # (num_patches, C * temporal_patch_size * patch_size^2) with tps = 1.
+        grid = [(1, 8, 8)]
+        num_patches = 8 * 8
+        pixel_values = mx.random.uniform(
+            shape=(num_patches, 3 * vision_config.patch_size**2)
+        )
+        positions = mage_vl.mage_vl._positions_from_grid(grid, vision_config)
+        hidden_states = model.vision_tower(pixel_values, positions, grid)
+        self.assertEqual(
+            hidden_states.shape,
+            (num_patches // 4, vision_config.out_hidden_size),
+        )
+
+        # Video case (t > 1) exercises the 4-frame block-diagonal attention windows.
+        grid = [(8, 4, 4)]
+        num_patches = 8 * 4 * 4
+        pixel_values = mx.random.uniform(
+            shape=(num_patches, 3 * vision_config.patch_size**2)
+        )
+        positions = mage_vl.mage_vl._positions_from_grid(grid, vision_config)
+        hidden_states = model.vision_tower(pixel_values, positions, grid)
+        self.assertEqual(
+            hidden_states.shape,
+            (num_patches // 4, vision_config.out_hidden_size),
+        )
+
     def test_qwen3_vl(self):
         from mlx_vlm.models import qwen3_vl
 
@@ -2799,6 +2953,32 @@ class TestModels(unittest.TestCase):
                 self.assertIn("vision_tower.blocks.0.attn.qkv", config.quantization)
                 self.assertIn("language_model.lm_head", config.quantization)
                 self.assertIs(config.quantization, config.quantization_config)
+
+    def test_chandra_ocr2_config_uses_qwen3_5(self):
+        from mlx_vlm.models import qwen3_5
+        from mlx_vlm.utils import get_model_and_args
+
+        chandra_config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "image_token_id": 151655,
+            "video_token_id": 151656,
+            "vision_start_token_id": 151652,
+            "vision_end_token_id": 151653,
+            "tie_word_embeddings": True,
+            "text_config": {"model_type": "qwen3_5_text"},
+            "vision_config": {"model_type": "qwen3_5", "patch_size": 16},
+        }
+
+        model_class, _ = get_model_and_args(config=dict(chandra_config))
+        self.assertIs(model_class, qwen3_5)
+
+        config = qwen3_5.ModelConfig.from_dict(dict(chandra_config))
+        self.assertEqual(config.image_token_id, 151655)
+        self.assertEqual(config.video_token_id, 151656)
+        self.assertEqual(config.vision_start_token_id, 151652)
+        self.assertEqual(config.vision_end_token_id, 151653)
+        self.assertEqual(config.vision_config.patch_size, 16)
 
     def test_qwen3_5_decode_uses_rope_deltas_kwarg(self):
         from mlx_vlm.models import qwen3_5
@@ -6679,8 +6859,8 @@ class TestModels(unittest.TestCase):
             rel_extent=16,
             sconv_kernel_size=4,
             mlp_layer_types=["dense", "sparse"],
-            intermediate_size=128,
-            moe_intermediate_size=32,
+            intermediate_size=32,
+            dense_intermediate_size=128,
             n_routed_experts=4,
             num_experts_per_tok=2,
             n_shared_experts=2,
@@ -6756,9 +6936,337 @@ class TestModels(unittest.TestCase):
         self.assertEqual(out.logits.shape, (1, len(ids), config.text_config.vocab_size))
         self.assertTrue(bool(mx.isfinite(out.logits).all()))
 
+    def test_kimi_k3(self):
+        from mlx_vlm.models import kimi_k3
+
+        text_config = kimi_k3.TextConfig(
+            vocab_size=1000,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            intermediate_size=96,
+            rms_norm_eps=1e-5,
+            hidden_act="situ",
+            activation_situ_beta=4.0,
+            activation_situ_linear_beta=25.0,
+            attn_res_block_size=2,
+            q_lora_rank=24,
+            kv_lora_rank=32,
+            qk_nope_head_dim=16,
+            qk_rope_head_dim=8,
+            v_head_dim=16,
+            mla_use_output_gate=True,
+            num_experts=8,
+            num_experts_per_token=2,
+            num_shared_experts=2,
+            moe_intermediate_size=32,
+            routed_expert_hidden_size=48,
+            latent_moe_use_norm=True,
+            first_k_dense_replace=1,
+            linear_attn_config=dict(
+                num_heads=2,
+                head_dim=32,
+                short_conv_kernel_size=4,
+                gate_lower_bound=-5.0,
+                use_full_rank_gate=True,
+                kda_layers=[1, 2, 3],
+                full_attn_layers=[4],
+            ),
+        )
+
+        vision_config = kimi_k3.VisionConfig(
+            patch_size=14,
+            init_pos_emb_height=8,
+            init_pos_emb_width=8,
+            init_pos_emb_time=2,
+            vt_num_attention_heads=2,
+            vt_num_hidden_layers=2,
+            vt_hidden_size=32,
+            vt_intermediate_size=64,
+            qkv_hidden_size=48,
+            mm_hidden_size=32,
+            text_hidden_size=64,
+        )
+
+        config = kimi_k3.ModelConfig(
+            model_type="kimi_k3",
+            text_config=text_config,
+            vision_config=vision_config,
+            vocab_size=1000,
+            media_placeholder_token_id=999,
+        )
+
+        model = kimi_k3.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        patches = mx.random.uniform(shape=(16, 14, 14, 3))
+        features = model.vision_tower(patches, [[1, 4, 4]])
+        self.assertEqual(features.shape, (4, 4, 32))
+        projected = model.mm_projector(features)
+        self.assertEqual(projected.shape, (4, 64))
+        self.assertTrue(mx.isfinite(projected).all().item())
+
+    @staticmethod
+    def _muse_glimmer_config():
+        from mlx_vlm.models import muse_glimmer
+
+        return muse_glimmer.ModelConfig(
+            text_config=muse_glimmer.TextConfig(
+                vocab_size=64,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=8,
+                max_position_embeddings=128,
+                sliding_window=8,
+                layer_types=["sliding_attention", "full_attention"],
+                layer_rope_theta=[10000.0, 0],
+            ),
+            vision_config=muse_glimmer.VisionConfig(
+                hidden_size=8,
+                intermediate_size=16,
+                num_attention_heads=2,
+                num_hidden_layers=2,
+                patch_size=2,
+                patch_temporal=2,
+                merge_size=2,
+                pos_emb_height=4,
+                pos_emb_width=4,
+                max_position_embeddings=16,
+                layer_types=["window_attention", "full_attention"],
+            ),
+            image_token_id=7,
+            video_token_id=6,
+            out_hidden_size=32,
+            projector_hidden_size=16,
+        )
+
+    def test_muse_glimmer(self):
+        from mlx_vlm.models import muse_glimmer
+        from mlx_vlm.models.cache import KVCache, RotatingKVCache
+
+        config = self._muse_glimmer_config()
+        model = muse_glimmer.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        pixel_values = mx.zeros((4, 2 * 3 * 2 * 2))
+        grid = mx.array([[1, 2, 2]])
+        output = model(
+            mx.array([[1, config.image_token_id, 2]]),
+            pixel_values=pixel_values,
+            image_grid_thw=grid,
+        )
+        self.assertEqual(output.logits.shape, (1, 3, config.text_config.vocab_size))
+        self.assertTrue(mx.isfinite(output.logits).all().item())
+
+        cache = model.make_cache()
+        self.assertIsInstance(cache[0], RotatingKVCache)
+        self.assertIsInstance(cache[1], KVCache)
+
+    def test_muse_glimmer_numerical_parity(self):
+        from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm
+        from mlx_vlm.models.muse_glimmer.vision import apply_rotary, rotate_half
+
+        norm = CenteredRMSNorm(4, eps=1e-6)
+        norm.weight = (mx.arange(4, dtype=mx.float32) * 0.031 - 0.2).astype(mx.bfloat16)
+        inputs = (
+            (mx.arange(4, dtype=mx.float32) * 0.37 - 1.13)
+            .reshape(1, 4)
+            .astype(mx.bfloat16)
+        )
+        inputs32 = inputs.astype(mx.float32)
+        expected = inputs32 * mx.rsqrt(
+            mx.mean(mx.square(inputs32), axis=-1, keepdims=True) + norm.eps
+        )
+        expected = (expected * (1.0 + norm.weight.astype(mx.float32))).astype(
+            inputs.dtype
+        )
+        self.assertTrue(mx.array_equal(norm(inputs), expected).item())
+
+        q = mx.arange(16, dtype=mx.bfloat16).reshape(1, 2, 2, 4) / 16
+        k = q + 0.25
+        cos = mx.cos(mx.arange(8, dtype=mx.float32).reshape(2, 4) / 8)
+        sin = mx.sin(mx.arange(8, dtype=mx.float32).reshape(2, 4) / 8)
+        actual_q, actual_k = apply_rotary(q, k, cos, sin)
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        expected_q = (
+            q.astype(mx.float32) * cos + rotate_half(q).astype(mx.float32) * sin
+        ).astype(q.dtype)
+        expected_k = (
+            k.astype(mx.float32) * cos + rotate_half(k).astype(mx.float32) * sin
+        ).astype(k.dtype)
+        self.assertTrue(mx.array_equal(actual_q, expected_q).item())
+        self.assertTrue(mx.array_equal(actual_k, expected_k).item())
+
+    def test_muse_glimmer_compiled_decoder_transitions(self):
+        from mlx_vlm.models.muse_glimmer.language import (
+            _centered_rms_norm,
+            _finish_mlp,
+            _prepare_mlp_input,
+        )
+
+        residual = mx.arange(16, dtype=mx.float32).reshape(1, 2, 8).astype(mx.bfloat16)
+        attention = (residual * 0.125 - 0.5).astype(mx.bfloat16)
+        mlp_output = (residual * -0.25 + 0.75).astype(mx.bfloat16)
+        weight = (mx.arange(8, dtype=mx.float32) * 0.02 - 0.1).astype(mx.bfloat16)
+        eps = 1e-6
+
+        expected_residual = residual + _centered_rms_norm(attention, weight, eps)
+        expected_mlp_input = _centered_rms_norm(expected_residual, weight, eps)
+        actual_residual, actual_mlp_input = _prepare_mlp_input(
+            residual,
+            attention,
+            weight,
+            weight,
+            eps,
+            eps,
+        )
+        expected_output = expected_residual + _centered_rms_norm(
+            mlp_output, weight, eps
+        )
+        actual_output = _finish_mlp(expected_residual, mlp_output, weight, eps)
+        mx.eval(
+            expected_residual,
+            expected_mlp_input,
+            actual_residual,
+            actual_mlp_input,
+            expected_output,
+            actual_output,
+        )
+
+        self.assertTrue(mx.array_equal(actual_residual, expected_residual).item())
+        self.assertTrue(mx.array_equal(actual_mlp_input, expected_mlp_input).item())
+        self.assertTrue(mx.array_equal(actual_output, expected_output).item())
+
+    def test_muse_glimmer_dflash_capture_and_rollback(self):
+        from mlx_vlm.models import muse_glimmer
+
+        model = muse_glimmer.Model(self._muse_glimmer_config()).language_model
+        caches = model.make_cache()
+        outputs = model(
+            mx.array([[1, 2, 3]], dtype=mx.int32),
+            cache=caches,
+            capture_layer_ids=[0, 1],
+        )
+        mx.eval(outputs.logits, outputs.hidden_states)
+
+        self.assertEqual(len(outputs.hidden_states), 2)
+        self.assertTrue(
+            all(hidden.shape == (1, 3, 32) for hidden in outputs.hidden_states)
+        )
+        self.assertEqual([cache.offset for cache in caches], [3, 3])
+
+        verify = model(
+            mx.array([[4, 5, 6, 7]], dtype=mx.int32),
+            cache=caches,
+            capture_layer_ids=[0, 1],
+        )
+        mx.eval(verify.logits)
+        accepted = model.rollback_speculative_cache(
+            caches,
+            verify.gdn_states,
+            accepted=1,
+            block_size=4,
+        )
+
+        self.assertEqual(accepted, 1)
+        self.assertEqual([cache.offset for cache in caches], [5, 5])
+
+    def test_muse_glimmer_quantized_embeddings(self):
+        from mlx_vlm.models import muse_glimmer
+        from mlx_vlm.models.muse_glimmer.language import RMSNormNoScale
+
+        model = muse_glimmer.Model(self._muse_glimmer_config())
+        nn.quantize(
+            model.language_model,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda _, module: (
+                hasattr(module, "to_quantized") and module.weight.shape[-1] % 32 == 0
+            ),
+        )
+
+        text_model = model.language_model.model
+        self.assertIsInstance(text_model.embed_tokens, nn.QuantizedEmbedding)
+        self.assertIsInstance(text_model.embed_norm, RMSNormNoScale)
+
+        input_ids = mx.array([[1, 2, 3]])
+        normalized = text_model.embed_norm(text_model.embed_tokens(input_ids))
+        embedded = model.get_input_embeddings(input_ids).inputs_embeds
+        np.testing.assert_allclose(embedded, normalized, rtol=1e-5, atol=1e-7)
+
 
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
+
+    def test_molmo_image_feature_scatter_skips_padded_slots(self):
+        """Each valid patch feature lands on exactly its token position; padded
+        slots (image_input_idx < 0) are skipped rather than wrapping around."""
+        from mlx_vlm.models import molmo
+
+        text_config = molmo.TextConfig(
+            d_model=32,
+            n_heads=4,
+            n_kv_heads=2,
+            n_layers=1,
+            mlp_hidden_size=64,
+            vocab_size=128,
+            embedding_size=128,
+            additional_vocab_size=8,
+        )
+        vision_config = molmo.VisionConfig(
+            hidden_size=64,
+            image_emb_dim=32,
+            image_num_heads=2,
+            image_num_key_value_heads=2,
+            image_num_layers=1,
+            image_head_dim=16,
+            image_mlp_dim=64,
+            d_model=32,
+        )
+        config = molmo.ModelConfig(text_config=text_config, vision_config=vision_config)
+        model = molmo.Model(config)
+
+        batch_size, seq_len, num_image, num_patch, dim = 1, 16, 2, 3, 32
+        input_ids = mx.arange(seq_len, dtype=mx.int32)[None, :]
+        # Two padded slots: -1 and -100 (Molmo's real padding value).
+        image_input_idx = mx.array([[[3, 4, -1], [7, 8, -100]]], dtype=mx.int32)
+        features = mx.random.normal((batch_size, num_image, num_patch, dim))
+        dummy_pixels = mx.zeros((batch_size, num_image, num_patch, 4))
+
+        out = model.get_input_embeddings(
+            input_ids,
+            pixel_values=dummy_pixels,
+            image_input_idx=image_input_idx,
+            cached_image_features=features,
+        ).inputs_embeds
+
+        expected = np.array(model.language_model.model.wte(input_ids), dtype=np.float32)
+        flat_idx = np.array(image_input_idx).reshape(-1)
+        flat_feats = np.array(features, dtype=np.float32).reshape(-1, dim)
+        for pos, feat in zip(flat_idx, flat_feats):
+            if pos >= 0:
+                expected[0, pos] += feat
+
+        self.assertTrue(
+            np.allclose(np.array(out, dtype=np.float32), expected, atol=1e-5),
+            "image features must be added only at their valid token positions",
+        )
 
     def _check_returns_input_embeddings_features(self, model, model_name):
         """Helper to test get_input_embeddings returns InputEmbeddingsFeatures."""
@@ -7818,7 +8326,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
 
         self.assertEqual(mask, "causal")
 
-    def test_gemma4_unified_audio_tokens_keep_vision_mask_causal(self):
+    def test_gemma4_unified_audio_tokens_keep_vision_overlay(self):
         from mlx_vlm.models import gemma4_unified
         from mlx_vlm.models.gemma4.language import Gemma4TextModel
 
@@ -7844,7 +8352,9 @@ class TestGetInputEmbeddings(unittest.TestCase):
 
         mask = model._make_masks(hidden_states, [None], mm_token_type_ids)[0]
 
-        self.assertEqual(mask, "causal")
+        self.assertIsInstance(mask, mx.array)
+        self.assertTrue(bool(mask[0, 0, 1, 2].item()))
+        self.assertFalse(bool(mask[0, 0, 4, 5].item()))
 
     def test_glm4v_input_embeddings(self):
         from mlx_vlm.models import glm4v
@@ -10582,6 +11092,109 @@ class TestQwen35NormSanitization(unittest.TestCase):
         self.assertTrue(mx.allclose(out[self._MLX_KEY], mx.zeros(4)).item())
 
 
+class TestQwen35StructuredOutputMaskWidth(unittest.TestCase):
+    """Structured output must not be capped at the tokenizer vocab width (#1797).
+
+    llguidance packs its token bitmask over the tokenizer vocabulary, but the
+    masked argmax kernel indexes mask words by lm_head row without bounds
+    checking. Checkpoints whose ``vocab_size`` is padded above the tokenizer
+    vocab (Qwen3.5: 248077 tokens, 248320 rows) therefore built a mask 7 words
+    short, and constrained decoding died with "packed token mask must be int32
+    with one complete row per token".
+    """
+
+    # Word-aligned so the mask covers exactly [0, VOCAB) and every lm_head row
+    # at or above VOCAB falls in the padding words. llguidance zeroes the
+    # unused bits of its final partial word, so this matches real masks.
+    VOCAB = 960  # tokenizer vocab -> 30 packed words
+    N = 1024  # padded lm_head rows -> 32 packed words required
+    K = 512
+
+    def _head(self):
+        import mlx.nn as nn
+
+        mx.random.seed(0)
+        linear = nn.Linear(self.K, self.N, bias=False)
+        # Let the padding rows win an unconstrained argmax, so sampling a real
+        # token proves the padding words were actually treated as disallowed.
+        weight = mx.zeros((self.N, self.K))
+        weight[self.VOCAB :, :] = 4.0
+        linear.weight = weight.astype(mx.bfloat16)
+        return nn.QuantizedLinear.from_linear(linear, group_size=64, bits=4)
+
+    def _mask(self, rows, words):
+        return mx.full((rows, words), -1, dtype=mx.int32)
+
+    def _narrow(self, rows=1):
+        return self._mask(rows, (self.VOCAB + 31) // 32)
+
+    def test_pad_widens_mask_and_disallows_padding_rows(self):
+        from mlx_vlm.models.qwen3_5.language import _pad_token_mask_to_head
+
+        narrow = self._narrow()
+        padded = _pad_token_mask_to_head(narrow, self.N)
+
+        self.assertEqual(padded.shape, (1, (self.N + 31) // 32))
+        self.assertEqual(padded.dtype, mx.int32)
+        self.assertTrue(mx.all(padded[:, : narrow.shape[1]] == -1).item())
+        self.assertTrue(mx.all(padded[:, narrow.shape[1] :] == 0).item())
+
+    def test_pad_is_noop_when_already_wide_enough(self):
+        from mlx_vlm.models.qwen3_5.language import _pad_token_mask_to_head
+
+        wide = self._mask(1, (self.N + 31) // 32)
+        self.assertIs(_pad_token_mask_to_head(wide, self.N), wide)
+
+    def test_narrow_mask_still_rejected(self):
+        from mlx_vlm.models.qwen3_5.language import _target_verify_quantized_argmax
+
+        head = self._head()
+        x = mx.zeros((1, 1, self.K), dtype=mx.bfloat16)
+        with self.assertRaises(ValueError):
+            _target_verify_quantized_argmax(head, x, token_mask=self._narrow())
+
+    def test_padded_mask_samples_within_the_real_vocabulary(self):
+        from mlx_vlm.models.qwen3_5.language import (
+            _pad_token_mask_to_head,
+            _target_verify_quantized_argmax,
+        )
+
+        head = self._head()
+        mx.random.seed(1)
+        x = (mx.random.normal((1, 1, self.K)) * 0.1).astype(mx.bfloat16)
+
+        logits = head(x).astype(mx.float32)
+        self.assertGreaterEqual(
+            int(mx.argmax(logits, axis=-1).reshape(-1)[0]), self.VOCAB
+        )
+
+        padded = _pad_token_mask_to_head(self._narrow(), self.N)
+        sampled = _target_verify_quantized_argmax(head, x, token_mask=padded)
+        self.assertIsNotNone(sampled)
+        token = int(sampled.reshape(-1)[0])
+
+        self.assertLess(token, self.VOCAB)
+        expected = mx.argmax(logits[..., : self.VOCAB], axis=-1)
+        self.assertEqual(token, int(expected.reshape(-1)[0]))
+
+    def test_padded_mask_handles_multi_row_batch(self):
+        from mlx_vlm.models.qwen3_5.language import (
+            _pad_token_mask_to_head,
+            _target_verify_quantized_argmax,
+        )
+
+        head = self._head()
+        mx.random.seed(2)
+        x = (mx.random.normal((2, 1, self.K)) * 0.1).astype(mx.bfloat16)
+        padded = _pad_token_mask_to_head(self._narrow(rows=2), self.N)
+
+        sampled = _target_verify_quantized_argmax(head, x, token_mask=padded)
+        self.assertIsNotNone(sampled)
+        self.assertEqual(sampled.shape, (2, 1))
+        for token in sampled.reshape(-1).tolist():
+            self.assertLess(int(token), self.VOCAB)
+
+
 class TestQwenMRoPEDecodeContinuation(unittest.TestCase):
     """Regression tests for MRoPE decode positions in plain generation.
 
@@ -10705,8 +11318,8 @@ class TestInklingMTP(unittest.TestCase):
         "log_scaling_alpha": 0.1,
         "sconv_kernel_size": 4,
         "mlp_layer_types": ["dense", "sparse"],
-        "intermediate_size": 128,
-        "moe_intermediate_size": 64,
+        "intermediate_size": 64,
+        "dense_intermediate_size": 128,
         "n_routed_experts": 8,
         "num_experts_per_tok": 2,
         "n_shared_experts": 1,
@@ -11653,3 +12266,738 @@ class TestGptOssMixedQuant(unittest.TestCase):
         self.assertEqual(type(q_proj).__name__, "QuantizedLinear")
         self.assertEqual(q_proj.bits, 8)  # affine 8-bit, not top-level mxfp4
         self.assertTrue(hasattr(q_proj, "biases"))
+
+
+class TestBert(unittest.TestCase):
+    def test_bert_embedding_forward(self):
+        from mlx_vlm.models import bert
+
+        config = bert.ModelConfig(
+            model_type="bert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = bert.Model(config)
+
+        batch, seq = 2, 5
+        input_ids = mx.array(np.random.randint(0, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestXLMRoberta(unittest.TestCase):
+    def test_xlm_roberta_embedding_forward(self):
+        from mlx_vlm.models import xlm_roberta
+
+        config = xlm_roberta.ModelConfig(
+            model_type="xlm-roberta",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = xlm_roberta.Model(config)
+
+        batch, seq = 2, 5
+        input_ids = mx.array(np.random.randint(2, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestModernBert(unittest.TestCase):
+    def test_modernbert_embedding_forward(self):
+        from mlx_vlm.models import modernbert
+
+        config = modernbert.ModelConfig(
+            model_type="modernbert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=3,
+            intermediate_size=48,
+            num_attention_heads=4,
+            global_attn_every_n_layers=2,
+            local_attention=8,
+        )
+        model = modernbert.Model(config)
+
+        batch, seq = 2, 6
+        input_ids = mx.array(np.random.randint(0, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestQwen3Embedding(unittest.TestCase):
+    def test_qwen3_embedding_forward(self):
+        from mlx_vlm.models import qwen3_embedding
+
+        config = qwen3_embedding.ModelConfig(
+            model_type="qwen3",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=37,
+            num_attention_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=99,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+            rope_theta=1000000.0,
+            head_dim=8,
+            tie_word_embeddings=True,
+        )
+        model = qwen3_embedding.Model(config)
+
+        batch, seq = 2, 5
+        input_ids = mx.array(np.random.randint(0, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestGemma3Embedding(unittest.TestCase):
+    def test_gemma3_embedding_forward(self):
+        from mlx_vlm.models import gemma3_embedding
+
+        config = gemma3_embedding.ModelConfig(
+            model_type="gemma3_text",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=37,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=99,
+            sliding_window=8,
+            sliding_window_pattern=2,
+            query_pre_attn_scalar=8,
+            max_position_embeddings=64,
+        )
+        model = gemma3_embedding.Model(config)
+
+        batch, seq = 2, 5
+        input_ids = mx.array(np.random.randint(0, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestLfm2Embedding(unittest.TestCase):
+    def test_lfm2_embedding_forward(self):
+        from mlx_vlm.models import lfm2_embedding
+
+        config = lfm2_embedding.ModelConfig(
+            model_type="lfm2",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+            norm_eps=1e-5,
+            conv_bias=False,
+            conv_L_cache=3,
+            block_dim=32,
+            block_ff_dim=64,
+            block_multiple_of=16,
+            block_ffn_dim_multiplier=1.0,
+            block_auto_adjust_ff_dim=True,
+            layer_types=["conv", "full_attention"],
+            tie_word_embeddings=True,
+        )
+        model = lfm2_embedding.Model(config)
+
+        batch, seq = 2, 5
+        input_ids = mx.array(np.random.randint(0, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestCohereCompass(unittest.TestCase):
+    def test_released_text_config_defaults_and_per_layer_rope(self):
+        from mlx_vlm.models import cohere_compass
+
+        text_config = cohere_compass.TextConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            layer_types=["sliding_attention", "full_attention"],
+            rope_parameters={
+                "sliding_attention": {
+                    "mrope_interleaved": True,
+                    "mrope_section": [2, 1, 1],
+                    "rope_type": "default",
+                    "rope_theta": 50_000,
+                },
+                "full_attention": None,
+                "rope_type": "default",
+                "rope_theta": 10_000,
+            },
+        )
+        model = cohere_compass.LanguageModel(text_config)
+
+        self.assertEqual(text_config.norm_type, "layer_norm")
+        self.assertEqual(text_config.transformer_block_type, "parallel")
+        self.assertFalse(hasattr(model.model.layers[0], "post_attention_layernorm"))
+        self.assertTrue(model.model.layers[0].self_attn.rotary_emb.enabled)
+        self.assertFalse(model.model.layers[1].self_attn.rotary_emb.enabled)
+        self.assertAlmostEqual(
+            model.model.layers[0].self_attn.rotary_emb.inv_freq[1].item(),
+            50_000 ** (-0.25),
+            places=6,
+        )
+        rotary = model.model.layers[0].self_attn.rotary_emb
+        positions = mx.array(
+            [
+                [[1, 2]],
+                [[3, 4]],
+                [[5, 6]],
+            ]
+        )
+        cos, _ = rotary(mx.zeros((1, 2, 32)), positions)
+        selected = mx.take(positions, rotary.position_selector, axis=0).transpose(
+            1, 2, 0
+        )
+        frequencies = selected.astype(mx.float32) * rotary.inv_freq
+        expected = mx.cos(mx.concatenate([frequencies, frequencies], axis=-1))
+        self.assertTrue(mx.allclose(cos, expected).item())
+
+    def test_text_rope_respects_interleaved_and_split_layouts(self):
+        from mlx_vlm.models.cohere_compass.language import _apply_rope
+
+        q = mx.array([[[[1.0, 2.0, 3.0, 4.0]]]])
+        k = mx.array([[[[5.0, 6.0, 7.0, 8.0]]]])
+        cos = mx.zeros((1, 1, 4))
+        sin = mx.ones((1, 1, 4))
+
+        q_interleaved, k_interleaved = _apply_rope(q, k, cos, sin, "interleave")
+        q_split, k_split = _apply_rope(q, k, cos, sin, "split")
+        mx.eval(q_interleaved, k_interleaved, q_split, k_split)
+
+        self.assertEqual(q_interleaved.tolist(), [[[[-2.0, 1.0, -4.0, 3.0]]]])
+        self.assertEqual(k_interleaved.tolist(), [[[[-6.0, 5.0, -8.0, 7.0]]]])
+        self.assertEqual(q_split.tolist(), [[[[-3.0, -4.0, 1.0, 2.0]]]])
+        self.assertEqual(k_split.tolist(), [[[[-7.0, -8.0, 5.0, 6.0]]]])
+
+    def test_vision_rope_uses_split_frequency_layout(self):
+        from mlx_vlm.models.cohere_compass.vision import _vision_position_embeddings
+
+        rotary = mx.array([[0.0, mx.pi / 2]])
+        cos, sin = _vision_position_embeddings(rotary)
+        mx.eval(cos, sin)
+
+        self.assertTrue(
+            mx.allclose(cos, mx.array([[1.0, 0.0, 1.0, 0.0]]), atol=1e-6).item()
+        )
+        self.assertTrue(
+            mx.allclose(sin, mx.array([[0.0, 1.0, 0.0, 1.0]]), atol=1e-6).item()
+        )
+
+    def _tiny_model(self):
+        from mlx_vlm.models import cohere_compass
+
+        text_config = cohere_compass.TextConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=128,
+            rms_norm_eps=1e-6,
+            norm_type="layer_norm",
+            transformer_block_type="parallel",
+            tie_word_embeddings=True,
+            sliding_window=8,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            rope_parameters={"mrope_section": [2, 1, 1]},
+            rope_style="interleave",
+            rope_on_all_layers=False,
+        )
+        vision_config = cohere_compass.VisionConfig(
+            depth=2,
+            hidden_size=16,
+            intermediate_size=32,
+            num_heads=2,
+            patch_size=2,
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            out_hidden_size=32,
+            num_position_embeddings=16,
+            deepstack_visual_indexes=[0],
+        )
+        config = cohere_compass.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            image_token_id=63,
+            vision_start_token_id=62,
+            vision_end_token_id=61,
+        )
+        return cohere_compass.Model(config)
+
+    def test_forward_and_cache(self):
+        model = self._tiny_model()
+        input_ids = mx.array([[1, 62, 63, 63, 63, 63, 61, 2]])
+        pixel_values = mx.random.normal((16, 24))
+        image_grid_thw = mx.array([[1, 4, 4]])
+
+        cache = model.language_model.make_cache()
+        output = model(
+            input_ids,
+            pixel_values,
+            cache=cache,
+            image_grid_thw=image_grid_thw,
+        )
+        mx.eval(output.logits)
+        self.assertEqual(output.logits.shape, (1, 8, 64))
+
+        next_output = model(mx.array([[2]]), cache=cache)
+        mx.eval(next_output.logits)
+        self.assertEqual(next_output.logits.shape, (1, 1, 64))
+
+    def test_chunked_prefill_aligns_deepstack_visual_rows(self):
+        from types import SimpleNamespace
+
+        model = self._tiny_model()
+        language_model = model.language_model
+
+        class Recorder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.visual_pos_masks = None
+                self.deepstack_visual_embeds = None
+                self.embed_tokens = SimpleNamespace(
+                    as_linear=lambda hidden: mx.zeros(
+                        (*hidden.shape[:-1], 64), dtype=hidden.dtype
+                    )
+                )
+
+            def __call__(
+                self,
+                inputs,
+                *,
+                visual_pos_masks=None,
+                deepstack_visual_embeds=None,
+                **kwargs,
+            ):
+                self.visual_pos_masks = visual_pos_masks
+                self.deepstack_visual_embeds = deepstack_visual_embeds
+                return mx.zeros((inputs.shape[0], inputs.shape[1], 32))
+
+        recorder = Recorder()
+        language_model.model = recorder
+        full_mask = mx.array(
+            [
+                [False, True, True, False, True, True, False, True, False],
+                [True, False, True, False, True, False, False, False, False],
+            ]
+        )
+        visual_rows = int(full_mask.sum().item())
+        embeds = mx.arange(visual_rows * 32).reshape(visual_rows, 32)
+
+        language_model(
+            mx.zeros((2, 3), dtype=mx.int32),
+            inputs_embeds=mx.zeros((2, 3, 32)),
+            cache=[SimpleNamespace(offset=4)],
+            position_ids=mx.zeros((3, 2, 3), dtype=mx.int32),
+            visual_pos_masks=full_mask,
+            deepstack_visual_embeds=[embeds],
+        )
+
+        self.assertEqual(
+            recorder.visual_pos_masks.tolist(),
+            [[True, True, False], [True, False, False]],
+        )
+        expected = mx.concatenate([embeds[2:4], embeds[7:8]], axis=0)
+        self.assertEqual(
+            recorder.deepstack_visual_embeds[0].tolist(), expected.tolist()
+        )
+
+    def test_chunk_local_deepstack_payload_aligns_visual_rows(self):
+        from types import SimpleNamespace
+
+        from mlx_vlm.models.cohere_compass.language import DeepstackVisualFeatures
+
+        model = self._tiny_model()
+        language_model = model.language_model
+
+        class Recorder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.visual_pos_masks = None
+                self.deepstack_visual_embeds = None
+                self.embed_tokens = SimpleNamespace(
+                    as_linear=lambda hidden: mx.zeros(
+                        (*hidden.shape[:-1], 64), dtype=hidden.dtype
+                    )
+                )
+
+            def __call__(
+                self,
+                inputs,
+                *,
+                visual_pos_masks=None,
+                deepstack_visual_embeds=None,
+                **kwargs,
+            ):
+                self.visual_pos_masks = visual_pos_masks
+                self.deepstack_visual_embeds = deepstack_visual_embeds
+                return mx.zeros((inputs.shape[0], inputs.shape[1], 32))
+
+        recorder = Recorder()
+        language_model.model = recorder
+        full_mask = mx.array(
+            [
+                [False, True, True, False, True, True, False, True, False],
+                [True, False, True, False, True, False, False, False, False],
+            ]
+        )
+        visual_rows = int(full_mask.sum().item())
+        embeds = mx.arange(visual_rows * 32).reshape(visual_rows, 32)
+
+        language_model(
+            mx.zeros((2, 3), dtype=mx.int32),
+            inputs_embeds=mx.zeros((2, 3, 32)),
+            cache=[SimpleNamespace(offset=4)],
+            position_ids=mx.zeros((3, 2, 3), dtype=mx.int32),
+            visual_pos_masks=full_mask[:, 4:7],
+            deepstack_visual_embeds=DeepstackVisualFeatures(
+                embeddings=[embeds], position_mask=full_mask
+            ),
+        )
+
+        self.assertEqual(
+            recorder.visual_pos_masks.tolist(),
+            [[True, True, False], [True, False, False]],
+        )
+        expected = mx.concatenate([embeds[2:4], embeds[7:8]], axis=0)
+        self.assertEqual(
+            recorder.deepstack_visual_embeds[0].tolist(), expected.tolist()
+        )
+
+    def test_visual_mask_tracks_packed_deepstack_rows(self):
+        model = self._tiny_model()
+        input_ids = mx.array(
+            [
+                [1, 62, 63, 63, 63, 63, 61, 2],
+                [3, 62, 63, 63, 63, 63, 61, 4],
+            ]
+        )
+        pixel_values = mx.random.normal((32, 24))
+        features = model.get_input_embeddings(
+            input_ids,
+            pixel_values,
+            image_grid_thw=mx.array([[1, 4, 4], [1, 4, 4]]),
+        )
+
+        self.assertEqual(features.visual_pos_masks.dtype, mx.bool_)
+        self.assertEqual(features.deepstack_visual_embeds.position_mask.dtype, mx.bool_)
+        self.assertEqual(
+            features.deepstack_visual_embeds.position_mask.tolist(),
+            features.visual_pos_masks.tolist(),
+        )
+
+    def test_decode_rope_uses_logical_batch_offsets(self):
+        from types import SimpleNamespace
+
+        model = self._tiny_model()
+        language_model = model.language_model
+
+        class Recorder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.position_ids = None
+                self.rotary_emb = SimpleNamespace(
+                    position_selector=mx.array([0, 1, 2], dtype=mx.int32)
+                )
+                self.embed_tokens = SimpleNamespace(
+                    as_linear=lambda hidden: mx.zeros(
+                        (*hidden.shape[:-1], 64), dtype=hidden.dtype
+                    )
+                )
+
+            def __call__(self, inputs, *, position_ids=None, **kwargs):
+                self.position_ids = position_ids
+                return mx.zeros((inputs.shape[0], inputs.shape[1], 32))
+
+        recorder = Recorder()
+        language_model.model = recorder
+        cache = SimpleNamespace(
+            _idx=10,
+            offset=mx.array([10, 8], dtype=mx.int32),
+            left_padding=mx.array([0, 2], dtype=mx.int32),
+        )
+
+        language_model(
+            mx.zeros((2, 1), dtype=mx.int32),
+            cache=[cache],
+            rope_deltas=mx.zeros((2, 1), dtype=mx.int32),
+        )
+
+        self.assertEqual(
+            recorder.position_ids.tolist(),
+            [[[10], [8]], [[10], [8]], [[10], [8]]],
+        )
+
+    def test_visual_deepstack_allows_chunked_prefill(self):
+        model = self._tiny_model()
+        self.assertTrue(model.chunked_prefill_policy(prefill_kwargs={}))
+        self.assertTrue(
+            model.chunked_prefill_policy(
+                prefill_kwargs={"deepstack_visual_embeds": [mx.zeros((4, 32))]}
+            )
+        )
+
+    def test_deepstack_injection_preserves_batch_row_order(self):
+        model = self._tiny_model()
+        hidden = mx.zeros((2, 5, 32))
+        visual_mask = mx.array(
+            [
+                [False, True, False, True, False],
+                [True, False, True, False, True],
+            ]
+        )
+        visual_embeds = mx.concatenate(
+            [mx.full((1, 32), float(index)) for index in range(1, 6)], axis=0
+        )
+        output = model.language_model.model._deepstack_process(
+            hidden, visual_mask, visual_embeds
+        )
+
+        self.assertEqual(output[0, 1, 0].item(), 1)
+        self.assertEqual(output[0, 3, 0].item(), 2)
+        self.assertEqual(output[1, 0, 0].item(), 3)
+        self.assertEqual(output[1, 2, 0].item(), 4)
+        self.assertEqual(output[1, 4, 0].item(), 5)
+
+    def test_batched_padding_matches_single_rows(self):
+        from mlx_vlm.generate.ar import _make_cache
+
+        mx.random.seed(0)
+        model = self._tiny_model()
+        model.update(
+            tree_map(lambda value: value.astype(mx.bfloat16), model.parameters())
+        )
+        language_model = model.language_model
+        rows = [
+            [1, 2, 3, 4, 5],
+            [6, 7, 8, 9, 10, 11, 12, 13],
+            [14, 15, 16, 17, 18, 19, 20, 21],
+        ]
+        max_length = max(map(len, rows))
+        padding = [max_length - len(row) for row in rows]
+        input_ids = mx.array([[0] * pad + row for row, pad in zip(rows, padding)])
+        attention_mask = mx.array(
+            [[0] * pad + [1] * len(row) for row, pad in zip(rows, padding)]
+        )
+        position_ids, rope_deltas = language_model.get_rope_index(
+            input_ids, attention_mask=attention_mask
+        )
+
+        single_caches = []
+        single_logits = []
+        single_deltas = []
+        for row in rows:
+            row_ids = mx.array([row])
+            row_mask = mx.ones_like(row_ids)
+            row_positions, row_delta = language_model.get_rope_index(
+                row_ids, attention_mask=row_mask
+            )
+            row_cache = language_model.make_cache()
+            output = language_model(
+                row_ids,
+                cache=row_cache,
+                position_ids=row_positions,
+                rope_deltas=row_delta,
+            )
+            mx.eval(output.logits, [entry.state for entry in row_cache])
+            single_caches.append(row_cache)
+            single_logits.append(output.logits[:, -1])
+            single_deltas.append(row_delta)
+
+        batch_cache = _make_cache(language_model, [0] * len(rows))
+        output = language_model(
+            input_ids,
+            cache=batch_cache,
+            position_ids=position_ids,
+            rope_deltas=rope_deltas,
+            attention_mask=attention_mask,
+        )
+        mx.eval(output.logits, [entry.state for entry in batch_cache])
+        self.assertEqual(output.logits.shape[1], 1)
+        for row, expected in enumerate(single_logits):
+            self.assertTrue(
+                mx.allclose(
+                    output.logits[row : row + 1, -1], expected, atol=0, rtol=0
+                ).item()
+            )
+
+        first_tokens = mx.concatenate(
+            [mx.argmax(logits, axis=-1) for logits in single_logits]
+        )
+        expected_next = []
+        for row, row_cache in enumerate(single_caches):
+            next_output = language_model(
+                first_tokens[row : row + 1, None],
+                cache=row_cache,
+                rope_deltas=single_deltas[row],
+            )
+            mx.eval(next_output.logits, [entry.state for entry in row_cache])
+            expected_next.append(next_output.logits[:, -1])
+
+        batch_next = language_model(
+            first_tokens[:, None],
+            cache=batch_cache,
+            rope_deltas=rope_deltas,
+        )
+        mx.eval(batch_next.logits, [entry.state for entry in batch_cache])
+        for row, expected in enumerate(expected_next):
+            self.assertEqual(
+                mx.argmax(batch_next.logits[row, -1]).item(),
+                mx.argmax(expected).item(),
+            )
+
+        keep = mx.array([0], dtype=mx.int32)
+        for entry in batch_cache:
+            entry.filter(keep)
+        filtered_delta = rope_deltas[keep]
+        next_token = mx.argmax(expected_next[0], axis=-1)
+        expected_filtered = language_model(
+            next_token[:, None],
+            cache=single_caches[0],
+            rope_deltas=single_deltas[0],
+        )
+        actual_filtered = language_model(
+            next_token[:, None],
+            cache=batch_cache,
+            rope_deltas=filtered_delta,
+        )
+        mx.eval(expected_filtered.logits, actual_filtered.logits)
+        self.assertEqual(
+            mx.argmax(actual_filtered.logits[0, -1]).item(),
+            mx.argmax(expected_filtered.logits[0, -1]).item(),
+        )
+
+    def test_vision_batch_matches_individual_images(self):
+        model = self._tiny_model()
+        pixels = mx.random.normal((32, 24))
+        image_features, deepstack_features = model.vision_tower(
+            pixels,
+            mx.array([[1, 4, 4], [1, 4, 4]]),
+        )
+        first_features, first_deepstack = model.vision_tower(
+            pixels[:16], mx.array([[1, 4, 4]])
+        )
+        second_features, second_deepstack = model.vision_tower(
+            pixels[16:], mx.array([[1, 4, 4]])
+        )
+        mx.eval(
+            image_features,
+            first_features,
+            second_features,
+            *(deepstack_features or []),
+            *(first_deepstack or []),
+            *(second_deepstack or []),
+        )
+        self.assertTrue(
+            mx.allclose(
+                image_features,
+                mx.concatenate([first_features, second_features], axis=0),
+                atol=1e-5,
+            ).item()
+        )
+        for batched, first, second in zip(
+            deepstack_features, first_deepstack, second_deepstack
+        ):
+            self.assertTrue(
+                mx.allclose(
+                    batched,
+                    mx.concatenate([first, second], axis=0),
+                    atol=1e-5,
+                ).item()
+            )
+
+    def test_processor_patch_layout(self):
+        from PIL import Image
+
+        from mlx_vlm.models.cohere_compass.processing_cohere_compass import (
+            CohereCompassImageProcessor,
+        )
+
+        processor = CohereCompassImageProcessor(
+            patch_size=2,
+            temporal_patch_size=2,
+            merge_size=2,
+            min_pixels=16 * 16,
+            max_pixels=32 * 32,
+        )
+        output = processor(Image.new("RGB", (12, 10)))
+        self.assertEqual(output["pixel_values"].shape[-1], 24)
+        self.assertEqual(output["image_grid_thw"].tolist(), [[1, 8, 10]])
+
+    def test_processor_uses_left_padding_for_batched_prompts(self):
+        from mlx_vlm.models.cohere_compass.processing_cohere_compass import (
+            CohereCompassProcessor,
+        )
+
+        class Tokenizer:
+            image_token = "<|IMAGE_PAD|>"
+            image_token_id = 63
+            vision_start_token = "<|VISION_START|>"
+            vision_end_token = "<|VISION_END|>"
+
+            def __call__(self, text, **kwargs):
+                self.last_kwargs = kwargs
+                return {"input_ids": [[1] * len(value) for value in text]}
+
+            def convert_tokens_to_ids(self, token):
+                return self.image_token_id
+
+        processor = CohereCompassProcessor.__new__(CohereCompassProcessor)
+        processor.tokenizer = Tokenizer()
+        processor.image_processor = None
+        processor.image_token = processor.tokenizer.image_token
+        processor.image_token_id = processor.tokenizer.image_token_id
+        processor.vision_start_token = processor.tokenizer.vision_start_token
+        processor.vision_end_token = processor.tokenizer.vision_end_token
+
+        processor(text=["short", "longer"], padding=True)
+
+        self.assertEqual(processor.tokenizer.last_kwargs["padding_side"], "left")

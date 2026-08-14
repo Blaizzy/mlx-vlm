@@ -8,6 +8,7 @@ matching parser module from ``mlx_vlm.tool_parsers``.
 import importlib
 
 _TEMPLATE_MARKERS = [
+    (("<atem:function_calls>", "<atem:invoke"), "atem"),
     (("<|tool_call>",), "gemma4"),
     (("<|START_ACTION|>",), "cohere2_moe"),
     (("]<]minimax[>[<tool_call>",), "minimax_m3"),
@@ -16,6 +17,7 @@ _TEMPLATE_MARKERS = [
     (("<start_function_call>",), "function_gemma"),
     (("<longcat_tool_call>",), "longcat"),
     (("<arg_key>",), "glm47"),
+    (("<|tool_call_start|>", "<|tool_call_end|>"), "pythonic"),
     (("<|tool_list_start|>",), "pythonic"),
     (("<tool_call>\\n<function=",), "qwen3_coder"),
     (("<tool_call>\n<function=",), "qwen3_coder"),

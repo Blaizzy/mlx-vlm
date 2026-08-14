@@ -1,25 +1,36 @@
 import argparse
 import codecs
-import contextlib
 import json
 import logging
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
+from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..speculative.utils import format_speculative_stats
 from ..tokenizer_utils import make_streaming_detokenizer
-from ..turboquant import TurboQuantKVCache, turboquant_enabled
-from ..utils import StoppingCriteria, ThinkingBudgetCriteria, load, prepare_inputs
+from ..utils import (
+    StoppingCriteria,
+    ThinkingBudgetCriteria,
+    load,
+    prepare_inputs,
+    should_add_special_tokens,
+)
+from .common import (
+    DEFAULT_KV_GROUP_SIZE,
+    DEFAULT_KV_QUANT_SCHEME,
+    DEFAULT_QUANTIZED_KV_START,
+    GenerationResult,
+    generation_stream,
+    wired_limit,
+)
 from .image import (
     DEFAULT_IMAGE_GUIDANCE,
     DEFAULT_IMAGE_SIZE,
@@ -27,6 +38,7 @@ from .image import (
     DEFAULT_IMAGE_TASK,
     run_image_generation_cli,
 )
+from .video_generation import DEFAULT_VIDEO_STEPS, run_video_generation_cli
 
 logger = logging.getLogger("mlx_vlm.generate")
 
@@ -42,13 +54,10 @@ DEFAULT_SEED = 0
 DEFAULT_TOP_K = 0
 DEFAULT_MIN_P = 0.0
 DEFAULT_REPETITION_CONTEXT_SIZE = 20
-DEFAULT_KV_GROUP_SIZE = 64
-DEFAULT_KV_QUANT_SCHEME = "uniform"
 DEFAULT_COMPLETION_BATCH_SIZE = 32
 DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_THINKING_START_TOKEN = "<think>"
 DEFAULT_THINKING_END_TOKEN = "</think>"
-DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
 DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
@@ -56,7 +65,7 @@ DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Generate text from an image using a model."
+        description="Generate text, an image, or a video with a supported model."
     )
     parser.add_argument(
         "--model",
@@ -67,15 +76,18 @@ def parse_arguments():
     parser.add_argument(
         "--output-modality",
         type=str,
-        choices=("text", "image"),
+        choices=("text", "image", "video"),
         default="text",
-        help="Generate text with a VLM or generate an image with a supported image model.",
+        help=(
+            "Generate text with a VLM, an image with a supported image model, "
+            "or a video with a supported video model."
+        ),
     )
     parser.add_argument(
         "--output",
         type=str,
         default=None,
-        help="Output path for image generation.",
+        help="Output path for image or video generation.",
     )
     parser.add_argument(
         "--task",
@@ -89,15 +101,19 @@ def parse_arguments():
         type=str,
         default=None,
         help=(
-            "Image size as WIDTHxHEIGHT. Generation defaults to "
-            f"{DEFAULT_IMAGE_SIZE}; editing defaults to the first reference image size."
+            "Output size as WIDTHxHEIGHT. Image generation defaults to "
+            f"{DEFAULT_IMAGE_SIZE}; image editing defaults to the first reference "
+            "image size, and video uses the model default when omitted."
         ),
     )
     parser.add_argument(
         "--steps",
         type=int,
-        default=DEFAULT_IMAGE_STEPS,
-        help="Number of image inference steps.",
+        default=None,
+        help=(
+            "Number of inference steps. Defaults to "
+            f"{DEFAULT_IMAGE_STEPS} for images and {DEFAULT_VIDEO_STEPS} for videos."
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -105,7 +121,38 @@ def parse_arguments():
         default=None,
         help=(
             "PRNG seed for reproducible sampling and diffusion canvas init. "
-            "Image generation/editing defaults to a random 32-bit seed."
+            "Image and video generation default to a random 32-bit seed."
+        ),
+    )
+    parser.add_argument(
+        "--workflow",
+        choices=("t2va", "fl2va", "ref2va"),
+        default=None,
+        help=(
+            "Video-generation workflow. Inferred from --image/--last-image or "
+            "--reference when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=None,
+        help="Requested number of generated video frames.",
+    )
+    parser.add_argument(
+        "--last-image",
+        type=str,
+        default=None,
+        help="Last-frame conditioning image for FL2VA video generation.",
+    )
+    parser.add_argument(
+        "--reference",
+        action="append",
+        default=None,
+        metavar="KIND=PATH",
+        help=(
+            "Ordered Ref2VA reference; KIND is image, video, or audio. Repeat "
+            "the argument to preserve semantic reference order."
         ),
     )
     parser.add_argument(
@@ -155,6 +202,13 @@ def parse_arguments():
         type=float,
         default=2.0,
         help="Frames-per-second to sample from --video.",
+    )
+    parser.add_argument(
+        "--video-max-frames",
+        type=int,
+        default=16,
+        help="Cap on frames sent when video falls back to ordered images "
+        "(long clips are re-sampled evenly to this count).",
     )
     parser.add_argument(
         "--resize-shape",
@@ -330,8 +384,11 @@ def parse_arguments():
     parser.add_argument(
         "--verbose",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Detailed output (use --no-verbose to print only the final result).",
+        default=False,
+        help=(
+            "Enable detailed output and progress bars. By default only the final "
+            "result is printed."
+        ),
     )
     parser.add_argument(
         "--eos-tokens",
@@ -351,6 +408,32 @@ def parse_arguments():
         type=float,
         default=None,
         help="Number of bits to quantize the KV cache to.",
+    )
+    parser.add_argument(
+        "--kv-key-bits",
+        type=float,
+        default=None,
+        help="Override the TurboQuant key bit-width (defaults to floor(--kv-bits)).",
+    )
+    parser.add_argument(
+        "--kv-value-bits",
+        type=float,
+        default=None,
+        help="Override the TurboQuant value bit-width (defaults to ceil(--kv-bits)).",
+    )
+    parser.add_argument(
+        "--kv-key-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=None,
+        help="Override the KV quantization backend for keys only.",
+    )
+    parser.add_argument(
+        "--kv-value-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=None,
+        help="Override the KV quantization backend for values only.",
     )
     parser.add_argument(
         "--kv-quant-scheme",
@@ -498,151 +581,6 @@ def normalize_resize_shape(
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
 
 
-# A stream on the default device just for generation
-generation_stream = mx.new_thread_local_stream(mx.default_device())
-
-
-def maybe_quantize_kv_cache(
-    prompt_cache,
-    quantized_kv_start,
-    kv_group_size,
-    kv_bits,
-    kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
-):
-    if kv_bits is None:
-        return
-
-    if turboquant_enabled(kv_bits, kv_quant_scheme):
-
-        def quantize_entry(entry):
-            if isinstance(entry, TurboQuantKVCache):
-                return entry
-            if isinstance(entry, cache.RotatingKVCache):
-                return entry
-            if isinstance(entry, cache.KVCache):
-                if entry.offset == 0:
-                    # Empty: replace so update_and_fetch quantizes on the fly
-                    return TurboQuantKVCache(bits=kv_bits)
-                if entry.offset < quantized_kv_start:
-                    return entry
-                return TurboQuantKVCache.from_cache(entry, bits=kv_bits)
-            if isinstance(entry, cache.CacheList):
-                entry.caches = [quantize_entry(sub_entry) for sub_entry in entry.caches]
-                return entry
-            if isinstance(entry, list):
-                for i, sub_entry in enumerate(entry):
-                    entry[i] = quantize_entry(sub_entry)
-                return entry
-            if isinstance(entry, tuple):
-                return tuple(quantize_entry(sub_entry) for sub_entry in entry)
-            return entry
-
-        # Last-layer policy shared with _make_cache / APC warm restore.
-        n = len(prompt_cache)
-        for index, layer_cache in enumerate(prompt_cache):
-            if not cache.should_quantize_kv_layer(index, n):
-                continue
-            prompt_cache[index] = quantize_entry(layer_cache)
-        return
-
-    n = len(prompt_cache)
-    for index, layer_cache in enumerate(prompt_cache):
-        if not cache.should_quantize_kv_layer(index, n):
-            continue
-        if (
-            hasattr(layer_cache, "to_quantized")
-            and layer_cache.offset >= quantized_kv_start
-        ):
-            prompt_cache[index] = layer_cache.to_quantized(
-                group_size=kv_group_size,
-                bits=int(kv_bits),
-            )
-
-
-@contextlib.contextmanager
-def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
-    """
-    A context manager to temporarily change the wired limit.
-
-    Note, the wired limit should not be changed during an async eval.  If an
-    async eval could be running pass in the streams to synchronize with prior
-    to exiting the context manager.
-    """
-    if not mx.metal.is_available():
-        yield
-        return
-
-    model_bytes = tree_reduce(
-        lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
-    )
-    max_rec_size = mx.device_info()["max_recommended_working_set_size"]
-    if model_bytes > 0.9 * max_rec_size:
-        model_mb = model_bytes // 2**20
-        max_rec_mb = max_rec_size // 2**20
-        print(
-            f"[WARNING] Generating with a model that requires {model_mb} MB "
-            f"which is close to the maximum recommended size of {max_rec_mb} "
-            "MB. This can be slow. See the documentation for possible work-arounds: "
-            "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
-        )
-    old_limit = mx.set_wired_limit(max_rec_size)
-    try:
-        yield
-    finally:
-        if streams is not None:
-            for s in streams:
-                mx.synchronize(s)
-        else:
-            mx.synchronize()
-        mx.set_wired_limit(old_limit)
-
-
-@dataclass
-class GenerationResult:
-    text: str = ""
-    token: Optional[int] = None
-    logprobs: Optional[List[float]] = None
-    prompt_tokens: int = 0
-    generation_tokens: int = 0
-    total_tokens: int = 0
-    prompt_tps: float = 0.0
-    generation_tps: float = 0.0
-    peak_memory: float = 0.0
-    cached_tokens: int = 0
-    # Populated only on the terminal chunk yielded by ``stream_generate``:
-    # ``"stop"`` for eos/stop-sequence, ``"length"`` for max_tokens.
-    finish_reason: Optional[str] = None
-
-
-class PromptCacheState:
-    """Holds KV cache and token history across conversation turns.
-
-    Pass this to stream_generate via the ``prompt_cache_state`` kwarg to
-    reuse the KV cache from previous turns.  Only the new tokens (after
-    the common prefix) are processed, avoiding redundant prefill.
-    """
-
-    def __init__(self):
-        self.cache: Optional[List[Any]] = None
-        self.token_ids: Optional[List[int]] = None
-
-    def find_prefix_length(self, new_ids: list) -> int:
-        """Return the number of leading tokens that match the cached ids."""
-        if self.token_ids is None:
-            return 0
-        max_len = min(len(self.token_ids), len(new_ids))
-        for i in range(max_len):
-            if self.token_ids[i] != new_ids[i]:
-                return i
-        return max_len
-
-    def update(self, token_ids: list, kv_cache: list):
-        """Store the full token sequence and corresponding KV cache."""
-        self.token_ids = list(token_ids)
-        self.cache = kv_cache
-
-
-from .common import GenerationResult, generation_stream, wired_limit
 from .diffusion import (
     DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD,
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
@@ -694,6 +632,45 @@ def _prime_cached_prefix_rope_state(
     return True
 
 
+def _cache_fully_retained(c: Any) -> bool:
+    """Whether ``c`` still holds its whole sequence from position 0.
+
+    Only such a cache can be rolled back to an earlier prefix. Note this is not
+    ``is_trimmable()``: ``BufferedRotatingKVCache`` reports itself trimmable even
+    after it has evicted early tokens, and trimming it then would only clamp to
+    its retained window and desync ``offset`` from the flat layers.
+    """
+    children = getattr(c, "caches", None)
+    if children is not None:  # CacheList
+        return all(_cache_fully_retained(x) for x in children)
+    start_position = getattr(c, "start_position", None)
+    if start_position is not None:  # Buffered/Chunked: evicts by advancing start
+        return int(start_position) == 0
+    max_size = getattr(c, "max_size", None)
+    if max_size is not None:  # RotatingKVCache: reusable until the window wraps
+        return int(getattr(c, "offset", 0) or 0) <= int(max_size)
+    return True  # KVCache / QuantizedKVCache retain the whole sequence
+
+
+def _prefix_cache_trim_amount(kv_cache: List[Any], prefix_len: int) -> Optional[int]:
+    """Trailing tokens to drop so ``kv_cache`` keeps only its first ``prefix_len``.
+
+    The old reuse path sliced key/value arrays directly --
+    ``keys[..., :prefix_len, :]`` -- which is only valid for a flat cache. On a
+    rotating (sliding-window) cache it slices a ring buffer by a logical length,
+    taking an arbitrary rotation of the window and leaving the ring index stale:
+    silent output corruption, or a broadcast crash once speculative decoding wraps
+    the cache in ``BufferedRotatingKVCache``. Returns the number of tokens to drop
+    (``0`` when the whole cache is reusable), or ``None`` when an entry has already
+    evicted part of the prefix and the caller must cold-prefill instead.
+    """
+    cached_len = max((int(getattr(c, "offset", 0) or 0) for c in kv_cache), default=0)
+    n_drop = max(0, cached_len - prefix_len)
+    if n_drop and not all(_cache_fully_retained(c) for c in kv_cache):
+        return None
+    return n_drop
+
+
 from .ar import generate_step
 
 
@@ -727,6 +704,12 @@ def stream_generate(
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     verbose = kwargs.pop("verbose", False)
+    # Preserve only explicitly supplied sequence tensors as semantic APC
+    # inputs. Tensors produced by prepare_inputs span the complete prompt and
+    # therefore change whenever text is appended, even when the old token
+    # prefix is identical.
+    custom_inputs_embeds = kwargs.get("inputs_embeds")
+    custom_mask = kwargs.get("mask")
 
     # Set up thinking budget criteria if requested
     thinking_budget = kwargs.pop("thinking_budget", None)
@@ -744,11 +727,7 @@ def stream_generate(
         else []
     )
 
-    add_special_tokens = (
-        getattr(processor, "chat_template", None) is None
-        if model.config.model_type in ["gemma3", "gemma3n", "gemma4", "gemma4_unified"]
-        else True
-    )
+    add_special_tokens = should_add_special_tokens(model.config.model_type, processor)
 
     resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
     image_token_index = getattr(model.config, "image_token_index", None)
@@ -855,8 +834,8 @@ def stream_generate(
             media={
                 "audio": audio_features if audio_features is not None else audio,
                 "video": video_features if video_features is not None else video,
-                "embeddings": kwargs.get("inputs_embeds"),
-                "masks": mask,
+                "embeddings": custom_inputs_embeds,
+                "masks": custom_mask,
             },
             model=model,
             processor=processor,
@@ -864,27 +843,26 @@ def stream_generate(
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
-        if prefix_len > 0 and prefix_len < input_ids.shape[1]:
-            if _apc_suffix_is_text_only(prefix_len) and _prime_cached_prefix_rope_state(
-                model, input_ids, mask, kwargs
-            ):
-                reused_prefix_len = prefix_len
-                # Trim to only new tokens
-                input_ids = input_ids[:, prefix_len:]
-                pixel_values = None
-                kwargs.pop("cached_image_features", None)
-                # Reuse the saved KV cache (trimmed to prefix length)
-                kv_cache = prompt_cache_state.cache
-                # Trim cache to prefix_len in case it includes generated tokens
-                for c in kv_cache:
-                    if hasattr(c, "keys") and c.keys is not None:
-                        cached_len = c.keys.shape[2]
-                        if cached_len > prefix_len:
-                            c.keys = c.keys[:, :, :prefix_len, :]
-                            c.values = c.values[:, :, :prefix_len, :]
-                            if hasattr(c, "offset"):
-                                c.offset = prefix_len
-                kwargs["prompt_cache"] = kv_cache
+        kv_cache = prompt_cache_state.cache
+        # None => a cache can't be trimmed back to the shared prefix (wrapped
+        # rotating window); reusing it would corrupt state, so cold-prefill instead.
+        n_drop = _prefix_cache_trim_amount(kv_cache, prefix_len)
+        if (
+            0 < prefix_len < input_ids.shape[1]
+            and n_drop is not None
+            and _apc_suffix_is_text_only(prefix_len)
+            and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
+        ):
+            # Drop cached tokens past the shared prefix via each cache's own trim().
+            for c in kv_cache:
+                if n_drop:
+                    c.trim(n_drop)
+            reused_prefix_len = prefix_len
+            # Trim to only new tokens
+            input_ids = input_ids[:, prefix_len:]
+            pixel_values = None
+            kwargs.pop("cached_image_features", None)
+            kwargs["prompt_cache"] = kv_cache
 
     # APC: cross-request, hash-based prefix lookup. Only consulted if a per-turn
     # PromptCacheState didn't already produce a hit.
@@ -912,15 +890,17 @@ def stream_generate(
                     kwargs["prompt_cache"] = warm_cache
                 else:
                     apc_blocks_in_use = matched_blocks
-                    _kv_bits = kwargs.get("kv_bits")
+                    _quant_policy = kv_quant_from_legacy(
+                        kwargs.get("kv_bits"),
+                        kwargs.get("kv_quant_scheme"),
+                        kwargs.get("kv_group_size", 64),
+                        kwargs.get("kv_key_bits"),
+                        kwargs.get("kv_value_bits"),
+                        kwargs.get("kv_key_scheme"),
+                        kwargs.get("kv_value_scheme"),
+                    )
                     _quant_cfg = (
-                        {
-                            "bits": _kv_bits,
-                            "group_size": kwargs.get("kv_group_size", 64),
-                            "scheme": kwargs.get("kv_quant_scheme"),
-                        }
-                        if _kv_bits is not None
-                        else None
+                        _quant_policy.to_config() if _quant_policy is not None else None
                     )
                     kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
                         matched_blocks,
@@ -1236,6 +1216,9 @@ def main():
     if getattr(args, "output_modality", "text") == "image":
         run_image_generation_cli(args)
         return
+    if getattr(args, "output_modality", "text") == "video":
+        run_video_generation_cli(args)
+        return
 
     if getattr(args, "seed", None) is not None:
         mx.random.seed(args.seed)
@@ -1309,6 +1292,62 @@ def main():
             prompt if isinstance(prompt, list) else [prompt]
         )
 
+    # Processors without native video support used to drop --video silently:
+    # the frames were loaded, the processor ignored the kwarg, and the model
+    # hallucinated an answer with no visual input at all. Fall back to sending
+    # sampled frames as ordered images (see generate/video.py).
+    gen_kwargs_extra = {}
+    video_prompt = None
+    if args.video:
+        from .video import (
+            pair_adjacent_frames,
+            processor_handles_video,
+            sample_video_frames,
+            subsample_evenly,
+            timestamped_frame_messages,
+        )
+
+        if not processor_handles_video(processor):
+            frames, frame_fps = sample_video_frames(args.video, args.fps or 2.0)
+            sampled = len(frames)
+            max_frames = max(2, getattr(args, "video_max_frames", 16) or 16)
+            pair_hook = getattr(model, "prepare_video_frame_pairs", None)
+            if pair_hook is not None:
+                anchors, first_frames, second_frames = pair_adjacent_frames(
+                    frames, max_frames
+                )
+                gen_kwargs_extra.update(pair_hook(processor, second_frames))
+                still_count = len(args.image or [])
+                args.image = (args.image or []) + first_frames
+                user_text = (
+                    " ".join(args.prompt)
+                    if isinstance(args.prompt, list)
+                    else str(args.prompt)
+                )
+                msgs = timestamped_frame_messages(
+                    user_text,
+                    args.system,
+                    still_count,
+                    [a / max(frame_fps, 1e-6) for a in anchors],
+                )
+                _tok = (
+                    processor.tokenizer
+                    if hasattr(processor, "tokenizer")
+                    else processor
+                )
+                video_prompt = _tok.apply_chat_template(
+                    msgs, add_generation_prompt=True, tokenize=False
+                )
+            else:
+                frames = subsample_evenly(frames, max_frames)
+                print(
+                    f"{processor.__class__.__name__} has no native video "
+                    f"support; sending {len(frames)} of {sampled} sampled "
+                    f"frames as ordered images."
+                )
+                args.image = (args.image or []) + frames
+            args.video = None
+
     num_images = len(args.image) if args.image is not None else 0
     num_audios = len(args.audio) if args.audio is not None else 0
 
@@ -1319,14 +1358,17 @@ def main():
         chat_template_kwargs["video"] = args.video
         chat_template_kwargs["fps"] = args.fps
 
-    prompt = apply_chat_template(
-        processor,
-        config,
-        prompt,
-        num_images=num_images,
-        num_audios=num_audios,
-        **chat_template_kwargs,
-    )
+    if video_prompt is not None:
+        prompt = video_prompt
+    else:
+        prompt = apply_chat_template(
+            processor,
+            config,
+            prompt,
+            num_images=num_images,
+            num_audios=num_audios,
+            **chat_template_kwargs,
+        )
 
     kwargs = {}
 
@@ -1419,6 +1461,7 @@ def main():
 
     else:
         gen_kwargs = {
+            **gen_kwargs_extra,
             "image": args.image,
             "audio": args.audio,
             "video": args.video,
@@ -1434,6 +1477,10 @@ def main():
             "verbose": args.verbose,
             "max_kv_size": args.max_kv_size,
             "kv_bits": args.kv_bits,
+            "kv_key_bits": getattr(args, "kv_key_bits", None),
+            "kv_value_bits": getattr(args, "kv_value_bits", None),
+            "kv_key_scheme": getattr(args, "kv_key_scheme", None),
+            "kv_value_scheme": getattr(args, "kv_value_scheme", None),
             "kv_group_size": args.kv_group_size,
             "kv_quant_scheme": getattr(
                 args, "kv_quant_scheme", DEFAULT_KV_QUANT_SCHEME

@@ -10,6 +10,8 @@ from .common import (
     _speculative_walk,
     _speculative_walk_batch,
     _speculative_walk_batch_uniform_acceptance,
+    speculative_stats_since,
+    speculative_stats_snapshot,
 )
 from .dflash import (
     _dflash_committed_hidden_segments,
@@ -61,6 +63,8 @@ __all__ = [
     "run_speculative_server_rounds",
     "speculative_hidden_state",
     "speculative_prefill_kwargs",
+    "speculative_stats_since",
+    "speculative_stats_snapshot",
 ]
 
 
@@ -110,7 +114,7 @@ def make_speculative_prompt_cache(
     left_padding,
     make_cache: Callable,
 ):
-    if draft_kind == "mtp" and batch_size == 1:
+    if batch_size == 1:
         return cache.make_prompt_cache(lm)
     return make_cache(lm, left_padding)
 
@@ -193,6 +197,23 @@ def run_speculative_server_rounds(
         return
 
     if draft_kind == "dflash":
+        if batch_size == 1:
+            for tok, state in _dflash_rounds(
+                model,
+                draft_model,
+                prompt_cache,
+                hidden,
+                first_bonus=int(first_bonus.reshape(-1).item()),
+                max_tokens=max_tokens,
+                sampler=sampler,
+                draft_block_size=draft_block_size,
+                token_dtype=token_dtype,
+            ):
+                yield [tok], state
+                if stop_check is not None and stop_check(0, tok):
+                    return
+            return
+
         yield from _dflash_rounds_batch(
             model,
             draft_model,

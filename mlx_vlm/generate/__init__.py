@@ -39,6 +39,20 @@ from .image import (
     load_image_model,
 )
 from .types import GenerateKwargs, ProcessorLike
+from .video_generation import (
+    VideoGenerationModel,
+    VideoGenerationRequest,
+    VideoGenerationResult,
+    VideoProgressCallback,
+    VideoReference,
+    VideoReferenceKind,
+    VideoWorkflow,
+    generate_video,
+    is_video_generation_model,
+    load_video_generation_model,
+    save_video,
+    video_generation_model_class,
+)
 
 __all__ = [
     "BatchGenerator",
@@ -55,11 +69,19 @@ __all__ = [
     "PromptCacheState",
     "PromptProcessingBatch",
     "ProcessorLike",
+    "VideoGenerationModel",
+    "VideoGenerationRequest",
+    "VideoGenerationResult",
+    "VideoProgressCallback",
+    "VideoReference",
+    "VideoReferenceKind",
+    "VideoWorkflow",
     "batch_generate",
     "edit_image",
     "generate",
     "generate_image",
     "generate_step",
+    "generate_video",
     "generation_stream",
     "image_edit_model_class",
     "image_generation_model_class",
@@ -67,13 +89,17 @@ __all__ = [
     "image_to_png_bytes",
     "is_image_edit_model",
     "is_image_generation_model",
+    "is_video_generation_model",
     "load_image_edit_model",
     "load_image_generation_model",
     "load_image_model",
+    "load_video_generation_model",
     "main",
     "maybe_quantize_kv_cache",
     "parse_arguments",
+    "save_video",
     "stream_generate",
+    "video_generation_model_class",
     "wired_limit",
 ]
 
@@ -81,7 +107,7 @@ __all__ = [
 def __getattr__(name):
     import importlib
 
-    from . import ar, dispatch, image
+    from . import ar, dispatch, image, video_generation
 
     edit_image_module = importlib.import_module("mlx_vlm.generate.edit_image")
 
@@ -91,13 +117,15 @@ def __getattr__(name):
         return getattr(edit_image_module, name)
     if hasattr(image, name):
         return getattr(image, name)
+    if hasattr(video_generation, name):
+        return getattr(video_generation, name)
     return getattr(ar, name)
 
 
 def __dir__():
     import importlib
 
-    from . import ar, dispatch, image
+    from . import ar, dispatch, image, video_generation
 
     edit_image_module = importlib.import_module("mlx_vlm.generate.edit_image")
 
@@ -107,4 +135,5 @@ def __dir__():
         | set(dir(dispatch))
         | set(dir(edit_image_module))
         | set(dir(image))
+        | set(dir(video_generation))
     )

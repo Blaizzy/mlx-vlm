@@ -407,7 +407,24 @@ def convert(
                 shutil.rmtree(dest)
             shutil.copytree(item, dest)
 
-    processor.save_pretrained(mlx_path)
+    # Not every remote-code processor inherits ProcessorMixin — Mage-VL's `MageVLProcessor`
+    # deliberately does not ("We deliberately do NOT inherit transformers.ProcessorMixin"), so it
+    # has no save_pretrained. The weights are already written by this point; losing the whole
+    # conversion to the sidecar-copy step would be absurd. Fall back to copying the processor
+    # files verbatim, which is what save_pretrained would have produced anyway.
+    if hasattr(processor, "save_pretrained"):
+        processor.save_pretrained(mlx_path)
+    else:
+        # NOTE: no local `import shutil` here — convert.py already imports it at module scope,
+        # and a function-local import would make the name local for the WHOLE function, unbinding
+        # the earlier uses. That failure reads as "cannot access local variable 'shutil'".
+        src = Path(hf_path)
+        if src.is_dir():
+            for pattern in ("*.json", "*.txt", "*.jinja", "*.model"):
+                for f in src.glob(pattern):
+                    if f.name not in ("config.json", "model.safetensors.index.json"):
+                        shutil.copy2(f, Path(mlx_path) / f.name)
+        print("[INFO] processor lacks save_pretrained; copied processor files verbatim")
 
     save_config(config, config_path=mlx_path / "config.json")
 
