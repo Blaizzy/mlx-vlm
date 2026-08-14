@@ -1361,3 +1361,94 @@ def test_composite_assembly_rejects_an_index_past_the_template():
 
     assert apc_module.make_warm_composite_cache(stored, _mixed_template()) is None
     manager.release(stored)
+
+
+def _exact_index_is_consistent(manager):
+    from collections import Counter
+
+    expected = Counter(len(e.token_ids) for e in manager._exact_cache.values())
+    return manager._exact_lengths == sorted(
+        expected
+    ) and manager._exact_length_counts == dict(expected)
+
+
+def _store_snapshot(manager, tokens):
+    from mlx_vlm.models.cache import KVCache
+
+    tokens = list(tokens)
+    entry = KVCache()
+    entry.keys = mx.zeros((1, 2, len(tokens), 8))
+    entry.values = mx.zeros((1, 2, len(tokens), 8))
+    entry.offset = len(tokens)
+    return manager.store_exact_cache(tokens, [entry])
+
+
+def test_exact_length_index_tracks_eviction():
+    manager = APCManager(num_blocks=64, block_size=16)
+    manager._exact_cache_max = 3
+    manager.exact_cache_min_tokens = 1
+
+    for length in (32, 64, 96, 128, 160):
+        _store_snapshot(manager, range(length))
+
+    assert len(manager._exact_cache) == 3
+    assert _exact_index_is_consistent(manager)
+    assert manager._exact_lengths == [96, 128, 160]
+
+
+def test_exact_length_index_does_not_double_count_a_rewrite():
+    manager = APCManager(num_blocks=64, block_size=16)
+    manager._exact_cache_max = 4
+    manager.exact_cache_min_tokens = 1
+    tokens = list(range(48))
+
+    _store_snapshot(manager, tokens)
+    _store_snapshot(manager, tokens)
+
+    assert len(manager._exact_cache) == 1
+    assert manager._exact_lengths == [48]
+    assert _exact_index_is_consistent(manager)
+
+
+def test_exact_length_index_keeps_duplicate_lengths_until_all_are_gone():
+    manager = APCManager(num_blocks=64, block_size=16)
+    manager._exact_cache_max = 4
+    manager.exact_cache_min_tokens = 1
+
+    _store_snapshot(manager, range(32))
+    _store_snapshot(manager, range(1000, 1032))
+
+    assert manager._exact_lengths == [32]
+    assert manager._exact_length_counts == {32: 2}
+
+    manager._exact_cache_max = 1
+    _store_snapshot(manager, range(2000, 2032))
+
+    assert _exact_index_is_consistent(manager)
+
+
+def test_clear_empties_the_exact_length_index():
+    manager = APCManager(num_blocks=64, block_size=16)
+    manager.exact_cache_min_tokens = 1
+    _store_snapshot(manager, range(64))
+
+    manager.clear()
+
+    assert manager._exact_lengths == []
+    assert manager._exact_length_counts == {}
+
+
+def test_longest_prefix_still_wins_after_eviction():
+    manager = APCManager(num_blocks=64, block_size=16)
+    manager._exact_cache_max = 2
+    manager.exact_cache_min_tokens = 1
+    tokens = list(range(256))
+
+    _store_snapshot(manager, tokens[:64])
+    _store_snapshot(manager, tokens[:128])
+    _store_snapshot(manager, tokens[:192])
+
+    cache, prefix_len = manager.lookup_exact_cache(tokens)
+
+    assert cache is not None
+    assert prefix_len == 192

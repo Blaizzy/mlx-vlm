@@ -40,6 +40,7 @@ FlashInfer/FA3), not a different cache design.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import logging
@@ -376,14 +377,21 @@ def partition_cache_by_pageability(
     return pageable, checkpointed
 
 
-def _sequence_hash(token_ids: Sequence[int], extra_hash: int, block_size: int) -> int:
+def _sequence_hash_array(tokens: np.ndarray, extra_hash: int, block_size: int) -> int:
     h = hashlib.sha256()
     h.update(int(extra_hash & ((1 << 64) - 1)).to_bytes(8, "little"))
     h.update(int(block_size).to_bytes(4, "little", signed=False))
-    arr = np.asarray([int(t) for t in token_ids], dtype=np.int32)
-    h.update(int(arr.size).to_bytes(8, "little", signed=False))
-    h.update(arr.tobytes())
+    h.update(int(tokens.size).to_bytes(8, "little", signed=False))
+    h.update(tokens.tobytes())
     return int.from_bytes(h.digest()[:8], "little", signed=True)
+
+
+def _sequence_hash(token_ids: Sequence[int], extra_hash: int, block_size: int) -> int:
+    return _sequence_hash_array(
+        np.asarray([int(t) for t in token_ids], dtype=np.int32),
+        extra_hash,
+        block_size,
+    )
 
 
 def hash_image_payload(
@@ -2882,6 +2890,8 @@ class APCManager:
             self._free_push(b)
         self.hash_table: dict[int, APCBlock] = {}
         self._exact_cache: "OrderedDict[int, APCExactCacheEntry]" = OrderedDict()
+        self._exact_lengths: List[int] = []
+        self._exact_length_counts: Dict[int, int] = {}
         self.stats = APCStats()
         self.lock = threading.RLock()
         self.disk = disk
@@ -3001,6 +3011,37 @@ class APCManager:
             return self._resident_bytes_locked()
 
     # ---------- Public API ----------
+    def _exact_length_add(self, length: int) -> None:
+        count = self._exact_length_counts.get(length, 0)
+        self._exact_length_counts[length] = count + 1
+        if count == 0:
+            bisect.insort(self._exact_lengths, length)
+
+    def _exact_length_drop(self, length: int) -> None:
+        count = self._exact_length_counts.get(length, 0)
+        if count > 1:
+            self._exact_length_counts[length] = count - 1
+            return
+        self._exact_length_counts.pop(length, None)
+        position = bisect.bisect_left(self._exact_lengths, length)
+        if (
+            position < len(self._exact_lengths)
+            and self._exact_lengths[position] == length
+        ):
+            del self._exact_lengths[position]
+
+    def _insert_exact_entry(self, key: int, entry: APCExactCacheEntry) -> None:
+        """Store a snapshot, keeping the length index and LRU bound in step."""
+        previous = self._exact_cache.get(key)
+        if previous is not None:
+            self._exact_length_drop(len(previous.token_ids))
+        self._exact_cache[key] = entry
+        self._exact_cache.move_to_end(key)
+        self._exact_length_add(len(entry.token_ids))
+        while len(self._exact_cache) > self._exact_cache_max:
+            _, evicted = self._exact_cache.popitem(last=False)
+            self._exact_length_drop(len(evicted.token_ids))
+
     def lookup_exact_cache(
         self,
         token_ids: Sequence[int],
@@ -3030,17 +3071,13 @@ class APCManager:
             best_key: Optional[int] = None
             best_entry: Optional[APCExactCacheEntry] = None
             if self._exact_cache_max > 0:
-                candidate_lens = sorted(
-                    {
-                        len(entry.token_ids)
-                        for entry in self._exact_cache.values()
-                        if min_prefix_tokens < len(entry.token_ids) <= max_len
-                    },
-                    reverse=True,
-                )
-                for candidate_len in candidate_lens:
-                    key = _sequence_hash(
-                        token_tuple[:candidate_len], extra_hash, self.block_size
+                upper = bisect.bisect_right(self._exact_lengths, max_len)
+                lower = bisect.bisect_right(self._exact_lengths, min_prefix_tokens)
+                token_array = np.asarray(token_tuple, dtype=np.int32)
+                for position in range(upper - 1, lower - 1, -1):
+                    candidate_len = self._exact_lengths[position]
+                    key = _sequence_hash_array(
+                        token_array[:candidate_len], extra_hash, self.block_size
                     )
                     entry = self._exact_cache.get(key)
                     if entry is None or entry.extra_hash != extra_hash:
@@ -3110,20 +3147,15 @@ class APCManager:
                                     self.stats.hits += 1
                                     self.stats.matched_tokens += disk_prefix_len
                                     if promote_key not in self._exact_cache:
-                                        self._exact_cache[promote_key] = (
+                                        self._insert_exact_entry(
+                                            promote_key,
                                             APCExactCacheEntry(
                                                 token_ids=stored_tokens,
                                                 extra_hash=int(extra_hash),
                                                 prompt_cache=storage_copy,
                                                 last_used=time.time(),
-                                            )
+                                            ),
                                         )
-                                        self._exact_cache.move_to_end(promote_key)
-                                        while (
-                                            len(self._exact_cache)
-                                            > self._exact_cache_max
-                                        ):
-                                            self._exact_cache.popitem(last=False)
                                 return prompt_cache, disk_prefix_len
                         with self.lock:
                             self.stats.exact_hits += 1
@@ -3177,15 +3209,15 @@ class APCManager:
         stored = False
         with self.lock:
             if self._exact_cache_max > 0:
-                self._exact_cache[key] = APCExactCacheEntry(
-                    token_ids=token_tuple,
-                    extra_hash=int(extra_hash),
-                    prompt_cache=copied,
-                    last_used=time.time(),
+                self._insert_exact_entry(
+                    key,
+                    APCExactCacheEntry(
+                        token_ids=token_tuple,
+                        extra_hash=int(extra_hash),
+                        prompt_cache=copied,
+                        last_used=time.time(),
+                    ),
                 )
-                self._exact_cache.move_to_end(key)
-                while len(self._exact_cache) > self._exact_cache_max:
-                    self._exact_cache.popitem(last=False)
                 stored = True
         if stored:
             apc_trace(
@@ -3384,15 +3416,15 @@ class APCManager:
                 )
                 if copied is not None:
                     key = _sequence_hash(token_tuple, extra_hash, self.block_size)
-                    self._exact_cache[key] = APCExactCacheEntry(
-                        token_ids=token_tuple,
-                        extra_hash=int(extra_hash),
-                        prompt_cache=copied,
-                        last_used=time.time(),
+                    self._insert_exact_entry(
+                        key,
+                        APCExactCacheEntry(
+                            token_ids=token_tuple,
+                            extra_hash=int(extra_hash),
+                            prompt_cache=copied,
+                            last_used=time.time(),
+                        ),
                     )
-                    self._exact_cache.move_to_end(key)
-                    while len(self._exact_cache) > self._exact_cache_max:
-                        self._exact_cache.popitem(last=False)
                     self.stats.exact_stores += 1
                     layer_major_stored = True
             parent = SEED_PARENT_HASH
@@ -3530,6 +3562,8 @@ class APCManager:
             for b in self.pool:
                 self._free_push(b)
             self._exact_cache.clear()
+            self._exact_lengths.clear()
+            self._exact_length_counts.clear()
             self.stats = APCStats()
 
     def close(self) -> None:
