@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -23,7 +24,9 @@ import mlx_vlm.server as server
 import mlx_vlm.server.cli as server_cli
 import mlx_vlm.server.generation as server_generation
 import mlx_vlm.server.openai as server_openai
+import mlx_vlm.server.reranking as server_reranking
 import mlx_vlm.speculative.utils as speculative_utils
+import mlx_vlm.utils as vlm_utils
 from mlx_vlm import apc as apc_module
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
@@ -6375,6 +6378,7 @@ class TestResponseGenerator:
             "MLX_VLM_PRELOAD_IMAGE_MODEL",
             "MLX_VLM_PRELOAD_TTS_MODEL",
             "MLX_VLM_PRELOAD_STT_MODEL",
+            "MLX_VLM_PRELOAD_RERANKER_MODEL",
             "MLX_VLM_VISION_CACHE_SIZE",
             "MLX_VLM_MAX_TOKENS",
             "MLX_VLM_THINKING_BUDGET",
@@ -6404,6 +6408,8 @@ class TestResponseGenerator:
                 "tts-demo",
                 "--stt-model",
                 "stt-demo",
+                "--reranker-model",
+                "reranker-demo",
                 "--enable-thinking",
                 "--thinking-budget",
                 "128",
@@ -6433,6 +6439,7 @@ class TestResponseGenerator:
             assert os.environ["MLX_VLM_PRELOAD_IMAGE_MODEL"] == "image-demo"
             assert os.environ["MLX_VLM_PRELOAD_TTS_MODEL"] == "tts-demo"
             assert os.environ["MLX_VLM_PRELOAD_STT_MODEL"] == "stt-demo"
+            assert os.environ["MLX_VLM_PRELOAD_RERANKER_MODEL"] == "reranker-demo"
             assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
             assert run_calls[0][1]["host"] == "127.0.0.1"
         finally:
@@ -6443,6 +6450,7 @@ class TestResponseGenerator:
                 "MLX_VLM_PRELOAD_IMAGE_MODEL",
                 "MLX_VLM_PRELOAD_TTS_MODEL",
                 "MLX_VLM_PRELOAD_STT_MODEL",
+                "MLX_VLM_PRELOAD_RERANKER_MODEL",
                 "MLX_VLM_VISION_CACHE_SIZE",
                 "MLX_VLM_MAX_TOKENS",
                 "MLX_VLM_THINKING_BUDGET",
@@ -6459,6 +6467,7 @@ class TestResponseGenerator:
             "MLX_VLM_PRELOAD_IMAGE_MODEL": "image-demo",
             "MLX_VLM_PRELOAD_TTS_MODEL": "tts-demo",
             "MLX_VLM_PRELOAD_STT_MODEL": "stt-demo",
+            "MLX_VLM_PRELOAD_RERANKER_MODEL": "reranker-demo",
         }
         for key, value in preload_env.items():
             monkeypatch.setenv(key, value)
@@ -6484,6 +6493,7 @@ class TestResponseGenerator:
             ("image-demo", None, "image_generation"),
             ("tts-demo", None, "audio_tts"),
             ("stt-demo", None, "audio_stt"),
+            ("reranker-demo", None, "reranker"),
         ]
         for key in preload_env:
             assert key not in os.environ
@@ -6494,6 +6504,7 @@ class TestResponseGenerator:
             "MLX_VLM_PRELOAD_TTS_MODEL": "tts-demo",
             "MLX_VLM_PRELOAD_STT_MODEL": "stt-demo",
             "MLX_VLM_PRELOAD_EMBEDDING_MODEL": "embed-demo",
+            "MLX_VLM_PRELOAD_RERANKER_MODEL": "reranker-demo",
         }
         for key, value in preload_env.items():
             monkeypatch.setenv(key, value)
@@ -6519,7 +6530,13 @@ class TestResponseGenerator:
 
         asyncio.run(run_lifespan())
 
-        assert calls == ["text_generation", "audio_tts", "audio_stt", "embedding"]
+        assert calls == [
+            "text_generation",
+            "audio_tts",
+            "audio_stt",
+            "embedding",
+            "reranker",
+        ]
         failure = server.runtime.preload_failures["audio_stt"]
         assert failure["model"] == "stt-demo"
         assert "Failed to load audio model" in failure["error"]
@@ -7395,3 +7412,334 @@ def test_runtime_config_enum_knobs_reject_invalid():
     applied, rejected = cfg.apply_changes({"kv_quant_scheme": "turboquant"})
     assert applied == {"kv_quant_scheme": "turboquant"}
     assert rejected == []
+
+
+class TestReranking:
+    def test_requires_model(self, client, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_PRELOAD_RERANKER_MODEL", raising=False)
+
+        response = client.post("/v1/rerank", json={"query": "q", "documents": ["d"]})
+
+        assert response.status_code == 400
+        assert "No reranker model specified" in response.json()["detail"]
+
+    def test_sorts_limits_and_returns_documents(self, client, monkeypatch):
+        cache_calls = []
+
+        def fake_get_cached_model(model, *, model_kind):
+            cache_calls.append((model, model_kind))
+            return object(), object(), SimpleNamespace(model_type="qwen3")
+
+        monkeypatch.setattr(server, "get_cached_model", fake_get_cached_model)
+        monkeypatch.setattr(
+            server_reranking,
+            "score_documents",
+            lambda *args: ([0.2, 0.9, 0.5], 12),
+        )
+
+        response = client.post(
+            "/v1/rerank",
+            json={
+                "model": "reranker",
+                "query": "query",
+                "documents": ["first", "second", "third"],
+                "top_n": 2,
+                "return_documents": True,
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "model": "reranker",
+            "results": [
+                {"index": 1, "relevance_score": 0.9, "document": "second"},
+                {"index": 2, "relevance_score": 0.5, "document": "third"},
+            ],
+            "usage": {"prompt_tokens": 12, "total_tokens": 12},
+        }
+        assert cache_calls == [("reranker", "reranker")]
+
+    def test_preserves_input_order_for_equal_scores(self, client, monkeypatch):
+        monkeypatch.setattr(
+            server,
+            "get_cached_model",
+            lambda *args, **kwargs: (
+                object(),
+                object(),
+                SimpleNamespace(model_type="qwen3"),
+            ),
+        )
+        monkeypatch.setattr(
+            server_reranking,
+            "score_documents",
+            lambda *args: ([0.5, 0.5, 0.5], 3),
+        )
+
+        response = client.post(
+            "/v1/rerank",
+            json={
+                "model": "reranker",
+                "query": "query",
+                "documents": ["a", "b", "c"],
+            },
+        )
+
+        assert [result["index"] for result in response.json()["results"]] == [0, 1, 2]
+
+    def test_uses_preloaded_model(self, client, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_PRELOAD_RERANKER_MODEL", "preloaded")
+        seen = []
+
+        def fake_get_cached_model(model, *, model_kind):
+            seen.append((model, model_kind))
+            return object(), object(), SimpleNamespace(model_type="qwen3")
+
+        monkeypatch.setattr(server, "get_cached_model", fake_get_cached_model)
+        monkeypatch.setattr(
+            server_reranking, "score_documents", lambda *args: ([0.7], 4)
+        )
+
+        response = client.post(
+            "/v1/rerank", json={"query": "query", "documents": ["document"]}
+        )
+
+        assert response.status_code == 200
+        assert response.json()["model"] == "preloaded"
+        assert seen == [("preloaded", "reranker")]
+
+    def test_uses_cached_preload_after_environment_is_consumed(
+        self, client, monkeypatch
+    ):
+        monkeypatch.delenv("MLX_VLM_PRELOAD_RERANKER_MODEL", raising=False)
+        registry = server.ModelCacheRegistry()
+        registry.set("reranker", {"model_path": "preloaded"})
+        monkeypatch.setattr(server.runtime, "model_cache", registry)
+        monkeypatch.setattr(
+            server,
+            "get_cached_model",
+            lambda *args, **kwargs: (
+                object(),
+                object(),
+                SimpleNamespace(model_type="qwen3"),
+            ),
+        )
+        monkeypatch.setattr(
+            server_reranking, "score_documents", lambda *args: ([0.7], 4)
+        )
+
+        response = client.post(
+            "/v1/rerank", json={"query": "query", "documents": ["document"]}
+        )
+
+        assert response.status_code == 200
+        assert response.json()["model"] == "preloaded"
+
+    def test_uses_server_authentication(self, client, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret")
+        monkeypatch.setattr(
+            server,
+            "get_cached_model",
+            lambda *args, **kwargs: (
+                object(),
+                object(),
+                SimpleNamespace(model_type="qwen3"),
+            ),
+        )
+        monkeypatch.setattr(
+            server_reranking, "score_documents", lambda *args: ([0.5], 1)
+        )
+        payload = {"model": "reranker", "query": "q", "documents": ["d"]}
+
+        assert client.post("/v1/rerank", json=payload).status_code == 401
+        response = client.post(
+            "/v1/rerank",
+            json=payload,
+            headers={"Authorization": "Bearer secret"},
+        )
+
+        assert response.status_code == 200
+
+    @pytest.mark.parametrize(
+        "value,label,expected",
+        [
+            ("  text  ", "query", server_reranking.RerankItem(text="text")),
+            (
+                {"text": " text "},
+                "query",
+                server_reranking.RerankItem(text="text"),
+            ),
+            (
+                {"image_url": {"url": " image.png "}},
+                "documents[0]",
+                server_reranking.RerankItem(image="image.png"),
+            ),
+            (
+                {"video": " video.mp4 "},
+                "documents[0]",
+                server_reranking.RerankItem(video="video.mp4"),
+            ),
+        ],
+    )
+    def test_normalizes_items(self, value, label, expected):
+        assert server_reranking.normalize_item(value, label) == expected
+
+    @pytest.mark.parametrize("value", ["", "   ", {}, {"text": " "}, {"image": {}}])
+    def test_rejects_empty_items(self, value):
+        with pytest.raises(ValueError):
+            server_reranking.normalize_item(value, "query")
+
+    def test_text_model_rejects_media(self):
+        with pytest.raises(ValueError, match="do not support image or video"):
+            server_reranking.score_documents(
+                object(),
+                object(),
+                SimpleNamespace(model_type="qwen3"),
+                server_reranking.RerankItem(image="image.png"),
+                [server_reranking.RerankItem(text="document")],
+                "instruction",
+            )
+
+    def test_vl_messages_preserve_content_order(self):
+        messages = server_reranking._vl_messages(
+            server_reranking.RerankItem(text="query", image="query.png"),
+            server_reranking.RerankItem(text="document", video="document.mp4"),
+            "rank candidates",
+        )
+
+        assert messages[1]["content"] == [
+            {"type": "text", "text": "<Instruct>: rank candidates"},
+            {"type": "text", "text": "<Query>:"},
+            {"type": "image"},
+            {"type": "text", "text": "query"},
+            {"type": "text", "text": "\n<Document>:"},
+            {"type": "video"},
+            {"type": "text", "text": "document"},
+        ]
+
+    def test_batches_without_reordering(self, monkeypatch):
+        batches = []
+
+        def fake_score_batch(model, processor, query, documents, instruction):
+            del model, processor, query, instruction
+            batches.append([document.text for document in documents])
+            return [float(document.text) for document in documents], len(documents)
+
+        monkeypatch.setenv("MLX_VLM_RERANK_BATCH_SIZE", "2")
+        monkeypatch.setattr(server_reranking, "_score_text_batch", fake_score_batch)
+        documents = [server_reranking.RerankItem(text=str(index)) for index in range(5)]
+
+        scores, tokens = server_reranking.score_documents(
+            object(),
+            object(),
+            SimpleNamespace(model_type="qwen3"),
+            server_reranking.RerankItem(text="query"),
+            documents,
+            "instruction",
+        )
+
+        assert scores == [0.0, 1.0, 2.0, 3.0, 4.0]
+        assert tokens == 5
+        assert batches == [["0", "1"], ["2", "3"], ["4"]]
+
+    def test_attention_mask_combines_padding_and_causality(self):
+        mask = server_reranking._attention_mask(mx.array([[0, 1, 1], [1, 1, 0]]))
+
+        assert mask.shape == (2, 1, 3, 3)
+        assert mask[0, 0].tolist() == [
+            [False, False, False],
+            [False, True, False],
+            [False, True, True],
+        ]
+        assert mask[1, 0].tolist() == [
+            [True, False, False],
+            [True, True, False],
+            [False, False, False],
+        ]
+
+    def test_attention_mask_uses_native_causal_path_without_padding(self):
+        assert server_reranking._attention_mask(mx.ones((2, 3))) == "causal"
+
+    def test_binary_scores_pool_last_non_padding_token(self):
+        model = SimpleNamespace(
+            language_model=SimpleNamespace(lm_head=lambda hidden_states: hidden_states)
+        )
+        tokenizer = SimpleNamespace(
+            unk_token_id=None,
+            convert_tokens_to_ids=lambda token: {"no": 0, "yes": 1}[token],
+        )
+        hidden_states = mx.array(
+            [
+                [[9.0, -9.0], [2.0, 4.0], [1.0, 5.0]],
+                [[4.0, 1.0], [8.0, 2.0], [-9.0, 9.0]],
+            ]
+        )
+
+        scores = server_reranking._binary_scores(
+            model, hidden_states, mx.array([[0, 1, 1], [1, 1, 0]]), tokenizer
+        )
+
+        assert scores == pytest.approx([1 / (1 + math.exp(-4)), 1 / (1 + math.exp(6))])
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            [1, 2, 3],
+            {"input_ids": [1, 2, 3]},
+            SimpleNamespace(input_ids=[1, 2, 3]),
+            SimpleNamespace(input_ids=[[1, 2, 3]]),
+            mx.array([1, 2, 3]),
+        ],
+    )
+    def test_input_ids_accept_tokenizer_return_types(self, value):
+        assert server_reranking._input_ids(value) == [1, 2, 3]
+
+    def test_ensure_chat_template_loads_packaged_template(self, tmp_path, monkeypatch):
+        (tmp_path / "chat_template.jinja").write_text("template", encoding="utf-8")
+        processor = SimpleNamespace(
+            chat_template=None,
+            tokenizer=SimpleNamespace(chat_template=None),
+        )
+        monkeypatch.setattr(server_reranking, "get_model_path", lambda path: tmp_path)
+
+        server_reranking.ensure_chat_template(processor, "reranker")
+
+        assert processor.chat_template == "template"
+        assert processor.tokenizer.chat_template == "template"
+
+    def test_model_uses_isolated_cache(self, monkeypatch):
+        registry = server.ModelCacheRegistry()
+        text_cache = {
+            "cache_key": ("language", None, "text_generation"),
+            "model_kind": "text_generation",
+        }
+        registry.set("text_generation", text_cache)
+        monkeypatch.setattr(server.runtime, "model_cache", registry)
+        model = SimpleNamespace(config=SimpleNamespace(model_type="qwen3"))
+        processor = object()
+        monkeypatch.setattr(vlm_utils, "load", lambda path: (model, processor))
+        monkeypatch.setattr(
+            server._app_module, "ensure_reranker_chat_template", lambda *args: None
+        )
+
+        loaded = server.get_cached_model("reranker", None, model_kind="reranker")
+
+        assert loaded == (model, processor, model.config)
+        assert registry.for_kind("text_generation") is text_cache
+        assert registry.for_kind("reranker")["cache_key"] == (
+            "reranker",
+            None,
+            "reranker",
+            server.runtime.config.fingerprint(kinds={"reranker"}),
+        )
+
+    def test_loader_rejects_unsupported_family(self, monkeypatch):
+        monkeypatch.setattr(server.runtime, "model_cache", server.ModelCacheRegistry())
+        model = SimpleNamespace(config=SimpleNamespace(model_type="bert"))
+        monkeypatch.setattr(vlm_utils, "load", lambda path: (model, object()))
+
+        with pytest.raises(
+            server.HTTPException, match="Unsupported reranker model type"
+        ) as exc:
+            server.get_cached_model("reranker", None, model_kind="reranker")
+
+        assert exc.value.status_code == 400
