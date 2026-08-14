@@ -34,6 +34,28 @@ from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 
+
+def test_response_generator_prefill_step_override_wins_over_environment(monkeypatch):
+    class DormantThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setenv("PREFILL_STEP_SIZE", "2048")
+    monkeypatch.setattr(server_generation, "Thread", DormantThread)
+
+    default_generator = server.ResponseGenerator(model_path="default")
+    overridden_generator = server.ResponseGenerator(
+        model_path="overridden",
+        prefill_step_size=3072,
+    )
+
+    assert default_generator.prefill_step_size == 2048
+    assert overridden_generator.prefill_step_size == 3072
+
+
 _MUSE_RESPONSE_TEMPLATE = {
     "defaults": {"role": "assistant"},
     "fields": {
@@ -1209,6 +1231,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
     gen.processor = SimpleNamespace()
     gen.config = SimpleNamespace(eos_token_id=3)
     gen.tokenizer = SimpleNamespace(all_special_ids=[0])
+    gen.prefill_step_size = 3072
     captured = {}
 
     def fake_stream_diffusion_generate_from_kwargs(
@@ -1255,7 +1278,6 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         "stream_diffusion_generate_from_kwargs",
         fake_stream_diffusion_generate_from_kwargs,
     )
-    monkeypatch.setattr(server_generation, "get_prefill_step_size", lambda: 2048)
     args = server.GenerationArguments(
         max_tokens=4,
         temperature=0.0,
@@ -1306,7 +1328,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         "top_p": 1.0,
         "top_k": 0,
         "mm_token_type_ids": "types",
-        "prefill_step_size": 2048,
+        "prefill_step_size": 3072,
         "seed": 123,
         "max_denoising_steps": 7,
         "block_length": 16,
@@ -1714,7 +1736,9 @@ class _RecordingSpeculativeLM:
         )
 
 
-def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
+def _run_speculative_prefill_once(
+    monkeypatch, *, draft_kind, request_specs, prefill_step_size=2048
+):
     lm = _RecordingSpeculativeLM(draft_kind)
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
     gen.model = SimpleNamespace(language_model=lm)
@@ -1726,6 +1750,7 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
     gen.stop_tokens = {99}
     gen.requests = Queue()
     gen._stop = False
+    gen.prefill_step_size = prefill_step_size
     gen._make_sampler = lambda args: None
     gen.tokenizer = SimpleNamespace(
         decode=lambda tokens: "".join(str(tok) for tok in tokens)
@@ -1788,6 +1813,7 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
 
     gen._run_speculative()
     call = lm.calls[0]
+    call["prefill_input_lengths"] = [item["inputs"].shape[1] for item in lm.calls]
     call["round_kwargs"] = gen.round_kwargs
     return call
 
@@ -1809,6 +1835,29 @@ def test_speculative_server_threads_greedy_flag_to_mtp_loop(monkeypatch):
     )
 
     assert call["round_kwargs"]["greedy_sampling"] is True
+
+
+def test_speculative_server_honors_prefill_step_override(monkeypatch):
+    monkeypatch.setattr(
+        server_generation, "_chunked_prefill_enabled", lambda *args, **kwargs: True
+    )
+    call = _run_speculative_prefill_once(
+        monkeypatch,
+        draft_kind="mtp",
+        prefill_step_size=2,
+        request_specs=[
+            {
+                "input_ids": mx.array([[11, 12, 13]], dtype=mx.int32),
+                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
+            },
+            {
+                "input_ids": mx.array([[21, 22, 23]], dtype=mx.int32),
+                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
+            },
+        ],
+    )
+
+    assert call["prefill_input_lengths"] == [2, 1]
 
 
 def test_speculative_server_prefill_threads_gemma4_per_layer_inputs(monkeypatch):
@@ -5522,6 +5571,7 @@ class TestResponseGenerator:
         gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
         gen.top_logprobs_k = 0
         gen.apc_manager = None
+        gen.prefill_step_size = 3072
         gen.tokenizer = SimpleNamespace()
         gen.requests = Queue()
         gen._stop = False
@@ -5580,6 +5630,7 @@ class TestResponseGenerator:
         assert kwargs["draft_block_size"] == 6
         assert kwargs["greedy_sampling"] is True
         assert kwargs["compute_logprobs"] is False
+        assert kwargs["prefill_step_size"] == 3072
         assert batch_state["instance"].next_active_sizes == [2]
 
     def test_run_coalesces_idle_mtp_batch_generator(self, monkeypatch):
