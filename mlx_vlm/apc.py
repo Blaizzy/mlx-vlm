@@ -2991,14 +2991,17 @@ class APCManager:
         if limit <= 0:
             return
         resident = self._resident_bytes_locked()
-        while resident > limit and self._free_head is not None:
+        for _ in range(len(self.pool)):
+            if resident <= limit or self._free_head is None:
+                return
             freed = self._free_head.resident_bytes()
             block = self._evict_lru()
             if block is None:
                 return
             self._free_push(block)
             resident -= freed
-            self.stats.budget_evictions += 1
+            if freed:
+                self.stats.budget_evictions += 1
 
     # ---------- Public API ----------
     def lookup_exact_cache(

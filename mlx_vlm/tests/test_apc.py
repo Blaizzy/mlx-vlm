@@ -1257,3 +1257,21 @@ def test_state_stride_rounds_up_to_whole_kv_blocks():
         assert manager.state_stride % manager.block_size == 0
     finally:
         del os.environ["APC_STATE_STRIDE"]
+
+
+def test_resident_budget_never_evicts_a_held_block():
+    block_size = 16
+    manager = APCManager(num_blocks=16, block_size=block_size)
+    token_ids = list(range(4 * block_size))
+    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids))
+
+    manager._max_resident_bytes = 1
+    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
+
+    assert stored
+    assert all(b.resident_bytes() > 0 for b in stored)
+    assert manager.resident_bytes() > manager._max_resident_bytes
+
+    manager.release(stored)
+    manager._shrink_to_resident_budget_locked()
+    assert manager.resident_bytes() == 0
