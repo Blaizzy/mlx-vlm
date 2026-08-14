@@ -1729,3 +1729,46 @@ def test_block_mode_still_reuses_after_the_membership_guard():
 
     assert plan is not None and plan["prefix_len"] > 0
     manager.release(plan["matched_blocks"])
+
+
+class _FakeLM:
+    def __init__(self, entries):
+        self._entries = entries
+
+    def make_cache(self):
+        from mlx_vlm.models.cache import ArraysCache, KVCache, RotatingKVCache
+
+        built = []
+        for kind in self._entries:
+            if kind == "kv":
+                built.append(KVCache())
+            elif kind == "state":
+                built.append(ArraysCache(1))
+            else:
+                built.append(RotatingKVCache(max_size=64, keep=0))
+        return built
+
+
+def test_a_mixed_cache_stays_on_exact_mode_until_composite_is_enabled(monkeypatch):
+    monkeypatch.delenv("APC_COMPOSITE", raising=False)
+
+    assert model_apc_mode(_FakeLM(["kv", "state", "kv"])) == "exact"
+
+
+def test_a_mixed_cache_selects_composite_when_enabled(monkeypatch):
+    monkeypatch.setenv("APC_COMPOSITE", "1")
+
+    assert model_apc_mode(_FakeLM(["kv", "state", "kv"])) == "composite"
+    assert model_apc_mode(_FakeLM(["kv", "rotating"])) == "composite"
+
+
+def test_a_dense_cache_is_block_mode_whether_or_not_composite_is_enabled(monkeypatch):
+    monkeypatch.setenv("APC_COMPOSITE", "1")
+
+    assert model_apc_mode(_FakeLM(["kv", "kv"])) == "block"
+
+
+def test_a_cache_with_nothing_to_page_stays_exact(monkeypatch):
+    monkeypatch.setenv("APC_COMPOSITE", "1")
+
+    assert model_apc_mode(_FakeLM(["state", "state"])) == "exact"

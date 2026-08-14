@@ -74,6 +74,15 @@ def _env_truthy(name: str, default: str = "") -> bool:
     return os.environ.get(name, default).lower() in ("1", "true", "yes")
 
 
+def composite_apc_enabled() -> bool:
+    """Whether a mixed cache may use composite mode instead of exact mode.
+
+    Off by default until the composite store and restore paths are wired in,
+    so a model that will eventually use it keeps today's exact-mode behaviour.
+    """
+    return _env_truthy("APC_COMPOSITE", "0")
+
+
 def apc_trace_enabled() -> bool:
     """Optional request-path tracing (``APC_TRACE=1``), sibling of ``APC_DISK_TRACE``."""
     return _env_truthy("APC_TRACE")
@@ -4368,7 +4377,10 @@ def model_apc_mode(language_model: Any) -> Optional[str]:
     ``"block"`` is the normal block-level KV path. ``"exact"`` is a
     conservative whole-prefix snapshot path for custom mixed cache layouts
     such as hybrid SSM/attention models, where recurrent state cannot be
-    reconstructed by concatenating K/V blocks alone.
+    reconstructed by concatenating K/V blocks alone. ``"composite"`` pages the
+    layers that can be paged and checkpoints only the rest, for a cache that
+    mixes the two; it is opt-in via ``APC_COMPOSITE`` while it is being built
+    out, and a model that qualifies for it also qualifies for ``"exact"``.
     """
     if not hasattr(language_model, "make_cache"):
         return "block"
@@ -4379,6 +4391,10 @@ def model_apc_mode(language_model: Any) -> Optional[str]:
     if prompt_cache and all(_cache_entry_supports_block_apc(c) for c in prompt_cache):
         return "block"
     if prompt_cache and all(_cache_entry_supports_exact_apc(c) for c in prompt_cache):
+        if composite_apc_enabled() and any(
+            _cache_entry_supports_block_apc(c) for c in prompt_cache
+        ):
+            return "composite"
         return "exact"
     return None
 
