@@ -780,9 +780,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 config[quantization_key] = quantization_value
 
     if (quantization := config.get("quantization", None)) is not None:
-        # Handle legacy models which may or may not have vision quantized
+        # Handle legacy models which may or may not have vision quantized.
+        # text-only quants of unified VLM families set vision_config to null,
+        # so coerce None to {} to avoid AttributeError on the .get below.
         # TODO: Re-upload the models with the new quantization config and remove this
-        skip_vision = config.get("vision_config", {}).get("skip_vision", False)
+        skip_vision = (config.get("vision_config") or {}).get("skip_vision", False)
         quantized_model = (
             model.language_model._model
             if getattr(model, "_is_text_model", False)

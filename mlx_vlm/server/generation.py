@@ -198,7 +198,7 @@ def _run_chunked_speculative_prefill(
     if (
         prefill_step_size is not None
         and prefill_step_size > 0
-        and remaining_embeds.shape[1] > 1
+        and remaining_embeds.shape[1] > prefill_step_size
     ):
         while remaining_embeds.shape[1] > 1:
             n_to_process = min(prefill_step_size, remaining_embeds.shape[1] - 1)
@@ -1721,6 +1721,7 @@ class ResponseGenerator:
         max_num_seqs = get_max_num_seqs()
 
         while not self._stop:
+            new_items = []
             try:
                 # Poll the request queue — non-blocking when generating, short
                 # blocking wait when idle so we don't spin.
@@ -1866,12 +1867,13 @@ class ResponseGenerator:
 
             except Exception as e:
                 logger.exception("Error in generation thread")
-                for info in list(active.values()):
-                    try:
-                        info["rqueue"].put(e)
-                        info["rqueue"].put(None)
-                    except Exception:
-                        pass
+                error_queues = {
+                    id(info["rqueue"]): info["rqueue"] for info in active.values()
+                }
+                error_queues.update(
+                    {id(request.rqueue): request.rqueue for request in new_items}
+                )
+                _notify_queues(error_queues.values(), e, None)
                 active.clear()
                 batch_gen = None
                 mx.clear_cache()

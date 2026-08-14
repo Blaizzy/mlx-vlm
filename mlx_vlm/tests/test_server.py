@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
+from transformers.utils.chat_parsing import ResponseParser, parse_response
 
 import mlx_vlm.server as server
 import mlx_vlm.server.cli as server_cli
@@ -30,7 +31,55 @@ from mlx_vlm import apc as apc_module
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
+from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
+
+_MUSE_RESPONSE_TEMPLATE = {
+    "defaults": {"role": "assistant"},
+    "fields": {
+        "content": {
+            "close": ["<|eot|>", "<|eom|>"],
+            "content": "text",
+            "open_pattern": r"to=user<\|message\|>",
+        },
+        "reasoning_content": {
+            "close": "<|eom|>",
+            "content": "text",
+            "open_pattern": r"to=self<\|message\|>",
+        },
+        "tool_calls": {
+            "close": "</atem:invoke>",
+            "content": "xml-inline",
+            "content_args": {
+                "tag_pattern": (
+                    r'<atem:parameter\b[^>]*?\bname="(?P<key>[^"]+)"'
+                    r"[^>]*?>(?P<value>.*?)</atem:parameter>"
+                ),
+                "value_parser": {
+                    "args": {"allow_non_json": True},
+                    "name": "json",
+                },
+            },
+            "open_pattern": r'<atem:invoke\b[^>]*?\bname="(?P<name>[^"]+)">',
+            "repeats": True,
+            "transform": {
+                "function": {"arguments": "{content}", "name": "{name}"},
+                "type": "function",
+            },
+        },
+    },
+    "start_anchor": "<|start|>assistant",
+}
+
+
+class _MuseResponseTemplateTokenizer:
+    response_template = _MUSE_RESPONSE_TEMPLATE
+
+    def parse_response(self, response, prefix=None):
+        return parse_response(response, self.response_template, prefix=prefix)
+
+    def get_response_parser(self, prefix=None):
+        return ResponseParser(self.response_template, prefix=prefix)
 
 
 @pytest.fixture
@@ -474,7 +523,10 @@ def test_speculative_server_hidden_state_concatenates_for_dflash():
     assert result.shape == (1, 1, 8)
 
 
-def test_speculative_prompt_cache_uses_unbatched_cache_for_single_mtp(monkeypatch):
+@pytest.mark.parametrize("draft_kind", ["mtp", "dflash", "eagle3"])
+def test_speculative_prompt_cache_uses_unbatched_cache_for_singleton(
+    monkeypatch, draft_kind
+):
     lm = object()
     unbatched_cache = object()
     batched_cache = object()
@@ -485,7 +537,7 @@ def test_speculative_prompt_cache_uses_unbatched_cache_for_single_mtp(monkeypatc
 
     result = speculative_utils.make_speculative_prompt_cache(
         lm,
-        draft_kind="mtp",
+        draft_kind=draft_kind,
         batch_size=1,
         left_padding=[0],
         make_cache=lambda *args, **kwargs: batched_cache,
@@ -494,7 +546,7 @@ def test_speculative_prompt_cache_uses_unbatched_cache_for_single_mtp(monkeypatc
     assert result is unbatched_cache
 
 
-def test_speculative_prompt_cache_uses_batched_cache_for_batch_or_dflash(monkeypatch):
+def test_speculative_prompt_cache_uses_batched_cache_for_batch(monkeypatch):
     lm = object()
     batched_cache = object()
 
@@ -516,12 +568,69 @@ def test_speculative_prompt_cache_uses_batched_cache_for_batch_or_dflash(monkeyp
         speculative_utils.make_speculative_prompt_cache(
             lm,
             draft_kind="dflash",
-            batch_size=1,
-            left_padding=[0],
+            batch_size=2,
+            left_padding=[0, 1],
             make_cache=lambda *args, **kwargs: batched_cache,
         )
         is batched_cache
     )
+
+
+def test_speculative_prefill_keeps_short_prompt_in_one_forward():
+    calls = []
+    output = SimpleNamespace(logits=mx.zeros((1, 3, 5)))
+
+    def lm(inputs, cache=None, **kwargs):
+        calls.append((inputs, cache, kwargs))
+        return output
+
+    input_ids = mx.array([[1, 2, 3]], dtype=mx.int32)
+    inputs_embeds = mx.ones((1, 3, 4), dtype=mx.float32)
+    result, remaining_ids = server_generation._run_chunked_speculative_prefill(
+        lm,
+        input_ids,
+        inputs_embeds,
+        [],
+        {},
+        {"capture_layer_ids": [1, 2]},
+        prefill_step_size=4,
+        generation_stream=mx.default_stream(mx.default_device()),
+    )
+
+    assert result is output
+    assert remaining_ids.tolist() == [[1, 2, 3]]
+    assert len(calls) == 1
+    assert calls[0][0].tolist() == [[1, 2, 3]]
+    assert calls[0][2]["inputs_embeds"].shape == (1, 3, 4)
+    assert calls[0][2]["capture_layer_ids"] == [1, 2]
+    assert "n_to_process" not in calls[0][2]
+
+
+def test_speculative_prefill_chunks_only_above_step_size():
+    calls = []
+
+    def lm(inputs, cache=None, **kwargs):
+        calls.append((inputs, cache, kwargs))
+        return SimpleNamespace(logits=mx.zeros((1, inputs.shape[1], 5)))
+
+    input_ids = mx.array([[1, 2, 3]], dtype=mx.int32)
+    inputs_embeds = mx.ones((1, 3, 4), dtype=mx.float32)
+    _, remaining_ids = server_generation._run_chunked_speculative_prefill(
+        lm,
+        input_ids,
+        inputs_embeds,
+        [],
+        {},
+        {"capture_layer_ids": [1, 2]},
+        prefill_step_size=2,
+        generation_stream=mx.default_stream(mx.default_device()),
+    )
+
+    assert remaining_ids.tolist() == [[3]]
+    assert [call[0].tolist() for call in calls] == [[[1, 2]], [[3]]]
+    assert calls[0][2]["n_to_process"] == 2
+    assert "capture_layer_ids" not in calls[0][2]
+    assert calls[1][2]["capture_layer_ids"] == [1, 2]
 
 
 def test_speculative_server_reads_draft_block_size_env(monkeypatch):
@@ -846,6 +955,49 @@ def test_speculative_thread_exception_reaches_client_queue(monkeypatch):
 
     assert rqueue.get(timeout=1) is error
     assert rqueue.get(timeout=1) is None
+
+
+def test_ar_thread_exception_reaches_pending_client_queue(monkeypatch):
+    class FakeBatchGenerator:
+        def __init__(self, *_args, **_kwargs):
+            self.has_work = False
+
+        def close(self):
+            pass
+
+    gen = _unstarted_response_generator()
+
+    def initialize_model():
+        gen.model = SimpleNamespace(language_model=object())
+        gen.processor = SimpleNamespace()
+        gen.config = SimpleNamespace()
+        gen.tokenizer = SimpleNamespace()
+
+    error = RuntimeError("vision embedding failed")
+    gen._initialize_model = initialize_model
+    gen._gpu_embed = MagicMock(side_effect=error)
+    monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
+
+    rqueue = Queue()
+    gen.requests.put(
+        server_generation.QueuedGenerationRequest(
+            rqueue=rqueue,
+            raw_inputs={"input_ids": mx.array([[1]], dtype=mx.int32)},
+            prompt_tokens=1,
+            args=server.GenerationArguments(max_tokens=2),
+        )
+    )
+
+    worker = Thread(target=gen._run, daemon=True)
+    worker.start()
+    try:
+        assert rqueue.get(timeout=1) is error
+        assert rqueue.get(timeout=1) is None
+        assert worker.is_alive()
+    finally:
+        gen._stop = True
+        gen.requests.put(None)
+        worker.join(timeout=2)
 
 
 def test_speculative_thread_exception_skips_broken_queues(monkeypatch):
@@ -2979,6 +3131,65 @@ def test_chat_completions_response_uses_reasoning_content(client):
     assert message["content"] == "Custom answer."
 
 
+def test_chat_completions_uses_processor_config_and_response_template(
+    client, monkeypatch
+):
+    model = SimpleNamespace()
+    config = SimpleNamespace(
+        model_type="muse_glimmer",
+        thinking_start_token="to=self<|message|>",
+        thinking_end_token="<|eom|>",
+    )
+    processor = SimpleNamespace(
+        config=config,
+        tokenizer=_MuseResponseTemplateTokenizer(),
+    )
+    monkeypatch.delenv("MLX_VLM_THINKING_START_TOKEN", raising=False)
+    monkeypatch.delenv("MLX_VLM_THINKING_END_TOKEN", raising=False)
+    result = GenerationResult(
+        text=(
+            "to=self<|message|>Say exactly: hello world\n\n"
+            "We need to say exactly: hello world ...\n\n"
+            "No extra.<|eom|><|start|>assistant to=user<|message|>hello world"
+        ),
+        prompt_tokens=8,
+        generation_tokens=32,
+        total_tokens=40,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="<|start|>assistant"),
+        patch.object(server, "generate", return_value=result) as mock_generate,
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "mlx-community/Muse-Glimmer-30B-4bit",
+                "messages": [{"role": "user", "content": "Say exactly: hello world"}],
+            },
+        )
+
+    assert response.status_code == 200
+    generate_kwargs = mock_generate.call_args.kwargs
+    assert generate_kwargs["thinking_start_token"] == "to=self<|message|>"
+    assert generate_kwargs["thinking_end_token"] == "<|eom|>"
+    message = response.json()["choices"][0]["message"]
+    expected_reasoning = (
+        "Say exactly: hello world\n\n"
+        "We need to say exactly: hello world ...\n\n"
+        "No extra."
+    )
+    assert message["reasoning_content"] == expected_reasoning
+    assert message["reasoning"] == expected_reasoning
+    assert message["content"] == "hello world"
+
+
 @pytest.mark.parametrize(
     "audio_data_factory",
     [
@@ -3349,10 +3560,10 @@ def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch)
     )
 
 
-def test_chat_completions_streaming_tool_calls_emit_usage_chunk(client, monkeypatch):
+def test_chat_completions_streaming_response_template_tool_calls(client, monkeypatch):
     model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
+    processor = SimpleNamespace(tokenizer=_MuseResponseTemplateTokenizer())
+    config = SimpleNamespace(model_type="muse_glimmer")
 
     class FakeResponseGenerator:
         tokenizer = SimpleNamespace(decode=lambda tokens: "")
@@ -3365,8 +3576,11 @@ def test_chat_completions_streaming_tool_calls_emit_usage_chunk(client, monkeypa
                 [
                     server.StreamingToken(
                         text=(
-                            '<tool_call>{"name":"get_weather",'
-                            '"arguments":{"location":"SF"}}</tool_call>'
+                            "to=self<|message|>I need the weather tool.<|eom|>"
+                            "<|start|>assistant to=get_weather<|message|>"
+                            '<atem:function_calls><atem:invoke name="get_weather">'
+                            '<atem:parameter name="city">Warsaw</atem:parameter>'
+                            "</atem:invoke></atem:function_calls>"
                         ),
                         token=1,
                         logprobs=0.0,
@@ -3377,11 +3591,8 @@ def test_chat_completions_streaming_tool_calls_emit_usage_chunk(client, monkeypa
                 ]
             )
 
-    tool_module = SimpleNamespace(
-        tool_call_start="<tool_call>",
-        tool_call_end="</tool_call>",
-        parse_tool_call=lambda call, tools: json.loads(call),
-    )
+    from mlx_vlm.tool_parsers import atem as tool_module
+
     monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
 
     with (
@@ -3415,8 +3626,23 @@ def test_chat_completions_streaming_tool_calls_emit_usage_chunk(client, monkeypa
         if chunk["choices"] and chunk["choices"][0]["finish_reason"] == "tool_calls"
     )
     usage_chunk = next(chunk for chunk in chunks if chunk.get("usage") is not None)
+    reasoning = "".join(
+        chunk["choices"][0]["delta"].get("reasoning_content") or ""
+        for chunk in chunks
+        if chunk["choices"]
+    )
+    content = "".join(
+        chunk["choices"][0]["delta"].get("content") or ""
+        for chunk in chunks
+        if chunk["choices"]
+    )
+    tool_call = tool_chunk["choices"][0]["delta"]["tool_calls"][0]
 
     assert tool_chunk.get("usage") is None
+    assert tool_call["function"]["name"] == "get_weather"
+    assert json.loads(tool_call["function"]["arguments"]) == {"city": "Warsaw"}
+    assert reasoning == "I need the weather tool."
+    assert content == ""
     assert usage_chunk["choices"] == []
     assert usage_chunk["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
 
@@ -3746,6 +3972,13 @@ def test_anthropic_messages_endpoint_converts_tool_result_inputs(client, monkeyp
         },
         {"role": "tool", "tool_call_id": "toolu_1", "content": "72F", "name": None},
     ]
+    normalized = apply_chat_template(
+        None,
+        config,
+        mock_template.call_args.args[2],
+        return_messages=True,
+    )
+    assert normalized[0]["content"] == ""
 
 
 def test_anthropic_messages_usage_reports_cached_tokens(client, monkeypatch):
@@ -3881,24 +4114,33 @@ def test_anthropic_messages_endpoint_preserves_tool_result_images(client, monkey
     assert mock_generate.call_args.kwargs["image"] == ["data:image/png;base64,aW1n"]
 
 
-def test_anthropic_messages_endpoint_returns_tool_use_blocks(client, monkeypatch):
+def test_anthropic_nonstreaming_preserves_thinking_with_tool_use(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
+    config = SimpleNamespace(
+        model_type="muse_glimmer",
+        thinking_start_token="to=self<|message|>",
+        thinking_end_token="<|eom|>",
+    )
+    processor = SimpleNamespace(
+        config=config,
+        tokenizer=_MuseResponseTemplateTokenizer(),
+    )
     result = GenerationResult(
-        text='<tool_call>{"name":"get_weather","arguments":{"location":"SF"}}</tool_call>',
+        text=(
+            "to=self<|message|>I need the weather tool.<|eom|>"
+            "<|start|>assistant to=get_weather<|message|>"
+            '<atem:function_calls><atem:invoke name="get_weather">'
+            '<atem:parameter name="city">Warsaw</atem:parameter>'
+            "</atem:invoke></atem:function_calls>"
+        ),
         prompt_tokens=7,
         generation_tokens=6,
         prompt_tps=0.0,
         generation_tps=0.0,
         peak_memory=0.0,
     )
-    tool_module = SimpleNamespace(
-        tool_call_start="<tool_call>",
-        tool_call_end="</tool_call>",
-        parse_tool_call=lambda call, tools: json.loads(call),
-    )
+    from mlx_vlm.tool_parsers import atem as tool_module
 
     with (
         patch.object(
@@ -3920,11 +4162,12 @@ def test_anthropic_messages_endpoint_returns_tool_use_blocks(client, monkeypatch
                         "description": "Get weather",
                         "input_schema": {
                             "type": "object",
-                            "properties": {"location": {"type": "string"}},
-                            "required": ["location"],
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
                         },
                     }
                 ],
+                "thinking": {"type": "enabled", "budget_tokens": 4},
                 "max_tokens": 8,
             },
         )
@@ -3932,9 +4175,16 @@ def test_anthropic_messages_endpoint_returns_tool_use_blocks(client, monkeypatch
     assert response.status_code == 200
     payload = response.json()
     assert payload["stop_reason"] == "tool_use"
-    assert payload["content"][0]["type"] == "tool_use"
-    assert payload["content"][0]["name"] == "get_weather"
-    assert payload["content"][0]["input"] == {"location": "SF"}
+    assert payload["content"][0] == {
+        "type": "thinking",
+        "thinking": "I need the weather tool.",
+        "signature": "",
+    }
+    assert payload["content"][1]["type"] == "tool_use"
+    assert payload["content"][1]["name"] == "get_weather"
+    assert payload["content"][1]["input"] == {"city": "Warsaw"}
+    assert "to=self" not in response.text
+    assert "<atem:" not in response.text
 
 
 def test_anthropic_messages_streaming_uses_anthropic_events(client, monkeypatch):
@@ -6022,6 +6272,12 @@ class TestResponseGenerator:
     def test_build_gen_args_uses_server_thinking_token_defaults_when_omitted(
         self, monkeypatch
     ):
+        processor = SimpleNamespace(
+            config=SimpleNamespace(
+                thinking_start_token="<model-analysis>",
+                thinking_end_token="</model-analysis>",
+            )
+        )
         monkeypatch.setenv("MLX_VLM_THINKING_BUDGET", "256")
         monkeypatch.setenv("MLX_VLM_THINKING_START_TOKEN", "<analysis>")
         monkeypatch.setenv("MLX_VLM_THINKING_END_TOKEN", "</analysis>")
@@ -6033,11 +6289,32 @@ class TestResponseGenerator:
         assert "thinking_budget" not in req.model_fields_set
         assert "thinking_start_token" not in req.model_fields_set
         assert "thinking_end_token" not in req.model_fields_set
-        args = server._build_gen_args(req)
+        args = server._build_gen_args(req, processor)
 
         assert args.thinking_budget == 256
         assert args.thinking_start_token == "<analysis>"
         assert args.thinking_end_token == "</analysis>"
+
+    def test_build_gen_args_uses_processor_config_thinking_tokens_when_omitted(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("MLX_VLM_THINKING_START_TOKEN", raising=False)
+        monkeypatch.delenv("MLX_VLM_THINKING_END_TOKEN", raising=False)
+        processor = SimpleNamespace(
+            config=SimpleNamespace(
+                thinking_start_token="to=self<|message|>",
+                thinking_end_token="<|eom|>",
+            )
+        )
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+        )
+
+        args = server._build_gen_args(req, processor)
+
+        assert args.thinking_start_token == "to=self<|message|>"
+        assert args.thinking_end_token == "<|eom|>"
 
     def test_build_gen_args_request_thinking_overrides_server_default(
         self, monkeypatch
@@ -6063,6 +6340,12 @@ class TestResponseGenerator:
     def test_build_gen_args_request_thinking_tokens_override_server_defaults(
         self, monkeypatch
     ):
+        processor = SimpleNamespace(
+            config=SimpleNamespace(
+                thinking_start_token="<model-analysis>",
+                thinking_end_token="</model-analysis>",
+            )
+        )
         monkeypatch.setenv("MLX_VLM_THINKING_BUDGET", "256")
         monkeypatch.setenv("MLX_VLM_THINKING_START_TOKEN", "<analysis>")
         monkeypatch.setenv("MLX_VLM_THINKING_END_TOKEN", "</analysis>")
@@ -6074,7 +6357,7 @@ class TestResponseGenerator:
             thinking_end_token="</think>",
         )
 
-        args = server._build_gen_args(req)
+        args = server._build_gen_args(req, processor)
 
         assert args.thinking_budget == 32
         assert args.thinking_start_token == "<think>"
@@ -6529,6 +6812,18 @@ class TestSplitThinking:
         assert reasoning == "Custom reasoning."
         assert content == "Custom answer."
 
+    def test_response_template_parses_reasoning_and_content(self):
+        text = (
+            "to=self<|message|>Muse reasoning.<|eom|>"
+            "<|start|>assistant to=user<|message|>Muse answer."
+        )
+        reasoning, content = server._split_thinking(
+            text,
+            processor=SimpleNamespace(tokenizer=_MuseResponseTemplateTokenizer()),
+        )
+        assert reasoning == "Muse reasoning."
+        assert content == "Muse answer."
+
     def test_cohere_thinking_markers_strip_text_markers(self):
         text = (
             "<|START_THINKING|>Custom reasoning.<|END_THINKING|>"
@@ -6687,6 +6982,33 @@ class TestThinkingStreamState:
         assert second.reasoning == "Custom reasoning."
         assert second.content == "Custom answer."
         assert second.thinking_closed is True
+
+    def test_response_template_markers_split_across_chunks(self):
+        state = server.make_response_stream_state(
+            SimpleNamespace(tokenizer=_MuseResponseTemplateTokenizer()),
+            thinking_start_token="unused-start",
+            thinking_end_token="unused-end",
+        )
+        reasoning = []
+        content = []
+
+        chunks = (
+            "to=self<|mes",
+            "sage|>Muse reasoning.<|eom|><|start|>assistant ",
+            "to=user<|message|>Muse answer.",
+        )
+        thinking_closed = False
+        for index, chunk in enumerate(chunks):
+            delta = state.feed(chunk, last=index == len(chunks) - 1)
+            if delta.reasoning:
+                reasoning.append(delta.reasoning)
+            if delta.content:
+                content.append(delta.content)
+            thinking_closed = thinking_closed or delta.thinking_closed
+
+        assert "".join(reasoning) == "Muse reasoning."
+        assert "".join(content) == "Muse answer."
+        assert thinking_closed is True
 
     def test_cohere_text_markers_are_suppressed_across_chunks(self):
         state = server.ThinkingStreamState(enable_thinking=True)
