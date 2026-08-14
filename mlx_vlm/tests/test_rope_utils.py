@@ -101,13 +101,13 @@ def test_eager_rope_per_batch_offset_does_not_expand_seq():
     assert out.shape == x.shape, f"seq dim expanded: {out.shape} != {x.shape}"
 
     # Per-batch array offset must equal per-row scalar application.
-    ref = mx.concatenate(
-        [rope(x[0:1], offset=86), rope(x[1:2], offset=34258)], axis=0
-    )
+    ref = mx.concatenate([rope(x[0:1], offset=86), rope(x[1:2], offset=34258)], axis=0)
     assert bool(mx.array_equal(out, ref).item())
 
     # Multi-token batch: (B, S) positions, still per-row equal to scalars.
-    x2 = mx.random.normal(key=mx.random.key(1), shape=(2, 32, 3, 128)).astype(mx.float32)
+    x2 = mx.random.normal(key=mx.random.key(1), shape=(2, 32, 3, 128)).astype(
+        mx.float32
+    )
     out2 = rope(x2, offset=offsets)
     ref2 = mx.concatenate(
         [rope(x2[0:1], offset=86), rope(x2[1:2], offset=34258)], axis=0
@@ -128,6 +128,12 @@ def test_eager_rope_per_batch_offset_does_not_expand_seq():
         [rope_t(x[0:1], offset=86), rope_t(x[1:2], offset=34258)], axis=0
     )
     assert bool(mx.array_equal(out3, ref3).item())
+
+    # 0-d array offset (mx.array(86)) takes the same single code path as a
+    # scalar int and must stay bit-identical to it.
+    out4 = rope(x, offset=mx.array(86, dtype=mx.float32))
+    ref4 = rope(x, offset=86)
+    assert bool(mx.array_equal(out4, ref4).item())
 
 
 def test_eager_rope_evals_private_helper_arrays_on_init(monkeypatch):
