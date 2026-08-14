@@ -1181,3 +1181,78 @@ def test_exact_disk_hit_promotion_with_nonzero_extra_hash(tmp_path, monkeypatch)
     assert warm_wrong is None
 
     manager.close()
+
+
+def test_partition_splits_a_hybrid_cache_by_pageability():
+    from mlx_vlm.models.cache import ArraysCache, KVCache
+
+    cache = [KVCache(), ArraysCache(size=1), KVCache(), ArraysCache(size=1)]
+
+    pageable, checkpointed = apc_module.partition_cache_by_pageability(cache)
+
+    assert pageable == [0, 2]
+    assert checkpointed == [1, 3]
+
+
+def test_partition_of_a_dense_cache_is_every_layer():
+    from mlx_vlm.models.cache import KVCache
+
+    pageable, checkpointed = apc_module.partition_cache_by_pageability(
+        [KVCache() for _ in range(4)]
+    )
+
+    assert pageable == [0, 1, 2, 3]
+    assert checkpointed == []
+
+
+def test_dense_store_records_the_dense_layer_range():
+    block_size = 16
+    manager = APCManager(num_blocks=8, block_size=block_size)
+    token_ids = list(range(2 * block_size))
+    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids))
+
+    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
+
+    assert stored
+    assert all(b.layer_indices == tuple(range(len(layer_keys))) for b in stored)
+    manager.release(stored)
+
+
+def test_sparse_store_records_the_layers_it_came_from():
+    block_size = 16
+    manager = APCManager(num_blocks=8, block_size=block_size)
+    token_ids = list(range(2 * block_size))
+    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids))
+
+    stored = manager.store_kv_blocks(
+        token_ids, layer_keys, layer_values, layer_indices=[2, 5]
+    )
+
+    assert stored
+    assert all(b.layer_indices == (2, 5) for b in stored)
+    manager.release(stored)
+
+
+def test_harvest_skips_stateful_layers_only_when_asked():
+    from mlx_vlm.models.cache import ArraysCache, KVCache
+
+    block_size = 16
+    token_ids = list(range(2 * block_size))
+    kv = KVCache()
+    slab = mx.zeros((1, 2, len(token_ids), 32))
+    kv.update_and_fetch(slab, slab)
+    state = ArraysCache(size=1)
+    state[0] = mx.zeros((1, 2, 4, 32))
+    mixed = [state, kv]
+
+    strict = APCManager(num_blocks=8, block_size=block_size)
+    assert apc_module.harvest_blocks_from_batch_cache(strict, mixed, token_ids) == []
+
+    partial = APCManager(num_blocks=8, block_size=block_size)
+    blocks = apc_module.harvest_blocks_from_batch_cache(
+        partial, mixed, token_ids, allow_partial_layers=True
+    )
+
+    assert blocks
+    assert all(b.layer_indices == (1,) for b in blocks)
+    partial.release(blocks)

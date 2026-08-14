@@ -357,6 +357,25 @@ def _cache_entry_supports_block_apc(c: Any) -> bool:
     return apc_block_eligible(c)
 
 
+def partition_cache_by_pageability(
+    prompt_cache: Sequence[Any],
+) -> Tuple[List[int], List[int]]:
+    """Split a prompt cache into layer indices that page and ones that cannot.
+
+    A hybrid model's attention layers hold ordinary block-reusable KV while its
+    recurrent layers hold state that only a whole checkpoint can restore, so the
+    two halves are cached by different means.
+    """
+    pageable: List[int] = []
+    checkpointed: List[int] = []
+    for index, entry in enumerate(prompt_cache):
+        if _cache_entry_supports_block_apc(entry):
+            pageable.append(index)
+        else:
+            checkpointed.append(index)
+    return pageable, checkpointed
+
+
 def _sequence_hash(token_ids: Sequence[int], extra_hash: int, block_size: int) -> int:
     h = hashlib.sha256()
     h.update(int(extra_hash & ((1 << 64) - 1)).to_bytes(8, "little"))
@@ -509,6 +528,7 @@ class APCBlock(APCNode):
     token_ids: Tuple[int, ...] = ()
     extra_hash: int = 0
     ref_cnt: int = 0
+    layer_indices: Tuple[int, ...] = ()
     components: Dict[ComponentId, StateHandle] = field(default_factory=dict)
     last_used: float = 0.0
     prev: Optional["APCBlock"] = None
@@ -2952,6 +2972,7 @@ class APCManager:
         b.token_ids = ()
         b.parent_hash = SEED_PARENT_HASH
         b.extra_hash = 0
+        b.layer_indices = ()
         b.release_components()
         return b
 
@@ -3312,12 +3333,22 @@ class APCManager:
         *,
         extra_hash: int = 0,
         skip_first_n_tokens: int = 0,
+        layer_indices: Optional[Sequence[int]] = None,
     ) -> List[APCBlock]:
         """Slice ``layer_keys`` / ``layer_values`` into block_size chunks and
         store any new full blocks beyond ``skip_first_n_tokens``.
 
+        ``layer_indices`` names the model layers the arrays came from, which a
+        hybrid needs because only some of its layers page. It defaults to the
+        dense range, so a model whose every layer pages is unaffected.
+
         Returns newly acquired blocks (caller must release).
         """
+        stored_layer_indices = (
+            tuple(int(i) for i in layer_indices)
+            if layer_indices is not None
+            else tuple(range(len(layer_keys)))
+        )
         with self.lock:
             n_full = len(token_ids) // self.block_size
             skip_full = skip_first_n_tokens // self.block_size
@@ -3432,6 +3463,7 @@ class APCManager:
                 b.token_ids = chunk
                 b.extra_hash = extra_hash
                 b.set_kv(k_slabs, v_slabs)
+                b.layer_indices = stored_layer_indices
                 b.ref_cnt = 1
                 self.hash_table[h] = b
                 new_blocks.append(b)
@@ -3482,6 +3514,7 @@ class APCManager:
                 b.token_ids = ()
                 b.parent_hash = SEED_PARENT_HASH
                 b.extra_hash = 0
+                b.layer_indices = ()
                 b.release_components()
                 b.ref_cnt = 0
                 b.prev = b.next = None
@@ -4078,30 +4111,44 @@ def harvest_blocks_from_batch_cache(
     batch_idx: Optional[int] = None,
     extra_hash: int = 0,
     skip_first_n_tokens: int = 0,
+    allow_partial_layers: bool = False,
 ) -> List[APCBlock]:
     """Harvest full blocks from a prompt cache and store them.
 
     With ``batch_idx`` set, slices one row out of a batched KV cache
     (continuous-batching prefill). With ``batch_idx`` unset, harvests a
     single-request cache. Either way, adds the new prefix to APC.
+
+    A hybrid cache holds layers with no block-reusable KV. By default one such
+    layer abandons the harvest, since the stored blocks would not describe the
+    whole model. With *allow_partial_layers* those layers are skipped instead and
+    the stored blocks record which layers they came from, so a composite restore
+    can put them back in the right places.
     """
     layer_keys: List[mx.array] = []
     layer_values: List[mx.array] = []
-    for c in batch_caches:
+    pageable: List[int] = []
+    for index, c in enumerate(batch_caches):
         k, v = layer_kv_for_apc(c, batch_idx=batch_idx)
         if k is None or v is None:
+            if allow_partial_layers:
+                continue
             return []
         if batch_idx is not None and int(k.shape[0]) != 1:
             k = k[batch_idx : batch_idx + 1]
             v = v[batch_idx : batch_idx + 1]
         layer_keys.append(k)
         layer_values.append(v)
+        pageable.append(index)
+    if not layer_keys:
+        return []
     return apc_manager.store_kv_blocks(
         full_token_ids,
         layer_keys,
         layer_values,
         extra_hash=extra_hash,
         skip_first_n_tokens=skip_first_n_tokens,
+        layer_indices=pageable,
     )
 
 
