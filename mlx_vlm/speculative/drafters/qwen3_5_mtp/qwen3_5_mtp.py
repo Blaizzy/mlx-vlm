@@ -7,6 +7,7 @@ import mlx.nn as nn
 from ....models.base import create_attention_mask
 from ....models.cache import BatchKVCache, KVCache
 from ....models.qwen3_5.language import Qwen3_5DecoderLayer
+from ....models.qwen3_5.weights import dequantize_fp8_weights
 from ....models.qwen3_5_moe.language import Qwen3_5MoeDecoderLayer
 from .config import Qwen3_5MTPConfig
 
@@ -468,7 +469,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
 
     def sanitize(self, weights: dict) -> dict:
         out = {}
-        weights = dict(weights)
+        weights = dequantize_fp8_weights(weights)
         expert_prefixes = [
             key[: -len(".experts.gate_up_proj")]
             for key in weights

@@ -10,6 +10,7 @@ from ..qwen3_vl.qwen3_vl import masked_scatter
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
+from .weights import dequantize_fp8_weights
 
 
 def sanitize_key(key):
@@ -145,6 +146,7 @@ class Model(Qwen3VLModel):
         # The MTP draft shard is separate from the base model. Its presence
         # must not select the base model's RMSNorm loading convention.
         weights = {key: value for key, value in weights.items() if "mtp." not in key}
+        weights = dequantize_fp8_weights(weights)
         shift_norm_weights = should_shift_norm_weights(weights)
 
         if self.config.text_config.tie_word_embeddings:
