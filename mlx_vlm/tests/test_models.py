@@ -5921,6 +5921,218 @@ class TestModels(unittest.TestCase):
             channel_first=True,
         )
 
+    def test_nemotron_parse(self):
+        from mlx_vlm.models import nemotron_parse
+
+        text_config = nemotron_parse.TextConfig(
+            d_model=64,
+            decoder_attention_heads=8,
+            decoder_ffn_dim=128,
+            decoder_layers=2,
+            vocab_size=128,
+        )
+        vision_config = nemotron_parse.VisionConfig(
+            hidden_size=64,
+            num_heads=8,
+            mlp_ratio=2.0,
+            num_layers=2,
+            neck_dim=64,
+        )
+        config = nemotron_parse.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            vocab_size=128,
+        )
+        model = nemotron_parse.Model(config)
+
+        batch_size = 1
+        pixel_values = mx.random.normal((batch_size, 3, 64, 64))
+
+        # Forward with no cache (the cache=None fallback path).
+        output = model(pixel_values=pixel_values)
+        self.assertEqual(
+            output.logits.shape, (batch_size, 1, config.text_config.vocab_size)
+        )
+        self.assertEqual(output.encoder_outputs.shape, (batch_size, 5, 64))
+
+        # Every decoder layer must own a distinct cache pair: the cache=None
+        # fallback and make_cache() must produce identical logits.
+        output_cached = model(pixel_values=pixel_values, cache=model.make_cache())
+        self.assertTrue(mx.array_equal(output.logits, output_cached.logits).item())
+        # And the two cache paths must not alias objects across layers.
+        cache = model.make_cache()
+        self.assertEqual(len(cache), config.text_config.decoder_layers)
+        self.assertEqual(
+            len({id(c[0]) for c in cache}), config.text_config.decoder_layers
+        )
+        self.assertEqual(
+            len({id(c[1]) for c in cache}), config.text_config.decoder_layers
+        )
+
+        # Multi-step decode with the cache must advance.
+        cache = model.make_cache()
+        enc = output.encoder_outputs
+        dec = mx.array([[config.text_config.decoder_start_token_id]])
+        for _ in range(3):
+            out = model.language_model(
+                decoder_input_ids=dec,
+                encoder_outputs=enc,
+                cache=cache,
+            )
+            dec = mx.argmax(out.logits[:, -1, :], axis=-1, keepdims=True)
+        self.assertEqual(dec.shape, (batch_size, 1))
+
+    def test_nemotron_parse_input_embeddings(self):
+        from mlx_vlm.models import nemotron_parse
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        text_config = nemotron_parse.TextConfig(
+            d_model=64,
+            decoder_attention_heads=8,
+            decoder_ffn_dim=128,
+            decoder_layers=2,
+            vocab_size=128,
+        )
+        vision_config = nemotron_parse.VisionConfig(
+            hidden_size=64,
+            num_heads=8,
+            mlp_ratio=2.0,
+            num_layers=2,
+            neck_dim=64,
+        )
+        model = nemotron_parse.Model(
+            nemotron_parse.ModelConfig(
+                text_config=text_config,
+                vision_config=vision_config,
+                vocab_size=128,
+            )
+        )
+
+        pixel_values = mx.random.normal((1, 3, 64, 64))
+        result = model.get_input_embeddings(pixel_values=pixel_values)
+        self.assertIsInstance(result, InputEmbeddingsFeatures)
+        self.assertIsNotNone(result.inputs_embeds)
+        self.assertIsNotNone(result.decoder_inputs_embeds)
+
+        # Deliberate image-only contract: without pixel_values there are no
+        # encoder states to decode against, so this must raise.
+        with self.assertRaises(ValueError):
+            model.get_input_embeddings(input_ids=mx.array([[1, 2, 3]]))
+
+    def test_nemotron_parse_untied_lm_head(self):
+        from mlx_vlm.models import nemotron_parse
+
+        # v1.x checkpoints carry a real, untied lm_head (and no text_config
+        # key at the top level); the config pipeline must keep the decoder's
+        # vocab_size and the sanitize must map lm_head.weight, not rebuild it
+        # from the shared embedding.
+        config_dict = {
+            "model_type": "nemotron_parse",
+            "vocab_size": 52329,
+            "image_size": [2048, 1664],
+            "decoder_start_token_id": 2,
+            "text_config": {},
+            "encoder": {"hidden_size": 64, "num_layers": 2, "patch_size": 16},
+            "decoder": {
+                "d_model": 64,
+                "decoder_attention_heads": 8,
+                "decoder_ffn_dim": 128,
+                "decoder_layers": 2,
+                "vocab_size": 128,
+                "decoder_start_token_id": None,
+            },
+        }
+        config = nemotron_parse.ModelConfig.from_dict(config_dict)
+        self.assertEqual(config.text_config.vocab_size, 128)
+        # The loader pipeline re-derives the text config from the text_config
+        # key after from_dict; it must see the decoder params (with the
+        # top-level decoder_start_token_id override), not the seed {}.
+        self.assertEqual(config_dict["text_config"]["vocab_size"], 128)
+        self.assertEqual(
+            nemotron_parse.TextConfig.from_dict(config_dict["text_config"]).vocab_size,
+            128,
+        )
+
+        weights = {
+            "decoder.embed_tokens.weight": mx.zeros((128, 64)),
+            "lm_head.weight": mx.ones((128, 64)),
+        }
+        sanitized = nemotron_parse.Model.sanitize(weights)
+        # The untied head keeps its own values under language_model.lm_head;
+        # the tied reconstruction would have overwritten it with the shared
+        # embedding.
+        self.assertTrue(
+            mx.array_equal(
+                sanitized["language_model.lm_head.weight"], mx.ones((128, 64))
+            ).item()
+        )
+        self.assertTrue(
+            mx.array_equal(
+                sanitized["language_model.model.shared.weight"], mx.zeros((128, 64))
+            ).item()
+        )
+
+        # Without lm_head.weight the tied fallback still reconstructs it from
+        # the shared embedding (2.0 checkpoints).
+        tied = {k: v for k, v in weights.items() if k != "lm_head.weight"}
+        sanitized_tied = nemotron_parse.Model.sanitize(tied)
+        self.assertTrue(
+            mx.array_equal(
+                sanitized_tied["language_model.lm_head.weight"],
+                sanitized_tied["language_model.model.shared.weight"],
+            ).item()
+        )
+
+    def test_nemotron_parse_prompt_seed_strips_automatic_specials(self):
+        from mlx_vlm.models import nemotron_parse
+
+        text_config = nemotron_parse.TextConfig(
+            d_model=64,
+            decoder_attention_heads=8,
+            decoder_ffn_dim=128,
+            decoder_layers=2,
+            vocab_size=128,
+            bos_token_id=0,
+            eos_token_id=2,
+        )
+        vision_config = nemotron_parse.VisionConfig(
+            hidden_size=64,
+            num_heads=8,
+            mlp_ratio=2.0,
+            num_layers=2,
+            neck_dim=64,
+        )
+        model = nemotron_parse.Model(
+            nemotron_parse.ModelConfig(
+                text_config=text_config,
+                vision_config=vision_config,
+                vocab_size=128,
+            )
+        )
+
+        pixel_values = mx.random.normal((1, 3, 64, 64))
+        encoder_outputs = model.vision_tower(pixel_values)
+
+        # The generate loop hands the tokenizer-wrapped prompt to the
+        # language model together with the start-token embedding; the decoder
+        # must seed from the raw prompt (like the HF reference), so the
+        # wrapped length 8 collapses to the raw length 6.
+        wrapped = mx.array([[0, 2, 0, 7, 8, 9, 10, 2]])
+        start_embed = model.language_model.model.shared(mx.array([[2]]))
+        out = model.language_model(
+            inputs=wrapped,
+            encoder_outputs=encoder_outputs,
+            decoder_inputs_embeds=start_embed,
+        )
+        self.assertEqual(out.logits.shape, (1, 6, 128))
+
+        # A single-token decoder step passes through unchanged.
+        out = model.language_model(
+            decoder_input_ids=mx.array([[3]]),
+            encoder_outputs=encoder_outputs,
+        )
+        self.assertEqual(out.logits.shape, (1, 1, 128))
+
     def test_deepseek_vl_v2(self):
         from mlx_vlm.models import deepseek_vl_v2
 
