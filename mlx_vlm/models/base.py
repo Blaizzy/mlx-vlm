@@ -210,7 +210,11 @@ def create_attention_mask(
     h, cache=None, window_size: Optional[int] = None, return_array: bool = False
 ):
     N = h.shape[1]
-    if cache and hasattr(cache, "make_mask"):
+    if (
+        cache is not None
+        and not isinstance(cache, mx.array)
+        and hasattr(cache, "make_mask")
+    ):
         return cache.make_mask(N, return_array=return_array, window_size=window_size)
     if N == 1:
         return None
@@ -220,7 +224,11 @@ def create_attention_mask(
 
 
 def create_ssm_mask(h, cache=None):
-    if cache and hasattr(cache, "make_mask"):
+    if (
+        cache is not None
+        and not isinstance(cache, mx.array)
+        and hasattr(cache, "make_mask")
+    ):
         return cache.make_mask(h.shape[1])
     return None
 

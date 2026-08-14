@@ -392,6 +392,26 @@ class KVCache(_BaseCache):
         self.offset -= n
         return n
 
+    def extract(self, idx):
+        cache = KVCache()
+        if self.keys is None:
+            if idx not in (0, -1):
+                raise IndexError("KVCache row index out of range")
+            return cache
+
+        batch_size = int(self.keys.shape[0])
+        if idx < 0:
+            idx += batch_size
+        if idx < 0 or idx >= batch_size:
+            raise IndexError(
+                f"KVCache row index {idx} out of range for batch size {batch_size}"
+            )
+
+        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, : self.offset, :])
+        cache.values = mx.contiguous(self.values[idx : idx + 1, :, : self.offset, :])
+        cache.offset = self.offset
+        return cache
+
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
         quant_cache.offset = self.offset
@@ -1034,6 +1054,8 @@ class BatchKVCache(_BaseCache):
             self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
+        if self._right_padding is not None:
+            self._right_padding = self._right_padding[batch_indices]
 
         # Shift left to reduce padding
         min_left_pad = self.left_padding.min().item()
@@ -1390,6 +1412,8 @@ class BatchRotatingKVCache(_BaseCache):
             self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
+        if self._lengths is not None:
+            self._lengths = self._lengths[batch_indices]
 
     def extend(self, other):
         """
@@ -1838,6 +1862,8 @@ class BatchQuantizedKVCache(_BaseCache):
             self.values = tuple(v[batch_indices] for v in self.values)
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
+        if self._right_padding is not None:
+            self._right_padding = self._right_padding[batch_indices]
 
         min_lp = self.left_padding.min().item()
         if min_lp > 0:
