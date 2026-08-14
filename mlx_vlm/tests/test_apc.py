@@ -1305,3 +1305,59 @@ def test_exact_lookup_honours_the_minimum_prefix():
     _, reused = manager.lookup_exact_cache(tokens, min_prefix_tokens=200)
 
     assert reused == 256
+
+
+def _mixed_template():
+    from mlx_vlm.models.cache import ArraysCache, KVCache
+
+    return [ArraysCache(size=1), KVCache(), ArraysCache(size=1), KVCache()]
+
+
+def test_composite_assembly_puts_paged_layers_back_in_place():
+    from mlx_vlm.models.cache import ArraysCache, KVCache
+
+    block_size = 16
+    manager = APCManager(num_blocks=8, block_size=block_size)
+    token_ids = list(range(2 * block_size))
+    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids), num_layers=2)
+    stored = manager.store_kv_blocks(
+        token_ids, layer_keys, layer_values, layer_indices=[1, 3]
+    )
+    template = _mixed_template()
+
+    out = apc_module.make_warm_composite_cache(stored, template)
+
+    assert out is not None
+    assert isinstance(out[1], KVCache) and isinstance(out[3], KVCache)
+    assert isinstance(out[0], ArraysCache) and isinstance(out[2], ArraysCache)
+    assert out[0] is template[0] and out[2] is template[2]
+    manager.release(stored)
+
+
+def test_composite_assembly_rejects_blocks_from_different_layouts():
+    block_size = 16
+    manager = APCManager(num_blocks=16, block_size=block_size)
+    token_ids = list(range(2 * block_size))
+    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids), num_layers=2)
+    a = manager.store_kv_blocks(
+        token_ids, layer_keys, layer_values, layer_indices=[1, 3]
+    )
+    other = list(range(500, 500 + 2 * block_size))
+    b = manager.store_kv_blocks(other, layer_keys, layer_values, layer_indices=[0, 2])
+
+    assert apc_module.make_warm_composite_cache(a + b, _mixed_template()) is None
+    manager.release(a)
+    manager.release(b)
+
+
+def test_composite_assembly_rejects_an_index_past_the_template():
+    block_size = 16
+    manager = APCManager(num_blocks=8, block_size=block_size)
+    token_ids = list(range(2 * block_size))
+    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids), num_layers=2)
+    stored = manager.store_kv_blocks(
+        token_ids, layer_keys, layer_values, layer_indices=[1, 99]
+    )
+
+    assert apc_module.make_warm_composite_cache(stored, _mixed_template()) is None
+    manager.release(stored)

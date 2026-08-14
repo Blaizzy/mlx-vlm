@@ -3653,6 +3653,42 @@ def _fill_batch_layer_cache(
     return c
 
 
+def make_warm_composite_cache(
+    matched_blocks: List[APCBlock],
+    template: Sequence[Any],
+    min_capacity_tokens: Optional[int] = None,
+    kv_quant_config: Optional[dict] = None,
+) -> Optional[List[Any]]:
+    """Place the paged layers of a hybrid back into the model's own layout.
+
+    ``template`` is a fresh cache from the model, which supplies an entry of the
+    right type for every layer. The blocks only cover the layers they were
+    harvested from, so they are stitched as usual and then dropped into those
+    positions. Returns ``None`` when the blocks do not describe a layout this
+    template can accept.
+    """
+    if not matched_blocks or not template:
+        return None
+    indices = matched_blocks[0].layer_indices
+    if not indices or any(b.layer_indices != indices for b in matched_blocks):
+        return None
+    if any(index >= len(template) for index in indices):
+        return None
+
+    warm = make_warm_kv_cache(
+        matched_blocks,
+        min_capacity_tokens=min_capacity_tokens,
+        kv_quant_config=kv_quant_config,
+    )
+    if len(warm) != len(indices):
+        return None
+
+    out = list(template)
+    for slot, layer_index in enumerate(indices):
+        out[layer_index] = warm[slot]
+    return out
+
+
 def make_warm_kv_cache(
     matched_blocks: List[APCBlock],
     min_capacity_tokens: Optional[int] = None,
