@@ -1454,30 +1454,46 @@ def test_longest_prefix_still_wins_after_eviction():
     assert prefix_len == 192
 
 
-def test_partial_harvest_skips_every_non_pageable_type_not_just_kv_less_ones():
-    """A RotatingKVCache exposes .keys/.values but is not block-pageable.
+def test_partial_harvest_skips_non_pageable_layers_that_still_expose_kv():
+    """Four cache types expose .keys/.values but cannot be paged.
 
-    Skipping on "yields no KV" would page a sliding-window layer's ring buffer
-    as if it were linear trimmable KV.
+    Deciding by "does this layer yield KV" would harvest a ring buffer or a
+    chunked layout into blocks as if it were linear, trimmable KV.
     """
-    from mlx_vlm.models.cache import ArraysCache, KVCache, RotatingKVCache
-
-    rotating = RotatingKVCache(max_size=64, keep=0)
-    rotating.update_and_fetch(mx.zeros((1, 1, 64, 4)), mx.zeros((1, 1, 64, 4)))
-    plain = KVCache()
-    plain.update_and_fetch(mx.zeros((1, 1, 64, 4)), mx.zeros((1, 1, 64, 4)))
-    cache = [plain, rotating, ArraysCache(2)]
-
-    manager = APCManager(num_blocks=64, block_size=16)
-    blocks = harvest_blocks_from_batch_cache(
-        manager, cache, list(range(64)), allow_partial_layers=True
+    from mlx_vlm.models.cache import (
+        ArraysCache,
+        BufferedRotatingKVCache,
+        ChunkedKVCache,
+        ConcatenateKVCache,
+        KVCache,
+        RotatingKVCache,
     )
 
-    assert blocks
-    pageable, _ = apc_module.partition_cache_by_pageability(cache)
-    assert blocks[0].layer_indices == tuple(pageable) == (0,)
-    assert not apc_module._cache_entry_supports_block_apc(rotating)
-    manager.release(blocks)
+    factories = {
+        "rotating": lambda: RotatingKVCache(max_size=64, keep=0),
+        "chunked": lambda: ChunkedKVCache(64),
+        "concatenate": lambda: ConcatenateKVCache(),
+        "buffered_rotating": lambda: BufferedRotatingKVCache(max_size=64, keep=0),
+    }
+
+    for label, factory in factories.items():
+        non_pageable = factory()
+        non_pageable.update_and_fetch(mx.zeros((1, 1, 64, 4)), mx.zeros((1, 1, 64, 4)))
+        plain = KVCache()
+        plain.update_and_fetch(mx.zeros((1, 1, 64, 4)), mx.zeros((1, 1, 64, 4)))
+        cache = [plain, non_pageable, ArraysCache(2)]
+
+        manager = APCManager(num_blocks=64, block_size=16)
+        blocks = harvest_blocks_from_batch_cache(
+            manager, cache, list(range(64)), allow_partial_layers=True
+        )
+
+        assert blocks, label
+        pageable, _ = apc_module.partition_cache_by_pageability(cache)
+        assert blocks[0].layer_indices == tuple(pageable) == (0,), label
+        assert not apc_module._cache_entry_supports_block_apc(non_pageable), label
+        assert apc_module.layer_kv_for_apc(non_pageable)[0] is not None, label
+        manager.release(blocks)
 
 
 def test_partial_harvest_agrees_with_the_partition_helper():
