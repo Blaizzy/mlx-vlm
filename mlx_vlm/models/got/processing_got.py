@@ -10,7 +10,18 @@ from ..base import install_auto_processor_patch
 GOT_OCR_MEAN = (0.48145466, 0.4578275, 0.40821073)
 GOT_OCR_STD = (0.26862954, 0.26130258, 0.27577711)
 
+# Image tags from tokenization_qwen.py. ModelConfig carries the same three
+# tokens as ids under im_start_token / im_end_token / im_patch_token, which
+# despite the names are <img> / </img> / <imgpad>, not <|im_start|> / <|im_end|>.
+IMG_START_TAG = "<img>"
+IMG_END_TAG = "</img>"
+IMG_PAD_TAG = "<imgpad>"
+
+# config.image_token_len: 1024/16 patches, downsampled twice, is a 16x16 grid.
 IMAGE_TOKEN_LEN = 256
+
+# mlx-vlm's generic placeholder, substituted in place when the caller uses one.
+IMAGE_PLACEHOLDER = "<image>"
 
 # The MPT conversation GOT was trained with, from modeling_GOT.py. The tokenizer
 # ships no chat template, so otherwise the model gets a bare instruction.
@@ -24,15 +35,21 @@ GOT_USER_ROLE = "<|im_start|>user\n"
 GOT_ASSISTANT_ROLE = "<|im_start|>assistant\n"
 
 
-def build_got_prompt(instruction: str, has_image: bool = True) -> str:
+def build_got_prompt(
+    instruction: str,
+    has_image: bool = True,
+    image_token_len: int = IMAGE_TOKEN_LEN,
+) -> str:
     """Wrap an OCR instruction in the MPT conversation GOT expects."""
     if GOT_SEP in instruction or GOT_USER_ROLE in instruction:
         return instruction
 
-    image_tokens = "<img>" + "<imgpad>" * IMAGE_TOKEN_LEN + "</img>\n"
     if has_image:
-        if "<image>" in instruction:
-            instruction = instruction.replace("<image>", image_tokens)
+        image_tokens = (
+            IMG_START_TAG + IMG_PAD_TAG * image_token_len + IMG_END_TAG + "\n"
+        )
+        if IMAGE_PLACEHOLDER in instruction:
+            instruction = instruction.replace(IMAGE_PLACEHOLDER, image_tokens)
         else:
             instruction = image_tokens + instruction
 
