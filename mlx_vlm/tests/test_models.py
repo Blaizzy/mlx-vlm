@@ -10,6 +10,1726 @@ import numpy as np
 from mlx.utils import tree_flatten, tree_map
 
 
+class TestNanochatModel(unittest.TestCase):
+    def test_native_loader_and_cached_forward(self):
+        from mlx_vlm.models import nanochat
+        from mlx_vlm.utils import get_model_and_args
+
+        config = nanochat.ModelConfig(
+            model_type="nanochat",
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=64,
+            max_position_embeddings=128,
+            intermediate_size=64,
+            rope_theta=10000.0,
+        )
+        model = nanochat.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        first_logits = model(inputs[:, :2], cache=cache).logits
+        second_logits = model(inputs[:, 2:], cache=cache).logits
+        cached_logits = mx.concatenate([first_logits, second_logits], axis=1)
+        mx.eval(full_logits, cached_logits)
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(len(model.layers), config.num_hidden_layers)
+
+        model_module, model_type = get_model_and_args(config.to_dict())
+        self.assertIs(model_module, nanochat)
+        self.assertEqual(model_type, "nanochat")
+
+    def test_sanitize_adds_native_wrapper_prefix(self):
+        from mlx_vlm.models import nanochat
+
+        model = nanochat.Model(
+            nanochat.ModelConfig(
+                vocab_size=8,
+                hidden_size=8,
+                intermediate_size=16,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+            )
+        )
+        weights = {"transformer.wte.weight": mx.zeros((8, 8))}
+
+        sanitized = model.sanitize(weights)
+
+        self.assertEqual(set(sanitized), {"language_model.transformer.wte.weight"})
+
+
+class TestMamba2Model(unittest.TestCase):
+    def _config(self, tied=True):
+        from mlx_vlm.models import mamba2
+
+        return mamba2.ModelConfig(
+            model_type="mamba2",
+            num_heads=4,
+            head_dim=8,
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=32,
+            state_size=8,
+            num_hidden_layers=2,
+            layer_norm_epsilon=1e-5,
+            conv_kernel=4,
+            n_groups=2,
+            use_bias=False,
+            use_conv_bias=True,
+            tie_word_embeddings=tied,
+            time_step_limit=(0.0, float("inf")),
+            time_step_rank="auto",
+        )
+
+    def test_native_loader_cached_forward_and_conv_sanitize(self):
+        from mlx_vlm.models import mamba2
+        from mlx_vlm.models.cache import ArraysCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = mamba2.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {"backbone.layers.0.mixer.conv1d.weight": mx.zeros((64, 1, 4))}
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertTrue(all(isinstance(item, ArraysCache) for item in cache))
+        self.assertEqual(
+            sanitized["language_model.backbone.layers.0.mixer.conv1d.weight"].shape,
+            (64, 4, 1),
+        )
+        self.assertEqual(config.time_step_rank, 2)
+        self.assertEqual(config.ssm_state_size, config.state_size)
+        self.assertIs(model_module, mamba2)
+        self.assertEqual(model_type, "mamba2")
+
+
+class TestPlamo2Model(unittest.TestCase):
+    def test_native_loader_cached_forward_and_conv_sanitize(self):
+        from mlx_vlm.models import plamo2
+        from mlx_vlm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = plamo2.ModelConfig(
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            hidden_size_per_head=8,
+            intermediate_size=64,
+            mamba_num_heads=4,
+            mamba_d_state=8,
+            mamba_d_conv=4,
+            mamba_step=2,
+            vocab_size=64,
+        )
+        mx.random.seed(0)
+        model = plamo2.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {"model.layers.layers.0.mixer.conv1d.weight": mx.zeros((32, 1, 4))}
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertLess(mx.max(mx.abs(full_logits - cached_logits)).item(), 2e-3)
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertEqual(
+            sanitized["language_model.model.layers.layers.0.mixer.conv1d.weight"].shape,
+            (32, 4, 1),
+        )
+        self.assertIs(model_module, plamo2)
+        self.assertEqual(model_type, "plamo2")
+
+
+class TestAFM7Model(unittest.TestCase):
+    def test_concatenate_kv_cache(self):
+        from mlx_vlm.models.cache import ConcatenateKVCache
+
+        cache = ConcatenateKVCache()
+        keys = mx.arange(16).reshape(1, 2, 2, 4)
+        values = keys + 16
+        cache.update_and_fetch(keys[:, :, :1], values[:, :, :1])
+        cached_keys, cached_values = cache.update_and_fetch(
+            keys[:, :, 1:], values[:, :, 1:]
+        )
+        mx.eval(cached_keys, cached_values)
+
+        self.assertEqual(cache.offset, 2)
+        self.assertEqual(cached_keys.tolist(), keys.tolist())
+        self.assertEqual(cached_values.tolist(), values.tolist())
+        self.assertEqual(cache.trim(1), 1)
+        self.assertEqual(cache.state[0].shape[-2], 1)
+
+        restored = ConcatenateKVCache()
+        restored.prefix_cache_restore(cache.prefix_cache_snapshot())
+        self.assertEqual(restored.offset, 1)
+        self.assertEqual(restored.state[0].tolist(), cache.state[0].tolist())
+
+    def test_native_loader_cached_forward_and_kv_reuse(self):
+        from mlx_vlm.models import afm7
+        from mlx_vlm.models.afm7.language import FusedLinear
+        from mlx_vlm.models.cache import KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = afm7.ModelConfig(
+            model_type="afm7",
+            vocab_size=64,
+            hidden_dim=32,
+            num_layers=4,
+            num_kv_reuse_layers=2,
+            num_heads=4,
+            num_kv_heads=2,
+            hidden_dim_scale_factor=2.0,
+        )
+        mx.random.seed(0)
+        model = afm7.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize({"model.embedding.weight": mx.zeros((64, 32))})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(len(model.language_model.model.layers), 2)
+        self.assertEqual(len(model.language_model.model.kv_reuse_layers), 2)
+        self.assertEqual(len(model.layers), config.num_layers)
+        self.assertTrue(all(isinstance(item, KVCache) for item in cache))
+        self.assertEqual(cache[-1].offset, inputs.shape[1])
+        self.assertIsInstance(
+            model.language_model.model.layers[0].self_attn.qkv_proj, FusedLinear
+        )
+        self.assertEqual(
+            model.language_model.model.layers[0].self_attn.qkv_proj.output_dims,
+            [32, 16, 16],
+        )
+        self.assertEqual(set(sanitized), {"language_model.model.embedding.weight"})
+        self.assertIs(model_module, afm7)
+        self.assertEqual(model_type, "afm7")
+
+
+class TestJambaModel(unittest.TestCase):
+    def test_native_loader_hybrid_cache_and_expert_sanitize(self):
+        from mlx_vlm.models import jamba
+        from mlx_vlm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = jamba.ModelConfig(
+            model_type="jamba",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            attn_layer_offset=1,
+            attn_layer_period=2,
+            expert_layer_offset=0,
+            expert_layer_period=2,
+            mamba_d_conv=4,
+            mamba_d_state=8,
+            mamba_expand=2,
+            num_experts=2,
+            num_experts_per_tok=2,
+            rms_norm_eps=1e-5,
+            max_position_embeddings=128,
+            vocab_size=64,
+        )
+        mx.random.seed(0)
+        model = jamba.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {
+                "model.layers.0.mamba.conv1d.weight": mx.zeros((64, 1, 4)),
+                "model.layers.0.feed_forward.experts.0.gate_proj.weight": mx.zeros(
+                    (64, 32)
+                ),
+                "model.layers.0.feed_forward.experts.1.gate_proj.weight": mx.ones(
+                    (64, 32)
+                ),
+                "lm_head.weight": mx.zeros((64, 32)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertEqual(config.mamba_dt_rank, 2)
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.mamba.conv1d.weight"].shape,
+            (64, 4, 1),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.feed_forward.switch_mlp.gate_proj.weight"
+            ].shape,
+            (2, 64, 32),
+        )
+        self.assertNotIn("language_model.lm_head.weight", sanitized)
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.router", None),
+            {
+                "group_size": 64,
+                "bits": 8,
+            },
+        )
+        self.assertIs(model_module, jamba)
+        self.assertEqual(model_type, "jamba")
+
+
+class TestBailingMoeLinearModel(unittest.TestCase):
+    def test_native_loader_hybrid_cache_expert_sanitize_and_predicates(self):
+        from mlx_vlm.models import bailing_moe_linear
+        from mlx_vlm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = bailing_moe_linear.ModelConfig(
+            model_type="bailing_moe_linear",
+            hidden_size=32,
+            intermediate_size=64,
+            max_position_embeddings=128,
+            moe_intermediate_size=48,
+            num_experts=4,
+            num_shared_experts=1,
+            norm_topk_prob=True,
+            num_attention_heads=4,
+            num_experts_per_tok=2,
+            num_hidden_layers=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            vocab_size=64,
+            first_k_dense_replace=1,
+            layer_group_size=2,
+            group_norm_size=4,
+            use_qk_norm=True,
+            norm_head=True,
+            moe_router_enable_expert_bias=True,
+            score_function="sigmoid",
+            n_group=2,
+            topk_group=1,
+            head_dim=8,
+        )
+        mx.random.seed(0)
+        model = bailing_moe_linear.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {
+                **{
+                    f"model.layers.1.mlp.experts.{expert}.gate_proj.weight": mx.full(
+                        (48, 32), expert
+                    )
+                    for expert in range(config.num_experts)
+                },
+                "model.layers.1.mlp.gate.weight": mx.ones((4, 32)),
+                "lm_head.weight": mx.ones((64, 32)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertIsInstance(cache[2], ArraysCache)
+        self.assertIsInstance(cache[3], KVCache)
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight"
+            ].shape,
+            (4, 48, 32),
+        )
+        self.assertIn(
+            "language_model.model.layers.1.mlp.gate.gate_proj.weight", sanitized
+        )
+        self.assertTrue(
+            mx.allclose(
+                mx.linalg.norm(sanitized["language_model.lm_head.weight"], axis=0),
+                mx.ones((32,)),
+                atol=1e-5,
+            ).item()
+        )
+        self.assertFalse(model.cast_predicate("model.layers.1.mlp.gate.expert_bias"))
+        self.assertEqual(
+            model.quant_predicate("model.layers.1.mlp.gate.gate_proj", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, bailing_moe_linear)
+        self.assertEqual(model_type, "bailing_moe_linear")
+
+
+class TestGraniteMoeHybridModel(unittest.TestCase):
+    def _config(self, use_moe=True):
+        from mlx_vlm.models import granitemoehybrid
+
+        return granitemoehybrid.ModelConfig(
+            model_type="granitemoehybrid",
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=48,
+            num_hidden_layers=4,
+            max_position_embeddings=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            attention_bias=False,
+            embedding_multiplier=2.0,
+            attention_multiplier=0.5,
+            logits_scaling=4.0,
+            residual_multiplier=0.75,
+            layer_types=["mamba", "attention", "mamba", "attention"],
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            num_local_experts=4 if use_moe else None,
+            num_experts_per_tok=2 if use_moe else None,
+            shared_intermediate_size=40 if use_moe else None,
+            mamba_n_heads=4,
+            mamba_d_head=8,
+            mamba_proj_bias=False,
+            mamba_d_state=8,
+            mamba_d_conv=4,
+            mamba_n_groups=2,
+            mamba_conv_bias=True,
+            tie_word_embeddings=False,
+        )
+
+    def test_native_loader_hybrid_cache_moe_sanitize_and_predicate(self):
+        from mlx_vlm.models import granitemoehybrid
+        from mlx_vlm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        mx.random.seed(0)
+        model = granitemoehybrid.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        input_weights = {
+            f"model.layers.{layer}.block_sparse_moe.input_linear.weight": mx.ones(
+                (4, 96, 32)
+            )
+            for layer in range(config.num_hidden_layers)
+        }
+        output_weights = {
+            f"model.layers.{layer}.block_sparse_moe.output_linear.weight": mx.ones(
+                (4, 32, 48)
+            )
+            for layer in range(config.num_hidden_layers)
+        }
+        sanitized = model.sanitize(
+            {
+                **input_weights,
+                **output_weights,
+                "model.layers.0.mamba.conv1d.weight": mx.ones((80, 1, 4)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertIsInstance(cache[2], ArraysCache)
+        self.assertIsInstance(cache[3], KVCache)
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.block_sparse_moe.switch_mlp.gate_proj.weight"
+            ].shape,
+            (4, 48, 32),
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.mamba.conv1d.weight"].shape,
+            (80, 4, 1),
+        )
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.block_sparse_moe.router.layer", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, granitemoehybrid)
+        self.assertEqual(model_type, "granitemoehybrid")
+
+    def test_dense_checkpoint_sanitize(self):
+        from mlx_vlm.models import granitemoehybrid
+
+        config = self._config(use_moe=False)
+        model = granitemoehybrid.Model(config)
+        weights = {
+            f"model.layers.{layer}.shared_mlp.input_linear.weight": mx.ones((96, 32))
+            for layer in range(config.num_hidden_layers)
+        }
+        weights.update(
+            {
+                f"model.layers.{layer}.shared_mlp.output_linear.weight": mx.ones(
+                    (32, 48)
+                )
+                for layer in range(config.num_hidden_layers)
+            }
+        )
+
+        sanitized = model.sanitize(weights)
+
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.mlp.gate_proj.weight"].shape,
+            (48, 32),
+        )
+        self.assertTrue(
+            model.quant_predicate("model.layers.0.block_sparse_moe.router.layer", None)
+        )
+
+
+class TestKimiLinearModel(unittest.TestCase):
+    def test_native_loader_hybrid_cache_sanitize_and_predicates(self):
+        from mlx_vlm.models import kimi_linear
+        from mlx_vlm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = kimi_linear.ModelConfig(
+            model_type="kimi_linear",
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            intermediate_size=64,
+            head_dim=8,
+            rope_theta=10000.0,
+            rms_norm_eps=1e-5,
+            linear_attn_config={
+                "kda_layers": [1, 3],
+                "num_heads": 4,
+                "head_dim": 8,
+                "short_conv_kernel_size": 4,
+            },
+            model_max_length=128,
+            num_experts=4,
+            moe_intermediate_size=48,
+            kv_lora_rank=8,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            num_experts_per_token=2,
+            num_shared_experts=1,
+            moe_router_activation_func="sigmoid",
+            num_expert_group=2,
+            topk_group=1,
+        )
+        mx.random.seed(0)
+        model = kimi_linear.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        weights = {
+            **{
+                f"model.layers.0.block_sparse_moe.experts.{expert}.{projection}.weight": mx.full(
+                    (
+                        48 if projection != "w2" else 32,
+                        32 if projection != "w2" else 48,
+                    ),
+                    expert,
+                )
+                for expert in range(config.num_experts)
+                for projection in ("w1", "w2", "w3")
+            },
+            "model.layers.0.block_sparse_moe.gate.weight": mx.ones((4, 32)),
+            "model.layers.0.block_sparse_moe.gate.e_score_correction_bias": mx.ones(
+                (4,)
+            ),
+            "model.layers.0.self_attn.q_conv1d.weight": mx.ones((32, 1, 4)),
+            "model.layers.0.self_attn.dt_bias": mx.ones((4, 8)),
+            "model.layers.1.self_attn.kv_b_proj.weight": mx.ones((32, 8)),
+            "model.mtp.layers.0.weight": mx.ones((1,)),
+        }
+        sanitized = model.sanitize(weights)
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertIsInstance(cache[2], ArraysCache)
+        self.assertIsInstance(cache[3], KVCache)
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
+            ].shape,
+            (4, 48, 32),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.self_attn.q_conv.conv.weight"
+            ].shape,
+            (32, 4, 1),
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.self_attn.dt_bias"].shape,
+            (32,),
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.1.self_attn.embed_q.weight"].shape,
+            (4, 8, 4),
+        )
+        self.assertFalse(
+            model.cast_predicate("model.layers.0.mlp.e_score_correction_bias")
+        )
+        self.assertFalse(model.cast_predicate("model.layers.0.self_attn.A_log"))
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.mlp.gate", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, kimi_linear)
+        self.assertEqual(model_type, "kimi_linear")
+
+
+class TestStep3p5Model(unittest.TestCase):
+    def _config(self):
+        from mlx_vlm.models import step3p5
+
+        return step3p5.ModelConfig(
+            model_type="step3p5",
+            hidden_size=32,
+            num_hidden_layers=4,
+            vocab_size=64,
+            num_attention_heads=4,
+            num_attention_groups=2,
+            head_dim=8,
+            intermediate_size=64,
+            rms_norm_eps=1e-5,
+            rope_theta=[10000.0, 12000.0, 14000.0, 16000.0],
+            max_position_embeddings=128,
+            sliding_window=8,
+            layer_types=[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            yarn_only_types=["full_attention"],
+            partial_rotary_factors=[0.5, 1.0, 0.5, 1.0],
+            attention_other_setting={
+                "num_attention_heads": 2,
+                "num_attention_groups": 1,
+            },
+            use_head_wise_attn_gate=True,
+            moe_num_experts=4,
+            moe_top_k=2,
+            moe_intermediate_size=48,
+            share_expert_dim=40,
+            moe_layers_enum="1,3",
+            moe_router_scaling_factor=0.75,
+            norm_expert_weight=True,
+            swiglu_limits=[0.0, 1.5, 0.0, 2.0],
+            swiglu_limits_shared=[1.0, 1.25, 1.5, 1.75],
+        )
+
+    def test_native_loader_dual_cache_sanitize_and_predicates(self):
+        from mlx_vlm.models import step3p5
+        from mlx_vlm.models.cache import KVCache, RotatingKVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        mx.random.seed(0)
+        model = step3p5.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {
+                "model.layers.1.moe.gate_proj.weight": mx.ones((4, 48, 32)),
+                "model.layers.1.moe.router_bias": mx.ones((4,)),
+                "model.layers.1.share_expert.gate_proj.weight": mx.ones((40, 32)),
+                "model.layers.1.input_layernorm.weight": mx.zeros((32,)),
+                "model.layers.4.moe.gate_proj.weight": mx.ones((4, 48, 32)),
+                "model.mtp.layers.0.weight": mx.ones((1,)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertIsInstance(cache[0], RotatingKVCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertIsInstance(cache[2], RotatingKVCache)
+        self.assertIsInstance(cache[3], KVCache)
+        self.assertIn(
+            "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight",
+            sanitized,
+        )
+        self.assertIn("language_model.model.layers.1.mlp.gate.router_bias", sanitized)
+        self.assertIn(
+            "language_model.model.layers.1.mlp.share_expert.gate_proj.weight",
+            sanitized,
+        )
+        self.assertTrue(
+            mx.allclose(
+                sanitized["language_model.model.layers.1.input_layernorm.weight"],
+                mx.ones((32,)),
+            ).item()
+        )
+        self.assertNotIn(
+            "language_model.model.layers.4.mlp.switch_mlp.gate_proj.weight",
+            sanitized,
+        )
+        self.assertFalse(model.cast_predicate("model.layers.1.mlp.gate.router_bias"))
+        self.assertEqual(
+            model.quant_predicate("model.layers.1.mlp.gate.gate", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, step3p5)
+        self.assertEqual(model_type, "step3p5")
+
+    def test_sharding_path(self):
+        from unittest.mock import patch
+
+        from mlx_vlm.models import step3p5
+
+        class Group:
+            @staticmethod
+            def size():
+                return 1
+
+        model = step3p5.Model(self._config())
+        with (
+            patch(
+                "mlx_vlm.models.step3p5.language.shard_linear",
+                side_effect=lambda layer, *args, **kwargs: layer,
+            ) as shard_linear,
+            patch("mlx_vlm.models.step3p5.language.shard_inplace") as shard_inplace,
+        ):
+            model.shard(Group())
+
+        self.assertEqual(shard_linear.call_count, 26)
+        self.assertEqual(shard_inplace.call_count, 12)
+
+
+class TestMiniMaxModel(unittest.TestCase):
+    def test_native_loader_cache_expert_sanitize_and_predicates(self):
+        from mlx_vlm.models import minimax
+        from mlx_vlm.models.cache import KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = minimax.ModelConfig(
+            model_type="minimax",
+            hidden_size=32,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            num_experts_per_tok=2,
+            num_local_experts=4,
+            shared_intermediate_size=64,
+            num_hidden_layers=2,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            rotary_dim=4,
+            vocab_size=64,
+            tie_word_embeddings=False,
+            head_dim=8,
+            use_qk_norm=True,
+        )
+        mx.random.seed(0)
+        model = minimax.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {
+                f"model.layers.0.block_sparse_moe.experts.{expert}.w1.weight": mx.full(
+                    (64, 32), expert
+                )
+                for expert in range(config.num_local_experts)
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertTrue(all(isinstance(item, KVCache) for item in cache))
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.block_sparse_moe.switch_mlp.gate_proj.weight"
+            ].shape,
+            (4, 64, 32),
+        )
+        self.assertFalse(model.cast_predicate("e_score_correction_bias"))
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.block_sparse_moe.gate", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, minimax)
+        self.assertEqual(model_type, "minimax")
+
+
+class TestLongcatFlashModel(unittest.TestCase):
+    def test_native_loader_dual_cache_sanitize_and_predicates(self):
+        from mlx_vlm.models import longcat_flash
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = longcat_flash.ModelConfig(
+            model_type="longcat_flash",
+            attention_method="mla",
+            zero_expert_type="identity",
+            hidden_size=32,
+            ffn_hidden_size=64,
+            moe_topk=2,
+            expert_ffn_hidden_size=48,
+            n_routed_experts=3,
+            zero_expert_num=1,
+            num_layers=1,
+            vocab_size=64,
+            max_position_embeddings=128,
+            num_attention_heads=4,
+            kv_lora_rank=8,
+            q_lora_rank=8,
+            qk_rope_head_dim=4,
+            qk_nope_head_dim=4,
+            v_head_dim=4,
+            routed_scaling_factor=1.0,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            mla_scale_q_lora=True,
+            mla_scale_kv_lora=True,
+            attention_bias=False,
+            norm_topk_prob=True,
+            router_bias=False,
+        )
+        mx.random.seed(0)
+        model = longcat_flash.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        weights = {
+            f"model.layers.0.mlp.experts.{expert}.gate_proj.weight": mx.full(
+                (48, 32), expert
+            )
+            for expert in range(config.n_routed_experts)
+        }
+        for index in range(2):
+            weights[f"model.layers.0.self_attn.{index}.kv_b_proj.weight"] = mx.zeros(
+                (32, 8)
+            )
+        weights["model.mtp.layers.0.weight"] = mx.zeros((1,))
+        sanitized = model.sanitize(weights)
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(len(cache), config.num_layers)
+        self.assertIsInstance(cache[0], CacheList)
+        self.assertTrue(all(isinstance(item, KVCache) for item in cache[0].caches))
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
+            ].shape,
+            (3, 48, 32),
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.self_attn.0.embed_q.weight"].shape,
+            (4, 8, 4),
+        )
+        self.assertFalse(any("model.mtp" in key for key in sanitized))
+        self.assertFalse(model.cast_predicate("e_score_correction_bias"))
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.mlp.router.classifier", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, longcat_flash)
+        self.assertEqual(model_type, "longcat_flash")
+
+
+class TestLongcatFlashNgramModel(unittest.TestCase):
+    def test_native_loader_ngram_context_and_dual_cache(self):
+        from mlx_vlm.models import longcat_flash_ngram
+        from mlx_vlm.models.cache import ArraysCache, CacheList
+        from mlx_vlm.utils import get_model_and_args
+
+        config = longcat_flash_ngram.ModelConfig(
+            model_type="longcat_flash_ngram",
+            hidden_size=32,
+            ffn_hidden_size=64,
+            moe_topk=2,
+            expert_ffn_hidden_size=48,
+            n_routed_experts=3,
+            zero_expert_num=1,
+            num_layers=1,
+            vocab_size=64,
+            max_position_embeddings=128,
+            num_attention_heads=4,
+            kv_lora_rank=8,
+            q_lora_rank=8,
+            qk_rope_head_dim=4,
+            qk_nope_head_dim=4,
+            v_head_dim=4,
+            routed_scaling_factor=1.0,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            mla_scale_q_lora=True,
+            mla_scale_kv_lora=True,
+            ngram_vocab_size_ratio=2,
+            emb_neighbor_num=3,
+            emb_split_num=2,
+            norm_topk_prob=True,
+        )
+        mx.random.seed(0)
+        model = longcat_flash_ngram.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize({"model.embed_tokens.weight": mx.zeros((64, 32))})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], CacheList)
+        self.assertEqual(cache[0][0].tolist(), [[3, 4]])
+        self.assertEqual(
+            set(sanitized),
+            {"language_model.model.ngram_embeddings.word_embeddings.weight"},
+        )
+        self.assertIs(model_module, longcat_flash_ngram)
+        self.assertEqual(model_type, "longcat_flash_ngram")
+
+
+class TestGlm4MoeLiteModel(unittest.TestCase):
+    def test_native_loader_mla_cache_and_checkpoint_sanitize(self):
+        from mlx_vlm.models import glm4_moe_lite
+        from mlx_vlm.models.cache import KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = glm4_moe_lite.ModelConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            moe_intermediate_size=48,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            routed_scaling_factor=1.25,
+            kv_lora_rank=8,
+            q_lora_rank=8,
+            qk_rope_head_dim=4,
+            qk_nope_head_dim=4,
+            v_head_dim=4,
+            norm_topk_prob=True,
+            n_group=2,
+            topk_group=1,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            max_position_embeddings=128,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+        )
+        mx.random.seed(0)
+        model = glm4_moe_lite.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        weights = {
+            f"model.layers.1.mlp.experts.{expert}.gate_proj.weight": mx.full(
+                (48, 32), expert
+            )
+            for expert in range(config.n_routed_experts)
+        }
+        weights["model.layers.0.self_attn.kv_b_proj.weight"] = mx.zeros((32, 8))
+        weights["model.layers.3.weight"] = mx.zeros((1,))
+        sanitized = model.sanitize(weights)
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertTrue(all(isinstance(item, KVCache) for item in cache))
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight"
+            ].shape,
+            (4, 48, 32),
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.self_attn.embed_q.weight"].shape,
+            (4, 8, 4),
+        )
+        self.assertNotIn("language_model.model.layers.3.weight", sanitized)
+        self.assertFalse(model.cast_predicate("e_score_correction_bias"))
+        self.assertIs(model_module, glm4_moe_lite)
+        self.assertEqual(model_type, "glm4_moe_lite")
+
+
+class TestRWKV7Model(unittest.TestCase):
+    def test_native_loader_recurrent_cache_kernel_and_sanitize(self):
+        from mlx_vlm.models import rwkv7
+        from mlx_vlm.models.cache import ArraysCache
+        from mlx_vlm.models.rwkv7 import language
+        from mlx_vlm.utils import get_model_and_args
+
+        config = rwkv7.ModelConfig(
+            model_type="rwkv7",
+            vocab_size=64,
+            hidden_size=64,
+            intermediate_size=128,
+            norm_eps=1e-5,
+            head_dim=32,
+            num_hidden_layers=2,
+            a_low_rank_dim=8,
+            v_low_rank_dim=8,
+            gate_low_rank_dim=16,
+            decay_low_rank_dim=16,
+            tie_word_embeddings=False,
+        )
+        mx.random.seed(0)
+        model = rwkv7.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize({"model.layers.0.attn.k_k": mx.zeros((64,))})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertTrue(all(isinstance(item, ArraysCache) for item in cache))
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.attn.k_k"].shape, (2, 32)
+        )
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.attn.w_lora.lora.2", None),
+            {"bits": 8},
+        )
+        if mx.metal.is_available():
+            self.assertIsNotNone(language._wkv7_kernel)
+        self.assertIs(model_module, rwkv7)
+        self.assertEqual(model_type, "rwkv7")
+
+
+class TestFalconH1Model(unittest.TestCase):
+    def test_native_loader_hybrid_cache_and_multiplier_sanitize(self):
+        from mlx_vlm.models import falcon_h1
+        from mlx_vlm.models.cache import ArraysCache, CacheList, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = falcon_h1.ModelConfig(
+            hidden_size=32,
+            head_dim=8,
+            intermediate_size=64,
+            mamba_d_ssm=32,
+            mamba_d_state=8,
+            mamba_d_conv=4,
+            mamba_d_head=8,
+            mamba_n_groups=2,
+            mamba_n_heads=4,
+            mamba_chunk_size=16,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            vocab_size=64,
+            tie_word_embeddings=False,
+        )
+        mx.random.seed(0)
+        model = falcon_h1.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {
+                "model.layers.0.mamba.conv1d.weight": mx.ones((64, 1, 4)),
+                "model.layers.0.mamba.in_proj.weight": mx.ones((100, 32)),
+                "model.embed_tokens.weight": mx.ones((64, 32)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(len(model.layers), config.num_hidden_layers)
+        self.assertTrue(all(isinstance(item, CacheList) for item in cache))
+        self.assertIsInstance(cache[0][0], ArraysCache)
+        self.assertIsInstance(cache[0][1], KVCache)
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.mamba.conv1d.weight"].shape,
+            (64, 4, 1),
+        )
+        self.assertTrue(
+            mx.allclose(
+                sanitized["language_model.model.embed_tokens.weight"],
+                mx.full((64, 32), config.embedding_multiplier),
+            ).item()
+        )
+        self.assertIs(model_module, falcon_h1)
+        self.assertEqual(model_type, "falcon_h1")
+
+
+class TestBitNetModel(unittest.TestCase):
+    def _config(self, tied=True):
+        from mlx_vlm.models import bitnet
+
+        return bitnet.ModelConfig(
+            model_type="bitnet",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            tie_word_embeddings=tied,
+        )
+
+    def test_packed_ternary_kernel_and_loader(self):
+        from mlx_vlm.models import bitnet
+        from mlx_vlm.models.bitnet.bitlinear import BitLinear
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = bitnet.Model(config)
+        layer = BitLinear(4, 4, bias=False)
+        layer.weight = mx.array([[0b11100100] * 4], dtype=mx.uint8)
+        layer.weight_scale = mx.array([0.5], dtype=mx.float32)
+        output = layer(mx.ones((1, 4), dtype=mx.float32))
+        mx.eval(output)
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(output.tolist(), [[-2.0, 0.0, 2.0, 4.0]])
+        self.assertIsInstance(
+            model.language_model.model.layers[0].self_attn.q_proj, BitLinear
+        )
+        self.assertIs(model_module, bitnet)
+        self.assertEqual(model_type, "bitnet")
+
+    def test_cached_forward_and_sanitize(self):
+        from mlx_vlm.models import bitnet
+
+        config = self._config()
+        model = bitnet.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {
+                "model.embed_tokens.weight": mx.zeros((64, 32)),
+                "model.layers.0.self_attn.rotary_emb.inv_freq": mx.zeros((4,)),
+                "lm_head.weight": mx.zeros((64, 32)),
+            }
+        )
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(set(sanitized), {"language_model.model.embed_tokens.weight"})
+
+
+class TestMambaModel(unittest.TestCase):
+    def _config(self, model_type="mamba", tied=True):
+        from mlx_vlm.models import mamba
+
+        return mamba.ModelConfig(
+            model_type=model_type,
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            state_size=8,
+            num_hidden_layers=2,
+            conv_kernel=4,
+            use_bias=False,
+            use_conv_bias=True,
+            time_step_rank="auto",
+            tie_word_embeddings=tied,
+        )
+
+    def test_native_loader_cached_forward_and_conv_sanitize(self):
+        from mlx_vlm.models import mamba
+        from mlx_vlm.models.cache import ArraysCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = mamba.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        original = mx.zeros((64, 1, 4))
+        sanitized = model.sanitize({"backbone.layers.0.mixer.conv1d.weight": original})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertTrue(all(isinstance(item, ArraysCache) for item in cache))
+        self.assertEqual(
+            sanitized["language_model.backbone.layers.0.mixer.conv1d.weight"].shape,
+            (64, 4, 1),
+        )
+        self.assertEqual(config.time_step_rank, 2)
+        self.assertIs(model_module, mamba)
+        self.assertEqual(model_type, "mamba")
+
+    def test_falcon_mamba_rms_and_untied_head(self):
+        from mlx_vlm.models import mamba
+
+        config = self._config(model_type="falcon_mamba", tied=False)
+        model = mamba.Model(config)
+        self.assertTrue(config.use_bcdt_rms)
+        self.assertEqual(model(mx.array([[1]])).logits.shape, (1, 1, 64))
+
+
+class TestMellumModel(unittest.TestCase):
+    def _config(self, tie_word_embeddings=True):
+        from mlx_vlm.models import mellum
+
+        return mellum.ModelConfig(
+            model_type="mellum",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_experts=3,
+            num_experts_per_tok=2,
+            moe_intermediate_size=48,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            num_key_value_heads=2,
+            head_dim=8,
+            tie_word_embeddings=tie_word_embeddings,
+            max_position_embeddings=128,
+            norm_topk_prob=True,
+            sliding_window=4,
+            layer_types=["full_attention", "sliding_attention"],
+            rope_parameters={
+                "full_attention": {"rope_theta": 10000.0},
+                "sliding_attention": {"rope_theta": 10000.0},
+            },
+        )
+
+    def test_native_loader_mixed_cache_and_quant_predicate(self):
+        from mlx_vlm.models import mellum
+        from mlx_vlm.models.cache import KVCache, RotatingKVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = mellum.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertIsInstance(cache[0], KVCache)
+        self.assertIsInstance(cache[1], RotatingKVCache)
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.mlp.gate", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, mellum)
+        self.assertEqual(model_type, "mellum")
+
+    def test_sanitize_stacks_experts_and_drops_tied_head(self):
+        from mlx_vlm.models import mellum
+
+        config = self._config()
+        model = mellum.Model(config)
+        weights = {"lm_head.weight": mx.zeros((64, 32))}
+        for layer_idx in range(config.num_hidden_layers):
+            for expert_idx in range(config.num_experts):
+                for name in ("up_proj", "down_proj", "gate_proj"):
+                    weights[
+                        f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{name}.weight"
+                    ] = mx.full((2, 2), expert_idx)
+        sanitized = model.sanitize(weights)
+        key = "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight"
+
+        self.assertNotIn("language_model.lm_head.weight", sanitized)
+        self.assertEqual(sanitized[key].shape, (config.num_experts, 2, 2))
+
+
+class TestIQuestLoopCoderModel(unittest.TestCase):
+    def _config(self):
+        from mlx_vlm.models import iquestloopcoder
+
+        return iquestloopcoder.ModelConfig(
+            model_type="iquestloopcoder",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            head_dim=8,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            tie_word_embeddings=False,
+            loop_num=2,
+            loop_window_size=4,
+        )
+
+    def test_native_loader_dual_cache_and_checkpoint_prefix(self):
+        from mlx_vlm.models import iquestloopcoder
+        from mlx_vlm.models.cache import KVCache, RotatingKVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = iquestloopcoder.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize({"model.embed_tokens.weight": mx.zeros((64, 32))})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertTrue(all(isinstance(item, KVCache) for item in cache[:2]))
+        self.assertTrue(all(isinstance(item, RotatingKVCache) for item in cache[2:]))
+        self.assertEqual(set(sanitized), {"language_model.model.embed_tokens.weight"})
+        self.assertIs(model_module, iquestloopcoder)
+        self.assertEqual(model_type, "iquestloopcoder")
+
+    def test_rejects_unsupported_loop_count(self):
+        from mlx_vlm.models import iquestloopcoder
+
+        config = self._config()
+        config.loop_num = 3
+        with self.assertRaisesRegex(ValueError, "Only loop_num=2"):
+            iquestloopcoder.Model(config)
+
+
+class TestYoutuLLMModel(unittest.TestCase):
+    def _config(self, q_lora_rank=16, tie_word_embeddings=True):
+        from mlx_vlm.models import youtu_llm
+
+        return youtu_llm.ModelConfig(
+            model_type="youtu_llm",
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            kv_lora_rank=16,
+            q_lora_rank=q_lora_rank,
+            qk_rope_head_dim=4,
+            v_head_dim=8,
+            qk_nope_head_dim=4,
+            max_position_embeddings=128,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            rope_traditional=True,
+            tie_word_embeddings=tie_word_embeddings,
+        )
+
+    def test_native_loader_cached_forward_and_tied_sanitize(self):
+        from mlx_vlm.models import youtu_llm
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = youtu_llm.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {
+                "model.embed_tokens.weight": mx.zeros((64, 32)),
+                "lm_head.weight": mx.zeros((64, 32)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(set(sanitized), {"language_model.model.embed_tokens.weight"})
+        self.assertIs(model_module, youtu_llm)
+        self.assertEqual(model_type, "youtu_llm")
+
+    def test_direct_query_projection_and_untied_output(self):
+        from mlx_vlm.models import youtu_llm
+
+        config = self._config(q_lora_rank=None, tie_word_embeddings=False)
+        model = youtu_llm.Model(config)
+        self.assertEqual(model(mx.array([[1]])).logits.shape, (1, 1, 64))
+        self.assertTrue(
+            hasattr(model.language_model.model.layers[0].self_attn, "q_proj")
+        )
+
+
+class TestKlearModel(unittest.TestCase):
+    def _config(self):
+        from mlx_vlm.models import klear
+
+        return klear.ModelConfig(
+            model_type="Klear",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            attention_bias=False,
+            mlp_only_layers=[],
+            num_experts=2,
+            num_experts_per_tok=1,
+            decoder_sparse_step=1,
+            n_shared_experts=1,
+            moe_intermediate_size=48,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            num_key_value_heads=2,
+            rope_theta=10000.0,
+            max_position_embeddings=128,
+            norm_topk_prob=True,
+        )
+
+    def test_native_loader_cached_forward_and_predicates(self):
+        from mlx_vlm.models import klear
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = klear.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertIs(model_module, klear)
+        self.assertEqual(model_type, "klear")
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.mlp.gate", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertFalse(model.cast_predicate("model.layers.0.mlp.expert_bias"))
+
+    def test_sanitize_stacks_experts(self):
+        from mlx_vlm.models import klear
+
+        config = self._config()
+        model = klear.Model(config)
+        weights = {}
+        for layer_idx in range(config.num_hidden_layers):
+            prefix = f"model.layers.{layer_idx}.mlp.experts"
+            for expert_idx in range(config.num_experts):
+                for name in ("gate_proj", "up_proj", "down_proj"):
+                    weights[f"{prefix}.{expert_idx}.{name}.weight"] = mx.full(
+                        (2, 2), expert_idx
+                    )
+
+        sanitized = model.sanitize(weights)
+        key = "language_model.model.layers.0.mlp.experts.gate_proj.weight"
+        self.assertIn(key, sanitized)
+        self.assertEqual(sanitized[key].shape, (config.num_experts, 2, 2))
+
+
+class TestPlamoModel(unittest.TestCase):
+    def test_native_loader_cached_forward_and_checkpoint_prefix(self):
+        from mlx_vlm.models import plamo
+        from mlx_vlm.utils import get_model_and_args
+
+        config = plamo.ModelConfig(
+            model_type="plamo",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            n_shared_head=2,
+        )
+        model = plamo.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize({"model.embed_tokens.weight": mx.zeros((64, 32))})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(set(sanitized), {"language_model.model.embed_tokens.weight"})
+        self.assertIs(model_module, plamo)
+        self.assertEqual(model_type, "plamo")
+
+
+class TestLille130mModel(unittest.TestCase):
+    def test_cached_forward_and_checkpoint_prefix(self):
+        from mlx_vlm.models import lille_130m
+        from mlx_vlm.utils import get_model_and_args
+
+        config = lille_130m.ModelConfig(
+            model_type="lille-130m",
+            block_size=128,
+            layer_norm_eps=1e-5,
+            n_embd=64,
+            n_head=4,
+            n_kv_heads=2,
+            n_layer=2,
+            rope_theta=10000.0,
+            vocab_size=64,
+        )
+        model = lille_130m.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :1], cache=cache).logits,
+                model(inputs[:, 1:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {
+                "transformer.tok_embeddings.weight": mx.zeros((64, 64)),
+                "transformer.layers.0.attention.rotary_emb.inv_freq": mx.zeros((4,)),
+            }
+        )
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(
+            set(sanitized), {"language_model.transformer.tok_embeddings.weight"}
+        )
+        self.assertEqual(len(model.layers), config.n_layer)
+        model_module, model_type = get_model_and_args(config.to_dict())
+        self.assertIs(model_module, lille_130m)
+        self.assertEqual(model_type, "lille_130m")
+
+
+class TestOlmoModel(unittest.TestCase):
+    def _config(self, weight_tying=True):
+        from mlx_vlm.models import olmo
+
+        return olmo.ModelConfig(
+            model_type="olmo",
+            d_model=32,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=64,
+            embedding_size=64,
+            mlp_hidden_size=None,
+            mlp_ratio=4,
+            weight_tying=weight_tying,
+        )
+
+    def test_native_loader_and_cached_forward(self):
+        from mlx_vlm.models import olmo
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = olmo.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        first_logits = model(inputs[:, :2], cache=cache).logits
+        second_logits = model(inputs[:, 2:], cache=cache).logits
+        cached_logits = mx.concatenate([first_logits, second_logits], axis=1)
+        mx.eval(full_logits, cached_logits)
+
+        self.assertEqual(full_logits.shape, (1, 4, config.embedding_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(config.mlp_hidden_size, config.mlp_ratio * config.d_model)
+
+        model_module, model_type = get_model_and_args(config.to_dict())
+        self.assertIs(model_module, olmo)
+        self.assertEqual(model_type, "olmo")
+
+    def test_untied_output_and_checkpoint_prefix(self):
+        from mlx_vlm.models import olmo
+
+        config = self._config(weight_tying=False)
+        model = olmo.Model(config)
+        output = model(mx.array([[1]])).logits
+        sanitized = model.sanitize({"model.transformer.wte.weight": mx.zeros((64, 32))})
+
+        self.assertEqual(output.shape, (1, 1, config.embedding_size))
+        self.assertEqual(
+            set(sanitized), {"language_model.model.transformer.wte.weight"}
+        )
+
+
 class TestModels(unittest.TestCase):
     def language_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(model.model_type, model_type)
@@ -2105,6 +3825,16 @@ class TestModels(unittest.TestCase):
             config.vision_config.num_channels,
             (config.vision_config.image_size, config.vision_config.image_size),
         )
+
+        sanitized = model.sanitize(
+            {
+                "model.embed_tokens.weight": mx.zeros((2, 2)),
+                "lm_head.weight": mx.zeros((2, 2)),
+                "language_model.lm_head.weight": mx.zeros((2, 2)),
+            }
+        )
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        self.assertNotIn("language_model.lm_head.weight", sanitized)
 
     def test_paligemma(self):
         from mlx_vlm.models import paligemma
@@ -4396,9 +6126,8 @@ class TestModels(unittest.TestCase):
         import tempfile
         from pathlib import Path
 
-        from mlx_lm.utils import quantize_model
-
         from mlx_vlm.models import gemma4
+        from mlx_vlm.quant_utils import quantize_model
         from mlx_vlm.utils import load_model, save_config, save_weights
 
         text_config = gemma4.TextConfig(

@@ -13,13 +13,13 @@ import mlx.nn as nn
 import pytest
 
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
-from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
     StoppingCriteria,
     _drop_modules_without_weights,
     _load_safetensors,
     apply_generation_config_defaults,
     get_model_and_args,
+    get_model_path,
     load,
     load_config,
     load_image,
@@ -229,8 +229,21 @@ def test_update_module_configs():
     assert updated.vision_config == "vision_config"
 
 
+def test_get_model_path_downloads_jsonl_tokenizers(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_snapshot_download(**kwargs):
+        captured.update(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr("mlx_vlm.utils.snapshot_download", fake_snapshot_download)
+
+    assert get_model_path("org/model") == tmp_path
+    assert "*.jsonl" in captured["allow_patterns"]
+
+
 def test_quantize_module():
-    from mlx_lm.utils import quantize_model
+    from mlx_vlm.quant_utils import quantize_model
 
     class DummyModule(nn.Module):
         def __init__(self, shape):
@@ -528,11 +541,9 @@ def test_load_passes_revision():
         )
 
 
-def test_get_model_and_args_routes_text_only_configs():
-    model_class, model_type = get_model_and_args({"model_type": "unvendored_text_arch"})
-
-    assert model_class.__name__ == "mlx_vlm.models.text_only"
-    assert model_type == "text_only"
+def test_get_model_and_args_rejects_unknown_text_configs():
+    with pytest.raises(ValueError):
+        get_model_and_args({"model_type": "unknown_text_arch"})
 
 
 def test_get_model_and_args_remaps_mistral_to_llama():
@@ -542,39 +553,29 @@ def test_get_model_and_args_remaps_mistral_to_llama():
     assert model_type == "llama"
 
 
-def test_get_model_and_args_does_not_route_vision_configs_to_text_only():
+@pytest.mark.parametrize(
+    ("alias", "native_model_type"),
+    [
+        ("phi-msft", "phixtral"),
+        ("falcon_mamba", "mamba"),
+        ("joyai_llm_flash", "deepseek_v3"),
+        ("kimi_k2", "deepseek_v3"),
+        ("minimax_m2", "minimax"),
+        ("iquestcoder", "llama"),
+    ],
+)
+def test_get_model_and_args_remaps_text_model_aliases(alias, native_model_type):
+    model_class, model_type = get_model_and_args({"model_type": alias})
+
+    assert model_class.__name__ == f"mlx_vlm.models.{native_model_type}"
+    assert model_type == native_model_type
+
+
+def test_get_model_and_args_rejects_unknown_vision_configs():
     with pytest.raises(ValueError):
         get_model_and_args(
             {"model_type": "unknown-vlm", "vision_config": {"hidden_size": 16}},
         )
-
-
-def test_load_model_routes_text_models_through_existing_loader():
-    class FakeArgs:
-        @classmethod
-        def from_dict(cls, config):
-            return cls()
-
-    class FakeLM(nn.Module):
-        def __init__(self, args):
-            super().__init__()
-            self.model = nn.Linear(2, 2, bias=False)
-
-        def __call__(self, inputs, cache=None):
-            return self.model(inputs)
-
-    with (
-        patch(
-            "mlx_vlm.utils.load_config",
-            return_value={"model_type": "unvendored_text_arch"},
-        ),
-        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
-        patch("mlx_vlm.utils.mx.load", return_value={"model.weight": mx.zeros((2, 2))}),
-        patch("mlx_lm.utils._get_classes", return_value=(FakeLM, FakeArgs)),
-    ):
-        model = load_model(Path("/tmp/model"), lazy=True, strict=False)
-
-    assert getattr(model, "_is_text_model", False) is True
 
 
 def test_load_model_forwards_strict_to_load_weights():
@@ -862,65 +863,6 @@ def test_load_processor_propagates_auto_processor_errors():
     with patch("mlx_vlm.utils.AutoProcessor.from_pretrained", side_effect=ValueError):
         with pytest.raises(ValueError):
             load_processor(Path("/tmp/model"), eos_token_ids=2)
-
-
-def test_text_only_model_provides_input_embeddings_and_wraps_logits():
-    class TinyInner(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embed_tokens = nn.Embedding(8, 3)
-            self.layers = []
-
-        def __call__(self, inputs, cache=None, input_embeddings=None):
-            if input_embeddings is not None:
-                return input_embeddings
-            return self.embed_tokens(inputs)
-
-    class TinyLM(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.model = TinyInner()
-            self.lm_head = nn.Linear(3, 4, bias=False)
-
-        def __call__(self, inputs, cache=None, input_embeddings=None):
-            return self.lm_head(self.model(inputs, cache, input_embeddings))
-
-    model = TextOnlyModel(TinyLM(), {"model_type": "llama", "eos_token_id": 2})
-    embeds = model.get_input_embeddings(mx.array([[1, 2]]))
-    output = model(mx.array([[1, 2]]), inputs_embeds=embeds.inputs_embeds)
-
-    assert embeds.inputs_embeds.shape == (1, 2, 3)
-    assert output.logits.shape == (1, 2, 4)
-    assert model.config.model_type == "llama"
-
-
-def test_text_only_language_model_uses_inner_embedding_path_when_outer_cannot():
-    class TinyInner(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embed_tokens = nn.Embedding(8, 3)
-            self.layers = []
-
-        def __call__(self, inputs, cache=None, input_embeddings=None):
-            assert input_embeddings is not None
-            return input_embeddings
-
-    class OuterNoEmbeddingForward(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.model = TinyInner()
-            self.lm_head = nn.Linear(3, 4, bias=False)
-
-        def __call__(self, inputs, cache=None):
-            raise AssertionError("outer call should be bypassed for input embeddings")
-
-    model = TextOnlyModel(
-        OuterNoEmbeddingForward(), {"model_type": "gpt_oss", "eos_token_id": 2}
-    )
-    embeds = model.get_input_embeddings(mx.array([[1, 2]])).inputs_embeds
-    output = model.language_model(mx.array([[1, 2]]), inputs_embeds=embeds)
-
-    assert output.logits.shape == (1, 2, 4)
 
 
 def _make_test_image_bytes():
