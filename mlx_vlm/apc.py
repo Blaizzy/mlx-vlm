@@ -3030,19 +3030,26 @@ class APCManager:
             best_key: Optional[int] = None
             best_entry: Optional[APCExactCacheEntry] = None
             if self._exact_cache_max > 0:
-                for key, entry in self._exact_cache.items():
-                    candidate_len = len(entry.token_ids)
-                    if (
-                        entry.extra_hash != extra_hash
-                        or candidate_len <= min_prefix_tokens
-                        or candidate_len > max_len
-                    ):
+                candidate_lens = sorted(
+                    {
+                        len(entry.token_ids)
+                        for entry in self._exact_cache.values()
+                        if min_prefix_tokens < len(entry.token_ids) <= max_len
+                    },
+                    reverse=True,
+                )
+                for candidate_len in candidate_lens:
+                    key = _sequence_hash(
+                        token_tuple[:candidate_len], extra_hash, self.block_size
+                    )
+                    entry = self._exact_cache.get(key)
+                    if entry is None or entry.extra_hash != extra_hash:
                         continue
                     if token_tuple[:candidate_len] != entry.token_ids:
                         continue
-                    if best_entry is None or candidate_len > len(best_entry.token_ids):
-                        best_key = key
-                        best_entry = entry
+                    best_key = key
+                    best_entry = entry
+                    break
 
                 if best_entry is not None and best_key is not None:
                     self._exact_cache.move_to_end(best_key)

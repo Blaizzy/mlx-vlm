@@ -1183,6 +1183,14 @@ def test_exact_disk_hit_promotion_with_nonzero_extra_hash(tmp_path, monkeypatch)
     manager.close()
 
 
+def _tiny_exact_cache(tokens):
+    from mlx_vlm.models.cache import ArraysCache
+
+    c = ArraysCache(size=1)
+    c[0] = mx.zeros((1, 2, max(1, len(tokens)), 8))
+    return [c]
+
+
 def test_partition_splits_a_hybrid_cache_by_pageability():
     from mlx_vlm.models.cache import ArraysCache, KVCache
 
@@ -1256,3 +1264,44 @@ def test_harvest_skips_stateful_layers_only_when_asked():
     assert blocks
     assert all(b.layer_indices == (1,) for b in blocks)
     partial.release(blocks)
+
+
+def test_exact_lookup_picks_the_longest_stored_prefix():
+    manager = APCManager(num_blocks=8, block_size=16)
+    tokens = list(range(1, 600))
+    for boundary in (128, 256, 384):
+        manager.store_exact_cache(
+            tokens[:boundary], _tiny_exact_cache(tokens[:boundary])
+        )
+
+    cache, reused = manager.lookup_exact_cache(tokens)
+
+    assert cache is not None
+    assert reused == 384
+
+
+def test_exact_lookup_ignores_a_prefix_that_diverges():
+    manager = APCManager(num_blocks=8, block_size=16)
+    stored = list(range(1, 600))
+    for boundary in (128, 256):
+        manager.store_exact_cache(
+            stored[:boundary], _tiny_exact_cache(stored[:boundary])
+        )
+
+    divergent = stored[:200] + [9999] * 400
+    cache, reused = manager.lookup_exact_cache(divergent)
+
+    assert reused == 128
+
+
+def test_exact_lookup_honours_the_minimum_prefix():
+    manager = APCManager(num_blocks=8, block_size=16)
+    tokens = list(range(1, 600))
+    for boundary in (128, 256):
+        manager.store_exact_cache(
+            tokens[:boundary], _tiny_exact_cache(tokens[:boundary])
+        )
+
+    _, reused = manager.lookup_exact_cache(tokens, min_prefix_tokens=200)
+
+    assert reused == 256
