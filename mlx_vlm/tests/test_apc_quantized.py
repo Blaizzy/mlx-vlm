@@ -1491,3 +1491,75 @@ def test_live_batch_generator_staggered_apc_kv_join():
     finally:
         close(gen)
         apc.close()
+
+
+def _quant_config() -> dict:
+    return {"bits": 8, "group_size": GROUP_SIZE}
+
+
+def _warm_block(num_layers: int, block_size: int):
+    class Block:
+        def __init__(self):
+            shape = (1, H, block_size, GROUP_SIZE)
+            self.keys = [mx.zeros(shape) for _ in range(num_layers)]
+            self.values = [mx.zeros(shape) for _ in range(num_layers)]
+
+    return Block()
+
+
+def _layer_is_quantized(cache) -> bool:
+    return "Quantized" in type(cache).__name__ or isinstance(
+        cache, BatchTurboQuantKVCache
+    )
+
+
+@pytest.mark.parametrize("num_layers", [2, 4, 8, 28])
+def test_warm_block_restore_matches_live_layer_quantization(num_layers):
+    block_size = 16
+    picks = [
+        {
+            "matched_blocks": [_warm_block(num_layers, block_size) for _ in range(2)],
+            "prefix_len": 2 * block_size,
+        },
+        None,
+    ]
+
+    warm, _ = make_warm_batch_kv_cache_multi(picks, num_layers, _quant_config())
+
+    expected = [should_quantize_kv_layer(i, num_layers) for i in range(num_layers)]
+    assert [_layer_is_quantized(c) for c in warm] == expected
+
+
+def _hybrid_exact_row(num_layers: int, prefix_len: int, full_attn_every: int = 4):
+    row = []
+    for layer_idx in range(num_layers):
+        if layer_idx % full_attn_every == 0:
+            entry = KVCache()
+            slab = mx.zeros((1, H, prefix_len, GROUP_SIZE))
+            entry.update_and_fetch(slab, slab)
+        else:
+            entry = ArraysCache(size=2)
+            entry[0] = mx.zeros((1, H, 4, GROUP_SIZE))
+            entry[1] = mx.zeros((1, H, 4, GROUP_SIZE))
+        row.append(entry)
+    return row
+
+
+@pytest.mark.parametrize("num_layers", [4, 8])
+def test_exact_hybrid_restore_matches_live_layer_quantization(num_layers):
+    prefix_len = 64
+    rows = [_hybrid_exact_row(num_layers, prefix_len) for _ in range(2)]
+
+    merged, restored_prefix = make_warm_batch_exact_cache_multi(
+        rows, [prefix_len, prefix_len], _quant_config()
+    )
+
+    assert merged is not None
+    assert restored_prefix == prefix_len
+    for layer_idx, entry in enumerate(merged):
+        if layer_idx % 4:
+            assert isinstance(entry, ArraysCache)
+        else:
+            assert _layer_is_quantized(entry) == should_quantize_kv_layer(
+                layer_idx, num_layers
+            )
