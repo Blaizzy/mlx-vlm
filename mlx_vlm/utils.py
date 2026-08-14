@@ -849,12 +849,18 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # strict=False above must not swallow a genuinely malformed offload
         # dir: verify every parameter left at random-init is actually an
         # expected expert-weight path, and fail loudly on anything else.
-        from .moe_offload import PEREXPERT_RE, STACKED_RE
+        from .moe_offload import PEREXPERT_RE, STACKED_FUSED_RE, STACKED_RE
 
         expected = {k for k, _ in tree_flatten(model.parameters())}
         missing = expected - set(weights)
         unexpected_missing = [
-            k for k in missing if not (PEREXPERT_RE.match(k) or STACKED_RE.match(k))
+            k
+            for k in missing
+            if not (
+                PEREXPERT_RE.match(k)
+                or STACKED_RE.match(k)
+                or STACKED_FUSED_RE.match(k)
+            )
         ]
         if unexpected_missing:
             raise ValueError(

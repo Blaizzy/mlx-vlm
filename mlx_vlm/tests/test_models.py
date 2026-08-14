@@ -12738,3 +12738,124 @@ class TestMoEOffload(unittest.TestCase):
         mx.eval(expected)
 
         self.assertTrue(mx.allclose(out, expected, atol=1e-5).item())
+
+    def test_fused_switch_layer_loads_through_load_model(self):
+        """load_model()'s malformed-offload-dir check only recognized
+        PEREXPERT_RE/STACKED_RE, not STACKED_FUSED_RE -- so a fused
+        gate_up_proj checkpoint (Laguna/MiniMax-M3-VL) repacked correctly
+        still failed to load through the real, documented mlx_vlm.load()
+        path with "malformed repack() output?", even though patch_model()
+        itself handled it fine. Unlike test_fused_switch_layer_offloads_
+        correctly (which calls patch_model() directly, bypassing this
+        check), this goes through load_model() end-to-end."""
+        import dataclasses
+        import json
+        import os
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models import laguna
+        from mlx_vlm.moe_offload import repack
+        from mlx_vlm.utils import load_model, save_weights
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=256,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=16,
+            max_position_embeddings=256,
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=64,
+            shared_expert_intermediate_size=64,
+            mlp_only_layers=[],
+        )
+        model = laguna.Model(config)
+        mx.eval(model.parameters())
+
+        group_size, bits = 32, 4
+
+        def only_switch_mlp(path, module):
+            return "switch_mlp" in path and hasattr(module, "to_quantized")
+
+        nn.quantize(
+            model, group_size=group_size, bits=bits, class_predicate=only_switch_mlp
+        )
+        mx.eval(model.parameters())
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            build = os.path.join(tmp_dir, "build")
+            offload = os.path.join(tmp_dir, "offload")
+            save_weights(build, model)
+            cfg_dict = dataclasses.asdict(config)
+            cfg_dict["quantization"] = {
+                "group_size": group_size,
+                "bits": bits,
+                "mode": "affine",
+            }
+            with open(os.path.join(build, "config.json"), "w") as f:
+                json.dump(cfg_dict, f)
+            repack(build, offload)
+
+            prompt = mx.array([[1, 2, 3, 4, 5, 6]])
+            resident_model = load_model(Path(build))
+            logits_resident = resident_model(prompt).logits
+            mx.eval(logits_resident)
+
+            offload_model = load_model(Path(offload))
+            store = getattr(offload_model, "moe_offload_store", None)
+            self.assertIsNotNone(
+                store, "load_model did not auto-patch the fused offload dir"
+            )
+            self.assertEqual(store.swapped, 2)
+
+            logits_offload = offload_model(prompt).logits
+            mx.eval(logits_offload)
+
+            diff = mx.abs(logits_resident - logits_offload).max().item()
+            rel = diff / float(mx.abs(logits_resident).max())
+            self.assertLess(
+                rel, 0.02, f"fused offload output diverged: {rel:.4f} relative"
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_patch_model_raises_on_missing_expert_layer_file(self):
+        """patch_model()'s only completeness check was the global
+        swapped[0]==0 count -- a single missing/corrupted
+        experts/layer_*.safetensors (partial repack, interrupted transfer)
+        left that one layer un-swapped with no error anywhere, silently
+        running it on random-init weights, so long as at least one other
+        layer swapped fine. Must now raise instead."""
+        import os
+        import shutil
+        import tempfile
+
+        from mlx_vlm.models import deepseek_v3
+        from mlx_vlm.moe_offload import patch_model
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            build, offload = self._build_and_repack(tmp_dir, quantize=True)
+
+            # Corrupt the repack: delete one (of two) MoE layers' expert file.
+            experts_dir = os.path.join(str(offload), "experts")
+            layer_files = sorted(os.listdir(experts_dir))
+            self.assertGreaterEqual(len(layer_files), 2)
+            os.remove(os.path.join(experts_dir, layer_files[0]))
+
+            config = self._tiny_deepseek_v3_config()
+            model = deepseek_v3.Model(config)
+            mx.eval(model.parameters())
+
+            with self.assertRaises(ValueError) as ctx:
+                patch_model(model, str(offload))
+            self.assertIn("missing", str(ctx.exception).lower())
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)

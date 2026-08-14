@@ -293,6 +293,7 @@ def patch_model(model, offload_dir: str) -> "ExpertStore":
             "doesn't look like a valid repack() output directory."
         )
     swapped = [0]
+    missing_layers = []
 
     def visit(module, path=""):
         for name, child in list(module.items()):
@@ -310,7 +311,14 @@ def patch_model(model, offload_dir: str) -> "ExpertStore":
                     # A different expert count (e.g. always-on shared experts as
                     # their own switch layer) stays resident -- else index collision.
                     lid = _layer_id(cp)
-                    if lid is not None and store.experts_present(lid):
+                    if lid is not None and not store.experts_present(lid):
+                        # Shape/expert-count matches, so this layer WAS meant to
+                        # be offloaded -- a missing experts/layer_*.safetensors
+                        # here means a partial or corrupted repack(), not an
+                        # intentional skip. Left un-swapped, it would silently
+                        # run on random-init weights with no error anywhere.
+                        missing_layers.append((lid, cp))
+                    elif lid is not None:
                         if is_separate:
                             gate_quant = resolve_quant(f"{cp}.gate_proj")
                             up_quant = resolve_quant(f"{cp}.up_proj")
@@ -355,6 +363,15 @@ def patch_model(model, offload_dir: str) -> "ExpertStore":
                         visit(c, f"{cp}.{k}")
 
     visit(model)
+    if missing_layers:
+        detail = ", ".join(f"layer {lid} ({cp})" for lid, cp in sorted(missing_layers))
+        raise ValueError(
+            f"Offload dir {offload_dir} is missing experts/layer_*.safetensors for "
+            f"{len(missing_layers)} switch layer(s) whose shape and expert count "
+            f"match this model's routed experts: {detail}. This looks like a "
+            "partial or corrupted repack() output -- re-run repack() rather than "
+            "silently running those layers on random-init weights."
+        )
     if swapped[0] == 0:
         raise ValueError(
             f"patch_model swapped 0 modules for {offload_dir} -- offload_index.json "
