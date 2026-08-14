@@ -12268,6 +12268,110 @@ class TestGptOssMixedQuant(unittest.TestCase):
         self.assertTrue(hasattr(q_proj, "biases"))
 
 
+class TestRerankerLoader(unittest.TestCase):
+    def test_identifies_sequence_classifier_architectures(self):
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        architectures = [
+            "BertForSequenceClassification",
+            "ModernBertForSequenceClassification",
+            "XLMRobertaForSequenceClassification",
+        ]
+        for architecture in architectures:
+            with self.subTest(architecture=architecture):
+                self.assertTrue(
+                    reranker_loader.is_sequence_classifier_config(
+                        {"architectures": [architecture]}
+                    )
+                )
+
+    def test_loads_supported_native_sequence_classifier(self):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        for model_type in ("bert", "modernbert", "xlm-roberta"):
+            with self.subTest(model_type=model_type):
+                config = {
+                    "architectures": ["ExampleForSequenceClassification"],
+                    "model_type": model_type,
+                    "num_labels": 1,
+                }
+                sentinel = object()
+                captured = {}
+
+                def fake_load_encoder_model(model_path, **kwargs):
+                    captured["model_path"] = model_path
+                    captured.update(kwargs)
+                    return sentinel
+
+                with patch.object(
+                    reranker_loader,
+                    "load_encoder_model",
+                    side_effect=fake_load_encoder_model,
+                ):
+                    model = reranker_loader.load_sequence_classification_model(
+                        Path("model"), config=config
+                    )
+
+                self.assertIs(model, sentinel)
+                self.assertEqual(
+                    captured["model_class_name"], "SequenceClassificationModel"
+                )
+                self.assertEqual(captured["config"], config)
+                self.assertEqual(captured["config_overrides"], {"num_labels": 1})
+
+    def test_rejects_multi_label_sequence_classifier(self):
+        from pathlib import Path
+
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        config = {
+            "architectures": ["BertForSequenceClassification"],
+            "model_type": "bert",
+            "num_labels": 2,
+        }
+
+        with self.assertRaisesRegex(ValueError, "exactly one output label"):
+            reranker_loader.load_sequence_classification_model(
+                Path("model"), config=config
+            )
+
+    def test_rejects_unsupported_sequence_classifier_family(self):
+        from pathlib import Path
+
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        config = {
+            "architectures": ["DebertaV2ForSequenceClassification"],
+            "model_type": "deberta-v2",
+            "num_labels": 1,
+        }
+
+        with self.assertRaisesRegex(ValueError, "Unsupported reranker model type"):
+            reranker_loader.load_sequence_classification_model(
+                Path("model"), config=config
+            )
+
+    def test_rejects_embedding_checkpoint_as_reranker(self):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        config = {
+            "architectures": ["BertModel"],
+            "model_type": "bert",
+        }
+        with (
+            patch.object(reranker_loader, "get_model_path", return_value=Path("model")),
+            patch.object(reranker_loader, "load_config", return_value=config),
+            self.assertRaisesRegex(ValueError, "sequence-classification checkpoints"),
+        ):
+            reranker_loader.load_reranker("embedding-model")
+
+
 class TestBert(unittest.TestCase):
     def test_bert_embedding_forward(self):
         from mlx_vlm.models import bert
@@ -12308,7 +12412,7 @@ class TestBert(unittest.TestCase):
         output = model(
             mx.array(np.random.randint(0, config.vocab_size, (2, 5))),
             attention_mask=mx.ones((2, 5)),
-            token_type_ids=mx.zeros((2, 5)),
+            token_type_ids=mx.zeros((2, 5), dtype=mx.int32),
         )
 
         self.assertEqual(output.logits.shape, (2, 1))
