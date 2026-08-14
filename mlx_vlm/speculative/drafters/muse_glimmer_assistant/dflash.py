@@ -80,7 +80,13 @@ class MuseGlimmerAssistantAttention(nn.Module):
             context_length = context_hidden_states.shape[1]
             cache.offset += skip
 
-        cache_offset = cache.offset
+        # Additive absolute-position shift (APC warm hits / round-1 window
+        # truncation), set by speculative/dflash.py's _drafter_pos_shift; see
+        # the rationale comment in speculative/drafters/qwen3_dflash/dflash.py.
+        # Only RoPE consumes the shift: the bidirectional sliding mask below
+        # compares position differences, which the shift leaves unchanged.
+        # Default 0 == old behavior.
+        cache_offset = cache.offset + int(getattr(cache, "pos_shift", 0))
         queries = self.q_proj(hidden_states)
         kv_hidden_states = mx.concatenate(
             [context_hidden_states, hidden_states], axis=1
