@@ -12292,6 +12292,52 @@ class TestBert(unittest.TestCase):
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
 
+    def test_bert_sequence_classification_forward(self):
+        from mlx_vlm.models import bert
+
+        config = bert.ModelConfig(
+            model_type="bert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = bert.SequenceClassificationModel(config)
+        output = model(
+            mx.array(np.random.randint(0, config.vocab_size, (2, 5))),
+            attention_mask=mx.ones((2, 5)),
+            token_type_ids=mx.zeros((2, 5)),
+        )
+
+        self.assertEqual(output.logits.shape, (2, 1))
+
+    def test_bert_sequence_classifier_sanitize_keeps_head(self):
+        from mlx_vlm.models import bert
+
+        config = bert.ModelConfig(
+            model_type="bert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = bert.SequenceClassificationModel(config)
+        weights = model.sanitize(
+            {
+                "bert.embeddings.word_embeddings.weight": mx.zeros((99, 32)),
+                "bert.pooler.dense.weight": mx.zeros((32, 32)),
+                "classifier.weight": mx.zeros((1, 32)),
+            }
+        )
+
+        self.assertIn("embeddings.word_embeddings.weight", weights)
+        self.assertIn("pooler.dense.weight", weights)
+        self.assertIn("classifier.weight", weights)
+
 
 class TestXLMRoberta(unittest.TestCase):
     def test_xlm_roberta_embedding_forward(self):
@@ -12316,6 +12362,51 @@ class TestXLMRoberta(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+    def test_xlm_roberta_sequence_classification_forward(self):
+        from mlx_vlm.models import xlm_roberta
+
+        config = xlm_roberta.ModelConfig(
+            model_type="xlm_roberta",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = xlm_roberta.SequenceClassificationModel(config)
+        output = model(
+            mx.array(np.random.randint(2, config.vocab_size, (2, 5))),
+            attention_mask=mx.ones((2, 5)),
+        )
+
+        self.assertEqual(output.logits.shape, (2, 1))
+
+    def test_xlm_roberta_sequence_classifier_sanitize_keeps_head(self):
+        from mlx_vlm.models import xlm_roberta
+
+        config = xlm_roberta.ModelConfig(
+            model_type="xlm_roberta",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = xlm_roberta.SequenceClassificationModel(config)
+        weights = model.sanitize(
+            {
+                "roberta.embeddings.word_embeddings.weight": mx.zeros((99, 32)),
+                "classifier.dense.weight": mx.zeros((32, 32)),
+                "classifier.out_proj.weight": mx.zeros((1, 32)),
+            }
+        )
+
+        self.assertIn("embeddings.word_embeddings.weight", weights)
+        self.assertIn("classifier.dense.weight", weights)
+        self.assertIn("classifier.out_proj.weight", weights)
 
 
 class TestModernBert(unittest.TestCase):
@@ -12342,6 +12433,52 @@ class TestModernBert(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+    def test_modernbert_sequence_classification_forward(self):
+        from mlx_vlm.models import modernbert
+
+        config = modernbert.ModelConfig(
+            model_type="modernbert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=3,
+            intermediate_size=48,
+            num_attention_heads=4,
+            global_attn_every_n_layers=2,
+            local_attention=8,
+            classifier_pooling="mean",
+        )
+        model = modernbert.SequenceClassificationModel(config)
+        output = model(
+            mx.array(np.random.randint(0, config.vocab_size, (2, 6))),
+            attention_mask=mx.array([[1, 1, 1, 1, 1, 1], [1, 1, 1, 0, 0, 0]]),
+        )
+
+        self.assertEqual(output.logits.shape, (2, 1))
+
+    def test_modernbert_sequence_classifier_sanitize_keeps_head(self):
+        from mlx_vlm.models import modernbert
+
+        config = modernbert.ModelConfig(
+            model_type="modernbert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=1,
+            intermediate_size=48,
+            num_attention_heads=4,
+        )
+        model = modernbert.SequenceClassificationModel(config)
+        weights = model.sanitize(
+            {
+                "model.embeddings.tok_embeddings.weight": mx.zeros((99, 32)),
+                "head.dense.weight": mx.zeros((32, 32)),
+                "classifier.weight": mx.zeros((1, 32)),
+            }
+        )
+
+        self.assertIn("embeddings.tok_embeddings.weight", weights)
+        self.assertIn("head.dense.weight", weights)
+        self.assertIn("classifier.weight", weights)
 
 
 class TestQwen3Embedding(unittest.TestCase):
