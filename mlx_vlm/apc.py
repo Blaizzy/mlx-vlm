@@ -4418,6 +4418,9 @@ def apc_lookup_plan(
             }
         return None
 
+    if apc_mode != "block":
+        return None
+
     matched, prefix_len = manager.lookup_prefix(ids_list, extra_hash=extra_hash)
     if prefix_len > 0 and prefix_has_media(prefix_len):
         manager.release(matched)

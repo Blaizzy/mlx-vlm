@@ -1686,3 +1686,46 @@ def test_checkpoint_fits_reads_the_budget_from_the_environment(monkeypatch):
 
     assert apc_module.checkpoint_fits(0, 1 << 20)
     assert not apc_module.checkpoint_fits(0, (1 << 20) + 1)
+
+
+def _plan_for_mode(manager, tokens, mode):
+    return apc_module.apc_lookup_plan(
+        manager,
+        tokens,
+        extra_hash=0,
+        apc_mode=mode,
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda prefix_len: True,
+        prefix_has_media=lambda prefix_len: False,
+    )
+
+
+def test_an_unknown_apc_mode_never_takes_the_block_path():
+    """A third mode must decline, not fall through to block reuse.
+
+    The block path assembles a warm cache assuming every layer came from
+    blocks, which is wrong for any cache that only pages some of them.
+    """
+    manager = APCManager(num_blocks=64, block_size=16)
+    tokens = list(range(64))
+    keys = [mx.zeros((1, 1, len(tokens), 4))]
+    values = [mx.zeros((1, 1, len(tokens), 4))]
+    manager.release(manager.store_kv_blocks(tokens, keys, values))
+    probe = tokens + list(range(900, 908))
+
+    assert _plan_for_mode(manager, probe, "block") is not None
+    for mode in ("composite", "future-mode", ""):
+        assert _plan_for_mode(manager, probe, mode) is None, mode
+
+
+def test_block_mode_still_reuses_after_the_membership_guard():
+    manager = APCManager(num_blocks=64, block_size=16)
+    tokens = list(range(64))
+    keys = [mx.zeros((1, 1, len(tokens), 4))]
+    values = [mx.zeros((1, 1, len(tokens), 4))]
+    manager.release(manager.store_kv_blocks(tokens, keys, values))
+
+    plan = _plan_for_mode(manager, tokens + list(range(900, 908)), "block")
+
+    assert plan is not None and plan["prefix_len"] > 0
+    manager.release(plan["matched_blocks"])

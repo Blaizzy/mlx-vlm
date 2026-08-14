@@ -2465,7 +2465,7 @@ class BatchGenerator:
             )
             if warm_cache is None:
                 return None
-        else:
+        elif apc_mode == "block":
             # Build the multi-row warm cache (zeros for cold rows, K/V for warm).
             num_layers = (
                 len(self.model.make_cache())
@@ -2475,6 +2475,8 @@ class BatchGenerator:
             warm_cache, _ = _apc.make_warm_batch_kv_cache_multi(
                 picks, num_layers=num_layers, kv_quant_config=_quant_cfg
             )
+        else:
+            return None
 
         apc_meta = [
             {
