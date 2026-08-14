@@ -40,8 +40,6 @@ class ModelConfig(TextConfig):
 
 
 class Model(nn.Module):
-    _is_text_model = True
-
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config

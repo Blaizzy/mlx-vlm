@@ -40,6 +40,7 @@ MODEL_CONFIG = {
     "lfm2_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "aya_vision": MessageFormat.LIST_WITH_IMAGE,
     "cohere2_vision": MessageFormat.LIST_WITH_IMAGE,
+    "cohere_compass": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "paddleocr_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen2_vl": MessageFormat.LIST_WITH_IMAGE,
     "qwen2_5_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -83,6 +84,7 @@ MODEL_CONFIG = {
     "molmo_point": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "step3p7": MessageFormat.IMAGE_PATCH_TOKEN,
     "minimax_m3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "muse_glimmer": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
@@ -184,10 +186,17 @@ def _content_media_count(content: Any, media_types: tuple[str, ...]) -> int:
     )
 
 
-def _normalize_tool_call_arguments(message: Dict[str, Any]) -> Dict[str, Any]:
-    """Copy a message and convert OpenAI JSON-string tool arguments to dicts."""
+def _normalize_tool_message(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy a tool message and normalize fields consumed by chat templates."""
     normalized = dict(message)
     tool_calls = normalized.get("tool_calls")
+    if (
+        normalized.get("role") == "assistant"
+        and tool_calls
+        and normalized.get("content") is None
+    ):
+        normalized["content"] = ""
+
     if tool_calls is None:
         return normalized
 
@@ -890,7 +899,7 @@ def apply_chat_template(
         # Single dict prompt
         role = prompt.get("role", "user")
         if "tool_calls" in prompt or "tool_call_id" in prompt or role == "tool":
-            messages.append(_normalize_tool_call_arguments(prompt))
+            messages.append(_normalize_tool_message(prompt))
         else:
             content = extract_text_from_content(prompt["content"])
             messages.append(
@@ -957,7 +966,7 @@ def apply_chat_template(
                     "tool_calls" in p or "tool_call_id" in p or role == "tool"
                 )
                 if has_tool_metadata:
-                    messages.append(_normalize_tool_call_arguments(p))
+                    messages.append(_normalize_tool_message(p))
                 else:
                     # Handle multimodal content: extract only text, skip image/audio URLs
                     content = extract_text_from_content(content)

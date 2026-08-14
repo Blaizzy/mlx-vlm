@@ -3,6 +3,7 @@ import logging
 from typing import Any, Optional, Tuple
 
 from .laguna_dflash import LagunaDFlashDraftModel
+from .muse_glimmer_assistant import MuseGlimmerAssistantDraftModel
 from .qwen3_dflash import DFlashDraftModel
 
 KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
@@ -18,6 +19,7 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
     "inkling_mtp": "mtp",
     "qwen3_5_mtp": "mtp",
     "laguna": "dflash",
+    "muse_glimmer_assistant": "dflash",
 }
 
 DEFAULT_DRAFTER_KIND = "dflash"
@@ -170,12 +172,13 @@ def load_drafter(
 
 
 __all__ = [
+    "DEFAULT_DRAFTER_KIND",
+    "DRAFTER_KIND_BY_MODEL_TYPE",
+    "KNOWN_DRAFTER_KINDS",
     "DFlashDraftModel",
     "LagunaDFlashDraftModel",
-    "KNOWN_DRAFTER_KINDS",
-    "DRAFTER_KIND_BY_MODEL_TYPE",
-    "DEFAULT_DRAFTER_KIND",
-    "validate_drafter_compatibility",
-    "resolve_drafter_kind",
+    "MuseGlimmerAssistantDraftModel",
     "load_drafter",
+    "resolve_drafter_kind",
+    "validate_drafter_compatibility",
 ]

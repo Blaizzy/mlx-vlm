@@ -198,7 +198,7 @@ def _run_chunked_speculative_prefill(
     if (
         prefill_step_size is not None
         and prefill_step_size > 0
-        and remaining_embeds.shape[1] > 1
+        and remaining_embeds.shape[1] > prefill_step_size
     ):
         while remaining_embeds.shape[1] > 1:
             n_to_process = min(prefill_step_size, remaining_embeds.shape[1] - 1)
@@ -338,6 +338,18 @@ def get_quantized_kv_bits(model: str):
         )
         return None
     return kv_bits
+
+
+def get_quantized_kv_split_bits():
+    def _read(name):
+        raw = os.environ.get(name)
+        return float(raw) if raw else None
+
+    return _read("KV_KEY_BITS"), _read("KV_VALUE_BITS")
+
+
+def get_kv_split_schemes():
+    return os.environ.get("KV_KEY_SCHEME"), os.environ.get("KV_VALUE_SCHEME")
 
 
 def get_kv_group_size():
@@ -827,6 +839,7 @@ class QueuedGenerationRequest:
     images: Optional[List] = None
     videos: Optional[List] = None
     audio: Optional[List] = None
+    apc_semantic_hash: Optional[int] = None
     request_id: Optional[str] = None
     queued_at: float = field(default_factory=time.perf_counter)
 
@@ -1061,6 +1074,10 @@ class ResponseGenerator:
         adapter_path: Optional[str] = None,
         vision_cache=None,
         kv_bits=None,
+        kv_key_bits=None,
+        kv_value_bits=None,
+        kv_key_scheme=None,
+        kv_value_scheme=None,
         kv_group_size=DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
         quantized_kv_start=DEFAULT_QUANTIZED_KV_START,
@@ -1076,11 +1093,16 @@ class ResponseGenerator:
         self.vision_cache = vision_cache
         self.draft_model = None
         self.kv_bits = kv_bits
+        self.kv_key_bits = kv_key_bits
+        self.kv_value_bits = kv_value_bits
+        self.kv_key_scheme = kv_key_scheme
+        self.kv_value_scheme = kv_value_scheme
         self.kv_group_size = kv_group_size
         self.kv_quant_scheme = kv_quant_scheme
         self.quantized_kv_start = quantized_kv_start
         self.top_logprobs_k = top_logprobs_k
         self.apc_manager = apc_manager
+        self.apc_mode = None
         self.tokenizer = None
         self.requests: Queue = Queue()
         self._stop = False
@@ -1171,6 +1193,10 @@ class ResponseGenerator:
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
+        self.apc_mode = None
+        if self.apc_manager is not None:
+            language_model = getattr(model, "language_model", model)
+            self.apc_mode = _apc.model_apc_mode(language_model)
 
     def generate(
         self,
@@ -1205,6 +1231,25 @@ class ResponseGenerator:
         prompt_tokens = _count_prompt_tokens(raw_inputs)
         _check_configured_context_budget(prompt_tokens, args.max_tokens)
 
+        apc_semantic_hash = None
+        if getattr(self, "apc_mode", None) is not None:
+            pixel_values = raw_inputs.get("pixel_values")
+            image_hash = 0
+            if pixel_values is not None:
+                image_hash = _apc.hash_image_payload(pixel_values=pixel_values)
+            elif images is not None:
+                image_hash = _apc.hash_image_payload(image_ref=images)
+            apc_semantic_hash = _apc.semantic_extra_hash(
+                tenant=getattr(args, "tenant_id", None),
+                image_hash=image_hash,
+                media={
+                    "audio": raw_inputs.get("input_features"),
+                    "video": raw_inputs.get("pixel_values_videos"),
+                },
+                model=getattr(self.model, "language_model", self.model),
+                processor=self.processor,
+            )
+
         request_id = f"{id(rqueue):x}"
         queued_request = QueuedGenerationRequest(
             rqueue=rqueue,
@@ -1215,6 +1260,7 @@ class ResponseGenerator:
             images=images,
             videos=videos,
             audio=audio,
+            apc_semantic_hash=apc_semantic_hash,
             request_id=request_id,
             queued_at=request_started_at,
         )
@@ -1559,7 +1605,12 @@ class ResponseGenerator:
             enable_thinking=enable_thinking,
         )
 
-    def _gpu_embed(self, raw_inputs: dict, images=None) -> Tuple[mx.array, dict]:
+    def _gpu_embed(
+        self,
+        raw_inputs: dict,
+        images=None,
+        apc_semantic_hash: Optional[int] = None,
+    ) -> Tuple[mx.array, dict]:
         """GPU-only: run vision encoder if needed. Must run on GPU thread."""
         input_ids = raw_inputs.get("input_ids")
         pixel_values = raw_inputs.get("pixel_values")
@@ -1589,12 +1640,8 @@ class ResponseGenerator:
             **data_kwargs,
             **{k: v for k, v in embed.to_dict().items() if v is not None},
         }
-        if images is not None:
-            gen_kwargs["_apc_image_hash"] = _apc.hash_image_payload(image_ref=images)
-        elif pixel_values is not None:
-            gen_kwargs["_apc_image_hash"] = _apc.hash_image_payload(
-                pixel_values=pixel_values
-            )
+        if apc_semantic_hash is not None:
+            gen_kwargs["_apc_semantic_hash"] = apc_semantic_hash
         return input_ids, gen_kwargs
 
     def _collect_pending_requests(
@@ -1674,6 +1721,7 @@ class ResponseGenerator:
         max_num_seqs = get_max_num_seqs()
 
         while not self._stop:
+            new_items = []
             try:
                 # Poll the request queue — non-blocking when generating, short
                 # blocking wait when idle so we don't spin.
@@ -1736,6 +1784,10 @@ class ResponseGenerator:
                             stop_tokens=self.stop_tokens,
                             sampler=self._make_sampler(args),
                             kv_bits=self.kv_bits,
+                            kv_key_bits=getattr(self, "kv_key_bits", None),
+                            kv_value_bits=getattr(self, "kv_value_bits", None),
+                            kv_key_scheme=getattr(self, "kv_key_scheme", None),
+                            kv_value_scheme=getattr(self, "kv_value_scheme", None),
                             kv_group_size=self.kv_group_size,
                             kv_quant_scheme=self.kv_quant_scheme,
                             quantized_kv_start=self.quantized_kv_start,
@@ -1752,12 +1804,17 @@ class ResponseGenerator:
 
                     # Vision encoder runs on the GPU thread; text tokenization
                     # already happened on the caller thread.
-                    input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
+                    input_ids, gen_kwargs = self._gpu_embed(
+                        raw_inputs,
+                        images,
+                        apc_semantic_hash=request.apc_semantic_hash,
+                    )
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
-                    # Per-tenant APC salt: keep this out of the model forward
-                    # by namespacing under "_apc_tenant"; BatchGenerator strips
-                    # it before merging kwargs for the language model.
-                    if getattr(args, "tenant_id", None):
+                    # Preserve tenant isolation for manually queued requests
+                    # that predate server-side semantic hash computation.
+                    if request.apc_semantic_hash is None and getattr(
+                        args, "tenant_id", None
+                    ):
                         gen_kwargs["_apc_tenant"] = args.tenant_id
 
                     # Drain pending text-only prompts before inserting an
@@ -1810,12 +1867,13 @@ class ResponseGenerator:
 
             except Exception as e:
                 logger.exception("Error in generation thread")
-                for info in list(active.values()):
-                    try:
-                        info["rqueue"].put(e)
-                        info["rqueue"].put(None)
-                    except Exception:
-                        pass
+                error_queues = {
+                    id(info["rqueue"]): info["rqueue"] for info in active.values()
+                }
+                error_queues.update(
+                    {id(request.rqueue): request.rqueue for request in new_items}
+                )
+                _notify_queues(error_queues.values(), e, None)
                 active.clear()
                 batch_gen = None
                 mx.clear_cache()
@@ -2011,7 +2069,11 @@ class ResponseGenerator:
                     log_state = self._log_prefill_started(
                         request, backend=f"speculative_{draft_kind}"
                     )
-                    input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
+                    input_ids, gen_kwargs = self._gpu_embed(
+                        raw_inputs,
+                        images,
+                        apc_semantic_hash=request.apc_semantic_hash,
+                    )
                     uid = id(rqueue)
                     uids.append(uid)
                     rqueues[uid] = rqueue
