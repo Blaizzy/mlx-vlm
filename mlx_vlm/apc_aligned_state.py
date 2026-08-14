@@ -1,104 +1,65 @@
-"""Block-aligned reuse for non-pageable cache state.
+"""Where to checkpoint a prompt so a divergent request can resume.
 
 Recurrent and convolution state summarises every token before it, so it cannot
-be sliced to an arbitrary position the way attention KV can. It can, however,
-be checkpointed: a node that covers a block boundary can hold the state as it
-stood at that boundary, and a later request sharing that prefix resumes from
-it.
+be sliced to an arbitrary position the way attention KV can. Reuse therefore
+happens at boundaries: a request stores the whole cache at chosen prefix
+lengths, and a later request sharing that prefix restores the longest boundary
+it matches.
 
-The planner below turns one scheduling step into the two motions that keep such
-state coherent:
-
-``zero`` starts a request whose prefix is empty, because the node it lands on
-may still hold another request's bytes. ``copy`` carries state from the node a
-request just left into the node it is entering, leaving the old node intact as
-a checkpoint.
-
-A prefix hit needs no third motion: the request is admitted with its matched
-length, so the first copy of the step reads the checkpoint it hit.
+One checkpoint near the end of a prompt only helps a request that repeats it.
+Boundaries spread across the prompt are what let a request that shares an
+opening and then diverges start from the last common point, so the schedule
+below walks a fixed stride and keeps every boundary that leaves a text-only
+suffix.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence
 
-__all__ = ["StatePlan", "StateStep", "plan_state_motions"]
+from .apc import adjust_prefix_to_text_suffix_boundary
 
-
-@dataclass(frozen=True)
-class StateStep:
-    """One request's position in a step: what it had, and what it runs now."""
-
-    node_ids: Sequence[int]
-    computed: int
-    scheduled: int
-    shareable: Optional[Sequence[bool]] = None
+__all__ = ["checkpoint_schedule"]
 
 
-@dataclass
-class StatePlan:
-    """Node ids to clear, node pairs to carry forward, and each step's target."""
-
-    zero: List[int] = field(default_factory=list)
-    copy: List[Tuple[int, int]] = field(default_factory=list)
-    targets: List[int] = field(default_factory=list)
-
-
-def _node_index(position: int, stride: int) -> int:
-    return position // stride
-
-
-def plan_state_motions(
-    steps: Sequence[StateStep],
+def checkpoint_schedule(
+    token_ids: Sequence[int],
     stride: int,
-    copy_on_write: bool = True,
-) -> StatePlan:
-    """Plan state motion for one scheduling step.
+    media_token_ids: Iterable[int] = (),
+    *,
+    guard_tokens: int = 1,
+    limit: Optional[int] = None,
+) -> List[int]:
+    """Prefix lengths at which to store a reusable checkpoint.
 
-    ``stride`` is the checkpoint interval in tokens. With ``copy_on_write`` a
-    node is only carried forward when it is shareable, since a node no other
-    request can reach is free to advance in place.
+    Boundaries are multiples of ``stride`` that keep at least ``guard_tokens``
+    to generate from, moved forward when needed so no media placeholder is left
+    in the suffix. ``limit`` keeps the earliest boundaries when a prompt would
+    otherwise produce more than the cache should hold, since a request that
+    shares an opening and then diverges can only resume from an early one.
     """
     if stride <= 0:
         raise ValueError(f"stride must be positive, got {stride}")
 
-    plan = StatePlan()
-    for step in steps:
-        if step.scheduled <= 0:
-            raise ValueError("every scheduled step must run at least one token")
+    media_token_ids = tuple(media_token_ids)
+    highest = len(token_ids) - max(1, guard_tokens)
+    if highest <= 0:
+        return []
 
-        last_position = step.computed + step.scheduled - 1
-        target_index = _node_index(last_position, stride)
-        if target_index >= len(step.node_ids):
-            raise ValueError(
-                f"step needs node index {target_index} but was given "
-                f"{len(step.node_ids)} nodes"
-            )
-
-        target = step.node_ids[target_index]
-        plan.targets.append(target)
-
-        if step.computed == 0:
-            plan.zero.append(target)
+    boundaries: List[int] = []
+    for candidate in range(stride, highest + 1, stride):
+        safe = adjust_prefix_to_text_suffix_boundary(
+            token_ids,
+            candidate,
+            media_token_ids,
+            max_prefix_tokens=highest,
+        )
+        if safe <= 0:
             continue
-
-        source_index = _node_index(step.computed - 1, stride)
-        source = step.node_ids[source_index]
-        if source == target:
+        if boundaries and safe <= boundaries[-1]:
             continue
+        boundaries.append(safe)
 
-        if copy_on_write and not _is_shareable(step, source_index):
-            continue
-
-        plan.copy.append((source, target))
-
-    return plan
-
-
-def _is_shareable(step: StateStep, index: int) -> bool:
-    if step.shareable is None:
-        return True
-    if index >= len(step.shareable):
-        return True
-    return bool(step.shareable[index])
+    if limit is not None and limit >= 0 and len(boundaries) > limit:
+        boundaries = boundaries[:limit]
+    return boundaries

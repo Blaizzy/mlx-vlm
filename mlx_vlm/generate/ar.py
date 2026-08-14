@@ -9,7 +9,7 @@ import time
 import warnings
 from collections.abc import Generator
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -148,6 +148,15 @@ def normalize_resize_shape(values):
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
 
 
+def _pending_checkpoint_lens(checkpoint, lengths, prompt_len):
+    """Ascending prompt-cache checkpoint lengths that fall inside the prompt."""
+    if checkpoint is None or lengths is None:
+        return []
+    if isinstance(lengths, int):
+        lengths = (lengths,)
+    return sorted({int(n) for n in lengths if 0 < int(n) < prompt_len})
+
+
 def generate_step(
     input_ids: mx.array,
     model: nn.Module,
@@ -186,7 +195,7 @@ def generate_step(
     draft_kind: str = "dflash",
     draft_block_size: Optional[int] = None,
     prompt_cache_checkpoint: Optional[Callable[[int, List[Any]], None]] = None,
-    prompt_cache_checkpoint_len: Optional[int] = None,
+    prompt_cache_checkpoint_len: Optional[Union[int, Sequence[int]]] = None,
     seed: Optional[int] = None,
     verbose: bool = False,
     **kwargs,
@@ -416,18 +425,15 @@ def generate_step(
             prefill_kwargs=policy_kwargs,
         ):
             prefill_step_size = None
-        checkpoint_len = (
-            int(prompt_cache_checkpoint_len)
-            if prompt_cache_checkpoint is not None
-            and prompt_cache_checkpoint_len is not None
-            else None
+        pending_checkpoints = _pending_checkpoint_lens(
+            prompt_cache_checkpoint,
+            prompt_cache_checkpoint_len,
+            inputs_embeds.shape[1],
         )
-        checkpoint_done = False
+        checkpoint_len = pending_checkpoints[0] if pending_checkpoints else None
         should_chunk = (
             prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size
-        ) or (
-            checkpoint_len is not None and 0 < checkpoint_len < inputs_embeds.shape[1]
-        )
+        ) or bool(pending_checkpoints)
         if prefill_step_size is not None and should_chunk:
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
@@ -439,9 +445,9 @@ def generate_step(
                     n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
                     if (
                         checkpoint_len is not None
-                        and not checkpoint_done
-                        and processed_tokens < checkpoint_len
-                        and processed_tokens + n_to_process > checkpoint_len
+                        and processed_tokens
+                        < checkpoint_len
+                        < processed_tokens + n_to_process
                     ):
                         n_to_process = checkpoint_len - processed_tokens
                     chunk_kwargs = kwargs
@@ -459,11 +465,17 @@ def generate_step(
                     processed_tokens += n_to_process
                     if (
                         checkpoint_len is not None
-                        and not checkpoint_done
-                        and processed_tokens == checkpoint_len
+                        and processed_tokens >= checkpoint_len
                     ):
-                        prompt_cache_checkpoint(processed_tokens, prompt_cache)
-                        checkpoint_done = True
+                        while pending_checkpoints and processed_tokens >= (
+                            pending_checkpoints[0]
+                        ):
+                            reached = pending_checkpoints.pop(0)
+                            if reached == processed_tokens:
+                                prompt_cache_checkpoint(reached, prompt_cache)
+                        checkpoint_len = (
+                            pending_checkpoints[0] if pending_checkpoints else None
+                        )
                     inputs_embeds = inputs_embeds[:, n_to_process:]
                     input_ids = input_ids[:, n_to_process:]
                     mx.clear_cache()

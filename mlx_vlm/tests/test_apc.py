@@ -1217,22 +1217,6 @@ def test_resident_budget_disabled_by_default_keeps_every_block():
     manager.release(matched)
 
 
-def test_resident_budget_counts_every_component_not_just_kv():
-    block_size = 16
-    manager = APCManager(num_blocks=4, block_size=block_size)
-    token_ids = list(range(block_size))
-    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids))
-    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
-    kv_only = manager.resident_bytes()
-    manager.release(stored)
-
-    block = stored[0]
-    extra = mx.zeros((1024,), dtype=mx.float32)
-    block.set_state("state", [extra])
-
-    assert manager.resident_bytes() == kv_only + extra.nbytes
-
-
 def test_state_stride_is_coarser_than_the_kv_block_size():
     manager = APCManager(num_blocks=4, block_size=16)
 

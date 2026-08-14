@@ -15,6 +15,7 @@ import mlx.core as mx
 import pytest
 
 from mlx_vlm.apc import APCManager, model_apc_mode
+from mlx_vlm.apc_aligned_state import checkpoint_schedule
 from mlx_vlm.models.cache import KVCache
 
 # ============================================================================
@@ -550,3 +551,53 @@ def test_block_eligible_layers_have_extractable_kv_after_prefill():
             assert mx.any(
                 c.values != 0
             ).item(), f"Block-eligible layer {i} values are all zeros"
+
+
+def _prefill(lm, tokens):
+    cache = lm.make_cache()
+    lm(mx.array([tokens]), cache=cache)
+    mx.eval([c for c in cache if c is not None])
+    return cache
+
+
+def test_divergent_suffix_resumes_from_an_earlier_checkpoint():
+    """A request that shares an opening and then diverges needs a boundary.
+
+    With a single checkpoint near the end of the prompt there is nothing for it
+    to match, which is what kept hybrid reuse all-or-nothing.
+    """
+    lm = _make_tiny_qwen35()
+    prompt = list(range(1, 97))
+    boundaries = checkpoint_schedule(prompt, stride=16, guard_tokens=8)
+    assert len(boundaries) > 1
+
+    shared = 40
+    divergent = prompt[:shared] + [700 + i for i in range(24)]
+
+    final_only = APCManager(num_blocks=64, block_size=16)
+    final_only.store_exact_cache(prompt[: boundaries[-1]], _prefill(lm, prompt))
+    _, reused_final_only = final_only.lookup_exact_cache(divergent)
+
+    scheduled = APCManager(num_blocks=64, block_size=16)
+    for boundary in boundaries:
+        scheduled.store_exact_cache(prompt[:boundary], _prefill(lm, prompt[:boundary]))
+    restored, reused_scheduled = scheduled.lookup_exact_cache(divergent)
+
+    assert reused_final_only == 0
+    assert 0 < reused_scheduled <= shared
+    assert reused_scheduled == max(b for b in boundaries if b <= shared)
+    assert restored is not None
+
+
+def test_scheduled_checkpoints_still_serve_an_exact_repeat():
+    lm = _make_tiny_qwen35()
+    prompt = list(range(1, 97))
+    boundaries = checkpoint_schedule(prompt, stride=16, guard_tokens=8)
+
+    apc = APCManager(num_blocks=64, block_size=16)
+    for boundary in boundaries:
+        apc.store_exact_cache(prompt[:boundary], _prefill(lm, prompt[:boundary]))
+
+    _, reused = apc.lookup_exact_cache(prompt)
+
+    assert reused == boundaries[-1]

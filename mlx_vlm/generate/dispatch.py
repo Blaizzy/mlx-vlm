@@ -11,6 +11,7 @@ import mlx.nn as nn
 from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
+from ..apc_aligned_state import checkpoint_schedule
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
@@ -944,13 +945,22 @@ def stream_generate(
         exact_checkpoint_len = None
         exact_checkpoint = None
         if apc_manager is not None and apc_mode == "exact" and reused_prefix_len == 0:
-            exact_checkpoint_len = _apc.adjust_prefix_to_text_suffix_boundary(
+            final_checkpoint = _apc.adjust_prefix_to_text_suffix_boundary(
                 full_input_ids_list,
                 len(full_input_ids_list) - apc_manager.exact_cache_guard_tokens,
                 multimodal_token_ids,
                 max_prefix_tokens=len(full_input_ids_list) - 1,
             )
-            if exact_checkpoint_len <= 0:
+            exact_checkpoint_len = checkpoint_schedule(
+                full_input_ids_list,
+                apc_manager.state_stride,
+                multimodal_token_ids,
+                guard_tokens=apc_manager.exact_cache_guard_tokens,
+                limit=apc_manager.exact_checkpoint_limit,
+            )
+            if final_checkpoint > 0 and final_checkpoint not in exact_checkpoint_len:
+                exact_checkpoint_len.append(final_checkpoint)
+            if not exact_checkpoint_len:
                 exact_checkpoint_len = None
 
             def exact_checkpoint(prefix_len: int, prompt_cache: List[Any]) -> None:

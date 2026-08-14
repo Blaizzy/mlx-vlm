@@ -2868,13 +2868,16 @@ class APCManager:
         self.lock = threading.RLock()
         self.disk = disk
         self._exact_cache_max = max(
-            0, int(os.environ.get("APC_EXACT_CACHE_ENTRIES", "2"))
+            0, int(os.environ.get("APC_EXACT_CACHE_ENTRIES", "8"))
         )
         self._max_resident_bytes = int(
             float(os.environ.get("APC_MAX_RESIDENT_GB", "0")) * (1 << 30)
         )
         stride = max(block_size, int(os.environ.get("APC_STATE_STRIDE", "512")))
         self.state_stride = ((stride + block_size - 1) // block_size) * block_size
+        self.exact_checkpoint_limit = max(
+            1, int(os.environ.get("APC_EXACT_CHECKPOINTS", "4"))
+        )
         self.exact_cache_guard_tokens = max(
             1, int(os.environ.get("APC_EXACT_PREFIX_GUARD_TOKENS", "16"))
         )

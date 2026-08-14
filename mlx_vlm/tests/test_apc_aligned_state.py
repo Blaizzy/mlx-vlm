@@ -1,89 +1,73 @@
 import pytest
 
-from mlx_vlm.apc_aligned_state import StateStep, plan_state_motions
+from mlx_vlm.apc_aligned_state import checkpoint_schedule
+from mlx_vlm.generate.ar import _pending_checkpoint_lens
+
+IMAGE = 900
 
 
-def test_fresh_request_zeroes_its_first_node():
-    plan = plan_state_motions([StateStep([7, 8], computed=0, scheduled=4)], stride=16)
+def test_schedule_walks_the_stride():
+    tokens = list(range(100))
 
-    assert plan.zero == [7]
-    assert plan.copy == []
-    assert plan.targets == [7]
+    assert checkpoint_schedule(tokens, stride=25) == [25, 50, 75]
 
 
-def test_step_inside_one_node_moves_nothing():
-    plan = plan_state_motions([StateStep([3, 4], computed=2, scheduled=4)], stride=16)
+def test_schedule_leaves_room_to_generate():
+    tokens = list(range(100))
 
-    assert plan.zero == []
-    assert plan.copy == []
-    assert plan.targets == [3]
+    assert checkpoint_schedule(tokens, stride=25, guard_tokens=30) == [25, 50]
 
 
-def test_crossing_a_boundary_carries_state_forward():
-    plan = plan_state_motions([StateStep([3, 9], computed=15, scheduled=2)], stride=16)
-
-    assert plan.copy == [(3, 9)]
-    assert plan.targets == [9]
+def test_short_prompt_has_no_boundary():
+    assert checkpoint_schedule(list(range(10)), stride=25) == []
 
 
-def test_prefix_hit_resumes_from_the_checkpoint_it_matched():
-    hit = StateStep([4, 5, 6], computed=32, scheduled=1)
+def test_schedule_keeps_the_earliest_boundaries_under_a_limit():
+    tokens = list(range(1000))
 
-    plan = plan_state_motions([hit], stride=16)
-
-    assert plan.zero == []
-    assert plan.copy == [(5, 6)]
-    assert plan.targets == [6]
+    assert checkpoint_schedule(tokens, stride=100, limit=3) == [100, 200, 300]
 
 
-def test_private_nodes_advance_in_place_under_copy_on_write():
-    private = StateStep([3, 9], computed=15, scheduled=2, shareable=[False, False])
-
-    assert plan_state_motions([private], stride=16).copy == []
-    assert plan_state_motions([private], stride=16, copy_on_write=False).copy == [
-        (3, 9)
-    ]
+def test_a_limit_of_zero_disables_checkpointing():
+    assert checkpoint_schedule(list(range(100)), stride=25, limit=0) == []
 
 
-def test_shareable_nodes_are_always_carried_forward():
-    shared = StateStep([3, 9], computed=15, scheduled=2, shareable=[True, False])
+def test_boundaries_move_past_media_so_the_suffix_is_text_only():
+    tokens = list(range(40)) + [IMAGE] * 20 + list(range(40))
 
-    assert plan_state_motions([shared], stride=16).copy == [(3, 9)]
+    schedule = checkpoint_schedule(tokens, stride=25, media_token_ids=[IMAGE])
 
-
-def test_motions_batch_across_requests():
-    steps = [
-        StateStep([1, 2], computed=0, scheduled=1),
-        StateStep([3, 4], computed=15, scheduled=2),
-        StateStep([5, 6], computed=4, scheduled=2),
-    ]
-
-    plan = plan_state_motions(steps, stride=16)
-
-    assert plan.zero == [1]
-    assert plan.copy == [(3, 4)]
-    assert plan.targets == [1, 4, 5]
+    assert schedule
+    assert all(IMAGE not in tokens[boundary:] for boundary in schedule)
 
 
-def test_a_long_step_lands_on_the_node_holding_its_last_token():
-    plan = plan_state_motions(
-        [StateStep([1, 2, 3], computed=0, scheduled=40)], stride=16
-    )
+def test_boundaries_are_strictly_increasing():
+    tokens = list(range(30)) + [IMAGE] * 30 + list(range(40))
 
-    assert plan.targets == [3]
-    assert plan.zero == [3]
+    schedule = checkpoint_schedule(tokens, stride=10, media_token_ids=[IMAGE])
+
+    assert schedule == sorted(set(schedule))
 
 
 def test_stride_must_be_positive():
     with pytest.raises(ValueError):
-        plan_state_motions([StateStep([1], computed=0, scheduled=1)], stride=0)
+        checkpoint_schedule([1, 2, 3], stride=0)
 
 
-def test_empty_step_is_rejected():
-    with pytest.raises(ValueError):
-        plan_state_motions([StateStep([1], computed=0, scheduled=0)], stride=16)
+def test_pending_lengths_accept_one_value_or_many():
+    def store(prefix_len, cache):
+        return None
+
+    assert _pending_checkpoint_lens(store, 32, prompt_len=100) == [32]
+    assert _pending_checkpoint_lens(store, [64, 32], prompt_len=100) == [32, 64]
 
 
-def test_missing_node_for_target_is_rejected():
-    with pytest.raises(ValueError):
-        plan_state_motions([StateStep([1], computed=0, scheduled=40)], stride=16)
+def test_pending_lengths_drop_values_outside_the_prompt():
+    def store(prefix_len, cache):
+        return None
+
+    assert _pending_checkpoint_lens(store, [0, 50, 100, 250], prompt_len=100) == [50]
+
+
+def test_pending_lengths_are_empty_without_a_store_callback():
+    assert _pending_checkpoint_lens(None, [10, 20], prompt_len=100) == []

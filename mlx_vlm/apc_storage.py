@@ -58,26 +58,6 @@ class KVBlockHandle:
         self.values = None
 
 
-class ArrayStateHandle:
-    """Fixed-size arrays for a node's non-pageable component.
-
-    Recurrent and convolution state is a summary of every token before it, so
-    it cannot be sliced like KV. A node stores it whole and reuse restores it
-    at the boundary the node covers.
-    """
-
-    __slots__ = ("arrays",)
-
-    def __init__(self, arrays: Optional[List[mx.array]] = None):
-        self.arrays = arrays
-
-    def resident_bytes(self) -> int:
-        return sum(_array_bytes(t) for t in self.arrays or ())
-
-    def release(self) -> None:
-        self.arrays = None
-
-
 class APCNode:
     """Logical prefix-index entry: identity plus per-component storage handles.
 
@@ -106,15 +86,6 @@ class APCNode:
 
     def set_kv(self, keys: List[mx.array], values: List[mx.array]) -> None:
         self.components[self.KV_COMPONENT] = KVBlockHandle(keys, values)
-
-    def state_arrays(self, component_id: ComponentId) -> Optional[List[mx.array]]:
-        handle = self.components.get(component_id)
-        return handle.arrays if isinstance(handle, ArrayStateHandle) else None
-
-    def set_state(self, component_id: ComponentId, arrays: List[mx.array]) -> None:
-        if component_id == self.KV_COMPONENT:
-            raise ValueError("kv is a pageable component, use set_kv")
-        self.components[component_id] = ArrayStateHandle(list(arrays))
 
     def release_components(self) -> None:
         for handle in self.components.values():
