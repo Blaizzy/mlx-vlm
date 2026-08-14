@@ -1452,3 +1452,55 @@ def test_longest_prefix_still_wins_after_eviction():
 
     assert cache is not None
     assert prefix_len == 192
+
+
+def test_partial_harvest_skips_every_non_pageable_type_not_just_kv_less_ones():
+    """A RotatingKVCache exposes .keys/.values but is not block-pageable.
+
+    Skipping on "yields no KV" would page a sliding-window layer's ring buffer
+    as if it were linear trimmable KV.
+    """
+    from mlx_vlm.models.cache import ArraysCache, KVCache, RotatingKVCache
+
+    rotating = RotatingKVCache(max_size=64, keep=0)
+    rotating.update_and_fetch(mx.zeros((1, 1, 64, 4)), mx.zeros((1, 1, 64, 4)))
+    plain = KVCache()
+    plain.update_and_fetch(mx.zeros((1, 1, 64, 4)), mx.zeros((1, 1, 64, 4)))
+    cache = [plain, rotating, ArraysCache(2)]
+
+    manager = APCManager(num_blocks=64, block_size=16)
+    blocks = harvest_blocks_from_batch_cache(
+        manager, cache, list(range(64)), allow_partial_layers=True
+    )
+
+    assert blocks
+    pageable, _ = apc_module.partition_cache_by_pageability(cache)
+    assert blocks[0].layer_indices == tuple(pageable) == (0,)
+    assert not apc_module._cache_entry_supports_block_apc(rotating)
+    manager.release(blocks)
+
+
+def test_partial_harvest_agrees_with_the_partition_helper():
+    from mlx_vlm.models.cache import ArraysCache, KVCache, RotatingKVCache
+
+    entries = []
+    for index in range(8):
+        if index % 3 == 0:
+            entry = KVCache()
+        elif index % 3 == 1:
+            entry = RotatingKVCache(max_size=64, keep=0)
+        else:
+            entries.append(ArraysCache(2))
+            continue
+        entry.update_and_fetch(mx.zeros((1, 1, 64, 4)), mx.zeros((1, 1, 64, 4)))
+        entries.append(entry)
+
+    manager = APCManager(num_blocks=256, block_size=16)
+    blocks = harvest_blocks_from_batch_cache(
+        manager, entries, list(range(64)), allow_partial_layers=True
+    )
+    pageable, other = apc_module.partition_cache_by_pageability(entries)
+
+    assert blocks[0].layer_indices == tuple(pageable)
+    assert set(pageable).isdisjoint(other)
+    manager.release(blocks)

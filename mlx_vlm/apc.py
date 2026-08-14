@@ -4217,6 +4217,8 @@ def harvest_blocks_from_batch_cache(
     layer_values: List[mx.array] = []
     pageable: List[int] = []
     for index, c in enumerate(batch_caches):
+        if allow_partial_layers and not _cache_entry_supports_block_apc(c):
+            continue
         k, v = layer_kv_for_apc(c, batch_idx=batch_idx)
         if k is None or v is None:
             if allow_partial_layers:
