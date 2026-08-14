@@ -4,6 +4,27 @@ from typing import Dict, List, Optional, Union
 
 from ..base import BaseModelConfig
 
+ENDOFTEXT_TOKEN = 151643
+IM_END_TOKEN = 151645
+
+
+def _stop_token_ids(eos_token_id) -> List[int]:
+    """Stop ids for GOT, which ends a turn with <|im_end|>, not with eos.
+
+    The config declares only 151643, so without 151645 generation never stops.
+    """
+    if eos_token_id is None:
+        ids = []
+    elif isinstance(eos_token_id, int):
+        ids = [eos_token_id]
+    else:
+        ids = list(eos_token_id)
+
+    for token_id in (ENDOFTEXT_TOKEN, IM_END_TOKEN):
+        if token_id not in ids:
+            ids.append(token_id)
+    return ids
+
 
 @dataclass
 class VisionConfig(BaseModelConfig):
@@ -17,6 +38,7 @@ class VisionConfig(BaseModelConfig):
     num_heads: int = 12
     mlp_ratio: float = 4.0
     out_chans: int = 256
+    out_dim: int = 1024
     qkv_bias: bool = True
     use_abs_pos: bool = True
     use_rel_pos: bool = True
@@ -58,10 +80,14 @@ class ModelConfig(BaseModelConfig):
     im_start_token: int = 151857
     im_end_token: int = 151858
     vocab_size: int = 151860
-    eos_token_id: Optional[Union[int, List[int]]] = 151643
+    eos_token_id: Optional[Union[int, List[int]]] = None
 
     @classmethod
     def from_dict(cls, params):
+        # Written back into params, not just onto the instance: load_model
+        # reapplies this same dict through apply_generation_config_defaults.
+        params["eos_token_id"] = _stop_token_ids(params.get("eos_token_id"))
+
         # The GOT-OCR config is flat.
         # Text params are in the root.
         excluded_keys = {"vision_config"}

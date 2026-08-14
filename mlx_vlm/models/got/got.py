@@ -15,7 +15,9 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
-        self.mm_projector = nn.Linear(1024, 1024)
+        self.multi_modal_projector = nn.Linear(
+            config.vision_config.out_dim, config.text_config.hidden_size
+        )
         self.language_model = LanguageModel(config.text_config)
 
     def get_input_embeddings(
@@ -39,7 +41,7 @@ class Model(nn.Module):
         hidden_states = self.vision_tower(pixel_values)
 
         # Project features
-        image_features = self.mm_projector(hidden_states)
+        image_features = self.multi_modal_projector(hidden_states)
 
         # In GOT-OCR, the image token is represented by im_patch_token.
         # We replace the embeddings at these positions with the image features.
@@ -61,19 +63,15 @@ class Model(nn.Module):
     ):
         image_positions = input_ids == image_token_id
 
-        batch_size, seq_len = input_ids.shape
+        batch_size, _ = input_ids.shape
         batch_outputs = []
-        feature_start_idx = 0
 
         for batch_idx in range(batch_size):
             image_mask = image_positions[batch_idx]
             num_positions = mx.sum(image_mask).item()
 
             if num_positions > 0:
-                # Shape of image_features is (B, seq, C).
-                # GOT-OCR batches image generation, so we assume image_features[batch_idx] holds features.
-                # However, usually image_features is passed flattened or per batch.
-                # In GOT-OCR, it's (B, 256, 1024).
+                # (B, 256, 1024): one image per sequence, image_token_len each.
                 batch_features = image_features[batch_idx]
 
                 if batch_features.shape[0] != num_positions:
@@ -122,6 +120,16 @@ class Model(nn.Module):
         return logits
 
     def sanitize(self, weights):
+        # Skip the conv transposes for checkpoints already in MLX layout, so
+        # sanitize stays idempotent and does not double-transpose (see #1871).
+        already_mlx = any(
+            k.endswith("patch_embed.proj.weight")
+            and v.ndim == 4
+            and v.shape[-1] == 3
+            and v.shape[1] != 3
+            for k, v in weights.items()
+        )
+
         sanitized_weights = {}
         for k, v in weights.items():
             if k.startswith("model.vision_tower_high."):
@@ -137,8 +145,9 @@ class Model(nn.Module):
                 else:
                     sanitized_weights[k_vis] = v
             elif k.startswith("model.mm_projector_vary."):
+                # Named so skip_multimodal_module() keeps it unquantized.
                 sanitized_weights[
-                    k.replace("model.mm_projector_vary.", "mm_projector.")
+                    k.replace("model.mm_projector_vary.", "multi_modal_projector.")
                 ] = v
             elif k.startswith("model."):
                 new_k = k.replace("model.", "language_model.model.")
@@ -160,7 +169,7 @@ class Model(nn.Module):
                 # PyTorch conv2d weight shape: (out_channels, in_channels, kH, kW)
                 # MLX conv2d weight shape: (out_channels, kH, kW, in_channels)
                 w = sanitized_weights[k]
-                if len(w.shape) == 4:
+                if w.ndim == 4 and not already_mlx:
                     sanitized_weights[k] = w.transpose(0, 2, 3, 1)
 
         if self.config.text_config.tie_word_embeddings:

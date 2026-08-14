@@ -73,8 +73,10 @@ def add_decomposed_rel_pos(
     B, _, dim = q.shape
     r_q = q.reshape(B, q_h, q_w, dim)
 
-    rel_h = mx.sum(r_q[:, :, :, None, :] * Rh[None, :, None, :, :], axis=-1)
-    rel_w = mx.sum(r_q[:, :, :, None, :] * Rw[None, None, :, :, :], axis=-1)
+    # einsum, not broadcast-then-sum: the latter materialises 201M elements
+    # per global block.
+    rel_h = mx.einsum("bhwc,hkc->bhwk", r_q, Rh)
+    rel_w = mx.einsum("bhwc,wkc->bhwk", r_q, Rw)
 
     attn = (
         attn.reshape(B, q_h, q_w, k_h, k_w)
@@ -233,9 +235,22 @@ class VisionModel(nn.Module):
         )
         self.norm2 = nn.LayerNorm(config.out_chans, eps=1e-6)
 
-        self.net_2 = nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1, bias=False)
+        # Two stride-2 convs: 64x64 neck output down to the 16x16 patch grid.
+        self.net_2 = nn.Conv2d(
+            config.out_chans,
+            config.out_chans * 2,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False,
+        )
         self.net_3 = nn.Conv2d(
-            512, 1024, kernel_size=3, stride=2, padding=1, bias=False
+            config.out_chans * 2,
+            config.out_dim,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False,
         )
 
     def __call__(self, x: mx.array) -> mx.array:

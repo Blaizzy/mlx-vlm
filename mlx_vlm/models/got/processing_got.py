@@ -1,3 +1,4 @@
+import os
 from typing import List, Optional, Union
 
 import numpy as np
@@ -8,6 +9,41 @@ from ..base import install_auto_processor_patch
 
 GOT_OCR_MEAN = (0.48145466, 0.4578275, 0.40821073)
 GOT_OCR_STD = (0.26862954, 0.26130258, 0.27577711)
+
+IMAGE_TOKEN_LEN = 256
+
+# The MPT conversation GOT was trained with, from modeling_GOT.py. The tokenizer
+# ships no chat template, so otherwise the model gets a bare instruction.
+GOT_SYSTEM = (
+    "<|im_start|>system\n"
+    "        You should follow the instructions carefully and "
+    "explain your answers in detail."
+)
+GOT_SEP = "<|im_end|>"
+GOT_USER_ROLE = "<|im_start|>user\n"
+GOT_ASSISTANT_ROLE = "<|im_start|>assistant\n"
+
+
+def build_got_prompt(instruction: str, has_image: bool = True) -> str:
+    """Wrap an OCR instruction in the MPT conversation GOT expects."""
+    if GOT_SEP in instruction or GOT_USER_ROLE in instruction:
+        return instruction
+
+    image_tokens = "<img>" + "<imgpad>" * IMAGE_TOKEN_LEN + "</img>\n"
+    if has_image:
+        if "<image>" in instruction:
+            instruction = instruction.replace("<image>", image_tokens)
+        else:
+            instruction = image_tokens + instruction
+
+    return (
+        GOT_SYSTEM
+        + GOT_SEP
+        + GOT_USER_ROLE
+        + instruction
+        + GOT_SEP
+        + GOT_ASSISTANT_ROLE
+    )
 
 
 class GotOcrImageProcessor:
@@ -75,26 +111,17 @@ class GotOcrProcessor:
         return_tensors: Optional[str] = None,
         **kwargs,
     ) -> BatchFeature:
-        if images is not None:
+        has_image = images is not None
+        if has_image:
             image_inputs = self.image_processor(images, **kwargs)
-            # Insert image tokens if images are provided
-            image_tokens = "<img>" + "<imgpad>" * 256 + "</img>\n"
-            if text is not None:
-                if isinstance(text, str):
-                    if "<image>" in text:
-                        text = text.replace("<image>", image_tokens)
-                    else:
-                        text = image_tokens + text
-                elif isinstance(text, list):
-                    new_text = []
-                    for t in text:
-                        if "<image>" in t:
-                            new_text.append(t.replace("<image>", image_tokens))
-                        else:
-                            new_text.append(image_tokens + t)
-                    text = new_text
         else:
             image_inputs = {}
+
+        if text is not None:
+            if isinstance(text, str):
+                text = build_got_prompt(text, has_image=has_image)
+            elif isinstance(text, list):
+                text = [build_got_prompt(t, has_image=has_image) for t in text]
 
         if text is not None:
             text_inputs = self.tokenizer(text, return_tensors=return_tensors, **kwargs)
@@ -102,6 +129,14 @@ class GotOcrProcessor:
             text_inputs = {}
 
         return BatchFeature(data={**image_inputs, **text_inputs})
+
+    def save_pretrained(self, save_directory, **kwargs):
+        # Writes qwen.tiktoken, which the tokenizer needs to reload. Without
+        # this, convert.py copies only *.py and *.json and the converted repo
+        # ships no vocab file, hidden locally by the HF cache still having one.
+        os.makedirs(save_directory, exist_ok=True)
+        if self.tokenizer is not None:
+            self.tokenizer.save_pretrained(save_directory, **kwargs)
 
     def decode(self, *args, **kwargs):
         return self.tokenizer.decode(*args, **kwargs)

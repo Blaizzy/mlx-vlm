@@ -10638,6 +10638,111 @@ class TestGetInputEmbeddings(unittest.TestCase):
         for key in sanitized:
             self.assertNotIn("language_language_model", key)
 
+    def _got_tiny_config(self):
+        from mlx_vlm.models import got
+
+        return got.ModelConfig(
+            text_config=got.TextConfig(
+                model_type="qwen2",
+                hidden_size=8,
+                num_hidden_layers=1,
+                intermediate_size=16,
+                num_attention_heads=2,
+                rms_norm_eps=1e-6,
+                vocab_size=32,
+            ),
+            vision_config=got.VisionConfig(
+                img_size=32,
+                patch_size=16,
+                embed_dim=8,
+                depth=1,
+                num_heads=2,
+                out_chans=4,
+                out_dim=8,
+                window_size=2,
+                global_attn_indexes=(0,),
+            ),
+            model_type="GOT",
+        )
+
+    def test_got_sanitize_is_idempotent(self):
+        from mlx_vlm.models import got
+
+        model = got.Model(self._got_tiny_config())
+
+        hf_weights = {
+            # torch conv layout: (out_channels, in_channels, kH, kW)
+            "model.vision_tower_high.patch_embed.proj.weight": mx.zeros((8, 3, 16, 16)),
+            "model.vision_tower_high.neck.0.weight": mx.zeros((4, 8, 1, 1)),
+            "model.vision_tower_high.neck.1.weight": mx.zeros((4,)),
+            "model.vision_tower_high.net_2.weight": mx.zeros((8, 4, 3, 3)),
+            "model.mm_projector_vary.weight": mx.zeros((8, 8)),
+            "model.embed_tokens.weight": mx.zeros((32, 8)),
+            "lm_head.weight": mx.zeros((32, 8)),
+        }
+
+        sanitized = model.sanitize(dict(hf_weights))
+
+        self.assertEqual(
+            sanitized["vision_tower.patch_embed.proj.weight"].shape, (8, 16, 16, 3)
+        )
+        self.assertEqual(sanitized["vision_tower.conv1.weight"].shape, (4, 1, 1, 8))
+        self.assertEqual(sanitized["vision_tower.norm1.weight"].shape, (4,))
+        self.assertEqual(sanitized["vision_tower.net_2.weight"].shape, (8, 3, 3, 4))
+        self.assertIn("multi_modal_projector.weight", sanitized)
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        # tie_word_embeddings is on, so the stored lm_head is dropped
+        self.assertNotIn("language_model.lm_head.weight", sanitized)
+
+        # Converted checkpoints go through sanitize again on load. Transposing a
+        # second time would give (8, 16, 3, 16) and fail load_weights (#1871).
+        twice = model.sanitize(dict(sanitized))
+        for key, value in sanitized.items():
+            self.assertEqual(twice[key].shape, value.shape, key)
+
+    def test_got_config_adds_im_end_to_stop_ids(self):
+        from mlx_vlm.models import got
+
+        params = {
+            "model_type": "GOT",
+            "hidden_size": 8,
+            "num_hidden_layers": 1,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 32,
+            "eos_token_id": 151643,
+        }
+        config = got.ModelConfig.from_dict(params)
+
+        # GOT ends a turn with <|im_end|>, which upstream does not declare.
+        self.assertEqual(config.eos_token_id, [151643, 151645])
+        # Written back, because load_model reapplies the raw dict afterwards.
+        self.assertEqual(params["eos_token_id"], [151643, 151645])
+
+    def test_got_prompt_matches_reference_conversation(self):
+        from mlx_vlm.models.got.processing_got import build_got_prompt
+
+        prompt = build_got_prompt("OCR: ")
+
+        self.assertTrue(prompt.startswith("<|im_start|>system\n"))
+        self.assertIn("<img>" + "<imgpad>" * 256 + "</img>\nOCR: ", prompt)
+        self.assertTrue(prompt.endswith("<|im_end|><|im_start|>assistant\n"))
+        # An already wrapped prompt is passed through untouched.
+        self.assertEqual(build_got_prompt(prompt), prompt)
+        # Without an image there are no patch tokens.
+        self.assertNotIn("<imgpad>", build_got_prompt("OCR: ", has_image=False))
+
+    def test_got_vision_produces_one_token_per_downsampled_patch(self):
+        from mlx_vlm.models import got
+
+        config = self._got_tiny_config()
+        vision_tower = got.Model(config).vision_tower
+
+        # 32/16 = 2x2 patches, then two stride-2 convs -> 1x1 grid.
+        out = vision_tower(mx.zeros((1, 32, 32, 3)))
+        self.assertEqual(out.shape, (1, 1, config.vision_config.out_dim))
+
     def test_paddleocr_vl_text_only_clears_mrope_state(self):
         from mlx_vlm.models import paddleocr_vl
 
