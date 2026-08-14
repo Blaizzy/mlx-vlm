@@ -66,6 +66,7 @@ logger = logging.getLogger("mlx_vlm.apc")
 DEFAULT_BLOCK_SIZE = 16
 DEFAULT_NUM_BLOCKS = 2048
 SEED_PARENT_HASH = 0
+STORE_EVAL_BLOCKS = 64
 
 
 def _env_truthy(name: str, default: str = "") -> bool:
@@ -387,10 +388,10 @@ def _sequence_hash_array(tokens: np.ndarray, extra_hash: int, block_size: int) -
 
 
 def _sequence_hash(token_ids: Sequence[int], extra_hash: int, block_size: int) -> int:
+    if not isinstance(token_ids, (list, tuple, np.ndarray)):
+        token_ids = list(token_ids)
     return _sequence_hash_array(
-        np.asarray([int(t) for t in token_ids], dtype=np.int32),
-        extra_hash,
-        block_size,
+        np.asarray(token_ids, dtype=np.int32), extra_hash, block_size
     )
 
 
@@ -3401,6 +3402,8 @@ class APCManager:
             )
             new_blocks: List[APCBlock] = []
             disk_blocks: List[_DiskLayerMajorBlock] = []
+            pending_slabs: List[mx.array] = []
+            pending_blocks = 0
             per_block_tensors = len(layer_keys) + len(layer_values)
             token_tuple = tuple(int(t) for t in token_ids[:layer_major_prefix_tokens])
             layer_major_stored = False
@@ -3496,7 +3499,13 @@ class APCManager:
                 # a view when the source is already row-contiguous.
                 k_slabs = [_copy_mlx_array(k[..., start:end, :]) for k in layer_keys]
                 v_slabs = [_copy_mlx_array(v[..., start:end, :]) for v in layer_values]
-                mx.eval(k_slabs + v_slabs)
+                pending_slabs.extend(k_slabs)
+                pending_slabs.extend(v_slabs)
+                pending_blocks += 1
+                if pending_blocks >= STORE_EVAL_BLOCKS:
+                    mx.eval(pending_slabs)
+                    pending_slabs = []
+                    pending_blocks = 0
                 b.block_hash = h
                 b.parent_hash = parent
                 b.token_ids = chunk
@@ -3509,6 +3518,8 @@ class APCManager:
                 self.stats.stores += 1
                 self.stats.served_tokens += self.block_size
                 parent = h
+            if pending_slabs:
+                mx.eval(pending_slabs)
             if self.disk is not None and disk_blocks:
                 try:
                     self.disk.save_layer_major_blocks(
