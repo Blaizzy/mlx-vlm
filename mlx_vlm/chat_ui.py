@@ -57,9 +57,7 @@ class ModelState:
 
         # Load new model
         self.config = load_config(model_name)
-        self.model, self.processor = load(
-            model_name, processor_kwargs={"trust_remote_code": True}
-        )
+        self.model, self.processor = load(model_name, trust_remote_code=True)
         self.image_processor = load_image_processor(model_name)
         self.current_model_name = model_name
         self.vision_cache.clear()
