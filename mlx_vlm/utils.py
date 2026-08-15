@@ -550,6 +550,37 @@ def get_model_and_args(config: dict):
     raise ValueError(msg)
 
 
+def _has_config(config: dict, key: str) -> bool:
+    value = config.get(key)
+    return value is not None and value != {}
+
+
+def _is_text_only_config(config: dict) -> bool:
+    return not any(
+        _has_config(config, key)
+        for key in ("vision_config", "audio_config", "dflash_config")
+    )
+
+
+def _drop_modules_without_weights(model: nn.Module, weights: dict) -> None:
+    weighted_modules = {key.partition(".")[0] for key in weights}
+    dropped_modules = []
+    for name, child in list(model.items()):
+        if name == "language_model" or not isinstance(child, nn.Module):
+            continue
+        if not tree_flatten(child.parameters()) or name in weighted_modules:
+            continue
+        setattr(model, name, None)
+        dropped_modules.append(name)
+
+    if dropped_modules:
+        logging.warning(
+            "Text-only checkpoint has no weights for VLM module(s): %s. "
+            "Disabling those modules.",
+            ", ".join(dropped_modules),
+        )
+
+
 def get_model_path(
     path_or_hf_repo: str,
     revision: Optional[str] = None,
@@ -662,6 +693,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         weights.update(_load_safetensors(wf))
 
     model_class, _ = get_model_and_args(config=config)
+    text_only_config = _is_text_only_config(config)
 
     # Initialize text and vision configs if not present
     config.setdefault("text_config", config.pop("llm_config", {}))
@@ -818,6 +850,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 "Please use a quantized model with mode 'nvfp4' or 'mxfp8'."
             )
         model = quantize_activations(model)
+
+    if text_only_config:
+        _drop_modules_without_weights(model, weights)
 
     model.load_weights(list(weights.items()), strict=strict)
 
