@@ -1083,6 +1083,7 @@ class ResponseGenerator:
         quantized_kv_start=DEFAULT_QUANTIZED_KV_START,
         top_logprobs_k=0,
         apc_manager: Optional["_apc.APCManager"] = None,
+        prefill_step_size: Optional[int] = None,
     ):
         self.model_path = model_path
         self.adapter_path = adapter_path
@@ -1102,6 +1103,11 @@ class ResponseGenerator:
         self.quantized_kv_start = quantized_kv_start
         self.top_logprobs_k = top_logprobs_k
         self.apc_manager = apc_manager
+        self.prefill_step_size = (
+            get_prefill_step_size()
+            if prefill_step_size is None
+            else int(prefill_step_size)
+        )
         self.apc_mode = None
         self.tokenizer = None
         self.requests: Queue = Queue()
@@ -1113,6 +1119,14 @@ class ResponseGenerator:
         self._tokenizer_lock = Lock()
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    def _effective_prefill_step_size(self) -> int:
+        prefill_step_size = getattr(self, "prefill_step_size", None)
+        return (
+            get_prefill_step_size()
+            if prefill_step_size is None
+            else int(prefill_step_size)
+        )
 
     def stop_and_join(self):
         self._stop = True
@@ -1819,7 +1833,7 @@ class ResponseGenerator:
                             draft_kind=self.draft_kind,
                             draft_block_size=_get_draft_block_size_from_env(),
                             greedy_sampling=args.temperature == 0,
-                            prefill_step_size=get_prefill_step_size(),
+                            prefill_step_size=self._effective_prefill_step_size(),
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
@@ -1968,7 +1982,7 @@ class ResponseGenerator:
             "top_k": args.top_k,
             "mm_token_type_ids": raw_inputs.get("mm_token_type_ids"),
         }
-        prefill_step_size = get_prefill_step_size()
+        prefill_step_size = self._effective_prefill_step_size()
         if prefill_step_size > 0:
             stream_kwargs["prefill_step_size"] = prefill_step_size
         if args.seed is not None:
@@ -2132,7 +2146,7 @@ class ResponseGenerator:
                     make_cache=_make_cache,
                 )
 
-                prefill_step_size = get_prefill_step_size()
+                prefill_step_size = self._effective_prefill_step_size()
                 policy_kwargs = {**prompt_kwargs, **prefill_kwargs}
                 if not _chunked_prefill_enabled(
                     self.model,
