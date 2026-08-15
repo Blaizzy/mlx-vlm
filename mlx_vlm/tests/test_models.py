@@ -1730,6 +1730,66 @@ class TestOlmoModel(unittest.TestCase):
         )
 
 
+class TestSmolVLMFlattenedImageFeatures(unittest.TestCase):
+    def test_get_input_embeddings_uses_flattened_connector_output(self):
+        from mlx_vlm.models import smolvlm
+
+        text_config = smolvlm.TextConfig(
+            hidden_size=8,
+            intermediate_size=16,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_hidden_layers=1,
+            vocab_size=32,
+        )
+        vision_config = smolvlm.VisionConfig(
+            hidden_size=8,
+            intermediate_size=16,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            image_size=4,
+            patch_size=2,
+        )
+        model = smolvlm.Model(
+            smolvlm.ModelConfig(
+                text_config=text_config,
+                vision_config=vision_config,
+                image_token_id=31,
+                scale_factor=1,
+            )
+        )
+        input_ids = mx.array([[1, 31, 31, 31, 31, 2]])
+        pixel_values = mx.random.uniform(shape=(1, 1, 3, 4, 4))
+
+        output = model.get_input_embeddings(input_ids, pixel_values=pixel_values)
+
+        self.assertEqual(output.inputs_embeds.shape, (1, 6, 8))
+
+    def test_prepare_inputs_accepts_flattened_image_features(self):
+        from mlx_vlm.models import smolvlm
+
+        model = SimpleNamespace(config=SimpleNamespace(image_token_index=9))
+        input_ids = mx.array([[1, 9, 2, 9, 3]])
+        inputs_embeds = mx.arange(15).reshape(1, 5, 3)
+        image_features = mx.array([[101, 102, 103], [201, 202, 203]])
+
+        output = smolvlm.Model._prepare_inputs_for_multimodal(
+            model, image_features, inputs_embeds, input_ids
+        )
+
+        expected = mx.stack(
+            [
+                inputs_embeds[0, 0],
+                image_features[0],
+                inputs_embeds[0, 2],
+                image_features[1],
+                inputs_embeds[0, 4],
+            ]
+        )[None]
+        self.assertEqual(output.shape, inputs_embeds.shape)
+        self.assertTrue(mx.array_equal(output, expected).item())
+
+
 class TestModels(unittest.TestCase):
     def language_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(model.model_type, model_type)

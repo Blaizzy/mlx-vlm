@@ -1532,9 +1532,11 @@ class ResponseGenerator:
         )
         if args.logits_processors is not None:
             request_processors = args.logits_processors
-            if input_ids is not None and self._prompt_has_open_thinking(
-                args, input_ids
-            ):
+            already_closed = (
+                input_ids is not None
+                and self._prompt_thinking_already_closed(args, input_ids)
+            )
+            if args.enable_thinking and not already_closed:
                 request_processors = self._wrap_processors_until_thinking_done(
                     args, request_processors
                 )
@@ -1570,6 +1572,23 @@ class ResponseGenerator:
             last_end = -1
         return last_start > last_end
 
+    def _prompt_thinking_already_closed(
+        self, args: GenerationArguments, input_ids: mx.array
+    ) -> bool:
+        if not args.enable_thinking:
+            return False
+        thinking_start_token_id, thinking_end_token_id = self._thinking_token_ids(args)
+        tokens = input_ids.flatten().tolist()
+        try:
+            last_start = len(tokens) - 1 - tokens[::-1].index(thinking_start_token_id)
+        except ValueError:
+            return False
+        try:
+            last_end = len(tokens) - 1 - tokens[::-1].index(thinking_end_token_id)
+        except ValueError:
+            return False
+        return last_end > last_start
+
     def _wrap_processors_until_thinking_done(
         self,
         args: GenerationArguments,
@@ -1596,13 +1615,14 @@ class ResponseGenerator:
         tokenizer = self.tokenizer
         thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
         thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
-        enable_thinking = self._prompt_has_open_thinking(args, input_ids)
+        prompt_preopens_thinking = self._prompt_has_open_thinking(args, input_ids)
         return ThinkingBudgetCriteria(
             tokenizer=tokenizer,
             thinking_budget=args.thinking_budget,
             thinking_end_token=thinking_end_token,
             thinking_start_token=thinking_start_token,
-            enable_thinking=enable_thinking,
+            enable_thinking=args.enable_thinking,
+            prompt_preopens_thinking=prompt_preopens_thinking,
         )
 
     def _gpu_embed(

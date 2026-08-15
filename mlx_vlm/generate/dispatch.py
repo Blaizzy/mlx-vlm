@@ -920,7 +920,7 @@ def stream_generate(
         thinking_start_token_id = tokenizer.encode(
             thinking_start_token, add_special_tokens=False
         )[-1]
-        enable_thinking = enable_thinking and (
+        prompt_preopens_thinking = (
             thinking_start_token_id in input_ids.flatten().tolist()
         )
         tokenizer.thinking_budget_criteria = ThinkingBudgetCriteria(
@@ -929,6 +929,7 @@ def stream_generate(
             thinking_end_token=thinking_end_token,
             thinking_start_token=thinking_start_token,
             enable_thinking=enable_thinking,
+            prompt_preopens_thinking=prompt_preopens_thinking,
         )
         kwargs["thinking_budget_criteria"] = tokenizer.thinking_budget_criteria
     else:
