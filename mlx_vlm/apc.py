@@ -510,12 +510,14 @@ class CompositeCheckpointer:
         extra_hash: int = 0,
         prefill_chunk: int = 2048,
         budget_bytes: Optional[int] = None,
+        required_positions: Sequence[int] = (),
     ) -> None:
         self.manager = manager
         self.token_ids = list(token_ids)
         self.extra_hash = int(extra_hash)
         self.prefill_chunk = int(prefill_chunk)
         self.budget_bytes = budget_bytes
+        self.required_positions = frozenset(int(p) for p in required_positions)
         self.stride: Optional[int] = None
         self.stored_bytes = 0
         self.stored = 0
@@ -537,7 +539,9 @@ class CompositeCheckpointer:
             if self.stride == 0:
                 self.decline = CompositeDecline.BUDGET
                 return
-        if self.stride <= 0 or prefix_len % self.stride:
+        if prefix_len not in self.required_positions and (
+            self.stride <= 0 or prefix_len % self.stride
+        ):
             return
         if not checkpoint_fits(self.stored_bytes, cost, budget_bytes=self.budget_bytes):
             self.decline = CompositeDecline.BUDGET_EXHAUSTED

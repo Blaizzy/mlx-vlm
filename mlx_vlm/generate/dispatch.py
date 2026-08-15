@@ -956,14 +956,27 @@ def stream_generate(
             and reused_prefix_len == 0
         ):
             _chunk = kwargs.get("prefill_step_size") or DEFAULT_PREFILL_STEP_SIZE
-            _last = len(full_input_ids_list) - apc_manager.exact_cache_guard_tokens
-            exact_checkpoint_len = list(range(_chunk, max(_chunk, _last), _chunk))
+            _block = apc_manager.block_size
+            _last = _apc.adjust_prefix_to_text_suffix_boundary(
+                full_input_ids_list,
+                len(full_input_ids_list) - apc_manager.exact_cache_guard_tokens,
+                multimodal_token_ids,
+                max_prefix_tokens=len(full_input_ids_list) - 1,
+            )
+            _last -= _last % _block
+            exact_checkpoint_len = [
+                b for b in range(_chunk, max(_chunk, _last), _chunk)
+            ]
+            if _last > 0:
+                exact_checkpoint_len.append(_last)
+            exact_checkpoint_len = sorted(set(exact_checkpoint_len))
             if exact_checkpoint_len:
                 composite_checkpointer = _apc.CompositeCheckpointer(
                     apc_manager,
                     full_input_ids_list,
                     extra_hash=apc_extra_hash,
                     prefill_chunk=_chunk,
+                    required_positions=([_last] if _last > 0 else []),
                 )
                 exact_checkpoint = composite_checkpointer
             else:
@@ -1012,15 +1025,11 @@ def stream_generate(
                         apc_manager.note_composite_decline(
                             _apc.CompositeDecline.NOT_CHUNKED
                         )
-                    final_len = _apc.adjust_prefix_to_text_suffix_boundary(
-                        full_input_ids_list,
-                        len(full_input_ids_list) - apc_manager.exact_cache_guard_tokens,
-                        multimodal_token_ids,
-                        max_prefix_tokens=len(full_input_ids_list) - 1,
-                    )
-                    if final_len > 0:
+                    if composite_checkpointer.stored == 0:
                         try:
-                            composite_checkpointer.store_final(final_len, tracked_cache)
+                            composite_checkpointer.store_final(
+                                len(full_input_ids_list), tracked_cache
+                            )
                         except Exception as e:
                             logger.warning("APC composite fallback store failed: %s", e)
                 if (
