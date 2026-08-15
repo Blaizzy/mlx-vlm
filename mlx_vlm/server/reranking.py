@@ -3,15 +3,17 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from numbers import Integral
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 from fastapi import HTTPException
-from mlx_lm.models.base import create_causal_mask
 from pydantic import BaseModel, Field
 
+from ..models.cache import create_causal_mask
 from ..prompt_utils import get_chat_template
+from ..reranker import RerankerKind, reranker_kind, reranker_model_type
 from ..utils import get_model_path, load_image, load_video, prepare_inputs
 from .runtime import runtime
 
@@ -211,6 +213,57 @@ def _score_text_batch(model, processor, query, documents, instruction):
     )
 
 
+def _sequence_max_length(config, tokenizer) -> int:
+    limits = [DEFAULT_MAX_LENGTH]
+    for value in (
+        getattr(config, "max_position_embeddings", None),
+        getattr(tokenizer, "model_max_length", None),
+    ):
+        if isinstance(value, Integral) and 0 < value < 1_000_000:
+            limits.append(int(value))
+    return min(limits)
+
+
+def _score_sequence_batch(model, processor, config, query, documents):
+    tokenizer = _tokenizer(processor)
+    encoded = tokenizer(
+        [query.text] * len(documents),
+        [document.text for document in documents],
+        padding=True,
+        truncation=True,
+        max_length=_sequence_max_length(config, tokenizer),
+        return_tensors="np",
+    )
+    model_inputs = {
+        key: mx.array(encoded[key])
+        for key in ("input_ids", "attention_mask", "token_type_ids")
+        if key in encoded
+    }
+    if "input_ids" not in model_inputs:
+        raise ValueError("The reranker tokenizer did not return input IDs.")
+
+    output = model(**model_inputs)
+    logits = getattr(output, "logits", output)
+    if logits.ndim == 2 and logits.shape[-1] == 1:
+        logits = logits[:, 0]
+    elif logits.ndim != 1:
+        raise ValueError(
+            "Reranker sequence classifiers must return one relevance logit per pair."
+        )
+    if logits.shape[0] != len(documents):
+        raise ValueError("The reranker returned an unexpected number of scores.")
+
+    scores = mx.sigmoid(logits)
+    mx.eval(scores)
+    attention_mask = model_inputs.get("attention_mask")
+    prompt_tokens = (
+        int(mx.sum(attention_mask).item())
+        if attention_mask is not None
+        else int(model_inputs["input_ids"].size)
+    )
+    return [float(value) for value in scores.tolist()], prompt_tokens
+
+
 def _item_content(item: RerankItem, prefix: str):
     content = [{"type": "text", "text": prefix}]
     if item.video:
@@ -302,25 +355,42 @@ def _batch_size(model_type: str) -> int:
 
 
 def score_documents(model, processor, config, query, documents, instruction):
-    model_type = getattr(config, "model_type", None)
-    if model_type not in ("qwen3", "qwen3_vl"):
-        raise ValueError(f"Unsupported reranker model type: {model_type!r}.")
-    if model_type == "qwen3" and (
-        query.has_media or any(document.has_media for document in documents)
-    ):
-        raise ValueError("Qwen3 text rerankers do not support image or video inputs.")
+    kind = reranker_kind(config)
+    model_type = reranker_model_type(config)
+    has_media = query.has_media or any(document.has_media for document in documents)
 
-    score_batch = _score_vl_batch if model_type == "qwen3_vl" else _score_text_batch
+    if kind == RerankerKind.SEQUENCE_CLASSIFIER:
+        if has_media:
+            raise ValueError(
+                "Sequence-classification rerankers do not support image or video inputs."
+            )
+        if query.text is None or any(document.text is None for document in documents):
+            raise ValueError(
+                "Sequence-classification rerankers require text queries and documents."
+            )
+        if instruction is not None:
+            raise ValueError(
+                "Sequence-classification rerankers do not support custom instructions."
+            )
+
+        def score_batch(batch):
+            return _score_sequence_batch(model, processor, config, query, batch)
+
+    elif kind == RerankerKind.GENERATIVE_TEXT and has_media:
+        raise ValueError("Qwen3 text rerankers do not support image or video inputs.")
+    else:
+        score_function = (
+            _score_vl_batch if kind == RerankerKind.GENERATIVE_VL else _score_text_batch
+        )
+        resolved_instruction = instruction or DEFAULT_INSTRUCTION
+
+        def score_batch(batch):
+            return score_function(model, processor, query, batch, resolved_instruction)
+
     scores, prompt_tokens = [], 0
     batch_size = _batch_size(model_type)
     for start in range(0, len(documents), batch_size):
-        batch_scores, batch_tokens = score_batch(
-            model,
-            processor,
-            query,
-            documents[start : start + batch_size],
-            instruction,
-        )
+        batch_scores, batch_tokens = score_batch(documents[start : start + batch_size])
         scores.extend(batch_scores)
         prompt_tokens += batch_tokens
     return scores, prompt_tokens
@@ -351,9 +421,11 @@ def register_routes(app, deps):
                 normalize_item(document, f"documents[{index}]")
                 for index, document in enumerate(body.documents)
             ]
-            instruction = (body.instruction or DEFAULT_INSTRUCTION).strip()
-            if not instruction:
-                raise ValueError("`instruction` must not be empty.")
+            instruction = body.instruction
+            if instruction is not None:
+                instruction = instruction.strip()
+                if not instruction:
+                    raise ValueError("`instruction` must not be empty.")
 
             def _work():
                 model, processor, config = get_cached_model(
