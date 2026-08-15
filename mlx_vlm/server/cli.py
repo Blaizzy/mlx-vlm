@@ -78,7 +78,7 @@ def main():
         "--reranker-model",
         type=str,
         default=None,
-        help="Pre-load a Qwen3 or Qwen3-VL reranker model at startup.",
+        help="Pre-load a supported reranker model at startup.",
     )
     parser.add_argument(
         "--adapter-path",

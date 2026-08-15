@@ -20,6 +20,7 @@ from starlette.requests import HTTPConnection
 from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
+from ..reranker import RerankerKind, reranker_kind
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
 from ..version import __version__
@@ -728,10 +729,10 @@ def get_cached_model(
                 detail="Adapters are not supported for reranker models.",
             )
         logger.info("Loading reranker model: %s", model_path)
-        from ..utils import load
+        from ..reranker_loader import load_reranker
 
         try:
-            model, processor = load(model_path)
+            model, processor = load_reranker(model_path)
         except RepositoryNotFoundError as e:
             raise HTTPException(
                 status_code=404,
@@ -749,18 +750,20 @@ def get_cached_model(
                 status_code=500, detail=f"Failed to load reranker model: {e}"
             ) from e
         config = model.config
-        model_type = getattr(config, "model_type", None)
-        if model_type not in ("qwen3", "qwen3_vl"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported reranker model type: {model_type!r}.",
-            )
         try:
-            ensure_reranker_chat_template(processor, model_path)
+            kind = reranker_kind(config)
         except ValueError as e:
             raise HTTPException(
-                status_code=400, detail=f"Unsupported reranker model: {e}"
+                status_code=400,
+                detail=str(e),
             ) from e
+        if kind != RerankerKind.SEQUENCE_CLASSIFIER:
+            try:
+                ensure_reranker_chat_template(processor, model_path)
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=400, detail=f"Unsupported reranker model: {e}"
+                ) from e
         cache = {
             "cache_key": cache_key,
             "model_path": model_path,

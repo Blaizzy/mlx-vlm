@@ -16,3 +16,4 @@ class ModelConfig(BaseModelConfig):
     layer_norm_eps: float = 1e-5
     pad_token_id: int = 1
     hidden_act: str = "gelu"
+    num_labels: int = 1
