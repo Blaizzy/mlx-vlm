@@ -159,6 +159,8 @@ def maybe_quantize_kv_cache(
         return
 
     for index, layer_cache in enumerate(prompt_cache):
+        if isinstance(layer_cache, (cache.RotatingKVCache, cache.BatchRotatingKVCache)):
+            continue
         if (
             hasattr(layer_cache, "to_quantized")
             and layer_cache.offset >= quantized_kv_start

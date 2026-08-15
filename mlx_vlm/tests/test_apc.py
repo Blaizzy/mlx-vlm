@@ -2029,3 +2029,33 @@ def test_a_batched_cache_is_not_classified_as_composite(monkeypatch):
             return [BatchRotatingKVCache(32, [0]), BatchKVCache([0])]
 
     assert model_apc_mode(BatchLM()) == "exact"
+
+
+def test_kv_bits_leaves_a_sliding_window_cache_alone_instead_of_raising():
+    """A rotating cache has no quantized form, and does not need one.
+
+    Its window is bounded, so it is not what grows under a long prompt, and
+    asking it to quantize raised NotImplementedError and took the request with
+    it. The heterogeneous and turboquant paths already skip it.
+    """
+    from mlx_vlm.generate.common import maybe_quantize_kv_cache
+    from mlx_vlm.models.cache import KVCache, RotatingKVCache
+
+    shape = (1, 1, 48, 64)
+    rotating = RotatingKVCache(max_size=64, keep=0)
+    rotating.update_and_fetch(mx.zeros(shape), mx.zeros(shape))
+    plain = KVCache()
+    plain.update_and_fetch(mx.zeros(shape), mx.zeros(shape))
+    tail = KVCache()
+    tail.update_and_fetch(mx.zeros(shape), mx.zeros(shape))
+    prompt_cache = [plain, rotating, tail]
+
+    maybe_quantize_kv_cache(
+        prompt_cache,
+        quantized_kv_start=0,
+        kv_group_size=32,
+        kv_bits=8,
+    )
+
+    assert isinstance(prompt_cache[1], RotatingKVCache)
+    assert type(prompt_cache[0]).__name__ != "KVCache"
