@@ -62,6 +62,11 @@ class LanguageModelOutput:
 
 
 @dataclass
+class SequenceClassifierOutput:
+    logits: mx.array
+
+
+@dataclass
 class InputEmbeddingsFeatures:
     inputs_embeds: mx.array
     attention_mask_4d: Optional[mx.array] = None

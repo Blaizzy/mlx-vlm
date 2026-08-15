@@ -20,13 +20,13 @@ from fastapi.testclient import TestClient
 from PIL import Image
 from transformers.utils.chat_parsing import ResponseParser, parse_response
 
+import mlx_vlm.reranker_loader as reranker_loader
 import mlx_vlm.server as server
 import mlx_vlm.server.cli as server_cli
 import mlx_vlm.server.generation as server_generation
 import mlx_vlm.server.openai as server_openai
 import mlx_vlm.server.reranking as server_reranking
 import mlx_vlm.speculative.utils as speculative_utils
-import mlx_vlm.utils as vlm_utils
 from mlx_vlm import apc as apc_module
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
@@ -7401,6 +7401,107 @@ class TestReranking:
         assert tokens == 5
         assert batches == [["0", "1"], ["2", "3"], ["4"]]
 
+    def test_generative_reranker_uses_default_instruction(self, monkeypatch):
+        instructions = []
+
+        def fake_score_batch(model, processor, query, documents, instruction):
+            del model, processor, query
+            instructions.append(instruction)
+            return [0.5] * len(documents), len(documents)
+
+        monkeypatch.setattr(server_reranking, "_score_text_batch", fake_score_batch)
+
+        server_reranking.score_documents(
+            object(),
+            object(),
+            SimpleNamespace(model_type="qwen3"),
+            server_reranking.RerankItem(text="query"),
+            [server_reranking.RerankItem(text="document")],
+            None,
+        )
+
+        assert instructions == [server_reranking.DEFAULT_INSTRUCTION]
+
+    def test_sequence_classifier_scores_tokenized_pairs(self):
+        calls = []
+
+        class Tokenizer:
+            model_max_length = 6
+
+            def __call__(self, queries, documents, **kwargs):
+                calls.append((queries, documents, kwargs))
+                return {
+                    "input_ids": np.array([[1, 2, 3, 0], [1, 4, 5, 6]]),
+                    "attention_mask": np.array([[1, 1, 1, 0], [1, 1, 1, 1]]),
+                    "token_type_ids": np.array([[0, 0, 1, 0], [0, 0, 1, 1]]),
+                }
+
+        class Model:
+            def __call__(self, **inputs):
+                assert set(inputs) == {
+                    "input_ids",
+                    "attention_mask",
+                    "token_type_ids",
+                }
+                return SimpleNamespace(logits=mx.array([[-2.0], [2.0]]))
+
+        scores, tokens = server_reranking.score_documents(
+            Model(),
+            Tokenizer(),
+            SimpleNamespace(model_type="bert", max_position_embeddings=4),
+            server_reranking.RerankItem(text="query"),
+            [
+                server_reranking.RerankItem(text="first"),
+                server_reranking.RerankItem(text="second"),
+            ],
+            None,
+        )
+
+        assert scores == pytest.approx([1 / (1 + math.exp(2)), 1 / (1 + math.exp(-2))])
+        assert tokens == 7
+        assert calls == [
+            (
+                ["query", "query"],
+                ["first", "second"],
+                {
+                    "padding": True,
+                    "truncation": True,
+                    "max_length": 4,
+                    "return_tensors": "np",
+                },
+            )
+        ]
+
+    @pytest.mark.parametrize(
+        "query,documents,instruction,error",
+        [
+            (
+                server_reranking.RerankItem(image="query.png"),
+                [server_reranking.RerankItem(text="document")],
+                None,
+                "do not support image or video",
+            ),
+            (
+                server_reranking.RerankItem(text="query"),
+                [server_reranking.RerankItem(text="document")],
+                "rank legal documents",
+                "do not support custom instructions",
+            ),
+        ],
+    )
+    def test_sequence_classifier_rejects_unsupported_inputs(
+        self, query, documents, instruction, error
+    ):
+        with pytest.raises(ValueError, match=error):
+            server_reranking.score_documents(
+                object(),
+                object(),
+                SimpleNamespace(model_type="modernbert"),
+                query,
+                documents,
+                instruction,
+            )
+
     def test_attention_mask_combines_padding_and_causality(self):
         mask = server_reranking._attention_mask(mx.array([[0, 1, 1], [1, 1, 0]]))
 
@@ -7476,7 +7577,9 @@ class TestReranking:
         monkeypatch.setattr(server.runtime, "model_cache", registry)
         model = SimpleNamespace(config=SimpleNamespace(model_type="qwen3"))
         processor = object()
-        monkeypatch.setattr(vlm_utils, "load", lambda path: (model, processor))
+        monkeypatch.setattr(
+            reranker_loader, "load_reranker", lambda path: (model, processor)
+        )
         monkeypatch.setattr(
             server._app_module, "ensure_reranker_chat_template", lambda *args: None
         )
@@ -7493,8 +7596,10 @@ class TestReranking:
 
     def test_loader_rejects_unsupported_family(self, monkeypatch):
         monkeypatch.setattr(server.runtime, "model_cache", server.ModelCacheRegistry())
-        model = SimpleNamespace(config=SimpleNamespace(model_type="bert"))
-        monkeypatch.setattr(vlm_utils, "load", lambda path: (model, object()))
+        model = SimpleNamespace(config=SimpleNamespace(model_type="deberta_v2"))
+        monkeypatch.setattr(
+            reranker_loader, "load_reranker", lambda path: (model, object())
+        )
 
         with pytest.raises(
             server.HTTPException, match="Unsupported reranker model type"
@@ -7502,3 +7607,20 @@ class TestReranking:
             server.get_cached_model("reranker", None, model_kind="reranker")
 
         assert exc.value.status_code == 400
+
+    def test_loader_skips_chat_template_for_sequence_classifier(self, monkeypatch):
+        monkeypatch.setattr(server.runtime, "model_cache", server.ModelCacheRegistry())
+        model = SimpleNamespace(config=SimpleNamespace(model_type="bert"))
+        processor = object()
+        monkeypatch.setattr(
+            reranker_loader, "load_reranker", lambda path: (model, processor)
+        )
+        monkeypatch.setattr(
+            server._app_module,
+            "ensure_reranker_chat_template",
+            lambda *args: pytest.fail("sequence classifiers do not use chat templates"),
+        )
+
+        loaded = server.get_cached_model("reranker", None, model_kind="reranker")
+
+        assert loaded == (model, processor, model.config)
