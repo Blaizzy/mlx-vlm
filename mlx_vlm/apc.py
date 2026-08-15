@@ -3708,7 +3708,8 @@ class APCManager:
             token_tuple = tuple(int(t) for t in token_ids[:layer_major_prefix_tokens])
             layer_major_stored = False
             if (
-                self._layer_major_memory_min_tokens > 0
+                layer_indices is None
+                and self._layer_major_memory_min_tokens > 0
                 and self._exact_cache_max > 0
                 and layer_major_prefix_tokens >= self._layer_major_memory_min_tokens
             ):

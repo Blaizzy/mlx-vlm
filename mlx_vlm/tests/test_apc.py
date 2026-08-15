@@ -2100,3 +2100,45 @@ def test_composite_state_never_reaches_the_disk_store(tmp_path):
 
     assert manager.stats_snapshot().get("disk_writes", 0) == 0
     assert manager.stats_snapshot()["composite_state_entries"] == 1
+
+
+def test_a_partial_harvest_still_makes_blocks_past_the_layer_major_threshold():
+    """Above the layer-major threshold the pool normally stores one snapshot.
+
+    That snapshot covers whichever layers it was handed, and composite hands it
+    only the pageable ones, so it would be both a partial cache in the exact
+    store and a prefix with no blocks for composite to match.
+    """
+    from mlx_vlm.models.cache import ArraysCache, KVCache
+
+    manager = APCManager(num_blocks=512, block_size=16)
+    manager._layer_major_memory_min_tokens = 64
+    tokens = list(range(256))
+    warm = [KVCache(), ArraysCache(1)]
+    warm[0].update_and_fetch(
+        mx.zeros((1, 1, len(tokens), 4)), mx.zeros((1, 1, len(tokens), 4))
+    )
+
+    blocks = harvest_blocks_from_batch_cache(
+        manager, warm, tokens, allow_partial_layers=True
+    )
+
+    assert blocks
+    assert blocks[0].layer_indices == (0,)
+    matched, prefix = manager.lookup_prefix(tokens + list(range(900, 908)))
+    assert prefix > 0
+    manager.release(matched)
+    manager.release(blocks)
+
+
+def test_a_whole_harvest_still_uses_the_layer_major_tier():
+    manager = APCManager(num_blocks=512, block_size=16)
+    manager._layer_major_memory_min_tokens = 64
+    manager.exact_cache_min_tokens = 1
+    tokens = list(range(256))
+    keys = [mx.zeros((1, 1, len(tokens), 4))]
+    values = [mx.zeros((1, 1, len(tokens), 4))]
+
+    manager.release(manager.store_kv_blocks(tokens, keys, values))
+
+    assert manager.stats_snapshot()["exact_stores"] >= 1
