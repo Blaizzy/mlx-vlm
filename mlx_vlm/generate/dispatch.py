@@ -1004,14 +1004,14 @@ def stream_generate(
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = total_prompt_tokens / prompt_time
                 tic = time.perf_counter()
-                if (
-                    composite_checkpointer is not None
-                    and composite_checkpointer.stored == 0
-                    and composite_checkpointer.decline is None
-                ):
-                    apc_manager.note_composite_decline(
-                        _apc.CompositeDecline.NOT_CHUNKED
-                    )
+                if composite_checkpointer is not None:
+                    if (
+                        composite_checkpointer.stored == 0
+                        and composite_checkpointer.decline is None
+                    ):
+                        apc_manager.note_composite_decline(
+                            _apc.CompositeDecline.NOT_CHUNKED
+                        )
                     final_len = _apc.adjust_prefix_to_text_suffix_boundary(
                         full_input_ids_list,
                         len(full_input_ids_list) - apc_manager.exact_cache_guard_tokens,
