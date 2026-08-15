@@ -480,6 +480,7 @@ class CompositeDecline:
     NO_BLOCKS = "no_blocks"
     LAYOUT_MISMATCH = "layout_mismatch"
     BATCHED = "batched"
+    NOT_CHUNKED = "not_chunked"
 
 
 class CompositeCheckpointer:

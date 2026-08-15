@@ -1005,6 +1005,14 @@ def stream_generate(
                 prompt_tps = total_prompt_tokens / prompt_time
                 tic = time.perf_counter()
                 if (
+                    composite_checkpointer is not None
+                    and composite_checkpointer.stored == 0
+                    and composite_checkpointer.decline is None
+                ):
+                    apc_manager.note_composite_decline(
+                        _apc.CompositeDecline.NOT_CHUNKED
+                    )
+                if (
                     apc_manager is not None
                     and apc_mode == "exact"
                     and reused_prefix_len == 0
