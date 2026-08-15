@@ -600,7 +600,9 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
     out = qwen_language._target_verify_quantized_linear(linear, x)
     mx.eval(ref, out)
 
-    assert bool(mx.array_equal(ref, out).item())
+    # The target kernel and MLX's quantized GEMM accumulate in different
+    # orders, so BF16 rounding can differ by a small amount.
+    assert bool(mx.allclose(ref, out, rtol=1e-2, atol=1e-2).item())
 
 
 def test_qwen_fused_greedy_decode_support_matches_lm_head():
