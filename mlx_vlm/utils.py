@@ -163,60 +163,6 @@ def _f32_to_e4m3(x: mx.array) -> mx.array:
     return byte.astype(mx.uint8)
 
 
-def _f32_to_e8m0(x: mx.array) -> mx.array:
-    """Encode non-negative scales to the E8M0 bytes used by MLX MXFP4."""
-    x = x.astype(mx.float32)
-    finite = mx.isfinite(x)
-    positive = x > 0
-    safe = mx.where(finite & positive, x, 1.0)
-    exponent = mx.clip(mx.round(mx.log2(safe)), -127, 127) + 127
-    exponent = mx.where(finite, mx.where(positive, exponent, 0), 255)
-    return exponent.astype(mx.uint8)
-
-
-def _transform_modelopt_mxfp4_weights(
-    weights: Dict[str, mx.array],
-    quantization_config: Optional[Dict[str, Any]],
-) -> Tuple[Dict[str, mx.array], Optional[Dict[str, Any]]]:
-    if quantization_config is None:
-        return weights, None
-    if quantization_config.get("quant_method") != "mxfp4":
-        return weights, None
-
-    scale_suffix = ".weight_scale"
-    prefixes = {
-        key[: -len(scale_suffix)] for key in weights if key.endswith(scale_suffix)
-    }
-    if not prefixes:
-        return weights, None
-    if quantization_config.get("micro_block", 32) != 32:
-        raise ValueError("MLX MXFP4 requires a micro block size of 32.")
-
-    transformed = {}
-    for key, value in weights.items():
-        if key.endswith(scale_suffix):
-            prefix = key[: -len(scale_suffix)]
-            weight_key = f"{prefix}.weight"
-            if weight_key not in weights:
-                raise ValueError(f"Missing MXFP4 weight for {key}.")
-            weight = weights[weight_key]
-            if weight.dtype != mx.uint8 or weight.ndim != 2 or value.ndim != 2:
-                raise ValueError(f"Invalid ModelOpt MXFP4 tensors for {prefix}.")
-            if (
-                weight.shape[0] != value.shape[0]
-                or weight.shape[1] != 16 * value.shape[1]
-            ):
-                raise ValueError(f"Invalid ModelOpt MXFP4 scale shape for {prefix}.")
-            transformed[weight_key] = weight.view(mx.uint32)
-            transformed[f"{prefix}.scales"] = _f32_to_e8m0(value)
-        elif key.endswith(".weight") and key[: -len(".weight")] in prefixes:
-            continue
-        else:
-            transformed[key] = value
-
-    return transformed, {"group_size": 32, "bits": 4, "mode": "mxfp4"}
-
-
 def _transform_modelopt_nvfp4_weights(
     weights: Dict[str, mx.array],
     quantization_config: Optional[Dict[str, Any]],
@@ -805,8 +751,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     weights, transformed_quantization = _transform_modelopt_nvfp4_weights(
         weights, quantization_config
     )
-    if transformed_quantization is None:
-        weights, transformed_quantization = _transform_modelopt_mxfp4_weights(
+    if transformed_quantization is None and config.get("model_type") == "qwen3_5":
+        from .models.qwen3_5.language import transform_modelopt_mxfp4_weights
+
+        weights, transformed_quantization = transform_modelopt_mxfp4_weights(
             weights, quantization_config
         )
     if transformed_quantization is None:

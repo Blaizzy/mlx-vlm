@@ -12,11 +12,13 @@ import mlx.nn as nn
 import pytest
 
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
+from mlx_vlm.models.qwen3_5.language import (
+    _f32_to_e8m0,
+    transform_modelopt_mxfp4_weights,
+)
 from mlx_vlm.utils import (
     StoppingCriteria,
-    _f32_to_e8m0,
     _load_safetensors,
-    _transform_modelopt_mxfp4_weights,
     _transform_modelopt_nvfp4_weights,
     apply_generation_config_defaults,
     get_model_and_args,
@@ -41,7 +43,7 @@ def test_transform_modelopt_mxfp4_weights():
         "layer.bias": mx.ones((2,)),
     }
 
-    transformed, quantization = _transform_modelopt_mxfp4_weights(
+    transformed, quantization = transform_modelopt_mxfp4_weights(
         weights,
         {"quant_method": "mxfp4", "micro_block": 32},
     )

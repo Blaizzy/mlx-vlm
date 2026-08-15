@@ -8,9 +8,8 @@ from ..qwen3_vl import Model as Qwen3VLModel
 from ..qwen3_vl import processing_qwen3_vl  # noqa: F401
 from ..qwen3_vl.qwen3_vl import masked_scatter
 from .config import ModelConfig
-from .language import LanguageModel
+from .language import LanguageModel, dequantize_fp8_weights
 from .vision import VisionModel
-from .weights import dequantize_fp8_weights
 
 
 def sanitize_key(key):

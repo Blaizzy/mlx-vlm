@@ -6,8 +6,7 @@ import mlx.nn as nn
 
 from ....models.base import create_attention_mask
 from ....models.cache import BatchKVCache, KVCache
-from ....models.qwen3_5.language import Qwen3_5DecoderLayer
-from ....models.qwen3_5.weights import dequantize_fp8_weights
+from ....models.qwen3_5.language import Qwen3_5DecoderLayer, dequantize_fp8_weights
 from ....models.qwen3_5_moe.language import Qwen3_5MoeDecoderLayer
 from .config import Qwen3_5MTPConfig
 

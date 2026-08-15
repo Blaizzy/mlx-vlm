@@ -12913,7 +12913,7 @@ class TestQwen38FP8(unittest.TestCase):
         )
 
     def test_invalid_fp8_scale_grid_is_rejected(self):
-        from mlx_vlm.models.qwen3_5.weights import dequantize_fp8_weights
+        from mlx_vlm.models.qwen3_5.language import dequantize_fp8_weights
 
         with self.assertRaisesRegex(ValueError, "Invalid FP8 scale shape"):
             dequantize_fp8_weights(
