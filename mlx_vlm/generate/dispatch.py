@@ -875,6 +875,12 @@ def stream_generate(
             safe_lookup_min=apc_safe_prefix_lookup_min,
             suffix_is_text_only=_apc_suffix_is_text_only,
             prefix_has_media=_apc_prefix_has_media_tokens,
+            cache_template=(
+                model.language_model.make_cache()
+                if apc_mode == "composite"
+                and hasattr(model.language_model, "make_cache")
+                else None
+            ),
         )
         if plan is not None:
             plen = plan["prefix_len"]
@@ -943,7 +949,26 @@ def stream_generate(
         thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
         exact_checkpoint_len = None
         exact_checkpoint = None
-        if apc_manager is not None and apc_mode == "exact" and reused_prefix_len == 0:
+        composite_checkpointer = None
+        if (
+            apc_manager is not None
+            and apc_mode == "composite"
+            and reused_prefix_len == 0
+        ):
+            _chunk = kwargs.get("prefill_step_size") or DEFAULT_PREFILL_STEP_SIZE
+            _last = len(full_input_ids_list) - apc_manager.exact_cache_guard_tokens
+            exact_checkpoint_len = list(range(_chunk, max(_chunk, _last), _chunk))
+            if exact_checkpoint_len:
+                composite_checkpointer = _apc.CompositeCheckpointer(
+                    apc_manager,
+                    full_input_ids_list,
+                    extra_hash=apc_extra_hash,
+                    prefill_chunk=_chunk,
+                )
+                exact_checkpoint = composite_checkpointer
+            else:
+                exact_checkpoint_len = None
+        elif apc_manager is not None and apc_mode == "exact" and reused_prefix_len == 0:
             exact_checkpoint_len = _apc.adjust_prefix_to_text_suffix_boundary(
                 full_input_ids_list,
                 len(full_input_ids_list) - apc_manager.exact_cache_guard_tokens,
@@ -1065,7 +1090,7 @@ def stream_generate(
             prompt_cache_state.update(all_ids, tracked_cache)
 
         # APC: harvest new blocks from the post-generation KV state.
-        if apc_manager is not None and apc_mode == "block":
+        if apc_manager is not None and apc_mode in ("block", "composite"):
             try:
                 if all_ids is None:
                     all_ids = full_input_ids_list + [
@@ -1078,6 +1103,7 @@ def stream_generate(
                     extra_hash=apc_extra_hash,
                     skip_first_n_tokens=reused_prefix_len,
                     blocks_in_use=apc_blocks_in_use,
+                    allow_partial_layers=apc_mode == "composite",
                 )
             except Exception as e:
                 logger.warning("APC store failed: %s", e)

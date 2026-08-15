@@ -9,7 +9,7 @@ import time
 import warnings
 from collections.abc import Generator
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -50,6 +50,26 @@ DEFAULT_MIN_P = 0.0
 DEFAULT_TOP_N_SIGMA = 0.0
 DEFAULT_REPETITION_CONTEXT_SIZE = 20
 DEFAULT_PREFILL_STEP_SIZE = 2048
+
+
+def _prompt_cache_checkpoint_lens(
+    callback: Optional[Callable[[int, List[Any]], None]],
+    lens: Optional[Union[int, Sequence[int]]],
+    total_tokens: int,
+) -> List[int]:
+    """Prefill positions at which to hand the cache to ``callback``.
+
+    Exact mode asks for one snapshot near the end of the prompt; composite mode
+    asks for several, so a divergent request can resume from the last shared
+    boundary. A position at or past the end is dropped, since the prefill loop
+    always leaves a final token for the first decode step.
+    """
+    if callback is None or lens is None:
+        return []
+    values = [lens] if isinstance(lens, int) else list(lens)
+    return sorted({int(v) for v in values if 0 < int(v) < total_tokens})
+
+
 DEFAULT_COMPLETION_BATCH_SIZE = 32
 DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
@@ -186,7 +206,7 @@ def generate_step(
     draft_kind: str = "dflash",
     draft_block_size: Optional[int] = None,
     prompt_cache_checkpoint: Optional[Callable[[int, List[Any]], None]] = None,
-    prompt_cache_checkpoint_len: Optional[int] = None,
+    prompt_cache_checkpoint_len: Optional[Union[int, Sequence[int]]] = None,
     seed: Optional[int] = None,
     verbose: bool = False,
     **kwargs,
@@ -416,18 +436,15 @@ def generate_step(
             prefill_kwargs=policy_kwargs,
         ):
             prefill_step_size = None
-        checkpoint_len = (
-            int(prompt_cache_checkpoint_len)
-            if prompt_cache_checkpoint is not None
-            and prompt_cache_checkpoint_len is not None
-            else None
+        checkpoint_lens = _prompt_cache_checkpoint_lens(
+            prompt_cache_checkpoint,
+            prompt_cache_checkpoint_len,
+            inputs_embeds.shape[1],
         )
-        checkpoint_done = False
+        checkpoint_index = 0
         should_chunk = (
             prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size
-        ) or (
-            checkpoint_len is not None and 0 < checkpoint_len < inputs_embeds.shape[1]
-        )
+        ) or bool(checkpoint_lens)
         if prefill_step_size is not None and should_chunk:
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
@@ -437,13 +454,17 @@ def generate_step(
             ) as pbar:
                 while inputs_embeds.shape[1] > 1:
                     n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
+                    next_checkpoint = (
+                        checkpoint_lens[checkpoint_index]
+                        if checkpoint_index < len(checkpoint_lens)
+                        else None
+                    )
                     if (
-                        checkpoint_len is not None
-                        and not checkpoint_done
-                        and processed_tokens < checkpoint_len
-                        and processed_tokens + n_to_process > checkpoint_len
+                        next_checkpoint is not None
+                        and processed_tokens < next_checkpoint
+                        and processed_tokens + n_to_process > next_checkpoint
                     ):
-                        n_to_process = checkpoint_len - processed_tokens
+                        n_to_process = next_checkpoint - processed_tokens
                     chunk_kwargs = kwargs
                     if getattr(model.language_model, "supports_logits_to_keep", False):
                         chunk_kwargs = {**kwargs, "logits_to_keep": 1}
@@ -457,13 +478,13 @@ def generate_step(
                     quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
                     processed_tokens += n_to_process
-                    if (
-                        checkpoint_len is not None
-                        and not checkpoint_done
-                        and processed_tokens == checkpoint_len
+                    while (
+                        checkpoint_index < len(checkpoint_lens)
+                        and checkpoint_lens[checkpoint_index] <= processed_tokens
                     ):
-                        prompt_cache_checkpoint(processed_tokens, prompt_cache)
-                        checkpoint_done = True
+                        if checkpoint_lens[checkpoint_index] == processed_tokens:
+                            prompt_cache_checkpoint(processed_tokens, prompt_cache)
+                        checkpoint_index += 1
                     inputs_embeds = inputs_embeds[:, n_to_process:]
                     input_ids = input_ids[:, n_to_process:]
                     mx.clear_cache()
@@ -2227,6 +2248,9 @@ class BatchGenerator:
         self.apc_mode = None
         if apc_manager is not None:
             self.apc_mode = _apc.model_apc_mode(model)
+            if self.apc_mode == "composite":
+                apc_manager.note_composite_decline(_apc.CompositeDecline.BATCHED)
+                self.apc_mode = "exact"
             if self.apc_mode is None:
                 apc_manager = None
         self.apc_manager = apc_manager

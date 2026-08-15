@@ -470,6 +470,78 @@ def checkpoint_stride(
     return prefill_chunk * (-(-wanted // affordable))
 
 
+class CompositeDecline:
+    """Why composite mode did not reuse or store anything for a request."""
+
+    NOT_MIXED = "not_mixed"
+    BUDGET = "budget"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    NO_STATE_CHECKPOINT = "no_state_checkpoint"
+    NO_BLOCKS = "no_blocks"
+    LAYOUT_MISMATCH = "layout_mismatch"
+    BATCHED = "batched"
+
+
+class CompositeCheckpointer:
+    """Stores state-only checkpoints while a prompt is being prefilled.
+
+    The stride cannot be chosen before prefill starts, because a fresh cache
+    holds no state to measure. It is therefore decided on the first boundary
+    the prefill reaches, which is also the earliest point a checkpoint could be
+    taken, and every later boundary is re-checked against the running total so
+    a state that keeps growing cannot overrun the budget.
+    """
+
+    def __init__(
+        self,
+        manager: "APCManager",
+        token_ids: Sequence[int],
+        *,
+        extra_hash: int = 0,
+        prefill_chunk: int = 2048,
+        budget_bytes: Optional[int] = None,
+    ) -> None:
+        self.manager = manager
+        self.token_ids = list(token_ids)
+        self.extra_hash = int(extra_hash)
+        self.prefill_chunk = int(prefill_chunk)
+        self.budget_bytes = budget_bytes
+        self.stride: Optional[int] = None
+        self.stored_bytes = 0
+        self.stored = 0
+        self.decline: Optional[str] = None
+
+    def __call__(self, prefix_len: int, prompt_cache: Sequence[Any]) -> None:
+        pageable, checkpointed = partition_cache_by_pageability(prompt_cache)
+        if not pageable or not checkpointed:
+            self.decline = CompositeDecline.NOT_MIXED
+            return
+        cost = checkpoint_state_bytes(prompt_cache, checkpointed)
+        if self.stride is None:
+            self.stride = checkpoint_stride(
+                cost,
+                len(self.token_ids),
+                budget_bytes=self.budget_bytes,
+                prefill_chunk=self.prefill_chunk,
+            )
+            if self.stride == 0:
+                self.decline = CompositeDecline.BUDGET
+                return
+        if self.stride <= 0 or prefix_len % self.stride:
+            return
+        if not checkpoint_fits(self.stored_bytes, cost, budget_bytes=self.budget_bytes):
+            self.decline = CompositeDecline.BUDGET_EXHAUSTED
+            return
+        stored = self.manager.store_exact_cache(
+            self.token_ids[:prefix_len],
+            [prompt_cache[i] for i in checkpointed],
+            extra_hash=self.extra_hash,
+        )
+        if stored:
+            self.stored_bytes += cost
+            self.stored += 1
+
+
 def _sequence_hash_array(tokens: np.ndarray, extra_hash: int, block_size: int) -> int:
     h = hashlib.sha256()
     h.update(int(extra_hash & ((1 << 64) - 1)).to_bytes(8, "little"))
@@ -2983,6 +3055,7 @@ class APCManager:
             self._free_push(b)
         self.hash_table: dict[int, APCBlock] = {}
         self._exact_cache: "OrderedDict[int, APCExactCacheEntry]" = OrderedDict()
+        self._composite_declines: Dict[str, int] = {}
         self._exact_lengths: List[int] = []
         self._exact_length_counts: Dict[int, int] = {}
         self.stats = APCStats()
@@ -3623,11 +3696,24 @@ class APCManager:
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
             return new_blocks
 
+    def note_composite_decline(self, reason: str) -> None:
+        """Record that composite mode did nothing for a request, and why.
+
+        Composite declines by design when a checkpoint will not fit the budget,
+        so a model that qualifies for it can still reuse nothing. Without a
+        reason that is indistinguishable from a fault.
+        """
+        with self.lock:
+            self._composite_declines[reason] = (
+                self._composite_declines.get(reason, 0) + 1
+            )
+
     def stats_snapshot(self) -> dict:
         with self.lock:
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
             snap = self.stats.snapshot(self.num_blocks, self.block_size)
             snap["resident_bytes"] = self._resident_bytes_locked()
+            snap["composite_declines"] = dict(self._composite_declines)
             if self.disk is not None:
                 snap["disk_bytes"] = self.disk.disk_bytes
                 snap["disk_max_bytes"] = self.disk.max_bytes
@@ -3665,6 +3751,7 @@ class APCManager:
             for b in self.pool:
                 self._free_push(b)
             self._exact_cache.clear()
+            self._composite_declines.clear()
             self._exact_lengths.clear()
             self._exact_length_counts.clear()
             self.stats = APCStats()
@@ -4357,6 +4444,7 @@ def commit_prefix_blocks(
     extra_hash: int = 0,
     skip_first_n_tokens: int = 0,
     blocks_in_use: Sequence[APCBlock] = (),
+    allow_partial_layers: bool = False,
 ) -> List[APCBlock]:
     """Harvest one (row of a) prompt cache into hashed blocks, store them, then release the in-use prefix blocks together with the new ones. Shared block-mode commit for both generate paths."""
     new_blocks = harvest_blocks_from_batch_cache(
@@ -4366,6 +4454,7 @@ def commit_prefix_blocks(
         batch_idx=batch_idx,
         extra_hash=extra_hash,
         skip_first_n_tokens=skip_first_n_tokens,
+        allow_partial_layers=allow_partial_layers,
     )
     apc_manager.release(list(blocks_in_use) + new_blocks)
     return new_blocks
@@ -4403,6 +4492,82 @@ def model_supports_apc(language_model: Any) -> bool:
     return model_apc_mode(language_model) is not None
 
 
+def _composite_lookup_plan(
+    manager: "APCManager",
+    ids_list: Sequence[int],
+    *,
+    extra_hash: int,
+    safe_lookup_min: int,
+    suffix_is_text_only,
+    prefix_has_media,
+    cache_template: Optional[Sequence[Any]] = None,
+) -> Optional[dict]:
+    """Rebuild a hybrid's cache from paged blocks plus a state checkpoint.
+
+    Both halves have to resume at the same token, so the reusable length is the
+    longest state checkpoint that the blocks also cover. The blocks are trimmed
+    down to it; the state cannot be trimmed, which is what sets the boundary.
+    """
+    n = len(ids_list)
+    if cache_template is None:
+        manager.note_composite_decline(CompositeDecline.LAYOUT_MISMATCH)
+        return None
+
+    matched, block_prefix_len = manager.lookup_prefix(ids_list, extra_hash=extra_hash)
+    if block_prefix_len > 0 and prefix_has_media(block_prefix_len):
+        manager.release(matched)
+        matched, block_prefix_len = [], 0
+    if not matched or block_prefix_len <= 0:
+        manager.release(matched)
+        manager.note_composite_decline(CompositeDecline.NO_BLOCKS)
+        return None
+
+    state_cache, state_prefix_len = manager.lookup_exact_cache(
+        ids_list,
+        extra_hash=extra_hash,
+        max_prefix_tokens=block_prefix_len,
+        min_prefix_tokens=safe_lookup_min,
+    )
+    if state_cache is None or not 0 < state_prefix_len <= block_prefix_len:
+        manager.release(matched)
+        manager.note_composite_decline(CompositeDecline.NO_STATE_CHECKPOINT)
+        return None
+    if state_prefix_len >= n or not suffix_is_text_only(state_prefix_len):
+        manager.release(matched)
+        manager.note_composite_decline(CompositeDecline.NO_STATE_CHECKPOINT)
+        return None
+
+    warm = make_warm_composite_cache(
+        matched,
+        cache_template,
+        state_entries=state_cache,
+        min_capacity_tokens=n + 1,
+    )
+    if warm is None:
+        manager.release(matched)
+        manager.note_composite_decline(CompositeDecline.LAYOUT_MISMATCH)
+        return None
+
+    trim = block_prefix_len - state_prefix_len
+    if trim:
+        pageable, _ = partition_cache_by_pageability(cache_template)
+        for index in pageable:
+            entry = warm[index]
+            if not hasattr(entry, "trim"):
+                manager.release(matched)
+                manager.note_composite_decline(CompositeDecline.LAYOUT_MISMATCH)
+                return None
+            entry.trim(trim)
+
+    return {
+        "matched_blocks": matched,
+        "warm_cache": warm,
+        "prefix_len": state_prefix_len,
+        "extra_hash": extra_hash,
+        "full_input_ids": list(ids_list),
+    }
+
+
 def apc_lookup_plan(
     manager: "APCManager",
     ids_list: Sequence[int],
@@ -4412,11 +4577,23 @@ def apc_lookup_plan(
     safe_lookup_min: int,
     suffix_is_text_only,
     prefix_has_media,
+    cache_template: Optional[Sequence[Any]] = None,
 ) -> Optional[dict]:
     """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply."""
     n = len(ids_list)
     if not ids_list or n < 2:
         return None
+
+    if apc_mode == "composite":
+        return _composite_lookup_plan(
+            manager,
+            ids_list,
+            extra_hash=extra_hash,
+            safe_lookup_min=safe_lookup_min,
+            suffix_is_text_only=suffix_is_text_only,
+            prefix_has_media=prefix_has_media,
+            cache_template=cache_template,
+        )
 
     if apc_mode == "exact":
         exact_cache, exact_prefix_len = manager.lookup_exact_cache(

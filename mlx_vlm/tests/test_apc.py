@@ -1772,3 +1772,187 @@ def test_a_cache_with_nothing_to_page_stays_exact(monkeypatch):
     monkeypatch.setenv("APC_COMPOSITE", "1")
 
     assert model_apc_mode(_FakeLM(["state", "state"])) == "exact"
+
+
+def _lens(lens, total=100, callback=lambda n, c: None):
+    from mlx_vlm.generate.ar import _prompt_cache_checkpoint_lens
+
+    return _prompt_cache_checkpoint_lens(callback, lens, total)
+
+
+def test_checkpoint_lens_accepts_a_single_position():
+    assert _lens(32) == [32]
+
+
+def test_checkpoint_lens_accepts_and_sorts_many():
+    assert _lens([64, 16, 32]) == [16, 32, 64]
+
+
+def test_checkpoint_lens_drops_positions_outside_the_prompt():
+    assert _lens([0, -5, 50, 100, 250], total=100) == [50]
+
+
+def test_checkpoint_lens_deduplicates():
+    assert _lens([32, 32, 64]) == [32, 64]
+
+
+def test_checkpoint_lens_is_empty_without_a_callback():
+    assert _lens([10, 20], callback=None) == []
+    assert _lens(None) == []
+
+
+def _hybrid_cache(seq_len=64, state_shape=(1, 4, 4)):
+    from mlx_vlm.models.cache import ArraysCache, KVCache
+
+    kv = KVCache()
+    kv.update_and_fetch(mx.zeros((1, 1, seq_len, 4)), mx.zeros((1, 1, seq_len, 4)))
+    state = ArraysCache(1)
+    state[0] = mx.ones(state_shape)
+    return [kv, state]
+
+
+def _checkpointer(manager, tokens, **kw):
+    return apc_module.CompositeCheckpointer(manager, tokens, prefill_chunk=16, **kw)
+
+
+def test_checkpointer_picks_a_stride_on_its_first_boundary():
+    manager = APCManager(num_blocks=64, block_size=16)
+    manager.exact_cache_min_tokens = 1
+    tokens = list(range(64))
+    cp = _checkpointer(manager, tokens, budget_bytes=1 << 20)
+
+    cp(16, _hybrid_cache())
+
+    assert cp.stride == 16
+    assert cp.stored == 1
+    assert cp.decline is None
+
+
+def test_checkpointer_declines_when_one_checkpoint_will_not_fit():
+    manager = APCManager(num_blocks=64, block_size=16)
+    manager.exact_cache_min_tokens = 1
+    cp = _checkpointer(manager, list(range(64)), budget_bytes=8)
+
+    cp(16, _hybrid_cache())
+
+    assert cp.stride == 0
+    assert cp.stored == 0
+    assert cp.decline == apc_module.CompositeDecline.BUDGET
+
+
+def test_checkpointer_only_stores_on_stride_multiples():
+    manager = APCManager(num_blocks=64, block_size=16)
+    manager.exact_cache_min_tokens = 1
+    cp = _checkpointer(manager, list(range(128)), budget_bytes=1 << 20)
+
+    cp(16, _hybrid_cache())
+    cp(24, _hybrid_cache())
+    cp(32, _hybrid_cache())
+
+    assert cp.stride == 16
+    assert cp.stored == 2
+
+
+def test_checkpointer_stops_when_a_growing_state_exhausts_the_budget():
+    """The stride is priced once, but a sliding window keeps growing.
+
+    Pricing off the first, small measurement yields a fine stride; the running
+    total must still stop before the budget is exceeded.
+    """
+    manager = APCManager(num_blocks=64, block_size=16)
+    manager.exact_cache_min_tokens = 1
+    small = apc_module.checkpoint_state_bytes(_hybrid_cache(state_shape=(1, 2, 2)))
+    budget = small * 4
+    cp = _checkpointer(manager, list(range(64)), budget_bytes=budget)
+
+    cp(16, _hybrid_cache(state_shape=(1, 2, 2)))
+    assert cp.stride == 16 and cp.stored == 1
+
+    cp(32, _hybrid_cache(state_shape=(1, 8, 8)))
+
+    assert cp.stored == 1
+    assert cp.stored_bytes <= budget
+    assert cp.decline == apc_module.CompositeDecline.BUDGET_EXHAUSTED
+
+
+def test_checkpointer_declines_a_cache_with_nothing_to_page():
+    from mlx_vlm.models.cache import ArraysCache
+
+    manager = APCManager(num_blocks=64, block_size=16)
+    cp = _checkpointer(manager, list(range(64)))
+
+    cp(16, [ArraysCache(1), ArraysCache(1)])
+
+    assert cp.decline == apc_module.CompositeDecline.NOT_MIXED
+    assert cp.stored == 0
+
+
+def _composite_plan(manager, tokens, template):
+    return apc_module.apc_lookup_plan(
+        manager,
+        tokens,
+        extra_hash=0,
+        apc_mode="composite",
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda n: True,
+        prefix_has_media=lambda n: False,
+        cache_template=template,
+    )
+
+
+def test_composite_lookup_declines_without_a_template():
+    manager = APCManager(num_blocks=64, block_size=16)
+
+    assert _composite_plan(manager, list(range(64)), None) is None
+    assert manager.stats_snapshot()["composite_declines"] == {
+        apc_module.CompositeDecline.LAYOUT_MISMATCH: 1
+    }
+
+
+def test_composite_lookup_declines_when_nothing_is_stored():
+    manager = APCManager(num_blocks=64, block_size=16)
+
+    assert _composite_plan(manager, list(range(64)), _hybrid_cache()) is None
+    assert manager.stats_snapshot()["composite_declines"] == {
+        apc_module.CompositeDecline.NO_BLOCKS: 1
+    }
+
+
+def test_composite_lookup_declines_when_only_blocks_are_stored():
+    manager = APCManager(num_blocks=64, block_size=16)
+    tokens = list(range(64))
+    warm = _hybrid_cache()
+    manager.release(
+        harvest_blocks_from_batch_cache(
+            manager, warm, tokens, allow_partial_layers=True
+        )
+    )
+
+    plan = _composite_plan(manager, tokens + list(range(900, 908)), _hybrid_cache())
+
+    assert plan is None
+    assert manager.stats_snapshot()["composite_declines"] == {
+        apc_module.CompositeDecline.NO_STATE_CHECKPOINT: 1
+    }
+
+
+def test_composite_lookup_returns_a_plan_when_both_halves_exist():
+    manager = APCManager(num_blocks=64, block_size=16)
+    manager.exact_cache_min_tokens = 1
+    tokens = list(range(64))
+    warm = _hybrid_cache()
+    manager.release(
+        harvest_blocks_from_batch_cache(
+            manager, warm, tokens, allow_partial_layers=True
+        )
+    )
+    _, checkpointed = apc_module.partition_cache_by_pageability(warm)
+    assert manager.store_exact_cache(tokens[:32], [warm[i] for i in checkpointed])
+
+    plan = _composite_plan(manager, tokens + list(range(900, 908)), _hybrid_cache())
+
+    assert plan is not None
+    assert plan["prefix_len"] == 32
+    assert plan["warm_cache"] is not None
+    assert manager.stats_snapshot()["composite_declines"] == {}
+    manager.release(plan["matched_blocks"])
