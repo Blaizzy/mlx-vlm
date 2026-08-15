@@ -1956,3 +1956,45 @@ def test_composite_lookup_returns_a_plan_when_both_halves_exist():
     assert plan["warm_cache"] is not None
     assert manager.stats_snapshot()["composite_declines"] == {}
     manager.release(plan["matched_blocks"])
+
+
+def test_store_final_keeps_composite_no_worse_than_exact_without_chunking():
+    """A prefill that never chunks must still leave a usable checkpoint.
+
+    Hidden-state speculative decoding runs the prompt in one pass, so the
+    stride-based checkpoints never fire. Without a fallback, composite would
+    store nothing where exact mode would have stored its snapshot.
+    """
+    manager = APCManager(num_blocks=64, block_size=16)
+    manager.exact_cache_min_tokens = 1
+    tokens = list(range(64))
+    cache = _hybrid_cache()
+    cp = _checkpointer(manager, tokens, budget_bytes=1 << 20)
+
+    assert cp.stored == 0
+    assert cp.store_final(48, cache) is True
+    assert cp.stored == 1
+
+    restored, prefix_len = manager.lookup_exact_cache(tokens)
+    assert restored is not None
+    assert prefix_len == 48
+
+
+def test_store_final_respects_the_budget():
+    manager = APCManager(num_blocks=64, block_size=16)
+    manager.exact_cache_min_tokens = 1
+    cp = _checkpointer(manager, list(range(64)), budget_bytes=8)
+
+    assert cp.store_final(48, _hybrid_cache()) is False
+    assert cp.stored == 0
+    assert cp.decline == apc_module.CompositeDecline.BUDGET
+
+
+def test_store_final_declines_a_cache_with_nothing_to_page():
+    from mlx_vlm.models.cache import ArraysCache
+
+    manager = APCManager(num_blocks=64, block_size=16)
+    cp = _checkpointer(manager, list(range(64)))
+
+    assert cp.store_final(48, [ArraysCache(1)]) is False
+    assert cp.decline == apc_module.CompositeDecline.NOT_MIXED

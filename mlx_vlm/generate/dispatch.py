@@ -1012,6 +1012,17 @@ def stream_generate(
                     apc_manager.note_composite_decline(
                         _apc.CompositeDecline.NOT_CHUNKED
                     )
+                    final_len = _apc.adjust_prefix_to_text_suffix_boundary(
+                        full_input_ids_list,
+                        len(full_input_ids_list) - apc_manager.exact_cache_guard_tokens,
+                        multimodal_token_ids,
+                        max_prefix_tokens=len(full_input_ids_list) - 1,
+                    )
+                    if final_len > 0:
+                        try:
+                            composite_checkpointer.store_final(final_len, tracked_cache)
+                        except Exception as e:
+                            logger.warning("APC composite fallback store failed: %s", e)
                 if (
                     apc_manager is not None
                     and apc_mode == "exact"
