@@ -2008,7 +2008,7 @@ def test_a_composite_plan_hands_back_blocks_the_caller_must_release():
         )
     )
     _, checkpointed = apc_module.partition_cache_by_pageability(warm)
-    manager.store_exact_cache(tokens[:32], [warm[i] for i in checkpointed])
+    manager.composite_state.store(tokens[:32], [warm[i] for i in checkpointed])
     assert _held(manager) == 0
 
     plan = _composite_plan(manager, tokens + list(range(900, 908)), _hybrid_cache())
@@ -2036,3 +2036,67 @@ def test_plans_that_carry_a_warm_cache_alone_leave_no_blocks_held():
     assert plan["matched_blocks"]
     manager.release(plan["matched_blocks"])
     assert _held(manager) == 0
+
+
+def _state_entries(seq_len=8, value=1.0):
+    from mlx_vlm.models.cache import ArraysCache
+
+    entry = ArraysCache(1)
+    entry[0] = mx.full((1, seq_len, seq_len), value)
+    return [entry]
+
+
+def test_composite_state_survives_the_two_entry_exact_cache_limit():
+    """Composite takes a checkpoint per boundary; the exact cache keeps two.
+
+    Sharing that cache meant an eight-thousand-token prompt kept only its last
+    two boundaries, so a request diverging early found blocks and no state.
+    """
+    manager = APCManager(num_blocks=64, block_size=16)
+    assert manager._exact_cache_max == 2
+
+    for boundary in (16, 32, 48, 64, 80):
+        manager.composite_state.store(list(range(boundary)), _state_entries())
+
+    assert len(manager.composite_state._entries) == 5
+    restored, prefix = manager.composite_state.lookup(list(range(200)))
+    assert restored is not None and prefix == 80
+
+
+def test_composite_state_is_not_reachable_from_the_exact_cache():
+    """A state checkpoint covers only some layers of a model.
+
+    Returned to a caller expecting a whole prompt cache, it would hand the
+    model a cache with layers missing.
+    """
+    manager = APCManager(num_blocks=64, block_size=16)
+    manager.exact_cache_min_tokens = 1
+    tokens = list(range(64))
+
+    manager.composite_state.store(tokens[:32], _state_entries())
+
+    assert manager.lookup_exact_cache(tokens) == (None, 0)
+    assert manager.composite_state.lookup(tokens)[1] == 32
+
+
+def test_composite_state_is_bounded_by_bytes_not_by_a_count():
+    manager = APCManager(num_blocks=64, block_size=16)
+    one = apc_module.checkpoint_state_bytes(_state_entries(), [0])
+
+    for boundary in (16, 32, 48, 64):
+        manager.composite_state.store(
+            list(range(boundary)), _state_entries(), budget_bytes=one * 2
+        )
+
+    assert manager.composite_state.resident_bytes <= one * 2
+    assert len(manager.composite_state._entries) == 2
+
+
+def test_composite_state_never_reaches_the_disk_store(tmp_path):
+    manager = APCManager(num_blocks=64, block_size=16)
+    manager.exact_cache_min_tokens = 1
+
+    manager.composite_state.store(list(range(32)), _state_entries())
+
+    assert manager.stats_snapshot().get("disk_writes", 0) == 0
+    assert manager.stats_snapshot()["composite_state_entries"] == 1

@@ -479,6 +479,124 @@ def checkpoint_stride(
     return prefill_chunk * (-(-wanted // affordable))
 
 
+class CompositeStateStore:
+    """Checkpoints of the layers a hybrid cannot page.
+
+    Held apart from the exact-prefix cache for three reasons. Its entries cover
+    only some of a model's layers, so returning one to a caller that expects a
+    whole prompt cache would hand the model a cache with layers missing. Its
+    size is governed by bytes, because composite already picks its stride from
+    a memory budget, where the exact cache is bounded by a count that defaults
+    to two and would drop all but the last pair of boundaries. And it is memory
+    only, since a checkpoint at every stride would otherwise reach the disk
+    store on each boundary.
+    """
+
+    def __init__(self, block_size: int) -> None:
+        self.block_size = int(block_size)
+        self._entries: "OrderedDict[int, APCExactCacheEntry]" = OrderedDict()
+        self._bytes: Dict[int, int] = {}
+        self._lengths: List[int] = []
+        self._counts: Dict[int, int] = {}
+        self.resident_bytes = 0
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._bytes.clear()
+        self._lengths.clear()
+        self._counts.clear()
+        self.resident_bytes = 0
+
+    def _index_add(self, length: int) -> None:
+        count = self._counts.get(length, 0)
+        self._counts[length] = count + 1
+        if count == 0:
+            bisect.insort(self._lengths, length)
+
+    def _index_drop(self, length: int) -> None:
+        count = self._counts.get(length, 0)
+        if count > 1:
+            self._counts[length] = count - 1
+            return
+        self._counts.pop(length, None)
+        position = bisect.bisect_left(self._lengths, length)
+        if position < len(self._lengths) and self._lengths[position] == length:
+            del self._lengths[position]
+
+    def _drop(self, key: int) -> None:
+        entry = self._entries.pop(key, None)
+        if entry is None:
+            return
+        self.resident_bytes -= self._bytes.pop(key, 0)
+        self._index_drop(len(entry.token_ids))
+
+    def store(
+        self,
+        token_ids: Sequence[int],
+        entries: Sequence[Any],
+        extra_hash: int = 0,
+        budget_bytes: Optional[int] = None,
+    ) -> bool:
+        token_tuple = tuple(int(t) for t in token_ids)
+        if not token_tuple or not entries:
+            return False
+        copied = _clone_prompt_cache_for_apc(entries)
+        if copied is None:
+            return False
+        cost = checkpoint_state_bytes(copied, range(len(copied)))
+        key = _sequence_hash(token_tuple, extra_hash, self.block_size)
+        self._drop(key)
+        self._entries[key] = APCExactCacheEntry(
+            token_ids=token_tuple,
+            extra_hash=int(extra_hash),
+            prompt_cache=copied,
+            last_used=time.time(),
+        )
+        self._entries.move_to_end(key)
+        self._bytes[key] = cost
+        self.resident_bytes += cost
+        self._index_add(len(token_tuple))
+        if budget_bytes is None:
+            budget_bytes = _checkpoint_budget_bytes()
+        while self.resident_bytes > budget_bytes and len(self._entries) > 1:
+            self._drop(next(iter(self._entries)))
+        return True
+
+    def lookup(
+        self,
+        token_ids: Sequence[int],
+        extra_hash: int = 0,
+        max_prefix_tokens: Optional[int] = None,
+        min_prefix_tokens: int = 0,
+    ) -> Tuple[Optional[List[Any]], int]:
+        token_tuple = tuple(int(t) for t in token_ids)
+        max_len = len(token_tuple)
+        if max_prefix_tokens is not None and max_prefix_tokens > 0:
+            max_len = min(max_len, int(max_prefix_tokens))
+        if max_len <= min_prefix_tokens or not self._entries:
+            return None, 0
+        upper = bisect.bisect_right(self._lengths, max_len)
+        lower = bisect.bisect_right(self._lengths, min_prefix_tokens)
+        token_array = np.asarray(token_tuple, dtype=np.int32)
+        for position in range(upper - 1, lower - 1, -1):
+            candidate = self._lengths[position]
+            key = _sequence_hash_array(
+                token_array[:candidate], extra_hash, self.block_size
+            )
+            entry = self._entries.get(key)
+            if entry is None or entry.extra_hash != extra_hash:
+                continue
+            if token_tuple[:candidate] != entry.token_ids:
+                continue
+            self._entries.move_to_end(key)
+            entry.last_used = time.time()
+            restored = _clone_prompt_cache_for_apc(entry.prompt_cache)
+            if restored is None:
+                return None, 0
+            return restored, candidate
+        return None, 0
+
+
 class CompositeDecline:
     """Why composite mode did not reuse or store anything for a request."""
 
@@ -546,10 +664,11 @@ class CompositeCheckpointer:
         if not checkpoint_fits(self.stored_bytes, cost, budget_bytes=self.budget_bytes):
             self.decline = CompositeDecline.BUDGET_EXHAUSTED
             return
-        stored = self.manager.store_exact_cache(
+        stored = self.manager.composite_state.store(
             self.token_ids[:prefix_len],
             [prompt_cache[i] for i in checkpointed],
             extra_hash=self.extra_hash,
+            budget_bytes=self.budget_bytes,
         )
         if stored:
             self.stored_bytes += cost
@@ -3070,6 +3189,7 @@ class APCManager:
         self.hash_table: dict[int, APCBlock] = {}
         self._exact_cache: "OrderedDict[int, APCExactCacheEntry]" = OrderedDict()
         self._composite_declines: Dict[str, int] = {}
+        self.composite_state = CompositeStateStore(block_size)
         self._last_reuse_tokens = 0
         self._exact_lengths: List[int] = []
         self._exact_length_counts: Dict[int, int] = {}
@@ -3739,6 +3859,8 @@ class APCManager:
             snap = self.stats.snapshot(self.num_blocks, self.block_size)
             snap["resident_bytes"] = self._resident_bytes_locked()
             snap["composite_declines"] = dict(self._composite_declines)
+            snap["composite_state_bytes"] = self.composite_state.resident_bytes
+            snap["composite_state_entries"] = len(self.composite_state._entries)
             snap["last_reuse_tokens"] = self._last_reuse_tokens
             if self.disk is not None:
                 snap["disk_bytes"] = self.disk.disk_bytes
@@ -3777,6 +3899,7 @@ class APCManager:
             for b in self.pool:
                 self._free_push(b)
             self._exact_cache.clear()
+            self.composite_state.clear()
             self._composite_declines.clear()
             self._exact_lengths.clear()
             self._exact_length_counts.clear()
@@ -4550,7 +4673,7 @@ def _composite_lookup_plan(
         manager.note_composite_decline(CompositeDecline.NO_BLOCKS)
         return None
 
-    state_cache, state_prefix_len = manager.lookup_exact_cache(
+    state_cache, state_prefix_len = manager.composite_state.lookup(
         ids_list,
         extra_hash=extra_hash,
         max_prefix_tokens=block_prefix_len,
