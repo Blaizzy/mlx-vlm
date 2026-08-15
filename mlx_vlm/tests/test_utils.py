@@ -12,10 +12,6 @@ import mlx.nn as nn
 import pytest
 
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
-from mlx_vlm.models.qwen3_5.language import (
-    _f32_to_e8m0,
-    transform_modelopt_mxfp4_weights,
-)
 from mlx_vlm.utils import (
     StoppingCriteria,
     _load_safetensors,
@@ -33,27 +29,6 @@ from mlx_vlm.utils import (
     sanitize_weights,
     update_module_configs,
 )
-
-
-def test_transform_modelopt_mxfp4_weights():
-    packed = mx.arange(64, dtype=mx.uint8).reshape(2, 32)
-    weights = {
-        "layer.weight": packed,
-        "layer.weight_scale": mx.array([[0.5, 1.0], [2.0, 4.0]]),
-        "layer.bias": mx.ones((2,)),
-    }
-
-    transformed, quantization = transform_modelopt_mxfp4_weights(
-        weights,
-        {"quant_method": "mxfp4", "micro_block": 32},
-    )
-
-    assert transformed["layer.weight"].dtype == mx.uint32
-    assert transformed["layer.weight"].shape == (2, 8)
-    assert transformed["layer.scales"].tolist() == [[126, 127], [128, 129]]
-    assert mx.array_equal(transformed["layer.bias"], weights["layer.bias"])
-    assert "layer.weight_scale" not in transformed
-    assert quantization == {"group_size": 32, "bits": 4, "mode": "mxfp4"}
 
 
 def test_transform_modelopt_nvfp4_weights():
@@ -79,17 +54,6 @@ def test_transform_modelopt_nvfp4_weights():
     assert "layer.weight_scale_2" not in transformed
     assert "layer.input_scale" not in transformed
     assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
-
-
-@pytest.mark.parametrize(
-    ("values", "expected"),
-    [
-        ([0.0, float("nan"), float("inf")], [0, 255, 255]),
-        ([2**-127, 1.0, 2**127], [0, 127, 254]),
-    ],
-)
-def test_f32_to_e8m0(values, expected):
-    assert _f32_to_e8m0(mx.array(values)).tolist() == expected
 
 
 class MockTensor:

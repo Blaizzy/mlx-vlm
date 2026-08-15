@@ -751,12 +751,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     weights, transformed_quantization = _transform_modelopt_nvfp4_weights(
         weights, quantization_config
     )
-    if transformed_quantization is None and config.get("model_type") == "qwen3_5":
-        from .models.qwen3_5.language import transform_modelopt_mxfp4_weights
-
-        weights, transformed_quantization = transform_modelopt_mxfp4_weights(
-            weights, quantization_config
-        )
     if transformed_quantization is None:
         weights, transformed_quantization = _transform_compressed_tensors_weights(
             weights, quantization_config
