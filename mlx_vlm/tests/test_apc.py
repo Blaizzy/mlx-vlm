@@ -2059,3 +2059,53 @@ def test_kv_bits_leaves_a_sliding_window_cache_alone_instead_of_raising():
 
     assert isinstance(prompt_cache[1], RotatingKVCache)
     assert type(prompt_cache[0]).__name__ != "KVCache"
+
+
+def _held(manager):
+    return sum(1 for b in manager.pool if b.block_hash is not None and b.ref_cnt > 0)
+
+
+def test_a_composite_plan_hands_back_blocks_the_caller_must_release():
+    """Composite is the first plan to carry a warm cache and blocks together.
+
+    Every other plan carries one or the other, so a caller that releases blocks
+    only when there is no warm cache will pin a composite hit's blocks forever.
+    """
+    manager = APCManager(num_blocks=64, block_size=16)
+    manager.exact_cache_min_tokens = 1
+    tokens = list(range(64))
+    warm = _hybrid_cache()
+    manager.release(
+        harvest_blocks_from_batch_cache(
+            manager, warm, tokens, allow_partial_layers=True
+        )
+    )
+    _, checkpointed = apc_module.partition_cache_by_pageability(warm)
+    manager.store_exact_cache(tokens[:32], [warm[i] for i in checkpointed])
+    assert _held(manager) == 0
+
+    plan = _composite_plan(manager, tokens + list(range(900, 908)), _hybrid_cache())
+
+    assert plan is not None
+    assert plan["warm_cache"] is not None
+    assert plan["matched_blocks"]
+    assert _held(manager) > 0
+
+    manager.release(plan["matched_blocks"])
+    assert _held(manager) == 0
+
+
+def test_plans_that_carry_a_warm_cache_alone_leave_no_blocks_held():
+    manager = APCManager(num_blocks=64, block_size=16)
+    tokens = list(range(64))
+    keys = [mx.zeros((1, 1, len(tokens), 4))]
+    values = [mx.zeros((1, 1, len(tokens), 4))]
+    manager.release(manager.store_kv_blocks(tokens, keys, values))
+
+    plan = _plan_for_mode(manager, tokens + list(range(900, 908)), "block")
+
+    assert plan is not None
+    assert plan.get("warm_cache") is None
+    assert plan["matched_blocks"]
+    manager.release(plan["matched_blocks"])
+    assert _held(manager) == 0

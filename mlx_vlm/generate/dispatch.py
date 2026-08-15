@@ -892,10 +892,10 @@ def stream_generate(
                 input_ids = input_ids[:, plen:]
                 pixel_values = None
                 kwargs.pop("cached_image_features", None)
+                apc_blocks_in_use = matched_blocks
                 if warm_cache is not None:
                     kwargs["prompt_cache"] = warm_cache
                 else:
-                    apc_blocks_in_use = matched_blocks
                     _quant_policy = kv_quant_from_legacy(
                         kwargs.get("kv_bits"),
                         kwargs.get("kv_quant_scheme"),
@@ -913,7 +913,7 @@ def stream_generate(
                         min_capacity_tokens=plen + input_ids.shape[1] + 1,
                         kv_quant_config=_quant_cfg,
                     )
-            elif warm_cache is None and matched_blocks:
+            elif matched_blocks:
                 apc_manager.release(matched_blocks)
 
     if thinking_budget is not None:
