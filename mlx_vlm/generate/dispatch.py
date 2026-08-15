@@ -964,11 +964,13 @@ def stream_generate(
                 max_prefix_tokens=len(full_input_ids_list) - 1,
             )
             _last -= _last % _block
+            _end = len(full_input_ids_list)
             exact_checkpoint_len = [
                 b for b in range(_chunk, max(_chunk, _last), _chunk)
             ]
             if _last > 0:
                 exact_checkpoint_len.append(_last)
+            exact_checkpoint_len.append(_end)
             exact_checkpoint_len = sorted(set(exact_checkpoint_len))
             if exact_checkpoint_len:
                 composite_checkpointer = _apc.CompositeCheckpointer(
@@ -976,7 +978,7 @@ def stream_generate(
                     full_input_ids_list,
                     extra_hash=apc_extra_hash,
                     prefill_chunk=_chunk,
-                    required_positions=([_last] if _last > 0 else []),
+                    required_positions=[p for p in (_last, _end) if p > 0],
                 )
                 exact_checkpoint = composite_checkpointer
             else:
@@ -990,6 +992,9 @@ def stream_generate(
             )
             if exact_checkpoint_len <= 0:
                 exact_checkpoint_len = None
+            exact_checkpoint_len = sorted(
+                {p for p in (exact_checkpoint_len, len(full_input_ids_list)) if p}
+            )
 
             def exact_checkpoint(prefix_len: int, prompt_cache: List[Any]) -> None:
                 apc_manager.store_exact_cache(
@@ -1017,34 +1022,14 @@ def stream_generate(
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = total_prompt_tokens / prompt_time
                 tic = time.perf_counter()
-                if composite_checkpointer is not None:
-                    if (
-                        composite_checkpointer.stored == 0
-                        and composite_checkpointer.decline is None
-                    ):
-                        apc_manager.note_composite_decline(
-                            _apc.CompositeDecline.NOT_CHUNKED
-                        )
-                    if composite_checkpointer.stored == 0:
-                        try:
-                            composite_checkpointer.store_final(
-                                len(full_input_ids_list), tracked_cache
-                            )
-                        except Exception as e:
-                            logger.warning("APC composite fallback store failed: %s", e)
                 if (
-                    apc_manager is not None
-                    and apc_mode == "exact"
-                    and reused_prefix_len == 0
+                    composite_checkpointer is not None
+                    and composite_checkpointer.stored == 0
+                    and composite_checkpointer.decline is None
                 ):
-                    try:
-                        apc_manager.store_exact_cache(
-                            full_input_ids_list,
-                            tracked_cache,
-                            extra_hash=apc_extra_hash,
-                        )
-                    except Exception as e:
-                        logger.warning("APC exact-cache store failed: %s", e)
+                    apc_manager.note_composite_decline(
+                        _apc.CompositeDecline.NO_CHECKPOINT
+                    )
 
             generated_tokens.append(token)
 

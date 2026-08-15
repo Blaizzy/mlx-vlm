@@ -489,7 +489,7 @@ class CompositeDecline:
     NO_BLOCKS = "no_blocks"
     LAYOUT_MISMATCH = "layout_mismatch"
     BATCHED = "batched"
-    NOT_CHUNKED = "not_chunked"
+    NO_CHECKPOINT = "no_checkpoint"
 
 
 class CompositeCheckpointer:
@@ -554,32 +554,6 @@ class CompositeCheckpointer:
         if stored:
             self.stored_bytes += cost
             self.stored += 1
-
-    def store_final(self, prefix_len: int, prompt_cache: Sequence[Any]) -> bool:
-        """Take one checkpoint at the end of a prefill that was never chunked.
-
-        Some prefill paths, notably hidden-state speculative decoding, run the
-        prompt in a single pass and so offer no intermediate boundary. Composite
-        would otherwise store nothing at all, which is worse than the exact mode
-        it replaces, so it falls back to that mode's single snapshot.
-        """
-        pageable, checkpointed = partition_cache_by_pageability(prompt_cache)
-        if not pageable or not checkpointed or prefix_len <= 0:
-            self.decline = CompositeDecline.NOT_MIXED
-            return False
-        cost = checkpoint_state_bytes(prompt_cache, checkpointed)
-        if not checkpoint_fits(self.stored_bytes, cost, budget_bytes=self.budget_bytes):
-            self.decline = CompositeDecline.BUDGET
-            return False
-        stored = self.manager.store_exact_cache(
-            self.token_ids[:prefix_len],
-            [prompt_cache[i] for i in checkpointed],
-            extra_hash=self.extra_hash,
-        )
-        if stored:
-            self.stored_bytes += cost
-            self.stored += 1
-        return bool(stored)
 
 
 def _sequence_hash_array(tokens: np.ndarray, extra_hash: int, block_size: int) -> int:

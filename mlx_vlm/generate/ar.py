@@ -67,7 +67,7 @@ def _prompt_cache_checkpoint_lens(
     if callback is None or lens is None:
         return []
     values = [lens] if isinstance(lens, int) else list(lens)
-    return sorted({int(v) for v in values if 0 < int(v) < total_tokens})
+    return sorted({int(v) for v in values if 0 < int(v) <= total_tokens})
 
 
 DEFAULT_COMPLETION_BATCH_SIZE = 32
@@ -442,6 +442,7 @@ def generate_step(
             inputs_embeds.shape[1],
         )
         checkpoint_index = 0
+        prefill_total = inputs_embeds.shape[1]
         should_chunk = (
             prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size
         ) or bool(checkpoint_lens)
@@ -493,6 +494,13 @@ def generate_step(
             input_ids = input_ids[:, -1:]
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
+        while (
+            checkpoint_index < len(checkpoint_lens)
+            and checkpoint_lens[checkpoint_index] <= prefill_total
+        ):
+            if checkpoint_lens[checkpoint_index] == prefill_total:
+                prompt_cache_checkpoint(prefill_total, prompt_cache)
+            checkpoint_index += 1
 
     mx.async_eval(y, logprobs)
 
