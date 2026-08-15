@@ -74,6 +74,15 @@ def _env_truthy(name: str, default: str = "") -> bool:
     return os.environ.get(name, default).lower() in ("1", "true", "yes")
 
 
+def _is_batch_cache_entry(entry: Any) -> bool:
+    """Whether a cache entry belongs to a batched layout.
+
+    Composite restore is single-stream, so a batched cache must not be
+    classified as composite only to decline on every request.
+    """
+    return type(entry).__name__.startswith("Batch")
+
+
 def composite_apc_enabled() -> bool:
     """Whether a mixed cache may use composite mode instead of exact mode.
 
@@ -3083,6 +3092,7 @@ class APCManager:
         self.hash_table: dict[int, APCBlock] = {}
         self._exact_cache: "OrderedDict[int, APCExactCacheEntry]" = OrderedDict()
         self._composite_declines: Dict[str, int] = {}
+        self._last_reuse_tokens = 0
         self._exact_lengths: List[int] = []
         self._exact_length_counts: Dict[int, int] = {}
         self.stats = APCStats()
@@ -3723,6 +3733,16 @@ class APCManager:
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
             return new_blocks
 
+    def note_reuse(self, prefix_len: int) -> None:
+        """Record how much of the most recent prompt was reused.
+
+        The cumulative counters cannot answer "did this request reuse
+        anything", which is what a parity run has to assert to tell a real hit
+        from a silent fall-back that happened to produce the same tokens.
+        """
+        with self.lock:
+            self._last_reuse_tokens = int(prefix_len)
+
     def note_composite_decline(self, reason: str) -> None:
         """Record that composite mode did nothing for a request, and why.
 
@@ -3741,6 +3761,7 @@ class APCManager:
             snap = self.stats.snapshot(self.num_blocks, self.block_size)
             snap["resident_bytes"] = self._resident_bytes_locked()
             snap["composite_declines"] = dict(self._composite_declines)
+            snap["last_reuse_tokens"] = self._last_reuse_tokens
             if self.disk is not None:
                 snap["disk_bytes"] = self.disk.disk_bytes
                 snap["disk_max_bytes"] = self.disk.max_bytes
@@ -4507,8 +4528,10 @@ def model_apc_mode(language_model: Any) -> Optional[str]:
     if prompt_cache and all(_cache_entry_supports_block_apc(c) for c in prompt_cache):
         return "block"
     if prompt_cache and all(_cache_entry_supports_exact_apc(c) for c in prompt_cache):
-        if composite_apc_enabled() and any(
-            _cache_entry_supports_block_apc(c) for c in prompt_cache
+        if (
+            composite_apc_enabled()
+            and not any(_is_batch_cache_entry(c) for c in prompt_cache)
+            and any(_cache_entry_supports_block_apc(c) for c in prompt_cache)
         ):
             return "composite"
         return "exact"
@@ -4586,6 +4609,7 @@ def _composite_lookup_plan(
                 return None
             entry.trim(trim)
 
+    manager.note_reuse(state_prefix_len)
     return {
         "matched_blocks": matched,
         "warm_cache": warm,
@@ -4629,6 +4653,7 @@ def apc_lookup_plan(
         if exact_cache is not None and 0 < exact_prefix_len < n:
             if not suffix_is_text_only(exact_prefix_len):
                 return None
+            manager.note_reuse(exact_prefix_len)
             return {
                 "matched_blocks": [],
                 "warm_cache": exact_cache,
@@ -4668,6 +4693,7 @@ def apc_lookup_plan(
             manager.release(matched)
         if not suffix_is_text_only(disk_prefix_len):
             return None
+        manager.note_reuse(disk_prefix_len)
         return {
             "matched_blocks": [],
             "warm_cache": warm_cache,
@@ -4680,6 +4706,7 @@ def apc_lookup_plan(
             manager.release(matched)
         if not suffix_is_text_only(exact_prefix_len):
             return None
+        manager.note_reuse(exact_prefix_len)
         return {
             "matched_blocks": [],
             "warm_cache": exact_cache,
@@ -4691,6 +4718,7 @@ def apc_lookup_plan(
         if not suffix_is_text_only(prefix_len):
             manager.release(matched)
             return None
+        manager.note_reuse(prefix_len)
         return {
             "matched_blocks": matched,
             "prefix_len": prefix_len,

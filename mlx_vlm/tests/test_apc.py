@@ -1998,3 +1998,34 @@ def test_store_final_declines_a_cache_with_nothing_to_page():
 
     assert cp.store_final(48, [ArraysCache(1)]) is False
     assert cp.decline == apc_module.CompositeDecline.NOT_MIXED
+
+
+def test_last_reuse_tokens_reports_the_current_request_not_a_running_total():
+    manager = APCManager(num_blocks=64, block_size=16)
+    tokens = list(range(64))
+    keys = [mx.zeros((1, 1, len(tokens), 4))]
+    values = [mx.zeros((1, 1, len(tokens), 4))]
+    manager.release(manager.store_kv_blocks(tokens, keys, values))
+
+    assert manager.stats_snapshot()["last_reuse_tokens"] == 0
+
+    plan = _plan_for_mode(manager, tokens + list(range(900, 908)), "block")
+    assert plan is not None
+    hit = manager.stats_snapshot()["last_reuse_tokens"]
+    assert hit == plan["prefix_len"] > 0
+    manager.release(plan["matched_blocks"])
+
+    assert _plan_for_mode(manager, list(range(500, 564)), "block") is None
+    assert manager.stats_snapshot()["last_reuse_tokens"] == hit
+
+
+def test_a_batched_cache_is_not_classified_as_composite(monkeypatch):
+    from mlx_vlm.models.cache import BatchKVCache, BatchRotatingKVCache
+
+    monkeypatch.setenv("APC_COMPOSITE", "1")
+
+    class BatchLM:
+        def make_cache(self):
+            return [BatchRotatingKVCache(32, [0]), BatchKVCache([0])]
+
+    assert model_apc_mode(BatchLM()) == "exact"
