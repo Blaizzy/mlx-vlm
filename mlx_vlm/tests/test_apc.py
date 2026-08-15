@@ -309,7 +309,7 @@ def test_single_row_prompt_batch_exact_checkpoint_stores_without_extract():
     from mlx_vlm.generate.ar import PromptProcessingBatch
     from mlx_vlm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
-    token_ids = list(range(12))
+    token_ids = list(range(32))
     arrays = ArraysCache(size=1)
     arrays[0] = mx.ones((1, 3, 5))
     kv = KVCache()
@@ -1181,3 +1181,50 @@ def test_exact_disk_hit_promotion_with_nonzero_extra_hash(tmp_path, monkeypatch)
     assert warm_wrong is None
 
     manager.close()
+
+
+def _tiny_exact_cache(tokens):
+    from mlx_vlm.models.cache import ArraysCache
+
+    c = ArraysCache(size=1)
+    c[0] = mx.zeros((1, 2, max(1, len(tokens)), 32))
+    return [c]
+
+
+def test_a_short_first_prompt_does_not_store_a_one_token_snapshot():
+    manager = APCManager(num_blocks=8, block_size=16)
+    short = [1, 2, 3]
+
+    desired = len(short) - manager.exact_cache_guard_tokens
+    prefix_len = apc_module.adjust_prefix_to_text_suffix_boundary(short, desired, [])
+
+    assert prefix_len == 0
+    assert not manager.store_exact_cache(short[:1], _tiny_exact_cache(short[:1]))
+
+
+def test_a_short_prompt_cannot_poison_later_lookups():
+    manager = APCManager(num_blocks=8, block_size=16)
+    manager.store_exact_cache([1], _tiny_exact_cache([1]))
+
+    later = list(range(1, 400))
+    cache, reused = manager.lookup_exact_cache(later)
+
+    assert cache is None
+    assert reused == 0
+
+
+def test_a_useful_prefix_is_still_stored():
+    manager = APCManager(num_blocks=8, block_size=16)
+    tokens = list(range(1, 200))
+
+    assert manager.store_exact_cache(tokens[:128], _tiny_exact_cache(tokens[:128]))
+
+    cache, reused = manager.lookup_exact_cache(tokens)
+    assert cache is not None
+    assert reused == 128
+
+
+def test_positive_desired_prefix_is_unchanged():
+    tokens = list(range(1, 100))
+
+    assert apc_module.adjust_prefix_to_text_suffix_boundary(tokens, 40, []) == 40
