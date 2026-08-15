@@ -9,6 +9,7 @@ GOT-OCR 2.0 is an 8.3B parameter vision-language model developed by StepFun for 
   - [`mlx-community/GOT-OCR2_0-bf16`](https://huggingface.co/mlx-community/GOT-OCR2_0-bf16)
   - [`mlx-community/GOT-OCR2_0-4bit`](https://huggingface.co/mlx-community/GOT-OCR2_0-4bit)
   - [`mlx-community/GOT-OCR2_0-8bit`](https://huggingface.co/mlx-community/GOT-OCR2_0-8bit)
+- **Quantizations Collection**: [axiom-of-choice/mlx-quantizations](https://huggingface.co/collections/axiom-of-choice/mlx-quantizations)
 - **Architecture**: ViT-based `ImageEncoderViT` (1024x1024 input downsampled to 256 visual tokens) with window attention and decomposed relative positional embeddings + linear projector + Qwen2-based language decoder.
 - **Source**: [stepfun-ai/GOT-OCR2_0](https://huggingface.co/stepfun-ai/GOT-OCR2_0)
 
