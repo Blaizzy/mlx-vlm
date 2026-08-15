@@ -211,31 +211,31 @@ See `README.md` for a complete `curl` example.
 
 ### Live settings (`/v1/settings`)
 
-Reloadable server settings can be read and changed at runtime without a
-restart. The server owns the schema (which knobs are live and which model
-kinds each one reloads); clients own the values.
+Read and change a curated set of server settings at runtime, without a
+restart. `GET` lists the settings the server accepts; `PATCH` changes them.
 
 ```bash
-# read schema + current values + fingerprint
+# list the available settings and their current values
 curl http://127.0.0.1:8080/v1/settings
 
-# merge a change (only listed knobs are touched)
+# merge: only the settings you list are changed
 curl -X PATCH http://127.0.0.1:8080/v1/settings \
   -H 'Content-Type: application/json' \
   -d '{"kv_quant_scheme": "turboquant"}'
 
-# replace: reset all knobs to their boot-time defaults, then apply these
+# replace: reset everything to its boot-time default, then apply these
 curl -X PATCH http://127.0.0.1:8080/v1/settings \
   -H 'Content-Type: application/json' \
   -d '{"op": "replace", "values": {"apc_enabled": true}}'
 ```
 
-Applying a change bumps the config fingerprint in the model cache key, so
-the next request to an affected model kind reloads it with the new settings
-(scoped per kind: KV/APC/spec knobs reload `text_generation`;
-`vision_cache_size` reloads image kinds). Unknown or invalid knobs are
-rejected and never applied. Request-time knobs such as `max_kv_size` and
-`token_queue_timeout` apply to new requests without reloading the model.
+Changes take effect on the next request. Most settings reload the affected
+model first — KV, APC, and speculative-decoding settings reload text models,
+`vision_cache_size` reloads image models — while `max_kv_size` and
+`token_queue_timeout` apply to new requests without a reload.
+
+The response reports which settings were applied and which were rejected;
+unknown names and invalid values are rejected and never applied.
 
 ## Distributed Inference
 

@@ -1,4 +1,4 @@
-"""Live, server-side settings for mlx-vlm (T2 reloadable knobs)."""
+"""Server settings that can be changed at runtime, without a restart."""
 
 from __future__ import annotations
 
