@@ -704,6 +704,12 @@ def stream_generate(
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     verbose = kwargs.pop("verbose", False)
+    # Preserve only explicitly supplied sequence tensors as semantic APC
+    # inputs. Tensors produced by prepare_inputs span the complete prompt and
+    # therefore change whenever text is appended, even when the old token
+    # prefix is identical.
+    custom_inputs_embeds = kwargs.get("inputs_embeds")
+    custom_mask = kwargs.get("mask")
 
     # Set up thinking budget criteria if requested
     thinking_budget = kwargs.pop("thinking_budget", None)
@@ -828,8 +834,8 @@ def stream_generate(
             media={
                 "audio": audio_features if audio_features is not None else audio,
                 "video": video_features if video_features is not None else video,
-                "embeddings": kwargs.get("inputs_embeds"),
-                "masks": mask,
+                "embeddings": custom_inputs_embeds,
+                "masks": custom_mask,
             },
             model=model,
             processor=processor,
@@ -908,7 +914,7 @@ def stream_generate(
         thinking_start_token_id = tokenizer.encode(
             thinking_start_token, add_special_tokens=False
         )[-1]
-        enable_thinking = enable_thinking and (
+        prompt_preopens_thinking = (
             thinking_start_token_id in input_ids.flatten().tolist()
         )
         tokenizer.thinking_budget_criteria = ThinkingBudgetCriteria(
@@ -917,6 +923,7 @@ def stream_generate(
             thinking_end_token=thinking_end_token,
             thinking_start_token=thinking_start_token,
             enable_thinking=enable_thinking,
+            prompt_preopens_thinking=prompt_preopens_thinking,
         )
         kwargs["thinking_budget_criteria"] = tokenizer.thinking_budget_criteria
     else:

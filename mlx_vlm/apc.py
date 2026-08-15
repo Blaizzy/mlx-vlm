@@ -127,8 +127,8 @@ def tenant_scoped_hash(tenant: Optional[str], payload_hash: int = 0) -> int:
 def _tensor_content_hash(t: Any) -> int:
     """Lossless content hash of a tensor: shape + dtype + exact bytes.
 
-    Unlike ``hash_image_payload`` this keeps shape and dtype and does not
-    downcast to fp16, so distinct masks/embeddings never collide.
+    Keeps shape and dtype and does not downcast, so distinct semantic inputs
+    never collide solely because their flattened values happen to match.
     """
     dtype = str(getattr(t, "dtype", ""))
     shape = tuple(getattr(t, "shape", ()))
@@ -379,9 +379,7 @@ def hash_image_payload(
     """
     if pixel_values is not None:
         try:
-            arr = np.asarray(pixel_values).astype(np.float16, copy=False)
-            digest = hashlib.sha256(arr.tobytes()).digest()
-            return int.from_bytes(digest[:8], "little", signed=True)
+            return _tensor_content_hash(pixel_values)
         except Exception:
             pass
 
@@ -494,7 +492,9 @@ def adjust_prefix_to_text_suffix_boundary(
     )
     if max_len <= 0:
         return 0
-    desired = max(1, int(desired_prefix_len))
+    if int(desired_prefix_len) <= 0:
+        return 0
+    desired = int(desired_prefix_len)
     prefix_len = max(desired, media_safe_prefix_min(token_ids, media_token_ids))
     if prefix_len > max_len:
         return 0
@@ -2873,6 +2873,9 @@ class APCManager:
         self.exact_cache_guard_tokens = max(
             1, int(os.environ.get("APC_EXACT_PREFIX_GUARD_TOKENS", "16"))
         )
+        self.exact_cache_min_tokens = max(
+            1, int(os.environ.get("APC_EXACT_MIN_TOKENS", "16"))
+        )
         # If free RAM (best-effort reading) drops below this, skip disk
         # promotion this turn and fall back to memory-only matching. The
         # request still serves correctly — it just doesn't get the warm-
@@ -3128,6 +3131,8 @@ class APCManager:
         extra_hash: int = 0,
     ) -> bool:
         """Store a full prompt-cache snapshot for exact-prefix reuse."""
+        if len(token_ids) < self.exact_cache_min_tokens:
+            return False
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
             return False
         token_tuple = tuple(int(t) for t in token_ids)
