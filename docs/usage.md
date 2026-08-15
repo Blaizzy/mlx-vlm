@@ -39,6 +39,34 @@ print(output)
 
 Speed up generation 2–3× using a lightweight drafter model that predicts multiple tokens per round, verified in parallel by the target model.
 
+### DSpark
+
+Qwen3.8 uses a native DSpark drafter with a parallel backbone and sequential
+Markov head. The BF16 checkpoint is quantized to 4-bit at load time by default:
+
+```bash
+python -m mlx_vlm.generate \
+    --model mlx-community/Qwen3.8-27B-4bit \
+    --draft-model RadixArk/Qwen3.8-27B-DSpark \
+    --draft-kind dspark \
+    --prompt "Write a concise note about speculative decoding." \
+    --max-tokens 256 --temperature 0
+
+python -m mlx_vlm.server \
+    --model mlx-community/Qwen3.8-27B-4bit \
+    --draft-model RadixArk/Qwen3.8-27B-DSpark \
+    --draft-kind dspark
+```
+
+The checkpoint's full trained draft width is available as the ceiling. By
+default, the runtime starts with three proposals, backs off on low acceptance,
+and grows only when deeper positions pay off. A runtime block size includes the
+known target bonus token, so `--draft-block-size 4` fixes a round at three
+proposals. Benchmark fixed caps on the deployment Mac. Prefill follows the
+normal portable chunk ceiling and reduces it only when live Metal headroom
+cannot hold the requested hidden-state captures. `--prefill-step-size` remains
+the ceiling. Use `--draft-bits 0` to retain the BF16 drafter.
+
 ### CLI
 
 ```bash
@@ -191,6 +219,7 @@ for i in range(B):
 
 | Target | Drafter | Notes |
 |--------|---------|-------|
+| `mlx-community/Qwen3.8-27B-4bit` | `RadixArk/Qwen3.8-27B-DSpark` | Text generation. Native DSpark; adaptive draft depth or a fixed `--draft-block-size`. |
 | `Qwen/Qwen3.5-4B` | `z-lab/Qwen3.5-4B-DFlash` | Text + image. ~2.5× speedup on code/reasoning. |
 | `meta-models/Muse-Glimmer-30B` | `meta-models/Muse-Glimmer-30B-assistant` | Text + image. Native 5-layer, 16-token DFlash assistant. |
 | `MiniMaxAI/MiniMax-M3` | `Inferact/MiniMax-M3-EAGLE3` | Text, image, and video target. Uses `--draft-kind eagle3`. |

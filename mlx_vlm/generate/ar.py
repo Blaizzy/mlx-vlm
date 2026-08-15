@@ -26,6 +26,7 @@ from ..speculative.utils import (
     run_speculative_server_rounds,
     speculative_hidden_state,
     speculative_prefill_kwargs,
+    speculative_prefill_step_size,
 )
 from ..turboquant import BatchTurboQuantKVCache, turboquant_enabled
 from ..utils import group_images_by_shape, prepare_inputs, should_add_special_tokens
@@ -387,6 +388,11 @@ def generate_step(
                 kwargs = {}
 
             return y, logprobs.squeeze(0) if logprobs.shape[0] == 1 else logprobs
+
+    if draft_model is not None:
+        prefill_step_size = speculative_prefill_step_size(
+            prefill_step_size, draft_model
+        )
 
     with mx.stream(generation_stream):
         # Get input embeddings (handles both multimodal and text-only)
@@ -1613,7 +1619,11 @@ class PromptProcessingBatch:
         self.uids = uids
         self._prompt_uids = list(uids)
         self.max_tokens = max_tokens
-        self.prefill_step_size = prefill_step_size
+        self.prefill_step_size = (
+            speculative_prefill_step_size(prefill_step_size, draft_model)
+            if draft_model is not None
+            else prefill_step_size
+        )
         self.draft_model = draft_model
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size

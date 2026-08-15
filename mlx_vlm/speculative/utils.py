@@ -61,6 +61,7 @@ __all__ = [
     "make_speculative_prompt_cache",
     "run_speculative_rounds",
     "run_speculative_server_rounds",
+    "speculative_prefill_step_size",
     "speculative_hidden_state",
     "speculative_prefill_kwargs",
     "speculative_stats_since",
@@ -77,10 +78,11 @@ def get_speculative_rounds_batch(draft_kind: str):
         return _eagle3_rounds_batch
     if draft_kind == "mtp":
         return _mtp_rounds_batch
-    if draft_kind == "dflash":
+    if draft_kind in ("dflash", "dspark"):
         return _dflash_rounds_batch
     raise ValueError(
-        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+        f"Unknown draft_kind {draft_kind!r}. Supported: "
+        "['dflash', 'dspark', 'eagle3', 'mtp']"
     )
 
 
@@ -89,20 +91,71 @@ def speculative_prefill_kwargs(draft_kind: str, drafter) -> dict:
         return {"return_hidden": True, "return_shared_kv": True}
     if draft_kind == "eagle3":
         return {"capture_layer_ids": _eagle3_capture_layer_ids(drafter)}
-    if draft_kind == "dflash":
+    if draft_kind in ("dflash", "dspark"):
         return {"capture_layer_ids": list(drafter.config.target_layer_ids)}
     raise ValueError(
-        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+        f"Unknown draft_kind {draft_kind!r}. Supported: "
+        "['dflash', 'dspark', 'eagle3', 'mtp']"
     )
+
+
+def speculative_prefill_step_size(
+    prefill_step_size,
+    drafter,
+    *,
+    device_info=None,
+    active_memory=None,
+    cache_memory=None,
+):
+    """Choose a power-of-two prefill chunk from live Metal headroom.
+
+    ``prefill_step_size`` remains the caller's ceiling. Drafters may provide a
+    conservative per-token working-memory estimate; without one, the caller's
+    value is returned unchanged. Passing zero keeps chunking disabled.
+    """
+    if prefill_step_size is None:
+        return None
+    requested = int(prefill_step_size)
+    if requested <= 0:
+        return None
+
+    bytes_per_token = getattr(drafter, "prefill_memory_bytes_per_token", None)
+    if bytes_per_token is None or int(bytes_per_token) <= 0:
+        return requested
+
+    try:
+        info = device_info if device_info is not None else mx.device_info()
+        working_set = int(info["max_recommended_working_set_size"])
+        active = (
+            int(active_memory)
+            if active_memory is not None
+            else int(mx.get_active_memory())
+        )
+        cached = (
+            int(cache_memory)
+            if cache_memory is not None
+            else int(mx.get_cache_memory())
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return requested
+
+    # Preserve room for Metal kernels, command buffers, the OS, and growth of
+    # the target/drafter KV caches. The remainder funds the transient prefill.
+    reserve = max(512 * 1024**2, working_set // 10)
+    available = max(0, working_set - active - cached - reserve)
+    estimated = max(8, available // int(bytes_per_token))
+    power_of_two = 1 << (int(estimated).bit_length() - 1)
+    return min(requested, power_of_two)
 
 
 def speculative_hidden_state(draft_kind: str, outputs):
     if draft_kind == "mtp":
         return outputs.hidden_states[-1]
-    if draft_kind in ("dflash", "eagle3"):
+    if draft_kind in ("dflash", "dspark", "eagle3"):
         return mx.concatenate(outputs.hidden_states, axis=-1)
     raise ValueError(
-        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+        f"Unknown draft_kind {draft_kind!r}. Supported: "
+        "['dflash', 'dspark', 'eagle3', 'mtp']"
     )
 
 
@@ -196,7 +249,7 @@ def run_speculative_server_rounds(
         )
         return
 
-    if draft_kind == "dflash":
+    if draft_kind in ("dflash", "dspark"):
         if batch_size == 1:
             for tok, state in _dflash_rounds(
                 model,
@@ -229,7 +282,8 @@ def run_speculative_server_rounds(
         return
 
     raise ValueError(
-        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+        f"Unknown draft_kind {draft_kind!r}. Supported: "
+        "['dflash', 'dspark', 'eagle3', 'mtp']"
     )
 
 
@@ -347,9 +401,10 @@ def run_speculative_rounds(
             )
         return
 
-    if draft_kind != "dflash":
+    if draft_kind not in ("dflash", "dspark"):
         raise ValueError(
-            f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+            f"Unknown draft_kind {draft_kind!r}. Supported: "
+            "['dflash', 'dspark', 'eagle3', 'mtp']"
         )
 
     hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)

@@ -515,8 +515,9 @@ def parse_arguments():
         "--draft-kind",
         type=str,
         default=None,
-        choices=["dflash", "eagle3", "mtp"],
+        choices=["dflash", "dspark", "eagle3", "mtp"],
         help="Drafter family. Supported: 'dflash' (Qwen3.5 DFlash), "
+        "'dspark' (DSpark semi-autoregressive drafter), "
         "'eagle3' (Speculators/SGLang EAGLE-3), "
         "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model). "
         "Default: auto-detected from the drafter's HF model_type.",
@@ -526,6 +527,13 @@ def parse_arguments():
         type=int,
         default=None,
         help="Override the drafter's configured block size.",
+    )
+    parser.add_argument(
+        "--draft-bits",
+        type=int,
+        choices=[0, 2, 3, 4, 5, 6, 8],
+        default=4,
+        help="Quantize a dense DSpark drafter to this bit width (0 keeps BF16).",
     )
     parser.add_argument(
         "--enable-thinking",
@@ -1266,7 +1274,9 @@ def main():
 
         print(f"Loading drafter ({args.draft_kind or 'auto'}): {args.draft_model}")
         draft_model, resolved_kind = load_drafter(
-            args.draft_model, kind=args.draft_kind
+            args.draft_model,
+            kind=args.draft_kind,
+            draft_bits=args.draft_bits,
         )
         if args.draft_kind is None:
             print(f"  → auto-detected --draft-kind={resolved_kind!r}.")

@@ -8,6 +8,7 @@ from .common import (
     _record_speculative_round,
     _speculative_walk,
     _speculative_walk_batch,
+    _target_verify_kwargs,
     generation_stream,
 )
 
@@ -44,7 +45,9 @@ def _dflash_next_block_size(
         return block_total
 
     current = min(block_total, max(2, recent[-1][1] + 1))
-    min_total = min(block_total, 4)
+    min_total = min(
+        block_total, max(2, int(getattr(draft_model, "dflash_min_block_size", 4)))
+    )
     drafted = sum(d for _, d in recent)
     accepted = sum(a for a, _ in recent)
     accept_rate = accepted / drafted
@@ -114,16 +117,22 @@ def _dflash_rounds(
     emitted = 1  # the first bonus has already been yielded by the caller
 
     while emitted < max_tokens:
-        bs = _dflash_next_block_size(
-            draft_model,
-            block_total,
-            max_tokens - emitted + 1,
-            (
-                getattr(draft_model, "dflash_initial_block_size", None)
-                if use_model_initial_block_size
-                else None
-            ),
-        )
+        remaining = max_tokens - emitted + 1
+        if draft_block_size is not None and getattr(
+            draft_model, "fixed_requested_block_size", False
+        ):
+            bs = min(block_total, remaining)
+        else:
+            bs = _dflash_next_block_size(
+                draft_model,
+                block_total,
+                remaining,
+                (
+                    getattr(draft_model, "dflash_initial_block_size", None)
+                    if use_model_initial_block_size
+                    else None
+                ),
+            )
         if bs <= 1:
             break
 
@@ -148,6 +157,7 @@ def _dflash_rounds(
                 verify_input,
                 cache=prompt_cache,
                 capture_layer_ids=target_layer_ids,
+                **_target_verify_kwargs(lm),
             )
             hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
             target_tokens = sampler(verify_out.logits)
@@ -230,14 +240,19 @@ def _dflash_rounds_batch(
     active_idx = list(range(B))  # maps active-slot → original-index
     hidden_by_orig = [hidden[i : i + 1] for i in range(B)]
 
-    total_emitted = sum(emitted)
-
     while len(active_idx) > 0:
         remaining = [
             max(1, max_tokens - emitted[active_idx[j]] + 1)
             for j in range(len(active_idx))
         ]
-        bs = _dflash_next_block_size(draft_model, block_total, min(remaining))
+        if draft_block_size is not None and getattr(
+            draft_model, "fixed_requested_block_size", False
+        ):
+            bs = min(block_total, min(remaining))
+        else:
+            bs = _dflash_next_block_size(
+                draft_model, block_total, min(remaining)
+            )
         if bs <= 1:
             break
 
@@ -271,6 +286,7 @@ def _dflash_rounds_batch(
                 verify_input,
                 cache=prompt_cache,
                 capture_layer_ids=target_layer_ids,
+                **_target_verify_kwargs(lm),
             )
             hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
             target_tokens = sampler(verify_out.logits)
@@ -338,4 +354,3 @@ def _dflash_rounds_batch(
             active_idx = [active_idx[j] for j in keep_slots]
 
         verify_out = None
-        total_emitted = sum(emitted)
