@@ -255,6 +255,80 @@ def test_turboquant_cache_preserves_attention_shape_and_compresses_memory():
     assert diff < 0.35
 
 
+def _build_ragged_batch_turbo(lengths, nkv, D, bits, seed=0):
+    mx.random.seed(seed)
+    base = None
+    for L in lengths:
+        c = BatchTurboQuantKVCache([0], bits=bits)
+        c.update_and_fetch(
+            mx.random.normal((1, nkv, L, D)).astype(mx.float16),
+            mx.random.normal((1, nkv, L, D)).astype(mx.float16),
+        )
+        base = c if base is None else (base.extend(c) or base)
+    return base
+
+
+def test_batch_turboquant_fused_decode_matches_reference():
+    """Fused ragged batch decode == per-row single-row fused == dequantized SDPA,
+    across 1-pass/2-pass, GQA ratios, head dims and bit widths."""
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+
+    # (lengths, n_kv_heads, n_q_heads, head_dim, bits)
+    cases = [
+        ([64, 40, 100, 16], 4, 8, 128, 4),  # 1-pass, ragged
+        ([200, 50, 300, 17, 128, 33, 256, 8], 2, 16, 128, 4),  # 1-pass, B=8
+        ([500, 128], 8, 8, 64, 8),  # 1-pass, 8-bit
+        ([3000, 1500, 4096, 500], 4, 8, 128, 4),  # 2-pass (>2048)
+        ([2048, 1000, 512, 1500], 4, 24, 256, 4),  # GQA-6, D=256
+    ]
+    for lengths, nkv, nq, D, bits in cases:
+        cache = _build_ragged_batch_turbo(lengths, nkv, D, bits)
+        B = len(lengths)
+        mx.random.seed(1)
+        q = mx.random.normal((B, nq, 1, D)).astype(mx.float16)
+        scale = D**-0.5
+        fused = cache.decode_attention(q, scale=scale)
+        assert fused is not None, f"fused decode not taken for {lengths}"
+        assert fused.shape == (B, nq, 1, D)
+        for i in range(B):
+            single = cache.extract(i)
+            qi = q[i : i + 1]
+            ref_fused = single.decode_attention(qi, scale=scale)
+            dk, dv = single.dequantize()
+            ref_dq = mx.fast.scaled_dot_product_attention(
+                qi, dk.astype(qi.dtype), dv.astype(qi.dtype), scale=scale
+            )
+            f = fused[i : i + 1].astype(mx.float32)
+            assert float(mx.max(mx.abs(f - ref_fused.astype(mx.float32)))) < 1e-4
+            assert float(mx.max(mx.abs(f - ref_dq.astype(mx.float32)))) < 5e-3
+
+
+def test_batch_turboquant_fused_decode_respects_left_padding_mask():
+    """The fused path reproduces the left-padding causal mask via `pads`, so it
+    matches dequantize->SDPA with the explicit mask."""
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+    lengths, nkv, nq, D = [64, 40, 100, 16], 4, 8, 128
+    cache = _build_ragged_batch_turbo(lengths, nkv, D, 4)
+    B = len(lengths)
+    mx.random.seed(1)
+    q = mx.random.normal((B, nq, 1, D)).astype(mx.float16)
+    scale = D**-0.5
+    T = cache._idx
+    rinds = mx.arange(T)
+    mask = (rinds[None, :] >= cache.left_padding[:, None]).reshape(B, 1, 1, T)
+    fused = cache.decode_attention(q, scale=scale, mask=mask)
+    assert fused is not None
+    dk, dv = cache.dequantize()
+    ref = mx.fast.scaled_dot_product_attention(
+        q, dk.astype(q.dtype), dv.astype(q.dtype), scale=scale, mask=mask
+    )
+    assert (
+        float(mx.max(mx.abs(fused.astype(mx.float32) - ref.astype(mx.float32)))) < 5e-3
+    )
+
+
 def test_turboquant_decode_attention_matches_dequantized_attention():
     keys = mx.random.normal((1, 2, 16, 32))
     values = mx.random.normal((1, 2, 16, 32))

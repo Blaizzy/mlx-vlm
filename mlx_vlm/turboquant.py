@@ -2300,8 +2300,14 @@ def _gen_unrolled_value(bits: int, n_elems: int, bit_off_var: str = "") -> str:
 
 
 @lru_cache(maxsize=None)
-def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
-    """Fused MSE decode: 32 simdgroups × 32 lanes, online softmax + weighted sum."""
+def _fused_mse_decode_kernel(
+    key_bits: int, val_bits: int, dim: int = 256, ragged: bool = False
+):
+    """Fused MSE decode: 32 simdgroups × 32 lanes, online softmax + weighted sum.
+
+    ragged=True adds a per-row ``pads`` input (left-padding count per batch row) so a
+    left-padded continuous-batch cache skips its padding tokens; ragged=False is the
+    original single-length path, byte-identical."""
     if not _metal_available() or key_bits <= 0 or val_bits <= 0:
         return None
     if dim < 32 or dim % 32 != 0:
@@ -2331,6 +2337,7 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
         auto token_count = key_norms_shape[2];
         auto kv_heads = key_norms_shape[1];
         auto bh = bqh / RepeatCount;  // map q_head -> kv_head
+        {"int pad = (int)pads[bqh / (kv_heads * RepeatCount)];" if ragged else ""}
 
         auto k_nm = key_norms + bh * token_count;
         auto k_pk = key_packed + bh * token_count * KPackedWidth;
@@ -2362,7 +2369,7 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
         {"int v_bit_off = v_bit_start & 7;" if (elems_per_lane * val_bits) % 8 else ""}
 
         // KV loop: each simdgroup handles tokens simd_gid, simd_gid+32, ...
-        for (int t = simd_gid; t < (int)token_count; t += BN) {{
+        for (int t = {"(int)pad + " if ragged else ""}simd_gid; t < (int)token_count; t += BN) {{
             U kn = static_cast<U>(k_nm[t]);
 
             // Key score — unrolled byte extraction
@@ -2418,25 +2425,33 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
         }}
     """
 
+    input_names = [
+        "queries",
+        "key_norms",
+        "key_packed",
+        "key_codebook",
+        "val_norms",
+        "val_packed",
+        "val_codebook",
+    ]
+    if ragged:
+        input_names.append("pads")
     return mx.fast.metal_kernel(
-        name=f"turboquant_fused_mse_sdpa_k{key_bits}_v{val_bits}_d{dim}",
-        input_names=[
-            "queries",
-            "key_norms",
-            "key_packed",
-            "key_codebook",
-            "val_norms",
-            "val_packed",
-            "val_codebook",
-        ],
+        name=f"turboquant_fused_mse_sdpa_k{key_bits}_v{val_bits}_d{dim}"
+        f"{'_ragged' if ragged else ''}",
+        input_names=input_names,
         output_names=["out"],
         source=source,
     )
 
 
 @lru_cache(maxsize=None)
-def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 256):
-    """2-pass decode pass 1: block-parallel quantized attention."""
+def _fused_mse_decode_2pass_1_kernel(
+    key_bits: int, val_bits: int, dim: int = 256, ragged: bool = False
+):
+    """2-pass decode pass 1: block-parallel quantized attention.
+
+    ragged=True skips per-row left-padding via a ``pads`` input."""
     if not _metal_available() or key_bits <= 0 or val_bits <= 0:
         return None
     if dim < 32 or dim % 32 != 0:
@@ -2472,6 +2487,7 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 25
         auto k_pk = key_packed + bh * token_count * KPackedWidth;
         auto v_nm = val_norms + bh * token_count;
         auto v_pk = val_packed + bh * token_count * VPackedWidth;
+        {"int pad = (int)pads[batch_idx];" if ragged else ""}
 
         // Load pre-rotated query
         thread U q[qk_per_thread];
@@ -2492,7 +2508,7 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 25
         {"int v_bit_off = v_bit_start & 7;" if (elems_per_lane * val_bits) % 8 else ""}
 
         // KV loop: stride by blocks (each block handles a different subset)
-        for (int t = block_idx; t < (int)token_count; t += Blocks) {{
+        for (int t = {"(int)pad + " if ragged else ""}block_idx; t < (int)token_count; t += Blocks) {{
             U kn = static_cast<U>(k_nm[t]);
 
             // Key score — unrolled byte extraction
@@ -2522,17 +2538,21 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 25
                 static_cast<U>(o[i]);
     """
 
+    input_names = [
+        "queries",
+        "key_norms",
+        "key_packed",
+        "key_codebook",
+        "val_norms",
+        "val_packed",
+        "val_codebook",
+    ]
+    if ragged:
+        input_names.append("pads")
     return mx.fast.metal_kernel(
-        name=f"turboquant_mse_sdpa_2pass1_k{key_bits}_v{val_bits}_d{dim}",
-        input_names=[
-            "queries",
-            "key_norms",
-            "key_packed",
-            "key_codebook",
-            "val_norms",
-            "val_packed",
-            "val_codebook",
-        ],
+        name=f"turboquant_mse_sdpa_2pass1_k{key_bits}_v{val_bits}_d{dim}"
+        f"{'_ragged' if ragged else ''}",
+        input_names=input_names,
         output_names=["out_acc", "out_sums", "out_maxs"],
         source=source,
     )
@@ -6338,6 +6358,120 @@ class BatchTurboQuantKVCache(_BaseCache):
         k = self.key_codec.dequantize(keys_state).astype(mx.float32)
         v = self.value_codec.dequantize(values_state).astype(mx.float32)
         return k, v
+
+    def decode_attention(
+        self, queries, keys_state=None, values_state=None, scale=1.0, mask=None
+    ):
+        """Fused ragged decode over the left-padded batch. Returns None to signal
+        the caller to fall back to dequantize->SDPA (unsupported codec/bits/shape)."""
+        if keys_state is None or values_state is None:
+            keys_state = _slice_state(self.keys, self._idx)
+            values_state = _slice_state(self.values, self._idx)
+        if isinstance(keys_state, _QuantizedStateProxy):
+            keys_state = keys_state._state
+        if isinstance(values_state, _QuantizedStateProxy):
+            values_state = values_state._state
+
+        if queries.shape[-2] != 1:
+            return None
+        if not (
+            isinstance(self.key_codec, _TurboQuantMSECodec)
+            and isinstance(self.value_codec, _TurboQuantMSECodec)
+            and isinstance(keys_state, TurboQuantMSEState)
+            and isinstance(values_state, TurboQuantMSEState)
+        ):
+            return None
+        # Left-padding is reproduced by `pads`; BatchTurboQuant is only used for
+        # non-windowed causal attention (windowed -> RotatingKVCache, excluded from
+        # turbo), so a None/"causal"/left-padding-array mask is handled. Reject only
+        # unexpected string masks.
+        if isinstance(mask, str) and mask != "causal":
+            return None
+
+        B, n_q_heads, L, D = queries.shape
+        n_kv_heads = keys_state.norms.shape[1]
+        n_repeats = n_q_heads // n_kv_heads
+        total_tokens = _state_length(keys_state)
+        key_bits = int(self.key_codec.bits)
+        val_bits = int(self.value_codec.bits)
+        dtype = queries.dtype
+        value_dim = self.value_codec.dim
+
+        grouped = (queries * scale).reshape(B, n_kv_heads, n_repeats, L, D)
+        q_rot_flat = self.key_codec.prepare_queries(grouped).reshape(
+            B * n_kv_heads * n_repeats, D
+        )
+        BQH = B * n_q_heads
+        pads = self.left_padding.astype(mx.int32)
+        kv_inputs = [
+            q_rot_flat,
+            keys_state.norms,
+            keys_state.indices,
+            self.key_codec.codebook,
+            values_state.norms,
+            values_state.indices,
+            self.value_codec.codebook,
+            pads,
+        ]
+        packed = [
+            ("KPackedWidth", keys_state.indices.shape[-1]),
+            ("VPackedWidth", values_state.indices.shape[-1]),
+        ]
+
+        if total_tokens <= 2048:
+            kernel = _fused_mse_decode_kernel(key_bits, val_bits, D, ragged=True)
+            if kernel is None:
+                return None
+            out = kernel(
+                inputs=kv_inputs,
+                template=[("Dim", D), ("RepeatCount", n_repeats), *packed],
+                grid=(BQH * 1024, 1, 1),
+                threadgroup=(1024, 1, 1),
+                output_shapes=[(BQH, D)],
+                output_dtypes=[mx.float32],
+            )[0]
+        else:
+            pass1 = _fused_mse_decode_2pass_1_kernel(key_bits, val_bits, D, ragged=True)
+            pass2 = _fused_mse_decode_2pass_2_kernel()
+            if pass1 is None or pass2 is None:
+                return None
+            if total_tokens <= 8192:
+                num_blocks = 64
+            elif total_tokens <= 32768:
+                num_blocks = 128
+            elif total_tokens <= 65536:
+                num_blocks = 256
+            else:
+                num_blocks = 512
+            out_acc, out_sums, out_maxs = pass1(
+                inputs=kv_inputs,
+                template=[
+                    ("Dim", D),
+                    ("RepeatCount", n_repeats),
+                    ("Blocks", num_blocks),
+                    *packed,
+                ],
+                grid=(n_kv_heads * 32, B * n_repeats, num_blocks),
+                threadgroup=(32, n_repeats, 1),
+                output_shapes=[
+                    (BQH * num_blocks, D),
+                    (BQH * num_blocks,),
+                    (BQH * num_blocks,),
+                ],
+                output_dtypes=[mx.float32, mx.float32, mx.float32],
+            )
+            out = pass2(
+                inputs=[out_acc, out_sums, out_maxs],
+                template=[("Dim", D), ("Blocks", num_blocks)],
+                grid=(BQH * 1024, 1, 1),
+                threadgroup=(1024, 1, 1),
+                output_shapes=[(BQH, D)],
+                output_dtypes=[mx.float32],
+            )[0]
+
+        out_rotated = out.reshape(B, n_kv_heads, n_repeats, D)
+        output = self.value_codec._rotate_inverse(out_rotated)
+        return output.reshape(B, n_q_heads, L, value_dim).astype(dtype)
 
     def dequantize_for_apc(self):
         """Return raw float (keys, values) for APC storage.

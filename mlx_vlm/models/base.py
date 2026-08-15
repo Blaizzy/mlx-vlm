@@ -341,6 +341,16 @@ def scaled_dot_product_attention(
         )
 
     if isinstance(cache, BatchTurboQuantKVCache):
+        if sinks is None and queries.shape[-2] == 1:
+            fused = cache.decode_attention(
+                queries,
+                keys_state=keys,
+                values_state=values,
+                scale=scale,
+                mask=mask,
+            )
+            if fused is not None:
+                return fused
         dequantized_keys, dequantized_values = cache.dequantize(keys, values)
         return mx.fast.scaled_dot_product_attention(
             queries,
