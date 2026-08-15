@@ -6,7 +6,6 @@ and Qwen3.5 DFlash cache rollback coverage in one place.
 
 import importlib
 import json
-import struct
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
@@ -14,7 +13,6 @@ from unittest.mock import patch
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-import numpy as np
 import pytest
 from mlx.utils import tree_flatten, tree_map
 
@@ -3184,29 +3182,6 @@ def test_qwen3_5_mtp_sanitize_strips_prefix_and_offsets_norms():
     assert out["layers.0.self_attn.q_norm.weight"].tolist() == [1.0, 1.0]
 
 
-def test_qwen3_5_mtp_sanitize_dequantizes_blockwise_fp8():
-    weight_key = "mtp.layers.0.self_attn.q_proj.weight"
-    scale_key = f"{weight_key}_scale_inv"
-    weights = {
-        weight_key: mx.to_fp8(mx.ones((130, 129), dtype=mx.float32)),
-        scale_key: mx.array([[0.5, 1.0], [2.0, 4.0]], dtype=mx.bfloat16),
-    }
-
-    out = Qwen3_5MTPDraftModel.sanitize(None, weights)
-    expected = np.ones((130, 129), dtype=np.float32)
-    expected[:128, :128] *= 0.5
-    expected[:128, 128:] *= 1.0
-    expected[128:, :128] *= 2.0
-    expected[128:, 128:] *= 4.0
-
-    assert not any(key.endswith("weight_scale_inv") for key in out)
-    assert out["layers.0.self_attn.q_proj.weight"].dtype == mx.bfloat16
-    assert mx.array_equal(
-        out["layers.0.self_attn.q_proj.weight"],
-        mx.array(expected, dtype=mx.bfloat16),
-    ).item()
-
-
 def test_split_qwen3_5_mtp_writes_sidecar_without_index_mtp_entries(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "mtp"
@@ -3239,57 +3214,50 @@ def test_split_qwen3_5_mtp_writes_sidecar_without_index_mtp_entries(tmp_path):
     assert weights["pre_fc_norm_hidden.weight"][0].item() == 1.0
 
 
-def test_split_qwen3_5_mtp_dequantizes_indexed_fp8_weights(tmp_path):
+def test_split_qwen3_5_mtp_converts_fine_grained_fp8(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "mtp"
     source.mkdir()
     text_config = _tiny_qwen3_5_text_config()
     text_config.mtp_num_hidden_layers = 1
     (source / "config.json").write_text(
-        json.dumps({"model_type": "qwen3_5", "text_config": text_config.to_dict()})
+        json.dumps(
+            {
+                "model_type": "qwen3_5",
+                "text_config": text_config.to_dict(),
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "fmt": "e4m3",
+                    "weight_block_size": [128, 128],
+                },
+            }
+        )
     )
-    weight_key = "mtp.layers.0.self_attn.q_proj.weight"
-    scale_key = f"{weight_key}_scale_inv"
     mx.save_safetensors(
         str(source / "mtp.safetensors"),
         {
-            weight_key: mx.to_fp8(mx.ones((128, 128), dtype=mx.float32)),
-            scale_key: mx.array([[0.25]], dtype=mx.bfloat16),
+            "mtp.layers.0.mlp.down_proj.weight": mx.to_fp8(
+                mx.ones((128, 128), dtype=mx.bfloat16)
+            ),
+            "mtp.layers.0.mlp.down_proj.weight_scale_inv": mx.full(
+                (1, 1), 0.125, dtype=mx.bfloat16
+            ),
+            "mtp.pre_fc_norm_hidden.weight": mx.zeros((16,)),
         },
         metadata={},
-    )
-    shard_path = source / "mtp.safetensors"
-    shard = shard_path.read_bytes()
-    header_size = struct.unpack("<Q", shard[:8])[0]
-    header = json.loads(shard[8 : 8 + header_size])
-    header[weight_key]["dtype"] = "F8_E4M3"
-    encoded_header = json.dumps(header, separators=(",", ":")).encode()
-    encoded_header += b" " * ((8 - len(encoded_header) % 8) % 8)
-    shard_path.write_bytes(
-        struct.pack("<Q", len(encoded_header))
-        + encoded_header
-        + shard[8 + header_size :]
-    )
-    (source / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "weight_map": {
-                    weight_key: "mtp.safetensors",
-                    scale_key: "mtp.safetensors",
-                }
-            }
-        )
     )
 
     split_qwen3_5_mtp(str(source), str(output))
 
+    with open(output / "config.json") as f:
+        cfg = json.load(f)
     weights = mx.load(str(output / "model.safetensors"))
-    output_key = "layers.0.self_attn.q_proj.weight"
+    expected = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    assert cfg["quantization"] == expected
+    assert cfg["quantization_config"] == expected
+    assert weights["layers.0.mlp.down_proj.weight"].dtype == mx.uint32
+    assert weights["layers.0.mlp.down_proj.scales"].dtype == mx.uint8
     assert not any(key.endswith("weight_scale_inv") for key in weights)
-    assert weights[output_key].dtype == mx.bfloat16
-    assert mx.array_equal(
-        weights[output_key], mx.full((128, 128), 0.25, dtype=mx.bfloat16)
-    ).item()
 
 
 def test_deepseek_v4_returns_mtp_hidden_and_trims_without_snapshot():

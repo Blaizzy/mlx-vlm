@@ -469,7 +469,6 @@ class Qwen3_5MTPDraftModel(nn.Module):
 
     def sanitize(self, weights: dict) -> dict:
         out = {}
-        weights = dequantize_fp8_weights(weights)
         expert_prefixes = [
             key[: -len(".experts.gate_up_proj")]
             for key in weights

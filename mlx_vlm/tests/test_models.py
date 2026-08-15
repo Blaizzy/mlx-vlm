@@ -12879,50 +12879,6 @@ class TestQwen38FP8(unittest.TestCase):
         self.assertEqual(config.quantization_config["quant_method"], "fp8")
         self.assertEqual(config.quantization_config["weight_block_size"], [128, 128])
 
-    def test_sanitize_dequantizes_blockwise_fp8(self):
-        from mlx_vlm.models import qwen3_5
-
-        weight_key = "model.language_model.layers.0.self_attn.q_proj.weight"
-        scale_key = f"{weight_key}_scale_inv"
-        weights = {
-            weight_key: mx.to_fp8(mx.ones((130, 129), dtype=mx.float32)),
-            scale_key: mx.array([[0.5, 1.0], [2.0, 4.0]], dtype=mx.bfloat16),
-        }
-        stub = SimpleNamespace(
-            config=SimpleNamespace(
-                text_config=SimpleNamespace(
-                    tie_word_embeddings=False, num_hidden_layers=1
-                )
-            )
-        )
-
-        out = qwen3_5.Model.sanitize(stub, weights)
-        output_key = "language_model.model.layers.0.self_attn.q_proj.weight"
-        expected = np.ones((130, 129), dtype=np.float32)
-        expected[:128, :128] *= 0.5
-        expected[:128, 128:] *= 1.0
-        expected[128:, :128] *= 2.0
-        expected[128:, 128:] *= 4.0
-
-        self.assertFalse(any(key.endswith("weight_scale_inv") for key in out))
-        self.assertEqual(out[output_key].dtype, mx.bfloat16)
-        self.assertTrue(
-            mx.array_equal(
-                out[output_key], mx.array(expected, dtype=mx.bfloat16)
-            ).item()
-        )
-
-    def test_invalid_fp8_scale_grid_is_rejected(self):
-        from mlx_vlm.models.qwen3_5.language import dequantize_fp8_weights
-
-        with self.assertRaisesRegex(ValueError, "Invalid FP8 scale shape"):
-            dequantize_fp8_weights(
-                {
-                    "proj.weight": mx.to_fp8(mx.ones((129, 129))),
-                    "proj.weight_scale_inv": mx.ones((1, 2)),
-                }
-            )
-
 
 class TestQwen35StructuredOutputMaskWidth(unittest.TestCase):
     """Structured output must not be capped at the tokenizer vocab width (#1797).

@@ -754,6 +754,59 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
     assert quantize.call_args.kwargs["mode"] == "affine"
 
 
+def test_load_model_uses_qwen_fine_grained_fp8_quantization_config():
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeQwenModel(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.proj = nn.Linear(128, 128, bias=False)
+
+        def load_weights(self, weights, strict=True):
+            self.loaded_weights = weights
+            self.loaded_strict = strict
+
+    fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeQwenModel)
+    source_config = {
+        "model_type": "qwen3_5",
+        "quantization_config": {
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "weight_block_size": [128, 128],
+        },
+    }
+
+    with (
+        patch("mlx_vlm.utils.load_config", return_value=source_config),
+        patch(
+            "mlx_vlm.utils.glob.glob",
+            return_value=["/tmp/model/model.safetensors"],
+        ),
+        patch(
+            "mlx_vlm.utils._load_safetensors",
+            return_value={
+                "proj.weight": mx.zeros((128, 32), dtype=mx.uint32),
+                "proj.scales": mx.zeros((128, 4), dtype=mx.uint8),
+            },
+        ),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "qwen3_5"),
+        ),
+        patch("mlx_vlm.utils.nn.quantize") as quantize,
+    ):
+        load_model(Path("/tmp/model"), lazy=True)
+
+    quantize.assert_called_once()
+    assert quantize.call_args.kwargs["group_size"] == 32
+    assert quantize.call_args.kwargs["bits"] == 8
+    assert quantize.call_args.kwargs["mode"] == "mxfp8"
+
+
 def test_load_model_quantizes_projector_with_scales_when_skip_vision():
     class FakeConfig:
         @classmethod

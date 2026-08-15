@@ -8,6 +8,7 @@ from typing import Dict, Iterable, Optional
 import mlx.core as mx
 from safetensors import safe_open
 
+from ....models.qwen3_5.fp8 import make_quantization_config
 from ....utils import get_model_path
 from .qwen3_5_mtp import Qwen3_5MTPDraftModel
 
@@ -124,6 +125,8 @@ def split_qwen3_5_mtp(
         quantization = source_config.get("mtplx_mtp_quantization")
         if quantization is None:
             quantization = source_config.get("quantization")
+        if quantization is None:
+            quantization = make_quantization_config(source_config)
         if quantization is not None:
             draft_config["quantization"] = quantization
             draft_config["quantization_config"] = quantization
