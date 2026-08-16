@@ -2118,6 +2118,14 @@ class PoolingCache(_BaseCache):
     def meta_state(self, v):
         self.ratio = v
 
+    @classmethod
+    def from_state(cls, state, meta_state):
+        # Restoring buffered state calls ``accumulate_windows``, which needs
+        # the compression ratio before the generic state setter can run.
+        obj = cls(meta_state)
+        obj.state = state
+        return obj
+
     def is_trimmable(self):
         return self.pooled is None
 
@@ -2142,7 +2150,12 @@ class PoolingCache(_BaseCache):
         return total
 
     @classmethod
-    def merge(cls, caches):
+    def merge(cls, caches, prefix_lens=None):
+        # APC's generic exact-cache adapter passes prefix lengths to custom
+        # merge implementations. Pooling caches derive their batched progress
+        # from each row's pooled length and remainder, so no extra alignment is
+        # required here.
+        del prefix_lens
         return BatchPoolingCache.merge(caches)
 
 
