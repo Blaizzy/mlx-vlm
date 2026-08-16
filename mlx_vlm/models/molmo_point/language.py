@@ -9,6 +9,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..rope_utils import initialize_rope
 from .config import ModelConfig, TextConfig
 
 
@@ -36,7 +37,7 @@ class LanguageModelMLP(nn.Module):
 
 
 class Molmo2Attention(nn.Module):
-    def __init__(self, config: TextConfig):
+    def __init__(self, config: TextConfig, layer_idx: int = 0):
         super().__init__()
         self.config = config
         self.num_heads = config.num_attention_heads
@@ -65,7 +66,20 @@ class Molmo2Attention(nn.Module):
             bias=False,
         )
 
-        self.rotary_emb = nn.RoPE(self.head_dim, base=config.rope_theta)
+        scaling_config = config.rope_scaling
+        if (
+            config.rope_scaling_layers is not None
+            and layer_idx not in config.rope_scaling_layers
+        ):
+            scaling_config = None
+
+        self.rotary_emb = initialize_rope(
+            dims=self.head_dim,
+            base=config.rope_theta,
+            traditional=False,
+            scaling_config=scaling_config,
+            max_position_embeddings=config.max_position_embeddings,
+        )
 
     def __call__(
         self,
@@ -106,9 +120,9 @@ class Molmo2Attention(nn.Module):
 
 
 class Molmo2DecoderLayer(nn.Module):
-    def __init__(self, config: TextConfig):
+    def __init__(self, config: TextConfig, layer_idx: int = 0):
         super().__init__()
-        self.self_attn = Molmo2Attention(config)
+        self.self_attn = Molmo2Attention(config, layer_idx)
         self.attn_norm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.ff_norm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.mlp = LanguageModelMLP(config.hidden_size, config.intermediate_size)
@@ -138,7 +152,8 @@ class Molmo2Transformer(nn.Module):
             config.vocab_size, config.additional_vocab_size, config.hidden_size
         )
         self.blocks = [
-            Molmo2DecoderLayer(config) for _ in range(config.num_hidden_layers)
+            Molmo2DecoderLayer(config, layer_idx)
+            for layer_idx in range(config.num_hidden_layers)
         ]
         self.ln_f = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
 

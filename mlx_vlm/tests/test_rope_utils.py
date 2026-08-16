@@ -152,9 +152,76 @@ def test_su_scaled_rope_evals_private_helper_arrays_on_init(monkeypatch):
     assert tree_flatten(host.parameters()) == []
     assert tree_flatten(host.trainable_parameters()) == []
     eager_arrays = host.rope.eager_eval_arrays()
-    assert eager_arrays[0] is host.rope._freqs
+    assert eager_arrays[0] is host.rope._short_freqs
+    assert eager_arrays[1] is host.rope._long_freqs
+    assert eager_arrays[2] is host.rope._short_scale
+    assert eager_arrays[3] is host.rope._long_scale
     assert len(eval_args) == 1
-    assert eval_args[0][0] is eager_arrays[0]
+    assert len(eval_args[0]) == len(eager_arrays)
+    for actual, expected in zip(eval_args[0], eager_arrays):
+        assert actual is expected
+
+
+def test_su_scaled_rope_selects_factors_from_position_span():
+    dims = 8
+    base = 100.0
+    short_factor = [1.0, 1.25, 1.5, 1.75]
+    long_factor = [2.0, 2.25, 2.5, 2.75]
+    rope = SuScaledRoPE(
+        dims=dims,
+        base=base,
+        max_position_embeddings=8,
+        original_max_position_embeddings=4,
+        short_factor=short_factor,
+        long_factor=long_factor,
+        short_mscale=1.0,
+        long_mscale=2.0,
+    )
+    inputs = (mx.arange(16, dtype=mx.float32) / 10).reshape(1, 1, 2, dims)
+    base_freqs = base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
+
+    short = rope(inputs, offset=2)
+    expected_short = mx.fast.rope(
+        inputs,
+        dims,
+        traditional=False,
+        base=None,
+        scale=1.0,
+        offset=2,
+        freqs=mx.array(short_factor) * base_freqs,
+    )
+    long = rope(inputs, offset=3)
+    expected_long = mx.fast.rope(
+        2.0 * inputs,
+        dims,
+        traditional=False,
+        base=None,
+        scale=1.0,
+        offset=3,
+        freqs=mx.array(long_factor) * base_freqs,
+    )
+
+    mx.eval(short, expected_short, long, expected_long)
+    assert _max_diff(short, expected_short) < 1e-5
+    assert _max_diff(long, expected_long) < 1e-5
+
+
+def test_initialize_longrope_accepts_top_level_original_context_length():
+    rope = initialize_rope(
+        dims=8,
+        base=10000.0,
+        traditional=False,
+        scaling_config={
+            "type": "longrope",
+            "short_factor": [1.0] * 4,
+            "long_factor": [2.0] * 4,
+        },
+        max_position_embeddings=16,
+        original_max_position_embeddings=8,
+    )
+
+    assert isinstance(rope, SuScaledRoPE)
+    assert rope.original_max_position_embeddings == 8
 
 
 def test_llama3_rope_evals_private_helper_arrays_on_init(monkeypatch):
