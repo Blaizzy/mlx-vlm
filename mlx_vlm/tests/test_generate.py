@@ -1628,6 +1628,7 @@ class TestThinkingBudgetCriteria:
             thinking_end_token="</think>",
             thinking_start_token="<think>",
             enable_thinking=True,
+            prompt_preopens_thinking=True,
         )
 
         # enable_thinking=True — already in thinking mode
@@ -1677,13 +1678,41 @@ class TestThinkingBudgetCriteria:
         assert criteria.thinking_token_count == 0
         assert criteria.budget_exceeded is False
 
-    def _make_criteria(self, enable_thinking=True):
+    def test_self_opening_model_budget_still_enforced(self):
+        """Regression test for issue #1911."""
+        criteria = ThinkingBudgetCriteria(
+            tokenizer=FakeTokenizer(),
+            thinking_budget=5,
+            thinking_end_token="</think>",
+            thinking_start_token="<think>",
+            enable_thinking=True,
+            prompt_preopens_thinking=False,
+        )
+
+        assert criteria.in_thinking is False
+
+        assert criteria(99) is None
+        assert criteria.in_thinking is True
+
+        for i in range(5):
+            assert criteria(50 + i) is None
+        assert criteria.thinking_token_count == 5
+        assert criteria.budget_exceeded is False
+
+        assert criteria(60) == 10  # \n
+        assert criteria.pop_forced_token_id() == 10
+        assert criteria(60) == 100  # </think>
+        assert criteria.pop_forced_token_id() == 100
+        assert criteria.budget_exceeded is True
+
+    def _make_criteria(self, enable_thinking=True, prompt_preopens_thinking=True):
         return ThinkingBudgetCriteria(
             tokenizer=FakeTokenizer(),
             thinking_budget=5,
             thinking_end_token="</think>",
             thinking_start_token="<think>",
             enable_thinking=enable_thinking,
+            prompt_preopens_thinking=prompt_preopens_thinking,
         )
 
     def test_pop_forced_token_id_safe_before_first_call(self):

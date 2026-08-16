@@ -311,17 +311,7 @@ def convert(
             return model_quant_predicate(path, module)
         return True
 
-    # TODO: Remove once all LM models are migrated
-    # Text-only models wrap the real mlx-lm model under `language_model._model`.
-    # nn.Module.parameters() can't reach that underscore child, so dtype-cast,
-    # quantization, and save_weights must operate on the inner model -- the same
-    # one load_model quantizes (see utils.load_model). Otherwise convert writes
-    # an empty safetensors and mixed-bit per-layer keys don't match on reload.
-    target = (
-        model.language_model._model
-        if getattr(model, "_is_text_model", False)
-        else model
-    )
+    target = model
 
     if isinstance(quant_predicate, str):
         quant_predicate = mixed_quant_predicate_builder(quant_predicate, target)
