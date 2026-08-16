@@ -159,6 +159,47 @@ def _drop_prefill_kwargs(prompt_kwargs: dict, keys: List[str], n: int) -> dict:
     return out
 
 
+def _dflash_apc_text_only(request) -> bool:
+    """Return whether a queued request has no multimodal prompt state."""
+    if request.images or request.videos or request.audio:
+        return False
+    raw_inputs = request.raw_inputs or {}
+    return not any(
+        key in raw_inputs
+        for key in ("pixel_values", "pixel_values_videos", "input_features")
+    )
+
+
+def _dflash_apc_lookup(
+    request,
+    input_ids: List[int],
+    *,
+    batch_size: int,
+    draft_kind: str,
+    apc_manager,
+    apc_mode: Optional[str],
+):
+    """Look up a conservative B=1, text-only exact-cache DFlash prefix."""
+    if (
+        batch_size != 1
+        or draft_kind != "dflash"
+        or apc_manager is None
+        or apc_mode != "exact"
+        or request.apc_semantic_hash is None
+        or not _dflash_apc_text_only(request)
+    ):
+        return None
+    return _apc.apc_lookup_plan(
+        apc_manager,
+        input_ids,
+        extra_hash=int(request.apc_semantic_hash),
+        apc_mode="exact",
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda _prefix_len: True,
+        prefix_has_media=lambda _prefix_len: False,
+    )
+
+
 def _run_chunked_speculative_prefill(
     lm,
     input_ids: mx.array,
@@ -2144,6 +2185,41 @@ class ResponseGenerator:
                     make_cache=_make_cache,
                 )
 
+                apc_cached_tokens = 0
+                apc_extra_hash = None
+                apc_manager = getattr(self, "apc_manager", None)
+                apc_mode = getattr(self, "apc_mode", None)
+                if B == 1:
+                    apc_extra_hash = pending[0].apc_semantic_hash
+                    try:
+                        apc_plan = _dflash_apc_lookup(
+                            pending[0],
+                            all_input_ids[0],
+                            batch_size=B,
+                            draft_kind=draft_kind,
+                            apc_manager=apc_manager,
+                            apc_mode=apc_mode,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "DFlash APC lookup failed; using cold prefill: %s", e
+                        )
+                        apc_plan = None
+                    if apc_plan is not None:
+                        prefix_len = int(apc_plan["prefix_len"])
+                        sequence_keys = _sequence_aligned_prefill_keys(
+                            prompt_kwargs,
+                            batch_size=1,
+                            sequence_length=inputs_embeds_mx.shape[1],
+                        )
+                        input_mx = input_mx[:, prefix_len:]
+                        inputs_embeds_mx = inputs_embeds_mx[:, prefix_len:, :]
+                        prompt_kwargs = _drop_prefill_kwargs(
+                            prompt_kwargs, sequence_keys, prefix_len
+                        )
+                        prompt_cache = apc_plan["warm_cache"]
+                        apc_cached_tokens = prefix_len
+
                 prefill_step_size = self._effective_prefill_step_size()
                 policy_kwargs = {**prompt_kwargs, **prefill_kwargs}
                 if not _chunked_prefill_enabled(
@@ -2179,6 +2255,22 @@ class ResponseGenerator:
                 )
                 mx.eval(first_bonus, hidden, out.logits)
                 prompt_elapsed = time.perf_counter() - prompt_started
+                if (
+                    B == 1
+                    and draft_kind == "dflash"
+                    and apc_manager is not None
+                    and apc_mode == "exact"
+                    and apc_extra_hash is not None
+                    and _dflash_apc_text_only(pending[0])
+                ):
+                    try:
+                        apc_manager.store_exact_cache(
+                            all_input_ids[0],
+                            prompt_cache,
+                            extra_hash=int(apc_extra_hash),
+                        )
+                    except Exception as e:
+                        logger.warning("DFlash APC store failed: %s", e)
                 for uid in uids:
                     prompt_tokens = prompt_tokens_map[uid]
                     prompt_tps_map[uid] = (
@@ -2188,9 +2280,10 @@ class ResponseGenerator:
                     )
                     logger.info(
                         "Prefill completed: request=%s prompt_tokens=%d "
-                        "cached_tokens=0 elapsed=%.3fs rate=%.1f tok/s",
+                        "cached_tokens=%d elapsed=%.3fs rate=%.1f tok/s",
                         stream_infos[uid].get("request_id", uid),
                         prompt_tokens,
+                        apc_cached_tokens,
                         prompt_elapsed,
                         float(prompt_tps_map[uid] or 0.0),
                     )
@@ -2221,6 +2314,7 @@ class ResponseGenerator:
                             finish_reason=finish,
                             peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
                             prompt_tps=prompt_tps_map.get(uid),
+                            cached_tokens=apc_cached_tokens,
                             emitted_at=emitted_at,
                         )
                     )
@@ -2268,6 +2362,7 @@ class ResponseGenerator:
                     eos_token_ids=eos_set,
                     prompt_tokens=input_mx,
                     row_ids=sample_row_ids,
+                    context_offset=apc_cached_tokens,
                 )
                 for tok_list, _ in rounds_iter:
                     for j, tok in enumerate(tok_list):

@@ -137,6 +137,7 @@ def run_speculative_server_rounds(
     eos_token_ids: Optional[set] = None,
     prompt_tokens: Optional[mx.array] = None,
     row_ids: Optional[List[int]] = None,
+    context_offset: int = 0,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
 
@@ -208,6 +209,7 @@ def run_speculative_server_rounds(
                 sampler=sampler,
                 draft_block_size=draft_block_size,
                 token_dtype=token_dtype,
+                context_offset=context_offset,
             ):
                 yield [tok], state
                 if stop_check is not None and stop_check(0, tok):

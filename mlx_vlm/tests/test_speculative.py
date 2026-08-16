@@ -32,6 +32,7 @@ from mlx_vlm.models.cache import (
 )
 from mlx_vlm.quantization.one_bit import OneBitLinear
 from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
+from mlx_vlm.speculative.dflash import _drafter_pos_shift
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
     DRAFTER_KIND_BY_MODEL_TYPE,
@@ -1617,13 +1618,24 @@ def test_dflash_server_singleton_dispatches_single_rounds(monkeypatch):
             token_dtype=mx.int32,
             greedy_sampling=True,
             stop_check=lambda _seq_idx, token_id: token_id == 4,
+            context_offset=123,
         )
     )
 
     assert result == [([3], None), ([4], None)]
     assert calls
     assert calls[0][1]["first_bonus"] == 2
+    assert calls[0][1]["context_offset"] == 123
     assert "use_model_initial_block_size" not in calls[0][1]
+
+
+def test_dflash_context_shift_does_not_mutate_cache_offsets():
+    caches = [SimpleNamespace(offset=3), SimpleNamespace(offset=8, pos_shift=2)]
+
+    _drafter_pos_shift(caches, 11)
+
+    assert [cache.offset for cache in caches] == [3, 8]
+    assert [cache.pos_shift for cache in caches] == [11, 13]
 
 
 def test_mtp_uses_uniform_deferred_walk_for_batched_sampling():

@@ -80,7 +80,9 @@ class MuseGlimmerAssistantAttention(nn.Module):
             context_length = context_hidden_states.shape[1]
             cache.offset += skip
 
-        cache_offset = cache.offset
+        # The shift affects absolute RoPE only. The sliding mask below uses
+        # relative positions, so its raw cache offsets remain unchanged.
+        cache_offset = cache.offset + int(getattr(cache, "pos_shift", 0))
         queries = self.q_proj(hidden_states)
         kv_hidden_states = mx.concatenate(
             [context_hidden_states, hidden_states], axis=1
