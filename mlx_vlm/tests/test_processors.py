@@ -2101,6 +2101,179 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertEqual(int(result["pixel_attention_mask"].sum()), 256)
         self.assertEqual(_num_image_tokens_from_patch_grid(16, 16, 2), 64)
 
+    def test_large_image_is_split_into_tiles_and_thumbnail(self):
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlNumpyImageProcessor
+
+        processor = Lfm2VlNumpyImageProcessor(
+            encoder_patch_size=16,
+            downsample_factor=2,
+            min_image_tokens=64,
+            max_image_tokens=256,
+            max_num_patches=1024,
+        )
+
+        # 2560x1440 screenshot: 8 tiles in a 4x2 grid + one thumbnail
+        image = Image.fromarray(
+            np.random.randint(0, 255, (1440, 2560, 3), dtype=np.uint8)
+        )
+        result = processor([image], return_tensors="np")
+
+        self.assertEqual(result["pixel_values"].shape, (9, 1024, 768))
+        self.assertEqual(result["spatial_shapes"].tolist(), [[32, 32]] * 8 + [[24, 42]])
+        self.assertEqual(result["image_rows"].tolist(), [2])
+        self.assertEqual(result["image_cols"].tolist(), [4])
+        self.assertEqual(result["image_sizes"].tolist(), [[384, 672]])
+        self.assertEqual(
+            result["pixel_attention_mask"].sum(axis=1).tolist(), [1024] * 8 + [1008]
+        )
+
+    def test_small_image_stays_single_view_with_tiling_enabled(self):
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlNumpyImageProcessor
+
+        processor = Lfm2VlNumpyImageProcessor()
+
+        # Below the too-large threshold: identical to the pre-tiling behavior
+        image = Image.fromarray(
+            np.random.randint(0, 255, (540, 960, 3), dtype=np.uint8)
+        )
+        result = processor([image], return_tensors="np")
+
+        self.assertEqual(result["pixel_values"].shape, (1, 1024, 768))
+        self.assertEqual(result["spatial_shapes"].tolist(), [[24, 42]])
+        self.assertEqual(result["image_rows"].tolist(), [1])
+        self.assertEqual(result["image_cols"].tolist(), [1])
+        self.assertEqual(result["image_sizes"].tolist(), [[384, 672]])
+
+        # Explicitly disabling splitting on a large image keeps one view
+        large = Image.fromarray(
+            np.random.randint(0, 255, (1440, 2560, 3), dtype=np.uint8)
+        )
+        result = processor([large], return_tensors="np", do_image_splitting=False)
+        self.assertEqual(result["pixel_values"].shape, (1, 1024, 768))
+        self.assertEqual(result["image_rows"].tolist(), [1])
+        self.assertEqual(result["image_cols"].tolist(), [1])
+
+    def test_patched_call_expands_multi_tile_markers(self):
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import (
+            Lfm2VlNumpyImageProcessor,
+            _patched_call,
+        )
+
+        class RecordingTokenizer(type(_mock_tokenizer())):
+            def __init__(self):
+                self.texts = []
+
+            def __call__(self, text, **kwargs):
+                self.texts.append(text)
+                return super().__call__(text, **kwargs)
+
+        tokenizer = RecordingTokenizer()
+
+        class DummyProcessor:
+            pass
+
+        processor = DummyProcessor()
+        processor.image_processor = Lfm2VlNumpyImageProcessor()
+        processor.tokenizer = tokenizer
+        processor.image_token = "<image>"
+        processor.image_start_token = "<|image_start|>"
+        processor.image_end_token = "<|image_end|>"
+        processor.image_thumbnail_token = "<|img_thumbnail|>"
+        processor._merge_kwargs = lambda *args, **kwargs: {
+            "text_kwargs": {},
+            "images_kwargs": {},
+        }
+
+        image = Image.fromarray(
+            np.random.randint(0, 255, (1440, 2560, 3), dtype=np.uint8)
+        )
+        result = _patched_call(
+            processor,
+            images=[image],
+            text="<image>Describe this image",
+        )
+
+        self.assertEqual(result["pixel_values"].shape, (9, 1024, 768))
+
+        expanded = tokenizer.texts[0][0]
+        self.assertTrue(expanded.startswith("<|image_start|><|img_row_1_col_1|>"))
+        # Row-major tile markers, thumbnail marker last, then the image end
+        markers = [
+            f"<|img_row_{row}_col_{col}|>" for row in (1, 2) for col in (1, 2, 3, 4)
+        ]
+        for marker in markers:
+            self.assertIn(marker, expanded)
+        self.assertLess(
+            expanded.index(markers[-1]), expanded.index("<|img_thumbnail|>")
+        )
+        self.assertIn("<|img_thumbnail|>" + "<image>" * 252 + "<|image_end|>", expanded)
+        self.assertTrue(expanded.endswith("Describe this image"))
+        # 8 tiles * 256 tokens + 252 thumbnail tokens
+        self.assertEqual(expanded.count("<image>"), 8 * 256 + 252)
+
+    def test_non_numpy_image_processor_swapped_with_tiling(self):
+        # Regression test for the torch-installed case: the real
+        # Siglip2ImageProcessor (no tiling, (B, C, H, W) output) must be
+        # swapped for the NumPy processor before any image is processed.
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import _patched_call
+
+        class FakeTorchSiglip2:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+            def to_dict(self):
+                return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
+
+            def __call__(self, images, **kwargs):
+                raise AssertionError(
+                    "non-NumPy image processor should have been swapped out"
+                )
+
+        class RecordingTokenizer(type(_mock_tokenizer())):
+            def __init__(self):
+                self.texts = []
+
+            def __call__(self, text, **kwargs):
+                self.texts.append(text)
+                return super().__call__(text, **kwargs)
+
+        tokenizer = RecordingTokenizer()
+
+        class DummyProcessor:
+            pass
+
+        processor = DummyProcessor()
+        processor.image_processor = FakeTorchSiglip2(do_resize=True)
+        processor.tokenizer = tokenizer
+        processor.image_token = "<image>"
+        processor.image_start_token = "<|image_start|>"
+        processor.image_end_token = "<|image_end|>"
+        processor.image_thumbnail_token = "<|img_thumbnail|>"
+        processor._merge_kwargs = lambda *args, **kwargs: {
+            "text_kwargs": {},
+            "images_kwargs": {},
+        }
+
+        image = Image.fromarray(
+            np.random.randint(0, 255, (1440, 2560, 3), dtype=np.uint8)
+        )
+        result = _patched_call(
+            processor,
+            images=[image],
+            text="<image>Describe this image",
+        )
+
+        self.assertEqual(
+            type(processor.image_processor).__name__, "Lfm2VlNumpyImageProcessor"
+        )
+        self.assertEqual(result["pixel_values"].shape, (9, 1024, 768))
+        self.assertEqual(result["spatial_shapes"].tolist()[:8], [[32, 32]] * 8)
+        expanded = tokenizer.texts[0][0]
+        self.assertTrue(expanded.startswith("<|image_start|><|img_row_1_col_1|>"))
+        self.assertIn("<|img_thumbnail|>", expanded)
+        # 8 tiles * 256 tokens + 252 thumbnail tokens
+        self.assertEqual(expanded.count("<image>"), 8 * 256 + 252)
+
     def test_scalar_image_rows_and_cols_are_supported(self):
         from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import _patched_call
 
@@ -2146,13 +2319,20 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertIn("input_ids", result)
         self.assertIn("attention_mask", result)
 
-    def test_from_pretrained_uses_slow_image_processor(self):
+    def test_from_pretrained_uses_numpy_image_processor_despite_siglip2(self):
+        # Even when the real Siglip2ImageProcessor is importable (torch
+        # installed), from_pretrained must build the NumPy processor: it is
+        # the only implementation with official tiling and the packed-patch
+        # output the MLX model consumes.
         import json
         import tempfile
         from pathlib import Path
         from unittest.mock import patch
 
-        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlProcessor
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import (
+            Lfm2VlNumpyImageProcessor,
+            Lfm2VlProcessor,
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             (Path(tmpdir) / "processor_config.json").write_text(
@@ -2212,14 +2392,67 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
             ):
                 processor = Lfm2VlProcessor.from_pretrained(tmpdir)
 
-        self.assertIsInstance(processor.image_processor, DummySiglip2ImageProcessor)
+        self.assertIsInstance(processor.image_processor, Lfm2VlNumpyImageProcessor)
         self.assertTrue(processor.image_processor.do_resize)
-        self.assertFalse(processor.image_processor.do_image_splitting)
+        # The official tiling defaults are re-applied even when the repo config
+        # ships `do_image_splitting: false` (the LiquidAI MLX repos do).
+        self.assertTrue(processor.image_processor.do_image_splitting)
         tokenizer_from_pretrained.assert_called_once_with(
             tmpdir,
             trust_remote_code=False,
             local_files_only=True,
         )
+
+    def test_from_pretrained_honors_explicit_splitting_override(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlProcessor
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "processor_config.json").write_text(
+                json.dumps({"processor_class": "Lfm2VlProcessor"})
+            )
+
+            class DummySiglip2ImageProcessor:
+                def __init__(self, **kwargs):
+                    self.do_image_splitting = kwargs.get("do_image_splitting")
+                    self.use_thumbnail = kwargs.get("use_thumbnail")
+
+            def _fake_init(
+                self, image_processor, tokenizer, chat_template=None, **kwargs
+            ):
+                self.image_processor = image_processor
+                self.tokenizer = tokenizer
+                self.chat_template = chat_template
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=_mock_tokenizer(),
+                ),
+                patch(
+                    "mlx_vlm.models.lfm2_vl.processing_lfm2_vl.Siglip2ImageProcessor",
+                    DummySiglip2ImageProcessor,
+                    create=True,
+                ),
+                patch(
+                    "mlx_vlm.models.lfm2_vl.processing_lfm2_vl._SLOW_PROCESSOR_AVAILABLE",
+                    True,
+                ),
+                patch(
+                    "mlx_vlm.models.lfm2_vl.processing_lfm2_vl._original_init",
+                    _fake_init,
+                ),
+            ):
+                processor = Lfm2VlProcessor.from_pretrained(
+                    tmpdir, do_image_splitting=False
+                )
+
+        self.assertFalse(processor.image_processor.do_image_splitting)
+        self.assertTrue(processor.image_processor.use_thumbnail)
 
 
 class TestMolmoPointProcessor(unittest.TestCase):
