@@ -133,8 +133,8 @@ class SuScaledRoPE(nn.Module):
         self.dim = dims
 
         freqs = base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
-        self._freqs = mx.array(long_factor, dtype=mx.float32) * freqs
-        self.eval_cached_arrays()
+        self._short_freqs = mx.array(short_factor, dtype=mx.float32) * freqs
+        self._long_freqs = mx.array(long_factor, dtype=mx.float32) * freqs
 
         def default_scale(factor):
             return math.sqrt(
@@ -142,10 +142,24 @@ class SuScaledRoPE(nn.Module):
             )
 
         factor = max_position_embeddings / original_max_position_embeddings
-        self._scale = long_mscale or (1.0 if factor <= 1.0 else default_scale(factor))
+        scale = 1.0 if factor <= 1.0 else default_scale(factor)
+        self._short_scale = mx.array(
+            scale if short_mscale is None else short_mscale,
+            dtype=mx.float32,
+        )
+        self._long_scale = mx.array(
+            scale if long_mscale is None else long_mscale,
+            dtype=mx.float32,
+        )
+        self.eval_cached_arrays()
 
     def eager_eval_arrays(self):
-        return [self._freqs]
+        return [
+            self._short_freqs,
+            self._long_freqs,
+            self._short_scale,
+            self._long_scale,
+        ]
 
     def eval_cached_arrays(self):
         arrays = self.eager_eval_arrays()
@@ -153,8 +167,16 @@ class SuScaledRoPE(nn.Module):
             mx.eval(*arrays)
 
     def __call__(self, x, offset: Union[int, mx.array] = 0):
-        x = x[...]
-        x[..., : self.dim] = self._scale * x[..., : self.dim]
+        position_end = mx.max(mx.array(offset, dtype=mx.int32)) + x.shape[-2]
+        use_long = position_end > self.original_max_position_embeddings
+        freqs = mx.where(use_long, self._long_freqs, self._short_freqs)
+        scale = mx.where(use_long, self._long_scale, self._short_scale)
+
+        x_rope = scale.astype(x.dtype) * x[..., : self.dim]
+        if self.dim < x.shape[-1]:
+            x = mx.concatenate([x_rope, x[..., self.dim :]], axis=-1)
+        else:
+            x = x_rope
         return mx.fast.rope(
             x,
             self.dim,
@@ -162,7 +184,7 @@ class SuScaledRoPE(nn.Module):
             base=None,
             scale=1.0,
             offset=offset,
-            freqs=self._freqs,
+            freqs=freqs,
         )
 
 
@@ -381,6 +403,7 @@ def initialize_rope(
     scaling_config: Optional[dict] = None,
     max_position_embeddings: Optional[int] = None,
     implementation: str = "fast",
+    original_max_position_embeddings: Optional[int] = None,
 ):
     if scaling_config is not None:
         rope_type = scaling_config.get("type") or scaling_config.get(
@@ -440,15 +463,27 @@ def initialize_rope(
         )
 
     if rope_type == "longrope":
+        original_max_position_embeddings = (
+            original_max_position_embeddings
+            if original_max_position_embeddings is not None
+            else scaling_config.get("original_max_position_embeddings")
+        )
+        if original_max_position_embeddings is None:
+            raise ValueError(
+                "LongRoPE requires original_max_position_embeddings either as an "
+                "argument or in scaling_config"
+            )
+        if max_position_embeddings is None:
+            raise ValueError("LongRoPE requires max_position_embeddings")
         return SuScaledRoPE(
             dims=dims,
             base=base,
             max_position_embeddings=max_position_embeddings,
-            original_max_position_embeddings=scaling_config[
-                "original_max_position_embeddings"
-            ],
+            original_max_position_embeddings=original_max_position_embeddings,
             short_factor=scaling_config["short_factor"],
             long_factor=scaling_config["long_factor"],
+            short_mscale=scaling_config.get("short_mscale"),
+            long_mscale=scaling_config.get("long_mscale"),
         )
 
     if rope_type == "proportional":
