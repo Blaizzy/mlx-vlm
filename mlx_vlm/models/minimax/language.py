@@ -225,7 +225,8 @@ class MiniMaxModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = create_attention_mask(h, cache[0])
+        if mask is None:
+            mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
