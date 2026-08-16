@@ -6,6 +6,7 @@ the server passes ``reasoning_effort`` (OpenAI standard), so without the
 alias the requested effort is silently dropped and the template always
 renders "high".
 """
+
 from mlx_vlm.server.generation import GenerationArguments
 
 
