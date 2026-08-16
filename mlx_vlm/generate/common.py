@@ -62,6 +62,30 @@ def _chunked_prefill_enabled(
     return draft_model is None
 
 
+def resolve_quantized_kv_start(
+    kv_bits: Optional[float],
+    quantized_kv_start: int,
+    prompt_length: Optional[int],
+) -> int:
+    """Hold KV quantization until the prompt is in, when using the default.
+
+    Quantizing mid-prefill is close to pure cost: the conversion lands while the
+    run is still compute-bound, and every remaining prompt chunk then attends
+    through the slower quantized path. The saving only arrives at decode, once
+    the cache is large enough to dominate bandwidth. A fixed threshold means any
+    prompt longer than it pays that cost for the rest of prefill, so push the
+    conversion out to the prefill/decode boundary, where it happens once.
+
+    A caller who names a threshold means it, including one that fires during
+    prefill, so only the default is adjusted.
+    """
+    if kv_bits is None or prompt_length is None:
+        return quantized_kv_start
+    if quantized_kv_start != DEFAULT_QUANTIZED_KV_START:
+        return quantized_kv_start
+    return max(quantized_kv_start, int(prompt_length))
+
+
 def maybe_quantize_kv_cache(
     prompt_cache,
     quantized_kv_start,

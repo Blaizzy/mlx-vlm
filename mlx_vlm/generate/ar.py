@@ -36,6 +36,7 @@ from .common import (
     _chunked_prefill_enabled,
     generation_stream,
     maybe_quantize_kv_cache,
+    resolve_quantized_kv_start,
     wired_limit,
 )
 from .types import GenerateKwargs, ProcessorLike, Unpack
@@ -247,6 +248,12 @@ def generate_step(
         Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
           one token and a vector of log probabilities.
     """
+
+    quantized_kv_start = resolve_quantized_kv_start(
+        kv_bits,
+        quantized_kv_start,
+        input_ids.shape[-1] if input_ids is not None else None,
+    )
 
     quantize_cache_fn = functools.partial(
         _generate_module_override("maybe_quantize_kv_cache", maybe_quantize_kv_cache),
