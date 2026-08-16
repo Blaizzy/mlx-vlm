@@ -1,7 +1,12 @@
 import mlx.core as mx
 import pytest
 
-from mlx_vlm.models.cache import CacheList, KVCache
+from mlx_vlm.models.cache import (
+    BatchRotatingKVCache,
+    CacheList,
+    KVCache,
+    RotatingKVCache,
+)
 
 
 def _make_kv_cache(batch_size=1, length=3):
@@ -53,3 +58,22 @@ def test_empty_kv_cache_extracts_as_empty():
 
     assert extracted.empty()
     assert extracted.offset == 0
+
+
+def test_batch_rotating_merge_skips_zero_length_backing_storage():
+    def make_cache(length):
+        cache = RotatingKVCache(max_size=32)
+        cache.keys = mx.zeros((1, 2, 24, 4))
+        cache.values = mx.ones((1, 2, 24, 4))
+        cache._idx = 24
+        cache.offset = length
+        return cache
+
+    merged = BatchRotatingKVCache.merge([make_cache(0), make_cache(24)])
+    mx.eval(merged.keys, merged.values)
+
+    assert merged.keys.shape == (2, 2, 24, 4)
+    assert merged.values.shape == (2, 2, 24, 4)
+    assert merged.offset.tolist() == [0, 24]
+    assert mx.all(merged.keys[0] == 0).item()
+    assert mx.all(merged.values[0] == 0).item()

@@ -13,9 +13,15 @@ _FULL_COS = "full"
 
 
 def _eager_rope_angles(x, offset, frequencies, scale, traditional):
-    positions = mx.arange(x.shape[-2], dtype=mx.float32) + offset
+    # offset is always an mx.array here (EagerRoPE.__call__ wraps it): 0-d for
+    # a scalar offset or (B,) for a per-batch offset (BatchRotatingKVCache /
+    # BatchKVCache). Give it a trailing axis so broadcasting keeps the seq dim
+    # S instead of accidentally expanding it to B.
+    positions = (
+        mx.arange(x.shape[-2], dtype=mx.float32)[None, :] + offset[..., None]
+    )  # (1, S) or (B, S)
     positions = positions * scale
-    angles = positions[:, None] * frequencies[None]
+    angles = positions[:, :, None] * frequencies[None, None]  # (B, S, F)
     if traditional:
         return mx.repeat(angles, 2, axis=-1)
     return mx.concatenate([angles, angles], axis=-1)
@@ -42,8 +48,9 @@ def _eager_rope_apply(x, cos, sin, dims, traditional):
 def _compiled_eager_rope(x, offset, frequencies, scale, traditional):
     dims = frequencies.shape[0] * 2
     angles = _eager_rope_angles(x, offset, frequencies, scale, traditional)
-    cos = mx.cos(angles).astype(x.dtype)[None, None]
-    sin = mx.sin(angles).astype(x.dtype)[None, None]
+    # angles is always (B, S, F*2) -> cos/sin (B, 1, S, D).
+    cos = mx.cos(angles).astype(x.dtype)[:, None]
+    sin = mx.sin(angles).astype(x.dtype)[:, None]
     return _eager_rope_apply(x, cos, sin, dims, traditional)
 
 

@@ -20,19 +20,42 @@ from fastapi.testclient import TestClient
 from PIL import Image
 from transformers.utils.chat_parsing import ResponseParser, parse_response
 
+import mlx_vlm.reranker_loader as reranker_loader
 import mlx_vlm.server as server
 import mlx_vlm.server.cli as server_cli
 import mlx_vlm.server.generation as server_generation
 import mlx_vlm.server.openai as server_openai
 import mlx_vlm.server.reranking as server_reranking
 import mlx_vlm.speculative.utils as speculative_utils
-import mlx_vlm.utils as vlm_utils
 from mlx_vlm import apc as apc_module
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
+
+
+def test_response_generator_prefill_step_override_wins_over_environment(monkeypatch):
+    class DormantThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setenv("PREFILL_STEP_SIZE", "2048")
+    monkeypatch.setattr(server_generation, "Thread", DormantThread)
+
+    default_generator = server.ResponseGenerator(model_path="default")
+    overridden_generator = server.ResponseGenerator(
+        model_path="overridden",
+        prefill_step_size=3072,
+    )
+
+    assert default_generator.prefill_step_size == 2048
+    assert overridden_generator.prefill_step_size == 3072
+
 
 _MUSE_RESPONSE_TEMPLATE = {
     "defaults": {"role": "assistant"},
@@ -676,11 +699,9 @@ def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     server.get_cached_model("demo-model", "adapter-a")
     server.get_cached_model("demo-model")
 
-    assert server.runtime.model_cache["cache_key"] == (
-        "demo-model",
-        "adapter-a",
-        "text_generation",
-    )
+    cache_key = server.runtime.model_cache["cache_key"]
+    assert cache_key[:3] == ("demo-model", "adapter-a", "text_generation")
+    assert cache_key[3] == server.runtime.config.fingerprint(kinds={"text_generation"})
     assert server.runtime.model_cache["adapter_path"] == "adapter-a"
 
 
@@ -745,6 +766,8 @@ def _unstarted_response_generator():
     gen.vision_cache = None
     gen.draft_model = None
     gen.draft_kind = None
+    gen.draft_model_path = None
+    gen.draft_kind_override = None
     gen.kv_bits = None
     gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
     gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
@@ -1209,6 +1232,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
     gen.processor = SimpleNamespace()
     gen.config = SimpleNamespace(eos_token_id=3)
     gen.tokenizer = SimpleNamespace(all_special_ids=[0])
+    gen.prefill_step_size = 3072
     captured = {}
 
     def fake_stream_diffusion_generate_from_kwargs(
@@ -1255,7 +1279,6 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         "stream_diffusion_generate_from_kwargs",
         fake_stream_diffusion_generate_from_kwargs,
     )
-    monkeypatch.setattr(server_generation, "get_prefill_step_size", lambda: 2048)
     args = server.GenerationArguments(
         max_tokens=4,
         temperature=0.0,
@@ -1306,7 +1329,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         "top_p": 1.0,
         "top_k": 0,
         "mm_token_type_ids": "types",
-        "prefill_step_size": 2048,
+        "prefill_step_size": 3072,
         "seed": 123,
         "max_denoising_steps": 7,
         "block_length": 16,
@@ -1714,7 +1737,9 @@ class _RecordingSpeculativeLM:
         )
 
 
-def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
+def _run_speculative_prefill_once(
+    monkeypatch, *, draft_kind, request_specs, prefill_step_size=2048
+):
     lm = _RecordingSpeculativeLM(draft_kind)
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
     gen.model = SimpleNamespace(language_model=lm)
@@ -1726,6 +1751,7 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
     gen.stop_tokens = {99}
     gen.requests = Queue()
     gen._stop = False
+    gen.prefill_step_size = prefill_step_size
     gen._make_sampler = lambda args: None
     gen.tokenizer = SimpleNamespace(
         decode=lambda tokens: "".join(str(tok) for tok in tokens)
@@ -1788,6 +1814,7 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
 
     gen._run_speculative()
     call = lm.calls[0]
+    call["prefill_input_lengths"] = [item["inputs"].shape[1] for item in lm.calls]
     call["round_kwargs"] = gen.round_kwargs
     return call
 
@@ -1809,6 +1836,29 @@ def test_speculative_server_threads_greedy_flag_to_mtp_loop(monkeypatch):
     )
 
     assert call["round_kwargs"]["greedy_sampling"] is True
+
+
+def test_speculative_server_honors_prefill_step_override(monkeypatch):
+    monkeypatch.setattr(
+        server_generation, "_chunked_prefill_enabled", lambda *args, **kwargs: True
+    )
+    call = _run_speculative_prefill_once(
+        monkeypatch,
+        draft_kind="mtp",
+        prefill_step_size=2,
+        request_specs=[
+            {
+                "input_ids": mx.array([[11, 12, 13]], dtype=mx.int32),
+                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
+            },
+            {
+                "input_ids": mx.array([[21, 22, 23]], dtype=mx.int32),
+                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
+            },
+        ],
+    )
+
+    assert call["prefill_input_lengths"] == [2, 1]
 
 
 def test_speculative_server_prefill_threads_gemma4_per_layer_inputs(monkeypatch):
@@ -4853,21 +4903,25 @@ class TestResponseGenerator:
 
     def test_token_queue_timeout_defaults_to_long_prefill_window(self, monkeypatch):
         monkeypatch.delenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", raising=False)
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
 
         assert server.get_token_queue_timeout() == 600.0
 
     def test_token_queue_timeout_accepts_namespaced_env(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "42.5")
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
 
         assert server.get_token_queue_timeout() == 42.5
 
     def test_token_queue_timeout_invalid_values_fall_back_to_default(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "bad")
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
 
         assert server.get_token_queue_timeout() == 600.0
 
     def test_token_queue_timeout_can_disable_timeout(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "0")
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
 
         assert server.get_token_queue_timeout() is None
 
@@ -5010,7 +5064,7 @@ class TestResponseGenerator:
 
         gen.requests = Requests()
         gen._cancel = cancelled.append
-        monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "0.01")
+        monkeypatch.setattr(server.runtime.config, "token_queue_timeout", 0.01)
 
         _, token_iter = gen.generate("hello")
 
@@ -5081,7 +5135,9 @@ class TestResponseGenerator:
 
         gen.requests = Requests()
         gen._cancel = cancelled.append
-        monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", str(timeout_s * 10))
+        monkeypatch.setattr(
+            server.runtime.config, "token_queue_timeout", timeout_s * 10
+        )
 
         _, token_iter = gen.generate("hello")
 
@@ -5582,6 +5638,7 @@ class TestResponseGenerator:
         gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
         gen.top_logprobs_k = 0
         gen.apc_manager = None
+        gen.prefill_step_size = 3072
         gen.tokenizer = SimpleNamespace()
         gen.requests = Queue()
         gen._stop = False
@@ -5640,6 +5697,7 @@ class TestResponseGenerator:
         assert kwargs["draft_block_size"] == 6
         assert kwargs["greedy_sampling"] is True
         assert kwargs["compute_logprobs"] is False
+        assert kwargs["prefill_step_size"] == 3072
         assert batch_state["instance"].next_active_sizes == [2]
 
     def test_run_coalesces_idle_mtp_batch_generator(self, monkeypatch):
@@ -6052,6 +6110,42 @@ class TestResponseGenerator:
         )
 
         assert processors == [structured_processor]
+
+    def test_server_generation_delays_structured_processors_for_self_opening_model(
+        self, monkeypatch
+    ):
+        """Regression test for issue #1911."""
+
+        class SimpleTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return {"<think>": [10], "</think>": [20]}[text]
+
+        repetition_processor = lambda tokens, logits: logits
+        structured_processor = lambda tokens, logits: logits
+
+        monkeypatch.setattr(
+            server_generation,
+            "make_logits_processors",
+            lambda *_args: [repetition_processor],
+        )
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.tokenizer = SimpleTokenizer()
+        args = server.GenerationArguments(
+            enable_thinking=True,
+            thinking_start_token="<think>",
+            thinking_end_token="</think>",
+            logits_processors=[structured_processor],
+        )
+
+        processors = gen._make_logits_processors(
+            args,
+            mx.array([[1, 2, 3]], dtype=mx.int32),
+        )
+
+        assert processors[0] is repetition_processor
+        assert isinstance(processors[1], server_generation.ThinkingAwareLogitsProcessor)
+        assert processors[1].processor is structured_processor
 
     def test_build_gen_args_from_openai_request(self):
         req = SimpleNamespace(
@@ -7234,6 +7328,263 @@ class TestCountThinkingTagTokens:
         assert server._count_thinking_tag_tokens("plain text") == 0
 
 
+class TestRuntimeConfig:
+    def test_from_env_seeds_defaults(self, monkeypatch):
+        monkeypatch.setenv("KV_QUANT_SCHEME", "group")
+        monkeypatch.setenv("KV_BITS", "6")
+        monkeypatch.setenv("APC_ENABLED", "1")
+        monkeypatch.setenv("MLX_VLM_VISION_CACHE_SIZE", "33")
+        cfg = RuntimeConfig.from_env()
+        assert cfg.kv_quant_scheme == "group"
+        assert cfg.kv_bits == 6.0
+        assert cfg.apc_enabled is True
+        assert cfg.vision_cache_size == 33
+
+    def test_fingerprint_stable_and_scoped(self):
+        cfg = RuntimeConfig.from_env()
+        fp = cfg.fingerprint()
+        assert fp == cfg.fingerprint()  # stable across calls
+
+        cfg2 = RuntimeConfig.from_env()
+        assert cfg2.fingerprint() == fp
+
+        # toggling a dead APC knob while APC is off must not invalidate
+        cfg2.apc_block_size = 64
+        assert cfg2.fingerprint() == fp
+
+        # toggling an effective knob must invalidate
+        cfg2.vision_cache_size = 40
+        assert cfg2.fingerprint() != fp
+
+    def test_apply_changes_validates_and_coerces(self):
+        cfg = RuntimeConfig.from_env()
+        applied, rejected = cfg.apply_changes(
+            {
+                "kv_bits": "8",  # str -> float coercion
+                "apc_enabled": "true",
+                "vision_cache_size": "50",
+                "not_a_knob": 1,
+            }
+        )
+        assert applied == {
+            "kv_bits": 8.0,
+            "apc_enabled": True,
+            "vision_cache_size": 50,
+        }
+        assert rejected == [{"name": "not_a_knob", "reason": "unknown knob"}]
+        assert cfg.kv_bits == 8.0
+        assert cfg.apc_enabled is True
+        assert cfg.vision_cache_size == 50
+
+    def test_apply_changes_rejects_bad_values(self):
+        cfg = RuntimeConfig.from_env()
+        applied, rejected = cfg.apply_changes({"kv_bits": "not-a-number"})
+        assert applied == {}
+        assert len(rejected) == 1
+        assert rejected[0]["name"] == "kv_bits"
+        assert cfg.kv_bits is None  # unchanged
+
+    def test_reload_kinds_scoped(self):
+        cfg = RuntimeConfig.from_env()
+        applied, _ = cfg.apply_changes({"kv_quant_scheme": "turboquant"})
+        assert cfg.reload_kinds(applied) == {"text_generation"}
+        applied, _ = cfg.apply_changes({"vision_cache_size": 10})
+        assert cfg.reload_kinds(applied) == {"image_generation", "image_edit"}
+
+    def test_reload_kinds_excludes_live_knobs(self):
+        cfg = RuntimeConfig.from_env()
+        before = cfg.fingerprint()
+        applied, _ = cfg.apply_changes(
+            {"max_kv_size": 4096, "token_queue_timeout": 30.0}
+        )
+        assert applied == {"max_kv_size": 4096, "token_queue_timeout": 30.0}
+        assert cfg.reload_kinds(applied) == set()
+        assert cfg.fingerprint() == before
+
+    def test_reload_kinds_excludes_apc_knobs_while_disabled(self):
+        cfg = RuntimeConfig.from_env()
+        cfg.apply_changes({"apc_enabled": False})
+        before = cfg.fingerprint()
+
+        applied, _ = cfg.apply_changes({"apc_block_size": 32})
+        assert applied == {"apc_block_size": 32}
+        assert cfg.reload_kinds(applied) == set()
+        assert cfg.fingerprint() == before
+
+        applied, _ = cfg.apply_changes({"apc_enabled": True, "apc_block_size": 64})
+        assert cfg.reload_kinds(applied) == {"text_generation"}
+        assert cfg.fingerprint() != before
+
+    def test_settings_endpoints_get_and_patch(self, client, monkeypatch):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        cfg = server.runtime.config
+
+        r = client.get("/v1/settings")
+        assert r.status_code == 200
+        body = r.json()
+        assert set(body) == {"schema", "current", "fingerprint"}
+        names = {k["name"] for k in body["schema"]}
+        assert "kv_bits" in names and "apc_enabled" in names
+        assert body["current"]["kv_quant_scheme"] == cfg.kv_quant_scheme
+
+        before = cfg.fingerprint()
+        r = client.patch("/v1/settings", json={"kv_quant_scheme": "turboquant"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["applied"] == {"kv_quant_scheme": "turboquant"}
+        assert body["rejected"] == []
+        assert body["reload_kinds"] == ["text_generation"]
+        assert body["current"]["kv_quant_scheme"] == "turboquant"
+        assert body["fingerprint"] != before
+
+        r = client.get("/v1/settings")
+        assert r.json()["current"]["kv_quant_scheme"] == "turboquant"
+
+        # unknown knobs are never applied
+        r = client.patch("/v1/settings", json={"bogus": 1})
+        assert r.status_code == 200
+        assert r.json()["applied"] == {}
+        assert r.json()["rejected"] == [{"name": "bogus", "reason": "unknown knob"}]
+
+    def test_settings_patch_requires_json_object(self, client, monkeypatch):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        r = client.patch("/v1/settings", json=[1, 2, 3])
+        assert r.status_code == 400
+
+
+class TestRuntimeConfigAdditions:
+    def test_schema_includes_live_and_reloadable_knobs(self):
+        cfg = RuntimeConfig.from_env()
+        spec = {k["name"]: k for k in cfg.schema()}
+        for name in (
+            "max_kv_size",
+            "token_queue_timeout",
+            "spec_draft_model",
+            "spec_draft_kind",
+        ):
+            assert name in spec
+            assert spec[name]["reload_kinds"] == ["text_generation"]
+
+    def test_token_queue_timeout_is_live(self, client, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", raising=False)
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        cfg = server.runtime.config
+        fingerprint = cfg.fingerprint()
+
+        response = client.patch("/v1/settings", json={"token_queue_timeout": 1200})
+
+        assert response.status_code == 200
+        assert response.json()["applied"] == {"token_queue_timeout": 1200.0}
+        assert server.get_token_queue_timeout() == 1200.0
+        assert cfg.fingerprint() == fingerprint
+
+        response = client.patch("/v1/settings", json={"token_queue_timeout": 0})
+
+        assert response.json()["applied"] == {"token_queue_timeout": None}
+        assert server.get_token_queue_timeout() is None
+
+    def test_max_kv_size_is_live_context_limit(self, monkeypatch):
+        import mlx_vlm.server.generation as server_generation
+
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 4096)
+        assert server_generation.get_configured_context_limit() == 4096
+
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", None)
+        monkeypatch.delenv("MAX_KV_SIZE", raising=False)
+        assert server_generation.get_configured_context_limit() is None
+
+    def test_spec_draft_knob_reaches_generator(self, monkeypatch):
+        class FakeResponseGenerator:
+            last_kwargs = {}
+
+            def __init__(self, *args, **kwargs):
+                FakeResponseGenerator.last_kwargs = kwargs
+                self.model = SimpleNamespace()
+                self.processor = SimpleNamespace()
+                self.config = SimpleNamespace(model_type="qwen2_vl")
+
+            def wait_until_ready(self):
+                return self.model, self.processor, self.config
+
+            def stop_and_join(self):
+                pass
+
+        monkeypatch.setattr(
+            server._app_module, "ResponseGenerator", FakeResponseGenerator
+        )
+        monkeypatch.setattr(server._app_module._apc, "from_env", lambda *_, **__: None)
+        monkeypatch.setattr(server.runtime, "model_cache", {})
+        monkeypatch.setattr(server.runtime, "response_generator", None)
+        monkeypatch.setattr(server.runtime, "apc_manager", None)
+        monkeypatch.setattr(server.runtime.config, "spec_draft_model", "draft-x")
+        monkeypatch.setattr(server.runtime.config, "spec_draft_kind", "auto")
+
+        server.get_cached_model("demo-model")
+        assert FakeResponseGenerator.last_kwargs["draft_model_path"] == "draft-x"
+        assert FakeResponseGenerator.last_kwargs["draft_kind"] == "auto"
+
+    def test_settings_patch_replace_semantics(self, client, monkeypatch):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        cfg = server.runtime.config
+        assert cfg.apc_enabled is False
+
+        client.patch(
+            "/v1/settings",
+            json={"kv_quant_scheme": "turboquant", "apc_enabled": True},
+        )
+        assert cfg.kv_quant_scheme == "turboquant"
+        assert cfg.apc_enabled is True
+
+        r = client.patch(
+            "/v1/settings",
+            json={"op": "replace", "values": {"kv_quant_scheme": "uniform"}},
+        )
+        body = r.json()
+        assert body["op"] == "replace"
+        assert cfg.kv_quant_scheme == "uniform"
+        assert cfg.apc_enabled is False
+
+        r = client.patch("/v1/settings", json={"op": "bogus", "values": {}})
+        assert r.status_code == 400
+
+        r = client.patch("/v1/settings", json={"op": "replace", "values": "x"})
+        assert r.status_code == 400
+
+
+def test_runtime_config_fingerprint_is_kind_scoped():
+    cfg = RuntimeConfig.from_env()
+    text_fp = cfg.fingerprint(kinds={"text_generation"})
+    vision_fp = cfg.fingerprint(kinds={"image_generation"})
+
+    cfg.apply_changes({"kv_quant_scheme": "turboquant"})
+    assert cfg.fingerprint(kinds={"text_generation"}) != text_fp
+    assert cfg.fingerprint(kinds={"image_generation"}) == vision_fp
+
+    cfg.apply_changes({"vision_cache_size": 64})
+    assert cfg.fingerprint(kinds={"image_generation"}) != vision_fp
+    assert cfg.fingerprint(kinds={"text_generation"}) != text_fp
+
+
+def test_runtime_config_live_knob_not_in_fingerprint():
+    cfg = RuntimeConfig.from_env()
+    fp = cfg.fingerprint()
+    cfg.apply_changes({"max_kv_size": 8192})
+    assert cfg.fingerprint() == fp
+
+
+def test_runtime_config_enum_knobs_reject_invalid():
+    cfg = RuntimeConfig.from_env()
+    applied, rejected = cfg.apply_changes({"kv_quant_scheme": "bogus"})
+    assert applied == {}
+    assert rejected[0]["name"] == "kv_quant_scheme"
+    assert "bogus" in rejected[0]["reason"]
+    assert cfg.kv_quant_scheme == "uniform"
+
+    applied, rejected = cfg.apply_changes({"kv_quant_scheme": "turboquant"})
+    assert applied == {"kv_quant_scheme": "turboquant"}
+    assert rejected == []
+
+
 class TestReranking:
     def test_requires_model(self, client, monkeypatch):
         monkeypatch.delenv("MLX_VLM_PRELOAD_RERANKER_MODEL", raising=False)
@@ -7461,6 +7812,107 @@ class TestReranking:
         assert tokens == 5
         assert batches == [["0", "1"], ["2", "3"], ["4"]]
 
+    def test_generative_reranker_uses_default_instruction(self, monkeypatch):
+        instructions = []
+
+        def fake_score_batch(model, processor, query, documents, instruction):
+            del model, processor, query
+            instructions.append(instruction)
+            return [0.5] * len(documents), len(documents)
+
+        monkeypatch.setattr(server_reranking, "_score_text_batch", fake_score_batch)
+
+        server_reranking.score_documents(
+            object(),
+            object(),
+            SimpleNamespace(model_type="qwen3"),
+            server_reranking.RerankItem(text="query"),
+            [server_reranking.RerankItem(text="document")],
+            None,
+        )
+
+        assert instructions == [server_reranking.DEFAULT_INSTRUCTION]
+
+    def test_sequence_classifier_scores_tokenized_pairs(self):
+        calls = []
+
+        class Tokenizer:
+            model_max_length = 6
+
+            def __call__(self, queries, documents, **kwargs):
+                calls.append((queries, documents, kwargs))
+                return {
+                    "input_ids": np.array([[1, 2, 3, 0], [1, 4, 5, 6]]),
+                    "attention_mask": np.array([[1, 1, 1, 0], [1, 1, 1, 1]]),
+                    "token_type_ids": np.array([[0, 0, 1, 0], [0, 0, 1, 1]]),
+                }
+
+        class Model:
+            def __call__(self, **inputs):
+                assert set(inputs) == {
+                    "input_ids",
+                    "attention_mask",
+                    "token_type_ids",
+                }
+                return SimpleNamespace(logits=mx.array([[-2.0], [2.0]]))
+
+        scores, tokens = server_reranking.score_documents(
+            Model(),
+            Tokenizer(),
+            SimpleNamespace(model_type="bert", max_position_embeddings=4),
+            server_reranking.RerankItem(text="query"),
+            [
+                server_reranking.RerankItem(text="first"),
+                server_reranking.RerankItem(text="second"),
+            ],
+            None,
+        )
+
+        assert scores == pytest.approx([1 / (1 + math.exp(2)), 1 / (1 + math.exp(-2))])
+        assert tokens == 7
+        assert calls == [
+            (
+                ["query", "query"],
+                ["first", "second"],
+                {
+                    "padding": True,
+                    "truncation": True,
+                    "max_length": 4,
+                    "return_tensors": "np",
+                },
+            )
+        ]
+
+    @pytest.mark.parametrize(
+        "query,documents,instruction,error",
+        [
+            (
+                server_reranking.RerankItem(image="query.png"),
+                [server_reranking.RerankItem(text="document")],
+                None,
+                "do not support image or video",
+            ),
+            (
+                server_reranking.RerankItem(text="query"),
+                [server_reranking.RerankItem(text="document")],
+                "rank legal documents",
+                "do not support custom instructions",
+            ),
+        ],
+    )
+    def test_sequence_classifier_rejects_unsupported_inputs(
+        self, query, documents, instruction, error
+    ):
+        with pytest.raises(ValueError, match=error):
+            server_reranking.score_documents(
+                object(),
+                object(),
+                SimpleNamespace(model_type="modernbert"),
+                query,
+                documents,
+                instruction,
+            )
+
     def test_attention_mask_combines_padding_and_causality(self):
         mask = server_reranking._attention_mask(mx.array([[0, 1, 1], [1, 1, 0]]))
 
@@ -7536,7 +7988,9 @@ class TestReranking:
         monkeypatch.setattr(server.runtime, "model_cache", registry)
         model = SimpleNamespace(config=SimpleNamespace(model_type="qwen3"))
         processor = object()
-        monkeypatch.setattr(vlm_utils, "load", lambda path: (model, processor))
+        monkeypatch.setattr(
+            reranker_loader, "load_reranker", lambda path: (model, processor)
+        )
         monkeypatch.setattr(
             server._app_module, "ensure_reranker_chat_template", lambda *args: None
         )
@@ -7549,12 +8003,15 @@ class TestReranking:
             "reranker",
             None,
             "reranker",
+            server.runtime.config.fingerprint(kinds={"reranker"}),
         )
 
     def test_loader_rejects_unsupported_family(self, monkeypatch):
         monkeypatch.setattr(server.runtime, "model_cache", server.ModelCacheRegistry())
-        model = SimpleNamespace(config=SimpleNamespace(model_type="bert"))
-        monkeypatch.setattr(vlm_utils, "load", lambda path: (model, object()))
+        model = SimpleNamespace(config=SimpleNamespace(model_type="deberta_v2"))
+        monkeypatch.setattr(
+            reranker_loader, "load_reranker", lambda path: (model, object())
+        )
 
         with pytest.raises(
             server.HTTPException, match="Unsupported reranker model type"
@@ -7562,3 +8019,20 @@ class TestReranking:
             server.get_cached_model("reranker", None, model_kind="reranker")
 
         assert exc.value.status_code == 400
+
+    def test_loader_skips_chat_template_for_sequence_classifier(self, monkeypatch):
+        monkeypatch.setattr(server.runtime, "model_cache", server.ModelCacheRegistry())
+        model = SimpleNamespace(config=SimpleNamespace(model_type="bert"))
+        processor = object()
+        monkeypatch.setattr(
+            reranker_loader, "load_reranker", lambda path: (model, processor)
+        )
+        monkeypatch.setattr(
+            server._app_module,
+            "ensure_reranker_chat_template",
+            lambda *args: pytest.fail("sequence classifiers do not use chat templates"),
+        )
+
+        loaded = server.get_cached_model("reranker", None, model_kind="reranker")
+
+        assert loaded == (model, processor, model.config)
