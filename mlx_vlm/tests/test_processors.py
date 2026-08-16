@@ -1108,6 +1108,83 @@ class TestSmolVLMProcessor(_ProcessorTestBase, unittest.TestCase):
     def _image_call_args(self):
         return {"text": ["<image> Describe"], "images": [[_make_image()]]}
 
+    def test_split_image_prompt_matches_flattened_feature_rows(self):
+        from mlx_vlm.models.smolvlm.processing_smolvlm import get_image_prompt_string
+
+        image_seq_len = 81
+        single = get_image_prompt_string(0, 0, image_seq_len, "<F>", "<image>", "<G>")
+        split = get_image_prompt_string(3, 4, image_seq_len, "<F>", "<image>", "<G>")
+
+        self.assertEqual(single.count("<image>"), image_seq_len)
+        self.assertEqual(split.count("<image>"), 13 * image_seq_len)
+        self.assertIn("<row_1_col_1>", split)
+        self.assertIn("<row_3_col_4>", split)
+
+    def test_split_image_requests_row_col_info_and_expands_tokens(self):
+        """SmolVLM2-2.2B (#1919): 3x4 tiles + global, image_seq_len=81.
+
+        The vision encoder emits 13 x 81 feature rows. Without
+        return_row_col_info the prompt stays on the single-image template
+        (81 <image> tokens) and Idefics3 scatter raises
+        tokens: 81, features 1053.
+        """
+        from mlx_vlm.models.smolvlm.processing_smolvlm import SmolVLMProcessor
+
+        image_seq_len = 81
+        rows, cols = 3, 4
+        n_tiles = rows * cols + 1
+        seen = {}
+        recorded = {}
+
+        class RecordingTokenizer:
+            model_input_names = ["input_ids", "attention_mask"]
+
+            def __call__(self, text, **kw):
+                recorded["text"] = text
+                texts = [text] if isinstance(text, str) else text
+                return {
+                    "input_ids": [list(range(10)) for _ in texts],
+                    "attention_mask": [[1] * 10 for _ in texts],
+                }
+
+        class SplittingImageProcessor:
+            model_input_names = ["pixel_values"]
+
+            def fetch_images(self, images):
+                return [images] if not isinstance(images, list) else images
+
+            def __call__(self, images=None, **kw):
+                seen.update(kw)
+                out = {
+                    "pixel_values": np.random.randn(1, n_tiles, 3, 32, 32).astype(
+                        np.float32
+                    )
+                }
+                if kw.get("return_row_col_info"):
+                    out["rows"] = [[rows]]
+                    out["cols"] = [[cols]]
+                return out
+
+        p = SmolVLMProcessor.__new__(SmolVLMProcessor)
+        p.fake_image_token = "<fake_token_around_image>"
+        p.image_token = "<image>"
+        p.image_token_id = 100
+        p.end_of_utterance_token = "<end_of_utterance>"
+        p.global_image_token = "<global-img>"
+        p.image_seq_len = image_seq_len
+        p.video_token = "<video>"
+        p.image_processor = SplittingImageProcessor()
+        p.tokenizer = RecordingTokenizer()
+
+        p(text=["<image> Describe"], images=[[_make_image()]])
+
+        self.assertTrue(seen.get("return_row_col_info"))
+        expanded = recorded["text"][0]
+        self.assertEqual(expanded.count("<image>"), n_tiles * image_seq_len)
+        self.assertIn("<row_1_col_1>", expanded)
+        self.assertIn("<row_3_col_4>", expanded)
+        self.assertIn("<global-img>", expanded)
+
 
 class TestMllamaProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
