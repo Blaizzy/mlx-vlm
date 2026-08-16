@@ -1,5 +1,6 @@
 import glob
 import importlib
+import importlib.util
 import inspect
 import json
 import logging
@@ -755,7 +756,24 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(_load_safetensors(wf))
 
-    model_class, _ = get_model_and_args(config=config)
+    if (model_file := config.get("model_file")) is not None:
+        # Load the model module from inside the checkpoint (same mechanism as
+        # mlx_lm): config.json names a Python file shipped with the weights,
+        # letting a stock install read checkpoints that need a custom model
+        # class (e.g. novel quantization formats).
+        model_file_path = model_path / model_file
+        if not model_file_path.is_file():
+            raise FileNotFoundError(
+                f"config.json declares model_file={model_file!r} but "
+                f"{model_file_path} does not exist"
+            )
+        spec = importlib.util.spec_from_file_location(
+            "custom_model", model_file_path
+        )
+        model_class = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(model_class)
+    else:
+        model_class, _ = get_model_and_args(config=config)
     text_only_config = _is_text_only_config(config)
 
     # Initialize text and vision configs if not present
