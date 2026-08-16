@@ -15,10 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from mlx_vlm.generate.ar import (
-    PromptProcessingBatch,
-    _get_apc_exact_max_prompt_tokens,
-)
+from mlx_vlm.generate.ar import PromptProcessingBatch, _get_apc_exact_max_prompt_tokens
 
 
 class _RecordingManager:
