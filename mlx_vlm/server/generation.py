@@ -51,7 +51,6 @@ from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
 
-DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
 DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
 DEFAULT_LOG_PROGRESS_INTERVAL = 10
 DEFAULT_ENABLE_THINKING = False
@@ -98,21 +97,7 @@ def get_server_max_tokens():
 
 
 def get_token_queue_timeout():
-    raw_timeout = os.environ.get("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "")
-    if raw_timeout == "":
-        return DEFAULT_TOKEN_QUEUE_TIMEOUT
-    try:
-        timeout = float(raw_timeout)
-    except ValueError:
-        logger.warning(
-            "Invalid MLX_VLM_TOKEN_QUEUE_TIMEOUT=%r; falling back to %ss.",
-            raw_timeout,
-            DEFAULT_TOKEN_QUEUE_TIMEOUT,
-        )
-        return DEFAULT_TOKEN_QUEUE_TIMEOUT
-    if timeout <= 0:
-        return None
-    return timeout
+    return runtime.config.token_queue_timeout
 
 
 def get_speculative_batch_coalesce_s():
@@ -371,6 +356,8 @@ def get_max_kv_size(model: str):
 
 
 def get_configured_context_limit():
+    if runtime.config.max_kv_size is not None:
+        return runtime.config.max_kv_size or None
     max_kv_tokens = int(os.environ.get("MAX_KV_SIZE", 0))
     return max_kv_tokens or None
 
@@ -1085,6 +1072,8 @@ class ResponseGenerator:
         quantized_kv_start=DEFAULT_QUANTIZED_KV_START,
         top_logprobs_k=0,
         apc_manager: Optional["_apc.APCManager"] = None,
+        draft_model_path: Optional[str] = None,
+        draft_kind: Optional[str] = None,
         prefill_step_size: Optional[int] = None,
     ):
         self.model_path = model_path
@@ -1094,6 +1083,8 @@ class ResponseGenerator:
         self.config = None
         self.stop_tokens = set()
         self.vision_cache = vision_cache
+        self.draft_model_path = draft_model_path
+        self.draft_kind_override = draft_kind
         self.draft_model = None
         self.kv_bits = kv_bits
         self.kv_key_bits = kv_key_bits
@@ -1130,10 +1121,15 @@ class ResponseGenerator:
             else int(prefill_step_size)
         )
 
-    def stop_and_join(self):
+    def stop_and_join(self, timeout: float = 10.0):
         self._stop = True
         self.requests.put(None)
-        self._thread.join(timeout=5.0)
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            logger.info(
+                "Generation thread still draining in-flight requests; "
+                "letting it finish in the background."
+            )
 
     def wait_until_ready(self, timeout: Optional[float] = None):
         if not self._ready.wait(timeout):
@@ -1164,8 +1160,10 @@ class ResponseGenerator:
                 stop_tokens.add(config.eos_token_id)
 
         draft_model = None
-        draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND")
-        draft_model_path = os.environ.get("MLX_VLM_DRAFT_MODEL")
+        draft_kind = self.draft_kind_override or os.environ.get("MLX_VLM_DRAFT_KIND")
+        draft_model_path = self.draft_model_path or os.environ.get(
+            "MLX_VLM_DRAFT_MODEL"
+        )
         if draft_model_path:
             from ..speculative.drafters import (
                 load_drafter,
@@ -1756,7 +1754,7 @@ class ResponseGenerator:
         active: dict = {}
         max_num_seqs = get_max_num_seqs()
 
-        while not self._stop:
+        while not (self._stop and not active and self.requests.empty()):
             new_items = []
             try:
                 # Poll the request queue — non-blocking when generating, short
@@ -1779,7 +1777,7 @@ class ResponseGenerator:
                     capacity=capacity,
                     coalesce_s=coalesce_s,
                 )
-                if should_stop:
+                if should_stop and not active:
                     break
 
                 # Drop abandoned requests before doing more work.
