@@ -15,8 +15,7 @@ import pytest
 
 from mlx_vlm.utils import load_model
 
-MODEL_PY = textwrap.dedent(
-    '''
+MODEL_PY = textwrap.dedent("""
     import mlx.core as mx
     import mlx.nn as nn
 
@@ -44,8 +43,7 @@ MODEL_PY = textwrap.dedent(
 
         def __call__(self, x):
             return self.proj(x)
-    '''
-)
+    """)
 
 
 def _write_checkpoint(path, config_extra=None):

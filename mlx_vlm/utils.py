@@ -599,9 +599,7 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
                 f"config.json declares model_file={model_file!r} but "
                 f"{model_file_path} does not exist"
             )
-        spec = importlib.util.spec_from_file_location(
-            "custom_model", model_file_path
-        )
+        spec = importlib.util.spec_from_file_location("custom_model", model_file_path)
         arch = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(arch)
         return arch, "custom"
