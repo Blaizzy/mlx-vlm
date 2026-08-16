@@ -302,9 +302,7 @@ def process_tool_calls(model_output: str, tool_module, tools):
         # Optional turn header immediately before the block: the full form
         # "<|start|>assistant to=<name><|message|>" or the bare
         # "to=<name><|message|>".
-        header = (
-            r"(?:(?:<\|start\|>assistant )?to=[A-Za-z0-9_.-]+<\|message\|>)?"
-        )
+        header = r"(?:(?:<\|start\|>assistant )?to=[A-Za-z0-9_.-]+<\|message\|>)?"
         if end_marker == "":
             pattern = re.compile(f"{header}{re.escape(anchor)}.*?(?:\n|$)", re.DOTALL)
         else:
@@ -386,9 +384,7 @@ def process_tool_calls(model_output: str, tool_module, tools):
                 " ",
                 remaining,
             )
-            remaining = re.sub(
-                r"\s*<\|(?:eom|eot)\|>\s*", " ", remaining
-            ).strip()
+            remaining = re.sub(r"\s*<\|(?:eom|eot)\|>\s*", " ", remaining).strip()
     return dict(calls=called_tools, remaining_text=remaining)
 
 
@@ -449,7 +445,7 @@ def _strip_glimmer_leading_markers(text: str) -> str:
     ):
         for length in range(min(len(marker), len(t)), 0, -1):
             if t.endswith(marker[:length]):
-                t = t[: -length]
+                t = t[:-length]
                 break
     return t
 

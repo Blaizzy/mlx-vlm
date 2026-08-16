@@ -10,8 +10,6 @@ every regression found across review rounds:
 - multi-chunk plain prose must not be glued
 """
 
-import pytest
-
 from mlx_vlm.server.glimmer_stream import MuseGlimmerStreamState
 
 
@@ -59,6 +57,7 @@ def _stream(text, size=1, state=None):
 
 # --- thinking + answer ---------------------------------------------------
 
+
 def test_answer_header_stripped():
     r, c = _stream("to=user<|message|>The result is 42.")
     assert r == ""
@@ -66,9 +65,7 @@ def test_answer_header_stripped():
 
 
 def test_thinking_then_answer():
-    r, c = _stream(
-        "to=self<|message|>plan<|eom|>to=user<|message|>blue"
-    )
+    r, c = _stream("to=self<|message|>plan<|eom|>to=user<|message|>blue")
     assert r == "plan"
     assert c == "blue"
 
@@ -93,6 +90,7 @@ def test_multiple_thinking_blocks():
 
 # --- tool calls ----------------------------------------------------------
 
+
 def test_tool_block_fully_suppressed():
     r, c = _stream("to=bash<|message|>" + TOOL_BLOCK + "to=user<|message|>done")
     assert "<atem" not in c
@@ -102,9 +100,7 @@ def test_tool_block_fully_suppressed():
 def test_tool_block_then_multichunk_answer():
     text = (
         "to=self<|message|>check<|eom|>"
-        "to=bash<|message|>"
-        + TOOL_BLOCK
-        + "to=user<|message|>The result is 42."
+        "to=bash<|message|>" + TOOL_BLOCK + "to=user<|message|>The result is 42."
     )
     r, c = _stream(text, size=7)
     assert r == "check"
@@ -130,6 +126,7 @@ def test_two_tool_blocks_then_answer():
 
 # --- quoted markers must survive -----------------------------------------
 
+
 def test_quoted_to_self_mid_answer():
     text = (
         "to=self<|message|>first<|eom|>"
@@ -148,14 +145,13 @@ def test_quoted_to_user_header_mid_answer():
 
 
 def test_quoted_tool_start_mid_answer():
-    text = (
-        "to=user<|message|>The doc says <atem:function_calls> is the tag. Done."
-    )
+    text = "to=user<|message|>The doc says <atem:function_calls> is the tag. Done."
     r, c = _stream(text, size=6)
     assert "The doc says <atem:function_calls> is the tag. Done." in c
 
 
 # --- chunk-boundary splits ------------------------------------------------
+
 
 def test_split_header_across_chunks():
     text = "to=user<|message|>hello world"
@@ -174,11 +170,7 @@ def test_split_to_self_quoted_across_chunks():
 
 
 def test_split_end_marker_no_tail_leak():
-    text = (
-        "to=bash<|message|>"
-        + TOOL_BLOCK
-        + "to=user<|message|>final answer"
-    )
+    text = "to=bash<|message|>" + TOOL_BLOCK + "to=user<|message|>final answer"
     r, c = _stream(text, size=5)
     assert "final answer" in c
     # No partial "</atem:function_calls>" tail may survive.
@@ -188,17 +180,14 @@ def test_split_end_marker_no_tail_leak():
 
 
 def test_split_tool_start_handled():
-    text = (
-        "to=bash<|message|>"
-        + TOOL_BLOCK
-        + "to=user<|message|>answer"
-    )
+    text = "to=bash<|message|>" + TOOL_BLOCK + "to=user<|message|>answer"
     r, c = _stream(text, size=4)
     assert "answer" in c
     assert "<atem" not in c
 
 
 # --- prose integrity -------------------------------------------------------
+
 
 def test_multichunk_prose_not_glued():
     text = "to=user<|message|>The color is blue and it looks nice."
@@ -226,6 +215,7 @@ def test_last_flag_flushes_held_text():
 
 # --- regression tests from round-4 review ---------------------------------
 
+
 def test_delta_has_thinking_closed_field():
     """Anthropic endpoint reads thinking_closed on every delta."""
     state = MuseGlimmerStreamState()
@@ -240,9 +230,7 @@ def test_eom_then_tool_block_header_stripped():
     tool block must be recognized (not leak into content)."""
     text = (
         "to=user<|message|>answer one<|eom|>"
-        "to=bash<|message|>"
-        + TOOL_BLOCK
-        + "to=user<|message|>done"
+        "to=bash<|message|>" + TOOL_BLOCK + "to=user<|message|>done"
     )
     r, c = _stream(text, size=7)
     assert "answer one" in c
@@ -260,11 +248,7 @@ def test_eom_then_user_header():
 
 
 def test_newline_after_tool_end_header_stripped():
-    text = (
-        "to=bash<|message|>"
-        + TOOL_BLOCK
-        + "\nto=user<|message|>done"
-    )
+    text = "to=bash<|message|>" + TOOL_BLOCK + "\nto=user<|message|>done"
     r, c = _stream(text, size=7)
     assert "done" in c
     assert "to=user" not in c
@@ -289,9 +273,7 @@ def test_response_output_items_from_text_glimmer():
 
     full_text = (
         "to=self<|message|>check<|eom|>"
-        "to=bash<|message|>"
-        + TOOL_BLOCK
-        + "to=user<|message|>The result is 42."
+        "to=bash<|message|>" + TOOL_BLOCK + "to=user<|message|>The result is 42."
     )
     items, clean_text, reasoning, finish = _response_output_items_from_text(
         full_text,
@@ -337,6 +319,7 @@ def test_process_tool_calls_quoted_to_self_in_answer_survives():
 
 # --- round-5 regression tests ---------------------------------------------
 
+
 def test_full_form_header_stripped():
     """<|start|>assistant to=<name><|message|> (the template's full form)
     must be stripped in the stream, not leaked."""
@@ -373,7 +356,7 @@ def test_eom_then_header_exact():
 
 
 def test_eom_then_plain_to_word_not_routing():
-    """"answer one<|eom|>to the store" — "to " (no =) is not routing."""
+    """ "answer one<|eom|>to the store" — "to " (no =) is not routing."""
     text = "to=user<|message|>answer one<|eom|>to the store"
     r, c = _stream(text, size=3)
     assert c == "answer one to the store"
@@ -411,6 +394,7 @@ def test_multi_thinking_blocks_single_newline():
 
 # --- round-6 regression tests ---------------------------------------------
 
+
 def test_whitespace_then_marker_after_eom():
     """Whitespace arriving before a routing marker must not flip the segment
     flag (newline token before to=self re-open)."""
@@ -426,11 +410,7 @@ def test_whitespace_then_marker_after_eom():
 
 
 def test_whitespace_then_header_after_tool_end():
-    text = (
-        "to=bash<|message|>"
-        + TOOL_BLOCK
-        + "\nto=user<|message|>done"
-    )
+    text = "to=bash<|message|>" + TOOL_BLOCK + "\nto=user<|message|>done"
     r, c = _stream(text, size=1)
     assert "done" in c
     assert "to=user" not in c
@@ -484,6 +464,7 @@ def test_flush_strips_partial_eom():
 
 # --- round-7 regression tests ---------------------------------------------
 
+
 def test_full_form_header_size1():
     """The full-form header must not leak at size-1 chunking (feed boundary
     after the "<|start|>assistant " prefix)."""
@@ -514,9 +495,7 @@ def test_post_tool_eom_header_final_parse():
 
     out = (
         "to=self<|message|>check<|eom|>"
-        "to=bash<|message|>"
-        + TOOL_BLOCK
-        + "to=user<|message|>answer one<|eom|>"
+        "to=bash<|message|>" + TOOL_BLOCK + "to=user<|message|>answer one<|eom|>"
         "to=user<|message|>answer two"
     )
     tc = process_tool_calls(out, atem, TOOLS)

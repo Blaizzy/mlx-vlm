@@ -101,9 +101,7 @@ class MuseGlimmerStreamState:
                 idx = self.buffer.find(_GLIMMER_TOOL_END)
                 if idx < 0:
                     # Hold partial end-marker tails so they never leak.
-                    hold = self._partial_marker_len(
-                        self.buffer, (_GLIMMER_TOOL_END,)
-                    )
+                    hold = self._partial_marker_len(self.buffer, (_GLIMMER_TOOL_END,))
                     if hold:
                         break
                     # Tool body without any end marker: suppress, drop.
@@ -111,9 +109,7 @@ class MuseGlimmerStreamState:
                     break
                 # Position-aware: consume through the end marker; anything
                 # after it (in this chunk) is the next segment start.
-                self.buffer = self.buffer[
-                    idx + len(_GLIMMER_TOOL_END) :
-                ].lstrip("\n")
+                self.buffer = self.buffer[idx + len(_GLIMMER_TOOL_END) :].lstrip("\n")
                 self.state = "normal"
                 self.segment_started = True
                 continue
@@ -142,9 +138,7 @@ class MuseGlimmerStreamState:
 
             # "to=self<|message|>" opens thinking — check before the generic
             # header strip (which would otherwise consume it as a header).
-            if self.segment_started and self.buffer.startswith(
-                _GLIMMER_SELF_OPEN
-            ):
+            if self.segment_started and self.buffer.startswith(_GLIMMER_SELF_OPEN):
                 if self._reasoning_emitted:
                     # Consecutive thinking block: separate from the previous.
                     self._pending_reasoning_sep = True
@@ -272,9 +266,7 @@ class MuseGlimmerStreamState:
                 # the following text starts a fresh segment. Avoid doubling
                 # the space when the preceding emitted text already ends in
                 # whitespace.
-                self.buffer = re.sub(
-                    r"^\s*<\|eom\|>\s*", " ", self.buffer, count=1
-                )
+                self.buffer = re.sub(r"^\s*<\|eom\|>\s*", " ", self.buffer, count=1)
                 prev_ws = self._last_content_end.isspace()
                 if self.buffer.startswith(" ") and not prev_ws:
                     content.append(" ")
@@ -285,9 +277,7 @@ class MuseGlimmerStreamState:
             if kind == "eot":
                 # End-of-turn marker. Substitute a separator and treat the
                 # following text as a fresh segment (matches the final parse).
-                self.buffer = re.sub(
-                    r"^\s*<\|eot\|>\s*", " ", self.buffer, count=1
-                )
+                self.buffer = re.sub(r"^\s*<\|eot\|>\s*", " ", self.buffer, count=1)
                 prev_ws = self._last_content_end.isspace()
                 if self.buffer.startswith(" ") and not prev_ws:
                     content.append(" ")
@@ -346,7 +336,7 @@ class MuseGlimmerStreamState:
         ):
             for length in range(min(len(marker), len(text)), 0, -1):
                 if text.endswith(marker[:length]):
-                    text = text[: -length]
+                    text = text[:-length]
                     break
         return text
 
@@ -408,7 +398,11 @@ class MuseGlimmerStreamState:
         rest = stripped[3:]
         # Name chars, then an optional partial "<|message|>".
         name_end = 0
-        while name_end < len(rest) and rest[name_end] in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-":
+        while (
+            name_end < len(rest)
+            and rest[name_end]
+            in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-"
+        ):
             name_end += 1
         after = rest[name_end:]
         if not after:

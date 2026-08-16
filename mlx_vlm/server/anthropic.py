@@ -22,7 +22,6 @@ from .generation import (
     _count_prompt_tokens,
 )
 from .glimmer_stream import make_glimmer_stream_state
-
 from .responses_state import (
     make_response_stream_state,
     process_tool_calls,

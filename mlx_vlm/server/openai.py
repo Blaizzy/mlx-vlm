@@ -31,6 +31,7 @@ from .generation import (
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
+from .glimmer_stream import make_glimmer_stream_state
 from .responses_state import (
     _normalize_response_input,
     _response_chain_items,
@@ -48,7 +49,6 @@ from .responses_state import (
     response_store_lock,
     suppress_tool_call_content,
 )
-from .glimmer_stream import make_glimmer_stream_state
 from .runtime import runtime
 from .schemas import (
     ChatChoice,
@@ -1840,11 +1840,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             # Suppress tool-call markup from content (the
                             # Glimmer state machine already handles it).
                             if glimmer_state is None:
-                                in_tool_call, delta_content = suppress_tool_call_content(
-                                    full_output,
-                                    in_tool_call,
-                                    tc_start,
-                                    delta_content,
+                                in_tool_call, delta_content = (
+                                    suppress_tool_call_content(
+                                        full_output,
+                                        in_tool_call,
+                                        tc_start,
+                                        delta_content,
+                                    )
                                 )
 
                             chunk_logprobs = None

@@ -43,6 +43,7 @@ def _atem_block(name, cmd):
 
 # --- _split_thinking ------------------------------------------------------
 
+
 def test_glimmer_reasoning_routed_to_reasoning():
     reasoning, content = _split_thinking(
         "to=self<|message|>The user wants a color. Blue is typical.<|eom|>"
@@ -107,11 +108,9 @@ def test_non_glimmer_answer_only_not_misrouted():
 
 # --- process_tool_calls ----------------------------------------------------
 
+
 def test_process_tool_calls_bare_block_with_header():
-    out = (
-        "to=bash<|message|>"
-        + _atem_block("bash", "echo hi")
-    )
+    out = "to=bash<|message|>" + _atem_block("bash", "echo hi")
     tc = process_tool_calls(out, atem, TOOLS)
     assert len(tc["calls"]) == 1
     assert tc["calls"][0]["function"]["name"] == "bash"
@@ -136,8 +135,7 @@ def test_process_tool_calls_multiple_blocks():
 def test_process_tool_calls_envelope_form():
     out = (
         "to=self<|message|>I need to run a command.<|eom|>"
-        "to=bash<|message|>"
-        + _atem_block("bash", "date")
+        "to=bash<|message|>" + _atem_block("bash", "date")
     )
     tc = process_tool_calls(out, atem, TOOLS)
     assert len(tc["calls"]) == 1
