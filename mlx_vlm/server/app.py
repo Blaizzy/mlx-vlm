@@ -15,10 +15,12 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
+from starlette.requests import HTTPConnection
 
 from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
+from ..reranker import RerankerKind, reranker_kind
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
 from ..version import __version__
@@ -43,6 +45,7 @@ from .generation import (
     get_top_logprobs_k,
 )
 from .openai import register_routes as register_openai_routes
+from .realtime import register_routes as register_realtime_routes
 from .reranking import ensure_chat_template as ensure_reranker_chat_template
 from .reranking import register_routes as register_reranking_routes
 from .responses_state import _split_thinking as _split_thinking_text
@@ -63,7 +66,7 @@ def _server_api_key() -> Optional[str]:
     return key if key else None
 
 
-def _require_management_api_key(request: Request) -> None:
+def _require_management_api_key(request: HTTPConnection) -> None:
     api_key = _server_api_key()
     if api_key is None:
         return
@@ -181,12 +184,15 @@ def _build_gen_args(
 def _read_tenant_id(http_request) -> Optional[str]:
     """Pull a per-tenant APC salt from the request headers.
 
-    Honoured headers (in order): ``X-APC-Tenant``, ``X-Tenant-Id``.
+    Honoured headers (in order): ``X-APC-Tenant``, ``X-Tenant-Id``. Falls back to
+    ``APC_DEFAULT_TENANT`` so a single-tenant deployment shares one cache without
+    every client sending a header.
     """
+    default = os.environ.get("APC_DEFAULT_TENANT") or None
     if http_request is None or not hasattr(http_request, "headers"):
-        return None
+        return default
     h = http_request.headers
-    return h.get("x-apc-tenant") or h.get("x-tenant-id") or None
+    return h.get("x-apc-tenant") or h.get("x-tenant-id") or default
 
 
 async def _preflight_stream_context_budget(
@@ -421,6 +427,9 @@ async def lifespan(app):
         if runtime.audio_queue is not None:
             runtime.audio_queue.stop_and_join()
             runtime.audio_queue = None
+        if runtime.realtime_engine is not None:
+            runtime.realtime_engine.stop_and_join()
+            runtime.realtime_engine = None
 
 
 app = FastAPI(
@@ -728,10 +737,10 @@ def get_cached_model(
                 detail="Adapters are not supported for reranker models.",
             )
         logger.info("Loading reranker model: %s", model_path)
-        from ..utils import load
+        from ..reranker_loader import load_reranker
 
         try:
-            model, processor = load(model_path)
+            model, processor = load_reranker(model_path)
         except RepositoryNotFoundError as e:
             raise HTTPException(
                 status_code=404,
@@ -749,18 +758,20 @@ def get_cached_model(
                 status_code=500, detail=f"Failed to load reranker model: {e}"
             ) from e
         config = model.config
-        model_type = getattr(config, "model_type", None)
-        if model_type not in ("qwen3", "qwen3_vl"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unsupported reranker model type: {model_type!r}.",
-            )
         try:
-            ensure_reranker_chat_template(processor, model_path)
+            kind = reranker_kind(config)
         except ValueError as e:
             raise HTTPException(
-                status_code=400, detail=f"Unsupported reranker model: {e}"
+                status_code=400,
+                detail=str(e),
             ) from e
+        if kind != RerankerKind.SEQUENCE_CLASSIFIER:
+            try:
+                ensure_reranker_chat_template(processor, model_path)
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=400, detail=f"Unsupported reranker model: {e}"
+                ) from e
         cache = {
             "cache_key": cache_key,
             "model_path": model_path,
@@ -884,6 +895,15 @@ def unload_model_sync():
             runtime.audio_queue.stop_and_join()
             runtime.audio_queue = None
             unloaded_any = True
+    if runtime.realtime_engine is not None:
+        is_realtime_worker = getattr(
+            runtime.realtime_engine, "is_worker_thread", lambda: False
+        )
+        if not is_realtime_worker():
+            logger.info("Stopping realtime VoiceChat engine.")
+            runtime.realtime_engine.stop_and_join()
+            runtime.realtime_engine = None
+            unloaded_any = True
 
     registry = _model_cache_registry()
     for cache_group, _ in list(registry.items()):
@@ -928,6 +948,7 @@ _protocol_deps = SimpleNamespace(
 register_anthropic_routes(inference_router, _protocol_deps)
 register_openai_routes(inference_router, _protocol_deps)
 register_audio_routes(inference_router, _protocol_deps)
+register_realtime_routes(inference_router, _protocol_deps)
 register_embeddings_routes(inference_router, _protocol_deps)
 register_reranking_routes(inference_router, _protocol_deps)
 

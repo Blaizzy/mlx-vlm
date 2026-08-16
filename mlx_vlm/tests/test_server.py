@@ -20,13 +20,13 @@ from fastapi.testclient import TestClient
 from PIL import Image
 from transformers.utils.chat_parsing import ResponseParser, parse_response
 
+import mlx_vlm.reranker_loader as reranker_loader
 import mlx_vlm.server as server
 import mlx_vlm.server.cli as server_cli
 import mlx_vlm.server.generation as server_generation
 import mlx_vlm.server.openai as server_openai
 import mlx_vlm.server.reranking as server_reranking
 import mlx_vlm.speculative.utils as speculative_utils
-import mlx_vlm.utils as vlm_utils
 from mlx_vlm import apc as apc_module
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
@@ -34,6 +34,28 @@ from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
+
+
+def test_response_generator_prefill_step_override_wins_over_environment(monkeypatch):
+    class DormantThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setenv("PREFILL_STEP_SIZE", "2048")
+    monkeypatch.setattr(server_generation, "Thread", DormantThread)
+
+    default_generator = server.ResponseGenerator(model_path="default")
+    overridden_generator = server.ResponseGenerator(
+        model_path="overridden",
+        prefill_step_size=3072,
+    )
+
+    assert default_generator.prefill_step_size == 2048
+    assert overridden_generator.prefill_step_size == 3072
+
 
 _MUSE_RESPONSE_TEMPLATE = {
     "defaults": {"role": "assistant"},
@@ -1210,6 +1232,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
     gen.processor = SimpleNamespace()
     gen.config = SimpleNamespace(eos_token_id=3)
     gen.tokenizer = SimpleNamespace(all_special_ids=[0])
+    gen.prefill_step_size = 3072
     captured = {}
 
     def fake_stream_diffusion_generate_from_kwargs(
@@ -1256,7 +1279,6 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         "stream_diffusion_generate_from_kwargs",
         fake_stream_diffusion_generate_from_kwargs,
     )
-    monkeypatch.setattr(server_generation, "get_prefill_step_size", lambda: 2048)
     args = server.GenerationArguments(
         max_tokens=4,
         temperature=0.0,
@@ -1307,7 +1329,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         "top_p": 1.0,
         "top_k": 0,
         "mm_token_type_ids": "types",
-        "prefill_step_size": 2048,
+        "prefill_step_size": 3072,
         "seed": 123,
         "max_denoising_steps": 7,
         "block_length": 16,
@@ -1715,7 +1737,9 @@ class _RecordingSpeculativeLM:
         )
 
 
-def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
+def _run_speculative_prefill_once(
+    monkeypatch, *, draft_kind, request_specs, prefill_step_size=2048
+):
     lm = _RecordingSpeculativeLM(draft_kind)
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
     gen.model = SimpleNamespace(language_model=lm)
@@ -1727,6 +1751,7 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
     gen.stop_tokens = {99}
     gen.requests = Queue()
     gen._stop = False
+    gen.prefill_step_size = prefill_step_size
     gen._make_sampler = lambda args: None
     gen.tokenizer = SimpleNamespace(
         decode=lambda tokens: "".join(str(tok) for tok in tokens)
@@ -1789,6 +1814,7 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
 
     gen._run_speculative()
     call = lm.calls[0]
+    call["prefill_input_lengths"] = [item["inputs"].shape[1] for item in lm.calls]
     call["round_kwargs"] = gen.round_kwargs
     return call
 
@@ -1810,6 +1836,29 @@ def test_speculative_server_threads_greedy_flag_to_mtp_loop(monkeypatch):
     )
 
     assert call["round_kwargs"]["greedy_sampling"] is True
+
+
+def test_speculative_server_honors_prefill_step_override(monkeypatch):
+    monkeypatch.setattr(
+        server_generation, "_chunked_prefill_enabled", lambda *args, **kwargs: True
+    )
+    call = _run_speculative_prefill_once(
+        monkeypatch,
+        draft_kind="mtp",
+        prefill_step_size=2,
+        request_specs=[
+            {
+                "input_ids": mx.array([[11, 12, 13]], dtype=mx.int32),
+                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
+            },
+            {
+                "input_ids": mx.array([[21, 22, 23]], dtype=mx.int32),
+                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
+            },
+        ],
+    )
+
+    assert call["prefill_input_lengths"] == [2, 1]
 
 
 def test_speculative_server_prefill_threads_gemma4_per_layer_inputs(monkeypatch):
@@ -5529,6 +5578,7 @@ class TestResponseGenerator:
         gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
         gen.top_logprobs_k = 0
         gen.apc_manager = None
+        gen.prefill_step_size = 3072
         gen.tokenizer = SimpleNamespace()
         gen.requests = Queue()
         gen._stop = False
@@ -5587,6 +5637,7 @@ class TestResponseGenerator:
         assert kwargs["draft_block_size"] == 6
         assert kwargs["greedy_sampling"] is True
         assert kwargs["compute_logprobs"] is False
+        assert kwargs["prefill_step_size"] == 3072
         assert batch_state["instance"].next_active_sizes == [2]
 
     def test_run_coalesces_idle_mtp_batch_generator(self, monkeypatch):
@@ -5999,6 +6050,42 @@ class TestResponseGenerator:
         )
 
         assert processors == [structured_processor]
+
+    def test_server_generation_delays_structured_processors_for_self_opening_model(
+        self, monkeypatch
+    ):
+        """Regression test for issue #1911."""
+
+        class SimpleTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return {"<think>": [10], "</think>": [20]}[text]
+
+        repetition_processor = lambda tokens, logits: logits
+        structured_processor = lambda tokens, logits: logits
+
+        monkeypatch.setattr(
+            server_generation,
+            "make_logits_processors",
+            lambda *_args: [repetition_processor],
+        )
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.tokenizer = SimpleTokenizer()
+        args = server.GenerationArguments(
+            enable_thinking=True,
+            thinking_start_token="<think>",
+            thinking_end_token="</think>",
+            logits_processors=[structured_processor],
+        )
+
+        processors = gen._make_logits_processors(
+            args,
+            mx.array([[1, 2, 3]], dtype=mx.int32),
+        )
+
+        assert processors[0] is repetition_processor
+        assert isinstance(processors[1], server_generation.ThinkingAwareLogitsProcessor)
+        assert processors[1].processor is structured_processor
 
     def test_build_gen_args_from_openai_request(self):
         req = SimpleNamespace(
@@ -7665,6 +7752,107 @@ class TestReranking:
         assert tokens == 5
         assert batches == [["0", "1"], ["2", "3"], ["4"]]
 
+    def test_generative_reranker_uses_default_instruction(self, monkeypatch):
+        instructions = []
+
+        def fake_score_batch(model, processor, query, documents, instruction):
+            del model, processor, query
+            instructions.append(instruction)
+            return [0.5] * len(documents), len(documents)
+
+        monkeypatch.setattr(server_reranking, "_score_text_batch", fake_score_batch)
+
+        server_reranking.score_documents(
+            object(),
+            object(),
+            SimpleNamespace(model_type="qwen3"),
+            server_reranking.RerankItem(text="query"),
+            [server_reranking.RerankItem(text="document")],
+            None,
+        )
+
+        assert instructions == [server_reranking.DEFAULT_INSTRUCTION]
+
+    def test_sequence_classifier_scores_tokenized_pairs(self):
+        calls = []
+
+        class Tokenizer:
+            model_max_length = 6
+
+            def __call__(self, queries, documents, **kwargs):
+                calls.append((queries, documents, kwargs))
+                return {
+                    "input_ids": np.array([[1, 2, 3, 0], [1, 4, 5, 6]]),
+                    "attention_mask": np.array([[1, 1, 1, 0], [1, 1, 1, 1]]),
+                    "token_type_ids": np.array([[0, 0, 1, 0], [0, 0, 1, 1]]),
+                }
+
+        class Model:
+            def __call__(self, **inputs):
+                assert set(inputs) == {
+                    "input_ids",
+                    "attention_mask",
+                    "token_type_ids",
+                }
+                return SimpleNamespace(logits=mx.array([[-2.0], [2.0]]))
+
+        scores, tokens = server_reranking.score_documents(
+            Model(),
+            Tokenizer(),
+            SimpleNamespace(model_type="bert", max_position_embeddings=4),
+            server_reranking.RerankItem(text="query"),
+            [
+                server_reranking.RerankItem(text="first"),
+                server_reranking.RerankItem(text="second"),
+            ],
+            None,
+        )
+
+        assert scores == pytest.approx([1 / (1 + math.exp(2)), 1 / (1 + math.exp(-2))])
+        assert tokens == 7
+        assert calls == [
+            (
+                ["query", "query"],
+                ["first", "second"],
+                {
+                    "padding": True,
+                    "truncation": True,
+                    "max_length": 4,
+                    "return_tensors": "np",
+                },
+            )
+        ]
+
+    @pytest.mark.parametrize(
+        "query,documents,instruction,error",
+        [
+            (
+                server_reranking.RerankItem(image="query.png"),
+                [server_reranking.RerankItem(text="document")],
+                None,
+                "do not support image or video",
+            ),
+            (
+                server_reranking.RerankItem(text="query"),
+                [server_reranking.RerankItem(text="document")],
+                "rank legal documents",
+                "do not support custom instructions",
+            ),
+        ],
+    )
+    def test_sequence_classifier_rejects_unsupported_inputs(
+        self, query, documents, instruction, error
+    ):
+        with pytest.raises(ValueError, match=error):
+            server_reranking.score_documents(
+                object(),
+                object(),
+                SimpleNamespace(model_type="modernbert"),
+                query,
+                documents,
+                instruction,
+            )
+
     def test_attention_mask_combines_padding_and_causality(self):
         mask = server_reranking._attention_mask(mx.array([[0, 1, 1], [1, 1, 0]]))
 
@@ -7740,7 +7928,9 @@ class TestReranking:
         monkeypatch.setattr(server.runtime, "model_cache", registry)
         model = SimpleNamespace(config=SimpleNamespace(model_type="qwen3"))
         processor = object()
-        monkeypatch.setattr(vlm_utils, "load", lambda path: (model, processor))
+        monkeypatch.setattr(
+            reranker_loader, "load_reranker", lambda path: (model, processor)
+        )
         monkeypatch.setattr(
             server._app_module, "ensure_reranker_chat_template", lambda *args: None
         )
@@ -7758,8 +7948,10 @@ class TestReranking:
 
     def test_loader_rejects_unsupported_family(self, monkeypatch):
         monkeypatch.setattr(server.runtime, "model_cache", server.ModelCacheRegistry())
-        model = SimpleNamespace(config=SimpleNamespace(model_type="bert"))
-        monkeypatch.setattr(vlm_utils, "load", lambda path: (model, object()))
+        model = SimpleNamespace(config=SimpleNamespace(model_type="deberta_v2"))
+        monkeypatch.setattr(
+            reranker_loader, "load_reranker", lambda path: (model, object())
+        )
 
         with pytest.raises(
             server.HTTPException, match="Unsupported reranker model type"
@@ -7767,3 +7959,20 @@ class TestReranking:
             server.get_cached_model("reranker", None, model_kind="reranker")
 
         assert exc.value.status_code == 400
+
+    def test_loader_skips_chat_template_for_sequence_classifier(self, monkeypatch):
+        monkeypatch.setattr(server.runtime, "model_cache", server.ModelCacheRegistry())
+        model = SimpleNamespace(config=SimpleNamespace(model_type="bert"))
+        processor = object()
+        monkeypatch.setattr(
+            reranker_loader, "load_reranker", lambda path: (model, processor)
+        )
+        monkeypatch.setattr(
+            server._app_module,
+            "ensure_reranker_chat_template",
+            lambda *args: pytest.fail("sequence classifiers do not use chat templates"),
+        )
+
+        loaded = server.get_cached_model("reranker", None, model_kind="reranker")
+
+        assert loaded == (model, processor, model.config)
