@@ -5,6 +5,22 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 
+def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:
+    """Whether layer ``layer_idx`` should use a quantized KV cache.
+
+    Live batch generation (``_make_cache``), stream quantize, and APC warm
+    restore must share this policy so continuous-batching ``extend`` always
+    joins same-typed peers.
+
+    For deep stacks (``num_layers > 2``) the last full-attention layer stays
+    unquantized — it is sensitive to quantization (see gemma-4-class models).
+    Shallow stacks (``num_layers <= 2``) quantize every layer when kv-bits is on.
+    """
+    if num_layers <= 2:
+        return True
+    return layer_idx < num_layers - 1
+
+
 def create_causal_mask(
     N: int,
     offset: int = 0,
@@ -116,6 +132,77 @@ class _BaseCache:
         obj.state = state
         obj.meta_state = meta_state
         return obj
+
+    def prefix_cache_snapshot(self):
+        """Return an opaque, restorable snapshot of this cache's state.
+
+        The returned object must round-trip through ``prefix_cache_restore``
+        into a fresh cache from ``model.make_cache()``. References are returned
+        as-is; the caller (adapter) is responsible for any detaching copy.
+        """
+        return {"state": self.state, "meta_state": self.meta_state}
+
+    def prefix_cache_restore(self, snapshot):
+        """Restore a snapshot from :meth:`prefix_cache_snapshot` into ``self``."""
+        self.state = snapshot["state"]
+        self.meta_state = snapshot["meta_state"]
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        """Merge single-row snapshots into a batched cache, or ``None``.
+
+        Default: not batch-mergeable. Pageable/windowed caches override to
+        return a batched cache built from ``rows``.
+        """
+        return None
+
+
+class ConcatenateKVCache(_BaseCache):
+    def __init__(self):
+        self.keys = None
+        self.values = None
+        self.offset = 0
+
+    def update_and_fetch(self, keys, values):
+        if self.keys is None:
+            self.keys = keys
+            self.values = values
+        else:
+            self.keys = mx.concatenate([self.keys, keys], axis=-2)
+            self.values = mx.concatenate([self.values, values], axis=-2)
+        self.offset = self.keys.shape[-2]
+        return self.keys, self.values
+
+    @property
+    def state(self):
+        return self.keys, self.values
+
+    @state.setter
+    def state(self, value):
+        self.keys, self.values = value
+        self.offset = 0 if self.keys is None else self.keys.shape[-2]
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        if self.keys is not None:
+            self.keys = self.keys[..., : self.offset, :]
+            self.values = self.values[..., : self.offset, :]
+        return n
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
 
 
 def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
@@ -304,6 +391,26 @@ class KVCache(_BaseCache):
         n = min(self.offset, n)
         self.offset -= n
         return n
+
+    def extract(self, idx):
+        cache = KVCache()
+        if self.keys is None:
+            if idx not in (0, -1):
+                raise IndexError("KVCache row index out of range")
+            return cache
+
+        batch_size = int(self.keys.shape[0])
+        if idx < 0:
+            idx += batch_size
+        if idx < 0 or idx >= batch_size:
+            raise IndexError(
+                f"KVCache row index {idx} out of range for batch size {batch_size}"
+            )
+
+        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, : self.offset, :])
+        cache.values = mx.contiguous(self.values[idx : idx + 1, :, : self.offset, :])
+        cache.offset = self.offset
+        return cache
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
@@ -947,6 +1054,8 @@ class BatchKVCache(_BaseCache):
             self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
+        if self._right_padding is not None:
+            self._right_padding = self._right_padding[batch_indices]
 
         # Shift left to reduce padding
         min_left_pad = self.left_padding.min().item()
@@ -1303,6 +1412,8 @@ class BatchRotatingKVCache(_BaseCache):
             self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
+        if self._lengths is not None:
+            self._lengths = self._lengths[batch_indices]
 
     def extend(self, other):
         """
@@ -1395,7 +1506,7 @@ class BatchRotatingKVCache(_BaseCache):
         keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
         values = mx.zeros((B, H, max_length, Dv), dtype=dt)
         for i, (p, length, c) in enumerate(zip(padding, lengths, caches)):
-            if c.keys is None:
+            if c.keys is None or length == 0:
                 continue
             keys[i : i + 1, :, p : p + length] = c._temporal_order(c.keys)[
                 ..., -length:, :
@@ -1751,6 +1862,8 @@ class BatchQuantizedKVCache(_BaseCache):
             self.values = tuple(v[batch_indices] for v in self.values)
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
+        if self._right_padding is not None:
+            self._right_padding = self._right_padding[batch_indices]
 
         min_lp = self.left_padding.min().item()
         if min_lp > 0:

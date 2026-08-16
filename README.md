@@ -19,6 +19,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
     - [Continuous Batching](#continuous-batching)
     - [Automatic Prefix Caching (APC)](#automatic-prefix-caching-apc)
     - [KV Cache Quantization](#kv-cache-quantization)
+- [1-bit Affine Inference](#1-bit-affine-inference)
 - [Activation Quantization (CUDA)](#activation-quantization-cuda)
 - [Multi-Image Chat Support](#multi-image-chat-support)
   - [Supported Models](#supported-models)
@@ -63,6 +64,52 @@ The easiest way to get started is to install the `mlx-vlm` package using pip:
 
 ```sh
 pip install -U mlx-vlm
+```
+
+The [Gradio chat UI](#chat-ui-with-gradio) needs an extra dependency that is not
+part of the base install:
+
+```sh
+pip install -U 'mlx-vlm[ui]'
+```
+
+Quote the package name so that shells which expand square brackets, such as
+`zsh`, do not treat `[ui]` as a glob pattern.
+
+## Agent Skills
+
+This repo ships an agent-skills bundle under `skills/` for common MLX-VLM workflows — usage, conversion, development, and support. Skills load into a coding agent (Claude Code, Codex, Gemini) so it follows the right project conventions instead of guessing.
+
+| Skill | Description |
+|-------|-------------|
+| `cli-inference` | Run and debug command-line inference (`mlx_vlm.generate`) — text/image/audio inputs and image-generation flags. |
+| `server-inference` | Run and debug the local server across the models, chat, responses, messages, audio, image, cache, and metrics endpoints. |
+| `convert-quantize` | Convert and quantize Hugging Face models to MLX (`mlx_vlm.convert`) — bits/group size, quant modes, RTN/AWQ, mixed recipes. |
+| `add-new-model` | Port a new architecture into `mlx_vlm/models` — config, weight-name mapping, reuse a similar model, add a test class. |
+| `benchmarking` | Produce credible, reproducible perf numbers and fork-vs-main A/B tables for PRs. |
+| `contributing` | Shape a change to pass review — code/config/test placement, pre-commit hooks, and PR expectations. |
+| `hf-cache-models` | List MLX-VLM-supported (and, with `--check-arch`, loadable) models in the local Hugging Face cache. |
+| `reproducible-github-issues` | Turn CLI or server failures into concise, reproducible GitHub issues. |
+
+Validate the bundle at any time:
+
+```sh
+python3 skills/scripts/validate_skills.py
+```
+
+Install from a local checkout:
+
+```sh
+# Claude Code
+/plugin marketplace add /path/to/mlx-vlm
+/plugin install mlx-vlm-skills@mlx-vlm
+
+# Codex CLI
+codex plugin marketplace add /path/to/mlx-vlm
+codex plugin add mlx-vlm-skills@mlx-vlm
+
+# Gemini CLI
+gemini extensions install /path/to/mlx-vlm/skills
 ```
 
 ## Usage
@@ -137,7 +184,7 @@ Speed up generation by drafting several candidate tokens with a small "drafter" 
 
 See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
 
-#### DFlash (Qwen3.5)
+#### DFlash (Qwen3.5 and Muse Glimmer)
 
 A lightweight block-diffusion drafter that predicts multiple tokens per round, typically 2–3× faster.
 
@@ -158,6 +205,18 @@ mlx_vlm.generate --model Qwen/Qwen3.5-4B \
 # Server with speculative decoding
 mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --draft-model z-lab/Qwen3.5-4B-DFlash
+```
+
+Muse Glimmer's published assistant checkpoint is auto-detected as DFlash:
+
+```sh
+mlx_vlm.generate --model meta-models/Muse-Glimmer-30B \
+  --draft-model meta-models/Muse-Glimmer-30B-assistant \
+  --prompt "Write a quicksort in Python." \
+  --max-tokens 512 --temperature 0
+
+mlx_vlm.server --model meta-models/Muse-Glimmer-30B \
+  --draft-model meta-models/Muse-Glimmer-30B-assistant
 ```
 
 DFlash draft-cache windowing is available from the Python API. During
@@ -271,7 +330,14 @@ for model-specific conversion and runtime notes.
 
 ### Chat UI with Gradio
 
-Launch a chat interface using Gradio:
+The Gradio chat UI requires the optional `ui` extra, which the base `mlx-vlm`
+install does not include:
+
+```sh
+pip install -U 'mlx-vlm[ui]'
+```
+
+Then launch the chat interface:
 
 ```sh
 mlx_vlm.chat_ui --model mlx-community/Qwen2-VL-2B-Instruct-4bit
@@ -392,6 +458,9 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --thinking-budget 512 \
   --thinking-start-token "<think>" \
   --thinking-end-token "</think>"
+
+# Require bearer authentication for API endpoints
+mlx_vlm.server --api-key <secret-token>
 ```
 
 #### Server Options
@@ -400,6 +469,8 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 - `--image-model`: Preload an image generation model at server startup
 - `--tts-model`: Preload a text-to-speech model at server startup
 - `--stt-model`: Preload a speech-to-text model at server startup
+- `--embedding-model`: Preload an embedding model at server startup
+- `--reranker-model`: Preload a supported reranker model at server startup
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
 - `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`, `Inferact/MiniMax-M3-EAGLE3`) — enables speculative decoding for ~2× or higher throughput
 - `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP)
@@ -413,10 +484,28 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 - `--thinking-end-token`: Default token that closes a thinking block (`--thinking-eos-token` is also accepted)
 - `--kv-bits`: Number of bits for KV cache quantization (e.g. `8` for uniform, `3.5` for TurboQuant)
 - `--kv-quant-scheme`: KV cache quantization backend (`uniform` or `turboquant`)
+- `--kv-key-bits` / `--kv-value-bits`: Override the bit-width for keys or values individually (see [Per-tensor KV quantization](#per-tensor-kv-quantization))
+- `--kv-key-scheme` / `--kv-value-scheme`: Override the quantization backend for keys or values individually
 - `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
 - `--max-kv-size`: Maximum KV cache size in tokens
 - `--vision-cache-size`: Max number of cached vision features (default: `20`)
+- `--log-progress-interval`: Decoded tokens between progress log messages; `0` disables periodic decode progress (default: `10`)
+- `--api-key`: Bearer token required for inference, model discovery, and management endpoints
 - `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
+
+At `INFO`, the server logs request start/completion, chunked-prefill progress,
+time to first token, periodic decode throughput, and the final token counts. Set
+`--log-level DEBUG` to emit decode progress for every token and add its token
+number, token ID, and decoded text to the same log entry. Decode progress uses
+`rate` for the instantaneous inter-token rate; decode completion uses the same
+field name for aggregate decode throughput measured across completed token
+intervals.
+
+OpenAI-compatible streaming responses expose throughput under
+`timings.predicted_per_second`. Token-bearing SSE chunks report the instantaneous
+inter-token rate, while terminal and usage chunks report the aggregate rate as
+`(tokens - 1) / (last_token_time - first_token_time)`. The first token reports
+`null` because it has no preceding token interval.
 
 You can also set trust remote code via environment variable:
 ```sh
@@ -815,6 +904,33 @@ mlx_vlm.server --model google/gemma-4-26b-a4b-it --kv-bits 3.5 --kv-quant-scheme
 
 Full-attention layers use quantized batch caches while sliding-window layers keep their fixed-size rotating caches. The last full-attention layer stays unquantized (sensitive in deep models).
 
+##### Per-tensor KV quantization
+
+Keys and values do not have to share a bit-width or a backend. A fractional `--kv-bits` already splits the budget — `3.5` gives 3-bit keys and 4-bit values — and `--kv-key-bits` / `--kv-value-bits` override either side:
+
+```sh
+# 8-bit keys, 3-bit values, both TurboQuant
+mlx_vlm.generate --model mlx-community/Qwen3.5-9B-MLX-4bit \
+  --kv-bits 3.5 --kv-quant-scheme turboquant \
+  --kv-key-bits 8 --kv-value-bits 3
+```
+
+`--kv-key-scheme` / `--kv-value-scheme` go further and select a different backend per tensor, which builds a hybrid cache:
+
+```sh
+# uniform 8-bit keys beside TurboQuant 3-bit values
+mlx_vlm.generate --model mlx-community/Qwen3.5-9B-MLX-4bit \
+  --kv-bits 8 --kv-quant-scheme uniform \
+  --kv-value-bits 3 --kv-value-scheme turboquant
+```
+
+Two limitations apply to mixed *schemes* specifically:
+
+- The hybrid cache dequantizes on every step instead of using a fused kernel, so it is slower than either homogeneous path.
+- Mixed schemes are not supported during continuous batching or for batch prefix caches, and raise `NotImplementedError` there. Mixed bit-widths under a single scheme work everywhere.
+
+Note that values are given the extra bit by default for a reason: value error passes straight through the attention output, whereas key error is partly reabsorbed by the softmax. Measured on Qwen3.5, spending an equal budget key-heavy was consistently worse than value-heavy, so prefer measuring before overriding.
+
 Tested with gemma-4-26b-a4b-it at 20K context:
 
 | Config | Gen tok/s | KV Cache | KV Reduction |
@@ -963,9 +1079,12 @@ Structured outputs are not currently supported with speculative decoding.
 - `/models` and `/v1/models` - List models available locally
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
+- `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
+- `/v1/rerank` - Rank text or multimodal documents by relevance to a query
 - `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
 - `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models
 - `/audio/translations` and `/v1/audio/translations` - OpenAI-compatible audio translation endpoint for STT models that expose a translation task
+- `/v1/realtime` - WebSocket-based realtime full-duplex speech. See the [Nemotron VoiceChat guide](mlx_vlm/models/nemotron_voicechat/README.md#realtime-websocket-api) for supported models and usage.
 - `/health` - Check server status
 - `/metrics` and `/v1/metrics` - Inspect rolling request metrics, throughput, and runtime counters
 - `/unload` - Unload all loaded model caches from memory
@@ -977,6 +1096,35 @@ Structured outputs are not currently supported with speculative decoding.
 ```sh
 curl "http://localhost:8080/models"
 ```
+
+##### Embeddings
+
+```sh
+curl -X POST "http://localhost:8080/v1/embeddings" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "sentence-transformers/all-MiniLM-L6-v2",
+    "input": ["The quick brown fox.", "A fast auburn fox."]
+  }'
+```
+
+Preload a default with `--embedding-model <repo-or-path>`. Supported architectures: BERT, XLM-RoBERTa, ModernBERT, Qwen3-Embedding, EmbeddingGemma (gemma3), LFM2, SigLIP (text), Qwen3-VL-Embedding, and Llama-Nemotron-VL, plus LLM2Vec bidirectional Llama. ColBERT-style multi-vector models (ColIdefics3, ColQwen2.5) are also available for late-interaction use.
+
+##### Reranking
+
+```sh
+curl -X POST "http://localhost:8080/v1/rerank" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen3-Reranker-0.6B-4bit",
+    "query": "What is the capital of France?",
+    "documents": ["Berlin is in Germany.", "Paris is the capital of France."],
+    "top_n": 1,
+    "return_documents": true
+  }'
+```
+
+Preload a default with `--reranker-model <repo-or-path>`. Supported text rerankers include one-label BERT, XLM-RoBERTa, and ModernBERT sequence-classification checkpoints, plus Qwen3 generative rerankers. Qwen3-VL rerankers also accept objects containing `text`, `image`, `image_url`, `video`, or `video_url`. Sequence-classification rerankers accept text pairs and do not support custom instructions.
 
 ##### Text Input
 
@@ -1129,6 +1277,38 @@ curl -X POST "http://localhost:8080/responses" \
 - `thinking_end_token`: Token that closes a thinking block
 - `stream`: Enable streaming responses
 
+## 1-bit Affine Inference
+
+MLX-VLM can load existing affine 1-bit MLX checkpoints without a custom MLX
+build. When a checkpoint declares `"bits": 1`, compatible `Linear` and
+`Embedding` layers are replaced automatically with an inference-only module
+that JIT-compiles its Metal kernel from Python.
+
+The checkpoint must use MLX's packed `uint32` weight layout, include `scales`
+and `biases`, and declare a group size of `32`, `64`, or `128`:
+
+```json
+{
+  "quantization": {
+    "group_size": 64,
+    "bits": 1,
+    "mode": "affine"
+  }
+}
+```
+
+Load and generate normally; no extra inference flag is needed:
+
+```python
+from mlx_vlm import generate, load
+
+model, processor = load("path/to/1bit-model")
+result = generate(model, processor, "Describe this image", image=["image.jpg"])
+```
+
+This path is for inference from an already quantized checkpoint. Converting a
+floating-point model to 1-bit still requires a quantizer that can produce the
+packed weights and affine parameters.
 
 ## Activation Quantization (CUDA)
 
@@ -1389,7 +1569,12 @@ See [docs/usage.md](https://github.com/Blaizzy/mlx-vlm/blob/main/docs/usage.md#d
 
 # Fine-tuning
 
-MLX-VLM supports fine-tuning models with LoRA and QLoRA.
+MLX-VLM supports fine-tuning models with LoRA and QLoRA. Fine-tuning (and the
+eval scripts) need the training extra, which is not installed by default:
+
+```bash
+pip install "mlx-vlm[train]"
+```
 
 ## LoRA & QLoRA
 

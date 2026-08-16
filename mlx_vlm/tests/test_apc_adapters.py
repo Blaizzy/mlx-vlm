@@ -472,7 +472,40 @@ def _fill_batch_turbo(left_padding, seq_len, bits=4.0):
     return cache, k, v
 
 
-class TestBatchRotatingRightPadPrefill:
+class TestBatchRightPadPrefill:
+    @staticmethod
+    def _filter_reordered_row(cache):
+        cache.prepare(right_padding=[2, 0], lengths=[4, 6])
+        k, v = _rand_kv(batch=2, seq_len=3)
+        cache.update_and_fetch(k, v)
+
+        cache.filter(mx.array([1, 0], dtype=mx.int32))
+        cache.filter(mx.array([1], dtype=mx.int32))
+
+    def test_batch_kv_filter_keeps_pending_right_padding_aligned(self):
+        cache = BatchKVCache([0, 0])
+
+        self._filter_reordered_row(cache)
+
+        assert cache._right_padding.tolist() == [2]
+        cache.finalize()
+        assert cache.keys.shape[0] == 1
+        assert cache.values.shape[0] == 1
+        assert cache.offset.tolist() == [1]
+        assert cache.left_padding.tolist() == [2]
+
+    def test_batch_quantized_filter_keeps_pending_right_padding_aligned(self):
+        cache = BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS)
+
+        self._filter_reordered_row(cache)
+
+        assert cache._right_padding.tolist() == [2]
+        cache.finalize()
+        assert all(part.shape[0] == 1 for part in cache.keys)
+        assert all(part.shape[0] == 1 for part in cache.values)
+        assert cache.offset.tolist() == [1]
+        assert cache.left_padding.tolist() == [2]
+
     def test_single_token_update_while_lengths_pending(self):
         cache = BatchRotatingKVCache(32, [0, 0])
         k, v = _rand_kv(batch=2, seq_len=4)
@@ -486,6 +519,24 @@ class TestBatchRotatingRightPadPrefill:
         assert cache._lengths is None
         k2, v2 = _rand_kv(batch=2, seq_len=1)
         cache.update_and_fetch(k2, v2)
+
+    def test_rotating_filter_keeps_pending_lengths_aligned(self):
+        cache = BatchRotatingKVCache(32, [0, 0])
+
+        self._filter_reordered_row(cache)
+
+        assert cache._lengths.tolist() == [4]
+        k, v = _rand_kv(batch=1, seq_len=2)
+        out_k, out_v = cache.update_and_fetch(k, v)
+        mx.eval(out_k, out_v)
+        assert out_k.shape[0] == 1
+        assert out_v.shape[0] == 1
+
+        cache.finalize()
+        assert cache.keys.shape[0] == 1
+        assert cache.values.shape[0] == 1
+        assert cache.offset.tolist() == [4]
+        assert cache.left_padding.tolist() == [1]
 
 
 class TestBatchTurboQuantParity:

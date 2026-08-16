@@ -107,11 +107,15 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
                 "attention_mask", None
             )
             audio_inputs["input_features"] = audio_inputs.pop("input_features", None)
-            audio_lengths = iter(
-                _get_feat_extract_output_lengths(
-                    audio_inputs["feature_attention_mask"].sum(-1)
-                )
-            )
+            mask = audio_inputs["feature_attention_mask"]
+            mel_frames = audio_inputs["input_features"].shape[-1]
+            mel_lengths = mask.sum(-1)
+            # feature_attention_mask is sample-domain; convert to mel frames via the
+            # mask/mel ratio (the hop length) so the placeholder count matches the
+            # audio encoder's true output length.
+            if mask.shape[-1] > mel_frames:
+                mel_lengths = mel_lengths // (mask.shape[-1] // mel_frames)
+            audio_lengths = iter(_get_feat_extract_output_lengths(mel_lengths))
         else:
             audio_inputs = {}
             audio_lengths = iter([])

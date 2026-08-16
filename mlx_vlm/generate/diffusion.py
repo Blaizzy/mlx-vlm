@@ -295,6 +295,57 @@ def _diffusion_initialize_canvas(
     return mx.random.randint(0, vocab_size, (batch_size, canvas_length)).astype(dtype)
 
 
+def _normalize_decoder_input_ids(
+    decoder_input_ids,
+    batch_size: int,
+    dtype,
+) -> Optional[mx.array]:
+    if decoder_input_ids is None:
+        return None
+
+    decoder_input_ids = mx.array(decoder_input_ids)
+    if decoder_input_ids.ndim != 2:
+        raise ValueError(
+            "decoder_input_ids must be a 2D array with shape "
+            "(batch_size, sequence_length)."
+        )
+    if decoder_input_ids.shape[0] != batch_size:
+        raise ValueError(
+            "decoder_input_ids batch size must match input_ids batch size."
+        )
+    return decoder_input_ids.astype(dtype)
+
+
+def _diffusion_initial_canvas(
+    decoder_input_ids: Optional[mx.array],
+    start_index: int,
+    batch_size: int,
+    canvas_length: int,
+    vocab_size: int,
+    dtype,
+) -> mx.array:
+    seed_canvas = None
+    seed_length = 0
+    if decoder_input_ids is not None and start_index < decoder_input_ids.shape[1]:
+        end_index = min(start_index + canvas_length, decoder_input_ids.shape[1])
+        seed_canvas = decoder_input_ids[:, start_index:end_index].astype(dtype)
+        seed_length = seed_canvas.shape[1]
+        if seed_length == canvas_length:
+            return seed_canvas
+
+    random_canvas = _diffusion_initialize_canvas(
+        batch_size,
+        canvas_length,
+        vocab_size,
+        dtype,
+    )
+    if seed_canvas is None:
+        return random_canvas
+
+    random_canvas[:, :seed_length] = seed_canvas
+    return random_canvas
+
+
 def _diffusion_linear_temperature(
     cur_step: int,
     max_denoising_steps: int,
@@ -509,6 +560,7 @@ def stream_diffusion_generate(
     diffusion_unmasking_width: int = DEFAULT_DIFFUSION_UNMASKING_WIDTH,
     mm_token_type_ids: Optional[mx.array] = None,
     prefill_step_size: Optional[int] = None,
+    decoder_input_ids: Optional[mx.array] = None,
 ) -> Generator[GenerationResult, None, None]:
     if input_ids.shape[0] != 1:
         raise ValueError(
@@ -542,6 +594,11 @@ def stream_diffusion_generate(
         int(diffusion_min_canvas_length or DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH),
     )
     vocab_size = int(text_config.vocab_size)
+    decoder_input_ids = _normalize_decoder_input_ids(
+        decoder_input_ids,
+        batch_size,
+        input_ids.dtype,
+    )
     max_new_tokens = int(max_tokens or generation_config.get("max_new_tokens", 256))
     if max_denoising_steps is None:
         max_denoising_steps = int(
@@ -732,7 +789,9 @@ def stream_diffusion_generate(
                 if decoder_attention_mask is not None
                 else None
             )
-            current_canvas = _diffusion_initialize_canvas(
+            current_canvas = _diffusion_initial_canvas(
+                decoder_input_ids,
+                generated_tokens,
                 batch_size,
                 canvas_length,
                 vocab_size,

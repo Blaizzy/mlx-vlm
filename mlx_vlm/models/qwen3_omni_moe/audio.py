@@ -196,6 +196,11 @@ class AudioModel(nn.Module):
         feature_lens: Optional[mx.array] = None,
         aftercnn_lens: Optional[mx.array] = None,
     ):
+        # Accept the batched (1, mel, T) layout from the standard path as well as
+        # unbatched (mel, T); the chunk-padding loop below indexes the mel axis.
+        if input_features.ndim == 3:
+            input_features = input_features[0]
+
         if feature_lens is None:
             feature_lens = mx.array([input_features.shape[-1]], dtype=mx.int32)
 

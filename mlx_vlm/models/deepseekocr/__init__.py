@@ -1,2 +1,3 @@
 from .config import MLPConfig, ModelConfig, ProjectorConfig, TextConfig, VisionConfig
-from .deepseekocr import DeepseekOCRProcessor, LanguageModel, Model, VisionModel
+from .deepseekocr import LanguageModel, Model, VisionModel
+from .processing_deepseekocr import DeepseekOCRProcessor

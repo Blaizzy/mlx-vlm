@@ -6,17 +6,7 @@ import mlx.nn as nn
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
-from .processing import Glm46VProcessor
 from .vision import VisionModel
-
-# Register the processor with the name expected by the model config
-try:
-    from transformers import AutoProcessor
-
-    # The model's preprocessor_config.json specifies "processor_class": "Glm46VProcessor"
-    AutoProcessor.register("Glm46VProcessor", Glm46VProcessor)
-except Exception as e:
-    print(f"Error registering glm4v processor: {e}")
 
 
 class Model(nn.Module):

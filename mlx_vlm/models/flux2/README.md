@@ -6,7 +6,7 @@ token generation path.
 
 Capabilities:
 - **Text-to-image generation** with FLUX.2 Klein and FLUX.2 Klein Base models
-- **Image editing** with FLUX.2 Klein 9B and the 9B KV reference-cache variant
+- **Image editing** with FLUX.2 Klein and FLUX.2 Klein Base models
 - **CLI output** to PNG files
 - **Python API output** as an evaluated `mx.array`
 - **OpenAI-compatible API** through `/v1/images/generations` and `/v1/images/edits`
@@ -15,10 +15,10 @@ Capabilities:
 
 | Model | Alias | Generation | Editing | Notes |
 |-------|-------|------------|---------|-------|
-| `black-forest-labs/FLUX.2-klein-4B` | `flux2-klein-4b`, `flux2-klein`, `klein-4b` | Yes | No | Dense 4B text-to-image model |
+| `black-forest-labs/FLUX.2-klein-4B` | `flux2-klein-4b`, `flux2-klein`, `klein-4b` | Yes | Yes | Dense 4B text-to-image and image-edit model |
 | `black-forest-labs/FLUX.2-klein-9B` | `flux2-klein-9b`, `klein-9b` | Yes | Yes | Dense 9B text-to-image and image-edit model |
-| `black-forest-labs/FLUX.2-klein-base-4B` | `flux2-klein-base-4b`, `flux2-base-4b`, `klein-base-4b` | Yes | No | Base 4B text-to-image model |
-| `black-forest-labs/FLUX.2-klein-base-9B` | `flux2-klein-base-9b`, `flux2-base-9b`, `klein-base-9b` | Yes | No | Base 9B text-to-image model |
+| `black-forest-labs/FLUX.2-klein-base-4B` | `flux2-klein-base-4b`, `flux2-base-4b`, `klein-base-4b` | Yes | Yes | Base 4B text-to-image and image-edit model |
+| `black-forest-labs/FLUX.2-klein-base-9B` | `flux2-klein-base-9b`, `flux2-base-9b`, `klein-base-9b` | Yes | Yes | Base 9B text-to-image and image-edit model |
 | `black-forest-labs/FLUX.2-klein-9b-kv` | `flux2-klein-9b-kv`, `klein-9b-kv` | Yes | Yes | 9B image-edit model with per-call reference-image KV caching |
 
 Models are downloaded with `huggingface_hub.snapshot_download` when they are not

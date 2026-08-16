@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Iterator, Optional
+from typing import Any, Dict, Iterator, Optional
 
 
 class ModelCacheRegistry:
@@ -63,8 +63,10 @@ class ServerRuntime:
     model_cache: ModelCacheRegistry = field(default_factory=ModelCacheRegistry)
     response_generator: Optional[Any] = None
     audio_queue: Optional[Any] = None
+    realtime_engine: Optional[Any] = None
     apc_manager: Optional[Any] = None
     metrics: Optional[Any] = None
+    preload_failures: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
 
 runtime = ServerRuntime()

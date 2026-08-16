@@ -16,6 +16,7 @@ def _dflash_next_block_size(
     draft_model: nn.Module,
     requested_block_total: int,
     remaining_budget: int,
+    initial_block_size: Optional[int] = None,
 ) -> int:
     """Choose the next DFlash verify block size from recent acceptance.
 
@@ -38,6 +39,8 @@ def _dflash_next_block_size(
         if int(d) > 0
     ]
     if not recent:
+        if initial_block_size is not None:
+            return min(block_total, max(2, int(initial_block_size)))
         return block_total
 
     current = min(block_total, max(2, recent[-1][1] + 1))
@@ -83,6 +86,7 @@ def _dflash_rounds(
     sampler: Callable[[mx.array], mx.array],
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
+    use_model_initial_block_size: bool = True,
 ) -> Generator[Tuple[int, None], None, None]:
     """DFlash speculative-decoding **round loop**.
 
@@ -94,13 +98,17 @@ def _dflash_rounds(
     if not hasattr(lm, "rollback_speculative_cache"):
         raise RuntimeError(
             f"{type(lm).__name__} does not implement rollback_speculative_cache. "
-            "Speculative decoding with a DFlash drafter currently only "
-            "supports mlx_vlm.models.qwen3_5."
+            "This target does not currently support DFlash speculative decoding."
         )
 
     target_layer_ids = list(draft_model.config.target_layer_ids)
     block_total = _dflash_block_total(draft_model, draft_block_size)
     draft_cache = draft_model.reset(model)
+    prepare_target_hidden = getattr(draft_model, "prepare_target_hidden", None)
+    hidden_is_prepared = callable(prepare_target_hidden)
+    if hidden_is_prepared:
+        hidden = prepare_target_hidden(hidden)
+        mx.async_eval(hidden)
 
     b = first_bonus
     emitted = 1  # the first bonus has already been yielded by the caller
@@ -110,12 +118,24 @@ def _dflash_rounds(
             draft_model,
             block_total,
             max_tokens - emitted + 1,
+            (
+                getattr(draft_model, "dflash_initial_block_size", None)
+                if use_model_initial_block_size
+                else None
+            ),
         )
         if bs <= 1:
             break
 
+        draft_kwargs = {"target_hidden_prepared": True} if hidden_is_prepared else {}
         draft_tokens = draft_model.draft_block(
-            b, hidden, draft_cache, bs, sampler, token_dtype
+            b,
+            hidden,
+            draft_cache,
+            bs,
+            sampler,
+            token_dtype,
+            **draft_kwargs,
         )
         mx.async_eval(draft_tokens)
 
@@ -139,13 +159,6 @@ def _dflash_rounds(
         )
         _record_speculative_round(draft_model, accepted, bs - 1)
 
-        # Emit
-        for tok in new_tokens:
-            yield tok, None
-            emitted += 1
-            if emitted >= max_tokens:
-                return
-
         if accepted < bs - 1:
             hidden = hidden[:, : accepted + 1, :]
         b = new_tokens[-1] if new_tokens else b
@@ -156,8 +169,19 @@ def _dflash_rounds(
                     prompt_cache, verify_out.gdn_states, accepted, bs
                 )
 
-        if emitted % 256 == 0:
-            mx.clear_cache()
+        if hidden_is_prepared and emitted + len(new_tokens) < max_tokens:
+            hidden = prepare_target_hidden(hidden)
+            mx.async_eval(hidden)
+
+        # Emit after scheduling the next context projection so its execution
+        # can overlap server-side detokenization and response handling.
+        for tok in new_tokens:
+            yield tok, None
+            emitted += 1
+            if emitted >= max_tokens:
+                return
+
+        verify_out = None
 
 
 def _dflash_rounds_batch(
@@ -313,7 +337,5 @@ def _dflash_rounds_batch(
             # Update active index mapping
             active_idx = [active_idx[j] for j in keep_slots]
 
-        new_total = sum(emitted)
-        if new_total // 256 > total_emitted // 256:
-            mx.clear_cache()
-        total_emitted = new_total
+        verify_out = None
+        total_emitted = sum(emitted)

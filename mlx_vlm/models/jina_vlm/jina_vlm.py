@@ -4,15 +4,14 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from transformers import AutoProcessor
 
-from ..base import InputEmbeddingsFeatures
+from ..base import InputEmbeddingsFeatures, install_auto_processor_patch
 from .config import ModelConfig, VisionConfig
 from .language import LanguageModel
 from .processing_jinavlm import JinaVLMProcessor
 from .vision import VisionModel
 
-AutoProcessor.register("jvlm", JinaVLMProcessor)
+install_auto_processor_patch("jvlm", JinaVLMProcessor)
 
 
 class CrossAttention(nn.Module):

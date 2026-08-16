@@ -9,6 +9,7 @@ from ..base import (
     kv_sequence_length,
     scaled_dot_product_attention,
 )
+from ..mlp import DeepseekMLP as Glm4vMoeMLP
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig, TextConfig
@@ -152,26 +153,6 @@ class Glm4vMoeAttention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
-
-
-class Glm4vMoeMLP(nn.Module):
-    def __init__(
-        self, config: TextConfig, hidden_size: int = None, intermediate_size: int = None
-    ):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size if hidden_size is None else hidden_size
-        self.intermediate_size = (
-            config.intermediate_size if intermediate_size is None else intermediate_size
-        )
-
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-
-    def __call__(self, x):
-        down_proj = self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
 
 
 @mx.compile

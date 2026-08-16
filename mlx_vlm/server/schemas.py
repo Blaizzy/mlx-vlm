@@ -202,11 +202,9 @@ class ResponseInputImageParam(TypedDict, total=False):
     type: Required[
         Literal["input_image"]
     ]  # The type of the input item. Always `input_image`.
-    image_url: Required[str]
+    image_url: Optional[str]
     file_id: Optional[str]
-    """The ID of the file to be sent to the model.
-     NOTE : wouldn't this help the model if we passed the file_id as well to the vlm models
-    """
+    """A file reference. This server currently rejects file IDs."""
 
 
 class InputAudio(TypedDict, total=False):
@@ -338,6 +336,15 @@ class OpenAIRequest(FlexibleBaseModel):
     top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
     top_k: int = Field(0, description="Top-k sampling.")
     min_p: float = Field(0.0, description="Min-p sampling.")
+    top_n_sigma: float = Field(
+        0.0, description="Top-nσ sampling. 0 disables; typical ~0.5-2.0."
+    )
+    p_less: bool = Field(
+        False, description="Hyperparameter-free p-less sampling (on/off)."
+    )
+    typical_p: float = Field(
+        1.0, description="Locally typical sampling. 1.0 disables; typical ~0.2-0.95."
+    )
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     repetition_context_size: Optional[int] = Field(
         None, description="Repetition penalty context size."
@@ -357,6 +364,14 @@ class OpenAIRequest(FlexibleBaseModel):
             "Override server thinking mode for this request. If omitted, the "
             "server default set by --enable-thinking is used."
         ),
+    )
+    reasoning: Optional[Any] = Field(
+        None,
+        description="OpenAI Responses API reasoning configuration.",
+    )
+    reasoning_effort: Optional[str] = Field(
+        None,
+        description="OpenAI-compatible reasoning effort.",
     )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
@@ -431,6 +446,12 @@ class GenerationTimings(BaseModel):
     predicted_per_token_ms: float
     predicted_per_second: float
     peak_memory: float = 0.0
+    # Speculative decoding stats, following the llama.cpp server timings
+    # field names; None unless the request ran with a drafter.
+    draft_kind: Optional[str] = None
+    draft_rounds: Optional[int] = None
+    draft_n: Optional[int] = None
+    draft_n_accepted: Optional[int] = None
 
     @staticmethod
     def _derive_gen_tps(token_times: List[float]) -> Optional[float]:
@@ -446,9 +467,11 @@ class GenerationTimings(BaseModel):
         prompt_tokens: int,
         output_tokens: int,
     ) -> "GenerationTimings":
-        generation_tps = metrics.generation_tps or cls._derive_gen_tps(
-            metrics.token_times
-        )
+        generation_tps = getattr(metrics, "rate", None)
+        if generation_tps is None:
+            generation_tps = metrics.generation_tps or cls._derive_gen_tps(
+                metrics.token_times
+            )
         cached_tokens = metrics.cached_tokens
         prompt_n = max(0, int(prompt_tokens) - int(cached_tokens))
         prompt_s = prompt_tokens / metrics.prompt_tps if metrics.prompt_tps else 0.0
@@ -469,7 +492,17 @@ class GenerationTimings(BaseModel):
             ),
             predicted_per_second=float(generation_tps or 0.0),
             peak_memory=float(metrics.peak_memory or 0.0),
+            draft_kind=getattr(metrics, "draft_kind", None),
+            draft_rounds=getattr(metrics, "draft_rounds", None),
+            draft_n=getattr(metrics, "draft_n", None),
+            draft_n_accepted=getattr(metrics, "draft_n_accepted", None),
         )
+
+
+class StreamingTimings(BaseModel):
+    """Timing data available while a response is still streaming."""
+
+    predicted_per_second: Optional[float] = None
 
 
 class OpenAIErrorObject(BaseModel):
@@ -583,6 +616,7 @@ class ResponseOutputTextDeltaEvent(BaseStreamEvent):
     output_index: int
     content_index: int
     delta: str
+    timings: StreamingTimings
 
 
 class ResponseOutputTextDoneEvent(BaseStreamEvent):
@@ -591,6 +625,7 @@ class ResponseOutputTextDoneEvent(BaseStreamEvent):
     output_index: int
     content_index: int
     text: str
+    timings: StreamingTimings
 
 
 class ResponseContentPartDoneEvent(BaseStreamEvent):
@@ -700,6 +735,15 @@ class VLMRequest(FlexibleBaseModel):
     top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
     top_k: int = Field(0, description="Top-k sampling.")
     min_p: float = Field(0.0, description="Min-p sampling.")
+    top_n_sigma: float = Field(
+        0.0, description="Top-nσ sampling. 0 disables; typical ~0.5-2.0."
+    )
+    p_less: bool = Field(
+        False, description="Hyperparameter-free p-less sampling (on/off)."
+    )
+    typical_p: float = Field(
+        1.0, description="Locally typical sampling. 1.0 disables; typical ~0.2-0.95."
+    )
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     repetition_context_size: Optional[int] = Field(
@@ -720,6 +764,14 @@ class VLMRequest(FlexibleBaseModel):
             "Override server thinking mode for this request. If omitted, the "
             "server default set by --enable-thinking is used."
         ),
+    )
+    reasoning: Optional[Any] = Field(
+        None,
+        description="OpenAI-compatible reasoning configuration.",
+    )
+    reasoning_effort: Optional[str] = Field(
+        None,
+        description="OpenAI-compatible reasoning effort.",
     )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
@@ -795,6 +847,13 @@ class StreamOptions(BaseModel):
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
     stream_options: Optional[StreamOptions] = None
+    tools: Optional[List[Any]] = Field(None, description="Tools the model may call.")
+    tool_choice: Optional[Any] = Field(
+        None,
+        description=(
+            "Controls tool use: none, auto, required, or a specific function."
+        ),
+    )
 
 
 class TopLogprob(BaseModel):
@@ -845,7 +904,7 @@ class ChatStreamChunk(BaseModel):
     model: str = ""
     choices: List[ChatStreamChoice] = []
     usage: Optional[UsageStats] = None
-    timings: Optional[GenerationTimings] = None
+    timings: Optional[Union[GenerationTimings, StreamingTimings]] = None
 
 
 # Models for Anthropic-compatible /v1/messages endpoint

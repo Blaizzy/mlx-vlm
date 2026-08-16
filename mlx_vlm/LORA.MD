@@ -7,7 +7,11 @@
 ## Requirements
 
 - Python 3.7+
-- Required Python packages: `mlx-vlm`, `mlx`, `numpy`, `transformers`, `datasets`, `PIL`
+- Install the training extra (adds `datasets` on top of the inference dependencies):
+
+  ```bash
+  pip install "mlx-vlm[train]"
+  ```
 
 ## Trainer Backend
 

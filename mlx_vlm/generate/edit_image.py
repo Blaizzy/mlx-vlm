@@ -132,6 +132,7 @@ def load_image_edit_model(
         not model_path.exists()
         and alias_model_class is not None
         and getattr(alias_model_class, "is_image_edit_model", False)
+        and alias_model_class.supports_model(model)
     ):
         return alias_model_class.from_model_id(
             model,

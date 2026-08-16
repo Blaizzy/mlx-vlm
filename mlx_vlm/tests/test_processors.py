@@ -1360,6 +1360,52 @@ class TestQwen3VLProcessor(_ProcessorTestBase, unittest.TestCase):
             1280 * 28 * 28,
         )
 
+    def test_video_processor_accepts_pil_frame_lists(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLVideoProcessor
+
+        frames = [
+            Image.new("RGB", (224, 224), color=(i * 40, 128, 128)) for i in range(4)
+        ]
+        processor = Qwen3VLVideoProcessor(
+            patch_size=14,
+            temporal_patch_size=2,
+            merge_size=2,
+            do_rescale=False,
+            do_normalize=False,
+        )
+
+        output = processor(videos=[frames])
+
+        np.testing.assert_array_equal(
+            output["video_grid_thw"], np.array([[2, 16, 16]], dtype=np.int64)
+        )
+        self.assertEqual(output["pixel_values_videos"].shape, (512, 1176))
+
+        direct_output = processor(videos=frames)
+        np.testing.assert_array_equal(
+            direct_output["video_grid_thw"], np.array([[2, 16, 16]], dtype=np.int64)
+        )
+        self.assertEqual(direct_output["pixel_values_videos"].shape, (512, 1176))
+
+    def test_video_processor_accepts_channel_last_arrays(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLVideoProcessor
+
+        video = np.zeros((4, 224, 224, 3), dtype=np.uint8)
+        processor = Qwen3VLVideoProcessor(
+            patch_size=14,
+            temporal_patch_size=2,
+            merge_size=2,
+            do_rescale=False,
+            do_normalize=False,
+        )
+
+        output = processor(videos=[video])
+
+        np.testing.assert_array_equal(
+            output["video_grid_thw"], np.array([[2, 16, 16]], dtype=np.int64)
+        )
+        self.assertEqual(output["pixel_values_videos"].shape, (512, 1176))
+
 
 class TestQwen3OmniMoeProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
@@ -2149,7 +2195,7 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
                 patch(
                     "transformers.AutoTokenizer.from_pretrained",
                     return_value=_mock_tokenizer(),
-                ),
+                ) as tokenizer_from_pretrained,
                 patch(
                     "mlx_vlm.models.lfm2_vl.processing_lfm2_vl.Siglip2ImageProcessor",
                     DummySiglip2ImageProcessor,
@@ -2169,6 +2215,11 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertIsInstance(processor.image_processor, DummySiglip2ImageProcessor)
         self.assertTrue(processor.image_processor.do_resize)
         self.assertFalse(processor.image_processor.do_image_splitting)
+        tokenizer_from_pretrained.assert_called_once_with(
+            tmpdir,
+            trust_remote_code=False,
+            local_files_only=True,
+        )
 
 
 class TestMolmoPointProcessor(unittest.TestCase):
@@ -2269,6 +2320,16 @@ class TestNemotronHNanoOmniProcessor(unittest.TestCase):
         self.assertGreater(int(result["num_tokens"][0].item()), 0)
 
 
+class TestLagunaProcessor(unittest.TestCase):
+    def test_chat_template_owns_laguna_special_tokens(self):
+        from mlx_vlm.utils import should_add_special_tokens
+
+        processor = SimpleNamespace(chat_template="{{ messages }}")
+
+        self.assertFalse(should_add_special_tokens("laguna", processor))
+        self.assertTrue(should_add_special_tokens("llama", processor))
+
+
 # ── AutoProcessor patch tests ─────────────────────────────────────────────────
 
 
@@ -2328,11 +2389,466 @@ class TestKimiVLPatch(unittest.TestCase):
         )
 
 
+class TestKimiK3Patch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
+            "kimi_k3",
+            "mlx_vlm.models.kimi_k3.processing_kimi_k3",
+            "KimiK3Processor",
+        )
+
+    def test_patch_intercepts_with_trust_remote_code_false(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import KimiK3Processor
+
+        sentinel = object()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps({"model_type": "kimi_k3"})
+            )
+            with patch.object(
+                KimiK3Processor, "from_pretrained", return_value=sentinel
+            ) as from_pretrained:
+                result = AutoProcessor.from_pretrained(tmpdir, trust_remote_code=False)
+
+        self.assertIs(result, sentinel)
+        self.assertFalse(from_pretrained.call_args.kwargs["trust_remote_code"])
+
+
+class TestKimiK3Processor(unittest.TestCase):
+    @staticmethod
+    def _make_tokenizer():
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+        class _Tokenizer(PreTrainedTokenizerBase):
+            """Mimics the K3 tokenizer: python chat renderer, no jinja template."""
+
+            model_input_names = ["input_ids", "attention_mask"]
+
+            def __init__(self):
+                super().__init__()
+                self.last_call = None
+                self.encode_calls = []
+
+            def convert_tokens_to_ids(self, token):
+                return 0
+
+            def encode(self, text, **kwargs):
+                self.encode_calls.append((text, kwargs))
+                return [1, 2, 3]
+
+            def apply_chat_template(
+                self, conversation, tokenize=False, add_generation_prompt=True
+            ):
+                self.last_call = {
+                    "tokenize": tokenize,
+                    "add_generation_prompt": add_generation_prompt,
+                }
+                return "rendered"
+
+            def save_pretrained(self, save_directory, **kwargs):
+                return ()
+
+        return _Tokenizer()
+
+    def _make_processor(self):
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import KimiK3Processor
+
+        return KimiK3Processor(tokenizer=self._make_tokenizer())
+
+    def test_advertises_chat_rendering_without_jinja_template(self):
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import _CHAT_TEMPLATE_SENTINEL
+
+        processor = self._make_processor()
+        self.assertEqual(processor.chat_template, _CHAT_TEMPLATE_SENTINEL)
+
+    def test_local_renderer_takes_precedence_over_tokenizer_template(self):
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import (
+            _CHAT_TEMPLATE_SENTINEL,
+            KimiK3Processor,
+        )
+
+        tokenizer = self._make_tokenizer()
+        tokenizer.chat_template = "{{ messages }}"
+        processor = KimiK3Processor(tokenizer=tokenizer)
+        self.assertEqual(processor.chat_template, _CHAT_TEMPLATE_SENTINEL)
+
+    def test_apply_chat_template_renders_xtml_locally(self):
+        processor = self._make_processor()
+        result = processor.apply_chat_template(
+            [{"role": "user", "content": "hi"}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        self.assertIn('<|open|>message role="user"<|sep|>hi', result)
+        self.assertTrue(result.endswith("<|open|>think<|sep|>"))
+        self.assertIsNone(processor.tokenizer.last_call)
+
+    def test_apply_chat_template_ignores_explicit_template_override(self):
+        processor = self._make_processor()
+        expected = processor.apply_chat_template([{"role": "user", "content": "hi"}])
+        actual = processor.apply_chat_template(
+            [{"role": "user", "content": "hi"}],
+            chat_template="{{ messages }}",
+        )
+        self.assertEqual(actual, expected)
+
+    def test_tokenized_chat_preserves_literal_control_tokens_in_user_text(self):
+        processor = self._make_processor()
+        processor.apply_chat_template(
+            [{"role": "user", "content": "literal <|end_of_msg|> marker"}],
+            tokenize=True,
+        )
+
+        calls = processor.tokenizer.encode_calls
+        user_calls = [
+            kwargs for text, kwargs in calls if text == "literal <|end_of_msg|> marker"
+        ]
+        control_calls = [kwargs for text, kwargs in calls if text == "<|end_of_msg|>"]
+        self.assertTrue(user_calls)
+        self.assertTrue(control_calls)
+        self.assertTrue(user_calls[0]["split_special_tokens"])
+        self.assertFalse(control_calls[0]["split_special_tokens"])
+
+    def test_prompt_utils_uses_python_renderer_not_plain_fallback(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        processor = self._make_processor()
+        result = apply_chat_template(
+            processor,
+            {"model_type": "kimi_k3"},
+            "Describe this image.",
+            num_images=1,
+        )
+        self.assertIn("Describe this image.<|kimi_image_placeholder|>", result)
+        self.assertIn('<|open|>message role="assistant"', result)
+
+    def test_rejects_video_like_the_reference_processor(self):
+        processor = self._make_processor()
+        video = np.zeros((2, 16, 24, 3), dtype=np.uint8)
+
+        with self.assertRaisesRegex(ValueError, "unsupported media type: video"):
+            processor(videos=[video], text="Describe this video.")
+
+    def test_save_pretrained_does_not_persist_the_sentinel(self):
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import _CHAT_TEMPLATE_SENTINEL
+
+        processor = self._make_processor()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            processor.save_pretrained(tmpdir)
+            offenders = [f for f in os.listdir(tmpdir) if "chat_template" in f]
+            contents = {
+                name: (Path(tmpdir) / name).read_text()
+                for name in os.listdir(tmpdir)
+                if (Path(tmpdir) / name).is_file()
+            }
+        self.assertEqual(offenders, [])
+        for name, text in contents.items():
+            self.assertNotIn(_CHAT_TEMPLATE_SENTINEL, text, name)
+        self.assertEqual(processor.chat_template, _CHAT_TEMPLATE_SENTINEL)
+
+    def test_save_pretrained_restores_sentinel_on_failure(self):
+        import tempfile
+
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import _CHAT_TEMPLATE_SENTINEL
+
+        processor = self._make_processor()
+
+        def boom(save_directory, **kwargs):
+            raise RuntimeError("disk full")
+
+        processor.tokenizer.save_pretrained = boom
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(RuntimeError):
+                processor.save_pretrained(tmpdir)
+        self.assertEqual(processor.chat_template, _CHAT_TEMPLATE_SENTINEL)
+
+    def test_save_pretrained_persists_fast_tokenizer_for_local_reload(self):
+        import tempfile
+        from pathlib import Path
+
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import Whitespace
+        from transformers import PreTrainedTokenizerFast
+
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import KimiK3Processor
+
+        backend = Tokenizer(
+            WordLevel(
+                {"[UNK]": 0, "[PAD]": 1, "hello": 2},
+                unk_token="[UNK]",
+            )
+        )
+        backend.pre_tokenizer = Whitespace()
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+        )
+        processor = KimiK3Processor(tokenizer=tokenizer)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            processor.save_pretrained(tmpdir)
+            self.assertTrue((Path(tmpdir) / "tokenizer.json").is_file())
+            with patch(
+                "mlx_vlm.models.kimi_k3.processing_kimi_k3._convert_kimi_k3_tiktoken"
+            ) as convert_tiktoken:
+                reloaded = KimiK3Processor.from_pretrained(tmpdir)
+
+        convert_tiktoken.assert_not_called()
+        self.assertEqual(
+            reloaded.tokenizer.encode("hello", add_special_tokens=False),
+            [2],
+        )
+
+    def test_from_pretrained_uses_local_fast_tokenizer_without_remote_code(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import KimiK3Processor
+
+        tokenizer = self._make_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir)
+            (model_path / "tokenizer.json").write_text("{}")
+            (model_path / "preprocessor_config.json").write_text(
+                json.dumps({"media_proc_cfg": {"patch_size": 16}})
+            )
+            with (
+                patch(
+                    "mlx_vlm.models.kimi_k3.processing_kimi_k3."
+                    "PreTrainedTokenizerFast.from_pretrained",
+                    return_value=tokenizer,
+                ) as tokenizer_from_pretrained,
+                patch(
+                    "mlx_vlm.models.kimi_k3.processing_kimi_k3."
+                    "_convert_kimi_k3_tiktoken"
+                ) as convert_tiktoken,
+            ):
+                processor = KimiK3Processor.from_pretrained(model_path)
+
+        self.assertIsInstance(processor, KimiK3Processor)
+        self.assertEqual(tokenizer_from_pretrained.call_args.args[0], str(model_path))
+        tokenizer_kwargs = tokenizer_from_pretrained.call_args.kwargs
+        self.assertTrue(tokenizer_kwargs["local_files_only"])
+        self.assertFalse(tokenizer_kwargs["trust_remote_code"])
+        self.assertNotIn("revision", tokenizer_kwargs)
+        convert_tiktoken.assert_not_called()
+        self.assertEqual(processor.image_processor.patch_size, 16)
+
+    def test_from_pretrained_uses_remote_fast_tokenizer_when_available(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import KimiK3Processor
+
+        tokenizer = self._make_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            tokenizer_json = tmp_path / "tokenizer.json"
+            tokenizer_json.write_text("{}")
+            preprocessor_config = tmp_path / "preprocessor_config.json"
+            preprocessor_config.write_text(
+                json.dumps({"media_proc_cfg": {"patch_size": 18}})
+            )
+
+            def download(repo_id, filename, **kwargs):
+                self.assertEqual(repo_id, "moonshotai/Kimi-K3")
+                self.assertEqual(kwargs["revision"], "model-revision")
+                return {
+                    "tokenizer.json": tokenizer_json,
+                    "preprocessor_config.json": preprocessor_config,
+                }[filename]
+
+            with (
+                patch("huggingface_hub.hf_hub_download", side_effect=download),
+                patch(
+                    "mlx_vlm.models.kimi_k3.processing_kimi_k3."
+                    "PreTrainedTokenizerFast.from_pretrained",
+                    return_value=tokenizer,
+                ) as tokenizer_from_pretrained,
+                patch(
+                    "mlx_vlm.models.kimi_k3.processing_kimi_k3."
+                    "_convert_kimi_k3_tiktoken"
+                ) as convert_tiktoken,
+            ):
+                processor = KimiK3Processor.from_pretrained(
+                    "moonshotai/Kimi-K3",
+                    revision="model-revision",
+                )
+
+        self.assertIsInstance(processor, KimiK3Processor)
+        self.assertEqual(
+            tokenizer_from_pretrained.call_args.args[0], "moonshotai/Kimi-K3"
+        )
+        tokenizer_kwargs = tokenizer_from_pretrained.call_args.kwargs
+        self.assertEqual(tokenizer_kwargs["revision"], "model-revision")
+        self.assertFalse(tokenizer_kwargs["trust_remote_code"])
+        convert_tiktoken.assert_not_called()
+        self.assertEqual(processor.image_processor.patch_size, 18)
+
+    def test_from_pretrained_converts_local_tiktoken_model(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import KimiK3Processor
+
+        tokenizer = self._make_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir)
+            vocab_file = model_path / "tiktoken.model"
+            vocab_file.write_text("tiktoken ranks")
+            tokenizer_config = model_path / "tokenizer_config.json"
+            tokenizer_config.write_text(json.dumps({"added_tokens_decoder": {}}))
+            (model_path / "preprocessor_config.json").write_text("{}")
+            with (
+                patch(
+                    "mlx_vlm.models.kimi_k3.processing_kimi_k3."
+                    "_convert_kimi_k3_tiktoken",
+                    return_value=tokenizer,
+                ) as convert_tiktoken,
+                patch(
+                    "mlx_vlm.models.kimi_k3.processing_kimi_k3."
+                    "PreTrainedTokenizerFast.from_pretrained"
+                ) as tokenizer_from_pretrained,
+            ):
+                processor = KimiK3Processor.from_pretrained(model_path)
+
+        self.assertIsInstance(processor, KimiK3Processor)
+        convert_tiktoken.assert_called_once_with(vocab_file, tokenizer_config)
+        tokenizer_from_pretrained.assert_not_called()
+
+    def test_tiktoken_conversion_requires_optional_dependency(self):
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import _convert_kimi_k3_tiktoken
+
+        with patch("importlib.util.find_spec", return_value=None):
+            with self.assertRaisesRegex(
+                ImportError, "Install `tiktoken`.*tokenizer.json"
+            ):
+                _convert_kimi_k3_tiktoken("tiktoken.model", "tokenizer_config.json")
+
+    def test_runtime_conversion_restores_all_control_token_slots(self):
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import _kimi_k3_control_tokens
+
+        config = {
+            "added_tokens_decoder": {
+                "100": {"content": "[BOS]"},
+                "103": {"content": "<|open|>"},
+                "355": {"content": "[PAD]"},
+            }
+        }
+        tokens = _kimi_k3_control_tokens(config, base_vocab_size=100)
+
+        self.assertEqual(len(tokens), 256)
+        self.assertEqual(tokens[0], "[BOS]")
+        self.assertEqual(tokens[1], "<|reserved_token_101|>")
+        self.assertEqual(tokens[3], "<|open|>")
+        self.assertEqual(tokens[-1], "[PAD]")
+
+
 class TestPhi3VPatch(unittest.TestCase):
     def test_patch_intercepts(self):
         _assert_patch_intercepts(
             self, "phi3_v", "mlx_vlm.models.phi3_v.processing_phi3_v", "Phi3VProcessor"
         )
+
+
+class TestLagunaProcessor(unittest.TestCase):
+    @staticmethod
+    def _fast_tokenizer():
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import Whitespace
+        from transformers import PreTrainedTokenizerFast
+
+        tokenizer = Tokenizer(
+            WordLevel(
+                {"<unk>": 0, "<eos>": 1, "<pad>": 2, "prompt": 3},
+                unk_token="<unk>",
+            )
+        )
+        tokenizer.pre_tokenizer = Whitespace()
+        fast_tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer,
+            unk_token="<unk>",
+            eos_token="<eos>",
+            pad_token="<pad>",
+        )
+        fast_tokenizer.chat_template = "template"
+        return fast_tokenizer
+
+    def test_from_pretrained_loads_fast_tokenizer_directly(self):
+        from mlx_vlm.models.laguna.processing_laguna import LagunaProcessor
+
+        tokenizer = self._fast_tokenizer()
+        with patch(
+            "mlx_vlm.models.laguna.processing_laguna."
+            "PreTrainedTokenizerFast.from_pretrained",
+            return_value=tokenizer,
+        ) as from_pretrained:
+            processor = LagunaProcessor.from_pretrained(
+                "/tmp/model",
+                processor_kwargs={"local_files_only": True},
+                quantize_activations=True,
+                trust_remote_code=True,
+            )
+
+        self.assertIs(processor.tokenizer, tokenizer)
+        args, kwargs = from_pretrained.call_args
+        self.assertEqual(args, ("/tmp/model",))
+        self.assertTrue(kwargs["fix_mistral_regex"])
+        self.assertTrue(kwargs["local_files_only"])
+        self.assertTrue(kwargs["trust_remote_code"])
+        self.assertNotIn("processor_kwargs", kwargs)
+        self.assertNotIn("quantize_activations", kwargs)
+
+    def test_auto_processor_patch_intercepts_laguna(self):
+        import importlib
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        from mlx_vlm.models.laguna.processing_laguna import LagunaProcessor
+
+        importlib.import_module("mlx_vlm.models.laguna")
+
+        tokenizer = self._fast_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "laguna",
+                        "rope_parameters": {"sliding_attention": {"rope_type": "yarn"}},
+                    }
+                )
+            )
+            with patch(
+                "mlx_vlm.models.laguna.processing_laguna."
+                "PreTrainedTokenizerFast.from_pretrained",
+                return_value=tokenizer,
+            ):
+                processor = AutoProcessor.from_pretrained(
+                    tmpdir, quantize_activations=True
+                )
+
+        self.assertIsInstance(processor, LagunaProcessor)
+        self.assertIs(processor.tokenizer, tokenizer)
 
 
 class TestHunYuanVLPatch(unittest.TestCase):
@@ -2626,6 +3142,38 @@ class TestDeepseekV4Processor(unittest.TestCase):
         self.assertIsInstance(processor, DeepseekV4Processor)
 
 
+class TestPlamo2VLPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        import importlib
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        module = importlib.import_module("mlx_vlm.models.plamo2vl")
+        sentinel = object()
+
+        def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+            self.assertEqual(Path(pretrained_model_name_or_path), Path(tmpdir))
+            self.assertTrue(kwargs.get("trust_remote_code"))
+            return sentinel
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps({"model_type": "plamo2vl"}),
+                encoding="utf-8",
+            )
+            with patch.object(
+                module.Plamo2VLProcessor,
+                "from_pretrained",
+                classmethod(from_pretrained),
+            ):
+                processor = AutoProcessor.from_pretrained(tmpdir)
+
+        self.assertIs(processor, sentinel)
+
+
 class TestPatchChainsForUnknownModelType(unittest.TestCase):
     def test_falls_through(self):
         import importlib
@@ -2736,6 +3284,101 @@ class TestLocateAnythingProcessor(unittest.TestCase):
             self.assertEqual(reloaded.image_processor.in_token_limit, 1234)
             self.assertEqual(reloaded.chat_template, chat_template)
             self.assertEqual(reloaded.tokenizer.chat_template, chat_template)
+
+
+class TestMuseGlimmerProcessor(unittest.TestCase):
+    def test_from_pretrained_attaches_model_config(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.muse_glimmer.processing_muse_glimmer import (
+            MuseGlimmerProcessor,
+        )
+
+        tokenizer = _mock_tokenizer(chat_template="{{ messages }}")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "muse_glimmer",
+                        "text_config": {
+                            "vocab_size": 1234,
+                            "eos_token_id": 99,
+                        },
+                    }
+                )
+            )
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=tokenizer,
+                ),
+                patch.object(
+                    MuseGlimmerProcessor,
+                    "check_argument_for_proper_class",
+                    return_value=None,
+                ),
+            ):
+                processor = MuseGlimmerProcessor.from_pretrained(tmpdir)
+
+        self.assertEqual(processor.config.model_type, "muse_glimmer")
+        self.assertEqual(processor.config.vocab_size, 1234)
+        self.assertEqual(processor.config.eos_token_id, 99)
+        self.assertEqual(processor.config.thinking_start_token, "to=self<|message|>")
+        self.assertEqual(processor.config.thinking_end_token, "<|eom|>")
+
+
+class TestProcessorRegistration(unittest.TestCase):
+    _AFFECTED_MODULES = (
+        "mlx_vlm.models.glm4v.glm4v",
+        "mlx_vlm.models.glm4v_moe.glm4v_moe",
+        "mlx_vlm.models.deepseek_vl_v2.deepseek_vl_v2",
+        "mlx_vlm.models.deepseekocr.deepseekocr",
+        "mlx_vlm.models.deepseekocr_2.deepseekocr_2",
+        "mlx_vlm.models.unlimited_ocr.unlimitedocr",
+        "mlx_vlm.models.jina_vlm.jina_vlm",
+    )
+
+    def test_no_string_first_autoprocessor_register(self):
+        import re
+        from pathlib import Path
+
+        import mlx_vlm
+
+        models_dir = Path(mlx_vlm.__file__).parent / "models"
+        pattern = re.compile(r"""AutoProcessor\.register\(\s*['"]""")
+        offenders = [
+            str(path.relative_to(models_dir))
+            for path in models_dir.rglob("*.py")
+            if pattern.search(path.read_text())
+        ]
+        self.assertEqual(offenders, [], f"string-first register calls: {offenders}")
+
+    def test_affected_modules_import_cleanly(self):
+        import importlib
+
+        for module in self._AFFECTED_MODULES:
+            with self.subTest(module=module):
+                importlib.import_module(module)
+
+
+class TestTrustRemoteCodePassthrough(unittest.TestCase):
+    """Regression test for #1724 — an explicit trust_remote_code must not be overridden."""
+
+    def test_molmo_point_honors_explicit_false(self):
+        from mlx_vlm.models.molmo_point import processing_molmo_point
+
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained") as from_pretrained,
+            patch.object(processing_molmo_point, "load_chat_template"),
+        ):
+            processing_molmo_point.MolmoPointProcessor.from_pretrained(
+                "/tmp/model", trust_remote_code=False
+            )
+
+        _, kwargs = from_pretrained.call_args
+        self.assertFalse(kwargs["trust_remote_code"])
 
 
 if __name__ == "__main__":

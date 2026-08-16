@@ -487,10 +487,6 @@ class Gemma4TextModel(nn.Module):
         """Create attention masks, deduplicated by layer type."""
         mask = {}
         masks = []
-        has_audio_tokens = (
-            mm_token_type_ids is not None
-            and int(mx.sum(mm_token_type_ids == 3).item()) > 0
-        )
         has_visual_tokens = (
             mm_token_type_ids is not None
             and int(mx.sum((mm_token_type_ids == 1) | (mm_token_type_ids == 2)).item())
@@ -502,7 +498,6 @@ class Gemma4TextModel(nn.Module):
             getattr(self.config, "use_bidirectional_attention", None) == "vision"
             and mm_token_type_ids is not None
             and has_visual_tokens
-            and not has_audio_tokens
             and h.shape[1] > 1
         )
         for l, c in zip(self.layers, cache):
@@ -655,6 +650,8 @@ class Gemma4TextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    supports_logits_to_keep = True
+
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
@@ -731,6 +728,7 @@ class LanguageModel(nn.Module):
         # Allow callers to pass pre-allocated sinks directly.
         hidden_sink = kwargs.pop("hidden_sink", hidden_sink)
         shared_kv_sink = kwargs.pop("shared_kv_sink", shared_kv_sink)
+        logits_to_keep = kwargs.pop("logits_to_keep", None)
 
         out = self.model(
             inputs,
@@ -743,6 +741,8 @@ class LanguageModel(nn.Module):
             shared_kv_sink=shared_kv_sink,
             **kwargs,
         )
+        if logits_to_keep:
+            out = out[:, -int(logits_to_keep) :, :]
         out = self.logits_from_hidden(out)
         return LanguageModelOutput(
             logits=out,

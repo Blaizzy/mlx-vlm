@@ -865,7 +865,7 @@ class VisionTower(nn.Module):
         msfa_indices = (3, 4)
         msfa_output_resolution = (16, 16)
 
-        (num_features, self.blocks) = self.build()
+        num_features, self.blocks = self.build()
         self.num_features = self.head_hidden_size = (
             num_features  # output of msfa is output of forward_features()
         )

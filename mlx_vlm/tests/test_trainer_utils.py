@@ -78,22 +78,6 @@ class TestTrainerUtils(unittest.TestCase):
         result = find_all_linear_names(model)
         self.assertEqual(set(result), {"layer1", "layer2"})
 
-    @patch("mlx_lm.utils.load_adapters")
-    def test_apply_lora_layers_dispatches_text_model_adapters(self, mock_load_adapters):
-        inner_model = MagicMock()
-        loaded_inner_model = MagicMock()
-        mock_load_adapters.return_value = loaded_inner_model
-
-        model = MagicMock()
-        model._is_text_model = True
-        model.language_model._model = inner_model
-
-        result = apply_lora_layers(model, "adapter-dir")
-
-        self.assertIs(result, model)
-        mock_load_adapters.assert_called_once_with(inner_model, "adapter-dir")
-        self.assertIs(model.language_model._model, loaded_inner_model)
-
     @patch("mlx_vlm.trainer.utils.get_peft_model")
     def test_apply_lora_layers_keeps_vlm_adapter_schema(self, mock_get_peft):
         with TemporaryDirectory() as tmpdir:
@@ -105,7 +89,6 @@ class TestTrainerUtils(unittest.TestCase):
             (adapter_dir / "adapters.safetensors").touch()
 
             model = MagicMock()
-            model._is_text_model = False
             model.language_model.named_modules.return_value = []
             mock_get_peft.return_value = model
 
@@ -119,7 +102,7 @@ class TestTrainerUtils(unittest.TestCase):
                 str(adapter_dir / "adapters.safetensors"), strict=False
             )
 
-    def test_apply_lora_layers_loads_mlx_lm_vlm_schema(self):
+    def test_apply_lora_layers_loads_native_vlm_schema(self):
         class DummyLanguageModel(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -137,8 +120,7 @@ class TestTrainerUtils(unittest.TestCase):
         with TemporaryDirectory() as tmpdir:
             adapter_dir = Path(tmpdir) / "adapter"
             adapter_dir.mkdir()
-            (adapter_dir / "adapter_config.json").write_text(
-                """
+            (adapter_dir / "adapter_config.json").write_text("""
                 {
                   "fine_tune_type": "lora",
                   "num_layers": -1,
@@ -149,8 +131,7 @@ class TestTrainerUtils(unittest.TestCase):
                     "keys": ["language_model.proj"]
                   }
                 }
-                """
-            )
+                """)
             (adapter_dir / "adapters.safetensors").touch()
 
             model = DummyModel()

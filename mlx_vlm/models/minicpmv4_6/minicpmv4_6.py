@@ -5,6 +5,11 @@ import mlx.nn as nn
 import numpy as np
 
 from ..base import InputEmbeddingsFeatures
+from ..qwen3_5.qwen3_5 import (
+    NORM_WEIGHT_SUFFIXES,
+    should_offset_norm_weight,
+    should_shift_norm_weights,
+)
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel, check_array_shape
@@ -423,14 +428,8 @@ class Model(nn.Module):
         return output
 
     def sanitize(self, weights):
+        shift_norm_weights = should_shift_norm_weights(weights)
         sanitized_weights = {}
-        offset_norm_keys = (
-            ".input_layernorm.weight",
-            ".post_attention_layernorm.weight",
-            "model.norm.weight",
-            ".q_norm.weight",
-            ".k_norm.weight",
-        )
 
         for key, value in weights.items():
             original_key = key
@@ -484,7 +483,8 @@ class Model(nn.Module):
                 value = value.transpose(0, 2, 3, 1)
             if (
                 original_key.startswith("model.language_model.")
-                and any(key.endswith(suffix) for suffix in offset_norm_keys)
+                and should_offset_norm_weight(original_key, shift_norm_weights)
+                and any(key.endswith(suffix) for suffix in NORM_WEIGHT_SUFFIXES)
                 and value.ndim == 1
             ):
                 value = value + 1.0
