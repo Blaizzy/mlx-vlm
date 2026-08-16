@@ -287,10 +287,22 @@ class RuntimeConfig:
                 applied[name] = value
         return applied, rejected
 
+    def _in_cache_key(self, name: str) -> bool:
+        # Callers must hold self._lock. A knob outside the cache key cannot
+        # change the fingerprint, so changing it never reloads a model.
+        if name in _LIVE_KNOBS:
+            return False
+        if name.startswith("apc_") and name != "apc_enabled" and not self.apc_enabled:
+            return False
+        return True
+
     def reload_kinds(self, applied: Dict[str, Any]) -> Set[str]:
         kinds: Set[str] = set()
-        for name in applied:
-            kinds.update(_KNOB_SPEC[name]["reload_kinds"])
+        with self._lock:
+            for name in applied:
+                if not self._in_cache_key(name):
+                    continue
+                kinds.update(_KNOB_SPEC[name]["reload_kinds"])
         return kinds
 
     def fingerprint(self, kinds: Optional[Iterable[str]] = None) -> str:
@@ -298,16 +310,10 @@ class RuntimeConfig:
         items: List[Tuple[str, str]] = []
         with self._lock:
             for name in _KNOB_SPEC:
-                if name in _LIVE_KNOBS:
+                if not self._in_cache_key(name):
                     continue
                 spec = _KNOB_SPEC[name]
                 if kind_set is not None and not (set(spec["reload_kinds"]) & kind_set):
-                    continue
-                if (
-                    name.startswith("apc_")
-                    and name != "apc_enabled"
-                    and not self.apc_enabled
-                ):
                     continue
                 value = getattr(self, name)
                 items.append((name, "" if value is None else str(value)))

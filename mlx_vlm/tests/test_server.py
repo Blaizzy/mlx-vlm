@@ -7244,6 +7244,30 @@ class TestRuntimeConfig:
         applied, _ = cfg.apply_changes({"vision_cache_size": 10})
         assert cfg.reload_kinds(applied) == {"image_generation", "image_edit"}
 
+    def test_reload_kinds_excludes_live_knobs(self):
+        cfg = RuntimeConfig.from_env()
+        before = cfg.fingerprint()
+        applied, _ = cfg.apply_changes(
+            {"max_kv_size": 4096, "token_queue_timeout": 30.0}
+        )
+        assert applied == {"max_kv_size": 4096, "token_queue_timeout": 30.0}
+        assert cfg.reload_kinds(applied) == set()
+        assert cfg.fingerprint() == before
+
+    def test_reload_kinds_excludes_apc_knobs_while_disabled(self):
+        cfg = RuntimeConfig.from_env()
+        cfg.apply_changes({"apc_enabled": False})
+        before = cfg.fingerprint()
+
+        applied, _ = cfg.apply_changes({"apc_block_size": 32})
+        assert applied == {"apc_block_size": 32}
+        assert cfg.reload_kinds(applied) == set()
+        assert cfg.fingerprint() == before
+
+        applied, _ = cfg.apply_changes({"apc_enabled": True, "apc_block_size": 64})
+        assert cfg.reload_kinds(applied) == {"text_generation"}
+        assert cfg.fingerprint() != before
+
     def test_settings_endpoints_get_and_patch(self, client, monkeypatch):
         monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
         cfg = server.runtime.config
