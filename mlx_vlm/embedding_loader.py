@@ -8,6 +8,7 @@ EMBEDDING_MODEL_REMAPPING = {
     "qwen3": "qwen3_embedding",
     "gemma3_text": "gemma3_embedding",
     "lfm2": "lfm2_embedding",
+    "ministral3": "ministral3_embedding",
     "xlm-roberta": "xlm_roberta",
 }
 

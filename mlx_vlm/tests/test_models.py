@@ -15506,3 +15506,110 @@ class TestCohereCompass(unittest.TestCase):
         processor(text=["short", "longer"], padding=True)
 
         self.assertEqual(processor.tokenizer.last_kwargs["padding_side"], "left")
+
+
+class TestMinistral3Embedding(unittest.TestCase):
+    @staticmethod
+    def _model():
+        from mlx_vlm.models import ministral3_embedding
+
+        config = ministral3_embedding.ModelConfig(
+            model_type="ministral3",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=99,
+            head_dim=8,
+            max_position_embeddings=64,
+            rope_parameters={
+                "rope_theta": 10000.0,
+                "llama_4_scaling_beta": 0.1,
+                "original_max_position_embeddings": 64,
+            },
+        )
+        mx.random.seed(0)
+        return ministral3_embedding.Model(config), config
+
+    @staticmethod
+    def _cosine(a, b):
+        return (a * b).sum() / (mx.linalg.norm(a) * mx.linalg.norm(b))
+
+    def test_ministral3_embedding_forward(self):
+        model, config = self._model()
+
+        batch, seq = 2, 5
+        input_ids = mx.array(np.random.randint(0, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+    def test_ministral3_embedding_attends_to_later_tokens(self):
+        model, _ = self._model()
+        mask = mx.ones((1, 4))
+
+        first = model(mx.array([[1, 2, 3, 4]]), attention_mask=mask)
+        changed = model(mx.array([[1, 2, 3, 42]]), attention_mask=mask)
+
+        # A causal backbone would leave token 0 untouched by a later token.
+        delta = mx.abs(
+            first.last_hidden_state[0, 0] - changed.last_hidden_state[0, 0]
+        ).max()
+        self.assertGreater(delta.item(), 1e-3)
+
+    def test_ministral3_embedding_ignores_masked_positions(self):
+        model, _ = self._model()
+        mask = mx.array([[1.0, 1.0, 1.0, 0.0, 0.0]])
+
+        kept = model(mx.array([[1, 2, 3, 0, 0]]), attention_mask=mask).text_embeds
+        swapped = model(mx.array([[1, 2, 3, 77, 88]]), attention_mask=mask).text_embeds
+
+        self.assertTrue(mx.allclose(kept, swapped, atol=1e-6).item())
+
+    def test_ministral3_embedding_is_invariant_to_padding(self):
+        model, _ = self._model()
+
+        alone = model(mx.array([[1, 2, 3]]), attention_mask=mx.ones((1, 3))).text_embeds
+        padded = model(
+            mx.array([[1, 2, 3, 0, 0]]),
+            attention_mask=mx.array([[1.0, 1.0, 1.0, 0.0, 0.0]]),
+        ).text_embeds
+
+        self.assertGreater(self._cosine(alone[0], padded[0]).item(), 1 - 1e-5)
+
+    def test_ministral3_embedding_is_invariant_to_batch_order(self):
+        model, _ = self._model()
+        input_ids = mx.array([[1, 2, 3], [5, 6, 7]])
+        mask = mx.ones((2, 3))
+
+        out = model(input_ids, attention_mask=mask).text_embeds
+        reversed_out = model(input_ids[::-1], attention_mask=mask).text_embeds
+
+        self.assertGreater(self._cosine(out[0], reversed_out[1]).item(), 1 - 1e-5)
+
+    def test_ministral3_embedding_sanitize_drops_lm_head(self):
+        model, _ = self._model()
+
+        weights = model.sanitize(
+            {
+                "lm_head.weight": mx.zeros((2, 2)),
+                "embed_tokens.weight": mx.zeros((2, 2)),
+                "model.norm.weight": mx.zeros((2,)),
+            }
+        )
+
+        self.assertEqual(
+            sorted(weights), ["model.embed_tokens.weight", "model.norm.weight"]
+        )
+
+    def test_ministral3_is_remapped_to_the_embedding_model(self):
+        from mlx_vlm.embedding_loader import EMBEDDING_MODEL_REMAPPING
+
+        self.assertEqual(
+            EMBEDDING_MODEL_REMAPPING["ministral3"], "ministral3_embedding"
+        )
