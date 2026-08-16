@@ -10,6 +10,7 @@ from ..base import (
 )
 from ..cache import KVCache
 from ..mlp import SwiGLUMLP as MLP
+from ..rope_utils import initialize_rope
 from .config import TextConfig
 
 
@@ -68,8 +69,12 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        self.rope = nn.RoPE(
-            head_dim, traditional=args.rope_traditional, base=args.rope_theta
+        self.rope = initialize_rope(
+            dims=head_dim,
+            base=args.rope_theta,
+            traditional=args.rope_traditional,
+            scaling_config=args.rope_scaling,
+            max_position_embeddings=args.max_position_embeddings,
         )
 
     def __call__(

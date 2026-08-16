@@ -3099,6 +3099,75 @@ class TestModels(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 1, config.vocab_size))
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
 
+    def test_gemma3_rope_scaling_applies_only_to_global_attention(self):
+        from mlx_vlm.models import gemma3
+        from mlx_vlm.models.gemma3.language import LanguageModel
+
+        config = gemma3.TextConfig(
+            model_type="gemma3_text",
+            hidden_size=16,
+            num_hidden_layers=6,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            vocab_size=32,
+            sliding_window_pattern=3,
+            rope_scaling={"rope_type": "linear", "factor": 8.0},
+        )
+
+        model = LanguageModel(config)
+
+        for layer_idx, layer in enumerate(model.layers):
+            expected_scale = 0.125 if (layer_idx + 1) % 3 == 0 else 1.0
+            self.assertEqual(layer.self_attn.rope.scale, expected_scale)
+
+    def test_gemma3_rope_without_scaling(self):
+        from mlx_vlm.models import gemma3
+        from mlx_vlm.models.gemma3.language import LanguageModel
+
+        config = gemma3.TextConfig(
+            model_type="gemma3_text",
+            hidden_size=16,
+            num_hidden_layers=3,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            vocab_size=32,
+            sliding_window_pattern=3,
+        )
+
+        model = LanguageModel(config)
+
+        for layer in model.layers:
+            self.assertEqual(layer.self_attn.rope.scale, 1.0)
+
+    def test_gemma3n_rope_scaling_applies_only_to_global_attention(self):
+        from mlx_vlm.models import gemma3n
+        from mlx_vlm.models.gemma3n.language import Gemma3nAttention
+
+        config = gemma3n.TextConfig(
+            model_type="gemma3n_text",
+            hidden_size=16,
+            num_hidden_layers=2,
+            intermediate_size=[32, 32],
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            vocab_size=32,
+            layer_types=["sliding_attention", "full_attention"],
+            rope_scaling={"rope_type": "linear", "factor": 8.0},
+        )
+
+        sliding = Gemma3nAttention(config, layer_idx=0, is_kv_shared_layer=False)
+        global_attention = Gemma3nAttention(
+            config, layer_idx=1, is_kv_shared_layer=False
+        )
+
+        self.assertEqual(sliding.rope.scale, 1.0)
+        self.assertEqual(global_attention.rope.scale, 0.125)
+
     def test_llama_language_model(self):
         from mlx_vlm.models import llama
 
@@ -5759,6 +5828,39 @@ class TestModels(unittest.TestCase):
 
         self.assertEqual(output.shape, (1, 1, 1, 4))
 
+    def test_mllama_rope_scaling_is_applied(self):
+        from mlx_vlm.models import mllama
+        from mlx_vlm.models.rope_utils import Llama3RoPE
+
+        config = mllama.TextConfig(
+            hidden_size=16,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            rope_scaling={
+                "rope_type": "llama3",
+                "factor": 8.0,
+                "high_freq_factor": 4.0,
+                "low_freq_factor": 1.0,
+                "original_max_position_embeddings": 8192,
+            },
+        )
+
+        attn = mllama.language.MllamaTextSelfAttention(config, layer_idx=0)
+        self.assertIsInstance(attn.rope, Llama3RoPE)
+
+    def test_mllama_without_rope_scaling_is_plain(self):
+        from mlx_vlm.models import mllama
+
+        config = mllama.TextConfig(
+            hidden_size=16,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            rope_scaling=None,
+        )
+        attn = mllama.language.MllamaTextSelfAttention(config, layer_idx=0)
+
+        self.assertAlmostEqual(attn.rope.scale, 1.0)
+
     def test_mllama(self):
         from mlx_vlm.models import mllama
 
@@ -5932,6 +6034,28 @@ class TestModels(unittest.TestCase):
         apply_generation_config_defaults(config, {"eos_token_id": [151645, 151646]})
 
         self.assertEqual(config.eos_token_id, [151645, 151646])
+
+    def test_molmo_point_applies_rope_scaling_only_to_configured_layers(self):
+        from mlx_vlm.models import molmo_point
+
+        config = molmo_point.TextConfig(
+            hidden_size=16,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=4,
+            vocab_size=16,
+            additional_vocab_size=4,
+            num_hidden_layers=2,
+            intermediate_size=32,
+            max_position_embeddings=16,
+            rope_scaling={"type": "linear", "factor": 2.0},
+            rope_scaling_layers=[1],
+        )
+
+        transformer = molmo_point.language.Molmo2Transformer(config)
+
+        self.assertAlmostEqual(transformer.blocks[0].self_attn.rotary_emb.scale, 1.0)
+        self.assertAlmostEqual(transformer.blocks[1].self_attn.rotary_emb.scale, 0.5)
 
     def test_molmo2_sanitizes_non_finite_image_features(self):
         from mlx_vlm.models.molmo2.molmo2 import (
@@ -7624,6 +7748,29 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
             vision_feature_layer=0,
         )
+
+    def test_phi4mm_longrope_uses_top_level_original_context_length(self):
+        from mlx_vlm.models import phi4mm
+        from mlx_vlm.models.rope_utils import SuScaledRoPE
+
+        config = phi4mm.ModelConfig(
+            hidden_size=16,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=16,
+            original_max_position_embeddings=8,
+            rope_scaling={
+                "type": "longrope",
+                "short_factor": [1.0, 1.0],
+                "long_factor": [2.0, 2.0],
+            },
+        )
+
+        attn = phi4mm.language.Attention(config)
+
+        self.assertIsInstance(attn.rope, SuScaledRoPE)
+        self.assertEqual(attn.rope.original_max_position_embeddings, 8)
 
     def test_phi4mm(self):
         from mlx_vlm.models import phi4mm
