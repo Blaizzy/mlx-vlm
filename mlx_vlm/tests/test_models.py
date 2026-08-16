@@ -1789,6 +1789,27 @@ class TestSmolVLMFlattenedImageFeatures(unittest.TestCase):
         self.assertEqual(output.shape, inputs_embeds.shape)
         self.assertTrue(mx.array_equal(output, expected).item())
 
+    def test_prepare_inputs_rejects_split_image_token_mismatch(self):
+        """#1919 production shape: 81 placeholders vs 13 flattened tiles.
+
+        The Idefics3 1:1 scatter must keep rejecting this. The processor is
+        what expands the prompt to 13 x 81 tokens; do not paper over the
+        mismatch by dropping extra tiles.
+        """
+        from mlx_vlm.models import smolvlm
+
+        model = SimpleNamespace(config=SimpleNamespace(image_token_index=9))
+        n_tokens, n_tiles, hidden = 81, 13, 3
+        seq = 1 + n_tokens + 1
+        input_ids = mx.array([[1] + [9] * n_tokens + [2]])
+        inputs_embeds = mx.zeros((1, seq, hidden))
+        image_features = mx.zeros((n_tiles * n_tokens, hidden))
+
+        with self.assertRaisesRegex(ValueError, r"tokens: 81, features 1053"):
+            smolvlm.Model._prepare_inputs_for_multimodal(
+                model, image_features, inputs_embeds, input_ids
+            )
+
 
 class TestModels(unittest.TestCase):
     def language_test_runner(self, model, model_type, vocab_size, num_layers):
