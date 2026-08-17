@@ -66,6 +66,7 @@ class VisionFeatureCache:
         # cannot serialise to the same byte stream (without this, {"a": [1, 23]}
         # and {"a": [12, 3]} hash identically).
         if isinstance(value, mx.array):
+            hasher.update(f"mx|{value.dtype}|".encode())  # np widens bf16
             try:
                 value = np.asarray(value)
             except Exception:
