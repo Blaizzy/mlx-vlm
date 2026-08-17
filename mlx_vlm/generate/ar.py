@@ -34,6 +34,7 @@ from .common import (
     DEFAULT_KV_QUANT_SCHEME,
     DEFAULT_QUANTIZED_KV_START,
     _chunked_prefill_enabled,
+    _default_prefill_step_size_for_offload,
     generation_stream,
     maybe_quantize_kv_cache,
     wired_limit,
@@ -406,6 +407,9 @@ def generate_step(
         policy_kwargs = kwargs
         if speculative_prefill_capture_kwargs:
             policy_kwargs = {**kwargs, **speculative_prefill_capture_kwargs}
+        prefill_step_size = _default_prefill_step_size_for_offload(
+            model, prefill_step_size, draft_model, DEFAULT_PREFILL_STEP_SIZE
+        )
         if prefill_step_size is not None and not _chunked_prefill_enabled(
             model,
             input_ids=input_ids,
@@ -1738,6 +1742,9 @@ class PromptProcessingBatch:
                     )
                 prepare(right_padding=right_pad_per_row, lengths=self._suffix_lens)
 
+        self.prefill_step_size = _default_prefill_step_size_for_offload(
+            self.model, self.prefill_step_size, draft_model, DEFAULT_PREFILL_STEP_SIZE
+        )
         if self.prefill_step_size is not None:
             policy_kwargs = dict(self._prompt_kwargs)
             if draft_model is not None and draft_kind is not None:
@@ -3152,6 +3159,12 @@ def _generate_batch(
         **{k: v for k, v in embedding_output.to_dict().items() if v is not None},
     }
 
+    kwargs["prefill_step_size"] = _default_prefill_step_size_for_offload(
+        model,
+        kwargs.get("prefill_step_size", DEFAULT_PREFILL_STEP_SIZE),
+        kwargs.get("draft_model"),
+        DEFAULT_PREFILL_STEP_SIZE,
+    )
     if kwargs.get("prefill_step_size", DEFAULT_PREFILL_STEP_SIZE) is not None:
         policy_kwargs = dict(gen_kwargs)
         draft_model = kwargs.get("draft_model")
