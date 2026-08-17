@@ -3,11 +3,13 @@ from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_map
 
 from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    kv_sequence_length,
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
@@ -1638,13 +1640,13 @@ class Qwen3_5Attention(nn.Module):
             output = None
 
         if output is None and target_verify and L > 1:
-            prefix_len = keys.shape[-2] - L
+            prefix_len = kv_sequence_length(keys) - L
             output = mx.concatenate(
                 [
                     scaled_dot_product_attention(
                         queries[:, :, i : i + 1, :],
-                        keys[:, :, : prefix_len + i + 1, :],
-                        values[:, :, : prefix_len + i + 1, :],
+                        tree_map(lambda x: x[..., : prefix_len + i + 1, :], keys),
+                        tree_map(lambda x: x[..., : prefix_len + i + 1, :], values),
                         cache=cache,
                         scale=self.scale,
                         mask=(

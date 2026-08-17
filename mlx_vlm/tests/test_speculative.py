@@ -1085,6 +1085,39 @@ def test_qwen3_5_single_row_quantized_batch_cache_keeps_prompt_state():
     assert quantized_cache.offset.tolist() == [4]
 
 
+def test_qwen3_5_target_verify_handles_uniform_quantized_batch_cache():
+    mx.random.seed(0)
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.hidden_size = 64
+    text_config.intermediate_size = 128
+    text_config.num_attention_heads = 2
+    text_config.num_key_value_heads = 1
+    text_config.head_dim = 32
+    attention = qwen_language.Qwen3_5Attention(text_config)
+    mx.eval(attention.parameters())
+
+    verify_cache = BatchQuantizedKVCache([0], group_size=32, bits=8)
+    singleton_cache = BatchQuantizedKVCache([0], group_size=32, bits=8)
+    prompt = mx.random.normal((1, 4, text_config.hidden_size))
+    verify_tokens = mx.random.normal((1, 3, text_config.hidden_size))
+
+    verify_prompt = attention(prompt, cache=verify_cache)
+    singleton_prompt = attention(prompt, cache=singleton_cache)
+    mx.eval(verify_prompt, singleton_prompt)
+    verified = attention(verify_tokens, cache=verify_cache, target_verify=True)
+    singleton = mx.concatenate(
+        [
+            attention(verify_tokens[:, i : i + 1], cache=singleton_cache)
+            for i in range(verify_tokens.shape[1])
+        ],
+        axis=1,
+    )
+    mx.eval(verified, singleton)
+
+    assert verified.shape == singleton.shape == (1, 3, text_config.hidden_size)
+    assert mx.allclose(verified, singleton, rtol=1e-4, atol=1e-4).item()
+
+
 def test_qwen3_5_single_row_shortcut_skips_quantized_batch_caches():
     assert qwen_language._is_single_row_batch_cache(BatchKVCache([0]))
     assert not qwen_language._is_single_row_batch_cache(
@@ -3042,6 +3075,23 @@ def test_qwen3_5_rollback_speculative_cache_trims_batch_rows_ragged():
     assert cache._idx == 5
     assert cache.offset.tolist() == [5, 3]
     assert cache.left_padding.tolist() == [0, 2]
+
+
+def test_qwen3_5_rollback_speculative_cache_trims_uniform_quantized_batch_kv():
+    cache = BatchQuantizedKVCache([0], group_size=32, bits=8)
+    keys = mx.arange(1 * 1 * 7 * 32, dtype=mx.float32).reshape(1, 1, 7, 32)
+    values = keys + 100
+    cache.update_and_fetch(keys, values)
+
+    qwen_language.LanguageModel.rollback_speculative_cache(
+        None, [cache], [], accepted=0, block_size=3
+    )
+
+    mx.eval(cache.offset)
+    assert cache._idx == 5
+    assert cache.offset.tolist() == [5]
+    assert cache.state[0][0].shape[-2] == 5
+    assert cache.state[1][0].shape[-2] == 5
 
 
 def test_qwen3_5_rollback_speculative_cache_handles_turboquant_batch_kv():
