@@ -1,14 +1,10 @@
 import argparse
-import glob
-import json
-import shutil
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Optional
 
 import mlx.core as mx
-from safetensors import safe_open
 
-from ....utils import get_model_path
+from ..mtp_split import MTPSplitter
 
 # GLM-4.7-Flash ships one trained nextn (MTP) layer as
 # ``model.layers.<num_hidden_layers>.*`` (a dedicated ``embed_tokens``, the
@@ -32,61 +28,6 @@ _MTP_MLP_PREFIX = "model.mtp_block.mlp"
 # Registered attention buffers that are recomputed at build time; they have no
 # home in the flat layout, so a strict load would reject them if kept.
 _SKIP_BUFFER_SUFFIXES = ("rotary_emb.inv_freq",)
-
-
-def _safetensor_files(model_path: Path) -> List[Path]:
-    return [
-        Path(path)
-        for path in glob.glob(str(model_path / "*.safetensors"))
-        if not path.endswith("consolidated.safetensors")
-    ]
-
-
-def _weight_map(model_path: Path) -> Dict[str, str]:
-    index_path = model_path / "model.safetensors.index.json"
-    if not index_path.exists():
-        return {}
-    with open(index_path) as f:
-        data = json.load(f)
-    return data.get("weight_map", {})
-
-
-def _iter_nextn_keys(
-    model_path: Path, nextn_prefix: str
-) -> Iterable[tuple[Path, List[str]]]:
-    """Yield (shard, keys) for the shards that hold the nextn layer tensors.
-
-    Uses the weight index when present (so only the handful of shards with
-    nextn tensors are touched), otherwise scans the local safetensors files.
-    """
-    weight_map = _weight_map(model_path)
-    if weight_map:
-        by_file: Dict[str, List[str]] = {}
-        for key, filename in weight_map.items():
-            if key.startswith(nextn_prefix):
-                by_file.setdefault(filename, []).append(key)
-        if by_file:
-            for filename, keys in by_file.items():
-                yield model_path / filename, keys
-            return
-
-    for file in _safetensor_files(model_path):
-        with safe_open(file, framework="mlx") as f:
-            keys = [key for key in f.keys() if key.startswith(nextn_prefix)]
-        if keys:
-            yield file, keys
-
-
-def _load_selected_tensors(file: Path, keys: List[str]) -> Dict[str, mx.array]:
-    tensors = {}
-    try:
-        with safe_open(file, framework="mlx") as f:
-            for key in keys:
-                tensors[key] = mx.array(f.get_tensor(key))
-    except (AttributeError, RuntimeError, TypeError):
-        shard = mx.load(str(file))
-        tensors = {key: shard[key] for key in keys}
-    return tensors
 
 
 def _is_nonparameter_buffer(rest: str) -> bool:
@@ -193,6 +134,51 @@ def _quantize(
     return {"group_size": group_size, "bits": bits, "mode": "affine"}
 
 
+class Glm4MoeLiteMTPSplitter(MTPSplitter):
+    output_model_type = "glm4_moe_lite_mtp"
+    draft_model_cls = None
+    require_text_config = False
+    tie_word_embeddings_default = False
+    depth_field = "num_nextn_predict_layers"
+    block_size_extra = 1
+    tokenizer_files = (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "merges.txt",
+        "special_tokens_map.json",
+        "generation_config.json",
+        "chat_template.jinja",
+    )
+
+    def read_text_config(self, source_config: dict) -> dict:
+        text_config = dict(source_config.get("text_config") or source_config)
+        text_config.pop("quantization", None)
+        text_config.pop("quantization_config", None)
+        return text_config
+
+    def _nextn_prefix(self, text_config: dict) -> str:
+        return f"model.layers.{int(text_config['num_hidden_layers'])}."
+
+    def select_keys(self, key: str, text_config: dict) -> bool:
+        return key.startswith(self._nextn_prefix(text_config))
+
+    def rename(
+        self, tensors: Dict[str, mx.array], text_config: dict
+    ) -> Dict[str, mx.array]:
+        return _flatten_nextn_weights(tensors, self._nextn_prefix(text_config))
+
+    def postprocess(self, tensors: Dict[str, mx.array], text_config: dict) -> None:
+        _split_kv_b_proj(tensors, text_config)
+        _stack_experts(tensors, text_config)
+
+    def quantization(self, tensors, source_config, text_config, quant_opts):
+        q_bits = quant_opts.get("q_bits")
+        if q_bits is None:
+            return None
+        return _quantize(tensors, q_bits, quant_opts.get("q_group_size", 64))
+
+
 def split_glm4_moe_lite_mtp(
     source: str,
     output: str,
@@ -204,69 +190,15 @@ def split_glm4_moe_lite_mtp(
     q_group_size: int = 64,
 ) -> Path:
     """Write GLM-4.7-Flash native MTP tensors into a standalone drafter folder."""
-    source_path = get_model_path(
-        source, revision=revision, force_download=force_download
+    return Glm4MoeLiteMTPSplitter().split(
+        source,
+        output,
+        revision=revision,
+        block_size=block_size,
+        force_download=force_download,
+        q_bits=q_bits,
+        q_group_size=q_group_size,
     )
-    output_path = Path(output)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    with open(source_path / "config.json") as f:
-        source_config = json.load(f)
-    text_config = dict(source_config.get("text_config") or source_config)
-
-    nextn_prefix = f"model.layers.{int(text_config['num_hidden_layers'])}."
-    selected = {}
-    for file, keys in _iter_nextn_keys(source_path, nextn_prefix):
-        selected.update(_load_selected_tensors(file, keys))
-
-    if not selected:
-        raise ValueError(f"No {nextn_prefix}* tensors found in {source_path}.")
-
-    weights = _flatten_nextn_weights(selected, nextn_prefix)
-    _split_kv_b_proj(weights, text_config)
-    _stack_experts(weights, text_config)
-
-    quantization = None
-    if q_bits is not None:
-        quantization = _quantize(weights, q_bits, q_group_size)
-
-    mx.eval(list(weights.values()))
-    mx.save_safetensors(
-        str(output_path / "model.safetensors"),
-        weights,
-        metadata={"format": "mlx"},
-    )
-
-    depth = int(text_config.get("num_nextn_predict_layers", 1))
-    text_config.pop("quantization", None)
-    text_config.pop("quantization_config", None)
-    draft_config = {
-        "model_type": "glm4_moe_lite_mtp",
-        "text_config": text_config,
-        "block_size": int(block_size or depth + 1),
-        "tie_word_embeddings": bool(text_config.get("tie_word_embeddings", False)),
-    }
-    if quantization is not None:
-        draft_config["quantization"] = quantization
-        draft_config["quantization_config"] = quantization
-
-    with open(output_path / "config.json", "w") as f:
-        json.dump(dict(sorted(draft_config.items())), f, indent=2)
-
-    for name in (
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "vocab.json",
-        "merges.txt",
-        "special_tokens_map.json",
-        "generation_config.json",
-        "chat_template.jinja",
-    ):
-        src = source_path / name
-        if src.exists():
-            shutil.copy(src, output_path / name)
-
-    return output_path
 
 
 def build_parser() -> argparse.ArgumentParser:

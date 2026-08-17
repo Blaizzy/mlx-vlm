@@ -15613,3 +15613,166 @@ class TestMinistral3Embedding(unittest.TestCase):
         self.assertEqual(
             EMBEDDING_MODEL_REMAPPING["ministral3"], "ministral3_embedding"
         )
+
+
+class TestMTPSplit(unittest.TestCase):
+    def _write_source(self, tmp, config, tensors):
+        import json
+        from pathlib import Path
+
+        path = Path(tmp)
+        (path / "config.json").write_text(json.dumps(config))
+        # no mlx metadata -> splitter treats it as an HF source (sanitize path)
+        mx.save_safetensors(str(path / "model.safetensors"), tensors)
+        return str(path)
+
+    def test_registry_resolves_all_families(self):
+        from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
+
+        expected = {
+            "qwen3_5": "qwen3_5_mtp",
+            "qwen3_5_moe": "qwen3_5_mtp",
+            "deepseek_v4": "deepseek_v4_mtp",
+            "glm4_moe_lite": "glm4_moe_lite_mtp",
+            "inkling_mm_model": "inkling_mtp",
+        }
+        for base, out_type in expected.items():
+            splitter = get_mtp_splitter(base)
+            self.assertIsNotNone(splitter)
+            self.assertEqual(splitter.output_model_type, out_type)
+        self.assertIsNone(get_mtp_splitter("not_a_model"))
+
+    def test_qwen_split_strips_prefix_and_shifts_norm(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
+
+        norm = mx.random.normal((8,))
+        qproj = mx.random.normal((8, 8))
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            src = self._write_source(
+                tmp,
+                {
+                    "model_type": "qwen3_5",
+                    "text_config": {
+                        "model_type": "qwen3_5",
+                        "mtp_num_hidden_layers": 1,
+                        "tie_word_embeddings": True,
+                    },
+                },
+                {
+                    "mtp.norm.weight": norm,
+                    "mtp.layers.0.self_attn.q_proj.weight": qproj,
+                },
+            )
+            split_qwen3_5_mtp(src, out)
+            weights = mx.load(str(Path(out) / "model.safetensors"))
+            config = json.loads((Path(out) / "config.json").read_text())
+
+        self.assertEqual(
+            set(weights), {"norm.weight", "layers.0.self_attn.q_proj.weight"}
+        )
+        # HF-layout norm weights get the +1.0 shift; the projection passes through
+        self.assertTrue(mx.allclose(weights["norm.weight"], norm + 1.0).item())
+        self.assertTrue(
+            mx.array_equal(weights["layers.0.self_attn.q_proj.weight"], qproj).item()
+        )
+        self.assertEqual(config["model_type"], "qwen3_5_mtp")
+        self.assertEqual(config["block_size"], 3)  # mtp_num_hidden_layers(1) + 2
+        self.assertTrue(config["tie_word_embeddings"])
+
+    def test_glm_split_flattens_splits_mla_and_stacks_experts(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.speculative.drafters.glm4_moe_lite_mtp.split import (
+            split_glm4_moe_lite_mtp,
+        )
+
+        N = 2
+        p = f"model.layers.{N}."
+        tensors = {
+            p + "enorm.weight": mx.random.normal((8,)),
+            p + "hnorm.weight": mx.random.normal((8,)),
+            p + "eh_proj.weight": mx.random.normal((8, 16)),
+            p + "embed_tokens.weight": mx.random.normal((10, 8)),
+            p + "shared_head.norm.weight": mx.random.normal((8,)),
+            p + "shared_head.head.weight": mx.random.normal((10, 8)),
+            p + "input_layernorm.weight": mx.random.normal((8,)),
+            p + "self_attn.kv_b_proj.weight": mx.random.normal((8, 3)),
+            p + "self_attn.o_proj.weight": mx.random.normal((8, 8)),
+            p + "mlp.gate.weight": mx.random.normal((2, 8)),
+        }
+        for e in range(2):
+            for proj in ("gate_proj", "down_proj", "up_proj"):
+                tensors[p + f"mlp.experts.{e}.{proj}.weight"] = mx.random.normal((8, 8))
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            src = self._write_source(
+                tmp,
+                {
+                    "text_config": {
+                        "model_type": "glm4_moe_lite",
+                        "num_hidden_layers": N,
+                        "num_attention_heads": 2,
+                        "qk_nope_head_dim": 2,
+                        "v_head_dim": 2,
+                        "n_routed_experts": 2,
+                        "num_nextn_predict_layers": 1,
+                    }
+                },
+                tensors,
+            )
+            split_glm4_moe_lite_mtp(src, out)
+            weights = mx.load(str(Path(out) / "model.safetensors"))
+            config = json.loads((Path(out) / "config.json").read_text())
+
+        self.assertIn("model.embed_tokens.weight", weights)
+        self.assertIn("lm_head.weight", weights)
+        self.assertIn("model.mtp_block.self_attn.embed_q.weight", weights)
+        self.assertIn("model.mtp_block.self_attn.unembed_out.weight", weights)
+        self.assertNotIn("model.mtp_block.self_attn.kv_b_proj.weight", weights)
+        stacked = weights["model.mtp_block.mlp.switch_mlp.gate_proj.weight"]
+        self.assertEqual(stacked.shape, (2, 8, 8))  # 2 experts stacked
+        self.assertEqual(config["model_type"], "glm4_moe_lite_mtp")
+        self.assertEqual(config["block_size"], 2)  # num_nextn_predict_layers(1) + 1
+
+    def test_detect_and_split_mtp_dispatch(self):
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
+        from mlx_vlm.split_mtp import split_mtp
+
+        cfg = {
+            "model_type": "qwen3_5",
+            "text_config": {"model_type": "qwen3_5", "mtp_num_hidden_layers": 1},
+        }
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            src = self._write_source(
+                tmp, cfg, {"mtp.norm.weight": mx.random.normal((8,))}
+            )
+            splitter = detect_mtp_splitter(Path(src))
+            self.assertIsNotNone(splitter)
+            self.assertEqual(splitter.output_model_type, "qwen3_5_mtp")
+            split_mtp(src, out)  # auto-detect dispatch
+            self.assertTrue((Path(out) / "model.safetensors").exists())
+
+    def test_detect_returns_none_when_flag_but_no_tensors(self):
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
+
+        # config declares MTP but ships no mtp.* tensors (the MiniMax-M2 trap)
+        cfg = {
+            "model_type": "qwen3_5",
+            "text_config": {"model_type": "qwen3_5", "mtp_num_hidden_layers": 1},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._write_source(
+                tmp, cfg, {"model.embed_tokens.weight": mx.random.normal((4, 8))}
+            )
+            self.assertIsNone(detect_mtp_splitter(Path(src)))
