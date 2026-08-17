@@ -513,6 +513,31 @@ def test_stopping_criteria_reset():
     assert stopping_criteria(7) is True
 
 
+def test_load_processor_preserves_additional_eos_tokens_on_reset():
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(eos_token_ids=[2]),
+        additional_eos_token_ids=[3],
+    )
+
+    class Detokenizer:
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+
+    with (
+        patch(
+            "mlx_vlm.utils.AutoProcessor.from_pretrained",
+            return_value=processor,
+        ),
+        patch("mlx_vlm.utils.load_tokenizer", return_value=Detokenizer),
+    ):
+        loaded = load_processor("unused-model-path")
+
+    criteria = loaded.tokenizer.stopping_criteria
+    assert criteria.eos_token_ids == [2, 3]
+    criteria.reset([5])
+    assert criteria.eos_token_ids == [5, 3]
+
+
 def test_load_passes_revision():
     model_mock = MagicMock()
     model_mock.config = MagicMock(eos_token_id=None)

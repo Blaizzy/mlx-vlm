@@ -821,6 +821,28 @@ def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
     assert gen.draft_kind is None
 
 
+def test_server_includes_processor_specific_stop_tokens(monkeypatch):
+    config = SimpleNamespace(eos_token_id=[2])
+    model = SimpleNamespace(language_model=SimpleNamespace(config=config))
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(),
+        additional_eos_token_ids=[3],
+    )
+    gen = _unstarted_response_generator()
+
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.delenv("MLX_VLM_DRAFT_KIND", raising=False)
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+
+    gen._initialize_model()
+
+    assert gen.stop_tokens == {2, 3}
+
+
 def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
     config = SimpleNamespace(eos_token_id=[])
     language_model = SimpleNamespace()
@@ -3745,9 +3767,12 @@ def test_chat_completions_endpoint_flattens_text_content_parts(client):
     ]
 
 
-def test_chat_completions_endpoint_forwards_video_content(client):
+def test_chat_completions_endpoint_forwards_native_video_content(client):
     model = SimpleNamespace()
-    processor = SimpleNamespace()
+    processor = SimpleNamespace(
+        video_processor=SimpleNamespace(),
+        process=lambda text=None, images=None, videos=None, **kwargs: None,
+    )
     config = SimpleNamespace(model_type="gemma4")
     result = GenerationResult(
         text="done",
@@ -3758,6 +3783,7 @@ def test_chat_completions_endpoint_forwards_video_content(client):
         generation_tps=5.0,
         peak_memory=0.1,
     )
+    from mlx_vlm.generate import video as video_module
 
     with (
         patch.object(
@@ -3767,6 +3793,7 @@ def test_chat_completions_endpoint_forwards_video_content(client):
             server, "apply_chat_template", return_value="prompt"
         ) as mock_template,
         patch.object(server, "generate", return_value=result) as mock_generate,
+        patch.object(video_module, "sample_video_frames") as mock_sample,
     ):
         response = client.post(
             "/chat/completions",
@@ -3790,6 +3817,61 @@ def test_chat_completions_endpoint_forwards_video_content(client):
         {"role": "user", "content": "Describe this video."}
     ]
     assert mock_generate.call_args.kwargs["video"] == ["clip.mp4"]
+    mock_sample.assert_not_called()
+
+
+def test_chat_completions_endpoint_falls_back_from_video_to_images(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="mage_vl")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+    frames = [object(), object()]
+    from mlx_vlm.generate import video as video_module
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result) as mock_generate,
+        patch.object(
+            video_module,
+            "sample_video_frames",
+            return_value=(frames, 2.0),
+        ) as mock_sample,
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "video_url", "video_url": {"url": "clip.mp4"}},
+                            {"type": "text", "text": "Describe this video."},
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.kwargs["num_images"] == 2
+    assert mock_template.call_args.kwargs["video"] is None
+    assert mock_generate.call_args.kwargs["image"] == frames
+    assert mock_generate.call_args.kwargs["video"] == []
+    mock_sample.assert_called_once_with(["clip.mp4"], 2.0)
 
 
 def test_chat_completions_endpoint_preserves_assistant_reasoning_content(client):

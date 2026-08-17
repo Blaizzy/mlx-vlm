@@ -1156,6 +1156,7 @@ class ResponseGenerator:
                 stop_tokens.update(config.eos_token_id)
             elif config.eos_token_id is not None:
                 stop_tokens.add(config.eos_token_id)
+        stop_tokens.update(getattr(processor, "additional_eos_token_ids", ()))
 
         draft_model = None
         draft_kind = self.draft_kind_override or os.environ.get("MLX_VLM_DRAFT_KIND")

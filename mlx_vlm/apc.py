@@ -3983,9 +3983,18 @@ def extract_prompt_cache_from_batch(
 
 def _prompt_cache_is_batch_shaped(caches: Sequence[Any]) -> bool:
     """True when every entry can row-extract (Batch* / ArraysCache layout)."""
+
+    def can_extract_row(cache: Any) -> bool:
+        if not callable(getattr(cache, "extract", None)):
+            return False
+        children = getattr(cache, "caches", None)
+        if children is None:
+            return True
+        return all(can_extract_row(child) for child in children)
+
     if not caches:
         return False
-    return all(callable(getattr(c, "extract", None)) for c in caches)
+    return all(can_extract_row(cache) for cache in caches)
 
 
 def snapshot_prompt_cache_row(

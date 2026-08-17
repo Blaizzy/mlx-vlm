@@ -22,6 +22,7 @@ from ..generate.edit_image import ImageEditRequest as CoreImageEditRequest
 from ..generate.edit_image import edit_image
 from ..generate.image import ImageGenerationRequest as CoreImageGenerationRequest
 from ..generate.image import generate_image, parse_size
+from ..generate.video import resolve_video_inputs
 from ..prompt_utils import apply_chat_template, extract_text_from_content
 from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from ..utils import prepare_inputs
@@ -1694,6 +1695,23 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
         )
 
         model, processor, config = get_cached_model(request.model, adapter_path)
+
+        video_resolution = resolve_video_inputs(
+            processor,
+            videos,
+            images=images,
+            fps=2.0,
+            max_frames=16,
+        )
+        images, videos = video_resolution.images, video_resolution.videos
+        if video_resolution.used_fallback:
+            logger.info(
+                "Processor %s has no native video support; sending %d of %d "
+                "sampled frames as ordered images.",
+                processor.__class__.__name__,
+                video_resolution.selected_count,
+                video_resolution.sampled_count,
+            )
 
         # Detect tool parser from chat template
         tool_parser_type = _infer_tool_parser_from_processor(processor)
