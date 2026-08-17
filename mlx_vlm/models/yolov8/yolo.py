@@ -6,12 +6,10 @@ difference between PyTorch (B, C, H, W) and MLX (B, H, W, C).
 Reference: ultralytics/ultralytics/nn/modules/block.py, head.py, tasks.py
 """
 
-import math
 
 import mlx.core as mx
 import mlx.nn as nn
 from safetensors import safe_open
-
 
 # ---------------------------------------------------------------------------
 # Building blocks
@@ -58,8 +56,7 @@ class C2f(nn.Module):
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv((2 + n) * self.c, c2, 1)
         self.m = [
-            Bottleneck(self.c, self.c, shortcut, g, k=(3, 3), e=1.0)
-            for _ in range(n)
+            Bottleneck(self.c, self.c, shortcut, g, k=(3, 3), e=1.0) for _ in range(n)
         ]
 
     def __call__(self, x):
@@ -125,13 +122,25 @@ class Detect(nn.Module):
 
         # Box regression branches (one per scale). Use named attributes
         # because MLX has no ModuleList.
-        self.cv2_0 = nn.Sequential(Conv(ch[0], c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, reg_max * 4, 1))
-        self.cv2_1 = nn.Sequential(Conv(ch[1], c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, reg_max * 4, 1))
-        self.cv2_2 = nn.Sequential(Conv(ch[2], c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, reg_max * 4, 1))
+        self.cv2_0 = nn.Sequential(
+            Conv(ch[0], c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, reg_max * 4, 1)
+        )
+        self.cv2_1 = nn.Sequential(
+            Conv(ch[1], c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, reg_max * 4, 1)
+        )
+        self.cv2_2 = nn.Sequential(
+            Conv(ch[2], c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, reg_max * 4, 1)
+        )
         # Classification branches (one per scale).
-        self.cv3_0 = nn.Sequential(Conv(ch[0], c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, nc, 1))
-        self.cv3_1 = nn.Sequential(Conv(ch[1], c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, nc, 1))
-        self.cv3_2 = nn.Sequential(Conv(ch[2], c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, nc, 1))
+        self.cv3_0 = nn.Sequential(
+            Conv(ch[0], c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, nc, 1)
+        )
+        self.cv3_1 = nn.Sequential(
+            Conv(ch[1], c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, nc, 1)
+        )
+        self.cv3_2 = nn.Sequential(
+            Conv(ch[2], c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, nc, 1)
+        )
 
         self.dfl = DFL(reg_max)
 
@@ -155,7 +164,7 @@ class Detect(nn.Module):
             boxes.append(bx.reshape(b, n_anchors, self.reg_max * 4).transpose(0, 2, 1))
             scores.append(sc.reshape(b, n_anchors, self.nc).transpose(0, 2, 1))
 
-        boxes = mx.concatenate(boxes, axis=-1)   # (B, 64, 8400)
+        boxes = mx.concatenate(boxes, axis=-1)  # (B, 64, 8400)
         scores = mx.concatenate(scores, axis=-1)  # (B, 80, 8400)
 
         # DFL decoding: (B, 64, 8400) -> (B, 4, 8400).
@@ -179,29 +188,29 @@ class YOLOv8(nn.Module):
     #   args: constructor kwargs (channel args only; repeats handled in __init__).
     LAYERS = [
         # Backbone
-        (-1, "conv", {"c1": 3, "c2": 16, "k": 3, "s": 2}),        # 0
-        (-1, "conv", {"c1": 16, "c2": 32, "k": 3, "s": 2}),       # 1
+        (-1, "conv", {"c1": 3, "c2": 16, "k": 3, "s": 2}),  # 0
+        (-1, "conv", {"c1": 16, "c2": 32, "k": 3, "s": 2}),  # 1
         (-1, "c2f", {"c1": 32, "c2": 32, "n": 1, "shortcut": True}),  # 2
-        (-1, "conv", {"c1": 32, "c2": 64, "k": 3, "s": 2}),       # 3
+        (-1, "conv", {"c1": 32, "c2": 64, "k": 3, "s": 2}),  # 3
         (-1, "c2f", {"c1": 64, "c2": 64, "n": 2, "shortcut": True}),  # 4  P3
-        (-1, "conv", {"c1": 64, "c2": 128, "k": 3, "s": 2}),      # 5
+        (-1, "conv", {"c1": 64, "c2": 128, "k": 3, "s": 2}),  # 5
         (-1, "c2f", {"c1": 128, "c2": 128, "n": 2, "shortcut": True}),  # 6  P4
-        (-1, "conv", {"c1": 128, "c2": 256, "k": 3, "s": 2}),     # 7
+        (-1, "conv", {"c1": 128, "c2": 256, "k": 3, "s": 2}),  # 7
         (-1, "c2f", {"c1": 256, "c2": 256, "n": 1, "shortcut": True}),  # 8  P5
-        (-1, "sppf", {"c1": 256, "c2": 256, "k": 5}),             # 9
+        (-1, "sppf", {"c1": 256, "c2": 256, "k": 5}),  # 9
         # FPN neck (top-down)
-        (-1, "upsample", {}),                                       # 10
-        ([-1, 6], "concat", {}),                                    # 11
+        (-1, "upsample", {}),  # 10
+        ([-1, 6], "concat", {}),  # 11
         (-1, "c2f", {"c1": 384, "c2": 128, "n": 2, "shortcut": False}),  # 12
-        (-1, "upsample", {}),                                       # 13
-        ([-1, 4], "concat", {}),                                    # 14
+        (-1, "upsample", {}),  # 13
+        ([-1, 4], "concat", {}),  # 14
         (-1, "c2f", {"c1": 192, "c2": 64, "n": 2, "shortcut": False}),  # 15  P3/8 out
         # PANet neck (bottom-up)
-        (-1, "conv", {"c1": 64, "c2": 64, "k": 3, "s": 2}),       # 16
-        ([-1, 12], "concat", {}),                                   # 17
+        (-1, "conv", {"c1": 64, "c2": 64, "k": 3, "s": 2}),  # 16
+        ([-1, 12], "concat", {}),  # 17
         (-1, "c2f", {"c1": 192, "c2": 128, "n": 2, "shortcut": False}),  # 18  P4/16 out
-        (-1, "conv", {"c1": 128, "c2": 128, "k": 3, "s": 2}),     # 19
-        ([-1, 9], "concat", {}),                                    # 20
+        (-1, "conv", {"c1": 128, "c2": 128, "k": 3, "s": 2}),  # 19
+        ([-1, 9], "concat", {}),  # 20
         (-1, "c2f", {"c1": 384, "c2": 256, "n": 2, "shortcut": False}),  # 21  P5/32 out
     ]
 
@@ -332,9 +341,7 @@ def box_iou(box1, box2):
     return inter / mx.maximum(union, 1e-7)
 
 
-def non_max_suppression(
-    prediction, conf_thresh=0.25, iou_thresh=0.45, max_det=300
-):
+def non_max_suppression(prediction, conf_thresh=0.25, iou_thresh=0.45, max_det=300):
     """Apply NMS to YOLOv8 output.
 
     Args:
@@ -514,7 +521,11 @@ if __name__ == "__main__":
     print(f"Scores shape: {scores.shape}")  # (1, 80, 8400)
 
     # Anchor generation.
-    feats = [mx.zeros((1, 80, 80, 64)), mx.zeros((1, 40, 40, 128)), mx.zeros((1, 20, 20, 256))]
+    feats = [
+        mx.zeros((1, 80, 80, 64)),
+        mx.zeros((1, 40, 40, 128)),
+        mx.zeros((1, 20, 20, 256)),
+    ]
     anchors, strides = make_anchors(feats, [8, 16, 32])
     print(f"Anchors shape: {anchors.shape}")  # (8400, 2)
     print(f"Strides shape: {strides.shape}")  # (8400, 1)
@@ -530,4 +541,6 @@ if __name__ == "__main__":
 
     # NMS.
     detections = non_max_suppression(pred, conf_thresh=0.25, iou_thresh=0.45)
-    print(f"NMS output: {len(detections)} images, first has {detections[0].shape[0]} detections")
+    print(
+        f"NMS output: {len(detections)} images, first has {detections[0].shape[0]} detections"
+    )
