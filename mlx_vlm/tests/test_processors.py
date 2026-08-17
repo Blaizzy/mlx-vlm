@@ -1571,6 +1571,14 @@ class TestIdefics3Processor(_ProcessorTestBase, unittest.TestCase):
         self.assertIn("<row_1_col_1>", result)
         self.assertIn("<row_2_col_2>", result)
 
+    def test_end_of_utterance_is_an_additional_eos_token(self):
+        processor = self._make_processor()
+        processor.tokenizer.convert_tokens_to_ids = lambda token: (
+            128258 if token == "<end_of_utterance>" else None
+        )
+
+        self.assertEqual(processor.additional_eos_token_ids, [128258])
+
 
 class TestAyaVisionProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
