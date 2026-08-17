@@ -1303,17 +1303,16 @@ def main():
         from .video import (
             pair_adjacent_frames,
             processor_handles_video,
+            resolve_video_inputs,
             sample_video_frames,
-            subsample_evenly,
             timestamped_frame_messages,
         )
 
         if not processor_handles_video(processor):
-            frames, frame_fps = sample_video_frames(args.video, args.fps or 2.0)
-            sampled = len(frames)
             max_frames = max(2, getattr(args, "video_max_frames", 16) or 16)
             pair_hook = getattr(model, "prepare_video_frame_pairs", None)
             if pair_hook is not None:
+                frames, frame_fps = sample_video_frames(args.video, args.fps or 2.0)
                 anchors, first_frames, second_frames = pair_adjacent_frames(
                     frames, max_frames
                 )
@@ -1339,15 +1338,23 @@ def main():
                 video_prompt = _tok.apply_chat_template(
                     msgs, add_generation_prompt=True, tokenize=False
                 )
+                args.video = None
             else:
-                frames = subsample_evenly(frames, max_frames)
+                resolution = resolve_video_inputs(
+                    processor,
+                    args.video,
+                    images=args.image,
+                    fps=args.fps or 2.0,
+                    max_frames=max_frames,
+                )
                 print(
                     f"{processor.__class__.__name__} has no native video "
-                    f"support; sending {len(frames)} of {sampled} sampled "
+                    f"support; sending {resolution.selected_count} of "
+                    f"{resolution.sampled_count} sampled "
                     f"frames as ordered images."
                 )
-                args.image = (args.image or []) + frames
-            args.video = None
+                args.image = resolution.images
+                args.video = resolution.videos or None
 
     num_images = len(args.image) if args.image is not None else 0
     num_audios = len(args.audio) if args.audio is not None else 0

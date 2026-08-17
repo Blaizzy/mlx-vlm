@@ -2306,6 +2306,82 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
     assert capsys.readouterr().out.strip() == "done"
 
 
+def test_resolve_video_inputs_keeps_native_video_unchanged():
+    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
+    images = [object()]
+    videos = ["first.mp4", "second.mp4"]
+    processor = SimpleNamespace(
+        video_processor=SimpleNamespace(),
+        process=lambda text=None, images=None, videos=None, **kwargs: None,
+    )
+
+    with patch.object(video_module, "sample_video_frames") as mock_sample:
+        resolution = video_module.resolve_video_inputs(
+            processor,
+            videos,
+            images=images,
+        )
+
+    assert resolution.images == images
+    assert resolution.videos == videos
+    assert resolution.used_fallback is False
+    mock_sample.assert_not_called()
+
+
+def test_resolve_video_inputs_uses_one_global_frame_budget():
+    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
+    still = object()
+    images = [still]
+    videos = ["first.mp4", "second.mp4"]
+    frames = [object() for _ in range(10)]
+
+    with patch.object(
+        video_module,
+        "sample_video_frames",
+        return_value=(frames, 1.5),
+    ) as mock_sample:
+        resolution = video_module.resolve_video_inputs(
+            SimpleNamespace(),
+            videos,
+            images=images,
+            fps=1.5,
+            max_frames=4,
+        )
+
+    assert resolution.images == [still, frames[0], frames[3], frames[6], frames[9]]
+    assert resolution.videos == []
+    assert resolution.used_fallback is True
+    assert resolution.sampled_count == 10
+    assert resolution.selected_count == 4
+    assert resolution.frame_fps == pytest.approx(1.5)
+    assert images == [still]
+    assert videos == ["first.mp4", "second.mp4"]
+    mock_sample.assert_called_once_with(videos, 1.5)
+
+
+def test_resolve_video_inputs_does_not_partially_mutate_on_decode_failure():
+    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
+    images = [object()]
+    videos = ["good.mp4", "bad.mp4"]
+
+    with (
+        patch.object(
+            video_module,
+            "sample_video_frames",
+            side_effect=RuntimeError("decode failed"),
+        ),
+        pytest.raises(RuntimeError, match="decode failed"),
+    ):
+        video_module.resolve_video_inputs(
+            SimpleNamespace(),
+            videos,
+            images=images,
+        )
+
+    assert len(images) == 1
+    assert videos == ["good.mp4", "bad.mp4"]
+
+
 def test_generate_cli_video_frames_fallback_without_video_processor(capsys):
     video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
 
