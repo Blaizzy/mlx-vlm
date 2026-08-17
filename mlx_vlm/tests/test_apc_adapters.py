@@ -98,6 +98,45 @@ def test_snapshot_batch_cache_list_extracts_nested_pooling_cache():
     assert mx.array_equal(cloned.state[1], gate).item()
 
 
+def test_pooling_cache_exact_apc_round_trips_warm_and_cold_rows():
+    from mlx_vlm.apc import make_warm_batch_exact_cache_multi, snapshot_prompt_cache_row
+
+    def make_row(prompt_length):
+        rotating = RotatingKVCache(max_size=16)
+        pooling = PoolingCache(ratio=4)
+        if prompt_length > 0:
+            keys = mx.arange(prompt_length * 3, dtype=mx.float32).reshape(
+                1, 1, prompt_length, 3
+            )
+            rotating.update_and_fetch(keys, keys + 1)
+            kv = keys.reshape(1, prompt_length, 3)
+            gate = mx.ones((1, prompt_length, 2), dtype=mx.float32)
+            ready_kv, _, _ = pooling.accumulate_windows(kv, gate, offset=0)
+            pooled_length = ready_kv.shape[1] // pooling.ratio
+            pooling.update_and_fetch(mx.ones((1, pooled_length, 3), dtype=mx.float32))
+        return [CacheList(rotating, pooling)]
+
+    warm = snapshot_prompt_cache_row(make_row(6), batch_idx=0)
+    cold = snapshot_prompt_cache_row(make_row(0), batch_idx=0)
+
+    assert warm is not None
+    assert cold is not None
+    merged, max_prefix = make_warm_batch_exact_cache_multi(
+        [warm, cold], prefix_lens=[6, 0]
+    )
+
+    assert merged is not None
+    assert max_prefix == 6
+    rotating, pooling = merged[0].caches
+    assert isinstance(rotating, BatchRotatingKVCache)
+    assert rotating.offset.tolist() == [6, 0]
+    assert isinstance(pooling, BatchPoolingCache)
+    assert pooling.ratio == 4
+    assert pooling.remainder == [2, 0]
+    assert pooling._pool_lengths == [1, 0]
+    assert pooling._processed == [6, 0]
+
+
 def test_batch_pooling_cache_merge_accepts_prefix_lengths():
     merged = BatchPoolingCache.merge(
         [PoolingCache(ratio=4), PoolingCache(ratio=4)],
