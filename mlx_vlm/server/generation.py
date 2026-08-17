@@ -691,6 +691,7 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
             adapter_path,
             trust_remote_code=trust_remote_code,
             expert_cache_gb=get_expert_cache_gb(),
+            max_kv_size=get_configured_context_limit(),
         )
         config = model.config
         logger.info("Model and processor loaded successfully.")

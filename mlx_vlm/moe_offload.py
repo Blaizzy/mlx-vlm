@@ -226,14 +226,94 @@ _PROJ_KEYS = tuple(
 )
 
 
-def _default_expert_cache_bytes() -> int:
+def _resident_bytes_on_disk(offload_dir: str) -> int:
+    return sum(
+        os.path.getsize(f)
+        for f in glob.glob(os.path.join(offload_dir, "resident-*.safetensors"))
+    )
+
+
+def _kv_cache_bytes(cache_entries) -> int:
+    from mlx.utils import tree_flatten
+
+    total = 0
+    for c in cache_entries:
+        children = getattr(c, "caches", None)
+        if children is not None:
+            total += _kv_cache_bytes(children)
+            continue
+        state = getattr(c, "state", None)
+        if state is None:
+            continue
+        for _, arr in tree_flatten(state):
+            if hasattr(arr, "nbytes"):
+                total += arr.nbytes
+    return total
+
+
+def _kv_cache_token_caps(cache_entries) -> list:
+    caps = []
+    for c in cache_entries:
+        children = getattr(c, "caches", None)
+        if children is not None:
+            caps.extend(_kv_cache_token_caps(children))
+            continue
+        caps.append(getattr(c, "max_size", None))
+    return caps
+
+
+def _estimate_kv_reserve_bytes(model, max_kv_size: Optional[int]) -> int:
+    """Reserve headroom for KV cache growth up to ``max_kv_size`` tokens, so
+    the expert budget doesn't overcommit against a model whose cache grows
+    with context (a plain ``KVCache`` has no compression or window, unlike
+    DeepSeek's ``PoolingCache``/``RotatingKVCache``). Measured empirically by
+    running two real tiny forward passes through the model's own
+    ``make_cache()`` and reading the marginal per-token growth off
+    ``cache.state`` -- generic across cache classes (works whether the cache
+    is bounded, compressed, or plain) rather than guessing a per-architecture
+    formula. Returns 0 (no reservation -- today's behavior) if anything about
+    the model's calling convention doesn't cooperate, or ``max_kv_size`` is
+    unset; a wrong reservation is worse than none.
+    """
+    if not max_kv_size or max_kv_size <= 0:
+        return 0
+    import mlx.core as mx
+
+    lm = getattr(model, "language_model", model)
+    make_cache = getattr(lm, "make_cache", None)
+    if not callable(make_cache):
+        return 0
+    try:
+        cache = make_cache()
+        ids = mx.zeros((1, 3), dtype=mx.int32)
+        lm(ids[:, :2], cache=cache)
+        mx.eval([c.state for c in cache])
+        bytes_at_2 = _kv_cache_bytes(cache)
+        lm(ids[:, 2:3], cache=cache)
+        mx.eval([c.state for c in cache])
+        bytes_at_3 = _kv_cache_bytes(cache)
+    except Exception:
+        return 0
+
+    per_token = max(0, bytes_at_3 - bytes_at_2)
+    caps = _kv_cache_token_caps(cache)
+    effective_tokens = max_kv_size
+    if caps and all(c is not None for c in caps):
+        effective_tokens = min(max_kv_size, max(int(c) for c in caps))
+    return bytes_at_3 + per_token * max(0, effective_tokens - 3)
+
+
+def _default_expert_cache_bytes(
+    resident_bytes: int = 0, kv_reserve_bytes: int = 0
+) -> int:
     import mlx.core as mx
 
     try:
         recommended = mx.device_info()["max_recommended_working_set_size"]
     except Exception:
         return 0
-    return int(0.7 * recommended)
+    budget = int(0.8 * recommended) - resident_bytes - kv_reserve_bytes
+    return max(0, budget)
 
 
 class ExpertStore:
@@ -263,7 +343,12 @@ class ExpertStore:
     generally, not new here or fixable by locking.
     """
 
-    def __init__(self, offload_dir: str, expert_cache_bytes: Optional[int] = None):
+    def __init__(
+        self,
+        offload_dir: str,
+        expert_cache_bytes: Optional[int] = None,
+        kv_reserve_bytes: int = 0,
+    ):
         import mlx.core as mx
 
         idx = json.load(open(os.path.join(offload_dir, "offload_index.json")))
@@ -279,7 +364,10 @@ class ExpertStore:
         self._budget = (
             expert_cache_bytes
             if expert_cache_bytes is not None
-            else _default_expert_cache_bytes()
+            else _default_expert_cache_bytes(
+                resident_bytes=_resident_bytes_on_disk(offload_dir),
+                kv_reserve_bytes=kv_reserve_bytes,
+            )
         )
         self._lru: "OrderedDict[Tuple[int, int], int]" = OrderedDict()
         self._resident_bytes = 0
@@ -369,7 +457,10 @@ class ExpertStore:
 
 
 def patch_model(
-    model, offload_dir: str, expert_cache_gb: Optional[float] = None
+    model,
+    offload_dir: str,
+    expert_cache_gb: Optional[float] = None,
+    max_kv_size: Optional[int] = None,
 ) -> "ExpertStore":
     """Swap every switch layer in ``model`` for an offloaded one (see module
     docstring for separate-vs-fused handling). group_size/bits/mode are
@@ -377,10 +468,13 @@ def patch_model(
     per-path override mechanism ``load_model``/``convert`` use. Raises if no
     expert files are found or nothing gets swapped, rather than silently
     loading fully resident. ``expert_cache_gb`` bounds the store's resident
-    expert set (default: 70% of the GPU's recommended working set, from
-    ``mx.device_info()``) -- pass a smaller value to leave more headroom for
-    a large KV cache, or a very large one to effectively disable eviction
-    for a checkpoint already known to fit. Returns the store.
+    expert set (default: 80% of the GPU's recommended working set, minus the
+    on-disk resident weight size and minus a KV-cache reserve for
+    ``max_kv_size`` tokens if given) -- pass a smaller value to leave more
+    headroom for a large KV cache, or a very large one to effectively
+    disable eviction for a checkpoint already known to fit. ``max_kv_size``
+    only affects the *auto* budget; it's ignored if ``expert_cache_gb`` is
+    set explicitly. Returns the store.
     """
     import mlx.nn as nn
 
@@ -404,7 +498,12 @@ def patch_model(
     expert_cache_bytes = (
         int(expert_cache_gb * 1e9) if expert_cache_gb is not None else None
     )
-    store = ExpertStore(offload_dir, expert_cache_bytes)
+    kv_reserve_bytes = (
+        0
+        if expert_cache_bytes is not None
+        else _estimate_kv_reserve_bytes(model, max_kv_size)
+    )
+    store = ExpertStore(offload_dir, expert_cache_bytes, kv_reserve_bytes)
     if not store._maps:
         raise ValueError(
             f"No expert files found under {offload_dir}/experts -- this "

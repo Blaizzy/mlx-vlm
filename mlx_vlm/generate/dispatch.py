@@ -1265,6 +1265,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
         quantize_activations=args.quantize_activations,
         expert_cache_gb=args.expert_cache_gb,
+        max_kv_size=args.max_kv_size,
     )
     config = model.config
 

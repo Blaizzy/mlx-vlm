@@ -857,7 +857,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         from .moe_offload import patch_model
 
         model.moe_offload_store = patch_model(
-            model, str(model_path), expert_cache_gb=kwargs.get("expert_cache_gb")
+            model,
+            str(model_path),
+            expert_cache_gb=kwargs.get("expert_cache_gb"),
+            max_kv_size=kwargs.get("max_kv_size"),
         )
         lazy = requested_lazy
 
