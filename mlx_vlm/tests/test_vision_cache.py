@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import mlx.core as mx
 import pytest
 
@@ -86,6 +88,111 @@ class TestVisionFeatureCache:
         assert len(cache) == 0
         for i in range(5):
             assert cache.get(f"img{i}.jpg") is None
+
+
+class TestContentKey:
+    """Keys must track the pixels the encoder sees, not the image's name.
+
+    A path or URL is not a safe key: the bytes behind a stable name change
+    between requests (a camera overwriting frame.jpg, a snapshot URL), which
+    previously served the earlier frame's features and silently answered
+    about the wrong image.
+    """
+
+    def test_same_pixels_same_key(self):
+        pixels = mx.zeros((1, 3, 8, 8))
+        assert VisionFeatureCache.content_key(pixels) == VisionFeatureCache.content_key(
+            mx.zeros((1, 3, 8, 8))
+        )
+
+    def test_different_pixels_different_key(self):
+        assert VisionFeatureCache.content_key(
+            mx.zeros((1, 3, 8, 8))
+        ) != VisionFeatureCache.content_key(mx.ones((1, 3, 8, 8)))
+
+    def test_rewritten_frame_misses(self):
+        cache = VisionFeatureCache()
+        features = mx.ones((1, 4, 8))
+        cache.put(VisionFeatureCache.content_key(mx.zeros((1, 3, 8, 8))), features)
+        assert (
+            cache.get(VisionFeatureCache.content_key(mx.zeros((1, 3, 8, 8))))
+            is not None
+        )
+        assert cache.get(VisionFeatureCache.content_key(mx.ones((1, 3, 8, 8)))) is None
+
+    def test_grid_metadata_separates_identical_pixels(self):
+        """Qwen-style towers consume grid metadata alongside the pixels.
+
+        Two solid-colour images with transposed grids preprocess to the same
+        flattened patches, so the pixels alone are not a complete key.
+        """
+        pixels = mx.ones((8, 12))
+        wide = VisionFeatureCache.content_key(
+            pixels, {"image_grid_thw": mx.array([[1, 2, 4]])}
+        )
+        tall = VisionFeatureCache.content_key(
+            pixels, {"image_grid_thw": mx.array([[1, 4, 2]])}
+        )
+        assert wide is not None and tall is not None
+        assert wide != tall
+
+    def test_nested_fragments_are_unambiguous(self):
+        """Distinct structures must not serialise to the same byte stream."""
+        pixels = mx.ones((2, 2))
+        a = VisionFeatureCache.content_key(pixels, {"a": [1, 23]})
+        b = VisionFeatureCache.content_key(pixels, {"a": [12, 3]})
+        assert a is not None and b is not None
+        assert a != b
+        assert VisionFeatureCache.content_key(
+            pixels, {"ab": 1}
+        ) != VisionFeatureCache.content_key(pixels, {"a": "b1"})
+
+    def test_unhashable_extra_disables_caching(self):
+        assert (
+            VisionFeatureCache.content_key(mx.ones((2, 2)), {"proc": object()}) is None
+        )
+
+    def test_unhashable_pixels_disable_caching(self):
+        cache = VisionFeatureCache()
+        key = VisionFeatureCache.content_key(object())
+        assert key is None
+        cache.put(key, mx.ones((1, 4, 8)))
+        assert len(cache) == 0
+        assert cache.get(key) is None
+
+    def test_server_keys_on_pixels_not_image_source(self):
+        """Regression for the server's continuous-batching path.
+
+        _gpu_embed used to set _image_key to the request's image sources, so
+        two different frames posted under one path shared a cache entry.
+        """
+        from mlx_vlm.server.generation import ResponseGenerator
+
+        captured = {}
+
+        class _Model:
+            def get_input_embeddings(self, input_ids, pixel_values, mask=None, **kw):
+                captured["key"] = kw.get("_image_key")
+                return SimpleNamespace(to_dict=lambda: {})
+
+        gen = object.__new__(ResponseGenerator)
+        gen.model = _Model()
+        gen.vision_cache = VisionFeatureCache()
+
+        same_source = ["/tmp/frame.jpg"]
+        gen._gpu_embed(
+            {"input_ids": mx.zeros((1, 4)), "pixel_values": mx.zeros((1, 3, 8, 8))},
+            images=same_source,
+        )
+        first = captured["key"]
+        gen._gpu_embed(
+            {"input_ids": mx.zeros((1, 4)), "pixel_values": mx.ones((1, 3, 8, 8))},
+            images=same_source,
+        )
+        second = captured["key"]
+
+        assert first is not None and second is not None
+        assert first != second, "two different frames shared one cache key"
 
 
 class TestCachedImageFeaturesKwarg:

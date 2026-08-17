@@ -1658,8 +1658,11 @@ class ResponseGenerator:
             and self.vision_cache is not None
             and images is not None
         ):
+            # data_kwargs carries the grid/position metadata the vision tower
+            # consumes alongside the pixels, so it belongs in the cache key.
+            image_key = self.vision_cache.content_key(pixel_values, data_kwargs)
             data_kwargs["vision_cache"] = self.vision_cache
-            data_kwargs["_image_key"] = images
+            data_kwargs["_image_key"] = image_key
 
         # Always call get_input_embeddings — BatchGenerator requires inputs_embeds
         embed = self.model.get_input_embeddings(
