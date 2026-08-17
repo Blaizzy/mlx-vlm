@@ -2,8 +2,10 @@
 them resident, so a checkpoint bigger than RAM can still run.
 
 ``repack`` splits each MoE layer's stacked expert tensor into a per-expert
-on-disk store; ``ExpertStore`` mmaps it; ``patch_model`` swaps every switch
-layer (``SwitchGLU``/subclasses, or a fused ``gate_up_proj`` variant like
+on-disk store; ``ExpertStore`` mmaps it and keeps a byte-budgeted LRU of
+resident experts, evicting the coldest ones once touched experts approach the
+GPU's recommended working set; ``patch_model`` swaps every switch layer
+(``SwitchGLU``/subclasses, or a fused ``gate_up_proj`` variant like
 Laguna/MiniMax-M3-VL) for an ``OffloadedSwitchGLU`` that computes only the
 router-selected experts. Loading is transparent: ``mlx_vlm.load()`` detects
 ``offload_index.json`` and patches automatically. Prefill must be chunked
@@ -18,6 +20,7 @@ import json
 import os
 import re
 import shutil
+from collections import OrderedDict
 from typing import Optional, Tuple
 
 # stacked: switch_mlp.gate_proj.weight [E,out,in]; per-expert: experts.{j}.gate_proj.weight;
@@ -216,34 +219,106 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
     )
 
 
+_PROJ_KEYS = tuple(
+    f"{p}.{k}"
+    for p in ("gate_proj", "up_proj", "down_proj")
+    for k in ("weight", "scales", "biases")
+)
+
+
+def _default_expert_cache_bytes() -> int:
+    import mlx.core as mx
+
+    try:
+        recommended = mx.device_info()["max_recommended_working_set_size"]
+    except Exception:
+        return 0
+    return int(0.7 * recommended)
+
+
 class ExpertStore:
     """Serves per-expert quantized weights from memory-mapped per-layer files.
 
-    ``get()`` only reads ``self._maps``, built once in ``__init__`` and never
-    mutated -- concurrent calls need no locking (measured: an LRU cache here
-    had a 0% hit rate for single-request serving, since ``mx.load()``'s mmap
-    plus the OS page cache already serves repeat reads; removed rather than
-    kept as dead weight). That does not make the returned arrays safe to
-    *evaluate* from a different thread than the one that called ``mx.load()``
-    here -- MLX raises ``RuntimeError: no Stream(...) in current thread`` for
-    that, a pre-existing constraint of ``mx.load()`` generally, not new here
-    or fixable by locking.
+    A materialized expert stays resident in ``self._maps[layer_id]`` once
+    touched -- an earlier version relied on that alone (measured: an
+    additional LRU cache had a 0% hit rate for single-request serving, since
+    ``mx.load()``'s mmap plus the OS page cache already serves repeat reads).
+    That held for every model this was tested against, where the whole
+    routed-expert corpus fits in RAM regardless. It does not hold at DeepSeek
+    V4 Flash's scale (256 experts x 43 layers): routing alone samples close
+    to the full expert set within a couple hundred tokens (prompt and
+    generated combined), so unbounded residency grows toward the full
+    on-disk corpus and OOMs once that exceeds physical memory. ``get()`` now
+    tracks per-``(layer, expert)`` residency with a byte budget and evicts
+    the least-recently-used expert -- by dropping its keys from ``self._maps``
+    so MLX can reclaim the buffers, not by discarding the per-layer mmap
+    handle itself -- re-fetching lazily from the same on-disk file on the
+    next miss. Concurrent ``get()`` calls still need no locking for the
+    reads themselves, but eviction mutates ``self._maps`` and ``self._lru``,
+    so callers serving multiple requests concurrently must serialize access
+    to a single ``ExpertStore``. That does not make the returned arrays safe
+    to *evaluate* from a different thread than the one that called
+    ``mx.load()`` here -- MLX raises ``RuntimeError: no Stream(...) in
+    current thread`` for that, a pre-existing constraint of ``mx.load()``
+    generally, not new here or fixable by locking.
     """
 
-    def __init__(self, offload_dir: str):
+    def __init__(self, offload_dir: str, expert_cache_bytes: Optional[int] = None):
         import mlx.core as mx
 
         idx = json.load(open(os.path.join(offload_dir, "offload_index.json")))
         self.num_experts = idx["num_experts"]
+        self._paths = {}
         self._maps = {}  # {layer_id: {name: lazy mx.array}}
         for path in glob.glob(
             os.path.join(offload_dir, "experts", "layer_*.safetensors")
         ):
             lid = int(os.path.basename(path).split("_")[1].split(".")[0])
+            self._paths[lid] = path
             self._maps[lid] = mx.load(path)  # mmap, lazy
+        self._budget = (
+            expert_cache_bytes
+            if expert_cache_bytes is not None
+            else _default_expert_cache_bytes()
+        )
+        self._lru: "OrderedDict[Tuple[int, int], int]" = OrderedDict()
+        self._resident_bytes = 0
 
     def experts_present(self, layer_id: int) -> bool:
         return layer_id in self._maps
+
+    def _ensure_loaded(self, layer_id: int, j: int, m: dict) -> None:
+        import mlx.core as mx
+
+        if f"e{j}.gate_proj.weight" in m:
+            return
+        fresh = mx.load(self._paths[layer_id])
+        for k in _PROJ_KEYS:
+            name = f"e{j}.{k}"
+            if name in fresh:
+                m[name] = fresh[name]
+
+    def _evict_until_fits(self, incoming_bytes: int) -> None:
+        import gc
+
+        import mlx.core as mx
+
+        if self._budget <= 0:
+            return
+        evicted = False
+        while self._lru and self._resident_bytes + incoming_bytes > self._budget:
+            (lid, j), nbytes = self._lru.popitem(last=False)
+            m = self._maps[lid]
+            for k in _PROJ_KEYS:
+                m.pop(f"e{j}.{k}", None)
+            self._resident_bytes -= nbytes
+            evicted = True
+        if evicted:
+            gc.collect()
+            try:
+                mx.clear_cache()
+            except Exception:
+                pass
 
     def get(self, layer_id: int, j: int):
         """(gate, up, down), each (w, scales, biases) lazy arrays for expert j.
@@ -251,6 +326,15 @@ class ExpertStore:
         bf16/float32) expert -- ``e{j}.{proj}.weight`` is the only key repack
         wrote for it."""
         m = self._maps[layer_id]
+        self._ensure_loaded(layer_id, j, m)
+        key = (layer_id, j)
+        if key in self._lru:
+            self._lru.move_to_end(key)
+        else:
+            nbytes = sum(m[f"e{j}.{k}"].nbytes for k in _PROJ_KEYS if f"e{j}.{k}" in m)
+            self._evict_until_fits(nbytes)
+            self._lru[key] = nbytes
+            self._resident_bytes += nbytes
         trip = lambda p: (
             m[f"e{j}.{p}.weight"],
             m.get(f"e{j}.{p}.scales"),
@@ -259,13 +343,19 @@ class ExpertStore:
         return (trip("gate_proj"), trip("up_proj"), trip("down_proj"))
 
 
-def patch_model(model, offload_dir: str) -> "ExpertStore":
+def patch_model(
+    model, offload_dir: str, expert_cache_gb: Optional[float] = None
+) -> "ExpertStore":
     """Swap every switch layer in ``model`` for an offloaded one (see module
     docstring for separate-vs-fused handling). group_size/bits/mode are
     resolved per projection via ``_quantization_for_path``, the same
     per-path override mechanism ``load_model``/``convert`` use. Raises if no
     expert files are found or nothing gets swapped, rather than silently
-    loading fully resident. Returns the store.
+    loading fully resident. ``expert_cache_gb`` bounds the store's resident
+    expert set (default: 70% of the GPU's recommended working set, from
+    ``mx.device_info()``) -- pass a smaller value to leave more headroom for
+    a large KV cache, or a very large one to effectively disable eviction
+    for a checkpoint already known to fit. Returns the store.
     """
     import mlx.nn as nn
 
@@ -286,7 +376,10 @@ def patch_model(model, offload_dir: str) -> "ExpertStore":
         merged = {**default_quant, **_quantization_for_path(quantization, path)}
         return merged["group_size"], merged["bits"], merged["mode"]
 
-    store = ExpertStore(offload_dir)
+    expert_cache_bytes = (
+        int(expert_cache_gb * 1e9) if expert_cache_gb is not None else None
+    )
+    store = ExpertStore(offload_dir, expert_cache_bytes)
     if not store._maps:
         raise ValueError(
             f"No expert files found under {offload_dir}/experts -- this "
