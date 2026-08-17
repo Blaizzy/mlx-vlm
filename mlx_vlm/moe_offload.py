@@ -390,8 +390,6 @@ class ExpertStore:
                 m[name] = fresh[name]
 
     def _evict_until_fits(self, incoming_bytes: int) -> None:
-        import gc
-
         import mlx.core as mx
 
         if self._budget <= 0:
@@ -406,7 +404,6 @@ class ExpertStore:
             self._evictions += 1
             evicted = True
         if evicted:
-            gc.collect()
             try:
                 mx.clear_cache()
             except Exception:
