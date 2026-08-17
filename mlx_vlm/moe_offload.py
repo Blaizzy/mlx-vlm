@@ -433,6 +433,35 @@ class ExpertStore:
         )
         return (trip("gate_proj"), trip("up_proj"), trip("down_proj"))
 
+    def get_all(self, layer_id: int, needed) -> dict:
+        """Bulk variant of ``get()`` for calls that touch most of a layer's
+        experts at once (a large prefill chunk routing over most of
+        ``num_experts``) -- measured (cProfile, real DeepSeek V4 Flash run):
+        at that touch ratio, per-expert ``get()`` degenerates into near-100%
+        misses, each paying its own full-file ``mx.load()`` plus an
+        LRU-eviction pass that mostly just re-evicts what the next expert is
+        about to reload. One ``mx.load()`` for the whole layer, bypassing the
+        per-expert LRU/eviction bookkeeping entirely, avoids that thrash.
+        Deliberately does not register into ``self._lru``/``_resident_bytes``:
+        integrating a whole layer into the byte-budget would evict most of
+        every *other* layer's residency to fit, which is not what a single
+        forward call touching one layer should cost. A decode step's later
+        selective ``get()`` calls simply re-miss (cheap: the OS page cache is
+        already warm from this call's ``mx.load()``)."""
+        import mlx.core as mx
+
+        fresh = mx.load(self._paths[layer_id])
+        out = {}
+        for j in needed:
+            j = int(j)
+            trip = lambda p: (
+                fresh[f"e{j}.{p}.weight"],
+                fresh.get(f"e{j}.{p}.scales"),
+                fresh.get(f"e{j}.{p}.biases"),
+            )
+            out[j] = (trip("gate_proj"), trip("up_proj"), trip("down_proj"))
+        return out
+
     def stats(self) -> dict:
         """A snapshot of eviction behavior, for a server-side observability
         endpoint or ad hoc tuning of ``expert_cache_gb``. ``hit_rate`` is

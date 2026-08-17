@@ -15112,6 +15112,7 @@ class TestMoEOffload(unittest.TestCase):
         class FakeStore:
             def __init__(self, gw, uw, dw):
                 self.gw, self.uw, self.dw = gw, uw, dw
+                self.num_experts = 4
 
             def get(self, layer_id, j):
                 return (
