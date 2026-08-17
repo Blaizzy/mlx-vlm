@@ -283,6 +283,9 @@ class ExpertStore:
         )
         self._lru: "OrderedDict[Tuple[int, int], int]" = OrderedDict()
         self._resident_bytes = 0
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
 
     def experts_present(self, layer_id: int) -> bool:
         return layer_id in self._maps
@@ -312,6 +315,7 @@ class ExpertStore:
             for k in _PROJ_KEYS:
                 m.pop(f"e{j}.{k}", None)
             self._resident_bytes -= nbytes
+            self._evictions += 1
             evicted = True
         if evicted:
             gc.collect()
@@ -330,7 +334,9 @@ class ExpertStore:
         key = (layer_id, j)
         if key in self._lru:
             self._lru.move_to_end(key)
+            self._hits += 1
         else:
+            self._misses += 1
             nbytes = sum(m[f"e{j}.{k}"].nbytes for k in _PROJ_KEYS if f"e{j}.{k}" in m)
             self._evict_until_fits(nbytes)
             self._lru[key] = nbytes
@@ -341,6 +347,25 @@ class ExpertStore:
             m.get(f"e{j}.{p}.biases"),
         )
         return (trip("gate_proj"), trip("up_proj"), trip("down_proj"))
+
+    def stats(self) -> dict:
+        """A snapshot of eviction behavior, for a server-side observability
+        endpoint or ad hoc tuning of ``expert_cache_gb``. ``hit_rate`` is
+        fraction of ``get()`` calls that found the expert already resident;
+        a low rate under real traffic (not this session's cold start) means
+        the budget is too small for the working set and thrashing."""
+        total = self._hits + self._misses
+        return {
+            "budget_bytes": self._budget,
+            "resident_bytes": self._resident_bytes,
+            "resident_experts": len(self._lru),
+            "num_experts": self.num_experts,
+            "num_layers": len(self._maps),
+            "hits": self._hits,
+            "misses": self._misses,
+            "evictions": self._evictions,
+            "hit_rate": (self._hits / total) if total else None,
+        }
 
 
 def patch_model(

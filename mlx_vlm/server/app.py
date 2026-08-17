@@ -1040,6 +1040,21 @@ async def apc_cache_reset(request: Request):
     return {"enabled": True, "status": "cleared"}
 
 
+@app.get("/v1/moe-offload/stats")
+@app.get("/moe-offload/stats", include_in_schema=False)
+async def moe_offload_stats(request: Request):
+    """Report the loaded model's expert-offload eviction state (or
+    ``enabled=false`` for a normal, non-offloaded checkpoint)."""
+    _require_management_api_key(request)
+    model = getattr(runtime.response_generator, "model", None)
+    store = getattr(model, "moe_offload_store", None)
+    if store is None:
+        return {"enabled": False}
+    snap = store.stats()
+    snap["enabled"] = True
+    return snap
+
+
 @app.post("/unload")
 async def unload_model_endpoint(request: Request):
     """
