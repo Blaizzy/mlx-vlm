@@ -36,6 +36,34 @@ def _pop_image_processor_kwargs(kwargs):
     }
 
 
+def _drop_surplus_image_tokens(
+    text: str,
+    *,
+    image_token: str,
+    vision_start_token: str,
+    vision_end_token: str,
+    count: int,
+) -> str:
+    """Remove stale image placeholders when a prompt has more markers than images."""
+    if count <= 0 or image_token not in text:
+        return text
+
+    wrapped_token = f"{vision_start_token}{image_token}{vision_end_token}"
+    for _ in range(count):
+        token_index = text.find(image_token)
+        if token_index < 0:
+            break
+
+        wrapped_index = token_index - len(vision_start_token)
+        if wrapped_index >= 0 and text.startswith(wrapped_token, wrapped_index):
+            text = text[:wrapped_index] + text[wrapped_index + len(wrapped_token) :]
+            continue
+
+        text = text[:token_index] + text[token_index + len(image_token) :]
+
+    return text
+
+
 def _smart_resize_video(
     num_frames: int,
     height: int,
@@ -639,9 +667,35 @@ class Qwen3VLProcessor(ProcessorMixin):
         text = text.copy()
         if image_grid_thw is not None:
             merge_length = self.image_processor.merge_size**2
+            num_images = len(image_grid_thw)
+            num_image_tokens = sum(
+                item.count(self.image_token) for item in text if isinstance(item, str)
+            )
+            surplus_image_tokens = max(0, num_image_tokens - num_images)
+            if surplus_image_tokens:
+                for i in range(len(text)):
+                    if not isinstance(text[i], str) or surplus_image_tokens <= 0:
+                        continue
+                    item_image_tokens = text[i].count(self.image_token)
+                    if item_image_tokens <= 0:
+                        continue
+                    drop_count = min(item_image_tokens, surplus_image_tokens)
+                    text[i] = _drop_surplus_image_tokens(
+                        text[i],
+                        image_token=self.image_token,
+                        vision_start_token=self.vision_start_token,
+                        vision_end_token=self.vision_end_token,
+                        count=drop_count,
+                    )
+                    surplus_image_tokens -= drop_count
+
             index = 0
             for i in range(len(text)):
+                if not isinstance(text[i], str):
+                    continue
                 while self.image_token in text[i]:
+                    if index >= num_images:
+                        break
                     num_image_tokens = image_grid_thw[index].prod() // merge_length
                     text[i] = text[i].replace(
                         self.image_token,
