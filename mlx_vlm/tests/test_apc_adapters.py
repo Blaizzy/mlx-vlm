@@ -49,9 +49,35 @@ def _max_abs_error(a: mx.array, b: mx.array) -> float:
     return mx.max(mx.abs(a - b)).item()
 
 
-def test_snapshot_nested_pooling_cache_restores_ratio_before_buffered_state():
+def test_snapshot_single_row_cache_list_clones_nested_pooling_cache():
     from mlx_vlm.apc import snapshot_prompt_cache_row
 
+    rotating = RotatingKVCache(max_size=16)
+    keys, values = _rand_kv(batch=1, seq_len=3, heads=1, dim=2)
+    rotating.update_and_fetch(keys, values)
+    pooling = PoolingCache(ratio=4)
+    kv = mx.arange(6, dtype=mx.float32).reshape(1, 3, 2)
+    gate = mx.arange(3, dtype=mx.float32).reshape(1, 3, 1)
+    pooling.accumulate_windows(kv, gate, offset=0)
+
+    snapshot = snapshot_prompt_cache_row([CacheList(rotating, pooling)], batch_idx=0)
+
+    assert snapshot is not None
+    cloned_rotating, cloned = snapshot[0].caches
+    assert isinstance(cloned_rotating, RotatingKVCache)
+    assert cloned_rotating.offset == 3
+    assert isinstance(cloned, PoolingCache)
+    assert cloned.ratio == 4
+    assert cloned.remainder == 3
+    mx.eval(*[value for value in cloned.state if value is not None])
+    assert mx.array_equal(cloned.state[0], kv).item()
+    assert mx.array_equal(cloned.state[1], gate).item()
+
+
+def test_snapshot_batch_cache_list_extracts_nested_pooling_cache():
+    from mlx_vlm.apc import snapshot_prompt_cache_row
+
+    rotating, _, _ = _fill_batch_rotating([0], seq_len=3, max_size=16)
     pooling = BatchPoolingCache(ratio=4, left_padding=[0])
     kv = mx.arange(6, dtype=mx.float32).reshape(1, 3, 2)
     gate = mx.arange(3, dtype=mx.float32).reshape(1, 3, 1)
@@ -59,10 +85,11 @@ def test_snapshot_nested_pooling_cache_restores_ratio_before_buffered_state():
     pooling.accumulate_windows(kv, gate, offset=0)
     pooling.finalize()
 
-    snapshot = snapshot_prompt_cache_row([CacheList(pooling)], batch_idx=0)
+    snapshot = snapshot_prompt_cache_row([CacheList(rotating, pooling)], batch_idx=0)
 
     assert snapshot is not None
-    cloned = snapshot[0][0]
+    cloned_rotating, cloned = snapshot[0].caches
+    assert isinstance(cloned_rotating, RotatingKVCache)
     assert isinstance(cloned, PoolingCache)
     assert cloned.ratio == 4
     assert cloned.remainder == 3
