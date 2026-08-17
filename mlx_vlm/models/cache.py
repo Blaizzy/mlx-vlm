@@ -2151,12 +2151,7 @@ class PoolingCache(_BaseCache):
 
     @classmethod
     def merge(cls, caches, prefix_lens=None):
-        # APC's generic exact-cache adapter passes prefix lengths to custom
-        # merge implementations. Pooling caches derive their batched progress
-        # from each row's pooled length and remainder, so no extra alignment is
-        # required here.
-        del prefix_lens
-        return BatchPoolingCache.merge(caches)
+        return BatchPoolingCache.merge(caches, prefix_lens)
 
 
 class BatchPoolingCache(_BaseCache):
@@ -2497,8 +2492,11 @@ class BatchPoolingCache(_BaseCache):
         return cache
 
     @classmethod
-    def merge(cls, caches):
+    def merge(cls, caches, prefix_lens=None):
         """Merge a list of PoolingCache instances into a BatchPoolingCache."""
+        # APC passes prefix lengths to custom merge implementations. Pooling
+        # caches derive progress from each row's pooled length and remainder.
+        del prefix_lens
         B = len(caches)
         if not all(c.ratio == caches[0].ratio for c in caches):
             raise ValueError(

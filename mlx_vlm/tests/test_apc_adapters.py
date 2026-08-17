@@ -98,7 +98,19 @@ def test_snapshot_batch_cache_list_extracts_nested_pooling_cache():
     assert mx.array_equal(cloned.state[1], gate).item()
 
 
-def test_pooling_cache_exact_batch_merge_accepts_prefix_lengths():
+def test_batch_pooling_cache_merge_accepts_prefix_lengths():
+    merged = BatchPoolingCache.merge(
+        [PoolingCache(ratio=4), PoolingCache(ratio=4)],
+        prefix_lens=[0, 0],
+    )
+
+    assert isinstance(merged, BatchPoolingCache)
+    assert merged.remainder == [0, 0]
+    assert merged._pool_lengths == [0, 0]
+    assert merged._processed == [0, 0]
+
+
+def test_pooling_cache_exact_batch_merge_forwards_prefix_lengths():
     from mlx_vlm.apc_adapters import merge_cache_entries
 
     warm = PoolingCache(ratio=4)
