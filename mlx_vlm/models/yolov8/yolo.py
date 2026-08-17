@@ -6,7 +6,6 @@ difference between PyTorch (B, C, H, W) and MLX (B, H, W, C).
 Reference: ultralytics/ultralytics/nn/modules/block.py, head.py, tasks.py
 """
 
-
 import mlx.core as mx
 import mlx.nn as nn
 from safetensors import safe_open
