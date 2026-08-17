@@ -68,7 +68,7 @@ class DeepseekV4MTPSplitter(MTPSplitter):
     def sanitize_ctx(self, text_config: dict):
         return SimpleNamespace(args=DeepseekV4Config.from_dict(text_config))
 
-    def quantization(self, tensors, source_config, text_config, quant_opts):
+    def quantization_from_source(self, tensors, source_config):
         return _quantization_from_weights(tensors)
 
 

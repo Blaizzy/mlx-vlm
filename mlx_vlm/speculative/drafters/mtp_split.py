@@ -111,7 +111,46 @@ class MTPSplitter:
         text_config: dict,
         quant_opts: dict,
     ) -> Optional[dict]:
+        # (a) source already carries quantized MTP tensors -> record their config
+        existing = self.quantization_from_source(tensors, source_config)
+        if existing is not None:
+            return existing
+        # (b) fp drafter + a quantization was requested (e.g. convert --mtp --bits)
+        q_bits = quant_opts.get("q_bits")
+        if q_bits is None:
+            return None
+        return self._affine_quantize(
+            tensors, q_bits, quant_opts.get("q_group_size", 64)
+        )
+
+    def quantization_from_source(
+        self, tensors: Dict[str, mx.array], source_config: dict
+    ) -> Optional[dict]:
         return None
+
+    def should_quantize_key(self, key: str) -> bool:
+        # skip the router gate (kept full precision for routing stability); norms
+        # and the fp32 correction bias fall out via the ndim/divisibility checks
+        return key.endswith(".weight") and not key.endswith("mlp.gate.weight")
+
+    def _affine_quantize(
+        self, weights: Dict[str, mx.array], bits: int, group_size: int
+    ) -> Optional[dict]:
+        quantized_any = False
+        for key in list(weights):
+            if not self.should_quantize_key(key):
+                continue
+            weight = weights[key]
+            if weight.ndim < 2 or weight.shape[-1] % group_size != 0:
+                continue
+            wq, scales, biases = mx.quantize(weight, group_size=group_size, bits=bits)
+            weights[key] = wq
+            weights[key[: -len(".weight")] + ".scales"] = scales
+            weights[key[: -len(".weight")] + ".biases"] = biases
+            quantized_any = True
+        if not quantized_any:
+            return None
+        return {"group_size": group_size, "bits": bits, "mode": "affine"}
 
     def depth(self, text_config: dict) -> int:
         return int(text_config.get(self.depth_field, 1) or 1)
@@ -220,6 +259,7 @@ class MTPSplitter:
 MTP_SPLITTERS: Dict[str, str] = {
     "qwen3_5": "mlx_vlm.speculative.drafters.qwen3_5_mtp.split:Qwen3_5MTPSplitter",
     "qwen3_5_moe": "mlx_vlm.speculative.drafters.qwen3_5_mtp.split:Qwen3_5MTPSplitter",
+    "qwen3_next": "mlx_vlm.speculative.drafters.qwen3_5_mtp.split:Qwen3NextMTPSplitter",
     "deepseek_v4": "mlx_vlm.speculative.drafters.deepseek_v4_mtp.split:DeepseekV4MTPSplitter",
     "glm4_moe_lite": "mlx_vlm.speculative.drafters.glm4_moe_lite_mtp.split:Glm4MoeLiteMTPSplitter",
     "inkling_mm_model": "mlx_vlm.speculative.drafters.inkling_mtp.split:InklingMTPSplitter",

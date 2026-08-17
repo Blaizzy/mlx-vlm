@@ -107,33 +107,6 @@ def _stack_experts(weights: Dict[str, mx.array], text_config: dict) -> None:
         )
 
 
-def _quantize(
-    weights: Dict[str, mx.array], bits: int, group_size: int
-) -> Optional[dict]:
-    """Affine-quantize the projection weights in place, matching mlx-lm convert.
-
-    Skips the router gate (``mlp.gate.weight`` stays full precision for routing
-    stability), norms, and the fp32 correction bias. Returns the quantization
-    config to record, or ``None`` if nothing was quantized.
-    """
-    quantized_any = False
-    for key in list(weights):
-        if not key.endswith(".weight") or key.endswith("mlp.gate.weight"):
-            continue
-        weight = weights[key]
-        if weight.ndim < 2 or weight.shape[-1] % group_size != 0:
-            continue
-        wq, scales, biases = mx.quantize(weight, group_size=group_size, bits=bits)
-        weights[key] = wq
-        weights[key[: -len(".weight")] + ".scales"] = scales
-        weights[key[: -len(".weight")] + ".biases"] = biases
-        quantized_any = True
-
-    if not quantized_any:
-        return None
-    return {"group_size": group_size, "bits": bits, "mode": "affine"}
-
-
 class Glm4MoeLiteMTPSplitter(MTPSplitter):
     output_model_type = "glm4_moe_lite_mtp"
     draft_model_cls = None
@@ -171,12 +144,6 @@ class Glm4MoeLiteMTPSplitter(MTPSplitter):
     def postprocess(self, tensors: Dict[str, mx.array], text_config: dict) -> None:
         _split_kv_b_proj(tensors, text_config)
         _stack_experts(tensors, text_config)
-
-    def quantization(self, tensors, source_config, text_config, quant_opts):
-        q_bits = quant_opts.get("q_bits")
-        if q_bits is None:
-            return None
-        return _quantize(tensors, q_bits, quant_opts.get("q_group_size", 64))
 
 
 def split_glm4_moe_lite_mtp(

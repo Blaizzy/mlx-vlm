@@ -15776,3 +15776,82 @@ class TestMTPSplit(unittest.TestCase):
                 tmp, cfg, {"model.embed_tokens.weight": mx.random.normal((4, 8))}
             )
             self.assertIsNone(detect_mtp_splitter(Path(src)))
+
+    def test_qwen3_next_split_stacks_separate_experts(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
+        from mlx_vlm.split_mtp import split_mtp
+
+        norm = mx.random.normal((8,))
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            tensors = {
+                "mtp.pre_fc_norm_embedding.weight": norm,
+                "mtp.fc.weight": mx.random.normal((8, 16)),
+                "mtp.norm.weight": mx.random.normal((8,)),
+                "mtp.layers.0.input_layernorm.weight": mx.random.normal((8,)),
+            }
+            for e in range(2):
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    tensors[f"mtp.layers.0.mlp.experts.{e}.{proj}.weight"] = (
+                        mx.random.normal((8, 8))
+                    )
+            src = self._write_source(
+                tmp,
+                {"text_config": {"model_type": "qwen3_next", "num_experts": 2}},
+                tensors,
+            )
+            splitter = detect_mtp_splitter(Path(src))
+            self.assertIsNotNone(splitter)
+            self.assertEqual(splitter.output_model_type, "qwen3_5_mtp")
+            split_mtp(src, out)
+            weights = mx.load(str(Path(out) / "model.safetensors"))
+            config = json.loads((Path(out) / "config.json").read_text())
+
+        self.assertTrue(all(not k.startswith("mtp.") for k in weights))
+        # zero-centered-norm +1.0 shift applies to Qwen3-Next norms too
+        self.assertTrue(
+            mx.allclose(weights["pre_fc_norm_embedding.weight"], norm + 1.0).item()
+        )
+        # separate up/down/gate experts collapse into a stacked switch_mlp
+        self.assertEqual(
+            weights["layers.0.mlp.switch_mlp.gate_proj.weight"].shape, (2, 8, 8)
+        )
+        self.assertNotIn("layers.0.mlp.experts.0.gate_proj.weight", weights)
+        self.assertEqual(config["model_type"], "qwen3_5_mtp")
+        self.assertEqual(config["block_size"], 3)  # depth defaults to 1 (+2)
+
+    def test_requested_quantization_quantizes_fp_drafter(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.split_mtp import split_mtp
+
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            src = self._write_source(
+                tmp,
+                {
+                    "model_type": "qwen3_5",
+                    "text_config": {
+                        "model_type": "qwen3_5",
+                        "mtp_num_hidden_layers": 1,
+                    },
+                },
+                {
+                    "mtp.norm.weight": mx.random.normal((64,)),
+                    "mtp.layers.0.self_attn.q_proj.weight": mx.random.normal((64, 64)),
+                },
+            )
+            split_mtp(src, out, q_bits=4, q_group_size=64)
+            weights = mx.load(str(Path(out) / "model.safetensors"))
+            config = json.loads((Path(out) / "config.json").read_text())
+
+        # the 2D projection got affine-quantized; the 1D norm did not
+        self.assertIn("layers.0.self_attn.q_proj.scales", weights)
+        self.assertIn("layers.0.self_attn.q_proj.biases", weights)
+        self.assertNotIn("norm.scales", weights)
+        self.assertEqual(config["quantization"]["mode"], "affine")
+        self.assertEqual(config["quantization"]["bits"], 4)

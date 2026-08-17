@@ -421,22 +421,30 @@ def convert(
     save_config(config, config_path=mlx_path / "config.json")
 
     if mtp:
-        from .speculative.drafters.mtp_split import detect_mtp_splitter
+        try:
+            from .speculative.drafters.mtp_split import detect_mtp_splitter
 
-        splitter = detect_mtp_splitter(model_path)
-        if splitter is None:
+            splitter = detect_mtp_splitter(model_path)
+            if splitter is None:
+                print(
+                    "[INFO] --mtp: no native MTP tensors / registered splitter for "
+                    "this model; skipping drafter"
+                )
+            else:
+                drafter_path = mtp_output or f"{mlx_path}-mtp"
+                print(f"[INFO] Extracting MTP drafter -> {drafter_path}")
+                splitter.split(
+                    str(model_path),
+                    str(drafter_path),
+                    q_bits=q_bits if quantize else None,
+                    q_group_size=q_group_size,
+                )
+        except Exception as exc:
+            # the base conversion already succeeded; a drafter failure must not
+            # take the whole convert down with it
             print(
-                "[INFO] --mtp: no native MTP tensors / registered splitter for this "
-                "model; skipping drafter"
-            )
-        else:
-            drafter_path = mtp_output or f"{mlx_path}-mtp"
-            print(f"[INFO] Extracting MTP drafter -> {drafter_path}")
-            splitter.split(
-                str(model_path),
-                str(drafter_path),
-                q_bits=q_bits if quantize else None,
-                q_group_size=q_group_size,
+                f"[WARNING] --mtp: failed to extract MTP drafter "
+                f"({type(exc).__name__}: {exc}); base conversion is unaffected"
             )
 
     hf_repo = None if Path(hf_path).exists() else hf_path
