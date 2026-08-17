@@ -11,18 +11,15 @@ except ModuleNotFoundError as e:  # optional 'train' extra
         "Fine-tuning requires the 'train' extra: pip install 'mlx-vlm[train]'"
     ) from e
 
-from .trainer.datasets import PreferenceVisionDataset, VisionDataset
-from .trainer.orpo_trainer import ORPOTrainingArgs, train_orpo
-from .trainer.sft_trainer import TrainingArgs, train
-from .trainer.utils import (
-    Colors,
+from .trainer.core import Colors, not_supported_for_training, print_trainable_parameters
+from .trainer.peft.utils import (
     apply_lora_layers,
     find_all_linear_names,
     get_peft_model,
-    not_supported_for_training,
-    print_trainable_parameters,
     unfreeze_modules,
 )
+from .trainer.vlm import ORPOTrainingArgs, TrainingArgs, train, train_orpo
+from .trainer.vlm.datasets import PreferenceVisionDataset, VisionDataset
 from .utils import load
 
 logging.basicConfig(level=logging.INFO)

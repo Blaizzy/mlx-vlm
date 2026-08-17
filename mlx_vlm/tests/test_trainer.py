@@ -4,9 +4,9 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_vlm.trainer.datasets import VisionDataset
-from mlx_vlm.trainer.lora import LoRaLayer
-from mlx_vlm.trainer.sft_trainer import (
+from mlx_vlm.trainer.peft.lora import LoRaLayer
+from mlx_vlm.trainer.vlm.datasets import VisionDataset
+from mlx_vlm.trainer.vlm.sft.trainer import (
     TrainingArgs,
     iterate_batches,
     train,
@@ -21,7 +21,7 @@ class TestDataset(unittest.TestCase):
         self.mock_processor = MagicMock()
         self.mock_image_processor = MagicMock()
 
-    @patch("mlx_vlm.trainer.datasets.apply_chat_template")
+    @patch("mlx_vlm.trainer.vlm.datasets.apply_chat_template")
     @patch("mlx_vlm.utils.prepare_inputs")
     def test_dataset_getitem(self, mock_prepare_inputs, mock_apply_chat_template):
         dataset = VisionDataset(
@@ -68,7 +68,7 @@ class TestDataset(unittest.TestCase):
         self.assertEqual(result["image_grid_thw"], (1, 1, 1))
         self.assertTrue(mx.array_equal(result["image_sizes"], mx.array([224, 224])))
 
-    @patch("mlx_vlm.trainer.datasets.apply_chat_template")
+    @patch("mlx_vlm.trainer.vlm.datasets.apply_chat_template")
     @patch("mlx_vlm.utils.prepare_inputs")
     def test_dataset_getitem_falls_back_to_image_token_id(
         self, mock_prepare_inputs, mock_apply_chat_template
@@ -98,7 +98,7 @@ class TestDataset(unittest.TestCase):
         call_kwargs = mock_prepare_inputs.call_args[1]
         self.assertEqual(call_kwargs["image_token_index"], 151655)
 
-    @patch("mlx_vlm.trainer.datasets.apply_chat_template")
+    @patch("mlx_vlm.trainer.vlm.datasets.apply_chat_template")
     def test_dataset_getitem_raises_when_image_token_keys_missing(
         self, mock_apply_chat_template
     ):
@@ -134,7 +134,7 @@ class TestDataset(unittest.TestCase):
         self.assertEqual(dataset.config, self.mock_config)
         self.assertEqual(dataset.processor, self.mock_processor)
 
-    @patch("mlx_vlm.trainer.datasets.apply_chat_template")
+    @patch("mlx_vlm.trainer.vlm.datasets.apply_chat_template")
     @patch("mlx_vlm.utils.prepare_inputs")
     def test_dataset_adds_completion_mask_from_chat_template(
         self, mock_prepare_inputs, mock_apply_chat_template
@@ -180,7 +180,7 @@ class TestDataset(unittest.TestCase):
             mx.array_equal(result["completion_mask"], mx.array([[0, 0, 1, 1]]))
         )
 
-    @patch("mlx_vlm.trainer.datasets.apply_chat_template")
+    @patch("mlx_vlm.trainer.vlm.datasets.apply_chat_template")
     @patch("mlx_vlm.utils.prepare_inputs")
     def test_dataset_skips_completion_mask_when_not_training_on_completions(
         self, mock_prepare_inputs, mock_apply_chat_template
@@ -421,8 +421,8 @@ class TestTrainer(unittest.TestCase):
         self.mock_optimizer = MagicMock()
         self.mock_optimizer.learning_rate = 1e-4
 
-    @patch("mlx_vlm.trainer.sft_trainer.iterate_batches")
-    @patch("mlx_vlm.trainer.sft_trainer.mx.save_safetensors")
+    @patch("mlx_vlm.trainer.vlm.sft.trainer.iterate_batches")
+    @patch("mlx_vlm.trainer.vlm.sft.trainer.mx.save_safetensors")
     def test_trainer_initialization(self, mock_save_safetensors, mock_iterate_batches):
         mock_batch = {
             "input_ids": mx.array([[1, 2, 3], [1, 2, 3], [1, 2, 3], [1, 2, 3]]),
@@ -446,8 +446,8 @@ class TestTrainer(unittest.TestCase):
         self.mock_optimizer.update.assert_called()
         mock_save_safetensors.assert_called()
 
-    @patch("mlx_vlm.trainer.sft_trainer.iterate_batches")
-    @patch("mlx_vlm.trainer.sft_trainer.mx.save_safetensors")
+    @patch("mlx_vlm.trainer.vlm.sft.trainer.iterate_batches")
+    @patch("mlx_vlm.trainer.vlm.sft.trainer.mx.save_safetensors")
     def test_train_smoke(self, mock_save_safetensors, mock_iterate_batches):
         mock_batch = {
             "input_ids": mx.array([[1, 2, 3], [1, 2, 3], [1, 2, 3], [1, 2, 3]]),
@@ -470,8 +470,8 @@ class TestTrainer(unittest.TestCase):
         self.mock_optimizer.update.assert_called()
         mock_save_safetensors.assert_called()
 
-    @patch("mlx_vlm.trainer.sft_trainer.iterate_batches")
-    @patch("mlx_vlm.trainer.sft_trainer.mx.save_safetensors")
+    @patch("mlx_vlm.trainer.vlm.sft.trainer.iterate_batches")
+    @patch("mlx_vlm.trainer.vlm.sft.trainer.mx.save_safetensors")
     def test_train_uses_default_adapter_file_when_missing(
         self, mock_save_safetensors, mock_iterate_batches
     ):
