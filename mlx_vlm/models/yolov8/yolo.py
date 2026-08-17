@@ -379,7 +379,8 @@ def non_max_suppression(prediction, conf_thresh=0.25, iou_thresh=0.45, max_det=3
             output.append(mx.zeros((0, 6)))
             continue
 
-        # Convert xywh to xyxy.
+        # Convert xywh to xyxy. The boxes are already ordered by descending
+        # score (topk_idx sort above), so no re-sort is needed here.
         cx, cy, w, h = (
             boxes_xywh[:, 0],
             boxes_xywh[:, 1],
@@ -391,12 +392,6 @@ def non_max_suppression(prediction, conf_thresh=0.25, iou_thresh=0.45, max_det=3
         x2 = cx + w / 2
         y2 = cy + h / 2
         boxes_xyxy = mx.stack([x1, y1, x2, y2], axis=-1)
-
-        # Sort by score (descending).
-        order = mx.argsort(max_scores)[::-1]
-        boxes_xyxy = mx.take(boxes_xyxy, order, axis=0)
-        max_scores = mx.take(max_scores, order, axis=0)
-        class_ids = mx.take(class_ids, order, axis=0)
 
         # Greedy NMS.
         keep = []
@@ -529,14 +524,19 @@ if __name__ == "__main__":
     print(f"Anchors shape: {anchors.shape}")  # (8400, 2)
     print(f"Strides shape: {strides.shape}")  # (8400, 1)
 
-    # Decode boxes.
+    # Decode boxes: (1, 4, 8400) in grid coordinates.
     decoded = dist2bbox(dfl_out, anchors)
-    print(f"Decoded boxes shape: {decoded.shape}")  # (1, 4, 8400)
+    print(f"Decoded boxes shape (grid coords): {decoded.shape}")
+
+    # Scale decoded boxes from grid coordinates to pixel coordinates using the
+    # per-anchor stride. strides: (8400, 1) -> broadcast over (B, 4, 8400).
+    decoded_px = decoded * strides.reshape(1, 1, -1)
+    print(f"Decoded boxes shape (pixel coords): {decoded_px.shape}")
 
     # Full pipeline: decode + scores.
     cls_scores = mx.sigmoid(scores)
-    pred = mx.concatenate([decoded, cls_scores], axis=1)  # (1, 84, 8400)
-    print(f"Full prediction shape: {pred.shape}")  # (1, 84, 8400)
+    pred = mx.concatenate([decoded_px, cls_scores], axis=1)  # (1, 84, 8400)
+    print(f"Full prediction shape: {pred.shape}")
 
     # NMS.
     detections = non_max_suppression(pred, conf_thresh=0.25, iou_thresh=0.45)
