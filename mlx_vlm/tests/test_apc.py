@@ -81,6 +81,27 @@ def test_hash_chain_and_image_hash_are_deterministic():
     )
 
 
+def test_image_hash_reads_in_memory_image_content_not_identity():
+    """An image passed as an object must key by its pixels.
+
+    Falling back to ``repr`` would key by address: two runs of the same request
+    would miss each other, and a reused address would collide.
+    """
+    from PIL import Image
+
+    def solid(colour):
+        return Image.fromarray(np.full((8, 8, 3), colour, dtype=np.uint8))
+
+    red, red_again, blue = (
+        solid((220, 30, 30)),
+        solid((220, 30, 30)),
+        solid((30, 30, 220)),
+    )
+
+    assert hash_image_payload(image_ref=red) == hash_image_payload(image_ref=red_again)
+    assert hash_image_payload(image_ref=red) != hash_image_payload(image_ref=blue)
+
+
 def test_image_hash_preserves_tensor_shape_and_dtype():
     flat_values = mx.arange(12, dtype=mx.float32)
     first_shape = flat_values.reshape(1, 3, 2, 2)

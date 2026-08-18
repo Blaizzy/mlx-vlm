@@ -367,6 +367,21 @@ def _sequence_hash(token_ids: Sequence[int], extra_hash: int, block_size: int) -
     return int.from_bytes(h.digest()[:8], "little", signed=True)
 
 
+def _in_memory_image_bytes(image_ref: Any) -> Optional[bytes]:
+    """Raw pixels of an in-memory image, or None if this is not one.
+
+    An image handed over as an object rather than a path would otherwise fall
+    back to ``repr``, which carries its address: not stable across processes,
+    and not unique once the allocator reuses that address.
+    """
+    if not (hasattr(image_ref, "mode") and hasattr(image_ref, "size")):
+        return None
+    try:
+        return np.asarray(image_ref).tobytes()
+    except Exception:
+        return None
+
+
 def hash_image_payload(
     pixel_values: Optional[mx.array] = None,
     image_ref: Any = None,
@@ -396,6 +411,11 @@ def hash_image_payload(
     if isinstance(image_ref, bytes):
         return int.from_bytes(
             hashlib.sha256(image_ref).digest()[:8], "little", signed=True
+        )
+    pixels = _in_memory_image_bytes(image_ref)
+    if pixels is not None:
+        return int.from_bytes(
+            hashlib.sha256(pixels).digest()[:8], "little", signed=True
         )
     digest = hashlib.sha256(repr(image_ref).encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "little", signed=True)

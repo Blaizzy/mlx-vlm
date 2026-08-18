@@ -599,6 +599,51 @@ def _prompt_kwarg_row(key: str, v: mx.array, row_idx: int, batch_size: int) -> m
     return v[:1]
 
 
+def _apply_apc_row_semantic_hash(
+    prompt_kwargs_rows: List[dict],
+    *,
+    model: Any,
+    processor: Any,
+    pixel_values: Optional[mx.array],
+    images: Optional[List[Any]],
+) -> None:
+    """Key each batch row by its media rather than by its prompt embeddings.
+
+    ``inputs_embeds`` in a batch row is derived from that row's tokens and
+    media, and ``_apc_extra_hash`` would otherwise fold its contents into the
+    cache key. That makes the key unique to the whole prompt, so two prompts
+    sharing an opening can never share a prefix. The media hash carries the
+    only information the token chain does not already cover. The server
+    precomputes the same value for the same reason.
+    """
+    rows = len(prompt_kwargs_rows)
+    row_major_pixels = (
+        pixel_values is not None
+        and int(getattr(pixel_values, "shape", (0,))[0] or 0) == rows
+    )
+    for i, row in enumerate(prompt_kwargs_rows):
+        if row.get("_apc_semantic_hash") is not None:
+            continue
+        row_pixels = pixel_values[i : i + 1] if row_major_pixels else None
+        image_ref = None
+        if row_pixels is None:
+            if images and i < len(images):
+                image_ref = images[i]
+            elif images:
+                image_ref = images
+        row["_apc_semantic_hash"] = _apc.semantic_extra_hash(
+            image_hash=_apc.hash_image_payload(
+                pixel_values=row_pixels, image_ref=image_ref
+            ),
+            media={
+                "audio": row.get("input_features"),
+                "video": row.get("pixel_values_videos"),
+            },
+            model=getattr(model, "language_model", model),
+            processor=processor,
+        )
+
+
 def _split_prompt_kwargs_per_row(prompt_kwargs: dict, batch_size: int) -> List[dict]:
     """Normalize batched prompt kwargs into one dict per batch row.
 
@@ -3203,10 +3248,20 @@ def _generate_batch(
             for _ in range(batch_size)
         ]
 
+    prompt_kwargs_rows = _split_prompt_kwargs_per_row(gen_kwargs, batch_size)
+    if getattr(gen, "apc_manager", None) is not None:
+        _apply_apc_row_semantic_hash(
+            prompt_kwargs_rows,
+            model=model,
+            processor=processor,
+            pixel_values=pixel_values,
+            images=images,
+        )
+
     uids = gen.insert(
         input_ids.tolist(),
         max_tokens,
-        prompt_kwargs=_split_prompt_kwargs_per_row(gen_kwargs, batch_size),
+        prompt_kwargs=prompt_kwargs_rows,
         logits_processors=logits_processors,
     )
     results = {uid: [] for uid in uids}

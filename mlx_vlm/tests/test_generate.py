@@ -2727,6 +2727,75 @@ def test_batch_apc_extra_hash_returns_precomputed_semantic_hash():
     assert extended_hash == semantic_hash
 
 
+def test_batch_rows_sharing_a_prefix_get_one_apc_key():
+    """Two prompts with a shared opening must land on the same APC salt.
+
+    Their derived ``inputs_embeds`` differ, so hashing those would make every
+    row's key unique to its whole prompt and prefix reuse impossible.
+    """
+    rows = [
+        {"inputs_embeds": mx.ones((1, 8, 4))},
+        {"inputs_embeds": mx.zeros((1, 12, 4))},
+    ]
+
+    ar_module._apply_apc_row_semantic_hash(
+        rows,
+        model=SimpleNamespace(language_model=SimpleNamespace()),
+        processor=SimpleNamespace(),
+        pixel_values=None,
+        images=None,
+    )
+
+    generator = SimpleNamespace(apc_manager=object())
+    salts = [BatchGenerator._apc_extra_hash(generator, row) for row in rows]
+    assert salts[0] == salts[1]
+
+
+def test_batch_rows_with_different_images_get_different_apc_keys():
+    rows = [{"inputs_embeds": mx.ones((1, 8, 4))} for _ in range(2)]
+    pixel_values = mx.stack([mx.zeros((3, 2, 2)), mx.ones((3, 2, 2))])
+
+    ar_module._apply_apc_row_semantic_hash(
+        rows,
+        model=SimpleNamespace(language_model=SimpleNamespace()),
+        processor=SimpleNamespace(),
+        pixel_values=pixel_values,
+        images=None,
+    )
+
+    assert rows[0]["_apc_semantic_hash"] != rows[1]["_apc_semantic_hash"]
+
+
+def test_batch_row_image_key_falls_back_to_the_row_reference():
+    """A processor that flattens patches leaves no per-row slice to hash."""
+    rows = [{"inputs_embeds": mx.ones((1, 8, 4))} for _ in range(2)]
+    flattened = mx.ones((37, 8))
+
+    ar_module._apply_apc_row_semantic_hash(
+        rows,
+        model=SimpleNamespace(language_model=SimpleNamespace()),
+        processor=SimpleNamespace(),
+        pixel_values=flattened,
+        images=["red.png", "blue.png"],
+    )
+
+    assert rows[0]["_apc_semantic_hash"] != rows[1]["_apc_semantic_hash"]
+
+
+def test_batch_row_semantic_hash_keeps_a_precomputed_value():
+    rows = [{"_apc_semantic_hash": 4242, "inputs_embeds": mx.ones((1, 8, 4))}]
+
+    ar_module._apply_apc_row_semantic_hash(
+        rows,
+        model=SimpleNamespace(language_model=SimpleNamespace()),
+        processor=SimpleNamespace(),
+        pixel_values=mx.ones((1, 3, 2, 2)),
+        images=None,
+    )
+
+    assert rows[0]["_apc_semantic_hash"] == 4242
+
+
 def test_batch_apc_extra_hash_still_tracks_non_text_media():
     batch_generator = SimpleNamespace(apc_manager=object())
     base = {
