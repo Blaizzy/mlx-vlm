@@ -22,7 +22,7 @@ from .generation import (
     _count_prompt_tokens,
 )
 from .responses_state import (
-    ThinkingStreamState,
+    make_response_stream_state,
     process_tool_calls,
     prompt_has_open_thinking,
     suppress_tool_call_content,
@@ -431,15 +431,11 @@ def _apply_stop_sequences(
 
 
 def _anthropic_content_from_generation(
-    full_text: str,
+    reasoning: Optional[str],
+    content: str,
     parsed_tool_calls: Optional[List[Any]] = None,
     include_thinking: bool = False,
-    thinking_start_token: Optional[str] = None,
-    thinking_end_token: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    reasoning, content = _split_thinking(
-        full_text, thinking_start_token, thinking_end_token
-    )
     blocks: List[Dict[str, Any]] = []
     if include_thinking and reasoning:
         blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
@@ -540,7 +536,8 @@ async def anthropic_messages_endpoint(http_request: Request):
                 open_block_type = None
                 full_output = ""
                 text_output = ""
-                thinking_state = ThinkingStreamState(
+                thinking_state = make_response_stream_state(
+                    processor,
                     prompt_has_open_thinking(
                         formatted_prompt,
                         gen_args.enable_thinking,
@@ -671,7 +668,9 @@ async def anthropic_messages_endpoint(http_request: Request):
                         for event in start_message_event():
                             yield event
 
-                        thinking_delta = thinking_state.feed(delta)
+                        thinking_delta = thinking_state.feed(
+                            delta, last=bool(getattr(token, "finish_reason", None))
+                        )
                         delta_reasoning = thinking_delta.reasoning
                         delta_content = thinking_delta.content
 
@@ -942,23 +941,32 @@ async def anthropic_messages_endpoint(http_request: Request):
                 metrics.record_result(result)
                 finish_reason = getattr(result, "finish_reason", None) or "stop"
 
+            reasoning, content = _split_thinking(
+                full_text,
+                gen_args.thinking_start_token,
+                gen_args.thinking_end_token,
+                processor=processor,
+            )
             parsed_tool_calls = None
-            response_text = full_text
             if tool_module is not None and tools:
                 tc = process_tool_calls(full_text, tool_module, tools)
                 if tc["calls"]:
                     parsed_tool_calls = tc["calls"]
-                    response_text = tc["remaining_text"] or ""
+                    _, content = _split_thinking(
+                        tc["remaining_text"] or "",
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
+                        processor=processor,
+                    )
 
-            response_text, stop_sequence = _apply_stop_sequences(
-                response_text, request.stop_sequences
+            content, stop_sequence = _apply_stop_sequences(
+                content, request.stop_sequences
             )
             content_blocks = _anthropic_content_from_generation(
-                response_text,
+                reasoning,
+                content,
                 parsed_tool_calls=parsed_tool_calls,
                 include_thinking=bool(gen_args.enable_thinking),
-                thinking_start_token=gen_args.thinking_start_token,
-                thinking_end_token=gen_args.thinking_end_token,
             )
             stop_reason = _anthropic_stop_reason(
                 finish_reason,

@@ -14,6 +14,7 @@ import mlx.core as mx
 from fastapi import HTTPException
 
 from .. import apc as _apc
+from .._stream_cleanup import clear_mlx_streams
 from ..generate import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
@@ -51,7 +52,6 @@ from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
 
-DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
 DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
 DEFAULT_LOG_PROGRESS_INTERVAL = 10
 DEFAULT_ENABLE_THINKING = False
@@ -98,21 +98,7 @@ def get_server_max_tokens():
 
 
 def get_token_queue_timeout():
-    raw_timeout = os.environ.get("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "")
-    if raw_timeout == "":
-        return DEFAULT_TOKEN_QUEUE_TIMEOUT
-    try:
-        timeout = float(raw_timeout)
-    except ValueError:
-        logger.warning(
-            "Invalid MLX_VLM_TOKEN_QUEUE_TIMEOUT=%r; falling back to %ss.",
-            raw_timeout,
-            DEFAULT_TOKEN_QUEUE_TIMEOUT,
-        )
-        return DEFAULT_TOKEN_QUEUE_TIMEOUT
-    if timeout <= 0:
-        return None
-    return timeout
+    return runtime.config.token_queue_timeout
 
 
 def get_speculative_batch_coalesce_s():
@@ -198,7 +184,7 @@ def _run_chunked_speculative_prefill(
     if (
         prefill_step_size is not None
         and prefill_step_size > 0
-        and remaining_embeds.shape[1] > 1
+        and remaining_embeds.shape[1] > prefill_step_size
     ):
         while remaining_embeds.shape[1] > 1:
             n_to_process = min(prefill_step_size, remaining_embeds.shape[1] - 1)
@@ -371,6 +357,8 @@ def get_max_kv_size(model: str):
 
 
 def get_configured_context_limit():
+    if runtime.config.max_kv_size is not None:
+        return runtime.config.max_kv_size or None
     max_kv_tokens = int(os.environ.get("MAX_KV_SIZE", 0))
     return max_kv_tokens or None
 
@@ -839,6 +827,7 @@ class QueuedGenerationRequest:
     images: Optional[List] = None
     videos: Optional[List] = None
     audio: Optional[List] = None
+    apc_semantic_hash: Optional[int] = None
     request_id: Optional[str] = None
     queued_at: float = field(default_factory=time.perf_counter)
 
@@ -1082,6 +1071,9 @@ class ResponseGenerator:
         quantized_kv_start=DEFAULT_QUANTIZED_KV_START,
         top_logprobs_k=0,
         apc_manager: Optional["_apc.APCManager"] = None,
+        draft_model_path: Optional[str] = None,
+        draft_kind: Optional[str] = None,
+        prefill_step_size: Optional[int] = None,
     ):
         self.model_path = model_path
         self.adapter_path = adapter_path
@@ -1090,6 +1082,8 @@ class ResponseGenerator:
         self.config = None
         self.stop_tokens = set()
         self.vision_cache = vision_cache
+        self.draft_model_path = draft_model_path
+        self.draft_kind_override = draft_kind
         self.draft_model = None
         self.kv_bits = kv_bits
         self.kv_key_bits = kv_key_bits
@@ -1101,6 +1095,12 @@ class ResponseGenerator:
         self.quantized_kv_start = quantized_kv_start
         self.top_logprobs_k = top_logprobs_k
         self.apc_manager = apc_manager
+        self.prefill_step_size = (
+            get_prefill_step_size()
+            if prefill_step_size is None
+            else int(prefill_step_size)
+        )
+        self.apc_mode = None
         self.tokenizer = None
         self.requests: Queue = Queue()
         self._stop = False
@@ -1112,10 +1112,23 @@ class ResponseGenerator:
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def stop_and_join(self):
+    def _effective_prefill_step_size(self) -> int:
+        prefill_step_size = getattr(self, "prefill_step_size", None)
+        return (
+            get_prefill_step_size()
+            if prefill_step_size is None
+            else int(prefill_step_size)
+        )
+
+    def stop_and_join(self, timeout: float = 10.0):
         self._stop = True
         self.requests.put(None)
-        self._thread.join(timeout=5.0)
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            logger.info(
+                "Generation thread still draining in-flight requests; "
+                "letting it finish in the background."
+            )
 
     def wait_until_ready(self, timeout: Optional[float] = None):
         if not self._ready.wait(timeout):
@@ -1144,10 +1157,13 @@ class ResponseGenerator:
                 stop_tokens.update(config.eos_token_id)
             elif config.eos_token_id is not None:
                 stop_tokens.add(config.eos_token_id)
+        stop_tokens.update(getattr(processor, "additional_eos_token_ids", ()))
 
         draft_model = None
-        draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND")
-        draft_model_path = os.environ.get("MLX_VLM_DRAFT_MODEL")
+        draft_kind = self.draft_kind_override or os.environ.get("MLX_VLM_DRAFT_KIND")
+        draft_model_path = self.draft_model_path or os.environ.get(
+            "MLX_VLM_DRAFT_MODEL"
+        )
         if draft_model_path:
             from ..speculative.drafters import (
                 load_drafter,
@@ -1191,6 +1207,10 @@ class ResponseGenerator:
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
+        self.apc_mode = None
+        if self.apc_manager is not None:
+            language_model = getattr(model, "language_model", model)
+            self.apc_mode = _apc.model_apc_mode(language_model)
 
     def generate(
         self,
@@ -1225,6 +1245,25 @@ class ResponseGenerator:
         prompt_tokens = _count_prompt_tokens(raw_inputs)
         _check_configured_context_budget(prompt_tokens, args.max_tokens)
 
+        apc_semantic_hash = None
+        if getattr(self, "apc_mode", None) is not None:
+            pixel_values = raw_inputs.get("pixel_values")
+            image_hash = 0
+            if pixel_values is not None:
+                image_hash = _apc.hash_image_payload(pixel_values=pixel_values)
+            elif images is not None:
+                image_hash = _apc.hash_image_payload(image_ref=images)
+            apc_semantic_hash = _apc.semantic_extra_hash(
+                tenant=getattr(args, "tenant_id", None),
+                image_hash=image_hash,
+                media={
+                    "audio": raw_inputs.get("input_features"),
+                    "video": raw_inputs.get("pixel_values_videos"),
+                },
+                model=getattr(self.model, "language_model", self.model),
+                processor=self.processor,
+            )
+
         request_id = f"{id(rqueue):x}"
         queued_request = QueuedGenerationRequest(
             rqueue=rqueue,
@@ -1235,6 +1274,7 @@ class ResponseGenerator:
             images=images,
             videos=videos,
             audio=audio,
+            apc_semantic_hash=apc_semantic_hash,
             request_id=request_id,
             queued_at=request_started_at,
         )
@@ -1506,9 +1546,11 @@ class ResponseGenerator:
         )
         if args.logits_processors is not None:
             request_processors = args.logits_processors
-            if input_ids is not None and self._prompt_has_open_thinking(
-                args, input_ids
-            ):
+            already_closed = (
+                input_ids is not None
+                and self._prompt_thinking_already_closed(args, input_ids)
+            )
+            if args.enable_thinking and not already_closed:
                 request_processors = self._wrap_processors_until_thinking_done(
                     args, request_processors
                 )
@@ -1544,6 +1586,23 @@ class ResponseGenerator:
             last_end = -1
         return last_start > last_end
 
+    def _prompt_thinking_already_closed(
+        self, args: GenerationArguments, input_ids: mx.array
+    ) -> bool:
+        if not args.enable_thinking:
+            return False
+        thinking_start_token_id, thinking_end_token_id = self._thinking_token_ids(args)
+        tokens = input_ids.flatten().tolist()
+        try:
+            last_start = len(tokens) - 1 - tokens[::-1].index(thinking_start_token_id)
+        except ValueError:
+            return False
+        try:
+            last_end = len(tokens) - 1 - tokens[::-1].index(thinking_end_token_id)
+        except ValueError:
+            return False
+        return last_end > last_start
+
     def _wrap_processors_until_thinking_done(
         self,
         args: GenerationArguments,
@@ -1570,16 +1629,22 @@ class ResponseGenerator:
         tokenizer = self.tokenizer
         thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
         thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
-        enable_thinking = self._prompt_has_open_thinking(args, input_ids)
+        prompt_preopens_thinking = self._prompt_has_open_thinking(args, input_ids)
         return ThinkingBudgetCriteria(
             tokenizer=tokenizer,
             thinking_budget=args.thinking_budget,
             thinking_end_token=thinking_end_token,
             thinking_start_token=thinking_start_token,
-            enable_thinking=enable_thinking,
+            enable_thinking=args.enable_thinking,
+            prompt_preopens_thinking=prompt_preopens_thinking,
         )
 
-    def _gpu_embed(self, raw_inputs: dict, images=None) -> Tuple[mx.array, dict]:
+    def _gpu_embed(
+        self,
+        raw_inputs: dict,
+        images=None,
+        apc_semantic_hash: Optional[int] = None,
+    ) -> Tuple[mx.array, dict]:
         """GPU-only: run vision encoder if needed. Must run on GPU thread."""
         input_ids = raw_inputs.get("input_ids")
         pixel_values = raw_inputs.get("pixel_values")
@@ -1609,12 +1674,8 @@ class ResponseGenerator:
             **data_kwargs,
             **{k: v for k, v in embed.to_dict().items() if v is not None},
         }
-        if images is not None:
-            gen_kwargs["_apc_image_hash"] = _apc.hash_image_payload(image_ref=images)
-        elif pixel_values is not None:
-            gen_kwargs["_apc_image_hash"] = _apc.hash_image_payload(
-                pixel_values=pixel_values
-            )
+        if apc_semantic_hash is not None:
+            gen_kwargs["_apc_semantic_hash"] = apc_semantic_hash
         return input_ids, gen_kwargs
 
     def _collect_pending_requests(
@@ -1666,6 +1727,12 @@ class ResponseGenerator:
         return pending, should_stop
 
     def _run(self):
+        try:
+            self._run_impl()
+        finally:
+            clear_mlx_streams()
+
+    def _run_impl(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
         try:
             self._initialize_model()
@@ -1693,7 +1760,8 @@ class ResponseGenerator:
         active: dict = {}
         max_num_seqs = get_max_num_seqs()
 
-        while not self._stop:
+        while not (self._stop and not active and self.requests.empty()):
+            new_items = []
             try:
                 # Poll the request queue — non-blocking when generating, short
                 # blocking wait when idle so we don't spin.
@@ -1715,7 +1783,7 @@ class ResponseGenerator:
                     capacity=capacity,
                     coalesce_s=coalesce_s,
                 )
-                if should_stop:
+                if should_stop and not active:
                     break
 
                 # Drop abandoned requests before doing more work.
@@ -1771,17 +1839,22 @@ class ResponseGenerator:
                             draft_kind=self.draft_kind,
                             draft_block_size=_get_draft_block_size_from_env(),
                             greedy_sampling=args.temperature == 0,
-                            prefill_step_size=get_prefill_step_size(),
+                            prefill_step_size=self._effective_prefill_step_size(),
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
                     # already happened on the caller thread.
-                    input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
+                    input_ids, gen_kwargs = self._gpu_embed(
+                        raw_inputs,
+                        images,
+                        apc_semantic_hash=request.apc_semantic_hash,
+                    )
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
-                    # Per-tenant APC salt: keep this out of the model forward
-                    # by namespacing under "_apc_tenant"; BatchGenerator strips
-                    # it before merging kwargs for the language model.
-                    if getattr(args, "tenant_id", None):
+                    # Preserve tenant isolation for manually queued requests
+                    # that predate server-side semantic hash computation.
+                    if request.apc_semantic_hash is None and getattr(
+                        args, "tenant_id", None
+                    ):
                         gen_kwargs["_apc_tenant"] = args.tenant_id
 
                     # Drain pending text-only prompts before inserting an
@@ -1834,12 +1907,13 @@ class ResponseGenerator:
 
             except Exception as e:
                 logger.exception("Error in generation thread")
-                for info in list(active.values()):
-                    try:
-                        info["rqueue"].put(e)
-                        info["rqueue"].put(None)
-                    except Exception:
-                        pass
+                error_queues = {
+                    id(info["rqueue"]): info["rqueue"] for info in active.values()
+                }
+                error_queues.update(
+                    {id(request.rqueue): request.rqueue for request in new_items}
+                )
+                _notify_queues(error_queues.values(), e, None)
                 active.clear()
                 batch_gen = None
                 mx.clear_cache()
@@ -1914,7 +1988,7 @@ class ResponseGenerator:
             "top_k": args.top_k,
             "mm_token_type_ids": raw_inputs.get("mm_token_type_ids"),
         }
-        prefill_step_size = get_prefill_step_size()
+        prefill_step_size = self._effective_prefill_step_size()
         if prefill_step_size > 0:
             stream_kwargs["prefill_step_size"] = prefill_step_size
         if args.seed is not None:
@@ -2035,7 +2109,11 @@ class ResponseGenerator:
                     log_state = self._log_prefill_started(
                         request, backend=f"speculative_{draft_kind}"
                     )
-                    input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
+                    input_ids, gen_kwargs = self._gpu_embed(
+                        raw_inputs,
+                        images,
+                        apc_semantic_hash=request.apc_semantic_hash,
+                    )
                     uid = id(rqueue)
                     uids.append(uid)
                     rqueues[uid] = rqueue
@@ -2074,7 +2152,7 @@ class ResponseGenerator:
                     make_cache=_make_cache,
                 )
 
-                prefill_step_size = get_prefill_step_size()
+                prefill_step_size = self._effective_prefill_step_size()
                 policy_kwargs = {**prompt_kwargs, **prefill_kwargs}
                 if not _chunked_prefill_enabled(
                     self.model,

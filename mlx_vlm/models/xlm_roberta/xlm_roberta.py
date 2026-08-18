@@ -1,7 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import scaled_dot_product_attention
+from ..base import SequenceClassifierOutput, scaled_dot_product_attention
 from ..pooling import EmbeddingOutput, normalize_embeddings, pool_by_config
 from .config import ModelConfig
 
@@ -128,7 +128,7 @@ class Model(nn.Module):
         self.embeddings = XLMRobertaEmbeddings(config)
         self.encoder = XLMRobertaEncoder(config)
 
-    def __call__(self, input_ids, attention_mask=None, token_type_ids=None, **kwargs):
+    def _encode(self, input_ids, attention_mask=None, token_type_ids=None):
         B, L = input_ids.shape
         h = self.embeddings(input_ids, token_type_ids)
         if attention_mask is None:
@@ -136,7 +136,10 @@ class Model(nn.Module):
         mask = (1.0 - attention_mask[:, None, None, :].astype(h.dtype)) * mx.finfo(
             h.dtype
         ).min
-        h = self.encoder(h, mask.astype(h.dtype))
+        return self.encoder(h, mask.astype(h.dtype)), attention_mask
+
+    def __call__(self, input_ids, attention_mask=None, token_type_ids=None, **kwargs):
+        h, attention_mask = self._encode(input_ids, attention_mask, token_type_ids)
         pooling_config = getattr(self, "pooling_config", None) or {
             "pooling_mode": "mean"
         }
@@ -162,3 +165,23 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.encoder.layer
+
+
+class RobertaClassificationHead(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
+
+    def __call__(self, hidden_states):
+        return self.out_proj(mx.tanh(self.dense(hidden_states[:, 0])))
+
+
+class SequenceClassificationModel(Model):
+    def __init__(self, config: ModelConfig):
+        super().__init__(config)
+        self.classifier = RobertaClassificationHead(config)
+
+    def __call__(self, input_ids, attention_mask=None, token_type_ids=None, **kwargs):
+        hidden_states, _ = self._encode(input_ids, attention_mask, token_type_ids)
+        return SequenceClassifierOutput(logits=self.classifier(hidden_states))

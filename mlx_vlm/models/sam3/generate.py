@@ -21,6 +21,8 @@ import mlx.nn as nn
 import numpy as np
 from PIL import Image
 
+from ..._stream_cleanup import clear_mlx_streams
+
 
 @dataclass
 class DetectionResult:
@@ -1309,6 +1311,12 @@ def track_video_realtime(
 
     # --- Thread 2: Optimized inference (backbone + encoder caching, fast overlay) ---
     def inference_loop():
+        try:
+            inference_loop_impl()
+        finally:
+            clear_mlx_streams()
+
+    def inference_loop_impl():
         backbone_cache = {"features": None, "frame_idx": -1}
         encoder_cache = {}
         inference_count = 0

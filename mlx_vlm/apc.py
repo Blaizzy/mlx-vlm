@@ -56,6 +56,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import mlx.core as mx
 import numpy as np
 
+from ._stream_cleanup import clear_mlx_streams
 from .apc_storage import APCNode, ComponentId, StateHandle
 from .kv_quant import from_config as kv_quant_from_config
 from .kv_quant import kv_quant_fingerprint
@@ -127,8 +128,8 @@ def tenant_scoped_hash(tenant: Optional[str], payload_hash: int = 0) -> int:
 def _tensor_content_hash(t: Any) -> int:
     """Lossless content hash of a tensor: shape + dtype + exact bytes.
 
-    Unlike ``hash_image_payload`` this keeps shape and dtype and does not
-    downcast to fp16, so distinct masks/embeddings never collide.
+    Keeps shape and dtype and does not downcast, so distinct semantic inputs
+    never collide solely because their flattened values happen to match.
     """
     dtype = str(getattr(t, "dtype", ""))
     shape = tuple(getattr(t, "shape", ()))
@@ -379,9 +380,7 @@ def hash_image_payload(
     """
     if pixel_values is not None:
         try:
-            arr = np.asarray(pixel_values).astype(np.float16, copy=False)
-            digest = hashlib.sha256(arr.tobytes()).digest()
-            return int.from_bytes(digest[:8], "little", signed=True)
+            return _tensor_content_hash(pixel_values)
         except Exception:
             pass
 
@@ -494,7 +493,9 @@ def adjust_prefix_to_text_suffix_boundary(
     )
     if max_len <= 0:
         return 0
-    desired = max(1, int(desired_prefix_len))
+    if int(desired_prefix_len) <= 0:
+        return 0
+    desired = int(desired_prefix_len)
     prefix_len = max(desired, media_safe_prefix_min(token_ids, media_token_ids))
     if prefix_len > max_len:
         return 0
@@ -2805,6 +2806,12 @@ class DiskBlockStore:
         self._maybe_evict()
 
     def _writer_loop(self) -> None:
+        try:
+            self._writer_loop_impl()
+        finally:
+            clear_mlx_streams()
+
+    def _writer_loop_impl(self) -> None:
         while True:
             item = self._q.get()
             if item is None:
@@ -2872,6 +2879,9 @@ class APCManager:
         )
         self.exact_cache_guard_tokens = max(
             1, int(os.environ.get("APC_EXACT_PREFIX_GUARD_TOKENS", "16"))
+        )
+        self.exact_cache_min_tokens = max(
+            1, int(os.environ.get("APC_EXACT_MIN_TOKENS", "16"))
         )
         # If free RAM (best-effort reading) drops below this, skip disk
         # promotion this turn and fall back to memory-only matching. The
@@ -3128,6 +3138,8 @@ class APCManager:
         extra_hash: int = 0,
     ) -> bool:
         """Store a full prompt-cache snapshot for exact-prefix reuse."""
+        if len(token_ids) < self.exact_cache_min_tokens:
+            return False
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
             return False
         token_tuple = tuple(int(t) for t in token_ids)
@@ -3978,9 +3990,18 @@ def extract_prompt_cache_from_batch(
 
 def _prompt_cache_is_batch_shaped(caches: Sequence[Any]) -> bool:
     """True when every entry can row-extract (Batch* / ArraysCache layout)."""
+
+    def can_extract_row(cache: Any) -> bool:
+        if not callable(getattr(cache, "extract", None)):
+            return False
+        children = getattr(cache, "caches", None)
+        if children is None:
+            return True
+        return all(can_extract_row(child) for child in children)
+
     if not caches:
         return False
-    return all(callable(getattr(c, "extract", None)) for c in caches)
+    return all(can_extract_row(cache) for cache in caches)
 
 
 def snapshot_prompt_cache_row(
@@ -4437,23 +4458,47 @@ def self_check_model_apc(
     return result
 
 
-def from_env(model_namespace: Optional[str] = None) -> Optional[APCManager]:
-    """Build an APCManager from env vars when ``APC_ENABLED=1``, else None.
-
-    When ``APC_DISK_PATH`` is set, also wires up the shard-based SSD tier.
-    The disk read path defaults to direct file reads so restored K/V tensors
-    are MLX-owned buffers rather than mmap-backed safetensors views.
-    """
-    if os.environ.get("APC_ENABLED", "0") not in ("1", "true", "True", "yes"):
+def from_env(
+    model_namespace: Optional[str] = None,
+    overrides: Optional[dict] = None,
+) -> Optional[APCManager]:
+    """Build an APCManager when enabled; read knobs from env (default) or
+    ``overrides`` (keys: enabled, disk_path, block_size, num_blocks,
+    disk_max_gb) so live settings can drive APC without env mutation."""
+    if overrides is not None and "enabled" in overrides:
+        enabled = bool(overrides["enabled"])
+    else:
+        enabled = os.environ.get("APC_ENABLED", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+    if not enabled:
         return None
-    block_size = int(os.environ.get("APC_BLOCK_SIZE", DEFAULT_BLOCK_SIZE))
-    num_blocks = int(os.environ.get("APC_NUM_BLOCKS", DEFAULT_NUM_BLOCKS))
+
+    def _ov_int(override_key: str, env_name: str, default: int) -> int:
+        if (
+            overrides is not None
+            and override_key in overrides
+            and overrides[override_key] is not None
+        ):
+            return int(overrides[override_key])
+        return int(os.environ.get(env_name, default))
+
+    block_size = _ov_int("block_size", "APC_BLOCK_SIZE", DEFAULT_BLOCK_SIZE)
+    num_blocks = _ov_int("num_blocks", "APC_NUM_BLOCKS", DEFAULT_NUM_BLOCKS)
 
     disk: Optional[DiskBlockStore] = None
-    disk_path = os.environ.get("APC_DISK_PATH")
+    if overrides is not None and overrides.get("disk_path") is not None:
+        disk_path = overrides["disk_path"]
+    else:
+        disk_path = os.environ.get("APC_DISK_PATH")
     if disk_path:
         ns = model_namespace or os.environ.get("APC_DISK_NAMESPACE", "default")
-        max_gb = float(os.environ.get("APC_DISK_MAX_GB", 0))
+        if overrides is not None and overrides.get("disk_max_gb") is not None:
+            max_gb = float(overrides["disk_max_gb"])
+        else:
+            max_gb = float(os.environ.get("APC_DISK_MAX_GB", 0))
         max_bytes = int(max_gb * (1 << 30)) if max_gb > 0 else None
         workers = int(os.environ.get("APC_DISK_WORKERS", "1"))
         try:

@@ -404,3 +404,43 @@ def test_from_pretrained_builds_native_audio_extractor(tmp_path, monkeypatch):
     assert processor.feature_extractor.feature_size == 12
     assert processor.feature_extractor.sampling_rate == 8000
     assert processor.feature_extractor.hop_length == 400
+
+
+def test_sanitize_maps_pre_converted_mlx_checkpoint():
+    from mlx_vlm.models.inkling.inkling import Model
+
+    model = Model.__new__(Model)
+    weights = {
+        "model.llm.layers.0.mlp.experts.gate_proj.weight": mx.zeros(
+            (4, 8, 2), mx.uint32
+        ),
+        "model.llm.layers.0.mlp.experts.gate_proj.scales": mx.zeros((4, 8, 2)),
+        "model.llm.layers.0.mlp.experts.down_proj.weight": mx.zeros(
+            (4, 8, 2), mx.uint32
+        ),
+        "model.llm.layers.0.attn.k_sconv.weight": mx.zeros((6, 4, 1)),
+        "model.audio.encoder.weight": mx.zeros((5, 3)),
+        "model.audio.encoder.scales": mx.zeros((5, 3)),
+        "model.visual.layers.linear_1.weight": mx.zeros((3, 2)),
+        "model.visual.layers.linear_1.scales": mx.zeros((3, 2)),
+    }
+
+    out = model.sanitize(weights)
+    prefix = "language_model.model.layers.0.mlp.switch_mlp."
+
+    assert prefix + "gate_proj.weight" in out
+    assert prefix + "gate_proj.scales" in out
+    assert not any(".mlp.experts." in k for k in out)
+
+    assert out[prefix + "gate_scale"].shape == (4,)
+    assert out[prefix + "out_scale"].shape == (4,)
+
+    assert out["language_model.model.layers.0.self_attn.k_sconv.conv.weight"].shape == (
+        6,
+        4,
+        1,
+    )
+
+    assert "audio_tower.embed_audio_tokens.scales" in out
+    assert "vision_tower.encoder_layers.1.projection.scales" in out
+    assert out["vision_tower.encoder_layers.1.projection.weight"].shape == (3, 2)
