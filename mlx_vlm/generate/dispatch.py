@@ -32,7 +32,6 @@ from .common import (
     wired_limit,
 )
 from .image import (
-    DEFAULT_IMAGE_GUIDANCE,
     DEFAULT_IMAGE_SIZE,
     DEFAULT_IMAGE_STEPS,
     DEFAULT_IMAGE_TASK,
