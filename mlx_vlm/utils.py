@@ -1140,7 +1140,11 @@ def load_processor(
         )
 
         # Create and assign the StoppingCriteria
-        criteria = StoppingCriteria(final_eos_token_ids, tokenizer_obj)
+        criteria = StoppingCriteria(
+            final_eos_token_ids,
+            tokenizer_obj,
+            additional_eos_token_ids=getattr(processor, "additional_eos_token_ids", ()),
+        )
         if hasattr(processor, "tokenizer"):
             processor.tokenizer.stopping_criteria = criteria
         else:
@@ -2022,14 +2026,17 @@ def group_images_by_shape(
 
 
 class StoppingCriteria:
-    def __init__(self, eos_token_ids: List[int], tokenizer=None):
-
-        if isinstance(eos_token_ids, int):
-            self.eos_token_ids = [eos_token_ids]
-        else:
-            self.eos_token_ids = list(eos_token_ids)
-
+    def __init__(
+        self,
+        eos_token_ids: List[int],
+        tokenizer=None,
+        additional_eos_token_ids: Optional[List[int]] = None,
+    ):
         self.tokenizer = tokenizer
+        self.additional_eos_token_ids = list(
+            dict.fromkeys(additional_eos_token_ids or ())
+        )
+        self.reset(eos_token_ids)
 
     def add_eos_token_ids(self, new_eos_token_ids: Union[int, List[int]] = None):
         """
@@ -2066,8 +2073,14 @@ class StoppingCriteria:
         if isinstance(eos_token_ids, int):
             eos_token_ids = [eos_token_ids]
 
-        if self.eos_token_ids != eos_token_ids:
-            self.eos_token_ids = list(eos_token_ids)
+        resolved = list(eos_token_ids)
+        resolved.extend(
+            token_id
+            for token_id in self.additional_eos_token_ids
+            if token_id not in resolved
+        )
+        if getattr(self, "eos_token_ids", None) != resolved:
+            self.eos_token_ids = resolved
 
     def __call__(self, input_ids: mx.array) -> bool:
         return input_ids in self.eos_token_ids
