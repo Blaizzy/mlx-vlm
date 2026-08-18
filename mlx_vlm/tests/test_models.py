@@ -9844,6 +9844,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
                     rms_norm_eps=1e-6,
                     num_key_value_heads=2,
                     head_dim=8,
+                    mm_tokens_per_image=4,
                 ),
                 vision_config=gemma3.VisionConfig(
                     model_type="gemma3",
