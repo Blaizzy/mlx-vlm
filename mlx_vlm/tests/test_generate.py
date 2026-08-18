@@ -3058,3 +3058,69 @@ class TestBatchTurboQuantizedKVStart:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestPrePaddedBatchRows:
+    """Rows that arrive already padded must still declare that padding.
+
+    The tokenizer squares a batch off with left padding and reports it in the
+    attention mask. If that never reaches the caches, every row looks the same
+    length: a causal mask does not exclude padding that comes first, and a
+    recurrent layer walks it like any other column.
+    """
+
+    def _batch(self, rows, existing_left_padding):
+        import mlx.nn as nn
+
+        from mlx_vlm.generate.ar import PromptProcessingBatch
+
+        class Tiny(nn.Module):
+            def make_cache(self):
+                from mlx_vlm.models.cache import ArraysCache, KVCache
+
+                return [KVCache(), ArraysCache(1)]
+
+        return PromptProcessingBatch(
+            model=Tiny(),
+            uids=list(range(len(rows))),
+            input_ids=rows,
+            max_tokens=[4] * len(rows),
+            inputs_embeds=None,
+            prompt_kwargs={},
+            existing_left_padding=existing_left_padding,
+        )
+
+    def test_declared_padding_reaches_the_caches(self):
+        rows = [list(range(8)), list(range(8))]
+
+        batch = self._batch(rows, existing_left_padding=[5, 0])
+
+        assert batch._left_padding_per_row == [5, 0]
+
+    def test_uniform_rows_without_a_declaration_record_none(self):
+        rows = [list(range(8)), list(range(8))]
+
+        batch = self._batch(rows, existing_left_padding=None)
+
+        assert batch._left_padding_per_row == [0, 0]
+
+    def test_a_declaration_adds_to_the_generator_s_own_padding(self):
+        rows = [list(range(4)), list(range(8))]
+
+        batch = self._batch(rows, existing_left_padding=[2, 1])
+
+        assert batch._left_padding_per_row == [6, 1]
+
+    def test_arrays_cache_masks_the_declared_padding(self):
+        import mlx.core as mx
+
+        from mlx_vlm.models.cache import ArraysCache
+
+        entry = ArraysCache(1)
+        entry.left_padding = mx.array([5, 0])
+
+        mask = entry.make_mask(8)
+
+        assert mask.shape == (2, 8)
+        assert mask[0].tolist() == [False] * 5 + [True] * 3
+        assert mask[1].tolist() == [True] * 8
