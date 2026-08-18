@@ -5768,7 +5768,7 @@ class TestResponseGenerator:
         gen._run_speculative = lambda: pytest.fail("MTP should use BatchGenerator")
         gen._collect_pending_requests = fake_collect_pending_requests
 
-        gen._run()
+        gen._run_impl()
 
         assert calls == [(False, 0.037)]
 
