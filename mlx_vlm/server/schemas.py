@@ -127,7 +127,7 @@ class ImageEditRequest(FlexibleBaseModel):
     steps: Optional[int] = Field(
         None,
         ge=1,
-        description="Number of image edit inference steps; model default if omitted.",
+        description="Inference steps. Defaults to the selected model's recommendation.",
     )
     seed: Optional[int] = Field(
         None,
@@ -135,7 +135,7 @@ class ImageEditRequest(FlexibleBaseModel):
     )
     guidance: Optional[float] = Field(
         None,
-        description="Classifier-free guidance scale; model default if omitted.",
+        description="CFG scale. Defaults to the selected model's recommendation.",
     )
     response_format: Literal["b64_json", "path"] = Field(
         "b64_json",

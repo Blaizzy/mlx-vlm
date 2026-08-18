@@ -6,6 +6,7 @@ from typing import Any, ClassVar
 
 import mlx.core as mx
 
+from mlx_vlm.generate.edit_image import ImageEditModel, ImageEditRequest
 from mlx_vlm.generate.image import (
     ImageGenerationModel,
     ImageGenerationRequest,
@@ -148,14 +149,107 @@ class ErnieImageGenerationModel(ImageGenerationModel):
         return cls(pipeline=pipeline, model_id=str(model))
 
 
+@dataclass(slots=True)
+class ErnieImageEditModel(ImageEditModel):
+    is_image_edit_model: ClassVar[bool] = True
+    model_type: ClassVar[str] = "ernie_image"
+    pipeline: ErnieImagePipeline
+    model_id: str
+    family: str = "ernie_image"
+
+    @property
+    def variant(self) -> str:
+        return self.pipeline.variant.name
+
+    @property
+    def default_steps(self) -> int:
+        return self.pipeline.variant.default_steps
+
+    @property
+    def default_guidance(self) -> float:
+        return self.pipeline.variant.default_guidance
+
+    def edit(self, request: ImageEditRequest) -> ImageGenerationResult:
+        if len(request.image_paths) != 1:
+            raise ValueError("ERNIE-Image img2img accepts exactly one source image")
+        seed = 0 if request.seed is None else request.seed
+        steps = request.steps or self.default_steps
+        guidance = (
+            self.default_guidance
+            if request.guidance is None
+            else request.guidance
+        )
+        image_strength = float(request.extra.get("image_strength", 0.6))
+        array = self.pipeline.edit_array(
+            request.prompt,
+            request.image_paths[0],
+            seed=seed,
+            steps=steps,
+            width=request.width,
+            height=request.height,
+            guidance=guidance,
+            negative_prompt=str(request.extra.get("negative_prompt", "")),
+            image_strength=image_strength,
+        )
+        metadata = {
+            "model_path": str(self.pipeline.model_path),
+            "architecture": "single-stream-dit-img2img",
+            "classifier_free_guidance": guidance > 1.0,
+            "image_strength": image_strength,
+            "native_instruction_edit": False,
+            "reference_count": 1,
+        }
+        if quantization := self.pipeline.quantization_config:
+            metadata["quantization"] = quantization
+        if self.pipeline.last_revised_prompt is not None:
+            metadata["revised_prompt"] = self.pipeline.last_revised_prompt
+        return ImageGenerationResult(
+            array=array,
+            seed=seed,
+            width=array.shape[1],
+            height=array.shape[0],
+            steps=steps,
+            model=self.model_id,
+            family=self.family,
+            variant=self.variant,
+            guidance=guidance,
+            prompt_tokens=self.pipeline.count_prompt_tokens(
+                self.pipeline.last_revised_prompt or request.prompt
+            ),
+            peak_memory=mx.get_peak_memory() / 1e9,
+            metadata=metadata,
+        )
+
+    @classmethod
+    def supports_model(cls, model: str) -> bool:
+        return ErnieImageGenerationModel.supports_model(model)
+
+    @classmethod
+    def from_model_id(
+        cls,
+        model: str = "ernie-image-turbo",
+        **kwargs: Any,
+    ) -> "ErnieImageEditModel":
+        generation = ErnieImageGenerationModel.from_model_id(model, **kwargs)
+        return cls(pipeline=generation.pipeline, model_id=generation.model_id)
+
+
 def load(
     model: str = "ernie-image-turbo", **kwargs: Any
 ) -> ErnieImageGenerationModel:
     return ErnieImageGenerationModel.from_model_id(model, **kwargs)
 
 
+def load_edit(
+    model: str = "ernie-image-turbo", **kwargs: Any
+) -> ErnieImageEditModel:
+    return ErnieImageEditModel.from_model_id(model, **kwargs)
+
+
 __all__ = [
+    "ErnieImageEditModel",
     "ErnieImageGenerationModel",
     "load",
+    "load_edit",
     "resolve_variant",
 ]

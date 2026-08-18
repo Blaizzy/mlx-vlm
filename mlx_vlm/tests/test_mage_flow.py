@@ -8,7 +8,12 @@ import numpy as np
 import pytest
 
 import mlx_vlm.models.mage_flow.download as download_module
-from mlx_vlm.generate.edit_image import image_edit_model_class, is_image_edit_model
+from mlx_vlm.generate.edit_image import (
+    ImageEditRequest,
+    edit_image,
+    image_edit_model_class,
+    is_image_edit_model,
+)
 from mlx_vlm.generate.image import (
     image_generation_model_class,
     is_image_generation_model,
@@ -100,6 +105,28 @@ def test_mage_flow_registers_generation_and_edit_families() -> None:
     assert not is_image_generation_model("mage-flow-edit")
     assert is_image_edit_model("mage-flow-edit-base")
     assert not is_image_edit_model("mage-flow-turbo")
+
+
+def test_mage_flow_edit_uses_variant_defaults() -> None:
+    pipeline = type(
+        "Pipeline",
+        (),
+        {
+            "variant": get_variant("mage-flow-edit-base"),
+            "model_path": None,
+            "count_prompt_tokens": lambda self, prompt, edit=True: 1,
+            "edit_array": lambda self, *args, **kwargs: mx.zeros(
+                (16, 16, 3), dtype=mx.uint8
+            ),
+        },
+    )()
+    model = MageFlowImageEditModel(pipeline=pipeline, model_id="mage-flow-edit-base")
+    result = edit_image(
+        model,
+        ImageEditRequest(prompt="edit", image_paths=("source.png",), seed=1),
+    )
+    assert result.steps == 30
+    assert result.guidance == 5.0
 
 
 def test_mage_flow_remote_metadata_dispatch(

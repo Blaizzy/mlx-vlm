@@ -1,3 +1,8 @@
-from .model import ErnieImageGenerationModel, load
+from .model import ErnieImageEditModel, ErnieImageGenerationModel, load, load_edit
 
-__all__ = ["ErnieImageGenerationModel", "load"]
+__all__ = [
+    "ErnieImageEditModel",
+    "ErnieImageGenerationModel",
+    "load",
+    "load_edit",
+]

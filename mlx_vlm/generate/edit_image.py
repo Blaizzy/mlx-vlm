@@ -226,6 +226,18 @@ def edit_image(
         raise ValueError("At least one reference image path is required")
     if request.seed is None:
         request = replace(request, seed=random.randrange(2**32))
+    if request.steps is None:
+        request = replace(
+            request,
+            steps=int(getattr(model, "default_steps", DEFAULT_IMAGE_STEPS)),
+        )
+    if request.guidance is None:
+        request = replace(
+            request,
+            guidance=float(
+                getattr(model, "default_guidance", DEFAULT_IMAGE_GUIDANCE)
+            ),
+        )
 
     data = model.edit(request)
     if output_path is not None:

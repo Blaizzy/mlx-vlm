@@ -107,6 +107,12 @@ def convert_ernie_image(
     }
 
     components: dict[str, dict[str, Any]] = {}
+    include_vae_encoder = _vae_checkpoint_has_encoder(source)
+    if not include_vae_encoder:
+        print(
+            "[WARNING] Source VAE has no encoder weights; the converted "
+            "checkpoint will support generation but not img2img."
+        )
     plans: list[
         tuple[
             str,
@@ -125,7 +131,11 @@ def convert_ernie_image(
             lambda path, module: path.startswith("layers.")
             and hasattr(module, "to_quantized"),
         ),
-        ("vae", lambda: load_vae(source), None),
+        (
+            "vae",
+            lambda: load_vae(source, include_encoder=include_vae_encoder),
+            None,
+        ),
     ]
     if list((source / "pe").glob("*.safetensors")):
         plans.append(
@@ -161,6 +171,10 @@ def convert_ernie_image(
             "tensor_layout": "mlx_nhwc",
             "quantization": active_quantization,
         }
+        if name == "vae":
+            components[name]["supports_img2img"] = bool(
+                getattr(model, "encoder", None) is not None
+            )
         del model
         gc.collect()
         mx.clear_cache()
@@ -176,6 +190,7 @@ def convert_ernie_image(
         "source_tensor_layout": _source_layout(source),
         "tensor_layout": "mlx_nhwc",
         "components": components,
+        "supports_img2img": include_vae_encoder,
     }
     (destination / "mlx_ernie_image.json").write_text(
         json.dumps(native_metadata, indent=2, sort_keys=True) + "\n"
@@ -184,6 +199,23 @@ def convert_ernie_image(
     if upload_repo is not None:
         upload_to_hub(destination, upload_repo)
     return destination
+
+
+def _vae_checkpoint_has_encoder(source: Path) -> bool:
+    index = _read_json(
+        source / "vae" / "model.safetensors.index.json",
+        required=False,
+    )
+    if index is None:
+        return True
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict):
+        raise ValueError(
+            "VAE model.safetensors.index.json is missing a weight_map"
+        )
+    return any(key.startswith("encoder.") for key in weight_map) and any(
+        key.startswith("quant_conv.") for key in weight_map
+    )
 
 
 def _quantization_parameters(

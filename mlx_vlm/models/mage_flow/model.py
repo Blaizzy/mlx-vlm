@@ -52,6 +52,14 @@ class MageFlowImageGenerationModel(ImageGenerationModel):
     def variant(self) -> str:
         return self.pipeline.variant.name
 
+    @property
+    def default_steps(self) -> int:
+        return self.pipeline.variant.default_steps
+
+    @property
+    def default_guidance(self) -> float:
+        return self.pipeline.variant.default_guidance
+
     def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
         steps = request.resolve_steps()
@@ -130,6 +138,14 @@ class MageFlowImageEditModel(ImageEditModel):
     @property
     def variant(self) -> str:
         return self.pipeline.variant.name
+
+    @property
+    def default_steps(self) -> int:
+        return self.pipeline.variant.default_steps
+
+    @property
+    def default_guidance(self) -> float:
+        return self.pipeline.variant.default_guidance
 
     def edit(self, request: ImageEditRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed

@@ -49,7 +49,11 @@ def load_transformer(model_path: str | Path) -> ErnieImageTransformer:
     transformer = ErnieImageTransformer(config)
     target_shapes = _parameter_shapes(transformer)
     raw, metadata = load_safetensors(root / "transformer")
-    weights = sanitize_transformer_weights(raw, target_shapes=target_shapes)
+    weights = sanitize_transformer_weights(
+        raw,
+        target_shapes=target_shapes,
+        source_layout=_tensor_layout(metadata),
+    )
     return apply_weights(transformer, weights, metadata)
 
 
@@ -57,6 +61,7 @@ def sanitize_transformer_weights(
     raw: dict[str, mx.array],
     *,
     target_shapes: dict[str, tuple[int, ...]],
+    source_layout: str | None = None,
 ) -> dict[str, mx.array]:
     weights: dict[str, mx.array] = {}
     for raw_key, value in raw.items():
@@ -65,7 +70,10 @@ def sanitize_transformer_weights(
         tensor = _cast_float(value)
         if key == "x_embedder.proj.weight":
             tensor = match_conv_layout(
-                tensor, target_shape=target_shapes.get(key), key=key
+                tensor,
+                target_shape=target_shapes.get(key),
+                key=key,
+                source_layout=source_layout,
             )
         weights[key] = tensor
     return weights
@@ -123,26 +131,62 @@ def load_prompt_enhancer(
     )
 
 
-def load_vae(model_path: str | Path) -> Flux2VAE:
+def load_vae(
+    model_path: str | Path, *, include_encoder: bool = False
+) -> Flux2VAE:
     root = Path(model_path).expanduser()
-    vae = Flux2VAE(decoder_block_out_channels=(128, 256, 512, 512))
+    channels = (128, 256, 512, 512)
+    vae = Flux2VAE(
+        decoder_block_out_channels=channels,
+        include_encoder=include_encoder,
+        encoder_block_out_channels=channels,
+    )
     vae.bn.eps = 1e-5
     target_shapes = _parameter_shapes(vae)
     raw, metadata = load_safetensors(root / "vae")
+    source_layout = _tensor_layout(metadata)
     weights = {}
     for raw_key, value in raw.items():
         if raw_key.endswith(".num_batches_tracked"):
             continue
-        if not raw_key.startswith(("decoder.", "post_quant_conv.", "bn.")):
+        prefixes = ("decoder.", "post_quant_conv.", "bn.")
+        if include_encoder:
+            prefixes += ("encoder.", "quant_conv.")
+        if not raw_key.startswith(prefixes):
             continue
         key = raw_key.replace(".to_out.0.", ".to_out.")
         tensor = _cast_float(value)
         if tensor.ndim == 4:
             tensor = match_conv_layout(
-                tensor, target_shape=target_shapes.get(key), key=key
+                tensor,
+                target_shape=target_shapes.get(key),
+                key=key,
+                source_layout=source_layout,
             )
         weights[key] = tensor
+    if include_encoder:
+        _require_vae_encoder_weights(weights, target_shapes=target_shapes)
     return apply_weights(vae, weights, metadata)
+
+
+def _require_vae_encoder_weights(
+    weights: dict[str, mx.array],
+    *,
+    target_shapes: dict[str, tuple[int, ...]],
+) -> None:
+    required = {
+        key
+        for key in target_shapes
+        if key.startswith(("encoder.", "quant_conv."))
+    }
+    missing = sorted(required - weights.keys())
+    if missing:
+        preview = ", ".join(missing[:3])
+        raise ValueError(
+            "ERNIE-Image img2img requires VAE encoder weights, but the "
+            f"checkpoint is missing {len(missing)} tensors (for example: "
+            f"{preview}). Re-convert from the official full checkpoint."
+        )
 
 
 def _parameter_shapes(model: nn.Module) -> dict[str, tuple[int, ...]]:
@@ -162,8 +206,26 @@ def match_conv_layout(
     *,
     target_shape: tuple[int, ...] | None,
     key: str,
+    source_layout: str | None = None,
 ) -> mx.array:
-    if target_shape is None or tuple(value.shape) == target_shape:
+    if target_shape is None:
+        return value
+    if source_layout == "pytorch_nchw":
+        transposed = value.transpose(0, 2, 3, 1)
+        if tuple(transposed.shape) != target_shape:
+            raise ValueError(
+                f"PyTorch convolution weight shape mismatch for {key}: "
+                f"checkpoint={tuple(value.shape)}, expected={target_shape}"
+            )
+        return transposed
+    if source_layout == "mlx_nhwc":
+        if tuple(value.shape) != target_shape:
+            raise ValueError(
+                f"MLX convolution weight shape mismatch for {key}: "
+                f"checkpoint={tuple(value.shape)}, expected={target_shape}"
+            )
+        return value
+    if tuple(value.shape) == target_shape:
         return value
     transposed = value.transpose(0, 2, 3, 1)
     if tuple(transposed.shape) == target_shape:
@@ -172,6 +234,15 @@ def match_conv_layout(
         f"Unsupported convolution weight shape for {key}: "
         f"checkpoint={tuple(value.shape)}, expected={target_shape}"
     )
+
+
+def _tensor_layout(metadata: dict[str, Any]) -> str:
+    layout = metadata.get("tensor_layout")
+    if layout in {"mlx_nhwc", "pytorch_nchw"}:
+        return str(layout)
+    if "mflux_version" in metadata or metadata.get("format") == "mlx":
+        return "mlx_nhwc"
+    return "pytorch_nchw"
 
 
 def apply_weights(

@@ -545,18 +545,10 @@ def generate_image(
                 prompt=request.prompt,
                 image_paths=tuple(image_paths),
                 seed=request.seed,
-                steps=(
-                    DEFAULT_IMAGE_STEPS
-                    if request.steps is None
-                    else request.steps
-                ),
+                steps=request.steps,
                 width=request.width,
                 height=request.height,
-                guidance=(
-                    DEFAULT_IMAGE_GUIDANCE
-                    if request.guidance is None
-                    else request.guidance
-                ),
+                guidance=request.guidance,
                 output_format=request.output_format,
                 extra=dict(request.extra),
             )
@@ -688,18 +680,21 @@ def run_image_generation_cli(args: Any) -> None:
             else Path("outputs") / f"edit-{seed}.png"
         )
         model = load_image_model(args.model, task="edit", **load_kwargs)
+        if steps is None:
+            steps = int(getattr(model, "default_steps", DEFAULT_IMAGE_STEPS))
+        guidance = (
+            float(getattr(model, "default_guidance", DEFAULT_IMAGE_GUIDANCE))
+            if args.guidance is None
+            else args.guidance
+        )
         request = ImageEditRequest(
             prompt=prompt,
             image_paths=tuple(args.image),
             seed=seed,
-            steps=DEFAULT_IMAGE_STEPS if steps is None else steps,
+            steps=steps,
             width=width,
             height=height,
-            guidance=(
-                DEFAULT_IMAGE_GUIDANCE
-                if args.guidance is None
-                else args.guidance
-            ),
+            guidance=guidance,
             extra=dict(getattr(args, "gen_kwargs", {}) or {}),
         )
         result = generate_image(

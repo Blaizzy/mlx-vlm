@@ -9,6 +9,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from mlx import nn
+from PIL import Image
 
 import mlx_vlm.models.ernie_image.convert as ernie_convert
 import mlx_vlm.models.ernie_image.weights as weights_module
@@ -17,6 +18,11 @@ from mlx_vlm.generate.image import (
     generate_image,
     image_generation_model_class,
     is_image_generation_model,
+)
+from mlx_vlm.generate.edit_image import (
+    ImageEditRequest,
+    image_edit_model_class,
+    is_image_edit_model,
 )
 from mlx_vlm.models.ernie_image.config import (
     ErnieImageTransformerConfig,
@@ -27,14 +33,19 @@ from mlx_vlm.models.ernie_image.config import (
 from mlx_vlm.models.ernie_image.convert import (
     _quantization_parameters,
     _source_layout,
+    _vae_checkpoint_has_encoder,
     _write_missing_configs,
     is_ernie_image_checkpoint,
 )
 from mlx_vlm.models.ernie_image.download import validate_model_layout
-from mlx_vlm.models.ernie_image.model import ErnieImageGenerationModel
+from mlx_vlm.models.ernie_image.model import (
+    ErnieImageEditModel,
+    ErnieImageGenerationModel,
+)
 from mlx_vlm.models.ernie_image.pipeline import (
     ErnieImagePipeline,
     ErnieImageRuntimeConfig,
+    _load_edit_image,
     _pad_text,
 )
 from mlx_vlm.models.ernie_image.scheduler import ErnieImageFlowMatchScheduler
@@ -49,6 +60,7 @@ from mlx_vlm.models.ernie_image.transformer import (
     timestep_embedding,
 )
 from mlx_vlm.models.ernie_image.weights import (
+    _require_vae_encoder_weights,
     apply_weights,
     match_conv_layout,
     sanitize_text_encoder_weights,
@@ -113,6 +125,8 @@ def test_ernie_dispatches_ids_metadata_and_mflux_indexes(tmp_path: Path) -> None
         is ErnieImageGenerationModel
     )
     assert is_image_generation_model("ernie-image")
+    assert image_edit_model_class(tmp_path.as_posix()) is ErnieImageEditModel
+    assert is_image_edit_model("baidu/ERNIE-Image-Turbo")
 
     (tmp_path / "model_index.json").unlink()
     (tmp_path / "mlx_ernie_image.json").unlink()
@@ -317,6 +331,25 @@ def test_ernie_weight_sanitizers_and_layouts() -> None:
     assert set(text) == {"embed_tokens.weight"}
 
 
+def test_ambiguous_rgb_conv_uses_source_layout_metadata() -> None:
+    source = mx.arange(2 * 3 * 3 * 3).reshape(2, 3, 3, 3)
+    expected = source.transpose(0, 2, 3, 1)
+    converted = match_conv_layout(
+        source,
+        target_shape=(2, 3, 3, 3),
+        key="encoder.conv_in.weight",
+        source_layout="pytorch_nchw",
+    )
+    unchanged = match_conv_layout(
+        expected,
+        target_shape=(2, 3, 3, 3),
+        key="encoder.conv_in.weight",
+        source_layout="mlx_nhwc",
+    )
+    np.testing.assert_array_equal(np.array(converted), np.array(expected))
+    np.testing.assert_array_equal(np.array(unchanged), np.array(expected))
+
+
 @pytest.mark.parametrize(
     "mode,group_size,bits",
     [
@@ -374,6 +407,10 @@ class FakePipeline:
         self.calls.append((prompt, kwargs))
         return mx.zeros((16, 16, 3), dtype=mx.uint8)
 
+    def edit_array(self, prompt, image, **kwargs):
+        self.calls.append((prompt, image, kwargs))
+        return mx.zeros((16, 32, 3), dtype=mx.uint8)
+
     def count_prompt_tokens(self, prompt):  # noqa: ARG002
         return 3
 
@@ -423,6 +460,40 @@ def test_generation_request_defaults_remain_valid_for_edit_bridge() -> None:
     )
 
 
+def test_ernie_edit_model_forwards_img2img_strength() -> None:
+    pipeline = FakePipeline("ernie-image-turbo")
+    model = ErnieImageEditModel(pipeline=pipeline, model_id="ernie")
+    result = model.edit(
+        ImageEditRequest(
+            prompt="make it a convertible",
+            image_paths=("source.png",),
+            seed=3,
+            steps=8,
+            guidance=1.0,
+            extra={"image_strength": 0.55},
+        )
+    )
+    assert result.width == 32
+    assert result.height == 16
+    assert result.metadata["image_strength"] == 0.55
+    assert result.metadata["native_instruction_edit"] is False
+    assert pipeline.calls[0][2]["image_strength"] == 0.55
+
+
+def test_ernie_base_edit_uses_variant_defaults() -> None:
+    pipeline = FakePipeline("ernie-image")
+    model = ErnieImageEditModel(pipeline=pipeline, model_id="ernie")
+    result = model.edit(
+        ImageEditRequest(
+            prompt="make it a convertible",
+            image_paths=("source.png",),
+            seed=3,
+        )
+    )
+    assert result.steps == 50
+    assert result.guidance == 4.0
+
+
 class FakeTransformer:
     def __init__(self) -> None:
         self.calls = []
@@ -436,6 +507,19 @@ class FakeTransformer:
 
 class FakeVAE:
     quantization_config = None
+
+    def __init__(self) -> None:
+        self.encoder = object()
+        self.bn = SimpleNamespace(
+            running_mean=mx.zeros((128,)),
+            running_var=mx.ones((128,)),
+        )
+
+    def encode(self, pixels):
+        return mx.zeros(
+            (pixels.shape[0], 32, pixels.shape[2] // 8, pixels.shape[3] // 8),
+            dtype=mx.bfloat16,
+        )
 
     def decode_packed_latents(self, latents):
         return mx.zeros((1, 3, latents.shape[2] * 16, latents.shape[3] * 16))
@@ -461,7 +545,7 @@ def _fake_runtime_pipeline(variant: str, *, evict: bool = False) -> ErnieImagePi
         mx.zeros((len(prompts), 3, 4), dtype=mx.bfloat16),
         mx.array([1, 3] if len(prompts) == 2 else [3]),
     )
-    pipeline._ensure_components = lambda: None
+    pipeline._ensure_components = lambda **kwargs: None
     return pipeline
 
 
@@ -478,6 +562,104 @@ def test_turbo_skips_cfg_and_evicts_large_components() -> None:
     pipeline.generate_array("prompt", seed=1, steps=1, width=16, height=16)
     assert pipeline.transformer is None
     assert pipeline.vae is None
+
+
+def test_img2img_uses_strength_to_select_denoising_steps(tmp_path: Path) -> None:
+    image_path = tmp_path / "source.png"
+    Image.new("RGB", (32, 16), color="navy").save(image_path)
+    pipeline = _fake_runtime_pipeline("ernie-image-turbo")
+    result = pipeline.edit_array(
+        "make it a convertible",
+        image_path,
+        seed=1,
+        steps=8,
+        width=32,
+        height=16,
+        guidance=1.0,
+        image_strength=0.5,
+    )
+    assert result.shape == (16, 32, 3)
+    assert len(pipeline.transformer.calls) == 4
+
+
+def test_edit_image_rounds_source_size_to_model_grid(tmp_path: Path) -> None:
+    image_path = tmp_path / "source.png"
+    Image.new("RGBA", (1160, 890), color="navy").save(image_path)
+    pixels, width, height = _load_edit_image(
+        image_path, width=None, height=None
+    )
+    assert (width, height) == (1152, 880)
+    assert pixels.shape == (1, 3, 880, 1152)
+
+
+def test_edit_image_caps_large_source_to_one_megapixel(tmp_path: Path) -> None:
+    image_path = tmp_path / "source.png"
+    Image.new("RGB", (4032, 3024), color="navy").save(image_path)
+    pixels, width, height = _load_edit_image(
+        image_path, width=None, height=None
+    )
+    assert (width, height) == (1168, 880)
+    assert pixels.shape == (1, 3, 880, 1168)
+
+
+@pytest.mark.parametrize(
+    "size,expected",
+    [
+        ((300, 200), (384, 256)),
+        ((4000, 250), (2048, 128)),
+    ],
+)
+def test_edit_auto_size_preserves_aspect_ratio(
+    tmp_path: Path,
+    size: tuple[int, int],
+    expected: tuple[int, int],
+) -> None:
+    image_path = tmp_path / "source.png"
+    Image.new("RGB", size, color="navy").save(image_path)
+    _, width, height = _load_edit_image(
+        image_path, width=None, height=None
+    )
+    assert (width, height) == expected
+
+
+def test_img2img_rejects_decoder_only_converted_vae() -> None:
+    with pytest.raises(ValueError, match="VAE encoder weights"):
+        _require_vae_encoder_weights(
+            {"decoder.conv_in.weight": mx.zeros((1,))},
+            target_shapes={
+                "encoder.conv_in.weight": (2, 3, 3, 3),
+                "quant_conv.weight": (4, 1, 1, 4),
+                "decoder.conv_in.weight": (2, 3, 3, 4),
+            },
+        )
+
+
+def test_conversion_detects_decoder_only_vae_index(tmp_path: Path) -> None:
+    vae = tmp_path / "vae"
+    vae.mkdir()
+    index = vae / "model.safetensors.index.json"
+    index.write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "decoder.conv_in.weight": "model.safetensors",
+                    "post_quant_conv.weight": "model.safetensors",
+                }
+            }
+        )
+    )
+    assert not _vae_checkpoint_has_encoder(tmp_path)
+    index.write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "encoder.conv_in.weight": "model.safetensors",
+                    "quant_conv.weight": "model.safetensors",
+                }
+            }
+        )
+    )
+    assert _vae_checkpoint_has_encoder(tmp_path)
 
 
 def test_prompt_enhancement_auto_detects_optional_components(tmp_path: Path) -> None:

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import gc
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
 from PIL import Image
+
+from mlx_vlm.models.flux2.latent import patchify_latents
 
 from .config import ErnieImageVariant, get_variant, validate_dimensions
 from .download import download_model, validate_model_layout
@@ -50,6 +53,42 @@ def _to_image_array(decoded: mx.array) -> mx.array:
     image = mx.round(images * 255).astype(mx.uint8)[0]
     mx.eval(image)
     return image
+
+
+def _load_edit_image(
+    image: str | Path | Image.Image,
+    *,
+    width: int | None,
+    height: int | None,
+) -> tuple[mx.array, int, int]:
+    if isinstance(image, Image.Image):
+        source = image.convert("RGB")
+    else:
+        with Image.open(Path(image).expanduser()) as opened:
+            source = opened.convert("RGB")
+    if width is None and height is None:
+        max_scale = min(2048 / source.width, 2048 / source.height)
+        scale = min(
+            1.0,
+            math.sqrt((1024 * 1024) / (source.width * source.height)),
+            max_scale,
+        )
+        min_scale = 256 / min(source.width, source.height)
+        if min_scale <= max_scale:
+            scale = max(scale, min_scale)
+        width = _round_edit_dimension(source.width * scale)
+        height = _round_edit_dimension(source.height * scale)
+    elif width is None or height is None:
+        raise ValueError("width and height must be supplied together for editing")
+    validate_dimensions(width=width, height=height)
+    source = source.resize((width, height), Image.Resampling.LANCZOS)
+    pixels = np.asarray(source, dtype=np.float32) / 127.5 - 1.0
+    pixels = np.transpose(pixels, (2, 0, 1))[None, ...]
+    return mx.array(pixels), width, height
+
+
+def _round_edit_dimension(value: float) -> int:
+    return max(16, min(2048, int(value) // 16 * 16))
 
 
 class ErnieImagePipeline:
@@ -154,13 +193,17 @@ class ErnieImagePipeline:
             mx.clear_cache()
         return text, lengths
 
-    def _ensure_components(self) -> None:
+    def _ensure_components(self, *, require_encoder: bool = False) -> None:
         if self.transformer is None:
             self.transformer = load_transformer(self.model_path)
             if config := getattr(self.transformer, "quantization_config", None):
                 self.component_quantization["transformer"] = dict(config)
-        if self.vae is None:
-            self.vae = load_vae(self.model_path)
+        if self.vae is None or (
+            require_encoder and getattr(self.vae, "encoder", None) is None
+        ):
+            self.vae = load_vae(
+                self.model_path, include_encoder=require_encoder
+            )
             if config := getattr(self.vae, "quantization_config", None):
                 self.component_quantization["vae"] = dict(config)
 
@@ -259,7 +302,99 @@ class ErnieImagePipeline:
             dtype=mx.bfloat16,
         )
         scheduler = ErnieImageFlowMatchScheduler(num_inference_steps=steps)
-        for index in range(steps):
+        latents = self._denoise(
+            latents=latents,
+            scheduler=scheduler,
+            start_index=0,
+            text_hidden_states=text_hidden_states,
+            text_lengths=text_lengths,
+            guidance=guidance,
+        )
+        return self._decode(latents)
+
+    def edit_array(
+        self,
+        prompt: str,
+        image: str | Path | Image.Image,
+        *,
+        seed: int = 42,
+        steps: int | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        guidance: float | None = None,
+        negative_prompt: str = "",
+        image_strength: float = 0.6,
+    ) -> mx.array:
+        if not prompt:
+            raise ValueError("prompt must not be empty")
+        if not 0.0 < image_strength <= 1.0:
+            raise ValueError(
+                f"image_strength must be in (0, 1], got {image_strength}"
+            )
+        pixels, width, height = _load_edit_image(
+            image, width=width, height=height
+        )
+        steps = self.variant.default_steps if steps is None else steps
+        guidance = self.variant.default_guidance if guidance is None else guidance
+        if steps < 1:
+            raise ValueError(f"steps must be >= 1, got {steps}")
+        if guidance < 0:
+            raise ValueError(f"guidance must be >= 0, got {guidance}")
+        if self._should_enhance_prompt():
+            prompt = self._enhance_prompt(
+                prompt, width=width, height=height, seed=seed
+            )
+            self.last_revised_prompt = prompt
+        else:
+            self.last_revised_prompt = None
+
+        do_cfg = guidance > 1.0
+        prompts = [negative_prompt, prompt] if do_cfg else [prompt]
+        text_hidden_states, text_lengths = self._encode_prompts(prompts)
+        self._ensure_components(require_encoder=True)
+
+        source_latents = self.vae.encode(pixels)
+        source_latents = patchify_latents(source_latents)
+        mean = self.vae.bn.running_mean.reshape(1, -1, 1, 1).astype(
+            source_latents.dtype
+        )
+        std = mx.sqrt(
+            self.vae.bn.running_var.reshape(1, -1, 1, 1) + 1e-5
+        ).astype(source_latents.dtype)
+        source_latents = (source_latents - mean) / std
+        noise = mx.random.normal(
+            source_latents.shape,
+            key=mx.random.key(seed),
+            dtype=source_latents.dtype,
+        )
+        scheduler = ErnieImageFlowMatchScheduler(num_inference_steps=steps)
+        denoise_steps = max(1, min(steps, round(steps * image_strength)))
+        start_index = steps - denoise_steps
+        sigma = scheduler.sigmas[start_index].astype(source_latents.dtype)
+        latents = (1.0 - sigma) * source_latents + sigma * noise
+        mx.eval(latents)
+        latents = self._denoise(
+            latents=latents,
+            scheduler=scheduler,
+            start_index=start_index,
+            text_hidden_states=text_hidden_states,
+            text_lengths=text_lengths,
+            guidance=guidance,
+        )
+        return self._decode(latents)
+
+    def _denoise(
+        self,
+        *,
+        latents: mx.array,
+        scheduler: ErnieImageFlowMatchScheduler,
+        start_index: int,
+        text_hidden_states: mx.array,
+        text_lengths: mx.array,
+        guidance: float,
+    ) -> mx.array:
+        do_cfg = guidance > 1.0
+        for index in range(start_index, len(scheduler.timesteps)):
             latent_input = (
                 mx.concatenate([latents, latents], axis=0) if do_cfg else latents
             )
@@ -282,7 +417,9 @@ class ErnieImagePipeline:
                 model_output=prediction, step_index=index, sample=latents
             )
             mx.eval(latents)
+        return latents
 
+    def _decode(self, latents: mx.array) -> mx.array:
         decoded = self.vae.decode_packed_latents(latents)
         mx.eval(decoded)
         if self.runtime_config.evict_transformer:
@@ -296,5 +433,6 @@ class ErnieImagePipeline:
 __all__ = [
     "ErnieImagePipeline",
     "ErnieImageRuntimeConfig",
+    "_load_edit_image",
     "_pad_text",
 ]
