@@ -57,6 +57,20 @@ def test_response_generator_prefill_step_override_wins_over_environment(monkeypa
     assert overridden_generator.prefill_step_size == 3072
 
 
+def test_response_generator_clears_worker_streams(monkeypatch):
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    error = RuntimeError("worker failed")
+    gen._run_impl = MagicMock(side_effect=error)
+    clear_streams = MagicMock()
+    monkeypatch.setattr(server_generation, "clear_mlx_streams", clear_streams)
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        gen._run()
+
+    gen._run_impl.assert_called_once_with()
+    clear_streams.assert_called_once_with()
+
+
 _MUSE_RESPONSE_TEMPLATE = {
     "defaults": {"role": "assistant"},
     "fields": {
