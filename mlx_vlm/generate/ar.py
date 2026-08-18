@@ -572,7 +572,11 @@ _SEQUENCE_ALIGNED_PROMPT_KWARGS = {
     "token_type_ids",
 }
 
-APC_PRIVATE_PROMPT_KEYS = ("_apc_tenant", "_apc_image_hash")
+APC_PRIVATE_PROMPT_KEYS = (
+    "_apc_tenant",
+    "_apc_image_hash",
+    "_apc_semantic_hash",
+)
 
 
 def _is_mrope_position_ids_prompt_kwarg(key: str, v: mx.array) -> bool:
@@ -1597,6 +1601,7 @@ class PromptProcessingBatch:
         apc_meta: Optional[List[dict]] = None,
         apc_manager: Optional["_apc.APCManager"] = None,
         right_pad_per_row: Optional[List[int]] = None,
+        existing_left_padding: Optional[List[int]] = None,
         suffix_lens: Optional[List[int]] = None,
         apc_mode: Optional[str] = None,
         draft_model: Optional[nn.Module] = None,
@@ -1632,6 +1637,11 @@ class PromptProcessingBatch:
             self._input_ids = _right_pad_prompts(input_ids, max_length=max_length)
         else:
             left_padding = [max_length - l for l in lengths]
+            if existing_left_padding is not None:
+                left_padding = [
+                    pad + int(existing)
+                    for pad, existing in zip(left_padding, existing_left_padding)
+                ]
             self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
         self._left_padding_per_row = list(left_padding)
         self._total_prompt_tokens = sum(lengths)
@@ -2174,6 +2184,7 @@ class BatchGenerator:
         completion_batch_size: int = DEFAULT_COMPLETION_BATCH_SIZE,
         prefill_batch_size: int = DEFAULT_PREFILL_BATCH_SIZE,
         prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
+        existing_left_padding: Optional[List[int]] = None,
         prompt_cache=None,
         kv_bits=None,
         kv_key_bits=None,
@@ -2247,6 +2258,7 @@ class BatchGenerator:
             top_logprobs_k=self.top_logprobs_k,
             greedy_sampling=self.greedy_sampling,
         )
+        self._existing_left_padding = existing_left_padding
         self._prompt_batch: Optional[PromptProcessingBatch] = None
         self._unprocessed_sequences = []
 
@@ -2270,6 +2282,9 @@ class BatchGenerator:
             return 0
         if prompt_kwargs is None:
             prompt_kwargs = {}
+        precomputed = prompt_kwargs.get("_apc_semantic_hash")
+        if precomputed is not None:
+            return int(precomputed)
         img = prompt_kwargs.get("_apc_image_hash")
         if img is None:
             pixel_values = prompt_kwargs.get("pixel_values")
@@ -2803,6 +2818,7 @@ class BatchGenerator:
             self._prompt_batch = prompt_batch_cls(
                 model=self.model,
                 uids=uids,
+                existing_left_padding=getattr(self, "_existing_left_padding", None),
                 input_ids=input_ids,
                 max_tokens=max_tokens_list,
                 inputs_embeds=inputs_embeds,
@@ -3163,12 +3179,19 @@ def _generate_batch(
             kwargs["prefill_step_size"] = None
 
     # Use batch_size for prefill and completion to ensure consistent processing
+    existing_left_padding = None
+    if mask is not None and getattr(mask, "ndim", 0) == 2:
+        pads = [int(v) for v in (mask.shape[1] - mask.sum(axis=1)).tolist()]
+        if any(pads):
+            existing_left_padding = pads
+
     gen = BatchGenerator(
         model.language_model,
         processor,
         prefill_batch_size=batch_size,
         completion_batch_size=batch_size,
         compute_logprobs=False,
+        existing_left_padding=existing_left_padding,
         **kwargs,
     )
 

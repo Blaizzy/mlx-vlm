@@ -12,6 +12,87 @@ _HALF_COS = "half"
 _FULL_COS = "full"
 
 
+def _eager_rope_angles(x, offset, frequencies, scale, traditional):
+    # offset is always an mx.array here (EagerRoPE.__call__ wraps it): 0-d for
+    # a scalar offset or (B,) for a per-batch offset (BatchRotatingKVCache /
+    # BatchKVCache). Give it a trailing axis so broadcasting keeps the seq dim
+    # S instead of accidentally expanding it to B.
+    positions = (
+        mx.arange(x.shape[-2], dtype=mx.float32)[None, :] + offset[..., None]
+    )  # (1, S) or (B, S)
+    positions = positions * scale
+    angles = positions[:, :, None] * frequencies[None, None]  # (B, S, F)
+    if traditional:
+        return mx.repeat(angles, 2, axis=-1)
+    return mx.concatenate([angles, angles], axis=-1)
+
+
+def _eager_rope_rotate(x, dims, traditional):
+    x = x[..., :dims]
+    if traditional:
+        return mx.stack([-x[..., 1::2], x[..., ::2]], axis=-1).reshape(x.shape)
+    midpoint = dims // 2
+    return mx.concatenate([-x[..., midpoint:], x[..., :midpoint]], axis=-1)
+
+
+def _eager_rope_apply(x, cos, sin, dims, traditional):
+    x_rope = x[..., :dims]
+    rotated = _eager_rope_rotate(x, dims, traditional)
+    out = x_rope * cos + rotated * sin
+    if dims < x.shape[-1]:
+        out = mx.concatenate([out, x[..., dims:]], axis=-1)
+    return out
+
+
+@mx.compile
+def _compiled_eager_rope(x, offset, frequencies, scale, traditional):
+    dims = frequencies.shape[0] * 2
+    angles = _eager_rope_angles(x, offset, frequencies, scale, traditional)
+    # angles is always (B, S, F*2) -> cos/sin (B, 1, S, D).
+    cos = mx.cos(angles).astype(x.dtype)[:, None]
+    sin = mx.sin(angles).astype(x.dtype)[:, None]
+    return _eager_rope_apply(x, cos, sin, dims, traditional)
+
+
+class EagerRoPE(nn.Module):
+    """RoPE with explicit FP32 frequencies and activation-dtype cos/sin."""
+
+    def __init__(
+        self,
+        dims: int,
+        traditional: bool = False,
+        base: float = 10000.0,
+        scale: float = 1.0,
+    ):
+        super().__init__()
+        self.dims = dims
+        self.traditional = traditional
+        self.base = base
+        self.scale = scale
+        self._frequencies = 1.0 / (
+            base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
+        )
+        self._scale = mx.array(scale, dtype=mx.float32)
+        self.eval_cached_arrays()
+
+    def eager_eval_arrays(self):
+        return [self._frequencies, self._scale]
+
+    def eval_cached_arrays(self):
+        arrays = self.eager_eval_arrays()
+        if arrays:
+            mx.eval(*arrays)
+
+    def __call__(self, x: mx.array, offset: int = 0) -> mx.array:
+        return _compiled_eager_rope(
+            x,
+            mx.array(offset, dtype=mx.float32),
+            self._frequencies,
+            self._scale,
+            self.traditional,
+        )
+
+
 class SuScaledRoPE(nn.Module):
     def __init__(
         self,
@@ -52,7 +133,8 @@ class SuScaledRoPE(nn.Module):
         self.dim = dims
 
         freqs = base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
-        self._freqs = mx.array(long_factor, dtype=mx.float32) * freqs
+        self._short_freqs = mx.array(short_factor, dtype=mx.float32) * freqs
+        self._long_freqs = mx.array(long_factor, dtype=mx.float32) * freqs
 
         def default_scale(factor):
             return math.sqrt(
@@ -60,11 +142,41 @@ class SuScaledRoPE(nn.Module):
             )
 
         factor = max_position_embeddings / original_max_position_embeddings
-        self._scale = long_mscale or (1.0 if factor <= 1.0 else default_scale(factor))
+        scale = 1.0 if factor <= 1.0 else default_scale(factor)
+        self._short_scale = mx.array(
+            scale if short_mscale is None else short_mscale,
+            dtype=mx.float32,
+        )
+        self._long_scale = mx.array(
+            scale if long_mscale is None else long_mscale,
+            dtype=mx.float32,
+        )
+        self.eval_cached_arrays()
+
+    def eager_eval_arrays(self):
+        return [
+            self._short_freqs,
+            self._long_freqs,
+            self._short_scale,
+            self._long_scale,
+        ]
+
+    def eval_cached_arrays(self):
+        arrays = self.eager_eval_arrays()
+        if arrays:
+            mx.eval(*arrays)
 
     def __call__(self, x, offset: Union[int, mx.array] = 0):
-        x = x[...]
-        x[..., : self.dim] = self._scale * x[..., : self.dim]
+        position_end = mx.max(mx.array(offset, dtype=mx.int32)) + x.shape[-2]
+        use_long = position_end > self.original_max_position_embeddings
+        freqs = mx.where(use_long, self._long_freqs, self._short_freqs)
+        scale = mx.where(use_long, self._long_scale, self._short_scale)
+
+        x_rope = scale.astype(x.dtype) * x[..., : self.dim]
+        if self.dim < x.shape[-1]:
+            x = mx.concatenate([x_rope, x[..., self.dim :]], axis=-1)
+        else:
+            x = x_rope
         return mx.fast.rope(
             x,
             self.dim,
@@ -72,7 +184,7 @@ class SuScaledRoPE(nn.Module):
             base=None,
             scale=1.0,
             offset=offset,
-            freqs=self._freqs,
+            freqs=freqs,
         )
 
 
@@ -111,12 +223,21 @@ class Llama3RoPE(nn.Module):
         )
         smooth_freqs = freqs / ((1 - smooth_factors) / factor + smooth_factors)
         self._freqs = mx.where(is_medium_freq, smooth_freqs, freqs)
+        self.eval_cached_arrays()
 
     def extra_repr(self):
         return (
             f"{self.dims}, traditional={self.traditional}, "
             f"max_position_embeddings={self.max_position_embeddings}"
         )
+
+    def eager_eval_arrays(self):
+        return [self._freqs]
+
+    def eval_cached_arrays(self):
+        arrays = self.eager_eval_arrays()
+        if arrays:
+            mx.eval(*arrays)
 
     def __call__(self, x, offset: int = 0):
         return mx.fast.rope(
@@ -185,6 +306,15 @@ class YarnRoPE(nn.Module):
         )
         self.dims = dims
         self.traditional = traditional
+        self.eval_cached_arrays()
+
+    def eager_eval_arrays(self):
+        return [self._freqs]
+
+    def eval_cached_arrays(self):
+        arrays = self.eager_eval_arrays()
+        if arrays:
+            mx.eval(*arrays)
 
     def __call__(self, x, offset=0):
         if self.mscale != 1.0:
@@ -272,6 +402,8 @@ def initialize_rope(
     traditional,
     scaling_config: Optional[dict] = None,
     max_position_embeddings: Optional[int] = None,
+    implementation: str = "fast",
+    original_max_position_embeddings: Optional[int] = None,
 ):
     if scaling_config is not None:
         rope_type = scaling_config.get("type") or scaling_config.get(
@@ -280,9 +412,24 @@ def initialize_rope(
     else:
         rope_type = "default"
 
+    if implementation not in ("fast", "eager"):
+        raise ValueError(f"Unsupported RoPE implementation {implementation}")
+
     if rope_type in ["default", "linear"]:
         scale = 1 / scaling_config["factor"] if rope_type == "linear" else 1.0
+        if implementation == "eager":
+            return EagerRoPE(
+                dims,
+                traditional=traditional,
+                base=base,
+                scale=scale,
+            )
         return nn.RoPE(dims, traditional=traditional, base=base, scale=scale)
+
+    if implementation != "fast":
+        raise ValueError(
+            f"RoPE implementation {implementation} does not support type {rope_type}"
+        )
 
     if rope_type == "llama3":
         return Llama3RoPE(
@@ -316,15 +463,27 @@ def initialize_rope(
         )
 
     if rope_type == "longrope":
+        original_max_position_embeddings = (
+            original_max_position_embeddings
+            if original_max_position_embeddings is not None
+            else scaling_config.get("original_max_position_embeddings")
+        )
+        if original_max_position_embeddings is None:
+            raise ValueError(
+                "LongRoPE requires original_max_position_embeddings either as an "
+                "argument or in scaling_config"
+            )
+        if max_position_embeddings is None:
+            raise ValueError("LongRoPE requires max_position_embeddings")
         return SuScaledRoPE(
             dims=dims,
             base=base,
             max_position_embeddings=max_position_embeddings,
-            original_max_position_embeddings=scaling_config[
-                "original_max_position_embeddings"
-            ],
+            original_max_position_embeddings=original_max_position_embeddings,
             short_factor=scaling_config["short_factor"],
             long_factor=scaling_config["long_factor"],
+            short_mscale=scaling_config.get("short_mscale"),
+            long_mscale=scaling_config.get("long_mscale"),
         )
 
     if rope_type == "proportional":

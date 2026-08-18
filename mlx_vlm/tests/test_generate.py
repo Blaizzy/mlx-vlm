@@ -1,5 +1,6 @@
 """Tests for batch generation functionality in mlx_vlm.generate module."""
 
+import contextlib
 import logging
 import sys
 import typing
@@ -1626,6 +1627,7 @@ class TestThinkingBudgetCriteria:
             thinking_end_token="</think>",
             thinking_start_token="<think>",
             enable_thinking=True,
+            prompt_preopens_thinking=True,
         )
 
         # enable_thinking=True — already in thinking mode
@@ -1675,13 +1677,41 @@ class TestThinkingBudgetCriteria:
         assert criteria.thinking_token_count == 0
         assert criteria.budget_exceeded is False
 
-    def _make_criteria(self, enable_thinking=True):
+    def test_self_opening_model_budget_still_enforced(self):
+        """Regression test for issue #1911."""
+        criteria = ThinkingBudgetCriteria(
+            tokenizer=FakeTokenizer(),
+            thinking_budget=5,
+            thinking_end_token="</think>",
+            thinking_start_token="<think>",
+            enable_thinking=True,
+            prompt_preopens_thinking=False,
+        )
+
+        assert criteria.in_thinking is False
+
+        assert criteria(99) is None
+        assert criteria.in_thinking is True
+
+        for i in range(5):
+            assert criteria(50 + i) is None
+        assert criteria.thinking_token_count == 5
+        assert criteria.budget_exceeded is False
+
+        assert criteria(60) == 10  # \n
+        assert criteria.pop_forced_token_id() == 10
+        assert criteria(60) == 100  # </think>
+        assert criteria.pop_forced_token_id() == 100
+        assert criteria.budget_exceeded is True
+
+    def _make_criteria(self, enable_thinking=True, prompt_preopens_thinking=True):
         return ThinkingBudgetCriteria(
             tokenizer=FakeTokenizer(),
             thinking_budget=5,
             thinking_end_token="</think>",
             thinking_start_token="<think>",
             enable_thinking=enable_thinking,
+            prompt_preopens_thinking=prompt_preopens_thinking,
         )
 
     def test_pop_forced_token_id_safe_before_first_call(self):
@@ -1995,6 +2025,100 @@ def test_stream_generate_forwards_verbose_to_generate_step():
     assert captured["verbose"] is True
 
 
+def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
+    captured = {}
+    tokenizer = SimpleNamespace(stopping_criteria=SimpleNamespace())
+    processor = SimpleNamespace(tokenizer=tokenizer)
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test"),
+        language_model=SimpleNamespace(),
+    )
+    prepared_mask = mx.ones((1, 4), dtype=mx.int32)
+
+    def capture_hash(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    with (
+        patch.object(
+            dispatch_module,
+            "prepare_inputs",
+            return_value={
+                "input_ids": mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+                "attention_mask": prepared_mask,
+            },
+        ),
+        patch.object(dispatch_module._apc, "model_apc_mode", return_value="block"),
+        patch.object(
+            dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
+        ),
+        patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
+        patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(
+            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
+        ),
+        patch.object(dispatch_module, "make_streaming_detokenizer"),
+        patch.object(dispatch_module, "generate_step", return_value=iter(())),
+    ):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="hello",
+                apc_manager=MagicMock(),
+                max_tokens=0,
+            )
+        )
+
+    assert captured["media"]["embeddings"] is None
+    assert captured["media"]["masks"] is None
+
+
+def test_stream_generate_hashes_explicit_sequence_tensors_for_apc_safety():
+    captured = {}
+    tokenizer = SimpleNamespace(stopping_criteria=SimpleNamespace())
+    processor = SimpleNamespace(tokenizer=tokenizer)
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test"),
+        language_model=SimpleNamespace(),
+    )
+    custom_embeds = mx.ones((1, 4, 3))
+    custom_mask = mx.array([[1, 1, 0, 0]], dtype=mx.int32)
+
+    def capture_hash(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    with (
+        patch.object(dispatch_module._apc, "model_apc_mode", return_value="block"),
+        patch.object(
+            dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
+        ),
+        patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
+        patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(
+            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
+        ),
+        patch.object(dispatch_module, "make_streaming_detokenizer"),
+        patch.object(dispatch_module, "generate_step", return_value=iter(())),
+    ):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="",
+                input_ids=mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+                inputs_embeds=custom_embeds,
+                mask=custom_mask,
+                apc_manager=MagicMock(),
+                max_tokens=0,
+            )
+        )
+
+    assert captured["media"]["embeddings"] is custom_embeds
+    assert captured["media"]["masks"] is custom_mask
+
+
 def test_public_generation_annotations_match_runtime_results():
     hints = typing.get_type_hints(dispatch_module.stream_generate)
 
@@ -2180,6 +2304,82 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
     assert mock_generate.call_args.kwargs["video"] == ["clip.mp4"]
     assert mock_generate.call_args.kwargs["fps"] == pytest.approx(1.0)
     assert capsys.readouterr().out.strip() == "done"
+
+
+def test_resolve_video_inputs_keeps_native_video_unchanged():
+    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
+    images = [object()]
+    videos = ["first.mp4", "second.mp4"]
+    processor = SimpleNamespace(
+        video_processor=SimpleNamespace(),
+        process=lambda text=None, images=None, videos=None, **kwargs: None,
+    )
+
+    with patch.object(video_module, "sample_video_frames") as mock_sample:
+        resolution = video_module.resolve_video_inputs(
+            processor,
+            videos,
+            images=images,
+        )
+
+    assert resolution.images == images
+    assert resolution.videos == videos
+    assert resolution.used_fallback is False
+    mock_sample.assert_not_called()
+
+
+def test_resolve_video_inputs_uses_one_global_frame_budget():
+    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
+    still = object()
+    images = [still]
+    videos = ["first.mp4", "second.mp4"]
+    frames = [object() for _ in range(10)]
+
+    with patch.object(
+        video_module,
+        "sample_video_frames",
+        return_value=(frames, 1.5),
+    ) as mock_sample:
+        resolution = video_module.resolve_video_inputs(
+            SimpleNamespace(),
+            videos,
+            images=images,
+            fps=1.5,
+            max_frames=4,
+        )
+
+    assert resolution.images == [still, frames[0], frames[3], frames[6], frames[9]]
+    assert resolution.videos == []
+    assert resolution.used_fallback is True
+    assert resolution.sampled_count == 10
+    assert resolution.selected_count == 4
+    assert resolution.frame_fps == pytest.approx(1.5)
+    assert images == [still]
+    assert videos == ["first.mp4", "second.mp4"]
+    mock_sample.assert_called_once_with(videos, 1.5)
+
+
+def test_resolve_video_inputs_does_not_partially_mutate_on_decode_failure():
+    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
+    images = [object()]
+    videos = ["good.mp4", "bad.mp4"]
+
+    with (
+        patch.object(
+            video_module,
+            "sample_video_frames",
+            side_effect=RuntimeError("decode failed"),
+        ),
+        pytest.raises(RuntimeError, match="decode failed"),
+    ):
+        video_module.resolve_video_inputs(
+            SimpleNamespace(),
+            videos,
+            images=images,
+        )
+
+    assert len(images) == 1
+    assert videos == ["good.mp4", "bad.mp4"]
 
 
 def test_generate_cli_video_frames_fallback_without_video_processor(capsys):
@@ -2502,6 +2702,119 @@ def test_batch_apc_extra_hash_uses_precomputed_image_hash():
     assert got == apc_module.tenant_scoped_hash("tenant-a", 123)
 
 
+def test_batch_apc_extra_hash_returns_precomputed_semantic_hash():
+    batch_generator = SimpleNamespace(apc_manager=object())
+    semantic_hash = 7088136067003016882
+
+    short_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {
+            "_apc_semantic_hash": semantic_hash,
+            "inputs_embeds": mx.ones((1, 8, 4)),
+            "attention_mask": mx.ones((1, 8), dtype=mx.int32),
+        },
+    )
+    extended_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {
+            "_apc_semantic_hash": semantic_hash,
+            "inputs_embeds": mx.ones((1, 12, 4)),
+            "attention_mask": mx.ones((1, 12), dtype=mx.int32),
+        },
+    )
+
+    assert short_hash == semantic_hash
+    assert extended_hash == semantic_hash
+
+
+def test_batch_apc_extra_hash_still_tracks_non_text_media():
+    batch_generator = SimpleNamespace(apc_manager=object())
+    base = {
+        "_apc_image_hash": 123,
+        "_apc_tenant": "tenant-a",
+        "inputs_embeds": mx.ones((1, 8, 4)),
+        "attention_mask": mx.ones((1, 8), dtype=mx.int32),
+    }
+
+    first_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {**base, "input_features": mx.zeros((1, 4, 8))},
+    )
+    second_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {**base, "input_features": mx.ones((1, 4, 8))},
+    )
+
+    assert first_hash != second_hash
+
+
+def test_batch_apc_extra_hash_tracks_explicit_sequence_tensors():
+    batch_generator = SimpleNamespace(apc_manager=object())
+    base = {
+        "_apc_image_hash": 123,
+        "_apc_tenant": "tenant-a",
+    }
+
+    first_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {
+            **base,
+            "inputs_embeds": mx.zeros((1, 8, 4)),
+            "attention_mask": mx.ones((1, 8), dtype=mx.int32),
+        },
+    )
+    second_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {
+            **base,
+            "inputs_embeds": mx.ones((1, 8, 4)),
+            "attention_mask": mx.ones((1, 8), dtype=mx.int32),
+        },
+    )
+
+    assert first_hash != second_hash
+
+
+def test_precomputed_semantic_hash_reuses_actual_growing_apc_prefix():
+    manager = apc_module.APCManager(num_blocks=4, block_size=4)
+    manager.exact_cache_guard_tokens = 1
+    semantic_hash = 7088136067003016882
+    short_tokens = list(range(8))
+    extended_tokens = [*short_tokens, 8, 9]
+    layer_keys = [mx.ones((1, 1, len(short_tokens), 2))]
+    layer_values = [mx.ones((1, 1, len(short_tokens), 2)) * 2]
+
+    stored = manager.store_kv_blocks(
+        short_tokens,
+        layer_keys,
+        layer_values,
+        extra_hash=semantic_hash,
+    )
+    manager.release(stored)
+
+    batch_generator = object.__new__(BatchGenerator)
+    batch_generator.apc_manager = manager
+    batch_generator.apc_mode = "block"
+    batch_generator.model = SimpleNamespace(config=SimpleNamespace())
+    batch_generator._wire_stack = None
+
+    pick = batch_generator._apc_pick_for(
+        (
+            1,
+            extended_tokens,
+            1,
+            {"_apc_semantic_hash": semantic_hash},
+            [],
+            None,
+        )
+    )
+
+    assert pick is not None
+    assert pick["prefix_len"] == len(short_tokens)
+    assert pick["extra_hash"] == semantic_hash
+    manager.release(pick["matched_blocks"])
+
+
 def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
     class EmptyGenerationBatch:
         def __len__(self):
@@ -2640,6 +2953,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
                 "keep_tensor": mx.ones((1, 1)),
                 "_apc_tenant": "tenant-a",
                 "_apc_image_hash": 123,
+                "_apc_semantic_hash": 7,
             },
             [],
             None,
@@ -2682,6 +2996,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
     assert batch is not None
     assert "_apc_tenant" not in captured["prompt_kwargs"]
     assert "_apc_image_hash" not in captured["prompt_kwargs"]
+    assert "_apc_semantic_hash" not in captured["prompt_kwargs"]
     assert captured["prompt_kwargs"]["keep_tensor"].shape == (2, 1)
 
 
@@ -2743,3 +3058,69 @@ class TestBatchTurboQuantizedKVStart:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestPrePaddedBatchRows:
+    """Rows that arrive already padded must still declare that padding.
+
+    The tokenizer squares a batch off with left padding and reports it in the
+    attention mask. If that never reaches the caches, every row looks the same
+    length: a causal mask does not exclude padding that comes first, and a
+    recurrent layer walks it like any other column.
+    """
+
+    def _batch(self, rows, existing_left_padding):
+        import mlx.nn as nn
+
+        from mlx_vlm.generate.ar import PromptProcessingBatch
+
+        class Tiny(nn.Module):
+            def make_cache(self):
+                from mlx_vlm.models.cache import ArraysCache, KVCache
+
+                return [KVCache(), ArraysCache(1)]
+
+        return PromptProcessingBatch(
+            model=Tiny(),
+            uids=list(range(len(rows))),
+            input_ids=rows,
+            max_tokens=[4] * len(rows),
+            inputs_embeds=None,
+            prompt_kwargs={},
+            existing_left_padding=existing_left_padding,
+        )
+
+    def test_declared_padding_reaches_the_caches(self):
+        rows = [list(range(8)), list(range(8))]
+
+        batch = self._batch(rows, existing_left_padding=[5, 0])
+
+        assert batch._left_padding_per_row == [5, 0]
+
+    def test_uniform_rows_without_a_declaration_record_none(self):
+        rows = [list(range(8)), list(range(8))]
+
+        batch = self._batch(rows, existing_left_padding=None)
+
+        assert batch._left_padding_per_row == [0, 0]
+
+    def test_a_declaration_adds_to_the_generator_s_own_padding(self):
+        rows = [list(range(4)), list(range(8))]
+
+        batch = self._batch(rows, existing_left_padding=[2, 1])
+
+        assert batch._left_padding_per_row == [6, 1]
+
+    def test_arrays_cache_masks_the_declared_padding(self):
+        import mlx.core as mx
+
+        from mlx_vlm.models.cache import ArraysCache
+
+        entry = ArraysCache(1)
+        entry.left_padding = mx.array([5, 0])
+
+        mask = entry.make_mask(8)
+
+        assert mask.shape == (2, 8)
+        assert mask[0].tolist() == [False] * 5 + [True] * 3
+        assert mask[1].tolist() == [True] * 8
