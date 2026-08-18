@@ -50,6 +50,14 @@ class ZImagePipeline:
         if self.vae is None:
             self.vae = load_vae(self.model_path, self.config)
 
+    def _evict_components(self) -> None:
+        if self.transformer is None and self.vae is None:
+            return
+        self.transformer = None
+        self.vae = None
+        gc.collect()
+        mx.clear_cache()
+
     def _encode_prompt(self, prompt: str, max_length: int = 512) -> mx.array:
         """Tokenize and encode prompt through text encoder."""
         tokens = self.tokenizer(
@@ -89,6 +97,9 @@ class ZImagePipeline:
         steps: int = 9,
         width: int = 1024,
         height: int = 1024,
+        guidance: float = 0.0,
+        negative_prompt: str | None = None,
+        cfg_truncation: float = 1.0,
     ) -> mx.array:
         """Generate image as uint8 [H, W, 3] array."""
         for name, value in (("width", width), ("height", height)):
@@ -96,10 +107,21 @@ class ZImagePipeline:
                 raise ValueError(
                     f"Z-Image {name} must be a positive multiple of 16, got {value}"
                 )
+        if steps < 2:
+            raise ValueError(f"Z-Image steps must be at least 2, got {steps}")
+        if cfg_truncation < 0.0 or cfg_truncation > 1.0:
+            raise ValueError(
+                f"Z-Image cfg_truncation must be in [0, 1], got {cfg_truncation}"
+            )
 
         # Encode prompt
+        if self.evict_text_encoder:
+            self._evict_components()
         self._reload_encoder()
         cap_feats = self._encode_prompt(prompt)
+        negative_cap_feats = (
+            self._encode_prompt(negative_prompt or "") if guidance > 1.0 else None
+        )
         self._evict_encoder()
 
         # Load components
@@ -116,13 +138,24 @@ class ZImagePipeline:
         )
 
         # Denoise
+        # Upstream skips the terminal zero timestep, so N requested steps run N - 1
+        # nonzero transformer forwards.
         scheduler = FlowMatchEulerDiscreteScheduler(
-            num_inference_steps=steps,
+            num_inference_steps=steps - 1,
             shift=self.config.scheduler_shift,
         )
-        for i in range(steps):
+        for i in range(steps - 1):
             t = (1.0 - scheduler.sigmas[i]).reshape(1)
-            velocity = -self.transformer(latents, t, cap_feats)
+            prediction = self.transformer(latents, t, cap_feats)
+            if negative_cap_feats is not None and float(t.item()) <= cfg_truncation:
+                negative_prediction = self.transformer(
+                    latents,
+                    t,
+                    negative_cap_feats,
+                )
+                # Z-Image uses the conditional prediction as the guidance base.
+                prediction = prediction + guidance * (prediction - negative_prediction)
+            velocity = -prediction
             latents = scheduler.step(
                 velocity=velocity,
                 step_index=i,

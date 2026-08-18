@@ -150,6 +150,7 @@ class ZImageConfig:
     default_steps: int = 9
     default_guidance: float = 0.0
     scheduler_shift: float = 3.0
+    variant: str = "turbo"
 
     @classmethod
     def from_model_path(cls, model_path: str | Path) -> ZImageConfig:
@@ -162,7 +163,8 @@ class ZImageConfig:
             return json.loads(path.read_text())
 
         scheduler = load("scheduler/scheduler_config.json")
-        defaults = cls()
+        scheduler_shift = float(scheduler.get("shift", cls().scheduler_shift))
+        variant = "turbo" if scheduler_shift <= 3.0 else "base"
         return cls(
             transformer=ZImageTransformerConfig.from_dict(
                 load("transformer/config.json")
@@ -171,7 +173,10 @@ class ZImageConfig:
                 load("text_encoder/config.json")
             ),
             vae=ZImageVAEConfig.from_dict(load("vae/config.json")),
-            scheduler_shift=float(scheduler.get("shift", defaults.scheduler_shift)),
+            default_steps=9 if variant == "turbo" else 50,
+            default_guidance=0.0 if variant == "turbo" else 4.0,
+            scheduler_shift=scheduler_shift,
+            variant=variant,
         )
 
 

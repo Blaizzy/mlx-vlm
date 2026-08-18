@@ -158,7 +158,7 @@ def parse_arguments():
     parser.add_argument(
         "--guidance",
         type=float,
-        default=DEFAULT_IMAGE_GUIDANCE,
+        default=None,
         help="Classifier-free guidance for image generation/editing.",
     )
     parser.add_argument(

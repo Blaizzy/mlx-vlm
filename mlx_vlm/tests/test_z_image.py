@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
@@ -129,6 +130,138 @@ def test_dispatch_via_image_generation_model_class(tmp_path: Path) -> None:
     cls = image_generation_model_class(str(tmp_path))
     assert cls is ZImageGenerationModel
     assert is_image_generation_model(str(tmp_path))
+    assert image_generation_model_class("Tongyi-MAI/Z-Image") is ZImageGenerationModel
+
+
+def test_base_model_forwards_cfg_options() -> None:
+    calls = {}
+
+    class FakePipeline:
+        config = ZImageConfig(
+            default_steps=50,
+            default_guidance=4.0,
+            scheduler_shift=6.0,
+            variant="base",
+        )
+        model_path = Path("/tmp/z-image")
+
+        def generate_array(self, prompt: str, **kwargs):
+            calls.update(prompt=prompt, **kwargs)
+            return mx.zeros((16, 16, 3), dtype=mx.uint8)
+
+        def count_prompt_tokens(self, prompt: str) -> int:
+            return 1
+
+    model = ZImageGenerationModel(
+        pipeline=FakePipeline(),
+        model_id="Tongyi-MAI/Z-Image",
+    )
+    result = model.generate(
+        ImageGenerationRequest(
+            prompt="fox",
+            seed=42,
+            steps=50,
+            width=512,
+            height=512,
+            guidance=4.0,
+            extra={
+                "negative_prompt": "blurry",
+                "cfg_truncation": 0.75,
+            },
+        )
+    )
+    assert model.variant == "base"
+    assert calls["guidance"] == 4.0
+    assert calls["negative_prompt"] == "blurry"
+    assert calls["cfg_truncation"] == 0.75
+    assert result.metadata["guidance_mode"] == "classifier-free"
+
+
+def test_base_model_applies_variant_defaults() -> None:
+    calls = {}
+
+    class FakePipeline:
+        config = ZImageConfig(
+            default_steps=50,
+            default_guidance=4.0,
+            scheduler_shift=6.0,
+            variant="base",
+        )
+        model_path = Path("/tmp/z-image")
+
+        def generate_array(self, prompt: str, **kwargs):
+            calls.update(prompt=prompt, **kwargs)
+            return mx.zeros((16, 16, 3), dtype=mx.uint8)
+
+        def count_prompt_tokens(self, prompt: str) -> int:
+            return 1
+
+    model = ZImageGenerationModel(
+        pipeline=FakePipeline(),
+        model_id="Tongyi-MAI/Z-Image",
+    )
+    result = model.generate(ImageGenerationRequest(prompt="fox"))
+    assert calls["steps"] == 50
+    assert calls["guidance"] == 4.0
+    assert result.steps == 50
+    assert result.guidance == 4.0
+
+
+def test_base_model_preserves_explicit_generic_values() -> None:
+    calls = {}
+
+    class FakePipeline:
+        config = ZImageConfig(
+            default_steps=50,
+            default_guidance=4.0,
+            scheduler_shift=6.0,
+            variant="base",
+        )
+        model_path = Path("/tmp/z-image")
+
+        def generate_array(self, prompt: str, **kwargs):
+            calls.update(prompt=prompt, **kwargs)
+            return mx.zeros((16, 16, 3), dtype=mx.uint8)
+
+        def count_prompt_tokens(self, prompt: str) -> int:
+            return 1
+
+    model = ZImageGenerationModel(
+        pipeline=FakePipeline(),
+        model_id="Tongyi-MAI/Z-Image",
+    )
+    result = model.generate(ImageGenerationRequest(prompt="fox", steps=4, guidance=1.0))
+    assert calls["steps"] == 4
+    assert calls["guidance"] == 1.0
+    assert result.metadata["guidance_mode"] == "disabled"
+
+
+def test_generation_evicts_components_before_reloading_encoder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline = object.__new__(ZImagePipeline)
+    pipeline.evict_text_encoder = True
+    pipeline.transformer = object()
+    pipeline.vae = object()
+    pipeline.text_encoder = None
+    reloaded = False
+
+    def reload_encoder() -> None:
+        nonlocal reloaded
+        assert pipeline.transformer is None
+        assert pipeline.vae is None
+        reloaded = True
+
+    monkeypatch.setattr(pipeline, "_reload_encoder", reload_encoder)
+    monkeypatch.setattr(
+        pipeline,
+        "_encode_prompt",
+        lambda _prompt: (_ for _ in ()).throw(RuntimeError("stop after reload")),
+    )
+
+    with pytest.raises(RuntimeError, match="stop after reload"):
+        pipeline.generate_array("fox", steps=2, width=16, height=16)
+    assert reloaded
 
 
 # --- Tiny random-weight shape tests ---
@@ -218,6 +351,9 @@ def test_vae_decoder_shape() -> None:
 
 def test_rejects_classifier_free_guidance() -> None:
     model = object.__new__(ZImageGenerationModel)
+    model.pipeline = SimpleNamespace(
+        config=ZImageConfig(),
+    )
     with pytest.raises(ValueError, match="does not support classifier-free guidance"):
         model.generate(ImageGenerationRequest(prompt="test", guidance=2.0))
 
@@ -247,6 +383,26 @@ def test_config_loads_original_metadata(tmp_path: Path) -> None:
     assert config.text_encoder.hidden_size == 2560
     assert config.text_encoder.num_attention_heads == 32
     assert config.scheduler_shift == 3.0
+    assert config.variant == "turbo"
+    assert config.default_steps == 9
+    assert config.default_guidance == 0.0
+
+
+def test_config_detects_base_variant(tmp_path: Path) -> None:
+    configs = {
+        "transformer/config.json": {},
+        "text_encoder/config.json": {},
+        "vae/config.json": {},
+        "scheduler/scheduler_config.json": {"shift": 6.0},
+    }
+    for relative, content in configs.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(content))
+    config = ZImageConfig.from_model_path(tmp_path)
+    assert config.variant == "base"
+    assert config.default_steps == 50
+    assert config.default_guidance == 4.0
 
 
 def test_transformer_config_allows_distinct_refiner_depths() -> None:

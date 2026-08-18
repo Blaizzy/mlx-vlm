@@ -59,12 +59,18 @@ ImageColorSpace = Literal["RGB"]
 class ImageGenerationRequest:
     prompt: str
     seed: int | None = None
-    steps: int = DEFAULT_IMAGE_STEPS
+    steps: int | None = None
     width: int = 512
     height: int = 512
-    guidance: float = DEFAULT_IMAGE_GUIDANCE
+    guidance: float | None = None
     output_format: Literal["png"] = DEFAULT_IMAGE_FORMAT
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def resolve_steps(self, default: int = DEFAULT_IMAGE_STEPS) -> int:
+        return default if self.steps is None else self.steps
+
+    def resolve_guidance(self, default: float = DEFAULT_IMAGE_GUIDANCE) -> float:
+        return default if self.guidance is None else self.guidance
 
 
 @dataclass(slots=True)
@@ -532,10 +538,10 @@ def generate_image(
                 prompt=request.prompt,
                 image_paths=tuple(image_paths),
                 seed=request.seed,
-                steps=request.steps,
+                steps=request.resolve_steps(),
                 width=request.width,
                 height=request.height,
-                guidance=request.guidance,
+                guidance=request.resolve_guidance(),
                 output_format=request.output_format,
                 extra=dict(request.extra),
             )
@@ -624,8 +630,6 @@ def run_image_generation_cli(args: Any) -> None:
     _validate_image_generation_args(args, task=task)
     seed = args.seed if args.seed is not None else random.randrange(2**32)
     steps = getattr(args, "steps", None)
-    if steps is None:
-        steps = DEFAULT_IMAGE_STEPS
     prompt = _prompt_to_image_text(args.prompt)
     if not prompt:
         raise ValueError(f"--prompt must not be empty for image {task}")
@@ -651,10 +655,12 @@ def run_image_generation_cli(args: Any) -> None:
             prompt=prompt,
             image_paths=tuple(args.image),
             seed=seed,
-            steps=steps,
+            steps=DEFAULT_IMAGE_STEPS if steps is None else steps,
             width=width,
             height=height,
-            guidance=args.guidance,
+            guidance=(
+                DEFAULT_IMAGE_GUIDANCE if args.guidance is None else args.guidance
+            ),
             extra=dict(getattr(args, "gen_kwargs", {}) or {}),
         )
         result = generate_image(

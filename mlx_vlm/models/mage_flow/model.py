@@ -54,13 +54,15 @@ class MageFlowImageGenerationModel(ImageGenerationModel):
 
     def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
+        steps = request.resolve_steps()
+        guidance = request.resolve_guidance()
         array = self.pipeline.generate_array(
             request.prompt,
             seed=seed,
-            steps=request.steps,
+            steps=steps,
             width=request.width,
             height=request.height,
-            guidance=request.guidance,
+            guidance=guidance,
             negative_prompt=request.extra.get("negative_prompt", " "),
             static_shift=float(request.extra.get("static_shift", 6.0)),
             renormalization=bool(request.extra.get("renormalization", False)),
@@ -70,11 +72,11 @@ class MageFlowImageGenerationModel(ImageGenerationModel):
             seed=seed,
             width=request.width,
             height=request.height,
-            steps=request.steps,
+            steps=steps,
             model=self.model_id,
             family=self.family,
             variant=self.variant,
-            guidance=request.guidance,
+            guidance=guidance,
             prompt_tokens=self.pipeline.count_prompt_tokens(request.prompt),
             peak_memory=mx.get_peak_memory() / 1e9,
             metadata={

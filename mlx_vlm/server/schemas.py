@@ -47,18 +47,18 @@ class ImageGenerationRequest(FlexibleBaseModel):
     )
     width: Optional[int] = Field(None, description="Generated image width.")
     height: Optional[int] = Field(None, description="Generated image height.")
-    steps: int = Field(
-        DEFAULT_IMAGE_STEPS,
+    steps: Optional[int] = Field(
+        None,
         ge=1,
-        description="Number of image generation inference steps.",
+        description="Number of image generation inference steps; model default if omitted.",
     )
     seed: Optional[int] = Field(
         None,
         description="Base seed. Multiple outputs use (seed + i) values.",
     )
-    guidance: float = Field(
-        DEFAULT_IMAGE_GUIDANCE,
-        description="Classifier-free guidance scale.",
+    guidance: Optional[float] = Field(
+        None,
+        description="Classifier-free guidance scale; model default if omitted.",
     )
     auto_json_caption: Optional[bool] = Field(
         None,
