@@ -156,6 +156,55 @@ class _BaseCache:
         return None
 
 
+class ConcatenateKVCache(_BaseCache):
+    def __init__(self):
+        self.keys = None
+        self.values = None
+        self.offset = 0
+
+    def update_and_fetch(self, keys, values):
+        if self.keys is None:
+            self.keys = keys
+            self.values = values
+        else:
+            self.keys = mx.concatenate([self.keys, keys], axis=-2)
+            self.values = mx.concatenate([self.values, values], axis=-2)
+        self.offset = self.keys.shape[-2]
+        return self.keys, self.values
+
+    @property
+    def state(self):
+        return self.keys, self.values
+
+    @state.setter
+    def state(self, value):
+        self.keys, self.values = value
+        self.offset = 0 if self.keys is None else self.keys.shape[-2]
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        if self.keys is not None:
+            self.keys = self.keys[..., : self.offset, :]
+            self.values = self.values[..., : self.offset, :]
+        return n
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
+
+
 def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
     """Dequantize uniform-quantized K/V tuples to raw float arrays.
 
@@ -165,16 +214,16 @@ def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
     if keys_tuple is None or values_tuple is None or length == 0:
         return None, None
     keys = mx.dequantize(
-        keys_tuple[0][..., :length, :],
-        keys_tuple[1][..., :length, :],
-        keys_tuple[2][..., :length, :],
+        mx.contiguous(keys_tuple[0][..., :length, :]),
+        mx.contiguous(keys_tuple[1][..., :length, :]),
+        mx.contiguous(keys_tuple[2][..., :length, :]),
         group_size=group_size,
         bits=bits,
     )
     values = mx.dequantize(
-        values_tuple[0][..., :length, :],
-        values_tuple[1][..., :length, :],
-        values_tuple[2][..., :length, :],
+        mx.contiguous(values_tuple[0][..., :length, :]),
+        mx.contiguous(values_tuple[1][..., :length, :]),
+        mx.contiguous(values_tuple[2][..., :length, :]),
         group_size=group_size,
         bits=bits,
     )
@@ -1457,7 +1506,7 @@ class BatchRotatingKVCache(_BaseCache):
         keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
         values = mx.zeros((B, H, max_length, Dv), dtype=dt)
         for i, (p, length, c) in enumerate(zip(padding, lengths, caches)):
-            if c.keys is None:
+            if c.keys is None or length == 0:
                 continue
             keys[i : i + 1, :, p : p + length] = c._temporal_order(c.keys)[
                 ..., -length:, :
@@ -2069,6 +2118,14 @@ class PoolingCache(_BaseCache):
     def meta_state(self, v):
         self.ratio = v
 
+    @classmethod
+    def from_state(cls, state, meta_state):
+        # Restoring buffered state calls ``accumulate_windows``, which needs
+        # the compression ratio before the generic state setter can run.
+        obj = cls(meta_state)
+        obj.state = state
+        return obj
+
     def is_trimmable(self):
         return self.pooled is None
 
@@ -2093,8 +2150,8 @@ class PoolingCache(_BaseCache):
         return total
 
     @classmethod
-    def merge(cls, caches):
-        return BatchPoolingCache.merge(caches)
+    def merge(cls, caches, prefix_lens=None):
+        return BatchPoolingCache.merge(caches, prefix_lens)
 
 
 class BatchPoolingCache(_BaseCache):
@@ -2435,8 +2492,11 @@ class BatchPoolingCache(_BaseCache):
         return cache
 
     @classmethod
-    def merge(cls, caches):
+    def merge(cls, caches, prefix_lens=None):
         """Merge a list of PoolingCache instances into a BatchPoolingCache."""
+        # APC passes prefix lengths to custom merge implementations. Pooling
+        # caches derive progress from each row's pooled length and remainder.
+        del prefix_lens
         B = len(caches)
         if not all(c.ratio == caches[0].ratio for c in caches):
             raise ValueError(

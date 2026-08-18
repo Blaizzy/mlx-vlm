@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import struct
+import warnings
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -48,8 +49,15 @@ MODEL_REMAPPING = {
     "cohere2moe": "cohere2_moe",
     "unlimited-ocr": "unlimited_ocr",
     "mistral": "llama",
+    "phi-msft": "phixtral",
+    "falcon_mamba": "mamba",
+    "joyai_llm_flash": "deepseek_v3",
+    "kimi_k2": "deepseek_v3",
+    "minimax_m2": "minimax",
+    "iquestcoder": "llama",
     "nemotron-nas": "nemotron_nas",
     "inkling_mm_model": "inkling",
+    "lille-130m": "lille_130m",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -515,15 +523,7 @@ def get_class_predicate(skip_vision=False, weights=None, quantization_config=Non
 
 
 def get_model_and_args(config: dict):
-    """
-    Retrieve the model object based on the configuration.
-
-    Args:
-        config (dict): The model configuration.
-
-    Returns:
-        A tuple containing the Model class and the ModelArgs class.
-    """
+    """Resolve a model package and its normalized model type."""
     raw_model_type = config.get("model_type") or config.get("speculators_model_type")
     if raw_model_type is None:
         raise KeyError("model_type")
@@ -546,10 +546,6 @@ def get_model_and_args(config: dict):
             last_err = e
             continue
 
-    if _is_text_only_config(config):
-        arch = importlib.import_module("mlx_vlm.models.text_only")
-        return arch, "text_only"
-
     msg = f"Model type {model_type} not supported. Error: {last_err}"
     logging.error(msg)
     raise ValueError(msg)
@@ -565,6 +561,25 @@ def _is_text_only_config(config: dict) -> bool:
         _has_config(config, key)
         for key in ("vision_config", "audio_config", "dflash_config")
     )
+
+
+def _drop_modules_without_weights(model: nn.Module, weights: dict) -> None:
+    weighted_modules = {key.partition(".")[0] for key in weights}
+    dropped_modules = []
+    for name, child in list(model.items()):
+        if name == "language_model" or not isinstance(child, nn.Module):
+            continue
+        if not tree_flatten(child.parameters()) or name in weighted_modules:
+            continue
+        setattr(model, name, None)
+        dropped_modules.append(name)
+
+    if dropped_modules:
+        logging.warning(
+            "Text-only checkpoint has no weights for VLM module(s): %s. "
+            "Disabling those modules.",
+            ", ".join(dropped_modules),
+        )
 
 
 def get_model_path(
@@ -679,6 +694,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         weights.update(_load_safetensors(wf))
 
     model_class, _ = get_model_and_args(config=config)
+    text_only_config = _is_text_only_config(config)
 
     # Initialize text and vision configs if not present
     config.setdefault("text_config", config.pop("llm_config", {}))
@@ -764,7 +780,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 from .models.deepseek_v4.language import make_quantization_config
 
                 quantization = make_quantization_config(model)
-            elif quant_method in ("awq", "gptq", "bitnet"):
+            elif quant_method in ("awq", "gptq"):
                 logging.warning(
                     "Quantization method %s is not supported in mlx_vlm.load_model()",
                     quant_method,
@@ -786,11 +802,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # so coerce None to {} to avoid AttributeError on the .get below.
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = (config.get("vision_config") or {}).get("skip_vision", False)
-        quantized_model = (
-            model.language_model._model
-            if getattr(model, "_is_text_model", False)
-            else model
-        )
+        quantized_model = model
 
         # Stock MLX rejects bits=1; route those layers to our Metal kernel.
         replace_one_bit_modules(quantized_model, quantization, weights)
@@ -839,6 +851,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 "Please use a quantized model with mode 'nvfp4' or 'mxfp8'."
             )
         model = quantize_activations(model)
+
+    if text_only_config:
+        _drop_modules_without_weights(model, weights)
 
     model.load_weights(list(weights.items()), strict=strict)
 
@@ -1126,7 +1141,11 @@ def load_processor(
         )
 
         # Create and assign the StoppingCriteria
-        criteria = StoppingCriteria(final_eos_token_ids, tokenizer_obj)
+        criteria = StoppingCriteria(
+            final_eos_token_ids,
+            tokenizer_obj,
+            additional_eos_token_ids=getattr(processor, "additional_eos_token_ids", ()),
+        )
         if hasattr(processor, "tokenizer"):
             processor.tokenizer.stopping_criteria = criteria
         else:
@@ -1413,8 +1432,16 @@ def process_image(img, resize_shape, image_processor):
         img = load_image(img)
     if hasattr(img, "mode") and img.mode != "RGB":
         img = img.convert("RGB")
-    if resize_shape is not None and not isinstance(image_processor, BaseImageProcessor):
-        img = resize_image(img, resize_shape)
+    if resize_shape is not None:
+        if isinstance(image_processor, BaseImageProcessor):
+            # warnings (not logging) so repeated calls in a batch dedupe.
+            warnings.warn(
+                f"resize_shape={resize_shape} is ignored because "
+                f"{type(image_processor).__name__} handles its own image "
+                "sizing; use the processor's sizing options instead."
+            )
+        else:
+            img = resize_image(img, resize_shape)
     return img
 
 
@@ -2008,14 +2035,17 @@ def group_images_by_shape(
 
 
 class StoppingCriteria:
-    def __init__(self, eos_token_ids: List[int], tokenizer=None):
-
-        if isinstance(eos_token_ids, int):
-            self.eos_token_ids = [eos_token_ids]
-        else:
-            self.eos_token_ids = list(eos_token_ids)
-
+    def __init__(
+        self,
+        eos_token_ids: List[int],
+        tokenizer=None,
+        additional_eos_token_ids: Optional[List[int]] = None,
+    ):
         self.tokenizer = tokenizer
+        self.additional_eos_token_ids = list(
+            dict.fromkeys(additional_eos_token_ids or ())
+        )
+        self.reset(eos_token_ids)
 
     def add_eos_token_ids(self, new_eos_token_ids: Union[int, List[int]] = None):
         """
@@ -2052,8 +2082,14 @@ class StoppingCriteria:
         if isinstance(eos_token_ids, int):
             eos_token_ids = [eos_token_ids]
 
-        if self.eos_token_ids != eos_token_ids:
-            self.eos_token_ids = list(eos_token_ids)
+        resolved = list(eos_token_ids)
+        resolved.extend(
+            token_id
+            for token_id in self.additional_eos_token_ids
+            if token_id not in resolved
+        )
+        if getattr(self, "eos_token_ids", None) != resolved:
+            self.eos_token_ids = resolved
 
     def __call__(self, input_ids: mx.array) -> bool:
         return input_ids in self.eos_token_ids
@@ -2074,10 +2110,12 @@ class ThinkingBudgetCriteria:
         thinking_end_token: str = "</think>",
         thinking_start_token: Optional[str] = None,
         enable_thinking: bool = False,
+        prompt_preopens_thinking: bool = False,
     ):
         self.tokenizer = tokenizer
         self.thinking_budget = thinking_budget
         self.enable_thinking = enable_thinking
+        self.prompt_preopens_thinking = prompt_preopens_thinking
 
         # Resolve token IDs from strings
         self.thinking_end_token_id = tokenizer.encode(
@@ -2095,14 +2133,14 @@ class ThinkingBudgetCriteria:
         self._forced_sequence.append(self.thinking_end_token_id)
         self._forced_index = 0
 
-        self.in_thinking = self.enable_thinking
+        self.in_thinking = self.enable_thinking and self.prompt_preopens_thinking
         self.thinking_token_count = 0
         self.budget_exceeded = False
         self.forced_token_id = None
 
     def reset_thinking_state(self):
         """Reset thinking state between generations."""
-        self.in_thinking = self.enable_thinking
+        self.in_thinking = self.enable_thinking and self.prompt_preopens_thinking
         self.thinking_token_count = 0
         self.budget_exceeded = False
         self._forced_index = 0

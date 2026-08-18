@@ -320,11 +320,6 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
     Returns:
         nn.Module: The updated model with LoRA layers applied.
     """
-    is_text_model = getattr(model, "_is_text_model", False)
-    # Text-only fallback models wrap the inner LM as language_model._model;
-    # apply LoRA to that inner module with mlx-vlm's own loader
-    target = model.language_model._model if is_text_model else model
-
     adapter_path = Path(adapter_path)
 
     if not adapter_path.exists():
@@ -336,16 +331,12 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
             raise ValueError("The adapter does not have lora params in the config")
 
     if "lora_parameters" in config:
-        target = _apply_lora_layers(target, config)
+        model = _apply_lora_layers(model, config)
     else:
-        target = _apply_legacy_lora_layers(target, config)
+        model = _apply_legacy_lora_layers(model, config)
 
-    target.load_weights(str(adapter_path / "adapters.safetensors"), strict=False)
-
-    if is_text_model:
-        model.language_model._model = target
-        return model
-    return target
+    model.load_weights(str(adapter_path / "adapters.safetensors"), strict=False)
+    return model
 
 
 def unfreeze_modules(model: nn.Module, module_names):
