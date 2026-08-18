@@ -158,6 +158,8 @@ def _model_type_from_id(model: str) -> str:
         "klein": "flux2",
         "mage": "mage_flow",
         "mageflow": "mage_flow",
+        "z": "z_image",
+        "zimage": "z_image",
     }.get(model_type, model_type)
 
 
@@ -254,6 +256,14 @@ def _image_model_type_from_component_indexes(root: Path) -> str | None:
     }
     if flux2_markers <= keys:
         return "flux2"
+    # Z-Image: layers with SwiGLU feed-forward and context_refiner
+    z_image_markers = {
+        "layers.0.feed_forward.w1.weight",
+        "context_refiner.0.attention.to_q.weight",
+        "noise_refiner.0.adaLN_modulation.0.weight",
+    }
+    if z_image_markers <= keys:
+        return "z_image"
     return None
 
 
