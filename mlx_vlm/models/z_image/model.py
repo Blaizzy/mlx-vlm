@@ -14,7 +14,7 @@ from mlx_vlm.generate.image import (
     ImageGenerationResult,
 )
 
-from .config import ZImageConfig, detect_z_image_layout
+from .config import detect_z_image_layout
 from .pipeline import ZImagePipeline
 
 # Known model IDs / aliases
@@ -39,7 +39,12 @@ class ZImageGenerationModel(ImageGenerationModel):
 
     def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
-        steps = request.steps or 9
+        steps = request.steps or self.pipeline.config.default_steps
+        if not 0.0 <= request.guidance <= 1.0:
+            raise ValueError(
+                "Z-Image Turbo does not support classifier-free guidance; "
+                "use a guidance value between 0 and 1 to keep it disabled"
+            )
         array = self.pipeline.generate_array(
             request.prompt,
             seed=seed,
@@ -62,6 +67,7 @@ class ZImageGenerationModel(ImageGenerationModel):
             metadata={
                 "model_path": str(self.pipeline.model_path),
                 "architecture": "z-image-dit",
+                "guidance_mode": "disabled",
             },
         )
 
@@ -75,7 +81,7 @@ class ZImageGenerationModel(ImageGenerationModel):
         return model.strip().lower().rstrip("/") in _KNOWN_IDS
 
     @classmethod
-    def from_model_id(cls, model: str, **kwargs: Any) -> "ZImageGenerationModel":
+    def from_model_id(cls, model: str, **kwargs: Any) -> ZImageGenerationModel:
         model_path = kwargs.pop("model_path", None)
         if model_path is None:
             path = Path(model).expanduser()

@@ -283,8 +283,8 @@ def convert(
     hf_path: str,
     mlx_path: str = "mlx_model",
     quantize: bool = False,
-    q_group_size: int = 64,
-    q_bits: int = 4,
+    q_group_size: Optional[int] = None,
+    q_bits: Optional[int] = None,
     q_mode: str = "affine",
     quant_method: str = "rtn",
     calibration: str = "text",
@@ -295,9 +295,35 @@ def convert(
     dequantize: bool = False,
     trust_remote_code: bool = True,
     quant_predicate: Optional[str] = None,
+    quantize_vae: bool = False,
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
+    from .models.z_image.convert import convert_z_image, is_z_image_model_path
+
+    if is_z_image_model_path(model_path):
+        if dequantize:
+            raise ValueError(
+                "Z-Image conversion requires the original dense checkpoint"
+            )
+        if quant_method != "rtn":
+            raise ValueError("Z-Image conversion currently supports RTN only")
+        if quant_predicate is not None:
+            raise ValueError(
+                "Mixed-bit recipes are not supported for Z-Image conversion"
+            )
+        quantization = _quantization_params(q_group_size, q_bits, q_mode)
+        return convert_z_image(
+            model_path,
+            mlx_path,
+            quantize=quantize,
+            q_group_size=quantization["group_size"],
+            q_bits=quantization["bits"],
+            q_mode=q_mode,
+            dtype=dtype,
+            quantize_vae=quantize_vae,
+            upload_repo=upload_repo,
+        )
     model, config, processor = fetch_from_hub(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )
@@ -471,6 +497,14 @@ def configure_parser() -> argparse.ArgumentParser:
         type=str,
         choices=["affine", "mxfp4", "nvfp4", "mxfp8"],
         default="affine",
+    )
+    parser.add_argument(
+        "--quantize-vae",
+        help=(
+            "Quantize compatible Z-Image VAE layers. By default the VAE "
+            "stays in the selected floating-point dtype."
+        ),
+        action="store_true",
     )
     parser.add_argument(
         "--quant-method",

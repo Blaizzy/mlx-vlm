@@ -6,11 +6,11 @@ import gc
 from pathlib import Path
 
 import mlx.core as mx
-import numpy as np
 from transformers import AutoTokenizer
 
+from mlx_vlm.models.mage_flow.scheduler import FlowMatchEulerDiscreteScheduler
+
 from .config import ZImageConfig
-from .scheduler import FlowMatchEulerScheduler
 from .weights import load_text_encoder, load_transformer, load_vae
 
 
@@ -25,7 +25,7 @@ class ZImagePipeline:
         evict_text_encoder: bool = True,
     ) -> None:
         self.model_path = Path(model_path).expanduser()
-        self.config = config or ZImageConfig()
+        self.config = config or ZImageConfig.from_model_path(self.model_path)
         self.evict_text_encoder = evict_text_encoder
         self.text_encoder = load_text_encoder(self.model_path, self.config)
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -36,6 +36,14 @@ class ZImagePipeline:
         self.transformer = None
         self.vae = None
 
+    def _format_prompt(self, prompt: str) -> str:
+        return self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=True,
+        )
+
     def _ensure_components(self) -> None:
         if self.transformer is None:
             self.transformer = load_transformer(self.model_path, self.config)
@@ -44,17 +52,8 @@ class ZImagePipeline:
 
     def _encode_prompt(self, prompt: str, max_length: int = 512) -> mx.array:
         """Tokenize and encode prompt through text encoder."""
-        # Apply chat template
-        messages = [{"role": "user", "content": prompt}]
-        try:
-            text = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-        except Exception:
-            text = prompt
-
         tokens = self.tokenizer(
-            text,
+            self._format_prompt(prompt),
             padding="max_length",
             max_length=max_length,
             truncation=True,
@@ -62,7 +61,9 @@ class ZImagePipeline:
         )
         input_ids = mx.array(tokens["input_ids"])
         attention_mask = mx.array(tokens["attention_mask"])
-        hidden = self.text_encoder(input_ids, attention_mask)
+        hidden = self.text_encoder(input_ids, attention_mask, output_penultimate=True)
+        valid_length = int(mx.sum(attention_mask[0]).item())
+        hidden = hidden[:, :valid_length]
         mx.eval(hidden)
         return hidden
 
@@ -77,13 +78,7 @@ class ZImagePipeline:
             self.text_encoder = load_text_encoder(self.model_path, self.config)
 
     def count_prompt_tokens(self, prompt: str) -> int:
-        messages = [{"role": "user", "content": prompt}]
-        try:
-            text = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-        except Exception:
-            text = prompt
+        text = self._format_prompt(prompt)
         return len(self.tokenizer(text, truncation=False)["input_ids"])
 
     def generate_array(
@@ -96,6 +91,12 @@ class ZImagePipeline:
         height: int = 1024,
     ) -> mx.array:
         """Generate image as uint8 [H, W, 3] array."""
+        for name, value in (("width", width), ("height", height)):
+            if value < 16 or value % 16:
+                raise ValueError(
+                    f"Z-Image {name} must be a positive multiple of 16, got {value}"
+                )
+
         # Encode prompt
         self._reload_encoder()
         cap_feats = self._encode_prompt(prompt)
@@ -115,13 +116,18 @@ class ZImagePipeline:
         )
 
         # Denoise
-        scheduler = FlowMatchEulerScheduler(steps)
+        scheduler = FlowMatchEulerDiscreteScheduler(
+            num_inference_steps=steps,
+            shift=self.config.scheduler_shift,
+        )
         for i in range(steps):
-            t = scheduler.get_model_input_timestep(i)
-            noise_pred = self.transformer(latents, t, cap_feats)
-            # Negate prediction per reference pipeline
-            noise_pred = -noise_pred
-            latents = scheduler.step(noise_pred, i, latents)
+            t = (1.0 - scheduler.sigmas[i]).reshape(1)
+            velocity = -self.transformer(latents, t, cap_feats)
+            latents = scheduler.step(
+                velocity=velocity,
+                step_index=i,
+                latents=latents,
+            )
             mx.eval(latents)
 
         # Decode
@@ -133,7 +139,7 @@ class ZImagePipeline:
         mx.eval(decoded)
 
         # Post-process to uint8
-        image = (decoded[0] / 2.0 + 0.5)
+        image = decoded[0] / 2.0 + 0.5
         image = mx.clip(image, 0.0, 1.0)
         return mx.round(image * 255.0).astype(mx.uint8)
 

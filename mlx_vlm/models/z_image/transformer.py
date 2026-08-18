@@ -17,8 +17,7 @@ from __future__ import annotations
 import math
 
 import mlx.core as mx
-import mlx.nn as nn
-import numpy as np
+from mlx import nn
 
 from .config import ZImageTransformerConfig
 
@@ -37,9 +36,7 @@ class TimestepEmbedder(nn.Module):
 
     def __call__(self, t: mx.array) -> mx.array:
         half = self.frequency_size // 2
-        freqs = mx.exp(
-            -math.log(10000) * mx.arange(half, dtype=mx.float32) / half
-        )
+        freqs = mx.exp(-math.log(10000) * mx.arange(half, dtype=mx.float32) / half)
         args = t.reshape(-1, 1).astype(mx.float32) * freqs[None]
         emb = mx.concatenate([mx.cos(args), mx.sin(args)], axis=-1)
         return self.linear2(nn.silu(self.linear1(emb.astype(t.dtype))))
@@ -62,7 +59,9 @@ class MRoPE:
     """Multi-resolution RoPE for Z-Image."""
 
     def __init__(
-        self, head_dim: int, sections: tuple[int, ...] = (32, 48, 48), theta: float = 256.0
+        self,
+        sections: tuple[int, ...] = (32, 48, 48),
+        theta: float = 256.0,
     ) -> None:
         self.sections = sections
         self.theta = theta
@@ -73,9 +72,7 @@ class MRoPE:
         sin_parts = []
         for i, s in enumerate(self.sections):
             ids = position_ids[..., i].astype(mx.float32)
-            inv_freq = 1.0 / (
-                self.theta ** (mx.arange(0, s, 2, dtype=mx.float32) / s)
-            )
+            inv_freq = 1.0 / (self.theta ** (mx.arange(0, s, 2, dtype=mx.float32) / s))
             theta = ids[..., None] * inv_freq[None, None, :]
             cos_parts.append(mx.repeat(mx.cos(theta), 2, axis=-1))
             sin_parts.append(mx.repeat(mx.sin(theta), 2, axis=-1))
@@ -112,7 +109,13 @@ class Attention(nn.Module):
         self.norm_q = nn.RMSNorm(head_dim)
         self.norm_k = nn.RMSNorm(head_dim)
 
-    def __call__(self, x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
+    def __call__(
+        self,
+        x: mx.array,
+        cos: mx.array,
+        sin: mx.array,
+        mask: mx.array | None = None,
+    ) -> mx.array:
         B, L, _ = x.shape
         q = self.to_q(x).reshape(B, L, self.num_heads, self.head_dim)
         k = self.to_k(x).reshape(B, L, self.num_heads, self.head_dim)
@@ -124,7 +127,7 @@ class Attention(nn.Module):
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
-        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
+        out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.to_out[0](out)
 
@@ -141,8 +144,14 @@ class ZImageTransformerBlock(nn.Module):
     """
 
     def __init__(
-        self, dim: int, num_heads: int, head_dim: int, mlp_dim: int, *,
-        modulation: bool = True, adaln_dim: int = ADALN_EMBED_DIM,
+        self,
+        dim: int,
+        num_heads: int,
+        head_dim: int,
+        mlp_dim: int,
+        *,
+        modulation: bool = True,
+        adaln_dim: int = ADALN_EMBED_DIM,
     ) -> None:
         super().__init__()
         self.modulation = modulation
@@ -157,7 +166,12 @@ class ZImageTransformerBlock(nn.Module):
             self.adaLN_modulation = [nn.Linear(adaln_dim, 4 * dim)]
 
     def __call__(
-        self, x: mx.array, cos: mx.array, sin: mx.array, adaln_input: mx.array | None = None
+        self,
+        x: mx.array,
+        cos: mx.array,
+        sin: mx.array,
+        adaln_input: mx.array | None = None,
+        mask: mx.array | None = None,
     ) -> mx.array:
         if self.modulation:
             chunks = self.adaLN_modulation[0](adaln_input)
@@ -166,12 +180,14 @@ class ZImageTransformerBlock(nn.Module):
             gate_mlp = mx.tanh(gate_mlp)[:, None, :]
             scale_msa = (1.0 + scale_msa)[:, None, :]
             scale_mlp = (1.0 + scale_mlp)[:, None, :]
-            attn_out = self.attention(self.attention_norm1(x) * scale_msa, cos, sin)
+            attn_out = self.attention(
+                self.attention_norm1(x) * scale_msa, cos, sin, mask
+            )
             x = x + gate_msa * self.attention_norm2(attn_out)
             ffn_out = self.feed_forward(self.ffn_norm1(x) * scale_mlp)
             x = x + gate_mlp * self.ffn_norm2(ffn_out)
         else:
-            attn_out = self.attention(self.attention_norm1(x), cos, sin)
+            attn_out = self.attention(self.attention_norm1(x), cos, sin, mask)
             x = x + self.attention_norm2(attn_out)
             ffn_out = self.feed_forward(self.ffn_norm1(x))
             x = x + self.ffn_norm2(ffn_out)
@@ -181,7 +197,9 @@ class ZImageTransformerBlock(nn.Module):
 class FinalLayer(nn.Module):
     """Matches all_final_layer.2-1.{adaLN_modulation.0, linear}."""
 
-    def __init__(self, dim: int, out_dim: int, adaln_dim: int = ADALN_EMBED_DIM) -> None:
+    def __init__(
+        self, dim: int, out_dim: int, adaln_dim: int = ADALN_EMBED_DIM
+    ) -> None:
         super().__init__()
         self.norm_final = nn.LayerNorm(dim, affine=False, eps=1e-6)
         self.linear = nn.Linear(dim, out_dim)
@@ -222,6 +240,12 @@ class ZImageTransformer(nn.Module):
         dim = config.hidden_size
         num_heads = config.num_attention_heads
         head_dim = dim // num_heads
+        if config.num_key_value_heads != num_heads:
+            raise ValueError("Z-Image grouped-query attention is not supported")
+        if sum(config.rope_sections) != head_dim:
+            raise ValueError(
+                "Z-Image RoPE sections must sum to the attention head dimension"
+            )
         mlp_dim = config.intermediate_size
         patch_size = config.patch_size
         f_patch_size = config.f_patch_size
@@ -240,7 +264,9 @@ class ZImageTransformer(nn.Module):
             nn.Linear(config.text_embed_dim, dim),
         ]
         self.noise_refiner = [
-            ZImageTransformerBlock(dim, num_heads, head_dim, mlp_dim, modulation=True, adaln_dim=adaln_dim)
+            ZImageTransformerBlock(
+                dim, num_heads, head_dim, mlp_dim, modulation=True, adaln_dim=adaln_dim
+            )
             for _ in range(config.n_refiner_layers)
         ]
         self.context_refiner = [
@@ -248,19 +274,23 @@ class ZImageTransformer(nn.Module):
             for _ in range(config.n_context_refiner_layers)
         ]
         self.layers = [
-            ZImageTransformerBlock(dim, num_heads, head_dim, mlp_dim, modulation=True, adaln_dim=adaln_dim)
+            ZImageTransformerBlock(
+                dim, num_heads, head_dim, mlp_dim, modulation=True, adaln_dim=adaln_dim
+            )
             for _ in range(config.num_hidden_layers)
         ]
         # For weight loading, use sanitization to map these special keys
-        self._final_layer = FinalLayer(dim, patch_size * patch_size * f_patch_size * in_ch, adaln_dim=adaln_dim)
-        self._x_embedder = nn.Linear(f_patch_size * patch_size * patch_size * in_ch, dim)
+        self.final_layer = FinalLayer(
+            dim, patch_size * patch_size * f_patch_size * in_ch, adaln_dim=adaln_dim
+        )
+        self.x_embedder = nn.Linear(f_patch_size * patch_size * patch_size * in_ch, dim)
 
         # Learnable padding tokens
         self.x_pad_token = mx.zeros((1, dim))
         self.cap_pad_token = mx.zeros((1, dim))
 
-        self.rope = MRoPE(head_dim, config.rope_sections, config.rope_theta)
-        self.t_scale = 1000.0
+        self.rope = MRoPE(config.rope_sections, config.rope_theta)
+        self.t_scale = config.timestep_scale
 
     def _patchify(self, x: mx.array) -> tuple[mx.array, tuple[int, int, int]]:
         """x: [B, C, F, H, W] → patches [B, L, patch_dim]."""
@@ -288,9 +318,7 @@ class ZImageTransformer(nn.Module):
         """Build position IDs for cap and image tokens."""
         # Caption positions: t=1..cap_len, h=0, w=0
         t_ids = mx.arange(1, cap_len + 1, dtype=mx.float32)
-        cap_pos = mx.stack(
-            [t_ids, mx.zeros(cap_len), mx.zeros(cap_len)], axis=-1
-        )[None]
+        cap_pos = mx.stack([t_ids, mx.zeros(cap_len), mx.zeros(cap_len)], axis=-1)[None]
 
         # Image positions
         start_t = cap_len + 1
@@ -311,17 +339,58 @@ class ZImageTransformer(nn.Module):
         """
         B = x.shape[0]
         patches, (Ft, Ht, Wt) = self._patchify(x)
+        image_len = patches.shape[1]
+        image_padding = (-image_len) % SEQ_MULTI_OF
+        if image_padding:
+            patches = mx.concatenate(
+                [patches, mx.repeat(patches[:, -1:], image_padding, axis=1)],
+                axis=1,
+            )
         cap_len = cap_feats.shape[1]
+        cap_padding = (-cap_len) % SEQ_MULTI_OF
+        if cap_padding:
+            cap_feats = mx.concatenate(
+                [cap_feats, mx.repeat(cap_feats[:, -1:], cap_padding, axis=1)],
+                axis=1,
+            )
+        padded_cap_len = cap_feats.shape[1]
 
         # Embed timestep
         t_emb = self.t_embedder(t * self.t_scale)
 
         # Embed patches and caption
-        img_tokens = self._x_embedder(patches)
+        img_tokens = self.x_embedder(patches)
+        if image_padding:
+            img_tokens = mx.concatenate(
+                [
+                    img_tokens[:, :image_len],
+                    mx.broadcast_to(
+                        self.x_pad_token,
+                        (B, image_padding, self.config.hidden_size),
+                    ),
+                ],
+                axis=1,
+            )
         cap_tokens = self.cap_embedder[1](self.cap_embedder[0](cap_feats))
+        if cap_padding:
+            cap_tokens = mx.concatenate(
+                [
+                    cap_tokens[:, :cap_len],
+                    mx.broadcast_to(
+                        self.cap_pad_token,
+                        (B, cap_padding, self.config.hidden_size),
+                    ),
+                ],
+                axis=1,
+            )
 
         # Position IDs
-        cap_pos, img_pos = self._build_position_ids(cap_len, Ft, Ht, Wt)
+        cap_pos, img_pos = self._build_position_ids(padded_cap_len, Ft, Ht, Wt)
+        if image_padding:
+            img_pos = mx.concatenate(
+                [img_pos, mx.zeros((1, image_padding, 3), dtype=img_pos.dtype)],
+                axis=1,
+            )
         img_cos, img_sin = self.rope.compute_freqs(img_pos)
         cap_cos, cap_sin = self.rope.compute_freqs(cap_pos)
 
@@ -337,12 +406,16 @@ class ZImageTransformer(nn.Module):
         unified = mx.concatenate([img_tokens, cap_tokens], axis=1)
         unified_cos = mx.concatenate([img_cos, cap_cos], axis=1)
         unified_sin = mx.concatenate([img_sin, cap_sin], axis=1)
-
         for block in self.layers:
-            unified = block(unified, unified_cos, unified_sin, adaln_input=t_emb)
+            unified = block(
+                unified,
+                unified_cos,
+                unified_sin,
+                adaln_input=t_emb,
+            )
 
         # Final layer (image tokens only)
-        img_out = self._final_layer(unified[:, : Ft * Ht * Wt], t_emb)
+        img_out = self.final_layer(unified[:, :image_len], t_emb)
         return self._unpatchify(img_out, (Ft, Ht, Wt))
 
 
@@ -352,12 +425,15 @@ def sanitize_transformer_weights(
     """Map checkpoint keys to module attribute paths."""
     sanitized: dict[str, mx.array] = {}
     for key, value in weights.items():
-        # Map 'all_final_layer.2-1.*' → '_final_layer.*'
+        # Map the source ModuleDict key to the registered MLX module.
         if key.startswith("all_final_layer.2-1."):
-            key = "_final_layer." + key[len("all_final_layer.2-1."):]
-        # Map 'all_x_embedder.2-1.*' → '_x_embedder.*'
+            key = "final_layer." + key[len("all_final_layer.2-1.") :]
+            key = key.replace("adaLN_modulation.1.", "adaLN_modulation.0.")
+        # Map the source ModuleDict key to the registered MLX module.
         elif key.startswith("all_x_embedder.2-1."):
-            key = "_x_embedder." + key[len("all_x_embedder.2-1."):]
+            key = "x_embedder." + key[len("all_x_embedder.2-1.") :]
+        key = key.replace("t_embedder.mlp.0.", "t_embedder.linear1.")
+        key = key.replace("t_embedder.mlp.2.", "t_embedder.linear2.")
         sanitized[key] = value
     return sanitized
 
