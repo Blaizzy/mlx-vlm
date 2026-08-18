@@ -3129,6 +3129,46 @@ if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
 
+class TestRowsKeepTheirOwnTokens:
+    """A batch's padding must not follow a row into APC.
+
+    ``prepare_inputs`` squares the batch off before the generator sees it, so a
+    shorter row's ids start with padding. APC hashes from position zero, so a
+    padded row shares no block with the same prompt sent alone.
+    """
+
+    def _rows(self, pad):
+        prompt_kwargs_rows = [
+            {
+                "inputs_embeds": mx.arange(6 * 2, dtype=mx.float32).reshape(1, 6, 2),
+                "position_ids": mx.arange(6, dtype=mx.int32).reshape(1, 6),
+            }
+            for _ in pad
+        ]
+        row_ids = [[9, 9, 1, 2, 3, 4][:6] for _ in pad]
+        trimmed = ar_module._drop_row_left_padding(row_ids, prompt_kwargs_rows, pad)
+        return trimmed, prompt_kwargs_rows
+
+    def test_a_padded_row_hands_over_its_real_tokens(self):
+        trimmed, rows = self._rows([2, 0])
+
+        assert trimmed[0] == [1, 2, 3, 4]
+        assert trimmed[1] == [9, 9, 1, 2, 3, 4]
+
+    def test_embeddings_and_positions_follow_the_tokens(self):
+        _, rows = self._rows([2, 0])
+
+        assert rows[0]["inputs_embeds"].shape == (1, 4, 2)
+        assert rows[0]["position_ids"].shape == (1, 4)
+        assert rows[1]["inputs_embeds"].shape == (1, 6, 2)
+
+    def test_an_unpadded_row_is_left_alone(self):
+        trimmed, rows = self._rows([0, 0])
+
+        assert trimmed == [[9, 9, 1, 2, 3, 4]] * 2
+        assert all(row["inputs_embeds"].shape == (1, 6, 2) for row in rows)
+
+
 class TestPrePaddedBatchRows:
     """Rows that arrive already padded must still declare that padding.
 

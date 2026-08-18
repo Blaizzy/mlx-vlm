@@ -717,6 +717,38 @@ def _concat_prompt_kwarg_rows(key: str, rows: List[mx.array]) -> mx.array:
     return mx.concatenate(rows, axis=0)
 
 
+def _drop_row_left_padding(
+    row_ids: List[List[int]],
+    prompt_kwargs_rows: List[dict],
+    left_padding: List[int],
+) -> List[List[int]]:
+    """Hand each row its own tokens, without the batch's left padding.
+
+    ``prepare_inputs`` squares the batch off before the generator sees it, so a
+    shorter row's ids and embeddings start with padding. APC walks its hash
+    chain from position zero, so a padded row hashes to nothing in common with
+    the same prompt sent on its own and only the longest rows in a batch can
+    match a prefix. The generator pads ragged rows itself in
+    ``_merge_prefill_prompt_kwargs``, to the same width, so handing it real
+    tokens keeps the prefill shape and gives APC the sequence it was given.
+    """
+    trimmed: List[List[int]] = []
+    for ids, row, pad in zip(row_ids, prompt_kwargs_rows, left_padding):
+        if pad <= 0:
+            trimmed.append(ids)
+            continue
+        trimmed.append(ids[pad:])
+        embeds = row.get("inputs_embeds")
+        if embeds is not None:
+            row["inputs_embeds"] = embeds[:, pad:, :]
+        for key, value in list(row.items()):
+            if key == "inputs_embeds" or not isinstance(value, mx.array):
+                continue
+            if _is_sequence_aligned_prompt_kwarg(key, value, len(ids)):
+                row[key] = _slice_sequence_aligned_prompt_kwarg(key, value, start=pad)
+    return trimmed
+
+
 def _merge_prefill_prompt_kwargs(
     prompt_kwargs_list: List[Optional[dict]],
     input_ids: List[List[int]],
@@ -3258,8 +3290,15 @@ def _generate_batch(
             images=images,
         )
 
+    row_ids = input_ids.tolist()
+    if existing_left_padding is not None:
+        row_ids = _drop_row_left_padding(
+            row_ids, prompt_kwargs_rows, existing_left_padding
+        )
+        gen._existing_left_padding = None
+
     uids = gen.insert(
-        input_ids.tolist(),
+        row_ids,
         max_tokens,
         prompt_kwargs=prompt_kwargs_rows,
         logits_processors=logits_processors,
