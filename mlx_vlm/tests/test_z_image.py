@@ -11,6 +11,11 @@ import mlx.core as mx
 import pytest
 from mlx import nn
 
+from mlx_vlm.generate.edit_image import (
+    ImageEditRequest,
+    image_edit_model_class,
+    is_image_edit_model,
+)
 from mlx_vlm.generate.image import (
     ImageGenerationRequest,
     image_generation_model_class,
@@ -28,8 +33,8 @@ from mlx_vlm.models.z_image.convert import (
     _save_component,
     is_z_image_model_path,
 )
-from mlx_vlm.models.z_image.model import ZImageGenerationModel
-from mlx_vlm.models.z_image.pipeline import ZImagePipeline
+from mlx_vlm.models.z_image.model import ZImageEditModel, ZImageGenerationModel
+from mlx_vlm.models.z_image.pipeline import ZImagePipeline, _img2img_start_index
 from mlx_vlm.models.z_image.text_encoder import (
     ZImageTextEncoder,
     sanitize_text_encoder_weights,
@@ -135,6 +140,86 @@ def test_dispatch_via_image_generation_model_class(tmp_path: Path) -> None:
     assert cls is ZImageGenerationModel
     assert is_image_generation_model(str(tmp_path))
     assert image_generation_model_class("Tongyi-MAI/Z-Image") is ZImageGenerationModel
+
+
+def test_dispatch_via_image_edit_model_class(tmp_path: Path) -> None:
+    for relative in (
+        "model_index.json",
+        "transformer/config.json",
+        "transformer/model.safetensors",
+        "text_encoder/config.json",
+        "text_encoder/model.safetensors",
+        "vae/config.json",
+        "vae/model.safetensors",
+        "scheduler/scheduler_config.json",
+        "tokenizer/tokenizer.json",
+    ):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"_class_name":"ZImagePipeline"}')
+    assert ZImageEditModel.supports_model(str(tmp_path))
+    assert image_edit_model_class(str(tmp_path)) is ZImageEditModel
+    assert is_image_edit_model(str(tmp_path))
+
+
+def test_edit_model_forwards_img2img_options() -> None:
+    calls = {}
+
+    class FakePipeline:
+        config = ZImageConfig(
+            default_steps=9,
+            default_guidance=0.0,
+            scheduler_shift=3.0,
+            variant="turbo",
+        )
+        model_path = Path("/tmp/z-image")
+
+        def edit_array(self, prompt: str, image_paths, **kwargs):
+            calls.update(prompt=prompt, image_paths=image_paths, **kwargs)
+            return mx.zeros((16, 32, 3), dtype=mx.uint8)
+
+        def count_prompt_tokens(self, prompt: str) -> int:
+            return 1
+
+    model = ZImageEditModel(
+        pipeline=FakePipeline(),
+        model_id="Tongyi-MAI/Z-Image-Turbo",
+    )
+    result = model.edit(
+        ImageEditRequest(
+            prompt="replace the cart",
+            image_paths=("source.png",),
+            extra={"strength": 0.55},
+        )
+    )
+    assert calls["steps"] == 8
+    assert calls["guidance"] == 0.0
+    assert calls["strength"] == 0.55
+    assert result.width == 32
+    assert result.height == 16
+
+    model.edit(
+        ImageEditRequest(
+            prompt="replace the cart",
+            image_paths=("source.png",),
+            steps=4,
+            guidance=1.0,
+        )
+    )
+    assert calls["steps"] == 4
+    assert calls["guidance"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "steps,strength,expected",
+    [(9, 0.6, 3), (9, 0.5, 4), (8, 0.6, 3), (8, 0.3, 5)],
+)
+def test_img2img_start_index_matches_diffusers(
+    steps: int,
+    strength: float,
+    expected: int,
+) -> None:
+    assert _img2img_start_index(steps, strength) == expected
 
 
 def test_base_model_forwards_cfg_options() -> None:

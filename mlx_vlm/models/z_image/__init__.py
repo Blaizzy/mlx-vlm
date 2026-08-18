@@ -1,3 +1,3 @@
-from .model import ZImageGenerationModel, load
+from .model import ZImageEditModel, ZImageGenerationModel, load, load_edit
 
-__all__ = ["ZImageGenerationModel", "load"]
+__all__ = ["ZImageEditModel", "ZImageGenerationModel", "load", "load_edit"]

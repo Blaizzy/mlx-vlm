@@ -133,14 +133,16 @@ class MageFlowImageEditModel(ImageEditModel):
 
     def edit(self, request: ImageEditRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
+        steps = request.resolve_steps(self.pipeline.variant.default_steps)
+        guidance = request.resolve_guidance(self.pipeline.variant.default_guidance)
         array = self.pipeline.edit_array(
             request.prompt,
             request.image_paths,
             seed=seed,
-            steps=request.steps,
+            steps=steps,
             width=request.width,
             height=request.height,
-            guidance=request.guidance,
+            guidance=guidance,
             negative_prompt=request.extra.get("negative_prompt", " "),
             max_size=request.extra.get("max_size"),
             static_shift=float(request.extra.get("static_shift", 6.0)),
@@ -152,11 +154,11 @@ class MageFlowImageEditModel(ImageEditModel):
             seed=seed,
             width=array.shape[1],
             height=array.shape[0],
-            steps=request.steps,
+            steps=steps,
             model=self.model_id,
             family=self.family,
             variant=self.variant,
-            guidance=request.guidance,
+            guidance=guidance,
             prompt_tokens=self.pipeline.count_prompt_tokens(request.prompt, edit=True),
             peak_memory=mx.get_peak_memory() / 1e9,
             metadata={
