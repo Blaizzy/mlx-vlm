@@ -47,6 +47,7 @@ class GenerateKwargs(TypedDict, total=False):
     pixel_values: Any
     mask: Any
     resize_shape: tuple[int, int] | None
+    processor_kwargs: dict[str, Any] | None
     eos_tokens: list[int] | list[str] | None
     stopping_criteria: Any
     thinking_budget: int | None

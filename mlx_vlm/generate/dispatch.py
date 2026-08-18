@@ -735,6 +735,7 @@ def stream_generate(
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
     apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
     apc_tenant: Optional[str] = kwargs.pop("apc_tenant", None)
+    processor_kwargs = kwargs.pop("processor_kwargs", None)
     image = image or None
     audio = audio or None
     video = video or None
@@ -753,6 +754,7 @@ def stream_generate(
             image_token_index=image_token_index,
             resize_shape=resize_shape,
             add_special_tokens=add_special_tokens,
+            processor_kwargs=processor_kwargs,
             **kwargs,
         )
         input_ids = inputs.get("input_ids", None)

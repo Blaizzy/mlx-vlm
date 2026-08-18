@@ -3131,6 +3131,7 @@ def _generate_batch(
 
     resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
     image_token_index = getattr(model.config, "image_token_index", None)
+    processor_kwargs = kwargs.pop("processor_kwargs", None)
 
     inputs = prepare_inputs(
         processor,
@@ -3141,6 +3142,7 @@ def _generate_batch(
         resize_shape=resize_shape,
         add_special_tokens=add_special_tokens,
         pad_to_uniform_size=False,  # Since images are pre-grouped by shape, they're already uniform size
+        processor_kwargs=processor_kwargs,
     )
     input_ids = inputs.get("input_ids", None)
     pixel_values = inputs.get("pixel_values", None)
