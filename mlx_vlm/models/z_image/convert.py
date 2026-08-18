@@ -48,6 +48,22 @@ def _load_safetensors(directory: Path) -> dict[str, mx.array]:
     return weights
 
 
+def _sanitize_vae_for_conversion(
+    directory: Path,
+    weights: dict[str, mx.array],
+) -> dict[str, mx.array]:
+    index_path = directory / "model.safetensors.index.json"
+    metadata = (
+        json.loads(index_path.read_text()).get("metadata", {})
+        if index_path.exists()
+        else {}
+    )
+    return sanitize_vae_weights(
+        weights,
+        source_layout=(False if metadata.get("mlx_vlm_format") == "z_image" else None),
+    )
+
+
 def _cast_weights(weights: dict[str, mx.array], dtype: mx.Dtype) -> dict[str, mx.array]:
     return {
         key: value.astype(dtype) if mx.issubdtype(value.dtype, mx.floating) else value
@@ -164,7 +180,11 @@ def convert_z_image(
             lambda: ZImageTextEncoder(config.text_encoder),
             sanitize_text_encoder_weights,
         ),
-        ("vae", lambda: ZImageVAE(config.vae), sanitize_vae_weights),
+        (
+            "vae",
+            lambda: ZImageVAE(config.vae),
+            lambda weights: _sanitize_vae_for_conversion(source / "vae", weights),
+        ),
     )
 
     for name, make_model, sanitizer in component_specs:

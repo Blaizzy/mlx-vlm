@@ -23,7 +23,11 @@ from mlx_vlm.models.z_image.config import (
     ZImageVAEConfig,
     detect_z_image_layout,
 )
-from mlx_vlm.models.z_image.convert import _save_component, is_z_image_model_path
+from mlx_vlm.models.z_image.convert import (
+    _sanitize_vae_for_conversion,
+    _save_component,
+    is_z_image_model_path,
+)
 from mlx_vlm.models.z_image.model import ZImageGenerationModel
 from mlx_vlm.models.z_image.pipeline import ZImagePipeline
 from mlx_vlm.models.z_image.text_encoder import (
@@ -462,6 +466,23 @@ def test_sanitize_source_vae_weights() -> None:
         converted["encoder.conv_in.weight"],
         sanitized["encoder.conv_in.weight"],
     )
+
+
+def test_conversion_preserves_native_vae_layout(tmp_path: Path) -> None:
+    native = mx.zeros((8, 3, 3, 4))
+    vae_path = tmp_path / "vae"
+    vae_path.mkdir()
+    (vae_path / "model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {"mlx_vlm_format": "z_image"}})
+    )
+
+    converted = _sanitize_vae_for_conversion(
+        vae_path,
+        {"encoder.conv_in.weight": native},
+    )
+
+    assert converted["encoder.conv_in.weight"].shape == native.shape
+    assert mx.array_equal(converted["encoder.conv_in.weight"], native)
 
 
 @pytest.mark.parametrize("width,height", [(0, 512), (513, 512), (512, 513)])
