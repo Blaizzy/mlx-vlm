@@ -15270,6 +15270,130 @@ class TestMoEOffload(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def test_repack_sanitizes_raw_mixtral_style_expert_naming(self):
+        """MiniMax's real upstream checkpoint uses Mixtral-style per-expert
+        ``block_sparse_moe.experts.{e}.{w1,w2,w3}.weight`` naming, not the
+        ``experts.{e}.{gate,up,down}_proj.weight`` convention plan() expects
+        directly -- repack() must fall back to the model's own sanitize()
+        (already used for regular, non-offload loading) to normalize it
+        first. Regression coverage for two real bugs caught building that
+        fallback: (1) calling sanitize() on a later layer's tensors alone,
+        with no layer-0 key present at all, silently no-ops for any
+        sanitize() that gates its whole MoE-restructuring block on "is
+        layer 0's raw key present" as a one-shot global probe rather than a
+        true per-layer guard (minimax's does) -- both layers must still be
+        offloaded, not just layer 0; (2) some models put the real
+        restructuring on Model.sanitize() and delegate to LanguageModel from
+        inside it (minimax doesn't even re-export LanguageModel from its
+        __init__.py), so calling only one step misses the other's family."""
+        import dataclasses
+        import json
+        import os
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models import minimax
+        from mlx_vlm.moe_offload import repack
+        from mlx_vlm.utils import load_model, save_weights
+
+        config = minimax.ModelConfig(
+            model_type="minimax_m2",
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            max_position_embeddings=256,
+            num_experts_per_tok=2,
+            num_local_experts=4,
+            shared_intermediate_size=128,
+            num_hidden_layers=2,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            rotary_dim=16,
+            vocab_size=256,
+            head_dim=16,
+        )
+        model = minimax.Model(config)
+        mx.eval(model.parameters())
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            build_prefixed = os.path.join(tmp_dir, "build_prefixed")
+            build_raw = os.path.join(tmp_dir, "build_raw")
+            offload_raw = os.path.join(tmp_dir, "offload_raw")
+
+            save_weights(build_prefixed, model)
+            weights = {}
+            for fn in sorted(os.listdir(build_prefixed)):
+                if fn.endswith(".safetensors"):
+                    weights.update(mx.load(os.path.join(build_prefixed, fn)))
+
+            # Invert LanguageModel.sanitize()'s w1/w2/w3 -> switch_mlp
+            # stacking, to reconstruct MiniMax-M2's genuine raw (Mixtral-
+            # style) upstream checkpoint from this already-canonical model.
+            mapping = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+            raw_weights = {}
+            for k, v in weights.items():
+                handled = False
+                for new_name, orig_name in mapping.items():
+                    suffix = f".block_sparse_moe.switch_mlp.{new_name}.weight"
+                    if k.startswith("language_model.") and suffix in k:
+                        layer_prefix = k[len("language_model.") :].split(
+                            ".block_sparse_moe"
+                        )[0]
+                        for e in range(v.shape[0]):
+                            raw_weights[
+                                f"{layer_prefix}.block_sparse_moe.experts.{e}.{orig_name}.weight"
+                            ] = v[e]
+                        handled = True
+                        break
+                if not handled:
+                    k2 = (
+                        k[len("language_model.") :]
+                        if k.startswith("language_model.")
+                        else k
+                    )
+                    raw_weights[k2] = v
+
+            os.makedirs(build_raw, exist_ok=True)
+            mx.save_safetensors(
+                os.path.join(build_raw, "model.safetensors"), raw_weights
+            )
+            with open(os.path.join(build_raw, "config.json"), "w") as f:
+                json.dump(dataclasses.asdict(config), f)
+
+            repack(build_raw, offload_raw)
+
+            idx = json.load(open(os.path.join(offload_raw, "offload_index.json")))
+            self.assertEqual(
+                idx["layers"],
+                [0, 1],
+                "layer 1 was silently skipped -- sanitize() was only called "
+                "with layer 1's own tensors, tripping a global layer-0 guard",
+            )
+            self.assertEqual(idx["num_experts"], 4)
+
+            prompt = mx.array([[1, 2, 3, 4, 5]])
+            logits_true = model(prompt).logits
+            mx.eval(logits_true)
+
+            offload_model = load_model(Path(offload_raw))
+            store = getattr(offload_model, "moe_offload_store", None)
+            self.assertIsNotNone(
+                store, "load_model did not auto-patch the sanitize-fallback offload dir"
+            )
+            logits_offload = offload_model(prompt).logits
+            mx.eval(logits_offload)
+
+            diff = mx.abs(logits_true - logits_offload).max().item()
+            rel = diff / float(mx.abs(logits_true).max())
+            self.assertLess(
+                rel, 0.02, f"sanitize-fallback offload output diverged: {rel:.4f}"
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
 
 class TestCohereCompass(unittest.TestCase):
     def test_released_text_config_defaults_and_per_layer_rope(self):

@@ -86,6 +86,131 @@ def _check_disk_headroom(build: str, out: str, margin: float = 2.0) -> None:
         )
 
 
+_LAYER_IDX_RE = re.compile(r"\.layers\.(\d+)\.")
+
+
+def _group_raw_names_by_layer(names) -> dict:
+    """Buckets raw tensor names by transformer layer index (parsed from a
+    generic ``.layers.N.`` substring, present regardless of vendor-specific
+    expert naming), so the ``sanitize()`` fallback in ``repack()`` can process
+    one layer's tensors at a time instead of needing the whole checkpoint in
+    memory. Names with no such substring (embeddings, final norm, lm_head,
+    vision/audio towers, ...) group under ``None`` -- every ``sanitize()``
+    checked here leaves those unchanged, and ``plan()`` always classifies
+    them resident regardless."""
+    groups: dict = {}
+    for n in names:
+        m = _LAYER_IDX_RE.search(n)
+        key = int(m.group(1)) if m else None
+        groups.setdefault(key, []).append(n)
+    return groups
+
+
+def _get_language_sanitizer(config: dict):
+    """A ``weights -> weights`` callable that mirrors
+    ``mlx_vlm.utils.load_model()``'s own sanitize sequence exactly: the
+    top-level ``Model.sanitize()`` (if the model defines one), then
+    ``LanguageModel.sanitize()`` (if the model exposes one) -- the same two
+    steps, in the same order, ``load_model()`` already applies for regular
+    (non-offload) loading. Returns ``None`` if the model type can't be
+    resolved or neither step is available.
+
+    This is why ``plan()``'s generic regex doesn't need (and shouldn't grow)
+    per-vendor special cases: a checkpoint using Mixtral-style ``w1/w2/w3``
+    naming, gpt-oss's fused MXFP4 ``blocks``/``scales`` layout, or Llama4's
+    headerless fused expert tensor is already normalized into the same
+    ``experts.J.gate_proj.weight`` convention by that model's own file, under
+    its own model path -- ``repack()`` was just never calling it.
+
+    Both steps matter, not just one: some packages put the MoE-restructuring
+    logic on ``Model.sanitize()`` and delegate to ``LanguageModel`` from
+    inside it (e.g. ``minimax``, which doesn't even re-export
+    ``LanguageModel`` from its ``__init__.py``); others (e.g. Llama4, which
+    is natively multimodal on the HF side too, so its raw checkpoint already
+    carries the ``language_model.`` prefix ``Model.sanitize()`` exists to add
+    elsewhere) define no ``Model.sanitize()`` at all and put everything on
+    ``LanguageModel`` instead. Calling only one of the two silently misses
+    the other's model family. Building the full ``Model`` (with a vision
+    tower, for a model like Llama4) costs nothing extra here: MLX's laziness
+    means an unevaluated skeleton's placeholder weights are never
+    materialized, only sanitize()'s own transforms on the real loaded
+    weights are.
+    """
+    from .utils import get_model_and_args, sanitize_weights, update_module_configs
+
+    try:
+        model_class, _ = get_model_and_args(config=dict(config))
+    except KeyError:
+        return None
+
+    has_model_sanitize = hasattr(model_class, "Model") and hasattr(
+        model_class.Model, "sanitize"
+    )
+    has_language_sanitize = hasattr(model_class, "LanguageModel") and hasattr(
+        model_class.LanguageModel, "sanitize"
+    )
+    if not has_model_sanitize and not has_language_sanitize:
+        return None
+
+    cfg = dict(config)
+    cfg.setdefault("text_config", cfg.pop("llm_config", {}))
+    cfg.setdefault("vision_config", {})
+    cfg.setdefault("audio_config", {})
+    model_config = model_class.ModelConfig.from_dict(cfg)
+    model_config = update_module_configs(
+        model_config,
+        model_class,
+        cfg,
+        ["text", "vision", "perceiver", "projector", "audio"],
+    )
+    model = model_class.Model(model_config) if has_model_sanitize else None
+    text_config = getattr(model_config, "text_config", None) or model_config
+
+    def sanitize(weights: dict) -> dict:
+        if model is not None:
+            weights = model.sanitize(weights)
+        if has_language_sanitize:
+            weights = sanitize_weights(model_class.LanguageModel, weights, text_config)
+        return weights
+
+    return sanitize
+
+
+def _expand_expert_layer(entries, get_value) -> Tuple[dict, int]:
+    """Builds one layer's ``{e{j}.{proj}.{kind}: array}`` dict from ``plan()``'s
+    entries for that layer, un-stacking STACK/STACK_FUSED tensors into
+    per-expert slices. ``get_value(src)`` fetches the (possibly lazy) array
+    for a raw/sanitized source name -- the caller decides how, so this same
+    expansion logic serves both repack()'s fast path (load on demand from the
+    original checkpoint) and its sanitize() fallback (index into an
+    already-sanitized in-memory dict)."""
+    layer = {}
+    n_experts = 0
+    for key, src, mode in entries:
+        arr = get_value(src)
+        if mode == "STACK":
+            E = arr.shape[0]
+            n_experts = max(n_experts, E)
+            mm = STACKED_RE.match(src)
+            for j in range(E):
+                layer[f"e{j}.{mm['proj']}.{mm['kind']}"] = arr[j]
+        elif mode == "STACK_FUSED":
+            # gate = first half of axis 1 (the doubled output dim), up = second.
+            E = arr.shape[0]
+            half = arr.shape[1] // 2
+            n_experts = max(n_experts, E)
+            mm = STACKED_FUSED_RE.match(src)
+            kind = mm["kind"]
+            gate_half, up_half = arr[:, :half, ...], arr[:, half:, ...]
+            for j in range(E):
+                layer[f"e{j}.gate_proj.{kind}"] = gate_half[j]
+                layer[f"e{j}.up_proj.{kind}"] = up_half[j]
+        else:
+            layer[key] = arr
+            n_experts = max(n_experts, int(key[1:].split(".")[0]) + 1)
+    return layer, n_experts
+
+
 def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
     """Memory-bounded repack (streams shard-by-shard so it runs on constrained
     RAM, e.g. a 16 GB mini). Uses the safetensors index if present, else globs
@@ -112,7 +237,6 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
             fname = os.path.basename(f)
             wmap.update({k: fname for k in mx.load(f)})
     p = plan(list(wmap))
-    resident_set = set(p["resident"])
 
     def clear():
         gc.collect()
@@ -121,10 +245,6 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
         except Exception:
             pass
 
-    # ---- RESIDENT: stream shards -> sharded resident-*.safetensors (peak ~ one shard + buffer)
-    by_shard = {}
-    for n in wmap:
-        by_shard.setdefault(wmap[n], []).append(n)
     buf, buf_bytes, ri, res_index = {}, 0, 0, {}
 
     def flush_resident():
@@ -140,60 +260,136 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
         buf, buf_bytes = {}, 0
         clear()
 
-    for shard, tns in by_shard.items():
-        need = [n for n in tns if n in resident_set]
-        if not need:
-            continue
-        w = mx.load(os.path.join(build, shard))
-        for n in need:
-            buf[n] = w[n]
-            buf_bytes += w[n].nbytes
-            if buf_bytes >= resident_shard_gb * 1e9:
-                flush_resident()
-        del w
-        clear()
-    flush_resident()
-    print(f"resident: {len(res_index)} tensors in {ri} shards", flush=True)
+    def add_resident(name, value):
+        nonlocal buf_bytes
+        buf[name] = value
+        buf_bytes += value.nbytes
+        if buf_bytes >= resident_shard_gb * 1e9:
+            flush_resident()
 
-    # ---- EXPERTS: per layer, load only the needed shards, split, free (peak ~ a few shards)
-    n_experts = None
-    for lid, entries in sorted(p["experts"].items()):
-        layer = {}
-        for key, src, mode in entries:
-            w = mx.load(os.path.join(build, wmap[src]))  # re-mmap on demand
-            arr = w[src]
-            if mode == "STACK":
-                E = arr.shape[0]
-                n_experts = max(n_experts or 0, E)
-                mm = STACKED_RE.match(src)
-                for j in range(E):
-                    layer[f"e{j}.{mm['proj']}.{mm['kind']}"] = arr[j]
-            elif mode == "STACK_FUSED":
-                # gate = first half of axis 1 (the doubled output dim), up = second.
-                E = arr.shape[0]
-                half = arr.shape[1] // 2
-                n_experts = max(n_experts or 0, E)
-                mm = STACKED_FUSED_RE.match(src)
-                kind = mm["kind"]
-                gate_half, up_half = arr[:, :half, ...], arr[:, half:, ...]
-                for j in range(E):
-                    layer[f"e{j}.gate_proj.{kind}"] = gate_half[j]
-                    layer[f"e{j}.up_proj.{kind}"] = up_half[j]
-            else:
-                layer[key] = arr
-                n_experts = max(n_experts or 0, int(key[1:].split(".")[0]) + 1)
-            del w
+    def write_expert_layer(lid, entries, get_value) -> int:
+        layer, e_count = _expand_expert_layer(entries, get_value)
         mx.eval(list(layer.values()))
         mx.save_safetensors(
             os.path.join(out, "experts", f"layer_{lid:04d}.safetensors"),
             layer,
             metadata={"format": "mlx"},
         )
-        layer = None
         clear()
-        if lid % 8 == 0:
-            print(f"  experts: layer {lid} done", flush=True)
-    print(f"experts: {len(p['layers'])} MoE layers x {n_experts} experts", flush=True)
+        return e_count
+
+    n_experts = None
+    written_layers = []
+
+    if p["layers"]:
+        # ---- FAST PATH: raw checkpoint names already match plan()'s convention
+        # directly (true for DeepSeek/Kimi-K2, GLM's glm4_moe, Qwen3-MoE, and
+        # ERNIE4.5-MoE checked against their real upstream checkpoints). RESIDENT:
+        # stream shards -> sharded resident-*.safetensors (peak ~ one shard + buffer).
+        resident_set = set(p["resident"])
+        by_shard = {}
+        for n in wmap:
+            by_shard.setdefault(wmap[n], []).append(n)
+
+        for shard, tns in by_shard.items():
+            need = [n for n in tns if n in resident_set]
+            if not need:
+                continue
+            w = mx.load(os.path.join(build, shard))
+            for n in need:
+                add_resident(n, w[n])
+            del w
+            clear()
+        flush_resident()
+        print(f"resident: {len(res_index)} tensors in {ri} shards", flush=True)
+
+        # EXPERTS: per layer, load only the needed shards, split, free (peak ~ a few shards)
+        for lid, entries in sorted(p["experts"].items()):
+            e_count = write_expert_layer(
+                lid, entries, lambda src: mx.load(os.path.join(build, wmap[src]))[src]
+            )
+            n_experts = max(n_experts or 0, e_count)
+            written_layers.append(lid)
+            if lid % 8 == 0:
+                print(f"  experts: layer {lid} done", flush=True)
+        print(
+            f"experts: {len(written_layers)} MoE layers x {n_experts} experts",
+            flush=True,
+        )
+    else:
+        # ---- FALLBACK: raw names don't match plan()'s convention (a different
+        # upstream naming scheme -- Mixtral-style w1/w2/w3, gpt-oss's fused
+        # MXFP4 blocks, Llama4's headerless fused tensor, ...). Every one of
+        # these is already handled by the target model's own LanguageModel
+        # .sanitize() (see _get_language_sanitizer) -- repack() just wasn't
+        # routing through it. Sanitize one transformer layer's raw tensors at
+        # a time (bounded memory, and safe: every sanitize() checked here
+        # guards each rewrite on "is this key present", so a partial-layer
+        # dict is processed correctly), then classify+write exactly like the
+        # fast path above, just fed from sanitized names/values.
+        print(
+            "repack: raw checkpoint names don't match the offload convention "
+            "directly; falling back to the model's own sanitize()",
+            flush=True,
+        )
+        config = json.load(open(os.path.join(build, "config.json")))
+        sanitize = _get_language_sanitizer(config)
+        if sanitize is None:
+            raise ValueError(
+                f"moe_offload.repack: {build!r}'s checkpoint doesn't match the "
+                "expected expert tensor naming, and no LanguageModel.sanitize() "
+                f"was found for model_type {config.get('model_type')!r} to "
+                "normalize it. This model's MoE layout isn't supported for "
+                "offloading yet."
+            )
+
+        groups = _group_raw_names_by_layer(wmap)
+
+        def load_names(names):
+            return {n: mx.load(os.path.join(build, wmap[n]))[n] for n in names}
+
+        # Some sanitize() implementations (e.g. minimax's) gate their entire
+        # MoE-restructuring block on "is layer 0's raw expert key present" --
+        # a cheap one-shot global probe, not a true per-layer guard. Calling
+        # sanitize() on a later layer's tensors alone, with no layer-0 key at
+        # all, would silently trip that guard's negative branch and return
+        # them unchanged rather than restructured. Carry layer 0's own raw
+        # tensors alongside every other group's call so any such guard is
+        # satisfied; the output then also contains layer 0's own
+        # (correctly, redundantly) re-sanitized entries, so filter each
+        # call's output back down to just the group actually being written.
+        probe_names = groups.get(0, [])
+        probe_raw = load_names(probe_names) if probe_names else {}
+
+        for lid in sorted(groups, key=lambda k: (k is None, k)):
+            names = groups[lid]
+            raw = load_names(names)
+            merged = {**probe_raw, **raw} if (lid != 0 and probe_raw) else raw
+            sanitized = sanitize(dict(merged))
+            del raw, merged
+            gp = plan(list(sanitized))
+            for n in gp["resident"]:
+                m = _LAYER_IDX_RE.search(n)
+                n_layer = int(m.group(1)) if m else None
+                if n_layer is not None and n_layer != lid:
+                    continue  # leaked from the layer-0 probe
+                add_resident(n, sanitized[n])
+            for glid, entries in sorted(gp["experts"].items()):
+                if glid != lid:
+                    continue  # leaked from the layer-0 probe
+                e_count = write_expert_layer(glid, entries, lambda src: sanitized[src])
+                n_experts = max(n_experts or 0, e_count)
+                written_layers.append(glid)
+            sanitized = None
+            clear()
+            if lid is not None and lid % 8 == 0:
+                print(f"  layer {lid} done", flush=True)
+        flush_resident()
+        print(f"resident: {len(res_index)} tensors in {ri} shards", flush=True)
+        print(
+            f"experts: {len(written_layers)} MoE layers x {n_experts} experts",
+            flush=True,
+        )
 
     import shutil
 
@@ -213,7 +409,7 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
             )
     json.dump(
-        {"layers": p["layers"], "num_experts": n_experts},
+        {"layers": sorted(written_layers), "num_experts": n_experts},
         open(os.path.join(out, "offload_index.json"), "w"),
         indent=2,
     )
