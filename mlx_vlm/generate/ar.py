@@ -52,6 +52,19 @@ DEFAULT_REPETITION_CONTEXT_SIZE = 20
 DEFAULT_PREFILL_STEP_SIZE = 2048
 
 
+def _take_prompt_cache_checkpoint(callback, prefix_len: int, prompt_cache) -> None:
+    """Hand the cache to ``callback``, and keep generating if it refuses.
+
+    A checkpoint only buys a later request some prefill. Losing one costs
+    nothing the caller asked for, so a failure here must not take the request
+    with it.
+    """
+    try:
+        callback(prefix_len, prompt_cache)
+    except Exception as e:
+        logger.warning("APC prompt-cache checkpoint at %d failed: %s", prefix_len, e)
+
+
 def _prompt_cache_checkpoint_lens(
     callback: Optional[Callable[[int, List[Any]], None]],
     lens: Optional[Union[int, Sequence[int]]],
@@ -484,7 +497,11 @@ def generate_step(
                         and checkpoint_lens[checkpoint_index] <= processed_tokens
                     ):
                         if checkpoint_lens[checkpoint_index] == processed_tokens:
-                            prompt_cache_checkpoint(processed_tokens, prompt_cache)
+                            _take_prompt_cache_checkpoint(
+                                prompt_cache_checkpoint,
+                                processed_tokens,
+                                prompt_cache,
+                            )
                         checkpoint_index += 1
                     inputs_embeds = inputs_embeds[:, n_to_process:]
                     input_ids = input_ids[:, n_to_process:]
@@ -499,7 +516,9 @@ def generate_step(
             and checkpoint_lens[checkpoint_index] <= prefill_total
         ):
             if checkpoint_lens[checkpoint_index] == prefill_total:
-                prompt_cache_checkpoint(prefill_total, prompt_cache)
+                _take_prompt_cache_checkpoint(
+                    prompt_cache_checkpoint, prefill_total, prompt_cache
+                )
             checkpoint_index += 1
 
     mx.async_eval(y, logprobs)

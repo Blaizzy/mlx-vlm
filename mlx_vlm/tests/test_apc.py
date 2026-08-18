@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import os
 import shutil
 import subprocess
@@ -2181,3 +2182,57 @@ def test_positive_desired_prefix_is_unchanged():
     tokens = list(range(1, 100))
 
     assert apc_module.adjust_prefix_to_text_suffix_boundary(tokens, 40, []) == 40
+
+
+def test_composite_state_store_survives_concurrent_writers():
+    """The store replaced a cache that held the manager lock on every path.
+
+    Its own dict and sorted length index have to be guarded, or two requests
+    checkpointing at once leave the index disagreeing with the entries.
+    """
+    import threading as _threading
+
+    manager = APCManager(num_blocks=64, block_size=16)
+    store = manager.composite_state
+    errors = []
+
+    def writer(base):
+        try:
+            for i in range(40):
+                store.store(list(range(base + i, base + i + 48)), _state_entries())
+                store.lookup(list(range(base + i, base + i + 96)))
+        except Exception as e:  # pragma: no cover - only on a race
+            errors.append(e)
+
+    threads = [
+        _threading.Thread(target=writer, args=(b,)) for b in (0, 500, 1000, 1500)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    expected = collections.Counter(len(e.token_ids) for e in store._entries.values())
+    assert store._lengths == sorted(expected)
+    assert store._counts == dict(expected)
+    assert len(store) == len(store._entries)
+
+
+def test_a_failing_checkpoint_does_not_stop_generation():
+    """A checkpoint only saves a later request some prefill.
+
+    Losing one costs nothing that was asked for, so it must not surface as a
+    failed request.
+    """
+    from mlx_vlm.generate.ar import _take_prompt_cache_checkpoint
+
+    calls = []
+
+    def explode(prefix_len, prompt_cache):
+        calls.append(prefix_len)
+        raise RuntimeError("cache store failed")
+
+    _take_prompt_cache_checkpoint(explode, 128, [])
+
+    assert calls == [128]

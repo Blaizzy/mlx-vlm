@@ -494,18 +494,24 @@ class CompositeStateStore:
 
     def __init__(self, block_size: int) -> None:
         self.block_size = int(block_size)
+        self._lock = threading.RLock()
         self._entries: "OrderedDict[int, APCExactCacheEntry]" = OrderedDict()
         self._bytes: Dict[int, int] = {}
         self._lengths: List[int] = []
         self._counts: Dict[int, int] = {}
         self.resident_bytes = 0
 
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
     def clear(self) -> None:
-        self._entries.clear()
-        self._bytes.clear()
-        self._lengths.clear()
-        self._counts.clear()
-        self.resident_bytes = 0
+        with self._lock:
+            self._entries.clear()
+            self._bytes.clear()
+            self._lengths.clear()
+            self._counts.clear()
+            self.resident_bytes = 0
 
     def _index_add(self, length: int) -> None:
         count = self._counts.get(length, 0)
@@ -545,6 +551,16 @@ class CompositeStateStore:
             return False
         cost = checkpoint_state_bytes(copied, range(len(copied)))
         key = _sequence_hash(token_tuple, extra_hash, self.block_size)
+        if budget_bytes is None:
+            budget_bytes = _checkpoint_budget_bytes()
+        with self._lock:
+            return self._store_locked(
+                token_tuple, copied, cost, key, extra_hash, budget_bytes
+            )
+
+    def _store_locked(
+        self, token_tuple, copied, cost, key, extra_hash, budget_bytes
+    ) -> bool:
         self._drop(key)
         self._entries[key] = APCExactCacheEntry(
             token_ids=token_tuple,
@@ -556,8 +572,6 @@ class CompositeStateStore:
         self._bytes[key] = cost
         self.resident_bytes += cost
         self._index_add(len(token_tuple))
-        if budget_bytes is None:
-            budget_bytes = _checkpoint_budget_bytes()
         while self.resident_bytes > budget_bytes and len(self._entries) > 1:
             self._drop(next(iter(self._entries)))
         return True
@@ -575,6 +589,14 @@ class CompositeStateStore:
             max_len = min(max_len, int(max_prefix_tokens))
         if max_len <= min_prefix_tokens or not self._entries:
             return None, 0
+        with self._lock:
+            return self._lookup_locked(
+                token_tuple, extra_hash, max_len, min_prefix_tokens
+            )
+
+    def _lookup_locked(
+        self, token_tuple, extra_hash, max_len, min_prefix_tokens
+    ) -> Tuple[Optional[List[Any]], int]:
         upper = bisect.bisect_right(self._lengths, max_len)
         lower = bisect.bisect_right(self._lengths, min_prefix_tokens)
         token_array = np.asarray(token_tuple, dtype=np.int32)
@@ -3868,7 +3890,7 @@ class APCManager:
             snap["resident_bytes"] = self._resident_bytes_locked()
             snap["composite_declines"] = dict(self._composite_declines)
             snap["composite_state_bytes"] = self.composite_state.resident_bytes
-            snap["composite_state_entries"] = len(self.composite_state._entries)
+            snap["composite_state_entries"] = len(self.composite_state)
             snap["last_reuse_tokens"] = self._last_reuse_tokens
             if self.disk is not None:
                 snap["disk_bytes"] = self.disk.disk_bytes
