@@ -14,6 +14,7 @@ import mlx.core as mx
 from fastapi import HTTPException
 
 from .. import apc as _apc
+from .._stream_cleanup import clear_mlx_streams
 from ..generate import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
@@ -1726,6 +1727,12 @@ class ResponseGenerator:
         return pending, should_stop
 
     def _run(self):
+        try:
+            self._run_impl()
+        finally:
+            clear_mlx_streams()
+
+    def _run_impl(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
         try:
             self._initialize_model()
