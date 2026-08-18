@@ -60,8 +60,8 @@ class ImageGenerationRequest:
     prompt: str
     seed: int | None = None
     steps: int | None = None
-    width: int = 512
-    height: int = 512
+    width: int | None = None
+    height: int | None = None
     guidance: float | None = None
     output_format: Literal["png"] = DEFAULT_IMAGE_FORMAT
     extra: dict[str, Any] = field(default_factory=dict)
@@ -166,6 +166,7 @@ def _model_type_from_id(model: str) -> str:
         "mageflow": "mage_flow",
         "z": "z_image",
         "zimage": "z_image",
+        "ernie": "ernie_image",
     }.get(model_type, model_type)
 
 
@@ -269,6 +270,13 @@ def _image_model_type_from_component_indexes(root: Path) -> str | None:
     }
     if z_image_markers <= keys:
         return "z_image"
+    ernie_image_markers = {
+        "adaln_modulation.weight",
+        "final_norm.linear.weight",
+        "layers.0.adaLN_sa_ln.weight",
+    }
+    if ernie_image_markers <= keys:
+        return "ernie_image"
     return None
 
 
@@ -537,10 +545,18 @@ def generate_image(
                 prompt=request.prompt,
                 image_paths=tuple(image_paths),
                 seed=request.seed,
-                steps=request.steps,
+                steps=(
+                    DEFAULT_IMAGE_STEPS
+                    if request.steps is None
+                    else request.steps
+                ),
                 width=request.width,
                 height=request.height,
-                guidance=request.guidance,
+                guidance=(
+                    DEFAULT_IMAGE_GUIDANCE
+                    if request.guidance is None
+                    else request.guidance
+                ),
                 output_format=request.output_format,
                 extra=dict(request.extra),
             )
@@ -561,6 +577,28 @@ def generate_image(
 
     if request.seed is None:
         request = replace(request, seed=random.randrange(2**32))
+    if request.width is None:
+        request = replace(
+            request,
+            width=int(getattr(model, "default_width", 512)),
+        )
+    if request.height is None:
+        request = replace(
+            request,
+            height=int(getattr(model, "default_height", 512)),
+        )
+    if request.steps is None:
+        request = replace(
+            request,
+            steps=int(getattr(model, "default_steps", DEFAULT_IMAGE_STEPS)),
+        )
+    if request.guidance is None:
+        request = replace(
+            request,
+            guidance=float(
+                getattr(model, "default_guidance", DEFAULT_IMAGE_GUIDANCE)
+            ),
+        )
 
     data = model.generate(request)
     if output_path is not None:
@@ -654,10 +692,14 @@ def run_image_generation_cli(args: Any) -> None:
             prompt=prompt,
             image_paths=tuple(args.image),
             seed=seed,
-            steps=steps,
+            steps=DEFAULT_IMAGE_STEPS if steps is None else steps,
             width=width,
             height=height,
-            guidance=args.guidance,
+            guidance=(
+                DEFAULT_IMAGE_GUIDANCE
+                if args.guidance is None
+                else args.guidance
+            ),
             extra=dict(getattr(args, "gen_kwargs", {}) or {}),
         )
         result = generate_image(
@@ -667,13 +709,18 @@ def run_image_generation_cli(args: Any) -> None:
             output_path=output_path,
         )
     else:
-        width, height = parse_size(getattr(args, "size", None) or DEFAULT_IMAGE_SIZE)
+        model = load_image_model(args.model, task="generate", **load_kwargs)
+        size = getattr(args, "size", None)
+        if size is None:
+            width = int(getattr(model, "default_width", 512))
+            height = int(getattr(model, "default_height", 512))
+        else:
+            width, height = parse_size(size)
         output_path = (
             Path(args.output).expanduser()
             if args.output is not None
             else Path("outputs") / f"image-{seed}.png"
         )
-        model = load_image_model(args.model, task="generate", **load_kwargs)
         extra = dict(getattr(args, "gen_kwargs", {}) or {})
         prompt_expansion_model = getattr(args, "prompt_expansion_model", None)
         if prompt_expansion_model is not None:

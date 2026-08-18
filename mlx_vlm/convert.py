@@ -300,6 +300,36 @@ def convert(
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
+    from .models.ernie_image.convert import (
+        convert_ernie_image,
+        is_ernie_image_checkpoint,
+    )
+
+    if is_ernie_image_checkpoint(model_path):
+        if dequantize:
+            raise ValueError(
+                "ERNIE-Image conversion does not support --dequantize"
+            )
+        if quant_method != "rtn":
+            raise ValueError(
+                "ERNIE-Image conversion supports RTN quantization only"
+            )
+        if quant_predicate is not None:
+            raise ValueError(
+                "ERNIE-Image conversion does not support mixed-bit recipes"
+            )
+        return convert_ernie_image(
+            model_path,
+            mlx_path,
+            source_id=None if Path(hf_path).exists() else hf_path,
+            quantize=quantize,
+            q_group_size=q_group_size,
+            q_bits=q_bits,
+            q_mode=q_mode,
+            dtype=dtype,
+            upload_repo=upload_repo,
+            revision=revision,
+        )
     model, config, processor = fetch_from_hub(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )

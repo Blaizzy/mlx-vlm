@@ -14,7 +14,11 @@ from ..generate import (
     DEFAULT_TOP_P,
     normalize_resize_shape,
 )
-from ..generate.image import DEFAULT_IMAGE_SIZE
+from ..generate.image import (
+    DEFAULT_IMAGE_GUIDANCE,
+    DEFAULT_IMAGE_SIZE,
+    DEFAULT_IMAGE_STEPS,
+)
 
 
 def get_server_max_tokens():
@@ -38,15 +42,18 @@ class ImageGenerationRequest(FlexibleBaseModel):
     )
     n: int = Field(1, ge=1, le=10, description="Number of images to generate.")
     size: Optional[str] = Field(
-        DEFAULT_IMAGE_SIZE,
-        description="Image size as WIDTHxHEIGHT. Width/height fields override this.",
+        None,
+        description=(
+            "Image size as WIDTHxHEIGHT. Width/height fields override this; "
+            "otherwise the selected model's default is used."
+        ),
     )
     width: Optional[int] = Field(None, description="Generated image width.")
     height: Optional[int] = Field(None, description="Generated image height.")
     steps: Optional[int] = Field(
         None,
         ge=1,
-        description="Number of image generation inference steps; model default if omitted.",
+        description="Inference steps. Defaults to the selected model's recommendation.",
     )
     seed: Optional[int] = Field(
         None,
@@ -54,7 +61,7 @@ class ImageGenerationRequest(FlexibleBaseModel):
     )
     guidance: Optional[float] = Field(
         None,
-        description="Classifier-free guidance scale; model default if omitted.",
+        description="CFG scale. Defaults to the selected model's recommendation.",
     )
     auto_json_caption: Optional[bool] = Field(
         None,
