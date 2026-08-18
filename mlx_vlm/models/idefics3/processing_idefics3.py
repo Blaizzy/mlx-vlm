@@ -100,6 +100,11 @@ class Idefics3Processor(ProcessorMixin):
     image_processor_class = "AutoImageProcessor"
     tokenizer_class = "AutoTokenizer"
 
+    @property
+    def additional_eos_token_ids(self):
+        token_id = self.tokenizer.convert_tokens_to_ids(self.end_of_utterance_token)
+        return [token_id] if token_id is not None else []
+
     def __init__(
         self,
         image_processor,
