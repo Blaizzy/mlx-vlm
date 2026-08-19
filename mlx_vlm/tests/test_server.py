@@ -57,6 +57,20 @@ def test_response_generator_prefill_step_override_wins_over_environment(monkeypa
     assert overridden_generator.prefill_step_size == 3072
 
 
+def test_response_generator_clears_worker_streams(monkeypatch):
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    error = RuntimeError("worker failed")
+    gen._run_impl = MagicMock(side_effect=error)
+    clear_streams = MagicMock()
+    monkeypatch.setattr(server_generation, "clear_mlx_streams", clear_streams)
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        gen._run()
+
+    gen._run_impl.assert_called_once_with()
+    clear_streams.assert_called_once_with()
+
+
 _MUSE_RESPONSE_TEMPLATE = {
     "defaults": {"role": "assistant"},
     "fields": {
@@ -5754,7 +5768,7 @@ class TestResponseGenerator:
         gen._run_speculative = lambda: pytest.fail("MTP should use BatchGenerator")
         gen._collect_pending_requests = fake_collect_pending_requests
 
-        gen._run()
+        gen._run_impl()
 
         assert calls == [(False, 0.037)]
 
@@ -7348,6 +7362,41 @@ class TestCountThinkingTagTokens:
 
     def test_no_tags(self):
         assert server._count_thinking_tag_tokens("plain text") == 0
+
+
+class TestQuantizedKVBits:
+    def test_kv_bits_unset_returns_none(self, monkeypatch):
+        monkeypatch.delenv("KV_BITS", raising=False)
+        assert server_generation.get_quantized_kv_bits() is None
+
+    def test_kv_bits_applies(self, monkeypatch):
+        monkeypatch.setenv("KV_BITS", "3.5")
+        assert server_generation.get_quantized_kv_bits() == 3.5
+
+    @pytest.mark.parametrize(
+        "model_path",
+        [
+            "mlx-community/gemma-4-31B-it-qat-mxfp4",
+            "mlx-community/gemma-4-31B-it-QAT-mxfp4",
+            "/models/qat-experiments/llama-3",
+            "some-org/qatar-news-llm",
+        ],
+    )
+    def test_kv_bits_not_suppressed_by_model_path(self, monkeypatch, model_path):
+        # KV cache quantization is independent of how the weights were trained,
+        # so nothing in the model path may suppress it (#1333).
+        monkeypatch.setenv("KV_BITS", "3.5")
+        monkeypatch.setenv("MAX_KV_SIZE", "0")
+        assert server_generation.get_quantized_kv_bits() == 3.5
+        assert server_generation.get_max_kv_size(model_path) is None
+
+    def test_split_bits_agree_with_uniform_bits(self, monkeypatch):
+        # The split path never had a model-path guard; both must behave alike.
+        monkeypatch.setenv("KV_BITS", "3.5")
+        monkeypatch.setenv("KV_KEY_BITS", "3")
+        monkeypatch.setenv("KV_VALUE_BITS", "4")
+        assert server_generation.get_quantized_kv_bits() == 3.5
+        assert server_generation.get_quantized_kv_split_bits() == (3.0, 4.0)
 
 
 class TestRuntimeConfig:
