@@ -1,69 +1,15 @@
 import argparse
-import glob
-import json
-import shutil
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Iterable, Optional
+from typing import Dict, List, Optional
 
 import mlx.core as mx
 from safetensors import safe_open
 
 from ....models.deepseek_v4.config import ModelConfig as DeepseekV4Config
-from ....utils import _load_safetensors, get_model_path
+from ....utils import _load_safetensors
+from ..mtp_split import MTPSplitter
 from .deepseek_v4_mtp import DeepseekV4MTPDraftModel
-
-
-def _safetensor_files(model_path: Path) -> list[Path]:
-    return [
-        Path(path)
-        for path in glob.glob(str(model_path / "*.safetensors"))
-        if not path.endswith("consolidated.safetensors")
-    ]
-
-
-def _weight_map(model_path: Path) -> Dict[str, str]:
-    index_path = model_path / "model.safetensors.index.json"
-    if not index_path.exists():
-        return {}
-    with open(index_path) as f:
-        data = json.load(f)
-    return data.get("weight_map", {})
-
-
-def _iter_mtp_keys(model_path: Path) -> Iterable[tuple[Path, list[str]]]:
-    weight_map = _weight_map(model_path)
-    if weight_map:
-        by_file: Dict[str, list[str]] = {}
-        for key, filename in weight_map.items():
-            if key.startswith("mtp."):
-                by_file.setdefault(filename, []).append(key)
-        if by_file:
-            for filename, keys in by_file.items():
-                yield model_path / filename, keys
-            return
-
-    for file in _safetensor_files(model_path):
-        with safe_open(file, framework="mlx") as f:
-            keys = [key for key in f.keys() if key.startswith("mtp.")]
-        if keys:
-            yield file, keys
-
-
-def _load_selected_tensors(file: Path, keys: list[str]) -> Dict[str, mx.array]:
-    tensors = {}
-    try:
-        with safe_open(file, framework="mlx") as f:
-            for key in keys:
-                tensors[key] = mx.array(f.get_tensor(key))
-    except (AttributeError, RuntimeError, TypeError):
-        shard = _load_safetensors(str(file))
-        tensors = {key: shard[key] for key in keys}
-    return tensors
-
-
-def _text_config(source_config: dict) -> dict:
-    return dict(source_config.get("text_config") or source_config)
 
 
 def _module_from_scales_key(key: str) -> str:
@@ -91,6 +37,41 @@ def _quantization_from_weights(weights: Dict[str, mx.array]) -> Optional[dict]:
     return quantization if len(quantization) > 3 else None
 
 
+class DeepseekV4MTPSplitter(MTPSplitter):
+    output_model_type = "deepseek_v4_mtp"
+    draft_model_cls = DeepseekV4MTPDraftModel
+    require_text_config = False
+    tie_word_embeddings_default = False
+    depth_field = "num_nextn_predict_layers"
+    block_size_extra = 1
+    tokenizer_files = (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "merges.txt",
+        "special_tokens_map.json",
+        "generation_config.json",
+        "chat_template.jinja",
+    )
+
+    def select_keys(self, key: str, text_config: dict) -> bool:
+        return key.startswith("mtp.")
+
+    def load_shard(self, file: Path, keys: List[str]) -> Dict[str, mx.array]:
+        try:
+            with safe_open(file, framework="mlx") as f:
+                return {key: mx.array(f.get_tensor(key)) for key in keys}
+        except (AttributeError, RuntimeError, TypeError):
+            shard = _load_safetensors(str(file))
+            return {key: shard[key] for key in keys}
+
+    def sanitize_ctx(self, text_config: dict):
+        return SimpleNamespace(args=DeepseekV4Config.from_dict(text_config))
+
+    def quantization_from_source(self, tensors, source_config):
+        return _quantization_from_weights(tensors)
+
+
 def split_deepseek_v4_mtp(
     source: str,
     output: str,
@@ -100,62 +81,13 @@ def split_deepseek_v4_mtp(
     force_download: bool = False,
 ) -> Path:
     """Write DeepSeek-V4 native MTP tensors into a standalone drafter folder."""
-    source_path = get_model_path(
-        source, revision=revision, force_download=force_download
+    return DeepseekV4MTPSplitter().split(
+        source,
+        output,
+        revision=revision,
+        block_size=block_size,
+        force_download=force_download,
     )
-    output_path = Path(output)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    config_path = source_path / "config.json"
-    with open(config_path) as f:
-        source_config = json.load(f)
-    text_config = _text_config(source_config)
-
-    selected = {}
-    for file, keys in _iter_mtp_keys(source_path):
-        selected.update(_load_selected_tensors(file, keys))
-
-    if not selected:
-        raise ValueError(f"No mtp.* tensors found in {source_path}.")
-
-    sanitize_context = SimpleNamespace(args=DeepseekV4Config.from_dict(text_config))
-    selected = DeepseekV4MTPDraftModel.sanitize(sanitize_context, selected)
-
-    mx.save_safetensors(
-        str(output_path / "model.safetensors"),
-        selected,
-        metadata={"format": "mlx"},
-    )
-
-    depth = int(text_config.get("num_nextn_predict_layers", 1))
-    draft_config = {
-        "model_type": "deepseek_v4_mtp",
-        "text_config": text_config,
-        "block_size": int(block_size or depth + 1),
-        "tie_word_embeddings": bool(text_config.get("tie_word_embeddings", False)),
-    }
-    quantization = _quantization_from_weights(selected)
-    if quantization is not None:
-        draft_config["quantization"] = quantization
-        draft_config["quantization_config"] = quantization
-
-    with open(output_path / "config.json", "w") as f:
-        json.dump(dict(sorted(draft_config.items())), f, indent=2)
-
-    for name in (
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "vocab.json",
-        "merges.txt",
-        "special_tokens_map.json",
-        "generation_config.json",
-        "chat_template.jinja",
-    ):
-        src = source_path / name
-        if src.exists():
-            shutil.copy(src, output_path / name)
-
-    return output_path
 
 
 def build_parser() -> argparse.ArgumentParser:
