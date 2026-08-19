@@ -600,7 +600,9 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
     out = qwen_language._target_verify_quantized_linear(linear, x)
     mx.eval(ref, out)
 
-    assert bool(mx.array_equal(ref, out).item())
+    # The target kernel and MLX's quantized GEMM accumulate in different
+    # orders, so BF16 rounding can differ by a small amount.
+    assert bool(mx.allclose(ref, out, rtol=1e-2, atol=1e-2).item())
 
 
 def test_qwen_fused_greedy_decode_support_matches_lm_head():
@@ -1589,6 +1591,43 @@ def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):
     assert calls[0][2]["row_ids"] == [0]
 
 
+def test_dflash_server_singleton_dispatches_single_rounds(monkeypatch):
+    calls = []
+
+    def fake_single(*args, **kwargs):
+        calls.append((args, kwargs))
+        yield 3, None
+        yield 4, None
+        yield 5, None
+
+    def fake_batch(*args, **kwargs):
+        raise AssertionError("server DFlash singleton should use single round path")
+
+    monkeypatch.setattr(speculative_utils, "_dflash_rounds", fake_single)
+    monkeypatch.setattr(speculative_utils, "_dflash_rounds_batch", fake_batch)
+
+    result = list(
+        speculative_utils.run_speculative_server_rounds(
+            SimpleNamespace(language_model=SimpleNamespace()),
+            SimpleNamespace(),
+            prompt_cache=[],
+            hidden=mx.zeros((1, 1, 1), dtype=mx.float32),
+            draft_kind="dflash",
+            first_bonus=mx.array([2], dtype=mx.int32),
+            max_tokens=4,
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            token_dtype=mx.int32,
+            greedy_sampling=True,
+            stop_check=lambda _seq_idx, token_id: token_id == 4,
+        )
+    )
+
+    assert result == [([3], None), ([4], None)]
+    assert calls
+    assert calls[0][1]["first_bonus"] == 2
+    assert "use_model_initial_block_size" not in calls[0][1]
+
+
 def test_mtp_uses_uniform_deferred_walk_for_batched_sampling():
     ragged_drafter = SimpleNamespace(requires_uniform_batch_acceptance=False)
     uniform_drafter = SimpleNamespace(requires_uniform_batch_acceptance=True)
@@ -2089,6 +2128,12 @@ def test_dflash_next_block_size_starts_at_requested_ceiling():
     draft_model = SimpleNamespace(accept_lens=[], draft_lens=[])
 
     assert _dflash_next_block_size(draft_model, 16, 20) == 16
+
+
+def test_dflash_next_block_size_uses_model_initial_size():
+    draft_model = SimpleNamespace(accept_lens=[], draft_lens=[])
+
+    assert _dflash_next_block_size(draft_model, 16, 20, 4) == 4
 
 
 def test_dflash_next_block_size_backs_off_on_low_acceptance():
@@ -3298,6 +3343,52 @@ def test_split_qwen3_5_mtp_writes_sidecar_without_index_mtp_entries(tmp_path):
     assert cfg["block_size"] == 3
     assert "fc.weight" in weights
     assert weights["pre_fc_norm_hidden.weight"][0].item() == 1.0
+
+
+def test_split_qwen3_5_mtp_converts_fine_grained_fp8(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.mtp_num_hidden_layers = 1
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5",
+                "text_config": text_config.to_dict(),
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "fmt": "e4m3",
+                    "weight_block_size": [128, 128],
+                },
+            }
+        )
+    )
+    mx.save_safetensors(
+        str(source / "mtp.safetensors"),
+        {
+            "mtp.layers.0.mlp.down_proj.weight": mx.to_fp8(
+                mx.ones((128, 128), dtype=mx.bfloat16)
+            ),
+            "mtp.layers.0.mlp.down_proj.weight_scale_inv": mx.full(
+                (1, 1), 0.125, dtype=mx.bfloat16
+            ),
+            "mtp.pre_fc_norm_hidden.weight": mx.zeros((16,)),
+        },
+        metadata={},
+    )
+
+    split_qwen3_5_mtp(str(source), str(output))
+
+    with open(output / "config.json") as f:
+        cfg = json.load(f)
+    weights = mx.load(str(output / "model.safetensors"))
+    expected = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    assert cfg["quantization"] == expected
+    assert cfg["quantization_config"] == expected
+    assert weights["layers.0.mlp.down_proj.weight"].dtype == mx.uint32
+    assert weights["layers.0.mlp.down_proj.scales"].dtype == mx.uint8
+    assert not any(key.endswith("weight_scale_inv") for key in weights)
 
 
 def test_deepseek_v4_returns_mtp_hidden_and_trims_without_snapshot():

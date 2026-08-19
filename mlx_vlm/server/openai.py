@@ -22,6 +22,7 @@ from ..generate.edit_image import ImageEditRequest as CoreImageEditRequest
 from ..generate.edit_image import edit_image
 from ..generate.image import ImageGenerationRequest as CoreImageGenerationRequest
 from ..generate.image import generate_image, parse_size
+from ..generate.video import resolve_video_inputs
 from ..prompt_utils import apply_chat_template, extract_text_from_content
 from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from ..utils import prepare_inputs
@@ -32,7 +33,6 @@ from .generation import (
     _count_prompt_tokens,
 )
 from .responses_state import (
-    ThinkingStreamState,
     _normalize_response_input,
     _response_chain_items,
     _response_items_to_chat,
@@ -42,6 +42,7 @@ from .responses_state import (
 from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
     _store_response,
+    make_response_stream_state,
     process_tool_calls,
     prompt_has_open_thinking,
     response_store,
@@ -1095,7 +1096,8 @@ async def responses_endpoint(request: Request):
                         if tool_module is not None and chat_tools
                         else None
                     )
-                    thinking_state = ThinkingStreamState(
+                    thinking_state = make_response_stream_state(
+                        processor,
                         prompt_has_open_thinking(
                             formatted_prompt,
                             gen_args.enable_thinking,
@@ -1136,7 +1138,9 @@ async def responses_endpoint(request: Request):
                             raw_delta = token.text
                             full_text += raw_delta
                             chunk_rate = metrics.record_chunk(token)
-                            thinking_delta = thinking_state.feed(raw_delta)
+                            thinking_delta = thinking_state.feed(
+                                raw_delta, last=bool(token.finish_reason)
+                            )
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
                                 yield _response_sse_event(
@@ -1187,7 +1191,10 @@ async def responses_endpoint(request: Request):
                             raw_delta = chunk.text
                             full_text += raw_delta
                             chunk_rate = metrics.record_chunk(chunk)
-                            thinking_delta = thinking_state.feed(raw_delta)
+                            chunk_finish = getattr(chunk, "finish_reason", None)
+                            thinking_delta = thinking_state.feed(
+                                raw_delta, last=bool(chunk_finish)
+                            )
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
                                 yield _response_sse_event(
@@ -1206,7 +1213,6 @@ async def responses_endpoint(request: Request):
                             in_tool_call, delta = suppress_tool_call_content(
                                 full_text, in_tool_call, tc_start, delta
                             )
-                            chunk_finish = getattr(chunk, "finish_reason", None)
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
                             usage_stats = {
@@ -1228,6 +1234,7 @@ async def responses_endpoint(request: Request):
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
                             reasoning_item_id,
+                            processor=processor,
                         )
                     )
                     tool_output_items = [
@@ -1486,6 +1493,7 @@ async def responses_endpoint(request: Request):
                         tool_registry,
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
+                        processor=processor,
                     )
                 )
                 if output_finish_reason == "tool_calls":
@@ -1688,6 +1696,23 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
         model, processor, config = get_cached_model(request.model, adapter_path)
 
+        video_resolution = resolve_video_inputs(
+            processor,
+            videos,
+            images=images,
+            fps=2.0,
+            max_frames=16,
+        )
+        images, videos = video_resolution.images, video_resolution.videos
+        if video_resolution.used_fallback:
+            logger.info(
+                "Processor %s has no native video support; sending %d of %d "
+                "sampled frames as ordered images.",
+                processor.__class__.__name__,
+                video_resolution.selected_count,
+                video_resolution.sampled_count,
+            )
+
         # Detect tool parser from chat template
         tool_parser_type = _infer_tool_parser_from_processor(processor)
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
@@ -1779,7 +1804,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
-                        thinking_state = ThinkingStreamState(
+                        thinking_state = make_response_stream_state(
+                            processor,
                             prompt_has_open_thinking(
                                 formatted_prompt,
                                 gen_args.enable_thinking,
@@ -1810,7 +1836,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             chunk_rate = metrics.record_chunk(token)
 
                             # Detect thinking boundaries
-                            thinking_delta = thinking_state.feed(token.text)
+                            thinking_delta = thinking_state.feed(
+                                token.text, last=bool(token.finish_reason)
+                            )
                             delta_reasoning = thinking_delta.reasoning
                             delta_content = thinking_delta.content
 
@@ -1929,7 +1957,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         request_id = f"chatcmpl-{uuid.uuid4()}"
                         output_text = ""
-                        thinking_state = ThinkingStreamState(
+                        thinking_state = make_response_stream_state(
+                            processor,
                             prompt_has_open_thinking(
                                 formatted_prompt,
                                 gen_args.enable_thinking,
@@ -1951,7 +1980,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
 
-                            thinking_delta = thinking_state.feed(chunk.text)
+                            thinking_delta = thinking_state.feed(
+                                chunk.text, last=bool(chunk_finish)
+                            )
                             if thinking_delta.content or thinking_delta.reasoning:
                                 choices = [
                                     ChatStreamChoice(
@@ -2173,6 +2204,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     full_text,
                     gen_args.thinking_start_token,
                     gen_args.thinking_end_token,
+                    prompt_has_open_thinking(
+                        formatted_prompt,
+                        gen_args.enable_thinking,
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
+                    ),
+                    processor=processor,
                 )
 
                 # Count raw generated tokens minus thinking tag tokens

@@ -15,10 +15,12 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
+from starlette.requests import HTTPConnection
 
 from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
+from ..reranker import RerankerKind, reranker_kind
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
 from ..version import __version__
@@ -36,11 +38,16 @@ from .generation import (
     get_configured_context_limit,
     get_kv_group_size,
     get_kv_quant_scheme,
+    get_kv_split_schemes,
     get_quantized_kv_bits,
+    get_quantized_kv_split_bits,
     get_quantized_kv_start,
     get_top_logprobs_k,
 )
 from .openai import register_routes as register_openai_routes
+from .realtime import register_routes as register_realtime_routes
+from .reranking import ensure_chat_template as ensure_reranker_chat_template
+from .reranking import register_routes as register_reranking_routes
 from .responses_state import _split_thinking as _split_thinking_text
 from .runtime import ModelCacheRegistry, runtime
 from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
@@ -59,7 +66,7 @@ def _server_api_key() -> Optional[str]:
     return key if key else None
 
 
-def _require_management_api_key(request: Request) -> None:
+def _require_management_api_key(request: HTTPConnection) -> None:
     api_key = _server_api_key()
     if api_key is None:
         return
@@ -88,6 +95,8 @@ def _cache_group_for_cache(cache: dict) -> str:
         return "audio"
     if model_kind == "embedding":
         return "embedding"
+    if model_kind == "reranker":
+        return "reranker"
     return "text_generation"
 
 
@@ -151,6 +160,7 @@ def _server_runtime_snapshot() -> dict:
         "continuous_batching_enabled": runtime.response_generator is not None,
         "request_queue_depth": queue_depth,
         "audio_queue_depth": audio_queue_depth,
+        "preload_failures": dict(runtime.preload_failures),
         "apc": (
             {"enabled": False}
             if runtime.apc_manager is None
@@ -174,12 +184,15 @@ def _build_gen_args(
 def _read_tenant_id(http_request) -> Optional[str]:
     """Pull a per-tenant APC salt from the request headers.
 
-    Honoured headers (in order): ``X-APC-Tenant``, ``X-Tenant-Id``.
+    Honoured headers (in order): ``X-APC-Tenant``, ``X-Tenant-Id``. Falls back to
+    ``APC_DEFAULT_TENANT`` so a single-tenant deployment shares one cache without
+    every client sending a header.
     """
+    default = os.environ.get("APC_DEFAULT_TENANT") or None
     if http_request is None or not hasattr(http_request, "headers"):
-        return None
+        return default
     h = http_request.headers
-    return h.get("x-apc-tenant") or h.get("x-tenant-id") or None
+    return h.get("x-apc-tenant") or h.get("x-tenant-id") or default
 
 
 async def _preflight_stream_context_budget(
@@ -258,9 +271,17 @@ def _split_thinking(
     text: str,
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
+    starts_in_thinking: bool = False,
+    processor=None,
 ) -> Tuple[Optional[str], str]:
     """Split thinking tags from content. Returns (reasoning, content)."""
-    return _split_thinking_text(text, thinking_start_token, thinking_end_token)
+    return _split_thinking_text(
+        text,
+        thinking_start_token,
+        thinking_end_token,
+        starts_in_thinking,
+        processor=processor,
+    )
 
 
 def _decode_token(tokenizer, token_id: int) -> Tuple[str, Optional[List[int]]]:
@@ -367,16 +388,38 @@ async def lifespan(app):
             "embedding",
             "embedding model",
         ),
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_RERANKER_MODEL", None),
+            None,
+            "reranker",
+            "reranker model",
+        ),
     )
+    runtime.preload_failures.clear()
     for preload_model_path, preload_adapter_path, model_kind, label in preload_models:
         if not preload_model_path:
             continue
         logger.info("Pre-loading %s: %s", label, preload_model_path)
-        get_cached_model(
-            preload_model_path,
-            preload_adapter_path,
-            model_kind=model_kind,
-        )
+        try:
+            get_cached_model(
+                preload_model_path,
+                preload_adapter_path,
+                model_kind=model_kind,
+            )
+        except Exception as e:
+            reason = getattr(e, "detail", None) or str(e)
+            runtime.preload_failures[model_kind] = {
+                "model": preload_model_path,
+                "label": label,
+                "error": str(reason),
+            }
+            logger.error(
+                "Failed to pre-load %s %r: %s. Continuing without it.",
+                label,
+                preload_model_path,
+                reason,
+            )
+            continue
         logger.info("%s ready.", label.capitalize())
     try:
         yield
@@ -384,6 +427,9 @@ async def lifespan(app):
         if runtime.audio_queue is not None:
             runtime.audio_queue.stop_and_join()
             runtime.audio_queue = None
+        if runtime.realtime_engine is not None:
+            runtime.realtime_engine.stop_and_join()
+            runtime.realtime_engine = None
 
 
 app = FastAPI(
@@ -470,6 +516,7 @@ def get_cached_model(
     load_as_edit = model_kind == "image_edit"
     load_as_audio = _audio_model_kind(model_kind)
     load_as_embedding = model_kind == "embedding"
+    load_as_reranker = model_kind == "reranker"
     load_as_image = model_kind == "image_generation" or (
         model_kind == "auto" and is_image_generation_model(model_path)
     )
@@ -482,6 +529,9 @@ def get_cached_model(
     elif load_as_embedding:
         cache_group = "embedding"
         effective_model_kind = "embedding"
+    elif load_as_reranker:
+        cache_group = "reranker"
+        effective_model_kind = "reranker"
     elif load_as_image:
         cache_group = "image_generation"
         effective_model_kind = "image_generation"
@@ -495,7 +545,12 @@ def get_cached_model(
         cached = cached_cache.get("cache_key")
         adapter_path = cached[1] if cached and cached[0] == model_path else None
 
-    cache_key = (model_path, adapter_path, effective_model_kind)
+    cache_key = (
+        model_path,
+        adapter_path,
+        effective_model_kind,
+        runtime.config.fingerprint(kinds={effective_model_kind}),
+    )
     cached_cache = registry.for_kind(cache_group)
 
     # Return from cache if already loaded and matches the requested paths
@@ -675,24 +730,105 @@ def get_cached_model(
         registry.set(cache_group, cache)
         return model, processor, config
 
-    vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
+    if load_as_reranker:
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Adapters are not supported for reranker models.",
+            )
+        logger.info("Loading reranker model: %s", model_path)
+        from ..reranker_loader import load_reranker
+
+        try:
+            model, processor = load_reranker(model_path)
+        except RepositoryNotFoundError as e:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Model not found: {model_path!r} is not a known "
+                    "Hugging Face repo or local path"
+                ),
+            ) from e
+        except (FileNotFoundError, ValueError) as e:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported reranker model: {e}"
+            ) from e
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load reranker model: {e}"
+            ) from e
+        config = model.config
+        try:
+            kind = reranker_kind(config)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=str(e),
+            ) from e
+        if kind != RerankerKind.SEQUENCE_CLASSIFIER:
+            try:
+                ensure_reranker_chat_template(processor, model_path)
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=400, detail=f"Unsupported reranker model: {e}"
+                ) from e
+        cache = {
+            "cache_key": cache_key,
+            "model_path": model_path,
+            "adapter_path": None,
+            "model": model,
+            "processor": processor,
+            "config": config,
+            "model_kind": "reranker",
+        }
+        registry.set(cache_group, cache)
+        return model, processor, config
+
+    cfg = runtime.config
+    vision_cache_size = cfg.vision_cache_size
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
 
-    # KV cache quantization (uniform or TurboQuant)
-    kv_bits = get_quantized_kv_bits(model_path)
-    kv_group_size = get_kv_group_size()
-    quantized_kv_start = get_quantized_kv_start()
-    kv_quant_scheme = get_kv_quant_scheme()
+    kv_bits = cfg.kv_bits if cfg.kv_bits is not None else get_quantized_kv_bits()
+    default_key_bits, default_value_bits = get_quantized_kv_split_bits()
+    kv_key_bits = cfg.kv_key_bits if cfg.kv_key_bits is not None else default_key_bits
+    kv_value_bits = (
+        cfg.kv_value_bits if cfg.kv_value_bits is not None else default_value_bits
+    )
+    default_key_scheme, default_value_scheme = get_kv_split_schemes()
+    kv_key_scheme = (
+        cfg.kv_key_scheme if cfg.kv_key_scheme is not None else default_key_scheme
+    )
+    kv_value_scheme = (
+        cfg.kv_value_scheme if cfg.kv_value_scheme is not None else default_value_scheme
+    )
+    kv_group_size = (
+        cfg.kv_group_size if cfg.kv_group_size is not None else get_kv_group_size()
+    )
+    quantized_kv_start = (
+        cfg.quantized_kv_start
+        if cfg.quantized_kv_start is not None
+        else get_quantized_kv_start()
+    )
+    kv_quant_scheme = cfg.kv_quant_scheme or get_kv_quant_scheme()
 
     runtime.apc_manager = _apc.from_env(
         model_namespace=_apc.apc_disk_namespace(
             model_path,
             adapter_path=adapter_path,
             kv_bits=kv_bits,
+            kv_key_bits=kv_key_bits,
+            kv_value_bits=kv_value_bits,
             kv_group_size=kv_group_size,
             kv_quant_scheme=kv_quant_scheme,
             quantized_kv_start=quantized_kv_start,
-        )
+        ),
+        overrides={
+            "enabled": cfg.apc_enabled,
+            "disk_path": cfg.apc_disk_path,
+            "block_size": cfg.apc_block_size,
+            "num_blocks": cfg.apc_num_blocks,
+            "disk_max_gb": cfg.apc_disk_max_gb,
+        },
     )
 
     response_generator = ResponseGenerator(
@@ -700,11 +836,17 @@ def get_cached_model(
         adapter_path=adapter_path,
         vision_cache=vision_cache,
         kv_bits=kv_bits,
+        kv_key_bits=kv_key_bits,
+        kv_value_bits=kv_value_bits,
+        kv_key_scheme=kv_key_scheme,
+        kv_value_scheme=kv_value_scheme,
         kv_group_size=kv_group_size,
         kv_quant_scheme=kv_quant_scheme,
         quantized_kv_start=quantized_kv_start,
         top_logprobs_k=get_top_logprobs_k(),
         apc_manager=runtime.apc_manager,
+        draft_model_path=cfg.spec_draft_model,
+        draft_kind=cfg.spec_draft_kind,
     )
     try:
         model, processor, config = response_generator.wait_until_ready()
@@ -751,6 +893,15 @@ def unload_model_sync():
             runtime.audio_queue.stop_and_join()
             runtime.audio_queue = None
             unloaded_any = True
+    if runtime.realtime_engine is not None:
+        is_realtime_worker = getattr(
+            runtime.realtime_engine, "is_worker_thread", lambda: False
+        )
+        if not is_realtime_worker():
+            logger.info("Stopping realtime VoiceChat engine.")
+            runtime.realtime_engine.stop_and_join()
+            runtime.realtime_engine = None
+            unloaded_any = True
 
     registry = _model_cache_registry()
     for cache_group, _ in list(registry.items()):
@@ -795,7 +946,9 @@ _protocol_deps = SimpleNamespace(
 register_anthropic_routes(inference_router, _protocol_deps)
 register_openai_routes(inference_router, _protocol_deps)
 register_audio_routes(inference_router, _protocol_deps)
+register_realtime_routes(inference_router, _protocol_deps)
 register_embeddings_routes(inference_router, _protocol_deps)
+register_reranking_routes(inference_router, _protocol_deps)
 
 
 @inference_router.get("/models", response_model=ModelsResponse)
@@ -918,6 +1071,49 @@ async def apc_cache_reset(request: Request):
         return {"enabled": False}
     runtime.apc_manager.clear()
     return {"enabled": True, "status": "cleared"}
+
+
+def _settings_operation(payload: dict):
+    if "op" in payload or "values" in payload:
+        op = payload.get("op", "merge")
+        if op not in ("merge", "replace"):
+            raise HTTPException(status_code=400, detail=f"unsupported op {op!r}")
+        values = payload.get("values")
+        if not isinstance(values, dict):
+            raise HTTPException(status_code=400, detail="values must be a JSON object")
+        return op, values
+    return "merge", payload
+
+
+@app.get("/v1/settings")
+@app.get("/settings", include_in_schema=False)
+async def get_runtime_settings(request: Request):
+    _require_management_api_key(request)
+    cfg = runtime.config
+    return {
+        "schema": cfg.schema(),
+        "current": cfg.current(),
+        "fingerprint": cfg.fingerprint(),
+    }
+
+
+@app.patch("/v1/settings")
+@app.patch("/settings", include_in_schema=False)
+async def update_runtime_settings(request: Request):
+    _require_management_api_key(request)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="body must be a JSON object")
+    op, values = _settings_operation(payload)
+    applied, rejected = runtime.config.apply_changes(values, op=op)
+    return {
+        "op": op,
+        "applied": applied,
+        "rejected": rejected,
+        "reload_kinds": sorted(runtime.config.reload_kinds(applied)),
+        "fingerprint": runtime.config.fingerprint(),
+        "current": runtime.config.current(),
+    }
 
 
 @app.post("/unload")

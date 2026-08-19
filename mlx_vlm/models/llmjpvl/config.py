@@ -28,6 +28,7 @@ class TextConfig(BaseModelConfig):
     rms_norm_eps: float = 1e-6
     vocab_size: int = 196608
     num_key_value_heads: Optional[int] = None
+    head_dim: Optional[int] = None
     rope_theta: float = 500000.0
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None

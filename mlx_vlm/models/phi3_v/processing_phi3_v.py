@@ -590,14 +590,14 @@ class Phi3VProcessor(ProcessorMixin):
         """Load the processor from a pretrained model path."""
         from huggingface_hub import hf_hub_download
 
-        kwargs.pop("trust_remote_code", None)
+        trust_remote_code = kwargs.pop("trust_remote_code", True)
 
         model_path = Path(pretrained_model_name_or_path)
         is_local = model_path.exists() and model_path.is_dir()
 
         tokenizer = AutoTokenizer.from_pretrained(
             str(model_path) if is_local else pretrained_model_name_or_path,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             local_files_only=is_local,
         )
 

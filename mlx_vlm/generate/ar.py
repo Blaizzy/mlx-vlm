@@ -16,6 +16,7 @@ import mlx.nn as nn
 from tqdm import tqdm
 
 from .. import apc as _apc
+from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..sample_utils import make_logits_processors, make_sampler
@@ -382,6 +383,10 @@ def generate_step(
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
     kv_bits: Optional[float] = None,
+    kv_key_bits: Optional[float] = None,
+    kv_value_bits: Optional[float] = None,
+    kv_key_scheme: Optional[str] = None,
+    kv_value_scheme: Optional[str] = None,
     kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
@@ -460,6 +465,10 @@ def generate_step(
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
         kv_quant_scheme=kv_quant_scheme,
+        kv_key_bits=kv_key_bits,
+        kv_value_bits=kv_value_bits,
+        kv_key_scheme=kv_key_scheme,
+        kv_value_scheme=kv_value_scheme,
     )
 
     sampler_is_greedy = sampler is None and temperature == 0
@@ -546,6 +555,8 @@ def generate_step(
         step_kwargs = kwargs
         if speculative_prefill_capture_kwargs:
             step_kwargs = {**kwargs, **speculative_prefill_capture_kwargs}
+        if getattr(model.language_model, "supports_logits_to_keep", False):
+            step_kwargs = {**step_kwargs, "logits_to_keep": 1}
 
         with mx.stream(generation_stream):
             if "decoder_input_ids" in step_kwargs:
@@ -651,12 +662,15 @@ def generate_step(
                         and processed_tokens + n_to_process > checkpoint_len
                     ):
                         n_to_process = checkpoint_len - processed_tokens
+                    chunk_kwargs = kwargs
+                    if getattr(model.language_model, "supports_logits_to_keep", False):
+                        chunk_kwargs = {**kwargs, "logits_to_keep": 1}
                     model.language_model(
                         inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
                         cache=prompt_cache,
                         n_to_process=n_to_process,
-                        **kwargs,
+                        **chunk_kwargs,
                     )
                     quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
@@ -776,7 +790,11 @@ _SEQUENCE_ALIGNED_PROMPT_KWARGS = {
     "token_type_ids",
 }
 
-APC_PRIVATE_PROMPT_KEYS = ("_apc_tenant", "_apc_image_hash")
+APC_PRIVATE_PROMPT_KEYS = (
+    "_apc_tenant",
+    "_apc_image_hash",
+    "_apc_semantic_hash",
+)
 
 
 def _is_mrope_position_ids_prompt_kwarg(key: str, v: mx.array) -> bool:
@@ -943,6 +961,10 @@ def _make_cache(
     model,
     left_padding,
     kv_bits=None,
+    kv_key_bits=None,
+    kv_value_bits=None,
+    kv_key_scheme=None,
+    kv_value_scheme=None,
     kv_group_size=64,
     kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
     quantized_kv_start=0,
@@ -960,6 +982,22 @@ def _make_cache(
     - ``"uniform"`` → ``BatchQuantizedKVCache`` (``mx.quantize``)
     - ``"turboquant"`` or fractional *kv_bits* → ``BatchTurboQuantKVCache``
     """
+    _batch_policy = kv_quant_from_legacy(
+        kv_bits,
+        kv_quant_scheme,
+        kv_group_size,
+        kv_key_bits,
+        kv_value_bits,
+        kv_key_scheme,
+        kv_value_scheme,
+    )
+    if _batch_policy is not None and not _batch_policy.is_homogeneous:
+        raise NotImplementedError(
+            "mixed key/value KV quantization schemes are not supported on the "
+            "batch path yet; run with a single --kv-quant-scheme or disable "
+            "continuous batching"
+        )
+
     use_turbo = kv_bits is not None and turboquant_enabled(kv_bits, kv_quant_scheme)
 
     defer_turbo = (
@@ -970,7 +1008,9 @@ def _make_cache(
         if use_turbo:
             if defer_turbo:
                 return cache.BatchKVCache(lp)
-            return BatchTurboQuantKVCache(lp, bits=kv_bits)
+            return BatchTurboQuantKVCache(
+                lp, bits=kv_bits, key_bits=kv_key_bits, value_bits=kv_value_bits
+            )
         return cache.BatchQuantizedKVCache(
             lp, group_size=kv_group_size, bits=int(kv_bits)
         )
@@ -1795,6 +1835,10 @@ class PromptProcessingBatch:
         thinking_budget_criteria: Optional[List[Any]] = None,
         prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
         kv_bits=None,
+        kv_key_bits=None,
+        kv_value_bits=None,
+        kv_key_scheme=None,
+        kv_value_scheme=None,
         kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
         quantized_kv_start: int = 0,
@@ -1802,6 +1846,7 @@ class PromptProcessingBatch:
         apc_meta: Optional[List[dict]] = None,
         apc_manager: Optional["_apc.APCManager"] = None,
         right_pad_per_row: Optional[List[int]] = None,
+        existing_left_padding: Optional[List[int]] = None,
         suffix_lens: Optional[List[int]] = None,
         apc_mode: Optional[str] = None,
         draft_model: Optional[nn.Module] = None,
@@ -1839,6 +1884,11 @@ class PromptProcessingBatch:
             self._input_ids = _right_pad_prompts(input_ids, max_length=max_length)
         else:
             left_padding = [max_length - l for l in lengths]
+            if existing_left_padding is not None:
+                left_padding = [
+                    pad + int(existing)
+                    for pad, existing in zip(left_padding, existing_left_padding)
+                ]
             self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
         self._left_padding_per_row = list(left_padding)
         self._total_prompt_tokens = sum(lengths)
@@ -1896,6 +1946,10 @@ class PromptProcessingBatch:
                     lm,
                     lp,
                     kv_bits=kv_bits,
+                    kv_key_bits=kv_key_bits,
+                    kv_value_bits=kv_value_bits,
+                    kv_key_scheme=kv_key_scheme,
+                    kv_value_scheme=kv_value_scheme,
                     kv_group_size=kv_group_size,
                     kv_quant_scheme=kv_quant_scheme,
                     quantized_kv_start=quantized_kv_start,
@@ -1914,6 +1968,10 @@ class PromptProcessingBatch:
                 model,
                 left_padding,
                 kv_bits=kv_bits,
+                kv_key_bits=kv_key_bits,
+                kv_value_bits=kv_value_bits,
+                kv_key_scheme=kv_key_scheme,
+                kv_value_scheme=kv_value_scheme,
                 kv_group_size=kv_group_size,
                 kv_quant_scheme=kv_quant_scheme,
                 quantized_kv_start=quantized_kv_start,
@@ -2374,8 +2432,13 @@ class BatchGenerator:
         completion_batch_size: int = DEFAULT_COMPLETION_BATCH_SIZE,
         prefill_batch_size: int = DEFAULT_PREFILL_BATCH_SIZE,
         prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
+        existing_left_padding: Optional[List[int]] = None,
         prompt_cache=None,
         kv_bits=None,
+        kv_key_bits=None,
+        kv_value_bits=None,
+        kv_key_scheme=None,
+        kv_value_scheme=None,
         kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
         quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
@@ -2395,6 +2458,10 @@ class BatchGenerator:
         self.max_tokens = max_tokens
         self.processor = processor
         self.kv_bits = kv_bits
+        self.kv_key_bits = kv_key_bits
+        self.kv_value_bits = kv_value_bits
+        self.kv_key_scheme = kv_key_scheme
+        self.kv_value_scheme = kv_value_scheme
         self.kv_group_size = kv_group_size
         self.kv_quant_scheme = kv_quant_scheme
         self.quantized_kv_start = quantized_kv_start
@@ -2439,6 +2506,7 @@ class BatchGenerator:
             top_logprobs_k=self.top_logprobs_k,
             greedy_sampling=self.greedy_sampling,
         )
+        self._existing_left_padding = existing_left_padding
         self._prompt_batch: Optional[PromptProcessingBatch] = None
         self._unprocessed_sequences = []
 
@@ -2462,6 +2530,9 @@ class BatchGenerator:
             return 0
         if prompt_kwargs is None:
             prompt_kwargs = {}
+        precomputed = prompt_kwargs.get("_apc_semantic_hash")
+        if precomputed is not None:
+            return int(precomputed)
         img = prompt_kwargs.get("_apc_image_hash")
         if img is None:
             pixel_values = prompt_kwargs.get("pixel_values")
@@ -2627,15 +2698,16 @@ class BatchGenerator:
         apc_mode = getattr(self, "apc_mode", "block")
         # bits + group_size + scheme so warm restore matches live _make_cache
         # backend (uniform BatchQuantized vs BatchTurboQuant).
-        _quant_cfg = (
-            {
-                "bits": self.kv_bits,
-                "group_size": self.kv_group_size,
-                "scheme": self.kv_quant_scheme,
-            }
-            if self.kv_bits is not None
-            else None
+        _quant_policy = kv_quant_from_legacy(
+            self.kv_bits,
+            self.kv_quant_scheme,
+            self.kv_group_size,
+            getattr(self, "kv_key_bits", None),
+            getattr(self, "kv_value_bits", None),
+            getattr(self, "kv_key_scheme", None),
+            getattr(self, "kv_value_scheme", None),
         )
+        _quant_cfg = _quant_policy.to_config() if _quant_policy is not None else None
         if apc_mode == "exact":
             row_caches = [
                 p["warm_cache"] if p is not None else self.model.make_cache()
@@ -2690,6 +2762,10 @@ class BatchGenerator:
             thinking_budget_criteria=thinking_budget_criteria,
             prefill_step_size=self.prefill_step_size,
             kv_bits=self.kv_bits,
+            kv_key_bits=getattr(self, "kv_key_bits", None),
+            kv_value_bits=getattr(self, "kv_value_bits", None),
+            kv_key_scheme=getattr(self, "kv_key_scheme", None),
+            kv_value_scheme=getattr(self, "kv_value_scheme", None),
             kv_group_size=self.kv_group_size,
             kv_quant_scheme=self.kv_quant_scheme,
             quantized_kv_start=getattr(
@@ -2913,11 +2989,10 @@ class BatchGenerator:
         if self._prompt_batch is not None:
             if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
-                n = self._prompt_batch.prompt_step()
+                self._prompt_batch.prompt_step()
                 elapsed = time.perf_counter() - tic
                 self._prompt_time_counter += elapsed
                 self._record_prompt_batch_time(self._prompt_batch, elapsed)
-                self._prompt_tokens_counter += n
                 return prompt_responses, generation_responses
 
             tic = time.perf_counter()
@@ -3002,6 +3077,7 @@ class BatchGenerator:
             self._prompt_batch = prompt_batch_cls(
                 model=self.model,
                 uids=uids,
+                existing_left_padding=getattr(self, "_existing_left_padding", None),
                 input_ids=input_ids,
                 max_tokens=max_tokens_list,
                 inputs_embeds=inputs_embeds,
@@ -3010,6 +3086,10 @@ class BatchGenerator:
                 thinking_budget_criteria=thinking_budget_criteria,
                 prefill_step_size=self.prefill_step_size,
                 kv_bits=self.kv_bits,
+                kv_key_bits=getattr(self, "kv_key_bits", None),
+                kv_value_bits=getattr(self, "kv_value_bits", None),
+                kv_key_scheme=getattr(self, "kv_key_scheme", None),
+                kv_value_scheme=getattr(self, "kv_value_scheme", None),
                 kv_group_size=self.kv_group_size,
                 kv_quant_scheme=self.kv_quant_scheme,
                 quantized_kv_start=getattr(
@@ -3360,12 +3440,19 @@ def _generate_batch(
             kwargs["prefill_step_size"] = None
 
     # Use batch_size for prefill and completion to ensure consistent processing
+    existing_left_padding = None
+    if mask is not None and getattr(mask, "ndim", 0) == 2:
+        pads = [int(v) for v in (mask.shape[1] - mask.sum(axis=1)).tolist()]
+        if any(pads):
+            existing_left_padding = pads
+
     gen = BatchGenerator(
         model.language_model,
         processor,
         prefill_batch_size=batch_size,
         completion_batch_size=batch_size,
         compute_logprobs=False,
+        existing_left_padding=existing_left_padding,
         **kwargs,
     )
 

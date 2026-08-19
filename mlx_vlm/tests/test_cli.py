@@ -1,8 +1,39 @@
 import argparse
 import ast
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_package_clears_main_thread_mlx_streams_at_exit(tmp_path):
+    marker = tmp_path / "streams-cleared"
+    env = os.environ.copy()
+    env["MLX_VLM_CLEAR_STREAMS_MARKER"] = str(marker)
+    script = """
+import os
+from pathlib import Path
+
+import mlx.core as mx
+
+original_clear_streams = getattr(mx, "clear_streams", None)
+
+
+def record_clear_streams():
+    Path(os.environ["MLX_VLM_CLEAR_STREAMS_MARKER"]).write_text("cleared")
+    if original_clear_streams is not None:
+        original_clear_streams()
+
+
+mx.clear_streams = record_clear_streams
+import mlx_vlm
+"""
+
+    subprocess.run([sys.executable, "-c", script], check=True, env=env)
+
+    assert marker.read_text() == "cleared"
 
 
 def _load_module(path: str) -> ast.Module:
@@ -32,7 +63,9 @@ def _keyword_map(call: ast.Call) -> dict[str, ast.expr]:
     return {kw.arg: kw.value for kw in call.keywords}
 
 
-def _assert_verbose_uses_boolean_optional_action(path: str) -> None:
+def _assert_verbose_uses_boolean_optional_action(
+    path: str, *, expected_default: bool
+) -> None:
     verbose_call = _find_verbose_add_argument(_load_module(path))
     keywords = _keyword_map(verbose_call)
 
@@ -44,26 +77,30 @@ def _assert_verbose_uses_boolean_optional_action(path: str) -> None:
 
     default = keywords["default"]
     assert isinstance(default, ast.Constant)
-    assert default.value is True
+    assert default.value is expected_default
 
 
 def test_generate_verbose_flag_uses_boolean_optional_action():
-    _assert_verbose_uses_boolean_optional_action("mlx_vlm/generate/dispatch.py")
+    _assert_verbose_uses_boolean_optional_action(
+        "mlx_vlm/generate/dispatch.py", expected_default=False
+    )
 
 
 def test_chat_verbose_flag_uses_boolean_optional_action():
-    _assert_verbose_uses_boolean_optional_action("mlx_vlm/chat.py")
+    _assert_verbose_uses_boolean_optional_action(
+        "mlx_vlm/chat.py", expected_default=True
+    )
 
 
-def test_verbose_flag_semantics():
+def test_generate_verbose_flag_semantics():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--verbose",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
     )
 
-    assert parser.parse_args([]).verbose is True
+    assert parser.parse_args([]).verbose is False
     assert parser.parse_args(["--verbose"]).verbose is True
     assert parser.parse_args(["--no-verbose"]).verbose is False
 

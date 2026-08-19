@@ -1,7 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import scaled_dot_product_attention
+from ..base import SequenceClassifierOutput, scaled_dot_product_attention
 from ..pooling import EmbeddingOutput, normalize_embeddings, pool_by_config
 from .config import ModelConfig
 
@@ -119,7 +119,7 @@ class Model(nn.Module):
         sliding_mask = mx.where(window, global_mask, -1e9)
         return global_mask.astype(dtype), sliding_mask.astype(dtype)
 
-    def __call__(self, input_ids, attention_mask=None, **kwargs):
+    def _encode(self, input_ids, attention_mask=None):
         B, L = input_ids.shape
         if attention_mask is None:
             attention_mask = mx.ones((B, L))
@@ -127,7 +127,10 @@ class Model(nn.Module):
         global_mask, sliding_mask = self._masks(attention_mask, h.dtype)
         for layer in self.layers:
             h = layer(h, global_mask, sliding_mask)
-        h = self.final_norm(h)
+        return self.final_norm(h), attention_mask
+
+    def __call__(self, input_ids, attention_mask=None, **kwargs):
+        h, attention_mask = self._encode(input_ids, attention_mask)
         pooling_config = getattr(self, "pooling_config", None) or {
             "pooling_mode": "mean"
         }
@@ -149,4 +152,57 @@ class Model(nn.Module):
             ):
                 continue
             out[k] = v
+        return out
+
+
+class ModernBertPredictionHead(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        if config.classifier_activation != "gelu":
+            raise ValueError(
+                f"Unsupported ModernBERT classifier activation: "
+                f"{config.classifier_activation!r}."
+            )
+        self.dense = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=config.classifier_bias
+        )
+        self.act = nn.GELU(approx="precise")
+        self.norm = nn.LayerNorm(
+            config.hidden_size, eps=config.norm_eps, bias=config.norm_bias
+        )
+
+    def __call__(self, hidden_states):
+        return self.norm(self.act(self.dense(hidden_states)))
+
+
+class SequenceClassificationModel(Model):
+    def __init__(self, config: ModelConfig):
+        super().__init__(config)
+        self.head = ModernBertPredictionHead(config)
+        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
+
+    def __call__(self, input_ids, attention_mask=None, **kwargs):
+        hidden_states, attention_mask = self._encode(input_ids, attention_mask)
+        if self.config.classifier_pooling == "cls":
+            pooled = hidden_states[:, 0]
+        elif self.config.classifier_pooling == "mean":
+            mask = attention_mask[..., None].astype(hidden_states.dtype)
+            pooled = mx.sum(hidden_states * mask, axis=1) / mx.maximum(
+                mx.sum(mask, axis=1), 1
+            )
+        else:
+            raise ValueError(
+                f"Unsupported ModernBERT classifier pooling: "
+                f"{self.config.classifier_pooling!r}."
+            )
+        return SequenceClassifierOutput(logits=self.classifier(self.head(pooled)))
+
+    def sanitize(self, weights):
+        out = {}
+        for key, value in weights.items():
+            if key.startswith("model."):
+                key = key[len("model.") :]
+            if key.startswith("decoder.") or key.startswith("pooler."):
+                continue
+            out[key] = value
         return out
