@@ -374,3 +374,133 @@ def test_new_modes_never_empty_no_nan():
     )
     mx.eval(got)
     assert all(0 <= int(t) < 50 for t in got.tolist())
+
+
+# --- 3-D verify logits ([B, T, V]) -----------------------------------------
+#
+# dflash/eagle3 verify loops call ``sampler(verify_out.logits)`` with the whole
+# verify block at once and concatenate/index the result along axis 1, so the
+# sampler contract is [B, T, V] -> [B, T]. The server hands those loops a
+# _PositionedTargetSampler as their only sampler, so a 2-D-only sampler fails
+# every request on a dflash/eagle3 drafter.
+
+
+def _pinned_and_hot(seed_pinned=11, seed_hot=12):
+    """Row 0 pinned to its argmax (top_k=1), row 1 free to roam."""
+    return _PositionedTargetSampler(
+        [
+            SamplingConfig(temperature=1.0, top_k=1, seed=seed_pinned),
+            SamplingConfig(temperature=2.0, seed=seed_hot),
+        ]
+    )
+
+
+def test_sampler_accepts_3d_verify_logits():
+    B, T, V = 2, 3, 16
+    lp = _log_normalize(mx.random.normal((B, T, V), key=mx.random.key(0)))
+    tokens = _pinned_and_hot()(lp)
+    mx.eval(tokens)
+    assert tokens.shape == (B, T)
+    assert tokens.dtype in (mx.int32, mx.uint32, mx.int64)
+
+
+def test_3d_rows_use_their_own_config():
+    # Expanding the per-row configs in the wrong order (tile instead of repeat)
+    # gives row 0's flattened positions row 1's config, so the pinned row stops
+    # tracking its own argmax.
+    B, T, V = 2, 8, 24
+    lp = _log_normalize(mx.random.normal((B, T, V), key=mx.random.key(3)))
+    tokens = _pinned_and_hot()(lp)
+    argmax = mx.argmax(lp, axis=-1)
+    mx.eval(tokens, argmax)
+    # row 0 is top_k=1 -> its argmax at every position
+    assert tokens[0].tolist() == argmax[0].tolist()
+    # row 1 is hot: it must not be pinned to the argmax at every position
+    assert tokens[1].tolist() != argmax[1].tolist()
+
+
+def test_3d_positions_advance_within_the_block():
+    # A single frozen key for the whole block would draw the same quantile at
+    # every position; with a near-uniform row that shows up as one repeated
+    # token across T.
+    B, T, V = 1, 12, 40
+    lp = _log_normalize(mx.zeros((B, T, V)))
+    tokens = _PositionedTargetSampler([SamplingConfig(temperature=1.0, seed=5)])(lp)
+    mx.eval(tokens)
+    assert len(set(tokens[0].tolist())) > 1
+
+
+def test_3d_matches_2d_per_slice():
+    # Each [b, t] slice must be sampled from that slice alone -- no leakage
+    # from neighbouring positions. Pinning every row to top_k=1 makes the
+    # expected answer exact, so a transposed flatten/reshape fails loudly.
+    B, T, V = 3, 4, 20
+    lp = _log_normalize(mx.random.normal((B, T, V), key=mx.random.key(7)))
+    sampler = _PositionedTargetSampler(
+        [SamplingConfig(temperature=1.0, top_k=1, seed=s) for s in (1, 2, 3)]
+    )
+    tokens = sampler(lp)
+    expected = mx.argmax(lp, axis=-1)
+    mx.eval(tokens, expected)
+    assert tokens.tolist() == expected.tolist()
+
+
+def test_sampler_rejects_unsupported_rank():
+    sampler = _PositionedTargetSampler([SamplingConfig(temperature=1.0, seed=1)])
+    with pytest.raises(ValueError, match="rank"):
+        sampler(mx.zeros((5,)))
+    with pytest.raises(ValueError, match="rank"):
+        sampler(mx.zeros((1, 1, 2, 5)))
+
+
+def test_3d_width_mismatch_still_raises():
+    sampler = _PositionedTargetSampler(
+        [SamplingConfig(temperature=1.0, seed=1), SamplingConfig(seed=2)]
+    )
+    with pytest.raises(ValueError, match="configs length"):
+        sampler(mx.zeros((3, 2, 5)))
+
+
+# --- narrower batches on a uniform sampler ---------------------------------
+#
+# The dflash/eagle3 round loops build ONE sampler for the whole batch and then
+# call it with fewer rows: draft_block drafts row by row ([1, T, V] per row,
+# dflash.py:255-267), and continuous batching drops finished sequences from the
+# verify batch without rebuilding the sampler (dflash.py:328-338). The server
+# guarantees those configs are uniform (_serialize_speculative_batch_by_config
+# returns [target_config] * len(kept)), so one config broadcasts to any width.
+
+
+def test_uniform_configs_broadcast_to_narrower_batch():
+    V = 12
+    sampler = _PositionedTargetSampler([SamplingConfig(temperature=1.0, seed=4)] * 3)
+    lp2 = _log_normalize(mx.random.normal((1, V), key=mx.random.key(1)))
+    lp3 = _log_normalize(mx.random.normal((2, 5, V), key=mx.random.key(2)))
+    tok2, tok3 = sampler(lp2), sampler(lp3)
+    mx.eval(tok2, tok3)
+    assert tok2.shape == (1,)
+    assert tok3.shape == (2, 5)
+
+
+def test_broadcast_uses_the_shared_config_not_a_default():
+    # A broadcast row must carry the batch's config, not SamplingConfig() --
+    # whose temperature=0.0 would silently turn the row greedy.
+    V, T = 32, 16
+    lp = _log_normalize(mx.zeros((1, T, V)))
+    tokens = _PositionedTargetSampler([SamplingConfig(temperature=1.0, seed=4)] * 3)(lp)
+    mx.eval(tokens)
+    assert len(set(tokens[0].tolist())) > 1
+
+
+def test_heterogeneous_configs_still_require_matching_width():
+    sampler = _PositionedTargetSampler(
+        [
+            SamplingConfig(temperature=1.0, seed=1),
+            SamplingConfig(temperature=1.5, seed=2),
+            SamplingConfig(temperature=0.5, seed=3),
+        ]
+    )
+    with pytest.raises(ValueError, match="configs length"):
+        sampler(mx.zeros((1, 6)))
+    with pytest.raises(ValueError, match="configs length"):
+        sampler(mx.zeros((2, 4, 6)))

@@ -189,6 +189,10 @@ def batched_row_sample(
     Greedy rows (temperature < eps) return argmax of the unfiltered logprobs.
     """
     eps = 1e-5
+    if logprobs.ndim != 2:
+        raise ValueError(
+            f"batched_row_sample expects rank-2 [B, V] logprobs, got rank {logprobs.ndim}."
+        )
     B, V = logprobs.shape
     work = logprobs.astype(mx.float32) if logprobs.dtype == mx.bfloat16 else logprobs
 
@@ -264,7 +268,26 @@ class _PositionedTargetSampler:
         invariant."""
         return _PositionedTargetSampler([self.configs[i] for i in keep])
 
-    def _uses_new_modes(self) -> bool:
+    def _configs_for(self, n: int) -> List["SamplingConfig"]:
+        """Per-row configs for a batch of width ``n``.
+
+        The dflash/eagle3 round loops build one sampler for the whole batch and
+        then call it with fewer rows: the drafter drafts one row at a time
+        (``draft_block``), and continuous batching drops finished sequences
+        from the verify batch without rebuilding the sampler. Those batches are
+        uniform by construction (the server's
+        ``_serialize_speculative_batch_by_config`` returns one repeated
+        config), so a single shared config broadcasts to any width. A genuinely
+        heterogeneous sampler must still line up 1:1, or a row would silently
+        sample with a neighbour's parameters.
+        """
+        if n == len(self.configs):
+            return self.configs
+        if len(set(self.configs)) == 1:
+            return [self.configs[0]] * n
+        raise ValueError("configs length must match logprobs batch size.")
+
+    def _uses_new_modes(self, configs: Optional[List["SamplingConfig"]] = None) -> bool:
         """True when any row enables top_n_sigma / p_less / typical_p.
 
         When no row does (the overwhelmingly common case) the extra masks are
@@ -273,18 +296,18 @@ class _PositionedTargetSampler:
         """
         return any(
             x.top_n_sigma > 0 or bool(x.p_less) or 0.0 < x.typical_p < 1.0
-            for x in self.configs
+            for x in (self.configs if configs is None else configs)
         )
 
-    def _arrays(self):
-        c = self.configs
+    def _arrays(self, configs: Optional[List["SamplingConfig"]] = None):
+        c = self.configs if configs is None else configs
         base = (
             mx.array([x.temperature for x in c], dtype=mx.float32),
             mx.array([x.top_p for x in c], dtype=mx.float32),
             mx.array([x.top_k for x in c], dtype=mx.int32),
             mx.array([x.min_p for x in c], dtype=mx.float32),
         )
-        if not self._uses_new_modes():
+        if not self._uses_new_modes(c):
             return base + (None, None, None)
         return base + (
             mx.array([x.top_n_sigma for x in c], dtype=mx.float32),
@@ -293,16 +316,43 @@ class _PositionedTargetSampler:
         )
 
     def __call__(self, logprobs: mx.array) -> mx.array:
-        n = logprobs.shape[0]
+        if logprobs.ndim == 3:
+            return self._draw_block(logprobs)
+        if logprobs.ndim != 2:
+            raise ValueError(
+                "sampler expects rank-2 [B, V] or rank-3 [B, T, V] logprobs, "
+                f"got rank {logprobs.ndim}."
+            )
+        configs = self._configs_for(logprobs.shape[0])
+        keys = mx.stack(
+            [mx.random.key(_position_seed(c.seed, i, 0)) for i, c in enumerate(configs)]
+        )
+        return self._draw(logprobs, keys, configs=configs)
+
+    def _draw_block(self, logprobs: mx.array) -> mx.array:
+        """Verify-block sampling: [B, T, V] -> [B, T].
+
+        The dflash/eagle3 verify loops hand the whole block to the sampler in
+        one call and then index/concatenate the result along axis 1, so this
+        rank is part of the sampler contract, not an edge case.
+
+        Rows are flattened row-major -- row ``b`` owns flat rows
+        ``b*T .. b*T+T-1`` -- and each row's config is repeated ``T`` times to
+        match, so every position keeps its own row's parameters. Keys advance
+        with the position inside the block so the T draws are independent
+        rather than T copies of one quantile.
+        """
+        B, T, _ = logprobs.shape
+        configs = self._configs_for(B)
         keys = mx.stack(
             [
-                mx.random.key(_position_seed(c.seed, i, 0))
-                for i, c in enumerate(self.configs)
+                mx.random.key(_position_seed(c.seed, i, t))
+                for i, c in enumerate(configs)
+                for t in range(T)
             ]
         )
-        if n != len(self.configs):
-            raise ValueError("configs length must match logprobs batch size.")
-        return self._draw(logprobs, keys)
+        flat = self._draw(logprobs.reshape(B * T, -1), keys, configs=configs, repeat=T)
+        return flat.reshape(B, T)
 
     def sample_target(
         self, logprobs: mx.array, *, row_ids: List[int], positions: List[int]
@@ -319,7 +369,21 @@ class _PositionedTargetSampler:
         )
         return self._draw(logprobs, keys)
 
-    def _draw(self, logprobs: mx.array, keys: mx.array) -> mx.array:
+    def _draw(
+        self,
+        logprobs: mx.array,
+        keys: mx.array,
+        *,
+        configs: Optional[List["SamplingConfig"]] = None,
+        repeat: int = 1,
+    ) -> mx.array:
+        arrays = self._arrays(configs)
+        if repeat > 1:
+            # mx.repeat (not tile) so the expansion is row-major and matches
+            # the [B, T, V] -> [B*T, V] flatten in _draw_block.
+            arrays = tuple(
+                None if a is None else mx.repeat(a, repeat, axis=0) for a in arrays
+            )
         (
             temperature,
             top_p,
@@ -328,7 +392,7 @@ class _PositionedTargetSampler:
             top_n_sigma,
             p_less,
             typical_p,
-        ) = self._arrays()
+        ) = arrays
         return batched_row_sample(
             logprobs,
             temperature=temperature,
