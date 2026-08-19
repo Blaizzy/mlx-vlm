@@ -87,6 +87,7 @@ nav:
     - Usage: usage.md
     - Server: server.md
     - Speculative Decoding: speculative-decoding.md
+    - Quantization: quantization.md
     - Prefix Caching: prefix-caching.md
     - KV Cache Quantization: kv-cache-quantization.md
     - Examples: examples.md
