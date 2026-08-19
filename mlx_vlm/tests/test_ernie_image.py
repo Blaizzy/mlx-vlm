@@ -31,6 +31,7 @@ from mlx_vlm.models.ernie_image.config import (
 )
 from mlx_vlm.models.ernie_image.convert import (
     _quantization_parameters,
+    _quantize_component,
     _source_layout,
     _vae_checkpoint_has_encoder,
     _write_missing_configs,
@@ -65,6 +66,7 @@ from mlx_vlm.models.ernie_image.weights import (
     sanitize_text_encoder_weights,
     sanitize_transformer_weights,
 )
+from mlx_vlm.models.flux2.vae import Flux2VAE
 
 convert_module = importlib.import_module("mlx_vlm.convert")
 
@@ -390,6 +392,22 @@ def test_ernie_strict_quantized_loading_modes(
 def test_ernie_rejects_incompatible_native_quantization_options() -> None:
     with pytest.raises(ValueError, match="requires"):
         _quantization_parameters("mxfp8", 64, 8)
+
+
+def test_conversion_quantizes_compatible_vae_attention() -> None:
+    vae = Flux2VAE(
+        decoder_block_out_channels=(32, 32),
+        include_encoder=True,
+        encoder_block_out_channels=(32, 32),
+    )
+    _quantize_component(
+        vae,
+        {"mode": "mxfp8", "group_size": 32, "bits": 8},
+        lambda path, module: hasattr(module, "to_quantized"),
+    )
+    assert isinstance(vae.decoder.mid_block.attentions[0].to_q, nn.QuantizedLinear)
+    assert isinstance(vae.encoder.mid_block.attentions[0].to_q, nn.QuantizedLinear)
+    assert isinstance(vae.decoder.conv_in, nn.Conv2d)
 
 
 class FakePipeline:

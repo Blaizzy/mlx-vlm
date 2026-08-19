@@ -118,7 +118,7 @@ def convert_ernie_image(
         (
             "vae",
             lambda: load_vae(source, include_encoder=include_vae_encoder),
-            None,
+            lambda path, module: hasattr(module, "to_quantized"),
         ),
     ]
     if list((source / "pe").glob("*.safetensors")):
