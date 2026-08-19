@@ -1106,6 +1106,101 @@ def test_exact_lookup_memory_takes_priority_over_disk(tmp_path, monkeypatch):
     manager.close()
 
 
+def test_exact_disk_roundtrip_generic_composite_cache(tmp_path, monkeypatch):
+    """Checkpoint serialization covers in-tree composite/custom cache leaves."""
+    from mlx_vlm.models.cache import CacheList, PoolingCache, SimpleKVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    monkeypatch.setenv("APC_EXACT_MIN_TOKENS", "1")
+    token_ids = list(range(12))
+
+    simple = SimpleKVCache()
+    simple.update_and_fetch(mx.ones((1, 2, 12, 4)), mx.ones((1, 2, 12, 4)) * 2)
+
+    pooling = PoolingCache(ratio=2)
+    pooling.pooled = mx.ones((1, 5, 4)) * 3
+    pooling.buf_kv = mx.ones((1, 2, 4)) * 4
+    pooling.buf_gate = mx.ones((1, 2, 1)) * 5
+    pooling.remainder = 1
+    mx.eval(simple.keys, simple.values, pooling.state)
+
+    disk = DiskBlockStore(tmp_path, namespace="generic-checkpoint")
+    manager = APCManager(num_blocks=4, block_size=4, disk=disk)
+    assert manager.store_exact_cache(
+        token_ids, [(simple, SimpleKVCache()), CacheList(pooling)]
+    )
+    disk._q.join()
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="generic-checkpoint")
+    manager = APCManager(num_blocks=4, block_size=4, disk=disk)
+    restored, prefix_len = manager.lookup_exact_cache(token_ids + [99])
+    assert prefix_len == len(token_ids)
+    assert isinstance(restored[0], tuple)
+    assert isinstance(restored[0][0], SimpleKVCache)
+    assert restored[0][0].cache_length == len(token_ids)
+    assert isinstance(restored[1], CacheList)
+    restored_pool = restored[1].caches[0]
+    assert isinstance(restored_pool, PoolingCache)
+    assert restored_pool.ratio == 2 and restored_pool.remainder == 1
+    assert bool(mx.array_equal(restored_pool.pooled, pooling.pooled))
+    manager.close()
+
+
+def test_exact_disk_roundtrip_ring_and_indexed_kv_cache(tmp_path, monkeypatch):
+    """Subtype metadata survives checkpoint persistence and process restart."""
+    from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
+    from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    monkeypatch.setenv("APC_EXACT_MIN_TOKENS", "1")
+    token_ids = list(range(10))
+
+    ring = RingSlidingKVCache(window_size=4)
+    ring.keys = mx.ones((1, 2, 8, 4))
+    ring.values = mx.ones((1, 2, 8, 4)) * 2
+    ring.prefill_length = 4
+    ring.offset = 11
+    ring._ring_pos = 3
+
+    indexed = MiniMaxM3KVCache()
+    indexed.kv_cache.update_and_fetch(
+        mx.ones((1, 2, 10, 4)) * 3,
+        mx.ones((1, 2, 10, 4)) * 4,
+    )
+    indexed.update_index_and_fetch(mx.ones((1, 1, 10, 4)) * 5)
+    mx.eval(ring.keys, ring.values, indexed.state)
+
+    disk = DiskBlockStore(tmp_path, namespace="special-checkpoint")
+    manager = APCManager(num_blocks=4, block_size=4, disk=disk)
+    assert manager.store_exact_cache(token_ids, [ring, indexed])
+    disk._q.join()
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="special-checkpoint")
+    manager = APCManager(num_blocks=4, block_size=4, disk=disk)
+    restored, prefix_len = manager.lookup_exact_cache(token_ids + [99])
+    assert prefix_len == len(token_ids)
+    restored_ring, restored_indexed = restored
+    assert isinstance(restored_ring, RingSlidingKVCache)
+    assert (
+        restored_ring.window_size,
+        restored_ring.prefill_length,
+        restored_ring.offset,
+        restored_ring._ring_pos,
+    ) == (4, 4, 11, 3)
+    assert isinstance(restored_indexed, MiniMaxM3KVCache)
+    assert restored_indexed.offset == 10
+    assert restored_indexed.index_offset == 10
+    assert bool(
+        mx.array_equal(
+            restored_indexed.index_keys,
+            indexed.index_keys[..., : indexed.index_offset, :],
+        )
+    )
+    manager.close()
+
+
 def test_exact_disk_hit_promotion_clone_is_independent_of_returned_cache(
     tmp_path, monkeypatch
 ):

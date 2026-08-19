@@ -813,7 +813,7 @@ def stream_generate(
     full_input_ids_list = input_ids.flatten().tolist()
     apc_blocks_in_use: List[_apc.APCBlock] = []
     apc_extra_hash = 0
-    apc_mode: Optional[str] = None
+    apc_coordinator: Optional[_apc.APCCoordinator] = None
 
     multimodal_token_ids = _apc.multimodal_token_ids_from_config(model.config)
     apc_safe_prefix_min = _apc.media_safe_prefix_min(
@@ -837,8 +837,9 @@ def stream_generate(
         )
 
     if apc_manager is not None:
-        apc_mode = _apc.model_apc_mode(model.language_model)
-        if apc_mode is None:
+        apc_coordinator = _apc.APCCoordinator(apc_manager, model.language_model)
+        if not apc_coordinator.enabled:
+            apc_coordinator = None
             apc_manager = None
 
     if apc_manager is not None:
@@ -884,11 +885,9 @@ def stream_generate(
     # APC: cross-request, hash-based prefix lookup. Only consulted if a per-turn
     # PromptCacheState didn't already produce a hit.
     if apc_manager is not None and reused_prefix_len == 0:
-        plan = _apc.apc_lookup_plan(
-            apc_manager,
+        plan = apc_coordinator.lookup(
             full_input_ids_list,
             extra_hash=apc_extra_hash,
-            apc_mode=apc_mode,
             safe_lookup_min=apc_safe_prefix_lookup_min,
             suffix_is_text_only=_apc_suffix_is_text_only,
             prefix_has_media=_apc_prefix_has_media_tokens,
@@ -903,29 +902,26 @@ def stream_generate(
                 input_ids = input_ids[:, plen:]
                 pixel_values = None
                 kwargs.pop("cached_image_features", None)
-                if warm_cache is not None:
-                    kwargs["prompt_cache"] = warm_cache
-                else:
-                    apc_blocks_in_use = matched_blocks
-                    _quant_policy = kv_quant_from_legacy(
-                        kwargs.get("kv_bits"),
-                        kwargs.get("kv_quant_scheme"),
-                        kwargs.get("kv_group_size", 64),
-                        kwargs.get("kv_key_bits"),
-                        kwargs.get("kv_value_bits"),
-                        kwargs.get("kv_key_scheme"),
-                        kwargs.get("kv_value_scheme"),
-                    )
-                    _quant_cfg = (
-                        _quant_policy.to_config() if _quant_policy is not None else None
-                    )
-                    kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
-                        matched_blocks,
-                        min_capacity_tokens=plen + input_ids.shape[1] + 1,
-                        kv_quant_config=_quant_cfg,
-                    )
+                apc_blocks_in_use = matched_blocks
+                _quant_policy = kv_quant_from_legacy(
+                    kwargs.get("kv_bits"),
+                    kwargs.get("kv_quant_scheme"),
+                    kwargs.get("kv_group_size", 64),
+                    kwargs.get("kv_key_bits"),
+                    kwargs.get("kv_value_bits"),
+                    kwargs.get("kv_key_scheme"),
+                    kwargs.get("kv_value_scheme"),
+                )
+                _quant_cfg = (
+                    _quant_policy.to_config() if _quant_policy is not None else None
+                )
+                kwargs["prompt_cache"] = apc_coordinator.materialize_single(
+                    plan,
+                    min_capacity_tokens=plen + input_ids.shape[1] + 1,
+                    kv_quant_config=_quant_cfg,
+                )
             elif warm_cache is None and matched_blocks:
-                apc_manager.release(matched_blocks)
+                apc_coordinator.release_hit(plan)
 
     if thinking_budget is not None:
         thinking_start_token_id = tokenizer.encode(
@@ -961,18 +957,19 @@ def stream_generate(
         thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
         exact_checkpoint_len = None
         exact_checkpoint = None
-        if apc_manager is not None and apc_mode == "exact" and reused_prefix_len == 0:
-            exact_checkpoint_len = _apc.adjust_prefix_to_text_suffix_boundary(
-                full_input_ids_list,
-                len(full_input_ids_list) - apc_manager.exact_cache_guard_tokens,
-                multimodal_token_ids,
-                max_prefix_tokens=len(full_input_ids_list) - 1,
+        if (
+            apc_coordinator is not None
+            and apc_coordinator.is_checkpoint
+            and reused_prefix_len == 0
+        ):
+            exact_checkpoint_len = apc_coordinator.checkpoint_len(
+                full_input_ids_list, multimodal_token_ids
             )
             if exact_checkpoint_len <= 0:
                 exact_checkpoint_len = None
 
             def exact_checkpoint(prefix_len: int, prompt_cache: List[Any]) -> None:
-                apc_manager.store_exact_cache(
+                apc_coordinator.store_checkpoint(
                     full_input_ids_list[:prefix_len],
                     prompt_cache,
                     extra_hash=apc_extra_hash,
@@ -998,12 +995,12 @@ def stream_generate(
                 prompt_tps = total_prompt_tokens / prompt_time
                 tic = time.perf_counter()
                 if (
-                    apc_manager is not None
-                    and apc_mode == "exact"
+                    apc_coordinator is not None
+                    and apc_coordinator.is_checkpoint
                     and reused_prefix_len == 0
                 ):
                     try:
-                        apc_manager.store_exact_cache(
+                        apc_coordinator.store_checkpoint(
                             full_input_ids_list,
                             tracked_cache,
                             extra_hash=apc_extra_hash,
@@ -1083,14 +1080,13 @@ def stream_generate(
             prompt_cache_state.update(all_ids, tracked_cache)
 
         # APC: harvest new blocks from the post-generation KV state.
-        if apc_manager is not None and apc_mode == "block":
+        if apc_coordinator is not None and not apc_coordinator.is_checkpoint:
             try:
                 if all_ids is None:
                     all_ids = full_input_ids_list + [
                         t.item() if hasattr(t, "item") else t for t in generated_tokens
                     ]
-                _apc.commit_prefix_blocks(
-                    apc_manager,
+                apc_coordinator.commit(
                     tracked_cache,
                     all_ids,
                     extra_hash=apc_extra_hash,
@@ -1099,7 +1095,7 @@ def stream_generate(
                 )
             except Exception as e:
                 logger.warning("APC store failed: %s", e)
-                apc_manager.release(apc_blocks_in_use)
+                apc_coordinator.manager.release(apc_blocks_in_use)
 
         # Cleanup after generation
         mx.clear_cache()

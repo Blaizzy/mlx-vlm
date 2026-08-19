@@ -1,8 +1,10 @@
 """Automatic Prefix Caching (APC) for mlx-vlm.
 
-Hash-based, block-level KV cache reuse across requests. The KV cache is split
-into fixed-size blocks (default 16 tokens). Each fully-filled block is
-identified by a chained hash::
+Hash-based model-cache reuse across requests. ``APCCoordinator`` derives a
+grouped cache plan from ``model.make_cache()``: native dense K/V entries use
+fixed-size blocks (default 16 tokens), while windowed/recurrent/composite
+entries use restorable checkpoints at a common prefix boundary. Each
+fully-filled pageable block is identified by a chained hash::
 
     block_hash[i] = H(block_hash[i-1], tuple(tokens[i*bs:(i+1)*bs]), extra_hash[i])
 
@@ -41,6 +43,7 @@ FlashInfer/FA3), not a different cache design.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -57,6 +60,7 @@ import mlx.core as mx
 import numpy as np
 
 from ._stream_cleanup import clear_mlx_streams
+from .apc_coordinator import APCCoordinator
 from .apc_storage import APCNode, ComponentId, StateHandle
 from .kv_quant import from_config as kv_quant_from_config
 from .kv_quant import kv_quant_fingerprint
@@ -686,6 +690,89 @@ def _numel(shape: Sequence[int]) -> int:
     for dim in shape:
         out *= int(dim)
     return out
+
+
+def _encode_checkpoint_tree(
+    value: Any,
+    tensor_prefix: str,
+    arrays: Dict[str, mx.array],
+    counter: List[int],
+) -> Optional[dict]:
+    """Encode a snapshot tree into JSON structure plus safetensors arrays."""
+    if isinstance(value, mx.array):
+        name = f"{tensor_prefix}_t{counter[0]}"
+        counter[0] += 1
+        arrays[name] = value
+        return {"kind": "array", "name": name}
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return {"kind": "scalar", "value": value}
+    if isinstance(value, np.generic):
+        return {"kind": "scalar", "value": value.item()}
+    if isinstance(value, tuple):
+        items = [
+            _encode_checkpoint_tree(v, tensor_prefix, arrays, counter) for v in value
+        ]
+        if any(item is None for item in items):
+            return None
+        return {"kind": "tuple", "items": items}
+    if isinstance(value, list):
+        items = [
+            _encode_checkpoint_tree(v, tensor_prefix, arrays, counter) for v in value
+        ]
+        if any(item is None for item in items):
+            return None
+        return {"kind": "list", "items": items}
+    if isinstance(value, dict):
+        items = []
+        for key, item_value in value.items():
+            enc_key = _encode_checkpoint_tree(key, tensor_prefix, arrays, counter)
+            enc_value = _encode_checkpoint_tree(
+                item_value, tensor_prefix, arrays, counter
+            )
+            if enc_key is None or enc_value is None:
+                return None
+            items.append([enc_key, enc_value])
+        return {"kind": "dict", "items": items}
+    return None
+
+
+def _decode_checkpoint_tree(structure: dict, load_array) -> Any:
+    kind = structure.get("kind")
+    if kind == "array":
+        return load_array(structure["name"])
+    if kind == "scalar":
+        return structure.get("value")
+    if kind == "tuple":
+        return tuple(
+            _decode_checkpoint_tree(item, load_array)
+            for item in structure.get("items", ())
+        )
+    if kind == "list":
+        return [
+            _decode_checkpoint_tree(item, load_array)
+            for item in structure.get("items", ())
+        ]
+    if kind == "dict":
+        return {
+            _decode_checkpoint_tree(key, load_array): _decode_checkpoint_tree(
+                value, load_array
+            )
+            for key, value in structure.get("items", ())
+        }
+    raise ValueError(f"unsupported checkpoint tree node: {kind!r}")
+
+
+def _resolve_checkpoint_class(module_name: str, qualname: str) -> Optional[type]:
+    """Resolve an importable cache class recorded by the local disk tier."""
+    if not module_name.startswith("mlx_vlm.") or "<locals>" in qualname:
+        return None
+    try:
+        value: Any = importlib.import_module(module_name)
+        for part in qualname.split("."):
+            value = getattr(value, part)
+        return value if isinstance(value, type) else None
+    except (ImportError, AttributeError):
+        return None
 
 
 def _safetensors_dtype_info(dtype: str):
@@ -1413,6 +1500,33 @@ class DiskBlockStore:
         from .models import cache as lm_cache
 
         kind = metadata.get(f"{prefix}_kind")
+        if kind == "ring_kv":
+            from .models.unlimited_ocr.language import RingSlidingKVCache
+
+            try:
+                window_size = int(metadata[f"{prefix}_window_size"])
+                offset = int(metadata.get(f"{prefix}_offset", "0"))
+                prefill_length = int(metadata.get(f"{prefix}_prefill_length", "-1"))
+                ring_pos = int(metadata.get(f"{prefix}_ring_pos", "0"))
+            except (KeyError, TypeError, ValueError):
+                return None
+            c = RingSlidingKVCache(window_size)
+            c.offset = offset
+            c.prefill_length = None if prefill_length < 0 else prefill_length
+            c._ring_pos = ring_pos
+            if metadata.get(f"{prefix}_empty", "0") == "1":
+                return c
+            k_entry = tensor_entries.get(f"{prefix}_k")
+            v_entry = tensor_entries.get(f"{prefix}_v")
+            if k_entry is None or v_entry is None:
+                return None
+            c.keys = _read_safetensors_tensor(path, data_start, k_entry)
+            c.values = _read_safetensors_tensor(path, data_start, v_entry)
+            if c.keys is None or c.values is None:
+                return None
+            eval_targets.extend([c.keys, c.values])
+            return c
+
         if kind == "kv":
             if metadata.get(f"{prefix}_empty", "0") == "1":
                 c = lm_cache.KVCache()
@@ -1533,6 +1647,76 @@ class DiskBlockStore:
                 eval_targets.append(c.lengths)
             return c
 
+        if kind == "simple_kv":
+            try:
+                cache_length = int(metadata.get(f"{prefix}_cache_length", "0"))
+            except (TypeError, ValueError):
+                return None
+            c = lm_cache.SimpleKVCache()
+            c.cache_length = cache_length
+            if metadata.get(f"{prefix}_empty", "0") == "1":
+                return c
+            k_entry = tensor_entries.get(f"{prefix}_k")
+            v_entry = tensor_entries.get(f"{prefix}_v")
+            if k_entry is None or v_entry is None:
+                return None
+            c.keys = _read_safetensors_tensor(path, data_start, k_entry)
+            c.values = _read_safetensors_tensor(path, data_start, v_entry)
+            if c.keys is None or c.values is None:
+                return None
+            eval_targets.extend([c.keys, c.values])
+            return c
+
+        if kind == "pooling":
+            try:
+                ratio = int(metadata[f"{prefix}_ratio"])
+                remainder = int(metadata.get(f"{prefix}_remainder", "0"))
+            except (KeyError, TypeError, ValueError):
+                return None
+            c = lm_cache.PoolingCache(ratio)
+            c.remainder = remainder
+            for attr in ("pooled", "buf_kv", "buf_gate"):
+                entry = tensor_entries.get(f"{prefix}_{attr}")
+                if entry is None:
+                    continue
+                value = _read_safetensors_tensor(path, data_start, entry)
+                if value is None:
+                    return None
+                setattr(c, attr, value)
+                eval_targets.append(value)
+            return c
+
+        if kind == "minimax_m3":
+            from .models.minimax_m3_vl.language import MiniMaxM3KVCache
+
+            try:
+                offset = int(metadata.get(f"{prefix}_offset", "0"))
+                index_offset = int(metadata.get(f"{prefix}_index_offset", "0"))
+            except (TypeError, ValueError):
+                return None
+            c = MiniMaxM3KVCache()
+            k_entry = tensor_entries.get(f"{prefix}_k")
+            v_entry = tensor_entries.get(f"{prefix}_v")
+            if k_entry is not None or v_entry is not None:
+                if k_entry is None or v_entry is None:
+                    return None
+                keys = _read_safetensors_tensor(path, data_start, k_entry)
+                values = _read_safetensors_tensor(path, data_start, v_entry)
+                if keys is None or values is None:
+                    return None
+                c.kv_cache.keys = keys
+                c.kv_cache.values = values
+                c.kv_cache.offset = offset
+                eval_targets.extend([keys, values])
+            index_entry = tensor_entries.get(f"{prefix}_index_keys")
+            if index_entry is not None:
+                c.index_keys = _read_safetensors_tensor(path, data_start, index_entry)
+                if c.index_keys is None:
+                    return None
+                eval_targets.append(c.index_keys)
+            c.index_offset = index_offset
+            return c
+
         if kind in ("cache_list", "tuple"):
             try:
                 size = int(metadata.get(f"{prefix}_size", "0"))
@@ -1555,6 +1739,46 @@ class DiskBlockStore:
             if kind == "cache_list":
                 return lm_cache.CacheList(*loaded)
             return tuple(loaded)
+
+        if kind == "checkpoint":
+            module_name = metadata.get(f"{prefix}_module", "")
+            qualname = metadata.get(f"{prefix}_qualname", "")
+            cls = _resolve_checkpoint_class(module_name, qualname)
+            if cls is None:
+                return None
+            try:
+                structure = json.loads(metadata[f"{prefix}_tree"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                return None
+
+            loaded_arrays: List[mx.array] = []
+
+            def load_array(name: str) -> mx.array:
+                entry = tensor_entries.get(name)
+                if entry is None:
+                    raise KeyError(name)
+                array = _read_safetensors_tensor(path, data_start, entry)
+                if array is None:
+                    raise ValueError(name)
+                loaded_arrays.append(array)
+                return array
+
+            try:
+                payload = _decode_checkpoint_tree(structure, load_array)
+                try:
+                    cache = cls()
+                except TypeError:
+                    cache = cls.__new__(cls)
+                restore = getattr(cache, "prefix_cache_restore", None)
+                if callable(restore):
+                    restore(payload)
+                else:
+                    cache.state = payload["state"]
+                    cache.meta_state = payload["meta_state"]
+            except (KeyError, TypeError, ValueError, AttributeError):
+                return None
+            eval_targets.extend(loaded_arrays)
+            return cache
 
         return None
 
@@ -2570,7 +2794,25 @@ class DiskBlockStore:
     ) -> bool:
         from .models import cache as lm_cache
 
-        if isinstance(c, lm_cache.KVCache):
+        if (
+            type(c).__name__ == "RingSlidingKVCache"
+            and type(c).__module__ == "mlx_vlm.models.unlimited_ocr.language"
+        ):
+            metadata[f"{prefix}_kind"] = "ring_kv"
+            metadata[f"{prefix}_window_size"] = str(int(c.window_size))
+            metadata[f"{prefix}_offset"] = str(int(c.offset))
+            metadata[f"{prefix}_prefill_length"] = str(
+                -1 if c.prefill_length is None else int(c.prefill_length)
+            )
+            metadata[f"{prefix}_ring_pos"] = str(int(c._ring_pos))
+            if c.keys is None or c.values is None:
+                metadata[f"{prefix}_empty"] = "1"
+                return True
+            arrays[f"{prefix}_k"] = c.keys
+            arrays[f"{prefix}_v"] = c.values
+            return True
+
+        if type(c) is lm_cache.KVCache:
             off = int(getattr(c, "offset", 0) or 0)
             metadata[f"{prefix}_kind"] = "kv"
             metadata[f"{prefix}_offset"] = str(off)
@@ -2625,6 +2867,40 @@ class DiskBlockStore:
                 arrays[f"{prefix}_lengths"] = c.lengths
             return True
 
+        if isinstance(c, lm_cache.SimpleKVCache):
+            metadata[f"{prefix}_kind"] = "simple_kv"
+            metadata[f"{prefix}_cache_length"] = str(int(c.cache_length))
+            if c.keys is None or c.values is None:
+                metadata[f"{prefix}_empty"] = "1"
+                return True
+            arrays[f"{prefix}_k"] = c.keys
+            arrays[f"{prefix}_v"] = c.values
+            return True
+
+        if isinstance(c, lm_cache.PoolingCache):
+            metadata[f"{prefix}_kind"] = "pooling"
+            metadata[f"{prefix}_ratio"] = str(int(c.ratio))
+            metadata[f"{prefix}_remainder"] = str(int(c.remainder))
+            for attr in ("pooled", "buf_kv", "buf_gate"):
+                value = getattr(c, attr, None)
+                if value is not None:
+                    arrays[f"{prefix}_{attr}"] = value
+            return True
+
+        if (
+            type(c).__name__ == "MiniMaxM3KVCache"
+            and type(c).__module__ == "mlx_vlm.models.minimax_m3_vl.language"
+        ):
+            metadata[f"{prefix}_kind"] = "minimax_m3"
+            metadata[f"{prefix}_offset"] = str(int(c.offset))
+            metadata[f"{prefix}_index_offset"] = str(int(c.index_offset))
+            if not c.kv_cache.empty():
+                arrays[f"{prefix}_k"] = c.kv_cache.keys
+                arrays[f"{prefix}_v"] = c.kv_cache.values
+            if c.index_keys is not None:
+                arrays[f"{prefix}_index_keys"] = c.index_keys
+            return True
+
         if isinstance(c, lm_cache.CacheList):
             metadata[f"{prefix}_kind"] = "cache_list"
             metadata[f"{prefix}_size"] = str(len(c.caches))
@@ -2645,7 +2921,30 @@ class DiskBlockStore:
                 for j, sub_c in enumerate(c)
             )
 
-        return False
+        snapshot = getattr(c, "prefix_cache_snapshot", None)
+        if callable(snapshot):
+            try:
+                payload = snapshot()
+            except Exception:
+                return False
+        elif hasattr(c, "state") and hasattr(c, "meta_state"):
+            payload = {"state": c.state, "meta_state": c.meta_state}
+        else:
+            return False
+
+        structure = _encode_checkpoint_tree(payload, prefix, arrays, [0])
+        module_name = type(c).__module__
+        qualname = type(c).__qualname__
+        if (
+            structure is None
+            or _resolve_checkpoint_class(module_name, qualname) is None
+        ):
+            return False
+        metadata[f"{prefix}_kind"] = "checkpoint"
+        metadata[f"{prefix}_module"] = module_name
+        metadata[f"{prefix}_qualname"] = qualname
+        metadata[f"{prefix}_tree"] = json.dumps(structure, separators=(",", ":"))
+        return True
 
     def _write_exact_cache_snapshot(
         self,
@@ -2669,7 +2968,10 @@ class DiskBlockStore:
         if not arrays:
             return []
 
-        mx.eval(list(arrays.values()))
+        # ``store_exact_cache`` materializes the detached snapshot before it is
+        # queued. Do not create/evaluate MLX graphs in this worker thread: MLX
+        # streams are thread-local and recent releases reject that implicit
+        # cross-thread evaluation.
         tag = f"{os.getpid()}-{threading.get_ident()}"
         tmp = path.parent / f"{path.stem}.{tag}{self.SUFFIX}"
         mx.save_safetensors(str(tmp), arrays, metadata=metadata)
@@ -2875,10 +3177,22 @@ class APCManager:
         self.lock = threading.RLock()
         self.disk = disk
         self._exact_cache_max = max(
-            0, int(os.environ.get("APC_EXACT_CACHE_ENTRIES", "2"))
+            0,
+            int(
+                os.environ.get(
+                    "APC_CHECKPOINT_ENTRIES",
+                    os.environ.get("APC_EXACT_CACHE_ENTRIES", "2"),
+                )
+            ),
         )
         self.exact_cache_guard_tokens = max(
-            1, int(os.environ.get("APC_EXACT_PREFIX_GUARD_TOKENS", "16"))
+            1,
+            int(
+                os.environ.get(
+                    "APC_CHECKPOINT_GUARD_TOKENS",
+                    os.environ.get("APC_EXACT_PREFIX_GUARD_TOKENS", "16"),
+                )
+            ),
         )
         self.exact_cache_min_tokens = max(
             1, int(os.environ.get("APC_EXACT_MIN_TOKENS", "16"))
@@ -2928,6 +3242,10 @@ class APCManager:
         self._layer_major_memory_min_tokens = max(
             0, int(os.environ.get("APC_LAYER_MAJOR_MEMORY_MIN_TOKENS", "50000"))
         )
+
+    def coordinator(self, model: Any) -> APCCoordinator:
+        """Bind this storage manager to a model's grouped cache plan."""
+        return APCCoordinator(self, model)
 
     # ---------- LRU free queue (O(1)) ----------
     def _free_push(self, b: APCBlock) -> None:
@@ -4161,15 +4479,21 @@ def model_apc_mode(language_model: Any) -> Optional[str]:
     """
     if not hasattr(language_model, "make_cache"):
         return "block"
-    try:
-        prompt_cache = language_model.make_cache()
-    except Exception:
-        return None
-    if prompt_cache and all(_cache_entry_supports_block_apc(c) for c in prompt_cache):
-        return "block"
-    if prompt_cache and all(_cache_entry_supports_exact_apc(c) for c in prompt_cache):
-        return "exact"
-    return None
+    from .apc_adapters import build_prefix_cache_plan
+
+    return build_prefix_cache_plan(language_model).legacy_mode
+
+
+def model_apc_plan(language_model: Any):
+    """Return the grouped cache plan used by the APC coordinator.
+
+    This is the preferred introspection API. ``model_apc_mode`` remains as a
+    compatibility shim for callers that only understand the old block/exact
+    split.
+    """
+    from .apc_adapters import build_prefix_cache_plan
+
+    return build_prefix_cache_plan(language_model)
 
 
 def model_supports_apc(language_model: Any) -> bool:

@@ -2100,7 +2100,7 @@ def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
     processor = SimpleNamespace(tokenizer=tokenizer)
     model = SimpleNamespace(
         config=SimpleNamespace(model_type="test"),
-        language_model=SimpleNamespace(),
+        language_model=SimpleNamespace(layers=[object()]),
     )
     prepared_mask = mx.ones((1, 4), dtype=mx.int32)
 
@@ -2122,7 +2122,11 @@ def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
             dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
         ),
         patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
-        patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(
+            dispatch_module.cache,
+            "make_prompt_cache",
+            return_value=[dispatch_module.cache.KVCache()],
+        ),
         patch.object(
             dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
         ),
@@ -2149,7 +2153,7 @@ def test_stream_generate_hashes_explicit_sequence_tensors_for_apc_safety():
     processor = SimpleNamespace(tokenizer=tokenizer)
     model = SimpleNamespace(
         config=SimpleNamespace(model_type="test"),
-        language_model=SimpleNamespace(),
+        language_model=SimpleNamespace(layers=[object()]),
     )
     custom_embeds = mx.ones((1, 4, 3))
     custom_mask = mx.array([[1, 1, 0, 0]], dtype=mx.int32)
@@ -2164,7 +2168,11 @@ def test_stream_generate_hashes_explicit_sequence_tensors_for_apc_safety():
             dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
         ),
         patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
-        patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(
+            dispatch_module.cache,
+            "make_prompt_cache",
+            return_value=[dispatch_module.cache.KVCache()],
+        ),
         patch.object(
             dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
         ),

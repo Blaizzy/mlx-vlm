@@ -30,7 +30,7 @@ def test_kvcache_subclass_is_not_pageable_by_inheritance():
     from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 
     ring = RingSlidingKVCache(window_size=64)
-    assert A.resolve_capability(ring) == A.Capability.CHECKPOINT
+    assert A.resolve_capability(ring) == A.Capability.WINDOWED
     assert A.apc_block_eligible(ring) is False
     assert A.apc_exact_eligible(ring) is True
 
@@ -86,7 +86,74 @@ def test_build_prefix_cache_plan():
     assert len(plan.components) == 2
     assert plan.restorable
     assert plan.capabilities == [A.Capability.PAGEABLE, A.Capability.CHECKPOINT]
+    assert len(plan.groups) == 2
+    assert plan.is_hybrid
+    assert plan.strategy == "checkpoint"
     assert "PrefixCachePlan" in plan.describe()
+
+
+def test_dense_plan_has_one_pageable_group():
+    plan = A.build_prefix_cache_plan_from_caches([C.KVCache(), C.KVCache()])
+    assert plan.restorable
+    assert not plan.is_hybrid
+    assert plan.strategy == "block"
+    assert len(plan.groups) == 1
+    assert plan.groups[0].layer_indices == (0, 1)
+
+
+def test_hybrid_plan_groups_full_window_and_state_entries():
+    caches = [
+        C.KVCache(),
+        C.RotatingKVCache(max_size=64),
+        C.ArraysCache(2),
+    ]
+    plan = A.build_prefix_cache_plan_from_caches(caches)
+    assert plan.restorable and plan.is_hybrid
+    assert plan.strategy == "checkpoint"
+    assert [g.spec.capability for g in plan.groups] == [
+        A.Capability.PAGEABLE,
+        A.Capability.WINDOWED,
+        A.Capability.CHECKPOINT,
+    ]
+    assert [c.group_id for c in plan.components] == [0, 1, 2]
+
+
+def test_composite_spec_is_recursive():
+    spec = A.cache_spec(C.CacheList(C.KVCache(), C.ArraysCache(2)))
+    assert spec.capability == A.Capability.COMPOSITE
+    assert [child.capability for child in spec.children] == [
+        A.Capability.PAGEABLE,
+        A.Capability.CHECKPOINT,
+    ]
+    assert spec.restorable
+
+
+def test_simple_kv_cache_uses_snapshot_protocol():
+    simple = C.SimpleKVCache()
+    simple.update_and_fetch(mx.ones((1, 2, 3, 4)), mx.ones((1, 2, 3, 4)))
+    cloned = _clone(simple)
+    assert isinstance(cloned, C.SimpleKVCache)
+    assert cloned.cache_length == 3
+    assert bool(mx.array_equal(simple.keys, cloned.keys))
+
+
+def test_coordinator_hides_dense_vs_hybrid_storage_strategy():
+    from mlx_vlm.apc import APCManager
+    from mlx_vlm.apc_coordinator import APCCoordinator
+
+    class Dense:
+        def make_cache(self):
+            return [C.KVCache(), C.KVCache()]
+
+    class Hybrid:
+        def make_cache(self):
+            return [C.KVCache(), C.ArraysCache(2)]
+
+    manager = APCManager(num_blocks=4, block_size=4)
+    dense = APCCoordinator(manager, Dense())
+    hybrid = APCCoordinator(manager, Hybrid())
+    assert dense.enabled and dense.strategy == "block"
+    assert hybrid.enabled and hybrid.strategy == "checkpoint"
 
 
 def test_apc_py_delegates_to_registry():

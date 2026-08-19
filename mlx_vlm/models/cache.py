@@ -2669,6 +2669,51 @@ class SimpleKVCache:
         self.values = values
         self.cache_length += keys.shape[2]
 
+    @property
+    def state(self):
+        if self.keys is None:
+            return None, None
+        return (
+            self.keys[..., : self.cache_length, :],
+            self.values[..., : self.cache_length, :],
+        )
+
+    @state.setter
+    def state(self, value):
+        self.keys, self.values = value
+        self.cache_length = 0 if self.keys is None else int(self.keys.shape[2])
+
+    @property
+    def meta_state(self):
+        return str(self.cache_length)
+
+    @meta_state.setter
+    def meta_state(self, value):
+        self.cache_length = int(value or 0)
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        cache = cls()
+        cache.state = state
+        cache.meta_state = meta_state
+        return cache
+
+    def prefix_cache_snapshot(self):
+        return {"state": self.state, "meta_state": self.meta_state}
+
+    def prefix_cache_restore(self, snapshot):
+        self.state = snapshot["state"]
+        self.meta_state = snapshot["meta_state"]
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
+
 
 class StaticPrefixKVCache(_BaseCache):
     """Fixed-capacity KV cache with prefix fetch semantics.

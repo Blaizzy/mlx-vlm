@@ -1611,6 +1611,7 @@ class PromptProcessingBatch:
         warm_cache: Optional[List[Any]] = None,
         apc_meta: Optional[List[dict]] = None,
         apc_manager: Optional["_apc.APCManager"] = None,
+        apc_coordinator: Optional["_apc.APCCoordinator"] = None,
         right_pad_per_row: Optional[List[int]] = None,
         existing_left_padding: Optional[List[int]] = None,
         suffix_lens: Optional[List[int]] = None,
@@ -1682,6 +1683,7 @@ class PromptProcessingBatch:
         # APC metadata used for post-prefill block harvest (per-row).
         self._apc_meta = apc_meta or []
         self._apc_manager = apc_manager
+        self._apc_coordinator = apc_coordinator
         self._apc_mode = apc_mode
         self._apc_harvest_enabled = True
         self._prompt_time_s = 0.0
@@ -1782,6 +1784,12 @@ class PromptProcessingBatch:
             if meta is not None:
                 self._apc_manager.release(meta.get("apc_blocks", []))
 
+    def _apc_uses_checkpoints(self) -> bool:
+        coordinator = getattr(self, "_apc_coordinator", None)
+        if coordinator is not None:
+            return coordinator.is_checkpoint
+        return self._apc_mode == "exact"
+
     def needs_processing(self):
         """True if prompt needs chunked processing before generate()."""
         if self._inputs_embeds is None or self.prefill_step_size is None:
@@ -1795,7 +1803,7 @@ class PromptProcessingBatch:
     ) -> Optional[int]:
         checkpoint_len = int(meta.get("checkpoint_len") or 0)
         if (
-            self._apc_mode != "exact"
+            not self._apc_uses_checkpoints()
             or checkpoint_len <= 0
             or meta.get("checkpoint_done")
         ):
@@ -1814,7 +1822,7 @@ class PromptProcessingBatch:
     def _next_apc_checkpoint_column(self) -> Optional[int]:
         if (
             self._apc_manager is None
-            or self._apc_mode != "exact"
+            or not self._apc_uses_checkpoints()
             or not self._apc_meta
             or self._inputs_embeds is None
         ):
@@ -1849,7 +1857,7 @@ class PromptProcessingBatch:
         return _apc.snapshot_prompt_cache_row(self.prompt_cache, batch_idx)
 
     def _store_apc_exact_checkpoints(self) -> None:
-        if self._apc_manager is None or self._apc_mode != "exact":
+        if self._apc_manager is None or not self._apc_uses_checkpoints():
             return
         for batch_idx, meta in enumerate(self._apc_meta):
             if meta is None or meta.get("checkpoint_done"):
@@ -1862,11 +1870,19 @@ class PromptProcessingBatch:
             prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
             if prompt_cache is None:
                 continue
-            self._apc_manager.store_exact_cache(
-                meta["full_input_ids"][:checkpoint_len],
-                prompt_cache,
-                extra_hash=meta.get("extra_hash", 0),
-            )
+            coordinator = getattr(self, "_apc_coordinator", None)
+            if coordinator is not None:
+                coordinator.store_checkpoint(
+                    meta["full_input_ids"][:checkpoint_len],
+                    prompt_cache,
+                    extra_hash=meta.get("extra_hash", 0),
+                )
+            else:
+                self._apc_manager.store_exact_cache(
+                    meta["full_input_ids"][:checkpoint_len],
+                    prompt_cache,
+                    extra_hash=meta.get("extra_hash", 0),
+                )
             meta["checkpoint_done"] = True
 
     def _prompt_kwargs_for_step(self, n: Optional[int] = None) -> dict:
@@ -2096,7 +2112,17 @@ class PromptProcessingBatch:
                 for batch_idx, meta in enumerate(self._apc_meta):
                     if meta is None:
                         continue
-                    if self._apc_mode == "exact":
+                    coordinator = getattr(self, "_apc_coordinator", None)
+                    if coordinator is not None:
+                        coordinator.commit(
+                            self.prompt_cache,
+                            meta["full_input_ids"],
+                            batch_idx=batch_idx,
+                            extra_hash=meta.get("extra_hash", 0),
+                            skip_first_n_tokens=meta.get("prefix_len", 0),
+                            blocks_in_use=meta.get("apc_blocks", []),
+                        )
+                    elif self._apc_mode == "exact":
                         prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
                         if prompt_cache is not None:
                             self._apc_manager.store_exact_cache(
@@ -2240,13 +2266,14 @@ class BatchGenerator:
             top_logprobs_k = 0
             self.compute_logprobs = False
             self.top_logprobs_k = 0
-        # APC mode detection: plain KV models use block APC;
-        # mixed/custom cache models use exact prompt-cache snapshots.
-        self.apc_mode = None
-        if apc_manager is not None:
-            self.apc_mode = _apc.model_apc_mode(model)
-            if self.apc_mode is None:
-                apc_manager = None
+        self.apc = (
+            _apc.APCCoordinator(apc_manager, model) if apc_manager is not None else None
+        )
+        if self.apc is not None and not self.apc.enabled:
+            self.apc = None
+            apc_manager = None
+        # Compatibility attribute for callers/tests that still inspect it.
+        self.apc_mode = self.apc.legacy_mode if self.apc is not None else None
         self.apc_manager = apc_manager
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
@@ -2341,6 +2368,9 @@ class BatchGenerator:
         )
 
     def _apc_exact_checkpoint_len(self, ids_list: List[int]) -> int:
+        coordinator = getattr(self, "apc", None)
+        if coordinator is not None:
+            return coordinator.checkpoint_len(ids_list, self._apc_media_token_ids())
         if self.apc_manager is None or getattr(self, "apc_mode", "block") != "exact":
             return 0
         return _apc.adjust_prefix_to_text_suffix_boundary(
@@ -2359,14 +2389,24 @@ class BatchGenerator:
         uid, ids_list, max_toks, prompt_kwargs, lps, criteria = sequence
         if not ids_list or len(ids_list) < 2:
             return None
+        coordinator = getattr(self, "apc", None)
+        lookup_kwargs = {
+            "extra_hash": self._apc_extra_hash(prompt_kwargs or {}),
+            "safe_lookup_min": self._apc_safe_prefix_lookup_min(ids_list),
+            "suffix_is_text_only": lambda pl: self._apc_suffix_is_text_only(
+                ids_list, pl
+            ),
+            "prefix_has_media": lambda pl: self._apc_prefix_has_media_tokens(
+                ids_list, pl
+            ),
+        }
+        if coordinator is not None:
+            return coordinator.lookup(ids_list, **lookup_kwargs)
         return _apc.apc_lookup_plan(
             self.apc_manager,
             ids_list,
-            extra_hash=self._apc_extra_hash(prompt_kwargs or {}),
             apc_mode=getattr(self, "apc_mode", "block"),
-            safe_lookup_min=self._apc_safe_prefix_lookup_min(ids_list),
-            suffix_is_text_only=lambda pl: self._apc_suffix_is_text_only(ids_list, pl),
-            prefix_has_media=lambda pl: self._apc_prefix_has_media_tokens(ids_list, pl),
+            **lookup_kwargs,
         )
 
     def _build_mixed_prompt_batch(
@@ -2470,30 +2510,36 @@ class BatchGenerator:
             getattr(self, "kv_value_scheme", None),
         )
         _quant_cfg = _quant_policy.to_config() if _quant_policy is not None else None
-        if apc_mode == "exact":
+        coordinator = getattr(self, "apc", None)
+        if coordinator is not None:
+            warm_cache, _ = coordinator.merge_rows(
+                picks,
+                prefix_lens,
+                kv_quant_config=_quant_cfg,
+            )
+        elif apc_mode == "exact":
             row_caches = [
                 p["warm_cache"] if p is not None else self.model.make_cache()
                 for p in picks
             ]
-            # Pass kv_quant_config so exact multi warm matches live _make_cache
-            # layer types under --kv-bits (cold quant row + exact float join).
             warm_cache, _ = _apc.make_warm_batch_exact_cache_multi(
                 row_caches,
                 prefix_lens,
                 kv_quant_config=_quant_cfg,
             )
-            if warm_cache is None:
-                return None
         else:
-            # Build the multi-row warm cache (zeros for cold rows, K/V for warm).
             num_layers = (
                 len(self.model.make_cache())
                 if hasattr(self.model, "make_cache")
                 else len(self.model.layers)
             )
             warm_cache, _ = _apc.make_warm_batch_kv_cache_multi(
-                picks, num_layers=num_layers, kv_quant_config=_quant_cfg
+                picks,
+                num_layers=num_layers,
+                kv_quant_config=_quant_cfg,
             )
+        if warm_cache is None:
+            return None
 
         apc_meta = [
             {
@@ -2536,6 +2582,7 @@ class BatchGenerator:
             warm_cache=warm_cache,
             apc_meta=apc_meta,
             apc_manager=self.apc_manager,
+            apc_coordinator=getattr(self, "apc", None),
             right_pad_per_row=right_pad_per_row,
             suffix_lens=suffix_lens,
             apc_mode=apc_mode,
@@ -2848,6 +2895,7 @@ class BatchGenerator:
                 ),
                 apc_meta=apc_meta,
                 apc_manager=self.apc_manager,
+                apc_coordinator=getattr(self, "apc", None),
                 apc_mode=self.apc_mode,
                 draft_model=getattr(self, "draft_model", None),
                 draft_kind=getattr(self, "draft_kind", None),
