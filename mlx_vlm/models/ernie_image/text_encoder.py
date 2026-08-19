@@ -141,9 +141,7 @@ class ErnieImageTextMLP(nn.Module):
 class ErnieImageTextBlock(nn.Module):
     def __init__(self, config: ErnieImageTextConfig) -> None:
         super().__init__()
-        self.input_layernorm = nn.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = ErnieImageTextAttention(config)
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps

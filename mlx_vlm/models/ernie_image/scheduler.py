@@ -15,14 +15,10 @@ class ErnieImageFlowMatchScheduler:
             raise ValueError(
                 f"num_inference_steps must be >= 1, got {num_inference_steps}"
             )
-        sigmas = mx.linspace(
-            1.0, 0.0, num_inference_steps + 1, dtype=mx.float32
-        )[:-1]
+        sigmas = mx.linspace(1.0, 0.0, num_inference_steps + 1, dtype=mx.float32)[:-1]
         sigmas = shift * sigmas / (1.0 + (shift - 1.0) * sigmas)
         self.timesteps = sigmas * float(num_train_timesteps)
-        self.sigmas = mx.concatenate(
-            [sigmas, mx.zeros((1,), dtype=mx.float32)], axis=0
-        )
+        self.sigmas = mx.concatenate([sigmas, mx.zeros((1,), dtype=mx.float32)], axis=0)
 
     def step(
         self, *, model_output: mx.array, step_index: int, sample: mx.array

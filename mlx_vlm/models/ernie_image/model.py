@@ -142,9 +142,7 @@ class ErnieImageGenerationModel(ImageGenerationModel):
             evict_transformer=kwargs.pop("evict_transformer", False),
             max_sequence_length=kwargs.pop("max_sequence_length", 2048),
             use_prompt_enhancer=kwargs.pop("use_prompt_enhancer", None),
-            prompt_enhancer_max_tokens=kwargs.pop(
-                "prompt_enhancer_max_tokens", None
-            ),
+            prompt_enhancer_max_tokens=kwargs.pop("prompt_enhancer_max_tokens", None),
         )
         return cls(pipeline=pipeline, model_id=str(model))
 
@@ -175,9 +173,7 @@ class ErnieImageEditModel(ImageEditModel):
         seed = 0 if request.seed is None else request.seed
         steps = request.steps or self.default_steps
         guidance = (
-            self.default_guidance
-            if request.guidance is None
-            else request.guidance
+            self.default_guidance if request.guidance is None else request.guidance
         )
         image_strength = float(request.extra.get("image_strength", 0.6))
         array = self.pipeline.edit_array(
@@ -234,15 +230,11 @@ class ErnieImageEditModel(ImageEditModel):
         return cls(pipeline=generation.pipeline, model_id=generation.model_id)
 
 
-def load(
-    model: str = "ernie-image-turbo", **kwargs: Any
-) -> ErnieImageGenerationModel:
+def load(model: str = "ernie-image-turbo", **kwargs: Any) -> ErnieImageGenerationModel:
     return ErnieImageGenerationModel.from_model_id(model, **kwargs)
 
 
-def load_edit(
-    model: str = "ernie-image-turbo", **kwargs: Any
-) -> ErnieImageEditModel:
+def load_edit(model: str = "ernie-image-turbo", **kwargs: Any) -> ErnieImageEditModel:
     return ErnieImageEditModel.from_model_id(model, **kwargs)
 
 

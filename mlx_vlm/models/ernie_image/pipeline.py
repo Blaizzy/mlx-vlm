@@ -15,12 +15,7 @@ from .config import ErnieImageVariant, get_variant, validate_dimensions
 from .download import download_model, validate_model_layout
 from .scheduler import ErnieImageFlowMatchScheduler
 from .text_encoder import ErnieImageTokenizer
-from .weights import (
-    load_prompt_enhancer,
-    load_text_encoder,
-    load_transformer,
-    load_vae,
-)
+from .weights import load_prompt_enhancer, load_text_encoder, load_transformer, load_vae
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,9 +196,7 @@ class ErnieImagePipeline:
         if self.vae is None or (
             require_encoder and getattr(self.vae, "encoder", None) is None
         ):
-            self.vae = load_vae(
-                self.model_path, include_encoder=require_encoder
-            )
+            self.vae = load_vae(self.model_path, include_encoder=require_encoder)
             if config := getattr(self.vae, "quantization_config", None):
                 self.component_quantization["vae"] = dict(config)
 
@@ -283,9 +276,7 @@ class ErnieImagePipeline:
         if guidance < 0:
             raise ValueError(f"guidance must be >= 0, got {guidance}")
         if self._should_enhance_prompt():
-            prompt = self._enhance_prompt(
-                prompt, width=width, height=height, seed=seed
-            )
+            prompt = self._enhance_prompt(prompt, width=width, height=height, seed=seed)
             self.last_revised_prompt = prompt
         else:
             self.last_revised_prompt = None
@@ -328,12 +319,8 @@ class ErnieImagePipeline:
         if not prompt:
             raise ValueError("prompt must not be empty")
         if not 0.0 < image_strength <= 1.0:
-            raise ValueError(
-                f"image_strength must be in (0, 1], got {image_strength}"
-            )
-        pixels, width, height = _load_edit_image(
-            image, width=width, height=height
-        )
+            raise ValueError(f"image_strength must be in (0, 1], got {image_strength}")
+        pixels, width, height = _load_edit_image(image, width=width, height=height)
         steps = self.variant.default_steps if steps is None else steps
         guidance = self.variant.default_guidance if guidance is None else guidance
         if steps < 1:
@@ -341,9 +328,7 @@ class ErnieImagePipeline:
         if guidance < 0:
             raise ValueError(f"guidance must be >= 0, got {guidance}")
         if self._should_enhance_prompt():
-            prompt = self._enhance_prompt(
-                prompt, width=width, height=height, seed=seed
-            )
+            prompt = self._enhance_prompt(prompt, width=width, height=height, seed=seed)
             self.last_revised_prompt = prompt
         else:
             self.last_revised_prompt = None
@@ -358,9 +343,9 @@ class ErnieImagePipeline:
         mean = self.vae.bn.running_mean.reshape(1, -1, 1, 1).astype(
             source_latents.dtype
         )
-        std = mx.sqrt(
-            self.vae.bn.running_var.reshape(1, -1, 1, 1) + 1e-5
-        ).astype(source_latents.dtype)
+        std = mx.sqrt(self.vae.bn.running_var.reshape(1, -1, 1, 1) + 1e-5).astype(
+            source_latents.dtype
+        )
         source_latents = (source_latents - mean) / std
         noise = mx.random.normal(
             source_latents.shape,
@@ -410,9 +395,7 @@ class ErnieImagePipeline:
             )
             if do_cfg:
                 unconditional, conditional = mx.split(prediction, 2, axis=0)
-                prediction = unconditional + guidance * (
-                    conditional - unconditional
-                )
+                prediction = unconditional + guidance * (conditional - unconditional)
             latents = scheduler.step(
                 model_output=prediction, step_index=index, sample=latents
             )

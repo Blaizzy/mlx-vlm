@@ -58,9 +58,9 @@ class ErnieImagePromptEnhancer:
         sampler = make_sampler(temp=temperature, top_p=top_p)
         mx.random.seed(seed)
         generated = []
-        additional_eos = getattr(
-            self.tokenizer, "additional_special_tokens_ids", None
-        ) or ()
+        additional_eos = (
+            getattr(self.tokenizer, "additional_special_tokens_ids", None) or ()
+        )
         eos_ids = {
             int(token)
             for token in (

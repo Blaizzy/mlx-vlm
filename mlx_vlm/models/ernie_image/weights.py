@@ -131,9 +131,7 @@ def load_prompt_enhancer(
     )
 
 
-def load_vae(
-    model_path: str | Path, *, include_encoder: bool = False
-) -> Flux2VAE:
+def load_vae(model_path: str | Path, *, include_encoder: bool = False) -> Flux2VAE:
     root = Path(model_path).expanduser()
     channels = (128, 256, 512, 512)
     vae = Flux2VAE(
@@ -175,9 +173,7 @@ def _require_vae_encoder_weights(
     target_shapes: dict[str, tuple[int, ...]],
 ) -> None:
     required = {
-        key
-        for key in target_shapes
-        if key.startswith(("encoder.", "quant_conv."))
+        key for key in target_shapes if key.startswith(("encoder.", "quant_conv."))
     }
     missing = sorted(required - weights.keys())
     if missing:
@@ -190,9 +186,7 @@ def _require_vae_encoder_weights(
 
 
 def _parameter_shapes(model: nn.Module) -> dict[str, tuple[int, ...]]:
-    return {
-        key: tuple(value.shape) for key, value in tree_flatten(model.parameters())
-    }
+    return {key: tuple(value.shape) for key, value in tree_flatten(model.parameters())}
 
 
 def _cast_float(value: mx.array) -> mx.array:
@@ -280,13 +274,9 @@ def infer_quantization_config(
     if not quantized_paths:
         return None
 
-    mode_value = _metadata_value(
-        metadata, "mode", "quantization_mode", "q_mode"
-    )
+    mode_value = _metadata_value(metadata, "mode", "quantization_mode", "q_mode")
     mode = str(mode_value).lower() if mode_value is not None else None
-    bits = _metadata_int(
-        metadata, "bits", "num_bits", "quantization_level", "q_bits"
-    )
+    bits = _metadata_int(metadata, "bits", "num_bits", "quantization_level", "q_bits")
     group_size = _metadata_int(
         metadata, "group_size", "quantization_group_size", "q_group_size"
     )
@@ -327,8 +317,7 @@ def _infer_quantization_mode(
             mode
             for mode, (group_size, bits) in _QUANTIZATION_DEFAULTS.items()
             if mode != "affine"
-            and tuple(packed.shape)
-            == (output_dims, (input_dims * bits + 31) // 32)
+            and tuple(packed.shape) == (output_dims, (input_dims * bits + 31) // 32)
             and tuple(scales.shape) == (output_dims, input_dims // group_size)
         }
     if len(candidates) != 1:

@@ -11,24 +11,11 @@ import mlx.core as mx
 from mlx import nn
 from mlx.utils import tree_flatten, tree_map_with_path
 
-from mlx_vlm.utils import (
-    create_model_card,
-    make_shards,
-    upload_to_hub,
-)
+from mlx_vlm.utils import create_model_card, make_shards, upload_to_hub
 
-from .config import (
-    ErnieImageTransformerConfig,
-    get_variant,
-    variant_from_local_path,
-)
+from .config import ErnieImageTransformerConfig, get_variant, variant_from_local_path
 from .text_encoder import ErnieImageTextConfig
-from .weights import (
-    load_prompt_enhancer,
-    load_text_encoder,
-    load_transformer,
-    load_vae,
-)
+from .weights import load_prompt_enhancer, load_text_encoder, load_transformer, load_vae
 
 _MODE_DEFAULTS = {
     "affine": (64, 4),
@@ -58,8 +45,7 @@ def is_ernie_image_checkpoint(model_path: str | Path) -> bool:
         "final_norm.linear.weight",
         "layers.0.adaLN_sa_ln.weight",
     } <= keys and (
-        "adaLN_modulation.1.weight" in keys
-        or "adaln_modulation.weight" in keys
+        "adaLN_modulation.1.weight" in keys or "adaln_modulation.weight" in keys
     )
 
 
@@ -93,9 +79,7 @@ def convert_ernie_image(
     if precision not in (mx.float16, mx.bfloat16, mx.float32):
         raise ValueError(f"Unsupported ERNIE-Image conversion dtype: {dtype}")
     quantization = (
-        _quantization_parameters(q_mode, q_group_size, q_bits)
-        if quantize
-        else None
+        _quantization_parameters(q_mode, q_group_size, q_bits) if quantize else None
     )
 
     destination.mkdir(parents=True, exist_ok=True)
@@ -210,9 +194,7 @@ def _vae_checkpoint_has_encoder(source: Path) -> bool:
         return True
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict):
-        raise ValueError(
-            "VAE model.safetensors.index.json is missing a weight_map"
-        )
+        raise ValueError("VAE model.safetensors.index.json is missing a weight_map")
     return any(key.startswith("encoder.") for key in weight_map) and any(
         key.startswith("quant_conv.") for key in weight_map
     )
@@ -285,9 +267,7 @@ def _save_component(
     shards = make_shards(weights)
     shard_count = len(shards)
     file_format = (
-        "model-{:05d}-of-{:05d}.safetensors"
-        if shard_count > 1
-        else "model.safetensors"
+        "model-{:05d}-of-{:05d}.safetensors" if shard_count > 1 else "model.safetensors"
     )
     index_metadata = dict(metadata)
     index_metadata["total_size"] = sum(value.nbytes for value in weights.values())
@@ -329,8 +309,10 @@ def _copy_sidecars(source: Path, destination: Path) -> None:
                 shutil.rmtree(target)
             shutil.copytree(source_dir, target)
     for component in ("transformer", "text_encoder", "vae", "pe", "scheduler"):
-        source_config = source / component / (
-            "scheduler_config.json" if component == "scheduler" else "config.json"
+        source_config = (
+            source
+            / component
+            / ("scheduler_config.json" if component == "scheduler" else "config.json")
         )
         if source_config.exists():
             target_dir = destination / component

@@ -307,13 +307,9 @@ def convert(
 
     if is_ernie_image_checkpoint(model_path):
         if dequantize:
-            raise ValueError(
-                "ERNIE-Image conversion does not support --dequantize"
-            )
+            raise ValueError("ERNIE-Image conversion does not support --dequantize")
         if quant_method != "rtn":
-            raise ValueError(
-                "ERNIE-Image conversion supports RTN quantization only"
-            )
+            raise ValueError("ERNIE-Image conversion supports RTN quantization only")
         if quant_predicate is not None:
             raise ValueError(
                 "ERNIE-Image conversion does not support mixed-bit recipes"

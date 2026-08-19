@@ -14,11 +14,6 @@ from ..generate import (
     DEFAULT_TOP_P,
     normalize_resize_shape,
 )
-from ..generate.image import (
-    DEFAULT_IMAGE_GUIDANCE,
-    DEFAULT_IMAGE_SIZE,
-    DEFAULT_IMAGE_STEPS,
-)
 
 
 def get_server_max_tokens():

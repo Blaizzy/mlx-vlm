@@ -587,9 +587,7 @@ def generate_image(
     if request.guidance is None:
         request = replace(
             request,
-            guidance=float(
-                getattr(model, "default_guidance", DEFAULT_IMAGE_GUIDANCE)
-            ),
+            guidance=float(getattr(model, "default_guidance", DEFAULT_IMAGE_GUIDANCE)),
         )
 
     data = model.generate(request)

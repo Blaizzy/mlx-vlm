@@ -12,17 +12,16 @@ from mlx import nn
 from PIL import Image
 
 import mlx_vlm.models.ernie_image.convert as ernie_convert
-import mlx_vlm.models.ernie_image.weights as weights_module
+from mlx_vlm.generate.edit_image import (
+    ImageEditRequest,
+    image_edit_model_class,
+    is_image_edit_model,
+)
 from mlx_vlm.generate.image import (
     ImageGenerationRequest,
     generate_image,
     image_generation_model_class,
     is_image_generation_model,
-)
-from mlx_vlm.generate.edit_image import (
-    ImageEditRequest,
-    image_edit_model_class,
-    is_image_edit_model,
 )
 from mlx_vlm.models.ernie_image.config import (
     ErnieImageTransformerConfig,
@@ -100,9 +99,7 @@ def _write_layout(root: Path, *, turbo: bool = True) -> None:
         ("baidu/ERNIE-Image-Turbo", "ernie-image-turbo", 8, 1.0),
     ],
 )
-def test_ernie_variants(
-    model_id: str, name: str, steps: int, guidance: float
-) -> None:
+def test_ernie_variants(model_id: str, name: str, steps: int, guidance: float) -> None:
     variant = get_variant(model_id)
     assert variant.name == name
     assert variant.default_steps == steps
@@ -117,8 +114,7 @@ def test_ernie_local_variant_uses_native_metadata(tmp_path: Path) -> None:
 def test_ernie_dispatches_ids_metadata_and_mflux_indexes(tmp_path: Path) -> None:
     _write_layout(tmp_path)
     assert (
-        image_generation_model_class(tmp_path.as_posix())
-        is ErnieImageGenerationModel
+        image_generation_model_class(tmp_path.as_posix()) is ErnieImageGenerationModel
     )
     assert (
         image_generation_model_class("baidu/ERNIE-Image-Turbo")
@@ -141,8 +137,7 @@ def test_ernie_dispatches_ids_metadata_and_mflux_indexes(tmp_path: Path) -> None
         json.dumps(index)
     )
     assert (
-        image_generation_model_class(tmp_path.as_posix())
-        is ErnieImageGenerationModel
+        image_generation_model_class(tmp_path.as_posix()) is ErnieImageGenerationModel
     )
 
 
@@ -317,9 +312,12 @@ def test_ernie_weight_sanitizers_and_layouts() -> None:
     assert "adaln_modulation.weight" in sanitized
     assert "layers.0.self_attention.to_out.weight" in sanitized
     assert sanitized["x_embedder.proj.weight"].shape == native.shape
-    assert match_conv_layout(
-        native, target_shape=tuple(native.shape), key="conv.weight"
-    ).shape == native.shape
+    assert (
+        match_conv_layout(
+            native, target_shape=tuple(native.shape), key="conv.weight"
+        ).shape
+        == native.shape
+    )
 
     text = sanitize_text_encoder_weights(
         {
@@ -585,9 +583,7 @@ def test_img2img_uses_strength_to_select_denoising_steps(tmp_path: Path) -> None
 def test_edit_image_rounds_source_size_to_model_grid(tmp_path: Path) -> None:
     image_path = tmp_path / "source.png"
     Image.new("RGBA", (1160, 890), color="navy").save(image_path)
-    pixels, width, height = _load_edit_image(
-        image_path, width=None, height=None
-    )
+    pixels, width, height = _load_edit_image(image_path, width=None, height=None)
     assert (width, height) == (1152, 880)
     assert pixels.shape == (1, 3, 880, 1152)
 
@@ -595,9 +591,7 @@ def test_edit_image_rounds_source_size_to_model_grid(tmp_path: Path) -> None:
 def test_edit_image_caps_large_source_to_one_megapixel(tmp_path: Path) -> None:
     image_path = tmp_path / "source.png"
     Image.new("RGB", (4032, 3024), color="navy").save(image_path)
-    pixels, width, height = _load_edit_image(
-        image_path, width=None, height=None
-    )
+    pixels, width, height = _load_edit_image(image_path, width=None, height=None)
     assert (width, height) == (1168, 880)
     assert pixels.shape == (1, 3, 880, 1168)
 
@@ -616,9 +610,7 @@ def test_edit_auto_size_preserves_aspect_ratio(
 ) -> None:
     image_path = tmp_path / "source.png"
     Image.new("RGB", size, color="navy").save(image_path)
-    _, width, height = _load_edit_image(
-        image_path, width=None, height=None
-    )
+    _, width, height = _load_edit_image(image_path, width=None, height=None)
     assert (width, height) == expected
 
 
@@ -683,9 +675,7 @@ def test_conversion_detection_and_layout_metadata(tmp_path: Path) -> None:
         (output / component).mkdir(parents=True, exist_ok=True)
     _write_missing_configs(output)
     assert (
-        json.loads((output / "transformer" / "config.json").read_text())[
-            "_class_name"
-        ]
+        json.loads((output / "transformer" / "config.json").read_text())["_class_name"]
         == "ErnieImageTransformer2DModel"
     )
     assert (
@@ -709,9 +699,7 @@ def test_main_convert_routes_ernie_before_vlm_loader(
     )
 
     def fake_convert(model_path, output_path, **kwargs):
-        calls.update(
-            {"model_path": model_path, "output_path": output_path, **kwargs}
-        )
+        calls.update({"model_path": model_path, "output_path": output_path, **kwargs})
         return Path(output_path)
 
     monkeypatch.setattr(ernie_convert, "convert_ernie_image", fake_convert)

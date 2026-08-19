@@ -47,14 +47,11 @@ def rope_frequencies(
         omega = 1.0 / (
             theta
             ** (
-                mx.arange(0, dim, 2, dtype=mx.float32)
-                / mx.array(dim, dtype=mx.float32)
+                mx.arange(0, dim, 2, dtype=mx.float32) / mx.array(dim, dtype=mx.float32)
             )
         )
         angles = positions[..., axis, None] * omega
-        angles = mx.stack([angles, angles], axis=-1).reshape(
-            *angles.shape[:-1], dim
-        )
+        angles = mx.stack([angles, angles], axis=-1).reshape(*angles.shape[:-1], dim)
         frequencies.append(angles)
     angles = mx.concatenate(frequencies, axis=-1)
     return mx.cos(angles)[:, None, :, :], mx.sin(angles)[:, None, :, :]
@@ -99,14 +96,10 @@ class ErnieImageAttention(nn.Module):
         self.to_k = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.to_v = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.norm_q = (
-            nn.RMSNorm(self.head_dim, eps=config.eps)
-            if config.qk_layernorm
-            else None
+            nn.RMSNorm(self.head_dim, eps=config.eps) if config.qk_layernorm else None
         )
         self.norm_k = (
-            nn.RMSNorm(self.head_dim, eps=config.eps)
-            if config.qk_layernorm
-            else None
+            nn.RMSNorm(self.head_dim, eps=config.eps) if config.qk_layernorm else None
         )
         self.to_out = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
 
@@ -157,9 +150,7 @@ class ErnieImageMLP(nn.Module):
         )
 
 
-def _modulate(
-    hidden_states: mx.array, shift: mx.array, scale: mx.array
-) -> mx.array:
+def _modulate(hidden_states: mx.array, shift: mx.array, scale: mx.array) -> mx.array:
     dtype = hidden_states.dtype
     hidden_states = hidden_states.astype(mx.float32)
     hidden_states = hidden_states * (1.0 + scale[:, None, :]) + shift[:, None, :]
@@ -191,15 +182,13 @@ class ErnieImageTransformerBlock(nn.Module):
             mask=mask,
         )
         hidden_states = hidden_states + (
-            gate_msa[:, None, :].astype(mx.float32)
-            * attended.astype(mx.float32)
+            gate_msa[:, None, :].astype(mx.float32) * attended.astype(mx.float32)
         ).astype(hidden_states.dtype)
         mlp_output = self.mlp(
             _modulate(self.adaLN_mlp_ln(hidden_states), shift_mlp, scale_mlp)
         )
         return hidden_states + (
-            gate_mlp[:, None, :].astype(mx.float32)
-            * mlp_output.astype(mx.float32)
+            gate_mlp[:, None, :].astype(mx.float32) * mlp_output.astype(mx.float32)
         ).astype(hidden_states.dtype)
 
 
@@ -212,15 +201,13 @@ class ErnieImageFinalNorm(nn.Module):
     def __call__(self, hidden_states: mx.array, conditioning: mx.array) -> mx.array:
         scale, shift = mx.split(self.linear(conditioning), 2, axis=-1)
         hidden_states = self.norm(hidden_states)
-        return (
-            hidden_states * (1.0 + scale[:, None, :]) + shift[:, None, :]
-        ).astype(hidden_states.dtype)
+        return (hidden_states * (1.0 + scale[:, None, :]) + shift[:, None, :]).astype(
+            hidden_states.dtype
+        )
 
 
 class ErnieImageTransformer(nn.Module):
-    def __init__(
-        self, config: ErnieImageTransformerConfig | None = None
-    ) -> None:
+    def __init__(self, config: ErnieImageTransformerConfig | None = None) -> None:
         super().__init__()
         self.config = config or ErnieImageTransformerConfig()
         config = self.config
@@ -229,9 +216,7 @@ class ErnieImageTransformer(nn.Module):
         )
         self.text_proj = nn.Linear(config.text_in_dim, config.hidden_size, bias=False)
         self.time_embedding = ErnieImageTimestepEmbedding(config.hidden_size)
-        self.adaln_modulation = nn.Linear(
-            config.hidden_size, 6 * config.hidden_size
-        )
+        self.adaln_modulation = nn.Linear(config.hidden_size, 6 * config.hidden_size)
         self.layers = [
             ErnieImageTransformerBlock(config) for _ in range(config.num_layers)
         ]
@@ -264,9 +249,7 @@ class ErnieImageTransformer(nn.Module):
         grid_x = mx.broadcast_to(x, (latent_height, latent_width)).reshape(-1)
         image_positions = mx.stack(
             [
-                mx.broadcast_to(
-                    text_lengths[:, None], (batch, image_tokens)
-                ),
+                mx.broadcast_to(text_lengths[:, None], (batch, image_tokens)),
                 mx.broadcast_to(grid_y[None, :], (batch, image_tokens)),
                 mx.broadcast_to(grid_x[None, :], (batch, image_tokens)),
             ],
