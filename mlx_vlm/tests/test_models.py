@@ -2486,6 +2486,24 @@ class TestModels(unittest.TestCase):
         self.assertEqual(type(cache[0]).__name__, "ArraysCache")
         self.assertEqual(type(cache[1]).__name__, "KVCache")
 
+    def test_olmoe_config_uses_upstream_rms_norm_default(self):
+        from mlx_vlm.models import olmoe
+
+        config = olmoe.ModelConfig.from_dict(
+            {
+                "model_type": "olmoe",
+                "hidden_size": 32,
+                "num_hidden_layers": 1,
+                "intermediate_size": 16,
+                "num_attention_heads": 4,
+                "vocab_size": 64,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+            }
+        )
+
+        self.assertEqual(config.rms_norm_eps, 1e-5)
+
     def test_cohere2_moe_language_model(self):
         from mlx_vlm.models import cohere2_moe
 
