@@ -5,6 +5,7 @@ from typing import Dict, Optional
 
 import mlx.core as mx
 
+from ....models.qwen3_5.fp8 import make_quantization_config
 from ..mtp_split import MTPSplitter
 from .qwen3_5_mtp import Qwen3_5MTPDraftModel
 
@@ -46,6 +47,8 @@ class Qwen3_5MTPSplitter(MTPSplitter):
         quantization = source_config.get("mtplx_mtp_quantization")
         if quantization is None:
             quantization = source_config.get("quantization")
+        if quantization is None:
+            quantization = make_quantization_config(source_config)
         return quantization
 
 
@@ -108,6 +111,8 @@ class Qwen3NextMTPSplitter(MTPSplitter):
         quantization = source_config.get("mtplx_mtp_quantization")
         if quantization is None:
             quantization = source_config.get("quantization")
+        if quantization is None:
+            quantization = make_quantization_config(source_config)
         return quantization
 
 

@@ -214,16 +214,16 @@ def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
     if keys_tuple is None or values_tuple is None or length == 0:
         return None, None
     keys = mx.dequantize(
-        keys_tuple[0][..., :length, :],
-        keys_tuple[1][..., :length, :],
-        keys_tuple[2][..., :length, :],
+        mx.contiguous(keys_tuple[0][..., :length, :]),
+        mx.contiguous(keys_tuple[1][..., :length, :]),
+        mx.contiguous(keys_tuple[2][..., :length, :]),
         group_size=group_size,
         bits=bits,
     )
     values = mx.dequantize(
-        values_tuple[0][..., :length, :],
-        values_tuple[1][..., :length, :],
-        values_tuple[2][..., :length, :],
+        mx.contiguous(values_tuple[0][..., :length, :]),
+        mx.contiguous(values_tuple[1][..., :length, :]),
+        mx.contiguous(values_tuple[2][..., :length, :]),
         group_size=group_size,
         bits=bits,
     )
@@ -2118,6 +2118,14 @@ class PoolingCache(_BaseCache):
     def meta_state(self, v):
         self.ratio = v
 
+    @classmethod
+    def from_state(cls, state, meta_state):
+        # Restoring buffered state calls ``accumulate_windows``, which needs
+        # the compression ratio before the generic state setter can run.
+        obj = cls(meta_state)
+        obj.state = state
+        return obj
+
     def is_trimmable(self):
         return self.pooled is None
 
@@ -2142,8 +2150,8 @@ class PoolingCache(_BaseCache):
         return total
 
     @classmethod
-    def merge(cls, caches):
-        return BatchPoolingCache.merge(caches)
+    def merge(cls, caches, prefix_lens=None):
+        return BatchPoolingCache.merge(caches, prefix_lens)
 
 
 class BatchPoolingCache(_BaseCache):
@@ -2484,8 +2492,11 @@ class BatchPoolingCache(_BaseCache):
         return cache
 
     @classmethod
-    def merge(cls, caches):
+    def merge(cls, caches, prefix_lens=None):
         """Merge a list of PoolingCache instances into a BatchPoolingCache."""
+        # APC passes prefix lengths to custom merge implementations. Pooling
+        # caches derive progress from each row's pooled length and remainder.
+        del prefix_lens
         B = len(caches)
         if not all(c.ratio == caches[0].ratio for c in caches):
             raise ValueError(
