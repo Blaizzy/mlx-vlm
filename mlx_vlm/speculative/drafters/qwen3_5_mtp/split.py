@@ -8,6 +8,7 @@ from typing import Dict, Iterable, Optional
 import mlx.core as mx
 from safetensors import safe_open
 
+from ....models.qwen3_5.fp8 import make_quantization_config
 from ....utils import get_model_path
 from .qwen3_5_mtp import Qwen3_5MTPDraftModel
 
@@ -60,7 +61,7 @@ def _load_selected_tensors(file: Path, keys: list[str]) -> Dict[str, mx.array]:
         with safe_open(file, framework="mlx") as f:
             for key in keys:
                 tensors[key] = mx.array(f.get_tensor(key))
-    except TypeError:
+    except (AttributeError, TypeError):
         shard = mx.load(str(file))
         tensors = {key: shard[key] for key in keys}
     return tensors
@@ -74,7 +75,7 @@ def split_qwen3_5_mtp(
     block_size: Optional[int] = None,
     force_download: bool = False,
 ) -> Path:
-    """Write Qwen3.5 native MTP tensors into a standalone drafter folder."""
+    """Write Qwen3.5-family MTP tensors into a standalone drafter folder."""
     source_path = get_model_path(
         source, revision=revision, force_download=force_download
     )
@@ -124,6 +125,8 @@ def split_qwen3_5_mtp(
         quantization = source_config.get("mtplx_mtp_quantization")
         if quantization is None:
             quantization = source_config.get("quantization")
+        if quantization is None:
+            quantization = make_quantization_config(source_config)
         if quantization is not None:
             draft_config["quantization"] = quantization
             draft_config["quantization_config"] = quantization
@@ -141,7 +144,7 @@ def split_qwen3_5_mtp(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Split Qwen3.5 native MTP tensors into a standalone MLX drafter."
+        description="Split Qwen3.5-family MTP tensors into a standalone MLX drafter."
     )
     parser.add_argument("--model", "--source", dest="source", required=True)
     parser.add_argument("--output", required=True)
@@ -154,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     args = build_parser().parse_args()
     output = split_qwen3_5_mtp(**vars(args))
-    print(f"Wrote Qwen3.5 MTP drafter to {output}")
+    print(f"Wrote Qwen3.5-family MTP drafter to {output}")
 
 
 if __name__ == "__main__":

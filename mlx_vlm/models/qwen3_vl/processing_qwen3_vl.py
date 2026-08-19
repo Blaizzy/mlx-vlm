@@ -270,6 +270,35 @@ class Qwen3VLImageProcessor(ImageProcessingMixin):
         images = _flatten_images(images)
         return [_to_numpy_image(img) for img in images]
 
+    def _resolved_size(
+        self,
+        height: int,
+        width: int,
+        min_pixels: Optional[int] = None,
+        max_pixels: Optional[int] = None,
+        resized_height: Optional[int] = None,
+        resized_width: Optional[int] = None,
+    ) -> Tuple[int, int]:
+        """Resolve the post-resize ``(height, width)`` for a single image.
+
+        Shared by ``_process_one`` and ``num_image_tokens`` so a token
+        estimate cannot drift from the size preprocessing actually uses.
+        """
+        factor = self.patch_size * self.merge_size
+        if (resized_height is None) != (resized_width is None):
+            raise ValueError(
+                "resized_height and resized_width must be provided together."
+            )
+        if resized_height is not None:
+            return _smart_resize_image(resized_height, resized_width, factor=factor)
+        return _smart_resize_image(
+            height,
+            width,
+            factor=factor,
+            min_pixels=self.min_pixels if min_pixels is None else min_pixels,
+            max_pixels=self.max_pixels if max_pixels is None else max_pixels,
+        )
+
     def _process_one(
         self,
         image: np.ndarray,
@@ -279,25 +308,14 @@ class Qwen3VLImageProcessor(ImageProcessingMixin):
         resized_width: Optional[int] = None,
     ) -> Tuple[np.ndarray, List[int]]:
         C, H, W = image.shape
-        factor = self.patch_size * self.merge_size
-        if (resized_height is None) != (resized_width is None):
-            raise ValueError(
-                "resized_height and resized_width must be provided together."
-            )
-        if resized_height is not None:
-            resized_h, resized_w = _smart_resize_image(
-                resized_height,
-                resized_width,
-                factor=factor,
-            )
-        else:
-            resized_h, resized_w = _smart_resize_image(
-                H,
-                W,
-                factor=factor,
-                min_pixels=self.min_pixels if min_pixels is None else min_pixels,
-                max_pixels=self.max_pixels if max_pixels is None else max_pixels,
-            )
+        resized_h, resized_w = self._resolved_size(
+            H,
+            W,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+            resized_height=resized_height,
+            resized_width=resized_width,
+        )
         # Bicubic resize via PIL (same pattern as the video path).
         frame = _resize_video_frames(image[None, ...], resized_h, resized_w)[0]
 
@@ -361,6 +379,37 @@ class Qwen3VLImageProcessor(ImageProcessingMixin):
 
     def preprocess(self, images, **kwargs):
         return self(images, **kwargs)
+
+    def num_image_tokens(
+        self,
+        height: int,
+        width: int,
+        min_pixels: Optional[int] = None,
+        max_pixels: Optional[int] = None,
+        resized_height: Optional[int] = None,
+        resized_width: Optional[int] = None,
+    ) -> int:
+        """Number of language-model image tokens an image of the given size
+        will produce, computed without processing any pixels.
+
+        Resolves the size through ``_resolved_size``, the same helper
+        ``_process_one`` uses, so the result equals
+        ``image_grid_thw.prod() // merge_size**2`` of an actual ``preprocess``
+        call for the same image and overrides.
+        """
+        resized_h, resized_w = self._resolved_size(
+            height,
+            width,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+            resized_height=resized_height,
+            resized_width=resized_width,
+        )
+        grid_h = resized_h // self.patch_size
+        grid_w = resized_w // self.patch_size
+        # grid_t is always 1 for still images (frames are duplicated along T
+        # to fill temporal_patch_size, not counted as extra tokens).
+        return (grid_h * grid_w) // self.merge_size**2
 
 
 class Qwen3VLVideoProcessor(BaseVideoProcessor):
