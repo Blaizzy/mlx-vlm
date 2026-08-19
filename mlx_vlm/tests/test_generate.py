@@ -1627,6 +1627,7 @@ class TestThinkingBudgetCriteria:
             thinking_end_token="</think>",
             thinking_start_token="<think>",
             enable_thinking=True,
+            prompt_preopens_thinking=True,
         )
 
         # enable_thinking=True — already in thinking mode
@@ -1676,13 +1677,41 @@ class TestThinkingBudgetCriteria:
         assert criteria.thinking_token_count == 0
         assert criteria.budget_exceeded is False
 
-    def _make_criteria(self, enable_thinking=True):
+    def test_self_opening_model_budget_still_enforced(self):
+        """Regression test for issue #1911."""
+        criteria = ThinkingBudgetCriteria(
+            tokenizer=FakeTokenizer(),
+            thinking_budget=5,
+            thinking_end_token="</think>",
+            thinking_start_token="<think>",
+            enable_thinking=True,
+            prompt_preopens_thinking=False,
+        )
+
+        assert criteria.in_thinking is False
+
+        assert criteria(99) is None
+        assert criteria.in_thinking is True
+
+        for i in range(5):
+            assert criteria(50 + i) is None
+        assert criteria.thinking_token_count == 5
+        assert criteria.budget_exceeded is False
+
+        assert criteria(60) == 10  # \n
+        assert criteria.pop_forced_token_id() == 10
+        assert criteria(60) == 100  # </think>
+        assert criteria.pop_forced_token_id() == 100
+        assert criteria.budget_exceeded is True
+
+    def _make_criteria(self, enable_thinking=True, prompt_preopens_thinking=True):
         return ThinkingBudgetCriteria(
             tokenizer=FakeTokenizer(),
             thinking_budget=5,
             thinking_end_token="</think>",
             thinking_start_token="<think>",
             enable_thinking=enable_thinking,
+            prompt_preopens_thinking=prompt_preopens_thinking,
         )
 
     def test_pop_forced_token_id_safe_before_first_call(self):
@@ -2277,6 +2306,82 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
     assert mock_generate.call_args.kwargs["video"] == ["clip.mp4"]
     assert mock_generate.call_args.kwargs["fps"] == pytest.approx(1.0)
     assert capsys.readouterr().out.strip() == "done"
+
+
+def test_resolve_video_inputs_keeps_native_video_unchanged():
+    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
+    images = [object()]
+    videos = ["first.mp4", "second.mp4"]
+    processor = SimpleNamespace(
+        video_processor=SimpleNamespace(),
+        process=lambda text=None, images=None, videos=None, **kwargs: None,
+    )
+
+    with patch.object(video_module, "sample_video_frames") as mock_sample:
+        resolution = video_module.resolve_video_inputs(
+            processor,
+            videos,
+            images=images,
+        )
+
+    assert resolution.images == images
+    assert resolution.videos == videos
+    assert resolution.used_fallback is False
+    mock_sample.assert_not_called()
+
+
+def test_resolve_video_inputs_uses_one_global_frame_budget():
+    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
+    still = object()
+    images = [still]
+    videos = ["first.mp4", "second.mp4"]
+    frames = [object() for _ in range(10)]
+
+    with patch.object(
+        video_module,
+        "sample_video_frames",
+        return_value=(frames, 1.5),
+    ) as mock_sample:
+        resolution = video_module.resolve_video_inputs(
+            SimpleNamespace(),
+            videos,
+            images=images,
+            fps=1.5,
+            max_frames=4,
+        )
+
+    assert resolution.images == [still, frames[0], frames[3], frames[6], frames[9]]
+    assert resolution.videos == []
+    assert resolution.used_fallback is True
+    assert resolution.sampled_count == 10
+    assert resolution.selected_count == 4
+    assert resolution.frame_fps == pytest.approx(1.5)
+    assert images == [still]
+    assert videos == ["first.mp4", "second.mp4"]
+    mock_sample.assert_called_once_with(videos, 1.5)
+
+
+def test_resolve_video_inputs_does_not_partially_mutate_on_decode_failure():
+    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
+    images = [object()]
+    videos = ["good.mp4", "bad.mp4"]
+
+    with (
+        patch.object(
+            video_module,
+            "sample_video_frames",
+            side_effect=RuntimeError("decode failed"),
+        ),
+        pytest.raises(RuntimeError, match="decode failed"),
+    ):
+        video_module.resolve_video_inputs(
+            SimpleNamespace(),
+            videos,
+            images=images,
+        )
+
+    assert len(images) == 1
+    assert videos == ["good.mp4", "bad.mp4"]
 
 
 def test_generate_cli_video_frames_fallback_without_video_processor(capsys):
@@ -2956,3 +3061,69 @@ class TestBatchTurboQuantizedKVStart:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestPrePaddedBatchRows:
+    """Rows that arrive already padded must still declare that padding.
+
+    The tokenizer squares a batch off with left padding and reports it in the
+    attention mask. If that never reaches the caches, every row looks the same
+    length: a causal mask does not exclude padding that comes first, and a
+    recurrent layer walks it like any other column.
+    """
+
+    def _batch(self, rows, existing_left_padding):
+        import mlx.nn as nn
+
+        from mlx_vlm.generate.ar import PromptProcessingBatch
+
+        class Tiny(nn.Module):
+            def make_cache(self):
+                from mlx_vlm.models.cache import ArraysCache, KVCache
+
+                return [KVCache(), ArraysCache(1)]
+
+        return PromptProcessingBatch(
+            model=Tiny(),
+            uids=list(range(len(rows))),
+            input_ids=rows,
+            max_tokens=[4] * len(rows),
+            inputs_embeds=None,
+            prompt_kwargs={},
+            existing_left_padding=existing_left_padding,
+        )
+
+    def test_declared_padding_reaches_the_caches(self):
+        rows = [list(range(8)), list(range(8))]
+
+        batch = self._batch(rows, existing_left_padding=[5, 0])
+
+        assert batch._left_padding_per_row == [5, 0]
+
+    def test_uniform_rows_without_a_declaration_record_none(self):
+        rows = [list(range(8)), list(range(8))]
+
+        batch = self._batch(rows, existing_left_padding=None)
+
+        assert batch._left_padding_per_row == [0, 0]
+
+    def test_a_declaration_adds_to_the_generator_s_own_padding(self):
+        rows = [list(range(4)), list(range(8))]
+
+        batch = self._batch(rows, existing_left_padding=[2, 1])
+
+        assert batch._left_padding_per_row == [6, 1]
+
+    def test_arrays_cache_masks_the_declared_padding(self):
+        import mlx.core as mx
+
+        from mlx_vlm.models.cache import ArraysCache
+
+        entry = ArraysCache(1)
+        entry.left_padding = mx.array([5, 0])
+
+        mask = entry.make_mask(8)
+
+        assert mask.shape == (2, 8)
+        assert mask[0].tolist() == [False] * 5 + [True] * 3
+        assert mask[1].tolist() == [True] * 8

@@ -158,6 +158,7 @@ def test_apc_exact_store_materializes_its_snapshot(monkeypatch):
     cache.values = mx.ones((1, 1, 4, 2))
     cache.offset = 4
     apc = APCManager(num_blocks=4, block_size=4)
+    apc.exact_cache_min_tokens = 1
     real_eval = mx.eval
     eval_calls = []
 
