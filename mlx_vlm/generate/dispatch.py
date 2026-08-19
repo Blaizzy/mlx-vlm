@@ -345,6 +345,18 @@ def parse_arguments():
         help="Temperature for sampling.",
     )
     parser.add_argument(
+        "--top-p",
+        type=float,
+        default=DEFAULT_TOP_P,
+        help="Nucleus-sampling probability threshold (default: 1.0).",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=DEFAULT_TOP_K,
+        help="Restrict sampling to the top K tokens; 0 disables it.",
+    )
+    parser.add_argument(
         "--repetition-penalty",
         type=float,
         default=None,
@@ -526,6 +538,19 @@ def parse_arguments():
         type=int,
         default=None,
         help="Override the drafter's configured block size.",
+    )
+    parser.add_argument(
+        "--draft-bits",
+        type=int,
+        choices=[4, 8],
+        default=None,
+        help="Quantize the drafter in memory to 4 or 8 bits.",
+    )
+    parser.add_argument(
+        "--draft-group-size",
+        type=int,
+        default=64,
+        help="Group size for in-memory drafter quantization (default: 64).",
     )
     parser.add_argument(
         "--enable-thinking",
@@ -1266,7 +1291,10 @@ def main():
 
         print(f"Loading drafter ({args.draft_kind or 'auto'}): {args.draft_model}")
         draft_model, resolved_kind = load_drafter(
-            args.draft_model, kind=args.draft_kind
+            args.draft_model,
+            kind=args.draft_kind,
+            draft_bits=getattr(args, "draft_bits", None),
+            draft_group_size=getattr(args, "draft_group_size", 64),
         )
         if args.draft_kind is None:
             print(f"  → auto-detected --draft-kind={resolved_kind!r}.")
@@ -1431,6 +1459,8 @@ def main():
             stream_kwargs = {
                 "max_tokens": args.max_tokens,
                 "temperature": args.temperature,
+                "top_p": getattr(args, "top_p", DEFAULT_TOP_P),
+                "top_k": getattr(args, "top_k", DEFAULT_TOP_K),
                 "repetition_penalty": args.repetition_penalty,
                 "repetition_context_size": args.repetition_context_size,
                 "presence_penalty": args.presence_penalty,
@@ -1475,6 +1505,8 @@ def main():
             "video": args.video,
             "fps": args.fps,
             "temperature": args.temperature,
+            "top_p": getattr(args, "top_p", DEFAULT_TOP_P),
+            "top_k": getattr(args, "top_k", DEFAULT_TOP_K),
             "max_tokens": args.max_tokens,
             "repetition_penalty": args.repetition_penalty,
             "repetition_context_size": args.repetition_context_size,

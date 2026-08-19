@@ -1175,7 +1175,15 @@ class ResponseGenerator:
                 draft_kind or "auto",
                 draft_model_path,
             )
-            draft_model, resolved_kind = load_drafter(draft_model_path, kind=draft_kind)
+            draft_bits_value = os.environ.get("MLX_VLM_DRAFT_BITS")
+            draft_bits = int(draft_bits_value) if draft_bits_value else None
+            draft_group_size = int(os.environ.get("MLX_VLM_DRAFT_GROUP_SIZE", "64"))
+            draft_model, resolved_kind = load_drafter(
+                draft_model_path,
+                kind=draft_kind,
+                draft_bits=draft_bits,
+                draft_group_size=draft_group_size,
+            )
             if draft_kind is None:
                 logger.info("Auto-detected speculative draft kind: %s", resolved_kind)
             elif resolved_kind != draft_kind:

@@ -10,6 +10,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
     - [Thinking Budget](#thinking-budget)
   - [Speculative Decoding](#speculative-decoding)
     - [DFlash (Qwen3.5)](#dflash-qwen35)
+    - [DFlash 2 (Qwen3.8)](#dflash-2-qwen38)
     - [Gemma 4 MTP](#gemma-4-mtp)
     - [Gemma 4 EAGLE-3](#gemma-4-eagle-3)
     - [MiniMax M3 EAGLE-3](#minimax-m3-eagle-3)
@@ -181,6 +182,7 @@ Speed up generation by drafting several candidate tokens with a small "drafter" 
 | `--draft-model` | HuggingFace repo or local path for the drafter |
 | `--draft-kind` | Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP) |
 | `--draft-block-size` | Override the drafter's configured block size |
+| `--draft-bits` | Quantize the drafter in memory to 4 or 8 bits |
 
 See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
 
@@ -248,6 +250,20 @@ result = generate(
     draft_model=draft_model,
     draft_kind=draft_kind,
 )
+```
+
+#### DFlash 2 (Qwen3.8)
+
+DFlash 2 adds dynamic causal convolutions and a candidate path selector to
+keep later block positions coherent. For the 4-bit Qwen3.8 target, a verify
+block of 5 and a 4-bit drafter are the recommended MLX settings:
+
+```sh
+mlx_vlm.generate \
+  --model mlx-community/Qwen3.8-27B-4bit \
+  --draft-model incoai/Qwen3.8-27B-DFlash2 \
+  --draft-bits 4 --draft-block-size 5 \
+  --prompt "Explain speculative decoding in 3 sentences."
 ```
 
 #### Gemma 4 MTP
