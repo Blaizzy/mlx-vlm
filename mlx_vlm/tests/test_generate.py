@@ -625,6 +625,27 @@ class TestBatchGenerator:
         assert prompt_responses[0].prompt_time == pytest.approx(0.2)
         assert prompt_responses[0].cached_tokens == 0
 
+    def test_chunked_prefill_stats_count_each_prompt_token_once(
+        self, mock_model, mock_processor
+    ):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            prefill_batch_size=1,
+            completion_batch_size=1,
+            prefill_step_size=2,
+        )
+        prompt_tokens = 5
+        gen._prompt_batch = SimpleNamespace(
+            needs_processing=lambda: True,
+            prompt_step=lambda: 2,
+        )
+        gen._prompt_tokens_counter = prompt_tokens
+
+        gen.next()
+
+        assert gen.stats().prompt_tokens == prompt_tokens
+
     def test_prompt_progress_reports_apc_cached_tokens(self):
         batch = PromptProcessingBatch(
             model=SimpleNamespace(),
