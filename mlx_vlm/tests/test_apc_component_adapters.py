@@ -156,17 +156,13 @@ def test_coordinator_hides_dense_vs_hybrid_storage_strategy():
     assert hybrid.enabled and hybrid.strategy == "checkpoint"
 
 
-def test_apc_py_delegates_to_registry():
-    from mlx_vlm.apc import (
-        _cache_entry_supports_block_apc,
-        _cache_entry_supports_exact_apc,
-    )
+def test_registry_eligibility_helpers():
     from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 
-    assert _cache_entry_supports_block_apc(C.KVCache()) is True
-    assert _cache_entry_supports_exact_apc(C.ArraysCache(2)) is True
+    assert A.apc_block_eligible(C.KVCache()) is True
+    assert A.apc_exact_eligible(C.ArraysCache(2)) is True
 
-    assert _cache_entry_supports_block_apc(RingSlidingKVCache(window_size=64)) is False
+    assert A.apc_block_eligible(RingSlidingKVCache(window_size=64)) is False
 
 
 def _clone(c):

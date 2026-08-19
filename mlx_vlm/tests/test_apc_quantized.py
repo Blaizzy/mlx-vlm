@@ -18,8 +18,6 @@ import pytest
 
 from mlx_vlm.apc import (
     APCManager,
-    _cache_entry_supports_block_apc,
-    _cache_entry_supports_exact_apc,
     _clone_cache_entry_for_apc,
     _clone_prompt_cache_for_apc,
     harvest_blocks_from_batch_cache,
@@ -29,6 +27,7 @@ from mlx_vlm.apc import (
     make_warm_kv_cache,
     model_apc_mode,
 )
+from mlx_vlm.apc_adapters import apc_block_eligible, apc_exact_eligible
 from mlx_vlm.generate.ar import _extend_cache, _make_cache
 from mlx_vlm.models.cache import (
     ArraysCache,
@@ -401,18 +400,18 @@ class TestCacheEntrySupport:
     def test_quantized_supports_block_apc(self):
         """QuantizedKVCache should be recognized as block-APC compatible."""
         cache = QuantizedKVCache(group_size=GROUP_SIZE, bits=BITS)
-        assert _cache_entry_supports_block_apc(cache) is True
+        assert apc_block_eligible(cache) is True
 
     def test_quantized_supports_exact_apc(self):
         """QuantizedKVCache should be recognized as exact-APC compatible."""
         cache = QuantizedKVCache(group_size=GROUP_SIZE, bits=BITS)
-        assert _cache_entry_supports_exact_apc(cache) is True
+        assert apc_exact_eligible(cache) is True
 
     def test_plain_kv_still_works(self):
         """Existing KVCache support is not broken."""
         cache = KVCache()
-        assert _cache_entry_supports_block_apc(cache) is True
-        assert _cache_entry_supports_exact_apc(cache) is True
+        assert apc_block_eligible(cache) is True
+        assert apc_exact_eligible(cache) is True
 
 
 # ---------------------------------------------------------------------------
@@ -566,7 +565,7 @@ class TestExactModeQuantized:
         mx.eval(batch_kv.keys, batch_q.keys)
 
         prompt_cache = [arrays, batch_kv, batch_q]
-        assert all(_cache_entry_supports_exact_apc(c) for c in prompt_cache)
+        assert all(apc_exact_eligible(c) for c in prompt_cache)
 
         # Clone path: BatchKVCache collapses to KVCache; quant dequants to KVCache.
         eval_targets: list = []
