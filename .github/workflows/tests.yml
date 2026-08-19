@@ -34,7 +34,6 @@ jobs:
       - name: Install package and dependencies
         run: |
           python -m pip install pytest
-          python -m pip install sentencepiece
           python -m pip install -e .
 
       - name: Run Python tests
