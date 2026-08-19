@@ -2726,6 +2726,7 @@ class BatchGenerator:
                 elapsed = time.perf_counter() - tic
                 self._prompt_time_counter += elapsed
                 self._record_prompt_batch_time(self._prompt_batch, elapsed)
+                self._prompt_tokens_counter += n
                 return prompt_responses, generation_responses
 
             tic = time.perf_counter()
