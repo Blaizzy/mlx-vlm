@@ -84,6 +84,10 @@ nav:
     - Home: index.md
     - Installation: installation.md
     - CLI Reference: cli_reference.md
+    - Usage: usage.md
+    - Server: server.md
+    - Prefix Caching: prefix-caching.md
+    - KV Cache Quantization: kv-cache-quantization.md
     - Examples: examples.md
     - Contributing: contributing.md
     - Community Projects: community_projects.md
