@@ -266,6 +266,20 @@ def test_audio_request_queue_serializes_requests(monkeypatch):
         audio_queue.stop_and_join()
 
 
+def test_audio_request_queue_clears_worker_streams(monkeypatch):
+    cleared_threads = []
+    monkeypatch.setattr(
+        server_audio,
+        "clear_mlx_streams",
+        lambda: cleared_threads.append(server_audio.threading.current_thread().name),
+    )
+
+    audio_queue = server_audio.AudioRequestQueue()
+    audio_queue.stop_and_join()
+
+    assert cleared_threads == [audio_queue._thread.name]
+
+
 def test_get_cached_model_loads_tts_audio_model(monkeypatch):
     fake_model = SimpleNamespace(model_type="fake_audio")
     monkeypatch.setattr(server, "load_audio_model", lambda model_path: fake_model)

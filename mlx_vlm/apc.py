@@ -56,6 +56,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import mlx.core as mx
 import numpy as np
 
+from ._stream_cleanup import clear_mlx_streams
 from .apc_storage import APCNode, ComponentId, StateHandle
 from .kv_quant import from_config as kv_quant_from_config
 from .kv_quant import kv_quant_fingerprint
@@ -2805,6 +2806,12 @@ class DiskBlockStore:
         self._maybe_evict()
 
     def _writer_loop(self) -> None:
+        try:
+            self._writer_loop_impl()
+        finally:
+            clear_mlx_streams()
+
+    def _writer_loop_impl(self) -> None:
         while True:
             item = self._q.get()
             if item is None:

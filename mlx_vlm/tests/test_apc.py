@@ -374,6 +374,20 @@ def test_apc_max_pool_tensors_keeps_disk_persistence(tmp_path, monkeypatch):
     manager.close()
 
 
+def test_disk_store_clears_each_writer_threads_streams(tmp_path, monkeypatch):
+    cleared_threads = []
+    monkeypatch.setattr(
+        apc_module,
+        "clear_mlx_streams",
+        lambda: cleared_threads.append(apc_module.threading.current_thread().name),
+    )
+
+    disk = DiskBlockStore(tmp_path, namespace="worker-cleanup", num_workers=2)
+    disk.close()
+
+    assert sorted(cleared_threads) == ["apc-disk-0", "apc-disk-1"]
+
+
 def test_disk_store_recovers_when_cache_dir_is_deleted(tmp_path):
     block_size = 16
     first_tokens = list(range(block_size))

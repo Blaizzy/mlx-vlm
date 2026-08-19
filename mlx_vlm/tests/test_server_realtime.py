@@ -97,6 +97,20 @@ def test_realtime_loader_uses_generic_load_and_model_session(monkeypatch):
     ]
 
 
+def test_realtime_engine_clears_worker_streams(monkeypatch):
+    cleared_threads = []
+    monkeypatch.setattr(
+        realtime,
+        "clear_mlx_streams",
+        lambda: cleared_threads.append(realtime.threading.current_thread().name),
+    )
+
+    engine = realtime.RealtimeVoiceChatEngine(loader=lambda _: None)
+    engine.stop_and_join()
+
+    assert cleared_threads == [engine._thread.name]
+
+
 @pytest.fixture
 def realtime_client(monkeypatch):
     os.environ.pop("MLX_VLM_SERVER_API_KEY", None)

@@ -1,5 +1,6 @@
 mlx>=0.32.0
 transformers>=5.14.0
+sentencepiece>=0.2.0
 miniaudio>=1.59
 tqdm>=4.66.2
 Pillow>=10.3.0

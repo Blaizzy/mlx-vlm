@@ -26,6 +26,7 @@ from mlx_audio.audio_io import read as audio_read
 from mlx_audio.audio_io import write as audio_write
 from pydantic import Field
 
+from .._stream_cleanup import clear_mlx_streams
 from .runtime import runtime
 from .schemas import FlexibleBaseModel
 
@@ -187,6 +188,12 @@ class AudioRequestQueue:
         self._thread.join(timeout=timeout)
 
     def _run(self) -> None:
+        try:
+            self._run_impl()
+        finally:
+            clear_mlx_streams()
+
+    def _run_impl(self) -> None:
         while not self._stop.is_set():
             request = self._requests.get()
             if request is None:

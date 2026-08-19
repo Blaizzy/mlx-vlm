@@ -214,16 +214,16 @@ def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
     if keys_tuple is None or values_tuple is None or length == 0:
         return None, None
     keys = mx.dequantize(
-        keys_tuple[0][..., :length, :],
-        keys_tuple[1][..., :length, :],
-        keys_tuple[2][..., :length, :],
+        mx.contiguous(keys_tuple[0][..., :length, :]),
+        mx.contiguous(keys_tuple[1][..., :length, :]),
+        mx.contiguous(keys_tuple[2][..., :length, :]),
         group_size=group_size,
         bits=bits,
     )
     values = mx.dequantize(
-        values_tuple[0][..., :length, :],
-        values_tuple[1][..., :length, :],
-        values_tuple[2][..., :length, :],
+        mx.contiguous(values_tuple[0][..., :length, :]),
+        mx.contiguous(values_tuple[1][..., :length, :]),
+        mx.contiguous(values_tuple[2][..., :length, :]),
         group_size=group_size,
         bits=bits,
     )
