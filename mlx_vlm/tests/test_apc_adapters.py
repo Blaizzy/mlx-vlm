@@ -10,13 +10,13 @@ import mlx.core as mx
 
 from mlx_vlm.apc import (
     APCManager,
-    _cache_entry_supports_exact_apc,
     _clone_cache_entry_for_apc,
     _clone_prompt_cache_for_apc,
     extract_prompt_cache_from_batch,
     harvest_blocks_from_batch_cache,
     model_apc_mode,
 )
+from mlx_vlm.apc_adapters import apc_exact_eligible
 from mlx_vlm.models.cache import (
     ArraysCache,
     BatchKVCache,
@@ -384,7 +384,7 @@ class TestGemmaLikeHybridExact:
 
     def test_supports_exact_apc_for_batch_rotating(self):
         cache, _, _ = _fill_batch_rotating([0], seq_len=16)
-        assert _cache_entry_supports_exact_apc(cache) is True
+        assert apc_exact_eligible(cache) is True
 
     def test_extract_batch_rotating_then_clone(self):
         cache, _, _ = _fill_batch_rotating([0], seq_len=20)
@@ -404,7 +404,7 @@ class TestGemmaLikeHybridExact:
         token_ids = list(range(seq_len))
         prompt_cache = self._gemma_like_layout(batch_size=1, seq_len=seq_len)
 
-        assert all(_cache_entry_supports_exact_apc(c) for c in prompt_cache)
+        assert all(apc_exact_eligible(c) for c in prompt_cache)
 
         snap = snapshot_prompt_cache_row(prompt_cache, batch_idx=0)
         assert snap is not None
@@ -753,4 +753,4 @@ class TestBatchTurboQuantParity:
 
     def test_supports_exact_apc(self):
         cache, _, _ = _fill_batch_turbo([0], seq_len=8)
-        assert _cache_entry_supports_exact_apc(cache) is True
+        assert apc_exact_eligible(cache) is True

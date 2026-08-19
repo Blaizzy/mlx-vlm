@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Protocol, Sequence, runtime_checkable
+from typing import Any, Dict, List, Optional, Sequence
 
 import mlx.core as mx
 
@@ -104,36 +104,9 @@ def _eval_tree(obj: Any, out: List[mx.array]) -> None:
 
 @dataclass
 class StateFragment:
-    """Captured, restorable state for one cache component at a boundary."""
+    """Detached state captured from one cache component."""
 
-    capability: Capability
-    prefix_len: int
     payload: Any
-    schema: str = f"v{ADAPTER_SCHEMA_VERSION}"
-
-    def eval_targets(self) -> List[mx.array]:
-        out: List[mx.array] = []
-        _eval_tree(self.payload, out)
-        return out
-
-
-@runtime_checkable
-class PrefixStateAdapter(Protocol):
-    """Capture/restore/merge contract for one cache-component kind."""
-
-    capability: Capability
-
-    def capture(self, cache: Any, prefix_len: int) -> Optional[StateFragment]: ...
-
-    def restore(self, fresh_cache: Any, fragment: StateFragment) -> None: ...
-
-    def merge_rows(
-        self, caches: Sequence[Any], prefix_lens: Sequence[int]
-    ) -> Optional[Any]: ...
-
-    def serialize(self, fragment: StateFragment) -> Any: ...
-
-    def deserialize(self, tree: Any) -> StateFragment: ...
 
 
 def _is_snapshotable(cache: Any) -> bool:
@@ -172,7 +145,7 @@ class CheckpointAdapter:
                 "meta_state": cache.meta_state,
             }
         )
-        return StateFragment(self.capability, prefix_len, payload=_snapshot_tree(raw))
+        return StateFragment(payload=_snapshot_tree(raw))
 
     def restore(self, fresh_cache: Any, fragment: StateFragment) -> None:
         # ``capture`` already detached every array. Re-copying here builds a
@@ -186,113 +159,8 @@ class CheckpointAdapter:
             fresh_cache.state = payload["state"]
             fresh_cache.meta_state = payload["meta_state"]
 
-    def merge_rows(
-        self, caches: Sequence[Any], prefix_lens: Sequence[int]
-    ) -> Optional[Any]:
-
-        first = caches[0] if caches else None
-        merge = getattr(first, "prefix_cache_merge", None)
-        return merge(caches, prefix_lens) if callable(merge) else None
-
-    def serialize(self, fragment: StateFragment) -> Any:
-        return {
-            "capability": fragment.capability.value,
-            "prefix_len": fragment.prefix_len,
-            "schema": fragment.schema,
-            "payload": fragment.payload,
-        }
-
-    def deserialize(self, tree: Any) -> StateFragment:
-        return StateFragment(
-            Capability(tree["capability"]),
-            int(tree["prefix_len"]),
-            payload=tree["payload"],
-            schema=tree.get("schema", "v1"),
-        )
-
-
-class CompositeAdapter:
-    """Recurses into ``CacheList`` / tuple caches, one sub-adapter per child."""
-
-    capability = Capability.COMPOSITE
-
-    def _children(self, cache: Any) -> Optional[Sequence[Any]]:
-        if isinstance(cache, tuple):
-            return list(cache)
-        subs = getattr(cache, "caches", None)
-        return list(subs) if subs is not None else None
-
-    def capture(self, cache: Any, prefix_len: int) -> Optional[StateFragment]:
-        children = self._children(cache)
-        if children is None:
-            return None
-        frags = []
-        for sub in children:
-            adapter = resolve_adapter(sub)
-            frag = adapter.capture(sub, prefix_len)
-            if frag is None:
-                return None
-            frags.append(frag)
-        return StateFragment(self.capability, prefix_len, payload=frags)
-
-    def restore(self, fresh_cache: Any, fragment: StateFragment) -> None:
-        children = self._children(fresh_cache)
-        for sub, frag in zip(children, fragment.payload):
-            resolve_adapter(sub).restore(sub, frag)
-
-    def merge_rows(
-        self, caches: Sequence[Any], prefix_lens: Sequence[int]
-    ) -> Optional[Any]:
-        return None
-
-    def serialize(self, fragment: StateFragment) -> Any:
-        return {
-            "capability": fragment.capability.value,
-            "prefix_len": fragment.prefix_len,
-            "children": [
-                resolve_adapter_by_capability(f.capability).serialize(f)
-                for f in fragment.payload
-            ],
-        }
-
-    def deserialize(self, tree: Any) -> StateFragment:
-        children = [
-            resolve_adapter_by_capability(Capability(c["capability"])).deserialize(c)
-            for c in tree["children"]
-        ]
-        return StateFragment(self.capability, int(tree["prefix_len"]), payload=children)
-
-
-class UnsupportedAdapter:
-    capability = Capability.UNSUPPORTED
-
-    def capture(self, cache: Any, prefix_len: int) -> Optional[StateFragment]:
-        return None
-
-    def restore(self, fresh_cache: Any, fragment: StateFragment) -> None:
-        raise TypeError("cache type does not implement the APC snapshot protocol")
-
-    def merge_rows(
-        self, caches: Sequence[Any], prefix_lens: Sequence[int]
-    ) -> Optional[Any]:
-        return None
-
-    def serialize(self, fragment: StateFragment) -> Any:
-        raise TypeError("unsupported APC fragment")
-
-    def deserialize(self, tree: Any) -> StateFragment:
-        raise TypeError("unsupported APC fragment")
-
-
 _CAPABILITY: Dict[type, Capability] = {}
 _DEFAULTS_REGISTERED = False
-_ADAPTERS: Dict[Capability, PrefixStateAdapter] = {
-    Capability.PAGEABLE: CheckpointAdapter(),
-    Capability.WINDOWED: CheckpointAdapter(),
-    Capability.CHECKPOINT: CheckpointAdapter(),
-    Capability.COMPOSITE: CompositeAdapter(),
-    Capability.UNSUPPORTED: UnsupportedAdapter(),
-}
 
 
 def register_capability(cls: type, capability: Capability) -> None:
@@ -406,16 +274,6 @@ def resolve_capability(
     if _has_explicit_snapshot_contract(cache) or _custom_state_contract(cache):
         return Capability.CHECKPOINT
     return Capability.UNSUPPORTED
-
-
-def resolve_adapter(
-    cache: Any, overrides: Optional[Dict[type, Capability]] = None
-) -> PrefixStateAdapter:
-    return _ADAPTERS[resolve_capability(cache, overrides)]
-
-
-def resolve_adapter_by_capability(cap: Capability) -> PrefixStateAdapter:
-    return _ADAPTERS[cap]
 
 
 _APC_EXACT_TYPES: Optional[tuple] = None
@@ -807,9 +665,6 @@ class PrefixCachePlan:
         """Compatibility spelling for the old block/exact API."""
         strategy = self.strategy
         return "exact" if strategy == "checkpoint" else strategy
-
-    def adapter_for(self, index: int) -> PrefixStateAdapter:
-        return _ADAPTERS[self.components[index].capability]
 
     def describe(self) -> str:
         head = (

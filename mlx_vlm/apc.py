@@ -350,18 +350,6 @@ def _clone_layer_major_kv_cache_for_apc(
     return out
 
 
-def _cache_entry_supports_exact_apc(c: Any) -> bool:
-    from .apc_adapters import apc_exact_eligible
-
-    return apc_exact_eligible(c)
-
-
-def _cache_entry_supports_block_apc(c: Any) -> bool:
-    from .apc_adapters import apc_block_eligible
-
-    return apc_block_eligible(c)
-
-
 def _sequence_hash(token_ids: Sequence[int], extra_hash: int, block_size: int) -> int:
     h = hashlib.sha256()
     h.update(int(extra_hash & ((1 << 64) - 1)).to_bytes(8, "little"))
@@ -510,32 +498,12 @@ def adjust_prefix_to_text_suffix_boundary(
 class APCBlock(APCNode):
     """Pooled logical node for one fixed-size KV block; its pageable K/V lives in the "kv" component handle."""
 
-    block_id: int
     block_hash: Optional[int] = None
-    parent_hash: int = SEED_PARENT_HASH
     token_ids: Tuple[int, ...] = ()
-    extra_hash: int = 0
     ref_cnt: int = 0
     components: Dict[ComponentId, StateHandle] = field(default_factory=dict)
-    last_used: float = 0.0
     prev: Optional["APCBlock"] = None
     next: Optional["APCBlock"] = None
-
-    @property
-    def node_key(self) -> Optional[int]:
-        return self.block_hash
-
-    @property
-    def prefix_len(self) -> int:
-        return len(self.token_ids)
-
-    @property
-    def parent_key(self) -> int:
-        return self.parent_hash
-
-    @property
-    def lock_count(self) -> int:
-        return self.ref_cnt
 
 
 @dataclass
@@ -545,19 +513,6 @@ class APCExactCacheEntry:
     token_ids: Tuple[int, ...]
     extra_hash: int
     prompt_cache: List[Any]
-    last_used: float
-
-
-@dataclass(frozen=True)
-class _DiskBlockSnapshot:
-    """Immutable view of an APC block for the asynchronous disk writer."""
-
-    block_hash: int
-    parent_hash: int
-    extra_hash: int
-    token_ids: Tuple[int, ...]
-    keys: List[mx.array]
-    values: List[mx.array]
 
 
 @dataclass(frozen=True)
@@ -958,8 +913,8 @@ class DiskBlockStore:
 
     The in-memory index ``hash → (shard_path, block_idx)`` is rebuilt on
     init by scanning shards (cheap, just reads safetensors headers).
-    Shard mmap'd handles are kept in a small LRU cache so siblings within
-    a single restore don't re-mmap the same file.
+    Restore reads layer-major tensors directly into the runtime prompt-cache
+    layout, avoiding per-block tensor materialization.
 
     Writes go through a single background worker so the prefill hot path
     isn't blocked. Eviction is at segment-shard granularity (drop one
@@ -969,8 +924,6 @@ class DiskBlockStore:
     SUFFIX = ".safetensors"
     SHARD_PREFIX = "shard_"
     EXACT_PREFIX = "exact_"
-    SHARD_STEM_LEN = len(SHARD_PREFIX) + 32  # "shard_" + 32 hex chars
-    EXACT_STEM_LEN = len(EXACT_PREFIX) + 32  # "exact_" + 32 hex chars
     # Eviction targets this fraction of max_bytes after a single sweep so
     # we don't thrash on every write near the cap.
     _EVICT_LOW_WATERMARK = 0.9
@@ -987,7 +940,6 @@ class DiskBlockStore:
         self.max_bytes = max_bytes
         self.evictions = 0  # cumulative shard deletions by _maybe_evict
         self._q: queue.Queue = queue.Queue(maxsize=4096)
-        self._stop = threading.Event()
         # Track in-flight hashes (across pending shard writes) so a lookup
         # racing a write can wait briefly for the bytes to land.
         self._in_flight: dict[int, threading.Event] = {}
@@ -997,25 +949,11 @@ class DiskBlockStore:
         # exact full-prefix hash -> snapshot path
         self._exact_index: dict[int, Path] = {}
         self._index_lock = threading.RLock()
-        # Direct-read mode avoids mmap-backed MLX arrays entirely. It parses
-        # safetensors headers, reads only the requested block's byte ranges
-        # with normal file I/O, then constructs MLX-managed arrays from those
-        # bytes. Keep the old mmap path available for comparison.
-        self._read_mode = os.environ.get("APC_DISK_READ_MODE", "direct").lower()
-        if self._read_mode not in ("direct", "mmap"):
-            logger.warning(
-                "APC disk: unknown APC_DISK_READ_MODE=%r; using direct",
-                self._read_mode,
-            )
-            self._read_mode = "direct"
         # Bounded LRU of parsed safetensors headers:
         # shard_path -> (tensor_entries, file_metadata, data_start).
         self._header_cache: "OrderedDict[Path, Tuple[dict, dict, int]]" = OrderedDict()
         self._header_cache_lock = threading.Lock()
         self._header_cache_max = int(os.environ.get("APC_DISK_HEADER_CACHE", 4))
-        self._direct_max_overread_bytes = int(
-            float(os.environ.get("APC_DISK_DIRECT_MAX_OVERREAD_MB", "8")) * (1 << 20)
-        )
         # Bound layer-major shard size so disk eviction is segment-granular
         # instead of one huge all-or-nothing prefix file. A Qwen3-VL-4B block
         # is ~2.25 MiB, so 256 blocks is roughly a 576 MiB shard before the
@@ -1031,16 +969,6 @@ class DiskBlockStore:
         self._restore_clear_every = max(
             0, int(os.environ.get("APC_DISK_RESTORE_CLEAR_EVERY", "1"))
         )
-        # Bounded LRU of mmap'd shards: shard_path -> (arrays_dict, file_metadata).
-        # Default capped at 2 — the within-restore working set is typically
-        # one shard, occasionally two (for a multi-shard restore). Larger
-        # caps risk pinning lots of materialised K/V tensors in unified
-        # memory after evicted blocks have already been used. Override with
-        # APC_DISK_MMAP_CACHE if you know what you're doing.
-        self._mmap_cache: "OrderedDict[Path, Tuple[dict, dict]]" = OrderedDict()
-        self._mmap_cache_lock = threading.Lock()
-        self._mmap_cache_max = int(os.environ.get("APC_DISK_MMAP_CACHE", 2))
-
         n_orphans = self._cleanup_partials()
         if n_orphans:
             logger.info(
@@ -1096,8 +1024,6 @@ class DiskBlockStore:
             stale_exact = [h for h, sp in self._exact_index.items() if sp == path]
             for h in stale_exact:
                 del self._exact_index[h]
-        with self._mmap_cache_lock:
-            self._mmap_cache.pop(path, None)
         with self._header_cache_lock:
             self._header_cache.pop(path, None)
 
@@ -1105,8 +1031,6 @@ class DiskBlockStore:
         with self._index_lock:
             self._index.clear()
             self._exact_index.clear()
-        with self._mmap_cache_lock:
-            self._mmap_cache.clear()
         with self._header_cache_lock:
             self._header_cache.clear()
         self._disk_bytes = 0
@@ -1215,10 +1139,6 @@ class DiskBlockStore:
         with self._index_lock:
             return len(self._exact_index)
 
-    @property
-    def load_returns_detached(self) -> bool:
-        return self._read_mode == "direct"
-
     def _maybe_evict(self) -> int:
         """Evict segment shards until under the low watermark.
 
@@ -1300,7 +1220,7 @@ class DiskBlockStore:
                 continue
             self._disk_bytes -= size
             evicted += 1
-            # Drop index + mmap entries pointing at this shard.
+            # Drop index and cached-header entries pointing at this shard.
             self._drop_index_for_path(p)
         if evicted:
             self.evictions += evicted
@@ -1337,46 +1257,10 @@ class DiskBlockStore:
                 self._header_cache.popitem(last=False)
         return parsed
 
-    # ---------- mmap cache ----------
-    def _open_shard(self, shard_path: Path):
-        """Return (arrays_dict, file_metadata) for a shard, mmap-cached."""
-        if not self._ensure_dir():
-            return None
-        if not shard_path.exists():
-            self._drop_index_for_path(shard_path)
-            return None
-        with self._mmap_cache_lock:
-            cached = self._mmap_cache.get(shard_path)
-            if cached is not None:
-                self._mmap_cache.move_to_end(shard_path)
-                return cached
-        try:
-            arrays, metadata = mx.load(str(shard_path), return_metadata=True)
-        except Exception as e:
-            logger.warning("APC disk shard load failed for %s: %s", shard_path, e)
-            self._drop_index_for_path(shard_path)
-            return None
-        # Touch recency timestamp so LRU eviction prefers truly-cold shards.
-        try:
-            os.utime(shard_path, None)
-        except OSError:
-            pass
-        bundle = (dict(arrays), dict(metadata))
-        with self._mmap_cache_lock:
-            self._mmap_cache[shard_path] = bundle
-            self._mmap_cache.move_to_end(shard_path)
-            while len(self._mmap_cache) > self._mmap_cache_max:
-                self._mmap_cache.popitem(last=False)
-        return bundle
-
     # ---------- Public API ----------
     def has(self, block_hash: int) -> bool:
         with self._index_lock:
             return block_hash in self._index
-
-    def has_exact(self, cache_hash: int) -> bool:
-        with self._index_lock:
-            return cache_hash in self._exact_index
 
     def find_exact_prefix(
         self,
@@ -1787,82 +1671,6 @@ class DiskBlockStore:
 
         return None
 
-    def load(
-        self, block_hash: int, *, wait_in_flight_ms: float = 0.0
-    ) -> Optional[Tuple[List[mx.array], List[mx.array], dict]]:
-        """Read one block. Returns (keys, values, per-block metadata) or None.
-
-        Per-block metadata is decoded from the shard's ``b{idx}_meta`` JSON
-        entry and includes ``token_ids``, ``parent_hash``, ``extra_hash``,
-        ``block_hash``.
-        """
-        with self._index_lock:
-            entry = self._index.get(block_hash)
-        if entry is None:
-            if wait_in_flight_ms > 0:
-                with self._in_flight_lock:
-                    ev = self._in_flight.get(block_hash)
-                if ev is not None and ev.wait(wait_in_flight_ms / 1000.0):
-                    with self._index_lock:
-                        entry = self._index.get(block_hash)
-            if entry is None:
-                return None
-        shard_path, block_idx = entry
-        if self._read_mode == "mmap":
-            return self._load_mmap(shard_path, block_idx)
-        return self._load_direct(shard_path, block_idx)
-
-    def load_many(
-        self, block_hashes: Sequence[int], *, wait_in_flight_ms: float = 0.0
-    ) -> List[Optional[Tuple[List[mx.array], List[mx.array], dict]]]:
-        """Read multiple blocks, preserving order.
-
-        In direct mode, consecutive requests from the same shard are coalesced
-        into larger byte-range reads. In mmap mode, fall back to one-at-a-time
-        loads so the old comparison path stays simple and unchanged.
-        """
-        if not block_hashes:
-            return []
-        if self._read_mode == "mmap":
-            return [
-                self.load(h, wait_in_flight_ms=wait_in_flight_ms) for h in block_hashes
-            ]
-
-        entries: List[Optional[Tuple[Path, int]]] = []
-        for h in block_hashes:
-            with self._index_lock:
-                entry = self._index.get(h)
-            if entry is None and wait_in_flight_ms > 0:
-                with self._in_flight_lock:
-                    ev = self._in_flight.get(h)
-                if ev is not None and ev.wait(wait_in_flight_ms / 1000.0):
-                    with self._index_lock:
-                        entry = self._index.get(h)
-            entries.append(entry)
-
-        out: List[Optional[Tuple[List[mx.array], List[mx.array], dict]]] = [None] * len(
-            block_hashes
-        )
-        i = 0
-        while i < len(entries):
-            entry = entries[i]
-            if entry is None:
-                i += 1
-                continue
-            shard_path = entry[0]
-            j = i + 1
-            while (
-                j < len(entries)
-                and entries[j] is not None
-                and entries[j][0] == shard_path
-            ):
-                j += 1
-            block_indices = [entries[k][1] for k in range(i, j)]
-            loaded = self._load_direct_many(shard_path, block_indices)
-            out[i:j] = loaded
-            i = j
-        return out
-
     def _decode_block_metadata(self, file_metadata: dict, block_idx: int) -> dict:
         block_meta_str = file_metadata.get(f"b{block_idx}_meta")
         if not block_meta_str:
@@ -1880,31 +1688,6 @@ class DiskBlockStore:
             return block_meta
         except Exception:
             return {}
-
-    def _load_mmap(
-        self, shard_path: Path, block_idx: int
-    ) -> Optional[Tuple[List[mx.array], List[mx.array], dict]]:
-        bundle = self._open_shard(shard_path)
-        if bundle is None:
-            return None
-        arrays, file_metadata = bundle
-        try:
-            num_layers = int(file_metadata.get("num_layers", "0"))
-        except (TypeError, ValueError):
-            return None
-        try:
-            keys = [arrays[f"b{block_idx}_k{l}"] for l in range(num_layers)]
-            values = [arrays[f"b{block_idx}_v{l}"] for l in range(num_layers)]
-        except KeyError as e:
-            logger.warning("APC disk shard %s missing tensor: %s", shard_path, e)
-            return None
-        return keys, values, self._decode_block_metadata(file_metadata, block_idx)
-
-    def _load_direct(
-        self, shard_path: Path, block_idx: int
-    ) -> Optional[Tuple[List[mx.array], List[mx.array], dict]]:
-        loaded = self._load_direct_many(shard_path, [block_idx])
-        return loaded[0] if loaded else None
 
     def _load_layer_major_segment(
         self,
@@ -2411,196 +2194,6 @@ class DiskBlockStore:
             )
         return keys, values, metadata
 
-    def _collect_direct_specs(
-        self,
-        tensor_entries: dict,
-        num_layers: int,
-        block_indices: Sequence[int],
-        shard_path: Path,
-    ):
-        specs = []
-        total_bytes = 0
-        for block_idx in block_indices:
-            for l in range(num_layers):
-                for suffix in ("k", "v"):
-                    name = f"b{block_idx}_{suffix}{l}"
-                    entry = tensor_entries.get(name)
-                    if entry is None:
-                        logger.warning(
-                            "APC disk shard %s missing tensor: %s", shard_path, name
-                        )
-                        return None
-                    bounds = _safetensors_tensor_bounds(entry)
-                    if bounds is None:
-                        logger.warning(
-                            "APC disk shard %s has unsupported/corrupt tensor: %s",
-                            shard_path,
-                            name,
-                        )
-                        return None
-                    start, end, _ = bounds
-                    specs.append((block_idx, name, entry, start, end))
-                    total_bytes += end - start
-        return specs, total_bytes
-
-    def _load_direct_many(
-        self, shard_path: Path, block_indices: Sequence[int]
-    ) -> List[Optional[Tuple[List[mx.array], List[mx.array], dict]]]:
-        if not block_indices:
-            return []
-        parsed = self._open_shard_header(shard_path)
-        if parsed is None:
-            return [None] * len(block_indices)
-        tensor_entries, file_metadata, data_start = parsed
-        try:
-            num_layers = int(file_metadata.get("num_layers", "0"))
-        except (TypeError, ValueError):
-            return [None] * len(block_indices)
-
-        if file_metadata.get("layout") in (
-            "layer_major_v1",
-            "layer_major_v2",
-            "token_major_v2",
-        ):
-            try:
-                block_hashes = [
-                    int(json.loads(file_metadata[f"b{idx}_meta"])["block_hash"])
-                    for idx in block_indices
-                ]
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                return [None] * len(block_indices)
-            loaded = self.load_layer_major_prefix(block_hashes, preserve_capacity=False)
-            if loaded is None:
-                return [None] * len(block_indices)
-            layer_keys, layer_values, metadatas = loaded
-            out = []
-            try:
-                block_size = int(file_metadata.get("block_size", "0"))
-            except (TypeError, ValueError):
-                return [None] * len(block_indices)
-            for i, md in enumerate(metadatas):
-                start = i * block_size
-                end = start + block_size
-                out.append(
-                    (
-                        [k[..., start:end, :] for k in layer_keys],
-                        [v[..., start:end, :] for v in layer_values],
-                        md,
-                    )
-                )
-            return out
-
-        collected = self._collect_direct_specs(
-            tensor_entries, num_layers, block_indices, shard_path
-        )
-        if collected is None:
-            return [None] * len(block_indices)
-        specs, total_bytes = collected
-        if not specs:
-            return [
-                ([], [], self._decode_block_metadata(file_metadata, block_idx))
-                for block_idx in block_indices
-            ]
-
-        min_start = min(start for _, _, _, start, _ in specs)
-        max_end = max(end for _, _, _, _, end in specs)
-        span = max_end - min_start
-        if (
-            len(block_indices) > 1
-            and span > total_bytes + self._direct_max_overread_bytes
-        ):
-            mid = len(block_indices) // 2
-            return self._load_direct_many(
-                shard_path, block_indices[:mid]
-            ) + self._load_direct_many(shard_path, block_indices[mid:])
-
-        try:
-            with open(shard_path, "rb") as f:
-                # ``mx.save_safetensors`` may reorder tensors in the data
-                # buffer, so we compute the exact span from the header. For a
-                # chain-contiguous shard restore this is usually one compact
-                # range, turning hundreds of small reads into one larger read.
-                f.seek(data_start + min_start)
-                slab = f.read(span)
-                if len(slab) != span:
-                    return [None] * len(block_indices)
-                view = memoryview(slab)
-                raw_by_name = {
-                    name: view[start - min_start : end - min_start]
-                    for _, name, _, start, end in specs
-                }
-        except OSError as e:
-            logger.warning("APC disk direct read failed for %s: %s", shard_path, e)
-            return [None] * len(block_indices)
-
-        entries_by_name = {name: entry for _, name, entry, _, _ in specs}
-        out: List[Optional[Tuple[List[mx.array], List[mx.array], dict]]] = []
-        for block_idx in block_indices:
-            keys: List[mx.array] = []
-            values: List[mx.array] = []
-            ok = True
-            for l in range(num_layers):
-                k_name = f"b{block_idx}_k{l}"
-                v_name = f"b{block_idx}_v{l}"
-                k = _mlx_array_from_safetensors_bytes(
-                    raw_by_name[k_name], entries_by_name[k_name]
-                )
-                v = _mlx_array_from_safetensors_bytes(
-                    raw_by_name[v_name], entries_by_name[v_name]
-                )
-                if k is None or v is None:
-                    ok = False
-                    break
-                keys.append(k)
-                values.append(v)
-            if ok:
-                out.append(
-                    (
-                        keys,
-                        values,
-                        self._decode_block_metadata(file_metadata, block_idx),
-                    )
-                )
-            else:
-                out.append(None)
-
-        # Touch recency timestamp so LRU eviction prefers truly-cold shards.
-        try:
-            os.utime(shard_path, None)
-        except OSError:
-            pass
-        return out
-
-    def save_batch(self, blocks: List["APCBlock"]) -> None:
-        """Schedule segment-shard writes containing ``blocks``. Returns
-        immediately; the writer thread does the safetensors save + atomic
-        rename + index update.
-        """
-        if not blocks:
-            return
-
-        snapshots: List[_DiskBlockSnapshot] = []
-        for b in blocks:
-            if b.block_hash is None or b.keys is None or b.values is None:
-                continue
-            snapshots.append(
-                _DiskBlockSnapshot(
-                    block_hash=int(b.block_hash),
-                    parent_hash=int(b.parent_hash),
-                    extra_hash=int(b.extra_hash),
-                    token_ids=tuple(int(t) for t in b.token_ids),
-                    keys=list(b.keys),
-                    values=list(b.values),
-                )
-            )
-            if len(snapshots) >= self._shard_max_blocks:
-                self._enqueue_block_snapshots(snapshots)
-                snapshots = []
-        if not snapshots:
-            return
-
-        self._enqueue_block_snapshots(snapshots)
-
     def save_exact_cache(
         self,
         cache_hash: int,
@@ -2665,12 +2258,6 @@ class DiskBlockStore:
             self._enqueue_shard(
                 self._shard_id_for(block_hashes), block_hashes, snapshot
             )
-
-    def _enqueue_block_snapshots(self, snapshots: List[_DiskBlockSnapshot]) -> None:
-        block_hashes = [b.block_hash for b in snapshots]
-        self._enqueue_shard(
-            self._shard_id_for(block_hashes), block_hashes, list(snapshots)
-        )
 
     def _enqueue_exact_snapshot(self, snapshot: _DiskExactCacheSnapshot) -> None:
         cache_hash = int(snapshot.cache_hash)
@@ -3017,46 +2604,6 @@ class DiskBlockStore:
         )
         return [b.block_hash for b in blocks]
 
-    def _write_block_snapshot(
-        self,
-        path: Path,
-        blocks: List[_DiskBlockSnapshot],
-    ) -> List[int]:
-        metadata: dict[str, str] = {}
-        num_layers = len(blocks[0].keys) if blocks and blocks[0].keys else 0
-        for idx, b in enumerate(blocks):
-            if b.keys is None or b.values is None:
-                continue
-            metadata[f"b{idx}_meta"] = json.dumps(
-                {
-                    "block_hash": int(b.block_hash),
-                    "parent_hash": int(b.parent_hash),
-                    "extra_hash": int(b.extra_hash),
-                    "token_ids": [int(t) for t in b.token_ids],
-                }
-            )
-        layer_keys: List[mx.array] = []
-        layer_values: List[mx.array] = []
-        for l in range(num_layers):
-            layer_keys.append(
-                mx.concatenate(
-                    [b.keys[l] for b in blocks if b.keys is not None], axis=2
-                )
-            )
-            layer_values.append(
-                mx.concatenate(
-                    [b.values[l] for b in blocks if b.values is not None], axis=2
-                )
-            )
-        layer_keys, layer_values = self._pad_layer_major_arrays(
-            layer_keys, layer_values
-        )
-        block_size = len(blocks[0].token_ids) if blocks and blocks[0].token_ids else 0
-        self._save_layer_major_shard(
-            path, blocks, metadata, layer_keys, layer_values, block_size
-        )
-        return [b.block_hash for b in blocks]
-
     def _save_layer_major_shard(
         self,
         path: Path,
@@ -3112,7 +2659,7 @@ class DiskBlockStore:
                 elif isinstance(payload, _DiskLayerMajorSnapshot):
                     block_hashes = self._write_layer_major_snapshot(path, payload)
                 else:
-                    block_hashes = self._write_block_snapshot(path, payload)
+                    raise TypeError(f"unsupported APC disk payload: {type(payload)!r}")
             except Exception as e:
                 logger.warning("APC disk shard save failed for %s: %s", path, e)
             finally:
@@ -3129,15 +2676,12 @@ class DiskBlockStore:
                 item = None
 
     def close(self) -> None:
-        self._stop.set()
         for _ in self._workers:
             self._q.put(None)
         for t in self._workers:
             t.join()
         with self._header_cache_lock:
             self._header_cache.clear()
-        with self._mmap_cache_lock:
-            self._mmap_cache.clear()
 
 
 class APCManager:
@@ -3151,7 +2695,7 @@ class APCManager:
     ):
         self.block_size = block_size
         self.num_blocks = num_blocks
-        self.pool: List[APCBlock] = [APCBlock(block_id=i) for i in range(num_blocks)]
+        self.pool: List[APCBlock] = [APCBlock() for _ in range(num_blocks)]
         self._free_head: Optional[APCBlock] = None
         self._free_tail: Optional[APCBlock] = None
         for b in self.pool:
@@ -3189,28 +2733,6 @@ class APCManager:
         self._disk_min_free_ram_bytes = int(
             float(os.environ.get("APC_DISK_MIN_FREE_RAM_GB", "2.0")) * (1 << 30)
         )
-        # Number of disk-loaded blocks to coalesce per ``mx.eval`` during
-        # warm-disk restore. The disk read itself is always serial (no
-        # thread pool, no buffering of mmap views beyond this batch); the
-        # batch only controls eval-dispatch count. With Qwen3-VL-4B's 36
-        # layers × bf16 head_dim=128 × block_size=16 × 8 KV-heads, one
-        # block of K+V is ~2.3 MB, so the default of 8 puts at most ~18 MB
-        # of fresh-block tensors in flight per eval — three orders of
-        # magnitude below the all-at-once eval that has crashed Apple
-        # Silicon hosts. Set to 1 for the strictly-bounded one-at-a-time
-        # path; raise it on a known-roomy machine to claw back wall time.
-        self._disk_eval_block_chunk = max(
-            1, int(os.environ.get("APC_DISK_EVAL_BLOCK_CHUNK", "8"))
-        )
-        # Number of disk blocks to coalesce into one direct byte-range read.
-        # This is separate from eval chunking: a larger read chunk improves
-        # SSD throughput/readahead while eval still happens in small batches.
-        # 256 Qwen3-VL-4B blocks are ~576 MB of K/V payload; large enough to
-        # restore an ~8k-token prompt shard in one sequential read, still
-        # small relative to the model's recommended Apple-Silicon working set.
-        self._disk_load_block_chunk = max(
-            1, int(os.environ.get("APC_DISK_LOAD_BLOCK_CHUNK", "256"))
-        )
         # Apple Metal has a per-process resource-count ceiling separate from
         # byte memory. Qwen3-VL-4B stores 72 MLX tensors per APCBlock, so a
         # very large pool can hit the ceiling before unified memory is scarce.
@@ -3241,7 +2763,6 @@ class APCManager:
         else:
             self._free_head = b
         self._free_tail = b
-        b.last_used = time.time()
 
     def _free_remove(self, b: APCBlock) -> None:
         if b.prev is not None:
@@ -3265,8 +2786,6 @@ class APCManager:
             self.stats.evictions += 1
         b.block_hash = None
         b.token_ids = ()
-        b.parent_hash = SEED_PARENT_HASH
-        b.extra_hash = 0
         b.release_components()
         return b
 
@@ -3340,7 +2859,6 @@ class APCManager:
 
                 if best_entry is not None and best_key is not None:
                     self._exact_cache.move_to_end(best_key)
-                    best_entry.last_used = time.time()
                     prefix_len = len(best_entry.token_ids)
                     source_cache = best_entry.prompt_cache
 
@@ -3402,7 +2920,6 @@ class APCManager:
                                                 token_ids=stored_tokens,
                                                 extra_hash=int(extra_hash),
                                                 prompt_cache=storage_copy,
-                                                last_used=time.time(),
                                             )
                                         )
                                         self._exact_cache.move_to_end(promote_key)
@@ -3470,7 +2987,6 @@ class APCManager:
                     token_ids=token_tuple,
                     extra_hash=int(extra_hash),
                     prompt_cache=copied,
-                    last_used=time.time(),
                 )
                 self._exact_cache.move_to_end(key)
                 while len(self._exact_cache) > self._exact_cache_max:
@@ -3667,7 +3183,6 @@ class APCManager:
                         token_ids=token_tuple,
                         extra_hash=int(extra_hash),
                         prompt_cache=copied,
-                        last_used=time.time(),
                     )
                     self._exact_cache.move_to_end(key)
                     while len(self._exact_cache) > self._exact_cache_max:
@@ -3745,9 +3260,7 @@ class APCManager:
                 v_slabs = [_copy_mlx_array(v[..., start:end, :]) for v in layer_values]
                 mx.eval(k_slabs + v_slabs)
                 b.block_hash = h
-                b.parent_hash = parent
                 b.token_ids = chunk
-                b.extra_hash = extra_hash
                 b.set_kv(k_slabs, v_slabs)
                 b.ref_cnt = 1
                 self.hash_table[h] = b
@@ -3797,8 +3310,6 @@ class APCManager:
             for b in self.pool:
                 b.block_hash = None
                 b.token_ids = ()
-                b.parent_hash = SEED_PARENT_HASH
-                b.extra_hash = 0
                 b.release_components()
                 b.ref_cnt = 0
                 b.prev = b.next = None
@@ -4078,7 +3589,6 @@ def make_warm_batch_kv_cache_multi(
     """
     from .models.cache import should_quantize_kv_layer
 
-    B = len(picks)
     prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
     max_prefix = max(prefix_lens) if prefix_lens else 0
     if max_prefix == 0:
@@ -4819,11 +4329,10 @@ def from_env(
             )
             cap_str = f"{max_gb:.1f} GB" if max_bytes else "unbounded"
             logger.info(
-                "APC disk tier at %s (ns=%s, cap=%s, read_mode=%s)",
+                "APC disk tier at %s (ns=%s, cap=%s)",
                 disk.dir,
                 ns,
                 cap_str,
-                disk._read_mode,
             )
         except Exception as e:
             logger.warning("APC disk tier disabled (init failed): %s", e)
