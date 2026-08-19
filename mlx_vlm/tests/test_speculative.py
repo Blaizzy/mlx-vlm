@@ -616,6 +616,21 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
     assert bool(mx.array_equal(ref, out).item())
 
 
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_qwen_target_verify_quantized_linear_m4_matches_singleton_path(dtype):
+    mx.random.seed(21)
+    linear = nn.QuantizedLinear(512, 64, bias=False, group_size=64, bits=4)
+    linear.scales = linear.scales.astype(dtype)
+    linear.biases = linear.biases.astype(dtype)
+    x = mx.random.normal((2, 4, 512)).astype(dtype)
+
+    ref = qwen_language._target_verify_timewise(linear, x)
+    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
 def test_qwen_capture_only_preserves_prefill_path():
     config = _tiny_qwen3_5_text_config()
     config.num_hidden_layers = 4
@@ -738,9 +753,10 @@ def test_qwen3_5_decode_quantized_linears_fused_matches_separate():
         assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
 
 
+@pytest.mark.parametrize("verify_len", [4, 5])
 @pytest.mark.parametrize("out_dims", [(64, 64), (64, 64, 16, 16)])
 def test_qwen3_5_target_verify_quantized_linears_fused_matches_singletons(
-    out_dims,
+    out_dims, verify_len
 ):
     mx.random.seed(180 + len(out_dims))
     linears = [
@@ -750,7 +766,7 @@ def test_qwen3_5_target_verify_quantized_linears_fused_matches_singletons(
     for linear in linears:
         linear.scales = linear.scales.astype(mx.bfloat16)
         linear.biases = linear.biases.astype(mx.bfloat16)
-    x = mx.random.normal((1, 5, 512), dtype=mx.bfloat16)
+    x = mx.random.normal((1, verify_len, 512), dtype=mx.bfloat16)
 
     singleton_rows = [
         qwen_language._decode_quantized_linears_fused(linears, x[:, i : i + 1])
