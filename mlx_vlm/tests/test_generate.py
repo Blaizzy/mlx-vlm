@@ -3393,3 +3393,262 @@ class TestPrePaddedBatchRows:
         assert mask.shape == (2, 8)
         assert mask[0].tolist() == [False] * 5 + [True] * 3
         assert mask[1].tolist() == [True] * 8
+
+
+# ============================================================================
+# An explicit sampler= must not be silently ignored
+# ============================================================================
+#
+# `sampler` is a documented public field (generate/types.py) and a
+# BatchGenerator constructor argument, and _generate_batch -- the engine behind
+# the public batch_generate() -- inserts without per-row sampling_configs. When
+# _step ignored self.sampler in favour of per-row configs, those rows fell back
+# to SamplingConfig() (temperature 0), so every caller passing sampler= got
+# greedy output instead. mlx_vlm/evals/ocrbench.py:288 is an in-repo victim.
+
+_SENTINEL_TOKEN = 1  # not 2: MockStoppingCriteria treats 2 as EOS
+_ARGMAX_TOKEN = 3  # what the greedy/per-row path produces below
+
+
+class _ConstantLogitModel:
+    """Logits are constant, so the greedy answer is always _ARGMAX_TOKEN and
+    any other token proves a different sampler ran."""
+
+    def __init__(self):
+        self.layers = [MagicMock() for _ in range(2)]
+
+    def __call__(self, input_ids, cache=None, inputs_embeds=None, **kwargs):
+        scores = mx.array([0.0, 1.0, 2.0, 3.0])
+        n = input_ids.shape[0]
+        t = input_ids.shape[1] if input_ids.ndim > 1 else 1
+        return SimpleNamespace(logits=mx.broadcast_to(scores, (n, t, 4)))
+
+
+def _constant_sampler(token_id):
+    def sampler(logprobs):
+        return mx.full((logprobs.shape[0],), token_id, dtype=mx.int32)
+
+    return sampler
+
+
+def _drain(gen, *, limit=64):
+    """Run the generator to completion, returning {uid: [tokens]}."""
+    out = {}
+    steps = 0
+    while gen.has_work and steps < limit:
+        _prompt, responses = gen.next()
+        for r in responses:
+            if r.finish_reason != "stop":
+                out.setdefault(r.uid, []).append(r.token)
+        steps += 1
+    gen.close()
+    return out
+
+
+def _sampler_generator(processor, sampler, *, max_tokens=3, batch=1):
+    return BatchGenerator(
+        model=_ConstantLogitModel(),
+        processor=processor,
+        sampler=sampler,
+        max_tokens=max_tokens,
+        prefill_batch_size=batch,
+        completion_batch_size=batch,
+        prefill_step_size=None,
+        compute_logprobs=False,
+    )
+
+
+def _insert_plain(gen, prompts, **kwargs):
+    """Insert the way _generate_batch does: no sampling_configs."""
+    return gen.insert(
+        prompts,
+        prompt_kwargs=[{"inputs_embeds": mx.zeros((1, len(p), 4))} for p in prompts],
+        **kwargs,
+    )
+
+
+def test_batch_generate_honors_explicit_sampler(mock_processor):
+    gen = _sampler_generator(mock_processor, _constant_sampler(_SENTINEL_TOKEN))
+    uids = _insert_plain(gen, [[1, 2, 3]])
+    tokens = _drain(gen)
+    assert tokens[uids[0]]
+    assert set(tokens[uids[0]]) == {_SENTINEL_TOKEN}
+
+
+def test_explicit_sampler_survives_batch_extend(mock_processor):
+    # A second prompt arriving mid-flight goes through GenerationBatch.extend();
+    # the sampler must still be honoured for both rows afterwards.
+    gen = _sampler_generator(
+        mock_processor, _constant_sampler(_SENTINEL_TOKEN), max_tokens=4, batch=2
+    )
+    first = _insert_plain(gen, [[1, 2, 3]])
+    gen.next()  # prefill + first decode step
+    second = _insert_plain(gen, [[4, 5]])
+    gen.next()
+    tokens = _drain(gen)
+    assert tokens.get(second[0]), "second row never produced a token"
+    for uid in (first[0], second[0]):
+        assert set(tokens.get(uid, [_SENTINEL_TOKEN])) == {_SENTINEL_TOKEN}
+
+
+def test_per_row_configs_take_precedence_over_sampler(mock_processor):
+    # Server-shaped call: both an explicit sampler and explicit per-row configs.
+    # Per-row wins, so the greedy config's argmax comes out, not the sentinel.
+    gen = _sampler_generator(mock_processor, _constant_sampler(_SENTINEL_TOKEN))
+    uids = _insert_plain(
+        gen, [[1, 2, 3]], sampling_configs=[SamplingConfig(temperature=0.0)]
+    )
+    tokens = _drain(gen)
+    assert tokens[uids[0]]
+    assert set(tokens[uids[0]]) == {_ARGMAX_TOKEN}
+
+
+def test_ocrbench_style_temperature_is_not_silently_greedy(mock_processor):
+    # evals/ocrbench.py builds a temperature sampler and passes it as sampler=.
+    # If it is ignored the rows decode greedily, so two runs with different
+    # global RNG seeds return identical tokens.
+    def temperature_sampler(logprobs):
+        return mx.random.categorical(logprobs * (1 / 0.7))
+
+    runs = []
+    for seed in (11, 22):
+        mx.random.seed(seed)
+        gen = _sampler_generator(mock_processor, temperature_sampler, max_tokens=8)
+        uids = _insert_plain(gen, [[1, 2, 3]])
+        runs.append(_drain(gen)[uids[0]])
+
+    assert runs[0] and runs[1]
+    assert runs[0] != runs[1]
+
+
+class _FusedGreedyModel(_ConstantLogitModel):
+    """Models like qwen3_5 implement fused_greedy_decode; _fused_greedy_step
+    takes it whenever greedy_sampling is True and returns argmax directly,
+    bypassing the sampler entirely."""
+
+    def fused_greedy_decode(self, input_ids, cache=None, **kwargs):
+        return mx.zeros((input_ids.shape[0], 1), dtype=mx.int32)
+
+
+def test_fused_greedy_path_does_not_swallow_an_explicit_sampler(mock_processor):
+    # Rows inserted without per-row configs must not be treated as "all
+    # temperature 0, so greedy is safe" -- their tokens come from the caller's
+    # sampler, which the fused path never calls. filter() recomputes
+    # greedy_sampling, so a row finishing early is what exposes this.
+    gen = BatchGenerator(
+        model=_FusedGreedyModel(),
+        processor=mock_processor,
+        sampler=_constant_sampler(_SENTINEL_TOKEN),
+        prefill_batch_size=2,
+        completion_batch_size=2,
+        prefill_step_size=None,
+        compute_logprobs=False,
+    )
+    uids = _insert_plain(gen, [[1, 2, 3], [4, 5, 6]], max_tokens=[1, 5])
+    tokens = _drain(gen)
+    emitted = [t for uid in uids for t in tokens.get(uid, [])]
+    assert emitted
+    assert set(emitted) == {_SENTINEL_TOKEN}
+
+
+def test_speculative_batch_honors_explicit_sampler():
+    # PromptProcessingBatch.generate() hands its sampler to the speculative
+    # batch too (main did: ar.py:2005 `sampler=sampler`). Dropping that made
+    # batch_generate(sampler=..., draft_model=...) silently greedy, and the
+    # greedy flag it derives would also switch the drafter into greedy drafting.
+    class _HiddenStateModel(_ConstantLogitModel):
+        def __call__(self, input_ids, cache=None, inputs_embeds=None, **kwargs):
+            out = super().__call__(input_ids, cache=cache, **kwargs)
+            n, t = input_ids.shape[0], input_ids.shape[1]
+            return SimpleNamespace(
+                logits=out.logits, hidden_states=[mx.zeros((n, t, 4))]
+            )
+
+    sampler = _constant_sampler(_SENTINEL_TOKEN)
+    batch = PromptProcessingBatch(
+        model=_HiddenStateModel(),
+        uids=[0],
+        input_ids=[[5]],
+        max_tokens=[2],
+        inputs_embeds=mx.ones((1, 1, 4)),
+        prompt_kwargs={},
+        prefill_step_size=None,
+        warm_cache=[],
+        draft_model=SimpleNamespace(config=SimpleNamespace(target_layer_ids=[0])),
+        draft_kind="dflash",
+    )
+    gen_batch = batch.generate(sampler, stop_criteria=lambda token: False)
+
+    assert isinstance(gen_batch, SpeculativeGenerationBatch)
+    assert gen_batch.sampler is sampler
+    # Unknown distribution -> the drafter must not be told the batch is greedy.
+    assert gen_batch.greedy_sampling is False
+
+
+def test_speculative_batch_per_row_configs_still_outrank_the_sampler():
+    from mlx_vlm.generate.ar import _PositionedTargetSampler
+
+    configs = [SamplingConfig(temperature=1.5, top_k=40)]
+    b = SpeculativeGenerationBatch.__new__(SpeculativeGenerationBatch)
+    b._all_uids = [10]
+    b.uids = [10]
+    SpeculativeGenerationBatch._init_sampling(b, configs, _constant_sampler(1))
+    assert isinstance(b.sampler, _PositionedTargetSampler)
+    assert b.sampler.configs == configs
+    assert b.greedy_sampling is False
+
+
+def test_generation_batch_built_the_upstream_way_still_decodes():
+    # main constructs GenerationBatch with sampler= and no sampling=; before
+    # this fix that combination raised out of _PositionedTargetSampler([]) on
+    # the very first step.
+    batch = GenerationBatch(
+        model=_ConstantLogitModel(),
+        uids=[0],
+        inputs=mx.array([0], dtype=mx.int32),
+        prompt_cache=[],
+        sampler=_constant_sampler(_SENTINEL_TOKEN),
+        stop_criteria=lambda token: False,
+        max_tokens=[3],
+    )
+    batch.next()  # replays the seed token the caller already has
+    tokens = [r.token for _ in range(2) for r in batch.next()]
+    assert tokens
+    assert set(tokens) == {_SENTINEL_TOKEN}
+
+
+def test_desynced_per_row_configs_raise_instead_of_broadcasting():
+    # The sampler broadcasts a uniform config to a narrower batch on purpose
+    # (the drafters draft row by row), so a batch whose configs fell out of
+    # step with its rows must be caught here, not silently sampled.
+    batch = GenerationBatch(
+        model=_ConstantLogitModel(),
+        uids=[0, 1],
+        inputs=mx.array([1, 2], dtype=mx.int32),
+        prompt_cache=[],
+        sampler=None,
+        stop_criteria=lambda token: False,
+        max_tokens=[3, 3],
+        sampling=[SamplingConfig(temperature=0.5, seed=1)],  # one config, two rows
+    )
+    with pytest.raises(ValueError, match="batch width"):
+        batch.next()
+
+
+def test_generation_batch_without_sampler_or_configs_decodes_greedily():
+    # Neither an explicit sampler nor per-row configs: the rows fall back to
+    # SamplingConfig() defaults (greedy) rather than raising out of the
+    # per-row sampler, which is what _PositionedTargetSampler([]) used to do.
+    batch = GenerationBatch(
+        model=_ConstantLogitModel(),
+        uids=[0, 1],
+        inputs=mx.array([0, 0], dtype=mx.int32),
+        prompt_cache=[],
+        sampler=None,
+        stop_criteria=lambda token: False,
+        max_tokens=[3, 3],
+    )
+    batch.next()  # replays the seed tokens the caller already has
+    tokens = [r.token for _ in range(2) for r in batch.next()]
+    assert tokens
+    assert set(tokens) == {_ARGMAX_TOKEN}

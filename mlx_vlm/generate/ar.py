@@ -1197,6 +1197,61 @@ def _sample_with_positions(
     return sampler(logprobs)
 
 
+def _default_argmax_sampler(logprobs: mx.array) -> mx.array:
+    """BatchGenerator's fallback when the caller supplies no ``sampler``.
+
+    A module-level function rather than a lambda so the batch classes can tell
+    "the caller passed nothing" from "the caller passed a sampler" by identity
+    -- which is what decides whether an explicit sampler outranks the per-row
+    configs.
+    """
+    return mx.argmax(logprobs, axis=-1)
+
+
+def _is_explicit_sampler(sampler) -> bool:
+    return sampler is not None and sampler is not _default_argmax_sampler
+
+
+def _has_explicit_sampling(sampling) -> bool:
+    """True when at least one row was inserted with its own SamplingConfig.
+
+    Rows inserted without one hold ``None``; that is deliberately distinct from
+    ``SamplingConfig()``, which is a caller asking for greedy.
+    """
+    return bool(sampling) and any(c is not None for c in sampling)
+
+
+def _row_configs(sampling, n: int) -> List["SamplingConfig"]:
+    """Per-row configs with the rows that carried none filled in.
+
+    The length is asserted rather than broadcast: the sampler will happily
+    broadcast a uniform config across a narrower batch (the drafters need
+    that), so a batch whose configs desynced from its rows would sample
+    plausibly and wrongly instead of failing.
+    """
+    if not sampling:
+        return [SamplingConfig()] * n
+    if len(sampling) != n:
+        raise ValueError(
+            f"sampling configs ({len(sampling)}) must match the batch width ({n})."
+        )
+    return [c if c is not None else SamplingConfig() for c in sampling]
+
+
+_sampler_override_logged = False
+
+
+def _log_sampler_outranked_by_configs() -> None:
+    global _sampler_override_logged
+    if _sampler_override_logged:
+        return
+    _sampler_override_logged = True
+    logger.info(
+        "Both an explicit sampler and per-row sampling configs were supplied; "
+        "the per-row configs win and the sampler is not called."
+    )
+
+
 class GenerationBatch:
     """
     Batched token generator with double-buffered pipelining.
@@ -1236,8 +1291,9 @@ class GenerationBatch:
         self._language_model = getattr(model, "language_model", model)
         self.uids = uids
         self.prompt_cache = prompt_cache
-        # Retained for PromptProcessingBatch/SpeculativeGenerationBatch/API
-        # compatibility; _step() now samples per-row via self.sampling, not this.
+        # Called by _step() only when no row carried its own SamplingConfig
+        # (see _sampler_outranks_configs); the server's continuous batch always
+        # supplies per-row configs, so there the configs win.
         self.sampler = sampler
         self.stop_criteria = stop_criteria
         self.max_tokens = max_tokens
@@ -1286,6 +1342,18 @@ class GenerationBatch:
             self.token_context.extend([[] for _ in range(missing)])
         elif len(self.token_context) > len(self.uids):
             self.token_context = self.token_context[: len(self.uids)]
+
+    def _sampler_outranks_configs(self) -> bool:
+        """Whether a caller-supplied ``sampler`` decides this batch's tokens.
+
+        ``sampler`` is public API (generate/types.py, the BatchGenerator
+        constructor) and the engine behind batch_generate() inserts rows
+        without per-row configs, so those rows must keep using it. Rows that DO
+        carry a config came from the server's per-row path and win.
+        """
+        return _is_explicit_sampler(self.sampler) and not _has_explicit_sampling(
+            self.sampling
+        )
 
     def _extend_sampling(self, other: "GenerationBatch"):
         self.sampling.extend(other.sampling)
@@ -1372,13 +1440,20 @@ class GenerationBatch:
             logits = mx.concatenate(processed_logits, axis=0)
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        sampler = _PositionedTargetSampler(self.sampling)
-        sampled = _sample_with_positions(
-            sampler,
-            logprobs,
-            row_ids=[0] * len(self.uids),
-            positions=[n + 1 for n in self._num_tokens],
-        )
+        if self._sampler_outranks_configs():
+            sampled = self.sampler(logprobs)
+        else:
+            if _is_explicit_sampler(self.sampler):
+                _log_sampler_outranked_by_configs()
+            sampler = _PositionedTargetSampler(
+                _row_configs(self.sampling, len(self.uids))
+            )
+            sampled = _sample_with_positions(
+                sampler,
+                logprobs,
+                row_ids=[0] * len(self.uids),
+                positions=[n + 1 for n in self._num_tokens],
+            )
 
         self._next_tokens = sampled
         prev_top_idx = self._next_top_idx
@@ -1552,8 +1627,10 @@ class GenerationBatch:
                 self.thinking_budget_criteria[idx] for idx in keep
             ]
         self._filter_sampling(keep)
-        self.greedy_sampling = bool(self.sampling) and all(
-            c.temperature == 0 for c in self.sampling
+        self.greedy_sampling = (
+            bool(self.sampling)
+            and not self._sampler_outranks_configs()
+            and all(c is None or c.temperature == 0 for c in self.sampling)
         )
 
         if not keep:
@@ -1706,6 +1783,7 @@ class SpeculativeGenerationBatch:
         draft_block_size: Optional[int] = None,
         token_dtype: mx.Dtype = mx.int32,
         sampling: Optional[List["SamplingConfig"]] = None,
+        sampler: Optional[Callable[[mx.array], mx.array]] = None,
     ):
         self.model = model
         self.draft_model = draft_model
@@ -1721,18 +1799,27 @@ class SpeculativeGenerationBatch:
         self.prompt_tokens = prompt_tokens
         self.draft_block_size = draft_block_size
         self.token_dtype = token_dtype
-        self._init_sampling(sampling)
+        self._init_sampling(sampling, sampler)
         self._num_tokens = [0] * len(uids)
         self._finished = [False] * len(uids)
         self._sent_first = False
         self._rounds_iter = None
 
-    def _init_sampling(self, sampling):
-        self.sampling = (
-            list(sampling) if sampling else [SamplingConfig()] * len(self._all_uids)
-        )
-        self.sampler = _PositionedTargetSampler(self.sampling)
-        self.greedy_sampling = all(c.temperature == 0 for c in self.sampling)
+    def _init_sampling(self, sampling, sampler=None):
+        # None, not SamplingConfig(): a row that carried no config defers to an
+        # explicit sampler=, a row that asked for greedy does not.
+        self.sampling = list(sampling) if sampling else [None] * len(self._all_uids)
+        configs = _row_configs(self.sampling, len(self._all_uids))
+        # Same precedence as GenerationBatch: rows carrying their own config
+        # win; otherwise a caller-supplied sampler drives the round loops.
+        if _is_explicit_sampler(sampler) and not _has_explicit_sampling(self.sampling):
+            self.sampler = sampler
+            self.greedy_sampling = False
+        else:
+            if _is_explicit_sampler(sampler):
+                _log_sampler_outranked_by_configs()
+            self.sampler = _PositionedTargetSampler(configs)
+            self.greedy_sampling = all(c.temperature == 0 for c in configs)
 
     def __len__(self):
         return sum(not done for done in self._finished)
@@ -2270,13 +2357,23 @@ class PromptProcessingBatch:
             logits = mx.concatenate(processed_logits, axis=0)
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        first_sampler = _PositionedTargetSampler(self.sampling)
-        first_tokens = _sample_with_positions(
-            first_sampler,
-            logprobs,
-            row_ids=[0] * len(self.uids),
-            positions=[0] * len(self.uids),
+        sampler_wins = _is_explicit_sampler(sampler) and not _has_explicit_sampling(
+            self.sampling
         )
+        if sampler_wins:
+            first_tokens = sampler(logprobs)
+        else:
+            if _is_explicit_sampler(sampler):
+                _log_sampler_outranked_by_configs()
+            first_sampler = _PositionedTargetSampler(
+                _row_configs(self.sampling, len(self.uids))
+            )
+            first_tokens = _sample_with_positions(
+                first_sampler,
+                logprobs,
+                row_ids=[0] * len(self.uids),
+                positions=[0] * len(self.uids),
+            )
 
         mx.async_eval(first_tokens)
 
@@ -2324,6 +2421,7 @@ class PromptProcessingBatch:
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
                 sampling=list(self.sampling),
+                sampler=sampler,
             )
             compute_logprobs = False
         else:
@@ -2336,7 +2434,7 @@ class PromptProcessingBatch:
                 stop_criteria=stop_criteria,
                 max_tokens=list(self.max_tokens),
                 top_logprobs_k=top_logprobs_k,
-                greedy_sampling=self.greedy_sampling,
+                greedy_sampling=self.greedy_sampling and not sampler_wins,
                 token_context=[list(ctx) for ctx in self._token_context],
                 logits_processors=list(self.logits_processors),
                 thinking_budget_criteria=list(self.thinking_budget_criteria),
@@ -2552,7 +2650,7 @@ class BatchGenerator:
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
-        self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+        self.sampler = sampler or _default_argmax_sampler
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
@@ -2846,7 +2944,9 @@ class BatchGenerator:
             draft_block_size=getattr(self, "draft_block_size", None),
             sampling=sampling_configs,
             # derive per-batch greedy flag from the actual configs (was: request #1)
-            greedy_sampling=all(c.temperature == 0 for c in sampling_configs),
+            greedy_sampling=all(
+                c is None or c.temperature == 0 for c in sampling_configs
+            ),
         )
 
     def _build_apc_meta_for_cold(
@@ -2912,7 +3012,10 @@ class BatchGenerator:
         elif len(thinking_budget_criteria) != len(prompts):
             raise ValueError("Insufficient number of thinking_budget_criteria provided")
         if sampling_configs is None:
-            sampling_configs = [SamplingConfig()] * len(prompts)
+            # None (not SamplingConfig()) so a row that asked for nothing stays
+            # distinguishable from a row that asked for greedy -- the first
+            # defers to an explicit sampler=, the second does not.
+            sampling_configs = [None] * len(prompts)
         elif len(sampling_configs) != len(prompts):
             raise ValueError("Insufficient number of sampling_configs provided")
 
@@ -3167,7 +3270,9 @@ class BatchGenerator:
                 draft_block_size=getattr(self, "draft_block_size", None),
                 sampling=sampling_configs,
                 # derive per-batch greedy flag from the actual configs (was: request #1)
-                greedy_sampling=all(c.temperature == 0 for c in sampling_configs),
+                greedy_sampling=all(
+                    c is None or c.temperature == 0 for c in sampling_configs
+                ),
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 
