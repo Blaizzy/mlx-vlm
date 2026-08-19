@@ -159,6 +159,7 @@ class CheckpointAdapter:
             fresh_cache.state = payload["state"]
             fresh_cache.meta_state = payload["meta_state"]
 
+
 _CAPABILITY: Dict[type, Capability] = {}
 _DEFAULTS_REGISTERED = False
 
