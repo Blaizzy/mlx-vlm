@@ -86,6 +86,7 @@ nav:
     - CLI Reference: cli_reference.md
     - Usage: usage.md
     - Server: server.md
+    - Speculative Decoding: speculative-decoding.md
     - Prefix Caching: prefix-caching.md
     - KV Cache Quantization: kv-cache-quantization.md
     - Examples: examples.md
