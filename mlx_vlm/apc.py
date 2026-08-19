@@ -776,12 +776,12 @@ def _resolve_checkpoint_class(module_name: str, qualname: str) -> Optional[type]
 
 
 def _safetensors_dtype_info(dtype: str):
-    """Return ``(numpy_dtype, mlx_dtype, bitcast_to)`` for supported dtypes."""
+    """Return ``(itemsize, buffer_format, mlx_dtype, bitcast_to)``."""
     if dtype == "BF16":
-        return np.dtype("<u2"), mx.uint16, mx.bfloat16
+        return 2, "H", mx.uint16, mx.bfloat16
     mapping = {
-        "F16": (np.dtype("<f2"), mx.float16, None),
-        "F32": (np.dtype("<f4"), mx.float32, None),
+        "F16": (2, "e", mx.float16, None),
+        "F32": (4, "f", mx.float32, None),
     }
     return mapping.get(dtype)
 
@@ -795,10 +795,10 @@ def _safetensors_tensor_bounds(
         dtype_info = _safetensors_dtype_info(str(entry["dtype"]))
         if dtype_info is None:
             return None
-        np_dtype, _, _ = dtype_info
+        itemsize, _, _, _ = dtype_info
         if int(end) < int(start):
             return None
-        if _numel(shape) * np_dtype.itemsize != int(end) - int(start):
+        if _numel(shape) * itemsize != int(end) - int(start):
             return None
         return int(start), int(end), shape
     except (KeyError, TypeError, ValueError):
@@ -813,9 +813,14 @@ def _mlx_array_from_safetensors_bytes(buf, entry: dict) -> Optional[mx.array]:
     dtype_info = _safetensors_dtype_info(str(entry["dtype"]))
     if dtype_info is None:
         return None
-    np_dtype, mlx_dtype, bitcast_to = dtype_info
-    arr = np.frombuffer(buf, dtype=np_dtype, count=_numel(shape)).reshape(shape)
-    out = mx.array(arr, dtype=mlx_dtype)
+    _, buffer_format, mlx_dtype, bitcast_to = dtype_info
+    try:
+        view = memoryview(buf).cast(buffer_format)
+        if len(view) != _numel(shape):
+            return None
+        out = mx.array(view, dtype=mlx_dtype).reshape(shape)
+    except (TypeError, ValueError):
+        return None
     if bitcast_to is not None:
         out = out.view(bitcast_to)
     return out
@@ -859,8 +864,8 @@ def _read_safetensors_axis0_slice_bytes(
     dtype_info = _safetensors_dtype_info(str(entry["dtype"]))
     if dtype_info is None:
         return None
-    np_dtype, _, _ = dtype_info
-    row_bytes = _numel(shape[1:]) * np_dtype.itemsize
+    itemsize, _, _, _ = dtype_info
+    row_bytes = _numel(shape[1:]) * itemsize
     byte_start = start + axis0_start * row_bytes
     byte_end = start + axis0_end * row_bytes
     try:
@@ -1994,9 +1999,7 @@ class DiskBlockStore:
         if not segments:
             return None
 
-        segment_infos: List[
-            Tuple[Path, dict, dict, int, int, Optional[int], List[int]]
-        ] = []
+        segment_infos: List[Tuple[dict[str, mx.array], int, Optional[int]]] = []
         metadata: List[dict] = []
         num_layers: Optional[int] = None
         block_size_ref: Optional[int] = None
@@ -2013,7 +2016,7 @@ class DiskBlockStore:
             parsed = self._open_shard_header(shard_path)
             if parsed is None:
                 return None
-            tensor_entries, file_metadata, data_start = parsed
+            _tensor_entries, file_metadata, _data_start = parsed
             layout = file_metadata.get("layout")
             if layout not in ("layer_major_v1", "layer_major_v2"):
                 return None
@@ -2028,6 +2031,17 @@ class DiskBlockStore:
                 num_layers = shard_layers
                 block_size_ref = block_size
             elif shard_layers != num_layers or block_size != block_size_ref:
+                return None
+            try:
+                shard_arrays = dict(mx.load(str(shard_path)))
+            except Exception as e:
+                logger.warning("APC disk shard load failed for %s: %s", shard_path, e)
+                return None
+            if any(
+                f"{kind}{layer_idx}" not in shard_arrays
+                for layer_idx in range(shard_layers)
+                for kind in ("k", "v")
+            ):
                 return None
 
             token_start = start_idx * block_size
@@ -2052,13 +2066,9 @@ class DiskBlockStore:
             )
             segment_infos.append(
                 (
-                    shard_path,
-                    tensor_entries,
-                    file_metadata,
-                    data_start,
+                    shard_arrays,
                     token_start,
                     slice_end,
-                    list(block_indices),
                 )
             )
             metadata.extend(
@@ -2077,21 +2087,9 @@ class DiskBlockStore:
         for layer_idx in range(num_layers):
             k_parts: List[mx.array] = []
             v_parts: List[mx.array] = []
-            for (
-                shard_path,
-                tensor_entries,
-                _file_metadata,
-                data_start,
-                token_start,
-                slice_end,
-                _block_indices,
-            ) in segment_infos:
-                k_entry = tensor_entries.get(f"k{layer_idx}")
-                v_entry = tensor_entries.get(f"v{layer_idx}")
-                if k_entry is None or v_entry is None:
-                    return None
-                k = _read_safetensors_tensor(shard_path, data_start, k_entry)
-                v = _read_safetensors_tensor(shard_path, data_start, v_entry)
+            for shard_arrays, token_start, slice_end in segment_infos:
+                k = shard_arrays.pop(f"k{layer_idx}", None)
+                v = shard_arrays.pop(f"v{layer_idx}", None)
                 if k is None or v is None:
                     return None
                 k_parts.append(k[..., token_start:slice_end, :])
@@ -2102,7 +2100,7 @@ class DiskBlockStore:
             mx.eval(k_out, v_out)
             keys.append(k_out)
             values.append(v_out)
-            del k_parts, v_parts, k_out, v_out
+            del k, v, k_parts, v_parts, k_out, v_out
             if (
                 self._restore_clear_every > 0
                 and (layer_idx + 1) % self._restore_clear_every == 0
@@ -2167,9 +2165,8 @@ class DiskBlockStore:
     ) -> Optional[Tuple[List[mx.array], List[mx.array], List[dict]]]:
         """Fast path for token-major shards.
 
-        Concatenate raw token-major byte ranges before constructing MLX arrays.
-        This avoids a first-request MLX compile of 72 per-layer concatenations
-        when a prefix spans a common-prefix shard plus a request-specific shard.
+        Load token ranges directly into MLX, concatenate them once, then
+        transpose into the runtime's contiguous per-layer cache layout.
         """
         if not segments:
             return None
@@ -2178,11 +2175,11 @@ class DiskBlockStore:
         block_size_ref: Optional[int] = None
         k_tail_shape: Optional[Tuple[int, ...]] = None
         v_tail_shape: Optional[Tuple[int, ...]] = None
-        k_dtype: Optional[str] = None
-        v_dtype: Optional[str] = None
+        k_dtype: Optional[mx.Dtype] = None
+        v_dtype: Optional[mx.Dtype] = None
         total_tokens = 0
-        k_buf = bytearray()
-        v_buf = bytearray()
+        k_parts: List[mx.array] = []
+        v_parts: List[mx.array] = []
         metadata: List[dict] = []
 
         for shard_path, block_indices in segments:
@@ -2212,18 +2209,16 @@ class DiskBlockStore:
             start_idx = block_indices[0]
             token_start = start_idx * block_size
             token_end = token_start + len(block_indices) * block_size
-            k_sliced = _read_safetensors_axis0_slice_bytes(
+            k_part = _read_safetensors_axis0_slice(
                 shard_path, data_start, k_entry, token_start, token_end
             )
-            v_sliced = _read_safetensors_axis0_slice_bytes(
+            v_part = _read_safetensors_axis0_slice(
                 shard_path, data_start, v_entry, token_start, token_end
             )
-            if k_sliced is None or v_sliced is None:
+            if k_part is None or v_part is None:
                 return None
-            k_raw, k_sliced_entry = k_sliced
-            v_raw, v_sliced_entry = v_sliced
-            k_shape = tuple(int(x) for x in k_sliced_entry["shape"])
-            v_shape = tuple(int(x) for x in v_sliced_entry["shape"])
+            k_shape = tuple(int(x) for x in k_part.shape)
+            v_shape = tuple(int(x) for x in v_part.shape)
             if len(k_shape) != 5 or len(v_shape) != 5:
                 return None
             if k_shape[1] != num_layers or v_shape[1] != num_layers:
@@ -2233,18 +2228,18 @@ class DiskBlockStore:
             if k_tail_shape is None:
                 k_tail_shape = k_shape[1:]
                 v_tail_shape = v_shape[1:]
-                k_dtype = str(k_sliced_entry["dtype"])
-                v_dtype = str(v_sliced_entry["dtype"])
+                k_dtype = k_part.dtype
+                v_dtype = v_part.dtype
             elif (
                 k_tail_shape != k_shape[1:]
                 or v_tail_shape != v_shape[1:]
-                or k_dtype != str(k_sliced_entry["dtype"])
-                or v_dtype != str(v_sliced_entry["dtype"])
+                or k_dtype != k_part.dtype
+                or v_dtype != v_part.dtype
             ):
                 return None
 
-            k_buf.extend(k_raw)
-            v_buf.extend(v_raw)
+            k_parts.append(k_part)
+            v_parts.append(v_part)
             total_tokens += k_shape[0]
             metadata.extend(
                 self._decode_block_metadata(file_metadata, idx) for idx in block_indices
@@ -2264,51 +2259,36 @@ class DiskBlockStore:
         ):
             return None
 
-        k_dtype_info = _safetensors_dtype_info(k_dtype)
-        v_dtype_info = _safetensors_dtype_info(v_dtype)
-        if k_dtype_info is None or v_dtype_info is None:
-            return None
-        k_np_dtype, k_mlx_dtype, k_bitcast_to = k_dtype_info
-        v_np_dtype, v_mlx_dtype, v_bitcast_to = v_dtype_info
-        try:
-            k_np = np.frombuffer(k_buf, dtype=k_np_dtype).reshape(
-                (total_tokens, *k_tail_shape)
-            )
-            v_np = np.frombuffer(v_buf, dtype=v_np_dtype).reshape(
-                (total_tokens, *v_tail_shape)
-            )
-        except ValueError:
-            return None
+        k_all = k_parts[0] if len(k_parts) == 1 else mx.concatenate(k_parts, axis=0)
+        v_all = v_parts[0] if len(v_parts) == 1 else mx.concatenate(v_parts, axis=0)
 
         # Build standard contiguous KVCache slabs with one decode step of spare
         # capacity. Exact-size restored caches make KVCache.update_and_fetch()
-        # grow via 72 MLX concatenations on the first generated token, which is
-        # a large first-use compile. Padding here is a plain NumPy copy.
+        # grow every layer on the first generated token, which is a large
+        # first-use compile. Keep the conversion and padding entirely in MLX.
         kv_step = 256
         capacity = ((total_tokens + 1 + kv_step - 1) // kv_step) * kv_step
+        pad_tokens = capacity - total_tokens
+        if pad_tokens > 0:
+            k_all = mx.concatenate(
+                [
+                    k_all,
+                    mx.zeros((pad_tokens, *k_tail_shape), dtype=k_dtype),
+                ],
+                axis=0,
+            )
+            v_all = mx.concatenate(
+                [
+                    v_all,
+                    mx.zeros((pad_tokens, *v_tail_shape), dtype=v_dtype),
+                ],
+                axis=0,
+            )
         keys: List[mx.array] = []
         values: List[mx.array] = []
         for l in range(num_layers):
-            k_layer = np.zeros(
-                (k_tail_shape[1], k_tail_shape[2], capacity, k_tail_shape[3]),
-                dtype=k_np_dtype,
-            )
-            v_layer = np.zeros(
-                (v_tail_shape[1], v_tail_shape[2], capacity, v_tail_shape[3]),
-                dtype=v_np_dtype,
-            )
-            k_layer[..., :total_tokens, :] = k_np[:, l, ...].transpose(1, 2, 0, 3)
-            v_layer[..., :total_tokens, :] = v_np[:, l, ...].transpose(1, 2, 0, 3)
-            keys.append(mx.array(k_layer, dtype=k_mlx_dtype))
-            values.append(mx.array(v_layer, dtype=v_mlx_dtype))
-        if k_bitcast_to is not None:
-            keys = [k.view(k_bitcast_to) for k in keys]
-        if v_bitcast_to is not None:
-            values = [v.view(v_bitcast_to) for v in values]
-        if k_bitcast_to is not None:
-            keys = [_copy_mlx_array(k) for k in keys]
-        if v_bitcast_to is not None:
-            values = [_copy_mlx_array(v) for v in values]
+            keys.append(mx.contiguous(mx.transpose(k_all[:, l, ...], (1, 2, 0, 3))))
+            values.append(mx.contiguous(mx.transpose(v_all[:, l, ...], (1, 2, 0, 3))))
         mx.eval(keys + values)
         return keys, values, metadata
 
@@ -2660,6 +2640,11 @@ class DiskBlockStore:
             return
         shared_layer_keys = list(layer_keys)
         shared_layer_values = list(layer_values)
+        # Generation uses a thread-local Metal stream. Materialize the live
+        # cache on its producer thread before handing references to the disk
+        # worker; a worker cannot evaluate an unresolved graph owned by that
+        # stream. This is synchronization only — it creates no staging copy.
+        mx.eval(shared_layer_keys + shared_layer_values)
         all_block_hashes = [b.block_hash for b in blocks]
         store_id = self._shard_id_for(all_block_hashes)
         segment_count = (
