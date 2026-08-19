@@ -16,6 +16,7 @@ import mlx.core as mx
 import numpy as np
 from fastapi import WebSocket, WebSocketDisconnect
 
+from .._stream_cleanup import clear_mlx_streams
 from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -111,6 +112,12 @@ class RealtimeVoiceChatEngine:
         self._thread.join(timeout=timeout)
 
     def _run(self) -> None:
+        try:
+            self._run_impl()
+        finally:
+            clear_mlx_streams()
+
+    def _run_impl(self) -> None:
         loaded_name: str | None = None
         loaded_model = None
         session_id: str | None = None

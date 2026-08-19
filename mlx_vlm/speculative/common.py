@@ -12,7 +12,7 @@ def _copy_rng_state() -> List[mx.array]:
 
 def _restore_rng_state(state: List[mx.array]) -> None:
     for i, value in enumerate(state):
-        mx.random.state[i] = value
+        mx.random.state[i][:] = value
 
 
 def _append_arrays(value: Any, arrays: List[mx.array]) -> None:
