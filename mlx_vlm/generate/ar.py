@@ -2783,11 +2783,10 @@ class BatchGenerator:
         if self._prompt_batch is not None:
             if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
-                n = self._prompt_batch.prompt_step()
+                self._prompt_batch.prompt_step()
                 elapsed = time.perf_counter() - tic
                 self._prompt_time_counter += elapsed
                 self._record_prompt_batch_time(self._prompt_batch, elapsed)
-                self._prompt_tokens_counter += n
                 return prompt_responses, generation_responses
 
             tic = time.perf_counter()
