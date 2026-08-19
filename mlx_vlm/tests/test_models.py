@@ -13357,6 +13357,75 @@ class TestQwen35NormSanitization(unittest.TestCase):
         self.assertTrue(mx.allclose(out[self._MLX_KEY], mx.zeros(4)).item())
 
 
+class TestQwen38FP8(unittest.TestCase):
+    def test_released_architecture_uses_qwen3_5_path(self):
+        from mlx_vlm.models import qwen3_5
+        from mlx_vlm.utils import get_model_and_args
+
+        released_config = {
+            "model_type": "qwen3_5",
+            "image_token_id": 248056,
+            "video_token_id": 248057,
+            "vision_start_token_id": 248053,
+            "vision_end_token_id": 248054,
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 5120,
+                "intermediate_size": 17408,
+                "linear_num_value_heads": 48,
+                "linear_num_key_heads": 16,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "num_hidden_layers": 64,
+                "num_attention_heads": 24,
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 248320,
+                "num_key_value_heads": 4,
+                "max_position_embeddings": 262144,
+                "head_dim": 256,
+                "eos_token_id": 248044,
+                "rope_parameters": {
+                    "rope_type": "default",
+                    "mrope_interleaved": True,
+                    "mrope_section": [11, 11, 10],
+                    "rope_theta": 10000000,
+                    "partial_rotary_factor": 0.25,
+                },
+                "full_attention_interval": 4,
+                "mtp_num_hidden_layers": 1,
+            },
+            "vision_config": {
+                "model_type": "qwen3_5",
+                "depth": 27,
+                "hidden_size": 1152,
+                "out_hidden_size": 5120,
+                "patch_size": 16,
+                "deepstack_visual_indexes": [],
+            },
+            "quantization_config": {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            },
+        }
+
+        model_module, model_type = get_model_and_args(released_config)
+        config = qwen3_5.ModelConfig.from_dict(released_config)
+
+        self.assertIs(model_module, qwen3_5)
+        self.assertEqual(model_type, "qwen3_5")
+        self.assertEqual(config.text_config.hidden_size, 5120)
+        self.assertEqual(config.text_config.num_hidden_layers, 64)
+        self.assertEqual(config.text_config.head_dim, 256)
+        self.assertEqual(config.vision_config.depth, 27)
+        self.assertEqual(config.vision_config.out_hidden_size, 5120)
+        self.assertEqual(config.eos_token_id, [248044, 248046])
+        self.assertEqual(config.quantization_config["quant_method"], "fp8")
+        self.assertEqual(config.quantization_config["weight_block_size"], [128, 128])
+
+
 class TestQwen35StructuredOutputMaskWidth(unittest.TestCase):
     """Structured output must not be capped at the tokenizer vocab width (#1797).
 
