@@ -314,6 +314,17 @@ def get_server_thinking_end_token():
     return os.environ.get("MLX_VLM_THINKING_END_TOKEN")
 
 
+def get_expert_cache_gb():
+    raw = os.environ.get("EXPERT_CACHE_GB", "")
+    if raw == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid EXPERT_CACHE_GB=%r; ignoring.", raw)
+        return None
+
+
 def get_quantized_kv_bits(model: str):
     kv_bits = float(os.environ.get("KV_BITS", 0))
     if kv_bits == 0:
@@ -664,7 +675,11 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
             os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
         )
         model, processor = load(
-            model_path, adapter_path, trust_remote_code=trust_remote_code
+            model_path,
+            adapter_path,
+            trust_remote_code=trust_remote_code,
+            expert_cache_gb=get_expert_cache_gb(),
+            max_kv_size=get_configured_context_limit(),
         )
         config = model.config
         logger.info("Model and processor loaded successfully.")

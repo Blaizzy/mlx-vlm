@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -16,12 +17,38 @@ DEFAULT_KV_GROUP_SIZE = 64
 DEFAULT_KV_QUANT_SCHEME = "uniform"
 DEFAULT_QUANTIZED_KV_START = 5000
 
+logger = logging.getLogger("mlx_vlm.generate")
+
 # A stream on the default device just for generation
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
 def _policy_enabled(policy) -> bool:
     return bool(getattr(policy, "enabled", policy))
+
+
+def _default_prefill_step_size_for_offload(
+    model, prefill_step_size: Optional[int], draft_model, default: int
+) -> Optional[int]:
+    """A one-shot lazy prefill pins every touched expert in a single graph
+    until the final eval, defeating ``ExpertStore``'s LRU budget regardless
+    of ``prefill_step_size``'s own chunked-prefill benefits elsewhere -- so
+    an explicit ``None`` (chunking off) against an expert-offload model is a
+    footgun, not a valid choice, unless a drafter already has its own reason
+    to require an unchunked prefill."""
+    if (
+        prefill_step_size is None
+        and draft_model is None
+        and getattr(model, "moe_offload_store", None) is not None
+    ):
+        logger.warning(
+            "prefill_step_size=None with an expert-offload model: falling "
+            "back to prefill_step_size=%d instead of pinning every touched "
+            "expert resident until the final eval.",
+            default,
+        )
+        return default
+    return prefill_step_size
 
 
 def _chunked_prefill_enabled(
