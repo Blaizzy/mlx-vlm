@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Protocol, Sequence, runtime_checka
 
 import mlx.core as mx
 
-ADAPTER_SCHEMA_VERSION = 1
+ADAPTER_SCHEMA_VERSION = 2
 
 
 class Capability(str, Enum):
@@ -19,6 +19,58 @@ class Capability(str, Enum):
     CHECKPOINT = "checkpoint"
     COMPOSITE = "composite"
     UNSUPPORTED = "unsupported"
+
+
+@dataclass(frozen=True)
+class CacheSpec:
+    """Logical cache format for one model cache entry.
+
+    This intentionally mirrors vLLM's ``KVCacheSpec`` boundary without
+    importing allocator concerns that do not apply to MLX's contiguous runtime
+    caches.  APC only needs to know whether an entry can be stored as pageable
+    K/V, must be restored as a window/state checkpoint, or is a composite of
+    other entries.
+    """
+
+    capability: Capability
+    type_name: str
+    block_eligible: bool = False
+    window_size: Optional[int] = None
+    children: tuple["CacheSpec", ...] = ()
+
+    @property
+    def pageable(self) -> bool:
+        return self.capability == Capability.PAGEABLE or (
+            self.capability == Capability.COMPOSITE
+            and bool(self.children)
+            and all(child.pageable for child in self.children)
+        )
+
+    @property
+    def restorable(self) -> bool:
+        return self.capability != Capability.UNSUPPORTED and all(
+            child.restorable for child in self.children
+        )
+
+    @property
+    def group_key(self) -> tuple:
+        """Stable grouping key for entries sharing one storage policy."""
+        return (
+            self.capability.value,
+            self.type_name,
+            self.block_eligible,
+            self.window_size,
+            tuple(child.group_key for child in self.children),
+        )
+
+
+@dataclass(frozen=True)
+class CacheGroupSpec:
+    """Homogeneous cache entries coordinated as one APC cache group."""
+
+    group_id: int
+    spec: CacheSpec
+    layer_indices: tuple[int, ...]
 
 
 def _copy_array(x: mx.array) -> mx.array:
@@ -92,6 +144,17 @@ def _is_snapshotable(cache: Any) -> bool:
     return hasattr(cache, "state") and hasattr(cache, "meta_state")
 
 
+def _has_explicit_snapshot_contract(cache: Any) -> bool:
+    """True when a custom type explicitly opts into prefix snapshots."""
+    from .models.cache import _BaseCache
+
+    base_snapshot = _BaseCache.__dict__.get("prefix_cache_snapshot")
+    for klass in type(cache).__mro__:
+        if "prefix_cache_snapshot" in klass.__dict__:
+            return klass.__dict__["prefix_cache_snapshot"] is not base_snapshot
+    return False
+
+
 class CheckpointAdapter:
     """Universal fallback: snapshot ``state`` + ``meta_state`` as an opaque blob."""
 
@@ -112,7 +175,10 @@ class CheckpointAdapter:
         return StateFragment(self.capability, prefix_len, payload=_snapshot_tree(raw))
 
     def restore(self, fresh_cache: Any, fragment: StateFragment) -> None:
-        payload = _snapshot_tree(fragment.payload)
+        # ``capture`` already detached every array. Re-copying here builds a
+        # second lazy graph, doubles memory traffic, and can leak unevaluated
+        # arrays into the asynchronous disk writer.
+        payload = fragment.payload
         restore = getattr(fresh_cache, "prefix_cache_restore", None)
         if callable(restore):
             restore(payload)
@@ -197,38 +263,128 @@ class CompositeAdapter:
         return StateFragment(self.capability, int(tree["prefix_len"]), payload=children)
 
 
+class UnsupportedAdapter:
+    capability = Capability.UNSUPPORTED
+
+    def capture(self, cache: Any, prefix_len: int) -> Optional[StateFragment]:
+        return None
+
+    def restore(self, fresh_cache: Any, fragment: StateFragment) -> None:
+        raise TypeError("cache type does not implement the APC snapshot protocol")
+
+    def merge_rows(
+        self, caches: Sequence[Any], prefix_lens: Sequence[int]
+    ) -> Optional[Any]:
+        return None
+
+    def serialize(self, fragment: StateFragment) -> Any:
+        raise TypeError("unsupported APC fragment")
+
+    def deserialize(self, tree: Any) -> StateFragment:
+        raise TypeError("unsupported APC fragment")
+
+
 _CAPABILITY: Dict[type, Capability] = {}
+_DEFAULTS_REGISTERED = False
 _ADAPTERS: Dict[Capability, PrefixStateAdapter] = {
     Capability.PAGEABLE: CheckpointAdapter(),
     Capability.WINDOWED: CheckpointAdapter(),
     Capability.CHECKPOINT: CheckpointAdapter(),
     Capability.COMPOSITE: CompositeAdapter(),
+    Capability.UNSUPPORTED: UnsupportedAdapter(),
 }
 
 
 def register_capability(cls: type, capability: Capability) -> None:
+    """Register the cache policy for an in-tree or third-party cache type.
+
+    Models with a custom cache should prefer implementing
+    ``prefix_cache_snapshot`` / ``prefix_cache_restore``.  Registration is
+    useful when a cache is semantically windowed or pageable and that cannot be
+    inferred from its state contract alone.
+    """
     _CAPABILITY[cls] = capability
 
 
 def register_default_capabilities() -> None:
     """Register the in-tree cache classes' declared capabilities."""
+    global _DEFAULTS_REGISTERED
+    if _DEFAULTS_REGISTERED:
+        return
     from .models import cache as c
 
-    for cls in (c.KVCache, c.QuantizedKVCache, c.ChunkedKVCache):
+    for cls in (
+        c.KVCache,
+        c.QuantizedKVCache,
+        c.BatchKVCache,
+        c.BatchQuantizedKVCache,
+        c.SimpleKVCache,
+    ):
         register_capability(cls, Capability.PAGEABLE)
-    for cls in (c.RotatingKVCache,):
+    for cls in (c.RotatingKVCache, c.BatchRotatingKVCache, c.ChunkedKVCache):
         register_capability(cls, Capability.WINDOWED)
-    for cls in (c.ArraysCache, c.PoolingCache, c.StaticPrefixKVCache):
+    for cls in (
+        c.ArraysCache,
+        c.PoolingCache,
+        c.BatchPoolingCache,
+        c.StaticPrefixKVCache,
+    ):
         register_capability(cls, Capability.CHECKPOINT)
     register_capability(c.CacheList, Capability.COMPOSITE)
+    try:
+        from .turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
+
+        register_capability(TurboQuantKVCache, Capability.PAGEABLE)
+        register_capability(BatchTurboQuantKVCache, Capability.PAGEABLE)
+    except ImportError:
+        # TurboQuant is optional in stripped-down installations.
+        pass
+    _DEFAULTS_REGISTERED = True
+
+
+def cache_spec(
+    cache: Any, overrides: Optional[Dict[type, Capability]] = None
+) -> CacheSpec:
+    """Describe one cache entry without model-name checks.
+
+    Composite entries are recursively described so caches such as MLA + index
+    state or sparse-attention cache lists remain extensible.
+    """
+    capability = resolve_capability(cache, overrides)
+    children: tuple[CacheSpec, ...] = ()
+    if capability == Capability.COMPOSITE:
+        if isinstance(cache, tuple):
+            raw_children = cache
+        else:
+            raw_children = tuple(getattr(cache, "caches", ()))
+        children = tuple(cache_spec(child, overrides) for child in raw_children)
+        if not children or not all(child.restorable for child in children):
+            capability = Capability.UNSUPPORTED
+
+    window_size = None
+    if capability == Capability.WINDOWED:
+        for attr in ("max_size", "window_size", "chunk_size"):
+            value = getattr(cache, attr, None)
+            if value is not None:
+                try:
+                    window_size = int(value)
+                except (TypeError, ValueError):
+                    pass
+                break
+    return CacheSpec(
+        capability=capability,
+        type_name=type(cache).__name__,
+        block_eligible=apc_block_eligible(cache),
+        window_size=window_size,
+        children=children,
+    )
 
 
 def resolve_capability(
     cache: Any, overrides: Optional[Dict[type, Capability]] = None
 ) -> Capability:
     """Resolve the capability of ``cache``."""
-    if not _CAPABILITY:
-        register_default_capabilities()
+    register_default_capabilities()
     t = type(cache)
     if isinstance(cache, tuple):
         return Capability.COMPOSITE
@@ -239,8 +395,15 @@ def resolve_capability(
     for base in t.__mro__[1:]:
         if base in _CAPABILITY:
             cap = _CAPABILITY[base]
-            return Capability.CHECKPOINT if cap == Capability.PAGEABLE else cap
-    if _is_snapshotable(cache):
+            if cap == Capability.PAGEABLE:
+                if any(
+                    getattr(cache, attr, None) is not None
+                    for attr in ("max_size", "window_size", "chunk_size")
+                ):
+                    return Capability.WINDOWED
+                return Capability.CHECKPOINT
+            return cap
+    if _has_explicit_snapshot_contract(cache) or _custom_state_contract(cache):
         return Capability.CHECKPOINT
     return Capability.UNSUPPORTED
 
@@ -296,18 +459,12 @@ def apc_exact_eligible(cache: Any) -> bool:
         return all(apc_exact_eligible(s) for s in cache.caches)
     if isinstance(cache, tuple):
         return all(apc_exact_eligible(s) for s in cache)
-    return _custom_state_contract(cache)
+    return _has_explicit_snapshot_contract(cache) or _custom_state_contract(cache)
 
 
 def apc_mode(caches: Sequence[Any]) -> Optional[str]:
     """APC strategy for a prompt cache: ``"block"``, ``"exact"`` or ``None``."""
-    if not caches:
-        return None
-    if all(apc_block_eligible(c) for c in caches):
-        return "block"
-    if all(apc_exact_eligible(c) for c in caches):
-        return "exact"
-    return None
+    return build_prefix_cache_plan_from_caches(caches).legacy_mode
 
 
 def _apc_array_helpers():
@@ -364,7 +521,7 @@ class RotatingKVCacheCloneAdapter:
 
 
 class ChunkedKVCacheCloneAdapter:
-    capability = Capability.PAGEABLE
+    capability = Capability.WINDOWED
 
     def clone(self, c, *, min_capacity_tokens, eval_targets):
         copy, _ = _apc_array_helpers()
@@ -431,6 +588,25 @@ class ArraysCacheCloneAdapter:
         return out
 
 
+class PoolingCacheCloneAdapter:
+    capability = Capability.CHECKPOINT
+
+    def clone(self, c, *, min_capacity_tokens, eval_targets):
+        copy, _ = _apc_array_helpers()
+        out = type(c)(int(c.ratio))
+        out.remainder = int(c.remainder)
+        for name in ("buf_kv", "buf_gate", "pooled"):
+            value = getattr(c, name, None)
+            if value is not None:
+                value = copy(value)
+                eval_targets.append(value)
+            setattr(out, name, value)
+        return out
+
+    def merge_rows(self, caches, prefix_lens):
+        return type(caches[0]).merge(caches)
+
+
 _CLONE_RULES: Optional[list] = None
 
 
@@ -444,6 +620,7 @@ def _clone_rules():
             (lm.RotatingKVCache, RotatingKVCacheCloneAdapter()),
             (lm.ChunkedKVCache, ChunkedKVCacheCloneAdapter()),
             (lm.ArraysCache, ArraysCacheCloneAdapter()),
+            (lm.PoolingCache, PoolingCacheCloneAdapter()),
         ]
     return _CLONE_RULES
 
@@ -469,6 +646,21 @@ def _state_clone(c, eval_targets):
     out = type(c).__new__(type(c))
     out.state = detached
     out.meta_state = c.meta_state
+    return out
+
+
+def _snapshot_contract_clone(c, eval_targets):
+    """Clone a cache that explicitly implements the snapshot protocol."""
+    adapter = CheckpointAdapter()
+    fragment = adapter.capture(c, prefix_len=int(getattr(c, "offset", 0) or 0))
+    if fragment is None:
+        return None
+    _eval_tree(fragment.payload, eval_targets)
+    try:
+        out = type(c)()
+    except TypeError:
+        out = type(c).__new__(type(c))
+    adapter.restore(out, fragment)
     return out
 
 
@@ -521,6 +713,8 @@ def clone_cache_entry(c, *, min_capacity_tokens, eval_targets):
         out.keys, out.values, out.offset = copy(dk), copy(dv), dk.shape[-2]
         eval_targets.extend([out.keys, out.values])
         return out
+    if _has_explicit_snapshot_contract(c):
+        return _snapshot_contract_clone(c, eval_targets)
     if _custom_state_contract(c):
         return _state_clone(c, eval_targets)
     return None
@@ -563,14 +757,23 @@ class ComponentPlan:
     type_name: str
     capability: Capability
     restorable: bool
+    group_id: int = -1
     reason: Optional[str] = None
 
 
 @dataclass
 class PrefixCachePlan:
-    """Per-model description of how each cache entry is captured/restored."""
+    """Per-model description of how cache entries are captured/restored.
+
+    Layers with the same :class:`CacheSpec` are placed in one homogeneous
+    group.  The coordinator intersects reuse at a single token boundary across
+    all groups, which is the same core rule used by vLLM's hybrid KV cache
+    manager.
+    """
 
     components: List[ComponentPlan] = field(default_factory=list)
+    layer_specs: List[CacheSpec] = field(default_factory=list)
+    groups: List[CacheGroupSpec] = field(default_factory=list)
 
     @property
     def restorable(self) -> bool:
@@ -580,20 +783,86 @@ class PrefixCachePlan:
     def capabilities(self) -> List[Capability]:
         return [c.capability for c in self.components]
 
+    @property
+    def is_hybrid(self) -> bool:
+        return len(self.groups) > 1 or any(
+            not spec.pageable for spec in self.layer_specs
+        )
+
+    @property
+    def strategy(self) -> Optional[str]:
+        """Physical APC strategy used by today's contiguous MLX caches."""
+        if not self.restorable:
+            return None
+        # The block pool currently pages native KVCache leaves. Composite,
+        # windowed, recurrent and custom caches are stored as checkpoints.
+        return (
+            "block"
+            if all(spec.block_eligible for spec in self.layer_specs)
+            else "checkpoint"
+        )
+
+    @property
+    def legacy_mode(self) -> Optional[str]:
+        """Compatibility spelling for the old block/exact API."""
+        strategy = self.strategy
+        return "exact" if strategy == "checkpoint" else strategy
+
     def adapter_for(self, index: int) -> PrefixStateAdapter:
         return _ADAPTERS[self.components[index].capability]
 
     def describe(self) -> str:
         head = (
             f"PrefixCachePlan: {len(self.components)} components, "
+            f"groups={len(self.groups)}, strategy={self.strategy}, "
             f"restorable={self.restorable}"
         )
         lines = [
-            f"  [{c.index}] {c.type_name}: {c.capability.value}"
+            f"  [{c.index}] {c.type_name}: {c.capability.value} group={c.group_id}"
             + ("" if c.restorable else f"  REJECTED ({c.reason})")
             for c in self.components
         ]
         return "\n".join([head, *lines])
+
+
+def build_prefix_cache_plan_from_caches(
+    caches: Sequence[Any], overrides: Optional[Dict[type, Capability]] = None
+) -> PrefixCachePlan:
+    """Build a vLLM-style grouped plan from a concrete cache layout."""
+    specs = [cache_spec(entry, overrides) for entry in caches]
+    grouped: Dict[tuple, List[int]] = {}
+    for index, spec in enumerate(specs):
+        grouped.setdefault(spec.group_key, []).append(index)
+
+    groups: List[CacheGroupSpec] = []
+    group_for_layer: Dict[int, int] = {}
+    for group_id, indices in enumerate(grouped.values()):
+        groups.append(
+            CacheGroupSpec(
+                group_id=group_id,
+                spec=specs[indices[0]],
+                layer_indices=tuple(indices),
+            )
+        )
+        for index in indices:
+            group_for_layer[index] = group_id
+
+    components = [
+        ComponentPlan(
+            index=index,
+            type_name=spec.type_name,
+            capability=spec.capability,
+            restorable=spec.restorable,
+            group_id=group_for_layer.get(index, -1),
+            reason=None if spec.restorable else "no snapshot/restore contract",
+        )
+        for index, spec in enumerate(specs)
+    ]
+    return PrefixCachePlan(
+        components=components,
+        layer_specs=specs,
+        groups=groups,
+    )
 
 
 def build_prefix_cache_plan(
@@ -602,20 +871,16 @@ def build_prefix_cache_plan(
     """Build a plan by resolving one adapter per entry ``model.make_cache()``."""
     lm = getattr(model, "language_model", model)
     make_cache = getattr(lm, "make_cache", None) or getattr(model, "make_cache", None)
-    if not callable(make_cache):
+    try:
+        if callable(make_cache):
+            caches = make_cache()
+        else:
+            # Match generation's default for dense language models which only
+            # expose ``layers`` and intentionally omit a custom cache factory.
+            # This is common among VLM wrappers around a conventional LM.
+            from .models.cache import make_prompt_cache
+
+            caches = make_prompt_cache(lm)
+    except Exception:
         return PrefixCachePlan()
-    caches = make_cache()
-    comps: List[ComponentPlan] = []
-    for i, entry in enumerate(caches):
-        cap = resolve_capability(entry, overrides)
-        restorable = cap != Capability.UNSUPPORTED
-        comps.append(
-            ComponentPlan(
-                index=i,
-                type_name=type(entry).__name__,
-                capability=cap,
-                restorable=restorable,
-                reason=None if restorable else "no snapshot/restore contract",
-            )
-        )
-    return PrefixCachePlan(components=comps)
+    return build_prefix_cache_plan_from_caches(caches, overrides)
