@@ -8,6 +8,7 @@ from .common import (
     _record_speculative_round,
     _speculative_walk,
     _speculative_walk_batch,
+    _target_verify_kwargs,
     generation_stream,
 )
 
@@ -85,14 +86,16 @@ def _dflash_verify_target(
     greedy_sampling: bool,
 ):
     """Verify one DFlash block, fusing the quantized greedy LM-head argmax."""
+    target_verify_kwargs = _target_verify_kwargs(lm)
     argmax_from_hidden = getattr(lm, "speculative_argmax_from_hidden", None)
-    if greedy_sampling and verify_input.shape[0] > 1 and callable(argmax_from_hidden):
+    if greedy_sampling and callable(argmax_from_hidden):
         verify_out = lm(
             verify_input,
             cache=prompt_cache,
             capture_layer_ids=target_layer_ids,
             return_hidden=True,
             skip_logits=True,
+            **target_verify_kwargs,
         )
         target_tokens = argmax_from_hidden(verify_out.hidden_states[-1])
         captured = verify_out.hidden_states[:-1]
@@ -101,6 +104,7 @@ def _dflash_verify_target(
             verify_input,
             cache=prompt_cache,
             capture_layer_ids=target_layer_ids,
+            **target_verify_kwargs,
         )
         if greedy_sampling:
             target_tokens = sampler(verify_out.logits)
@@ -289,6 +293,7 @@ def _dflash_rounds(
                     verify_input,
                     cache=prompt_cache,
                     capture_layer_ids=target_layer_ids,
+                    **_target_verify_kwargs(lm),
                 )
                 hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
                 target_probabilities = _dflash_target_probabilities(
@@ -463,6 +468,7 @@ def _dflash_rounds_batch(
                     verify_input,
                     cache=prompt_cache,
                     capture_layer_ids=target_layer_ids,
+                    **_target_verify_kwargs(lm),
                 )
                 hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
                 target_probabilities = _dflash_target_probabilities(

@@ -194,8 +194,8 @@ def _target_verify_qlinear_header(bits: int, group_size: int) -> str:
     constant constexpr int VALUES_PER_THREAD = PACK_FACTOR * PACKS_PER_THREAD;
     constant constexpr int BLOCK_SIZE = VALUES_PER_THREAD * SIMD_SIZE;
     constant constexpr int SCALE_STEP_PER_THREAD = GS / VALUES_PER_THREAD;
-    constant constexpr int RESULTS_PER_SIMDGROUP = 4;
-    constant constexpr int NUM_SIMDGROUPS = 2;
+    constant constexpr int RESULTS_PER_SIMDGROUP = 1;
+    constant constexpr int NUM_SIMDGROUPS = 8;
     constant constexpr int BN = RESULTS_PER_SIMDGROUP * NUM_SIMDGROUPS;
 
     template <typename T>
@@ -527,7 +527,9 @@ def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
     N = linear.weight.shape[0]
 
     x = mx.contiguous(x)
-    kernel = _target_verify_qmv_kernel(linear.bits, linear.group_size, x.dtype, T, K, N)
+    kernel = _target_verify_qmv_kernel(
+        linear.bits, linear.group_size, x.dtype, T, K, N
+    )
     out = kernel(
         inputs=[x, linear.weight, linear.scales, linear.biases],
         template=[
@@ -536,8 +538,8 @@ def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
             ("K_SIZE", int(K)),
             ("N_SIZE", int(N)),
         ],
-        grid=(32, 2 * (N // 8), B),
-        threadgroup=(32, 2, 1),
+        grid=(32, 8 * (N // 8), B),
+        threadgroup=(32, 8, 1),
         output_shapes=[(B, T, N)],
         output_dtypes=[x.dtype],
     )[0]
@@ -546,11 +548,10 @@ def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
     return out
 
 
-def _decode_quantized_linears_fused(linears, x: mx.array):
+def _fused_quantized_linears(linears, x: mx.array):
     if (
         x.ndim != 3
-        or x.shape[1] != 1
-        or len(linears) != 4
+        or len(linears) < 2
         or not all(isinstance(linear, nn.QuantizedLinear) for linear in linears)
     ):
         return None
@@ -560,6 +561,7 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
         linear.bits == first.bits
         and linear.group_size == first.group_size
         and linear.mode == first.mode
+        and linear.weight.shape[1] == first.weight.shape[1]
         and linear.biases is not None
         and linear.scales.dtype == x.dtype
         and linear.biases.dtype == x.dtype
@@ -586,6 +588,18 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
         first._qwen3_5_fused_decode_linears = cached
 
     _, weights, scales, biases, split_indices = cached
+    return first, weights, scales, biases, split_indices
+
+
+def _decode_quantized_linears_fused(linears, x: mx.array):
+    if x.ndim != 3 or x.shape[1] != 1 or len(linears) != 4:
+        return None
+
+    fused = _fused_quantized_linears(linears, x)
+    if fused is None:
+        return None
+
+    first, weights, scales, biases, split_indices = fused
     output = mx.quantized_matmul(
         x,
         weights,
@@ -596,6 +610,44 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
         bits=first.bits,
         mode=first.mode,
     )
+    return tuple(mx.split(output, split_indices, axis=-1))
+
+
+def _target_verify_quantized_linears(linears, x: mx.array):
+    fused = _fused_quantized_linears(linears, x)
+    if fused is None:
+        return None
+
+    first, weights, scales, biases, split_indices = fused
+    K = first.weight.shape[1] * 32 // first.bits
+    N = weights.shape[0]
+    if (
+        first.bits not in (4, 5)
+        or first.mode != "affine"
+        or K % 512 != 0
+        or N % 8 != 0
+        or x.shape[-1] != K
+    ):
+        return None
+
+    B, T, _ = x.shape
+    x = mx.contiguous(x)
+    kernel = _target_verify_qmv_kernel(
+        first.bits, first.group_size, x.dtype, T, K, N
+    )
+    output = kernel(
+        inputs=[x, weights, scales, biases],
+        template=[
+            ("T", x.dtype),
+            ("VERIFY_T", int(T)),
+            ("K_SIZE", int(K)),
+            ("N_SIZE", int(N)),
+        ],
+        grid=(32, 8 * (N // 8), B),
+        threadgroup=(32, 8, 1),
+        output_shapes=[(B, T, N)],
+        output_dtypes=[x.dtype],
+    )[0]
     return tuple(mx.split(output, split_indices, axis=-1))
 
 
@@ -662,8 +714,8 @@ def _target_verify_quantized_argmax(
             ("N_SIZE", int(N)),
             ("NUM_TILES", int(num_tiles)),
         ],
-        grid=(32, 2 * num_tiles, B),
-        threadgroup=(32, 2, 1),
+        grid=(32, 8 * num_tiles, B),
+        threadgroup=(32, 8, 1),
         output_shapes=[(B, T, num_tiles), (B, T, num_tiles)],
         output_dtypes=[x.dtype, mx.int32],
     )
@@ -692,8 +744,6 @@ def _target_verify_linear(linear, x: mx.array, target_verify: bool) -> mx.array:
         return linear(x)
 
     if isinstance(linear, nn.QuantizedLinear):
-        if x.shape[0] == 1:
-            return linear(x)
         out = _target_verify_quantized_linear(linear, x)
         if out is not None:
             return out
@@ -721,6 +771,9 @@ def _target_verify_linears(linears, x: mx.array, target_verify: bool):
             return out
         return tuple(linear(x) for linear in linears)
 
+    out = _target_verify_quantized_linears(linears, x)
+    if out is not None:
+        return out
     return tuple(_target_verify_linear(linear, x, target_verify) for linear in linears)
 
 
@@ -2097,6 +2150,8 @@ class Qwen3_5Model(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    requires_explicit_target_verify = True
+
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
         self.args = args
@@ -2605,6 +2660,7 @@ class LanguageModel(nn.Module):
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         attention_mask = kwargs.pop("attention_mask", None)
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
+        target_verify = kwargs.pop("target_verify", False)
         return_hidden = kwargs.pop("return_hidden", False)
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         skip_logits = kwargs.pop("skip_logits", False)
@@ -2742,8 +2798,7 @@ class LanguageModel(nn.Module):
         hidden_sink: Optional[List[mx.array]] = (
             [] if capture_layer_ids is not None else None
         )
-        gdn_sink: Optional[list] = [] if capture_layer_ids is not None else None
-        target_verify = gdn_sink is not None
+        gdn_sink: Optional[list] = [] if target_verify else None
 
         out = self.model(
             inputs,
@@ -2857,6 +2912,7 @@ class LanguageModel(nn.Module):
             inputs,
             cache=cache,
             capture_layer_ids=[],
+            target_verify=True,
             return_hidden=True,
             return_shared_kv=True,
         )
@@ -2872,6 +2928,7 @@ class LanguageModel(nn.Module):
             inputs,
             cache=cache,
             capture_layer_ids=[],
+            target_verify=True,
             return_hidden=True,
             return_shared_kv=True,
             skip_logits=True,

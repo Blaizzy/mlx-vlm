@@ -609,11 +609,44 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
     linear.biases = linear.biases.astype(mx.bfloat16)
     x = mx.random.normal((1, 3, 512)).astype(mx.bfloat16)
 
-    ref = linear(x)
-    out = qwen_language._target_verify_quantized_linear(linear, x)
+    ref = qwen_language._target_verify_timewise(linear, x)
+    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_capture_only_preserves_prefill_path():
+    config = _tiny_qwen3_5_text_config()
+    config.num_hidden_layers = 4
+    config.full_attention_interval = 4
+    model = qwen_language.LanguageModel(config)
+    inputs = mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32)
+    position_ids = mx.arange(inputs.shape[1])[None, :]
+
+    baseline = model(
+        inputs,
+        cache=model.make_cache(),
+        position_ids=position_ids,
+    )
+    captured = model(
+        inputs,
+        cache=model.make_cache(),
+        position_ids=position_ids,
+        capture_layer_ids=[0, 3],
+    )
+    verified = model(
+        inputs,
+        cache=model.make_cache(),
+        position_ids=position_ids,
+        capture_layer_ids=[0, 3],
+        target_verify=True,
+    )
+    mx.eval(baseline.logits, captured.logits, verified.logits)
+
+    assert bool(mx.array_equal(baseline.logits, captured.logits).item())
+    assert captured.gdn_states is None
+    assert len(verified.gdn_states) == 3
 
 
 def test_qwen_fused_greedy_decode_support_matches_lm_head():
@@ -703,6 +736,36 @@ def test_qwen3_5_decode_quantized_linears_fused_matches_separate():
 
         assert out is not None
         assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
+
+
+@pytest.mark.parametrize("out_dims", [(64, 64), (64, 64, 16, 16)])
+def test_qwen3_5_target_verify_quantized_linears_fused_matches_singletons(
+    out_dims,
+):
+    mx.random.seed(180 + len(out_dims))
+    linears = [
+        nn.QuantizedLinear(512, out_dim, bias=False, group_size=64, bits=4)
+        for out_dim in out_dims
+    ]
+    for linear in linears:
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+    x = mx.random.normal((1, 5, 512), dtype=mx.bfloat16)
+
+    singleton_rows = [
+        qwen_language._decode_quantized_linears_fused(linears, x[:, i : i + 1])
+        if len(linears) == 4
+        else tuple(linear(x[:, i : i + 1]) for linear in linears)
+        for i in range(x.shape[1])
+    ]
+    ref = tuple(
+        mx.concatenate([row[j] for row in singleton_rows], axis=1)
+        for j in range(len(linears))
+    )
+    out = qwen_language._target_verify_linears(linears, x, target_verify=True)
+    mx.eval(*ref, *out)
+
+    assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
 
 
 def test_qwen_target_verify_quantized_argmax_matches_singleton_path():
@@ -2059,8 +2122,10 @@ def test_dflash_committed_hidden_segments_keep_per_row_lengths():
     assert segments[1].tolist() == [[[6.0, 7.0]]]
 
 
-def test_dflash_greedy_verify_uses_fused_argmax_without_logits():
+def test_dflash_singleton_greedy_verify_uses_fused_argmax_without_logits():
     class FakeLM:
+        requires_explicit_target_verify = True
+
         def __init__(self):
             self.kwargs = None
 
@@ -2078,13 +2143,13 @@ def test_dflash_greedy_verify_uses_fused_argmax_without_logits():
             )
 
         def speculative_argmax_from_hidden(self, hidden):
-            assert hidden.shape == (2, 2, 2)
-            return mx.array([[7, 8], [9, 10]], dtype=mx.int32)
+            assert hidden.shape == (1, 2, 2)
+            return mx.array([[7, 8]], dtype=mx.int32)
 
     lm = FakeLM()
     verify_out, captured, target_tokens = _dflash_verify_target(
         lm,
-        mx.array([[4, 5], [6, 7]], dtype=mx.int32),
+        mx.array([[4, 5]], dtype=mx.int32),
         prompt_cache=[],
         target_layer_ids=[1, 2],
         sampler=lambda _: (_ for _ in ()).throw(AssertionError("sampler called")),
@@ -2094,8 +2159,9 @@ def test_dflash_greedy_verify_uses_fused_argmax_without_logits():
     assert verify_out.logits is None
     assert lm.kwargs["return_hidden"] is True
     assert lm.kwargs["skip_logits"] is True
-    assert captured.shape == (2, 2, 4)
-    assert target_tokens.tolist() == [[7, 8], [9, 10]]
+    assert lm.kwargs["target_verify"] is True
+    assert captured.shape == (1, 2, 4)
+    assert target_tokens.tolist() == [[7, 8]]
 
 
 def test_dflash2_rejection_sampling_requires_probability_sampler():
