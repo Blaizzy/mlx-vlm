@@ -374,6 +374,58 @@ def test_apc_max_pool_tensors_keeps_disk_persistence(tmp_path, monkeypatch):
     manager.close()
 
 
+def test_layer_major_disk_restore_uses_mlx_without_numpy_staging(tmp_path, monkeypatch):
+    monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "2")
+    block_size = 16
+    token_ids = list(range(3 * block_size))
+    layer_keys, layer_values = _make_fake_kv(num_layers=2, seq_len=len(token_ids))
+
+    disk = DiskBlockStore(tmp_path, namespace="mlx-direct")
+    manager = APCManager(num_blocks=1, block_size=block_size, disk=disk)
+    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
+    manager.release(stored)
+    disk._q.join()
+    manager.close()
+
+    def reject_numpy_staging(*_args, **_kwargs):
+        raise AssertionError("disk restore must not stage tensors through NumPy")
+
+    monkeypatch.setattr(apc_module.np, "frombuffer", reject_numpy_staging)
+    disk = DiskBlockStore(tmp_path, namespace="mlx-direct")
+    manager = APCManager(num_blocks=1, block_size=block_size, disk=disk)
+    warm, matched_tokens = manager.lookup_prefix_disk_cache(token_ids)
+
+    assert warm is not None
+    assert matched_tokens == len(token_ids)
+    for layer_idx, cache in enumerate(warm):
+        _assert_allclose(cache.keys[..., :matched_tokens, :], layer_keys[layer_idx])
+        _assert_allclose(cache.values[..., :matched_tokens, :], layer_values[layer_idx])
+    manager.close()
+
+
+def test_disk_writer_materializes_generation_stream_cache_on_producer(
+    tmp_path, monkeypatch
+):
+    from mlx_vlm.generate.common import generation_stream
+
+    monkeypatch.setenv("APC_MAX_POOL_TENSORS", "1")
+    block_size = 16
+    token_ids = list(range(block_size))
+    with mx.stream(generation_stream):
+        base = mx.arange(block_size * 4, dtype=mx.float32).reshape(1, 1, block_size, 4)
+        layer_keys = [base + 1, base + 2]
+        layer_values = [base + 3, base + 4]
+
+    disk = DiskBlockStore(tmp_path, namespace="generation-stream")
+    manager = APCManager(num_blocks=1, block_size=block_size, disk=disk)
+    assert manager.store_kv_blocks(token_ids, layer_keys, layer_values) == []
+    disk._q.join()
+
+    assert disk.num_blocks_indexed == 1
+    assert disk.disk_bytes > 0
+    manager.close()
+
+
 def test_disk_store_clears_each_writer_threads_streams(tmp_path, monkeypatch):
     cleared_threads = []
     monkeypatch.setattr(
