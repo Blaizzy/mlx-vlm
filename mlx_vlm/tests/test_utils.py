@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 import struct
 from io import BytesIO
 from pathlib import Path
@@ -14,6 +15,7 @@ import pytest
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.utils import (
     StoppingCriteria,
+    _drop_modules_without_weights,
     _load_safetensors,
     _transform_modelopt_nvfp4_weights,
     apply_generation_config_defaults,
@@ -25,6 +27,7 @@ from mlx_vlm.utils import (
     load_model,
     load_processor,
     prepare_inputs,
+    process_image,
     process_inputs_with_fallback,
     sanitize_weights,
     update_module_configs,
@@ -537,6 +540,31 @@ def test_stopping_criteria_reset():
     assert stopping_criteria(7) is True
 
 
+def test_load_processor_preserves_additional_eos_tokens_on_reset():
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(eos_token_ids=[2]),
+        additional_eos_token_ids=[3],
+    )
+
+    class Detokenizer:
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+
+    with (
+        patch(
+            "mlx_vlm.utils.AutoProcessor.from_pretrained",
+            return_value=processor,
+        ),
+        patch("mlx_vlm.utils.load_tokenizer", return_value=Detokenizer),
+    ):
+        loaded = load_processor("unused-model-path")
+
+    criteria = loaded.tokenizer.stopping_criteria
+    assert criteria.eos_token_ids == [2, 3]
+    criteria.reset([5])
+    assert criteria.eos_token_ids == [5, 3]
+
+
 def test_load_passes_revision():
     model_mock = MagicMock()
     model_mock.config = MagicMock(eos_token_id=None)
@@ -633,6 +661,87 @@ def test_load_model_forwards_strict_to_load_weights():
 
     assert model.loaded_weights == list(weights.items())
     assert model.loaded_strict is False
+
+
+class TestDropModulesWithoutWeights:
+    class ParameterlessHelper(nn.Module):
+        pass
+
+    class FakeModel(nn.Module):
+        def __init__(self, config=None):
+            super().__init__()
+            self.config = config
+            self.language_model = nn.Linear(2, 2, bias=False)
+            self.vision_tower = nn.Linear(2, 2, bias=True)
+            self.parameterless_helper = (
+                TestDropModulesWithoutWeights.ParameterlessHelper()
+            )
+
+    def test_preserves_language_and_parameterless_modules(self, caplog):
+        model = self.FakeModel()
+        language_model = model.language_model
+        parameterless_helper = model.parameterless_helper
+
+        with caplog.at_level(logging.WARNING):
+            _drop_modules_without_weights(model, {})
+
+        assert model.language_model is language_model
+        assert model.parameterless_helper is parameterless_helper
+        assert model.vision_tower is None
+        assert "vision_tower" in caplog.text
+        assert "language_model" not in caplog.text
+        assert "parameterless_helper" not in caplog.text
+
+    def test_keeps_partially_weighted_module_for_strict_validation(self):
+        model = self.FakeModel()
+        weights = {
+            "language_model.weight": mx.zeros((2, 2)),
+            "vision_tower.bias": mx.zeros((2,)),
+        }
+
+        _drop_modules_without_weights(model, weights)
+
+        assert model.vision_tower is not None
+        with pytest.raises(ValueError, match="Missing"):
+            model.load_weights(list(weights.items()), strict=True)
+
+    def test_load_model_prunes_and_logs_text_only_modules(self, caplog):
+        class FakeConfig:
+            @classmethod
+            def from_dict(cls, config):
+                return cls()
+
+        class FakeModel(self.FakeModel):
+            def load_weights(self, weights, strict=True):
+                self.loaded_weights = weights
+                self.loaded_strict = strict
+
+        fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeModel)
+        weights = {"language_model.weight": mx.zeros((2, 2))}
+
+        with (
+            patch(
+                "mlx_vlm.utils.load_config",
+                return_value={"model_type": "fake"},
+            ),
+            patch(
+                "mlx_vlm.utils.glob.glob",
+                return_value=["/tmp/model/model.safetensors"],
+            ),
+            patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+            patch(
+                "mlx_vlm.utils.get_model_and_args",
+                return_value=(fake_model_class, "fake"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            model = load_model(Path("/tmp/model"), lazy=True)
+
+        assert model.language_model is not None
+        assert model.vision_tower is None
+        assert model.parameterless_helper is not None
+        assert "vision_tower" in caplog.text
+        assert model.loaded_strict is True
 
 
 def test_load_safetensors_reinterprets_f8_e8m0_header(tmp_path):
@@ -948,3 +1057,35 @@ class TestLoadImage:
     def test_nonexistent_path_object_raises(self):
         with pytest.raises(ValueError, match="Failed to load image"):
             load_image(Path("/nonexistent/path/image.png"))
+
+
+class TestProcessImage:
+    def _image(self, width=640, height=480):
+        from PIL import Image
+
+        return Image.new("RGB", (width, height), color=(120, 40, 200))
+
+    def test_resize_shape_applied_without_custom_processor(self):
+        img = process_image(self._image(), (320, 320), None)
+        assert max(img.size) <= 320
+
+    def test_resize_shape_ignored_with_custom_processor_warns(self):
+        from mlx_vlm.models.base import BaseImageProcessor
+
+        class DummyProcessor(BaseImageProcessor):
+            def preprocess(self, images):
+                return images
+
+        original = self._image()
+        with pytest.warns(UserWarning, match="resize_shape.*DummyProcessor"):
+            img = process_image(original, (320, 320), DummyProcessor())
+
+        assert img.size == original.size
+
+    def test_no_resize_shape_no_warning(self):
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            img = process_image(self._image(), None, None)
+        assert img.size == (640, 480)

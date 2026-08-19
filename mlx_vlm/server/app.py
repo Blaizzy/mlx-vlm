@@ -184,12 +184,15 @@ def _build_gen_args(
 def _read_tenant_id(http_request) -> Optional[str]:
     """Pull a per-tenant APC salt from the request headers.
 
-    Honoured headers (in order): ``X-APC-Tenant``, ``X-Tenant-Id``.
+    Honoured headers (in order): ``X-APC-Tenant``, ``X-Tenant-Id``. Falls back to
+    ``APC_DEFAULT_TENANT`` so a single-tenant deployment shares one cache without
+    every client sending a header.
     """
+    default = os.environ.get("APC_DEFAULT_TENANT") or None
     if http_request is None or not hasattr(http_request, "headers"):
-        return None
+        return default
     h = http_request.headers
-    return h.get("x-apc-tenant") or h.get("x-tenant-id") or None
+    return h.get("x-apc-tenant") or h.get("x-tenant-id") or default
 
 
 async def _preflight_stream_context_budget(
@@ -542,7 +545,12 @@ def get_cached_model(
         cached = cached_cache.get("cache_key")
         adapter_path = cached[1] if cached and cached[0] == model_path else None
 
-    cache_key = (model_path, adapter_path, effective_model_kind)
+    cache_key = (
+        model_path,
+        adapter_path,
+        effective_model_kind,
+        runtime.config.fingerprint(kinds={effective_model_kind}),
+    )
     cached_cache = registry.for_kind(cache_group)
 
     # Return from cache if already loaded and matches the requested paths
@@ -776,16 +784,34 @@ def get_cached_model(
         registry.set(cache_group, cache)
         return model, processor, config
 
-    vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
+    cfg = runtime.config
+    vision_cache_size = cfg.vision_cache_size
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
 
-    # KV cache quantization (uniform or TurboQuant)
-    kv_bits = get_quantized_kv_bits(model_path)
-    kv_key_bits, kv_value_bits = get_quantized_kv_split_bits()
-    kv_key_scheme, kv_value_scheme = get_kv_split_schemes()
-    kv_group_size = get_kv_group_size()
-    quantized_kv_start = get_quantized_kv_start()
-    kv_quant_scheme = get_kv_quant_scheme()
+    kv_bits = (
+        cfg.kv_bits if cfg.kv_bits is not None else get_quantized_kv_bits(model_path)
+    )
+    default_key_bits, default_value_bits = get_quantized_kv_split_bits()
+    kv_key_bits = cfg.kv_key_bits if cfg.kv_key_bits is not None else default_key_bits
+    kv_value_bits = (
+        cfg.kv_value_bits if cfg.kv_value_bits is not None else default_value_bits
+    )
+    default_key_scheme, default_value_scheme = get_kv_split_schemes()
+    kv_key_scheme = (
+        cfg.kv_key_scheme if cfg.kv_key_scheme is not None else default_key_scheme
+    )
+    kv_value_scheme = (
+        cfg.kv_value_scheme if cfg.kv_value_scheme is not None else default_value_scheme
+    )
+    kv_group_size = (
+        cfg.kv_group_size if cfg.kv_group_size is not None else get_kv_group_size()
+    )
+    quantized_kv_start = (
+        cfg.quantized_kv_start
+        if cfg.quantized_kv_start is not None
+        else get_quantized_kv_start()
+    )
+    kv_quant_scheme = cfg.kv_quant_scheme or get_kv_quant_scheme()
 
     runtime.apc_manager = _apc.from_env(
         model_namespace=_apc.apc_disk_namespace(
@@ -797,7 +823,14 @@ def get_cached_model(
             kv_group_size=kv_group_size,
             kv_quant_scheme=kv_quant_scheme,
             quantized_kv_start=quantized_kv_start,
-        )
+        ),
+        overrides={
+            "enabled": cfg.apc_enabled,
+            "disk_path": cfg.apc_disk_path,
+            "block_size": cfg.apc_block_size,
+            "num_blocks": cfg.apc_num_blocks,
+            "disk_max_gb": cfg.apc_disk_max_gb,
+        },
     )
 
     response_generator = ResponseGenerator(
@@ -814,6 +847,8 @@ def get_cached_model(
         quantized_kv_start=quantized_kv_start,
         top_logprobs_k=get_top_logprobs_k(),
         apc_manager=runtime.apc_manager,
+        draft_model_path=cfg.spec_draft_model,
+        draft_kind=cfg.spec_draft_kind,
     )
     try:
         model, processor, config = response_generator.wait_until_ready()
@@ -1038,6 +1073,49 @@ async def apc_cache_reset(request: Request):
         return {"enabled": False}
     runtime.apc_manager.clear()
     return {"enabled": True, "status": "cleared"}
+
+
+def _settings_operation(payload: dict):
+    if "op" in payload or "values" in payload:
+        op = payload.get("op", "merge")
+        if op not in ("merge", "replace"):
+            raise HTTPException(status_code=400, detail=f"unsupported op {op!r}")
+        values = payload.get("values")
+        if not isinstance(values, dict):
+            raise HTTPException(status_code=400, detail="values must be a JSON object")
+        return op, values
+    return "merge", payload
+
+
+@app.get("/v1/settings")
+@app.get("/settings", include_in_schema=False)
+async def get_runtime_settings(request: Request):
+    _require_management_api_key(request)
+    cfg = runtime.config
+    return {
+        "schema": cfg.schema(),
+        "current": cfg.current(),
+        "fingerprint": cfg.fingerprint(),
+    }
+
+
+@app.patch("/v1/settings")
+@app.patch("/settings", include_in_schema=False)
+async def update_runtime_settings(request: Request):
+    _require_management_api_key(request)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="body must be a JSON object")
+    op, values = _settings_operation(payload)
+    applied, rejected = runtime.config.apply_changes(values, op=op)
+    return {
+        "op": op,
+        "applied": applied,
+        "rejected": rejected,
+        "reload_kinds": sorted(runtime.config.reload_kinds(applied)),
+        "fingerprint": runtime.config.fingerprint(),
+        "current": runtime.config.current(),
+    }
 
 
 @app.post("/unload")
