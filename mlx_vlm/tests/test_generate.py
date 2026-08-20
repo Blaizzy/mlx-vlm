@@ -2046,6 +2046,72 @@ def test_stream_generate_forwards_verbose_to_generate_step():
     assert captured["verbose"] is True
 
 
+def test_stream_generate_stores_checkpoint_only_before_decode():
+    class FakeStoppingCriteria:
+        def __call__(self, token):
+            return False
+
+    class FakeDetokenizer:
+        last_segment = ""
+
+        def reset(self):
+            pass
+
+        def add_token(self, token, skip_special_token_ids=None):
+            pass
+
+        def finalize(self):
+            pass
+
+    coordinator = MagicMock()
+    coordinator.enabled = True
+    coordinator.is_checkpoint = True
+    coordinator.lookup.return_value = None
+    coordinator.checkpoint_len.return_value = 3
+
+    def fake_generate_step(*args, **kwargs):
+        kwargs["prompt_cache_checkpoint"](
+            kwargs["prompt_cache_checkpoint_len"], kwargs["prompt_cache"]
+        )
+        yield 7, mx.zeros((4,))
+
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(stopping_criteria=FakeStoppingCriteria()),
+        detokenizer=FakeDetokenizer(),
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test", eos_token_id=[]),
+        language_model=SimpleNamespace(),
+    )
+    prompt_cache = []
+
+    with (
+        patch.object(dispatch_module._apc, "APCCoordinator", return_value=coordinator),
+        patch.object(dispatch_module._apc, "semantic_extra_hash", return_value=0),
+        patch.object(
+            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
+        ),
+        patch.object(dispatch_module, "generate_step", side_effect=fake_generate_step),
+    ):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="",
+                input_ids=mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache=prompt_cache,
+                apc_manager=MagicMock(),
+                max_tokens=1,
+            )
+        )
+
+    coordinator.store_checkpoint.assert_called_once_with(
+        [1, 2, 3], prompt_cache, extra_hash=0
+    )
+
+
 def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
     captured = {}
     tokenizer = SimpleNamespace(stopping_criteria=SimpleNamespace())

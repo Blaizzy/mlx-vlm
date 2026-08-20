@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import mlx.core as mx
 
-ADAPTER_SCHEMA_VERSION = 2
+ADAPTER_SCHEMA_VERSION = 3
 
 
 class Capability(str, Enum):

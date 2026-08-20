@@ -2831,6 +2831,10 @@ class APCManager:
         if self._exact_cache_max <= 0 and disk is None:
             return None, 0
         token_tuple = tuple(int(t) for t in token_ids)
+        # Match the uncached KV allocation boundary through prompt processing.
+        # Reserving one additional decode token here changes the first decode
+        # batch's cache growth path and can perturb numerics in hybrid models.
+        prompt_capacity_tokens = len(token_tuple)
         max_len = len(token_tuple) - 1
         if max_prefix_tokens is not None and max_prefix_tokens > 0:
             max_len = min(max_len, int(max_prefix_tokens))
@@ -2884,7 +2888,7 @@ class APCManager:
                 cache_hash, disk_prefix_len = disk_match
                 loaded = disk.load_exact_cache(
                     cache_hash,
-                    min_capacity_tokens=len(token_tuple) + 1,
+                    min_capacity_tokens=prompt_capacity_tokens,
                 )
                 if loaded is not None:
                     stored_tokens, stored_extra_hash, prompt_cache = loaded
@@ -2940,7 +2944,7 @@ class APCManager:
             return None, 0
         prompt_cache = _clone_prompt_cache_for_apc(
             source_cache,
-            min_capacity_tokens=len(token_tuple) + 1,
+            min_capacity_tokens=prompt_capacity_tokens,
         )
         if prompt_cache is None:
             return None, 0
