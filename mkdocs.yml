@@ -83,11 +83,21 @@ extra_css:
 nav:
     - Home: index.md
     - Installation: installation.md
+    - Usage: usage.md
     - CLI Reference: cli_reference.md
     - Examples: examples.md
-    - Contributing: contributing.md
-    - Community Projects: community_projects.md
-    - Report Issues: report_issues.md
-    - Changelog: changelog.md
+    - Guides:
+        - Server: server.md
+        - Speculative Decoding: speculative-decoding.md
+        - Quantization: quantization.md
+        - KV Cache Quantization: kv-cache-quantization.md
+        - Prefix Caching: prefix-caching.md
+        - Multimodal & Vision: multimodal.md
+        - Fine-tuning: fine-tuning.md
+    - Project:
+        - Contributing: contributing.md
+        - Community Projects: community_projects.md
+        - Report Issues: report_issues.md
+        - Changelog: changelog.md
 
 docs_dir: docs
