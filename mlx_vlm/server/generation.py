@@ -819,6 +819,106 @@ class GenerationArguments:
         return kw
 
 
+def _unsupported_speculative_sampling_fields(args: "GenerationArguments") -> List[str]:
+    """Sampling fields the speculative path would silently ignore.
+
+    The speculative round-loops sample with the sampler from ``_make_sampler``
+    and never apply ``_make_logits_processors``, so under a drafter:
+
+    - ``logit_bias`` and the repetition/presence/frequency penalties (logits
+      processors) are never applied;
+    - ``top_n_sigma`` / ``p_less`` / ``typical_p`` are exclusive-priority
+      branches — composing them keeps only the first;
+    - ``top_k`` / ``min_p`` composed with one of those branch fields are
+      dropped (the branch samplers are built without them). Plain
+      ``top_k`` / ``min_p`` are deliberately NOT flagged: implementing them
+      row-level in the positioned sampler is #1647's lane, and this guard
+      must not reject requests that PR makes correct.
+
+    Greedy (``temperature == 0``) ignores every sampler knob by design and is
+    never flagged here.
+    """
+    fields = []
+    if args.logit_bias:
+        fields.append("logit_bias")
+    if args.repetition_penalty is not None and args.repetition_penalty not in (0, 1.0):
+        fields.append("repetition_penalty")
+    if args.presence_penalty is not None and args.presence_penalty != 0:
+        fields.append("presence_penalty")
+    if args.frequency_penalty is not None and args.frequency_penalty != 0:
+        fields.append("frequency_penalty")
+
+    if args.temperature != 0:
+        branch_fields = [
+            name
+            for name, active in (
+                ("top_n_sigma", args.top_n_sigma > 0),
+                ("p_less", bool(args.p_less)),
+                ("typical_p", args.typical_p < 1.0),
+            )
+            if active
+        ]
+        if len(branch_fields) > 1:
+            # Exclusive-priority branch would honor only the first field.
+            fields.extend(branch_fields[1:])
+        if branch_fields:
+            # The branch samplers never see top_k/min_p.
+            if args.top_k > 0:
+                fields.append("top_k")
+            if args.min_p != 0.0:
+                fields.append("min_p")
+    return fields
+
+
+def preflight_speculative_args(draft_model, args: "GenerationArguments") -> None:
+    """Speculative-compat guards, raised as ``HTTPException(400)``.
+
+    Module-level and model-free so streaming endpoints can run it BEFORE
+    constructing/starting an SSE response: once the stream generator is
+    running, an exception from ``ResponseGenerator.generate`` is swallowed by
+    the generator's ``except Exception`` and surfaces as error data under
+    HTTP 200. ``generate()`` still calls this for defense in depth, so
+    non-stream behavior is unchanged.
+
+    No-op when ``draft_model`` is None (non-speculative serving honors all of
+    these fields).
+    """
+    if draft_model is None:
+        return
+    if args.logits_processors is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Structured response_format is not supported with "
+            "speculative decoding.",
+        )
+    if args.thinking_budget is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="thinking_budget is not supported with speculative "
+            "decoding in the server.",
+        )
+    unsupported = _unsupported_speculative_sampling_fields(args)
+    if unsupported:
+        detail = ", ".join(unsupported)
+        if os.environ.get("MLX_VLM_SPEC_IGNORE_UNSUPPORTED_SAMPLING", "") == "1":
+            logger.warning(
+                "Speculative decoding ignores logits processors and "
+                "unsupported sampler fields; accepting request but NOT "
+                "applying: %s (MLX_VLM_SPEC_IGNORE_UNSUPPORTED_SAMPLING=1).",
+                detail,
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{detail} not supported with speculative decoding "
+                "in the server: the speculative path samples with "
+                "temperature/top_p only and would silently ignore these "
+                "fields. Unset them, or set "
+                "MLX_VLM_SPEC_IGNORE_UNSUPPORTED_SAMPLING=1 to accept such "
+                "requests with a warning (the fields stay ignored).",
+            )
+
+
 @dataclass
 class GenerationContext:
     """Context returned when a request is queued."""
@@ -1208,14 +1308,7 @@ class ResponseGenerator:
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
-        if self.draft_model is not None and args.logits_processors is not None:
-            raise ValueError(
-                "Structured response_format is not supported with speculative decoding."
-            )
-        if self.draft_model is not None and args.thinking_budget is not None:
-            raise ValueError(
-                "thinking_budget is not supported with speculative decoding in the server."
-            )
+        preflight_speculative_args(self.draft_model, args)
         rqueue: Queue = Queue()
         request_started_at = time.perf_counter()
 

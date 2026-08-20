@@ -20,6 +20,7 @@ from .generation import (
     PromptTooLongError,
     _build_metrics_envelope,
     _count_prompt_tokens,
+    preflight_speculative_args,
 )
 from .responses_state import (
     ThinkingStreamState,
@@ -83,6 +84,32 @@ def _anthropic_error_response(
         },
         headers={"request-id": f"req_{uuid.uuid4().hex}"},
     )
+
+
+def _preflight_speculative_stream_args(*, endpoint: str, model: str, args) -> None:
+    """Run the speculative-compat guards BEFORE the SSE stream starts.
+
+    Mirror of the helper in ``openai.py``: for stream=true,
+    ``ResponseGenerator.generate()`` runs inside an already-started SSE
+    generator, so its ``HTTPException(400)`` would be swallowed by the
+    generator's ``except Exception`` and surface as error data under
+    HTTP 200. The caller converts the raised HTTPException to an
+    Anthropic-format error response.
+    """
+    rg = runtime.response_generator
+    if rg is None:
+        return
+    try:
+        preflight_speculative_args(getattr(rg, "draft_model", None), args)
+    except HTTPException as e:
+        if runtime.metrics is not None:
+            runtime.metrics.record_failure(
+                endpoint=endpoint,
+                model=model,
+                stream=True,
+                error=str(e.detail),
+            )
+        raise
 
 
 def _sse_event(event: str, payload: Dict[str, Any]) -> str:
@@ -527,13 +554,18 @@ async def anthropic_messages_endpoint(http_request: Request):
                     audio=None,
                     args=gen_args,
                 )
+                _preflight_speculative_stream_args(
+                    endpoint="/v1/messages",
+                    model=request.model,
+                    args=gen_args,
+                )
             except HTTPException as e:
-                # The preflight raises HTTPException(400) for an over-budget
-                # prompt and already records the failure. Convert it to an
-                # Anthropic-format error here; otherwise the endpoint's outer
-                # ``except Exception`` reports this client error as a 500
-                # api_error with a "400: ..." message. Mirrors the dedicated
-                # HTTPException handling in the OpenAI routers.
+                # Both preflights raise HTTPException(400) and record the
+                # failure themselves. Convert to an Anthropic-format error
+                # here; otherwise the endpoint's outer ``except Exception``
+                # reports these client errors as a 500 api_error with a
+                # "400: ..." message. Mirrors the dedicated HTTPException
+                # handling in the OpenAI routers.
                 return _anthropic_error_response(e.status_code, str(e.detail))
 
             async def stream_generator():
