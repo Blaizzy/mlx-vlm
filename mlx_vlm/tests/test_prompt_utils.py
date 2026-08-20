@@ -1,6 +1,20 @@
 """Tests for prompt_utils module, specifically multimodal content handling."""
 
-from mlx_vlm.prompt_utils import extract_text_from_content
+from mlx_vlm.prompt_utils import apply_chat_template, extract_text_from_content
+
+
+def _assistant_tool_call(content):
+    return {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": {}},
+            }
+        ],
+    }
 
 
 class TestExtractTextFromContent:
@@ -140,6 +154,275 @@ class TestApplyChatTemplateIntegration:
     These tests verify the actual bug fix works end-to-end, not just the helper.
     Uses return_messages=True to inspect intermediate messages without mocking.
     """
+
+    def test_molmo_builds_chat_message_for_processor_template(self):
+        """Molmo must go through its processor's ``User: ... Assistant:`` chat
+        template rather than the raw-prompt shortcut: raw prompts can read as
+        complete documents, making greedy decoding emit EOS immediately."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "molmo"},
+            "Describe this image briefly.",
+            return_messages=True,
+            num_images=1,
+        )
+
+        assert result == [{"role": "user", "content": "Describe this image briefly."}]
+
+    def test_nemotron_omni_formats_image_and_audio_messages(self):
+        """Nemotron Omni should use typed multimodal content for HF templates."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        for model_type in (
+            "nemotron_h_nano_omni",
+            "nemotronh_nano_omni_reasoning_v3",
+        ):
+            result = apply_chat_template(
+                None,
+                {"model_type": model_type},
+                "Describe the inputs.",
+                return_messages=True,
+                num_images=1,
+                num_audios=1,
+            )
+
+            assert result == [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {
+                            "type": "text",
+                            "text": "Describe the inputs.",
+                            "content": "Describe the inputs.",
+                        },
+                        {"type": "audio"},
+                    ],
+                }
+            ]
+
+    def test_gemma4_unified_formats_image_and_audio_messages(self):
+        """Gemma 4 Unified should use typed multimodal content for HF templates."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "gemma4_unified"},
+            "Describe the inputs.",
+            return_messages=True,
+            num_images=1,
+            num_audios=1,
+        )
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {
+                        "type": "text",
+                        "text": "Describe the inputs.",
+                        "content": "Describe the inputs.",
+                    },
+                    {"type": "audio"},
+                ],
+            }
+        ]
+
+    def test_gemma4_unified_formats_video_messages(self):
+        """Gemma 4 Unified should use typed video content for HF templates."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "gemma4_unified"},
+            "Describe the video.",
+            return_messages=True,
+            video=["clip.mp4"],
+            fps=1,
+        )
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video",
+                        "video": "clip.mp4",
+                        "max_pixels": 224 * 224,
+                        "fps": 1,
+                    },
+                    {
+                        "type": "text",
+                        "text": "Describe the video.",
+                        "content": "Describe the video.",
+                    },
+                ],
+            }
+        ]
+
+    def test_gemma4_unified_formats_video_and_audio_messages(self):
+        """Video prompts should retain audio placeholders when audio is present."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "gemma4_unified"},
+            "Describe the video and audio.",
+            return_messages=True,
+            video=["clip.mp4"],
+            fps=1,
+            num_audios=1,
+        )
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video",
+                        "video": "clip.mp4",
+                        "max_pixels": 224 * 224,
+                        "fps": 1,
+                    },
+                    {"type": "audio"},
+                    {
+                        "type": "text",
+                        "text": "Describe the video and audio.",
+                        "content": "Describe the video and audio.",
+                    },
+                ],
+            }
+        ]
+
+    def test_text_only_formats_regular_chat_message(self):
+        """Text-only models should use regular role/content messages with no image tokens."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "laguna"},
+            "Make a program to find pi",
+            return_messages=True,
+        )
+
+        assert result == [{"role": "user", "content": "Make a program to find pi"}]
+
+    def test_step3p7_formats_image_patch_token(self):
+        """Step-3.7 prompts should include the placeholder its processor expands."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "step3p7"},
+            "What do you see?",
+            return_messages=True,
+            num_images=1,
+        )
+
+        assert result == [{"role": "user", "content": "<im_patch>What do you see?"}]
+
+    def test_tool_call_arguments_json_string_is_normalized(self):
+        """OpenAI-style JSON-string tool call arguments should become dicts."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        messages = [
+            {"role": "user", "content": "Estimate pi."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "calculate_pi",
+                            "arguments": '{"method":"monte_carlo","samples":1000}',
+                        },
+                    }
+                ],
+            },
+        ]
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "laguna"},
+            messages,
+            return_messages=True,
+        )
+
+        arguments = result[1]["tool_calls"][0]["function"]["arguments"]
+        assert arguments == {"method": "monte_carlo", "samples": 1000}
+
+    def test_assistant_tool_call_content_is_preserved(self):
+        """Existing text and structured content should remain unchanged."""
+        for content in [
+            "I will check.",
+            [{"type": "text", "text": "I will check."}],
+        ]:
+            result = apply_chat_template(
+                None,
+                {"model_type": "qwen3_vl"},
+                _assistant_tool_call(content),
+                return_messages=True,
+            )
+
+            assert result[0]["content"] == content
+
+    def test_assistant_tool_call_none_content_reaches_template_as_string(self):
+        """Templates that iterate non-string content should receive a string."""
+
+        class IterableContentTemplate:
+            chat_template = "tool template"
+
+            def apply_chat_template(self, messages, **_):
+                for message in messages:
+                    content = message["content"]
+                    if not isinstance(content, str):
+                        list(content)
+                return messages
+
+        message = _assistant_tool_call(None)
+        result = apply_chat_template(
+            IterableContentTemplate(),
+            {"model_type": "qwen3_vl"},
+            message,
+        )
+
+        assert message["content"] is None
+        assert result[0]["content"] == ""
+
+    def test_single_tool_call_dict_is_preserved(self):
+        """A single assistant message with tool_calls should keep tool metadata."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        prompt = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "calculate_pi",
+                        "arguments": '{"method":"nilakantha"}',
+                    },
+                }
+            ],
+        }
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "laguna"},
+            prompt,
+            return_messages=True,
+        )
+
+        assert result[0]["tool_calls"][0]["function"]["arguments"] == {
+            "method": "nilakantha"
+        }
 
     def test_multimodal_message_does_not_include_base64_in_prompt(self):
         """Critical regression test: base64 should NOT appear in formatted messages.
@@ -357,3 +640,212 @@ class TestExtractTextFromContentEdgeCases:
         ]
         result = extract_text_from_content(content)
         assert result == "Actual content"
+
+
+def test_apply_chat_template_uses_plamo2vl_processor():
+    from mlx_vlm.prompt_utils import apply_chat_template
+
+    captured = {}
+
+    class DummyProcessor:
+        chat_template = "plamo2vl"
+
+        def apply_chat_template(
+            self,
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **kwargs,
+        ):
+            captured["messages"] = messages
+            captured["tokenize"] = tokenize
+            captured["add_generation_prompt"] = add_generation_prompt
+            return "formatted-plamo-prompt"
+
+    result = apply_chat_template(
+        DummyProcessor(),
+        {"model_type": "plamo2vl"},
+        "画像の前面に積み重なっているのはどのようなアイテムですか？",
+        num_images=1,
+    )
+
+    assert result == "formatted-plamo-prompt"
+    assert captured["messages"] == [
+        "画像の前面に積み重なっているのはどのようなアイテムですか？"
+    ]
+    assert captured["tokenize"] is False
+    assert captured["add_generation_prompt"] is True
+
+
+def test_apply_chat_template_uses_generic_text_model_fallback():
+    class TextProcessor:
+        chat_template = "{{ messages }}"
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True
+        ):
+            assert add_generation_prompt is True
+            assert messages == [{"role": "user", "content": "Hello"}]
+            return "templated"
+
+    result = apply_chat_template(
+        TextProcessor(),
+        {"model_type": "llama"},
+        "Hello",
+    )
+
+    assert result == "templated"
+
+
+def test_apply_chat_template_defaults_thinking_disabled_when_supported():
+    class ThinkingProcessor:
+        chat_template = "{{ messages }}"
+
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+        ):
+            self.kwargs = kwargs
+            if kwargs.get("enable_thinking") is False:
+                return "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            return "<|im_start|>assistant\n<think>\n"
+
+    processor = ThinkingProcessor()
+    result = apply_chat_template(
+        processor,
+        {"model_type": "qwen3_5_moe"},
+        "Describe this image.",
+        num_images=1,
+    )
+
+    assert processor.kwargs["enable_thinking"] is False
+    assert result.endswith("<think>\n\n</think>\n\n")
+
+
+def test_apply_chat_template_preserves_explicit_thinking_enabled():
+    class ThinkingProcessor:
+        chat_template = "{{ messages }}"
+
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+        ):
+            self.kwargs = kwargs
+            if kwargs.get("enable_thinking") is False:
+                return "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            return "<|im_start|>assistant\n<think>\n"
+
+    processor = ThinkingProcessor()
+    result = apply_chat_template(
+        processor,
+        {"model_type": "qwen3_5_moe"},
+        "Describe this image.",
+        num_images=1,
+        enable_thinking=True,
+    )
+
+    assert processor.kwargs["enable_thinking"] is True
+    assert result.endswith("<think>\n")
+
+
+def test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates():
+    class ThinkingModeProcessor:
+        chat_template = "{% if thinking_mode == 'enabled' %}<mm:think>{% endif %}"
+
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+        ):
+            del messages, tokenize, add_generation_prompt
+            self.kwargs = kwargs
+            return "prompt"
+
+    processor = ThinkingModeProcessor()
+    result = apply_chat_template(
+        processor,
+        {"model_type": "minimax_m3_vl"},
+        "Describe this image.",
+        num_images=1,
+        enable_thinking=True,
+    )
+
+    assert result == "prompt"
+    assert processor.kwargs["enable_thinking"] is True
+    assert processor.kwargs["thinking_mode"] == "enabled"
+
+
+def test_apply_chat_template_keeps_enable_thinking_only_for_other_templates():
+    class EnableThinkingProcessor:
+        chat_template = "{% if enable_thinking %}<think>{% endif %}"
+
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+        ):
+            del messages, tokenize, add_generation_prompt
+            self.kwargs = kwargs
+            return "prompt"
+
+    processor = EnableThinkingProcessor()
+    result = apply_chat_template(
+        processor,
+        {"model_type": "qwen3_5_moe"},
+        "Describe this image.",
+        num_images=1,
+        enable_thinking=True,
+    )
+
+    assert result == "prompt"
+    assert processor.kwargs["enable_thinking"] is True
+    assert "thinking_mode" not in processor.kwargs
+
+
+class TestModelSpecificPromptContracts:
+    """Guard model-specific multimodal message formats from regressions."""
+
+    def test_ernie4_5_vl_uses_image_url_before_text(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "ernie4_5_moe_vl"},
+            "Describe this image.",
+            return_messages=True,
+            num_images=1,
+        )
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert [item["type"] for item in result[0]["content"]] == [
+            "image_url",
+            "text",
+        ]
+        assert result[0]["content"][1]["text"] == "Describe this image."
+
+    def test_paddleocr_vl_uses_image_before_text(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "paddleocr_vl"},
+            "OCR:",
+            return_messages=True,
+            num_images=2,
+        )
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert [item["type"] for item in result[0]["content"]] == [
+            "image",
+            "image",
+            "text",
+        ]
+        assert result[0]["content"][-1]["text"] == "OCR:"

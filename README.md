@@ -8,12 +8,18 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 - [Usage](#usage)
   - [Command Line Interface (CLI)](#command-line-interface-cli)
     - [Thinking Budget](#thinking-budget)
-  - [Speculative Decoding (DFlash)](#speculative-decoding-dflash)
+  - [Speculative Decoding](#speculative-decoding)
+    - [DFlash (Qwen3.5)](#dflash-qwen35)
+    - [Gemma 4 MTP](#gemma-4-mtp)
+    - [Gemma 4 EAGLE-3](#gemma-4-eagle-3)
+    - [MiniMax M3 EAGLE-3](#minimax-m3-eagle-3)
   - [Chat UI with Gradio](#chat-ui-with-gradio)
   - [Python Script](#python-script)
   - [Server (FastAPI)](#server-fastapi)
     - [Continuous Batching](#continuous-batching)
+    - [Automatic Prefix Caching (APC)](#automatic-prefix-caching-apc)
     - [KV Cache Quantization](#kv-cache-quantization)
+- [1-bit Affine Inference](#1-bit-affine-inference)
 - [Activation Quantization (CUDA)](#activation-quantization-cuda)
 - [Multi-Image Chat Support](#multi-image-chat-support)
   - [Supported Models](#supported-models)
@@ -32,18 +38,25 @@ Some models have detailed documentation with prompt formats, examples, and best 
 |-------|---------------|
 | DeepSeek-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |
 | DeepSeek-OCR-2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README.md) |
+| Unlimited-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/unlimited_ocr/README.md) |
 | DOTS-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
 | DOTS-MOCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
+| ERNIE 4.5 VL | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/ernie4_5_moe_vl/README.md) |
 | GLM-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/glm_ocr/README.md) |
 | Phi-4 Reasoning Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/phi4_siglip/README.md) |
 | MiniCPM-o | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmo/README.md) |
+| PaddleOCR-VL | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/paddleocr_vl/README.md) |
 | Phi-4 Multimodal | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/phi4mm/README.md) |
 | MolmoPoint | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/molmo_point/README.md) |
+| LocateAnything | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/locateanything/README.md) |
+| Moondream2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream2/README.md) |
 | Moondream3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream3/README.md) |
 | Gemma 4 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
+| MiniMax M3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
 | Falcon-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
 | Granite Vision 3.2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
 | Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
+| MiniCPM-V 4.6 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
 
 ## Installation
 
@@ -51,6 +64,52 @@ The easiest way to get started is to install the `mlx-vlm` package using pip:
 
 ```sh
 pip install -U mlx-vlm
+```
+
+The [Gradio chat UI](#chat-ui-with-gradio) needs an extra dependency that is not
+part of the base install:
+
+```sh
+pip install -U 'mlx-vlm[ui]'
+```
+
+Quote the package name so that shells which expand square brackets, such as
+`zsh`, do not treat `[ui]` as a glob pattern.
+
+## Agent Skills
+
+This repo ships an agent-skills bundle under `skills/` for common MLX-VLM workflows — usage, conversion, development, and support. Skills load into a coding agent (Claude Code, Codex, Gemini) so it follows the right project conventions instead of guessing.
+
+| Skill | Description |
+|-------|-------------|
+| `cli-inference` | Run and debug command-line inference (`mlx_vlm.generate`) — text/image/audio inputs and image-generation flags. |
+| `server-inference` | Run and debug the local server across the models, chat, responses, messages, audio, image, cache, and metrics endpoints. |
+| `convert-quantize` | Convert and quantize Hugging Face models to MLX (`mlx_vlm.convert`) — bits/group size, quant modes, RTN/AWQ, mixed recipes. |
+| `add-new-model` | Port a new architecture into `mlx_vlm/models` — config, weight-name mapping, reuse a similar model, add a test class. |
+| `benchmarking` | Produce credible, reproducible perf numbers and fork-vs-main A/B tables for PRs. |
+| `contributing` | Shape a change to pass review — code/config/test placement, pre-commit hooks, and PR expectations. |
+| `hf-cache-models` | List MLX-VLM-supported (and, with `--check-arch`, loadable) models in the local Hugging Face cache. |
+| `reproducible-github-issues` | Turn CLI or server failures into concise, reproducible GitHub issues. |
+
+Validate the bundle at any time:
+
+```sh
+python3 skills/scripts/validate_skills.py
+```
+
+Install from a local checkout:
+
+```sh
+# Claude Code
+/plugin marketplace add /path/to/mlx-vlm
+/plugin install mlx-vlm-skills@mlx-vlm
+
+# Codex CLI
+codex plugin marketplace add /path/to/mlx-vlm
+codex plugin add mlx-vlm-skills@mlx-vlm
+
+# Gemini CLI
+gemini extensions install /path/to/mlx-vlm/skills
 ```
 
 ## Usage
@@ -95,9 +154,39 @@ mlx_vlm.generate --model mlx-community/Qwen3.5-2B-4bit \
 
 When the budget is exceeded, the model is forced to emit `\n</think>` and transition to the answer. If `--enable-thinking` is passed but the model's chat template does not support it, the budget is applied only if the model generates the start token on its own.
 
-### Speculative Decoding (DFlash)
+On the server, thinking mode is disabled by default. Start the server with `--enable-thinking` to make thinking mode the default for requests that do not specify it:
 
-Speed up generation 2–3× using a lightweight block-diffusion drafter that predicts multiple tokens per round, verified in parallel by the target model.
+```sh
+mlx_vlm.server --model Qwen/Qwen3.5-4B --enable-thinking
+```
+
+You can also set server defaults for the thinking budget and delimiter tokens:
+
+```sh
+mlx_vlm.server --model Qwen/Qwen3.5-4B \
+  --enable-thinking \
+  --thinking-budget 512 \
+  --thinking-start-token "<think>" \
+  --thinking-end-token "</think>"
+```
+
+Requests can override the server defaults with `enable_thinking`, `thinking_budget`, `thinking_start_token`, or `thinking_end_token`.
+
+### Speculative Decoding
+
+Speed up generation by drafting several candidate tokens with a small "drafter" model and verifying them in a single target forward pass. Three drafter families are supported.
+
+| Flag | Description |
+|------|-------------|
+| `--draft-model` | HuggingFace repo or local path for the drafter |
+| `--draft-kind` | Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP) |
+| `--draft-block-size` | Override the drafter's configured block size |
+
+See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
+
+#### DFlash (Qwen3.5 and Muse Glimmer)
+
+A lightweight block-diffusion drafter that predicts multiple tokens per round, typically 2–3× faster.
 
 ```sh
 # Text generation with speculative decoding
@@ -118,17 +207,137 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --draft-model z-lab/Qwen3.5-4B-DFlash
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--draft-model` | HuggingFace repo or local path for the drafter |
-| `--draft-kind` | Drafter family (default: `dflash`) |
-| `--draft-block-size` | Override the drafter's configured block size |
+Muse Glimmer's published assistant checkpoint is auto-detected as DFlash:
 
-See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
+```sh
+mlx_vlm.generate --model meta-models/Muse-Glimmer-30B \
+  --draft-model meta-models/Muse-Glimmer-30B-assistant \
+  --prompt "Write a quicksort in Python." \
+  --max-tokens 512 --temperature 0
+
+mlx_vlm.server --model meta-models/Muse-Glimmer-30B \
+  --draft-model meta-models/Muse-Glimmer-30B-assistant
+```
+
+DFlash draft-cache windowing is available from the Python API. During
+speculative decoding the target model still verifies every proposed token with
+its full KV cache; this knob only changes the DFlash drafter cache. When
+`draft_window_size` is set, the drafter keeps at most that many recent committed
+tokens in its own KV cache instead of attending over the full generated prefix.
+That reduces draft-side cache length and memory, but it can lower acceptance
+because the drafter has less context than the target verifier. On MLX, the full
+draft cache is usually faster for Qwen3.5 DFlash, so windowing defaults to
+`None`; set it only when you want to experiment with this compact recent-token
+cache tradeoff:
+
+```python
+from mlx_vlm import load
+from mlx_vlm.generate import generate
+from mlx_vlm.speculative.drafters import load_drafter
+
+model, processor = load("Qwen/Qwen3.5-4B")
+draft_model, draft_kind = load_drafter("z-lab/Qwen3.5-4B-DFlash")
+draft_model.config.draft_window_size = 256  # None disables windowing
+
+result = generate(
+    model,
+    processor,
+    "Write a quicksort in Python.",
+    max_tokens=512,
+    temperature=0,
+    draft_model=draft_model,
+    draft_kind=draft_kind,
+)
+```
+
+#### Gemma 4 MTP
+
+[Multi-Token Prediction](https://ai.google.dev/gemma/docs/mtp/mtp): Google's 4-layer "assistant" drafter that shares K/V with the target and drafts multiple tokens autoregressively from a constant position. Pass `--draft-kind mtp` to dispatch the MTP round-loop.
+
+```sh
+mlx_vlm.generate --model mlx-community/gemma-4-31B-it-bf16 \
+  --draft-model mlx-community/gemma-4-31B-it-assistant-bf16 \
+  --draft-kind mtp --draft-block-size 4 \
+  --prompt "Explain speculative decoding in 3 sentences." \
+  --max-tokens 256 --temperature 0
+
+# Server
+mlx_vlm.server --model mlx-community/gemma-4-31B-it-bf16 \
+  --draft-model mlx-community/gemma-4-31B-it-assistant-bf16 \
+  --draft-kind mtp --draft-block-size 4
+```
+
+Supported pairings (target ↔ drafter):
+
+| Target                          | Drafter                                  |
+|---------------------------------|------------------------------------------|
+| `mlx-community/gemma-4-E2B-it-bf16`         | `mlx-community/gemma-4-E2B-it-assistant-bf16`        |
+| `mlx-community/gemma-4-E4B-it-bf16`         | `mlx-community/gemma-4-E4B-it-assistant-bf16`        |
+| `mlx-community/gemma-4-26B-A4B-it-bf16`     | `mlx-community/gemma-4-26B-A4B-it-assistant-bf16`    |
+| `mlx-community/gemma-4-31B-it-bf16`         | `mlx-community/gemma-4-31B-it-assistant-bf16`        |
+
+Measured speedups (greedy, byte-identical output): up to **3.94×** on 26B-A4B and **2.29×** on 31B at B=4. See [`mlx_vlm/speculative/drafters/gemma4_assistant/README.md`](mlx_vlm/speculative/drafters/gemma4_assistant/README.md) for full sweeps and architecture notes.
+
+#### Gemma 4 EAGLE-3
+
+[EAGLE-3](https://sgl-project.github.io/SpecForge/concepts/EAGLE3.html) drafts from three target hidden-state captures with a lightweight one-layer speculator. The Red Hat Speculators checkpoint auto-detects as `--draft-kind eagle3`.
+
+```sh
+mlx_vlm.generate --model mlx-community/gemma-4-31B-it-bf16 \
+  --draft-model RedHatAI/gemma-4-31B-it-speculator.eagle3 \
+  --prompt "Explain speculative decoding in 3 sentences." \
+  --max-tokens 256 --temperature 0
+
+# Server
+mlx_vlm.server --model mlx-community/gemma-4-31B-it-bf16 \
+  --draft-model RedHatAI/gemma-4-31B-it-speculator.eagle3
+```
+
+#### MiniMax M3 EAGLE-3
+
+MiniMax M3 supports the released `Inferact/MiniMax-M3-EAGLE3` drafter. Convert
+the target with `mlx_vlm.convert` because `mlx_lm.convert` does not know the
+`minimax_m3_vl` model type.
+
+```sh
+mlx_vlm.convert \
+  --hf-path MiniMaxAI/MiniMax-M3 \
+  --mlx-path ~/MiniMax-M3-4bit \
+  --quantize --q-bits 4 \
+  --trust-remote-code
+
+mlx_vlm.convert \
+  --hf-path Inferact/MiniMax-M3-EAGLE3 \
+  --mlx-path ~/MiniMax-M3-EAGLE3
+
+mlx_vlm.generate \
+  --model ~/MiniMax-M3-4bit \
+  --draft-model ~/MiniMax-M3-EAGLE3 \
+  --draft-kind eagle3 \
+  --draft-block-size 3 \
+  --prompt "Explain MiniMax Sparse Attention in one paragraph." \
+  --max-tokens 256 --temperature 0
+```
+
+The public MiniMax M3 BF16 checkpoint advertises MTP metadata but does not
+publish `mtp` or `nextn` tensors, so use the released EAGLE-3 drafter for that
+checkpoint.
+
+MiniMax M3 also supports image/video prompts, MiniMax thinking tags, MiniMax
+tool-call parsing, MSA index caches, and MXFP8 config loading. See
+[`mlx_vlm/models/minimax_m3_vl/README.md`](mlx_vlm/models/minimax_m3_vl/README.md)
+for model-specific conversion and runtime notes.
 
 ### Chat UI with Gradio
 
-Launch a chat interface using Gradio:
+The Gradio chat UI requires the optional `ui` extra, which the base `mlx-vlm`
+install does not include:
+
+```sh
+pip install -U 'mlx-vlm[ui]'
+```
+
+Then launch the chat interface:
 
 ```sh
 mlx_vlm.chat_ui --model mlx-community/Qwen2-VL-2B-Instruct-4bit
@@ -228,29 +437,75 @@ mlx_vlm.server --port 8080
 # Preload a model at startup (Hugging Face repo or local path)
 mlx_vlm.server --model <hf_repo_or_local_path>
 
+# Preload separate model kinds at startup
+mlx_vlm.server --model <language_model> \
+  --image-model <image_generation_model> \
+  --tts-model <text_to_speech_model> \
+  --stt-model <speech_to_text_model>
+
 # Preload a model with adapter
 mlx_vlm.server --model <hf_repo_or_local_path> --adapter-path <adapter_path>
 
 # With trust remote code enabled (required for some models)
 mlx_vlm.server --trust-remote-code
+
+# Enable thinking mode by default for requests that do not override it
+mlx_vlm.server --model Qwen/Qwen3.5-4B --enable-thinking
+
+# Configure thinking defaults at startup
+mlx_vlm.server --model Qwen/Qwen3.5-4B \
+  --enable-thinking \
+  --thinking-budget 512 \
+  --thinking-start-token "<think>" \
+  --thinking-end-token "</think>"
+
+# Require bearer authentication for API endpoints
+mlx_vlm.server --api-key <secret-token>
 ```
 
 #### Server Options
 
-- `--model`: Preload a model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
+- `--model`: Preload a language model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
+- `--image-model`: Preload an image generation model at server startup
+- `--tts-model`: Preload a text-to-speech model at server startup
+- `--stt-model`: Preload a speech-to-text model at server startup
+- `--embedding-model`: Preload an embedding model at server startup
+- `--reranker-model`: Preload a supported reranker model at server startup
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
-- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`) — enables DFlash speculative decoding for ~2× higher throughput
-- `--draft-kind`: Drafter family (default: `dflash`)
+- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`, `Inferact/MiniMax-M3-EAGLE3`) — enables speculative decoding for ~2× or higher throughput
+- `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP)
 - `--draft-block-size`: Override the drafter's configured block size
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)
 - `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub
+- `--enable-thinking`: Enable thinking mode by default for requests that do not set `enable_thinking`
+- `--thinking-budget`: Default maximum number of tokens allowed inside a thinking block
+- `--thinking-start-token`: Default token that opens a thinking block
+- `--thinking-end-token`: Default token that closes a thinking block (`--thinking-eos-token` is also accepted)
 - `--kv-bits`: Number of bits for KV cache quantization (e.g. `8` for uniform, `3.5` for TurboQuant)
 - `--kv-quant-scheme`: KV cache quantization backend (`uniform` or `turboquant`)
+- `--kv-key-bits` / `--kv-value-bits`: Override the bit-width for keys or values individually (see [Per-tensor KV quantization](#per-tensor-kv-quantization))
+- `--kv-key-scheme` / `--kv-value-scheme`: Override the quantization backend for keys or values individually
 - `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
 - `--max-kv-size`: Maximum KV cache size in tokens
 - `--vision-cache-size`: Max number of cached vision features (default: `20`)
+- `--log-progress-interval`: Decoded tokens between progress log messages; `0` disables periodic decode progress (default: `10`)
+- `--api-key`: Bearer token required for inference, model discovery, and management endpoints
 - `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
+
+At `INFO`, the server logs request start/completion, chunked-prefill progress,
+time to first token, periodic decode throughput, and the final token counts. Set
+`--log-level DEBUG` to emit decode progress for every token and add its token
+number, token ID, and decoded text to the same log entry. Decode progress uses
+`rate` for the instantaneous inter-token rate; decode completion uses the same
+field name for aggregate decode throughput measured across completed token
+intervals.
+
+OpenAI-compatible streaming responses expose throughput under
+`timings.predicted_per_second`. Token-bearing SSE chunks report the instantaneous
+inter-token rate, while terminal and usage chunks report the aggregate rate as
+`(tokens - 1) / (last_token_time - first_token_time)`. The first token reports
+`null` because it has no preceding token interval.
 
 You can also set trust remote code via environment variable:
 ```sh
@@ -273,14 +528,356 @@ Verify via the health endpoint:
 
 ```sh
 curl http://localhost:8080/health
-# {"status":"healthy","loaded_model":"...","continuous_batching_enabled":true}
+# {"status":"healthy","loaded_model":"...","apc_enabled":false}
 ```
 
 If `--model` is omitted, the model is loaded on the first request.
 
+### Automatic Prefix Caching (APC)
+
+Automatic Prefix Caching reuses block-level K/V cache state across requests that share the same prefix. It is useful for repeated long documents, long chat histories, or retrieval contexts where each request appends a short new suffix.
+
+APC has two tiers:
+
+- **Warm memory**: keeps reusable `APCBlock` tensors in process memory. This is the fastest path, but it keeps both the reusable block pool and the runtime `KVCache`.
+- **Warm disk**: persists cached prefixes as safetensors shards so they survive process restarts. Warm-disk reads build the layer-major prompt cache directly without promoting restored blocks into the `APCBlock` pool; writes can still populate both memory and disk tiers.
+
+#### Python Script
+
+Use `APCManager` directly when calling `stream_generate`:
+
+```python
+from pathlib import Path
+
+from mlx_vlm import load, stream_generate
+from mlx_vlm.apc import APCManager, DiskBlockStore
+from mlx_vlm.prompt_utils import apply_chat_template
+
+model_id = "Qwen/Qwen3-VL-4B-Instruct"
+model, processor = load(model_id)
+
+disk = DiskBlockStore(
+    Path("~/.cache/mlx-vlm/caching").expanduser(),
+    namespace=model_id,
+    max_bytes=3 * (1 << 30),  # 3 GB disk cap; use None for uncapped
+)
+apc = APCManager(num_blocks=4096, block_size=16, disk=disk)
+
+document = Path("long_document.txt").read_text()
+
+try:
+    # First request computes the full prefix and stores reusable K/V blocks.
+    prompt1 = apply_chat_template(
+        processor,
+        model.config,
+        prompt=f"{document}\n\nSummarize the key decisions.",
+        num_images=0,
+    )
+    for _ in stream_generate(
+        model, processor, prompt1, max_tokens=128, temperature=0.0, apc_manager=apc
+    ):
+        pass
+
+    # Second request shares the same document prefix and only prefills the suffix.
+    prompt2 = apply_chat_template(
+        processor,
+        model.config,
+        prompt=f"{document}\n\nList the open engineering risks.",
+        num_images=0,
+    )
+    for chunk in stream_generate(
+        model, processor, prompt2, max_tokens=128, temperature=0.0, apc_manager=apc
+    ):
+        print(chunk.text, end="", flush=True)
+
+    print(apc.stats_snapshot())
+finally:
+    apc.close()
+```
+
+To compare cold, warm-memory, warm-disk, and disk-eviction behavior with a
+model, use the same direct API path:
+
+```python
+import os
+import tempfile
+import time
+from pathlib import Path
+
+from mlx_vlm import load, stream_generate
+from mlx_vlm.apc import APCManager, DiskBlockStore
+from mlx_vlm.prompt_utils import apply_chat_template
+
+model_id = "Qwen/Qwen3-VL-4B-Instruct"
+contexts = [8000, 20000, 50000, 100000]
+disk_cap_gb = 0  # 0 means uncapped
+shard_max_blocks = 256
+context_sweep_max_tokens = 1  # one token is enough to measure prefill reuse
+
+test_prompt_tokens = 8000
+fill_prompts = 80
+eviction_disk_cap_gb = 3.0
+
+os.environ["APC_DISK_SHARD_MAX_BLOCKS"] = str(shard_max_blocks)
+
+model, processor = load(model_id)
+tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+
+def disk_cap_bytes(gb: float):
+    return None if gb <= 0 else int(gb * (1 << 30))
+
+
+def make_context(target_tokens: int, seed: int = 0) -> str:
+    line = (
+        f"Document {seed}: APC benchmark content with deterministic facts, "
+        "dates, identifiers, and repeated technical notes.\n"
+    )
+    line_tokens = max(1, len(tokenizer.encode(line, add_special_tokens=False)))
+    text = line * max(1, target_tokens // line_tokens)
+    while len(tokenizer.encode(text, add_special_tokens=False)) < target_tokens:
+        text += line
+    return text
+
+
+def make_prompt(context: str, question: str) -> str:
+    return apply_chat_template(
+        processor,
+        model.config,
+        prompt=f"{context}\n\n{question}",
+        num_images=0,
+    )
+
+
+def run_once(apc: APCManager, context: str, question: str, max_tokens: int = 32):
+    prompt = make_prompt(context, question)
+    apc.reset_stats()
+
+    last = None
+    output = []
+    start = time.perf_counter()
+    for chunk in stream_generate(
+        model,
+        processor,
+        prompt,
+        max_tokens=max_tokens,
+        temperature=0.0,
+        apc_manager=apc,
+    ):
+        output.append(chunk.text)
+        last = chunk
+
+    if last is None:
+        raise RuntimeError("generation returned no chunks")
+
+    return {
+        "wall_s": time.perf_counter() - start,
+        "prompt_tokens": last.prompt_tokens,
+        "prompt_tps": last.prompt_tps,
+        "generation_tps": last.generation_tps,
+        "apc": apc.stats_snapshot(),
+        "text": "".join(output).strip(),
+    }
+
+
+def print_result(label: str, result: dict) -> None:
+    stats = result["apc"]
+    print(
+        f"{label:<12} "
+        f"prompt_tokens={result['prompt_tokens']:>7} "
+        f"prompt_tps={result['prompt_tps']:>8.1f} "
+        f"gen_tps={result['generation_tps']:>7.1f} "
+        f"matched={stats.get('matched_tokens', 0):>7} "
+        f"disk_hits={stats.get('disk_hits', 0):>5} "
+        f"disk_evictions={stats.get('disk_evictions', 0):>5}"
+    )
+
+
+def open_apc(cache_root: Path, namespace: str, disk_gb: float) -> APCManager:
+    disk = DiskBlockStore(
+        cache_root,
+        namespace=namespace,
+        max_bytes=disk_cap_bytes(disk_gb),
+    )
+    return APCManager(num_blocks=4096, block_size=16, disk=disk)
+
+
+def run_context_sweep() -> None:
+    print("cold / warm-memory / warm-disk")
+    with tempfile.TemporaryDirectory() as tmp:
+        cache_root = Path(tmp)
+        for target_tokens in contexts:
+            context = make_context(target_tokens)
+            namespace = f"{model_id}-context-{target_tokens}"
+            apc = open_apc(cache_root, namespace, disk_cap_gb)
+            try:
+                print(f"\ncontext ~= {target_tokens} text tokens")
+                print_result(
+                    "cold",
+                    run_once(
+                        apc,
+                        context,
+                        "Summarize the key decisions.",
+                        max_tokens=context_sweep_max_tokens,
+                    ),
+                )
+                print_result(
+                    "warm-memory",
+                    run_once(
+                        apc,
+                        context,
+                        "List the open engineering risks.",
+                        max_tokens=context_sweep_max_tokens,
+                    ),
+                )
+            finally:
+                # Closing waits for queued disk writes before reopening the disk tier.
+                apc.close()
+
+            apc = open_apc(cache_root, namespace, disk_cap_gb)
+            try:
+                print_result(
+                    "warm-disk",
+                    run_once(
+                        apc,
+                        context,
+                        "Extract the implementation timeline.",
+                        max_tokens=context_sweep_max_tokens,
+                    ),
+                )
+            finally:
+                apc.close()
+
+
+def run_disk_eviction_workload() -> None:
+    print("\ndisk eviction workload")
+    with tempfile.TemporaryDirectory() as tmp:
+        cache_root = Path(tmp)
+        namespace = f"{model_id}-eviction"
+        test_context = make_context(test_prompt_tokens, seed=0)
+
+        apc = open_apc(cache_root, namespace, eviction_disk_cap_gb)
+        try:
+            print_result(
+                "seed",
+                run_once(apc, test_context, "Summarize the retained test prefix."),
+            )
+        finally:
+            apc.close()
+
+        apc = open_apc(cache_root, namespace, eviction_disk_cap_gb)
+        try:
+            for i in range(fill_prompts):
+                fill_context = make_context(test_prompt_tokens, seed=i + 1)
+                run_once(
+                    apc,
+                    fill_context,
+                    f"Summarize filler document {i + 1}.",
+                    max_tokens=1,
+                )
+                if (i + 1) % 10 == 0:
+                    stats = apc.stats_snapshot()
+                    print(
+                        f"filled={i + 1:>3} "
+                        f"disk_gb={stats.get('disk_bytes', 0) / (1 << 30):.2f} "
+                        f"disk_evictions={stats.get('disk_evictions', 0)}"
+                    )
+        finally:
+            apc.close()
+
+        apc = open_apc(cache_root, namespace, eviction_disk_cap_gb)
+        try:
+            print_result(
+                "post-fill",
+                run_once(
+                    apc,
+                    test_context,
+                    "Check whether the retained test prefix still restores.",
+                ),
+            )
+        finally:
+            apc.close()
+
+
+run_context_sweep()
+run_disk_eviction_workload()
+```
+
+#### Server
+
+Enable in-memory APC for the server with environment variables:
+
+```sh
+APC_ENABLED=1 \
+APC_NUM_BLOCKS=4096 \
+mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --port 8080
+```
+
+APC works with KV-cache quantization (`--kv-bits`):
+
+```sh
+APC_ENABLED=1 \
+APC_NUM_BLOCKS=4096 \
+mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --kv-bits 8 --port 8080
+```
+
+Enable the persistent disk tier:
+
+```sh
+APC_ENABLED=1 \
+APC_NUM_BLOCKS=4096 \
+APC_DISK_PATH=~/.cache/mlx-vlm/caching \
+APC_DISK_MAX_GB=3 \
+APC_DISK_SHARD_MAX_BLOCKS=256 \
+mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --port 8080
+```
+
+Repeated requests with the same long prefix will hit APC automatically:
+
+```sh
+curl -X POST "http://localhost:8080/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -H "X-APC-Tenant: demo" \
+  -d '{
+    "model": "Qwen/Qwen3-VL-4B-Instruct",
+    "messages": [{
+      "role": "user",
+      "content": "Paste a long shared document here.\n\nNow answer question A."
+    }],
+    "max_tokens": 128
+  }'
+```
+
+Use the same `X-APC-Tenant` value for requests that may share cached prefixes. Use different tenant values to isolate cache entries between users or workspaces.
+
+Inspect and reset APC state:
+
+```sh
+curl http://localhost:8080/v1/cache/stats
+curl -X POST http://localhost:8080/v1/cache/reset
+```
+
+Common APC environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `APC_ENABLED` | `0` | Set to `1` to enable APC |
+| `APC_NUM_BLOCKS` | `2048` | Number of in-memory APC blocks |
+| `APC_BLOCK_SIZE` | `16` | Tokens per APC block |
+| `APC_DISK_PATH` | unset | Directory for persistent disk shards |
+| `APC_DISK_MAX_GB` | `0` | Disk cap in GB; `0` means uncapped |
+| `APC_DISK_SHARD_MAX_BLOCKS` | `256` | Max blocks per disk segment shard |
+| `APC_MAX_POOL_TENSORS` | `450000` | Stops adding memory blocks before the Metal resource limit; disk writes continue |
+| `APC_LAYER_MAJOR_MEMORY_MIN_TOKENS` | `50000` | Store long warm-memory prefixes as compact layer-major snapshots instead of per-block tensors |
+| `APC_HASH` | `fast` | Set to `sha256` for a stable cryptographic hash |
+| `APC_TRACE` | unset | Set to `1` for greppable store/reject/self-check log lines |
+
+APC is disabled automatically for models that use a custom cache layout. APC works with `--kv-bits` (including TurboQuant): the live KV cache stays quantized; the reusable APC pool stores dequantized float K/V, so pool size does not shrink with quant.
+When APC is enabled on the server, a non-fatal layout self-check runs at model load.
+
 #### KV Cache Quantization
 
-Reduce KV cache memory during continuous batching with `--kv-bits`. Both uniform quantization and TurboQuant are supported:
+Reduce KV cache memory during continuous batching with `--kv-bits`. Both uniform quantization and TurboQuant are supported. Compatible with Automatic Prefix Caching (`APC_ENABLED=1`).
 
 ```sh
 # Uniform 8-bit KV cache quantization
@@ -291,6 +888,33 @@ mlx_vlm.server --model google/gemma-4-26b-a4b-it --kv-bits 3.5 --kv-quant-scheme
 ```
 
 Full-attention layers use quantized batch caches while sliding-window layers keep their fixed-size rotating caches. The last full-attention layer stays unquantized (sensitive in deep models).
+
+##### Per-tensor KV quantization
+
+Keys and values do not have to share a bit-width or a backend. A fractional `--kv-bits` already splits the budget — `3.5` gives 3-bit keys and 4-bit values — and `--kv-key-bits` / `--kv-value-bits` override either side:
+
+```sh
+# 8-bit keys, 3-bit values, both TurboQuant
+mlx_vlm.generate --model mlx-community/Qwen3.5-9B-MLX-4bit \
+  --kv-bits 3.5 --kv-quant-scheme turboquant \
+  --kv-key-bits 8 --kv-value-bits 3
+```
+
+`--kv-key-scheme` / `--kv-value-scheme` go further and select a different backend per tensor, which builds a hybrid cache:
+
+```sh
+# uniform 8-bit keys beside TurboQuant 3-bit values
+mlx_vlm.generate --model mlx-community/Qwen3.5-9B-MLX-4bit \
+  --kv-bits 8 --kv-quant-scheme uniform \
+  --kv-value-bits 3 --kv-value-scheme turboquant
+```
+
+Two limitations apply to mixed *schemes* specifically:
+
+- The hybrid cache dequantizes on every step instead of using a fused kernel, so it is slower than either homogeneous path.
+- Mixed schemes are not supported during continuous batching or for batch prefix caches, and raise `NotImplementedError` there. Mixed bit-widths under a single scheme work everywhere.
+
+Note that values are given the extra bit by default for a reason: value error passes straight through the attention output, whereas key error is partly reabsorbed by the softmax. Measured on Qwen3.5, spending an equal budget key-heavy was consistently worse than value-heavy, so prefer measuring before overriding.
 
 Tested with gemma-4-26b-a4b-it at 20K context:
 
@@ -330,6 +954,104 @@ TOP_LOGPROBS_K=5 mlx_vlm.server --model mlx-community/Qwen2-VL-2B-Instruct-4bit
 
 Per-request `top_logprobs` is clamped to `TOP_LOGPROBS_K`. When `TOP_LOGPROBS_K=0`, requests with `logprobs: true` still return chosen-token logprobs; only the `top_logprobs` list stays empty. Leaving the cap at `0` keeps the vocab-wide sort out of the decode graph, so deployments that don't need logprobs pay zero overhead.
 
+#### Structured Outputs
+
+The `/v1/chat/completions` and `/v1/responses` endpoints support OpenAI-compatible `json_schema` structured outputs. The server constrains generation to the supplied JSON schema and supports both streaming and non-streaming responses.
+
+You can define the schema with Pydantic:
+
+```python
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class AnimalResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    animal: Literal["dog", "cat", "bird", "unknown"]
+    species: str = Field(max_length=60)
+    description: str = Field(max_length=200)
+
+
+schema = AnimalResult.model_json_schema()
+```
+
+Call the local server with the OpenAI Python client:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="not-needed")
+
+response = client.chat.completions.create(
+    model="mlx-community/Qwen3.5-4B-MLX-4bit",
+    messages=[
+        {"role": "user", "content": "Return a dog object."},
+    ],
+    response_format={
+        "type": "json_schema",
+        "json_schema": {
+            "name": "AnimalResult",
+            "strict": True,
+            "schema": schema,
+        },
+    },
+)
+
+result = AnimalResult.model_validate_json(response.choices[0].message.content)
+print(result)
+```
+
+Example output:
+
+```text
+animal='dog' species='Canis lupus familiaris' description='A domesticated canine known for companionship and loyalty.'
+```
+
+Chat completions use top-level `response_format`. The same format works for text-only and multimodal requests:
+
+```sh
+curl -X POST "http://localhost:8080/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen3.5-4B-MLX-4bit",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Identify the main animal in this image."},
+        {"type": "image_url", "image_url": {"url": "/path/to/image.jpg"}}
+      ]
+    }],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "AnimalResult",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "animal": {"type": "string", "enum": ["dog", "cat", "bird", "unknown"]},
+            "species": {"type": "string", "maxLength": 60},
+            "description": {"type": "string", "maxLength": 200}
+          },
+          "required": ["animal", "species", "description"],
+          "additionalProperties": false
+        }
+      }
+    },
+    "max_tokens": 256
+  }'
+```
+
+Structured outputs are also supported with:
+
+- Streaming chat completions by setting `"stream": true`
+- The responses API via `text.format` on `/v1/responses`
+- Text-only requests using the same `response_format` shape
+
+Structured outputs are not currently supported with speculative decoding.
+
 #### How It Works
 
 - A dedicated generation thread runs a `BatchGenerator` that processes multiple requests in parallel
@@ -342,8 +1064,15 @@ Per-request `top_logprobs` is clamped to `TOP_LOGPROBS_K`. When `TOP_LOGPROBS_K=
 - `/models` and `/v1/models` - List models available locally
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
+- `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
+- `/v1/rerank` - Rank text or multimodal documents by relevance to a query
+- `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
+- `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models
+- `/audio/translations` and `/v1/audio/translations` - OpenAI-compatible audio translation endpoint for STT models that expose a translation task
+- `/v1/realtime` - WebSocket-based realtime full-duplex speech. See the [Nemotron VoiceChat guide](mlx_vlm/models/nemotron_voicechat/README.md#realtime-websocket-api) for supported models and usage.
 - `/health` - Check server status
-- `/unload` - Unload current model from memory
+- `/metrics` and `/v1/metrics` - Inspect rolling request metrics, throughput, and runtime counters
+- `/unload` - Unload all loaded model caches from memory
 
 #### Usage Examples
 
@@ -352,6 +1081,35 @@ Per-request `top_logprobs` is clamped to `TOP_LOGPROBS_K`. When `TOP_LOGPROBS_K=
 ```sh
 curl "http://localhost:8080/models"
 ```
+
+##### Embeddings
+
+```sh
+curl -X POST "http://localhost:8080/v1/embeddings" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "sentence-transformers/all-MiniLM-L6-v2",
+    "input": ["The quick brown fox.", "A fast auburn fox."]
+  }'
+```
+
+Preload a default with `--embedding-model <repo-or-path>`. Supported architectures: BERT, XLM-RoBERTa, ModernBERT, Qwen3-Embedding, EmbeddingGemma (gemma3), LFM2, SigLIP (text), Qwen3-VL-Embedding, and Llama-Nemotron-VL, plus LLM2Vec bidirectional Llama. ColBERT-style multi-vector models (ColIdefics3, ColQwen2.5) are also available for late-interaction use.
+
+##### Reranking
+
+```sh
+curl -X POST "http://localhost:8080/v1/rerank" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen3-Reranker-0.6B-4bit",
+    "query": "What is the capital of France?",
+    "documents": ["Berlin is in Germany.", "Paris is the capital of France."],
+    "top_n": 1,
+    "return_documents": true
+  }'
+```
+
+Preload a default with `--reranker-model <repo-or-path>`. Supported text rerankers include one-label BERT, XLM-RoBERTa, and ModernBERT sequence-classification checkpoints, plus Qwen3 generative rerankers. Qwen3-VL rerankers also accept objects containing `text`, `image`, `image_url`, `video`, or `video_url`. Sequence-classification rerankers accept text pairs and do not support custom instructions.
 
 ##### Text Input
 
@@ -403,9 +1161,10 @@ curl -X POST "http://localhost:8080/chat/completions" \
   }'
 ```
 
-##### Audio Support (New)
+##### Audio Input
+
 ```sh
-curl -X POST "http://localhost:8080/generate" \
+curl -X POST "http://localhost:8080/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/gemma-3n-E2B-it-4bit",
@@ -424,9 +1183,33 @@ curl -X POST "http://localhost:8080/generate" \
   }'
 ```
 
-##### Multi-Modal (Image + Audio)
+##### Text-to-Speech
+
 ```sh
-curl -X POST "http://localhost:8080/generate" \
+curl -X POST "http://localhost:8080/v1/audio/speech" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/pocket-tts",
+    "input": "Hello from MLX VLM.",
+    "voice": "fantine",
+    "response_format": "mp3"
+  }' \
+  --output speech.mp3
+```
+
+##### Speech-to-Text
+
+```sh
+curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
+  -F model=mlx-community/parakeet-tdt-0.6b-v3 \
+  -F file=@/path/to/audio.mp3 \
+  -F response_format=json
+```
+
+##### Multi-Modal (Image + Audio)
+
+```sh
+curl -X POST "http://localhost:8080/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/gemma-3n-E2B-it-4bit",
@@ -444,6 +1227,7 @@ curl -X POST "http://localhost:8080/generate" \
 ```
 
 ##### Responses Endpoint
+
 ```sh
 curl -X POST "http://localhost:8080/responses" \
   -H "Content-Type: application/json" \
@@ -472,8 +1256,44 @@ curl -X POST "http://localhost:8080/responses" \
 - `top_k`: Top-k sampling cutoff
 - `min_p`: Min-p sampling threshold
 - `repetition_penalty`: Penalty applied to repeated tokens
+- `enable_thinking`: Override the server thinking-mode default for a request (`true` or `false`)
+- `thinking_budget`: Maximum tokens allowed inside the thinking block
+- `thinking_start_token`: Token that opens a thinking block
+- `thinking_end_token`: Token that closes a thinking block
 - `stream`: Enable streaming responses
 
+## 1-bit Affine Inference
+
+MLX-VLM can load existing affine 1-bit MLX checkpoints without a custom MLX
+build. When a checkpoint declares `"bits": 1`, compatible `Linear` and
+`Embedding` layers are replaced automatically with an inference-only module
+that JIT-compiles its Metal kernel from Python.
+
+The checkpoint must use MLX's packed `uint32` weight layout, include `scales`
+and `biases`, and declare a group size of `32`, `64`, or `128`:
+
+```json
+{
+  "quantization": {
+    "group_size": 64,
+    "bits": 1,
+    "mode": "affine"
+  }
+}
+```
+
+Load and generate normally; no extra inference flag is needed:
+
+```python
+from mlx_vlm import generate, load
+
+model, processor = load("path/to/1bit-model")
+result = generate(model, processor, "Describe this image", image=["image.jpg"])
+```
+
+This path is for inference from an already quantized checkpoint. Converting a
+floating-point model to 1-bit still requires a quantizer that can produce the
+packed weights and affine parameters.
 
 ## Activation Quantization (CUDA)
 
@@ -558,6 +1378,7 @@ The following models support video chat:
 2. Qwen2.5-VL
 3. Idefics3
 4. LLaVA
+5. MiniMax M3
 
 With more coming soon.
 
@@ -565,9 +1386,8 @@ With more coming soon.
 
 #### Command Line
 ```sh
-mlx_vlm.video_generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Describe this video" --video path/to/video.mp4 --max-pixels 224 224 --fps 1.0
+mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Describe this video" --video path/to/video.mp4 --fps 1.0
 ```
-
 
 These examples demonstrate how to use multiple images with MLX-VLM for more complex visual reasoning tasks.
 
@@ -734,7 +1554,12 @@ See [docs/usage.md](https://github.com/Blaizzy/mlx-vlm/blob/main/docs/usage.md#d
 
 # Fine-tuning
 
-MLX-VLM supports fine-tuning models with LoRA and QLoRA.
+MLX-VLM supports fine-tuning models with LoRA and QLoRA. Fine-tuning (and the
+eval scripts) need the training extra, which is not installed by default:
+
+```bash
+pip install "mlx-vlm[train]"
+```
 
 ## LoRA & QLoRA
 

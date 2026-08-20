@@ -6,7 +6,12 @@ import mlx.nn as nn
 
 from mlx_vlm.trainer.datasets import VisionDataset
 from mlx_vlm.trainer.lora import LoRaLayer
-from mlx_vlm.trainer.sft_trainer import TrainingArgs, train
+from mlx_vlm.trainer.sft_trainer import (
+    TrainingArgs,
+    iterate_batches,
+    train,
+    vision_language_loss_fn,
+)
 
 
 class TestDataset(unittest.TestCase):
@@ -129,6 +134,274 @@ class TestDataset(unittest.TestCase):
         self.assertEqual(dataset.config, self.mock_config)
         self.assertEqual(dataset.processor, self.mock_processor)
 
+    @patch("mlx_vlm.trainer.datasets.apply_chat_template")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    def test_dataset_adds_completion_mask_from_chat_template(
+        self, mock_prepare_inputs, mock_apply_chat_template
+    ):
+        dataset = VisionDataset(
+            self.mock_hf_dataset,
+            self.mock_config,
+            self.mock_processor,
+            train_on_completions=True,
+        )
+
+        messages = [
+            {"role": "user", "content": "Use the tool."},
+            {"role": "assistant", "content": "tool call"},
+        ]
+        self.mock_hf_dataset.__getitem__.return_value = {"messages": messages}
+
+        def fake_apply_chat_template(
+            _processor, _config, conversation, add_generation_prompt, **_kwargs
+        ):
+            if add_generation_prompt:
+                self.assertEqual(conversation, messages[:-1])
+                return "prefix"
+            self.assertEqual(conversation, messages)
+            return "full"
+
+        def fake_prepare_inputs(**kwargs):
+            prompts = kwargs["prompts"]
+            if prompts == ["prefix"]:
+                return {"input_ids": mx.array([[1, 2]])}
+            return {
+                "input_ids": mx.array([[1, 2, 3, 4]]),
+                "attention_mask": mx.array([[1, 1, 1, 1]]),
+            }
+
+        mock_apply_chat_template.side_effect = fake_apply_chat_template
+        mock_prepare_inputs.side_effect = fake_prepare_inputs
+
+        result = dataset[0]
+
+        self.assertIn("completion_mask", result)
+        self.assertTrue(
+            mx.array_equal(result["completion_mask"], mx.array([[0, 0, 1, 1]]))
+        )
+
+    @patch("mlx_vlm.trainer.datasets.apply_chat_template")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    def test_dataset_skips_completion_mask_when_not_training_on_completions(
+        self, mock_prepare_inputs, mock_apply_chat_template
+    ):
+        dataset = VisionDataset(
+            self.mock_hf_dataset,
+            self.mock_config,
+            self.mock_processor,
+        )
+
+        messages = [
+            {"role": "user", "content": "Use the tool."},
+            {"role": "assistant", "content": "tool call"},
+        ]
+        self.mock_hf_dataset.__getitem__.return_value = {"messages": messages}
+
+        mock_apply_chat_template.return_value = "full"
+        mock_prepare_inputs.return_value = {
+            "input_ids": mx.array([[1, 2, 3, 4]]),
+            "attention_mask": mx.array([[1, 1, 1, 1]]),
+        }
+
+        result = dataset[0]
+
+        self.assertNotIn("completion_mask", result)
+        mock_apply_chat_template.assert_called_once_with(
+            self.mock_processor,
+            self.mock_config,
+            messages,
+            add_generation_prompt=False,
+            num_images=0,
+            num_audios=0,
+        )
+
+
+class TestBatchCollation(unittest.TestCase):
+    def test_iterate_batches_concatenates_variable_length_pixel_values(self):
+        dataset = [
+            {
+                "input_ids": mx.array([1, 2, 3]),
+                "attention_mask": mx.array([1, 1, 1]),
+                "pixel_values": mx.zeros((2, 4)),
+                "image_grid_thw": mx.array([[1, 1, 2]]),
+            },
+            {
+                "input_ids": mx.array([4, 5]),
+                "attention_mask": mx.array([1, 1]),
+                "pixel_values": mx.ones((3, 4)),
+                "image_grid_thw": mx.array([[1, 1, 3]]),
+            },
+        ]
+
+        batch = next(iterate_batches(dataset, batch_size=2, max_seq_length=32))
+
+        self.assertEqual(batch["input_ids"].shape, (2, 32))
+        self.assertEqual(batch["pixel_values"].shape, (5, 4))
+        self.assertTrue(
+            mx.array_equal(batch["image_grid_thw"], mx.array([[1, 1, 2], [1, 1, 3]]))
+        )
+
+    def test_iterate_batches_preserves_multi_image_grid_rows(self):
+        dataset = [
+            {
+                "input_ids": mx.array([1, 2, 3]),
+                "attention_mask": mx.array([1, 1, 1]),
+                "pixel_values": mx.zeros((5, 4)),
+                "image_grid_thw": mx.array([[1, 1, 2], [1, 1, 3]]),
+            }
+        ]
+
+        batch = next(iterate_batches(dataset, batch_size=1, max_seq_length=32))
+
+        self.assertEqual(batch["image_grid_thw"].shape, (2, 3))
+        self.assertTrue(
+            mx.array_equal(batch["image_grid_thw"], mx.array([[1, 1, 2], [1, 1, 3]]))
+        )
+
+    def test_iterate_batches_concatenates_mixed_image_grid_rows(self):
+        dataset = [
+            {
+                "input_ids": mx.array([1, 2, 3]),
+                "attention_mask": mx.array([1, 1, 1]),
+                "pixel_values": mx.zeros((2, 4)),
+                "image_grid_thw": mx.array([[1, 1, 2]]),
+            },
+            {
+                "input_ids": mx.array([4, 5]),
+                "attention_mask": mx.array([1, 1]),
+                "pixel_values": mx.ones((7, 4)),
+                "image_grid_thw": mx.array([[1, 1, 3], [1, 2, 2]]),
+            },
+        ]
+
+        batch = next(iterate_batches(dataset, batch_size=2, max_seq_length=32))
+
+        self.assertEqual(batch["image_grid_thw"].shape, (3, 3))
+        self.assertTrue(
+            mx.array_equal(
+                batch["image_grid_thw"],
+                mx.array([[1, 1, 2], [1, 1, 3], [1, 2, 2]]),
+            )
+        )
+
+    def test_iterate_batches_pads_completion_mask(self):
+        dataset = [
+            {
+                "input_ids": mx.array([1, 2, 3]),
+                "attention_mask": mx.array([1, 1, 1]),
+                "pixel_values": None,
+                "completion_mask": mx.array([0, 1, 1]),
+            },
+            {
+                "input_ids": mx.array([4, 5]),
+                "attention_mask": mx.array([1, 1]),
+                "pixel_values": None,
+                "completion_mask": mx.array([0, 1]),
+            },
+        ]
+
+        batch = next(iterate_batches(dataset, batch_size=2, max_seq_length=32))
+
+        self.assertIn("completion_mask", batch)
+        self.assertEqual(batch["completion_mask"].shape, (2, 32))
+        self.assertTrue(
+            mx.array_equal(batch["completion_mask"][0, :3], mx.array([0, 1, 1]))
+        )
+        self.assertTrue(
+            mx.array_equal(batch["completion_mask"][1, :2], mx.array([0, 1]))
+        )
+
+
+class _VisionDatasetStub(list):
+    """A dataset list that also carries a model config, like VisionDataset."""
+
+    def __init__(self, items, config):
+        super().__init__(items)
+        self.config = config
+
+
+def _image_example(num_image_tokens, image_token_id=99, num_sub_images=2):
+    input_ids = mx.array([1] + [image_token_id] * num_image_tokens)
+    return {
+        "input_ids": input_ids,
+        "attention_mask": mx.ones(input_ids.shape, dtype=mx.int32),
+        "pixel_values": mx.zeros((num_sub_images, 4)),
+    }
+
+
+class TestImageTokenTruncationGuard(unittest.TestCase):
+    """Truncation must never cut image tokens (#1830).
+
+    ``pixel_values`` still yields one feature per image token, so an example whose
+    placeholders are truncated away fails the model's feature/token alignment
+    check. Such examples are skipped instead of corrupting the batch.
+    """
+
+    config = {"image_token_index": 99}
+
+    def test_skips_examples_whose_image_tokens_do_not_fit(self):
+        dataset = _VisionDatasetStub(
+            [_image_example(10), _image_example(3)], self.config
+        )
+
+        batch = next(iterate_batches(dataset, batch_size=1, max_seq_length=8))
+
+        # Only the short example survives; it keeps all 3 of its image tokens.
+        self.assertEqual(int((batch["input_ids"] == 99).sum()), 3)
+
+    def test_raises_when_no_example_fits(self):
+        dataset = _VisionDatasetStub(
+            [_image_example(10), _image_example(12)], self.config
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            next(iterate_batches(dataset, batch_size=1, max_seq_length=8))
+
+        self.assertIn("No trainable examples", str(ctx.exception))
+
+    def test_partially_filtered_batch_keeps_pixel_values_aligned(self):
+        # One example is dropped from a size-2 batch: the collated pixel_values
+        # must cover only the surviving example, or alignment breaks again.
+        dataset = _VisionDatasetStub(
+            [_image_example(10), _image_example(3)], self.config
+        )
+
+        batch = next(iterate_batches(dataset, batch_size=2, max_seq_length=8))
+
+        self.assertEqual(batch["input_ids"].shape[0], 1)
+        self.assertEqual(batch["pixel_values"].shape[0], 1)
+        self.assertEqual(int((batch["input_ids"] == 99).sum()), 3)
+
+    def test_keeps_examples_that_fit_untouched(self):
+        dataset = _VisionDatasetStub([_image_example(3)], self.config)
+
+        batch = next(iterate_batches(dataset, batch_size=1, max_seq_length=32))
+
+        self.assertEqual(int((batch["input_ids"] == 99).sum()), 3)
+
+    def test_text_only_datasets_are_unaffected(self):
+        # No image token in the config: long examples truncate as before.
+        dataset = _VisionDatasetStub([_image_example(10)], {"model_type": "llama"})
+
+        batch = next(iterate_batches(dataset, batch_size=1, max_seq_length=8))
+
+        self.assertEqual(batch["input_ids"].shape, (1, 8))
+
+
+class TestIdefics3MaskArgument(unittest.TestCase):
+    def test_call_accepts_mask_as_third_positional_argument(self):
+        """The trainer calls ``model(input_ids, pixel_values, attention_mask)``.
+
+        Idefics3 previously omitted ``mask``, so the attention mask bound to
+        ``cache`` and crashed in ``create_attention_mask`` (#1830).
+        """
+        import inspect
+
+        from mlx_vlm.models.idefics3.idefics3 import Model
+
+        params = list(inspect.signature(Model.__call__).parameters)
+        self.assertEqual(params[1:4], ["input_ids", "pixel_values", "mask"])
+
 
 class TestTrainer(unittest.TestCase):
     def setUp(self):
@@ -196,6 +469,137 @@ class TestTrainer(unittest.TestCase):
 
         self.mock_optimizer.update.assert_called()
         mock_save_safetensors.assert_called()
+
+    @patch("mlx_vlm.trainer.sft_trainer.iterate_batches")
+    @patch("mlx_vlm.trainer.sft_trainer.mx.save_safetensors")
+    def test_train_uses_default_adapter_file_when_missing(
+        self, mock_save_safetensors, mock_iterate_batches
+    ):
+        mock_batch = {
+            "input_ids": mx.array([[1, 2, 3], [1, 2, 3], [1, 2, 3], [1, 2, 3]]),
+            "attention_mask": mx.array([[1, 1, 1], [1, 1, 1], [1, 1, 1], [1, 1, 1]]),
+            "pixel_values": mx.array(
+                [[[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]], [[0.1, 0.2]]]
+            ),
+            "labels": mx.array([[0, 1, 2], [0, 1, 2], [0, 1, 2], [0, 1, 2]]),
+        }
+        mock_iterate_batches.return_value = iter([mock_batch])
+
+        train(
+            model=self.mock_model,
+            optimizer=self.mock_optimizer,
+            train_dataset=MagicMock(__len__=lambda self: 4),
+            val_dataset=None,
+            args=TrainingArgs(
+                iters=1,
+                batch_size=4,
+                steps_per_save=1,
+                adapter_file=None,
+            ),
+        )
+
+        saved_paths = [call.args[0] for call in mock_save_safetensors.call_args_list]
+        self.assertEqual(
+            saved_paths,
+            [
+                "adapters.safetensors",
+                "0000001_adapters.safetensors",
+                "adapters.safetensors",
+            ],
+        )
+
+    def test_gemma4_unified_loss_lets_model_build_internal_masks(self):
+        class DummyOutput:
+            def __init__(self, logits):
+                self.logits = logits
+
+        class CaptureModel:
+            model_type = "gemma4_unified"
+
+            def __call__(self, input_ids, pixel_values, mask, **kwargs):
+                self.mask = mask
+                self.kwargs = kwargs
+                vocab_size = 10
+                return DummyOutput(mx.zeros((*input_ids.shape, vocab_size)))
+
+        model = CaptureModel()
+        batch = {
+            "input_ids": mx.array([[1, 2, 3, 4]]),
+            "attention_mask": mx.array([[1, 1, 1, 1]]),
+            "pixel_values": None,
+        }
+
+        vision_language_loss_fn(model, batch)
+
+        self.assertIsNone(model.mask)
+
+    def test_completion_mask_is_used_without_passing_to_model(self):
+        class DummyOutput:
+            def __init__(self, logits):
+                self.logits = logits
+
+        class CaptureModel:
+            model_type = "test_model"
+
+            def __call__(self, input_ids, pixel_values, mask, **kwargs):
+                self.mask = mask
+                self.kwargs = kwargs
+                vocab_size = 10
+                return DummyOutput(mx.zeros((*input_ids.shape, vocab_size)))
+
+        model = CaptureModel()
+        batch = {
+            "input_ids": mx.array([[1, 2, 3, 4]]),
+            "attention_mask": mx.array([[1, 1, 1, 1]]),
+            "completion_mask": mx.array([[0, 0, 1, 1]]),
+            "pixel_values": None,
+        }
+
+        vision_language_loss_fn(
+            model, batch, train_on_completions=True, assistant_id=999
+        )
+
+        self.assertTrue(mx.array_equal(model.mask, mx.array([[1, 1, 1]])))
+        self.assertNotIn("completion_mask", model.kwargs)
+
+    def test_completion_mask_loss_denominator_uses_masked_token_count(self):
+        class DummyOutput:
+            def __init__(self, logits):
+                self.logits = logits
+
+        class FixedLogitsModel:
+            model_type = "test_model"
+
+            def __call__(self, input_ids, pixel_values, mask, **kwargs):
+                logits = mx.array(
+                    [
+                        [
+                            [4.0, 0.0],
+                            [0.0, 4.0],
+                            [4.0, 0.0],
+                        ]
+                    ]
+                )
+                return DummyOutput(logits=logits)
+
+        model = FixedLogitsModel()
+        batch = {
+            "input_ids": mx.array([[1, 0, 1, 0]]),
+            "attention_mask": mx.array([[1, 1, 1, 1]]),
+            "completion_mask": mx.array([[0, 0, 1, 0]]),
+            "pixel_values": None,
+        }
+
+        labels = batch["input_ids"][:, 1:]
+        logits = model(None, None, None).logits
+        ce = nn.losses.cross_entropy(logits, labels)
+        expected = ce[0, 1]
+
+        actual = vision_language_loss_fn(
+            model, batch, train_on_completions=True, assistant_id=999
+        )
+
+        self.assertAlmostEqual(actual.item(), expected.item(), places=6)
 
 
 class TestLoRaScaling(unittest.TestCase):

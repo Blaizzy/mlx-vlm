@@ -5,6 +5,7 @@ import mlx.core as mx
 import mlx_whisper
 import numpy as np
 import speech_recognition as sr
+from action_parser import parse_action_response
 from PIL import ImageGrab
 from utils import draw_point, update_navigation_history
 
@@ -173,7 +174,7 @@ def process_command(model, processor, query, past_actions=[]):
 
     print("Response: ", response)
 
-    response = eval(response)
+    response = parse_action_response(response)
     # normalize the values
     response["position"] = [
         response["position"][0] * screenshot.width,

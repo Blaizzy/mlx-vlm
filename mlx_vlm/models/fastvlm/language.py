@@ -2,9 +2,9 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.qwen2 import Qwen2Model
 
 from ..base import LanguageModelOutput
+from ..qwen2.language import Qwen2Model
 from .config import TextConfig
 
 
@@ -27,12 +27,16 @@ class LanguageModel(nn.Module):
         **kwargs,
     ):
         out = self.model(inputs, cache=cache, input_embeddings=inputs_embeds)
-        out = self.model.embed_tokens.as_linear(out)
+        if self.config.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(out)
+        else:
+            out = self.lm_head(out)
         return LanguageModelOutput(out)
 
     def sanitize(self, weights):
         if self.config.tie_word_embeddings:
-            weights.pop("lm_head.weight", None)
+            # Model.sanitize prepends "language_model." to top-level lm_head.weight.
+            weights.pop("language_model.lm_head.weight", None)
         return {
             k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
         }

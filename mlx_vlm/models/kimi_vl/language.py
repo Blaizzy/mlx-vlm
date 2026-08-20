@@ -4,13 +4,14 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
+from ..mlp import DeepseekMLP as DeepseekV3MLP
+from ..switch_layers import SwitchGLU
 from .config import TextConfig
 
 
@@ -229,26 +230,6 @@ class DeepseekV3Attention(nn.Module):
         return self.o_proj(output)
 
 
-class DeepseekV3MLP(nn.Module):
-    def __init__(
-        self, config: TextConfig, hidden_size: int = None, intermediate_size: int = None
-    ):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size if hidden_size is None else hidden_size
-        self.intermediate_size = (
-            config.intermediate_size if intermediate_size is None else intermediate_size
-        )
-
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-
-    def __call__(self, x):
-        down_proj = self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
-
-
 @mx.compile
 def group_expert_select(
     gates,
@@ -397,11 +378,11 @@ class DeepseekV3Model(nn.Module):
         else:
             h = inputs_embeds
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * self.num_layers
+
+        if mask is None:
+            mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)

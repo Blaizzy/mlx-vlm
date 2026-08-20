@@ -3,7 +3,6 @@
 import time
 from dataclasses import dataclass, field
 from functools import partial
-from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -12,7 +11,12 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_map
 from tqdm import tqdm
 
-from .sft_trainer import TrainingArgs, _squeeze_leading_batch_dim
+from .sft_trainer import (
+    TrainingArgs,
+    _collate_arrays,
+    _resolve_adapter_file,
+    _squeeze_leading_batch_dim,
+)
 from .utils import Colors, grad_checkpoint, save_adapter
 
 
@@ -167,7 +171,7 @@ def _pad_and_collate(items, prefix, max_seq_length):
 
     pixel_values_batch = None
     if pv_key in items[0] and items[0][pv_key] is not None:
-        pixel_values_batch = mx.stack(
+        pixel_values_batch = _collate_arrays(
             [_squeeze_leading_batch_dim(item[pv_key]) for item in items]
         )
 
@@ -183,7 +187,7 @@ def _pad_and_collate(items, prefix, max_seq_length):
             vals = [_squeeze_leading_batch_dim(item[k]) for item in items]
             if isinstance(vals[0], mx.array):
                 try:
-                    result[k.removeprefix(f"{prefix}_")] = mx.stack(vals)
+                    result[k.removeprefix(f"{prefix}_")] = _collate_arrays(vals)
                 except Exception:
                     result[k.removeprefix(f"{prefix}_")] = vals[0]
             else:
@@ -330,6 +334,8 @@ def train_orpo(
             f"{Colors.OKBLUE}No validation dataset provided — training will run without validation.{Colors.ENDC}"
         )
 
+    adapter_file = _resolve_adapter_file(args)
+
     # Enable gradient checkpointing if requested
     if args.grad_checkpoint:
         if hasattr(model, "layers"):
@@ -471,20 +477,18 @@ def train_orpo(
 
         # Save checkpoint
         if it % args.steps_per_save == 0 and rank == 0:
-            save_adapter(model, args.adapter_file)
-            checkpoint = (
-                Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
-            )
+            save_adapter(model, adapter_file)
+            checkpoint = adapter_file.parent / f"{it:07d}_adapters.safetensors"
             save_adapter(model, checkpoint)
             print(
                 f"{Colors.OKBLUE}Iter {it}: Saved adapter weights to "
-                f"{args.adapter_file} and {checkpoint}.{Colors.ENDC}",
+                f"{adapter_file} and {checkpoint}.{Colors.ENDC}",
                 flush=True,
             )
 
     # Save final weights
     if rank == 0:
-        save_adapter(model, args.adapter_file)
+        save_adapter(model, adapter_file)
         print(
-            f"{Colors.OKGREEN}Saved final adapter weights to {args.adapter_file}.{Colors.ENDC}"
+            f"{Colors.OKGREEN}Saved final adapter weights to {adapter_file}.{Colors.ENDC}"
         )

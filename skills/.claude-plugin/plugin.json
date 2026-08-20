@@ -1,0 +1,14 @@
+{
+  "name": "mlx-vlm-skills",
+  "description": "Skills for MLX-VLM: command-line and server inference, convert/quantize, adding new models, benchmarking, contributing, cached-model listing, and reproducible GitHub issues.",
+  "version": "0.1.0",
+  "author": {
+    "name": "MLX-VLM contributors"
+  },
+  "keywords": [
+    "mlx",
+    "mlx-vlm",
+    "vision-language-models",
+    "apple-silicon"
+  ]
+}

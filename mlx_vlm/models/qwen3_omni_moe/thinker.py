@@ -47,26 +47,32 @@ class Thinker(nn.Module):
         feature_attention_mask: Optional[mx.array] = None,
         audio_feature_lengths: Optional[mx.array] = None,
     ):
-        if feature_attention_mask is not None:
+        if input_features.ndim == 3:
+            # (B, mel, T) -> (B, T, mel); select each item's valid mel frames.
             input_features = mx.transpose(input_features, (0, 2, 1))
-            audio_feature_lengths = mx.sum(feature_attention_mask, axis=1)
-            mask_bool = feature_attention_mask.astype(mx.bool_)
-            batch_size, seq_len, hidden_dim = input_features.shape
-            input_features_flat = mx.reshape(input_features, (-1, hidden_dim))
-            mask_flat = mx.reshape(mask_bool, (-1,))
-            indices = mx.array(np.where(mask_flat)[0])
-            input_features = mx.take(input_features_flat, indices, axis=0)
-            input_features = mx.transpose(input_features, (1, 0))
+            batch_size, mel_frames, hidden_dim = input_features.shape
 
-        feature_lens = (
-            audio_feature_lengths
-            if audio_feature_lengths is not None
-            else (
-                mx.sum(feature_attention_mask, axis=-1)
-                if feature_attention_mask is not None
-                else None
-            )
-        )
+            if audio_feature_lengths is None:
+                if feature_attention_mask is not None:
+                    lengths = mx.sum(feature_attention_mask, axis=-1)
+                    # feature_attention_mask is sample-domain; convert its per-item
+                    # sum to mel frames via the mask/mel ratio (the hop length).
+                    mask_len = feature_attention_mask.shape[-1]
+                    if mask_len > mel_frames:
+                        lengths = lengths // (mask_len // mel_frames)
+                    audio_feature_lengths = lengths
+                else:
+                    audio_feature_lengths = mx.full(
+                        (batch_size,), mel_frames, dtype=mx.int32
+                    )
+
+            lens = [int(v) for v in np.array(audio_feature_lengths)]
+            segments = [input_features[i, : lens[i]] for i in range(batch_size)]
+            input_features = mx.transpose(mx.concatenate(segments, axis=0), (1, 0))
+            feature_lens = mx.array(lens, dtype=mx.int32)
+        else:
+            feature_lens = audio_feature_lengths
+
         audio_outputs = self.audio_tower(
             input_features,
             feature_lens=feature_lens,
@@ -140,7 +146,6 @@ class Thinker(nn.Module):
     ):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
         visual_pos_masks = None
-        deepstack_visual_embeds = None
         visual_embeds_multiscale = None
 
         if input_features is not None:
@@ -267,10 +272,19 @@ class Thinker(nn.Module):
                     visual_embeds_multiscale_joint.append(embed_joint)
                 visual_embeds_multiscale = tuple(visual_embeds_multiscale_joint)
 
+        mask = kwargs.get("mask", None)
+        position_ids, rope_deltas = self.language_model.get_rope_index(
+            input_ids, image_grid_thw, video_grid_thw, mask
+        )
+        if image_grid_thw is None and video_grid_thw is None and position_ids.ndim == 3:
+            position_ids = position_ids[0]
+
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds,
             visual_pos_masks=visual_pos_masks,
-            deepstack_visual_embeds=deepstack_visual_embeds,
+            deepstack_visual_embeds=visual_embeds_multiscale,
+            position_ids=position_ids,
+            rope_deltas=rope_deltas,
         )
 
     @staticmethod
@@ -316,17 +330,16 @@ class Thinker(nn.Module):
         feature_attention_mask = kwargs.pop("feature_attention_mask", None)
         audio_feature_lengths = kwargs.pop("audio_feature_lengths", None)
 
-        inputs_embeds, visual_pos_masks, deepstack_visual_embeds = (
-            self.get_input_embeddings(
-                input_ids,
-                pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                input_features=input_features,
-                feature_attention_mask=feature_attention_mask,
-                audio_feature_lengths=audio_feature_lengths,
-            )
+        input_embedding_features = self.get_input_embeddings(
+            input_ids,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            input_features=input_features,
+            feature_attention_mask=feature_attention_mask,
+            audio_feature_lengths=audio_feature_lengths,
+            mask=mask,
         )
 
         kwargs = {
@@ -334,14 +347,11 @@ class Thinker(nn.Module):
             "pixel_values_videos": pixel_values_videos,
             "image_grid_thw": image_grid_thw,
             "video_grid_thw": video_grid_thw,
-            "visual_pos_masks": visual_pos_masks,
-            "deepstack_visual_embeds": deepstack_visual_embeds,
+            **input_embedding_features.to_dict(),
             **kwargs,
         }
 
-        logits = self.language_model(
-            input_ids, inputs_embeds, mask=mask, cache=cache, **kwargs
-        )
+        logits = self.language_model(input_ids, mask=mask, cache=cache, **kwargs)
 
         return logits
 

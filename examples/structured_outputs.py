@@ -12,7 +12,7 @@ except ImportError:
     sys.exit(1)
 
 from mlx_vlm import generate, load, stream_generate
-from mlx_vlm.video_generate import process_vision_info
+from mlx_vlm.utils import load_image
 
 # need install outlines with version 1.1.1, uv pip install outlines==1.1.1
 
@@ -52,7 +52,7 @@ messages = [
 ]
 
 # Process vision inputs and generate prompt
-image_inputs, video_inputs = process_vision_info(messages)
+image_inputs = [load_image(image_path)]
 input_prompt = processor.tokenizer.apply_chat_template(
     messages,
     tokenize=False,
@@ -62,7 +62,6 @@ input_prompt = processor.tokenizer.apply_chat_template(
 inputs = processor(
     text=[input_prompt],
     images=image_inputs,
-    videos=video_inputs,
     padding=True,
     return_tensors="pt",
 )

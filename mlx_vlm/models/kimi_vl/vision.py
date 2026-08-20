@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -12,13 +12,14 @@ def _as_hw_shapes(grid_hws) -> List[Tuple[int, int]]:
     return [(int(shape[0]), int(shape[1])) for shape in raw_shapes]
 
 
+def _resolve_hw_shapes(grid_hws, grid_shapes=None) -> List[Tuple[int, int]]:
+    return _as_hw_shapes(grid_shapes if grid_shapes is not None else grid_hws)
+
+
 def make_block_attention_mask(cu_seqlens: mx.array, seq_length: int) -> mx.array:
-    attention_mask = mx.zeros((seq_length, seq_length), dtype=mx.bool_)
-    for i in range(1, len(cu_seqlens)):
-        start = int(cu_seqlens[i - 1])
-        end = int(cu_seqlens[i])
-        attention_mask[start:end, start:end] = True
-    return attention_mask
+    pos = mx.arange(seq_length)
+    block_id = mx.sum(pos[None, :] >= cu_seqlens[1:, None], axis=0)
+    return block_id[:, None] == block_id[None, :]
 
 
 def check_array_shape(arr):
@@ -72,7 +73,8 @@ class VisionRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (
             self.theta ** (mx.arange(0, self.dim, 2, dtype=mx.float32) / self.dim)
         )
-        seq = mx.arange(seqlen.tolist(), dtype=inv_freq.dtype)
+        n = int(seqlen) if not isinstance(seqlen, int) else seqlen
+        seq = mx.arange(n, dtype=inv_freq.dtype)
         freqs = mx.outer(seq, inv_freq)
         return freqs
 
@@ -86,31 +88,24 @@ class Learnable2DInterpPosEmb(nn.Module):
         self.width = width
         self.interpolation_mode = interpolation_mode
         self.weight = mx.ones((height, width, dim))
-        self._interp_cache: Dict[Tuple[int, int], mx.array] = {}
 
     def _get_pos_emb(self, shape: Tuple[int, int]) -> mx.array:
-        cached = self._interp_cache.get(shape)
-        if cached is not None:
-            return cached
-
         if shape == self.weight.shape[:-1]:
-            cached = self.weight.flatten(end_axis=1)
-        else:
-            cached = (
-                bicubic_interpolate(
-                    mx.expand_dims(self.weight.transpose(2, 0, 1), axis=0),
-                    size=shape,
-                )
-                .squeeze(0)
-                .transpose(1, 2, 0)
-                .flatten(end_axis=1)
+            return self.weight.flatten(end_axis=1)
+
+        return (
+            bicubic_interpolate(
+                mx.expand_dims(self.weight.transpose(2, 0, 1), axis=0),
+                size=shape,
             )
+            .squeeze(0)
+            .transpose(1, 2, 0)
+            .flatten(end_axis=1)
+        )
 
-        self._interp_cache[shape] = cached
-        return cached
-
-    def __call__(self, x: mx.array, grid_hws: mx.array) -> mx.array:
-        pos_embs = [self._get_pos_emb(shape) for shape in _as_hw_shapes(grid_hws)]
+    def __call__(self, x: mx.array, grid_hws: mx.array, grid_shapes=None) -> mx.array:
+        shapes = _resolve_hw_shapes(grid_hws, grid_shapes)
+        pos_embs = [self._get_pos_emb(shape) for shape in shapes]
         out = x + mx.concatenate(pos_embs, axis=0).astype(x.dtype)
         return out
 
@@ -140,10 +135,12 @@ class PatchEmbed(nn.Module):
             height=init_pos_emb_height, width=init_pos_emb_height, dim=embed_dim
         )
 
-    def __call__(self, hidden_states: mx.array, grid_thw: mx.array) -> mx.array:
+    def __call__(
+        self, hidden_states: mx.array, grid_thw: mx.array, grid_shapes=None
+    ) -> mx.array:
         hidden_states = self.proj(hidden_states).swapaxes(1, 3)
         hidden_states = hidden_states.reshape(hidden_states.shape[0], -1)
-        hidden_states = self.pos_emb(hidden_states, grid_thw)
+        hidden_states = self.pos_emb(hidden_states, grid_thw, grid_shapes=grid_shapes)
         return hidden_states
 
 
@@ -310,9 +307,6 @@ class Rope2DPosEmb(nn.Module):
         self.max_width = max_width
         self.theta_base = theta_base
 
-        self._freqs_cis = None
-        self._shape_freqs_cache: Dict[Tuple[int, int], mx.array] = {}
-
     def extra_repr(self):
         return f"dim={self.dim}, max_height={self.max_height}, max_width={self.max_width}, theta_base={self.theta_base}"
 
@@ -352,7 +346,7 @@ class Rope2DPosEmb(nn.Module):
         freqs_cis = freqs_cis.reshape(self.max_height, self.max_width, -1)
         return freqs_cis
 
-    def get_freqs_cis(self, grid_hws: mx.array) -> mx.array:
+    def get_freqs_cis(self, grid_hws: mx.array, grid_shapes=None) -> mx.array:
         """
         Args:
             grid_hws (mx.array): grid height and width
@@ -360,10 +354,8 @@ class Rope2DPosEmb(nn.Module):
         Returns:
             freqs_cis: array of shape (sum(t * height * width), dim//2)
         """
-        if self._freqs_cis is None:
-            self._freqs_cis = self._precompute_freqs_cis()
-
-        shapes = _as_hw_shapes(grid_hws)
+        freqs_cis_full = self._precompute_freqs_cis()
+        shapes = _resolve_hw_shapes(grid_hws, grid_shapes)
         assert all(
             1 <= h <= self.max_height and 1 <= w <= self.max_width for h, w in shapes
         ), (
@@ -373,13 +365,8 @@ class Rope2DPosEmb(nn.Module):
         )
 
         freqs_cis_list = []
-        for shape in shapes:
-            cached = self._shape_freqs_cache.get(shape)
-            if cached is None:
-                h, w = shape
-                cached = self._freqs_cis[:h, :w].reshape(-1, self.dim // 2)
-                self._shape_freqs_cache[shape] = cached
-            freqs_cis_list.append(cached)
+        for h, w in shapes:
+            freqs_cis_list.append(freqs_cis_full[:h, :w].reshape(-1, self.dim // 2))
 
         freqs_cis = mx.concatenate(freqs_cis_list, axis=0)
         return freqs_cis
@@ -389,10 +376,11 @@ def patch_merger(
     x: mx.array,
     grid_hws: Sequence[Tuple[int, int]],
     merge_kernel_size: list[int, int] = (2, 2),
+    grid_shapes=None,
 ) -> List[mx.array]:
     d_model = x.shape[-1]
     kernel_height, kernel_width = merge_kernel_size
-    shapes = _as_hw_shapes(grid_hws)
+    shapes = _resolve_hw_shapes(grid_hws, grid_shapes)
 
     lengths = [h * w for h, w in shapes]
     split_points = []
@@ -447,10 +435,15 @@ class VisionModel(nn.Module):
         hidden_states: mx.array,
         grid_thw: mx.array,
         output_hidden_states: Optional[bool] = None,
+        grid_shapes: Optional[List[Tuple[int, int]]] = None,
     ) -> mx.array:
 
-        hidden_states = self.patch_embed(hidden_states, grid_thw)
-        rotary_pos_emb = self.rope_pos_emb.get_freqs_cis(grid_thw)
+        hidden_states = self.patch_embed(
+            hidden_states, grid_thw, grid_shapes=grid_shapes
+        )
+        rotary_pos_emb = self.rope_pos_emb.get_freqs_cis(
+            grid_thw, grid_shapes=grid_shapes
+        )
 
         # Calculate cu_seqlens for each item in the batch
         lengths = mx.concatenate(
@@ -477,7 +470,10 @@ class VisionModel(nn.Module):
         hidden_states = self.final_layernorm(hidden_states)
 
         hidden_states = patch_merger(
-            hidden_states, grid_thw, merge_kernel_size=self.merge_kernel_size
+            hidden_states,
+            grid_thw,
+            merge_kernel_size=self.merge_kernel_size,
+            grid_shapes=grid_shapes,
         )
 
         return hidden_states

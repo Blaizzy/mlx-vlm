@@ -4,10 +4,13 @@ from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.base import create_attention_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache
 
-from ..base import LanguageModelOutput
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
+from ..cache import KVCache
 from .config import TextConfig
 
 
@@ -265,7 +268,8 @@ class LanguageModel(nn.Module):
             cache = [None] * len(self.layers)
 
         # Create causal attention mask
-        mask = create_attention_mask(x, cache)
+        if mask is None:
+            mask = create_attention_mask(x, cache)
 
         for i, layer in enumerate(self.layers):
             x = layer(x, mask=mask, cache=cache[i])

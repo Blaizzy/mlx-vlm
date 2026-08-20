@@ -25,6 +25,7 @@ from transformers.image_utils import (
 )
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
+from transformers.video_processing_utils import BaseVideoProcessor
 
 from ..base import load_chat_template, to_mlx
 
@@ -47,6 +48,57 @@ def _to_channel_first(image, input_format):
     if input_format == ChannelDimension.LAST:
         return np.transpose(image, (2, 0, 1))
     return image
+
+
+def _convert_video_to_patches(video: np.ndarray, patch_size: int):
+    num_frames, channels, height, width = video.shape
+    patch_height = height // patch_size
+    patch_width = width // patch_size
+    patches = video.reshape(
+        num_frames,
+        channels,
+        patch_height,
+        patch_size,
+        patch_width,
+        patch_size,
+    )
+    patches = patches.transpose(0, 2, 4, 3, 5, 1)
+    patches = patches.reshape(
+        num_frames,
+        patch_height * patch_width,
+        patch_size * patch_size * channels,
+    )
+
+    grid = np.meshgrid(
+        np.arange(patch_width, dtype=np.int64),
+        np.arange(patch_height, dtype=np.int64),
+        indexing="xy",
+    )
+    positions = np.stack(grid, axis=-1).reshape(-1, 2)
+    positions = np.repeat(positions[None], num_frames, axis=0)
+    return patches.astype(np.float32), positions
+
+
+def _pad_video_patches(patches: np.ndarray, positions: np.ndarray, target_length: int):
+    current_length = patches.shape[1]
+    if current_length > target_length:
+        return patches[:, :target_length], positions[:, :target_length]
+    padding_length = target_length - current_length
+    if padding_length == 0:
+        return patches, positions
+    patches = np.pad(
+        patches,
+        ((0, 0), (0, padding_length), (0, 0)),
+        mode="constant",
+        constant_values=0,
+    )
+    positions = np.pad(
+        positions,
+        ((0, 0), (0, padding_length), (0, 0)),
+        mode="constant",
+        constant_values=-1,
+    )
+    return patches, positions
 
 
 class Gemma4ImageProcessor(HFBaseImageProcessor):
@@ -210,17 +262,16 @@ class Gemma4ImageProcessor(HFBaseImageProcessor):
         return self.preprocess(images, **kwargs)
 
 
-class Gemma4VideoProcessor:
+class Gemma4VideoProcessor(BaseVideoProcessor):
     """Video processor for Gemma 4.
 
     Samples frames, applies the same aspect-ratio preserving resize as images
     (with a smaller per-frame token budget), rescales to [0, 1], and returns
-    channel-first pixel tensors stacked across frames. The existing
-    ``vision_tower`` internally patchifies each frame, so we output regular
-    (N_frames, C, H, W) tensors rather than pre-patched ones.
+    padded model patches plus per-patch position IDs. This matches the
+    Transformers Gemma 4 video preprocessing contract.
     """
 
-    model_input_names = ["pixel_values_videos"]
+    model_input_names = ["pixel_values_videos", "video_position_ids"]
 
     def __init__(
         self,
@@ -228,13 +279,16 @@ class Gemma4VideoProcessor:
         max_soft_tokens: int = 70,
         pooling_kernel_size: int = 3,
         num_frames: int = 32,
+        do_resize: bool = True,
         do_rescale: bool = True,
         rescale_factor: float = 1 / 255,
         do_normalize: bool = False,
         image_mean: Optional[list] = None,
         image_std: Optional[list] = None,
         default_fps: float = 2.0,
+        **kwargs,
     ):
+        # Ignore extra HF processor's config keys this processor doesn't consume.
         if max_soft_tokens not in _SUPPORTED_SOFT_TOKENS:
             raise ValueError(
                 f"`max_soft_tokens` must be one of {_SUPPORTED_SOFT_TOKENS}, "
@@ -244,6 +298,7 @@ class Gemma4VideoProcessor:
         self.max_soft_tokens = max_soft_tokens
         self.pooling_kernel_size = pooling_kernel_size
         self.num_frames = num_frames
+        self.do_resize = do_resize
         self.do_rescale = do_rescale
         self.rescale_factor = rescale_factor
         self.do_normalize = do_normalize
@@ -299,10 +354,11 @@ class Gemma4VideoProcessor:
 
         Returns:
             dict with:
-              - pixel_values_videos: np.ndarray (N_total_frames, C, H, W)
-                where all frames share the same H/W (one video at a time
-                preserves sizes; cross-video sizes may differ so we return a
-                list in that case)
+              - pixel_values_videos: np.ndarray (N_videos, N_frames,
+                max_patches, patch_size * patch_size * C), or a list when
+                videos have different frame counts
+              - video_position_ids: np.ndarray (N_videos, N_frames,
+                max_patches, 2), or a list matching pixel_values_videos
               - num_frames_per_video: list[int]
               - num_soft_tokens_per_frame: list[int] (one per video)
               - frame_timestamps: list[list[float]] seconds per frame
@@ -318,6 +374,7 @@ class Gemma4VideoProcessor:
             fps = [fps] * len(videos)
 
         processed = []
+        processed_positions = []
         num_frames_per_video = []
         num_soft_tokens_per_frame = []
         frame_timestamps = []
@@ -331,7 +388,8 @@ class Gemma4VideoProcessor:
                 )
 
             video = self._sample_frames(video, self.num_frames)
-            video = self._resize_frames(video, max_patches)
+            if self.do_resize:
+                video = self._resize_frames(video, max_patches)
 
             video_f = video.astype(np.float32)
             if self.do_rescale and video.dtype == np.uint8:
@@ -342,26 +400,34 @@ class Gemma4VideoProcessor:
                 std = np.array(self.image_std, dtype=np.float32)[:, None, None]
                 video_f = (video_f - mean) / std
 
-            T, _, H, W = video_f.shape
-            num_patches = (H // self.patch_size) * (W // self.patch_size)
-            tokens_per_frame = num_patches // (self.pooling_kernel_size**2)
+            patches, positions = _convert_video_to_patches(video_f, self.patch_size)
+            real_patches = min(patches.shape[1], max_patches)
+            tokens_per_frame = real_patches // (self.pooling_kernel_size**2)
+            patches, positions = _pad_video_patches(patches, positions, max_patches)
 
-            processed.append(video_f)
-            num_frames_per_video.append(T)
+            processed.append(patches)
+            processed_positions.append(positions)
+            num_frames_per_video.append(video_f.shape[0])
             num_soft_tokens_per_frame.append(int(tokens_per_frame))
             sr = fps[i] if fps[i] and fps[i] > 0 else self.default_fps
-            frame_timestamps.append([float(j) / float(sr) for j in range(T)])
+            frame_timestamps.append(
+                [float(j) / float(sr) for j in range(video_f.shape[0])]
+            )
 
-        shapes = {v.shape[1:] for v in processed}
+        shapes = {v.shape for v in processed}
         if len(shapes) == 1:
-            pixel_values_videos = np.concatenate(processed, axis=0)
+            pixel_values_videos = np.stack(processed)
+            video_position_ids = np.stack(processed_positions)
         else:
             pixel_values_videos = processed
+            video_position_ids = processed_positions
 
         return {
             "pixel_values_videos": pixel_values_videos,
+            "video_position_ids": video_position_ids,
             "num_frames_per_video": num_frames_per_video,
             "num_soft_tokens_per_frame": num_soft_tokens_per_frame,
+            "num_soft_tokens_per_video": num_soft_tokens_per_frame,
             "frame_timestamps": frame_timestamps,
         }
 
@@ -369,22 +435,31 @@ class Gemma4VideoProcessor:
 class Gemma4Processor(ProcessorMixin):
     """Combined processor for Gemma 4 (image + text + audio + video)."""
 
-    attributes = ["image_processor", "tokenizer"]
+    model_type = "gemma4"
+    attributes = ["image_processor", "tokenizer", "video_processor"]
     image_processor_class = "Gemma4ImageProcessor"
     tokenizer_class = "AutoTokenizer"
+    video_processor_class = "Gemma4VideoProcessor"
     valid_kwargs = ["chat_template", "image_seq_length", "audio_seq_length"]
+
+    # Transformers resolves expected processor base classes at runtime. In
+    # torch-free environments, `transformers.BaseVideoProcessor` can point to a
+    # dummy torchvision object even though `video_processing_utils` exposes the
+    # real base class our numpy processor subclasses.
+    def check_argument_for_proper_class(self, argument_name, argument):
+        return type(argument)
 
     def __init__(
         self,
         image_processor=None,
         tokenizer=None,
+        video_processor=None,
         chat_template=None,
         image_seq_length: int = 280,
         audio_seq_length: int = 750,
         **kwargs,
     ):
         feature_extractor = kwargs.pop("feature_extractor", None)
-        video_processor = kwargs.pop("video_processor", None)
 
         if image_processor is None:
             image_processor = Gemma4ImageProcessor()
@@ -436,12 +511,12 @@ class Gemma4Processor(ProcessorMixin):
         super().__init__(
             image_processor=image_processor,
             tokenizer=tokenizer,
+            video_processor=video_processor,
             chat_template=chat_template,
             **kwargs,
         )
 
         self.feature_extractor = feature_extractor
-        self.video_processor = video_processor
 
     def _compute_audio_num_tokens(self, audio_waveform, sampling_rate: int) -> int:
         """Compute number of audio soft tokens from waveform duration.
@@ -467,6 +542,7 @@ class Gemma4Processor(ProcessorMixin):
         audio: Optional[List] = None,
         videos: Optional[List] = None,
         fps: Optional[Union[float, List[float]]] = None,
+        return_mm_token_type_ids: bool = True,
         **kwargs,
     ) -> BatchFeature:
         if text is None and images is None and audio is None and videos is None:
@@ -487,10 +563,15 @@ class Gemma4Processor(ProcessorMixin):
             )
 
         # ── Process images ──────────────────────────────────────────────
+        image_kwargs = dict(kwargs.pop("images_kwargs", None) or {})
+        for _k in ("max_soft_tokens", "patch_size", "pooling_kernel_size"):
+            if _k in kwargs:
+                image_kwargs[_k] = kwargs.pop(_k)
+
         image_inputs = {}
         if images is not None:
             images = self.image_processor.fetch_images(images)
-            image_data, num_soft_tokens = self.image_processor(images)
+            image_data, num_soft_tokens = self.image_processor(images, **image_kwargs)
             image_inputs = image_data
 
             if text is not None and num_soft_tokens is not None:
@@ -548,6 +629,8 @@ class Gemma4Processor(ProcessorMixin):
 
             pvv = video_data["pixel_values_videos"]
             video_inputs["pixel_values_videos"] = pvv
+            if "video_position_ids" in video_data:
+                video_inputs["video_position_ids"] = video_data["video_position_ids"]
             video_inputs["num_frames_per_video"] = num_frames_per_video
 
         # ── Process audio ───────────────────────────────────────────────
@@ -602,8 +685,6 @@ class Gemma4Processor(ProcessorMixin):
             ]
 
         # ── Tokenize text ───────────────────────────────────────────────
-        # Pop return_mm_token_type_ids before passing remaining kwargs to tokenizer
-        return_mm_token_type_ids = kwargs.pop("return_mm_token_type_ids", False)
         text_inputs = self.tokenizer(text=text, **kwargs)
 
         # Generate multimodal token type IDs
@@ -612,11 +693,11 @@ class Gemma4Processor(ProcessorMixin):
             mm_token_type_ids = np.zeros_like(array_ids)
             if self.image_token_id is not None:
                 mm_token_type_ids[array_ids == self.image_token_id] = 1
-            if self.audio_token_id is not None:
-                mm_token_type_ids[array_ids == self.audio_token_id] = 2
             if self.video_token_id is not None:
-                mm_token_type_ids[array_ids == self.video_token_id] = 3
-            text_inputs["token_type_ids"] = mm_token_type_ids.tolist()
+                mm_token_type_ids[array_ids == self.video_token_id] = 2
+            if self.audio_token_id is not None:
+                mm_token_type_ids[array_ids == self.audio_token_id] = 3
+            text_inputs["mm_token_type_ids"] = mm_token_type_ids.tolist()
 
         # num_frames_per_video is Python-side metadata; keep it out of to_mlx
         video_meta = {}
@@ -653,10 +734,144 @@ class Gemma4Processor(ProcessorMixin):
                 config.setdefault("audio_ms_per_token", self.audio_ms_per_token)
                 config_path.write_text(json.dumps(config, indent=2))
 
+    def _extract_media_from_messages(self, messages):
+        images, audio, videos = [], [], []
+        counts = {"images": 0, "audio": 0, "videos": 0}
+
+        def _source(item, *keys):
+            for key in keys:
+                value = item.get(key)
+                if isinstance(value, dict):
+                    value = (
+                        value.get("url")
+                        or value.get("path")
+                        or value.get("data")
+                        or value.get("bytes")
+                    )
+                if value is not None:
+                    return value
+            return None
+
+        def _walk(content):
+            if not isinstance(content, list):
+                return
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if item_type in {"image", "input_image", "image_url"}:
+                    counts["images"] += 1
+                    src = _source(item, "image", "image_url", "url")
+                    if src is not None:
+                        images.append(src)
+                elif item_type in {"audio", "input_audio", "audio_url"}:
+                    counts["audio"] += 1
+                    src = _source(item, "audio", "input_audio", "audio_url", "url")
+                    if src is not None:
+                        audio.append(src)
+                elif item_type in {"video", "input_video", "video_url"}:
+                    counts["videos"] += 1
+                    src = _source(item, "video", "input_video", "video_url", "url")
+                    if src is not None:
+                        videos.append(src)
+
+        if isinstance(messages, dict):
+            _walk(messages.get("content"))
+        elif isinstance(messages, list):
+            for message in messages:
+                if isinstance(message, dict):
+                    _walk(message.get("content"))
+
+        return images, audio, videos, counts
+
+    @staticmethod
+    def _as_list(value):
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        return [value]
+
     def apply_chat_template(self, messages, **kwargs):
+        """Render Gemma 4 multimodal chat and optionally prepare MLX inputs.
+
+        Hugging Face tokenizers only render text. For Gemma 4 processors we also
+        accept image/audio/video payloads embedded in message content and, when
+        requested, return the full multimodal tensor dictionary.
+        """
+        from ...prompt_utils import apply_chat_template as _apply_chat_template
+        from ...utils import prepare_inputs
+
         kwargs.setdefault("enable_thinking", False)
-        kwargs.setdefault("tokenize", False)
-        return self.tokenizer.apply_chat_template(messages, **kwargs)
+        tokenize = kwargs.pop("tokenize", False)
+        return_dict = kwargs.pop("return_dict", False)
+        return_tensors = kwargs.pop("return_tensors", "mlx")
+        add_generation_prompt = kwargs.pop("add_generation_prompt", True)
+
+        explicit_images = kwargs.pop("images", None)
+        explicit_images = kwargs.pop("image", explicit_images)
+        explicit_audio = kwargs.pop("audio", None)
+        explicit_videos = kwargs.pop("videos", None)
+        explicit_videos = kwargs.pop("video", explicit_videos)
+
+        processor_kwargs = {}
+        for key in (
+            "padding",
+            "padding_side",
+            "pad_to_uniform_size",
+            "resize_shape",
+            "return_mm_token_type_ids",
+            "truncation",
+            "max_length",
+            "fps",
+        ):
+            if key in kwargs:
+                processor_kwargs[key] = kwargs.pop(key)
+
+        extracted_images, extracted_audio, extracted_videos, counts = (
+            self._extract_media_from_messages(messages)
+        )
+        images = self._as_list(explicit_images) or extracted_images
+        audio = self._as_list(explicit_audio) or extracted_audio
+        videos = self._as_list(explicit_videos) or extracted_videos
+
+        num_images = counts["images"] or len(images)
+        num_audios = counts["audio"] or len(audio)
+
+        model_type = getattr(self, "model_type", "gemma4")
+        template_kwargs = dict(kwargs)
+        if videos:
+            template_kwargs["video"] = videos
+            if "fps" in processor_kwargs:
+                template_kwargs["fps"] = processor_kwargs["fps"]
+        prompt = _apply_chat_template(
+            self.tokenizer,
+            {"model_type": model_type},
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            num_images=num_images,
+            num_audios=num_audios,
+            **template_kwargs,
+        )
+
+        if not tokenize:
+            return prompt
+
+        inputs = prepare_inputs(
+            self,
+            images=images or None,
+            audio=audio or None,
+            videos=videos or None,
+            prompts=prompt,
+            return_tensors=return_tensors,
+            add_special_tokens=False,
+            **processor_kwargs,
+        )
+        if return_dict:
+            return inputs
+        return inputs["input_ids"]
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)
@@ -666,9 +881,16 @@ class Gemma4Processor(ProcessorMixin):
 
     @property
     def model_input_names(self):
-        tokenizer_input_names = self.tokenizer.model_input_names + ["token_type_ids"]
+        tokenizer_input_names = self.tokenizer.model_input_names + ["mm_token_type_ids"]
         image_processor_input_names = self.image_processor.model_input_names
-        all_names = list(tokenizer_input_names + image_processor_input_names)
+        video_processor_input_names = getattr(
+            getattr(self, "video_processor", None), "model_input_names", []
+        )
+        all_names = list(
+            tokenizer_input_names
+            + image_processor_input_names
+            + video_processor_input_names
+        )
         return list(dict.fromkeys(all_names))
 
     @classmethod
@@ -678,7 +900,7 @@ class Gemma4Processor(ProcessorMixin):
 
         from transformers import AutoTokenizer
 
-        kwargs.pop("trust_remote_code", None)
+        trust_remote_code = kwargs.pop("trust_remote_code", True)
         kwargs.pop("use_fast", None)
 
         model_path = Path(pretrained_model_name_or_path)
@@ -686,7 +908,7 @@ class Gemma4Processor(ProcessorMixin):
 
         tokenizer = AutoTokenizer.from_pretrained(
             str(model_path) if is_local else pretrained_model_name_or_path,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             local_files_only=is_local,
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)
@@ -695,6 +917,7 @@ class Gemma4Processor(ProcessorMixin):
         proc_config = {}
         ip_config = {}
         fe_config = {}
+        vp_config = {}
 
         def _load_json(path):
             if path.exists():
@@ -738,7 +961,7 @@ class Gemma4Processor(ProcessorMixin):
         if "image_processor" in proc_config and isinstance(
             proc_config["image_processor"], dict
         ):
-            ip_config = proc_config["image_processor"]
+            ip_config = dict(proc_config["image_processor"])
             ip_config.pop("image_processor_type", None)
         elif "image_processor_type" not in proc_config and any(
             k in proc_config
@@ -766,10 +989,17 @@ class Gemma4Processor(ProcessorMixin):
         if "feature_extractor" in proc_config and isinstance(
             proc_config["feature_extractor"], dict
         ):
-            fe_config = proc_config["feature_extractor"]
+            fe_config = dict(proc_config["feature_extractor"])
             fe_config.pop("feature_extractor_type", None)
 
+        if "video_processor" in proc_config and isinstance(
+            proc_config["video_processor"], dict
+        ):
+            vp_config = dict(proc_config["video_processor"])
+            vp_config.pop("video_processor_type", None)
+
         image_processor = Gemma4ImageProcessor(**ip_config)
+        video_processor = Gemma4VideoProcessor(**vp_config)
 
         # Load audio feature extractor.
         # The standard HF checkpoint does not include a "feature_extractor" key
@@ -795,6 +1025,7 @@ class Gemma4Processor(ProcessorMixin):
         return cls(
             image_processor=image_processor,
             tokenizer=tokenizer,
+            video_processor=video_processor,
             image_seq_length=image_seq_length,
             audio_seq_length=audio_seq_length,
             audio_ms_per_token=audio_ms_per_token,
@@ -803,7 +1034,7 @@ class Gemma4Processor(ProcessorMixin):
         )
 
 
-__all__ = ["Gemma4ImageProcessor", "Gemma4Processor"]
+__all__ = ["Gemma4ImageProcessor", "Gemma4Processor", "Gemma4VideoProcessor"]
 
 from ..base import install_auto_processor_patch
 

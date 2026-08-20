@@ -247,7 +247,11 @@ class Model(nn.Module):
         self.language_model._rope_deltas = mx.zeros((batch_size, 1), dtype=mx.int32)
 
     def get_vision_embedding(self, pixel_values, tgt_sizes):
-        dtype = self.language_model.model.embed_tokens.weight.dtype
+        # Source dtype from the vision tower's patch embedding so this remains
+        # a float type when the language model is quantized (embed_tokens.weight
+        # is then a packed uint32 storage tensor; casting pixel_values to it
+        # crashes mx.conv2d). Mirrors the convention used by qwen2_vl etc.
+        dtype = self.vision_tower.embeddings.patch_embedding.weight.dtype
 
         if pixel_values is None:
             return []

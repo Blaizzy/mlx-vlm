@@ -8,6 +8,7 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
+from ..rope_utils import initialize_rope
 from .config import TextConfig
 
 
@@ -26,10 +27,12 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=config.attention_bias)
 
-        self.rope = nn.RoPE(
-            head_dim,
-            traditional=config.rope_traditional,
+        self.rope = initialize_rope(
+            dims=head_dim,
             base=config.rope_theta,
+            traditional=config.rope_traditional,
+            scaling_config=config.rope_scaling,
+            max_position_embeddings=config.max_position_embeddings,
         )
 
     def __call__(self, x, mask=None, cache=None):
@@ -55,8 +58,6 @@ class Attention(nn.Module):
 
 
 class SharedMLP(nn.Module):
-    """GraniteMoeHybrid shared MLP with fused gate+up projection."""
-
     def __init__(self, config: TextConfig):
         super().__init__()
         # Fused gate + up projection: output is 2 * intermediate_size
@@ -75,11 +76,32 @@ class SharedMLP(nn.Module):
         return self.output_linear(nn.silu(gate) * x)
 
 
+class MLP(nn.Module):
+    def __init__(self, config: TextConfig):
+        super().__init__()
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=config.mlp_bias
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=config.mlp_bias
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=config.mlp_bias
+        )
+
+    def __call__(self, x) -> mx.array:
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.self_attn = Attention(config)
-        self.shared_mlp = SharedMLP(config)
+        self.use_shared_mlp = config.use_shared_mlp
+        if self.use_shared_mlp:
+            self.shared_mlp = SharedMLP(config)
+        else:
+            self.mlp = MLP(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -89,7 +111,8 @@ class TransformerBlock(nn.Module):
     def __call__(self, x, mask=None, cache=None):
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r * self.residual_multiplier
-        r = self.shared_mlp(self.post_attention_layernorm(h))
+        mlp_fn = self.shared_mlp if self.use_shared_mlp else self.mlp
+        r = mlp_fn(self.post_attention_layernorm(h))
         out = h + r * self.residual_multiplier
         return out
 

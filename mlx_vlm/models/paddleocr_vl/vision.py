@@ -107,19 +107,29 @@ class PaddleOCRVisionEmbeddings(nn.Module):
         patch_pos_embed = patch_pos_embed.reshape(-1, dim)
         return patch_pos_embed
 
-    def __call__(self, hidden_states: mx.array, grid_thw: mx.array) -> mx.array:
-        batch_size, squence_len, channel, patch_size, patch_size = hidden_states.shape
+    def _patch_embed(self, hidden_states: mx.array) -> mx.array:
+        batch_size, sequence_len, channel, patch_height, patch_width = (
+            hidden_states.shape
+        )
         target_dtype = self.patch_embedding.weight.dtype
         hidden_states = hidden_states.reshape(
-            batch_size * squence_len, channel, patch_size, patch_size
+            batch_size * sequence_len, channel, patch_height, patch_width
         )
         # For MLX-Conv2d
         hidden_states = hidden_states.transpose(0, 2, 3, 1)
         patch_embeds = self.patch_embedding(hidden_states).astype(target_dtype)
         patch_embeds = patch_embeds.transpose(0, 3, 1, 2)
         embeddings = patch_embeds.flatten(-2).squeeze(-1)
-        embeddings = embeddings.reshape(batch_size, squence_len, -1)
+        return embeddings.reshape(batch_size, sequence_len, -1)
 
+    def same_grid_batch(self, hidden_states: mx.array, grid_thw: mx.array) -> mx.array:
+        embeddings = self._patch_embed(hidden_states)
+        _, h, w = grid_thw[0].tolist()
+        position_embedding = self.interpolate_pos_encoding(h, w)
+        return embeddings + mx.expand_dims(position_embedding, axis=0)
+
+    def __call__(self, hidden_states: mx.array, grid_thw: mx.array) -> mx.array:
+        embeddings = self._patch_embed(hidden_states)
         start = 0
         embeddings = embeddings.squeeze(0)
         tmp_embeddings = []
@@ -147,30 +157,66 @@ class PaddleOCRProjector(nn.Module):
         self.act = nn.GELU()
         self.linear_2 = nn.Linear(hidden_size, context_dim, bias=True)
 
+    def _project_image(self, x: mx.array, image_grid: mx.array) -> mx.array:
+        x = self.pre_norm(x)
+        t, h, w = image_grid.tolist()
+        d = x.shape[-1]
+        h_block = h // self.spatial_merge_size
+        w_block = w // self.spatial_merge_size
+
+        x = x.reshape(
+            t, h_block, self.spatial_merge_size, w_block, self.spatial_merge_size, d
+        )
+        x = x.transpose(0, 1, 3, 2, 4, 5)
+        x = x.reshape(
+            t * h_block * w_block,
+            self.spatial_merge_size * self.spatial_merge_size * d,
+        )
+
+        hidden_states = self.linear_1(x)
+        hidden_states = self.act(hidden_states)
+        return self.linear_2(hidden_states)
+
+    def same_grid_batch(self, x: mx.array, grid_thw: mx.array) -> mx.array:
+        x = self.pre_norm(x)
+        batch_size = x.shape[0]
+        t, h, w = grid_thw[0].tolist()
+        d = x.shape[-1]
+        h_block = h // self.spatial_merge_size
+        w_block = w // self.spatial_merge_size
+
+        x = x.reshape(
+            batch_size,
+            t,
+            h_block,
+            self.spatial_merge_size,
+            w_block,
+            self.spatial_merge_size,
+            d,
+        )
+        x = x.transpose(0, 1, 2, 4, 3, 5, 6)
+        x = x.reshape(
+            batch_size * t * h_block * w_block,
+            self.spatial_merge_size * self.spatial_merge_size * d,
+        )
+
+        hidden_states = self.linear_1(x)
+        hidden_states = self.act(hidden_states)
+        return self.linear_2(hidden_states)
+
     def __call__(self, x: mx.array, grid_thw: mx.array) -> mx.array:
-        x_chunks = x.split(grid_thw.prod(axis=1).tolist(), axis=0)
+        lengths = [int(length) for length in grid_thw.prod(axis=1).tolist()]
+        split_indices = []
+        offset = 0
+        for length in lengths[:-1]:
+            offset += length
+            split_indices.append(offset)
+
+        x_chunks = mx.split(x, split_indices, axis=0) if split_indices else [x]
 
         processed_features = []
-        for x, image_grid in zip(x_chunks, grid_thw):
-            x = self.pre_norm(x)
-            t, h, w = image_grid.tolist()
-            d = x.shape[-1]
-            h_block = h // self.spatial_merge_size
-            w_block = w // self.spatial_merge_size
-
-            x = x.reshape(
-                t, h_block, self.spatial_merge_size, w_block, self.spatial_merge_size, d
-            )
-            x = x.transpose(0, 1, 3, 2, 4, 5)
-            x = x.reshape(
-                t * h_block * w_block,
-                self.spatial_merge_size * self.spatial_merge_size * d,
-            )
-
-            hidden_states = self.linear_1(x)
-            hidden_states = self.act(hidden_states)
-            hidden_states = self.linear_2(hidden_states)
-            processed_features.append(hidden_states)
+        for image_features, image_grid in zip(x_chunks, grid_thw):
+            processed_features.append(self._project_image(image_features, image_grid))
 
         return mx.concatenate(processed_features, axis=0)
 
@@ -185,23 +231,37 @@ class Attention(nn.Module):
         self.out_proj = nn.Linear(dim, dim)
 
     def __call__(
-        self, x: mx.array, cu_seqlens: mx.array, rotary_pos_emb: mx.array = None
+        self,
+        x: mx.array,
+        cu_seqlens: Optional[mx.array] = None,
+        rotary_pos_emb: mx.array = None,
     ) -> mx.array:
-        seq_length = x.shape[0]
+        unbatched = len(x.shape) == 2
+        if unbatched:
+            x = mx.expand_dims(x, axis=0)
+
+        batch_size, seq_length, _ = x.shape
         qkv = (
-            self.qkv(x).reshape(seq_length, 3, self.num_heads, -1).transpose(1, 0, 2, 3)
+            self.qkv(x)
+            .reshape(batch_size, seq_length, 3, self.num_heads, -1)
+            .transpose(2, 0, 1, 3, 4)
         )
-        q, k, v = mx.split(qkv, 3)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
-        q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
-        k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
+        q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
+        k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
 
-        attention_mask = mx.ones((1, seq_length, seq_length), dtype=x.dtype)
+        attention_mask = None
+        if cu_seqlens is not None:
+            cu_seqlens_list = [int(length) for length in cu_seqlens.tolist()]
+            single_segment = cu_seqlens_list == [0, seq_length]
 
-        for i in range(1, len(cu_seqlens)):
-            start = int(cu_seqlens[i - 1])
-            end = int(cu_seqlens[i])
-            attention_mask[start:end, start:end] = 0
+            if not single_segment:
+                attention_mask = mx.full(
+                    (1, seq_length, seq_length), -float("inf"), dtype=x.dtype
+                )
+                for start, end in zip(cu_seqlens_list[:-1], cu_seqlens_list[1:]):
+                    attention_mask[:, start:end, start:end] = 0
 
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
@@ -211,7 +271,9 @@ class Attention(nn.Module):
             q, k, v, scale=self.scale, mask=attention_mask
         )
         output = output.transpose(0, 2, 1, 3)
-        output = output.reshape(seq_length, -1)
+        output = output.reshape(batch_size, seq_length, -1)
+        if unbatched:
+            output = output.squeeze(0)
         return self.out_proj(output)
 
 
@@ -301,29 +363,96 @@ class VisionModel(nn.Module):
 
         return rotary_pos_emb_full.reshape(pos_ids.shape[0], -1)
 
+    def _use_same_grid_batch_path(
+        self,
+        hidden_states: mx.array,
+        grid_thw: mx.array,
+        output_hidden_states: Optional[bool],
+    ) -> bool:
+        if output_hidden_states:
+            return False
+        if len(hidden_states.shape) != 5:
+            return False
+        if grid_thw.shape[0] <= 1:
+            return False
+        if hidden_states.shape[0] != grid_thw.shape[0]:
+            return False
+
+        grids = [[int(dim) for dim in row] for row in grid_thw.tolist()]
+        first_grid = grids[0]
+        if first_grid[0] != 1:
+            return False
+        if any(grid != first_grid for grid in grids[1:]):
+            return False
+
+        _, h, w = first_grid
+        return hidden_states.shape[1] == h * w
+
+    def _build_cu_seqlens(self, grid_thw: mx.array) -> mx.array:
+        cu_seqlens = []
+        for i in range(grid_thw.shape[0]):
+            seq_len = grid_thw[i, 1] * grid_thw[i, 2]
+            cu_seqlens.append(mx.repeat(seq_len, grid_thw[i, 0]))
+
+        cu_seqlens = mx.concatenate(cu_seqlens)
+        cu_seqlens = mx.cumsum(cu_seqlens.astype(mx.int32), axis=0)
+        return mx.pad(cu_seqlens, (1, 0), mode="constant", constant_values=0)
+
+    def _pack_batch_as_sequence(
+        self, hidden_states: mx.array, grid_thw: mx.array
+    ) -> mx.array:
+        if len(hidden_states.shape) != 5:
+            return hidden_states
+        if grid_thw.shape[0] <= 1:
+            return hidden_states
+        if hidden_states.shape[0] != grid_thw.shape[0]:
+            return hidden_states
+
+        lengths = [int(t) * int(h) * int(w) for t, h, w in grid_thw.tolist()]
+        if any(length != hidden_states.shape[1] for length in lengths):
+            return hidden_states
+
+        batch_size, sequence_len, channels, patch_height, patch_width = (
+            hidden_states.shape
+        )
+        return hidden_states.reshape(
+            1,
+            batch_size * sequence_len,
+            channels,
+            patch_height,
+            patch_width,
+        )
+
+    def _forward_same_grid_batch(
+        self, hidden_states: mx.array, grid_thw: mx.array
+    ) -> mx.array:
+        hidden_states = self.embeddings.same_grid_batch(hidden_states, grid_thw)
+        rotary_pos_emb = self.rot_pos_emb(grid_thw[:1])
+
+        for layer in self.layers:
+            hidden_states = layer(
+                hidden_states, cu_seqlens=None, rotary_pos_emb=rotary_pos_emb
+            )
+
+        hidden_states = self.post_layernorm(hidden_states)
+        return self.projector.same_grid_batch(hidden_states, grid_thw)
+
     def __call__(
         self,
         hidden_states: mx.array,
         grid_thw: mx.array,
         output_hidden_states: Optional[bool] = None,
     ) -> mx.array:
+        if self._use_same_grid_batch_path(
+            hidden_states, grid_thw, output_hidden_states
+        ):
+            return self._forward_same_grid_batch(hidden_states, grid_thw)
+
+        hidden_states = self._pack_batch_as_sequence(hidden_states, grid_thw)
         hidden_states = self.embeddings(hidden_states, grid_thw)
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-        # Assuming grid_thw has shape (batch_size, 3)
-        batch_size = grid_thw.shape[0]
-
-        # Calculate cu_seqlens for each item in the batch
-        cu_seqlens = []
-        for i in range(batch_size):
-            seq_len = grid_thw[i, 1] * grid_thw[i, 2]
-            cu_seqlens.append(mx.repeat(seq_len, grid_thw[i, 0]))
-
-        # Concatenate the cu_seqlens for all items in the batch
-        cu_seqlens = mx.concatenate(cu_seqlens)
-
-        cu_seqlens = mx.cumsum(cu_seqlens.astype(mx.int32), axis=0)
-        cu_seqlens = mx.pad(cu_seqlens, (1, 0), mode="constant", constant_values=0)
+        cu_seqlens = self._build_cu_seqlens(grid_thw)
 
         encoder_states = (hidden_states,) if output_hidden_states else None
         for layer in self.layers:

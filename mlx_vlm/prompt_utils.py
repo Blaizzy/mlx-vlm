@@ -1,3 +1,5 @@
+import inspect
+import json
 from enum import Enum
 from functools import partial
 from typing import Any, Dict, List, Union
@@ -14,10 +16,14 @@ class MessageFormat(Enum):
     LIST_WITH_IMAGE_TYPE_TEXT_IMAGE_LAST = "list_with_image_type_text_image_last"
     IMAGE_TOKEN = "image_token"
     IMAGE_TOKEN_PIPE = "image_token_pipe"
+    IMAGE_PATCH_TOKEN = "image_patch_token"
     START_IMAGE_TOKEN = "start_image_token"
     IMAGE_TOKEN_NEWLINE = "image_token_newline"
+    SINGLE_IMAGE_TOKEN = "single_image_token"
+    IMAGE_TOKEN_WRAPPED = "image_token_wrapped"
     NUMBERED_IMAGE_TOKENS = "numbered_image_tokens"
     PROMPT_ONLY = "prompt_only"
+    TEXT_ONLY = "text_only"
     PROMPT_WITH_IMAGE_TOKEN = "prompt_with_image_token"
     PROMPT_WITH_START_IMAGE_TOKEN = "prompt_with_start_image_token"
     VIDEO_WITH_TEXT = "video_with_text"
@@ -34,15 +40,19 @@ MODEL_CONFIG = {
     "lfm2_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "aya_vision": MessageFormat.LIST_WITH_IMAGE,
     "cohere2_vision": MessageFormat.LIST_WITH_IMAGE,
+    "cohere_compass": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "paddleocr_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen2_vl": MessageFormat.LIST_WITH_IMAGE,
     "qwen2_5_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "zaya1_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "mage_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_omni_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "minicpmo": MessageFormat.IMAGE_TOKEN,
+    "minicpmv4_6": MessageFormat.IMAGE_TOKEN_WRAPPED,
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -50,11 +60,18 @@ MODEL_CONFIG = {
     "dots_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
+    "llmjpvl": MessageFormat.IMAGE_TOKEN,
+    "nemotron_h_nano_omni": MessageFormat.LIST_WITH_IMAGE_TYPE,
+    "nemotronh_nano_omni_reasoning_v3": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
     "kimi_k25": MessageFormat.LIST_WITH_IMAGE,
+    "kimi_k3": MessageFormat.LIST_WITH_IMAGE,
+    "locateanything": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "gemma3": MessageFormat.START_IMAGE_TOKEN,
     "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "gemma4": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
+    "gemma4_unified": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
+    "diffusion_gemma": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "llama4": MessageFormat.LIST_WITH_IMAGE,
     "smolvlm": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "llava": MessageFormat.LIST_WITH_IMAGE,
@@ -65,6 +82,9 @@ MODEL_CONFIG = {
     "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "molmo2": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "molmo_point": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "step3p7": MessageFormat.IMAGE_PATCH_TOKEN,
+    "minimax_m3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "muse_glimmer": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
@@ -75,15 +95,25 @@ MODEL_CONFIG = {
     "deepseek_vl_v2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "deepseekocr_2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "deepseekocr": MessageFormat.IMAGE_TOKEN_NEWLINE,
+    "unlimited-ocr": MessageFormat.SINGLE_IMAGE_TOKEN,
     "phi4-siglip": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "hunyuan_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "youtu_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "inkling": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "inkling_mm_model": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Prompt-only models
     "florence2": MessageFormat.PROMPT_ONLY,
-    "molmo": MessageFormat.PROMPT_ONLY,
+    "plamo2vl": MessageFormat.PROMPT_ONLY,
+    "molmo": MessageFormat.TEXT_ONLY,
+    "moondream2": MessageFormat.PROMPT_ONLY,
     "moondream3": MessageFormat.PROMPT_ONLY,
     "falcon_ocr": MessageFormat.PROMPT_ONLY,
     "paligemma": MessageFormat.PROMPT_WITH_IMAGE_TOKEN,
+    "laguna": MessageFormat.TEXT_ONLY,
+    "nemotron_labs_diffusion": MessageFormat.TEXT_ONLY,
+    "deepseek_v4": MessageFormat.TEXT_ONLY,
+    "hrm_text": MessageFormat.TEXT_ONLY,
+    "minimax_m3": MessageFormat.TEXT_ONLY,
 }
 
 # Models that don't support multi-image
@@ -144,6 +174,48 @@ def _get_role_content(item: Any) -> Union[tuple[str, Any], None]:
     if hasattr(item, "role") and hasattr(item, "content"):
         return getattr(item, "role", "user"), getattr(item, "content", "")
     return None
+
+
+def _content_media_count(content: Any, media_types: tuple[str, ...]) -> int:
+    if not isinstance(content, list):
+        return 0
+    return sum(
+        1
+        for item in content
+        if isinstance(item, dict) and item.get("type") in media_types
+    )
+
+
+def _normalize_tool_message(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy a tool message and normalize fields consumed by chat templates."""
+    normalized = dict(message)
+    tool_calls = normalized.get("tool_calls")
+    if (
+        normalized.get("role") == "assistant"
+        and tool_calls
+        and normalized.get("content") is None
+    ):
+        normalized["content"] = ""
+
+    if tool_calls is None:
+        return normalized
+
+    normalized_calls = []
+    for tool_call in tool_calls:
+        tool_call = dict(tool_call) if isinstance(tool_call, dict) else tool_call
+        if isinstance(tool_call, dict) and "function" in tool_call:
+            function = dict(tool_call["function"])
+            arguments = function.get("arguments", {})
+            if isinstance(arguments, str):
+                try:
+                    function["arguments"] = json.loads(arguments)
+                except (json.JSONDecodeError, TypeError):
+                    function["arguments"] = {}
+            tool_call["function"] = function
+        normalized_calls.append(tool_call)
+
+    normalized["tool_calls"] = normalized_calls
+    return normalized
 
 
 class MessageBuilder:
@@ -225,8 +297,20 @@ class MessageFormatter:
             "qwen3_5_moe",
             "qwen3_omni_moe",
             "gemma4",
+            "gemma4_unified",
+            "diffusion_gemma",
+            "minicpmv4_6",
+            "minimax_m3_vl",
         ] and kwargs.get("video"):
-            return self._format_video_message(prompt, role, **kwargs)
+            return self._format_video_message(
+                prompt,
+                role,
+                skip_image_token,
+                skip_audio_token,
+                num_images,
+                num_audios,
+                **kwargs,
+            )
 
         # Route to appropriate formatter
         formatter_map = {
@@ -252,14 +336,24 @@ class MessageFormatter:
             MessageFormat.IMAGE_TOKEN_PIPE: partial(
                 self._format_with_token, token="<|image|>"
             ),
+            MessageFormat.IMAGE_PATCH_TOKEN: partial(
+                self._format_with_token, token="<im_patch>"
+            ),
             MessageFormat.START_IMAGE_TOKEN: partial(
                 self._format_with_token, token="<start_of_image>", image_first=False
             ),
             MessageFormat.IMAGE_TOKEN_NEWLINE: partial(
                 self._format_with_token, token="<image>\n"
             ),
+            MessageFormat.SINGLE_IMAGE_TOKEN: partial(
+                self._format_with_token, token="<image>", repeat_image_token=False
+            ),
+            MessageFormat.IMAGE_TOKEN_WRAPPED: partial(
+                self._format_with_token, token="(<image>./</image>)\n"
+            ),
             MessageFormat.NUMBERED_IMAGE_TOKENS: self._format_numbered_tokens,
             MessageFormat.PROMPT_ONLY: lambda *args, **kw: prompt,
+            MessageFormat.TEXT_ONLY: self._format_text_only,
             MessageFormat.PROMPT_WITH_IMAGE_TOKEN: lambda *args, **kw: "<image>"
             * num_images
             + prompt,
@@ -303,7 +397,23 @@ class MessageFormatter:
             image_tokens = [image_builder()] * num_images
             content = image_tokens + content if image_first else content + image_tokens
 
+        if role == "user" and not skip_audio_token and num_audios > 0:
+            content = content + [MessageBuilder.audio_message()] * num_audios
+
         return {"role": role, "content": content}
+
+    def _format_text_only(
+        self,
+        prompt: str,
+        role: str,
+        skip_image_token: bool,
+        skip_audio_token: bool,
+        num_images: int,
+        num_audios: int,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Format a regular text-only chat message."""
+        return {"role": role, "content": prompt}
 
     def _format_list_with_image_type(
         self,
@@ -355,13 +465,14 @@ class MessageFormatter:
         num_audios: int,
         token: str,
         image_first: bool = True,
+        repeat_image_token: bool = True,
         **kwargs,
     ) -> Dict[str, Any]:
         """Format with image tokens in the text."""
         content = prompt
 
         if role == "user" and not skip_image_token and num_images > 0:
-            prefix = token * num_images
+            prefix = token * num_images if repeat_image_token else token
             content = f"{prefix}{content}" if image_first else f"{content}{prefix}"
 
         if role == "user" and not skip_audio_token and num_audios > 0:
@@ -435,6 +546,8 @@ class MessageFormatter:
             MessageBuilder.video_message(v, max_pixels, f)
             for v, f in zip(videos, fps_list)
         ]
+        if role == "user" and not skip_audio_token and num_audios > 0:
+            content.extend([MessageBuilder.audio_message()] * num_audios)
         content.append(MessageBuilder.text_message(prompt))
         return {"role": role, "content": content}
 
@@ -502,14 +615,35 @@ def get_chat_template(
 
         return "<image>"
 
-    def _flatten_content(content: Any, image_token: str) -> str:
+    def _get_video_token() -> str:
+        if processor is None:
+            return "<video>"
+
+        video_token = getattr(processor, "video_token", None)
+        if isinstance(video_token, str) and video_token:
+            return video_token
+
+        tokenizer = getattr(processor, "tokenizer", None)
+        video_token = getattr(tokenizer, "video_token", None)
+        if isinstance(video_token, str) and video_token:
+            return video_token
+
+        return "<video>"
+
+    def _flatten_content(content: Any, image_token: str, video_token: str) -> str:
         if isinstance(content, str):
             return content
 
         if isinstance(content, list):
             parts = []
             audio_marker = kwargs.get("audio_token", "<audio>")
-            multimodal_markers = {image_token, audio_marker, "<audio>", "<video>"}
+            multimodal_markers = {
+                image_token,
+                video_token,
+                audio_marker,
+                "<audio>",
+                "<video>",
+            }
             for item in content:
                 if isinstance(item, dict):
                     item_type = item.get("type", "")
@@ -521,8 +655,8 @@ def get_chat_template(
                         parts.append(image_token)
                     elif item_type in ("audio", "input_audio"):
                         parts.append("<audio>")
-                    elif item_type == "video":
-                        parts.append("<video>")
+                    elif item_type in ("video", "input_video", "video_url"):
+                        parts.append(video_token)
                     else:
                         text = item.get("text", "") or item.get("content", "")
                         if text:
@@ -551,6 +685,7 @@ def get_chat_template(
 
     def _messages_to_plain_prompt() -> str:
         image_token = _get_image_token()
+        video_token = _get_video_token()
         normalized = []
 
         for message in messages:
@@ -563,7 +698,7 @@ def get_chat_template(
                     {
                         "role": message.get("role", "user"),
                         "content": _flatten_content(
-                            message.get("content", ""), image_token
+                            message.get("content", ""), image_token, video_token
                         ),
                     }
                 )
@@ -601,6 +736,37 @@ def get_chat_template(
 
     chat_template_override = kwargs.get("chat_template", None)
 
+    def _supports_template_kw(template_processor: Any, name: str) -> bool:
+        try:
+            signature = inspect.signature(template_processor.apply_chat_template)
+        except (TypeError, ValueError):
+            return False
+
+        return name in signature.parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+
+    def _template_references_kw(template_processor: Any, name: str) -> bool:
+        templates = [
+            chat_template_override,
+            getattr(template_processor, "chat_template", None),
+            getattr(
+                getattr(template_processor, "tokenizer", None),
+                "chat_template",
+                None,
+            ),
+        ]
+
+        for template in templates:
+            if isinstance(template, str) and name in template:
+                return True
+            if isinstance(template, dict) and any(
+                isinstance(value, str) and name in value for value in template.values()
+            ):
+                return True
+        return False
+
     try:
         template_processor = None
         if (
@@ -633,12 +799,24 @@ def get_chat_template(
         if template_processor is None:
             return _messages_to_plain_prompt()
 
+        template_kwargs = dict(kwargs)
+        if "enable_thinking" not in template_kwargs and _supports_template_kw(
+            template_processor, "enable_thinking"
+        ):
+            template_kwargs["enable_thinking"] = False
+        if (
+            "thinking_mode" not in template_kwargs
+            and template_kwargs.get("enable_thinking") is True
+            and _template_references_kw(template_processor, "thinking_mode")
+        ):
+            template_kwargs["thinking_mode"] = "enabled"
+
         try:
             return template_processor.apply_chat_template(
                 messages,
                 tokenize=tokenize,
                 add_generation_prompt=add_generation_prompt,
-                **kwargs,
+                **template_kwargs,
             )
         except ValueError as e:
             if chat_template_override is None and _missing_template_error(e):
@@ -677,6 +855,32 @@ def apply_chat_template(
     config = config if isinstance(config, dict) else config.__dict__
     model_type = config["model_type"]
 
+    # Use standard formatting for text-only models.
+    if model_type.lower() not in MODEL_CONFIG:
+        if isinstance(prompt, str):
+            messages = [{"role": "user", "content": prompt}]
+        elif isinstance(prompt, dict):
+            msg = dict(prompt)
+            msg["content"] = extract_text_from_content(msg.get("content", ""))
+            messages = [msg]
+        elif isinstance(prompt, list):
+            messages = []
+            for item in prompt:
+                if isinstance(item, str):
+                    messages.append({"role": "user", "content": item})
+                elif (role_content := _get_role_content(item)) is not None:
+                    role, content = role_content
+                    msg = dict(item) if isinstance(item, dict) else {"role": role}
+                    if role != "tool":
+                        msg["content"] = extract_text_from_content(content)
+                    messages.append(msg)
+        else:
+            messages = [{"role": "user", "content": str(prompt)}]
+
+        if return_messages:
+            return messages
+        return get_chat_template(processor, messages, add_generation_prompt, **kwargs)
+
     # Build messages from prompts
     messages = []
 
@@ -693,38 +897,64 @@ def apply_chat_template(
         )
     elif isinstance(prompt, dict):
         # Single dict prompt
-        content = extract_text_from_content(prompt["content"])
-        messages.append(
-            get_message_json(
-                model_type,
-                content,
-                prompt["role"],
-                num_images=num_images,
-                num_audios=num_audios,
-                **kwargs,
+        role = prompt.get("role", "user")
+        if "tool_calls" in prompt or "tool_call_id" in prompt or role == "tool":
+            messages.append(_normalize_tool_message(prompt))
+        else:
+            content = extract_text_from_content(prompt["content"])
+            messages.append(
+                get_message_json(
+                    model_type,
+                    content,
+                    role,
+                    num_images=num_images,
+                    num_audios=num_audios,
+                    **kwargs,
+                )
             )
-        )
     elif isinstance(prompt, list):
-        # List of prompts — find the last user message to place image/audio tokens
+        # Preserve explicit media markers on their originating user message.
+        # Any legacy side-channel media without markers remains attached to the
+        # last user message for backward compatibility.
         last_user_idx = -1
+        explicit_image_counts = [0] * len(prompt)
         for i, p in enumerate(prompt):
             if isinstance(p, str):
                 last_user_idx = i
             elif (rc := _get_role_content(p)) is not None:
-                if rc[0] not in ("system", "assistant", "tool"):
+                role, content = rc
+                if role not in ("system", "assistant", "tool"):
                     last_user_idx = i
+                    explicit_image_counts[i] = _content_media_count(
+                        content, ("image", "image_url", "input_image")
+                    )
+
+        def _allocate_media_counts(explicit_counts, total_count):
+            remaining = total_count
+            allocated = []
+            for count in explicit_counts:
+                count = min(count, remaining)
+                allocated.append(count)
+                remaining -= count
+            if remaining and last_user_idx >= 0:
+                allocated[last_user_idx] += remaining
+            return allocated
+
+        image_counts = _allocate_media_counts(explicit_image_counts, num_images)
+        audio_counts = [0] * len(prompt)
+        if last_user_idx >= 0:
+            audio_counts[last_user_idx] = num_audios
 
         for i, p in enumerate(prompt):
             if isinstance(p, str):
-                is_target = i == last_user_idx
                 messages.append(
                     get_message_json(
                         model_type,
                         p,
-                        skip_image_token=not is_target,
-                        skip_audio_token=not is_target,
-                        num_images=num_images,
-                        num_audios=num_audios,
+                        skip_image_token=image_counts[i] == 0,
+                        skip_audio_token=audio_counts[i] == 0,
+                        num_images=image_counts[i],
+                        num_audios=audio_counts[i],
                         **kwargs,
                     )
                 )
@@ -736,22 +966,21 @@ def apply_chat_template(
                     "tool_calls" in p or "tool_call_id" in p or role == "tool"
                 )
                 if has_tool_metadata:
-                    messages.append(p)
+                    messages.append(_normalize_tool_message(p))
                 else:
                     # Handle multimodal content: extract only text, skip image/audio URLs
                     content = extract_text_from_content(content)
-                    is_target = i == last_user_idx
                     messages.append(
                         get_message_json(
                             model_type,
                             content,
                             role,
-                            skip_image_token=not is_target
+                            skip_image_token=image_counts[i] == 0
                             or role in ["system", "assistant"],
-                            skip_audio_token=not is_target
+                            skip_audio_token=audio_counts[i] == 0
                             or role in ["system", "assistant"],
-                            num_images=num_images,
-                            num_audios=num_audios,
+                            num_images=image_counts[i],
+                            num_audios=audio_counts[i],
                             **kwargs,
                         )
                     )
@@ -760,7 +989,7 @@ def apply_chat_template(
         return messages
 
     # Some models only need the last message
-    if model_type in ["paligemma", "molmo", "florence2", "falcon_ocr"]:
+    if model_type in ["paligemma", "florence2", "falcon_ocr"]:
         return messages[-1]
 
     return get_chat_template(processor, messages, add_generation_prompt, **kwargs)

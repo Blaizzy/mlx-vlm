@@ -110,12 +110,17 @@ def nearest_interpolate(x, size=None, scale_factor=None):
     return result
 
 
-def _cubic_weight(t):
-    """Bicubic kernel with a=-0.5 (Keys' cubic), pure MLX."""
+def _cubic_weight(t, a=-0.75):
+    """Cubic convolution kernel.
+
+    PyTorch's ``F.interpolate(mode="bicubic")`` uses ``a=-0.75`` (ATen
+    ``upsample_bicubic2d``) for the non-antialiased path, but its antialiased
+    path matches Pillow, which uses ``a=-0.5`` (Keys' cubic). The caller selects
+    the coefficient per axis based on whether antialiasing is active.
+    """
     at = mx.abs(t)
     at2 = at * at
     at3 = at2 * at
-    a = -0.5
     w1 = (a + 2.0) * at3 - (a + 3.0) * at2 + 1.0
     w2 = a * at3 - 5.0 * a * at2 + 8.0 * a * at - 4.0 * a
     return mx.where(at <= 1.0, w1, mx.where(at < 2.0, w2, mx.zeros_like(t)))
@@ -151,7 +156,9 @@ def _bicubic_interpolate_mlx(x, out_h, out_w, align_corners=False, antialias=Fal
         offsets = mx.arange(n_taps, dtype=mx.int32)  # (taps,)
         pix = start[:, None] + offsets[None, :]  # (out, taps)
         dist = coords[:, None] - pix.astype(mx.float32)  # (out, taps)
-        w = _cubic_weight(dist / fs)
+        # Antialiased resize matches Pillow (a=-0.5) on every axis; plain
+        # bicubic uses PyTorch's a=-0.75.
+        w = _cubic_weight(dist / fs, -0.5 if antialias else -0.75)
         # Zero out-of-bounds
         mask = (pix >= 0) & (pix < in_size)
         w = w * mask
@@ -220,7 +227,11 @@ def bicubic_interpolate(
     # Calculate antialiasing parameters
     # PyTorch uses support = 2.0 for bicubic when antialiasing
     support = 2.0
-    antialias_flag = 1.0 if (antialias and (scale_h < 1.0 or scale_w < 1.0)) else 0.0
+    # PyTorch's antialiased bicubic uses the Pillow coefficient (a=-0.5) for
+    # every resized axis whenever antialias is requested — including pure
+    # upscales and mixed up/down resizes. Support is only widened for the axes
+    # that are actually downsampled (filter_scale_* below).
+    antialias_flag = 1.0 if antialias else 0.0
 
     # When downsampling with antialias, PyTorch expands the filter support
     if antialias and scale_h < 1.0:
@@ -259,14 +270,13 @@ def bicubic_interpolate(
         x_flat = x_flat.astype(mx.float32)
 
     header = """
-        // Bicubic kernel function
-        float cubic_kernel(float x) {
+        // Cubic convolution kernel. PyTorch's non-antialiased bicubic uses
+        // a=-0.75 (ATen upsample_bicubic2d); its antialiased path matches
+        // Pillow, which uses a=-0.5 (Keys' cubic).
+        float cubic_kernel_a(float x, float a) {
             float absx = fabs(x);
             float absx2 = absx * absx;
             float absx3 = absx2 * absx;
-
-            const float a = -0.5f;
-
             if (absx <= 1.0f) {
                 return (a + 2.0f) * absx3 - (a + 3.0f) * absx2 + 1.0f;
             } else if (absx < 2.0f) {
@@ -275,11 +285,14 @@ def bicubic_interpolate(
             return 0.0f;
         }
 
-        // Antialiased bicubic kernel - scales the support region for downsampling
+        float cubic_kernel(float x) {
+            return cubic_kernel_a(x, -0.75f);
+        }
+
+        // Antialiased bicubic kernel - widens the support for downsampling and
+        // uses Pillow's a=-0.5 to match PyTorch's antialiased path.
         float cubic_kernel_antialias(float x, float scale) {
-            // When downsampling, we need to integrate over a wider region
-            // This matches PyTorch's antialiasing behavior
-            return cubic_kernel(x / scale);
+            return cubic_kernel_a(x / scale, -0.5f);
         }
     """
 

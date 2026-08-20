@@ -3,7 +3,6 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -11,80 +10,33 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..mlp import SwiGLUMLP as MLP
+from ..rope_utils import MRoPERotaryEmbedding
+from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
+from ..switch_layers import SwitchGLU
 from .config import TextConfig, ThinkerConfig
 
 
-class Qwen3OmniMoeThinkerTextRotaryEmbedding:
+class Qwen3OmniMoeThinkerTextRotaryEmbedding(MRoPERotaryEmbedding):
     def __init__(
-        self, dim, max_position_embeddings=2048, base=10000, rope_scaling=None
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        rope_scaling=None,
     ):
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-
-        inv_freq = 1.0 / (
-            self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
+        super().__init__(
+            dim,
+            max_position_embeddings=max_position_embeddings,
+            base=base,
+            rope_scaling=rope_scaling,
+            style="interleaved",
         )
-        self.inv_freq = inv_freq
         self.attention_scaling = 1.0
-
-        rope_scaling = rope_scaling or {}
-        self.mrope_section = rope_scaling.get("mrope_section", [24, 20, 20])
-
-    def apply_interleaved_mrope(self, freqs, mrope_section):
-        D = freqs.shape[-1]
-        indices = mx.arange(D)
-
-        freqs_t = freqs[0]
-
-        limit1 = mrope_section[1] * 3
-        mask1 = (indices % 3 == 1) & (indices < limit1)
-        freqs_t = mx.where(mask1, freqs[1], freqs_t)
-
-        limit2 = mrope_section[2] * 3
-        mask2 = (indices % 3 == 2) & (indices < limit2)
-        freqs_t = mx.where(mask2, freqs[2], freqs_t)
-
-        return freqs_t
-
-    def __call__(self, x, position_ids):
-
-        if position_ids.ndim == 2:
-            position_ids = mx.broadcast_to(
-                position_ids[None, ...],
-                (3, position_ids.shape[0], position_ids.shape[1]),
-            )
-
-        inv_freq_expanded = mx.broadcast_to(
-            self.inv_freq[None, None, :, None].astype(mx.float32),
-            (3, position_ids.shape[1], self.inv_freq.shape[0], 1),
-        )
-        position_ids_expanded = position_ids[:, :, None, :].astype(mx.float32)
-
-        freqs = inv_freq_expanded @ position_ids_expanded
-        freqs = mx.swapaxes(freqs, 2, 3)
-        freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
-        emb = mx.concatenate([freqs, freqs], axis=-1)
-        cos = mx.cos(emb) * self.attention_scaling
-        sin = mx.sin(emb) * self.attention_scaling
-
-        return cos.astype(x.dtype), sin.astype(x.dtype)
-
-
-def rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
-    cos = mx.expand_dims(cos, axis=unqueeze_dim)
-    sin = mx.expand_dims(sin, axis=unqueeze_dim)
-
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-
-    return q_embed, k_embed
+    return _apply_mrope(q, k, cos, sin, style="interleaved", unsqueeze_dim=unqueeze_dim)
 
 
 class Attention(nn.Module):
@@ -124,6 +76,7 @@ class Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -149,14 +102,21 @@ class Attention(nn.Module):
         else:
             kv_seq_len += cache.offset + 1 if cache is not None else 0
 
-        cos, sin = self.rotary_emb(values, position_ids)
+        if position_embeddings is None:
+            queries, keys = self.rotary_emb.apply_rotary(
+                queries,
+                keys,
+                position_ids,
+                unsqueeze_dim=1,
+            )
+        else:
+            cos, sin = position_embeddings
+            queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
         if mask is not None and isinstance(mask, mx.array):
             if isinstance(kv_seq_len, mx.array):
                 kv_seq_len = kv_seq_len.max().item()
             mask = mask[..., : int(kv_seq_len)]
-
-        queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
@@ -166,17 +126,6 @@ class Attention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
-
-
-class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
@@ -235,8 +184,15 @@ class Qwen3OmniMoEThinkerTextDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
+        r = self.self_attn(
+            self.input_layernorm(x),
+            mask=mask,
+            cache=cache,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
+        )
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         out = h + r
@@ -267,6 +223,7 @@ class Qwen3VLMoEModel(nn.Module):
         visual_pos_masks: Optional[mx.array] = None,
         deepstack_visual_embeds: Optional[mx.array] = None,
         output_hidden_states: bool = False,
+        output_hidden_state_idx: Optional[int] = None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -282,11 +239,19 @@ class Qwen3VLMoEModel(nn.Module):
             )
 
         all_hidden_states = [] if output_hidden_states else None
+        selected_hidden_state = h if output_hidden_state_idx == 0 else None
+        position_embeddings = None
+        if (
+            position_ids is not None
+            and self.layers
+            and not self.layers[0].self_attn.rotary_emb.fused_apply
+        ):
+            position_embeddings = self.layers[0].self_attn.rotary_emb(h, position_ids)
 
         for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
             if output_hidden_states:
                 all_hidden_states.append(h)
-            h = layer(h, mask, c, position_ids)
+            h = layer(h, mask, c, position_ids, position_embeddings)
 
             if deepstack_visual_embeds is not None and layer_idx in range(
                 len(deepstack_visual_embeds)
@@ -299,13 +264,22 @@ class Qwen3VLMoEModel(nn.Module):
 
             if layer_idx % 4 == 0:
                 mx.eval(h)
+            if output_hidden_state_idx == layer_idx + 1:
+                selected_hidden_state = h
 
         if output_hidden_states:
             all_hidden_states.append(h)
 
-        return (
-            (self.norm(h), all_hidden_states) if output_hidden_states else self.norm(h)
-        )
+        h = self.norm(h)
+        if output_hidden_states:
+            return h, all_hidden_states
+        if output_hidden_state_idx is not None:
+            if selected_hidden_state is None:
+                raise ValueError(
+                    f"output_hidden_state_idx={output_hidden_state_idx} is out of range"
+                )
+            return h, selected_hidden_state
+        return h
 
     def _deepstack_process(
         self,
@@ -316,10 +290,34 @@ class Qwen3VLMoEModel(nn.Module):
         if visual_pos_masks.ndim == 3:
             visual_pos_masks = visual_pos_masks[..., 0]
         visual_embeds = visual_embeds.astype(hidden_states.dtype)
-        visual_indices = np.where(visual_pos_masks)[0].tolist()
-        local_this = hidden_states[:, visual_indices, :] + visual_embeds
-        hidden_states[:, visual_indices, :] = local_this
-        return hidden_states
+
+        batch_size = hidden_states.shape[0]
+
+        updated_batches = []
+        offset = 0
+        for b in range(batch_size):
+            batch_mask = visual_pos_masks[b]
+            batch_hidden = hidden_states[b]
+
+            batch_indices = mx.array(np.where(batch_mask)[0], dtype=mx.uint32)
+
+            n_visual = len(batch_indices)
+            if n_visual == 0:
+                updated_batches.append(batch_hidden)
+                continue
+
+            sample_embeds = visual_embeds[offset : offset + n_visual]
+            offset += n_visual
+            if sample_embeds.shape[0] != n_visual:
+                updated_batches.append(batch_hidden)
+                continue
+
+            batch_result = mx.array(batch_hidden)  # avoid modifying in-place
+            batch_result = batch_result.at[batch_indices].add(sample_embeds)
+
+            updated_batches.append(batch_result)
+
+        return mx.stack(updated_batches, axis=0)
 
 
 class LanguageModel(nn.Module):
@@ -330,9 +328,13 @@ class LanguageModel(nn.Module):
         self.model_type = args.model_type
         self.model = Qwen3VLMoEModel(args)
         self._rope_deltas = None
+        self._position_ids = None
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def make_cache(self):
+        return [KVCache() for _ in self.layers]
 
     def get_rope_index(
         self,
@@ -360,21 +362,20 @@ class LanguageModel(nn.Module):
             )
             image_index, video_index = 0, 0
             for i, input_ids in enumerate(total_input_ids):
-                input_ids = mx.where(
-                    attention_mask[i] == 1, input_ids, mx.zeros_like(input_ids)
-                )
+                row_mask = attention_mask[i].tolist()
+                input_tokens = [
+                    token
+                    for token, keep in zip(input_ids.tolist(), row_mask)
+                    if keep == 1
+                ]
                 image_nums, video_nums = 0, 0
-                vision_start_indices = mx.sum(
-                    mx.where(
-                        input_ids == vision_start_token_id,
-                        mx.arange(input_ids.shape[0]),
-                        mx.zeros_like(input_ids),
-                    )
-                )
-                vision_tokens = input_ids[vision_start_indices + 1]
-                image_nums = (vision_tokens == image_token_id).sum().item()
-                video_nums = (vision_tokens == video_token_id).sum().item()
-                input_tokens = input_ids.tolist()
+                vision_tokens = [
+                    input_tokens[idx + 1]
+                    for idx, token in enumerate(input_tokens[:-1])
+                    if token == vision_start_token_id
+                ]
+                image_nums = sum(token == image_token_id for token in vision_tokens)
+                video_nums = sum(token == video_token_id for token in vision_tokens)
                 llm_pos_ids_list: list = []
                 st = 0
                 remain_images, remain_videos = image_nums, video_nums
@@ -455,8 +456,24 @@ class LanguageModel(nn.Module):
 
                     llm_pos_ids_list.append(t_index + st_idx)
 
+                if not llm_pos_ids_list:
+                    mrope_position_deltas.append(0)
+                    continue
+
                 llm_positions = mx.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
-                mask = mx.array(attention_mask[i] == 1)
+                compact_max_position = llm_positions.max()
+                padded_positions = [[1] * total_input_ids.shape[1] for _ in range(3)]
+                compact_positions = llm_positions.tolist()
+                compact_idx = 0
+                for col, keep in enumerate(row_mask):
+                    if keep == 1:
+                        for dim in range(3):
+                            padded_positions[dim][col] = compact_positions[dim][
+                                compact_idx
+                            ]
+                        compact_idx += 1
+                llm_positions = mx.array(padded_positions, dtype=position_ids.dtype)
+                mask = mx.array(row_mask, dtype=mx.bool_)
                 expanded_mask = mx.expand_dims(mask, axis=0)
                 expanded_mask = mx.broadcast_to(expanded_mask, (3, 1, mask.shape[0]))
                 expanded_positions = mx.expand_dims(llm_positions, axis=1)
@@ -473,9 +490,9 @@ class LanguageModel(nn.Module):
                 )
                 position_ids = updated_position_ids
                 mrope_position_deltas.append(
-                    llm_positions.max() + 1 - len(total_input_ids[i])
+                    compact_max_position + 1 - len(input_tokens)
                 )
-            mrope_position_deltas = mx.array(mrope_position_deltas)[0]
+            mrope_position_deltas = mx.array(mrope_position_deltas).reshape(-1, 1)
             return position_ids, mrope_position_deltas
         else:
             if attention_mask is not None:
@@ -483,11 +500,10 @@ class LanguageModel(nn.Module):
                 position_ids = mx.where(
                     attention_mask == 0, mx.ones_like(position_ids), position_ids
                 )
-                position_ids = mx.expand_dims(position_ids[0], axis=0)
-                position_ids = mx.tile(position_ids, (3, 1, 1))
-                max_position_ids = position_ids.max(0, keepdims=False)[0].max(
-                    -1, keepdims=True
-                )[0]
+                max_position_ids = position_ids.max(axis=-1, keepdims=True)
+                position_ids = mx.broadcast_to(
+                    position_ids[None, :, :], (3, *position_ids.shape)
+                )
                 mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
             else:
                 position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)
@@ -516,8 +532,13 @@ class LanguageModel(nn.Module):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         rope_deltas_kw = kwargs.pop("rope_deltas", None)
-        if pixel_values is not None:
+        pixel_values_videos = kwargs.pop("pixel_values_videos", None)
+        if pixel_values is not None or pixel_values_videos is not None:
             self._rope_deltas = None
+            self._position_ids = None
+
+        if rope_deltas_kw is not None:
+            self._rope_deltas = rope_deltas_kw
 
         # Use ``cache._idx`` — the Python-int token counter — instead of
         # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
@@ -533,17 +554,62 @@ class LanguageModel(nn.Module):
             ):
                 cache_offsets = c0.offset
 
-        if position_ids is None and (mask is None or mask.ndim == 2):
-            is_prefill = (
-                cache is None
-                or cache[0] is None
-                or (cache_offsets is None and cache_offset == 0)
+        # Chunked prefill passes the full-prompt position_ids to every chunk;
+        # slice it down to this chunk's [offset, offset + len) window.
+        if position_ids is not None and cache_offsets is None:
+            seq_length = (
+                inputs.shape[-1] if inputs is not None else inputs_embeds.shape[1]
             )
-            if is_prefill or self._rope_deltas is None:
-                position_ids, rope_deltas = self.get_rope_index(
-                    inputs, image_grid_thw, video_grid_thw, mask
+            if position_ids.shape[-1] > seq_length:
+                position_ids = position_ids[
+                    ..., cache_offset : cache_offset + seq_length
+                ]
+
+        rope_mask = mask
+        if mask is not None and mask.shape[-1] != inputs.shape[-1]:
+            rope_mask = None
+
+        if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
+            recalc_condition = (
+                (
+                    cache is not None
+                    and cache[0] is not None
+                    and (cache_offsets is None and cache_offset == 0)
                 )
-                self._rope_deltas = rope_deltas
+                or (self._rope_deltas is None and rope_deltas_kw is None)
+                or cache is None
+            )
+            if recalc_condition:
+                if self._position_ids is not None:
+                    batch_size, seq_length = inputs.shape
+                    if (
+                        self._position_ids.ndim == 3
+                        and self._position_ids.shape[1] == batch_size
+                        and self._position_ids.shape[-1] >= cache_offset + seq_length
+                    ):
+                        position_ids = self._position_ids[
+                            :, :, cache_offset : cache_offset + seq_length
+                        ]
+                    elif (
+                        self._position_ids.ndim == 2
+                        and self._position_ids.shape[0] == batch_size
+                        and self._position_ids.shape[-1] >= cache_offset + seq_length
+                    ):
+                        position_ids = self._position_ids[
+                            :, cache_offset : cache_offset + seq_length
+                        ]
+                    else:
+                        position_ids, rope_deltas = self.get_rope_index(
+                            inputs, image_grid_thw, video_grid_thw, rope_mask
+                        )
+                        self._rope_deltas = rope_deltas
+                        self._position_ids = position_ids
+                else:
+                    position_ids, rope_deltas = self.get_rope_index(
+                        inputs, image_grid_thw, video_grid_thw, rope_mask
+                    )
+                    self._rope_deltas = rope_deltas
+                    self._position_ids = position_ids
             else:
                 batch_size, seq_length = inputs.shape
                 rope_deltas_src = (
@@ -573,9 +639,14 @@ class LanguageModel(nn.Module):
                     position_ids, (3, batch_size, seq_length)
                 )
 
-        visual_pos_masks = kwargs.get("visual_pos_masks", None)
-        deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds", None)
+        if position_ids is not None:
+            mx.eval(position_ids)
+
         output_hidden_states = kwargs.pop("output_hidden_states", False)
+        output_hidden_state_idx = kwargs.pop("output_hidden_state_idx", None)
+
+        if position_ids is not None:
+            mx.eval(position_ids)
 
         out = self.model(
             inputs,
@@ -585,10 +656,11 @@ class LanguageModel(nn.Module):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
             output_hidden_states=output_hidden_states,
+            output_hidden_state_idx=output_hidden_state_idx,
         )
 
-        if output_hidden_states:
-            hidden_states, all_hidden_states = out
+        if output_hidden_states or output_hidden_state_idx is not None:
+            hidden_states, captured_hidden_states = out
             out = hidden_states
 
         if self.args.tie_word_embeddings:
@@ -598,7 +670,11 @@ class LanguageModel(nn.Module):
 
         return LanguageModelOutput(
             logits=logits,
-            hidden_states=all_hidden_states if output_hidden_states else None,
+            hidden_states=(
+                captured_hidden_states
+                if output_hidden_states or output_hidden_state_idx is not None
+                else None
+            ),
         )
 
     def sanitize(self, weights):
