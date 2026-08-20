@@ -184,7 +184,7 @@ Speed up generation by drafting several candidate tokens with a small "drafter" 
 
 See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
 
-#### DFlash (Qwen3.5 and Muse Glimmer)
+#### DFlash and DSpark (Qwen3.5, LFM2.5, and Muse Glimmer)
 
 A lightweight block-diffusion drafter that predicts multiple tokens per round, typically 2–3× faster.
 
@@ -206,6 +206,26 @@ mlx_vlm.generate --model Qwen/Qwen3.5-4B \
 mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --draft-model z-lab/Qwen3.5-4B-DFlash
 ```
+
+Liquid AI's DSpark checkpoint uses a Qwen3-style block drafter plus a learned
+Markov correction head. It is auto-detected and runs through the exact target
+verification path:
+
+```sh
+mlx_vlm.generate --model LiquidAI/LFM2.5-2.6B \
+  --draft-model LiquidAI/LFM2.5-2.6B-DSpark \
+  --prompt "Explain speculative decoding in three sentences." \
+  --max-tokens 256 --temperature 0
+
+mlx_vlm.server --model LiquidAI/LFM2.5-2.6B \
+  --draft-model LiquidAI/LFM2.5-2.6B-DSpark
+```
+
+The published DSpark `block_size: 9` means nine proposals; mlx-vlm verifies
+those proposals together with the anchor token in a ten-token target pass.
+The checkpoint's confidence head is loaded for parity, and DSpark retains its
+trained nine-proposal width instead of using the generic DFlash backoff.
+DSpark decoding currently requires greedy sampling (`temperature=0`).
 
 Muse Glimmer's published assistant checkpoint is auto-detected as DFlash:
 
