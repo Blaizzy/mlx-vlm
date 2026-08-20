@@ -174,15 +174,46 @@ Requests can override the server defaults with `enable_thinking`, `thinking_budg
 
 ### Speculative Decoding
 
-Speed up generation by drafting several candidate tokens with a small "drafter" model and verifying them in a single target forward pass. Three drafter families are supported.
+Speed up generation by drafting several candidate tokens with a small "drafter" model and verifying them in a single target forward pass. Four drafter families are supported.
 
 | Flag | Description |
 |------|-------------|
 | `--draft-model` | HuggingFace repo or local path for the drafter |
-| `--draft-kind` | Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP) |
+| `--draft-kind` | Drafter family — `dflash` (default), `dspark`, `eagle3`, or `mtp` (native/assistant MTP) |
 | `--draft-block-size` | Override the drafter's configured block size |
+| `--draft-bits` | Quantize a dense DSpark drafter at load time (`4` by default, `0` keeps BF16) |
 
 See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
+
+#### DSpark (Qwen3.8)
+
+DSpark combines a parallel draft backbone with a sequential low-rank Markov
+head. The target verifies every proposal before it is emitted. The published
+Qwen3.8 drafter is BF16 and is quantized to 4-bit at load time by default.
+
+```sh
+mlx_vlm.generate \
+  --model mlx-community/Qwen3.8-27B-4bit \
+  --draft-model RadixArk/Qwen3.8-27B-DSpark \
+  --draft-kind dspark \
+  --prompt "Write a quicksort in Python." \
+  --max-tokens 512 --temperature 0
+
+# OpenAI-compatible server
+mlx_vlm.server \
+  --model mlx-community/Qwen3.8-27B-4bit \
+  --draft-model RadixArk/Qwen3.8-27B-DSpark \
+  --draft-kind dspark
+```
+
+The checkpoint's full trained width is available, but the default runtime is
+acceptance-adaptive: it starts with three proposals, backs off when deeper
+positions miss, and grows toward the checkpoint ceiling only when acceptance
+supports it. `--draft-block-size 4` fixes the runtime at three proposals plus
+the known target bonus token; benchmark fixed caps on the deployment Mac.
+Prefill follows the normal portable chunk ceiling and can reduce it when live
+Metal headroom cannot hold the requested DSpark hidden-state captures. The
+`--prefill-step-size` value remains the ceiling (`0` disables chunking).
 
 #### DFlash (Qwen3.5 and Muse Glimmer)
 
@@ -473,7 +504,8 @@ mlx_vlm.server --api-key <secret-token>
 - `--reranker-model`: Preload a supported reranker model at server startup
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
 - `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`, `Inferact/MiniMax-M3-EAGLE3`) — enables speculative decoding for ~2× or higher throughput
-- `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP)
+- `--draft-kind`: Drafter family — `dflash` (default), `dspark`, `eagle3`, or `mtp` (native/assistant MTP)
+- `--draft-bits`: Quantize dense DSpark drafters at load time (`4` by default, `0` keeps BF16)
 - `--draft-block-size`: Override the drafter's configured block size
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)

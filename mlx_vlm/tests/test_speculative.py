@@ -57,6 +57,8 @@ from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPCo
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
 from mlx_vlm.speculative.drafters.qwen3_dflash import DFlashDraftModel, ModelConfig
+from mlx_vlm.speculative.drafters.qwen3_dspark import DSparkDraftModel
+from mlx_vlm.speculative.drafters.qwen3_dspark import ModelConfig as DSparkConfig
 from mlx_vlm.speculative.eagle3 import (
     _eagle3_block_settings,
     _eagle3_next_block_size,
@@ -79,6 +81,7 @@ from mlx_vlm.speculative.utils import (
     _speculative_walk_batch_uniform_acceptance,
     _speculative_walk_deferred_greedy,
     speculative_prefill_kwargs,
+    speculative_prefill_step_size,
 )
 from mlx_vlm.turboquant import BatchTurboQuantKVCache
 from mlx_vlm.utils import get_model_and_args
@@ -2159,6 +2162,138 @@ def test_dflash_drafter_uses_bound_target_embedding_scale():
     assert embedded.tolist() == [[[2.0] * 4, [2.0] * 4]]
 
 
+def test_dspark_config_parses_specforge_metadata():
+    config = DSparkConfig.from_dict(
+        {
+            "model_type": "qwen3",
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 0,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 8,
+            "block_size": 7,
+            "num_target_layers": 64,
+            "markov_rank": 2,
+            "rope_parameters": {
+                "rope_type": "yarn",
+                "rope_theta": 10000000,
+                "factor": 32.0,
+                "original_max_position_embeddings": 8192,
+            },
+            "dflash_config": {
+                "projector_type": "dspark",
+                "mask_token_id": 6,
+                "target_layer_ids": [4, 16, 28, 40, 52],
+            },
+        }
+    )
+
+    assert config.model_type == "dspark"
+    assert config.block_size == 7
+    assert config.runtime_block_size is None
+    assert config.mask_token_id == 6
+    assert config.target_layer_ids == [4, 16, 28, 40, 52]
+    assert config.rope_scaling["rope_type"] == "yarn"
+    assert config.rope_theta == 10000000
+
+
+def test_dspark_prefill_step_size_scales_with_metal_headroom():
+    gib = 1024**3
+    drafter = SimpleNamespace(prefill_memory_bytes_per_token=64 * 1024**2)
+
+    assert (
+        speculative_prefill_step_size(
+            2048,
+            drafter,
+            device_info={"max_recommended_working_set_size": 20 * gib},
+            active_memory=8 * gib,
+            cache_memory=0,
+        )
+        == 128
+    )
+    assert (
+        speculative_prefill_step_size(
+            2048,
+            drafter,
+            device_info={"max_recommended_working_set_size": 40 * gib},
+            active_memory=20 * gib,
+            cache_memory=0,
+        )
+        == 256
+    )
+    assert (
+        speculative_prefill_step_size(
+            2048,
+            drafter,
+            device_info={"max_recommended_working_set_size": 80 * gib},
+            active_memory=20 * gib,
+            cache_memory=0,
+        )
+        == 512
+    )
+    assert speculative_prefill_step_size(64, drafter, device_info={}) == 64
+    assert speculative_prefill_step_size(0, drafter) is None
+    assert speculative_prefill_step_size(None, drafter) is None
+
+
+def test_dspark_draft_uses_full_trained_block_for_two_proposals():
+    config = DSparkConfig(
+        hidden_size=4,
+        intermediate_size=8,
+        num_hidden_layers=0,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=4,
+        block_size=7,
+        mask_token_id=3,
+        target_layer_ids=[0],
+        markov_rank=0,
+        enable_confidence_head=False,
+    )
+    drafter = DSparkDraftModel(config)
+    assert drafter.max_runtime_block_size == 8
+    assert drafter.prefill_memory_bytes_per_token == 16
+    assert speculative_utils._dflash_block_total(drafter, None) == 8
+    assert (
+        _dflash_next_block_size(
+            drafter,
+            drafter.max_runtime_block_size,
+            64,
+            drafter.dflash_initial_block_size,
+        )
+        == 4
+    )
+    drafter.accept_lens = [0]
+    drafter.draft_lens = [3]
+    assert _dflash_next_block_size(drafter, drafter.max_runtime_block_size, 64) == 3
+    seen = {}
+
+    def fake_hidden(self, inputs, target_hidden, cache):
+        seen["inputs"] = inputs
+        return mx.zeros((1, inputs.shape[1], 4), dtype=mx.float32)
+
+    def fake_logits(self, hidden):
+        assert hidden.shape[1] == 2
+        return mx.array([[[0.0, 5.0, 0.0, 0.0], [0.0, 0.0, 5.0, 0.0]]])
+
+    drafter._hidden = MethodType(fake_hidden, drafter)
+    drafter._logits = MethodType(fake_logits, drafter)
+    drafted = drafter.draft_block(
+        1,
+        mx.zeros((1, 1, 4), dtype=mx.float32),
+        [],
+        block_size=3,
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+    )
+
+    assert seen["inputs"].shape == (1, 7)
+    assert seen["inputs"].tolist() == [[1, 3, 3, 3, 3, 3, 3]]
+    assert drafted.tolist() == [[1, 2]]
+
+
 def test_dflash_config_parses_sliding_attention_metadata():
     config = ModelConfig.from_dict(
         {
@@ -2447,6 +2582,22 @@ def test_kind_none_autodetects_eagle3_speculators_config(tmp_path):
     assert resolve_drafter_kind(path, "dflash") == "eagle3"
 
 
+def test_kind_none_autodetects_specforge_dspark_config(tmp_path):
+    path = tmp_path / "drafter"
+    path.mkdir()
+    (path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3",
+                "dflash_config": {"projector_type": "dspark"},
+            }
+        )
+    )
+
+    assert resolve_drafter_kind(path, None) == "dspark"
+    assert resolve_drafter_kind(path, "dflash") == "dspark"
+
+
 @pytest.mark.parametrize("model_type,hidden_size_field", MTP_DRAFTER_COMPAT_CASES)
 def test_mtp_drafter_compatibility_accepts_matching_target(
     model_type, hidden_size_field
@@ -2512,6 +2663,18 @@ def test_model_loader_uses_speculators_model_type_for_eagle3_config():
     assert arch.Model is Eagle3DraftModel
 
 
+def test_model_loader_routes_specforge_dspark_checkpoint():
+    arch, model_type = get_model_and_args(
+        {
+            "model_type": "qwen3",
+            "dflash_config": {"projector_type": "dspark"},
+        }
+    )
+
+    assert model_type == "qwen3_dspark"
+    assert arch.Model is DSparkDraftModel
+
+
 def test_model_loader_uses_gemma4_unified_assistant_drafter():
     arch, model_type = get_model_and_args({"model_type": "gemma4_unified_assistant"})
 
@@ -2573,6 +2736,47 @@ def _tiny_qwen3_5_text_config():
             "partial_rotary_factor": 0.25,
         },
     )
+
+
+def test_qwen3_5_prefill_hidden_capture_does_not_retain_gdn_rollback_state():
+    from mlx_vlm.models import qwen3_5
+
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.num_hidden_layers = 2
+    text_config.full_attention_interval = 2
+    config = qwen3_5.ModelConfig(
+        text_config=text_config,
+        vision_config=qwen3_5.VisionConfig(
+            model_type="qwen3_5",
+            depth=1,
+            hidden_size=16,
+            intermediate_size=32,
+            out_hidden_size=16,
+            num_heads=2,
+        ),
+        model_type="qwen3_5",
+    )
+    model = qwen3_5.LanguageModel(text_config, config)
+    mx.eval(model.parameters())
+    tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
+
+    prefill = model(
+        tokens,
+        cache=model.make_cache(),
+        capture_layer_ids=[0],
+    )
+    verify = model(
+        tokens,
+        cache=model.make_cache(),
+        capture_layer_ids=[0],
+        capture_gdn_states=True,
+    )
+    mx.eval(prefill.logits, verify.logits)
+
+    assert len(prefill.hidden_states) == 1
+    assert prefill.gdn_states is None
+    assert len(verify.hidden_states) == 1
+    assert len(verify.gdn_states) == 1
 
 
 def _tiny_deepseek_v4_config():
@@ -2638,6 +2842,16 @@ def test_eagle3_prefill_uses_mlx_capture_layer_indexes():
 
     assert speculative_prefill_kwargs("eagle3", drafter) == {
         "capture_layer_ids": [1, 29, 56]
+    }
+
+
+def test_dspark_prefill_captures_checkpoint_target_layers():
+    drafter = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=[4, 16, 28, 40, 52])
+    )
+
+    assert speculative_prefill_kwargs("dspark", drafter) == {
+        "capture_layer_ids": [4, 16, 28, 40, 52]
     }
 
 

@@ -2097,6 +2097,8 @@ class Qwen3_5Model(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    requires_speculative_gdn_states = True
+
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
         self.args = args
@@ -2127,7 +2129,7 @@ class LanguageModel(nn.Module):
             return bool(prefill_kwargs.get("return_hidden", False)) and bool(
                 prefill_kwargs.get("return_shared_kv", False)
             )
-        if draft_kind in ("dflash", "eagle3"):
+        if draft_kind in ("dflash", "dspark", "eagle3"):
             return prefill_kwargs.get("capture_layer_ids") is not None
         return draft_kind is None
 
@@ -2605,6 +2607,7 @@ class LanguageModel(nn.Module):
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         attention_mask = kwargs.pop("attention_mask", None)
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
+        capture_gdn_states = kwargs.pop("capture_gdn_states", False)
         return_hidden = kwargs.pop("return_hidden", False)
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         skip_logits = kwargs.pop("skip_logits", False)
@@ -2742,7 +2745,7 @@ class LanguageModel(nn.Module):
         hidden_sink: Optional[List[mx.array]] = (
             [] if capture_layer_ids is not None else None
         )
-        gdn_sink: Optional[list] = [] if capture_layer_ids is not None else None
+        gdn_sink: Optional[list] = [] if capture_gdn_states else None
         target_verify = gdn_sink is not None
 
         out = self.model(
@@ -2857,6 +2860,7 @@ class LanguageModel(nn.Module):
             inputs,
             cache=cache,
             capture_layer_ids=[],
+            capture_gdn_states=True,
             return_hidden=True,
             return_shared_kv=True,
         )
@@ -2872,6 +2876,7 @@ class LanguageModel(nn.Module):
             inputs,
             cache=cache,
             capture_layer_ids=[],
+            capture_gdn_states=True,
             return_hidden=True,
             return_shared_kv=True,
             skip_logits=True,

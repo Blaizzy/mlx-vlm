@@ -611,8 +611,11 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
-    is_dflash = config.get("dflash_config", None) is not None
-    if is_dflash:
+    dflash_config = config.get("dflash_config") or {}
+    is_dspark = dflash_config.get("projector_type") == "dspark"
+    if is_dspark:
+        model_type += "_dspark"
+    elif dflash_config:
         model_type += "_dflash"
 
     last_err: Optional[ImportError] = None

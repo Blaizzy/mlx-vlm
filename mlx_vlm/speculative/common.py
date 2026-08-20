@@ -6,6 +6,13 @@ import mlx.nn as nn
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
+def _target_verify_kwargs(lm: nn.Module) -> dict:
+    """Return target-specific state capture needed for speculative rollback."""
+    if getattr(lm, "requires_speculative_gdn_states", False):
+        return {"capture_gdn_states": True}
+    return {}
+
+
 def _copy_rng_state() -> List[mx.array]:
     return [mx.array(state) for state in mx.random.state]
 
@@ -259,7 +266,9 @@ def _dflash_block_total(draft_model: nn.Module, draft_block_size: Optional[int])
     if draft_block_size is not None:
         return int(draft_block_size)
 
-    configured = int(draft_model.config.block_size)
+    configured = int(
+        getattr(draft_model, "max_runtime_block_size", draft_model.config.block_size)
+    )
     runtime = getattr(draft_model.config, "runtime_block_size", None)
     if runtime is None:
         return configured

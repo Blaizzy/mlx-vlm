@@ -291,7 +291,7 @@ class LanguageModel(nn.Module):
         if draft_model is None:
             return True
         prefill_kwargs = prefill_kwargs or {}
-        if draft_kind in ("dflash", "eagle3"):
+        if draft_kind in ("dflash", "dspark", "eagle3"):
             return prefill_kwargs.get("capture_layer_ids") is not None
         return False
 

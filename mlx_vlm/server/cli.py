@@ -221,8 +221,8 @@ def main():
         "--draft-kind",
         type=str,
         default=None,
-        choices=["dflash", "eagle3", "mtp"],
-        help="Drafter family -- 'dflash', 'eagle3', or 'mtp' (Gemma 4). "
+        choices=["dflash", "dspark", "eagle3", "mtp"],
+        help="Drafter family -- 'dflash', 'dspark', 'eagle3', or 'mtp'. "
         "Default: auto-detected from the drafter's HF model_type.",
     )
     parser.add_argument(
@@ -230,6 +230,13 @@ def main():
         type=int,
         default=None,
         help="Override the drafter's configured block size.",
+    )
+    parser.add_argument(
+        "--draft-bits",
+        type=int,
+        choices=[0, 2, 3, 4, 5, 6, 8],
+        default=4,
+        help="Quantize a dense DSpark drafter to this bit width (0 keeps BF16).",
     )
     parser.add_argument(
         "--max-num-seqs",
@@ -297,9 +304,10 @@ def main():
         os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
     if args.draft_block_size is not None:
         os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
+    os.environ["MLX_VLM_DRAFT_BITS"] = str(args.draft_bits)
     if args.max_num_seqs is not None:
         os.environ["MLX_VLM_MAX_NUM_SEQS"] = str(args.max_num_seqs)
-    if args.prefill_step_size:
+    if args.prefill_step_size is not None:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = str(args.log_progress_interval)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)

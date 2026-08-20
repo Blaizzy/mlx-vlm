@@ -1,12 +1,17 @@
+import gc
 import json
 import logging
+import os
 from typing import Any, Optional, Tuple
+
+import mlx.core as mx
+import mlx.nn as nn
 
 from .laguna_dflash import LagunaDFlashDraftModel
 from .muse_glimmer_assistant import MuseGlimmerAssistantDraftModel
 from .qwen3_dflash import DFlashDraftModel
 
-KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
+KNOWN_DRAFTER_KINDS = {"dflash", "dspark", "mtp", "eagle3"}
 
 # Drafter HF ``model_type`` → required round-loop kind. Anything not listed
 # here falls back to ``DEFAULT_DRAFTER_KIND`` when the caller didn't pass one.
@@ -18,6 +23,7 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
     "glm4_moe_lite_mtp": "mtp",
     "inkling_mtp": "mtp",
     "qwen3_5_mtp": "mtp",
+    "dspark": "dspark",
     "laguna": "dflash",
     "muse_glimmer_assistant": "dflash",
 }
@@ -106,6 +112,8 @@ def _peek_drafter_model_type(model_path) -> Optional[str]:
     try:
         with open(model_path / "config.json") as f:
             config = json.load(f)
+            if (config.get("dflash_config") or {}).get("projector_type") == "dspark":
+                return "dspark"
             return config.get("model_type") or config.get("speculators_model_type")
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
@@ -151,7 +159,10 @@ def resolve_drafter_kind(model_path, kind: Optional[str] = None) -> str:
 
 
 def load_drafter(
-    path_or_repo: str, kind: Optional[str] = None, **kwargs
+    path_or_repo: str,
+    kind: Optional[str] = None,
+    draft_bits: Optional[int] = None,
+    **kwargs,
 ) -> Tuple[object, str]:
     """Load a speculative drafter and return ``(model, resolved_kind)``.
 
@@ -168,7 +179,42 @@ def load_drafter(
 
     path = get_model_path(path_or_repo)
     resolved = resolve_drafter_kind(path, kind)
-    return load_model(path, **kwargs), resolved
+    model = load_model(path, **kwargs)
+
+    if resolved == "dspark" and getattr(model, "quantize_on_load", False):
+        bits = (
+            int(os.environ.get("MLX_VLM_DRAFT_BITS", "4"))
+            if draft_bits is None
+            else int(draft_bits)
+        )
+        if bits not in (0, 2, 3, 4, 5, 6, 8):
+            raise ValueError(
+                "DSpark draft_bits must be 0 (BF16) or one of 2, 3, 4, 5, 6, 8."
+            )
+        with open(path / "config.json") as f:
+            checkpoint_config = json.load(f)
+        already_quantized = bool(
+            checkpoint_config.get("quantization")
+            or checkpoint_config.get("quantization_config")
+        )
+        if bits and not already_quantized:
+            nn.quantize(
+                model,
+                group_size=64,
+                bits=bits,
+                class_predicate=lambda _path, module: isinstance(
+                    module, (nn.Linear, nn.Embedding)
+                ),
+            )
+            mx.eval(model.parameters())
+            # ``nn.quantize`` replaces the dense modules, but the released
+            # BF16 tensors can remain in Python reference cycles until GC.
+            # Reclaim them before target prefill instead of carrying both
+            # dense and quantized copies into its peak-memory phase.
+            gc.collect()
+            mx.clear_cache()
+
+    return model, resolved
 
 
 __all__ = [
