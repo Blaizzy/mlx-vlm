@@ -29,8 +29,12 @@ from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
 from mlx_vlm.models.cache import (
     BatchKVCache,
+    BatchPoolingCache,
+    BatchRotatingKVCache,
     BufferedRotatingKVCache,
+    CacheList,
     KVCache,
+    PoolingCache,
     RotatingKVCache,
 )
 from mlx_vlm.utils import ThinkingBudgetCriteria
@@ -595,6 +599,50 @@ class TestBatchGenerator:
 
         assert stats.prompt_tps == 200.0  # 100 / 0.5
         assert stats.prompt_tokens == 100
+
+    def test_extend_active_deepseek_cache_with_concurrent_request(self):
+        def make_row(prompt_length):
+            rotating = BatchRotatingKVCache(max_size=16, left_padding=[0])
+            keys = mx.random.normal((1, 1, prompt_length, 4))
+            values = mx.random.normal((1, 1, prompt_length, 4))
+            rotating.update_and_fetch(keys, values)
+            rotating.finalize()
+
+            pooling = BatchPoolingCache(ratio=4, left_padding=[0])
+            pooling.prepare(lengths=[prompt_length])
+            kv = mx.random.normal((1, prompt_length, 3))
+            gate = mx.random.normal((1, prompt_length, 2))
+            ready_kv, _, _ = pooling.accumulate_windows(kv, gate, offset=0)
+            pooled = mx.random.normal((1, ready_kv.shape[1] // 4, 3))
+            pooling.update_and_fetch(pooled)
+            pooling.finalize()
+            return [CacheList(rotating, pooling)]
+
+        active = make_row(6)
+        joining = make_row(5)
+
+        extended = ar_module._extend_cache(active, joining)
+
+        rotating, pooling = extended[0].caches
+        assert isinstance(rotating, BatchRotatingKVCache)
+        assert rotating.offset.shape == (2,)
+        assert rotating.keys.shape[0] == 2
+        assert isinstance(pooling, BatchPoolingCache)
+        assert pooling.remainder == [2, 1]
+        assert pooling.pooled.shape[0] == 2
+
+    def test_make_cache_converts_left_padded_pooling_cache(self):
+        class PoolingModel:
+            def make_cache(self):
+                return [PoolingCache(ratio=4)]
+
+        caches = ar_module._make_cache(PoolingModel(), [2, 0])
+
+        assert len(caches) == 1
+        assert isinstance(caches[0], BatchPoolingCache)
+        assert caches[0].ratio == 4
+        assert caches[0].remainder == [0, 0]
+        assert caches[0].left_padding == [2, 0]
 
     def test_next_reports_prompt_progress_for_completed_prefill(
         self, mock_model, mock_processor, monkeypatch
