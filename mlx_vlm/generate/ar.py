@@ -53,6 +53,8 @@ DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_COMPLETION_BATCH_SIZE = 32
 DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
+# Below this, a row is greedy: make_sampler returns argmax at temperature 0.
+_GREEDY_EPS = 1e-5
 
 
 def _get_batch_cache_eval_interval() -> int:
@@ -189,7 +191,7 @@ def batched_row_sample(
     so the rank-based filters see the already-filtered distribution.
     Greedy rows (temperature < eps) return argmax of the unfiltered logprobs.
     """
-    eps = 1e-5
+    eps = _GREEDY_EPS
     if logprobs.ndim != 2:
         raise ValueError(
             f"batched_row_sample expects rank-2 [B, V] logprobs, got rank {logprobs.ndim}."
@@ -388,6 +390,20 @@ class _PositionedTargetSampler:
         configs: Optional[List["SamplingConfig"]] = None,
         repeat: int = 1,
     ) -> mx.array:
+        rows = self.configs if configs is None else configs
+        if all(c.temperature < _GREEDY_EPS for c in rows):
+            # Every row wants argmax, and greedy ignores every filter, so the
+            # whole sorted-space pass is dead work: batched_row_sample would
+            # build the [B, V] argsort + softmax + cumsum and then discard it
+            # at mx.where(temperature < eps, greedy, sampled) -- mx.where
+            # materialises both branches. DEFAULT_TEMPERATURE is 0.0 and all
+            # three server schemas default to it, so this is the server's
+            # default decode path. Measured at V=151936: 5.1x a bare argmax at
+            # B=1, 11.1x at B=16, 39.5x for a [8, 16, V] verify block.
+            # No widening cast here, unlike the chain below: bfloat16 -> float32
+            # is exact and order-preserving, so argmax picks the same index.
+            return mx.argmax(logprobs, axis=-1)
+
         arrays = self._arrays(configs)
         if repeat > 1:
             # mx.repeat (not tile) so the expansion is row-major and matches

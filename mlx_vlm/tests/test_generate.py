@@ -3652,3 +3652,29 @@ def test_generation_batch_without_sampler_or_configs_decodes_greedily():
     tokens = [r.token for _ in range(2) for r in batch.next()]
     assert tokens
     assert set(tokens) == {_ARGMAX_TOKEN}
+
+
+def test_server_default_decode_step_skips_sorted_space():
+    # The server's continuous batch decodes through GenerationBatch._step with
+    # per-row configs, and every server request schema defaults temperature to
+    # 0. That whole batch is greedy, so the step must never enter sorted space
+    # -- _fused_greedy_step cannot save it, since fused_greedy_decode is
+    # implemented by one model family.
+    batch = GenerationBatch(
+        model=_ConstantLogitModel(),
+        uids=[0, 1, 2],
+        inputs=mx.array([0, 0, 0], dtype=mx.int32),
+        prompt_cache=[],
+        sampler=None,
+        stop_criteria=lambda token: False,
+        max_tokens=[3, 3, 3],
+        sampling=[SamplingConfig(temperature=0.0)] * 3,
+    )
+    batch.next()  # replays the seed tokens
+
+    def boom(*args, **kwargs):
+        raise AssertionError("argsort called: the greedy fast path was not taken")
+
+    with patch.object(mx, "argsort", boom):
+        tokens = [r.token for r in batch.next()]
+    assert tokens == [_ARGMAX_TOKEN] * 3

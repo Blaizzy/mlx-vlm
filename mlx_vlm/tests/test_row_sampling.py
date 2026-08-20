@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import mlx.core as mx
 import pytest
 
@@ -683,3 +685,133 @@ def test_call_validates_width_before_keying():
     )
     with pytest.raises(ValueError, match="configs length"):
         sampler(mx.zeros((5, 8)))
+
+
+# --- all-greedy batches must not pay for sorted space ----------------------
+#
+# batched_row_sample always builds the [B, V] argsort + softmax + cumsum and
+# then throws it away for greedy rows at mx.where(temperature < eps, greedy,
+# sampled) -- mx.where materialises both branches, so the work is real.
+# DEFAULT_TEMPERATURE is 0.0 and all three server request schemas default to
+# it, so that is the server's default decode path, and _fused_greedy_step (the
+# only escape hatch) needs fused_greedy_decode, which one model family
+# implements. Measured at V=151936: 5.1x a bare argmax at B=1, 11.1x at B=16,
+# and 39.5x for a [8, 16, V] dflash/eagle3 verify block.
+
+
+def _no_sorting():
+    """Fail loudly if the sampler enters sorted space."""
+
+    def boom(*args, **kwargs):
+        raise AssertionError("argsort called: the greedy fast path was not taken")
+
+    return patch.object(mx, "argsort", boom)
+
+
+def test_all_greedy_batch_skips_sorted_space():
+    lp = _log_normalize(mx.random.normal((4, 40), key=mx.random.key(1)))
+    sampler = _PositionedTargetSampler([SamplingConfig(temperature=0.0)] * 4)
+    with _no_sorting():
+        tokens = sampler(lp)
+    mx.eval(tokens)
+    assert tokens.tolist() == mx.argmax(lp, axis=-1).tolist()
+
+
+def test_all_greedy_matches_the_sorted_path_token_for_token():
+    # The fast path must not drift from what batched_row_sample computed.
+    B, V = 5, 64
+    lp = _log_normalize(mx.random.normal((B, V), key=mx.random.key(2)))
+    fast = _PositionedTargetSampler([SamplingConfig(temperature=0.0)] * B)(lp)
+    slow = batched_row_sample(
+        lp,
+        temperature=mx.zeros((B,), mx.float32),
+        top_p=mx.ones((B,), mx.float32),
+        top_k=mx.zeros((B,), mx.int32),
+        min_p=mx.zeros((B,), mx.float32),
+        keys=_keys(B),
+    )
+    mx.eval(fast, slow)
+    assert fast.tolist() == slow.tolist()
+
+
+def test_all_greedy_ignores_every_filter():
+    # make_sampler returns argmax at temperature 0 regardless of top_k/top_p/
+    # min_p and the three modes, and so must the fast path -- it must not
+    # quietly become "argmax of the filtered distribution".
+    B, V = 3, 48
+    lp = _log_normalize(mx.random.normal((B, V), key=mx.random.key(3)) * 2.0)
+    cfg = SamplingConfig(
+        temperature=0.0,
+        top_p=0.1,
+        top_k=1,
+        min_p=0.9,
+        top_n_sigma=1.0,
+        p_less=True,
+        typical_p=0.5,
+    )
+    with _no_sorting():
+        tokens = _PositionedTargetSampler([cfg] * B)(lp)
+    mx.eval(tokens)
+    assert tokens.tolist() == mx.argmax(lp, axis=-1).tolist()
+
+
+def test_all_greedy_3d_verify_block_skips_sorted_space():
+    B, T, V = 2, 6, 32
+    lp = _log_normalize(mx.random.normal((B, T, V), key=mx.random.key(4)))
+    sampler = _PositionedTargetSampler([SamplingConfig(temperature=0.0)] * B)
+    with _no_sorting():
+        tokens = sampler(lp)
+    mx.eval(tokens)
+    assert tokens.tolist() == mx.argmax(lp, axis=-1).tolist()
+
+
+def test_all_greedy_bfloat16_matches_the_sorted_path():
+    B, V = 3, 32
+    lp = _log_normalize(mx.random.normal((B, V), key=mx.random.key(5))).astype(
+        mx.bfloat16
+    )
+    with _no_sorting():
+        fast = _PositionedTargetSampler([SamplingConfig(temperature=0.0)] * B)(lp)
+    slow = batched_row_sample(
+        lp,
+        temperature=mx.zeros((B,), mx.float32),
+        top_p=mx.ones((B,), mx.float32),
+        top_k=mx.zeros((B,), mx.int32),
+        min_p=mx.zeros((B,), mx.float32),
+        keys=_keys(B),
+    )
+    mx.eval(fast, slow)
+    assert fast.tolist() == slow.tolist()
+
+
+def test_mixed_batch_still_takes_the_sorted_path():
+    # One temperature>0 row is enough to need the real chain; the greedy rows
+    # in that batch must still come out as argmax.
+    B, V = 3, 40
+    lp = _log_normalize(mx.random.normal((B, V), key=mx.random.key(6)))
+    sampler = _PositionedTargetSampler(
+        [
+            SamplingConfig(temperature=0.0),
+            SamplingConfig(temperature=1.0, seed=1),
+            SamplingConfig(temperature=0.0),
+        ]
+    )
+    tokens = sampler(lp)
+    argmax = mx.argmax(lp, axis=-1)
+    mx.eval(tokens, argmax)
+    assert tokens[0].tolist() == argmax[0].tolist()
+    assert tokens[2].tolist() == argmax[2].tolist()
+    with pytest.raises(AssertionError, match="argsort called"):
+        with _no_sorting():
+            mx.eval(sampler(lp))
+
+
+def test_tiny_but_nonzero_temperature_still_samples():
+    # The fast path's threshold must agree with the chain's: a row just above
+    # _GREEDY_EPS is a sampled row. A uniform distribution separates the two
+    # cleanly -- argmax is a constant, sampling is not, at any temperature.
+    mx.random.seed(4)
+    V = 64
+    lp = _log_normalize(mx.zeros((1, V)))
+    sampler = _PositionedTargetSampler([SamplingConfig(temperature=1e-4, seed=1)])
+    assert len({int(sampler(lp)[0]) for _ in range(40)}) > 1
