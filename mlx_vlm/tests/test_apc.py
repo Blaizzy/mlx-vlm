@@ -1421,15 +1421,38 @@ def _tiny_exact_cache(tokens):
     return [c]
 
 
-def test_a_short_first_prompt_does_not_store_a_one_token_snapshot():
+def test_default_checkpoint_guard_preserves_final_prefill_boundary(monkeypatch):
+    from mlx_vlm.models.cache import ArraysCache, KVCache
+
+    monkeypatch.delenv("APC_CHECKPOINT_GUARD_TOKENS", raising=False)
+    monkeypatch.delenv("APC_EXACT_PREFIX_GUARD_TOKENS", raising=False)
+
+    class HybridModel:
+        @staticmethod
+        def make_cache():
+            return [ArraysCache(size=1), KVCache()]
+
+    manager = APCManager(num_blocks=8, block_size=16)
+    coordinator = manager.coordinator(HybridModel())
+    tokens = list(range(64))
+
+    assert manager.exact_cache_guard_tokens == 1
+    assert coordinator.checkpoint_len(tokens, set()) == len(tokens) - 1
+
+
+def test_a_short_first_prompt_does_not_store_an_undersized_snapshot(monkeypatch):
+    monkeypatch.delenv("APC_CHECKPOINT_GUARD_TOKENS", raising=False)
+    monkeypatch.delenv("APC_EXACT_PREFIX_GUARD_TOKENS", raising=False)
     manager = APCManager(num_blocks=8, block_size=16)
     short = [1, 2, 3]
 
     desired = len(short) - manager.exact_cache_guard_tokens
     prefix_len = apc_module.adjust_prefix_to_text_suffix_boundary(short, desired, [])
 
-    assert prefix_len == 0
-    assert not manager.store_exact_cache(short[:1], _tiny_exact_cache(short[:1]))
+    assert prefix_len == len(short) - 1
+    assert not manager.store_exact_cache(
+        short[:prefix_len], _tiny_exact_cache(short[:prefix_len])
+    )
 
 
 def test_a_short_prompt_cannot_poison_later_lookups():

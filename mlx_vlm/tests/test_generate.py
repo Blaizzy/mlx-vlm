@@ -1939,6 +1939,50 @@ def test_generate_step_schedules_final_prefill_async():
     assert events[0] == "async"
 
 
+def test_generate_step_preserves_explicit_prompt_position_metadata():
+    model = MagicMock()
+    model.language_model.supports_logits_to_keep = False
+    model.language_model.return_value = MagicMock(
+        logits=mx.zeros((1, 1, 4)),
+        cross_attention_states=None,
+        encoder_outputs=None,
+    )
+
+    full_position_ids = mx.array([[10, 11]], dtype=mx.int32)
+    full_rope_deltas = mx.array([[7]], dtype=mx.int32)
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 2, 4))
+    embedding_output.to_dict.return_value = {
+        "position_ids": mx.array([[0, 1]], dtype=mx.int32),
+        "rope_deltas": mx.array([[0]], dtype=mx.int32),
+    }
+    model.get_input_embeddings.return_value = embedding_output
+
+    with (
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+    ):
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1, 2]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            prompt_cache=[],
+            max_tokens=1,
+            position_ids=full_position_ids,
+            rope_deltas=full_rope_deltas,
+        )
+        next(gen)
+
+    # The generator prepares the following decode step before yielding the
+    # current token, so inspect the first (prompt/suffix) forward call.
+    call_kwargs = model.language_model.call_args_list[0].kwargs
+    assert bool(mx.array_equal(call_kwargs["position_ids"], full_position_ids))
+    assert bool(mx.array_equal(call_kwargs["rope_deltas"], full_rope_deltas))
+
+
 @pytest.mark.parametrize(("verbose", "disabled"), [(False, True), (True, False)])
 def test_generate_step_prefill_tqdm_respects_verbose(verbose, disabled):
     pbar = MagicMock()
@@ -2714,10 +2758,40 @@ def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
         )
 
     assert ok is False
+    assert "position_ids" not in kwargs
     assert "rope_deltas" not in kwargs
     assert bool(mx.array_equal(language_model._rope_deltas, rope_deltas_before))
     assert bool(mx.array_equal(language_model._position_ids, position_ids_before))
     assert "falling back to cold prefill" in caplog.text
+
+
+def test_cached_prefix_rope_forwards_full_prompt_metadata():
+    position_ids = mx.array([[0, 1, 2, 3]], dtype=mx.int32)
+    rope_deltas = mx.array([[7]], dtype=mx.int32)
+
+    class RopeLanguageModel:
+        _position_ids = None
+        _rope_deltas = None
+
+        @staticmethod
+        def get_rope_index(*args, **kwargs):
+            return position_ids, rope_deltas
+
+    language_model = RopeLanguageModel()
+    kwargs = {}
+
+    ok = _prime_cached_prefix_rope_state(
+        SimpleNamespace(language_model=language_model),
+        mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+        None,
+        kwargs,
+    )
+
+    assert ok is True
+    assert bool(mx.array_equal(kwargs["position_ids"], position_ids))
+    assert bool(mx.array_equal(kwargs["rope_deltas"], rope_deltas))
+    assert bool(mx.array_equal(language_model._position_ids, position_ids))
+    assert bool(mx.array_equal(language_model._rope_deltas, rope_deltas))
 
 
 class TestPrefixCacheReuseTrim:

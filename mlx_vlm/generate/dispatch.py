@@ -645,6 +645,11 @@ def _prime_cached_prefix_rope_state(
         lm._position_ids = position_ids
     if hasattr(lm, "_rope_deltas"):
         lm._rope_deltas = rope_deltas
+    # ``generate_step`` prepares embeddings after APC has trimmed the input to
+    # the uncached suffix. Preserve the full-prompt positions explicitly so a
+    # Qwen-style embedding helper cannot replace them with suffix-local 0..N
+    # positions. The language model slices these arrays at its cache offset.
+    kwargs["position_ids"] = position_ids
     kwargs["rope_deltas"] = rope_deltas
     return True
 
