@@ -28,8 +28,7 @@ class DSparkConfig(DFlashConfig):
         dflash_cfg = flat.pop("dflash_config", None) or {}
         if dflash_cfg.get("projector_type") != "dspark":
             raise ValueError(
-                "DSpark checkpoints require "
-                "dflash_config.projector_type='dspark'."
+                "DSpark checkpoints require " "dflash_config.projector_type='dspark'."
             )
 
         for key in ("mask_token_id", "target_layer_ids"):

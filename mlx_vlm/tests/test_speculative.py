@@ -2257,18 +2257,18 @@ def test_dspark_draft_uses_full_trained_block_for_two_proposals():
     assert drafter.max_runtime_block_size == 8
     assert drafter.prefill_memory_bytes_per_token == 16
     assert speculative_utils._dflash_block_total(drafter, None) == 8
-    assert _dflash_next_block_size(
-        drafter,
-        drafter.max_runtime_block_size,
-        64,
-        drafter.dflash_initial_block_size,
-    ) == 4
+    assert (
+        _dflash_next_block_size(
+            drafter,
+            drafter.max_runtime_block_size,
+            64,
+            drafter.dflash_initial_block_size,
+        )
+        == 4
+    )
     drafter.accept_lens = [0]
     drafter.draft_lens = [3]
-    assert (
-        _dflash_next_block_size(drafter, drafter.max_runtime_block_size, 64)
-        == 3
-    )
+    assert _dflash_next_block_size(drafter, drafter.max_runtime_block_size, 64) == 3
     seen = {}
 
     def fake_hidden(self, inputs, target_hidden, cache):
@@ -2277,9 +2277,7 @@ def test_dspark_draft_uses_full_trained_block_for_two_proposals():
 
     def fake_logits(self, hidden):
         assert hidden.shape[1] == 2
-        return mx.array(
-            [[[0.0, 5.0, 0.0, 0.0], [0.0, 0.0, 5.0, 0.0]]]
-        )
+        return mx.array([[[0.0, 5.0, 0.0, 0.0], [0.0, 0.0, 5.0, 0.0]]])
 
     drafter._hidden = MethodType(fake_hidden, drafter)
     drafter._logits = MethodType(fake_logits, drafter)

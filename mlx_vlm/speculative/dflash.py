@@ -250,9 +250,7 @@ def _dflash_rounds_batch(
         ):
             bs = min(block_total, min(remaining))
         else:
-            bs = _dflash_next_block_size(
-                draft_model, block_total, min(remaining)
-            )
+            bs = _dflash_next_block_size(draft_model, block_total, min(remaining))
         if bs <= 1:
             break
 

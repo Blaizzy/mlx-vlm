@@ -12,9 +12,7 @@ class VanillaMarkov(nn.Module):
     def __init__(self, config: DSparkConfig):
         super().__init__()
         self.markov_w1 = nn.Embedding(config.vocab_size, config.markov_rank)
-        self.markov_w2 = nn.Linear(
-            config.markov_rank, config.vocab_size, bias=False
-        )
+        self.markov_w2 = nn.Linear(config.markov_rank, config.vocab_size, bias=False)
 
     def prev_embeddings(self, token_ids: mx.array) -> mx.array:
         return self.markov_w1(token_ids)
