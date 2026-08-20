@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,8 +66,6 @@ from mlx_vlm.models.ernie_image.weights import (
     sanitize_transformer_weights,
 )
 from mlx_vlm.models.flux2.vae import Flux2VAE
-
-convert_module = importlib.import_module("mlx_vlm.convert")
 
 
 def _write_layout(root: Path, *, turbo: bool = True) -> None:
@@ -702,18 +699,21 @@ def test_conversion_detection_and_layout_metadata(tmp_path: Path) -> None:
     )
 
 
-def test_main_convert_routes_ernie_before_vlm_loader(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    "mode,expected_bits,expected_group_size",
+    [("affine", 4, 64), ("mxfp8", 8, 32)],
+)
+def test_ernie_convert_resolves_hub_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mode: str,
+    expected_bits: int,
+    expected_group_size: int,
 ) -> None:
     _write_layout(tmp_path)
     calls = {}
     monkeypatch.setattr(
-        convert_module, "get_model_path", lambda *args, **kwargs: tmp_path
-    )
-    monkeypatch.setattr(
-        convert_module,
-        "fetch_from_hub",
-        lambda *args, **kwargs: pytest.fail("VLM loader should not be called"),
+        ernie_convert, "get_model_path", lambda *args, **kwargs: tmp_path
     )
 
     def fake_convert(model_path, output_path, **kwargs):
@@ -722,14 +722,20 @@ def test_main_convert_routes_ernie_before_vlm_loader(
 
     monkeypatch.setattr(ernie_convert, "convert_ernie_image", fake_convert)
     output = tmp_path.parent / "converted"
-    result = convert_module.convert(
+    result = ernie_convert.convert(
         "baidu/ERNIE-Image-Turbo",
-        str(output),
+        output,
         quantize=True,
-        q_mode="mxfp8",
+        q_mode=mode,
         q_group_size=None,
         q_bits=None,
     )
     assert result == output
     assert calls["model_path"] == tmp_path
-    assert calls["q_mode"] == "mxfp8"
+    assert calls["source_id"] == "baidu/ERNIE-Image-Turbo"
+    assert calls["q_mode"] == mode
+    params = _quantization_parameters(
+        calls["q_mode"], calls["q_group_size"], calls["q_bits"]
+    )
+    assert params["bits"] == expected_bits
+    assert params["group_size"] == expected_group_size

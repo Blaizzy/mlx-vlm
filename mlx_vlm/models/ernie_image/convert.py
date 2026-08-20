@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import gc
 import json
 import shutil
@@ -11,7 +12,13 @@ import mlx.core as mx
 from mlx import nn
 from mlx.utils import tree_flatten, tree_map_with_path
 
-from mlx_vlm.utils import create_model_card, make_shards, upload_to_hub
+from mlx_vlm.utils import (
+    MODEL_CONVERSION_DTYPES,
+    create_model_card,
+    get_model_path,
+    make_shards,
+    upload_to_hub,
+)
 
 from .config import ErnieImageTransformerConfig, get_variant, variant_from_local_path
 from .text_encoder import ErnieImageTextConfig
@@ -112,8 +119,9 @@ def convert_ernie_image(
         (
             "transformer",
             lambda: load_transformer(source),
-            lambda path, module: path.startswith("layers.")
-            and hasattr(module, "to_quantized"),
+            lambda path, module: (
+                path.startswith("layers.") and hasattr(module, "to_quantized")
+            ),
         ),
         (
             "vae",
@@ -183,6 +191,87 @@ def convert_ernie_image(
     if upload_repo is not None:
         upload_to_hub(destination, upload_repo)
     return destination
+
+
+def convert(
+    model: str,
+    output_path: str | Path,
+    *,
+    revision: str | None = None,
+    quantize: bool = False,
+    q_group_size: int | None = None,
+    q_bits: int | None = None,
+    q_mode: str = "affine",
+    dtype: str | None = None,
+    upload_repo: str | None = None,
+) -> Path:
+    model_path = get_model_path(model, revision=revision)
+    return convert_ernie_image(
+        model_path,
+        output_path,
+        source_id=None if Path(model).expanduser().exists() else model,
+        quantize=quantize,
+        q_group_size=q_group_size,
+        q_bits=q_bits,
+        q_mode=q_mode,
+        dtype=dtype,
+        upload_repo=upload_repo,
+        revision=revision,
+    )
+
+
+def configure_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Convert an ERNIE-Image Diffusers checkpoint to MLX format."
+    )
+    parser.add_argument(
+        "--hf-path",
+        "--model",
+        dest="model",
+        required=True,
+        help="Local checkpoint path or Hugging Face repository ID.",
+    )
+    parser.add_argument(
+        "--revision",
+        default=None,
+        help="Hugging Face revision to download.",
+    )
+    parser.add_argument(
+        "--mlx-path",
+        dest="output_path",
+        default="mlx_model",
+        help="Directory for the converted MLX model.",
+    )
+    parser.add_argument(
+        "-q",
+        "--quantize",
+        action="store_true",
+        help="Quantize compatible transformer, text encoder, and VAE layers.",
+    )
+    parser.add_argument("--q-group-size", type=int, default=None)
+    parser.add_argument("--q-bits", type=int, default=None)
+    parser.add_argument(
+        "--q-mode",
+        choices=tuple(_MODE_DEFAULTS),
+        default="affine",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=MODEL_CONVERSION_DTYPES,
+        default=None,
+        help="Floating-point dtype for converted weights.",
+    )
+    parser.add_argument(
+        "--upload-repo",
+        default=None,
+        help="Hugging Face repository for the converted model.",
+    )
+    return parser
+
+
+def main() -> None:
+    args = configure_parser().parse_args()
+    convert(**vars(args))
 
 
 def _vae_checkpoint_has_encoder(source: Path) -> bool:
@@ -422,7 +511,13 @@ def _read_json(path: Path, *, required: bool) -> dict[str, Any] | None:
     return value
 
 
+if __name__ == "__main__":
+    main()
+
+
 __all__ = [
+    "configure_parser",
+    "convert",
     "convert_ernie_image",
     "is_ernie_image_checkpoint",
 ]
