@@ -643,6 +643,58 @@ def _is_text_only_config(config: dict) -> bool:
     )
 
 
+def _quantization_path_aliases(
+    path: str, model_type: Optional[str] = None
+) -> Tuple[str, ...]:
+    """Return checkpoint quantization keys that may refer to a module path."""
+    aliases = [path]
+    for prefix in ("language_model.", "model."):
+        for alias in tuple(aliases):
+            if alias.startswith(prefix):
+                aliases.append(alias[len(prefix) :])
+
+    if model_type == "deepseek_v4":
+        for alias in tuple(aliases):
+            aliases.append(alias.replace("model.embed_tokens", "embed"))
+            aliases.append(alias.replace("model.norm", "norm"))
+            aliases.append(alias.replace("lm_head", "head"))
+            aliases.append(
+                alias.replace(".ffn.gate.e_score_correction_bias", ".ffn.gate")
+            )
+
+        for alias in tuple(aliases):
+            for module_name, checkpoint_name in (
+                ("gate_proj", "w1"),
+                ("down_proj", "w2"),
+                ("up_proj", "w3"),
+            ):
+                module_path = f".ffn.shared_experts.{module_name}"
+                offset = alias.find(module_path)
+                if offset < 0:
+                    continue
+                end = offset + len(module_path)
+                if end == len(alias) or alias[end] == ".":
+                    aliases.append(
+                        alias[:offset]
+                        + f".ffn.shared_experts.{checkpoint_name}"
+                        + alias[end:]
+                    )
+
+    return tuple(dict.fromkeys(aliases))
+
+
+def _quantization_for_module_path(
+    quantization: dict, path: str, model_type: Optional[str] = None
+) -> Optional[dict]:
+    for alias in _quantization_path_aliases(path, model_type):
+        value = quantization.get(alias)
+        if isinstance(value, dict):
+            return value
+        if value is False:
+            return {}
+    return None
+
+
 def _drop_modules_without_weights(model: nn.Module, weights: dict) -> None:
     weighted_modules = {key.partition(".")[0] for key in weights}
     dropped_modules = []
@@ -896,6 +948,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         replace_one_bit_modules(quantized_model, quantization, weights)
 
         def get_class_predicate(p, m):
+            per_module_quantization = _quantization_for_module_path(
+                config["quantization"], p, config.get("model_type")
+            )
             # Skip legacy multimodal layers unless the checkpoint has quantized
             # tensors for this exact module.
             if (
@@ -905,17 +960,17 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             ):
                 return False
             # Skip 1-bit layers already replaced above.
-            if _quantization_for_path(config["quantization"], p).get("bits") == 1:
+            module_quantization = (
+                per_module_quantization
+                if per_module_quantization is not None
+                else _quantization_for_path(config["quantization"], p)
+            )
+            if module_quantization.get("bits") == 1:
                 return False
-            # Handle custom per layer quantizations. Config keys from the
-            # underlying text checkpoint omit the mlx-vlm ``language_model.``
-            # wrapper prefix that loaded module paths carry, so also match with
-            # that prefix stripped (e.g. per-layer 8-bit MoE router gates).
-            override = config["quantization"].get(p)
-            if override is None and p.startswith("language_model."):
-                override = config["quantization"].get(p[len("language_model.") :])
-            if isinstance(override, dict):
-                return override
+            # Handle custom per-layer quantization, including aliases introduced
+            # by model wrappers and checkpoint-name sanitization.
+            if per_module_quantization is not None:
+                return per_module_quantization
             if not hasattr(m, "to_quantized"):
                 return False
             # Skip layers not divisible by 64
