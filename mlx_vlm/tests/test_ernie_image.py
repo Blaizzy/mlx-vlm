@@ -110,6 +110,16 @@ def test_ernie_local_variant_uses_native_metadata(tmp_path: Path) -> None:
     assert variant_from_local_path(tmp_path).name == "ernie-image"
 
 
+def test_ernie_local_variant_prefers_recorded_source(tmp_path: Path) -> None:
+    _write_layout(tmp_path, turbo=False)
+    metadata_path = tmp_path / "mlx_ernie_image.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["source"] = "baidu/ERNIE-Image-Turbo"
+    metadata_path.write_text(json.dumps(metadata))
+
+    assert variant_from_local_path(tmp_path).name == "ernie-image-turbo"
+
+
 def test_ernie_dispatches_ids_metadata_and_mflux_indexes(tmp_path: Path) -> None:
     _write_layout(tmp_path)
     assert (

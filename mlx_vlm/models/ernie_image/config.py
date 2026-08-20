@@ -117,6 +117,11 @@ def variant_from_local_path(model_path: str | Path) -> ErnieImageVariant:
     native_metadata = root / "mlx_ernie_image.json"
     if native_metadata.exists():
         metadata = json.loads(native_metadata.read_text())
+        if source := metadata.get("source"):
+            try:
+                return get_variant(str(source))
+            except ValueError:
+                pass
         if variant := metadata.get("variant"):
             return get_variant(str(variant))
 

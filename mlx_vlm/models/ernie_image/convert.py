@@ -75,13 +75,13 @@ def convert_ernie_image(
         raise ValueError("ERNIE-Image conversion output must differ from its source")
     if not is_ernie_image_checkpoint(source):
         raise ValueError(f"Not an ERNIE-Image checkpoint: {source}")
-    try:
+    if source_id is not None:
+        try:
+            variant = get_variant(source_id)
+        except ValueError:
+            variant = variant_from_local_path(source)
+    else:
         variant = variant_from_local_path(source)
-    except ValueError:
-        source_name = (source_id or str(source)).lower()
-        variant = get_variant(
-            "ernie-image-turbo" if "turbo" in source_name else "ernie-image"
-        )
     precision = getattr(mx, dtype) if dtype is not None else mx.bfloat16
     if precision not in (mx.float16, mx.bfloat16, mx.float32):
         raise ValueError(f"Unsupported ERNIE-Image conversion dtype: {dtype}")
