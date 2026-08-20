@@ -17,6 +17,7 @@ from mlx_vlm.utils import (
     StoppingCriteria,
     _drop_modules_without_weights,
     _load_safetensors,
+    _quantization_for_module_path,
     _quantization_path_aliases,
     _transform_modelopt_nvfp4_weights,
     apply_generation_config_defaults,
@@ -841,10 +842,6 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
         ("language_model.model.norm", "norm"),
         ("language_model.lm_head", "head"),
         (
-            "language_model.model.layers.0.ffn.gate.e_score_correction_bias",
-            "layers.0.ffn.gate",
-        ),
-        (
             "language_model.model.layers.0.ffn.shared_experts.gate_proj",
             "layers.0.ffn.shared_experts.w1",
         ),
@@ -871,6 +868,24 @@ def test_deepseek_v4_sanitized_aliases_are_model_specific():
 
     assert "layers.0.ffn.shared_experts.gate_proj" in aliases
     assert "layers.0.ffn.shared_experts.w1" not in aliases
+
+
+def test_deepseek_v4_module_path_spelling_wins_over_sanitized_alias():
+    module_path = "language_model.model.layers.0.ffn.shared_experts.gate_proj"
+    module_path_spec = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    sanitized_alias_spec = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    quantization = {
+        "model.layers.0.ffn.shared_experts.gate_proj": module_path_spec,
+        "layers.0.ffn.shared_experts.w1": sanitized_alias_spec,
+    }
+
+    resolved = _quantization_for_module_path(
+        quantization,
+        module_path,
+        "deepseek_v4",
+    )
+
+    assert resolved == module_path_spec
 
 
 def test_load_model_matches_deepseek_v4_quantization_aliases():

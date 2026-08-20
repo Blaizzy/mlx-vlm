@@ -658,9 +658,6 @@ def _quantization_path_aliases(
             aliases.append(alias.replace("model.embed_tokens", "embed"))
             aliases.append(alias.replace("model.norm", "norm"))
             aliases.append(alias.replace("lm_head", "head"))
-            aliases.append(
-                alias.replace(".ffn.gate.e_score_correction_bias", ".ffn.gate")
-            )
 
         for alias in tuple(aliases):
             for module_name, checkpoint_name in (
