@@ -644,46 +644,24 @@ def _is_text_only_config(config: dict) -> bool:
 
 
 def _quantization_path_aliases(
-    path: str, model_type: Optional[str] = None
+    path: str, model: Optional[nn.Module] = None
 ) -> Tuple[str, ...]:
     """Return checkpoint quantization keys that may refer to a module path."""
     aliases = [path]
-    for prefix in ("language_model.", "model."):
-        for alias in tuple(aliases):
-            if alias.startswith(prefix):
-                aliases.append(alias[len(prefix) :])
+    if path.startswith("language_model."):
+        aliases.append(path[len("language_model.") :])
 
-    if model_type == "deepseek_v4":
-        for alias in tuple(aliases):
-            aliases.append(alias.replace("model.embed_tokens", "embed"))
-            aliases.append(alias.replace("model.norm", "norm"))
-            aliases.append(alias.replace("lm_head", "head"))
-
-        for alias in tuple(aliases):
-            for module_name, checkpoint_name in (
-                ("gate_proj", "w1"),
-                ("down_proj", "w2"),
-                ("up_proj", "w3"),
-            ):
-                module_path = f".ffn.shared_experts.{module_name}"
-                offset = alias.find(module_path)
-                if offset < 0:
-                    continue
-                end = offset + len(module_path)
-                if end == len(alias) or alias[end] == ".":
-                    aliases.append(
-                        alias[:offset]
-                        + f".ffn.shared_experts.{checkpoint_name}"
-                        + alias[end:]
-                    )
+    model_aliases = getattr(model, "quantization_path_aliases", None)
+    if callable(model_aliases):
+        aliases.extend(model_aliases(path))
 
     return tuple(dict.fromkeys(aliases))
 
 
 def _quantization_for_module_path(
-    quantization: dict, path: str, model_type: Optional[str] = None
+    quantization: dict, path: str, model: Optional[nn.Module] = None
 ) -> Optional[dict]:
-    for alias in _quantization_path_aliases(path, model_type):
+    for alias in _quantization_path_aliases(path, model):
         value = quantization.get(alias)
         if isinstance(value, dict):
             return value
@@ -946,7 +924,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
         def get_class_predicate(p, m):
             per_module_quantization = _quantization_for_module_path(
-                config["quantization"], p, config.get("model_type")
+                config["quantization"], p, model
             )
             # Skip legacy multimodal layers unless the checkpoint has quantized
             # tensors for this exact module.
@@ -964,8 +942,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
             if module_quantization.get("bits") == 1:
                 return False
-            # Handle custom per-layer quantization, including aliases introduced
-            # by model wrappers and checkpoint-name sanitization.
+            # Handle custom per-layer quantization, including aliases supplied
+            # by the model.
             if per_module_quantization is not None:
                 return per_module_quantization
             if not hasattr(m, "to_quantized"):

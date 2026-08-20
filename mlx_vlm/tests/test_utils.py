@@ -830,47 +830,24 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
     assert quantize.call_args.kwargs["mode"] == "affine"
 
 
-@pytest.mark.parametrize(
-    ("module_path", "checkpoint_path"),
-    [
-        (
-            "language_model.model.layers.0.attn.wq_a",
-            "layers.0.attn.wq_a",
-        ),
-        ("model.layers.0.attn.wq_a", "layers.0.attn.wq_a"),
-        ("language_model.model.embed_tokens", "embed"),
-        ("language_model.model.norm", "norm"),
-        ("language_model.lm_head", "head"),
-        (
-            "language_model.model.layers.0.ffn.shared_experts.gate_proj",
-            "layers.0.ffn.shared_experts.w1",
-        ),
-        (
-            "language_model.model.layers.0.ffn.shared_experts.down_proj",
-            "layers.0.ffn.shared_experts.w2",
-        ),
-        (
-            "language_model.model.layers.0.ffn.shared_experts.up_proj",
-            "layers.0.ffn.shared_experts.w3",
-        ),
-    ],
-)
-def test_deepseek_v4_quantization_path_aliases(module_path, checkpoint_path):
-    aliases = _quantization_path_aliases(module_path, "deepseek_v4")
-
-    assert checkpoint_path in aliases
-
-
-def test_deepseek_v4_sanitized_aliases_are_model_specific():
+def test_quantization_path_aliases_require_a_model_hook_for_model_specific_names():
     module_path = "language_model.model.layers.0.ffn.shared_experts.gate_proj"
 
-    aliases = _quantization_path_aliases(module_path, "qwen3")
+    aliases = _quantization_path_aliases(module_path)
 
-    assert "layers.0.ffn.shared_experts.gate_proj" in aliases
+    assert "model.layers.0.ffn.shared_experts.gate_proj" in aliases
+    assert "layers.0.ffn.shared_experts.gate_proj" not in aliases
     assert "layers.0.ffn.shared_experts.w1" not in aliases
 
 
 def test_deepseek_v4_module_path_spelling_wins_over_sanitized_alias():
+    from mlx_vlm.models import deepseek_v4
+
+    class AliasModel(nn.Module):
+        @staticmethod
+        def quantization_path_aliases(path):
+            return deepseek_v4.Model.quantization_path_aliases(path)
+
     module_path = "language_model.model.layers.0.ffn.shared_experts.gate_proj"
     module_path_spec = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
     sanitized_alias_spec = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
@@ -882,13 +859,15 @@ def test_deepseek_v4_module_path_spelling_wins_over_sanitized_alias():
     resolved = _quantization_for_module_path(
         quantization,
         module_path,
-        "deepseek_v4",
+        AliasModel(),
     )
 
     assert resolved == module_path_spec
 
 
 def test_load_model_matches_deepseek_v4_quantization_aliases():
+    from mlx_vlm.models import deepseek_v4
+
     class FakeConfig:
         @classmethod
         def from_dict(cls, config):
@@ -911,6 +890,10 @@ def test_load_model_matches_deepseek_v4_quantization_aliases():
         def load_weights(self, weights, strict=True):
             self.loaded_weights = weights
             self.loaded_strict = strict
+
+        @staticmethod
+        def quantization_path_aliases(path):
+            return deepseek_v4.Model.quantization_path_aliases(path)
 
     fake_model_class = SimpleNamespace(
         ModelConfig=FakeConfig, Model=FakeDeepseekV4Model

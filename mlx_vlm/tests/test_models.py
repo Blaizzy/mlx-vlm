@@ -2720,6 +2720,41 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(converted[wkey] == weight.view(mx.uint32)))
         self.assertEqual(converted[skey].shape, (128, 4))
 
+    def test_deepseek_v4_quantization_path_aliases(self):
+        from mlx_vlm.models import deepseek_v4
+
+        cases = (
+            (
+                "language_model.model.layers.0.attn.wq_a",
+                "layers.0.attn.wq_a",
+            ),
+            ("model.layers.0.attn.wq_a", "layers.0.attn.wq_a"),
+            ("language_model.model.embed_tokens", "embed"),
+            ("language_model.model.norm", "norm"),
+            ("language_model.lm_head", "head"),
+            (
+                "language_model.model.layers.0.ffn.shared_experts.gate_proj",
+                "layers.0.ffn.shared_experts.w1",
+            ),
+            (
+                "language_model.model.layers.0.ffn.shared_experts.down_proj",
+                "layers.0.ffn.shared_experts.w2",
+            ),
+            (
+                "language_model.model.layers.0.ffn.shared_experts.up_proj",
+                "layers.0.ffn.shared_experts.w3",
+            ),
+            (
+                "language_model.model.layers.0.ffn.shared_experts.gate_proj.weight",
+                "layers.0.ffn.shared_experts.w1.weight",
+            ),
+        )
+
+        for module_path, checkpoint_path in cases:
+            with self.subTest(module_path=module_path):
+                aliases = deepseek_v4.Model.quantization_path_aliases(module_path)
+                self.assertIn(checkpoint_path, aliases)
+
     def test_glm_moe_dsa_language_model(self):
         from mlx_vlm.models import glm_moe_dsa
 
