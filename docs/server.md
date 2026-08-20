@@ -115,8 +115,8 @@ If `--model` is omitted, the model is loaded on the first request.
 - `/models` and `/v1/models` - List models available locally
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
-- `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
-- `/v1/rerank` - Rank text or multimodal documents by relevance to a query
+- `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models — see [Embeddings & Reranking](embeddings-and-reranking.md)
+- `/v1/rerank` - Rank text or multimodal documents by relevance to a query — see [Embeddings & Reranking](embeddings-and-reranking.md)
 - `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
 - `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models
 - `/audio/translations` and `/v1/audio/translations` - OpenAI-compatible audio translation endpoint for STT models that expose a translation task
@@ -132,35 +132,6 @@ If `--model` is omitted, the model is loaded on the first request.
 ```sh
 curl "http://localhost:8080/models"
 ```
-
-### Embeddings
-
-```sh
-curl -X POST "http://localhost:8080/v1/embeddings" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "sentence-transformers/all-MiniLM-L6-v2",
-    "input": ["The quick brown fox.", "A fast auburn fox."]
-  }'
-```
-
-Preload a default with `--embedding-model <repo-or-path>`. Supported architectures: BERT, XLM-RoBERTa, ModernBERT, Qwen3-Embedding, EmbeddingGemma (gemma3), LFM2, SigLIP (text), Qwen3-VL-Embedding, and Llama-Nemotron-VL, plus LLM2Vec bidirectional Llama. ColBERT-style multi-vector models (ColIdefics3, ColQwen2.5) are also available for late-interaction use.
-
-### Reranking
-
-```sh
-curl -X POST "http://localhost:8080/v1/rerank" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "mlx-community/Qwen3-Reranker-0.6B-4bit",
-    "query": "What is the capital of France?",
-    "documents": ["Berlin is in Germany.", "Paris is the capital of France."],
-    "top_n": 1,
-    "return_documents": true
-  }'
-```
-
-Preload a default with `--reranker-model <repo-or-path>`. Supported text rerankers include one-label BERT, XLM-RoBERTa, and ModernBERT sequence-classification checkpoints, plus Qwen3 generative rerankers. Qwen3-VL rerankers also accept objects containing `text`, `image`, `image_url`, `video`, or `video_url`. Sequence-classification rerankers accept text pairs and do not support custom instructions.
 
 ### Text Input
 

@@ -88,6 +88,7 @@ nav:
     - Examples: examples.md
     - Guides:
         - Server: server.md
+        - Embeddings & Reranking: embeddings-and-reranking.md
         - Speculative Decoding: speculative-decoding.md
         - Quantization: quantization.md
         - KV Cache Quantization: kv-cache-quantization.md
