@@ -838,6 +838,91 @@ def test_exact_cache_disk_restore_preserves_rotating_kv(tmp_path, monkeypatch):
     manager.close()
 
 
+def test_exact_cache_disk_restore_preserves_deepseek_v4_empty_values(
+    tmp_path, monkeypatch
+):
+    """DeepSeek V4's K-only local cache persists its zero-width V tensor."""
+    from mlx_vlm.models.cache import CacheList, PoolingCache, RotatingKVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+
+    token_ids = list(range(40))
+    rotating = RotatingKVCache(max_size=8, keep=0)
+    rotating.keys = (
+        mx.arange(1 * 1 * 8 * 4, dtype=mx.float32)
+        .reshape(1, 1, 8, 4)
+        .astype(mx.bfloat16)
+    )
+    rotating.values = mx.zeros((1, 1, 8, 0), dtype=mx.bfloat16)
+    rotating.offset = len(token_ids)
+    rotating._idx = 3
+
+    pooled = PoolingCache(ratio=4)
+    pooled.pooled = mx.ones((1, 6, 4), dtype=mx.bfloat16)
+    index = PoolingCache(ratio=4)
+    index.pooled = mx.ones((1, 6, 2), dtype=mx.float32)
+    cache = CacheList(rotating, pooled, index)
+    mx.eval(rotating.keys, rotating.values, pooled.pooled, index.pooled)
+
+    disk = DiskBlockStore(tmp_path, namespace="deepseek-v4-empty-values")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [cache], extra_hash=19)
+    disk._q.join()
+    stats = manager.stats_snapshot()
+    assert stats["disk_writes"] == 1
+    assert stats["disk_write_failures"] == 0
+    assert stats["disk_exact_indexed"] == 1
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="deepseek-v4-empty-values")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    warm, matched_tokens = manager.lookup_exact_cache(
+        token_ids + [999],
+        extra_hash=19,
+    )
+
+    assert matched_tokens == len(token_ids)
+    assert warm is not None
+    assert manager.stats_snapshot()["disk_hits"] == 1
+    restored = warm[0]
+    assert isinstance(restored, CacheList)
+    restored_rotating = restored.caches[0]
+    assert restored_rotating.values.shape == (1, 1, 8, 0)
+    assert restored_rotating.values.dtype == mx.bfloat16
+    _assert_allclose(restored_rotating.keys, rotating.keys)
+    _assert_allclose(restored.caches[1].pooled, pooled.pooled)
+    _assert_allclose(restored.caches[2].pooled, index.pooled)
+    manager.close()
+
+
+def test_exact_cache_disk_write_stats_only_count_committed_files(tmp_path, monkeypatch):
+    from mlx_vlm.models.cache import KVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    token_ids = list(range(40))
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 2))
+    kv.values = mx.ones((1, 1, len(token_ids), 2))
+    kv.offset = len(token_ids)
+
+    def fail_after_creating_partial(path, *_args, **_kwargs):
+        open(path, "wb").close()
+        raise RuntimeError("synthetic serialization failure")
+
+    monkeypatch.setattr(apc_module.mx, "save_safetensors", fail_after_creating_partial)
+    disk = DiskBlockStore(tmp_path, namespace="failed-exact-write")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [kv])
+    disk._q.join()
+
+    stats = manager.stats_snapshot()
+    assert stats["disk_writes"] == 0
+    assert stats["disk_write_failures"] == 1
+    assert stats["disk_exact_indexed"] == 0
+    assert not list(disk.dir.glob(f"*{disk.SUFFIX}"))
+    manager.close()
+
+
 def test_model_apc_mode_distinguishes_block_and_exact_custom_cache():
     from mlx_vlm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
