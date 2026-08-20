@@ -21,7 +21,7 @@ positive multiples of 16.
 Convert the Turbo checkpoint to BF16:
 
 ```sh
-mlx_vlm.convert \
+python -m mlx_vlm.models.z_image.convert \
   --hf-path Tongyi-MAI/Z-Image-Turbo \
   --mlx-path ./Z-Image-Turbo-MLX
 ```
@@ -29,7 +29,7 @@ mlx_vlm.convert \
 Convert and quantize the transformer and text encoder:
 
 ```sh
-mlx_vlm.convert \
+python -m mlx_vlm.models.z_image.convert \
   --hf-path Tongyi-MAI/Z-Image-Turbo \
   --mlx-path ./Z-Image-Turbo-MLX-4bit \
   --quantize \

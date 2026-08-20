@@ -78,7 +78,7 @@ def test_detects_diffusers_z_image_model_index(tmp_path: Path) -> None:
     "mode,expected_bits,expected_group_size",
     [("affine", 4, 64), ("mxfp8", 8, 32)],
 )
-def test_generic_convert_dispatches_z_image(
+def test_z_image_convert_resolves_hub_model(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     mode: str,
@@ -90,10 +90,9 @@ def test_generic_convert_dispatches_z_image(
     (source / "model_index.json").write_text('{"_class_name":"ZImagePipeline"}')
     output = tmp_path / "output"
     calls = {}
-    convert_module = importlib.import_module("mlx_vlm.convert")
     z_image_convert = importlib.import_module("mlx_vlm.models.z_image.convert")
     monkeypatch.setattr(
-        convert_module, "get_model_path", lambda *args, **kwargs: source
+        z_image_convert, "get_model_path", lambda *args, **kwargs: source
     )
 
     def fake_convert(model_path, output_path, **kwargs):
@@ -101,9 +100,9 @@ def test_generic_convert_dispatches_z_image(
         return output
 
     monkeypatch.setattr(z_image_convert, "convert_z_image", fake_convert)
-    result = convert_module.convert(
+    result = z_image_convert.convert(
         "Tongyi-MAI/Z-Image-Turbo",
-        str(output),
+        output,
         quantize=True,
         q_mode=mode,
     )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 from pathlib import Path
@@ -9,7 +10,12 @@ import mlx.core as mx
 from mlx import nn
 
 from mlx_vlm.quant_utils import quantize_model
-from mlx_vlm.utils import save_weights, upload_to_hub
+from mlx_vlm.utils import (
+    MODEL_CONVERSION_DTYPES,
+    get_model_path,
+    save_weights,
+    upload_to_hub,
+)
 
 from .config import ZImageConfig
 from .text_encoder import ZImageTextEncoder, sanitize_text_encoder_weights
@@ -211,4 +217,106 @@ def convert_z_image(
     return destination
 
 
-__all__ = ["convert_z_image", "is_z_image_model_path"]
+def convert(
+    model: str,
+    output_path: str | Path,
+    *,
+    revision: str | None = None,
+    quantize: bool = False,
+    q_group_size: int | None = None,
+    q_bits: int | None = None,
+    q_mode: str = "affine",
+    dtype: str | None = None,
+    quantize_vae: bool = False,
+    upload_repo: str | None = None,
+) -> Path:
+    defaults = {
+        "affine": (64, 4),
+        "mxfp4": (32, 4),
+        "nvfp4": (16, 4),
+        "mxfp8": (32, 8),
+    }
+    default_group_size, default_bits = defaults[q_mode]
+    model_path = get_model_path(model, revision=revision)
+    return convert_z_image(
+        model_path,
+        output_path,
+        quantize=quantize,
+        q_group_size=q_group_size or default_group_size,
+        q_bits=q_bits or default_bits,
+        q_mode=q_mode,
+        dtype=dtype,
+        quantize_vae=quantize_vae,
+        upload_repo=upload_repo,
+    )
+
+
+def configure_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Convert a Z-Image Diffusers checkpoint to MLX format."
+    )
+    parser.add_argument(
+        "--hf-path",
+        "--model",
+        dest="model",
+        required=True,
+        help="Local checkpoint path or Hugging Face repository ID.",
+    )
+    parser.add_argument(
+        "--revision",
+        default=None,
+        help="Hugging Face revision to download.",
+    )
+    parser.add_argument(
+        "--mlx-path",
+        dest="output_path",
+        default="mlx_model",
+        help="Directory for the converted MLX model.",
+    )
+    parser.add_argument(
+        "-q",
+        "--quantize",
+        action="store_true",
+        help="Quantize the transformer and text encoder.",
+    )
+    parser.add_argument("--q-group-size", type=int, default=None)
+    parser.add_argument("--q-bits", type=int, default=None)
+    parser.add_argument(
+        "--q-mode",
+        choices=("affine", "mxfp4", "nvfp4", "mxfp8"),
+        default="affine",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=MODEL_CONVERSION_DTYPES,
+        default=None,
+        help="Floating-point dtype for converted weights.",
+    )
+    parser.add_argument(
+        "--quantize-vae",
+        action="store_true",
+        help="Also quantize compatible VAE layers.",
+    )
+    parser.add_argument(
+        "--upload-repo",
+        default=None,
+        help="Hugging Face repository for the converted model.",
+    )
+    return parser
+
+
+def main() -> None:
+    args = configure_parser().parse_args()
+    convert(**vars(args))
+
+
+if __name__ == "__main__":
+    main()
+
+
+__all__ = [
+    "configure_parser",
+    "convert",
+    "convert_z_image",
+    "is_z_image_model_path",
+]
