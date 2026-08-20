@@ -7,6 +7,7 @@ from .common import (
     _batch_cache_left_padding,
     _record_speculative_round,
     _SpeculativeSamplerRNG,
+    _target_verify_kwargs,
     generation_stream,
 )
 
@@ -165,11 +166,13 @@ def _eagle3_verify_target(
     sampler: Callable[[mx.array], mx.array],
     target_layer_ids: List[int],
 ):
+    target_verify_kwargs = _target_verify_kwargs(lm)
     if verify_input.shape[1] > 1 and "gemma4" in type(lm).__module__:
         first_out = lm(
             verify_input[:, :1],
             cache=prompt_cache,
             capture_layer_ids=target_layer_ids,
+            **target_verify_kwargs,
         )
         hidden_chunks = [mx.concatenate(first_out.hidden_states, axis=-1)]
         target_chunks = [sampler(first_out.logits)]
@@ -180,6 +183,7 @@ def _eagle3_verify_target(
                 verify_input[:, 1:],
                 cache=prompt_cache,
                 capture_layer_ids=target_layer_ids,
+                **target_verify_kwargs,
             )
             hidden_chunks.append(mx.concatenate(tail_out.hidden_states, axis=-1))
             target_chunks.append(sampler(tail_out.logits))
@@ -194,6 +198,7 @@ def _eagle3_verify_target(
         verify_input,
         cache=prompt_cache,
         capture_layer_ids=target_layer_ids,
+        **target_verify_kwargs,
     )
     hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
     target_tokens = sampler(verify_out.logits)

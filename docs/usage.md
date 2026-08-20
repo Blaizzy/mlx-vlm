@@ -49,6 +49,18 @@ python -m mlx_vlm.generate \
     --max-tokens 512 --temperature 0 --enable-thinking
 ```
 
+DFlash 2 is supported for Qwen3.8. Quantizing its drafter in memory and using
+block size 5 is recommended with the 4-bit target:
+
+```bash
+python -m mlx_vlm.generate \
+    --model mlx-community/Qwen3.8-27B-4bit \
+    --draft-model incoai/Qwen3.8-27B-DFlash2 \
+    --draft-bits 4 --draft-block-size 5 \
+    --prompt "Explain speculative decoding in three sentences." \
+    --max-tokens 512 --temperature 0
+```
+
 EAGLE-3 speculators are also supported and auto-detected from Speculators configs:
 
 ```bash
@@ -95,7 +107,7 @@ from mlx_vlm.generate import stream_generate
 from mlx_vlm.speculative.drafters import load_drafter
 
 model, processor = load("Qwen/Qwen3.5-4B")
-drafter = load_drafter("z-lab/Qwen3.5-4B-DFlash")
+drafter, draft_kind = load_drafter("z-lab/Qwen3.5-4B-DFlash")
 
 for result in stream_generate(
     model, processor,
@@ -103,6 +115,7 @@ for result in stream_generate(
     max_tokens=512,
     temperature=0,
     draft_model=drafter,
+    draft_kind=draft_kind,
     enable_thinking=True,
 ):
     print(result.text, end="", flush=True)

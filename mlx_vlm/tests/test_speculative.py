@@ -36,6 +36,7 @@ from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
     DRAFTER_KIND_BY_MODEL_TYPE,
     KNOWN_DRAFTER_KINDS,
+    quantize_drafter,
     resolve_drafter_kind,
     validate_drafter_compatibility,
 )
@@ -56,7 +57,16 @@ from mlx_vlm.speculative.drafters.glm4_moe_lite_mtp.split import split_glm4_moe_
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
-from mlx_vlm.speculative.drafters.qwen3_dflash import DFlashDraftModel, ModelConfig
+from mlx_vlm.speculative.drafters.qwen3_dflash import (
+    DFlash2DraftModel,
+    DFlashDraftModel,
+)
+from mlx_vlm.speculative.drafters.qwen3_dflash import Model as make_dflash_model
+from mlx_vlm.speculative.drafters.qwen3_dflash import ModelConfig
+from mlx_vlm.speculative.drafters.qwen3_dflash.dflash import (
+    CandidateSelector,
+    _grouped_dynamic_convolve,
+)
 from mlx_vlm.speculative.eagle3 import (
     _eagle3_block_settings,
     _eagle3_next_block_size,
@@ -65,6 +75,9 @@ from mlx_vlm.speculative.eagle3 import (
 )
 from mlx_vlm.speculative.utils import (
     _dflash_next_block_size,
+    _dflash_rejection_enabled,
+    _dflash_rejection_sample,
+    _dflash_verify_target,
     _effective_mtp_block_size,
     _format_speculative_stats,
     _mtp_draft_block_active,
@@ -596,13 +609,79 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
     linear.biases = linear.biases.astype(mx.bfloat16)
     x = mx.random.normal((1, 3, 512)).astype(mx.bfloat16)
 
-    ref = linear(x)
-    out = qwen_language._target_verify_quantized_linear(linear, x)
+    ref = qwen_language._target_verify_timewise(linear, x)
+    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
     mx.eval(ref, out)
 
     # The target kernel and MLX's quantized GEMM accumulate in different
     # orders, so BF16 rounding can differ by a small amount.
     assert bool(mx.allclose(ref, out, rtol=1e-2, atol=1e-2).item())
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_qwen_target_verify_quantized_linear_m4_matches_singleton_path(dtype):
+    mx.random.seed(21)
+    linear = nn.QuantizedLinear(512, 64, bias=False, group_size=64, bits=4)
+    linear.scales = linear.scales.astype(dtype)
+    linear.biases = linear.biases.astype(dtype)
+    x = mx.random.normal((2, 4, 512)).astype(dtype)
+
+    ref = qwen_language._target_verify_timewise(linear, x)
+    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_qwen_target_verify_quantized_linear_m8_matches_singleton_path(
+    dtype, batch_size
+):
+    mx.random.seed(22)
+    linear = nn.QuantizedLinear(512, 64, bias=False, group_size=64, bits=4)
+    linear.scales = linear.scales.astype(dtype)
+    linear.biases = linear.biases.astype(dtype)
+    x = mx.random.normal((batch_size, 8, 512)).astype(dtype)
+
+    ref = qwen_language._target_verify_timewise(linear, x)
+    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_capture_only_preserves_prefill_path():
+    config = _tiny_qwen3_5_text_config()
+    config.num_hidden_layers = 4
+    config.full_attention_interval = 4
+    model = qwen_language.LanguageModel(config)
+    inputs = mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32)
+    position_ids = mx.arange(inputs.shape[1])[None, :]
+
+    baseline = model(
+        inputs,
+        cache=model.make_cache(),
+        position_ids=position_ids,
+    )
+    captured = model(
+        inputs,
+        cache=model.make_cache(),
+        position_ids=position_ids,
+        capture_layer_ids=[0, 3],
+    )
+    verified = model(
+        inputs,
+        cache=model.make_cache(),
+        position_ids=position_ids,
+        capture_layer_ids=[0, 3],
+        target_verify=True,
+    )
+    mx.eval(baseline.logits, captured.logits, verified.logits)
+
+    assert bool(mx.array_equal(baseline.logits, captured.logits).item())
+    assert captured.gdn_states is None
+    assert len(verified.gdn_states) == 3
 
 
 def test_qwen_fused_greedy_decode_support_matches_lm_head():
@@ -694,6 +773,37 @@ def test_qwen3_5_decode_quantized_linears_fused_matches_separate():
         assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
 
 
+@pytest.mark.parametrize("verify_len", [4, 5])
+@pytest.mark.parametrize("out_dims", [(64, 64), (64, 64, 16, 16)])
+def test_qwen3_5_target_verify_quantized_linears_fused_matches_singletons(
+    out_dims, verify_len
+):
+    mx.random.seed(180 + len(out_dims))
+    linears = [
+        nn.QuantizedLinear(512, out_dim, bias=False, group_size=64, bits=4)
+        for out_dim in out_dims
+    ]
+    for linear in linears:
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+    x = mx.random.normal((1, verify_len, 512), dtype=mx.bfloat16)
+
+    singleton_rows = [
+        qwen_language._decode_quantized_linears_fused(linears, x[:, i : i + 1])
+        if len(linears) == 4
+        else tuple(linear(x[:, i : i + 1]) for linear in linears)
+        for i in range(x.shape[1])
+    ]
+    ref = tuple(
+        mx.concatenate([row[j] for row in singleton_rows], axis=1)
+        for j in range(len(linears))
+    )
+    out = qwen_language._target_verify_linears(linears, x, target_verify=True)
+    mx.eval(*ref, *out)
+
+    assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
+
+
 def test_qwen_target_verify_quantized_argmax_matches_singleton_path():
     mx.random.seed(16)
     linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=4)
@@ -701,6 +811,21 @@ def test_qwen_target_verify_quantized_argmax_matches_singleton_path():
     linear.biases = linear.biases.astype(mx.bfloat16)
 
     x = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
+    ref = mx.argmax(qwen_language._target_verify_timewise(linear, x), axis=-1)
+    out = qwen_language._target_verify_quantized_argmax(linear, x)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_qwen_target_verify_quantized_argmax_m8_matches_singleton_path(dtype):
+    mx.random.seed(23)
+    linear = nn.QuantizedLinear(512, 64, bias=False, group_size=64, bits=4)
+    linear.scales = linear.scales.astype(dtype)
+    linear.biases = linear.biases.astype(dtype)
+
+    x = mx.random.normal((1, 8, 512)).astype(dtype)
     ref = mx.argmax(qwen_language._target_verify_timewise(linear, x), axis=-1)
     out = qwen_language._target_verify_quantized_argmax(linear, x)
     mx.eval(ref, out)
@@ -2048,6 +2173,108 @@ def test_dflash_committed_hidden_segments_keep_per_row_lengths():
     assert segments[1].tolist() == [[[6.0, 7.0]]]
 
 
+def test_dflash_singleton_greedy_verify_uses_fused_argmax_without_logits():
+    class FakeLM:
+        requires_explicit_target_verify = True
+
+        def __init__(self):
+            self.kwargs = None
+
+        def __call__(self, inputs, **kwargs):
+            self.kwargs = kwargs
+            batch, length = inputs.shape
+            return SimpleNamespace(
+                logits=None,
+                hidden_states=[
+                    mx.full((batch, length, 2), 1.0),
+                    mx.full((batch, length, 2), 2.0),
+                    mx.full((batch, length, 2), 3.0),
+                ],
+                gdn_states=[],
+            )
+
+        def speculative_argmax_from_hidden(self, hidden):
+            assert hidden.shape == (1, 2, 2)
+            return mx.array([[7, 8]], dtype=mx.int32)
+
+    lm = FakeLM()
+    verify_out, captured, target_tokens = _dflash_verify_target(
+        lm,
+        mx.array([[4, 5]], dtype=mx.int32),
+        prompt_cache=[],
+        target_layer_ids=[1, 2],
+        sampler=lambda _: (_ for _ in ()).throw(AssertionError("sampler called")),
+        greedy_sampling=True,
+    )
+
+    assert verify_out.logits is None
+    assert lm.kwargs["return_hidden"] is True
+    assert lm.kwargs["skip_logits"] is True
+    assert lm.kwargs["target_verify"] is True
+    assert captured.shape == (1, 2, 4)
+    assert target_tokens.tolist() == [[7, 8]]
+
+
+def test_dflash2_rejection_sampling_requires_probability_sampler():
+    draft_model = SimpleNamespace(
+        supports_rejection_sampling=True,
+        propose_block=lambda *args: args,
+    )
+
+    def sampler(logits):
+        return mx.argmax(logits, axis=-1)
+
+    sampler.temperature = 1.0
+    assert not _dflash_rejection_enabled(draft_model, sampler, False)
+
+    sampler.probabilities = lambda logits: mx.softmax(logits, axis=-1)
+    assert _dflash_rejection_enabled(draft_model, sampler, False)
+    assert not _dflash_rejection_enabled(draft_model, sampler, True)
+
+
+def test_dflash2_rejection_sampling_accepts_certain_prefix():
+    draft_tokens = mx.array([[0, 1]], dtype=mx.int32)
+    draft_indices = mx.array([[[0, 2], [1, 2]]], dtype=mx.int32)
+    draft_probabilities = mx.array([[[0.1, 0.9], [0.2, 0.8]]])
+    target_probabilities = mx.array(
+        [[[0.2, 0.3, 0.5, 0.0], [0.1, 0.3, 0.6, 0.0], [0.0, 0.0, 0.0, 1.0]]]
+    )
+
+    accepted, bonus = _dflash_rejection_sample(
+        draft_tokens,
+        target_probabilities,
+        draft_probabilities,
+        draft_indices,
+    )
+
+    assert accepted == 2
+    assert bonus == 3
+
+
+def test_dflash2_rejection_sampling_draws_from_residual(monkeypatch):
+    draft_tokens = mx.array([[0, 1]], dtype=mx.int32)
+    draft_indices = mx.array([[[0, 2], [1, 2]]], dtype=mx.int32)
+    draft_probabilities = mx.array([[[0.9, 0.1], [0.5, 0.5]]])
+    target_probabilities = mx.array(
+        [[[0.1, 0.8, 0.1, 0.0], [0.1, 0.4, 0.5, 0.0], [0.0, 0.0, 0.0, 1.0]]]
+    )
+    monkeypatch.setattr(
+        mx.random,
+        "uniform",
+        lambda **kwargs: mx.full(kwargs["shape"], 0.5),
+    )
+
+    accepted, bonus = _dflash_rejection_sample(
+        draft_tokens,
+        target_probabilities,
+        draft_probabilities,
+        draft_indices,
+    )
+
+    assert accepted == 0
+    assert bonus == 1
+
+
 def test_gemma4_26b_dflash_config_preserves_capture_layers():
     config = Gemma4DFlashConfig.from_dict(
         {
@@ -2183,6 +2410,175 @@ def test_dflash_config_parses_sliding_attention_metadata():
     assert config.sliding_window == 16
     assert config.final_logit_softcapping == 30.0
     assert config.mask_token_id == 4
+
+
+def test_dflash2_config_parses_checkpoint_metadata():
+    config = ModelConfig.from_dict(
+        {
+            "architectures": ["DFlash2DraftModel"],
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "num_hidden_layers": 5,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "vocab_size": 248320,
+            "num_target_layers": 64,
+            "is_causal": False,
+            "layer_types": ["sliding_attention"] * 5,
+            "sliding_window": 2048,
+            "rope_parameters": {
+                "rope_theta": 10_000_000,
+                "rope_type": "default",
+            },
+            "dflash_config": {
+                "block_size": 8,
+                "conv_group_size": 16,
+                "conv_kernel_size": 2,
+                "mask_token_id": 248070,
+                "selector_rank": 256,
+                "selector_top_k": 16,
+                "target_layer_ids": [5, 19, 33, 47, 61],
+            },
+        }
+    )
+
+    assert config.architectures == ["DFlash2DraftModel"]
+    assert config.block_size == 8
+    assert config.conv_group_size == 16
+    assert config.conv_kernel_size == 2
+    assert config.selector_rank == 256
+    assert config.selector_top_k == 16
+    assert config.target_layer_ids == [5, 19, 33, 47, 61]
+    assert config.is_causal is False
+    assert config.rope_theta == 10_000_000
+    assert config.rope_scaling["rope_type"] == "default"
+
+
+def test_dflash_factory_selects_dflash2_from_architecture():
+    config = ModelConfig(
+        architectures=["DFlash2DraftModel"],
+        hidden_size=4,
+        intermediate_size=8,
+        num_hidden_layers=0,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=8,
+        target_layer_ids=[0],
+        conv_kernel_size=2,
+        conv_group_size=2,
+        selector_rank=2,
+        selector_top_k=2,
+    )
+
+    assert isinstance(make_dflash_model(config), DFlash2DraftModel)
+
+
+def test_dflash2_grouped_dynamic_convolution_is_causal():
+    hidden = mx.array([[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]])
+    dynamic = mx.array([[[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]]])
+    base = mx.zeros((2, 4), dtype=mx.float32)
+
+    output = _grouped_dynamic_convolve(hidden, dynamic, base, group_size=2)
+
+    assert output.tolist() == [[[1.0, 2.0, 6.0, 8.0], [32.0, 44.0, 66.0, 80.0]]]
+
+
+def test_dflash2_candidate_selector_traces_transition_path():
+    config = ModelConfig(
+        hidden_size=2,
+        intermediate_size=4,
+        num_hidden_layers=0,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=2,
+        vocab_size=4,
+        target_layer_ids=[0],
+        selector_rank=2,
+        selector_top_k=2,
+    )
+    selector = CandidateSelector(config)
+    selector.hidden_projection.weight = mx.eye(2)
+    selector.predecessor_codebook.weight = mx.array(
+        [[1.0, 0.0], [0.0, 0.0], [0.0, 1.0], [0.0, 0.0]]
+    )
+    selector.successor_codebook.weight = mx.array(
+        [[0.0, 0.0], [0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+    )
+    hidden = mx.array([[[10.0, 1.0], [1.0, 10.0]]])
+    logits = mx.array([[[-10.0, 5.0, 4.0, -10.0], [-10.0, 5.0, -10.0, 4.0]]])
+
+    path, candidates, probabilities = selector.select(hidden, logits, mx.array([0]))
+
+    assert path.tolist() == [[2, 3]]
+    assert candidates.shape == (1, 2, 2)
+    assert probabilities is None
+
+    sampled_path, sampled_candidates, probabilities = selector.select(
+        hidden, logits, mx.array([0]), temperature=1.0
+    )
+    mx.eval(sampled_path, probabilities)
+    assert probabilities.shape == (1, 2, 2)
+    assert mx.allclose(mx.sum(probabilities, axis=-1), mx.array(1.0)).item()
+    for position, token in enumerate(sampled_path[0].tolist()):
+        assert token in sampled_candidates[0, position].tolist()
+
+
+def test_dflash2_sanitize_maps_embedding_tensors_to_mlx_names():
+    config = ModelConfig(
+        architectures=["DFlash2DraftModel"],
+        hidden_size=4,
+        intermediate_size=8,
+        num_hidden_layers=0,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=8,
+        target_layer_ids=[0],
+        conv_kernel_size=2,
+        conv_group_size=2,
+        selector_rank=2,
+        selector_top_k=2,
+    )
+    model = DFlash2DraftModel(config)
+    predecessor = mx.zeros((8, 2))
+    successor = mx.ones((8, 2))
+
+    sanitized = model.sanitize(
+        {
+            "candidate_selector.predecessor_codebook": predecessor,
+            "candidate_selector.successor_codebook": successor,
+        }
+    )
+
+    assert sanitized["candidate_selector.predecessor_codebook.weight"] is predecessor
+    assert sanitized["candidate_selector.successor_codebook.weight"] is successor
+
+
+def test_quantize_drafter_quantizes_linear_layers_in_memory():
+    config = ModelConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=0,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=32,
+        vocab_size=64,
+        target_layer_ids=[0],
+    )
+    model = DFlashDraftModel(config)
+
+    result = quantize_drafter(model, bits=4, group_size=32)
+
+    assert result is model
+    assert isinstance(model.fc, nn.QuantizedLinear)
+    assert model.draft_quantization == {"bits": 4, "group_size": 32}
+
+
+def test_quantize_drafter_rejects_unsupported_precision():
+    with pytest.raises(ValueError, match="must be 4 or 8"):
+        quantize_drafter(SimpleNamespace(), bits=3)
 
 
 def test_effective_mtp_block_size_respects_requested_block_size():

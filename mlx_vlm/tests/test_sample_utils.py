@@ -346,5 +346,24 @@ class TestValidationDoesNotCorruptCompile(unittest.TestCase):
         self.assertEqual(toks.shape, (1,))
 
 
+class TestSamplerDistribution(unittest.TestCase):
+    def test_exposes_filtered_distribution_for_speculative_rejection(self):
+        logprobs = mx.log(mx.array([[0.05, 0.10, 0.20, 0.25, 0.40]]))
+        sampler = make_sampler(temp=0.5, top_k=2)
+
+        probabilities = sampler.probabilities(logprobs)
+        mx.eval(probabilities)
+
+        self.assertEqual(sampler.temperature, 0.5)
+        self.assertEqual(probabilities.shape, logprobs.shape)
+        self.assertTrue(mx.allclose(mx.sum(probabilities), mx.array(1.0)).item())
+        self.assertEqual(mx.sum(probabilities > 0).item(), 2)
+
+    def test_greedy_sampler_reports_zero_temperature(self):
+        sampler = make_sampler(temp=0.0)
+        self.assertEqual(sampler.temperature, 0.0)
+        self.assertEqual(sampler(mx.array([[0.0, 1.0]])).item(), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

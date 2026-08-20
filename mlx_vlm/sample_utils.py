@@ -61,7 +61,12 @@ def make_sampler(
         xtc_special_tokens = []
 
     if temp == 0:
-        return lambda x: mx.argmax(x, axis=-1)
+
+        def greedy_sampler(x):
+            return mx.argmax(x, axis=-1)
+
+        greedy_sampler.temperature = 0.0
+        return greedy_sampler
 
     sampling_methods = []
     if top_n_sigma > 0.0:
@@ -85,6 +90,14 @@ def make_sampler(
         for method in sampling_methods:
             logprobs = method(logprobs)
         return categorical_sampling(logprobs, temp)
+
+    def probabilities(logprobs):
+        for method in sampling_methods:
+            logprobs = method(logprobs)
+        return mx.softmax(logprobs * (1 / temp), axis=-1)
+
+    sampler.temperature = float(temp)
+    sampler.probabilities = probabilities
 
     return sampler
 

@@ -16,8 +16,12 @@ from .common import (
 from .dflash import (
     _dflash_committed_hidden_segments,
     _dflash_next_block_size,
+    _dflash_rejection_enabled,
+    _dflash_rejection_sample,
+    _dflash_rejection_walk,
     _dflash_rounds,
     _dflash_rounds_batch,
+    _dflash_verify_target,
 )
 from .eagle3 import _eagle3_capture_layer_ids, _eagle3_rounds, _eagle3_rounds_batch
 from .mtp import (
@@ -40,8 +44,12 @@ __all__ = [
     "_dflash_block_total",
     "_dflash_committed_hidden_segments",
     "_dflash_next_block_size",
+    "_dflash_rejection_enabled",
+    "_dflash_rejection_sample",
+    "_dflash_rejection_walk",
     "_dflash_rounds",
     "_dflash_rounds_batch",
+    "_dflash_verify_target",
     "_effective_mtp_block_size",
     "_format_speculative_stats",
     "_mtp_draft_block_active",
@@ -225,6 +233,7 @@ def run_speculative_server_rounds(
             draft_block_size=draft_block_size,
             token_dtype=token_dtype,
             stop_check=stop_check,
+            greedy_sampling=greedy_sampling,
         )
         return
 
@@ -367,6 +376,7 @@ def run_speculative_rounds(
             sampler=sampler,
             draft_block_size=draft_block_size,
             token_dtype=input_ids.dtype,
+            greedy_sampling=sampler_is_greedy,
         )
     else:
         mx.eval(first_token)
@@ -382,4 +392,5 @@ def run_speculative_rounds(
             sampler=sampler,
             draft_block_size=draft_block_size,
             token_dtype=input_ids.dtype,
+            greedy_sampling=sampler_is_greedy,
         )

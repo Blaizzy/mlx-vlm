@@ -150,8 +150,32 @@ def resolve_drafter_kind(model_path, kind: Optional[str] = None) -> str:
     return kind
 
 
+def quantize_drafter(model: Any, bits: int, group_size: int = 64) -> Any:
+    """Quantize a loaded drafter in memory for faster draft forwards."""
+    if bits not in (4, 8):
+        raise ValueError(f"Drafter quantization bits must be 4 or 8; got {bits}.")
+    if group_size not in (32, 64, 128):
+        raise ValueError(
+            "Drafter quantization group size must be 32, 64, or 128; "
+            f"got {group_size}."
+        )
+
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    nn.quantize(model, group_size=group_size, bits=bits)
+    mx.eval(model.parameters())
+    model.draft_quantization = {"bits": bits, "group_size": group_size}
+    return model
+
+
 def load_drafter(
-    path_or_repo: str, kind: Optional[str] = None, **kwargs
+    path_or_repo: str,
+    kind: Optional[str] = None,
+    *,
+    draft_bits: Optional[int] = None,
+    draft_group_size: int = 64,
+    **kwargs,
 ) -> Tuple[object, str]:
     """Load a speculative drafter and return ``(model, resolved_kind)``.
 
@@ -168,7 +192,10 @@ def load_drafter(
 
     path = get_model_path(path_or_repo)
     resolved = resolve_drafter_kind(path, kind)
-    return load_model(path, **kwargs), resolved
+    model = load_model(path, **kwargs)
+    if draft_bits is not None:
+        quantize_drafter(model, draft_bits, draft_group_size)
+    return model, resolved
 
 
 __all__ = [
@@ -178,6 +205,7 @@ __all__ = [
     "DFlashDraftModel",
     "LagunaDFlashDraftModel",
     "MuseGlimmerAssistantDraftModel",
+    "quantize_drafter",
     "load_drafter",
     "resolve_drafter_kind",
     "validate_drafter_compatibility",

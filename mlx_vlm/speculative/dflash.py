@@ -8,6 +8,7 @@ from .common import (
     _record_speculative_round,
     _speculative_walk,
     _speculative_walk_batch,
+    _target_verify_kwargs,
     generation_stream,
 )
 
@@ -75,6 +76,134 @@ def _dflash_committed_hidden_segments(
     ]
 
 
+def _dflash_verify_target(
+    lm: nn.Module,
+    verify_input: mx.array,
+    prompt_cache: List[Any],
+    target_layer_ids: List[int],
+    sampler: Callable[[mx.array], mx.array],
+    *,
+    greedy_sampling: bool,
+):
+    """Verify one DFlash block, fusing the quantized greedy LM-head argmax."""
+    target_verify_kwargs = _target_verify_kwargs(lm)
+    argmax_from_hidden = getattr(lm, "speculative_argmax_from_hidden", None)
+    if greedy_sampling and callable(argmax_from_hidden):
+        verify_out = lm(
+            verify_input,
+            cache=prompt_cache,
+            capture_layer_ids=target_layer_ids,
+            return_hidden=True,
+            skip_logits=True,
+            **target_verify_kwargs,
+        )
+        target_tokens = argmax_from_hidden(verify_out.hidden_states[-1])
+        captured = verify_out.hidden_states[:-1]
+    else:
+        verify_out = lm(
+            verify_input,
+            cache=prompt_cache,
+            capture_layer_ids=target_layer_ids,
+            **target_verify_kwargs,
+        )
+        if greedy_sampling:
+            target_tokens = sampler(verify_out.logits)
+        else:
+            target_logprobs = verify_out.logits - mx.logsumexp(
+                verify_out.logits, axis=-1, keepdims=True
+            )
+            target_tokens = sampler(target_logprobs)
+        captured = verify_out.hidden_states
+    return verify_out, mx.concatenate(captured, axis=-1), target_tokens
+
+
+def _dflash_rejection_enabled(
+    draft_model: nn.Module,
+    sampler: Callable[[mx.array], mx.array],
+    greedy_sampling: bool,
+) -> bool:
+    return (
+        not greedy_sampling
+        and getattr(draft_model, "supports_rejection_sampling", False)
+        and callable(getattr(draft_model, "propose_block", None))
+        and float(getattr(sampler, "temperature", 0.0)) > 0
+        and callable(getattr(sampler, "probabilities", None))
+    )
+
+
+def _dflash_target_probabilities(sampler, logits: mx.array) -> mx.array:
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    return sampler.probabilities(logprobs)
+
+
+def _dflash_sample_probs(probabilities: mx.array) -> mx.array:
+    return mx.random.categorical(mx.log(probabilities))
+
+
+def _dflash_rejection_sample(
+    draft_tokens: mx.array,
+    target_probabilities: mx.array,
+    draft_probabilities: mx.array,
+    draft_indices: mx.array,
+) -> Tuple[int, int]:
+    """Distribution-preserving speculative acceptance for one DFlash2 row."""
+    draft_count = draft_tokens.shape[1]
+    target_on_draft = mx.take_along_axis(
+        target_probabilities[:, :draft_count], draft_tokens[..., None], axis=-1
+    )[..., 0]
+    draft_on_draft = mx.sum(
+        draft_probabilities * (draft_indices == draft_tokens[..., None]), axis=-1
+    )
+    accepted = mx.sum(
+        mx.cumprod(
+            (
+                mx.random.uniform(shape=draft_on_draft.shape) * draft_on_draft
+                < target_on_draft
+            ).astype(mx.int32),
+            axis=-1,
+        ),
+        axis=-1,
+    )[0].item()
+
+    if accepted == draft_count:
+        bonus = _dflash_sample_probs(target_probabilities[:, -1])[0].item()
+        return accepted, bonus
+
+    residual = target_probabilities[0, accepted]
+    candidate_ids = draft_indices[0, accepted]
+    candidate_values = (
+        mx.take(residual, candidate_ids) - draft_probabilities[0, accepted]
+    )
+    residual = mx.put_along_axis(
+        residual[None], candidate_ids[None], candidate_values[None], axis=-1
+    )[0]
+    residual = mx.maximum(residual, 0)
+    total = mx.sum(residual)
+    residual = mx.where(
+        total > 0,
+        residual / mx.maximum(total, 1e-30),
+        target_probabilities[0, accepted],
+    )
+    return accepted, _dflash_sample_probs(residual[None])[0].item()
+
+
+def _dflash_rejection_walk(
+    draft_tokens: mx.array,
+    target_probabilities: mx.array,
+    draft_probabilities: mx.array,
+    draft_indices: mx.array,
+    budget: int,
+) -> Tuple[int, List[int]]:
+    accepted, bonus = _dflash_rejection_sample(
+        draft_tokens,
+        target_probabilities,
+        draft_probabilities,
+        draft_indices,
+    )
+    draft_row = draft_tokens.reshape(-1).tolist()[: draft_tokens.shape[1]]
+    return accepted, (draft_row[:accepted] + [bonus])[:budget]
+
+
 def _dflash_rounds(
     model: nn.Module,
     draft_model: nn.Module,
@@ -87,6 +216,7 @@ def _dflash_rounds(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     use_model_initial_block_size: bool = True,
+    greedy_sampling: bool = False,
 ) -> Generator[Tuple[int, None], None, None]:
     """DFlash speculative-decoding **round loop**.
 
@@ -109,6 +239,9 @@ def _dflash_rounds(
     if hidden_is_prepared:
         hidden = prepare_target_hidden(hidden)
         mx.async_eval(hidden)
+    rejection_sampling = _dflash_rejection_enabled(
+        draft_model, sampler, greedy_sampling
+    )
 
     b = first_bonus
     emitted = 1  # the first bonus has already been yielded by the caller
@@ -127,36 +260,72 @@ def _dflash_rounds(
         if bs <= 1:
             break
 
-        draft_kwargs = {"target_hidden_prepared": True} if hidden_is_prepared else {}
-        draft_tokens = draft_model.draft_block(
-            b,
-            hidden,
-            draft_cache,
-            bs,
-            sampler,
-            token_dtype,
-            **draft_kwargs,
-        )
-        mx.async_eval(draft_tokens)
+        if rejection_sampling:
+            draft_tokens, draft_indices, draft_probabilities = (
+                draft_model.propose_block(
+                    b,
+                    hidden,
+                    draft_cache,
+                    bs,
+                    float(sampler.temperature),
+                    token_dtype,
+                )
+            )
+            mx.async_eval(draft_tokens, draft_probabilities)
+        else:
+            draft_kwargs = {}
+            if hidden_is_prepared:
+                draft_kwargs["target_hidden_prepared"] = True
+            if getattr(draft_model, "supports_greedy_selector", False):
+                draft_kwargs["greedy_sampling"] = greedy_sampling
+            draft_tokens = draft_model.draft_block(
+                b, hidden, draft_cache, bs, sampler, token_dtype, **draft_kwargs
+            )
+            mx.async_eval(draft_tokens)
 
         with mx.stream(generation_stream):
             verify_input = mx.concatenate(
                 [mx.array([[b]], dtype=token_dtype), draft_tokens],
                 axis=1,
             )
-            verify_out = lm(
-                verify_input,
-                cache=prompt_cache,
-                capture_layer_ids=target_layer_ids,
-            )
-            hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
-            target_tokens = sampler(verify_out.logits)
-        mx.async_eval(target_tokens, hidden)
+            if rejection_sampling:
+                verify_out = lm(
+                    verify_input,
+                    cache=prompt_cache,
+                    capture_layer_ids=target_layer_ids,
+                    **_target_verify_kwargs(lm),
+                )
+                hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
+                target_probabilities = _dflash_target_probabilities(
+                    sampler, verify_out.logits
+                )
+            else:
+                verify_out, hidden, target_tokens = _dflash_verify_target(
+                    lm,
+                    verify_input,
+                    prompt_cache,
+                    target_layer_ids,
+                    sampler,
+                    greedy_sampling=greedy_sampling,
+                )
+        if rejection_sampling:
+            mx.async_eval(target_probabilities, hidden)
+        else:
+            mx.async_eval(target_tokens, hidden)
 
         # Walk
-        accepted, new_tokens = _speculative_walk(
-            draft_tokens, target_tokens, max_tokens - emitted
-        )
+        if rejection_sampling:
+            accepted, new_tokens = _dflash_rejection_walk(
+                draft_tokens,
+                target_probabilities,
+                draft_probabilities,
+                draft_indices,
+                max_tokens - emitted,
+            )
+        else:
+            accepted, new_tokens = _speculative_walk(
+                draft_tokens, target_tokens, max_tokens - emitted
+            )
         _record_speculative_round(draft_model, accepted, bs - 1)
 
         if accepted < bs - 1:
@@ -196,6 +365,7 @@ def _dflash_rounds_batch(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     stop_check: Optional[Callable[[int, int], bool]] = None,
+    greedy_sampling: bool = False,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batch DFlash speculative-decoding round loop (B > 1).
 
@@ -221,6 +391,9 @@ def _dflash_rounds_batch(
     block_total = _dflash_block_total(draft_model, draft_block_size)
     draft_model.reset(model)
     draft_caches = [draft_model.make_cache() for _ in range(B)]
+    rejection_sampling = _dflash_rejection_enabled(
+        draft_model, sampler, greedy_sampling
+    )
 
     # Per-sequence state tracked by ORIGINAL index so the caller sees
     # stable indices in the yielded token lists.
@@ -248,39 +421,92 @@ def _dflash_rounds_batch(
         # Draft rowwise: the DFlash drafter cache is scalar-offset and has
         # proven unsafe as a single batched cache on MLX/Metal. Target verify
         # remains batched below.
-        draft_tokens = mx.concatenate(
-            [
-                draft_model.draft_block(
+        if rejection_sampling:
+            proposals = [
+                draft_model.propose_block(
                     int(b_active[j]),
                     hidden_by_orig[active_idx[j]],
                     draft_caches[active_idx[j]],
                     bs,
-                    sampler,
+                    float(sampler.temperature),
                     token_dtype,
                 )
                 for j in range(n_active)
-            ],
-            axis=0,
-        )
-        mx.async_eval(draft_tokens)
+            ]
+            draft_tokens = mx.concatenate([p[0] for p in proposals], axis=0)
+            draft_indices = mx.concatenate([p[1] for p in proposals], axis=0)
+            draft_probabilities = mx.concatenate([p[2] for p in proposals], axis=0)
+            mx.async_eval(draft_tokens, draft_probabilities)
+        else:
+            draft_kwargs = (
+                {"greedy_sampling": greedy_sampling}
+                if getattr(draft_model, "supports_greedy_selector", False)
+                else {}
+            )
+            draft_tokens = mx.concatenate(
+                [
+                    draft_model.draft_block(
+                        int(b_active[j]),
+                        hidden_by_orig[active_idx[j]],
+                        draft_caches[active_idx[j]],
+                        bs,
+                        sampler,
+                        token_dtype,
+                        **draft_kwargs,
+                    )
+                    for j in range(n_active)
+                ],
+                axis=0,
+            )
+            mx.async_eval(draft_tokens)
 
         # Verify
         with mx.stream(generation_stream):
             verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
-            verify_out = lm(
-                verify_input,
-                cache=prompt_cache,
-                capture_layer_ids=target_layer_ids,
-            )
-            hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
-            target_tokens = sampler(verify_out.logits)
-        mx.async_eval(target_tokens, hidden_full)
+            if rejection_sampling:
+                verify_out = lm(
+                    verify_input,
+                    cache=prompt_cache,
+                    capture_layer_ids=target_layer_ids,
+                    **_target_verify_kwargs(lm),
+                )
+                hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
+                target_probabilities = _dflash_target_probabilities(
+                    sampler, verify_out.logits
+                )
+            else:
+                verify_out, hidden_full, target_tokens = _dflash_verify_target(
+                    lm,
+                    verify_input,
+                    prompt_cache,
+                    target_layer_ids,
+                    sampler,
+                    greedy_sampling=greedy_sampling,
+                )
+        if rejection_sampling:
+            mx.async_eval(target_probabilities, hidden_full)
+        else:
+            mx.async_eval(target_tokens, hidden_full)
 
         # Walk (per-sequence)
         budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
-        accepted_list, new_tokens_list = _speculative_walk_batch(
-            draft_tokens, target_tokens, budgets
-        )
+        if rejection_sampling:
+            walks = [
+                _dflash_rejection_walk(
+                    draft_tokens[j : j + 1],
+                    target_probabilities[j : j + 1],
+                    draft_probabilities[j : j + 1],
+                    draft_indices[j : j + 1],
+                    budgets[j],
+                )
+                for j in range(n_active)
+            ]
+            accepted_list = [walk[0] for walk in walks]
+            new_tokens_list = [walk[1] for walk in walks]
+        else:
+            accepted_list, new_tokens_list = _speculative_walk_batch(
+                draft_tokens, target_tokens, budgets
+            )
 
         min_accepted = min(accepted_list)
         accepted_arr = mx.array(accepted_list)

@@ -232,6 +232,19 @@ def main():
         help="Override the drafter's configured block size.",
     )
     parser.add_argument(
+        "--draft-bits",
+        type=int,
+        choices=[4, 8],
+        default=None,
+        help="Quantize the drafter in memory to 4 or 8 bits.",
+    )
+    parser.add_argument(
+        "--draft-group-size",
+        type=int,
+        default=64,
+        help="Group size for in-memory drafter quantization (default: 64).",
+    )
+    parser.add_argument(
         "--max-num-seqs",
         type=int,
         default=None,
@@ -297,6 +310,9 @@ def main():
         os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
     if args.draft_block_size is not None:
         os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
+    if args.draft_bits is not None:
+        os.environ["MLX_VLM_DRAFT_BITS"] = str(args.draft_bits)
+        os.environ["MLX_VLM_DRAFT_GROUP_SIZE"] = str(args.draft_group_size)
     if args.max_num_seqs is not None:
         os.environ["MLX_VLM_MAX_NUM_SEQS"] = str(args.max_num_seqs)
     if args.prefill_step_size:

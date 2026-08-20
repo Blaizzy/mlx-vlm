@@ -6,6 +6,13 @@ import mlx.nn as nn
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
+def _target_verify_kwargs(lm: nn.Module) -> dict:
+    """Opt models into verifier-only numerical paths explicitly."""
+    if getattr(lm, "requires_explicit_target_verify", False):
+        return {"target_verify": True}
+    return {}
+
+
 def _copy_rng_state() -> List[mx.array]:
     return [mx.array(state) for state in mx.random.state]
 
