@@ -47,6 +47,7 @@ PY
 - Then a real end-to-end generation via `Skill("mlx-vlm-skills:cli-inference")`. Run on Apple Silicon with enough RAM for the model; isolate a submodule with random-init weights if the full model does not fit (do not run large models on an 8 GB machine).
 - Compare a few greedy outputs against the reference implementation (transformers / diffusers) on the same prompt to confirm correctness, not just that it runs.
 - Format with pre-commit and follow PR expectations — `Skill("mlx-vlm-skills:contributing")`.
+- Ensure all commits are [signed](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits) or else the opened PR will not be merged.
 
 ## Common Failure Routing
 
