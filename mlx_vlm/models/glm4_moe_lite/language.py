@@ -5,6 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from ...turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
 from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
@@ -112,8 +113,14 @@ class Glm4MoeLiteAttention(nn.Module):
 
         kv_latent = mx.expand_dims(kv_latent, axis=1)
 
+        attention_cache = cache
         if cache is not None:
             kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
+            if isinstance(cache, (TurboQuantKVCache, BatchTurboQuantKVCache)):
+                kv_latent, k_pe = cache.dequantize(kv_latent, k_pe)
+                kv_latent = kv_latent.astype(x.dtype)
+                k_pe = k_pe.astype(x.dtype)
+                attention_cache = None
 
         pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
@@ -130,7 +137,7 @@ class Glm4MoeLiteAttention(nn.Module):
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
         output = scaled_dot_product_attention(
-            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
+            q_nope, k, v, cache=attention_cache, scale=self.scale, mask=pe_scores
         )
         if L == 1:
             output = self.unembed_out(output)
@@ -335,6 +342,7 @@ class LanguageModel(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.args = config
+        self.config = config
         self.model_type = config.model_type
         self.model = Glm4MoeLiteModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
