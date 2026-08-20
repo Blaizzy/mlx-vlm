@@ -8,6 +8,9 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import mlx.core as mx
 
+# v4 invalidates v3 hybrid checkpoints captured with the old 16-token guard.
+# Reusing those 4,080-token snapshots would bypass the new prompt_length - 1
+# replay boundary and reintroduce batch-shape and mRoPE parity drift.
 ADAPTER_SCHEMA_VERSION = 4
 
 
