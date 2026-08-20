@@ -9,6 +9,8 @@ import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten, tree_map
 
+from mlx_vlm.tests.sanitize_invariants import assert_sanitize_idempotent
+
 
 class TestNanochatModel(unittest.TestCase):
     def test_native_loader_and_cached_forward(self):
@@ -10882,7 +10884,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
             ),
         }
 
-        sanitized = model.sanitize(dict(hf_weights))
+        sanitized = assert_sanitize_idempotent(model, hf_weights)
         self.assertIn("language_model.model.embed_tokens.weight", sanitized)
         self.assertIn("language_model.model.layers.0.input_layernorm.weight", sanitized)
         self.assertIn("language_model.lm_head.weight", sanitized)
@@ -10892,8 +10894,6 @@ class TestGetInputEmbeddings(unittest.TestCase):
         self.assertEqual(
             sanitized["visual.layers.0.self_attn.qkv.weight"].shape, (48, 16)
         )
-
-        self.assertIs(model.sanitize(sanitized), sanitized)
 
         for key in sanitized:
             self.assertNotIn("language_language_model", key)
@@ -11388,11 +11388,8 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
             key = f"thinker.audio_tower.{local_key}"
 
-            sanitized = model.sanitize({key: mx.zeros(source_shape)})
+            sanitized = assert_sanitize_idempotent(model, {key: mx.zeros(source_shape)})
             self.assertEqual(sanitized[key].shape, target_shape)
-
-            resanitized = model.sanitize(dict(sanitized))
-            self.assertEqual(resanitized[key].shape, target_shape)
 
             already_mlx = model.sanitize({key: mx.zeros(target_shape)})
             self.assertEqual(already_mlx[key].shape, target_shape)
@@ -11446,11 +11443,8 @@ class TestGetInputEmbeddings(unittest.TestCase):
                 continue
 
             key = f"code2wav.{local_key}"
-            sanitized = model.sanitize({key: mx.zeros(source_shape)})
+            sanitized = assert_sanitize_idempotent(model, {key: mx.zeros(source_shape)})
             self.assertEqual(sanitized[key].shape, target_shape)
-
-            resanitized = model.sanitize(dict(sanitized))
-            self.assertEqual(resanitized[key].shape, target_shape)
 
             already_mlx = model.sanitize({key: mx.zeros(target_shape)})
             self.assertEqual(already_mlx[key].shape, target_shape)
