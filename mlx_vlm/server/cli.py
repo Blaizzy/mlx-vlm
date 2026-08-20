@@ -75,6 +75,12 @@ def main():
         help="Pre-load an embedding model at startup.",
     )
     parser.add_argument(
+        "--reranker-model",
+        type=str,
+        default=None,
+        help="Pre-load a supported reranker model at startup.",
+    )
+    parser.add_argument(
         "--adapter-path",
         type=str,
         default=None,
@@ -282,6 +288,8 @@ def main():
         os.environ["MLX_VLM_PRELOAD_STT_MODEL"] = args.stt_model
     if args.embedding_model:
         os.environ["MLX_VLM_PRELOAD_EMBEDDING_MODEL"] = args.embedding_model
+    if args.reranker_model:
+        os.environ["MLX_VLM_PRELOAD_RERANKER_MODEL"] = args.reranker_model
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     if args.draft_model:
         os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model

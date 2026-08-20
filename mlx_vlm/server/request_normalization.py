@@ -28,12 +28,15 @@ def _request_field_is_set(request, field_name: str) -> bool:
     return getattr(request, field_name, None) is not None
 
 
-def _request_field_or_default(request, field_name: str, default):
+def _request_field_or_default(request, field_name: str, default, *, config=None):
     fields_set = getattr(request, "model_fields_set", None)
-    if fields_set is not None and field_name not in fields_set:
+    if fields_set is None or field_name in fields_set:
+        value = getattr(request, field_name, None)
+        if value is not None:
+            return value
+    if default is not None:
         return default
-    value = getattr(request, field_name, default)
-    return default if value is None else value
+    return getattr(config, field_name, None)
 
 
 def _reasoning_effort_enabled(effort) -> Tuple[Optional[bool], Optional[str]]:
@@ -73,9 +76,9 @@ def _standard_reasoning_control(
 
 
 def _model_config_field_or_default(processor, field_name: str, default):
-    config = runtime.model_cache.get("config")
-    if config is None and processor is not None:
-        config = getattr(processor, "config", None)
+    config = getattr(processor, "config", None) if processor is not None else None
+    if config is None:
+        config = runtime.model_cache.get("config")
     return getattr(config, field_name, default)
 
 
@@ -138,6 +141,7 @@ def _build_gen_args(
     structured_logits_processor_builder=_build_structured_logits_processors,
 ) -> GenerationArguments:
     """Build generation arguments from a compatible API request."""
+    config = getattr(processor, "config", None) if processor is not None else None
     max_tokens = getattr(request, "max_tokens", None)
     if max_tokens is None:
         max_tokens = getattr(request, "max_output_tokens", None)
@@ -230,10 +234,16 @@ def _build_gen_args(
             request, "thinking_budget", get_server_thinking_budget()
         ),
         thinking_start_token=_request_field_or_default(
-            request, "thinking_start_token", get_server_thinking_start_token()
+            request,
+            "thinking_start_token",
+            get_server_thinking_start_token(),
+            config=config,
         ),
         thinking_end_token=_request_field_or_default(
-            request, "thinking_end_token", get_server_thinking_end_token()
+            request,
+            "thinking_end_token",
+            get_server_thinking_end_token(),
+            config=config,
         ),
         tenant_id=tenant_id,
     )
