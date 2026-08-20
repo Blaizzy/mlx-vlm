@@ -26,7 +26,22 @@ def resolve_variant(model: str | MageFlowVariant | None) -> MageFlowVariant:
     path = Path(model).expanduser()
     if path.exists():
         return variant_from_local_path(path)
-    return get_variant(model)
+    try:
+        return get_variant(model)
+    except ValueError:
+        name = model.rstrip("/").rsplit("/", 1)[-1]
+        if name != model:
+            return get_variant(name)
+        raise
+
+
+def _resolve_load_variant(
+    model: str,
+    model_path: str | Path | None,
+) -> MageFlowVariant:
+    if model_path is not None:
+        return variant_from_local_path(model_path)
+    return resolve_variant(model)
 
 
 def _can_load(model: str, *, task: str) -> bool:
@@ -65,6 +80,14 @@ class MageFlowImageGenerationModel(ImageGenerationModel):
             static_shift=float(request.extra.get("static_shift", 6.0)),
             renormalization=bool(request.extra.get("renormalization", False)),
         )
+        metadata = {
+            "model_path": str(self.pipeline.model_path),
+            "architecture": "native-resolution-mmdit",
+            "default_steps": self.pipeline.variant.default_steps,
+            "default_guidance": self.pipeline.variant.default_guidance,
+        }
+        if quantization := self.pipeline.quantization_config:
+            metadata["quantization"] = quantization
         return ImageGenerationResult(
             array=array,
             seed=seed,
@@ -77,12 +100,7 @@ class MageFlowImageGenerationModel(ImageGenerationModel):
             guidance=request.guidance,
             prompt_tokens=self.pipeline.count_prompt_tokens(request.prompt),
             peak_memory=mx.get_peak_memory() / 1e9,
-            metadata={
-                "model_path": str(self.pipeline.model_path),
-                "architecture": "native-resolution-mmdit",
-                "default_steps": self.pipeline.variant.default_steps,
-                "default_guidance": self.pipeline.variant.default_guidance,
-            },
+            metadata=metadata,
         )
 
     @classmethod
@@ -93,15 +111,15 @@ class MageFlowImageGenerationModel(ImageGenerationModel):
     def from_model_id(
         cls, model: str = "mage-flow", **kwargs: Any
     ) -> "MageFlowImageGenerationModel":
-        variant = resolve_variant(model)
-        if not variant.supports_generation:
-            raise ValueError(f"{variant.repo_id} is an image-edit checkpoint")
         model_path_arg = kwargs.pop("model_path", None)
         model_path = (
             Path(model).expanduser()
             if model_path_arg is None and Path(model).expanduser().exists()
             else model_path_arg
         )
+        variant = _resolve_load_variant(model, model_path)
+        if not variant.supports_generation:
+            raise ValueError(f"{variant.repo_id} is an image-edit checkpoint")
         pipeline = MageFlowPipeline.from_pretrained(
             variant,
             model_path=model_path,
@@ -145,6 +163,15 @@ class MageFlowImageEditModel(ImageEditModel):
             vl_cond_long_edge=request.extra.get("vl_cond_long_edge", 384),
             renormalization=bool(request.extra.get("renormalization", False)),
         )
+        metadata = {
+            "model_path": str(self.pipeline.model_path),
+            "architecture": "native-resolution-mmdit",
+            "reference_count": len(request.image_paths),
+            "default_steps": self.pipeline.variant.default_steps,
+            "default_guidance": self.pipeline.variant.default_guidance,
+        }
+        if quantization := self.pipeline.quantization_config:
+            metadata["quantization"] = quantization
         return ImageGenerationResult(
             array=array,
             seed=seed,
@@ -157,13 +184,7 @@ class MageFlowImageEditModel(ImageEditModel):
             guidance=request.guidance,
             prompt_tokens=self.pipeline.count_prompt_tokens(request.prompt, edit=True),
             peak_memory=mx.get_peak_memory() / 1e9,
-            metadata={
-                "model_path": str(self.pipeline.model_path),
-                "architecture": "native-resolution-mmdit",
-                "reference_count": len(request.image_paths),
-                "default_steps": self.pipeline.variant.default_steps,
-                "default_guidance": self.pipeline.variant.default_guidance,
-            },
+            metadata=metadata,
         )
 
     @classmethod
@@ -174,15 +195,15 @@ class MageFlowImageEditModel(ImageEditModel):
     def from_model_id(
         cls, model: str = "mage-flow-edit", **kwargs: Any
     ) -> "MageFlowImageEditModel":
-        variant = resolve_variant(model)
-        if not variant.supports_edit:
-            raise ValueError(f"{variant.repo_id} is a text-to-image checkpoint")
         model_path_arg = kwargs.pop("model_path", None)
         model_path = (
             Path(model).expanduser()
             if model_path_arg is None and Path(model).expanduser().exists()
             else model_path_arg
         )
+        variant = _resolve_load_variant(model, model_path)
+        if not variant.supports_edit:
+            raise ValueError(f"{variant.repo_id} is a text-to-image checkpoint")
         pipeline = MageFlowPipeline.from_pretrained(
             variant,
             model_path=model_path,

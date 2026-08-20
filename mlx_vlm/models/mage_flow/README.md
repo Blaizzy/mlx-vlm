@@ -23,6 +23,27 @@ The first load downloads the checkpoint's transformer, VAE, text encoder,
 tokenizer, and scheduler metadata. The text encoder is evicted after prompt
 encoding by default to reduce peak resident memory before denoising.
 
+## Quantization
+
+Convert and quantize the diffusion-transformer blocks:
+
+```sh
+python -m mlx_vlm.models.mage_flow.convert \
+  --hf-path microsoft/Mage-Flow-Turbo \
+  --mlx-path ./Mage-Flow-Turbo-MLX-4bit \
+  --quantize \
+  --q-mode affine \
+  --q-bits 4 \
+  --q-group-size 64
+```
+
+The converted directory can be passed to `--model` like the original
+checkpoint. Supported modes are `affine`, `mxfp4`, `nvfp4`, and `mxfp8`.
+The Qwen conditioner, transformer modulation/input/output projections, and VAE
+remain in the selected floating-point dtype because quantizing these
+quality-sensitive components causes severe image degradation. Add
+`--quantize-vae` to explicitly quantize compatible VAE linear layers.
+
 ## CLI
 
 Generate with the aligned model:
