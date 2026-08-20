@@ -2719,7 +2719,7 @@ class APCManager:
             int(
                 os.environ.get(
                     "APC_CHECKPOINT_GUARD_TOKENS",
-                    os.environ.get("APC_EXACT_PREFIX_GUARD_TOKENS", "16"),
+                    os.environ.get("APC_EXACT_PREFIX_GUARD_TOKENS", "1"),
                 )
             ),
         )

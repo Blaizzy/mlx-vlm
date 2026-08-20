@@ -389,6 +389,15 @@ def generate_step(
             return y, logprobs.squeeze(0) if logprobs.shape[0] == 1 else logprobs
 
     with mx.stream(generation_stream):
+        # APC may supply position metadata computed from the complete prompt
+        # before trimming to an uncached suffix. Embedding helpers see only the
+        # suffix and may return local positions, so explicit caller metadata
+        # must take precedence over their derived values.
+        explicit_prompt_metadata = {
+            key: kwargs[key]
+            for key in ("position_ids", "rope_deltas")
+            if kwargs.get(key) is not None
+        }
         # Get input embeddings (handles both multimodal and text-only)
         embedding_output = model.get_input_embeddings(
             input_ids, pixel_values, mask=mask, **kwargs
@@ -403,6 +412,7 @@ def generate_step(
                 if k != "inputs_embeds" and v is not None
             }
         )
+        kwargs.update(explicit_prompt_metadata)
         policy_kwargs = kwargs
         if speculative_prefill_capture_kwargs:
             policy_kwargs = {**kwargs, **speculative_prefill_capture_kwargs}

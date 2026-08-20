@@ -870,7 +870,7 @@ Common APC environment variables:
 | `APC_NUM_BLOCKS` | `2048` | Number of in-memory APC blocks |
 | `APC_BLOCK_SIZE` | `16` | Tokens per APC block |
 | `APC_CHECKPOINT_ENTRIES` | `2` | In-memory checkpoint entries for hybrid/stateful cache layouts |
-| `APC_CHECKPOINT_GUARD_TOKENS` | `16` | Tokens retained after a reusable hybrid checkpoint boundary |
+| `APC_CHECKPOINT_GUARD_TOKENS` | `1` | Tokens retained after a reusable hybrid checkpoint boundary; the default preserves the normal final-token prefill boundary |
 | `APC_DISK_PATH` | unset | Directory for persistent disk shards |
 | `APC_DISK_MAX_GB` | `0` | Disk cap in GB; `0` means uncapped |
 | `APC_DISK_SHARD_MAX_BLOCKS` | `256` | Max blocks per disk segment shard |
