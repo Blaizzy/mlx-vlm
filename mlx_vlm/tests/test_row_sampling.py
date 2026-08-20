@@ -504,3 +504,87 @@ def test_heterogeneous_configs_still_require_matching_width():
         sampler(mx.zeros((1, 6)))
     with pytest.raises(ValueError, match="configs length"):
         sampler(mx.zeros((2, 4, 6)))
+
+
+# --- ragged single-row sample_target ---------------------------------------
+#
+# The MTP acceptance walk projects one stream's whole verify block in a single
+# call: _positioned_target_tokens (speculative/mtp.py) passes [T, V] logprobs
+# for ONE row with row_ids=[row_id]*T and T ascending positions. Validating the
+# batch width against len(configs) instead of len(row_ids) rejects that shape,
+# so a single-stream MTP request with temperature>0 and a seed raised instead
+# of decoding. Server requests always carry a seed (DEFAULT_SEED=0).
+
+
+def test_sample_target_ragged_single_row():
+    T, V = 4, 12
+    lp = _log_normalize(mx.random.normal((T, V), key=mx.random.key(1)))
+    sampler = _PositionedTargetSampler([SamplingConfig(temperature=0.8, seed=7)])
+    tokens = sampler.sample_target(lp, row_ids=[7] * T, positions=list(range(T)))
+    mx.eval(tokens)
+    assert tokens.shape == (T,)
+
+
+def test_sample_target_ragged_matches_per_position_calls():
+    # Each ragged row must be drawn with exactly the key its own
+    # (row_id, position) pair produces -- the same answer as issuing T separate
+    # one-row calls. A wrong pairing (or one key reused across T) shows up here.
+    T, V = 5, 24
+    lp = _log_normalize(mx.random.normal((T, V), key=mx.random.key(2)))
+    cfg = SamplingConfig(temperature=1.2, seed=3)
+    sampler = _PositionedTargetSampler([cfg])
+    ragged = sampler.sample_target(lp, row_ids=[9] * T, positions=list(range(4, 4 + T)))
+    one_at_a_time = [
+        int(sampler.sample_target(lp[t : t + 1], row_ids=[9], positions=[4 + t])[0])
+        for t in range(T)
+    ]
+    mx.eval(ragged)
+    assert ragged.tolist() == one_at_a_time
+
+
+def test_sample_target_ragged_positions_actually_advance():
+    T, V = 12, 40
+    lp = _log_normalize(mx.zeros((T, V)))
+    sampler = _PositionedTargetSampler([SamplingConfig(temperature=1.0, seed=5)])
+    tokens = sampler.sample_target(lp, row_ids=[2] * T, positions=list(range(T)))
+    mx.eval(tokens)
+    assert len(set(tokens.tolist())) > 1
+
+
+def test_sample_target_still_rejects_genuine_width_mismatch():
+    # Distinct per-row configs cannot be resolved against a different number of
+    # rows -- relaxing the width check must not turn that into a silent
+    # neighbour-parameter sample.
+    sampler = _PositionedTargetSampler(
+        [
+            SamplingConfig(temperature=0.5, seed=1),
+            SamplingConfig(temperature=1.0, seed=2),
+            SamplingConfig(temperature=1.5, seed=3),
+        ]
+    )
+    with pytest.raises(ValueError):
+        sampler.sample_target(mx.zeros((2, 6)), row_ids=[0, 1], positions=[0, 0])
+
+
+def test_sample_target_rejects_row_ids_that_do_not_match_the_rows():
+    sampler = _PositionedTargetSampler([SamplingConfig(temperature=0.5, seed=1)])
+    with pytest.raises(ValueError, match="row_ids"):
+        sampler.sample_target(mx.zeros((3, 6)), row_ids=[0, 0], positions=[0, 1])
+    with pytest.raises(ValueError, match="row_ids"):
+        sampler.sample_target(mx.zeros((3, 6)), row_ids=[0, 0, 0], positions=[0, 1])
+
+
+def test_sample_target_ragged_row_honors_the_new_modes():
+    # The ragged block shares one config across T rows, including the
+    # non-rank modes -- each row must be filtered by top_n_sigma against its
+    # OWN distribution, not against row 0's.
+    T, V = 6, 32
+    lp = _log_normalize(mx.random.normal((T, V), key=mx.random.key(11)) * 3.0)
+    cfg = SamplingConfig(temperature=1.0, top_n_sigma=1.0, seed=5)
+    tokens = _PositionedTargetSampler([cfg]).sample_target(
+        lp, row_ids=[1] * T, positions=list(range(T))
+    )
+    mx.eval(tokens)
+    for t, tok in enumerate(tokens.tolist()):
+        allowed = _ref_keep(apply_top_n_sigma(lp[t], 1.0))
+        assert tok in allowed

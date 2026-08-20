@@ -357,17 +357,22 @@ class _PositionedTargetSampler:
     def sample_target(
         self, logprobs: mx.array, *, row_ids: List[int], positions: List[int]
     ) -> mx.array:
-        if logprobs.shape[0] != len(self.configs):
-            raise ValueError("configs length must match logprobs batch size.")
-        if len(row_ids) != len(positions) or len(row_ids) != len(self.configs):
-            raise ValueError("row_ids/positions must match configs length.")
+        n = logprobs.shape[0]
+        if len(row_ids) != n or len(positions) != n:
+            raise ValueError("row_ids/positions must match the logprobs rows.")
+        # Width is checked against the rows the caller actually passed, not
+        # against len(configs): the MTP acceptance walk projects ONE stream's
+        # whole verify block in a single call, so a 1-config sampler legitimately
+        # sees T rows, all carrying that stream's row_id at ascending positions
+        # (speculative/mtp.py:_positioned_target_tokens).
+        configs = self._configs_for(n)
         keys = mx.stack(
             [
                 mx.random.key(_position_seed(cfg.seed, row, pos))
-                for cfg, row, pos in zip(self.configs, row_ids, positions)
+                for cfg, row, pos in zip(configs, row_ids, positions)
             ]
         )
-        return self._draw(logprobs, keys)
+        return self._draw(logprobs, keys, configs=configs)
 
     def _draw(
         self,

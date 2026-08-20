@@ -3871,3 +3871,78 @@ def test_dflash_single_row_server_rounds_accept_a_row_aware_sampler():
     )
     tokens = [tok for tok_list, _ in outputs for tok in tok_list if tok is not None]
     assert tokens and all(tok == target_token for tok in tokens)
+
+
+# --- mtp single-row rounds with a row-aware sampler -------------------------
+
+
+def test_mtp_rounds_single_row_with_a_row_aware_sampler():
+    """A one-stream MTP request at temperature>0 with a seed must decode.
+
+    generate()/stream_generate() build a _PositionedTargetSampler holding ONE
+    config for that stream, and _mtp_acceptance_walk then projects the whole
+    verify block through sample_target in a single [T, V] call with
+    row_ids=[row_id]*T. Validating that width against len(configs) instead of
+    against the rows passed raised ValueError before a token came out. Only
+    the model forward is stubbed here; the round loop, the acceptance walk and
+    the sampler all run for real.
+    """
+    from mlx_vlm.generate.ar import SamplingConfig, _PositionedTargetSampler
+
+    V, BS, target_token = 8, 3, 1
+
+    class FakeLM:
+        def __init__(self):
+            self.rollback_calls = 0
+
+        def speculative_verify_hidden(self, verify_input, prompt_cache):
+            del prompt_cache
+            n, bs = verify_input.shape
+            logit = mx.where(mx.arange(V) == target_token, 50.0, 0.0)
+            return mx.broadcast_to(logit, (n, bs, V)), {}
+
+        def speculative_logits_from_hidden(self, hidden):
+            return hidden  # identity head: hidden IS the logits
+
+        def rollback_speculative_cache(self, *args):
+            self.rollback_calls += 1
+
+    class FakeDraft:
+        def __init__(self):
+            self.config = SimpleNamespace(block_size=BS)
+            self.prefer_requested_block_size = True
+            self.accept_lens = []
+            self.draft_lens = []
+
+        def reset(self, model):
+            del model
+
+        def set_shared_kv(self, *args, **kwargs):
+            pass
+
+        def draft_block(self, b, hidden, cache, block_size, sampler, token_dtype, **kw):
+            del b, cache, sampler, kw
+            # Draft token 0 != target_token, so every position rejects at 0 and
+            # the round emits exactly the verifier's bonus token.
+            return mx.zeros((hidden.shape[0], block_size - 1), dtype=token_dtype)
+
+    sampler = _PositionedTargetSampler([SamplingConfig(temperature=0.9, seed=4)])
+    tokens = list(
+        mtp_utils._mtp_rounds(
+            FakeLM(),
+            FakeDraft(),
+            [],
+            mx.zeros((1, 1, V), dtype=mx.float32),
+            {},
+            first_bonus=0,
+            max_tokens=4,
+            sampler=sampler,
+            draft_block_size=BS,
+            token_dtype=mx.int32,
+            greedy_sampling=False,
+        )
+    )
+
+    emitted = [tok for tok, _state in tokens]
+    assert emitted, "no tokens emitted"
+    assert all(tok == target_token for tok in emitted)
