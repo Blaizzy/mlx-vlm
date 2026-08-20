@@ -5,7 +5,7 @@ description: Use this skill when the user wants to add or port a new model archi
 
 # Add a New Model
 
-Use this workflow to port a Hugging Face model to MLX-VLM.
+Use this workflow to port a new model to MLX-VLM.
 
 ## Layout Rules
 
@@ -23,8 +23,9 @@ Use this workflow to port a Hugging Face model to MLX-VLM.
    - loading the weights and printing key names;
    - reading `model.safetensors.index.json` in the HF repo.
 5. **Wire the forward pass** (embeddings → vision/audio encoder → projector → language model), reusing shared helpers (`prompt_utils.py`, processors) where possible.
-6. **Convert to MLX** to get loadable weights — `Skill("mlx-vlm-skills:convert-quantize")`.
+6. **Convert to MLX** to get loadable weights — `Skill("mlx-vlm-skills:convert-quantize")`. Upload them to to `mlx-community` (which is self-add) on HF if there is no usable official repo. If the model is already usable directly from HF, you can skip this step and just use the repo directly.
 7. **Add a test class** in `mlx_vlm/tests/test_models.py` (e.g. `TestMyModel`) — a tiny random-weight config, a shape/forward check, and (if applicable) an exactness check against a reference path in the degenerate limit. Do not create a standalone test file.
+8. **Add a README in the model dir** with a short description of the model, supported HF repos, and example usage.
 
 ## Determine Layer Names (quick)
 
@@ -44,7 +45,7 @@ PY
   cd mlx_vlm && uv run --with pytest python -m pytest tests/test_models.py -q -k "TestMyModel"
   ```
 - Then a real end-to-end generation via `Skill("mlx-vlm-skills:cli-inference")`. Run on Apple Silicon with enough RAM for the model; isolate a submodule with random-init weights if the full model does not fit (do not run large models on an 8 GB machine).
-- Compare a few greedy outputs against the reference implementation (Transformers) on the same prompt to confirm correctness, not just that it runs.
+- Compare a few greedy outputs against the reference implementation (transformers / diffusers) on the same prompt to confirm correctness, not just that it runs.
 - Format with pre-commit and follow PR expectations — `Skill("mlx-vlm-skills:contributing")`.
 
 ## Common Failure Routing
@@ -53,3 +54,9 @@ PY
 - Weight-name mismatches on load: your module attribute names don't match the checkpoint; reconcile against `model.safetensors.index.json`.
 - Processor/chat-template errors: mirror a sibling model's `processing_*.py` and `prompt_utils` usage.
 - If you get stuck and want to file it, use `Skill("mlx-vlm-skills:reproducible-github-issues")`.
+
+## Code standards
+
+- Keep code comments concise (usually 1-2 lines)
+- Avoid redundant or excessive inline commentary
+- Use ASD-STE100 Simplified Technical English, simple wordings
