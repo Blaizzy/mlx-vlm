@@ -68,6 +68,26 @@ def _get_draft_block_size_from_env():
     return int(draft_block_size_str) if draft_block_size_str else None
 
 
+def _speculative_batch_path_enabled() -> bool:
+    """Route non-MTP drafters through the continuous-batching generator.
+
+    Non-MTP drafters are dispatched to the standalone ``_run_speculative`` loop,
+    which builds its own prompt cache and never receives ``apc_manager`` — so
+    automatic prefix caching is silently unavailable for them and every request
+    reports ``cached_tokens=0``. The batching generator is already generic over
+    ``draft_kind`` and is handed ``apc_manager``, ``draft_kind`` and
+    ``draft_block_size``, so it can drive those drafters as well.
+
+    Opt-in via ``MLX_VLM_SPECULATIVE_BATCH=1`` until the two paths have been
+    compared on more setups.
+    """
+    return os.environ.get("MLX_VLM_SPECULATIVE_BATCH", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 def _notify_queues(queues, *items):
     for queue in queues:
         for item in items:
@@ -1742,7 +1762,11 @@ class ResponseGenerator:
             self._run_diffusion()
             return
 
-        if self.draft_model is not None and self.draft_kind != "mtp":
+        if (
+            self.draft_model is not None
+            and self.draft_kind != "mtp"
+            and not _speculative_batch_path_enabled()
+        ):
             self._run_speculative()
             return
 
