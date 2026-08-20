@@ -296,6 +296,8 @@ def convert(
     trust_remote_code: bool = True,
     quant_predicate: Optional[str] = None,
     quantize_vae: bool = False,
+    mtp: bool = False,
+    mtp_output: Optional[str] = None,
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
@@ -444,6 +446,33 @@ def convert(
 
     save_config(config, config_path=mlx_path / "config.json")
 
+    if mtp:
+        try:
+            from .speculative.drafters.mtp_split import detect_mtp_splitter
+
+            splitter = detect_mtp_splitter(model_path)
+            if splitter is None:
+                print(
+                    "[INFO] --mtp: no native MTP tensors / registered splitter for "
+                    "this model; skipping drafter"
+                )
+            else:
+                drafter_path = mtp_output or f"{mlx_path}-mtp"
+                print(f"[INFO] Extracting MTP drafter -> {drafter_path}")
+                splitter.split(
+                    str(model_path),
+                    str(drafter_path),
+                    q_bits=q_bits if quantize else None,
+                    q_group_size=q_group_size,
+                )
+        except Exception as exc:
+            # the base conversion already succeeded; a drafter failure must not
+            # take the whole convert down with it
+            print(
+                f"[WARNING] --mtp: failed to extract MTP drafter "
+                f"({type(exc).__name__}: {exc}); base conversion is unaffected"
+            )
+
     hf_repo = None if Path(hf_path).exists() else hf_path
     create_model_card(mlx_path, hf_repo)
 
@@ -558,6 +587,18 @@ def configure_parser() -> argparse.ArgumentParser:
         help="Trust remote code.",
         action="store_true",
         default=False,
+    )
+    parser.add_argument(
+        "--mtp",
+        help="Also extract the model's native MTP tensors into a standalone drafter.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--mtp-output",
+        help="Output path for the MTP drafter (default: <mlx-path>-mtp).",
+        type=str,
+        default=None,
     )
     return parser
 
