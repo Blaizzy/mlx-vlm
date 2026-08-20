@@ -741,7 +741,10 @@ def _config_from_args(args: "GenerationArguments") -> SamplingConfig:
     return SamplingConfig(
         temperature=args.temperature,
         top_p=args.top_p,
-        top_k=args.top_k,
+        # Canonicalise the "disabled" spellings: the sampler reads any top_k <= 0
+        # as off, but SamplingConfig is compared by value and the server batches
+        # rows by config equality, so -1 and 0 must not look like two setups.
+        top_k=max(0, int(args.top_k)),
         min_p=args.min_p,
         seed=DEFAULT_SEED if args.seed is None else int(args.seed),
         top_n_sigma=args.top_n_sigma,

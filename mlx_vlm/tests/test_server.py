@@ -182,11 +182,12 @@ def test_chat_completions_endpoint_requires_model(client):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("top_k", -3),
         ("min_p", -0.1),
         ("min_p", 1.5),
-        ("top_p", 0.0),
         ("top_p", 1.5),
+        ("temperature", -0.5),
+        ("top_n_sigma", -1.0),
+        ("typical_p", 1.5),
     ],
 )
 def test_out_of_domain_sampling_params_rejected_at_admission(client, field, value):
@@ -204,17 +205,60 @@ def test_out_of_domain_sampling_params_rejected_at_admission(client, field, valu
     assert response.status_code == 422
 
 
-def test_out_of_domain_top_k_rejected_at_admission(client):
-    # top_k negative -> 422 from the request model, not a GPU-thread crash
+# The bounds above are this PR's addition; main had none. Anything that main
+# accepted and that the sampler already reads as "disabled" must keep working,
+# or a client that has always sent top_k=-1 (the conventional spelling, and
+# what vLLM and llama.cpp use) starts getting 422s from a sampling change.
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("top_k", -1),  # conventional "disabled"
+        ("top_k", -3),
+        ("top_k", 0),
+        ("top_p", 0.0),  # OpenAI's documented range is [0, 1]
+        ("typical_p", 0.0),  # 0 disables, same as 1.0
+        ("min_p", 0.0),
+        ("top_n_sigma", 0.0),
+        ("temperature", 0.0),
+    ],
+)
+def test_disabled_sampling_spellings_still_admitted(client, field, value):
+    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], field: value}
+    assert client.post("/v1/chat/completions", json=body).status_code != 422
+    # and the request model itself accepts it -- that is the admission gate
+    server.ChatRequest(
+        model="m",
+        messages=[server.ChatMessage(role="user", content="hi")],
+        **{field: value},
+    )
+
+
+def test_anthropic_endpoint_keeps_accepting_disabled_top_k(client):
+    # This PR's only change to AnthropicRequest was a ge=0 on top_k; /v1/messages
+    # is otherwise untouched by it, so it must keep admitting what main admitted.
+    server.AnthropicRequest(model="m", messages=[], max_tokens=8, top_k=-1)
     r = client.post(
-        "/v1/chat/completions",
+        "/v1/messages",
         json={
             "model": "m",
+            "max_tokens": 8,
             "messages": [{"role": "user", "content": "hi"}],
-            "top_k": -3,
+            "top_k": -1,
         },
     )
-    assert r.status_code == 422
+    assert r.status_code != 422
+
+
+def test_disabled_top_k_spellings_canonicalise_to_the_same_config():
+    # SamplingConfig is frozen and compared by value: the server batches rows
+    # by config equality (_serialize_speculative_batch_by_config), so top_k=-1
+    # and top_k=0 must not look like two different sampling setups.
+    from mlx_vlm.server.generation import GenerationArguments, _config_from_args
+
+    disabled = _config_from_args(GenerationArguments(temperature=0.7, top_k=-1))
+    canonical = _config_from_args(GenerationArguments(temperature=0.7, top_k=0))
+    assert disabled.top_k == 0
+    assert disabled == canonical
 
 
 @pytest.mark.parametrize(

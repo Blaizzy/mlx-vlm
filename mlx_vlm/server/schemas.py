@@ -333,8 +333,8 @@ class OpenAIRequest(FlexibleBaseModel):
     temperature: float = Field(
         DEFAULT_TEMPERATURE, ge=0.0, description="Temperature for sampling."
     )
-    top_p: float = Field(DEFAULT_TOP_P, gt=0.0, le=1.0, description="Top-p sampling.")
-    top_k: int = Field(0, ge=0, description="Top-k sampling (0 disables).")
+    top_p: float = Field(DEFAULT_TOP_P, ge=0.0, le=1.0, description="Top-p sampling.")
+    top_k: int = Field(0, description="Top-k sampling (<=0 disables).")
     min_p: float = Field(0.0, ge=0.0, le=1.0, description="Min-p sampling.")
     top_n_sigma: float = Field(
         0.0, ge=0.0, description="Top-nσ sampling. 0 disables; typical ~0.5-2.0."
@@ -344,9 +344,9 @@ class OpenAIRequest(FlexibleBaseModel):
     )
     typical_p: float = Field(
         1.0,
-        gt=0.0,
+        ge=0.0,
         le=1.0,
-        description="Locally typical sampling. 1.0 disables; typical ~0.2-0.95.",
+        description="Locally typical sampling. 1.0 (or 0.0) disables; typical ~0.2-0.95.",
     )
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     repetition_context_size: Optional[int] = Field(
@@ -735,8 +735,8 @@ class VLMRequest(FlexibleBaseModel):
     temperature: float = Field(
         DEFAULT_TEMPERATURE, ge=0.0, description="Temperature for sampling."
     )
-    top_p: float = Field(DEFAULT_TOP_P, gt=0.0, le=1.0, description="Top-p sampling.")
-    top_k: int = Field(0, ge=0, description="Top-k sampling (0 disables).")
+    top_p: float = Field(DEFAULT_TOP_P, ge=0.0, le=1.0, description="Top-p sampling.")
+    top_k: int = Field(0, description="Top-k sampling (<=0 disables).")
     min_p: float = Field(0.0, ge=0.0, le=1.0, description="Min-p sampling.")
     top_n_sigma: float = Field(
         0.0, ge=0.0, description="Top-nσ sampling. 0 disables; typical ~0.5-2.0."
@@ -746,9 +746,9 @@ class VLMRequest(FlexibleBaseModel):
     )
     typical_p: float = Field(
         1.0,
-        gt=0.0,
+        ge=0.0,
         le=1.0,
-        description="Locally typical sampling. 1.0 disables; typical ~0.2-0.95.",
+        description="Locally typical sampling. 1.0 (or 0.0) disables; typical ~0.2-0.95.",
     )
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
@@ -934,7 +934,7 @@ class AnthropicRequest(FlexibleBaseModel):
         DEFAULT_TEMPERATURE, description="Temperature for sampling."
     )
     top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
-    top_k: int = Field(0, ge=0, description="Top-k sampling.")
+    top_k: int = Field(0, description="Top-k sampling.")
     stop_sequences: Optional[List[str]] = None
     tools: Optional[List[Any]] = None
     tool_choice: Optional[Any] = None
