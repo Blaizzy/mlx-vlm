@@ -849,3 +849,44 @@ class TestModelSpecificPromptContracts:
             "text",
         ]
         assert result[0]["content"][-1]["text"] == "OCR:"
+
+
+class TestApplyChatTemplateModelTypeCasing:
+    """``config.json`` is free to ship any casing for ``model_type``.
+
+    ``MODEL_CONFIG`` membership is matched case-insensitively, so a mixed-case
+    model reaches the multimodal path. The prompt-only models must keep their
+    last-message-only handling on that path too, otherwise the whole
+    conversation is rendered with the generic fallback template.
+    """
+
+    CONVERSATION = [
+        {"role": "user", "content": "First question."},
+        {"role": "assistant", "content": "First answer."},
+        {"role": "user", "content": "Describe this image."},
+    ]
+
+    def _render(self, model_type):
+        return apply_chat_template(
+            None,
+            {"model_type": model_type},
+            self.CONVERSATION,
+            num_images=1,
+        )
+
+    def test_paligemma_last_message_only_ignores_casing(self):
+        assert self._render("PaliGemma") == self._render("paligemma")
+
+    def test_florence2_last_message_only_ignores_casing(self):
+        assert self._render("Florence2") == self._render("florence2")
+
+    def test_falcon_ocr_last_message_only_ignores_casing(self):
+        assert self._render("Falcon_OCR") == self._render("falcon_ocr")
+
+    def test_prompt_only_models_drop_the_earlier_turns(self):
+        """The prompt-only rendering must not carry the earlier turns."""
+        rendered = self._render("PaliGemma")
+
+        assert "First question." not in rendered
+        assert "First answer." not in rendered
+        assert "Describe this image." in rendered

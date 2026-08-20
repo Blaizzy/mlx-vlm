@@ -989,7 +989,7 @@ def apply_chat_template(
         return messages
 
     # Some models only need the last message
-    if model_type in ["paligemma", "florence2", "falcon_ocr"]:
+    if model_type.lower() in ["paligemma", "florence2", "falcon_ocr"]:
         return messages[-1]
 
     return get_chat_template(processor, messages, add_generation_prompt, **kwargs)
