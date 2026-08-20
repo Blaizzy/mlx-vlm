@@ -1,5 +1,3 @@
-"""Qwen3 text encoder adapter for Z-Image."""
-
 from __future__ import annotations
 
 import mlx.core as mx
@@ -66,7 +64,6 @@ class ZImageTextEncoder(Qwen3TextEncoder):
 def sanitize_text_encoder_weights(
     weights: dict[str, mx.array],
 ) -> dict[str, mx.array]:
-    """Map Hugging Face Qwen3 keys and drop computed rotary frequencies."""
     return {
         key.removeprefix("model."): value
         for key, value in weights.items()

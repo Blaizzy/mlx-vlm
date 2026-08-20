@@ -1,5 +1,3 @@
-"""Z-Image model implementing the ImageGenerationModel protocol."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass

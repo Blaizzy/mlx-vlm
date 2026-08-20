@@ -1,5 +1,3 @@
-"""Architecture configuration for Z-Image."""
-
 from __future__ import annotations
 
 import json
@@ -181,7 +179,6 @@ class ZImageConfig:
 
 
 def detect_z_image_layout(path: str | Path) -> bool:
-    """Detect if a local path is a Z-Image checkpoint."""
     root = Path(path).expanduser()
     return (
         (root / "model_index.json").exists()

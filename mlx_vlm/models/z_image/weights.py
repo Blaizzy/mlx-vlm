@@ -1,5 +1,3 @@
-"""Weight loading utilities for Z-Image."""
-
 from __future__ import annotations
 
 import json
@@ -19,7 +17,6 @@ from .vae import ZImageVAE, sanitize_vae_weights
 def _load_safetensors(
     directory: Path,
 ) -> tuple[dict[str, mx.array], dict[str, Any]]:
-    """Load all safetensors files from a directory."""
     files = sorted(
         p for p in directory.glob("*.safetensors") if not p.name.startswith("._")
     )
@@ -88,7 +85,6 @@ def _apply_weights(
 def load_transformer(
     model_path: str | Path, config: ZImageConfig | None = None
 ) -> ZImageTransformer:
-    """Load transformer from checkpoint."""
     root = Path(model_path).expanduser()
     config = config or ZImageConfig.from_model_path(root)
     transformer = ZImageTransformer(config.transformer)
@@ -100,7 +96,6 @@ def load_transformer(
 def load_text_encoder(
     model_path: str | Path, config: ZImageConfig | None = None
 ) -> ZImageTextEncoder:
-    """Load text encoder from checkpoint."""
     root = Path(model_path).expanduser()
     config = config or ZImageConfig.from_model_path(root)
     encoder = ZImageTextEncoder(config.text_encoder)
@@ -110,7 +105,6 @@ def load_text_encoder(
 
 
 def load_vae(model_path: str | Path, config: ZImageConfig | None = None) -> ZImageVAE:
-    """Load VAE from checkpoint."""
     root = Path(model_path).expanduser()
     config = config or ZImageConfig.from_model_path(root)
     vae = ZImageVAE(config.vae)

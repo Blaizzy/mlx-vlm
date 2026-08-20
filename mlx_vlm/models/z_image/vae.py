@@ -1,5 +1,3 @@
-"""Diffusers AutoencoderKL adapter for Z-Image."""
-
 from __future__ import annotations
 
 import mlx.core as mx
@@ -12,8 +10,6 @@ from .config import ZImageVAEConfig
 
 
 class ZImageVAE(nn.Module):
-    """AutoencoderKL without the optional quant/post-quant convolutions."""
-
     def __init__(self, config: ZImageVAEConfig | None = None) -> None:
         super().__init__()
         config = config or ZImageVAEConfig()
@@ -32,13 +28,11 @@ class ZImageVAE(nn.Module):
         )
 
     def encode(self, x: mx.array) -> mx.array:
-        """Encode an NHWC image and return the mean latent."""
         moments = self.encoder(x.transpose(0, 3, 1, 2))
         mean, _ = mx.split(moments, 2, axis=1)
         return mean.transpose(0, 2, 3, 1)
 
     def decode(self, z: mx.array) -> mx.array:
-        """Decode an NHWC latent into an NHWC image."""
         return self.decoder(z.transpose(0, 3, 1, 2)).transpose(0, 2, 3, 1)
 
 
@@ -47,7 +41,6 @@ def sanitize_vae_weights(
     *,
     source_layout: bool | None = None,
 ) -> dict[str, mx.array]:
-    """Map Diffusers and earlier MLX-VLM VAE layouts to shared VAE blocks."""
     if source_layout is None:
         source_layout = "encoder.conv_in.weight" in weights
     sanitized = {}

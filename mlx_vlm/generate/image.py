@@ -262,7 +262,6 @@ def _image_model_type_from_component_indexes(root: Path) -> str | None:
     }
     if flux2_markers <= keys:
         return "flux2"
-    # Z-Image: layers with SwiGLU feed-forward and context_refiner
     z_image_markers = {
         "layers.0.feed_forward.w1.weight",
         "context_refiner.0.attention.to_q.weight",

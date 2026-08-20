@@ -1,5 +1,3 @@
-"""Tests for the Z-Image model family."""
-
 from __future__ import annotations
 
 import importlib
@@ -357,7 +355,6 @@ def test_generation_evicts_components_before_reloading_encoder(
 
 
 def test_transformer_forward_shape() -> None:
-    """Tiny transformer produces correct output shape."""
     cfg = ZImageTransformerConfig(
         hidden_size=64,
         num_attention_heads=4,
@@ -401,7 +398,6 @@ def test_transformer_forward_shape() -> None:
 
 
 def test_text_encoder_forward_shape() -> None:
-    """Tiny text encoder produces correct output shape."""
     cfg = ZImageTextEncoderConfig(
         vocab_size=256,
         hidden_size=64,
@@ -419,7 +415,6 @@ def test_text_encoder_forward_shape() -> None:
 
 
 def test_vae_decoder_shape() -> None:
-    """Tiny VAE decoder produces correct output shape."""
     cfg = ZImageVAEConfig(
         in_channels=3,
         out_channels=3,
@@ -503,7 +498,6 @@ def test_transformer_config_allows_distinct_refiner_depths() -> None:
 
 
 def test_sanitize_transformer_weights() -> None:
-    """Weight key sanitization maps correctly."""
     weights = {
         "all_final_layer.2-1.linear.weight": mx.zeros((3,)),
         "all_final_layer.2-1.adaLN_modulation.1.weight": mx.zeros((3,)),

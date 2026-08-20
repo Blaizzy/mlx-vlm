@@ -1,5 +1,3 @@
-"""Z-Image generation pipeline."""
-
 from __future__ import annotations
 
 import gc
@@ -22,8 +20,6 @@ def _img2img_start_index(steps: int, strength: float) -> int:
 
 
 class ZImagePipeline:
-    """End-to-end text-to-image pipeline for Z-Image."""
-
     def __init__(
         self,
         model_path: str | Path,
@@ -66,7 +62,6 @@ class ZImagePipeline:
         mx.clear_cache()
 
     def _encode_prompt(self, prompt: str, max_length: int = 512) -> mx.array:
-        """Tokenize and encode prompt through text encoder."""
         tokens = self.tokenizer(
             self._format_prompt(prompt),
             padding="max_length",
@@ -164,7 +159,6 @@ class ZImagePipeline:
         negative_prompt: str | None = None,
         cfg_truncation: float = 1.0,
     ) -> mx.array:
-        """Generate image as uint8 [H, W, 3] array."""
         for name, value in (("width", width), ("height", height)):
             if value < 16 or value % 16:
                 raise ValueError(
@@ -225,7 +219,6 @@ class ZImagePipeline:
         cfg_truncation: float = 1.0,
         strength: float = 0.6,
     ) -> mx.array:
-        """Generate from a noised VAE encoding of one source image."""
         if len(image_paths) != 1:
             raise ValueError("Z-Image img2img requires exactly one source image")
         if not 0.0 < strength <= 1.0:

@@ -1,17 +1,3 @@
-"""Z-Image transformer architecture for MLX.
-
-Matches weight keys from the quantized checkpoint exactly:
-- layers.N.{adaLN_modulation.0, attention.{to_q,to_k,to_v,to_out.0,norm_q,norm_k},
-            attention_norm1, attention_norm2, feed_forward.{w1,w2,w3}, ffn_norm1, ffn_norm2}
-- noise_refiner.N.{same as layers}
-- context_refiner.N.{same as layers minus adaLN_modulation}
-- all_final_layer.2-1.{adaLN_modulation.0, linear}
-- all_x_embedder.2-1 (Linear)
-- t_embedder.{linear1, linear2}
-- cap_embedder.{0 (RMSNorm), 1 (Linear)}
-- x_pad_token, cap_pad_token
-"""
-
 from __future__ import annotations
 
 import math
@@ -26,8 +12,6 @@ SEQ_MULTI_OF = 32
 
 
 class TimestepEmbedder(nn.Module):
-    """Matches t_embedder.linear1 / t_embedder.linear2."""
-
     def __init__(self, out_size: int, frequency_size: int = 256) -> None:
         super().__init__()
         self.frequency_size = frequency_size
@@ -43,8 +27,6 @@ class TimestepEmbedder(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """SwiGLU: matches feed_forward.{w1, w2, w3}."""
-
     def __init__(self, dim: int, hidden_dim: int) -> None:
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
@@ -56,8 +38,6 @@ class FeedForward(nn.Module):
 
 
 class MRoPE:
-    """Multi-resolution RoPE for Z-Image."""
-
     def __init__(
         self,
         sections: tuple[int, ...] = (32, 48, 48),
@@ -67,7 +47,6 @@ class MRoPE:
         self.theta = theta
 
     def compute_freqs(self, position_ids: mx.array) -> tuple[mx.array, mx.array]:
-        """position_ids: [B, L, 3]. Returns (cos, sin) each [B, L, head_dim]."""
         cos_parts = []
         sin_parts = []
         for i, s in enumerate(self.sections):
@@ -80,7 +59,6 @@ class MRoPE:
 
 
 def apply_rotary(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
-    """x: [B, L, H, D], cos/sin: [B, L, D]."""
     cos = cos[:, :, None, :]
     sin = sin[:, :, None, :]
     *rest, D = x.shape
@@ -94,8 +72,6 @@ def apply_rotary(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
 
 
 class Attention(nn.Module):
-    """Matches attention.{to_q, to_k, to_v, to_out.0, norm_q, norm_k}."""
-
     def __init__(self, dim: int, num_heads: int, head_dim: int) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -133,16 +109,6 @@ class Attention(nn.Module):
 
 
 class ZImageTransformerBlock(nn.Module):
-    """Transformer block with optional adaLN modulation.
-
-    Weight keys:
-    - adaLN_modulation.0.{weight,scales,bias} (when modulation=True)
-    - attention.{to_q,to_k,to_v,to_out.0,norm_q,norm_k}.{weight,scales}
-    - attention_norm1.weight, attention_norm2.weight
-    - feed_forward.{w1,w2,w3}.{weight,scales}
-    - ffn_norm1.weight, ffn_norm2.weight
-    """
-
     def __init__(
         self,
         dim: int,
@@ -195,8 +161,6 @@ class ZImageTransformerBlock(nn.Module):
 
 
 class FinalLayer(nn.Module):
-    """Matches all_final_layer.2-1.{adaLN_modulation.0, linear}."""
-
     def __init__(
         self, dim: int, out_dim: int, adaln_dim: int = ADALN_EMBED_DIM
     ) -> None:
@@ -212,8 +176,6 @@ class FinalLayer(nn.Module):
 
 
 class _FinalLayerDict(nn.Module):
-    """Container matching the 'all_final_layer' dict with key '2-1'."""
-
     def __init__(self, dim: int, out_dim: int) -> None:
         super().__init__()
         # Attribute name uses Python-safe replacement but weight key
@@ -222,16 +184,12 @@ class _FinalLayerDict(nn.Module):
 
 
 class _XEmbedderDict(nn.Module):
-    """Container matching 'all_x_embedder' dict with key '2-1'."""
-
     def __init__(self, in_features: int, out_features: int) -> None:
         super().__init__()
         self.embed = nn.Linear(in_features, out_features)
 
 
 class ZImageTransformer(nn.Module):
-    """Complete Z-Image transformer matching checkpoint weight keys."""
-
     def __init__(self, config: ZImageTransformerConfig | None = None) -> None:
         super().__init__()
         if config is None:
@@ -293,7 +251,6 @@ class ZImageTransformer(nn.Module):
         self.t_scale = config.timestep_scale
 
     def _patchify(self, x: mx.array) -> tuple[mx.array, tuple[int, int, int]]:
-        """x: [B, C, F, H, W] → patches [B, L, patch_dim]."""
         B, C, F, H, W = x.shape
         pH, pW, pF = self.patch_size, self.patch_size, self.f_patch_size
         Ft, Ht, Wt = F // pF, H // pH, W // pW
@@ -303,7 +260,6 @@ class ZImageTransformer(nn.Module):
         return x, (Ft, Ht, Wt)
 
     def _unpatchify(self, x: mx.array, shape: tuple[int, int, int]) -> mx.array:
-        """patches [B, L, D] → [B, C, F, H, W]."""
         B = x.shape[0]
         Ft, Ht, Wt = shape
         pH, pW, pF = self.patch_size, self.patch_size, self.f_patch_size
@@ -315,7 +271,6 @@ class ZImageTransformer(nn.Module):
     def _build_position_ids(
         self, cap_len: int, Ft: int, Ht: int, Wt: int
     ) -> tuple[mx.array, mx.array]:
-        """Build position IDs for cap and image tokens."""
         # Caption positions: t=1..cap_len, h=0, w=0
         t_ids = mx.arange(1, cap_len + 1, dtype=mx.float32)
         cap_pos = mx.stack([t_ids, mx.zeros(cap_len), mx.zeros(cap_len)], axis=-1)[None]
@@ -332,11 +287,6 @@ class ZImageTransformer(nn.Module):
         return cap_pos, img_pos
 
     def __call__(self, x: mx.array, t: mx.array, cap_feats: mx.array) -> mx.array:
-        """
-        x: [B, C, F, H, W] noisy latents
-        t: [B] timestep in [0, 1]
-        cap_feats: [B, L_cap, D_cap] text embeddings
-        """
         B = x.shape[0]
         patches, (Ft, Ht, Wt) = self._patchify(x)
         image_len = patches.shape[1]
@@ -422,7 +372,6 @@ class ZImageTransformer(nn.Module):
 def sanitize_transformer_weights(
     weights: dict[str, mx.array],
 ) -> dict[str, mx.array]:
-    """Map checkpoint keys to module attribute paths."""
     sanitized: dict[str, mx.array] = {}
     for key, value in weights.items():
         # Map the source ModuleDict key to the registered MLX module.
