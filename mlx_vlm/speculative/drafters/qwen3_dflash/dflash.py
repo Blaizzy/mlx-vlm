@@ -117,6 +117,134 @@ class DFlashDecoderLayer(nn.Module):
         return h + self.mlp(self.post_attention_layernorm(h))
 
 
+# --- DFlash 2 -----------------------------------------------------------------
+# Ported from the reference MLX implementation in z-lab/dflash (MIT),
+# dflash/model_mlx.py: GroupedDynamicCausalConv, DFlash2DecoderLayer and
+# CandidateSelector. Its decoder-layer signature already matches the one above,
+# so the round loop in mlx_vlm/speculative/dflash.py is untouched: the selector
+# runs inside draft_block and still returns a plain token array.
+#
+# The drafter only proposes; the target verifies every token. A bug in the conv
+# or the selector therefore costs acceptance, never correctness. That is also
+# why the reference's distribution-preserving sampling path (q rows) is not
+# needed here -- _speculative_walk compares the draft against the target sample.
+
+
+def _grouped_dynamic_convolve(hidden, dynamic, base, group_size):
+    """Two-tap causal conv with a static kernel plus an input-dependent part.
+
+    The dynamic part is shared per group (group_size channels each), which is
+    why kernel_projection emits 2 * kernel_size * groups values instead of a
+    full per-channel matrix.
+    """
+    batch, length, hidden_size = hidden.shape
+    groups = hidden_size // group_size
+    blocks = hidden.reshape(batch, length, groups, group_size)
+    dynamic = dynamic.reshape(batch, length, base.shape[0], groups, 1)
+    output = mx.zeros_like(blocks)
+    for offset in range(base.shape[0]):
+        values = (
+            blocks
+            if offset == 0
+            else mx.concatenate(
+                (mx.zeros_like(blocks[:, :offset]), blocks[:, :-offset]), axis=1
+            )
+        )
+        kernel = base[offset].reshape(1, 1, groups, group_size).astype(hidden.dtype)
+        output = output + kernel * values
+        output = output + dynamic[:, :, offset] * values
+    return output.reshape(hidden.shape)
+
+
+class GroupedDynamicCausalConv(nn.Module):
+    def __init__(self, hidden_size, kernel_size, group_size):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.group_size = group_size
+        groups = hidden_size // group_size
+        self.base_kernel = mx.zeros((2, kernel_size, hidden_size))
+        self.kernel_projection = nn.Linear(
+            hidden_size, 2 * kernel_size * groups, bias=False
+        )
+
+    def prepare(self, hidden):
+        groups = hidden.shape[-1] // self.group_size
+        dynamic = self.kernel_projection(hidden).reshape(
+            *hidden.shape[:-1], 2, self.kernel_size, groups
+        )
+        return (
+            _grouped_dynamic_convolve(
+                hidden, dynamic[..., 0, :, :], self.base_kernel[0], self.group_size
+            ),
+            dynamic[..., 1, :, :],
+        )
+
+    def finish(self, hidden, dynamic):
+        return _grouped_dynamic_convolve(
+            hidden, dynamic, self.base_kernel[1], self.group_size
+        )
+
+
+class DFlash2DecoderLayer(DFlashDecoderLayer):
+    def __init__(self, config: DFlashConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
+        self.attention_conv = GroupedDynamicCausalConv(
+            config.hidden_size, config.conv_kernel_size, config.conv_group_size
+        )
+        self.mlp_conv = GroupedDynamicCausalConv(
+            config.hidden_size, config.conv_kernel_size, config.conv_group_size
+        )
+
+    def __call__(self, x, x_ctx, rope, cache):
+        residual = x
+        x, kernel = self.attention_conv.prepare(self.input_layernorm(x))
+        x = residual + self.attention_conv.finish(
+            self.self_attn(x, x_ctx, rope, cache), kernel
+        )
+        residual = x
+        x, kernel = self.mlp_conv.prepare(self.post_attention_layernorm(x))
+        return residual + self.mlp_conv.finish(self.mlp(x), kernel)
+
+
+class CandidateSelector(nn.Module):
+    """Pick one coherent path through the top-k candidates of a draft block.
+
+    Instead of taking an independent argmax per position, adjacent token pairs
+    are scored with a low-rank bilinear form (predecessor codebook x projected
+    hidden state x successor codebook) and the best path is traced once,
+    left to right.
+    """
+
+    def __init__(self, config: DFlashConfig):
+        super().__init__()
+        self.top_k = config.selector_top_k
+        self.predecessor_codebook = nn.Embedding(config.vocab_size, config.selector_rank)
+        self.successor_codebook = nn.Embedding(config.vocab_size, config.selector_rank)
+        self.hidden_projection = nn.Linear(
+            config.hidden_size, config.selector_rank, bias=False
+        )
+
+    def select(self, hidden: mx.array, logits: mx.array, anchor_ids: mx.array):
+        candidates = mx.argpartition(logits, -self.top_k, axis=-1)[..., -self.top_k :]
+        unary = mx.take_along_axis(logits, candidates, axis=-1)
+        hidden = self.hidden_projection(hidden)
+        predecessor = anchor_ids
+        path = []
+        for position in range(hidden.shape[1]):
+            edges = mx.sum(
+                self.predecessor_codebook(predecessor)[:, None]
+                * hidden[:, position, None]
+                * self.successor_codebook(candidates[:, position]),
+                axis=-1,
+            )
+            selected = mx.argmax(unary[:, position] + edges, axis=-1)
+            predecessor = mx.take_along_axis(
+                candidates[:, position], selected[:, None], axis=-1
+            )[:, 0]
+            path.append(predecessor)
+        return mx.stack(path, axis=1)
+
+
 class DFlashDraftModel(nn.Module):
     def __init__(self, config: DFlashConfig):
         super().__init__()
@@ -126,9 +254,15 @@ class DFlashDraftModel(nn.Module):
         concat_dim = len(config.target_layer_ids) * config.hidden_size
         self.fc = nn.Linear(concat_dim, config.hidden_size, bias=False)
         self.hidden_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.layers = [
-            DFlashDecoderLayer(config, i) for i in range(config.num_hidden_layers)
-        ]
+        # DFlash 2 adds per-layer convs and the path selector. Both are driven
+        # purely by the drafter config, so a v1 checkpoint builds as before.
+        layer_class = (
+            DFlash2DecoderLayer if config.conv_kernel_size > 0 else DFlashDecoderLayer
+        )
+        self.layers = [layer_class(config, i) for i in range(config.num_hidden_layers)]
+        self.candidate_selector = (
+            CandidateSelector(config) if config.selector_rank > 0 else None
+        )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rope = _build_rope(config)
         self.embed_tokens = None
@@ -216,6 +350,13 @@ class DFlashDraftModel(nn.Module):
             )
         draft_hidden = self._hidden(block, hidden, cache)
         draft_logits = self._logits(draft_hidden[:, 1:])
+        if self.candidate_selector is not None:
+            # DFlash 2: trace a path through the per-position top-k instead of
+            # taking an argmax per position. The anchor is the first block
+            # token, i.e. the bonus token that was already accepted.
+            return self.candidate_selector.select(
+                draft_hidden[:, 1:], draft_logits, block[:, 0]
+            ).astype(token_dtype)
         return sampler(draft_logits)
 
     def _hidden(
@@ -253,6 +394,13 @@ class DFlashDraftModel(nn.Module):
         for k, v in weights.items():
             if k.startswith("model."):
                 k = k[len("model.") :]
+            # DFlash 2 stores the selector codebooks as bare tensors, but they
+            # are nn.Embedding here, which expects the .weight suffix.
+            if k in (
+                "candidate_selector.predecessor_codebook",
+                "candidate_selector.successor_codebook",
+            ):
+                k = f"{k}.weight"
             out[k] = v
         return out
 

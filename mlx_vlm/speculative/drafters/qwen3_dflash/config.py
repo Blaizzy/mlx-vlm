@@ -29,6 +29,15 @@ class DFlashConfig(BaseModelConfig):
     final_logit_softcapping: Optional[float] = None
     runtime_block_size: int | None = None
     draft_window_size: int | None = None
+    # DFlash 2 extras. All default to 0, which reproduces DFlash v1 exactly, so
+    # v1 checkpoints keep loading unchanged. The v2 modules are only built when
+    # the drafter's own dflash_config asks for them:
+    #   conv_*     -> GroupedDynamicCausalConv in every decoder layer
+    #   selector_* -> CandidateSelector (top-k per position + path search)
+    conv_kernel_size: int = 0
+    conv_group_size: int = 0
+    selector_rank: int = 0
+    selector_top_k: int = 0
 
     @classmethod
     def from_dict(cls, params: dict) -> "DFlashConfig":
@@ -42,6 +51,22 @@ class DFlashConfig(BaseModelConfig):
             flat["runtime_block_size"] = dflash_cfg["runtime_block_size"]
         if "draft_window_size" in dflash_cfg:
             flat["draft_window_size"] = dflash_cfg["draft_window_size"]
+        # DFlash 2 moved block_size into dflash_config; v1 kept it top-level.
+        if "block_size" in dflash_cfg:
+            flat["block_size"] = dflash_cfg["block_size"]
+        for key in (
+            "conv_kernel_size",
+            "conv_group_size",
+            "selector_rank",
+            "selector_top_k",
+        ):
+            if key in dflash_cfg:
+                flat[key] = int(dflash_cfg[key])
+        # transformers 5.x nests RoPE settings under rope_parameters. Without
+        # this, rope_theta silently falls back to the class default.
+        rope_params = flat.get("rope_parameters")
+        if isinstance(rope_params, dict) and "rope_theta" in rope_params:
+            flat.setdefault("rope_theta", rope_params["rope_theta"])
         sig = inspect.signature(cls).parameters
         return cls(**{k: v for k, v in flat.items() if k in sig})
 
