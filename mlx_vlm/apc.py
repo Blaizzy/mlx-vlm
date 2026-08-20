@@ -54,7 +54,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import numpy as np
@@ -558,6 +558,7 @@ class APCStats:
     pool_used: int = 0
     disk_hits: int = 0
     disk_writes: int = 0
+    disk_write_failures: int = 0
     exact_hits: int = 0
     exact_stores: int = 0
     rejects: int = 0
@@ -586,6 +587,7 @@ class APCStats:
             "stores": self.stores,
             "disk_hits": self.disk_hits,
             "disk_writes": self.disk_writes,
+            "disk_write_failures": self.disk_write_failures,
             "exact_hits": self.exact_hits,
             "exact_stores": self.exact_stores,
             "rejects": self.rejects,
@@ -645,6 +647,102 @@ def _numel(shape: Sequence[int]) -> int:
     for dim in shape:
         out *= int(dim)
     return out
+
+
+_EMPTY_TENSORS_METADATA = "empty_tensors_v1"
+_EMPTY_TENSOR_MARKER = "__apc_empty_tensor__"
+
+
+def _mlx_dtype_from_name(name: str) -> Optional[mx.Dtype]:
+    """Resolve the stable string form of an MLX dtype.
+
+    MLX dtypes do not have a public string constructor. Exact-cache files only
+    need the dtypes that MLX arrays can currently expose, so keep the mapping
+    local and fail closed when a newer producer writes an unknown dtype.
+    """
+    for attr in (
+        "bool_",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "float16",
+        "float32",
+        "float64",
+        "bfloat16",
+        "complex64",
+    ):
+        dtype = getattr(mx, attr, None)
+        if dtype is not None and str(dtype) == name:
+            return dtype
+    return None
+
+
+def _extract_empty_tensor_specs(
+    arrays: Dict[str, mx.array],
+) -> Dict[str, Dict[str, Any]]:
+    """Remove zero-sized tensors from a safetensors payload and describe them.
+
+    ``mx.save_safetensors`` rejects arrays with any zero-width dimension. Such
+    arrays are legitimate cache state (DeepSeek V4 stores K-only local
+    attention as a normal key tensor paired with a ``[..., 0]`` value tensor),
+    so preserve shape and dtype in metadata and reconstruct them on restore.
+    """
+    specs: Dict[str, Dict[str, Any]] = {}
+    for name, value in list(arrays.items()):
+        shape = tuple(int(dim) for dim in value.shape)
+        if _numel(shape) != 0:
+            continue
+        specs[name] = {"shape": list(shape), "dtype": str(value.dtype)}
+        del arrays[name]
+    return specs
+
+
+def _restore_empty_tensor_entries(
+    tensor_entries: dict, metadata: dict
+) -> Optional[dict]:
+    """Add validated virtual safetensors entries for metadata-only tensors."""
+    raw = metadata.get(_EMPTY_TENSORS_METADATA)
+    if raw is None:
+        return dict(tensor_entries)
+    try:
+        specs = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(specs, dict):
+        return None
+
+    restored = dict(tensor_entries)
+    for name, spec in specs.items():
+        if not isinstance(name, str) or name in restored or not isinstance(spec, dict):
+            return None
+        shape_raw = spec.get("shape")
+        dtype_name = spec.get("dtype")
+        if not isinstance(shape_raw, list) or not isinstance(dtype_name, str):
+            return None
+        try:
+            shape = tuple(int(dim) for dim in shape_raw)
+        except (TypeError, ValueError):
+            return None
+        if (
+            any(type(dim) is not int for dim in shape_raw)
+            or any(dim < 0 for dim in shape)
+            or _numel(shape) != 0
+        ):
+            return None
+        dtype = _mlx_dtype_from_name(dtype_name)
+        if dtype is None:
+            return None
+        restored[name] = {
+            _EMPTY_TENSOR_MARKER: True,
+            "shape": shape,
+            "mlx_dtype": dtype,
+        }
+    return restored
 
 
 def _encode_checkpoint_tree(
@@ -784,6 +882,11 @@ def _mlx_array_from_safetensors_bytes(buf, entry: dict) -> Optional[mx.array]:
 def _read_safetensors_tensor(
     path: Path, data_start: int, entry: dict
 ) -> Optional[mx.array]:
+    if entry.get(_EMPTY_TENSOR_MARKER) is True:
+        try:
+            return mx.zeros(tuple(entry["shape"]), dtype=entry["mlx_dtype"])
+        except (KeyError, TypeError, ValueError):
+            return None
     bounds = _safetensors_tensor_bounds(entry)
     if bounds is None:
         return None
@@ -940,6 +1043,8 @@ class DiskBlockStore:
         self.max_bytes = max_bytes
         self.evictions = 0  # cumulative shard deletions by _maybe_evict
         self._q: queue.Queue = queue.Queue(maxsize=4096)
+        self._write_success_callback: Optional[Callable[[int], None]] = None
+        self._write_failure_callback: Optional[Callable[[int], None]] = None
         # Track in-flight hashes (across pending shard writes) so a lookup
         # racing a write can wait briefly for the bytes to land.
         self._in_flight: dict[int, threading.Event] = {}
@@ -987,6 +1092,26 @@ class DiskBlockStore:
         ]
         for t in self._workers:
             t.start()
+
+    def set_write_callbacks(
+        self,
+        success: Optional[Callable[[int], None]],
+        failure: Optional[Callable[[int], None]],
+    ) -> None:
+        """Observe completed background writes without blocking the producer."""
+        self._write_success_callback = success
+        self._write_failure_callback = failure
+
+    @staticmethod
+    def _notify_write_callback(
+        callback: Optional[Callable[[int], None]], count: int
+    ) -> None:
+        if callback is None or count <= 0:
+            return
+        try:
+            callback(count)
+        except Exception:
+            logger.exception("APC disk write stats callback failed")
 
     # ---------- Naming + housekeeping ----------
     @classmethod
@@ -1340,6 +1465,9 @@ class DiskBlockStore:
             return None
         tensor_entries, metadata, data_start = parsed
         if metadata.get("layout") != "exact_cache_v1":
+            return None
+        tensor_entries = _restore_empty_tensor_entries(tensor_entries, metadata)
+        if tensor_entries is None:
             return None
         try:
             token_ids = tuple(
@@ -2537,8 +2665,11 @@ class DiskBlockStore:
         for i, c in enumerate(snapshot.prompt_cache):
             if not self._snapshot_exact_cache_entry(c, f"c{i}", arrays, metadata):
                 raise ValueError(f"unsupported exact-cache entry at index {i}")
-        if not arrays:
-            return []
+        empty_specs = _extract_empty_tensor_specs(arrays)
+        if empty_specs:
+            metadata[_EMPTY_TENSORS_METADATA] = json.dumps(
+                empty_specs, separators=(",", ":"), sort_keys=True
+            )
 
         # ``store_exact_cache`` materializes the detached snapshot before it is
         # queued. Do not create/evaluate MLX graphs in this worker thread: MLX
@@ -2546,8 +2677,16 @@ class DiskBlockStore:
         # cross-thread evaluation.
         tag = f"{os.getpid()}-{threading.get_ident()}"
         tmp = path.parent / f"{path.stem}.{tag}{self.SUFFIX}"
-        mx.save_safetensors(str(tmp), arrays, metadata=metadata)
-        os.replace(tmp, path)
+        try:
+            mx.save_safetensors(str(tmp), arrays, metadata=metadata)
+            os.replace(tmp, path)
+        finally:
+            # A failed MLX serialization can leave a zero-byte sibling. It is
+            # never a valid cache shard and should not survive until restart.
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
         try:
             self._disk_bytes += path.stat().st_size
         except OSError:
@@ -2653,6 +2792,7 @@ class DiskBlockStore:
                 break
             shard_id, block_hashes, payload, ev = item
             path = self._shard_path(shard_id)
+            attempted_count = len(block_hashes)
             try:
                 if isinstance(payload, _DiskExactCacheSnapshot):
                     block_hashes = self._write_exact_cache_snapshot(path, payload)
@@ -2662,6 +2802,13 @@ class DiskBlockStore:
                     raise TypeError(f"unsupported APC disk payload: {type(payload)!r}")
             except Exception as e:
                 logger.warning("APC disk shard save failed for %s: %s", path, e)
+                self._notify_write_callback(
+                    self._write_failure_callback, attempted_count
+                )
+            else:
+                self._notify_write_callback(
+                    self._write_success_callback, len(block_hashes)
+                )
             finally:
                 with self._in_flight_lock:
                     for block_hash in block_hashes:
@@ -2705,6 +2852,11 @@ class APCManager:
         self.stats = APCStats()
         self.lock = threading.RLock()
         self.disk = disk
+        if self.disk is not None:
+            self.disk.set_write_callbacks(
+                self._record_disk_writes,
+                self._record_disk_write_failures,
+            )
         self._exact_cache_max = max(
             0,
             int(
@@ -2749,6 +2901,14 @@ class APCManager:
         self._layer_major_memory_min_tokens = max(
             0, int(os.environ.get("APC_LAYER_MAJOR_MEMORY_MIN_TOKENS", "50000"))
         )
+
+    def _record_disk_writes(self, count: int) -> None:
+        with self.lock:
+            self.stats.disk_writes += int(count)
+
+    def _record_disk_write_failures(self, count: int) -> None:
+        with self.lock:
+            self.stats.disk_write_failures += int(count)
 
     def coordinator(self, model: Any) -> APCCoordinator:
         """Bind this storage manager to a model's grouped cache plan."""
@@ -3007,8 +3167,6 @@ class APCManager:
         if self.disk is not None:
             try:
                 self.disk.save_exact_cache(key, token_tuple, extra_hash, copied)
-                with self.lock:
-                    self.stats.disk_writes += 1
                 stored = True
             except Exception as e:
                 logger.warning("APC exact disk save scheduling failed: %s", e)
@@ -3277,7 +3435,6 @@ class APCManager:
                     self.disk.save_layer_major_blocks(
                         disk_blocks, layer_keys, layer_values, self.block_size
                     )
-                    self.stats.disk_writes += len(disk_blocks)
                 except Exception as e:
                     logger.warning("APC disk save scheduling failed: %s", e)
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
@@ -3328,6 +3485,7 @@ class APCManager:
         """Best-effort shutdown: close the disk writer thread."""
         if self.disk is not None:
             self.disk.close()
+            self.disk.set_write_callbacks(None, None)
 
 
 def _reject_mixed_batch_policy(policy) -> None:
