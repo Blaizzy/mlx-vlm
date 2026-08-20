@@ -633,6 +633,24 @@ def test_qwen_target_verify_quantized_linear_m4_matches_singleton_path(dtype):
     assert bool(mx.array_equal(ref, out).item())
 
 
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_qwen_target_verify_quantized_linear_m8_matches_singleton_path(
+    dtype, batch_size
+):
+    mx.random.seed(22)
+    linear = nn.QuantizedLinear(512, 64, bias=False, group_size=64, bits=4)
+    linear.scales = linear.scales.astype(dtype)
+    linear.biases = linear.biases.astype(dtype)
+    x = mx.random.normal((batch_size, 8, 512)).astype(dtype)
+
+    ref = qwen_language._target_verify_timewise(linear, x)
+    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
 def test_qwen_capture_only_preserves_prefill_path():
     config = _tiny_qwen3_5_text_config()
     config.num_hidden_layers = 4
@@ -793,6 +811,21 @@ def test_qwen_target_verify_quantized_argmax_matches_singleton_path():
     linear.biases = linear.biases.astype(mx.bfloat16)
 
     x = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
+    ref = mx.argmax(qwen_language._target_verify_timewise(linear, x), axis=-1)
+    out = qwen_language._target_verify_quantized_argmax(linear, x)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_qwen_target_verify_quantized_argmax_m8_matches_singleton_path(dtype):
+    mx.random.seed(23)
+    linear = nn.QuantizedLinear(512, 64, bias=False, group_size=64, bits=4)
+    linear.scales = linear.scales.astype(dtype)
+    linear.biases = linear.biases.astype(dtype)
+
+    x = mx.random.normal((1, 8, 512)).astype(dtype)
     ref = mx.argmax(qwen_language._target_verify_timewise(linear, x), axis=-1)
     out = qwen_language._target_verify_quantized_argmax(linear, x)
     mx.eval(ref, out)

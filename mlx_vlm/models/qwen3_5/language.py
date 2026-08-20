@@ -466,6 +466,245 @@ _TARGET_VERIFY_M4_NUM_SIMDGROUPS = 2
 _TARGET_VERIFY_M4_RESULTS_PER_SIMDGROUP = 4
 
 
+_TARGET_VERIFY_QMV_M8_SOURCE = r"""
+#define M8_ARGMAX 0
+
+    uint n_tile = threadgroup_position_in_grid.y;
+    uint b_idx = threadgroup_position_in_grid.z;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+#if M8_ARGMAX
+    threadgroup float tile_best_values[8][M8_NUM_SIMDGROUPS];
+    threadgroup int tile_best_indices[8][M8_NUM_SIMDGROUPS];
+#endif
+
+    int out_row = int(n_tile) * M8_NUM_SIMDGROUPS * M8_RESULTS_PER_SIMDGROUP +
+        int(simd_gid) * M8_RESULTS_PER_SIMDGROUP;
+    int in_vec_size_w = K_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+    int in_vec_size_g = K_SIZE / GS;
+
+    const device uint8_t* ws =
+        (const device uint8_t*)w + out_row * in_vec_size_w +
+        int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
+    const device T* sc =
+        scales + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
+    const device T* bs =
+        biases + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
+    const device T* xk =
+        x + int(b_idx) * 8 * K_SIZE + int(simd_lid) * VALUES_PER_THREAD;
+
+    // Keep only two output rows live per SIMD group.  Eight rows per group
+    // spills on M3-class GPUs; four rows also loses occupancy once the eight
+    // singleton accumulators are present.
+    float result0[M8_RESULTS_PER_SIMDGROUP] = {0};
+    float result1[M8_RESULTS_PER_SIMDGROUP] = {0};
+    float result2[M8_RESULTS_PER_SIMDGROUP] = {0};
+    float result3[M8_RESULTS_PER_SIMDGROUP] = {0};
+    float result4[M8_RESULTS_PER_SIMDGROUP] = {0};
+    float result5[M8_RESULTS_PER_SIMDGROUP] = {0};
+    float result6[M8_RESULTS_PER_SIMDGROUP] = {0};
+    float result7[M8_RESULTS_PER_SIMDGROUP] = {0};
+
+    for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
+      float sum0 = 0.0f;
+      float sum1 = 0.0f;
+      float sum2 = 0.0f;
+      float sum3 = 0.0f;
+      float sum4 = 0.0f;
+      float sum5 = 0.0f;
+      float sum6 = 0.0f;
+      float sum7 = 0.0f;
+      float dot0[M8_RESULTS_PER_SIMDGROUP] = {0};
+      float dot1[M8_RESULTS_PER_SIMDGROUP] = {0};
+      float dot2[M8_RESULTS_PER_SIMDGROUP] = {0};
+      float dot3[M8_RESULTS_PER_SIMDGROUP] = {0};
+      float dot4[M8_RESULTS_PER_SIMDGROUP] = {0};
+      float dot5[M8_RESULTS_PER_SIMDGROUP] = {0};
+      float dot6[M8_RESULTS_PER_SIMDGROUP] = {0};
+      float dot7[M8_RESULTS_PER_SIMDGROUP] = {0};
+
+      for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
+        // Load each packed target weight once, then reuse it across all eight
+        // verifier rows.  q0..q3 deliberately retain the singleton kernel's
+        // nibble scaling; changing this expression changes BF16/FP16 rounding.
+        float q0[M8_RESULTS_PER_SIMDGROUP];
+        float q1[M8_RESULTS_PER_SIMDGROUP];
+        float q2[M8_RESULTS_PER_SIMDGROUP];
+        float q3[M8_RESULTS_PER_SIMDGROUP];
+#pragma clang loop unroll(full)
+        for (int row = 0; row < M8_RESULTS_PER_SIMDGROUP; ++row) {
+          const device uint16_t* packed_w =
+              (const device uint16_t*)(ws + row * in_vec_size_w);
+          uint16_t packed = packed_w[i / 4];
+          q0[row] = float(packed & 0x000f);
+          q1[row] = float(packed & 0x00f0);
+          q2[row] = float(packed & 0x0f00);
+          q3[row] = float(packed & 0xf000);
+        }
+
+        // Process one token at a time so only four source values and their
+        // promoted forms are live.  The generic T=8 kernel keeps 128 floats
+        // of activation state per thread and spills badly on Apple G15.
+#define M8_ACCUM_TOKEN(TOKEN, SUM, DOT)                                      \
+        {                                                                    \
+          T x0 = xk[(TOKEN) * K_SIZE + i];                                  \
+          T x1 = xk[(TOKEN) * K_SIZE + i + 1];                              \
+          T x2 = xk[(TOKEN) * K_SIZE + i + 2];                              \
+          T x3 = xk[(TOKEN) * K_SIZE + i + 3];                              \
+          SUM += x0 + x1 + x2 + x3;                                        \
+          float fx0 = float(x0);                                            \
+          float fx1 = float(x1) / 16.0f;                                    \
+          float fx2 = float(x2) / 256.0f;                                   \
+          float fx3 = float(x3) / 4096.0f;                                  \
+          _Pragma("clang loop unroll(full)")                               \
+          for (int row = 0; row < M8_RESULTS_PER_SIMDGROUP; ++row) {        \
+            DOT[row] += fx0 * q0[row] + fx1 * q1[row] +                     \
+                fx2 * q2[row] + fx3 * q3[row];                              \
+          }                                                                  \
+        }
+
+        M8_ACCUM_TOKEN(0, sum0, dot0);
+        M8_ACCUM_TOKEN(1, sum1, dot1);
+        M8_ACCUM_TOKEN(2, sum2, dot2);
+        M8_ACCUM_TOKEN(3, sum3, dot3);
+        M8_ACCUM_TOKEN(4, sum4, dot4);
+        M8_ACCUM_TOKEN(5, sum5, dot5);
+        M8_ACCUM_TOKEN(6, sum6, dot6);
+        M8_ACCUM_TOKEN(7, sum7, dot7);
+#undef M8_ACCUM_TOKEN
+      }
+
+#pragma clang loop unroll(full)
+      for (int row = 0; row < M8_RESULTS_PER_SIMDGROUP; ++row) {
+        float scale = float(sc[row * in_vec_size_g]);
+        float bias = float(bs[row * in_vec_size_g]);
+        result0[row] += scale * dot0[row] + bias * sum0;
+        result1[row] += scale * dot1[row] + bias * sum1;
+        result2[row] += scale * dot2[row] + bias * sum2;
+        result3[row] += scale * dot3[row] + bias * sum3;
+        result4[row] += scale * dot4[row] + bias * sum4;
+        result5[row] += scale * dot5[row] + bias * sum5;
+        result6[row] += scale * dot6[row] + bias * sum6;
+        result7[row] += scale * dot7[row] + bias * sum7;
+      }
+      ws += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+      sc += BLOCK_SIZE / GS;
+      bs += BLOCK_SIZE / GS;
+      xk += BLOCK_SIZE;
+    }
+
+#if M8_ARGMAX
+    float best_value0 = -3.4028234663852886e38f;
+    float best_value1 = -3.4028234663852886e38f;
+    float best_value2 = -3.4028234663852886e38f;
+    float best_value3 = -3.4028234663852886e38f;
+    float best_value4 = -3.4028234663852886e38f;
+    float best_value5 = -3.4028234663852886e38f;
+    float best_value6 = -3.4028234663852886e38f;
+    float best_value7 = -3.4028234663852886e38f;
+    int best_index0 = 0;
+    int best_index1 = 0;
+    int best_index2 = 0;
+    int best_index3 = 0;
+    int best_index4 = 0;
+    int best_index5 = 0;
+    int best_index6 = 0;
+    int best_index7 = 0;
+
+#pragma clang loop unroll(full)
+    for (int row = 0; row < M8_RESULTS_PER_SIMDGROUP; ++row) {
+      int n = out_row + row;
+      float rounded0 = float(T(simd_sum(result0[row])));
+      float rounded1 = float(T(simd_sum(result1[row])));
+      float rounded2 = float(T(simd_sum(result2[row])));
+      float rounded3 = float(T(simd_sum(result3[row])));
+      float rounded4 = float(T(simd_sum(result4[row])));
+      float rounded5 = float(T(simd_sum(result5[row])));
+      float rounded6 = float(T(simd_sum(result6[row])));
+      float rounded7 = float(T(simd_sum(result7[row])));
+      if (rounded0 > best_value0) { best_value0 = rounded0; best_index0 = n; }
+      if (rounded1 > best_value1) { best_value1 = rounded1; best_index1 = n; }
+      if (rounded2 > best_value2) { best_value2 = rounded2; best_index2 = n; }
+      if (rounded3 > best_value3) { best_value3 = rounded3; best_index3 = n; }
+      if (rounded4 > best_value4) { best_value4 = rounded4; best_index4 = n; }
+      if (rounded5 > best_value5) { best_value5 = rounded5; best_index5 = n; }
+      if (rounded6 > best_value6) { best_value6 = rounded6; best_index6 = n; }
+      if (rounded7 > best_value7) { best_value7 = rounded7; best_index7 = n; }
+    }
+
+    if (simd_lid == 0) {
+      tile_best_values[0][simd_gid] = best_value0;
+      tile_best_values[1][simd_gid] = best_value1;
+      tile_best_values[2][simd_gid] = best_value2;
+      tile_best_values[3][simd_gid] = best_value3;
+      tile_best_values[4][simd_gid] = best_value4;
+      tile_best_values[5][simd_gid] = best_value5;
+      tile_best_values[6][simd_gid] = best_value6;
+      tile_best_values[7][simd_gid] = best_value7;
+      tile_best_indices[0][simd_gid] = best_index0;
+      tile_best_indices[1][simd_gid] = best_index1;
+      tile_best_indices[2][simd_gid] = best_index2;
+      tile_best_indices[3][simd_gid] = best_index3;
+      tile_best_indices[4][simd_gid] = best_index4;
+      tile_best_indices[5][simd_gid] = best_index5;
+      tile_best_indices[6][simd_gid] = best_index6;
+      tile_best_indices[7][simd_gid] = best_index7;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_gid == 0 && simd_lid == 0) {
+#pragma clang loop unroll(full)
+      for (int t = 0; t < 8; ++t) {
+        float best = tile_best_values[t][0];
+        int best_idx = tile_best_indices[t][0];
+#pragma clang loop unroll(full)
+        for (int group = 1; group < M8_NUM_SIMDGROUPS; ++group) {
+          float candidate = tile_best_values[t][group];
+          if (candidate > best) {
+            best = candidate;
+            best_idx = tile_best_indices[t][group];
+          }
+        }
+        int offset = (int(b_idx) * 8 + t) * NUM_TILES + int(n_tile);
+        tile_values[offset] = T(best);
+        tile_indices[offset] = best_idx;
+      }
+    }
+#else
+#pragma clang loop unroll(full)
+    for (int row = 0; row < M8_RESULTS_PER_SIMDGROUP; ++row) {
+      float r0 = simd_sum(result0[row]);
+      float r1 = simd_sum(result1[row]);
+      float r2 = simd_sum(result2[row]);
+      float r3 = simd_sum(result3[row]);
+      float r4 = simd_sum(result4[row]);
+      float r5 = simd_sum(result5[row]);
+      float r6 = simd_sum(result6[row]);
+      float r7 = simd_sum(result7[row]);
+      if (simd_lid == 0) {
+        int base = int(b_idx) * 8 * N_SIZE + out_row + row;
+        y[base + 0 * N_SIZE] = T(r0);
+        y[base + 1 * N_SIZE] = T(r1);
+        y[base + 2 * N_SIZE] = T(r2);
+        y[base + 3 * N_SIZE] = T(r3);
+        y[base + 4 * N_SIZE] = T(r4);
+        y[base + 5 * N_SIZE] = T(r5);
+        y[base + 6 * N_SIZE] = T(r6);
+        y[base + 7 * N_SIZE] = T(r7);
+      }
+    }
+#endif
+"""
+
+
+_TARGET_VERIFY_M8_NUM_SIMDGROUPS = 4
+_TARGET_VERIFY_M8_RESULTS_PER_SIMDGROUP = 2
+_TARGET_VERIFY_QARGMAX_M8_SOURCE = _TARGET_VERIFY_QMV_M8_SOURCE.replace(
+    "#define M8_ARGMAX 0", "#define M8_ARGMAX 1"
+)
+
+
 _TARGET_VERIFY_QARGMAX_SOURCE = r"""
     uint n_tile = threadgroup_position_in_grid.y;
     uint b_idx = threadgroup_position_in_grid.z;
@@ -606,6 +845,28 @@ def _target_verify_qmv_m4_kernel(group_size, dtype, k_size, n_size):
 
 
 @lru_cache(maxsize=None)
+def _target_verify_qmv_m8_kernel(group_size, dtype, k_size, n_size):
+    """Build the M8 verifier as two M4 register tiles in one Metal launch.
+
+    A single workgroup retaining all eight rows reuses weights, but the extra
+    accumulators lower occupancy enough to lose on Apple G15. Flattening M8
+    into two independent four-token tiles preserves the native block-shaped
+    API and singleton arithmetic while keeping the faster M4 register layout.
+    """
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=(
+            "qwen3_5_target_verify_qmv_m8_"
+            f"gs{group_size}_k{k_size}_n{n_size}_{dtype_name}"
+        ),
+        input_names=["x", "w", "scales", "biases"],
+        output_names=["y"],
+        header=_target_verify_qlinear_header(4, group_size),
+        source=_TARGET_VERIFY_QMV_M4_SOURCE,
+    )
+
+
+@lru_cache(maxsize=None)
 def _target_verify_qargmax_kernel(bits, group_size, dtype, verify_t, k_size, n_size):
     dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     return mx.fast.metal_kernel(
@@ -617,6 +878,21 @@ def _target_verify_qargmax_kernel(bits, group_size, dtype, verify_t, k_size, n_s
         output_names=["tile_values", "tile_indices"],
         header=_target_verify_qlinear_header(bits, group_size),
         source=_TARGET_VERIFY_QARGMAX_SOURCE,
+    )
+
+
+@lru_cache(maxsize=None)
+def _target_verify_qargmax_m8_kernel(group_size, dtype, k_size, n_size):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=(
+            "qwen3_5_target_verify_qargmax_m8_"
+            f"gs{group_size}_k{k_size}_n{n_size}_{dtype_name}"
+        ),
+        input_names=["x", "w", "scales", "biases"],
+        output_names=["tile_values", "tile_indices"],
+        header=_target_verify_qlinear_header(4, group_size),
+        source=_TARGET_VERIFY_QARGMAX_M8_SOURCE,
     )
 
 
@@ -691,6 +967,18 @@ def _target_verify_qmv(
                 _TARGET_VERIFY_M4_RESULTS_PER_SIMDGROUP,
             ),
         ]
+    elif bits == 4 and T == 8:
+        kernel = _target_verify_qmv_m8_kernel(group_size, x.dtype, K, N)
+        template = [
+            ("T", x.dtype),
+            ("K_SIZE", int(K)),
+            ("N_SIZE", int(N)),
+            ("M4_NUM_SIMDGROUPS", _TARGET_VERIFY_M4_NUM_SIMDGROUPS),
+            (
+                "M4_RESULTS_PER_SIMDGROUP",
+                _TARGET_VERIFY_M4_RESULTS_PER_SIMDGROUP,
+            ),
+        ]
     else:
         kernel = _target_verify_qmv_kernel(bits, group_size, x.dtype, T, K, N)
         template = [
@@ -700,14 +988,24 @@ def _target_verify_qmv(
             ("N_SIZE", int(N)),
         ]
 
-    is_m4 = bits == 4 and T == 4
-    num_simdgroups = _TARGET_VERIFY_M4_NUM_SIMDGROUPS if is_m4 else 8
-    results_per_simdgroup = _TARGET_VERIFY_M4_RESULTS_PER_SIMDGROUP if is_m4 else 1
+    if bits == 4 and T == 4:
+        num_simdgroups = _TARGET_VERIFY_M4_NUM_SIMDGROUPS
+        results_per_simdgroup = _TARGET_VERIFY_M4_RESULTS_PER_SIMDGROUP
+    elif bits == 4 and T == 8:
+        num_simdgroups = _TARGET_VERIFY_M4_NUM_SIMDGROUPS
+        results_per_simdgroup = _TARGET_VERIFY_M4_RESULTS_PER_SIMDGROUP
+    else:
+        num_simdgroups = 8
+        results_per_simdgroup = 1
     rows_per_threadgroup = num_simdgroups * results_per_simdgroup
     return kernel(
         inputs=[x, weight, scales, biases],
         template=template,
-        grid=(32, num_simdgroups * (N // rows_per_threadgroup), B),
+        grid=(
+            32,
+            num_simdgroups * (N // rows_per_threadgroup),
+            B * 2 if bits == 4 and T == 8 else B,
+        ),
         threadgroup=(32, num_simdgroups, 1),
         output_shapes=[(B, T, N)],
         output_dtypes=[x.dtype],
@@ -859,12 +1157,18 @@ def _target_verify_quantized_argmax(
     num_tiles = N // 8
 
     x = mx.contiguous(x)
-    kernel_factory = (
-        _target_verify_masked_qargmax_kernel
-        if token_mask is not None
-        else _target_verify_qargmax_kernel
-    )
-    kernel = kernel_factory(linear.bits, linear.group_size, x.dtype, T, K, N)
+    use_m8 = linear.bits == 4 and T == 8 and token_mask is None
+    if use_m8:
+        kernel = _target_verify_qargmax_m8_kernel(
+            linear.group_size, x.dtype, K, N
+        )
+    else:
+        kernel_factory = (
+            _target_verify_masked_qargmax_kernel
+            if token_mask is not None
+            else _target_verify_qargmax_kernel
+        )
+        kernel = kernel_factory(linear.bits, linear.group_size, x.dtype, T, K, N)
     inputs = [x, linear.weight, linear.scales, linear.biases]
     if token_mask is not None:
         if token_mask.ndim == 1:
@@ -878,17 +1182,34 @@ def _target_verify_quantized_argmax(
                 "packed token mask must be int32 with one complete row per token"
             )
         inputs.append(token_mask)
-    tile_values, tile_indices = kernel(
-        inputs=inputs,
-        template=[
+    if use_m8:
+        template = [
+            ("T", x.dtype),
+            ("K_SIZE", int(K)),
+            ("N_SIZE", int(N)),
+            ("NUM_TILES", int(num_tiles)),
+            ("M8_NUM_SIMDGROUPS", _TARGET_VERIFY_M8_NUM_SIMDGROUPS),
+            (
+                "M8_RESULTS_PER_SIMDGROUP",
+                _TARGET_VERIFY_M8_RESULTS_PER_SIMDGROUP,
+            ),
+        ]
+        num_simdgroups = _TARGET_VERIFY_M8_NUM_SIMDGROUPS
+    else:
+        template = [
             ("T", x.dtype),
             ("VERIFY_T", int(T)),
             ("K_SIZE", int(K)),
             ("N_SIZE", int(N)),
             ("NUM_TILES", int(num_tiles)),
-        ],
-        grid=(32, 8 * num_tiles, B),
-        threadgroup=(32, 8, 1),
+        ]
+        num_simdgroups = 8
+
+    tile_values, tile_indices = kernel(
+        inputs=inputs,
+        template=template,
+        grid=(32, num_simdgroups * num_tiles, B),
+        threadgroup=(32, num_simdgroups, 1),
         output_shapes=[(B, T, num_tiles), (B, T, num_tiles)],
         output_dtypes=[x.dtype, mx.int32],
     )
