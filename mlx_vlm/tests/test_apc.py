@@ -636,6 +636,42 @@ def test_exact_cache_supports_mixed_kv_and_arrays_cache():
     )
 
 
+def test_exact_cache_restore_keeps_the_first_decode_growth_boundary():
+    """A warm replay must grow KV at the same token as an uncached replay."""
+    from mlx_vlm.models.cache import KVCache
+
+    prefix_len = KVCache.step - 16
+    full_prompt_len = KVCache.step
+    token_ids = list(range(prefix_len))
+    full_tokens = list(range(full_prompt_len))
+
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, KVCache.step, 2))
+    kv.values = mx.ones((1, 1, KVCache.step, 2)) * 2
+    kv.offset = prefix_len
+
+    manager = APCManager(num_blocks=4, block_size=16)
+    assert manager.store_exact_cache(token_ids, [kv])
+    warm, matched_tokens = manager.lookup_exact_cache(full_tokens)
+
+    assert matched_tokens == prefix_len
+    assert warm is not None
+    restored = warm[0]
+    assert restored.offset == prefix_len
+    assert restored.keys.shape[2] == KVCache.step
+
+    suffix_len = full_prompt_len - prefix_len
+    restored.update_and_fetch(
+        mx.ones((1, 1, suffix_len, 2)),
+        mx.ones((1, 1, suffix_len, 2)),
+    )
+    assert restored.offset == full_prompt_len
+    assert restored.keys.shape[2] == KVCache.step
+
+    restored.update_and_fetch(mx.ones((1, 1, 1, 2)), mx.ones((1, 1, 1, 2)))
+    assert restored.keys.shape[2] == 2 * KVCache.step
+
+
 def test_exact_cache_supports_rotating_and_chunked_kv_cache():
     from mlx_vlm.models.cache import ChunkedKVCache, KVCache, RotatingKVCache
 
@@ -724,6 +760,39 @@ def test_exact_cache_disk_restore_rebuilds_index(tmp_path, monkeypatch):
     _assert_allclose(warm[1].keys[..., : len(token_ids), :], kv.keys)
     assert warm[1].offset == len(token_ids)
     assert warm[1].keys.shape[2] >= len(token_ids) + 1
+    manager.close()
+
+
+def test_exact_disk_restore_keeps_the_first_decode_growth_boundary(
+    tmp_path, monkeypatch
+):
+    from mlx_vlm.models.cache import KVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    prefix_len = KVCache.step - 16
+    full_prompt_len = KVCache.step
+    token_ids = list(range(prefix_len))
+
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, KVCache.step, 2))
+    kv.values = mx.ones((1, 1, KVCache.step, 2)) * 2
+    kv.offset = prefix_len
+
+    disk = DiskBlockStore(tmp_path, namespace="decode-growth-boundary")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [kv])
+    disk._q.join()
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="decode-growth-boundary")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    warm, matched_tokens = manager.lookup_exact_cache(list(range(full_prompt_len)))
+
+    assert matched_tokens == prefix_len
+    assert warm is not None
+    assert warm[0].offset == prefix_len
+    assert warm[0].keys.shape[2] == KVCache.step
+    assert manager.stats_snapshot()["disk_hits"] == 1
     manager.close()
 
 

@@ -994,19 +994,6 @@ def stream_generate(
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = total_prompt_tokens / prompt_time
                 tic = time.perf_counter()
-                if (
-                    apc_coordinator is not None
-                    and apc_coordinator.is_checkpoint
-                    and reused_prefix_len == 0
-                ):
-                    try:
-                        apc_coordinator.store_checkpoint(
-                            full_input_ids_list,
-                            tracked_cache,
-                            extra_hash=apc_extra_hash,
-                        )
-                    except Exception as e:
-                        logger.warning("APC exact-cache store failed: %s", e)
 
             generated_tokens.append(token)
 
