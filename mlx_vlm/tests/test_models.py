@@ -999,12 +999,11 @@ class TestLongcatFlashNgramModel(unittest.TestCase):
 
 
 class TestGlm4MoeLiteModel(unittest.TestCase):
-    def test_native_loader_mla_cache_and_checkpoint_sanitize(self):
+    @staticmethod
+    def _config():
         from mlx_vlm.models import glm4_moe_lite
-        from mlx_vlm.models.cache import KVCache
-        from mlx_vlm.utils import get_model_and_args
 
-        config = glm4_moe_lite.ModelConfig(
+        return glm4_moe_lite.ModelConfig(
             vocab_size=64,
             hidden_size=32,
             intermediate_size=64,
@@ -1029,6 +1028,13 @@ class TestGlm4MoeLiteModel(unittest.TestCase):
             rms_norm_eps=1e-5,
             rope_theta=10000.0,
         )
+
+    def test_native_loader_mla_cache_and_checkpoint_sanitize(self):
+        from mlx_vlm.models import glm4_moe_lite
+        from mlx_vlm.models.cache import KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
         mx.random.seed(0)
         model = glm4_moe_lite.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
@@ -1068,8 +1074,33 @@ class TestGlm4MoeLiteModel(unittest.TestCase):
         )
         self.assertNotIn("language_model.model.layers.3.weight", sanitized)
         self.assertFalse(model.cast_predicate("e_score_correction_bias"))
+        self.assertIs(model.language_model.config, config)
         self.assertIs(model_module, glm4_moe_lite)
         self.assertEqual(model_type, "glm4_moe_lite")
+
+    def test_batch_turboquant_prefill_and_decode(self):
+        from mlx_vlm.models import glm4_moe_lite
+        from mlx_vlm.turboquant import BatchTurboQuantKVCache
+
+        config = self._config()
+        mx.random.seed(0)
+        model = glm4_moe_lite.Model(config)
+        cache = [
+            BatchTurboQuantKVCache([0], bits=3.5) for _ in model.language_model.layers
+        ]
+        inputs = mx.array([[1, 2, 3, 4]])
+
+        prefill_logits = model(inputs[:, :3], cache=cache).logits
+        decode_logits = model(inputs[:, 3:], cache=cache).logits
+        mx.eval(prefill_logits, decode_logits)
+
+        self.assertEqual(prefill_logits.shape, (1, 3, config.vocab_size))
+        self.assertEqual(decode_logits.shape, (1, 1, config.vocab_size))
+        for layer_cache in cache:
+            self.assertEqual(layer_cache.key_codec.dim, config.kv_lora_rank)
+            self.assertEqual(layer_cache.value_codec.dim, config.qk_rope_head_dim)
+            self.assertEqual(layer_cache.offset.tolist(), [4])
+            self.assertEqual(layer_cache._idx, 4)
 
 
 class TestRWKV7Model(unittest.TestCase):
