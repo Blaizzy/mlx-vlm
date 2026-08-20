@@ -588,3 +588,98 @@ def test_sample_target_ragged_row_honors_the_new_modes():
     for t, tok in enumerate(tokens.tolist()):
         allowed = _ref_keep(apply_top_n_sigma(lp[t], 1.0))
         assert tok in allowed
+
+
+# --- positionless draws must advance --------------------------------------
+#
+# __call__ receives only logprobs -- no row identity, no position -- so it
+# cannot key a draw the way sample_target does. It used to fabricate one
+# (_position_seed(seed, batch_index, 0)), which is a pure hash: the key never
+# advanced, so repeated calls on the same distribution returned the same token
+# and a row's draw was decided by its index in the batch. It now draws from the
+# global RNG, exactly as upstream's __call__ does. sample_target -- the
+# position-explicit API, and the one per-row seeding actually rests on -- is
+# unchanged.
+
+
+def _uniform(rows, V):
+    return _log_normalize(mx.zeros((rows, V)))
+
+
+def test_call_advances_between_invocations():
+    mx.random.seed(0)
+    V = 64
+    lp = _uniform(1, V)
+    sampler = _PositionedTargetSampler([SamplingConfig(temperature=1.5, seed=1)])
+    drawn = {int(sampler(lp)[0]) for _ in range(40)}
+    assert len(drawn) > 1
+
+
+def test_call_draw_is_not_pinned_by_batch_index():
+    # Three rows, same config, same distribution: under the old keying each row
+    # was a different constant, decided by its index. Now each row varies.
+    mx.random.seed(1)
+    V = 64
+    cfg = SamplingConfig(temperature=1.5, seed=7)
+    sampler = _PositionedTargetSampler([cfg] * 3)
+    lp = _uniform(3, V)
+    per_row = [set(), set(), set()]
+    for _ in range(40):
+        for row, tok in enumerate(sampler(lp).tolist()):
+            per_row[row].add(tok)
+    assert all(len(s) > 1 for s in per_row)
+
+
+def test_call_row_draw_survives_select_compaction():
+    # select() used to shift a survivor's index and therefore its frozen key,
+    # changing that row's token mid-generation. The draw is no longer a
+    # function of the index at all.
+    mx.random.seed(2)
+    V = 64
+    cfgs = [SamplingConfig(temperature=1.5, seed=s) for s in (1, 2, 3)]
+    lp = _uniform(2, V)
+    sub = _PositionedTargetSampler(cfgs).select([1, 2])
+    drawn = {tuple(sub(lp).tolist()) for _ in range(40)}
+    assert len(drawn) > 1
+
+
+def test_draw_block_varies_between_rounds():
+    # The dflash/eagle3 verify loops call the sampler once per round with the
+    # whole [B, T, V] block. Positions restart at 0 every round, so a keyed
+    # block replayed the identical quantile pattern every round.
+    mx.random.seed(3)
+    B, T, V = 2, 6, 48
+    lp = _log_normalize(mx.zeros((B, T, V)))
+    sampler = _PositionedTargetSampler([SamplingConfig(temperature=1.5, seed=4)] * B)
+    blocks = {tuple(map(tuple, sampler(lp).tolist())) for _ in range(30)}
+    assert len(blocks) > 1
+
+
+def test_sample_target_stays_deterministic():
+    # The position-explicit API is what per-row seeding rests on: identical
+    # (row_id, position) inputs must keep returning identical tokens, and two
+    # rows differing only by seed must still differ.
+    V = 64
+    lp = _uniform(2, V)
+    cfgs = [
+        SamplingConfig(temperature=1.5, seed=11),
+        SamplingConfig(temperature=1.5, seed=12),
+    ]
+    sampler = _PositionedTargetSampler(cfgs)
+    draws = [
+        sampler.sample_target(lp, row_ids=[0, 0], positions=[5, 5]).tolist()
+        for _ in range(5)
+    ]
+    assert all(d == draws[0] for d in draws)
+    assert draws[0][0] != draws[0][1]
+
+
+def test_call_validates_width_before_keying():
+    sampler = _PositionedTargetSampler(
+        [
+            SamplingConfig(temperature=1.0, seed=1),
+            SamplingConfig(temperature=2.0, seed=2),
+        ]
+    )
+    with pytest.raises(ValueError, match="configs length"):
+        sampler(mx.zeros((5, 8)))

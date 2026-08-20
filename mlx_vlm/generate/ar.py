@@ -174,7 +174,7 @@ def batched_row_sample(
     top_p: mx.array,
     top_k: mx.array,
     min_p: mx.array,
-    keys: mx.array,
+    keys: Optional[mx.array],
     top_n_sigma: Optional[mx.array] = None,
     p_less: Optional[mx.array] = None,
     typical_p: Optional[mx.array] = None,
@@ -182,7 +182,8 @@ def batched_row_sample(
     """Row-heterogeneous sampling in one sorted-space pass.
 
     logprobs: [B, V] log-normalized. temperature/top_p/min_p: [B] float.
-    top_k: [B] int (<=0 disables). keys: [B] PRNG keys. Returns [B] token ids.
+    top_k: [B] int (<=0 disables). keys: [B] PRNG keys, or None to draw from
+    the global RNG. Returns [B] token ids.
     Order mirrors ``make_sampler``: temperature -> top_n_sigma -> p_less ->
     typical_p -> top_p -> min_p -> top_k, with the non-rank modes applied first
     so the rank-based filters see the already-filtered distribution.
@@ -237,9 +238,13 @@ def batched_row_sample(
     keep = keep | (ranks == 0)
 
     masked = mx.where(keep, sl / safe_t[:, None], mx.array(-float("inf"), mx.float32))
-    sampled_pos = mx.vmap(
-        lambda row, key: mx.random.categorical(row, key=key), in_axes=(0, 0)
-    )(masked, keys)
+    if keys is None:
+        # No per-row keys: draw from the global RNG, which advances on its own.
+        sampled_pos = mx.random.categorical(masked, axis=-1)
+    else:
+        sampled_pos = mx.vmap(
+            lambda row, key: mx.random.categorical(row, key=key), in_axes=(0, 0)
+        )(masked, keys)
     sampled = mx.take_along_axis(order, sampled_pos[:, None], axis=-1)[:, 0]
 
     return mx.where(temperature < eps, greedy, sampled)
@@ -249,10 +254,20 @@ class _PositionedTargetSampler:
     """Row-aware sampler with stateless per-(row,position) RNG keying.
 
     Built from a per-row list of SamplingConfig. Each row is sampled with its
-    own temperature/top_p/top_k/min_p; the RNG key is derived per row from its
-    own seed + row_id + position, so a row's draw is invariant to batch
-    composition. Keeps the sample_target signature that speculative/mtp.py and
-    _sample_with_positions depend on."""
+    own temperature/top_p/top_k/min_p.
+
+    Two draw modes, decided by whether the caller can say WHERE it is:
+
+    * ``sample_target(row_ids=, positions=)`` -- the position-explicit API that
+      speculative/mtp.py and _sample_with_positions use -- derives each row's
+      RNG key from its own seed + row_id + position. That draw is reproducible
+      and invariant to batch composition, which is what per-row seeding rests
+      on.
+    * ``__call__(logprobs)`` gets no row identity and no position, so it cannot
+      key a draw honestly; fabricating one from the row's index in the current
+      batch froze the key (a pure hash of a constant) and tied the draw to
+      batch position. It draws from the global RNG instead, exactly as
+      upstream's __call__ does."""
 
     def __init__(self, configs: List["SamplingConfig"]):
         if not configs:
@@ -324,10 +339,7 @@ class _PositionedTargetSampler:
                 f"got rank {logprobs.ndim}."
             )
         configs = self._configs_for(logprobs.shape[0])
-        keys = mx.stack(
-            [mx.random.key(_position_seed(c.seed, i, 0)) for i, c in enumerate(configs)]
-        )
-        return self._draw(logprobs, keys, configs=configs)
+        return self._draw(logprobs, None, configs=configs)
 
     def _draw_block(self, logprobs: mx.array) -> mx.array:
         """Verify-block sampling: [B, T, V] -> [B, T].
@@ -338,20 +350,14 @@ class _PositionedTargetSampler:
 
         Rows are flattened row-major -- row ``b`` owns flat rows
         ``b*T .. b*T+T-1`` -- and each row's config is repeated ``T`` times to
-        match, so every position keeps its own row's parameters. Keys advance
-        with the position inside the block so the T draws are independent
-        rather than T copies of one quantile.
+        match, so every position keeps its own row's parameters. Like the rank-2
+        __call__ this is a positionless draw: the caller does not say where in
+        the stream the block sits (positions would restart at 0 every round),
+        so the B*T draws come from the global RNG.
         """
         B, T, _ = logprobs.shape
         configs = self._configs_for(B)
-        keys = mx.stack(
-            [
-                mx.random.key(_position_seed(c.seed, i, t))
-                for i, c in enumerate(configs)
-                for t in range(T)
-            ]
-        )
-        flat = self._draw(logprobs.reshape(B * T, -1), keys, configs=configs, repeat=T)
+        flat = self._draw(logprobs.reshape(B * T, -1), None, configs=configs, repeat=T)
         return flat.reshape(B, T)
 
     def sample_target(
@@ -377,7 +383,7 @@ class _PositionedTargetSampler:
     def _draw(
         self,
         logprobs: mx.array,
-        keys: mx.array,
+        keys: Optional[mx.array],
         *,
         configs: Optional[List["SamplingConfig"]] = None,
         repeat: int = 1,
