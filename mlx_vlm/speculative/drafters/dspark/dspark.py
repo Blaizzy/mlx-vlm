@@ -39,9 +39,7 @@ class VanillaMarkov(nn.Module):
         previous_tokens = first_prev_tokens.reshape(-1)
         sampled = []
         for step in range(proposal_length):
-            step_logits = self.apply_step_logits(
-                base_logits[:, step], previous_tokens
-            )
+            step_logits = self.apply_step_logits(base_logits[:, step], previous_tokens)
             previous_tokens = sampler(step_logits).reshape(-1)
             sampled.append(previous_tokens[:, None])
         return mx.concatenate(sampled, axis=1)

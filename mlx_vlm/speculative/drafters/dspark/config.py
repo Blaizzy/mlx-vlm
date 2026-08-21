@@ -103,9 +103,7 @@ class DSparkConfig(BaseModelConfig):
                 "DSpark runtime_block_size must be between 1 and block_size."
             )
         if self.block_size_policy not in {"fixed", "adaptive"}:
-            raise ValueError(
-                "DSpark block_size_policy must be 'fixed' or 'adaptive'."
-            )
+            raise ValueError("DSpark block_size_policy must be 'fixed' or 'adaptive'.")
         if self.dflash_initial_block_size is not None and (
             not isinstance(self.dflash_initial_block_size, int)
             or not 2 <= self.dflash_initial_block_size <= self.block_size
@@ -143,6 +141,7 @@ class DSparkConfig(BaseModelConfig):
                 "DSpark target_layer_ids must be unique, increasing indices "
                 "inside the target layer range."
             )
+
     @classmethod
     def from_dict(cls, params: dict) -> "DSparkConfig":
         flat = dict(params)
