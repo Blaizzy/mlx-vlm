@@ -17,6 +17,9 @@ from ..models.diffusion_visualizer import (
 )
 from ..tokenizer_utils import make_streaming_detokenizer
 from .common import (
+    DEFAULT_DIFFUSION_MAX_DENOISING_STEPS,
+    DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
+    DEFAULT_TEMPERATURE,
     GenerationResult,
     _chunked_prefill_enabled,
     generation_stream,
@@ -25,9 +28,6 @@ from .common import (
 
 logger = logging.getLogger("mlx_vlm.generate")
 
-DEFAULT_TEMPERATURE = 0.0
-DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
-DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 DEFAULT_DIFFUSION_UNMASKING_WIDTH = 0
 DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD = 0.9
 
