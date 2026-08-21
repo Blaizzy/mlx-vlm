@@ -351,7 +351,6 @@ class Thinker(nn.Module):
             **kwargs,
         }
 
-
         c0 = cache[0] if cache else None
         if c0 is not None:
             offset = getattr(c0, "_idx", None)
