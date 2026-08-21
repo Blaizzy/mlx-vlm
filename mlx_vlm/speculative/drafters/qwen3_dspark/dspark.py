@@ -66,9 +66,10 @@ def validate_lfm2_dspark_target(config: DSparkConfig, target_model) -> None:
     layers = getattr(inner, "layers", None)
 
     model_type = getattr(target_config, "model_type", None)
-    if model_type != "lfm2":
+    if model_type not in {"lfm2", "lfm2_moe"}:
         raise ValueError(
-            "LFM2 DSpark requires an LFM2 target, got " f"model_type={model_type!r}."
+            "LFM2 DSpark requires an LFM2 target (dense or MoE), got "
+            f"model_type={model_type!r}."
         )
     hidden_size = getattr(target_config, "hidden_size", None)
     if hidden_size != config.hidden_size:

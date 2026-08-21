@@ -9,7 +9,10 @@ from ..base import (
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from ..exact_speculative_verify import exact_speculative_verify_weight
+from ..exact_speculative_verify import (
+    exact_speculative_verify_switch_weight,
+    exact_speculative_verify_weight,
+)
 
 
 class Lfm2ExactSpeculativeVerifier:
@@ -76,13 +79,58 @@ class Lfm2ExactSpeculativeVerifier:
         return self._linear(conv.out_proj, output)
 
     def _feed_forward(self, feed_forward, x):
-        from .language import MLP
+        from .language import MLP, GatedMLP, Lfm2MoeSparseMoeBlock
 
-        if not isinstance(feed_forward, MLP):
-            return feed_forward(x)
-        gate = self._linear(feed_forward.w1, x)
-        value = self._linear(feed_forward.w3, x)
-        return self._linear(feed_forward.w2, swiglu(gate, value))
+        if isinstance(feed_forward, MLP):
+            gate = self._linear(feed_forward.w1, x)
+            value = self._linear(feed_forward.w3, x)
+            return self._linear(feed_forward.w2, swiglu(gate, value))
+        if isinstance(feed_forward, GatedMLP):
+            gate = self._linear(feed_forward.gate_proj, x)
+            value = self._linear(feed_forward.up_proj, x)
+            return self._linear(feed_forward.down_proj, swiglu(gate, value))
+        if isinstance(feed_forward, Lfm2MoeSparseMoeBlock):
+            gates = mx.softmax(
+                self._linear(feed_forward.gate, x).astype(mx.float32),
+                axis=-1,
+            )
+            if feed_forward.use_expert_bias:
+                gates += feed_forward.expert_bias
+            indices = mx.argpartition(gates, kth=-feed_forward.top_k, axis=-1)[
+                ..., -feed_forward.top_k :
+            ]
+            scores = mx.take_along_axis(gates, indices, axis=-1)
+            if feed_forward.norm_topk_prob:
+                scores /= mx.sum(scores, axis=-1, keepdims=True) + 1e-20
+            switch_mlp = feed_forward.switch_mlp
+            expert_up = self._switch_linear(switch_mlp.up_proj, x, indices)
+            expert_gate = self._switch_linear(switch_mlp.gate_proj, x, indices)
+            expert_output = self._switch_linear(
+                switch_mlp.down_proj,
+                swiglu(expert_gate, expert_up),
+                indices,
+            )
+            return (expert_output * scores.astype(x.dtype)[..., None]).sum(axis=-2)
+        return feed_forward(x)
+
+    @staticmethod
+    def _switch_linear(linear, x, indices):
+        output = exact_speculative_verify_switch_weight(linear.weight, x, indices)
+        if output is not None:
+            if hasattr(linear, "bias"):
+                output = output + linear.bias[indices]
+            return output
+
+        # Preserve exactness for unsupported (for example quantized) switch
+        # layers by retaining the singleton execution shape.
+        rows = []
+        input_has_expert_axis = x.shape[:-1] == indices.shape
+        for position in range(x.shape[1]):
+            row = x[:, position : position + 1]
+            row_indices = indices[:, position : position + 1]
+            row = mx.expand_dims(row, -2 if input_has_expert_axis else (-2, -3))
+            rows.append(linear(row, row_indices).squeeze(-2))
+        return mx.concatenate(rows, axis=1)
 
     def _layer(self, layer, x, mask, cache, gdn_sink):
         normed = layer.operator_norm(x)
