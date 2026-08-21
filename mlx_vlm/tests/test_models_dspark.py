@@ -462,6 +462,25 @@ def test_dspark_target_validation_is_family_agnostic():
     validate_dspark_target(config, target)
 
 
+def test_dspark_rollback_error_names_target_model_class():
+    class TargetWithoutRollback:
+        def __init__(self):
+            self.config = SimpleNamespace(
+                hidden_size=8,
+                num_hidden_layers=3,
+                vocab_size=32,
+            )
+            self.model = SimpleNamespace(layers=[object()] * 3)
+
+    target = SimpleNamespace(language_model=TargetWithoutRollback())
+
+    with pytest.raises(
+        ValueError,
+        match="DSpark target TargetWithoutRollback does not expose",
+    ):
+        validate_dspark_target(_tiny_draft_config(), target)
+
+
 def test_dspark_accepts_matching_lfm2_moe_target():
     drafter = DSparkDraftModel(_tiny_draft_config())
 

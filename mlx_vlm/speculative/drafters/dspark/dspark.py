@@ -116,7 +116,8 @@ def validate_dspark_target(config: DSparkConfig, target_model) -> None:
         )
     if not hasattr(language_model, "rollback_speculative_cache"):
         raise ValueError(
-            "The DSpark target does not expose speculative cache rollback support."
+            f"DSpark target {type(language_model).__name__} does not expose "
+            "speculative cache rollback support."
         )
 
 
