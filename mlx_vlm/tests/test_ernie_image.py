@@ -437,7 +437,7 @@ class FakePipeline:
     def count_prompt_tokens(self, prompt):  # noqa: ARG002
         return 3
 
-    def _should_enhance_prompt(self):
+    def _should_enhance_prompt(self, *, for_edit: bool = False):  # noqa: ARG002
         return False
 
 
@@ -515,6 +515,84 @@ def test_ernie_base_edit_uses_variant_defaults() -> None:
     )
     assert result.steps == 50
     assert result.guidance == 4.0
+
+
+def test_ernie_edit_model_accepts_strength_alias() -> None:
+    pipeline = FakePipeline("ernie-image-turbo")
+    model = ErnieImageEditModel(pipeline=pipeline, model_id="ernie")
+    result = model.edit(
+        ImageEditRequest(
+            prompt="make it a convertible",
+            image_paths=("source.png",),
+            seed=3,
+            steps=8,
+            guidance=1.0,
+            extra={"strength": 0.42},
+        )
+    )
+    assert result.metadata["image_strength"] == 0.42
+    assert result.metadata["prompt_enhancement"] is False
+    assert pipeline.calls[0][2]["image_strength"] == 0.42
+
+
+def test_ernie_edit_model_image_strength_precedes_strength() -> None:
+    pipeline = FakePipeline("ernie-image-turbo")
+    model = ErnieImageEditModel(pipeline=pipeline, model_id="ernie")
+    result = model.edit(
+        ImageEditRequest(
+            prompt="make it a convertible",
+            image_paths=("source.png",),
+            seed=3,
+            steps=8,
+            guidance=1.0,
+            extra={"strength": 0.42, "image_strength": 0.71},
+        )
+    )
+    assert result.metadata["image_strength"] == 0.71
+    assert pipeline.calls[0][2]["image_strength"] == 0.71
+
+
+def test_ernie_edit_model_uses_raised_edit_default_guidance() -> None:
+    pipeline = FakePipeline("ernie-image-turbo")
+    model = ErnieImageEditModel(pipeline=pipeline, model_id="ernie")
+    result = model.edit(
+        ImageEditRequest(
+            prompt="make it a convertible",
+            image_paths=("source.png",),
+            seed=3,
+        )
+    )
+    # No explicit guidance: the raised edit default is used, not the turbo
+    # generation default (1.0), so classifier-free guidance actually applies.
+    assert result.guidance == 3.0
+    assert result.metadata["classifier_free_guidance"] is True
+    # The model-card generation recommendation is left untouched.
+    assert get_variant("ernie-image-turbo").default_guidance == 1.0
+    assert get_variant("ernie-image-turbo").edit_default_guidance == 3.0
+
+
+def test_ernie_edit_model_defaults_prompt_enhancer_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mlx_vlm.models.ernie_image.model as ernie_model
+
+    captured: dict[str, object] = {}
+
+    class _StubPipeline:
+        def __init__(self) -> None:
+            self.variant = get_variant("ernie-image-turbo")
+            self.model_path = Path("/tmp/ernie")
+
+        @classmethod
+        def from_pretrained(cls, variant, **kwargs):  # noqa: ARG003
+            captured["use_prompt_enhancer"] = kwargs.get("use_prompt_enhancer")
+            return cls()
+
+    monkeypatch.setattr(ernie_model, "ErnieImagePipeline", _StubPipeline)
+    ErnieImageEditModel.from_model_id("ernie-image-turbo")
+    assert captured["use_prompt_enhancer"] is False
+    ErnieImageEditModel.from_model_id("ernie-image-turbo", use_prompt_enhancer=True)
+    assert captured["use_prompt_enhancer"] is True
 
 
 class FakeTransformer:
@@ -598,10 +676,11 @@ def test_img2img_uses_strength_to_select_denoising_steps(tmp_path: Path) -> None
         steps=8,
         width=32,
         height=16,
-        guidance=1.0,
         image_strength=0.5,
     )
     assert result.shape == (16, 32, 3)
+    # Turbo editing defaults to CFG guidance rather than Turbo generation's 1.0.
+    assert pipeline.transformer.calls[0][0][0] == 2
     assert len(pipeline.transformer.calls) == 4
 
 
@@ -689,6 +768,11 @@ def test_prompt_enhancement_auto_detects_optional_components(tmp_path: Path) -> 
     (tmp_path / "pe_tokenizer" / "tokenizer.json").write_text("{}")
     pipeline.runtime_config = ErnieImageRuntimeConfig(use_prompt_enhancer=None)
     assert pipeline._should_enhance_prompt()
+    # Auto-detected enhancement applies to generation only: img2img needs the
+    # source-aware prompt preserved unless callers explicitly opt in.
+    assert not pipeline._should_enhance_prompt(for_edit=True)
+    pipeline.runtime_config = ErnieImageRuntimeConfig(use_prompt_enhancer=True)
+    assert pipeline._should_enhance_prompt(for_edit=True)
 
 
 def test_conversion_detection_and_layout_metadata(tmp_path: Path) -> None:

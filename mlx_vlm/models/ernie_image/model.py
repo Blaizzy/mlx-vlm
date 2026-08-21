@@ -165,7 +165,12 @@ class ErnieImageEditModel(ImageEditModel):
 
     @property
     def default_guidance(self) -> float:
-        return self.pipeline.variant.default_guidance
+        # Editing is generic SDEdit rather than native instruction conditioning,
+        # so it needs classifier-free guidance to actually apply the requested
+        # change. Turbo ships at guidance 1.0 for generation (no CFG), which
+        # barely edits; the generation recommendation is left untouched and only
+        # this edit default is raised.
+        return self.pipeline.variant.edit_default_guidance
 
     def edit(self, request: ImageEditRequest) -> ImageGenerationResult:
         if len(request.image_paths) != 1:
@@ -175,7 +180,13 @@ class ErnieImageEditModel(ImageEditModel):
         guidance = (
             self.default_guidance if request.guidance is None else request.guidance
         )
-        image_strength = float(request.extra.get("image_strength", 0.6))
+        # ``image_strength`` is the canonical key; ``strength`` is accepted as
+        # an alias so the edit command lines up with the z_image model and
+        # matches the naming used in the documentation.
+        raw_strength = request.extra.get(
+            "image_strength", request.extra.get("strength", 0.6)
+        )
+        image_strength = float(raw_strength)
         array = self.pipeline.edit_array(
             request.prompt,
             request.image_paths[0],
@@ -192,6 +203,7 @@ class ErnieImageEditModel(ImageEditModel):
             "architecture": "single-stream-dit-img2img",
             "classifier_free_guidance": guidance > 1.0,
             "image_strength": image_strength,
+            "prompt_enhancement": self.pipeline._should_enhance_prompt(for_edit=True),
             "native_instruction_edit": False,
             "reference_count": 1,
         }
@@ -226,6 +238,11 @@ class ErnieImageEditModel(ImageEditModel):
         model: str = "ernie-image-turbo",
         **kwargs: Any,
     ) -> "ErnieImageEditModel":
+        # The prompt enhancer is a text-to-image feature: it rewrites a short
+        # prompt into a standalone scene caption and never sees the source
+        # image, so it dilutes edit intent. Default it off for the edit task;
+        # callers can still opt back in with ``use_prompt_enhancer=True``.
+        kwargs.setdefault("use_prompt_enhancer", False)
         generation = ErnieImageGenerationModel.from_model_id(model, **kwargs)
         return cls(pipeline=generation.pipeline, model_id=generation.model_id)
 

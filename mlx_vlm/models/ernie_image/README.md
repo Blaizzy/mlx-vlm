@@ -73,7 +73,9 @@ mlx_vlm.generate \
   --gen-kwargs '{"negative_prompt":"blurry, low quality"}'
 ```
 
-Transform one source image:
+Transform one source image. Editing is generic SDEdit-style re-diffusion rather
+than native instruction conditioning, so a guidance value above 1 (e.g. `3`) is
+needed for the requested change to apply strongly:
 
 ```sh
 mlx_vlm.generate \
@@ -84,14 +86,17 @@ mlx_vlm.generate \
   --prompt "Give the fox a red Santa hat" \
   --size 1024x1024 \
   --steps 8 \
-  --guidance 1 \
+  --guidance 3 \
   --seed 42 \
   --output outputs/ernie-image-edit.png \
-  --gen-kwargs '{"image_strength":0.6}'
+  --gen-kwargs '{"image_strength":0.7}'
 ```
 
-`image_strength` must be greater than 0 and no more than 1. The optional prompt
-enhancer is used automatically when its weights are present.
+`image_strength` (alias `strength`) must be greater than 0 and no more than 1;
+higher values re-diffuse the source more. The optional prompt enhancer is
+disabled by default for editing because it rewrites the prompt into a
+standalone caption that never sees the source image. Pass
+`use_prompt_enhancer=True` when loading the model to re-enable it.
 
 ## Python
 
@@ -128,8 +133,8 @@ result = generate_image(
     image_paths=("input/fox.png",),
     seed=42,
     steps=8,
-    guidance=1.0,
-    image_strength=0.6,
+    guidance=3.0,
+    image_strength=0.7,
     output_path="outputs/ernie-image-edit.png",
 )
 

@@ -200,7 +200,13 @@ class ErnieImagePipeline:
             if config := getattr(self.vae, "quantization_config", None):
                 self.component_quantization["vae"] = dict(config)
 
-    def _should_enhance_prompt(self) -> bool:
+    def _should_enhance_prompt(self, *, for_edit: bool = False) -> bool:
+        """Return whether prompt enhancement is active for generation or editing.
+
+        Auto-detection is intentionally limited to text-to-image generation.
+        Img2img prompts depend on the source image, which the enhancer cannot
+        observe, so editing requires an explicit opt-in.
+        """
         available = (
             bool(list((self.model_path / "pe").glob("*.safetensors")))
             and (self.model_path / "pe_tokenizer" / "tokenizer.json").exists()
@@ -211,6 +217,8 @@ class ErnieImagePipeline:
                 "Prompt enhancement was requested but pe/ and pe_tokenizer/ "
                 "are not present in the model snapshot"
             )
+        if for_edit and requested is None:
+            return False
         return available if requested is None else requested
 
     def _enhance_prompt(
@@ -322,12 +330,12 @@ class ErnieImagePipeline:
             raise ValueError(f"image_strength must be in (0, 1], got {image_strength}")
         pixels, width, height = _load_edit_image(image, width=width, height=height)
         steps = self.variant.default_steps if steps is None else steps
-        guidance = self.variant.default_guidance if guidance is None else guidance
+        guidance = self.variant.edit_default_guidance if guidance is None else guidance
         if steps < 1:
             raise ValueError(f"steps must be >= 1, got {steps}")
         if guidance < 0:
             raise ValueError(f"guidance must be >= 0, got {guidance}")
-        if self._should_enhance_prompt():
+        if self._should_enhance_prompt(for_edit=True):
             prompt = self._enhance_prompt(prompt, width=width, height=height, seed=seed)
             self.last_revised_prompt = prompt
         else:
