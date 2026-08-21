@@ -46,35 +46,59 @@ class VanillaMarkov(nn.Module):
 
 
 class DSparkConfidenceHead(nn.Module):
-    def __init__(self, hidden_size: int, markov_rank: int):
+    def __init__(
+        self,
+        hidden_size: int,
+        markov_rank: int,
+        with_markov: bool = True,
+    ):
         super().__init__()
-        self.proj = nn.Linear(hidden_size + markov_rank, 1, bias=True)
+        self.with_markov = with_markov
+        input_size = hidden_size + markov_rank if with_markov else hidden_size
+        self.proj = nn.Linear(input_size, 1, bias=True)
 
     def __call__(
         self,
         hidden_states: mx.array,
         markov_embeddings: mx.array,
     ) -> mx.array:
-        features = mx.concatenate([hidden_states, markov_embeddings], axis=-1)
+        features = (
+            mx.concatenate([hidden_states, markov_embeddings], axis=-1)
+            if self.with_markov
+            else hidden_states
+        )
         return mx.sigmoid(self.proj(features).squeeze(-1).astype(mx.float32))
 
 
-def validate_lfm2_dspark_target(config: DSparkConfig, target_model) -> None:
+def _target_metadata(target_model):
     language_model = getattr(target_model, "language_model", target_model)
-    target_config = getattr(language_model, "config", None)
+    outer_config = getattr(language_model, "config", None)
+    target_config = getattr(outer_config, "text_config", None)
+    if target_config is None:
+        target_config = outer_config or getattr(language_model, "args", None)
     inner = getattr(language_model, "model", language_model)
     layers = getattr(inner, "layers", None)
+    return language_model, target_config, layers
+
+
+def _validate_dspark_target(
+    config: DSparkConfig,
+    target_model,
+    *,
+    model_types: set[str],
+    target_name: str,
+) -> None:
+    language_model, target_config, layers = _target_metadata(target_model)
 
     model_type = getattr(target_config, "model_type", None)
-    if model_type not in {"lfm2", "lfm2_moe"}:
+    if model_type not in model_types:
         raise ValueError(
-            "LFM2 DSpark requires an LFM2 target (dense or MoE), got "
-            f"model_type={model_type!r}."
+            f"DSpark requires {target_name}, got " f"model_type={model_type!r}."
         )
     hidden_size = getattr(target_config, "hidden_size", None)
     if hidden_size != config.hidden_size:
         raise ValueError(
-            "LFM2 DSpark target hidden-size mismatch: "
+            "DSpark target hidden-size mismatch: "
             f"draft={config.hidden_size}, target={hidden_size}."
         )
     layer_count = (
@@ -84,41 +108,75 @@ def validate_lfm2_dspark_target(config: DSparkConfig, target_model) -> None:
     )
     if layer_count != config.num_target_layers:
         raise ValueError(
-            "LFM2 DSpark target layer-count mismatch: "
+            "DSpark target layer-count mismatch: "
             f"draft={config.num_target_layers}, target={layer_count}."
         )
     vocab_size = getattr(target_config, "vocab_size", None)
     if vocab_size != config.vocab_size:
         raise ValueError(
-            "LFM2 DSpark target vocabulary mismatch: "
+            "DSpark target vocabulary mismatch: "
             f"draft={config.vocab_size}, target={vocab_size}."
         )
     if not hasattr(language_model, "rollback_speculative_cache"):
         raise ValueError(
-            "The LFM2 target does not expose speculative cache rollback support."
+            f"The {target_name} does not expose speculative cache rollback support."
         )
 
 
+def validate_lfm2_dspark_target(config: DSparkConfig, target_model) -> None:
+    _validate_dspark_target(
+        config,
+        target_model,
+        model_types={"lfm2", "lfm2_moe"},
+        target_name="an LFM2 target (dense or MoE)",
+    )
+
+
+def validate_qwen3_5_dspark_target(config: DSparkConfig, target_model) -> None:
+    _validate_dspark_target(
+        config,
+        target_model,
+        model_types={"qwen3_5", "qwen3_5_text"},
+        target_name="a Qwen3.5/3.8 target",
+    )
+
+
 class DSparkDraftModel(DFlashDraftModel):
-    """MLX port of Liquid AI's LFM2.5 DSpark draft model."""
+    """MLX port of a Qwen3-backbone DSpark draft model."""
 
     requires_greedy_sampling = True
-    # DSpark is trained for a fixed semi-autoregressive proposal block. The
-    # generic DFlash acceptance controller is counterproductive here because
-    # it quickly collapses the nine-token block to only 2-4 proposals.
+    # Liquid's checkpoints use their complete trained proposal block. Qwen's
+    # published checkpoint overrides this per instance and starts with a
+    # shorter tile that the generic acceptance controller may grow.
     prefer_requested_block_size = True
 
     def __init__(self, config: DSparkConfig):
         super().__init__(config)
+        self.prefer_requested_block_size = config.prefer_requested_block_size
+        self.dflash_initial_block_size = config.dflash_initial_block_size
         self.markov_head = VanillaMarkov(config.vocab_size, config.markov_rank)
         self.confidence_head: DSparkConfidenceHead | None = (
-            DSparkConfidenceHead(config.hidden_size, config.markov_rank)
+            DSparkConfidenceHead(
+                config.hidden_size,
+                config.markov_rank,
+                with_markov=config.confidence_head_with_markov,
+            )
             if config.enable_confidence_head
             else None
         )
 
     def validate_target_compatibility(self, target_model) -> None:
-        validate_lfm2_dspark_target(self.config, target_model)
+        _language_model, target_config, _layers = _target_metadata(target_model)
+        model_type = getattr(target_config, "model_type", None)
+        if model_type in {"lfm2", "lfm2_moe"}:
+            validate_lfm2_dspark_target(self.config, target_model)
+        elif model_type in {"qwen3_5", "qwen3_5_text"}:
+            validate_qwen3_5_dspark_target(self.config, target_model)
+        else:
+            raise ValueError(
+                "DSpark requires a supported LFM2 or Qwen3.5/3.8 target, got "
+                f"model_type={model_type!r}."
+            )
 
     def bind(self, target_model) -> "DSparkDraftModel":
         self.validate_target_compatibility(target_model)
@@ -179,7 +237,7 @@ class DSparkDraftModel(DFlashDraftModel):
             key = key.removeprefix("model.")
             if key in normalized:
                 raise ValueError(
-                    f"Duplicate LFM2 DSpark weight key after sanitization: {key}"
+                    f"Duplicate DSpark weight key after sanitization: {key}"
                 )
             normalized[key] = value
         return normalized
@@ -194,4 +252,5 @@ __all__ = [
     "Model",
     "VanillaMarkov",
     "validate_lfm2_dspark_target",
+    "validate_qwen3_5_dspark_target",
 ]
