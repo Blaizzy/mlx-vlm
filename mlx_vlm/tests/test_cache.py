@@ -136,9 +136,7 @@ def test_batch_rotating_merge_skips_zero_length_backing_storage():
     assert mx.all(merged.values[0] == 0).item()
 
 
-# ---------------------------------------------------------------------------
-# make_prompt_cache honours max_kv_size for models that build their own cache
-# ---------------------------------------------------------------------------
+
 
 
 class _ZeroArg:
