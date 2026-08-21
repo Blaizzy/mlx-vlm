@@ -51,7 +51,8 @@ class DSparkConfig(BaseModelConfig):
     mask_token_id: int = 125017
     target_layer_ids: list[int] = field(default_factory=list)
     num_target_layers: int = 30
-    runtime_block_size: int | None = None
+    # Eight rows fit one verifier threadgroup; nine or ten pad to sixteen.
+    runtime_block_size: int | None = 8
     draft_window_size: int | None = None
 
     markov_rank: int = 256
@@ -92,6 +93,12 @@ class DSparkConfig(BaseModelConfig):
         if self.block_size != self.proposal_length + 1:
             raise ValueError(
                 "LFM2 DSpark verification block_size must equal " "proposal_length + 1."
+            )
+        if self.runtime_block_size is not None and (
+            not isinstance(self.runtime_block_size, int) or self.runtime_block_size <= 0
+        ):
+            raise ValueError(
+                "LFM2 DSpark runtime_block_size must be a positive integer."
             )
         if self.hidden_size != self.num_attention_heads * self.head_dim:
             raise ValueError(

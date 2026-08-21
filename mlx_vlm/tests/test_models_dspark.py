@@ -8,6 +8,7 @@ from mlx_vlm.generate.ar import generate_step
 from mlx_vlm.models.cache import ArraysCache, BatchKVCache
 from mlx_vlm.models.lfm2 import Model as Lfm2Model
 from mlx_vlm.models.lfm2 import ModelConfig as Lfm2Config
+from mlx_vlm.models.target_verify import target_verify_weight
 from mlx_vlm.speculative.drafters import (
     resolve_drafter_kind,
     validate_drafter_compatibility,
@@ -124,6 +125,7 @@ def test_published_config_normalizes_dspark_gamma_to_verify_width():
 
     assert config.proposal_length == 9
     assert config.block_size == 10
+    assert config.runtime_block_size == 8
     assert config.target_layer_ids == [2, 9, 17, 21, 27]
     assert config.num_target_layers == 30
     assert config.markov_rank == 256
@@ -178,6 +180,55 @@ def test_tiny_dspark_forward_uses_markov_head_and_published_block_semantics():
     assert hidden.shape == (1, 3, 16)
     assert tokens.shape == (1, drafter.config.proposal_length)
     assert all(cache.offset == 3 for cache in draft_cache)
+
+
+def test_target_verify_dense_kernel_matches_mlx_linear():
+    if not mx.metal.is_available():
+        pytest.skip("The target-verification kernel requires Metal.")
+
+    mx.random.seed(11)
+    inputs = mx.random.normal((1, 5, 8)).astype(mx.bfloat16)
+    weight = mx.random.normal((16, 8)).astype(mx.bfloat16)
+    expected = inputs @ weight.T
+    actual = target_verify_weight(weight, inputs)
+    assert actual is not None
+    mx.eval(expected, actual)
+
+    assert actual.shape == expected.shape
+    assert bool(mx.array_equal(actual, expected))
+
+
+def test_lfm2_target_verify_logits_exactly_match_single_token_decode():
+    if not mx.metal.is_available():
+        pytest.skip("Exact target verification requires Metal.")
+
+    mx.random.seed(13)
+    target = _tiny_target()
+    lm = target.language_model
+    mx.eval(target.parameters())
+
+    prompt = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+    verify = mx.array([[5, 6, 7, 8]], dtype=mx.int32)
+    block_cache = lm.make_cache()
+    singleton_cache = lm.make_cache()
+    lm(prompt, cache=block_cache)
+    lm(prompt, cache=singleton_cache)
+
+    block_logits = lm(
+        verify,
+        cache=block_cache,
+        speculative_verify=True,
+    ).logits
+    singleton_logits = mx.concatenate(
+        [
+            lm(verify[:, index : index + 1], cache=singleton_cache).logits
+            for index in range(verify.shape[1])
+        ],
+        axis=1,
+    )
+    mx.eval(block_logits, singleton_logits)
+
+    assert bool(mx.array_equal(block_logits, singleton_logits))
 
 
 def test_lfm2_hybrid_cache_rollback_matches_committed_prefix():
