@@ -51,32 +51,66 @@ _REAL_ARGSORT = mx.argsort
 # Every entry is a deliberate, reviewed difference from make_sampler. Adding an
 # entry is a design decision, not a way to quiet a failure.
 #
+# Established by three independent sweeps that wrote their own oracles rather
+# than reusing this file's helpers: 56,736 rank-filter cases, 63,012 mode-chain
+# cases, 5,446 pathological-input cases. Everything they found is below.
+#
 # 1. EMPTY ROWS. A rank filter chained after a mode can reject every token
-#    upstream -- apply_top_p compares cumulative mass against `1 - top_p` on a
-#    distribution whose mass no longer sums to 1. make_sampler then draws from
-#    an all -inf row, i.e. an arbitrary token. This keeps the top surviving
-#    token instead, and the tests assert that shape rather than equality.
+#    upstream, and make_sampler then draws from an all -inf row -- an arbitrary
+#    token. This keeps the top survivor instead.
 #
-# 2. typical_p CHAINED AFTER ANOTHER MODE. Upstream's chain feeds `0 * -inf`
-#    into typical_p's entropy sum (measured 485 NaN of 512 after top_n_sigma),
-#    which poisons the argsort that sets its cutoff. Those terms are dropped
-#    here instead of inherited. This is the ONLY mode combination that
-#    diverges: modes otherwise chain sequentially exactly as make_sampler's do,
-#    and test_two_modes_without_typical_p_match_make_sampler asserts equality
-#    for the pairs that do not involve typical_p.
+# 2. INPUT NORMALIZATION, and what it does to typical_p. batched_row_sample
+#    log-normalizes its own input because the speculative loops hand it raw
+#    lm_head logits (dflash.py, eagle3.py, mtp.py) while the AR path hands it
+#    logprobs, and exp() of an unnormalized row is not a probability vector --
+#    without it top_p silently stops filtering on every speculative request.
+#    make_sampler does not normalize, so the two disagree on any row whose
+#    exp-mass is not 1. Two of the three modes are unaffected (top_n_sigma is
+#    shift-invariant, p_less softmaxes), but typical_p is not: on a row that
+#    already carries -inf entries -- a grammar mask, or logit_bias=-inf, or the
+#    output of a previous mode -- upstream measures typicality against the
+#    residual mass and this measures it against the renormalized distribution.
+#    Measured: 8 tokens kept upstream vs 1 here on a 64-token row with 56
+#    entries masked. Ours is the more defensible reading of "keep half the
+#    probability mass", but it IS different, it is reachable through logit_bias,
+#    and the alternative (normalize only for the rank filters, leave the modes
+#    on the raw input) is an open design question, not a settled one.
 #
-# 3. INPUT NORMALIZATION. batched_row_sample log-normalizes its own input,
-#    because the speculative loops hand it raw lm_head logits while the AR path
-#    hands it logprobs, and exp() of an unnormalized row is not a probability
-#    vector. make_sampler does not normalize, so for an input whose exp-mass is
-#    not 1 -- a row a logits processor has already partly masked, say -- the two
-#    disagree. That is a deliberate trade: without it top_p silently stops
-#    filtering on every speculative request, which is the larger error.
+# 3. TIE ORDERING AT ANY CUTOFF -- INCLUDING float32. Upstream sorts ascending
+#    and this sorts descending, so equal-valued tokens straddling a threshold
+#    fall on opposite sides. Same cardinality, same probability mass, different
+#    members: log_softmax([3,3,3,3,0,-1,-2,-3]) at top_p=0.5 keeps {0,1,2} here
+#    and {1,2,3} upstream. An earlier version of this note claimed float32 was
+#    safe and that "the strict sweeps run in float32" made it a non-issue. That
+#    was wrong. Rare on random rows (0 of 600) and constant on quantized or
+#    rounded logits. Jittering the ties away restores exact parity, which is how
+#    the mechanism was confirmed.
 #
-# 4. Tie ordering at the cutoff in float16/bfloat16: upstream sorts ascending
-#    and this sorts descending, so equal-valued tokens straddling the threshold
-#    can fall on opposite sides. Not semantic. The strict sweeps run in float32
-#    and the reduced-precision sweep skips rows with a tie on the boundary.
+# 4. min_p EXACTLY ON THE BOUNDARY. Upstream's _apply_min_p is @mx.compile'd,
+#    and the compiled kernel drops a token whose logprob equals
+#    max + log(min_p) to the bit, while the same formula run eagerly -- or under
+#    mx.disable_compile() -- keeps it. This matches upstream's uncompiled
+#    semantics, so the divergence is against an MLX compile artifact rather than
+#    against make_sampler's intent. Needs an exact-boundary coincidence: 0 of
+#    1,800 random rows, but a Zipf row hits it every time at min_p=0.01.
+#
+# 5. REDUCED PRECISION beyond tie ordering. In float16/bfloat16, p_less and
+#    typical_p differ systematically, not just at ties, because the statistics
+#    they compute (collision probability, entropy) are accumulated at different
+#    widths on each side. The strict sweeps therefore run in float32.
+#
+# 6. top_k OUTSIDE ITS DOMAIN. make_sampler raises for top_k >= vocab_size
+#    (apply_top_k validates 0 < top_k < vocab_size); this treats any top_k at or
+#    above the vocab as "keep everything", and clamps into int32 so an absurd
+#    value cannot crash the GPU worker and take every co-batched request with
+#    it. Deliberate, and the better behaviour for a server, but a difference.
+#
+# 7. TEMPERATURE EDGES. Greedy is decided by temperature < _GREEDY_EPS (1e-5)
+#    rather than == 0, so 0 < temperature < 1e-5 is greedy here and sampled
+#    upstream (token-equivalent in practice -- the argmax survives every filter
+#    -- except where the upstream chain empties the row, which is entry 1).
+#    Negative temperature is greedy here; upstream inverts the distribution.
+#    Both are reachable now that the request schemas carry no bounds.
 
 
 def _log_normalize(x):
@@ -426,3 +460,54 @@ def test_greedy_ignores_every_filter_like_make_sampler(filters):
     ref = make_sampler(temp=0)(lp)
     mx.eval(ours, ref)
     assert ours.tolist() == ref.tolist()
+
+
+# --- the divergences above, pinned so they cannot drift silently ------------
+
+
+def test_float32_ties_straddling_the_cutoff_keep_the_same_count():
+    """KNOWN_DIVERGENCE 3. Different members, same cardinality and same mass.
+
+    If this ever starts differing in SIZE it is no longer tie ordering and the
+    entry no longer covers it.
+    """
+    row = _log_normalize(mx.array([3.0, 3.0, 3.0, 3.0, 0.0, -1.0, -2.0, -3.0]))
+    mx.eval(row)
+    cfg = SamplingConfig(temperature=1.0, top_p=0.5, seed=1)
+    ours = _sampler_keep(row, cfg)
+    ref = _reference_keep(row, cfg)
+    assert len(ours) == len(ref), f"tie divergence changed the count: {ours} vs {ref}"
+
+
+def test_typical_p_on_a_premasked_row_is_the_normalization_divergence():
+    """KNOWN_DIVERGENCE 2, and the reachable half of it.
+
+    A grammar mask or logit_bias=-inf produces a row whose exp-mass is not 1.
+    Assert the divergence exists and is the normalization one, by showing it
+    disappears once the row is renormalized before upstream sees it too.
+    """
+    base = _row(64, key=0)
+    masked = mx.where(mx.arange(64) < 8, base, mx.array(NEG_INF))
+    mx.eval(masked)
+    cfg = SamplingConfig(temperature=0.7, typical_p=0.5, seed=1)
+
+    assert _sampler_keep(masked, cfg) != _reference_keep(masked, cfg)
+    # feed upstream the same normalized row and the disagreement goes away
+    renormalized = masked - mx.logsumexp(masked, axis=-1, keepdims=True)
+    mx.eval(renormalized)
+    assert _sampler_keep(masked, cfg) == _reference_keep(renormalized, cfg)
+
+
+@pytest.mark.parametrize("temperature", [1e-6, -1.0])
+def test_temperature_edges_are_greedy_here(temperature):
+    """KNOWN_DIVERGENCE 7. Reachable now that the schemas carry no bounds."""
+    lp = _row(256, key=4)
+    argmax = int(mx.argmax(lp, axis=-1))
+    cfg = SamplingConfig(temperature=temperature, top_p=0.9, seed=1)
+    drawn = set()
+    for seed in range(8):
+        mx.random.seed(seed)
+        token = _PositionedTargetSampler([cfg])(lp[None])
+        mx.eval(token)
+        drawn.add(int(token[0]))
+    assert drawn == {argmax}
