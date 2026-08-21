@@ -11,11 +11,13 @@ from mlx import nn
 
 from mlx_vlm.generate.edit_image import (
     ImageEditRequest,
+    edit_image,
     image_edit_model_class,
     is_image_edit_model,
 )
 from mlx_vlm.generate.image import (
     ImageGenerationRequest,
+    generate_image,
     image_generation_model_class,
     is_image_generation_model,
 )
@@ -159,6 +161,37 @@ def test_dispatch_via_image_edit_model_class(tmp_path: Path) -> None:
     assert is_image_edit_model(str(tmp_path))
 
 
+@pytest.mark.parametrize(
+    "variant,generation_steps,edit_steps,guidance",
+    [
+        ("turbo", 9, 8, 0.0),
+        ("base", 50, 50, 4.0),
+    ],
+)
+def test_z_model_task_defaults_follow_variant(
+    variant: str,
+    generation_steps: int,
+    edit_steps: int,
+    guidance: float,
+) -> None:
+    """Expose defaults so the shared helpers do not override Z-Image settings."""
+    pipeline = SimpleNamespace(
+        config=ZImageConfig(
+            default_steps=generation_steps,
+            default_guidance=guidance,
+            scheduler_shift=3.0 if variant == "turbo" else 6.0,
+            variant=variant,
+        )
+    )
+    generation = ZImageGenerationModel(pipeline=pipeline, model_id="z-image")
+    editing = ZImageEditModel(pipeline=pipeline, model_id="z-image")
+
+    assert generation.default_steps == generation_steps
+    assert generation.default_guidance == guidance
+    assert editing.default_steps == edit_steps
+    assert editing.default_guidance == guidance
+
+
 def test_edit_model_forwards_img2img_options() -> None:
     calls = {}
 
@@ -182,12 +215,15 @@ def test_edit_model_forwards_img2img_options() -> None:
         pipeline=FakePipeline(),
         model_id="Tongyi-MAI/Z-Image-Turbo",
     )
-    result = model.edit(
+    # Exercise the public helper: it must preserve Z-Image's Turbo-specific
+    # defaults instead of replacing them with generic image defaults.
+    result = edit_image(
+        model,
         ImageEditRequest(
             prompt="replace the cart",
             image_paths=("source.png",),
             extra={"strength": 0.55},
-        )
+        ),
     )
     assert calls["steps"] == 8
     assert calls["guidance"] == 0.0
@@ -286,7 +322,9 @@ def test_base_model_applies_variant_defaults() -> None:
         pipeline=FakePipeline(),
         model_id="Tongyi-MAI/Z-Image",
     )
-    result = model.generate(ImageGenerationRequest(prompt="fox"))
+    # The public helper must use the Base adapter defaults, not 4 steps and
+    # guidance 1.0 from the generic image fallback.
+    result = generate_image(model, ImageGenerationRequest(prompt="fox"))
     assert calls["steps"] == 50
     assert calls["guidance"] == 4.0
     assert result.steps == 50
