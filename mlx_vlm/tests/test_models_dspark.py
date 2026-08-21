@@ -6,13 +6,17 @@ import pytest
 
 from mlx_vlm.generate.ar import generate_step
 from mlx_vlm.models.cache import ArraysCache, BatchKVCache
+from mlx_vlm.models.exact_speculative_verify import exact_speculative_verify_weight
 from mlx_vlm.models.lfm2 import Model as Lfm2Model
 from mlx_vlm.models.lfm2 import ModelConfig as Lfm2Config
+from mlx_vlm.models.lfm2_moe import Model as Lfm2MoeModel
+from mlx_vlm.models.lfm2_moe import ModelConfig as Lfm2MoeConfig
 from mlx_vlm.speculative.drafters import (
     resolve_drafter_kind,
     validate_drafter_compatibility,
 )
 from mlx_vlm.speculative.drafters.qwen3_dspark import DSparkDraftModel, ModelConfig
+from mlx_vlm.speculative.drafters.qwen3_dspark.dspark import validate_lfm2_dspark_target
 from mlx_vlm.speculative.utils import run_speculative_rounds
 from mlx_vlm.utils import get_model_and_args
 
@@ -75,6 +79,29 @@ def _tiny_draft_config():
     )
 
 
+def _published_moe_config():
+    config = _published_config()
+    config["rope_theta"] = 5000000.0
+    config["dflash_config"] = {
+        "mask_token_id": 125017,
+        "target_layer_ids": [2, 6, 10, 14, 18],
+        "num_target_layers": 24,
+    }
+    return config
+
+
+def _published_1_2b_config():
+    config = _published_config()
+    config["vocab_size"] = 65536
+    config["rope_theta"] = 1000000.0
+    config["dflash_config"] = {
+        "mask_token_id": 64402,
+        "target_layer_ids": [2, 5, 8, 11, 14],
+        "num_target_layers": 16,
+    }
+    return config
+
+
 def _tiny_target():
     config = Lfm2Config(
         model_type="lfm2",
@@ -98,6 +125,32 @@ def _tiny_target():
         tie_word_embeddings=True,
     )
     return Lfm2Model(config)
+
+
+def _tiny_moe_target():
+    config = Lfm2MoeConfig(
+        model_type="lfm2_moe",
+        vocab_size=32,
+        hidden_size=8,
+        intermediate_size=16,
+        moe_intermediate_size=8,
+        num_hidden_layers=3,
+        num_experts=4,
+        num_experts_per_tok=2,
+        norm_topk_prob=True,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        max_position_embeddings=128,
+        use_expert_bias=True,
+        num_dense_layers=1,
+        norm_eps=1e-5,
+        conv_bias=False,
+        conv_L_cache=3,
+        rope_theta=10000.0,
+        layer_types=["conv", "full_attention", "conv"],
+        tie_word_embeddings=True,
+    )
+    return Lfm2MoeModel(config)
 
 
 def _generated_tokens(target, prompt, drafter=None):
@@ -124,10 +177,52 @@ def test_published_config_normalizes_dspark_gamma_to_verify_width():
 
     assert config.proposal_length == 9
     assert config.block_size == 10
+    assert config.runtime_block_size == 8
     assert config.target_layer_ids == [2, 9, 17, 21, 27]
     assert config.num_target_layers == 30
     assert config.markov_rank == 256
     assert DSparkDraftModel.prefer_requested_block_size is True
+
+
+def test_published_lfm2_moe_dspark_config_preserves_target_layers():
+    config = ModelConfig.from_dict(_published_moe_config())
+
+    assert config.proposal_length == 9
+    assert config.block_size == 10
+    assert config.target_layer_ids == [2, 6, 10, 14, 18]
+    assert config.num_target_layers == 24
+    assert config.rope_theta == 5000000.0
+
+
+def test_published_1_2b_dspark_config_preserves_target_contract():
+    config = ModelConfig.from_dict(_published_1_2b_config())
+
+    assert config.proposal_length == 9
+    assert config.block_size == 10
+    assert config.runtime_block_size == 8
+    assert config.target_layer_ids == [2, 5, 8, 11, 14]
+    assert config.num_target_layers == 16
+    assert config.vocab_size == 65536
+    assert config.mask_token_id == 64402
+    assert config.rope_theta == 1000000.0
+
+
+def test_published_1_2b_dspark_accepts_matching_target_metadata():
+    config = ModelConfig.from_dict(_published_1_2b_config())
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            config=SimpleNamespace(
+                model_type="lfm2",
+                hidden_size=2048,
+                num_hidden_layers=16,
+                vocab_size=65536,
+            ),
+            model=SimpleNamespace(layers=[object()] * 16),
+            rollback_speculative_cache=lambda *args: None,
+        )
+    )
+
+    validate_lfm2_dspark_target(config, target)
 
 
 def test_generic_loader_routes_markov_dflash_checkpoint_to_dspark(tmp_path):
@@ -148,6 +243,12 @@ def test_dspark_requires_the_matching_lfm2_target():
     target.language_model.config.model_type = "other"
     with pytest.raises(ValueError, match="requires an LFM2 target"):
         validate_drafter_compatibility(target, drafter, "dflash")
+
+
+def test_dspark_accepts_matching_lfm2_moe_target():
+    drafter = DSparkDraftModel(_tiny_draft_config())
+
+    validate_drafter_compatibility(_tiny_moe_target(), drafter, "dflash")
 
 
 def test_tiny_dspark_forward_uses_markov_head_and_published_block_semantics():
@@ -180,9 +281,93 @@ def test_tiny_dspark_forward_uses_markov_head_and_published_block_semantics():
     assert all(cache.offset == 3 for cache in draft_cache)
 
 
-def test_lfm2_hybrid_cache_rollback_matches_committed_prefix():
-    mx.random.seed(3)
+def test_exact_speculative_verify_dense_kernel_matches_mlx_linear():
+    if not mx.metal.is_available():
+        pytest.skip("The target-verification kernel requires Metal.")
+
+    mx.random.seed(11)
+    inputs = mx.random.normal((1, 5, 8)).astype(mx.bfloat16)
+    weight = mx.random.normal((16, 8)).astype(mx.bfloat16)
+    expected = inputs @ weight.T
+    actual = exact_speculative_verify_weight(weight, inputs)
+    assert actual is not None
+    mx.eval(expected, actual)
+
+    assert actual.shape == expected.shape
+    assert bool(mx.array_equal(actual, expected))
+
+
+def test_lfm2_exact_speculative_verify_matches_single_token_decode():
+    if not mx.metal.is_available():
+        pytest.skip("Exact target verification requires Metal.")
+
+    mx.random.seed(13)
     target = _tiny_target()
+    lm = target.language_model
+    mx.eval(target.parameters())
+
+    prompt = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+    verify = mx.array([[5, 6, 7, 8]], dtype=mx.int32)
+    block_cache = lm.make_cache()
+    singleton_cache = lm.make_cache()
+    lm(prompt, cache=block_cache)
+    lm(prompt, cache=singleton_cache)
+
+    block_logits = lm(
+        verify,
+        cache=block_cache,
+        speculative_verify=True,
+    ).logits
+    singleton_logits = mx.concatenate(
+        [
+            lm(verify[:, index : index + 1], cache=singleton_cache).logits
+            for index in range(verify.shape[1])
+        ],
+        axis=1,
+    )
+    mx.eval(block_logits, singleton_logits)
+
+    assert bool(mx.array_equal(block_logits, singleton_logits))
+
+
+def test_lfm2_moe_exact_speculative_verify_matches_single_token_decode():
+    if not mx.metal.is_available():
+        pytest.skip("Exact target verification requires Metal.")
+
+    mx.random.seed(17)
+    target = _tiny_moe_target()
+    target.set_dtype(mx.bfloat16)
+    lm = target.language_model
+    mx.eval(target.parameters())
+
+    prompt = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+    verify = mx.array([[5, 6, 7, 8]], dtype=mx.int32)
+    block_cache = lm.make_cache()
+    singleton_cache = lm.make_cache()
+    lm(prompt, cache=block_cache)
+    lm(prompt, cache=singleton_cache)
+
+    block_logits = lm(
+        verify,
+        cache=block_cache,
+        speculative_verify=True,
+    ).logits
+    singleton_logits = mx.concatenate(
+        [
+            lm(verify[:, index : index + 1], cache=singleton_cache).logits
+            for index in range(verify.shape[1])
+        ],
+        axis=1,
+    )
+    mx.eval(block_logits, singleton_logits)
+
+    assert bool(mx.array_equal(block_logits, singleton_logits))
+
+
+@pytest.mark.parametrize("target_factory", [_tiny_target, _tiny_moe_target])
+def test_lfm2_hybrid_cache_rollback_matches_committed_prefix(target_factory):
+    mx.random.seed(3)
+    target = target_factory()
     lm = target.language_model
     mx.eval(target.parameters())
 
@@ -263,6 +448,20 @@ def test_lfm2_ragged_batch_rollback_matches_each_committed_prefix():
 def test_greedy_dspark_generation_matches_lfm2_baseline():
     mx.random.seed(7)
     target = _tiny_target()
+    drafter = DSparkDraftModel(_tiny_draft_config())
+    mx.eval(target.parameters(), drafter.parameters())
+    prompt = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+
+    baseline = _generated_tokens(target, prompt)
+    speculative = _generated_tokens(target, prompt, drafter)
+
+    assert speculative == baseline
+    assert drafter.draft_lens
+
+
+def test_greedy_dspark_generation_matches_lfm2_moe_baseline():
+    mx.random.seed(19)
+    target = _tiny_moe_target()
     drafter = DSparkDraftModel(_tiny_draft_config())
     mx.eval(target.parameters(), drafter.parameters())
     prompt = mx.array([[1, 2, 3, 4]], dtype=mx.int32)

@@ -221,11 +221,13 @@ mlx_vlm.server --model LiquidAI/LFM2.5-2.6B \
   --draft-model LiquidAI/LFM2.5-2.6B-DSpark
 ```
 
-The published DSpark `block_size: 9` means nine proposals; mlx-vlm verifies
-those proposals together with the anchor token in a ten-token target pass.
-The checkpoint's confidence head is loaded for parity, and DSpark retains its
-trained nine-proposal width instead of using the generic DFlash backoff.
-DSpark decoding currently requires greedy sampling (`temperature=0`).
+The published DSpark `block_size: 9` means nine proposals, or ten target rows
+after adding the anchor token. On MLX, DSpark verifies seven proposals plus the
+anchor by default: eight rows exactly fill the verifier threadgroup, while nine
+or ten rows pad to sixteen and run slower. The trained width remains available
+with `--draft-block-size 10`. The checkpoint's confidence head is loaded for
+parity, and DSpark decoding currently requires greedy sampling
+(`temperature=0`).
 
 Muse Glimmer's published assistant checkpoint is auto-detected as DFlash:
 

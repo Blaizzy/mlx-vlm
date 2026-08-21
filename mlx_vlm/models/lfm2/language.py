@@ -13,6 +13,9 @@ from ..base import (
 from ..cache import ArraysCache, KVCache
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
+from .speculative_verifier import Lfm2ExactSpeculativeVerifier
+
+_EXACT_SPECULATIVE_VERIFIER = Lfm2ExactSpeculativeVerifier()
 
 
 class Attention(nn.Module):
@@ -47,9 +50,19 @@ class Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
-        B, L, D = x.shape
-
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        queries, keys, values = self._prepare_projected_qkv(
+            queries, keys, values, cache
+        )
+
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, mask=mask, scale=self.scale
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(x.shape[0], x.shape[1], -1)
+        return self.out_proj(output)
+
+    def _prepare_projected_qkv(self, queries, keys, values, cache):
+        B, L, _ = queries.shape
 
         queries = self.q_layernorm(queries.reshape(B, L, self.n_heads, -1)).transpose(
             0, 2, 1, 3
@@ -67,11 +80,7 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, mask=mask, scale=self.scale
-        )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.out_proj(output)
+        return queries, keys, values
 
 
 class ShortConv(nn.Module):
@@ -100,7 +109,10 @@ class ShortConv(nn.Module):
         cache: Optional[Any] = None,
         gdn_sink: list | None = None,
     ):
-        BCx = self.in_proj(x)
+        projected = self.in_proj(x)
+        return self.out_proj(self._convolve_projected(projected, mask, cache, gdn_sink))
+
+    def _convolve_projected(self, BCx, mask, cache, gdn_sink):
         B, C, x = mx.split(BCx, 3, axis=-1)
         Bx = B * x
         if mask is not None:
@@ -151,7 +163,7 @@ class ShortConv(nn.Module):
         conv_out = self.conv(Bx)
 
         y = C * conv_out
-        return self.out_proj(y)
+        return y
 
 
 class MLP(nn.Module):
@@ -350,11 +362,19 @@ class LanguageModel(nn.Module):
             inputs_embeds = input_embeddings
 
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
-        speculative_verify = bool(kwargs.pop("speculative_verify", False))
+        exact_speculative_verify = bool(kwargs.pop("speculative_verify", False))
+        if exact_speculative_verify:
+            return _EXACT_SPECULATIVE_VERIFIER(
+                self,
+                inputs,
+                cache=cache,
+                input_embeddings=inputs_embeds,
+                capture_layer_ids=capture_layer_ids,
+            )
+
         hidden_sink: list[mx.array] | None = (
             [] if capture_layer_ids is not None else None
         )
-        gdn_sink: list | None = [] if speculative_verify else None
 
         out = self.model(
             inputs,
@@ -362,7 +382,6 @@ class LanguageModel(nn.Module):
             inputs_embeds,
             capture_layer_ids=capture_layer_ids,
             hidden_sink=hidden_sink,
-            gdn_sink=gdn_sink,
         )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
@@ -371,7 +390,7 @@ class LanguageModel(nn.Module):
         return LanguageModelOutput(
             logits=out,
             hidden_states=hidden_sink,
-            gdn_states=gdn_sink,
+            gdn_states=None,
         )
 
     def chunked_prefill_policy(
