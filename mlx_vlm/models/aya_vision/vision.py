@@ -165,7 +165,7 @@ class VisionEmbeddings(nn.Module):
 
         for i in range(batch_size):
             # (1, dim, height, width) -> (1, dim, target_height, target_width)
-            height, width = spatial_shapes[i]
+            height, width = spatial_shapes[i].tolist()
             # Then upsample width dimension
             resized_embeddings = resize_bilinear(
                 positional_embeddings,
