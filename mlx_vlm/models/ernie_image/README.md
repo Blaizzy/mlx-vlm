@@ -6,10 +6,10 @@ flow-matching scheduler with MLX. It also supports optional prompt enhancement.
 
 ## Models
 
-| Hugging Face model | Variant | Generation | Image-to-image | Recommended settings |
-|---|---|---|---|---|
-| `baidu/ERNIE-Image-Turbo` | Turbo | Yes | Yes | 8 steps, guidance 1 |
-| `baidu/ERNIE-Image` | Base | Yes | Yes | 50 steps, guidance 4 |
+| Hugging Face model        | Variant | Generation | Image-to-image | Recommended settings |
+| ------------------------- | ------- | ---------- | -------------- | -------------------- |
+| `baidu/ERNIE-Image-Turbo` | Turbo   | Yes        | Yes            | 8 steps, guidance 1  |
+| `baidu/ERNIE-Image`       | Base    | Yes        | Yes            | 50 steps, guidance 4 |
 
 The base model uses classifier-free guidance. Turbo disables classifier-free
 guidance at its recommended guidance value. Width and height must be positive
@@ -49,7 +49,7 @@ Generate an image with the Turbo model:
 ```sh
 mlx_vlm.generate \
   --output-modality image \
-  --model ./ERNIE-Image-Turbo-MLX \
+  --model baidu/ERNIE-Image-Turbo \
   --prompt "A red panda serving tea in a moonlit bamboo forest" \
   --size 1024x1024 \
   --steps 8 \
@@ -63,7 +63,7 @@ Generate an image with the Base model:
 ```sh
 mlx_vlm.generate \
   --output-modality image \
-  --model ./ERNIE-Image-MLX \
+  --model baidu/ERNIE-Image \
   --prompt "A cinematic photograph of a fox walking through fresh snow" \
   --size 1024x1024 \
   --steps 50 \
@@ -79,7 +79,7 @@ Transform one source image:
 mlx_vlm.generate \
   --output-modality image \
   --task edit \
-  --model ./ERNIE-Image-Turbo-MLX \
+  --model baidu/ERNIE-Image-Turbo \
   --image input/fox.png \
   --prompt "Give the fox a red Santa hat" \
   --size 1024x1024 \
