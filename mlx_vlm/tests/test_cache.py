@@ -136,9 +136,6 @@ def test_batch_rotating_merge_skips_zero_length_backing_storage():
     assert mx.all(merged.values[0] == 0).item()
 
 
-
-
-
 class _ZeroArg:
     """The common shape: a uniform KV cache, built with no arguments."""
 
