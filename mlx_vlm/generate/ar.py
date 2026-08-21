@@ -219,24 +219,38 @@ def batched_row_sample(
     order = mx.argsort(-work, axis=-1)  # [B, V] descending
     sl = mx.take_along_axis(work, order, axis=-1)  # sorted logprobs
 
-    # Renormalized over the tokens the modes left alive, so top_p/min_p act as a
-    # nucleus of the *filtered* distribution. This is identical to the unfiltered
-    # behaviour when no mode is active (verified against apply_top_p/apply_min_p),
-    # and deliberately differs from chaining make_sampler's apply_top_p after a
-    # mode: that path compares cumulative mass against ``1 - top_p`` on a
-    # distribution whose mass no longer sums to 1, which can reject every token
-    # (e.g. top_n_sigma=1.0 + top_p=0.9 leaves an all -inf row upstream).
-    p = mx.softmax(sl / safe_t[:, None], axis=-1)
-    csum = mx.cumsum(p, axis=-1)
+    # The rank filters run on the UNSCALED distribution, and accumulate in
+    # make_sampler's own summation order: apply_top_p sorts ascending and sums
+    # from the least likely token, so accumulating descending here would round
+    # differently even where the semantics agree. Temperature is applied only at
+    # the draw below, exactly as categorical_sampling does. mx.exp (not softmax)
+    # because apply_top_p exponentiates the logprobs as given -- softmax would
+    # renormalize over whatever the modes left alive and silently change the
+    # composition.
+    probs_ascending = mx.exp(sl[:, ::-1])
+    csum_inclusive = mx.cumsum(probs_ascending, axis=-1)[:, ::-1]
 
     ranks = mx.arange(V, dtype=mx.int32)[None, :]
     k_eff = mx.where(top_k <= 0, V, top_k)
     keep = ranks < k_eff[:, None]  # top_k, exactly-k by rank
-    keep = keep & ((csum - p) <= top_p[:, None])  # top_p (>=1 keeps all)
-    keep = keep & (p >= (p[:, :1] * min_p[:, None]))  # min_p (<=0 keeps all)
-    # Always keep >=1 token. After the chain above, rank 0 is the best surviving
-    # token (not necessarily the global argmax), so this never resurrects a
-    # token the modes rejected.
+
+    # make_sampler skips apply_top_p entirely unless 0 < top_p < 1, so every
+    # other spelling has to be a no-op here: 1.0 (the server default) must not
+    # lose the tail to cumsum drift, and 0.0 must not collapse the row to its
+    # argmax -- upstream reads both as "top-p off".
+    top_p_active = (top_p > 0.0) & (top_p < 1.0)
+    keep = keep & (~top_p_active[:, None] | (csum_inclusive > (1.0 - top_p)[:, None]))
+
+    # min_p in log space against max + log(min_p), as _apply_min_p does.
+    # log(<=0) is -inf, i.e. the disabled spelling, with no branch needed.
+    log_min_p = mx.log(mx.maximum(min_p, 0.0))
+    keep = keep & (sl >= (sl[:, :1] + log_min_p[:, None]))
+
+    # Always keep >=1 token. Upstream never empties a row for valid parameters
+    # (the top token survives every filter), but chaining a rank filter after a
+    # mode can: that is the one place this is a deliberate floor rather than a
+    # no-op. Rank 0 is the best surviving token, so it never resurrects a token
+    # the modes rejected.
     keep = keep | (ranks == 0)
 
     masked = mx.where(keep, sl / safe_t[:, None], mx.array(-float("inf"), mx.float32))
