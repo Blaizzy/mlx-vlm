@@ -179,58 +179,78 @@ def test_chat_completions_endpoint_requires_model(client):
     assert any(err.get("loc") == ["body", "model"] for err in detail)
 
 
+# This PR adds no request validation. It briefly did -- ge/gt/le bounds on the
+# sampling fields -- which 422'd six shapes main accepted, on two of three
+# endpoints, for a change that is supposed to be about per-row sampling. The
+# bounds are gone; schemas.py is byte-identical to main again. What replaces
+# them is this: every value main admitted still reaches the sampler, and the
+# sampler degrades all of them safely.
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("min_p", -0.1),
-        ("min_p", 1.5),
+        ("top_k", -1),  # the conventional "disabled" spelling
+        ("top_k", -3),
+        ("top_k", 0),
+        ("top_p", 0.0),
+        ("top_p", 1.0),
         ("top_p", 1.5),
+        ("min_p", -0.1),
+        ("min_p", 0.0),
+        ("min_p", 1.5),
         ("temperature", -0.5),
+        ("temperature", 0.0),
         ("top_n_sigma", -1.0),
+        ("top_n_sigma", 0.0),
+        ("typical_p", 0.0),
         ("typical_p", 1.5),
     ],
 )
-def test_out_of_domain_sampling_params_rejected_at_admission(client, field, value):
-    # Out-of-domain sampling params must 422 from request validation before
-    # they ever reach the GPU thread — not silently sample with nonsensical
-    # values, and not 500 from a background-thread crash.
-    response = client.post(
-        "/v1/chat/completions",
-        json={
-            "model": "m",
-            "messages": [{"role": "user", "content": "hi"}],
-            field: value,
-        },
-    )
-    assert response.status_code == 422
-
-
-# The bounds above are this PR's addition; main had none. Anything that main
-# accepted and that the sampler already reads as "disabled" must keep working,
-# or a client that has always sent top_k=-1 (the conventional spelling, and
-# what vLLM and llama.cpp use) starts getting 422s from a sampling change.
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("top_k", -1),  # conventional "disabled"
-        ("top_k", -3),
-        ("top_k", 0),
-        ("top_p", 0.0),  # OpenAI's documented range is [0, 1]
-        ("typical_p", 0.0),  # 0 disables, same as 1.0
-        ("min_p", 0.0),
-        ("top_n_sigma", 0.0),
-        ("temperature", 0.0),
-    ],
-)
-def test_disabled_sampling_spellings_still_admitted(client, field, value):
+def test_every_shape_main_admitted_is_still_admitted(client, field, value):
     body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], field: value}
     assert client.post("/v1/chat/completions", json=body).status_code != 422
-    # and the request model itself accepts it -- that is the admission gate
     server.ChatRequest(
         model="m",
         messages=[server.ChatMessage(role="user", content="hi")],
         **{field: value},
     )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("top_k", -1),
+        ("top_p", 0.0),
+        ("top_p", 1.5),
+        ("min_p", -0.1),
+        ("min_p", 1.5),
+        ("temperature", -0.5),
+        ("top_n_sigma", -1.0),
+        ("typical_p", 0.0),
+        ("typical_p", 1.5),
+    ],
+)
+def test_admitted_out_of_range_values_degrade_safely_in_the_sampler(field, value):
+    """No validation means the sampler is the only thing standing between a
+    nonsensical request and a crash, so assert it holds: a real token, in
+    range, no NaN, no raise."""
+    import mlx.core as mx
+
+    from mlx_vlm.generate.ar import _PositionedTargetSampler
+    from mlx_vlm.server.generation import GenerationArguments, _config_from_args
+
+    V = 64
+    lp = mx.random.normal((1, V), key=mx.random.key(2)) * 2.0
+    lp = lp - mx.logsumexp(lp, axis=-1, keepdims=True)
+    kwargs = {"temperature": 0.8}
+    kwargs[field] = value  # may override temperature itself
+    args = GenerationArguments(**kwargs)
+    sampler = _PositionedTargetSampler([_config_from_args(args)])
+    for seed in range(8):
+        mx.random.seed(seed)
+        token = sampler(lp)
+        mx.eval(token)
+        tok = int(token[0])
+        assert 0 <= tok < V, f"{field}={value} produced out-of-range token {tok}"
 
 
 def test_anthropic_endpoint_keeps_accepting_disabled_top_k(client):

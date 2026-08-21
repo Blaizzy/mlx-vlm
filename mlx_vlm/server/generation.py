@@ -745,11 +745,13 @@ def _config_from_args(args: "GenerationArguments") -> SamplingConfig:
         # as off, but SamplingConfig is compared by value and the server batches
         # rows by config equality, so -1 and 0 must not look like two setups.
         top_k=max(0, int(args.top_k)),
+        # Same reason: anything outside (0, 1) disables typical-p, so collapse
+        # the spellings to one value or two identical setups compare unequal.
+        typical_p=(args.typical_p if 0.0 < args.typical_p < 1.0 else 1.0),
         min_p=args.min_p,
         seed=DEFAULT_SEED if args.seed is None else int(args.seed),
         top_n_sigma=args.top_n_sigma,
         p_less=args.p_less,
-        typical_p=args.typical_p,
     )
 
 
@@ -1980,7 +1982,7 @@ class ResponseGenerator:
         self, pending: List[QueuedGenerationRequest]
     ) -> Tuple[List[QueuedGenerationRequest], List[SamplingConfig]]:
         """dflash/eagle3 don't yet thread per-row sampling params through the
-        drafter verify path (that's PR2). Never let one row's params
+        drafter verify path yet. Never let one row's params
         silently win for the whole batch: if `pending` disagrees on
         sampling config, keep only the requests that match the first one
         and requeue the rest for the next round.
@@ -2000,11 +2002,11 @@ class ResponseGenerator:
             "dflash/eagle3 speculative batch has heterogeneous sampling "
             "params; serializing by config instead of co-batching (%d of "
             "%d requests deferred to the next round). Full per-row "
-            "speculative sampling lands in a follow-up PR.",
+            "speculative sampling lands in a follow-up.",
             len(deferred),
             len(pending),
         )
-        # TODO(PR2): per-row dflash/eagle3 sampling.
+        # TODO: per-row dflash/eagle3 sampling.
         for request in deferred:
             self.requests.put(request)
         return kept, [target_config] * len(kept)

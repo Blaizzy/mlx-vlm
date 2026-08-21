@@ -527,9 +527,9 @@ def test_real_extend_and_filter_keep_sampling_aligned_to_uids():
 
 
 def test_prompt_processing_batch_first_token_honors_per_row_sampling_config():
-    """Task 3 wired PromptProcessingBatch.generate()'s first token through
-    self.sampling, but the server admission crash (fixed in Task 4) kept the
-    real server path from ever exercising it — the earlier coverage only
+    """PromptProcessingBatch.generate() draws the first token from
+    self.sampling, but no test drove that through the real server path, so the
+    earlier coverage only
     checked plumbing (extend/filter alignment), not that a live first-token
     draw actually differs per row. Two rows share identical logits but
     distinct SamplingConfigs (different temperature/seed); their sampled

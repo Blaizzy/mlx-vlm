@@ -78,15 +78,6 @@ def _position_seed(seed: int, row_id: int, position: int) -> int:
     return int(x & 0xFFFFFFFF)
 
 
-def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.array:
-    return mx.stack(
-        [
-            mx.random.key(_position_seed(seed, row, pos))
-            for row, pos in zip(row_ids, positions)
-        ]
-    )
-
-
 @dataclass(frozen=True)
 class SamplingConfig:
     """Immutable per-row sampling parameters. One per request; rides the batch
@@ -3013,7 +3004,7 @@ class BatchGenerator:
             draft_kind=getattr(self, "draft_kind", None),
             draft_block_size=getattr(self, "draft_block_size", None),
             sampling=sampling_configs,
-            # derive per-batch greedy flag from the actual configs (was: request #1)
+            # derive the per-batch greedy flag from the actual configs
             greedy_sampling=all(
                 c is None or c.temperature == 0 for c in sampling_configs
             ),
@@ -3339,7 +3330,7 @@ class BatchGenerator:
                 draft_kind=getattr(self, "draft_kind", None),
                 draft_block_size=getattr(self, "draft_block_size", None),
                 sampling=sampling_configs,
-                # derive per-batch greedy flag from the actual configs (was: request #1)
+                # derive the per-batch greedy flag from the actual configs
                 greedy_sampling=all(
                     c is None or c.temperature == 0 for c in sampling_configs
                 ),
