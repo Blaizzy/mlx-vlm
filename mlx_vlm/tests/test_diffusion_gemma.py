@@ -2,6 +2,7 @@ import contextlib
 import importlib
 import io
 import json
+import os
 import unittest
 from pathlib import Path
 from queue import Queue
@@ -690,6 +691,78 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(responses[-1].diffusion_canvas_tokens, 3)
         self.assertEqual(responses[-1].diffusion_denoising_steps, 1)
         self.assertEqual(responses[-1].diffusion_work_tokens, 3)
+
+    def test_stream_generate_reuses_hybrid_prompt_cache_with_apc(self):
+        from mlx_vlm.apc import APCManager
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        processor = FakeProcessor()
+        input_ids = mx.array([[2, 3, 4, 5]], dtype=mx.int32)
+        recorder = RecordingEncoder(model.model.encoder)
+        model.model.encoder = recorder
+
+        with patch.dict(
+            os.environ,
+            {
+                "APC_CHECKPOINT_ENTRIES": "4",
+                "APC_EXACT_MIN_TOKENS": "1",
+            },
+        ):
+            manager = APCManager(num_blocks=4, block_size=2)
+
+        try:
+            mx.random.seed(7)
+            cold = list(
+                stream_generate(
+                    model,
+                    processor,
+                    "",
+                    input_ids=input_ids,
+                    max_tokens=2,
+                    max_denoising_steps=1,
+                    _apc_manager=manager,
+                    _apc_semantic_hash=11,
+                )
+            )
+            cold_prefill_shapes = list(recorder.input_lengths)
+            recorder.input_lengths.clear()
+
+            mx.random.seed(7)
+            warm = list(
+                stream_generate(
+                    model,
+                    processor,
+                    "",
+                    input_ids=input_ids,
+                    max_tokens=2,
+                    max_denoising_steps=1,
+                    _apc_manager=manager,
+                    _apc_semantic_hash=11,
+                )
+            )
+            warm_prefill_shapes = list(recorder.input_lengths)
+
+            cold_tokens = [
+                response.token
+                for response in cold
+                if response.token is not None and not response.is_draft
+            ]
+            warm_tokens = [
+                response.token
+                for response in warm
+                if response.token is not None and not response.is_draft
+            ]
+            self.assertEqual(cold_tokens, warm_tokens)
+            self.assertEqual(cold[-1].cached_tokens, 0)
+            self.assertEqual(warm[-1].cached_tokens, 3)
+            self.assertEqual(cold_prefill_shapes[-1], 1)
+            self.assertEqual(warm_prefill_shapes, [1])
+            self.assertEqual(manager.stats_snapshot()["exact_hits"], 1)
+        finally:
+            manager.close()
 
     def test_stream_generate_uses_model_owned_generator(self):
         from mlx_vlm.generate import stream_generate

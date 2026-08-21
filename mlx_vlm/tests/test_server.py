@@ -1269,6 +1269,9 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
     gen.config = SimpleNamespace(eos_token_id=3)
     gen.tokenizer = SimpleNamespace(all_special_ids=[0])
     gen.prefill_step_size = 3072
+    apc_manager = SimpleNamespace()
+    gen.apc_manager = apc_manager
+    gen.apc_mode = "exact"
     captured = {}
 
     def fake_stream_diffusion_generate_from_kwargs(
@@ -1304,6 +1307,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
                 total_tokens=3,
                 prompt_tps=10.0,
                 generation_tps=5.0,
+                cached_tokens=1,
                 finish_reason="length",
             )
         )
@@ -1348,16 +1352,20 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         },
         args=args,
         cancelled=set(),
+        apc_semantic_hash=73,
     )
 
     chunk = rqueue.get(timeout=1)
     assert chunk.text == "ok"
     assert chunk.finish_reason == "length"
     assert chunk.generation_tps == 5.0
+    assert chunk.cached_tokens == 1
     assert captured["input_ids"].tolist() == [[11, 12]]
     assert captured["pixel_values"] == "pixels"
     assert captured["attention_mask"] == "mask"
     assert captured["skip_special_token_ids"] == {0}
+    assert captured["kwargs"]["_apc_manager"] is apc_manager
+    assert captured["kwargs"]["_apc_semantic_hash"] == 73
     assert captured["skip_special_tokens"] is True
     assert captured["kwargs"] == {
         "max_tokens": 4,
@@ -1380,6 +1388,8 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         "diffusion_sampler": "entropy-bound",
         "threshold": 0.7,
         "min_threshold": 0.4,
+        "_apc_manager": apc_manager,
+        "_apc_semantic_hash": 73,
     }
 
 

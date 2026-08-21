@@ -954,6 +954,7 @@ class _DiffusionBlockEmitter:
                 peak_memory=result.peak_memory,
                 prompt_tps=result.prompt_tps,
                 generation_tps=result.generation_tps,
+                cached_tokens=result.cached_tokens,
                 token_count=token_count,
             )
             self.block_text = []
@@ -1942,7 +1943,13 @@ class ResponseGenerator:
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     try:
                         self._generate_diffusion(
-                            uid, rqueue, raw_inputs, args, cancelled, log_state
+                            uid,
+                            rqueue,
+                            raw_inputs,
+                            args,
+                            cancelled,
+                            log_state,
+                            apc_semantic_hash=request.apc_semantic_hash,
                         )
                         rqueue.put(None)
                     except Exception as e:
@@ -1959,7 +1966,14 @@ class ResponseGenerator:
                 gc.collect()
 
     def _generate_diffusion(
-        self, uid, rqueue, raw_inputs, args, cancelled, log_state=None
+        self,
+        uid,
+        rqueue,
+        raw_inputs,
+        args,
+        cancelled,
+        log_state=None,
+        apc_semantic_hash=None,
     ):
         log_state = log_state or {"request_id": uid, "generated_tokens": 0}
         input_ids = raw_inputs.get("input_ids")
@@ -1989,6 +2003,9 @@ class ResponseGenerator:
         if args.logits_processors is not None:
             stream_kwargs["logits_processors"] = args.logits_processors
         stream_kwargs.update(args.diffusion_kwargs())
+        if self.apc_manager is not None and self.apc_mode is not None:
+            stream_kwargs["_apc_manager"] = self.apc_manager
+            stream_kwargs["_apc_semantic_hash"] = int(apc_semantic_hash or 0)
 
         emitter = _DiffusionBlockEmitter()
         prefill_logged = False
