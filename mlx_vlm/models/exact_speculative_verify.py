@@ -1,8 +1,8 @@
 import mlx.core as mx
 
-_TARGET_VERIFY_GEMV = (
+_EXACT_SPECULATIVE_VERIFY_GEMV = (
     mx.fast.metal_kernel(
-        name="target_verify_gemv",
+        name="exact_speculative_verify_gemv",
         input_names=["x", "weight"],
         output_names=["out"],
         header="#include <metal_simdgroup>\nusing namespace metal;\n",
@@ -83,13 +83,13 @@ _TARGET_VERIFY_GEMV = (
 )
 
 
-def target_verify_dense_available() -> bool:
-    return _TARGET_VERIFY_GEMV is not None
+def exact_speculative_verify_dense_available() -> bool:
+    return _EXACT_SPECULATIVE_VERIFY_GEMV is not None
 
 
-def target_verify_weight(weight: mx.array, x: mx.array) -> mx.array | None:
+def exact_speculative_verify_weight(weight: mx.array, x: mx.array) -> mx.array | None:
     """Multiply a small verification block by a dense BF16/FP16 weight."""
-    if _TARGET_VERIFY_GEMV is None or x.ndim != 3:
+    if _EXACT_SPECULATIVE_VERIFY_GEMV is None or x.ndim != 3:
         return None
 
     batch, length, dimensions = x.shape
@@ -104,7 +104,7 @@ def target_verify_weight(weight: mx.array, x: mx.array) -> mx.array | None:
 
     rows = batch * length
     padded_rows = ((rows + 7) // 8) * 8
-    out = _TARGET_VERIFY_GEMV(
+    out = _EXACT_SPECULATIVE_VERIFY_GEMV(
         inputs=[x.reshape(rows, dimensions), weight],
         template=[
             ("T", x.dtype),
@@ -121,6 +121,6 @@ def target_verify_weight(weight: mx.array, x: mx.array) -> mx.array | None:
 
 
 __all__ = [
-    "target_verify_dense_available",
-    "target_verify_weight",
+    "exact_speculative_verify_dense_available",
+    "exact_speculative_verify_weight",
 ]

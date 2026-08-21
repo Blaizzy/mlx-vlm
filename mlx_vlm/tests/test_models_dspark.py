@@ -6,9 +6,9 @@ import pytest
 
 from mlx_vlm.generate.ar import generate_step
 from mlx_vlm.models.cache import ArraysCache, BatchKVCache
+from mlx_vlm.models.exact_speculative_verify import exact_speculative_verify_weight
 from mlx_vlm.models.lfm2 import Model as Lfm2Model
 from mlx_vlm.models.lfm2 import ModelConfig as Lfm2Config
-from mlx_vlm.models.target_verify import target_verify_weight
 from mlx_vlm.speculative.drafters import (
     resolve_drafter_kind,
     validate_drafter_compatibility,
@@ -182,7 +182,7 @@ def test_tiny_dspark_forward_uses_markov_head_and_published_block_semantics():
     assert all(cache.offset == 3 for cache in draft_cache)
 
 
-def test_target_verify_dense_kernel_matches_mlx_linear():
+def test_exact_speculative_verify_dense_kernel_matches_mlx_linear():
     if not mx.metal.is_available():
         pytest.skip("The target-verification kernel requires Metal.")
 
@@ -190,7 +190,7 @@ def test_target_verify_dense_kernel_matches_mlx_linear():
     inputs = mx.random.normal((1, 5, 8)).astype(mx.bfloat16)
     weight = mx.random.normal((16, 8)).astype(mx.bfloat16)
     expected = inputs @ weight.T
-    actual = target_verify_weight(weight, inputs)
+    actual = exact_speculative_verify_weight(weight, inputs)
     assert actual is not None
     mx.eval(expected, actual)
 
@@ -198,7 +198,7 @@ def test_target_verify_dense_kernel_matches_mlx_linear():
     assert bool(mx.array_equal(actual, expected))
 
 
-def test_lfm2_target_verify_logits_exactly_match_single_token_decode():
+def test_lfm2_exact_speculative_verify_matches_single_token_decode():
     if not mx.metal.is_available():
         pytest.skip("Exact target verification requires Metal.")
 

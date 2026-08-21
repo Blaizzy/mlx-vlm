@@ -12,16 +12,10 @@ from ..base import (
 )
 from ..cache import ArraysCache, KVCache
 from ..switch_layers import SwitchGLU
-from ..target_verify import target_verify_weight
 from .config import ModelConfig
+from .speculative_verifier import Lfm2ExactSpeculativeVerifier
 
-
-def _linear(linear: nn.Linear, x: mx.array, target_verify: bool) -> mx.array:
-    if target_verify:
-        output = target_verify_weight(linear.weight, x)
-        if output is not None:
-            return output
-    return linear(x)
+_EXACT_SPECULATIVE_VERIFIER = Lfm2ExactSpeculativeVerifier()
 
 
 class Attention(nn.Module):
@@ -55,13 +49,20 @@ class Attention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-        target_verify: bool = False,
     ) -> mx.array:
-        B, L, D = x.shape
+        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        queries, keys, values = self._prepare_projected_qkv(
+            queries, keys, values, cache
+        )
 
-        queries = _linear(self.q_proj, x, target_verify)
-        keys = _linear(self.k_proj, x, target_verify)
-        values = _linear(self.v_proj, x, target_verify)
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, mask=mask, scale=self.scale
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(x.shape[0], x.shape[1], -1)
+        return self.out_proj(output)
+
+    def _prepare_projected_qkv(self, queries, keys, values, cache):
+        B, L, _ = queries.shape
 
         queries = self.q_layernorm(queries.reshape(B, L, self.n_heads, -1)).transpose(
             0, 2, 1, 3
@@ -79,32 +80,7 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        if target_verify and cache is not None and L > 1:
-            prefix_length = keys.shape[-2] - L
-            output = mx.concatenate(
-                [
-                    scaled_dot_product_attention(
-                        queries[:, :, i : i + 1, :],
-                        keys[:, :, : prefix_length + i + 1, :],
-                        values[:, :, : prefix_length + i + 1, :],
-                        cache=cache,
-                        mask=(
-                            mask[..., i : i + 1, : prefix_length + i + 1]
-                            if isinstance(mask, mx.array) and mask.ndim >= 4
-                            else None
-                        ),
-                        scale=self.scale,
-                    )
-                    for i in range(L)
-                ],
-                axis=2,
-            )
-        else:
-            output = scaled_dot_product_attention(
-                queries, keys, values, cache=cache, mask=mask, scale=self.scale
-            )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return _linear(self.out_proj, output, target_verify)
+        return queries, keys, values
 
 
 class ShortConv(nn.Module):
@@ -132,9 +108,11 @@ class ShortConv(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         gdn_sink: list | None = None,
-        target_verify: bool = False,
     ):
-        BCx = _linear(self.in_proj, x, target_verify)
+        projected = self.in_proj(x)
+        return self.out_proj(self._convolve_projected(projected, mask, cache, gdn_sink))
+
+    def _convolve_projected(self, BCx, mask, cache, gdn_sink):
         B, C, x = mx.split(BCx, 3, axis=-1)
         Bx = B * x
         if mask is not None:
@@ -185,7 +163,7 @@ class ShortConv(nn.Module):
         conv_out = self.conv(Bx)
 
         y = C * conv_out
-        return _linear(self.out_proj, y, target_verify)
+        return y
 
 
 class MLP(nn.Module):
@@ -208,10 +186,8 @@ class MLP(nn.Module):
         self.w3 = nn.Linear(dim, ff_dim, bias=False)
         self.w2 = nn.Linear(ff_dim, dim, bias=False)
 
-    def __call__(self, x, target_verify: bool = False) -> mx.array:
-        gate = _linear(self.w1, x, target_verify)
-        value = _linear(self.w3, x, target_verify)
-        return _linear(self.w2, swiglu(gate, value), target_verify)
+    def __call__(self, x) -> mx.array:
+        return self.w2(swiglu(self.w1(x), self.w3(x)))
 
 
 class GatedMLP(nn.Module):
@@ -296,30 +272,18 @@ class Lfm2DecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         gdn_sink: list | None = None,
-        target_verify: bool = False,
     ) -> mx.array:
         if self.is_attention_layer:
-            r = self.self_attn(
-                self.operator_norm(x),
-                mask=mask,
-                cache=cache,
-                target_verify=target_verify,
-            )
+            r = self.self_attn(self.operator_norm(x), mask=mask, cache=cache)
         else:
             r = self.conv(
                 self.operator_norm(x),
                 mask=mask,
                 cache=cache,
                 gdn_sink=gdn_sink,
-                target_verify=target_verify,
             )
         h = x + r
-        normed = self.ffn_norm(h)
-        if target_verify and isinstance(self.feed_forward, MLP):
-            feed_forward = self.feed_forward(normed, target_verify=True)
-        else:
-            feed_forward = self.feed_forward(normed)
-        out = h + feed_forward
+        out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
 
@@ -352,7 +316,6 @@ class Lfm2Model(nn.Module):
         capture_layer_ids: list[int] | None = None,
         hidden_sink: list | None = None,
         gdn_sink: list | None = None,
-        target_verify: bool = False,
     ):
         if input_embeddings is not None:
             h = input_embeddings
@@ -368,13 +331,7 @@ class Lfm2Model(nn.Module):
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
         for index, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = attn_mask if layer.is_attention_layer else conv_mask
-            h = layer(
-                h,
-                mask,
-                cache=c,
-                gdn_sink=gdn_sink,
-                target_verify=target_verify,
-            )
+            h = layer(h, mask, cache=c, gdn_sink=gdn_sink)
             if hidden_sink is not None and index in capture_set:
                 hidden_sink.append(h)
 
@@ -405,11 +362,19 @@ class LanguageModel(nn.Module):
             inputs_embeds = input_embeddings
 
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
-        speculative_verify = bool(kwargs.pop("speculative_verify", False))
+        exact_speculative_verify = bool(kwargs.pop("speculative_verify", False))
+        if exact_speculative_verify:
+            return _EXACT_SPECULATIVE_VERIFIER(
+                self,
+                inputs,
+                cache=cache,
+                input_embeddings=inputs_embeds,
+                capture_layer_ids=capture_layer_ids,
+            )
+
         hidden_sink: list[mx.array] | None = (
             [] if capture_layer_ids is not None else None
         )
-        gdn_sink: list | None = [] if speculative_verify else None
 
         out = self.model(
             inputs,
@@ -417,26 +382,15 @@ class LanguageModel(nn.Module):
             inputs_embeds,
             capture_layer_ids=capture_layer_ids,
             hidden_sink=hidden_sink,
-            gdn_sink=gdn_sink,
-            target_verify=speculative_verify,
         )
         if self.args.tie_word_embeddings:
-            verify_logits = (
-                target_verify_weight(self.model.embed_tokens.weight, out)
-                if speculative_verify
-                else None
-            )
-            out = (
-                verify_logits
-                if verify_logits is not None
-                else self.model.embed_tokens.as_linear(out)
-            )
+            out = self.model.embed_tokens.as_linear(out)
         else:
-            out = _linear(self.lm_head, out, speculative_verify)
+            out = self.lm_head(out)
         return LanguageModelOutput(
             logits=out,
             hidden_states=hidden_sink,
-            gdn_states=gdn_sink,
+            gdn_states=None,
         )
 
     def chunked_prefill_policy(

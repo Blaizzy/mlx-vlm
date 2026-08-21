@@ -11,10 +11,14 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
+from ..exact_speculative_verify import (
+    exact_speculative_verify_dense_available,
+)
+from ..exact_speculative_verify import (
+    exact_speculative_verify_weight as _target_verify_weight,
+)
 from ..rope_utils import MRoPERotaryEmbedding
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
-from ..target_verify import target_verify_dense_available
-from ..target_verify import target_verify_weight as _target_verify_weight
 from .config import ModelConfig, TextConfig
 from .gated_delta import (
     gated_delta_accept_states,
@@ -76,7 +80,7 @@ def _qwen3_5_decode_depthwise_conv(conv_input: mx.array, weight: mx.array):
 
 def _use_target_verify_dense(linear, x: mx.array, target_verify: bool) -> bool:
     return (
-        target_verify_dense_available()
+        exact_speculative_verify_dense_available()
         and target_verify
         and x.ndim == 3
         and x.shape[1] > 1
