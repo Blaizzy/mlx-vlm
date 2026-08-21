@@ -1,5 +1,6 @@
 import glob
 import importlib
+import importlib.util
 import inspect
 import json
 import logging
@@ -584,8 +585,25 @@ def get_class_predicate(skip_vision=False, weights=None, quantization_config=Non
     return predicate
 
 
-def get_model_and_args(config: dict):
-    """Resolve a model package and its normalized model type."""
+def get_model_and_args(config: dict, model_path: Optional[Path] = None):
+    """Resolve a model package and its normalized model type.
+
+    If the config declares ``model_file`` and ``model_path`` is provided, the
+    model module is imported from that file inside the checkpoint (the same
+    mechanism mlx_lm supports) instead of the built-in registry.
+    """
+    if model_path is not None and (model_file := config.get("model_file")):
+        model_file_path = Path(model_path) / model_file
+        if not model_file_path.is_file():
+            raise FileNotFoundError(
+                f"config.json declares model_file={model_file!r} but "
+                f"{model_file_path} does not exist"
+            )
+        spec = importlib.util.spec_from_file_location("custom_model", model_file_path)
+        arch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(arch)
+        return arch, "custom"
+
     raw_model_type = config.get("model_type") or config.get("speculators_model_type")
     if raw_model_type is None:
         raise KeyError("model_type")
@@ -595,7 +613,11 @@ def get_model_and_args(config: dict):
 
     is_dflash = config.get("dflash_config", None) is not None
     if is_dflash:
-        model_type += "_dflash"
+        # DSpark checkpoints deliberately reuse a Qwen3 draft backbone and
+        # model_type, but their Markov head changes proposal semantics. Route
+        # them before the generic DFlash suffix is applied.
+        suffix = "_dspark" if int(config.get("markov_rank", 0) or 0) > 0 else "_dflash"
+        model_type += suffix
 
     last_err: Optional[ImportError] = None
     for pkg in ("mlx_vlm.models", "mlx_vlm.speculative.drafters"):
@@ -755,7 +777,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(_load_safetensors(wf))
 
-    model_class, _ = get_model_and_args(config=config)
+    model_class, _ = get_model_and_args(config=config, model_path=model_path)
     text_only_config = _is_text_only_config(config)
 
     # Initialize text and vision configs if not present

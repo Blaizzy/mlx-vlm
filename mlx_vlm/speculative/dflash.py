@@ -148,6 +148,7 @@ def _dflash_rounds(
                 verify_input,
                 cache=prompt_cache,
                 capture_layer_ids=target_layer_ids,
+                speculative_verify=True,
             )
             hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
             target_tokens = sampler(verify_out.logits)
@@ -271,6 +272,7 @@ def _dflash_rounds_batch(
                 verify_input,
                 cache=prompt_cache,
                 capture_layer_ids=target_layer_ids,
+                speculative_verify=True,
             )
             hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
             target_tokens = sampler(verify_out.logits)
