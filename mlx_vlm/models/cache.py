@@ -626,8 +626,10 @@ class RotatingKVCache(_BaseCache):
 class ArraysCache(_BaseCache):
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
-        instance.left_padding = None
-        instance.lengths = None
+        instance._left_padding = None
+        instance._left_padding_advance = 0
+        instance._lengths = None
+        instance._lengths_advance = 0
         return instance
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
@@ -636,14 +638,40 @@ class ArraysCache(_BaseCache):
             self.left_padding = mx.array(left_padding)
 
     @property
+    def left_padding(self):
+        if self._left_padding is None:
+            return None
+        if self._left_padding_advance == 0:
+            return self._left_padding
+        return self._left_padding - self._left_padding_advance
+
+    @left_padding.setter
+    def left_padding(self, value):
+        self._left_padding = value
+        self._left_padding_advance = 0
+
+    @property
+    def lengths(self):
+        if self._lengths is None:
+            return None
+        if self._lengths_advance == 0:
+            return self._lengths
+        return self._lengths - self._lengths_advance
+
+    @lengths.setter
+    def lengths(self, value):
+        self._lengths = value
+        self._lengths_advance = 0
+
+    @property
     def batch_size(self):
         for c in self.cache:
             if c is not None:
                 return c.shape[0]
-        if self.left_padding is not None:
-            return self.left_padding.size
-        elif self.lengths is not None:
-            return self.lengths.size
+        if self._left_padding is not None:
+            return self._left_padding.size
+        elif self._lengths is not None:
+            return self._lengths.size
         else:
             return 1
 
@@ -715,10 +743,10 @@ class ArraysCache(_BaseCache):
         self.left_padding = None
 
     def advance(self, N):
-        if self.lengths is not None:
-            self.lengths -= N
-        if self.left_padding is not None:
-            self.left_padding -= N
+        if self._lengths is not None:
+            self._lengths_advance += N
+        if self._left_padding is not None:
+            self._left_padding_advance += N
 
     def make_mask(self, N: int):
         if self.left_padding is not None:

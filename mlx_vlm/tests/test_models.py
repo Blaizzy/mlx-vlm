@@ -9,6 +9,7 @@ import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten, tree_map
 
+from mlx_vlm.tests.cache_invariants import assert_cached_forward_matches_full
 from mlx_vlm.tests.sanitize_invariants import assert_sanitize_idempotent
 
 
@@ -29,17 +30,10 @@ class TestNanochatModel(unittest.TestCase):
             rope_theta=10000.0,
         )
         model = nanochat.Model(config)
-        inputs = mx.array([[1, 2, 3, 4]])
 
-        full_logits = model(inputs).logits
-        cache = model.make_cache()
-        first_logits = model(inputs[:, :2], cache=cache).logits
-        second_logits = model(inputs[:, 2:], cache=cache).logits
-        cached_logits = mx.concatenate([first_logits, second_logits], axis=1)
-        mx.eval(full_logits, cached_logits)
+        full_logits, _ = assert_cached_forward_matches_full(model)
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertEqual(len(model.layers), config.num_hidden_layers)
 
         model_module, model_type = get_model_and_args(config.to_dict())
@@ -96,24 +90,16 @@ class TestMamba2Model(unittest.TestCase):
 
         config = self._config()
         model = mamba2.Model(config)
-        inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         sanitized = model.sanitize(
             {"backbone.layers.0.mixer.conv1d.weight": mx.zeros((64, 1, 4))}
         )
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertTrue(all(isinstance(item, ArraysCache) for item in cache))
         self.assertEqual(
             sanitized["language_model.backbone.layers.0.mixer.conv1d.weight"].shape,
@@ -147,23 +133,16 @@ class TestPlamo2Model(unittest.TestCase):
         mx.random.seed(0)
         model = plamo2.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache, atol=2e-3
         )
-        mx.eval(full_logits, cached_logits)
         sanitized = model.sanitize(
             {"model.layers.layers.0.mixer.conv1d.weight": mx.zeros((32, 1, 4))}
         )
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertLess(mx.max(mx.abs(full_logits - cached_logits)).item(), 2e-3)
         self.assertIsInstance(cache[0], ArraysCache)
         self.assertIsInstance(cache[1], KVCache)
         self.assertEqual(
@@ -217,21 +196,14 @@ class TestAFM7Model(unittest.TestCase):
         mx.random.seed(0)
         model = afm7.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         sanitized = model.sanitize({"model.embedding.weight": mx.zeros((64, 32))})
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertEqual(len(model.language_model.model.layers), 2)
         self.assertEqual(len(model.language_model.model.kv_reuse_layers), 2)
         self.assertEqual(len(model.layers), config.num_layers)
@@ -278,16 +250,10 @@ class TestJambaModel(unittest.TestCase):
         mx.random.seed(0)
         model = jamba.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         sanitized = model.sanitize(
             {
                 "model.layers.0.mamba.conv1d.weight": mx.zeros((64, 1, 4)),
@@ -303,7 +269,6 @@ class TestJambaModel(unittest.TestCase):
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertIsInstance(cache[0], ArraysCache)
         self.assertIsInstance(cache[1], KVCache)
         self.assertEqual(config.mamba_dt_rank, 2)
@@ -365,16 +330,10 @@ class TestBailingMoeLinearModel(unittest.TestCase):
         mx.random.seed(0)
         model = bailing_moe_linear.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         sanitized = model.sanitize(
             {
                 **{
@@ -390,7 +349,6 @@ class TestBailingMoeLinearModel(unittest.TestCase):
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertIsInstance(cache[0], ArraysCache)
         self.assertIsInstance(cache[1], KVCache)
         self.assertIsInstance(cache[2], ArraysCache)
@@ -463,16 +421,10 @@ class TestGraniteMoeHybridModel(unittest.TestCase):
         mx.random.seed(0)
         model = granitemoehybrid.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         input_weights = {
             f"model.layers.{layer}.block_sparse_moe.input_linear.weight": mx.ones(
                 (4, 96, 32)
@@ -495,7 +447,6 @@ class TestGraniteMoeHybridModel(unittest.TestCase):
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertIsInstance(cache[0], ArraysCache)
         self.assertIsInstance(cache[1], KVCache)
         self.assertIsInstance(cache[2], ArraysCache)
@@ -585,16 +536,10 @@ class TestKimiLinearModel(unittest.TestCase):
         mx.random.seed(0)
         model = kimi_linear.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         weights = {
             **{
                 f"model.layers.0.block_sparse_moe.experts.{expert}.{projection}.weight": mx.full(
@@ -620,7 +565,6 @@ class TestKimiLinearModel(unittest.TestCase):
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertIsInstance(cache[0], ArraysCache)
         self.assertIsInstance(cache[1], KVCache)
         self.assertIsInstance(cache[2], ArraysCache)
@@ -707,16 +651,10 @@ class TestStep3p5Model(unittest.TestCase):
         mx.random.seed(0)
         model = step3p5.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         sanitized = model.sanitize(
             {
                 "model.layers.1.moe.gate_proj.weight": mx.ones((4, 48, 32)),
@@ -730,7 +668,6 @@ class TestStep3p5Model(unittest.TestCase):
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertIsInstance(cache[0], RotatingKVCache)
         self.assertIsInstance(cache[1], KVCache)
         self.assertIsInstance(cache[2], RotatingKVCache)
@@ -814,16 +751,10 @@ class TestMiniMaxModel(unittest.TestCase):
         mx.random.seed(0)
         model = minimax.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         sanitized = model.sanitize(
             {
                 f"model.layers.0.block_sparse_moe.experts.{expert}.w1.weight": mx.full(
@@ -835,7 +766,6 @@ class TestMiniMaxModel(unittest.TestCase):
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertTrue(all(isinstance(item, KVCache) for item in cache))
         self.assertEqual(
             sanitized[
@@ -889,16 +819,10 @@ class TestLongcatFlashModel(unittest.TestCase):
         mx.random.seed(0)
         model = longcat_flash.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         weights = {
             f"model.layers.0.mlp.experts.{expert}.gate_proj.weight": mx.full(
                 (48, 32), expert
@@ -914,7 +838,6 @@ class TestLongcatFlashModel(unittest.TestCase):
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertEqual(len(cache), config.num_layers)
         self.assertIsInstance(cache[0], CacheList)
         self.assertTrue(all(isinstance(item, KVCache) for item in cache[0].caches))
@@ -974,21 +897,14 @@ class TestLongcatFlashNgramModel(unittest.TestCase):
         mx.random.seed(0)
         model = longcat_flash_ngram.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         sanitized = model.sanitize({"model.embed_tokens.weight": mx.zeros((64, 32))})
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertIsInstance(cache[0], ArraysCache)
         self.assertIsInstance(cache[1], CacheList)
         self.assertEqual(cache[0][0].tolist(), [[3, 4]])
@@ -1040,16 +956,10 @@ class TestGlm4MoeLiteModel(unittest.TestCase):
         mx.random.seed(0)
         model = glm4_moe_lite.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         weights = {
             f"model.layers.1.mlp.experts.{expert}.gate_proj.weight": mx.full(
                 (48, 32), expert
@@ -1062,7 +972,6 @@ class TestGlm4MoeLiteModel(unittest.TestCase):
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertTrue(all(isinstance(item, KVCache) for item in cache))
         self.assertEqual(
             sanitized[
@@ -1129,21 +1038,14 @@ class TestRWKV7Model(unittest.TestCase):
         mx.random.seed(0)
         model = rwkv7.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         sanitized = model.sanitize({"model.layers.0.attn.k_k": mx.zeros((64,))})
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertTrue(all(isinstance(item, ArraysCache) for item in cache))
         self.assertEqual(
             sanitized["language_model.model.layers.0.attn.k_k"].shape, (2, 32)
@@ -1184,16 +1086,10 @@ class TestFalconH1Model(unittest.TestCase):
         mx.random.seed(0)
         model = falcon_h1.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         sanitized = model.sanitize(
             {
                 "model.layers.0.mamba.conv1d.weight": mx.ones((64, 1, 4)),
@@ -1204,7 +1100,6 @@ class TestFalconH1Model(unittest.TestCase):
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertEqual(len(model.layers), config.num_hidden_layers)
         self.assertTrue(all(isinstance(item, CacheList) for item in cache))
         self.assertIsInstance(cache[0][0], ArraysCache)
@@ -1266,16 +1161,10 @@ class TestBitNetModel(unittest.TestCase):
         config = self._config()
         model = bitnet.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         sanitized = model.sanitize(
             {
                 "model.embed_tokens.weight": mx.zeros((64, 32)),
@@ -1285,7 +1174,6 @@ class TestBitNetModel(unittest.TestCase):
         )
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertEqual(set(sanitized), {"language_model.model.embed_tokens.weight"})
 
 
@@ -1315,22 +1203,15 @@ class TestMambaModel(unittest.TestCase):
         config = self._config()
         model = mamba.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         original = mx.zeros((64, 1, 4))
         sanitized = model.sanitize({"backbone.layers.0.mixer.conv1d.weight": original})
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertTrue(all(isinstance(item, ArraysCache) for item in cache))
         self.assertEqual(
             sanitized["language_model.backbone.layers.0.mixer.conv1d.weight"].shape,
@@ -1385,20 +1266,13 @@ class TestMellumModel(unittest.TestCase):
         config = self._config()
         model = mellum.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertIsInstance(cache[0], KVCache)
         self.assertIsInstance(cache[1], RotatingKVCache)
         self.assertEqual(
@@ -1455,21 +1329,14 @@ class TestIQuestLoopCoderModel(unittest.TestCase):
         config = self._config()
         model = iquestloopcoder.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         sanitized = model.sanitize({"model.embed_tokens.weight": mx.zeros((64, 32))})
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertTrue(all(isinstance(item, KVCache) for item in cache[:2]))
         self.assertTrue(all(isinstance(item, RotatingKVCache) for item in cache[2:]))
         self.assertEqual(set(sanitized), {"language_model.model.embed_tokens.weight"})
@@ -1516,16 +1383,10 @@ class TestYoutuLLMModel(unittest.TestCase):
         config = self._config()
         model = youtu_llm.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         sanitized = model.sanitize(
             {
                 "model.embed_tokens.weight": mx.zeros((64, 32)),
@@ -1535,7 +1396,6 @@ class TestYoutuLLMModel(unittest.TestCase):
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertEqual(set(sanitized), {"language_model.model.embed_tokens.weight"})
         self.assertIs(model_module, youtu_llm)
         self.assertEqual(model_type, "youtu_llm")
@@ -1583,20 +1443,13 @@ class TestKlearModel(unittest.TestCase):
         config = self._config()
         model = klear.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertIs(model_module, klear)
         self.assertEqual(model_type, "klear")
         self.assertEqual(
@@ -1643,21 +1496,14 @@ class TestPlamoModel(unittest.TestCase):
         model = plamo.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
 
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :2], cache=cache).logits,
-                model(inputs[:, 2:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
         )
-        mx.eval(full_logits, cached_logits)
         sanitized = model.sanitize({"model.embed_tokens.weight": mx.zeros((64, 32))})
         model_module, model_type = get_model_and_args(config.to_dict())
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertEqual(set(sanitized), {"language_model.model.embed_tokens.weight"})
         self.assertIs(model_module, plamo)
         self.assertEqual(model_type, "plamo")
@@ -1682,16 +1528,10 @@ class TestLille130mModel(unittest.TestCase):
         model = lille_130m.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
 
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        cached_logits = mx.concatenate(
-            [
-                model(inputs[:, :1], cache=cache).logits,
-                model(inputs[:, 1:], cache=cache).logits,
-            ],
-            axis=1,
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache, splits=(1,)
         )
-        mx.eval(full_logits, cached_logits)
         sanitized = model.sanitize(
             {
                 "transformer.tok_embeddings.weight": mx.zeros((64, 64)),
@@ -1700,7 +1540,6 @@ class TestLille130mModel(unittest.TestCase):
         )
 
         self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertEqual(
             set(sanitized), {"language_model.transformer.tok_embeddings.weight"}
         )
@@ -1734,15 +1573,12 @@ class TestOlmoModel(unittest.TestCase):
         model = olmo.Model(config)
         inputs = mx.array([[1, 2, 3, 4]])
 
-        full_logits = model(inputs).logits
         cache = model.make_cache()
-        first_logits = model(inputs[:, :2], cache=cache).logits
-        second_logits = model(inputs[:, 2:], cache=cache).logits
-        cached_logits = mx.concatenate([first_logits, second_logits], axis=1)
-        mx.eval(full_logits, cached_logits)
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
 
         self.assertEqual(full_logits.shape, (1, 4, config.embedding_size))
-        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
         self.assertEqual(config.mlp_hidden_size, config.mlp_ratio * config.d_model)
 
         model_module, model_type = get_model_and_args(config.to_dict())

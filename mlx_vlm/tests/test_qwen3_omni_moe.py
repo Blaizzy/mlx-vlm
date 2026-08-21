@@ -252,6 +252,61 @@ class Qwen3OmniMoeTest(unittest.TestCase):
             bool(mx.allclose(batch[1:2], solo_text, rtol=1e-4, atol=1e-5).item())
         )
 
+    def _thinker_logits(self, model, ids, cache, **kw):
+        x = ids if isinstance(ids, mx.array) else mx.array(ids, dtype=mx.int32)
+        out = model.thinker(x, cache=cache, **kw)
+        return out.logits if hasattr(out, "logits") else out
+
+    def _assert_prefill_decode_match(self, pre, step, pos):
+        a, b = pre.reshape(-1), step[:, -1].reshape(-1)
+        cosine = float((a * b).sum() / (mx.linalg.norm(a) * mx.linalg.norm(b) + 1e-9))
+        self.assertGreater(cosine, 0.999, f"decode diverges from prefill at pos {pos}")
+
+    def test_decode_continues_rope_positions_from_cache_offset(self):
+        # Prefill and step-by-step decode of the same text tokens must agree.
+        # get_rope_index restarts positions at 0 on every call, so without
+        # cache-offset-aware positions each decoded token collapses to RoPE
+        # position 0 and diverges from prefill (#1983).
+        from mlx_vlm.models.cache import make_prompt_cache
+
+        model = _tiny_model()
+        inner = model.thinker.language_model.model
+        ids = [20, 21, 22, 23, 24, 25, 26, 27]
+        pre = self._thinker_logits(model, [ids], make_prompt_cache(inner))
+        cache = make_prompt_cache(inner)
+        for pos, tok in enumerate(ids):
+            step = self._thinker_logits(model, [[tok]], cache)
+            self._assert_prefill_decode_match(pre[:, pos], step, pos)
+
+    def test_decode_continues_rope_positions_multimodal(self):
+        # After an image+text prefill, decoded text tokens must continue mRoPE
+        # positions from the cache offset (via rope_deltas), matching a single
+        # full prefill of image+text+continuation (#1983).
+        from mlx_vlm.models.cache import make_prompt_cache
+
+        model = _tiny_vision_model()
+        inner = model.thinker.language_model.model
+        img_ids, pixel_values, grid = _image_inputs()
+        cont = [30, 31, 32, 33]
+        prefix_len = img_ids.shape[1]
+        full = mx.concatenate([img_ids, mx.array([cont], dtype=mx.int32)], axis=1)
+        pre = self._thinker_logits(
+            model,
+            full,
+            make_prompt_cache(inner),
+            pixel_values=pixel_values,
+            image_grid_thw=grid,
+        )
+        cache = make_prompt_cache(inner)
+        self._thinker_logits(
+            model, img_ids, cache, pixel_values=pixel_values, image_grid_thw=grid
+        )
+        for i, tok in enumerate(cont):
+            step = self._thinker_logits(model, [[tok]], cache)
+            self._assert_prefill_decode_match(
+                pre[:, prefix_len + i], step, prefix_len + i
+            )
+
     def test_quant_predicate_forwarded_to_top_level_model(self):
         model = _tiny_model()
         predicate = model.quant_predicate
