@@ -746,6 +746,119 @@ class TestDropModulesWithoutWeights:
         assert "vision_tower" in caplog.text
         assert model.loaded_strict is True
 
+    def test_keeps_module_declared_in_manifest_but_not_loaded(self):
+        # The manifest claims vision weights but none loaded (missing shard or a
+        # rename/sanitize bug). The tower must be kept so strict fails loudly
+        # instead of silently degrading the checkpoint to text-only (#1963).
+        model = self.FakeModel()
+        weights = {"language_model.weight": mx.zeros((2, 2))}
+        declared = {
+            "language_model.weight",
+            "vision_tower.weight",
+            "vision_tower.bias",
+        }
+
+        _drop_modules_without_weights(model, weights, declared)
+
+        assert model.vision_tower is not None
+        with pytest.raises(ValueError, match="Missing"):
+            model.load_weights(list(weights.items()), strict=True)
+
+    def test_drops_module_absent_from_manifest(self, caplog):
+        # The manifest also omits vision -> an intentional text-only conversion.
+        model = self.FakeModel()
+        weights = {"language_model.weight": mx.zeros((2, 2))}
+        declared = {"language_model.weight"}
+
+        with caplog.at_level(logging.WARNING):
+            _drop_modules_without_weights(model, weights, declared)
+
+        assert model.vision_tower is None
+        assert "vision_tower" in caplog.text
+
+    def test_load_model_prunes_when_config_still_advertises_vision(self, caplog):
+        # Text-only conversions on the Hub keep a populated vision_config while
+        # shipping no vision weights and no manifest entry for them; the tower
+        # must still be dropped so the checkpoint loads (regression for #1958).
+        class FakeConfig:
+            @classmethod
+            def from_dict(cls, config):
+                return cls()
+
+        class FakeModel(self.FakeModel):
+            def load_weights(self, weights, strict=True):
+                self.loaded_weights = weights
+                self.loaded_strict = strict
+
+        fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeModel)
+        weights = {"language_model.weight": mx.zeros((2, 2))}
+
+        with (
+            patch(
+                "mlx_vlm.utils.load_config",
+                return_value={
+                    "model_type": "fake",
+                    "vision_config": {"hidden_size": 8, "num_hidden_layers": 2},
+                },
+            ),
+            patch(
+                "mlx_vlm.utils.glob.glob",
+                return_value=["/tmp/model/model.safetensors"],
+            ),
+            patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+            patch(
+                "mlx_vlm.utils.get_model_and_args",
+                return_value=(fake_model_class, "fake"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            model = load_model(Path("/tmp/model"), lazy=True)
+
+        assert model.vision_tower is None
+        assert model.loaded_strict is True
+
+    def test_load_model_errors_when_manifest_shard_missing(self, tmp_path):
+        # End-to-end: the index declares vision weights but the shard is absent.
+        # load_model must keep the tower and let the strict load fail loudly.
+        (tmp_path / "model.safetensors").write_bytes(b"")
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "language_model.weight": "model.safetensors",
+                        "vision_tower.weight": "model-vision.safetensors",
+                        "vision_tower.bias": "model-vision.safetensors",
+                    }
+                }
+            )
+        )
+
+        class FakeConfig:
+            @classmethod
+            def from_dict(cls, config):
+                return cls()
+
+        # real nn.Module.load_weights -> strict failure surfaces
+        fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=self.FakeModel)
+        weights = {"language_model.weight": mx.zeros((2, 2))}
+
+        with (
+            patch(
+                "mlx_vlm.utils.load_config",
+                return_value={
+                    "model_type": "fake",
+                    "vision_config": {"hidden_size": 8, "num_hidden_layers": 2},
+                },
+            ),
+            patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+            patch(
+                "mlx_vlm.utils.get_model_and_args",
+                return_value=(fake_model_class, "fake"),
+            ),
+            pytest.raises(ValueError, match="Missing"),
+        ):
+            load_model(tmp_path, lazy=True)
+
 
 def test_load_safetensors_reinterprets_f8_e8m0_header(tmp_path):
     path = tmp_path / "model.safetensors"
