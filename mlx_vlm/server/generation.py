@@ -739,16 +739,20 @@ class GenerationArguments:
 def _config_from_args(args: "GenerationArguments") -> SamplingConfig:
     """Build the per-row sampling config admitted with a request."""
     return SamplingConfig(
-        temperature=args.temperature,
         top_p=args.top_p,
         # Canonicalise the "disabled" spellings: the sampler reads any top_k <= 0
         # as off, but SamplingConfig is compared by value and the server batches
         # rows by config equality, so -1 and 0 must not look like two setups.
         top_k=max(0, int(args.top_k)),
+        # Same argument for the other spellings that mean "off": a negative
+        # min_p keeps everything and a negative temperature is greedy, exactly
+        # as 0.0 does for both, so they must not compare unequal and split a
+        # batch that could have run together.
+        min_p=max(0.0, float(args.min_p)),
+        temperature=max(0.0, float(args.temperature)),
         # Same reason: anything outside (0, 1) disables typical-p, so collapse
         # the spellings to one value or two identical setups compare unequal.
         typical_p=(args.typical_p if 0.0 < args.typical_p < 1.0 else 1.0),
-        min_p=args.min_p,
         seed=DEFAULT_SEED if args.seed is None else int(args.seed),
         top_n_sigma=args.top_n_sigma,
         p_less=args.p_less,

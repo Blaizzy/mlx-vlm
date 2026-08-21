@@ -226,8 +226,8 @@ def batched_row_sample(
         modes_keep = _new_modes_keep(work, safe_t, ns, pl, tp)  # [B, V] original
         # Backstop, and unreachable today: now that the modes chain sequentially
         # each one keeps at least the best token the previous left, so the mask
-        # cannot empty (searched 14,160 row x mode-config combinations, zero
-        # empty). Kept because the failure it prevents is silent and severe -- an
+        # cannot empty (the checked-in sweep re-verifies 4,960 row x mode-config
+        # combinations, zero empty). Kept because the failure it prevents is silent and severe -- an
         # all -inf row makes the rank-0 floor "keep" a -inf entry and the
         # categorical draw returns a uniformly random token -- and a fourth mode
         # added later would reintroduce the risk. Tested by forcing the mask

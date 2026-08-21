@@ -117,9 +117,12 @@ def test_topk_one_is_deterministic_argmax():
 
 
 def test_topk_restricts_to_topk_indices():
-    # distinct logits: only the top-3 indices may ever be sampled.
+    # Distinct logits: only the top-3 indices may ever be sampled. n is large
+    # on purpose -- the tail carries 0.25% of the mass here, so at the default
+    # 256 draws this assertion held ~53% of the time with the top_k filter
+    # deleted entirely. At n=1024 the unfiltered row reaches index 3.
     lp = mx.array([[10.0, 8.0, 6.0, 4.0, 2.0, 0.0]])
-    assert _sampled_set(lp, top_k=3, temperature=1.0) <= {0, 1, 2}
+    assert _sampled_set(lp, top_k=3, temperature=1.0, n=1024) <= {0, 1, 2}
 
 
 def test_topk_exactly_k_rank_cutoff_not_value_threshold_on_ties():

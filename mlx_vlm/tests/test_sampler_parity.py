@@ -82,9 +82,13 @@ _REAL_ARGSORT = mx.argsort
 #    members: log_softmax([3,3,3,3,0,-1,-2,-3]) at top_p=0.5 keeps {0,1,2} here
 #    and {1,2,3} upstream. An earlier version of this note claimed float32 was
 #    safe and that "the strict sweeps run in float32" made it a non-issue. That
-#    was wrong. Rare on random rows (0 of 600) and constant on quantized or
-#    rounded logits. Jittering the ties away restores exact parity, which is how
-#    the mechanism was confirmed.
+#    was wrong. Rare on random float32 rows (0 of 600) and constant on quantized
+#    or rounded logits. Reduced precision makes it common rather than rare,
+#    because a short mantissa produces exact duplicates: measured at top_p=0.9,
+#    28% of bfloat16 rows and 5% of float16 rows differ, against 2.3% and 0.6%
+#    once rows with a tie on the cutoff are excluded -- so most of the reduced-
+#    precision difference is this entry, not entry 5. Jittering the ties away
+#    restores exact parity, which is how the mechanism was confirmed.
 #
 # 4. min_p EXACTLY ON THE BOUNDARY. Upstream's _apply_min_p is @mx.compile'd,
 #    and the compiled kernel drops a token whose logprob equals
@@ -94,10 +98,33 @@ _REAL_ARGSORT = mx.argsort
 #    against make_sampler's intent. Needs an exact-boundary coincidence: 0 of
 #    1,800 random rows, but a Zipf row hits it every time at min_p=0.01.
 #
-# 5. REDUCED PRECISION beyond tie ordering. In float16/bfloat16, p_less and
-#    typical_p differ systematically, not just at ties, because the statistics
-#    they compute (collision probability, entropy) are accumulated at different
-#    widths on each side. The strict sweeps therefore run in float32.
+# 5. REDUCED PRECISION beyond tie ordering, in the MODES *and* the RANK
+#    FILTERS. In float16/bfloat16, p_less and typical_p differ systematically
+#    because the statistics they compute (collision probability, entropy)
+#    accumulate at different widths on each side. The rank filters drift too,
+#    on rows with no tie at all: the nucleus cutoff is an accumulated sum, and a
+#    token can sit within ~5e-5 of it. Measured on tie-free rows, top_p=0.9:
+#    1 of 155 float16 rows and 2 of 86 bfloat16 rows land differently, always by
+#    a single token at the low-mass edge. Compounding it, this upcasts bfloat16
+#    to float32 (ar.py, batched_row_sample) and make_sampler upcasts neither, so
+#    the two are not even computing at the same width. Deliberate -- float16
+#    logprobs overflow mx.std for any real vocab -- and the more correct of the
+#    two, but a divergence. The strict sweeps therefore run in float32.
+
+# 8. min_p OUTSIDE [0, 1]. make_sampler raises
+#    ValueError("`min_p` has to be a float in the [0, 1] interval") for a
+#    negative or above-1 min_p; this accepts both -- negative keeps everything,
+#    above-1 collapses the row to its argmax. Same server-robustness reasoning
+#    as entry 6, and reachable from an ordinary request, because the schemas
+#    carry no bounds (deliberately -- see 760577a7).
+#    Worth stating plainly for a reviewer: on main this parameter was inert.
+#    main's _make_sampler passes only temp and top_p to make_sampler and never
+#    forwards min_p at all, so main silently ignored min_p=1.5 and sampled
+#    normally. Honouring in-range min_p is the feature; min_p > 1 becoming
+#    greedy is its fallout. _config_from_args canonicalises min_p < 0 to 0.0 so
+#    the disabled spellings do not split a batch, but it deliberately does NOT
+#    clamp min_p > 1, because that value is not a spelling of "off" -- it is a
+#    distinct (if unusual) request.
 #
 # 6. top_k OUTSIDE ITS DOMAIN. make_sampler raises for top_k >= vocab_size
 #    (apply_top_k validates 0 < top_k < vocab_size); this treats any top_k at or
@@ -334,6 +361,25 @@ def test_typical_p_after_another_mode_stays_well_defined():
     cfg = SamplingConfig(temperature=1.0, top_n_sigma=1.0, typical_p=0.5, seed=1)
     ours = _sampler_keep(lp, cfg)
     assert ours, "chained modes emptied the row"
+
+    # Pin the exact set. Non-emptiness and a subset relation both hold even with
+    # the NaN-safe entropy guard removed, so they cannot detect its loss -- and
+    # that guard changes the answer on 26.5% of chained-mode combinations,
+    # including this one. The oracle is upstream's own typical_p run on the
+    # stage-1 output with the -inf entries dropped rather than multiplied in,
+    # which is the entropy make_sampler meant to compute.
+    survivors = [i for i, v in enumerate(stage1.tolist()) if v != NEG_INF]
+    # NOT renormalized: the chain normalizes once on entry, before the modes,
+    # so typical_p sees the masked row's residual mass -- which is exactly what
+    # dropping the -inf terms from upstream's sums computes.
+    compact = mx.array([stage1.tolist()[i] for i in survivors], dtype=mx.float32)
+    expected = {
+        survivors[j]
+        for j, v in enumerate(apply_typical_p(compact, 0.5).tolist())
+        if v != NEG_INF
+    }
+    assert ours == expected, f"NaN-safe entropy drifted: {ours ^ expected}"
+
     # Chaining only removes, so the result stays inside the first mode's set.
     assert ours <= _reference_keep(
         lp, SamplingConfig(temperature=1.0, top_n_sigma=1.0, seed=1)
@@ -431,24 +477,65 @@ def test_raw_logits_are_normalized_before_the_rank_filters(top_p):
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-def test_reduced_precision_matches_where_no_tie_straddles_the_cutoff(dtype):
-    """KNOWN_DIVERGENCE 2: reduced precision may reorder ties at the boundary.
+def test_reduced_precision_drift_is_rare_and_bounded(dtype):
+    """KNOWN_DIVERGENCE 5, asserted as a bound rather than as absence.
 
-    Assert equality on rows whose reference cutoff has no duplicate value on the
-    boundary, so a genuine semantic drift still fails here.
+    An earlier version of this test skipped rows with a tie on the cutoff and
+    asserted exact equality on the rest -- which passed only because keys 0-29
+    happen to contain no drifting row. Sweep a wide key range instead, and
+    assert what is actually true: drift is rare, and when it happens it moves
+    one token at the low-mass edge, never more.
     """
-    checked = 0
-    for key in range(30):
-        lp = _row(256, key=key, dtype=dtype)
-        cfg = SamplingConfig(temperature=0.7, top_p=0.9, seed=1)
-        ref = _reference_keep(lp.astype(mx.float32), cfg)
-        vals = lp.astype(mx.float32).tolist()
-        boundary = min((vals[i] for i in ref), default=None)
-        if boundary is None or sum(1 for v in vals if v == boundary) != 1:
-            continue  # a tie sits on the cutoff; skip, it is not a semantic case
+    cfg = SamplingConfig(temperature=0.7, top_p=0.9, seed=1)
+    checked = drifted = 0
+    for key in range(30, 200):
+        lp = _row(256, key=key, scale=2.5, dtype=dtype)
+        ref32 = lp.astype(mx.float32)
+        ref = _reference_keep(ref32, cfg)
+        if not ref:
+            continue
+        # Skip rows with a tie ON the cutoff -- that is entry 3's mechanism, and
+        # it dominates bfloat16 (28% of all rows) purely because its mantissa is
+        # short enough to make exact duplicates common. What is under test here
+        # is entry 5: accumulation drift on rows with no tie at all.
+        vals = ref32.tolist()
+        boundary = min(vals[i] for i in ref)
+        if sum(1 for v in vals if v == boundary) != 1:
+            continue
         checked += 1
-        assert _sampler_keep(lp, cfg) == ref, f"dtype={dtype} key={key}"
-    assert checked >= 10, f"only {checked} tie-free rows exercised"
+        ours = _sampler_keep(lp, cfg)
+        if ours != ref:
+            drifted += 1
+            assert abs(len(ours) - len(ref)) <= 1, (
+                f"{dtype} key={key}: drift moved {abs(len(ours) - len(ref))} tokens, "
+                "which is no longer edge-of-nucleus rounding"
+            )
+    assert checked >= 50, f"only {checked} tie-free rows exercised"
+    assert (
+        drifted <= checked // 10
+    ), f"{drifted}/{checked} tie-free rows drifted -- systematic, not rounding"
+
+
+def test_min_p_out_of_domain_is_accepted_where_make_sampler_raises():
+    """KNOWN_DIVERGENCE 8, and it is reachable: the schemas carry no bounds.
+
+    make_sampler raises for min_p outside [0, 1]. This accepts both spellings --
+    negative keeps everything, above-1 collapses to the argmax -- rather than
+    letting one request fail the whole co-batched round.
+    """
+    lp = _row(64, key=1)
+    argmax = int(mx.argmax(lp, axis=-1))
+
+    for bad in (-0.5, 1.5):
+        with pytest.raises(ValueError):
+            apply_min_p(lp, bad)
+
+    assert _sampler_keep(
+        lp, SamplingConfig(temperature=0.8, min_p=-0.5, seed=1)
+    ) == set(range(64))
+    assert _sampler_keep(lp, SamplingConfig(temperature=0.8, min_p=1.5, seed=1)) == {
+        argmax
+    }
 
 
 @pytest.mark.parametrize("filters", RANK_FILTERS, ids=lambda f: repr(sorted(f.items())))
@@ -503,11 +590,27 @@ def test_temperature_edges_are_greedy_here(temperature):
     """KNOWN_DIVERGENCE 7. Reachable now that the schemas carry no bounds."""
     lp = _row(256, key=4)
     argmax = int(mx.argmax(lp, axis=-1))
-    cfg = SamplingConfig(temperature=temperature, top_p=0.9, seed=1)
+    # Two rows, only one of them greedy. At batch size 1 _draw's all-greedy fast
+    # path fires before batched_row_sample is ever entered, so a single-row test
+    # here passes without reaching the code the divergence is about.
+    cfgs = [
+        SamplingConfig(temperature=temperature, top_p=0.9, seed=1),
+        SamplingConfig(temperature=1.0, top_p=0.9, seed=2),
+    ]
+    rows = mx.stack([lp, lp])
+    calls = []
+    real = ar_module.batched_row_sample
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
     drawn = set()
-    for seed in range(8):
-        mx.random.seed(seed)
-        token = _PositionedTargetSampler([cfg])(lp[None])
-        mx.eval(token)
-        drawn.add(int(token[0]))
+    with patch.object(ar_module, "batched_row_sample", spy):
+        for seed in range(8):
+            mx.random.seed(seed)
+            tokens = _PositionedTargetSampler(cfgs)(rows)
+            mx.eval(tokens)
+            drawn.add(int(tokens[0]))
+    assert calls, "the greedy fast path short-circuited before the code under test"
     assert drawn == {argmax}
