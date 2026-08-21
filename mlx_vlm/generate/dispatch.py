@@ -29,10 +29,13 @@ from .common import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
     DEFAULT_MAX_TOKENS,
+    DEFAULT_MIN_P,
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
     DEFAULT_REPETITION_CONTEXT_SIZE,
     DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_K,
+    DEFAULT_TOP_P,
     GenerationResult,
     generation_stream,
     wired_limit,
@@ -337,6 +340,26 @@ def parse_arguments():
         type=float,
         default=DEFAULT_TEMPERATURE,
         help="Temperature for sampling.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=DEFAULT_TOP_P,
+        help="Nucleus sampling: keep the smallest set of tokens whose "
+        "probabilities sum to this. 1.0 disables it.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=DEFAULT_TOP_K,
+        help="Keep only the k most probable tokens. 0 disables it.",
+    )
+    parser.add_argument(
+        "--min-p",
+        type=float,
+        default=DEFAULT_MIN_P,
+        help="Drop tokens whose probability is below this fraction of the "
+        "most probable token's. 0 disables it.",
     )
     parser.add_argument(
         "--repetition-penalty",
@@ -1425,6 +1448,9 @@ def main():
             stream_kwargs = {
                 "max_tokens": args.max_tokens,
                 "temperature": args.temperature,
+                "top_p": args.top_p,
+                "top_k": args.top_k,
+                "min_p": args.min_p,
                 "repetition_penalty": args.repetition_penalty,
                 "repetition_context_size": args.repetition_context_size,
                 "presence_penalty": args.presence_penalty,
@@ -1469,6 +1495,9 @@ def main():
             "video": args.video,
             "fps": args.fps,
             "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "min_p": args.min_p,
             "max_tokens": args.max_tokens,
             "repetition_penalty": args.repetition_penalty,
             "repetition_context_size": args.repetition_context_size,
