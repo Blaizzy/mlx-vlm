@@ -2,11 +2,14 @@ import mlx.core as mx
 import pytest
 
 from mlx_vlm.models.cache import (
+    ArraysCache,
     BatchPoolingCache,
     BatchRotatingKVCache,
     CacheList,
     KVCache,
     RotatingKVCache,
+    UnboundedKVCache,
+    make_prompt_cache,
 )
 
 
@@ -131,3 +134,107 @@ def test_batch_rotating_merge_skips_zero_length_backing_storage():
     assert merged.offset.tolist() == [0, 24]
     assert mx.all(merged.keys[0] == 0).item()
     assert mx.all(merged.values[0] == 0).item()
+
+
+# ---------------------------------------------------------------------------
+# make_prompt_cache honours max_kv_size for models that build their own cache
+# ---------------------------------------------------------------------------
+
+
+class _ZeroArg:
+    """The common shape: a uniform KV cache, built with no arguments."""
+
+    def make_cache(self):
+        return [KVCache(), KVCache()]
+
+
+class _Hybrid:
+    """Recurrent state interleaved with attention, as the hybrid models build."""
+
+    def make_cache(self):
+        return [ArraysCache(size=2), KVCache(), ArraysCache(size=2)]
+
+
+class _Nested:
+    def make_cache(self):
+        return [CacheList(KVCache(), ArraysCache(size=2))]
+
+
+class _AcceptsMaxSize:
+    def make_cache(self, max_size=None):
+        self.seen = max_size
+        return [RotatingKVCache(max_size=max_size or 999)]
+
+
+class _SwallowsKwargs:
+    """A bare ``**kwargs`` must not count as accepting the bound."""
+
+    def make_cache(self, **kwargs):
+        self.seen = kwargs
+        return [KVCache()]
+
+
+class _AlreadyTighter:
+    def make_cache(self):
+        return [RotatingKVCache(max_size=16)]
+
+
+class _NotBoundable:
+    def make_cache(self):
+        return [ArraysCache(size=2), ArraysCache(size=2)]
+
+
+def test_max_kv_size_bounds_a_zero_argument_make_cache():
+    cache = make_prompt_cache(_ZeroArg(), max_kv_size=64)
+    assert [type(c) for c in cache] == [RotatingKVCache, RotatingKVCache]
+    assert {c.max_size for c in cache} == {64}
+
+
+def test_max_kv_size_leaves_fixed_size_state_alone():
+    cache = make_prompt_cache(_Hybrid(), max_kv_size=64)
+    assert [type(c).__name__ for c in cache] == [
+        "ArraysCache",
+        "RotatingKVCache",
+        "ArraysCache",
+    ]
+    assert cache[1].max_size == 64
+
+
+def test_max_kv_size_recurses_into_cache_list():
+    cache = make_prompt_cache(_Nested(), max_kv_size=64)
+    inner = list(cache[0].caches)
+    assert isinstance(inner[0], RotatingKVCache) and inner[0].max_size == 64
+    assert type(inner[1]).__name__ == "ArraysCache"
+
+
+def test_max_kv_size_is_passed_to_a_make_cache_that_accepts_it():
+    model = _AcceptsMaxSize()
+    cache = make_prompt_cache(model, max_kv_size=64)
+    assert model.seen == 64
+    assert cache[0].max_size == 64
+
+
+def test_bare_kwargs_does_not_count_as_accepting_the_bound():
+    model = _SwallowsKwargs()
+    cache = make_prompt_cache(model, max_kv_size=64)
+    assert not getattr(model, "seen", None)
+    assert isinstance(cache[0], RotatingKVCache) and cache[0].max_size == 64
+
+
+def test_a_tighter_existing_bound_is_kept():
+    cache = make_prompt_cache(_AlreadyTighter(), max_kv_size=64)
+    assert cache[0].max_size == 16
+
+
+def test_unboundable_cache_raises_instead_of_ignoring_the_request():
+    with pytest.raises(UnboundedKVCache, match="max_kv_size=64"):
+        make_prompt_cache(_NotBoundable(), max_kv_size=64)
+
+
+def test_no_bound_requested_leaves_the_model_cache_untouched():
+    assert [type(c) for c in make_prompt_cache(_ZeroArg())] == [KVCache, KVCache]
+    assert [type(c).__name__ for c in make_prompt_cache(_Hybrid())] == [
+        "ArraysCache",
+        "KVCache",
+        "ArraysCache",
+    ]
