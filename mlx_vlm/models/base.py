@@ -301,7 +301,7 @@ def _turboquant_attention_applies(cache) -> bool:
         return True
     if not cache.is_single_row():
         return False
-    return bool((cache.left_padding == 0).all().item())
+    return cache.fused_attention_eligible
 
 
 def scaled_dot_product_attention(

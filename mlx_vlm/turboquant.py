@@ -6363,7 +6363,20 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         self.value_codec = None
         self.left_padding = mx.array(left_padding)
         self.offset = mx.array([-lp for lp in left_padding])
+        self._fused_attention_eligible = (
+            len(left_padding) == 1 and left_padding[0] == 0
+        )
         self._idx = 0
+
+    def _refresh_fused_attention_eligibility(self):
+        """Refresh the host-side fused-kernel guard after batch mutation.
+
+        Reading MLX state synchronizes the device, so lifecycle operations do
+        it once and decode only reads the cached Python boolean.
+        """
+        self._fused_attention_eligible = self.batch_size == 1 and bool(
+            (self.left_padding == 0).all().item()
+        )
 
     # ------------------------------------------------------------------
     # Codec initialisation (deferred until first update)
@@ -6464,6 +6477,7 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
                 self.values = _map_state(self.values, _trim)
             self._idx -= min_lp
             self.left_padding -= min_lp
+        self._refresh_fused_attention_eligibility()
 
     def zero_row_tail(self, batch_index: int, start: int, end: int):
         self.keys = _zero_state_row_tail(self.keys, batch_index, start, end)
@@ -6473,6 +6487,7 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         if self.keys is None and other.keys is None:
             self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
             self.offset = mx.concatenate([self.offset, other.offset])
+            self._refresh_fused_attention_eligibility()
             return
 
         max_idx = max(self._idx, other._idx)
@@ -6497,18 +6512,21 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         if r_self is None and r_other is None:
             self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
             self.offset = mx.concatenate([self.offset, other.offset])
+            self._refresh_fused_attention_eligibility()
             return
         if r_self is None:
             self.keys, self.values, so, slp = r_other
             self.offset = mx.concatenate([self.offset, so])
             self.left_padding = mx.concatenate([self.left_padding + max_idx, slp])
             self._idx = max_idx
+            self._refresh_fused_attention_eligibility()
             return
         if r_other is None:
             self.keys, self.values, so, slp = r_self
             self.offset = mx.concatenate([so, other.offset])
             self.left_padding = mx.concatenate([slp, other.left_padding + max_idx])
             self._idx = max_idx
+            self._refresh_fused_attention_eligibility()
             return
 
         sk, sv, so, slp = r_self
@@ -6519,6 +6537,7 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         self.offset = mx.concatenate([so, oo])
         self.left_padding = mx.concatenate([slp, olp])
         self._idx = max_idx
+        self._refresh_fused_attention_eligibility()
 
     # ------------------------------------------------------------------
     # Dequantize (for attention fallback)
@@ -6590,6 +6609,7 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         self.keys, self.values, self.offset, self.left_padding = val
         if self.keys is not None:
             self._idx = _state_length(self.keys)
+        self._refresh_fused_attention_eligibility()
 
     @property
     def meta_state(self):
@@ -6626,6 +6646,10 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
     @property
     def batch_size(self):
         return int(self.left_padding.shape[0])
+
+    @property
+    def fused_attention_eligible(self):
+        return self._fused_attention_eligible
 
     def is_single_row(self):
         return self.batch_size == 1

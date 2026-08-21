@@ -85,6 +85,23 @@ class TestFusedPathGuard:
         cache, _, _ = _filled([3], 8)
         assert not _turboquant_attention_applies(cache)
 
+    def test_cached_eligibility_tracks_batch_lifecycle(self):
+        cache = BatchTurboQuantKVCache([0], bits=BITS)
+        other = BatchTurboQuantKVCache([0], bits=BITS)
+        assert cache.fused_attention_eligible
+
+        cache.extend(other)
+        assert not cache.fused_attention_eligible
+        assert not _turboquant_attention_applies(cache)
+
+        cache.filter(mx.array([0]))
+        assert cache.fused_attention_eligible
+        assert _turboquant_attention_applies(cache)
+
+        cache.state = BatchTurboQuantKVCache([2], bits=BITS).state
+        assert not cache.fused_attention_eligible
+        assert not _turboquant_attention_applies(cache)
+
 
 class TestNumericalEquivalence:
     """The fused path must agree with the dequantizing fallback."""
