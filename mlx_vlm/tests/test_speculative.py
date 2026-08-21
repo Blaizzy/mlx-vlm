@@ -3580,3 +3580,115 @@ def test_split_glm4_moe_lite_mtp_flattens_nextn_layer(tmp_path):
     assert out["model.mtp_block.mlp.gate.e_score_correction_bias"].dtype == mx.float32
     # non-parameter buffers are dropped
     assert not any(k.endswith("rotary_emb.inv_freq") for k in out)
+
+
+def _tiny_qwen3_5_quant_model(full_attention_interval=2, num_hidden_layers=2):
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.hidden_size = 64
+    text_config.intermediate_size = 128
+    text_config.num_hidden_layers = num_hidden_layers
+    text_config.num_attention_heads = 2
+    text_config.num_key_value_heads = 1
+    text_config.head_dim = 32
+    text_config.full_attention_interval = full_attention_interval
+    model_config = qwen_language.ModelConfig(
+        text_config=text_config,
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        model_type="qwen3_5",
+        image_token_id=101,
+        video_token_id=102,
+        image_token_index=101,
+        video_token_index=102,
+        vision_start_token_id=100,
+        vision_end_token_id=103,
+        vocab_size=text_config.vocab_size,
+    )
+    return qwen_language.LanguageModel(text_config, config=model_config), text_config
+
+
+def test_qwen3_5_mtp_verify_supports_native_quantized_batch_cache():
+    # Native uniform 4-bit KV returns (packed, scales, biases) tuples; target
+    # verification must not assume plain arrays (regression for #1986).
+    model, text_config = _tiny_qwen3_5_quant_model()
+
+    arrays = ArraysCache(size=2)
+    arrays.left_padding = mx.array([0, 0], dtype=mx.int32)
+    quantized = BatchQuantizedKVCache([0, 0], group_size=32, bits=4)
+    prompt_cache = [arrays, quantized]
+
+    prompt = mx.array([[1, 2, 3], [4, 5, 6]], dtype=mx.int32)
+    model(prompt, cache=prompt_cache)
+
+    verify = mx.array([[7, 8, 9], [10, 11, 12]], dtype=mx.int32)
+    hidden, shared_kv, rollback_state = model.speculative_verify_hidden(
+        verify, prompt_cache
+    )
+    mx.eval(hidden, prompt_cache[1].state)
+
+    assert hidden.shape == (2, 3, text_config.hidden_size)
+    assert rollback_state is not None
+    assert quantized._idx == 6
+    assert quantized.offset.tolist() == [6, 6]
+
+    accepted = model.rollback_speculative_cache(
+        prompt_cache, rollback_state, mx.array([0, 1]), block_size=3
+    )
+    mx.eval(prompt_cache[1].state)
+
+    assert accepted == 1
+    assert quantized._idx == 5
+    assert quantized.offset.tolist() == [4, 5]
+    assert quantized.left_padding.tolist() == [1, 0]
+
+
+def test_qwen3_5_rollback_speculative_cache_handles_native_quantized_batch_kv():
+    cache = BatchQuantizedKVCache([0, 0], group_size=32, bits=4)
+    cache.update_and_fetch(
+        mx.random.normal((2, 1, 7, 32)), mx.random.normal((2, 1, 7, 32))
+    )
+
+    qwen_language.LanguageModel.rollback_speculative_cache(
+        None, [cache], [], mx.array([0, 2]), block_size=5
+    )
+
+    mx.eval(cache.keys, cache.values, cache.offset)
+    assert cache._idx == 5
+    assert cache.offset.tolist() == [3, 5]
+    assert cache.left_padding.tolist() == [2, 0]
+
+
+def test_qwen3_5_native_quantized_batch_no_cross_row_contamination():
+    # All-full-attention so every layer uses a quantized batch cache and a decode
+    # step exercises the fixed verify + ragged rollback end-to-end. A target row
+    # that accepted fewer tokens than its neighbors (so rollback rolls its tail
+    # into left-padding) must be unaffected by neighbor CONTENT -- guards against
+    # the quantized ragged path leaking rejected/other-row state (#1986).
+    model, _ = _tiny_qwen3_5_quant_model(full_attention_interval=1)
+    B, L = 3, 3
+
+    def decode_row0(neighbor_seed):
+        mx.random.seed(neighbor_seed)
+        neighbors = mx.random.randint(1, 31, (B - 1, 5)).tolist()
+        prompts = [[1, 2, 3]] + neighbors
+        T = max(len(p) for p in prompts)
+        lp = [T - len(p) for p in prompts]
+        tokens = [[0] * (T - len(p)) + list(p) for p in prompts]
+        cache = [
+            BatchQuantizedKVCache(list(lp), group_size=32, bits=4) for _ in range(2)
+        ]
+        model(mx.array(tokens, dtype=mx.int32), cache=cache)
+        verify = mx.array([[7, 8, 9]] * B, dtype=mx.int32)
+        _h, _s, rb = model.speculative_verify_hidden(verify, cache)
+        # target row accepts 0 (non-max); neighbors accept the max (L - 1)
+        model.rollback_speculative_cache(
+            cache, rb, mx.array([0] + [L - 1] * (B - 1)), block_size=L
+        )
+        out = model(mx.array([[7]] * B, dtype=mx.int32), cache=cache)
+        logits = (out.logits if hasattr(out, "logits") else out)[:, -1, :]
+        mx.eval(logits)
+        return logits[0]
+
+    a = decode_row0(1)
+    b = decode_row0(2)
+    assert bool(mx.all(mx.isfinite(a)).item())
+    assert float(mx.abs(a - b).max()) < 1e-4
