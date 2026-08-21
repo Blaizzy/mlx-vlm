@@ -55,6 +55,7 @@ DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
 # Below this, a row is greedy: make_sampler returns argmax at temperature 0.
 _GREEDY_EPS = 1e-5
+_INT32_MAX = 2**31 - 1
 
 
 def _get_batch_cache_eval_interval() -> int:
@@ -223,11 +224,14 @@ def batched_row_sample(
         pl = p_less if p_less is not None else mx.zeros((B,), dtype=mx.bool_)
         tp = typical_p if typical_p is not None else mx.ones((B,), mx.float32)
         modes_keep = _new_modes_keep(work, safe_t, ns, pl, tp)  # [B, V] original
-        # A row the modes reject entirely must not become an all -inf row: the
-        # rank-0 floor below would then "keep" a -inf entry and the categorical
-        # draw would return a uniformly random token from the whole vocabulary,
-        # silently. Fall back to that row's argmax, which is what a caller
-        # asking for an impossible combination should get.
+        # Backstop, and unreachable today: now that the modes chain sequentially
+        # each one keeps at least the best token the previous left, so the mask
+        # cannot empty (searched 14,160 row x mode-config combinations, zero
+        # empty). Kept because the failure it prevents is silent and severe -- an
+        # all -inf row makes the rank-0 floor "keep" a -inf entry and the
+        # categorical draw returns a uniformly random token -- and a fourth mode
+        # added later would reintroduce the risk. Tested by forcing the mask
+        # empty rather than by hoping a draw reaches it.
         rescued = mx.arange(V, dtype=mx.int32)[None, :] == mx.argmax(
             work, axis=-1, keepdims=True
         ).astype(mx.int32)
@@ -355,7 +359,15 @@ class _PositionedTargetSampler:
         base = (
             mx.array([x.temperature for x in c], dtype=mx.float32),
             mx.array([x.top_p for x in c], dtype=mx.float32),
-            mx.array([x.top_k for x in c], dtype=mx.int32),
+            # Clamped into int32: top_k has no upper bound on any request schema
+            # (main has none either), and mx.array(..., dtype=mx.int32) raises
+            # std::bad_cast above 2**31-1. That raise lands in the GPU worker's
+            # except handler, which fails every co-batched request, so one
+            # client could take down everyone else's in-flight generation.
+            # Any value at or above the vocab size means "keep everything".
+            mx.array(
+                [min(max(int(x.top_k), -1), _INT32_MAX) for x in c], dtype=mx.int32
+            ),
             mx.array([x.min_p for x in c], dtype=mx.float32),
         )
         if not self._uses_new_modes(c):

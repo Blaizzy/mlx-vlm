@@ -25,7 +25,12 @@ from unittest.mock import patch
 import mlx.core as mx
 import pytest
 
-from mlx_vlm.generate.ar import SamplingConfig, _PositionedTargetSampler
+from mlx_vlm.generate import ar as ar_module
+from mlx_vlm.generate.ar import (
+    SamplingConfig,
+    _new_modes_keep,
+    _PositionedTargetSampler,
+)
 from mlx_vlm.sample_utils import (
     apply_min_p,
     apply_p_less,
@@ -44,28 +49,34 @@ _REAL_ARGSORT = mx.argsort
 # --- KNOWN_DIVERGENCES -----------------------------------------------------
 #
 # Every entry is a deliberate, reviewed difference from make_sampler. Adding an
-# entry is a design decision, not a way to quiet a failure. A sweep over 120
-# mode x rank-filter x temperature combinations leaves exactly these two, with
-# nothing unexplained.
+# entry is a design decision, not a way to quiet a failure.
 #
 # 1. EMPTY ROWS. A rank filter chained after a mode can reject every token
 #    upstream -- apply_top_p compares cumulative mass against `1 - top_p` on a
-#    distribution whose mass no longer sums to 1. make_sampler then draws from an
-#    all -inf row, i.e. an arbitrary token. This keeps the top surviving token
-#    instead. Strictly better, and asserted as such below.
+#    distribution whose mass no longer sums to 1. make_sampler then draws from
+#    an all -inf row, i.e. an arbitrary token. This keeps the top surviving
+#    token instead, and the tests assert that shape rather than equality.
 #
-# 2. TWO OR MORE MODES AT ONCE. make_sampler chains the modes sequentially, so
-#    typical_p after another mode computes its entropy over `0 * -inf` terms:
-#    measured 485 NaN of 512 for typical_p composed after top_n_sigma, which then
-#    poisons the argsort that decides its cutoff. This computes each mode's
-#    statistics on the full distribution and intersects the masks, which is
-#    well defined. Replicating upstream here would mean importing NaN-dependent
-#    behaviour, so it is deliberately not replicated.
+# 2. typical_p CHAINED AFTER ANOTHER MODE. Upstream's chain feeds `0 * -inf`
+#    into typical_p's entropy sum (measured 485 NaN of 512 after top_n_sigma),
+#    which poisons the argsort that sets its cutoff. Those terms are dropped
+#    here instead of inherited. This is the ONLY mode combination that
+#    diverges: modes otherwise chain sequentially exactly as make_sampler's do,
+#    and test_two_modes_without_typical_p_match_make_sampler asserts equality
+#    for the pairs that do not involve typical_p.
 #
-# 3. Tie ordering at the cutoff in float16/bfloat16: upstream sorts ascending and
-#    this sorts descending, so equal-valued tokens straddling the threshold can
-#    fall on opposite sides. Not semantic. The strict sweeps run in float32 and
-#    the reduced-precision sweep skips rows with a tie on the boundary.
+# 3. INPUT NORMALIZATION. batched_row_sample log-normalizes its own input,
+#    because the speculative loops hand it raw lm_head logits while the AR path
+#    hands it logprobs, and exp() of an unnormalized row is not a probability
+#    vector. make_sampler does not normalize, so for an input whose exp-mass is
+#    not 1 -- a row a logits processor has already partly masked, say -- the two
+#    disagree. That is a deliberate trade: without it top_p silently stops
+#    filtering on every speculative request, which is the larger error.
+#
+# 4. Tie ordering at the cutoff in float16/bfloat16: upstream sorts ascending
+#    and this sorts descending, so equal-valued tokens straddling the threshold
+#    can fall on opposite sides. Not semantic. The strict sweeps run in float32
+#    and the reduced-precision sweep skips rows with a tie on the boundary.
 
 
 def _log_normalize(x):
@@ -295,21 +306,76 @@ def test_typical_p_after_another_mode_stays_well_defined():
     )
 
 
-def test_a_row_the_modes_reject_entirely_falls_back_to_its_argmax():
-    """An empty mask must not become an all -inf row.
+def test_the_chained_mode_mask_is_never_empty():
+    """The invariant that makes the all -inf row unreachable.
 
-    The rank-0 floor would "keep" a -inf entry and mx.random.categorical would
-    then return a uniformly random token from the whole vocabulary -- silently,
-    on parameter values the request schema documents as typical.
+    Each mode keeps at least the best token the previous one left, so chaining
+    cannot empty the mask. This is what actually protects the draw; the
+    argmax backstop in batched_row_sample is insurance against a fourth mode
+    being added later, not a live path.
     """
-    lp = _row(4096, key=3)
-    cfg = SamplingConfig(temperature=0.7, top_n_sigma=1.0, typical_p=0.3, seed=1)
+    empty = []
+    for key in range(40):
+        for scale in (0.5, 2.0, 8.0, 20.0):
+            for ns in (0.0, 0.5, 1.0, 2.0):
+                for pl in (False, True):
+                    for typ in (1.0, 0.5, 0.1, 0.01):
+                        if ns == 0.0 and not pl and typ >= 1.0:
+                            continue
+                        lp = _row(256, key=key, scale=scale)
+                        mask = _new_modes_keep(
+                            lp[None],
+                            mx.array([0.7]),
+                            mx.array([ns]),
+                            mx.array([pl]),
+                            mx.array([typ]),
+                        )
+                        mx.eval(mask)
+                        if int(mx.sum(mask)) == 0:
+                            empty.append((key, scale, ns, pl, typ))
+    assert not empty, f"chained mode mask emptied: {empty[:5]}"
+
+
+def test_an_empty_mode_mask_would_still_draw_a_real_token():
+    """Exercise the backstop directly instead of hoping a draw reaches it.
+
+    An all -inf row would make the rank-0 floor keep a -inf entry, and
+    mx.random.categorical would then return a uniformly random token from the
+    whole vocabulary -- silently. Force the mask empty and assert the argmax
+    comes out instead.
+    """
+    lp = _row(512, key=3)
     argmax = int(mx.argmax(lp, axis=-1))
-    draws = set()
-    for seed in range(8):
-        mx.random.seed(seed)
-        draws.add(int(_PositionedTargetSampler([cfg])(lp[None])[0]))
-    assert draws == {argmax}, f"expected the argmax fallback, drew {sorted(draws)[:8]}"
+    cfg = SamplingConfig(temperature=0.7, top_n_sigma=1.0, typical_p=0.3, seed=1)
+
+    def all_rejected(work, *args, **kwargs):
+        return mx.zeros(work.shape, dtype=mx.bool_)
+
+    drawn = set()
+    with patch.object(ar_module, "_new_modes_keep", all_rejected):
+        for seed in range(16):
+            mx.random.seed(seed)
+            token = _PositionedTargetSampler([cfg])(lp[None])
+            mx.eval(token)
+            drawn.add(int(token[0]))
+    assert drawn == {argmax}, f"backstop drew {sorted(drawn)[:8]} instead of {argmax}"
+
+
+@pytest.mark.parametrize("top_k", [2**31, 10**12, 10**18])
+def test_enormous_top_k_does_not_crash_the_worker(top_k):
+    """top_k has no upper bound on any request schema, here or on main.
+
+    Above int32 the per-row array build raises std::bad_cast, and that raise
+    lands in the GPU worker's except handler, which fails every co-batched
+    request -- so one client's absurd top_k would end everyone else's
+    in-flight generation.
+    """
+    lp = _row(256, key=1)
+    token = _PositionedTargetSampler(
+        [SamplingConfig(temperature=0.7, top_k=top_k, seed=1)]
+    )(lp[None])
+    mx.eval(token)
+    assert 0 <= int(token[0]) < 256
 
 
 @pytest.mark.parametrize("top_p", [0.5, 0.9])
