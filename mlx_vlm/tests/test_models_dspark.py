@@ -18,11 +18,10 @@ from mlx_vlm.speculative.drafters import (
     resolve_drafter_kind,
     validate_drafter_compatibility,
 )
-from mlx_vlm.speculative.drafters.qwen3_dspark import (
+from mlx_vlm.speculative.drafters.dspark import (
     DSparkDraftModel,
     ModelConfig,
-    validate_lfm2_dspark_target,
-    validate_qwen3_5_dspark_target,
+    validate_dspark_target,
 )
 from mlx_vlm.speculative.utils import run_speculative_rounds
 from mlx_vlm.utils import get_model_and_args
@@ -112,6 +111,7 @@ def _tiny_draft_config():
             "rms_norm_eps": 1e-5,
             "vocab_size": 32,
             "rope_theta": 10000.0,
+            "rope_is_neox_style": False,
             "max_position_embeddings": 128,
             "layer_types": ["full_attention"],
             "block_size": 3,
@@ -310,14 +310,18 @@ def _generated_tokens(target, prompt, drafter=None):
 
 def test_published_config_normalizes_dspark_gamma_to_verify_width():
     config = ModelConfig.from_dict(_published_config())
+    drafter = DSparkDraftModel(config)
 
+    assert config.model_type == "dspark"
+    assert config.backbone_model_type == "qwen3"
     assert config.proposal_length == 9
     assert config.block_size == 10
     assert config.runtime_block_size == 8
     assert config.target_layer_ids == [2, 9, 17, 21, 27]
     assert config.num_target_layers == 30
     assert config.markov_rank == 256
-    assert DSparkDraftModel.prefer_requested_block_size is True
+    assert config.block_size_policy == "fixed"
+    assert drafter.prefer_requested_block_size is True
 
 
 def test_published_qwen38_config_normalizes_dspark_contract_and_yarn():
@@ -339,10 +343,33 @@ def test_published_qwen38_config_normalizes_dspark_contract_and_yarn():
         "beta_slow": 1.0,
     }
     assert config.rope_is_neox_style is True
-    assert config.prefer_requested_block_size is False
+    assert config.block_size_policy == "adaptive"
     assert config.dflash_initial_block_size == 4
     assert drafter.prefer_requested_block_size is False
     assert drafter.rope.traditional is False
+
+
+def test_dspark_config_uses_explicit_rope_capability_not_architecture_name():
+    published = _published_config()
+    published.pop("rope_is_neox_style")
+    published["architectures"] = ["LfmNamedFutureDSparkModel"]
+
+    config = ModelConfig.from_dict(published)
+
+    assert config.rope_is_neox_style is True
+
+
+def test_dspark_block_policy_can_be_declared_by_any_checkpoint():
+    published = _published_config()
+    published["dflash_config"]["block_size_policy"] = "adaptive"
+    published["dflash_config"]["dflash_initial_block_size"] = 3
+
+    config = ModelConfig.from_dict(published)
+    drafter = DSparkDraftModel(config)
+
+    assert config.block_size_policy == "adaptive"
+    assert config.dflash_initial_block_size == 3
+    assert drafter.prefer_requested_block_size is False
 
 
 def test_published_lfm2_moe_dspark_config_preserves_target_layers():
@@ -383,13 +410,13 @@ def test_published_1_2b_dspark_accepts_matching_target_metadata():
         )
     )
 
-    validate_lfm2_dspark_target(config, target)
+    validate_dspark_target(config, target)
 
 
 def test_generic_loader_routes_markov_dflash_checkpoint_to_dspark(tmp_path):
     architecture, model_type = get_model_and_args(_published_config())
 
-    assert model_type == "qwen3_dspark"
+    assert model_type == "dspark"
     assert architecture.Model is DSparkDraftModel
 
     (tmp_path / "config.json").write_text(json.dumps(_published_config()))
@@ -400,21 +427,39 @@ def test_generic_loader_routes_qwen38_dspark_checkpoint(tmp_path):
     published = _published_qwen38_config()
     architecture, model_type = get_model_and_args(published)
 
-    assert model_type == "qwen3_dspark"
+    assert model_type == "dspark"
     assert architecture.Model is DSparkDraftModel
 
     (tmp_path / "config.json").write_text(json.dumps(published))
     assert resolve_drafter_kind(tmp_path) == "dflash"
 
 
-def test_dspark_requires_the_matching_lfm2_target():
+def test_generic_loader_routes_nested_markov_contract_to_dspark():
+    published = _published_qwen38_config()
+    published.pop("markov_rank")
+
+    architecture, model_type = get_model_and_args(published)
+
+    assert model_type == "dspark"
+    assert architecture.Model is DSparkDraftModel
+
+
+def test_dspark_requires_matching_target_structure():
     drafter = DSparkDraftModel(_tiny_draft_config())
     target = _tiny_target()
 
     validate_drafter_compatibility(target, drafter, "dflash")
-    target.language_model.config.model_type = "other"
-    with pytest.raises(ValueError, match="requires a supported LFM2 or Qwen3.5/3.8"):
+    target.language_model.config.hidden_size += 1
+    with pytest.raises(ValueError, match="target hidden-size mismatch"):
         validate_drafter_compatibility(target, drafter, "dflash")
+
+
+def test_dspark_target_validation_is_family_agnostic():
+    config = _tiny_draft_config()
+    target = _tiny_target()
+    target.language_model.config.model_type = "future_hybrid_model"
+
+    validate_dspark_target(config, target)
 
 
 def test_dspark_accepts_matching_lfm2_moe_target():
@@ -441,7 +486,7 @@ def test_published_qwen38_dspark_accepts_nested_target_metadata():
         )
     )
 
-    validate_qwen3_5_dspark_target(config, target)
+    validate_dspark_target(config, target)
 
 
 def test_dspark_accepts_matching_qwen38_target():
@@ -732,6 +777,39 @@ def test_greedy_dspark_generation_matches_qwen38_baseline():
 
     assert speculative == baseline
     assert drafter.draft_lens
+
+
+@pytest.mark.parametrize(
+    ("target_factory", "draft_config_factory"),
+    [
+        (_tiny_target, _tiny_draft_config),
+        (_tiny_qwen38_target, _tiny_qwen38_draft_config),
+    ],
+)
+def test_dspark_repeated_generation_resets_request_state(
+    target_factory,
+    draft_config_factory,
+):
+    mx.random.seed(31)
+    target = target_factory()
+    drafter = DSparkDraftModel(draft_config_factory())
+    mx.eval(target.parameters(), drafter.parameters())
+    prompt = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+
+    baseline = _generated_tokens(target, prompt)
+    first = _generated_tokens(target, prompt, drafter)
+    first_accept_lens = list(drafter.accept_lens)
+    first_draft_lens = list(drafter.draft_lens)
+
+    # These lists drive the adaptive controller and must describe one request,
+    # not lifetime state carried over from a previous generation.
+    drafter.accept_lens.append(999)
+    drafter.draft_lens.append(999)
+    second = _generated_tokens(target, prompt, drafter)
+
+    assert first == second == baseline
+    assert drafter.accept_lens == first_accept_lens
+    assert drafter.draft_lens == first_draft_lens
 
 
 def test_dspark_rejects_non_greedy_speculative_sampling():

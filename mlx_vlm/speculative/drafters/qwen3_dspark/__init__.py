@@ -1,8 +1,8 @@
-from .config import DSparkConfig as ModelConfig
-from .dspark import DSparkDraftModel
-from .dspark import DSparkDraftModel as Model
+"""Compatibility package; new code should import ``drafters.dspark``."""
+
+from ..dspark import DSparkDraftModel, Model, ModelConfig, VanillaMarkov
 from .dspark import (
-    VanillaMarkov,
+    validate_dspark_target,
     validate_lfm2_dspark_target,
     validate_qwen3_5_dspark_target,
 )
@@ -12,6 +12,7 @@ __all__ = [
     "Model",
     "ModelConfig",
     "VanillaMarkov",
+    "validate_dspark_target",
     "validate_lfm2_dspark_target",
     "validate_qwen3_5_dspark_target",
 ]
