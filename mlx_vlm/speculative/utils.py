@@ -72,6 +72,14 @@ def format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
     return _format_speculative_stats(draft_model)
 
 
+def _validate_speculative_sampling(draft_model: nn.Module, greedy: bool) -> None:
+    if getattr(draft_model, "requires_greedy_sampling", False) and not greedy:
+        raise ValueError(
+            f"{type(draft_model).__name__} supports greedy speculative decoding "
+            "only; set temperature=0."
+        )
+
+
 def get_speculative_rounds_batch(draft_kind: str):
     if draft_kind == "eagle3":
         return _eagle3_rounds_batch
@@ -139,6 +147,7 @@ def run_speculative_server_rounds(
     row_ids: Optional[List[int]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
+    _validate_speculative_sampling(draft_model, greedy_sampling)
 
     if draft_kind == "eagle3":
         if batch_size == 1:
@@ -249,6 +258,7 @@ def run_speculative_rounds(
     sampler_is_greedy: bool = False,
 ) -> Generator[Tuple[Any, mx.array], None, None]:
     B = input_ids.shape[0]
+    _validate_speculative_sampling(draft_model, sampler_is_greedy)
 
     if draft_kind == "mtp":
         shared_kv_states = last_outputs.shared_kv_states
