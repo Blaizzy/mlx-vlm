@@ -14,7 +14,11 @@ from .. import apc as _apc
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
-from ..speculative.utils import format_speculative_stats
+from ..speculative.utils import (
+    format_speculative_stats,
+    speculative_stats_since,
+    speculative_stats_snapshot,
+)
 from ..tokenizer_utils import make_streaming_detokenizer
 from ..utils import (
     StoppingCriteria,
@@ -732,6 +736,11 @@ def stream_generate(
     image_token_index = getattr(model.config, "image_token_index", None)
     vision_cache = kwargs.pop("vision_cache", None)
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
+    draft_model = kwargs.get("draft_model")
+    draft_kind = kwargs.get("draft_kind", "dflash")
+    draft_stats_start = (
+        speculative_stats_snapshot(draft_model) if draft_model is not None else None
+    )
     apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
     apc_tenant: Optional[str] = kwargs.pop("apc_tenant", None)
     image = image or None
@@ -1023,6 +1032,12 @@ def stream_generate(
             # generate_step exhausted its budget without stopping_criteria firing.
             finish_reason = "length"
 
+        draft_rounds = draft_n_accepted = draft_n = None
+        if draft_model is not None and draft_stats_start is not None:
+            draft_rounds, draft_n_accepted, draft_n = speculative_stats_since(
+                draft_model, draft_stats_start
+            )
+
         if not generated_tokens:
             prompt_time = time.perf_counter() - tic
             prompt_tps = total_prompt_tokens / prompt_time if prompt_time > 0 else 0.0
@@ -1038,6 +1053,10 @@ def stream_generate(
                 peak_memory=mx.get_peak_memory() / 1e9,
                 cached_tokens=reused_prefix_len,
                 finish_reason="length",
+                draft_kind=draft_kind if draft_rounds is not None else None,
+                draft_rounds=draft_rounds,
+                draft_n=draft_n,
+                draft_n_accepted=draft_n_accepted,
             )
             return
 
@@ -1054,6 +1073,10 @@ def stream_generate(
             peak_memory=mx.get_peak_memory() / 1e9,
             cached_tokens=reused_prefix_len,
             finish_reason=finish_reason,
+            draft_kind=draft_kind if draft_rounds is not None else None,
+            draft_rounds=draft_rounds,
+            draft_n=draft_n,
+            draft_n_accepted=draft_n_accepted,
         )
 
         # Save cache state for potential reuse on next turn
@@ -1207,6 +1230,10 @@ def generate(
         diffusion_work_tokens=last_response.diffusion_work_tokens,
         diffusion_canvas_tps=last_response.diffusion_canvas_tps,
         diffusion_work_tps=last_response.diffusion_work_tps,
+        draft_kind=last_response.draft_kind,
+        draft_rounds=last_response.draft_rounds,
+        draft_n=last_response.draft_n,
+        draft_n_accepted=last_response.draft_n_accepted,
     )
 
 
