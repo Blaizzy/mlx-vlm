@@ -11,9 +11,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
-from ..exact_speculative_verify import (
-    exact_speculative_verify_dense_available,
-)
+from ..exact_speculative_verify import exact_speculative_verify_dense_available
 from ..exact_speculative_verify import (
     exact_speculative_verify_weight as _target_verify_weight,
 )

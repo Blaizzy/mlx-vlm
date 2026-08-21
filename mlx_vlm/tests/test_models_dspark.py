@@ -16,6 +16,7 @@ from mlx_vlm.speculative.drafters import (
     validate_drafter_compatibility,
 )
 from mlx_vlm.speculative.drafters.qwen3_dspark import DSparkDraftModel, ModelConfig
+from mlx_vlm.speculative.drafters.qwen3_dspark.dspark import validate_lfm2_dspark_target
 from mlx_vlm.speculative.utils import run_speculative_rounds
 from mlx_vlm.utils import get_model_and_args
 
@@ -85,6 +86,18 @@ def _published_moe_config():
         "mask_token_id": 125017,
         "target_layer_ids": [2, 6, 10, 14, 18],
         "num_target_layers": 24,
+    }
+    return config
+
+
+def _published_1_2b_config():
+    config = _published_config()
+    config["vocab_size"] = 65536
+    config["rope_theta"] = 1000000.0
+    config["dflash_config"] = {
+        "mask_token_id": 64402,
+        "target_layer_ids": [2, 5, 8, 11, 14],
+        "num_target_layers": 16,
     }
     return config
 
@@ -179,6 +192,37 @@ def test_published_lfm2_moe_dspark_config_preserves_target_layers():
     assert config.target_layer_ids == [2, 6, 10, 14, 18]
     assert config.num_target_layers == 24
     assert config.rope_theta == 5000000.0
+
+
+def test_published_1_2b_dspark_config_preserves_target_contract():
+    config = ModelConfig.from_dict(_published_1_2b_config())
+
+    assert config.proposal_length == 9
+    assert config.block_size == 10
+    assert config.runtime_block_size == 8
+    assert config.target_layer_ids == [2, 5, 8, 11, 14]
+    assert config.num_target_layers == 16
+    assert config.vocab_size == 65536
+    assert config.mask_token_id == 64402
+    assert config.rope_theta == 1000000.0
+
+
+def test_published_1_2b_dspark_accepts_matching_target_metadata():
+    config = ModelConfig.from_dict(_published_1_2b_config())
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            config=SimpleNamespace(
+                model_type="lfm2",
+                hidden_size=2048,
+                num_hidden_layers=16,
+                vocab_size=65536,
+            ),
+            model=SimpleNamespace(layers=[object()] * 16),
+            rollback_speculative_cache=lambda *args: None,
+        )
+    )
+
+    validate_lfm2_dspark_target(config, target)
 
 
 def test_generic_loader_routes_markov_dflash_checkpoint_to_dspark(tmp_path):
