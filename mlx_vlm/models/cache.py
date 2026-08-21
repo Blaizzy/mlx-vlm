@@ -2163,8 +2163,9 @@ class BatchPoolingCache(_BaseCache):
     def __init__(self, ratio: int, left_padding: List[int]):
         self.ratio = ratio
 
-        if not all(p == 0 for p in left_padding):
-            raise RuntimeError("BatchPoolingCache does not support left padding")
+        if isinstance(left_padding, mx.array):
+            left_padding = left_padding.tolist()
+        self.left_padding = [int(p) for p in left_padding]
 
         batch_size = len(left_padding)
 
@@ -2184,7 +2185,22 @@ class BatchPoolingCache(_BaseCache):
 
     def prepare(self, *, lengths=None, right_padding=None, left_padding=None):
         if left_padding is not None:
-            raise RuntimeError("BatchPoolingCache does not support left padding")
+            if (
+                self.buf_kv is not None
+                or self.pooled is not None
+                or any(self.remainder)
+            ):
+                raise ValueError(
+                    "Left padding can only be added to an empty BatchPoolingCache"
+                )
+            if isinstance(left_padding, mx.array):
+                left_padding = left_padding.tolist()
+            if len(left_padding) != len(self.left_padding):
+                raise ValueError("Left padding must match the cache batch size")
+            self.left_padding = [
+                current + int(pad)
+                for current, pad in zip(self.left_padding, left_padding)
+            ]
         if lengths is not None:
             self._lengths = [
                 processed + length
@@ -2199,16 +2215,25 @@ class BatchPoolingCache(_BaseCache):
         _, _, D2 = gate.shape
         ratio = self.ratio
 
+        if not (
+            len(self.left_padding) == len(self._lengths) == len(self._processed) == B
+        ):
+            raise ValueError("Pooling cache metadata must match the input batch size")
+
         if self.buf_kv is None:
             self.buf_kv = mx.zeros((B, ratio, D1), dtype=kv.dtype)
             self.buf_gate = mx.zeros((B, ratio, D2), dtype=gate.dtype)
 
-        valid_lengths = [
-            min(length - processed, L)
-            for length, processed in zip(self._lengths, self._processed)
+        # Each row can start at a different physical position because prompt
+        # batches are left-padded. Only logical tokens participate in pooling.
+        starts = [min(pad, L) for pad in self.left_padding]
+        self.left_padding = [
+            pad - start for pad, start in zip(self.left_padding, starts)
         ]
-        if max(valid_lengths) != L:
-            raise RuntimeError()
+        valid_lengths = [
+            max(0, min(length - processed, L - start))
+            for length, processed, start in zip(self._lengths, self._processed, starts)
+        ]
         for i in range(B):
             self._processed[i] += valid_lengths[i]
 
@@ -2222,8 +2247,9 @@ class BatchPoolingCache(_BaseCache):
             for i in range(B):
                 r = self.remainder[i]
                 vl = valid_lengths[i]
-                self.buf_kv[i, r : r + vl] = kv[i, :vl]
-                self.buf_gate[i, r : r + vl] = gate[i, :vl]
+                start = starts[i]
+                self.buf_kv[i, r : r + vl] = kv[i, start : start + vl]
+                self.buf_gate[i, r : r + vl] = gate[i, start : start + vl]
             self.remainder = new_remainder
 
             r_kv = mx.zeros((B, 0, D1), dtype=kv.dtype)
@@ -2244,6 +2270,7 @@ class BatchPoolingCache(_BaseCache):
             vl = valid_lengths[i]
             u = usable[i]
             nr = new_remainder[i]
+            start = starts[i]
 
             if u > 0:
                 # Tokens from the buffer (the leftover from last call)
@@ -2253,11 +2280,13 @@ class BatchPoolingCache(_BaseCache):
 
                 # Tokens from the new input that complete full windows
                 consume = u - r
-                r_kv[i, r : r + consume] = kv[i, :consume]
-                r_gate[i, r : r + consume] = gate[i, :consume]
+                r_kv[i, r : r + consume] = kv[i, start : start + consume]
+                r_gate[i, r : r + consume] = gate[i, start : start + consume]
 
                 r_base[i] = (
-                    offset[i] - r if isinstance(offset, mx.array) else offset - r
+                    offset[i] + start - r
+                    if isinstance(offset, mx.array)
+                    else offset + start - r
                 )
 
             # Fill new remainder buffer from the tail of the input
@@ -2265,8 +2294,8 @@ class BatchPoolingCache(_BaseCache):
                 if u > 0:
                     # Old remainder was consumed into usable output;
                     # new remainder is purely from the tail of new input.
-                    new_buf_kv[i, :nr] = kv[i, vl - nr : vl]
-                    new_buf_gate[i, :nr] = gate[i, vl - nr : vl]
+                    new_buf_kv[i, :nr] = kv[i, start + vl - nr : start + vl]
+                    new_buf_gate[i, :nr] = gate[i, start + vl - nr : start + vl]
                 else:
                     # No full window produced: carry over old buffer and
                     # append any new valid tokens.
@@ -2274,8 +2303,8 @@ class BatchPoolingCache(_BaseCache):
                         new_buf_kv[i, :r] = self.buf_kv[i, :r]
                         new_buf_gate[i, :r] = self.buf_gate[i, :r]
                     if vl > 0:
-                        new_buf_kv[i, r : r + vl] = kv[i, :vl]
-                        new_buf_gate[i, r : r + vl] = gate[i, :vl]
+                        new_buf_kv[i, r : r + vl] = kv[i, start : start + vl]
+                        new_buf_gate[i, r : r + vl] = gate[i, start : start + vl]
 
         self.buf_kv = new_buf_kv
         self.buf_gate = new_buf_gate
@@ -2358,11 +2387,28 @@ class BatchPoolingCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return (self.ratio, self.remainder, self._pool_lengths, self._processed)
+        return (
+            self.ratio,
+            self.remainder,
+            self._pool_lengths,
+            self._processed,
+            self.left_padding,
+        )
 
     @meta_state.setter
     def meta_state(self, v):
-        self.ratio, self.remainder, self._pool_lengths, self._processed = v
+        if len(v) == 4:
+            self.ratio, self.remainder, self._pool_lengths, self._processed = v
+            self.left_padding = [0] * len(self.remainder)
+        else:
+            (
+                self.ratio,
+                self.remainder,
+                self._pool_lengths,
+                self._processed,
+                self.left_padding,
+            ) = v
+        self._lengths = [2**31] * len(self.remainder)
 
     def is_trimmable(self):
         return self.pooled is None
@@ -2405,6 +2451,7 @@ class BatchPoolingCache(_BaseCache):
         self._pool_lengths = [self._pool_lengths[i] for i in idx_list]
         self._lengths = [self._lengths[i] for i in idx_list]
         self._processed = [self._processed[i] for i in idx_list]
+        self.left_padding = [self.left_padding[i] for i in idx_list]
 
     def extend(self, other):
         # Merge the remainder buffers
@@ -2478,6 +2525,7 @@ class BatchPoolingCache(_BaseCache):
         self._pool_lengths = self._pool_lengths + other._pool_lengths
         self._lengths = self._lengths + other._lengths
         self._processed = self._processed + other._processed
+        self.left_padding = self.left_padding + other.left_padding
 
     def extract(self, idx):
         cache = PoolingCache(self.ratio)

@@ -17,7 +17,9 @@ from mlx_vlm.utils import (
     StoppingCriteria,
     _drop_modules_without_weights,
     _load_safetensors,
+    _transform_modelopt_nvfp4_weights,
     apply_generation_config_defaults,
+    estimate_num_image_tokens,
     get_model_and_args,
     get_model_path,
     load,
@@ -31,6 +33,31 @@ from mlx_vlm.utils import (
     sanitize_weights,
     update_module_configs,
 )
+
+
+def test_transform_modelopt_nvfp4_weights():
+    packed = mx.arange(32, dtype=mx.uint8).reshape(2, 16)
+    weights = {
+        "layer.weight": packed,
+        "layer.weight_scale": mx.array([[56, 64], [72, 80]], dtype=mx.uint8),
+        "layer.weight_scale_2": mx.array(0.5, dtype=mx.float32),
+        "layer.input_scale": mx.array(0.25, dtype=mx.float32),
+        "layer.bias": mx.ones((2,)),
+    }
+
+    transformed, quantization = _transform_modelopt_nvfp4_weights(
+        weights,
+        {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+    )
+
+    assert transformed["layer.weight"].dtype == mx.uint32
+    assert transformed["layer.weight"].shape == (2, 4)
+    assert transformed["layer.scales"].tolist() == [[48, 56], [64, 72]]
+    assert mx.array_equal(transformed["layer.bias"], weights["layer.bias"])
+    assert "layer.weight_scale" not in transformed
+    assert "layer.weight_scale_2" not in transformed
+    assert "layer.input_scale" not in transformed
+    assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 
 
 class MockTensor:
@@ -801,6 +828,59 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
     assert quantize.call_args.kwargs["mode"] == "affine"
 
 
+def test_load_model_uses_qwen_fine_grained_fp8_quantization_config():
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeQwenModel(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.proj = nn.Linear(128, 128, bias=False)
+
+        def load_weights(self, weights, strict=True):
+            self.loaded_weights = weights
+            self.loaded_strict = strict
+
+    fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeQwenModel)
+    source_config = {
+        "model_type": "qwen3_5",
+        "quantization_config": {
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "weight_block_size": [128, 128],
+        },
+    }
+
+    with (
+        patch("mlx_vlm.utils.load_config", return_value=source_config),
+        patch(
+            "mlx_vlm.utils.glob.glob",
+            return_value=["/tmp/model/model.safetensors"],
+        ),
+        patch(
+            "mlx_vlm.utils._load_safetensors",
+            return_value={
+                "proj.weight": mx.zeros((128, 32), dtype=mx.uint32),
+                "proj.scales": mx.zeros((128, 4), dtype=mx.uint8),
+            },
+        ),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "qwen3_5"),
+        ),
+        patch("mlx_vlm.utils.nn.quantize") as quantize,
+    ):
+        load_model(Path("/tmp/model"), lazy=True)
+
+    quantize.assert_called_once()
+    assert quantize.call_args.kwargs["group_size"] == 32
+    assert quantize.call_args.kwargs["bits"] == 8
+    assert quantize.call_args.kwargs["mode"] == "mxfp8"
+
+
 def test_load_model_quantizes_projector_with_scales_when_skip_vision():
     class FakeConfig:
         @classmethod
@@ -1010,3 +1090,55 @@ class TestProcessImage:
             warnings.simplefilter("error")
             img = process_image(self._image(), None, None)
         assert img.size == (640, 480)
+
+
+class TestEstimateNumImageTokens:
+    def _processor(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+        return Qwen3VLImageProcessor()
+
+    def _actual_tokens(self, processor, width, height, **kwargs):
+        import numpy as np
+        from PIL import Image
+
+        img = Image.new("RGB", (width, height), color=(9, 30, 51))
+        grid = processor([img], **kwargs)["image_grid_thw"][0]
+        return int(np.prod(grid)) // processor.merge_size**2
+
+    @pytest.mark.parametrize(
+        "width,height",
+        [(64, 64), (640, 480), (1000, 1400), (2500, 1200), (333, 517)],
+    )
+    def test_estimate_matches_actual_processing(self, width, height):
+        processor = self._processor()
+        estimate = estimate_num_image_tokens(processor, height, width)
+        assert estimate == self._actual_tokens(processor, width, height)
+
+    @pytest.mark.parametrize("max_pixels", [256 * 256, 512 * 512])
+    def test_estimate_matches_actual_with_max_pixels(self, max_pixels):
+        processor = self._processor()
+        estimate = estimate_num_image_tokens(
+            processor, 1400, 1000, max_pixels=max_pixels
+        )
+        assert estimate == self._actual_tokens(
+            processor, 1000, 1400, max_pixels=max_pixels
+        )
+
+    def test_estimate_matches_actual_with_resized_dimensions(self):
+        processor = self._processor()
+        estimate = estimate_num_image_tokens(
+            processor, 1400, 1000, resized_height=448, resized_width=448
+        )
+        assert estimate == self._actual_tokens(
+            processor, 1000, 1400, resized_height=448, resized_width=448
+        )
+
+    def test_dispatcher_unwraps_wrapped_processor(self):
+        wrapped = SimpleNamespace(image_processor=self._processor())
+        direct = estimate_num_image_tokens(self._processor(), 480, 640)
+        assert estimate_num_image_tokens(wrapped, 480, 640) == direct
+
+    def test_unsupported_processor_raises(self):
+        with pytest.raises(NotImplementedError, match="num_image_tokens"):
+            estimate_num_image_tokens(SimpleNamespace(), 480, 640)

@@ -59,12 +59,18 @@ ImageColorSpace = Literal["RGB"]
 class ImageGenerationRequest:
     prompt: str
     seed: int | None = None
-    steps: int = DEFAULT_IMAGE_STEPS
+    steps: int | None = None
     width: int = 512
     height: int = 512
-    guidance: float = DEFAULT_IMAGE_GUIDANCE
+    guidance: float | None = None
     output_format: Literal["png"] = DEFAULT_IMAGE_FORMAT
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def resolve_steps(self, default: int = DEFAULT_IMAGE_STEPS) -> int:
+        return default if self.steps is None else self.steps
+
+    def resolve_guidance(self, default: float = DEFAULT_IMAGE_GUIDANCE) -> float:
+        return default if self.guidance is None else self.guidance
 
 
 @dataclass(slots=True)
@@ -158,6 +164,8 @@ def _model_type_from_id(model: str) -> str:
         "klein": "flux2",
         "mage": "mage_flow",
         "mageflow": "mage_flow",
+        "z": "z_image",
+        "zimage": "z_image",
     }.get(model_type, model_type)
 
 
@@ -254,6 +262,13 @@ def _image_model_type_from_component_indexes(root: Path) -> str | None:
     }
     if flux2_markers <= keys:
         return "flux2"
+    z_image_markers = {
+        "layers.0.feed_forward.w1.weight",
+        "context_refiner.0.attention.to_q.weight",
+        "noise_refiner.0.adaLN_modulation.0.weight",
+    }
+    if z_image_markers <= keys:
+        return "z_image"
     return None
 
 
@@ -614,8 +629,6 @@ def run_image_generation_cli(args: Any) -> None:
     _validate_image_generation_args(args, task=task)
     seed = args.seed if args.seed is not None else random.randrange(2**32)
     steps = getattr(args, "steps", None)
-    if steps is None:
-        steps = DEFAULT_IMAGE_STEPS
     prompt = _prompt_to_image_text(args.prompt)
     if not prompt:
         raise ValueError(f"--prompt must not be empty for image {task}")
