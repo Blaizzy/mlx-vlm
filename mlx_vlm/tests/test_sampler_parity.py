@@ -239,30 +239,95 @@ def test_one_mode_plus_rank_filters_matches_make_sampler(temperature, combo):
         assert ours == ref, f"T={temperature} {combo} key={key}"
 
 
-def test_multi_mode_composition_is_well_defined_where_upstream_is_not():
-    """KNOWN_DIVERGENCE 2, asserted from both sides.
+TWO_MODE_COMBOS = [
+    dict(top_n_sigma=1.0, p_less=True),
+    dict(top_n_sigma=1.5, p_less=True),
+    dict(top_n_sigma=1.0, p_less=True, top_p=0.9),
+    dict(top_n_sigma=1.0, p_less=True, top_k=40),
+]
 
-    Upstream's sequential chain feeds -inf into typical_p's entropy sum; this
-    intersects masks computed on the full distribution instead. Assert that
-    upstream really is NaN-poisoned here (so the divergence stays justified) and
-    that ours stays non-empty and inside each mode's own candidate set.
+
+@pytest.mark.parametrize("temperature", [0.3, 0.7, 1.0, 1.5, 2.0])
+@pytest.mark.parametrize(
+    "combo", TWO_MODE_COMBOS, ids=lambda c: repr(sorted(c.items()))
+)
+def test_two_modes_without_typical_p_match_make_sampler(temperature, combo):
+    """Modes chain sequentially, so a second mode filters what the first left.
+
+    p_less's collision probability is a property of the distribution it is
+    actually sampling from; computing it on the unfiltered row is a different
+    filter, not a rounding difference. Nothing in this chain is NaN-poisoned
+    upstream, so nothing licenses a divergence here.
+    """
+    cfg = SamplingConfig(temperature=temperature, seed=1, **combo)
+    for key in (11, 12, 13, 14, 15):
+        lp = _row(512, key=key)
+        ref = _reference_keep(lp, cfg)
+        if not ref:
+            continue  # KNOWN_DIVERGENCE 1, covered elsewhere
+        assert _sampler_keep(lp, cfg) == ref, f"T={temperature} {combo} key={key}"
+
+
+def test_typical_p_after_another_mode_stays_well_defined():
+    """KNOWN_DIVERGENCE 2, now narrowed to exactly one chain.
+
+    typical_p is the only mode whose upstream form breaks when chained: its
+    entropy sum takes 0 * -inf over the tokens a previous mode masked. This
+    drops those terms instead of inheriting the NaN. The guard asserts upstream
+    really is still poisoned, so the divergence gets revisited rather than
+    inherited if that is ever fixed upstream.
     """
     lp = _row(512, key=11)
-    poisoned = mx.exp(apply_top_n_sigma(lp, 1.0)) * apply_top_n_sigma(lp, 1.0)
+    stage1 = apply_top_n_sigma(lp, 1.0)
+    poisoned = mx.exp(stage1) * stage1
     mx.eval(poisoned)
     assert any(math.isnan(v) for v in poisoned.tolist()), (
-        "upstream's mode-after-mode chain is no longer NaN-poisoned -- "
-        "re-evaluate KNOWN_DIVERGENCE 2, it may now be fixable by matching it"
+        "upstream's typical_p-after-a-mode chain is no longer NaN-poisoned -- "
+        "re-evaluate KNOWN_DIVERGENCE 2, it may now be matchable"
     )
 
     cfg = SamplingConfig(temperature=1.0, top_n_sigma=1.0, typical_p=0.5, seed=1)
     ours = _sampler_keep(lp, cfg)
-    assert ours
-    for single in (
-        SamplingConfig(temperature=1.0, top_n_sigma=1.0, seed=1),
-        SamplingConfig(temperature=1.0, typical_p=0.5, seed=1),
-    ):
-        assert ours <= _reference_keep(lp, single)
+    assert ours, "chained modes emptied the row"
+    # Chaining only removes, so the result stays inside the first mode's set.
+    assert ours <= _reference_keep(
+        lp, SamplingConfig(temperature=1.0, top_n_sigma=1.0, seed=1)
+    )
+
+
+def test_a_row_the_modes_reject_entirely_falls_back_to_its_argmax():
+    """An empty mask must not become an all -inf row.
+
+    The rank-0 floor would "keep" a -inf entry and mx.random.categorical would
+    then return a uniformly random token from the whole vocabulary -- silently,
+    on parameter values the request schema documents as typical.
+    """
+    lp = _row(4096, key=3)
+    cfg = SamplingConfig(temperature=0.7, top_n_sigma=1.0, typical_p=0.3, seed=1)
+    argmax = int(mx.argmax(lp, axis=-1))
+    draws = set()
+    for seed in range(8):
+        mx.random.seed(seed)
+        draws.add(int(_PositionedTargetSampler([cfg])(lp[None])[0]))
+    assert draws == {argmax}, f"expected the argmax fallback, drew {sorted(draws)[:8]}"
+
+
+@pytest.mark.parametrize("top_p", [0.5, 0.9])
+def test_raw_logits_are_normalized_before_the_rank_filters(top_p):
+    """The speculative loops pass raw lm_head logits, not log-normalized ones.
+
+    exp() of an unnormalized row sums to e**logsumexp rather than 1, so the
+    nucleus cutoff is satisfied almost everywhere and top_p stops filtering.
+    dflash.py:153/276, eagle3.py:175/185/199 and mtp.py:172 all call the
+    sampler this way, so the same request would filter differently depending on
+    whether it was routed to speculative decoding.
+    """
+    raw = mx.random.normal((4096,), key=mx.random.key(5)) * 2.0
+    lp = _log_normalize(raw)
+    mx.eval(raw, lp)
+    cfg = SamplingConfig(temperature=0.7, top_p=top_p, seed=1)
+    assert _sampler_keep(raw, cfg) == _sampler_keep(lp, cfg)
+    assert _sampler_keep(raw, cfg) == _reference_keep(lp, cfg)
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])

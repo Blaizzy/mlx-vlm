@@ -129,6 +129,7 @@ def _new_modes_keep(
     # Upstream's _top_n_sigma casts unconditionally for the same reason.
     f = work.astype(mx.float32)
     keep = mx.ones((B, V), dtype=mx.bool_)
+    neg = mx.array(-float("inf"), mx.float32)
 
     # top-nσ: drop logit < max - n*std (raw logits; shift-invariant so the
     # log-normalized work gives the same set). Phrased as "not (x < t)" rather
@@ -139,18 +140,28 @@ def _new_modes_keep(
         f, axis=-1, keepdims=True
     )
     keep = keep & mx.where(ns > 0, ~(f < threshold), mx.array(True))
+    # Each mode sees what the previous one left, exactly as make_sampler's
+    # chain does -- p_less's collision probability is a property of the
+    # distribution it is actually sampling from, so computing it on the
+    # unfiltered row would be a different filter, not a rounding difference.
+    f = mx.where(keep, f, neg)
 
     # p-less: drop prob < collision prob L = sum p^2, p = softmax(work/temp).
     probs = mx.softmax(f / safe_t[:, None], axis=-1)
     collision = mx.sum(probs * probs, axis=-1, keepdims=True)
     keep = keep & mx.where(p_less[:, None], ~(probs < collision), mx.array(True))
+    f = mx.where(keep, f, neg)
 
     # typical-p: keep tokens by ascending |surprisal - entropy| until their
     # cumulative prob reaches typical_p (on the true, un-scaled distribution).
     # Gated on 0 < typical_p < 1 exactly like make_sampler, so out-of-range
     # values disable the mode instead of filtering everything away.
     prob = mx.exp(f)
-    entropy = -mx.sum(prob * f, axis=-1, keepdims=True)
+    # -inf entries contribute 0*-inf = NaN to make_sampler's entropy sum, which
+    # then poisons the argsort that sets this cutoff (measured 485 NaN of 512
+    # after top_n_sigma). Drop those terms instead: it is the entropy upstream
+    # meant, and it keeps the chained result well defined.
+    entropy = -mx.sum(mx.where(prob > 0, prob * f, 0.0), axis=-1, keepdims=True)
     shifted = mx.abs(-f - entropy)
     order_tp = mx.argsort(shifted, axis=-1)
     cum = mx.cumsum(mx.take_along_axis(prob, order_tp, axis=-1), axis=-1)
@@ -198,6 +209,13 @@ def batched_row_sample(
         )
     B, V = logprobs.shape
     work = logprobs.astype(mx.float32) if logprobs.dtype == mx.bfloat16 else logprobs
+    # The filters below read exp(work) as a probability vector. The AR batch
+    # path hands us log-normalized logprobs, but the speculative loops hand us
+    # raw lm_head logits (speculative/dflash.py:153,276, eagle3.py:175,185,199,
+    # mtp.py:172), where the cumulative mass reaches e**logsumexp rather than 1
+    # and top_p silently stops filtering. Normalize here so the contract holds
+    # for every caller rather than for half of them.
+    work = work - mx.logsumexp(work, axis=-1, keepdims=True)
 
     # Greedy ignores every filter (make_sampler returns argmax when temp == 0),
     # so take it from the unfiltered logprobs before any masking below.
@@ -214,6 +232,17 @@ def batched_row_sample(
         pl = p_less if p_less is not None else mx.zeros((B,), dtype=mx.bool_)
         tp = typical_p if typical_p is not None else mx.ones((B,), mx.float32)
         modes_keep = _new_modes_keep(work, safe_t, ns, pl, tp)  # [B, V] original
+        # A row the modes reject entirely must not become an all -inf row: the
+        # rank-0 floor below would then "keep" a -inf entry and the categorical
+        # draw would return a uniformly random token from the whole vocabulary,
+        # silently. Fall back to that row's argmax, which is what a caller
+        # asking for an impossible combination should get.
+        rescued = mx.arange(V, dtype=mx.int32)[None, :] == mx.argmax(
+            work, axis=-1, keepdims=True
+        ).astype(mx.int32)
+        modes_keep = modes_keep | (
+            ~mx.any(modes_keep, axis=-1, keepdims=True) & rescued
+        )
         work = mx.where(modes_keep, work, mx.array(-float("inf"), work.dtype))
 
     order = mx.argsort(-work, axis=-1)  # [B, V] descending
