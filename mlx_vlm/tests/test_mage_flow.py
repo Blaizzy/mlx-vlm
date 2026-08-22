@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import importlib
+import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
 import pytest
+from mlx import nn
+from mlx.utils import tree_flatten
 
 import mlx_vlm.models.mage_flow.download as download_module
 from mlx_vlm.generate.edit_image import image_edit_model_class, is_image_edit_model
@@ -19,10 +23,19 @@ from mlx_vlm.models.mage_flow.config import (
     validate_dimensions,
     variant_from_local_path,
 )
+from mlx_vlm.models.mage_flow.convert import (
+    _quantization_parameters,
+    _quantize_component,
+    _save_component,
+    _transformer_quantization_predicate,
+    convert_mage_flow,
+)
 from mlx_vlm.models.mage_flow.download import DOWNLOAD_PATTERNS, validate_model_layout
 from mlx_vlm.models.mage_flow.model import (
     MageFlowImageEditModel,
     MageFlowImageGenerationModel,
+    _resolve_load_variant,
+    resolve_variant,
 )
 from mlx_vlm.models.mage_flow.scheduler import FlowMatchEulerDiscreteScheduler
 from mlx_vlm.models.mage_flow.transformer import (
@@ -30,6 +43,8 @@ from mlx_vlm.models.mage_flow.transformer import (
     image_rope_frequencies,
 )
 from mlx_vlm.models.mage_flow.weights import (
+    _apply_weights,
+    _load_safetensors,
     sanitize_transformer_weights,
     sanitize_vae_weights,
 )
@@ -118,6 +133,21 @@ def test_mage_flow_remote_metadata_dispatch(
     )
 
 
+def test_mage_flow_resolves_community_repo_alias() -> None:
+    assert (
+        resolve_variant("mage-flow-community/Mage-Flow-Turbo").name == "mage-flow-turbo"
+    )
+
+
+def test_mage_flow_load_prefers_local_metadata(tmp_path: Path) -> None:
+    _write_layout(tmp_path)
+    (tmp_path / "mlx_mage_flow.json").write_text('{"variant":"mage-flow-edit-turbo"}')
+    assert (
+        _resolve_load_variant("community/custom-name", tmp_path).name
+        == "mage-flow-edit-turbo"
+    )
+
+
 def test_mage_flow_local_variant_uses_cache_parent_name(tmp_path: Path) -> None:
     snapshot = (
         tmp_path / "models--microsoft--Mage-Flow-Edit-Turbo" / "snapshots" / "hash"
@@ -145,7 +175,7 @@ def test_mage_flow_download_uses_family_patterns(
 
     monkeypatch.setattr(download_module, "snapshot_download", fake_snapshot_download)
     assert download_module.download_model("mage-flow-turbo", max_workers=2) == tmp_path
-    assert calls["repo_id"] == "microsoft/Mage-Flow-Turbo"
+    assert calls["repo_id"] == "mage-flow-community/Mage-Flow-Turbo"
     assert calls["allow_patterns"] == list(DOWNLOAD_PATTERNS)
     assert calls["max_workers"] == 2
 
@@ -217,6 +247,192 @@ def test_mage_flow_weight_sanitizers() -> None:
     assert vae["dconv_encoder.blocks.0.ca_conv.weight"].shape == (2, 1, 1, 2)
     assert "decoder_model.dec_net.res_blocks.0.linear_2.weight" in vae
     assert len(vae) == 2
+
+
+def test_mage_flow_native_vae_layout_is_not_transposed() -> None:
+    weight = mx.zeros((2, 3, 3, 4))
+    sanitized = sanitize_vae_weights(
+        {"decoder_model.conv_in.weight": weight},
+        source_layout="mlx_nhwc",
+    )
+    assert sanitized["decoder_model.conv_in.weight"].shape == weight.shape
+
+
+@pytest.mark.parametrize(
+    "mode,bits,group_size",
+    [
+        ("affine", 4, 64),
+        ("mxfp4", 4, 32),
+        ("nvfp4", 4, 16),
+        ("mxfp8", 8, 32),
+    ],
+)
+def test_mage_flow_loads_quantized_weights(
+    mode: str, bits: int, group_size: int
+) -> None:
+    class TinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = nn.Linear(64, 32, bias=False)
+
+    quantized = TinyModel()
+    nn.quantize(
+        quantized,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+    loaded = _apply_weights(
+        TinyModel(),
+        dict(tree_flatten(quantized.parameters())),
+        {
+            "quantization_mode": mode,
+            "quantization_level": str(bits),
+            "quantization_group_size": str(group_size),
+        },
+    )
+    assert isinstance(loaded.proj, nn.QuantizedLinear)
+    assert loaded.quantization_config == {
+        "bits": bits,
+        "group_size": group_size,
+        "mode": mode,
+    }
+
+
+def test_mage_flow_quantizes_only_compatible_layers() -> None:
+    class TinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.compatible = nn.Linear(64, 32, bias=False)
+            self.incompatible = nn.Linear(63, 32, bias=False)
+
+    model = TinyModel()
+    config = _quantization_parameters("affine", 64, 4)
+    _quantize_component(model, config)
+    assert isinstance(model.compatible, nn.QuantizedLinear)
+    assert isinstance(model.incompatible, nn.Linear)
+    assert model.quantization_config == config
+
+
+def test_mage_flow_quantization_skips_sensitive_transformer_layers() -> None:
+    module = nn.Linear(64, 32, bias=False)
+    assert _transformer_quantization_predicate(
+        "transformer_blocks.0.attn.to_q",
+        module,
+    )
+    assert not _transformer_quantization_predicate(
+        "transformer_blocks.0.img_mod.linear",
+        module,
+    )
+    assert not _transformer_quantization_predicate(
+        "transformer_blocks.0.txt_mod.linear",
+        module,
+    )
+    assert not _transformer_quantization_predicate("proj_out", module)
+
+
+def test_mage_flow_saved_quantization_metadata(tmp_path: Path) -> None:
+    class TinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = nn.Linear(64, 32, bias=False)
+
+    model = TinyModel()
+    config = _quantization_parameters("affine", 64, 4)
+    _quantize_component(model, config)
+    _save_component(tmp_path, model, config)
+
+    index = json.loads((tmp_path / "model.safetensors.index.json").read_text())
+    assert index["metadata"]["mlx_vlm_format"] == "mage_flow"
+    assert index["metadata"]["tensor_layout"] == "mlx_nhwc"
+    component_config = json.loads((tmp_path / "config.json").read_text())
+    assert component_config["quantization"] == config
+    assert component_config["quantization_config"] == config
+    weights, metadata = _load_safetensors(tmp_path)
+    loaded = _apply_weights(TinyModel(), weights, {**component_config, **metadata})
+    assert isinstance(loaded.proj, nn.QuantizedLinear)
+    assert loaded.quantization_config == config
+
+
+def test_mage_flow_quantized_weights_require_config() -> None:
+    class TinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = nn.Linear(64, 32, bias=False)
+
+    quantized = TinyModel()
+    nn.quantize(quantized, group_size=64, bits=4, mode="affine")
+    with pytest.raises(ValueError, match="quantization mode"):
+        _apply_weights(
+            TinyModel(),
+            dict(tree_flatten(quantized.parameters())),
+            {},
+        )
+
+
+def test_mage_flow_conversion_rejects_output_inside_source(tmp_path: Path) -> None:
+    _write_layout(tmp_path)
+    with pytest.raises(ValueError, match="inside its source"):
+        convert_mage_flow(tmp_path, tmp_path / "converted")
+
+
+def test_mage_flow_conversion_rejects_ambiguous_local_variant(tmp_path: Path) -> None:
+    _write_layout(tmp_path)
+    output = tmp_path.parent / f"{tmp_path.name}-converted"
+    with pytest.raises(ValueError, match="--variant"):
+        convert_mage_flow(tmp_path, output)
+
+
+def test_mage_flow_conversion_prefers_source_id_variant(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _write_layout(tmp_path)
+
+    @dataclass
+    class FakeComponent:
+        quantization_config = None
+
+        def parameters(self):
+            return {}
+
+        def update(self, parameters):  # noqa: ARG002
+            pass
+
+    class FakeTextEncoder:
+        model = FakeComponent()
+
+    import mlx_vlm.models.mage_flow.convert as convert_module
+
+    monkeypatch.setattr(
+        convert_module, "load_text_encoder", lambda path: FakeTextEncoder()
+    )
+    monkeypatch.setattr(
+        convert_module, "load_transformer", lambda path: FakeComponent()
+    )
+    monkeypatch.setattr(convert_module, "load_vae", lambda path: FakeComponent())
+    monkeypatch.setattr(convert_module, "_cast_component", lambda model, dtype: None)
+    monkeypatch.setattr(
+        convert_module,
+        "_save_component",
+        lambda directory, model, quantization: directory.mkdir(
+            parents=True, exist_ok=True
+        ),
+    )
+
+    output = tmp_path.parent / f"{tmp_path.name}-converted"
+    convert_mage_flow(
+        tmp_path,
+        output,
+        source_id="mage-flow-community/Mage-Flow-Edit-Turbo",
+    )
+    metadata = json.loads((output / "mlx_mage_flow.json").read_text())
+    assert metadata["variant"] == "mage-flow-edit-turbo"
+
+
+def test_mage_flow_rejects_incompatible_native_quantization_options() -> None:
+    with pytest.raises(ValueError, match="requires"):
+        _quantization_parameters("mxfp8", 64, 8)
 
 
 def test_all_six_variants_are_present() -> None:
