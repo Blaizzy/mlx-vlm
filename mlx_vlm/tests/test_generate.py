@@ -1195,10 +1195,10 @@ class TestBatchGenerate:
         assert response.texts == ["Response 1", "Response 2"]
         mock_generate_batch.assert_called_once()
 
-    def test_generate_batch_splits_batched_prompt_kwargs_per_row(
+    def test_generate_batch_passes_mask_and_split_prompt_kwargs_to_generator(
         self, mock_model, mock_processor
     ):
-        """Regression test for Gemma 4-style batched ``inputs_embeds``."""
+        """BatchGenerator receives the dense rows and their padding metadata."""
 
         class _EmbeddingOutput:
             def __init__(self, inputs_embeds, position_ids):
@@ -1219,12 +1219,17 @@ class TestBatchGenerate:
         hidden_size = 7
         input_ids = mx.array(
             [
-                [11, 12, 13, 14, 15],
+                [0, 0, 11, 12, 13],
                 [21, 22, 23, 24, 25],
-                [31, 32, 33, 34, 35],
+                [0, 31, 32, 33, 34],
             ],
             dtype=mx.int32,
         )
+        attention_mask = mx.array(
+            [[0, 0, 1, 1, 1], [1, 1, 1, 1, 1], [0, 1, 1, 1, 1]],
+            dtype=mx.int32,
+        )
+        prepared_attention_mask = attention_mask
         inputs_embeds = mx.arange(
             batch_size * seq_len * hidden_size, dtype=mx.float32
         ).reshape(batch_size, seq_len, hidden_size)
@@ -1234,9 +1239,15 @@ class TestBatchGenerate:
         embedding_output = _EmbeddingOutput(inputs_embeds, position_ids)
 
         def fake_insert(
-            self, prompts, max_tokens, prompt_kwargs=None, logits_processors=None
+            self,
+            prompts,
+            max_tokens,
+            prompt_kwargs=None,
+            logits_processors=None,
+            attention_mask=None,
         ):
-            assert len(prompts) == batch_size
+            assert mx.array_equal(prompts, input_ids)
+            assert mx.array_equal(attention_mask, prepared_attention_mask)
             assert len(prompt_kwargs) == batch_size
             for i, kw in enumerate(prompt_kwargs):
                 assert kw["inputs_embeds"].shape == (1, seq_len, hidden_size)
@@ -1256,7 +1267,7 @@ class TestBatchGenerate:
                 "prepare_inputs",
                 return_value={
                     "input_ids": input_ids,
-                    "attention_mask": mx.ones((batch_size, seq_len), dtype=mx.int32),
+                    "attention_mask": attention_mask,
                 },
             ),
             patch.object(
@@ -3125,20 +3136,19 @@ class TestBatchTurboQuantizedKVStart:
         assert "BatchTurboQuantKVCache" in kinds
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+class TestTokenizerPaddedBatchRows:
+    """BatchGenerator canonicalizes masked dense rows before queueing them."""
 
+    def _generator(self):
+        gen = object.__new__(BatchGenerator)
+        gen.max_tokens = 4
+        gen.logits_processors = []
+        gen._unprocessed_sequences = []
+        gen.uid_count = 0
+        gen._wire_stack = None
+        return gen
 
-class TestPrePaddedBatchRows:
-    """Rows that arrive already padded must still declare that padding.
-
-    The tokenizer squares a batch off with left padding and reports it in the
-    attention mask. If that never reaches the caches, every row looks the same
-    length: a causal mask does not exclude padding that comes first, and a
-    recurrent layer walks it like any other column.
-    """
-
-    def _batch(self, rows, existing_left_padding):
+    def _batch(self, rows):
         import mlx.nn as nn
 
         from mlx_vlm.generate.ar import PromptProcessingBatch
@@ -3156,29 +3166,70 @@ class TestPrePaddedBatchRows:
             max_tokens=[4] * len(rows),
             inputs_embeds=None,
             prompt_kwargs={},
-            existing_left_padding=existing_left_padding,
         )
 
-    def test_declared_padding_reaches_the_caches(self):
-        rows = [list(range(8)), list(range(8))]
+    def test_unpads_tokens_and_sequence_aligned_prompt_tensors(self):
+        input_ids = mx.array([[0, 0, 4, 5], [6, 7, 8, 9], [10, 11, 0, 0]])
+        attention_mask = mx.array([[0, 0, 1, 1], [1, 1, 1, 1], [1, 1, 0, 0]])
+        inputs_embeds = mx.arange(3 * 4 * 3).reshape(3, 4, 3)
+        position_ids = mx.arange(3 * 3 * 4).reshape(3, 3, 4)
+        prompt_kwargs = ar_module._split_prompt_kwargs_per_row(
+            {
+                "inputs_embeds": inputs_embeds,
+                "position_ids": position_ids,
+                "rope_deltas": mx.array([[2], [3], [4]]),
+            },
+            batch_size=3,
+        )
 
-        batch = self._batch(rows, existing_left_padding=[5, 0])
+        gen = self._generator()
+        assert gen.insert(
+            input_ids,
+            prompt_kwargs=prompt_kwargs,
+            attention_mask=attention_mask,
+        ) == [0, 1, 2]
+        queued = {sequence[0]: sequence for sequence in gen._unprocessed_sequences}
 
-        assert batch._left_padding_per_row == [5, 0]
+        assert queued[0][1] == [4, 5]
+        assert queued[1][1] == [6, 7, 8, 9]
+        assert queued[2][1] == [10, 11]
+        assert queued[0][3]["inputs_embeds"].shape == (1, 2, 3)
+        assert queued[1][3]["inputs_embeds"].shape == (1, 4, 3)
+        assert queued[2][3]["inputs_embeds"].shape == (1, 2, 3)
+        assert queued[0][3]["position_ids"].shape == (3, 1, 2)
+        assert queued[1][3]["position_ids"].shape == (3, 1, 4)
+        assert queued[2][3]["position_ids"].shape == (3, 1, 2)
+        assert queued[0][3]["rope_deltas"].tolist() == [[2]]
+        assert queued[2][3]["rope_deltas"].tolist() == [[4]]
 
-    def test_uniform_rows_without_a_declaration_record_none(self):
-        rows = [list(range(8)), list(range(8))]
+    def test_rejects_noncontiguous_padding_mask(self):
+        gen = self._generator()
+        with pytest.raises(ValueError, match="one contiguous prompt span"):
+            gen.insert(
+                mx.array([[0, 4, 0, 5]]),
+                prompt_kwargs=[{"inputs_embeds": mx.ones((1, 4, 3))}],
+                attention_mask=mx.array([[0, 1, 0, 1]]),
+            )
+        assert gen._unprocessed_sequences == []
 
-        batch = self._batch(rows, existing_left_padding=None)
+    def test_accepts_mask_with_existing_python_prompt_rows(self):
+        gen = self._generator()
 
-        assert batch._left_padding_per_row == [0, 0]
+        gen.insert(
+            [[0, 4, 5], [6, 7, 8]],
+            attention_mask=mx.array([[0, 1, 1], [1, 1, 1]]),
+        )
 
-    def test_a_declaration_adds_to_the_generator_s_own_padding(self):
-        rows = [list(range(4)), list(range(8))]
+        queued = {sequence[0]: sequence[1] for sequence in gen._unprocessed_sequences}
+        assert queued == {0: [4, 5], 1: [6, 7, 8]}
 
-        batch = self._batch(rows, existing_left_padding=[2, 1])
+    def test_ragged_rows_initialize_both_cache_types(self):
+        batch = self._batch([[4, 5], [6, 7, 8, 9]])
 
-        assert batch._left_padding_per_row == [6, 1]
+        assert batch._left_padding_per_row == [2, 0]
+        assert batch.total_prompt_tokens == 6
+        assert batch.prompt_cache[0].offset.tolist() == [-2, 0]
+        assert batch.prompt_cache[1].left_padding.tolist() == [2, 0]
 
     def test_arrays_cache_masks_the_declared_padding(self):
         import mlx.core as mx
@@ -3186,10 +3237,14 @@ class TestPrePaddedBatchRows:
         from mlx_vlm.models.cache import ArraysCache
 
         entry = ArraysCache(1)
-        entry.left_padding = mx.array([5, 0])
+        entry.left_padding = mx.array([2, 0])
 
-        mask = entry.make_mask(8)
+        mask = entry.make_mask(4)
 
-        assert mask.shape == (2, 8)
-        assert mask[0].tolist() == [False] * 5 + [True] * 3
-        assert mask[1].tolist() == [True] * 8
+        assert mask.shape == (2, 4)
+        assert mask[0].tolist() == [False, False, True, True]
+        assert mask[1].tolist() == [True] * 4
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
