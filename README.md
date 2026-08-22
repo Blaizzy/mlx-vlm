@@ -1228,6 +1228,19 @@ curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
   -F response_format=json
 ```
 
+Repeat `hotwords` to pass a structured vocabulary list to a transcription model
+whose `generate` method accepts that parameter. For example, Fun-ASR-Nano
+supports native hotwords:
+
+```sh
+curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
+  -F model=mlx-community/Fun-ASR-Nano-2512 \
+  -F file=@/path/to/audio.mp3 \
+  -F language=zh \
+  -F hotwords=MLX \
+  -F 'hotwords=Apple Silicon'
+```
+
 ##### Multi-Modal (Image + Audio)
 
 ```sh

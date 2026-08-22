@@ -70,6 +70,7 @@ class AudioTranscriptionRequest(FlexibleBaseModel):
     frame_threshold: int = 25
     stream: bool = False
     context: Optional[str] = None
+    hotwords: Optional[List[str]] = None
     prefill_step_size: int = 2048
     text: Optional[str] = None
     word_timestamps: bool = False
@@ -399,6 +400,9 @@ async def _parse_transcription_request(
     timestamp_granularities = _form_list(form, "timestamp_granularities")
     if not timestamp_granularities:
         timestamp_granularities = _form_list(form, "timestamp_granularities[]")
+    hotwords = _form_list(form, "hotwords")
+    if not hotwords:
+        hotwords = _form_list(form, "hotwords[]")
 
     payload = AudioTranscriptionRequest(
         model=model,
@@ -412,6 +416,7 @@ async def _parse_transcription_request(
         frame_threshold=_form_int(form.get("frame_threshold"), default=25),
         stream=_form_bool(form.get("stream"), default=False),
         context=_clean_form_value(form.get("context")),
+        hotwords=hotwords or None,
         prefill_step_size=_form_int(form.get("prefill_step_size"), default=2048),
         text=_clean_form_value(form.get("text")),
         word_timestamps=_form_bool(form.get("word_timestamps"), default=False),
