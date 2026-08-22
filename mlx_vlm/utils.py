@@ -2044,6 +2044,16 @@ class ThinkingBudgetCriteria:
 
     Tracks tokens within thinking blocks (between start and end tokens) and
     forces a closing sequence (e.g. ``\\n</think>``) when budget is exceeded.
+
+    ``enable_thinking`` arms the budget; it says the caller wants reasoning and
+    wants it capped. ``thinking_open_in_prompt`` is the separate question of
+    whether the *rendered prompt* already left a thinking block open, and only
+    seeds the initial state. Templates differ here: Qwen3-VL seeds an open
+    ``<think>``, while GLM-4.1V seeds nothing and the model emits its own
+    opener on the first generated token. Both must be budgeted, so a prompt
+    without a seeded opener may not disarm the criteria. Defaults to
+    ``enable_thinking`` so callers that never made the distinction are
+    unaffected.
     """
 
     def __init__(
@@ -2053,10 +2063,16 @@ class ThinkingBudgetCriteria:
         thinking_end_token: str = "</think>",
         thinking_start_token: Optional[str] = None,
         enable_thinking: bool = False,
+        thinking_open_in_prompt: Optional[bool] = None,
     ):
         self.tokenizer = tokenizer
         self.thinking_budget = thinking_budget
         self.enable_thinking = enable_thinking
+        self.thinking_open_in_prompt = (
+            enable_thinking
+            if thinking_open_in_prompt is None
+            else bool(thinking_open_in_prompt)
+        )
 
         # Resolve token IDs from strings
         self.thinking_end_token_id = tokenizer.encode(
@@ -2074,14 +2090,14 @@ class ThinkingBudgetCriteria:
         self._forced_sequence.append(self.thinking_end_token_id)
         self._forced_index = 0
 
-        self.in_thinking = self.enable_thinking
+        self.in_thinking = self.thinking_open_in_prompt
         self.thinking_token_count = 0
         self.budget_exceeded = False
         self.forced_token_id = None
 
     def reset_thinking_state(self):
         """Reset thinking state between generations."""
-        self.in_thinking = self.enable_thinking
+        self.in_thinking = self.thinking_open_in_prompt
         self.thinking_token_count = 0
         self.budget_exceeded = False
         self._forced_index = 0

@@ -1596,13 +1596,16 @@ class ResponseGenerator:
         tokenizer = self.tokenizer
         thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
         thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
-        enable_thinking = self._prompt_has_open_thinking(args, input_ids)
+        # An open block in the prompt seeds the initial state; it does not
+        # decide whether the budget is armed. Templates that seed no opener
+        # leave the model to emit `<think>` itself, which must still be capped.
         return ThinkingBudgetCriteria(
             tokenizer=tokenizer,
             thinking_budget=args.thinking_budget,
             thinking_end_token=thinking_end_token,
             thinking_start_token=thinking_start_token,
-            enable_thinking=enable_thinking,
+            enable_thinking=bool(args.enable_thinking),
+            thinking_open_in_prompt=self._prompt_has_open_thinking(args, input_ids),
         )
 
     def _gpu_embed(

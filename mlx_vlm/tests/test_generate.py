@@ -1676,6 +1676,73 @@ class TestThinkingBudgetCriteria:
         assert criteria.thinking_token_count == 0
         assert criteria.budget_exceeded is False
 
+    def test_model_generated_start_token_is_budgeted(self):
+        """The model may open `<think>` itself when the template seeds nothing.
+
+        GLM-4.1V-style templates render no opener, so the prompt contains no
+        `<think>` and the block starts on the first generated token. That block
+        still has to be capped: arming the budget is the caller's
+        `enable_thinking`, not whether the prompt happened to seed a delimiter.
+        """
+        criteria = ThinkingBudgetCriteria(
+            tokenizer=FakeTokenizer(),
+            thinking_budget=5,
+            thinking_end_token="</think>",
+            thinking_start_token="<think>",
+            enable_thinking=True,
+            thinking_open_in_prompt=False,
+        )
+
+        # Nothing open yet, so tokens before the opener are not counted.
+        assert criteria.in_thinking is False
+
+        # The model emits its own opener.
+        assert criteria(99) is None
+        assert criteria.in_thinking is True
+
+        for i in range(5):
+            assert criteria(50 + i) is None
+        assert criteria.thinking_token_count == 5
+        assert criteria.budget_exceeded is False
+
+        assert criteria(60) == 10  # \n
+        assert criteria.pop_forced_token_id() == 10
+        assert criteria(60) == 100  # </think>
+        assert criteria.pop_forced_token_id() == 100
+        assert criteria.budget_exceeded is True
+
+    def test_thinking_open_in_prompt_defaults_to_enable_thinking(self):
+        """Callers that never made the distinction keep the old initial state."""
+        for enable_thinking in (True, False):
+            criteria = ThinkingBudgetCriteria(
+                tokenizer=FakeTokenizer(),
+                thinking_budget=5,
+                thinking_end_token="</think>",
+                thinking_start_token="<think>",
+                enable_thinking=enable_thinking,
+            )
+            assert criteria.thinking_open_in_prompt is enable_thinking
+            assert criteria.in_thinking is enable_thinking
+
+    def test_reset_restores_the_prompt_open_state_not_the_arm_flag(self):
+        """Between generations the block is closed again unless the prompt opened one."""
+        criteria = ThinkingBudgetCriteria(
+            tokenizer=FakeTokenizer(),
+            thinking_budget=5,
+            thinking_end_token="</think>",
+            thinking_start_token="<think>",
+            enable_thinking=True,
+            thinking_open_in_prompt=False,
+        )
+        assert criteria(99) is None
+        assert criteria.in_thinking is True
+
+        criteria.reset_thinking_state()
+
+        assert criteria.in_thinking is False
+        assert criteria.thinking_token_count == 0
+        assert criteria.budget_exceeded is False
+
     def _make_criteria(self, enable_thinking=True):
         return ThinkingBudgetCriteria(
             tokenizer=FakeTokenizer(),
