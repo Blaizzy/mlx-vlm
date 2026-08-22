@@ -8,7 +8,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..generate import generate, stream_generate
@@ -21,6 +21,7 @@ from .generation import (
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
+from .openai import _prepare_chat_tool_choice
 from .responses_state import (
     make_response_stream_state,
     process_tool_calls,
@@ -366,6 +367,11 @@ def _anthropic_messages_to_internal(
 
     tools = _anthropic_tools_to_openai(request.tools)
     tool_choice = _anthropic_tool_choice_to_openai(request.tool_choice)
+    # Passing tool_choice through as a template kwarg only constrains the models
+    # whose chat template reads it, so enforce it the way /v1/chat/completions does.
+    processed_messages, tools, tool_choice = _prepare_chat_tool_choice(
+        processed_messages, tools, tool_choice
+    )
     return processed_messages, images, tools, tool_choice
 
 
@@ -469,9 +475,12 @@ async def anthropic_messages_endpoint(http_request: Request):
         )
         model, processor, config = get_cached_model(request.model, adapter_path)
 
-        processed_messages, images, tools, tool_choice = (
-            _anthropic_messages_to_internal(request)
-        )
+        try:
+            processed_messages, images, tools, tool_choice = (
+                _anthropic_messages_to_internal(request)
+            )
+        except HTTPException as e:
+            return _anthropic_error_response(e.status_code, str(e.detail))
         tool_parser_type = _infer_tool_parser_from_processor(processor)
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
 
@@ -1059,9 +1068,12 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
         body = _normalize_anthropic_system_messages(await http_request.json())
         request = _anthropic_request_with_derived_fields(AnthropicRequest(**body))
         model, processor, config = get_cached_model(request.model)
-        processed_messages, images, tools, tool_choice = (
-            _anthropic_messages_to_internal(request)
-        )
+        try:
+            processed_messages, images, tools, tool_choice = (
+                _anthropic_messages_to_internal(request)
+            )
+        except HTTPException as e:
+            return _anthropic_error_response(e.status_code, str(e.detail))
         gen_args = _build_gen_args(
             request, processor, tenant_id=_read_tenant_id(http_request)
         )
