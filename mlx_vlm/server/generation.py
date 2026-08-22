@@ -1,6 +1,7 @@
 import gc
 import logging
 import os
+import random
 import time
 from collections import deque
 from contextlib import nullcontext
@@ -22,7 +23,6 @@ from ..generate import (
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
     DEFAULT_REPETITION_CONTEXT_SIZE,
-    DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_THINKING_END_TOKEN,
     DEFAULT_THINKING_START_TOKEN,
@@ -239,7 +239,7 @@ class _PositionedTargetSampler:
     def __init__(self, *, temperature: float, top_p: float, seed: Optional[int]):
         self.temperature = float(temperature)
         self.top_p = float(top_p)
-        self.seed = DEFAULT_SEED if seed is None else int(seed)
+        self.seed = random.randrange(2**32) if seed is None else int(seed)
 
     def __call__(self, logprobs: mx.array) -> mx.array:
         if self.top_p > 0 and self.top_p < 1.0:

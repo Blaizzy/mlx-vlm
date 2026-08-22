@@ -9,7 +9,6 @@ if TYPE_CHECKING:
 
 from ..generate import (
     DEFAULT_MAX_TOKENS,
-    DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     normalize_resize_shape,
@@ -740,7 +739,10 @@ class VLMRequest(FlexibleBaseModel):
     typical_p: float = Field(
         1.0, description="Locally typical sampling. 1.0 disables; typical ~0.2-0.95."
     )
-    seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
+    seed: Optional[int] = Field(
+        None,
+        description="Seed for random generation. Omitted requests draw a fresh seed.",
+    )
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     repetition_context_size: Optional[int] = Field(
         None, description="Repetition penalty context size."
