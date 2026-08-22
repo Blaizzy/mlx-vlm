@@ -20,6 +20,7 @@ import mlx_vlm.models.deepseek_v4.language as deepseek_language
 import mlx_vlm.models.gemma4.language as gemma4_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.speculative.mtp as mtp_utils
+from mlx_vlm.models.base import kv_sequence_length
 from mlx_vlm.models.cache import (
     ArraysCache,
     BatchKVCache,
@@ -84,6 +85,16 @@ from mlx_vlm.turboquant import BatchTurboQuantKVCache
 from mlx_vlm.utils import get_model_and_args
 
 speculative_utils = importlib.import_module("mlx_vlm.speculative.utils")
+
+
+def test_kv_sequence_length_supports_turboquant_state_proxy():
+    cache = BatchTurboQuantKVCache([0], bits=4)
+    keys, _ = cache.update_and_fetch(
+        mx.random.normal((1, 1, 5, 32)),
+        mx.random.normal((1, 1, 5, 32)),
+    )
+
+    assert kv_sequence_length(keys) == 5
 
 
 def test_speculative_sampler_rng_keeps_draft_sampling_off_target_stream():
@@ -1085,6 +1096,61 @@ def test_qwen3_5_single_row_quantized_batch_cache_keeps_prompt_state():
     assert prompt_cache[1] is quantized_cache
     assert quantized_cache._idx == 4
     assert quantized_cache.offset.tolist() == [4]
+
+
+def test_qwen3_5_mtp_verify_supports_native_quantized_batch_cache():
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.hidden_size = 64
+    text_config.intermediate_size = 128
+    text_config.num_hidden_layers = 2
+    text_config.num_attention_heads = 2
+    text_config.num_key_value_heads = 1
+    text_config.head_dim = 32
+    text_config.full_attention_interval = 2
+    model_config = qwen_language.ModelConfig(
+        text_config=text_config,
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        model_type="qwen3_5",
+        image_token_id=101,
+        video_token_id=102,
+        image_token_index=101,
+        video_token_index=102,
+        vision_start_token_id=100,
+        vision_end_token_id=103,
+        vocab_size=text_config.vocab_size,
+    )
+    model = qwen_language.LanguageModel(text_config, config=model_config)
+
+    arrays = ArraysCache(size=2)
+    arrays.left_padding = mx.array([0, 0], dtype=mx.int32)
+    quantized = BatchQuantizedKVCache([0, 0], group_size=32, bits=4)
+    prompt_cache = [arrays, quantized]
+
+    prompt = mx.array([[1, 2, 3], [4, 5, 6]], dtype=mx.int32)
+    model(prompt, cache=prompt_cache)
+    mx.eval(prompt_cache[1].state)
+
+    verify = mx.array([[7, 8, 9], [10, 11, 12]], dtype=mx.int32)
+    hidden, shared_kv, rollback_state = model.speculative_verify_hidden(
+        verify, prompt_cache
+    )
+    mx.eval(hidden, prompt_cache[1].state)
+
+    assert hidden.shape == (2, 3, text_config.hidden_size)
+    assert shared_kv == {}
+    assert rollback_state is not None
+    assert quantized._idx == 6
+    assert quantized.offset.tolist() == [6, 6]
+
+    accepted = model.rollback_speculative_cache(
+        prompt_cache, rollback_state, mx.array([0, 1]), block_size=3
+    )
+    mx.eval(prompt_cache[1].state)
+
+    assert accepted == 1
+    assert quantized._idx == 5
+    assert quantized.offset.tolist() == [4, 5]
+    assert quantized.left_padding.tolist() == [1, 0]
 
 
 def test_qwen3_5_single_row_shortcut_skips_quantized_batch_caches():
@@ -3063,6 +3129,22 @@ def test_qwen3_5_rollback_speculative_cache_handles_turboquant_batch_kv():
     assert mx.all(cache.keys.indices[0, :, 3:5, :] == 0).item()
     assert mx.all(cache.values.norms[0, :, 3:5] == 0).item()
     assert mx.any(cache.keys.norms[1, :, 3:5] != 0).item()
+
+
+def test_qwen3_5_rollback_speculative_cache_handles_native_quantized_batch_kv():
+    cache = BatchQuantizedKVCache([0, 0], group_size=32, bits=4)
+    keys = mx.random.normal((2, 1, 7, 32))
+    values = mx.random.normal((2, 1, 7, 32))
+    cache.update_and_fetch(keys, values)
+
+    qwen_language.LanguageModel.rollback_speculative_cache(
+        None, [cache], [], mx.array([0, 2]), block_size=5
+    )
+
+    mx.eval(cache.keys, cache.values, cache.offset)
+    assert cache._idx == 5
+    assert cache.offset.tolist() == [3, 5]
+    assert cache.left_padding.tolist() == [2, 0]
 
 
 def test_gemma4_rollback_speculative_cache_handles_turboquant_batch_tail_zero():
