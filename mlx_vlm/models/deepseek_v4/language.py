@@ -1341,6 +1341,8 @@ class LanguageModel(nn.Module):
     ) -> int:
         if isinstance(accepted, int):
             accepted = mx.array([accepted])
+        if isinstance(accepted, (list, tuple)):
+            accepted = mx.array(accepted, dtype=mx.int32)
 
         max_a = int(accepted.max().item())
         if gdn_states:

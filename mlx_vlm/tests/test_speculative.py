@@ -3082,6 +3082,46 @@ def test_gemma4_rollback_speculative_cache_handles_turboquant_batch_tail_zero():
     assert mx.any(cache.keys.norms[1, :, 3:5] != 0).item()
 
 
+def test_deepseek_v4_rollback_speculative_cache_accepts_python_list():
+    class DummyCache:
+        keys = None
+
+        def __init__(self):
+            self.trims = []
+
+        def trim(self, n):
+            self.trims.append(n)
+
+    cache = DummyCache()
+
+    max_a = deepseek_language.LanguageModel.rollback_speculative_cache(
+        SimpleNamespace(), [cache], None, [0], block_size=2
+    )
+
+    assert max_a == 0
+    assert cache.trims == [1]
+
+
+def test_deepseek_v4_rollback_speculative_cache_accepts_python_list_batched():
+    class DummyCache:
+        keys = None
+
+        def __init__(self):
+            self.trims = []
+
+        def trim(self, n):
+            self.trims.append(n)
+
+    cache = DummyCache()
+
+    max_a = deepseek_language.LanguageModel.rollback_speculative_cache(
+        SimpleNamespace(), [cache], None, [0, 2], block_size=4
+    )
+
+    assert max_a == 2
+    assert cache.trims == [1]
+
+
 def test_deepseek_v4_rollback_speculative_cache_handles_turboquant_batch_tail_zero():
     cache = BatchTurboQuantKVCache([0, 0], bits=3.5)
     keys = mx.arange(2 * 1 * 5 * 8, dtype=mx.float32).reshape(2, 1, 5, 8)
