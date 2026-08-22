@@ -1,3 +1,5 @@
+import math
+
 import mlx.core as mx
 
 _HAS_METAL = mx.metal.is_available()
@@ -553,7 +555,7 @@ def grid_sample(x, grid):
         template=[("T", x.dtype)],
         output_shapes=[out_shape],
         output_dtypes=[x.dtype],
-        grid=(mx.prod(mx.array(out_shape)), 1, 1),
+        grid=(math.prod(out_shape), 1, 1),
         threadgroup=(256, 1, 1),
     )
     return outputs[0]
