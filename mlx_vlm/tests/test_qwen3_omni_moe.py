@@ -2,6 +2,7 @@ import unittest
 
 import mlx.core as mx
 
+from mlx_vlm.models.qwen3_omni_moe.audio import _get_feat_extract_output_lengths
 from mlx_vlm.models.qwen3_omni_moe.config import (
     AudioConfig,
     Code2WavConfig,
@@ -13,6 +14,25 @@ from mlx_vlm.models.qwen3_omni_moe.config import (
     VisionConfig,
 )
 from mlx_vlm.models.qwen3_omni_moe.qwen3_omni_moe import Model
+
+
+def _floor_output_lengths(input_lengths):
+    leave = input_lengths % 100
+    feat = (leave - 1) // 2 + 1
+    return ((feat - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
+
+
+class Qwen3OmniAudioLengthTest(unittest.TestCase):
+    def test_matches_floor_reference(self):
+        for length in [100, 320, 500, 1000, 2800, 2900, 2999, 3000, 3100, 6000]:
+            got = int(_get_feat_extract_output_lengths(mx.array([length]))[0])
+            self.assertEqual(got, _floor_output_lengths(length), msg=f"length={length}")
+
+    def test_multiple_of_100_not_overcounted(self):
+        for length in (2900, 3000, 6000):
+            got = int(_get_feat_extract_output_lengths(mx.array([length]))[0])
+            self.assertEqual(got, _floor_output_lengths(length), msg=f"length={length}")
+
 
 IMAGE_TOKEN = 60
 VISION_START = 63
