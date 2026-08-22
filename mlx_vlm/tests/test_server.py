@@ -22,6 +22,7 @@ from transformers.utils.chat_parsing import ResponseParser, parse_response
 
 import mlx_vlm.reranker_loader as reranker_loader
 import mlx_vlm.server as server
+import mlx_vlm.server.anthropic as server_anthropic
 import mlx_vlm.server.cli as server_cli
 import mlx_vlm.server.generation as server_generation
 import mlx_vlm.server.openai as server_openai
@@ -4562,6 +4563,149 @@ def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch)
     assert '"type": "input_json_delta"' in body
     assert '"partial_json": "{\\"location\\": \\"SF\\"}"' in body
     assert '"stop_reason": "tool_use"' in body
+
+
+ANTHROPIC_TOOLS = [
+    {
+        "name": "get_time",
+        "description": "Get the current time",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_weather",
+        "description": "Get the current weather",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+]
+
+
+def _anthropic_tool_choice_request(client, tool_choice, tools=ANTHROPIC_TOOLS):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(text="done", prompt_tokens=5, generation_tokens=2)
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                "tools": tools,
+                "tool_choice": tool_choice,
+                "max_tokens": 32,
+            },
+        )
+    return response, mock_template
+
+
+def test_anthropic_messages_tool_choice_none_disables_tools(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+
+    response, mock_template = _anthropic_tool_choice_request(client, {"type": "none"})
+
+    assert response.status_code == 200
+    assert mock_template.call_args.kwargs["tools"] is None
+    assert mock_template.call_args.kwargs["tool_choice"] == "none"
+
+
+def test_anthropic_messages_any_tool_choice_adds_instruction(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+
+    response, mock_template = _anthropic_tool_choice_request(client, {"type": "any"})
+
+    assert response.status_code == 200
+    messages = mock_template.call_args.args[2]
+    assert "must call one or more" in messages[-1]["content"]
+    selected_tools = mock_template.call_args.kwargs["tools"]
+    assert [tool["function"]["name"] for tool in selected_tools] == [
+        "get_time",
+        "get_weather",
+    ]
+    assert mock_template.call_args.kwargs["tool_choice"] == "required"
+
+
+def test_anthropic_messages_forced_tool_choice_filters_tools(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+
+    response, mock_template = _anthropic_tool_choice_request(
+        client, {"type": "tool", "name": "get_time"}
+    )
+
+    assert response.status_code == 200
+    messages = mock_template.call_args.args[2]
+    assert "must call the 'get_time' function" in messages[-1]["content"]
+    selected_tools = mock_template.call_args.kwargs["tools"]
+    assert [tool["function"]["name"] for tool in selected_tools] == ["get_time"]
+    assert mock_template.call_args.kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "get_time"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("tool_choice", "tools", "message"),
+    [
+        (
+            {"type": "tool", "name": "missing"},
+            ANTHROPIC_TOOLS,
+            "unknown function 'missing'",
+        ),
+        ({"type": "any"}, [], "requires at least one tool"),
+    ],
+)
+def test_anthropic_messages_rejects_unsatisfiable_tool_choice(
+    client, monkeypatch, tool_choice, tools, message
+):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+
+    response, _ = _anthropic_tool_choice_request(client, tool_choice, tools=tools)
+
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["type"] == "error"
+    assert payload["error"]["type"] == "invalid_request_error"
+    assert message in payload["error"]["message"]
+
+
+def test_anthropic_count_tokens_applies_tool_choice(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server_anthropic, "prepare_inputs", return_value={}),
+        patch.object(server_anthropic, "_count_prompt_tokens", return_value=7),
+    ):
+        response = client.post(
+            "/v1/messages/count_tokens",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                "tools": ANTHROPIC_TOOLS,
+                "tool_choice": {"type": "tool", "name": "get_time"},
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"input_tokens": 7}
+    selected_tools = mock_template.call_args.kwargs["tools"]
+    assert [tool["function"]["name"] for tool in selected_tools] == ["get_time"]
 
 
 def test_cache_endpoints_report_disabled_stats_and_reset(client, monkeypatch):
