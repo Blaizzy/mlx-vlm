@@ -13,7 +13,7 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_map
 from tqdm import tqdm
 
-from .utils import Colors, grad_checkpoint, save_adapter
+from ...core import Colors, grad_checkpoint, save_adapter
 
 
 def _squeeze_leading_batch_dim(value):

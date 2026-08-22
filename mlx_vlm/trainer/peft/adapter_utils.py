@@ -6,7 +6,7 @@ from typing import Dict
 import mlx.nn as nn
 from mlx.utils import tree_unflatten
 
-from ..models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+from ...models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 from .dora_layers import DoRAEmbedding, DoRALinear
 from .lora_layers import LoRAEmbedding, LoRALinear, LoRASwitchLinear
 
