@@ -175,7 +175,7 @@ def test_mage_flow_download_uses_family_patterns(
 
     monkeypatch.setattr(download_module, "snapshot_download", fake_snapshot_download)
     assert download_module.download_model("mage-flow-turbo", max_workers=2) == tmp_path
-    assert calls["repo_id"] == "microsoft/Mage-Flow-Turbo"
+    assert calls["repo_id"] == "mage-flow-community/Mage-Flow-Turbo"
     assert calls["allow_patterns"] == list(DOWNLOAD_PATTERNS)
     assert calls["max_workers"] == 2
 
@@ -345,13 +345,29 @@ def test_mage_flow_saved_quantization_metadata(tmp_path: Path) -> None:
     index = json.loads((tmp_path / "model.safetensors.index.json").read_text())
     assert index["metadata"]["mlx_vlm_format"] == "mage_flow"
     assert index["metadata"]["tensor_layout"] == "mlx_nhwc"
-    assert index["metadata"]["quantization_mode"] == "affine"
-    assert index["metadata"]["quantization_group_size"] == "64"
-    assert index["metadata"]["quantization_level"] == "4"
+    component_config = json.loads((tmp_path / "config.json").read_text())
+    assert component_config["quantization"] == config
+    assert component_config["quantization_config"] == config
     weights, metadata = _load_safetensors(tmp_path)
-    loaded = _apply_weights(TinyModel(), weights, metadata)
+    loaded = _apply_weights(TinyModel(), weights, {**component_config, **metadata})
     assert isinstance(loaded.proj, nn.QuantizedLinear)
     assert loaded.quantization_config == config
+
+
+def test_mage_flow_quantized_weights_require_config() -> None:
+    class TinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = nn.Linear(64, 32, bias=False)
+
+    quantized = TinyModel()
+    nn.quantize(quantized, group_size=64, bits=4, mode="affine")
+    with pytest.raises(ValueError, match="quantization mode"):
+        _apply_weights(
+            TinyModel(),
+            dict(tree_flatten(quantized.parameters())),
+            {},
+        )
 
 
 def test_mage_flow_conversion_rejects_output_inside_source(tmp_path: Path) -> None:

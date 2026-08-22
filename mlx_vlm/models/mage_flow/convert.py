@@ -12,6 +12,11 @@ import mlx.core as mx
 from mlx import nn
 from mlx.utils import tree_map_with_path
 
+from mlx_vlm.quant_utils import (
+    QUANTIZATION_MODE_DEFAULTS,
+    get_quantization_params,
+    quantize_model,
+)
 from mlx_vlm.utils import (
     MODEL_CONVERSION_DTYPES,
     get_model_path,
@@ -21,13 +26,6 @@ from mlx_vlm.utils import (
 
 from .config import VARIANTS, MageFlowVariant, get_variant, variant_from_local_path
 from .weights import load_text_encoder, load_transformer, load_vae
-
-_MODE_DEFAULTS = {
-    "affine": (64, 4),
-    "mxfp4": (32, 4),
-    "nvfp4": (16, 4),
-    "mxfp8": (32, 8),
-}
 
 
 def is_mage_flow_checkpoint(model_path: str | Path) -> bool:
@@ -49,7 +47,6 @@ def convert_mage_flow(
     q_bits: int | None = None,
     q_mode: str = "affine",
     dtype: str | None = None,
-    quantize_vae: bool = False,
     upload_repo: str | None = None,
     revision: str | None = None,
 ) -> Path:
@@ -96,11 +93,7 @@ def convert_mage_flow(
             lambda: load_transformer(source),
             _transformer_quantization_predicate,
         ),
-        (
-            "vae",
-            lambda: load_vae(source),
-            (lambda path, module: True) if quantize_vae else None,
-        ),
+        ("vae", lambda: load_vae(source), None),
     )
     for name, loader, predicate in plans:
         print(f"[INFO] Converting Mage-Flow {name}")
@@ -153,7 +146,6 @@ def convert(
     q_bits: int | None = None,
     q_mode: str = "affine",
     dtype: str | None = None,
-    quantize_vae: bool = False,
     upload_repo: str | None = None,
 ) -> Path:
     model_path = get_model_path(model, revision=revision)
@@ -167,7 +159,6 @@ def convert(
         q_bits=q_bits,
         q_mode=q_mode,
         dtype=dtype,
-        quantize_vae=quantize_vae,
         upload_repo=upload_repo,
         revision=revision,
     )
@@ -211,7 +202,7 @@ def configure_parser() -> argparse.ArgumentParser:
     parser.add_argument("--q-bits", type=int, default=None)
     parser.add_argument(
         "--q-mode",
-        choices=tuple(_MODE_DEFAULTS),
+        choices=tuple(QUANTIZATION_MODE_DEFAULTS),
         default="affine",
     )
     parser.add_argument(
@@ -219,11 +210,6 @@ def configure_parser() -> argparse.ArgumentParser:
         choices=MODEL_CONVERSION_DTYPES,
         default=None,
         help="Floating-point dtype for unquantized weights.",
-    )
-    parser.add_argument(
-        "--quantize-vae",
-        action="store_true",
-        help="Also quantize compatible VAE layers.",
     )
     parser.add_argument(
         "--upload-repo",
@@ -266,23 +252,7 @@ def _quantization_parameters(
     group_size: int | None,
     bits: int | None,
 ) -> dict[str, int | str]:
-    if mode not in _MODE_DEFAULTS:
-        raise ValueError(f"Unsupported Mage-Flow quantization mode: {mode}")
-    default_group_size, default_bits = _MODE_DEFAULTS[mode]
-    resolved_group_size = group_size or default_group_size
-    resolved_bits = bits or default_bits
-    if mode != "affine" and (resolved_group_size, resolved_bits) != (
-        default_group_size,
-        default_bits,
-    ):
-        raise ValueError(
-            f"{mode} requires group_size={default_group_size}, bits={default_bits}"
-        )
-    return {
-        "group_size": resolved_group_size,
-        "bits": resolved_bits,
-        "mode": mode,
-    }
+    return get_quantization_params(group_size, bits, mode)
 
 
 def _quantize_component(
@@ -290,25 +260,15 @@ def _quantize_component(
     config: dict[str, int | str],
     predicate: Callable[[str, nn.Module], bool] | None = None,
 ) -> None:
-    group_size = int(config["group_size"])
-
-    def compatible(path: str, module: nn.Module) -> bool:
-        return (
-            (predicate is None or predicate(path, module))
-            and hasattr(module, "to_quantized")
-            and hasattr(module, "weight")
-            and module.weight.ndim == 2
-            and module.weight.shape[-1] % group_size == 0
-        )
-
-    nn.quantize(
+    _, quantized_config = quantize_model(
         model,
-        group_size=group_size,
+        {},
+        group_size=int(config["group_size"]),
         bits=int(config["bits"]),
         mode=str(config["mode"]),
-        class_predicate=compatible,
+        quant_predicate=predicate,
     )
-    model.quantization_config = dict(config)
+    model.quantization_config = dict(quantized_config["quantization"])
 
 
 def _transformer_quantization_predicate(
@@ -349,13 +309,11 @@ def _save_component(
         }
     )
     if quantization:
-        metadata.update(
-            {
-                "quantization_mode": str(quantization["mode"]),
-                "quantization_group_size": str(quantization["group_size"]),
-                "quantization_level": str(quantization["bits"]),
-            }
-        )
+        config_path = directory / "config.json"
+        config = _read_json(config_path, required=False) or {}
+        config["quantization"] = dict(quantization)
+        config["quantization_config"] = dict(quantization)
+        config_path.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
     index_path.write_text(json.dumps(index, indent=4, sort_keys=True) + "\n")
 
 

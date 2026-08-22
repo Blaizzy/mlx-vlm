@@ -12,17 +12,11 @@ from mlx.utils import tree_unflatten
 
 from mlx_vlm.models.qwen3_vl.config import ModelConfig as Qwen3VLConfig
 from mlx_vlm.models.qwen3_vl.qwen3_vl import Model as Qwen3VLModel
+from mlx_vlm.quant_utils import QUANTIZATION_MODE_DEFAULTS
 
 from .text_encoder import MageFlowTextEncoder
 from .transformer import MageFlowTransformer
 from .vae import MageVAE
-
-_QUANTIZATION_DEFAULTS = {
-    "affine": (64, 4),
-    "mxfp4": (32, 4),
-    "nvfp4": (16, 4),
-    "mxfp8": (32, 8),
-}
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +102,9 @@ def infer_quantization_config(
         return None
 
     mode_value = _metadata_value(metadata, "mode", "quantization_mode", "q_mode")
-    mode = str(mode_value).lower() if mode_value is not None else None
+    if mode_value is None:
+        raise ValueError("Quantized checkpoint is missing its quantization mode")
+    mode = str(mode_value).lower()
     bits = _metadata_int(
         metadata,
         "bits",
@@ -119,16 +115,16 @@ def infer_quantization_config(
     group_size = _metadata_int(
         metadata, "group_size", "quantization_group_size", "q_group_size"
     )
-    if mode is None:
-        mode = _infer_quantization_mode(model, weights, quantized_paths)
-    if mode not in _QUANTIZATION_DEFAULTS:
+    if bits is None or group_size is None:
+        raise ValueError("Quantized checkpoint is missing its bits or group size")
+    if mode not in QUANTIZATION_MODE_DEFAULTS:
         raise ValueError(f"Unsupported Mage-Flow quantization mode: {mode}")
-    default_group_size, default_bits = _QUANTIZATION_DEFAULTS[mode]
     config = QuantizationConfig(
-        bits=bits or default_bits,
-        group_size=group_size or default_group_size,
+        bits=bits,
+        group_size=group_size,
         mode=mode,
     )
+    default_group_size, default_bits = QUANTIZATION_MODE_DEFAULTS[mode]
     if mode != "affine" and (config.group_size, config.bits) != (
         default_group_size,
         default_bits,
@@ -138,43 +134,6 @@ def infer_quantization_config(
         )
     _validate_quantized_paths(model, weights, quantized_paths, config)
     return config
-
-
-def _infer_quantization_mode(
-    model: nn.Module,
-    weights: dict[str, mx.array],
-    paths: list[str],
-) -> str:
-    if any(f"{path}.biases" in weights for path in paths):
-        return "affine"
-    modules = dict(model.named_modules())
-    candidates = set(_QUANTIZATION_DEFAULTS) - {"affine"}
-    for path in paths:
-        module = modules.get(path)
-        packed = weights[f"{path}.weight"]
-        scales = weights[f"{path}.scales"]
-        if module is None or not hasattr(module, "weight"):
-            raise ValueError(
-                f"Quantized checkpoint path has no matching module: {path}"
-            )
-        output_dims, input_dims = module.weight.shape
-        candidates &= {
-            candidate
-            for candidate, (
-                candidate_group,
-                candidate_bits,
-            ) in _QUANTIZATION_DEFAULTS.items()
-            if candidate != "affine"
-            and tuple(packed.shape)
-            == (output_dims, (input_dims * candidate_bits + 31) // 32)
-            and tuple(scales.shape) == (output_dims, input_dims // candidate_group)
-        }
-    if len(candidates) != 1:
-        raise ValueError(
-            "Quantization metadata is required when tensor shapes do not identify "
-            f"one mode, candidates={sorted(candidates)}"
-        )
-    return candidates.pop()
 
 
 def _validate_quantized_paths(
