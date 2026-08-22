@@ -856,7 +856,7 @@ def apply_chat_template(
     model_type = config["model_type"]
 
     # Use standard formatting for text-only models.
-    if model_type not in MODEL_CONFIG:
+    if model_type.lower() not in MODEL_CONFIG:
         if isinstance(prompt, str):
             messages = [{"role": "user", "content": prompt}]
         elif isinstance(prompt, dict):

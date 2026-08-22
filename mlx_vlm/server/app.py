@@ -788,9 +788,7 @@ def get_cached_model(
     vision_cache_size = cfg.vision_cache_size
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
 
-    kv_bits = (
-        cfg.kv_bits if cfg.kv_bits is not None else get_quantized_kv_bits(model_path)
-    )
+    kv_bits = cfg.kv_bits if cfg.kv_bits is not None else get_quantized_kv_bits()
     default_key_bits, default_value_bits = get_quantized_kv_split_bits()
     kv_key_bits = cfg.kv_key_bits if cfg.kv_key_bits is not None else default_key_bits
     kv_value_bits = (

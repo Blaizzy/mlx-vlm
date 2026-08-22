@@ -14,6 +14,7 @@ import mlx.core as mx
 from fastapi import HTTPException
 
 from .. import apc as _apc
+from .._stream_cleanup import clear_mlx_streams
 from ..generate import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
@@ -313,16 +314,9 @@ def get_server_thinking_end_token():
     return os.environ.get("MLX_VLM_THINKING_END_TOKEN")
 
 
-def get_quantized_kv_bits(model: str):
+def get_quantized_kv_bits():
     kv_bits = float(os.environ.get("KV_BITS", 0))
-    if kv_bits == 0:
-        return None
-    if "qat" in model:
-        logger.info(
-            "Model %s is quantization aware; KV cache will not be quantized.", model
-        )
-        return None
-    return kv_bits
+    return kv_bits or None
 
 
 def get_quantized_kv_split_bits():
@@ -349,7 +343,7 @@ def get_max_kv_size(model: str):
     max_kv_tokens = int(os.environ.get("MAX_KV_SIZE", 0))
     if max_kv_tokens == 0:
         return None
-    if get_quantized_kv_bits(model) is not None:
+    if get_quantized_kv_bits() is not None:
         logger.warning("Model %s uses QuantizedKVCache; MAX_KV_SIZE is ignored.", model)
         return None
     return max_kv_tokens
@@ -797,6 +791,8 @@ class GenerationArguments:
             kw["reasoning"] = self.reasoning
         if self.reasoning_effort is not None:
             kw["reasoning_effort"] = self.reasoning_effort
+            # Muse Glimmer's chat template reads the reasoning_strength alias.
+            kw["reasoning_strength"] = self.reasoning_effort
         if self.thinking_budget is not None:
             kw["thinking_budget"] = self.thinking_budget
         if self.thinking_start_token is not None:
@@ -1726,6 +1722,12 @@ class ResponseGenerator:
         return pending, should_stop
 
     def _run(self):
+        try:
+            self._run_impl()
+        finally:
+            clear_mlx_streams()
+
+    def _run_impl(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
         try:
             self._initialize_model()
