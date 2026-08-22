@@ -238,6 +238,10 @@ class GenerationResult:
     diffusion_total_steps: int = 0
     diffusion_canvas_index: int = 0
     diffusion_block_complete: bool = False
+    draft_kind: Optional[str] = None
+    draft_rounds: Optional[int] = None
+    draft_n: Optional[int] = None
+    draft_n_accepted: Optional[int] = None
 
 
 class PromptCacheState:

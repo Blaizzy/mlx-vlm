@@ -2094,6 +2094,180 @@ def test_stream_generate_forwards_verbose_to_generate_step():
     assert captured["verbose"] is True
 
 
+class _SpeculativeStatsStoppingCriteria:
+    def __call__(self, token):
+        return False
+
+
+class _SpeculativeStatsDetokenizer:
+    def reset(self):
+        self.segments = []
+
+    def add_token(self, token, skip_special_token_ids=None):
+        self.segments.append(str(token))
+
+    @property
+    def last_segment(self):
+        return self.segments.pop(0) if self.segments else ""
+
+    def finalize(self):
+        pass
+
+
+def _stream_generate_for_speculative_stats(generate_step, **draft_kwargs):
+    tokenizer = SimpleNamespace(stopping_criteria=_SpeculativeStatsStoppingCriteria())
+    processor = SimpleNamespace(
+        tokenizer=tokenizer, detokenizer=_SpeculativeStatsDetokenizer()
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test", eos_token_id=[]),
+        language_model=SimpleNamespace(),
+    )
+
+    with patch.object(dispatch_module, "generate_step", side_effect=generate_step):
+        return list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="",
+                input_ids=mx.array([[1]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache=[],
+                max_tokens=1,
+                **draft_kwargs,
+            )
+        )
+
+
+def test_stream_generate_reports_request_speculative_stats_on_terminal_chunk():
+    drafter = SimpleNamespace(
+        speculative_total_rounds=10,
+        speculative_total_accepted=20.0,
+        speculative_total_drafted=30,
+    )
+
+    def fake_generate_step(*args, **kwargs):
+        drafter.speculative_total_rounds += 2
+        drafter.speculative_total_accepted += 5
+        drafter.speculative_total_drafted += 8
+        yield 7, mx.zeros((4,))
+
+    chunks = _stream_generate_for_speculative_stats(
+        fake_generate_step,
+        draft_model=drafter,
+        draft_kind="mtp",
+    )
+
+    intermediate, terminal = chunks
+    assert intermediate.draft_kind is None
+    assert intermediate.draft_rounds is None
+    assert intermediate.draft_n is None
+    assert intermediate.draft_n_accepted is None
+    assert terminal.draft_kind == "mtp"
+    assert terminal.draft_rounds == 2
+    assert terminal.draft_n == 8
+    assert terminal.draft_n_accepted == 5
+
+
+def test_stream_generate_uses_default_speculative_kind():
+    drafter = SimpleNamespace()
+
+    def fake_generate_step(*args, **kwargs):
+        drafter.speculative_total_rounds = 1
+        drafter.speculative_total_accepted = 2
+        drafter.speculative_total_drafted = 3
+        yield 7, mx.zeros((4,))
+
+    chunks = _stream_generate_for_speculative_stats(
+        fake_generate_step,
+        draft_model=drafter,
+    )
+
+    assert chunks[-1].draft_kind == "dflash"
+    assert chunks[-1].draft_rounds == 1
+    assert chunks[-1].draft_n == 3
+    assert chunks[-1].draft_n_accepted == 2
+
+
+@pytest.mark.parametrize(
+    "draft_kwargs",
+    [
+        {},
+        {
+            "draft_model": SimpleNamespace(
+                speculative_total_rounds=4,
+                speculative_total_accepted=6.0,
+                speculative_total_drafted=8,
+            ),
+            "draft_kind": "mtp",
+        },
+    ],
+    ids=["without-drafter", "without-rounds"],
+)
+def test_stream_generate_omits_speculative_stats_without_request_rounds(
+    draft_kwargs,
+):
+    def fake_generate_step(*args, **kwargs):
+        yield 7, mx.zeros((4,))
+
+    chunks = _stream_generate_for_speculative_stats(fake_generate_step, **draft_kwargs)
+
+    terminal = chunks[-1]
+    assert terminal.draft_kind is None
+    assert terminal.draft_rounds is None
+    assert terminal.draft_n is None
+    assert terminal.draft_n_accepted is None
+
+
+def test_stream_generate_reports_speculative_stats_for_zero_token_result():
+    drafter = SimpleNamespace()
+
+    def fake_generate_step(*args, **kwargs):
+        drafter.speculative_total_rounds = 1
+        drafter.speculative_total_accepted = 0
+        drafter.speculative_total_drafted = 2
+        yield from ()
+
+    chunks = _stream_generate_for_speculative_stats(
+        fake_generate_step,
+        draft_model=drafter,
+        draft_kind="mtp",
+    )
+
+    assert len(chunks) == 1
+    terminal = chunks[0]
+    assert terminal.generation_tokens == 0
+    assert terminal.draft_kind == "mtp"
+    assert terminal.draft_rounds == 1
+    assert terminal.draft_n == 2
+    assert terminal.draft_n_accepted == 0
+
+
+def test_generate_preserves_terminal_speculative_stats():
+    terminal = GenerationResult(
+        text="done",
+        draft_kind="mtp",
+        draft_rounds=2,
+        draft_n=8,
+        draft_n_accepted=5,
+    )
+    tokenizer = SimpleNamespace(stopping_criteria=MagicMock())
+    processor = SimpleNamespace(tokenizer=tokenizer)
+    model = SimpleNamespace(config=SimpleNamespace(eos_token_id=[]))
+
+    with patch.object(
+        dispatch_module, "stream_generate", return_value=iter([terminal])
+    ):
+        result = dispatch_module.generate(model, processor, "prompt")
+
+    assert result.text == "done"
+    assert result.draft_kind == "mtp"
+    assert result.draft_rounds == 2
+    assert result.draft_n == 8
+    assert result.draft_n_accepted == 5
+
+
 def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
     captured = {}
     tokenizer = SimpleNamespace(stopping_criteria=SimpleNamespace())
