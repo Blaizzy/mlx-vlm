@@ -31,6 +31,7 @@ from .generation import (
     PromptTooLongError,
     _build_metrics_envelope,
     _count_prompt_tokens,
+    preflight_speculative_args,
 )
 from .responses_state import (
     _normalize_response_input,
@@ -157,6 +158,33 @@ def _ensure_effective_input(messages, *, images=None, audio=None):
     if any(_message_has_effective_input(message) for message in messages or []):
         return
     raise HTTPException(status_code=400, detail=_MISSING_INPUT_DETAIL)
+
+
+def _preflight_speculative_stream_args(*, endpoint: str, model: str, args) -> None:
+    """Run the speculative-compat guards BEFORE the SSE stream starts.
+
+    For stream=true, ``ResponseGenerator.generate()`` runs inside an
+    already-started SSE generator, so its ``HTTPException(400)`` would be
+    swallowed by the generator's ``except Exception`` and surface as error
+    data under HTTP 200. Preflighting here turns the guards
+    (logits_processors/response_format, thinking_budget,
+    unsupported-sampling) into real 400 responses; ``generate()`` keeps the
+    same guards for defense in depth.
+    """
+    rg = runtime.response_generator
+    if rg is None:
+        return
+    try:
+        preflight_speculative_args(getattr(rg, "draft_model", None), args)
+    except HTTPException as e:
+        if runtime.metrics is not None:
+            runtime.metrics.record_failure(
+                endpoint=endpoint,
+                model=model,
+                stream=True,
+                error=str(e.detail),
+            )
+        raise
 
 
 def _tool_function_name(tool: Any) -> Optional[str]:
@@ -1035,6 +1063,11 @@ async def responses_endpoint(request: Request):
                 audio=None,
                 args=gen_args,
             )
+            _preflight_speculative_stream_args(
+                endpoint="/responses",
+                model=openai_request.model,
+                args=gen_args,
+            )
 
             async def stream_generator():
                 token_iterator = None
@@ -1769,6 +1802,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 images=images if images else None,
                 audio=audio if audio else None,
                 videos=videos if videos else None,
+                args=gen_args,
+            )
+            _preflight_speculative_stream_args(
+                endpoint="/chat/completions",
+                model=request.model,
                 args=gen_args,
             )
 
