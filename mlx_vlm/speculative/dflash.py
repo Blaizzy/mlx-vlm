@@ -125,7 +125,7 @@ def _sample_dflash_target_block(
     base_positions: List[int],
 ) -> mx.array:
     batch, length, vocab_size = logits.shape
-    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    logprobs = _dflash_target_logprobs(logits)
     flat_logprobs = logprobs.reshape(batch * length, vocab_size)
     positions = [
         int(base_position) + position
@@ -138,6 +138,16 @@ def _sample_dflash_target_block(
         row_ids=rows,
         positions=positions,
     ).reshape(batch, length)
+
+
+def _dflash_target_logprobs(logits: mx.array) -> mx.array:
+    return mx.stack(
+        [
+            row - mx.logsumexp(row, axis=-1, keepdims=True)
+            for row in (logits[:, position, :] for position in range(logits.shape[1]))
+        ],
+        axis=1,
+    )
 
 
 def _sample_dflash_target_walk(
@@ -162,7 +172,7 @@ def _sample_dflash_target_walk(
     batch, length, _ = logits.shape
     draft_count = int(draft_tokens.shape[1])
     draft_rows = draft_tokens.tolist()
-    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    logprobs = _dflash_target_logprobs(logits)
 
     for position in range(length):
         target_tokens = sampler(logprobs[:, position, :])

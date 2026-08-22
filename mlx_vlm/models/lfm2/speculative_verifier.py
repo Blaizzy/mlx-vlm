@@ -22,6 +22,14 @@ class Lfm2ExactSpeculativeVerifier:
     def _linear(linear, x: mx.array) -> mx.array:
         output = exact_speculative_verify_weight(linear.weight, x)
         if output is None:
+            if x.ndim == 3 and x.shape[1] > 1:
+                return mx.concatenate(
+                    [
+                        linear(x[:, position : position + 1])
+                        for position in range(x.shape[1])
+                    ],
+                    axis=1,
+                )
             return linear(x)
         if hasattr(linear, "bias"):
             output = output + linear.bias
