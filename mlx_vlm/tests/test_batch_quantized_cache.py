@@ -194,6 +194,29 @@ class TestState:
         assert state[1] is None
 
 
+class TestTrim:
+    def test_trim_updates_active_length_and_row_offsets(self):
+        cache = BatchQuantizedKVCache([2, 0], group_size=GROUP_SIZE, bits=BITS)
+        k, v = _rand_kv(B, 7)
+        cache.update_and_fetch(k, v)
+
+        assert cache.is_trimmable()
+        assert cache.trim(3) == 3
+        mx.eval(cache.offset)
+
+        assert cache._idx == 4
+        assert cache.offset.tolist() == [2, 4]
+        assert cache.state[0][0].shape[-2] == 4
+        assert cache.state[1][0].shape[-2] == 4
+
+        # Trimming is bounded by the active cache length and restores the
+        # original per-row offsets without reallocating the backing storage.
+        assert cache.trim(99) == 4
+        mx.eval(cache.offset)
+        assert cache._idx == 0
+        assert cache.offset.tolist() == [-2, 0]
+
+
 class TestMakeMask:
     def test_make_mask_matches_batch_kv_cache_with_left_padding(self):
         left_padding = [2, 0]
