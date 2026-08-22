@@ -39,9 +39,12 @@ def _resolve_load_variant(
     model: str,
     model_path: str | Path | None,
 ) -> MageFlowVariant:
-    if model_path is not None:
-        return variant_from_local_path(model_path)
-    return resolve_variant(model)
+    try:
+        return resolve_variant(model)
+    except ValueError:
+        if model_path is not None:
+            return variant_from_local_path(model_path)
+        raise
 
 
 def _can_load(model: str, *, task: str) -> bool:

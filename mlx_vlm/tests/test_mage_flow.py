@@ -148,6 +148,14 @@ def test_mage_flow_load_prefers_local_metadata(tmp_path: Path) -> None:
     )
 
 
+def test_mage_flow_load_prefers_explicit_variant(tmp_path: Path) -> None:
+    model_path = tmp_path / "unrelated-edit-turbo-directory" / "model"
+    _write_layout(model_path)
+    assert (
+        _resolve_load_variant("mage-flow-base", model_path).name == "mage-flow-base"
+    )
+
+
 def test_mage_flow_local_variant_uses_cache_parent_name(tmp_path: Path) -> None:
     snapshot = (
         tmp_path / "models--microsoft--Mage-Flow-Edit-Turbo" / "snapshots" / "hash"
