@@ -1401,7 +1401,7 @@ class GenerationBatch:
 
 
 class SpeculativeGenerationBatch:
-    """GenerationBatch-compatible wrapper for server-side MTP decode."""
+    """GenerationBatch-compatible wrapper for server-side speculative decode."""
 
     is_speculative = True
     Response = GenerationBatch.Response
