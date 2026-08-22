@@ -211,6 +211,21 @@ def kv_sequence_length(keys) -> int:
     return _turboquant_state_length(keys)
 
 
+def slice_kv_sequence(state, end: int):
+    """Return the ``[..., :end, :]`` sequence prefix of a KV state.
+
+    Unquantized caches hand back a plain ``[B, H, S, D]`` array; uniform
+    quantized caches hand back a ``(packed, scales, biases)`` tuple whose
+    components all carry the sequence on axis 2. Slice every component so
+    callers such as speculative target verification can narrow the prefix
+    without first dequantizing. Other state wrappers implement the same
+    four-axis slice directly.
+    """
+    if type(state) in (tuple, list):
+        return tree_map(lambda x: x[:, :, :end, :], state)
+    return state[:, :, :end, :]
+
+
 def create_attention_mask(
     h, cache=None, window_size: Optional[int] = None, return_array: bool = False
 ):

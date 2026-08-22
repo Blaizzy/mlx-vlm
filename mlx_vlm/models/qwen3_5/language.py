@@ -8,7 +8,9 @@ from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    kv_sequence_length,
     scaled_dot_product_attention,
+    slice_kv_sequence,
 )
 from ..cache import ArraysCache, KVCache
 from ..exact_speculative_verify import exact_speculative_verify_dense_available
@@ -1543,13 +1545,13 @@ class Qwen3_5Attention(nn.Module):
             output = None
 
         if output is None and target_verify and L > 1:
-            prefix_len = keys.shape[-2] - L
+            prefix_len = kv_sequence_length(keys) - L
             output = mx.concatenate(
                 [
                     scaled_dot_product_attention(
                         queries[:, :, i : i + 1, :],
-                        keys[:, :, : prefix_len + i + 1, :],
-                        values[:, :, : prefix_len + i + 1, :],
+                        slice_kv_sequence(keys, prefix_len + i + 1),
+                        slice_kv_sequence(values, prefix_len + i + 1),
                         cache=cache,
                         scale=self.scale,
                         mask=(
