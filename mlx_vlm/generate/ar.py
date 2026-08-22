@@ -30,9 +30,18 @@ from ..speculative.utils import (
 from ..turboquant import BatchTurboQuantKVCache, turboquant_enabled
 from ..utils import group_images_by_shape, prepare_inputs, should_add_special_tokens
 from .common import (
+    DEFAULT_COMPLETION_BATCH_SIZE,
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_MIN_P,
+    DEFAULT_PREFILL_BATCH_SIZE,
+    DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
+    DEFAULT_REPETITION_CONTEXT_SIZE,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_K,
+    DEFAULT_TOP_P,
     _chunked_prefill_enabled,
     generation_stream,
     maybe_quantize_kv_cache,
@@ -42,16 +51,7 @@ from .types import GenerateKwargs, ProcessorLike, Unpack
 
 logger = logging.getLogger("mlx_vlm.generate")
 
-DEFAULT_MAX_TOKENS = 2048
-DEFAULT_TEMPERATURE = 0.0
-DEFAULT_TOP_P = 1.0
-DEFAULT_TOP_K = 0
-DEFAULT_MIN_P = 0.0
 DEFAULT_TOP_N_SIGMA = 0.0
-DEFAULT_REPETITION_CONTEXT_SIZE = 20
-DEFAULT_PREFILL_STEP_SIZE = 2048
-DEFAULT_COMPLETION_BATCH_SIZE = 32
-DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
 
 
