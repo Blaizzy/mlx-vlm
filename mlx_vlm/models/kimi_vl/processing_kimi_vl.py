@@ -327,6 +327,28 @@ class KimiVLProcessor(ProcessorMixin):
     image_processor_class = "KimiVLImageProcessor"
     tokenizer_class = "AutoTokenizer"
 
+    # The chat template terminates every turn with <|im_end|>, which is not an
+    # eos id in the shipped configs, so generation runs past the model's turn
+    # boundary. Role openers are included because the published MLX conversions
+    # renumber the special tokens relative to the upstream tiktoken vocabulary
+    # (e.g. the model's <|im_end|> id decodes as <|im_assistant|>), so the
+    # boundary the model actually emits can surface as any of these.
+    turn_boundary_tokens = (
+        "<|im_end|>",
+        "<|im_user|>",
+        "<|im_assistant|>",
+        "<|im_system|>",
+    )
+
+    @property
+    def additional_eos_token_ids(self):
+        token_ids = []
+        for token in self.turn_boundary_tokens:
+            token_id = self.tokenizer.convert_tokens_to_ids(token)
+            if token_id is not None and token_id not in token_ids:
+                token_ids.append(token_id)
+        return token_ids
+
     def __init__(
         self,
         image_processor=None,
