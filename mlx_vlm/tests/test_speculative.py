@@ -8,7 +8,7 @@ import importlib
 import json
 from pathlib import Path
 from types import MethodType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -3097,6 +3097,47 @@ def test_deepseek_v4_rollback_speculative_cache_handles_turboquant_batch_tail_ze
     assert mx.all(cache.keys.indices[0, :, 3:5, :] == 0).item()
     assert mx.all(cache.values.norms[0, :, 3:5] == 0).item()
     assert mx.any(cache.keys.norms[1, :, 3:5] != 0).item()
+
+
+def test_deepseek_v4_rollback_speculative_cache_accepts_python_list():
+    class DummyCache:
+        keys = None
+
+        def __init__(self):
+            self.trims = []
+
+        def trim(self, n):
+            self.trims.append(n)
+
+    cache = DummyCache()
+
+    max_a = deepseek_language.LanguageModel.rollback_speculative_cache(
+        SimpleNamespace(), [cache], None, [0], block_size=2
+    )
+
+    assert max_a == 0
+    assert cache.trims == [1]
+
+
+def test_deepseek_v4_rollback_speculative_cache_replays_python_list_acceptance():
+    language = MagicMock()
+    verify_inputs = mx.array([[7, 8]], dtype=mx.int32)
+
+    with patch.object(deepseek_language, "_restore_cache_state") as restore:
+        max_a = deepseek_language.LanguageModel.rollback_speculative_cache(
+            language,
+            [],
+            ("snapshot", verify_inputs),
+            [0],
+            block_size=2,
+        )
+
+    assert max_a == 0
+    restore.assert_called_once_with([], "snapshot")
+    language.assert_called_once()
+    replay_inputs = language.call_args.args[0]
+    assert replay_inputs.tolist() == [[7]]
+    assert language.call_args.kwargs == {"cache": [], "skip_logits": True}
 
 
 def test_qwen3_5_mtp_filter_batch_keeps_drafter_state_aligned():
