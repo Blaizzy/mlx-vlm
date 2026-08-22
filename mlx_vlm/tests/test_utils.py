@@ -17,7 +17,11 @@ from mlx_vlm.utils import (
     StoppingCriteria,
     _drop_modules_without_weights,
     _load_safetensors,
+    _quantization_for_module_path,
+    _quantization_path_aliases,
+    _transform_modelopt_nvfp4_weights,
     apply_generation_config_defaults,
+    estimate_num_image_tokens,
     get_model_and_args,
     get_model_path,
     load,
@@ -26,10 +30,36 @@ from mlx_vlm.utils import (
     load_model,
     load_processor,
     prepare_inputs,
+    process_image,
     process_inputs_with_fallback,
     sanitize_weights,
     update_module_configs,
 )
+
+
+def test_transform_modelopt_nvfp4_weights():
+    packed = mx.arange(32, dtype=mx.uint8).reshape(2, 16)
+    weights = {
+        "layer.weight": packed,
+        "layer.weight_scale": mx.array([[56, 64], [72, 80]], dtype=mx.uint8),
+        "layer.weight_scale_2": mx.array(0.5, dtype=mx.float32),
+        "layer.input_scale": mx.array(0.25, dtype=mx.float32),
+        "layer.bias": mx.ones((2,)),
+    }
+
+    transformed, quantization = _transform_modelopt_nvfp4_weights(
+        weights,
+        {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+    )
+
+    assert transformed["layer.weight"].dtype == mx.uint32
+    assert transformed["layer.weight"].shape == (2, 4)
+    assert transformed["layer.scales"].tolist() == [[48, 56], [64, 72]]
+    assert mx.array_equal(transformed["layer.bias"], weights["layer.bias"])
+    assert "layer.weight_scale" not in transformed
+    assert "layer.weight_scale_2" not in transformed
+    assert "layer.input_scale" not in transformed
+    assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 
 
 class MockTensor:
@@ -800,6 +830,169 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
     assert quantize.call_args.kwargs["mode"] == "affine"
 
 
+def test_quantization_path_aliases_require_a_model_hook_for_model_specific_names():
+    module_path = "language_model.model.layers.0.ffn.shared_experts.gate_proj"
+
+    aliases = _quantization_path_aliases(module_path)
+
+    assert "model.layers.0.ffn.shared_experts.gate_proj" in aliases
+    assert "layers.0.ffn.shared_experts.gate_proj" not in aliases
+    assert "layers.0.ffn.shared_experts.w1" not in aliases
+
+
+def test_deepseek_v4_module_path_spelling_wins_over_sanitized_alias():
+    from mlx_vlm.models import deepseek_v4
+
+    class AliasModel(nn.Module):
+        @staticmethod
+        def quantization_path_aliases(path):
+            return deepseek_v4.Model.quantization_path_aliases(path)
+
+    module_path = "language_model.model.layers.0.ffn.shared_experts.gate_proj"
+    module_path_spec = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    sanitized_alias_spec = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    quantization = {
+        "model.layers.0.ffn.shared_experts.gate_proj": module_path_spec,
+        "layers.0.ffn.shared_experts.w1": sanitized_alias_spec,
+    }
+
+    resolved = _quantization_for_module_path(
+        quantization,
+        module_path,
+        AliasModel(),
+    )
+
+    assert resolved == module_path_spec
+
+
+def test_load_model_matches_deepseek_v4_quantization_aliases():
+    from mlx_vlm.models import deepseek_v4
+
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeDeepseekV4Model(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.language_model = nn.Module()
+            self.language_model.model = nn.Module()
+            self.language_model.model.layers = [nn.Module()]
+            self.language_model.model.layers[0].ffn = nn.Module()
+            self.language_model.model.layers[0].ffn.shared_experts = nn.Module()
+            self.language_model.model.layers[0].ffn.shared_experts.gate_proj = (
+                nn.Linear(64, 64, bias=False)
+            )
+            self.language_model.lm_head = nn.Linear(64, 64, bias=False)
+
+        def load_weights(self, weights, strict=True):
+            self.loaded_weights = weights
+            self.loaded_strict = strict
+
+        @staticmethod
+        def quantization_path_aliases(path):
+            return deepseek_v4.Model.quantization_path_aliases(path)
+
+    fake_model_class = SimpleNamespace(
+        ModelConfig=FakeConfig, Model=FakeDeepseekV4Model
+    )
+    mxfp8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    quantization = {
+        "group_size": 32,
+        "bits": 4,
+        "mode": "mxfp4",
+        "layers.0.ffn.shared_experts.w1": mxfp8,
+        "head": False,
+    }
+
+    with (
+        patch(
+            "mlx_vlm.utils.load_config",
+            return_value={
+                "model_type": "deepseek_v4",
+                "quantization": quantization,
+            },
+        ),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value={}),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "deepseek_v4"),
+        ),
+        patch("mlx_vlm.utils.nn.quantize") as quantize,
+    ):
+        load_model(Path("/tmp/model"), lazy=True)
+
+    predicate = quantize.call_args.kwargs["class_predicate"]
+    fake_model = FakeDeepseekV4Model(FakeConfig())
+    shared_expert_spec = predicate(
+        "language_model.model.layers.0.ffn.shared_experts.gate_proj",
+        fake_model.language_model.model.layers[0].ffn.shared_experts.gate_proj,
+    )
+    head_spec = predicate(
+        "language_model.lm_head",
+        fake_model.language_model.lm_head,
+    )
+
+    assert shared_expert_spec == mxfp8
+    assert head_spec == {}
+
+
+def test_load_model_uses_qwen_fine_grained_fp8_quantization_config():
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeQwenModel(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.proj = nn.Linear(128, 128, bias=False)
+
+        def load_weights(self, weights, strict=True):
+            self.loaded_weights = weights
+            self.loaded_strict = strict
+
+    fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeQwenModel)
+    source_config = {
+        "model_type": "qwen3_5",
+        "quantization_config": {
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "weight_block_size": [128, 128],
+        },
+    }
+
+    with (
+        patch("mlx_vlm.utils.load_config", return_value=source_config),
+        patch(
+            "mlx_vlm.utils.glob.glob",
+            return_value=["/tmp/model/model.safetensors"],
+        ),
+        patch(
+            "mlx_vlm.utils._load_safetensors",
+            return_value={
+                "proj.weight": mx.zeros((128, 32), dtype=mx.uint32),
+                "proj.scales": mx.zeros((128, 4), dtype=mx.uint8),
+            },
+        ),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "qwen3_5"),
+        ),
+        patch("mlx_vlm.utils.nn.quantize") as quantize,
+    ):
+        load_model(Path("/tmp/model"), lazy=True)
+
+    quantize.assert_called_once()
+    assert quantize.call_args.kwargs["group_size"] == 32
+    assert quantize.call_args.kwargs["bits"] == 8
+    assert quantize.call_args.kwargs["mode"] == "mxfp8"
+
+
 def test_load_model_quantizes_projector_with_scales_when_skip_vision():
     class FakeConfig:
         @classmethod
@@ -977,3 +1170,87 @@ class TestLoadImage:
     def test_nonexistent_path_object_raises(self):
         with pytest.raises(ValueError, match="Failed to load image"):
             load_image(Path("/nonexistent/path/image.png"))
+
+
+class TestProcessImage:
+    def _image(self, width=640, height=480):
+        from PIL import Image
+
+        return Image.new("RGB", (width, height), color=(120, 40, 200))
+
+    def test_resize_shape_applied_without_custom_processor(self):
+        img = process_image(self._image(), (320, 320), None)
+        assert max(img.size) <= 320
+
+    def test_resize_shape_ignored_with_custom_processor_warns(self):
+        from mlx_vlm.models.base import BaseImageProcessor
+
+        class DummyProcessor(BaseImageProcessor):
+            def preprocess(self, images):
+                return images
+
+        original = self._image()
+        with pytest.warns(UserWarning, match="resize_shape.*DummyProcessor"):
+            img = process_image(original, (320, 320), DummyProcessor())
+
+        assert img.size == original.size
+
+    def test_no_resize_shape_no_warning(self):
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            img = process_image(self._image(), None, None)
+        assert img.size == (640, 480)
+
+
+class TestEstimateNumImageTokens:
+    def _processor(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+        return Qwen3VLImageProcessor()
+
+    def _actual_tokens(self, processor, width, height, **kwargs):
+        import numpy as np
+        from PIL import Image
+
+        img = Image.new("RGB", (width, height), color=(9, 30, 51))
+        grid = processor([img], **kwargs)["image_grid_thw"][0]
+        return int(np.prod(grid)) // processor.merge_size**2
+
+    @pytest.mark.parametrize(
+        "width,height",
+        [(64, 64), (640, 480), (1000, 1400), (2500, 1200), (333, 517)],
+    )
+    def test_estimate_matches_actual_processing(self, width, height):
+        processor = self._processor()
+        estimate = estimate_num_image_tokens(processor, height, width)
+        assert estimate == self._actual_tokens(processor, width, height)
+
+    @pytest.mark.parametrize("max_pixels", [256 * 256, 512 * 512])
+    def test_estimate_matches_actual_with_max_pixels(self, max_pixels):
+        processor = self._processor()
+        estimate = estimate_num_image_tokens(
+            processor, 1400, 1000, max_pixels=max_pixels
+        )
+        assert estimate == self._actual_tokens(
+            processor, 1000, 1400, max_pixels=max_pixels
+        )
+
+    def test_estimate_matches_actual_with_resized_dimensions(self):
+        processor = self._processor()
+        estimate = estimate_num_image_tokens(
+            processor, 1400, 1000, resized_height=448, resized_width=448
+        )
+        assert estimate == self._actual_tokens(
+            processor, 1000, 1400, resized_height=448, resized_width=448
+        )
+
+    def test_dispatcher_unwraps_wrapped_processor(self):
+        wrapped = SimpleNamespace(image_processor=self._processor())
+        direct = estimate_num_image_tokens(self._processor(), 480, 640)
+        assert estimate_num_image_tokens(wrapped, 480, 640) == direct
+
+    def test_unsupported_processor_raises(self):
+        with pytest.raises(NotImplementedError, match="num_image_tokens"):
+            estimate_num_image_tokens(SimpleNamespace(), 480, 640)
