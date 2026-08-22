@@ -23,7 +23,6 @@ from mlx_vlm.speculative.drafters.dspark import (
     ModelConfig,
     validate_dspark_target,
 )
-from mlx_vlm.speculative.utils import run_speculative_rounds
 from mlx_vlm.utils import get_model_and_args
 
 
@@ -270,7 +269,15 @@ def _tiny_qwen38_target():
     return model
 
 
-def _generated_tokens(target, prompt, drafter=None):
+def _generated_tokens(
+    target,
+    prompt,
+    drafter=None,
+    *,
+    max_tokens=10,
+    temperature=0,
+    seed=None,
+):
     kwargs = {}
     if drafter is not None:
         kwargs.update(draft_model=drafter, draft_kind="dflash")
@@ -300,8 +307,9 @@ def _generated_tokens(target, prompt, drafter=None):
             generation_target,
             None,
             None,
-            max_tokens=10,
-            temperature=0,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            seed=seed,
             prefill_step_size=None,
             **kwargs,
         )
@@ -831,24 +839,70 @@ def test_dspark_repeated_generation_resets_request_state(
     assert drafter.draft_lens == first_draft_lens
 
 
-def test_dspark_rejects_non_greedy_speculative_sampling():
-    drafter = DSparkDraftModel(_tiny_draft_config())
-    rounds = run_speculative_rounds(
-        None,
+@pytest.mark.parametrize(
+    ("target_factory", "draft_config_factory"),
+    [
+        (_tiny_target, _tiny_draft_config),
+        (_tiny_qwen38_target, _tiny_qwen38_draft_config),
+    ],
+)
+@pytest.mark.parametrize("temperature", [0.25, 0.5, 1.0])
+def test_sampled_dspark_generation_matches_baseline(
+    target_factory,
+    draft_config_factory,
+    temperature,
+):
+    mx.random.seed(37)
+    target = target_factory()
+    drafter = DSparkDraftModel(draft_config_factory())
+    mx.eval(target.parameters(), drafter.parameters())
+    prompt = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+
+    baseline = _generated_tokens(
+        target,
+        prompt,
+        max_tokens=24,
+        temperature=temperature,
+        seed=41,
+    )
+    speculative = _generated_tokens(
+        target,
+        prompt,
         drafter,
-        [],
-        mx.array([[1]], dtype=mx.int32),
-        mx.array([2], dtype=mx.int32),
-        mx.array([0.0]),
-        None,
-        draft_kind="dflash",
-        max_tokens=1,
-        sampler=lambda logits: mx.argmax(logits, axis=-1),
-        sampler_is_greedy=False,
+        max_tokens=24,
+        temperature=temperature,
+        seed=41,
     )
 
-    with pytest.raises(ValueError, match="temperature=0"):
-        next(rounds)
+    assert speculative == baseline
+    assert drafter.draft_lens
+
+
+def test_sampled_dspark_generation_matches_stateful_baseline():
+    mx.random.seed(43)
+    target = _tiny_qwen38_target()
+    drafter = DSparkDraftModel(_tiny_qwen38_draft_config())
+    mx.eval(target.parameters(), drafter.parameters())
+    prompt = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+
+    mx.random.seed(47)
+    baseline = _generated_tokens(
+        target,
+        prompt,
+        max_tokens=24,
+        temperature=0.7,
+    )
+    mx.random.seed(47)
+    speculative = _generated_tokens(
+        target,
+        prompt,
+        drafter,
+        max_tokens=24,
+        temperature=0.7,
+    )
+
+    assert speculative == baseline
+    assert drafter.draft_lens
 
 
 def test_target_compatibility_rejects_wrong_size():

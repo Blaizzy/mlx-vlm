@@ -124,7 +124,6 @@ def validate_dspark_target(config: DSparkConfig, target_model) -> None:
 class DSparkDraftModel(DFlashDraftModel):
     """Model-agnostic DSpark proposal model over a Qwen-style draft backbone."""
 
-    requires_greedy_sampling = True
     prefer_requested_block_size = False
 
     def __init__(self, config: DSparkConfig):
