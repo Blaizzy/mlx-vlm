@@ -8,7 +8,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..generate import generate, stream_generate
@@ -514,14 +514,23 @@ async def anthropic_messages_endpoint(http_request: Request):
                 model=request.model,
                 stream=True,
             )
-            await _preflight_stream_context_budget(
-                endpoint="/v1/messages",
-                model=request.model,
-                prompt=formatted_prompt,
-                images=images if images else None,
-                audio=None,
-                args=gen_args,
-            )
+            try:
+                await _preflight_stream_context_budget(
+                    endpoint="/v1/messages",
+                    model=request.model,
+                    prompt=formatted_prompt,
+                    images=images if images else None,
+                    audio=None,
+                    args=gen_args,
+                )
+            except HTTPException as e:
+                # The preflight raises HTTPException(400) for an over-budget
+                # prompt and already records the failure. Convert it to an
+                # Anthropic-format error here; otherwise the endpoint's outer
+                # ``except Exception`` reports this client error as a 500
+                # api_error with a "400: ..." message. Mirrors the dedicated
+                # HTTPException handling in the OpenAI routers.
+                return _anthropic_error_response(e.status_code, str(e.detail))
 
             async def stream_generator():
                 token_iterator = None
