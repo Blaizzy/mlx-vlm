@@ -51,28 +51,18 @@ class ErnieImageGenerationModel(ImageGenerationModel):
     def default_guidance(self) -> float:
         return self.pipeline.variant.default_guidance
 
-    @property
-    def default_width(self) -> int:
-        return 1024
-
-    @property
-    def default_height(self) -> int:
-        return 1024
-
     def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
         steps = self.default_steps if request.steps is None else request.steps
         guidance = (
             self.default_guidance if request.guidance is None else request.guidance
         )
-        width = self.default_width if request.width is None else request.width
-        height = self.default_height if request.height is None else request.height
         array = self.pipeline.generate_array(
             request.prompt,
             seed=seed,
             steps=steps,
-            width=width,
-            height=height,
+            width=request.width,
+            height=request.height,
             guidance=guidance,
             negative_prompt=str(request.extra.get("negative_prompt", "")),
         )
@@ -91,8 +81,8 @@ class ErnieImageGenerationModel(ImageGenerationModel):
         return ImageGenerationResult(
             array=array,
             seed=seed,
-            width=width,
-            height=height,
+            width=request.width,
+            height=request.height,
             steps=steps,
             model=self.model_id,
             family=self.family,
@@ -141,6 +131,7 @@ class ErnieImageGenerationModel(ImageGenerationModel):
             evict_text_encoder=kwargs.pop("evict_text_encoder", True),
             evict_transformer=kwargs.pop("evict_transformer", False),
             max_sequence_length=kwargs.pop("max_sequence_length", 2048),
+            prompt_cache_size=kwargs.pop("prompt_cache_size", 2),
             use_prompt_enhancer=kwargs.pop("use_prompt_enhancer", None),
             prompt_enhancer_max_tokens=kwargs.pop("prompt_enhancer_max_tokens", None),
         )

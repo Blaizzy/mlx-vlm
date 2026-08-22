@@ -6,15 +6,12 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
+from mlx import nn
 
 import mlx_vlm.models.mage_flow.download as download_module
-from mlx_vlm.generate.edit_image import (
-    ImageEditRequest,
-    edit_image,
-    image_edit_model_class,
-    is_image_edit_model,
-)
+from mlx_vlm.generate.edit_image import image_edit_model_class, is_image_edit_model
 from mlx_vlm.generate.image import (
+    ImageGenerationRequest,
     image_generation_model_class,
     is_image_generation_model,
 )
@@ -35,6 +32,8 @@ from mlx_vlm.models.mage_flow.transformer import (
     image_rope_frequencies,
 )
 from mlx_vlm.models.mage_flow.weights import (
+    _apply_weights,
+    _prepare_vae_weights,
     sanitize_transformer_weights,
     sanitize_vae_weights,
 )
@@ -107,26 +106,65 @@ def test_mage_flow_registers_generation_and_edit_families() -> None:
     assert not is_image_edit_model("mage-flow-turbo")
 
 
-def test_mage_flow_edit_uses_variant_defaults() -> None:
+def test_mage_flow_generation_uses_variant_defaults() -> None:
     pipeline = type(
         "Pipeline",
         (),
         {
-            "variant": get_variant("mage-flow-edit-base"),
+            "variant": get_variant("mage-flow-base"),
             "model_path": None,
-            "count_prompt_tokens": lambda self, prompt, edit=True: 1,
-            "edit_array": lambda self, *args, **kwargs: mx.zeros(
+            "count_prompt_tokens": lambda self, prompt: 1,
+            "generate_array": lambda self, *args, **kwargs: mx.zeros(
                 (16, 16, 3), dtype=mx.uint8
             ),
         },
     )()
-    model = MageFlowImageEditModel(pipeline=pipeline, model_id="mage-flow-edit-base")
-    result = edit_image(
-        model,
-        ImageEditRequest(prompt="edit", image_paths=("source.png",), seed=1),
-    )
+    model = MageFlowImageGenerationModel(pipeline=pipeline, model_id="mage-flow-base")
+
+    result = model.generate(ImageGenerationRequest(prompt="generate", seed=1))
+
     assert result.steps == 30
     assert result.guidance == 5.0
+
+
+def test_mage_flow_loads_native_quantized_weights() -> None:
+    from mlx.utils import tree_flatten
+
+    class TinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = nn.Linear(64, 32, bias=False)
+
+    quantized = TinyModel()
+    nn.quantize(quantized, group_size=32, bits=8, mode="mxfp8")
+    weights = dict(tree_flatten(quantized.parameters()))
+
+    loaded = _apply_weights(
+        TinyModel(),
+        weights,
+        {
+            "quantization_mode": "mxfp8",
+            "quantization_level": "8",
+            "quantization_group_size": "32",
+        },
+    )
+
+    assert loaded.quantization_config == {
+        "group_size": 32,
+        "bits": 8,
+        "mode": "mxfp8",
+    }
+
+
+def test_mage_flow_preserves_native_vae_weights() -> None:
+    weights = {
+        "decoder_model.conv.weight": mx.zeros((2, 3, 3, 4)),
+        "dconv_encoder.conv.weight": mx.zeros((2, 3, 3, 4)),
+    }
+
+    prepared = _prepare_vae_weights(weights, {"mlx_vlm_format": "mage_flow"})
+
+    assert prepared is weights
 
 
 def test_mage_flow_remote_metadata_dispatch(

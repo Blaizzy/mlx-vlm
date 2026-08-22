@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -464,15 +465,15 @@ def test_model_request_defaults_follow_variant(
     assert result.steps == steps
     assert result.guidance == guidance
     assert result.metadata["classifier_free_guidance"] is cfg
-    assert result.width == result.height == 1024
+    assert result.width == result.height == 512
     assert pipeline.calls[0][1]["negative_prompt"] == "fog"
 
 
-def test_generation_request_defaults_remain_valid_for_edit_bridge() -> None:
+def test_generation_request_converts_to_edit_request() -> None:
     class FakeEditModel:
         def edit(self, request):
-            assert request.steps == 4
-            assert request.guidance == 1.0
+            assert isinstance(request, ImageEditRequest)
+            assert request.image_paths == ("reference.png",)
             return SimpleNamespace(path=None)
 
     generate_image(
@@ -648,6 +649,21 @@ def _fake_runtime_pipeline(variant: str, *, evict: bool = False) -> ErnieImagePi
     )
     pipeline._ensure_components = lambda **kwargs: None
     return pipeline
+
+
+def test_prompt_cache_evicts_least_recently_used_entry() -> None:
+    pipeline = ErnieImagePipeline.__new__(ErnieImagePipeline)
+    pipeline.runtime_config = ErnieImageRuntimeConfig(prompt_cache_size=2)
+    pipeline.prompt_cache = OrderedDict()
+    pipeline.tokenizer = SimpleNamespace(encode=lambda prompt: prompt)
+    pipeline.text_encoder = lambda prompt: mx.array([len(prompt)])
+
+    first = pipeline._encode_prompt("first")
+    pipeline._encode_prompt("second")
+    assert pipeline._encode_prompt("first") is first
+    pipeline._encode_prompt("third")
+
+    assert list(pipeline.prompt_cache) == ["first", "third"]
 
 
 def test_base_cfg_batches_unconditional_before_conditional() -> None:

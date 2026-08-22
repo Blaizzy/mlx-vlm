@@ -60,8 +60,8 @@ class ImageGenerationRequest:
     prompt: str
     seed: int | None = None
     steps: int | None = None
-    width: int | None = None
-    height: int | None = None
+    width: int = 512
+    height: int = 512
     guidance: float | None = None
     output_format: Literal["png"] = DEFAULT_IMAGE_FORMAT
     extra: dict[str, Any] = field(default_factory=dict)
@@ -569,26 +569,6 @@ def generate_image(
 
     if request.seed is None:
         request = replace(request, seed=random.randrange(2**32))
-    if request.width is None:
-        request = replace(
-            request,
-            width=int(getattr(model, "default_width", 512)),
-        )
-    if request.height is None:
-        request = replace(
-            request,
-            height=int(getattr(model, "default_height", 512)),
-        )
-    if request.steps is None:
-        request = replace(
-            request,
-            steps=int(getattr(model, "default_steps", DEFAULT_IMAGE_STEPS)),
-        )
-    if request.guidance is None:
-        request = replace(
-            request,
-            guidance=float(getattr(model, "default_guidance", DEFAULT_IMAGE_GUIDANCE)),
-        )
 
     data = model.generate(request)
     if output_path is not None:
@@ -678,13 +658,6 @@ def run_image_generation_cli(args: Any) -> None:
             else Path("outputs") / f"edit-{seed}.png"
         )
         model = load_image_model(args.model, task="edit", **load_kwargs)
-        if steps is None:
-            steps = int(getattr(model, "default_steps", DEFAULT_IMAGE_STEPS))
-        guidance = (
-            float(getattr(model, "default_guidance", DEFAULT_IMAGE_GUIDANCE))
-            if args.guidance is None
-            else args.guidance
-        )
         request = ImageEditRequest(
             prompt=prompt,
             image_paths=tuple(args.image),
@@ -692,7 +665,7 @@ def run_image_generation_cli(args: Any) -> None:
             steps=steps,
             width=width,
             height=height,
-            guidance=guidance,
+            guidance=args.guidance,
             extra=dict(getattr(args, "gen_kwargs", {}) or {}),
         )
         result = generate_image(
@@ -702,18 +675,13 @@ def run_image_generation_cli(args: Any) -> None:
             output_path=output_path,
         )
     else:
-        model = load_image_model(args.model, task="generate", **load_kwargs)
-        size = getattr(args, "size", None)
-        if size is None:
-            width = int(getattr(model, "default_width", 512))
-            height = int(getattr(model, "default_height", 512))
-        else:
-            width, height = parse_size(size)
+        width, height = parse_size(getattr(args, "size", None) or DEFAULT_IMAGE_SIZE)
         output_path = (
             Path(args.output).expanduser()
             if args.output is not None
             else Path("outputs") / f"image-{seed}.png"
         )
+        model = load_image_model(args.model, task="generate", **load_kwargs)
         extra = dict(getattr(args, "gen_kwargs", {}) or {})
         prompt_expansion_model = getattr(args, "prompt_expansion_model", None)
         if prompt_expansion_model is not None:

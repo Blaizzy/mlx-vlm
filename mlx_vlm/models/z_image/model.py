@@ -38,16 +38,6 @@ class ZImageGenerationModel(ImageGenerationModel):
     def variant(self) -> str | None:
         return self.pipeline.config.variant
 
-    @property
-    def default_steps(self) -> int:
-        """Return the generation denoising-step default for this variant."""
-        return self.pipeline.config.default_steps
-
-    @property
-    def default_guidance(self) -> float:
-        """Return the generation guidance default for this variant."""
-        return self.pipeline.config.default_guidance
-
     def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
         steps = request.resolve_steps(self.pipeline.config.default_steps)
@@ -124,16 +114,6 @@ class ZImageEditModel(ImageEditModel):
     @property
     def variant(self) -> str | None:
         return self.pipeline.config.variant
-
-    @property
-    def default_steps(self) -> int:
-        """Return the img2img denoising-step default for this variant."""
-        return 8 if self.variant == "turbo" else 50
-
-    @property
-    def default_guidance(self) -> float:
-        """Return the img2img guidance default for this variant."""
-        return self.pipeline.config.default_guidance
 
     def edit(self, request: ImageEditRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import math
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +24,7 @@ class ErnieImageRuntimeConfig:
     evict_text_encoder: bool = True
     evict_transformer: bool = False
     max_sequence_length: int = 2048
+    prompt_cache_size: int = 2
     use_prompt_enhancer: bool | None = None
     prompt_enhancer_max_tokens: int | None = None
 
@@ -107,7 +109,7 @@ class ErnieImagePipeline:
         self.prompt_enhancer = None
         self.transformer = None
         self.vae = None
-        self.prompt_cache: dict[str, mx.array] = {}
+        self.prompt_cache: OrderedDict[str, mx.array] = OrderedDict()
         self.last_revised_prompt: str | None = None
 
     @classmethod
@@ -123,6 +125,7 @@ class ErnieImagePipeline:
         evict_text_encoder: bool = True,
         evict_transformer: bool = False,
         max_sequence_length: int = 2048,
+        prompt_cache_size: int = 2,
         use_prompt_enhancer: bool | None = None,
         prompt_enhancer_max_tokens: int | None = None,
     ) -> "ErnieImagePipeline":
@@ -145,6 +148,7 @@ class ErnieImagePipeline:
                 evict_text_encoder=evict_text_encoder,
                 evict_transformer=evict_transformer,
                 max_sequence_length=max_sequence_length,
+                prompt_cache_size=prompt_cache_size,
                 use_prompt_enhancer=use_prompt_enhancer,
                 prompt_enhancer_max_tokens=prompt_enhancer_max_tokens,
             ),
@@ -171,11 +175,15 @@ class ErnieImagePipeline:
     def _encode_prompt(self, prompt: str) -> mx.array:
         cached = self.prompt_cache.get(prompt)
         if cached is not None:
+            self.prompt_cache.move_to_end(prompt)
             return cached
         input_ids = self.tokenizer.encode(prompt)
         hidden_states = self._ensure_text_encoder()(input_ids)
         mx.eval(hidden_states)
-        self.prompt_cache[prompt] = hidden_states
+        if self.runtime_config.prompt_cache_size > 0:
+            self.prompt_cache[prompt] = hidden_states
+            while len(self.prompt_cache) > self.runtime_config.prompt_cache_size:
+                self.prompt_cache.popitem(last=False)
         return hidden_states
 
     def _encode_prompts(self, prompts: list[str]) -> tuple[mx.array, mx.array]:
@@ -244,8 +252,8 @@ class ErnieImagePipeline:
         *,
         seed: int = 42,
         steps: int | None = None,
-        width: int = 1024,
-        height: int = 1024,
+        width: int = 512,
+        height: int = 512,
         guidance: float | None = None,
         negative_prompt: str = "",
     ) -> Image.Image:
@@ -269,8 +277,8 @@ class ErnieImagePipeline:
         *,
         seed: int = 42,
         steps: int | None = None,
-        width: int = 1024,
-        height: int = 1024,
+        width: int = 512,
+        height: int = 512,
         guidance: float | None = None,
         negative_prompt: str = "",
     ) -> mx.array:

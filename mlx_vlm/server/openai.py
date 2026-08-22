@@ -458,9 +458,7 @@ def register_routes(app, deps):
 # OpenAI compatile endpoints
 
 
-def _resolve_image_size(
-    image_request: ImageGenerationRequest, model=None
-) -> Tuple[int, int]:
+def _resolve_image_size(image_request: ImageGenerationRequest) -> Tuple[int, int]:
     if image_request.width is not None or image_request.height is not None:
         if image_request.width is None or image_request.height is None:
             raise HTTPException(
@@ -469,12 +467,7 @@ def _resolve_image_size(
             )
         return image_request.width, image_request.height
     try:
-        if image_request.size is not None:
-            return parse_size(image_request.size)
-        return (
-            int(getattr(model, "default_width", 512)),
-            int(getattr(model, "default_height", 512)),
-        )
+        return parse_size(image_request.size or "512x512")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -556,6 +549,7 @@ async def images_generations_endpoint(request: Request):
     if not image_request.prompt:
         raise HTTPException(status_code=400, detail="Missing prompt.")
 
+    width, height = _resolve_image_size(image_request)
     created = int(time.time())
     base_seed = (
         int(image_request.seed)
@@ -572,7 +566,6 @@ async def images_generations_endpoint(request: Request):
         model, _, _ = get_cached_model(
             image_request.model, model_kind="image_generation"
         )
-        width, height = _resolve_image_size(image_request, model)
         generation_lock = _runtime_cache_get("generation_lock", kind="image_generation")
 
         def _generate_all():

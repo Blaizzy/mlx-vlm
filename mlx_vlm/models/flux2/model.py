@@ -72,14 +72,6 @@ class Flux2ImageGenerationModel(ImageGenerationModel):
     def variant(self) -> str:
         return self.pipeline.variant.name
 
-    @property
-    def default_steps(self) -> int:
-        return 4
-
-    @property
-    def default_guidance(self) -> float:
-        return 1.0
-
     def count_prompt_tokens(self, prompt: str) -> int | None:
         try:
             return self.pipeline.tokenizer.count_tokens(prompt)
@@ -173,14 +165,6 @@ class Flux2ImageEditModel(ImageEditModel):
     @property
     def variant(self) -> str:
         return self.pipeline.variant.name
-
-    @property
-    def default_steps(self) -> int:
-        return 4
-
-    @property
-    def default_guidance(self) -> float:
-        return 1.0
 
     def count_prompt_tokens(self, prompt: str) -> int | None:
         try:

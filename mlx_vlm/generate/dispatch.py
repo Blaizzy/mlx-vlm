@@ -158,10 +158,7 @@ def parse_arguments():
         "--guidance",
         type=float,
         default=None,
-        help=(
-            "Classifier-free guidance for image generation/editing. "
-            "Defaults to the selected image model's recommendation."
-        ),
+        help="Classifier-free guidance for image generation/editing.",
     )
     parser.add_argument(
         "--prompt-expansion-model",
