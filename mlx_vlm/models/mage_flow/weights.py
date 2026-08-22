@@ -3,11 +3,8 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
 
 import mlx.core as mx
-from mlx import nn
-from mlx.utils import tree_unflatten
 
 from mlx_vlm.models.qwen3_vl.config import ModelConfig as Qwen3VLConfig
 from mlx_vlm.models.qwen3_vl.qwen3_vl import Model as Qwen3VLModel
@@ -47,61 +44,6 @@ def sanitize_transformer_weights(
     return sanitized
 
 
-def _load_metadata(directory: Path) -> dict[str, Any]:
-    index_path = directory / "model.safetensors.index.json"
-    if not index_path.exists():
-        return {}
-    metadata = json.loads(index_path.read_text()).get("metadata", {})
-    return metadata if isinstance(metadata, dict) else {}
-
-
-def _apply_weights(
-    model: nn.Module,
-    weights: dict[str, mx.array],
-    metadata: dict[str, Any],
-) -> nn.Module:
-    quantized_paths = {
-        key[: -len(".scales")] for key in weights if key.endswith(".scales")
-    }
-    if quantized_paths:
-        mode = str(metadata.get("quantization_mode", ""))
-        bits = int(metadata.get("quantization_level", 0))
-        group_size = int(metadata.get("quantization_group_size", 0))
-        expected = {
-            "affine": None,
-            "mxfp4": (4, 32),
-            "mxfp8": (8, 32),
-            "nvfp4": (4, 16),
-        }.get(mode)
-        if expected is None and mode != "affine":
-            raise ValueError(f"Unsupported Mage-Flow quantization mode: {mode!r}")
-        if expected is not None and expected != (bits, group_size):
-            raise ValueError(
-                "Invalid Mage-Flow quantization metadata: "
-                f"mode={mode!r}, bits={bits}, group_size={group_size}"
-            )
-        modules = dict(model.named_modules())
-        missing = sorted(path for path in quantized_paths if path not in modules)
-        if missing:
-            raise ValueError(f"Quantized weights have no matching module: {missing[0]}")
-        nn.quantize(
-            model,
-            group_size=group_size,
-            bits=bits,
-            mode=mode,
-            class_predicate=lambda path, module: path in quantized_paths,
-        )
-        model.quantization_config = {
-            "group_size": group_size,
-            "bits": bits,
-            "mode": mode,
-        }
-    else:
-        model.quantization_config = None
-    model.update(tree_unflatten(list(weights.items())), strict=True)
-    return model
-
-
 def load_transformer(model_path: str | Path) -> MageFlowTransformer:
     root = Path(model_path).expanduser()
     config = json.loads((root / "transformer" / "config.json").read_text())
@@ -116,8 +58,8 @@ def load_transformer(model_path: str | Path) -> MageFlowTransformer:
         theta=float(config.get("theta", 10000)),
     )
     weights = sanitize_transformer_weights(_load_safetensors(root / "transformer"))
-    metadata = _load_metadata(root / "transformer")
-    return _apply_weights(transformer, weights, metadata)
+    transformer.load_weights(list(weights.items()), strict=True)
+    return transformer
 
 
 def _map_vae_key(key: str) -> str | None:
@@ -162,23 +104,10 @@ def sanitize_vae_weights(
     return sanitized
 
 
-def _prepare_vae_weights(
-    weights: dict[str, mx.array],
-    metadata: dict[str, Any],
-) -> dict[str, mx.array]:
-    if metadata.get("mlx_vlm_format") == "mage_flow":
-        return weights
-    return sanitize_vae_weights(weights)
-
-
 def load_vae(model_path: str | Path, *, include_encoder: bool = True) -> MageVAE:
     root = Path(model_path).expanduser()
     vae = MageVAE(include_encoder=include_encoder)
-    vae_root = root / "vae"
-    weights = _prepare_vae_weights(
-        _load_safetensors(vae_root),
-        _load_metadata(vae_root),
-    )
+    weights = sanitize_vae_weights(_load_safetensors(root / "vae"))
     if not include_encoder:
         weights = {
             key: value

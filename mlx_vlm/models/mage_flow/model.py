@@ -54,8 +54,8 @@ class MageFlowImageGenerationModel(ImageGenerationModel):
 
     def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
-        steps = request.resolve_steps(self.pipeline.variant.default_steps)
-        guidance = request.resolve_guidance(self.pipeline.variant.default_guidance)
+        steps = request.resolve_steps()
+        guidance = request.resolve_guidance()
         array = self.pipeline.generate_array(
             request.prompt,
             seed=seed,
