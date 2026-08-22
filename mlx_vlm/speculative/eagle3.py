@@ -194,6 +194,7 @@ def _eagle3_verify_target(
         verify_input,
         cache=prompt_cache,
         capture_layer_ids=target_layer_ids,
+        speculative_verify=True,
     )
     hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
     target_tokens = sampler(verify_out.logits)
