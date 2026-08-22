@@ -5,6 +5,7 @@ from typing import Any, Optional, Tuple
 from .laguna_dflash import LagunaDFlashDraftModel
 from .muse_glimmer_assistant import MuseGlimmerAssistantDraftModel
 from .qwen3_dflash import DFlashDraftModel
+from .qwen3_dspark import DSparkDraftModel
 
 KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
 
@@ -176,6 +177,7 @@ __all__ = [
     "DRAFTER_KIND_BY_MODEL_TYPE",
     "KNOWN_DRAFTER_KINDS",
     "DFlashDraftModel",
+    "DSparkDraftModel",
     "LagunaDFlashDraftModel",
     "MuseGlimmerAssistantDraftModel",
     "load_drafter",
