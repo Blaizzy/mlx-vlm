@@ -75,6 +75,12 @@ def _dflash_committed_hidden_segments(
     ]
 
 
+def _drafter_pos_shift(cache_list, extra: int) -> None:
+    """Shift drafter RoPE positions without changing cache bookkeeping."""
+    for cache in cache_list:
+        cache.pos_shift = int(getattr(cache, "pos_shift", 0)) + int(extra)
+
+
 def _dflash_rounds(
     model: nn.Module,
     draft_model: nn.Module,
@@ -87,6 +93,7 @@ def _dflash_rounds(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     use_model_initial_block_size: bool = True,
+    context_offset: int = 0,
 ) -> Generator[Tuple[int, None], None, None]:
     """DFlash speculative-decoding **round loop**.
 
@@ -104,6 +111,8 @@ def _dflash_rounds(
     target_layer_ids = list(draft_model.config.target_layer_ids)
     block_total = _dflash_block_total(draft_model, draft_block_size)
     draft_cache = draft_model.reset(model)
+    if context_offset > 0:
+        _drafter_pos_shift(draft_cache, context_offset)
     prepare_target_hidden = getattr(draft_model, "prepare_target_hidden", None)
     hidden_is_prepared = callable(prepare_target_hidden)
     if hidden_is_prepared:
