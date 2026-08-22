@@ -10,6 +10,8 @@ from mlx_vlm.models.cache import ArraysCache, BatchKVCache
 from mlx_vlm.models.exact_speculative_verify import exact_speculative_verify_weight
 from mlx_vlm.models.lfm2 import Model as Lfm2Model
 from mlx_vlm.models.lfm2 import ModelConfig as Lfm2Config
+from mlx_vlm.models.lfm2.language import Lfm2MoeSparseMoeBlock
+from mlx_vlm.models.lfm2.speculative_verifier import Lfm2ExactSpeculativeVerifier
 from mlx_vlm.models.lfm2_moe import Model as Lfm2MoeModel
 from mlx_vlm.models.lfm2_moe import ModelConfig as Lfm2MoeConfig
 from mlx_vlm.models.qwen3_5 import language as qwen_language
@@ -565,6 +567,30 @@ def test_exact_speculative_verify_dense_kernel_matches_mlx_linear():
     mx.eval(expected, actual)
 
     assert actual.shape == expected.shape
+    assert bool(mx.array_equal(actual, expected))
+
+
+def test_lfm2_moe_exact_speculative_verify_narrow_router_matches_singletons():
+    mx.random.seed(12)
+    moe = Lfm2MoeSparseMoeBlock(
+        SimpleNamespace(
+            hidden_size=64,
+            moe_intermediate_size=32,
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            use_expert_bias=True,
+        )
+    )
+    moe.set_dtype(mx.bfloat16)
+    inputs = mx.random.normal((1, 5, 64)).astype(mx.bfloat16)
+    expected = mx.concatenate(
+        [moe(inputs[:, position : position + 1]) for position in range(5)],
+        axis=1,
+    )
+    actual = Lfm2ExactSpeculativeVerifier()._feed_forward(moe, inputs)
+    mx.eval(expected, actual)
+
     assert bool(mx.array_equal(actual, expected))
 
 
