@@ -48,6 +48,8 @@ from ..speculative.utils import (
 from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
+from .prefill_scheduler import ResumablePrefill, TailFairScheduler, TailWork
+from .resumable_dflash_prefill import DFlashPrefillContinuation
 from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -79,6 +81,52 @@ def _notify_queues(queues, *items):
 
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
+
+
+def _resumable_dflash_prefill_enabled() -> bool:
+    return os.environ.get("MLX_VLM_RESUMABLE_DFLASH_PREFILL", "0") == "1"
+
+
+def _resumable_dflash_slice_tokens() -> int:
+    raw = os.environ.get("MLX_VLM_RESUMABLE_PREFILL_SLICE_TOKENS", "2048")
+    try:
+        return max(128, int(raw))
+    except ValueError:
+        return 2048
+
+
+def _resumable_dflash_max_deferrals() -> int:
+    raw = os.environ.get("MLX_VLM_RESUMABLE_PREFILL_MAX_DEFERRALS", "3")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 3
+
+
+def _resumable_dflash_max_seqs() -> int:
+    """Bound resident prompt caches even when the global cap is unset."""
+    global_cap = get_max_num_seqs()
+    raw = os.environ.get("MLX_VLM_RESUMABLE_PREFILL_MAX_SEQS", "4")
+    try:
+        local_cap = max(2, int(raw))
+    except ValueError:
+        local_cap = 4
+    return min(global_cap, local_cap) if global_cap is not None else local_cap
+
+
+def _resumable_dflash_request_eligible(request) -> bool:
+    """The resumable lane currently owns text-only, single-request work."""
+    return _dflash_apc_text_only(request)
+
+
+def _partition_resumable_dflash_requests(requests):
+    """Return ``(eligible, fallback, reason)`` at one admission boundary."""
+    requests = list(requests)
+    if len(requests) > 1:
+        return [], requests, "coalesced_batch"
+    if requests and not _resumable_dflash_request_eligible(requests[0]):
+        return [], requests, "multimodal"
+    return requests, [], None
 
 
 def get_max_num_seqs():
@@ -158,6 +206,73 @@ def _drop_prefill_kwargs(prompt_kwargs: dict, keys: List[str], n: int) -> dict:
         if key in out:
             out[key] = out[key][:, n:, ...]
     return out
+
+
+def _dflash_apc_text_only(request) -> bool:
+    """Return whether a queued request has no multimodal prompt state."""
+    if (
+        getattr(request, "images", None)
+        or getattr(request, "videos", None)
+        or getattr(request, "audio", None)
+    ):
+        return False
+    raw_inputs = getattr(request, "raw_inputs", None) or {}
+    return not any(
+        key in raw_inputs
+        for key in ("pixel_values", "pixel_values_videos", "input_features")
+    )
+
+
+def _dflash_apc_lookup(
+    request,
+    input_ids: List[int],
+    *,
+    batch_size: int,
+    draft_kind: str,
+    apc_manager,
+    apc_mode: Optional[str],
+):
+    """Look up a conservative B=1, text-only exact-cache DFlash prefix."""
+    if (
+        batch_size != 1
+        or draft_kind != "dflash"
+        or apc_manager is None
+        or apc_mode != "exact"
+        or request.apc_semantic_hash is None
+        or not _dflash_apc_text_only(request)
+    ):
+        return None
+    return _apc.apc_lookup_plan(
+        apc_manager,
+        input_ids,
+        extra_hash=int(request.apc_semantic_hash),
+        apc_mode="exact",
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda _prefix_len: True,
+        prefix_has_media=lambda _prefix_len: False,
+    )
+
+
+def _resumable_dflash_context_limit(draft_model) -> Optional[int]:
+    """Bound retained round-one hidden context to the drafter window."""
+    window = getattr(getattr(draft_model, "config", None), "sliding_window", None)
+    if not window or int(window) <= 1:
+        return None
+    return int(window) - 1
+
+
+def _append_dflash_context(existing, new_hidden, limit: Optional[int], dropped: int):
+    """Keep the newest round-1 target context and its absolute start offset."""
+    combined = (
+        new_hidden
+        if existing is None
+        else mx.concatenate([existing, new_hidden], axis=1)
+    )
+    if limit is not None and int(combined.shape[1]) > int(limit):
+        trim = int(combined.shape[1]) - int(limit)
+        combined = combined[:, -int(limit) :, :]
+        dropped += trim
+    return combined, int(dropped)
 
 
 def _run_chunked_speculative_prefill(
@@ -1141,6 +1256,28 @@ class ResponseGenerator:
             pending, self._cancelled = self._cancelled, set()
             return pending
 
+    def _take_cancellation(self, uid) -> bool:
+        """Consume one request's cancellation without draining its peers."""
+        with self._cancel_lock:
+            if uid not in self._cancelled:
+                return False
+            self._cancelled.remove(uid)
+            return True
+
+    def _finish_cancelled_speculative_requests(
+        self, uids, rqueues, finished_uids
+    ) -> int:
+        """Close cancelled speculative rows at a safe round boundary."""
+        cancelled = 0
+        for uid in uids:
+            if uid in finished_uids or not self._take_cancellation(uid):
+                continue
+            rqueues[uid].put(None)
+            finished_uids.add(uid)
+            cancelled += 1
+            logger.info("Speculative generation cancelled: request=%s", uid)
+        return cancelled
+
     def _initialize_model(self):
         model, processor, config = load_model_resources(
             self.model_path, self.adapter_path
@@ -2046,7 +2183,596 @@ class ResponseGenerator:
         finally:
             results.close()
 
+    def _prepare_resumable_dflash_request(self, request, lm, prefill_kwargs):
+        """Prepare one text-only B=1 request through APC restore, without prefill."""
+        if not _resumable_dflash_request_eligible(request):
+            raise ValueError(
+                "resumable DFlash prefill currently supports text-only requests"
+            )
+        log_state = self._log_prefill_started(
+            request, backend="speculative_dflash_resumable"
+        )
+        log_state["streamer"] = _ServerTokenStreamer(
+            self.tokenizer,
+            make_streaming_detokenizer(self.processor),
+        )
+        if hasattr(lm, "_position_ids"):
+            lm._position_ids = None
+        if hasattr(lm, "_rope_deltas"):
+            lm._rope_deltas = None
+        input_ids, gen_kwargs = self._gpu_embed(
+            request.raw_inputs,
+            None,
+            apc_semantic_hash=request.apc_semantic_hash,
+        )
+        ids_list = input_ids.squeeze(0).tolist()
+        inputs_embeds, prompt_kwargs = _merge_prefill_prompt_kwargs(
+            [gen_kwargs], [ids_list]
+        )
+        prompt_cache = make_speculative_prompt_cache(
+            lm,
+            draft_kind="dflash",
+            batch_size=1,
+            left_padding=[0],
+            make_cache=_make_cache,
+        )
+        prefix_len = 0
+        extra_hash = request.apc_semantic_hash
+        apc_active = False
+        apc_manager = getattr(self, "apc_manager", None)
+        apc_mode = getattr(self, "apc_mode", None)
+        if apc_manager is not None:
+            try:
+                plan = _dflash_apc_lookup(
+                    request,
+                    ids_list,
+                    batch_size=1,
+                    draft_kind="dflash",
+                    apc_manager=apc_manager,
+                    apc_mode=apc_mode,
+                )
+                if plan is not None:
+                    # Build the warm path in temporary locals.  APC faults must
+                    # leave the pristine cold cache/input path usable.
+                    warm_prefix_len = int(plan["prefix_len"])
+                    sequence_keys = _sequence_aligned_prefill_keys(
+                        prompt_kwargs,
+                        batch_size=1,
+                        sequence_length=inputs_embeds.shape[1],
+                    )
+                    input_ids = input_ids[:, warm_prefix_len:]
+                    inputs_embeds = inputs_embeds[:, warm_prefix_len:, :]
+                    prompt_kwargs = _drop_prefill_kwargs(
+                        prompt_kwargs, sequence_keys, warm_prefix_len
+                    )
+                    prompt_cache = plan["warm_cache"]
+                    prefix_len = warm_prefix_len
+                    apc_active = True
+            except Exception:
+                logger.warning(
+                    "APC resumable lookup failed; cold prefill", exc_info=True
+                )
+
+        request_id = self._request_log_id(request)
+        scheduler_id = str(id(request.rqueue))
+        continuation = DFlashPrefillContinuation(
+            request_id=request_id,
+            prompt_cache=prompt_cache,
+            remaining_input_ids=input_ids,
+            remaining_embeds=inputs_embeds,
+            prompt_kwargs=prompt_kwargs,
+            cached_tokens=prefix_len,
+            full_input_ids=ids_list,
+            metadata={
+                "request": request,
+                "log_state": log_state,
+                "extra_hash": extra_hash,
+                "apc_active": apc_active,
+                "prompt_started": time.perf_counter(),
+                "prefill_compute_s": 0.0,
+                "draft_context": None,
+                "draft_context_dropped": 0,
+                "draft_context_limit": _resumable_dflash_context_limit(
+                    self.draft_model
+                ),
+            },
+        )
+        work = TailWork(
+            prompt_tokens=len(ids_list),
+            cached_tokens=prefix_len,
+        )
+        scheduled = ResumablePrefill(
+            request_id=scheduler_id,
+            work=work,
+            cache_state=prompt_cache,
+            remaining_input=continuation,
+            metadata={"continuation": continuation},
+        )
+        request.rqueue.put(
+            GenerationContext(
+                uid=id(request.rqueue), prompt_tokens=request.prompt_tokens
+            )
+        )
+        logger.info(
+            "Resumable prefill admitted: request=%s prompt_tokens=%d "
+            "cached_tokens=%d uncached_tokens=%d",
+            request_id,
+            len(ids_list),
+            prefix_len,
+            work.uncached_tokens,
+        )
+        return scheduled
+
+    def _advance_one_resumable_dflash_segment(
+        self, scheduled, tokens, lm, prefill_kwargs, generation_stream
+    ):
+        continuation = scheduled.metadata["continuation"]
+        segment_tokens = continuation.next_segment_tokens(tokens)
+        if segment_tokens <= 0:
+            return False
+
+        keys = _sequence_aligned_prefill_keys(
+            continuation.prompt_kwargs,
+            batch_size=1,
+            sequence_length=continuation.remaining_tokens,
+        )
+        segment_kwargs = _slice_prefill_kwargs(
+            continuation.prompt_kwargs, keys, segment_tokens
+        )
+        # Retain only the drafter's round-1 window. Discarding every prior slice
+        # collapses context to one position and reverses the measured warm-context
+        # acceptance win; retaining the bounded tail restores that contract
+        # without keeping full-prompt hidden state resident.
+        call_kwargs = {**segment_kwargs, **prefill_kwargs}
+        call_kwargs["inputs_embeds"] = continuation.remaining_embeds[:, :segment_tokens]
+        segment_started = time.perf_counter()
+        with mx.stream(generation_stream):
+            output = lm(
+                continuation.remaining_input_ids[:, :segment_tokens],
+                cache=continuation.prompt_cache,
+                n_to_process=segment_tokens,
+                **call_kwargs,
+            )
+        context, dropped = _append_dflash_context(
+            continuation.metadata.get("draft_context"),
+            speculative_hidden_state("dflash", output),
+            continuation.metadata.get("draft_context_limit"),
+            continuation.metadata.get("draft_context_dropped", 0),
+        )
+        mx.eval([c.state for c in continuation.prompt_cache], context)
+        continuation.metadata["prefill_compute_s"] += (
+            time.perf_counter() - segment_started
+        )
+        continuation.metadata["draft_context"] = context
+        continuation.metadata["draft_context_dropped"] = dropped
+
+        next_kwargs = _drop_prefill_kwargs(
+            continuation.prompt_kwargs, keys, segment_tokens
+        )
+        continuation.commit_segment(
+            segment_tokens,
+            next_ids=continuation.remaining_input_ids[:, segment_tokens:],
+            next_embeds=continuation.remaining_embeds[:, segment_tokens:],
+            next_kwargs=next_kwargs,
+        )
+        scheduled.commit_segment(segment_tokens, continuation)
+
+        logger.info(
+            "Resumable prefill progress: request=%s cached=%d processed=%d "
+            "remaining=%d segments=%d",
+            continuation.request_id,
+            continuation.cached_tokens,
+            continuation.processed_uncached,
+            continuation.remaining_tokens,
+            continuation.segment_count,
+        )
+        return True
+
+    def _advance_resumable_dflash_segment(
+        self,
+        scheduled,
+        tokens,
+        lm,
+        prefill_kwargs,
+        generation_stream,
+        should_yield=None,
+    ):
+        """Run adjacent slices without leaving the MLX prefill hot path.
+
+        A request or cancellation still interrupts at every evaluated slice
+        boundary.  When neither exists, staying in this method avoids the
+        allocator/graph churn observed when each slice made a full trip through
+        the outer admission scheduler (most visible around 3--4k prompts).
+        """
+        advanced = False
+        continuation = scheduled.metadata["continuation"]
+        while not continuation.ready_for_final:
+            if not self._advance_one_resumable_dflash_segment(
+                scheduled, tokens, lm, prefill_kwargs, generation_stream
+            ):
+                break
+            advanced = True
+            mx.clear_cache()
+            if should_yield is not None and should_yield():
+                break
+            if not self.requests.empty():
+                break
+            with self._cancel_lock:
+                if self._cancelled:
+                    break
+        return advanced
+
+    def _finish_resumable_dflash_request(
+        self,
+        scheduled,
+        lm,
+        drafter,
+        prefill_kwargs,
+        draft_block_size,
+        generation_stream,
+    ):
+        """Run final target position and the unchanged B=1 DFlash decode."""
+        continuation = scheduled.metadata["continuation"]
+        if not continuation.ready_for_final:
+            raise RuntimeError("resumable DFlash continuation is not final-ready")
+        request = continuation.metadata["request"]
+        uid = id(request.rqueue)
+        sampler = self._make_sampler(request.args) or make_sampler(temp=0)
+        final_kwargs = {**continuation.prompt_kwargs, **prefill_kwargs}
+        final_kwargs["inputs_embeds"] = continuation.remaining_embeds
+        final_started = time.perf_counter()
+        with mx.stream(generation_stream):
+            output = lm(
+                continuation.remaining_input_ids,
+                cache=continuation.prompt_cache,
+                **final_kwargs,
+            )
+        final_hidden = speculative_hidden_state("dflash", output)
+        all_hidden, context_dropped = _append_dflash_context(
+            continuation.metadata.get("draft_context"),
+            final_hidden,
+            continuation.metadata.get("draft_context_limit"),
+            continuation.metadata.get("draft_context_dropped", 0),
+        )
+
+        hidden = all_hidden
+        context_offset = continuation.cached_tokens + context_dropped
+
+        row_ids = [0]
+        first_bonus = _sample_last_token(
+            output.logits,
+            sampler,
+            row_ids=row_ids,
+            positions=[0],
+        ).astype(mx.int32)
+        mx.eval(first_bonus, hidden, output.logits)
+        continuation.metadata["prefill_compute_s"] += (
+            time.perf_counter() - final_started
+        )
+        scheduled.commit_segment(1, continuation)
+        prompt_elapsed = time.perf_counter() - continuation.metadata["prompt_started"]
+
+        extra_hash = continuation.metadata.get("extra_hash")
+        if (
+            self.apc_manager is not None
+            and self.apc_mode == "exact"
+            and extra_hash is not None
+            and _dflash_apc_text_only(request)
+        ):
+            try:
+                self.apc_manager.store_exact_cache(
+                    continuation.full_input_ids,
+                    continuation.prompt_cache,
+                    extra_hash=int(extra_hash),
+                )
+            except Exception as error:
+                logger.warning("Failed to store DFlash APC entry: %s", error)
+
+        prefilled = scheduled.work.uncached_tokens
+        prompt_compute = continuation.metadata["prefill_compute_s"]
+        prompt_tps = (
+            scheduled.work.prompt_tokens / prompt_compute
+            if prompt_compute > 0
+            else None
+        )
+        logger.info(
+            "Prefill completed: request=%s prompt_tokens=%d cached_tokens=%d "
+            "prefilled=%d wall=%.3fs compute=%.3fs rate=%.1f tok/s segments=%d",
+            continuation.request_id,
+            scheduled.work.prompt_tokens,
+            continuation.cached_tokens,
+            prefilled,
+            prompt_elapsed,
+            prompt_compute,
+            float(prompt_tps or 0.0),
+            continuation.segment_count + 1,
+        )
+
+        log_state = continuation.metadata["log_state"]
+        if self._take_cancellation(uid):
+            request.rqueue.put(None)
+            return
+        token_list = []
+        token = int(first_bonus.tolist()[0])
+        token_list.append(token)
+        is_stop = token in self.stop_tokens
+        is_max = len(token_list) >= request.args.max_tokens
+        finish = "stop" if is_stop else "length" if is_max else None
+        text = self._stream_text(log_state, token, finish)
+        emitted_at = self._log_decode_progress(
+            uid, log_state, token=token, text=text, finish_reason=finish
+        )
+        request.rqueue.put(
+            StreamingToken(
+                text=text,
+                token=token,
+                logprobs=0.0,
+                finish_reason=finish,
+                peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
+                prompt_tps=prompt_tps,
+                cached_tokens=continuation.cached_tokens,
+                emitted_at=emitted_at,
+            )
+        )
+        if finish:
+            request.rqueue.put(None)
+            return
+
+        cancelled = set()
+
+        def stop_check(_seq_idx, token_id):
+            if self._take_cancellation(uid):
+                cancelled.add(uid)
+            return (
+                uid in cancelled
+                or self._stop
+                or token_id in self.stop_tokens
+                or len(token_list) >= request.args.max_tokens
+            )
+
+        snapshot = speculative_stats_snapshot(drafter)
+        rounds_iter = run_speculative_server_rounds(
+            self.model,
+            drafter,
+            continuation.prompt_cache,
+            hidden,
+            draft_kind="dflash",
+            first_bonus=first_bonus,
+            max_tokens=request.args.max_tokens,
+            sampler=sampler,
+            draft_block_size=draft_block_size,
+            token_dtype=mx.int32,
+            stop_check=stop_check,
+            greedy_sampling=request.args.temperature == 0,
+            prompt_tokens=continuation.remaining_input_ids,
+            row_ids=row_ids,
+            context_offset=context_offset,
+        )
+        finished = False
+        for tokens, _ in rounds_iter:
+            if uid in cancelled or self._take_cancellation(uid):
+                cancelled.add(uid)
+                break
+            token = tokens[0]
+            if token is None:
+                continue
+            token = int(token)
+            token_list.append(token)
+            is_stop = token in self.stop_tokens
+            is_max = len(token_list) >= request.args.max_tokens
+            finish = "stop" if is_stop else "length" if is_max else None
+            text = self._stream_text(log_state, token, finish)
+            emitted_at = self._log_decode_progress(
+                uid, log_state, token=token, text=text, finish_reason=finish
+            )
+            rounds, accepted, drafted = (
+                speculative_stats_since(drafter, snapshot)
+                if finish
+                else (None, None, None)
+            )
+            request.rqueue.put(
+                StreamingToken(
+                    text=text,
+                    token=token,
+                    logprobs=0.0,
+                    finish_reason=finish,
+                    peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
+                    prompt_tps=prompt_tps,
+                    emitted_at=emitted_at,
+                    draft_kind="dflash" if finish else None,
+                    draft_rounds=rounds,
+                    draft_n_accepted=accepted,
+                    draft_n=drafted,
+                    cached_tokens=continuation.cached_tokens,
+                )
+            )
+            if finish:
+                request.rqueue.put(None)
+                finished = True
+                break
+
+        rounds, accepted, drafted = speculative_stats_since(drafter, snapshot)
+        if rounds:
+            logger.info(
+                "Speculative decode: kind=dflash batch=1 tokens=%d accept=%.2f "
+                "rounds=%d drafted=%s resumable_prefill=1",
+                len(token_list),
+                (accepted + rounds) / rounds,
+                rounds,
+                drafted,
+            )
+        if not finished and uid not in cancelled:
+            text = log_state["streamer"].finalize()
+            emitted_at = self._log_decode_progress(
+                uid,
+                log_state,
+                token=0,
+                text=text,
+                finish_reason="length",
+                token_count=0,
+            )
+            request.rqueue.put(
+                StreamingToken(
+                    text=text,
+                    token=0,
+                    logprobs=0.0,
+                    finish_reason="length",
+                    peak_memory=mx.get_peak_memory() / 1e9,
+                    prompt_tps=prompt_tps,
+                    token_count=0,
+                    emitted_at=emitted_at,
+                    cached_tokens=continuation.cached_tokens,
+                    draft_kind="dflash" if rounds else None,
+                    draft_rounds=rounds,
+                    draft_n_accepted=accepted,
+                    draft_n=drafted,
+                )
+            )
+            request.rqueue.put(None)
+        elif uid in cancelled:
+            request.rqueue.put(None)
+
+    def _run_speculative_resumable_dflash(self):
+        """Experimental B=1 text lane: interleave APC-aware prefill slices."""
+        generation_stream = mx.default_stream(mx.default_device())
+        lm = self.model.language_model
+        drafter = self.draft_model
+        prefill_kwargs = speculative_prefill_kwargs("dflash", drafter)
+        draft_block_size = _get_draft_block_size_from_env()
+        scheduler = TailFairScheduler(
+            slice_tokens=_resumable_dflash_slice_tokens(),
+            max_deferrals=_resumable_dflash_max_deferrals(),
+        )
+        max_resident = _resumable_dflash_max_seqs()
+
+        while not self._stop:
+            current = None
+            preparing = None
+            try:
+                scheduler_active = bool(len(scheduler))
+                room = max(0, max_resident - len(scheduler))
+                # Preserve ordinary coalescing while idle. Once continuations
+                # are resident, admit at most one request at a slice boundary.
+                capacity = min(1, room) if scheduler_active else room
+                coalesce_s = (
+                    0.0
+                    if scheduler_active
+                    else get_speculative_batch_coalesce_s()
+                )
+                new_requests, should_stop = self._collect_pending_requests(
+                    active=scheduler_active,
+                    capacity=capacity,
+                    coalesce_s=coalesce_s,
+                )
+                if should_stop:
+                    break
+                # A coalesced batch and every media request keep the established
+                # non-resumable implementation. This is a real fallback, not a
+                # rejection: the same model owner runs one batch to completion,
+                # then returns to the resumable scheduler.
+                new_requests, fallback, fallback_reason = (
+                    _partition_resumable_dflash_requests(new_requests)
+                )
+                if fallback:
+                    logger.info(
+                        "Resumable prefill fallback: requests=%d reason=%s",
+                        len(fallback),
+                        fallback_reason,
+                    )
+                    self._run_speculative_nonresumable(
+                        initial_pending=fallback, return_after_batch=True
+                    )
+                    continue
+                for request in new_requests:
+                    preparing = request
+                    scheduler.enqueue(
+                        self._prepare_resumable_dflash_request(
+                            request, lm, prefill_kwargs
+                        )
+                    )
+                    preparing = None
+                if not len(scheduler):
+                    continue
+
+                resident_ids = set(scheduler.pending_ids())
+                with self._cancel_lock:
+                    cancelled = {
+                        uid for uid in self._cancelled if str(uid) in resident_ids
+                    }
+                    self._cancelled.difference_update(cancelled)
+                for uid in cancelled:
+                    removed = scheduler.cancel(str(uid))
+                    if removed is not None:
+                        continuation = removed.metadata["continuation"]
+                        continuation.metadata["request"].rqueue.put(None)
+                        logger.info(
+                            "Resumable prefill cancelled: request=%s "
+                            "processed=%d remaining=%d",
+                            continuation.request_id,
+                            continuation.processed_uncached,
+                            continuation.remaining_tokens,
+                        )
+
+                choice = scheduler.choose()
+                if choice is None:
+                    continue
+                current, budget = choice
+                continuation = current.metadata["continuation"]
+                if continuation.ready_for_final:
+                    self._finish_resumable_dflash_request(
+                        current,
+                        lm,
+                        drafter,
+                        prefill_kwargs,
+                        draft_block_size,
+                        generation_stream,
+                    )
+                    mx.clear_cache()
+                    continue
+
+                self._advance_resumable_dflash_segment(
+                    current,
+                    budget,
+                    lm,
+                    prefill_kwargs,
+                    generation_stream,
+                    should_yield=lambda: bool(len(scheduler)),
+                )
+                scheduler.requeue(current)
+            except Exception as error:
+                logger.exception("Error in resumable DFlash generation: %s", error)
+                if preparing is not None:
+                    _notify_queues([preparing.rqueue], error, None)
+                elif current is not None:
+                    request = current.metadata["continuation"].metadata["request"]
+                    _notify_queues([request.rqueue], error, None)
+                mx.clear_cache()
+                gc.collect()
+
+        # stop_and_join must not strand clients that already received a
+        # GenerationContext. Notify every resident continuation immediately.
+        for item in scheduler.drain():
+            request = item.metadata["continuation"].metadata["request"]
+            _notify_queues(
+                [request.rqueue], RuntimeError("generation server stopped"), None
+            )
+
     def _run_speculative(self):
+        if self.draft_kind == "dflash" and _resumable_dflash_prefill_enabled():
+            logger.info(
+                "Resumable DFlash prefill enabled "
+                "(slice_tokens=%d max_deferrals=%d max_seqs=%d, hybrid routing)",
+                _resumable_dflash_slice_tokens(),
+                _resumable_dflash_max_deferrals(),
+                _resumable_dflash_max_seqs(),
+            )
+            self._run_speculative_resumable_dflash()
+            return
+        self._run_speculative_nonresumable()
+
+    def _run_speculative_nonresumable(
+        self, initial_pending=None, return_after_batch=False
+    ):
         """GPU thread loop with DFlash, EAGLE-3, or MTP speculative decoding.
 
         Collects incoming requests, prefills them as a batch with the
@@ -2070,10 +2796,15 @@ class ResponseGenerator:
             rqueues = {}
             try:
                 # --- Phase 1: collect pending requests ---
-                pending, should_stop = self._collect_pending_requests(
-                    active=False,
-                    coalesce_s=get_speculative_batch_coalesce_s(),
-                )
+                if initial_pending is not None:
+                    pending = initial_pending
+                    initial_pending = None
+                    should_stop = False
+                else:
+                    pending, should_stop = self._collect_pending_requests(
+                        active=False,
+                        coalesce_s=get_speculative_batch_coalesce_s(),
+                    )
                 if should_stop:
                     break
 
@@ -2147,6 +2878,41 @@ class ResponseGenerator:
                     make_cache=_make_cache,
                 )
 
+                apc_cached_tokens = 0
+                apc_extra_hash = None
+                apc_manager = getattr(self, "apc_manager", None)
+                apc_mode = getattr(self, "apc_mode", None)
+                if B == 1:
+                    apc_extra_hash = pending[0].apc_semantic_hash
+                    try:
+                        apc_plan = _dflash_apc_lookup(
+                            pending[0],
+                            all_input_ids[0],
+                            batch_size=B,
+                            draft_kind=draft_kind,
+                            apc_manager=apc_manager,
+                            apc_mode=apc_mode,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "DFlash APC lookup failed; using cold prefill: %s", e
+                        )
+                        apc_plan = None
+                    if apc_plan is not None:
+                        prefix_len = int(apc_plan["prefix_len"])
+                        sequence_keys = _sequence_aligned_prefill_keys(
+                            prompt_kwargs,
+                            batch_size=1,
+                            sequence_length=inputs_embeds_mx.shape[1],
+                        )
+                        input_mx = input_mx[:, prefix_len:]
+                        inputs_embeds_mx = inputs_embeds_mx[:, prefix_len:, :]
+                        prompt_kwargs = _drop_prefill_kwargs(
+                            prompt_kwargs, sequence_keys, prefix_len
+                        )
+                        prompt_cache = apc_plan["warm_cache"]
+                        apc_cached_tokens = prefix_len
+
                 prefill_step_size = self._effective_prefill_step_size()
                 policy_kwargs = {**prompt_kwargs, **prefill_kwargs}
                 if not _chunked_prefill_enabled(
@@ -2182,6 +2948,22 @@ class ResponseGenerator:
                 )
                 mx.eval(first_bonus, hidden, out.logits)
                 prompt_elapsed = time.perf_counter() - prompt_started
+                if (
+                    B == 1
+                    and draft_kind == "dflash"
+                    and apc_manager is not None
+                    and apc_mode == "exact"
+                    and apc_extra_hash is not None
+                    and _dflash_apc_text_only(pending[0])
+                ):
+                    try:
+                        apc_manager.store_exact_cache(
+                            all_input_ids[0],
+                            prompt_cache,
+                            extra_hash=int(apc_extra_hash),
+                        )
+                    except Exception as e:
+                        logger.warning("DFlash APC store failed: %s", e)
                 for uid in uids:
                     prompt_tokens = prompt_tokens_map[uid]
                     prompt_tps_map[uid] = (
@@ -2191,18 +2973,28 @@ class ResponseGenerator:
                     )
                     logger.info(
                         "Prefill completed: request=%s prompt_tokens=%d "
-                        "cached_tokens=0 elapsed=%.3fs rate=%.1f tok/s",
+                        "cached_tokens=%d elapsed=%.3fs rate=%.1f tok/s",
                         stream_infos[uid].get("request_id", uid),
                         prompt_tokens,
+                        apc_cached_tokens,
                         prompt_elapsed,
                         float(prompt_tps_map[uid] or 0.0),
                     )
 
                 finished_uids = set()
 
+                # A request may be cancelled while its prompt is in the
+                # uninterruptible target forward. Close it before exposing the
+                # first sampled token.
+                self._finish_cancelled_speculative_requests(
+                    uids, rqueues, finished_uids
+                )
+
                 # Send first bonus tokens to clients
                 fb_list = first_bonus.tolist()
                 for j, uid in enumerate(uids):
+                    if uid in finished_uids:
+                        continue
                     tok = int(fb_list[j])
                     token_lists[uid].append(tok)
                     is_stop = tok in self.stop_tokens
@@ -2224,6 +3016,7 @@ class ResponseGenerator:
                             finish_reason=finish,
                             peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
                             prompt_tps=prompt_tps_map.get(uid),
+                            cached_tokens=apc_cached_tokens,
                             emitted_at=emitted_at,
                         )
                     )
@@ -2231,6 +3024,15 @@ class ResponseGenerator:
                         rqueues[uid].put(None)
                         finished_uids.add(uid)
 
+                if len(finished_uids) == len(uids):
+                    continue
+
+                # A cancellation can arrive while the target is pre-filling.
+                # Consume only this batch's request IDs: draining the shared
+                # set here would discard cancellations for queued peers.
+                self._finish_cancelled_speculative_requests(
+                    uids, rqueues, finished_uids
+                )
                 if len(finished_uids) == len(uids):
                     continue
 
@@ -2271,8 +3073,16 @@ class ResponseGenerator:
                     eos_token_ids=eos_set,
                     prompt_tokens=input_mx,
                     row_ids=sample_row_ids,
+                    context_offset=apc_cached_tokens,
                 )
                 for tok_list, _ in rounds_iter:
+                    # Every rounds backend yields at a committed decode
+                    # boundary. Check cancellation before emitting that
+                    # boundary's tokens, then let stop_check filter cancelled
+                    # rows from the next backend round.
+                    self._finish_cancelled_speculative_requests(
+                        uids, rqueues, finished_uids
+                    )
                     for j, tok in enumerate(tok_list):
                         if tok is None:
                             continue
@@ -2367,6 +3177,9 @@ class ResponseGenerator:
                         )
                         rqueues[uid].put(None)
 
+                if return_after_batch:
+                    return
+
             except Exception as e:
                 logger.exception("Error in speculative generation thread: %s", e)
                 error_queues = {id(rqueue): rqueue for rqueue in rqueues.values()}
@@ -2376,6 +3189,8 @@ class ResponseGenerator:
                 _notify_queues(error_queues.values(), e, None)
                 mx.clear_cache()
                 gc.collect()
+                if return_after_batch:
+                    return
 
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""

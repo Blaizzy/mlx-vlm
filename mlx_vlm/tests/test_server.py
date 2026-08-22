@@ -1774,7 +1774,13 @@ class _RecordingSpeculativeLM:
 
 
 def _run_speculative_prefill_once(
-    monkeypatch, *, draft_kind, request_specs, prefill_step_size=2048
+    monkeypatch,
+    *,
+    draft_kind,
+    request_specs,
+    prefill_step_size=2048,
+    apc_manager=None,
+    apc_mode=None,
 ):
     lm = _RecordingSpeculativeLM(draft_kind)
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
@@ -1787,7 +1793,11 @@ def _run_speculative_prefill_once(
     gen.stop_tokens = {99}
     gen.requests = Queue()
     gen._stop = False
+    gen._cancel_lock = Lock()
+    gen._cancelled = set()
     gen.prefill_step_size = prefill_step_size
+    gen.apc_manager = apc_manager
+    gen.apc_mode = apc_mode
     gen._make_sampler = lambda args: None
     gen.tokenizer = SimpleNamespace(
         decode=lambda tokens: "".join(str(tok) for tok in tokens)
@@ -1803,6 +1813,11 @@ def _run_speculative_prefill_once(
     gen._gpu_embed = fake_gpu_embed
 
     monkeypatch.setattr(server_generation, "_make_cache", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        server_generation,
+        "make_speculative_prompt_cache",
+        lambda *args, **kwargs: [],
+    )
     monkeypatch.setattr(
         server_generation, "_get_draft_block_size_from_env", lambda: None
     )
@@ -1845,6 +1860,10 @@ def _run_speculative_prefill_once(
                 raw_inputs={"input_ids": spec["input_ids"]},
                 prompt_tokens=int(spec["input_ids"].shape[1]),
                 args=args,
+                images=spec.get("images"),
+                videos=spec.get("videos"),
+                audio=spec.get("audio"),
+                apc_semantic_hash=spec.get("apc_semantic_hash"),
             )
         )
 
@@ -1853,6 +1872,121 @@ def _run_speculative_prefill_once(
     call["prefill_input_lengths"] = [item["inputs"].shape[1] for item in lm.calls]
     call["round_kwargs"] = gen.round_kwargs
     return call
+
+
+def test_dflash_singleton_apc_hit_prefills_suffix_and_reuses_semantic_hash(
+    monkeypatch,
+):
+    lookup = {}
+
+    class _APCManager:
+        def __init__(self):
+            self.stores = []
+
+        def store_exact_cache(self, token_ids, prompt_cache, *, extra_hash):
+            self.stores.append((list(token_ids), prompt_cache, extra_hash))
+
+    manager = _APCManager()
+    warm_cache = [SimpleNamespace(offset=2)]
+
+    def fake_lookup(manager_arg, ids, **kwargs):
+        lookup.update(manager=manager_arg, ids=list(ids), kwargs=kwargs)
+        return {"warm_cache": warm_cache, "prefix_len": 2}
+
+    monkeypatch.setattr(server_generation._apc, "apc_lookup_plan", fake_lookup)
+    call = _run_speculative_prefill_once(
+        monkeypatch,
+        draft_kind="dflash",
+        apc_manager=manager,
+        apc_mode="exact",
+        request_specs=[
+            {
+                "input_ids": mx.array([[11, 12, 13, 14]], dtype=mx.int32),
+                "gen_kwargs": {
+                    "inputs_embeds": mx.ones((1, 4, 4), dtype=mx.float32),
+                    "attention_mask": mx.array([[1, 1, 1, 1]], dtype=mx.int32),
+                },
+                "apc_semantic_hash": 991,
+            }
+        ],
+    )
+
+    assert call["inputs"].tolist() == [[13, 14]]
+    assert call["inputs_embeds"].shape[1] == 2
+    assert call["attention_mask"].tolist() == [[1, 1]]
+    assert call["cache"] is warm_cache
+    assert call["round_kwargs"]["context_offset"] == 2
+    assert lookup["manager"] is manager
+    assert lookup["ids"] == [11, 12, 13, 14]
+    assert lookup["kwargs"]["extra_hash"] == 991
+    assert manager.stores == [([11, 12, 13, 14], warm_cache, 991)]
+
+
+@pytest.mark.parametrize(
+    "request_overrides",
+    [
+        {"images": ["image"]},
+        {"videos": ["video"]},
+        {"audio": ["audio"]},
+        {"raw_inputs": {"input_ids": [1, 2], "pixel_values": object()}},
+        {"raw_inputs": {"input_ids": [1, 2], "pixel_values_videos": object()}},
+        {"raw_inputs": {"input_ids": [1, 2], "input_features": object()}},
+    ],
+)
+def test_dflash_apc_lookup_rejects_multimodal_requests(request_overrides):
+    request = SimpleNamespace(
+        images=None,
+        videos=None,
+        audio=None,
+        raw_inputs={"input_ids": [1, 2]},
+        apc_semantic_hash=7,
+    )
+    for key, value in request_overrides.items():
+        setattr(request, key, value)
+
+    assert (
+        server_generation._dflash_apc_lookup(
+            request,
+            [1, 2],
+            batch_size=1,
+            draft_kind="dflash",
+            apc_manager=object(),
+            apc_mode="exact",
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("batch_size", "draft_kind", "apc_mode", "semantic_hash"),
+    [
+        (2, "dflash", "exact", 7),
+        (1, "mtp", "exact", 7),
+        (1, "dflash", "block", 7),
+        (1, "dflash", "exact", None),
+    ],
+)
+def test_dflash_apc_lookup_rejects_unsupported_modes(
+    batch_size, draft_kind, apc_mode, semantic_hash
+):
+    request = SimpleNamespace(
+        images=None,
+        videos=None,
+        audio=None,
+        raw_inputs={"input_ids": [1, 2]},
+        apc_semantic_hash=semantic_hash,
+    )
+    assert (
+        server_generation._dflash_apc_lookup(
+            request,
+            [1, 2],
+            batch_size=batch_size,
+            draft_kind=draft_kind,
+            apc_manager=object(),
+            apc_mode=apc_mode,
+        )
+        is None
+    )
 
 
 def test_speculative_server_threads_greedy_flag_to_mtp_loop(monkeypatch):
@@ -4730,6 +4864,22 @@ class TestResponseGenerator:
         gen.wait_until_ready = lambda: None
         gen._cpu_preprocess = lambda prompt, images, audio: {"input_ids": [1, 2, 3]}
         return gen
+
+    def test_speculative_cancellation_is_request_local(self):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen._cancel_lock = Lock()
+        gen._cancelled = {11, 22}
+        rqueue = Queue()
+        finished = set()
+
+        cancelled = gen._finish_cancelled_speculative_requests(
+            [11], {11: rqueue}, finished
+        )
+
+        assert cancelled == 1
+        assert finished == {11}
+        assert rqueue.get_nowait() is None
+        assert gen._cancelled == {22}
 
     def test_generate_rejects_requests_over_configured_context_limit(self, monkeypatch):
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
