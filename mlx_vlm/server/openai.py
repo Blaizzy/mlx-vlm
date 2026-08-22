@@ -32,6 +32,7 @@ from .generation import (
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
+from .glimmer_stream import make_glimmer_stream_state
 from .responses_state import (
     _normalize_response_input,
     _response_chain_items,
@@ -1096,16 +1097,21 @@ async def responses_endpoint(request: Request):
                         if tool_module is not None and chat_tools
                         else None
                     )
-                    thinking_state = make_response_stream_state(
-                        processor,
-                        prompt_has_open_thinking(
-                            formatted_prompt,
-                            gen_args.enable_thinking,
+                    glimmer_state = make_glimmer_stream_state(processor)
+                    thinking_state = (
+                        glimmer_state
+                        if glimmer_state is not None
+                        else make_response_stream_state(
+                            processor,
+                            prompt_has_open_thinking(
+                                formatted_prompt,
+                                gen_args.enable_thinking,
+                                gen_args.thinking_start_token,
+                                gen_args.thinking_end_token,
+                            ),
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
-                        ),
-                        gen_args.thinking_start_token,
-                        gen_args.thinking_end_token,
+                        )
                     )
                     reasoning_item_id = f"rs_{uuid.uuid4().hex}"
                     streamed_reasoning = ""
@@ -1156,9 +1162,10 @@ async def responses_endpoint(request: Request):
                                     },
                                 )
                             delta = thinking_delta.content
-                            in_tool_call, delta = suppress_tool_call_content(
-                                full_text, in_tool_call, tc_start, delta
-                            )
+                            if glimmer_state is None:
+                                in_tool_call, delta = suppress_tool_call_content(
+                                    full_text, in_tool_call, tc_start, delta
+                                )
                             usage_stats = {
                                 "input_tokens": ctx.prompt_tokens,
                                 "output_tokens": output_tokens,
@@ -1210,9 +1217,10 @@ async def responses_endpoint(request: Request):
                                     },
                                 )
                             delta = thinking_delta.content
-                            in_tool_call, delta = suppress_tool_call_content(
-                                full_text, in_tool_call, tc_start, delta
-                            )
+                            if glimmer_state is None:
+                                in_tool_call, delta = suppress_tool_call_content(
+                                    full_text, in_tool_call, tc_start, delta
+                                )
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
                             usage_stats = {
@@ -1804,16 +1812,21 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
-                        thinking_state = make_response_stream_state(
-                            processor,
-                            prompt_has_open_thinking(
-                                formatted_prompt,
-                                gen_args.enable_thinking,
+                        glimmer_state = make_glimmer_stream_state(processor)
+                        thinking_state = (
+                            glimmer_state
+                            if glimmer_state is not None
+                            else make_response_stream_state(
+                                processor,
+                                prompt_has_open_thinking(
+                                    formatted_prompt,
+                                    gen_args.enable_thinking,
+                                    gen_args.thinking_start_token,
+                                    gen_args.thinking_end_token,
+                                ),
                                 gen_args.thinking_start_token,
                                 gen_args.thinking_end_token,
-                            ),
-                            gen_args.thinking_start_token,
-                            gen_args.thinking_end_token,
+                            )
                         )
                         full_output = ""  # raw output for tool call parsing
                         # Track tool-call state to suppress markup from content
@@ -1842,10 +1855,17 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             delta_reasoning = thinking_delta.reasoning
                             delta_content = thinking_delta.content
 
-                            # Suppress tool-call markup from content
-                            in_tool_call, delta_content = suppress_tool_call_content(
-                                full_output, in_tool_call, tc_start, delta_content
-                            )
+                            # Suppress tool-call markup from content (the
+                            # Glimmer state machine already handles it).
+                            if glimmer_state is None:
+                                in_tool_call, delta_content = (
+                                    suppress_tool_call_content(
+                                        full_output,
+                                        in_tool_call,
+                                        tc_start,
+                                        delta_content,
+                                    )
+                                )
 
                             chunk_logprobs = None
                             if request.logprobs and token.finish_reason != "stop":
@@ -1957,16 +1977,21 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         request_id = f"chatcmpl-{uuid.uuid4()}"
                         output_text = ""
-                        thinking_state = make_response_stream_state(
-                            processor,
-                            prompt_has_open_thinking(
-                                formatted_prompt,
-                                gen_args.enable_thinking,
+                        glimmer_state = make_glimmer_stream_state(processor)
+                        thinking_state = (
+                            glimmer_state
+                            if glimmer_state is not None
+                            else make_response_stream_state(
+                                processor,
+                                prompt_has_open_thinking(
+                                    formatted_prompt,
+                                    gen_args.enable_thinking,
+                                    gen_args.thinking_start_token,
+                                    gen_args.thinking_end_token,
+                                ),
                                 gen_args.thinking_start_token,
                                 gen_args.thinking_end_token,
-                            ),
-                            gen_args.thinking_start_token,
-                            gen_args.thinking_end_token,
+                            )
                         )
                         for chunk in token_iterator:
                             if chunk is None or not hasattr(chunk, "text"):
@@ -2239,6 +2264,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             tc["remaining_text"] or "",
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
+                            processor=processor,
                         )
                         if clean_remaining:
                             # Strip model control tokens

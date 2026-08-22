@@ -21,6 +21,7 @@ from .generation import (
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
+from .glimmer_stream import make_glimmer_stream_state
 from .responses_state import (
     make_response_stream_state,
     process_tool_calls,
@@ -536,16 +537,21 @@ async def anthropic_messages_endpoint(http_request: Request):
                 open_block_type = None
                 full_output = ""
                 text_output = ""
-                thinking_state = make_response_stream_state(
-                    processor,
-                    prompt_has_open_thinking(
-                        formatted_prompt,
-                        gen_args.enable_thinking,
+                glimmer_state = make_glimmer_stream_state(processor)
+                thinking_state = (
+                    glimmer_state
+                    if glimmer_state is not None
+                    else make_response_stream_state(
+                        processor,
+                        prompt_has_open_thinking(
+                            formatted_prompt,
+                            gen_args.enable_thinking,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        ),
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
-                    ),
-                    gen_args.thinking_start_token,
-                    gen_args.thinking_end_token,
+                    )
                 )
                 in_tool_call = False
                 tc_start = tool_module.tool_call_start if tool_module else None
@@ -674,9 +680,13 @@ async def anthropic_messages_endpoint(http_request: Request):
                         delta_reasoning = thinking_delta.reasoning
                         delta_content = thinking_delta.content
 
-                        in_tool_call, delta_content = suppress_tool_call_content(
-                            full_output, in_tool_call, tc_start, delta_content
-                        )
+                        if glimmer_state is None:
+                            in_tool_call, delta_content = suppress_tool_call_content(
+                                full_output,
+                                in_tool_call,
+                                tc_start,
+                                delta_content,
+                            )
 
                         if delta_reasoning is not None and gen_args.enable_thinking:
                             yield open_block("thinking")

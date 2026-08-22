@@ -8,6 +8,9 @@ import re
 # from assistant content after parsing the invocation.
 tool_call_start = "to=self<|message|>"
 tool_call_end = "</atem:function_calls>"
+# Fallback block marker for tool calls emitted without the reasoning
+# envelope (Muse sometimes skips the self-reasoning turn).
+tool_call_block_start = "<atem:function_calls>"
 
 _INVOKE_PATTERN = re.compile(
     r'<atem:invoke\b[^>]*?\bname="(?P<name>[^"]+)">(?P<body>.*?)' r"</atem:invoke>",

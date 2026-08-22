@@ -289,26 +289,41 @@ def process_tool_calls(model_output: str, tool_module, tools):
     called_tools = []
     remaining = model_output
 
-    if tool_module.tool_call_start in model_output:
-        if tool_module.tool_call_end == "":
-            pattern = re.compile(
-                f"{re.escape(tool_module.tool_call_start)}.*?(?:\n|$)", re.DOTALL
-            )
+    end_marker = tool_module.tool_call_end if tool_module else None
+    block_start = getattr(tool_module, "tool_call_block_start", None)
+    envelope_start = getattr(tool_module, "tool_call_start", None)
+
+    # Anchor on the raw block marker when available: it appears in every tool
+    # call (with or without the reasoning envelope) and each block is matched
+    # independently, so multiple calls in one output are all parsed. Fall back
+    # to the parser's start marker otherwise.
+    anchor = block_start or envelope_start
+    if anchor is not None:
+        # Optional turn header immediately before the block: the full form
+        # "<|start|>assistant to=<name><|message|>" or the bare
+        # "to=<name><|message|>".
+        header = r"(?:(?:<\|start\|>assistant )?to=[A-Za-z0-9_.-]+<\|message\|>)?"
+        if end_marker == "":
+            pattern = re.compile(f"{header}{re.escape(anchor)}.*?(?:\n|$)", re.DOTALL)
         else:
             pattern = re.compile(
-                f"{re.escape(tool_module.tool_call_start)}.*?{re.escape(tool_module.tool_call_end)}",
-                re.DOTALL,
+                f"{header}{re.escape(anchor)}.*?{re.escape(end_marker)}", re.DOTALL
             )
-
         matches = re.findall(pattern, model_output)
         if matches:
             remaining = re.sub(pattern, " ", model_output).strip()
             for match in matches:
                 call = (
                     match.strip()
-                    .removeprefix(tool_module.tool_call_start)
-                    .removesuffix(tool_module.tool_call_end)
+                    .removeprefix(envelope_start or anchor)
+                    .removesuffix(end_marker)
                 )
+                # The match may include a recipient header before the block.
+                call = re.sub(
+                    r"^(?:<\|start\|>assistant )?to=[A-Za-z0-9_.-]+<\|message\|>",
+                    "",
+                    call,
+                ).strip()
                 try:
                     parsed = tool_module.parse_tool_call(call, tools)
                     parsed_calls = parsed if isinstance(parsed, list) else [parsed]
@@ -331,6 +346,45 @@ def process_tool_calls(model_output: str, tool_module, tools):
                         )
                 except Exception:
                     logger.warning("Invalid tool call: %s", call)
+        # Drop any remaining reasoning envelope so it never surfaces in
+        # content (e.g. "to=self<|message|>planning<|eom|>" or a truncated
+        # "to=self<|message|>planning" that precedes a tool block), then
+        # clean any leftover <|eom|> continuation markers. ATEM-only: other
+        # parsers' start markers are not reasoning envelopes.
+        if envelope_start and block_start:
+            remaining = re.sub(
+                f"{re.escape(envelope_start)}.*?<\\|eom\\|>",
+                " ",
+                remaining,
+                flags=re.DOTALL,
+            ).strip()
+            # Truncated envelope with NO close marker: strip only when it is
+            # the leading construct (a reasoning envelope precedes its tool
+            # block) or generation cut off mid-reasoning at the very start of
+            # the remaining text. Deletion is bounded at the next recipient
+            # header or end of text so a real answer after a no-eom envelope
+            # survives. A quoted "to=self" later in the answer also survives
+            # (it is not the leading construct).
+            leading = remaining.lstrip()
+            if leading.startswith(envelope_start):
+                remaining = re.sub(
+                    rf"^\s*{re.escape(envelope_start)}.*?"
+                    r"(?=to=[A-Za-z0-9_.-]+<\|message\|>|$)",
+                    " ",
+                    remaining,
+                    flags=re.DOTALL,
+                ).strip()
+        if block_start:
+            # Strip a header immediately after a continuation marker (the
+            # stream treats it as a routing boundary) BEFORE the blanket
+            # substitution removes the marker itself.
+            remaining = re.sub(
+                r"\s*<\|(?:eom|eot)\|>\s*(?:<\|start\|>assistant )?"
+                r"to=[A-Za-z0-9_.-]+<\|message\|>",
+                " ",
+                remaining,
+            )
+            remaining = re.sub(r"\s*<\|(?:eom|eot)\|>\s*", " ", remaining).strip()
     return dict(calls=called_tools, remaining_text=remaining)
 
 
@@ -359,6 +413,41 @@ def _clean_reasoning(reasoning: str, start_marker: str) -> str:
     if start_marker == "<|channel>thought":
         reasoning = reasoning.lstrip("thought")
     return reasoning.strip()
+
+
+def _strip_glimmer_leading_markers(text: str) -> str:
+    """Remove a leading recipient header (bare or full form) and continuation
+    markers from Glimmer content.
+
+    A header is removed at the start of the text AND immediately after a
+    substituted continuation marker (``<|eom|>``/``<|eot|>``), which the
+    stream treats as a routing boundary. A *quoted* header mid-answer (not
+    after a continuation marker) must survive, matching the stream. A
+    trailing partial marker (generation cut mid-marker) is also stripped,
+    matching the stream's flush behavior.
+    """
+    t = re.sub(r"^\s*<\|start\|>assistant ", "", text)
+    t = re.sub(r"^\s*to=[A-Za-z0-9_.-]+<\|message\|>", "", t)
+    # Header right after a continuation marker (stream sees a fresh segment).
+    t = re.sub(
+        r"\s*<\|(?:eom|eot)\|>\s*(?:<\|start\|>assistant )?"
+        r"to=[A-Za-z0-9_.-]+<\|message\|>",
+        " ",
+        t,
+    )
+    # Trailing partial marker prefix (e.g. "plan<|eom" cut mid-marker).
+    for marker in (
+        "<atem:function_calls>",
+        "</atem:function_calls>",
+        "<|eom|>",
+        "<|eot|>",
+        "<|start|>assistant",
+    ):
+        for length in range(min(len(marker), len(t)), 0, -1):
+            if t.endswith(marker[:length]):
+                t = t[:-length]
+                break
+    return t
 
 
 def _split_thinking(
@@ -393,17 +482,70 @@ def _split_thinking(
                 "Falling back from tokenizer response-template parser", exc_info=True
             )
 
+    _glimmer = processor is not None and getattr(
+        type(processor), "__module__", ""
+    ).startswith("mlx_vlm.models.muse_glimmer")
+    if _glimmer:
+        # Glimmer: collect ALL reasoning blocks ("to=self<|message|>…<|eom|>")
+        # in order; a lone <|eom|> or to=self (answer-only generation, stray
+        # continuation marker) stays in content.
+        reasoning_parts: List[Tuple[int, str]] = []
+        rest = text
+        while True:
+            start = rest.find("to=self<|message|>")
+            if start < 0:
+                break
+            # Only a block at a routing boundary (start of text or right
+            # after a close marker) is a reasoning turn; a quoted
+            # "to=self<|message|>" mid-answer must survive.
+            prev = rest[:start]
+            at_boundary = not prev.strip() or prev.rstrip().endswith(
+                ("<|eom|>", "<|eot|>", "</atem:function_calls>")
+            )
+            if not at_boundary:
+                break
+            end = rest.find("<|eom|>", start)
+            if end < 0:
+                break
+            reasoning_parts.append(
+                (start, rest[start + len("to=self<|message|>") : end].strip())
+            )
+            rest = rest[:start] + rest[end + len("<|eom|>") :]
+        if reasoning_parts:
+            reasoning = "\n".join(p for _, p in reasoning_parts if p) or None
+            content = _strip_glimmer_leading_markers(rest)
+            content = re.sub(r"\s*<\|(?:eom|eot)\|>\s*", " ", content).strip()
+            return reasoning, content
+
     for start_marker, end_marker in ThinkingStreamState._build_open_close_markers(
         thinking_start_token, thinking_end_token
     ):
+        # The Glimmer pair may only classify content via the strict (ordered,
+        # both-marker) branch. A lone <|eom|> or to=self must never route the
+        # whole answer into reasoning (answer-only generation).
+        is_glimmer_pair = (
+            start_marker == "to=self<|message|>" and end_marker == "<|eom|>"
+        ) and (
+            _glimmer
+            or (
+                thinking_start_token == "to=self<|message|>"
+                and thinking_end_token == "<|eom|>"
+            )
+        )
         start = text.find(start_marker)
         end = text.find(end_marker, start if start >= 0 else 0)
         if start >= 0 and start < end:
             reasoning = text[start + len(start_marker) : end].strip()
             content = _strip_content_markers(
                 text[:start] + text[end + len(end_marker) :]
-            ).strip()
-            return reasoning or None, content
+            )
+            if _glimmer:
+                content = _strip_glimmer_leading_markers(content)
+                content = re.sub(r"\s*<\|(?:eom|eot)\|>\s*", " ", content)
+            return reasoning or None, content.strip()
+
+        if is_glimmer_pair:
+            continue
 
         if end_marker in text:
             reasoning, content = text.split(end_marker, 1)
@@ -418,7 +560,14 @@ def _split_thinking(
         reasoning = _strip_content_markers(text).strip()
         return reasoning or None, ""
 
-    return None, _strip_content_markers(text).strip()
+    content = _strip_content_markers(text)
+    if _glimmer:
+        # Answer-only output: remove a leading recipient header and
+        # continuation markers that survived (e.g.
+        # "to=user<|message|>…<|eom|>").
+        content = _strip_glimmer_leading_markers(content)
+        content = re.sub(r"\s*<\|(?:eom|eot)\|>\s*", " ", content)
+    return None, content.strip()
 
 
 def _response_output_items_from_text(
@@ -449,6 +598,7 @@ def _response_output_items_from_text(
                 tc.get("remaining_text") or "",
                 thinking_start_token,
                 thinking_end_token,
+                processor=processor,
             )
             remaining = re.sub(r"<\|[^>]+\|>|<[^>]+>", "", remaining).strip()
             return reasoning_items + items, remaining, reasoning, "tool_calls"
