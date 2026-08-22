@@ -769,6 +769,25 @@ def test_unsupported_model_request_does_not_crash_server(client, monkeypatch):
     assert client.get("/health").status_code == 200
 
 
+def test_health_reports_process_and_speculative_identity(client, monkeypatch):
+    response_generator = SimpleNamespace(
+        requests=Queue(),
+        draft_model=object(),
+        draft_kind="dflash",
+    )
+    monkeypatch.setattr(server.runtime, "response_generator", response_generator)
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["server_instance_id"] == server._app_module.SERVER_INSTANCE_ID
+    assert payload["speculative_decode"] == {
+        "enabled": True,
+        "kind": "dflash",
+    }
+
+
 def _unstarted_response_generator():
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
     gen.model_path = "demo"
