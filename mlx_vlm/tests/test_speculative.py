@@ -2048,6 +2048,134 @@ def test_dflash_committed_hidden_segments_keep_per_row_lengths():
     assert segments[1].tolist() == [[[6.0, 7.0]]]
 
 
+def test_dflash_batch_round_stops_on_first_bonus_or_emitted_eos():
+    class LanguageModel:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, inputs, cache, capture_layer_ids):
+            del cache, capture_layer_ids
+            self.calls += 1
+            batch, length = inputs.shape
+            return SimpleNamespace(
+                logits=mx.zeros((batch, length, 128)),
+                hidden_states=[mx.zeros((batch, length, 1))],
+                gdn_states=None,
+            )
+
+        def rollback_speculative_cache(self, *args):
+            del args
+
+    class Drafter:
+        config = SimpleNamespace(target_layer_ids=[0], block_size=4)
+        accept_lens = []
+        draft_lens = []
+
+        def reset(self, model):
+            del model
+
+        def make_cache(self):
+            return []
+
+        def draft_block(self, *args):
+            del args
+            return mx.array([[1, 2, 3]])
+
+    first_bonus_lm = LanguageModel()
+    first_bonus_rounds = list(
+        speculative_utils._dflash_rounds_batch(
+            SimpleNamespace(language_model=first_bonus_lm),
+            Drafter(),
+            [],
+            mx.zeros((1, 1, 1)),
+            first_bonus=mx.array([99]),
+            max_tokens=8,
+            sampler=lambda logits: mx.array([[99, 0, 0, 0]]),
+            eos_token_ids={99},
+        )
+    )
+    assert first_bonus_rounds == []
+    assert first_bonus_lm.calls == 0
+
+    emitted_lm = LanguageModel()
+    emitted_rounds = list(
+        speculative_utils._dflash_rounds_batch(
+            SimpleNamespace(language_model=emitted_lm),
+            Drafter(),
+            [],
+            mx.zeros((1, 1, 1)),
+            first_bonus=mx.array([10]),
+            max_tokens=8,
+            sampler=lambda logits: mx.array([[99, 0, 0, 0]]),
+            eos_token_ids={99},
+        )
+    )
+    assert [tokens for tokens, _ in emitted_rounds] == [[99]]
+    assert emitted_lm.calls == 1
+
+
+def test_dflash_batch_filters_initial_eos_rows_before_verify():
+    class Cache:
+        def __init__(self):
+            self.filtered = []
+
+        def filter(self, keep):
+            self.filtered.append(keep.tolist())
+
+    class LanguageModel:
+        def __init__(self, cache):
+            self.cache = cache
+            self.batch_sizes = []
+
+        def __call__(self, inputs, cache, capture_layer_ids):
+            del capture_layer_ids
+            assert cache == [self.cache]
+            assert self.cache.filtered == [[1]]
+            self.batch_sizes.append(inputs.shape[0])
+            return SimpleNamespace(
+                logits=mx.zeros((1, inputs.shape[1], 128)),
+                hidden_states=[mx.zeros((1, inputs.shape[1], 1))],
+                gdn_states=None,
+            )
+
+        def rollback_speculative_cache(self, *args):
+            del args
+
+    class Drafter:
+        config = SimpleNamespace(target_layer_ids=[0], block_size=4)
+        accept_lens = []
+        draft_lens = []
+
+        def reset(self, model):
+            del model
+
+        def make_cache(self):
+            return []
+
+        def draft_block(self, *args):
+            del args
+            return mx.array([[1, 2, 3]])
+
+    cache = Cache()
+    language_model = LanguageModel(cache)
+    rounds = list(
+        speculative_utils._dflash_rounds_batch(
+            SimpleNamespace(language_model=language_model),
+            Drafter(),
+            [cache],
+            mx.zeros((2, 1, 1)),
+            first_bonus=mx.array([99, 10]),
+            max_tokens=8,
+            sampler=lambda logits: mx.array([[99, 0, 0, 0]]),
+            eos_token_ids={99},
+        )
+    )
+
+    assert [tokens for tokens, _ in rounds] == [[None, 99]]
+    assert cache.filtered == [[1]]
+    assert language_model.batch_sizes == [1]
+
+
 def test_gemma4_26b_dflash_config_preserves_capture_layers():
     config = Gemma4DFlashConfig.from_dict(
         {
