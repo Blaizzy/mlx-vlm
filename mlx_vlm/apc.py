@@ -71,6 +71,31 @@ DEFAULT_BLOCK_SIZE = 16
 DEFAULT_NUM_BLOCKS = 2048
 SEED_PARENT_HASH = 0
 
+# Matching is by token-id sequence, so a marker is reliable when it is a single
+# special token in the target vocabulary. Multi-token markers still match when
+# BPE happens to segment them the same way in context, but that is not
+# guaranteed -- keep genuine special tokens for each family in this list.
+DEFAULT_SEMANTIC_BOUNDARY_MARKERS = (
+    "</tool_call>",
+    "</tool_response>",
+    "</tool_output>",
+    "</think>",
+    "<|observation|>",
+    "<|user|>",
+    "<|assistant|>",
+    "<|im_end|>",
+    "<|end|>",
+    "<end_of_turn>",
+    "<start_of_turn>",
+    "<|eot_id|>",
+)
+DEFAULT_SEMANTIC_MIN_GAP = 256
+# Checkpoints are whole prompt-cache snapshots, so the pool grows with both the
+# checkpoint count and the context length. Left uncapped, a large budget on a
+# long context can exhaust memory. Applied only when semantic checkpoints are
+# enabled, so the default (feature off) pool is unchanged.
+DEFAULT_SEMANTIC_MAX_POOL_GB = 4.0
+
 
 def _env_truthy(name: str, default: str = "") -> bool:
     """Return True when env var is a common truthy string (1/true/yes)."""
@@ -492,6 +517,131 @@ def adjust_prefix_to_text_suffix_boundary(
     if prefix_len > max_len:
         return 0
     return prefix_len
+
+
+def semantic_checkpoint_config() -> Tuple[int, Tuple[str, ...], int, int]:
+    """Read the semantic-checkpoint policy from the environment.
+
+    Returns ``(max_checkpoints, markers, min_gap, max_pool_bytes)``.
+    ``max_checkpoints == 0`` disables the feature, leaving checkpoint mode on
+    its existing tail-only behaviour and the pool uncapped as before.
+    """
+    try:
+        max_checkpoints = max(0, int(os.environ.get("APC_SEMANTIC_CHECKPOINTS", "0")))
+    except ValueError:
+        max_checkpoints = 0
+    raw = os.environ.get("APC_SEMANTIC_BOUNDARY_TOKENS")
+    markers = (
+        tuple(m for m in (s.strip() for s in raw.split(",")) if m)
+        if raw
+        else DEFAULT_SEMANTIC_BOUNDARY_MARKERS
+    )
+    try:
+        min_gap = max(
+            1,
+            int(os.environ.get("APC_SEMANTIC_MIN_GAP", str(DEFAULT_SEMANTIC_MIN_GAP))),
+        )
+    except ValueError:
+        min_gap = DEFAULT_SEMANTIC_MIN_GAP
+    # Checkpoints are whole prompt-cache snapshots, so the pool grows with both
+    # count and context length; cap it, but only once the feature is on.
+    max_pool_bytes = 0
+    if max_checkpoints > 0:
+        try:
+            gb = float(
+                os.environ.get("APC_SEMANTIC_MAX_POOL_GB", DEFAULT_SEMANTIC_MAX_POOL_GB)
+            )
+        except ValueError:
+            gb = DEFAULT_SEMANTIC_MAX_POOL_GB
+        max_pool_bytes = int(gb * (1 << 30)) if gb > 0 else 0
+    return max_checkpoints, markers, min_gap, max_pool_bytes
+
+
+def resolve_boundary_sequences(
+    tokenizer: Any, markers: Optional[Sequence[str]] = None
+) -> Tuple[Tuple[int, ...], ...]:
+    """Encode boundary markers into token-id sequences for ``tokenizer``.
+
+    Matching is on id sequences rather than single ids, so a marker works
+    whether or not it is a special token in this vocabulary. Markers that fail
+    to encode are dropped; duplicates collapse.
+    """
+    encode = getattr(tokenizer, "encode", None)
+    if not callable(encode):
+        return ()
+    seqs: List[Tuple[int, ...]] = []
+    for marker in markers or DEFAULT_SEMANTIC_BOUNDARY_MARKERS:
+        try:
+            ids = encode(marker, add_special_tokens=False)
+        except TypeError:  # tokenizer without the kwarg
+            try:
+                ids = encode(marker)
+            except Exception:
+                continue
+        except Exception:
+            continue
+        if ids:
+            seqs.append(tuple(int(t) for t in ids))
+    return tuple(dict.fromkeys(seqs))  # ordered dedup
+
+
+def semantic_checkpoint_offsets(
+    token_ids: Sequence[int],
+    boundary_seqs: Sequence[Sequence[int]],
+    *,
+    max_checkpoints: int,
+    min_gap: int = DEFAULT_SEMANTIC_MIN_GAP,
+    guard: int = 0,
+) -> List[int]:
+    """Prefix lengths just after each semantic boundary, thinned to a budget.
+
+    Offsets are ascending, at least ``min_gap`` apart, and kept inside
+    ``[min_gap, len(token_ids) - guard]`` so every checkpoint has tokens on
+    both sides.
+    Returns ``[]`` when the feature is off or nothing qualifies, which leaves
+    the caller on the existing tail-only path.
+    """
+    if max_checkpoints <= 0 or not boundary_seqs:
+        return []
+    ids = tuple(int(t) for t in token_ids)
+    n = len(ids)
+    limit = min(n - max(0, int(guard)), n - 1)
+    if limit <= min_gap:
+        return []
+
+    # Bucket by first token so the scan touches each position once.
+    by_first: Dict[int, List[Tuple[int, ...]]] = {}
+    for seq in boundary_seqs:
+        s = tuple(int(t) for t in seq)
+        if s:
+            by_first.setdefault(s[0], []).append(s)
+
+    hits: set = set()
+    for i, tok in enumerate(ids):
+        for s in by_first.get(tok, ()):
+            end = i + len(s)
+            if end <= n and ids[i:end] == s:
+                hits.add(end)  # checkpoint lands just *after* the marker
+                break
+
+    candidates = sorted(h for h in hits if min_gap <= h <= limit)
+    if not candidates:
+        return []
+
+    spaced: List[int] = []
+    for off in candidates:
+        if not spaced or off - spaced[-1] >= min_gap:
+            spaced.append(off)
+    if len(spaced) <= max_checkpoints:
+        return spaced
+
+    # Over budget: spread evenly across the prompt, always keeping the
+    # shallowest and deepest. An edit is about as likely early as late, and the
+    # deepest offset is what still serves plain append-only turns.
+    if max_checkpoints == 1:
+        return [spaced[-1]]
+    step = (len(spaced) - 1) / (max_checkpoints - 1)
+    return [spaced[round(i * step)] for i in range(max_checkpoints)]
 
 
 @dataclass
@@ -2857,15 +3007,27 @@ class APCManager:
                 self._record_disk_writes,
                 self._record_disk_write_failures,
             )
+        (
+            self.semantic_checkpoints,
+            self.semantic_markers,
+            self.semantic_min_gap,
+            self._semantic_max_pool_bytes,
+        ) = semantic_checkpoint_config()
+        # Each semantic checkpoint needs a pool slot of its own, on top of the
+        # tail snapshots checkpoint mode already takes. With the feature off the
+        # default is unchanged at 2.
         self._exact_cache_max = max(
             0,
             int(
                 os.environ.get(
                     "APC_CHECKPOINT_ENTRIES",
-                    os.environ.get("APC_EXACT_CACHE_ENTRIES", "2"),
+                    os.environ.get(
+                        "APC_EXACT_CACHE_ENTRIES", str(2 + self.semantic_checkpoints)
+                    ),
                 )
             ),
         )
+        self._boundary_seqs: Optional[Tuple[Any, Tuple[Tuple[int, ...], ...]]] = None
         self.exact_cache_guard_tokens = max(
             1,
             int(
@@ -2968,6 +3130,41 @@ class APCManager:
 
     def _resident_bytes_locked(self) -> int:
         return sum(b.resident_bytes() for b in self.pool)
+
+    @staticmethod
+    def _entry_bytes(entry: "APCExactCacheEntry") -> int:
+        arrays: List[mx.array] = []
+        for layer in entry.prompt_cache:
+            _collect_mx_arrays(getattr(layer, "state", None), arrays)
+        return sum({id(a): a.nbytes for a in arrays}.values())
+
+    def _trim_exact_cache_locked(self) -> None:
+        """Evict LRU-first until the pool is within both the count and byte caps."""
+        while len(self._exact_cache) > self._exact_cache_max:
+            self._exact_cache.popitem(last=False)
+        budget = self._semantic_max_pool_bytes
+        if budget <= 0 or len(self._exact_cache) <= 1:
+            return
+        total = sum(self._entry_bytes(e) for e in self._exact_cache.values())
+        # Always keep the most recent entry, even if it alone exceeds the cap --
+        # dropping it would make the feature silently useless.
+        while total > budget and len(self._exact_cache) > 1:
+            _, evicted = self._exact_cache.popitem(last=False)
+            total -= self._entry_bytes(evicted)
+            self.stats.record_reject("pool_bytes", budget=budget)
+
+    def boundary_sequences(self, tokenizer: Any) -> Tuple[Tuple[int, ...], ...]:
+        """Semantic boundary markers encoded for ``tokenizer``, memoized.
+
+        Encoding is a handful of tokenizer calls, but it would otherwise run on
+        every request; the tokenizer is stable for the life of a manager.
+        """
+        cached = self._boundary_seqs
+        if cached is not None and cached[0] is tokenizer:
+            return cached[1]
+        seqs = resolve_boundary_sequences(tokenizer, self.semantic_markers)
+        self._boundary_seqs = (tokenizer, seqs)
+        return seqs
 
     def resident_bytes(self) -> int:
         with self.lock:
@@ -3153,9 +3350,8 @@ class APCManager:
                     prompt_cache=copied,
                 )
                 self._exact_cache.move_to_end(key)
-                while len(self._exact_cache) > self._exact_cache_max:
-                    self._exact_cache.popitem(last=False)
-                stored = True
+                self._trim_exact_cache_locked()
+                stored = key in self._exact_cache
         if stored:
             apc_trace(
                 "store",
@@ -3347,8 +3543,7 @@ class APCManager:
                         prompt_cache=copied,
                     )
                     self._exact_cache.move_to_end(key)
-                    while len(self._exact_cache) > self._exact_cache_max:
-                        self._exact_cache.popitem(last=False)
+                    self._trim_exact_cache_locked()
                     self.stats.exact_stores += 1
                     layer_major_stored = True
             parent = SEED_PARENT_HASH

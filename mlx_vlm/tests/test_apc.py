@@ -335,7 +335,8 @@ def test_single_row_prompt_batch_exact_checkpoint_stores_without_extract():
         {
             "full_input_ids": token_ids,
             "prefix_len": 0,
-            "checkpoint_len": len(token_ids),
+            "checkpoint_lens": [len(token_ids)],
+            "checkpoint_idx": 0,
             "extra_hash": 0,
         }
     ]
@@ -344,7 +345,7 @@ def test_single_row_prompt_batch_exact_checkpoint_stores_without_extract():
 
     batch._store_apc_exact_checkpoints()
 
-    assert batch._apc_meta[0]["checkpoint_done"] is True
+    assert batch._apc_meta[0]["checkpoint_idx"] == 1
     assert batch._apc_manager.stats_snapshot()["exact_stores"] == 1
 
 

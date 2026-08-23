@@ -9,7 +9,7 @@ import time
 import warnings
 from collections.abc import Generator
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -148,6 +148,31 @@ def normalize_resize_shape(values):
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
 
 
+def _clip_chunk_to_checkpoint(
+    n_to_process: int,
+    processed_tokens: int,
+    checkpoint_lens: Sequence[int],
+    checkpoint_idx: int,
+) -> Tuple[int, int]:
+    """Shorten a prefill chunk so it ends exactly on the next pending checkpoint.
+
+    Snapshots are only meaningful at an exact prefix length, so a chunk that
+    would straddle one is cut short. Also advances ``checkpoint_idx`` past any
+    checkpoint prefill has already run beyond. Returns the possibly-reduced
+    chunk size and the new cursor.
+    """
+    while (
+        checkpoint_idx < len(checkpoint_lens)
+        and checkpoint_lens[checkpoint_idx] <= processed_tokens
+    ):
+        checkpoint_idx += 1
+    if checkpoint_idx < len(checkpoint_lens):
+        target = checkpoint_lens[checkpoint_idx]
+        if processed_tokens + n_to_process > target:
+            n_to_process = target - processed_tokens
+    return n_to_process, checkpoint_idx
+
+
 def generate_step(
     input_ids: mx.array,
     model: nn.Module,
@@ -186,7 +211,7 @@ def generate_step(
     draft_kind: str = "dflash",
     draft_block_size: Optional[int] = None,
     prompt_cache_checkpoint: Optional[Callable[[int, List[Any]], None]] = None,
-    prompt_cache_checkpoint_len: Optional[int] = None,
+    prompt_cache_checkpoint_len: Optional[Union[int, Sequence[int]]] = None,
     seed: Optional[int] = None,
     verbose: bool = False,
     **kwargs,
@@ -426,18 +451,22 @@ def generate_step(
             prefill_kwargs=policy_kwargs,
         ):
             prefill_step_size = None
-        checkpoint_len = (
-            int(prompt_cache_checkpoint_len)
-            if prompt_cache_checkpoint is not None
+        # One or more prefix lengths at which to hand the caller a snapshot of
+        # the prompt cache. A bare int keeps the historical single-checkpoint
+        # contract; a sequence drives APC's semantic checkpoints.
+        checkpoint_lens: List[int] = []
+        if (
+            prompt_cache_checkpoint is not None
             and prompt_cache_checkpoint_len is not None
-            else None
-        )
-        checkpoint_done = False
+        ):
+            raw = prompt_cache_checkpoint_len
+            if isinstance(raw, int):
+                raw = [raw]
+            checkpoint_lens = sorted({c for c in map(int, raw) if c > 0})
+        checkpoint_idx = 0
         should_chunk = (
             prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size
-        ) or (
-            checkpoint_len is not None and 0 < checkpoint_len < inputs_embeds.shape[1]
-        )
+        ) or any(0 < c < inputs_embeds.shape[1] for c in checkpoint_lens)
         if prefill_step_size is not None and should_chunk:
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
@@ -447,13 +476,12 @@ def generate_step(
             ) as pbar:
                 while inputs_embeds.shape[1] > 1:
                     n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
-                    if (
-                        checkpoint_len is not None
-                        and not checkpoint_done
-                        and processed_tokens < checkpoint_len
-                        and processed_tokens + n_to_process > checkpoint_len
-                    ):
-                        n_to_process = checkpoint_len - processed_tokens
+                    n_to_process, checkpoint_idx = _clip_chunk_to_checkpoint(
+                        n_to_process,
+                        processed_tokens,
+                        checkpoint_lens,
+                        checkpoint_idx,
+                    )
                     chunk_kwargs = kwargs
                     if getattr(model.language_model, "supports_logits_to_keep", False):
                         chunk_kwargs = {**kwargs, "logits_to_keep": 1}
@@ -468,12 +496,11 @@ def generate_step(
                     mx.eval([c.state for c in prompt_cache])
                     processed_tokens += n_to_process
                     if (
-                        checkpoint_len is not None
-                        and not checkpoint_done
-                        and processed_tokens == checkpoint_len
+                        checkpoint_idx < len(checkpoint_lens)
+                        and processed_tokens == checkpoint_lens[checkpoint_idx]
                     ):
                         prompt_cache_checkpoint(processed_tokens, prompt_cache)
-                        checkpoint_done = True
+                        checkpoint_idx += 1
                     inputs_embeds = inputs_embeds[:, n_to_process:]
                     input_ids = input_ids[:, n_to_process:]
                     mx.clear_cache()
@@ -1808,26 +1835,29 @@ class PromptProcessingBatch:
             return True
         return self._inputs_embeds.shape[1] > self.prefill_step_size
 
+    def _pending_checkpoint_lens(self, meta: dict) -> List[int]:
+        """Checkpoint prefix lengths for this row that have not been stored yet."""
+        lens = meta.get("checkpoint_lens") or []
+        return [int(c) for c in lens[int(meta.get("checkpoint_idx", 0)) :]]
+
     def _apc_checkpoint_column_for_meta(
         self, batch_idx: int, meta: dict
     ) -> Optional[int]:
-        checkpoint_len = int(meta.get("checkpoint_len") or 0)
-        if (
-            not self._apc_uses_checkpoints()
-            or checkpoint_len <= 0
-            or meta.get("checkpoint_done")
-        ):
+        if not self._apc_uses_checkpoints():
             return None
         prefix_len = int(meta.get("prefix_len", 0) or 0)
-        if checkpoint_len <= prefix_len:
-            meta["checkpoint_done"] = True
-            return None
-        if self._right_pad_per_row is not None:
-            suffix_checkpoint = checkpoint_len - prefix_len
-            if suffix_checkpoint >= self._suffix_lens[batch_idx]:
-                return None
-            return suffix_checkpoint
-        return self._left_padding_per_row[batch_idx] + checkpoint_len
+        for checkpoint_len in self._pending_checkpoint_lens(meta):
+            if checkpoint_len <= 0 or checkpoint_len <= prefix_len:
+                # Already covered by the restored prefix; retire it.
+                meta["checkpoint_idx"] = int(meta.get("checkpoint_idx", 0)) + 1
+                continue
+            if self._right_pad_per_row is not None:
+                suffix_checkpoint = checkpoint_len - prefix_len
+                if suffix_checkpoint >= self._suffix_lens[batch_idx]:
+                    return None
+                return suffix_checkpoint
+            return self._left_padding_per_row[batch_idx] + checkpoint_len
+        return None
 
     def _next_apc_checkpoint_column(self) -> Optional[int]:
         if (
@@ -1870,9 +1900,12 @@ class PromptProcessingBatch:
         if self._apc_manager is None or not self._apc_uses_checkpoints():
             return
         for batch_idx, meta in enumerate(self._apc_meta):
-            if meta is None or meta.get("checkpoint_done"):
+            if meta is None:
                 continue
-            checkpoint_len = int(meta.get("checkpoint_len") or 0)
+            pending = self._pending_checkpoint_lens(meta)
+            if not pending:
+                continue
+            checkpoint_len = pending[0]
             if checkpoint_len <= 0:
                 continue
             if self._row_real_tokens_processed(batch_idx) != checkpoint_len:
@@ -1893,7 +1926,7 @@ class PromptProcessingBatch:
                     prompt_cache,
                     extra_hash=meta.get("extra_hash", 0),
                 )
-            meta["checkpoint_done"] = True
+            meta["checkpoint_idx"] = int(meta.get("checkpoint_idx", 0)) + 1
 
     def _prompt_kwargs_for_step(self, n: Optional[int] = None) -> dict:
         if n is None or not self._prompt_length_aware_keys:
@@ -2377,17 +2410,14 @@ class BatchGenerator:
             self._apc_media_token_ids(),
         )
 
-    def _apc_exact_checkpoint_len(self, ids_list: List[int]) -> int:
-        coordinator = getattr(self, "apc", None)
-        if coordinator is not None:
-            return coordinator.checkpoint_len(ids_list, self._apc_media_token_ids())
-        if self.apc_manager is None or getattr(self, "apc_mode", "block") != "exact":
-            return 0
-        return _apc.adjust_prefix_to_text_suffix_boundary(
-            ids_list,
-            len(ids_list) - self.apc_manager.exact_cache_guard_tokens,
-            self._apc_media_token_ids(),
-            max_prefix_tokens=len(ids_list) - 1,
+    def _apc_exact_checkpoint_lens(self, ids_list: List[int]) -> List[int]:
+        """Ascending prefix lengths to snapshot: the tail one, plus any
+        semantic boundaries APC is configured to keep."""
+        coordinator = getattr(self, "apc_coordinator", None)
+        if coordinator is None:
+            return []
+        return coordinator.checkpoint_lens(
+            ids_list, self._apc_media_token_ids(), self.tokenizer
         )
 
     def _apc_pick_for(self, sequence) -> Optional[dict]:
@@ -2561,7 +2591,8 @@ class BatchGenerator:
                     else self._apc_extra_hash(prompt_kwargs_list[i] or {})
                 ),
                 "apc_blocks": picks[i].get("matched_blocks", []) if picks[i] else [],
-                "checkpoint_len": self._apc_exact_checkpoint_len(full_ids[i]),
+                "checkpoint_lens": self._apc_exact_checkpoint_lens(full_ids[i]),
+                "checkpoint_idx": 0,
             }
             for i in range(len(sequences))
         ]
@@ -2621,7 +2652,8 @@ class BatchGenerator:
                     "prefix_len": 0,
                     "extra_hash": extra_hash,
                     "apc_blocks": [],
-                    "checkpoint_len": self._apc_exact_checkpoint_len(list(ids_list)),
+                    "checkpoint_lens": self._apc_exact_checkpoint_lens(list(ids_list)),
+                    "checkpoint_idx": 0,
                 }
             )
         return meta

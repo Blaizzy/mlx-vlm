@@ -14,7 +14,16 @@ from __future__ import annotations
 import mlx.core as mx
 import pytest
 
-from mlx_vlm.apc import APCManager, model_apc_mode
+from mlx_vlm.apc import (
+    DEFAULT_SEMANTIC_BOUNDARY_MARKERS,
+    DEFAULT_SEMANTIC_MAX_POOL_GB,
+    APCManager,
+    model_apc_mode,
+    resolve_boundary_sequences,
+    semantic_checkpoint_config,
+    semantic_checkpoint_offsets,
+)
+from mlx_vlm.generate.ar import _clip_chunk_to_checkpoint
 from mlx_vlm.models.cache import KVCache
 
 # ============================================================================
@@ -551,3 +560,418 @@ def test_block_eligible_layers_have_extractable_kv_after_prefill():
             assert mx.any(
                 c.values != 0
             ).item(), f"Block-eligible layer {i} values are all zeros"
+
+
+# ============================================================================
+# Semantic checkpoint boundaries
+#
+# Recurrent state is a fold over every token up to t, so it can only be
+# restored at a prefix that was actually snapshotted. A tail-only checkpoint
+# therefore gives up all reuse the moment an agent edits its history. These
+# tests cover boundary selection, the widened multi-checkpoint prefill
+# contract, and the reuse behaviour that motivates both.
+# ============================================================================
+
+MARK = 900  # stand-in for a boundary marker token id
+MARK2 = 901
+
+
+def _seq_with_markers(segment_len, n_segments, marker=MARK):
+    """[filler * segment_len, marker] * n_segments -> ids, boundary offsets."""
+    ids, offsets = [], []
+    for _ in range(n_segments):
+        ids.extend(range(1, segment_len + 1))
+        ids.append(marker)
+        offsets.append(len(ids))
+    return ids, offsets
+
+
+def test_semantic_offsets_disabled_by_default():
+    ids, _ = _seq_with_markers(100, 6)
+    assert (
+        semantic_checkpoint_offsets(ids, [(MARK,)], max_checkpoints=0, min_gap=50) == []
+    )
+
+
+def test_semantic_offsets_land_just_after_the_marker():
+    ids, offsets = _seq_with_markers(100, 4)
+    got = semantic_checkpoint_offsets(ids, [(MARK,)], max_checkpoints=8, min_gap=50)
+    # Last boundary is inside the guard-free tail, so it drops out; the rest
+    # must line up exactly with the token following each marker.
+    assert got == [o for o in offsets if o <= len(ids) - 1]
+    for off in got:
+        assert ids[off - 1] == MARK
+
+
+def test_semantic_offsets_enforce_min_gap():
+    ids, _ = _seq_with_markers(10, 30)  # a boundary every 11 tokens
+    got = semantic_checkpoint_offsets(ids, [(MARK,)], max_checkpoints=64, min_gap=100)
+    assert got, "expected at least one boundary"
+    assert all(b - a >= 100 for a, b in zip(got, got[1:]))
+
+
+def test_semantic_offsets_thin_to_budget_keeping_both_ends():
+    ids, _ = _seq_with_markers(60, 20)
+    dense = semantic_checkpoint_offsets(ids, [(MARK,)], max_checkpoints=64, min_gap=1)
+    thin = semantic_checkpoint_offsets(ids, [(MARK,)], max_checkpoints=4, min_gap=1)
+    assert len(thin) == 4
+    assert set(thin) <= set(dense)
+    # Shallowest and deepest are the two that must survive: the first covers
+    # early edits, the last is what still serves plain append-only turns.
+    assert thin[0] == dense[0]
+    assert thin[-1] == dense[-1]
+
+
+def test_semantic_offsets_respect_guard_and_stay_in_bounds():
+    ids, _ = _seq_with_markers(100, 5)
+    got = semantic_checkpoint_offsets(
+        ids, [(MARK,)], max_checkpoints=8, min_gap=50, guard=250
+    )
+    assert got
+    assert max(got) <= len(ids) - 250
+    assert min(got) >= 50
+
+
+def test_semantic_offsets_empty_without_boundaries():
+    ids = list(range(1, 600))
+    assert semantic_checkpoint_offsets(ids, [(MARK,)], max_checkpoints=4) == []
+    assert semantic_checkpoint_offsets(ids, [], max_checkpoints=4) == []
+
+
+def test_semantic_offsets_match_multi_token_markers():
+    marker = (MARK, MARK2)
+    ids = []
+    expected = []
+    for _ in range(4):
+        ids.extend(range(1, 101))
+        ids.extend(marker)
+        expected.append(len(ids))
+    got = semantic_checkpoint_offsets(ids, [marker], max_checkpoints=8, min_gap=50)
+    assert got == [o for o in expected if o <= len(ids) - 1]
+
+
+def test_resolve_boundary_sequences_dedups_and_drops_unencodable():
+    class Tok:
+        def encode(self, text, add_special_tokens=False):
+            if text == "boom":
+                raise ValueError("unencodable")
+            return {"a": [1, 2], "b": [1, 2], "c": [3]}[text]
+
+    assert resolve_boundary_sequences(Tok(), ["a", "b", "c", "boom"]) == ((1, 2), (3,))
+    assert resolve_boundary_sequences(object(), ["a"]) == ()
+
+
+def test_semantic_checkpoint_config_reads_env(monkeypatch):
+    monkeypatch.delenv("APC_SEMANTIC_CHECKPOINTS", raising=False)
+    monkeypatch.delenv("APC_SEMANTIC_BOUNDARY_TOKENS", raising=False)
+    monkeypatch.delenv("APC_SEMANTIC_MIN_GAP", raising=False)
+    count, markers, gap, _ = semantic_checkpoint_config()
+    assert count == 0  # off unless asked for
+    assert markers == DEFAULT_SEMANTIC_BOUNDARY_MARKERS
+
+    monkeypatch.setenv("APC_SEMANTIC_CHECKPOINTS", "5")
+    monkeypatch.setenv("APC_SEMANTIC_BOUNDARY_TOKENS", "</a>, </b> ,")
+    monkeypatch.setenv("APC_SEMANTIC_MIN_GAP", "64")
+    assert semantic_checkpoint_config()[:3] == (5, ("</a>", "</b>"), 64)
+
+    monkeypatch.setenv("APC_SEMANTIC_CHECKPOINTS", "not-a-number")
+    assert semantic_checkpoint_config()[0] == 0
+
+
+def test_exact_pool_grows_with_the_semantic_budget(monkeypatch):
+    monkeypatch.delenv("APC_EXACT_CACHE_ENTRIES", raising=False)
+    monkeypatch.delenv("APC_SEMANTIC_CHECKPOINTS", raising=False)
+    assert APCManager(num_blocks=4, block_size=4)._exact_cache_max == 2
+
+    monkeypatch.setenv("APC_SEMANTIC_CHECKPOINTS", "4")
+    assert APCManager(num_blocks=4, block_size=4)._exact_cache_max == 6
+
+    # An explicit override still wins.
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "3")
+    assert APCManager(num_blocks=4, block_size=4)._exact_cache_max == 3
+
+
+def test_boundary_sequences_are_memoized_per_tokenizer(monkeypatch):
+    monkeypatch.setenv("APC_SEMANTIC_CHECKPOINTS", "2")
+    monkeypatch.setenv("APC_SEMANTIC_BOUNDARY_TOKENS", "</x>")
+    calls = []
+
+    class Tok:
+        def encode(self, text, add_special_tokens=False):
+            calls.append(text)
+            return [7]
+
+    apc = APCManager(num_blocks=4, block_size=4)
+    tok = Tok()
+    assert apc.boundary_sequences(tok) == ((7,),)
+    assert apc.boundary_sequences(tok) == ((7,),)
+    assert len(calls) == 1
+
+    apc.boundary_sequences(Tok())  # different tokenizer re-encodes
+    assert len(calls) == 2
+
+
+def _kv_at(offset, fill=1.0):
+    kv = KVCache()
+    kv.keys = mx.full((1, 1, offset, 2), fill)
+    kv.values = mx.full((1, 1, offset, 2), fill)
+    kv.offset = offset
+    return kv
+
+
+def test_chunk_clipping_lands_on_every_checkpoint():
+    """Prefill chunks must be cut so each checkpoint prefix is hit exactly."""
+    lens = [10, 25, 40]
+    total, step = 64, 16
+    processed, idx, fired = 0, 0, []
+    while processed < total - 1:
+        n = min(step, total - 1 - processed)
+        n, idx = _clip_chunk_to_checkpoint(n, processed, lens, idx)
+        assert n > 0
+        processed += n
+        if idx < len(lens) and processed == lens[idx]:
+            fired.append(processed)
+            idx += 1
+    assert fired == lens
+
+
+def test_chunk_clipping_is_a_noop_without_checkpoints():
+    assert _clip_chunk_to_checkpoint(16, 0, [], 0) == (16, 0)
+    # A checkpoint already behind us just advances the cursor.
+    assert _clip_chunk_to_checkpoint(16, 40, [10, 25], 0) == (16, 2)
+
+
+def test_edited_history_resumes_from_deepest_semantic_checkpoint(monkeypatch):
+    """The point of the feature: an edit mid-history still finds a warm prefix."""
+    monkeypatch.setenv("APC_SEMANTIC_CHECKPOINTS", "4")
+    ids, _ = _seq_with_markers(100, 6)
+    apc = APCManager(num_blocks=8, block_size=16)
+    chosen = semantic_checkpoint_offsets(
+        ids, [(MARK,)], max_checkpoints=4, min_gap=50, guard=16
+    )
+    assert len(chosen) >= 3
+    for off in chosen:
+        assert apc.store_exact_cache(ids[:off], [_kv_at(off)])
+
+    # An agent rewrites everything after a point past the third checkpoint.
+    edit_at = chosen[2] + 30
+    edited = ids[:edit_at] + [777] * 200
+
+    restored, prefix_len = apc.lookup_exact_cache(edited)
+    assert restored is not None
+    assert prefix_len == chosen[2]
+
+
+def test_tail_only_checkpoint_misses_the_same_edit(monkeypatch):
+    """Control for the test above: today's tail-only policy salvages nothing."""
+    monkeypatch.delenv("APC_SEMANTIC_CHECKPOINTS", raising=False)
+    ids, _ = _seq_with_markers(100, 6)
+    apc = APCManager(num_blocks=8, block_size=16)
+    tail = len(ids) - apc.exact_cache_guard_tokens
+    assert apc.store_exact_cache(ids[:tail], [_kv_at(tail)])
+
+    chosen = semantic_checkpoint_offsets(
+        ids, [(MARK,)], max_checkpoints=4, min_gap=50, guard=16
+    )
+    edited = ids[: chosen[2] + 30] + [777] * 200
+
+    restored, prefix_len = apc.lookup_exact_cache(edited)
+    assert restored is None
+    assert prefix_len == 0
+
+
+def test_semantic_checkpoints_still_serve_append_only_turns(monkeypatch):
+    """Adding boundaries must not cost the deepest-prefix hit on plain appends."""
+    monkeypatch.setenv("APC_SEMANTIC_CHECKPOINTS", "4")
+    ids, _ = _seq_with_markers(100, 6)
+    apc = APCManager(num_blocks=8, block_size=16)
+    chosen = semantic_checkpoint_offsets(
+        ids, [(MARK,)], max_checkpoints=4, min_gap=50, guard=16
+    )
+    for off in chosen:
+        apc.store_exact_cache(ids[:off], [_kv_at(off)])
+
+    appended = ids + [55] * 120
+    _, prefix_len = apc.lookup_exact_cache(appended)
+    assert prefix_len == max(chosen)
+
+
+def _kda_states(prompt_cache):
+    """Every recurrent KDA state array in a GLM-5-Next prompt cache."""
+    from mlx_vlm.models.cache import ArraysCache
+
+    return [
+        a
+        for c in prompt_cache
+        if isinstance(c, ArraysCache)
+        for a in c.state
+        if a is not None
+    ]
+
+
+def test_checkpoint_restore_reproduces_recurrent_state():
+    """A checkpoint is only sound if resuming the fold matches never breaking it.
+
+    KDA state at token t depends on every token before it, so a restore that
+    lost information would silently diverge for the whole rest of the sequence.
+    """
+    lm = _make_tiny_qwen35()
+    ids = [(i * 7 + 3) % 32 for i in range(96)]
+
+    cold = lm.make_cache()
+    lm(mx.array([ids]), cache=cold)
+    mx.eval([c.state for c in cold])
+
+    split = 48
+    warm = lm.make_cache()
+    lm(mx.array([ids[:split]]), cache=warm)
+    mx.eval([c.state for c in warm])
+
+    apc = APCManager(num_blocks=16, block_size=16)
+    assert apc.store_exact_cache(ids[:split], warm)
+    restored, prefix_len = apc.lookup_exact_cache(ids)
+    assert restored is not None and prefix_len == split
+
+    lm(mx.array([ids[split:]]), cache=restored)
+    mx.eval([c.state for c in restored])
+
+    cold_states, warm_states = _kda_states(cold), _kda_states(restored)
+    assert cold_states, "factory produced no recurrent state to compare"
+    for a, b in zip(cold_states, warm_states):
+        assert a.shape == b.shape
+        assert mx.allclose(a, b, atol=1e-5, rtol=1e-5).item()
+
+
+def test_multiple_checkpoints_each_restore_correctly(monkeypatch):
+    """Every stored boundary must be independently resumable, not just the last.
+
+    Also covers the pool sizing: without a semantic budget the default of two
+    entries would evict the shallowest checkpoint as the third is stored.
+    """
+    monkeypatch.setenv("APC_SEMANTIC_CHECKPOINTS", "3")
+    lm = _make_tiny_qwen35()
+    ids = [(i * 5 + 11) % 32 for i in range(120)]
+
+    cold = lm.make_cache()
+    lm(mx.array([ids]), cache=cold)
+    mx.eval([c.state for c in cold])
+    expected = _kda_states(cold)
+
+    apc = APCManager(num_blocks=16, block_size=16)
+    splits = [30, 60, 90]
+    for split in splits:
+        cache = lm.make_cache()
+        lm(mx.array([ids[:split]]), cache=cache)
+        mx.eval([c.state for c in cache])
+        assert apc.store_exact_cache(ids[:split], cache)
+
+    for split in splits:
+        restored, prefix_len = apc.lookup_exact_cache(
+            ids[:split] + [31] * 4, max_prefix_tokens=split
+        )
+        assert prefix_len == split, f"no checkpoint recovered at {split}"
+        lm(mx.array([ids[split:]]), cache=restored)
+        mx.eval([c.state for c in restored])
+        for a, b in zip(expected, _kda_states(restored)):
+            assert mx.allclose(a, b, atol=1e-5, rtol=1e-5).item()
+
+
+def test_single_checkpoint_schedule_matches_the_pre_list_behaviour():
+    """The list-based clip must reproduce the old scalar logic exactly.
+
+    Widening ``prompt_cache_checkpoint_len`` from an int to a sequence is only
+    safe if a one-element list drives the identical chunk schedule, so this
+    replays the pre-change branch and compares step for step.
+    """
+
+    def legacy_schedule(total, step, checkpoint_len):
+        processed, done, chunks, fired = 0, False, [], []
+        while processed < total - 1:
+            n = min(step, total - 1 - processed)
+            if (
+                checkpoint_len is not None
+                and not done
+                and processed < checkpoint_len
+                and processed + n > checkpoint_len
+            ):
+                n = checkpoint_len - processed
+            chunks.append(n)
+            processed += n
+            if checkpoint_len is not None and not done and processed == checkpoint_len:
+                fired.append(processed)
+                done = True
+        return chunks, fired
+
+    def new_schedule(total, step, checkpoint_len):
+        lens = [] if checkpoint_len is None else [checkpoint_len]
+        processed, idx, chunks, fired = 0, 0, [], []
+        while processed < total - 1:
+            n = min(step, total - 1 - processed)
+            n, idx = _clip_chunk_to_checkpoint(n, processed, lens, idx)
+            chunks.append(n)
+            processed += n
+            if idx < len(lens) and processed == lens[idx]:
+                fired.append(processed)
+                idx += 1
+        return chunks, fired
+
+    for total in (33, 64, 100, 257):
+        for step in (8, 16, 64):
+            for checkpoint_len in [None] + list(range(1, total, 7)):
+                assert legacy_schedule(total, step, checkpoint_len) == new_schedule(
+                    total, step, checkpoint_len
+                ), (total, step, checkpoint_len)
+
+
+def test_pool_byte_budget_is_off_when_feature_is_off(monkeypatch):
+    """The historical two-entry pool must not gain a byte cap."""
+    monkeypatch.delenv("APC_SEMANTIC_CHECKPOINTS", raising=False)
+    monkeypatch.delenv("APC_SEMANTIC_MAX_POOL_GB", raising=False)
+    assert semantic_checkpoint_config()[3] == 0
+    assert APCManager(num_blocks=4, block_size=4)._semantic_max_pool_bytes == 0
+
+
+def test_pool_byte_budget_defaults_on_when_feature_is_on(monkeypatch):
+    monkeypatch.setenv("APC_SEMANTIC_CHECKPOINTS", "8")
+    monkeypatch.delenv("APC_SEMANTIC_MAX_POOL_GB", raising=False)
+    gb = 1 << 30
+    assert semantic_checkpoint_config()[3] == int(DEFAULT_SEMANTIC_MAX_POOL_GB * gb)
+    monkeypatch.setenv("APC_SEMANTIC_MAX_POOL_GB", "0")
+    assert semantic_checkpoint_config()[3] == 0  # explicit opt-out
+    monkeypatch.setenv("APC_SEMANTIC_MAX_POOL_GB", "1.5")
+    assert semantic_checkpoint_config()[3] == int(1.5 * gb)
+    monkeypatch.setenv("APC_SEMANTIC_MAX_POOL_GB", "junk")
+    assert semantic_checkpoint_config()[3] == int(DEFAULT_SEMANTIC_MAX_POOL_GB * gb)
+
+
+def test_pool_evicts_on_bytes_not_just_count(monkeypatch):
+    """A budget smaller than the working set must evict LRU-first, keeping the newest."""
+    monkeypatch.setenv("APC_SEMANTIC_CHECKPOINTS", "8")
+    # the clone trims K/V to the stored prefix, so an entry at offset N costs
+    # 2 * N * 64 * 4 B. Offsets 40..200 total ~300 KiB; cap below that.
+    monkeypatch.setenv("APC_SEMANTIC_MAX_POOL_GB", str(150 * 1024 / (1 << 30)))
+    apc = APCManager(num_blocks=8, block_size=16)
+    assert apc._semantic_max_pool_bytes > 0
+
+    def big(n):
+        kv = KVCache()
+        kv.keys = mx.zeros((1, 1, 512, 64))
+        kv.values = mx.zeros((1, 1, 512, 64))
+        kv.offset = n
+        return [kv]
+
+    ids = list(range(1, 400))
+    for off in (40, 80, 120, 160, 200):
+        apc.store_exact_cache(ids[:off], big(off))
+
+    assert len(apc._exact_cache) < 5, "byte cap did not evict anything"
+    total = sum(apc._entry_bytes(e) for e in apc._exact_cache.values())
+    assert total <= apc._semantic_max_pool_bytes
+    # the newest checkpoint survives — it is the one most likely to be reused
+    assert max(len(e.token_ids) for e in apc._exact_cache.values()) == 200
+
+
+def test_default_markers_cover_non_qwen_families():
+    """gemma / llama turn markers must be present, plus the paper's tool_output."""
+    for m in ("</tool_output>", "<end_of_turn>", "<start_of_turn>", "<|eot_id|>"):
+        assert m in DEFAULT_SEMANTIC_BOUNDARY_MARKERS

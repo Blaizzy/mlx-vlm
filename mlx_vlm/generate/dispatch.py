@@ -967,11 +967,12 @@ def stream_generate(
             and apc_coordinator.is_checkpoint
             and reused_prefix_len == 0
         ):
-            exact_checkpoint_len = apc_coordinator.checkpoint_len(
-                full_input_ids_list, multimodal_token_ids
+            exact_checkpoint_len = (
+                apc_coordinator.checkpoint_lens(
+                    full_input_ids_list, multimodal_token_ids, tokenizer
+                )
+                or None
             )
-            if exact_checkpoint_len <= 0:
-                exact_checkpoint_len = None
 
             def exact_checkpoint(prefix_len: int, prompt_cache: List[Any]) -> None:
                 apc_coordinator.store_checkpoint(

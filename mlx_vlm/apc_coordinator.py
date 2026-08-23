@@ -94,6 +94,43 @@ class APCCoordinator:
             max_prefix_tokens=len(token_ids) - 1,
         )
 
+    def checkpoint_lens(
+        self,
+        token_ids: Sequence[int],
+        media_token_ids: set[int],
+        tokenizer: Any = None,
+    ) -> List[int]:
+        """Ascending prefix lengths to snapshot: the tail one, plus any
+        semantic boundaries APC is configured to keep.
+
+        Recurrent state is not sliceable, so an edited history can only resume
+        from a stored point -- a tail-only checkpoint means any earlier edit
+        re-prefills everything. Offsets whose suffix still contains media
+        tokens are dropped: a warm restore drops pixel_values, so they would
+        never match.
+        """
+        # checkpoint_len already returns 0 unless enabled and in checkpoint
+        # mode, and `enabled` implies a manager, so no further guard is needed.
+        tail = self.checkpoint_len(token_ids, media_token_ids)
+        lens = [tail] if tail > 0 else []
+        mgr = self.manager
+        if tail > 0 and tokenizer is not None and mgr.semantic_checkpoints > 0:
+            from .apc import media_safe_prefix_min, semantic_checkpoint_offsets
+
+            media_min = media_safe_prefix_min(token_ids, media_token_ids)
+            lens.extend(
+                off
+                for off in semantic_checkpoint_offsets(
+                    token_ids,
+                    mgr.boundary_sequences(tokenizer),
+                    max_checkpoints=mgr.semantic_checkpoints,
+                    min_gap=mgr.semantic_min_gap,
+                    guard=mgr.exact_cache_guard_tokens,
+                )
+                if off >= media_min
+            )
+        return sorted(set(lens))
+
     def merge_rows(
         self,
         picks: Sequence[Optional[dict]],

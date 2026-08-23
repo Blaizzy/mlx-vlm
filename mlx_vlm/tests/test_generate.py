@@ -2160,11 +2160,15 @@ def test_stream_generate_stores_checkpoint_only_before_decode():
     coordinator.is_checkpoint = True
     coordinator.lookup.return_value = None
     coordinator.checkpoint_len.return_value = 3
+    # dispatch asks for the plural form; the tail entry is the same prefix
+    coordinator.checkpoint_lens.return_value = [3]
 
     def fake_generate_step(*args, **kwargs):
-        kwargs["prompt_cache_checkpoint"](
-            kwargs["prompt_cache_checkpoint_len"], kwargs["prompt_cache"]
-        )
+        # prompt_cache_checkpoint_len accepts an int or a sequence; the real
+        # prefill fires the callback once per checkpoint prefix.
+        lens = kwargs["prompt_cache_checkpoint_len"]
+        for n in lens if isinstance(lens, (list, tuple)) else [lens]:
+            kwargs["prompt_cache_checkpoint"](n, kwargs["prompt_cache"])
         yield 7, mx.zeros((4,))
 
     processor = SimpleNamespace(
