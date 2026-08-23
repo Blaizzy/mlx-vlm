@@ -22,8 +22,11 @@ def _use_target_verify_dense(linear, x: mx.array) -> bool:
     )
 
 
-def _target_verify_qlinear_header(bits: int, group_size: int) -> str:
-    return r"""
+def _target_verify_qlinear_header(
+    bits: int, group_size: int, results_per_simdgroup: int = 4
+) -> str:
+    return (
+        r"""
     using namespace metal;
 
     constant constexpr int SIMD_SIZE = 32;
@@ -35,7 +38,7 @@ def _target_verify_qlinear_header(bits: int, group_size: int) -> str:
     constant constexpr int VALUES_PER_THREAD = PACK_FACTOR * PACKS_PER_THREAD;
     constant constexpr int BLOCK_SIZE = VALUES_PER_THREAD * SIMD_SIZE;
     constant constexpr int SCALE_STEP_PER_THREAD = GS / VALUES_PER_THREAD;
-    constant constexpr int RESULTS_PER_SIMDGROUP = 4;
+    constant constexpr int RESULTS_PER_SIMDGROUP = __RESULTS_PER_SIMDGROUP__;
     constant constexpr int NUM_SIMDGROUPS = 2;
     constant constexpr int BN = RESULTS_PER_SIMDGROUP * NUM_SIMDGROUPS;
 
@@ -114,7 +117,31 @@ def _target_verify_qlinear_header(bits: int, group_size: int) -> str:
       }
       return scale * accum + sum * bias;
     }
-""".replace("__BITS__", str(bits)).replace("__GS__", str(group_size))
+
+    inline float qdot_exact(
+        const thread uint16_t* ws,
+        const thread float* x_thread,
+        float scale,
+        float bias,
+        float sum) {
+      float accum = 0.0f;
+      if (BITS == 4) {
+        for (int i = 0; i < (VALUES_PER_THREAD / 4); i++) {
+          uint packed = ws[i];
+          accum +=
+              (x_thread[4 * i] * (packed & 0x000f) +
+               x_thread[4 * i + 1] * ((packed >> 4) & 0x000f) +
+               x_thread[4 * i + 2] * ((packed >> 8) & 0x000f) +
+               x_thread[4 * i + 3] * ((packed >> 12) & 0x000f));
+        }
+      }
+      return scale * accum + sum * bias;
+    }
+
+""".replace("__BITS__", str(bits))
+        .replace("__GS__", str(group_size))
+        .replace("__RESULTS_PER_SIMDGROUP__", str(results_per_simdgroup))
+    )
 
 
 _TARGET_VERIFY_QMV_SOURCE = r"""
@@ -455,6 +482,171 @@ _TARGET_VERIFY_QARGMAX_TOKEN_TILED_SOURCE = r"""
     }
 """
 
+
+_TARGET_VERIFY_QMV_STREAMED_SOURCE = r"""
+    uint n_tile = threadgroup_position_in_grid.y;
+    uint b_idx = threadgroup_position_in_grid.z;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    int out_row = int(n_tile) * BN + int(simd_gid) * RESULTS_PER_SIMDGROUP;
+    int in_vec_size_w = K_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+    int in_vec_size_g = K_SIZE / GS;
+
+    const device uint8_t* ws =
+        (const device uint8_t*)w + out_row * in_vec_size_w +
+        int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
+    const device T* sc =
+        scales + out_row * in_vec_size_g +
+        int(simd_lid) / SCALE_STEP_PER_THREAD;
+    const device T* bs =
+        biases + out_row * in_vec_size_g +
+        int(simd_lid) / SCALE_STEP_PER_THREAD;
+    const device T* xk =
+        x + int(b_idx) * VERIFY_T * K_SIZE +
+        int(simd_lid) * VALUES_PER_THREAD;
+
+    float result[VERIFY_T][RESULTS_PER_SIMDGROUP];
+    for (int t = 0; t < VERIFY_T; ++t) {
+      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+        result[t][row] = 0.0f;
+      }
+    }
+
+    for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
+      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+        const device uint16_t* source =
+            (const device uint16_t*)(ws + row * in_vec_size_w);
+        uint16_t packed[VALUES_PER_THREAD / 4];
+        for (int index = 0; index < VALUES_PER_THREAD / 4; ++index) {
+          packed[index] = source[index];
+        }
+        float scale = float(sc[row * in_vec_size_g]);
+        float bias = float(bs[row * in_vec_size_g]);
+        for (int t = 0; t < VERIFY_T; ++t) {
+          float x_thread[VALUES_PER_THREAD];
+          float sum = load_vector_exact<T>(
+              xk + t * K_SIZE, x_thread);
+          result[t][row] += qdot_exact(
+              packed, x_thread, scale, bias, sum);
+        }
+      }
+
+      ws += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+      sc += BLOCK_SIZE / GS;
+      bs += BLOCK_SIZE / GS;
+      xk += BLOCK_SIZE;
+    }
+
+    for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+      int n = out_row + row;
+      for (int t = 0; t < VERIFY_T; ++t) {
+        float value = simd_sum(result[t][row]);
+        if (simd_lid == 0) {
+          y[(int(b_idx) * VERIFY_T + t) * N_SIZE + n] = T(value);
+        }
+      }
+    }
+"""
+
+
+_TARGET_VERIFY_QARGMAX_STREAMED_SOURCE = r"""
+    uint n_tile = threadgroup_position_in_grid.y;
+    uint b_idx = threadgroup_position_in_grid.z;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    int out_row = int(n_tile) * BN + int(simd_gid) * RESULTS_PER_SIMDGROUP;
+    int in_vec_size_w = K_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+    int in_vec_size_g = K_SIZE / GS;
+
+    threadgroup float tile_best_values[VERIFY_T][NUM_SIMDGROUPS];
+    threadgroup int tile_best_indices[VERIFY_T][NUM_SIMDGROUPS];
+
+    const device uint8_t* ws =
+        (const device uint8_t*)w + out_row * in_vec_size_w +
+        int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
+    const device T* sc =
+        scales + out_row * in_vec_size_g +
+        int(simd_lid) / SCALE_STEP_PER_THREAD;
+    const device T* bs =
+        biases + out_row * in_vec_size_g +
+        int(simd_lid) / SCALE_STEP_PER_THREAD;
+    const device T* xk =
+        x + int(b_idx) * VERIFY_T * K_SIZE +
+        int(simd_lid) * VALUES_PER_THREAD;
+
+    float result[VERIFY_T][RESULTS_PER_SIMDGROUP];
+    for (int t = 0; t < VERIFY_T; ++t) {
+      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+        result[t][row] = 0.0f;
+      }
+    }
+
+    for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
+      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+        const device uint16_t* source =
+            (const device uint16_t*)(ws + row * in_vec_size_w);
+        uint16_t packed[VALUES_PER_THREAD / 4];
+        for (int index = 0; index < VALUES_PER_THREAD / 4; ++index) {
+          packed[index] = source[index];
+        }
+        float scale = float(sc[row * in_vec_size_g]);
+        float bias = float(bs[row * in_vec_size_g]);
+        for (int t = 0; t < VERIFY_T; ++t) {
+          float x_thread[VALUES_PER_THREAD];
+          float sum = load_vector_exact<T>(
+              xk + t * K_SIZE, x_thread);
+          result[t][row] += qdot_exact(
+              packed, x_thread, scale, bias, sum);
+        }
+      }
+
+      ws += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+      sc += BLOCK_SIZE / GS;
+      bs += BLOCK_SIZE / GS;
+      xk += BLOCK_SIZE;
+    }
+
+    for (int t = 0; t < VERIFY_T; ++t) {
+      float best_value = -3.4028234663852886e38f;
+      int best_index = 0;
+      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+        int n = out_row + row;
+        float rounded = float(T(simd_sum(result[t][row])));
+        if (n < N_SIZE && rounded > best_value) {
+          best_value = rounded;
+          best_index = n;
+        }
+      }
+
+      if (simd_lid == 0) {
+        tile_best_values[t][simd_gid] = best_value;
+        tile_best_indices[t][simd_gid] = best_index;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_gid == 0 && simd_lid == 0) {
+      for (int t = 0; t < VERIFY_T; ++t) {
+        float best = tile_best_values[t][0];
+        int best_idx = tile_best_indices[t][0];
+        for (int i = 1; i < NUM_SIMDGROUPS; ++i) {
+          float candidate = tile_best_values[t][i];
+          int candidate_idx = tile_best_indices[t][i];
+          if (candidate > best) {
+            best = candidate;
+            best_idx = candidate_idx;
+          }
+        }
+        int offset =
+            (int(b_idx) * VERIFY_T + t) * NUM_TILES + int(n_tile);
+        tile_values[offset] = T(best);
+        tile_indices[offset] = best_idx;
+      }
+    }
+"""
+
 _TARGET_VERIFY_MASKED_QARGMAX_SOURCE = _TARGET_VERIFY_QARGMAX_SOURCE.replace(
     "if (n < N_SIZE) {",
     """if (
@@ -471,6 +663,16 @@ _TARGET_VERIFY_MASKED_QARGMAX_TOKEN_TILED_SOURCE = _TARGET_VERIFY_QARGMAX_TOKEN_
           ((as_type<uint>(mask[
                 (flat_token_start + t) * mask_shape[1] + (n >> 5)]) >>
             (n & 31)) & 1u) != 0u) {""",
+)
+
+_TARGET_VERIFY_MASKED_QARGMAX_STREAMED_SOURCE = _TARGET_VERIFY_QARGMAX_STREAMED_SOURCE.replace(
+    "if (n < N_SIZE && rounded > best_value) {",
+    """if (
+          n < N_SIZE &&
+          ((as_type<uint>(mask[
+                (int(b_idx) * VERIFY_T + t) * mask_shape[1] + (n >> 5)]) >>
+            (n & 31)) & 1u) != 0u &&
+          rounded > best_value) {""",
 )
 
 
@@ -659,6 +861,57 @@ def _target_verify_masked_qargmax_token_tiled_kernel(
 
 
 @lru_cache(maxsize=None)
+def _target_verify_qmv_streamed_kernel(
+    bits, group_size, dtype, verify_t, k_size, n_size
+):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=(
+            "qwen3_5_target_verify_qmv_streamed_"
+            f"b{bits}_gs{group_size}_t{verify_t}_k{k_size}_n{n_size}_{dtype_name}"
+        ),
+        input_names=["x", "w", "scales", "biases"],
+        output_names=["y"],
+        header=_target_verify_qlinear_header(bits, group_size, 1),
+        source=_TARGET_VERIFY_QMV_STREAMED_SOURCE,
+    )
+
+
+@lru_cache(maxsize=None)
+def _target_verify_qargmax_streamed_kernel(
+    bits, group_size, dtype, verify_t, k_size, n_size
+):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=(
+            "qwen3_5_target_verify_qargmax_streamed_"
+            f"b{bits}_gs{group_size}_t{verify_t}_k{k_size}_n{n_size}_{dtype_name}"
+        ),
+        input_names=["x", "w", "scales", "biases"],
+        output_names=["tile_values", "tile_indices"],
+        header=_target_verify_qlinear_header(bits, group_size, 1),
+        source=_TARGET_VERIFY_QARGMAX_STREAMED_SOURCE,
+    )
+
+
+@lru_cache(maxsize=None)
+def _target_verify_masked_qargmax_streamed_kernel(
+    bits, group_size, dtype, verify_t, k_size, n_size
+):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=(
+            "qwen3_5_target_verify_masked_qargmax_streamed_"
+            f"b{bits}_gs{group_size}_t{verify_t}_k{k_size}_n{n_size}_{dtype_name}"
+        ),
+        input_names=["x", "w", "scales", "biases", "mask"],
+        output_names=["tile_values", "tile_indices"],
+        header=_target_verify_qlinear_header(bits, group_size, 1),
+        source=_TARGET_VERIFY_MASKED_QARGMAX_STREAMED_SOURCE,
+    )
+
+
+@lru_cache(maxsize=None)
 def _target_verify_fused_qmv_kernel(bits, group_size, dtype, verify_t, k_size, n_sizes):
     dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     shape_name = "_".join(str(n) for n in n_sizes)
@@ -714,13 +967,15 @@ def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
     N = linear.weight.shape[0]
 
     x = mx.contiguous(x)
-    token_tiled = linear.bits == 4 and T >= 6
-    results_per_simdgroup = 4
-    kernel_factory = (
-        _target_verify_qmv_token_tiled_kernel
-        if token_tiled
-        else _target_verify_qmv_kernel
-    )
+    streamed = linear.bits == 4 and 6 <= T <= 8
+    token_tiled = linear.bits == 4 and T >= 6 and not streamed
+    results_per_simdgroup = 1 if streamed else 4
+    if streamed:
+        kernel_factory = _target_verify_qmv_streamed_kernel
+    elif token_tiled:
+        kernel_factory = _target_verify_qmv_token_tiled_kernel
+    else:
+        kernel_factory = _target_verify_qmv_kernel
     kernel_args = (linear.bits, linear.group_size, x.dtype, T, K, N)
     kernel = kernel_factory(*kernel_args)
     rows_per_threadgroup = 2 * results_per_simdgroup
@@ -778,13 +1033,20 @@ def _target_verify_quantized_argmax(
             return out.transpose(1, 0)
 
     N = linear.weight.shape[0]
-    token_tiled = linear.bits == 4 and T >= 6
-    results_per_simdgroup = 4
+    streamed = linear.bits == 4 and 6 <= T <= 8
+    token_tiled = linear.bits == 4 and T >= 6 and not streamed
+    results_per_simdgroup = 1 if streamed else 4
     rows_per_threadgroup = 2 * results_per_simdgroup
     num_tiles = N // rows_per_threadgroup
 
     x = mx.contiguous(x)
-    if token_tiled:
+    if streamed:
+        kernel_factory = (
+            _target_verify_masked_qargmax_streamed_kernel
+            if token_mask is not None
+            else _target_verify_qargmax_streamed_kernel
+        )
+    elif token_tiled:
         kernel_factory = (
             _target_verify_masked_qargmax_token_tiled_kernel
             if token_mask is not None

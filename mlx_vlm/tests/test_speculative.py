@@ -614,7 +614,7 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
 
 
 @pytest.mark.parametrize("input_dims", [512, 6144])
-@pytest.mark.parametrize("verify_length", [3, 4, 6])
+@pytest.mark.parametrize("verify_length", [3, 4, 6, 7, 8])
 def test_qwen_target_verify_4bit_linear_matches_singleton_path_exactly(
     input_dims, verify_length
 ):
@@ -789,18 +789,22 @@ def test_qwen3_5_quantized_argmax_batch_as_time_matches_rowwise():
     assert bool(mx.array_equal(out, ref).item())
 
 
-def test_qwen3_5_4bit_quantized_argmax_token_tiles_match_singletons():
-    mx.random.seed(38)
+@pytest.mark.parametrize("verify_length", [6, 7, 8])
+def test_qwen3_5_4bit_quantized_argmax_wide_blocks_match_singletons(verify_length):
+    mx.random.seed(32 + verify_length)
     linear = nn.QuantizedLinear(512, 32, bias=False, group_size=64, bits=4)
     linear.scales = linear.scales.astype(mx.bfloat16)
     linear.biases = linear.biases.astype(mx.bfloat16)
-    x = mx.random.normal((1, 6, 512), dtype=mx.bfloat16)
+    x = mx.random.normal((1, verify_length, 512), dtype=mx.bfloat16)
 
     out = qwen_verifier._target_verify_quantized_argmax(linear, x)
+    mask = mx.full((verify_length, 1), -1, dtype=mx.int32)
+    masked = qwen_verifier._target_verify_quantized_argmax(linear, x, token_mask=mask)
     ref = mx.argmax(qwen_verifier._target_verify_timewise(linear, x), axis=-1)
-    mx.eval(out, ref)
+    mx.eval(out, masked, ref)
 
     assert bool(mx.array_equal(out, ref).item())
+    assert bool(mx.array_equal(masked, ref).item())
 
 
 def _qwen3_5_ragged_attention_reference(queries, keys, values, pads, scale):
