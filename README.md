@@ -210,7 +210,7 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 DFlash2 adds dynamic convolutions and a candidate-path selector. The published
 Qwen3.8-27B checkpoint is auto-detected and uses the shared exact DFlash target
 verification path. For the fastest quantized setup, convert the drafter to
-4-bit and use the default three-row verification block:
+4-bit; the verifier adapts between three and five rows from recent acceptance:
 
 ```sh
 mlx_vlm.convert --hf-path z-lab/Qwen3.8-27B-DFlash2 \

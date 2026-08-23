@@ -102,9 +102,7 @@ class CandidateSelector(nn.Module):
         anchor_ids: mx.array,
         sampler: Callable[[mx.array], mx.array],
     ) -> mx.array:
-        candidates = mx.argpartition(logits, -self.top_k, axis=-1)[
-            ..., -self.top_k :
-        ]
+        candidates = mx.argpartition(logits, -self.top_k, axis=-1)[..., -self.top_k :]
         unary = mx.take_along_axis(logits, candidates, axis=-1)
         hidden = self.hidden_projection(hidden)
         predecessor = anchor_ids.reshape(-1)
@@ -132,7 +130,9 @@ class CandidateSelector(nn.Module):
 
 class DFlash2DraftModel(DFlashDraftModel):
     layer_class = DFlash2DecoderLayer
-    prefer_requested_block_size = True
+    prefer_requested_block_size = False
+    dflash_initial_block_size = 3
+    dflash_min_block_size = 3
 
     def __init__(self, config: DFlash2Config):
         super().__init__(config)
@@ -192,9 +192,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             sampler,
         ).astype(token_dtype)
 
-    def sanitize(
-        self, weights: Mapping[str, mx.array]
-    ) -> dict[str, mx.array]:
+    def sanitize(self, weights: Mapping[str, mx.array]) -> dict[str, mx.array]:
         normalized = {}
         codebooks = {
             "candidate_selector.predecessor_codebook",

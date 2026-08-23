@@ -137,7 +137,7 @@ class DFlash2Config(DFlashConfig):
             flat["rope_scaling"] = rope_parameters
 
         if "runtime_block_size" not in flat:
-            flat["runtime_block_size"] = min(3, int(flat["block_size"]))
+            flat["runtime_block_size"] = min(5, int(flat["block_size"]))
 
         signature = inspect.signature(cls).parameters
         return cls(**{key: value for key, value in flat.items() if key in signature})

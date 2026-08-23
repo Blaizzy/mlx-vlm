@@ -45,7 +45,10 @@ def _dflash_next_block_size(
         return block_total
 
     current = min(block_total, max(2, recent[-1][1] + 1))
-    min_total = min(block_total, 4)
+    min_total = min(
+        block_total,
+        max(2, int(getattr(draft_model, "dflash_min_block_size", 4))),
+    )
     drafted = sum(d for _, d in recent)
     accepted = sum(a for a, _ in recent)
     accept_rate = accepted / drafted

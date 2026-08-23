@@ -141,9 +141,7 @@ def _generated_tokens(target, prompt, drafter=None, temperature=0, seed=None):
         get_input_embeddings=get_input_embeddings,
     )
     kwargs = (
-        {"draft_model": drafter, "draft_kind": "dflash"}
-        if drafter is not None
-        else {}
+        {"draft_model": drafter, "draft_kind": "dflash"} if drafter is not None else {}
     )
     return [
         int(token.item()) if hasattr(token, "item") else int(token)
@@ -169,7 +167,7 @@ def test_published_dflash2_config_and_loader_routing(tmp_path):
     assert config.model_type == "dflash2"
     assert config.backbone_model_type == "qwen3"
     assert config.block_size == 8
-    assert config.runtime_block_size == 3
+    assert config.runtime_block_size == 5
     assert config.target_layer_ids == [5, 19, 33, 47, 61]
     assert config.conv_kernel_size == 2
     assert config.conv_group_size == 16
@@ -179,6 +177,11 @@ def test_published_dflash2_config_and_loader_routing(tmp_path):
     assert config.rope_scaling == {"rope_type": "default"}
     assert model_type == "dflash2"
     assert architecture.Model is DFlash2DraftModel
+
+    drafter = DFlash2DraftModel(config)
+    assert drafter.prefer_requested_block_size is False
+    assert drafter.dflash_initial_block_size == 3
+    assert drafter.dflash_min_block_size == 3
 
     (tmp_path / "config.json").write_text(json.dumps(published))
     assert resolve_drafter_kind(tmp_path) == "dflash"
@@ -220,9 +223,7 @@ def test_candidate_selector_uses_coherent_top_candidate_path():
     selector.successor_codebook.weight = mx.zeros((32, 4))
     selector.hidden_projection.weight = mx.zeros((4, 16))
     hidden = mx.zeros((1, 2, 16))
-    logits = mx.array(
-        [[[0, 1, 5, 2] + [0] * 28, [0, 7, 2, 3] + [0] * 28]]
-    )
+    logits = mx.array([[[0, 1, 5, 2] + [0] * 28, [0, 7, 2, 3] + [0] * 28]])
 
     selected = selector.select(
         hidden,

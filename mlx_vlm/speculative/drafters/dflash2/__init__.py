@@ -1,5 +1,6 @@
 from .config import DFlash2Config as ModelConfig
-from .dflash2 import CandidateSelector, DFlash2DraftModel
+from .dflash2 import CandidateSelector
+from .dflash2 import DFlash2DraftModel
 from .dflash2 import DFlash2DraftModel as Model
 from .dflash2 import GroupedDynamicCausalConv, _grouped_dynamic_convolve
 

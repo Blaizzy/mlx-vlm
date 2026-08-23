@@ -2105,6 +2105,26 @@ def test_dflash_next_block_size_uses_model_initial_size():
     assert _dflash_next_block_size(draft_model, 16, 20, 4) == 4
 
 
+def test_dflash_next_block_size_honors_model_minimum():
+    draft_model = SimpleNamespace(
+        accept_lens=[0, 1],
+        draft_lens=[2, 3],
+        dflash_min_block_size=3,
+    )
+
+    assert _dflash_next_block_size(draft_model, 5, 20) == 3
+
+
+def test_dflash_next_block_size_grows_from_model_minimum():
+    draft_model = SimpleNamespace(
+        accept_lens=[2, 2, 2, 2],
+        draft_lens=[2, 2, 2, 2],
+        dflash_min_block_size=3,
+    )
+
+    assert _dflash_next_block_size(draft_model, 5, 20) == 5
+
+
 def test_dflash_next_block_size_backs_off_on_low_acceptance():
     draft_model = SimpleNamespace(accept_lens=[1, 2], draft_lens=[15, 7])
 
