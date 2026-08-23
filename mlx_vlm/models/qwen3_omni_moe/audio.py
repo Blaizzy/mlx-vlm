@@ -8,14 +8,22 @@ import numpy as np
 from mlx_vlm.models.qwen3_omni_moe.config import AudioConfig
 
 
+def _round_up_half(x):
+    """``(x - 1) // 2 + 1`` without the negative intermediate.
+
+    Identical for every ``x >= 0``, but ``x - 1`` is ``-1`` at ``x == 0``, and
+    MLX truncates that toward zero where NumPy and PyTorch floor it. Writing it
+    this way keeps the two in agreement and stays on device.
+    """
+    return (x + 1) // 2
+
+
 def _get_feat_extract_output_lengths(input_lengths):
-    input_lengths = np.array(input_lengths)
-    input_lengths_leave = input_lengths % 100
-    feat_lengths = (input_lengths_leave - 1) // 2 + 1
-    output_lengths = (
-        ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
-    )
-    return mx.array(output_lengths.astype(np.int32))
+    # Three round-up halvings of the sub-window remainder, plus 13 frames per
+    # whole 100-frame window. Matches the reference processor that sets the
+    # audio placeholder count, so emitted embeddings stay in sync with it.
+    remainder = _round_up_half(_round_up_half(_round_up_half(input_lengths % 100)))
+    return remainder + (input_lengths // 100) * 13
 
 
 class Attention(nn.Module):

@@ -16,22 +16,34 @@ from mlx_vlm.models.qwen3_omni_moe.config import (
 from mlx_vlm.models.qwen3_omni_moe.qwen3_omni_moe import Model
 
 
-def _floor_output_lengths(input_lengths):
-    leave = input_lengths % 100
-    feat = (leave - 1) // 2 + 1
-    return ((feat - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
-
-
 class Qwen3OmniAudioLengthTest(unittest.TestCase):
-    def test_matches_floor_reference(self):
-        for length in [100, 320, 500, 1000, 2800, 2900, 2999, 3000, 3100, 6000]:
-            got = int(_get_feat_extract_output_lengths(mx.array([length]))[0])
-            self.assertEqual(got, _floor_output_lengths(length), msg=f"length={length}")
+    # Pinned against the reference processor that sets the audio placeholder
+    # count. Literal values rather than a re-implementation of the formula, so
+    # the test still fails if the formula itself drifts.
+    EXPECTED = (
+        (0, 0),
+        (100, 13),
+        (320, 42),
+        (500, 65),
+        (999, 130),
+        (1000, 130),
+        (2800, 364),
+        (2900, 377),
+        (2999, 390),
+        (3000, 390),  # the 30s clamp -- MLX truncation returned 391 here
+        (3100, 403),
+        (6000, 780),
+    )
 
-    def test_multiple_of_100_not_overcounted(self):
-        for length in (2900, 3000, 6000):
+    def test_matches_reference_output_lengths(self):
+        for length, expected in self.EXPECTED:
             got = int(_get_feat_extract_output_lengths(mx.array([length]))[0])
-            self.assertEqual(got, _floor_output_lengths(length), msg=f"length={length}")
+            self.assertEqual(got, expected, msg=f"length={length}")
+
+    def test_batched_lengths_match_scalar(self):
+        lengths = [length for length, _ in self.EXPECTED]
+        got = _get_feat_extract_output_lengths(mx.array(lengths)).tolist()
+        self.assertEqual(got, [expected for _, expected in self.EXPECTED])
 
 
 IMAGE_TOKEN = 60
