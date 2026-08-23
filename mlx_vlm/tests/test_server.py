@@ -720,6 +720,82 @@ def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     assert server.runtime.model_cache["adapter_path"] == "adapter-a"
 
 
+def test_unload_model_cache_group_resets_apc_around_generator_shutdown(
+    monkeypatch,
+):
+    events = []
+
+    class FakeAPCManager:
+        def __init__(self):
+            self.contents = ["old-model-prefix"]
+
+        def clear(self):
+            events.append(("clear", list(self.contents)))
+            self.contents.clear()
+
+    manager = FakeAPCManager()
+
+    class FakeResponseGenerator:
+        def stop_and_join(self):
+            events.append(("stop", list(manager.contents)))
+            # Simulate a store that was already in flight when shutdown began.
+            manager.contents.append("draining-worker-prefix")
+
+    response_generator = FakeResponseGenerator()
+    registry = server.ModelCacheRegistry()
+    registry.set(
+        "text_generation",
+        {
+            "model_path": "old-model",
+            "adapter_path": None,
+            "response_generator": response_generator,
+            "apc_manager": manager,
+        },
+    )
+    monkeypatch.setattr(server.runtime, "model_cache", registry)
+    monkeypatch.setattr(server.runtime, "response_generator", response_generator)
+    monkeypatch.setattr(server.runtime, "apc_manager", manager)
+    monkeypatch.setattr(server._app_module.gc, "collect", lambda: None)
+    monkeypatch.setattr(server._app_module.mx, "clear_cache", lambda: None)
+
+    assert server._app_module._unload_model_cache_group("text_generation") is True
+
+    assert events == [
+        ("clear", ["old-model-prefix"]),
+        ("stop", []),
+        ("clear", ["draining-worker-prefix"]),
+    ]
+    assert manager.contents == []
+    assert registry.for_kind("text_generation") == {}
+    assert server.runtime.response_generator is None
+    assert server.runtime.apc_manager is None
+
+
+def test_unload_model_cache_group_keeps_model_when_initial_apc_reset_fails(
+    monkeypatch,
+):
+    class FailingAPCManager:
+        def clear(self):
+            raise RuntimeError("APC cleanup failed")
+
+    response_generator = MagicMock()
+    cache = {
+        "model_path": "old-model",
+        "adapter_path": None,
+        "response_generator": response_generator,
+        "apc_manager": FailingAPCManager(),
+    }
+    registry = server.ModelCacheRegistry()
+    registry.set("text_generation", cache)
+    monkeypatch.setattr(server.runtime, "model_cache", registry)
+
+    with pytest.raises(RuntimeError, match="APC cleanup failed"):
+        server._app_module._unload_model_cache_group("text_generation")
+
+    response_generator.stop_and_join.assert_not_called()
+    assert registry.for_kind("text_generation") is cache
+
+
 @pytest.mark.parametrize(
     "load_error",
     [
