@@ -27,6 +27,7 @@ from mlx_vlm.generate import (
 from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
+from mlx_vlm.generate.ar import SamplingConfig
 from mlx_vlm.models.cache import (
     BatchKVCache,
     BatchPoolingCache,
@@ -470,6 +471,224 @@ class TestGenerationBatch:
         assert captured.tolist() == [[5], [7]]
 
 
+def test_sampling_configs_survive_extend_and_filter():
+    from mlx_vlm.generate.ar import GenerationBatch, SamplingConfig
+
+    def mk(uids, configs):
+        b = GenerationBatch.__new__(GenerationBatch)
+        b.uids = list(uids)
+        b.sampling = list(configs)
+        return b
+
+    a = mk([1], [SamplingConfig(temperature=0.7)])
+    b = mk([2, 3], [SamplingConfig(temperature=1.0), SamplingConfig(temperature=2.0)])
+    GenerationBatch._extend_sampling(a, b)  # helper under test
+    assert [c.temperature for c in a.sampling] == [0.7, 1.0, 2.0]
+    GenerationBatch._filter_sampling(a, [0, 2])  # keep rows 0 and 2
+    assert [c.temperature for c in a.sampling] == [0.7, 2.0]
+
+
+def test_real_extend_and_filter_keep_sampling_aligned_to_uids():
+    """Exercise .extend()/.filter() on real GenerationBatch instances so the
+    per-row sampling list is proven to stay 1:1 with self.uids across the
+    genuine lifecycle (not just the isolated helpers)."""
+
+    def make_batch(uids, temps, *, greedy_sampling):
+        return GenerationBatch(
+            model=object(),
+            uids=list(uids),
+            inputs=mx.array(list(uids), dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[4] * len(uids),
+            sampling=[SamplingConfig(temperature=t) for t in temps],
+            greedy_sampling=greedy_sampling,
+        )
+
+    # Real extend: sampling concatenates in order and stays aligned to uids.
+    a = make_batch([1], [0.7], greedy_sampling=False)
+    b = make_batch([2, 3], [1.0, 2.0], greedy_sampling=False)
+    a.extend(b)
+    assert a.uids == [1, 2, 3]
+    assert [c.temperature for c in a.sampling] == [0.7, 1.0, 2.0]
+    assert len(a.sampling) == len(a.uids)
+
+    # Real filter dropping the middle row keeps sampling aligned to uids.
+    a.filter([0, 2])
+    assert a.uids == [1, 3]
+    assert [c.temperature for c in a.sampling] == [0.7, 2.0]
+    assert len(a.sampling) == len(a.uids)
+
+    # Greedy reconciliation: all-greedy accumulator absorbing a temperature>0
+    # batch must drop the greedy fast path.
+    greedy = make_batch([10], [0.0], greedy_sampling=True)
+    sampled = make_batch([11], [1.5], greedy_sampling=False)
+    assert greedy.greedy_sampling is True
+    greedy.extend(sampled)
+    assert greedy.greedy_sampling is False
+    assert [c.temperature for c in greedy.sampling] == [0.0, 1.5]
+
+
+def test_prompt_processing_batch_first_token_honors_per_row_sampling_config():
+    """PromptProcessingBatch.generate() draws the first token from
+    self.sampling, but no test drove that through the real server path, so the
+    earlier coverage only
+    checked plumbing (extend/filter alignment), not that a live first-token
+    draw actually differs per row. Two rows share identical logits but
+    distinct SamplingConfigs (different temperature/seed); their sampled
+    first tokens must match an independent _PositionedTargetSampler call
+    over the same configs — proof the batch doesn't fall back to a single
+    shared sampler for the whole row."""
+    from mlx_vlm.generate.ar import _PositionedTargetSampler
+
+    class FixedLogitModel:
+        def __call__(self, input_ids, cache=None, inputs_embeds=None, **kwargs):
+            token_scores = mx.array([0.0, 1.0, 2.0, 3.0])
+            return SimpleNamespace(
+                logits=mx.broadcast_to(
+                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
+                )
+            )
+
+    configs = [
+        SamplingConfig(temperature=1.5, seed=1),
+        SamplingConfig(temperature=1.5, seed=2),
+    ]
+    batch = PromptProcessingBatch(
+        model=FixedLogitModel(),
+        uids=[0, 1],
+        input_ids=[[5], [6]],
+        max_tokens=[1, 1],
+        inputs_embeds=mx.ones((2, 1, 4)),
+        prompt_kwargs={},
+        prefill_step_size=None,
+        warm_cache=[],
+        sampling=configs,
+    )
+
+    gen_batch = batch.generate(
+        lambda logprobs: mx.argmax(
+            logprobs, axis=-1
+        ),  # unused: real path is self.sampling
+        stop_criteria=lambda token: False,
+    )
+
+    expected_logits = mx.broadcast_to(mx.array([0.0, 1.0, 2.0, 3.0]), (2, 4))
+    expected_logprobs = expected_logits - mx.logsumexp(
+        expected_logits, axis=-1, keepdims=True
+    )
+    expected = _PositionedTargetSampler(configs).sample_target(
+        expected_logprobs, row_ids=[0, 0], positions=[0, 0]
+    )
+    mx.eval(expected, gen_batch._next_tokens)
+
+    sampled = gen_batch._next_tokens.tolist()
+    assert sampled == expected.tolist()
+    # The two rows' distinct seeds must actually matter here — otherwise
+    # this test would pass even if per-row seeding were silently broken.
+    assert sampled[0] != sampled[1]
+
+
+def test_generation_batch_row_sampling_invariant_to_batch_composition():
+    """_step() used to key each row's RNG off its *positional* index in the
+    batch (row_ids=list(range(len(self.uids)))). filter() compacts finished
+    rows out of self.uids, so a survivor's positional index — and therefore
+    its sampling RNG key — shifted depending on which other rows happened to
+    share the batch and finish early. A seeded request must be reproducible
+    regardless of batch composition (vLLM's "same seed => same stream"
+    contract); row_id is now held constant so only the row's own seed
+    differentiates it. This drives a real GenerationBatch: row "R" co-batched
+    with a row that finishes after one step and gets filter()-compacted away
+    must sample the identical token stream as R generating alone from the
+    start.
+
+    This test fails under the old `row_ids=list(range(len(self.uids)))`
+    keying (verified manually: R's first post-filter token flips from 2 to 3
+    because its positional index was 1 while co-batched vs. 0 when alone) and
+    passes under the fixed constant `row_ids=[0] * len(self.uids)`.
+    """
+
+    class FixedLogitModel:
+        def __call__(self, input_ids, cache=None, **kwargs):
+            token_scores = mx.array([0.0, 1.0, 2.0, 3.0])
+            logits = mx.broadcast_to(
+                token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
+            )
+            return SimpleNamespace(logits=logits)
+
+    # temperature=2.0/seed=1 was picked because, at position=1, row_id=0 and
+    # row_id=1 provably sample different tokens (2 vs. 3) from this fixed
+    # logit distribution — a prerequisite for the bug to be observable at all.
+    seeded_cfg = SamplingConfig(temperature=2.0, seed=1)
+
+    def run(uids, sampling, max_tokens, steps):
+        batch = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=list(uids),
+            inputs=mx.array(list(uids), dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=list(max_tokens),
+            sampling=list(sampling),
+        )
+        tokens_for_row = []
+        for _ in range(steps):
+            for response in batch.next():
+                if response.uid == 1:
+                    tokens_for_row.append(response.token)
+        return tokens_for_row
+
+    # Row 1 ("R") co-batched with row 0, which finishes after its first step
+    # (max_tokens=1) and is filter()-compacted out — R's positional index
+    # shifts from 1 (co-batched) to 0 (once alone).
+    co_batched = run(
+        uids=[0, 1],
+        sampling=[SamplingConfig(temperature=0.0), seeded_cfg],
+        max_tokens=[1, 3],
+        steps=3,
+    )
+
+    # Same row, alone in its own batch from the start — positional index is
+    # always 0.
+    solo = run(
+        uids=[1],
+        sampling=[seeded_cfg],
+        max_tokens=[3],
+        steps=3,
+    )
+
+    assert co_batched == solo
+
+
+def test_generation_batch_filter_reenables_greedy_fast_path():
+    """filter() re-derives self.sampling for the surviving rows via
+    _filter_sampling() but, before this fix, never recomputed
+    greedy_sampling — so a mixed batch that drops its last temperature>0 row
+    stayed permanently off the _fused_greedy_step fast path. Build a mixed
+    batch (greedy_sampling False), filter the temp>0 row out, and confirm
+    greedy_sampling flips back to True so subsequent steps can use the fused
+    greedy decode path again."""
+    batch = GenerationBatch(
+        model=object(),
+        uids=[0, 1],
+        inputs=mx.array([0, 1], dtype=mx.int32),
+        prompt_cache=[],
+        sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+        stop_criteria=lambda token: False,
+        max_tokens=[4, 4],
+        sampling=[SamplingConfig(temperature=0.0), SamplingConfig(temperature=1.0)],
+        greedy_sampling=False,
+    )
+
+    assert batch.greedy_sampling is False
+
+    batch.filter([0])  # drop the temperature>0 row; only the greedy row remains
+
+    assert batch.greedy_sampling is True
+
+
 # ============================================================================
 # Tests for Helper Functions
 # ============================================================================
@@ -800,6 +1019,7 @@ class TestBatchGenerator:
             max_tokens=[2, 2],
             token_context=[mx.array([10]), mx.array([20])],
             logits_processors=[[force_token_2], [force_token_2]],
+            sampling=[SamplingConfig(), SamplingConfig()],
         )
 
         first = batch.next()
@@ -839,6 +1059,7 @@ class TestBatchGenerator:
             stop_criteria=lambda token: False,
             max_tokens=[2],
             thinking_budget_criteria=[ForceAfterFirst()],
+            sampling=[SamplingConfig()],
         )
 
         first = batch.next()
@@ -877,6 +1098,7 @@ class TestBatchGenerator:
             stop_criteria=lambda token: False,
             max_tokens=[2],
             thinking_budget_criteria=[ForceAfterFirst()],
+            sampling=[SamplingConfig()],
         )
 
         original_eval = mx.eval
@@ -946,6 +1168,7 @@ class TestBatchGenerator:
             stop_criteria=lambda token: False,
             max_tokens=[2],
             greedy_sampling=True,
+            sampling=[SamplingConfig()],
         )
         batch.compute_logprobs = False
 
@@ -970,7 +1193,6 @@ class TestBatchGenerator:
             uids=[100, 200],
             first_tokens=mx.array([0, 9], dtype=mx.int32),
             prompt_cache=[],
-            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
             stop_criteria=lambda token: False,
             max_tokens=[10, 10],
             hidden=mx.zeros((2, 1, 1)),
@@ -1016,6 +1238,7 @@ class TestBatchGenerator:
             stop_criteria=stop_criteria,
             max_tokens=[2, 2],
             logits_processors=[None, None],
+            sampling=[SamplingConfig(), SamplingConfig()],
         )
         structured = GenerationBatch(
             model=FixedLogitModel(),
@@ -1027,6 +1250,7 @@ class TestBatchGenerator:
             max_tokens=[2],
             token_context=[[30]],
             logits_processors=[[force_token_2]],
+            sampling=[SamplingConfig()],
         )
 
         plain.extend(structured)
@@ -2646,6 +2870,26 @@ def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
     assert "falling back to cold prefill" in caplog.text
 
 
+def test_apc_pick_for_accepts_the_tuple_insert_actually_builds(
+    mock_model, mock_processor
+):
+    # _apc_pick_for destructures the queued-sequence tuple, so its arity is
+    # coupled to what insert() appends. Per-row sampling added a 7th element
+    # (the SamplingConfig); an unpack still expecting 6 raises ValueError on
+    # every APC-enabled prefill. Feed the real producer's tuple to the real
+    # consumer so the two cannot drift apart again.
+    gen = BatchGenerator(
+        model=mock_model.language_model,
+        processor=mock_processor,
+        max_tokens=16,
+    )
+    gen.insert([[7]])  # 1-token prompt: bails out after the unpack, before APC
+    sequence = gen._unprocessed_sequences[0]
+    gen.apc_manager = object()  # enable the APC path
+
+    assert gen._apc_pick_for(sequence) is None
+
+
 class TestPrefixCacheReuseTrim:
     """Prompt-cache prefix reuse must trim each cache through its own trim()
     contract. A raw ``keys[..., :prefix_len, :]`` slice corrupts rotating
@@ -2884,6 +3128,7 @@ def test_precomputed_semantic_hash_reuses_actual_growing_apc_prefix():
             {"_apc_semantic_hash": semantic_hash},
             [],
             None,
+            SamplingConfig(),
         )
     )
 
@@ -2938,6 +3183,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
             },
             [],
             None,
+            SamplingConfig(),
         )
         for i, length in enumerate(lengths)
     ]
@@ -3035,6 +3281,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
             },
             [],
             None,
+            SamplingConfig(),
         ),
         (
             2,
@@ -3048,6 +3295,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
             },
             [],
             None,
+            SamplingConfig(),
         ),
     ]
     picks = [
@@ -3097,7 +3345,7 @@ def test_apc_pick_rejects_image_tokens_and_releases_blocks():
     bg.model = SimpleNamespace(config=SimpleNamespace(image_token_id=image_token_id))
     bg._wire_stack = None
 
-    pick = bg._apc_pick_for((1, token_ids, 1, {}, [], None))
+    pick = bg._apc_pick_for((1, token_ids, 1, {}, [], None, SamplingConfig()))
 
     assert pick is None
     assert all(block.ref_cnt == 0 for block in stored)
@@ -3202,3 +3450,288 @@ class TestPrePaddedBatchRows:
         assert mask.shape == (2, 8)
         assert mask[0].tolist() == [False] * 5 + [True] * 3
         assert mask[1].tolist() == [True] * 8
+
+
+# ============================================================================
+# An explicit sampler= must not be silently ignored
+# ============================================================================
+#
+# `sampler` is a documented public field (generate/types.py) and a
+# BatchGenerator constructor argument, and _generate_batch -- the engine behind
+# the public batch_generate() -- inserts without per-row sampling_configs. When
+# _step ignored self.sampler in favour of per-row configs, those rows fell back
+# to SamplingConfig() (temperature 0), so every caller passing sampler= got
+# greedy output instead. mlx_vlm/evals/ocrbench.py:288 is an in-repo victim.
+
+_SENTINEL_TOKEN = 1  # not 2: MockStoppingCriteria treats 2 as EOS
+_ARGMAX_TOKEN = 3  # what the greedy/per-row path produces below
+
+
+class _ConstantLogitModel:
+    """Logits are constant, so the greedy answer is always _ARGMAX_TOKEN and
+    any other token proves a different sampler ran."""
+
+    def __init__(self):
+        self.layers = [MagicMock() for _ in range(2)]
+
+    def __call__(self, input_ids, cache=None, inputs_embeds=None, **kwargs):
+        scores = mx.array([0.0, 1.0, 2.0, 3.0])
+        n = input_ids.shape[0]
+        t = input_ids.shape[1] if input_ids.ndim > 1 else 1
+        return SimpleNamespace(logits=mx.broadcast_to(scores, (n, t, 4)))
+
+
+def _constant_sampler(token_id):
+    def sampler(logprobs):
+        return mx.full((logprobs.shape[0],), token_id, dtype=mx.int32)
+
+    return sampler
+
+
+def _drain(gen, *, limit=64):
+    """Run the generator to completion, returning {uid: [tokens]}."""
+    out = {}
+    steps = 0
+    while gen.has_work and steps < limit:
+        _prompt, responses = gen.next()
+        for r in responses:
+            if r.finish_reason != "stop":
+                out.setdefault(r.uid, []).append(r.token)
+        steps += 1
+    gen.close()
+    return out
+
+
+def _sampler_generator(processor, sampler, *, max_tokens=3, batch=1):
+    return BatchGenerator(
+        model=_ConstantLogitModel(),
+        processor=processor,
+        sampler=sampler,
+        max_tokens=max_tokens,
+        prefill_batch_size=batch,
+        completion_batch_size=batch,
+        prefill_step_size=None,
+        compute_logprobs=False,
+    )
+
+
+def _insert_plain(gen, prompts, **kwargs):
+    """Insert the way _generate_batch does: no sampling_configs."""
+    return gen.insert(
+        prompts,
+        prompt_kwargs=[{"inputs_embeds": mx.zeros((1, len(p), 4))} for p in prompts],
+        **kwargs,
+    )
+
+
+def test_batch_generate_honors_explicit_sampler(mock_processor):
+    gen = _sampler_generator(mock_processor, _constant_sampler(_SENTINEL_TOKEN))
+    uids = _insert_plain(gen, [[1, 2, 3]])
+    tokens = _drain(gen)
+    assert tokens[uids[0]]
+    assert set(tokens[uids[0]]) == {_SENTINEL_TOKEN}
+
+
+def test_explicit_sampler_survives_batch_extend(mock_processor):
+    # A second prompt arriving mid-flight goes through GenerationBatch.extend();
+    # the sampler must still be honoured for both rows afterwards.
+    gen = _sampler_generator(
+        mock_processor, _constant_sampler(_SENTINEL_TOKEN), max_tokens=4, batch=2
+    )
+    first = _insert_plain(gen, [[1, 2, 3]])
+    gen.next()  # prefill + first decode step
+    second = _insert_plain(gen, [[4, 5]])
+    gen.next()
+    tokens = _drain(gen)
+    assert tokens.get(second[0]), "second row never produced a token"
+    for uid in (first[0], second[0]):
+        assert set(tokens.get(uid, [_SENTINEL_TOKEN])) == {_SENTINEL_TOKEN}
+
+
+def test_per_row_configs_take_precedence_over_sampler(mock_processor):
+    # Server-shaped call: both an explicit sampler and explicit per-row configs.
+    # Per-row wins, so the greedy config's argmax comes out, not the sentinel.
+    gen = _sampler_generator(mock_processor, _constant_sampler(_SENTINEL_TOKEN))
+    uids = _insert_plain(
+        gen, [[1, 2, 3]], sampling_configs=[SamplingConfig(temperature=0.0)]
+    )
+    tokens = _drain(gen)
+    assert tokens[uids[0]]
+    assert set(tokens[uids[0]]) == {_ARGMAX_TOKEN}
+
+
+def test_ocrbench_style_temperature_is_not_silently_greedy(mock_processor):
+    # evals/ocrbench.py builds a temperature sampler and passes it as sampler=.
+    # If it is ignored the rows decode greedily, so two runs with different
+    # global RNG seeds return identical tokens.
+    def temperature_sampler(logprobs):
+        return mx.random.categorical(logprobs * (1 / 0.7))
+
+    runs = []
+    for seed in (11, 22):
+        mx.random.seed(seed)
+        gen = _sampler_generator(mock_processor, temperature_sampler, max_tokens=8)
+        uids = _insert_plain(gen, [[1, 2, 3]])
+        runs.append(_drain(gen)[uids[0]])
+
+    assert runs[0] and runs[1]
+    assert runs[0] != runs[1]
+
+
+class _FusedGreedyModel(_ConstantLogitModel):
+    """Models like qwen3_5 implement fused_greedy_decode; _fused_greedy_step
+    takes it whenever greedy_sampling is True and returns argmax directly,
+    bypassing the sampler entirely."""
+
+    def fused_greedy_decode(self, input_ids, cache=None, **kwargs):
+        return mx.zeros((input_ids.shape[0], 1), dtype=mx.int32)
+
+
+def test_fused_greedy_path_does_not_swallow_an_explicit_sampler(mock_processor):
+    # Rows inserted without per-row configs must not be treated as "all
+    # temperature 0, so greedy is safe" -- their tokens come from the caller's
+    # sampler, which the fused path never calls. filter() recomputes
+    # greedy_sampling, so a row finishing early is what exposes this.
+    gen = BatchGenerator(
+        model=_FusedGreedyModel(),
+        processor=mock_processor,
+        sampler=_constant_sampler(_SENTINEL_TOKEN),
+        prefill_batch_size=2,
+        completion_batch_size=2,
+        prefill_step_size=None,
+        compute_logprobs=False,
+    )
+    uids = _insert_plain(gen, [[1, 2, 3], [4, 5, 6]], max_tokens=[1, 5])
+    tokens = _drain(gen)
+    emitted = [t for uid in uids for t in tokens.get(uid, [])]
+    assert emitted
+    assert set(emitted) == {_SENTINEL_TOKEN}
+
+
+def test_speculative_batch_honors_explicit_sampler():
+    # PromptProcessingBatch.generate() hands its sampler to the speculative
+    # batch too (main did: ar.py:2005 `sampler=sampler`). Dropping that made
+    # batch_generate(sampler=..., draft_model=...) silently greedy, and the
+    # greedy flag it derives would also switch the drafter into greedy drafting.
+    class _HiddenStateModel(_ConstantLogitModel):
+        def __call__(self, input_ids, cache=None, inputs_embeds=None, **kwargs):
+            out = super().__call__(input_ids, cache=cache, **kwargs)
+            n, t = input_ids.shape[0], input_ids.shape[1]
+            return SimpleNamespace(
+                logits=out.logits, hidden_states=[mx.zeros((n, t, 4))]
+            )
+
+    sampler = _constant_sampler(_SENTINEL_TOKEN)
+    batch = PromptProcessingBatch(
+        model=_HiddenStateModel(),
+        uids=[0],
+        input_ids=[[5]],
+        max_tokens=[2],
+        inputs_embeds=mx.ones((1, 1, 4)),
+        prompt_kwargs={},
+        prefill_step_size=None,
+        warm_cache=[],
+        draft_model=SimpleNamespace(config=SimpleNamespace(target_layer_ids=[0])),
+        draft_kind="dflash",
+    )
+    gen_batch = batch.generate(sampler, stop_criteria=lambda token: False)
+
+    assert isinstance(gen_batch, SpeculativeGenerationBatch)
+    assert gen_batch.sampler is sampler
+    # Unknown distribution -> the drafter must not be told the batch is greedy.
+    assert gen_batch.greedy_sampling is False
+
+
+def test_speculative_batch_per_row_configs_still_outrank_the_sampler():
+    from mlx_vlm.generate.ar import _PositionedTargetSampler
+
+    configs = [SamplingConfig(temperature=1.5, top_k=40)]
+    b = SpeculativeGenerationBatch.__new__(SpeculativeGenerationBatch)
+    b._all_uids = [10]
+    b.uids = [10]
+    SpeculativeGenerationBatch._init_sampling(b, configs, _constant_sampler(1))
+    assert isinstance(b.sampler, _PositionedTargetSampler)
+    assert b.sampler.configs == configs
+    assert b.greedy_sampling is False
+
+
+def test_generation_batch_built_the_upstream_way_still_decodes():
+    # main constructs GenerationBatch with sampler= and no sampling=; before
+    # this fix that combination raised out of _PositionedTargetSampler([]) on
+    # the very first step.
+    batch = GenerationBatch(
+        model=_ConstantLogitModel(),
+        uids=[0],
+        inputs=mx.array([0], dtype=mx.int32),
+        prompt_cache=[],
+        sampler=_constant_sampler(_SENTINEL_TOKEN),
+        stop_criteria=lambda token: False,
+        max_tokens=[3],
+    )
+    batch.next()  # replays the seed token the caller already has
+    tokens = [r.token for _ in range(2) for r in batch.next()]
+    assert tokens
+    assert set(tokens) == {_SENTINEL_TOKEN}
+
+
+def test_desynced_per_row_configs_raise_instead_of_broadcasting():
+    # The sampler broadcasts a uniform config to a narrower batch on purpose
+    # (the drafters draft row by row), so a batch whose configs fell out of
+    # step with its rows must be caught here, not silently sampled.
+    batch = GenerationBatch(
+        model=_ConstantLogitModel(),
+        uids=[0, 1],
+        inputs=mx.array([1, 2], dtype=mx.int32),
+        prompt_cache=[],
+        sampler=None,
+        stop_criteria=lambda token: False,
+        max_tokens=[3, 3],
+        sampling=[SamplingConfig(temperature=0.5, seed=1)],  # one config, two rows
+    )
+    with pytest.raises(ValueError, match="batch width"):
+        batch.next()
+
+
+def test_generation_batch_without_sampler_or_configs_decodes_greedily():
+    # Neither an explicit sampler nor per-row configs: the rows fall back to
+    # SamplingConfig() defaults (greedy) rather than raising out of the
+    # per-row sampler, which is what _PositionedTargetSampler([]) used to do.
+    batch = GenerationBatch(
+        model=_ConstantLogitModel(),
+        uids=[0, 1],
+        inputs=mx.array([0, 0], dtype=mx.int32),
+        prompt_cache=[],
+        sampler=None,
+        stop_criteria=lambda token: False,
+        max_tokens=[3, 3],
+    )
+    batch.next()  # replays the seed tokens the caller already has
+    tokens = [r.token for _ in range(2) for r in batch.next()]
+    assert tokens
+    assert set(tokens) == {_ARGMAX_TOKEN}
+
+
+def test_server_default_decode_step_skips_sorted_space():
+    # The server's continuous batch decodes through GenerationBatch._step with
+    # per-row configs, and every server request schema defaults temperature to
+    # 0. That whole batch is greedy, so the step must never enter sorted space
+    # -- _fused_greedy_step cannot save it, since fused_greedy_decode is
+    # implemented by one model family.
+    batch = GenerationBatch(
+        model=_ConstantLogitModel(),
+        uids=[0, 1, 2],
+        inputs=mx.array([0, 0, 0], dtype=mx.int32),
+        prompt_cache=[],
+        sampler=None,
+        stop_criteria=lambda token: False,
+        max_tokens=[3, 3, 3],
+        sampling=[SamplingConfig(temperature=0.0)] * 3,
+    )
+    batch.next()  # replays the seed tokens
+
+    def boom(*args, **kwargs):
+        raise AssertionError("argsort called: the greedy fast path was not taken")
+
+    with patch.object(mx, "argsort", boom):
+        tokens = [r.token for r in batch.next()]
+    assert tokens == [_ARGMAX_TOKEN] * 3

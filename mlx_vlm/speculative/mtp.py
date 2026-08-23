@@ -1092,6 +1092,13 @@ def _mtp_rounds_batch(
         # plain KVCache / RotatingKVCache do not, so we keep all rows
         # in the batch and just stop emitting for finished rows. End the
         # round-loop when every row has finished.
+        #
+        # A positioned per-row sampler is built at the full batch width (one
+        # config per row); when we drop finished rows we compact its configs in
+        # lockstep via .select(keep_slots) so it stays aligned to the shrunk
+        # logprobs. keep_slots indexes the current active set, matching both
+        # active_idx and the sampler's configs, so compaction stays enabled for
+        # positioned samplers too.
         cache_filterable = all(hasattr(c, "filter") for c in prompt_cache)
         if all(finished[active_idx[j]] for j in range(n_active)):
             break
@@ -1104,6 +1111,9 @@ def _mtp_rounds_batch(
                 filter_drafter = getattr(draft_model, "filter_batch", None)
                 if callable(filter_drafter):
                     filter_drafter(keep_mx)
+                sampler_select = getattr(sampler, "select", None)
+                if callable(sampler_select):
+                    sampler = sampler_select(keep_slots)
                 hidden = hidden[keep_mx]
                 for k in next_shared_kv:
                     K_next, V_next = next_shared_kv[k]
