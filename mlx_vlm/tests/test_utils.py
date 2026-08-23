@@ -17,6 +17,8 @@ from mlx_vlm.utils import (
     StoppingCriteria,
     _drop_modules_without_weights,
     _load_safetensors,
+    _quantization_for_module_path,
+    _quantization_path_aliases,
     _transform_modelopt_nvfp4_weights,
     apply_generation_config_defaults,
     estimate_num_image_tokens,
@@ -826,6 +828,116 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
     assert quantize.call_args.kwargs["group_size"] == 64
     assert quantize.call_args.kwargs["bits"] == 8
     assert quantize.call_args.kwargs["mode"] == "affine"
+
+
+def test_quantization_path_aliases_require_a_model_hook_for_model_specific_names():
+    module_path = "language_model.model.layers.0.ffn.shared_experts.gate_proj"
+
+    aliases = _quantization_path_aliases(module_path)
+
+    assert "model.layers.0.ffn.shared_experts.gate_proj" in aliases
+    assert "layers.0.ffn.shared_experts.gate_proj" not in aliases
+    assert "layers.0.ffn.shared_experts.w1" not in aliases
+
+
+def test_deepseek_v4_module_path_spelling_wins_over_sanitized_alias():
+    from mlx_vlm.models import deepseek_v4
+
+    class AliasModel(nn.Module):
+        @staticmethod
+        def quantization_path_aliases(path):
+            return deepseek_v4.Model.quantization_path_aliases(path)
+
+    module_path = "language_model.model.layers.0.ffn.shared_experts.gate_proj"
+    module_path_spec = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    sanitized_alias_spec = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    quantization = {
+        "model.layers.0.ffn.shared_experts.gate_proj": module_path_spec,
+        "layers.0.ffn.shared_experts.w1": sanitized_alias_spec,
+    }
+
+    resolved = _quantization_for_module_path(
+        quantization,
+        module_path,
+        AliasModel(),
+    )
+
+    assert resolved == module_path_spec
+
+
+def test_load_model_matches_deepseek_v4_quantization_aliases():
+    from mlx_vlm.models import deepseek_v4
+
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeDeepseekV4Model(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.language_model = nn.Module()
+            self.language_model.model = nn.Module()
+            self.language_model.model.layers = [nn.Module()]
+            self.language_model.model.layers[0].ffn = nn.Module()
+            self.language_model.model.layers[0].ffn.shared_experts = nn.Module()
+            self.language_model.model.layers[0].ffn.shared_experts.gate_proj = (
+                nn.Linear(64, 64, bias=False)
+            )
+            self.language_model.lm_head = nn.Linear(64, 64, bias=False)
+
+        def load_weights(self, weights, strict=True):
+            self.loaded_weights = weights
+            self.loaded_strict = strict
+
+        @staticmethod
+        def quantization_path_aliases(path):
+            return deepseek_v4.Model.quantization_path_aliases(path)
+
+    fake_model_class = SimpleNamespace(
+        ModelConfig=FakeConfig, Model=FakeDeepseekV4Model
+    )
+    mxfp8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    quantization = {
+        "group_size": 32,
+        "bits": 4,
+        "mode": "mxfp4",
+        "layers.0.ffn.shared_experts.w1": mxfp8,
+        "head": False,
+    }
+
+    with (
+        patch(
+            "mlx_vlm.utils.load_config",
+            return_value={
+                "model_type": "deepseek_v4",
+                "quantization": quantization,
+            },
+        ),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value={}),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "deepseek_v4"),
+        ),
+        patch("mlx_vlm.utils.nn.quantize") as quantize,
+    ):
+        load_model(Path("/tmp/model"), lazy=True)
+
+    predicate = quantize.call_args.kwargs["class_predicate"]
+    fake_model = FakeDeepseekV4Model(FakeConfig())
+    shared_expert_spec = predicate(
+        "language_model.model.layers.0.ffn.shared_experts.gate_proj",
+        fake_model.language_model.model.layers[0].ffn.shared_experts.gate_proj,
+    )
+    head_spec = predicate(
+        "language_model.lm_head",
+        fake_model.language_model.lm_head,
+    )
+
+    assert shared_expert_spec == mxfp8
+    assert head_spec == {}
 
 
 def test_load_model_uses_qwen_fine_grained_fp8_quantization_config():
