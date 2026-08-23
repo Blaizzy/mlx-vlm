@@ -36,7 +36,12 @@ from ..generate.diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
-from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
+from ..sample_utils import (
+    apply_top_k,
+    make_logits_processors,
+    make_sampler,
+    top_p_sampling,
+)
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_server_rounds,
@@ -236,12 +241,24 @@ def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.ar
 class _PositionedTargetSampler:
     """Server sampler with stateless target draws for ragged verification."""
 
-    def __init__(self, *, temperature: float, top_p: float, seed: Optional[int]):
+    def __init__(
+        self,
+        *,
+        temperature: float,
+        top_p: float,
+        top_k: int = 0,
+        seed: Optional[int],
+    ):
         self.temperature = float(temperature)
         self.top_p = float(top_p)
+        self.top_k = int(top_k)
         self.seed = DEFAULT_SEED if seed is None else int(seed)
 
+    def _apply_top_k(self, logprobs: mx.array) -> mx.array:
+        return apply_top_k(logprobs, self.top_k) if self.top_k > 0 else logprobs
+
     def __call__(self, logprobs: mx.array) -> mx.array:
+        logprobs = self._apply_top_k(logprobs)
         if self.top_p > 0 and self.top_p < 1.0:
             return top_p_sampling(logprobs, self.top_p, self.temperature)
         return mx.random.categorical(logprobs * (1 / self.temperature))
@@ -255,6 +272,7 @@ class _PositionedTargetSampler:
     ) -> mx.array:
         if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
             raise ValueError("row_ids and positions must match logprobs batch size.")
+        logprobs = self._apply_top_k(logprobs)
         keys = _position_keys(self.seed, row_ids, positions)
         if self.top_p > 0 and self.top_p < 1.0:
             return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
@@ -1507,23 +1525,27 @@ class ResponseGenerator:
             return make_sampler(
                 temp=args.temperature,
                 top_p=args.top_p,
+                top_k=args.top_k,
                 top_n_sigma=args.top_n_sigma,
             )
         if args.p_less:
             return make_sampler(
                 temp=args.temperature,
                 top_p=args.top_p,
+                top_k=args.top_k,
                 p_less=True,
             )
         if args.typical_p < 1.0:
             return make_sampler(
                 temp=args.temperature,
                 top_p=args.top_p,
+                top_k=args.top_k,
                 typical_p=args.typical_p,
             )
         return _PositionedTargetSampler(
             temperature=args.temperature,
             top_p=args.top_p,
+            top_k=args.top_k,
             seed=args.seed,
         )
 
