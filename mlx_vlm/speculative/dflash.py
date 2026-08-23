@@ -116,6 +116,32 @@ class _PositionedDraftSampler:
         self.positions = [position + length for position in self.positions]
         return sampled.reshape(logits.shape[:-1])
 
+    def sample_proposal(self, logits: mx.array) -> mx.array:
+        sample_proposal = getattr(self.sampler, "sample_proposal", None)
+        if not callable(sample_proposal):
+            return mx.argmax(logits, axis=-1)
+        if logits.ndim == 1:
+            batch, length = 1, 1
+        elif logits.ndim == 2:
+            batch, length = logits.shape[0], 1
+        else:
+            batch, length = logits.shape[0], logits.shape[1]
+        if batch != len(self.row_ids):
+            raise ValueError(
+                "Draft sampler row count does not match logits batch size."
+            )
+        rows = [row_id for row_id in self.row_ids for _ in range(length)]
+        positions = [
+            position + offset for position in self.positions for offset in range(length)
+        ]
+        sampled = sample_proposal(
+            logits.reshape(batch * length, logits.shape[-1]),
+            row_ids=rows,
+            positions=positions,
+        )
+        self.positions = [position + length for position in self.positions]
+        return sampled.reshape(logits.shape[:-1])
+
 
 def _sample_dflash_target_block(
     logits: mx.array,
