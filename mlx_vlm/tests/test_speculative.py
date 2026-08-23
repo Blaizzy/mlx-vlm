@@ -589,6 +589,60 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_path():
     assert bool(mx.array_equal(ref, out).item())
 
 
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_qwen_target_verify_quantized_linear_m3_matches_singletons(dtype):
+    mx.random.seed(23)
+    linear = nn.QuantizedLinear(512, 64, bias=False, group_size=64, bits=4)
+    linear.scales = linear.scales.astype(dtype)
+    linear.biases = linear.biases.astype(dtype)
+    x = mx.random.normal((2, 3, 512)).astype(dtype)
+
+    ref = qwen_language._target_verify_singletons(linear, x)
+    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+@pytest.mark.parametrize("bits", [4, 5])
+def test_qwen_target_verify_quantized_gdn_linears_match_singletons(bits):
+    mx.random.seed(24 + bits)
+    linears = tuple(
+        nn.QuantizedLinear(512, out_dim, bias=False, group_size=64, bits=bits)
+        for out_dim in (64, 64, 16, 16)
+    )
+    for linear in linears:
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+    x = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
+
+    ref_rows = [
+        [
+            qwen_language._decode_quantized_linears_fused(
+                linears, x[row : row + 1, i : i + 1]
+            )
+            for i in range(x.shape[1])
+        ]
+        for row in range(x.shape[0])
+    ]
+    ref = tuple(
+        mx.concatenate(
+            [
+                mx.concatenate(
+                    [time_step[j] for time_step in batch_row], axis=1
+                )
+                for batch_row in ref_rows
+            ],
+            axis=0,
+        )
+        for j in range(len(linears))
+    )
+    out = qwen_language._target_verify_linears(linears, x, target_verify=True)
+    mx.eval(*ref, *out)
+
+    assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
+
+
 def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
     mx.random.seed(17)
     linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=4)

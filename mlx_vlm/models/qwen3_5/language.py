@@ -239,6 +239,121 @@ _TARGET_VERIFY_QMV_SOURCE = r"""
 """
 
 
+_TARGET_VERIFY_QMV_M3_SOURCE = r"""
+    uint n_tile = threadgroup_position_in_grid.y;
+    uint b_idx = threadgroup_position_in_grid.z;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    int out_row = int(n_tile) * M3_NUM_SIMDGROUPS * M3_RESULTS_PER_SIMDGROUP +
+        int(simd_gid) * M3_RESULTS_PER_SIMDGROUP;
+    int in_vec_size_w = K_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+    int in_vec_size_g = K_SIZE / GS;
+
+    const device uint8_t* ws =
+        (const device uint8_t*)w + out_row * in_vec_size_w +
+        int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
+    const device T* sc =
+        scales + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
+    const device T* bs =
+        biases + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
+    const device T* xk =
+        x + int(b_idx) * 3 * K_SIZE + int(simd_lid) * VALUES_PER_THREAD;
+
+    float result0[M3_RESULTS_PER_SIMDGROUP] = {0};
+    float result1[M3_RESULTS_PER_SIMDGROUP] = {0};
+    float result2[M3_RESULTS_PER_SIMDGROUP] = {0};
+    for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
+      float sum0 = 0.0f;
+      float sum1 = 0.0f;
+      float sum2 = 0.0f;
+      float dot0[M3_RESULTS_PER_SIMDGROUP] = {0};
+      float dot1[M3_RESULTS_PER_SIMDGROUP] = {0};
+      float dot2[M3_RESULTS_PER_SIMDGROUP] = {0};
+
+      for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
+        // Preserve the singleton kernel's source-dtype zero-point sum and
+        // nibble scaling exactly while reusing each packed weight for all
+        // three native Qwen MTP verifier positions.
+        T x00 = xk[0 * K_SIZE + i];
+        T x01 = xk[0 * K_SIZE + i + 1];
+        T x02 = xk[0 * K_SIZE + i + 2];
+        T x03 = xk[0 * K_SIZE + i + 3];
+        sum0 += x00 + x01 + x02 + x03;
+
+        T x10 = xk[1 * K_SIZE + i];
+        T x11 = xk[1 * K_SIZE + i + 1];
+        T x12 = xk[1 * K_SIZE + i + 2];
+        T x13 = xk[1 * K_SIZE + i + 3];
+        sum1 += x10 + x11 + x12 + x13;
+
+        T x20 = xk[2 * K_SIZE + i];
+        T x21 = xk[2 * K_SIZE + i + 1];
+        T x22 = xk[2 * K_SIZE + i + 2];
+        T x23 = xk[2 * K_SIZE + i + 3];
+        sum2 += x20 + x21 + x22 + x23;
+
+        float fx00 = float(x00);
+        float fx01 = float(x01) / 16.0f;
+        float fx02 = float(x02) / 256.0f;
+        float fx03 = float(x03) / 4096.0f;
+        float fx10 = float(x10);
+        float fx11 = float(x11) / 16.0f;
+        float fx12 = float(x12) / 256.0f;
+        float fx13 = float(x13) / 4096.0f;
+        float fx20 = float(x20);
+        float fx21 = float(x21) / 16.0f;
+        float fx22 = float(x22) / 256.0f;
+        float fx23 = float(x23) / 4096.0f;
+
+#pragma clang loop unroll(full)
+        for (int row = 0; row < M3_RESULTS_PER_SIMDGROUP; ++row) {
+          const device uint16_t* packed_w =
+              (const device uint16_t*)(ws + row * in_vec_size_w);
+          uint16_t packed = packed_w[i / 4];
+          float q0 = float(packed & 0x000f);
+          float q1 = float(packed & 0x00f0);
+          float q2 = float(packed & 0x0f00);
+          float q3 = float(packed & 0xf000);
+          dot0[row] += fx00 * q0 + fx01 * q1 + fx02 * q2 + fx03 * q3;
+          dot1[row] += fx10 * q0 + fx11 * q1 + fx12 * q2 + fx13 * q3;
+          dot2[row] += fx20 * q0 + fx21 * q1 + fx22 * q2 + fx23 * q3;
+        }
+      }
+
+#pragma clang loop unroll(full)
+      for (int row = 0; row < M3_RESULTS_PER_SIMDGROUP; ++row) {
+        float scale = float(sc[row * in_vec_size_g]);
+        float bias = float(bs[row * in_vec_size_g]);
+        result0[row] += scale * dot0[row] + bias * sum0;
+        result1[row] += scale * dot1[row] + bias * sum1;
+        result2[row] += scale * dot2[row] + bias * sum2;
+      }
+      ws += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+      sc += BLOCK_SIZE / GS;
+      bs += BLOCK_SIZE / GS;
+      xk += BLOCK_SIZE;
+    }
+
+#pragma clang loop unroll(full)
+    for (int row = 0; row < M3_RESULTS_PER_SIMDGROUP; ++row) {
+      float r0 = simd_sum(result0[row]);
+      float r1 = simd_sum(result1[row]);
+      float r2 = simd_sum(result2[row]);
+      if (simd_lid == 0) {
+        int base = int(b_idx) * 3 * N_SIZE + out_row + row;
+        y[base + 0 * N_SIZE] = T(r0);
+        y[base + 1 * N_SIZE] = T(r1);
+        y[base + 2 * N_SIZE] = T(r2);
+      }
+    }
+"""
+
+
+_TARGET_VERIFY_M3_NUM_SIMDGROUPS = 2
+_TARGET_VERIFY_M3_RESULTS_PER_SIMDGROUP = 4
+
+
 _TARGET_VERIFY_QARGMAX_SOURCE = r"""
     uint n_tile = threadgroup_position_in_grid.y;
     uint b_idx = threadgroup_position_in_grid.z;
@@ -364,6 +479,21 @@ def _target_verify_qmv_kernel(bits, group_size, dtype, verify_t, k_size, n_size)
 
 
 @lru_cache(maxsize=None)
+def _target_verify_qmv_m3_kernel(group_size, dtype, k_size, n_size):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=(
+            "qwen3_5_target_verify_qmv_m3_"
+            f"gs{group_size}_k{k_size}_n{n_size}_{dtype_name}"
+        ),
+        input_names=["x", "w", "scales", "biases"],
+        output_names=["y"],
+        header=_target_verify_qlinear_header(4, group_size),
+        source=_TARGET_VERIFY_QMV_M3_SOURCE,
+    )
+
+
+@lru_cache(maxsize=None)
 def _target_verify_qargmax_kernel(bits, group_size, dtype, verify_t, k_size, n_size):
     dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     return mx.fast.metal_kernel(
@@ -424,37 +554,71 @@ def _can_target_verify_quantized(linear, x: mx.array) -> bool:
     return x.shape[-1] == K
 
 
-def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
-    if not _can_target_verify_quantized(linear, x):
-        return None
-
+def _target_verify_qmv(
+    x: mx.array,
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    *,
+    bits: int,
+    group_size: int,
+    specialize_m3: bool = True,
+) -> mx.array:
     B, T, K = x.shape
-    N = linear.weight.shape[0]
-
+    N = weight.shape[0]
     x = mx.contiguous(x)
-    kernel = _target_verify_qmv_kernel(linear.bits, linear.group_size, x.dtype, T, K, N)
-    out = kernel(
-        inputs=[x, linear.weight, linear.scales, linear.biases],
-        template=[
+
+    if specialize_m3 and bits == 4 and T == 3:
+        kernel = _target_verify_qmv_m3_kernel(group_size, x.dtype, K, N)
+        template = [
+            ("T", x.dtype),
+            ("K_SIZE", int(K)),
+            ("N_SIZE", int(N)),
+            ("M3_NUM_SIMDGROUPS", _TARGET_VERIFY_M3_NUM_SIMDGROUPS),
+            (
+                "M3_RESULTS_PER_SIMDGROUP",
+                _TARGET_VERIFY_M3_RESULTS_PER_SIMDGROUP,
+            ),
+        ]
+    else:
+        kernel = _target_verify_qmv_kernel(bits, group_size, x.dtype, T, K, N)
+        template = [
             ("T", x.dtype),
             ("VERIFY_T", int(T)),
             ("K_SIZE", int(K)),
             ("N_SIZE", int(N)),
-        ],
+        ]
+
+    return kernel(
+        inputs=[x, weight, scales, biases],
+        template=template,
         grid=(32, 2 * (N // 8), B),
         threadgroup=(32, 2, 1),
         output_shapes=[(B, T, N)],
         output_dtypes=[x.dtype],
     )[0]
+
+
+def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
+    if not _can_target_verify_quantized(linear, x):
+        return None
+
+    out = _target_verify_qmv(
+        x,
+        linear.weight,
+        linear.scales,
+        linear.biases,
+        bits=linear.bits,
+        group_size=linear.group_size,
+    )
     if "bias" in linear:
         out = out + linear["bias"]
     return out
 
 
-def _decode_quantized_linears_fused(linears, x: mx.array):
+def _fused_quantized_linears(linears, x: mx.array):
     if (
         x.ndim != 3
-        or x.shape[1] != 1
         or len(linears) != 4
         or not all(isinstance(linear, nn.QuantizedLinear) for linear in linears)
     ):
@@ -465,6 +629,7 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
         linear.bits == first.bits
         and linear.group_size == first.group_size
         and linear.mode == first.mode
+        and linear.weight.shape[1] == first.weight.shape[1]
         and linear.biases is not None
         and linear.scales.dtype == x.dtype
         and linear.biases.dtype == x.dtype
@@ -491,6 +656,18 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
         first._qwen3_5_fused_decode_linears = cached
 
     _, weights, scales, biases, split_indices = cached
+    return first, weights, scales, biases, split_indices
+
+
+def _decode_quantized_linears_fused(linears, x: mx.array):
+    if x.ndim != 3 or x.shape[1] != 1 or len(linears) != 4:
+        return None
+
+    fused = _fused_quantized_linears(linears, x)
+    if fused is None:
+        return None
+
+    first, weights, scales, biases, split_indices = fused
     output = mx.quantized_matmul(
         x,
         weights,
@@ -500,6 +677,35 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
         group_size=first.group_size,
         bits=first.bits,
         mode=first.mode,
+    )
+    return tuple(mx.split(output, split_indices, axis=-1))
+
+
+def _target_verify_quantized_linears(linears, x: mx.array):
+    fused = _fused_quantized_linears(linears, x)
+    if fused is None:
+        return None
+
+    first, weights, scales, biases, split_indices = fused
+    K = first.weight.shape[1] * 32 // first.bits
+    N = weights.shape[0]
+    if (
+        first.bits not in (4, 5)
+        or first.mode != "affine"
+        or K % 512 != 0
+        or N % 8 != 0
+        or x.shape[-1] != K
+    ):
+        return None
+
+    output = _target_verify_qmv(
+        x,
+        weights,
+        scales,
+        biases,
+        bits=first.bits,
+        group_size=first.group_size,
+        specialize_m3=False,
     )
     return tuple(mx.split(output, split_indices, axis=-1))
 
@@ -597,8 +803,6 @@ def _target_verify_linear(linear, x: mx.array, target_verify: bool) -> mx.array:
         return linear(x)
 
     if isinstance(linear, nn.QuantizedLinear):
-        if x.shape[0] == 1:
-            return linear(x)
         out = _target_verify_quantized_linear(linear, x)
         if out is not None:
             return out
@@ -626,6 +830,9 @@ def _target_verify_linears(linears, x: mx.array, target_verify: bool):
             return out
         return tuple(linear(x) for linear in linears)
 
+    out = _target_verify_quantized_linears(linears, x)
+    if out is not None:
+        return out
     return tuple(_target_verify_linear(linear, x, target_verify) for linear in linears)
 
 
