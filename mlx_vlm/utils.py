@@ -611,13 +611,14 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
-    is_dflash = config.get("dflash_config", None) is not None
-    if is_dflash:
-        # DSpark checkpoints deliberately reuse a Qwen3 draft backbone and
-        # model_type, but their Markov head changes proposal semantics. Route
-        # them before the generic DFlash suffix is applied.
-        suffix = "_dspark" if int(config.get("markov_rank", 0) or 0) > 0 else "_dflash"
-        model_type += suffix
+    dflash_config = config.get("dflash_config")
+    if dflash_config is not None:
+        is_dspark = (
+            dflash_config.get("projector_type") == "dspark"
+            or int(config.get("markov_rank") or dflash_config.get("markov_rank") or 0)
+            > 0
+        )
+        model_type = "dspark" if is_dspark else f"{model_type}_dflash"
 
     last_err: Optional[ImportError] = None
     for pkg in ("mlx_vlm.models", "mlx_vlm.speculative.drafters"):

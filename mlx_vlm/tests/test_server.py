@@ -515,6 +515,38 @@ def test_positioned_target_sampler_is_batch_grouping_invariant():
     assert batched.tolist() == [single_0.item(), single_1.item()]
 
 
+@pytest.mark.parametrize("top_p", [1.0, 0.95])
+def test_positioned_target_sampler_honors_top_k(top_p):
+    sampler = server_generation._PositionedTargetSampler(
+        temperature=1.0, top_p=top_p, top_k=2, seed=42
+    )
+    logits = mx.array([[0.0, 1.0, 2.0, 3.0]], dtype=mx.float32)
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    repeated = mx.repeat(logprobs, 32, axis=0)
+
+    tokens = sampler.sample_target(
+        repeated,
+        row_ids=[0] * 32,
+        positions=list(range(32)),
+    )
+    mx.eval(tokens)
+
+    assert set(tokens.tolist()) <= {2, 3}
+
+
+def test_server_passes_top_k_to_positioned_sampler():
+    generator = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    args = server_generation.GenerationArguments(
+        max_tokens=1,
+        temperature=1.0,
+        top_k=7,
+    )
+
+    sampler = generator._make_sampler(args)
+
+    assert sampler.top_k == 7
+
+
 def test_speculative_server_dispatches_eagle3_batch_loop():
     assert (
         speculative_utils.get_speculative_rounds_batch("eagle3")
