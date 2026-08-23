@@ -15,7 +15,7 @@ from fastapi import HTTPException
 
 from .. import apc as _apc
 from .._stream_cleanup import clear_mlx_streams
-from ..generate import (
+from ..generate import (  # noqa: F401 - compatibility re-exported by server.__init__
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
     DEFAULT_MAX_TOKENS,
@@ -40,10 +40,7 @@ from ..sample_utils import (
     make_sampler,
     top_p_sampling,
 )
-from ..speculative.utils import (
-    speculative_stats_since,
-    speculative_stats_snapshot,
-)
+from ..speculative.utils import speculative_stats_since, speculative_stats_snapshot
 from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
