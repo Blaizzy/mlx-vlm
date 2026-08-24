@@ -5,8 +5,36 @@ import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput
 from .config import ModelConfig
+from .fp8 import convert_glm5_next_fp8_weights
 from .language import LanguageModel
 from .vision import VisionModel
+
+
+def _replace_features(inputs_embeds, positions, features, label):
+    expected = int(positions.sum().item())
+    if expected != features.shape[0]:
+        raise ValueError(
+            f"{label} features and placeholder tokens do not match: "
+            f"{features.shape[0]} features for {expected} tokens."
+        )
+
+    outputs = []
+    offset = 0
+    for batch_idx in range(inputs_embeds.shape[0]):
+        row_mask = positions[batch_idx]
+        count = int(row_mask.sum().item())
+        row_features = features[offset : offset + count]
+        if count:
+            feature_index = mx.where(
+                row_mask, mx.cumsum(row_mask.astype(mx.int32)) - 1, 0
+            )
+            gathered = row_features[feature_index]
+            row = mx.where(row_mask[:, None], gathered, inputs_embeds[batch_idx])
+        else:
+            row = inputs_embeds[batch_idx]
+        outputs.append(row)
+        offset += count
+    return mx.stack(outputs)
 
 
 class Model(nn.Module):
@@ -14,52 +42,14 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
         self.model_type = config.model_type
-        self.language_model = LanguageModel(config.text_config, config)
-        self.vision_model = VisionModel(config.vision_config)
+        self.vision_tower = VisionModel(config.vision_config)
+        self.language_model = LanguageModel(config.text_config)
 
-    @staticmethod
-    def merge_input_ids_with_image_features(
-        image_token_id,
-        video_token_id,
-        image_features,
-        inputs_embeds,
-        input_ids,
-    ):
-        image_positions = input_ids == image_token_id
-        if mx.sum(image_positions) == 0:
-            image_positions = input_ids == video_token_id
-
-        batch_size, seq_len = input_ids.shape
-        batch_outputs = []
-        feature_start_idx = 0
-
-        for batch_idx in range(batch_size):
-            image_mask = image_positions[batch_idx]
-            num_positions = mx.sum(image_mask).item()
-
-            if num_positions > 0:
-                batch_features = image_features[
-                    feature_start_idx : feature_start_idx + num_positions
-                ]
-                if batch_features.shape[0] != num_positions:
-                    raise ValueError(
-                        f"Number of image token positions ({num_positions}) does not match "
-                        f"number of image features ({batch_features.shape[0]}) for batch {batch_idx}"
-                    )
-                cumsum = mx.cumsum(image_mask.astype(mx.int32))
-                feature_indices = mx.where(image_mask, cumsum - 1, 0)
-                gathered_features = batch_features[feature_indices]
-                image_mask_expanded = mx.expand_dims(image_mask, axis=-1)
-                batch_output = mx.where(
-                    image_mask_expanded, gathered_features, inputs_embeds[batch_idx]
-                )
-                feature_start_idx += num_positions
-            else:
-                batch_output = inputs_embeds[batch_idx]
-
-            batch_outputs.append(batch_output)
-
-        return mx.stack(batch_outputs, axis=0)
+    def _video_grid(self, video_grid_thw):
+        flattened = []
+        for t, h, w in video_grid_thw.tolist():
+            flattened.extend([[1, h, w]] * t)
+        return mx.array(flattened, dtype=video_grid_thw.dtype)
 
     def get_input_embeddings(
         self,
@@ -68,29 +58,56 @@ class Model(nn.Module):
         **kwargs,
     ) -> InputEmbeddingsFeatures:
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+        attention_mask = kwargs.get("mask")
 
-        if pixel_values is None:
-            return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
+        image_grid_thw = kwargs.get("image_grid_thw")
+        video_grid_thw = kwargs.get("video_grid_thw")
+        pixel_values_videos = kwargs.get("pixel_values_videos")
+        cached = kwargs.get("cached_image_features")
 
-        image_grid_thw = kwargs.get("image_grid_thw", None)
-        video_grid_thw = kwargs.get("video_grid_thw", None)
-        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+        in_video = mx.zeros(input_ids.shape, dtype=mx.bool_)
+        if self.config.video_start_token_id is not None:
+            starts = input_ids == self.config.video_start_token_id
+            ends = input_ids == self.config.video_end_token_id
+            in_video = mx.cumsum(starts.astype(mx.int32), axis=-1) > mx.cumsum(
+                ends.astype(mx.int32), axis=-1
+            )
 
-        dtype = self.vision_model.patch_embed.proj.weight.dtype
-        pixel_values = pixel_values.astype(dtype)
+        if pixel_values is not None:
+            if image_grid_thw is None:
+                raise ValueError("`image_grid_thw` is required with image pixels.")
+            if cached is None:
+                dtype = self.vision_tower.patch_embed.proj.weight.dtype
+                features = self.vision_tower(pixel_values.astype(dtype), image_grid_thw)
+            else:
+                features = cached
+            image_positions = (input_ids == self.config.image_token_id) & ~in_video
+            inputs_embeds = _replace_features(
+                inputs_embeds,
+                image_positions,
+                features.astype(inputs_embeds.dtype),
+                "Image",
+            )
 
-        hidden_states = kwargs.get("cached_image_features", None)
-        if hidden_states is None:
-            hidden_states = self.vision_model(pixel_values, grid_thw)
+        if pixel_values_videos is not None:
+            if video_grid_thw is None:
+                raise ValueError("`video_grid_thw` is required with video pixels.")
+            dtype = self.vision_tower.patch_embed.proj.weight.dtype
+            features = self.vision_tower(
+                pixel_values_videos.astype(dtype), self._video_grid(video_grid_thw)
+            )
+            video_positions = (input_ids == self.config.image_token_id) & in_video
+            inputs_embeds = _replace_features(
+                inputs_embeds,
+                video_positions,
+                features.astype(inputs_embeds.dtype),
+                "Video",
+            )
 
-        final_inputs_embeds = self.merge_input_ids_with_image_features(
-            self.config.image_token_id,
-            self.config.video_token_id,
-            hidden_states,
-            inputs_embeds,
-            input_ids,
+        return InputEmbeddingsFeatures(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
         )
-        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
 
     def __call__(
         self,
@@ -100,57 +117,42 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ) -> LanguageModelOutput:
-        features = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
+        features = self.get_input_embeddings(
+            input_ids, pixel_values, mask=mask, **kwargs
+        )
         return self.language_model(
             input_ids,
             inputs_embeds=features.inputs_embeds,
-            mask=mask,
+            attention_mask=features.attention_mask,
             cache=cache,
         )
 
     def sanitize(self, weights):
-        # HF container: Glm5NextForConditionalGeneration -> model.{visual,language_model} + lm_head
+        weights = convert_glm5_next_fp8_weights(weights)
         remapped = {}
-        for k, v in weights.items():
-            nk = k
-            if nk.startswith("model.visual."):
-                nk = "vision_model." + nk[len("model.visual.") :]
-            elif nk.startswith("visual."):
-                nk = "vision_model." + nk[len("visual.") :]
-            elif nk.startswith("model.language_model."):
-                nk = "language_model.model." + nk[len("model.language_model.") :]
-            elif nk.startswith("lm_head."):
-                nk = "language_model." + nk
-            remapped[nk] = v
+        for key, value in weights.items():
+            if key.startswith("model.visual."):
+                key = "vision_tower." + key[len("model.visual.") :]
+            elif key.startswith("model.language_model."):
+                key = "language_model.model." + key[len("model.language_model.") :]
+            elif key == "lm_head.weight":
+                key = "language_model.lm_head.weight"
+            remapped[key] = value
 
-        lang, vis, other = {}, {}, {}
-        for k, v in remapped.items():
-            if k.startswith("language_model."):
-                lang[k[len("language_model.") :]] = v
-            elif k.startswith("vision_model."):
-                vis[k[len("vision_model.") :]] = v
-            else:
-                other[k] = v
-
-        lang = self.language_model.sanitize(lang)
-        vis = self.vision_model.sanitize(vis)
-
-        out = {f"language_model.{k}": v for k, v in lang.items()}
-        out.update({f"vision_model.{k}": v for k, v in vis.items()})
-        out.update(other)
-        return out
+        remapped = self.language_model.sanitize(remapped)
+        return self.vision_tower.sanitize(remapped)
 
     @property
     def layers(self):
-        return self.language_model.model.layers
-
-    @property
-    def quant_predicate(self):
-        return self.language_model.quant_predicate
+        return self.language_model.layers
 
     @property
     def cast_predicate(self):
         return self.language_model.cast_predicate
+
+    @property
+    def quant_predicate(self):
+        return self.language_model.quant_predicate
 
     def make_cache(self):
         return self.language_model.make_cache()

@@ -57,6 +57,7 @@ MODEL_CONFIG = {
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "glm5_next": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "dots_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
@@ -305,6 +306,7 @@ class MessageFormatter:
             "minicpmv4_6",
             "minimax_m3_vl",
             "llava_onevision",
+            "glm5_next",
         ] and kwargs.get("video"):
             return self._format_video_message(
                 prompt,
