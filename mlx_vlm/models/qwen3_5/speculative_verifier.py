@@ -676,77 +676,7 @@ _TARGET_VERIFY_MASKED_QARGMAX_STREAMED_SOURCE = _TARGET_VERIFY_QARGMAX_STREAMED_
 )
 
 
-_TARGET_VERIFY_FUSED_QMV_SOURCE = r"""
-    uint n_tile = threadgroup_position_in_grid.y;
-    uint b_idx = threadgroup_position_in_grid.z;
-    uint simd_gid = simdgroup_index_in_threadgroup;
-    uint simd_lid = thread_index_in_simdgroup;
-
-    int global_out = int(n_tile) * BN + int(simd_gid) * RESULTS_PER_SIMDGROUP;
-    int local_out = global_out;
-    int in_vec_size_w = K_SIZE * BYTES_PER_PACK / PACK_FACTOR;
-    int in_vec_size_g = K_SIZE / GS;
-    const device uint8_t* selected_w = (const device uint8_t*)w0;
-    const device T* selected_scales = scales0;
-    const device T* selected_biases = biases0;
-__SELECT_LINEAR__
-
-    const device uint8_t* ws =
-        selected_w + local_out * in_vec_size_w +
-        int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
-    const device T* sc =
-        selected_scales + local_out * in_vec_size_g +
-        int(simd_lid) / SCALE_STEP_PER_THREAD;
-    const device T* bs =
-        selected_biases + local_out * in_vec_size_g +
-        int(simd_lid) / SCALE_STEP_PER_THREAD;
-    const device T* xk =
-        x + int(b_idx) * VERIFY_T * K_SIZE + int(simd_lid) * VALUES_PER_THREAD;
-
-    float result[VERIFY_T][RESULTS_PER_SIMDGROUP];
-    float x_thread[VERIFY_T][VALUES_PER_THREAD];
-    for (int t = 0; t < VERIFY_T; ++t) {
-      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
-        result[t][row] = 0.0f;
-      }
-    }
-
-    for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
-      float sums[VERIFY_T];
-      for (int t = 0; t < VERIFY_T; ++t) {
-        sums[t] = load_vector_exact<T>(xk + t * K_SIZE, x_thread[t]);
-      }
-
-      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
-        const device uint8_t* wl = ws + row * in_vec_size_w;
-        const device T* sl = sc + row * in_vec_size_g;
-        const device T* bl = bs + row * in_vec_size_g;
-        float s = float(sl[0]);
-        float b = float(bl[0]);
-        for (int t = 0; t < VERIFY_T; ++t) {
-          result[t][row] += qdot_exact(wl, x_thread[t], s, b, sums[t]);
-        }
-      }
-
-      ws += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
-      sc += BLOCK_SIZE / GS;
-      bs += BLOCK_SIZE / GS;
-      xk += BLOCK_SIZE;
-    }
-
-    for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
-      int n = global_out + row;
-      for (int t = 0; t < VERIFY_T; ++t) {
-        float r = simd_sum(result[t][row]);
-        if (simd_lid == 0) {
-          y[(int(b_idx) * VERIFY_T + t) * N_SIZE + n] = T(r);
-        }
-      }
-    }
-"""
-
-
-def _target_verify_fused_qmv_source(n_sizes) -> str:
+def _target_verify_fused_qmv_source(source: str, n_sizes) -> str:
     selections = []
     offset = int(n_sizes[0])
     for index, n_size in enumerate(n_sizes[1:], start=1):
@@ -757,8 +687,30 @@ def _target_verify_fused_qmv_source(n_sizes) -> str:
       selected_biases = biases{index};
     }}""")
         offset += int(n_size)
-    return _TARGET_VERIFY_FUSED_QMV_SOURCE.replace(
-        "__SELECT_LINEAR__", "\n".join(selections)
+    selection = "\n".join(selections)
+    source = source.replace(
+        "    int out_row = int(n_tile) * BN + int(simd_gid) * RESULTS_PER_SIMDGROUP;",
+        f"""    int global_out = int(n_tile) * BN + int(simd_gid) * RESULTS_PER_SIMDGROUP;
+    int local_out = global_out;
+    const device uint8_t* selected_w = (const device uint8_t*)w0;
+    const device T* selected_scales = scales0;
+    const device T* selected_biases = biases0;
+{selection}""",
+    )
+    return (
+        source.replace(
+            "(const device uint8_t*)w + out_row * in_vec_size_w",
+            "selected_w + local_out * in_vec_size_w",
+        )
+        .replace(
+            "scales + out_row * in_vec_size_g",
+            "selected_scales + local_out * in_vec_size_g",
+        )
+        .replace(
+            "biases + out_row * in_vec_size_g",
+            "selected_biases + local_out * in_vec_size_g",
+        )
+        .replace("int n = out_row + row;", "int n = global_out + row;")
     )
 
 
@@ -926,7 +878,30 @@ def _target_verify_fused_qmv_kernel(bits, group_size, dtype, verify_t, k_size, n
         input_names=input_names,
         output_names=["y"],
         header=_target_verify_qlinear_header(bits, group_size),
-        source=_target_verify_fused_qmv_source(n_sizes),
+        source=_target_verify_fused_qmv_source(_TARGET_VERIFY_QMV_SOURCE, n_sizes),
+    )
+
+
+@lru_cache(maxsize=None)
+def _target_verify_fused_qmv_streamed_kernel(
+    bits, group_size, dtype, verify_t, k_size, n_sizes
+):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    shape_name = "_".join(str(n) for n in n_sizes)
+    input_names = ["x"]
+    for index in range(len(n_sizes)):
+        input_names.extend([f"w{index}", f"scales{index}", f"biases{index}"])
+    return mx.fast.metal_kernel(
+        name=(
+            "qwen3_5_target_verify_fused_qmv_streamed_"
+            f"b{bits}_gs{group_size}_t{verify_t}_k{k_size}_n{shape_name}_{dtype_name}"
+        ),
+        input_names=input_names,
+        output_names=["y"],
+        header=_target_verify_qlinear_header(bits, group_size, 1),
+        source=_target_verify_fused_qmv_source(
+            _TARGET_VERIFY_QMV_STREAMED_SOURCE, n_sizes
+        ),
     )
 
 
@@ -1133,7 +1108,7 @@ def _target_verify_quantized_linears(linears, x: mx.array):
     if (
         not 2 <= len(linears) <= 4
         or x.ndim != 3
-        or not 1 < x.shape[1] < 6
+        or not 1 < x.shape[1] <= 8
         or not all(
             isinstance(linear, nn.QuantizedLinear)
             and linear.bits == 4
@@ -1150,9 +1125,13 @@ def _target_verify_quantized_linears(linears, x: mx.array):
     n_sizes = tuple(int(linear.weight.shape[0]) for linear in linears)
     total_n = sum(n_sizes)
     x = mx.contiguous(x)
-    kernel = _target_verify_fused_qmv_kernel(
-        4, linears[0].group_size, x.dtype, T, K, n_sizes
+    streamed = T >= 6
+    kernel_factory = (
+        _target_verify_fused_qmv_streamed_kernel
+        if streamed
+        else _target_verify_fused_qmv_kernel
     )
+    kernel = kernel_factory(4, linears[0].group_size, x.dtype, T, K, n_sizes)
     inputs = [x]
     for linear in linears:
         inputs.extend([linear.weight, linear.scales, linear.biases])
@@ -1164,7 +1143,7 @@ def _target_verify_quantized_linears(linears, x: mx.array):
             ("K_SIZE", int(K)),
             ("N_SIZE", int(total_n)),
         ],
-        grid=(32, 2 * (total_n // 8), B),
+        grid=(32, 2 * (total_n // (2 if streamed else 8)), B),
         threadgroup=(32, 2, 1),
         output_shapes=[(B, T, total_n)],
         output_dtypes=[x.dtype],
@@ -1439,6 +1418,7 @@ class Qwen3_5ExactSpeculativeVerifier:
             state,
             mask,
             use_kernel=not layer.training,
+            state_steps=length - 1,
         )
         gdn_sink.append(
             (
