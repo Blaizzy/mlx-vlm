@@ -5,7 +5,6 @@ import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput
 from .config import ModelConfig
-from .fp8 import convert_glm5_next_fp8_weights
 from .language import LanguageModel
 from .vision import VisionModel
 
@@ -128,7 +127,6 @@ class Model(nn.Module):
         )
 
     def sanitize(self, weights):
-        weights = convert_glm5_next_fp8_weights(weights)
         remapped = {}
         for key, value in weights.items():
             if key.startswith("model.visual."):

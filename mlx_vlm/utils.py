@@ -984,6 +984,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         weights, transformed_quantization = _transform_compressed_tensors_weights(
             weights, quantization_config
         )
+    if transformed_quantization is None:
+        from .fp8 import transform_fp8_weights
+
+        weights, transformed_quantization = transform_fp8_weights(weights, config)
     if transformed_quantization is not None:
         config["quantization"] = transformed_quantization
         config["quantization_config"] = transformed_quantization
@@ -1042,17 +1046,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 from .models.deepseek_v4.language import make_quantization_config
 
                 quantization = make_quantization_config(model)
-            elif quant_method == "fp8" and config.get("model_type") in {
-                "qwen3_5",
-                "qwen3_5_moe",
-            }:
-                from .models.qwen3_5.fp8 import make_quantization_config
-
-                quantization = make_quantization_config(config)
-            elif quant_method == "fp8" and config.get("model_type") == "glm5_next":
-                from .models.glm5_next.fp8 import make_quantization_config
-
-                quantization = make_quantization_config(config)
             elif quant_method in ("awq", "gptq"):
                 logging.warning(
                     "Quantization method %s is not supported in mlx_vlm.load_model()",

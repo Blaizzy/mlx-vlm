@@ -3,13 +3,15 @@ from types import SimpleNamespace
 import mlx.core as mx
 import numpy as np
 
+from mlx_vlm.fp8 import transform_fp8_weights
+from mlx_vlm.generate.ar import _make_cache
+from mlx_vlm.models.cache import BatchPoolingCache, PoolingCache
 from mlx_vlm.models.glm5_next.config import ModelConfig, TextConfig, VisionConfig
-from mlx_vlm.models.glm5_next.fp8 import (
-    convert_glm5_next_fp8_weights,
-    make_quantization_config,
-)
 from mlx_vlm.models.glm5_next.glm5_next import Model
-from mlx_vlm.models.glm5_next.language import LanguageModel
+from mlx_vlm.models.glm5_next.language import (
+    LanguageModel,
+    _sparse_prefill_attention,
+)
 from mlx_vlm.models.glm5_next.processing import (
     Glm5NextImageProcessor,
     Glm5NextProcessor,
@@ -259,6 +261,97 @@ def test_glm5_next_hybrid_decoder_cache_matches_full_forward():
     assert float(mx.max(mx.abs(full - chunked)).item()) < 1e-5
 
 
+def test_glm5_next_sparse_prefill_uses_fused_sdpa_equivalent_math():
+    mx.random.seed(1)
+    q = mx.random.normal((1, 2, 3, 4))
+    k = mx.random.normal((1, 2, 5, 4))
+    v = mx.random.normal((1, 2, 5, 3))
+    indices = mx.array([[[0, -1, -1], [0, 1, 2], [1, 3, 4]]], dtype=mx.int32)
+    scale = 0.5
+
+    actual = _sparse_prefill_attention(q, k, v, indices, scale, chunk_size=2)
+
+    safe = mx.clip(indices, 0, k.shape[2] - 1)
+    gather_idx = safe[:, None, :, :, None]
+    selected_k = mx.take_along_axis(
+        mx.broadcast_to(k[:, :, None], (1, 2, 3, 5, 4)),
+        gather_idx,
+        axis=3,
+    )
+    selected_v = mx.take_along_axis(
+        mx.broadcast_to(v[:, :, None], (1, 2, 3, 5, 3)),
+        gather_idx,
+        axis=3,
+    )
+    scores = (q[..., None, :].astype(mx.float32) * selected_k.astype(mx.float32)).sum(
+        axis=-1
+    ) * scale
+    scores = mx.where(indices[:, None] >= 0, scores, mx.finfo(mx.float32).min)
+    probs = mx.softmax(scores, axis=-1, precise=True).astype(v.dtype)
+    expected = (probs[..., None] * selected_v).sum(axis=-2)
+    mx.eval(actual, expected)
+
+    assert float(mx.max(mx.abs(actual - expected)).item()) < 1e-5
+
+
+def test_glm5_next_chunked_prefill_projects_only_new_tokens():
+    mx.random.seed(2)
+    model = LanguageModel(_text_config())
+    model.eval()
+    tokens = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+    full = model(tokens).logits
+
+    attention = model.layers[1].self_attn
+    original_embed_q = attention.embed_q
+    projected_lengths = []
+
+    class RecordingMultiLinear:
+        def __call__(self, x, transpose=True):
+            projected_lengths.append(x.shape[2])
+            return original_embed_q(x, transpose=transpose)
+
+    attention.embed_q = RecordingMultiLinear()
+    cache = model.make_cache()
+    first = model(tokens[:, :2], cache=cache).logits
+    second = model(tokens[:, 2:], cache=cache).logits
+    chunked = mx.concatenate([first, second], axis=1)
+    mx.eval(full, chunked)
+
+    sparse_cache = cache[1]
+    assert projected_lengths == [2, 3]
+    assert sparse_cache[1].keys.shape[-1] == 1
+    assert isinstance(sparse_cache[2], PoolingCache)
+    assert sparse_cache[2].pooled.shape[1] == 2
+    assert sparse_cache[2].remainder == 1
+    assert sparse_cache[3].size() == 5
+    assert float(mx.max(mx.abs(full - chunked)).item()) < 1e-5
+
+
+def test_glm5_next_incremental_pooling_matches_left_padded_batch():
+    mx.random.seed(3)
+    model = LanguageModel(_text_config())
+    model.eval()
+    tokens = mx.array([[0, 0, 1, 2, 3, 4], [1, 2, 3, 4, 5, 6]], dtype=mx.int32)
+    attention_mask = mx.array([[0, 0, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]], dtype=mx.bool_)
+    full = model(tokens, attention_mask=attention_mask).logits
+
+    cache = _make_cache(model, left_padding=[2, 0])
+    first = model(
+        tokens[:, :3], cache=cache, attention_mask=attention_mask[:, :3]
+    ).logits
+    second = model(
+        tokens[:, 3:], cache=cache, attention_mask=attention_mask[:, 3:]
+    ).logits
+    chunked = mx.concatenate([first, second], axis=1)
+    mx.eval(full, chunked)
+
+    valid = mx.broadcast_to(attention_mask[..., None], full.shape)
+    error = mx.where(valid, mx.abs(full - chunked), 0)
+    assert isinstance(cache[1][2], BatchPoolingCache)
+    assert cache[1][2]._pool_lengths == [2, 3]
+    assert float(mx.max(error).item()) < 1e-5
+
+
 def test_glm5_next_multimodal_forward_and_sanitize():
     config = ModelConfig(
         text_config=_text_config(),
@@ -290,6 +383,12 @@ def test_glm5_next_multimodal_forward_and_sanitize():
         "model.language_model.layers.0.self_attn.q_conv1d.weight": mx.zeros((8, 1, 2)),
         "model.language_model.layers.1.self_attn.kv_b_proj.weight": mx.zeros((16, 4)),
         "model.language_model.layers.2.input_layernorm.weight": mx.zeros((16,)),
+        "model.language_model.layers.0.fp8_proj.weight": mx.zeros(
+            (32, 32), dtype=mx.uint8
+        ),
+        "model.language_model.layers.0.fp8_proj.weight_scale_inv": mx.ones(
+            (1, 1), dtype=mx.bfloat16
+        ),
     }
     for expert in range(2):
         for name, shape in (
@@ -301,6 +400,16 @@ def test_glm5_next_multimodal_forward_and_sanitize():
                 mx.zeros(shape)
             )
 
+    raw, _ = transform_fp8_weights(
+        raw,
+        {
+            "quantization_config": {
+                "quant_method": "fp8",
+                "fmt": "e4m3",
+                "weight_block_size": [128, 128],
+            }
+        },
+    )
     sanitized = model.sanitize(raw)
     assert sanitized["vision_tower.patch_embed.proj.weight"].shape == (8, 2, 2, 2, 3)
     assert sanitized["vision_tower.downsample.weight"].shape == (16, 2, 2, 8)
@@ -308,26 +417,6 @@ def test_glm5_next_multimodal_forward_and_sanitize():
         "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight"
     ].shape == (2, 8, 16)
     assert "language_model.model.layers.2.input_layernorm.weight" not in sanitized
+    assert sanitized["language_model.model.layers.0.fp8_proj.weight"].dtype == mx.uint32
+    assert sanitized["language_model.model.layers.0.fp8_proj.scales"].dtype == mx.uint8
     assert set(model.sanitize(sanitized)) == set(sanitized)
-
-
-def test_glm5_next_fp8_conversion_uses_native_mxfp8():
-    weights = {
-        "linear.weight": mx.zeros((32, 32), dtype=mx.uint8),
-        "linear.weight_scale_inv": mx.ones((1, 1), dtype=mx.bfloat16),
-    }
-    converted = convert_glm5_next_fp8_weights(weights)
-    mx.eval(converted)
-
-    assert converted["linear.weight"].shape == (32, 8)
-    assert converted["linear.scales"].shape == (32, 1)
-    assert make_quantization_config(
-        {
-            "model_type": "glm5_next",
-            "quantization_config": {
-                "quant_method": "fp8",
-                "fmt": "e4m3",
-                "weight_block_size": [128, 128],
-            },
-        }
-    ) == {"group_size": 32, "bits": 8, "mode": "mxfp8"}

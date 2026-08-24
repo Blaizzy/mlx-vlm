@@ -7,7 +7,6 @@ import mlx.nn as nn
 
 from ....models.base import create_attention_mask
 from ....models.cache import BatchKVCache, KVCache
-from ....models.qwen3_5.fp8 import convert_qwen_fp8_weights
 from ....models.qwen3_5.language import Qwen3_5DecoderLayer
 from ....models.qwen3_5_moe.language import Qwen3_5MoeDecoderLayer
 from .config import Qwen3_5MTPConfig
@@ -487,8 +486,6 @@ class Qwen3_5MTPDraftModel(nn.Module):
                 if value.ndim == 1 and mx.issubdtype(value.dtype, mx.floating):
                     value = value + 1.0
             out[key] = value
-        out = convert_qwen_fp8_weights(out)
-
         expert_prefixes = [
             key[: -len(".experts.gate_up_proj")]
             for key in out

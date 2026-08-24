@@ -2,11 +2,12 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 
-from mlx_vlm.models.qwen3_5.fp8 import (
-    _dequantize_qwen_fp8_weight,
-    convert_qwen_fp8_weights,
+from mlx_vlm.fp8 import (
+    _dequantize_fp8_weight,
+    _quantize_fp8_weight,
     make_quantization_config,
-    quantize_qwen_fp8_weight,
+    transform_fp8_weight_pairs,
+    transform_fp8_weights,
 )
 from mlx_vlm.models.qwen3_5.qwen3_5 import Model
 from mlx_vlm.models.qwen3_5_moe.qwen3_5_moe import Model as MoeModel
@@ -19,9 +20,9 @@ def _source_fp8_pair(rows=130, cols=160):
     return weight, scales
 
 
-def test_qwen_fp8_quantization_config_requires_128_block_e4m3():
+def test_fp8_quantization_config_requires_128_block_e4m3():
     config = {
-        "model_type": "qwen3_5",
+        "model_type": "future_model_with_the_same_checkpoint_format",
         "quantization_config": {
             "quant_method": "fp8",
             "fmt": "e4m3",
@@ -38,26 +39,9 @@ def test_qwen_fp8_quantization_config_requires_128_block_e4m3():
     assert make_quantization_config(config) is None
 
 
-def test_qwen_fp8_quantization_config_accepts_moe():
-    config = {
-        "model_type": "qwen3_5_moe",
-        "quantization_config": {
-            "quant_method": "fp8",
-            "fmt": "e4m3",
-            "weight_block_size": [128, 128],
-        },
-    }
-
-    assert make_quantization_config(config) == {
-        "group_size": 32,
-        "bits": 8,
-        "mode": "mxfp8",
-    }
-
-
-def test_qwen_fp8_reconstruction_requantizes_to_native_mxfp8():
+def test_fp8_reconstruction_requantizes_to_native_mxfp8():
     weight, scale_inv = _source_fp8_pair()
-    restored = _dequantize_qwen_fp8_weight(weight, scale_inv)
+    restored = _dequantize_fp8_weight(weight, scale_inv)
 
     decoded = mx.from_fp8(weight, dtype=mx.bfloat16)
     expanded_scales = mx.repeat(
@@ -70,7 +54,7 @@ def test_qwen_fp8_reconstruction_requantizes_to_native_mxfp8():
         direct_restored, group_size=32, bits=8, mode="mxfp8"
     )
 
-    actual_weight, actual_scales = quantize_qwen_fp8_weight(weight, scale_inv)
+    actual_weight, actual_scales = _quantize_fp8_weight(weight, scale_inv)
     mx.eval(
         restored,
         direct_restored,
@@ -89,16 +73,25 @@ def test_qwen_fp8_reconstruction_requantizes_to_native_mxfp8():
     assert actual_scales.shape == (130, 5)
 
 
-def test_qwen_fp8_weight_conversion_replaces_scale_inv_pair():
+def test_fp8_weight_conversion_replaces_scale_inv_pair():
     weight, scale_inv = _source_fp8_pair(128, 128)
-    out = convert_qwen_fp8_weights(
+    out, quantization = transform_fp8_weights(
         {
             "proj.weight": weight,
             "proj.weight_scale_inv": scale_inv[:1, :1],
             "norm.weight": mx.ones((128,), dtype=mx.bfloat16),
-        }
+        },
+        {
+            "model_type": "another_compatible_model",
+            "quantization_config": {
+                "quant_method": "fp8",
+                "fmt": "e4m3",
+                "weight_block_size": [128, 128],
+            },
+        },
     )
 
+    assert quantization == {"group_size": 32, "bits": 8, "mode": "mxfp8"}
     assert "proj.weight_scale_inv" not in out
     assert "proj.scales" in out
     assert out["proj.weight"].dtype == mx.uint32
@@ -106,12 +99,12 @@ def test_qwen_fp8_weight_conversion_replaces_scale_inv_pair():
     assert out["norm.weight"].dtype == mx.bfloat16
 
 
-def test_qwen_fp8_weight_conversion_supports_batched_bare_experts():
+def test_fp8_weight_conversion_supports_batched_bare_experts():
     values = mx.random.uniform(low=-4, high=4, shape=(2, 256, 128))
     weight = mx.to_fp8(values)
     scale_inv = mx.ones((2, 2, 1), dtype=mx.bfloat16)
 
-    out = convert_qwen_fp8_weights(
+    out = transform_fp8_weight_pairs(
         {
             "experts.gate_up_proj": weight,
             "experts.gate_up_proj_scale_inv": scale_inv,
@@ -125,20 +118,27 @@ def test_qwen_fp8_weight_conversion_supports_batched_bare_experts():
     assert not any(key.endswith("scale_inv") for key in out)
 
 
-def test_qwen_model_sanitize_converts_fp8_before_key_remapping():
+def test_shared_fp8_transform_runs_before_qwen_key_remapping():
     weight, scale_inv = _source_fp8_pair(128, 128)
     context = SimpleNamespace(
         config=SimpleNamespace(text_config=SimpleNamespace(tie_word_embeddings=False))
     )
-    out = Model.sanitize(
-        context,
+    transformed, _ = transform_fp8_weights(
         {
             "model.language_model.layers.0.mlp.down_proj.weight": weight,
             "model.language_model.layers.0.mlp.down_proj.weight_scale_inv": (
                 scale_inv[:1, :1]
             ),
         },
+        {
+            "quantization_config": {
+                "quant_method": "fp8",
+                "fmt": "e4m3",
+                "weight_block_size": [128, 128],
+            }
+        },
     )
+    out = Model.sanitize(context, transformed)
 
     prefix = "language_model.model.layers.0.mlp.down_proj"
     assert f"{prefix}.weight" in out

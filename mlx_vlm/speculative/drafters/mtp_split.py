@@ -19,6 +19,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import mlx.core as mx
 from safetensors import safe_open
 
+from ...fp8 import transform_fp8_weights
 from ...utils import get_model_path
 
 
@@ -218,6 +219,7 @@ class MTPSplitter:
         if not selected:
             raise ValueError(f"No MTP tensors found in {source_path}.")
 
+        selected, _ = transform_fp8_weights(selected, source_config)
         weights = self.transform(selected, text_config, source_is_mlx)
         quantization = self.quantization(
             weights, source_config, text_config, quant_opts

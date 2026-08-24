@@ -8,7 +8,7 @@ from ..base import (
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from ..cache import ArraysCache, CacheList, KVCache
+from ..cache import ArraysCache, CacheList, KVCache, PoolingCache
 from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
 from ..gated_delta import gated_delta_update
 from ..mla import MultiLinear
@@ -250,6 +250,18 @@ def _batch_gather(values: mx.array, indices: mx.array) -> mx.array:
     )
 
 
+def _sparse_head_gather(values: mx.array, indices: mx.array) -> mx.array:
+    """Gather per-query positions directly into fused-SDPA batch layout."""
+    batch, heads, kv_length, dim = values.shape
+    query_length, topk = indices.shape[1:]
+    batch_offsets = (mx.arange(batch) * heads * kv_length)[:, None, None, None]
+    head_offsets = (mx.arange(heads) * kv_length)[None, None, :, None]
+    flat_indices = batch_offsets + head_offsets + indices[:, :, None]
+    return values.reshape(batch * heads * kv_length, dim)[
+        flat_indices.reshape(-1)
+    ].reshape(batch * query_length, heads, topk, dim)
+
+
 class Glm5NextIndexer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
@@ -305,81 +317,127 @@ class Glm5NextIndexer(nn.Module):
         pool_keys = (probs.astype(grouped_keys.dtype) * grouped_keys).sum(axis=2)
         return pool_keys, indices, pool_valid, valid
 
-    def __call__(self, x, q_resid, padding_mask=None, cache=None):
+    def _compress_pools(self, keys, gates):
+        batch = keys.shape[0]
+        if keys.shape[1] == 0:
+            return mx.zeros((batch, 0, self.head_dim), dtype=keys.dtype)
+
+        keys = mx.unflatten(keys, 1, (-1, self.index_kpool))
+        gates = mx.unflatten(gates, 1, (-1, self.index_kpool))
+        logits = gates.astype(mx.float32)
+        logits = logits + self.index_kpool_compress_ape[None, None]
+        probs = mx.softmax(logits, axis=2, precise=True).astype(keys.dtype)
+        return (probs * keys).sum(axis=2)
+
+    def __call__(
+        self,
+        x,
+        q_resid,
+        padding_mask=None,
+        cache=None,
+        pool_cache=None,
+        offset=0,
+    ):
         batch, q_length, _ = x.shape
-        q = self.wq_b(q_resid).reshape(batch, q_length, self.n_heads, self.head_dim)
         k = self.k_norm(self.wk(x))
         gate = x.astype(mx.float32) @ self.index_kpool_compress_gate.T
         if padding_mask is None:
             query_valid = mx.ones((batch, q_length), dtype=mx.bool_)
         else:
             query_valid = padding_mask.astype(mx.bool_)
-        packed = mx.concatenate(
-            [k, gate.astype(k.dtype), query_valid[..., None].astype(k.dtype)],
-            axis=-1,
-        )
-
         if cache is not None:
-            packed, _ = cache.update_and_fetch(
-                packed[:, None],
-                mx.zeros((batch, 1, q_length, 0), dtype=packed.dtype),
+            valid_state, _ = cache.update_and_fetch(
+                query_valid[:, None, :, None],
+                mx.zeros((batch, 1, q_length, 0), dtype=mx.bool_),
             )
-            packed = packed[:, 0]
-            current_length = cache.offset
-        else:
-            current_length = q_length
+            key_valid = valid_state[:, 0, :, 0].astype(mx.bool_)
 
-        pool_keys, pool_indices, pool_valid, key_valid = self._pooled_states(packed)
-        kv_length = packed.shape[1]
+            ready_k, ready_gate, _ = pool_cache.accumulate_windows(
+                k, gate.astype(k.dtype), offset
+            )
+            new_pool_keys = self._compress_pools(ready_k, ready_gate)
+            pool_keys = pool_cache.update_and_fetch(new_pool_keys)
+
+            pool_count = pool_keys.shape[1]
+            first_key = mx.where(
+                mx.any(key_valid, axis=-1),
+                mx.argmax(key_valid.astype(mx.int32), axis=-1),
+                key_valid.shape[1],
+            )
+            pool_offsets = mx.arange(pool_count * self.index_kpool).reshape(
+                1, pool_count, self.index_kpool
+            )
+            pool_indices = first_key[:, None, None] + pool_offsets
+            if isinstance(pool_cache.offset, mx.array):
+                pool_valid = mx.arange(pool_count)[None] < pool_cache.offset[:, None]
+            else:
+                pool_valid = mx.ones((batch, pool_count), dtype=mx.bool_)
+        else:
+            packed = mx.concatenate(
+                [k, gate.astype(k.dtype), query_valid[..., None].astype(k.dtype)],
+                axis=-1,
+            )
+            pool_keys, pool_indices, pool_valid, key_valid = self._pooled_states(packed)
+
+        kv_length = key_valid.shape[1]
         kv_positions = mx.arange(kv_length)[None, None]
-        if isinstance(current_length, mx.array):
-            current_length = current_length[:, None, None]
-        q_positions = current_length - q_length + mx.arange(q_length)[None, :, None]
+        q_positions = kv_length - q_length + mx.arange(q_length)[None, :, None]
         visible = (kv_positions <= q_positions) & key_valid[:, None]
 
-        scores = q.astype(mx.float32) @ pool_keys[:, None].swapaxes(-1, -2).astype(
-            mx.float32
-        )
-        scores = mx.maximum(scores * self.softmax_scale, 0)
-        weights = self.weights_proj(x).astype(mx.float32) * self.n_heads**-0.5
-        scores = (scores * weights[..., None]).sum(axis=2)
-
-        pool_end = mx.clip(pool_indices[..., -1], 0, max(kv_length - 1, 0))
-        pool_visible = mx.take_along_axis(
-            visible,
-            mx.broadcast_to(pool_end[:, None], (batch, q_length, pool_end.shape[1])),
-            axis=-1,
-        )
-        candidates = pool_visible & pool_valid[:, None]
-        scores = mx.where(candidates, scores, mx.finfo(mx.float32).min)
-
-        select_k = min(self.index_topk // self.index_kpool, pool_indices.shape[1])
-        if select_k == pool_indices.shape[1]:
-            selected = mx.broadcast_to(
-                mx.arange(select_k)[None, None], (batch, q_length, select_k)
-            )
+        pool_count = pool_indices.shape[1]
+        select_k = min(self.index_topk // self.index_kpool, pool_count)
+        if pool_count == 0:
+            topk = mx.zeros((batch, q_length, 0), dtype=mx.int32)
         else:
-            selected = mx.argpartition(-scores, kth=select_k - 1, axis=-1)[
-                ..., :select_k
-            ]
-        selected_valid = mx.take_along_axis(candidates, selected, axis=-1)
-        expanded_pools = mx.broadcast_to(
-            pool_indices[:, None],
-            (batch, q_length, *pool_indices.shape[1:]),
-        )
-        selected_indices = mx.take_along_axis(
-            expanded_pools,
-            selected[..., None],
-            axis=2,
-        )
-        topk = selected_indices.reshape(batch, q_length, -1)
-        topk = mx.where(
-            mx.repeat(selected_valid[..., None], self.index_kpool, axis=-1).reshape(
-                batch, q_length, -1
-            ),
-            topk,
-            -1,
-        )
+            pool_end = mx.clip(pool_indices[..., -1], 0, max(kv_length - 1, 0))
+            pool_visible = mx.take_along_axis(
+                visible,
+                mx.broadcast_to(
+                    pool_end[:, None], (batch, q_length, pool_end.shape[1])
+                ),
+                axis=-1,
+            )
+            candidates = pool_visible & pool_valid[:, None]
+
+            if select_k == pool_count:
+                selected = mx.broadcast_to(
+                    mx.arange(select_k)[None, None], (batch, q_length, select_k)
+                )
+            else:
+                q = self.wq_b(q_resid).reshape(
+                    batch, q_length, self.n_heads, self.head_dim
+                )
+                # The optimized serving implementations score the indexer in
+                # FP8. Keeping the MLX matmul in the model dtype avoids a large
+                # FP32 [B, Q, H, P] temporary while retaining FP32 weighting.
+                scores = q @ pool_keys[:, None].swapaxes(-1, -2)
+                scores = mx.maximum(scores, 0).astype(mx.float32)
+                scores = scores * self.softmax_scale
+                weights = self.weights_proj(x).astype(mx.float32) * self.n_heads**-0.5
+                scores = (scores * weights[..., None]).sum(axis=2)
+                scores = mx.where(candidates, scores, mx.finfo(mx.float32).min)
+                selected = mx.argpartition(-scores, kth=select_k - 1, axis=-1)[
+                    ..., :select_k
+                ]
+
+            selected_valid = mx.take_along_axis(candidates, selected, axis=-1)
+            expanded_pools = mx.broadcast_to(
+                pool_indices[:, None],
+                (batch, q_length, *pool_indices.shape[1:]),
+            )
+            selected_indices = mx.take_along_axis(
+                expanded_pools,
+                selected[..., None],
+                axis=2,
+            )
+            topk = selected_indices.reshape(batch, q_length, -1)
+            topk = mx.where(
+                mx.repeat(selected_valid[..., None], self.index_kpool, axis=-1).reshape(
+                    batch, q_length, -1
+                ),
+                topk,
+                -1,
+            )
 
         output_width = self.index_topk
         if self.always_select_tail and self.index_kpool > 1:
@@ -411,7 +469,7 @@ class Glm5NextIndexer(nn.Module):
         return mx.where(query_valid[..., None], topk, -1).astype(mx.int32)
 
 
-def _sparse_prefill_attention(q, k, v, indices, scale, chunk_size=32):
+def _sparse_prefill_attention(q, k, v, indices, scale, chunk_size=16):
     batch, heads, q_length, dim = q.shape
     kv_length = k.shape[2]
     outputs = []
@@ -420,23 +478,37 @@ def _sparse_prefill_attention(q, k, v, indices, scale, chunk_size=32):
         idx = indices[:, start:end]
         valid = (idx >= 0) & (idx < kv_length)
         safe = mx.clip(idx, 0, max(kv_length - 1, 0))
-        gather_idx = safe[:, None, :, :, None]
-        key_source = mx.broadcast_to(
-            k[:, :, None], (batch, heads, end - start, kv_length, dim)
+        chunk_length = end - start
+
+        # Gather once from [B, H, N, D], then fold each query row into the
+        # batch dimension so MLX can use its fused SDPA kernel. The outer loop
+        # is only memory tiling; score, mask, softmax, and value reduction are
+        # fused rather than materialized as separate FP32 tensors.
+        selected_k = _sparse_head_gather(k, safe)
+        selected_v = _sparse_head_gather(v, safe)
+        chunk_q = (
+            q[:, :, start:end]
+            .transpose(0, 2, 1, 3)
+            .reshape(batch * chunk_length, heads, 1, dim)
         )
-        value_source = mx.broadcast_to(
-            v[:, :, None],
-            (batch, heads, end - start, kv_length, v.shape[-1]),
+        mask = valid.reshape(batch * chunk_length, 1, 1, idx.shape[-1])
+        out = mx.fast.scaled_dot_product_attention(
+            chunk_q,
+            selected_k,
+            selected_v,
+            scale=scale,
+            mask=mask,
         )
-        selected_k = mx.take_along_axis(key_source, gather_idx, axis=3)
-        selected_v = mx.take_along_axis(value_source, gather_idx, axis=3)
-        scores = (
-            q[:, :, start:end, None].astype(mx.float32) * selected_k.astype(mx.float32)
-        ).sum(axis=-1) * scale
-        scores = mx.where(valid[:, None], scores, mx.finfo(mx.float32).min)
-        probs = mx.softmax(scores, axis=-1, precise=True).astype(selected_v.dtype)
-        outputs.append((probs[..., None] * selected_v).sum(axis=-2))
+        outputs.append(
+            out.reshape(batch, chunk_length, heads, v.shape[-1]).transpose(0, 2, 1, 3)
+        )
     return mx.concatenate(outputs, axis=2)
+
+
+# Projected MLA keys/values make prefill much faster, but unlike the latent
+# cache they grow by every attention head. Bound the transient optimization so
+# million-token contexts retain the compressed-cache memory advantage.
+_MAX_PROJECTED_PREFILL_TOKENS = 32768
 
 
 class Glm5NextAttention(nn.Module):
@@ -484,16 +556,25 @@ class Glm5NextAttention(nn.Module):
             .reshape(batch, length, self.num_heads, self.q_head_dim)
             .transpose(0, 2, 1, 3)
         )
-        latent = self.kv_a_layernorm(self.kv_a_proj_with_mqa(x))[:, None]
+        new_latent = self.kv_a_layernorm(self.kv_a_proj_with_mqa(x))[:, None]
 
         if cache is None:
-            kv_cache = index_cache = None
+            kv_cache = index_cache = pool_cache = projected_cache = None
+            cache_offset = 0
+            latent = new_latent
         else:
             kv_cache = cache[0]
-            index_cache = cache[1] if self.indexer is not None else None
+            cache_offset = kv_cache.offset
+            if self.indexer is None:
+                index_cache = pool_cache = None
+                projected_cache = cache[1]
+            else:
+                index_cache = cache[1]
+                pool_cache = cache[2]
+                projected_cache = cache[3]
             latent, _ = kv_cache.update_and_fetch(
-                latent,
-                mx.zeros((batch, 1, length, 0), dtype=latent.dtype),
+                new_latent,
+                mx.zeros((batch, 1, length, 0), dtype=new_latent.dtype),
             )
 
         if self.indexer is None:
@@ -501,7 +582,14 @@ class Glm5NextAttention(nn.Module):
                 raise ValueError("Shared indexer layer has no previous top-k indices.")
             topk = prev_topk_indices
         else:
-            topk = self.indexer(x, q_resid, padding_mask, index_cache)
+            topk = self.indexer(
+                x,
+                q_resid,
+                padding_mask,
+                index_cache,
+                pool_cache,
+                cache_offset,
+            )
 
         if length == 1:
             kv_length = latent.shape[2]
@@ -523,8 +611,19 @@ class Glm5NextAttention(nn.Module):
             )
             out = self.unembed_out(out)
         else:
-            keys = self.embed_q(latent, transpose=False)
-            values = self.unembed_out(latent)
+            previous_length = latent.shape[2] - length
+            cache_matches = (
+                projected_cache is not None
+                and projected_cache.size() == previous_length
+                and latent.shape[2] <= _MAX_PROJECTED_PREFILL_TOKENS
+            )
+            if cache_matches:
+                new_keys = self.embed_q(new_latent, transpose=False)
+                new_values = self.unembed_out(new_latent)
+                keys, values = projected_cache.update_and_fetch(new_keys, new_values)
+            else:
+                keys = self.embed_q(latent, transpose=False)
+                values = self.unembed_out(latent)
             out = _sparse_prefill_attention(q, keys, values, topk, self.scale)
 
         out = out.transpose(0, 2, 1, 3).reshape(batch, length, -1)
@@ -661,9 +760,16 @@ class LanguageModel(nn.Module):
             if layer.block_type == "linear_attention":
                 caches.append(ArraysCache(size=4))
             elif layer.self_attn.indexer is None:
-                caches.append(CacheList(KVCache()))
-            else:
                 caches.append(CacheList(KVCache(), KVCache()))
+            else:
+                caches.append(
+                    CacheList(
+                        KVCache(),
+                        KVCache(),
+                        PoolingCache(layer.self_attn.indexer.index_kpool),
+                        KVCache(),
+                    )
+                )
         return caches
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
