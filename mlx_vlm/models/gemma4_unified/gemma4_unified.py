@@ -365,6 +365,8 @@ class Model(nn.Module):
                 new_key = "embed_vision." + k.removeprefix(
                     "model.embed_vision.multimodal_embedder."
                 )
+            elif k.startswith("model.embed_vision.embedding_projection."):
+                new_key = k.removeprefix("model.")
             elif k.startswith("model.embed_vision."):
                 new_key = "vision_embedder." + k.removeprefix("model.embed_vision.")
             elif k.startswith("model."):

@@ -7005,6 +7005,19 @@ class TestModels(unittest.TestCase):
         self.assertIn("vision_embedder.patch_dense.weight", hf_vision_weights)
         self.assertIn("embed_vision.embedding_projection.weight", hf_vision_weights)
 
+        google_vision_weights = model.sanitize(
+            {
+                "model.vision_embedder.patch_dense.weight": mx.zeros((32, 48)),
+                "model.embed_vision.embedding_projection.weight": mx.zeros(
+                    (32, 32)
+                ),
+            }
+        )
+        self.assertIn("vision_embedder.patch_dense.weight", google_vision_weights)
+        self.assertIn(
+            "embed_vision.embedding_projection.weight", google_vision_weights
+        )
+
         loaded = gemma4_unified.ModelConfig.from_dict(
             {
                 "model_type": "gemma4_unified",
