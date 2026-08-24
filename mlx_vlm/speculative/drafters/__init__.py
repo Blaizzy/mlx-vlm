@@ -2,6 +2,7 @@ import json
 import logging
 from typing import Any, Optional, Tuple
 
+from .dflash2 import DFlash2DraftModel
 from .dspark import DSparkDraftModel
 from .laguna_dflash import LagunaDFlashDraftModel
 from .muse_glimmer_assistant import MuseGlimmerAssistantDraftModel
@@ -178,6 +179,7 @@ __all__ = [
     "DRAFTER_KIND_BY_MODEL_TYPE",
     "KNOWN_DRAFTER_KINDS",
     "DFlashDraftModel",
+    "DFlash2DraftModel",
     "DSparkDraftModel",
     "LagunaDFlashDraftModel",
     "MuseGlimmerAssistantDraftModel",

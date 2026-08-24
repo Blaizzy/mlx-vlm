@@ -611,8 +611,11 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
+    architectures = set(config.get("architectures") or ())
     dflash_config = config.get("dflash_config")
-    if dflash_config is not None:
+    if "DFlash2DraftModel" in architectures:
+        model_type = "dflash2"
+    elif dflash_config is not None:
         is_dspark = (
             dflash_config.get("projector_type") == "dspark"
             or int(config.get("markov_rank") or dflash_config.get("markov_rank") or 0)

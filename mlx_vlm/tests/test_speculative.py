@@ -405,6 +405,26 @@ def test_qwen_gated_delta_accept_states_matches_python_gather():
     assert bool(mx.array_equal(ref_conv, out_conv).item())
 
 
+def test_qwen_gated_delta_accept_states_uses_live_state_after_last_saved_step():
+    intermediate_states = mx.zeros((1, 2, 2, 3, 5), dtype=mx.float32)
+    conv_input = mx.zeros((1, 5, 6), dtype=mx.float32)
+    live_state = mx.full((1, 2, 3, 5), 7.0, dtype=mx.float32)
+    live_conv = mx.full((1, 3, 6), 8.0, dtype=mx.float32)
+
+    state, conv = qwen_language.gated_delta_accept_states(
+        intermediate_states,
+        conv_input,
+        live_state,
+        live_conv,
+        mx.array([2], dtype=mx.int32),
+        kernel_size=4,
+    )
+    mx.eval(state, conv)
+
+    assert bool(mx.array_equal(state, live_state).item())
+    assert bool(mx.array_equal(conv, live_conv).item())
+
+
 def test_qwen_rollback_speculative_cache_zero_inits_missing_state():
     accepted = mx.array([1, 0], dtype=mx.int32)
     caches = [ArraysCache(size=2)]
@@ -444,12 +464,25 @@ def test_qwen_gdn_sink_captures_intermediate_states_for_batched_verify():
     layer = qwen_language.Qwen3_5GatedDeltaNet(config)
     sink = []
 
-    def fake_update(q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=True):
+    def fake_update(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        mask,
+        use_kernel=True,
+        state_steps=None,
+    ):
         del k, v, a, b, A_log, dt_bias, state, mask, use_kernel
         B, S = q.shape[:2]
+        state_steps = S if state_steps is None else state_steps
         out = mx.zeros((B, S, 2, 4), dtype=mx.float32)
         next_state = mx.zeros((B, 2, 4, 4), dtype=mx.float32)
-        states = mx.ones((B, S, 2, 4, 4), dtype=mx.float32)
+        states = mx.ones((B, state_steps, 2, 4, 4), dtype=mx.float32)
         return out, next_state, states
 
     verifier = qwen_verifier.Qwen3_5ExactSpeculativeVerifier()
@@ -466,7 +499,7 @@ def test_qwen_gdn_sink_captures_intermediate_states_for_batched_verify():
 
     mx.eval(out)
     assert out.shape == (2, 3, 16)
-    assert sink[0][11].shape == (2, 3, 2, 4, 4)
+    assert sink[0][11].shape == (2, 2, 2, 4, 4)
 
 
 def test_qwen_gdn_sink_captures_intermediate_states_for_singleton_verify():
@@ -482,12 +515,25 @@ def test_qwen_gdn_sink_captures_intermediate_states_for_singleton_verify():
     layer = qwen_language.Qwen3_5GatedDeltaNet(config)
     sink = []
 
-    def fake_update(q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=True):
+    def fake_update(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        mask,
+        use_kernel=True,
+        state_steps=None,
+    ):
         del k, v, a, b, A_log, dt_bias, state, mask, use_kernel
         B, S = q.shape[:2]
+        state_steps = S if state_steps is None else state_steps
         out = mx.zeros((B, S, 2, 4), dtype=mx.float32)
         next_state = mx.zeros((B, 2, 4, 4), dtype=mx.float32)
-        states = mx.ones((B, S, 2, 4, 4), dtype=mx.float32)
+        states = mx.ones((B, state_steps, 2, 4, 4), dtype=mx.float32)
         return out, next_state, states
 
     verifier = qwen_verifier.Qwen3_5ExactSpeculativeVerifier()
@@ -504,7 +550,7 @@ def test_qwen_gdn_sink_captures_intermediate_states_for_singleton_verify():
 
     mx.eval(out)
     assert out.shape == (1, 3, 16)
-    assert sink[0][11].shape == (1, 3, 2, 4, 4)
+    assert sink[0][11].shape == (1, 2, 2, 4, 4)
 
 
 def test_qwen_gdn_verify_update_matches_stepwise_path():
@@ -545,6 +591,31 @@ def test_qwen_gdn_verify_update_matches_stepwise_path():
     mx.eval(*ref, *out)
 
     assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
+
+
+def test_qwen_gdn_verify_can_omit_the_live_final_state():
+    mx.random.seed(27)
+    B, S, Hk, D, Hv, Dv = 1, 3, 2, 64, 4, 16
+    q = mx.random.normal((B, S, Hk, D)).astype(mx.bfloat16)
+    k = mx.random.normal((B, S, Hk, D)).astype(mx.bfloat16)
+    v = mx.random.normal((B, S, Hv, Dv)).astype(mx.bfloat16)
+    a = mx.random.normal((B, S, Hv)).astype(mx.bfloat16)
+    b = mx.random.normal((B, S, Hv)).astype(mx.bfloat16)
+    A_log = mx.random.normal((Hv,)).astype(mx.bfloat16)
+    dt_bias = mx.ones((Hv,), dtype=mx.bfloat16)
+    state = mx.zeros((B, Hv, Dv, D), dtype=mx.float32)
+
+    full = qwen_verifier.gated_delta_update_with_states(
+        q, k, v, a, b, A_log, dt_bias, state, state_steps=S
+    )
+    shortened = qwen_verifier.gated_delta_update_with_states(
+        q, k, v, a, b, A_log, dt_bias, state, state_steps=S - 1
+    )
+    mx.eval(*full, *shortened)
+
+    assert bool(mx.array_equal(full[0], shortened[0]).item())
+    assert bool(mx.array_equal(full[1], shortened[1]).item())
+    assert bool(mx.array_equal(full[2][:, :-1], shortened[2]).item())
 
 
 def test_qwen_target_verify_linear_matches_singleton_dense_gemv():
@@ -614,7 +685,7 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
 
 
 @pytest.mark.parametrize("input_dims", [512, 6144])
-@pytest.mark.parametrize("verify_length", [3, 4, 6])
+@pytest.mark.parametrize("verify_length", [3, 4, 6, 7, 8])
 def test_qwen_target_verify_4bit_linear_matches_singleton_path_exactly(
     input_dims, verify_length
 ):
@@ -632,8 +703,9 @@ def test_qwen_target_verify_4bit_linear_matches_singleton_path_exactly(
 
 
 @pytest.mark.parametrize("output_dims", [(16, 24), (16, 24, 32), (8, 16, 24, 32)])
-def test_qwen_target_verify_4bit_linears_fuse_exactly(output_dims):
-    mx.random.seed(51 + len(output_dims))
+@pytest.mark.parametrize("verify_length", [3, 6, 8])
+def test_qwen_target_verify_4bit_linears_fuse_exactly(output_dims, verify_length):
+    mx.random.seed(51 + len(output_dims) + verify_length)
     linears = tuple(
         nn.QuantizedLinear(512, output_dim, bias=False, group_size=64, bits=4)
         for output_dim in output_dims
@@ -641,7 +713,7 @@ def test_qwen_target_verify_4bit_linears_fuse_exactly(output_dims):
     for linear in linears:
         linear.scales = linear.scales.astype(mx.bfloat16)
         linear.biases = linear.biases.astype(mx.bfloat16)
-    x = mx.random.normal((1, 3, 512)).astype(mx.bfloat16)
+    x = mx.random.normal((1, verify_length, 512)).astype(mx.bfloat16)
 
     ref = tuple(qwen_verifier._target_verify_timewise(linear, x) for linear in linears)
     out = qwen_verifier._target_verify_linears(linears, x)
@@ -789,18 +861,22 @@ def test_qwen3_5_quantized_argmax_batch_as_time_matches_rowwise():
     assert bool(mx.array_equal(out, ref).item())
 
 
-def test_qwen3_5_4bit_quantized_argmax_token_tiles_match_singletons():
-    mx.random.seed(38)
+@pytest.mark.parametrize("verify_length", [6, 7, 8])
+def test_qwen3_5_4bit_quantized_argmax_wide_blocks_match_singletons(verify_length):
+    mx.random.seed(32 + verify_length)
     linear = nn.QuantizedLinear(512, 32, bias=False, group_size=64, bits=4)
     linear.scales = linear.scales.astype(mx.bfloat16)
     linear.biases = linear.biases.astype(mx.bfloat16)
-    x = mx.random.normal((1, 6, 512), dtype=mx.bfloat16)
+    x = mx.random.normal((1, verify_length, 512), dtype=mx.bfloat16)
 
     out = qwen_verifier._target_verify_quantized_argmax(linear, x)
+    mask = mx.full((verify_length, 1), -1, dtype=mx.int32)
+    masked = qwen_verifier._target_verify_quantized_argmax(linear, x, token_mask=mask)
     ref = mx.argmax(qwen_verifier._target_verify_timewise(linear, x), axis=-1)
-    mx.eval(out, ref)
+    mx.eval(out, masked, ref)
 
     assert bool(mx.array_equal(out, ref).item())
+    assert bool(mx.array_equal(masked, ref).item())
 
 
 def _qwen3_5_ragged_attention_reference(queries, keys, values, pads, scale):
@@ -2103,6 +2179,26 @@ def test_dflash_next_block_size_uses_model_initial_size():
     draft_model = SimpleNamespace(accept_lens=[], draft_lens=[])
 
     assert _dflash_next_block_size(draft_model, 16, 20, 4) == 4
+
+
+def test_dflash_next_block_size_honors_model_minimum():
+    draft_model = SimpleNamespace(
+        accept_lens=[0, 1],
+        draft_lens=[2, 3],
+        dflash_min_block_size=3,
+    )
+
+    assert _dflash_next_block_size(draft_model, 5, 20) == 3
+
+
+def test_dflash_next_block_size_grows_from_model_minimum():
+    draft_model = SimpleNamespace(
+        accept_lens=[2, 2, 2, 2],
+        draft_lens=[2, 2, 2, 2],
+        dflash_min_block_size=3,
+    )
+
+    assert _dflash_next_block_size(draft_model, 5, 20) == 5
 
 
 def test_dflash_next_block_size_backs_off_on_low_acceptance():
