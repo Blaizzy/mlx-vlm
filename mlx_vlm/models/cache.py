@@ -2152,6 +2152,10 @@ class PoolingCache(_BaseCache):
     def offset(self):
         return 0 if self.pooled is None else self.pooled.shape[1]
 
+    @property
+    def pool_lengths(self):
+        return self.offset
+
     def accumulate_windows(self, kv: mx.array, gate: mx.array, offset):
         B, L, D1 = kv.shape
         _, _, D2 = gate.shape
@@ -2326,6 +2330,10 @@ class BatchPoolingCache(_BaseCache):
     @property
     def offset(self):
         return mx.array(self._pool_lengths, dtype=mx.int32)
+
+    @property
+    def pool_lengths(self):
+        return list(self._pool_lengths)
 
     def prepare(self, *, lengths=None, right_padding=None, left_padding=None):
         if left_padding is not None:
@@ -2739,6 +2747,273 @@ class BatchPoolingCache(_BaseCache):
             batch_cache.buf_gate = buf_gate
 
         return batch_cache
+
+
+class HierarchyCache(_BaseCache):
+    """Incremental block-mean representatives for hierarchical indexing.
+
+    ``values`` passed to :meth:`update_and_fetch` are already-compressed index
+    keys. The cache groups them into fixed-size blocks, retains only the
+    incomplete tail, and appends one mean representative per completed block.
+    Per-row counts keep the cache compatible with left-padded continuous
+    batches without making padding part of a representative.
+    """
+
+    def __init__(self, block_size: int):
+        if block_size < 1:
+            raise ValueError("HierarchyCache block size must be positive")
+        self.block_size = block_size
+        self.buffer = None
+        self.representatives = None
+        self.remainders = []
+        self.representative_lengths = []
+
+    def _initialize_batch(self, batch_size: int):
+        if not self.remainders:
+            self.remainders = [0] * batch_size
+            self.representative_lengths = [0] * batch_size
+        elif len(self.remainders) != batch_size:
+            raise ValueError("Hierarchy cache metadata must match the batch size")
+
+    def update_and_fetch(self, values: mx.array, new_counts=None):
+        batch, width, dim = values.shape
+        self._initialize_batch(batch)
+        if new_counts is None:
+            new_counts = [width] * batch
+        elif isinstance(new_counts, mx.array):
+            new_counts = new_counts.tolist()
+        else:
+            new_counts = list(new_counts)
+        if len(new_counts) != batch:
+            raise ValueError("Hierarchy cache counts must match the batch size")
+        new_counts = [int(count) for count in new_counts]
+        if any(count < 0 or count > width for count in new_counts):
+            raise ValueError("Hierarchy cache counts exceed the input width")
+
+        if self.buffer is None:
+            self.buffer = mx.zeros((batch, self.block_size, dim), dtype=values.dtype)
+        elif self.buffer.shape != (batch, self.block_size, dim):
+            raise ValueError("Hierarchy cache input shape changed unexpectedly")
+
+        next_buffer = mx.zeros_like(self.buffer)
+        row_representatives = []
+        new_block_counts = []
+        next_remainders = []
+        for row, count in enumerate(new_counts):
+            remainder = self.remainders[row]
+            parts = []
+            if remainder:
+                parts.append(self.buffer[row : row + 1, :remainder])
+            if count:
+                parts.append(values[row : row + 1, :count])
+            if parts:
+                combined = (
+                    parts[0] if len(parts) == 1 else mx.concatenate(parts, axis=1)
+                )
+            else:
+                combined = mx.zeros((1, 0, dim), dtype=values.dtype)
+
+            complete = combined.shape[1] // self.block_size
+            usable = complete * self.block_size
+            if complete:
+                reps = (
+                    combined[:, :usable]
+                    .reshape(1, complete, self.block_size, dim)
+                    .mean(axis=2)
+                )
+            else:
+                reps = mx.zeros((1, 0, dim), dtype=values.dtype)
+            tail = combined[:, usable:]
+            if tail.shape[1]:
+                next_buffer[row : row + 1, : tail.shape[1]] = tail
+
+            row_representatives.append(reps)
+            new_block_counts.append(complete)
+            next_remainders.append(tail.shape[1])
+
+        next_lengths = [
+            old + added
+            for old, added in zip(self.representative_lengths, new_block_counts)
+        ]
+        max_length = max(next_lengths, default=0)
+        if max_length:
+            next_representatives = mx.zeros(
+                (batch, max_length, dim), dtype=values.dtype
+            )
+            if self.representatives is not None:
+                next_representatives[:, : self.representatives.shape[1]] = (
+                    self.representatives
+                )
+            for row, (old_length, reps) in enumerate(
+                zip(self.representative_lengths, row_representatives)
+            ):
+                if reps.shape[1]:
+                    next_representatives[
+                        row : row + 1, old_length : old_length + reps.shape[1]
+                    ] = reps
+            self.representatives = next_representatives
+
+        self.buffer = next_buffer
+        self.remainders = next_remainders
+        self.representative_lengths = next_lengths
+        if self.representatives is None:
+            return mx.zeros((batch, 0, dim), dtype=values.dtype), next_lengths
+        return self.representatives, next_lengths
+
+    @property
+    def state(self):
+        return (self.buffer, self.representatives)
+
+    @state.setter
+    def state(self, value):
+        self.buffer, self.representatives = value
+
+    @property
+    def meta_state(self):
+        return (
+            self.block_size,
+            self.remainders,
+            self.representative_lengths,
+        )
+
+    @meta_state.setter
+    def meta_state(self, value):
+        self.block_size, self.remainders, self.representative_lengths = value
+
+    def to_batch(self, left_padding):
+        cache = HierarchyCache(self.block_size)
+        cache._initialize_batch(len(left_padding))
+        return cache
+
+    def prepare(self, **kwargs):
+        del kwargs
+
+    def finalize(self):
+        pass
+
+    def is_trimmable(self):
+        return self.representatives is None
+
+    def trim(self, n):
+        if not self.remainders:
+            return 0
+        n = min(min(self.remainders), n)
+        self.remainders = [remainder - n for remainder in self.remainders]
+        return n
+
+    def size(self):
+        return max(self.representative_lengths, default=0)
+
+    def empty(self):
+        return self.representatives is None and not any(self.remainders)
+
+    @property
+    def nbytes(self):
+        total = 0
+        if self.buffer is not None:
+            total += self.buffer.nbytes
+        if self.representatives is not None:
+            total += self.representatives.nbytes
+        return total
+
+    def filter(self, batch_indices):
+        if isinstance(batch_indices, mx.array):
+            indices = batch_indices.tolist()
+        else:
+            indices = list(batch_indices)
+        if self.buffer is not None:
+            self.buffer = self.buffer[batch_indices]
+        if self.representatives is not None:
+            self.representatives = self.representatives[batch_indices]
+        self.remainders = [self.remainders[index] for index in indices]
+        self.representative_lengths = [
+            self.representative_lengths[index] for index in indices
+        ]
+
+    def extend(self, other):
+        if self.block_size != other.block_size:
+            raise ValueError("Cannot extend hierarchy caches with different blocks")
+        first_batch = len(self.remainders)
+        second_batch = len(other.remainders)
+
+        if self.buffer is not None or other.buffer is not None:
+            source = self.buffer if self.buffer is not None else other.buffer
+            dim, dtype = source.shape[-1], source.dtype
+            first = self.buffer
+            if first is None:
+                first = mx.zeros((first_batch, self.block_size, dim), dtype=dtype)
+            second = other.buffer
+            if second is None:
+                second = mx.zeros((second_batch, self.block_size, dim), dtype=dtype)
+            self.buffer = mx.concatenate([first, second], axis=0)
+
+        if self.representatives is not None or other.representatives is not None:
+            source = (
+                self.representatives
+                if self.representatives is not None
+                else other.representatives
+            )
+            dim, dtype = source.shape[-1], source.dtype
+            max_length = max(
+                0 if self.representatives is None else self.representatives.shape[1],
+                0 if other.representatives is None else other.representatives.shape[1],
+            )
+
+            def pad(representatives, batch_size):
+                if representatives is None:
+                    return mx.zeros((batch_size, max_length, dim), dtype=dtype)
+                if representatives.shape[1] < max_length:
+                    padding = mx.zeros(
+                        (
+                            batch_size,
+                            max_length - representatives.shape[1],
+                            dim,
+                        ),
+                        dtype=dtype,
+                    )
+                    return mx.concatenate([representatives, padding], axis=1)
+                return representatives
+
+            self.representatives = mx.concatenate(
+                [
+                    pad(self.representatives, first_batch),
+                    pad(other.representatives, second_batch),
+                ],
+                axis=0,
+            )
+
+        self.remainders += other.remainders
+        self.representative_lengths += other.representative_lengths
+
+    def extract(self, index):
+        cache = HierarchyCache(self.block_size)
+        cache.remainders = [self.remainders[index]]
+        cache.representative_lengths = [self.representative_lengths[index]]
+        if self.buffer is not None:
+            cache.buffer = mx.contiguous(self.buffer[index : index + 1])
+        length = cache.representative_lengths[0]
+        if self.representatives is not None and length:
+            cache.representatives = mx.contiguous(
+                self.representatives[index : index + 1, :length]
+            )
+        return cache
+
+    @classmethod
+    def merge(cls, caches, prefix_lens=None):
+        del prefix_lens
+        if not caches:
+            raise ValueError("Cannot merge an empty hierarchy cache list")
+        if not all(cache.block_size == caches[0].block_size for cache in caches):
+            raise ValueError("Cannot merge hierarchy caches with different blocks")
+        merged = cls(caches[0].block_size)
+        for cache in caches:
+            row = cache.extract(0) if cache.remainders else cls(cache.block_size)
+            row._initialize_batch(1)
+            if not merged.remainders:
+                merged = row
+            else:
+                merged.extend(row)
+        return merged
 
 
 class SimpleKVCache:
