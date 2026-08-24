@@ -37,7 +37,8 @@ from mlx_vlm.utils import (
 )
 
 
-def test_transform_modelopt_nvfp4_weights():
+@pytest.mark.parametrize("quant_method", ["modelopt", "modelopt_mixed"])
+def test_transform_modelopt_nvfp4_weights(quant_method):
     packed = mx.arange(32, dtype=mx.uint8).reshape(2, 16)
     weights = {
         "layer.weight": packed,
@@ -49,7 +50,7 @@ def test_transform_modelopt_nvfp4_weights():
 
     transformed, quantization = _transform_modelopt_nvfp4_weights(
         weights,
-        {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+        {"quant_method": quant_method, "quant_algo": "NVFP4"},
     )
 
     assert transformed["layer.weight"].dtype == mx.uint32
@@ -59,6 +60,30 @@ def test_transform_modelopt_nvfp4_weights():
     assert "layer.weight_scale" not in transformed
     assert "layer.weight_scale_2" not in transformed
     assert "layer.input_scale" not in transformed
+    assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
+def test_transform_modelopt_mixed_nvfp4_fp8_weights():
+    weights = {
+        "experts.weight": mx.arange(32, dtype=mx.uint8).reshape(2, 16),
+        "experts.weight_scale": mx.array([[56, 64], [72, 80]], dtype=mx.uint8),
+        "experts.weight_scale_2": mx.array(0.5, dtype=mx.float32),
+        "experts.input_scale": mx.array(0.25, dtype=mx.float32),
+        "attention.weight": mx.array([[56, 64], [68, 72]], dtype=mx.uint8),
+        "attention.weight_scale": mx.array([0.5, 0.25], dtype=mx.bfloat16),
+        "attention.input_scale": mx.array(0.125, dtype=mx.float32),
+    }
+
+    transformed, quantization = _transform_modelopt_nvfp4_weights(
+        weights,
+        {"quant_method": "modelopt_mixed", "quant_algo": "MIXED_PRECISION"},
+    )
+
+    assert transformed["experts.weight"].dtype == mx.uint32
+    assert transformed["experts.scales"].dtype == mx.uint8
+    assert transformed["attention.weight"].dtype == mx.bfloat16
+    assert transformed["attention.weight"].tolist() == [[0.5, 1.0], [0.75, 1.0]]
+    assert not any("weight_scale" in key or "input_scale" in key for key in transformed)
     assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 
 
