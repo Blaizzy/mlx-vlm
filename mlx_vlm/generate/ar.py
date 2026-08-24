@@ -30,9 +30,18 @@ from ..speculative.utils import (
 from ..turboquant import BatchTurboQuantKVCache, turboquant_enabled
 from ..utils import group_images_by_shape, prepare_inputs, should_add_special_tokens
 from .common import (
+    DEFAULT_COMPLETION_BATCH_SIZE,
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_MIN_P,
+    DEFAULT_PREFILL_BATCH_SIZE,
+    DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
+    DEFAULT_REPETITION_CONTEXT_SIZE,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_K,
+    DEFAULT_TOP_P,
     _chunked_prefill_enabled,
     generation_stream,
     maybe_quantize_kv_cache,
@@ -42,16 +51,7 @@ from .types import GenerateKwargs, ProcessorLike, Unpack
 
 logger = logging.getLogger("mlx_vlm.generate")
 
-DEFAULT_MAX_TOKENS = 2048
-DEFAULT_TEMPERATURE = 0.0
-DEFAULT_TOP_P = 1.0
-DEFAULT_TOP_K = 0
-DEFAULT_MIN_P = 0.0
 DEFAULT_TOP_N_SIGMA = 0.0
-DEFAULT_REPETITION_CONTEXT_SIZE = 20
-DEFAULT_PREFILL_STEP_SIZE = 2048
-DEFAULT_COMPLETION_BATCH_SIZE = 32
-DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
 
 
@@ -722,6 +722,15 @@ def _merge_prefill_prompt_kwargs(
     return inputs_embeds, merged_kwargs
 
 
+def _is_batch_cache_entry(entry) -> bool:
+    """Return whether a cache entry already owns a batch dimension."""
+    if isinstance(entry, cache.CacheList):
+        return all(_is_batch_cache_entry(child) for child in entry.caches)
+    return callable(getattr(entry, "filter", None)) and callable(
+        getattr(entry, "extend", None)
+    )
+
+
 def _extend_cache(cache_a, cache_b):
     """Extend cache_a with cache_b along the batch dimension."""
     if not cache_a:
@@ -730,9 +739,9 @@ def _extend_cache(cache_a, cache_b):
         return cache_a
     extended = []
     for ca, cb in zip(cache_a, cache_b):
-        if not hasattr(ca, "left_padding") and hasattr(ca.__class__, "merge"):
+        if not _is_batch_cache_entry(ca) and hasattr(ca.__class__, "merge"):
             ca = ca.__class__.merge([ca])
-        if not hasattr(cb, "left_padding") and hasattr(cb.__class__, "merge"):
+        if not _is_batch_cache_entry(cb) and hasattr(cb.__class__, "merge"):
             cb = cb.__class__.merge([cb])
         ca.extend(cb)
         extended.append(ca)
@@ -817,6 +826,8 @@ def _make_cache(
         elif isinstance(c, cache.ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c
+        elif isinstance(c, cache.PoolingCache):
+            return cache.BatchPoolingCache(c.ratio, left_padding)
         elif isinstance(c, cache.RotatingKVCache):
             if c.keep > 0:
                 raise ValueError("RotatingKVCache with keep tokens is not supported.")

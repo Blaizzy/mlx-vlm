@@ -38,6 +38,9 @@ Issues = "https://github.com/Blaizzy/mlx-vlm/issues"
 include = ["mlx_vlm*"]
 exclude = ["mlx_vlm.tests*"]
 
+[tool.setuptools.package-data]
+mlx_vlm = ["py.typed"]
+
 [tool.setuptools.dynamic]
 version = {attr = "mlx_vlm.version.__version__"}
 dependencies = {file = ["requirements.txt"]}

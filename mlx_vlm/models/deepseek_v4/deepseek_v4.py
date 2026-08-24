@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -46,6 +46,36 @@ class Model(nn.Module):
             return key
 
         return {transform_key(k): v for k, v in weights.items()}
+
+    @staticmethod
+    def quantization_path_aliases(path: str) -> Tuple[str, ...]:
+        """Return legacy checkpoint names for a loaded DeepSeek-V4 module path."""
+        path = path.removeprefix("language_model.").removeprefix("model.")
+        aliases = [path]
+
+        if path == "embed_tokens":
+            aliases.append("embed")
+        elif path == "lm_head":
+            aliases.append("head")
+
+        for module_name, checkpoint_name in (
+            ("gate_proj", "w1"),
+            ("down_proj", "w2"),
+            ("up_proj", "w3"),
+        ):
+            module_path = f".ffn.shared_experts.{module_name}"
+            offset = path.find(module_path)
+            if offset < 0:
+                continue
+            end = offset + len(module_path)
+            if end == len(path) or path[end] == ".":
+                aliases.append(
+                    path[:offset]
+                    + f".ffn.shared_experts.{checkpoint_name}"
+                    + path[end:]
+                )
+
+        return tuple(dict.fromkeys(aliases))
 
     @property
     def quant_predicate(self):
