@@ -45,6 +45,25 @@ class DebertaEmbeddings(nn.Module):
         return states * attention_mask[..., None].astype(states.dtype)
 
 
+def _position_gather_indices(
+    length: int, bucket_size: int, max_position: int, pos_att_type
+):
+    """c2p / p2c gather indices for disentangled attention.
+
+    These depend only on sequence length and config, not on any weights, so
+    every layer of the stack reuses one pair instead of rebuilding its own.
+    """
+    relative = _relative_positions(length, bucket_size, max_position)
+    span = bucket_size
+    content_to_position = None
+    position_to_content = None
+    if "c2p" in pos_att_type:
+        content_to_position = mx.clip(relative + span, 0, 2 * span - 1)[None, None]
+    if "p2c" in pos_att_type:
+        position_to_content = mx.clip(-relative + span, 0, 2 * span - 1)[None, None]
+    return content_to_position, position_to_content
+
+
 class DisentangledSelfAttention(nn.Module):
     def __init__(self, config: EncoderConfig):
         super().__init__()
@@ -65,7 +84,7 @@ class DisentangledSelfAttention(nn.Module):
             batch, length, self.num_attention_heads, self.head_dim
         ).transpose(0, 2, 1, 3)
 
-    def __call__(self, states, attention_mask, relative_embeddings):
+    def __call__(self, states, attention_mask, relative_embeddings, position_indices):
         query = self._heads(self.query_proj(states))
         key = self._heads(self.key_proj(states))
         value = self._heads(self.value_proj(states))
@@ -77,32 +96,24 @@ class DisentangledSelfAttention(nn.Module):
 
         length = states.shape[1]
         span = self.position_buckets
-        relative = _relative_positions(
-            length, self.position_buckets, self.max_relative_positions
-        )
         relative_embeddings = relative_embeddings[: 2 * span][None]
         if not self.share_att_key:
             raise ValueError("GLiNER2.5 requires share_att_key=True")
         position_query = self._heads(self.query_proj(relative_embeddings))
         position_key = self._heads(self.key_proj(relative_embeddings))
 
-        batch = states.shape[0]
-        if "c2p" in self.pos_att_type:
+        content_to_position, position_to_content = position_indices
+        if content_to_position is not None:
             c2p = query @ position_key.swapaxes(-1, -2)
-            indices = mx.clip(relative + span, 0, 2 * span - 1)[None, None]
-            indices = mx.broadcast_to(
-                indices, (batch, self.num_attention_heads, length, length)
+            scores = (
+                scores + mx.take_along_axis(c2p, content_to_position, axis=-1) / scale
             )
-            scores = scores + mx.take_along_axis(c2p, indices, axis=-1) / scale
-        if "p2c" in self.pos_att_type:
+        if position_to_content is not None:
             p2c = key @ position_query.swapaxes(-1, -2)
-            indices = mx.clip(-relative + span, 0, 2 * span - 1)[None, None]
-            indices = mx.broadcast_to(
-                indices, (batch, self.num_attention_heads, length, length)
-            )
             scores = (
                 scores
-                + mx.take_along_axis(p2c, indices, axis=-1).swapaxes(-1, -2) / scale
+                + mx.take_along_axis(p2c, position_to_content, axis=-1).swapaxes(-1, -2)
+                / scale
             )
 
         keep = attention_mask[:, None, :, None].astype(mx.bool_) & attention_mask[
@@ -132,9 +143,12 @@ class DebertaAttention(nn.Module):
         self.self_attn = DisentangledSelfAttention(config)
         self.output = DebertaSelfOutput(config)
 
-    def __call__(self, states, attention_mask, relative_embeddings):
+    def __call__(self, states, attention_mask, relative_embeddings, position_indices):
         return self.output(
-            self.self_attn(states, attention_mask, relative_embeddings), states
+            self.self_attn(
+                states, attention_mask, relative_embeddings, position_indices
+            ),
+            states,
         )
 
 
@@ -164,8 +178,10 @@ class DebertaLayer(nn.Module):
         self.intermediate = DebertaIntermediate(config)
         self.output = DebertaOutput(config)
 
-    def __call__(self, states, attention_mask, relative_embeddings):
-        attended = self.attention(states, attention_mask, relative_embeddings)
+    def __call__(self, states, attention_mask, relative_embeddings, position_indices):
+        attended = self.attention(
+            states, attention_mask, relative_embeddings, position_indices
+        )
         return self.output(self.intermediate(attended), attended)
 
 
@@ -177,11 +193,22 @@ class DebertaEncoder(nn.Module):
             config.position_buckets * 2, config.hidden_size
         )
         self.layers = [DebertaLayer(config) for _ in range(config.num_hidden_layers)]
+        self.position_buckets = config.position_buckets
+        self.max_relative_positions = config.max_relative_positions
+        self.pos_att_type = config.pos_att_type
 
     def __call__(self, states, attention_mask):
         relative_embeddings = self.layer_norm(self.rel_embeddings.weight)
+        position_indices = _position_gather_indices(
+            states.shape[1],
+            self.position_buckets,
+            self.max_relative_positions,
+            self.pos_att_type,
+        )
         for layer in self.layers:
-            states = layer(states, attention_mask, relative_embeddings)
+            states = layer(
+                states, attention_mask, relative_embeddings, position_indices
+            )
         return states
 
 
