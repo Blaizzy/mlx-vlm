@@ -504,8 +504,19 @@ def initialize_rope(
     raise ValueError(f"Unsupported RoPE type {rope_type}")
 
 
-def _cumulative_splits(lengths: Sequence[int]):
-    return mx.cumsum(mx.array(lengths, dtype=mx.int32))[:-1]
+def _cumulative_splits(lengths: Sequence[int]) -> List[int]:
+    """Offsets at which ``mx.split`` should cut, as host ints.
+
+    ``mx.split`` takes ``int | Sequence[int]``; passing a device array raises
+    a TypeError. Section lengths come from static config, so accumulate them
+    on the host rather than round-tripping through the GPU.
+    """
+    offsets: List[int] = []
+    total = 0
+    for length in lengths[:-1]:
+        total += length
+        offsets.append(total)
+    return offsets
 
 
 def _interleaved_position_selector(mrope_section: Sequence[int], freq_dim: int):
