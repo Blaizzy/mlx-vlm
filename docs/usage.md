@@ -49,6 +49,18 @@ python -m mlx_vlm.generate \
     --max-tokens 512 --temperature 0 --enable-thinking
 ```
 
+Liquid AI's LFM2.5 DSpark drafter is also auto-detected:
+
+```bash
+python -m mlx_vlm.generate \
+    --model LiquidAI/LFM2.5-2.6B \
+    --draft-model LiquidAI/LFM2.5-2.6B-DSpark \
+    --prompt "Write a concise note about speculative decoding." \
+    --max-tokens 256 --temperature 0
+```
+
+DSpark decoding currently supports greedy sampling (`temperature=0`).
+
 EAGLE-3 speculators are also supported and auto-detected from Speculators configs:
 
 ```bash
@@ -192,6 +204,7 @@ for i in range(B):
 | Target | Drafter | Notes |
 |--------|---------|-------|
 | `Qwen/Qwen3.5-4B` | `z-lab/Qwen3.5-4B-DFlash` | Text + image. ~2.5× speedup on code/reasoning. |
+| `LiquidAI/LFM2.5-2.6B` | `LiquidAI/LFM2.5-2.6B-DSpark` | Text. Nine Markov-corrected proposals with exact LFM2 target verification. |
 | `meta-models/Muse-Glimmer-30B` | `meta-models/Muse-Glimmer-30B-assistant` | Text + image. Native 5-layer, 16-token DFlash assistant. |
 | `MiniMaxAI/MiniMax-M3` | `Inferact/MiniMax-M3-EAGLE3` | Text, image, and video target. Uses `--draft-kind eagle3`. |
 

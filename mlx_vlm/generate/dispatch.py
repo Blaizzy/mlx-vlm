@@ -24,15 +24,23 @@ from ..utils import (
     should_add_special_tokens,
 )
 from .common import (
+    DEFAULT_DIFFUSION_MAX_DENOISING_STEPS,
+    DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_MIN_P,
+    DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
+    DEFAULT_REPETITION_CONTEXT_SIZE,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_K,
+    DEFAULT_TOP_P,
     GenerationResult,
     generation_stream,
     wired_limit,
 )
 from .image import (
-    DEFAULT_IMAGE_GUIDANCE,
     DEFAULT_IMAGE_SIZE,
     DEFAULT_IMAGE_STEPS,
     DEFAULT_IMAGE_TASK,
@@ -47,20 +55,9 @@ DEFAULT_IMAGE = None
 DEFAULT_AUDIO = None
 DEFAULT_VIDEO = None
 DEFAULT_PROMPT = "What are these?"
-DEFAULT_MAX_TOKENS = 2048
-DEFAULT_TEMPERATURE = 0.0
-DEFAULT_TOP_P = 1.0
 DEFAULT_SEED = 0
-DEFAULT_TOP_K = 0
-DEFAULT_MIN_P = 0.0
-DEFAULT_REPETITION_CONTEXT_SIZE = 20
-DEFAULT_COMPLETION_BATCH_SIZE = 32
-DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_THINKING_START_TOKEN = "<think>"
 DEFAULT_THINKING_END_TOKEN = "</think>"
-DEFAULT_PREFILL_STEP_SIZE = 2048
-DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
-DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 
 
 def parse_arguments():
@@ -158,7 +155,7 @@ def parse_arguments():
     parser.add_argument(
         "--guidance",
         type=float,
-        default=DEFAULT_IMAGE_GUIDANCE,
+        default=None,
         help="Classifier-free guidance for image generation/editing.",
     )
     parser.add_argument(
@@ -343,6 +340,26 @@ def parse_arguments():
         type=float,
         default=DEFAULT_TEMPERATURE,
         help="Temperature for sampling.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=DEFAULT_TOP_P,
+        help="Nucleus sampling: keep the smallest set of tokens whose "
+        "probabilities sum to this. 1.0 disables it.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=DEFAULT_TOP_K,
+        help="Keep only the k most probable tokens. 0 disables it.",
+    )
+    parser.add_argument(
+        "--min-p",
+        type=float,
+        default=DEFAULT_MIN_P,
+        help="Drop tokens whose probability is below this fraction of the "
+        "most probable token's. 0 disables it.",
     )
     parser.add_argument(
         "--repetition-penalty",
@@ -1431,6 +1448,9 @@ def main():
             stream_kwargs = {
                 "max_tokens": args.max_tokens,
                 "temperature": args.temperature,
+                "top_p": args.top_p,
+                "top_k": args.top_k,
+                "min_p": args.min_p,
                 "repetition_penalty": args.repetition_penalty,
                 "repetition_context_size": args.repetition_context_size,
                 "presence_penalty": args.presence_penalty,
@@ -1475,6 +1495,9 @@ def main():
             "video": args.video,
             "fps": args.fps,
             "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "min_p": args.min_p,
             "max_tokens": args.max_tokens,
             "repetition_penalty": args.repetition_penalty,
             "repetition_context_size": args.repetition_context_size,

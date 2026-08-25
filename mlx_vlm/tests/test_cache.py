@@ -2,6 +2,8 @@ import mlx.core as mx
 import pytest
 
 from mlx_vlm.models.cache import (
+    ArraysCache,
+    BatchPoolingCache,
     BatchRotatingKVCache,
     CacheList,
     KVCache,
@@ -43,6 +45,40 @@ def test_cache_list_can_extract_an_already_extracted_kv_cache():
     assert mx.array_equal(extracted_again[0].values, first.state[1]).item()
 
 
+def test_arrays_cache_advance_matches_decremented_values():
+    cache = ArraysCache(1, left_padding=[3, 1])
+    cache.prepare(lengths=[10, 7])
+    cache.advance(1)
+    cache.advance(2)
+
+    assert cache.left_padding.tolist() == [0, -2]
+    assert cache.lengths.tolist() == [7, 4]
+
+    mask = cache.make_mask(4)
+    assert mask.tolist() == [[p >= lp for p in range(4)] for lp in (0, -2)]
+
+    cache.filter([1, 0])
+    assert cache.left_padding.tolist() == [-2, 0]
+    assert cache.lengths.tolist() == [4, 7]
+
+    cache.finalize()
+    assert cache.left_padding is None and cache.lengths is None
+
+
+def test_arrays_cache_advance_does_not_accumulate_buffers():
+    cache = ArraysCache(1, left_padding=[0, 0])
+    cache.prepare(lengths=[8, 8])
+
+    mx.clear_cache()
+    base = mx.get_active_memory()
+    for _ in range(20000):
+        cache.advance(1)
+    delta = mx.get_active_memory() - base
+
+    assert delta < 4096, f"advance leaked {delta} bytes over 20k steps"
+    assert cache.lengths.tolist() == [8 - 20000, 8 - 20000]
+
+
 def test_kv_cache_extract_validates_row_index():
     cache, _, _ = _make_kv_cache(batch_size=2)
 
@@ -51,6 +87,59 @@ def test_kv_cache_extract_validates_row_index():
         cache.extract(2)
     with pytest.raises(IndexError):
         cache.extract(-3)
+
+
+def test_batch_pooling_cache_skips_left_padding_across_chunks():
+    cache = BatchPoolingCache(ratio=4, left_padding=[5, 0])
+    kv = mx.array(
+        [
+            [[90], [91], [92], [93], [94], [1], [2], [3], [4]],
+            [[10], [11], [12], [13], [14], [15], [16], [17], [18]],
+        ],
+        dtype=mx.float32,
+    )
+    gate = kv + 100
+    offsets = [mx.array([-5, 0]), mx.array([-2, 3]), mx.array([1, 6])]
+
+    outputs = []
+    for chunk, offset in zip(range(0, 9, 3), offsets):
+        outputs.append(
+            cache.accumulate_windows(
+                kv[:, chunk : chunk + 3],
+                gate[:, chunk : chunk + 3],
+                offset,
+            )
+        )
+
+    ready_kv, ready_gate, pool_base = outputs[-1]
+    assert ready_kv[:, :, 0].tolist() == [
+        [1.0, 2.0, 3.0, 4.0],
+        [14.0, 15.0, 16.0, 17.0],
+    ]
+    assert ready_gate[:, :, 0].tolist() == [
+        [101.0, 102.0, 103.0, 104.0],
+        [114.0, 115.0, 116.0, 117.0],
+    ]
+    assert pool_base.tolist() == [0, 4]
+    assert cache.left_padding == [0, 0]
+    assert cache._processed == [4, 9]
+    assert cache.remainder == [0, 1]
+    assert cache.buf_kv[:, :1, 0].tolist() == [[0.0], [18.0]]
+
+
+def test_batch_pooling_cache_tracks_left_padding_through_batch_operations():
+    cache = BatchPoolingCache(ratio=4, left_padding=[3, 1])
+    other = BatchPoolingCache(ratio=4, left_padding=[2])
+
+    cache.extend(other)
+    cache.filter([2, 0])
+
+    assert cache.left_padding == [2, 3]
+
+    restored = BatchPoolingCache.from_state(cache.state, cache.meta_state)
+    assert restored.left_padding == [2, 3]
+    restored.prepare(left_padding=[1, 2])
+    assert restored.left_padding == [3, 5]
 
 
 def test_empty_kv_cache_extracts_as_empty():
