@@ -22,6 +22,7 @@ from transformers.utils.chat_parsing import ResponseParser, parse_response
 
 import mlx_vlm.reranker_loader as reranker_loader
 import mlx_vlm.server as server
+import mlx_vlm.server.anthropic as server_anthropic
 import mlx_vlm.server.cli as server_cli
 import mlx_vlm.server.generation as server_generation
 import mlx_vlm.server.openai as server_openai
@@ -514,6 +515,38 @@ def test_positioned_target_sampler_is_batch_grouping_invariant():
     assert batched.tolist() == [single_0.item(), single_1.item()]
 
 
+@pytest.mark.parametrize("top_p", [1.0, 0.95])
+def test_positioned_target_sampler_honors_top_k(top_p):
+    sampler = server_generation._PositionedTargetSampler(
+        temperature=1.0, top_p=top_p, top_k=2, seed=42
+    )
+    logits = mx.array([[0.0, 1.0, 2.0, 3.0]], dtype=mx.float32)
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    repeated = mx.repeat(logprobs, 32, axis=0)
+
+    tokens = sampler.sample_target(
+        repeated,
+        row_ids=[0] * 32,
+        positions=list(range(32)),
+    )
+    mx.eval(tokens)
+
+    assert set(tokens.tolist()) <= {2, 3}
+
+
+def test_server_passes_top_k_to_positioned_sampler():
+    generator = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    args = server_generation.GenerationArguments(
+        max_tokens=1,
+        temperature=1.0,
+        top_k=7,
+    )
+
+    sampler = generator._make_sampler(args)
+
+    assert sampler.top_k == 7
+
+
 def test_speculative_server_dispatches_eagle3_batch_loop():
     assert (
         speculative_utils.get_speculative_rounds_batch("eagle3")
@@ -717,6 +750,82 @@ def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     assert cache_key[:3] == ("demo-model", "adapter-a", "text_generation")
     assert cache_key[3] == server.runtime.config.fingerprint(kinds={"text_generation"})
     assert server.runtime.model_cache["adapter_path"] == "adapter-a"
+
+
+def test_unload_model_cache_group_resets_apc_around_generator_shutdown(
+    monkeypatch,
+):
+    events = []
+
+    class FakeAPCManager:
+        def __init__(self):
+            self.contents = ["old-model-prefix"]
+
+        def clear(self):
+            events.append(("clear", list(self.contents)))
+            self.contents.clear()
+
+    manager = FakeAPCManager()
+
+    class FakeResponseGenerator:
+        def stop_and_join(self):
+            events.append(("stop", list(manager.contents)))
+            # Simulate a store that was already in flight when shutdown began.
+            manager.contents.append("draining-worker-prefix")
+
+    response_generator = FakeResponseGenerator()
+    registry = server.ModelCacheRegistry()
+    registry.set(
+        "text_generation",
+        {
+            "model_path": "old-model",
+            "adapter_path": None,
+            "response_generator": response_generator,
+            "apc_manager": manager,
+        },
+    )
+    monkeypatch.setattr(server.runtime, "model_cache", registry)
+    monkeypatch.setattr(server.runtime, "response_generator", response_generator)
+    monkeypatch.setattr(server.runtime, "apc_manager", manager)
+    monkeypatch.setattr(server._app_module.gc, "collect", lambda: None)
+    monkeypatch.setattr(server._app_module.mx, "clear_cache", lambda: None)
+
+    assert server._app_module._unload_model_cache_group("text_generation") is True
+
+    assert events == [
+        ("clear", ["old-model-prefix"]),
+        ("stop", []),
+        ("clear", ["draining-worker-prefix"]),
+    ]
+    assert manager.contents == []
+    assert registry.for_kind("text_generation") == {}
+    assert server.runtime.response_generator is None
+    assert server.runtime.apc_manager is None
+
+
+def test_unload_model_cache_group_keeps_model_when_initial_apc_reset_fails(
+    monkeypatch,
+):
+    class FailingAPCManager:
+        def clear(self):
+            raise RuntimeError("APC cleanup failed")
+
+    response_generator = MagicMock()
+    cache = {
+        "model_path": "old-model",
+        "adapter_path": None,
+        "response_generator": response_generator,
+        "apc_manager": FailingAPCManager(),
+    }
+    registry = server.ModelCacheRegistry()
+    registry.set("text_generation", cache)
+    monkeypatch.setattr(server.runtime, "model_cache", registry)
+
+    with pytest.raises(RuntimeError, match="APC cleanup failed"):
+        server._app_module._unload_model_cache_group("text_generation")
+
+    response_generator.stop_and_join.assert_not_called()
+    assert registry.for_kind("text_generation") is cache
 
 
 @pytest.mark.parametrize(
@@ -4564,6 +4673,149 @@ def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch)
     assert '"stop_reason": "tool_use"' in body
 
 
+ANTHROPIC_TOOLS = [
+    {
+        "name": "get_time",
+        "description": "Get the current time",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_weather",
+        "description": "Get the current weather",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+]
+
+
+def _anthropic_tool_choice_request(client, tool_choice, tools=ANTHROPIC_TOOLS):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(text="done", prompt_tokens=5, generation_tokens=2)
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                "tools": tools,
+                "tool_choice": tool_choice,
+                "max_tokens": 32,
+            },
+        )
+    return response, mock_template
+
+
+def test_anthropic_messages_tool_choice_none_disables_tools(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+
+    response, mock_template = _anthropic_tool_choice_request(client, {"type": "none"})
+
+    assert response.status_code == 200
+    assert mock_template.call_args.kwargs["tools"] is None
+    assert mock_template.call_args.kwargs["tool_choice"] == "none"
+
+
+def test_anthropic_messages_any_tool_choice_adds_instruction(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+
+    response, mock_template = _anthropic_tool_choice_request(client, {"type": "any"})
+
+    assert response.status_code == 200
+    messages = mock_template.call_args.args[2]
+    assert "must call one or more" in messages[-1]["content"]
+    selected_tools = mock_template.call_args.kwargs["tools"]
+    assert [tool["function"]["name"] for tool in selected_tools] == [
+        "get_time",
+        "get_weather",
+    ]
+    assert mock_template.call_args.kwargs["tool_choice"] == "required"
+
+
+def test_anthropic_messages_forced_tool_choice_filters_tools(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+
+    response, mock_template = _anthropic_tool_choice_request(
+        client, {"type": "tool", "name": "get_time"}
+    )
+
+    assert response.status_code == 200
+    messages = mock_template.call_args.args[2]
+    assert "must call the 'get_time' function" in messages[-1]["content"]
+    selected_tools = mock_template.call_args.kwargs["tools"]
+    assert [tool["function"]["name"] for tool in selected_tools] == ["get_time"]
+    assert mock_template.call_args.kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "get_time"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("tool_choice", "tools", "message"),
+    [
+        (
+            {"type": "tool", "name": "missing"},
+            ANTHROPIC_TOOLS,
+            "unknown function 'missing'",
+        ),
+        ({"type": "any"}, [], "requires at least one tool"),
+    ],
+)
+def test_anthropic_messages_rejects_unsatisfiable_tool_choice(
+    client, monkeypatch, tool_choice, tools, message
+):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+
+    response, _ = _anthropic_tool_choice_request(client, tool_choice, tools=tools)
+
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["type"] == "error"
+    assert payload["error"]["type"] == "invalid_request_error"
+    assert message in payload["error"]["message"]
+
+
+def test_anthropic_count_tokens_applies_tool_choice(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server_anthropic, "prepare_inputs", return_value={}),
+        patch.object(server_anthropic, "_count_prompt_tokens", return_value=7),
+    ):
+        response = client.post(
+            "/v1/messages/count_tokens",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                "tools": ANTHROPIC_TOOLS,
+                "tool_choice": {"type": "tool", "name": "get_time"},
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"input_tokens": 7}
+    selected_tools = mock_template.call_args.kwargs["tools"]
+    assert [tool["function"]["name"] for tool in selected_tools] == ["get_time"]
+
+
 def test_cache_endpoints_report_disabled_stats_and_reset(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "apc_manager", None)
 
@@ -7362,6 +7614,41 @@ class TestCountThinkingTagTokens:
 
     def test_no_tags(self):
         assert server._count_thinking_tag_tokens("plain text") == 0
+
+
+class TestQuantizedKVBits:
+    def test_kv_bits_unset_returns_none(self, monkeypatch):
+        monkeypatch.delenv("KV_BITS", raising=False)
+        assert server_generation.get_quantized_kv_bits() is None
+
+    def test_kv_bits_applies(self, monkeypatch):
+        monkeypatch.setenv("KV_BITS", "3.5")
+        assert server_generation.get_quantized_kv_bits() == 3.5
+
+    @pytest.mark.parametrize(
+        "model_path",
+        [
+            "mlx-community/gemma-4-31B-it-qat-mxfp4",
+            "mlx-community/gemma-4-31B-it-QAT-mxfp4",
+            "/models/qat-experiments/llama-3",
+            "some-org/qatar-news-llm",
+        ],
+    )
+    def test_kv_bits_not_suppressed_by_model_path(self, monkeypatch, model_path):
+        # KV cache quantization is independent of how the weights were trained,
+        # so nothing in the model path may suppress it (#1333).
+        monkeypatch.setenv("KV_BITS", "3.5")
+        monkeypatch.setenv("MAX_KV_SIZE", "0")
+        assert server_generation.get_quantized_kv_bits() == 3.5
+        assert server_generation.get_max_kv_size(model_path) is None
+
+    def test_split_bits_agree_with_uniform_bits(self, monkeypatch):
+        # The split path never had a model-path guard; both must behave alike.
+        monkeypatch.setenv("KV_BITS", "3.5")
+        monkeypatch.setenv("KV_KEY_BITS", "3")
+        monkeypatch.setenv("KV_VALUE_BITS", "4")
+        assert server_generation.get_quantized_kv_bits() == 3.5
+        assert server_generation.get_quantized_kv_split_bits() == (3.0, 4.0)
 
 
 class TestRuntimeConfig:

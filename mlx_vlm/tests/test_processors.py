@@ -1410,6 +1410,197 @@ class TestQwen3VLProcessor(_ProcessorTestBase, unittest.TestCase):
     def _image_call_args(self):
         return {"text": ["<|image_pad|> Describe"], "images": [_make_image()]}
 
+    def _make_capturing_processor(self, image_grid_thw):
+        captured = {}
+        image_grid_thw = np.array(image_grid_thw, dtype=np.int64)
+
+        class ImageProcessor:
+            model_input_names = ["pixel_values"]
+            merge_size = 2
+
+            def __call__(self, images=None, **kwargs):
+                return {
+                    "pixel_values": np.zeros(
+                        (len(image_grid_thw), 3, 224, 224), dtype=np.float32
+                    ),
+                    "image_grid_thw": image_grid_thw,
+                }
+
+        class Tokenizer:
+            model_input_names = ["input_ids", "attention_mask"]
+
+            def __call__(self, text, **kwargs):
+                captured["text"] = text
+                return {
+                    "input_ids": [list(range(len(item))) for item in text],
+                    "attention_mask": [[1] * len(item) for item in text],
+                }
+
+        processor = self._make_processor()
+        processor.image_processor = ImageProcessor()
+        processor.tokenizer = Tokenizer()
+        return processor, captured
+
+    def test_surplus_image_tokens_are_removed_in_prompt_order(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import (
+            _drop_surplus_image_tokens,
+        )
+
+        text = "old <|image_pad|> new <|vs|><|image_pad|><|ve|>"
+
+        result = _drop_surplus_image_tokens(
+            text,
+            image_token="<|image_pad|>",
+            vision_start_token="<|vs|>",
+            vision_end_token="<|ve|>",
+            count=1,
+        )
+
+        self.assertEqual(result, "old  new <|vs|><|image_pad|><|ve|>")
+
+    def test_surplus_wrapped_image_token_is_removed_before_expansion(self):
+        processor, captured = self._make_capturing_processor([[1, 16, 16]])
+        prompt = "old <|vs|><|image_pad|><|ve|> " "new <|vs|><|image_pad|><|ve|>"
+
+        processor(text=[prompt], images=[_make_image()])
+
+        rendered = captured["text"][0]
+        self.assertTrue(rendered.startswith("old  new <|vs|>"))
+        self.assertEqual(rendered.count("<|vs|>"), 1)
+        self.assertEqual(rendered.count("<|ve|>"), 1)
+        self.assertEqual(rendered.count("<|image_pad|>"), 64)
+
+    def test_multiple_surplus_image_tokens_keep_latest_marker(self):
+        processor, captured = self._make_capturing_processor([[1, 16, 16]])
+        prompt = (
+            "first <|vs|><|image_pad|><|ve|> "
+            "second <|vs|><|image_pad|><|ve|> "
+            "third <|vs|><|image_pad|><|ve|>"
+        )
+
+        processor(text=[prompt], images=[_make_image()])
+
+        expected = "first  second  third <|vs|>" + "<|image_pad|>" * 64 + "<|ve|>"
+        self.assertEqual(captured["text"], [expected])
+
+    def test_matching_image_tokens_expand_in_grid_order(self):
+        processor, captured = self._make_capturing_processor([[1, 4, 4], [1, 4, 8]])
+        prompt = "first <|vs|><|image_pad|><|ve|> " "second <|vs|><|image_pad|><|ve|>"
+
+        processor(text=[prompt], images=[_make_image(), _make_image()])
+
+        expected = (
+            "first <|vs|>"
+            + "<|image_pad|>" * 4
+            + "<|ve|> second <|vs|>"
+            + "<|image_pad|>" * 8
+            + "<|ve|>"
+        )
+        self.assertEqual(captured["text"], [expected])
+
+    def test_surplus_image_tokens_do_not_cross_batch_entries(self):
+        processor, captured = self._make_capturing_processor([[1, 4, 4], [1, 4, 8]])
+        text = [
+            "first <|vs|><|image_pad|><|ve|>",
+            "stale <|vs|><|image_pad|><|ve|> " "current <|vs|><|image_pad|><|ve|>",
+        ]
+
+        processor(text=text, images=[_make_image(), _make_image()])
+
+        expected_first = "first <|vs|>" + "<|image_pad|>" * 4 + "<|ve|>"
+        expected_second = "stale  current <|vs|>" + "<|image_pad|>" * 8 + "<|ve|>"
+        self.assertEqual(captured["text"], [expected_first, expected_second])
+
+    def test_grouped_images_resolve_variable_batch_counts(self):
+        processor, captured = self._make_capturing_processor(
+            [[1, 4, 4], [1, 4, 8], [1, 4, 12]]
+        )
+        text = [
+            "stale <|vs|><|image_pad|><|ve|> " "current <|vs|><|image_pad|><|ve|>",
+            "first <|vs|><|image_pad|><|ve|> " "second <|vs|><|image_pad|><|ve|>",
+        ]
+
+        processor(
+            text=text,
+            images=[[_make_image()], [_make_image(), _make_image()]],
+        )
+
+        expected_first = "stale  current <|vs|>" + "<|image_pad|>" * 4 + "<|ve|>"
+        expected_second = (
+            "first <|vs|>"
+            + "<|image_pad|>" * 8
+            + "<|ve|> second <|vs|>"
+            + "<|image_pad|>" * 12
+            + "<|ve|>"
+        )
+        self.assertEqual(captured["text"], [expected_first, expected_second])
+
+    def test_grouped_images_allow_rows_without_current_images(self):
+        processor, captured = self._make_capturing_processor([[1, 4, 4]])
+        text = [
+            "stale <|vs|><|image_pad|><|ve|>",
+            "stale <|vs|><|image_pad|><|ve|> " "current <|vs|><|image_pad|><|ve|>",
+        ]
+
+        processor(text=text, images=[[], [_make_image()]])
+
+        expected = "stale  current <|vs|>" + "<|image_pad|>" * 4 + "<|ve|>"
+        self.assertEqual(captured["text"], ["stale ", expected])
+
+    def test_ambiguous_flat_image_batch_is_rejected(self):
+        processor, _ = self._make_capturing_processor(
+            [[1, 4, 4], [1, 4, 8], [1, 4, 12]]
+        )
+        text = [
+            "first <|image_pad|> second <|image_pad|>",
+            "first <|image_pad|> second <|image_pad|>",
+        ]
+
+        with self.assertRaisesRegex(ValueError, "Cannot unambiguously map"):
+            processor(
+                text=text,
+                images=[_make_image(), _make_image(), _make_image()],
+            )
+
+    def test_flat_variable_image_counts_require_explicit_groups(self):
+        processor, _ = self._make_capturing_processor(
+            [[1, 4, 4], [1, 4, 8], [1, 4, 12]]
+        )
+        text = [
+            "first <|image_pad|>",
+            "stale <|image_pad|> first <|image_pad|> second <|image_pad|>",
+        ]
+
+        with self.assertRaisesRegex(ValueError, "Cannot unambiguously map"):
+            processor(
+                text=text,
+                images=[_make_image(), _make_image(), _make_image()],
+            )
+
+    def test_more_grouped_images_than_row_markers_is_rejected(self):
+        processor, _ = self._make_capturing_processor(
+            [[1, 4, 4], [1, 4, 8], [1, 4, 12]]
+        )
+        text = ["first <|image_pad|>", "second <|image_pad|>"]
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Text entry 0 contains 1 image placeholders, but 2 images were supplied",
+        ):
+            processor(
+                text=text,
+                images=[[_make_image(), _make_image()], [_make_image()]],
+            )
+
+    def test_image_processor_flattens_grouped_images(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+        processor = Qwen3VLImageProcessor()
+
+        output = processor(images=[[_make_image()], [_make_image()]])
+
+        self.assertEqual(output["image_grid_thw"].shape, (2, 3))
+
     def test_image_processor_honors_per_call_max_pixels(self):
         from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
 

@@ -10,10 +10,14 @@ from .config import DFlashConfig
 
 
 def _build_rope(config: DFlashConfig):
+    # Qwen-family checkpoints normally use split-half (NeoX) pairing. DSpark
+    # checkpoints expose rope_is_neox_style explicitly; MLX calls the
+    # interleaved GPT-J pairing "traditional".
+    traditional = not bool(getattr(config, "rope_is_neox_style", True))
     return initialize_rope(
         dims=config.head_dim,
         base=config.rope_theta,
-        traditional=False,
+        traditional=traditional,
         scaling_config=config.rope_scaling,
         max_position_embeddings=config.max_position_embeddings,
     )
@@ -118,6 +122,8 @@ class DFlashDecoderLayer(nn.Module):
 
 
 class DFlashDraftModel(nn.Module):
+    layer_class = DFlashDecoderLayer
+
     def __init__(self, config: DFlashConfig):
         super().__init__()
         self.config = config
@@ -127,7 +133,7 @@ class DFlashDraftModel(nn.Module):
         self.fc = nn.Linear(concat_dim, config.hidden_size, bias=False)
         self.hidden_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers = [
-            DFlashDecoderLayer(config, i) for i in range(config.num_hidden_layers)
+            self.layer_class(config, i) for i in range(config.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rope = _build_rope(config)
