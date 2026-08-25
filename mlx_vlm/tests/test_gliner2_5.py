@@ -1,4 +1,5 @@
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 from mlx_vlm.gliner import (
@@ -249,3 +250,47 @@ def test_gliner2_rejects_tokenizer_missing_special_tokens():
 
     with pytest.raises(ValueError, match="special tokens"):
         GLiNER2(object(), _Tokenizer())
+
+
+def test_quantized_encoder_still_runs():
+    """A quantized checkpoint must still encode.
+
+    ``mlx_vlm.convert -q`` turns ``rel_embeddings`` into a QuantizedEmbedding,
+    whose ``.weight`` is packed uint32 with a narrower last dimension. Reading
+    that attribute directly instead of calling the module makes the relative
+    embedding LayerNorm reject the shape, so every quantized model fails at
+    inference even though conversion reports success.
+    """
+    config = ModelConfig.from_dict(
+        {
+            "model_type": "extractor",
+            "architecture": "boundary",
+            "encoder_config": {
+                "vocab_size": 512,
+                "hidden_size": 128,
+                "num_attention_heads": 4,
+                "num_hidden_layers": 2,
+                "intermediate_size": 256,
+                "position_buckets": 64,
+                "max_relative_positions": 128,
+            },
+        }
+    )
+    model = Model(config)
+    model.eval()
+    ids = mx.zeros((1, 16), dtype=mx.int32)
+    mask = mx.ones((1, 16), dtype=mx.bool_)
+    reference = model.encode(ids, mask)
+    mx.eval(reference)
+
+    nn.quantize(model.encoder, group_size=64, bits=4)
+    mx.eval(model.parameters())
+
+    assert isinstance(
+        model.encoder.encoder.rel_embeddings, nn.QuantizedEmbedding
+    ), "rel_embeddings should have been quantized for this test to be meaningful"
+    encoded = model.encode(ids, mask)
+    mx.eval(encoded)
+
+    assert encoded.shape == reference.shape
+    assert bool(mx.all(mx.isfinite(encoded.astype(mx.float32))))

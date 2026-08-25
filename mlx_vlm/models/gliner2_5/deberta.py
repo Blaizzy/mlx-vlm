@@ -189,16 +189,20 @@ class DebertaEncoder(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.rel_embeddings = nn.Embedding(
-            config.position_buckets * 2, config.hidden_size
-        )
+        self.num_rel_embeddings = config.position_buckets * 2
+        self.rel_embeddings = nn.Embedding(self.num_rel_embeddings, config.hidden_size)
         self.layers = [DebertaLayer(config) for _ in range(config.num_hidden_layers)]
         self.position_buckets = config.position_buckets
         self.max_relative_positions = config.max_relative_positions
         self.pos_att_type = config.pos_att_type
 
     def __call__(self, states, attention_mask):
-        relative_embeddings = self.layer_norm(self.rel_embeddings.weight)
+        # Read the table through the module, not off ``.weight``: once the
+        # checkpoint is quantized that attribute holds packed uint32 with a
+        # narrower last dimension, which the LayerNorm below would reject.
+        relative_embeddings = self.layer_norm(
+            self.rel_embeddings(mx.arange(self.num_rel_embeddings))
+        )
         position_indices = _position_gather_indices(
             states.shape[1],
             self.position_buckets,
