@@ -15,6 +15,7 @@ across every layer in one graph until the final eval and OOMs anyway.
 
 from __future__ import annotations
 
+import argparse
 import glob
 import json
 import os
@@ -838,16 +839,29 @@ def _n_experts(switch_glu) -> int:
     return int(w.shape[0]) if w is not None else 0
 
 
-def main() -> None:
-    import argparse
-
-    ap = argparse.ArgumentParser(
-        description="Repack an mlx-vlm MoE checkpoint for expert-offload."
+def configure_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Repack an mlx-vlm MoE checkpoint for expert offloading."
     )
-    ap.add_argument("--build", required=True, help="mlx-vlm checkpoint directory")
-    ap.add_argument("--out", required=True, help="output offload directory")
-    a = ap.parse_args()
-    repack(a.build, a.out)
+    parser.add_argument(
+        "--build", required=True, help="mlx-vlm checkpoint directory to repack."
+    )
+    parser.add_argument(
+        "--out", required=True, help="Output directory for the offloaded checkpoint."
+    )
+    parser.add_argument(
+        "--resident-shard-gb",
+        type=float,
+        default=5.0,
+        help="Peak resident shard size while streaming the repack (default: 5.0).",
+    )
+    return parser
+
+
+def main():
+    parser = configure_parser()
+    args = parser.parse_args()
+    repack(**vars(args))
 
 
 if __name__ == "__main__":
