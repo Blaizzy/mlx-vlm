@@ -134,3 +134,34 @@ def test_apodex_mtp_splitter_still_prefers_text_config_model_type(tmp_path):
     )
 
     assert detect_mtp_splitter(tmp_path) is not None
+
+
+def test_apodex_sanitize_passes_through_native_mlx_weights():
+    """Re-loading an already-converted MLX checkpoint must be a no-op.
+
+    Community MLX conversions of Apodex ship fully stacked
+    ``switch_mlp.{weight,scales,biases}`` keys with no ``.experts.`` names and
+    no ``_scale_inv`` sidecars. Sanitize has to leave those alone rather than
+    re-running a conversion over them.
+    """
+    context = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                tie_word_embeddings=False, num_hidden_layers=1, num_experts=2
+            )
+        )
+    )
+    prefix = "language_model.model.layers.0.mlp.switch_mlp"
+    weights = {}
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        weights[f"{prefix}.{projection}.weight"] = mx.zeros((2, 8, 4), mx.uint32)
+        weights[f"{prefix}.{projection}.scales"] = mx.ones((2, 8, 2), mx.bfloat16)
+        weights[f"{prefix}.{projection}.biases"] = mx.zeros((2, 8, 2), mx.bfloat16)
+
+    out = Model.sanitize(context, dict(weights))
+
+    assert set(out) == set(weights)
+    for key, value in weights.items():
+        assert out[key].shape == value.shape
+        assert out[key].dtype == value.dtype
+    assert not any("_scale_inv" in key or ".experts." in key for key in out)
