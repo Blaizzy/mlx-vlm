@@ -609,6 +609,13 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
         raise KeyError("model_type")
     model_type = raw_model_type.lower()
 
+    if (
+        model_type == "extractor"
+        and config.get("architecture") == "boundary"
+        and "BoundaryExtractor" in (config.get("architectures") or ())
+    ):
+        model_type = "gliner2_5"
+
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
     architectures = set(config.get("architectures") or ())
@@ -754,6 +761,17 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     """
     strict = kwargs.pop("strict", True)
     config = load_config(model_path, **kwargs)
+    if (
+        config.get("model_type") == "extractor"
+        and config.get("architecture") == "boundary"
+    ):
+        encoder_config_path = model_path / "encoder_config" / "config.json"
+        if not encoder_config_path.is_file():
+            raise FileNotFoundError(
+                f"GLiNER2.5 encoder config not found: {encoder_config_path}"
+            )
+        with open(encoder_config_path) as f:
+            config["encoder_config"] = json.load(f)
 
     index_file = model_path / "model.safetensors.index.json"
     weight_files = []
