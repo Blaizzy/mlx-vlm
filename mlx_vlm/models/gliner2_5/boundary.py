@@ -333,17 +333,21 @@ class SharedPoolScorer(nn.Module):
         score = score + film.squeeze(-1)
         score_rows = []
         for row in range(score.shape[0]):
+            # Indexing a (queries, positions) plane with a candidate vector puts
+            # the advanced axis first, so every gather below is
+            # (candidates, queries) -- the same layout as ``score[row]``.
             row_score = (
                 score[row]
-                + marginals.start_logits[row, :, starts[row]].T
-                + marginals.end_logits[row, :, ends[row]].T
+                + marginals.start_logits[row, :, starts[row]]
+                + marginals.end_logits[row, :, ends[row]]
             )
-            interval = (
+            inside = (
                 marginals.inside_prefix[row, :, ends[row]]
                 - marginals.inside_prefix[row, :, starts[row]]
-                + marginals.inside_mean[row] * lengths[row][None]
             )
-            row_score = row_score + (interval / mx.sqrt(lengths[row])[None]).T
+            # (queries, 1) * (1, candidates) -> transpose into candidate-major.
+            interval = inside + (marginals.inside_mean[row] * lengths[row][None]).T
+            row_score = row_score + interval / mx.sqrt(lengths[row])[:, None]
             score_rows.append(row_score)
         score = mx.stack(score_rows)
         keep = pooled.mask[..., None] & query_mask[:, None]

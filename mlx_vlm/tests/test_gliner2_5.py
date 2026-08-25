@@ -2,6 +2,11 @@ import mlx.core as mx
 
 from mlx_vlm.gliner import _CharSplitter, _resolve_flat_overlaps, _WhitespaceSplitter
 from mlx_vlm.models.gliner2_5 import Model, ModelConfig
+from mlx_vlm.models.gliner2_5.boundary import (
+    Marginals,
+    PooledCandidates,
+    SharedPoolScorer,
+)
 
 
 def test_nested_encoder_config():
@@ -56,3 +61,44 @@ def test_flat_overlap_resolution_uses_total_score():
     ]
 
     assert _resolve_flat_overlaps(spans) == [(0.6, 0, 1), (0.6, 1, 2)]
+
+
+def test_shared_pool_scorer_keeps_candidate_major_layout():
+    """Span-marginal gathers must stay candidate-major.
+
+    Indexing a ``(queries, positions)`` plane with a candidate vector puts the
+    advanced axis first, so the gather is ``(candidates, queries)`` -- matching
+    ``score``. Transposing it instead makes the scorer unusable for any input
+    where the candidate and query counts differ.
+    """
+    batch, positions, candidates, queries = 1, 6, 5, 3
+    hidden_size, boundary_dim = 16, 8
+    scorer = SharedPoolScorer(
+        hidden_size, boundary_dim, {"pair_dim": 8, "content_dim": 4}
+    )
+
+    starts = mx.array([[0, 1, 2, 0, 3]])
+    ends = mx.array([[2, 3, 4, 5, 5]])
+    pooled = PooledCandidates(
+        indices=mx.stack((starts, ends), axis=-1),
+        mask=mx.ones((batch, candidates), dtype=mx.bool_),
+        compat_logits=mx.zeros((batch, candidates)),
+    )
+    marginals = Marginals(
+        start_logits=mx.zeros((batch, queries, positions)),
+        end_logits=mx.zeros((batch, queries, positions)),
+        inside_prefix=mx.zeros((batch, queries, positions)),
+        inside_mean=mx.zeros((batch, queries, 1)),
+    )
+
+    logits = scorer(
+        mx.zeros((batch, positions, boundary_dim)),
+        mx.zeros((batch, queries, hidden_size)),
+        mx.ones((batch, queries), dtype=mx.bool_),
+        pooled,
+        marginals,
+        mx.zeros((batch, positions, hidden_size)),
+        mx.ones((batch, positions)),
+    )
+
+    assert logits.shape == (batch, candidates, queries)
