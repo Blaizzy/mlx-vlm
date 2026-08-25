@@ -38,6 +38,9 @@ Issues = "https://github.com/Blaizzy/mlx-vlm/issues"
 include = ["mlx_vlm*"]
 exclude = ["mlx_vlm.tests*"]
 
+[tool.setuptools.package-data]
+mlx_vlm = ["py.typed"]
+
 [tool.setuptools.dynamic]
 version = {attr = "mlx_vlm.version.__version__"}
 dependencies = {file = ["requirements.txt"]}
@@ -47,3 +50,4 @@ ui = ["gradio>=5.19.0"]
 cuda = ["mlx-cuda"]
 cpu = ["mlx-cpu"]
 train = ["datasets>=2.19.1"]
+realtime = ["sounddevice>=0.5.0"]

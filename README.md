@@ -9,7 +9,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
   - [Command Line Interface (CLI)](#command-line-interface-cli)
     - [Thinking Budget](#thinking-budget)
   - [Speculative Decoding](#speculative-decoding)
-    - [DFlash (Qwen3.5)](#dflash-qwen35)
+    - [DFlash, DFlash2, and DSpark](#dflash-dflash2-and-dspark)
     - [Gemma 4 MTP](#gemma-4-mtp)
     - [Gemma 4 EAGLE-3](#gemma-4-eagle-3)
     - [MiniMax M3 EAGLE-3](#minimax-m3-eagle-3)
@@ -184,7 +184,7 @@ Speed up generation by drafting several candidate tokens with a small "drafter" 
 
 See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
 
-#### DFlash (Qwen3.5)
+#### DFlash, DFlash2, and DSpark
 
 A lightweight block-diffusion drafter that predicts multiple tokens per round, typically 2–3× faster.
 
@@ -205,6 +205,59 @@ mlx_vlm.generate --model Qwen/Qwen3.5-4B \
 # Server with speculative decoding
 mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --draft-model z-lab/Qwen3.5-4B-DFlash
+```
+
+DFlash2 adds dynamic convolutions and a candidate-path selector. The published
+Qwen3.8-27B checkpoint is auto-detected and uses the shared exact DFlash target
+verification path. For the fastest quantized setup, convert the drafter to
+4-bit; the verifier adapts between three and five rows from recent acceptance:
+
+```sh
+mlx_vlm.convert --hf-path z-lab/Qwen3.8-27B-DFlash2 \
+  --mlx-path Qwen3.8-27B-DFlash2-4bit \
+  --quantize --q-bits 4 --q-group-size 64
+
+mlx_vlm.generate --model mlx-community/Qwen3.8-27B-4bit \
+  --draft-model Qwen3.8-27B-DFlash2-4bit \
+  --prompt "Write a quicksort in Python." \
+  --max-tokens 512 --temperature 0
+
+mlx_vlm.server --model mlx-community/Qwen3.8-27B-4bit \
+  --draft-model Qwen3.8-27B-DFlash2-4bit
+```
+
+Liquid AI's DSpark checkpoint uses a Qwen3-style block drafter plus a learned
+Markov correction head. It is auto-detected and runs through the exact target
+verification path:
+
+```sh
+mlx_vlm.generate --model LiquidAI/LFM2.5-2.6B \
+  --draft-model LiquidAI/LFM2.5-2.6B-DSpark \
+  --prompt "Explain speculative decoding in three sentences." \
+  --max-tokens 256 --temperature 0
+
+mlx_vlm.server --model LiquidAI/LFM2.5-2.6B \
+  --draft-model LiquidAI/LFM2.5-2.6B-DSpark
+```
+
+The published DSpark `block_size: 9` means nine proposals, or ten target rows
+after adding the anchor token. On MLX, DSpark verifies seven proposals plus the
+anchor by default: eight rows exactly fill the verifier threadgroup, while nine
+or ten rows pad to sixteen and run slower. The trained width remains available
+with `--draft-block-size 10`. The checkpoint's confidence head is loaded for
+parity, and DSpark decoding currently requires greedy sampling
+(`temperature=0`).
+
+Muse Glimmer's published assistant checkpoint is auto-detected as DFlash:
+
+```sh
+mlx_vlm.generate --model meta-models/Muse-Glimmer-30B \
+  --draft-model meta-models/Muse-Glimmer-30B-assistant \
+  --prompt "Write a quicksort in Python." \
+  --max-tokens 512 --temperature 0
+
+mlx_vlm.server --model meta-models/Muse-Glimmer-30B \
+  --draft-model meta-models/Muse-Glimmer-30B-assistant
 ```
 
 DFlash draft-cache windowing is available from the Python API. During
@@ -466,8 +519,9 @@ mlx_vlm.server --api-key <secret-token>
 - `--tts-model`: Preload a text-to-speech model at server startup
 - `--stt-model`: Preload a speech-to-text model at server startup
 - `--embedding-model`: Preload an embedding model at server startup
+- `--reranker-model`: Preload a supported reranker model at server startup
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
-- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`, `Inferact/MiniMax-M3-EAGLE3`) — enables speculative decoding for ~2× or higher throughput
+- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.8-27B-DFlash2`, `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`, `Inferact/MiniMax-M3-EAGLE3`) — enables speculative decoding for ~2× or higher throughput
 - `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP)
 - `--draft-block-size`: Override the drafter's configured block size
 - `--host`: Host address (default: `0.0.0.0`)
@@ -1073,9 +1127,11 @@ Structured outputs are not currently supported with speculative decoding.
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
 - `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
+- `/v1/rerank` - Rank text or multimodal documents by relevance to a query
 - `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
 - `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models
 - `/audio/translations` and `/v1/audio/translations` - OpenAI-compatible audio translation endpoint for STT models that expose a translation task
+- `/v1/realtime` - WebSocket-based realtime full-duplex speech. See the [Nemotron VoiceChat guide](mlx_vlm/models/nemotron_voicechat/README.md#realtime-websocket-api) for supported models and usage.
 - `/health` - Check server status
 - `/metrics` and `/v1/metrics` - Inspect rolling request metrics, throughput, and runtime counters
 - `/unload` - Unload all loaded model caches from memory
@@ -1100,6 +1156,22 @@ curl -X POST "http://localhost:8080/v1/embeddings" \
 ```
 
 Preload a default with `--embedding-model <repo-or-path>`. Supported architectures: BERT, XLM-RoBERTa, ModernBERT, Qwen3-Embedding, EmbeddingGemma (gemma3), LFM2, SigLIP (text), Qwen3-VL-Embedding, and Llama-Nemotron-VL, plus LLM2Vec bidirectional Llama. ColBERT-style multi-vector models (ColIdefics3, ColQwen2.5) are also available for late-interaction use.
+
+##### Reranking
+
+```sh
+curl -X POST "http://localhost:8080/v1/rerank" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen3-Reranker-0.6B-4bit",
+    "query": "What is the capital of France?",
+    "documents": ["Berlin is in Germany.", "Paris is the capital of France."],
+    "top_n": 1,
+    "return_documents": true
+  }'
+```
+
+Preload a default with `--reranker-model <repo-or-path>`. Supported text rerankers include one-label BERT, XLM-RoBERTa, and ModernBERT sequence-classification checkpoints, plus Qwen3 generative rerankers. Qwen3-VL rerankers also accept objects containing `text`, `image`, `image_url`, `video`, or `video_url`. Sequence-classification rerankers accept text pairs and do not support custom instructions.
 
 ##### Text Input
 

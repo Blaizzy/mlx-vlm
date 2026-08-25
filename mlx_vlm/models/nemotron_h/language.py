@@ -74,6 +74,27 @@ class NemotronHMamba2Mixer(nn.Module):
             self.intermediate_size, self.hidden_size, bias=args.mamba_proj_bias
         )
 
+    def _split_projected_states(self, projected: mx.array):
+        # Nemotron-H checkpoints may tensor-core-pad the projection with two
+        # unused ``d_mlp`` branches. The reference derives their width from the
+        # loaded weight rather than the config and discards them before gate.
+        base_size = self.intermediate_size + self.conv_dim + self.num_heads
+        extra_size = projected.shape[-1] - base_size
+        if extra_size < 0 or extra_size % 2:
+            raise ValueError(
+                "invalid Nemotron-H Mamba projection width: "
+                f"got {projected.shape[-1]}, expected {base_size} plus an even padding"
+            )
+        d_mlp = extra_size // 2
+        gate_start = 2 * d_mlp
+        conv_start = gate_start + self.intermediate_size
+        dt_start = conv_start + self.conv_dim
+        return (
+            projected[..., gate_start:conv_start],
+            projected[..., conv_start:dt_start],
+            projected[..., dt_start:],
+        )
+
     def _conv(
         self,
         conv_input: mx.array,
@@ -126,9 +147,8 @@ class NemotronHMamba2Mixer(nn.Module):
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
         if cache:
             state = cache[1]
-            lengths = cache.lengths
         else:
-            state, lengths = None, None
+            state = None
 
         y, state = ssm_update(
             hidden_states,
@@ -156,11 +176,7 @@ class NemotronHMamba2Mixer(nn.Module):
 
         projected = self.in_proj(hidden_states)
 
-        gate, conv_input, dt = mx.split(
-            projected,
-            [self.intermediate_size, self.intermediate_size + self.conv_dim],
-            axis=-1,
-        )
+        gate, conv_input, dt = self._split_projected_states(projected)
         conv_output = self._conv(conv_input, cache, mask)
         hidden_states_ssm, B, C = mx.split(
             conv_output,
@@ -397,9 +413,11 @@ class NemotronHBlock(nn.Module):
 
 
 class NemotronHModel(nn.Module):
-    def __init__(self, args: ModelConfig):
+    def __init__(self, args: ModelConfig, with_embeddings: bool = True):
         super().__init__()
-        self.embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.with_embeddings = with_embeddings
+        if with_embeddings:
+            self.embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
             NemotronHBlock(args, block_type)
             for block_type in args.hybrid_override_pattern
@@ -420,15 +438,27 @@ class NemotronHModel(nn.Module):
 
     def __call__(
         self,
-        inputs,
+        inputs=None,
         cache: Optional[Any] = None,
+        inputs_embeds: Optional[mx.array] = None,
     ):
-        hidden_states = self.embeddings(inputs)
+        if (inputs is None) == (inputs_embeds is None):
+            raise ValueError("Provide exactly one of inputs or inputs_embeds")
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        elif self.with_embeddings:
+            hidden_states = self.embeddings(inputs)
+        else:
+            raise ValueError("This Nemotron-H backbone has no token embedding table")
 
         if cache is None:
             cache = [None] * len(self.layers)
-        attn_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
+        has_attention = any(layer.block_type == "*" for layer in self.layers)
+        has_mamba = any(layer.block_type == "M" for layer in self.layers)
+        attn_cache = cache[self.fa_idx] if has_attention else None
+        ssm_cache = cache[self.ssm_idx] if has_mamba else None
+        attn_mask = create_attention_mask(hidden_states, attn_cache)
+        ssm_mask = create_ssm_mask(hidden_states, ssm_cache)
 
         cache_counter = 0
         for layer in self.layers:
@@ -469,10 +499,10 @@ class Model(nn.Module):
 
     def make_cache(self):
         caches = []
-        for l in self.layers:
-            if l.block_type == "M":
+        for layer in self.layers:
+            if layer.block_type == "M":
                 caches.append(ArraysCache(size=2))
-            elif l.block_type == "*":
+            elif layer.block_type == "*":
                 caches.append(KVCache())
         return caches
 
@@ -482,8 +512,8 @@ class Model(nn.Module):
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
 
-        for l in range(self.args.num_hidden_layers):
-            prefix = f"backbone.layers.{l}.mixer"
+        for layer_idx in range(self.args.num_hidden_layers):
+            prefix = f"backbone.layers.{layer_idx}.mixer"
             for m, n in [("down_proj", "fc2"), ("up_proj", "fc1")]:
                 if f"{prefix}.experts.0.{m}.weight" in weights:
                     to_join = [
@@ -520,7 +550,7 @@ class LanguageModel(nn.Module):
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
-        out = self.backbone(inputs, cache=cache)
+        out = self.backbone(inputs, cache=cache, inputs_embeds=inputs_embeds)
         return LanguageModelOutput(logits=self.lm_head(out))
 
     def sanitize(self, weights):

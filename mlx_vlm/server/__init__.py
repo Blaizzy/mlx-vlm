@@ -55,7 +55,6 @@ from .generation import (
     DEFAULT_ENABLE_THINKING,
     DEFAULT_LOG_PROGRESS_INTERVAL,
     DEFAULT_SPECULATIVE_BATCH_COALESCE_MS,
-    DEFAULT_TOKEN_QUEUE_TIMEOUT,
     METRICS_HISTORY_LIMIT,
     METRICS_RECENT_LIMIT,
     BatchGenerator,
@@ -115,6 +114,7 @@ from .responses_state import (
 from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
     _store_response,
+    make_response_stream_state,
     process_tool_calls,
     prompt_has_open_thinking,
     response_store,
@@ -123,6 +123,7 @@ from .responses_state import (
     suppress_tool_call_content,
 )
 from .runtime import ModelCacheRegistry, runtime
+from .runtime_config import DEFAULT_TOKEN_QUEUE_TIMEOUT
 from .schemas import (
     AnthropicMessageParam,
     AnthropicMessageResponse,

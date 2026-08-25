@@ -156,6 +156,55 @@ class _BaseCache:
         return None
 
 
+class ConcatenateKVCache(_BaseCache):
+    def __init__(self):
+        self.keys = None
+        self.values = None
+        self.offset = 0
+
+    def update_and_fetch(self, keys, values):
+        if self.keys is None:
+            self.keys = keys
+            self.values = values
+        else:
+            self.keys = mx.concatenate([self.keys, keys], axis=-2)
+            self.values = mx.concatenate([self.values, values], axis=-2)
+        self.offset = self.keys.shape[-2]
+        return self.keys, self.values
+
+    @property
+    def state(self):
+        return self.keys, self.values
+
+    @state.setter
+    def state(self, value):
+        self.keys, self.values = value
+        self.offset = 0 if self.keys is None else self.keys.shape[-2]
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        if self.keys is not None:
+            self.keys = self.keys[..., : self.offset, :]
+            self.values = self.values[..., : self.offset, :]
+        return n
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
+
+
 def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
     """Dequantize uniform-quantized K/V tuples to raw float arrays.
 
@@ -165,16 +214,16 @@ def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
     if keys_tuple is None or values_tuple is None or length == 0:
         return None, None
     keys = mx.dequantize(
-        keys_tuple[0][..., :length, :],
-        keys_tuple[1][..., :length, :],
-        keys_tuple[2][..., :length, :],
+        mx.contiguous(keys_tuple[0][..., :length, :]),
+        mx.contiguous(keys_tuple[1][..., :length, :]),
+        mx.contiguous(keys_tuple[2][..., :length, :]),
         group_size=group_size,
         bits=bits,
     )
     values = mx.dequantize(
-        values_tuple[0][..., :length, :],
-        values_tuple[1][..., :length, :],
-        values_tuple[2][..., :length, :],
+        mx.contiguous(values_tuple[0][..., :length, :]),
+        mx.contiguous(values_tuple[1][..., :length, :]),
+        mx.contiguous(values_tuple[2][..., :length, :]),
         group_size=group_size,
         bits=bits,
     )
@@ -342,6 +391,26 @@ class KVCache(_BaseCache):
         n = min(self.offset, n)
         self.offset -= n
         return n
+
+    def extract(self, idx):
+        cache = KVCache()
+        if self.keys is None:
+            if idx not in (0, -1):
+                raise IndexError("KVCache row index out of range")
+            return cache
+
+        batch_size = int(self.keys.shape[0])
+        if idx < 0:
+            idx += batch_size
+        if idx < 0 or idx >= batch_size:
+            raise IndexError(
+                f"KVCache row index {idx} out of range for batch size {batch_size}"
+            )
+
+        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, : self.offset, :])
+        cache.values = mx.contiguous(self.values[idx : idx + 1, :, : self.offset, :])
+        cache.offset = self.offset
+        return cache
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
@@ -557,8 +626,10 @@ class RotatingKVCache(_BaseCache):
 class ArraysCache(_BaseCache):
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
-        instance.left_padding = None
-        instance.lengths = None
+        instance._left_padding = None
+        instance._left_padding_advance = 0
+        instance._lengths = None
+        instance._lengths_advance = 0
         return instance
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
@@ -567,14 +638,40 @@ class ArraysCache(_BaseCache):
             self.left_padding = mx.array(left_padding)
 
     @property
+    def left_padding(self):
+        if self._left_padding is None:
+            return None
+        if self._left_padding_advance == 0:
+            return self._left_padding
+        return self._left_padding - self._left_padding_advance
+
+    @left_padding.setter
+    def left_padding(self, value):
+        self._left_padding = value
+        self._left_padding_advance = 0
+
+    @property
+    def lengths(self):
+        if self._lengths is None:
+            return None
+        if self._lengths_advance == 0:
+            return self._lengths
+        return self._lengths - self._lengths_advance
+
+    @lengths.setter
+    def lengths(self, value):
+        self._lengths = value
+        self._lengths_advance = 0
+
+    @property
     def batch_size(self):
         for c in self.cache:
             if c is not None:
                 return c.shape[0]
-        if self.left_padding is not None:
-            return self.left_padding.size
-        elif self.lengths is not None:
-            return self.lengths.size
+        if self._left_padding is not None:
+            return self._left_padding.size
+        elif self._lengths is not None:
+            return self._lengths.size
         else:
             return 1
 
@@ -646,10 +743,10 @@ class ArraysCache(_BaseCache):
         self.left_padding = None
 
     def advance(self, N):
-        if self.lengths is not None:
-            self.lengths -= N
-        if self.left_padding is not None:
-            self.left_padding -= N
+        if self._lengths is not None:
+            self._lengths_advance += N
+        if self._left_padding is not None:
+            self._left_padding_advance += N
 
     def make_mask(self, N: int):
         if self.left_padding is not None:
@@ -985,6 +1082,8 @@ class BatchKVCache(_BaseCache):
             self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
+        if self._right_padding is not None:
+            self._right_padding = self._right_padding[batch_indices]
 
         # Shift left to reduce padding
         min_left_pad = self.left_padding.min().item()
@@ -1341,6 +1440,8 @@ class BatchRotatingKVCache(_BaseCache):
             self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
+        if self._lengths is not None:
+            self._lengths = self._lengths[batch_indices]
 
     def extend(self, other):
         """
@@ -1433,7 +1534,7 @@ class BatchRotatingKVCache(_BaseCache):
         keys = mx.zeros((B, H, max_length, Dk), dtype=dt)
         values = mx.zeros((B, H, max_length, Dv), dtype=dt)
         for i, (p, length, c) in enumerate(zip(padding, lengths, caches)):
-            if c.keys is None:
+            if c.keys is None or length == 0:
                 continue
             keys[i : i + 1, :, p : p + length] = c._temporal_order(c.keys)[
                 ..., -length:, :
@@ -1789,6 +1890,8 @@ class BatchQuantizedKVCache(_BaseCache):
             self.values = tuple(v[batch_indices] for v in self.values)
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
+        if self._right_padding is not None:
+            self._right_padding = self._right_padding[batch_indices]
 
         min_lp = self.left_padding.min().item()
         if min_lp > 0:
@@ -2043,6 +2146,14 @@ class PoolingCache(_BaseCache):
     def meta_state(self, v):
         self.ratio = v
 
+    @classmethod
+    def from_state(cls, state, meta_state):
+        # Restoring buffered state calls ``accumulate_windows``, which needs
+        # the compression ratio before the generic state setter can run.
+        obj = cls(meta_state)
+        obj.state = state
+        return obj
+
     def is_trimmable(self):
         return self.pooled is None
 
@@ -2067,8 +2178,8 @@ class PoolingCache(_BaseCache):
         return total
 
     @classmethod
-    def merge(cls, caches):
-        return BatchPoolingCache.merge(caches)
+    def merge(cls, caches, prefix_lens=None):
+        return BatchPoolingCache.merge(caches, prefix_lens)
 
 
 class BatchPoolingCache(_BaseCache):
@@ -2077,8 +2188,9 @@ class BatchPoolingCache(_BaseCache):
     def __init__(self, ratio: int, left_padding: List[int]):
         self.ratio = ratio
 
-        if not all(p == 0 for p in left_padding):
-            raise RuntimeError("BatchPoolingCache does not support left padding")
+        if isinstance(left_padding, mx.array):
+            left_padding = left_padding.tolist()
+        self.left_padding = [int(p) for p in left_padding]
 
         batch_size = len(left_padding)
 
@@ -2098,7 +2210,22 @@ class BatchPoolingCache(_BaseCache):
 
     def prepare(self, *, lengths=None, right_padding=None, left_padding=None):
         if left_padding is not None:
-            raise RuntimeError("BatchPoolingCache does not support left padding")
+            if (
+                self.buf_kv is not None
+                or self.pooled is not None
+                or any(self.remainder)
+            ):
+                raise ValueError(
+                    "Left padding can only be added to an empty BatchPoolingCache"
+                )
+            if isinstance(left_padding, mx.array):
+                left_padding = left_padding.tolist()
+            if len(left_padding) != len(self.left_padding):
+                raise ValueError("Left padding must match the cache batch size")
+            self.left_padding = [
+                current + int(pad)
+                for current, pad in zip(self.left_padding, left_padding)
+            ]
         if lengths is not None:
             self._lengths = [
                 processed + length
@@ -2113,16 +2240,25 @@ class BatchPoolingCache(_BaseCache):
         _, _, D2 = gate.shape
         ratio = self.ratio
 
+        if not (
+            len(self.left_padding) == len(self._lengths) == len(self._processed) == B
+        ):
+            raise ValueError("Pooling cache metadata must match the input batch size")
+
         if self.buf_kv is None:
             self.buf_kv = mx.zeros((B, ratio, D1), dtype=kv.dtype)
             self.buf_gate = mx.zeros((B, ratio, D2), dtype=gate.dtype)
 
-        valid_lengths = [
-            min(length - processed, L)
-            for length, processed in zip(self._lengths, self._processed)
+        # Each row can start at a different physical position because prompt
+        # batches are left-padded. Only logical tokens participate in pooling.
+        starts = [min(pad, L) for pad in self.left_padding]
+        self.left_padding = [
+            pad - start for pad, start in zip(self.left_padding, starts)
         ]
-        if max(valid_lengths) != L:
-            raise RuntimeError()
+        valid_lengths = [
+            max(0, min(length - processed, L - start))
+            for length, processed, start in zip(self._lengths, self._processed, starts)
+        ]
         for i in range(B):
             self._processed[i] += valid_lengths[i]
 
@@ -2136,8 +2272,9 @@ class BatchPoolingCache(_BaseCache):
             for i in range(B):
                 r = self.remainder[i]
                 vl = valid_lengths[i]
-                self.buf_kv[i, r : r + vl] = kv[i, :vl]
-                self.buf_gate[i, r : r + vl] = gate[i, :vl]
+                start = starts[i]
+                self.buf_kv[i, r : r + vl] = kv[i, start : start + vl]
+                self.buf_gate[i, r : r + vl] = gate[i, start : start + vl]
             self.remainder = new_remainder
 
             r_kv = mx.zeros((B, 0, D1), dtype=kv.dtype)
@@ -2158,6 +2295,7 @@ class BatchPoolingCache(_BaseCache):
             vl = valid_lengths[i]
             u = usable[i]
             nr = new_remainder[i]
+            start = starts[i]
 
             if u > 0:
                 # Tokens from the buffer (the leftover from last call)
@@ -2167,11 +2305,13 @@ class BatchPoolingCache(_BaseCache):
 
                 # Tokens from the new input that complete full windows
                 consume = u - r
-                r_kv[i, r : r + consume] = kv[i, :consume]
-                r_gate[i, r : r + consume] = gate[i, :consume]
+                r_kv[i, r : r + consume] = kv[i, start : start + consume]
+                r_gate[i, r : r + consume] = gate[i, start : start + consume]
 
                 r_base[i] = (
-                    offset[i] - r if isinstance(offset, mx.array) else offset - r
+                    offset[i] + start - r
+                    if isinstance(offset, mx.array)
+                    else offset + start - r
                 )
 
             # Fill new remainder buffer from the tail of the input
@@ -2179,8 +2319,8 @@ class BatchPoolingCache(_BaseCache):
                 if u > 0:
                     # Old remainder was consumed into usable output;
                     # new remainder is purely from the tail of new input.
-                    new_buf_kv[i, :nr] = kv[i, vl - nr : vl]
-                    new_buf_gate[i, :nr] = gate[i, vl - nr : vl]
+                    new_buf_kv[i, :nr] = kv[i, start + vl - nr : start + vl]
+                    new_buf_gate[i, :nr] = gate[i, start + vl - nr : start + vl]
                 else:
                     # No full window produced: carry over old buffer and
                     # append any new valid tokens.
@@ -2188,8 +2328,8 @@ class BatchPoolingCache(_BaseCache):
                         new_buf_kv[i, :r] = self.buf_kv[i, :r]
                         new_buf_gate[i, :r] = self.buf_gate[i, :r]
                     if vl > 0:
-                        new_buf_kv[i, r : r + vl] = kv[i, :vl]
-                        new_buf_gate[i, r : r + vl] = gate[i, :vl]
+                        new_buf_kv[i, r : r + vl] = kv[i, start : start + vl]
+                        new_buf_gate[i, r : r + vl] = gate[i, start : start + vl]
 
         self.buf_kv = new_buf_kv
         self.buf_gate = new_buf_gate
@@ -2272,11 +2412,28 @@ class BatchPoolingCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return (self.ratio, self.remainder, self._pool_lengths, self._processed)
+        return (
+            self.ratio,
+            self.remainder,
+            self._pool_lengths,
+            self._processed,
+            self.left_padding,
+        )
 
     @meta_state.setter
     def meta_state(self, v):
-        self.ratio, self.remainder, self._pool_lengths, self._processed = v
+        if len(v) == 4:
+            self.ratio, self.remainder, self._pool_lengths, self._processed = v
+            self.left_padding = [0] * len(self.remainder)
+        else:
+            (
+                self.ratio,
+                self.remainder,
+                self._pool_lengths,
+                self._processed,
+                self.left_padding,
+            ) = v
+        self._lengths = [2**31] * len(self.remainder)
 
     def is_trimmable(self):
         return self.pooled is None
@@ -2319,6 +2476,7 @@ class BatchPoolingCache(_BaseCache):
         self._pool_lengths = [self._pool_lengths[i] for i in idx_list]
         self._lengths = [self._lengths[i] for i in idx_list]
         self._processed = [self._processed[i] for i in idx_list]
+        self.left_padding = [self.left_padding[i] for i in idx_list]
 
     def extend(self, other):
         # Merge the remainder buffers
@@ -2392,6 +2550,7 @@ class BatchPoolingCache(_BaseCache):
         self._pool_lengths = self._pool_lengths + other._pool_lengths
         self._lengths = self._lengths + other._lengths
         self._processed = self._processed + other._processed
+        self.left_padding = self.left_padding + other.left_padding
 
     def extract(self, idx):
         cache = PoolingCache(self.ratio)
@@ -2409,8 +2568,11 @@ class BatchPoolingCache(_BaseCache):
         return cache
 
     @classmethod
-    def merge(cls, caches):
+    def merge(cls, caches, prefix_lens=None):
         """Merge a list of PoolingCache instances into a BatchPoolingCache."""
+        # APC passes prefix lengths to custom merge implementations. Pooling
+        # caches derive progress from each row's pooled length and remainder.
+        del prefix_lens
         B = len(caches)
         if not all(c.ratio == caches[0].ratio for c in caches):
             raise ValueError(

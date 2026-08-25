@@ -8,7 +8,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..generate import generate, stream_generate
@@ -21,8 +21,9 @@ from .generation import (
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
+from .openai import _prepare_chat_tool_choice
 from .responses_state import (
-    ThinkingStreamState,
+    make_response_stream_state,
     process_tool_calls,
     prompt_has_open_thinking,
     suppress_tool_call_content,
@@ -366,6 +367,11 @@ def _anthropic_messages_to_internal(
 
     tools = _anthropic_tools_to_openai(request.tools)
     tool_choice = _anthropic_tool_choice_to_openai(request.tool_choice)
+    # Passing tool_choice through as a template kwarg only constrains the models
+    # whose chat template reads it, so enforce it the way /v1/chat/completions does.
+    processed_messages, tools, tool_choice = _prepare_chat_tool_choice(
+        processed_messages, tools, tool_choice
+    )
     return processed_messages, images, tools, tool_choice
 
 
@@ -431,15 +437,11 @@ def _apply_stop_sequences(
 
 
 def _anthropic_content_from_generation(
-    full_text: str,
+    reasoning: Optional[str],
+    content: str,
     parsed_tool_calls: Optional[List[Any]] = None,
     include_thinking: bool = False,
-    thinking_start_token: Optional[str] = None,
-    thinking_end_token: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    reasoning, content = _split_thinking(
-        full_text, thinking_start_token, thinking_end_token
-    )
     blocks: List[Dict[str, Any]] = []
     if include_thinking and reasoning:
         blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
@@ -473,9 +475,12 @@ async def anthropic_messages_endpoint(http_request: Request):
         )
         model, processor, config = get_cached_model(request.model, adapter_path)
 
-        processed_messages, images, tools, tool_choice = (
-            _anthropic_messages_to_internal(request)
-        )
+        try:
+            processed_messages, images, tools, tool_choice = (
+                _anthropic_messages_to_internal(request)
+            )
+        except HTTPException as e:
+            return _anthropic_error_response(e.status_code, str(e.detail))
         tool_parser_type = _infer_tool_parser_from_processor(processor)
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
 
@@ -540,7 +545,8 @@ async def anthropic_messages_endpoint(http_request: Request):
                 open_block_type = None
                 full_output = ""
                 text_output = ""
-                thinking_state = ThinkingStreamState(
+                thinking_state = make_response_stream_state(
+                    processor,
                     prompt_has_open_thinking(
                         formatted_prompt,
                         gen_args.enable_thinking,
@@ -944,23 +950,32 @@ async def anthropic_messages_endpoint(http_request: Request):
                 metrics.record_result(result)
                 finish_reason = getattr(result, "finish_reason", None) or "stop"
 
+            reasoning, content = _split_thinking(
+                full_text,
+                gen_args.thinking_start_token,
+                gen_args.thinking_end_token,
+                processor=processor,
+            )
             parsed_tool_calls = None
-            response_text = full_text
             if tool_module is not None and tools:
                 tc = process_tool_calls(full_text, tool_module, tools)
                 if tc["calls"]:
                     parsed_tool_calls = tc["calls"]
-                    response_text = tc["remaining_text"] or ""
+                    _, content = _split_thinking(
+                        tc["remaining_text"] or "",
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
+                        processor=processor,
+                    )
 
-            response_text, stop_sequence = _apply_stop_sequences(
-                response_text, request.stop_sequences
+            content, stop_sequence = _apply_stop_sequences(
+                content, request.stop_sequences
             )
             content_blocks = _anthropic_content_from_generation(
-                response_text,
+                reasoning,
+                content,
                 parsed_tool_calls=parsed_tool_calls,
                 include_thinking=bool(gen_args.enable_thinking),
-                thinking_start_token=gen_args.thinking_start_token,
-                thinking_end_token=gen_args.thinking_end_token,
             )
             stop_reason = _anthropic_stop_reason(
                 finish_reason,
@@ -1053,9 +1068,12 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
         body = _normalize_anthropic_system_messages(await http_request.json())
         request = _anthropic_request_with_derived_fields(AnthropicRequest(**body))
         model, processor, config = get_cached_model(request.model)
-        processed_messages, images, tools, tool_choice = (
-            _anthropic_messages_to_internal(request)
-        )
+        try:
+            processed_messages, images, tools, tool_choice = (
+                _anthropic_messages_to_internal(request)
+            )
+        except HTTPException as e:
+            return _anthropic_error_response(e.status_code, str(e.detail))
         gen_args = _build_gen_args(
             request, processor, tenant_id=_read_tenant_id(http_request)
         )

@@ -19,6 +19,8 @@ from mlx.utils import tree_flatten, tree_map
 import mlx_vlm.models.deepseek_v4.language as deepseek_language
 import mlx_vlm.models.gemma4.language as gemma4_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
+import mlx_vlm.models.qwen3_5.speculative_verifier as qwen_verifier
+import mlx_vlm.models.qwen3_5_moe.language as qwen_moe_language
 import mlx_vlm.speculative.mtp as mtp_utils
 from mlx_vlm.models.cache import (
     ArraysCache,
@@ -403,6 +405,26 @@ def test_qwen_gated_delta_accept_states_matches_python_gather():
     assert bool(mx.array_equal(ref_conv, out_conv).item())
 
 
+def test_qwen_gated_delta_accept_states_uses_live_state_after_last_saved_step():
+    intermediate_states = mx.zeros((1, 2, 2, 3, 5), dtype=mx.float32)
+    conv_input = mx.zeros((1, 5, 6), dtype=mx.float32)
+    live_state = mx.full((1, 2, 3, 5), 7.0, dtype=mx.float32)
+    live_conv = mx.full((1, 3, 6), 8.0, dtype=mx.float32)
+
+    state, conv = qwen_language.gated_delta_accept_states(
+        intermediate_states,
+        conv_input,
+        live_state,
+        live_conv,
+        mx.array([2], dtype=mx.int32),
+        kernel_size=4,
+    )
+    mx.eval(state, conv)
+
+    assert bool(mx.array_equal(state, live_state).item())
+    assert bool(mx.array_equal(conv, live_conv).item())
+
+
 def test_qwen_rollback_speculative_cache_zero_inits_missing_state():
     accepted = mx.array([1, 0], dtype=mx.int32)
     caches = [ArraysCache(size=2)]
@@ -442,26 +464,42 @@ def test_qwen_gdn_sink_captures_intermediate_states_for_batched_verify():
     layer = qwen_language.Qwen3_5GatedDeltaNet(config)
     sink = []
 
-    def fake_update(q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=True):
+    def fake_update(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        mask,
+        use_kernel=True,
+        state_steps=None,
+    ):
         del k, v, a, b, A_log, dt_bias, state, mask, use_kernel
         B, S = q.shape[:2]
+        state_steps = S if state_steps is None else state_steps
         out = mx.zeros((B, S, 2, 4), dtype=mx.float32)
         next_state = mx.zeros((B, 2, 4, 4), dtype=mx.float32)
-        states = mx.ones((B, S, 2, 4, 4), dtype=mx.float32)
+        states = mx.ones((B, state_steps, 2, 4, 4), dtype=mx.float32)
         return out, next_state, states
 
+    verifier = qwen_verifier.Qwen3_5ExactSpeculativeVerifier()
     with patch.object(
-        qwen_language, "gated_delta_update_with_states", side_effect=fake_update
+        qwen_verifier, "gated_delta_update_with_states", side_effect=fake_update
     ):
-        out = layer(
+        out = verifier._gated_delta(
+            layer,
             mx.zeros((2, 3, 16), dtype=mx.float32),
-            cache=ArraysCache(size=2),
-            gdn_sink=sink,
+            None,
+            ArraysCache(size=2),
+            sink,
         )
 
     mx.eval(out)
     assert out.shape == (2, 3, 16)
-    assert sink[0][11].shape == (2, 3, 2, 4, 4)
+    assert sink[0][11].shape == (2, 2, 2, 4, 4)
 
 
 def test_qwen_gdn_sink_captures_intermediate_states_for_singleton_verify():
@@ -477,26 +515,42 @@ def test_qwen_gdn_sink_captures_intermediate_states_for_singleton_verify():
     layer = qwen_language.Qwen3_5GatedDeltaNet(config)
     sink = []
 
-    def fake_update(q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=True):
+    def fake_update(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        mask,
+        use_kernel=True,
+        state_steps=None,
+    ):
         del k, v, a, b, A_log, dt_bias, state, mask, use_kernel
         B, S = q.shape[:2]
+        state_steps = S if state_steps is None else state_steps
         out = mx.zeros((B, S, 2, 4), dtype=mx.float32)
         next_state = mx.zeros((B, 2, 4, 4), dtype=mx.float32)
-        states = mx.ones((B, S, 2, 4, 4), dtype=mx.float32)
+        states = mx.ones((B, state_steps, 2, 4, 4), dtype=mx.float32)
         return out, next_state, states
 
+    verifier = qwen_verifier.Qwen3_5ExactSpeculativeVerifier()
     with patch.object(
-        qwen_language, "gated_delta_update_with_states", side_effect=fake_update
+        qwen_verifier, "gated_delta_update_with_states", side_effect=fake_update
     ):
-        out = layer(
+        out = verifier._gated_delta(
+            layer,
             mx.zeros((1, 3, 16), dtype=mx.float32),
-            cache=ArraysCache(size=2),
-            gdn_sink=sink,
+            None,
+            ArraysCache(size=2),
+            sink,
         )
 
     mx.eval(out)
     assert out.shape == (1, 3, 16)
-    assert sink[0][11].shape == (1, 3, 2, 4, 4)
+    assert sink[0][11].shape == (1, 2, 2, 4, 4)
 
 
 def test_qwen_gdn_verify_update_matches_stepwise_path():
@@ -531,12 +585,37 @@ def test_qwen_gdn_verify_update_matches_stepwise_path():
         states.append(current_state)
 
     ref = (mx.concatenate(outputs, axis=1), current_state, mx.stack(states, axis=1))
-    out = qwen_language._gated_delta_update_verify_decode(
+    out = qwen_verifier.gated_delta_update_with_states(
         q, k, v, a, b, A_log, dt_bias, state, None, use_kernel=False
     )
     mx.eval(*ref, *out)
 
     assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
+
+
+def test_qwen_gdn_verify_can_omit_the_live_final_state():
+    mx.random.seed(27)
+    B, S, Hk, D, Hv, Dv = 1, 3, 2, 64, 4, 16
+    q = mx.random.normal((B, S, Hk, D)).astype(mx.bfloat16)
+    k = mx.random.normal((B, S, Hk, D)).astype(mx.bfloat16)
+    v = mx.random.normal((B, S, Hv, Dv)).astype(mx.bfloat16)
+    a = mx.random.normal((B, S, Hv)).astype(mx.bfloat16)
+    b = mx.random.normal((B, S, Hv)).astype(mx.bfloat16)
+    A_log = mx.random.normal((Hv,)).astype(mx.bfloat16)
+    dt_bias = mx.ones((Hv,), dtype=mx.bfloat16)
+    state = mx.zeros((B, Hv, Dv, D), dtype=mx.float32)
+
+    full = qwen_verifier.gated_delta_update_with_states(
+        q, k, v, a, b, A_log, dt_bias, state, state_steps=S
+    )
+    shortened = qwen_verifier.gated_delta_update_with_states(
+        q, k, v, a, b, A_log, dt_bias, state, state_steps=S - 1
+    )
+    mx.eval(*full, *shortened)
+
+    assert bool(mx.array_equal(full[0], shortened[0]).item())
+    assert bool(mx.array_equal(full[1], shortened[1]).item())
+    assert bool(mx.array_equal(full[2][:, :-1], shortened[2]).item())
 
 
 def test_qwen_target_verify_linear_matches_singleton_dense_gemv():
@@ -556,7 +635,7 @@ def test_qwen_target_verify_linear_matches_singleton_dense_gemv():
         ],
         axis=0,
     )
-    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    out = qwen_verifier._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -569,7 +648,7 @@ def test_qwen_target_verify_gemv_kernel_matches_singleton_dense_gemv():
     x = mx.random.normal((1, 4, 256)).astype(mx.bfloat16)
 
     ref = mx.concatenate([linear(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
-    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    out = qwen_verifier._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -582,8 +661,8 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_path():
     linear.biases = linear.biases.astype(mx.bfloat16)
     x = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
 
-    ref = qwen_language._target_verify_timewise(linear, x)
-    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    ref = qwen_verifier._target_verify_timewise(linear, x)
+    out = qwen_verifier._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -597,7 +676,62 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
     x = mx.random.normal((1, 3, 512)).astype(mx.bfloat16)
 
     ref = linear(x)
-    out = qwen_language._target_verify_quantized_linear(linear, x)
+    out = qwen_verifier._target_verify_quantized_linear(linear, x)
+    mx.eval(ref, out)
+
+    # The target kernel and MLX's quantized GEMM accumulate in different
+    # orders, so BF16 rounding can differ by a small amount.
+    assert bool(mx.allclose(ref, out, rtol=1e-2, atol=1e-2).item())
+
+
+@pytest.mark.parametrize("input_dims", [512, 6144])
+@pytest.mark.parametrize("verify_length", [3, 4, 6, 7, 8])
+def test_qwen_target_verify_4bit_linear_matches_singleton_path_exactly(
+    input_dims, verify_length
+):
+    mx.random.seed(31 + input_dims + verify_length)
+    linear = nn.QuantizedLinear(input_dims, 16, bias=False, group_size=64, bits=4)
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    x = mx.random.normal((1, verify_length, input_dims)).astype(mx.bfloat16)
+
+    ref = qwen_verifier._target_verify_timewise(linear, x)
+    out = qwen_verifier._target_verify_linear(linear, x)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+@pytest.mark.parametrize("output_dims", [(16, 24), (16, 24, 32), (8, 16, 24, 32)])
+@pytest.mark.parametrize("verify_length", [3, 6, 8])
+def test_qwen_target_verify_4bit_linears_fuse_exactly(output_dims, verify_length):
+    mx.random.seed(51 + len(output_dims) + verify_length)
+    linears = tuple(
+        nn.QuantizedLinear(512, output_dim, bias=False, group_size=64, bits=4)
+        for output_dim in output_dims
+    )
+    for linear in linears:
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+    x = mx.random.normal((1, verify_length, 512)).astype(mx.bfloat16)
+
+    ref = tuple(qwen_verifier._target_verify_timewise(linear, x) for linear in linears)
+    out = qwen_verifier._target_verify_linears(linears, x)
+    mx.eval(*ref, *out)
+
+    assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
+
+
+@pytest.mark.parametrize("input_dims", [512, 6144])
+def test_qwen_target_verify_8bit_linear_matches_singleton_path_exactly(input_dims):
+    mx.random.seed(21 + input_dims)
+    linear = nn.QuantizedLinear(input_dims, 16, bias=False, group_size=64, bits=8)
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    x = mx.random.normal((1, 4, input_dims)).astype(mx.bfloat16)
+
+    ref = qwen_verifier._target_verify_timewise(linear, x)
+    out = qwen_verifier._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -611,10 +745,10 @@ def test_qwen_fused_greedy_decode_support_matches_lm_head():
         args=SimpleNamespace(tie_word_embeddings=False),
         lm_head=linear,
     )
-    assert qwen_language._can_target_verify_quantized_head(model.lm_head)
+    assert qwen_verifier._can_target_verify_quantized_head(model.lm_head)
 
     model.lm_head = OneBitLinear(512, 16, bias=False, group_size=32)
-    assert not qwen_language._can_target_verify_quantized_head(model.lm_head)
+    assert not qwen_verifier._can_target_verify_quantized_head(model.lm_head)
     assert (
         qwen_language.LanguageModel.fused_greedy_decode(
             model, mx.array([[1]], dtype=mx.int32), cache=[]
@@ -659,7 +793,7 @@ def test_qwen_fused_greedy_decode_uses_quantized_argmax():
     out = qwen_language.LanguageModel.fused_greedy_decode(
         model, inputs, cache=["cache"]
     )
-    ref = qwen_language._target_verify_quantized_argmax(model.lm_head, hidden)
+    ref = qwen_verifier._target_verify_quantized_argmax(model.lm_head, hidden)
     mx.eval(out, ref)
 
     assert bool(mx.array_equal(out, ref).item())
@@ -692,15 +826,16 @@ def test_qwen3_5_decode_quantized_linears_fused_matches_separate():
         assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
 
 
-def test_qwen_target_verify_quantized_argmax_matches_singleton_path():
-    mx.random.seed(16)
-    linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=4)
+@pytest.mark.parametrize("bits", [4, 8])
+def test_qwen_target_verify_quantized_argmax_matches_singleton_path(bits):
+    mx.random.seed(16 + bits)
+    linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=bits)
     linear.scales = linear.scales.astype(mx.bfloat16)
     linear.biases = linear.biases.astype(mx.bfloat16)
 
     x = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
-    ref = mx.argmax(qwen_language._target_verify_timewise(linear, x), axis=-1)
-    out = qwen_language._target_verify_quantized_argmax(linear, x)
+    ref = mx.argmax(qwen_verifier._target_verify_timewise(linear, x), axis=-1)
+    out = qwen_verifier._target_verify_quantized_argmax(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -713,10 +848,10 @@ def test_qwen3_5_quantized_argmax_batch_as_time_matches_rowwise():
     linear.biases = linear.biases.astype(mx.bfloat16)
     x = mx.random.normal((4, 1, 512), dtype=mx.bfloat16)
 
-    out = qwen_language._target_verify_quantized_argmax(linear, x)
+    out = qwen_verifier._target_verify_quantized_argmax(linear, x)
     ref = mx.concatenate(
         [
-            qwen_language._target_verify_quantized_argmax(linear, x[row : row + 1])
+            qwen_verifier._target_verify_quantized_argmax(linear, x[row : row + 1])
             for row in range(x.shape[0])
         ],
         axis=0,
@@ -724,6 +859,24 @@ def test_qwen3_5_quantized_argmax_batch_as_time_matches_rowwise():
     mx.eval(out, ref)
 
     assert bool(mx.array_equal(out, ref).item())
+
+
+@pytest.mark.parametrize("verify_length", [6, 7, 8])
+def test_qwen3_5_4bit_quantized_argmax_wide_blocks_match_singletons(verify_length):
+    mx.random.seed(32 + verify_length)
+    linear = nn.QuantizedLinear(512, 32, bias=False, group_size=64, bits=4)
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    x = mx.random.normal((1, verify_length, 512), dtype=mx.bfloat16)
+
+    out = qwen_verifier._target_verify_quantized_argmax(linear, x)
+    mask = mx.full((verify_length, 1), -1, dtype=mx.int32)
+    masked = qwen_verifier._target_verify_quantized_argmax(linear, x, token_mask=mask)
+    ref = mx.argmax(qwen_verifier._target_verify_timewise(linear, x), axis=-1)
+    mx.eval(out, masked, ref)
+
+    assert bool(mx.array_equal(out, ref).item())
+    assert bool(mx.array_equal(masked, ref).item())
 
 
 def _qwen3_5_ragged_attention_reference(queries, keys, values, pads, scale):
@@ -825,7 +978,7 @@ def test_qwen_target_verify_small_projection_matches_singleton_dense_gemv():
         ],
         axis=0,
     )
-    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    out = qwen_verifier._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -840,10 +993,33 @@ def test_qwen_target_verify_mlp_matches_singleton_dense_path():
     x = mx.random.normal((2, 3, 16)).astype(mx.bfloat16)
 
     ref = mx.concatenate([mlp(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
-    out = mlp(x, target_verify=True)
+    out = qwen_verifier.Qwen3_5ExactSpeculativeVerifier()._feed_forward(mlp, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_exact_verifier_moe_matches_singleton_path():
+    mx.random.seed(111)
+    config = SimpleNamespace(
+        hidden_size=16,
+        moe_intermediate_size=32,
+        shared_expert_intermediate_size=32,
+        num_experts=4,
+        num_experts_per_tok=2,
+    )
+    moe = qwen_moe_language.Qwen3_5MoeSparseMoeBlock(config)
+    moe.set_dtype(mx.bfloat16)
+    x = mx.random.normal((2, 3, 16)).astype(mx.bfloat16)
+
+    expected = mx.concatenate(
+        [moe(x[:, index : index + 1]) for index in range(x.shape[1])],
+        axis=1,
+    )
+    actual = qwen_verifier.Qwen3_5ExactSpeculativeVerifier()._feed_forward(moe, x)
+    mx.eval(expected, actual)
+
+    assert bool(mx.array_equal(expected, actual).item())
 
 
 def test_qwen_target_verify_norms_match_singleton_path():
@@ -898,7 +1074,7 @@ def test_qwen_gdn_verify_conv_matches_singleton_windows():
         ],
         axis=1,
     )
-    out = layer._causal_conv1d_verify(conv_input, steps)
+    out = layer.conv1d(conv_input)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -1589,6 +1765,43 @@ def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):
     assert calls[0][2]["row_ids"] == [0]
 
 
+def test_dflash_server_singleton_dispatches_single_rounds(monkeypatch):
+    calls = []
+
+    def fake_single(*args, **kwargs):
+        calls.append((args, kwargs))
+        yield 3, None
+        yield 4, None
+        yield 5, None
+
+    def fake_batch(*args, **kwargs):
+        raise AssertionError("server DFlash singleton should use single round path")
+
+    monkeypatch.setattr(speculative_utils, "_dflash_rounds", fake_single)
+    monkeypatch.setattr(speculative_utils, "_dflash_rounds_batch", fake_batch)
+
+    result = list(
+        speculative_utils.run_speculative_server_rounds(
+            SimpleNamespace(language_model=SimpleNamespace()),
+            SimpleNamespace(),
+            prompt_cache=[],
+            hidden=mx.zeros((1, 1, 1), dtype=mx.float32),
+            draft_kind="dflash",
+            first_bonus=mx.array([2], dtype=mx.int32),
+            max_tokens=4,
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            token_dtype=mx.int32,
+            greedy_sampling=True,
+            stop_check=lambda _seq_idx, token_id: token_id == 4,
+        )
+    )
+
+    assert result == [([3], None), ([4], None)]
+    assert calls
+    assert calls[0][1]["first_bonus"] == 2
+    assert "use_model_initial_block_size" not in calls[0][1]
+
+
 def test_mtp_uses_uniform_deferred_walk_for_batched_sampling():
     ragged_drafter = SimpleNamespace(requires_uniform_batch_acceptance=False)
     uniform_drafter = SimpleNamespace(requires_uniform_batch_acceptance=True)
@@ -1960,6 +2173,32 @@ def test_dflash_next_block_size_starts_at_requested_ceiling():
     draft_model = SimpleNamespace(accept_lens=[], draft_lens=[])
 
     assert _dflash_next_block_size(draft_model, 16, 20) == 16
+
+
+def test_dflash_next_block_size_uses_model_initial_size():
+    draft_model = SimpleNamespace(accept_lens=[], draft_lens=[])
+
+    assert _dflash_next_block_size(draft_model, 16, 20, 4) == 4
+
+
+def test_dflash_next_block_size_honors_model_minimum():
+    draft_model = SimpleNamespace(
+        accept_lens=[0, 1],
+        draft_lens=[2, 3],
+        dflash_min_block_size=3,
+    )
+
+    assert _dflash_next_block_size(draft_model, 5, 20) == 3
+
+
+def test_dflash_next_block_size_grows_from_model_minimum():
+    draft_model = SimpleNamespace(
+        accept_lens=[2, 2, 2, 2],
+        draft_lens=[2, 2, 2, 2],
+        dflash_min_block_size=3,
+    )
+
+    assert _dflash_next_block_size(draft_model, 5, 20) == 5
 
 
 def test_dflash_next_block_size_backs_off_on_low_acceptance():
@@ -3169,6 +3408,52 @@ def test_split_qwen3_5_mtp_writes_sidecar_without_index_mtp_entries(tmp_path):
     assert cfg["block_size"] == 3
     assert "fc.weight" in weights
     assert weights["pre_fc_norm_hidden.weight"][0].item() == 1.0
+
+
+def test_split_qwen3_5_mtp_converts_fine_grained_fp8(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.mtp_num_hidden_layers = 1
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5",
+                "text_config": text_config.to_dict(),
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "fmt": "e4m3",
+                    "weight_block_size": [128, 128],
+                },
+            }
+        )
+    )
+    mx.save_safetensors(
+        str(source / "mtp.safetensors"),
+        {
+            "mtp.layers.0.mlp.down_proj.weight": mx.to_fp8(
+                mx.ones((128, 128), dtype=mx.bfloat16)
+            ),
+            "mtp.layers.0.mlp.down_proj.weight_scale_inv": mx.full(
+                (1, 1), 0.125, dtype=mx.bfloat16
+            ),
+            "mtp.pre_fc_norm_hidden.weight": mx.zeros((16,)),
+        },
+        metadata={},
+    )
+
+    split_qwen3_5_mtp(str(source), str(output))
+
+    with open(output / "config.json") as f:
+        cfg = json.load(f)
+    weights = mx.load(str(output / "model.safetensors"))
+    expected = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    assert cfg["quantization"] == expected
+    assert cfg["quantization_config"] == expected
+    assert weights["layers.0.mlp.down_proj.weight"].dtype == mx.uint32
+    assert weights["layers.0.mlp.down_proj.scales"].dtype == mx.uint8
+    assert not any(key.endswith("weight_scale_inv") for key in weights)
 
 
 def test_deepseek_v4_returns_mtp_hidden_and_trims_without_snapshot():

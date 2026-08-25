@@ -30,9 +30,18 @@ from ..speculative.utils import (
 from ..turboquant import BatchTurboQuantKVCache, turboquant_enabled
 from ..utils import group_images_by_shape, prepare_inputs, should_add_special_tokens
 from .common import (
+    DEFAULT_COMPLETION_BATCH_SIZE,
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_MIN_P,
+    DEFAULT_PREFILL_BATCH_SIZE,
+    DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
+    DEFAULT_REPETITION_CONTEXT_SIZE,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_K,
+    DEFAULT_TOP_P,
     _chunked_prefill_enabled,
     generation_stream,
     maybe_quantize_kv_cache,
@@ -42,16 +51,7 @@ from .types import GenerateKwargs, ProcessorLike, Unpack
 
 logger = logging.getLogger("mlx_vlm.generate")
 
-DEFAULT_MAX_TOKENS = 2048
-DEFAULT_TEMPERATURE = 0.0
-DEFAULT_TOP_P = 1.0
-DEFAULT_TOP_K = 0
-DEFAULT_MIN_P = 0.0
 DEFAULT_TOP_N_SIGMA = 0.0
-DEFAULT_REPETITION_CONTEXT_SIZE = 20
-DEFAULT_PREFILL_STEP_SIZE = 2048
-DEFAULT_COMPLETION_BATCH_SIZE = 32
-DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
 
 
@@ -110,6 +110,16 @@ class _PositionedTargetSampler:
         keys = _position_keys(self.seed, row_ids, positions)
         if self.top_p > 0 and self.top_p < 1.0:
             return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
+        return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
+
+    def sample_proposal(
+        self,
+        logprobs: mx.array,
+        *,
+        row_ids: List[int],
+        positions: List[int],
+    ) -> mx.array:
+        keys = _position_keys(self.seed ^ 0x0DFA5202, row_ids, positions)
         return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
 
     def _sample_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
@@ -722,6 +732,15 @@ def _merge_prefill_prompt_kwargs(
     return inputs_embeds, merged_kwargs
 
 
+def _is_batch_cache_entry(entry) -> bool:
+    """Return whether a cache entry already owns a batch dimension."""
+    if isinstance(entry, cache.CacheList):
+        return all(_is_batch_cache_entry(child) for child in entry.caches)
+    return callable(getattr(entry, "filter", None)) and callable(
+        getattr(entry, "extend", None)
+    )
+
+
 def _extend_cache(cache_a, cache_b):
     """Extend cache_a with cache_b along the batch dimension."""
     if not cache_a:
@@ -730,9 +749,9 @@ def _extend_cache(cache_a, cache_b):
         return cache_a
     extended = []
     for ca, cb in zip(cache_a, cache_b):
-        if not hasattr(ca, "left_padding") and hasattr(ca.__class__, "merge"):
+        if not _is_batch_cache_entry(ca) and hasattr(ca.__class__, "merge"):
             ca = ca.__class__.merge([ca])
-        if not hasattr(cb, "left_padding") and hasattr(cb.__class__, "merge"):
+        if not _is_batch_cache_entry(cb) and hasattr(cb.__class__, "merge"):
             cb = cb.__class__.merge([cb])
         ca.extend(cb)
         extended.append(ca)
@@ -817,6 +836,8 @@ def _make_cache(
         elif isinstance(c, cache.ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c
+        elif isinstance(c, cache.PoolingCache):
+            return cache.BatchPoolingCache(c.ratio, left_padding)
         elif isinstance(c, cache.RotatingKVCache):
             if c.keep > 0:
                 raise ValueError("RotatingKVCache with keep tokens is not supported.")
@@ -1601,6 +1622,7 @@ class PromptProcessingBatch:
         apc_meta: Optional[List[dict]] = None,
         apc_manager: Optional["_apc.APCManager"] = None,
         right_pad_per_row: Optional[List[int]] = None,
+        existing_left_padding: Optional[List[int]] = None,
         suffix_lens: Optional[List[int]] = None,
         apc_mode: Optional[str] = None,
         draft_model: Optional[nn.Module] = None,
@@ -1636,6 +1658,11 @@ class PromptProcessingBatch:
             self._input_ids = _right_pad_prompts(input_ids, max_length=max_length)
         else:
             left_padding = [max_length - l for l in lengths]
+            if existing_left_padding is not None:
+                left_padding = [
+                    pad + int(existing)
+                    for pad, existing in zip(left_padding, existing_left_padding)
+                ]
             self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
         self._left_padding_per_row = list(left_padding)
         self._total_prompt_tokens = sum(lengths)
@@ -2178,6 +2205,7 @@ class BatchGenerator:
         completion_batch_size: int = DEFAULT_COMPLETION_BATCH_SIZE,
         prefill_batch_size: int = DEFAULT_PREFILL_BATCH_SIZE,
         prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
+        existing_left_padding: Optional[List[int]] = None,
         prompt_cache=None,
         kv_bits=None,
         kv_key_bits=None,
@@ -2251,6 +2279,7 @@ class BatchGenerator:
             top_logprobs_k=self.top_logprobs_k,
             greedy_sampling=self.greedy_sampling,
         )
+        self._existing_left_padding = existing_left_padding
         self._prompt_batch: Optional[PromptProcessingBatch] = None
         self._unprocessed_sequences = []
 
@@ -2722,11 +2751,10 @@ class BatchGenerator:
         if self._prompt_batch is not None:
             if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
-                n = self._prompt_batch.prompt_step()
+                self._prompt_batch.prompt_step()
                 elapsed = time.perf_counter() - tic
                 self._prompt_time_counter += elapsed
                 self._record_prompt_batch_time(self._prompt_batch, elapsed)
-                self._prompt_tokens_counter += n
                 return prompt_responses, generation_responses
 
             tic = time.perf_counter()
@@ -2810,6 +2838,7 @@ class BatchGenerator:
             self._prompt_batch = prompt_batch_cls(
                 model=self.model,
                 uids=uids,
+                existing_left_padding=getattr(self, "_existing_left_padding", None),
                 input_ids=input_ids,
                 max_tokens=max_tokens_list,
                 inputs_embeds=inputs_embeds,
@@ -3170,12 +3199,19 @@ def _generate_batch(
             kwargs["prefill_step_size"] = None
 
     # Use batch_size for prefill and completion to ensure consistent processing
+    existing_left_padding = None
+    if mask is not None and getattr(mask, "ndim", 0) == 2:
+        pads = [int(v) for v in (mask.shape[1] - mask.sum(axis=1)).tolist()]
+        if any(pads):
+            existing_left_padding = pads
+
     gen = BatchGenerator(
         model.language_model,
         processor,
         prefill_batch_size=batch_size,
         completion_batch_size=batch_size,
         compute_logprobs=False,
+        existing_left_padding=existing_left_padding,
         **kwargs,
     )
 

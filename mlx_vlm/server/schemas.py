@@ -14,11 +14,7 @@ from ..generate import (
     DEFAULT_TOP_P,
     normalize_resize_shape,
 )
-from ..generate.image import (
-    DEFAULT_IMAGE_GUIDANCE,
-    DEFAULT_IMAGE_SIZE,
-    DEFAULT_IMAGE_STEPS,
-)
+from ..generate.image import DEFAULT_IMAGE_SIZE
 
 
 def get_server_max_tokens():
@@ -47,18 +43,18 @@ class ImageGenerationRequest(FlexibleBaseModel):
     )
     width: Optional[int] = Field(None, description="Generated image width.")
     height: Optional[int] = Field(None, description="Generated image height.")
-    steps: int = Field(
-        DEFAULT_IMAGE_STEPS,
+    steps: Optional[int] = Field(
+        None,
         ge=1,
-        description="Number of image generation inference steps.",
+        description="Number of image generation inference steps; model default if omitted.",
     )
     seed: Optional[int] = Field(
         None,
         description="Base seed. Multiple outputs use (seed + i) values.",
     )
-    guidance: float = Field(
-        DEFAULT_IMAGE_GUIDANCE,
-        description="Classifier-free guidance scale.",
+    guidance: Optional[float] = Field(
+        None,
+        description="Classifier-free guidance scale; model default if omitted.",
     )
     auto_json_caption: Optional[bool] = Field(
         None,
@@ -121,18 +117,18 @@ class ImageEditRequest(FlexibleBaseModel):
     )
     width: Optional[int] = Field(None, description="Edited image width.")
     height: Optional[int] = Field(None, description="Edited image height.")
-    steps: int = Field(
-        DEFAULT_IMAGE_STEPS,
+    steps: Optional[int] = Field(
+        None,
         ge=1,
-        description="Number of image edit inference steps.",
+        description="Number of image edit inference steps; model default if omitted.",
     )
     seed: Optional[int] = Field(
         None,
         description="Base seed. Multiple outputs use (seed + i) values.",
     )
-    guidance: float = Field(
-        DEFAULT_IMAGE_GUIDANCE,
-        description="Classifier-free guidance scale.",
+    guidance: Optional[float] = Field(
+        None,
+        description="Classifier-free guidance scale; model default if omitted.",
     )
     response_format: Literal["b64_json", "path"] = Field(
         "b64_json",

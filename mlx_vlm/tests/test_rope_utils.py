@@ -7,6 +7,7 @@ from mlx.utils import tree_flatten
 
 import mlx_vlm.models.rope_utils as rope_utils
 from mlx_vlm.models.rope_utils import (
+    EagerRoPE,
     Llama3RoPE,
     MRoPERotaryEmbedding,
     ProportionalRoPE,
@@ -17,6 +18,7 @@ from mlx_vlm.models.rope_utils import (
     apply_rotary_pos_emb_even_odd,
     compute_mrope_frequencies,
     compute_selected_mrope_cos_sin,
+    initialize_rope,
     mrope_position_selector,
     mrope_section_selectors,
 )
@@ -44,6 +46,108 @@ def _disable_metal_fast_path(fn):
 def _position_ids(batch=2, seq_len=4):
     base = mx.arange(batch * seq_len, dtype=mx.int32).reshape(batch, seq_len)
     return mx.stack([base, base + 3, base + 7])
+
+
+def test_eager_rope_uses_fp32_frequencies_and_activation_dtype_trig():
+    inputs = (mx.arange(24, dtype=mx.float32) / 7).reshape(1, 2, 3, 4)
+    inputs = inputs.astype(mx.bfloat16)
+    rope = initialize_rope(
+        dims=4,
+        base=10000.0,
+        traditional=False,
+        scaling_config={"rope_type": "default"},
+        implementation="eager",
+    )
+    assert isinstance(rope, EagerRoPE)
+
+    positions = mx.arange(2, 5, dtype=mx.float32)
+    frequencies = 1.0 / (10000.0 ** (mx.arange(0, 4, 2, dtype=mx.float32) / 4))
+    angles = positions[:, None] * frequencies[None]
+    angles = mx.concatenate([angles, angles], axis=-1)
+    cos = mx.cos(angles).astype(inputs.dtype)[None, None]
+    sin = mx.sin(angles).astype(inputs.dtype)[None, None]
+    rotated = mx.concatenate([-inputs[..., 2:], inputs[..., :2]], axis=-1)
+    expected = inputs * cos + rotated * sin
+    output = rope(inputs, offset=2)
+    mx.eval(output, expected)
+
+    assert bool(mx.array_equal(output, expected).item())
+
+
+def test_eager_rope_per_batch_offset_does_not_expand_seq():
+    """Per-batch (array) offsets from batch caches must keep S, not grow it.
+
+    Regression for the batched-path crash on multi-request streaming:
+    ``_eager_rope_angles`` used ``arange(S) + offset`` which broadcast the
+    batch-sized offset along the seq dim (S=1 -> S=B), so the attention mask
+    (N=1) no longer matched the keys (S=B) and
+    ``mx.fast.scaled_dot_product_attention`` raised
+    ``Shapes (B,1,1,window) and (B,H,B,window+1) cannot be broadcast``.
+    """
+    rope = initialize_rope(
+        dims=128,
+        base=500000.0,
+        traditional=False,
+        scaling_config={"rope_type": "default"},
+        implementation="eager",
+    )
+    assert isinstance(rope, EagerRoPE)
+
+    rng = mx.random.key(0)
+    x = mx.random.normal(key=rng, shape=(2, 32, 1, 128)).astype(mx.float32)
+    offsets = mx.array([86, 34258], dtype=mx.int32)
+
+    out = rope(x, offset=offsets)
+    assert out.shape == x.shape, f"seq dim expanded: {out.shape} != {x.shape}"
+
+    # Per-batch array offset must equal per-row scalar application.
+    ref = mx.concatenate([rope(x[0:1], offset=86), rope(x[1:2], offset=34258)], axis=0)
+    assert bool(mx.array_equal(out, ref).item())
+
+    # Multi-token batch: (B, S) positions, still per-row equal to scalars.
+    x2 = mx.random.normal(key=mx.random.key(1), shape=(2, 32, 3, 128)).astype(
+        mx.float32
+    )
+    out2 = rope(x2, offset=offsets)
+    ref2 = mx.concatenate(
+        [rope(x2[0:1], offset=86), rope(x2[1:2], offset=34258)], axis=0
+    )
+    assert bool(mx.array_equal(out2, ref2).item())
+
+    # Traditional layout follows the same rule.
+    rope_t = initialize_rope(
+        dims=128,
+        base=500000.0,
+        traditional=True,
+        scaling_config={"rope_type": "default"},
+        implementation="eager",
+    )
+    out3 = rope_t(x, offset=offsets)
+    assert out3.shape == x.shape
+    ref3 = mx.concatenate(
+        [rope_t(x[0:1], offset=86), rope_t(x[1:2], offset=34258)], axis=0
+    )
+    assert bool(mx.array_equal(out3, ref3).item())
+
+    # 0-d array offset (mx.array(86)) takes the same single code path as a
+    # scalar int and must stay bit-identical to it.
+    out4 = rope(x, offset=mx.array(86, dtype=mx.float32))
+    ref4 = rope(x, offset=86)
+    assert bool(mx.array_equal(out4, ref4).item())
+
+
+def test_eager_rope_evals_private_helper_arrays_on_init(monkeypatch):
+    eval_args = []
+    monkeypatch.setattr(mx, "eval", lambda *args: eval_args.append(args))
+
+    rope = EagerRoPE(dims=8)
+
+    eager_arrays = rope.eager_eval_arrays()
+    assert eager_arrays[0] is rope._frequencies
+    assert eager_arrays[1] is rope._scale
+    assert len(eval_args) == 1
+    assert eval_args[0][0] is eager_arrays[0]
+    assert eval_args[0][1] is eager_arrays[1]
 
 
 def test_mrope_rotary_embedding_evals_private_helper_arrays_on_init(monkeypatch):
@@ -110,9 +214,76 @@ def test_su_scaled_rope_evals_private_helper_arrays_on_init(monkeypatch):
     assert tree_flatten(host.parameters()) == []
     assert tree_flatten(host.trainable_parameters()) == []
     eager_arrays = host.rope.eager_eval_arrays()
-    assert eager_arrays[0] is host.rope._freqs
+    assert eager_arrays[0] is host.rope._short_freqs
+    assert eager_arrays[1] is host.rope._long_freqs
+    assert eager_arrays[2] is host.rope._short_scale
+    assert eager_arrays[3] is host.rope._long_scale
     assert len(eval_args) == 1
-    assert eval_args[0][0] is eager_arrays[0]
+    assert len(eval_args[0]) == len(eager_arrays)
+    for actual, expected in zip(eval_args[0], eager_arrays):
+        assert actual is expected
+
+
+def test_su_scaled_rope_selects_factors_from_position_span():
+    dims = 8
+    base = 100.0
+    short_factor = [1.0, 1.25, 1.5, 1.75]
+    long_factor = [2.0, 2.25, 2.5, 2.75]
+    rope = SuScaledRoPE(
+        dims=dims,
+        base=base,
+        max_position_embeddings=8,
+        original_max_position_embeddings=4,
+        short_factor=short_factor,
+        long_factor=long_factor,
+        short_mscale=1.0,
+        long_mscale=2.0,
+    )
+    inputs = (mx.arange(16, dtype=mx.float32) / 10).reshape(1, 1, 2, dims)
+    base_freqs = base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
+
+    short = rope(inputs, offset=2)
+    expected_short = mx.fast.rope(
+        inputs,
+        dims,
+        traditional=False,
+        base=None,
+        scale=1.0,
+        offset=2,
+        freqs=mx.array(short_factor) * base_freqs,
+    )
+    long = rope(inputs, offset=3)
+    expected_long = mx.fast.rope(
+        2.0 * inputs,
+        dims,
+        traditional=False,
+        base=None,
+        scale=1.0,
+        offset=3,
+        freqs=mx.array(long_factor) * base_freqs,
+    )
+
+    mx.eval(short, expected_short, long, expected_long)
+    assert _max_diff(short, expected_short) < 1e-5
+    assert _max_diff(long, expected_long) < 1e-5
+
+
+def test_initialize_longrope_accepts_top_level_original_context_length():
+    rope = initialize_rope(
+        dims=8,
+        base=10000.0,
+        traditional=False,
+        scaling_config={
+            "type": "longrope",
+            "short_factor": [1.0] * 4,
+            "long_factor": [2.0] * 4,
+        },
+        max_position_embeddings=16,
+        original_max_position_embeddings=8,
+    )
+
+    assert isinstance(rope, SuScaledRoPE)
+    assert rope.original_max_position_embeddings == 8
 
 
 def test_llama3_rope_evals_private_helper_arrays_on_init(monkeypatch):
@@ -441,6 +612,10 @@ def _build_on_worker(factory):
 
 def test_su_scaled_rope_runs_on_a_thread_it_was_not_built_on():
     _build_on_worker(lambda: SuScaledRoPE(dims=8, long_factor=[1.0] * 4))
+
+
+def test_eager_rope_runs_on_a_thread_it_was_not_built_on():
+    _build_on_worker(lambda: EagerRoPE(dims=8))
 
 
 def test_llama3_rope_runs_on_a_thread_it_was_not_built_on():

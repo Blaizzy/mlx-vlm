@@ -312,6 +312,97 @@ class TestBatchCollation(unittest.TestCase):
         )
 
 
+class _VisionDatasetStub(list):
+    """A dataset list that also carries a model config, like VisionDataset."""
+
+    def __init__(self, items, config):
+        super().__init__(items)
+        self.config = config
+
+
+def _image_example(num_image_tokens, image_token_id=99, num_sub_images=2):
+    input_ids = mx.array([1] + [image_token_id] * num_image_tokens)
+    return {
+        "input_ids": input_ids,
+        "attention_mask": mx.ones(input_ids.shape, dtype=mx.int32),
+        "pixel_values": mx.zeros((num_sub_images, 4)),
+    }
+
+
+class TestImageTokenTruncationGuard(unittest.TestCase):
+    """Truncation must never cut image tokens (#1830).
+
+    ``pixel_values`` still yields one feature per image token, so an example whose
+    placeholders are truncated away fails the model's feature/token alignment
+    check. Such examples are skipped instead of corrupting the batch.
+    """
+
+    config = {"image_token_index": 99}
+
+    def test_skips_examples_whose_image_tokens_do_not_fit(self):
+        dataset = _VisionDatasetStub(
+            [_image_example(10), _image_example(3)], self.config
+        )
+
+        batch = next(iterate_batches(dataset, batch_size=1, max_seq_length=8))
+
+        # Only the short example survives; it keeps all 3 of its image tokens.
+        self.assertEqual(int((batch["input_ids"] == 99).sum()), 3)
+
+    def test_raises_when_no_example_fits(self):
+        dataset = _VisionDatasetStub(
+            [_image_example(10), _image_example(12)], self.config
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            next(iterate_batches(dataset, batch_size=1, max_seq_length=8))
+
+        self.assertIn("No trainable examples", str(ctx.exception))
+
+    def test_partially_filtered_batch_keeps_pixel_values_aligned(self):
+        # One example is dropped from a size-2 batch: the collated pixel_values
+        # must cover only the surviving example, or alignment breaks again.
+        dataset = _VisionDatasetStub(
+            [_image_example(10), _image_example(3)], self.config
+        )
+
+        batch = next(iterate_batches(dataset, batch_size=2, max_seq_length=8))
+
+        self.assertEqual(batch["input_ids"].shape[0], 1)
+        self.assertEqual(batch["pixel_values"].shape[0], 1)
+        self.assertEqual(int((batch["input_ids"] == 99).sum()), 3)
+
+    def test_keeps_examples_that_fit_untouched(self):
+        dataset = _VisionDatasetStub([_image_example(3)], self.config)
+
+        batch = next(iterate_batches(dataset, batch_size=1, max_seq_length=32))
+
+        self.assertEqual(int((batch["input_ids"] == 99).sum()), 3)
+
+    def test_text_only_datasets_are_unaffected(self):
+        # No image token in the config: long examples truncate as before.
+        dataset = _VisionDatasetStub([_image_example(10)], {"model_type": "llama"})
+
+        batch = next(iterate_batches(dataset, batch_size=1, max_seq_length=8))
+
+        self.assertEqual(batch["input_ids"].shape, (1, 8))
+
+
+class TestIdefics3MaskArgument(unittest.TestCase):
+    def test_call_accepts_mask_as_third_positional_argument(self):
+        """The trainer calls ``model(input_ids, pixel_values, attention_mask)``.
+
+        Idefics3 previously omitted ``mask``, so the attention mask bound to
+        ``cache`` and crashed in ``create_attention_mask`` (#1830).
+        """
+        import inspect
+
+        from mlx_vlm.models.idefics3.idefics3 import Model
+
+        params = list(inspect.signature(Model.__call__).parameters)
+        self.assertEqual(params[1:4], ["input_ids", "pixel_values", "mask"])
+
+
 class TestTrainer(unittest.TestCase):
     def setUp(self):
         class DummyOutput:

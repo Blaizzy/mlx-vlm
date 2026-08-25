@@ -24,6 +24,42 @@ def _centered_rms_norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
     return x.astype(dtype)
 
 
+@mx.compile
+def _prepare_mlp_input(
+    residual: mx.array,
+    attention_output: mx.array,
+    post_attention_weight: mx.array,
+    pre_feedforward_weight: mx.array,
+    post_attention_eps: float,
+    pre_feedforward_eps: float,
+) -> tuple[mx.array, mx.array]:
+    hidden_states = residual + _centered_rms_norm(
+        attention_output,
+        post_attention_weight,
+        post_attention_eps,
+    )
+    mlp_input = _centered_rms_norm(
+        hidden_states,
+        pre_feedforward_weight,
+        pre_feedforward_eps,
+    )
+    return hidden_states, mlp_input
+
+
+@mx.compile
+def _finish_mlp(
+    residual: mx.array,
+    mlp_output: mx.array,
+    post_feedforward_weight: mx.array,
+    post_feedforward_eps: float,
+) -> mx.array:
+    return residual + _centered_rms_norm(
+        mlp_output,
+        post_feedforward_weight,
+        post_feedforward_eps,
+    )
+
+
 class RMSNormNoScale(nn.Module):
     def __init__(self, eps: float):
         super().__init__()
@@ -96,6 +132,7 @@ class Attention(nn.Module):
             traditional=False,
             scaling_config={"rope_type": "default", "rope_theta": theta},
             max_position_embeddings=args.max_position_embeddings,
+            implementation="eager",
         )
 
     def __call__(
@@ -109,7 +146,11 @@ class Attention(nn.Module):
         keys = self.k_proj(x).reshape(batch, length, self.n_kv_heads, self.head_dim)
         values = self.v_proj(x).reshape(batch, length, self.n_kv_heads, self.head_dim)
 
-        queries = (self.qk_norm(queries) * self.qk_scale_factor).transpose(0, 2, 1, 3)
+        queries = self.qk_norm(queries)
+        queries = (queries.astype(mx.float32) * self.qk_scale_factor).astype(
+            queries.dtype
+        )
+        queries = queries.transpose(0, 2, 1, 3)
         keys = self.qk_norm(keys).transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)
 
@@ -159,11 +200,20 @@ class DecoderLayer(nn.Module):
     ) -> mx.array:
         residual = x
         x = self.self_attn(self.input_layernorm(x), mask=mask, cache=cache)
-        x = residual + self.post_attention_layernorm(x)
-
-        residual = x
-        x = self.mlp(self.pre_feedforward_layernorm(x))
-        return residual + self.post_feedforward_layernorm(x)
+        residual, mlp_input = _prepare_mlp_input(
+            residual,
+            x,
+            self.post_attention_layernorm.weight,
+            self.pre_feedforward_layernorm.weight,
+            self.post_attention_layernorm.eps,
+            self.pre_feedforward_layernorm.eps,
+        )
+        return _finish_mlp(
+            residual,
+            self.mlp(mlp_input),
+            self.post_feedforward_layernorm.weight,
+            self.post_feedforward_layernorm.eps,
+        )
 
 
 class TextModel(nn.Module):
@@ -189,6 +239,8 @@ class TextModel(nn.Module):
         inputs: Optional[mx.array],
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
+        capture_layer_ids: Optional[list[int]] = None,
+        hidden_sink: Optional[list[mx.array]] = None,
     ) -> mx.array:
         hidden_states = inputs_embeds
         if hidden_states is None:
@@ -205,9 +257,12 @@ class TextModel(nn.Module):
                 window_size=self.sliding_window,
             )
 
-        for layer, layer_cache in zip(self.layers, cache):
+        capture_set = set(capture_layer_ids) if capture_layer_ids else set()
+        for layer_idx, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             mask = sliding_mask if layer.is_sliding else full_mask
             hidden_states = layer(hidden_states, mask=mask, cache=layer_cache)
+            if hidden_sink is not None and layer_idx in capture_set:
+                hidden_sink.append(hidden_states)
         return self.norm(hidden_states)
 
 
@@ -222,6 +277,24 @@ class LanguageModel(nn.Module):
         self.final_logit_softcapping = args.final_logit_softcapping
         self.output_multiplier = args.output_multiplier
 
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del input_ids, inputs_embeds, prompt_cache
+        if draft_model is None:
+            return True
+        prefill_kwargs = prefill_kwargs or {}
+        if draft_kind in ("dflash", "eagle3"):
+            return prefill_kwargs.get("capture_layer_ids") is not None
+        return False
+
     def __call__(
         self,
         inputs: Optional[mx.array] = None,
@@ -231,11 +304,67 @@ class LanguageModel(nn.Module):
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
-        hidden_states = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+        capture_layer_ids = kwargs.pop("capture_layer_ids", None)
+        hidden_sink: Optional[list[mx.array]] = (
+            [] if capture_layer_ids is not None else None
+        )
+        hidden_states = self.model(
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            capture_layer_ids=capture_layer_ids,
+            hidden_sink=hidden_sink,
+        )
         logits = self.lm_head(hidden_states) * self.output_multiplier
         softcap = self.final_logit_softcapping
         logits = mx.tanh(logits / softcap) * softcap
-        return LanguageModelOutput(logits=logits)
+        return LanguageModelOutput(logits=logits, hidden_states=hidden_sink)
+
+    def rollback_speculative_cache(
+        self,
+        caches: list[Any],
+        gdn_states: Any,
+        accepted: Any,
+        block_size: int,
+    ) -> int:
+        """Rewind target KV caches to the accepted speculative prefix."""
+
+        del gdn_states
+        if isinstance(accepted, int):
+            accepted = mx.array([accepted])
+        if isinstance(accepted, (list, tuple)):
+            accepted = mx.array(accepted, dtype=mx.int32)
+
+        max_accepted = int(accepted.max().item())
+        retained = max_accepted + 1
+        trim = block_size - retained
+        is_batch = accepted.size > 1
+        valid_ends = accepted + 1
+
+        for cache in caches:
+            if cache is None:
+                continue
+            if trim > 0 and hasattr(cache, "trim"):
+                cache.trim(trim)
+            if (
+                is_batch
+                and hasattr(cache, "_idx")
+                and cache.keys is not None
+                and max_accepted > 0
+            ):
+                cache_length = cache._idx
+                verify_start = cache_length - retained
+                for row, valid_end in enumerate(valid_ends.tolist()):
+                    start = verify_start + int(valid_end)
+                    if start >= cache_length:
+                        continue
+                    zero_row_tail = getattr(cache, "zero_row_tail", None)
+                    if callable(zero_row_tail):
+                        zero_row_tail(row, start, cache_length)
+                    else:
+                        cache.keys[row, :, start:cache_length, :] = 0
+                        cache.values[row, :, start:cache_length, :] = 0
+        return max_accepted
 
     @property
     def layers(self):

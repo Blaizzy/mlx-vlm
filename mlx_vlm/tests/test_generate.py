@@ -29,8 +29,12 @@ from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
 from mlx_vlm.models.cache import (
     BatchKVCache,
+    BatchPoolingCache,
+    BatchRotatingKVCache,
     BufferedRotatingKVCache,
+    CacheList,
     KVCache,
+    PoolingCache,
     RotatingKVCache,
 )
 from mlx_vlm.utils import ThinkingBudgetCriteria
@@ -596,6 +600,50 @@ class TestBatchGenerator:
         assert stats.prompt_tps == 200.0  # 100 / 0.5
         assert stats.prompt_tokens == 100
 
+    def test_extend_active_deepseek_cache_with_concurrent_request(self):
+        def make_row(prompt_length):
+            rotating = BatchRotatingKVCache(max_size=16, left_padding=[0])
+            keys = mx.random.normal((1, 1, prompt_length, 4))
+            values = mx.random.normal((1, 1, prompt_length, 4))
+            rotating.update_and_fetch(keys, values)
+            rotating.finalize()
+
+            pooling = BatchPoolingCache(ratio=4, left_padding=[0])
+            pooling.prepare(lengths=[prompt_length])
+            kv = mx.random.normal((1, prompt_length, 3))
+            gate = mx.random.normal((1, prompt_length, 2))
+            ready_kv, _, _ = pooling.accumulate_windows(kv, gate, offset=0)
+            pooled = mx.random.normal((1, ready_kv.shape[1] // 4, 3))
+            pooling.update_and_fetch(pooled)
+            pooling.finalize()
+            return [CacheList(rotating, pooling)]
+
+        active = make_row(6)
+        joining = make_row(5)
+
+        extended = ar_module._extend_cache(active, joining)
+
+        rotating, pooling = extended[0].caches
+        assert isinstance(rotating, BatchRotatingKVCache)
+        assert rotating.offset.shape == (2,)
+        assert rotating.keys.shape[0] == 2
+        assert isinstance(pooling, BatchPoolingCache)
+        assert pooling.remainder == [2, 1]
+        assert pooling.pooled.shape[0] == 2
+
+    def test_make_cache_converts_left_padded_pooling_cache(self):
+        class PoolingModel:
+            def make_cache(self):
+                return [PoolingCache(ratio=4)]
+
+        caches = ar_module._make_cache(PoolingModel(), [2, 0])
+
+        assert len(caches) == 1
+        assert isinstance(caches[0], BatchPoolingCache)
+        assert caches[0].ratio == 4
+        assert caches[0].remainder == [0, 0]
+        assert caches[0].left_padding == [2, 0]
+
     def test_next_reports_prompt_progress_for_completed_prefill(
         self, mock_model, mock_processor, monkeypatch
     ):
@@ -624,6 +672,27 @@ class TestBatchGenerator:
         assert prompt_responses[0].prompt_tps == pytest.approx(15.0)
         assert prompt_responses[0].prompt_time == pytest.approx(0.2)
         assert prompt_responses[0].cached_tokens == 0
+
+    def test_chunked_prefill_stats_count_each_prompt_token_once(
+        self, mock_model, mock_processor
+    ):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            prefill_batch_size=1,
+            completion_batch_size=1,
+            prefill_step_size=2,
+        )
+        prompt_tokens = 5
+        gen._prompt_batch = SimpleNamespace(
+            needs_processing=lambda: True,
+            prompt_step=lambda: 2,
+        )
+        gen._prompt_tokens_counter = prompt_tokens
+
+        gen.next()
+
+        assert gen.stats().prompt_tokens == prompt_tokens
 
     def test_prompt_progress_reports_apc_cached_tokens(self):
         batch = PromptProcessingBatch(
@@ -1627,6 +1696,7 @@ class TestThinkingBudgetCriteria:
             thinking_end_token="</think>",
             thinking_start_token="<think>",
             enable_thinking=True,
+            prompt_preopens_thinking=True,
         )
 
         # enable_thinking=True — already in thinking mode
@@ -1676,13 +1746,41 @@ class TestThinkingBudgetCriteria:
         assert criteria.thinking_token_count == 0
         assert criteria.budget_exceeded is False
 
-    def _make_criteria(self, enable_thinking=True):
+    def test_self_opening_model_budget_still_enforced(self):
+        """Regression test for issue #1911."""
+        criteria = ThinkingBudgetCriteria(
+            tokenizer=FakeTokenizer(),
+            thinking_budget=5,
+            thinking_end_token="</think>",
+            thinking_start_token="<think>",
+            enable_thinking=True,
+            prompt_preopens_thinking=False,
+        )
+
+        assert criteria.in_thinking is False
+
+        assert criteria(99) is None
+        assert criteria.in_thinking is True
+
+        for i in range(5):
+            assert criteria(50 + i) is None
+        assert criteria.thinking_token_count == 5
+        assert criteria.budget_exceeded is False
+
+        assert criteria(60) == 10  # \n
+        assert criteria.pop_forced_token_id() == 10
+        assert criteria(60) == 100  # </think>
+        assert criteria.pop_forced_token_id() == 100
+        assert criteria.budget_exceeded is True
+
+    def _make_criteria(self, enable_thinking=True, prompt_preopens_thinking=True):
         return ThinkingBudgetCriteria(
             tokenizer=FakeTokenizer(),
             thinking_budget=5,
             thinking_end_token="</think>",
             thinking_start_token="<think>",
             enable_thinking=enable_thinking,
+            prompt_preopens_thinking=prompt_preopens_thinking,
         )
 
     def test_pop_forced_token_id_safe_before_first_call(self):
@@ -2141,6 +2239,9 @@ def test_generate_cli_smoke(capsys):
         system=None,
         max_tokens=12,
         temperature=0.7,
+        top_p=1.0,
+        top_k=0,
+        min_p=0.0,
         repetition_penalty=None,
         repetition_context_size=20,
         presence_penalty=None,
@@ -2216,6 +2317,9 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
         system=None,
         max_tokens=8,
         temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        min_p=0.0,
         repetition_penalty=None,
         repetition_context_size=20,
         presence_penalty=None,
@@ -2277,6 +2381,82 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
     assert capsys.readouterr().out.strip() == "done"
 
 
+def test_resolve_video_inputs_keeps_native_video_unchanged():
+    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
+    images = [object()]
+    videos = ["first.mp4", "second.mp4"]
+    processor = SimpleNamespace(
+        video_processor=SimpleNamespace(),
+        process=lambda text=None, images=None, videos=None, **kwargs: None,
+    )
+
+    with patch.object(video_module, "sample_video_frames") as mock_sample:
+        resolution = video_module.resolve_video_inputs(
+            processor,
+            videos,
+            images=images,
+        )
+
+    assert resolution.images == images
+    assert resolution.videos == videos
+    assert resolution.used_fallback is False
+    mock_sample.assert_not_called()
+
+
+def test_resolve_video_inputs_uses_one_global_frame_budget():
+    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
+    still = object()
+    images = [still]
+    videos = ["first.mp4", "second.mp4"]
+    frames = [object() for _ in range(10)]
+
+    with patch.object(
+        video_module,
+        "sample_video_frames",
+        return_value=(frames, 1.5),
+    ) as mock_sample:
+        resolution = video_module.resolve_video_inputs(
+            SimpleNamespace(),
+            videos,
+            images=images,
+            fps=1.5,
+            max_frames=4,
+        )
+
+    assert resolution.images == [still, frames[0], frames[3], frames[6], frames[9]]
+    assert resolution.videos == []
+    assert resolution.used_fallback is True
+    assert resolution.sampled_count == 10
+    assert resolution.selected_count == 4
+    assert resolution.frame_fps == pytest.approx(1.5)
+    assert images == [still]
+    assert videos == ["first.mp4", "second.mp4"]
+    mock_sample.assert_called_once_with(videos, 1.5)
+
+
+def test_resolve_video_inputs_does_not_partially_mutate_on_decode_failure():
+    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
+    images = [object()]
+    videos = ["good.mp4", "bad.mp4"]
+
+    with (
+        patch.object(
+            video_module,
+            "sample_video_frames",
+            side_effect=RuntimeError("decode failed"),
+        ),
+        pytest.raises(RuntimeError, match="decode failed"),
+    ):
+        video_module.resolve_video_inputs(
+            SimpleNamespace(),
+            videos,
+            images=images,
+        )
+
+    assert len(images) == 1
+    assert videos == ["good.mp4", "bad.mp4"]
+
+
 def test_generate_cli_video_frames_fallback_without_video_processor(capsys):
     video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
 
@@ -2298,6 +2478,9 @@ def test_generate_cli_video_frames_fallback_without_video_processor(capsys):
         system=None,
         max_tokens=8,
         temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        min_p=0.0,
         repetition_penalty=None,
         repetition_context_size=20,
         presence_penalty=None,
@@ -2953,3 +3136,69 @@ class TestBatchTurboQuantizedKVStart:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestPrePaddedBatchRows:
+    """Rows that arrive already padded must still declare that padding.
+
+    The tokenizer squares a batch off with left padding and reports it in the
+    attention mask. If that never reaches the caches, every row looks the same
+    length: a causal mask does not exclude padding that comes first, and a
+    recurrent layer walks it like any other column.
+    """
+
+    def _batch(self, rows, existing_left_padding):
+        import mlx.nn as nn
+
+        from mlx_vlm.generate.ar import PromptProcessingBatch
+
+        class Tiny(nn.Module):
+            def make_cache(self):
+                from mlx_vlm.models.cache import ArraysCache, KVCache
+
+                return [KVCache(), ArraysCache(1)]
+
+        return PromptProcessingBatch(
+            model=Tiny(),
+            uids=list(range(len(rows))),
+            input_ids=rows,
+            max_tokens=[4] * len(rows),
+            inputs_embeds=None,
+            prompt_kwargs={},
+            existing_left_padding=existing_left_padding,
+        )
+
+    def test_declared_padding_reaches_the_caches(self):
+        rows = [list(range(8)), list(range(8))]
+
+        batch = self._batch(rows, existing_left_padding=[5, 0])
+
+        assert batch._left_padding_per_row == [5, 0]
+
+    def test_uniform_rows_without_a_declaration_record_none(self):
+        rows = [list(range(8)), list(range(8))]
+
+        batch = self._batch(rows, existing_left_padding=None)
+
+        assert batch._left_padding_per_row == [0, 0]
+
+    def test_a_declaration_adds_to_the_generator_s_own_padding(self):
+        rows = [list(range(4)), list(range(8))]
+
+        batch = self._batch(rows, existing_left_padding=[2, 1])
+
+        assert batch._left_padding_per_row == [6, 1]
+
+    def test_arrays_cache_masks_the_declared_padding(self):
+        import mlx.core as mx
+
+        from mlx_vlm.models.cache import ArraysCache
+
+        entry = ArraysCache(1)
+        entry.left_padding = mx.array([5, 0])
+
+        mask = entry.make_mask(8)
+
+        assert mask.shape == (2, 8)
+        assert mask[0].tolist() == [False] * 5 + [True] * 3
+        assert mask[1].tolist() == [True] * 8
