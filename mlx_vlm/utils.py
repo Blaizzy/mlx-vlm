@@ -207,7 +207,23 @@ def _transform_modelopt_nvfp4_weights(
         for suffix in ("weight", "input_scale")
     }
     transformed = {}
+    # Each fold below builds a deep lazy graph. A large MoE export has tens of
+    # thousands of quantized tensors, so the unevaluated intermediates blow past
+    # Metal's live-buffer limit before the dict is ever consumed. Flush in
+    # batches to keep the graph shallow; this also frees the intermediates.
+    pending: List[mx.array] = []
+
+    def _flush(force: bool = False) -> None:
+        if pending and (force or len(pending) >= 256):
+            mx.eval(pending)
+            pending.clear()
+
     for key, value in weights.items():
+        # ModelOpt emits per-layer FP8 KV-cache scales when kv_cache_quant_algo
+        # is set. MLX quantizes the KV cache at runtime and has no parameter to
+        # hold them, so drop them rather than fail the strict load.
+        if key.endswith(".k_scale") or key.endswith(".v_scale"):
+            continue
         if key.endswith(scale_2_suffix):
             prefix = key[: -len(scale_2_suffix)]
             weight_key = f"{prefix}.weight"
@@ -236,6 +252,8 @@ def _transform_modelopt_nvfp4_weights(
             transformed[f"{prefix}.scales"] = _f32_to_e4m3(
                 decoded_scale * value.astype(mx.float32)
             )
+            pending.append(transformed[f"{prefix}.scales"])
+            _flush()
         elif key.endswith(scale_suffix) and key[: -len(scale_suffix)] in fp8_prefixes:
             prefix = key[: -len(scale_suffix)]
             weight_key = f"{prefix}.weight"
@@ -246,10 +264,14 @@ def _transform_modelopt_nvfp4_weights(
             transformed[weight_key] = _dequantize_compressed_tensors_fp8_weight(
                 weights[weight_key], value
             )
+            pending.append(transformed[weight_key])
+            _flush()
         elif key in nvfp4_consumed or key in fp8_consumed:
             continue
         else:
             transformed[key] = value
+
+    _flush(force=True)
 
     quantization = None
     if nvfp4_prefixes:
