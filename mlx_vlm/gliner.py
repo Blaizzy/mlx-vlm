@@ -191,21 +191,27 @@ class GLiNER2:
         )
         probabilities = mx.sigmoid(logits.astype(mx.float32))
         abstain = mx.sigmoid(null_logits.astype(mx.float32)) > 0.5
-        mx.eval(probabilities, pooled.indices, pooled.mask, abstain)
+        # Pull the whole candidate grid across once. Reading it element-wise
+        # costs one device synchronization per scalar, which dominates the
+        # request for every realistic label count.
+        scores = probabilities[0].tolist()
+        keeps = pooled.mask[0].tolist()
+        spans_index = pooled.indices[0].tolist()
+        abstains = abstain[0].tolist()
+        word_count = len(prepared.offsets)
+
         output = {}
         for query_index, label in enumerate(labels):
             candidates = []
-            if not bool(abstain[0, query_index].item()):
-                for candidate_index in range(pooled.indices.shape[1]):
-                    score = float(probabilities[0, candidate_index, query_index].item())
-                    if (
-                        not bool(pooled.mask[0, candidate_index].item())
-                        or score < threshold
-                    ):
+            if not abstains[query_index]:
+                for candidate_index, keep in enumerate(keeps):
+                    if not keep:
                         continue
-                    start = int(pooled.indices[0, candidate_index, 0].item())
-                    end = int(pooled.indices[0, candidate_index, 1].item())
-                    if start >= end or end > len(prepared.offsets):
+                    score = scores[candidate_index][query_index]
+                    if score < threshold:
+                        continue
+                    start, end = spans_index[candidate_index]
+                    if start >= end or end > word_count:
                         continue
                     candidates.append((score, start, end))
             spans = _resolve_flat_overlaps(candidates)
@@ -257,10 +263,7 @@ class GLiNER2:
             probabilities = mx.sigmoid(self.model.classify(choices).astype(mx.float32))[
                 0
             ]
-            mx.eval(probabilities)
-            scores = [
-                float(probabilities[index].item()) for index in range(len(labels))
-            ]
+            scores = probabilities.tolist()[: len(labels)]
             if multi_label:
                 results[task] = [
                     label

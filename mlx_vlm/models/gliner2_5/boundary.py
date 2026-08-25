@@ -203,34 +203,53 @@ class DocumentCandidatePool(nn.Module):
                 projected_start[row, pair_start] * projected_end[row, pair_end], axis=-1
             ) / math.sqrt(dim)
             global_score = compatibility + union_start[pair_start] + union_end[pair_end]
+            # Read the pair grid across once. Ranking used to evaluate a fresh
+            # three-term graph inside the sort key, so a single request issued
+            # thousands of device synchronizations and the pool -- not the
+            # encoder -- dominated end-to-end latency.
             mx.eval(pair_start, pair_end, valid, compatibility, global_score)
+            starts_list = pair_start.tolist()
+            ends_list = pair_end.tolist()
+            valid_list = valid.tolist()
+            global_list = global_score.tolist()
             pair_rows = [
-                (int(pair_start[i].item()), int(pair_end[i].item()), i)
-                for i in range(pair_start.size)
-                if bool(valid[i].item())
+                (starts_list[i], ends_list[i], i)
+                for i in range(len(valid_list))
+                if valid_list[i]
             ]
-            priorities = {}
-            for start, end, i in pair_rows:
-                priorities[(start, end)] = float(global_score[i].item())
+            priorities = {(start, end): global_list[i] for start, end, i in pair_rows}
             quota = min(self.min_pool_per_query, len(pair_rows))
-            for query_index in range(query_mask.shape[1]):
-                if not bool(query_mask[row, query_index].item()):
-                    continue
-                ranked = sorted(
-                    pair_rows,
-                    key=lambda item: float(
-                        (
-                            start_logits[row, query_index, item[0]]
-                            + end_logits[row, query_index, item[1]]
-                            + compatibility[item[2]]
-                        ).item()
-                    ),
-                    reverse=True,
-                )[:quota]
-                for rank, (start, end, _) in enumerate(ranked):
-                    priorities[(start, end)] = max(
-                        priorities[(start, end)], 5000.0 + quota - rank
+            if pair_rows and quota:
+                # Score every (query, pair) once instead of per comparison.
+                # mx.take keeps the query axis first; plain advanced indexing
+                # would move the gathered axis to the front.
+                pair_index = mx.array([row_[2] for row_ in pair_rows], dtype=mx.int32)
+                query_scores = (
+                    mx.take(
+                        start_logits[row],
+                        mx.array([row_[0] for row_ in pair_rows], dtype=mx.int32),
+                        axis=1,
                     )
+                    + mx.take(
+                        end_logits[row],
+                        mx.array([row_[1] for row_ in pair_rows], dtype=mx.int32),
+                        axis=1,
+                    )
+                    + compatibility[pair_index][None, :]
+                )
+                mx.eval(query_scores)
+                query_scores = query_scores.tolist()
+                order = range(len(pair_rows))
+                for query_index, active in enumerate(query_mask[row].tolist()):
+                    if not active:
+                        continue
+                    scores = query_scores[query_index]
+                    ranked = sorted(order, key=scores.__getitem__, reverse=True)[:quota]
+                    for rank, index in enumerate(ranked):
+                        start, end, _ = pair_rows[index]
+                        priorities[(start, end)] = max(
+                            priorities[(start, end)], 5000.0 + quota - rank
+                        )
             selected = sorted(priorities, key=priorities.get, reverse=True)[
                 : self.pool_size
             ]
