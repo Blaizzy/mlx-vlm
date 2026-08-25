@@ -534,7 +534,27 @@ def test_glm5_next_multimodal_forward_and_sanitize():
         "model.visual.downsample.weight": mx.zeros((16, 8, 2, 2)),
         "model.language_model.layers.0.hc_attn_fn": mx.zeros((24, 64)),
         "model.language_model.layers.0.self_attn.q_conv1d.weight": mx.zeros((8, 1, 2)),
+        "model.language_model.layers.0.self_attn.k_conv1d.weight": mx.zeros((8, 1, 2)),
+        "model.language_model.layers.0.self_attn.v_conv1d.weight": mx.zeros((8, 1, 2)),
+        "model.language_model.layers.0.self_attn.q_proj.weight": mx.zeros((8, 16)),
+        "model.language_model.layers.0.self_attn.k_proj.weight": mx.zeros((8, 16)),
+        "model.language_model.layers.0.self_attn.v_proj.weight": mx.zeros((8, 16)),
+        "model.language_model.layers.0.self_attn.f_a_proj.weight": mx.zeros((4, 16)),
+        "model.language_model.layers.0.self_attn.b_proj.weight": mx.zeros((2, 16)),
+        "model.language_model.layers.0.self_attn.g_a_proj.weight": mx.zeros((4, 16)),
+        "model.language_model.layers.0.mlp.gate_proj.weight": mx.zeros((32, 16)),
+        "model.language_model.layers.0.mlp.up_proj.weight": mx.zeros((32, 16)),
+        "model.language_model.layers.1.self_attn.q_a_proj.weight": mx.zeros((8, 16)),
+        "model.language_model.layers.1.self_attn.kv_a_proj_with_mqa.weight": mx.zeros(
+            (4, 16)
+        ),
         "model.language_model.layers.1.self_attn.kv_b_proj.weight": mx.zeros((16, 4)),
+        "model.language_model.layers.1.mlp.shared_experts.gate_proj.weight": mx.zeros(
+            (8, 16)
+        ),
+        "model.language_model.layers.1.mlp.shared_experts.up_proj.weight": mx.zeros(
+            (8, 16)
+        ),
         "model.language_model.layers.2.input_layernorm.weight": mx.zeros((16,)),
         "model.language_model.layers.0.fp8_proj.weight": mx.zeros(
             (32, 32), dtype=mx.uint8
@@ -569,6 +589,25 @@ def test_glm5_next_multimodal_forward_and_sanitize():
     assert sanitized[
         "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight"
     ].shape == (2, 8, 16)
+    assert sanitized[
+        "language_model.model.layers.0.self_attn.qkv_proj.weight"
+    ].shape == (24, 16)
+    assert sanitized[
+        "language_model.model.layers.0.self_attn.qkv_conv.conv.weight"
+    ].shape == (24, 2, 1)
+    assert sanitized[
+        "language_model.model.layers.0.self_attn.fbg_a_proj.weight"
+    ].shape == (10, 16)
+    assert sanitized["language_model.model.layers.0.mlp.gate_up_proj.weight"].shape == (
+        64,
+        16,
+    )
+    assert sanitized[
+        "language_model.model.layers.1.self_attn.qkv_a_proj.weight"
+    ].shape == (12, 16)
+    assert sanitized[
+        "language_model.model.layers.1.mlp.shared_experts.gate_up_proj.weight"
+    ].shape == (16, 16)
     assert "language_model.model.layers.2.input_layernorm.weight" not in sanitized
     assert sanitized["language_model.model.layers.0.fp8_proj.weight"].dtype == mx.uint32
     assert sanitized["language_model.model.layers.0.fp8_proj.scales"].dtype == mx.uint8

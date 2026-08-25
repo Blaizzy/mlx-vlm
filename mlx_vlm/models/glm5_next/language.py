@@ -37,15 +37,15 @@ class Glm5NextMLP(nn.Module):
     def __init__(self, config: TextConfig, intermediate_size: Optional[int] = None):
         super().__init__()
         intermediate_size = intermediate_size or config.intermediate_size
-        self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+        self.gate_up_proj = nn.Linear(
+            config.hidden_size, 2 * intermediate_size, bias=False
+        )
         self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
         self.swiglu_limit = config.swiglu_limit
 
     def __call__(self, x):
-        return self.down_proj(
-            _limited_swiglu(self.gate_proj(x), self.up_proj(x), self.swiglu_limit)
-        )
+        gate, up = mx.split(self.gate_up_proj(x), 2, axis=-1)
+        return self.down_proj(_limited_swiglu(gate, up, self.swiglu_limit))
 
 
 @mx.compile
@@ -179,17 +179,15 @@ class Glm5NextLinearAttention(nn.Module):
         self.scale = self.head_dim**-0.5
         self.lower_bound = config.linear_lower_bound
 
-        self.q_proj = nn.Linear(config.hidden_size, self.projection_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, self.projection_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, self.projection_dim, bias=False)
-        self.q_conv = ShortConv1d(self.projection_dim, self.conv_kernel)
-        self.k_conv = ShortConv1d(self.projection_dim, self.conv_kernel)
-        self.v_conv = ShortConv1d(self.projection_dim, self.conv_kernel)
+        self.qkv_proj = nn.Linear(
+            config.hidden_size, 3 * self.projection_dim, bias=False
+        )
+        self.qkv_conv = ShortConv1d(3 * self.projection_dim, self.conv_kernel)
 
-        self.f_a_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+        self.fbg_a_proj = nn.Linear(
+            config.hidden_size, 2 * self.head_dim + self.num_heads, bias=False
+        )
         self.f_b_proj = nn.Linear(self.head_dim, self.projection_dim, bias=False)
-        self.b_proj = nn.Linear(config.hidden_size, self.num_heads, bias=False)
-        self.g_a_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
         self.g_b_proj = nn.Linear(self.head_dim, self.projection_dim, bias=False)
         self.A_log = mx.zeros((self.num_heads,), dtype=mx.float32)
         self.dt_bias = mx.zeros((self.projection_dim,), dtype=mx.float32)
@@ -199,17 +197,25 @@ class Glm5NextLinearAttention(nn.Module):
     def __call__(self, x, mask=None, cache=None):
         batch, length, _ = x.shape
         if cache is None:
-            q_state = k_state = v_state = ssm_state = None
+            qkv_state = ssm_state = None
             lengths = None
         else:
-            q_state, k_state, v_state, ssm_state = cache
+            qkv_state = cache[0]
+            if qkv_state is not None and qkv_state.shape[-1] == self.projection_dim:
+                states = [cache[index] for index in range(3)]
+                qkv_state = (
+                    None
+                    if any(state is None for state in states)
+                    else mx.concatenate(states, axis=-1)
+                )
+            ssm_state = cache[3]
             lengths = cache.lengths
 
-        q, q_state = self.q_conv(self.q_proj(x), q_state, mask, lengths)
-        k, k_state = self.k_conv(self.k_proj(x), k_state, mask, lengths)
-        v, v_state = self.v_conv(self.v_proj(x), v_state, mask, lengths)
+        qkv, qkv_state = self.qkv_conv(self.qkv_proj(x), qkv_state, mask, lengths)
+        q, k, v = mx.split(qkv, 3, axis=-1)
         if cache is not None:
-            cache[0], cache[1], cache[2] = q_state, k_state, v_state
+            cache[0] = qkv_state
+            cache[1] = cache[2] = None
 
         shape = (batch, length, self.num_heads, self.head_dim)
         q, k, v = q.reshape(shape), k.reshape(shape), v.reshape(shape)
@@ -217,8 +223,13 @@ class Glm5NextLinearAttention(nn.Module):
         q = (self.scale**2) * mx.fast.rms_norm(q, None, eps)
         k = self.scale * mx.fast.rms_norm(k, None, eps)
 
-        a = self.f_b_proj(self.f_a_proj(x)).reshape(shape)
-        b = self.b_proj(x).reshape(batch, length, self.num_heads)
+        f_a, b, g_a = mx.split(
+            self.fbg_a_proj(x),
+            (self.head_dim, self.head_dim + self.num_heads),
+            axis=-1,
+        )
+        a = self.f_b_proj(f_a).reshape(shape)
+        b = b.reshape(batch, length, self.num_heads)
         out, ssm_state = gated_delta_update(
             q,
             k,
@@ -236,7 +247,7 @@ class Glm5NextLinearAttention(nn.Module):
             cache[3] = ssm_state
             cache.advance(length)
 
-        gate = self.g_b_proj(self.g_a_proj(x)).reshape(shape)
+        gate = self.g_b_proj(g_a).reshape(shape)
         out = (self.o_norm(out) * mx.sigmoid(gate)).reshape(batch, length, -1)
         return self.o_proj(out)
 
@@ -695,17 +706,16 @@ class Glm5NextAttention(nn.Module):
         self.v_head_dim = config.v_head_dim
         self.scale = self.q_head_dim**-0.5
         self.skip_topk = config.indexer_types[layer_idx] == "shared"
-        self.q_a_proj = nn.Linear(
-            config.hidden_size, config.q_lora_rank, bias=config.attention_bias
+        self.qkv_a_proj = nn.Linear(
+            config.hidden_size,
+            config.q_lora_rank + config.kv_lora_rank,
+            bias=config.attention_bias,
         )
         self.q_a_layernorm = nn.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
         self.q_b_proj = nn.Linear(
             config.q_lora_rank,
             self.num_heads * self.q_head_dim,
             bias=False,
-        )
-        self.kv_a_proj_with_mqa = nn.Linear(
-            config.hidden_size, config.kv_lora_rank, bias=config.attention_bias
         )
         self.kv_a_layernorm = nn.RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
         self.embed_q = MultiLinear(
@@ -723,13 +733,14 @@ class Glm5NextAttention(nn.Module):
 
     def __call__(self, x, padding_mask=None, cache=None, prev_topk_indices=None):
         batch, length, _ = x.shape
-        q_resid = self.q_a_layernorm(self.q_a_proj(x))
+        q_a, kv_a = mx.split(self.qkv_a_proj(x), (self.q_lora_rank,), axis=-1)
+        q_resid = self.q_a_layernorm(q_a)
         q = (
             self.q_b_proj(q_resid)
             .reshape(batch, length, self.num_heads, self.q_head_dim)
             .transpose(0, 2, 1, 3)
         )
-        new_latent = self.kv_a_layernorm(self.kv_a_proj_with_mqa(x))[:, None]
+        new_latent = self.kv_a_layernorm(kv_a)[:, None]
 
         if cache is None:
             kv_cache = index_cache = pool_cache = hierarchy_cache = None
@@ -991,6 +1002,51 @@ class LanguageModel(nn.Module):
 
         for layer_idx, layer in enumerate(self.layers):
             prefix = f"language_model.model.layers.{layer_idx}"
+            mlp_prefixes = []
+            if isinstance(layer.mlp, Glm5NextMLP):
+                mlp_prefixes.append(f"{prefix}.mlp")
+            elif isinstance(layer.mlp, Glm5NextMoE):
+                mlp_prefixes.append(f"{prefix}.mlp.shared_experts")
+            for mlp_prefix in mlp_prefixes:
+                for suffix in ("weight", "scales", "biases"):
+                    source_keys = [
+                        f"{mlp_prefix}.{projection}.{suffix}"
+                        for projection in ("gate_proj", "up_proj")
+                    ]
+                    present = [key in weights for key in source_keys]
+                    if not any(present):
+                        continue
+                    if not all(present):
+                        continue
+                    weights[f"{mlp_prefix}.gate_up_proj.{suffix}"] = mx.concatenate(
+                        [weights.pop(key) for key in source_keys], axis=0
+                    )
+
+            if isinstance(layer.self_attn, Glm5NextLinearAttention):
+                attn_prefix = f"{prefix}.self_attn"
+                for destination, sources in (
+                    ("qkv_proj", ("q_proj", "k_proj", "v_proj")),
+                    ("fbg_a_proj", ("f_a_proj", "b_proj", "g_a_proj")),
+                    (
+                        "qkv_conv.conv",
+                        ("q_conv.conv", "k_conv.conv", "v_conv.conv"),
+                    ),
+                ):
+                    for suffix in ("weight", "scales", "biases"):
+                        source_keys = [
+                            f"{attn_prefix}.{source}.{suffix}" for source in sources
+                        ]
+                        present = [key in weights for key in source_keys]
+                        if not any(present):
+                            continue
+                        if not all(present):
+                            continue
+                        weights[f"{attn_prefix}.{destination}.{suffix}"] = (
+                            mx.concatenate(
+                                [weights.pop(key) for key in source_keys], axis=0
+                            )
+                        )
+
             if isinstance(layer.mlp, Glm5NextMoE):
                 for name in ("gate_proj", "up_proj", "down_proj"):
                     for suffix in ("weight", "scales", "biases"):
@@ -1007,6 +1063,21 @@ class LanguageModel(nn.Module):
                             )
 
             attn_prefix = f"{prefix}.self_attn"
+            if isinstance(layer.self_attn, Glm5NextAttention):
+                for suffix in ("weight", "scales", "biases", "bias"):
+                    source_keys = [
+                        f"{attn_prefix}.{projection}.{suffix}"
+                        for projection in ("q_a_proj", "kv_a_proj_with_mqa")
+                    ]
+                    present = [key in weights for key in source_keys]
+                    if not any(present):
+                        continue
+                    if not all(present):
+                        continue
+                    weights[f"{attn_prefix}.qkv_a_proj.{suffix}"] = mx.concatenate(
+                        [weights.pop(key) for key in source_keys], axis=0
+                    )
+
             kv_b_key = f"{attn_prefix}.kv_b_proj.weight"
             if isinstance(layer.self_attn, Glm5NextAttention) and kv_b_key in weights:
                 value = weights.pop(kv_b_key)
