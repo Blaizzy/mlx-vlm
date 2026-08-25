@@ -609,18 +609,13 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
         raise KeyError("model_type")
     model_type = raw_model_type.lower()
 
-    if (
-        model_type == "extractor"
-        and config.get("architecture") == "boundary"
-        and "BoundaryExtractor" in (config.get("architectures") or ())
-    ):
-        model_type = "gliner2_5"
-
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
     architectures = set(config.get("architectures") or ())
     dflash_config = config.get("dflash_config")
-    if "DFlash2DraftModel" in architectures:
+    if "BoundaryExtractor" in architectures:
+        model_type = "gliner2_5"
+    elif "DFlash2DraftModel" in architectures:
         model_type = "dflash2"
     elif dflash_config is not None:
         is_dspark = (
@@ -761,17 +756,6 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     """
     strict = kwargs.pop("strict", True)
     config = load_config(model_path, **kwargs)
-    if (
-        config.get("model_type") == "extractor"
-        and config.get("architecture") == "boundary"
-    ):
-        encoder_config_path = model_path / "encoder_config" / "config.json"
-        if not encoder_config_path.is_file():
-            raise FileNotFoundError(
-                f"GLiNER2.5 encoder config not found: {encoder_config_path}"
-            )
-        with open(encoder_config_path) as f:
-            config["encoder_config"] = json.load(f)
 
     index_file = model_path / "model.safetensors.index.json"
     weight_files = []
@@ -1220,10 +1204,23 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
             except json.JSONDecodeError:
                 pass
 
-        return config
-
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"Config not found at {model_path}") from exc
+
+    # GLiNER2.5 ships its encoder config in a sidecar directory instead of
+    # inline, so fold it in alongside the other config files. Raised outside the
+    # block above so the missing file is not reported as a missing config.json.
+    if "BoundaryExtractor" in (config.get("architectures") or ()):
+        if "encoder_config" not in config:
+            encoder_config_path = model_path / "encoder_config" / "config.json"
+            if not encoder_config_path.is_file():
+                raise FileNotFoundError(
+                    f"GLiNER2.5 encoder config not found: {encoder_config_path}"
+                )
+            with open(encoder_config_path, encoding="utf-8") as f:
+                config["encoder_config"] = json.load(f)
+
+    return config
 
 
 def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImageProcessor:

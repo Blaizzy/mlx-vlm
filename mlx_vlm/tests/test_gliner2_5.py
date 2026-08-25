@@ -1,3 +1,5 @@
+import json
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
@@ -16,6 +18,7 @@ from mlx_vlm.models.gliner2_5.boundary import (
     PooledCandidates,
     SharedPoolScorer,
 )
+from mlx_vlm.utils import get_model_and_args, load_config
 
 
 def test_nested_encoder_config():
@@ -294,3 +297,63 @@ def test_quantized_encoder_still_runs():
 
     assert encoded.shape == reference.shape
     assert bool(mx.all(mx.isfinite(encoded.astype(mx.float32))))
+
+
+def _write_checkpoint(root, *, sidecar=True, inline=False):
+    encoder = {"vocab_size": 128, "hidden_size": 64, "num_attention_heads": 4}
+    config = {
+        "model_type": "extractor",
+        "architecture": "boundary",
+        "architectures": ["BoundaryExtractor"],
+    }
+    if inline:
+        config["encoder_config"] = encoder
+    (root / "config.json").write_text(json.dumps(config))
+    if sidecar:
+        (root / "encoder_config").mkdir()
+        (root / "encoder_config" / "config.json").write_text(json.dumps(encoder))
+    return root
+
+
+def test_load_config_folds_in_the_sidecar_encoder_config(tmp_path):
+    """The encoder config has to be composed in ``load_config``, not ``load_model``.
+
+    Several callers -- ``fetch_from_hub``, ``load_image_processor``, the encoder
+    and reranker loaders -- use ``load_config`` without ever reaching
+    ``load_model``, so folding it in later hands them an incomplete config.
+    """
+    config = load_config(_write_checkpoint(tmp_path))
+
+    assert config["encoder_config"]["hidden_size"] == 64
+
+
+def test_load_config_accepts_an_inlined_encoder_config(tmp_path):
+    """A converted checkpoint may carry the encoder config inline.
+
+    ``convert`` only reproduces the sidecar directory because it copies every
+    subdirectory wholesale; requiring the directory would couple loading to that
+    incidental behaviour.
+    """
+    config = load_config(_write_checkpoint(tmp_path, sidecar=False, inline=True))
+
+    assert config["encoder_config"]["hidden_size"] == 64
+
+
+def test_load_config_reports_the_missing_encoder_config(tmp_path):
+    """The error must name the sidecar, not read as a missing config.json."""
+    root = _write_checkpoint(tmp_path, sidecar=False)
+
+    with pytest.raises(FileNotFoundError, match="encoder config not found"):
+        load_config(root)
+
+
+def test_boundary_architecture_selects_the_gliner_module():
+    _, model_type = get_model_and_args(
+        {
+            "model_type": "extractor",
+            "architecture": "boundary",
+            "architectures": ["BoundaryExtractor"],
+        }
+    )
+
+    assert model_type == "gliner2_5"
