@@ -29,8 +29,12 @@ from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
 from mlx_vlm.models.cache import (
     BatchKVCache,
+    BatchPoolingCache,
+    BatchRotatingKVCache,
     BufferedRotatingKVCache,
+    CacheList,
     KVCache,
+    PoolingCache,
     RotatingKVCache,
 )
 from mlx_vlm.utils import ThinkingBudgetCriteria
@@ -596,6 +600,50 @@ class TestBatchGenerator:
         assert stats.prompt_tps == 200.0  # 100 / 0.5
         assert stats.prompt_tokens == 100
 
+    def test_extend_active_deepseek_cache_with_concurrent_request(self):
+        def make_row(prompt_length):
+            rotating = BatchRotatingKVCache(max_size=16, left_padding=[0])
+            keys = mx.random.normal((1, 1, prompt_length, 4))
+            values = mx.random.normal((1, 1, prompt_length, 4))
+            rotating.update_and_fetch(keys, values)
+            rotating.finalize()
+
+            pooling = BatchPoolingCache(ratio=4, left_padding=[0])
+            pooling.prepare(lengths=[prompt_length])
+            kv = mx.random.normal((1, prompt_length, 3))
+            gate = mx.random.normal((1, prompt_length, 2))
+            ready_kv, _, _ = pooling.accumulate_windows(kv, gate, offset=0)
+            pooled = mx.random.normal((1, ready_kv.shape[1] // 4, 3))
+            pooling.update_and_fetch(pooled)
+            pooling.finalize()
+            return [CacheList(rotating, pooling)]
+
+        active = make_row(6)
+        joining = make_row(5)
+
+        extended = ar_module._extend_cache(active, joining)
+
+        rotating, pooling = extended[0].caches
+        assert isinstance(rotating, BatchRotatingKVCache)
+        assert rotating.offset.shape == (2,)
+        assert rotating.keys.shape[0] == 2
+        assert isinstance(pooling, BatchPoolingCache)
+        assert pooling.remainder == [2, 1]
+        assert pooling.pooled.shape[0] == 2
+
+    def test_make_cache_converts_left_padded_pooling_cache(self):
+        class PoolingModel:
+            def make_cache(self):
+                return [PoolingCache(ratio=4)]
+
+        caches = ar_module._make_cache(PoolingModel(), [2, 0])
+
+        assert len(caches) == 1
+        assert isinstance(caches[0], BatchPoolingCache)
+        assert caches[0].ratio == 4
+        assert caches[0].remainder == [0, 0]
+        assert caches[0].left_padding == [2, 0]
+
     def test_next_reports_prompt_progress_for_completed_prefill(
         self, mock_model, mock_processor, monkeypatch
     ):
@@ -624,6 +672,27 @@ class TestBatchGenerator:
         assert prompt_responses[0].prompt_tps == pytest.approx(15.0)
         assert prompt_responses[0].prompt_time == pytest.approx(0.2)
         assert prompt_responses[0].cached_tokens == 0
+
+    def test_chunked_prefill_stats_count_each_prompt_token_once(
+        self, mock_model, mock_processor
+    ):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            prefill_batch_size=1,
+            completion_batch_size=1,
+            prefill_step_size=2,
+        )
+        prompt_tokens = 5
+        gen._prompt_batch = SimpleNamespace(
+            needs_processing=lambda: True,
+            prompt_step=lambda: 2,
+        )
+        gen._prompt_tokens_counter = prompt_tokens
+
+        gen.next()
+
+        assert gen.stats().prompt_tokens == prompt_tokens
 
     def test_prompt_progress_reports_apc_cached_tokens(self):
         batch = PromptProcessingBatch(
@@ -2170,6 +2239,9 @@ def test_generate_cli_smoke(capsys):
         system=None,
         max_tokens=12,
         temperature=0.7,
+        top_p=1.0,
+        top_k=0,
+        min_p=0.0,
         repetition_penalty=None,
         repetition_context_size=20,
         presence_penalty=None,
@@ -2245,6 +2317,9 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
         system=None,
         max_tokens=8,
         temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        min_p=0.0,
         repetition_penalty=None,
         repetition_context_size=20,
         presence_penalty=None,
@@ -2403,6 +2478,9 @@ def test_generate_cli_video_frames_fallback_without_video_processor(capsys):
         system=None,
         max_tokens=8,
         temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        min_p=0.0,
         repetition_penalty=None,
         repetition_context_size=20,
         presence_penalty=None,

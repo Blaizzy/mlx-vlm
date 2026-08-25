@@ -469,6 +469,13 @@ def _unload_model_cache_group(cache_group: str) -> bool:
         cache.get("adapter_path"),
     )
 
+    apc_manager = cache.get("apc_manager")
+    if apc_manager is not None:
+        # APC entries own model-specific KV state. Invalidate them before the
+        # generation worker starts releasing the model so no stale entry can
+        # be observed during a concurrent unload/reload transition.
+        apc_manager.clear()
+
     response_generator = cache.get("response_generator")
     if response_generator is not None:
         logger.info("Stopping response generator.")
@@ -476,8 +483,10 @@ def _unload_model_cache_group(cache_group: str) -> bool:
         if runtime.response_generator is response_generator:
             runtime.response_generator = None
 
-    apc_manager = cache.get("apc_manager")
     if apc_manager is not None:
+        # A worker that was already draining may have completed an APC store
+        # after the first reset. Clear once more before publishing the cache
+        # group as unloaded.
         apc_manager.clear()
         if runtime.apc_manager is apc_manager:
             runtime.apc_manager = None
@@ -788,9 +797,7 @@ def get_cached_model(
     vision_cache_size = cfg.vision_cache_size
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
 
-    kv_bits = (
-        cfg.kv_bits if cfg.kv_bits is not None else get_quantized_kv_bits(model_path)
-    )
+    kv_bits = cfg.kv_bits if cfg.kv_bits is not None else get_quantized_kv_bits()
     default_key_bits, default_value_bits = get_quantized_kv_split_bits()
     kv_key_bits = cfg.kv_key_bits if cfg.kv_key_bits is not None else default_key_bits
     kv_value_bits = (
