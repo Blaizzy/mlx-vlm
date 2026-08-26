@@ -17,7 +17,6 @@ from ..deepseek_v32.language import MoEGate, group_expert_select
 from ..gated_delta import gated_delta_update
 from ..mla import MultiLinear
 from ..mlp import DeepseekMLP
-from ..rope_utils import initialize_rope
 from .config import ModelConfig, TextConfig
 from .speculative_verifier import Glm5NextExactSpeculativeVerifier, verify_logits
 

@@ -13,6 +13,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
     - [Gemma 4 MTP](#gemma-4-mtp)
     - [Gemma 4 EAGLE-3](#gemma-4-eagle-3)
     - [MiniMax M3 EAGLE-3](#minimax-m3-eagle-3)
+    - [GLM-5.3-Flash MTP](#glm-53-flash-mtp)
   - [Chat UI with Gradio](#chat-ui-with-gradio)
   - [Python Script](#python-script)
   - [Server (FastAPI)](#server-fastapi)
@@ -369,6 +370,45 @@ MiniMax M3 also supports image/video prompts, MiniMax thinking tags, MiniMax
 tool-call parsing, MSA index caches, and MXFP8 config loading. See
 [`mlx_vlm/models/minimax_m3_vl/README.md`](mlx_vlm/models/minimax_m3_vl/README.md)
 for model-specific conversion and runtime notes.
+
+#### GLM-5.3-Flash MTP
+
+GLM-5.3-Flash (`glm5_next`) ships one trained nextn (MTP) layer inside the
+target checkpoint. `mlx_vlm.convert` drops it during a normal conversion, so it
+is extracted into a standalone drafter for self-speculative decoding. Split it
+once, then pass it with `--draft-kind mtp`:
+
+```sh
+# Extract the nextn layer into a standalone drafter (reads only the nextn shards)
+uv run python -m mlx_vlm.speculative.drafters.glm5_next_mtp.split \
+  --model zai-org/GLM-5.3-Flash \
+  --output ./GLM-5.3-Flash-MTP
+
+mlx_vlm.generate --model ./GLM-5.3-Flash-mlx \
+  --draft-model ./GLM-5.3-Flash-MTP --draft-kind mtp \
+  --prompt "Explain multi-head latent attention." \
+  --max-tokens 512 --temperature 0
+
+# Server
+mlx_vlm.server --model ./GLM-5.3-Flash-mlx \
+  --draft-model ./GLM-5.3-Flash-MTP --draft-kind mtp
+```
+
+A single nextn head drafts one token per round, so the speedup is bounded by the
+`[bonus, draft]` verify cost; it is largest in the mid-context band and tapers at
+very short and very long context. A self-calibrating never-lose gate measures the
+draft-vs-plain cost once and falls back to plain decoding whenever drafting would
+not be faster (short context, long context, or large batch), so enabling MTP does
+not slow generation below the baseline by more than the plain-step overhead.
+The drafter only proposes tokens; the target verifies every one, so decoding
+quality tracks plain greedy decoding.
+
+Measured speedups (M3 Ultra, 4-bit, greedy): **1.12-1.22×** in the 2k-8k
+mid-context band across batch 1/2/4, tapering to near-baseline at very short and
+very long context (single nextn head → block size 2 → ceiling ~1.36× at realistic
+acceptance). See
+[`mlx_vlm/speculative/drafters/glm5_next_mtp/README.md`](mlx_vlm/speculative/drafters/glm5_next_mtp/README.md)
+for the full sweep, split tool, and architecture notes.
 
 ### Chat UI with Gradio
 

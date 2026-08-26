@@ -42,9 +42,9 @@ folded back into the drafter's own KV/indexer cache.
   the draft is accepted often enough to clear the verify overhead, and that
   break-even shifts with context length and batch size. The orchestrator times
   drafting rounds against plain-decode rounds and pauses drafting whenever it is
-  not actually faster on the current workload, re-probing periodically. Output is
-  byte-identical either way (the target verifies every token), so this only puts
-  a hard floor at the baseline decode speed.
+  not actually faster on the current workload, re-probing periodically. The
+  target verifies every token either way, so the gate only trades drafting
+  throughput for a floor near the baseline decode speed.
 
 ## Split a Drafter
 
@@ -86,6 +86,35 @@ mlx_vlm.generate --model ./GLM-5.3-Flash-mlx \
   --prompt "Explain multi-head latent attention." \
   --max-tokens 512 --temperature 0
 ```
+
+## Measured speedups
+
+M3 Ultra, GLM-5.3-Flash 4-bit, greedy decoding, decode tok/s with vs. without the
+drafter (same build), 128-token completions:
+
+| batch | context | no MTP | MTP | speedup | accept |
+| --: | --: | --: | --: | --: | --: |
+| 1 | 512   | 33.8 | 30.8 | 0.91x | 0.65 |
+| 1 | 2048  | 29.8 | 34.6 | 1.16x | 0.79 |
+| 1 | 8192  | 29.3 | 35.7 | 1.22x | 0.87 |
+| 1 | 32768 | 28.6 | 28.1 | 0.98x | 0.75 |
+| 2 | 512   | 51.9 | 47.9 | 0.92x | 0.78 |
+| 2 | 2048  | 45.5 | 52.5 | 1.16x | 0.81 |
+| 2 | 8192  | 45.1 | 54.1 | 1.20x | 0.89 |
+| 2 | 32768 | 43.1 | 41.1 | 0.95x | 0.74 |
+| 4 | 512   | 82.3 | 73.7 | 0.90x | 0.56 |
+| 4 | 2048  | 71.7 | 81.2 | 1.13x | 0.79 |
+| 4 | 8192  | 70.5 | 78.9 | 1.12x | 0.81 |
+| 4 | 32768 | 66.3 | 60.9 | 0.92x | 0.56 |
+
+The win is in the mid-context band (1.12-1.22x at 2k-8k across batch sizes). A
+single nextn head drafts one token per round, so the block is 2 and the ceiling
+is `(1 + accept) / verify_ratio` -- with `verify_ratio` ~= 1.4 that is about
+1.36x at realistic acceptance and ~1.45x even at perfect acceptance. Larger gains
+need a multi-layer MTP head. At very short and very long context (and as the batch
+grows) drafting can't clear the verify overhead; the never-lose gate detects this
+and falls back to plain decode, so those cells stay within the plain-step overhead
+of the baseline instead of regressing.
 
 ## Notes
 
