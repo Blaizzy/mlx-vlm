@@ -202,13 +202,27 @@ def kv_sequence_length(keys) -> int:
     a ``(packed, scales, biases)`` tuple and TurboQuant caches return
     codec-state named tuples.
     """
-    if isinstance(keys, mx.array):
+    if isinstance(keys, mx.array) or hasattr(keys, "shape"):
         return keys.shape[-2]
     # Plain tuple/list only: TurboQuant states are NamedTuples with a
     # different layout and get measured by their own helper.
     if type(keys) in (tuple, list):
         return keys[0].shape[-2]
     return _turboquant_state_length(keys)
+
+
+def slice_kv_sequence(state, end: int):
+    """Return the ``[:end]`` sequence prefix of a KV state.
+
+    Uniform quantized caches return a tuple of packed values, scales and
+    biases instead of a single array. Slice every component so callers such
+    as speculative target verification can narrow the prefix without first
+    dequantizing it. Other state wrappers implement the same four-axis slice
+    directly.
+    """
+    if type(state) in (tuple, list):
+        return tree_map(lambda x: x[:, :, :end, :], state)
+    return state[:, :, :end, :]
 
 
 def create_attention_mask(
