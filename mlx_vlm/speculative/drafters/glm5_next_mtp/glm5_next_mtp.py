@@ -15,6 +15,15 @@ class Glm5NextMTPDraftModel(nn.Module):
     requires_uniform_batch_acceptance = True
     supports_ragged_batch_acceptance = False
 
+    # Never-lose gate: a single nextn head caps the block at 2 tokens, so a round
+    # only pays off when the draft is accepted often enough to clear the verify
+    # overhead -- and that break-even shifts with context length and batch size
+    # (short context and large batches raise the bar). The MTP orchestrator's
+    # self-calibrating timing controller (opt-in via this flag) measures drafting
+    # against plain decoding and asks for an empty block when drafting is not
+    # actually faster; draft_block then yields nothing and a plain decode step runs.
+    adaptive_pause = True
+
     def __init__(self, config: Glm5NextMTPConfig):
         super().__init__()
         self.config = config
@@ -241,6 +250,14 @@ class Glm5NextMTPDraftModel(nn.Module):
         greedy: bool = False,
     ) -> mx.array:
         del cache
+        if block_size <= 1:
+            # Paused round: yield no drafts so the orchestrator runs a plain decode
+            # step (verify sees only the bonus). Never slower than the baseline, and
+            # needs no bound embeddings/LM head.
+            self._round_appended = 0
+            B = 1 if isinstance(last_bonus, int) else int(last_bonus.shape[0])
+            return mx.zeros((B, 0), dtype=token_dtype)
+
         if self._input_embed is None or self._lm_head_fn is None:
             raise RuntimeError(
                 "bind(target_model) must be called before draft_block() "

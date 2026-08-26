@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
@@ -493,6 +494,120 @@ def _mtp_next_block_size(
     )
 
 
+def _median(values: List[float]) -> float:
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2:
+        return ordered[mid]
+    return 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
+class _AdaptivePauseController:
+    """Self-calibrating never-lose gate for MTP.
+
+    A single-nextn-head drafter only speeds things up when its draft is accepted
+    often enough to clear the verify overhead, and that break-even shifts with the
+    context length and batch size -- so a fixed acceptance threshold mislabels the
+    short-context / large-batch cases.
+
+    The controller runs a one-time calibration (a few synchronized draft rounds and
+    plain steps, skipping the first couple of drafts that pay compile/warm-up cost)
+    to measure this workload's draft-round vs plain-step wall time, turning it into a
+    break-even acceptance = draft_time / plain_time - 1. After that it stops timing
+    and gates purely on the drafter's rolling acceptance: it drafts while acceptance
+    clears break-even and otherwise runs a plain decode step, re-probing periodically
+    so it resumes the moment drafting pays off again.
+
+    Correctness is unaffected either way -- the target verifies every emitted token
+    whether it was drafted or produced by a plain step -- so this only trades a
+    little drafting throughput for a hard floor at the baseline decode speed. It is
+    opt-in: the orchestrator builds one only when the drafter sets ``adaptive_pause``.
+    """
+
+    def __init__(
+        self,
+        configured_block_total: int,
+        cal_skip: int = 2,
+        cal_draft: int = 3,
+        cal_plain: int = 2,
+        probe_every: int = 24,
+        window: int = 12,
+        margin: float = 0.02,
+    ) -> None:
+        self.configured = max(2, int(configured_block_total))
+        self.cal_skip = cal_skip
+        self.cal_draft = cal_draft
+        self.cal_plain = cal_plain
+        self.probe_every = probe_every
+        self.window = window
+        self.margin = margin
+        self.break_even: Optional[float] = None
+        self._draft_times: List[float] = []
+        self._plain_times: List[float] = []
+        self._draft_seen = 0
+        self._accepts: List[int] = []
+        self.since_probe = 0
+        self._t: Optional[float] = None
+        self._pending: Optional[str] = None  # "draft" | "plain" during calibration
+
+    def _calibrating(self) -> bool:
+        return self.break_even is None
+
+    def mark(self) -> None:
+        # Only times rounds during calibration; synchronizes so each measured
+        # interval is the real (completed) wall time rather than async dispatch time.
+        if not self._calibrating():
+            return
+        mx.synchronize()
+        now = time.perf_counter()
+        if self._t is not None and self._pending is not None:
+            dt = now - self._t
+            if self._pending == "draft":
+                self._draft_seen += 1
+                if self._draft_seen > self.cal_skip:
+                    self._draft_times.append(dt)
+            else:
+                self._plain_times.append(dt)
+        self._t = now
+
+    def block_total(self, remaining: int) -> int:
+        if remaining <= 1:
+            return 1
+        if self._calibrating():
+            if len(self._draft_times) < self.cal_draft:
+                return self.configured  # collect (post-warm-up) draft-round samples
+            if len(self._plain_times) < self.cal_plain:
+                return 1  # collect plain-step samples
+            plain = _median(self._plain_times)
+            draft = _median(self._draft_times)
+            self.break_even = max(0.0, draft / plain - 1.0) if plain > 0 else 0.0
+        # Steady state: gate on rolling acceptance against the measured break-even.
+        if not self._accepts:
+            return self.configured
+        rate = sum(self._accepts) / len(self._accepts)
+        if rate >= self.break_even + self.margin:
+            self.since_probe = 0
+            return self.configured
+        self.since_probe += 1
+        if self.since_probe >= self.probe_every:
+            self.since_probe = 0
+            return self.configured
+        return 1
+
+    def record(
+        self,
+        block_total: int,
+        accepted: Optional[int] = None,
+        n_draft: Optional[int] = None,
+    ) -> None:
+        self._pending = "draft" if block_total > 1 else "plain"
+        if block_total > 1 and n_draft:
+            self._accepts.append(1 if int(accepted or 0) >= int(n_draft) else 0)
+            if len(self._accepts) > self.window:
+                self._accepts = self._accepts[-self.window :]
+
+
 def _buffer_mtp_target_cache(
     prompt_cache: List[Any],
     draft_model: nn.Module,
@@ -595,15 +710,29 @@ def _mtp_rounds(
     b = first_bonus
     emitted = 1  # caller already yielded the first bonus
 
+    pause_ctl = (
+        _AdaptivePauseController(configured_block_total)
+        if getattr(draft_model, "adaptive_pause", False)
+        else None
+    )
+
     while emitted < max_tokens:
-        bs = _mtp_next_block_size(
-            draft_model,
-            block_total,
-            configured_block_total,
-            max_tokens - emitted + 1,
-        )
-        if bs <= 1:
-            break
+        if pause_ctl is not None:
+            pause_ctl.mark()
+            bs = pause_ctl.block_total(max_tokens - emitted)
+            # bs==1 mid-stream means "run a plain decode step" (draft_block yields
+            # no drafts, verify sees only the bonus); at end-of-budget it stops.
+            if bs <= 1 and max_tokens - emitted <= 1:
+                break
+        else:
+            bs = _mtp_next_block_size(
+                draft_model,
+                block_total,
+                configured_block_total,
+                max_tokens - emitted + 1,
+            )
+            if bs <= 1:
+                break
 
         draft_tokens = sampler_rng.draft_tokens(
             draft_model.draft_block,
@@ -640,6 +769,8 @@ def _mtp_rounds(
             sync_draft=not _sampler_supports_positioned_target(sampler)
         )
         _record_speculative_round(draft_model, accepted, bs - 1)
+        if pause_ctl is not None:
+            pause_ctl.record(bs, accepted=accepted, n_draft=bs - 1)
 
         for tok in new_tokens:
             yield tok, None
@@ -647,6 +778,9 @@ def _mtp_rounds(
             if emitted >= max_tokens:
                 return
 
+        # Keep the drafter's own cache in sync every round -- including paused rounds
+        # (the bonus token still advances the sequence) -- so a resumed drafting round
+        # proposes from a fresh state rather than a stale one.
         accept_verified = getattr(draft_model, "accept_verified_tokens", None)
         if callable(accept_verified):
             sampler_rng.draft_call(
@@ -880,19 +1014,33 @@ def _mtp_rounds_batch(
     finished = [False] * B
     active_idx = list(range(B))
 
+    pause_ctl = (
+        _AdaptivePauseController(configured_block_total)
+        if getattr(draft_model, "adaptive_pause", False)
+        else None
+    )
+
     while len(active_idx) > 0:
         remaining = [
             max(1, max_tokens - emitted[active_idx[j]] + 1)
             for j in range(len(active_idx))
         ]
-        bs = _mtp_next_block_size(
-            draft_model,
-            block_total,
-            configured_block_total,
-            min(remaining),
-        )
-        if bs <= 1:
-            break
+        if pause_ctl is not None:
+            pause_ctl.mark()
+            bs = pause_ctl.block_total(min(remaining))
+            # bs==1 with budget left means "run a plain decode step for the batch";
+            # only stop when every active row is out of budget.
+            if bs <= 1 and min(remaining) <= 1:
+                break
+        else:
+            bs = _mtp_next_block_size(
+                draft_model,
+                block_total,
+                configured_block_total,
+                min(remaining),
+            )
+            if bs <= 1:
+                break
 
         n_active = len(active_idx)
         b_active = [b[active_idx[j]] for j in range(n_active)]
@@ -988,6 +1136,8 @@ def _mtp_rounds_batch(
             sum(accepted_list) / len(accepted_list),
             bs - 1,
         )
+        if pause_ctl is not None:
+            pause_ctl.record(bs, accepted=min(accepted_list), n_draft=bs - 1)
 
         max_a = max(accepted_list)
 
