@@ -625,6 +625,18 @@ class Qwen4ExpTests(unittest.TestCase):
         self.assertIn(mapped, sanitized)
         self.assertEqual(sanitized[mapped].dtype, mx.bfloat16)
 
+    def test_quantization_uses_compatible_group_for_ple_shards(self):
+        model = qwen4_exp.Model(tiny_config())
+        predicate = model.quant_predicate
+        path = (
+            "language_model.model.layers.0.ple.ple_embedding."
+            "ngram_embedding.shards.0"
+        )
+        self.assertEqual(
+            predicate(path, None),
+            {"fallback_group_size": 32},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1033,11 +1033,31 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self.ngram_heads_offsets = mx.array(head_offsets, dtype=mx.int64)
         divisor = config.make_ngram_vocab_size_divisible_by
         padded_vocab_size = math.ceil(total_vocab_size / divisor) * divisor
-        self.ngram_embedding = ShardedEmbedding(
-            padded_vocab_size,
-            embedding_dim // self.ngram_heads,
-            config.split_ngram_parts,
-        )
+        if config.ple_storage:
+            from .ple_storage import QuantizedMMapNGramEmbedding
+
+            manifest = config.ple_storage.get("manifest")
+            if not manifest:
+                raise ValueError("ple_storage requires a manifest path")
+            self.ngram_embedding = QuantizedMMapNGramEmbedding(
+                manifest, cache_rows=config.ple_storage.get("cache_rows")
+            )
+            if self.ngram_embedding.row_count != padded_vocab_size:
+                raise ValueError(
+                    "external PLE row count does not match model configuration: "
+                    f"{self.ngram_embedding.row_count} != {padded_vocab_size}"
+                )
+            row_width = embedding_dim // self.ngram_heads
+            if self.ngram_embedding.row_width != row_width:
+                raise ValueError(
+                    "external PLE row width does not match model configuration"
+                )
+        else:
+            self.ngram_embedding = ShardedEmbedding(
+                padded_vocab_size,
+                embedding_dim // self.ngram_heads,
+                config.split_ngram_parts,
+            )
 
     def _shift_right_ignore_eos(self, token_ids: mx.array, shift: int):
         if shift == 0:
@@ -1776,3 +1796,17 @@ class LanguageModel(Qwen3_5LanguageModel):
             else:
                 caches.append(QSAKVCache())
         return caches
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _module):
+            if ".ple.ple_embedding.ngram_embedding.shards." in path:
+                # Affine group-64 cannot represent 160-wide PLE rows. Preserve
+                # compatible modes such as NVFP4/group-16 and otherwise fall
+                # back to affine group-32.
+                return {"fallback_group_size": 32}
+            if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
+                return {"group_size": 64, "bits": 8, "mode": "affine"}
+            return True
+
+        return predicate
