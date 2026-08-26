@@ -3431,6 +3431,16 @@ class TestQwen3_5MoePatch(unittest.TestCase):
         )
 
 
+class TestQwen4ExpPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
+            "qwen4_exp",
+            "mlx_vlm.models.qwen4_exp",
+            "Qwen3VLProcessor",
+        )
+
+
 class TestQwen3OmniMoePatch(unittest.TestCase):
     def test_patch_intercepts_without_hf_video_processor(self):
         import json

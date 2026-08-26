@@ -1100,6 +1100,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         weight = cached[1]
         return _qwen3_5_decode_depthwise_conv(conv_input, weight)
 
+    def _normalize_qk(self, q: mx.array, k: mx.array):
+        inv_scale = k.shape[-1] ** -0.5
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        return q, k
+
     def __call__(
         self,
         inputs: mx.array,
@@ -1164,9 +1170,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         state = cache[1] if cache else None
         if state is not None and state.shape[0] != B:
             state = None
-        inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        q, k = self._normalize_qk(q, k)
 
         out, state = gated_delta_update(
             q,
