@@ -12,6 +12,7 @@ class TextConfig(BaseModelConfig):
     intermediate_size: int = 12288
     moe_intermediate_size: int = 2048
     num_hidden_layers: int = 45
+    num_nextn_predict_layers: int = 1
     num_attention_heads: int = 64
     num_key_value_heads: int = 64
     n_shared_experts: int = 1

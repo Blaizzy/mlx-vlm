@@ -66,6 +66,9 @@ from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
 )
 from mlx_vlm.speculative.drafters.gemma4_dflash import ModelConfig as Gemma4DFlashConfig
 from mlx_vlm.speculative.drafters.glm4_moe_lite_mtp.split import split_glm4_moe_lite_mtp
+from mlx_vlm.speculative.drafters.glm5_next_mtp import Glm5NextMTPDraftModel
+from mlx_vlm.speculative.drafters.glm5_next_mtp import ModelConfig as Glm5NextMTPConfig
+from mlx_vlm.speculative.drafters.glm5_next_mtp.split import split_glm5_next_mtp
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
@@ -3850,6 +3853,174 @@ def test_deepseek_v4_mtp_draft_block_smoke():
     )
     mx.eval(tokens)
     assert tokens.shape == (1, 2)
+
+
+def _tiny_glm5_next_text_config():
+    from mlx_vlm.models.glm5_next.config import TextConfig
+
+    return TextConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        moe_intermediate_size=8,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        n_shared_experts=1,
+        n_routed_experts=2,
+        num_experts_per_tok=1,
+        kv_lora_rank=4,
+        q_lora_rank=8,
+        qk_nope_head_dim=4,
+        v_head_dim=4,
+        mlp_layer_types=["dense", "sparse"],
+        layer_types=["linear_attention", "deepseek_sparse_attention"],
+        indexer_types=["full", "full"],
+        index_topk=4,
+        index_kpool=2,
+        index_head_dim=4,
+        index_n_heads=2,
+        index_hisa_block=0,
+        index_hisa_keep=0,
+        linear_attn_config={
+            "num_heads": 2,
+            "head_dim": 4,
+            "short_conv_kernel_size": 2,
+            "gate_lower_bound": -5.0,
+        },
+        hc_mult=2,
+        max_position_embeddings=64,
+    )
+
+
+def test_glm5_next_mtp_draft_block_smoke():
+    text_config = _tiny_glm5_next_text_config()
+    drafter = Glm5NextMTPDraftModel(
+        Glm5NextMTPConfig(text_config=text_config, block_size=2)
+    )
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
+        )
+    )
+    drafter.reset(target)
+    drafter.set_shared_kv({}, kv_offset=4, position=4, kv_valid_len=4)
+    tokens = drafter.draft_block(
+        7,
+        mx.zeros((1, 1, 16)),
+        None,
+        2,
+        lambda logits: mx.argmax(logits, axis=-1),
+        mx.int32,
+        greedy=True,
+    )
+    mx.eval(tokens)
+    assert tokens.shape == (1, 1)
+    assert drafter.config.runtime_block_size == 2
+
+
+def test_glm5_next_mtp_batch_acceptance_keeps_rows_aligned():
+    text_config = _tiny_glm5_next_text_config()
+    drafter = Glm5NextMTPDraftModel(
+        Glm5NextMTPConfig(text_config=text_config, block_size=2)
+    )
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
+        )
+    )
+    drafter.reset(target)
+    drafter.set_shared_kv({}, kv_offset=4, position=4, kv_valid_len=4)
+    hidden = mx.zeros((2, 1, 16))
+    draft_tokens = drafter.draft_block(
+        mx.array([7, 8], dtype=mx.int32),
+        hidden,
+        None,
+        2,
+        lambda logits: mx.argmax(logits, axis=-1),
+        mx.int32,
+        greedy=True,
+    )
+    drafter.accept_verified_tokens_batch(
+        mx.zeros((2, 2, 16)),
+        draft_tokens,
+        accepted=[0, 0],
+        new_tokens=[[3], [4]],
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        token_dtype=mx.int32,
+        greedy=True,
+    )
+    mx.eval(drafter._seed_token, drafter._seed_hidden)
+
+    assert drafter._seed_token.shape == (2, 1)
+    assert drafter._seed_hidden.shape == (2, 1, 16)
+    assert drafter._next_position == 5
+    assert drafter._cache[0][0].offset == 1
+
+
+def test_glm5_next_mtp_sanitize_fuses_native_layer_weights():
+    config = _tiny_glm5_next_text_config()
+    context = SimpleNamespace(args=config)
+    weights = {
+        "mtp_block.mlp.shared_experts.gate_proj.weight": mx.zeros((8, 16)),
+        "mtp_block.mlp.shared_experts.up_proj.weight": mx.zeros((8, 16)),
+        "mtp_block.self_attn.q_a_proj.weight": mx.zeros((8, 16)),
+        "mtp_block.self_attn.kv_a_proj_with_mqa.weight": mx.zeros((4, 16)),
+        "mtp_block.self_attn.kv_b_proj.weight": mx.zeros((16, 4)),
+    }
+    for expert in range(config.n_routed_experts):
+        weights[f"mtp_block.mlp.experts.{expert}.gate_proj.weight"] = mx.zeros((8, 16))
+        weights[f"mtp_block.mlp.experts.{expert}.up_proj.weight"] = mx.zeros((8, 16))
+        weights[f"mtp_block.mlp.experts.{expert}.down_proj.weight"] = mx.zeros((16, 8))
+
+    out = Glm5NextMTPDraftModel.sanitize(context, weights)
+
+    assert out["mtp_block.mlp.shared_experts.gate_up_proj.weight"].shape == (
+        16,
+        16,
+    )
+    assert out["mtp_block.mlp.switch_mlp.gate_proj.weight"].shape == (2, 8, 16)
+    assert out["mtp_block.self_attn.qkv_a_proj.weight"].shape == (12, 16)
+    assert out["mtp_block.self_attn.embed_q.weight"].shape == (2, 4, 4)
+    assert out["mtp_block.self_attn.unembed_out.weight"].shape == (2, 4, 4)
+
+
+def test_split_glm5_next_mtp_extracts_layer_after_target_stack(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    text_config = _tiny_glm5_next_text_config()
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "glm5_next",
+                "text_config": text_config.to_dict(),
+            }
+        )
+    )
+    prefix = f"model.language_model.layers.{text_config.num_hidden_layers}"
+    mx.save_safetensors(
+        str(source / "model.safetensors"),
+        {
+            f"{prefix}.enorm.weight": mx.ones((16,)),
+            f"{prefix}.hnorm.weight": mx.ones((16,)),
+            f"{prefix}.eh_proj.weight": mx.ones((16, 32)),
+            f"{prefix}.shared_head.norm.weight": mx.ones((16,)),
+        },
+    )
+
+    split_glm5_next_mtp(str(source), str(output))
+
+    config = json.loads((output / "config.json").read_text())
+    weights = mx.load(str(output / "model.safetensors"))
+    assert config["model_type"] == "glm5_next_mtp"
+    assert config["block_size"] == 2
+    assert set(weights) == {
+        "eh_proj.weight",
+        "enorm.weight",
+        "hnorm.weight",
+        "shared_head_norm.weight",
+    }
 
 
 def test_deepseek_v4_mtp_runtime_block_size_defaults_to_native_nextn_depth():

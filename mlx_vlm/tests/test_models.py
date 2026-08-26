@@ -18002,6 +18002,8 @@ class TestMTPSplit(unittest.TestCase):
             "qwen3_5_moe": "qwen3_5_mtp",
             "deepseek_v4": "deepseek_v4_mtp",
             "glm4_moe_lite": "glm4_moe_lite_mtp",
+            "glm5_next": "glm5_next_mtp",
+            "glm5_next_text": "glm5_next_mtp",
             "glm_moe_dsa": "glm_moe_dsa_mtp",
             "inkling_mm_model": "inkling_mtp",
         }

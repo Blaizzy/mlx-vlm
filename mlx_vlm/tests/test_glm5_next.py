@@ -15,13 +15,13 @@ from mlx_vlm.models.glm5_next.language import (
     _score_index_keys,
     _sparse_prefill_attention,
 )
-from mlx_vlm.models.sparse_attention import indexed_sparse_attention
 from mlx_vlm.models.glm5_next.processing import (
     Glm5NextImageProcessor,
     Glm5NextProcessor,
     Glm5NextVideoProcessor,
     _resize_geometry,
 )
+from mlx_vlm.models.sparse_attention import indexed_sparse_attention
 from mlx_vlm.prompt_utils import apply_chat_template
 
 
@@ -95,6 +95,100 @@ def _video_processor():
         max_image_tokens=64,
         do_normalize=False,
     )
+
+
+def test_glm5_next_speculative_rejection_restores_recurrent_and_sparse_caches():
+    language_model = LanguageModel(_text_config())
+    rejected_cache = language_model.make_cache()
+    reference_cache = language_model.make_cache()
+    prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+    verify = mx.array([[4, 5]], dtype=mx.int32)
+
+    language_model(prompt, cache=rejected_cache)
+    language_model(prompt, cache=reference_cache)
+    _, _, rollback_state = language_model.speculative_verify_hidden(
+        verify, rejected_cache
+    )
+    language_model.rollback_speculative_cache(
+        rejected_cache, rollback_state, accepted=0, block_size=2
+    )
+    language_model(verify[:, :1], cache=reference_cache)
+
+    next_token = mx.array([[6]], dtype=mx.int32)
+    rejected = language_model(next_token, cache=rejected_cache).logits
+    reference = language_model(next_token, cache=reference_cache).logits
+    mx.eval(rejected, reference)
+
+    assert mx.allclose(rejected, reference, atol=1e-5, rtol=1e-5).item()
+
+
+def test_glm5_next_speculative_verify_matches_sequential_decode_arithmetic():
+    language_model = LanguageModel(_text_config())
+    verify_cache = language_model.make_cache()
+    sequential_cache = language_model.make_cache()
+    prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+    verify_tokens = mx.array([[4, 5]], dtype=mx.int32)
+
+    language_model(prompt, cache=verify_cache)
+    language_model(prompt, cache=sequential_cache)
+    verify_hidden, _, _ = language_model.speculative_verify_hidden(
+        verify_tokens, verify_cache
+    )
+    sequential_hidden = []
+    for position in range(verify_tokens.shape[1]):
+        output = language_model(
+            verify_tokens[:, position : position + 1],
+            cache=sequential_cache,
+            return_hidden=True,
+        )
+        sequential_hidden.append(output.hidden_states[-1])
+    sequential_hidden = mx.concatenate(sequential_hidden, axis=1)
+    mx.eval(verify_hidden, sequential_hidden)
+
+    assert mx.allclose(verify_hidden, sequential_hidden, atol=1e-5, rtol=1e-5).item()
+
+
+def test_glm5_next_chunked_prefill_policy_supports_mtp_capture():
+    language_model = LanguageModel(_text_config())
+    draft_model = object()
+
+    assert language_model.chunked_prefill_policy()
+    assert language_model.chunked_prefill_policy(
+        draft_model=draft_model,
+        draft_kind="mtp",
+        prefill_kwargs={"return_hidden": True, "return_shared_kv": True},
+    )
+    assert not language_model.chunked_prefill_policy(
+        draft_model=draft_model,
+        draft_kind="mtp",
+        prefill_kwargs={"return_hidden": True},
+    )
+    assert not language_model.chunked_prefill_policy(
+        draft_model=draft_model,
+        draft_kind="dflash",
+    )
+
+
+def test_glm5_next_speculative_argmax_uses_exact_head(monkeypatch):
+    import mlx_vlm.models.glm5_next.speculative_verifier as verifier
+
+    language_model = LanguageModel(_text_config())
+    hidden = mx.zeros((1, 3, language_model.args.hidden_size))
+    expected_logits = mx.zeros((1, 3, language_model.args.vocab_size))
+    expected_logits[:, :, 7] = 1
+    calls = []
+
+    def exact_head(weight, inputs):
+        calls.append((weight, inputs))
+        return expected_logits
+
+    monkeypatch.setattr(verifier, "exact_speculative_verify_weight", exact_head)
+    tokens = language_model.speculative_argmax_from_hidden(hidden)
+    mx.eval(tokens)
+
+    assert len(calls) == 1
+    assert calls[0][1] is hidden
+    assert tokens.tolist() == [[7, 7, 7]]
 
 
 class _Tokenizer:

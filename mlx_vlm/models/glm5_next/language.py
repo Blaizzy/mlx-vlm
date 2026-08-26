@@ -3,11 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import (
-    LanguageModelOutput,
-    create_ssm_mask,
-    scaled_dot_product_attention,
-)
+from ..base import LanguageModelOutput, create_ssm_mask, scaled_dot_product_attention
 from ..cache import ArraysCache, CacheList, HierarchyCache, KVCache, PoolingCache
 from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
 from ..gated_delta import gated_delta_update
@@ -15,6 +11,9 @@ from ..mla import MultiLinear
 from ..sparse_attention import indexed_sparse_attention
 from ..switch_layers import SwitchGLU
 from .config import TextConfig
+from .speculative_verifier import Glm5NextSpeculativeVerifier
+
+_SPECULATIVE_VERIFIER = Glm5NextSpeculativeVerifier()
 
 
 @mx.compile
@@ -731,7 +730,13 @@ class Glm5NextAttention(nn.Module):
         )
         self.indexer = None if self.skip_topk else Glm5NextIndexer(config, layer_idx)
 
-    def __call__(self, x, padding_mask=None, cache=None, prev_topk_indices=None):
+    def __call__(
+        self,
+        x,
+        padding_mask=None,
+        cache=None,
+        prev_topk_indices=None,
+    ):
         batch, length, _ = x.shape
         q_a, kv_a = mx.split(self.qkv_a_proj(x), (self.q_lora_rank,), axis=-1)
         q_resid = self.q_a_layernorm(q_a)
@@ -843,7 +848,13 @@ class DecoderLayer(nn.Module):
         self.attn_hc = HyperConnection(config)
         self.ffn_hc = HyperConnection(config)
 
-    def __call__(self, x, mask=None, cache=None, prev_topk_indices=None):
+    def __call__(
+        self,
+        x,
+        mask=None,
+        cache=None,
+        prev_topk_indices=None,
+    ):
         residual = x
         collapsed, post, comb = self.attn_hc(x)
         collapsed = self.input_layernorm(collapsed)
@@ -851,7 +862,12 @@ class DecoderLayer(nn.Module):
             collapsed = self.self_attn(collapsed, mask, cache)
             topk = prev_topk_indices
         else:
-            collapsed, topk = self.self_attn(collapsed, mask, cache, prev_topk_indices)
+            collapsed, topk = self.self_attn(
+                collapsed,
+                mask,
+                cache,
+                prev_topk_indices,
+            )
         x = hc_expand(collapsed, residual, post, comb)
 
         residual = x
@@ -877,6 +893,7 @@ class Glm5NextTextModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         cache: Optional[List[Any]] = None,
         attention_mask: Optional[mx.array] = None,
+        hidden_sink: Optional[List[mx.array]] = None,
     ):
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         if cache is None:
@@ -892,8 +909,16 @@ class Glm5NextTextModel(nn.Module):
             layer_mask = attention_mask
             if layer.block_type == "linear_attention" and layer_cache is not None:
                 layer_mask = create_ssm_mask(h[:, :, 0], layer_cache)
-            h, topk = layer(h, layer_mask, layer_cache, topk)
-        return self.norm(h.mean(axis=2))
+            h, topk = layer(
+                h,
+                layer_mask,
+                layer_cache,
+                topk,
+            )
+        h = self.norm(h.mean(axis=2))
+        if hidden_sink is not None:
+            hidden_sink.append(h)
+        return h
 
 
 class LanguageModel(nn.Module):
@@ -905,6 +930,26 @@ class LanguageModel(nn.Module):
         self.model = Glm5NextTextModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del input_ids, inputs_embeds, prompt_cache
+        prefill_kwargs = prefill_kwargs or {}
+        if draft_model is None:
+            return True
+        if draft_kind == "mtp":
+            return bool(prefill_kwargs.get("return_hidden", False)) and bool(
+                prefill_kwargs.get("return_shared_kv", False)
+            )
+        return draft_kind is None
+
     def __call__(
         self,
         inputs: Optional[mx.array] = None,
@@ -912,11 +957,67 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         **kwargs,
     ) -> LanguageModelOutput:
+        return_hidden = kwargs.pop("return_hidden", False)
+        return_shared_kv = kwargs.pop("return_shared_kv", False)
+        skip_logits = kwargs.pop("skip_logits", False)
+        speculative_verify = kwargs.pop("speculative_verify", False)
+        hidden_sink = kwargs.pop("hidden_sink", None)
+        if return_hidden and hidden_sink is None:
+            hidden_sink = []
         if inputs is None:
             inputs = kwargs.get("input_ids")
         attention_mask = kwargs.get("attention_mask")
-        hidden = self.model(inputs, inputs_embeds, cache, attention_mask)
-        return LanguageModelOutput(logits=self.lm_head(hidden))
+        if speculative_verify:
+            return _SPECULATIVE_VERIFIER(
+                self,
+                inputs,
+                inputs_embeds=inputs_embeds,
+                cache=cache,
+                attention_mask=attention_mask,
+                hidden_sink=hidden_sink,
+                return_shared_kv=return_shared_kv,
+                skip_logits=skip_logits,
+            )
+        hidden = self.model(
+            inputs,
+            inputs_embeds,
+            cache,
+            attention_mask,
+            hidden_sink=hidden_sink,
+        )
+        logits = None if skip_logits else self.lm_head(hidden)
+        return LanguageModelOutput(
+            logits=logits,
+            hidden_states=hidden_sink,
+            shared_kv_states={} if return_shared_kv else None,
+        )
+
+    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        return _SPECULATIVE_VERIFIER.logits_from_hidden(self, hidden)
+
+    def speculative_argmax_from_hidden(self, hidden: mx.array) -> mx.array:
+        return _SPECULATIVE_VERIFIER.argmax_from_hidden(self, hidden)
+
+    def speculative_verify_logits(self, inputs, cache, sampler):
+        return _SPECULATIVE_VERIFIER.verify(self, inputs, cache, sampler)
+
+    def speculative_verify_hidden(self, inputs, cache):
+        return _SPECULATIVE_VERIFIER.verify(self, inputs, cache)
+
+    def rollback_speculative_cache(
+        self,
+        caches: List[Any],
+        rollback_state,
+        accepted,
+        block_size: int,
+    ) -> int:
+        return _SPECULATIVE_VERIFIER.rollback(
+            self,
+            caches,
+            rollback_state,
+            accepted,
+            block_size,
+        )
 
     @property
     def layers(self):
