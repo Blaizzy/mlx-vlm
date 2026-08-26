@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -10,14 +10,17 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, CacheList, KVCache
+from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
 from ..deepseek_v32.language import DeepseekV32MoE
 from ..deepseek_v32.language import Model as DSV32Model
-from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
 from ..gated_delta import gated_delta_update
 from ..mla import MultiLinear
 from ..mlp import DeepseekMLP
 from ..rope_utils import initialize_rope
 from .config import ModelConfig, TextConfig
+from .speculative_verifier import Glm5NextExactSpeculativeVerifier, verify_logits
+
+_SPECULATIVE_VERIFIER = Glm5NextExactSpeculativeVerifier()
 
 
 class Glm5NextRMSNormGated(nn.Module):
@@ -181,6 +184,7 @@ class Glm5NextLinearAttention(nn.Module):
         inputs: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        gdn_sink: Optional[list] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
         if self.fuse_in:
@@ -219,16 +223,39 @@ class Glm5NextLinearAttention(nn.Module):
         k = _l2norm(k.astype(mx.float32)).astype(in_dtype)
 
         state = cache[1] if cache is not None else None
+        A_log = fg.A_log.reshape(self.num_heads, 1)
+        dt_bias = fg.dt_bias.reshape(self.num_heads, self.head_dim)
+        lower_bound = fg.safe_gate_lower_bound
+        if gdn_sink is not None:
+            # Speculative verify: run the fast kernel (no per-step capture) and stash the
+            # block inputs + entry state, so a rejected round can be replayed to the
+            # accepted token with the kernel in rollback_speculative_cache -- far cheaper
+            # than a per-step ops loop on the hot verify path.
+            gdn_sink.append(
+                (
+                    q,
+                    k,
+                    v,
+                    a,
+                    b_o,
+                    A_log,
+                    dt_bias,
+                    state,
+                    conv_input,
+                    self.conv_kernel_size,
+                    lower_bound,
+                )
+            )
         out, state = gated_delta_update(
             q,
             k,
             v,
             a,
             b_o,
-            fg.A_log.reshape(self.num_heads, 1),
-            fg.dt_bias.reshape(self.num_heads, self.head_dim),
+            A_log,
+            dt_bias,
             state=state,
-            lower_bound=fg.safe_gate_lower_bound,
+            lower_bound=lower_bound,
         )
         if cache is not None:
             cache[1] = state
@@ -397,7 +424,9 @@ class Glm5NextIndexer(nn.Module):
             c1 = min(c0 + chunk, S)
             cs = c1 - c0
             q_pos = offset + mx.arange(c0, c1)
-            visible = (kv_pos[None, None, :] <= q_pos[None, :, None]) & valid[:, None, :]
+            visible = (kv_pos[None, None, :] <= q_pos[None, :, None]) & valid[
+                :, None, :
+            ]
             scores = q[:, c0:c1] @ pool_keys_t
             scores = mx.maximum(scores * self.softmax_scale, 0.0)
             weights = self.weights_proj(x[:, c0:c1]) * (self.n_heads**-0.5)
@@ -421,7 +450,9 @@ class Glm5NextIndexer(nn.Module):
             ).reshape(B, cs, select_k * self.index_kpool)
             topk = mx.where(sv, topk, -1)
             if tail_on:
-                topk = mx.concatenate([topk, self._visible_tail(visible, valid)], axis=-1)
+                topk = mx.concatenate(
+                    [topk, self._visible_tail(visible, valid)], axis=-1
+                )
             if topk.shape[-1] < output_width:
                 pad = mx.full(
                     (B, cs, output_width - topk.shape[-1]), -1, dtype=topk.dtype
@@ -503,6 +534,22 @@ class Glm5NextSparseAttention(nn.Module):
             cache = [None] * 2
 
         topk_indices = self.indexer(x, qr, mask, cache=cache[1])
+        if topk_indices is not None and 1 < L <= 8:
+            # Short speculative-verify block: gather the top-k selected latents per query
+            # and attend O(L*topk), instead of masking over all Kv (O(L*Kv)). The indexer
+            # already selects causally per query, so no extra mask is needed. This is the
+            # decode-path selection generalized to a small block -- the win that makes
+            # verify affordable at long context.
+            if (
+                cache is not None
+                and cache[0] is not None
+                and cache[1] is not None
+                and cache[1].keys is not None
+            ):
+                cache[0].keys = mx.depends(
+                    cache[0].keys, (cache[1].keys, cache[1].values)
+                )
+            return self._gathered_verify_attention(q, kv_latent, topk_indices)
         attn_mask = mask
         if topk_indices is not None:
             Kv = kv_latent.shape[2]
@@ -567,6 +614,32 @@ class Glm5NextSparseAttention(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
+    def _gathered_verify_attention(self, q, kv_latent, topk_indices):
+        # Per-query top-k gather for a short block (verify): each query attends only to
+        # its selected latents (O(L*topk)) rather than a mask over all Kv (O(L*Kv)).
+        B, H, L, _ = q.shape
+        Kv = kv_latent.shape[2]
+        dim = kv_latent.shape[-1]
+        # topk_indices is [B, 1, L, topk] (axis 1 is the broadcast head); take per-query.
+        sel = topk_indices[:, 0, :, :]  # [B, L, topk]
+        topk = sel.shape[-1]
+        clamped = mx.clip(sel, 0, Kv - 1)
+        kv_g = mx.take_along_axis(
+            mx.broadcast_to(kv_latent, (B, L, Kv, dim)),
+            mx.broadcast_to(clamped[..., None], (B, L, topk, dim)),
+            axis=2,
+        )  # [B, L, topk, dim]
+        q_e = self.embed_q(q)  # [B, H, L, dim]
+        q_bl = q_e.transpose(0, 2, 1, 3).reshape(B * L, H, 1, dim)
+        kv_bl = kv_g.reshape(B * L, 1, topk, dim)
+        valid = (sel >= 0).reshape(B * L, 1, 1, topk)
+        attn = scaled_dot_product_attention(
+            q_bl, kv_bl, kv_bl, cache=None, scale=self.scale, mask=valid
+        )  # [B*L, H, 1, dim]
+        attn = attn.reshape(B, L, H, dim).transpose(0, 2, 1, 3)  # [B, H, L, dim]
+        out = self.unembed_out(attn).transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(out)
+
 
 class Glm5NextDecoderLayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
@@ -599,16 +672,20 @@ class Glm5NextDecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        gdn_sink: Optional[list] = None,
     ) -> mx.array:
         residual = x
         xc, post, comb = self.attn_hc(x)
-        r = self.self_attn(self.input_layernorm(xc), mask, cache)
+        if self.is_linear:
+            r = self.self_attn(self.input_layernorm(xc), mask, cache, gdn_sink=gdn_sink)
+        else:
+            r = self.self_attn(self.input_layernorm(xc), mask, cache)
         x = hc_expand(r, residual, post, comb)
-        # Compile the FFN block only for single-stream decode (B=1, S=1) -- the shape it
-        # was validated on and where its win lives. Compiling the 288-expert MoE at a
-        # batched or prefill shape spikes memory (it can OOM alongside the resident
-        # weights), so those shapes take the eager path.
-        if self.compile_ffn and x.shape[0] == 1 and x.shape[1] == 1:
+        # Compile the FFN block for single-stream decode (B=1) at small sequence lengths:
+        # S=1 decode and the short S=block_size speculative-verify block. mx.compile keeps
+        # a per-shape cache, so each small S compiles once. Batched/prefill shapes stay on
+        # the eager path (compiling the 288-expert MoE there spikes memory / can OOM).
+        if self.compile_ffn and x.shape[0] == 1 and x.shape[1] <= 8:
             if self._ffn_c is None:
                 self._ffn_c = mx.compile(self._ffn_block)
             return self._ffn_c(x)
@@ -641,6 +718,8 @@ class Glm5NextModel(nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         inputs_embeds: Optional[mx.array] = None,
+        gdn_sink: Optional[list] = None,
+        hidden_sink: Optional[list] = None,
     ) -> mx.array:
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
 
@@ -660,9 +739,11 @@ class Glm5NextModel(nn.Module):
 
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
-            h = layer(h, mask=mask, cache=c)
+            h = layer(h, mask=mask, cache=c, gdn_sink=gdn_sink)
 
         h = h.mean(axis=2)
+        if hidden_sink is not None:
+            hidden_sink.append(h)  # pre-final-norm hidden for the nextn drafter
         return self.norm(h)
 
 
@@ -686,17 +767,154 @@ class LanguageModel(nn.Module):
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
-        out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+        return_hidden = kwargs.pop("return_hidden", False)
+        return_shared_kv = kwargs.pop("return_shared_kv", False)
+        skip_logits = kwargs.pop("skip_logits", False)
+        capture_layer_ids = kwargs.pop("capture_layer_ids", None)
+        # Speculative verify runs when a capture list is supplied: collect each KDA
+        # layer's per-step recurrent state so a round can be rolled back on rejection.
+        gdn_sink: Optional[list] = [] if capture_layer_ids is not None else None
+        # Capture the pre-final-norm hidden for the nextn (MTP) drafter, which applies
+        # its own norm -- the DeepSeek-derived convention.
+        hidden_sink: Optional[list] = [] if return_hidden else None
+
+        out = self.model(
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            gdn_sink=gdn_sink,
+            hidden_sink=hidden_sink,
+        )
         # Only the last few positions' logits are ever needed for generation; slicing
         # before the (vocab-wide) projection skips it on discarded prefill positions.
         nlk = kwargs.get("num_logits_to_keep", 0)
-        if nlk:
-            out = out[:, -nlk:, :]
+        logits = None
+        if not skip_logits:
+            logits = self._logits(out[:, -nlk:, :] if nlk else out)
+
+        return LanguageModelOutput(
+            logits=logits,
+            hidden_states=hidden_sink,
+            gdn_states=gdn_sink,
+            shared_kv_states={} if return_shared_kv else None,
+        )
+
+    def _logits(self, normed_hidden: mx.array) -> mx.array:
         if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
+            return self.model.embed_tokens.as_linear(normed_hidden)
+        return self.lm_head(normed_hidden)
+
+    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        # `hidden` is the pre-final-norm hidden captured for the drafter; apply the
+        # final norm, then the (shared) exact-verify LM head.
+        return verify_logits(self, self.model.norm(hidden))
+
+    def speculative_argmax_from_hidden(self, hidden: mx.array) -> mx.array:
+        return mx.argmax(self.speculative_logits_from_hidden(hidden), axis=-1)
+
+    def speculative_verify_hidden(self, inputs: mx.array, cache):
+        out = _SPECULATIVE_VERIFIER(
+            self, inputs, cache=cache, capture_layer_ids=[], skip_logits=True
+        )
+        return out.hidden_states[-1], out.shared_kv_states, out.gdn_states
+
+    def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
+        out = _SPECULATIVE_VERIFIER(self, inputs, cache=cache, capture_layer_ids=[])
+        return (
+            out.hidden_states[-1],
+            out.shared_kv_states,
+            out.gdn_states,
+            sampler(out.logits),
+        )
+
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del input_ids, inputs_embeds, prompt_cache
+        prefill_kwargs = prefill_kwargs or {}
+        if draft_model is None:
+            return True
+        if draft_kind == "mtp":
+            return bool(prefill_kwargs.get("return_hidden", False)) and bool(
+                prefill_kwargs.get("return_shared_kv", False)
+            )
+        return draft_kind is None
+
+    def rollback_speculative_cache(
+        self,
+        caches: List[Any],
+        gdn_states: list,
+        accepted,
+        block_size: int,
+    ) -> int:
+        if isinstance(accepted, int):
+            accepted_list = [int(accepted)]
+        elif isinstance(accepted, mx.array):
+            accepted_list = [int(x) for x in accepted.reshape(-1).tolist()]
         else:
-            out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
+            accepted_list = [int(x) for x in accepted]
+        max_a = max(accepted_list)
+        trim = block_size - (max_a + 1)
+        is_batch = len(accepted_list) > 1
+
+        gdn_idx = 0
+        for c in caches:
+            if c is None:
+                continue
+            if isinstance(c, ArraysCache):
+                # KDA (linear-attention) layer: replay the fast gated-delta kernel from
+                # the entry state over just the accepted prefix (n tokens) to recover the
+                # rolled-back recurrent state, and slice the conv window to match. Uniform
+                # acceptance, so n is shared across the batch.
+                q_, k_, v_, a_, b_, A_log_, dt_bias_, init_state, conv_input, K, lb = (
+                    gdn_states[gdn_idx]
+                )
+                gdn_idx += 1
+                n = max_a + 1
+                _, state_n = gated_delta_update(
+                    q_[:, :n],
+                    k_[:, :n],
+                    v_[:, :n],
+                    a_[:, :n],
+                    b_[:, :n],
+                    A_log_,
+                    dt_bias_,
+                    state=init_state,
+                    lower_bound=lb,
+                )
+                c[1] = state_n
+                c[0] = conv_input[:, n : n + K - 1]
+            else:
+                # Sparse (MLA + lightning-indexer) layer: trim both KV caches, then roll
+                # the indexer pool back to the trimmed length by keeping only the pool
+                # blocks that are still fully in-range. The incremental decode path then
+                # rebuilds just the last partial block (O(index_kpool)) instead of the
+                # whole pool (O(T)) -- critical for long context.
+                if trim > 0 and c.is_trimmable():
+                    c.trim(trim)
+                indexer_cache = c[1]
+                pool = getattr(indexer_cache, "_pool", None)
+                if pool is not None:
+                    pk, pi, pv, t = pool
+                    t2 = t - trim
+                    if t2 <= 0:
+                        indexer_cache._pool = None
+                    else:
+                        n_stable = t2 // self.args.index_kpool
+                        indexer_cache._pool = (
+                            pk[:, :n_stable],
+                            pi[:, :n_stable],
+                            pv[:, :n_stable],
+                            t2,
+                        )
+        return max_a
 
     def sanitize(self, weights):
         weights = {k: v for k, v in weights.items() if "mtp." not in k}

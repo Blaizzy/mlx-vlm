@@ -3323,6 +3323,171 @@ class TestModels(unittest.TestCase):
         out = dsa(xs, mask4d, c2)  # must accept the 4-D mask and equal the None case
         self.assertLess(float(mx.max(mx.abs(out - ref))), 1e-3)
 
+    def _glm5_next_mtp_text_config(self):
+        from mlx_vlm.models import glm5_next
+
+        return glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=6,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=3,
+            layer_types=["linear_attention", "deepseek_sparse_attention"],
+            mlp_layer_types=["dense", "sparse"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=1,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+
+    def test_glm5_next_mtp_verify_and_rollback(self):
+        # Speculative verify must (a) be a faithful forward -- its captured hidden
+        # yields the same logits as a plain decode -- and (b) let rollback restore the
+        # KDA recurrent/conv state and MLA KV length to exactly the accepted prefix.
+        from mlx_vlm.models.glm5_next.language import LanguageModel
+
+        mx.random.seed(0)
+        lm = LanguageModel(self._glm5_next_mtp_text_config())
+        lm.eval()
+        mx.eval(lm.parameters())
+        prompt = mx.array([[2, 4, 6, 8]])
+        block = mx.array([[1, 3, 5, 7, 9]])  # block_size = 5
+        accepted, keep = 2, 3  # keep = accepted + 1
+
+        # (a) verify hidden -> logits must match a plain forward of the same block.
+        cp = lm.make_cache()
+        lm(prompt, cache=cp)
+        plain = lm(block, cache=cp).logits
+        cv0 = lm.make_cache()
+        lm(prompt, cache=cv0)
+        vout = lm(
+            block,
+            cache=cv0,
+            capture_layer_ids=[],
+            return_hidden=True,
+            return_shared_kv=True,
+            skip_logits=True,
+        )
+        self.assertEqual(len(vout.gdn_states), 1)  # one KDA (linear) layer
+        vlogits = lm.speculative_logits_from_hidden(vout.hidden_states[-1])
+        self.assertLess(float(mx.max(mx.abs(plain - vlogits))), 1e-2)
+
+        # (b) rollback the verify cache to `accepted`; compare to a plain forward of the
+        # kept prefix only.
+        cref = lm.make_cache()
+        lm(prompt, cache=cref)
+        lm(block[:, :keep], cache=cref)
+        cver = lm.make_cache()
+        lm(prompt, cache=cver)
+        rout = lm(
+            block,
+            cache=cver,
+            capture_layer_ids=[],
+            return_hidden=True,
+            return_shared_kv=True,
+            skip_logits=True,
+        )
+        lm.rollback_speculative_cache(cver, rout.gdn_states, accepted, block.shape[1])
+        ssm, fa = lm.model.ssm_idx, lm.model.fa_idx
+        self.assertLess(float(mx.max(mx.abs(cver[ssm][1] - cref[ssm][1]))), 5e-3)
+        self.assertLess(float(mx.max(mx.abs(cver[ssm][0] - cref[ssm][0]))), 5e-3)
+        self.assertEqual(
+            cver[fa][0].offset, cref[fa][0].offset
+        )  # MLA KV trimmed exactly
+        # indexer pool rolled back to the trimmed length (not fully rebuilt each round)
+        self.assertEqual(cver[fa][1]._pool[3], cref[fa][0].offset)
+
+    def test_glm5_next_mtp_chunked_prefill_policy(self):
+        # MTP verify needs both return_hidden and return_shared_kv; the policy must gate
+        # on that so the runtime doesn't chunk away the captured state.
+        from mlx_vlm.models.glm5_next.language import LanguageModel
+
+        lm = LanguageModel(self._glm5_next_mtp_text_config())
+        draft = object()
+        self.assertTrue(lm.chunked_prefill_policy(draft_model=None))
+        self.assertTrue(
+            lm.chunked_prefill_policy(
+                draft_model=draft,
+                draft_kind="mtp",
+                prefill_kwargs={"return_hidden": True, "return_shared_kv": True},
+            )
+        )
+        self.assertFalse(
+            lm.chunked_prefill_policy(
+                draft_model=draft,
+                draft_kind="mtp",
+                prefill_kwargs={"return_hidden": True},
+            )
+        )
+
+    def test_glm5_next_mtp_drafter_runs(self):
+        # The glm5_next_mtp drafter must bind to the target, prefill from its hidden,
+        # propose a block, and fold accepted tokens back into its own cache.
+        from mlx_vlm.models.glm5_next.language import LanguageModel
+        from mlx_vlm.speculative.drafters.glm5_next_mtp import Model, ModelConfig
+
+        mx.random.seed(0)
+        tcfg = self._glm5_next_mtp_text_config()
+        lm = LanguageModel(tcfg)
+        lm.eval()
+        mx.eval(lm.parameters())
+        drafter = Model(ModelConfig(text_config=tcfg, block_size=3))
+        drafter.eval()
+        mx.eval(drafter.parameters())
+        drafter.reset(lm)
+
+        prompt = mx.array([[2, 4, 6, 8]])
+        out = lm(
+            prompt,
+            cache=lm.make_cache(),
+            capture_layer_ids=[],
+            return_hidden=True,
+            return_shared_kv=True,
+        )
+        hidden = out.hidden_states[-1]
+        sampler = lambda logits: mx.argmax(logits, axis=-1)
+        bonus = int(mx.argmax(out.logits[:, -1, :]).item())
+        drafter.prefill_from_target_hidden(prompt, hidden, bonus, sampler, greedy=True)
+        draft = drafter.draft_block(
+            bonus, hidden[:, -1:, :], None, 3, sampler, greedy=True
+        )
+        self.assertEqual(draft.shape, (1, 2))  # block_size - 1 proposed tokens
+        verify_hidden = mx.broadcast_to(hidden[:, -1:, :], (1, 2, hidden.shape[-1]))
+        drafter.accept_verified_tokens(
+            verify_hidden,
+            draft,
+            1,
+            [int(draft[0, 0].item())],
+            sampler,
+            greedy=True,
+        )
+
     def test_nemotron_h_language_model(self):
         from mlx_vlm.models import nemotron_h
 
