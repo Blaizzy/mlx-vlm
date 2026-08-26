@@ -1,6 +1,7 @@
 import unittest
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from mlx_vlm.generate import maybe_quantize_kv_cache
 from mlx_vlm.models import qwen4_exp
@@ -10,6 +11,7 @@ from mlx_vlm.models.qwen4_exp.language import (
     QSAQuantizedKVCache,
     Qwen4ExpGatedDeltaNet,
     Qwen4ExpNGramEmbedding,
+    ShardedEmbedding,
 )
 from mlx_vlm.prompt_utils import MessageFormat, MessageFormatter
 
@@ -120,6 +122,41 @@ class Qwen4ExpTests(unittest.TestCase):
         self.assertTrue(mx.array_equal(full[:, :4], prefix).item())
         self.assertTrue(mx.array_equal(full[:, 4:], suffix).item())
         self.assertEqual(cache[3].shape, (1, config.ngram_size - 1))
+
+    def test_sharded_embedding_only_gathers_addressed_shards(self):
+        embedding = ShardedEmbedding(num_embeddings=10, dims=4, num_shards=3)
+        table = mx.arange(40, dtype=mx.float32).reshape(10, 4)
+        calls = [0, 0, 0]
+
+        class TrackingEmbedding(nn.Module):
+            def __init__(self, wrapped, shard_index):
+                super().__init__()
+                self.wrapped = wrapped
+                self.shard_index = shard_index
+
+            def __call__(self, indices):
+                calls[self.shard_index] += 1
+                return self.wrapped(indices)
+
+        tracked_shards = []
+        for shard_index, (shard, start, end) in enumerate(
+            zip(
+                embedding.shards,
+                embedding.shard_offsets[:-1],
+                embedding.shard_offsets[1:],
+            )
+        ):
+            shard.weight = table[start:end]
+            tracked_shards.append(TrackingEmbedding(shard, shard_index))
+        embedding.shards = tracked_shards
+
+        indices = mx.array([[0, 3, 7, 9, 1, 7]], dtype=mx.int32)
+        actual = embedding(indices)
+        expected = table[indices]
+        mx.eval(actual, expected)
+
+        self.assertTrue(mx.array_equal(actual, expected).item())
+        self.assertEqual(calls, [1, 0, 1])
 
     def test_gated_delta_uses_reference_l2_normalization(self):
         layer = Qwen4ExpGatedDeltaNet(tiny_config().text_config)

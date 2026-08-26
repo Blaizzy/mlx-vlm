@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -522,16 +523,34 @@ class ShardedEmbedding(nn.Module):
 
     def __call__(self, indices: mx.array) -> mx.array:
         flat = indices.reshape(-1)
+        # One tiny host sync avoids scheduling gathers against all 128 giant
+        # PLE shards for every token.
+        mx.eval(flat)
+        host_indices = [int(index) for index in flat.tolist()]
+        if not host_indices:
+            return self.shards[0](flat).reshape(*indices.shape, self.dims)
+        if any(index < 0 or index >= self.shard_offsets[-1] for index in host_indices):
+            raise IndexError("embedding index is outside the sharded vocabulary")
+
+        shard_indices = [
+            bisect_right(self.shard_offsets, index) - 1 for index in host_indices
+        ]
         result = None
-        for shard, start, end in zip(
-            self.shards, self.shard_offsets[:-1], self.shard_offsets[1:]
-        ):
-            local = mx.clip(flat - start, 0, end - start - 1)
-            values = shard(local)
-            mask = (flat >= start) & (flat < end)
-            result = (
-                values if result is None else mx.where(mask[:, None], values, result)
-            )
+        for shard_index in sorted(set(shard_indices)):
+            positions_list = [
+                position
+                for position, current_shard in enumerate(shard_indices)
+                if current_shard == shard_index
+            ]
+            local_indices = [
+                host_indices[position] - self.shard_offsets[shard_index]
+                for position in positions_list
+            ]
+            positions = mx.array(positions_list, dtype=mx.int32)
+            values = self.shards[shard_index](mx.array(local_indices, dtype=mx.int32))
+            if result is None:
+                result = mx.zeros((len(host_indices), self.dims), dtype=values.dtype)
+            result = result.at[positions].add(values)
         return result.reshape(*indices.shape, self.dims)
 
 
