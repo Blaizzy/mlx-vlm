@@ -3,9 +3,8 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..deepseek_v32.language import DeepseekV32MoE
 from .config import TextConfig
-from .language import Glm5NextSparseAttention
+from .language import Glm5NextMoE, Glm5NextSparseAttention
 
 
 class Glm5NextMTP(nn.Module):
@@ -23,7 +22,7 @@ class Glm5NextMTP(nn.Module):
         self.input_layernorm = nn.RMSNorm(h, eps=config.rms_norm_eps)
         self.self_attn = Glm5NextSparseAttention(config)
         self.post_attention_layernorm = nn.RMSNorm(h, eps=config.rms_norm_eps)
-        self.mlp = DeepseekV32MoE(config)
+        self.mlp = Glm5NextMoE(config)
         self.shared_head_norm = nn.RMSNorm(h, eps=config.rms_norm_eps)
 
     def __call__(
