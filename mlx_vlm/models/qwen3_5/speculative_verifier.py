@@ -1352,6 +1352,14 @@ class Qwen3_5ExactSpeculativeVerifier:
 
         return feed_forward(x)
 
+    @staticmethod
+    def _normalize_gated_delta_qk(layer, q, k):
+        del layer
+        inv_scale = k.shape[-1] ** -0.5
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        return q, k
+
     def _gated_delta(self, layer, inputs, mask, cache, gdn_sink):
         helpers = self._helpers()
         batch, length, _ = inputs.shape
@@ -1402,9 +1410,7 @@ class Qwen3_5ExactSpeculativeVerifier:
         state = cache[1] if cache else None
         if state is not None and state.shape[0] != batch:
             state = None
-        inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        q, k = self._normalize_gated_delta_qk(layer, q, k)
 
         initial_state = state
         output, state, intermediate_states = gated_delta_update_with_states(

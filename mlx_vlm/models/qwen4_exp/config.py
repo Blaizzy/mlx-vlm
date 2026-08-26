@@ -61,6 +61,9 @@ class TextConfig(BaseModelConfig):
     output_gate_type: str = "sigmoid"
     hidden_act: str = "silu"
     norm_topk_prob: bool = True
+    mtp_num_hidden_layers: int = 1
+    mtp_use_dedicated_embeddings: bool = False
+    mtp: Optional[Dict] = None
     eos_token_id: Optional[Union[int, List[int]]] = None
     tie_word_embeddings: bool = False
     attention_bias: bool = False
