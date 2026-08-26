@@ -364,11 +364,17 @@ class Qwen4ExpQSAIndexer(nn.Module):
         ]
 
         token_indices = mx.arange(key_len)
-        token_blocks = token_indices // self.compress_ratio
-        selected_tokens = mx.any(
-            token_blocks[None, None, None, :] == selected_blocks[..., None],
-            axis=2,
+        block_selected = mx.zeros((batch, seq_len, max_complete_blocks), dtype=mx.bool_)
+        block_selected = mx.put_along_axis(
+            block_selected, selected_blocks, mx.array(True), axis=-1
         )
+        selected_tokens = mx.repeat(block_selected, self.compress_ratio, axis=-1)
+        if selected_tokens.shape[-1] < key_len:
+            pad = mx.zeros(
+                (batch, seq_len, key_len - selected_tokens.shape[-1]),
+                dtype=mx.bool_,
+            )
+            selected_tokens = mx.concatenate([selected_tokens, pad], axis=-1)
         tail_starts = complete_counts * self.compress_ratio
         tail = (token_indices[None, None, :] >= tail_starts[None, :, None]) & (
             token_indices[None, None, :] < query_ends[None, :, None]
