@@ -3488,6 +3488,45 @@ class TestModels(unittest.TestCase):
             greedy=True,
         )
 
+    def test_glm5_next_mtp_never_lose_gate(self):
+        # The never-lose gate has two parts: (1) the drafter yields an empty block at
+        # block_size<=1 so the orchestrator can run a plain decode step, and (2) the
+        # orchestrator's timing controller pauses drafting once it is measurably
+        # slower per token than plain decoding, re-probing periodically.
+        from mlx_vlm.speculative.drafters.glm5_next_mtp import Model, ModelConfig
+        from mlx_vlm.speculative.mtp import _AdaptivePauseController
+
+        tcfg = self._glm5_next_mtp_text_config()
+        drafter = Model(ModelConfig(text_config=tcfg, block_size=2))
+        empty = drafter.draft_block(
+            5, mx.zeros((1, 1, tcfg.hidden_size)), None, 1, lambda x: x, greedy=True
+        )
+        self.assertEqual(empty.shape, (1, 0))
+
+        # Calibration collects draft samples first (block_total = configured), then
+        # plain samples (block_total = 1), then derives break-even = draft/plain - 1.
+        cal = _AdaptivePauseController(2, cal_draft=2, cal_plain=2)
+        self.assertTrue(cal._calibrating())
+        self.assertEqual(cal.block_total(64), 2)  # collecting draft samples
+        cal._draft_times = [0.050, 0.050]
+        self.assertEqual(cal.block_total(64), 1)  # now collecting plain samples
+        cal._plain_times = [0.030, 0.030]
+        cal.block_total(64)  # both collected -> finalize break-even
+        self.assertAlmostEqual(cal.break_even, 0.050 / 0.030 - 1.0, places=5)
+
+        # Post-calibration gating on rolling acceptance vs break-even.
+        ctl = _AdaptivePauseController(2, probe_every=5, window=8)
+        ctl.break_even = 0.6
+        ctl._accepts = [1] * 8  # clears break-even -> keep drafting
+        self.assertEqual(ctl.block_total(64), 2)
+        ctl._accepts = [0] * 8  # below break-even -> pause, re-probing periodically
+        ctl.since_probe = 0
+        seen = [ctl.block_total(64) for _ in range(12)]
+        self.assertIn(1, seen)  # paused
+        self.assertIn(2, seen)  # re-probed
+        self.assertLess(seen.count(2), seen.count(1))  # mostly paused
+        self.assertEqual(ctl.block_total(1), 1)  # end-of-budget stops
+
     def test_glm5_next_swiglu_clamp(self):
         # The text stack must apply config.swiglu_limit (reference clamps every text MLP);
         # the clamp must actually change the output when activations exceed the limit.
