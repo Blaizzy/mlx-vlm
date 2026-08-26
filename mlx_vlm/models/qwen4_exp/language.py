@@ -358,8 +358,12 @@ class Qwen4ExpQSAIndexer(nn.Module):
         block_position_ids = full_position_ids[..., block_starts]
         pooled_keys = self._apply_rope(pooled_keys, block_position_ids)
 
-        scores = query @ pooled_keys.transpose(0, 1, 3, 2)
-        scores = mx.sum(mx.maximum(scores.astype(mx.float32), 0), axis=1)
+        # Score in float32, as the reference does: which blocks win is a discrete
+        # choice, and rounding the products flips the ones near the cut-off.
+        scores = query.astype(mx.float32) @ pooled_keys.astype(mx.float32).transpose(
+            0, 1, 3, 2
+        )
+        scores = mx.sum(mx.maximum(scores, 0), axis=1)
         scores = scores / math.sqrt(self.head_dim)
 
         query_ends = past_len + mx.arange(seq_len) + 1
@@ -373,12 +377,29 @@ class Qwen4ExpQSAIndexer(nn.Module):
             ..., -self.block_topk :
         ]
 
-        token_indices = mx.arange(key_len)
-        token_blocks = token_indices // self.compress_ratio
-        selected_tokens = mx.any(
-            token_blocks[None, None, None, :] == selected_blocks[..., None],
-            axis=2,
+        # Mark the winners on the block axis and widen that to tokens. Comparing
+        # every token against every pick costs seq_len * key_len * block_topk
+        # bytes per prefill step -- 12 GB per sparse layer at a 12k prompt --
+        # against seq_len * key_len here.
+        block_hits = mx.put_along_axis(
+            mx.zeros((batch, seq_len, max_complete_blocks), dtype=mx.bool_),
+            selected_blocks,
+            mx.array(True),
+            axis=-1,
         )
+        selected_tokens = mx.repeat(block_hits, self.compress_ratio, axis=-1)
+        if complete_key_len < key_len:
+            selected_tokens = mx.concatenate(
+                [
+                    selected_tokens,
+                    mx.zeros(
+                        (batch, seq_len, key_len - complete_key_len), dtype=mx.bool_
+                    ),
+                ],
+                axis=-1,
+            )
+
+        token_indices = mx.arange(key_len)
         tail_starts = complete_counts * self.compress_ratio
         tail = (token_indices[None, None, :] >= tail_starts[None, :, None]) & (
             token_indices[None, None, :] < query_ends[None, :, None]
