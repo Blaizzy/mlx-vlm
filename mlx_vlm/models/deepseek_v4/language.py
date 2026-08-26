@@ -1249,6 +1249,29 @@ class LanguageModel(nn.Module):
         self.model = DeepseekV4Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        """Allow chunking when MTP state is captured by the final prefill call."""
+
+        del input_ids, inputs_embeds, prompt_cache
+        if draft_model is None:
+            return True
+
+        prefill_kwargs = prefill_kwargs or {}
+        return (
+            draft_kind == "mtp"
+            and bool(prefill_kwargs.get("return_hidden", False))
+            and bool(prefill_kwargs.get("return_shared_kv", False))
+        )
+
     def __call__(
         self,
         inputs: Optional[mx.array] = None,

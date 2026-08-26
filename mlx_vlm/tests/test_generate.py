@@ -2032,6 +2032,92 @@ def test_generate_step_chunks_prefill_when_model_policy_allows_speculation():
     model.chunked_prefill_policy.assert_called_once()
 
 
+def test_generate_step_chunks_deepseek_mtp_prefill_and_captures_final_state():
+    from mlx_vlm.models.deepseek_v4.language import LanguageModel
+
+    class RecordingDeepseekLanguageModel:
+        chunked_prefill_policy = LanguageModel.chunked_prefill_policy
+
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, inputs=None, inputs_embeds=None, **kwargs):
+            self.calls.append(
+                {
+                    "input_length": inputs_embeds.shape[1],
+                    "return_hidden": kwargs.get("return_hidden", False),
+                    "return_shared_kv": kwargs.get("return_shared_kv", False),
+                }
+            )
+            hidden_states = (
+                [mx.zeros((1, inputs_embeds.shape[1], 4))]
+                if kwargs.get("return_hidden", False)
+                else None
+            )
+            return SimpleNamespace(
+                logits=mx.zeros((1, inputs_embeds.shape[1], 4)),
+                hidden_states=hidden_states,
+                shared_kv_states=(
+                    {} if kwargs.get("return_shared_kv", False) else None
+                ),
+                cross_attention_states=None,
+                encoder_outputs=None,
+            )
+
+    language_model = RecordingDeepseekLanguageModel()
+
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 5, 4))
+    embedding_output.to_dict.return_value = {}
+    model = SimpleNamespace(
+        language_model=language_model,
+        get_input_embeddings=MagicMock(return_value=embedding_output),
+    )
+
+    draft_model = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=[]),
+    )
+
+    with (
+        patch("mlx_vlm.speculative.drafters.validate_drafter_compatibility"),
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+        patch.object(ar_module, "run_speculative_rounds", return_value=iter(())),
+    ):
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            max_tokens=1,
+            prefill_step_size=2,
+            draft_model=draft_model,
+            draft_kind="mtp",
+            prompt_cache=[],
+        )
+        list(gen)
+
+    assert language_model.calls == [
+        {
+            "input_length": 2,
+            "return_hidden": False,
+            "return_shared_kv": False,
+        },
+        {
+            "input_length": 2,
+            "return_hidden": False,
+            "return_shared_kv": False,
+        },
+        {
+            "input_length": 1,
+            "return_hidden": True,
+            "return_shared_kv": True,
+        },
+    ]
+
+
 def test_chunked_prefill_policy_defaults_conservative_for_speculation():
     model = SimpleNamespace(no_chunked_prefill=False)
 

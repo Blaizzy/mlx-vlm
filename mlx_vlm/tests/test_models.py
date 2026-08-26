@@ -2560,6 +2560,37 @@ class TestModels(unittest.TestCase):
 
         model = deepseek_v4.Model(config)
 
+        self.assertTrue(model.language_model.chunked_prefill_policy())
+        for prefill_kwargs in (
+            {},
+            {"return_hidden": True},
+            {"return_shared_kv": True},
+        ):
+            self.assertFalse(
+                model.language_model.chunked_prefill_policy(
+                    draft_model=object(),
+                    draft_kind="mtp",
+                    prefill_kwargs=prefill_kwargs,
+                )
+            )
+        self.assertTrue(
+            model.language_model.chunked_prefill_policy(
+                draft_model=object(),
+                draft_kind="mtp",
+                prefill_kwargs={
+                    "return_hidden": True,
+                    "return_shared_kv": True,
+                },
+            )
+        )
+        self.assertFalse(
+            model.language_model.chunked_prefill_policy(
+                draft_model=object(),
+                draft_kind="dflash",
+                prefill_kwargs={"capture_layer_ids": [1]},
+            )
+        )
+
         self.language_test_runner(
             model.language_model,
             config.model_type,
