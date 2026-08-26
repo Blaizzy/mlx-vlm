@@ -103,14 +103,37 @@ def quantize_model(
         fine_grained_config = False
         quantized_config["quantization"] = quant_params
 
+    # `quantized_config["quantization"]` aliases `quant_params` when the source
+    # model was not already quantized, and per-path entries are written into it
+    # below -- so snapshot the requested parameters before any of that lands.
+    requested_params = dict(quant_params)
+
     def wrapped_predicate(path, module):
         if not hasattr(module, "to_quantized"):
             return False
-        if module.weight.shape[-1] % group_size != 0:
-            return False
+
         bool_or_params = True
         if quant_predicate is not None:
             bool_or_params = quant_predicate(path, module)
+        if isinstance(bool_or_params, dict):
+            # A predicate may pin only some parameters -- typically a narrower
+            # group size for a row width the requested one does not divide -- and
+            # inherit the rest of the requested quantization.
+            bool_or_params = {**requested_params, **bool_or_params}
+
+        # Checked after the predicate, not before: a per-path group size is the
+        # only way to quantize a layer whose rows the requested group size does
+        # not divide, and testing the requested one first would skip the layer
+        # before its predicate ever got a say.
+        if bool_or_params:
+            path_group_size = (
+                bool_or_params["group_size"]
+                if isinstance(bool_or_params, dict)
+                else group_size
+            )
+            if module.weight.shape[-1] % path_group_size != 0:
+                return False
+
         if isinstance(bool_or_params, dict):
             quantized_config["quantization"][path] = bool_or_params
         elif fine_grained_config and bool_or_params:

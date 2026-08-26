@@ -33,6 +33,13 @@ def _target_verify_switch_glu(switch_mlp: SwitchGLU, x, indices, target_verify: 
 
 
 class Qwen3_5MoeSparseMoeBlock(nn.Module):
+    # Set by a model's `shard()` when the expert weights are split across ranks.
+    # `shard_inplace` only splits the weights -- mlx explicitly leaves the
+    # communication to the module -- so with a sharded `down_proj` this block
+    # produces a *partial* sum that has to be all-summed before it is used.
+    # `None` (every non-distributed caller) keeps the maths untouched.
+    sharding_group = None
+
     def __init__(self, args: TextConfig):
         super().__init__()
         dim = args.hidden_size
@@ -70,7 +77,12 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             * shared_y
         )
 
-        return y + shared_y
+        out = y + shared_y
+        if self.sharding_group is not None:
+            # Both branches went through a `sharded-to-all` `down_proj`, so a single
+            # reduction over their sum covers both.
+            out = mx.distributed.all_sum(out, group=self.sharding_group)
+        return out
 
 
 class Qwen3_5MoeDecoderLayer(nn.Module):

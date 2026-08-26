@@ -2786,3 +2786,181 @@ class StaticPrefixKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+
+# --- Speculative rollback: snapshot and restore -----------------------------
+#
+# Speculative decoding verifies a block of draft tokens in one forward pass and
+# then has to undo the rejected tail. Caches that can `trim` do that directly,
+# but some cannot: `PoolingCache` commits a compressed block once `ratio` raw
+# tokens have arrived and discards the originals, so trimming back into the
+# middle of a block is not expressible. For those, the caller snapshots the
+# pre-verify state, restores it after the verify, and replays the accepted
+# prefix through the model.
+#
+# `_needs_replay_snapshot_for_cache` exists so that cost is only paid when the
+# verify would actually destroy state -- if the incoming tokens do not fill a
+# pooling window, nothing is committed and a plain trim suffices.
+
+
+def _clone_cache_tree(value):
+    if isinstance(value, mx.array):
+        return mx.array(value)
+    if isinstance(value, tuple):
+        return tuple(_clone_cache_tree(v) for v in value)
+    if isinstance(value, list):
+        return [_clone_cache_tree(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _clone_cache_tree(v) for k, v in value.items()}
+    return value
+
+
+def _snapshot_cache_state(
+    caches: List[Any], incoming_tokens: int = 0
+) -> List[Optional[Tuple[Any, Any]]]:
+    return [_snapshot_single_cache(cache, incoming_tokens) for cache in caches]
+
+
+def _needs_replay_snapshot(cache, incoming_tokens: int) -> bool:
+    if cache is None:
+        return False
+    if isinstance(cache, CacheList):
+        return any(
+            _needs_replay_snapshot(child, incoming_tokens) for child in cache.caches
+        )
+    if isinstance(cache, PoolingCache):
+        return int(cache.remainder) + int(incoming_tokens) >= int(cache.ratio)
+    if isinstance(cache, RotatingKVCache):
+        return False
+    return not (hasattr(cache, "trim") and callable(cache.trim))
+
+
+def _needs_replay_snapshot_for_cache(
+    caches: Optional[List[Any]], incoming_tokens: int = 0
+) -> bool:
+    if caches is None:
+        return False
+    return any(_needs_replay_snapshot(cache, incoming_tokens) for cache in caches)
+
+
+def _snapshot_single_cache(cache, incoming_tokens: int = 0):
+    if cache is None:
+        return None
+    if isinstance(cache, CacheList):
+        return (
+            "cache_list",
+            [_snapshot_single_cache(child, incoming_tokens) for child in cache.caches],
+        )
+    if isinstance(cache, PoolingCache):
+        remainder = int(cache.remainder)
+        total = remainder + int(incoming_tokens)
+        overwrite_len = remainder
+        if incoming_tokens > 0:
+            overwrite_len = total % cache.ratio if total >= cache.ratio else 0
+        will_overwrite_remainder = (
+            remainder > 0 and cache.buf_kv is not None and overwrite_len > 0
+        )
+        buf_kv = cache.buf_kv[:, :overwrite_len] if will_overwrite_remainder else None
+        buf_gate = (
+            cache.buf_gate[:, :overwrite_len] if will_overwrite_remainder else None
+        )
+        pooled_len = None if cache.pooled is None else cache.pooled.shape[1]
+        return (
+            "pooling",
+            remainder,
+            _clone_cache_tree(buf_kv),
+            _clone_cache_tree(buf_gate),
+            pooled_len,
+        )
+    if isinstance(cache, RotatingKVCache):
+        return (
+            "rotating",
+            _clone_cache_tree(cache.offset),
+            int(cache._idx),
+            getattr(cache, "start_position", None),
+        )
+    return (
+        "full",
+        _clone_cache_tree(getattr(cache, "state", None)),
+        _clone_cache_tree(getattr(cache, "meta_state", None)),
+    )
+
+
+def _clear_cache_state(cache) -> None:
+    if isinstance(cache, CacheList):
+        for child in cache.caches:
+            _clear_cache_state(child)
+        return
+    if hasattr(cache, "keys"):
+        cache.keys = None
+    if hasattr(cache, "values"):
+        cache.values = None
+    if hasattr(cache, "offset"):
+        cache.offset = 0
+    if hasattr(cache, "_idx"):
+        cache._idx = 0
+    if hasattr(cache, "start_position"):
+        cache.start_position = 0
+    if hasattr(cache, "buf_kv"):
+        cache.buf_kv = None
+    if hasattr(cache, "buf_gate"):
+        cache.buf_gate = None
+    if hasattr(cache, "remainder"):
+        cache.remainder = 0
+    if hasattr(cache, "pooled"):
+        cache.pooled = None
+
+
+def _restore_single_cache(cache, snapshot) -> None:
+    if cache is None or snapshot is None:
+        return
+    kind = snapshot[0]
+    if isinstance(cache, CacheList):
+        for child, child_snapshot in zip(cache.caches, snapshot[1]):
+            _restore_single_cache(child, child_snapshot)
+        return
+    if kind == "pooling":
+        _, remainder, buf_kv, buf_gate, pooled_len = snapshot
+        cache.remainder = int(remainder)
+        if buf_kv is not None:
+            restore_len = int(buf_kv.shape[1])
+            if cache.buf_kv is None or cache.buf_kv.shape[1] < cache.ratio:
+                cache.buf_kv = mx.zeros(
+                    (buf_kv.shape[0], cache.ratio, buf_kv.shape[2]),
+                    dtype=buf_kv.dtype,
+                )
+            if cache.buf_gate is None or cache.buf_gate.shape[1] < cache.ratio:
+                cache.buf_gate = mx.zeros(
+                    (buf_gate.shape[0], cache.ratio, buf_gate.shape[2]),
+                    dtype=buf_gate.dtype,
+                )
+            cache.buf_kv[:, :restore_len] = buf_kv
+            cache.buf_gate[:, :restore_len] = buf_gate
+        if pooled_len is None:
+            cache.pooled = None
+        elif cache.pooled is not None:
+            cache.pooled = cache.pooled[:, :pooled_len]
+        return
+    if kind == "rotating":
+        _, offset, idx, start_position = snapshot
+        cache.offset = _clone_cache_tree(offset)
+        cache._idx = int(idx)
+        if start_position is not None and hasattr(cache, "start_position"):
+            cache.start_position = int(start_position)
+        return
+    _, state, meta_state = snapshot
+    if state is None:
+        _clear_cache_state(cache)
+        return
+    if meta_state is not None and hasattr(type(cache), "meta_state"):
+        cache.meta_state = _clone_cache_tree(meta_state)
+    cache.state = _clone_cache_tree(state)
+
+
+def _restore_cache_state(
+    caches: List[Any], snapshot: List[Optional[Tuple[Any, Any]]]
+) -> None:
+    for cache, entry in zip(caches, snapshot):
+        if cache is None or entry is None:
+            continue
+        _restore_single_cache(cache, entry)

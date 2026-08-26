@@ -652,14 +652,22 @@ def _prime_cached_prefix_rope_state(
 def _cache_fully_retained(c: Any) -> bool:
     """Whether ``c`` still holds its whole sequence from position 0.
 
-    Only such a cache can be rolled back to an earlier prefix. Note this is not
-    ``is_trimmable()``: ``BufferedRotatingKVCache`` reports itself trimmable even
-    after it has evicted early tokens, and trimming it then would only clamp to
-    its retained window and desync ``offset`` from the flat layers.
+    Only such a cache can be rolled back to an earlier prefix. This needs both
+    halves of the question answered. ``is_trimmable()`` alone is not enough:
+    ``BufferedRotatingKVCache`` reports itself trimmable even after it has evicted
+    early tokens, and trimming it then would only clamp to its retained window and
+    desync ``offset`` from the flat layers. But it is necessary -- a cache that
+    cannot trim cannot be rolled back at all. ``ArraysCache`` (gated-delta-net and
+    Mamba recurrent state) has no ``trim`` whatsoever, so without this the reuse
+    path raised ``AttributeError`` for every hybrid model; ``PoolingCache`` has one
+    that silently refuses once it holds a compressed block, which would leave the
+    pool describing tokens the rest of the cache no longer has.
     """
     children = getattr(c, "caches", None)
     if children is not None:  # CacheList
         return all(_cache_fully_retained(x) for x in children)
+    if not c.is_trimmable():
+        return False
     start_position = getattr(c, "start_position", None)
     if start_position is not None:  # Buffered/Chunked: evicts by advancing start
         return int(start_position) == 0

@@ -1166,8 +1166,9 @@ def sharded_load(
     mx.eval(model.language_model.parameters())
     model.eval()
 
-    # Synchronize processes to avoid timeout
-    mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
+    # Synchronize processes to avoid timeout. Don't pin the stream: ring/mpi run
+    # collectives on the cpu and nccl on the gpu, so naming either breaks the other.
+    mx.eval(mx.distributed.all_sum(mx.array(1.0)))
 
     return model, processor
 

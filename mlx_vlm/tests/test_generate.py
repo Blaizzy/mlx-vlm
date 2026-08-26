@@ -28,6 +28,7 @@ from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
 from mlx_vlm.models.cache import (
+    ArraysCache,
     BatchKVCache,
     BatchPoolingCache,
     BatchRotatingKVCache,
@@ -2720,6 +2721,26 @@ class TestPrefixCacheReuseTrim:
         assert c.offset == 40
         c.update_and_fetch(mx.zeros((1, 1, 1, 4)), mx.zeros((1, 1, 1, 4)))
         assert c.offset == 41
+
+    def test_recurrent_state_is_not_reusable(self):
+        # ArraysCache holds gated-delta-net / Mamba state, which cannot be rolled
+        # back to an earlier prefix -- it has no trim() at all. Reuse has to be
+        # declined; before this it raised AttributeError partway through trimming,
+        # after some caches had already been mutated.
+        flat = self._fill(KVCache(), 20)
+        caches = [ArraysCache(size=2), flat]
+        assert dispatch_module._prefix_cache_trim_amount(caches, 8) is None
+        assert flat.offset == 20  # nothing was mutated on the way out
+
+    def test_committed_pooling_cache_is_not_reusable(self):
+        # PoolingCache does have trim(), but it silently refuses once a compressed
+        # block is committed, which would leave the pool describing tokens the rest
+        # of the cache no longer has.
+        flat = self._fill(KVCache(), 20)
+        pooling = PoolingCache(4)
+        pooling.pooled = mx.zeros((1, 5, 4))
+        assert not pooling.is_trimmable()
+        assert dispatch_module._prefix_cache_trim_amount([flat, pooling], 8) is None
 
 
 class TestGemma4LogitsToKeep:

@@ -411,6 +411,18 @@ def _can_target_verify_quantized_head(linear) -> bool:
     return K % 512 == 0 and N % 8 == 0
 
 
+def _can_fuse_target_verify_kernels(linear) -> bool:
+    """Whether the fused Metal paths are usable for this head *on this backend*.
+
+    Separate from `_can_target_verify_quantized_head`, which answers the
+    backend-independent question of whether the head's shape and dtypes qualify.
+    Callers that merely advertise the capability need this one: the masked branch
+    of `fused_greedy_decode` raises rather than falling back, so promising support
+    on CUDA turns into a hard error at generation time.
+    """
+    return mx.metal.is_available() and _can_target_verify_quantized_head(linear)
+
+
 def _can_target_verify_quantized(linear, x: mx.array) -> bool:
     if (
         not _can_target_verify_quantized_head(linear)
@@ -425,7 +437,7 @@ def _can_target_verify_quantized(linear, x: mx.array) -> bool:
 
 
 def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
-    if not _can_target_verify_quantized(linear, x):
+    if not _can_target_verify_quantized(linear, x) or not mx.metal.is_available():
         return None
 
     B, T, K = x.shape
@@ -538,14 +550,8 @@ def _target_verify_quantized_argmax(
     N = linear.weight.shape[0]
     num_tiles = N // 8
 
-    x = mx.contiguous(x)
-    kernel_factory = (
-        _target_verify_masked_qargmax_kernel
-        if token_mask is not None
-        else _target_verify_qargmax_kernel
-    )
-    kernel = kernel_factory(linear.bits, linear.group_size, x.dtype, T, K, N)
-    inputs = [x, linear.weight, linear.scales, linear.biases]
+    # Validated before the backend check below: a malformed mask is a caller bug
+    # on every backend, and silently returning None would hide it.
     if token_mask is not None:
         if token_mask.ndim == 1:
             token_mask = token_mask[None, :]
@@ -557,6 +563,22 @@ def _target_verify_quantized_argmax(
             raise ValueError(
                 "packed token mask must be int32 with one complete row per token"
             )
+
+    # Metal-only fast path; elsewhere (e.g. CUDA) hand back None so callers fall
+    # back to the portable quantized matmul. Without this, greedy MTP verification
+    # dies mid-generation with `[metal_kernel] No Metal back-end.`
+    if not mx.metal.is_available():
+        return None
+
+    x = mx.contiguous(x)
+    kernel_factory = (
+        _target_verify_masked_qargmax_kernel
+        if token_mask is not None
+        else _target_verify_qargmax_kernel
+    )
+    kernel = kernel_factory(linear.bits, linear.group_size, x.dtype, T, K, N)
+    inputs = [x, linear.weight, linear.scales, linear.biases]
+    if token_mask is not None:
         inputs.append(token_mask)
     tile_values, tile_indices = kernel(
         inputs=inputs,
@@ -1458,6 +1480,15 @@ class Qwen3_5Attention(nn.Module):
             mrope_section=args.rope_parameters["mrope_section"],
         )
 
+    def post_cache(self, keys, values, mask, cache):
+        """Hook run right after the KV cache update, before attention.
+
+        A no-op here. Subclasses that attend to a subset of the cache override it
+        to compact ``keys``/``values`` and return a mask over the compacted axis
+        instead of over the full cache -- see ``qwen4_exp``'s QSA indexer.
+        """
+        return keys, values, mask
+
     def __call__(
         self,
         x: mx.array,
@@ -1528,6 +1559,8 @@ class Qwen3_5Attention(nn.Module):
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
+
+        keys, values, mask = self.post_cache(keys, values, mask, cache)
 
         left_padded_decode = (
             mask == "left_padded_decode" if isinstance(mask, str) else False
@@ -2705,7 +2738,7 @@ class LanguageModel(nn.Module):
                 for processors in logits_processors
             )
             and not self.args.tie_word_embeddings
-            and _can_target_verify_quantized_head(self.lm_head)
+            and _can_fuse_target_verify_kernels(self.lm_head)
             and "bias" not in self.lm_head
         )
 
@@ -2718,7 +2751,7 @@ class LanguageModel(nn.Module):
     ):
         if (
             self.args.tie_word_embeddings
-            or not _can_target_verify_quantized_head(self.lm_head)
+            or not _can_fuse_target_verify_kernels(self.lm_head)
             or "bias" in self.lm_head
         ):
             return None
