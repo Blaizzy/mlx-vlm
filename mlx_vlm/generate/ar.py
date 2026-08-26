@@ -130,6 +130,16 @@ class _PositionedTargetSampler:
             return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
         return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
 
+    def sample_proposal(
+        self,
+        logprobs: mx.array,
+        *,
+        row_ids: List[int],
+        positions: List[int],
+    ) -> mx.array:
+        keys = _position_keys(self.seed ^ 0x0DFA5202, row_ids, positions)
+        return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
+
     def _sample_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
         return mx.random.categorical(logprobs * (1 / self.temperature), key=key)
 

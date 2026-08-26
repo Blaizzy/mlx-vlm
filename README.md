@@ -9,7 +9,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
   - [Command Line Interface (CLI)](#command-line-interface-cli)
     - [Thinking Budget](#thinking-budget)
   - [Speculative Decoding](#speculative-decoding)
-    - [DFlash (Qwen3.5)](#dflash-qwen35)
+    - [DFlash, DFlash2, and DSpark](#dflash-dflash2-and-dspark)
     - [Gemma 4 MTP](#gemma-4-mtp)
     - [Gemma 4 EAGLE-3](#gemma-4-eagle-3)
     - [MiniMax M3 EAGLE-3](#minimax-m3-eagle-3)
@@ -57,6 +57,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Granite Vision 3.2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
 | Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
 | MiniCPM-V 4.6 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
+| GLiNER2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gliner2_5/README.md) |
 
 ## Installation
 
@@ -184,7 +185,7 @@ Speed up generation by drafting several candidate tokens with a small "drafter" 
 
 See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
 
-#### DFlash and DSpark (Qwen3.5, LFM2.5, and Muse Glimmer)
+#### DFlash, DFlash2, and DSpark
 
 A lightweight block-diffusion drafter that predicts multiple tokens per round, typically 2–3× faster.
 
@@ -205,6 +206,25 @@ mlx_vlm.generate --model Qwen/Qwen3.5-4B \
 # Server with speculative decoding
 mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --draft-model z-lab/Qwen3.5-4B-DFlash
+```
+
+DFlash2 adds dynamic convolutions and a candidate-path selector. The published
+Qwen3.8-27B checkpoint is auto-detected and uses the shared exact DFlash target
+verification path. For the fastest quantized setup, convert the drafter to
+4-bit; the verifier adapts between three and five rows from recent acceptance:
+
+```sh
+mlx_vlm.convert --hf-path z-lab/Qwen3.8-27B-DFlash2 \
+  --mlx-path Qwen3.8-27B-DFlash2-4bit \
+  --quantize --q-bits 4 --q-group-size 64
+
+mlx_vlm.generate --model mlx-community/Qwen3.8-27B-4bit \
+  --draft-model Qwen3.8-27B-DFlash2-4bit \
+  --prompt "Write a quicksort in Python." \
+  --max-tokens 512 --temperature 0
+
+mlx_vlm.server --model mlx-community/Qwen3.8-27B-4bit \
+  --draft-model Qwen3.8-27B-DFlash2-4bit
 ```
 
 Liquid AI's DSpark checkpoint uses a Qwen3-style block drafter plus a learned
@@ -494,7 +514,7 @@ mlx_vlm.server --api-key <secret-token>
 - `--embedding-model`: Preload an embedding model at server startup
 - `--reranker-model`: Preload a supported reranker model at server startup
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
-- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`, `Inferact/MiniMax-M3-EAGLE3`) — enables speculative decoding for ~2× or higher throughput
+- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.8-27B-DFlash2`, `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`, `Inferact/MiniMax-M3-EAGLE3`) — enables speculative decoding for ~2× or higher throughput
 - `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP)
 - `--draft-block-size`: Override the drafter's configured block size
 - `--host`: Host address (default: `0.0.0.0`)

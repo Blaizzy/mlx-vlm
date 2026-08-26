@@ -45,7 +45,10 @@ def _dflash_next_block_size(
         return block_total
 
     current = min(block_total, max(2, recent[-1][1] + 1))
-    min_total = min(block_total, 4)
+    min_total = min(
+        block_total,
+        max(2, int(getattr(draft_model, "dflash_min_block_size", 4))),
+    )
     drafted = sum(d for _, d in recent)
     accepted = sum(a for a, _ in recent)
     accept_rate = accepted / drafted
@@ -109,6 +112,32 @@ class _PositionedDraftSampler:
             position + offset for position in self.positions for offset in range(length)
         ]
         sampled = self.sampler.sample_target(
+            logits.reshape(batch * length, logits.shape[-1]),
+            row_ids=rows,
+            positions=positions,
+        )
+        self.positions = [position + length for position in self.positions]
+        return sampled.reshape(logits.shape[:-1])
+
+    def sample_proposal(self, logits: mx.array) -> mx.array:
+        sample_proposal = getattr(self.sampler, "sample_proposal", None)
+        if not callable(sample_proposal):
+            return mx.argmax(logits, axis=-1)
+        if logits.ndim == 1:
+            batch, length = 1, 1
+        elif logits.ndim == 2:
+            batch, length = logits.shape[0], 1
+        else:
+            batch, length = logits.shape[0], logits.shape[1]
+        if batch != len(self.row_ids):
+            raise ValueError(
+                "Draft sampler row count does not match logits batch size."
+            )
+        rows = [row_id for row_id in self.row_ids for _ in range(length)]
+        positions = [
+            position + offset for position in self.positions for offset in range(length)
+        ]
+        sampled = sample_proposal(
             logits.reshape(batch * length, logits.shape[-1]),
             row_ids=rows,
             positions=positions,

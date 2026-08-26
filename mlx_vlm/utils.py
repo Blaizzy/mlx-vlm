@@ -611,8 +611,13 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
+    architectures = set(config.get("architectures") or ())
     dflash_config = config.get("dflash_config")
-    if dflash_config is not None:
+    if "BoundaryExtractor" in architectures:
+        model_type = "gliner2_5"
+    elif "DFlash2DraftModel" in architectures:
+        model_type = "dflash2"
+    elif dflash_config is not None:
         is_dspark = (
             dflash_config.get("projector_type") == "dspark"
             or int(config.get("markov_rank") or dflash_config.get("markov_rank") or 0)
@@ -634,18 +639,6 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
     msg = f"Model type {model_type} not supported. Error: {last_err}"
     logging.error(msg)
     raise ValueError(msg)
-
-
-def _has_config(config: dict, key: str) -> bool:
-    value = config.get(key)
-    return value is not None and value != {}
-
-
-def _is_text_only_config(config: dict) -> bool:
-    return not any(
-        _has_config(config, key)
-        for key in ("vision_config", "audio_config", "dflash_config")
-    )
 
 
 def _quantization_path_aliases(
@@ -675,21 +668,26 @@ def _quantization_for_module_path(
     return None
 
 
-def _drop_modules_without_weights(model: nn.Module, weights: dict) -> None:
+def _drop_modules_without_weights(
+    model: nn.Module, weights: dict, declared_keys: Optional[set] = None
+) -> None:
+    """Drop weightless top-level VLM modules the checkpoint manifest also omits."""
     weighted_modules = {key.partition(".")[0] for key in weights}
+    declared_modules = {key.partition(".")[0] for key in (declared_keys or weights)}
     dropped_modules = []
     for name, child in list(model.items()):
         if name == "language_model" or not isinstance(child, nn.Module):
             continue
         if not tree_flatten(child.parameters()) or name in weighted_modules:
             continue
+        if name in declared_modules:
+            continue
         setattr(model, name, None)
         dropped_modules.append(name)
 
     if dropped_modules:
         logging.warning(
-            "Text-only checkpoint has no weights for VLM module(s): %s. "
-            "Disabling those modules.",
+            "Checkpoint has no weights for module(s): %s. Disabling them.",
             ", ".join(dropped_modules),
         )
 
@@ -761,10 +759,12 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
 
     index_file = model_path / "model.safetensors.index.json"
     weight_files = []
+    declared_keys: set = set()
     if index_file.exists():
         try:
             with open(index_file) as f:
                 weight_map = json.load(f).get("weight_map", {})
+            declared_keys = set(weight_map)
             weight_files = [
                 str(model_path / shard)
                 for shard in sorted(set(weight_map.values()))
@@ -772,6 +772,7 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
             ]
         except (ValueError, OSError):
             weight_files = []
+            declared_keys = set()
     if not weight_files:
         weight_files = [
             wf
@@ -806,7 +807,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         weights.update(_load_safetensors(wf))
 
     model_class, _ = get_model_and_args(config=config, model_path=model_path)
-    text_only_config = _is_text_only_config(config)
 
     # Initialize text and vision configs if not present
     config.setdefault("text_config", config.pop("llm_config", {}))
@@ -975,8 +975,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         model = quantize_activations(model)
 
-    if text_only_config:
-        _drop_modules_without_weights(model, weights)
+    _drop_modules_without_weights(model, weights, declared_keys)
 
     model.load_weights(list(weights.items()), strict=strict)
 
@@ -1205,10 +1204,23 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
             except json.JSONDecodeError:
                 pass
 
-        return config
-
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"Config not found at {model_path}") from exc
+
+    # GLiNER2.5 ships its encoder config in a sidecar directory instead of
+    # inline, so fold it in alongside the other config files. Raised outside the
+    # block above so the missing file is not reported as a missing config.json.
+    if "BoundaryExtractor" in (config.get("architectures") or ()):
+        if "encoder_config" not in config:
+            encoder_config_path = model_path / "encoder_config" / "config.json"
+            if not encoder_config_path.is_file():
+                raise FileNotFoundError(
+                    f"GLiNER2.5 encoder config not found: {encoder_config_path}"
+                )
+            with open(encoder_config_path, encoding="utf-8") as f:
+                config["encoder_config"] = json.load(f)
+
+    return config
 
 
 def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImageProcessor:

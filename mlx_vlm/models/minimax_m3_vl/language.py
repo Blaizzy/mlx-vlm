@@ -103,7 +103,10 @@ def _minimax_moe_select(
     return inds, weights * routed_scaling_factor
 
 
-@mx.compile
+# Deliberately not @mx.compile: `idx_keys` grows a position every decode step,
+# so a shape-keyed compiled function re-traces on every call and each trace
+# permanently grows MLX's compiler cache, eventually tripping
+# `[metal::malloc] Resource limit (499000) exceeded`. See the regression test.
 def _build_sparse_causal_mask_compiled(
     idx_queries: mx.array,
     idx_keys: mx.array,
@@ -188,7 +191,8 @@ def _build_sparse_causal_mask_compiled(
     return sparse_mask, topk_idx[:, None], topk_valid[:, None]
 
 
-@mx.compile
+# Deliberately not @mx.compile — same reason as
+# `_build_sparse_causal_mask_compiled` above.
 def _select_sparse_block_indices_compiled(
     idx_queries: mx.array,
     idx_keys: mx.array,
