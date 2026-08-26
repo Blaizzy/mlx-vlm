@@ -3111,3 +3111,28 @@ def test_minimax_m3_get_input_embeddings_uses_cached_video_without_pixels():
     assert output.visual_pos_masks.tolist() == [[False, True, True, False]]
     assert output.inputs_embeds[0, 1].tolist() == [4.0, 5.0, 6.0]
     assert output.inputs_embeds[0, 2].tolist() == [7.0, 8.0, 9.0]
+
+
+def test_sparse_index_helpers_are_not_shape_compiled():
+    """The sparse index helpers must stay uncompiled.
+
+    Both take `idx_keys` straight from `update_index_and_fetch`, whose sequence
+    dimension is the running context length. A non-shapeless `mx.compile` keys
+    on input shapes, so it re-traces every decode step: the compiled artifact is
+    never reused and each trace leaves permanent state in MLX's compiler cache
+    that `mx.clear_cache()` does not release, eventually tripping
+    `[metal::malloc] Resource limit (499000) exceeded` on a long-running server.
+
+    If either of these ever needs compiling again, it has to be `shapeless=True`
+    with the shape-dependent work (`idx_keys.shape[2]`, `mx.arange(total_len)`)
+    lifted out first.
+    """
+
+    def is_compiled(fn):
+        return type(fn).__name__ == "gc_func"
+
+    assert not is_compiled(minimax_language._build_sparse_causal_mask_compiled)
+    assert not is_compiled(minimax_language._select_sparse_block_indices_compiled)
+
+    # Guard the check itself: a compiled function must be detected as one.
+    assert is_compiled(mx.compile(lambda x: x + 1))
