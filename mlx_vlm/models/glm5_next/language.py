@@ -10,13 +10,12 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, CacheList, KVCache
+from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
 from ..deepseek_v32.language import DeepseekV32MoE
 from ..deepseek_v32.language import Model as DSV32Model
-from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
 from ..gated_delta import gated_delta_update
 from ..mla import MultiLinear
 from ..mlp import DeepseekMLP
-from ..rope_utils import initialize_rope
 from .config import ModelConfig, TextConfig
 
 
@@ -397,7 +396,9 @@ class Glm5NextIndexer(nn.Module):
             c1 = min(c0 + chunk, S)
             cs = c1 - c0
             q_pos = offset + mx.arange(c0, c1)
-            visible = (kv_pos[None, None, :] <= q_pos[None, :, None]) & valid[:, None, :]
+            visible = (kv_pos[None, None, :] <= q_pos[None, :, None]) & valid[
+                :, None, :
+            ]
             scores = q[:, c0:c1] @ pool_keys_t
             scores = mx.maximum(scores * self.softmax_scale, 0.0)
             weights = self.weights_proj(x[:, c0:c1]) * (self.n_heads**-0.5)
@@ -421,7 +422,9 @@ class Glm5NextIndexer(nn.Module):
             ).reshape(B, cs, select_k * self.index_kpool)
             topk = mx.where(sv, topk, -1)
             if tail_on:
-                topk = mx.concatenate([topk, self._visible_tail(visible, valid)], axis=-1)
+                topk = mx.concatenate(
+                    [topk, self._visible_tail(visible, valid)], axis=-1
+                )
             if topk.shape[-1] < output_width:
                 pad = mx.full(
                     (B, cs, output_width - topk.shape[-1]), -1, dtype=topk.dtype
