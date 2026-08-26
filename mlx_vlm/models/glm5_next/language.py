@@ -13,6 +13,7 @@ from ..cache import ArraysCache, CacheList, KVCache
 from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
 from ..deepseek_v32.language import DeepseekV32MoE
 from ..deepseek_v32.language import Model as DSV32Model
+from ..deepseek_v32.language import MoEGate, group_expert_select
 from ..gated_delta import gated_delta_update
 from ..mla import MultiLinear
 from ..mlp import DeepseekMLP
@@ -279,7 +280,7 @@ class Glm5NextIndexer(nn.Module):
             self.q_lora_rank, self.n_heads * self.head_dim, bias=False
         )
         self.wk = nn.Linear(self.dim, self.head_dim, bias=False)
-        self.k_norm = nn.LayerNorm(self.head_dim)
+        self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
         self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False)
         self.softmax_scale = self.head_dim**-0.5
         self.index_kpool_compress_ape = mx.zeros((self.index_kpool, self.head_dim))
@@ -490,14 +491,14 @@ class Glm5NextSparseAttention(nn.Module):
         self.q_a_proj = nn.Linear(
             self.hidden_size, self.q_lora_rank, bias=config.attention_bias
         )
-        self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=1e-6)
+        self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
         self.q_b_proj = nn.Linear(
             self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
         )
         self.kv_a_proj_with_mqa = nn.Linear(
             self.hidden_size, self.kv_lora_rank, bias=config.attention_bias
         )
-        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=1e-6)
+        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
         self.embed_q = MultiLinear(
             self.qk_nope_head_dim, self.kv_lora_rank, self.num_heads
         )
@@ -640,6 +641,66 @@ class Glm5NextSparseAttention(nn.Module):
         return self.o_proj(out)
 
 
+class Glm5NextClampedSwiGLU(nn.Module):
+    # GLM-5-Next clamps the SwiGLU activation in the text stack (config.swiglu_limit):
+    # the gate is clamped above and the up projection on both sides before silu(gate)*up.
+    # SwitchGLU invokes activation(x_up, x_gate).
+    def __init__(self, limit: Optional[float]):
+        super().__init__()
+        self.limit = limit
+
+    def __call__(self, x_up: mx.array, x_gate: mx.array) -> mx.array:
+        if self.limit is not None:
+            x_gate = mx.clip(x_gate, a_min=None, a_max=self.limit)
+            x_up = mx.clip(x_up, a_min=-self.limit, a_max=self.limit)
+        return nn.silu(x_gate) * x_up
+
+
+class Glm5NextMLP(DeepseekMLP):
+    # Dense / shared-expert MLP with the clamped SwiGLU (matches the reference text MLP).
+    def __init__(self, config, hidden_size=None, intermediate_size=None):
+        super().__init__(
+            config, hidden_size=hidden_size, intermediate_size=intermediate_size
+        )
+        self.limit = config.swiglu_limit
+
+    def __call__(self, x: mx.array) -> mx.array:
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        if self.limit is not None:
+            gate = mx.clip(gate, a_min=None, a_max=self.limit)
+            up = mx.clip(up, a_min=-self.limit, a_max=self.limit)
+        return self.down_proj(nn.silu(gate) * up)
+
+
+class Glm5NextMoEGate(MoEGate):
+    # Router logits in fp32 (reference uses moe_router_dtype=float32) so near-tie top-k
+    # membership matches the reference rather than flipping under bf16 rounding.
+    def __call__(self, x: mx.array):
+        logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
+        return group_expert_select(
+            logits,
+            self.e_score_correction_bias,
+            self.top_k,
+            self.n_group,
+            self.topk_group,
+            self.routed_scaling_factor,
+            self.norm_topk_prob,
+        )
+
+
+class Glm5NextMoE(DeepseekV32MoE):
+    # Sparse MoE with the clamped SwiGLU on both the routed experts and the shared expert,
+    # and an fp32 router.
+    def __init__(self, config):
+        super().__init__(config)
+        self.switch_mlp.activation = Glm5NextClampedSwiGLU(config.swiglu_limit)
+        self.gate = Glm5NextMoEGate(config)
+        if config.n_shared_experts is not None:
+            inter = config.moe_intermediate_size * config.n_shared_experts
+            self.shared_experts = Glm5NextMLP(config, intermediate_size=inter)
+
+
 class Glm5NextDecoderLayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
@@ -655,7 +716,7 @@ class Glm5NextDecoderLayer(nn.Module):
             and layer_idx >= config.first_k_dense_replace
             and config.mlp_layer_types[layer_idx] == "sparse"
         )
-        self.mlp = DeepseekV32MoE(config) if is_sparse else DeepseekMLP(config)
+        self.mlp = Glm5NextMoE(config) if is_sparse else Glm5NextMLP(config)
 
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
@@ -957,6 +1018,17 @@ class LanguageModel(nn.Module):
         for k, v in list(weights.items()):
             if "conv1d.weight" in k and v.ndim == 3 and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
+        # Heal already-converted checkpoints: mHC base/scale and KDA gate params must be
+        # fp32 (see cast_predicate); restore them on load if a prior convert cast to bf16.
+        for k, v in list(weights.items()):
+            keep = (
+                ".attn_hc." in k
+                or ".ffn_hc." in k
+                or k.endswith("A_log")
+                or k.endswith("dt_bias")
+            )
+            if keep and mx.issubdtype(v.dtype, mx.floating) and v.dtype != mx.float32:
+                weights[k] = v.astype(mx.float32)
         return weights
 
     @property
@@ -965,8 +1037,17 @@ class LanguageModel(nn.Module):
 
     @property
     def cast_predicate(self):
+        # Keep these in fp32 through convert: the fused mHC kernel reads attn_hc/ffn_hc
+        # `base` via a float4 pointer (a bf16 base yields a wrong comb matrix), and the
+        # KDA gate params (A_log, dt_bias) are fp32-sensitive.
         def predicate(k):
-            return "e_score_correction_bias" not in k
+            if "e_score_correction_bias" in k:
+                return False
+            if ".attn_hc." in k or ".ffn_hc." in k:
+                return False
+            if k.endswith("A_log") or k.endswith("dt_bias"):
+                return False
+            return True
 
         return predicate
 

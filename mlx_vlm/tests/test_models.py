@@ -3488,6 +3488,24 @@ class TestModels(unittest.TestCase):
             greedy=True,
         )
 
+    def test_glm5_next_swiglu_clamp(self):
+        # The text stack must apply config.swiglu_limit (reference clamps every text MLP);
+        # the clamp must actually change the output when activations exceed the limit.
+        import mlx.core as mx
+
+        from mlx_vlm.models.glm5_next.language import Glm5NextMLP
+
+        mx.random.seed(0)
+        cfg = self._glm5_next_mtp_text_config()
+        mlp = Glm5NextMLP(cfg)
+        mx.eval(mlp.parameters())
+        x = mx.random.normal((1, 3, cfg.hidden_size)) * 10.0
+        mlp.limit = None
+        unclamped = mlp(x)
+        mlp.limit = 0.5
+        clamped = mlp(x)
+        self.assertGreater(float(mx.max(mx.abs(unclamped - clamped))), 1e-3)
+
     def test_nemotron_h_language_model(self):
         from mlx_vlm.models import nemotron_h
 
