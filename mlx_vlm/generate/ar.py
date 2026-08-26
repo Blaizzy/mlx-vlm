@@ -19,7 +19,12 @@ from .. import apc as _apc
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
-from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
+from ..sample_utils import (
+    apply_top_k,
+    make_logits_processors,
+    make_sampler,
+    top_p_sampling,
+)
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_rounds,
@@ -88,12 +93,24 @@ def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.ar
 class _PositionedTargetSampler:
     """Sampler with stateless target draws keyed by generated-token position."""
 
-    def __init__(self, *, temperature: float, top_p: float, seed: int):
+    def __init__(
+        self,
+        *,
+        temperature: float,
+        top_p: float,
+        top_k: int = 0,
+        seed: int,
+    ):
         self.temperature = float(temperature)
         self.top_p = float(top_p)
+        self.top_k = int(top_k)
         self.seed = int(seed)
 
+    def _apply_top_k(self, logprobs: mx.array) -> mx.array:
+        return apply_top_k(logprobs, self.top_k) if self.top_k > 0 else logprobs
+
     def __call__(self, logprobs: mx.array) -> mx.array:
+        logprobs = self._apply_top_k(logprobs)
         if self.top_p > 0 and self.top_p < 1.0:
             return top_p_sampling(logprobs, self.top_p, self.temperature)
         return mx.random.categorical(logprobs * (1 / self.temperature))
@@ -107,6 +124,7 @@ class _PositionedTargetSampler:
     ) -> mx.array:
         if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
             raise ValueError("row_ids and positions must match logprobs batch size.")
+        logprobs = self._apply_top_k(logprobs)
         keys = _position_keys(self.seed, row_ids, positions)
         if self.top_p > 0 and self.top_p < 1.0:
             return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
@@ -266,7 +284,6 @@ def generate_step(
             seed is not None
             and temperature > 0
             and min_p == DEFAULT_MIN_P
-            and top_k == DEFAULT_TOP_K
             and top_n_sigma == DEFAULT_TOP_N_SIGMA
             and not p_less
             and typical_p == 1.0
@@ -274,6 +291,7 @@ def generate_step(
             sampler = _PositionedTargetSampler(
                 temperature=temperature,
                 top_p=top_p,
+                top_k=top_k,
                 seed=seed,
             )
         else:
