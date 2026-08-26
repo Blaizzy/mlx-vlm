@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import math
 from bisect import bisect_right
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import LanguageModelOutput
-from ..cache import ArraysCache, KVCache, QuantizedKVCache
+from ..cache import (
+    ArraysCache,
+    BatchKVCache,
+    KVCache,
+    QuantizedKVCache,
+    dynamic_roll,
+)
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
 from ..qwen3_5.language import (
     Qwen3_5Attention,
@@ -118,6 +125,52 @@ class QSAKVCache(KVCache):
             else:
                 self.index_position_ids = self.index_position_ids[batch_indices]
 
+    def to_batch(self, left_padding):
+        """Convert a singleton QSA cache without dropping indexer state."""
+
+        batch = BatchQSAKVCache(left_padding)
+        padding = mx.array(left_padding)
+        if self.empty() and self.index_keys is None:
+            return batch
+        if padding.size != 1:
+            raise ValueError(
+                "A warm QSA cache can only seed one batch row, got "
+                f"left_padding={padding.tolist()}"
+            )
+        pad = int(padding.item())
+        if not self.empty():
+            keys, values = self.state[:2]
+            if pad:
+                keys = mx.pad(keys, [(0, 0), (0, 0), (pad, 0), (0, 0)])
+                values = mx.pad(values, [(0, 0), (0, 0), (pad, 0), (0, 0)])
+            batch.kv_cache.state = (
+                keys,
+                values,
+                mx.array([self.offset], dtype=mx.int32),
+                padding.astype(mx.int32),
+            )
+        if self.index_keys is not None:
+            index_keys = self.index_keys[:, : self.offset]
+            positions = self.index_position_ids[..., : self.offset]
+            if pad:
+                index_keys = mx.pad(index_keys, [(0, 0), (pad, 0), (0, 0)])
+                positions = mx.pad(
+                    positions,
+                    (
+                        [(0, 0), (0, 0), (pad, 0)]
+                        if positions.ndim == 3
+                        else [(0, 0), (pad, 0)]
+                    ),
+                )
+            batch.index_keys = index_keys
+            batch.index_position_ids = positions
+            batch.index_offset = index_keys.shape[1]
+        return batch
+
+    @classmethod
+    def merge(cls, caches):
+        return BatchQSAKVCache.merge(caches)
+
     def to_quantized(self, group_size: int = 64, bits: int = 4):
         base = super().to_quantized(group_size=group_size, bits=bits)
         cache = QSAQuantizedKVCache(group_size=group_size, bits=bits)
@@ -134,6 +187,229 @@ class QSAKVCache(KVCache):
         if self.index_keys is not None:
             size += self.index_keys.nbytes + self.index_position_ids.nbytes
         return size
+
+
+class BatchQSAKVCache:
+    """Batch KV cache that keeps QSA raw keys and text/MRoPE positions aligned."""
+
+    def __init__(self, left_padding):
+        self.kv_cache = BatchKVCache(left_padding)
+        self.index_keys = None
+        self.index_position_ids = None
+        self.index_offset = 0
+
+    @property
+    def offset(self):
+        return self.kv_cache.offset
+
+    @property
+    def left_padding(self):
+        return self.kv_cache.left_padding
+
+    def update_and_fetch(self, keys, values):
+        return self.kv_cache.update_and_fetch(keys, values)
+
+    def update_indexer(self, keys: mx.array, position_ids: mx.array):
+        if self.index_keys is None:
+            self.index_keys = keys
+            self.index_position_ids = position_ids
+        else:
+            self.index_keys = mx.concatenate([self.index_keys, keys], axis=1)
+            self.index_position_ids = _append_indexer_positions(
+                self.index_position_ids, position_ids
+            )
+        self.index_offset = self.index_keys.shape[1]
+        return self.index_keys, self.index_position_ids
+
+    def prepare(self, **kwargs):
+        self.kv_cache.prepare(**kwargs)
+
+    def finalize(self):
+        right_padding = getattr(self.kv_cache, "_right_padding", None)
+        self.kv_cache.finalize()
+        if right_padding is None or self.index_keys is None:
+            return
+        self.index_keys = dynamic_roll(self.index_keys, right_padding, axis=1)
+        if self.index_position_ids.ndim == 3:
+            self.index_position_ids = dynamic_roll(
+                self.index_position_ids, right_padding[None], axis=2
+            )
+        else:
+            self.index_position_ids = dynamic_roll(
+                self.index_position_ids, right_padding, axis=1
+            )
+
+    def make_mask(self, *args, **kwargs):
+        return self.kv_cache.make_mask(*args, **kwargs)
+
+    def filter(self, batch_indices):
+        min_left = int(self.left_padding[batch_indices].min().item())
+        self.kv_cache.filter(batch_indices)
+        if self.index_keys is None:
+            return
+        self.index_keys = self.index_keys[batch_indices]
+        if self.index_position_ids.ndim == 3:
+            self.index_position_ids = self.index_position_ids[:, batch_indices]
+        else:
+            self.index_position_ids = self.index_position_ids[batch_indices]
+        if min_left > 0:
+            self.index_keys = self.index_keys[:, min_left:]
+            self.index_position_ids = self.index_position_ids[..., min_left:]
+            self.index_offset -= min_left
+
+    @staticmethod
+    def _pad_index(cache, target, sample_keys, sample_positions):
+        length = 0 if cache.index_keys is None else cache.index_offset
+        left = target - length
+        if cache.index_keys is None:
+            keys = mx.zeros(
+                (cache.offset.shape[0], 0, sample_keys.shape[-1]),
+                dtype=sample_keys.dtype,
+            )
+            if sample_positions.ndim == 3:
+                positions = mx.zeros(
+                    (sample_positions.shape[0], cache.offset.shape[0], 0),
+                    dtype=sample_positions.dtype,
+                )
+            else:
+                positions = mx.zeros(
+                    (cache.offset.shape[0], 0), dtype=sample_positions.dtype
+                )
+        else:
+            keys = cache.index_keys[:, :length]
+            positions = cache.index_position_ids[..., :length]
+        if left:
+            keys = mx.pad(keys, [(0, 0), (left, 0), (0, 0)])
+            positions = mx.pad(
+                positions,
+                (
+                    [(0, 0), (0, 0), (left, 0)]
+                    if positions.ndim == 3
+                    else [(0, 0), (left, 0)]
+                ),
+            )
+        return keys, positions
+
+    def extend(self, other):
+        if not isinstance(other, BatchQSAKVCache):
+            raise TypeError(f"Cannot extend BatchQSAKVCache with {type(other)}")
+        self.kv_cache.extend(other.kv_cache)
+        sample_keys = (
+            self.index_keys if self.index_keys is not None else other.index_keys
+        )
+        sample_positions = (
+            self.index_position_ids
+            if self.index_position_ids is not None
+            else other.index_position_ids
+        )
+        if sample_keys is None:
+            return
+        target = max(self.index_offset, other.index_offset)
+        left = self._pad_index(self, target, sample_keys, sample_positions)
+        right = self._pad_index(other, target, sample_keys, sample_positions)
+        self.index_keys = mx.concatenate([left[0], right[0]], axis=0)
+        position_axis = 1 if sample_positions.ndim == 3 else 0
+        self.index_position_ids = mx.concatenate(
+            [left[1], right[1]], axis=position_axis
+        )
+        self.index_offset = target
+
+    def extract(self, idx):
+        cache = QSAKVCache()
+        base = self.kv_cache.extract(idx)
+        cache.keys, cache.values, cache.offset = base.keys, base.values, base.offset
+        if self.index_keys is not None:
+            padding = int(self.left_padding[idx].item())
+            cache.index_keys = mx.contiguous(
+                self.index_keys[idx : idx + 1, padding : self.index_offset]
+            )
+            if self.index_position_ids.ndim == 3:
+                cache.index_position_ids = mx.contiguous(
+                    self.index_position_ids[
+                        :, idx : idx + 1, padding : self.index_offset
+                    ]
+                )
+            else:
+                cache.index_position_ids = mx.contiguous(
+                    self.index_position_ids[idx : idx + 1, padding : self.index_offset]
+                )
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        caches = list(caches)
+        out = cls([0] * len(caches))
+        if not caches:
+            return out
+        out.kv_cache = BatchKVCache.merge(caches)
+        sample = next((cache for cache in caches if cache.index_keys is not None), None)
+        if sample is None:
+            return out
+        target = max(cache.offset for cache in caches)
+        rows = [
+            cls._pad_index(
+                SimpleNamespace(
+                    index_keys=cache.index_keys,
+                    index_position_ids=cache.index_position_ids,
+                    index_offset=cache.offset,
+                    offset=mx.array([cache.offset]),
+                ),
+                target,
+                sample.index_keys,
+                sample.index_position_ids,
+            )
+            for cache in caches
+        ]
+        out.index_keys = mx.concatenate([row[0] for row in rows], axis=0)
+        position_axis = 1 if sample.index_position_ids.ndim == 3 else 0
+        out.index_position_ids = mx.concatenate(
+            [row[1] for row in rows], axis=position_axis
+        )
+        out.index_offset = target
+        return out
+
+    def size(self):
+        return self.kv_cache.size()
+
+    def empty(self):
+        return self.kv_cache.empty()
+
+    def is_trimmable(self):
+        return self.kv_cache.is_trimmable()
+
+    def trim(self, n):
+        trimmed = self.kv_cache.trim(n)
+        self.index_offset = max(0, self.index_offset - trimmed)
+        return trimmed
+
+    @property
+    def state(self):
+        return (
+            self.kv_cache.state,
+            (
+                None
+                if self.index_keys is None
+                else self.index_keys[:, : self.index_offset]
+            ),
+            (
+                None
+                if self.index_position_ids is None
+                else self.index_position_ids[..., : self.index_offset]
+            ),
+        )
+
+    @state.setter
+    def state(self, value):
+        kv_state, self.index_keys, self.index_position_ids = value
+        self.kv_cache.state = kv_state
+        self.index_offset = 0 if self.index_keys is None else self.index_keys.shape[1]
+
+    @property
+    def nbytes(self):
+        extra = 0
+        if self.index_keys is not None:
+            extra = self.index_keys.nbytes + self.index_position_ids.nbytes
+        return self.kv_cache.nbytes + extra
 
 
 class QSAQuantizedKVCache(QuantizedKVCache):

@@ -4,9 +4,11 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_vlm.generate import maybe_quantize_kv_cache
+from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models import qwen4_exp
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.models.qwen4_exp.language import (
+    BatchQSAKVCache,
     QSAKVCache,
     QSAQuantizedKVCache,
     Qwen4ExpGatedDeltaNet,
@@ -239,6 +241,64 @@ class Qwen4ExpTests(unittest.TestCase):
         self.assertIsInstance(quantized, QSAQuantizedKVCache)
         self.assertEqual(quantized.index_keys.shape, (1, 12, 8))
         self.assertEqual(quantized.offset, 12)
+
+    def test_qsa_cache_merges_ragged_rows_and_round_trips_extract(self):
+        rows = []
+        for length in (3, 1):
+            cache = QSAKVCache()
+            cache.update_and_fetch(
+                mx.ones((1, 2, length, 8)) * length,
+                mx.ones((1, 2, length, 8)) * (length + 1),
+            )
+            cache.update_indexer(
+                mx.arange(length * 8).reshape(1, length, 8),
+                mx.arange(length, dtype=mx.int32)[None],
+            )
+            rows.append(cache)
+
+        batch = QSAKVCache.merge(rows)
+        self.assertIsInstance(batch, BatchQSAKVCache)
+        self.assertEqual(batch.index_keys.shape, (2, 3, 8))
+        self.assertEqual(batch.index_position_ids.shape, (2, 3))
+        self.assertEqual(batch.left_padding.tolist(), [0, 2])
+
+        restored = batch.extract(1)
+        mx.eval(*restored.state)
+        self.assertEqual(restored.offset, 1)
+        self.assertTrue(mx.array_equal(restored.index_keys, rows[1].index_keys).item())
+        self.assertTrue(
+            mx.array_equal(
+                restored.index_position_ids, rows[1].index_position_ids
+            ).item()
+        )
+
+    def test_qsa_batch_cache_preserves_mrope_position_axis(self):
+        rows = []
+        for length in (2, 1):
+            cache = QSAKVCache()
+            cache.update_and_fetch(
+                mx.zeros((1, 2, length, 8)), mx.zeros((1, 2, length, 8))
+            )
+            positions = mx.broadcast_to(
+                mx.arange(length, dtype=mx.int32)[None, None], (3, 1, length)
+            )
+            cache.update_indexer(mx.zeros((1, length, 8)), positions)
+            rows.append(cache)
+
+        batch = QSAKVCache.merge(rows)
+        self.assertEqual(batch.index_position_ids.shape, (3, 2, 2))
+        batch.update_indexer(
+            mx.zeros((2, 1, 8)),
+            mx.array([[[2], [1]], [[2], [1]], [[2], [1]]], dtype=mx.int32),
+        )
+        self.assertEqual(batch.index_position_ids.shape, (3, 2, 3))
+
+    def test_generation_cache_factory_keeps_qsa_batch_type(self):
+        model = qwen4_exp.Model(tiny_config())
+        caches = _make_cache(model.language_model, [0])
+
+        self.assertEqual(len(caches), 2)
+        self.assertIsInstance(caches[1], BatchQSAKVCache)
 
     def test_sanitize_maps_packed_experts_and_ngram_shards(self):
         model = qwen4_exp.Model(tiny_config())
