@@ -1417,9 +1417,10 @@ The following models support video chat:
 
 1. Qwen2-VL
 2. Qwen2.5-VL
-3. Idefics3
-4. LLaVA
-5. MiniMax M3
+3. Qwen3.8-Flash-Next (Qwen4-Exp)
+4. Idefics3
+5. LLaVA
+6. MiniMax M3
 
 With more coming soon.
 
