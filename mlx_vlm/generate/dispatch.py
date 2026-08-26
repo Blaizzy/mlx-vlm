@@ -669,6 +669,77 @@ def _cache_fully_retained(c: Any) -> bool:
     return True  # KVCache / QuantizedKVCache retain the whole sequence
 
 
+def _cache_supports_trim(c: Any) -> bool:
+    """Whether ``c`` can be rolled back at all, i.e. whether ``trim()`` is usable.
+
+    Complements :func:`_cache_fully_retained`, which asks whether the prefix is
+    still *present*. A recurrent entry has no per-token history to roll back to:
+    ``ArraysCache`` -- used by the linear-attention (GatedDeltaNet) layers of
+    hybrid models such as Qwen3.5/Qwen3.6 MoE -- holds a fixed-size state, reports
+    ``is_trimmable() == False`` and defines no ``trim`` at all. It also exposes
+    none of the attributes ``_cache_fully_retained`` keys off, so it falls through
+    that check as reusable and the caller then dies on ``c.trim(n_drop)`` with
+    ``AttributeError: 'ArraysCache' object has no attribute 'trim'``.
+
+    This mirrors ``mlx_lm.models.cache.can_trim_prompt_cache``.
+    """
+    children = getattr(c, "caches", None)
+    if children is not None:  # CacheList
+        return all(_cache_supports_trim(x) for x in children)
+    if not hasattr(c, "trim"):
+        return False
+    is_trimmable = getattr(c, "is_trimmable", None)
+    if callable(is_trimmable):
+        try:
+            return bool(is_trimmable())
+        except Exception:
+            return False
+    return True
+
+
+def _cache_logical_len(c: Any) -> Optional[int]:
+    """How many tokens ``c`` logically holds, or ``None`` when that is unknowable.
+
+    ``_prefix_cache_trim_amount`` used to read this off a top-level ``offset``.
+    Two shapes have no such attribute and silently collapsed to ``0``:
+
+    * ``CacheList``, which keeps its length in its children -- used per layer by
+      hybrid models (inkling / zaya1_vl / falcon_h1).
+    * ``ArraysCache``, whose fixed-size recurrent state has no token axis at all
+      -- the whole cache for mamba / mamba2 / rwkv7, and the linear-attention
+      layers of Qwen3.5 / Qwen3.6 MoE.
+
+    A ``0`` there makes ``n_drop == 0``, which reports the cache as fully
+    reusable and skips both rollback guards below. For a recurrent cache that is
+    not a conservative answer but a wrong one: the prompt is sliced down to the
+    shared prefix while the state still represents the old full sequence.
+
+    ``offset`` is still preferred wherever it exists, so flat and rotating caches
+    keep their exact current semantics (note ``RotatingKVCache.size()`` clamps to
+    ``max_size`` and is deliberately *not* used here). Otherwise recurse into
+    ``caches``, and fall back to ``0`` only for a provably empty cache. A
+    non-empty cache with no way to state its length returns ``None`` -- fail
+    closed, because the alternative is reusing stale state.
+    """
+    offset = getattr(c, "offset", None)
+    if offset is not None:
+        return int(offset or 0)
+    children = getattr(c, "caches", None)
+    if children is not None:  # CacheList: length lives in the children
+        lens = [_cache_logical_len(x) for x in children]
+        if any(n is None for n in lens):
+            return None
+        return max(lens, default=0)
+    empty = getattr(c, "empty", None)
+    if callable(empty):
+        try:
+            if empty():
+                return 0  # nothing cached yet, so nothing to roll back
+        except Exception:
+            return None
+    return None
+
+
 def _prefix_cache_trim_amount(kv_cache: List[Any], prefix_len: int) -> Optional[int]:
     """Trailing tokens to drop so ``kv_cache`` keeps only its first ``prefix_len``.
 
@@ -678,11 +749,18 @@ def _prefix_cache_trim_amount(kv_cache: List[Any], prefix_len: int) -> Optional[
     taking an arbitrary rotation of the window and leaving the ring index stale:
     silent output corruption, or a broadcast crash once speculative decoding wraps
     the cache in ``BufferedRotatingKVCache``. Returns the number of tokens to drop
-    (``0`` when the whole cache is reusable), or ``None`` when an entry has already
-    evicted part of the prefix and the caller must cold-prefill instead.
+    (``0`` when the whole cache is reusable), or ``None`` when the caller must
+    cold-prefill instead -- because an entry's cached length cannot be
+    established, because it does not support ``trim()`` at all, or because it has
+    already evicted part of the prefix.
     """
-    cached_len = max((int(getattr(c, "offset", 0) or 0) for c in kv_cache), default=0)
+    lens = [_cache_logical_len(c) for c in kv_cache]
+    if any(n is None for n in lens):
+        return None
+    cached_len = max(lens, default=0)
     n_drop = max(0, cached_len - prefix_len)
+    if n_drop and not all(_cache_supports_trim(c) for c in kv_cache):
+        return None
     if n_drop and not all(_cache_fully_retained(c) for c in kv_cache):
         return None
     return n_drop

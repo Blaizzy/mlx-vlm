@@ -28,6 +28,7 @@ from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
 from mlx_vlm.models.cache import (
+    ArraysCache,
     BatchKVCache,
     BatchPoolingCache,
     BatchRotatingKVCache,
@@ -2720,6 +2721,96 @@ class TestPrefixCacheReuseTrim:
         assert c.offset == 40
         c.update_and_fetch(mx.zeros((1, 1, 1, 4)), mx.zeros((1, 1, 1, 4)))
         assert c.offset == 41
+
+    @staticmethod
+    def _recurrent(n_states=1):
+        # A production-shaped ArraysCache: state written, no synthetic .offset.
+        c = ArraysCache(n_states)
+        for i in range(n_states):
+            c[i] = mx.zeros((1, 4))
+        return c
+
+    def test_mixed_flat_and_recurrent_is_not_reusable(self):
+        # A hybrid model interleaves both: 3 linear-attention layers per full
+        # attention layer for Qwen3.5/3.6. One non-trimmable entry must decline
+        # reuse for the whole cache, otherwise the flat layers get rolled back
+        # while the recurrent ones do not and the two desync.
+        flat = self._fill(KVCache(), 100)
+        assert (
+            dispatch_module._prefix_cache_trim_amount([flat, self._recurrent()], 60)
+            is None
+        )
+
+    def test_mixed_flat_and_untouched_recurrent_is_not_reusable(self):
+        # Same shape, but the recurrent entry is still empty, so its length *is*
+        # known (0) and the sibling KVCache sets cached_len. This is the case that
+        # reaches _cache_supports_trim rather than the unknown-length guard:
+        # ArraysCache defines no trim() at all.
+        flat = self._fill(KVCache(), 100)
+        empty_recurrent = ArraysCache(1)
+        assert not hasattr(empty_recurrent, "trim")
+        assert (
+            dispatch_module._prefix_cache_trim_amount([flat, empty_recurrent], 60)
+            is None
+        )
+
+    def test_pure_recurrent_stack_is_not_reusable(self):
+        # mamba/mamba2/rwkv7 have no full-attention layer at all, so no sibling
+        # contributes an offset and cached_len used to collapse to 0 -- reporting
+        # the cache fully reusable and skipping every rollback guard. The failure
+        # there was never the AttributeError, it was silent stale-state reuse.
+        cache = [self._recurrent() for _ in range(4)]
+        assert dispatch_module._prefix_cache_trim_amount(cache, 60) is None
+
+    def test_per_layer_cachelist_hybrid_is_not_reusable(self):
+        # inkling/zaya1_vl/falcon_h1 wrap attention + recurrent state in one
+        # CacheList per layer. CacheList has no top-level offset either, so this
+        # shape hit the same collapse-to-0 path.
+        cache = [
+            CacheList(self._fill(KVCache(), 20), self._recurrent()) for _ in range(4)
+        ]
+        assert dispatch_module._prefix_cache_trim_amount(cache, 8) is None
+
+    def test_nested_non_trimmable_cache_is_not_reusable(self):
+        # Hybrid recurrent models can wrap an attention cache and recurrent state
+        # in a CacheList. CacheList has no top-level offset, so the cached length
+        # must be obtained from its children before deciding whether trimming is
+        # required.
+        c = CacheList(self._fill(KVCache(), 20), ArraysCache(2))
+        assert c.size() == 20
+        assert dispatch_module._prefix_cache_trim_amount([c], 8) is None
+
+    def test_nonempty_recurrent_cache_without_length_is_not_reusable(self):
+        # ArraysCache state does not expose a logical token length or offset.
+        # Assigning a synthetic offset in a test hides that production behavior;
+        # without a trustworthy length, divergent-prefix reuse must be declined.
+        c = ArraysCache(1)
+        c[0] = mx.zeros((1, 4))
+        assert not c.empty()
+        assert c.size() == 0
+        assert dispatch_module._prefix_cache_trim_amount([c], 8) is None
+
+    def test_nested_trimmable_cache_uses_child_length(self):
+        # A composite made entirely from trimmable caches should still reuse the
+        # shared prefix; this guards against conservatively rejecting every
+        # CacheList while fixing the recurrent-cache case above.
+        c = CacheList(self._fill(KVCache(), 20), self._fill(KVCache(), 20))
+        assert c.size() == 20
+        assert dispatch_module._prefix_cache_trim_amount([c], 8) == 12
+
+    def test_nested_trimmable_cache_with_exact_prefix_stays_warm(self):
+        # n_drop == 0 needs no rollback, so an all-trimmable CacheList keeps the
+        # append-only follow-up turn on the warm path.
+        c = CacheList(self._fill(KVCache(), 20), self._fill(KVCache(), 20))
+        assert dispatch_module._prefix_cache_trim_amount([c], 20) == 0
+
+    def test_rotating_cache_length_still_read_from_offset(self):
+        # RotatingKVCache.size() clamps to max_size, so cached_len must keep
+        # coming from offset -- otherwise a wrapped window would under-report its
+        # length and n_drop would silently shrink.
+        c = self._fill(RotatingKVCache(max_size=32), 100)
+        assert c.size() == 32
+        assert dispatch_module._cache_logical_len(c) == 100
 
 
 class TestGemma4LogitsToKeep:
