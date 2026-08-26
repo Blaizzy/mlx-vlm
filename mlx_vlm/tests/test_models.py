@@ -2706,6 +2706,623 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
         mx.eval([c.state for c in cache])
 
+    def test_glm5_next_language_model(self):
+        from mlx_vlm.models import glm5_next
+
+        text = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=6,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=3,
+            layer_types=["linear_attention", "deepseek_sparse_attention"],
+            mlp_layer_types=["dense", "sparse"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        vision = glm5_next.VisionConfig(
+            model_type="glm_ocr_vision",
+            depth=2,
+            hidden_size=64,
+            intermediate_size=64,
+            num_heads=2,
+            patch_size=14,
+            out_hidden_size=128,
+            projection_intermediate_size=128,
+            image_size=28,
+            spatial_merge_size=1,
+            temporal_patch_size=2,
+        )
+        config = glm5_next.ModelConfig(
+            text_config=text,
+            vision_config=vision,
+            model_type="glm5_next",
+            image_token_id=7,
+            video_token_id=8,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+
+        model = glm5_next.Model(config)
+
+        # hybrid per-layer schedule: layer 0 linear-attn, layer 1 sparse (DSA)
+        is_linear = [layer.is_linear for layer in model.language_model.model.layers]
+        self.assertEqual(is_linear, [True, False])
+
+        cache = model.make_cache()
+        self.assertEqual(len(cache), config.text_config.num_hidden_layers)
+
+        # sanitize: HF flat hyper-connection / forget-gate names + separate q/k/v
+        # convs -> our module names + a single fused, transposed depthwise conv.
+        san = model.sanitize(
+            {
+                "model.language_model.layers.0.hc_attn_base": mx.zeros((4, 4)),
+                "model.language_model.layers.0.self_attn.A_log": mx.zeros((2,)),
+                "model.language_model.layers.0.self_attn.q_conv1d.weight": mx.zeros(
+                    (128, 1, 2)
+                ),
+                "model.language_model.layers.0.self_attn.k_conv1d.weight": mx.zeros(
+                    (128, 1, 2)
+                ),
+                "model.language_model.layers.0.self_attn.v_conv1d.weight": mx.zeros(
+                    (128, 1, 2)
+                ),
+            }
+        )
+        self.assertIn("language_model.model.layers.0.attn_hc.base", san)
+        self.assertIn("language_model.model.layers.0.self_attn.forget_gate.A_log", san)
+        self.assertIn("language_model.model.layers.0.self_attn.conv1d.weight", san)
+        self.assertEqual(
+            san["language_model.model.layers.0.self_attn.conv1d.weight"].shape,
+            (384, 2, 1),
+        )
+
+        prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+        logits = model(prompt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 8, config.text_config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+        # incremental decode step (exercises the cached indexer + KDA/MLA caches)
+        nxt = mx.argmax(logits[:, -1:, :], axis=-1)
+        logits = model(nxt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 1, config.text_config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+    def test_glm5_next_kda_matches_recurrent(self):
+        # The shared gated-delta path must match glm5_next's reference recurrence
+        # (the KDA safe forget gate == gated_delta.compute_g_safe, term for term).
+        from mlx_vlm.models.gated_delta import gated_delta_update
+        from mlx_vlm.models.glm5_next.language import _l2norm, recurrent_kimi_delta
+
+        mx.random.seed(0)
+        B, S, H, D, lb = 2, 17, 4, 32, -5.0
+        q = mx.random.normal((B, S, H, D))
+        k = mx.random.normal((B, S, H, D))
+        v = mx.random.normal((B, S, H, D))
+        a = mx.random.normal((B, S, H, D)) * 0.5
+        b = mx.random.normal((B, S, H))
+        A_log = mx.random.normal((H,)) * 0.3
+        dt_bias = mx.random.normal((H, D)) * 0.1
+
+        A = mx.exp(A_log).reshape(1, 1, H, 1)
+        g = lb * mx.sigmoid(A * (a + dt_bias))
+        oracle, _ = recurrent_kimi_delta(q, k, v, g, mx.sigmoid(b), None)
+
+        qn = _l2norm(q.astype(mx.float32)) * (D**-0.5)
+        kn = _l2norm(k.astype(mx.float32))
+        out, _ = gated_delta_update(
+            qn,
+            kn,
+            v,
+            a,
+            b,
+            A_log.reshape(H, 1),
+            dt_bias,
+            state=None,
+            use_kernel=False,
+            lower_bound=lb,
+        )
+        self.assertLess(float(mx.max(mx.abs(oracle - out))), 1e-4)
+
+    def test_glm5_next_batched_matches_individual(self):
+        # Batched inference must match per-sequence runs. Every glm5_next path
+        # (KDA, DSA, indexer, MLA, hyper-connections) is exactly batch-invariant;
+        # only the shared SwitchGLU grouped-expert dispatch adds small reduction-
+        # order jitter across batch composition, hence the loose tolerance.
+        from mlx_vlm.models import glm5_next
+
+        text = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=6,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=3,
+            layer_types=["linear_attention", "deepseek_sparse_attention"],
+            mlp_layer_types=["dense", "sparse"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        vision = glm5_next.VisionConfig(
+            model_type="glm_ocr_vision",
+            depth=2,
+            hidden_size=64,
+            intermediate_size=64,
+            num_heads=2,
+            patch_size=14,
+            out_hidden_size=128,
+            projection_intermediate_size=128,
+            image_size=28,
+            spatial_merge_size=1,
+            temporal_patch_size=2,
+        )
+        config = glm5_next.ModelConfig(
+            text_config=text,
+            vision_config=vision,
+            model_type="glm5_next",
+            image_token_id=7,
+            video_token_id=8,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        lm = glm5_next.Model(config).language_model
+        prompts = [
+            [3, 5, 7, 9, 11, 13, 15, 17],
+            [2, 4, 6, 8, 10, 12, 14, 16],
+            [1, 1, 2, 3, 5, 8, 13, 21],
+        ]
+        batched = lm(mx.array(prompts), cache=lm.make_cache()).logits
+        for i, p in enumerate(prompts):
+            indiv = lm(mx.array([p]), cache=lm.make_cache()).logits
+            d = float(
+                mx.max(
+                    mx.abs(
+                        batched[i : i + 1].astype(mx.float32) - indiv.astype(mx.float32)
+                    )
+                )
+            )
+            self.assertLess(d, 5e-2)
+
+    def test_glm5_next_fused_kda_matches_unfused(self):
+        # Fusing the six KDA input-projections (q, k, v, f_a, g_a, b -- all take the
+        # same input) into one matmul is a lossless output-axis concat of the
+        # quantized weights, so the fused path must be bit-exact vs the separate one.
+        import mlx.nn as nn
+
+        from mlx_vlm.models import glm5_next
+        from mlx_vlm.models.cache import ArraysCache
+        from mlx_vlm.models.glm5_next.language import Glm5NextLinearAttention
+
+        mx.random.seed(0)
+        cfg = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=6,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=3,
+            layer_types=["linear_attention"],
+            mlp_layer_types=["dense"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        kda = Glm5NextLinearAttention(cfg)
+        nn.quantize(kda, class_predicate=lambda p, m: hasattr(m, "to_quantized"))
+        kda.eval()
+        for S in (1, 6):
+            x = mx.random.normal((1, S, cfg.hidden_size))
+            kda.fuse_in = False
+            c1 = ArraysCache(size=2)
+            c1[0] = None
+            c1[1] = None
+            ref = kda(x, None, c1)
+            kda.fuse_in = True
+            c2 = ArraysCache(size=2)
+            c2[0] = None
+            c2[1] = None
+            fused = kda(x, None, c2)
+            self.assertEqual(float(mx.max(mx.abs(ref - fused))), 0.0)
+
+    def test_glm5_next_indexer_bypass_matches_dense(self):
+        # When the whole cache fits within index_topk the indexer selects every token,
+        # so bypassing it (dense MLA) must match the full sparse path to fp tolerance.
+        from mlx_vlm.models import glm5_next
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.models.glm5_next.language import Glm5NextSparseAttention
+
+        mx.random.seed(0)
+        cfg = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=16,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=3,
+            layer_types=["deepseek_sparse_attention"],
+            mlp_layer_types=["dense"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        dsa = Glm5NextSparseAttention(cfg)
+        dsa.eval()
+        S = 8  # <= index_topk (16) -> the indexer would select all, so bypass == dense
+        x = mx.random.normal((1, S, cfg.hidden_size))
+        qpos = mx.arange(S)[:, None]
+        kpos = mx.arange(S)[None, :]
+        outs = {}
+        for bp in (True, False):
+            dsa.indexer.bypass_short = bp
+            c = CacheList(KVCache(), KVCache())
+            outs[bp] = dsa(x, kpos <= qpos, c)
+        self.assertLess(float(mx.max(mx.abs(outs[True] - outs[False]))), 1e-3)
+
+    def test_glm5_next_num_logits_to_keep(self):
+        # num_logits_to_keep=k returns exactly the last k positions' logits (so prefill
+        # can skip the vocab projection on discarded positions).
+        from mlx_vlm.models import glm5_next
+        from mlx_vlm.models.glm5_next.language import LanguageModel
+
+        mx.random.seed(0)
+        cfg = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=6,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=3,
+            layer_types=["linear_attention", "deepseek_sparse_attention"],
+            mlp_layer_types=["dense", "sparse"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        lm = LanguageModel(cfg)
+        p = mx.array([[3, 5, 7, 9, 11, 13, 15, 17]])
+        full = lm(p, cache=lm.make_cache()).logits
+        last = lm(p, cache=lm.make_cache(), num_logits_to_keep=1).logits
+        self.assertEqual(last.shape[1], 1)
+        self.assertLess(float(mx.max(mx.abs(last[:, -1] - full[:, -1]))), 1e-4)
+
+    def test_glm5_next_ffn_compile_matches_eager(self):
+        # Compiling the stateless FFN block (mx.compile) must match the eager path.
+        from mlx_vlm.models import glm5_next
+        from mlx_vlm.models.glm5_next.language import LanguageModel
+
+        mx.random.seed(0)
+        cfg = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=6,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=3,
+            layer_types=["linear_attention", "deepseek_sparse_attention"],
+            mlp_layer_types=["dense", "sparse"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        lm = LanguageModel(cfg)
+        p = mx.array([[3, 5, 7, 9, 11, 13, 15, 17]])
+        outs = {}
+        for on in (False, True):
+            for L in lm.model.layers:
+                L.compile_ffn = on
+                L._ffn_c = None
+            c = lm.make_cache()
+            lm(p, cache=c)  # prefill (S>1: eager either way)
+            # decode step is single-stream (B=1, S=1) -> the compiled FFN path is active
+            outs[on] = lm(mx.array([[19]]), cache=c).logits
+        self.assertLess(float(mx.max(mx.abs(outs[True] - outs[False]))), 1e-3)
+
+    def test_glm5_next_indexer_stale_pool_guard(self):
+        # Under continuous batching, BatchGenerator grows/shrinks the batch axis
+        # (extend/filter) but does not carry the indexer's cached _pool along, leaving
+        # a _pool whose batch axis no longer matches the live batch. The batch-axis
+        # guard must discard such a stale _pool and recompute, rather than crash on a
+        # concatenate shape mismatch. Here we prime the indexer past index_topk (so it
+        # actually pools), then plant a stale _pool with a mismatched batch axis (as a
+        # filter/extend would) and take a decode step: it must not crash and must equal
+        # the clean incremental result.
+        from mlx_vlm.models import glm5_next
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.models.glm5_next.language import Glm5NextSparseAttention
+
+        mx.random.seed(0)
+        cfg = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=4,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=2,
+            layer_types=["deepseek_sparse_attention"],
+            mlp_layer_types=["dense"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        dsa = Glm5NextSparseAttention(cfg)
+        dsa.eval()
+        S0 = 12  # > index_topk (4) so the indexer actually pools (no short-ctx bypass)
+        x0 = mx.random.normal((1, S0, cfg.hidden_size))
+        qpos = mx.arange(S0)[:, None]
+        kpos = mx.arange(S0)[None, :]
+        xs = mx.random.normal((1, 1, cfg.hidden_size))
+
+        c1 = CacheList(KVCache(), KVCache())
+        dsa(x0, kpos <= qpos, c1)
+        ref = dsa(xs, None, c1)  # clean incremental decode step
+
+        c2 = CacheList(KVCache(), KVCache())
+        dsa(x0, kpos <= qpos, c2)
+        pk, pi, pv, t = c2[
+            1
+        ]._pool  # plant a stale, batch-mismatched _pool (as filter/extend would)
+        c2[1]._pool = (
+            mx.concatenate([pk, pk], axis=0),
+            mx.concatenate([pi, pi], axis=0),
+            mx.concatenate([pv, pv], axis=0),
+            t,
+        )
+        out = dsa(xs, None, c2)  # must not crash; guard -> full recompute
+        self.assertLess(float(mx.max(mx.abs(out - ref))), 1e-3)
+
+    def test_glm5_next_indexer_batched_mask(self):
+        # Single-stream decode passes mask=None; under continuous batching the batched
+        # cache supplies a 4-D left-pad mask at decode. The DSA decode branch must accept
+        # it (rank-agnostic gather); an all-True 4-D mask must equal the mask=None result.
+        from mlx_vlm.models import glm5_next
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.models.glm5_next.language import Glm5NextSparseAttention
+
+        mx.random.seed(0)
+        cfg = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=4,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=2,
+            layer_types=["deepseek_sparse_attention"],
+            mlp_layer_types=["dense"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        dsa = Glm5NextSparseAttention(cfg)
+        dsa.eval()
+        S0 = 12  # > index_topk -> indexer active at decode
+        x0 = mx.random.normal((1, S0, cfg.hidden_size))
+        qpos = mx.arange(S0)[:, None]
+        kpos = mx.arange(S0)[None, :]
+        xs = mx.random.normal((1, 1, cfg.hidden_size))
+
+        c1 = CacheList(KVCache(), KVCache())
+        dsa(x0, kpos <= qpos, c1)
+        ref = dsa(xs, None, c1)  # single-stream: mask=None
+
+        c2 = CacheList(KVCache(), KVCache())
+        dsa(x0, kpos <= qpos, c2)
+        mask4d = mx.ones(
+            (1, 1, 1, S0 + 1), dtype=mx.bool_
+        )  # batched-style all-True left-pad mask
+        out = dsa(xs, mask4d, c2)  # must accept the 4-D mask and equal the None case
+        self.assertLess(float(mx.max(mx.abs(out - ref))), 1e-3)
+
     def test_nemotron_h_language_model(self):
         from mlx_vlm.models import nemotron_h
 
