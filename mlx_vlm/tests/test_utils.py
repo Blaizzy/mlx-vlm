@@ -334,6 +334,27 @@ def test_quantize_module():
         "mode": "affine",
     }
 
+    # A model-owned group override must be evaluated before the default-group
+    # divisibility gate. Qwen4-Exp's PLE rows are 160-wide: divisible by 32,
+    # but not by the converter's default 64.
+    module = DummyModule((10, 160))
+    config = {}
+
+    def group32_predicate(_path: str, _module: nn.Module):
+        return {"group_size": 32, "bits": 4, "mode": "affine"}
+
+    _, updated_config = quantize_model(
+        module,
+        config,
+        group_size=64,
+        bits=4,
+        mode="affine",
+        quant_predicate=group32_predicate,
+    )
+    assert module.language_model.group_size == 32
+    assert module.vision_model.group_size == 32
+    assert updated_config["quantization"]["language_model"]["group_size"] == 32
+
     # Test mxfp4 quantization
     module = DummyModule((10, 64))
     config = {}

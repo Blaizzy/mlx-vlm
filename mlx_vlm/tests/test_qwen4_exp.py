@@ -265,6 +265,46 @@ class Qwen4ExpTests(unittest.TestCase):
         self.assertEqual(sanitized[f"{mapped}.ple.conv1d.weight"].shape, (64, 3, 1))
         self.assertFalse(any(key.startswith("mtp.") for key in sanitized))
 
+    def test_quantization_uses_group32_for_ple_shards(self):
+        model = qwen4_exp.Model(tiny_config())
+        predicate = model.quant_predicate
+        path = (
+            "language_model.model.layers.0.ple.ple_embedding."
+            "ngram_embedding.shards.0"
+        )
+        self.assertEqual(
+            predicate(path, None),
+            {"group_size": 32, "bits": 4, "mode": "affine"},
+        )
+
+    def test_sanitize_restores_official_fp8_experts_and_ple(self):
+        model = qwen4_exp.Model(tiny_config())
+        weights = {}
+        prefix = "model.language_model.layers.0.mlp"
+        for expert in range(2):
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                key = f"{prefix}.experts.{expert}.{projection}.weight"
+                weights[key] = mx.to_fp8(mx.ones((128, 128)) * (expert + 1))
+                weights[f"{key}_scale_inv"] = mx.ones((1, 1))
+        ple = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
+        weights[f"{ple}.shard_0.weight"] = mx.to_fp8(mx.ones((4, 8)))
+        weights[f"{ple}.weight_scale"] = mx.array([0.5], dtype=mx.bfloat16)
+
+        sanitized = model.sanitize(weights)
+        mapped = "language_model.model.layers.0"
+        gate = sanitized[f"{mapped}.mlp.switch_mlp.gate_proj.weight"]
+        up = sanitized[f"{mapped}.mlp.switch_mlp.up_proj.weight"]
+        down = sanitized[f"{mapped}.mlp.switch_mlp.down_proj.weight"]
+        ple_weight = sanitized[
+            f"{mapped}.ple.ple_embedding.ngram_embedding.shards.0.weight"
+        ]
+        mx.eval(gate, up, down, ple_weight)
+        self.assertEqual(gate.shape, (2, 128, 128))
+        self.assertEqual(up.shape, (2, 128, 128))
+        self.assertEqual(down.shape, (2, 128, 128))
+        self.assertTrue(mx.allclose(ple_weight, mx.ones((4, 8)) * 0.5).item())
+        self.assertFalse(any("scale" in key for key in sanitized))
+
 
 if __name__ == "__main__":
     unittest.main()
