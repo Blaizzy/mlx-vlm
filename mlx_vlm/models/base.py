@@ -202,13 +202,24 @@ def kv_sequence_length(keys) -> int:
     a ``(packed, scales, biases)`` tuple and TurboQuant caches return
     codec-state named tuples.
     """
-    if isinstance(keys, mx.array):
+    if hasattr(keys, "shape"):
         return keys.shape[-2]
     # Plain tuple/list only: TurboQuant states are NamedTuples with a
     # different layout and get measured by their own helper.
     if type(keys) in (tuple, list):
         return keys[0].shape[-2]
     return _turboquant_state_length(keys)
+
+
+def kv_sequence_slice(keys, end: int):
+    """Slice a cache-returned key/value state along its sequence axis."""
+    if isinstance(keys, mx.array):
+        return keys[..., :end, :]
+    if type(keys) in (tuple, list):
+        return tree_map(lambda x: x[..., :end, :], keys)
+    if hasattr(keys, "slice_tokens"):
+        return keys.slice_tokens(end)
+    raise TypeError(f"Unsupported KV state type: {type(keys)!r}")
 
 
 def create_attention_mask(

@@ -4970,6 +4970,10 @@ class _QuantizedStateProxy:
     def __iter__(self):
         return iter(self._state)
 
+    def slice_tokens(self, end: int):
+        end = max(0, min(int(end), self.shape[-2]))
+        return _QuantizedStateProxy(_slice_state(self._state, end), end, self.shape[1])
+
 
 class TurboQuantKVCache(_BaseCache):
     decode_key_chunk_size = 1 << 30
