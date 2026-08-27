@@ -3516,6 +3516,132 @@ class TestModels(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 1, config.vocab_size))
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
 
+    def test_longcat_flash_sparse_language_model(self):
+        from mlx.utils import tree_flatten
+
+        from mlx_vlm.models import longcat_flash_sparse as longcat_flash
+
+        def cfg(method, **kw):
+            return longcat_flash.ModelConfig(
+                model_type="longcat_flash_sparse",
+                attention_method=method,
+                hidden_size=64,
+                ffn_hidden_size=128,
+                expert_ffn_hidden_size=48,
+                moe_topk=4,
+                n_routed_experts=6,
+                zero_expert_num=2,
+                num_layers=2,
+                vocab_size=512,
+                max_position_embeddings=1024,
+                num_attention_heads=4,
+                kv_lora_rank=32,
+                q_lora_rank=48,
+                qk_rope_head_dim=16,
+                qk_nope_head_dim=16,
+                v_head_dim=16,
+                routed_scaling_factor=2.0,
+                rms_norm_eps=1e-5,
+                norm_topk_prob=True,
+                rope_scaling=None,
+                **kw,
+            )
+
+        lsa_config = cfg(
+            "LSA",
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=8,
+            index_init_tokens=2,
+            index_local_tokens=4,
+            cli_factor=2,
+        )
+        model = longcat_flash.Model(lsa_config)
+
+        self.language_test_runner(
+            model.language_model,
+            lsa_config.model_type,
+            lsa_config.vocab_size,
+            lsa_config.num_layers,
+        )
+
+        # LSA layer keeps 3 cache slots: latent(0), indexer(0), latent(1)
+        cache = model.make_cache()
+        self.assertEqual(len(cache), lsa_config.num_layers)
+        self.assertEqual(len(cache[0].caches), 3)
+
+        prompt = mx.arange(24).reshape(1, 24)
+        logits = model(prompt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 24, lsa_config.vocab_size))
+        nxt = mx.argmax(logits[:, -1:, :], axis=-1)
+        logits = model(nxt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 1, lsa_config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+        # dense variant keeps 2 cache slots (the two attention sub-blocks)
+        dense = longcat_flash.Model(cfg("MLA"))
+        self.assertEqual(len(dense.make_cache()[0].caches), 2)
+
+        # sanitize: stack experts, split dual-block kv_b_proj, drop MTP
+        h, kv = lsa_config.hidden_size, lsa_config.kv_lora_rank
+        hd = lsa_config.qk_nope_head_dim + lsa_config.v_head_dim
+        nh, ef = lsa_config.num_attention_heads, lsa_config.expert_ffn_hidden_size
+        raw = {"model.mtp.embed_tokens.weight": mx.zeros((4, h))}
+        for e in range(lsa_config.n_routed_experts):
+            raw[f"model.layers.0.mlp.experts.{e}.gate_proj.weight"] = mx.zeros((ef, h))
+            raw[f"model.layers.0.mlp.experts.{e}.up_proj.weight"] = mx.zeros((ef, h))
+            raw[f"model.layers.0.mlp.experts.{e}.down_proj.weight"] = mx.zeros((h, ef))
+        for i in range(2):
+            raw[f"model.layers.0.self_attn.{i}.kv_b_proj.weight"] = mx.zeros(
+                (nh * hd, kv)
+            )
+        clean = dense.language_model.sanitize(dict(raw))
+        keys = dict(tree_flatten(clean)) if isinstance(clean, list) else clean
+        self.assertIn("model.layers.0.mlp.switch_mlp.gate_proj.weight", keys)
+        self.assertEqual(
+            keys["model.layers.0.mlp.switch_mlp.gate_proj.weight"].shape,
+            (lsa_config.n_routed_experts, ef, h),
+        )
+        for i in range(2):
+            self.assertIn(f"model.layers.0.self_attn.{i}.embed_q.weight", keys)
+            self.assertIn(f"model.layers.0.self_attn.{i}.unembed_out.weight", keys)
+            self.assertNotIn(f"model.layers.0.self_attn.{i}.kv_b_proj.weight", keys)
+        self.assertFalse(any(k.startswith("model.mtp") for k in keys))
+
+        # degenerate limit: an LSA model whose indexer never fires (index_topk >= L)
+        # must reproduce the dense backbone bit-for-bit when weights are shared.
+        ref = longcat_flash.Model(cfg("MLA"))
+        mx.eval(ref.parameters())
+        deg = longcat_flash.Model(
+            cfg("LSA", index_n_heads=4, index_head_dim=32, index_topk=10_000)
+        )
+        deg.load_weights(list(tree_flatten(ref.parameters())), strict=False)
+        mx.eval(deg.parameters())
+        ldense = ref(prompt).logits
+        ldeg = deg(prompt).logits
+        self.assertLess(float(mx.max(mx.abs(ldense - ldeg))), 1e-4)
+
+        # n-gram input embedding (Lite-Sparse): cache gains a leading context slot
+        # and chunked prefill must match single-shot (context cache threads state).
+        ng = longcat_flash.Model(
+            cfg(
+                "LSA",
+                index_n_heads=4,
+                index_head_dim=32,
+                index_topk=10_000,
+                oe_vocab_size_ratio=2,
+                oe_neighbor_num=3,
+                oe_split_num=2,
+            )
+        )
+        mx.eval(ng.parameters())
+        self.assertEqual(len(ng.make_cache()), lsa_config.num_layers + 1)
+        single = ng(prompt, cache=ng.make_cache()).logits[:, -1, :]
+        cc = ng.make_cache()
+        ng(prompt[:, :16], cache=cc)
+        chunked = ng(prompt[:, 16:], cache=cc).logits[:, -1, :]
+        self.assertLess(float(mx.max(mx.abs(single - chunked))), 5e-3)
+
     def test_qwen2_language_model(self):
         from mlx_vlm.models import qwen2
 
