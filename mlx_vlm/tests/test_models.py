@@ -1,5 +1,6 @@
 import importlib
 import inspect
+import io
 import threading
 import unittest
 from types import SimpleNamespace
@@ -7767,6 +7768,66 @@ class TestRTDetrV2(unittest.TestCase):
             "vision.backbone.encoder.stages.1.layers.0.shortcut.proj.conv.weight",
             sanitized,
         )
+
+
+class TestKeyOnlyKVCacheGraph(unittest.TestCase):
+    """Key-only KV caches (zero-width values, e.g. DeepSeek-V4 local attention)
+    must not retain a values graph that grows one node per decode step."""
+
+    @staticmethod
+    def _edges(array):
+        graph = io.StringIO()
+        mx.export_to_dot(graph, array)
+        return graph.getvalue().count("->")
+
+    def test_zero_width_values_graph_stays_bounded(self):
+        from mlx_vlm.models.cache import (
+            BatchRotatingKVCache,
+            BufferedRotatingKVCache,
+            KVCache,
+            RotatingKVCache,
+        )
+
+        def run(cache, batch, steps):
+            for step in range(steps):
+                keys = mx.full((batch, 1, 1, 4), step % 7, dtype=mx.float32)
+                cached_keys, _ = cache.update_and_fetch(keys, keys[..., :0])
+                mx.eval(cached_keys)
+            self.assertEqual(cache.values.shape[-1], 0)
+            return self._edges(cache.values)
+
+        cases = (
+            ("KVCache", lambda: KVCache(), 1),
+            ("RotatingKVCache", lambda: RotatingKVCache(max_size=8), 1),
+            (
+                "BatchRotatingKVCache",
+                lambda: BatchRotatingKVCache(max_size=8, left_padding=[0, 1]),
+                2,
+            ),
+            (
+                "BufferedRotatingKVCache",
+                lambda: BufferedRotatingKVCache(max_size=8, buffer_size=64),
+                1,
+            ),
+        )
+        for name, make_cache, batch in cases:
+            with self.subTest(cache=name):
+                short = run(make_cache(), batch, 16)
+                long = run(make_cache(), batch, 256)
+                self.assertLessEqual(long, short + 2)
+
+    def test_normal_values_are_unaffected(self):
+        from mlx_vlm.models.cache import KVCache, RotatingKVCache
+
+        for make_cache in (lambda: KVCache(), lambda: RotatingKVCache(max_size=8)):
+            cache = make_cache()
+            for step in range(12):
+                k = mx.full((1, 1, 1, 4), step + 1, dtype=mx.float32)
+                v = mx.full((1, 1, 1, 4), step + 1, dtype=mx.float32)
+                _, cached_values = cache.update_and_fetch(k, v)
+                mx.eval(cached_values)
+            self.assertEqual(cache.values.shape[-1], 4)
+            self.assertGreater(float(cache.values.sum()), 0.0)
 
 
 if __name__ == "__main__":
