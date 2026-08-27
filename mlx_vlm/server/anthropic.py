@@ -116,13 +116,18 @@ def _normalize_anthropic_system_messages(body: Any) -> Any:
     normalized_messages = []
     system_parts = []
     saw_system_message = False
+    saw_conversation = False
     for message in messages:
         if isinstance(message, dict) and message.get("role") == "system":
             saw_system_message = True
-            text = _anthropic_system_text(message.get("content"))
-            if text:
-                system_parts.append(text)
-            continue
+            if not saw_conversation:
+                text = _anthropic_system_text(message.get("content"))
+                if text:
+                    system_parts.append(text)
+                continue
+            message = {**message, "role": "user"}
+        else:
+            saw_conversation = True
         normalized_messages.append(message)
 
     if not saw_system_message:
