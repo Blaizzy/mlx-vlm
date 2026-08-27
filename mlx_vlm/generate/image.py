@@ -166,6 +166,7 @@ def _model_type_from_id(model: str) -> str:
         "mageflow": "mage_flow",
         "z": "z_image",
         "zimage": "z_image",
+        "ernie": "ernie_image",
     }.get(model_type, model_type)
 
 
@@ -269,6 +270,13 @@ def _image_model_type_from_component_indexes(root: Path) -> str | None:
     }
     if z_image_markers <= keys:
         return "z_image"
+    ernie_image_markers = {
+        "adaln_modulation.weight",
+        "final_norm.linear.weight",
+        "layers.0.adaLN_sa_ln.weight",
+    }
+    if ernie_image_markers <= keys:
+        return "ernie_image"
     return None
 
 

@@ -16,6 +16,18 @@ DEFAULT_KV_GROUP_SIZE = 64
 DEFAULT_KV_QUANT_SCHEME = "uniform"
 DEFAULT_QUANTIZED_KV_START = 5000
 
+DEFAULT_MAX_TOKENS = 2048
+DEFAULT_TEMPERATURE = 0.0
+DEFAULT_TOP_P = 1.0
+DEFAULT_TOP_K = 0
+DEFAULT_MIN_P = 0.0
+DEFAULT_REPETITION_CONTEXT_SIZE = 20
+DEFAULT_PREFILL_STEP_SIZE = 2048
+DEFAULT_COMPLETION_BATCH_SIZE = 32
+DEFAULT_PREFILL_BATCH_SIZE = 8
+DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
+DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
+
 # A stream on the default device just for generation
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
@@ -90,6 +102,8 @@ def maybe_quantize_kv_cache(
         def hybridize(entry):
             if isinstance(entry, (HybridQuantKVCache, cache.RotatingKVCache)):
                 return entry
+            if getattr(entry, "preserve_auxiliary_kv_state", False):
+                return entry
             if isinstance(entry, cache.KVCache):
                 if entry.offset >= quantized_kv_start or entry.offset == 0:
                     built = HybridQuantKVCache(policy)
@@ -121,6 +135,8 @@ def maybe_quantize_kv_cache(
             if isinstance(entry, TurboQuantKVCache):
                 return entry
             if isinstance(entry, cache.RotatingKVCache):
+                return entry
+            if getattr(entry, "preserve_auxiliary_kv_state", False):
                 return entry
             if isinstance(entry, cache.KVCache):
                 if entry.offset == 0:

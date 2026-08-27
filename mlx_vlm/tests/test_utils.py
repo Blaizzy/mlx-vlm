@@ -17,6 +17,8 @@ from mlx_vlm.utils import (
     StoppingCriteria,
     _drop_modules_without_weights,
     _load_safetensors,
+    _quantization_for_module_path,
+    _quantization_path_aliases,
     _transform_modelopt_nvfp4_weights,
     apply_generation_config_defaults,
     estimate_num_image_tokens,
@@ -35,7 +37,8 @@ from mlx_vlm.utils import (
 )
 
 
-def test_transform_modelopt_nvfp4_weights():
+@pytest.mark.parametrize("quant_method", ["modelopt", "modelopt_mixed"])
+def test_transform_modelopt_nvfp4_weights(quant_method):
     packed = mx.arange(32, dtype=mx.uint8).reshape(2, 16)
     weights = {
         "layer.weight": packed,
@@ -47,7 +50,7 @@ def test_transform_modelopt_nvfp4_weights():
 
     transformed, quantization = _transform_modelopt_nvfp4_weights(
         weights,
-        {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+        {"quant_method": quant_method, "quant_algo": "NVFP4"},
     )
 
     assert transformed["layer.weight"].dtype == mx.uint32
@@ -57,6 +60,30 @@ def test_transform_modelopt_nvfp4_weights():
     assert "layer.weight_scale" not in transformed
     assert "layer.weight_scale_2" not in transformed
     assert "layer.input_scale" not in transformed
+    assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
+def test_transform_modelopt_mixed_nvfp4_fp8_weights():
+    weights = {
+        "experts.weight": mx.arange(32, dtype=mx.uint8).reshape(2, 16),
+        "experts.weight_scale": mx.array([[56, 64], [72, 80]], dtype=mx.uint8),
+        "experts.weight_scale_2": mx.array(0.5, dtype=mx.float32),
+        "experts.input_scale": mx.array(0.25, dtype=mx.float32),
+        "attention.weight": mx.array([[56, 64], [68, 72]], dtype=mx.uint8),
+        "attention.weight_scale": mx.array([0.5, 0.25], dtype=mx.bfloat16),
+        "attention.input_scale": mx.array(0.125, dtype=mx.float32),
+    }
+
+    transformed, quantization = _transform_modelopt_nvfp4_weights(
+        weights,
+        {"quant_method": "modelopt_mixed", "quant_algo": "MIXED_PRECISION"},
+    )
+
+    assert transformed["experts.weight"].dtype == mx.uint32
+    assert transformed["experts.scales"].dtype == mx.uint8
+    assert transformed["attention.weight"].dtype == mx.bfloat16
+    assert transformed["attention.weight"].tolist() == [[0.5, 1.0], [0.75, 1.0]]
+    assert not any("weight_scale" in key or "input_scale" in key for key in transformed)
     assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 
 
@@ -744,6 +771,113 @@ class TestDropModulesWithoutWeights:
         assert "vision_tower" in caplog.text
         assert model.loaded_strict is True
 
+    def test_keeps_module_declared_in_manifest_but_not_loaded(self):
+        # Manifest declares vision weights but none loaded -> keep, strict fails (#1963).
+        model = self.FakeModel()
+        weights = {"language_model.weight": mx.zeros((2, 2))}
+        declared = {
+            "language_model.weight",
+            "vision_tower.weight",
+            "vision_tower.bias",
+        }
+
+        _drop_modules_without_weights(model, weights, declared)
+
+        assert model.vision_tower is not None
+        with pytest.raises(ValueError, match="Missing"):
+            model.load_weights(list(weights.items()), strict=True)
+
+    def test_drops_module_absent_from_manifest(self, caplog):
+        # The manifest also omits vision -> an intentional text-only conversion.
+        model = self.FakeModel()
+        weights = {"language_model.weight": mx.zeros((2, 2))}
+        declared = {"language_model.weight"}
+
+        with caplog.at_level(logging.WARNING):
+            _drop_modules_without_weights(model, weights, declared)
+
+        assert model.vision_tower is None
+        assert "vision_tower" in caplog.text
+
+    def test_load_model_prunes_when_config_still_advertises_vision(self, caplog):
+        # Populated vision_config but no vision weights -> tower dropped (#1958).
+        class FakeConfig:
+            @classmethod
+            def from_dict(cls, config):
+                return cls()
+
+        class FakeModel(self.FakeModel):
+            def load_weights(self, weights, strict=True):
+                self.loaded_weights = weights
+                self.loaded_strict = strict
+
+        fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeModel)
+        weights = {"language_model.weight": mx.zeros((2, 2))}
+
+        with (
+            patch(
+                "mlx_vlm.utils.load_config",
+                return_value={
+                    "model_type": "fake",
+                    "vision_config": {"hidden_size": 8, "num_hidden_layers": 2},
+                },
+            ),
+            patch(
+                "mlx_vlm.utils.glob.glob",
+                return_value=["/tmp/model/model.safetensors"],
+            ),
+            patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+            patch(
+                "mlx_vlm.utils.get_model_and_args",
+                return_value=(fake_model_class, "fake"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            model = load_model(Path("/tmp/model"), lazy=True)
+
+        assert model.vision_tower is None
+        assert model.loaded_strict is True
+
+    def test_load_model_errors_when_manifest_shard_missing(self, tmp_path):
+        # Index declares vision weights but the shard is absent -> strict fails (#1963).
+        (tmp_path / "model.safetensors").write_bytes(b"")
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "language_model.weight": "model.safetensors",
+                        "vision_tower.weight": "model-vision.safetensors",
+                        "vision_tower.bias": "model-vision.safetensors",
+                    }
+                }
+            )
+        )
+
+        class FakeConfig:
+            @classmethod
+            def from_dict(cls, config):
+                return cls()
+
+        fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=self.FakeModel)
+        weights = {"language_model.weight": mx.zeros((2, 2))}
+
+        with (
+            patch(
+                "mlx_vlm.utils.load_config",
+                return_value={
+                    "model_type": "fake",
+                    "vision_config": {"hidden_size": 8, "num_hidden_layers": 2},
+                },
+            ),
+            patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+            patch(
+                "mlx_vlm.utils.get_model_and_args",
+                return_value=(fake_model_class, "fake"),
+            ),
+            pytest.raises(ValueError, match="Missing"),
+        ):
+            load_model(tmp_path, lazy=True)
+
 
 def test_load_safetensors_reinterprets_f8_e8m0_header(tmp_path):
     path = tmp_path / "model.safetensors"
@@ -826,6 +960,116 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
     assert quantize.call_args.kwargs["group_size"] == 64
     assert quantize.call_args.kwargs["bits"] == 8
     assert quantize.call_args.kwargs["mode"] == "affine"
+
+
+def test_quantization_path_aliases_require_a_model_hook_for_model_specific_names():
+    module_path = "language_model.model.layers.0.ffn.shared_experts.gate_proj"
+
+    aliases = _quantization_path_aliases(module_path)
+
+    assert "model.layers.0.ffn.shared_experts.gate_proj" in aliases
+    assert "layers.0.ffn.shared_experts.gate_proj" not in aliases
+    assert "layers.0.ffn.shared_experts.w1" not in aliases
+
+
+def test_deepseek_v4_module_path_spelling_wins_over_sanitized_alias():
+    from mlx_vlm.models import deepseek_v4
+
+    class AliasModel(nn.Module):
+        @staticmethod
+        def quantization_path_aliases(path):
+            return deepseek_v4.Model.quantization_path_aliases(path)
+
+    module_path = "language_model.model.layers.0.ffn.shared_experts.gate_proj"
+    module_path_spec = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    sanitized_alias_spec = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    quantization = {
+        "model.layers.0.ffn.shared_experts.gate_proj": module_path_spec,
+        "layers.0.ffn.shared_experts.w1": sanitized_alias_spec,
+    }
+
+    resolved = _quantization_for_module_path(
+        quantization,
+        module_path,
+        AliasModel(),
+    )
+
+    assert resolved == module_path_spec
+
+
+def test_load_model_matches_deepseek_v4_quantization_aliases():
+    from mlx_vlm.models import deepseek_v4
+
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeDeepseekV4Model(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.language_model = nn.Module()
+            self.language_model.model = nn.Module()
+            self.language_model.model.layers = [nn.Module()]
+            self.language_model.model.layers[0].ffn = nn.Module()
+            self.language_model.model.layers[0].ffn.shared_experts = nn.Module()
+            self.language_model.model.layers[0].ffn.shared_experts.gate_proj = (
+                nn.Linear(64, 64, bias=False)
+            )
+            self.language_model.lm_head = nn.Linear(64, 64, bias=False)
+
+        def load_weights(self, weights, strict=True):
+            self.loaded_weights = weights
+            self.loaded_strict = strict
+
+        @staticmethod
+        def quantization_path_aliases(path):
+            return deepseek_v4.Model.quantization_path_aliases(path)
+
+    fake_model_class = SimpleNamespace(
+        ModelConfig=FakeConfig, Model=FakeDeepseekV4Model
+    )
+    mxfp8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    quantization = {
+        "group_size": 32,
+        "bits": 4,
+        "mode": "mxfp4",
+        "layers.0.ffn.shared_experts.w1": mxfp8,
+        "head": False,
+    }
+
+    with (
+        patch(
+            "mlx_vlm.utils.load_config",
+            return_value={
+                "model_type": "deepseek_v4",
+                "quantization": quantization,
+            },
+        ),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value={}),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "deepseek_v4"),
+        ),
+        patch("mlx_vlm.utils.nn.quantize") as quantize,
+    ):
+        load_model(Path("/tmp/model"), lazy=True)
+
+    predicate = quantize.call_args.kwargs["class_predicate"]
+    fake_model = FakeDeepseekV4Model(FakeConfig())
+    shared_expert_spec = predicate(
+        "language_model.model.layers.0.ffn.shared_experts.gate_proj",
+        fake_model.language_model.model.layers[0].ffn.shared_experts.gate_proj,
+    )
+    head_spec = predicate(
+        "language_model.lm_head",
+        fake_model.language_model.lm_head,
+    )
+
+    assert shared_expert_spec == mxfp8
+    assert head_spec == {}
 
 
 def test_load_model_uses_qwen_fine_grained_fp8_quantization_config():
@@ -1142,3 +1386,55 @@ class TestEstimateNumImageTokens:
     def test_unsupported_processor_raises(self):
         with pytest.raises(NotImplementedError, match="num_image_tokens"):
             estimate_num_image_tokens(SimpleNamespace(), 480, 640)
+
+
+def test_modelopt_mixed_drops_fp8_kv_cache_scales():
+    """ModelOpt emits per-layer KV-cache scales that MLX has no parameter for.
+
+    A real ``kv_cache_quant_algo: FP8`` export ships ``k_scale``/``v_scale`` on
+    every full-attention layer. MLX quantizes its KV cache at runtime, so these
+    must be dropped or ``load_weights(strict=True)`` rejects the checkpoint.
+    """
+    weights = {
+        "layer.weight": mx.arange(32, dtype=mx.uint8).reshape(2, 16),
+        "layer.weight_scale": mx.array([[56, 64], [72, 80]], dtype=mx.uint8),
+        "layer.weight_scale_2": mx.array(0.5, dtype=mx.float32),
+        "self_attn.k_proj.k_scale": mx.array(0.125, dtype=mx.float32),
+        "self_attn.v_proj.v_scale": mx.array(0.25, dtype=mx.float32),
+    }
+
+    transformed, quantization = _transform_modelopt_nvfp4_weights(
+        weights,
+        {"quant_method": "modelopt_mixed", "quant_algo": "MIXED_PRECISION"},
+    )
+
+    assert not any(
+        key.endswith(".k_scale") or key.endswith(".v_scale") for key in transformed
+    )
+    assert transformed["layer.weight"].dtype == mx.uint32
+    assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
+def test_modelopt_mixed_folds_many_tensors_without_exhausting_buffers():
+    """Folding must not accumulate one lazy graph across the whole checkpoint.
+
+    A 256-expert MoE export has tens of thousands of quantized tensors. If the
+    per-tensor folds are left unevaluated, the intermediates exceed Metal's
+    live-buffer limit and loading dies with ``[metal::malloc] Resource limit``.
+    24k tensors is below a real export (Apodex 1.1 mini NVFP4 has 30,720) but
+    above the point where an unbatched implementation fails.
+    """
+    count = 24000
+    weights = {}
+    for index in range(count):
+        weights[f"l.{index}.weight"] = mx.zeros((2, 16), dtype=mx.uint8)
+        weights[f"l.{index}.weight_scale"] = mx.zeros((2, 2), dtype=mx.uint8)
+        weights[f"l.{index}.weight_scale_2"] = mx.array(0.5, dtype=mx.float32)
+
+    transformed, _ = _transform_modelopt_nvfp4_weights(
+        weights,
+        {"quant_method": "modelopt_mixed", "quant_algo": "MIXED_PRECISION"},
+    )
+
+    assert len(transformed) == 2 * count
+    assert transformed[f"l.{count - 1}.scales"].dtype == mx.uint8

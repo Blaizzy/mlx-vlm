@@ -2,6 +2,8 @@ import json
 import logging
 from typing import Any, Optional, Tuple
 
+from .dflash2 import DFlash2DraftModel
+from .dspark import DSparkDraftModel
 from .laguna_dflash import LagunaDFlashDraftModel
 from .muse_glimmer_assistant import MuseGlimmerAssistantDraftModel
 from .qwen3_dflash import DFlashDraftModel
@@ -12,12 +14,14 @@ KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
 # here falls back to ``DEFAULT_DRAFTER_KIND`` when the caller didn't pass one.
 DRAFTER_KIND_BY_MODEL_TYPE = {
     "deepseek_v4_mtp": "mtp",
+    "dspark": "dflash",
     "eagle3": "eagle3",
     "gemma4_assistant": "mtp",
     "gemma4_unified_assistant": "mtp",
     "glm4_moe_lite_mtp": "mtp",
     "inkling_mtp": "mtp",
     "qwen3_5_mtp": "mtp",
+    "qwen4_exp_mtp": "mtp",
     "laguna": "dflash",
     "muse_glimmer_assistant": "dflash",
 }
@@ -176,6 +180,8 @@ __all__ = [
     "DRAFTER_KIND_BY_MODEL_TYPE",
     "KNOWN_DRAFTER_KINDS",
     "DFlashDraftModel",
+    "DFlash2DraftModel",
+    "DSparkDraftModel",
     "LagunaDFlashDraftModel",
     "MuseGlimmerAssistantDraftModel",
     "load_drafter",
