@@ -17,6 +17,14 @@ _PLE_SHARD_MARKER = ".ple.ple_embedding.ngram_embedding.shard_"
 
 def convert_qwen4_exp_fp8_weights(weights: dict[str, mx.array]):
     """Restore FP8 experts/PLE and pack experts into mlx-vlm's model layout."""
+    has_fp8_experts = any(
+        _EXPERT_WEIGHT_RE.match(key) and f"{key}_scale_inv" in weights
+        for key in weights
+    )
+    has_fp8_ple = any(key.endswith(_PLE_SCALE_SUFFIX) for key in weights)
+    if not (has_fp8_experts or has_fp8_ple):
+        return weights
+
     converted = dict(weights)
     expert_groups = defaultdict(lambda: defaultdict(dict))
     for key in list(converted):

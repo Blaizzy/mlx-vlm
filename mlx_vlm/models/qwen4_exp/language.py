@@ -1269,14 +1269,3 @@ class LanguageModel(Qwen3_5LanguageModel):
             else:
                 caches.append(QSAKVCache())
         return caches
-
-    @property
-    def quant_predicate(self):
-        def predicate(path, _module):
-            if ".ple.ple_embedding.ngram_embedding.shards." in path:
-                return {"group_size": 32, "bits": 4, "mode": "affine"}
-            if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
-                return {"group_size": 64, "bits": 8, "mode": "affine"}
-            return True
-
-        return predicate

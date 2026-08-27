@@ -265,18 +265,6 @@ class Qwen4ExpTests(unittest.TestCase):
         self.assertEqual(sanitized[f"{mapped}.ple.conv1d.weight"].shape, (64, 3, 1))
         self.assertFalse(any(key.startswith("mtp.") for key in sanitized))
 
-    def test_quantization_uses_group32_for_ple_shards(self):
-        model = qwen4_exp.Model(tiny_config())
-        predicate = model.quant_predicate
-        path = (
-            "language_model.model.layers.0.ple.ple_embedding."
-            "ngram_embedding.shards.0"
-        )
-        self.assertEqual(
-            predicate(path, None),
-            {"group_size": 32, "bits": 4, "mode": "affine"},
-        )
-
     def test_sanitize_restores_official_fp8_experts_and_ple(self):
         model = qwen4_exp.Model(tiny_config())
         weights = {}
@@ -304,6 +292,17 @@ class Qwen4ExpTests(unittest.TestCase):
         self.assertEqual(down.shape, (2, 128, 128))
         self.assertTrue(mx.allclose(ple_weight, mx.ones((4, 8)) * 0.5).item())
         self.assertFalse(any("scale" in key for key in sanitized))
+
+    def test_sanitize_leaves_non_fp8_expert_layout_unchanged(self):
+        model = qwen4_exp.Model(tiny_config())
+        key = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight"
+        weights = {key: mx.ones((2, 2), dtype=mx.bfloat16)}
+
+        sanitized = model.sanitize(weights)
+
+        mapped = "language_model.model.layers.0.mlp.experts.0.gate_proj.weight"
+        self.assertIn(mapped, sanitized)
+        self.assertEqual(sanitized[mapped].dtype, mx.bfloat16)
 
 
 if __name__ == "__main__":
