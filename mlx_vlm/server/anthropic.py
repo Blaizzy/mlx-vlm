@@ -23,10 +23,10 @@ from .generation import (
 )
 from .openai import _prepare_chat_tool_choice
 from .responses_state import (
+    ToolCallStreamState,
     make_response_stream_state,
     process_tool_calls,
     prompt_has_open_thinking,
-    suppress_tool_call_content,
 )
 from .runtime import runtime
 from .schemas import AnthropicMessageResponse, AnthropicRequest, AnthropicUsage
@@ -561,8 +561,9 @@ async def anthropic_messages_endpoint(http_request: Request):
                     gen_args.thinking_start_token,
                     gen_args.thinking_end_token,
                 )
-                in_tool_call = False
                 tc_start = tool_module.tool_call_start if tool_module else None
+                tc_end = tool_module.tool_call_end if tool_module else None
+                tool_call_state = ToolCallStreamState(tc_start, tc_end)
                 message_started = False
 
                 def close_open_block():
@@ -688,8 +689,9 @@ async def anthropic_messages_endpoint(http_request: Request):
                         delta_reasoning = thinking_delta.reasoning
                         delta_content = thinking_delta.content
 
-                        in_tool_call, delta_content = suppress_tool_call_content(
-                            full_output, in_tool_call, tc_start, delta_content
+                        delta_content = tool_call_state.feed(
+                            delta_content,
+                            last=bool(getattr(token, "finish_reason", None)),
                         )
 
                         if delta_reasoning is not None and gen_args.enable_thinking:

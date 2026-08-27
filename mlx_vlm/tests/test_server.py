@@ -4630,7 +4630,10 @@ def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch)
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 [
                     server.StreamingToken(
-                        text='<tool_call>{"name":"get_weather","arguments":{"location":"SF"}}</tool_call>',
+                        text=(
+                            '<tool_call>{"name":"get_weather","arguments":'
+                            '{"location":"SF"}}</tool_call> After the call.'
+                        ),
                         token=1,
                         logprobs=0.0,
                         finish_reason="stop",
@@ -4671,6 +4674,7 @@ def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch)
     assert '"name": "get_weather"' in body
     assert '"type": "input_json_delta"' in body
     assert '"partial_json": "{\\"location\\": \\"SF\\"}"' in body
+    assert '"text": " After the call."' in body
     assert '"stop_reason": "tool_use"' in body
 
 
@@ -7506,64 +7510,51 @@ class TestChatMessageSchema:
         assert msg.reasoning == "thought"
 
 
-class TestSuppressToolCallContent:
+class TestToolCallStreamState:
     """Tests for tool-call markup suppression in streaming."""
 
     def test_no_tool_module(self):
-        in_tc, content = server.suppress_tool_call_content(
-            "Hello world", False, None, "world"
-        )
-        assert in_tc is False
-        assert content == "world"
+        state = server.ToolCallStreamState(None, None)
+        assert state.feed("world") == "world"
 
     def test_normal_text_before_tool_call(self):
-        in_tc, content = server.suppress_tool_call_content(
-            "I will call", False, "<tool_call>", "call"
-        )
-        assert in_tc is False
-        assert content == "call"
+        state = server.ToolCallStreamState("<tool_call>", "</tool_call>")
+        assert state.feed("I will call") == "I will call"
+        assert state.in_tool_call is False
 
     def test_suppresses_on_start_marker(self):
-        in_tc, content = server.suppress_tool_call_content(
-            "text<tool_call>", False, "<tool_call>", ">"
-        )
-        assert in_tc is True
-        assert content is None
+        state = server.ToolCallStreamState("<tool_call>", "</tool_call>")
+        assert state.feed("text<tool_call>") == "text"
+        assert state.in_tool_call is True
 
     def test_suppresses_partial_marker(self):
-        in_tc, content = server.suppress_tool_call_content(
-            "text<tool", False, "<tool_call>", "<tool"
-        )
-        assert in_tc is False
-        assert content is None
+        state = server.ToolCallStreamState("<tool_call>", "</tool_call>")
+        assert state.feed("text<tool") == "text"
+        assert state.buffer == "<tool"
+        assert state.in_tool_call is False
 
     def test_stays_suppressed_after_entering(self):
-        in_tc, content = server.suppress_tool_call_content(
-            "text<tool_call>get_weather", True, "<tool_call>", "weather"
-        )
-        assert in_tc is True
-        assert content is None
+        state = server.ToolCallStreamState("<tool_call>", "</tool_call>")
+        assert state.feed("text<tool_call>") == "text"
+        assert state.feed("get_weather") is None
+        assert state.in_tool_call is True
 
     def test_pipe_delimited_marker(self):
-        in_tc, content = server.suppress_tool_call_content(
-            "text<|tool_call>call:get_weather", False, "<|tool_call>", "weather"
-        )
-        assert in_tc is True
-        assert content is None
+        state = server.ToolCallStreamState("<|tool_call>", "<|tool_call_end|>")
+        assert state.feed("text<|tool_call>call:get_weather") == "text"
+        assert state.in_tool_call is True
 
     def test_pipe_delimited_partial_marker(self):
-        in_tc, content = server.suppress_tool_call_content(
-            "text<|tool", False, "<|tool_call>", "<|tool"
-        )
-        assert in_tc is False
-        assert content is None
+        state = server.ToolCallStreamState("<|tool_call>", "<|tool_call_end|>")
+        assert state.feed("text<|tool") == "text"
+        assert state.buffer == "<|tool"
+        assert state.in_tool_call is False
 
     def test_literal_less_than_is_not_suppressed(self):
-        in_tc, content = server.suppress_tool_call_content(
-            "if n <", False, "<tool_call>", "<"
-        )
-        assert in_tc is False
-        assert content == "<"
+        state = server.ToolCallStreamState("<tool_call>", "</tool_call>")
+        assert state.feed("if n <") == "if n "
+        assert state.feed("x") == "<x"
+        assert state.in_tool_call is False
 
 
 class TestProcessToolCalls:
