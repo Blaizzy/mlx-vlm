@@ -33,6 +33,7 @@ source (which still carries `mtp.*`).
 |---|---|
 | `qwen3_5`, `qwen3_5_moe` | `qwen3_5_mtp` |
 | `qwen3_next` | `qwen3_5_mtp` (reuses the runtime) |
+| `qwen4_exp` | `qwen4_exp_mtp` |
 | `deepseek_v4` | `deepseek_v4_mtp` |
 | `glm4_moe_lite` | `glm4_moe_lite_mtp` |
 | `inkling_mm_model` | `inkling_mtp` |
