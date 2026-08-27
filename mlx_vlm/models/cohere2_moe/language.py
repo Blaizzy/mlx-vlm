@@ -2,7 +2,6 @@ from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -10,6 +9,8 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
+from ..mlp import SwiGLUMLP as MLP
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 
 
@@ -96,17 +97,6 @@ class Attention(nn.Module):
         ).astype(queries.dtype)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
-
-
-class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-
-    def __call__(self, x):
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class CohereMoeSparseMoeBlock(nn.Module):

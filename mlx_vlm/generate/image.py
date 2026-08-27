@@ -43,6 +43,10 @@ IMAGE_METADATA_DOWNLOAD_PATTERNS = (
     "manifest.json",
     "**/config.json",
 )
+IMAGE_COMPONENT_INDEX_DOWNLOAD_PATTERNS = (
+    *IMAGE_METADATA_DOWNLOAD_PATTERNS,
+    "**/model.safetensors.index.json",
+)
 
 ImageOutputFormat = Literal["b64_json", "path"]
 ImageTask = Literal["generate", "edit"]
@@ -55,12 +59,18 @@ ImageColorSpace = Literal["RGB"]
 class ImageGenerationRequest:
     prompt: str
     seed: int | None = None
-    steps: int = DEFAULT_IMAGE_STEPS
+    steps: int | None = None
     width: int = 512
     height: int = 512
-    guidance: float = DEFAULT_IMAGE_GUIDANCE
+    guidance: float | None = None
     output_format: Literal["png"] = DEFAULT_IMAGE_FORMAT
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def resolve_steps(self, default: int = DEFAULT_IMAGE_STEPS) -> int:
+        return default if self.steps is None else self.steps
+
+    def resolve_guidance(self, default: float = DEFAULT_IMAGE_GUIDANCE) -> float:
+        return default if self.guidance is None else self.guidance
 
 
 @dataclass(slots=True)
@@ -152,6 +162,11 @@ def _model_type_from_id(model: str) -> str:
         "flux.2": "flux2",
         "flux2": "flux2",
         "klein": "flux2",
+        "mage": "mage_flow",
+        "mageflow": "mage_flow",
+        "z": "z_image",
+        "zimage": "z_image",
+        "ernie": "ernie_image",
     }.get(model_type, model_type)
 
 
@@ -231,6 +246,40 @@ def _image_model_type_from_manifest(metadata: dict[str, Any]) -> str | None:
     return None
 
 
+def _image_model_type_from_component_indexes(root: Path) -> str | None:
+    transformer_index = _load_json_file(
+        root / "transformer" / "model.safetensors.index.json"
+    )
+    if transformer_index is None:
+        return None
+    weight_map = transformer_index.get("weight_map")
+    if not isinstance(weight_map, dict):
+        return None
+    keys = set(weight_map)
+    flux2_markers = {
+        "time_guidance_embed.linear_1.weight",
+        "double_stream_modulation_img.linear.weight",
+        "single_transformer_blocks.0.attn.to_qkv_mlp_proj.weight",
+    }
+    if flux2_markers <= keys:
+        return "flux2"
+    z_image_markers = {
+        "layers.0.feed_forward.w1.weight",
+        "context_refiner.0.attention.to_q.weight",
+        "noise_refiner.0.adaLN_modulation.0.weight",
+    }
+    if z_image_markers <= keys:
+        return "z_image"
+    ernie_image_markers = {
+        "adaln_modulation.weight",
+        "final_norm.linear.weight",
+        "layers.0.adaLN_sa_ln.weight",
+    }
+    if ernie_image_markers <= keys:
+        return "ernie_image"
+    return None
+
+
 def _load_json_file(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -247,15 +296,23 @@ def _local_image_model_types(model: str) -> tuple[str, ...]:
         return ()
 
     candidates: list[str] = []
+    manifest = _load_json_file(root / "manifest.json")
+    if manifest is not None:
+        # Bonsai repos ship FLUX.2 configs (Flux2KleinPipeline /
+        # Flux2Transformer2DModel), so class-name scanning below would
+        # classify them as flux2 before the manifest check. The manifest
+        # layout (transformer-packed-mflux + text_encoder-mlx-4bit +
+        # tokenizer) is the authoritative Bonsai discriminator, so it must
+        # be checked first.
+        _add_model_type(candidates, _image_model_type_from_manifest(manifest))
+
     for filename in ("model_index.json", "config.json"):
         metadata = _load_json_file(root / filename)
         if metadata is not None:
             for model_type in _image_model_types_from_metadata(metadata):
                 _add_model_type(candidates, model_type)
 
-    manifest = _load_json_file(root / "manifest.json")
-    if manifest is not None:
-        _add_model_type(candidates, _image_model_type_from_manifest(manifest))
+    _add_model_type(candidates, _image_model_type_from_component_indexes(root))
 
     for config_path in sorted(root.glob("*/config.json")):
         metadata = _load_json_file(config_path)
@@ -318,14 +375,36 @@ def _resolve_image_model_path(
     )
 
 
-def _resolve_image_model_metadata_path(model: str) -> Path | None:
+def _resolve_image_model_metadata_path(
+    model: str, *, include_component_indexes: bool = False
+) -> Path | None:
     model_path = Path(model).expanduser()
     if model_path.exists():
         return model_path
+    patterns = (
+        IMAGE_COMPONENT_INDEX_DOWNLOAD_PATTERNS
+        if include_component_indexes
+        else IMAGE_METADATA_DOWNLOAD_PATTERNS
+    )
     return get_model_path(
         model,
-        allow_patterns=list(IMAGE_METADATA_DOWNLOAD_PATTERNS),
+        allow_patterns=list(patterns),
     )
+
+
+def _image_generation_model_class_from_path(
+    model: str, resolved_path: Path | None
+) -> type[Any] | None:
+    local_model_types = (
+        _local_image_model_types(str(resolved_path))
+        if resolved_path is not None
+        else ()
+    )
+    for model_type in (_model_type_from_id(model), *local_model_types):
+        model_class = _image_model_class_for_type(model_type)
+        if model_class is not None and model_class.is_image_generation_model:
+            return model_class
+    return None
 
 
 def image_generation_model_class(model: str | None) -> type[Any] | None:
@@ -340,20 +419,17 @@ def image_generation_model_class(model: str | None) -> type[Any] | None:
         resolved_path = _resolve_image_model_metadata_path(model)
     except Exception:
         resolved_path = None
-    local_model_types = (
-        _local_image_model_types(str(resolved_path))
-        if resolved_path is not None
-        else ()
-    )
-    for model_type in (
-        *local_model_types,
-        _model_type_from_id(model),
-    ):
-        model_class = _image_model_class_for_type(model_type)
-        if model_class is not None and model_class.is_image_generation_model:
-            return model_class
+    model_class = _image_generation_model_class_from_path(model, resolved_path)
+    if model_class is not None or Path(model).expanduser().exists():
+        return model_class
 
-    return None
+    try:
+        resolved_path = _resolve_image_model_metadata_path(
+            model, include_component_indexes=True
+        )
+    except Exception:
+        return None
+    return _image_generation_model_class_from_path(model, resolved_path)
 
 
 def is_image_generation_model(model: str | None) -> bool:
@@ -394,7 +470,7 @@ def load_image_generation_model(
         else ()
     )
     model_class = None
-    for model_type in (*local_model_types, _model_type_from_id(model)):
+    for model_type in (_model_type_from_id(model), *local_model_types):
         model_class = _image_model_class_for_type(model_type)
         if model_class is not None and model_class.is_image_generation_model:
             break
@@ -463,8 +539,7 @@ def generate_image(
         if isinstance(request, ImageGenerationRequest):
             if image_paths is None:
                 raise ValueError(
-                    "image_paths are required when editing from "
-                    "ImageGenerationRequest"
+                    "image_paths are required when editing from ImageGenerationRequest"
                 )
             request = ImageEditRequest(
                 prompt=request.prompt,
@@ -561,6 +636,7 @@ def run_image_generation_cli(args: Any) -> None:
     task = _normalize_image_task(getattr(args, "task", DEFAULT_IMAGE_TASK))
     _validate_image_generation_args(args, task=task)
     seed = args.seed if args.seed is not None else random.randrange(2**32)
+    steps = getattr(args, "steps", None)
     prompt = _prompt_to_image_text(args.prompt)
     if not prompt:
         raise ValueError(f"--prompt must not be empty for image {task}")
@@ -586,7 +662,7 @@ def run_image_generation_cli(args: Any) -> None:
             prompt=prompt,
             image_paths=tuple(args.image),
             seed=seed,
-            steps=args.steps,
+            steps=steps,
             width=width,
             height=height,
             guidance=args.guidance,
@@ -613,7 +689,7 @@ def run_image_generation_cli(args: Any) -> None:
         request = ImageGenerationRequest(
             prompt=prompt,
             seed=seed,
-            steps=args.steps,
+            steps=steps,
             width=width,
             height=height,
             guidance=args.guidance,

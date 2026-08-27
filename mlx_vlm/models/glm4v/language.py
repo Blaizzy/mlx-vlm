@@ -6,6 +6,7 @@ import mlx.nn as nn
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    kv_sequence_length,
     scaled_dot_product_attention,
 )
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
@@ -145,7 +146,7 @@ class Glm4vAttention(nn.Module):
             keys, values = cache.update_and_fetch(keys, values)
 
         if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., : keys.shape[-2]]
+            mask = mask[..., : kv_sequence_length(keys)]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
@@ -409,6 +410,10 @@ class LanguageModel(nn.Module):
                     )  # Equivalent to expand(3, -1)
 
                     llm_pos_ids_list.append(t_index + st_idx)
+
+                if not llm_pos_ids_list:
+                    mrope_position_deltas.append(0)
+                    continue
 
                 llm_positions = mx.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
                 compact_max_position = llm_positions.max()

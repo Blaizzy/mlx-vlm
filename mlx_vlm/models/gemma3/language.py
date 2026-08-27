@@ -7,9 +7,11 @@ import mlx.nn as nn
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    kv_sequence_length,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
+from ..rope_utils import initialize_rope
 from .config import TextConfig
 
 
@@ -45,14 +47,16 @@ class Attention(nn.Module):
         self.k_norm = RMSNorm(dims=head_dim, eps=config.rms_norm_eps)
         self.is_sliding = (layer_idx + 1) % config.sliding_window_pattern != 0
 
-        self.rope = nn.RoPE(
-            head_dim,
+        self.rope = initialize_rope(
+            dims=head_dim,
             traditional=config.rope_traditional,
             base=(
                 config.rope_local_base_freq
                 if self.is_sliding
                 else config.rope_global_base_freq
             ),
+            scaling_config=None if self.is_sliding else config.rope_scaling,
+            max_position_embeddings=config.max_position_embeddings,
         )
 
     def __call__(
@@ -81,8 +85,9 @@ class Attention(nn.Module):
 
         # Sliding window
         if mask is not None and isinstance(mask, mx.array):
-            if mask.shape[-1] != keys.shape[-2]:
-                mask = mask[..., -keys.shape[-2] :]
+            key_len = kv_sequence_length(keys)
+            if mask.shape[-1] != key_len:
+                mask = mask[..., -key_len:]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache, scale=self.scale, mask=mask
@@ -172,9 +177,10 @@ class TransformerBlock(nn.Module):
 
 
 class Gemma3Model(nn.Module):
-    def __init__(self, config: TextConfig):
+    def __init__(self, config: TextConfig, scale_inputs_embeds: bool = True):
         super().__init__()
         self.config = config
+        self.scale_inputs_embeds = scale_inputs_embeds
         self.vocab_size = config.vocab_size
         self.window_size = config.sliding_window
         self.sliding_window_pattern = config.sliding_window_pattern
@@ -194,12 +200,14 @@ class Gemma3Model(nn.Module):
         mask: mx.array = None,
         cache=None,
     ):
-        if inputs_embeds is None:
+        embedded_tokens = inputs_embeds is None
+        if embedded_tokens:
             h = self.embed_tokens(inputs)
         else:
             h = inputs_embeds
 
-        h *= mx.array(self.config.hidden_size**0.5, mx.bfloat16).astype(h.dtype)
+        if embedded_tokens or self.scale_inputs_embeds:
+            h *= mx.array(self.config.hidden_size**0.5, mx.bfloat16).astype(h.dtype)
 
         if cache is None:
             cache = [None] * len(self.layers)

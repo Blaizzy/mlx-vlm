@@ -1,44 +1,9 @@
-from typing import Optional
-
 import mlx.core as mx
-import mlx.nn as nn
-from mlx_lm.models.cache import ArraysCache, KVCache
-from mlx_lm.models.lfm2_moe import Lfm2Model
 
-from ..base import LanguageModelOutput
-from .config import ModelConfig
+from ..lfm2.language import LanguageModel as Lfm2LanguageModel
 
 
-class LanguageModel(nn.Module):
-    def __init__(self, args: ModelConfig):
-        super().__init__()
-        self.args = args
-        self.config = args
-        self.model_type = args.model_type
-        self.model = Lfm2Model(args)
-        if not args.tie_word_embeddings:
-            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
-
-    def __call__(
-        self,
-        inputs: Optional[mx.array] = None,
-        cache=None,
-        input_embeddings: Optional[mx.array] = None,
-        inputs_embeds: Optional[mx.array] = None,
-        **kwargs,
-    ) -> LanguageModelOutput:
-        if inputs is None:
-            inputs = kwargs.get("input_ids")
-        if inputs_embeds is None:
-            inputs_embeds = input_embeddings
-
-        out = self.model(inputs, cache, inputs_embeds)
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
-
+class LanguageModel(Lfm2LanguageModel):
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -92,21 +57,3 @@ class LanguageModel(nn.Module):
             return "expert_bias" not in k
 
         return predicate
-
-    @property
-    def layers(self):
-        return self.model.layers
-
-    @property
-    def head_dim(self):
-        return self.args.hidden_size // self.args.num_attention_heads
-
-    @property
-    def n_kv_heads(self):
-        return self.args.num_key_value_heads
-
-    def make_cache(self):
-        return [
-            KVCache() if layer.is_attention_layer else ArraysCache(size=1)
-            for layer in self.layers
-        ]

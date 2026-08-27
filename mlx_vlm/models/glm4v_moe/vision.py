@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..kernels import grid_sample
+from ..mlp import SwiGLUMLP as Glm4vMoeVisionMLP
 from .config import VisionConfig
 
 
@@ -106,10 +107,16 @@ class Glm4vVisionEmbeddings(nn.Module):
 
             # Calculate target dimensions for each patch
             target_h = mx.concatenate(
-                [mx.repeat(image_shapes[i, 1], lengths[i]) for i in range(len(lengths))]
+                [
+                    mx.repeat(image_shapes[i, 1], int(lengths[i]))
+                    for i in range(len(lengths))
+                ]
             ).astype(mx.float32)
             target_w = mx.concatenate(
-                [mx.repeat(image_shapes[i, 2], lengths[i]) for i in range(len(lengths))]
+                [
+                    mx.repeat(image_shapes[i, 2], int(lengths[i]))
+                    for i in range(len(lengths))
+                ]
             ).astype(mx.float32)
 
             # Normalize coordinates to [-1, 1] range for grid_sample
@@ -223,17 +230,6 @@ class Glm4vMoeVisionAttention(nn.Module):
         output = output.transpose(0, 2, 1, 3)
         output = output.reshape(seq_length, -1)
         return self.proj(output)
-
-
-class Glm4vMoeVisionMLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Glm4vMoeVisionBlock(nn.Module):

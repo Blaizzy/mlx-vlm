@@ -171,8 +171,8 @@ class Gemma4UnifiedVideoProcessor(Gemma4VideoProcessor):
     ):
         if num_soft_tokens is not None and "max_soft_tokens" not in kwargs:
             kwargs["max_soft_tokens"] = num_soft_tokens
-        self.do_resize = kwargs.pop("do_resize", True)
-        super().__init__(**kwargs)
+        do_resize = kwargs.pop("do_resize", True)
+        super().__init__(do_resize=do_resize, **kwargs)
         self.model_patch_size = model_patch_size or (
             self.patch_size * self.pooling_kernel_size
         )
@@ -329,9 +329,15 @@ class Gemma4UnifiedAudioFeatureExtractor:
 class Gemma4UnifiedProcessor(Gemma4Processor):
     model_type = "gemma4_unified"
     image_processor_class = "Gemma4UnifiedImageProcessor"
+    video_processor_class = "Gemma4UnifiedVideoProcessor"
 
-    def __init__(self, image_processor=None, tokenizer=None, **kwargs):
-        video_processor = kwargs.pop("video_processor", None)
+    def __init__(
+        self,
+        image_processor=None,
+        tokenizer=None,
+        video_processor=None,
+        **kwargs,
+    ):
         if image_processor is None:
             image_processor = Gemma4UnifiedImageProcessor()
         if video_processor is None:
@@ -356,7 +362,7 @@ class Gemma4UnifiedProcessor(Gemma4Processor):
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         from transformers import AutoTokenizer
 
-        kwargs.pop("trust_remote_code", None)
+        trust_remote_code = kwargs.pop("trust_remote_code", True)
         kwargs.pop("use_fast", None)
 
         model_path = Path(pretrained_model_name_or_path)
@@ -364,7 +370,7 @@ class Gemma4UnifiedProcessor(Gemma4Processor):
 
         tokenizer = AutoTokenizer.from_pretrained(
             str(model_path) if is_local else pretrained_model_name_or_path,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             local_files_only=is_local,
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)

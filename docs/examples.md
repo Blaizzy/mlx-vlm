@@ -10,4 +10,3 @@ Example notebooks are available in the `examples/` directory:
 - [video_understanding.ipynb](https://github.com/Blaizzy/mlx-vlm/blob/main/examples/video_understanding.ipynb)
 
 Images and videos used by the notebooks are stored in the `examples/images/` and `examples/videos/` folders.
-

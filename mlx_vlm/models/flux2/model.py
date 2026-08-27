@@ -80,35 +80,41 @@ class Flux2ImageGenerationModel(ImageGenerationModel):
 
     def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
+        steps = request.resolve_steps()
+        guidance = request.resolve_guidance()
         max_sequence_length = request.extra.get("max_sequence_length", None)
         tiled_vae = request.extra.get("tiled_vae", None)
+        quantization_config = getattr(self.pipeline, "quantization_config", None)
         array = self.pipeline.generate_array(
             request.prompt,
             seed=seed,
-            steps=request.steps,
+            steps=steps,
             width=request.width,
             height=request.height,
-            guidance=request.guidance,
+            guidance=guidance,
             max_sequence_length=max_sequence_length,
             tiled_vae=tiled_vae,
         )
+        metadata = {
+            "model_path": str(self.pipeline.model_path),
+            "architecture": "quantized" if quantization_config else "dense",
+            "vae_variant": "full",
+        }
+        if quantization_config is not None:
+            metadata["quantization"] = dict(quantization_config)
         return ImageGenerationResult(
             array=array,
             seed=seed,
             width=request.width,
             height=request.height,
-            steps=request.steps,
+            steps=steps,
             model=self.model_id,
             family=self.family,
             variant=self.variant,
-            guidance=request.guidance,
+            guidance=guidance,
             prompt_tokens=self.count_prompt_tokens(request.prompt),
             peak_memory=mx.get_peak_memory() / 1e9,
-            metadata={
-                "model_path": str(self.pipeline.model_path),
-                "architecture": "dense",
-                "vae_variant": "full",
-            },
+            metadata=metadata,
         )
 
     @classmethod
@@ -131,8 +137,9 @@ class Flux2ImageGenerationModel(ImageGenerationModel):
             )
             else model_path_arg
         )
+        variant = resolve_variant(model_path if model_path is not None else model)
         pipeline = Flux2Image.from_pretrained(
-            resolve_variant(model),
+            variant,
             model_path=model_path,
             download=kwargs.pop("download", True),
             token=kwargs.pop("token", None),
@@ -167,38 +174,44 @@ class Flux2ImageEditModel(ImageEditModel):
 
     def edit(self, request: ImageEditRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
+        steps = request.resolve_steps()
+        guidance = request.resolve_guidance()
         max_sequence_length = request.extra.get("max_sequence_length", None)
         tiled_vae = request.extra.get("tiled_vae", None)
+        quantization_config = getattr(self.pipeline, "quantization_config", None)
         array = self.pipeline.edit_array(
             request.prompt,
             request.image_paths,
             seed=seed,
-            steps=request.steps,
+            steps=steps,
             width=request.width,
             height=request.height,
-            guidance=request.guidance,
+            guidance=guidance,
             max_sequence_length=max_sequence_length,
             tiled_vae=tiled_vae,
         )
+        metadata = {
+            "model_path": str(self.pipeline.model_path),
+            "architecture": "quantized" if quantization_config else "dense",
+            "vae_variant": "full",
+            "reference_count": len(request.image_paths),
+            "uses_reference_kv_cache": self.pipeline.variant.uses_reference_kv_cache,
+        }
+        if quantization_config is not None:
+            metadata["quantization"] = dict(quantization_config)
         return ImageGenerationResult(
             array=array,
             seed=seed,
             width=array.shape[1],
             height=array.shape[0],
-            steps=request.steps,
+            steps=steps,
             model=self.model_id,
             family=self.family,
             variant=self.variant,
-            guidance=request.guidance,
+            guidance=guidance,
             prompt_tokens=self.count_prompt_tokens(request.prompt),
             peak_memory=mx.get_peak_memory() / 1e9,
-            metadata={
-                "model_path": str(self.pipeline.model_path),
-                "architecture": "dense",
-                "vae_variant": "full",
-                "reference_count": len(request.image_paths),
-                "uses_reference_kv_cache": self.pipeline.variant.uses_reference_kv_cache,
-            },
+            metadata=metadata,
         )
 
     @classmethod
@@ -211,9 +224,6 @@ class Flux2ImageEditModel(ImageEditModel):
         model: str = "flux2-klein-9b-kv",
         **kwargs: Any,
     ) -> "Flux2ImageEditModel":
-        variant = resolve_variant(model)
-        if not variant.supports_edit:
-            raise ValueError(f"{variant.repo_id} does not support image editing")
         model_path_arg = kwargs.pop("model_path", None)
         model_path = (
             Path(model).expanduser()
@@ -224,6 +234,9 @@ class Flux2ImageEditModel(ImageEditModel):
             )
             else model_path_arg
         )
+        variant = resolve_variant(model_path if model_path is not None else model)
+        if not variant.supports_edit:
+            raise ValueError(f"{variant.repo_id} does not support image editing")
         pipeline = Flux2ImageEdit.from_pretrained(
             variant,
             model_path=model_path,

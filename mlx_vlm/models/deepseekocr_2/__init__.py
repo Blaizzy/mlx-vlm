@@ -8,5 +8,6 @@ from .config import (
     TextConfig,
     VisionConfig,
 )
-from .deepseekocr_2 import DeepseekOCR2Processor, Model
+from .deepseekocr_2 import Model
+from .processing_deepseekocr import DeepseekOCR2Processor
 from .vision import Qwen2Decoder2Encoder, VisionModel

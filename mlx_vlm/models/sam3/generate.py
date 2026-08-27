@@ -21,6 +21,8 @@ import mlx.nn as nn
 import numpy as np
 from PIL import Image
 
+from ..._stream_cleanup import clear_mlx_streams
+
 
 @dataclass
 class DetectionResult:
@@ -163,7 +165,17 @@ class Sam3Predictor:
 
         box_input = None
         if boxes is not None:
-            box_input = mx.array(boxes)[None]  # (1, N, 4)
+            boxes_arr = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+            if isinstance(image, Image.Image):
+                img_w, img_h = image.size
+            else:
+                img_h, img_w = image.shape[:2]
+            x1 = boxes_arr[:, 0] / img_w
+            y1 = boxes_arr[:, 1] / img_h
+            x2 = boxes_arr[:, 2] / img_w
+            y2 = boxes_arr[:, 3] / img_h
+            cxcywh = np.stack([(x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1], axis=-1)
+            box_input = mx.array(cxcywh)[None]
 
         # Run detection (text encoding skipped via cache)
         outputs = self.model.detect(
@@ -1299,6 +1311,12 @@ def track_video_realtime(
 
     # --- Thread 2: Optimized inference (backbone + encoder caching, fast overlay) ---
     def inference_loop():
+        try:
+            inference_loop_impl()
+        finally:
+            clear_mlx_streams()
+
+    def inference_loop_impl():
         backbone_cache = {"features": None, "frame_idx": -1}
         encoder_cache = {}
         inference_count = 0

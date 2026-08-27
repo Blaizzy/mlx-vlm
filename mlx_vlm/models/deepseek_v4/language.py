@@ -6,9 +6,6 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx.utils import tree_flatten
-from mlx_lm.models.mla import MultiLinear
-from mlx_lm.models.pipeline import PipelineMixin
-from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -16,6 +13,9 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import CacheList, PoolingCache, RotatingKVCache
+from ..mla import MultiLinear
+from ..pipeline import PipelineMixin
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 from .hisa_kernel import hisa_select
 from .hyper_connection import HyperConnection, HyperHead, hc_expand
@@ -405,6 +405,7 @@ class DeepseekV4MoE(nn.Module):
         self.shared_experts = DeepseekV4MLP(
             config,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
+            swiglu_limit=config.swiglu_limit,
         )
         self.sharding_group = None
 
@@ -1373,8 +1374,12 @@ class LanguageModel(nn.Module):
                 for bi, valid_end in enumerate(valid_ends.tolist()):
                     start = verify_start + int(valid_end)
                     if start < kv_len:
-                        cache.keys[bi, :, start:kv_len, :] = 0
-                        cache.values[bi, :, start:kv_len, :] = 0
+                        zero_row_tail = getattr(cache, "zero_row_tail", None)
+                        if callable(zero_row_tail):
+                            zero_row_tail(bi, start, kv_len)
+                        else:
+                            cache.keys[bi, :, start:kv_len, :] = 0
+                            cache.values[bi, :, start:kv_len, :] = 0
 
         return max_a
 

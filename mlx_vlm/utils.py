@@ -1,10 +1,12 @@
 import glob
 import importlib
+import importlib.util
 import inspect
 import json
 import logging
 import math
 import struct
+import warnings
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -14,7 +16,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import requests
-import safetensors
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_map
 from PIL import Image, ImageOps
@@ -22,6 +23,7 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
+from .quantization.one_bit import _quantization_for_path, replace_one_bit_modules
 from .tokenizer_utils import load_tokenizer
 from .trainer.utils import apply_lora_layers
 
@@ -46,6 +48,17 @@ MODEL_REMAPPING = {
     "falcon-perception": "falcon_perception",
     "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
     "cohere2moe": "cohere2_moe",
+    "unlimited-ocr": "unlimited_ocr",
+    "mistral": "llama",
+    "phi-msft": "phixtral",
+    "falcon_mamba": "mamba",
+    "joyai_llm_flash": "deepseek_v3",
+    "kimi_k2": "deepseek_v3",
+    "minimax_m2": "minimax",
+    "iquestcoder": "llama",
+    "nemotron-nas": "nemotron_nas",
+    "inkling_mm_model": "inkling",
+    "lille-130m": "lille_130m",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -152,6 +165,120 @@ def _f32_to_e4m3(x: mx.array) -> mx.array:
     return byte.astype(mx.uint8)
 
 
+def _transform_modelopt_nvfp4_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Optional[Dict[str, Any]],
+) -> Tuple[Dict[str, mx.array], Optional[Dict[str, Any]]]:
+    """Convert ModelOpt NVFP4 and mixed NVFP4/FP8 checkpoints.
+
+    ModelOpt's mixed export uses ``weight_scale_2`` to identify NVFP4
+    linears and a lone ``weight_scale`` for FP8 linears. MLX can load the
+    former natively; the latter are decoded to dense weights because its FP8
+    mode uses block scales rather than ModelOpt's per-tensor/channel scale.
+    """
+    if quantization_config is None:
+        return weights, None
+    if quantization_config.get("quant_method") not in {
+        "modelopt",
+        "modelopt_mixed",
+    } or quantization_config.get("quant_algo") not in {"NVFP4", "MIXED_PRECISION"}:
+        return weights, None
+
+    scale_2_suffix = ".weight_scale_2"
+    nvfp4_prefixes = {
+        key[: -len(scale_2_suffix)] for key in weights if key.endswith(scale_2_suffix)
+    }
+    scale_suffix = ".weight_scale"
+    scaled_prefixes = {
+        key[: -len(scale_suffix)] for key in weights if key.endswith(scale_suffix)
+    }
+    fp8_prefixes = scaled_prefixes - nvfp4_prefixes
+    if not nvfp4_prefixes and not fp8_prefixes:
+        return weights, None
+
+    nvfp4_consumed = {
+        f"{prefix}.{suffix}"
+        for prefix in nvfp4_prefixes
+        for suffix in ("weight", "weight_scale", "input_scale")
+    }
+    fp8_consumed = {
+        f"{prefix}.{suffix}"
+        for prefix in fp8_prefixes
+        for suffix in ("weight", "input_scale")
+    }
+    transformed = {}
+    # Each fold below builds a deep lazy graph. A large MoE export has tens of
+    # thousands of quantized tensors, so the unevaluated intermediates blow past
+    # Metal's live-buffer limit before the dict is ever consumed. Flush in
+    # batches to keep the graph shallow; this also frees the intermediates.
+    pending: List[mx.array] = []
+
+    def _flush(force: bool = False) -> None:
+        if pending and (force or len(pending) >= 256):
+            mx.eval(pending)
+            pending.clear()
+
+    for key, value in weights.items():
+        # ModelOpt emits per-layer FP8 KV-cache scales when kv_cache_quant_algo
+        # is set. MLX quantizes the KV cache at runtime and has no parameter to
+        # hold them, so drop them rather than fail the strict load.
+        if key.endswith(".k_scale") or key.endswith(".v_scale"):
+            continue
+        if key.endswith(scale_2_suffix):
+            prefix = key[: -len(scale_2_suffix)]
+            weight_key = f"{prefix}.weight"
+            scale_key = f"{prefix}.weight_scale"
+            if weight_key not in weights or scale_key not in weights:
+                raise ValueError(f"Missing ModelOpt NVFP4 tensors for {prefix}.")
+
+            weight = weights[weight_key]
+            scale = weights[scale_key]
+            if (
+                weight.dtype != mx.uint8
+                or scale.dtype != mx.uint8
+                or weight.ndim != 2
+                or scale.ndim != 2
+                or value.size != 1
+            ):
+                raise ValueError(f"Invalid ModelOpt NVFP4 tensors for {prefix}.")
+            if (
+                weight.shape[0] != scale.shape[0]
+                or weight.shape[1] != 8 * scale.shape[1]
+            ):
+                raise ValueError(f"Invalid ModelOpt NVFP4 scale shape for {prefix}.")
+
+            transformed[weight_key] = weight.view(mx.uint32)
+            decoded_scale = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
+            transformed[f"{prefix}.scales"] = _f32_to_e4m3(
+                decoded_scale * value.astype(mx.float32)
+            )
+            pending.append(transformed[f"{prefix}.scales"])
+            _flush()
+        elif key.endswith(scale_suffix) and key[: -len(scale_suffix)] in fp8_prefixes:
+            prefix = key[: -len(scale_suffix)]
+            weight_key = f"{prefix}.weight"
+            if weight_key not in weights or weights[weight_key].dtype != mx.uint8:
+                raise ValueError(f"Invalid ModelOpt FP8 tensors for {prefix}.")
+            if not mx.issubdtype(value.dtype, mx.floating):
+                raise ValueError(f"Invalid ModelOpt FP8 scale for {prefix}.")
+            transformed[weight_key] = _dequantize_compressed_tensors_fp8_weight(
+                weights[weight_key], value
+            )
+            pending.append(transformed[weight_key])
+            _flush()
+        elif key in nvfp4_consumed or key in fp8_consumed:
+            continue
+        else:
+            transformed[key] = value
+
+    _flush(force=True)
+
+    quantization = None
+    if nvfp4_prefixes:
+        quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    return transformed, quantization
+
+
 def _transform_compressed_tensors_nvfp4_weights(
     weights: Dict[str, mx.array],
     quantization_config: Dict[str, Any],
@@ -252,6 +379,144 @@ def _transform_compressed_tensors_int4_weights(
     return new_weights, {"group_size": group_size, "bits": bits, "mode": "affine"}
 
 
+# Compressed-tensors auxiliary tensors with no MLX consumer. They carry
+# activation / kv-cache / shape metadata; left in place they reach
+# ``model.load_weights(strict=True)`` as unexpected keys and abort startup.
+_COMPRESSED_TENSORS_DROP_SUFFIXES = (
+    ".weight_shape",
+    ".weight_global_scale",  # folded into ``.scales`` alongside ``.weight_packed``
+    ".weight_zero_point",
+    ".input_global_scale",
+    ".input_scale",
+    ".k_scale",
+    ".v_scale",
+)
+
+
+def _compressed_tensors_group_weights(
+    quantization_config: Dict[str, Any], ct_format: str
+) -> Dict[str, Any]:
+    """Return the ``weights`` sub-config of the first group with ``ct_format``."""
+    for group in (quantization_config.get("config_groups") or {}).values():
+        if isinstance(group, dict) and group.get("format") == ct_format:
+            return group.get("weights") or {}
+    return {}
+
+
+def _dequantize_compressed_tensors_fp8_weight(
+    weight: mx.array, scale: mx.array
+) -> mx.array:
+    """Dequantize a channel-wise fp8 ``float-quantized`` weight to dense.
+
+    ``float-quantized`` (``num_bits: 8``, ``strategy: channel``) stores the
+    weight as ``float8_e4m3fn`` -- which ``mx.load`` surfaces as raw ``uint8``
+    E4M3 bytes -- plus a per-output-channel ``weight_scale``. MLX has no
+    per-channel fp8 quantization mode, so we decode the E4M3 codes with the
+    shared LUT and rescale into a dense tensor: ``w = E4M3(byte) * weight_scale``.
+    The dense weight is emitted in ``weight_scale``'s dtype (the checkpoint's
+    compute dtype, typically ``bfloat16``).
+    """
+    out_dtype = scale.dtype if scale.dtype != mx.float32 else mx.bfloat16
+    decoded = _E4M3_DECODE_LUT[weight.astype(mx.uint32)]  # float32 [out, in]
+    scale = scale.astype(mx.float32)
+    if scale.ndim == 1:
+        scale = scale[:, None]
+    return (decoded * scale).astype(out_dtype)
+
+
+def _transform_compressed_tensors_mixed_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Dict[str, Any],
+) -> Tuple[Dict[str, mx.array], Optional[Dict[str, Any]]]:
+    """Route a compressed-tensors ``mixed-precision`` checkpoint per group.
+
+    A ``mixed-precision`` export keeps a single top-level ``format`` and puts
+    the real formats in per-group ``config_groups``. Rather than match each
+    group's regex ``targets``/``ignore`` against module paths (fragile -- the
+    HF names differ from MLX's), we route every quantized Linear by the tensors
+    it actually carries, which is exactly what the group assignment produced:
+
+    - ``.weight_packed`` + ``.weight_global_scale`` -> NVFP4
+      (folded to MLX-native ``nvfp4``, as ``_transform_..._nvfp4_weights`` does)
+    - ``.weight_packed`` alone -> INT4 ``pack-quantized`` (folded to ``affine``)
+    - ``.weight_scale`` without ``.weight_packed`` -> channel-wise fp8
+      ``float-quantized`` (dequantized to a dense weight)
+
+    Layers under ``ignore`` (vision, ``linear_attn``, ``mtp``) carry a plain
+    ``.weight`` with no scale and pass through untouched, so the later
+    ``nn.quantize`` pass -- which only quantizes modules that have a ``.scales``
+    tensor -- leaves them dense.
+
+    Only one MLX-native quantized mode may coexist with the dense/fp8 layers
+    (``nn.quantize`` applies a single ``group_size``/``bits``/``mode``). The
+    reported models pair NVFP4 with dense fp8, so this holds; a checkpoint that
+    mixes e.g. NVFP4 and INT4 raises rather than silently mis-quantizing.
+    """
+    packed_prefixes = {
+        key[: -len(".weight_packed")]
+        for key in weights
+        if key.endswith(".weight_packed")
+    }
+    # A ``.weight_scale`` with no packed sibling is a float-quantized fp8 layer.
+    fp8_prefixes = {
+        key[: -len(".weight_scale")] for key in weights if key.endswith(".weight_scale")
+    } - packed_prefixes
+
+    int4_cfg = _compressed_tensors_group_weights(quantization_config, "pack-quantized")
+    int4_bits = int4_cfg.get("num_bits", 4)
+    int4_group_size = int4_cfg.get("group_size", 32)
+
+    new_weights: Dict[str, mx.array] = {}
+    native_quant: Dict[str, Dict[str, Any]] = {}
+
+    for key, value in weights.items():
+        if key.endswith(".weight_packed"):
+            prefix = key[: -len(".weight_packed")]
+            scale = weights[f"{prefix}.weight_scale"]
+            global_key = f"{prefix}.weight_global_scale"
+            if global_key in weights:  # NVFP4
+                global_scale = weights[global_key].astype(mx.float32)
+                new_weights[f"{prefix}.weight"] = value.view(mx.uint32)
+                decoded = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
+                new_weights[f"{prefix}.scales"] = _f32_to_e4m3(decoded / global_scale)
+                native_quant["nvfp4"] = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+            else:  # INT4 symmetric pack-quantized
+                new_weights[f"{prefix}.weight"] = value.view(mx.uint32)
+                new_weights[f"{prefix}.scales"] = scale
+                new_weights[f"{prefix}.biases"] = -(2 ** (int4_bits - 1)) * scale
+                native_quant["affine"] = {
+                    "group_size": int4_group_size,
+                    "bits": int4_bits,
+                    "mode": "affine",
+                }
+            continue
+        if key.endswith(".weight_scale"):
+            prefix = key[: -len(".weight_scale")]
+            if prefix in fp8_prefixes:
+                new_weights[f"{prefix}.weight"] = (
+                    _dequantize_compressed_tensors_fp8_weight(
+                        weights[f"{prefix}.weight"], value
+                    )
+                )
+            # NVFP4 / INT4 scales are consumed with their ``.weight_packed``.
+            continue
+        if key.endswith(".weight") and key[: -len(".weight")] in fp8_prefixes:
+            continue  # emitted (dequantized to dense) at its ``.weight_scale``
+        if any(key.endswith(suffix) for suffix in _COMPRESSED_TENSORS_DROP_SUFFIXES):
+            continue
+        new_weights[key] = value
+
+    if not native_quant:
+        return new_weights, None
+    if len(native_quant) > 1:
+        raise NotImplementedError(
+            "mixed-precision compressed-tensors checkpoint mixes multiple "
+            f"MLX-native quantized modes {sorted(native_quant)}; only one native "
+            "mode alongside dense/fp8 layers is supported."
+        )
+    return new_weights, next(iter(native_quant.values()))
+
+
 def _transform_compressed_tensors_weights(
     weights: Dict[str, mx.array],
     quantization_config: Optional[Dict[str, Any]],
@@ -265,6 +530,12 @@ def _transform_compressed_tensors_weights(
         return weights, None
     if quantization_config.get("quant_method") != "compressed-tensors":
         return weights, None
+
+    # ``mixed-precision`` puts the real formats in per-group ``config_groups``;
+    # route per group (some groups may be dense fp8 with no ``.weight_packed``).
+    if quantization_config.get("format") == "mixed-precision":
+        return _transform_compressed_tensors_mixed_weights(weights, quantization_config)
+
     if not any(key.endswith(".weight_packed") for key in weights):
         return weights, None
 
@@ -336,6 +607,7 @@ def skip_multimodal_module(path: str) -> bool:
         "code_predictor",
         "img_projector",
         "multi_modal_projector",
+        "patch_merge_mlp",
     )
     return any(module in path for module in multimodal_modules)
 
@@ -365,16 +637,25 @@ def get_class_predicate(skip_vision=False, weights=None, quantization_config=Non
     return predicate
 
 
-def get_model_and_args(config: dict):
-    """
-    Retrieve the model object based on the configuration.
+def get_model_and_args(config: dict, model_path: Optional[Path] = None):
+    """Resolve a model package and its normalized model type.
 
-    Args:
-        config (dict): The model configuration.
-
-    Returns:
-        A tuple containing the Model class and the ModelArgs class.
+    If the config declares ``model_file`` and ``model_path`` is provided, the
+    model module is imported from that file inside the checkpoint (the same
+    mechanism mlx_lm supports) instead of the built-in registry.
     """
+    if model_path is not None and (model_file := config.get("model_file")):
+        model_file_path = Path(model_path) / model_file
+        if not model_file_path.is_file():
+            raise FileNotFoundError(
+                f"config.json declares model_file={model_file!r} but "
+                f"{model_file_path} does not exist"
+            )
+        spec = importlib.util.spec_from_file_location("custom_model", model_file_path)
+        arch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(arch)
+        return arch, "custom"
+
     raw_model_type = config.get("model_type") or config.get("speculators_model_type")
     if raw_model_type is None:
         raise KeyError("model_type")
@@ -382,9 +663,19 @@ def get_model_and_args(config: dict):
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
-    is_dflash = config.get("dflash_config", None) is not None
-    if is_dflash:
-        model_type += "_dflash"
+    architectures = set(config.get("architectures") or ())
+    dflash_config = config.get("dflash_config")
+    if "BoundaryExtractor" in architectures:
+        model_type = "gliner2_5"
+    elif "DFlash2DraftModel" in architectures:
+        model_type = "dflash2"
+    elif dflash_config is not None:
+        is_dspark = (
+            dflash_config.get("projector_type") == "dspark"
+            or int(config.get("markov_rank") or dflash_config.get("markov_rank") or 0)
+            > 0
+        )
+        model_type = "dspark" if is_dspark else f"{model_type}_dflash"
 
     last_err: Optional[ImportError] = None
     for pkg in ("mlx_vlm.models", "mlx_vlm.speculative.drafters"):
@@ -397,25 +688,60 @@ def get_model_and_args(config: dict):
             last_err = e
             continue
 
-    if _is_text_only_config(config):
-        arch = importlib.import_module("mlx_vlm.models.text_only")
-        return arch, "text_only"
-
     msg = f"Model type {model_type} not supported. Error: {last_err}"
     logging.error(msg)
     raise ValueError(msg)
 
 
-def _has_config(config: dict, key: str) -> bool:
-    value = config.get(key)
-    return value is not None and value != {}
+def _quantization_path_aliases(
+    path: str, model: Optional[nn.Module] = None
+) -> Tuple[str, ...]:
+    """Return checkpoint quantization keys that may refer to a module path."""
+    aliases = [path]
+    if path.startswith("language_model."):
+        aliases.append(path[len("language_model.") :])
+
+    model_aliases = getattr(model, "quantization_path_aliases", None)
+    if callable(model_aliases):
+        aliases.extend(model_aliases(path))
+
+    return tuple(dict.fromkeys(aliases))
 
 
-def _is_text_only_config(config: dict) -> bool:
-    return not any(
-        _has_config(config, key)
-        for key in ("vision_config", "audio_config", "dflash_config")
-    )
+def _quantization_for_module_path(
+    quantization: dict, path: str, model: Optional[nn.Module] = None
+) -> Optional[dict]:
+    for alias in _quantization_path_aliases(path, model):
+        value = quantization.get(alias)
+        if isinstance(value, dict):
+            return value
+        if value is False:
+            return {}
+    return None
+
+
+def _drop_modules_without_weights(
+    model: nn.Module, weights: dict, declared_keys: Optional[set] = None
+) -> None:
+    """Drop weightless top-level VLM modules the checkpoint manifest also omits."""
+    weighted_modules = {key.partition(".")[0] for key in weights}
+    declared_modules = {key.partition(".")[0] for key in (declared_keys or weights)}
+    dropped_modules = []
+    for name, child in list(model.items()):
+        if name == "language_model" or not isinstance(child, nn.Module):
+            continue
+        if not tree_flatten(child.parameters()) or name in weighted_modules:
+            continue
+        if name in declared_modules:
+            continue
+        setattr(model, name, None)
+        dropped_modules.append(name)
+
+    if dropped_modules:
+        logging.warning(
+            "Checkpoint has no weights for module(s): %s. Disabling them.",
+            ", ".join(dropped_modules),
+        )
 
 
 def get_model_path(
@@ -444,6 +770,7 @@ def get_model_path(
                 allow_patterns=allow_patterns
                 or [
                     "*.json",
+                    "*.jsonl",
                     "*.safetensors",
                     "*.py",
                     "*.model",
@@ -482,12 +809,28 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     strict = kwargs.pop("strict", True)
     config = load_config(model_path, **kwargs)
 
-    # Find all .safetensors files in the model_path, excluding consolidated model weights
-    weight_files = [
-        wf
-        for wf in glob.glob(str(model_path / "*.safetensors"))
-        if not wf.endswith("consolidated.safetensors")
-    ]
+    index_file = model_path / "model.safetensors.index.json"
+    weight_files = []
+    declared_keys: set = set()
+    if index_file.exists():
+        try:
+            with open(index_file) as f:
+                weight_map = json.load(f).get("weight_map", {})
+            declared_keys = set(weight_map)
+            weight_files = [
+                str(model_path / shard)
+                for shard in sorted(set(weight_map.values()))
+                if (model_path / shard).exists()
+            ]
+        except (ValueError, OSError):
+            weight_files = []
+            declared_keys = set()
+    if not weight_files:
+        weight_files = [
+            wf
+            for wf in glob.glob(str(model_path / "*.safetensors"))
+            if not wf.endswith("consolidated.safetensors")
+        ]
 
     if not weight_files:
         logging.error(f"No safetensors found in {model_path}")
@@ -515,10 +858,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(_load_safetensors(wf))
 
-    with safetensors.safe_open(weight_files[0], framework="np") as f:
-        is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
-
-    model_class, _ = get_model_and_args(config=config)
+    model_class, _ = get_model_and_args(config=config, model_path=model_path)
 
     # Initialize text and vision configs if not present
     config.setdefault("text_config", config.pop("llm_config", {}))
@@ -543,37 +883,35 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         if quantization_config is not None:
             config["quantization_config"] = quantization_config
 
-    weights, transformed_quantization = _transform_compressed_tensors_weights(
+    weights, transformed_quantization = _transform_modelopt_nvfp4_weights(
         weights, quantization_config
     )
+    if transformed_quantization is None:
+        weights, transformed_quantization = _transform_compressed_tensors_weights(
+            weights, quantization_config
+        )
     if transformed_quantization is not None:
         config["quantization"] = transformed_quantization
         config["quantization_config"] = transformed_quantization
 
-    if not is_mlx_format:
-        # Sanitize weights
-        weights = sanitize_weights(model, weights)
+    # Sanitize weights
+    weights = sanitize_weights(model, weights)
 
-        if hasattr(model, "thinker") and hasattr(model.thinker, "sanitize"):
-            weights = sanitize_weights(model.thinker, weights)
-            weights = sanitize_weights(model.thinker.vision_tower, weights)
-            weights = sanitize_weights(model.thinker.audio_tower, weights)
-            weights = sanitize_weights(model.thinker.language_model, weights)
-            weights = sanitize_weights(model.code2wav, weights)
-            weights = sanitize_weights(model.talker, weights)
-        else:
-            if hasattr(model_class, "VisionModel"):
-                weights = sanitize_weights(
-                    model_class.VisionModel, weights, model_config.vision_config
-                )
-            if hasattr(model_class, "LanguageModel"):
-                weights = sanitize_weights(
-                    model_class.LanguageModel, weights, model_config.text_config
-                )
-            if hasattr(model_class, "AudioModel"):
-                weights = sanitize_weights(
-                    model_class.AudioModel, weights, model_config.audio_config
-                )
+    if hasattr(model_class, "VisionModel"):
+        if hasattr(model_config, "vision_config"):
+            weights = sanitize_weights(
+                model_class.VisionModel, weights, model_config.vision_config
+            )
+    if hasattr(model_class, "LanguageModel"):
+        if hasattr(model_config, "text_config"):
+            weights = sanitize_weights(
+                model_class.LanguageModel, weights, model_config.text_config
+            )
+    if hasattr(model_class, "AudioModel"):
+        if hasattr(model_config, "audio_config"):
+            weights = sanitize_weights(
+                model_class.AudioModel, weights, model_config.audio_config
+            )
 
     if not has_quantization:
         quantization_config = config.get("quantization_config", None)
@@ -583,18 +921,41 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             if quantization_config is not None:
                 config["quantization_config"] = quantization_config
 
+        if quantization_config is None:
+            hf_quant_path = model_path / "hf_quant_config.json"
+            if hf_quant_path.exists():
+                with open(hf_quant_path) as f:
+                    hf_quant = json.load(f).get("quantization", {})
+                if hf_quant.get("quant_algo") == "NVFP4":
+                    # nvfp4 implies group_size=16
+                    config["quantization"] = config["quantization_config"] = {
+                        "group_size": 16,
+                        "bits": 4,
+                        "mode": "nvfp4",
+                    }
+
         if quantization_config is not None:
             quant_method = quantization_config.get("quant_method")
             quantization = None
             if quant_method == "compressed-tensors":
-                quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+                if quantization_config.get("format") == "mxfp4-pack-quantized":
+                    quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+                else:
+                    quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             elif quant_method == "mxfp4":
                 quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
             elif quant_method == "fp8" and config.get("model_type") == "deepseek_v4":
                 from .models.deepseek_v4.language import make_quantization_config
 
                 quantization = make_quantization_config(model)
-            elif quant_method in ("awq", "gptq", "bitnet"):
+            elif quant_method == "fp8" and config.get("model_type") in {
+                "qwen3_5",
+                "qwen3_5_moe",
+            }:
+                from .models.qwen3_5.fp8 import make_quantization_config
+
+                quantization = make_quantization_config(config)
+            elif quant_method in ("awq", "gptq"):
                 logging.warning(
                     "Quantization method %s is not supported in mlx_vlm.load_model()",
                     quant_method,
@@ -611,16 +972,20 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 config[quantization_key] = quantization_value
 
     if (quantization := config.get("quantization", None)) is not None:
-        # Handle legacy models which may or may not have vision quantized
+        # Handle legacy models which may or may not have vision quantized.
+        # text-only quants of unified VLM families set vision_config to null,
+        # so coerce None to {} to avoid AttributeError on the .get below.
         # TODO: Re-upload the models with the new quantization config and remove this
-        skip_vision = config.get("vision_config", {}).get("skip_vision", False)
-        quantized_model = (
-            model.language_model._model
-            if getattr(model, "_is_text_model", False)
-            else model
-        )
+        skip_vision = (config.get("vision_config") or {}).get("skip_vision", False)
+        quantized_model = model
+
+        # Stock MLX rejects bits=1; route those layers to our Metal kernel.
+        replace_one_bit_modules(quantized_model, quantization, weights)
 
         def get_class_predicate(p, m):
+            per_module_quantization = _quantization_for_module_path(
+                config["quantization"], p, model
+            )
             # Skip legacy multimodal layers unless the checkpoint has quantized
             # tensors for this exact module.
             if (
@@ -629,9 +994,18 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 and not _has_quantized_weights(p, weights)
             ):
                 return False
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
+            # Skip 1-bit layers already replaced above.
+            module_quantization = (
+                per_module_quantization
+                if per_module_quantization is not None
+                else _quantization_for_path(config["quantization"], p)
+            )
+            if module_quantization.get("bits") == 1:
+                return False
+            # Handle custom per-layer quantization, including aliases supplied
+            # by the model.
+            if per_module_quantization is not None:
+                return per_module_quantization
             if not hasattr(m, "to_quantized"):
                 return False
             # Skip layers not divisible by 64
@@ -655,6 +1029,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 "Please use a quantized model with mode 'nvfp4' or 'mxfp8'."
             )
         model = quantize_activations(model)
+
+    _drop_modules_without_weights(model, weights, declared_keys)
 
     model.load_weights(list(weights.items()), strict=strict)
 
@@ -883,10 +1259,23 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
             except json.JSONDecodeError:
                 pass
 
-        return config
-
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"Config not found at {model_path}") from exc
+
+    # GLiNER2.5 ships its encoder config in a sidecar directory instead of
+    # inline, so fold it in alongside the other config files. Raised outside the
+    # block above so the missing file is not reported as a missing config.json.
+    if "BoundaryExtractor" in (config.get("architectures") or ()):
+        if "encoder_config" not in config:
+            encoder_config_path = model_path / "encoder_config" / "config.json"
+            if not encoder_config_path.is_file():
+                raise FileNotFoundError(
+                    f"GLiNER2.5 encoder config not found: {encoder_config_path}"
+                )
+            with open(encoder_config_path, encoding="utf-8") as f:
+                config["encoder_config"] = json.load(f)
+
+    return config
 
 
 def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImageProcessor:
@@ -922,7 +1311,6 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
-
     processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
@@ -943,7 +1331,11 @@ def load_processor(
         )
 
         # Create and assign the StoppingCriteria
-        criteria = StoppingCriteria(final_eos_token_ids, tokenizer_obj)
+        criteria = StoppingCriteria(
+            final_eos_token_ids,
+            tokenizer_obj,
+            additional_eos_token_ids=getattr(processor, "additional_eos_token_ids", ()),
+        )
         if hasattr(processor, "tokenizer"):
             processor.tokenizer.stopping_criteria = criteria
         else:
@@ -1046,8 +1438,7 @@ def upload_to_hub(path: str, upload_repo: str):
     else:
         provenance = ""
 
-    card.text = dedent(
-        f"""
+    card.text = dedent(f"""
         # {upload_repo}
         {provenance}
         ## Use with mlx
@@ -1059,8 +1450,7 @@ def upload_to_hub(path: str, upload_repo: str):
         ```bash
         python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temperature 0.0 --prompt "Describe this image." --image <path_to_image>
         ```
-        """
-    )
+        """)
     card.save(card_path)
 
     api = HfApi()
@@ -1178,7 +1568,7 @@ def save_config(
         json.dump(config, fid, indent=4)
 
 
-def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
+def load_image(image_source: Union[str, Path, BytesIO, Image.Image], timeout: int = 10):
     """
     Helper function to load an image from either a URL, file path, data URI,
     or BytesIO object.
@@ -1187,23 +1577,30 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
 
     original_source = image_source
     try:
-        if not isinstance(image_source, (str, Path, BytesIO)):
+        if isinstance(image_source, Image.Image):
+            image = image_source
+        elif not isinstance(image_source, (str, Path, BytesIO)):
             raise ValueError(
                 f"Unsupported image source type: {type(image_source).__name__}"
             )
-        if isinstance(image_source, str) and image_source.startswith("data:image/"):
-            if "," not in image_source:
-                raise ValueError("Invalid data URI format - missing comma separator")
-            _, data = image_source.split(",", 1)
-            image_source = BytesIO(base64.b64decode(data))
-        if isinstance(image_source, str) and image_source.startswith(
-            ("http://", "https://")
-        ):
-            with requests.get(image_source, stream=True, timeout=timeout) as response:
-                response.raise_for_status()
-                image_source = BytesIO(response.content)
+        else:
+            if isinstance(image_source, str) and image_source.startswith("data:image/"):
+                if "," not in image_source:
+                    raise ValueError(
+                        "Invalid data URI format - missing comma separator"
+                    )
+                _, data = image_source.split(",", 1)
+                image_source = BytesIO(base64.b64decode(data))
+            if isinstance(image_source, str) and image_source.startswith(
+                ("http://", "https://")
+            ):
+                with requests.get(
+                    image_source, stream=True, timeout=timeout
+                ) as response:
+                    response.raise_for_status()
+                    image_source = BytesIO(response.content)
 
-        image = Image.open(image_source)
+            image = Image.open(image_source)
     except ValueError:
         raise
     except Exception as e:
@@ -1225,9 +1622,49 @@ def process_image(img, resize_shape, image_processor):
         img = load_image(img)
     if hasattr(img, "mode") and img.mode != "RGB":
         img = img.convert("RGB")
-    if resize_shape is not None and not isinstance(image_processor, BaseImageProcessor):
-        img = resize_image(img, resize_shape)
+    if resize_shape is not None:
+        if isinstance(image_processor, BaseImageProcessor):
+            # warnings (not logging) so repeated calls in a batch dedupe.
+            warnings.warn(
+                f"resize_shape={resize_shape} is ignored because "
+                f"{type(image_processor).__name__} handles its own image "
+                "sizing; use the processor's sizing options instead."
+            )
+        else:
+            img = resize_image(img, resize_shape)
     return img
+
+
+def estimate_num_image_tokens(processor, height: int, width: int, **size_overrides):
+    """Estimate how many language-model image tokens an image will produce.
+
+    Computed from the processor's own sizing math without loading or
+    processing any pixels, so it is cheap enough to run per candidate image
+    when sizing a prompt budget or choosing a ``max_pixels`` cap.
+
+    Args:
+        processor: A processor (or bare image processor). Wrapped processors
+            are unwrapped via their ``image_processor`` attribute.
+        height: Source image height in pixels.
+        width: Source image width in pixels.
+        **size_overrides: Optional per-call overrides forwarded to the image
+            processor's ``num_image_tokens``, e.g. ``max_pixels=1_000_000``.
+
+    Raises:
+        NotImplementedError: If the image processor does not expose
+            ``num_image_tokens``. Only dynamic-resolution processors support
+            estimation; fixed-resolution models produce a constant token
+            count regardless of image size.
+    """
+    image_processor = getattr(processor, "image_processor", processor)
+    counter = getattr(image_processor, "num_image_tokens", None)
+    if counter is None:
+        raise NotImplementedError(
+            f"{type(image_processor).__name__} does not expose "
+            "num_image_tokens; token estimation is only available for "
+            "dynamic-resolution image processors."
+        )
+    return int(counter(height, width, **size_overrides))
 
 
 def read_audio(file) -> tuple:
@@ -1408,11 +1845,6 @@ def load_audio(
         audio = resample_audio(audio, sample_rate, sr)
     audio = np.asarray(audio, dtype=np.float32)
     return audio.mean(axis=1) if audio.ndim > 1 else audio
-
-
-def normalize_audio_features(features: mx.array) -> mx.array:
-    """Normalize mel spectrogram features for lossy audio formats (e.g., MP3)."""
-    return (features - mx.mean(features)) / (mx.std(features) + 1e-6)
 
 
 def load_video(
@@ -1661,28 +2093,9 @@ def prepare_inputs(
                 images = padded_images
 
     # Process audio
-    audio_inputs = None
-    audio_feature_lengths = None
-    is_qwen3_omni_moe = False
-    processor_class_name = (
-        processor.__class__.__name__ if hasattr(processor, "__class__") else ""
-    )
-    if (
-        "qwen3" in processor_class_name.lower()
-        and "omni" in processor_class_name.lower()
-    ):
-        is_qwen3_omni_moe = True
-
-    is_lossy_audio = False
     if audio is not None and len(audio) > 0:
         if not isinstance(audio, list):
             audio = [audio]
-
-        # Check if any audio file is a lossy format (MP3, AAC, OGG, etc.)
-        lossy_extensions = {".mp3", ".m4a"}
-        is_lossy_audio = any(
-            str(f).lower().endswith(tuple(lossy_extensions)) for f in audio
-        )
 
         if len(audio) > 1:
             print(
@@ -1690,37 +2103,13 @@ def prepare_inputs(
             )
             audio = audio[:1]
 
-        if is_qwen3_omni_moe:
-            audio_arrays = [
-                load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
-                for audio_file in audio
-            ]
-            audio_arrays = [
-                audio_array.astype(np.float32) for audio_array in audio_arrays
-            ]
-
-            feature_extractor = getattr(processor, "feature_extractor", None)
-            if feature_extractor is None:
-                raise ValueError("Processor missing feature_extractor for audio prep.")
-
-            audio_inputs = feature_extractor(
-                audio_arrays,
-                sampling_rate=feature_extractor.sampling_rate,
-                padding=True,
-                return_attention_mask=True,
-            )
-
-            audio_feature_lengths = np.sum(
-                audio_inputs["attention_mask"], axis=-1, dtype=np.int32
-            )
-        else:
-            feature_extractor = getattr(processor, "feature_extractor", None)
-            sr = (
-                getattr(feature_extractor, "sampling_rate", 16000)
-                if feature_extractor is not None
-                else 16000
-            )
-            audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
+        feature_extractor = getattr(processor, "feature_extractor", None)
+        sr = (
+            getattr(feature_extractor, "sampling_rate", 16000)
+            if feature_extractor is not None
+            else 16000
+        )
+        audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
 
     video_fps = None
     if has_videos:
@@ -1795,8 +2184,11 @@ def prepare_inputs(
             inputs["pixel_values"] = inputs["images"]
             inputs.pop("images")
 
+        attention_mask = inputs.get("attention_mask")
         model_inputs["attention_mask"] = (
-            mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
+            attention_mask
+            if attention_mask is None or isinstance(attention_mask, mx.array)
+            else mx.array(attention_mask)
         )
 
         # Convert inputs to model_inputs with mx.array if present
@@ -1808,24 +2200,6 @@ def prepare_inputs(
                     model_inputs[key] = value
                 else:
                     model_inputs[key] = mx.array(value)
-
-    if audio_inputs is not None:
-        model_inputs["input_features"] = mx.array(audio_inputs["input_features"])
-        model_inputs["feature_attention_mask"] = mx.array(
-            audio_inputs["attention_mask"]
-        ).astype(mx.int32)
-        model_inputs["audio_feature_lengths"] = mx.array(
-            audio_feature_lengths, dtype=mx.int32
-        )
-
-    if is_lossy_audio and "input_features" in model_inputs:
-        f = model_inputs["input_features"]
-        if isinstance(f, list):
-            model_inputs["input_features"] = [
-                normalize_audio_features(mx.array(x)) for x in f
-            ]
-        else:
-            model_inputs["input_features"] = normalize_audio_features(f)
 
     return model_inputs
 
@@ -1883,14 +2257,17 @@ def group_images_by_shape(
 
 
 class StoppingCriteria:
-    def __init__(self, eos_token_ids: List[int], tokenizer=None):
-
-        if isinstance(eos_token_ids, int):
-            self.eos_token_ids = [eos_token_ids]
-        else:
-            self.eos_token_ids = list(eos_token_ids)
-
+    def __init__(
+        self,
+        eos_token_ids: List[int],
+        tokenizer=None,
+        additional_eos_token_ids: Optional[List[int]] = None,
+    ):
         self.tokenizer = tokenizer
+        self.additional_eos_token_ids = list(
+            dict.fromkeys(additional_eos_token_ids or ())
+        )
+        self.reset(eos_token_ids)
 
     def add_eos_token_ids(self, new_eos_token_ids: Union[int, List[int]] = None):
         """
@@ -1927,8 +2304,14 @@ class StoppingCriteria:
         if isinstance(eos_token_ids, int):
             eos_token_ids = [eos_token_ids]
 
-        if self.eos_token_ids != eos_token_ids:
-            self.eos_token_ids = eos_token_ids
+        resolved = list(eos_token_ids)
+        resolved.extend(
+            token_id
+            for token_id in self.additional_eos_token_ids
+            if token_id not in resolved
+        )
+        if getattr(self, "eos_token_ids", None) != resolved:
+            self.eos_token_ids = resolved
 
     def __call__(self, input_ids: mx.array) -> bool:
         return input_ids in self.eos_token_ids
@@ -1949,10 +2332,12 @@ class ThinkingBudgetCriteria:
         thinking_end_token: str = "</think>",
         thinking_start_token: Optional[str] = None,
         enable_thinking: bool = False,
+        prompt_preopens_thinking: bool = False,
     ):
         self.tokenizer = tokenizer
         self.thinking_budget = thinking_budget
         self.enable_thinking = enable_thinking
+        self.prompt_preopens_thinking = prompt_preopens_thinking
 
         # Resolve token IDs from strings
         self.thinking_end_token_id = tokenizer.encode(
@@ -1970,14 +2355,14 @@ class ThinkingBudgetCriteria:
         self._forced_sequence.append(self.thinking_end_token_id)
         self._forced_index = 0
 
-        self.in_thinking = self.enable_thinking
+        self.in_thinking = self.enable_thinking and self.prompt_preopens_thinking
         self.thinking_token_count = 0
         self.budget_exceeded = False
         self.forced_token_id = None
 
     def reset_thinking_state(self):
         """Reset thinking state between generations."""
-        self.in_thinking = self.enable_thinking
+        self.in_thinking = self.enable_thinking and self.prompt_preopens_thinking
         self.thinking_token_count = 0
         self.budget_exceeded = False
         self._forced_index = 0
@@ -2008,12 +2393,14 @@ class ThinkingBudgetCriteria:
         self.forced_token_id = None
         return None
 
-    def apply_forced_token(self, next_y: mx.array) -> Optional[mx.array]:
-        if self.forced_token_id is not None and self.enable_thinking:
-            next_y = mx.array([self.forced_token_id])
-            self.forced_token_id = None
-            return next_y
-        return next_y
+    def pop_forced_token_id(self) -> Optional[int]:
+        """Return and clear the pending forced token ID, if any."""
+        if self.forced_token_id is None or not self.enable_thinking:
+            return None
+
+        forced_token_id = self.forced_token_id
+        self.forced_token_id = None
+        return forced_token_id
 
 
 def print_array_report(t: mx.array, label: Optional[str]) -> dict:
@@ -2051,3 +2438,17 @@ def print_array_report(t: mx.array, label: Optional[str]) -> dict:
             print(f" '{key}': {repr(value)},")
     print("}")
     return report
+
+
+def should_add_special_tokens(model_type: str, processor) -> bool:
+    """Return whether tokenization should add markers outside the chat template."""
+    template_owns_markers = {
+        "gemma3",
+        "gemma3n",
+        "gemma4",
+        "gemma4_unified",
+        "laguna",
+    }
+    if model_type not in template_owns_markers:
+        return True
+    return getattr(processor, "chat_template", None) is None

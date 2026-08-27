@@ -266,5 +266,5 @@ All Gemma 4 variants share a common architecture with conditional features:
 - Thinking mode uses `<|channel>...<channel|>` delimiters to separate reasoning from the final answer.
 - Audio uses a Conformer-based encoder with 128-bin mel spectrogram input (16kHz). Audio tokens are dynamically expanded based on duration (~40ms per token, up to 750 tokens).
 - Supported audio formats: WAV, MP3, FLAC, and other formats handled by `soundfile`.
-- The 26B MoE model uses sparse expert routing via `mlx_lm.SwitchGLU` with `mx.gather_mm` — only the top-8 experts are computed per token.
+- The 26B MoE model uses sparse expert routing via `SwitchGLU` with `mx.gather_mm` — only the top-8 experts are computed per token.
 - The 31B dense model is bandwidth-bound at ~5 tok/s on 300 GB/s systems (62.5 GB / 300 GB/s).

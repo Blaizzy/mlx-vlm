@@ -14,11 +14,7 @@ from ..generate import (
     DEFAULT_TOP_P,
     normalize_resize_shape,
 )
-from ..generate.image import (
-    DEFAULT_IMAGE_GUIDANCE,
-    DEFAULT_IMAGE_SIZE,
-    DEFAULT_IMAGE_STEPS,
-)
+from ..generate.image import DEFAULT_IMAGE_SIZE
 
 
 def get_server_max_tokens():
@@ -47,18 +43,18 @@ class ImageGenerationRequest(FlexibleBaseModel):
     )
     width: Optional[int] = Field(None, description="Generated image width.")
     height: Optional[int] = Field(None, description="Generated image height.")
-    steps: int = Field(
-        DEFAULT_IMAGE_STEPS,
+    steps: Optional[int] = Field(
+        None,
         ge=1,
-        description="Number of image generation inference steps.",
+        description="Number of image generation inference steps; model default if omitted.",
     )
     seed: Optional[int] = Field(
         None,
         description="Base seed. Multiple outputs use (seed + i) values.",
     )
-    guidance: float = Field(
-        DEFAULT_IMAGE_GUIDANCE,
-        description="Classifier-free guidance scale.",
+    guidance: Optional[float] = Field(
+        None,
+        description="Classifier-free guidance scale; model default if omitted.",
     )
     auto_json_caption: Optional[bool] = Field(
         None,
@@ -121,18 +117,18 @@ class ImageEditRequest(FlexibleBaseModel):
     )
     width: Optional[int] = Field(None, description="Edited image width.")
     height: Optional[int] = Field(None, description="Edited image height.")
-    steps: int = Field(
-        DEFAULT_IMAGE_STEPS,
+    steps: Optional[int] = Field(
+        None,
         ge=1,
-        description="Number of image edit inference steps.",
+        description="Number of image edit inference steps; model default if omitted.",
     )
     seed: Optional[int] = Field(
         None,
         description="Base seed. Multiple outputs use (seed + i) values.",
     )
-    guidance: float = Field(
-        DEFAULT_IMAGE_GUIDANCE,
-        description="Classifier-free guidance scale.",
+    guidance: Optional[float] = Field(
+        None,
+        description="Classifier-free guidance scale; model default if omitted.",
     )
     response_format: Literal["b64_json", "path"] = Field(
         "b64_json",
@@ -202,11 +198,9 @@ class ResponseInputImageParam(TypedDict, total=False):
     type: Required[
         Literal["input_image"]
     ]  # The type of the input item. Always `input_image`.
-    image_url: Required[str]
+    image_url: Optional[str]
     file_id: Optional[str]
-    """The ID of the file to be sent to the model.
-     NOTE : wouldn't this help the model if we passed the file_id as well to the vlm models
-    """
+    """A file reference. This server currently rejects file IDs."""
 
 
 class InputAudio(TypedDict, total=False):
@@ -232,6 +226,26 @@ class ResponseImageUrlParam(TypedDict, total=False):
     image_url: Required[ImageUrl]
 
 
+class VideoUrl(TypedDict, total=False):
+    url: Required[str]
+
+
+class ResponseInputVideoParam(TypedDict, total=False):
+    type: Required[Literal["input_video"]]
+    video_url: Required[Union[str, VideoUrl]]
+    video: Optional[str]
+
+
+class ResponseVideoUrlParam(TypedDict, total=False):
+    type: Required[Literal["video_url"]]
+    video_url: Required[Union[str, VideoUrl]]
+
+
+class ResponseVideoParam(TypedDict, total=False):
+    type: Required[Literal["video"]]
+    video: Required[str]
+
+
 ResizeShapeInput: TypeAlias = Union[Tuple[int], Tuple[int, int]]
 
 ResponseInputContentParam: TypeAlias = Union[
@@ -239,6 +253,9 @@ ResponseInputContentParam: TypeAlias = Union[
     ResponseInputImageParam,
     ResponseImageUrlParam,
     ResponseInputAudioParam,
+    ResponseInputVideoParam,
+    ResponseVideoUrlParam,
+    ResponseVideoParam,
 ]
 
 ResponseInputMessageContentListParam: TypeAlias = List[ResponseInputContentParam]
@@ -315,6 +332,15 @@ class OpenAIRequest(FlexibleBaseModel):
     top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
     top_k: int = Field(0, description="Top-k sampling.")
     min_p: float = Field(0.0, description="Min-p sampling.")
+    top_n_sigma: float = Field(
+        0.0, description="Top-nσ sampling. 0 disables; typical ~0.5-2.0."
+    )
+    p_less: bool = Field(
+        False, description="Hyperparameter-free p-less sampling (on/off)."
+    )
+    typical_p: float = Field(
+        1.0, description="Locally typical sampling. 1.0 disables; typical ~0.2-0.95."
+    )
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     repetition_context_size: Optional[int] = Field(
         None, description="Repetition penalty context size."
@@ -334,6 +360,14 @@ class OpenAIRequest(FlexibleBaseModel):
             "Override server thinking mode for this request. If omitted, the "
             "server default set by --enable-thinking is used."
         ),
+    )
+    reasoning: Optional[Any] = Field(
+        None,
+        description="OpenAI Responses API reasoning configuration.",
+    )
+    reasoning_effort: Optional[str] = Field(
+        None,
+        description="OpenAI-compatible reasoning effort.",
     )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
@@ -408,6 +442,12 @@ class GenerationTimings(BaseModel):
     predicted_per_token_ms: float
     predicted_per_second: float
     peak_memory: float = 0.0
+    # Speculative decoding stats, following the llama.cpp server timings
+    # field names; None unless the request ran with a drafter.
+    draft_kind: Optional[str] = None
+    draft_rounds: Optional[int] = None
+    draft_n: Optional[int] = None
+    draft_n_accepted: Optional[int] = None
 
     @staticmethod
     def _derive_gen_tps(token_times: List[float]) -> Optional[float]:
@@ -423,9 +463,11 @@ class GenerationTimings(BaseModel):
         prompt_tokens: int,
         output_tokens: int,
     ) -> "GenerationTimings":
-        generation_tps = metrics.generation_tps or cls._derive_gen_tps(
-            metrics.token_times
-        )
+        generation_tps = getattr(metrics, "rate", None)
+        if generation_tps is None:
+            generation_tps = metrics.generation_tps or cls._derive_gen_tps(
+                metrics.token_times
+            )
         cached_tokens = metrics.cached_tokens
         prompt_n = max(0, int(prompt_tokens) - int(cached_tokens))
         prompt_s = prompt_tokens / metrics.prompt_tps if metrics.prompt_tps else 0.0
@@ -446,7 +488,17 @@ class GenerationTimings(BaseModel):
             ),
             predicted_per_second=float(generation_tps or 0.0),
             peak_memory=float(metrics.peak_memory or 0.0),
+            draft_kind=getattr(metrics, "draft_kind", None),
+            draft_rounds=getattr(metrics, "draft_rounds", None),
+            draft_n=getattr(metrics, "draft_n", None),
+            draft_n_accepted=getattr(metrics, "draft_n_accepted", None),
         )
+
+
+class StreamingTimings(BaseModel):
+    """Timing data available while a response is still streaming."""
+
+    predicted_per_second: Optional[float] = None
 
 
 class OpenAIErrorObject(BaseModel):
@@ -560,6 +612,7 @@ class ResponseOutputTextDeltaEvent(BaseStreamEvent):
     output_index: int
     content_index: int
     delta: str
+    timings: StreamingTimings
 
 
 class ResponseOutputTextDoneEvent(BaseStreamEvent):
@@ -568,6 +621,7 @@ class ResponseOutputTextDoneEvent(BaseStreamEvent):
     output_index: int
     content_index: int
     text: str
+    timings: StreamingTimings
 
 
 class ResponseContentPartDoneEvent(BaseStreamEvent):
@@ -617,12 +671,75 @@ class VLMRequest(FlexibleBaseModel):
         default_factory=get_server_max_tokens,
         description="Maximum number of tokens to generate.",
     )
+    max_denoising_steps: Optional[int] = Field(
+        None,
+        description="Maximum denoising steps for diffusion generation.",
+    )
+    block_length: Optional[int] = Field(
+        None,
+        description="Block length for masked diffusion text generation.",
+    )
+    num_to_transfer: Optional[int] = Field(
+        None,
+        description="Target number of masked tokens to transfer per diffusion step.",
+    )
+    max_transfer_per_step: Optional[int] = Field(
+        None,
+        description="Maximum masked tokens to transfer per diffusion step.",
+    )
+    editing_threshold: Optional[float] = Field(
+        None,
+        description="Confidence threshold for masked diffusion post-fill edits.",
+    )
+    max_post_steps: Optional[int] = Field(
+        None,
+        description="Maximum masked diffusion post-fill editing steps per block.",
+    )
+    stability_steps: Optional[int] = Field(
+        None,
+        description="Stop masked diffusion post-fill refinement after stable steps.",
+    )
+    diffusion_full_canvas: Optional[bool] = Field(
+        None,
+        description="Use the checkpoint canvas length for diffusion generation.",
+    )
+    diffusion_min_canvas_length: Optional[int] = Field(
+        None,
+        description="Minimum active canvas length for diffusion generation.",
+    )
+    diffusion_max_canvas_length: Optional[int] = Field(
+        None,
+        description="Maximum active canvas length for diffusion generation.",
+    )
+    diffusion_sampler: Optional[Literal["entropy-bound", "confidence-threshold"]] = (
+        Field(
+            None,
+            description="Canvas update sampler for diffusion generation.",
+        )
+    )
+    threshold: Optional[float] = Field(
+        None,
+        description="Token probability threshold for diffusion confidence transfer.",
+    )
+    min_threshold: Optional[float] = Field(
+        None,
+        description="Lowest token probability threshold for masked diffusion transfer.",
+    )
     temperature: float = Field(
         DEFAULT_TEMPERATURE, description="Temperature for sampling."
     )
     top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
     top_k: int = Field(0, description="Top-k sampling.")
     min_p: float = Field(0.0, description="Min-p sampling.")
+    top_n_sigma: float = Field(
+        0.0, description="Top-nσ sampling. 0 disables; typical ~0.5-2.0."
+    )
+    p_less: bool = Field(
+        False, description="Hyperparameter-free p-less sampling (on/off)."
+    )
+    typical_p: float = Field(
+        1.0, description="Locally typical sampling. 1.0 disables; typical ~0.2-0.95."
+    )
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     repetition_context_size: Optional[int] = Field(
@@ -643,6 +760,14 @@ class VLMRequest(FlexibleBaseModel):
             "Override server thinking mode for this request. If omitted, the "
             "server default set by --enable-thinking is used."
         ),
+    )
+    reasoning: Optional[Any] = Field(
+        None,
+        description="OpenAI-compatible reasoning configuration.",
+    )
+    reasoning_effort: Optional[str] = Field(
+        None,
+        description="OpenAI-compatible reasoning effort.",
     )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
@@ -718,6 +843,13 @@ class StreamOptions(BaseModel):
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
     stream_options: Optional[StreamOptions] = None
+    tools: Optional[List[Any]] = Field(None, description="Tools the model may call.")
+    tool_choice: Optional[Any] = Field(
+        None,
+        description=(
+            "Controls tool use: none, auto, required, or a specific function."
+        ),
+    )
 
 
 class TopLogprob(BaseModel):
@@ -768,7 +900,7 @@ class ChatStreamChunk(BaseModel):
     model: str = ""
     choices: List[ChatStreamChoice] = []
     usage: Optional[UsageStats] = None
-    timings: Optional[GenerationTimings] = None
+    timings: Optional[Union[GenerationTimings, StreamingTimings]] = None
 
 
 # Models for Anthropic-compatible /v1/messages endpoint

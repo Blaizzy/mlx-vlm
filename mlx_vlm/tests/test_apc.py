@@ -50,7 +50,7 @@ def _assert_allclose(a: mx.array, b: mx.array) -> None:
 
 
 def _make_exact_row_cache(prefix_len: int):
-    from mlx_lm.models.cache import ArraysCache, KVCache
+    from mlx_vlm.models.cache import ArraysCache, KVCache
 
     arrays = ArraysCache(size=2)
     arrays.cache = [
@@ -78,6 +78,19 @@ def test_hash_chain_and_image_hash_are_deterministic():
     assert hash_image_payload(None, None) == 0
     assert hash_image_payload(image_ref=["a.png", "b.png"]) == hash_image_payload(
         image_ref=["a.png", "b.png"]
+    )
+
+
+def test_image_hash_preserves_tensor_shape_and_dtype():
+    flat_values = mx.arange(12, dtype=mx.float32)
+    first_shape = flat_values.reshape(1, 3, 2, 2)
+    second_shape = flat_values.reshape(1, 3, 1, 4)
+
+    assert hash_image_payload(pixel_values=first_shape) != hash_image_payload(
+        pixel_values=second_shape
+    )
+    assert hash_image_payload(pixel_values=first_shape) != hash_image_payload(
+        pixel_values=first_shape.astype(mx.float16)
     )
 
 
@@ -256,7 +269,7 @@ def test_layer_major_memory_threshold_skips_block_pool(monkeypatch):
 
 
 def test_exact_batch_cache_merge_and_extract_supports_arrays_and_kv():
-    from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
+    from mlx_vlm.models.cache import ArraysCache, BatchKVCache, KVCache
 
     warm = _make_exact_row_cache(12)
     cold = _make_exact_row_cache(0)
@@ -293,11 +306,10 @@ def test_exact_batch_cache_merge_and_extract_supports_arrays_and_kv():
 
 
 def test_single_row_prompt_batch_exact_checkpoint_stores_without_extract():
-    from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
-
     from mlx_vlm.generate.ar import PromptProcessingBatch
+    from mlx_vlm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
-    token_ids = list(range(12))
+    token_ids = list(range(32))
     arrays = ArraysCache(size=1)
     arrays[0] = mx.ones((1, 3, 5))
     kv = KVCache()
@@ -360,6 +372,20 @@ def test_apc_max_pool_tensors_keeps_disk_persistence(tmp_path, monkeypatch):
     assert matched_tokens == len(token_ids)
     assert manager.stats_snapshot()["pool_used"] == 0
     manager.close()
+
+
+def test_disk_store_clears_each_writer_threads_streams(tmp_path, monkeypatch):
+    cleared_threads = []
+    monkeypatch.setattr(
+        apc_module,
+        "clear_mlx_streams",
+        lambda: cleared_threads.append(apc_module.threading.current_thread().name),
+    )
+
+    disk = DiskBlockStore(tmp_path, namespace="worker-cleanup", num_workers=2)
+    disk.close()
+
+    assert sorted(cleared_threads) == ["apc-disk-0", "apc-disk-1"]
 
 
 def test_disk_store_recovers_when_cache_dir_is_deleted(tmp_path):
@@ -519,7 +545,7 @@ def test_make_warm_batch_kv_cache_single_row_shapes():
 
 
 def test_exact_cache_supports_mixed_kv_and_arrays_cache():
-    from mlx_lm.models.cache import ArraysCache, KVCache
+    from mlx_vlm.models.cache import ArraysCache, KVCache
 
     block_size = 16
     manager = APCManager(num_blocks=4, block_size=block_size)
@@ -559,7 +585,7 @@ def test_exact_cache_supports_mixed_kv_and_arrays_cache():
 
 
 def test_exact_cache_supports_rotating_and_chunked_kv_cache():
-    from mlx_lm.models.cache import ChunkedKVCache, KVCache, RotatingKVCache
+    from mlx_vlm.models.cache import ChunkedKVCache, KVCache, RotatingKVCache
 
     block_size = 16
     manager = APCManager(num_blocks=4, block_size=block_size)
@@ -610,7 +636,7 @@ def test_exact_cache_supports_rotating_and_chunked_kv_cache():
 
 
 def test_exact_cache_disk_restore_rebuilds_index(tmp_path, monkeypatch):
-    from mlx_lm.models.cache import ArraysCache, KVCache
+    from mlx_vlm.models.cache import ArraysCache, KVCache
 
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
 
@@ -650,7 +676,7 @@ def test_exact_cache_disk_restore_rebuilds_index(tmp_path, monkeypatch):
 
 
 def test_exact_cache_disk_restore_preserves_rotating_kv(tmp_path, monkeypatch):
-    from mlx_lm.models.cache import KVCache, RotatingKVCache
+    from mlx_vlm.models.cache import KVCache, RotatingKVCache
 
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
 
@@ -692,7 +718,7 @@ def test_exact_cache_disk_restore_preserves_rotating_kv(tmp_path, monkeypatch):
 
 
 def test_model_apc_mode_distinguishes_block_and_exact_custom_cache():
-    from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
+    from mlx_vlm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
     assert model_apc_mode(object()) == "block"
 
@@ -901,7 +927,7 @@ def test_adjust_prefix_returns_zero_when_no_text_suffix_remains():
 def test_exact_disk_hit_is_promoted_to_memory(tmp_path, monkeypatch):
     """After a disk restore, the entry is written to _exact_cache so the next
     identical request is served from memory (disk_hits stays unchanged)."""
-    from mlx_lm.models.cache import KVCache
+    from mlx_vlm.models.cache import KVCache
 
     token_ids = list(range(40))
     kv = KVCache()
@@ -946,7 +972,7 @@ def test_exact_disk_hit_is_promoted_to_memory(tmp_path, monkeypatch):
 
 def test_exact_disk_hit_promotion_skipped_when_memory_disabled(tmp_path, monkeypatch):
     """When _exact_cache_max == 0 the disk hit still works; no promotion attempted."""
-    from mlx_lm.models.cache import KVCache
+    from mlx_vlm.models.cache import KVCache
 
     token_ids = list(range(20))
     kv = KVCache()
@@ -983,7 +1009,7 @@ def test_exact_disk_hit_promotion_lru_eviction(tmp_path, monkeypatch):
     """When _exact_cache_max=1 and a second distinct prefix is promoted, the
     first promoted entry is evicted from memory and subsequent requests for it
     go back to disk."""
-    from mlx_lm.models.cache import KVCache
+    from mlx_vlm.models.cache import KVCache
 
     def _make_kv(val, n):
         kv = KVCache()
@@ -1038,7 +1064,7 @@ def test_exact_lookup_memory_takes_priority_over_disk(tmp_path, monkeypatch):
     (skip insert if key already present) is implicitly exercised: because
     store_exact_cache writes to both memory and disk, any subsequent lookup
     hits memory first and never triggers a disk read."""
-    from mlx_lm.models.cache import KVCache
+    from mlx_vlm.models.cache import KVCache
 
     token_ids = list(range(30))
 
@@ -1086,7 +1112,7 @@ def test_exact_disk_hit_promotion_clone_is_independent_of_returned_cache(
     """The clone stored in _exact_cache must be a separate object from the
     cache returned to the caller.  Simulating token-generation mutations on the
     returned cache (advancing offset) must not corrupt the stored entry."""
-    from mlx_lm.models.cache import KVCache
+    from mlx_vlm.models.cache import KVCache
 
     token_ids = list(range(25))
     kv = KVCache()
@@ -1130,7 +1156,7 @@ def test_exact_disk_hit_promotion_with_nonzero_extra_hash(tmp_path, monkeypatch)
     """Promotion must use the correct key when extra_hash != 0, so the
     promoted entry is found on subsequent lookups with the same extra_hash and
     not accidentally served for a different extra_hash."""
-    from mlx_lm.models.cache import KVCache
+    from mlx_vlm.models.cache import KVCache
 
     token_ids = list(range(30))
     kv = KVCache()
@@ -1169,3 +1195,50 @@ def test_exact_disk_hit_promotion_with_nonzero_extra_hash(tmp_path, monkeypatch)
     assert warm_wrong is None
 
     manager.close()
+
+
+def _tiny_exact_cache(tokens):
+    from mlx_vlm.models.cache import ArraysCache
+
+    c = ArraysCache(size=1)
+    c[0] = mx.zeros((1, 2, max(1, len(tokens)), 32))
+    return [c]
+
+
+def test_a_short_first_prompt_does_not_store_a_one_token_snapshot():
+    manager = APCManager(num_blocks=8, block_size=16)
+    short = [1, 2, 3]
+
+    desired = len(short) - manager.exact_cache_guard_tokens
+    prefix_len = apc_module.adjust_prefix_to_text_suffix_boundary(short, desired, [])
+
+    assert prefix_len == 0
+    assert not manager.store_exact_cache(short[:1], _tiny_exact_cache(short[:1]))
+
+
+def test_a_short_prompt_cannot_poison_later_lookups():
+    manager = APCManager(num_blocks=8, block_size=16)
+    manager.store_exact_cache([1], _tiny_exact_cache([1]))
+
+    later = list(range(1, 400))
+    cache, reused = manager.lookup_exact_cache(later)
+
+    assert cache is None
+    assert reused == 0
+
+
+def test_a_useful_prefix_is_still_stored():
+    manager = APCManager(num_blocks=8, block_size=16)
+    tokens = list(range(1, 200))
+
+    assert manager.store_exact_cache(tokens[:128], _tiny_exact_cache(tokens[:128]))
+
+    cache, reused = manager.lookup_exact_cache(tokens)
+    assert cache is not None
+    assert reused == 128
+
+
+def test_positive_desired_prefix_is_unchanged():
+    tokens = list(range(1, 100))
+
+    assert apc_module.adjust_prefix_to_text_suffix_boundary(tokens, 40, []) == 40

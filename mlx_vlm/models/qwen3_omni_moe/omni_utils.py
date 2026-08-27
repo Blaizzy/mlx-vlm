@@ -62,8 +62,21 @@ def prepare_omni_inputs(
         "feature_attention_mask" in model_inputs
         and "audio_feature_lengths" not in model_inputs
     ):
-        model_inputs["audio_feature_lengths"] = (
-            model_inputs["feature_attention_mask"].sum(axis=1).astype(mx.int32)
-        )
+        mask = model_inputs["feature_attention_mask"]
+        lengths = mask.sum(axis=1)
+        # feature_attention_mask is sample-domain, while the audio encoder counts
+        # mel frames; convert each item's length via the mask/mel hop ratio so
+        # audio_feature_lengths matches the encoder's true frame count. Otherwise
+        # the sample-domain length (~160x too large) is forwarded to the model,
+        # which skips the mel-frame conversion in Thinker.get_audio_features and
+        # blows up the audio position/placeholder tensors (see #1620). This mirrors
+        # the same conversion already done in the processor and thinker.
+        input_features = model_inputs.get("input_features")
+        if input_features is not None:
+            mel_frames = input_features.shape[-1]
+            mask_len = mask.shape[-1]
+            if mask_len > mel_frames:
+                lengths = lengths // (mask_len // mel_frames)
+        model_inputs["audio_feature_lengths"] = lengths.astype(mx.int32)
 
     return model_inputs, text

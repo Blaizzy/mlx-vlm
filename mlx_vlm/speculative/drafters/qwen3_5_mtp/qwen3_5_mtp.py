@@ -1,3 +1,4 @@
+import re
 from dataclasses import replace
 from typing import Any, List, Optional
 
@@ -6,6 +7,7 @@ import mlx.nn as nn
 
 from ....models.base import create_attention_mask
 from ....models.cache import BatchKVCache, KVCache
+from ....models.qwen3_5.fp8 import convert_qwen_fp8_weights
 from ....models.qwen3_5.language import Qwen3_5DecoderLayer
 from ....models.qwen3_5_moe.language import Qwen3_5MoeDecoderLayer
 from .config import Qwen3_5MTPConfig
@@ -468,21 +470,6 @@ class Qwen3_5MTPDraftModel(nn.Module):
 
     def sanitize(self, weights: dict) -> dict:
         out = {}
-        weights = dict(weights)
-        expert_prefixes = [
-            key[: -len(".experts.gate_up_proj")]
-            for key in weights
-            if key.endswith(".experts.gate_up_proj")
-        ]
-        for prefix in expert_prefixes:
-            gate_up_weight = weights.pop(f"{prefix}.experts.gate_up_proj")
-            gate_weight, up_weights = mx.split(gate_up_weight, 2, axis=-2)
-            weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight
-            weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_weights
-            weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
-                f"{prefix}.experts.down_proj"
-            )
-
         norm_suffixes = (
             ".input_layernorm.weight",
             ".post_attention_layernorm.weight",
@@ -493,10 +480,64 @@ class Qwen3_5MTPDraftModel(nn.Module):
             "pre_fc_norm_hidden.weight",
         )
         for key, value in weights.items():
-            if key.startswith("mtp."):
+            is_hf_layout = key.startswith("mtp.")
+            if is_hf_layout:
                 key = key[len("mtp.") :]
-            if any(key.endswith(suffix) for suffix in norm_suffixes):
+            if is_hf_layout and any(key.endswith(suffix) for suffix in norm_suffixes):
                 if value.ndim == 1 and mx.issubdtype(value.dtype, mx.floating):
                     value = value + 1.0
             out[key] = value
+        out = convert_qwen_fp8_weights(out)
+
+        expert_prefixes = [
+            key[: -len(".experts.gate_up_proj")]
+            for key in out
+            if key.endswith(".experts.gate_up_proj")
+        ]
+        for prefix in expert_prefixes:
+            gate_up_key = f"{prefix}.experts.gate_up_proj"
+            gate_up_weight = out.pop(gate_up_key)
+            gate_weight, up_weight = mx.split(gate_up_weight, 2, axis=-2)
+            out[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight
+            out[f"{prefix}.switch_mlp.up_proj.weight"] = up_weight
+
+            gate_up_scales_key = f"{gate_up_key}_scales"
+            if gate_up_scales_key in out:
+                gate_scales, up_scales = mx.split(
+                    out.pop(gate_up_scales_key), 2, axis=-2
+                )
+                out[f"{prefix}.switch_mlp.gate_proj.scales"] = gate_scales
+                out[f"{prefix}.switch_mlp.up_proj.scales"] = up_scales
+
+            down_key = f"{prefix}.experts.down_proj"
+            out[f"{prefix}.switch_mlp.down_proj.weight"] = out.pop(down_key)
+            if f"{down_key}_scales" in out:
+                out[f"{prefix}.switch_mlp.down_proj.scales"] = out.pop(
+                    f"{down_key}_scales"
+                )
+
+        pattern = re.compile(
+            r"(.*\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\."
+            r"(weight|scales|biases)$"
+        )
+        groups = {}
+        for key in out:
+            if match := pattern.fullmatch(key):
+                expert_prefix, expert, projection, suffix = match.groups()
+                groups.setdefault((expert_prefix, projection, suffix), {})[
+                    int(expert)
+                ] = key
+
+        for (expert_prefix, projection, suffix), expert_keys in groups.items():
+            experts = sorted(expert_keys)
+            if experts != list(range(len(experts))):
+                raise ValueError(
+                    f"Qwen MTP expert indexes are not contiguous for {expert_prefix}: "
+                    f"{experts}."
+                )
+            base = expert_prefix[: -len(".experts")]
+            out[f"{base}.switch_mlp.{projection}.{suffix}"] = mx.stack(
+                [out.pop(expert_keys[expert]) for expert in experts]
+            )
+
         return out

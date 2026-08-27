@@ -8,6 +8,7 @@ on:
 jobs:
   test:
     runs-on: macos-14
+    timeout-minutes: 30
 
     steps:
       - name: Checkout code
@@ -17,10 +18,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-
-      - name: Install MLX
-        run: |
-          pip install mlx>=0.15
 
       - name: Install pre-commit
         run: |
@@ -39,4 +36,4 @@ jobs:
       - name: Run Python tests
         run: |
           cd mlx_vlm/
-          pytest -s ./tests --ignore=tests/test_smoke.py --ignore=tests/test_utils.py
+          pytest -s ./tests --ignore=tests/test_smoke.py

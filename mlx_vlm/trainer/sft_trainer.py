@@ -1,5 +1,6 @@
 # Copyright © 2026 MLX-VLM
 
+import logging
 import time
 from dataclasses import dataclass, field
 from functools import partial
@@ -46,6 +47,21 @@ def _collate_arrays(values):
         ):
             return mx.concatenate(values, axis=0)
         raise
+
+
+def _collate_grid_thw(values):
+    """Pack per-example image/video grids as (total_media, 3)."""
+    rows = []
+    for value in values:
+        value = value if isinstance(value, mx.array) else mx.array(value)
+        if value.ndim == 1:
+            value = value[None, :]
+        if value.ndim != 2 or value.shape[1] != 3:
+            raise ValueError(
+                f"Expected grid_thw values with shape (num_media, 3), got {value.shape}"
+            )
+        rows.append(value)
+    return mx.concatenate(rows, axis=0)
 
 
 @dataclass
@@ -202,6 +218,33 @@ def vision_language_loss_fn(
     return (ce * loss_mask).sum() / mx.maximum(loss_mask.sum(), 1)
 
 
+def _dataset_image_token_id(dataset):
+    """The placeholder token id a vision dataset expands one image feature into.
+
+    Returns ``None`` for text-only datasets, which are never image-aligned and so
+    are unaffected by the truncation guard below.
+    """
+    config = getattr(dataset, "config", None)
+    if not isinstance(config, dict):
+        return None
+    token_id = config.get("image_token_index") or config.get("image_token_id")
+    return int(token_id) if token_id else None
+
+
+def _drops_image_tokens(input_ids, image_token_id, max_seq_length):
+    """True when truncating to ``max_seq_length`` would cut image placeholders.
+
+    The model derives one image feature per placeholder token from
+    ``pixel_values``, which truncation does not shrink. Losing placeholders
+    therefore breaks the feature/token alignment the model asserts on.
+    """
+    if image_token_id is None or len(input_ids) <= max_seq_length:
+        return False
+    kept = int((input_ids[:max_seq_length] == image_token_id).sum())
+    total = int((input_ids == image_token_id).sum())
+    return kept != total
+
+
 def iterate_batches(dataset, batch_size, max_seq_length, train=False):
     indices = list(range(len(dataset)))
     if len(dataset) < batch_size:
@@ -216,14 +259,49 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
         for i in range(0, len(indices) - batch_size + 1, batch_size)
     ]
 
+    image_token_id = _dataset_image_token_id(dataset)
+    warned_indices = set()
+
     while True:
         order = (
             np.random.permutation(len(batch_indices))
             if train
             else range(len(batch_indices))
         )
+        yielded_any = False
         for b in order:
             items = [dataset[idx] for idx in batch_indices[b]]
+
+            # Drop examples whose image placeholders would not survive truncation:
+            # pixel_values keeps every sub-image, so training on them would fail the
+            # model's feature/token alignment check.
+            if image_token_id is not None:
+                kept = []
+                for idx, item in zip(batch_indices[b], items):
+                    input_ids = np.array(
+                        _squeeze_leading_batch_dim(item["input_ids"])
+                    ).reshape(-1)
+                    if _drops_image_tokens(input_ids, image_token_id, max_seq_length):
+                        if idx not in warned_indices:
+                            warned_indices.add(idx)
+                            total = int((input_ids == image_token_id).sum())
+                            fits = int(
+                                (input_ids[:max_seq_length] == image_token_id).sum()
+                            )
+                            logging.warning(
+                                f"Skipping example {idx}: its {total} image tokens do "
+                                f"not fit in max_seq_length={max_seq_length} (only "
+                                f"{fits} would remain). Raise max_seq_length or use a "
+                                "lower image resolution to train on this example."
+                            )
+                        continue
+                    kept.append(item)
+                if not kept:
+                    # Every example here was skipped; move on rather than failing
+                    # the run, since other batches may still be trainable.
+                    continue
+                items = kept
+
             lengths = [
                 min(_flat_seq_len(x["input_ids"]), max_seq_length) for x in items
             ]
@@ -285,6 +363,10 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                 )
             ]
             for k in extra_keys:
+                if k in ("image_grid_thw", "video_grid_thw"):
+                    batch[k] = _collate_grid_thw([item[k] for item in items])
+                    continue
+
                 vals = [_squeeze_leading_batch_dim(item[k]) for item in items]
                 if isinstance(vals[0], mx.array):
                     try:
@@ -294,7 +376,15 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                 else:
                     batch[k] = vals[0]
 
+            yielded_any = True
             yield batch
+
+        if not yielded_any:
+            raise ValueError(
+                "No trainable examples: every example has more image tokens than "
+                f"max_seq_length={max_seq_length} allows. Raise max_seq_length or "
+                "lower the image resolution."
+            )
         if not train:
             break
 

@@ -5,6 +5,11 @@ import mlx.nn as nn
 import numpy as np
 
 from ..base import InputEmbeddingsFeatures
+from ..qwen3_5.qwen3_5 import (
+    NORM_WEIGHT_SUFFIXES,
+    should_offset_norm_weight,
+    should_shift_norm_weights,
+)
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel, check_array_shape
@@ -423,23 +428,22 @@ class Model(nn.Module):
         return output
 
     def sanitize(self, weights):
+        shift_norm_weights = should_shift_norm_weights(weights)
         sanitized_weights = {}
-        norm_keys = (
-            ".input_layernorm.weight",
-            ".post_attention_layernorm.weight",
-            "model.norm.weight",
-            ".q_norm.weight",
-            ".k_norm.weight",
-        )
 
         for key, value in weights.items():
+            original_key = key
             # MiniCPM-V 4.6 checkpoint namespaces are prefixed with `model.`
             # and split across language_model / vision_tower / merger.
             if key.startswith("model."):
                 key = key.replace("model.", "", 1)
 
             mapped_key = None
-            if key.startswith("language_model."):
+            if key.startswith("language_model.model."):
+                mapped_key = key
+            elif key.startswith("language_model.lm_head."):
+                mapped_key = key
+            elif key.startswith("language_model."):
                 mapped_key = key.replace("language_model.", "language_model.model.", 1)
             elif key.startswith("lm_head."):
                 mapped_key = key.replace("lm_head.", "language_model.lm_head.", 1)
@@ -452,6 +456,10 @@ class Model(nn.Module):
             elif key.startswith("vit_merger.") or key.startswith("merger."):
                 mapped_key = key
             # Backward compatibility with older naming schemes.
+            elif key.startswith("llm.model."):
+                mapped_key = key.replace("llm.model.", "language_model.model.", 1)
+            elif key.startswith("llm.lm_head."):
+                mapped_key = key.replace("llm.", "language_model.", 1)
             elif key.startswith("llm."):
                 mapped_key = key.replace("llm.", "language_model.model.", 1)
             elif key.startswith("visual."):
@@ -473,9 +481,13 @@ class Model(nn.Module):
                 "embeddings.patch_embedding.weight"
             ) and not check_array_shape(value):
                 value = value.transpose(0, 2, 3, 1)
-            if any(key.endswith(suffix) for suffix in norm_keys) and value.ndim == 1:
+            if (
+                original_key.startswith("model.language_model.")
+                and should_offset_norm_weight(original_key, shift_norm_weights)
+                and any(key.endswith(suffix) for suffix in NORM_WEIGHT_SUFFIXES)
+                and value.ndim == 1
+            ):
                 value = value + 1.0
-
             sanitized_weights[key] = value
 
         if self.config.text_config.tie_word_embeddings:

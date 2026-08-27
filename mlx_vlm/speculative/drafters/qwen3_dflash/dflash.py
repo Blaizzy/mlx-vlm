@@ -2,19 +2,22 @@ from typing import List
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import KVCache
-from mlx_lm.models.qwen3 import MLP as Qwen3MLP
-from mlx_lm.models.rope_utils import initialize_rope
 
-from ....models.cache import BufferedRotatingKVCache, RotatingKVCache
+from ....models.activations import swiglu
+from ....models.cache import BufferedRotatingKVCache, KVCache, RotatingKVCache
+from ....models.rope_utils import initialize_rope
 from .config import DFlashConfig
 
 
 def _build_rope(config: DFlashConfig):
+    # Qwen-family checkpoints normally use split-half (NeoX) pairing. DSpark
+    # checkpoints expose rope_is_neox_style explicitly; MLX calls the
+    # interleaved GPT-J pairing "traditional".
+    traditional = not bool(getattr(config, "rope_is_neox_style", True))
     return initialize_rope(
         dims=config.head_dim,
         base=config.rope_theta,
-        traditional=False,
+        traditional=traditional,
         scaling_config=config.rope_scaling,
         max_position_embeddings=config.max_position_embeddings,
     )
@@ -90,6 +93,19 @@ class DFlashAttention(nn.Module):
         return self.o_proj(o.transpose(0, 2, 1, 3).reshape(B, L, -1))
 
 
+class Qwen3MLP(nn.Module):
+    """Qwen3-style gated MLP (matches mlx_lm.models.qwen3.MLP weights)."""
+
+    def __init__(self, dim, hidden_dim):
+        super().__init__()
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+
+    def __call__(self, x) -> mx.array:
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+
+
 class DFlashDecoderLayer(nn.Module):
     def __init__(self, config: DFlashConfig, layer_idx: int):
         super().__init__()
@@ -106,6 +122,8 @@ class DFlashDecoderLayer(nn.Module):
 
 
 class DFlashDraftModel(nn.Module):
+    layer_class = DFlashDecoderLayer
+
     def __init__(self, config: DFlashConfig):
         super().__init__()
         self.config = config
@@ -115,7 +133,7 @@ class DFlashDraftModel(nn.Module):
         self.fc = nn.Linear(concat_dim, config.hidden_size, bias=False)
         self.hidden_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers = [
-            DFlashDecoderLayer(config, i) for i in range(config.num_hidden_layers)
+            self.layer_class(config, i) for i in range(config.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rope = _build_rope(config)

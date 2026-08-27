@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import math
 from functools import lru_cache
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Tuple
 
 import mlx.core as mx
 import numpy as np
-from mlx_lm.models.cache import _BaseCache, create_attention_mask, create_causal_mask
+
+from .models.cache import _BaseCache, create_attention_mask, create_causal_mask
 
 DEFAULT_TURBOQUANT_SEED = 0
 _EPS = 1e-6
@@ -3507,6 +3508,20 @@ def _validate_bits(bits: float) -> float:
     return rounded
 
 
+def resolve_kv_bits(
+    bits: float,
+    key_bits: Optional[float] = None,
+    value_bits: Optional[float] = None,
+) -> Tuple[float, float, float]:
+    bits = _validate_bits(bits)
+    fractional = not math.isclose(bits, round(bits), abs_tol=1e-6)
+    if key_bits is None:
+        key_bits = math.floor(bits) if fractional else bits
+    if value_bits is None:
+        value_bits = math.ceil(bits) if fractional else bits
+    return bits, _validate_bits(key_bits), _validate_bits(value_bits)
+
+
 def turboquant_enabled(bits: Optional[float], scheme: Optional[str] = None) -> bool:
     if bits is None:
         return False
@@ -4105,6 +4120,21 @@ def _map_state_pair(s1, s2, fn):
 def _filter_state(state, batch_indices: mx.array):
     """Select batch elements from a TurboQuant state."""
     return _map_state(state, lambda a, ndim: a[batch_indices])
+
+
+def _zero_state_row_tail(state, batch_index: int, start: int, end: int):
+    """Zero a single batch row over the token range [start, end)."""
+    if state is None or start >= end:
+        return state
+
+    def _zero(a, ndim):
+        if ndim == 3:
+            a[batch_index, :, start:end] = 0
+        else:
+            a[batch_index, :, start:end, :] = 0
+        return a
+
+    return _map_state(state, _zero)
 
 
 def _pad_state_tokens(state, left: int, right: int):
@@ -4947,8 +4977,16 @@ class TurboQuantKVCache(_BaseCache):
     prefill_query_block_size = 16
     cache_step = 256
 
-    def __init__(self, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED):
-        self.bits = _validate_bits(bits)
+    def __init__(
+        self,
+        bits: float,
+        seed: int = DEFAULT_TURBOQUANT_SEED,
+        key_bits: Optional[float] = None,
+        value_bits: Optional[float] = None,
+    ):
+        self.bits, self.key_bits, self.value_bits = resolve_kv_bits(
+            bits, key_bits, value_bits
+        )
         self.seed = seed
         self.offset = 0
         self.keys = None
@@ -4962,9 +5000,16 @@ class TurboQuantKVCache(_BaseCache):
 
     @classmethod
     def from_cache(
-        cls, cache, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED
+        cls,
+        cache,
+        bits: float,
+        seed: int = DEFAULT_TURBOQUANT_SEED,
+        key_bits: Optional[float] = None,
+        value_bits: Optional[float] = None,
     ) -> "TurboQuantKVCache":
-        turbo_cache = cls(bits=bits, seed=seed)
+        turbo_cache = cls(
+            bits=bits, seed=seed, key_bits=key_bits, value_bits=value_bits
+        )
         keys, values = cache.state
         if keys is not None:
             turbo_cache.update_and_fetch(keys, values)
@@ -4972,23 +5017,12 @@ class TurboQuantKVCache(_BaseCache):
 
     def _ensure_codecs(self, keys: mx.array, values: mx.array):
         if self.key_codec is None:
-            # For fractional bits (e.g. 3.5), use lower bits for keys and higher
-            # for values instead of SplitCodec. Both stay as fast integer codecs
-            # with single-tile kernel support. Values benefit more from extra bits.
-            key_bits = (
-                math.floor(self.bits)
-                if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6)
-                else self.bits
+            self.key_codec = _build_codec(
+                keys, self.key_bits, mode="mse", seed=self.seed
             )
-            self.key_codec = _build_codec(keys, key_bits, mode="mse", seed=self.seed)
         if self.value_codec is None:
-            val_bits = (
-                math.ceil(self.bits)
-                if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6)
-                else self.bits
-            )
             self.value_codec = _build_codec(
-                values, val_bits, mode="mse", seed=self.seed + 1
+                values, self.value_bits, mode="mse", seed=self.seed + 1
             )
 
     def _try_fused_kv_quantize(self, keys, values):
@@ -5099,6 +5133,15 @@ class TurboQuantKVCache(_BaseCache):
         keys = self.key_codec.dequantize(keys_state).astype(mx.float32)
         values = self.value_codec.dequantize(values_state).astype(mx.float32)
         return keys, values
+
+    def dequantize_for_apc(self):
+        """Return raw float (keys, values) for APC storage.
+
+        Returns (None, None) if the cache is empty.
+        """
+        if self.keys is None or self.offset == 0:
+            return None, None
+        return self.dequantize()
 
     def _apply_attention_mask(
         self,
@@ -6044,13 +6087,23 @@ class TurboQuantKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.offset, self.bits, self.seed)))
+        return tuple(
+            map(
+                str,
+                (self.offset, self.bits, self.seed, self.key_bits, self.value_bits),
+            )
+        )
 
     @meta_state.setter
     def meta_state(self, value):
         self.offset = int(value[0])
         self.bits = float(value[1])
         self.seed = int(value[2])
+        self.bits, self.key_bits, self.value_bits = resolve_kv_bits(
+            self.bits,
+            float(value[3]) if len(value) > 3 else None,
+            float(value[4]) if len(value) > 4 else None,
+        )
 
     def is_trimmable(self):
         return True
@@ -6061,6 +6114,12 @@ class TurboQuantKVCache(_BaseCache):
         self._cached_state = None
         self._cached_state_offset = -1
         return n
+
+    def zero_row_tail(self, batch_index: int, start: int, end: int):
+        self.keys = _zero_state_row_tail(self.keys, batch_index, start, end)
+        self.values = _zero_state_row_tail(self.values, batch_index, start, end)
+        self._cached_state = None
+        self._cached_state_offset = -1
 
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
@@ -6094,8 +6153,12 @@ class BatchTurboQuantKVCache(_BaseCache):
         left_padding: list,
         bits: float,
         seed: int = DEFAULT_TURBOQUANT_SEED,
+        key_bits: Optional[float] = None,
+        value_bits: Optional[float] = None,
     ):
-        self.bits = _validate_bits(bits)
+        self.bits, self.key_bits, self.value_bits = resolve_kv_bits(
+            bits, key_bits, value_bits
+        )
         self.seed = seed
         self.keys = None
         self.values = None
@@ -6109,13 +6172,17 @@ class BatchTurboQuantKVCache(_BaseCache):
     # Codec initialisation (deferred until first update)
     # ------------------------------------------------------------------
 
-    def _ensure_codecs(self, keys: mx.array):
+    def _ensure_codecs(self, keys: mx.array, values: mx.array):
         if self.key_codec is not None:
             return
-        D = keys.shape[-1]
         # Delegate to a temporary TurboQuantKVCache to get codec setup right
-        tmp = TurboQuantKVCache(bits=self.bits, seed=self.seed)
-        tmp._ensure_codecs(keys, keys)  # values have same D
+        tmp = TurboQuantKVCache(
+            bits=self.bits,
+            seed=self.seed,
+            key_bits=self.key_bits,
+            value_bits=self.value_bits,
+        )
+        tmp._ensure_codecs(keys, values)
         self.key_codec = tmp.key_codec
         self.value_codec = tmp.value_codec
 
@@ -6124,7 +6191,7 @@ class BatchTurboQuantKVCache(_BaseCache):
     # ------------------------------------------------------------------
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
-        self._ensure_codecs(keys)
+        self._ensure_codecs(keys, values)
         prev = self._idx
 
         new_keys = self.key_codec.quantize(keys)
@@ -6159,6 +6226,22 @@ class BatchTurboQuantKVCache(_BaseCache):
             _QuantizedStateProxy(vs, self._idx, n_heads),
         )
 
+    def zero_row_tail(self, bi: int, start: int, end: int):
+        if start >= end:
+            return
+
+        def _z(arr, ndim):
+            if ndim == 3:
+                arr[bi, :, start:end] = 0
+            else:
+                arr[bi, :, start:end, :] = 0
+            return arr
+
+        if self.keys is not None:
+            self.keys = _map_state(self.keys, _z)
+        if self.values is not None:
+            self.values = _map_state(self.values, _z)
+
     # ------------------------------------------------------------------
     # Batch operations for Batch.filter / Batch.extend
     # ------------------------------------------------------------------
@@ -6183,6 +6266,10 @@ class BatchTurboQuantKVCache(_BaseCache):
                 self.values = _map_state(self.values, _trim)
             self._idx -= min_lp
             self.left_padding -= min_lp
+
+    def zero_row_tail(self, batch_index: int, start: int, end: int):
+        self.keys = _zero_state_row_tail(self.keys, batch_index, start, end)
+        self.values = _zero_state_row_tail(self.values, batch_index, start, end)
 
     def extend(self, other: "BatchTurboQuantKVCache"):
         if self.keys is None and other.keys is None:
@@ -6251,6 +6338,43 @@ class BatchTurboQuantKVCache(_BaseCache):
         v = self.value_codec.dequantize(values_state).astype(mx.float32)
         return k, v
 
+    def dequantize_for_apc(self):
+        """Return raw float (keys, values) for APC storage.
+
+        Returns (None, None) if the cache is empty.
+        """
+        if self.keys is None or self._idx == 0:
+            return None, None
+        return self.dequantize()
+
+    def extract(self, idx):
+        """Extract one batch row as a single-sequence TurboQuantKVCache."""
+        cache = TurboQuantKVCache(
+            bits=self.bits,
+            seed=self.seed,
+            key_bits=self.key_bits,
+            value_bits=self.value_bits,
+        )
+        if self.keys is None or self._idx == 0:
+            return cache
+        cache.key_codec = self.key_codec
+        cache.value_codec = self.value_codec
+        padding = max(0, int(self.left_padding[idx].item()))
+        end = self._idx
+        if padding >= end:
+            return cache
+        bi = mx.array([idx])
+        keys = _filter_state(_slice_state_range(self.keys, padding, end), bi)
+        values = _filter_state(_slice_state_range(self.values, padding, end), bi)
+
+        def _contiguous(a, ndim):
+            return mx.contiguous(a)
+
+        cache.keys = _map_state(keys, _contiguous)
+        cache.values = _map_state(values, _contiguous)
+        cache.offset = _state_length(cache.keys)
+        return cache
+
     # ------------------------------------------------------------------
     # State / introspection
     # ------------------------------------------------------------------
@@ -6271,22 +6395,42 @@ class BatchTurboQuantKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self._idx, self.bits, self.seed)))
+        return tuple(
+            map(
+                str,
+                (self._idx, self.bits, self.seed, self.key_bits, self.value_bits),
+            )
+        )
 
     @meta_state.setter
     def meta_state(self, v):
         self._idx = int(v[0])
         self.bits = float(v[1])
         self.seed = int(v[2])
+        self.bits, self.key_bits, self.value_bits = resolve_kv_bits(
+            self.bits,
+            float(v[3]) if len(v) > 3 else None,
+            float(v[4]) if len(v) > 4 else None,
+        )
 
     def is_trimmable(self):
-        return False
+        return True
 
     def trim(self, n):
-        return 0
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset -= n
+        return n
 
     def empty(self):
         return self.keys is None
+
+    @property
+    def batch_size(self):
+        return int(self.left_padding.shape[0])
+
+    def is_single_row(self):
+        return self.batch_size == 1
 
     def make_mask(self, N: int, return_array: bool = False, **kwargs):
         return create_causal_mask(
@@ -6306,3 +6450,158 @@ class BatchTurboQuantKVCache(_BaseCache):
         s = _slice_state(self.keys, self._idx)
         v = _slice_state(self.values, self._idx)
         return _state_nbytes(s) + _state_nbytes(v)
+
+
+class _UniformTensorQuantizer:
+    def __init__(self, bits: int, group_size: int):
+        self.bits = int(bits)
+        self.group_size = int(group_size)
+
+    def quantize(self, tensor: mx.array):
+        return mx.quantize(tensor, group_size=self.group_size, bits=self.bits)
+
+    def dequantize(self, state) -> mx.array:
+        weights, scales, biases = state
+        return mx.dequantize(
+            weights, scales, biases, group_size=self.group_size, bits=self.bits
+        )
+
+    @staticmethod
+    def concat(lhs, rhs):
+        if lhs is None:
+            return rhs
+        if rhs is None:
+            return lhs
+        return tuple(mx.concatenate([a, b], axis=-2) for a, b in zip(lhs, rhs))
+
+    @staticmethod
+    def length(state) -> int:
+        return 0 if state is None else state[0].shape[-2]
+
+    @staticmethod
+    def truncate(state, n: int):
+        return None if state is None else tuple(x[..., :n, :] for x in state)
+
+
+class _TurboTensorQuantizer:
+    def __init__(self, bits: float, seed: int):
+        self.bits = bits
+        self.seed = seed
+        self.codec = None
+
+    def _ensure(self, tensor: mx.array):
+        if self.codec is None:
+            self.codec = _build_codec(tensor, self.bits, mode="mse", seed=self.seed)
+
+    def quantize(self, tensor: mx.array):
+        self._ensure(tensor)
+        return self.codec.quantize(tensor)
+
+    def dequantize(self, state) -> mx.array:
+        return self.codec.dequantize(state)
+
+    @staticmethod
+    def concat(lhs, rhs):
+        return _concat_state(lhs, rhs)
+
+    @staticmethod
+    def length(state) -> int:
+        return 0 if state is None else _state_length(state)
+
+    @staticmethod
+    def truncate(state, n: int):
+        return _slice_state(state, n)
+
+
+def _make_tensor_quantizer(spec, seed: int):
+    if spec.scheme == "turboquant":
+        return _TurboTensorQuantizer(spec.bits, seed)
+    return _UniformTensorQuantizer(int(spec.bits), spec.group_size)
+
+
+class HybridQuantKVCache(_BaseCache):
+    def __init__(self, policy, seed: int = DEFAULT_TURBOQUANT_SEED):
+        self.policy = policy
+        self.seed = seed
+        self.offset = 0
+        self.keys = None
+        self.values = None
+        self.key_quantizer = _make_tensor_quantizer(policy.key, seed)
+        self.value_quantizer = _make_tensor_quantizer(policy.value, seed + 1)
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array):
+        self.keys = self.key_quantizer.concat(
+            self.keys, self.key_quantizer.quantize(keys)
+        )
+        self.values = self.value_quantizer.concat(
+            self.values, self.value_quantizer.quantize(values)
+        )
+        self.offset += keys.shape[-2]
+        return self.dequantize()
+
+    def dequantize(self):
+        return (
+            self.key_quantizer.dequantize(self.keys),
+            self.value_quantizer.dequantize(self.values),
+        )
+
+    @property
+    def state(self):
+        return self.keys, self.values
+
+    @state.setter
+    def state(self, value):
+        if value is None:
+            self.keys, self.values = None, None
+            self.offset = 0
+            return
+        self.keys, self.values = value
+        self.offset = self.key_quantizer.length(self.keys)
+
+    @property
+    def meta_state(self):
+        return tuple(
+            map(
+                str,
+                (
+                    self.offset,
+                    self.seed,
+                    self.policy.bits,
+                    self.policy.key.scheme,
+                    self.policy.key.bits,
+                    self.policy.value.scheme,
+                    self.policy.value.bits,
+                    self.policy.group_size,
+                ),
+            )
+        )
+
+    @meta_state.setter
+    def meta_state(self, value):
+        from .kv_quant import KVQuantPolicy, KVQuantSpec
+
+        self.offset = int(value[0])
+        self.seed = int(value[1])
+        group_size = int(value[7])
+        self.policy = KVQuantPolicy(
+            bits=float(value[2]),
+            key=KVQuantSpec(value[3], float(value[4]), group_size),
+            value=KVQuantSpec(value[5], float(value[6]), group_size),
+        )
+        self.key_quantizer = _make_tensor_quantizer(self.policy.key, self.seed)
+        self.value_quantizer = _make_tensor_quantizer(self.policy.value, self.seed + 1)
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        if n <= 0:
+            return 0
+        self.offset -= n
+        self.keys = self.key_quantizer.truncate(self.keys, self.offset)
+        self.values = self.value_quantizer.truncate(self.values, self.offset)
+        return n
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)

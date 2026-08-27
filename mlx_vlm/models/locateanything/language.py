@@ -2,7 +2,6 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.activations import swiglu
 
 from ..base import (
     LanguageModelOutput,
@@ -10,6 +9,8 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..mlp import SwiGLUMLP as MLP
+from ..rope_utils import initialize_rope
 from .config import TextConfig
 
 
@@ -68,8 +69,12 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        self.rope = nn.RoPE(
-            head_dim, traditional=args.rope_traditional, base=args.rope_theta
+        self.rope = initialize_rope(
+            dims=head_dim,
+            base=args.rope_theta,
+            traditional=args.rope_traditional,
+            scaling_config=args.rope_scaling,
+            max_position_embeddings=args.max_position_embeddings,
         )
 
     def __call__(
@@ -107,17 +112,6 @@ class Attention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
-
-
-class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class Qwen2DecoderLayer(nn.Module):

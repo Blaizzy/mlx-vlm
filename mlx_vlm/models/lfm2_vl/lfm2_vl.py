@@ -16,7 +16,8 @@ class Lfm2VlMultiModalProjector(nn.Module):
         super().__init__()
         in_channels = config.vision_config.hidden_size * (config.downsample_factor**2)
         self.projector_use_layernorm = config.projector_use_layernorm
-        self.layer_norm = nn.LayerNorm(in_channels)
+        if self.projector_use_layernorm:
+            self.layer_norm = nn.LayerNorm(in_channels)
         self.linear_1 = nn.Linear(
             in_channels,
             config.projector_hidden_size,
@@ -143,7 +144,9 @@ class Model(nn.Module):
 
                 feature = feature[: img_feature_lengths[img_idx], :][None, ...]
 
-                feature_org_h, feature_org_w = spatial_shapes[img_idx]
+                feature_org_h, feature_org_w = (
+                    int(dim) for dim in spatial_shapes[img_idx]
+                )
                 feature = feature.reshape(1, feature_org_h, feature_org_w, -1)
                 feature = self.pixel_unshuffle(feature)
 
@@ -196,11 +199,17 @@ class Model(nn.Module):
         spatial_shapes = kwargs.get("spatial_shapes", None)
         pixel_attention_mask = kwargs.get("pixel_attention_mask", None)
         input_embeddings_features = self.get_input_embeddings(
-            input_ids, pixel_values, spatial_shapes, pixel_attention_mask
+            input_ids,
+            pixel_values,
+            spatial_shapes=spatial_shapes,
+            pixel_attention_mask=pixel_attention_mask,
         )
 
         logits = self.language_model(
-            input_ids, mask=None, cache=cache, inputs_embeds=input_embeddings_features
+            input_ids,
+            mask=None,
+            cache=cache,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
         )
         return logits
 
@@ -224,4 +233,13 @@ class Model(nn.Module):
 
             return key
 
-        return {transform_key(k): v for k, v in weights.items()}
+        weights = {transform_key(k): v for k, v in weights.items()}
+
+        if not self.config.projector_use_layernorm:
+            weights = {
+                k: v
+                for k, v in weights.items()
+                if not k.startswith("multi_modal_projector.layer_norm.")
+            }
+
+        return weights

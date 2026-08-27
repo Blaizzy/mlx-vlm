@@ -49,18 +49,46 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import numpy as np
+
+from ._stream_cleanup import clear_mlx_streams
+from .apc_storage import APCNode, ComponentId, StateHandle
+from .kv_quant import from_config as kv_quant_from_config
+from .kv_quant import kv_quant_fingerprint
 
 logger = logging.getLogger("mlx_vlm.apc")
 
 DEFAULT_BLOCK_SIZE = 16
 DEFAULT_NUM_BLOCKS = 2048
 SEED_PARENT_HASH = 0
+
+
+def _env_truthy(name: str, default: str = "") -> bool:
+    """Return True when env var is a common truthy string (1/true/yes)."""
+    return os.environ.get(name, default).lower() in ("1", "true", "yes")
+
+
+def apc_trace_enabled() -> bool:
+    """Optional request-path tracing (``APC_TRACE=1``), sibling of ``APC_DISK_TRACE``."""
+    return _env_truthy("APC_TRACE")
+
+
+def apc_trace(event: str, **fields: Any) -> None:
+    """Emit a single greppable ``APC_TRACE`` log line when tracing is enabled.
+
+    Kept separate from stats counters: stats are always-on aggregates; trace is
+    opt-in detail for debugging store/lookup/reject/self-check paths.
+    """
+    if not apc_trace_enabled():
+        return
+    parts = " ".join(f"{key}={value}" for key, value in fields.items())
+    msg = f"APC_TRACE {event}" + (f" {parts}" if parts else "")
+    logger.info(msg)
 
 
 def _hash_use_sha256() -> bool:
@@ -97,6 +125,140 @@ def tenant_scoped_hash(tenant: Optional[str], payload_hash: int = 0) -> int:
     return int.from_bytes(h.digest()[:8], "little", signed=True)
 
 
+def _tensor_content_hash(t: Any) -> int:
+    """Lossless content hash of a tensor: shape + dtype + exact bytes.
+
+    Keeps shape and dtype and does not downcast, so distinct semantic inputs
+    never collide solely because their flattened values happen to match.
+    """
+    dtype = str(getattr(t, "dtype", ""))
+    shape = tuple(getattr(t, "shape", ()))
+    if isinstance(t, mx.array):
+        mx.eval(t)
+        try:
+            raw = np.asarray(t)
+        except Exception:
+            raw = np.asarray(t.astype(mx.float32))
+    else:
+        raw = np.ascontiguousarray(t)
+    h = hashlib.sha256()
+    h.update(repr(shape).encode("utf-8"))
+    h.update(dtype.encode("utf-8"))
+    h.update(raw.tobytes())
+    return int.from_bytes(h.digest()[:8], "little", signed=True)
+
+
+def _hash_payload(payload: Any) -> Optional[int]:
+    """Stable content hash of one non-token semantic input, or None to skip.
+
+    Tensors hash losslessly by shape + dtype + bytes; lists fold element-wise;
+    other refs hash by path/repr.
+    """
+    if payload is None:
+        return None
+    if isinstance(payload, (list, tuple)):
+        folded = SEED_PARENT_HASH
+        seen = False
+        for item in payload:
+            sub = _hash_payload(item)
+            if sub is not None:
+                folded = _stable_int_hash(folded, sub)
+                seen = True
+        return folded if seen else None
+    if isinstance(payload, (mx.array, np.ndarray)):
+        return _tensor_content_hash(payload)
+    return hash_image_payload(image_ref=payload)
+
+
+def model_key_dependencies(model: Any = None, processor: Any = None) -> Tuple[int, ...]:
+    """Fold any model/processor-declared APC key dependencies into hashes.
+
+    A model or processor may expose ``apc_key_dependencies()`` returning extra
+    semantic inputs. Absent or failing hooks contribute nothing.
+    """
+    deps: List[int] = []
+    for obj in (model, processor):
+        if obj is None:
+            continue
+        hook = getattr(obj, "apc_key_dependencies", None)
+        if not callable(hook):
+            continue
+        try:
+            for dep in hook() or ():
+                sub = _hash_payload(dep)
+                if sub is not None:
+                    deps.append(sub)
+        except Exception:
+            continue
+    return tuple(deps)
+
+
+def semantic_extra_hash(
+    *,
+    tenant: Optional[str] = None,
+    image_hash: int = 0,
+    media: Optional[Dict[str, Any]] = None,
+    model: Any = None,
+    processor: Any = None,
+) -> int:
+    """Complete APC salt: tenant + image + non-token media inputs + model/processor deps.
+
+    ``media`` maps a semantic-input name (audio/video/embeddings/masks/
+    rope_deltas/...) to its payload; entries fold in sorted-key order so the
+    result is order-independent. Reduces exactly to
+    ``tenant_scoped_hash(tenant, image_hash)`` when no extra inputs are present.
+    """
+    folded = int(image_hash)
+    if media:
+        for key in sorted(media):
+            sub = _hash_payload(media[key])
+            if sub is not None:
+                folded = _stable_int_hash(folded, _hash_payload(key), sub)
+    for dep in model_key_dependencies(model, processor):
+        folded = _stable_int_hash(folded, dep)
+    return tenant_scoped_hash(tenant, folded)
+
+
+def apc_disk_namespace(
+    model_path: str,
+    *,
+    adapter_path: Any = None,
+    weights_fingerprint: Any = None,
+    kv_bits: Any = None,
+    kv_key_bits: Any = None,
+    kv_value_bits: Any = None,
+    kv_group_size: Any = None,
+    kv_quant_scheme: Any = None,
+    quantized_kv_start: Any = None,
+) -> str:
+    """On-disk APC namespace fingerprinted by model identity + KV-quant + adapter schema.
+
+    Folds the model path, any adapter path / weights fingerprint, and KV
+    quantization into the namespace so a different adapter, model revision,
+    quantization, or adapter schema version never reads or writes another's
+    on-disk cache.
+    """
+    from .apc_adapters import ADAPTER_SCHEMA_VERSION
+
+    kv_descriptor = kv_quant_fingerprint(
+        kv_bits,
+        kv_group_size,
+        kv_quant_scheme,
+        quantized_kv_start,
+        kv_key_bits,
+        kv_value_bits,
+    )
+    fingerprint = _stable_int_hash(
+        ADAPTER_SCHEMA_VERSION,
+        _hash_payload(str(model_path)) or 0,
+        _hash_payload("" if adapter_path is None else str(adapter_path)) or 0,
+        _hash_payload("" if weights_fingerprint is None else str(weights_fingerprint))
+        or 0,
+        _hash_payload(kv_descriptor) or 0,
+    ) & ((1 << 32) - 1)
+    return f"{model_path}#s{ADAPTER_SCHEMA_VERSION}-{fingerprint:08x}"
+
+
 def _copy_mlx_array(x: mx.array) -> mx.array:
     """Materialize ``x`` into a fresh MLX-owned contiguous buffer."""
     return mx.contiguous(mx.array(x, dtype=x.dtype))
@@ -131,97 +293,12 @@ def _clone_cache_entry_for_apc(
     min_capacity_tokens: Optional[int],
     eval_targets: List[mx.array],
 ) -> Optional[Any]:
-    """Deep-copy one prompt-cache entry, preserving its concrete cache kind."""
-    from mlx_lm.models import cache as lm_cache
+    """Deep-copy one prompt-cache entry via the registered cache adapter."""
+    from .apc_adapters import clone_cache_entry
 
-    if isinstance(c, lm_cache.KVCache):
-        out = type(c)()
-        off = int(getattr(c, "offset", 0) or 0)
-        if c.keys is not None and c.values is not None and off > 0:
-            keys = _copy_mlx_array(c.keys[..., :off, :])
-            values = _copy_mlx_array(c.values[..., :off, :])
-            step = int(getattr(c, "step", getattr(type(c), "step", 256)) or 0)
-            keys, values = _pad_kv_for_capacity(
-                keys,
-                values,
-                offset=off,
-                min_capacity_tokens=min_capacity_tokens,
-                step=step,
-            )
-            out.keys = keys
-            out.values = values
-            out.offset = off
-            eval_targets.extend([keys, values])
-        return out
-
-    if isinstance(c, lm_cache.RotatingKVCache):
-        out = type(c)(
-            max_size=int(getattr(c, "max_size")),
-            keep=int(getattr(c, "keep", 0)),
-        )
-        out.offset = int(getattr(c, "offset", 0) or 0)
-        out._idx = int(getattr(c, "_idx", 0) or 0)
-        if c.keys is not None and c.values is not None:
-            out.keys = _copy_mlx_array(c.keys)
-            out.values = _copy_mlx_array(c.values)
-            eval_targets.extend([out.keys, out.values])
-        return out
-
-    if isinstance(c, lm_cache.ChunkedKVCache):
-        out = type(c)(chunk_size=int(getattr(c, "chunk_size")))
-        out.offset = int(getattr(c, "offset", 0) or 0)
-        out.start_position = int(getattr(c, "start_position", 0) or 0)
-        if c.keys is not None and c.values is not None:
-            out.keys = _copy_mlx_array(c.keys)
-            out.values = _copy_mlx_array(c.values)
-            eval_targets.extend([out.keys, out.values])
-        return out
-
-    if isinstance(c, lm_cache.ArraysCache):
-        out = lm_cache.ArraysCache(len(c.cache))
-        out.cache = []
-        for state in c.cache:
-            if state is None:
-                out.cache.append(None)
-                continue
-            copied = _copy_mlx_array(state)
-            out.cache.append(copied)
-            eval_targets.append(copied)
-        if c.left_padding is not None:
-            out.left_padding = _copy_mlx_array(c.left_padding)
-            eval_targets.append(out.left_padding)
-        if c.lengths is not None:
-            out.lengths = _copy_mlx_array(c.lengths)
-            eval_targets.append(out.lengths)
-        return out
-
-    if isinstance(c, lm_cache.CacheList):
-        copied = [
-            _clone_cache_entry_for_apc(
-                sub_c,
-                min_capacity_tokens=min_capacity_tokens,
-                eval_targets=eval_targets,
-            )
-            for sub_c in c.caches
-        ]
-        if any(sub_c is None for sub_c in copied):
-            return None
-        return lm_cache.CacheList(*copied)
-
-    if isinstance(c, tuple):
-        copied = [
-            _clone_cache_entry_for_apc(
-                sub_c,
-                min_capacity_tokens=min_capacity_tokens,
-                eval_targets=eval_targets,
-            )
-            for sub_c in c
-        ]
-        if any(sub_c is None for sub_c in copied):
-            return None
-        return tuple(copied)
-
-    return None
+    return clone_cache_entry(
+        c, min_capacity_tokens=min_capacity_tokens, eval_targets=eval_targets
+    )
 
 
 def _clone_prompt_cache_for_apc(
@@ -251,7 +328,7 @@ def _clone_layer_major_kv_cache_for_apc(
     prefix_len: int,
 ) -> Optional[List[Any]]:
     """Deep-copy layer-major K/V tensors into compact ``KVCache`` entries."""
-    from mlx_lm.models.cache import KVCache
+    from .models.cache import KVCache
 
     if prefix_len <= 0 or len(layer_keys) != len(layer_values):
         return None
@@ -270,29 +347,15 @@ def _clone_layer_major_kv_cache_for_apc(
 
 
 def _cache_entry_supports_exact_apc(c: Any) -> bool:
-    from mlx_lm.models import cache as lm_cache
+    from .apc_adapters import apc_exact_eligible
 
-    if isinstance(
-        c,
-        (
-            lm_cache.KVCache,
-            lm_cache.RotatingKVCache,
-            lm_cache.ChunkedKVCache,
-            lm_cache.ArraysCache,
-        ),
-    ):
-        return True
-    if isinstance(c, lm_cache.CacheList):
-        return all(_cache_entry_supports_exact_apc(sub_c) for sub_c in c.caches)
-    if isinstance(c, tuple):
-        return all(_cache_entry_supports_exact_apc(sub_c) for sub_c in c)
-    return False
+    return apc_exact_eligible(c)
 
 
 def _cache_entry_supports_block_apc(c: Any) -> bool:
-    from mlx_lm.models import cache as lm_cache
+    from .apc_adapters import apc_block_eligible
 
-    return isinstance(c, lm_cache.KVCache)
+    return apc_block_eligible(c)
 
 
 def _sequence_hash(token_ids: Sequence[int], extra_hash: int, block_size: int) -> int:
@@ -317,9 +380,7 @@ def hash_image_payload(
     """
     if pixel_values is not None:
         try:
-            arr = np.asarray(pixel_values).astype(np.float16, copy=False)
-            digest = hashlib.sha256(arr.tobytes()).digest()
-            return int.from_bytes(digest[:8], "little", signed=True)
+            return _tensor_content_hash(pixel_values)
         except Exception:
             pass
 
@@ -432,7 +493,9 @@ def adjust_prefix_to_text_suffix_boundary(
     )
     if max_len <= 0:
         return 0
-    desired = max(1, int(desired_prefix_len))
+    if int(desired_prefix_len) <= 0:
+        return 0
+    desired = int(desired_prefix_len)
     prefix_len = max(desired, media_safe_prefix_min(token_ids, media_token_ids))
     if prefix_len > max_len:
         return 0
@@ -440,8 +503,8 @@ def adjust_prefix_to_text_suffix_boundary(
 
 
 @dataclass
-class APCBlock:
-    """One fixed-size KV block. Holds per-layer K/V slabs once committed."""
+class APCBlock(APCNode):
+    """Pooled logical node for one fixed-size KV block; its pageable K/V lives in the "kv" component handle."""
 
     block_id: int
     block_hash: Optional[int] = None
@@ -449,11 +512,26 @@ class APCBlock:
     token_ids: Tuple[int, ...] = ()
     extra_hash: int = 0
     ref_cnt: int = 0
-    keys: Optional[List[mx.array]] = None
-    values: Optional[List[mx.array]] = None
+    components: Dict[ComponentId, StateHandle] = field(default_factory=dict)
     last_used: float = 0.0
     prev: Optional["APCBlock"] = None
     next: Optional["APCBlock"] = None
+
+    @property
+    def node_key(self) -> Optional[int]:
+        return self.block_hash
+
+    @property
+    def prefix_len(self) -> int:
+        return len(self.token_ids)
+
+    @property
+    def parent_key(self) -> int:
+        return self.parent_hash
+
+    @property
+    def lock_count(self) -> int:
+        return self.ref_cnt
 
 
 @dataclass
@@ -523,6 +601,15 @@ class APCStats:
     disk_writes: int = 0
     exact_hits: int = 0
     exact_stores: int = 0
+    rejects: int = 0
+    rejects_by_reason: Dict[str, int] = field(default_factory=dict)
+    last_reject: Optional[Dict[str, Any]] = None
+
+    def record_reject(self, reason: str, **details: Any) -> None:
+        self.rejects += 1
+        self.rejects_by_reason[reason] = self.rejects_by_reason.get(reason, 0) + 1
+        self.last_reject = {"reason": reason, **details}
+        apc_trace("reject", reason=reason, **details)
 
     def snapshot(self, num_blocks: int, block_size: int) -> dict:
         denom = self.matched_tokens + self.served_tokens
@@ -542,6 +629,11 @@ class APCStats:
             "disk_writes": self.disk_writes,
             "exact_hits": self.exact_hits,
             "exact_stores": self.exact_stores,
+            "rejects": self.rejects,
+            "rejects_by_reason": dict(self.rejects_by_reason),
+            "last_reject": (
+                dict(self.last_reject) if self.last_reject is not None else None
+            ),
         }
 
 
@@ -1318,9 +1410,7 @@ class DiskBlockStore:
         min_capacity_tokens: Optional[int],
         eval_targets: List[mx.array],
     ) -> Optional[Any]:
-        from mlx_lm.models import cache as lm_cache
-
-        from .models import cache as vlm_cache
+        from .models import cache as lm_cache
 
         kind = metadata.get(f"{prefix}_kind")
         if kind == "kv":
@@ -1366,7 +1456,7 @@ class DiskBlockStore:
                 idx = int(metadata.get(f"{prefix}_idx", "0"))
             except (KeyError, TypeError, ValueError):
                 return None
-            c = vlm_cache.RotatingKVCache(max_size=max_size, keep=keep)
+            c = lm_cache.RotatingKVCache(max_size=max_size, keep=keep)
             c.offset = offset
             c._idx = idx
             if metadata.get(f"{prefix}_empty", "0") == "1":
@@ -2011,7 +2101,7 @@ class DiskBlockStore:
         """
         if not block_hashes:
             return None
-        trace = os.environ.get("APC_DISK_TRACE", "").lower() in ("1", "true", "yes")
+        trace = _env_truthy("APC_DISK_TRACE")
         trace_t0 = time.perf_counter()
 
         entries: List[Tuple[Path, int]] = []
@@ -2478,7 +2568,7 @@ class DiskBlockStore:
         arrays: dict[str, mx.array],
         metadata: dict[str, str],
     ) -> bool:
-        from mlx_lm.models import cache as lm_cache
+        from .models import cache as lm_cache
 
         if isinstance(c, lm_cache.KVCache):
             off = int(getattr(c, "offset", 0) or 0)
@@ -2716,6 +2806,12 @@ class DiskBlockStore:
         self._maybe_evict()
 
     def _writer_loop(self) -> None:
+        try:
+            self._writer_loop_impl()
+        finally:
+            clear_mlx_streams()
+
+    def _writer_loop_impl(self) -> None:
         while True:
             item = self._q.get()
             if item is None:
@@ -2783,6 +2879,9 @@ class APCManager:
         )
         self.exact_cache_guard_tokens = max(
             1, int(os.environ.get("APC_EXACT_PREFIX_GUARD_TOKENS", "16"))
+        )
+        self.exact_cache_min_tokens = max(
+            1, int(os.environ.get("APC_EXACT_MIN_TOKENS", "16"))
         )
         # If free RAM (best-effort reading) drops below this, skip disk
         # promotion this turn and fall back to memory-only matching. The
@@ -2865,8 +2964,7 @@ class APCManager:
         b.token_ids = ()
         b.parent_hash = SEED_PARENT_HASH
         b.extra_hash = 0
-        b.keys = None
-        b.values = None
+        b.release_components()
         return b
 
     def _acquire_existing(self, b: APCBlock) -> APCBlock:
@@ -2885,6 +2983,13 @@ class APCManager:
         with self.lock:
             for b in blocks:
                 self._release_one(b)
+
+    def _resident_bytes_locked(self) -> int:
+        return sum(b.resident_bytes() for b in self.pool)
+
+    def resident_bytes(self) -> int:
+        with self.lock:
+            return self._resident_bytes_locked()
 
     # ---------- Public API ----------
     def lookup_exact_cache(
@@ -3033,11 +3138,26 @@ class APCManager:
         extra_hash: int = 0,
     ) -> bool:
         """Store a full prompt-cache snapshot for exact-prefix reuse."""
+        if len(token_ids) < self.exact_cache_min_tokens:
+            return False
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
             return False
         token_tuple = tuple(int(t) for t in token_ids)
         copied = _clone_prompt_cache_for_apc(prompt_cache)
         if copied is None:
+            types = [type(c).__name__ for c in prompt_cache]
+            logger.warning(
+                "APC exact-cache store rejected: unclonable prompt cache types %s "
+                "(token_len=%d). Exact-mode APC will not reuse this prefix.",
+                types,
+                len(token_tuple),
+            )
+            with self.lock:
+                self.stats.record_reject(
+                    "unclonable",
+                    types=types,
+                    token_len=len(token_tuple),
+                )
             return False
         key = _sequence_hash(token_tuple, extra_hash, self.block_size)
         stored = False
@@ -3053,6 +3173,14 @@ class APCManager:
                 while len(self._exact_cache) > self._exact_cache_max:
                     self._exact_cache.popitem(last=False)
                 stored = True
+        if stored:
+            apc_trace(
+                "store",
+                mode="exact",
+                ok=True,
+                token_len=len(token_tuple),
+                layers=len(copied),
+            )
         if self.disk is not None:
             try:
                 self.disk.save_exact_cache(key, token_tuple, extra_hash, copied)
@@ -3317,8 +3445,7 @@ class APCManager:
                 b.parent_hash = parent
                 b.token_ids = chunk
                 b.extra_hash = extra_hash
-                b.keys = k_slabs
-                b.values = v_slabs
+                b.set_kv(k_slabs, v_slabs)
                 b.ref_cnt = 1
                 self.hash_table[h] = b
                 new_blocks.append(b)
@@ -3340,6 +3467,7 @@ class APCManager:
         with self.lock:
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
             snap = self.stats.snapshot(self.num_blocks, self.block_size)
+            snap["resident_bytes"] = self._resident_bytes_locked()
             if self.disk is not None:
                 snap["disk_bytes"] = self.disk.disk_bytes
                 snap["disk_max_bytes"] = self.disk.max_bytes
@@ -3368,8 +3496,7 @@ class APCManager:
                 b.token_ids = ()
                 b.parent_hash = SEED_PARENT_HASH
                 b.extra_hash = 0
-                b.keys = None
-                b.values = None
+                b.release_components()
                 b.ref_cnt = 0
                 b.prev = b.next = None
             self.hash_table.clear()
@@ -3385,21 +3512,143 @@ class APCManager:
             self.disk.close()
 
 
+def _reject_mixed_batch_policy(policy) -> None:
+    if policy is not None and not policy.is_homogeneous:
+        raise NotImplementedError(
+            "mixed key/value KV quantization schemes are not supported for "
+            "batch prefix caches yet"
+        )
+
+
+def _fill_stream_layer_cache(
+    merged_k: mx.array,
+    merged_v: mx.array,
+    prefix_len: int,
+    *,
+    quantize: bool,
+    kv_quant_config: Optional[dict],
+    capacity: Optional[int] = None,
+    reuse_cache: Any = None,
+) -> Any:
+    """Build one stream-path layer cache (float or quantized) from dense K/V.
+
+    Backend selection matches batch warm / live ``maybe_quantize_kv_cache``:
+    TurboQuant for fractional bits / scheme, else uniform ``QuantizedKVCache``.
+    """
+    from .models.cache import KVCache, QuantizedKVCache
+
+    if quantize and kv_quant_config is not None:
+        policy = kv_quant_from_config(kv_quant_config)
+        from .turboquant import HybridQuantKVCache, TurboQuantKVCache
+
+        if not policy.is_homogeneous:
+            c = HybridQuantKVCache(policy)
+            c.update_and_fetch(merged_k, merged_v)
+            c.offset = prefix_len
+            return c
+        if policy.is_turboquant:
+            c = TurboQuantKVCache(
+                bits=policy.bits,
+                key_bits=policy.key.bits,
+                value_bits=policy.value.bits,
+            )
+            c.update_and_fetch(merged_k, merged_v)
+            return c
+        c = QuantizedKVCache(
+            group_size=policy.group_size,
+            bits=int(policy.bits),
+        )
+        c.update_and_fetch(merged_k, merged_v)
+        return c
+
+    if capacity is not None and capacity > prefix_len:
+        pad_tokens = capacity - prefix_len
+        k_pad_shape = (*merged_k.shape[:2], pad_tokens, merged_k.shape[3])
+        v_pad_shape = (*merged_v.shape[:2], pad_tokens, merged_v.shape[3])
+        merged_k = mx.concatenate(
+            [merged_k, mx.zeros(k_pad_shape, dtype=merged_k.dtype)], axis=2
+        )
+        merged_v = mx.concatenate(
+            [merged_v, mx.zeros(v_pad_shape, dtype=merged_v.dtype)], axis=2
+        )
+    c = reuse_cache if reuse_cache is not None else KVCache()
+    c.keys = merged_k
+    c.values = merged_v
+    c.offset = prefix_len
+    return c
+
+
+def _fill_batch_layer_cache(
+    merged_k: mx.array,
+    merged_v: mx.array,
+    left_padding: List[int],
+    offset: List[int],
+    *,
+    quantize: bool,
+    kv_quant_config: Optional[dict],
+) -> Any:
+    """Build one batch-path layer cache matching ``_make_cache`` layout.
+
+    When quantizing, select the same backend as live generation:
+    TurboQuant (``BatchTurboQuantKVCache``) if ``turboquant_enabled(bits, scheme)``,
+    otherwise uniform ``BatchQuantizedKVCache`` with integer bits.
+    """
+    from .models.cache import BatchKVCache, BatchQuantizedKVCache
+
+    if quantize and kv_quant_config is not None:
+        policy = kv_quant_from_config(kv_quant_config)
+        from .turboquant import BatchTurboQuantKVCache
+
+        _reject_mixed_batch_policy(policy)
+        if policy.is_turboquant:
+            c = BatchTurboQuantKVCache(
+                left_padding,
+                bits=policy.bits,
+                key_bits=policy.key.bits,
+                value_bits=policy.value.bits,
+            )
+            c.update_and_fetch(merged_k, merged_v)
+            return c
+        c = BatchQuantizedKVCache(
+            left_padding,
+            group_size=policy.group_size,
+            bits=int(policy.bits),
+        )
+        c.update_and_fetch(merged_k, merged_v)
+        return c
+
+    c = BatchKVCache(left_padding=list(left_padding))
+    c.state = (
+        merged_k,
+        merged_v,
+        mx.array(offset),
+        mx.array(left_padding),
+    )
+    return c
+
+
 def make_warm_kv_cache(
     matched_blocks: List[APCBlock],
     min_capacity_tokens: Optional[int] = None,
+    kv_quant_config: Optional[dict] = None,
 ) -> List[Any]:
-    """Stitch matched blocks into per-layer ``KVCache`` instances pre-filled
+    """Stitch matched blocks into per-layer cache instances pre-filled
     with the cached prefix's K/V state. Used by the single-stream
     ``stream_generate`` path.
+
+    When *kv_quant_config* is provided (dict with ``bits`` and ``group_size``),
+    re-quantizes raw float blocks via ``update_and_fetch`` on layers that
+    ``should_quantize_kv_layer`` marks for quant (last layer stays float when
+    ``num_layers > 2``, matching live generation).
     """
-    from mlx_lm.models.cache import KVCache
+    from .models.cache import KVCache, should_quantize_kv_layer
 
     if not matched_blocks:
         return []
     num_layers = len(matched_blocks[0].keys)
     out: List[Any] = []
     prefix_len = sum(b.keys[0].shape[-2] for b in matched_blocks)
+
     step_probe = KVCache()
     kv_step = int(getattr(step_probe, "step", getattr(KVCache, "step", 256)))
     capacity = prefix_len
@@ -3407,26 +3656,26 @@ def make_warm_kv_cache(
         capacity = max(prefix_len, int(min_capacity_tokens))
         if capacity > prefix_len and kv_step > 0:
             capacity = ((capacity + kv_step - 1) // kv_step) * kv_step
+
     for layer_idx in range(num_layers):
         ks = [b.keys[layer_idx] for b in matched_blocks]
         vs = [b.values[layer_idx] for b in matched_blocks]
         merged_k = mx.concatenate(ks, axis=2)
         merged_v = mx.concatenate(vs, axis=2)
-        if capacity > prefix_len:
-            pad_tokens = capacity - prefix_len
-            k_pad_shape = (*merged_k.shape[:2], pad_tokens, merged_k.shape[3])
-            v_pad_shape = (*merged_v.shape[:2], pad_tokens, merged_v.shape[3])
-            merged_k = mx.concatenate(
-                [merged_k, mx.zeros(k_pad_shape, dtype=merged_k.dtype)], axis=2
+        quantize = kv_quant_config is not None and should_quantize_kv_layer(
+            layer_idx, num_layers
+        )
+        out.append(
+            _fill_stream_layer_cache(
+                merged_k,
+                merged_v,
+                prefix_len,
+                quantize=quantize,
+                kv_quant_config=kv_quant_config,
+                capacity=None if quantize else capacity,
+                reuse_cache=step_probe if layer_idx == 0 and not quantize else None,
             )
-            merged_v = mx.concatenate(
-                [merged_v, mx.zeros(v_pad_shape, dtype=merged_v.dtype)], axis=2
-            )
-        c = step_probe if layer_idx == 0 else KVCache()
-        c.keys = merged_k
-        c.values = merged_v
-        c.offset = prefix_len
-        out.append(c)
+        )
     return out
 
 
@@ -3434,30 +3683,48 @@ def make_warm_kv_cache_from_layers(
     layer_keys: List[mx.array],
     layer_values: List[mx.array],
     prefix_len: int,
+    kv_quant_config: Optional[dict] = None,
 ) -> List[Any]:
-    """Build ``KVCache`` objects from already-concatenated disk-restored K/V."""
-    from mlx_lm.models.cache import KVCache
+    """Build cache objects from already-concatenated disk-restored K/V.
 
+    When *kv_quant_config* is provided, quantizes layers per
+    ``should_quantize_kv_layer`` (last layer float when n > 2).
+    """
+    from .models.cache import should_quantize_kv_layer
+
+    num_layers = len(layer_keys)
     out: List[Any] = []
-    for k, v in zip(layer_keys, layer_values):
-        c = KVCache()
-        c.keys = k
-        c.values = v
-        c.offset = prefix_len
-        out.append(c)
+    for layer_idx, (k, v) in enumerate(zip(layer_keys, layer_values)):
+        quantize = kv_quant_config is not None and should_quantize_kv_layer(
+            layer_idx, num_layers
+        )
+        out.append(
+            _fill_stream_layer_cache(
+                k,
+                v,
+                prefix_len,
+                quantize=quantize,
+                kv_quant_config=kv_quant_config,
+            )
+        )
     mx.clear_cache()
     return out
 
 
 def make_warm_batch_kv_cache(
     matched_blocks: List[APCBlock],
+    kv_quant_config: Optional[dict] = None,
 ) -> List[Any]:
-    """Stitch matched blocks into per-layer single-row ``BatchKVCache``
-    instances pre-filled with the cached prefix's K/V state. Used by the
-    batched continuous-batching path; the resulting cache list can be
+    """Stitch matched blocks into per-layer single-row batch cache instances
+    pre-filled with the cached prefix's K/V state. Used by the batched
+    continuous-batching path; the resulting cache list can be
     ``extend()``-ed into a running batch.
+
+    When *kv_quant_config* is provided, layer types match ``_make_cache``:
+    quantized batch caches for layers that ``should_quantize_kv_layer`` allows,
+    float ``BatchKVCache`` for the last layer when ``num_layers > 2``.
     """
-    from mlx_lm.models.cache import BatchKVCache
+    from .models.cache import should_quantize_kv_layer
 
     if not matched_blocks:
         return []
@@ -3469,26 +3736,34 @@ def make_warm_batch_kv_cache(
         vs = [b.values[layer_idx] for b in matched_blocks]
         merged_k = mx.concatenate(ks, axis=2)  # [1, H, prefix_len, D]
         merged_v = mx.concatenate(vs, axis=2)
-        c = BatchKVCache(left_padding=[0])
-        # state setter: (keys, values, offset, left_padding) → also sets _idx
-        c.state = (
-            merged_k,
-            merged_v,
-            mx.array([prefix_len]),
-            mx.array([0]),
+        quantize = kv_quant_config is not None and should_quantize_kv_layer(
+            layer_idx, num_layers
         )
-        out.append(c)
+        out.append(
+            _fill_batch_layer_cache(
+                merged_k,
+                merged_v,
+                left_padding=[0],
+                offset=[prefix_len],
+                quantize=quantize,
+                kv_quant_config=kv_quant_config,
+            )
+        )
     return out
 
 
 def make_warm_batch_kv_cache_multi(
     picks: List[Optional[dict]],
     num_layers: int,
+    kv_quant_config: Optional[dict] = None,
 ) -> Tuple[List[Any], int]:
-    """Build a multi-row ``BatchKVCache`` list for mixed warm / cold prefill.
+    """Build a multi-row batch cache list for mixed warm / cold prefill.
 
     ``picks`` is per-row, with each entry being ``None`` (cold) or a dict
     with key ``matched_blocks`` (list of APCBlock) and ``prefix_len``.
+
+    When *kv_quant_config* is provided, layer types match ``_make_cache`` via
+    ``should_quantize_kv_layer`` (last layer stays float when n > 2).
 
     Returns ``(cache_list, max_prefix)`` where ``max_prefix`` is the cache's
     ``_idx`` after warm-init (= max prefix_len across rows).
@@ -3498,7 +3773,7 @@ def make_warm_batch_kv_cache_multi(
       * keys[i, :, left_padding[i]:max_prefix, :] = concatenated block K
       * keys[i, :, :left_padding[i], :] = zeros (will be hidden by mask)
     """
-    from mlx_lm.models.cache import BatchKVCache
+    from .models.cache import should_quantize_kv_layer
 
     B = len(picks)
     prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
@@ -3554,14 +3829,19 @@ def make_warm_batch_kv_cache_multi(
 
         left_padding = [max_prefix - pl for pl in prefix_lens]
         offset = [pl for pl in prefix_lens]
-        c = BatchKVCache(left_padding=[0] * B)  # placeholder; state setter overrides
-        c.state = (
-            merged_k,
-            merged_v,
-            mx.array(offset),
-            mx.array(left_padding),
+        quantize = kv_quant_config is not None and should_quantize_kv_layer(
+            layer_idx, num_layers
         )
-        out.append(c)
+        out.append(
+            _fill_batch_layer_cache(
+                merged_k,
+                merged_v,
+                left_padding=left_padding,
+                offset=offset,
+                quantize=quantize,
+                kv_quant_config=kv_quant_config,
+            )
+        )
     return out, max_prefix
 
 
@@ -3573,81 +3853,91 @@ def _collect_mx_arrays(x: Any, out: List[mx.array]) -> None:
             _collect_mx_arrays(item, out)
 
 
-def _merge_arrays_cache_entries(
-    entries: Sequence[Any],
-    prefix_lens: Sequence[int],
-) -> Any:
-    from mlx_lm.models import cache as lm_cache
-
-    size = len(entries[0].cache)
-    out = lm_cache.ArraysCache(size)
-    merged_states: List[Optional[mx.array]] = []
-    for state_idx in range(size):
-        states = [entry.cache[state_idx] for entry in entries]
-        sample = next((s for s in states if s is not None), None)
-        if sample is None:
-            merged_states.append(None)
-            continue
-        rows = []
-        for state in states:
-            if state is None:
-                rows.append(mx.zeros((1,) + sample.shape[1:], dtype=sample.dtype))
-            else:
-                rows.append(state[:1])
-        merged_states.append(mx.concatenate(rows, axis=0))
-    out.cache = merged_states
-    return out
-
-
 def _merge_exact_cache_entries(
     entries: Sequence[Any],
     prefix_lens: Sequence[int],
 ) -> Any:
-    from mlx_lm.models import cache as lm_cache
+    """Merge single-row exact snapshots via the registered cache adapter."""
+    from .apc_adapters import merge_cache_entries
 
-    from .models import cache as vlm_cache
+    return merge_cache_entries(entries, prefix_lens)
 
-    if not entries:
-        return None
-    first = entries[0]
-    if all(isinstance(c, lm_cache.KVCache) for c in entries):
-        return vlm_cache.BatchKVCache.merge(entries)
-    if all(isinstance(c, lm_cache.ChunkedKVCache) for c in entries):
-        return vlm_cache.BatchKVCache.merge(entries)
-    if all(isinstance(c, lm_cache.RotatingKVCache) for c in entries):
-        return vlm_cache.BatchRotatingKVCache.merge(entries)
-    if all(isinstance(c, lm_cache.ArraysCache) for c in entries):
-        return _merge_arrays_cache_entries(entries, prefix_lens)
-    if all(isinstance(c, lm_cache.CacheList) for c in entries):
-        merged = [
-            _merge_exact_cache_entries(
-                [entry.caches[i] for entry in entries],
-                prefix_lens,
+
+def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) -> Any:
+    """Empty quantized batch cache matching live ``_make_cache`` backend."""
+    policy = kv_quant_from_config(kv_quant_config)
+    from .turboquant import BatchTurboQuantKVCache
+
+    _reject_mixed_batch_policy(policy)
+    if policy.is_turboquant:
+        return BatchTurboQuantKVCache(
+            left_padding,
+            bits=policy.bits,
+            key_bits=policy.key.bits,
+            value_bits=policy.value.bits,
+        )
+    from .models.cache import BatchQuantizedKVCache
+
+    return BatchQuantizedKVCache(
+        left_padding,
+        group_size=policy.group_size,
+        bits=int(policy.bits),
+    )
+
+
+def _align_exact_batch_caches_to_kv_policy(
+    caches: List[Any],
+    kv_quant_config: dict,
+) -> List[Any]:
+    """Requant float full-attn batch layers to match live ``_make_cache``.
+
+    Exact store keeps float snapshots; continuous-batching join under
+    ``--kv-bits`` requires the same per-layer types as a cold live row
+    (uniform or TurboQuant for layers that ``should_quantize_kv_layer``
+    marks, float last layer when n > 2). Hybrid non-KV types
+    (``ArraysCache``, ``BatchRotatingKVCache``, …) are left unchanged.
+    """
+    from .models.cache import BatchKVCache, should_quantize_kv_layer
+
+    n = len(caches)
+    out: List[Any] = []
+    for layer_idx, c in enumerate(caches):
+        quantize = should_quantize_kv_layer(layer_idx, n)
+        if not quantize or not isinstance(c, BatchKVCache):
+            out.append(c)
+            continue
+        left_padding = [int(x) for x in c.left_padding.tolist()]
+        if c.keys is None or int(c._idx) == 0:
+            out.append(_empty_quant_batch_cache(left_padding, kv_quant_config))
+            continue
+        merged_k = c.keys[..., : int(c._idx), :]
+        merged_v = c.values[..., : int(c._idx), :]
+        offset = [int(x) for x in c.offset.tolist()]
+        out.append(
+            _fill_batch_layer_cache(
+                merged_k,
+                merged_v,
+                left_padding=left_padding,
+                offset=offset,
+                quantize=True,
+                kv_quant_config=kv_quant_config,
             )
-            for i in range(len(first.caches))
-        ]
-        if any(c is None for c in merged):
-            return None
-        return lm_cache.CacheList(*merged)
-    if all(isinstance(c, tuple) for c in entries):
-        merged = [
-            _merge_exact_cache_entries(
-                [entry[i] for entry in entries],
-                prefix_lens,
-            )
-            for i in range(len(first))
-        ]
-        if any(c is None for c in merged):
-            return None
-        return lm_cache.CacheList(*merged)
-    return None
+        )
+    return out
 
 
 def make_warm_batch_exact_cache_multi(
     row_caches: Sequence[Sequence[Any]],
     prefix_lens: Sequence[int],
+    kv_quant_config: Optional[dict] = None,
 ) -> Tuple[Optional[List[Any]], int]:
-    """Merge single-row exact-cache snapshots into batch-aware caches."""
+    """Merge single-row exact-cache snapshots into batch-aware caches.
+
+    When *kv_quant_config* is provided, full-attention ``BatchKVCache`` layers
+    are re-quantized to match live ``_make_cache`` via
+    ``should_quantize_kv_layer`` (last layer stays float when n > 2). Hybrid
+    non-KV entries are unchanged. On-disk exact snapshots remain float.
+    """
 
     if not row_caches:
         return [], 0
@@ -3666,6 +3956,9 @@ def make_warm_batch_exact_cache_multi(
         if merged is None:
             return None, 0
         out.append(merged)
+
+    if kv_quant_config is not None:
+        out = _align_exact_batch_caches_to_kv_policy(out, kv_quant_config)
 
     eval_targets: List[mx.array] = []
     for c in out:
@@ -3695,40 +3988,137 @@ def extract_prompt_cache_from_batch(
     return out
 
 
-def harvest_blocks_from_batch_cache(
-    apc_manager: "APCManager",
-    batch_caches: List[Any],
-    batch_idx: int,
-    full_token_ids: Sequence[int],
-    *,
-    extra_hash: int = 0,
-    skip_first_n_tokens: int = 0,
-) -> List[APCBlock]:
-    """Slice one row out of a batched KV cache and store its full blocks.
+def _prompt_cache_is_batch_shaped(caches: Sequence[Any]) -> bool:
+    """True when every entry can row-extract (Batch* / ArraysCache layout)."""
 
-    Used at the end of prompt prefill in continuous-batching mode to add
-    the new prefix to APC.
+    def can_extract_row(cache: Any) -> bool:
+        if not callable(getattr(cache, "extract", None)):
+            return False
+        children = getattr(cache, "caches", None)
+        if children is None:
+            return True
+        return all(can_extract_row(child) for child in children)
+
+    if not caches:
+        return False
+    return all(can_extract_row(cache) for cache in caches)
+
+
+def snapshot_prompt_cache_row(
+    caches: Sequence[Any],
+    batch_idx: int = 0,
+    *,
+    min_capacity_tokens: Optional[int] = None,
+) -> Optional[List[Any]]:
+    """Row-normalize a prompt cache for APC store/lookup.
+
+    Batch-shaped layouts (every entry has ``extract``) are extracted first.
+    Single-row caches are cloned in place. Quantized layers are dequantized
+    into float ``KVCache`` entries.
     """
-    layer_keys: List[mx.array] = []
-    layer_values: List[mx.array] = []
-    for c in batch_caches:
-        keys = getattr(c, "keys", None)
-        values = getattr(c, "values", None)
-        idx = getattr(c, "_idx", None)
+    if not caches:
+        return []
+    source: Sequence[Any] = caches
+    if _prompt_cache_is_batch_shaped(caches):
+        row = extract_prompt_cache_from_batch(caches, batch_idx)
+        if row is None:
+            return None
+        source = row
+    return _clone_prompt_cache_for_apc(source, min_capacity_tokens=min_capacity_tokens)
+
+
+def layer_kv_for_apc(
+    c: Any,
+    batch_idx: Optional[int] = None,
+) -> Tuple[Optional[mx.array], Optional[mx.array]]:
+    """Return float K/V for one layer for block-mode APC harvest.
+
+    Prefer this over slicing ``c.keys`` directly: quantized caches store keys
+    as a tuple and dense slicing raises TypeError.
+    """
+    if hasattr(c, "dequantize_for_apc"):
+        dk, dv = c.dequantize_for_apc()
+        if dk is None or dv is None:
+            return None, None
         left_padding = getattr(c, "left_padding", None)
-        if keys is None or values is None or idx is None:
-            return []
-        # Pull this batch row, dropping any left-padding for this seq.
-        if left_padding is not None:
+        lp = 0
+        if batch_idx is not None and left_padding is not None:
             try:
                 lp = int(left_padding[batch_idx].item())
             except Exception:
                 lp = 0
-        else:
+        if batch_idx is not None and int(dk.shape[0]) > 1:
+            return (
+                dk[batch_idx : batch_idx + 1, :, lp:, :],
+                dv[batch_idx : batch_idx + 1, :, lp:, :],
+            )
+        if lp > 0:
+            return dk[..., lp:, :], dv[..., lp:, :]
+        return dk, dv
+
+    keys = getattr(c, "keys", None)
+    values = getattr(c, "values", None)
+    if keys is None or values is None:
+        return None, None
+    # Tuple keys without dequantize_for_apc cannot be sliced as dense arrays.
+    if isinstance(keys, tuple) or isinstance(values, tuple):
+        return None, None
+
+    left_padding = getattr(c, "left_padding", None)
+    idx = getattr(c, "_idx", None)
+    if idx is None:
+        off = getattr(c, "offset", None)
+        if off is None:
+            return None, None
+        try:
+            end = int(off)
+        except Exception:
+            return None, None
+        return keys[..., :end, :], values[..., :end, :]
+
+    lp = 0
+    if batch_idx is not None and left_padding is not None:
+        try:
+            lp = int(left_padding[batch_idx].item())
+        except Exception:
             lp = 0
-        # shape after slicing: [1, H, idx-lp, D]
-        layer_keys.append(keys[batch_idx : batch_idx + 1, :, lp:idx, :])
-        layer_values.append(values[batch_idx : batch_idx + 1, :, lp:idx, :])
+    end = int(idx)
+    if batch_idx is not None and int(keys.shape[0]) > 1:
+        return (
+            keys[batch_idx : batch_idx + 1, :, lp:end, :],
+            values[batch_idx : batch_idx + 1, :, lp:end, :],
+        )
+    if lp > 0:
+        return keys[..., lp:end, :], values[..., lp:end, :]
+    return keys[..., :end, :], values[..., :end, :]
+
+
+def harvest_blocks_from_batch_cache(
+    apc_manager: "APCManager",
+    batch_caches: List[Any],
+    full_token_ids: Sequence[int],
+    *,
+    batch_idx: Optional[int] = None,
+    extra_hash: int = 0,
+    skip_first_n_tokens: int = 0,
+) -> List[APCBlock]:
+    """Harvest full blocks from a prompt cache and store them.
+
+    With ``batch_idx`` set, slices one row out of a batched KV cache
+    (continuous-batching prefill). With ``batch_idx`` unset, harvests a
+    single-request cache. Either way, adds the new prefix to APC.
+    """
+    layer_keys: List[mx.array] = []
+    layer_values: List[mx.array] = []
+    for c in batch_caches:
+        k, v = layer_kv_for_apc(c, batch_idx=batch_idx)
+        if k is None or v is None:
+            return []
+        if batch_idx is not None and int(k.shape[0]) != 1:
+            k = k[batch_idx : batch_idx + 1]
+            v = v[batch_idx : batch_idx + 1]
+        layer_keys.append(k)
+        layer_values.append(v)
     return apc_manager.store_kv_blocks(
         full_token_ids,
         layer_keys,
@@ -3736,6 +4126,29 @@ def harvest_blocks_from_batch_cache(
         extra_hash=extra_hash,
         skip_first_n_tokens=skip_first_n_tokens,
     )
+
+
+def commit_prefix_blocks(
+    apc_manager: "APCManager",
+    prompt_cache: List[Any],
+    full_token_ids: Sequence[int],
+    *,
+    batch_idx: Optional[int] = None,
+    extra_hash: int = 0,
+    skip_first_n_tokens: int = 0,
+    blocks_in_use: Sequence[APCBlock] = (),
+) -> List[APCBlock]:
+    """Harvest one (row of a) prompt cache into hashed blocks, store them, then release the in-use prefix blocks together with the new ones. Shared block-mode commit for both generate paths."""
+    new_blocks = harvest_blocks_from_batch_cache(
+        apc_manager,
+        prompt_cache,
+        full_token_ids,
+        batch_idx=batch_idx,
+        extra_hash=extra_hash,
+        skip_first_n_tokens=skip_first_n_tokens,
+    )
+    apc_manager.release(list(blocks_in_use) + new_blocks)
+    return new_blocks
 
 
 def model_apc_mode(language_model: Any) -> Optional[str]:
@@ -3763,23 +4176,329 @@ def model_supports_apc(language_model: Any) -> bool:
     return model_apc_mode(language_model) is not None
 
 
-def from_env(model_namespace: Optional[str] = None) -> Optional[APCManager]:
-    """Build an APCManager from env vars when ``APC_ENABLED=1``, else None.
-
-    When ``APC_DISK_PATH`` is set, also wires up the shard-based SSD tier.
-    The disk read path defaults to direct file reads so restored K/V tensors
-    are MLX-owned buffers rather than mmap-backed safetensors views.
-    """
-    if os.environ.get("APC_ENABLED", "0") not in ("1", "true", "True", "yes"):
+def apc_lookup_plan(
+    manager: "APCManager",
+    ids_list: Sequence[int],
+    *,
+    extra_hash: int,
+    apc_mode: str,
+    safe_lookup_min: int,
+    suffix_is_text_only,
+    prefix_has_media,
+) -> Optional[dict]:
+    """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply."""
+    n = len(ids_list)
+    if not ids_list or n < 2:
         return None
-    block_size = int(os.environ.get("APC_BLOCK_SIZE", DEFAULT_BLOCK_SIZE))
-    num_blocks = int(os.environ.get("APC_NUM_BLOCKS", DEFAULT_NUM_BLOCKS))
+
+    if apc_mode == "exact":
+        exact_cache, exact_prefix_len = manager.lookup_exact_cache(
+            ids_list, extra_hash=extra_hash, min_prefix_tokens=safe_lookup_min
+        )
+        if exact_cache is not None and 0 < exact_prefix_len < n:
+            if not suffix_is_text_only(exact_prefix_len):
+                return None
+            return {
+                "matched_blocks": [],
+                "warm_cache": exact_cache,
+                "prefix_len": exact_prefix_len,
+                "extra_hash": extra_hash,
+                "full_input_ids": list(ids_list),
+            }
+        return None
+
+    matched, prefix_len = manager.lookup_prefix(ids_list, extra_hash=extra_hash)
+    if prefix_len > 0 and prefix_has_media(prefix_len):
+        manager.release(matched)
+        matched = []
+        prefix_len = 0
+    exact_cache = None
+    exact_prefix_len = 0
+    if prefix_len < n:
+        exact_cache, exact_prefix_len = manager.lookup_exact_cache(
+            ids_list,
+            extra_hash=extra_hash,
+            min_prefix_tokens=max(prefix_len, safe_lookup_min),
+        )
+    warm_cache = None
+    disk_prefix_len = 0
+    if max(prefix_len, exact_prefix_len) < n:
+        warm_cache, disk_prefix_len = manager.lookup_prefix_disk_cache(
+            ids_list,
+            extra_hash=extra_hash,
+            min_prefix_tokens=max(prefix_len, exact_prefix_len, safe_lookup_min),
+            allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
+        )
+    if disk_prefix_len > max(prefix_len, exact_prefix_len) and disk_prefix_len < n:
+        if matched:
+            manager.release(matched)
+        if not suffix_is_text_only(disk_prefix_len):
+            return None
+        return {
+            "matched_blocks": [],
+            "warm_cache": warm_cache,
+            "prefix_len": disk_prefix_len,
+            "extra_hash": extra_hash,
+            "full_input_ids": list(ids_list),
+        }
+    if exact_prefix_len > prefix_len and exact_prefix_len < n:
+        if matched:
+            manager.release(matched)
+        if not suffix_is_text_only(exact_prefix_len):
+            return None
+        return {
+            "matched_blocks": [],
+            "warm_cache": exact_cache,
+            "prefix_len": exact_prefix_len,
+            "extra_hash": extra_hash,
+            "full_input_ids": list(ids_list),
+        }
+    if 0 < prefix_len < n:
+        if not suffix_is_text_only(prefix_len):
+            manager.release(matched)
+            return None
+        return {
+            "matched_blocks": matched,
+            "prefix_len": prefix_len,
+            "extra_hash": extra_hash,
+            "full_input_ids": list(ids_list),
+        }
+    if matched:
+        manager.release(matched)
+    return None
+
+
+def _adapter_schema_version() -> int:
+    from .apc_adapters import ADAPTER_SCHEMA_VERSION
+
+    return ADAPTER_SCHEMA_VERSION
+
+
+@dataclass(frozen=True)
+class LayerSupport:
+    """Per-layer result from :func:`classify_layer_for_apc`."""
+
+    type_name: str
+    status: str  # "ok" | "empty_ok" | "unsupported"
+    reason: Optional[str] = None
+    capability: Optional[str] = None
+
+
+@dataclass
+class APCSelfCheckResult:
+    """Outcome of a dry-run layout check (startup self-check / diagnostics)."""
+
+    ok: bool
+    apc_mode: Optional[str]
+    layer_count: int
+    layer_types: List[str]
+    unsupported: List[LayerSupport] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+    capabilities: List[str] = field(default_factory=list)
+    schema_version: int = field(default_factory=_adapter_schema_version)
+
+
+def _layer_capability(c: Any) -> Optional[str]:
+    from .apc_adapters import resolve_capability
+
+    try:
+        return resolve_capability(c).value
+    except Exception:
+        return None
+
+
+def classify_layer_for_apc(c: Any) -> LayerSupport:
+    """Classify whether one prompt-cache layer can be snapshotted for APC.
+
+    Uses the same clone path as exact store so startup checks match runtime.
+    Empty layers that clone to a storage-native type count as ``empty_ok``.
+    """
+    type_name = type(c).__name__
+    capability = _layer_capability(c)
+    is_empty = False
+    empty_fn = getattr(c, "empty", None)
+    if callable(empty_fn):
+        try:
+            is_empty = bool(empty_fn())
+        except Exception:
+            is_empty = False
+
+    eval_targets: List[mx.array] = []
+    try:
+        copied = _clone_cache_entry_for_apc(
+            c,
+            min_capacity_tokens=None,
+            eval_targets=eval_targets,
+        )
+    except Exception as exc:
+        return LayerSupport(
+            type_name=type_name,
+            status="unsupported",
+            reason=f"clone_error:{type(exc).__name__}",
+            capability=capability,
+        )
+    if copied is None:
+        return LayerSupport(
+            type_name=type_name,
+            status="unsupported",
+            reason="unclonable",
+            capability=capability,
+        )
+    return LayerSupport(
+        type_name=type_name,
+        status="empty_ok" if is_empty else "ok",
+        capability=capability,
+    )
+
+
+def validate_prompt_cache_layout(
+    caches: Sequence[Any],
+    *,
+    apc_mode: Optional[str] = None,
+) -> APCSelfCheckResult:
+    """Validate a prompt-cache layout for APC without running a model forward."""
+    classified = [classify_layer_for_apc(c) for c in caches]
+    unsupported = [layer for layer in classified if layer.status == "unsupported"]
+    return APCSelfCheckResult(
+        ok=not unsupported,
+        apc_mode=apc_mode,
+        layer_count=len(caches),
+        layer_types=[layer.type_name for layer in classified],
+        unsupported=unsupported,
+        capabilities=[layer.capability or "unknown" for layer in classified],
+    )
+
+
+def self_check_model_apc(
+    model: Any,
+    *,
+    kv_bits: Optional[float] = None,
+    log: bool = True,
+) -> APCSelfCheckResult:
+    """Dry-run APC layout check for a loaded model (or its ``language_model``).
+
+    Non-fatal by design: logs ERROR on failure and returns a result. Callers
+    (e.g. server load) should not crash solely because the check fails.
+    """
+    notes: List[str] = []
+    if kv_bits is not None:
+        notes.append(f"kv_bits={kv_bits}")
+
+    try:
+        language_model = (
+            model.language_model if hasattr(model, "language_model") else model
+        )
+        if not hasattr(language_model, "make_cache"):
+            result = APCSelfCheckResult(
+                ok=False,
+                apc_mode=None,
+                layer_count=0,
+                layer_types=[],
+                notes=notes + ["model has no make_cache"],
+            )
+        else:
+            apc_mode = model_apc_mode(language_model)
+            if apc_mode is None:
+                result = APCSelfCheckResult(
+                    ok=False,
+                    apc_mode=None,
+                    layer_count=0,
+                    layer_types=[],
+                    notes=notes + ["no APC-compatible cache layout"],
+                )
+            else:
+                caches = language_model.make_cache()
+                result = validate_prompt_cache_layout(caches, apc_mode=apc_mode)
+                result.notes = list(notes) + list(result.notes)
+    except Exception as exc:
+        result = APCSelfCheckResult(
+            ok=False,
+            apc_mode=None,
+            layer_count=0,
+            layer_types=[],
+            notes=notes + [f"self-check failed: {type(exc).__name__}: {exc}"],
+        )
+
+    if log:
+        types_s = ",".join(result.layer_types) if result.layer_types else "-"
+        caps_s = ",".join(result.capabilities) if result.capabilities else "-"
+        if result.ok:
+            logger.info(
+                "APC self-check ok mode=%s schema=v%d layers=%d types=[%s] caps=[%s]%s",
+                result.apc_mode,
+                result.schema_version,
+                result.layer_count,
+                types_s,
+                caps_s,
+                f" kv_bits={kv_bits}" if kv_bits is not None else "",
+            )
+        else:
+            bad = [
+                f"{layer.type_name}:{layer.reason or layer.status}"
+                for layer in result.unsupported
+            ]
+            logger.error(
+                "APC self-check failed mode=%s schema=v%d layers=%d unsupported=%s notes=%s",
+                result.apc_mode,
+                result.schema_version,
+                result.layer_count,
+                bad or result.notes,
+                result.notes,
+            )
+
+    apc_trace(
+        "self_check",
+        ok=result.ok,
+        mode=result.apc_mode,
+        schema_version=result.schema_version,
+        layers=result.layer_count,
+        unsupported=len(result.unsupported),
+        kv_bits=kv_bits,
+    )
+    return result
+
+
+def from_env(
+    model_namespace: Optional[str] = None,
+    overrides: Optional[dict] = None,
+) -> Optional[APCManager]:
+    """Build an APCManager when enabled; read knobs from env (default) or
+    ``overrides`` (keys: enabled, disk_path, block_size, num_blocks,
+    disk_max_gb) so live settings can drive APC without env mutation."""
+    if overrides is not None and "enabled" in overrides:
+        enabled = bool(overrides["enabled"])
+    else:
+        enabled = os.environ.get("APC_ENABLED", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+    if not enabled:
+        return None
+
+    def _ov_int(override_key: str, env_name: str, default: int) -> int:
+        if (
+            overrides is not None
+            and override_key in overrides
+            and overrides[override_key] is not None
+        ):
+            return int(overrides[override_key])
+        return int(os.environ.get(env_name, default))
+
+    block_size = _ov_int("block_size", "APC_BLOCK_SIZE", DEFAULT_BLOCK_SIZE)
+    num_blocks = _ov_int("num_blocks", "APC_NUM_BLOCKS", DEFAULT_NUM_BLOCKS)
 
     disk: Optional[DiskBlockStore] = None
-    disk_path = os.environ.get("APC_DISK_PATH")
+    if overrides is not None and overrides.get("disk_path") is not None:
+        disk_path = overrides["disk_path"]
+    else:
+        disk_path = os.environ.get("APC_DISK_PATH")
     if disk_path:
         ns = model_namespace or os.environ.get("APC_DISK_NAMESPACE", "default")
-        max_gb = float(os.environ.get("APC_DISK_MAX_GB", 0))
+        if overrides is not None and overrides.get("disk_max_gb") is not None:
+            max_gb = float(overrides["disk_max_gb"])
+        else:
+            max_gb = float(os.environ.get("APC_DISK_MAX_GB", 0))
         max_bytes = int(max_gb * (1 << 30)) if max_gb > 0 else None
         workers = int(os.environ.get("APC_DISK_WORKERS", "1"))
         try:

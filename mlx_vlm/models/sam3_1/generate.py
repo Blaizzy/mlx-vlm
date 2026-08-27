@@ -12,6 +12,7 @@ import mlx.nn as nn
 import numpy as np
 from PIL import Image
 
+from ..._stream_cleanup import clear_mlx_streams
 from ..sam3.generate import (
     DetectionResult,
     Sam3Predictor,
@@ -794,6 +795,12 @@ def track_video_realtime(
 
     # --- Thread 2: Inference (backbone caching + tracker propagation) ---
     def inference_loop():
+        try:
+            inference_loop_impl()
+        finally:
+            clear_mlx_streams()
+
+    def inference_loop_impl():
         backbone_cache = {"features": None}
         encoder_cache = {}
         tracker_state = {"memory_bank": [], "n_objects": 0, "labels": []}

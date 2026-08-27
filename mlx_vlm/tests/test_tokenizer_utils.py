@@ -711,6 +711,20 @@ class TestBPEStreamingDetokenizer:
 
         assert detokenizer.text == "Got it, the user"
 
+    def test_invalid_byte_sequence_before_space_does_not_raise(self):
+        tokenizer = MockBPETokenizer()
+        tokenizer.vocab = {
+            "¡": 0,  # byte 0xA1 is not valid UTF-8 by itself
+            "Ġnext": 1,
+        }
+        detokenizer = BPEStreamingDetokenizer(tokenizer)
+
+        detokenizer.add_token(0)
+        detokenizer.add_token(1)
+        detokenizer.finalize()
+
+        assert detokenizer.text == f"{REPLACEMENT_CHAR} next"
+
 
 # ============================================================================
 # Tests for TokenizerWrapper

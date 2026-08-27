@@ -3,6 +3,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..mlp import TanhGELUMLP as MLP
 from .config import VisionConfig
 
 
@@ -33,17 +34,6 @@ class Attention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.proj(output)
-
-
-class MLP(nn.Module):
-    def __init__(self, config: VisionConfig):
-        super().__init__()
-        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=True)
-        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=True)
-        self.act = nn.GELU(approx="tanh")
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.fc2(self.act(self.fc1(x)))
 
 
 class EncoderBlock(nn.Module):

@@ -2,9 +2,9 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.qwen2 import Qwen2Model
 
 from ..base import LanguageModelOutput
+from ..qwen2.language import Qwen2Model
 from .config import TextConfig
 
 

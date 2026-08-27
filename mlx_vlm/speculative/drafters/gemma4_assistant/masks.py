@@ -11,7 +11,8 @@ longer than the sliding window.
 from typing import Optional, Tuple, Union
 
 import mlx.core as mx
-from mlx_lm.models.cache import dynamic_roll
+
+from ....models.cache import dynamic_roll
 
 
 def _single_value_or_none(value):

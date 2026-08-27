@@ -4,16 +4,16 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn import RMSNorm
-from mlx_lm.models.base import create_causal_mask
 
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    create_causal_mask,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
+from ..rope_utils import initialize_rope
 from .config import TextConfig
-from .rope_utils import initialize_rope
 
 
 @partial(mx.compile, shapeless=True)
@@ -106,11 +106,11 @@ class GeGLU(nn.Module):
 
 
 class Experts(nn.Module):
-    """Sparse MoE using mlx_lm SwitchGLU with gather_mm."""
+    """Sparse MoE using SwitchGLU with gather_mm."""
 
     def __init__(self, config: TextConfig):
         super().__init__()
-        from mlx_lm.models.switch_layers import SwitchGLU
+        from ..switch_layers import SwitchGLU
 
         self.switch_glu = SwitchGLU(
             input_dims=config.hidden_size,
@@ -474,6 +474,8 @@ class Gemma4TextModel(nn.Module):
             return base_mask
         if mm_token_type_ids.shape[1] != base_mask.shape[-1]:
             return base_mask
+        if base_mask.shape[-2] != base_mask.shape[-1]:
+            return base_mask
 
         block_sequence_ids = self._block_sequence_ids_for_mask(mm_token_type_ids)
         q_blocks = mx.expand_dims(block_sequence_ids, -1)
@@ -485,10 +487,6 @@ class Gemma4TextModel(nn.Module):
         """Create attention masks, deduplicated by layer type."""
         mask = {}
         masks = []
-        has_audio_tokens = (
-            mm_token_type_ids is not None
-            and int(mx.sum(mm_token_type_ids == 3).item()) > 0
-        )
         has_visual_tokens = (
             mm_token_type_ids is not None
             and int(mx.sum((mm_token_type_ids == 1) | (mm_token_type_ids == 2)).item())
@@ -500,7 +498,6 @@ class Gemma4TextModel(nn.Module):
             getattr(self.config, "use_bidirectional_attention", None) == "vision"
             and mm_token_type_ids is not None
             and has_visual_tokens
-            and not has_audio_tokens
             and h.shape[1] > 1
         )
         for l, c in zip(self.layers, cache):
@@ -653,6 +650,8 @@ class Gemma4TextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    supports_logits_to_keep = True
+
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
@@ -729,6 +728,7 @@ class LanguageModel(nn.Module):
         # Allow callers to pass pre-allocated sinks directly.
         hidden_sink = kwargs.pop("hidden_sink", hidden_sink)
         shared_kv_sink = kwargs.pop("shared_kv_sink", shared_kv_sink)
+        logits_to_keep = kwargs.pop("logits_to_keep", None)
 
         out = self.model(
             inputs,
@@ -741,6 +741,8 @@ class LanguageModel(nn.Module):
             shared_kv_sink=shared_kv_sink,
             **kwargs,
         )
+        if logits_to_keep:
+            out = out[:, -int(logits_to_keep) :, :]
         out = self.logits_from_hidden(out)
         return LanguageModelOutput(
             logits=out,
@@ -786,8 +788,12 @@ class LanguageModel(nn.Module):
                 for bi in range(accepted.shape[0]):
                     start = verify_start + int(ve[bi])
                     if start < kv_len:
-                        c.keys[bi, :, start:kv_len, :] = 0
-                        c.values[bi, :, start:kv_len, :] = 0
+                        zero_row_tail = getattr(c, "zero_row_tail", None)
+                        if callable(zero_row_tail):
+                            zero_row_tail(bi, start, kv_len)
+                        else:
+                            c.keys[bi, :, start:kv_len, :] = 0
+                            c.values[bi, :, start:kv_len, :] = 0
         return max_a
 
     def sanitize(self, weights):

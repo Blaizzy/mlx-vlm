@@ -13,6 +13,10 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from ..base import load_chat_template, to_mlx
+from ..pixtral.image_processing_pixtral import (
+    PixtralImageProcessor,
+    split_image_sizes_by_sample,
+)
 
 
 def is_url(val) -> bool:
@@ -24,19 +28,9 @@ def is_image_or_image_url(elem):
 
 
 def _load_mistral3_image_processor(pretrained_model_name_or_path, **kwargs):
-    from transformers import AutoImageProcessor
-
-    try:
-        return AutoImageProcessor.from_pretrained(
-            pretrained_model_name_or_path,
-            use_fast=False,
-            **kwargs,
-        )
-    except ValueError:
-        return AutoImageProcessor.from_pretrained(
-            pretrained_model_name_or_path,
-            **kwargs,
-        )
+    return PixtralImageProcessor.from_pretrained(
+        pretrained_model_name_or_path, **kwargs
+    )
 
 
 class Mistral3Processor(ProcessorMixin):
@@ -109,24 +103,22 @@ class Mistral3Processor(ProcessorMixin):
                 for sample in images
             ]
 
-            image_inputs = self.image_processor(images)
+            image_inputs = self.image_processor(
+                images, patch_size=self.patch_size * self.spatial_merge_size
+            )
 
             if text is not None:
-                image_sizes = image_inputs.get("image_sizes", [])
+                image_sizes_by_sample = split_image_sizes_by_sample(
+                    image_inputs.get("image_sizes", []), images
+                )
                 prompt_strings = []
                 for batch_idx, sample in enumerate(text):
                     if self.image_token in sample:
                         sample_sizes = (
-                            image_sizes[batch_idx]
-                            if batch_idx < len(image_sizes)
+                            image_sizes_by_sample[batch_idx]
+                            if batch_idx < len(image_sizes_by_sample)
                             else []
                         )
-                        # Normalize: slow processor returns [(h,w)] flat,
-                        # ensure it's a list of tuples
-                        if sample_sizes and not isinstance(
-                            sample_sizes[0], (list, tuple)
-                        ):
-                            sample_sizes = [sample_sizes]
                         parts = sample.split(self.image_token)
                         new_sample = parts[0]
                         for img_idx in range(len(parts) - 1):
@@ -149,7 +141,7 @@ class Mistral3Processor(ProcessorMixin):
                         prompt_strings.append(sample)
                 text = prompt_strings
 
-        return_tensors = kwargs.pop("return_tensors", None)
+        kwargs.pop("return_tensors", None)
 
         if text is not None:
             text_inputs = self.tokenizer(text, **kwargs)
@@ -247,6 +239,6 @@ class Mistral3Processor(ProcessorMixin):
 
 __all__ = ["Mistral3Processor"]
 
-from ..base import install_auto_processor_patch
+from ..base import install_auto_processor_patch  # noqa: E402
 
 install_auto_processor_patch("mistral3", Mistral3Processor)
