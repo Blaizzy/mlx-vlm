@@ -1242,3 +1242,102 @@ def test_positive_desired_prefix_is_unchanged():
     tokens = list(range(1, 100))
 
     assert apc_module.adjust_prefix_to_text_suffix_boundary(tokens, 40, []) == 40
+
+
+def test_exact_cache_disk_restore_preserves_integer_states(tmp_path, monkeypatch):
+    """Exact snapshots with integer state tensors must roundtrip via disk.
+
+    Hybrid models keep non-KV per-layer state in ``ArraysCache`` slots; for
+    qwen4_exp (Qwen3.8-Flash-Next) one DeltaNet slot is an int64 tensor. The
+    bespoke safetensors reader previously only mapped BF16/F16/F32, so
+    ``_read_safetensors_tensor`` returned None for the int64 slot and the
+    whole exact snapshot silently failed to load (lookup hit, restore no-op,
+    full re-prefill on every request).
+    """
+    from mlx_vlm.models.cache import ArraysCache, KVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+
+    token_ids = list(range(40))
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 2))
+    kv.values = mx.ones((1, 1, len(token_ids), 2)) * 2
+    kv.offset = len(token_ids)
+    arrays = ArraysCache(size=4)
+    arrays[0] = mx.ones((1, 3, 4), dtype=mx.bfloat16)
+    arrays[1] = mx.ones((1, 2, 3)) * 3
+    arrays[2] = mx.array([[len(token_ids), 0]], dtype=mx.int64)
+    arrays[3] = mx.array([[7]], dtype=mx.int32)
+
+    disk = DiskBlockStore(tmp_path, namespace="exact-int")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [arrays, kv], extra_hash=23)
+    disk._q.join()
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="exact-int")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    warm, matched_tokens = manager.lookup_exact_cache(
+        token_ids + [999],
+        extra_hash=23,
+    )
+
+    assert matched_tokens == len(token_ids)
+    assert warm is not None
+    assert warm[0][2].dtype == mx.int64
+    assert warm[0][3].dtype == mx.int32
+    assert mx.array_equal(warm[0][2], arrays[2])
+    assert mx.array_equal(warm[0][3], arrays[3])
+    _assert_allclose(warm[0][1], arrays[1])
+    manager.close()
+
+
+def test_make_warm_batch_exact_cache_multi_single_row_preserves_subclass():
+    """A single-row exact restore must serve model-specific cache subclasses.
+
+    ``merge_cache_entries`` matches plain ``KVCache`` by exact type and has
+    no adapter for model-specific subclasses (e.g. qwen4_exp's QSAKVCache,
+    which carries indexer state), so batch-merging a single row silently
+    returned None and the warm hit was dropped. With one row there is
+    nothing to merge: the snapshot caches are exactly what a cold b=1
+    prefill uses, so they can be served directly.
+    """
+    from mlx_vlm.models.cache import KVCache
+
+    class _AuxKVCache(KVCache):
+        """Minimal stand-in for QSAKVCache-style subclasses."""
+
+        def __init__(self):
+            super().__init__()
+            self.aux = None
+
+        @property
+        def state(self):
+            return self.keys, self.values, self.aux
+
+        @state.setter
+        def state(self, value):
+            self.keys, self.values, self.aux = value
+            self.offset = 0 if self.keys is None else self.keys.shape[2]
+
+    n = 24
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, n, 2))
+    kv.values = mx.ones((1, 1, n, 2)) * 2
+    kv.offset = n
+    aux = _AuxKVCache()
+    aux.keys = mx.ones((1, 1, n, 2)) * 3
+    aux.values = mx.ones((1, 1, n, 2)) * 4
+    aux.offset = n
+    aux.aux = mx.arange(n)[None, :]
+
+    warm, served = make_warm_batch_exact_cache_multi([[kv, aux]], [n])
+
+    assert warm is not None
+    assert served == n
+    assert type(warm[0]) is KVCache
+    assert type(warm[1]) is _AuxKVCache
+    assert warm[1].offset == n
+    assert warm[1].aux is not None
+    assert mx.array_equal(warm[1].aux, aux.aux)
+    _assert_allclose(warm[0].keys, kv.keys)

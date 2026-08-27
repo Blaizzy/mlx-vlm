@@ -695,6 +695,14 @@ def _safetensors_dtype_info(dtype: str):
     mapping = {
         "F16": (np.dtype("<f2"), mx.float16, None),
         "F32": (np.dtype("<f4"), mx.float32, None),
+        "I64": (np.dtype("<i8"), mx.int64, None),
+        "I32": (np.dtype("<i4"), mx.int32, None),
+        "I16": (np.dtype("<i2"), mx.int16, None),
+        "I8": (np.dtype("i1"), mx.int8, None),
+        "U8": (np.dtype("u1"), mx.uint8, None),
+        "U32": (np.dtype("<u4"), mx.uint32, None),
+        "U64": (np.dtype("<u8"), mx.uint64, None),
+        "BOOL": (np.dtype("?"), mx.bool_, None),
     }
     return mapping.get(dtype)
 
@@ -3954,6 +3962,22 @@ def make_warm_batch_exact_cache_multi(
             prefix_lens,
         )
         if merged is None:
+            # Single-row fallback: a model-specific cache subclass (e.g.
+            # qwen4_exp's QSAKVCache with indexer state) has no batch merge
+            # adapter. With one row there is nothing to merge — the snapshot
+            # caches are exactly what a cold b=1 prefill would use (and what
+            # speculative/MTP decoding already runs against), so serve them
+            # directly instead of silently dropping the warm hit. Restricted
+            # to float KV (no quant policy) since exact snapshots are stored
+            # in float and could not join a quantized live batch.
+            if len(row_caches) == 1 and kv_quant_config is None:
+                single = list(row_caches[0])
+                eval_targets: List[mx.array] = []
+                for c in single:
+                    _collect_mx_arrays(c.state, eval_targets)
+                if eval_targets:
+                    mx.eval(eval_targets)
+                return single, int(prefix_lens[0])
             return None, 0
         out.append(merged)
 
