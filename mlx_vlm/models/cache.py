@@ -771,11 +771,21 @@ class ChunkedKVCache(_BaseCache):
         self.start_position = 0
 
     def maybe_trim_front(self):
-        # Maintain the cache below the chunk size
-        if self.keys is not None and self.keys.shape[2] >= self.chunk_size:
-            self.start_position += self.keys.shape[2] - self.chunk_size
-            self.keys = self.keys[..., -self.chunk_size :, :]
-            self.values = self.values[..., -self.chunk_size :, :]
+        # Maintain the cache below the chunk size.
+        #
+        # Trim on the number of valid cached tokens, not on the allocated
+        # buffer width: update_and_fetch pads the buffer up to a multiple of
+        # ``step``, so ``self.keys.shape[2]`` overstates how much live data is
+        # there and the old arithmetic dropped up to ``step - 1`` valid tokens
+        # off the front of the attention window on every trim.
+        if self.keys is None:
+            return
+        valid = self.offset - self.start_position
+        if valid > self.chunk_size:
+            trim = valid - self.chunk_size
+            self.start_position += trim
+            self.keys = self.keys[..., trim:valid, :]
+            self.values = self.values[..., trim:valid, :]
 
     def update_and_fetch(self, keys, values):
         prev = self.offset - self.start_position
