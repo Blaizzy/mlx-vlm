@@ -14,6 +14,7 @@ class Glm5NextMTPDraftModel(nn.Module):
     prefer_requested_block_size = True
     requires_uniform_batch_acceptance = True
     supports_ragged_batch_acceptance = False
+    requires_filterable_batch_cache = True
 
     # Never-lose gate: a single nextn head caps the block at 2 tokens, so a round
     # only pays off when the draft is accepted often enough to clear the verify

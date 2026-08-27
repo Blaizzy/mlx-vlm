@@ -980,7 +980,9 @@ def _mtp_rounds_batch(
     row_ids = list(range(B)) if row_ids is None else list(row_ids)
     block_total = _dflash_block_total(draft_model, draft_block_size)
     configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
-    if getattr(draft_model, "supports_ragged_batch_acceptance", False):
+    if getattr(draft_model, "supports_ragged_batch_acceptance", False) or (
+        B > 1 and getattr(draft_model, "requires_filterable_batch_cache", False)
+    ):
         draft_model.reset(model, left_padding=[0] * B)
     else:
         draft_model.reset(model)

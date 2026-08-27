@@ -3554,6 +3554,76 @@ class TestModels(unittest.TestCase):
         self.assertLess(seen.count(2), seen.count(1))  # mostly paused
         self.assertEqual(ctl.block_total(1), 1)  # end-of-budget stops
 
+    def test_glm5_next_mtp_batch_generation_matches_target(self):
+        from mlx_vlm.generate import BatchGenerator
+        from mlx_vlm.models.glm5_next.language import LanguageModel
+        from mlx_vlm.speculative.drafters.glm5_next_mtp import Model, ModelConfig
+
+        class NeverStop:
+            def __call__(self, _token):
+                return False
+
+            def add_eos_token_ids(self, _tokens):
+                return None
+
+        def generate(target, prompts, max_tokens, drafter=None):
+            processor = SimpleNamespace(
+                tokenizer=SimpleNamespace(stopping_criteria=NeverStop())
+            )
+            generator = BatchGenerator(
+                target,
+                processor,
+                prefill_batch_size=2,
+                completion_batch_size=2,
+                prefill_step_size=None,
+                draft_model=drafter,
+                draft_kind="mtp" if drafter is not None else None,
+                draft_block_size=2,
+                greedy_sampling=True,
+            )
+            prompt_kwargs = [
+                {
+                    "inputs_embeds": target.model.embed_tokens(
+                        mx.array([prompt], dtype=mx.int32)
+                    )
+                }
+                for prompt in prompts
+            ]
+            uids = generator.insert(
+                prompts, max_tokens=max_tokens, prompt_kwargs=prompt_kwargs
+            )
+            tokens = {uid: [] for uid in uids}
+            try:
+                for _ in range(32):
+                    if not generator.has_work:
+                        break
+                    _, responses = generator.next()
+                    for response in responses:
+                        if response.token is not None:
+                            tokens[response.uid].append(int(response.token))
+                self.assertFalse(generator.has_work)
+            finally:
+                generator.close()
+            return [tokens[uid] for uid in uids]
+
+        mx.random.seed(0)
+        config = self._glm5_next_mtp_text_config()
+        target = LanguageModel(config)
+        target.eval()
+        mx.eval(target.parameters())
+        prompts = [[2, 4, 6], [3, 5, 7, 9, 11]]
+        max_tokens = [3, 5]
+
+        expected = generate(target, prompts, max_tokens)
+        drafter = Model(ModelConfig(text_config=config, block_size=2))
+        drafter.eval()
+        mx.eval(drafter.parameters())
+        actual = generate(target, prompts, max_tokens, drafter=drafter)
+
+        self.assertEqual(actual, expected)
+        self.assertEqual([len(row) for row in actual], max_tokens)
+        self.assertIn(0, drafter.accept_lens)
+
     def test_glm5_next_swiglu_clamp(self):
         # The text stack must apply config.swiglu_limit (reference clamps every text MLP);
         # the clamp must actually change the output when activations exceed the limit.
