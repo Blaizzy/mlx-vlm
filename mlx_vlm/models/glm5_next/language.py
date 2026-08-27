@@ -144,6 +144,9 @@ class Glm5NextLinearAttention(nn.Module):
     def _fused_in_proj(self, inputs):
         # q,k,v,f_a,g_a,b all take `inputs`; fuse into one matmul via a lossless
         # output-axis concat of the (quantized) weights, built once and cached.
+        # Returns ``None`` (and disables fusion) if the six projections do not share a
+        # single quantization -- a mixed-precision conversion would otherwise dequantize
+        # five of them with mods[0]'s group_size/bits.
         if not self._fused_ready:
             mods = [
                 self.q_proj,
@@ -153,6 +156,17 @@ class Glm5NextLinearAttention(nn.Module):
                 self.g_a_proj,
                 self.b_proj,
             ]
+            quantized = [hasattr(m, "scales") for m in mods]
+            homogeneous = all(quantized) or not any(quantized)
+            if homogeneous and all(quantized):
+                homogeneous = (
+                    len({m.group_size for m in mods}) == 1
+                    and len({m.bits for m in mods}) == 1
+                )
+            if not homogeneous:
+                self.fuse_in = False
+                self._fused_ready = True
+                return None
             pts, acc = [], 0
             for m in mods[:-1]:
                 acc += m.weight.shape[0]
@@ -187,8 +201,9 @@ class Glm5NextLinearAttention(nn.Module):
         gdn_sink: Optional[list] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
-        if self.fuse_in:
-            q_o, k_o, v_o, fa_o, ga_o, b_o = self._fused_in_proj(inputs)
+        fused = self._fused_in_proj(inputs) if self.fuse_in else None
+        if fused is not None:
+            q_o, k_o, v_o, fa_o, ga_o, b_o = fused
             mixed = mx.concatenate([q_o, k_o, v_o], axis=-1)
         else:
             mixed = mx.concatenate(

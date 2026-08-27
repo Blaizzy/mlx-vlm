@@ -3005,6 +3005,33 @@ class TestModels(unittest.TestCase):
             fused = kda(x, None, c2)
             self.assertEqual(float(mx.max(mx.abs(ref - fused))), 0.0)
 
+    def test_glm5_next_fused_in_proj_mixed_precision_fallback(self):
+        # A mixed-precision conversion (the six KDA input-projections not sharing one
+        # quantization) must NOT fuse -- fusing would dequantize five of them with
+        # mods[0]'s group_size/bits. _fused_in_proj detects this and falls back to the
+        # separate projections (issue: quantization homogeneity in _fused_in_proj).
+        import mlx.nn as nn
+
+        from mlx_vlm.models.cache import ArraysCache
+        from mlx_vlm.models.glm5_next.language import Glm5NextLinearAttention
+
+        mx.random.seed(0)
+        cfg = self._glm5_next_mtp_text_config()
+        kda = Glm5NextLinearAttention(cfg)
+        mx.eval(kda.parameters())
+        # Quantize only two of the six input-projections -> inhomogeneous.
+        kda.q_proj = nn.QuantizedLinear.from_linear(kda.q_proj, group_size=64, bits=4)
+        kda.k_proj = nn.QuantizedLinear.from_linear(kda.k_proj, group_size=64, bits=4)
+        kda.eval()
+        self.assertTrue(kda.fuse_in)
+        x = mx.random.normal((1, 3, cfg.hidden_size))
+        c = ArraysCache(size=2)
+        c[0] = None
+        c[1] = None
+        out = kda(x, None, c)  # triggers _fused_in_proj -> detects mixed -> falls back
+        self.assertFalse(kda.fuse_in)  # fusion disabled, no crash
+        self.assertEqual(out.shape, (1, 3, cfg.hidden_size))
+
     def test_glm5_next_indexer_bypass_matches_dense(self):
         # When the whole cache fits within index_topk the indexer selects every token,
         # so bypassing it (dense MLA) must match the full sparse path to fp tolerance.
