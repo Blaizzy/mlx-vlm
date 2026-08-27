@@ -64,7 +64,10 @@ class Model(nn.Module):
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
         hidden_states = self.vision_tower(
-            pixel_values.astype(inputs_embeds.dtype), patch_positions, grid_thw
+            pixel_values.astype(inputs_embeds.dtype),
+            patch_positions,
+            grid_thw,
+            cu_seqlens=kwargs.get("cu_seqlens", None),
         )
 
         image_token_id = self.config.image_token_id

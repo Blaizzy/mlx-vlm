@@ -362,7 +362,17 @@ class VisionModel(nn.Module):
         patch_positions: mx.array,
         grid_thw: Optional[List[Tuple[int, int, int]]] = None,
         skip_merger: bool = False,
+        cu_seqlens: Optional[List[int]] = None,
     ) -> mx.array:
+        """``cu_seqlens`` supplies attention-window boundaries directly.
+
+        The dense path derives them from ``grid_thw`` (``fixed_t * h * w`` per window),
+        which cannot describe a codec-selected patch set: sparse selection keeps a
+        different number of patches in every window. Callers doing sparse video pass the
+        boundaries they actually built. Everything else in the tower is already
+        sparsity-agnostic -- ``forward_from_positions`` takes arbitrary ``(L, 3)``
+        coordinates, and 3D RoPE is defined over the un-pruned grid by design.
+        """
         hidden_states = self.embeddings(hidden_state)
         if hidden_states.ndim == 2:
             hidden_states = mx.expand_dims(hidden_states, 0)
@@ -378,7 +388,15 @@ class VisionModel(nn.Module):
 
         hidden_states = self.layernorm_pre(hidden_states)
 
-        cu = build_cu_seqlens(grid_thw, total_patches, self.config.frame_windows_size)
+        if cu_seqlens is not None:
+            cu = list(cu_seqlens)
+            if not cu or cu[0] != 0 or cu[-1] != total_patches:
+                raise ValueError(
+                    f"cu_seqlens must start at 0 and end at total_patches={total_patches}; "
+                    f"got {cu[:3]}...{cu[-1:]}"
+                )
+        else:
+            cu = build_cu_seqlens(grid_thw, total_patches, self.config.frame_windows_size)
         mask = block_diagonal_mask(cu, hidden_states.dtype)
 
         # Item 3: upstream takes hidden_states[-1] — the final layer — despite its comment.
