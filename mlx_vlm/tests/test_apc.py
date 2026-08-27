@@ -675,6 +675,113 @@ def test_exact_cache_disk_restore_rebuilds_index(tmp_path, monkeypatch):
     manager.close()
 
 
+def test_exact_cache_disk_restore_preserves_safetensors_dtypes(tmp_path, monkeypatch):
+    from mlx_vlm.models.cache import ArraysCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+
+    states = [
+        mx.array([[-4, 7]], dtype=mx.int64),
+        mx.array([[-4, 7]], dtype=mx.int32),
+        mx.array([[-4, 7]], dtype=mx.int16),
+        mx.array([[-4, 7]], dtype=mx.int8),
+        mx.array([[4, 7]], dtype=mx.uint64),
+        mx.array([[4, 7]], dtype=mx.uint32),
+        mx.array([[4, 7]], dtype=mx.uint16),
+        mx.array([[4, 7]], dtype=mx.uint8),
+        mx.array([[True, False]], dtype=mx.bool_),
+    ]
+    arrays = ArraysCache(size=len(states))
+    arrays.cache = states
+    token_ids = list(range(40))
+
+    disk = DiskBlockStore(tmp_path, namespace="exact-dtypes")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [arrays])
+    disk._q.join()
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="exact-dtypes")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    warm, matched_tokens = manager.lookup_exact_cache(token_ids + [999])
+
+    assert matched_tokens == len(token_ids)
+    assert warm is not None
+    assert manager.stats_snapshot()["disk_hits"] == 1
+    for expected, restored in zip(states, warm[0].cache):
+        assert restored is not None
+        assert restored.dtype == expected.dtype
+        assert bool(mx.array_equal(restored, expected).item())
+    manager.close()
+
+
+def test_exact_cache_disk_restore_preserves_qsa_state(tmp_path, monkeypatch):
+    from mlx_vlm.models.cache import ArraysCache
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, QSAKVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+
+    token_ids = list(range(40))
+    arrays = ArraysCache(size=1)
+    arrays[0] = mx.arange(6, dtype=mx.int64).reshape(1, 2, 3)
+    qsa = QSAKVCache()
+    qsa.keys = mx.arange(1 * 2 * len(token_ids) * 4, dtype=mx.float32).reshape(
+        1, 2, len(token_ids), 4
+    )
+    qsa.values = qsa.keys + 1000
+    qsa.offset = len(token_ids)
+    qsa.index_keys = mx.arange(1 * len(token_ids) * 6, dtype=mx.float32).reshape(
+        1, len(token_ids), 6
+    )
+    qsa.index_position_ids = mx.arange(3 * len(token_ids), dtype=mx.int64).reshape(
+        3, 1, len(token_ids)
+    )
+    mx.eval(
+        arrays[0],
+        qsa.keys,
+        qsa.values,
+        qsa.index_keys,
+        qsa.index_position_ids,
+    )
+
+    disk = DiskBlockStore(tmp_path, namespace="qsa-exact")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [arrays, qsa], extra_hash=19)
+    disk._q.join()
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="qsa-exact")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    warm, matched_tokens = manager.lookup_exact_cache(token_ids + [999], extra_hash=19)
+
+    assert matched_tokens == len(token_ids)
+    assert warm is not None
+    assert manager.stats_snapshot()["disk_hits"] == 1
+    assert isinstance(warm[1], QSAKVCache)
+    assert warm[1].offset == len(token_ids)
+    assert warm[1].keys.shape[2] >= len(token_ids) + 1
+    _assert_allclose(warm[1].keys[..., : len(token_ids), :], qsa.keys)
+    _assert_allclose(warm[1].values[..., : len(token_ids), :], qsa.values)
+    _assert_allclose(warm[1].index_keys, qsa.index_keys)
+    assert warm[1].index_position_ids.dtype == mx.int64
+    assert bool(
+        mx.array_equal(warm[1].index_position_ids, qsa.index_position_ids).item()
+    )
+
+    batch_cache, max_prefix = make_warm_batch_exact_cache_multi(
+        [warm], [len(token_ids)]
+    )
+    assert max_prefix == len(token_ids)
+    assert batch_cache is not None
+    assert isinstance(batch_cache[1], BatchQSAKVCache)
+    extracted = batch_cache[1].extract(0)
+    _assert_allclose(extracted.index_keys, qsa.index_keys)
+    assert bool(
+        mx.array_equal(extracted.index_position_ids, qsa.index_position_ids).item()
+    )
+    manager.close()
+
+
 def test_exact_cache_disk_restore_preserves_rotating_kv(tmp_path, monkeypatch):
     from mlx_vlm.models.cache import KVCache, RotatingKVCache
 

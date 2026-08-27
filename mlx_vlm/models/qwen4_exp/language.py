@@ -49,6 +49,8 @@ def _append_indexer_positions(
 class QSAKVCache(KVCache):
     """KV cache with the raw indexer keys and multimodal positions used by QSA."""
 
+    exact_cache_disk_kind = "qwen4_exp_qsa_v1"
+
     # Hybrid/TurboQuant caches do not currently expose a way to carry the
     # indexer's unprojected keys. Uniform quantization uses the specialized
     # QSAQuantizedKVCache below; other schemes leave this cache in float.
