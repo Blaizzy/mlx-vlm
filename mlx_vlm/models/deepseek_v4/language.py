@@ -56,6 +56,13 @@ def _score_func(scores: mx.array, func: str) -> mx.array:
     raise ValueError(f"Unsupported DeepSeek-V4 scoring function: {func}")
 
 
+def _update_key_only_cache(cache: Any, keys: mx.array) -> mx.array:
+    """Update a rotating key-only cache without retaining a values graph."""
+    cached_keys, _ = cache.update_and_fetch(keys, keys[..., :0])
+    cache.values = cache.keys[..., :0]
+    return cached_keys
+
+
 @mx.compile
 def _expert_select(
     logits: mx.array,
@@ -679,7 +686,7 @@ class LocalAttention(nn.Module):
         kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         if cache is not None:
-            kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+            kv = _update_key_only_cache(cache, kv)
         mask = _align_local_mask(mask, kv.shape[2])
 
         out = scaled_dot_product_attention(
@@ -776,7 +783,7 @@ class CompressedAttention(nn.Module):
         kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         if local_cache is not None:
-            kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+            kv = _update_key_only_cache(local_cache, kv)
         mask = _align_local_mask(mask, kv.shape[2])
 
         # Pool tokens into compressed KV and concatenate with local KV
@@ -885,7 +892,7 @@ class SparseCompressedAttention(nn.Module):
         kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
         if local_cache is not None:
-            kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+            kv = _update_key_only_cache(local_cache, kv)
         mask = _align_local_mask(mask, kv.shape[2])
 
         pooled = self.compressor(x, comp_cache, offset)

@@ -1,5 +1,6 @@
 import importlib
 import inspect
+import io
 import threading
 import unittest
 from types import SimpleNamespace
@@ -2499,6 +2500,7 @@ class TestModels(unittest.TestCase):
 
     def test_deepseek_v4_language_model(self):
         from mlx_vlm.models import deepseek_v4
+        from mlx_vlm.models.cache import CacheList
         from mlx_vlm.models.deepseek_v4.hyper_connection import (
             _hc_split_sinkhorn_ops,
             hc_expand,
@@ -2541,7 +2543,7 @@ class TestModels(unittest.TestCase):
             head_dim=16,
             qk_rope_head_dim=4,
             sliding_window=16,
-            compress_ratios=[0, 0, 4, 0],
+            compress_ratios=[0, 128, 4, 0],
             index_n_heads=4,
             index_head_dim=8,
             index_topk=4,
@@ -2559,6 +2561,15 @@ class TestModels(unittest.TestCase):
         self.assertEqual(loaded_config.eos_token_id, 1)
 
         model = deepseek_v4.Model(config)
+        self.assertEqual(
+            [type(layer.attn).__name__ for layer in model.language_model.layers],
+            [
+                "LocalAttention",
+                "CompressedAttention",
+                "SparseCompressedAttention",
+                "LocalAttention",
+            ],
+        )
 
         self.language_test_runner(
             model.language_model,
@@ -2574,6 +2585,19 @@ class TestModels(unittest.TestCase):
         cache = model.make_cache()
         self.assertEqual(type(cache[0]).__name__, "RotatingKVCache")
         self.assertEqual(type(cache[2]).__name__, "CacheList")
+        cached_out = model.language_model(inputs, cache=cache)
+        mx.eval(cached_out.logits)
+        for step in range(16):
+            cached_out = model.language_model(mx.array([[step % 7]]), cache=cache)
+            mx.eval(cached_out.logits)
+        for layer_cache in cache:
+            local_cache = (
+                layer_cache[0] if isinstance(layer_cache, CacheList) else layer_cache
+            )
+            self.assertEqual(local_cache.values.shape[-1], 0)
+            graph = io.StringIO()
+            mx.export_to_dot(graph, local_cache.values)
+            self.assertLessEqual(graph.getvalue().count("->"), 4)
 
         weight = mx.to_fp8(mx.ones((128, 128), dtype=mx.float32))
         converted = model.sanitize(
@@ -2588,6 +2612,41 @@ class TestModels(unittest.TestCase):
         self.assertIn(skey, converted)
         self.assertTrue(mx.all(converted[wkey] == weight.view(mx.uint32)))
         self.assertEqual(converted[skey].shape, (128, 4))
+
+    def test_deepseek_v4_key_only_cache_graph_stays_bounded(self):
+        from mlx_vlm.models.cache import BatchRotatingKVCache, RotatingKVCache
+        from mlx_vlm.models.deepseek_v4 import language
+
+        def graph_edges(array):
+            graph = io.StringIO()
+            mx.export_to_dot(graph, array)
+            return graph.getvalue().count("->")
+
+        def run(cache, batch_size, steps):
+            for step in range(steps):
+                keys = mx.full(
+                    (batch_size, 1, 1, 4),
+                    step % 7,
+                    dtype=mx.float32,
+                )
+                cached_keys = language._update_key_only_cache(cache, keys)
+                mx.eval(cached_keys)
+            self.assertEqual(cache.values.shape, (*cache.keys.shape[:-1], 0))
+            return graph_edges(cache.values)
+
+        cases = (
+            ("RotatingKVCache", lambda: RotatingKVCache(max_size=8), 1),
+            (
+                "BatchRotatingKVCache",
+                lambda: BatchRotatingKVCache(max_size=8, left_padding=[0, 1]),
+                2,
+            ),
+        )
+        for cache_name, make_cache, batch_size in cases:
+            with self.subTest(cache=cache_name):
+                short = run(make_cache(), batch_size, 16)
+                long = run(make_cache(), batch_size, 64)
+                self.assertLessEqual(long, short + 2)
 
     def test_deepseek_v4_quantization_path_aliases(self):
         from mlx_vlm.models import deepseek_v4
