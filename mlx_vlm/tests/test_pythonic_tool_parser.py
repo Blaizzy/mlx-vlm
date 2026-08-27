@@ -70,6 +70,69 @@ def test_double_quoted_string_preserves_embedded_commas():
     }
 
 
+def test_multiline_string_is_preserved():
+    result = parse_tool_call(
+        "[write_file(path='game.html', content='<!doctype html>\n"
+        "<canvas></canvas>\n</html>')]"
+    )
+
+    assert result == {
+        "name": "write_file",
+        "arguments": {
+            "path": "game.html",
+            "content": "<!doctype html>\n<canvas></canvas>\n</html>",
+        },
+    }
+
+
+def test_string_with_unescaped_matching_quotes_is_preserved():
+    result = parse_tool_call(
+        "[write_file(path='game.html', "
+        "content='<script>const label = 'Score';</script>')]"
+    )
+
+    assert result == {
+        "name": "write_file",
+        "arguments": {
+            "path": "game.html",
+            "content": "<script>const label = 'Score';</script>",
+        },
+    }
+
+
+def test_multiline_double_quoted_html_is_preserved():
+    result = parse_tool_call(
+        '[write_file(path="game.html", content="<canvas id="game">\n</canvas>")]'
+    )
+
+    assert result == {
+        "name": "write_file",
+        "arguments": {
+            "path": "game.html",
+            "content": '<canvas id="game">\n</canvas>',
+        },
+    }
+
+
+def test_multiline_write_file_output_parses_for_server_response():
+    parser = load_tool_module("pythonic")
+    result = process_tool_calls(
+        "<|tool_call_start|>[write_file(path='game.html', "
+        "content='<!doctype html>\n<script>const label = 'Score';</script>')]"
+        "<|tool_call_end|>",
+        parser,
+        tools=[{"type": "function", "function": {"name": "write_file"}}],
+    )
+
+    assert result["remaining_text"] == ""
+    assert len(result["calls"]) == 1
+    assert result["calls"][0]["function"]["name"] == "write_file"
+    assert json.loads(result["calls"][0]["function"]["arguments"]) == {
+        "path": "game.html",
+        "content": "<!doctype html>\n<script>const label = 'Score';</script>",
+    }
+
+
 def test_nested_literal_arguments_are_parsed_without_splitting():
     result = parse_tool_call(
         "[configure(options={'position': [0, 1], 'enabled': True})]"
