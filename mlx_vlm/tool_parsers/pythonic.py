@@ -4,8 +4,6 @@
 import ast
 from typing import Any
 
-import regex as re
-
 """
 Tool parser for Pythonic function call formats.
 
@@ -14,36 +12,35 @@ Parses assistant responses containing tool calls in formats like:
 """
 
 
-_tool_call_regex = re.compile(r"\[(\w+)\((.*?)\)\]", re.DOTALL)
-_tool_args_regex = re.compile(r'(\w+)=(?:"([^"]*)"|([^,]+))(?:,\s*|$)', re.DOTALL)
-
-
 def parse_tool_call(text: str, tools: Any | None = None):
-    match = _tool_call_regex.search(text)
-    if not match:
-        raise ValueError("No function provided.")
+    try:
+        expression = ast.parse(text.strip(), mode="eval").body
+    except SyntaxError as exc:
+        raise ValueError("Invalid Pythonic tool call.") from exc
 
-    func_name = match.group(1)
-    args_str = match.group(2)
+    if not isinstance(expression, ast.List) or len(expression.elts) != 1:
+        raise ValueError("Expected a single tool call inside a list.")
+
+    call = expression.elts[0]
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+        raise ValueError("Expected a named function call.")
+    if call.args:
+        raise ValueError("Tool calls must use keyword arguments.")
 
     arguments = {}
-    if args_str:
-        matches = _tool_args_regex.findall(args_str)
-        for pair in matches:
-            key = pair[0].strip()
-            # pair[1] is quoted value, pair[2] is unquoted value
-            value = pair[1] if pair[1] else pair[2].strip()
+    for keyword in call.keywords:
+        if keyword.arg is None:
+            raise ValueError("Tool calls do not support unpacked arguments.")
+        if keyword.arg in arguments:
+            raise ValueError(f"Duplicate tool argument: {keyword.arg!r}.")
+        try:
+            arguments[keyword.arg] = ast.literal_eval(keyword.value)
+        except (ValueError, TypeError, SyntaxError) as exc:
+            raise ValueError(
+                f"Tool argument {keyword.arg!r} must be a literal value."
+            ) from exc
 
-            # Try to parse the value using ast.literal_eval
-            try:
-                value = ast.literal_eval(value)
-            except (ValueError, SyntaxError):
-                # If parsing fails, keep as string
-                pass
-
-            arguments[key] = value
-
-    return dict(name=func_name, arguments=arguments)
+    return dict(name=call.func.id, arguments=arguments)
 
 
 tool_call_start = "<|tool_call_start|>"

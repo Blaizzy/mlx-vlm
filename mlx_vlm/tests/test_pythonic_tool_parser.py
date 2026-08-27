@@ -1,12 +1,15 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from mlx_vlm.server.responses_state import process_tool_calls
 from mlx_vlm.tool_parsers import (
     _infer_tool_parser,
     _infer_tool_parser_from_processor,
     load_tool_module,
 )
+from mlx_vlm.tool_parsers.pythonic import parse_tool_call
 
 LFM_TOOL_TEMPLATE = """
 {{ '<|tool_call_start|>[' + tool_calls + ']<|tool_call_end|>' }}
@@ -40,3 +43,49 @@ def test_lfm_tool_call_output_parses_for_server_response():
         "location": "Warsaw",
         "unit": "celsius",
     }
+
+
+def test_single_quoted_string_preserves_embedded_commas():
+    result = parse_tool_call(
+        "[write_file(path='game.js', content='const player = { x: 0, y: 1 };')]"
+    )
+
+    assert result == {
+        "name": "write_file",
+        "arguments": {
+            "path": "game.js",
+            "content": "const player = { x: 0, y: 1 };",
+        },
+    }
+
+
+def test_double_quoted_string_preserves_embedded_commas():
+    result = parse_tool_call(
+        '[write_file(content="width=device-width, initial-scale=1.0")]'
+    )
+
+    assert result == {
+        "name": "write_file",
+        "arguments": {"content": "width=device-width, initial-scale=1.0"},
+    }
+
+
+def test_nested_literal_arguments_are_parsed_without_splitting():
+    result = parse_tool_call(
+        "[configure(options={'position': [0, 1], 'enabled': True})]"
+    )
+
+    assert result == {
+        "name": "configure",
+        "arguments": {"options": {"position": [0, 1], "enabled": True}},
+    }
+
+
+def test_malformed_quoted_argument_is_rejected():
+    with pytest.raises(ValueError, match="Invalid Pythonic tool call"):
+        parse_tool_call("[write_file(content='const player = { x: 0, y: 1 };)]")
+
+
+def test_non_literal_argument_is_rejected():
+    with pytest.raises(ValueError, match="must be a literal value"):
+        parse_tool_call("[write_file(content=get_content())]")
