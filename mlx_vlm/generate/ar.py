@@ -782,6 +782,10 @@ def _make_cache(
     *kv_quant_scheme* selects the quantization backend:
     - ``"uniform"`` → ``BatchQuantizedKVCache`` (``mx.quantize``)
     - ``"turboquant"`` or fractional *kv_bits* → ``BatchTurboQuantKVCache``
+
+    Model-specific ``to_batch()`` conversions preserve auxiliary cache state.
+    Quantized continuous batching with these caches raises
+    ``NotImplementedError``.
     """
     _batch_policy = kv_quant_from_legacy(
         kv_bits,
@@ -819,7 +823,13 @@ def _make_cache(
     def to_batch_cache(c, quantize=True):
         # Caches that ship their own batch-conversion (e.g. MiniMax M3 sparse
         # index-key side cache) know how to build the correct batch cache.
-        if hasattr(c, "to_batch") and not isinstance(c, cache.KVCache):
+        if hasattr(c, "to_batch"):
+            if kv_bits is not None and quantize:
+                raise NotImplementedError(
+                    f"{type(c).__name__} does not support quantized continuous "
+                    "batching with model-specific cache state; "
+                    "disable KV quantization for continuous batching"
+                )
             return c.to_batch(left_padding)
         if isinstance(c, cache.KVCache):
             if kv_bits is not None and quantize:
