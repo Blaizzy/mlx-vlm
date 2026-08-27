@@ -4149,8 +4149,9 @@ def test_anthropic_messages_endpoint_accepts_system_role_in_messages(
 
     assert response.status_code == 200
     assert mock_template.call_args.args[2] == [
-        {"role": "system", "content": "Use short answers.\nBe precise."},
+        {"role": "system", "content": "Use short answers."},
         {"role": "user", "content": "Hello"},
+        {"role": "user", "content": "Be precise."},
         {"role": "user", "content": "Introduce the project."},
     ]
 
