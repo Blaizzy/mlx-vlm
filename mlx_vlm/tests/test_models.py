@@ -7829,6 +7829,44 @@ class TestKeyOnlyKVCacheGraph(unittest.TestCase):
             self.assertEqual(cache.values.shape[-1], 4)
             self.assertGreater(float(cache.values.sum()), 0.0)
 
+    def test_guard_survives_merge_extract_and_apc(self):
+        from mlx_vlm.apc import _merge_exact_cache_entries
+        from mlx_vlm.models.cache import (
+            BatchRotatingKVCache,
+            RotatingKVCache,
+            _KeyOnlyValuesGuard,
+        )
+
+        def prefilled():
+            cache = RotatingKVCache(max_size=8)
+            keys = mx.zeros((1, 1, 3, 4))
+            cache.update_and_fetch(keys, keys[..., :0])
+            mx.eval(cache.keys)
+            return cache
+
+        def decode(cache, batch, steps):
+            for step in range(steps):
+                keys = mx.full((batch, 1, 1, 4), step % 7, dtype=mx.float32)
+                cached_keys, _ = cache.update_and_fetch(keys, keys[..., :0])
+                mx.eval(cached_keys)
+            return self._edges(cache.values)
+
+        cases = (
+            ("merge", RotatingKVCache.merge([prefilled(), prefilled()]), 2),
+            (
+                "extract",
+                BatchRotatingKVCache.merge([prefilled(), prefilled()]).extract(0),
+                1,
+            ),
+            ("apc", _merge_exact_cache_entries([prefilled(), prefilled()], [3, 3]), 2),
+        )
+        for name, cache, batch in cases:
+            with self.subTest(path=name):
+                self.assertIsInstance(cache, _KeyOnlyValuesGuard)
+                short = decode(cache, batch, 16)
+                long = decode(cache, batch, 256)
+                self.assertLessEqual(long, short + 2)
+
 
 if __name__ == "__main__":
     unittest.main()

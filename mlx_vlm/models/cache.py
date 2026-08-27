@@ -3,10 +3,10 @@ from typing import Any, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.cache import ArraysCache  # noqa: F401
-from mlx_lm.models.cache import BatchKVCache  # noqa: F401
 from mlx_lm.models.cache import CacheList  # noqa: F401
 from mlx_lm.models.cache import ChunkedKVCache  # noqa: F401
 from mlx_lm.models.cache import QuantizedKVCache  # noqa: F401
+from mlx_lm.models.cache import BatchKVCache as _BatchKVCache
 from mlx_lm.models.cache import BatchRotatingKVCache as _BatchRotatingKVCache
 from mlx_lm.models.cache import KVCache as _KVCache
 from mlx_lm.models.cache import RotatingKVCache as _RotatingKVCache
@@ -14,29 +14,32 @@ from mlx_lm.models.cache import _BaseCache
 
 
 def _drop_key_only_values(cache, cached_keys, cached_values, incoming_values):
-    """Collapse the values graph for a key-only cache update.
-
-    Some attention variants (e.g. DeepSeek-V4 local/compressed attention) reuse a
-    KV cache to store keys only, passing a zero-width values array on every
-    update. The cache still threads those values through ``update_and_fetch``, so
-    an unevaluated concat/scatter graph accumulates one node per step and is never
-    collapsed, because attention only ever reads the keys. Over a long generation
-    this exhausts Metal's resident-resource count. When the incoming values are
-    zero-width, rebind the cached values to a fresh zero-width view of the cached
-    keys so no growing graph is retained. Normal keys+values caches are untouched.
-    """
     if incoming_values.shape[-1] == 0 and cache.keys is not None:
         cache.values = cache.keys[..., :0]
         return cached_keys, cached_keys[..., :0]
     return cached_keys, cached_values
 
 
-class _KeyOnlyValuesGuard:
-    """Mixin dropping the retained values graph on zero-width (key-only) updates."""
+def _reguard(cache):
+    guarded = _GUARDED.get(type(cache))
+    if guarded is not None:
+        cache.__class__ = guarded
+    return cache
 
+
+class _KeyOnlyValuesGuard:
     def update_and_fetch(self, keys, values):
         cached_keys, cached_values = super().update_and_fetch(keys, values)
         return _drop_key_only_values(self, cached_keys, cached_values, values)
+
+    @classmethod
+    def merge(cls, caches):
+        return _reguard(super().merge(caches))
+
+
+class _KeyOnlyBatchGuard(_KeyOnlyValuesGuard):
+    def extract(self, idx):
+        return _reguard(super().extract(idx))
 
 
 class KVCache(_KeyOnlyValuesGuard, _KVCache):
@@ -47,8 +50,20 @@ class RotatingKVCache(_KeyOnlyValuesGuard, _RotatingKVCache):
     pass
 
 
-class BatchRotatingKVCache(_KeyOnlyValuesGuard, _BatchRotatingKVCache):
+class BatchKVCache(_KeyOnlyBatchGuard, _BatchKVCache):
     pass
+
+
+class BatchRotatingKVCache(_KeyOnlyBatchGuard, _BatchRotatingKVCache):
+    pass
+
+
+_GUARDED = {
+    _KVCache: KVCache,
+    _RotatingKVCache: RotatingKVCache,
+    _BatchKVCache: BatchKVCache,
+    _BatchRotatingKVCache: BatchRotatingKVCache,
+}
 
 
 class BufferedRotatingKVCache(RotatingKVCache):

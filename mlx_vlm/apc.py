@@ -1320,6 +1320,8 @@ class DiskBlockStore:
     ) -> Optional[Any]:
         from mlx_lm.models import cache as lm_cache
 
+        from .models import cache as vlm_cache
+
         kind = metadata.get(f"{prefix}_kind")
         if kind == "kv":
             if metadata.get(f"{prefix}_empty", "0") == "1":
@@ -1364,7 +1366,7 @@ class DiskBlockStore:
                 idx = int(metadata.get(f"{prefix}_idx", "0"))
             except (KeyError, TypeError, ValueError):
                 return None
-            c = lm_cache.RotatingKVCache(max_size=max_size, keep=keep)
+            c = vlm_cache.RotatingKVCache(max_size=max_size, keep=keep)
             c.offset = offset
             c._idx = idx
             if metadata.get(f"{prefix}_empty", "0") == "1":
@@ -3603,15 +3605,17 @@ def _merge_exact_cache_entries(
 ) -> Any:
     from mlx_lm.models import cache as lm_cache
 
+    from .models import cache as vlm_cache
+
     if not entries:
         return None
     first = entries[0]
     if all(isinstance(c, lm_cache.KVCache) for c in entries):
-        return lm_cache.BatchKVCache.merge(entries)
+        return vlm_cache.BatchKVCache.merge(entries)
     if all(isinstance(c, lm_cache.ChunkedKVCache) for c in entries):
-        return lm_cache.BatchKVCache.merge(entries)
+        return vlm_cache.BatchKVCache.merge(entries)
     if all(isinstance(c, lm_cache.RotatingKVCache) for c in entries):
-        return lm_cache.BatchRotatingKVCache.merge(entries)
+        return vlm_cache.BatchRotatingKVCache.merge(entries)
     if all(isinstance(c, lm_cache.ArraysCache) for c in entries):
         return _merge_arrays_cache_entries(entries, prefix_lens)
     if all(isinstance(c, lm_cache.CacheList) for c in entries):
