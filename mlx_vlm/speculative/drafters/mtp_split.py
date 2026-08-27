@@ -260,6 +260,8 @@ MTP_SPLITTERS: Dict[str, str] = {
     "qwen3_5": "mlx_vlm.speculative.drafters.qwen3_5_mtp.split:Qwen3_5MTPSplitter",
     "qwen3_5_moe": "mlx_vlm.speculative.drafters.qwen3_5_mtp.split:Qwen3_5MTPSplitter",
     "qwen3_next": "mlx_vlm.speculative.drafters.qwen3_5_mtp.split:Qwen3NextMTPSplitter",
+    "qwen4_exp": "mlx_vlm.speculative.drafters.qwen4_exp_mtp.split:Qwen4ExpMTPSplitter",
+    "qwen4_exp_text": "mlx_vlm.speculative.drafters.qwen4_exp_mtp.split:Qwen4ExpMTPSplitter",
     "deepseek_v4": "mlx_vlm.speculative.drafters.deepseek_v4_mtp.split:DeepseekV4MTPSplitter",
     "glm4_moe_lite": "mlx_vlm.speculative.drafters.glm4_moe_lite_mtp.split:Glm4MoeLiteMTPSplitter",
     "inkling_mm_model": "mlx_vlm.speculative.drafters.inkling_mtp.split:InklingMTPSplitter",
