@@ -695,6 +695,15 @@ def _safetensors_dtype_info(dtype: str):
     mapping = {
         "F16": (np.dtype("<f2"), mx.float16, None),
         "F32": (np.dtype("<f4"), mx.float32, None),
+        "I64": (np.dtype("<i8"), mx.int64, None),
+        "I32": (np.dtype("<i4"), mx.int32, None),
+        "I16": (np.dtype("<i2"), mx.int16, None),
+        "I8": (np.dtype("i1"), mx.int8, None),
+        "U64": (np.dtype("<u8"), mx.uint64, None),
+        "U32": (np.dtype("<u4"), mx.uint32, None),
+        "U16": (np.dtype("<u2"), mx.uint16, None),
+        "U8": (np.dtype("u1"), mx.uint8, None),
+        "BOOL": (np.dtype("?"), mx.bool_, None),
     }
     return mapping.get(dtype)
 
@@ -1413,6 +1422,86 @@ class DiskBlockStore:
         from .models import cache as lm_cache
 
         kind = metadata.get(f"{prefix}_kind")
+        if kind == "qwen4_exp_qsa_v1":
+            from .models.qwen4_exp.language import QSAKVCache
+
+            try:
+                off = int(metadata.get(f"{prefix}_offset", "0"))
+                step = int(metadata.get(f"{prefix}_step", "256"))
+            except (TypeError, ValueError):
+                return None
+            if off < 0:
+                return None
+
+            c = QSAKVCache()
+            if metadata.get(f"{prefix}_empty", "0") != "1":
+                k_entry = tensor_entries.get(f"{prefix}_k")
+                v_entry = tensor_entries.get(f"{prefix}_v")
+                if k_entry is None or v_entry is None:
+                    return None
+                k = _read_safetensors_tensor(path, data_start, k_entry)
+                v = _read_safetensors_tensor(path, data_start, v_entry)
+                if (
+                    k is None
+                    or v is None
+                    or k.ndim != 4
+                    or v.ndim != 4
+                    or k.shape[:3] != v.shape[:3]
+                    or off != k.shape[2]
+                ):
+                    return None
+                k, v = _pad_kv_for_capacity(
+                    k,
+                    v,
+                    offset=off,
+                    min_capacity_tokens=min_capacity_tokens,
+                    step=step,
+                )
+                c.keys = k
+                c.values = v
+                eval_targets.extend([k, v])
+            elif off != 0:
+                return None
+
+            index_empty = metadata.get(f"{prefix}_index_empty", "0") == "1"
+            if index_empty and off > 0:
+                return None
+            if not index_empty:
+                index_keys_entry = tensor_entries.get(f"{prefix}_index_keys")
+                position_ids_entry = tensor_entries.get(f"{prefix}_index_position_ids")
+                if index_keys_entry is None or position_ids_entry is None:
+                    return None
+                index_keys = _read_safetensors_tensor(
+                    path, data_start, index_keys_entry
+                )
+                position_ids = _read_safetensors_tensor(
+                    path, data_start, position_ids_entry
+                )
+                if (
+                    index_keys is None
+                    or position_ids is None
+                    or index_keys.ndim != 3
+                    or position_ids.ndim not in (2, 3)
+                    or index_keys.shape[1] != off
+                    or position_ids.shape[-1] != off
+                    or (c.keys is not None and index_keys.shape[0] != c.keys.shape[0])
+                    or (
+                        position_ids.ndim == 2
+                        and position_ids.shape[0] != index_keys.shape[0]
+                    )
+                    or (
+                        position_ids.ndim == 3
+                        and position_ids.shape[1] != index_keys.shape[0]
+                    )
+                ):
+                    return None
+                c.index_keys = index_keys
+                c.index_position_ids = position_ids
+                eval_targets.extend([index_keys, position_ids])
+
+            c.offset = off
+            return c
+
         if kind == "kv":
             if metadata.get(f"{prefix}_empty", "0") == "1":
                 c = lm_cache.KVCache()
@@ -2570,7 +2659,57 @@ class DiskBlockStore:
     ) -> bool:
         from .models import cache as lm_cache
 
-        if isinstance(c, lm_cache.KVCache):
+        if type(c).__dict__.get("exact_cache_disk_kind") == "qwen4_exp_qsa_v1":
+            off = int(getattr(c, "offset", 0) or 0)
+            if off < 0:
+                return False
+            if (c.keys is None) != (c.values is None):
+                return False
+            if (c.index_keys is None) != (c.index_position_ids is None):
+                return False
+            if off > 0 and (c.keys is None or c.index_keys is None):
+                return False
+            if c.keys is not None and (
+                c.keys.ndim != 4
+                or c.values.ndim != 4
+                or c.keys.shape[:3] != c.values.shape[:3]
+                or off > c.keys.shape[2]
+            ):
+                return False
+            if c.index_keys is not None and (
+                c.index_keys.ndim != 3
+                or c.index_position_ids.ndim not in (2, 3)
+                or off > c.index_keys.shape[1]
+                or off > c.index_position_ids.shape[-1]
+                or (c.keys is not None and c.index_keys.shape[0] != c.keys.shape[0])
+                or (
+                    c.index_position_ids.ndim == 2
+                    and c.index_position_ids.shape[0] != c.index_keys.shape[0]
+                )
+                or (
+                    c.index_position_ids.ndim == 3
+                    and c.index_position_ids.shape[1] != c.index_keys.shape[0]
+                )
+            ):
+                return False
+            metadata[f"{prefix}_kind"] = "qwen4_exp_qsa_v1"
+            metadata[f"{prefix}_offset"] = str(off)
+            metadata[f"{prefix}_step"] = str(
+                int(getattr(c, "step", getattr(type(c), "step", 256)) or 0)
+            )
+            if c.keys is None or c.values is None or off <= 0:
+                metadata[f"{prefix}_empty"] = "1"
+            else:
+                arrays[f"{prefix}_k"] = c.keys[..., :off, :]
+                arrays[f"{prefix}_v"] = c.values[..., :off, :]
+            if c.index_keys is None or c.index_position_ids is None:
+                metadata[f"{prefix}_index_empty"] = "1"
+            else:
+                arrays[f"{prefix}_index_keys"] = c.index_keys[:, :off]
+                arrays[f"{prefix}_index_position_ids"] = c.index_position_ids[..., :off]
+            return True
+
+        if type(c) is lm_cache.KVCache:
             off = int(getattr(c, "offset", 0) or 0)
             metadata[f"{prefix}_kind"] = "kv"
             metadata[f"{prefix}_offset"] = str(off)
