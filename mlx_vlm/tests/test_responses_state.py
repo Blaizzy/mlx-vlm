@@ -4,7 +4,10 @@ import pytest
 from fastapi import HTTPException
 
 from mlx_vlm.prompt_utils import apply_chat_template
-from mlx_vlm.server.responses_state import _response_items_to_chat
+from mlx_vlm.server.responses_state import (
+    _response_items_to_chat,
+    suppress_tool_call_content,
+)
 
 
 def test_function_output_image_stays_after_tool_result():
@@ -179,3 +182,98 @@ def test_unknown_function_output_blocks_remain_text():
 
     assert images == []
     assert json.loads(messages[0]["content"]) == [unknown]
+
+
+def _stream(chunks, tc_start, tc_end):
+    """Feed chunks through suppress_tool_call_content, return visible content."""
+    full = ""
+    in_tool_call = False
+    content = ""
+    for chunk in chunks:
+        full += chunk
+        in_tool_call, delta = suppress_tool_call_content(
+            full, in_tool_call, tc_start, chunk, tc_end
+        )
+        if delta:
+            content += delta
+    return content
+
+
+def test_streamed_content_resumes_after_a_tool_call_ends():
+    """Text after a completed tool call must not be swallowed.
+
+    Suppression used to latch on for the rest of the stream, because
+    `tc_start in full_output` stays true once the call has been seen.
+    """
+    content = _stream(
+        [
+            "Let me look. ",
+            "<tool_call>",
+            '{"name": "get_weather"}',
+            "</tool_call>",
+            " The weather is sunny.",
+        ],
+        "<tool_call>",
+        "</tool_call>",
+    )
+
+    assert "get_weather" not in content
+    assert content == "Let me look.  The weather is sunny."
+
+
+def test_streamed_content_resumes_between_consecutive_tool_calls():
+    content = _stream(
+        [
+            "<tool_call>",
+            '{"name": "a"}',
+            "</tool_call>",
+            " then ",
+            "<tool_call>",
+            '{"name": "b"}',
+            "</tool_call>",
+            " done.",
+        ],
+        "<tool_call>",
+        "</tool_call>",
+    )
+
+    assert content == " then  done."
+
+
+def test_streamed_tool_call_markup_is_still_suppressed():
+    content = _stream(
+        ["Hello ", "<tool_call>", '{"name": "a"}'],
+        "<tool_call>",
+        "</tool_call>",
+    )
+
+    assert content == "Hello "
+
+
+def test_suppression_without_an_end_marker_is_unchanged():
+    """Parsers with an empty tool_call_end keep the latching behavior."""
+    content = _stream(
+        ["Hello ", "<tool_call>", '{"name": "a"}', " trailing"],
+        "<tool_call>",
+        "",
+    )
+
+    assert content == "Hello "
+
+
+def test_tool_call_markup_inside_a_single_chunk_is_still_suppressed():
+    """A chunk that carries a whole call, or the end marker plus trailing
+    text, must not leak the markup itself into content."""
+    whole_call = _stream(
+        ['<tool_call>{"name": "shell", "command": "pwd"}</tool_call>'],
+        "<tool_call>",
+        "</tool_call>",
+    )
+    assert whole_call == ""
+
+    end_and_tail = _stream(
+        ["<tool_call>", '{"name": "shell"}', "</tool_call> done."],
+        "<tool_call>",
+        "</tool_call>",
+    )
+    assert end_and_tail == " done."

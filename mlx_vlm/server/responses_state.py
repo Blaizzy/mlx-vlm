@@ -269,10 +269,25 @@ def suppress_tool_call_content(
     in_tool_call: bool,
     tc_start: Optional[str],
     delta_content: Optional[str],
+    tc_end: Optional[str] = None,
 ) -> Tuple[bool, Optional[str]]:
     """Suppress tool-call markup from streamed delta.content."""
     if not tc_start:
         return in_tool_call, delta_content
+    if tc_end:
+        # Suppression must stop where the call does, otherwise every token
+        # after it is dropped: `tc_start in full_output` stays true for the
+        # rest of the stream. Only the text after the last completed call
+        # can open a new one, so match against that tail.
+        closed_at = full_output.rfind(tc_end)
+        if closed_at != -1:
+            in_tool_call = False
+            full_output = full_output[closed_at + len(tc_end) :]
+            # Whatever part of this delta fell inside the completed call must
+            # still be withheld -- it is markup. Keep only the tail that comes
+            # after the end marker.
+            if delta_content is not None and len(full_output) < len(delta_content):
+                delta_content = full_output or None
     if not in_tool_call:
         if tc_start in full_output:
             return True, None

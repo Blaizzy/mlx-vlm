@@ -1096,6 +1096,11 @@ async def responses_endpoint(request: Request):
                         if tool_module is not None and chat_tools
                         else None
                     )
+                    tc_end = (
+                        tool_module.tool_call_end
+                        if tool_module is not None and chat_tools
+                        else None
+                    )
                     thinking_state = make_response_stream_state(
                         processor,
                         prompt_has_open_thinking(
@@ -1157,7 +1162,7 @@ async def responses_endpoint(request: Request):
                                 )
                             delta = thinking_delta.content
                             in_tool_call, delta = suppress_tool_call_content(
-                                full_text, in_tool_call, tc_start, delta
+                                full_text, in_tool_call, tc_start, delta, tc_end
                             )
                             usage_stats = {
                                 "input_tokens": ctx.prompt_tokens,
@@ -1211,7 +1216,7 @@ async def responses_endpoint(request: Request):
                                 )
                             delta = thinking_delta.content
                             in_tool_call, delta = suppress_tool_call_content(
-                                full_text, in_tool_call, tc_start, delta
+                                full_text, in_tool_call, tc_start, delta, tc_end
                             )
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
@@ -1844,7 +1849,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                             # Suppress tool-call markup from content
                             in_tool_call, delta_content = suppress_tool_call_content(
-                                full_output, in_tool_call, tc_start, delta_content
+                                full_output,
+                                in_tool_call,
+                                tc_start,
+                                delta_content,
+                                tc_end,
                             )
 
                             chunk_logprobs = None
