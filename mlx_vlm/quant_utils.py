@@ -113,7 +113,8 @@ def quantize_model(
         # applied: a per-module predicate may request a smaller group size
         # (e.g. 32) precisely because the dims don't divide the global one.
         effective_group_size = (
-            bool_or_params.get("group_size", group_size)
+            # `or` also covers an explicit {"group_size": None} ("use default")
+            (bool_or_params.get("group_size") or group_size)
             if isinstance(bool_or_params, dict)
             else group_size
         )
