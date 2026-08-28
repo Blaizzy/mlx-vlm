@@ -2168,6 +2168,7 @@ def prepare_inputs(
         extra = {}
         if has_videos:
             extra["videos"] = videos
+            extra["do_sample_frames"] = False
             if video_fps is not None:
                 extra["fps"] = video_fps
         inputs = process_inputs_with_fallback(
