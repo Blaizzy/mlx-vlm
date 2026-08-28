@@ -1,8 +1,13 @@
+import inspect
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
+
+
+class UnboundedKVCache(ValueError):
+    """A KV bound was requested for a cache that cannot be bounded."""
 
 
 def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:
@@ -42,6 +47,67 @@ def create_causal_mask(
     return mask
 
 
+DEFAULT_ROTATING_KEEP = 4
+
+
+def _max_size_parameter(make_cache) -> Optional[str]:
+    """Name of the maximum-size argument a model's ``make_cache`` accepts.
+
+    ``None`` when it takes no such argument. A bare ``**kwargs`` does not
+    count: it would swallow the bound instead of applying it, which is the
+    silent no-op this lookup exists to avoid.
+    """
+    try:
+        parameters = inspect.signature(make_cache).parameters
+    except (TypeError, ValueError):
+        # Builtins and some bound C extensions have no introspectable signature.
+        return None
+    for name in ("max_size", "max_kv_size"):
+        parameter = parameters.get(name)
+        if parameter is not None and parameter.kind is not parameter.VAR_KEYWORD:
+            return name
+    return None
+
+
+_BOUND_APPLIED = "applied"
+_BOUND_ALREADY = "already"
+_BOUND_NOT_APPLICABLE = "n/a"
+
+
+def _bound_entry(entry: Any, max_kv_size: int) -> Tuple[Any, str]:
+    """Return ``entry`` bounded to ``max_kv_size``, and what that took.
+
+    Only caches that grow with the sequence are rewritten. Fixed-size state --
+    recurrent/SSM state in ``ArraysCache``, pooled or chunked caches, static
+    prefixes -- is already bounded by construction and is left alone. A cache
+    the model already bounded at or below the request is left alone too, and
+    reported as ``_BOUND_ALREADY`` so the caller can tell that apart from a
+    bound that could not be applied at all.
+    """
+    if isinstance(entry, (CacheList, tuple)):
+        children = entry.caches if isinstance(entry, CacheList) else entry
+        bounded = [_bound_entry(child, max_kv_size) for child in children]
+        statuses = {status for _, status in bounded}
+        if _BOUND_APPLIED in statuses:
+            rebuilt = [child for child, _ in bounded]
+            if isinstance(entry, CacheList):
+                return CacheList(*rebuilt), _BOUND_APPLIED
+            return tuple(rebuilt), _BOUND_APPLIED
+        if _BOUND_ALREADY in statuses:
+            return entry, _BOUND_ALREADY
+        return entry, _BOUND_NOT_APPLICABLE
+    if isinstance(entry, RotatingKVCache):
+        if entry.max_size is not None and entry.max_size <= max_kv_size:
+            return entry, _BOUND_ALREADY
+        return RotatingKVCache(max_size=max_kv_size, keep=entry.keep), _BOUND_APPLIED
+    if type(entry) is KVCache:
+        return (
+            RotatingKVCache(max_size=max_kv_size, keep=DEFAULT_ROTATING_KEEP),
+            _BOUND_APPLIED,
+        )
+    return entry, _BOUND_NOT_APPLICABLE
+
+
 def make_prompt_cache(
     model: nn.Module,
     max_kv_size: Optional[int] = None,
@@ -54,17 +120,41 @@ def make_prompt_cache(
 
     Args:
         model (nn.Module): The language model.
-        max_kv_size (Optional[int]): If provided and the model does not have a
-            ``make_cache`` method, a ``RotatingKVCache`` is used with a maximum
-            size of ``max_kv_size``
+        max_kv_size (Optional[int]): Bound every cache entry that grows with the
+            sequence to at most this many tokens. A model's ``make_cache`` is
+            given the bound directly if it accepts one; otherwise the caches it
+            returns are bounded here. Fixed-size state (recurrent/SSM state,
+            pooled, chunked and static-prefix caches) is already bounded and is
+            left as the model built it.
+
+    Raises:
+        UnboundedKVCache: if ``max_kv_size`` is given and nothing in the cache
+            could be bounded, rather than silently ignoring the request.
     """
     if hasattr(model, "make_cache"):
-        return model.make_cache()
+        if max_kv_size is None:
+            return model.make_cache()
+        parameter = _max_size_parameter(model.make_cache)
+        if parameter is not None:
+            return model.make_cache(**{parameter: max_kv_size})
+        cache = model.make_cache()
+        bounded = [_bound_entry(entry, max_kv_size) for entry in cache]
+        statuses = {status for _, status in bounded}
+        if not statuses & {_BOUND_APPLIED, _BOUND_ALREADY}:
+            raise UnboundedKVCache(
+                f"{type(model).__name__}.make_cache() returned "
+                f"{sorted({type(e).__name__ for e in cache})}, none of which "
+                f"grows with the sequence, so max_kv_size={max_kv_size} cannot "
+                "be applied. Drop the bound for this model, or give its "
+                "make_cache a max_size argument."
+            )
+        return [entry for entry, _ in bounded]
 
     num_layers = len(model.layers)
     if max_kv_size is not None:
         return [
-            RotatingKVCache(max_size=max_kv_size, keep=4) for _ in range(num_layers)
+            RotatingKVCache(max_size=max_kv_size, keep=DEFAULT_ROTATING_KEEP)
+            for _ in range(num_layers)
         ]
     else:
         return [KVCache() for _ in range(num_layers)]
