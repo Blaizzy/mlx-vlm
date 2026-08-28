@@ -33,6 +33,7 @@ from .generation import (
     _count_prompt_tokens,
 )
 from .responses_state import (
+    ToolCallStreamState,
     _normalize_response_input,
     _response_chain_items,
     _response_items_to_chat,
@@ -47,7 +48,6 @@ from .responses_state import (
     prompt_has_open_thinking,
     response_store,
     response_store_lock,
-    suppress_tool_call_content,
 )
 from .runtime import runtime
 from .schemas import (
@@ -1090,12 +1090,17 @@ async def responses_endpoint(request: Request):
                     # Stream text deltas using ResponseGenerator (continuous batching)
                     full_text = ""
                     usage_stats = {"input_tokens": 0, "output_tokens": 0}
-                    in_tool_call = False
                     tc_start = (
                         tool_module.tool_call_start
                         if tool_module is not None and chat_tools
                         else None
                     )
+                    tc_end = (
+                        tool_module.tool_call_end
+                        if tool_module is not None and chat_tools
+                        else None
+                    )
+                    tool_call_state = ToolCallStreamState(tc_start, tc_end)
                     thinking_state = make_response_stream_state(
                         processor,
                         prompt_has_open_thinking(
@@ -1156,8 +1161,8 @@ async def responses_endpoint(request: Request):
                                     },
                                 )
                             delta = thinking_delta.content
-                            in_tool_call, delta = suppress_tool_call_content(
-                                full_text, in_tool_call, tc_start, delta
+                            delta = tool_call_state.feed(
+                                delta, last=bool(token.finish_reason)
                             )
                             usage_stats = {
                                 "input_tokens": ctx.prompt_tokens,
@@ -1210,9 +1215,7 @@ async def responses_endpoint(request: Request):
                                     },
                                 )
                             delta = thinking_delta.content
-                            in_tool_call, delta = suppress_tool_call_content(
-                                full_text, in_tool_call, tc_start, delta
-                            )
+                            delta = tool_call_state.feed(delta, last=bool(chunk_finish))
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
                             usage_stats = {
@@ -1817,9 +1820,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         )
                         full_output = ""  # raw output for tool call parsing
                         # Track tool-call state to suppress markup from content
-                        in_tool_call = False
                         tc_start = tool_module.tool_call_start if tool_module else None
                         tc_end = tool_module.tool_call_end if tool_module else None
+                        tool_call_state = ToolCallStreamState(tc_start, tc_end)
 
                         def _next_token():
                             try:
@@ -1843,8 +1846,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             delta_content = thinking_delta.content
 
                             # Suppress tool-call markup from content
-                            in_tool_call, delta_content = suppress_tool_call_content(
-                                full_output, in_tool_call, tc_start, delta_content
+                            delta_content = tool_call_state.feed(
+                                delta_content, last=bool(token.finish_reason)
                             )
 
                             chunk_logprobs = None

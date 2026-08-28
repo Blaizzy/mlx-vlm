@@ -3,7 +3,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput, create_attention_mask
+from ..base import LanguageModelOutput, create_attention_mask, dequantize_kv_state
 from .config import ModelConfig
 
 
@@ -56,6 +56,10 @@ class Attention(nn.Module):
             queries = self.rope(queries, offset=cache.offset)
             keys = self.rope(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
+            # Logit softcapping rules out mx.fast.scaled_dot_product_attention,
+            # so the scores are built by hand below and the packed state a
+            # quantized cache returns has to be materialized first.
+            keys, values = dequantize_kv_state(cache, keys, values)
         else:
             queries = self.rope(queries)
             keys = self.rope(keys)

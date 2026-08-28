@@ -18,7 +18,7 @@ def make_quantization_config(config: dict) -> dict | None:
     """Return the native MLX config for a supported Qwen FP8 checkpoint."""
     quantization = config.get("quantization_config") or {}
     is_supported = (
-        config.get("model_type") == "qwen3_5"
+        config.get("model_type") in {"qwen3_5", "qwen3_5_moe"}
         and isinstance(quantization, dict)
         and quantization.get("quant_method") == "fp8"
         and quantization.get("fmt", "e4m3") == "e4m3"
@@ -33,19 +33,20 @@ def _dequantize_qwen_fp8_weight(
     *,
     block_size: int = FP8_BLOCK_SIZE,
 ) -> mx.array:
-    if weight.dtype != mx.uint8 or weight.ndim != 2:
+    if weight.dtype != mx.uint8 or weight.ndim < 2:
         raise ValueError(
-            "Qwen fine-grained FP8 weights must be 2D E4M3 bytes loaded as "
+            "Qwen fine-grained FP8 weights must be E4M3 byte matrices loaded as "
             f"uint8; got dtype={weight.dtype}, shape={weight.shape}."
         )
-    if scale_inv.ndim != 2 or not mx.issubdtype(scale_inv.dtype, mx.floating):
+    if scale_inv.ndim != weight.ndim or not mx.issubdtype(scale_inv.dtype, mx.floating):
         raise ValueError(
-            "Qwen fine-grained FP8 scales must be a 2D floating-point block "
+            "Qwen fine-grained FP8 scales must be a floating-point block "
             f"grid; got dtype={scale_inv.dtype}, shape={scale_inv.shape}."
         )
 
-    rows, cols = weight.shape
+    *batch_shape, rows, cols = weight.shape
     expected_scale_shape = (
+        *batch_shape,
         (rows + block_size - 1) // block_size,
         (cols + block_size - 1) // block_size,
     )
@@ -60,18 +61,22 @@ def _dequantize_qwen_fp8_weight(
     pad_cols = (-cols) % block_size
     decoded = mx.from_fp8(weight, dtype=mx.bfloat16)
     if pad_rows or pad_cols:
-        decoded = mx.pad(decoded, ((0, pad_rows), (0, pad_cols)))
+        decoded = mx.pad(
+            decoded,
+            [(0, 0)] * len(batch_shape) + [(0, pad_rows), (0, pad_cols)],
+        )
 
     decoded = decoded.reshape(
+        *batch_shape,
         (rows + pad_rows) // block_size,
         block_size,
         (cols + pad_cols) // block_size,
         block_size,
     )
-    decoded = (decoded * scale_inv[:, None, :, None]).reshape(
-        rows + pad_rows, cols + pad_cols
+    decoded = (decoded * scale_inv[..., :, None, :, None]).reshape(
+        *batch_shape, rows + pad_rows, cols + pad_cols
     )
-    return decoded[:rows, :cols]
+    return decoded[..., :rows, :cols]
 
 
 def quantize_qwen_fp8_weight(
@@ -94,8 +99,13 @@ def quantize_qwen_fp8_weight(
 def convert_qwen_fp8_weights(
     weights: dict[str, mx.array],
 ) -> dict[str, mx.array]:
-    """Replace Qwen ``weight_scale_inv`` pairs with MLX weight/scales pairs."""
-    scale_keys = [key for key in weights if key.endswith(".weight_scale_inv")]
+    """Replace Qwen FP8 inverse-scale pairs with MLX weight/scales pairs.
+
+    Regular linears use ``.weight`` / ``.weight_scale_inv`` while fused MoE
+    expert tensors use bare ``gate_up_proj`` / ``gate_up_proj_scale_inv``
+    names. Preserve the bare expert name until the MoE sanitizer splits it.
+    """
+    scale_keys = [key for key in weights if key.endswith("_scale_inv")]
     if not scale_keys:
         return weights
 
@@ -109,6 +119,10 @@ def convert_qwen_fp8_weights(
         scale_inv = converted.pop(scale_key)
         packed, scales = quantize_qwen_fp8_weight(weight, scale_inv)
         converted[weight_key] = packed
-        converted[weight_key[: -len(".weight")] + ".scales"] = scales
+        if weight_key.endswith(".weight"):
+            scales_key = weight_key[: -len(".weight")] + ".scales"
+        else:
+            scales_key = weight_key + "_scales"
+        converted[scales_key] = scales
 
     return converted

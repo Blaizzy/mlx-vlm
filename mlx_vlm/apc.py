@@ -835,6 +835,15 @@ def _safetensors_dtype_info(dtype: str):
     mapping = {
         "F16": (2, "e", mx.float16, None),
         "F32": (4, "f", mx.float32, None),
+        "I64": (8, "q", mx.int64, None),
+        "I32": (4, "i", mx.int32, None),
+        "I16": (2, "h", mx.int16, None),
+        "I8": (1, "b", mx.int8, None),
+        "U64": (8, "Q", mx.uint64, None),
+        "U32": (4, "I", mx.uint32, None),
+        "U16": (2, "H", mx.uint16, None),
+        "U8": (1, "B", mx.uint8, None),
+        "BOOL": (1, "?", mx.bool_, None),
     }
     return mapping.get(dtype)
 
@@ -1758,6 +1767,8 @@ class DiskBlockStore:
             return tuple(loaded)
 
         if kind == "checkpoint":
+            from .apc_adapters import reserve_checkpoint_capacity
+
             module_name = metadata.get(f"{prefix}_module", "")
             qualname = metadata.get(f"{prefix}_qualname", "")
             cls = _resolve_checkpoint_class(module_name, qualname)
@@ -1792,6 +1803,11 @@ class DiskBlockStore:
                 else:
                     cache.state = payload["state"]
                     cache.meta_state = payload["meta_state"]
+                reserve_checkpoint_capacity(
+                    cache,
+                    min_capacity_tokens=min_capacity_tokens,
+                    eval_targets=loaded_arrays,
+                )
             except (KeyError, TypeError, ValueError, AttributeError):
                 return None
             eval_targets.extend(loaded_arrays)

@@ -147,6 +147,11 @@ class _BaseCache:
         self.state = snapshot["state"]
         self.meta_state = snapshot["meta_state"]
 
+    def prefix_cache_reserve(self, min_capacity_tokens):
+        """Reserve optional post-restore capacity and return arrays to evaluate."""
+        del min_capacity_tokens
+        return ()
+
     def prefix_cache_merge(self, rows, prefix_lens):
         """Merge single-row snapshots into a batched cache, or ``None``.
 
@@ -383,6 +388,37 @@ class KVCache(_BaseCache):
     def state(self, v):
         self.keys, self.values = v
         self.offset = self.keys.shape[2]
+
+    def prefix_cache_reserve(self, min_capacity_tokens):
+        if self.keys is None or self.values is None:
+            return ()
+        capacity = max(self.offset, int(min_capacity_tokens))
+        if self.step > 0:
+            capacity = ((capacity + self.step - 1) // self.step) * self.step
+        if capacity <= self.keys.shape[2]:
+            return ()
+        pad_tokens = capacity - self.keys.shape[2]
+        self.keys = mx.concatenate(
+            [
+                self.keys,
+                mx.zeros(
+                    (*self.keys.shape[:2], pad_tokens, self.keys.shape[3]),
+                    dtype=self.keys.dtype,
+                ),
+            ],
+            axis=2,
+        )
+        self.values = mx.concatenate(
+            [
+                self.values,
+                mx.zeros(
+                    (*self.values.shape[:2], pad_tokens, self.values.shape[3]),
+                    dtype=self.values.dtype,
+                ),
+            ],
+            axis=2,
+        )
+        return self.keys, self.values
 
     def is_trimmable(self):
         return True
@@ -1989,10 +2025,13 @@ class BatchQuantizedKVCache(_BaseCache):
         self._idx, self.group_size, self.bits = map(int, v)
 
     def is_trimmable(self):
-        return False
+        return True
 
     def trim(self, n):
-        return 0
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset -= n
+        return n
 
     def empty(self):
         return self.keys is None

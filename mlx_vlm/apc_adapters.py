@@ -150,7 +150,14 @@ class CheckpointAdapter:
         )
         return StateFragment(payload=_snapshot_tree(raw))
 
-    def restore(self, fresh_cache: Any, fragment: StateFragment) -> None:
+    def restore(
+        self,
+        fresh_cache: Any,
+        fragment: StateFragment,
+        *,
+        min_capacity_tokens: Optional[int] = None,
+        eval_targets: Optional[List[mx.array]] = None,
+    ) -> None:
         # ``capture`` already detached every array. Re-copying here builds a
         # second lazy graph, doubles memory traffic, and can leak unevaluated
         # arrays into the asynchronous disk writer.
@@ -161,6 +168,28 @@ class CheckpointAdapter:
         else:
             fresh_cache.state = payload["state"]
             fresh_cache.meta_state = payload["meta_state"]
+        reserve_checkpoint_capacity(
+            fresh_cache,
+            min_capacity_tokens=min_capacity_tokens,
+            eval_targets=eval_targets,
+        )
+
+
+def reserve_checkpoint_capacity(
+    cache: Any,
+    *,
+    min_capacity_tokens: Optional[int],
+    eval_targets: Optional[List[mx.array]] = None,
+) -> None:
+    """Apply an optional cache-defined capacity reservation after restoration."""
+    if min_capacity_tokens is None:
+        return
+    reserve = getattr(cache, "prefix_cache_reserve", None)
+    if not callable(reserve):
+        return
+    targets = reserve(int(min_capacity_tokens))
+    if eval_targets is not None:
+        _eval_tree(targets, eval_targets)
 
 
 _CAPABILITY: Dict[type, Capability] = {}
@@ -498,20 +527,26 @@ def _custom_state_contract(c) -> bool:
     return False
 
 
-def _state_clone(c, eval_targets):
+def _state_clone(c, eval_targets, min_capacity_tokens):
     """Clone via the state/meta_state contract (from_state), detaching arrays."""
     detached = _snapshot_tree(c.state)
     _eval_tree(detached, eval_targets)
     from_state = getattr(type(c), "from_state", None)
     if callable(from_state):
-        return from_state(detached, c.meta_state)
-    out = type(c).__new__(type(c))
-    out.state = detached
-    out.meta_state = c.meta_state
+        out = from_state(detached, c.meta_state)
+    else:
+        out = type(c).__new__(type(c))
+        out.state = detached
+        out.meta_state = c.meta_state
+    reserve_checkpoint_capacity(
+        out,
+        min_capacity_tokens=min_capacity_tokens,
+        eval_targets=eval_targets,
+    )
     return out
 
 
-def _snapshot_contract_clone(c, eval_targets):
+def _snapshot_contract_clone(c, eval_targets, min_capacity_tokens):
     """Clone a cache that explicitly implements the snapshot protocol."""
     adapter = CheckpointAdapter()
     fragment = adapter.capture(c, prefix_len=int(getattr(c, "offset", 0) or 0))
@@ -522,7 +557,12 @@ def _snapshot_contract_clone(c, eval_targets):
         out = type(c)()
     except TypeError:
         out = type(c).__new__(type(c))
-    adapter.restore(out, fragment)
+    adapter.restore(
+        out,
+        fragment,
+        min_capacity_tokens=min_capacity_tokens,
+        eval_targets=eval_targets,
+    )
     return out
 
 
@@ -576,9 +616,9 @@ def clone_cache_entry(c, *, min_capacity_tokens, eval_targets):
         eval_targets.extend([out.keys, out.values])
         return out
     if _has_explicit_snapshot_contract(c):
-        return _snapshot_contract_clone(c, eval_targets)
+        return _snapshot_contract_clone(c, eval_targets, min_capacity_tokens)
     if _custom_state_contract(c):
-        return _state_clone(c, eval_targets)
+        return _state_clone(c, eval_targets, min_capacity_tokens)
     return None
 
 

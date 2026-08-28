@@ -37,6 +37,7 @@ from mlx_vlm.models.cache import (
     StaticPrefixKVCache,
 )
 from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
+from mlx_vlm.models.qwen4_exp.language import QSAKVCache
 from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 
 
@@ -83,6 +84,7 @@ def _cache_samples():
         "KVCache": KVCache(),
         "MiniMaxM3KVCache": MiniMaxM3KVCache(),
         "PoolingCache": PoolingCache(ratio=2),
+        "QSAKVCache": QSAKVCache(),
         "RingSlidingKVCache": RingSlidingKVCache(window_size=16),
         "RotatingKVCache": RotatingKVCache(max_size=16),
         "SimpleKVCache": SimpleKVCache(),
@@ -217,6 +219,16 @@ def _populated_cache(name: str, token_count: int):
         cache = MiniMaxM3KVCache()
         cache.update_and_fetch(mx.ones(shape), mx.ones(shape) * 2)
         cache.update_index_and_fetch(mx.ones(shape))
+        return cache
+    if name == "QSAKVCache":
+        cache = QSAKVCache()
+        cache.keys = mx.ones(shape)
+        cache.values = mx.ones(shape) * 2
+        cache.offset = token_count
+        cache.index_keys = mx.ones((1, token_count, 4)) * 3
+        cache.index_position_ids = mx.arange(token_count, dtype=mx.int64).reshape(
+            1, token_count
+        )
         return cache
     if name == "CacheList":
         return CacheList(
