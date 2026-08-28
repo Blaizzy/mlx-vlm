@@ -501,6 +501,14 @@ def parse_arguments():
         "Only supported for models quantized with 'nvfp4' or 'mxfp8' modes.",
     )
     parser.add_argument(
+        "--expert-cache-gb",
+        type=float,
+        default=None,
+        help="For an mlx_vlm.moe_offload checkpoint, bound the resident routed-"
+        "expert set to this many GB (default: 70%% of the GPU's recommended "
+        "working set). Ignored for a normal, non-offloaded checkpoint.",
+    )
+    parser.add_argument(
         "--processor-kwargs",
         type=json.loads,
         default={},
@@ -1262,6 +1270,8 @@ def main():
         revision=args.revision,
         trust_remote_code=args.trust_remote_code,
         quantize_activations=args.quantize_activations,
+        expert_cache_gb=args.expert_cache_gb,
+        max_kv_size=args.max_kv_size,
     )
     config = model.config
 

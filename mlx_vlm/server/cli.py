@@ -209,6 +209,14 @@ def main():
         help="Start index for quantized KV cache.",
     )
     parser.add_argument(
+        "--expert-cache-gb",
+        type=float,
+        default=None,
+        help="For an mlx_vlm.moe_offload checkpoint, bound the resident routed-"
+        "expert set to this many GB (default: 70%% of the GPU's recommended "
+        "working set). Ignored for a normal, non-offloaded checkpoint.",
+    )
+    parser.add_argument(
         "--draft-model",
         type=str,
         default=None,
@@ -325,6 +333,8 @@ def main():
     if args.max_kv_size is not None:
         os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    if args.expert_cache_gb is not None:
+        os.environ["EXPERT_CACHE_GB"] = str(args.expert_cache_gb)
     if args.top_logprobs_k is not None:
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
     if args.api_key:

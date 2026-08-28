@@ -807,6 +807,14 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
     strict = kwargs.pop("strict", True)
+    # An expert-offload dir (mlx_vlm.moe_offload) is missing routed-expert
+    # keys by design; defer eval until patch_model swaps those modules, or
+    # their random-init resident weights get eagerly materialized -- the OOM
+    # this feature exists to avoid.
+    is_offload_dir = (model_path / "offload_index.json").exists()
+    if is_offload_dir:
+        strict = False
+        requested_lazy, lazy = lazy, True
     config = load_config(model_path, **kwargs)
 
     index_file = model_path / "model.safetensors.index.json"
@@ -1030,9 +1038,44 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         model = quantize_activations(model)
 
+    if is_offload_dir:
+        # strict=False above must not swallow a genuinely malformed offload
+        # dir: verify every parameter left at random-init is actually an
+        # expected expert-weight path, and fail loudly on anything else.
+        from .moe_offload import PEREXPERT_RE, STACKED_FUSED_RE, STACKED_RE
+
+        expected = {k for k, _ in tree_flatten(model.parameters())}
+        missing = expected - set(weights)
+        unexpected_missing = [
+            k
+            for k in missing
+            if not (
+                PEREXPERT_RE.match(k)
+                or STACKED_RE.match(k)
+                or STACKED_FUSED_RE.match(k)
+            )
+        ]
+        if unexpected_missing:
+            raise ValueError(
+                f"Offload dir {model_path} is missing {len(unexpected_missing)} "
+                "resident parameters that aren't routed-expert weights (malformed "
+                "repack() output?): " + ", ".join(sorted(unexpected_missing)[:10])
+            )
+
     _drop_modules_without_weights(model, weights, declared_keys)
 
     model.load_weights(list(weights.items()), strict=strict)
+
+    if is_offload_dir:
+        from .moe_offload import patch_model
+
+        model.moe_offload_store = patch_model(
+            model,
+            str(model_path),
+            expert_cache_gb=kwargs.get("expert_cache_gb"),
+            max_kv_size=kwargs.get("max_kv_size"),
+        )
+        lazy = requested_lazy
 
     if not lazy:
         mx.eval(model.parameters())
