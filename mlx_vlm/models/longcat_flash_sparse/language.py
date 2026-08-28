@@ -100,8 +100,11 @@ class NgramEmbedding(nn.Module):
                 )
                 new_ids = (ngram_ids % emb_vocab_dim)[..., -seq_len:]
                 lookups.append(self.embedders[index](new_ids))
-        x = x + self.post_proj(mx.concatenate(lookups, axis=-1))
-        return x / (1 + self.num_embedders)
+        # LongcatCausalLM (Lite-Sparse) keeps the word embedding at full scale and
+        # normalizes only the n-gram contribution, unlike LongcatFlashNgram which
+        # divides the whole sum by (1 + num_embedders).
+        proj = self.post_proj(mx.concatenate(lookups, axis=-1))
+        return x + proj / (1 + self.num_embedders)
 
 
 class Indexer(nn.Module):
