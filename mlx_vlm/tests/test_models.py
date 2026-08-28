@@ -2816,6 +2816,62 @@ class TestModels(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 1, config.text_config.vocab_size))
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
 
+    def test_glm5_next_video_pixels_reach_vision_tower(self):
+        from mlx_vlm.models import glm5_next
+
+        vision = glm5_next.VisionConfig(
+            model_type="glm_ocr_vision",
+            depth=2,
+            hidden_size=64,
+            intermediate_size=64,
+            num_heads=2,
+            patch_size=14,
+            out_hidden_size=128,
+            projection_intermediate_size=128,
+            image_size=28,
+            spatial_merge_size=1,
+            temporal_patch_size=2,
+        )
+        config = glm5_next.ModelConfig(
+            text_config=self._glm5_next_mtp_text_config(),
+            vision_config=vision,
+            model_type="glm5_next",
+            image_token_id=7,
+            video_token_id=8,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        model = glm5_next.Model(config)
+
+        class _Reached(Exception):
+            pass
+
+        seen = {}
+
+        class _VisionSpy:
+            def __init__(self, real):
+                self.patch_embed = real.patch_embed
+
+            def __call__(self, pixel_values, grid_thw):
+                seen["grid"] = grid_thw
+                raise _Reached
+
+        model.vision_model = _VisionSpy(model.vision_model)
+
+        with self.assertRaises(_Reached):
+            model.get_input_embeddings(
+                mx.array([[1, 8, 8, 2]]),
+                pixel_values=None,
+                pixel_values_videos=mx.zeros((4, 8)),
+                video_grid_thw=mx.array([[2, 1, 1]]),
+            )
+        self.assertIsNotNone(seen.get("grid"))
+
+        feats = model.get_input_embeddings(mx.array([[1, 2, 3]]), pixel_values=None)
+        self.assertEqual(
+            feats.inputs_embeds.shape, (1, 3, config.text_config.hidden_size)
+        )
+
     def test_glm5_next_kda_matches_recurrent(self):
         # The shared gated-delta path must match glm5_next's reference recurrence
         # (the KDA safe forget gate == gated_delta.compute_g_safe, term for term).

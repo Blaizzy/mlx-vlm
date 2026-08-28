@@ -70,6 +70,9 @@ class Model(nn.Module):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
+
+        if pixel_values is None:
             return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
         image_grid_thw = kwargs.get("image_grid_thw", None)
