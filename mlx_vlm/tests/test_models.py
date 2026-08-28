@@ -2739,11 +2739,15 @@ class TestModels(unittest.TestCase):
             rope_parameters={"rope_theta": 10000.0},
             attention_bias=False,
             index_topk_pattern="FSFSFS",
+            num_nextn_predict_layers=1,
+            index_share_for_mtp_iteration=True,
         )
         self.assertEqual(
             config.indexer_types,
             ["full", "shared", "full", "shared", "full", "shared"],
         )
+        self.assertEqual(config.num_nextn_predict_layers, 1)
+        self.assertTrue(config.index_share_for_mtp_iteration)
 
         model = glm_moe_dsa.Model(config)
         has_indexer = [
@@ -2762,6 +2766,42 @@ class TestModels(unittest.TestCase):
         cache = model.make_cache()
         self.assertEqual(len(cache[0].caches), 2)
         self.assertEqual(len(cache[1].caches), 1)
+
+        from mlx_vlm.models.glm_moe_dsa.speculative_verifier import (
+            _quantized_head_logits,
+        )
+
+        tokens = mx.array([[1, 2, 3]])
+        target = model.language_model
+        target_out = target(tokens, return_hidden=True, skip_logits=True)
+        verified_hidden, shared_kv, gdn_states = target.speculative_verify_hidden(
+            tokens, cache=None
+        )
+        mx.eval(target_out.hidden_states, verified_hidden)
+        self.assertEqual(target_out.hidden_states[-1].shape, (1, 3, config.hidden_size))
+        self.assertTrue(
+            mx.array_equal(target_out.hidden_states[-1], verified_hidden).item()
+        )
+        self.assertEqual(shared_kv, {})
+        self.assertIsNone(gdn_states)
+
+        linear = nn.Linear(512, 8, bias=False)
+        linear.weight = mx.random.normal(linear.weight.shape).astype(mx.bfloat16)
+        verifier_inputs = mx.random.normal((1, 2, 512)).astype(mx.bfloat16)
+        for bits in (4, 5, 8):
+            quantized_head = nn.QuantizedLinear.from_linear(
+                linear, group_size=64, bits=bits
+            )
+            verifier_logits = _quantized_head_logits(quantized_head, verifier_inputs)
+            reference_logits = mx.concatenate(
+                [
+                    quantized_head(verifier_inputs[:, index : index + 1])
+                    for index in range(verifier_inputs.shape[1])
+                ],
+                axis=1,
+            )
+            mx.eval(verifier_logits, reference_logits)
+            self.assertTrue(mx.all(verifier_logits == reference_logits).item())
 
         sanitized = model.sanitize(
             {
