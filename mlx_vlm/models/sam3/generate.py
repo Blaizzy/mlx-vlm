@@ -1711,8 +1711,8 @@ def main():
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.5,
-        help="Score threshold (default: 0.3 image, 0.15 video)",
+        default=None,
+        help="Score threshold (default: 0.3 image, 0.15 video, 0.5 realtime)",
     )
     parser.add_argument(
         "--nms-thresh", type=float, default=0.5, help="NMS IoU threshold"

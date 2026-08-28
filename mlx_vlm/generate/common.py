@@ -129,6 +129,8 @@ def maybe_quantize_kv_cache(
         def hybridize(entry):
             if isinstance(entry, (HybridQuantKVCache, cache.RotatingKVCache)):
                 return entry
+            if getattr(entry, "preserve_auxiliary_kv_state", False):
+                return entry
             if isinstance(entry, cache.KVCache):
                 if entry.offset >= quantized_kv_start or entry.offset == 0:
                     built = HybridQuantKVCache(policy)
@@ -160,6 +162,8 @@ def maybe_quantize_kv_cache(
             if isinstance(entry, TurboQuantKVCache):
                 return entry
             if isinstance(entry, cache.RotatingKVCache):
+                return entry
+            if getattr(entry, "preserve_auxiliary_kv_state", False):
                 return entry
             if isinstance(entry, cache.KVCache):
                 if entry.offset == 0:

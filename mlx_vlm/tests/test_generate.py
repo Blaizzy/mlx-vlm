@@ -1892,6 +1892,69 @@ class TestSamplerArgs:
             {3: -0.75}, 1.15, 512, 0.2, 256, 0.3, 128
         )
 
+    @patch.object(generate_module.cache, "make_prompt_cache", return_value=[])
+    @patch.object(generate_module, "make_logits_processors", return_value=[])
+    @patch.object(ar_module, "_PositionedTargetSampler")
+    def test_seeded_top_k_uses_positioned_target_sampler(
+        self,
+        mock_positioned_sampler,
+        _mock_logits_processors,
+        _mock_prompt_cache,
+    ):
+        mock_positioned_sampler.return_value = lambda logprobs: mx.array([0])
+        model = MagicMock()
+        model.language_model.return_value = MagicMock(
+            logits=mx.zeros((1, 1, 4)),
+            cross_attention_states=None,
+            encoder_outputs=None,
+        )
+        embedding_output = MagicMock()
+        embedding_output.inputs_embeds = mx.zeros((1, 1, 4))
+        embedding_output.to_dict.return_value = {}
+        model.get_input_embeddings.return_value = embedding_output
+
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            max_tokens=1,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=40,
+            seed=7,
+        )
+        next(gen)
+
+        mock_positioned_sampler.assert_called_once_with(
+            temperature=1.0,
+            top_p=0.95,
+            top_k=40,
+            seed=7,
+        )
+
+
+@pytest.mark.parametrize("top_p", [1.0, 0.95])
+def test_positioned_target_sampler_honors_top_k(top_p):
+    sampler = ar_module._PositionedTargetSampler(
+        temperature=1.0,
+        top_p=top_p,
+        top_k=2,
+        seed=42,
+    )
+    logits = mx.array([[0.0, 1.0, 2.0, 3.0]], dtype=mx.float32)
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    repeated = mx.repeat(logprobs, 32, axis=0)
+
+    tokens = sampler.sample_target(
+        repeated,
+        row_ids=[0] * 32,
+        positions=list(range(32)),
+    )
+    mx.eval(tokens)
+
+    assert set(tokens.tolist()) <= {2, 3}
+
 
 def test_generate_step_schedules_final_prefill_async():
     model = MagicMock()
