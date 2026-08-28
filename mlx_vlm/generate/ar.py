@@ -2396,6 +2396,7 @@ class BatchGenerator:
             return None
         uid, ids_list, max_toks, prompt_kwargs, lps, criteria = sequence
         if not ids_list or len(ids_list) < 2:
+            self.apc_manager.record_reuse_outcome(_apc.ReuseOutcome.PROMPT_TOO_SHORT)
             return None
         return _apc.apc_lookup_plan(
             self.apc_manager,

@@ -592,6 +592,8 @@ class _DiskExactCacheSnapshot:
 class APCStats:
     hits: int = 0
     misses: int = 0
+    reuse_outcomes: Dict[str, int] = field(default_factory=dict)
+    store_outcomes: Dict[str, int] = field(default_factory=dict)
     matched_tokens: int = 0
     served_tokens: int = 0
     evictions: int = 0
@@ -624,6 +626,8 @@ class APCStats:
             "served_tokens": self.served_tokens,
             "token_hit_rate": hit_rate,
             "evictions": self.evictions,
+            "reuse_outcomes": dict(self.reuse_outcomes),
+            "store_outcomes": dict(self.store_outcomes),
             "stores": self.stores,
             "disk_hits": self.disk_hits,
             "disk_writes": self.disk_writes,
@@ -3130,6 +3134,16 @@ class APCManager:
         with self.lock:
             return self._resident_bytes_locked()
 
+    def record_reuse_outcome(self, outcome: str) -> None:
+        with self.lock:
+            counts = self.stats.reuse_outcomes
+            counts[outcome] = counts.get(outcome, 0) + 1
+
+    def record_store_outcome(self, outcome: str) -> None:
+        with self.lock:
+            counts = self.stats.store_outcomes
+            counts[outcome] = counts.get(outcome, 0) + 1
+
     # ---------- Public API ----------
     def lookup_exact_cache(
         self,
@@ -3556,6 +3570,7 @@ class APCManager:
                         i,
                         n_full,
                     )
+                    self.record_store_outcome(StoreOutcome.TENSOR_LIMIT)
                     if self.disk is None:
                         break
                     parent = h
@@ -3567,6 +3582,7 @@ class APCManager:
                         i,
                         n_full,
                     )
+                    self.record_store_outcome(StoreOutcome.POOL_EXHAUSTED)
                     if self.disk is None:
                         break
                     parent = h
@@ -3589,6 +3605,7 @@ class APCManager:
                 self.hash_table[h] = b
                 new_blocks.append(b)
                 self.stats.stores += 1
+                self.record_store_outcome(StoreOutcome.STORED)
                 self.stats.served_tokens += self.block_size
                 parent = h
             if self.disk is not None and disk_blocks:
@@ -4315,6 +4332,33 @@ def model_supports_apc(language_model: Any) -> bool:
     return model_apc_mode(language_model) is not None
 
 
+class StoreOutcome:
+    STORED = "stored"
+    POOL_EXHAUSTED = "pool_exhausted"
+    TENSOR_LIMIT = "tensor_limit"
+
+
+class ReuseOutcome:
+    EXACT = "exact"
+    DISK = "disk"
+    BLOCK = "block"
+    PROMPT_TOO_SHORT = "prompt_too_short"
+    NO_STORED_PREFIX = "no_stored_prefix"
+    MEDIA_SUFFIX = "media_suffix"
+    MEDIA_PREFIX = "media_prefix"
+
+
+@dataclass(frozen=True)
+class PrefixDecision:
+    plan: Optional[dict]
+    outcome: str
+    prefix_len: int = 0
+
+    @property
+    def reused(self) -> bool:
+        return self.plan is not None
+
+
 def apc_lookup_plan(
     manager: "APCManager",
     ids_list: Sequence[int],
@@ -4325,10 +4369,53 @@ def apc_lookup_plan(
     suffix_is_text_only,
     prefix_has_media,
 ) -> Optional[dict]:
-    """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply."""
+    return apc_lookup_decision(
+        manager,
+        ids_list,
+        extra_hash=extra_hash,
+        apc_mode=apc_mode,
+        safe_lookup_min=safe_lookup_min,
+        suffix_is_text_only=suffix_is_text_only,
+        prefix_has_media=prefix_has_media,
+    ).plan
+
+
+def apc_lookup_decision(
+    manager: "APCManager",
+    ids_list: Sequence[int],
+    *,
+    extra_hash: int,
+    apc_mode: str,
+    safe_lookup_min: int,
+    suffix_is_text_only,
+    prefix_has_media,
+) -> PrefixDecision:
+    decision = _decide_prefix(
+        manager,
+        ids_list,
+        extra_hash=extra_hash,
+        apc_mode=apc_mode,
+        safe_lookup_min=safe_lookup_min,
+        suffix_is_text_only=suffix_is_text_only,
+        prefix_has_media=prefix_has_media,
+    )
+    manager.record_reuse_outcome(decision.outcome)
+    return decision
+
+
+def _decide_prefix(
+    manager: "APCManager",
+    ids_list: Sequence[int],
+    *,
+    extra_hash: int,
+    apc_mode: str,
+    safe_lookup_min: int,
+    suffix_is_text_only,
+    prefix_has_media,
+) -> PrefixDecision:
     n = len(ids_list)
     if not ids_list or n < 2:
-        return None
+        return PrefixDecision(None, ReuseOutcome.PROMPT_TOO_SHORT)
 
     if apc_mode == "exact":
         exact_cache, exact_prefix_len = manager.lookup_exact_cache(
@@ -4336,21 +4423,27 @@ def apc_lookup_plan(
         )
         if exact_cache is not None and 0 < exact_prefix_len < n:
             if not suffix_is_text_only(exact_prefix_len):
-                return None
-            return {
-                "matched_blocks": [],
-                "warm_cache": exact_cache,
-                "prefix_len": exact_prefix_len,
-                "extra_hash": extra_hash,
-                "full_input_ids": list(ids_list),
-            }
-        return None
+                return PrefixDecision(None, ReuseOutcome.MEDIA_SUFFIX, exact_prefix_len)
+            return PrefixDecision(
+                {
+                    "matched_blocks": [],
+                    "warm_cache": exact_cache,
+                    "prefix_len": exact_prefix_len,
+                    "extra_hash": extra_hash,
+                    "full_input_ids": list(ids_list),
+                },
+                ReuseOutcome.EXACT,
+                exact_prefix_len,
+            )
+        return PrefixDecision(None, ReuseOutcome.NO_STORED_PREFIX)
 
     matched, prefix_len = manager.lookup_prefix(ids_list, extra_hash=extra_hash)
+    media_prefix_dropped = False
     if prefix_len > 0 and prefix_has_media(prefix_len):
         manager.release(matched)
         matched = []
         prefix_len = 0
+        media_prefix_dropped = True
     exact_cache = None
     exact_prefix_len = 0
     if prefix_len < n:
@@ -4372,39 +4465,53 @@ def apc_lookup_plan(
         if matched:
             manager.release(matched)
         if not suffix_is_text_only(disk_prefix_len):
-            return None
-        return {
-            "matched_blocks": [],
-            "warm_cache": warm_cache,
-            "prefix_len": disk_prefix_len,
-            "extra_hash": extra_hash,
-            "full_input_ids": list(ids_list),
-        }
+            return PrefixDecision(None, ReuseOutcome.MEDIA_SUFFIX, disk_prefix_len)
+        return PrefixDecision(
+            {
+                "matched_blocks": [],
+                "warm_cache": warm_cache,
+                "prefix_len": disk_prefix_len,
+                "extra_hash": extra_hash,
+                "full_input_ids": list(ids_list),
+            },
+            ReuseOutcome.DISK,
+            disk_prefix_len,
+        )
     if exact_prefix_len > prefix_len and exact_prefix_len < n:
         if matched:
             manager.release(matched)
         if not suffix_is_text_only(exact_prefix_len):
-            return None
-        return {
-            "matched_blocks": [],
-            "warm_cache": exact_cache,
-            "prefix_len": exact_prefix_len,
-            "extra_hash": extra_hash,
-            "full_input_ids": list(ids_list),
-        }
+            return PrefixDecision(None, ReuseOutcome.MEDIA_SUFFIX, exact_prefix_len)
+        return PrefixDecision(
+            {
+                "matched_blocks": [],
+                "warm_cache": exact_cache,
+                "prefix_len": exact_prefix_len,
+                "extra_hash": extra_hash,
+                "full_input_ids": list(ids_list),
+            },
+            ReuseOutcome.EXACT,
+            exact_prefix_len,
+        )
     if 0 < prefix_len < n:
         if not suffix_is_text_only(prefix_len):
             manager.release(matched)
-            return None
-        return {
-            "matched_blocks": matched,
-            "prefix_len": prefix_len,
-            "extra_hash": extra_hash,
-            "full_input_ids": list(ids_list),
-        }
+            return PrefixDecision(None, ReuseOutcome.MEDIA_SUFFIX, prefix_len)
+        return PrefixDecision(
+            {
+                "matched_blocks": matched,
+                "prefix_len": prefix_len,
+                "extra_hash": extra_hash,
+                "full_input_ids": list(ids_list),
+            },
+            ReuseOutcome.BLOCK,
+            prefix_len,
+        )
     if matched:
         manager.release(matched)
-    return None
+    if media_prefix_dropped:
+        return PrefixDecision(None, ReuseOutcome.MEDIA_PREFIX)
+    return PrefixDecision(None, ReuseOutcome.NO_STORED_PREFIX)
 
 
 def _adapter_schema_version() -> int:
