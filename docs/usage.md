@@ -220,35 +220,8 @@ for supported model families are detected from their `model_type`.
 python -m mlx_vlm.server
 ```
 
-See `README.md` for a complete `curl` example.
-
-### Live settings (`/v1/settings`)
-
-Read and change a curated set of server settings at runtime, without a
-restart. `GET` lists the settings the server accepts; `PATCH` changes them.
-
-```bash
-# list the available settings and their current values
-curl http://127.0.0.1:8080/v1/settings
-
-# merge: only the settings you list are changed
-curl -X PATCH http://127.0.0.1:8080/v1/settings \
-  -H 'Content-Type: application/json' \
-  -d '{"kv_quant_scheme": "turboquant"}'
-
-# replace: reset everything to its boot-time default, then apply these
-curl -X PATCH http://127.0.0.1:8080/v1/settings \
-  -H 'Content-Type: application/json' \
-  -d '{"op": "replace", "values": {"apc_enabled": true}}'
-```
-
-Changes take effect on the next request. Most settings reload the affected
-model first — KV, APC, and speculative-decoding settings reload text models,
-`vision_cache_size` reloads image models — while `max_kv_size` and
-`token_queue_timeout` apply to new requests without a reload.
-
-The response reports which settings were applied and which were rejected;
-unknown names and invalid values are rejected and never applied.
+See the [Server reference](server.md) for the complete API — CLI flags, all
+endpoints, curl examples, and live `/v1/settings`.
 
 ## Distributed Inference
 
