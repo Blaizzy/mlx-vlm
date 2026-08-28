@@ -16,6 +16,7 @@ from ..mla import MultiLinear
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
+from .indexer_kernel import indexer_dense_scores, indexer_dense_scores_available
 
 
 class NgramEmbedding(nn.Module):
@@ -29,14 +30,16 @@ class NgramEmbedding(nn.Module):
 
         self.word_embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
 
-        num_embedders = self.k * (self.n - 1)
-        emb_dim = args.hidden_size // num_embedders
+        self.num_embedders = self.k * (self.n - 1)
+        emb_dim = args.hidden_size // self.num_embedders
         self.embedders = []
-        self.post_projs = []
-        for i in range(num_embedders):
+        for i in range(self.num_embedders):
             emb_vocab_size = int(self.m + i * 2 + 1)
             self.embedders.append(nn.Embedding(emb_vocab_size, emb_dim))
-            self.post_projs.append(nn.Linear(emb_dim, args.hidden_size, bias=False))
+        # the per-embedder projections fuse into one GEMM over concatenated lookups
+        self.post_proj = nn.Linear(
+            self.num_embedders * emb_dim, args.hidden_size, bias=False
+        )
         self._compute_vocab_mods()
 
     def _compute_vocab_mods(self):
@@ -87,6 +90,7 @@ class NgramEmbedding(nn.Module):
         shifted_ids = {
             i: self._shift_right(context, i - 1) for i in range(2, self.n + 1)
         }
+        lookups = []
         for i in range(2, self.n + 1):
             for j in range(self.k):
                 index = (i - 2) * self.k + j
@@ -95,8 +99,9 @@ class NgramEmbedding(nn.Module):
                     context, shifted_ids, self._vocab_mods[(i, j)], ngram=i
                 )
                 new_ids = (ngram_ids % emb_vocab_dim)[..., -seq_len:]
-                x = x + self.post_projs[index](self.embedders[index](new_ids))
-        return x / (1 + self.k * (self.n - 1))
+                lookups.append(self.embedders[index](new_ids))
+        x = x + self.post_proj(mx.concatenate(lookups, axis=-1))
+        return x / (1 + self.num_embedders)
 
 
 class Indexer(nn.Module):
@@ -147,10 +152,14 @@ class Indexer(nn.Module):
         if seqlen <= self.index_topk:
             return None
 
-        scores = mx.maximum(q @ k.swapaxes(-1, -2), 0)
-        weights = self.weights_proj(x) * (self.n_heads**-0.5 * self.softmax_scale)
-        weights = weights.swapaxes(-1, -2)[..., None]
-        scores = (scores * weights).sum(axis=1, keepdims=True)
+        wp = self.weights_proj(x)
+        scale = self.n_heads**-0.5 * self.softmax_scale
+        if indexer_dense_scores_available(q.dtype, self.n_heads, self.head_dim):
+            scores = indexer_dense_scores(q, k[:, 0], wp, scale)[:, None]
+        else:
+            scores = mx.maximum(q @ k.swapaxes(-1, -2), 0)
+            w = (wp * scale).swapaxes(-1, -2)[..., None]
+            scores = (scores * w).sum(axis=1, keepdims=True)
 
         if self.index_init_tokens > 0 or self.index_local_tokens > 0:
             col = mx.arange(seqlen)
@@ -764,6 +773,7 @@ class LanguageModel(nn.Module):
 
         if self.args.oe_vocab_size_ratio > 0:
             remap = {}
+            proj_parts = {}
             for k, v in weights.items():
                 if k == "model.embed_tokens.weight":
                     remap["model.ngram_embeddings.word_embeddings.weight"] = v
@@ -771,10 +781,16 @@ class LanguageModel(nn.Module):
                     i = k[len("model.oe_embed_tokens") :].split(".")[0]
                     remap[f"model.ngram_embeddings.embedders.{i}.weight"] = v
                 elif k.startswith("model.oe_embed_proj"):
-                    i = k[len("model.oe_embed_proj") :].split(".")[0]
-                    remap[f"model.ngram_embeddings.post_projs.{i}.weight"] = v
+                    i = int(k[len("model.oe_embed_proj") :].split(".")[0])
+                    proj_parts[i] = v
                 else:
                     remap[k] = v
+            if proj_parts:
+                # fuse the per-embedder projections into one GEMM weight
+                fused = mx.concatenate(
+                    [proj_parts[i] for i in sorted(proj_parts)], axis=1
+                )
+                remap["model.ngram_embeddings.post_proj.weight"] = fused
             weights = remap
 
         return {k: v for k, v in weights.items() if not k.startswith("model.mtp")}
