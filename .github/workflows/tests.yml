@@ -1,6 +1,9 @@
 name: Test PRs
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
     branches:
       - main

@@ -124,17 +124,33 @@ jobs:
             );
             const { owner, repo } = context.repo;
             const run = context.payload.workflow_run;
-            let pullRequestSummary = run.pull_requests?.[0];
+            let pullRequestSummary = run.pull_requests?.find(
+              (pullRequest) =>
+                pullRequest.base?.repo?.full_name === `${owner}/${repo}` &&
+                pullRequest.head?.sha === run.head_sha
+            );
 
             if (!pullRequestSummary) {
-              const { data: associatedPullRequests } =
-                await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              const headOwner = run.head_repository?.owner?.login;
+              if (!headOwner) {
+                core.info("The workflow run's head repository is unavailable.");
+                return;
+              }
+
+              const candidatePullRequests = await github.paginate(
+                github.rest.pulls.list,
+                {
                   owner,
                   repo,
-                  commit_sha: run.head_sha,
-                });
-              pullRequestSummary = associatedPullRequests.find(
-                (pullRequest) => pullRequest.base.repo.full_name === `${owner}/${repo}`
+                  state: "all",
+                  head: `${headOwner}:${run.head_branch}`,
+                  per_page: 100,
+                }
+              );
+              pullRequestSummary = candidatePullRequests.find(
+                (pullRequest) =>
+                  pullRequest.base.repo.full_name === `${owner}/${repo}` &&
+                  pullRequest.head.sha === run.head_sha
               );
             }
 
@@ -149,9 +165,8 @@ jobs:
               repo,
               pull_number: issue_number,
             });
-            const eventHeadSha = run.pull_requests?.[0]?.head?.sha;
 
-            if (eventHeadSha && pullRequest.head.sha !== eventHeadSha) {
+            if (pullRequest.head.sha !== run.head_sha) {
               core.info("Ignoring a completed workflow run for an outdated PR revision.");
               return;
             }
@@ -234,6 +249,44 @@ jobs:
               .flatMap((job) => job.steps ?? [])
               .find((step) => step.name === "Run Python tests");
 
+            async function getMainTestBaseline() {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                owner,
+                repo,
+                workflow_id: "tests.yml",
+                branch: pullRequest.base.ref,
+                event: "push",
+                status: "completed",
+                per_page: 100,
+              });
+              const baselineRun = data.workflow_runs.find(
+                (candidate) => candidate.head_sha === pullRequest.base.sha
+              );
+
+              if (!baselineRun) {
+                return { conclusion: "unknown" };
+              }
+
+              const baselineJobs = await github.paginate(
+                github.rest.actions.listJobsForWorkflowRun,
+                {
+                  owner,
+                  repo,
+                  run_id: baselineRun.id,
+                  filter: "latest",
+                  per_page: 100,
+                }
+              );
+              const baselineTestStep = baselineJobs
+                .flatMap((job) => job.steps ?? [])
+                .find((step) => step.name === "Run Python tests");
+
+              return {
+                conclusion: baselineTestStep?.conclusion ?? "unknown",
+                url: baselineRun.html_url,
+              };
+            }
+
             const preCommitMarker = "<!-- mlx-vlm-pre-commit-failure -->";
             const preCommitBody = `${preCommitMarker}
             ⚠️ The **pre-commit checks failed** in [CI](${run.html_url}).
@@ -248,10 +301,24 @@ jobs:
             The project's pre-commit configuration includes **Black** and the other required formatters.`;
 
             const testMarker = "<!-- mlx-vlm-test-failure -->";
-            const testBody = `${testMarker}
+            let testBody = `${testMarker}
             ⚠️ The **Python tests failed** in [CI](${run.html_url}).
 
-            Review the failing test output, then reproduce the test suite locally with:
+            The bot could not compare this result with the current \`main\` baseline. Review the CI output to determine whether the failure is related to this PR.`;
+
+            if (testStep?.conclusion === "failure") {
+              const baseline = await getMainTestBaseline();
+
+              if (baseline.conclusion === "failure") {
+                testBody = `${testMarker}
+            ⚠️ The **Python tests failed** in [this PR's CI run](${run.html_url}), but the same test step is also failing on [the current \`main\` baseline](${baseline.url}).
+
+            No contributor action is requested yet. This is likely a baseline or dependency issue for the maintainers to investigate.`;
+              } else if (baseline.conclusion === "success") {
+                testBody = `${testMarker}
+            ⚠️ The **Python tests failed** in [CI](${run.html_url}) while [the current \`main\` baseline](${baseline.url}) is passing.
+
+            Review the failing output. To reproduce the test suite locally, run:
 
             \`\`\`shell
             python -m pip install pytest
@@ -260,7 +327,9 @@ jobs:
             pytest -s ./tests --ignore=tests/test_smoke.py
             \`\`\`
 
-            Fix the failure, then commit and push the changes.`;
+            If the failure is caused by this PR, fix it and push the changes. If it is unrelated, leave a note for the maintainers.`;
+              }
+            }
 
             if (preCommitStep) {
               await updateFailureReminder({
