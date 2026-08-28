@@ -293,6 +293,7 @@ class MessageFormatter:
             "qwen2_vl",
             "qwen2_5_vl",
             "qwen3_vl",
+            "mage_vl",
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",

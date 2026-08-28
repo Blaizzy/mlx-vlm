@@ -43,9 +43,19 @@ class MageVLProcessor(ProcessorMixin):
     tokenizer_class = "AutoTokenizer"
 
     def __init__(
-        self, image_processor=None, tokenizer=None, chat_template=None,
-        video_processor=None, **kwargs
+        self, image_processor=None, tokenizer=None, chat_template=None, **kwargs
     ):
+        # video_processor is carried in kwargs, not as a declared attribute or an
+        # __init__ parameter. transformers 5.x infers a processor's required attributes
+        # from the signature and then type-checks each against its Auto* class:
+        # declaring it raises "requires 3 arguments ... Got 2", and registering
+        # video_processor_class = "AutoVideoProcessor" rejects the numpy port with
+        # "Received a Qwen3VLVideoProcessor, but a BaseVideoProcessor was expected".
+        # Either error is swallowed by the AutoProcessor dispatcher, which then falls
+        # back to the checkpoint's torch remote code -- the exact failure this class
+        # exists to prevent. The image path sidesteps AutoImageProcessor for the same
+        # reason.
+        video_processor = kwargs.pop("video_processor", None)
         if chat_template is None and tokenizer is not None:
             chat_template = getattr(tokenizer, "chat_template", None)
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
