@@ -6,7 +6,7 @@ import mlx.nn as nn
 import pytest
 
 from mlx_vlm.models.qwen4_exp.config import TextConfig
-from mlx_vlm.models.qwen4_exp.language import LanguageModel
+from mlx_vlm.models.qwen4_exp.language import LanguageModel, Qwen4ExpDecoderLayer
 from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_mtp_splitter
 from mlx_vlm.speculative.drafters.qwen4_exp_mtp import (
     ModelConfig,
@@ -64,6 +64,13 @@ def _outer_config():
         video_token_id=61,
         vision_start_token_id=59,
     )
+
+
+def test_qwen4_decoder_layers_expose_normalized_layer_types_for_mtp():
+    config = _tiny_text_config()
+
+    assert Qwen4ExpDecoderLayer(config, 0).layer_type == "linear_attention"
+    assert Qwen4ExpDecoderLayer(config, 1).layer_type == "qwen_sparse_attention"
 
 
 def test_qwen4_mtp_fusion_matches_released_equations():

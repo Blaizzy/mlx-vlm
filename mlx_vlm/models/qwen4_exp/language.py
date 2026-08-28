@@ -1181,7 +1181,8 @@ class Qwen4ExpPLELayer(nn.Module):
 class Qwen4ExpDecoderLayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
-        self.is_linear = config.layer_types[layer_idx] == "linear_attention"
+        self.layer_type = config.layer_types[layer_idx]
+        self.is_linear = self.layer_type == "linear_attention"
         if self.is_linear:
             self.linear_attn = Qwen4ExpGatedDeltaNet(config)
         else:
