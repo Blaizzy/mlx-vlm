@@ -361,6 +361,13 @@ class Glm5NextIndexer(nn.Module):
             and getattr(cache, "_pool", None) is not None
             and getattr(cache, "_no_pad", False)
             and cache._pool[0].shape[0] == B
+            # Time-continuity: the cached pool is only valid if it was written exactly
+            # one token ago. Any rewind of the cache between decode steps (a multi-turn
+            # trim, a speculative rollback, a batch splice) leaves t_prev at or ahead of
+            # T -- the "new suffix" below is then empty and _pooled_states argmaxes a
+            # zero-size array (#2084). Fall back to one full pooling pass instead,
+            # which also rebuilds a fresh pool.
+            and cache._pool[3] == T - 1
         ):
             ck, ci, cv, t_prev = cache._pool
             n_stable = t_prev // self.index_kpool
