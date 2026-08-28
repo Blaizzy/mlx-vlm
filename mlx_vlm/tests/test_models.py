@@ -2872,6 +2872,115 @@ class TestModels(unittest.TestCase):
             feats.inputs_embeds.shape, (1, 3, config.text_config.hidden_size)
         )
 
+    def test_glm5_next_prefill_gather_matches_dense(self):
+        # The gathered multi-query path (full prefill and short verify blocks)
+        # must match the dense masked path it replaces: identical selections,
+        # identical softmax over them, O(S*topk) instead of O(S*T) work.
+        from mlx_vlm.models import glm5_next
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.models.glm5_next import language as glm5_lang
+        from mlx_vlm.models.glm5_next.language import Glm5NextSparseAttention
+
+        mx.random.seed(0)
+
+        def make_cfg(**overrides):
+            base = dict(
+                model_type="glm5_next_text",
+                vocab_size=128,
+                hidden_size=128,
+                intermediate_size=128,
+                moe_intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                n_shared_experts=1,
+                n_routed_experts=8,
+                routed_scaling_factor=2.5,
+                kv_lora_rank=64,
+                q_lora_rank=128,
+                qk_rope_head_dim=0,
+                v_head_dim=64,
+                qk_nope_head_dim=64,
+                qk_head_dim=64,
+                num_experts_per_tok=4,
+                first_k_dense_replace=1,
+                max_position_embeddings=4096,
+                rms_norm_eps=1e-5,
+                index_topk=4,
+                index_head_dim=64,
+                index_n_heads=2,
+                index_kpool=2,
+                layer_types=["deepseek_sparse_attention"],
+                mlp_layer_types=["dense"],
+                linear_attn_config={
+                    "num_heads": 2,
+                    "head_dim": 64,
+                    "short_conv_kernel_size": 2,
+                    "gate_lower_bound": -5.0,
+                },
+                hc_mult=4,
+                num_nextn_predict_layers=0,
+                pad_token_id=0,
+                eos_token_id=1,
+            )
+            base.update(overrides)
+            return glm5_next.TextConfig(**base)
+
+        dsa = Glm5NextSparseAttention(make_cfg())
+        dsa.eval()
+        # 12-token prefill chunk + 12-token prefill chunk + 4-token verify block
+        x = mx.random.normal((1, 28, 128))
+
+        def run(gathered):
+            # zero the crossover threshold so the tiny test context still
+            # exercises the gathered prefill branch
+            old_min = glm5_lang._GATHER_MIN_CONTEXT
+            glm5_lang._GATHER_MIN_CONTEXT = 0
+            dsa.use_gathered_attention = gathered
+            try:
+                c = CacheList(KVCache(), KVCache())
+                outs, pos = [], 0
+                for S in (12, 12, 4):
+                    qpos = mx.arange(pos, pos + S)[:, None]
+                    kpos = mx.arange(pos + S)[None, :]
+                    outs.append(dsa(x[:, pos : pos + S], kpos <= qpos, c))
+                    pos += S
+                return mx.concatenate(outs, axis=1)
+            finally:
+                dsa.use_gathered_attention = True
+                glm5_lang._GATHER_MIN_CONTEXT = old_min
+
+        dense = run(gathered=False)
+        gath = run(gathered=True)
+        self.assertLess(float(mx.max(mx.abs(gath - dense))), 1e-3)
+
+        # multi-chunk gather (chunk smaller than the block) is a pure reshape
+        old_chunk = glm5_lang._GATHER_Q_CHUNK
+        try:
+            glm5_lang._GATHER_Q_CHUNK = 8
+            chunked = run(gathered=True)
+        finally:
+            glm5_lang._GATHER_Q_CHUNK = old_chunk
+        self.assertLess(float(mx.max(mx.abs(chunked - gath))), 1e-6)
+
+        # tail selection off: the first index_kpool - 1 queries select nothing
+        # (the dense path's value for such rows is an implementation-defined
+        # fully-masked softmax); the gathered path must stay finite and zero
+        # those rows rather than emit NaN.
+        dsa2 = Glm5NextSparseAttention(
+            make_cfg(index_kpool_always_select_tail=False)
+        )
+        dsa2.eval()
+        qpos = mx.arange(12)[:, None]
+        kpos = mx.arange(12)[None, :]
+        old_min = glm5_lang._GATHER_MIN_CONTEXT
+        glm5_lang._GATHER_MIN_CONTEXT = 0
+        try:
+            out2 = dsa2(x[:, :12], kpos <= qpos, CacheList(KVCache(), KVCache()))
+        finally:
+            glm5_lang._GATHER_MIN_CONTEXT = old_min
+        self.assertTrue(mx.all(mx.isfinite(out2)).item())
+
     def test_glm5_next_kda_matches_recurrent(self):
         # The shared gated-delta path must match glm5_next's reference recurrence
         # (the KDA safe forget gate == gated_delta.compute_g_safe, term for term).

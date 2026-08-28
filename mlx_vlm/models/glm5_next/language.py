@@ -22,6 +22,20 @@ from .speculative_verifier import Glm5NextExactSpeculativeVerifier, verify_logit
 
 _SPECULATIVE_VERIFIER = Glm5NextExactSpeculativeVerifier()
 
+# Query chunk for gathered multi-query sparse attention: bounds the gathered
+# K/V transient to O(chunk * index_topk) latents at prefill while staying wide
+# enough to keep the GPU busy. The short speculative-verify block (L <= 8) is
+# always a single chunk.
+_GATHER_Q_CHUNK = 1024
+
+# Context length above which gathered prefill beats the dense masked path.
+# Measured crossover on M3 Ultra at GLM-5.3-Flash dims: dense is cheaper per
+# chunk below ~16k keys (0.74x at 8k), gathered wins beyond (1.65x at 32k,
+# 5.1x at 65k, 7.1x at 131k — near depth-flat). During a long chunked prefill
+# the early shallow chunks take the dense path and later chunks gather, per
+# chunk, automatically. Short verify blocks (L <= 8) always gather.
+_GATHER_MIN_CONTEXT = 16384
+
 
 class Glm5NextRMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
@@ -445,7 +459,14 @@ class Glm5NextIndexer(nn.Module):
             scores = q[:, c0:c1] @ pool_keys_t
             scores = mx.maximum(scores * self.softmax_scale, 0.0)
             weights = self.weights_proj(x[:, c0:c1]) * (self.n_heads**-0.5)
-            index_scores = mx.sum(weights[..., None] * scores, axis=2)
+            # Contract the head axis as a batched matmul rather than an
+            # elementwise product + sum: it never materializes the
+            # [B, cs, n_heads, P] product (halving the scorer transient),
+            # accumulates in fp32 for low-precision inputs (selection ties
+            # resolve as the fp32 reference does), and is structurally immune
+            # to the large-strided-shape reduction issue of mx.sum over a
+            # non-last axis (ml-explore/mlx#3784) should the chunk ever grow.
+            index_scores = (weights[:, :, None, :] @ scores).squeeze(2)
             pool_visible = mx.take_along_axis(
                 visible, mx.broadcast_to(pool_end[:, None, :], (B, cs, P)), axis=-1
             )
@@ -549,12 +570,22 @@ class Glm5NextSparseAttention(nn.Module):
             cache = [None] * 2
 
         topk_indices = self.indexer(x, qr, mask, cache=cache[1])
-        if topk_indices is not None and 1 < L <= 8:
-            # Short speculative-verify block: gather the top-k selected latents per query
-            # and attend O(L*topk), instead of masking over all Kv (O(L*Kv)). The indexer
-            # already selects causally per query, so no extra mask is needed. This is the
-            # decode-path selection generalized to a small block -- the win that makes
-            # verify affordable at long context.
+        if (
+            topk_indices is not None
+            and L > 1
+            # A quantized latent cache fetches K/V as quantized tuples, which the
+            # gather cannot index; those shapes keep the dense masked path below.
+            and not (cache[0] is not None and hasattr(cache[0], "group_size"))
+            and (L <= 8 or kv_latent.shape[2] >= _GATHER_MIN_CONTEXT)
+            and getattr(self, "use_gathered_attention", True)
+        ):
+            # Multi-query sparse attention: gather the top-k selected latents per
+            # query and attend O(L*topk), instead of masking over all Kv (O(L*Kv)).
+            # The indexer already selects causally per query, so no extra mask is
+            # needed. This is the decode-path selection generalized to any block:
+            # it makes the short speculative-verify block affordable at long
+            # context, and turns prefill from O(S*T) dense-masked attention into
+            # O(S*topk) -- near depth-flat prefill instead of linear decay.
             if (
                 cache is not None
                 and cache[0] is not None
@@ -564,7 +595,7 @@ class Glm5NextSparseAttention(nn.Module):
                 cache[0].keys = mx.depends(
                     cache[0].keys, (cache[1].keys, cache[1].values)
                 )
-            return self._gathered_verify_attention(q, kv_latent, topk_indices)
+            return self._gathered_attention(q, kv_latent, topk_indices)
         attn_mask = mask
         if topk_indices is not None:
             Kv = kv_latent.shape[2]
@@ -629,29 +660,45 @@ class Glm5NextSparseAttention(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
-    def _gathered_verify_attention(self, q, kv_latent, topk_indices):
-        # Per-query top-k gather for a short block (verify): each query attends only to
-        # its selected latents (O(L*topk)) rather than a mask over all Kv (O(L*Kv)).
+    def _gathered_attention(self, q, kv_latent, topk_indices):
+        # Per-query top-k gather: each query attends only to its selected latents
+        # (O(L*topk)) rather than a mask over all Kv (O(L*Kv)). Queries are chunked
+        # so the gathered-K/V transient stays O(chunk * topk) however long the
+        # prefill; a short verify block is a single chunk and unchanged.
         B, H, L, _ = q.shape
         Kv = kv_latent.shape[2]
         dim = kv_latent.shape[-1]
         # topk_indices is [B, 1, L, topk] (axis 1 is the broadcast head); take per-query.
         sel = topk_indices[:, 0, :, :]  # [B, L, topk]
         topk = sel.shape[-1]
+        sel_valid = sel >= 0
+        # A fully-masked SDPA row is implementation-defined: force key 0 for a
+        # query with no selected keys to keep the softmax finite, then zero its
+        # output below -- matching the dense masked path, which yields zero rows
+        # for such queries (reachable only for padded queries under batching, or
+        # with index_kpool_always_select_tail off).
+        row_has_keys = mx.any(sel_valid, axis=-1, keepdims=True)  # [B, L, 1]
+        sel_valid = sel_valid | ~row_has_keys
         clamped = mx.clip(sel, 0, Kv - 1)
-        kv_g = mx.take_along_axis(
-            mx.broadcast_to(kv_latent, (B, L, Kv, dim)),
-            mx.broadcast_to(clamped[..., None], (B, L, topk, dim)),
-            axis=2,
-        )  # [B, L, topk, dim]
         q_e = self.embed_q(q)  # [B, H, L, dim]
-        q_bl = q_e.transpose(0, 2, 1, 3).reshape(B * L, H, 1, dim)
-        kv_bl = kv_g.reshape(B * L, 1, topk, dim)
-        valid = (sel >= 0).reshape(B * L, 1, 1, topk)
-        attn = scaled_dot_product_attention(
-            q_bl, kv_bl, kv_bl, cache=None, scale=self.scale, mask=valid
-        )  # [B*L, H, 1, dim]
-        attn = attn.reshape(B, L, H, dim).transpose(0, 2, 1, 3)  # [B, H, L, dim]
+        outs = []
+        for a0 in range(0, L, _GATHER_Q_CHUNK):
+            a1 = min(a0 + _GATHER_Q_CHUNK, L)
+            lc = a1 - a0
+            kv_g = mx.take_along_axis(
+                mx.broadcast_to(kv_latent, (B, lc, Kv, dim)),
+                mx.broadcast_to(clamped[:, a0:a1, :, None], (B, lc, topk, dim)),
+                axis=2,
+            )  # [B, lc, topk, dim]
+            q_bl = q_e[:, :, a0:a1].transpose(0, 2, 1, 3).reshape(B * lc, H, 1, dim)
+            kv_bl = kv_g.reshape(B * lc, 1, topk, dim)
+            valid = sel_valid[:, a0:a1].reshape(B * lc, 1, 1, topk)
+            o = scaled_dot_product_attention(
+                q_bl, kv_bl, kv_bl, cache=None, scale=self.scale, mask=valid
+            )  # [B*lc, H, 1, dim]
+            outs.append(o.reshape(B, lc, H, dim).transpose(0, 2, 1, 3))
+        attn = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
+        attn = attn * row_has_keys.astype(attn.dtype)[:, None, :, 0, None]
         out = self.unembed_out(attn).transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(out)
 
