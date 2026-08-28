@@ -3879,21 +3879,47 @@ def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) -> 
 def _align_exact_batch_caches_to_kv_policy(
     caches: List[Any],
     kv_quant_config: dict,
-) -> List[Any]:
-    """Requant float full-attn batch layers to match live ``_make_cache``.
+) -> Optional[List[Any]]:
+    """Align legacy float full-attn snapshots with live ``_make_cache``.
 
-    Exact store keeps float snapshots; continuous-batching join under
-    ``--kv-bits`` requires the same per-layer types as a cold live row
-    (uniform or TurboQuant for layers that ``should_quantize_kv_layer``
-    marks, float last layer when n > 2). Hybrid non-KV types
-    (``ArraysCache``, ``BatchRotatingKVCache``, …) are left unchanged.
+    Native quantized snapshots already merge into their matching batch cache
+    and pass through unchanged. Older float snapshots still need conversion
+    so continuous-batching joins use the same per-layer types as cold rows.
     """
-    from .models.cache import BatchKVCache, should_quantize_kv_layer
+    from .models.cache import (
+        BatchKVCache,
+        BatchQuantizedKVCache,
+        should_quantize_kv_layer,
+    )
+    from .turboquant import BatchTurboQuantKVCache
 
     n = len(caches)
+    policy = kv_quant_from_config(kv_quant_config)
+    _reject_mixed_batch_policy(policy)
     out: List[Any] = []
     for layer_idx, c in enumerate(caches):
         quantize = should_quantize_kv_layer(layer_idx, n)
+        if isinstance(c, BatchQuantizedKVCache):
+            if (
+                not quantize
+                or policy.is_turboquant
+                or int(c.bits) != int(policy.bits)
+                or int(c.group_size) != int(policy.group_size)
+            ):
+                return None
+            out.append(c)
+            continue
+        if isinstance(c, BatchTurboQuantKVCache):
+            if (
+                not quantize
+                or not policy.is_turboquant
+                or c.bits != policy.bits
+                or c.key_bits != policy.key.bits
+                or c.value_bits != policy.value.bits
+            ):
+                return None
+            out.append(c)
+            continue
         if not quantize or not isinstance(c, BatchKVCache):
             out.append(c)
             continue
@@ -3924,10 +3950,10 @@ def make_warm_batch_exact_cache_multi(
 ) -> Tuple[Optional[List[Any]], int]:
     """Merge single-row exact-cache snapshots into batch-aware caches.
 
-    When *kv_quant_config* is provided, full-attention ``BatchKVCache`` layers
-    are re-quantized to match live ``_make_cache`` via
-    ``should_quantize_kv_layer`` (last layer stays float when n > 2). Hybrid
-    non-KV entries are unchanged. On-disk exact snapshots remain float.
+    Native quantized rows are merged in their packed representation. When
+    *kv_quant_config* is provided, legacy float ``BatchKVCache`` snapshots are
+    converted to match live ``_make_cache``. Hybrid non-KV entries are
+    unchanged.
     """
 
     if not row_caches:
@@ -3950,6 +3976,8 @@ def make_warm_batch_exact_cache_multi(
 
     if kv_quant_config is not None:
         out = _align_exact_batch_caches_to_kv_policy(out, kv_quant_config)
+        if out is None:
+            return None, 0
 
     eval_targets: List[mx.array] = []
     for c in out:
@@ -4004,8 +4032,8 @@ def snapshot_prompt_cache_row(
     """Row-normalize a prompt cache for APC store/lookup.
 
     Batch-shaped layouts (every entry has ``extract``) are extracted first.
-    Single-row caches are cloned in place. Quantized layers are dequantized
-    into float ``KVCache`` entries.
+    Single-row caches are cloned in place. Quantized layers with an explicit
+    checkpoint contract retain their native packed representation.
     """
     if not caches:
         return []

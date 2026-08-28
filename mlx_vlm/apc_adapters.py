@@ -8,10 +8,10 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import mlx.core as mx
 
-# v4 invalidates v3 hybrid checkpoints captured with the old 16-token guard.
-# Reusing those 4,080-token snapshots would bypass the new prompt_length - 1
-# replay boundary and reintroduce batch-shape and mRoPE parity drift.
-ADAPTER_SCHEMA_VERSION = 4
+# v5 stores quantized checkpoint components in their native packed form. Keep
+# them isolated from v4 float-expanded snapshots and from older readers that
+# do not understand the packed cache contracts.
+ADAPTER_SCHEMA_VERSION = 5
 
 
 class Capability(str, Enum):
@@ -128,6 +128,17 @@ def _has_explicit_snapshot_contract(cache: Any) -> bool:
     for klass in type(cache).__mro__:
         if "prefix_cache_snapshot" in klass.__dict__:
             return klass.__dict__["prefix_cache_snapshot"] is not base_snapshot
+    return False
+
+
+def _has_explicit_merge_contract(cache: Any) -> bool:
+    """True when a cache type overrides the default no-op merge contract."""
+    from .models.cache import _BaseCache
+
+    base_merge = _BaseCache.__dict__.get("prefix_cache_merge")
+    for klass in type(cache).__mro__:
+        if "prefix_cache_merge" in klass.__dict__:
+            return klass.__dict__["prefix_cache_merge"] is not base_merge
     return False
 
 
@@ -606,6 +617,11 @@ def clone_cache_entry(c, *, min_capacity_tokens, eval_targets):
             for s in c
         ]
         return None if any(s is None for s in subs) else tuple(subs)
+    # A cache-defined snapshot contract takes precedence over the legacy
+    # float-K/V fallback. Quantized caches use this to preserve their packed
+    # representation end to end.
+    if _has_explicit_snapshot_contract(c):
+        return _snapshot_contract_clone(c, eval_targets, min_capacity_tokens)
     if hasattr(c, "dequantize_for_apc"):
         copy, _ = _apc_array_helpers()
         dk, dv = c.dequantize_for_apc()
@@ -615,8 +631,6 @@ def clone_cache_entry(c, *, min_capacity_tokens, eval_targets):
         out.keys, out.values, out.offset = copy(dk), copy(dv), dk.shape[-2]
         eval_targets.extend([out.keys, out.values])
         return out
-    if _has_explicit_snapshot_contract(c):
-        return _snapshot_contract_clone(c, eval_targets, min_capacity_tokens)
     if _custom_state_contract(c):
         return _state_clone(c, eval_targets, min_capacity_tokens)
     return None
@@ -628,6 +642,12 @@ def merge_cache_entries(entries, prefix_lens):
     if not entries:
         return None
     first = entries[0]
+    for entry in entries:
+        if not _has_explicit_merge_contract(entry):
+            continue
+        merged = entry.prefix_cache_merge(entries, prefix_lens)
+        if merged is not None:
+            return merged
     for typ, adapter in _clone_rules():
         if typ is lm.KVCache:
             ok = all(type(c) is typ for c in entries)

@@ -3951,6 +3951,74 @@ def _state_length(state) -> int:
     raise TypeError(f"Unsupported TurboQuant state type: {type(state)!r}")
 
 
+def _snapshot_state_tree(state):
+    """Convert a packed TurboQuant state into a serializer-friendly tree."""
+    if state is None:
+        return None
+    if isinstance(state, TurboQuantMSEState):
+        return {"kind": "mse", "norms": state.norms, "indices": state.indices}
+    if isinstance(state, TurboQuantProdState):
+        return {
+            "kind": "prod",
+            "norms": state.norms,
+            "mse_indices": state.mse_indices,
+            "residual_norms": state.residual_norms,
+            "qjl_signs": state.qjl_signs,
+        }
+    if isinstance(state, TurboQuantPolarState):
+        return {
+            "kind": "polar",
+            "radii": state.radii,
+            "level_indices": list(state.level_indices),
+        }
+    if isinstance(state, TurboQuantPolarProdState):
+        return {
+            "kind": "polar_prod",
+            "norms": state.norms,
+            "polar_state": _snapshot_state_tree(state.polar_state),
+            "residual_norms": state.residual_norms,
+            "qjl_signs": state.qjl_signs,
+        }
+    if isinstance(state, TurboQuantSplitState):
+        return {
+            "kind": "split",
+            "low": _snapshot_state_tree(state.low),
+            "high": _snapshot_state_tree(state.high),
+        }
+    raise TypeError(f"Unsupported TurboQuant state type: {type(state)!r}")
+
+
+def _restore_state_tree(snapshot):
+    """Rebuild the packed NamedTuple state produced by ``_snapshot_state_tree``."""
+    if snapshot is None:
+        return None
+    kind = snapshot.get("kind")
+    if kind == "mse":
+        return TurboQuantMSEState(snapshot["norms"], snapshot["indices"])
+    if kind == "prod":
+        return TurboQuantProdState(
+            snapshot["norms"],
+            snapshot["mse_indices"],
+            snapshot["residual_norms"],
+            snapshot["qjl_signs"],
+        )
+    if kind == "polar":
+        return TurboQuantPolarState(snapshot["radii"], tuple(snapshot["level_indices"]))
+    if kind == "polar_prod":
+        return TurboQuantPolarProdState(
+            snapshot["norms"],
+            _restore_state_tree(snapshot["polar_state"]),
+            snapshot["residual_norms"],
+            snapshot["qjl_signs"],
+        )
+    if kind == "split":
+        return TurboQuantSplitState(
+            _restore_state_tree(snapshot["low"]),
+            _restore_state_tree(snapshot["high"]),
+        )
+    raise ValueError(f"Unsupported TurboQuant snapshot state: {kind!r}")
+
+
 def _allocate_state_like(state, length: int):
     if isinstance(state, TurboQuantMSEState):
         return TurboQuantMSEState(
@@ -4844,12 +4912,39 @@ def _select_outlier_indices(
 
 class _SplitCodec:
     def __init__(self, tensor: mx.array, bits: float, mode: str, seed: int):
+        low_idx, high_idx = _select_outlier_indices(tensor, bits)
+        self._init_from_indices(tensor.shape[-1], bits, mode, seed, low_idx, high_idx)
+
+    @classmethod
+    def from_indices(
+        cls,
+        dim: int,
+        bits: float,
+        mode: str,
+        seed: int,
+        low_idx,
+        high_idx,
+    ):
+        obj = cls.__new__(cls)
+        obj._init_from_indices(dim, bits, mode, seed, low_idx, high_idx)
+        return obj
+
+    def _init_from_indices(
+        self,
+        dim: int,
+        bits: float,
+        mode: str,
+        seed: int,
+        low_idx,
+        high_idx,
+    ) -> None:
         self.bits = bits
         self.mode = mode
-        self.dim = tensor.shape[-1]
+        self.dim = int(dim)
         self.lower_bits = math.floor(bits)
         self.upper_bits = math.ceil(bits)
-        low_idx, high_idx = _select_outlier_indices(tensor, bits)
+        low_idx = np.asarray(low_idx, dtype=np.int32)
+        high_idx = np.asarray(high_idx, dtype=np.int32)
         self.low_idx = mx.array(low_idx, dtype=mx.int32)
         self.high_idx = mx.array(high_idx, dtype=mx.int32)
 
@@ -4863,10 +4958,9 @@ class _SplitCodec:
         # Pre-build combined query transform for fused decode:
         # single (D, 2*dim_low + 2*dim_high) matrix replaces 2 takes + 2 matmuls
         if mode == "prod" and isinstance(self.low_codec, _TurboQuantProdCodec):
-            dim = tensor.shape[-1]
             dl = len(low_idx)
             dh = len(high_idx)
-            combined = mx.zeros((dim, 2 * dl + 2 * dh), dtype=mx.float32)
+            combined = mx.zeros((self.dim, 2 * dl + 2 * dh), dtype=mx.float32)
             combined[self.low_idx, :dl] = self.low_codec.query_transform_t[:, :dl]
             combined[self.low_idx, dl : 2 * dl] = self.low_codec.query_transform_t[
                 :, dl:
@@ -4940,6 +5034,68 @@ class _SplitCodec:
         )
         merged = mx.concatenate([low_tensor, high_tensor], axis=-1)
         return mx.take(merged, self.restore_order, axis=-1), denom, max_scores
+
+
+def _snapshot_codec(codec):
+    if codec is None:
+        return None
+    if isinstance(codec, _SplitCodec):
+        return {
+            "kind": "split",
+            "dim": codec.dim,
+            "bits": codec.bits,
+            "mode": codec.mode,
+            "low_idx": codec.low_idx,
+            "high_idx": codec.high_idx,
+        }
+    if isinstance(codec, _TurboQuantMSECodec):
+        return {"kind": "mse", "dim": codec.dim, "bits": codec.bits}
+    if isinstance(codec, _TurboQuantProdCodec):
+        return {"kind": "prod", "dim": codec.dim, "bits": codec.bits}
+    if isinstance(codec, _TurboQuantPolarProdCodec):
+        return {"kind": "polar_prod", "dim": codec.dim, "bits": codec.bits}
+    raise TypeError(f"Unsupported TurboQuant codec type: {type(codec)!r}")
+
+
+def _restore_codec(snapshot, seed: int):
+    if snapshot is None:
+        return None
+    kind = snapshot.get("kind")
+    dim = int(snapshot["dim"])
+    bits = snapshot["bits"]
+    if kind == "mse":
+        return _TurboQuantMSECodec(dim, int(bits), seed)
+    if kind == "prod":
+        return _TurboQuantProdCodec(dim, int(bits), seed)
+    if kind == "polar_prod":
+        return _TurboQuantPolarProdCodec(dim, int(bits), seed)
+    if kind == "split":
+        return _SplitCodec.from_indices(
+            dim,
+            float(bits),
+            snapshot["mode"],
+            seed,
+            np.asarray(snapshot["low_idx"]),
+            np.asarray(snapshot["high_idx"]),
+        )
+    raise ValueError(f"Unsupported TurboQuant codec snapshot: {kind!r}")
+
+
+def _codecs_compatible(lhs, rhs) -> bool:
+    """Whether two rows use the same packed coordinate system."""
+    if type(lhs) is not type(rhs):
+        return False
+    if isinstance(lhs, _SplitCodec):
+        return (
+            lhs.bits == rhs.bits
+            and lhs.mode == rhs.mode
+            and lhs.dim == rhs.dim
+            and bool(mx.array_equal(lhs.low_idx, rhs.low_idx).item())
+            and bool(mx.array_equal(lhs.high_idx, rhs.high_idx).item())
+        )
+    return getattr(lhs, "bits", None) == getattr(rhs, "bits", None) and getattr(
+        lhs, "dim", None
+    ) == getattr(rhs, "dim", None)
 
 
 def _build_codec(tensor: mx.array, bits: float, mode: str, seed: int):
@@ -5135,13 +5291,135 @@ class TurboQuantKVCache(_BaseCache):
         return keys, values
 
     def dequantize_for_apc(self):
-        """Return raw float (keys, values) for APC storage.
+        """Return raw float K/V for block-mode APC harvesting.
 
         Returns (None, None) if the cache is empty.
         """
         if self.keys is None or self.offset == 0:
             return None, None
         return self.dequantize()
+
+    def prefix_cache_snapshot(self):
+        """Capture packed state and the codec coordinates needed to decode it."""
+        return {
+            "meta_state": self.meta_state,
+            "keys": _snapshot_state_tree(_slice_state(self.keys, self.offset)),
+            "values": _snapshot_state_tree(_slice_state(self.values, self.offset)),
+            "key_codec": _snapshot_codec(self.key_codec),
+            "value_codec": _snapshot_codec(self.value_codec),
+        }
+
+    def prefix_cache_restore(self, snapshot):
+        """Restore packed state without dequantizing and re-quantizing it."""
+        meta = snapshot["meta_state"]
+        offset = int(meta[0])
+        bits = float(meta[1])
+        seed = int(meta[2])
+        key_bits = float(meta[3]) if len(meta) > 3 else None
+        value_bits = float(meta[4]) if len(meta) > 4 else None
+        self.__init__(
+            bits=bits,
+            seed=seed,
+            key_bits=key_bits,
+            value_bits=value_bits,
+        )
+        self.keys = _restore_state_tree(snapshot["keys"])
+        self.values = _restore_state_tree(snapshot["values"])
+        self.offset = offset
+        self.key_codec = _restore_codec(snapshot.get("key_codec"), seed)
+        self.value_codec = _restore_codec(snapshot.get("value_codec"), seed + 1)
+        if self.keys is not None and (
+            self.key_codec is None or self.value_codec is None
+        ):
+            raise ValueError("packed TurboQuant snapshot is missing codec metadata")
+
+    def prefix_cache_reserve(self, min_capacity_tokens):
+        """Reserve packed capacity for the first post-restore update."""
+        if self.keys is None or self.values is None:
+            return ()
+        needed = int(min_capacity_tokens)
+        self.keys = _reserve_state_capacity(
+            self.keys, self.offset, needed, self.cache_step
+        )
+        self.values = _reserve_state_capacity(
+            self.values, self.offset, needed, self.cache_step
+        )
+        return self.keys, self.values
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        """Merge compatible packed rows into ``BatchTurboQuantKVCache``."""
+        from .models.cache import KVCache
+
+        if not rows or len(rows) != len(prefix_lens):
+            return None
+
+        def is_cold_empty(row):
+            return type(row) is KVCache and row.keys is None and row.values is None
+
+        populated = []
+        for row in rows:
+            if isinstance(row, TurboQuantKVCache):
+                if (
+                    row.bits != self.bits
+                    or row.key_bits != self.key_bits
+                    or row.value_bits != self.value_bits
+                    or row.seed != self.seed
+                ):
+                    return None
+                if row.keys is not None:
+                    populated.append(row)
+            elif not is_cold_empty(row):
+                return None
+
+        prefix_lens = [int(length) for length in prefix_lens]
+        max_prefix = max(prefix_lens, default=0)
+        left_padding = [max_prefix - length for length in prefix_lens]
+        out = BatchTurboQuantKVCache(
+            left_padding,
+            bits=self.bits,
+            seed=self.seed,
+            key_bits=self.key_bits,
+            value_bits=self.value_bits,
+        )
+        if not populated:
+            out.offset = mx.array(prefix_lens)
+            return out
+        if any(
+            int(row.offset) != length
+            for row, length in zip(rows, prefix_lens)
+            if isinstance(row, TurboQuantKVCache) and row.keys is not None
+        ):
+            return None
+
+        reference = populated[0]
+        for row in populated[1:]:
+            if not _codecs_compatible(reference.key_codec, row.key_codec):
+                return None
+            if not _codecs_compatible(reference.value_codec, row.value_codec):
+                return None
+
+        def merge_states(attr):
+            reference_state = getattr(reference, attr)
+            merged = None
+            for row, left in zip(rows, left_padding):
+                if isinstance(row, TurboQuantKVCache) and row.keys is not None:
+                    state = _slice_state(getattr(row, attr), row.offset)
+                    state = _pad_state_tokens(
+                        state, left, max_prefix - left - _state_length(state)
+                    )
+                else:
+                    state = _allocate_state_like(reference_state, max_prefix)
+                merged = state if merged is None else _concat_state_batch(merged, state)
+            return merged
+
+        out.keys = merge_states("keys")
+        out.values = merge_states("values")
+        out.key_codec = reference.key_codec
+        out.value_codec = reference.value_codec
+        out.offset = mx.array(prefix_lens)
+        out.left_padding = mx.array(left_padding)
+        out._idx = max_prefix
+        return out
 
     def _apply_attention_mask(
         self,
@@ -6339,7 +6617,7 @@ class BatchTurboQuantKVCache(_BaseCache):
         return k, v
 
     def dequantize_for_apc(self):
-        """Return raw float (keys, values) for APC storage.
+        """Return raw float K/V for block-mode APC harvesting.
 
         Returns (None, None) if the cache is empty.
         """
