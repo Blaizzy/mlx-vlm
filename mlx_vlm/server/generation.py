@@ -1169,6 +1169,28 @@ class ResponseGenerator:
             pending, self._cancelled = self._cancelled, set()
             return pending
 
+    def _take_cancellation(self, uid) -> bool:
+        """Consume one request's cancellation without draining its peers."""
+        with self._cancel_lock:
+            if uid not in self._cancelled:
+                return False
+            self._cancelled.remove(uid)
+            return True
+
+    def _finish_cancelled_speculative_requests(
+        self, uids, rqueues, finished_uids
+    ) -> int:
+        """Close cancelled speculative rows at a safe round boundary."""
+        cancelled = 0
+        for uid in uids:
+            if uid in finished_uids or not self._take_cancellation(uid):
+                continue
+            rqueues[uid].put(None)
+            finished_uids.add(uid)
+            cancelled += 1
+            logger.info("Speculative generation cancelled: request=%s", uid)
+        return cancelled
+
     def _initialize_model(self):
         model, processor, config = load_model_resources(
             self.model_path, self.adapter_path
@@ -2232,9 +2254,18 @@ class ResponseGenerator:
 
                 finished_uids = set()
 
+                # A request may be cancelled while its prompt is in the
+                # uninterruptible target forward. Close it before exposing the
+                # first sampled token.
+                self._finish_cancelled_speculative_requests(
+                    uids, rqueues, finished_uids
+                )
+
                 # Send first bonus tokens to clients
                 fb_list = first_bonus.tolist()
                 for j, uid in enumerate(uids):
+                    if uid in finished_uids:
+                        continue
                     tok = int(fb_list[j])
                     token_lists[uid].append(tok)
                     is_stop = tok in self.stop_tokens
@@ -2263,6 +2294,15 @@ class ResponseGenerator:
                         rqueues[uid].put(None)
                         finished_uids.add(uid)
 
+                if len(finished_uids) == len(uids):
+                    continue
+
+                # A cancellation can arrive while the target is pre-filling.
+                # Consume only this batch's request IDs: draining the shared
+                # set here would discard cancellations for queued peers.
+                self._finish_cancelled_speculative_requests(
+                    uids, rqueues, finished_uids
+                )
                 if len(finished_uids) == len(uids):
                     continue
 
@@ -2305,6 +2345,13 @@ class ResponseGenerator:
                     row_ids=sample_row_ids,
                 )
                 for tok_list, _ in rounds_iter:
+                    # Every rounds backend yields at a committed decode
+                    # boundary. Check cancellation before emitting that
+                    # boundary's tokens, then let stop_check filter cancelled
+                    # rows from the next backend round.
+                    self._finish_cancelled_speculative_requests(
+                        uids, rqueues, finished_uids
+                    )
                     for j, tok in enumerate(tok_list):
                         if tok is None:
                             continue
