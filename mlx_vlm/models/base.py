@@ -202,13 +202,57 @@ def kv_sequence_length(keys) -> int:
     a ``(packed, scales, biases)`` tuple and TurboQuant caches return
     codec-state named tuples.
     """
-    if isinstance(keys, mx.array):
+    if isinstance(keys, mx.array) or hasattr(keys, "shape"):
         return keys.shape[-2]
     # Plain tuple/list only: TurboQuant states are NamedTuples with a
     # different layout and get measured by their own helper.
     if type(keys) in (tuple, list):
         return keys[0].shape[-2]
     return _turboquant_state_length(keys)
+
+
+def slice_kv_sequence(state, end: int):
+    """Return the ``[:end]`` sequence prefix of a KV state.
+
+    Uniform quantized caches return a tuple of packed values, scales and
+    biases instead of a single array. Slice every component so callers such
+    as speculative target verification can narrow the prefix without first
+    dequantizing it. Other state wrappers implement the same four-axis slice
+    directly.
+    """
+    if type(state) in (tuple, list):
+        return tree_map(lambda x: x[:, :, :end, :], state)
+    return state[:, :, :end, :]
+
+
+def dequantize_kv_state(cache, keys, values):
+    """Return plain ``[B, H, S, D]`` arrays for a state ``update_and_fetch`` returned.
+
+    Unquantized caches already hand back arrays and are passed through. Uniform
+    quantized caches return ``(packed, scales, biases)`` tuples and TurboQuant
+    caches return codec-state named tuples, neither of which can be indexed,
+    expanded or matmul'd like an array. Attention paths that cannot go through
+    :func:`scaled_dot_product_attention` -- logit softcapping, block-sparse
+    masking -- need real arrays, so they materialize the state here first.
+    """
+    if isinstance(keys, mx.array) or hasattr(keys, "shape"):
+        return keys, values
+    # Plain tuple/list only: TurboQuant states are NamedTuples and dequantize
+    # through their own cache method.
+    if type(keys) in (tuple, list):
+        return (
+            mx.dequantize(
+                *(mx.contiguous(x) for x in keys),
+                group_size=cache.group_size,
+                bits=cache.bits,
+            ),
+            mx.dequantize(
+                *(mx.contiguous(x) for x in values),
+                group_size=cache.group_size,
+                bits=cache.bits,
+            ),
+        )
+    return cache.dequantize(keys, values)
 
 
 def create_attention_mask(
