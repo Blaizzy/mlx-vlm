@@ -150,7 +150,6 @@ class GlmMoeDsaModel(DeepseekV32Model):
         x: mx.array,
         cache: Optional[Any] = None,
         inputs_embeds: Optional[mx.array] = None,
-        skip_final_norm: bool = False,
     ) -> mx.array:
         h = self.embed_tokens(x) if inputs_embeds is None else inputs_embeds
 
@@ -180,7 +179,7 @@ class GlmMoeDsaModel(DeepseekV32Model):
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
 
-        return h if skip_final_norm else self.norm(h)
+        return self.norm(h)
 
 
 class LanguageModel(nn.Module):
@@ -201,22 +200,35 @@ class LanguageModel(nn.Module):
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
+        capture_layer_ids = kwargs.get("capture_layer_ids")
+        speculative_verify = bool(kwargs.get("speculative_verify", False))
         return_hidden = kwargs.get("return_hidden", False)
         return_shared_kv = kwargs.get("return_shared_kv", False)
         skip_logits = kwargs.get("skip_logits", False)
-        pre_norm = self.model(
+
+        if speculative_verify:
+            return _SPECULATIVE_VERIFIER(
+                self,
+                inputs,
+                cache=cache,
+                inputs_embeds=inputs_embeds,
+                capture_layer_ids=capture_layer_ids,
+                return_hidden=return_hidden,
+                return_shared_kv=return_shared_kv,
+                skip_logits=skip_logits,
+            )
+
+        hidden = self.model(
             inputs,
             cache=cache,
             inputs_embeds=inputs_embeds,
-            skip_final_norm=return_hidden,
         )
-        normed = self.model.norm(pre_norm) if return_hidden else pre_norm
         num_logits_to_keep = kwargs.get("num_logits_to_keep", 0)
         if num_logits_to_keep:
-            normed = normed[:, -num_logits_to_keep:, :]
+            hidden = hidden[:, -num_logits_to_keep:, :]
         return LanguageModelOutput(
-            logits=None if skip_logits else self.lm_head(normed),
-            hidden_states=[pre_norm] if return_hidden else None,
+            logits=None if skip_logits else self.lm_head(hidden),
+            hidden_states=[hidden] if return_hidden else None,
             shared_kv_states={} if return_shared_kv else None,
         )
 
@@ -224,17 +236,32 @@ class LanguageModel(nn.Module):
         return hidden
 
     def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
-        return verify_logits(self, self.model.norm(hidden))
+        return verify_logits(self, hidden)
 
     def speculative_argmax_from_hidden(self, hidden: mx.array) -> mx.array:
         return mx.argmax(self.speculative_logits_from_hidden(hidden), axis=-1)
 
     def speculative_verify_hidden(self, inputs: mx.array, cache):
-        out = _SPECULATIVE_VERIFIER(self, inputs, cache=cache, skip_logits=True)
+        out = self(
+            inputs,
+            cache=cache,
+            capture_layer_ids=[],
+            speculative_verify=True,
+            return_hidden=True,
+            return_shared_kv=True,
+            skip_logits=True,
+        )
         return out.hidden_states[-1], out.shared_kv_states, out.gdn_states
 
     def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
-        out = _SPECULATIVE_VERIFIER(self, inputs, cache=cache)
+        out = self(
+            inputs,
+            cache=cache,
+            capture_layer_ids=[],
+            speculative_verify=True,
+            return_hidden=True,
+            return_shared_kv=True,
+        )
         return (
             out.hidden_states[-1],
             out.shared_kv_states,
@@ -266,6 +293,8 @@ class LanguageModel(nn.Module):
                 if cache is not None and cache.is_trimmable():
                     cache.trim(trim)
         return max_accepted
+
+    requires_uniform_dflash_acceptance = True
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         return DSV32Model.sanitize(self, weights)

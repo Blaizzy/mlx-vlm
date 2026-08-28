@@ -2848,7 +2848,14 @@ class TestModels(unittest.TestCase):
 
         tokens = mx.array([[1, 2, 3]])
         target = model.language_model
-        target_out = target(tokens, return_hidden=True, skip_logits=True)
+        target_out = target(
+            tokens,
+            capture_layer_ids=[],
+            speculative_verify=True,
+            return_hidden=True,
+            return_shared_kv=True,
+            skip_logits=True,
+        )
         verified_hidden, shared_kv, gdn_states = target.speculative_verify_hidden(
             tokens, cache=None
         )
@@ -2859,6 +2866,20 @@ class TestModels(unittest.TestCase):
         )
         self.assertEqual(shared_kv, {})
         self.assertIsNone(gdn_states)
+
+        captured = target(
+            tokens,
+            capture_layer_ids=[0, 2, 5],
+            speculative_verify=True,
+        )
+        mx.eval(captured.hidden_states)
+        self.assertEqual(len(captured.hidden_states), 3)
+        self.assertTrue(
+            all(
+                hidden.shape == (1, tokens.shape[1], config.hidden_size)
+                for hidden in captured.hidden_states
+            )
+        )
 
         linear = nn.Linear(512, 8, bias=False)
         linear.weight = mx.random.normal(linear.weight.shape).astype(mx.bfloat16)
