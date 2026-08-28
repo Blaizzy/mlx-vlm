@@ -2116,10 +2116,19 @@ def prepare_inputs(
         if not isinstance(videos, list):
             videos = [videos]
         fps_hint = kwargs.pop("fps", 2.0)
+        # The frame-count controls belong to load_video, which is what samples
+        # here. Left in kwargs they reach the processor instead, which only
+        # ever sees the frames load_video already picked, so they read as
+        # silently ignored.
+        sampling = {
+            name: kwargs.pop(name)
+            for name in ("nframes", "min_frames", "max_frames")
+            if name in kwargs
+        }
         loaded, video_fps = [], []
         for v in videos:
             arr, s_fps = (
-                load_video(str(v), fps=fps_hint)
+                load_video(str(v), fps=fps_hint, **sampling)
                 if isinstance(v, (str, bytes))
                 else (v, fps_hint)
             )

@@ -508,6 +508,48 @@ def test_prepare_inputs_preserves_mlx_attention_mask_for_thread_handoff():
     assert consumed == [[[1, 1]]]
 
 
+def test_prepare_inputs_forwards_video_sampling_kwargs_to_load_video():
+    """nframes/min_frames/max_frames clamp load_video's frame count.
+
+    load_video is what samples the clip here, so these have to reach it. Left
+    in kwargs they go to the processor, which only sees the frames load_video
+    already chose, and the caller's cap silently does nothing.
+    """
+    tok_result = MagicMock()
+    tok_result.input_ids = [[1, 2, 3]]
+    tok_result.attention_mask = [7, 8, 9]
+    processor = MockProcessor(tokenizer_return_value=tok_result)
+
+    seen = {}
+    frames = object()
+
+    def fake_load_video(path, **kw):
+        seen.update(kw)
+        return frames, 1.5
+
+    with (
+        patch("mlx_vlm.utils.load_video", side_effect=fake_load_video),
+        patch("mlx_vlm.utils.process_inputs_with_fallback") as fallback,
+    ):
+        fallback.return_value = {"input_ids": mx.array([[1, 2, 3]])}
+        prepare_inputs(
+            processor,
+            prompts="describe the clip",
+            videos=["clip.mp4"],
+            fps=0.5,
+            max_frames=20,
+            min_frames=8,
+        )
+
+    assert seen == {"fps": 0.5, "max_frames": 20, "min_frames": 8}
+
+    forwarded = fallback.call_args.kwargs
+    assert forwarded["videos"] == [frames]
+    assert forwarded["fps"] == [1.5]
+    for name in ("nframes", "min_frames", "max_frames"):
+        assert name not in forwarded
+
+
 def test_process_inputs_with_fallback():
 
     processor = MockProcessor()
