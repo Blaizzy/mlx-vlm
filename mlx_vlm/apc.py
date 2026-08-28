@@ -815,6 +815,79 @@ def _decode_checkpoint_tree(structure: dict, load_array) -> Any:
     raise ValueError(f"unsupported checkpoint tree node: {kind!r}")
 
 
+def _encode_turboquant_state(
+    value: Any,
+    tensor_prefix: str,
+    arrays: Dict[str, mx.array],
+    counter: List[int],
+) -> Optional[dict]:
+    """Encode a packed TurboQuant state while preserving NamedTuple types."""
+    if isinstance(value, mx.array):
+        name = f"{tensor_prefix}_t{counter[0]}"
+        counter[0] += 1
+        arrays[name] = value
+        return {"kind": "array", "name": name}
+    if value is None:
+        return {"kind": "none"}
+    if isinstance(value, tuple):
+        from . import turboquant as tq
+
+        state_types = {
+            cls.__name__
+            for cls in (
+                tq.TurboQuantMSEState,
+                tq.TurboQuantProdState,
+                tq.TurboQuantPolarState,
+                tq.TurboQuantPolarProdState,
+                tq.TurboQuantSplitState,
+            )
+        }
+        items = [
+            _encode_turboquant_state(item, tensor_prefix, arrays, counter)
+            for item in value
+        ]
+        if any(item is None for item in items):
+            return None
+        type_name = type(value).__name__
+        if type_name not in state_types:
+            return None
+        return {"kind": "state", "type": type_name, "items": items}
+    return None
+
+
+def _decode_turboquant_state(structure: dict, load_array) -> Any:
+    """Decode a packed TurboQuant state produced by its exact-APC schema."""
+    kind = structure.get("kind")
+    if kind == "array":
+        return load_array(structure["name"])
+    if kind == "none":
+        return None
+    if kind != "state":
+        raise ValueError(f"unsupported TurboQuant state node: {kind!r}")
+
+    from . import turboquant as tq
+
+    state_types = {
+        cls.__name__: cls
+        for cls in (
+            tq.TurboQuantMSEState,
+            tq.TurboQuantProdState,
+            tq.TurboQuantPolarState,
+            tq.TurboQuantPolarProdState,
+            tq.TurboQuantSplitState,
+        )
+    }
+    state_type = state_types.get(structure.get("type"))
+    if state_type is None:
+        raise ValueError("unknown TurboQuant state type")
+    return state_type(
+        *(
+            _decode_turboquant_state(item, load_array)
+            for item in structure.get("items", ())
+        )
+    )
+
+
 def _resolve_checkpoint_class(module_name: str, qualname: str) -> Optional[type]:
     """Resolve an importable cache class recorded by the local disk tier."""
     if not module_name.startswith("mlx_vlm.") or "<locals>" in qualname:
@@ -877,7 +950,13 @@ def _mlx_array_from_safetensors_bytes(buf, entry: dict) -> Optional[mx.array]:
         return None
     _, buffer_format, mlx_dtype, bitcast_to = dtype_info
     try:
-        view = memoryview(buf).cast(buffer_format)
+        if str(entry["dtype"]) == "F16":
+            # Python's memoryview does not implement the half-float ``e``
+            # format on every supported runtime. NumPy does, and MLX copies
+            # the resulting host view into its own array.
+            view = np.frombuffer(buf, dtype=np.dtype("<f2"))
+        else:
+            view = memoryview(buf).cast(buffer_format)
         if len(view) != _numel(shape):
             return None
         out = mx.array(view, dtype=mlx_dtype).reshape(shape)
@@ -1526,6 +1605,59 @@ class DiskBlockStore:
         from .models import cache as lm_cache
 
         kind = metadata.get(f"{prefix}_kind")
+        if kind == "turboquant_kv":
+            from .turboquant import TurboQuantKVCache
+
+            try:
+                bits = float(metadata[f"{prefix}_bits"])
+                key_bits = float(metadata[f"{prefix}_key_bits"])
+                value_bits = float(metadata[f"{prefix}_value_bits"])
+                seed = int(metadata.get(f"{prefix}_seed", "0"))
+                offset = int(metadata.get(f"{prefix}_offset", "0"))
+            except (KeyError, TypeError, ValueError):
+                return None
+            cache = TurboQuantKVCache(
+                bits=bits,
+                seed=seed,
+                key_bits=key_bits,
+                value_bits=value_bits,
+            )
+            if metadata.get(f"{prefix}_empty", "0") == "1":
+                return cache
+            try:
+                head_dim = int(metadata[f"{prefix}_head_dim"])
+                key_tree = json.loads(metadata[f"{prefix}_keys"])
+                value_tree = json.loads(metadata[f"{prefix}_values"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if head_dim <= 0:
+                return None
+
+            loaded_arrays: List[mx.array] = []
+
+            def load_array(name: str) -> mx.array:
+                entry = tensor_entries.get(name)
+                if entry is None:
+                    raise KeyError(name)
+                array = _read_safetensors_tensor(path, data_start, entry)
+                if array is None:
+                    raise ValueError(name)
+                loaded_arrays.append(array)
+                return array
+
+            try:
+                keys = _decode_turboquant_state(key_tree, load_array)
+                values = _decode_turboquant_state(value_tree, load_array)
+                dummy = mx.zeros((1, 1, 1, head_dim), dtype=mx.bfloat16)
+                cache._ensure_codecs(dummy, dummy)
+                cache.keys = keys
+                cache.values = values
+                cache.offset = offset
+            except (KeyError, TypeError, ValueError, AttributeError):
+                return None
+            eval_targets.extend(loaded_arrays)
+            return cache
+
         if kind == "ring_kv":
             from .models.unlimited_ocr.language import RingSlidingKVCache
 
@@ -2509,6 +2641,36 @@ class DiskBlockStore:
         metadata: dict[str, str],
     ) -> bool:
         from .models import cache as lm_cache
+
+        try:
+            from .turboquant import TurboQuantKVCache, _slice_state
+        except ImportError:
+            TurboQuantKVCache = ()
+
+        if isinstance(c, TurboQuantKVCache):
+            offset = int(getattr(c, "offset", 0) or 0)
+            metadata[f"{prefix}_kind"] = "turboquant_kv"
+            metadata[f"{prefix}_offset"] = str(offset)
+            metadata[f"{prefix}_bits"] = str(float(c.bits))
+            metadata[f"{prefix}_key_bits"] = str(float(c.key_bits))
+            metadata[f"{prefix}_value_bits"] = str(float(c.value_bits))
+            metadata[f"{prefix}_seed"] = str(int(c.seed))
+            if c.keys is None or c.values is None or offset <= 0:
+                metadata[f"{prefix}_empty"] = "1"
+                return True
+            head_dim = getattr(getattr(c, "key_codec", None), "dim", 0)
+            if not head_dim:
+                return False
+            keys = _slice_state(c.keys, offset)
+            values = _slice_state(c.values, offset)
+            key_tree = _encode_turboquant_state(keys, f"{prefix}_k", arrays, [0])
+            value_tree = _encode_turboquant_state(values, f"{prefix}_v", arrays, [0])
+            if key_tree is None or value_tree is None:
+                return False
+            metadata[f"{prefix}_head_dim"] = str(int(head_dim))
+            metadata[f"{prefix}_keys"] = json.dumps(key_tree, separators=(",", ":"))
+            metadata[f"{prefix}_values"] = json.dumps(value_tree, separators=(",", ":"))
+            return True
 
         if (
             type(c).__name__ == "RingSlidingKVCache"
@@ -3951,10 +4113,10 @@ def make_warm_batch_exact_cache_multi(
 ) -> Tuple[Optional[List[Any]], int]:
     """Merge single-row exact-cache snapshots into batch-aware caches.
 
-    When *kv_quant_config* is provided, full-attention ``BatchKVCache`` layers
-    are re-quantized to match live ``_make_cache`` via
+    When *kv_quant_config* is provided, float full-attention ``BatchKVCache``
+    layers are re-quantized to match live ``_make_cache`` via
     ``should_quantize_kv_layer`` (last layer stays float when n > 2). Hybrid
-    non-KV entries are unchanged. On-disk exact snapshots remain float. When
+    non-KV entries and already-packed TurboQuant entries are unchanged. When
     *consume_sources* is true, each row must be a list; its entries are cleared
     as their materialized batch layers take ownership of the restored state.
     """
@@ -4053,8 +4215,9 @@ def snapshot_prompt_cache_row(
     """Row-normalize a prompt cache for APC store/lookup.
 
     Batch-shaped layouts (every entry has ``extract``) are extracted first.
-    Single-row caches are cloned in place. Quantized layers are dequantized
-    into float ``KVCache`` entries.
+    Single-row caches are cloned in place. TurboQuant layers retain their
+    packed representation; other quantized cache implementations continue to
+    use their existing APC adapter behavior.
     """
     if not caches:
         return []

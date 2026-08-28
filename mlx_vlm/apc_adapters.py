@@ -513,6 +513,90 @@ class PoolingCacheCloneAdapter:
         return type(caches[0]).merge(caches)
 
 
+class TurboQuantKVCacheCloneAdapter:
+    capability = Capability.PAGEABLE
+
+    @staticmethod
+    def _copy_state(state, eval_targets):
+        from .apc import _copy_mlx_array
+        from .turboquant import _map_state
+
+        def copy_leaf(value, ndim):
+            copied = _copy_mlx_array(value)
+            eval_targets.append(copied)
+            return copied
+
+        return _map_state(state, copy_leaf)
+
+    def clone(self, c, *, min_capacity_tokens, eval_targets):
+        from .turboquant import TurboQuantKVCache, _slice_state
+
+        out = TurboQuantKVCache(
+            bits=c.bits,
+            seed=c.seed,
+            key_bits=c.key_bits,
+            value_bits=c.value_bits,
+        )
+        out.key_codec = c.key_codec
+        out.value_codec = c.value_codec
+        out.offset = int(c.offset)
+        if c.keys is not None and out.offset > 0:
+            out.keys = self._copy_state(_slice_state(c.keys, out.offset), eval_targets)
+            out.values = self._copy_state(
+                _slice_state(c.values, out.offset), eval_targets
+            )
+        return out
+
+    @staticmethod
+    def _validate_rows(caches):
+        first = caches[0]
+        policy = (first.bits, first.key_bits, first.value_bits, first.seed)
+        return not any(
+            (cache.bits, cache.key_bits, cache.value_bits, cache.seed) != policy
+            for cache in caches[1:]
+        )
+
+    def _merge_rows(self, caches, *, borrow_single):
+        from .apc import _copy_mlx_array
+        from .turboquant import BatchTurboQuantKVCache, _map_state, _slice_state
+
+        if not self._validate_rows(caches):
+            return None
+        merged = None
+        for cache in caches:
+            row = BatchTurboQuantKVCache(
+                [0],
+                bits=cache.bits,
+                seed=cache.seed,
+                key_bits=cache.key_bits,
+                value_bits=cache.value_bits,
+            )
+            row.key_codec = cache.key_codec
+            row.value_codec = cache.value_codec
+            row._idx = int(cache.offset)
+            row.offset = mx.array([int(cache.offset)])
+            if cache.keys is not None and row._idx > 0:
+                keys = _slice_state(cache.keys, row._idx)
+                values = _slice_state(cache.values, row._idx)
+                if len(caches) == 1 and not borrow_single:
+                    keys = _map_state(keys, lambda value, ndim: _copy_mlx_array(value))
+                    values = _map_state(
+                        values, lambda value, ndim: _copy_mlx_array(value)
+                    )
+                row.keys, row.values = keys, values
+            if merged is None:
+                merged = row
+            else:
+                merged.extend(row)
+        return merged
+
+    def merge_rows(self, caches, prefix_lens):
+        return self._merge_rows(caches, borrow_single=False)
+
+    def merge_rows_consuming(self, caches, prefix_lens):
+        return self._merge_rows(caches, borrow_single=True)
+
+
 _CLONE_RULES: Optional[list] = None
 
 
@@ -528,6 +612,12 @@ def _clone_rules():
             (lm.ArraysCache, ArraysCacheCloneAdapter()),
             (lm.PoolingCache, PoolingCacheCloneAdapter()),
         ]
+        try:
+            from .turboquant import TurboQuantKVCache
+
+            _CLONE_RULES.append((TurboQuantKVCache, TurboQuantKVCacheCloneAdapter()))
+        except ImportError:
+            pass
     return _CLONE_RULES
 
 
@@ -650,8 +740,9 @@ def merge_cache_entries(entries, prefix_lens, *, consume_sources=False):
         else:
             ok = all(isinstance(c, typ) for c in entries)
         if ok:
-            if consume_sources and typ is lm.KVCache:
-                return adapter.merge_rows_consuming(entries, prefix_lens)
+            merge_consuming = getattr(adapter, "merge_rows_consuming", None)
+            if consume_sources and callable(merge_consuming):
+                return merge_consuming(entries, prefix_lens)
             return adapter.merge_rows(entries, prefix_lens)
     if all(isinstance(c, lm.CacheList) for c in entries):
         merged = [

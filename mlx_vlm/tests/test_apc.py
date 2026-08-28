@@ -930,6 +930,179 @@ def test_exact_cache_disk_restore_rebuilds_index(tmp_path, monkeypatch):
     manager.close()
 
 
+def test_exact_cache_snapshot_keeps_turboquant_state_packed():
+    from mlx_vlm.apc import snapshot_prompt_cache_row
+    from mlx_vlm.turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
+
+    cache = BatchTurboQuantKVCache([0], bits=3.5)
+    keys = mx.arange(1 * 2 * 12 * 32, dtype=mx.float32).reshape(1, 2, 12, 32)
+    values = keys + 1000
+    cache.update_and_fetch(keys, values)
+    mx.eval(cache.state)
+
+    snapshot = snapshot_prompt_cache_row([cache])
+
+    assert snapshot is not None
+    restored = snapshot[0]
+    assert isinstance(restored, TurboQuantKVCache)
+    assert (restored.bits, restored.key_bits, restored.value_bits) == (3.5, 3.0, 4.0)
+    assert restored.offset == 12
+    assert restored.keys is not cache.keys
+    assert restored.values is not cache.values
+    assert restored.keys.indices.dtype == mx.uint32
+    assert restored.values.indices.dtype == mx.uint32
+
+
+def test_exact_disk_roundtrip_preserves_q4_and_q3_5_turboquant(tmp_path, monkeypatch):
+    from mlx_vlm.apc import snapshot_prompt_cache_row
+    from mlx_vlm.turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    monkeypatch.setenv("APC_EXACT_MIN_TOKENS", "1")
+    token_ids = list(range(12))
+    for bits, expected_widths in ((4.0, (4.0, 4.0)), (3.5, (3.0, 4.0))):
+        cache = BatchTurboQuantKVCache([0], bits=bits, seed=23)
+        keys = mx.arange(1 * 2 * 12 * 32, dtype=mx.float32).reshape(1, 2, 12, 32)
+        cache.update_and_fetch(keys, keys + 1000)
+        snapshot = snapshot_prompt_cache_row([cache])
+        assert snapshot is not None
+
+        namespace = f"packed-turboquant-{bits}"
+        disk = DiskBlockStore(tmp_path, namespace=namespace)
+        manager = APCManager(num_blocks=1, block_size=4, disk=disk)
+        assert manager.store_exact_cache(token_ids, snapshot, take_ownership=True)
+        disk._q.join()
+        manager.close()
+
+        disk = DiskBlockStore(tmp_path, namespace=namespace)
+        manager = APCManager(num_blocks=1, block_size=4, disk=disk)
+        warm, matched_tokens = manager.lookup_exact_cache(token_ids + [999])
+
+        assert matched_tokens == len(token_ids)
+        assert warm is not None
+        restored = warm[0]
+        assert isinstance(restored, TurboQuantKVCache)
+        assert restored.bits == bits
+        assert (restored.key_bits, restored.value_bits) == expected_widths
+        assert restored.seed == 23
+        _assert_allclose(
+            restored.key_codec.dequantize(restored.keys),
+            cache.key_codec.dequantize(cache.keys),
+        )
+        manager.close()
+
+
+def test_exact_merge_preserves_two_packed_turboquant_rows():
+    from mlx_vlm.apc import snapshot_prompt_cache_row
+    from mlx_vlm.turboquant import BatchTurboQuantKVCache
+
+    rows = []
+    for length, value in ((12, 1), (8, 2)):
+        cache = BatchTurboQuantKVCache([0], bits=3.5)
+        keys = mx.full((1, 2, length, 32), value, dtype=mx.float32)
+        cache.update_and_fetch(keys, keys + 10)
+        snapshot = snapshot_prompt_cache_row([cache])
+        assert snapshot is not None
+        rows.append(snapshot)
+
+    batch, max_prefix = make_warm_batch_exact_cache_multi(
+        rows,
+        [12, 8],
+        kv_quant_config={
+            "bits": 3.5,
+            "scheme": "turboquant",
+            "group_size": 64,
+        },
+        consume_sources=True,
+    )
+
+    assert max_prefix == 12
+    assert batch is not None
+    assert isinstance(batch[0], BatchTurboQuantKVCache)
+    assert batch[0]._idx == 12
+    assert batch[0].offset.tolist() == [12, 8]
+    assert batch[0].left_padding.tolist() == [0, 4]
+    assert all(row[0] is None for row in rows)
+
+    next_keys = mx.full((2, 2, 1, 32), 3, dtype=mx.float32)
+    batch[0].update_and_fetch(next_keys, next_keys + 10)
+    mx.eval(batch[0].state)
+    assert batch[0]._idx == 13
+    assert batch[0].offset.tolist() == [13, 9]
+
+
+def test_exact_disk_roundtrip_preserves_packed_turboquant_widths(tmp_path, monkeypatch):
+    from mlx_vlm.apc import snapshot_prompt_cache_row
+    from mlx_vlm.turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    monkeypatch.setenv("APC_EXACT_MIN_TOKENS", "1")
+    token_ids = list(range(12))
+    cache = BatchTurboQuantKVCache([0], bits=5.5, key_bits=3, value_bits=8, seed=17)
+    keys = mx.arange(1 * 2 * 12 * 32, dtype=mx.float32).reshape(1, 2, 12, 32)
+    values = keys + 1000
+    cache.update_and_fetch(keys, values)
+    snapshot = snapshot_prompt_cache_row([cache])
+    assert snapshot is not None
+
+    disk = DiskBlockStore(tmp_path, namespace="packed-turboquant")
+    manager = APCManager(num_blocks=1, block_size=4, disk=disk)
+    assert manager.store_exact_cache(token_ids, snapshot, take_ownership=True)
+    disk._q.join()
+    snapshot_path = next(iter(disk._exact_index.values()))
+    _, metadata, _ = disk._open_shard_header(snapshot_path)
+    assert metadata["c0_kind"] == "turboquant_kv"
+    assert metadata["c0_key_bits"] == "3.0"
+    assert metadata["c0_value_bits"] == "8.0"
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="packed-turboquant")
+    manager = APCManager(num_blocks=1, block_size=4, disk=disk)
+    warm, matched_tokens = manager.lookup_exact_cache(token_ids + [999])
+
+    assert matched_tokens == len(token_ids)
+    assert warm is not None
+    restored = warm[0]
+    assert isinstance(restored, TurboQuantKVCache)
+    assert (restored.bits, restored.key_bits, restored.value_bits) == (5.5, 3.0, 8.0)
+    assert restored.seed == 17
+    assert restored.offset == len(token_ids)
+    assert restored.keys.indices.dtype == mx.uint32
+    assert restored.values.indices.dtype == mx.uint32
+    _assert_allclose(
+        restored.key_codec.dequantize(restored.keys),
+        cache.key_codec.dequantize(cache.keys),
+    )
+    _assert_allclose(
+        restored.value_codec.dequantize(restored.values),
+        cache.value_codec.dequantize(cache.values),
+    )
+
+    rows = [list(warm)]
+    batch, max_prefix = make_warm_batch_exact_cache_multi(
+        rows,
+        [len(token_ids)],
+        kv_quant_config={
+            "bits": 5.5,
+            "scheme": "turboquant",
+            "key_bits": 3,
+            "value_bits": 8,
+            "group_size": 64,
+        },
+        consume_sources=True,
+    )
+    assert max_prefix == len(token_ids)
+    assert batch is not None
+    assert isinstance(batch[0], BatchTurboQuantKVCache)
+    assert (batch[0].bits, batch[0].key_bits, batch[0].value_bits) == (
+        5.5,
+        3.0,
+        8.0,
+    )
+    assert rows[0][0] is None
+    manager.close()
+
+
 def test_exact_disk_restore_keeps_the_first_decode_growth_boundary(
     tmp_path, monkeypatch
 ):
