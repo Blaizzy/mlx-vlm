@@ -442,8 +442,8 @@ class NemotronHModel(nn.Module):
         cache: Optional[Any] = None,
         inputs_embeds: Optional[mx.array] = None,
     ):
-        if (inputs is None) == (inputs_embeds is None):
-            raise ValueError("Provide exactly one of inputs or inputs_embeds")
+        if inputs is None and inputs_embeds is None:
+            raise ValueError("Provide either inputs or inputs_embeds")
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         elif self.with_embeddings:
