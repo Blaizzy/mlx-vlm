@@ -2,11 +2,13 @@ name: PR contributor reminder
 
 on:
   pull_request_target:
-    types: [opened]
+    types: [opened, reopened, synchronize]
+  workflow_run:
+    workflows: [Test PRs]
+    types: [completed]
 
 permissions:
   contents: read
-  pull-requests: write
 
 # GitHub usernames that should not receive the reminder, one per line.
 env:
@@ -16,11 +18,15 @@ env:
     lucasnewman
 
 jobs:
-  remind:
-    name: Remind contributor
+  signed-commit-reminder:
+    name: Check commit signatures
+    if: github.event_name == 'pull_request_target'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
-      - name: Post contribution checklist
+      - name: Update signed-commit reminder
         uses: actions/github-script@v7
         with:
           script: |
@@ -31,32 +37,9 @@ jobs:
                 .filter(Boolean)
             );
             const author = context.payload.pull_request.user.login;
-
-            if (excludedUsers.has(author.toLowerCase())) {
-              core.info(`Skipping reminder for excluded user @${author}.`);
-              return;
-            }
-
-            const marker = "<!-- mlx-vlm-pr-contributor-reminder -->";
-            const body = `${marker}
-            👋 Thanks for contributing to MLX-VLM!
-
-            Before your pull request is reviewed, please make sure that:
-
-            - **Every commit is signed.** GitHub should show a **Verified** badge next to each commit. See [GitHub's commit-signing guide](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits) if you need help setting this up.
-            - **The formatting hooks pass.** From the repository root, run:
-
-              \`\`\`shell
-              python -m pip install pre-commit
-              pre-commit run --all-files
-              \`\`\`
-
-              The project's pre-commit configuration runs **Black** along with the other required formatters. Commit and push any changes it makes.
-
-            Thank you for helping us keep the project consistent and easy to review! 🚀`;
-
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
+            const marker = "<!-- mlx-vlm-unverified-commits -->";
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner,
               repo,
@@ -67,14 +50,189 @@ jobs:
               comment.user?.type === "Bot" && comment.body?.includes(marker)
             );
 
-            if (existing) {
+            async function removeExistingReminder() {
+              if (!existing) return;
+              await github.rest.issues.deleteComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+              });
+            }
+
+            if (excludedUsers.has(author.toLowerCase())) {
+              core.info(`Skipping reminder for excluded user @${author}.`);
+              await removeExistingReminder();
+              return;
+            }
+
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner,
+              repo,
+              pull_number: issue_number,
+              per_page: 100,
+            });
+            const unverified = commits.filter(
+              (commit) => commit.commit.verification?.verified !== true
+            );
+
+            if (unverified.length === 0) {
+              core.info("Every commit is verified; no reminder is needed.");
+              await removeExistingReminder();
+              return;
+            }
+
+            const commitWord = unverified.length === 1 ? "commit" : "commits";
+            const body = `${marker}
+            ⚠️ GitHub does not mark **${unverified.length} ${commitWord}** in this PR as **Verified**.
+
+            Please sign every commit, then update the PR. You can review the commits on the [commits tab](${context.payload.pull_request.html_url}/commits) and follow [GitHub's commit-signing guide](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits) if needed.`;
+
+            if (existing && existing.body !== body) {
               await github.rest.issues.updateComment({
                 owner,
                 repo,
                 comment_id: existing.id,
                 body,
               });
-            } else {
+            } else if (!existing) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }
+
+  pre-commit-reminder:
+    name: Check pre-commit result
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Update pre-commit reminder
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const excludedUsers = new Set(
+              process.env.PR_REMINDER_EXCLUDED_USERS
+                .split("\n")
+                .map((username) => username.trim().toLowerCase())
+                .filter(Boolean)
+            );
+            const { owner, repo } = context.repo;
+            const run = context.payload.workflow_run;
+            let pullRequestSummary = run.pull_requests?.[0];
+
+            if (!pullRequestSummary) {
+              const { data: associatedPullRequests } =
+                await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner,
+                  repo,
+                  commit_sha: run.head_sha,
+                });
+              pullRequestSummary = associatedPullRequests.find(
+                (pullRequest) => pullRequest.base.repo.full_name === `${owner}/${repo}`
+              );
+            }
+
+            if (!pullRequestSummary) {
+              core.info("This workflow run is not associated with a pull request.");
+              return;
+            }
+
+            const issue_number = pullRequestSummary.number;
+            const { data: pullRequest } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: issue_number,
+            });
+            const eventHeadSha = run.pull_requests?.[0]?.head?.sha;
+
+            if (eventHeadSha && pullRequest.head.sha !== eventHeadSha) {
+              core.info("Ignoring a completed workflow run for an outdated PR revision.");
+              return;
+            }
+
+            const marker = "<!-- mlx-vlm-pre-commit-failure -->";
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) =>
+              comment.user?.type === "Bot" && comment.body?.includes(marker)
+            );
+
+            async function removeExistingReminder() {
+              if (!existing) return;
+              await github.rest.issues.deleteComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+              });
+            }
+
+            const author = pullRequest.user.login;
+            if (excludedUsers.has(author.toLowerCase())) {
+              core.info(`Skipping reminder for excluded user @${author}.`);
+              await removeExistingReminder();
+              return;
+            }
+
+            const jobs = await github.paginate(
+              github.rest.actions.listJobsForWorkflowRun,
+              {
+                owner,
+                repo,
+                run_id: run.id,
+                filter: "latest",
+                per_page: 100,
+              }
+            );
+            const preCommitStep = jobs
+              .flatMap((job) => job.steps ?? [])
+              .find((step) => step.name === "Run pre-commit checks");
+
+            if (!preCommitStep) {
+              core.warning("The Test PRs run did not contain the pre-commit step.");
+              return;
+            }
+
+            if (preCommitStep.conclusion === "success") {
+              core.info("Pre-commit passed; no reminder is needed.");
+              await removeExistingReminder();
+              return;
+            }
+
+            if (preCommitStep.conclusion !== "failure") {
+              core.info(`Pre-commit concluded with ${preCommitStep.conclusion}; leaving the reminder unchanged.`);
+              return;
+            }
+
+            const body = `${marker}
+            ⚠️ The **pre-commit checks failed** in [CI](${run.html_url}).
+
+            Run the following from the repository root, then commit and push any changes:
+
+            \`\`\`shell
+            python -m pip install pre-commit
+            pre-commit run --all-files
+            \`\`\`
+
+            The project's pre-commit configuration includes **Black** and the other required formatters.`;
+
+            if (existing && existing.body !== body) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else if (!existing) {
               await github.rest.issues.createComment({
                 owner,
                 repo,
