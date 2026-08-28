@@ -8,13 +8,16 @@ from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models import qwen4_exp
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.models.qwen4_exp.language import (
+    _DISK_SHARD_RE,
     BatchQSAKVCache,
     QSAKVCache,
     QSAQuantizedKVCache,
     Qwen4ExpGatedDeltaNet,
     Qwen4ExpNGramEmbedding,
     ShardedEmbedding,
+    _PLEDiskIndex,
 )
+from mlx_vlm.models.qwen4_exp.qwen4_exp import _NGRAM_SHARD_DROP_RE
 from mlx_vlm.prompt_utils import MessageFormat, MessageFormatter
 
 
@@ -624,6 +627,143 @@ class Qwen4ExpTests(unittest.TestCase):
         mapped = "language_model.model.layers.0.mlp.experts.0.gate_proj.weight"
         self.assertIn(mapped, sanitized)
         self.assertEqual(sanitized[mapped].dtype, mx.bfloat16)
+
+
+class Qwen4ExpPLEOnDiskTests(unittest.TestCase):
+    """Opt-in disk offload of the n-gram PLE table (ple_on_disk)."""
+
+    GROUP_SIZE = 32
+    BITS = 4
+
+    def _write_single_shard_checkpoint(self, directory, rows, dims):
+        """Quantize a random row table and write it as a one-shard PLE
+        checkpoint (safetensors + index.json), the layout _PLEDiskIndex reads.
+
+        Returns the quantized (weight, scales, biases) arrays so the resident
+        path can be built from the exact same bytes.
+        """
+        import json
+        import os
+
+        mx.random.seed(0)
+        table = mx.random.normal((rows, dims)).astype(mx.bfloat16)
+        weight, scales, biases = mx.quantize(
+            table, group_size=self.GROUP_SIZE, bits=self.BITS
+        )
+        prefix = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding"
+        tensors = {
+            f"{prefix}.shards.0.weight": weight,
+            f"{prefix}.shards.0.scales": scales,
+            f"{prefix}.shards.0.biases": biases,
+        }
+        shard_file = "model.safetensors"
+        mx.save_safetensors(os.path.join(directory, shard_file), tensors)
+        with open(os.path.join(directory, "model.safetensors.index.json"), "w") as fh:
+            json.dump({"weight_map": {name: shard_file for name in tensors}}, fh)
+        return weight, scales, biases
+
+    def test_disk_shard_regex_handles_both_namings(self):
+        prefix = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding"
+        for key in (f"{prefix}.shards.7.weight", f"{prefix}.shard_7.weight"):
+            match = _DISK_SHARD_RE.search(key)
+            self.assertIsNotNone(match, key)
+            self.assertEqual(int(match.group(1)), 7)
+            self.assertIsNotNone(_NGRAM_SHARD_DROP_RE.search(key))
+        # Non-shard PLE tensors must survive both filters.
+        heads = f"{prefix}.ngram_heads_offsets"
+        self.assertIsNone(_DISK_SHARD_RE.search(heads))
+        self.assertIsNone(_NGRAM_SHARD_DROP_RE.search(heads))
+
+    def test_ple_on_disk_defaults_off(self):
+        config = tiny_config().text_config
+        self.assertFalse(config.ple_on_disk)
+        self.assertIsNone(config.ple_disk_path)
+        # A shard-free embedding is only built when disk mode is requested.
+        resident = ShardedEmbedding(num_embeddings=10, dims=4, num_shards=2)
+        self.assertEqual(len(resident.shards), 2)
+        disk = ShardedEmbedding(num_embeddings=10, dims=4, num_shards=2, disk_dir="/x")
+        self.assertEqual(disk.shards, [])
+
+    def test_sanitize_drops_ngram_shards_in_disk_mode(self):
+        config = tiny_config()
+        config.text_config.ple_on_disk = True
+        model = qwen4_exp.Model(config)
+        prefix = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
+        weights = {
+            f"{prefix}.shard_0.weight": mx.zeros((4, 8)),
+            f"{prefix}.shards.1.weight": mx.zeros((4, 8)),
+            f"{prefix}.ngram_heads_offsets": mx.zeros((4,)),
+        }
+        sanitized = model.sanitize(weights)
+        self.assertFalse(
+            any("ngram_embedding.shard" in key for key in sanitized),
+            "shard tensors must be dropped in disk mode",
+        )
+        # Non-shard PLE tensors are still kept.
+        self.assertTrue(any("ngram_heads_offsets" in key for key in sanitized))
+
+    def test_disk_dequant_matches_mx_dequantize_bit_identical(self):
+        import tempfile
+
+        import numpy as np
+
+        rows, dims = 12, 64
+        with tempfile.TemporaryDirectory() as directory:
+            weight, scales, biases = self._write_single_shard_checkpoint(
+                directory, rows, dims
+            )
+            index = _PLEDiskIndex(directory)
+            wanted = [11, 0, 5, 5, 8]
+            disk_rows = index.rows(
+                0, wanted, dims, group_size=self.GROUP_SIZE, bits=self.BITS
+            )
+
+        reference = mx.dequantize(
+            weight[mx.array(wanted)],
+            scales=scales[mx.array(wanted)],
+            biases=biases[mx.array(wanted)],
+            group_size=self.GROUP_SIZE,
+            bits=self.BITS,
+        )
+        # _PLEDiskIndex dequantizes on the host in float32; the runtime embeds
+        # in bf16, so compare after the same bf16 rounding the module applies.
+        disk_bf16 = mx.array(disk_rows).astype(mx.bfloat16).astype(mx.float32)
+        reference_f32 = reference.astype(mx.float32)
+        mx.eval(disk_bf16, reference_f32)
+        max_abs = mx.max(mx.abs(disk_bf16 - reference_f32)).item()
+        self.assertEqual(max_abs, 0.0, f"disk dequant diverged: max abs {max_abs}")
+
+    def test_disk_mode_embedding_matches_resident(self):
+        import tempfile
+
+        rows, dims = 12, 64
+        with tempfile.TemporaryDirectory() as directory:
+            weight, scales, biases = self._write_single_shard_checkpoint(
+                directory, rows, dims
+            )
+
+            resident = ShardedEmbedding(rows, dims, num_shards=1)
+            quantized = nn.QuantizedEmbedding(
+                rows, dims, group_size=self.GROUP_SIZE, bits=self.BITS
+            )
+            quantized.weight, quantized.scales, quantized.biases = (
+                weight,
+                scales,
+                biases,
+            )
+            resident.shards = [quantized]
+
+            disk = ShardedEmbedding(rows, dims, num_shards=1, disk_dir=directory)
+
+            indices = mx.array([[11, 0, 5], [8, 1, 5]], dtype=mx.int32)
+            resident_out = resident(indices)
+            disk_out = disk(indices)
+            mx.eval(resident_out, disk_out)
+
+        self.assertEqual(disk_out.shape, resident_out.shape)
+        self.assertEqual(disk_out.dtype, resident_out.dtype)
+        max_abs = mx.max(mx.abs(disk_out - resident_out)).item()
+        self.assertEqual(max_abs, 0.0, f"disk vs resident diverged: max abs {max_abs}")
 
 
 if __name__ == "__main__":
