@@ -420,68 +420,6 @@ def test_speculative_server_dispatches_mtp_batch_loop():
     )
 
 
-def test_speculative_server_samples_first_bonus_like_decode_step():
-    seen = {}
-    logits = mx.array(
-        [
-            [[1.0, 2.0, 3.0]],
-            [[4.0, 1.0, 0.0]],
-        ],
-        dtype=mx.float32,
-    )
-
-    def sampler(logprobs):
-        seen["shape"] = logprobs.shape
-        seen["values"] = logprobs
-        return mx.argmax(logprobs, axis=-1)
-
-    tokens = server_generation._sample_last_token(logits, sampler)
-    expected_logprobs = logits[:, -1, :] - mx.logsumexp(
-        logits[:, -1, :], axis=-1, keepdims=True
-    )
-    mx.eval(tokens, seen["values"], expected_logprobs)
-
-    assert seen["shape"] == (2, 3)
-    assert tokens.tolist() == [2, 0]
-    assert bool(mx.allclose(seen["values"], expected_logprobs).item())
-
-
-def test_speculative_server_samples_first_bonus_with_positioned_sampler():
-    seen = {}
-    logits = mx.array(
-        [
-            [[1.0, 2.0, 3.0]],
-            [[4.0, 1.0, 0.0]],
-        ],
-        dtype=mx.float32,
-    )
-
-    class Sampler:
-        def __call__(self, logprobs):
-            raise AssertionError("positioned sampler was not used")
-
-        def sample_target(self, logprobs, *, row_ids, positions):
-            seen["shape"] = logprobs.shape
-            seen["row_ids"] = list(row_ids)
-            seen["positions"] = list(positions)
-            return mx.argmax(logprobs, axis=-1)
-
-    tokens = server_generation._sample_last_token(
-        logits,
-        Sampler(),
-        row_ids=[0, 0],
-        positions=[0, 0],
-    )
-    mx.eval(tokens)
-
-    assert seen == {
-        "shape": (2, 3),
-        "row_ids": [0, 0],
-        "positions": [0, 0],
-    }
-    assert tokens.tolist() == [2, 0]
-
-
 def test_positioned_target_sampler_is_batch_grouping_invariant():
     sampler = server_generation._PositionedTargetSampler(
         temperature=0.7, top_p=1.0, seed=42
@@ -644,63 +582,6 @@ def test_speculative_prompt_cache_uses_batched_cache_for_batch(monkeypatch):
         )
         is batched_cache
     )
-
-
-def test_speculative_prefill_keeps_short_prompt_in_one_forward():
-    calls = []
-    output = SimpleNamespace(logits=mx.zeros((1, 3, 5)))
-
-    def lm(inputs, cache=None, **kwargs):
-        calls.append((inputs, cache, kwargs))
-        return output
-
-    input_ids = mx.array([[1, 2, 3]], dtype=mx.int32)
-    inputs_embeds = mx.ones((1, 3, 4), dtype=mx.float32)
-    result, remaining_ids = server_generation._run_chunked_speculative_prefill(
-        lm,
-        input_ids,
-        inputs_embeds,
-        [],
-        {},
-        {"capture_layer_ids": [1, 2]},
-        prefill_step_size=4,
-        generation_stream=mx.default_stream(mx.default_device()),
-    )
-
-    assert result is output
-    assert remaining_ids.tolist() == [[1, 2, 3]]
-    assert len(calls) == 1
-    assert calls[0][0].tolist() == [[1, 2, 3]]
-    assert calls[0][2]["inputs_embeds"].shape == (1, 3, 4)
-    assert calls[0][2]["capture_layer_ids"] == [1, 2]
-    assert "n_to_process" not in calls[0][2]
-
-
-def test_speculative_prefill_chunks_only_above_step_size():
-    calls = []
-
-    def lm(inputs, cache=None, **kwargs):
-        calls.append((inputs, cache, kwargs))
-        return SimpleNamespace(logits=mx.zeros((1, inputs.shape[1], 5)))
-
-    input_ids = mx.array([[1, 2, 3]], dtype=mx.int32)
-    inputs_embeds = mx.ones((1, 3, 4), dtype=mx.float32)
-    _, remaining_ids = server_generation._run_chunked_speculative_prefill(
-        lm,
-        input_ids,
-        inputs_embeds,
-        [],
-        {},
-        {"capture_layer_ids": [1, 2]},
-        prefill_step_size=2,
-        generation_stream=mx.default_stream(mx.default_device()),
-    )
-
-    assert remaining_ids.tolist() == [[3]]
-    assert [call[0].tolist() for call in calls] == [[[1, 2]], [[3]]]
-    assert calls[0][2]["n_to_process"] == 2
-    assert "capture_layer_ids" not in calls[0][2]
-    assert calls[1][2]["capture_layer_ids"] == [1, 2]
 
 
 def test_speculative_server_reads_draft_block_size_env(monkeypatch):
@@ -1084,47 +965,6 @@ def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
     assert gen.draft_kind is None
 
 
-def test_speculative_thread_exception_reaches_client_queue(monkeypatch):
-    gen = _unstarted_response_generator()
-    gen.model = SimpleNamespace(language_model=SimpleNamespace())
-    gen.processor = SimpleNamespace()
-    gen.draft_model = SimpleNamespace(
-        config=SimpleNamespace(target_layer_ids=[1, 2]), accept_lens=[]
-    )
-    gen.draft_kind = "dflash"
-    gen.stop_tokens = set()
-
-    rqueue = Queue()
-    pending = [
-        server_generation.QueuedGenerationRequest(
-            rqueue=rqueue,
-            raw_inputs={"input_ids": mx.array([[1]], dtype=mx.int32)},
-            prompt_tokens=1,
-            args=server.GenerationArguments(max_tokens=2),
-        )
-    ]
-    calls = {"count": 0}
-
-    def collect_pending_requests(**_kwargs):
-        calls["count"] += 1
-        if calls["count"] == 1:
-            return pending, False
-        return [], True
-
-    error = RuntimeError("speculative prefill failed")
-    gen._collect_pending_requests = collect_pending_requests
-    gen._gpu_embed = MagicMock(side_effect=error)
-    monkeypatch.setattr(
-        "mlx_vlm.speculative.utils.speculative_prefill_kwargs",
-        lambda *_args, **_kwargs: {},
-    )
-
-    gen._run_speculative()
-
-    assert rqueue.get(timeout=1) is error
-    assert rqueue.get(timeout=1) is None
-
-
 def test_ar_thread_exception_reaches_pending_client_queue(monkeypatch):
     class FakeBatchGenerator:
         def __init__(self, *_args, **_kwargs):
@@ -1166,98 +1006,6 @@ def test_ar_thread_exception_reaches_pending_client_queue(monkeypatch):
         gen._stop = True
         gen.requests.put(None)
         worker.join(timeout=2)
-
-
-def test_speculative_thread_exception_skips_broken_queues(monkeypatch):
-    gen = _unstarted_response_generator()
-    gen.model = SimpleNamespace(language_model=SimpleNamespace())
-    gen.processor = SimpleNamespace()
-    gen.draft_model = SimpleNamespace(
-        config=SimpleNamespace(target_layer_ids=[1, 2]), accept_lens=[]
-    )
-    gen.draft_kind = "dflash"
-    gen.stop_tokens = set()
-
-    class BrokenQueue:
-        def put(self, item):
-            raise RuntimeError("client went away")
-
-    good_queue = Queue()
-    pending = [
-        server_generation.QueuedGenerationRequest(
-            rqueue=BrokenQueue(),
-            raw_inputs={"input_ids": mx.array([[1]], dtype=mx.int32)},
-            prompt_tokens=1,
-            args=server.GenerationArguments(max_tokens=2),
-        ),
-        server_generation.QueuedGenerationRequest(
-            rqueue=good_queue,
-            raw_inputs={"input_ids": mx.array([[1]], dtype=mx.int32)},
-            prompt_tokens=1,
-            args=server.GenerationArguments(max_tokens=2),
-        ),
-    ]
-    calls = {"count": 0}
-
-    def collect_pending_requests(**_kwargs):
-        calls["count"] += 1
-        if calls["count"] == 1:
-            return pending, False
-        return [], True
-
-    error = RuntimeError("speculative prefill failed")
-    gen._collect_pending_requests = collect_pending_requests
-    gen._gpu_embed = MagicMock(side_effect=error)
-
-    gen._run_speculative()
-
-    assert good_queue.get(timeout=1) is error
-    assert good_queue.get(timeout=1) is None
-
-
-def test_speculative_thread_exception_clears_runtime_cache(monkeypatch):
-    gen = _unstarted_response_generator()
-    gen.model = SimpleNamespace(language_model=SimpleNamespace())
-    gen.processor = SimpleNamespace()
-    gen.draft_model = SimpleNamespace(
-        config=SimpleNamespace(target_layer_ids=[1, 2]), accept_lens=[]
-    )
-    gen.draft_kind = "dflash"
-    gen.stop_tokens = set()
-    rqueue = Queue()
-
-    calls = {"clear_cache": 0, "collect": 0}
-    collect_calls = {"count": 0}
-
-    def collect_pending_requests(**_kwargs):
-        collect_calls["count"] += 1
-        if collect_calls["count"] > 1:
-            return [], True
-        return [
-            server_generation.QueuedGenerationRequest(
-                rqueue=rqueue,
-                raw_inputs={"input_ids": mx.array([[1]], dtype=mx.int32)},
-                prompt_tokens=1,
-                args=server.GenerationArguments(max_tokens=2),
-            )
-        ], False
-
-    gen._collect_pending_requests = collect_pending_requests
-    gen._gpu_embed = MagicMock(side_effect=RuntimeError("boom"))
-    monkeypatch.setattr(
-        server_generation.mx,
-        "clear_cache",
-        lambda: calls.__setitem__("clear_cache", calls["clear_cache"] + 1),
-    )
-    monkeypatch.setattr(
-        server_generation.gc,
-        "collect",
-        lambda: calls.__setitem__("collect", calls["collect"] + 1),
-    )
-
-    gen._run_speculative()
-
-    assert calls == {"clear_cache": 1, "collect": 1}
 
 
 def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatch):
@@ -1378,6 +1126,9 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
     gen.config = SimpleNamespace(eos_token_id=3)
     gen.tokenizer = SimpleNamespace(all_special_ids=[0])
     gen.prefill_step_size = 3072
+    apc_manager = SimpleNamespace()
+    gen.apc_manager = apc_manager
+    gen.apc_mode = "exact"
     captured = {}
 
     def fake_stream_diffusion_generate_from_kwargs(
@@ -1413,6 +1164,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
                 total_tokens=3,
                 prompt_tps=10.0,
                 generation_tps=5.0,
+                cached_tokens=1,
                 finish_reason="length",
             )
         )
@@ -1457,16 +1209,20 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         },
         args=args,
         cancelled=set(),
+        apc_semantic_hash=73,
     )
 
     chunk = rqueue.get(timeout=1)
     assert chunk.text == "ok"
     assert chunk.finish_reason == "length"
     assert chunk.generation_tps == 5.0
+    assert chunk.cached_tokens == 1
     assert captured["input_ids"].tolist() == [[11, 12]]
     assert captured["pixel_values"] == "pixels"
     assert captured["attention_mask"] == "mask"
     assert captured["skip_special_token_ids"] == {0}
+    assert captured["kwargs"]["_apc_manager"] is apc_manager
+    assert captured["kwargs"]["_apc_semantic_hash"] == 73
     assert captured["skip_special_tokens"] is True
     assert captured["kwargs"] == {
         "max_tokens": 4,
@@ -1489,6 +1245,8 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         "diffusion_sampler": "entropy-bound",
         "threshold": 0.7,
         "min_threshold": 0.4,
+        "_apc_manager": apc_manager,
+        "_apc_semantic_hash": 73,
     }
 
 
@@ -1852,221 +1610,6 @@ def test_images_edits_writes_paths(client, monkeypatch, tmp_path):
     assert [path.name for path in paths] == ["edit-40.png", "edit-41.png"]
     assert all(path.exists() for path in paths)
     assert all(item["b64_json"] is None for item in payload["data"])
-
-
-class _RecordingSpeculativeLM:
-    def __init__(self, draft_kind):
-        self.calls = []
-        self.draft_kind = draft_kind
-        self._position_ids = "stale"
-        self._rope_deltas = "stale"
-
-    def __call__(self, inputs, cache=None, **kwargs):
-        self.calls.append({"inputs": inputs, "cache": cache, **kwargs})
-        batch_size, seq_len = inputs.shape
-        logits = mx.broadcast_to(
-            mx.array([[[0.0, 1.0, 0.0, 0.0, 0.0]]], dtype=mx.float32),
-            (batch_size, seq_len, 5),
-        )
-        hidden = mx.ones((batch_size, seq_len, 2), dtype=mx.float32)
-        if self.draft_kind == "mtp":
-            return SimpleNamespace(
-                logits=logits,
-                hidden_states=[hidden],
-                shared_kv_states={"full_attention": ("k", "v")},
-            )
-        return SimpleNamespace(
-            logits=logits,
-            hidden_states=[hidden, hidden],
-            shared_kv_states=None,
-        )
-
-
-def _run_speculative_prefill_once(
-    monkeypatch, *, draft_kind, request_specs, prefill_step_size=2048
-):
-    lm = _RecordingSpeculativeLM(draft_kind)
-    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-    gen.model = SimpleNamespace(language_model=lm)
-    gen.processor = SimpleNamespace()
-    gen.draft_model = SimpleNamespace(
-        config=SimpleNamespace(target_layer_ids=[1, 2]), accept_lens=[]
-    )
-    gen.draft_kind = draft_kind
-    gen.stop_tokens = {99}
-    gen.requests = Queue()
-    gen._stop = False
-    gen.prefill_step_size = prefill_step_size
-    gen._make_sampler = lambda args: None
-    gen.tokenizer = SimpleNamespace(
-        decode=lambda tokens: "".join(str(tok) for tok in tokens)
-    )
-
-    specs_iter = iter(request_specs)
-
-    def fake_gpu_embed(raw_inputs, images=None, apc_semantic_hash=None):
-        del raw_inputs, images, apc_semantic_hash
-        spec = next(specs_iter)
-        return spec["input_ids"], spec["gen_kwargs"]
-
-    gen._gpu_embed = fake_gpu_embed
-
-    monkeypatch.setattr(server_generation, "_make_cache", lambda *args, **kwargs: [])
-    monkeypatch.setattr(
-        server_generation, "_get_draft_block_size_from_env", lambda: None
-    )
-    monkeypatch.setattr(
-        server_generation, "get_speculative_batch_coalesce_s", lambda: 0.0
-    )
-
-    class _FakeDetokenizer:
-        def __init__(self):
-            self.last_segment = ""
-
-        def reset(self):
-            self.last_segment = ""
-
-        def add_token(self, token):
-            self.last_segment = str(token)
-
-        def finalize(self):
-            pass
-
-    monkeypatch.setattr(
-        server_generation,
-        "make_streaming_detokenizer",
-        lambda processor: _FakeDetokenizer(),
-    )
-
-    def fake_rounds(*args, **kwargs):
-        del args
-        gen.round_kwargs = kwargs
-        gen._stop = True
-        yield ([4] * int(kwargs["first_bonus"].shape[0]), None)
-
-    monkeypatch.setattr(server_generation, "run_speculative_server_rounds", fake_rounds)
-
-    args = server.GenerationArguments(max_tokens=2, temperature=0)
-    for spec in request_specs:
-        gen.requests.put(
-            server_generation.QueuedGenerationRequest(
-                rqueue=Queue(),
-                raw_inputs={"input_ids": spec["input_ids"]},
-                prompt_tokens=int(spec["input_ids"].shape[1]),
-                args=args,
-            )
-        )
-
-    gen._run_speculative()
-    call = lm.calls[0]
-    call["prefill_input_lengths"] = [item["inputs"].shape[1] for item in lm.calls]
-    call["round_kwargs"] = gen.round_kwargs
-    return call
-
-
-def test_speculative_server_threads_greedy_flag_to_mtp_loop(monkeypatch):
-    call = _run_speculative_prefill_once(
-        monkeypatch,
-        draft_kind="mtp",
-        request_specs=[
-            {
-                "input_ids": mx.array([[11, 12, 13]], dtype=mx.int32),
-                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
-            },
-            {
-                "input_ids": mx.array([[21, 22, 23]], dtype=mx.int32),
-                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
-            },
-        ],
-    )
-
-    assert call["round_kwargs"]["greedy_sampling"] is True
-
-
-def test_speculative_server_honors_prefill_step_override(monkeypatch):
-    monkeypatch.setattr(
-        server_generation, "_chunked_prefill_enabled", lambda *args, **kwargs: True
-    )
-    call = _run_speculative_prefill_once(
-        monkeypatch,
-        draft_kind="mtp",
-        prefill_step_size=2,
-        request_specs=[
-            {
-                "input_ids": mx.array([[11, 12, 13]], dtype=mx.int32),
-                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
-            },
-            {
-                "input_ids": mx.array([[21, 22, 23]], dtype=mx.int32),
-                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
-            },
-        ],
-    )
-
-    assert call["prefill_input_lengths"] == [2, 1]
-
-
-def test_speculative_server_prefill_threads_gemma4_per_layer_inputs(monkeypatch):
-    call = _run_speculative_prefill_once(
-        monkeypatch,
-        draft_kind="mtp",
-        request_specs=[
-            {
-                "input_ids": mx.array([[11, 12, 13]], dtype=mx.int32),
-                "gen_kwargs": {
-                    "inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32),
-                    "per_layer_inputs": mx.array(
-                        [[[1.0, 1.5], [2.0, 2.5], [3.0, 3.5]]], dtype=mx.float32
-                    ),
-                },
-            },
-            {
-                "input_ids": mx.array([[21, 22]], dtype=mx.int32),
-                "gen_kwargs": {
-                    "inputs_embeds": mx.full((1, 2, 4), 7.0, dtype=mx.float32),
-                    "per_layer_inputs": mx.array(
-                        [[[4.0, 4.5], [5.0, 5.5]]], dtype=mx.float32
-                    ),
-                },
-            },
-        ],
-    )
-
-    assert call["return_hidden"] is True
-    assert call["return_shared_kv"] is True
-    assert call["per_layer_inputs"].shape == (2, 3, 2)
-    assert call["per_layer_inputs"].tolist()[1][0] == [0.0, 0.0]
-    assert call["inputs_embeds"].shape == (2, 3, 4)
-
-
-def test_speculative_server_prefill_threads_qwen_dflash_prompt_kwargs(monkeypatch):
-    call = _run_speculative_prefill_once(
-        monkeypatch,
-        draft_kind="dflash",
-        request_specs=[
-            {
-                "input_ids": mx.array([[31, 32, 33]], dtype=mx.int32),
-                "gen_kwargs": {
-                    "inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32),
-                    "image_grid_thw": mx.array([[1, 2, 3]], dtype=mx.int32),
-                    "_apc_semantic_hash": 123,
-                },
-            },
-            {
-                "input_ids": mx.array([[41, 42]], dtype=mx.int32),
-                "gen_kwargs": {
-                    "inputs_embeds": mx.full((1, 2, 4), 9.0, dtype=mx.float32),
-                    "image_grid_thw": mx.array([[4, 5, 6]], dtype=mx.int32),
-                },
-            },
-        ],
-    )
-
-    assert call["capture_layer_ids"] == [1, 2]
-    assert call["image_grid_thw"].tolist() == [[1, 2, 3], [4, 5, 6]]
-    assert call["inputs_embeds"].shape == (2, 3, 4)
-    assert call["inputs_embeds"].tolist()[1][0] == [0.0, 0.0, 0.0, 0.0]
-    assert "_apc_semantic_hash" not in call
 
 
 def test_responses_endpoint_forwards_new_sampling_args(client):
@@ -4630,7 +4173,10 @@ def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch)
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 [
                     server.StreamingToken(
-                        text='<tool_call>{"name":"get_weather","arguments":{"location":"SF"}}</tool_call>',
+                        text=(
+                            '<tool_call>{"name":"get_weather","arguments":'
+                            '{"location":"SF"}}</tool_call> After the call.'
+                        ),
                         token=1,
                         logprobs=0.0,
                         finish_reason="stop",
@@ -4671,6 +4217,7 @@ def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch)
     assert '"name": "get_weather"' in body
     assert '"type": "input_json_delta"' in body
     assert '"partial_json": "{\\"location\\": \\"SF\\"}"' in body
+    assert '"text": " After the call."' in body
     assert '"stop_reason": "tool_use"' in body
 
 
@@ -5840,7 +5387,10 @@ class TestResponseGenerator:
                 (str(uid * 10 + 1), "length"),
             ]
 
-    def test_run_routes_mtp_through_batch_generator(self, monkeypatch):
+    @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])
+    def test_run_routes_speculative_decode_through_batch_generator(
+        self, monkeypatch, draft_kind
+    ):
         batch_state = {}
         draft_model = object()
 
@@ -5926,7 +5476,8 @@ class TestResponseGenerator:
         gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
         gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
         gen.top_logprobs_k = 0
-        gen.apc_manager = None
+        apc_manager = object()
+        gen.apc_manager = apc_manager
         gen.prefill_step_size = 3072
         gen.tokenizer = SimpleNamespace()
         gen.requests = Queue()
@@ -5942,11 +5493,10 @@ class TestResponseGenerator:
             gen.config = SimpleNamespace()
             gen.stop_tokens = set()
             gen.draft_model = draft_model
-            gen.draft_kind = "mtp"
+            gen.draft_kind = draft_kind
             gen.tokenizer = SimpleNamespace()
 
         gen._initialize_model = fake_initialize_model
-        gen._run_speculative = lambda: pytest.fail("MTP should use BatchGenerator")
         gen._gpu_embed = lambda raw_inputs, images=None, apc_semantic_hash=None: (
             mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
             {},
@@ -5982,14 +5532,18 @@ class TestResponseGenerator:
 
         kwargs = batch_state["kwargs"]
         assert kwargs["draft_model"] is draft_model
-        assert kwargs["draft_kind"] == "mtp"
+        assert kwargs["draft_kind"] == draft_kind
         assert kwargs["draft_block_size"] == 6
         assert kwargs["greedy_sampling"] is True
         assert kwargs["compute_logprobs"] is False
         assert kwargs["prefill_step_size"] == 3072
+        assert kwargs["apc_manager"] is apc_manager
         assert batch_state["instance"].next_active_sizes == [2]
 
-    def test_run_coalesces_idle_mtp_batch_generator(self, monkeypatch):
+    @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])
+    def test_run_coalesces_idle_speculative_batch_generator(
+        self, monkeypatch, draft_kind
+    ):
         monkeypatch.setenv("MLX_VLM_SPEC_BATCH_COALESCE_MS", "37")
         calls = []
         draft_model = object()
@@ -6007,7 +5561,7 @@ class TestResponseGenerator:
             gen.config = SimpleNamespace()
             gen.stop_tokens = set()
             gen.draft_model = draft_model
-            gen.draft_kind = "mtp"
+            gen.draft_kind = draft_kind
             gen.tokenizer = SimpleNamespace()
 
         def fake_collect_pending_requests(
@@ -6018,7 +5572,6 @@ class TestResponseGenerator:
             return [], True
 
         gen._initialize_model = fake_initialize_model
-        gen._run_speculative = lambda: pytest.fail("MTP should use BatchGenerator")
         gen._collect_pending_requests = fake_collect_pending_requests
 
         gen._run_impl()
@@ -7506,64 +7059,51 @@ class TestChatMessageSchema:
         assert msg.reasoning == "thought"
 
 
-class TestSuppressToolCallContent:
+class TestToolCallStreamState:
     """Tests for tool-call markup suppression in streaming."""
 
     def test_no_tool_module(self):
-        in_tc, content = server.suppress_tool_call_content(
-            "Hello world", False, None, "world"
-        )
-        assert in_tc is False
-        assert content == "world"
+        state = server.ToolCallStreamState(None, None)
+        assert state.feed("world") == "world"
 
     def test_normal_text_before_tool_call(self):
-        in_tc, content = server.suppress_tool_call_content(
-            "I will call", False, "<tool_call>", "call"
-        )
-        assert in_tc is False
-        assert content == "call"
+        state = server.ToolCallStreamState("<tool_call>", "</tool_call>")
+        assert state.feed("I will call") == "I will call"
+        assert state.in_tool_call is False
 
     def test_suppresses_on_start_marker(self):
-        in_tc, content = server.suppress_tool_call_content(
-            "text<tool_call>", False, "<tool_call>", ">"
-        )
-        assert in_tc is True
-        assert content is None
+        state = server.ToolCallStreamState("<tool_call>", "</tool_call>")
+        assert state.feed("text<tool_call>") == "text"
+        assert state.in_tool_call is True
 
     def test_suppresses_partial_marker(self):
-        in_tc, content = server.suppress_tool_call_content(
-            "text<tool", False, "<tool_call>", "<tool"
-        )
-        assert in_tc is False
-        assert content is None
+        state = server.ToolCallStreamState("<tool_call>", "</tool_call>")
+        assert state.feed("text<tool") == "text"
+        assert state.buffer == "<tool"
+        assert state.in_tool_call is False
 
     def test_stays_suppressed_after_entering(self):
-        in_tc, content = server.suppress_tool_call_content(
-            "text<tool_call>get_weather", True, "<tool_call>", "weather"
-        )
-        assert in_tc is True
-        assert content is None
+        state = server.ToolCallStreamState("<tool_call>", "</tool_call>")
+        assert state.feed("text<tool_call>") == "text"
+        assert state.feed("get_weather") is None
+        assert state.in_tool_call is True
 
     def test_pipe_delimited_marker(self):
-        in_tc, content = server.suppress_tool_call_content(
-            "text<|tool_call>call:get_weather", False, "<|tool_call>", "weather"
-        )
-        assert in_tc is True
-        assert content is None
+        state = server.ToolCallStreamState("<|tool_call>", "<|tool_call_end|>")
+        assert state.feed("text<|tool_call>call:get_weather") == "text"
+        assert state.in_tool_call is True
 
     def test_pipe_delimited_partial_marker(self):
-        in_tc, content = server.suppress_tool_call_content(
-            "text<|tool", False, "<|tool_call>", "<|tool"
-        )
-        assert in_tc is False
-        assert content is None
+        state = server.ToolCallStreamState("<|tool_call>", "<|tool_call_end|>")
+        assert state.feed("text<|tool") == "text"
+        assert state.buffer == "<|tool"
+        assert state.in_tool_call is False
 
     def test_literal_less_than_is_not_suppressed(self):
-        in_tc, content = server.suppress_tool_call_content(
-            "if n <", False, "<tool_call>", "<"
-        )
-        assert in_tc is False
-        assert content == "<"
+        state = server.ToolCallStreamState("<tool_call>", "</tool_call>")
+        assert state.feed("if n <") == "if n "
+        assert state.feed("x") == "<x"
+        assert state.in_tool_call is False
 
 
 class TestProcessToolCalls:

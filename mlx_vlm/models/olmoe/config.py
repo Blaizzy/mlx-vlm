@@ -11,10 +11,10 @@ class ModelConfig(BaseModelConfig):
     num_hidden_layers: int
     intermediate_size: int
     num_attention_heads: int
-    rms_norm_eps: float
     vocab_size: int
     num_experts: int
     num_experts_per_tok: int
+    rms_norm_eps: float = 1e-5
     norm_topk_prob: bool = False
     head_dim: Optional[int] = None
     max_position_embeddings: Optional[int] = None
