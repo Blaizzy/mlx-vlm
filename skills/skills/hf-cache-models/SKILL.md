@@ -1,15 +1,15 @@
 ---
 name: hf-cache-models
-description: Use this skill when the user wants to list, inspect, or report MLX-VLM-supported models available in the local Hugging Face cache directory, including models shown by the server /v1/models endpoint, cache-dir overrides, JSON output, or issue-ready cached model lists.
+description: Use this skill when the user wants to list, inspect, or report MLX-VLM model candidates available in the local Hugging Face cache directory, including the server's opt-in hf-cache discovery mode, cache-dir overrides, JSON output, or issue-ready cached model lists.
 ---
 
 # HF Cache Models
 
-Use this workflow to list locally cached Hugging Face models that MLX-VLM should treat as server-visible models.
+Use this workflow to list locally cached Hugging Face models that MLX-VLM can expose when Hugging Face cache discovery is explicitly enabled.
 
 ## Supported Model Rule
 
-Match the server `/v1/models` cache filter:
+Match the server `/v1/models` filter used with `--model-discovery hf-cache`:
 
 - repo type is `model`
 - `main` revision exists in the cache
@@ -17,7 +17,7 @@ Match the server `/v1/models` cache filter:
 - `tokenizer_config.json` exists
 - either `model.safetensors.index.json` exists or at least one `*.safetensors` file exists
 
-This is a cache/file-presence check that mirrors the server (`mlx_vlm/server/app.py`). It does not load the model or prove generation works. Pass `--check-arch` to additionally require that mlx-vlm ships an architecture for the `model_type` — this narrows the list from *server-visible* to *probably loadable* (folder-name match; it does not resolve `MODEL_REMAPPING` aliases, so use it as a strong hint, not proof).
+This is a cache/file-presence check that mirrors the server's opt-in `hf-cache` discovery mode (`mlx_vlm/server/app.py`). It does not load the model, prove generation works, or affect the default `served` listing. Pass `--check-arch` to additionally require that mlx-vlm ships an architecture for the `model_type` — this narrows the list from a *cache candidate* to *probably loadable* (folder-name match; it does not resolve `MODEL_REMAPPING` aliases, so use it as a strong hint, not proof).
 
 ## Script
 
@@ -55,7 +55,8 @@ When reporting the result, include:
 - exact model IDs
 - whether the list came from the script or from `curl http://127.0.0.1:8080/v1/models`
 
-For server-visible verification, start the server and compare with:
+For Hugging Face cache-discovery verification, start the server with
+`--model-discovery hf-cache` and compare with:
 
 ```bash
 curl http://127.0.0.1:8080/v1/models
