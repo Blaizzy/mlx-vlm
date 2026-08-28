@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from bisect import bisect_right
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -938,10 +939,115 @@ def _find_nth_prime_after(start: int, count: int) -> int:
     return prime
 
 
-class ShardedEmbedding(nn.Module):
-    """Embedding kept in checkpoint-sized row shards to avoid a 100 GB join."""
+# Matches a PLE n-gram shard tensor under EITHER checkpoint naming convention
+# and captures the shard index: the ``.ngram_embedding.shard_N.`` (underscore)
+# layout that ``sanitize`` remaps to ``.ngram_embedding.shards.N.`` (dot), plus
+# checkpoints that already ship the dot layout. The disk index reads raw tensor
+# names straight from the safetensors index, so it must accept both.
+_DISK_SHARD_RE = re.compile(r"\.ngram_embedding\.shards?[._](\d+)")
 
-    def __init__(self, num_embeddings: int, dims: int, num_shards: int):
+
+class _PLEDiskIndex:
+    """Row-granular reads of the quantized n-gram table straight off the
+    safetensors files via numpy memmap.
+
+    The n-gram PLE table dominates the qwen4_exp parameter count, yet only a
+    handful of its rows are read per token. This keeps the table on disk and
+    dequantizes just the requested rows on the host, matching ``mx.dequantize``
+    for affine group quantization exactly (bit-identical to the resident path).
+    Rows are a few hundred bytes; only touched pages enter the OS page cache.
+    """
+
+    def __init__(self, model_dir):
+        import json as _json
+        import os as _os
+        import struct as _struct
+
+        import numpy as _np
+
+        self.np = _np
+        with open(_os.path.join(model_dir, "model.safetensors.index.json")) as fh:
+            idx = _json.load(fh)
+        files = {}
+        self.tensors = {}
+        for name, fname in idx["weight_map"].items():
+            match = _DISK_SHARD_RE.search(name)
+            if match is None:
+                continue
+            path = _os.path.join(model_dir, fname)
+            if fname not in files:
+                with open(path, "rb") as fh:
+                    header_len = _struct.unpack("<Q", fh.read(8))[0]
+                    header = _json.loads(fh.read(header_len))
+                files[fname] = (
+                    header,
+                    8 + header_len,
+                    _np.memmap(path, dtype=_np.uint8, mode="r"),
+                )
+            header, base, mm = files[fname]
+            info = header[name]
+            shard_no = int(match.group(1))
+            kind = (
+                name.rsplit(".", 1)[-1]
+                if name.endswith(("weight", "scales", "biases"))
+                else None
+            )
+            self.tensors.setdefault(shard_no, {})[kind] = (
+                mm,
+                base + info["data_offsets"][0],
+                info["shape"],
+                info["dtype"],
+            )
+
+    @staticmethod
+    def _bf16(raw_u8):
+        import numpy as _np
+
+        u16 = raw_u8.view(_np.uint16)
+        return (u16.astype(_np.uint32) << 16).view(_np.float32)
+
+    def rows(self, shard_no, local_rows, dims, group_size=32, bits=4):
+        """Dequantize ``local_rows`` of the given shard to float32 ``[R, dims]``.
+
+        Reproduces ``mx.dequantize`` for affine quantization on the host: each
+        packed uint32 word holds ``32 // bits`` values, unpacked little-endian
+        and scaled/biased per group with the bf16 scales and biases.
+        """
+        _np = self.np
+        tensors = self.tensors[shard_no]
+        out = _np.empty((len(local_rows), dims), dtype=_np.float32)
+        mm_w, off_w, shape_w, _ = tensors["weight"]
+        mm_s, off_s, shape_s, _ = tensors["scales"]
+        mm_b, off_b, _, _ = tensors["biases"]
+        wrow = shape_w[1] * 4  # uint32 words per row -> bytes
+        srow = shape_s[1] * 2  # bf16 groups per row -> bytes
+        vals_per_word = 32 // bits
+        shifts = _np.arange(vals_per_word, dtype=_np.uint32) * bits
+        for i, row in enumerate(local_rows):
+            packed = mm_w[off_w + row * wrow : off_w + (row + 1) * wrow].view(
+                _np.uint32
+            )
+            scales = self._bf16(
+                mm_s[off_s + row * srow : off_s + (row + 1) * srow].copy()
+            )
+            biases = self._bf16(
+                mm_b[off_b + row * srow : off_b + (row + 1) * srow].copy()
+            )
+            unpacked = (packed[:, None] >> shifts[None, :]) & ((1 << bits) - 1)
+            quantized = unpacked.reshape(-1)[:dims].astype(_np.float32)
+            groups = quantized.reshape(-1, group_size)
+            out[i] = (groups * scales[:, None] + biases[:, None]).reshape(-1)
+        return out
+
+
+class ShardedEmbedding(nn.Module):
+    """Embedding kept in checkpoint-sized row shards to avoid a 100 GB join.
+
+    When ``disk_dir`` is set the shards are never held resident: the table stays
+    on disk and rows are read and dequantized on demand (see ``_PLEDiskIndex``).
+    """
+
+    def __init__(self, num_embeddings: int, dims: int, num_shards: int, disk_dir=None):
         super().__init__()
         if num_shards <= 0 or num_shards > num_embeddings:
             raise ValueError("num_shards must be in [1, num_embeddings]")
@@ -949,7 +1055,11 @@ class ShardedEmbedding(nn.Module):
         self.shard_sizes = tuple(
             base + (1 if index < remainder else 0) for index in range(num_shards)
         )
-        self.shards = [nn.Embedding(size, dims) for size in self.shard_sizes]
+        self._disk_dir = disk_dir
+        self._disk_index = None
+        self.shards = (
+            [] if disk_dir else [nn.Embedding(size, dims) for size in self.shard_sizes]
+        )
         offsets = [0]
         for size in self.shard_sizes:
             offsets.append(offsets[-1] + size)
@@ -963,6 +1073,8 @@ class ShardedEmbedding(nn.Module):
         mx.eval(flat)
         host_indices = [int(index) for index in flat.tolist()]
         if not host_indices:
+            if self._disk_dir:
+                return mx.zeros((*indices.shape, self.dims), dtype=mx.bfloat16)
             return self.shards[0](flat).reshape(*indices.shape, self.dims)
         if any(index < 0 or index >= self.shard_offsets[-1] for index in host_indices):
             raise IndexError("embedding index is outside the sharded vocabulary")
@@ -970,6 +1082,10 @@ class ShardedEmbedding(nn.Module):
         shard_indices = [
             bisect_right(self.shard_offsets, index) - 1 for index in host_indices
         ]
+        if self._disk_dir:
+            return self._disk_gather(host_indices, shard_indices).reshape(
+                *indices.shape, self.dims
+            )
         result = None
         for shard_index in sorted(set(shard_indices)):
             positions_list = [
@@ -987,6 +1103,26 @@ class ShardedEmbedding(nn.Module):
                 result = mx.zeros((len(host_indices), self.dims), dtype=values.dtype)
             result = result.at[positions].add(values)
         return result.reshape(*indices.shape, self.dims)
+
+    def _disk_gather(self, host_indices, shard_indices) -> mx.array:
+        """Read dequantized rows for the given global indices off disk."""
+        import numpy as np
+
+        if self._disk_index is None:
+            self._disk_index = _PLEDiskIndex(self._disk_dir)
+        out = np.empty((len(host_indices), self.dims), dtype=np.float32)
+        per_shard = {}
+        for position, (shard_index, global_index) in enumerate(
+            zip(shard_indices, host_indices)
+        ):
+            local = global_index - self.shard_offsets[shard_index]
+            per_shard.setdefault(shard_index, []).append((position, local))
+        for shard_index, items in per_shard.items():
+            positions, local_rows = zip(*items)
+            out[list(positions)] = self._disk_index.rows(
+                shard_index, list(local_rows), self.dims
+            )
+        return mx.array(out).astype(mx.bfloat16)
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):
@@ -1031,10 +1167,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self.ngram_heads_offsets = mx.array(head_offsets, dtype=mx.int64)
         divisor = config.make_ngram_vocab_size_divisible_by
         padded_vocab_size = math.ceil(total_vocab_size / divisor) * divisor
+        disk_dir = config.ple_disk_path if config.ple_on_disk else None
         self.ngram_embedding = ShardedEmbedding(
             padded_vocab_size,
             embedding_dim // self.ngram_heads,
             config.split_ngram_parts,
+            disk_dir=disk_dir,
         )
 
     def _shift_right_ignore_eos(self, token_ids: mx.array, shift: int):

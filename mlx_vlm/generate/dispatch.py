@@ -509,6 +509,13 @@ def parse_arguments():
         "working set). Ignored for a normal, non-offloaded checkpoint.",
     )
     parser.add_argument(
+        "--ple-on-disk",
+        action="store_true",
+        help="Keep a model's n-gram PLE table (qwen4_exp) on disk and read rows "
+        "on demand instead of holding it resident. Ignored for models without "
+        "a PLE table.",
+    )
+    parser.add_argument(
         "--processor-kwargs",
         type=json.loads,
         default={},
@@ -1271,6 +1278,7 @@ def main():
         trust_remote_code=args.trust_remote_code,
         quantize_activations=args.quantize_activations,
         expert_cache_gb=args.expert_cache_gb,
+        ple_on_disk=args.ple_on_disk,
         max_kv_size=args.max_kv_size,
     )
     config = model.config

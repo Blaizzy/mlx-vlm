@@ -67,6 +67,11 @@ class TextConfig(BaseModelConfig):
     eos_token_id: Optional[Union[int, List[int]]] = None
     tie_word_embeddings: bool = False
     attention_bias: bool = False
+    # Runtime-only, not part of the checkpoint. Set by load_model() when the
+    # caller passes ``ple_on_disk=True`` so the n-gram PLE table is read row by
+    # row off disk instead of held resident. Default off => no behavior change.
+    ple_on_disk: bool = False
+    ple_disk_path: Optional[str] = None
     rope_parameters: Optional[Dict[str, Union[float, str, bool, List[int]]]] = field(
         default_factory=lambda: {
             "type": "default",

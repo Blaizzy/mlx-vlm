@@ -798,6 +798,9 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
+        ple_on_disk (bool, optional): If True, keep a model's n-gram PLE table
+            (qwen4_exp) on disk and read rows on demand instead of holding it
+            resident. No effect on models without a PLE table. Default: ``False``.
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -807,6 +810,7 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
     strict = kwargs.pop("strict", True)
+    ple_on_disk = kwargs.pop("ple_on_disk", False)
     # An expert-offload dir (mlx_vlm.moe_offload) is missing routed-expert
     # keys by design; defer eval until patch_model swaps those modules, or
     # their random-init resident weights get eagerly materialized -- the OOM
@@ -880,6 +884,20 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     modules = ["text", "vision", "perceiver", "projector", "audio"]
     model_config = update_module_configs(model_config, model_class, config, modules)
     model_config = apply_generation_config_defaults(model_config, config)
+
+    # Opt-in disk offload of a model's n-gram PLE table (qwen4_exp). The table
+    # is read row by row off ``model_path`` instead of held resident; the model
+    # constructs its ShardedEmbedding shard-free when this is set.
+    if ple_on_disk:
+        text_config = getattr(model_config, "text_config", None)
+        if text_config is not None and hasattr(text_config, "ple_on_disk"):
+            text_config.ple_on_disk = True
+            text_config.ple_disk_path = str(model_path)
+        else:
+            logging.warning(
+                "ple_on_disk=True ignored: %s has no PLE table to offload.",
+                config.get("model_type"),
+            )
 
     model = model_class.Model(model_config)
 
@@ -1187,6 +1205,9 @@ def load(
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
+        ple_on_disk (bool, optional): If True, keep a model's n-gram PLE table
+            (qwen4_exp) on disk and read rows on demand instead of holding it
+            resident. No effect on models without a PLE table. Default: ``False``.
 
     Returns:
         Tuple[nn.Module, TokenizerWrapper]: A tuple containing the loaded model and tokenizer.

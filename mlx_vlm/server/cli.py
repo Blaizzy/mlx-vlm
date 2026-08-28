@@ -217,6 +217,13 @@ def main():
         "working set). Ignored for a normal, non-offloaded checkpoint.",
     )
     parser.add_argument(
+        "--ple-on-disk",
+        action="store_true",
+        help="Keep a model's n-gram PLE table (qwen4_exp) on disk and read rows "
+        "on demand instead of holding it resident, freeing the table's RAM. "
+        "Ignored for models without a PLE table.",
+    )
+    parser.add_argument(
         "--draft-model",
         type=str,
         default=None,
@@ -335,6 +342,8 @@ def main():
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
     if args.expert_cache_gb is not None:
         os.environ["EXPERT_CACHE_GB"] = str(args.expert_cache_gb)
+    if args.ple_on_disk:
+        os.environ["PLE_ON_DISK"] = "1"
     if args.top_logprobs_k is not None:
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
     if args.api_key:

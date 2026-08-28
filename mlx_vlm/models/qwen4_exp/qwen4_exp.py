@@ -10,6 +10,10 @@ from .language import LanguageModel
 from .vision import VisionModel
 
 _NGRAM_SHARD_RE = re.compile(r"\.ngram_embedding\.shard_(\d+)(?=\.)")
+# Matches an n-gram shard tensor under either naming convention (underscore
+# ``.shard_N.`` or dot ``.shards.N.``); used to drop them in ple_on_disk mode,
+# where the table lives on disk and the ShardedEmbedding holds no shards.
+_NGRAM_SHARD_DROP_RE = re.compile(r"\.ngram_embedding\.shards?[._]\d+")
 
 
 class Model(Qwen3_5Model):
@@ -46,10 +50,17 @@ class Model(Qwen3_5Model):
                     f"{prefix}.experts.down_proj"
                 )
 
+        # In ple_on_disk mode the n-gram table is served row by row off disk, so
+        # the ShardedEmbedding holds no shards; drop the shard tensors before
+        # load_weights, or they collide with the empty module.
+        drop_ngram_shards = self.config.text_config.ple_on_disk
+
         sanitized = {}
         for key, value in weights.items():
             key = sanitize_key(key)
             key = _NGRAM_SHARD_RE.sub(r".ngram_embedding.shards.\1", key)
+            if drop_ngram_shards and _NGRAM_SHARD_DROP_RE.search(key):
+                continue
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
             sanitized[key] = value

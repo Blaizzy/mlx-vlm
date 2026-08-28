@@ -242,6 +242,10 @@ def get_expert_cache_gb():
         return None
 
 
+def get_ple_on_disk():
+    return os.environ.get("PLE_ON_DISK", "").lower() in ("1", "true", "yes")
+
+
 def get_quantized_kv_bits():
     kv_bits = float(os.environ.get("KV_BITS", 0))
     return kv_bits or None
@@ -589,6 +593,7 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
             adapter_path,
             trust_remote_code=trust_remote_code,
             expert_cache_gb=get_expert_cache_gb(),
+            ple_on_disk=get_ple_on_disk(),
             max_kv_size=get_configured_context_limit(),
         )
         config = model.config
