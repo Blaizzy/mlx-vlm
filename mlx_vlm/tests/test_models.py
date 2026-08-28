@@ -2967,9 +2967,7 @@ class TestModels(unittest.TestCase):
         # (the dense path's value for such rows is an implementation-defined
         # fully-masked softmax); the gathered path must stay finite and zero
         # those rows rather than emit NaN.
-        dsa2 = Glm5NextSparseAttention(
-            make_cfg(index_kpool_always_select_tail=False)
-        )
+        dsa2 = Glm5NextSparseAttention(make_cfg(index_kpool_always_select_tail=False))
         dsa2.eval()
         qpos = mx.arange(12)[:, None]
         kpos = mx.arange(12)[None, :]
