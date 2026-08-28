@@ -105,6 +105,7 @@ from .responses_state import (
     StoredResponse,
     ThinkingStreamDelta,
     ThinkingStreamState,
+    ToolCallStreamState,
     _normalize_response_input,
     _response_chain_items,
     _response_items_to_chat,
@@ -120,7 +121,6 @@ from .responses_state import (
     response_store,
     response_store_lock,
     response_store_order,
-    suppress_tool_call_content,
 )
 from .runtime import ModelCacheRegistry, runtime
 from .runtime_config import DEFAULT_TOKEN_QUEUE_TIMEOUT
