@@ -1,8 +1,7 @@
 # LongCat-Flash-Lite-Sparse (`longcat_flash_sparse`)
 
 MLX support for **LongCat-Flash-Lite-Sparse** (`LongcatCausalLM`) — the LSA
-sparse-attention + n-gram variant of the LongCat-Flash family. To our knowledge
-this is the first working implementation in any MLX stack.
+sparse-attention + n-gram variant of the LongCat-Flash family. 
 
 The Hugging Face config omits `model_type`; set `model_type: "longcat_flash_sparse"`
 to dispatch here.
