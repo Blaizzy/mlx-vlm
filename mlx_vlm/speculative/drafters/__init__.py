@@ -20,7 +20,6 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
     "gemma4_unified_assistant": "mtp",
     "glm4_moe_lite_mtp": "mtp",
     "inkling_mtp": "mtp",
-    "longcat_flash_sparse_mtp": "mtp",
     "qwen3_5_mtp": "mtp",
     "qwen4_exp_mtp": "mtp",
     "laguna": "dflash",

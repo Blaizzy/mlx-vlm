@@ -514,8 +514,6 @@ class LongcatFlashModel(nn.Module):
         self,
         x: mx.array,
         cache: Optional[Any] = None,
-        hidden_sink: Optional[list] = None,
-        skip_final_norm: bool = False,
     ) -> mx.array:
         if self.use_ngram:
             if cache is None:
@@ -534,77 +532,7 @@ class LongcatFlashModel(nn.Module):
         for layer, c in zip(self.layers, layer_cache):
             h = layer(h, mask, cache=c)
 
-        if hidden_sink is not None:
-            hidden_sink.append(h)
-        if skip_final_norm:
-            return h
         return self.norm(h)
-
-
-def _clone_cache_tree(v):
-    if isinstance(v, mx.array):
-        return mx.array(v)
-    if isinstance(v, tuple):
-        return tuple(_clone_cache_tree(x) for x in v)
-    if isinstance(v, list):
-        return [_clone_cache_tree(x) for x in v]
-    if isinstance(v, dict):
-        return {k: _clone_cache_tree(x) for k, x in v.items()}
-    return v
-
-
-def _needs_replay_snapshot(cache) -> bool:
-    if cache is None:
-        return False
-    if isinstance(cache, CacheList):
-        return any(_needs_replay_snapshot(c) for c in cache.caches)
-    return not (hasattr(cache, "trim") and callable(cache.trim))
-
-
-def _needs_replay_snapshot_for_cache(caches, incoming_tokens: int = 0) -> bool:
-    if caches is None:
-        return False
-    return any(_needs_replay_snapshot(c) for c in caches)
-
-
-def _snapshot_single_cache(cache):
-    if cache is None:
-        return None
-    if isinstance(cache, CacheList):
-        return ("cache_list", [_snapshot_single_cache(c) for c in cache.caches])
-    return ("full", _clone_cache_tree(getattr(cache, "state", None)))
-
-
-def _snapshot_cache_state(caches, incoming_tokens: int = 0):
-    return [_snapshot_single_cache(c) for c in caches]
-
-
-def _restore_single_cache(cache, snapshot):
-    if cache is None or snapshot is None:
-        return
-    if isinstance(cache, CacheList):
-        for child, child_snapshot in zip(cache.caches, snapshot[1]):
-            _restore_single_cache(child, child_snapshot)
-        return
-    _, state = snapshot
-    if state is not None:
-        cache.state = _clone_cache_tree(state)
-
-
-def _restore_cache_state(caches, snapshot):
-    for cache, entry in zip(caches, snapshot):
-        if cache is not None and entry is not None:
-            _restore_single_cache(cache, entry)
-
-
-def _iter_leaf_caches(caches):
-    for cache in caches:
-        if cache is None:
-            continue
-        if isinstance(cache, CacheList):
-            yield from _iter_leaf_caches(cache.caches)
-        else:
-            yield cache
 
 
 class LanguageModel(nn.Module):
@@ -625,77 +553,8 @@ class LanguageModel(nn.Module):
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
-        return_hidden = kwargs.pop("return_hidden", False)
-        return_shared_kv = kwargs.pop("return_shared_kv", False)
-        skip_logits = kwargs.pop("skip_logits", False)
-        skip_final_norm = kwargs.pop("skip_final_norm", False)
-        hidden_sink = kwargs.pop("hidden_sink", None)
-        if return_hidden and hidden_sink is None:
-            hidden_sink = []
-
-        out = self.model(
-            inputs,
-            cache,
-            hidden_sink=hidden_sink,
-            skip_final_norm=skip_final_norm,
-        )
-        logits = None if skip_logits else self.lm_head(out)
-        return LanguageModelOutput(
-            logits=logits,
-            hidden_states=hidden_sink,
-            shared_kv_states={} if return_shared_kv else None,
-        )
-
-    def speculative_draft_hidden(self, hidden: mx.array) -> mx.array:
-        return hidden
-
-    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
-        return self.lm_head(self.model.norm(hidden))
-
-    def _speculative_verify(self, inputs: mx.array, cache, sampler=None):
-        incoming = int(inputs.shape[1])
-        snapshot = (
-            _snapshot_cache_state(cache, incoming)
-            if _needs_replay_snapshot_for_cache(cache, incoming)
-            else None
-        )
-        sample_logits = sampler is not None
-        out = self(
-            inputs,
-            cache=cache,
-            return_hidden=True,
-            return_shared_kv=True,
-            skip_logits=not sample_logits,
-            skip_final_norm=not sample_logits,
-        )
-        hidden = out.hidden_states[-1]
-        rollback_state = (snapshot, inputs) if snapshot is not None else None
-        if not sample_logits:
-            return hidden, {}, rollback_state
-        return hidden, {}, rollback_state, sampler(out.logits)
-
-    def speculative_verify_hidden(self, inputs: mx.array, cache):
-        return self._speculative_verify(inputs, cache)
-
-    def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
-        return self._speculative_verify(inputs, cache, sampler)
-
-    def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
-        if isinstance(accepted, int):
-            accepted = mx.array([accepted])
-        max_a = int(accepted.max().item())
-        if gdn_states:
-            snapshot, verify_inputs = gdn_states
-            _restore_cache_state(caches, snapshot)
-            keep = max_a + 1
-            if keep > 0:
-                self(verify_inputs[:, :keep], cache=caches, skip_logits=True)
-            return max_a
-        trim = block_size - (max_a + 1)
-        for cache in _iter_leaf_caches(caches):
-            if trim > 0 and hasattr(cache, "trim"):
-                cache.trim(trim)
-        return max_a
+        out = self.model(inputs, cache)
+        return LanguageModelOutput(logits=self.lm_head(out))
 
     @property
     def layers(self):
