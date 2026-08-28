@@ -531,53 +531,33 @@ def test_speculative_server_hidden_state_concatenates_for_dflash():
     assert result.shape == (1, 1, 8)
 
 
-@pytest.mark.parametrize("draft_kind", ["mtp", "dflash", "eagle3"])
-def test_speculative_prompt_cache_uses_unbatched_cache_for_singleton(
-    monkeypatch, draft_kind
+@pytest.mark.parametrize(
+    "draft_kind,batch_size,left_padding",
+    [
+        ("mtp", 1, [0]),
+        ("mtp", 2, [0, 1]),
+        ("dflash", 1, [0]),
+        ("dflash", 2, [0, 1]),
+        ("eagle3", 1, [0]),
+        (None, 1, [0]),
+    ],
+)
+def test_speculative_prompt_cache_always_uses_supplied_make_cache(
+    draft_kind, batch_size, left_padding
 ):
-    lm = object()
-    unbatched_cache = object()
-    batched_cache = object()
-
-    monkeypatch.setattr(
-        speculative_utils.cache, "make_prompt_cache", lambda target: unbatched_cache
-    )
-
-    result = speculative_utils.make_speculative_prompt_cache(
-        lm,
-        draft_kind=draft_kind,
-        batch_size=1,
-        left_padding=[0],
-        make_cache=lambda *args, **kwargs: batched_cache,
-    )
-
-    assert result is unbatched_cache
-
-
-def test_speculative_prompt_cache_uses_batched_cache_for_batch(monkeypatch):
+    # `make_cache` is what applies --kv-bits. Single-row speculation used to
+    # bypass it for `cache.make_prompt_cache`, which left the KV unquantized
+    # however the server was configured.  That shortcut covered every drafter
+    # routed through here, so each one is checked for the single-row case.
     lm = object()
     batched_cache = object()
-
-    monkeypatch.setattr(
-        speculative_utils.cache, "make_prompt_cache", lambda target: pytest.fail()
-    )
 
     assert (
         speculative_utils.make_speculative_prompt_cache(
             lm,
-            draft_kind="mtp",
-            batch_size=2,
-            left_padding=[0, 1],
-            make_cache=lambda *args, **kwargs: batched_cache,
-        )
-        is batched_cache
-    )
-    assert (
-        speculative_utils.make_speculative_prompt_cache(
-            lm,
-            draft_kind="dflash",
-            batch_size=2,
-            left_padding=[0, 1],
+            draft_kind=draft_kind,
+            batch_size=batch_size,
+            left_padding=left_padding,
             make_cache=lambda *args, **kwargs: batched_cache,
         )
         is batched_cache
