@@ -231,6 +231,53 @@ class TestApplyChatTemplateIntegration:
             }
         ]
 
+    def test_glm5_next_formats_image_and_video_messages(self):
+        """glm5_next uses typed multimodal content so image/video parts survive."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        image = apply_chat_template(
+            None,
+            {"model_type": "glm5_next"},
+            "Describe this image.",
+            return_messages=True,
+            num_images=1,
+        )
+        assert any(c.get("type") == "image" for c in image[0]["content"])
+
+        video = apply_chat_template(
+            None,
+            {"model_type": "glm5_next"},
+            "Describe this video.",
+            return_messages=True,
+            num_images=0,
+            video=["clip.mp4"],
+        )
+        assert any(c.get("type") == "video" for c in video[0]["content"])
+
+    def test_glm5_next_video_not_duplicated_with_system_message(self):
+        """A system turn must not duplicate the single video placeholder."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        messages = [
+            {"role": "system", "content": "Answer directly."},
+            {"role": "user", "content": "Describe this video."},
+        ]
+        result = apply_chat_template(
+            None,
+            {"model_type": "glm5_next"},
+            messages,
+            return_messages=True,
+            num_images=0,
+            video=["clip.mp4"],
+        )
+        videos = sum(
+            1
+            for m in result
+            for c in m["content"]
+            if isinstance(c, dict) and c.get("type") == "video"
+        )
+        assert videos == 1
+
     def test_gemma4_unified_formats_video_messages(self):
         """Gemma 4 Unified should use typed video content for HF templates."""
         from mlx_vlm.prompt_utils import apply_chat_template
