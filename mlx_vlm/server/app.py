@@ -6,6 +6,7 @@ import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
@@ -14,12 +15,19 @@ import mlx.core as mx
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
-from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
+from huggingface_hub.errors import RepositoryNotFoundError
 from starlette.requests import HTTPConnection
 
 from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
+from ..model_registry import (
+    AmbiguousModelIdentifier,
+    ModelRegistryError,
+    ModelResolution,
+    get_model_registry,
+    public_model_id,
+)
 from ..reranker import RerankerKind, reranker_kind
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
@@ -112,6 +120,14 @@ def _model_cache_registry() -> ModelCacheRegistry:
     return registry
 
 
+def _cached_model_id(cache: dict) -> Optional[str]:
+    model_id = cache.get("model_id")
+    if model_id:
+        return model_id
+    model_path = cache.get("model_path")
+    return public_model_id(model_path) if model_path else None
+
+
 def _server_runtime_snapshot() -> dict:
     registry = _model_cache_registry()
     default_cache = registry.for_kind("text_generation")
@@ -140,11 +156,11 @@ def _server_runtime_snapshot() -> dict:
         except Exception:
             audio_queue_depth = 0
     return {
-        "loaded_model": default_cache.get("model_path", None),
+        "loaded_model": _cached_model_id(default_cache),
         "loaded_adapter": default_cache.get("adapter_path", None),
         "loaded_models": {
             group: {
-                "model": cache.get("model_path"),
+                "model": _cached_model_id(cache),
                 "adapter": cache.get("adapter_path"),
                 "model_kind": cache.get("model_kind"),
             }
@@ -332,6 +348,69 @@ def _server_package_attr(name, fallback=None):
     return globals()[name]
 
 
+def _server_model_registry(*, include_hf_cache: bool = True):
+    cache_scanner = _server_package_attr("scan_cache_dir", scan_cache_dir)
+    return get_model_registry(
+        include_hf_cache=include_hf_cache,
+        cache_scanner=cache_scanner,
+    )
+
+
+def _resolve_model_reference(reference: str):
+    for cache in _model_cache_registry().values():
+        if _cached_model_id(cache) != reference:
+            continue
+        location = cache.get("model_path")
+        if location:
+            local_path = Path(location).expanduser()
+            return ModelResolution(
+                id=reference,
+                load_target=str(location),
+                path=local_path if local_path.is_absolute() else None,
+            )
+    try:
+        return _server_model_registry(include_hf_cache=False).resolve(reference)
+    except AmbiguousModelIdentifier as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ModelRegistryError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+def _public_model_error_detail(
+    error: Exception, model_id: str, *private_references: str
+) -> str:
+    reason = str(getattr(error, "detail", None) or error)
+    for private_reference in sorted(set(private_references), key=len, reverse=True):
+        if private_reference != model_id:
+            reason = reason.replace(private_reference, model_id)
+    return reason
+
+
+def _model_load_http_error(
+    status_code: int,
+    message: str,
+    error: Exception,
+    model_id: str,
+    model_path: str,
+) -> HTTPException:
+    detail = _public_model_error_detail(error, model_id, model_path)
+    return HTTPException(status_code=status_code, detail=f"{message}: {detail}")
+
+
+def _public_model_failure(reference: str, error: Exception) -> tuple[str, str]:
+    model_id = public_model_id(reference)
+    private_references = {reference}
+    try:
+        resolution = _resolve_model_reference(reference)
+    except HTTPException:
+        pass
+    else:
+        model_id = resolution.id
+        private_references.add(resolution.load_target)
+
+    return model_id, _public_model_error_detail(error, model_id, *private_references)
+
+
 def __getattr__(name):
     legacy_runtime_attrs = {
         "model_cache": "model_cache",
@@ -407,11 +486,11 @@ async def lifespan(app):
                 model_kind=model_kind,
             )
         except Exception as e:
-            reason = getattr(e, "detail", None) or str(e)
+            model_id, reason = _public_model_failure(preload_model_path, e)
             runtime.preload_failures[model_kind] = {
-                "model": preload_model_path,
+                "model": model_id,
                 "label": label,
-                "error": str(reason),
+                "error": reason,
             }
             logger.error(
                 "Failed to pre-load %s %r: %s. Continuing without it.",
@@ -522,6 +601,9 @@ def get_cached_model(
     Factory function to get or load the appropriate model resources from cache or by loading.
     Also creates/updates the ResponseGenerator for continuous batching.
     """
+    resolution = _resolve_model_reference(model_path)
+    model_id = resolution.id
+    model_path = resolution.load_target
     load_as_edit = model_kind == "image_edit"
     load_as_audio = _audio_model_kind(model_kind)
     load_as_embedding = model_kind == "embedding"
@@ -567,7 +649,8 @@ def get_cached_model(
         if cache_group == "text_generation":
             runtime.response_generator = cached_cache.get("response_generator")
             runtime.apc_manager = cached_cache.get("apc_manager")
-        logger.debug("Using cached model: %s (adapter=%s)", model_path, adapter_path)
+        cached_cache["model_id"] = model_id
+        logger.debug("Using cached model: %s (adapter=%s)", model_id, adapter_path)
         return (
             cached_cache["model"],
             cached_cache["processor"],
@@ -585,16 +668,16 @@ def get_cached_model(
                 status_code=400,
                 detail="Adapters are not supported for image edit models.",
             )
-        logger.info("Loading image edit model: %s", model_path)
+        logger.info("Loading image edit model: %s", model_id)
         try:
             model = load_image_edit_model(model_path)
         except ValueError as e:
-            raise HTTPException(
-                status_code=400, detail=f"Unsupported image edit model: {e}"
+            raise _model_load_http_error(
+                400, "Unsupported image edit model", e, model_id, model_path
             ) from e
         except Exception as e:
-            raise HTTPException(
-                status_code=500, detail=f"Failed to load image edit model: {e}"
+            raise _model_load_http_error(
+                500, "Failed to load image edit model", e, model_id, model_path
             ) from e
         config = SimpleNamespace(
             model_type=getattr(model, "family", "image_edit"),
@@ -602,6 +685,7 @@ def get_cached_model(
         )
         cache = {
             "cache_key": cache_key,
+            "model_id": model_id,
             "model_path": model_path,
             "adapter_path": None,
             "model": model,
@@ -619,16 +703,16 @@ def get_cached_model(
                 status_code=400,
                 detail="Adapters are not supported for image generation models.",
             )
-        logger.info("Loading image generation model: %s", model_path)
+        logger.info("Loading image generation model: %s", model_id)
         try:
             model = load_image_generation_model(model_path)
         except ValueError as e:
-            raise HTTPException(
-                status_code=400, detail=f"Unsupported image generation model: {e}"
+            raise _model_load_http_error(
+                400, "Unsupported image generation model", e, model_id, model_path
             ) from e
         except Exception as e:
-            raise HTTPException(
-                status_code=500, detail=f"Failed to load image generation model: {e}"
+            raise _model_load_http_error(
+                500, "Failed to load image generation model", e, model_id, model_path
             ) from e
         config = SimpleNamespace(
             model_type=getattr(model, "family", "image_generation"),
@@ -636,6 +720,7 @@ def get_cached_model(
         )
         cache = {
             "cache_key": cache_key,
+            "model_id": model_id,
             "model_path": model_path,
             "adapter_path": None,
             "model": model,
@@ -653,7 +738,7 @@ def get_cached_model(
                 status_code=400,
                 detail="Adapters are not supported for audio models.",
             )
-        logger.info("Loading audio model: %s", model_path)
+        logger.info("Loading audio model: %s", model_id)
         try:
             model = _server_package_attr("load_audio_model", load_audio_model)(
                 model_path
@@ -662,17 +747,17 @@ def get_cached_model(
             raise HTTPException(
                 status_code=404,
                 detail=(
-                    f"Model not found: {model_path!r} is not a known "
+                    f"Model not found: {model_id!r} is not a known "
                     "Hugging Face repo or local path"
                 ),
             ) from e
         except (FileNotFoundError, ValueError) as e:
-            raise HTTPException(
-                status_code=400, detail=f"Unsupported audio model: {e}"
+            raise _model_load_http_error(
+                400, "Unsupported audio model", e, model_id, model_path
             ) from e
         except Exception as e:
-            raise HTTPException(
-                status_code=500, detail=f"Failed to load audio model: {e}"
+            raise _model_load_http_error(
+                500, "Failed to load audio model", e, model_id, model_path
             ) from e
         config = SimpleNamespace(
             model_type=getattr(model, "model_type", "audio"),
@@ -680,6 +765,7 @@ def get_cached_model(
         )
         cache = {
             "cache_key": cache_key,
+            "model_id": model_id,
             "model_path": model_path,
             "adapter_path": None,
             "model": model,
@@ -697,7 +783,7 @@ def get_cached_model(
                 status_code=400,
                 detail="Adapters are not supported for embedding models.",
             )
-        logger.info("Loading embedding model: %s", model_path)
+        logger.info("Loading embedding model: %s", model_id)
         from ..embedding_loader import load_embedding_model
         from ..models.pooling import read_pooling_config
         from ..utils import get_model_path, load_processor
@@ -710,17 +796,17 @@ def get_cached_model(
             raise HTTPException(
                 status_code=404,
                 detail=(
-                    f"Model not found: {model_path!r} is not a known "
+                    f"Model not found: {model_id!r} is not a known "
                     "Hugging Face repo or local path"
                 ),
             ) from e
         except (FileNotFoundError, ValueError) as e:
-            raise HTTPException(
-                status_code=400, detail=f"Unsupported embedding model: {e}"
+            raise _model_load_http_error(
+                400, "Unsupported embedding model", e, model_id, model_path
             ) from e
         except Exception as e:
-            raise HTTPException(
-                status_code=500, detail=f"Failed to load embedding model: {e}"
+            raise _model_load_http_error(
+                500, "Failed to load embedding model", e, model_id, model_path
             ) from e
         model.pooling_config = read_pooling_config(model_dir)
         config = SimpleNamespace(
@@ -729,6 +815,7 @@ def get_cached_model(
         )
         cache = {
             "cache_key": cache_key,
+            "model_id": model_id,
             "model_path": model_path,
             "adapter_path": None,
             "model": model,
@@ -859,9 +946,18 @@ def get_cached_model(
     )
     try:
         model, processor, config = response_generator.wait_until_ready()
-    except Exception:
+    except Exception as error:
         response_generator.stop_and_join()
         vision_cache.clear()
+        detail = _public_model_error_detail(error, model_id, model_path)
+        if isinstance(error, HTTPException):
+            raise HTTPException(
+                status_code=error.status_code,
+                detail=detail,
+                headers=error.headers,
+            ) from error
+        if detail != str(error):
+            raise RuntimeError(detail) from error
         raise
 
     # Dry-run APC layout when the shared pool is enabled (log-only; never blocks serve).
@@ -873,6 +969,7 @@ def get_cached_model(
 
     cache = {
         "cache_key": cache_key,
+        "model_id": model_id,
         "model_path": model_path,
         "adapter_path": adapter_path,
         "model": model,
@@ -971,39 +1068,23 @@ def models_endpoint():
     Return list of locally downloaded MLX models.
     """
 
-    required_files = {"config.json", "tokenizer_config.json"}
-
-    def probably_mlx_lm(repo):
-        if repo.repo_type != "model":
-            return False
-        if "main" not in repo.refs:
-            return False
-        file_names = {f.file_path.name for f in repo.refs["main"].files}
-        has_weights = "model.safetensors.index.json" in file_names or any(
-            file_name.endswith(".safetensors") for file_name in file_names
-        )
-        return required_files.issubset(file_names) and has_weights
-
-    # Scan the cache directory for downloaded mlx models when it exists.
     try:
-        hf_cache_info = _server_package_attr("scan_cache_dir", scan_cache_dir)()
-        downloaded_models = [
-            repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
-        ]
-    except CacheNotFound:
-        downloaded_models = []
+        entries = _server_model_registry().entries()
+    except AmbiguousModelIdentifier as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ModelRegistryError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
-    # Create a list of available models
     models = [
-        {"id": repo.repo_id, "object": "model", "created": int(repo.last_modified)}
-        for repo in downloaded_models
+        {"id": entry.id, "object": "model", "created": entry.created}
+        for entry in entries
     ]
     loaded_models = {
-        cache.get("model_path")
+        _cached_model_id(cache)
         for cache in _model_cache_registry().values()
-        if cache.get("model_path")
+        if _cached_model_id(cache)
     }
-    loaded_model = _model_cache_registry().get("model_path")
+    loaded_model = _cached_model_id(_model_cache_registry().for_kind())
     if loaded_model:
         loaded_models.add(loaded_model)
     for loaded in sorted(loaded_models):

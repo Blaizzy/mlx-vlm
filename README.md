@@ -479,6 +479,12 @@ mlx_vlm.server --port 8080
 # Preload a model at startup (Hugging Face repo or local path)
 mlx_vlm.server --model <hf_repo_or_local_path>
 
+# Discover models outside the Hugging Face cache
+mlx_vlm.server --model-path ~/Models --model-path /Volumes/Models
+
+# Give a local model a stable API identifier
+mlx_vlm.server --model-alias local-qwen=/Volumes/Models/Qwen3-VL-4bit
+
 # Preload separate model kinds at startup
 mlx_vlm.server --model <language_model> \
   --image-model <image_generation_model> \
@@ -508,6 +514,8 @@ mlx_vlm.server --api-key <secret-token>
 #### Server Options
 
 - `--model`: Preload a language model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
+- `--model-path`: Scan a directory for local models; repeat the option for multiple roots
+- `--model-alias`: Assign a stable public identifier to a local model with `ID=PATH`; repeat the option for multiple aliases
 - `--image-model`: Preload an image generation model at server startup
 - `--tts-model`: Preload a text-to-speech model at server startup
 - `--stt-model`: Preload a speech-to-text model at server startup
@@ -534,6 +542,19 @@ mlx_vlm.server --api-key <secret-token>
 - `--log-progress-interval`: Decoded tokens between progress log messages; `0` disables periodic decode progress (default: `10`)
 - `--api-key`: Bearer token required for inference, model discovery, and management endpoints
 - `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
+
+#### Local Model Discovery
+
+The server discovers valid model directories at a configured root, one level below it, or under an organization/model layout. Discovered models use root-relative IDs such as `local/Qwen3-VL-4bit` or `local/org/model`; local filesystem paths are not returned by `/v1/models`, `/health`, or `/metrics`.
+
+Use `--model-alias ID=PATH` when an explicit stable name is preferable or when two search roots contain the same relative model ID. Aliases replace automatically derived IDs in model listings. Requests may still use an exact local path for backward compatibility.
+
+The equivalent environment variables are:
+
+- `MLX_VLM_MODEL_PATHS`: search roots separated by the platform path separator (`:` on macOS and Linux)
+- `MLX_VLM_MODEL_ALIASES`: a JSON object mapping public IDs to local paths, for example `{"local-qwen":"/Volumes/Models/Qwen3-VL-4bit"}`
+
+The model listing is rescanned on each request, so adding or removing a model does not require restarting the server. Search roots follow symlinks, deduplicate canonical paths, and reject ambiguous public IDs until explicit aliases are configured.
 
 At `INFO`, the server logs request start/completion, chunked-prefill progress,
 time to first token, periodic decode throughput, and the final token counts. Set

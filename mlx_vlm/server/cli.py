@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+from pathlib import Path
 
 import uvicorn
 
@@ -9,6 +10,15 @@ from ..generate import (
     DEFAULT_KV_QUANT_SCHEME,
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
+)
+from ..model_registry import (
+    MODEL_ALIASES_ENV,
+    MODEL_PATHS_ENV,
+    InvalidModelRegistryConfiguration,
+    encode_model_aliases,
+    parse_model_alias,
+    parse_model_aliases,
+    parse_model_paths,
 )
 from .generation import (
     DEFAULT_ENABLE_THINKING,
@@ -23,6 +33,36 @@ DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 
 logger = logging.getLogger("mlx_vlm.server")
+
+
+def _configure_model_registry(args, parser):
+    try:
+        model_paths = parse_model_paths(os.environ.get(MODEL_PATHS_ENV))
+        for raw_path in args.model_path:
+            if not raw_path.strip():
+                raise InvalidModelRegistryConfiguration(
+                    "Model search paths cannot be empty"
+                )
+            path = Path(raw_path).expanduser().resolve()
+            if path not in model_paths:
+                model_paths.append(path)
+
+        aliases = parse_model_aliases(os.environ.get(MODEL_ALIASES_ENV))
+        for raw_alias in args.model_alias:
+            model_id, path = parse_model_alias(raw_alias)
+            existing = aliases.get(model_id)
+            if existing is not None and existing != path:
+                raise InvalidModelRegistryConfiguration(
+                    f"Model alias {model_id!r} is configured more than once"
+                )
+            aliases[model_id] = path
+    except InvalidModelRegistryConfiguration as error:
+        parser.error(str(error))
+
+    if model_paths:
+        os.environ[MODEL_PATHS_ENV] = os.pathsep.join(map(str, model_paths))
+    if aliases:
+        os.environ[MODEL_ALIASES_ENV] = encode_model_aliases(aliases)
 
 
 def main():
@@ -43,6 +83,26 @@ def main():
         "--trust-remote-code",
         action="store_true",
         help="Trust remote code when loading models from Hugging Face Hub.",
+    )
+    parser.add_argument(
+        "--model-path",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "Directory to scan for local models. Repeat to add multiple roots "
+            f"(also: {MODEL_PATHS_ENV}, separated by {os.pathsep!r})."
+        ),
+    )
+    parser.add_argument(
+        "--model-alias",
+        action="append",
+        default=[],
+        metavar="ID=PATH",
+        help=(
+            "Stable public ID for a local model path. Repeat to add multiple "
+            f"aliases (also: {MODEL_ALIASES_ENV} as a JSON object)."
+        ),
     )
     parser.add_argument(
         "--model",
@@ -274,6 +334,7 @@ def main():
         help="Set the logging level (default: INFO).",
     )
     args = parser.parse_args()
+    _configure_model_registry(args, parser)
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
     if args.model:

@@ -36,6 +36,7 @@ from ..generate.diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
+from ..model_registry import public_model_id
 from ..sample_utils import (
     apply_top_k,
     make_logits_processors,
@@ -465,6 +466,7 @@ class ServerMetricsStore:
         self._last_error: Optional[dict] = None
 
     def begin_request(self, *, endpoint: str, model: str, stream: bool):
+        model = public_model_id(model)
         with self._lock:
             self._requests_started += 1
             self._in_flight += 1
@@ -481,6 +483,8 @@ class ServerMetricsStore:
 
     def record_success(self, envelope: dict):
         payload = dict(envelope)
+        if payload.get("model"):
+            payload["model"] = public_model_id(payload["model"])
         with self._lock:
             self._requests_completed += 1
             self._in_flight = max(0, self._in_flight - 1)
@@ -511,6 +515,10 @@ class ServerMetricsStore:
         )
 
     def record_failure(self, *, endpoint: str, model: str, stream: bool, error: str):
+        public_model = public_model_id(model)
+        if public_model != model:
+            error = error.replace(model, public_model)
+        model = public_model
         with self._lock:
             self._requests_failed += 1
             self._in_flight = max(0, self._in_flight - 1)
@@ -640,7 +648,7 @@ def _build_metrics_envelope(
     return {
         "timestamp_unix": time.time(),
         "endpoint": endpoint,
-        "model": model,
+        "model": public_model_id(model),
         "stream": bool(stream),
         "backend": backend,
         "prompt_tokens": int(prompt_tokens),
