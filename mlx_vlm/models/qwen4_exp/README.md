@@ -131,8 +131,9 @@ python -m mlx_vlm.split_mtp \
   tensors. `mlx_vlm.split_mtp` extracts them into the standalone draft model
   used by speculative decoding.
 - QSA maintains an auxiliary index-key cache in addition to the normal KV
-  cache. Single-request generation, chunked prefill, and uniform KV-cache
-  quantization are supported.
-- The current QSA cache path is not yet wired into continuous batching.
+  cache. Single-request generation, chunked prefill, continuous batching, and
+  uniform KV-cache quantization for single requests are supported.
+- KV-cache quantization is unsupported with continuous QSA batching;
+  requesting both raises an explicit error to preserve the QSA indexer state.
 - Long image or video prompts may benefit from a smaller
   `--prefill-step-size` to reduce peak memory.
