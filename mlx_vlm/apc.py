@@ -3136,14 +3136,24 @@ class APCManager:
         prompt_cache: Sequence[Any],
         *,
         extra_hash: int = 0,
+        take_ownership: bool = False,
     ) -> bool:
-        """Store a full prompt-cache snapshot for exact-prefix reuse."""
+        """Store a full prompt-cache snapshot for exact-prefix reuse.
+
+        By default the manager defensively clones the supplied cache. Callers
+        may set *take_ownership* only when every entry is already a detached
+        snapshot that they will not access or mutate after this call.
+        """
         if len(token_ids) < self.exact_cache_min_tokens:
             return False
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
             return False
         token_tuple = tuple(int(t) for t in token_ids)
-        copied = _clone_prompt_cache_for_apc(prompt_cache)
+        copied = (
+            list(prompt_cache)
+            if take_ownership
+            else _clone_prompt_cache_for_apc(prompt_cache)
+        )
         if copied is None:
             types = [type(c).__name__ for c in prompt_cache]
             logger.warning(
@@ -3847,11 +3857,17 @@ def _collect_mx_arrays(x: Any, out: List[mx.array]) -> None:
 def _merge_exact_cache_entries(
     entries: Sequence[Any],
     prefix_lens: Sequence[int],
+    *,
+    consume_sources: bool = False,
 ) -> Any:
     """Merge single-row exact snapshots via the registered cache adapter."""
     from .apc_adapters import merge_cache_entries
 
-    return merge_cache_entries(entries, prefix_lens)
+    return merge_cache_entries(
+        entries,
+        prefix_lens,
+        consume_sources=consume_sources,
+    )
 
 
 def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) -> Any:
@@ -3876,6 +3892,33 @@ def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) -> 
     )
 
 
+def _align_exact_batch_cache_to_kv_policy(
+    cache: Any,
+    kv_quant_config: dict,
+    *,
+    layer_idx: int,
+    num_layers: int,
+) -> Any:
+    """Align one exact-restored layer with the live KV policy."""
+    from .models.cache import BatchKVCache, should_quantize_kv_layer
+
+    if not should_quantize_kv_layer(layer_idx, num_layers) or not isinstance(
+        cache, BatchKVCache
+    ):
+        return cache
+    left_padding = [int(x) for x in cache.left_padding.tolist()]
+    if cache.keys is None or int(cache._idx) == 0:
+        return _empty_quant_batch_cache(left_padding, kv_quant_config)
+    return _fill_batch_layer_cache(
+        cache.keys[..., : int(cache._idx), :],
+        cache.values[..., : int(cache._idx), :],
+        left_padding=left_padding,
+        offset=[int(x) for x in cache.offset.tolist()],
+        quantize=True,
+        kv_quant_config=kv_quant_config,
+    )
+
+
 def _align_exact_batch_caches_to_kv_policy(
     caches: List[Any],
     kv_quant_config: dict,
@@ -3888,46 +3931,32 @@ def _align_exact_batch_caches_to_kv_policy(
     marks, float last layer when n > 2). Hybrid non-KV types
     (``ArraysCache``, ``BatchRotatingKVCache``, …) are left unchanged.
     """
-    from .models.cache import BatchKVCache, should_quantize_kv_layer
-
-    n = len(caches)
-    out: List[Any] = []
-    for layer_idx, c in enumerate(caches):
-        quantize = should_quantize_kv_layer(layer_idx, n)
-        if not quantize or not isinstance(c, BatchKVCache):
-            out.append(c)
-            continue
-        left_padding = [int(x) for x in c.left_padding.tolist()]
-        if c.keys is None or int(c._idx) == 0:
-            out.append(_empty_quant_batch_cache(left_padding, kv_quant_config))
-            continue
-        merged_k = c.keys[..., : int(c._idx), :]
-        merged_v = c.values[..., : int(c._idx), :]
-        offset = [int(x) for x in c.offset.tolist()]
-        out.append(
-            _fill_batch_layer_cache(
-                merged_k,
-                merged_v,
-                left_padding=left_padding,
-                offset=offset,
-                quantize=True,
-                kv_quant_config=kv_quant_config,
-            )
+    return [
+        _align_exact_batch_cache_to_kv_policy(
+            cache,
+            kv_quant_config,
+            layer_idx=layer_idx,
+            num_layers=len(caches),
         )
-    return out
+        for layer_idx, cache in enumerate(caches)
+    ]
 
 
 def make_warm_batch_exact_cache_multi(
     row_caches: Sequence[Sequence[Any]],
     prefix_lens: Sequence[int],
     kv_quant_config: Optional[dict] = None,
+    *,
+    consume_sources: bool = False,
 ) -> Tuple[Optional[List[Any]], int]:
     """Merge single-row exact-cache snapshots into batch-aware caches.
 
     When *kv_quant_config* is provided, full-attention ``BatchKVCache`` layers
     are re-quantized to match live ``_make_cache`` via
     ``should_quantize_kv_layer`` (last layer stays float when n > 2). Hybrid
-    non-KV entries are unchanged. On-disk exact snapshots remain float.
+    non-KV entries are unchanged. On-disk exact snapshots remain float. When
+    *consume_sources* is true, each row must be a list; its entries are cleared
+    as their materialized batch layers take ownership of the restored state.
     """
 
     if not row_caches:
@@ -3937,25 +3966,45 @@ def make_warm_batch_exact_cache_multi(
     num_entries = len(row_caches[0])
     if any(len(row) != num_entries for row in row_caches):
         return None, 0
+    if consume_sources and any(not isinstance(row, list) for row in row_caches):
+        raise TypeError("consume_sources requires mutable cache-row lists")
 
     out: List[Any] = []
     for entry_idx in range(num_entries):
         merged = _merge_exact_cache_entries(
             [row[entry_idx] for row in row_caches],
             prefix_lens,
+            consume_sources=consume_sources,
         )
         if merged is None:
             return None, 0
+        if consume_sources and kv_quant_config is not None:
+            merged = _align_exact_batch_cache_to_kv_policy(
+                merged,
+                kv_quant_config,
+                layer_idx=entry_idx,
+                num_layers=num_entries,
+            )
         out.append(merged)
+        if consume_sources:
+            eval_targets: List[mx.array] = []
+            _collect_mx_arrays(merged.state, eval_targets)
+            if eval_targets:
+                mx.eval(eval_targets)
+            for row in row_caches:
+                if not isinstance(row, list):  # Guarded above; narrows the type.
+                    raise TypeError("consume_sources requires mutable cache-row lists")
+                row[entry_idx] = None
+            mx.clear_cache()
 
-    if kv_quant_config is not None:
-        out = _align_exact_batch_caches_to_kv_policy(out, kv_quant_config)
-
-    eval_targets: List[mx.array] = []
-    for c in out:
-        _collect_mx_arrays(c.state, eval_targets)
-    if eval_targets:
-        mx.eval(eval_targets)
+    if not consume_sources:
+        if kv_quant_config is not None:
+            out = _align_exact_batch_caches_to_kv_policy(out, kv_quant_config)
+        eval_targets: List[mx.array] = []
+        for cache in out:
+            _collect_mx_arrays(cache.state, eval_targets)
+        if eval_targets:
+            mx.eval(eval_targets)
     return out, max(prefix_lens) if prefix_lens else 0
 
 

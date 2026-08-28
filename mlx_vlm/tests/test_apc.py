@@ -305,6 +305,95 @@ def test_exact_batch_cache_merge_and_extract_supports_arrays_and_kv():
     assert extracted[1].offset == 12
 
 
+def test_single_row_exact_merge_consumes_source_and_preserves_capacity():
+    from mlx_vlm.models.cache import BatchKVCache, KVCache
+
+    prefix_len = 40
+    reserved_capacity = 1024
+    cache = KVCache()
+    cache.keys = mx.zeros((1, 1, reserved_capacity, 2), dtype=mx.float16)
+    cache.values = mx.ones((1, 1, reserved_capacity, 2), dtype=mx.float16)
+    cache.offset = prefix_len
+    original_keys = cache.keys
+    original_values = cache.values
+
+    rows = [[cache]]
+    warm, matched = make_warm_batch_exact_cache_multi(
+        rows,
+        [prefix_len],
+        consume_sources=True,
+    )
+
+    assert matched == prefix_len
+    assert warm is not None
+    assert isinstance(warm[0], BatchKVCache)
+    assert warm[0]._idx == prefix_len
+    assert int(warm[0].offset[0].item()) == prefix_len
+    assert warm[0].keys is original_keys
+    assert warm[0].values is original_values
+    assert warm[0].keys.shape[2] == reserved_capacity
+    assert warm[0].state[0].shape[2] == prefix_len
+    assert rows[0][0] is None
+
+    warm[0].update_and_fetch(
+        mx.full((1, 1, 8, 2), 2, dtype=mx.float16),
+        mx.full((1, 1, 8, 2), 3, dtype=mx.float16),
+    )
+    assert warm[0].keys is original_keys
+    assert warm[0].values is original_values
+    assert warm[0]._idx == prefix_len + 8
+
+
+def test_single_row_exact_merge_without_consuming_keeps_copy_semantics():
+    from mlx_vlm.models.cache import BatchKVCache, KVCache
+
+    prefix_len = 40
+    cache = KVCache()
+    cache.keys = mx.zeros((1, 1, 64, 2), dtype=mx.float16)
+    cache.values = mx.ones((1, 1, 64, 2), dtype=mx.float16)
+    cache.offset = prefix_len
+    original_keys = cache.keys
+    original_values = cache.values
+
+    rows = [[cache]]
+    warm, matched = make_warm_batch_exact_cache_multi(rows, [prefix_len])
+
+    assert matched == prefix_len
+    assert warm is not None
+    assert isinstance(warm[0], BatchKVCache)
+    assert warm[0].keys is not original_keys
+    assert warm[0].values is not original_values
+    assert rows[0][0] is cache
+
+
+def test_exact_merge_releases_each_source_layer_before_clearing(monkeypatch):
+    from mlx_vlm.models.cache import KVCache
+
+    row = []
+    for value in (1, 2):
+        cache = KVCache()
+        cache.keys = mx.full((1, 1, 4, 2), value, dtype=mx.float16)
+        cache.values = mx.full((1, 1, 4, 2), value + 1, dtype=mx.float16)
+        cache.offset = 4
+        row.append(cache)
+    rows = [row]
+    released_at_clear = []
+    clear_cache = lambda: released_at_clear.append(
+        tuple(cache is None for cache in rows[0])
+    )
+    monkeypatch.setattr(mx, "clear_cache", clear_cache)
+
+    warm, matched = make_warm_batch_exact_cache_multi(
+        rows,
+        [4],
+        consume_sources=True,
+    )
+
+    assert warm is not None
+    assert matched == 4
+    assert released_at_clear == [(True, False), (True, True)]
+
+
 def test_single_row_prompt_batch_exact_checkpoint_stores_without_extract():
     from mlx_vlm.generate.ar import PromptProcessingBatch
     from mlx_vlm.models.cache import ArraysCache, KVCache, RotatingKVCache
@@ -346,6 +435,43 @@ def test_single_row_prompt_batch_exact_checkpoint_stores_without_extract():
 
     assert batch._apc_meta[0]["checkpoint_done"] is True
     assert batch._apc_manager.stats_snapshot()["exact_stores"] == 1
+
+
+def test_exact_checkpoint_with_coordinator_stores_live_cache_once(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from mlx_vlm.generate.ar import PromptProcessingBatch
+
+    batch = PromptProcessingBatch.__new__(PromptProcessingBatch)
+    batch.prompt_cache = [object()]
+    batch._apc_manager = object()
+    batch._apc_coordinator = MagicMock()
+    batch._apc_meta = [
+        {
+            "full_input_ids": list(range(32)),
+            "prefix_len": 0,
+            "checkpoint_len": 32,
+            "extra_hash": 9,
+        }
+    ]
+    monkeypatch.setattr(batch, "_row_real_tokens_processed", lambda index: 32)
+    monkeypatch.setattr(
+        batch,
+        "_apc_prompt_cache_for_store",
+        lambda index: (_ for _ in ()).throw(
+            AssertionError("the coordinator must create the only snapshot")
+        ),
+    )
+
+    batch._store_apc_exact_checkpoints()
+
+    batch._apc_coordinator.store_checkpoint.assert_called_once_with(
+        list(range(32)),
+        batch.prompt_cache,
+        extra_hash=9,
+        batch_idx=0,
+    )
+    assert batch._apc_meta[0]["checkpoint_done"] is True
 
 
 def test_apc_max_pool_tensors_keeps_disk_persistence(tmp_path, monkeypatch):
@@ -721,6 +847,47 @@ def test_exact_cache_supports_rotating_and_chunked_kv_cache():
     assert warm[2].start_position == chunked.start_position
     _assert_allclose(warm[2].keys, chunked.keys)
     _assert_allclose(warm[2].values, chunked.values)
+
+
+def test_exact_cache_store_can_take_ownership_without_cloning(monkeypatch):
+    from mlx_vlm.models.cache import KVCache
+
+    token_ids = list(range(32))
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 2))
+    kv.values = mx.ones((1, 1, len(token_ids), 2)) * 2
+    kv.offset = len(token_ids)
+    manager = APCManager(num_blocks=1, block_size=16)
+
+    def fail_clone(*args, **kwargs):
+        raise AssertionError("an owned snapshot must not be cloned again")
+
+    monkeypatch.setattr(apc_module, "_clone_prompt_cache_for_apc", fail_clone)
+
+    assert manager.store_exact_cache(
+        token_ids,
+        [kv],
+        take_ownership=True,
+    )
+    stored = next(iter(manager._exact_cache.values())).prompt_cache
+    assert stored[0] is kv
+
+
+def test_exact_cache_store_clones_by_default():
+    from mlx_vlm.models.cache import KVCache
+
+    token_ids = list(range(32))
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 2))
+    kv.values = mx.ones((1, 1, len(token_ids), 2)) * 2
+    kv.offset = len(token_ids)
+    manager = APCManager(num_blocks=1, block_size=16)
+
+    assert manager.store_exact_cache(token_ids, [kv])
+    stored = next(iter(manager._exact_cache.values())).prompt_cache
+    assert stored[0] is not kv
+    assert stored[0].keys is not kv.keys
+    assert stored[0].values is not kv.values
 
 
 def test_exact_cache_disk_restore_rebuilds_index(tmp_path, monkeypatch):

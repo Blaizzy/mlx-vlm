@@ -109,13 +109,18 @@ class APCCoordinator:
 
         if self.is_checkpoint:
             row_caches = [
-                pick["warm_cache"] if pick is not None else self.fresh_cache()
+                (
+                    list(pick.pop("warm_cache"))
+                    if pick is not None
+                    else self.fresh_cache()
+                )
                 for pick in picks
             ]
             return make_warm_batch_exact_cache_multi(
                 row_caches,
                 prefix_lens,
                 kv_quant_config=kv_quant_config,
+                consume_sources=True,
             )
         return make_warm_batch_kv_cache_multi(
             list(picks),
@@ -157,7 +162,10 @@ class APCCoordinator:
         if snapshot is None:
             return False
         return self.manager.store_exact_cache(
-            token_ids, snapshot, extra_hash=extra_hash
+            token_ids,
+            snapshot,
+            extra_hash=extra_hash,
+            take_ownership=True,
         )
 
     def commit(
