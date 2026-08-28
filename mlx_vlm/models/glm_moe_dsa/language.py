@@ -13,6 +13,7 @@ from ..deepseek_v32.language import (
     DeepseekV32Attention,
     DeepseekV32DecoderLayer,
     DeepseekV32Model,
+    DeepseekV32MoE,
 )
 from ..deepseek_v32.language import Model as DSV32Model
 from .config import ModelConfig
@@ -22,9 +23,17 @@ _SPECULATIVE_VERIFIER = GlmMoeDsaExactSpeculativeVerifier()
 
 
 class GlmMoeDsaAttention(DeepseekV32Attention):
-    def __init__(self, config: ModelConfig, layer_idx: int):
+    def __init__(
+        self,
+        config: ModelConfig,
+        layer_idx: int,
+        *,
+        force_full_indexer: bool = False,
+    ):
         super().__init__(config)
-        self.skip_topk = config.indexer_types[layer_idx] == "shared"
+        self.skip_topk = (
+            not force_full_indexer and config.indexer_types[layer_idx] == "shared"
+        )
         if self.skip_topk:
             self.indexer = None
 
@@ -182,6 +191,39 @@ class GlmMoeDsaModel(DeepseekV32Model):
         return self.norm(h)
 
 
+class GlmMoeDsaMTP(nn.Module):
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        hidden_size = config.hidden_size
+        self.enorm = nn.RMSNorm(hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = nn.RMSNorm(hidden_size, eps=config.rms_norm_eps)
+        self.eh_proj = nn.Linear(2 * hidden_size, hidden_size, bias=False)
+        self.input_layernorm = nn.RMSNorm(hidden_size, eps=config.rms_norm_eps)
+        self.self_attn = GlmMoeDsaAttention(
+            config,
+            config.num_hidden_layers,
+            force_full_indexer=True,
+        )
+        self.post_attention_layernorm = nn.RMSNorm(hidden_size, eps=config.rms_norm_eps)
+        self.mlp = DeepseekV32MoE(config)
+        self.shared_head_norm = nn.RMSNorm(hidden_size, eps=config.rms_norm_eps)
+
+    def __call__(
+        self,
+        hidden: mx.array,
+        next_embed: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        x = self.eh_proj(
+            mx.concatenate([self.enorm(next_embed), self.hnorm(hidden)], axis=-1)
+        )
+        attention, _ = self.self_attn(self.input_layernorm(x), mask, cache)
+        x = x + attention
+        x = x + self.mlp(self.post_attention_layernorm(x))
+        return self.shared_head_norm(x)
+
+
 class LanguageModel(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -284,7 +326,7 @@ class LanguageModel(nn.Module):
         else:
             accepted_values = [int(value) for value in accepted]
         if len(set(accepted_values)) != 1:
-            raise ValueError("glm_moe_dsa requires uniform batch acceptance.")
+            raise ValueError("glm_moe_dsa MTP requires uniform batch acceptance.")
 
         max_accepted = accepted_values[0]
         trim = int(block_size) - (max_accepted + 1)

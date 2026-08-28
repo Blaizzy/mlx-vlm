@@ -2899,6 +2899,47 @@ class TestModels(unittest.TestCase):
             mx.eval(verifier_logits, reference_logits)
             self.assertTrue(mx.all(verifier_logits == reference_logits).item())
 
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.models.glm_moe_dsa.language import GlmMoeDsaMTP
+        from mlx_vlm.speculative.drafters.glm_moe_dsa_mtp import GlmMoeDsaMTPDraftModel
+        from mlx_vlm.speculative.drafters.glm_moe_dsa_mtp import (
+            ModelConfig as GlmMoeDsaMTPConfig,
+        )
+
+        mtp = GlmMoeDsaMTP(config)
+        mtp_out = mtp(
+            target_out.hidden_states[-1],
+            target.model.embed_tokens(tokens),
+            cache=CacheList(KVCache(), KVCache()),
+        )
+        mx.eval(mtp_out)
+        self.assertIsNotNone(mtp.self_attn.indexer)
+        self.assertEqual(mtp_out.shape, (1, 3, config.hidden_size))
+
+        drafter = GlmMoeDsaMTPDraftModel(GlmMoeDsaMTPConfig(text_config=config))
+        draft_cache = drafter.reset(target)
+
+        def greedy(logits):
+            return mx.argmax(logits, axis=-1)
+
+        drafter.prefill_from_target_hidden(
+            tokens,
+            target_out.hidden_states[-1],
+            bonus_token=4,
+            sampler=greedy,
+            greedy=True,
+        )
+        drafted_tokens = drafter.draft_block(
+            last_bonus=4,
+            hidden=target_out.hidden_states[-1][:, -1:, :],
+            cache=draft_cache,
+            block_size=2,
+            sampler=greedy,
+            greedy=True,
+        )
+        mx.eval(drafted_tokens)
+        self.assertEqual(drafted_tokens.shape, (1, 1))
+
         sanitized = model.sanitize(
             {
                 "model.embed_tokens.weight": mx.zeros((config.vocab_size, 128)),
@@ -17684,18 +17725,25 @@ class TestMTPSplit(unittest.TestCase):
 
     def test_registry_resolves_all_families(self):
         from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
+        from mlx_vlm.utils import get_model_and_args
 
         expected = {
             "qwen3_5": "qwen3_5_mtp",
             "qwen3_5_moe": "qwen3_5_mtp",
             "deepseek_v4": "deepseek_v4_mtp",
             "glm4_moe_lite": "glm4_moe_lite_mtp",
+            "glm_moe_dsa": "glm_moe_dsa_mtp",
             "inkling_mm_model": "inkling_mtp",
         }
         for base, out_type in expected.items():
             splitter = get_mtp_splitter(base)
             self.assertIsNotNone(splitter)
             self.assertEqual(splitter.output_model_type, out_type)
+        drafter_module, model_type = get_model_and_args(
+            {"model_type": "glm_moe_dsa_mtp"}
+        )
+        self.assertEqual(model_type, "glm_moe_dsa_mtp")
+        self.assertTrue(hasattr(drafter_module, "GlmMoeDsaMTPDraftModel"))
         self.assertIsNone(get_mtp_splitter("not_a_model"))
 
     def test_qwen_split_strips_prefix_and_shifts_norm(self):
@@ -17794,6 +17842,62 @@ class TestMTPSplit(unittest.TestCase):
         self.assertEqual(stacked.shape, (2, 8, 8))  # 2 experts stacked
         self.assertEqual(config["model_type"], "glm4_moe_lite_mtp")
         self.assertEqual(config["block_size"], 2)  # num_nextn_predict_layers(1) + 1
+
+    def test_glm_moe_dsa_split_extracts_layer_local_mtp(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.speculative.drafters.glm_moe_dsa_mtp.split import (
+            split_glm_moe_dsa_mtp,
+        )
+
+        layer = 2
+        prefix = f"model.layers.{layer}."
+        tensors = {
+            prefix + "enorm.weight": mx.random.normal((8,)),
+            prefix + "hnorm.weight": mx.random.normal((8,)),
+            prefix + "eh_proj.weight": mx.random.normal((8, 16)),
+            prefix + "input_layernorm.weight": mx.random.normal((8,)),
+            prefix + "post_attention_layernorm.weight": mx.random.normal((8,)),
+            prefix + "shared_head.norm.weight": mx.random.normal((8,)),
+            prefix + "self_attn.kv_b_proj.weight": mx.random.normal((8, 4)),
+            prefix + "mlp.gate.weight": mx.random.normal((2, 8)),
+        }
+        for expert in range(2):
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                tensors[prefix + f"mlp.experts.{expert}.{projection}.weight"] = (
+                    mx.random.normal((8, 8))
+                )
+        config = {
+            "model_type": "glm_moe_dsa",
+            "num_hidden_layers": layer,
+            "num_attention_heads": 2,
+            "qk_nope_head_dim": 2,
+            "v_head_dim": 2,
+            "n_routed_experts": 2,
+            "num_nextn_predict_layers": 1,
+            "index_share_for_mtp_iteration": True,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            source = self._write_source(tmp, config, tensors)
+            split_glm_moe_dsa_mtp(source, out)
+            weights = mx.load(str(Path(out) / "model.safetensors"))
+            sidecar = json.loads((Path(out) / "config.json").read_text())
+
+        self.assertEqual(sidecar["model_type"], "glm_moe_dsa_mtp")
+        self.assertEqual(sidecar["block_size"], 2)
+        self.assertTrue(sidecar["text_config"]["index_share_for_mtp_iteration"])
+        self.assertTrue(all(key.startswith("mtp.") for key in weights))
+        self.assertIn("mtp.shared_head_norm.weight", weights)
+        self.assertIn("mtp.self_attn.embed_q.weight", weights)
+        self.assertIn("mtp.self_attn.unembed_out.weight", weights)
+        self.assertNotIn("mtp.self_attn.kv_b_proj.weight", weights)
+        self.assertEqual(
+            weights["mtp.mlp.switch_mlp.gate_proj.weight"].shape,
+            (2, 8, 8),
+        )
 
     def test_detect_and_split_mtp_dispatch(self):
         import tempfile
