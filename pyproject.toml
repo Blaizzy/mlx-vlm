@@ -32,6 +32,7 @@ Issues = "https://github.com/Blaizzy/mlx-vlm/issues"
 "mlx_vlm.chat" = "mlx_vlm.chat:main"
 "mlx_vlm.convert" = "mlx_vlm.convert:main"
 "mlx_vlm.generate" = "mlx_vlm.generate:main"
+"mlx_vlm.moe_offload" = "mlx_vlm.moe_offload:main"
 "mlx_vlm.server" = "mlx_vlm.server:main"
 
 [tool.setuptools.packages.find]
