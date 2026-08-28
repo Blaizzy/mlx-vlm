@@ -151,11 +151,29 @@ class GlmMoeDsaModel(DeepseekV32Model):
         cache: Optional[Any] = None,
         inputs_embeds: Optional[mx.array] = None,
         skip_final_norm: bool = False,
+        capture_layer_ids: Optional[List[int]] = None,
+        hidden_sink: Optional[List[mx.array]] = None,
     ) -> mx.array:
         h = self.embed_tokens(x) if inputs_embeds is None else inputs_embeds
 
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
+
+        if capture_layer_ids is not None:
+            if pipeline_size != 1:
+                raise ValueError(
+                    "glm_moe_dsa layer capture does not support pipeline parallelism."
+                )
+            if len(set(capture_layer_ids)) != len(capture_layer_ids) or any(
+                not isinstance(layer_id, int)
+                or layer_id < 0
+                or layer_id >= self.num_layers
+                for layer_id in capture_layer_ids
+            ):
+                raise ValueError(
+                    "capture_layer_ids must be unique layer indices inside the model."
+                )
+        capture_set = set(capture_layer_ids or ())
 
         if cache is None:
             cache = [None] * self.num_layers
@@ -171,6 +189,8 @@ class GlmMoeDsaModel(DeepseekV32Model):
             h, prev_topk_indices = self.layers[self.start_idx + i](
                 h, mask, cache[i], prev_topk_indices
             )
+            if hidden_sink is not None and self.start_idx + i in capture_set:
+                hidden_sink.append(h)
 
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
@@ -204,19 +224,27 @@ class LanguageModel(nn.Module):
         return_hidden = kwargs.get("return_hidden", False)
         return_shared_kv = kwargs.get("return_shared_kv", False)
         skip_logits = kwargs.get("skip_logits", False)
+        capture_layer_ids = kwargs.get("capture_layer_ids")
+        hidden_sink = [] if capture_layer_ids is not None else None
         pre_norm = self.model(
             inputs,
             cache=cache,
             inputs_embeds=inputs_embeds,
             skip_final_norm=return_hidden,
+            capture_layer_ids=capture_layer_ids,
+            hidden_sink=hidden_sink,
         )
         normed = self.model.norm(pre_norm) if return_hidden else pre_norm
         num_logits_to_keep = kwargs.get("num_logits_to_keep", 0)
         if num_logits_to_keep:
             normed = normed[:, -num_logits_to_keep:, :]
+        if return_hidden:
+            if hidden_sink is None:
+                hidden_sink = []
+            hidden_sink.append(pre_norm)
         return LanguageModelOutput(
             logits=None if skip_logits else self.lm_head(normed),
-            hidden_states=[pre_norm] if return_hidden else None,
+            hidden_states=hidden_sink,
             shared_kv_states={} if return_shared_kv else None,
         )
 
@@ -266,6 +294,8 @@ class LanguageModel(nn.Module):
                 if cache is not None and cache.is_trimmable():
                     cache.trim(trim)
         return max_accepted
+
+    requires_uniform_dflash_acceptance = True
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         return DSV32Model.sanitize(self, weights)

@@ -2724,6 +2724,94 @@ class TestModels(unittest.TestCase):
             mx.eval(verifier_logits, reference_logits)
             self.assertTrue(mx.all(verifier_logits == reference_logits).item())
 
+        from mlx_vlm.generate.ar import generate_step
+        from mlx_vlm.speculative.dflash import _dflash_uniform_acceptance
+        from mlx_vlm.speculative.drafters.dflash2 import DFlash2DraftModel
+        from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
+
+        capture_layer_ids = [0, 2, 5]
+        captured = target(tokens, capture_layer_ids=capture_layer_ids)
+        capture_reference = target.model(tokens, skip_final_norm=True)
+        mx.eval(captured.logits, captured.hidden_states, capture_reference)
+        self.assertEqual(len(captured.hidden_states), len(capture_layer_ids))
+        self.assertTrue(
+            all(
+                hidden.shape == (1, tokens.shape[1], config.hidden_size)
+                for hidden in captured.hidden_states
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(captured.hidden_states[-1], capture_reference).item()
+        )
+
+        dflash_config = DFlash2Config.from_dict(
+            {
+                "architectures": ["DFlash2DraftModel"],
+                "model_type": config.model_type,
+                "hidden_size": config.hidden_size,
+                "intermediate_size": config.intermediate_size,
+                "num_hidden_layers": 1,
+                "num_attention_heads": config.num_attention_heads,
+                "num_key_value_heads": config.num_key_value_heads,
+                "head_dim": config.hidden_size // config.num_attention_heads,
+                "hidden_act": "silu",
+                "rms_norm_eps": config.rms_norm_eps,
+                "vocab_size": config.vocab_size,
+                "max_position_embeddings": config.max_position_embeddings,
+                "num_target_layers": config.num_hidden_layers,
+                "layer_types": ["full_attention"],
+                "rope_parameters": {"rope_theta": config.rope_theta},
+                "dflash_config": {
+                    "block_size": 3,
+                    "conv_group_size": 16,
+                    "conv_kernel_size": 2,
+                    "mask_token_id": config.vocab_size - 1,
+                    "selector_rank": 16,
+                    "selector_top_k": 4,
+                    "target_layer_ids": capture_layer_ids,
+                },
+            }
+        )
+        dflash = DFlash2DraftModel(dflash_config).bind(model)
+
+        accepted, uniform_tokens = _dflash_uniform_acceptance(
+            model,
+            mx.array([[10, 11], [20, 21]], dtype=mx.int32),
+            [1, 2],
+            [[10, 99], [20, 21, 98]],
+            [3, 3],
+        )
+        self.assertEqual(accepted, [1, 1])
+        self.assertEqual(uniform_tokens, [[10, 99], [20, 21]])
+
+        prompt = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+
+        def generated_tokens(temperature, seed=None, draft_model=None):
+            kwargs = {}
+            if draft_model is not None:
+                kwargs = {"draft_model": draft_model, "draft_kind": "dflash"}
+            return [
+                int(token.item()) if hasattr(token, "item") else int(token)
+                for token, _ in generate_step(
+                    prompt,
+                    model,
+                    None,
+                    None,
+                    max_tokens=3,
+                    temperature=temperature,
+                    seed=seed,
+                    prefill_step_size=None,
+                    **kwargs,
+                )
+            ]
+
+        mx.eval(dflash.parameters())
+        self.assertEqual(generated_tokens(0), generated_tokens(0, draft_model=dflash))
+        self.assertEqual(
+            generated_tokens(1.0, seed=7),
+            generated_tokens(1.0, seed=7, draft_model=dflash),
+        )
+
         sanitized = model.sanitize(
             {
                 "model.embed_tokens.weight": mx.zeros((config.vocab_size, 128)),
