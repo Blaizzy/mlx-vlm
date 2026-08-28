@@ -106,11 +106,19 @@ def quantize_model(
     def wrapped_predicate(path, module):
         if not hasattr(module, "to_quantized"):
             return False
-        if module.weight.shape[-1] % group_size != 0:
-            return False
         bool_or_params = True
         if quant_predicate is not None:
             bool_or_params = quant_predicate(path, module)
+        # The divisibility guard must use the group size that will actually be
+        # applied: a per-module predicate may request a smaller group size
+        # (e.g. 32) precisely because the dims don't divide the global one.
+        effective_group_size = (
+            bool_or_params.get("group_size", group_size)
+            if isinstance(bool_or_params, dict)
+            else group_size
+        )
+        if module.weight.shape[-1] % effective_group_size != 0:
+            return False
         if isinstance(bool_or_params, dict):
             quantized_config["quantization"][path] = bool_or_params
         elif fine_grained_config and bool_or_params:

@@ -1610,6 +1610,21 @@ class LanguageModel(Qwen3_5LanguageModel):
             )
         return hidden
 
+    @property
+    def quant_predicate(self):
+        base = super().quant_predicate
+
+        def predicate(path, module):
+            # PLE n-gram table dims are not divisible by 64; group 32 lets it
+            # quantize instead of falling back to full precision.
+            if "ngram_embedding" in path:
+                return {"group_size": 32, "bits": 4}
+            if base is None:
+                return True
+            return base(path, module)
+
+        return predicate
+
     def fused_greedy_decode(
         self,
         inputs: mx.array,
