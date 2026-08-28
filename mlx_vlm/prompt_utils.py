@@ -58,6 +58,7 @@ MODEL_CONFIG = {
     "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "glm5_next": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "dots_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
@@ -303,6 +304,7 @@ class MessageFormatter:
             "diffusion_gemma",
             "minicpmv4_6",
             "minimax_m3_vl",
+            "glm5_next",
         ] and kwargs.get("video"):
             return self._format_video_message(
                 prompt,
@@ -947,7 +949,10 @@ def apply_chat_template(
         if last_user_idx >= 0:
             audio_counts[last_user_idx] = num_audios
 
+        video_arg = kwargs.pop("video", None)
+
         for i, p in enumerate(prompt):
+            video_i = video_arg if i == last_user_idx else None
             if isinstance(p, str):
                 messages.append(
                     get_message_json(
@@ -957,6 +962,7 @@ def apply_chat_template(
                         skip_audio_token=audio_counts[i] == 0,
                         num_images=image_counts[i],
                         num_audios=audio_counts[i],
+                        video=video_i,
                         **kwargs,
                     )
                 )
@@ -983,6 +989,7 @@ def apply_chat_template(
                             or role in ["system", "assistant"],
                             num_images=image_counts[i],
                             num_audios=audio_counts[i],
+                            video=video_i,
                             **kwargs,
                         )
                     )
