@@ -872,6 +872,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     config.setdefault("text_config", config.pop("llm_config", {}))
     config.setdefault("vision_config", {})
     config.setdefault("audio_config", {})
+    ple_storage = config["text_config"].get("ple_storage")
+    if ple_storage and (manifest := ple_storage.get("manifest")):
+        manifest_path = Path(manifest)
+        if not manifest_path.is_absolute():
+            ple_storage["manifest"] = str(model_path / manifest_path)
 
     has_quantization = "quantization" in config
 

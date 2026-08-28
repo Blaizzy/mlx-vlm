@@ -26,6 +26,12 @@ class Model(Qwen3_5Model):
             key: value for key, value in weights.items() if not key.startswith("mtp.")
         }
         weights = convert_qwen4_exp_fp8_weights(weights)
+        if self.config.text_config.ple_storage:
+            weights = {
+                key: value
+                for key, value in weights.items()
+                if ".ple.ple_embedding.ngram_embedding." not in key
+            }
 
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
