@@ -503,6 +503,9 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 
 # Require bearer authentication for API endpoints
 mlx_vlm.server --api-key <secret-token>
+
+# Opt into shared Hugging Face cache model discovery
+mlx_vlm.server --model-discovery hf-cache
 ```
 
 #### Server Options
@@ -513,6 +516,7 @@ mlx_vlm.server --api-key <secret-token>
 - `--stt-model`: Preload a speech-to-text model at server startup
 - `--embedding-model`: Preload an embedding model at server startup
 - `--reranker-model`: Preload a supported reranker model at server startup
+- `--model-discovery`: Models exposed by `/v1/models`; `served` lists only models loaded by this process (default), while `hf-cache` also scans the shared Hugging Face cache
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
 - `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.8-27B-DFlash2`, `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`, `Inferact/MiniMax-M3-EAGLE3`) — enables speculative decoding for ~2× or higher throughput
 - `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP)
@@ -1103,7 +1107,7 @@ Structured outputs are not currently supported with speculative decoding.
 
 #### Available Endpoints
 
-- `/models` and `/v1/models` - List models available locally
+- `/models` and `/v1/models` - List models intentionally served by this process
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
 - `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
@@ -1123,6 +1127,11 @@ Structured outputs are not currently supported with speculative decoding.
 ```sh
 curl "http://localhost:8080/models"
 ```
+
+By default, model discovery is isolated from the shared Hugging Face cache so
+models downloaded by other applications are not advertised by this server.
+Use `--model-discovery hf-cache` (or
+`MLX_VLM_MODEL_DISCOVERY=hf-cache`) to enable cache-wide model discovery.
 
 ##### Embeddings
 

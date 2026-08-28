@@ -49,7 +49,12 @@ from .realtime import register_routes as register_realtime_routes
 from .reranking import ensure_chat_template as ensure_reranker_chat_template
 from .reranking import register_routes as register_reranking_routes
 from .responses_state import _split_thinking as _split_thinking_text
-from .runtime import ModelCacheRegistry, runtime
+from .runtime import (
+    MODEL_DISCOVERY_ENV,
+    MODEL_DISCOVERY_MODES,
+    ModelCacheRegistry,
+    runtime,
+)
 from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
@@ -98,6 +103,38 @@ def _cache_group_for_cache(cache: dict) -> str:
     if model_kind == "reranker":
         return "reranker"
     return "text_generation"
+
+
+def _model_discovery_mode() -> str:
+    mode = os.environ.get(MODEL_DISCOVERY_ENV, "served").strip().lower()
+    if mode not in MODEL_DISCOVERY_MODES:
+        logger.warning(
+            "Ignoring invalid %s=%r; using safe default 'served'.",
+            MODEL_DISCOVERY_ENV,
+            mode,
+        )
+        return "served"
+    return mode
+
+
+def _model_info(model_id: str, created: int) -> dict:
+    model_id = str(model_id)
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": created,
+    }
+
+
+def _served_model_entries() -> list[dict]:
+    created = int(time.time())
+    models = {}
+    for _, cache in _model_cache_registry().items():
+        model_id = cache.get("model_path")
+        if not model_id:
+            continue
+        models[model_id] = _model_info(model_id, created)
+    return list(models.values())
 
 
 def _model_cache_registry() -> ModelCacheRegistry:
@@ -968,53 +1005,40 @@ register_reranking_routes(inference_router, _protocol_deps)
 )
 def models_endpoint():
     """
-    Return list of locally downloaded MLX models.
+    Return models intentionally served by this process.
+
+    Set ``MLX_VLM_MODEL_DISCOVERY=hf-cache`` to include compatible-looking
+    repositories from the shared Hugging Face cache for opt-in discovery.
     """
+    models = {model["id"]: model for model in _served_model_entries()}
 
-    required_files = {"config.json", "tokenizer_config.json"}
+    if _model_discovery_mode() == "hf-cache":
+        required_files = {"config.json", "tokenizer_config.json"}
 
-    def probably_mlx_lm(repo):
-        if repo.repo_type != "model":
-            return False
-        if "main" not in repo.refs:
-            return False
-        file_names = {f.file_path.name for f in repo.refs["main"].files}
-        has_weights = "model.safetensors.index.json" in file_names or any(
-            file_name.endswith(".safetensors") for file_name in file_names
-        )
-        return required_files.issubset(file_names) and has_weights
-
-    # Scan the cache directory for downloaded mlx models when it exists.
-    try:
-        hf_cache_info = _server_package_attr("scan_cache_dir", scan_cache_dir)()
-        downloaded_models = [
-            repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
-        ]
-    except CacheNotFound:
-        downloaded_models = []
-
-    # Create a list of available models
-    models = [
-        {"id": repo.repo_id, "object": "model", "created": int(repo.last_modified)}
-        for repo in downloaded_models
-    ]
-    loaded_models = {
-        cache.get("model_path")
-        for cache in _model_cache_registry().values()
-        if cache.get("model_path")
-    }
-    loaded_model = _model_cache_registry().get("model_path")
-    if loaded_model:
-        loaded_models.add(loaded_model)
-    for loaded in sorted(loaded_models):
-        if all(model["id"] != loaded for model in models):
-            models.append(
-                {"id": loaded, "object": "model", "created": int(time.time())}
+        def probably_mlx_lm(repo):
+            if repo.repo_type != "model" or "main" not in repo.refs:
+                return False
+            file_names = {f.file_path.name for f in repo.refs["main"].files}
+            has_weights = "model.safetensors.index.json" in file_names or any(
+                file_name.endswith(".safetensors") for file_name in file_names
             )
+            return required_files.issubset(file_names) and has_weights
 
-    response = {"object": "list", "data": models}
+        try:
+            hf_cache_info = _server_package_attr("scan_cache_dir", scan_cache_dir)()
+            for repo in hf_cache_info.repos:
+                if probably_mlx_lm(repo) and repo.repo_id not in models:
+                    models[repo.repo_id] = _model_info(
+                        repo.repo_id,
+                        int(repo.last_modified),
+                    )
+        except CacheNotFound:
+            pass
 
-    return response
+    return {
+        "object": "list",
+        "data": sorted(models.values(), key=lambda model: model["id"].lower()),
+    }
 
 
 app.include_router(inference_router)

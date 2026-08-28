@@ -1261,6 +1261,8 @@ def test_speculative_thread_exception_clears_runtime_cache(monkeypatch):
 
 
 def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatch):
+    monkeypatch.setenv("MLX_VLM_MODEL_DISCOVERY", "hf-cache")
+
     def repo(repo_id, file_names):
         return SimpleNamespace(
             repo_id=repo_id,
@@ -1310,6 +1312,7 @@ def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatc
 def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
     client, monkeypatch
 ):
+    monkeypatch.delenv("MLX_VLM_MODEL_DISCOVERY", raising=False)
     monkeypatch.setattr(
         server,
         "scan_cache_dir",
@@ -1330,6 +1333,8 @@ def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
 
 
 def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(client, monkeypatch):
+    monkeypatch.setenv("MLX_VLM_MODEL_DISCOVERY", "hf-cache")
+
     def repo(repo_id, file_names):
         return SimpleNamespace(
             repo_id=repo_id,
@@ -1369,6 +1374,59 @@ def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(client, monkeyp
     assert [model["id"] for model in response.json()["data"]].count(
         "local/sharded-model"
     ) == 1
+
+
+def test_models_endpoint_default_does_not_advertise_shared_hf_cache(
+    client, monkeypatch
+):
+    monkeypatch.delenv("MLX_VLM_MODEL_DISCOVERY", raising=False)
+    scan_cache = MagicMock(
+        return_value=SimpleNamespace(
+            repos=[
+                SimpleNamespace(
+                    repo_id="sentence-transformers/all-MiniLM-L6-v2",
+                    repo_type="model",
+                    last_modified=123.0,
+                    refs={
+                        "main": SimpleNamespace(
+                            files=[
+                                SimpleNamespace(
+                                    file_path=SimpleNamespace(name=file_name)
+                                )
+                                for file_name in (
+                                    "config.json",
+                                    "tokenizer_config.json",
+                                    "model.safetensors",
+                                )
+                            ]
+                        )
+                    },
+                )
+            ]
+        )
+    )
+    monkeypatch.setattr(server, "scan_cache_dir", scan_cache)
+    registry = server.ModelCacheRegistry()
+    registry.set(
+        "text_generation",
+        {
+            "model_path": "/models/loaded-chat-model",
+            "model_kind": "text_generation",
+        },
+    )
+    monkeypatch.setattr(server.runtime, "model_cache", registry)
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    assert response.json()["data"] == [
+        {
+            "id": "/models/loaded-chat-model",
+            "object": "model",
+            "created": response.json()["data"][0]["created"],
+        }
+    ]
+    scan_cache.assert_not_called()
 
 
 def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
@@ -6819,6 +6877,7 @@ class TestResponseGenerator:
             "MLX_VLM_PRELOAD_TTS_MODEL",
             "MLX_VLM_PRELOAD_STT_MODEL",
             "MLX_VLM_PRELOAD_RERANKER_MODEL",
+            "MLX_VLM_MODEL_DISCOVERY",
             "MLX_VLM_VISION_CACHE_SIZE",
             "MLX_VLM_MAX_TOKENS",
             "MLX_VLM_THINKING_BUDGET",
@@ -6850,6 +6909,8 @@ class TestResponseGenerator:
                 "stt-demo",
                 "--reranker-model",
                 "reranker-demo",
+                "--model-discovery",
+                "served",
                 "--enable-thinking",
                 "--thinking-budget",
                 "128",
@@ -6880,6 +6941,7 @@ class TestResponseGenerator:
             assert os.environ["MLX_VLM_PRELOAD_TTS_MODEL"] == "tts-demo"
             assert os.environ["MLX_VLM_PRELOAD_STT_MODEL"] == "stt-demo"
             assert os.environ["MLX_VLM_PRELOAD_RERANKER_MODEL"] == "reranker-demo"
+            assert os.environ["MLX_VLM_MODEL_DISCOVERY"] == "served"
             assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
             assert run_calls[0][1]["host"] == "127.0.0.1"
         finally:
@@ -6891,6 +6953,7 @@ class TestResponseGenerator:
                 "MLX_VLM_PRELOAD_TTS_MODEL",
                 "MLX_VLM_PRELOAD_STT_MODEL",
                 "MLX_VLM_PRELOAD_RERANKER_MODEL",
+                "MLX_VLM_MODEL_DISCOVERY",
                 "MLX_VLM_VISION_CACHE_SIZE",
                 "MLX_VLM_MAX_TOKENS",
                 "MLX_VLM_THINKING_BUDGET",
