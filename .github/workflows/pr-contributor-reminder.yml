@@ -103,8 +103,8 @@ jobs:
               });
             }
 
-  pre-commit-reminder:
-    name: Check pre-commit result
+  ci-failure-reminders:
+    name: Check pre-commit and test results
     if: github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
@@ -112,7 +112,7 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - name: Update pre-commit reminder
+      - name: Update CI failure reminders
         uses: actions/github-script@v7
         with:
           script: |
@@ -156,18 +156,21 @@ jobs:
               return;
             }
 
-            const marker = "<!-- mlx-vlm-pre-commit-failure -->";
             const comments = await github.paginate(github.rest.issues.listComments, {
               owner,
               repo,
               issue_number,
               per_page: 100,
             });
-            const existing = comments.find((comment) =>
-              comment.user?.type === "Bot" && comment.body?.includes(marker)
-            );
 
-            async function removeExistingReminder() {
+            function findReminder(marker) {
+              return comments.find((comment) =>
+                comment.user?.type === "Bot" && comment.body?.includes(marker)
+              );
+            }
+
+            async function removeReminder(marker) {
+              const existing = findReminder(marker);
               if (!existing) return;
               await github.rest.issues.deleteComment({
                 owner,
@@ -176,10 +179,41 @@ jobs:
               });
             }
 
+            async function updateFailureReminder({ marker, body, conclusion, label }) {
+              if (conclusion === "success") {
+                core.info(`${label} passed; no reminder is needed.`);
+                await removeReminder(marker);
+                return;
+              }
+
+              if (conclusion !== "failure") {
+                core.info(`${label} concluded with ${conclusion}; leaving its reminder unchanged.`);
+                return;
+              }
+
+              const existing = findReminder(marker);
+              if (existing && existing.body !== body) {
+                await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else if (!existing) {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number,
+                  body,
+                });
+              }
+            }
+
             const author = pullRequest.user.login;
             if (excludedUsers.has(author.toLowerCase())) {
               core.info(`Skipping reminder for excluded user @${author}.`);
-              await removeExistingReminder();
+              await removeReminder("<!-- mlx-vlm-pre-commit-failure -->");
+              await removeReminder("<!-- mlx-vlm-test-failure -->");
               return;
             }
 
@@ -196,24 +230,12 @@ jobs:
             const preCommitStep = jobs
               .flatMap((job) => job.steps ?? [])
               .find((step) => step.name === "Run pre-commit checks");
+            const testStep = jobs
+              .flatMap((job) => job.steps ?? [])
+              .find((step) => step.name === "Run Python tests");
 
-            if (!preCommitStep) {
-              core.warning("The Test PRs run did not contain the pre-commit step.");
-              return;
-            }
-
-            if (preCommitStep.conclusion === "success") {
-              core.info("Pre-commit passed; no reminder is needed.");
-              await removeExistingReminder();
-              return;
-            }
-
-            if (preCommitStep.conclusion !== "failure") {
-              core.info(`Pre-commit concluded with ${preCommitStep.conclusion}; leaving the reminder unchanged.`);
-              return;
-            }
-
-            const body = `${marker}
+            const preCommitMarker = "<!-- mlx-vlm-pre-commit-failure -->";
+            const preCommitBody = `${preCommitMarker}
             ⚠️ The **pre-commit checks failed** in [CI](${run.html_url}).
 
             Run the following from the repository root, then commit and push any changes:
@@ -225,18 +247,39 @@ jobs:
 
             The project's pre-commit configuration includes **Black** and the other required formatters.`;
 
-            if (existing && existing.body !== body) {
-              await github.rest.issues.updateComment({
-                owner,
-                repo,
-                comment_id: existing.id,
-                body,
+            const testMarker = "<!-- mlx-vlm-test-failure -->";
+            const testBody = `${testMarker}
+            ⚠️ The **Python tests failed** in [CI](${run.html_url}).
+
+            Review the failing test output, then reproduce the test suite locally with:
+
+            \`\`\`shell
+            python -m pip install pytest
+            python -m pip install -e .
+            cd mlx_vlm
+            pytest -s ./tests --ignore=tests/test_smoke.py
+            \`\`\`
+
+            Fix the failure, then commit and push the changes.`;
+
+            if (preCommitStep) {
+              await updateFailureReminder({
+                marker: preCommitMarker,
+                body: preCommitBody,
+                conclusion: preCommitStep.conclusion,
+                label: "Pre-commit",
               });
-            } else if (!existing) {
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number,
-                body,
+            } else {
+              core.warning("The Test PRs run did not contain the pre-commit step.");
+            }
+
+            if (testStep) {
+              await updateFailureReminder({
+                marker: testMarker,
+                body: testBody,
+                conclusion: testStep.conclusion,
+                label: "Python tests",
               });
+            } else {
+              core.warning("The Test PRs run did not contain the Python test step.");
             }
