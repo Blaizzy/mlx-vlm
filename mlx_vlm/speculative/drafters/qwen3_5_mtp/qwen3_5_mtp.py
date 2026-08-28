@@ -100,12 +100,11 @@ class Qwen3_5MTPDraftModel(nn.Module):
         self._compact_proposal_head = head
 
     def _propose_token(self, hidden: mx.array, sampler, greedy: bool) -> mx.array:
-        if self._compact_proposal_head is not None:
-            if not greedy:
-                raise ValueError(
-                    "compact Qwen MTP proposal heads require greedy drafting"
-                )
+        if self._compact_proposal_head is not None and greedy:
             return self._compact_proposal_head.propose(hidden)
+        # Compact heads are proposal-only argmax accelerators. For stochastic
+        # drafting, preserve the original full-head sampler and its independent
+        # drafter RNG stream rather than applying a truncated vocabulary.
         logits = self._lm_head_fn(hidden)
         return mx.argmax(logits, axis=-1) if greedy else sampler(logits)
 

@@ -3318,20 +3318,33 @@ def test_compact_qwen_proposal_head_maps_argmax_to_real_vocab():
     assert mx.array_equal(head.propose(hidden), expected).item()
 
 
-def test_qwen_compact_proposal_requires_greedy_drafting():
-    compact = SimpleNamespace(propose=lambda hidden: mx.zeros(hidden.shape[:-1]))
+def test_qwen_compact_proposal_falls_back_to_full_head_for_stochastic_drafting():
+    compact_calls = []
+    sampler_calls = []
+    compact = SimpleNamespace(
+        propose=lambda hidden: compact_calls.append(hidden) or mx.zeros(
+            hidden.shape[:-1]
+        )
+    )
     draft = SimpleNamespace(
         _compact_proposal_head=compact,
-        _lm_head_fn=lambda hidden: hidden,
+        _lm_head_fn=lambda hidden: hidden + mx.array([[[0.0, 1.0]]]),
     )
 
-    with pytest.raises(ValueError, match="require greedy drafting"):
-        Qwen3_5MTPDraftModel._propose_token(
-            draft,
-            mx.zeros((1, 1, 2)),
-            lambda logits: mx.argmax(logits, axis=-1),
-            False,
-        )
+    def sampler(logits):
+        sampler_calls.append(logits)
+        return mx.argmax(logits, axis=-1)
+
+    token = Qwen3_5MTPDraftModel._propose_token(
+        draft,
+        mx.zeros((1, 1, 2)),
+        sampler,
+        False,
+    )
+
+    assert token.item() == 1
+    assert compact_calls == []
+    assert len(sampler_calls) == 1
 
 
 def test_qwen3_5_rollback_speculative_cache_trims_batch_rows_ragged():
