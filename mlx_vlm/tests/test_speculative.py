@@ -3952,3 +3952,64 @@ def test_longcat_flash_sparse_mtp_drafter():
         mx.array([[3, 7, 1, 9, 4]]), mx.random.normal((1, 5, H)), 2, None, greedy=True
     )
     assert drafter._seed_token is not None
+
+
+def test_longcat_flash_sparse_speculative_target_hooks():
+    from mlx_vlm.models.longcat_flash_sparse import Model, ModelConfig
+
+    H, V = 64, 512
+    base = dict(
+        model_type="longcat_flash_sparse",
+        attention_method="LSA",
+        hidden_size=H,
+        ffn_hidden_size=128,
+        expert_ffn_hidden_size=48,
+        moe_topk=4,
+        n_routed_experts=6,
+        zero_expert_num=2,
+        num_layers=2,
+        vocab_size=V,
+        max_position_embeddings=1024,
+        num_attention_heads=4,
+        kv_lora_rank=32,
+        q_lora_rank=48,
+        qk_rope_head_dim=16,
+        qk_nope_head_dim=16,
+        v_head_dim=16,
+        routed_scaling_factor=2.0,
+        rms_norm_eps=1e-5,
+        norm_topk_prob=True,
+        rope_scaling=None,
+        index_n_heads=4,
+        index_head_dim=32,
+        index_topk=8,
+        mtp_num_layers=3,
+    )
+
+    def _offset(cache, ngram):
+        return (cache[1] if ngram else cache[0]).caches[0].offset
+
+    for ngram in (True, False):
+        cfg = dict(base)
+        if ngram:
+            cfg.update(oe_vocab_size_ratio=2, oe_neighbor_num=3, oe_split_num=2)
+        lm = Model(ModelConfig.from_dict(cfg)).language_model
+        mx.eval(lm.parameters())
+        cache = lm.make_cache()
+        lm(mx.array([[3, 7, 1, 9, 4, 2, 8, 5]]), cache=cache, skip_logits=True)
+        o_prompt = int(_offset(cache, ngram))
+
+        hidden, shared, rollback = lm.speculative_verify_hidden(
+            mx.array([[1, 2, 3]]), cache
+        )
+        assert hidden.shape == (1, 3, H)
+        assert shared == {}
+        # n-gram ArraysCache can't be trimmed -> snapshot+replay; otherwise trim
+        assert (rollback is not None) == ngram
+        assert int(_offset(cache, ngram)) == o_prompt + 3
+
+        lm.rollback_speculative_cache(cache, rollback, 1, 3)  # accept 1 of 3
+        assert int(_offset(cache, ngram)) == o_prompt + 2  # keep accepted + 1
+
+        assert lm.speculative_draft_hidden(hidden).shape == hidden.shape
+        assert lm.speculative_logits_from_hidden(hidden).shape == (1, 3, V)
