@@ -9,6 +9,7 @@ from mlx_vlm.models.base import InputEmbeddingsFeatures
 from mlx_vlm.models.qwen3_5 import language as qwen_language
 from mlx_vlm.models.qwen3_5.config import TextConfig as Qwen3_5TextConfig
 from mlx_vlm.server.generation import _PositionedTargetSampler
+from mlx_vlm.speculative.dflash import _dflash_uniform_acceptance
 from mlx_vlm.speculative.drafters import (
     resolve_drafter_kind,
     validate_drafter_compatibility,
@@ -268,6 +269,23 @@ def test_dflash2_target_validation_is_structural():
     validate_drafter_compatibility(
         target, DFlash2DraftModel(config), draft_kind="dflash"
     )
+
+
+def test_dflash_uniform_acceptance_honors_target_requirement():
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(requires_uniform_dflash_acceptance=True)
+    )
+
+    accepted, tokens = _dflash_uniform_acceptance(
+        target,
+        mx.array([[10, 11], [20, 21]], dtype=mx.int32),
+        [1, 2],
+        [[10, 99], [20, 21, 98]],
+        [3, 3],
+    )
+
+    assert accepted == [1, 1]
+    assert tokens == [[10, 99], [20, 21]]
 
 
 @pytest.mark.parametrize(("temperature", "seed"), [(0, None), (1.0, 17)])
