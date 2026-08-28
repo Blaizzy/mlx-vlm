@@ -106,17 +106,30 @@ def quantize_model(
     def wrapped_predicate(path, module):
         if not hasattr(module, "to_quantized"):
             return False
+
+        input_dims = module.weight.shape[-1]
         bool_or_params = True
-        if quant_predicate is not None:
+        default_group_is_compatible = input_dims % group_size == 0
+        if not default_group_is_compatible:
+            if quant_predicate is None:
+                return False
             bool_or_params = quant_predicate(path, module)
-        if isinstance(bool_or_params, dict):
+            if not (
+                isinstance(bool_or_params, dict)
+                and "fallback_group_size" in bool_or_params
+            ):
+                return False
+        elif quant_predicate is not None:
+            bool_or_params = quant_predicate(path, module)
+
+        if isinstance(bool_or_params, dict) and "fallback_group_size" in bool_or_params:
             overrides = dict(bool_or_params)
-            fallback_group_size = overrides.pop("fallback_group_size", None)
+            fallback_group_size = overrides.pop("fallback_group_size")
             bool_or_params = {**quant_params, **overrides}
             if (
-                module.weight.shape[-1] % bool_or_params["group_size"]
+                input_dims % bool_or_params["group_size"]
                 and fallback_group_size is not None
-                and module.weight.shape[-1] % fallback_group_size == 0
+                and input_dims % fallback_group_size == 0
             ):
                 bool_or_params["group_size"] = fallback_group_size
         module_group_size = (
@@ -124,7 +137,7 @@ def quantize_model(
             if isinstance(bool_or_params, dict)
             else group_size
         )
-        if module.weight.shape[-1] % module_group_size != 0:
+        if input_dims % module_group_size != 0:
             return False
         if isinstance(bool_or_params, dict):
             quantized_config["quantization"][path] = bool_or_params
