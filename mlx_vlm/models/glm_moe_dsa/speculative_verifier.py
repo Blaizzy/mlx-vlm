@@ -4,7 +4,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput
+from ..base import LanguageModelOutput, create_attention_mask
 from ..exact_speculative_verify import (
     exact_speculative_verify_dense_available,
     exact_speculative_verify_weight,
@@ -271,26 +271,84 @@ def verify_logits(language_model, normed_hidden: mx.array) -> mx.array:
 class GlmMoeDsaExactSpeculativeVerifier:
     """Verify an MTP proposal using the target's pre-final-norm hidden states."""
 
+    @staticmethod
+    def _capture_hidden(
+        language_model,
+        inputs: mx.array,
+        cache: Any,
+        inputs_embeds: Optional[mx.array],
+        capture_layer_ids: list[int],
+        hidden_sink: list[mx.array],
+    ) -> mx.array:
+        model = language_model.model
+        if model.pipeline_size != 1:
+            raise ValueError(
+                "glm_moe_dsa layer capture does not support pipeline parallelism."
+            )
+        if len(set(capture_layer_ids)) != len(capture_layer_ids) or any(
+            not isinstance(layer_id, int)
+            or layer_id < 0
+            or layer_id >= model.num_layers
+            for layer_id in capture_layer_ids
+        ):
+            raise ValueError(
+                "capture_layer_ids must be unique layer indices inside the model."
+            )
+
+        hidden = model.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
+        if cache is None:
+            cache = [None] * model.num_layers
+        mask = create_attention_mask(
+            hidden, cache[0][0] if cache[0] else None, return_array=True
+        )
+        capture_set = set(capture_layer_ids)
+        prev_topk_indices = None
+        for index in range(model.num_layers):
+            layer_index = model.start_idx + index
+            hidden, prev_topk_indices = model.layers[layer_index](
+                hidden, mask, cache[index], prev_topk_indices
+            )
+            if layer_index in capture_set:
+                hidden_sink.append(hidden)
+        return model.norm(hidden)
+
     def __call__(
         self,
         language_model,
         inputs: mx.array,
         *,
         cache: Any = None,
+        inputs_embeds: Optional[mx.array] = None,
         capture_layer_ids: Optional[list[int]] = None,
+        return_hidden: bool = False,
+        return_shared_kv: bool = False,
         skip_logits: bool = False,
     ) -> LanguageModelOutput:
-        del capture_layer_ids
-        hidden = language_model.model(inputs, cache=cache, skip_final_norm=True)
-        logits = (
-            None
-            if skip_logits
-            else verify_logits(language_model, language_model.model.norm(hidden))
-        )
+        hidden_sink = [] if capture_layer_ids is not None else None
+        if capture_layer_ids:
+            hidden = self._capture_hidden(
+                language_model,
+                inputs,
+                cache,
+                inputs_embeds,
+                capture_layer_ids,
+                hidden_sink,
+            )
+        else:
+            hidden = language_model.model(
+                inputs,
+                cache=cache,
+                inputs_embeds=inputs_embeds,
+            )
+        if return_hidden:
+            if hidden_sink is None:
+                hidden_sink = []
+            hidden_sink.append(hidden)
+        logits = None if skip_logits else verify_logits(language_model, hidden)
         return LanguageModelOutput(
             logits=logits,
-            hidden_states=[hidden],
-            shared_kv_states={},
+            hidden_states=hidden_sink,
+            shared_kv_states={} if return_shared_kv else None,
         )
 
 
