@@ -18,6 +18,39 @@ model, processor = load("zai-org/GLM-5.3-Flash")
 print(generate(model, processor, "Explain multi-head latent attention.", max_tokens=256))
 ```
 
+## Image input
+
+`Glm5NextProcessor` is registered for `model_type=glm5_next`. Two details that
+are easy to get wrong if you reuse GLM-OCR helpers:
+
+1. **Token-budget `smart_resize`.** GLM-5.3's `min_image_tokens` / `max_image_tokens`
+   are token counts. They are converted to pixels with
+   `temporal_patch_size * (patch_size * merge_size)²`. The GLM-OCR / Qwen helper
+   treats the same numbers as a raw pixel budget and will shrink a native 448²
+   tile.
+2. **One-shot `<|image|>` expansion.** Replacement is `image_token * N`. Split on
+   the original slots before inserting the run. A `while token in text` loop
+   reconsumes the expansion and asks for extra `image_grid_thw` rows.
+
+The Hub `chat_template.jinja` on GLM-5.3-Flash currently stubs image content with
+an "unable to process" reminder. `from_pretrained` loads
+`chat_template_vlm.jinja` from this package instead.
+
+```python
+from mlx_vlm import generate, load
+from mlx_vlm.prompt_utils import apply_chat_template
+
+model, processor = load("zai-org/GLM-5.3-Flash")
+prompt = apply_chat_template(
+    processor, model.config, "Describe this image.", num_images=1
+)
+print(generate(model, processor, prompt, image=["photo.jpg"], max_tokens=256))
+```
+
+Video preprocessing is not implemented yet.
+
+A 448² native tile is 256 LLM image tokens (`32×32` patches, `2×2` merge).
+
 ## Decode optimizations
 
 All are on the compute path (no weight changes) and lossless:
