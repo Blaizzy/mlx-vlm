@@ -334,6 +334,94 @@ def test_quantize_module():
         "mode": "affine",
     }
 
+    # A model-owned group override must be evaluated before the default-group
+    # divisibility gate. Qwen4-Exp's PLE rows are 160-wide: divisible by 32,
+    # but not by the converter's default 64.
+    module = DummyModule((10, 160))
+    config = {}
+
+    def group32_predicate(_path: str, _module: nn.Module):
+        return {"fallback_group_size": 32}
+
+    _, updated_config = quantize_model(
+        module,
+        config,
+        group_size=64,
+        bits=4,
+        mode="affine",
+        quant_predicate=group32_predicate,
+    )
+    assert module.language_model.group_size == 32
+    assert module.vision_model.group_size == 32
+    assert updated_config["quantization"]["language_model"]["group_size"] == 32
+    assert updated_config["quantization"]["language_model"]["bits"] == 4
+    assert updated_config["quantization"]["language_model"]["mode"] == "affine"
+
+    # A compatible requested group remains authoritative. In particular,
+    # NVFP4 must retain its required group-16 layout rather than taking the
+    # affine fallback used for 160-wide PLE rows.
+    module = DummyModule((10, 160))
+    config = {}
+    _, updated_config = quantize_model(
+        module,
+        config,
+        group_size=16,
+        bits=4,
+        mode="nvfp4",
+        quant_predicate=group32_predicate,
+    )
+    assert module.language_model.group_size == 16
+    assert module.language_model.mode == "nvfp4"
+    assert updated_config["quantization"]["language_model"] == {
+        "group_size": 16,
+        "bits": 4,
+        "mode": "nvfp4",
+    }
+
+    # Existing partial overrides retain their implicit affine mode when the
+    # requested checkpoint format uses a mode with fixed group and bit sizes.
+    def affine8_predicate(_path: str, _module: nn.Module):
+        return {"group_size": 64, "bits": 8}
+
+    for mode, requested_group_size in (("nvfp4", 16), ("mxfp4", 32)):
+        module = DummyModule((10, 128))
+        _, updated_config = quantize_model(
+            module,
+            {},
+            group_size=requested_group_size,
+            bits=4,
+            mode=mode,
+            quant_predicate=affine8_predicate,
+        )
+        for name in ("language_model", "vision_model"):
+            quantized = getattr(module, name)
+            assert quantized.group_size == 64
+            assert quantized.bits == 8
+            assert quantized.mode == "affine"
+            assert updated_config["quantization"][name] == {
+                "group_size": 64,
+                "bits": 8,
+            }
+
+    # Only the explicit fallback protocol may bypass the requested group's
+    # divisibility check.
+    module = DummyModule((10, 96))
+    _, updated_config = quantize_model(
+        module,
+        {},
+        group_size=64,
+        bits=4,
+        mode="affine",
+        quant_predicate=lambda _path, _module: {"group_size": 32, "bits": 8},
+    )
+    assert not hasattr(module.language_model, "scales")
+    assert not hasattr(module.vision_model, "scales")
+    assert updated_config["quantization"] == {
+        "group_size": 64,
+        "bits": 4,
+        "mode": "affine",
+    }
+
     # Test mxfp4 quantization
     module = DummyModule((10, 64))
     config = {}

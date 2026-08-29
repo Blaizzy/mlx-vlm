@@ -503,6 +503,9 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 
 # Require bearer authentication for API endpoints
 mlx_vlm.server --api-key <secret-token>
+
+# Opt into shared Hugging Face cache model discovery
+mlx_vlm.server --model-discovery hf-cache
 ```
 
 #### Server Options
@@ -513,6 +516,7 @@ mlx_vlm.server --api-key <secret-token>
 - `--stt-model`: Preload a speech-to-text model at server startup
 - `--embedding-model`: Preload an embedding model at server startup
 - `--reranker-model`: Preload a supported reranker model at server startup
+- `--model-discovery`: Models exposed by `/v1/models`; `served` lists only models loaded by this process (default), while `hf-cache` also scans the shared Hugging Face cache
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
 - `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.8-27B-DFlash2`, `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`, `Inferact/MiniMax-M3-EAGLE3`) — enables speculative decoding for ~2× or higher throughput
 - `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP)
@@ -577,7 +581,9 @@ If `--model` is omitted, the model is loaded on the first request.
 
 ### Automatic Prefix Caching (APC)
 
-Automatic Prefix Caching reuses block-level K/V cache state across requests that share the same prefix. It is useful for repeated long documents, long chat histories, or retrieval contexts where each request appends a short new suffix.
+Automatic Prefix Caching reuses model cache state across requests that share the same prefix. It is useful for repeated long documents, long chat histories, or retrieval contexts where each request appends a short new suffix.
+
+APC builds a cache plan from `model.make_cache()` in the same style as vLLM's hybrid cache manager: each layer gets a cache spec, compatible specs form cache groups, and one coordinator selects a common reusable prefix across the groups. Dense attention models use pageable K/V blocks. Hybrid full/sliding-attention, recurrent/SSM, MLA/composite, VLM, and Omni layouts use restorable state checkpoints for the components that cannot be concatenated safely. Generation code uses the same coordinator API for both paths.
 
 APC has two tiers:
 
@@ -604,6 +610,9 @@ disk = DiskBlockStore(
     max_bytes=3 * (1 << 30),  # 3 GB disk cap; use None for uncapped
 )
 apc = APCManager(num_blocks=4096, block_size=16, disk=disk)
+
+# Optional diagnostics: inspect the automatically inferred cache groups.
+print(apc.coordinator(model).plan.describe())
 
 document = Path("long_document.txt").read_text()
 
@@ -906,6 +915,8 @@ Common APC environment variables:
 | `APC_ENABLED` | `0` | Set to `1` to enable APC |
 | `APC_NUM_BLOCKS` | `2048` | Number of in-memory APC blocks |
 | `APC_BLOCK_SIZE` | `16` | Tokens per APC block |
+| `APC_CHECKPOINT_ENTRIES` | `2` | In-memory checkpoint entries for hybrid/stateful cache layouts |
+| `APC_CHECKPOINT_GUARD_TOKENS` | `1` | Tokens retained after a reusable hybrid checkpoint boundary; the default preserves the normal final-token prefill boundary |
 | `APC_DISK_PATH` | unset | Directory for persistent disk shards |
 | `APC_DISK_MAX_GB` | `0` | Disk cap in GB; `0` means uncapped |
 | `APC_DISK_SHARD_MAX_BLOCKS` | `256` | Max blocks per disk segment shard |
@@ -914,7 +925,7 @@ Common APC environment variables:
 | `APC_HASH` | `fast` | Set to `sha256` for a stable cryptographic hash |
 | `APC_TRACE` | unset | Set to `1` for greppable store/reject/self-check log lines |
 
-APC is disabled automatically for models that use a custom cache layout. APC works with `--kv-bits` (including TurboQuant): the live KV cache stays quantized; the reusable APC pool stores dequantized float K/V, so pool size does not shrink with quant.
+Custom cache layouts can opt in without APC model-name checks by implementing `prefix_cache_snapshot()` and `prefix_cache_restore(snapshot)`. In-tree dense, sliding-window, recurrent, composite, VLM, and Omni cache layouts are detected automatically. APC works with `--kv-bits` (including TurboQuant): the live KV cache stays quantized; pageable APC K/V blocks are stored as dequantized float K/V, so block-pool size does not shrink with quant.
 When APC is enabled on the server, a non-fatal layout self-check runs at model load.
 
 #### KV Cache Quantization
@@ -1103,7 +1114,7 @@ Structured outputs are not currently supported with speculative decoding.
 
 #### Available Endpoints
 
-- `/models` and `/v1/models` - List models available locally
+- `/models` and `/v1/models` - List models intentionally served by this process
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
 - `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
@@ -1123,6 +1134,11 @@ Structured outputs are not currently supported with speculative decoding.
 ```sh
 curl "http://localhost:8080/models"
 ```
+
+By default, model discovery is isolated from the shared Hugging Face cache so
+models downloaded by other applications are not advertised by this server.
+Use `--model-discovery hf-cache` (or
+`MLX_VLM_MODEL_DISCOVERY=hf-cache`) to enable cache-wide model discovery.
 
 ##### Embeddings
 

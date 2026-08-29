@@ -6,6 +6,7 @@ from mlx_vlm.models.cache import (
     BatchPoolingCache,
     BatchRotatingKVCache,
     CacheList,
+    ChunkedKVCache,
     KVCache,
     RotatingKVCache,
 )
@@ -166,3 +167,31 @@ def test_batch_rotating_merge_skips_zero_length_backing_storage():
     assert merged.offset.tolist() == [0, 24]
     assert mx.all(merged.keys[0] == 0).item()
     assert mx.all(merged.values[0] == 0).item()
+
+
+def test_chunked_kv_cache_trims_on_valid_length_not_buffer_width():
+    # Regression test for maybe_trim_front: update_and_fetch pads the backing
+    # buffer up to a multiple of ``step``, so trimming on ``keys.shape[2]``
+    # discarded up to ``step - 1`` live tokens per trim and left the attention
+    # window narrower than ``chunk_size``.
+    chunk_size, n_tokens = 8, 14
+    original_step = ChunkedKVCache.step
+    ChunkedKVCache.step = 4
+    try:
+        cache = ChunkedKVCache(chunk_size)
+        window = []
+        for token in range(n_tokens):
+            # llama4/language.py trims before every update on chunked layers.
+            cache.maybe_trim_front()
+            kv = mx.full((1, 1, 1, 2), float(token))
+            keys, _ = cache.update_and_fetch(kv, kv)
+            window = [int(k) for k in keys[0, 0, :, 0]]
+    finally:
+        ChunkedKVCache.step = original_step
+
+    # The window must never fall below chunk_size once that many tokens exist,
+    # and must be the contiguous run ending at the newest token.
+    assert len(window) >= chunk_size
+    assert window[-1] == n_tokens - 1
+    assert window == list(range(window[0], window[0] + len(window)))
+    assert cache.start_position <= cache.offset
