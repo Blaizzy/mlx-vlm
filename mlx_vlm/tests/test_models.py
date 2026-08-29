@@ -2515,6 +2515,67 @@ class TestModels(unittest.TestCase):
         self.assertEqual(current.image_token_index, 124907)
         self.assertEqual(legacy.image_token_index, 396)
 
+    def test_lfm2_vl_sanitize_maps_layouts_to_language_model_prefix(self):
+        from mlx_vlm.models import lfm2_vl
+
+        config = lfm2_vl.ModelConfig(
+            model_type="lfm2-vl",
+            text_config=lfm2_vl.TextConfig(
+                hidden_size=64,
+                num_hidden_layers=2,
+                intermediate_size=128,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                vocab_size=128,
+                layer_types=["full_attention", "full_attention"],
+            ),
+            vision_config=lfm2_vl.VisionConfig(
+                hidden_size=64,
+                num_hidden_layers=2,
+                intermediate_size=128,
+                num_attention_heads=4,
+            ),
+            projector_use_layernorm=True,
+        )
+        model = lfm2_vl.Model(config)
+
+        raw_hf = {
+            "model.language_model.embed_tokens.weight": mx.zeros((128, 64)),
+            "model.vision_tower.vision_encoder.layers.0.self_attn.q_proj.weight": mx.zeros(
+                (64, 64)
+            ),
+            "model.multi_modal_projector.linear_1.weight": mx.zeros((64, 64)),
+        }
+        mlx_std = {
+            "language_model.model.embed_tokens.weight": mx.zeros((128, 64)),
+            "vision_tower.encoder.layers.0.self_attn.q_proj.weight": mx.zeros((64, 64)),
+            "multi_modal_projector.linear_1.weight": mx.zeros((64, 64)),
+        }
+        optiq = {
+            "model.embed_tokens.weight": mx.zeros((128, 64)),
+            "model.layers.0.conv.in_proj.weight": mx.zeros((64, 64)),
+            "vision_tower.encoder.layers.0.self_attn.q_proj.weight": mx.zeros((64, 64)),
+            "multi_modal_projector.linear_1.weight": mx.zeros((64, 64)),
+        }
+
+        for weights in (raw_hf, mlx_std, optiq):
+            keys = set(model.sanitize(weights))
+            self.assertFalse(any(k.startswith("model.") for k in keys))
+
+        self.assertIn(
+            "language_model.model.embed_tokens.weight", model.sanitize(raw_hf)
+        )
+        self.assertIn("language_model.model.embed_tokens.weight", model.sanitize(optiq))
+        self.assertIn(
+            "language_model.model.layers.0.conv.in_proj.weight",
+            model.sanitize(optiq),
+        )
+        self.assertIn(
+            "vision_tower.encoder.layers.0.self_attn.q_proj.weight",
+            model.sanitize(optiq),
+        )
+        self.assertEqual(set(mlx_std), set(model.sanitize(mlx_std)))
+
     def test_deepseek_v4_language_model(self):
         from mlx_vlm.models import deepseek_v4
         from mlx_vlm.models.deepseek_v4.hyper_connection import (
