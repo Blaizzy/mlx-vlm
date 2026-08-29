@@ -37,7 +37,8 @@ from mlx_vlm.utils import (
 )
 
 
-def test_transform_modelopt_nvfp4_weights():
+@pytest.mark.parametrize("quant_method", ["modelopt", "modelopt_mixed"])
+def test_transform_modelopt_nvfp4_weights(quant_method):
     packed = mx.arange(32, dtype=mx.uint8).reshape(2, 16)
     weights = {
         "layer.weight": packed,
@@ -49,7 +50,7 @@ def test_transform_modelopt_nvfp4_weights():
 
     transformed, quantization = _transform_modelopt_nvfp4_weights(
         weights,
-        {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+        {"quant_method": quant_method, "quant_algo": "NVFP4"},
     )
 
     assert transformed["layer.weight"].dtype == mx.uint32
@@ -59,6 +60,30 @@ def test_transform_modelopt_nvfp4_weights():
     assert "layer.weight_scale" not in transformed
     assert "layer.weight_scale_2" not in transformed
     assert "layer.input_scale" not in transformed
+    assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
+def test_transform_modelopt_mixed_nvfp4_fp8_weights():
+    weights = {
+        "experts.weight": mx.arange(32, dtype=mx.uint8).reshape(2, 16),
+        "experts.weight_scale": mx.array([[56, 64], [72, 80]], dtype=mx.uint8),
+        "experts.weight_scale_2": mx.array(0.5, dtype=mx.float32),
+        "experts.input_scale": mx.array(0.25, dtype=mx.float32),
+        "attention.weight": mx.array([[56, 64], [68, 72]], dtype=mx.uint8),
+        "attention.weight_scale": mx.array([0.5, 0.25], dtype=mx.bfloat16),
+        "attention.input_scale": mx.array(0.125, dtype=mx.float32),
+    }
+
+    transformed, quantization = _transform_modelopt_nvfp4_weights(
+        weights,
+        {"quant_method": "modelopt_mixed", "quant_algo": "MIXED_PRECISION"},
+    )
+
+    assert transformed["experts.weight"].dtype == mx.uint32
+    assert transformed["experts.scales"].dtype == mx.uint8
+    assert transformed["attention.weight"].dtype == mx.bfloat16
+    assert transformed["attention.weight"].tolist() == [[0.5, 1.0], [0.75, 1.0]]
+    assert not any("weight_scale" in key or "input_scale" in key for key in transformed)
     assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
 
 
@@ -303,6 +328,94 @@ def test_quantize_module():
     assert module.vision_model.group_size == 64
 
     # Check config is updated correctly
+    assert updated_config["quantization"] == {
+        "group_size": 64,
+        "bits": 4,
+        "mode": "affine",
+    }
+
+    # A model-owned group override must be evaluated before the default-group
+    # divisibility gate. Qwen4-Exp's PLE rows are 160-wide: divisible by 32,
+    # but not by the converter's default 64.
+    module = DummyModule((10, 160))
+    config = {}
+
+    def group32_predicate(_path: str, _module: nn.Module):
+        return {"fallback_group_size": 32}
+
+    _, updated_config = quantize_model(
+        module,
+        config,
+        group_size=64,
+        bits=4,
+        mode="affine",
+        quant_predicate=group32_predicate,
+    )
+    assert module.language_model.group_size == 32
+    assert module.vision_model.group_size == 32
+    assert updated_config["quantization"]["language_model"]["group_size"] == 32
+    assert updated_config["quantization"]["language_model"]["bits"] == 4
+    assert updated_config["quantization"]["language_model"]["mode"] == "affine"
+
+    # A compatible requested group remains authoritative. In particular,
+    # NVFP4 must retain its required group-16 layout rather than taking the
+    # affine fallback used for 160-wide PLE rows.
+    module = DummyModule((10, 160))
+    config = {}
+    _, updated_config = quantize_model(
+        module,
+        config,
+        group_size=16,
+        bits=4,
+        mode="nvfp4",
+        quant_predicate=group32_predicate,
+    )
+    assert module.language_model.group_size == 16
+    assert module.language_model.mode == "nvfp4"
+    assert updated_config["quantization"]["language_model"] == {
+        "group_size": 16,
+        "bits": 4,
+        "mode": "nvfp4",
+    }
+
+    # Existing partial overrides retain their implicit affine mode when the
+    # requested checkpoint format uses a mode with fixed group and bit sizes.
+    def affine8_predicate(_path: str, _module: nn.Module):
+        return {"group_size": 64, "bits": 8}
+
+    for mode, requested_group_size in (("nvfp4", 16), ("mxfp4", 32)):
+        module = DummyModule((10, 128))
+        _, updated_config = quantize_model(
+            module,
+            {},
+            group_size=requested_group_size,
+            bits=4,
+            mode=mode,
+            quant_predicate=affine8_predicate,
+        )
+        for name in ("language_model", "vision_model"):
+            quantized = getattr(module, name)
+            assert quantized.group_size == 64
+            assert quantized.bits == 8
+            assert quantized.mode == "affine"
+            assert updated_config["quantization"][name] == {
+                "group_size": 64,
+                "bits": 8,
+            }
+
+    # Only the explicit fallback protocol may bypass the requested group's
+    # divisibility check.
+    module = DummyModule((10, 96))
+    _, updated_config = quantize_model(
+        module,
+        {},
+        group_size=64,
+        bits=4,
+        mode="affine",
+        quant_predicate=lambda _path, _module: {"group_size": 32, "bits": 8},
+    )
+    assert not hasattr(module.language_model, "scales")
+    assert not hasattr(module.vision_model, "scales")
     assert updated_config["quantization"] == {
         "group_size": 64,
         "bits": 4,
@@ -1361,3 +1474,55 @@ class TestEstimateNumImageTokens:
     def test_unsupported_processor_raises(self):
         with pytest.raises(NotImplementedError, match="num_image_tokens"):
             estimate_num_image_tokens(SimpleNamespace(), 480, 640)
+
+
+def test_modelopt_mixed_drops_fp8_kv_cache_scales():
+    """ModelOpt emits per-layer KV-cache scales that MLX has no parameter for.
+
+    A real ``kv_cache_quant_algo: FP8`` export ships ``k_scale``/``v_scale`` on
+    every full-attention layer. MLX quantizes its KV cache at runtime, so these
+    must be dropped or ``load_weights(strict=True)`` rejects the checkpoint.
+    """
+    weights = {
+        "layer.weight": mx.arange(32, dtype=mx.uint8).reshape(2, 16),
+        "layer.weight_scale": mx.array([[56, 64], [72, 80]], dtype=mx.uint8),
+        "layer.weight_scale_2": mx.array(0.5, dtype=mx.float32),
+        "self_attn.k_proj.k_scale": mx.array(0.125, dtype=mx.float32),
+        "self_attn.v_proj.v_scale": mx.array(0.25, dtype=mx.float32),
+    }
+
+    transformed, quantization = _transform_modelopt_nvfp4_weights(
+        weights,
+        {"quant_method": "modelopt_mixed", "quant_algo": "MIXED_PRECISION"},
+    )
+
+    assert not any(
+        key.endswith(".k_scale") or key.endswith(".v_scale") for key in transformed
+    )
+    assert transformed["layer.weight"].dtype == mx.uint32
+    assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
+def test_modelopt_mixed_folds_many_tensors_without_exhausting_buffers():
+    """Folding must not accumulate one lazy graph across the whole checkpoint.
+
+    A 256-expert MoE export has tens of thousands of quantized tensors. If the
+    per-tensor folds are left unevaluated, the intermediates exceed Metal's
+    live-buffer limit and loading dies with ``[metal::malloc] Resource limit``.
+    24k tensors is below a real export (Apodex 1.1 mini NVFP4 has 30,720) but
+    above the point where an unbatched implementation fails.
+    """
+    count = 24000
+    weights = {}
+    for index in range(count):
+        weights[f"l.{index}.weight"] = mx.zeros((2, 16), dtype=mx.uint8)
+        weights[f"l.{index}.weight_scale"] = mx.zeros((2, 2), dtype=mx.uint8)
+        weights[f"l.{index}.weight_scale_2"] = mx.array(0.5, dtype=mx.float32)
+
+    transformed, _ = _transform_modelopt_nvfp4_weights(
+        weights,
+        {"quant_method": "modelopt_mixed", "quant_algo": "MIXED_PRECISION"},
+    )
+
+    assert len(transformed) == 2 * count
+    assert transformed[f"l.{count - 1}.scales"].dtype == mx.uint8

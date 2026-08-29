@@ -5,7 +5,12 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..activations import swiglu
-from ..base import LanguageModelOutput, scaled_dot_product_attention
+from ..base import (
+    LanguageModelOutput,
+    kv_sequence_length,
+    scaled_dot_product_attention,
+    slice_kv_sequence,
+)
 from ..exact_speculative_verify import exact_speculative_verify_dense_available
 from ..exact_speculative_verify import (
     exact_speculative_verify_weight as _target_verify_weight,
@@ -1266,13 +1271,13 @@ class Qwen3_5ExactSpeculativeVerifier:
             )
 
         if output is None and length > 1:
-            prefix_length = keys.shape[-2] - length
+            prefix_length = kv_sequence_length(keys) - length
             output = mx.concatenate(
                 [
                     scaled_dot_product_attention(
                         queries[:, :, index : index + 1, :],
-                        keys[:, :, : prefix_length + index + 1, :],
-                        values[:, :, : prefix_length + index + 1, :],
+                        slice_kv_sequence(keys, prefix_length + index + 1),
+                        slice_kv_sequence(values, prefix_length + index + 1),
                         cache=cache,
                         scale=attention.scale,
                         mask=(
@@ -1352,6 +1357,14 @@ class Qwen3_5ExactSpeculativeVerifier:
 
         return feed_forward(x)
 
+    @staticmethod
+    def _normalize_gated_delta_qk(layer, q, k):
+        del layer
+        inv_scale = k.shape[-1] ** -0.5
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        return q, k
+
     def _gated_delta(self, layer, inputs, mask, cache, gdn_sink):
         helpers = self._helpers()
         batch, length, _ = inputs.shape
@@ -1402,9 +1415,7 @@ class Qwen3_5ExactSpeculativeVerifier:
         state = cache[1] if cache else None
         if state is not None and state.shape[0] != batch:
             state = None
-        inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        q, k = self._normalize_gated_delta_qk(layer, q, k)
 
         initial_state = state
         output, state, intermediate_states = gated_delta_update_with_states(

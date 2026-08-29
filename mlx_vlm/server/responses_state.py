@@ -264,24 +264,69 @@ response_store_order: deque = deque()
 response_store_lock = Lock()
 
 
-def suppress_tool_call_content(
-    full_output: str,
-    in_tool_call: bool,
-    tc_start: Optional[str],
-    delta_content: Optional[str],
-) -> Tuple[bool, Optional[str]]:
-    """Suppress tool-call markup from streamed delta.content."""
-    if not tc_start:
-        return in_tool_call, delta_content
-    if not in_tool_call:
-        if tc_start in full_output:
-            return True, None
+class ToolCallStreamState:
+    """Remove tool-call spans from streamed content, independent of chunking.
 
-        if any(full_output.endswith(tc_start[:j]) for j in range(2, len(tc_start))):
-            return False, None
-    else:
-        return True, None
-    return in_tool_call, delta_content
+    Marker fragments are buffered until they either complete or stop matching.
+    Text outside calls is emitted exactly once; text and markup inside calls is
+    discarded. Parsers with no end marker keep the historical latching behavior
+    after the first start marker.
+    """
+
+    def __init__(
+        self,
+        tc_start: Optional[str],
+        tc_end: Optional[str],
+    ):
+        self.tc_start = tc_start or ""
+        self.tc_end = tc_end or ""
+        self.in_tool_call = False
+        self.buffer = ""
+
+    def feed(self, text: Optional[str], last: bool = False) -> Optional[str]:
+        if not self.tc_start:
+            return text
+
+        self.buffer += text or ""
+        visible = []
+
+        while self.buffer:
+            marker = self.tc_end if self.in_tool_call else self.tc_start
+            if not marker:
+                # A parser with no end marker treats the rest of the generation
+                # as tool-call content once its start marker has been seen.
+                self.buffer = ""
+                break
+
+            marker_at = self.buffer.find(marker)
+            if marker_at >= 0:
+                if not self.in_tool_call and marker_at:
+                    visible.append(self.buffer[:marker_at])
+                self.buffer = self.buffer[marker_at + len(marker) :]
+                self.in_tool_call = not self.in_tool_call
+                continue
+
+            stable, self.buffer = self._split_partial_marker(self.buffer, marker)
+            if stable and not self.in_tool_call:
+                visible.append(stable)
+            break
+
+        if last and self.buffer:
+            if not self.in_tool_call:
+                # An unfinished start-marker prefix is ordinary content when
+                # generation ends before the marker can complete.
+                visible.append(self.buffer)
+            self.buffer = ""
+
+        return "".join(visible) or None
+
+    @staticmethod
+    def _split_partial_marker(text: str, marker: str) -> Tuple[str, str]:
+        max_length = min(len(text), len(marker) - 1)
+        for length in range(max_length, 0, -1):
+            if text.endswith(marker[:length]):
+                return text[:-length], text[-length:]
+        return text, ""
 
 
 def process_tool_calls(model_output: str, tool_module, tools):

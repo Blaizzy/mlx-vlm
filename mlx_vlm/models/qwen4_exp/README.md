@@ -74,6 +74,29 @@ result = generate(
 print(result.text)
 ```
 
+## MTP speculative decoding
+
+The official checkpoint also contains a native multi-token prediction (MTP)
+head. Extract it into a standalone draft model, then use it for speculative
+decoding with the official model:
+
+```sh
+python -m mlx_vlm.split_mtp \
+  --model Qwen/Qwen3.8-Flash-Next \
+  --output ./Qwen3.8-Flash-Next-MTP
+
+mlx_vlm.generate \
+  --model Qwen/Qwen3.8-Flash-Next \
+  --draft-model ./Qwen3.8-Flash-Next-MTP \
+  --draft-kind mtp \
+  --prompt "Explain speculative decoding in one paragraph." \
+  --max-tokens 128
+```
+
+The released checkpoint contains one MTP layer, so the default draft block is
+one speculative token. `--draft-block-size` can chain the head for additional
+draft tokens; the best value depends on the prompt and hardware.
+
 ## Optional quantization
 
 The official BF16 checkpoint is approximately 360 GB. Depending on the
@@ -92,14 +115,25 @@ mlx_vlm.convert \
 Group size 32 allows the PLE embedding dimensions to be quantized. The bit
 width and output path can be adjusted for the target hardware.
 
+The extracted MTP head can be quantized independently:
+
+```sh
+python -m mlx_vlm.split_mtp \
+  --model Qwen/Qwen3.8-Flash-Next \
+  --output ./Qwen3.8-Flash-Next-MTP-3bit \
+  --q-group-size 32 \
+  --q-bits 3
+```
+
 ## Notes
 
-- The upstream checkpoint includes a separate MTP predictor; the base
-  conditional-generation runtime loads the text and vision model and ignores
-  the MTP tensors.
+- The base conditional-generation runtime ignores the embedded `mtp.*`
+  tensors. `mlx_vlm.split_mtp` extracts them into the standalone draft model
+  used by speculative decoding.
 - QSA maintains an auxiliary index-key cache in addition to the normal KV
-  cache. Single-request generation, chunked prefill, and uniform KV-cache
-  quantization are supported.
-- The current QSA cache path is not yet wired into continuous batching.
+  cache. Single-request generation, chunked prefill, continuous batching, and
+  uniform KV-cache quantization for single requests are supported.
+- KV-cache quantization is unsupported with continuous QSA batching;
+  requesting both raises an explicit error to preserve the QSA indexer state.
 - Long image or video prompts may benefit from a smaller
   `--prefill-step-size` to reduce peak memory.

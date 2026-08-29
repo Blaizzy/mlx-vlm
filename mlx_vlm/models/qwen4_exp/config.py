@@ -53,6 +53,7 @@ class TextConfig(BaseModelConfig):
     make_ngram_vocab_size_divisible_by: int = 128
     split_ngram_parts: int = 128
     seed: int = 1234
+    ple_storage: Optional[Dict] = None
     indexer_n_heads: int = 4
     indexer_kv_heads: int = 1
     indexer_head_dim: int = 128
@@ -61,6 +62,9 @@ class TextConfig(BaseModelConfig):
     output_gate_type: str = "sigmoid"
     hidden_act: str = "silu"
     norm_topk_prob: bool = True
+    mtp_num_hidden_layers: int = 1
+    mtp_use_dedicated_embeddings: bool = False
+    mtp: Optional[Dict] = None
     eos_token_id: Optional[Union[int, List[int]]] = None
     tie_word_embeddings: bool = False
     attention_bias: bool = False
