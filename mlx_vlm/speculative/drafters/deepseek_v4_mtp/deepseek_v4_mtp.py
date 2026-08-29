@@ -1,3 +1,4 @@
+import re
 from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -446,10 +447,12 @@ class DeepseekV4MTPDraftModel(nn.Module):
         weights = dict(weights)
         new_weights = {}
         for k, v in weights.items():
-            if k.startswith("mtp.0."):
-                k = k[len("mtp.0.") :]
-            elif k.startswith("mtp."):
-                k = k[len("mtp.") :]
+            # The single MTP block lives under `mtp.<layer_idx>.` (index 1 for
+            # DeepSeek-V4-Flash, 0 for others) or bare `mtp.` — strip any of them
+            # so the block's tensors land at the drafter's top level.
+            m = re.match(r"mtp\.(?:\d+\.)?", k)
+            if m:
+                k = k[m.end() :]
             new_weights[k] = v
         weights = new_weights
 
