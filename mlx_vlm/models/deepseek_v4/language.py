@@ -1340,12 +1340,19 @@ class LanguageModel(nn.Module):
         block_size: int,
     ) -> int:
         if isinstance(accepted, int):
-            accepted = mx.array([accepted])
+            accepted_list = [int(accepted)]
+        elif isinstance(accepted, mx.array):
+            accepted_list = [int(a) for a in accepted.reshape(-1).tolist()]
+        else:
+            accepted_list = [int(a) for a in accepted]
+        if not accepted_list:
+            raise ValueError(
+                "DeepSeek-V4 speculative rollback requires acceptance values."
+            )
 
-        max_a = int(accepted.max().item())
+        max_a = max(accepted_list)
         if gdn_states:
             cache_snapshot, verify_inputs = gdn_states
-            accepted_list = [int(a) for a in accepted.tolist()]
             if len(set(accepted_list)) != 1:
                 raise ValueError(
                     "DeepSeek-V4 speculative rollback requires uniform acceptance."
@@ -1358,8 +1365,8 @@ class LanguageModel(nn.Module):
 
         n = max_a + 1
         trim = block_size - n
-        is_batch = accepted.size > 1
-        valid_ends = accepted + 1
+        is_batch = len(accepted_list) > 1
+        valid_ends = [a + 1 for a in accepted_list]
 
         for cache in _iter_leaf_caches(caches):
             if trim > 0 and hasattr(cache, "trim"):
@@ -1371,7 +1378,7 @@ class LanguageModel(nn.Module):
                     continue
                 kv_len = cache._idx
                 verify_start = kv_len - n
-                for bi, valid_end in enumerate(valid_ends.tolist()):
+                for bi, valid_end in enumerate(valid_ends):
                     start = verify_start + int(valid_end)
                     if start < kv_len:
                         zero_row_tail = getattr(cache, "zero_row_tail", None)
