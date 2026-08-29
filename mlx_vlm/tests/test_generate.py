@@ -2151,6 +2151,125 @@ def test_chunked_prefill_policy_defaults_conservative_for_speculation():
     )
 
 
+def test_chunked_prefill_allows_speculation_for_rollback_capable_targets():
+    model = SimpleNamespace(
+        no_chunked_prefill=False,
+        language_model=SimpleNamespace(rollback_speculative_cache=lambda *a, **k: 0),
+    )
+
+    assert ar_module._chunked_prefill_enabled(
+        model,
+        draft_model=SimpleNamespace(config=SimpleNamespace(target_layer_ids=[])),
+        draft_kind="mtp",
+        prefill_kwargs={"return_hidden": True, "return_shared_kv": True},
+    )
+
+
+@pytest.mark.parametrize(
+    "draft_kind,has_prefill_hook,expected_hidden_len",
+    [
+        # Own-cache MTP (DeepSeek-V4 / Qwen3.5 / Inkling), EAGLE3 and DFlash all
+        # read target hidden past the last prompt position, so a chunked prefill
+        # has to hand the drafter the whole prompt.
+        ("mtp", True, 9),
+        ("eagle3", True, 9),
+        ("dflash", False, 9),
+        # Shared-KV MTP (Gemma 4) only ever looks at the final position.
+        ("mtp", False, 1),
+    ],
+)
+def test_chunked_prefill_primes_drafter_from_whole_prompt(
+    draft_kind, has_prefill_hook, expected_hidden_len
+):
+    model = MagicMock()
+    model.no_chunked_prefill = False
+    del model.chunked_prefill_policy
+    model.language_model.rollback_speculative_cache = lambda *a, **k: 0
+    model.language_model.supports_logits_to_keep = False
+
+    def language_model_call(*args, **kwargs):
+        embeds = kwargs.get("inputs_embeds")
+        n = embeds.shape[1] if embeds is not None else 1
+        captured = kwargs.get("return_hidden") or kwargs.get("capture_layer_ids")
+        return SimpleNamespace(
+            logits=mx.zeros((1, n, 4)),
+            hidden_states=[mx.zeros((1, n, 4))] if captured else None,
+            shared_kv_states={} if kwargs.get("return_shared_kv") else None,
+            cross_attention_states=None,
+            encoder_outputs=None,
+            gdn_states=None,
+        )
+
+    model.language_model.side_effect = language_model_call
+
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 9, 4))
+    embedding_output.to_dict.return_value = {}
+    model.get_input_embeddings.return_value = embedding_output
+
+    draft_model = SimpleNamespace(config=SimpleNamespace(target_layer_ids=[0]))
+    if has_prefill_hook:
+        draft_model.prefill_from_target_hidden = lambda *a, **k: None
+
+    seen = {}
+
+    def record_rounds(m, d, c, input_ids, first_token, logprobs, last_outputs, **kw):
+        seen["prompt_tokens"] = int(input_ids.shape[1])
+        hidden_states = getattr(last_outputs, "hidden_states", None)
+        seen["hidden_len"] = int(hidden_states[-1].shape[1]) if hidden_states else None
+        return iter(())
+
+    with (
+        patch("mlx_vlm.speculative.drafters.validate_drafter_compatibility"),
+        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+        patch.object(ar_module, "run_speculative_rounds", side_effect=record_rounds),
+    ):
+        list(
+            generate_module.generate_step(
+                input_ids=mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9]], dtype=mx.int32),
+                model=model,
+                pixel_values=None,
+                mask=None,
+                max_tokens=1,
+                prefill_step_size=2,
+                draft_model=draft_model,
+                draft_kind=draft_kind,
+            )
+        )
+
+    assert seen["prompt_tokens"] == 9
+    assert seen["hidden_len"] == expected_hidden_len
+
+
+def test_splice_prompt_hidden_keeps_tail_when_captures_do_not_line_up():
+    from mlx_vlm.speculative.utils import splice_prompt_hidden
+
+    outputs = SimpleNamespace(hidden_states=[mx.zeros((1, 1, 4))])
+
+    assert splice_prompt_hidden([], outputs) is outputs
+    assert splice_prompt_hidden([None], outputs) is outputs
+    assert splice_prompt_hidden([[mx.zeros((1, 2, 4))] * 2], outputs) is outputs
+
+    spliced = splice_prompt_hidden([[mx.zeros((1, 2, 4))]], outputs)
+    assert spliced.hidden_states[0].shape == (1, 3, 4)
+
+
+def test_drafter_consumes_prompt_hidden_matches_drafter_family():
+    from mlx_vlm.speculative.utils import drafter_consumes_prompt_hidden
+
+    shared_kv_drafter = SimpleNamespace()
+    own_cache_drafter = SimpleNamespace(prefill_from_target_hidden=lambda *a, **k: None)
+
+    assert not drafter_consumes_prompt_hidden("mtp", shared_kv_drafter)
+    assert drafter_consumes_prompt_hidden("mtp", own_cache_drafter)
+    assert drafter_consumes_prompt_hidden("eagle3", own_cache_drafter)
+    assert drafter_consumes_prompt_hidden("dflash", shared_kv_drafter)
+
+
 def test_stream_generate_forwards_verbose_to_generate_step():
     captured = {}
 

@@ -16668,11 +16668,20 @@ class TestCohereCompass(unittest.TestCase):
         )
 
     def test_visual_deepstack_allows_chunked_prefill(self):
+        from mlx_vlm.generate.common import _chunked_prefill_enabled
+
         model = self._tiny_model()
-        self.assertTrue(model.chunked_prefill_policy(prefill_kwargs={}))
+        self.assertTrue(_chunked_prefill_enabled(model, prefill_kwargs={}))
         self.assertTrue(
-            model.chunked_prefill_policy(
-                prefill_kwargs={"deepstack_visual_embeds": [mx.zeros((4, 32))]}
+            _chunked_prefill_enabled(
+                model,
+                prefill_kwargs={"deepstack_visual_embeds": [mx.zeros((4, 32))]},
+            )
+        )
+        # No rollback_speculative_cache hook, so speculation stays unchunked.
+        self.assertFalse(
+            _chunked_prefill_enabled(
+                model, draft_model=object(), draft_kind="dflash", prefill_kwargs={}
             )
         )
 

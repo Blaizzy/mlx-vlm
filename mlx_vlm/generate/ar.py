@@ -26,11 +26,14 @@ from ..sample_utils import (
     top_p_sampling,
 )
 from ..speculative.utils import (
+    drafter_consumes_prompt_hidden,
     make_speculative_prompt_cache,
+    prompt_chunk_capture_kwargs,
     run_speculative_rounds,
     run_speculative_server_rounds,
     speculative_hidden_state,
     speculative_prefill_kwargs,
+    splice_prompt_hidden,
 )
 from ..turboquant import BatchTurboQuantKVCache, turboquant_enabled
 from ..utils import group_images_by_shape, prepare_inputs, should_add_special_tokens
@@ -345,7 +348,10 @@ def generate_step(
 
     # Speculative decoding setup
     last_outputs = None
+    speculative_prompt_ids = input_ids
+    prompt_hidden_chunks: List[Optional[List[mx.array]]] = []
     speculative_prefill_capture_kwargs = {}
+    capture_prompt_hidden_per_chunk = False
     if draft_model is not None:
         from ..speculative.drafters import validate_drafter_compatibility
 
@@ -353,6 +359,10 @@ def generate_step(
         speculative_prefill_capture_kwargs = speculative_prefill_kwargs(
             draft_kind, draft_model
         )
+        capture_prompt_hidden_per_chunk = drafter_consumes_prompt_hidden(
+            draft_kind, draft_model
+        )
+        chunk_capture_kwargs = prompt_chunk_capture_kwargs(draft_kind, draft_model)
         # Reset stale mRoPE state from any previous generation.
         lm = model.language_model if hasattr(model, "language_model") else model
         if hasattr(lm, "_position_ids"):
@@ -470,6 +480,9 @@ def generate_step(
         ) or (
             checkpoint_len is not None and 0 < checkpoint_len < inputs_embeds.shape[1]
         )
+        # Drafters are primed from the whole prompt, which the chunk loop below
+        # consumes token by token; snapshot the ids before that happens.
+        speculative_prompt_ids = input_ids
         if prefill_step_size is not None and should_chunk:
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
@@ -489,13 +502,26 @@ def generate_step(
                     chunk_kwargs = kwargs
                     if getattr(model.language_model, "supports_logits_to_keep", False):
                         chunk_kwargs = {**kwargs, "logits_to_keep": 1}
-                    model.language_model(
+                    if capture_prompt_hidden_per_chunk:
+                        chunk_kwargs = {
+                            **chunk_kwargs,
+                            **chunk_capture_kwargs,
+                        }
+                    chunk_outputs = model.language_model(
                         inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
                         cache=prompt_cache,
                         n_to_process=n_to_process,
                         **chunk_kwargs,
                     )
+                    if capture_prompt_hidden_per_chunk:
+                        chunk_hidden = getattr(chunk_outputs, "hidden_states", None)
+                        # Eval now: an unevaluated capture pins the whole chunk's
+                        # activation graph until the drafter is primed.
+                        if chunk_hidden:
+                            mx.eval(chunk_hidden)
+                        prompt_hidden_chunks.append(chunk_hidden)
+                    chunk_outputs = None
                     quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
                     processed_tokens += n_to_process
@@ -519,11 +545,12 @@ def generate_step(
 
     # Speculative decoding
     if draft_model is not None:
+        last_outputs = splice_prompt_hidden(prompt_hidden_chunks, last_outputs)
         yield from run_speculative_rounds(
             model,
             draft_model,
             prompt_cache,
-            input_ids,
+            speculative_prompt_ids,
             y,
             logprobs,
             last_outputs,
@@ -1682,6 +1709,12 @@ class PromptProcessingBatch:
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling
+        self._capture_prompt_hidden_per_chunk = (
+            draft_model is not None
+            and draft_kind is not None
+            and drafter_consumes_prompt_hidden(draft_kind, draft_model)
+        )
+        self._prompt_hidden_chunks: List[Optional[List[mx.array]]] = []
 
         lengths = [len(ids) for ids in input_ids]
         max_length = max(lengths)
@@ -1710,6 +1743,9 @@ class PromptProcessingBatch:
         self._left_padding_per_row = list(left_padding)
         self._total_prompt_tokens = sum(lengths)
         self._processed_prompt_columns = 0
+        # ``prompt_step`` walks ``_input_ids`` forward chunk by chunk; drafters
+        # are primed from the whole prompt, so keep the unconsumed ids.
+        self._speculative_prompt_ids = self._input_ids
 
         self.logits_processors = logits_processors or []
         self.thinking_budget_criteria = thinking_budget_criteria or []
@@ -1961,13 +1997,26 @@ class PromptProcessingBatch:
         if n <= 0:
             return 0
         prompt_kwargs = self._prompt_kwargs_for_step(n)
-        self.model(
+        if self._capture_prompt_hidden_per_chunk:
+            prompt_kwargs = {
+                **prompt_kwargs,
+                **prompt_chunk_capture_kwargs(self.draft_kind, self.draft_model),
+            }
+        chunk_outputs = self.model(
             self._input_ids[:, :n],
             cache=self.prompt_cache,
             inputs_embeds=self._inputs_embeds[:, :n],
             n_to_process=n,
             **prompt_kwargs,
         )
+        if self._capture_prompt_hidden_per_chunk:
+            chunk_hidden = getattr(chunk_outputs, "hidden_states", None)
+            # Eval now: an unevaluated capture pins the whole chunk's
+            # activation graph until the drafter is primed.
+            if chunk_hidden:
+                mx.eval(chunk_hidden)
+            self._prompt_hidden_chunks.append(chunk_hidden)
+        chunk_outputs = None
         mx.async_eval([c.state for c in self.prompt_cache])
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
@@ -2018,6 +2067,9 @@ class PromptProcessingBatch:
             **call_kwargs,
         )
         logits = output.logits if hasattr(output, "logits") else output
+        if self._prompt_hidden_chunks:
+            output = splice_prompt_hidden(self._prompt_hidden_chunks, output)
+            self._prompt_hidden_chunks = []
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
             # Per-row last *real* token sits at index (seq - 1 - right_pad[i]).
             seq = logits.shape[1]
@@ -2091,7 +2143,7 @@ class PromptProcessingBatch:
                 shared_kv_states=(
                     output.shared_kv_states if self.draft_kind == "mtp" else None
                 ),
-                prompt_tokens=self._input_ids,
+                prompt_tokens=self._speculative_prompt_ids,
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
                 greedy_sampling=self.greedy_sampling,

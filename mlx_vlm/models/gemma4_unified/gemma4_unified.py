@@ -144,17 +144,10 @@ class Model(nn.Module):
         draft_kind=None,
         prefill_kwargs=None,
     ) -> bool:
-        del inputs_embeds, prompt_cache
+        del inputs_embeds, prompt_cache, draft_model, draft_kind
         prefill_kwargs = prefill_kwargs or {}
         if self._should_disable_chunked_prefill(input_ids, **prefill_kwargs):
             return False
-
-        if draft_model is not None:
-            return (
-                draft_kind == "mtp"
-                and bool(prefill_kwargs.get("return_hidden", False))
-                and bool(prefill_kwargs.get("return_shared_kv", False))
-            )
 
         return True
 

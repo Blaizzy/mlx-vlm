@@ -277,24 +277,6 @@ class LanguageModel(nn.Module):
         self.final_logit_softcapping = args.final_logit_softcapping
         self.output_multiplier = args.output_multiplier
 
-    def chunked_prefill_policy(
-        self,
-        *,
-        input_ids=None,
-        inputs_embeds=None,
-        prompt_cache=None,
-        draft_model=None,
-        draft_kind=None,
-        prefill_kwargs=None,
-    ) -> bool:
-        del input_ids, inputs_embeds, prompt_cache
-        if draft_model is None:
-            return True
-        prefill_kwargs = prefill_kwargs or {}
-        if draft_kind in ("dflash", "eagle3"):
-            return prefill_kwargs.get("capture_layer_ids") is not None
-        return False
-
     def __call__(
         self,
         inputs: Optional[mx.array] = None,

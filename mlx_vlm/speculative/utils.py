@@ -1,3 +1,6 @@
+import logging
+from copy import copy
+from dataclasses import is_dataclass, replace
 from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
@@ -56,16 +59,21 @@ __all__ = [
     "_speculative_walk_batch_deferred_greedy",
     "_speculative_walk_batch_uniform_acceptance",
     "_speculative_walk_deferred_greedy",
+    "drafter_consumes_prompt_hidden",
     "format_speculative_stats",
     "get_speculative_rounds_batch",
     "make_speculative_prompt_cache",
     "run_speculative_rounds",
     "run_speculative_server_rounds",
     "speculative_hidden_state",
+    "prompt_chunk_capture_kwargs",
     "speculative_prefill_kwargs",
     "speculative_stats_since",
     "speculative_stats_snapshot",
+    "splice_prompt_hidden",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 def format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
@@ -112,6 +120,70 @@ def speculative_hidden_state(draft_kind: str, outputs):
     raise ValueError(
         f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
     )
+
+
+def prompt_chunk_capture_kwargs(draft_kind: str, drafter) -> dict:
+    """Capture kwargs for an intermediate chunk of a chunked prefill.
+
+    Only the hidden-state capture has to span the whole prompt. Shared-KV
+    state is read off the completed target cache by the final prefill call,
+    so asking for it per chunk would materialize a full per-layer K/V dict
+    each time for nothing.
+    """
+    return {
+        key: value
+        for key, value in speculative_prefill_kwargs(draft_kind, drafter).items()
+        if key != "return_shared_kv"
+    }
+
+
+def drafter_consumes_prompt_hidden(draft_kind: str, drafter) -> bool:
+    """Whether a drafter reads target hidden past the last prompt position.
+
+    MTP drafters that borrow the target KV cache (``set_shared_kv`` with no
+    priming hook) only ever look at the final position, so capturing hidden on
+    the last prefill call is enough. Everything else needs the whole prompt:
+    own-cache MTP and EAGLE3 prime a persistent drafter cache via
+    ``prefill_from_target_hidden``, and DFlash cross-attends its first draft
+    block over the full prompt hidden as context.
+    """
+    if drafter is not None and callable(
+        getattr(drafter, "prefill_from_target_hidden", None)
+    ):
+        return True
+    return draft_kind != "mtp"
+
+
+def splice_prompt_hidden(chunk_hidden_states: List[List[mx.array]], outputs):
+    """Rejoin per-chunk captured hidden with the final prefill call's hidden.
+
+    Chunked prefill splits the prompt across several forward passes, so a
+    drafter primed only from the last call would see a one-token prompt.
+    Returns ``outputs`` with ``hidden_states`` spanning the whole prompt, or
+    unchanged when the captures cannot be lined up.
+    """
+    if not chunk_hidden_states or outputs is None:
+        return outputs
+    tail = getattr(outputs, "hidden_states", None)
+    if not tail:
+        return outputs
+    if any(not chunk or len(chunk) != len(tail) for chunk in chunk_hidden_states):
+        logger.warning(
+            "Chunked prefill captured %d hidden slot(s) but the final prefill "
+            "call returned %d; leaving the drafter primed from the prompt tail.",
+            max(len(chunk) if chunk else 0 for chunk in chunk_hidden_states),
+            len(tail),
+        )
+        return outputs
+    merged = [
+        mx.concatenate([chunk[i] for chunk in chunk_hidden_states] + [tail[i]], axis=1)
+        for i in range(len(tail))
+    ]
+    if is_dataclass(outputs):
+        return replace(outputs, hidden_states=merged)
+    spliced = copy(outputs)
+    spliced.hidden_states = merged
+    return spliced
 
 
 def make_speculative_prompt_cache(
