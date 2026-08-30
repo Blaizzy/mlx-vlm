@@ -75,6 +75,9 @@ def test_qwen4_decoder_layers_expose_normalized_layer_types_for_mtp():
 
 def test_qwen4_mtp_declares_continuous_batching_support():
     assert Qwen4ExpMTPDraftModel.supports_continuous_batching is True
+    assert Qwen4ExpMTPDraftModel.requires_verified_token_reconciliation is True
+    assert callable(getattr(Qwen4ExpMTPDraftModel, "accept_verified_tokens_batch"))
+    assert callable(getattr(Qwen4ExpMTPDraftModel, "filter_batch"))
 
 
 def test_qwen4_mtp_fusion_matches_released_equations():

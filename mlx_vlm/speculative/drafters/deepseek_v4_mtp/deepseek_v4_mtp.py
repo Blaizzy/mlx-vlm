@@ -43,6 +43,7 @@ class DeepseekV4MTPDraftModel(nn.Module):
     supports_greedy_draft_argmax = True
     prefer_requested_block_size = True
     requires_uniform_batch_acceptance = True
+    requires_verified_token_reconciliation = True
 
     def __init__(self, config: DeepseekV4MTPConfig):
         super().__init__()

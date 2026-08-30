@@ -25,6 +25,10 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
     supports_greedy_draft_argmax = True
     # filter_batch keeps owned KV and per-row speculative state aligned.
     supports_continuous_batching = True
+    # Unlike shared-KV-only assistants, this drafter owns speculative KV and
+    # seed state. External serving loops must reconcile every verified round
+    # and apply the same row filters as the target batch.
+    requires_verified_token_reconciliation = True
     # A caller-provided block size is an adaptive ceiling. Longer
     # autoregressive tails are useful only after the native one-token prefix
     # has demonstrated enough acceptance to amortize them.
