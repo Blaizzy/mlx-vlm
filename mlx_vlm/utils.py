@@ -7,6 +7,7 @@ import logging
 import math
 import struct
 import warnings
+from dataclasses import dataclass, fields
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -26,6 +27,8 @@ from .models.base import BaseImageProcessor
 from .quantization.one_bit import _quantization_for_path, replace_one_bit_modules
 from .tokenizer_utils import load_tokenizer
 from .trainer.utils import apply_lora_layers
+
+logger = logging.getLogger(__name__)
 
 # Modes that support activation quantization
 ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
@@ -1895,21 +1898,95 @@ def load_audio(
     return audio.mean(axis=1) if audio.ndim > 1 else audio
 
 
+@dataclass(frozen=True)
+class VideoSampling:
+    """How many frames to take from a clip, and at what rate.
+
+    Every field is optional so an unset one can be filled from a
+    lower-precedence source via :meth:`merge`, with
+    :data:`DEFAULT_VIDEO_SAMPLING` terminating the chain.
+    """
+
+    fps: Optional[float] = None
+    nframes: Optional[int] = None
+    min_frames: Optional[int] = None
+    max_frames: Optional[int] = None
+    frame_factor: Optional[int] = None
+
+    def merge(self, fallback: "VideoSampling") -> "VideoSampling":
+        """Return a copy with every unset field taken from ``fallback``."""
+        return VideoSampling(
+            **{
+                f.name: (
+                    getattr(self, f.name)
+                    if getattr(self, f.name) is not None
+                    else getattr(fallback, f.name)
+                )
+                for f in fields(self)
+            }
+        )
+
+
+DEFAULT_VIDEO_SAMPLING = VideoSampling(
+    fps=2.0, min_frames=4, max_frames=768, frame_factor=2
+)
+
+
+@dataclass
+class VideoMetadata:
+    """What the decode step knew about a clip, carried alongside its frames.
+
+    Field names mirror ``transformers.video_utils.VideoMetadata`` so a
+    processor ported from upstream can consume this unchanged.
+    """
+
+    total_num_frames: int
+    fps: float
+    frames_indices: List[int]
+    width: Optional[int] = None
+    height: Optional[int] = None
+    duration: Optional[float] = None
+
+    @property
+    def timestamps(self) -> List[float]:
+        """Seconds into the clip for each sampled frame."""
+        return [idx / self.fps for idx in self.frames_indices]
+
+    @property
+    def sampled_fps(self) -> float:
+        """Frame rate actually achieved, which clamping can push well below
+        the requested ``fps``."""
+        return len(self.frames_indices) / max(self.total_num_frames, 1e-6) * self.fps
+
+
 def load_video(
     video_path: str,
-    fps: float = 2.0,
-    nframes: Optional[int] = None,
-    min_frames: int = 4,
-    max_frames: int = 768,
-    frame_factor: int = 2,
-) -> Tuple[np.ndarray, float]:
+    sampling: Optional[VideoSampling] = None,
+    **sampling_kwargs,
+) -> Tuple[np.ndarray, "VideoMetadata"]:
     """Read a video file as a (T, C, H, W) numpy array.
 
-    Uniformly samples ``nframes`` frames — either a fixed count or derived
-    from ``fps`` — and returns the sampled frames alongside the effective
-    sampling fps.
+    Uniformly samples frames — either a fixed ``nframes`` or a count derived
+    from ``fps`` — and returns them alongside the :class:`VideoMetadata`
+    describing what was read. Sampling fields may be given either as a
+    :class:`VideoSampling` or as loose keyword arguments; the former wins
+    where both set the same field.
     """
     import cv2
+
+    if sampling_kwargs:
+        unknown = set(sampling_kwargs) - {f.name for f in fields(VideoSampling)}
+        if unknown:
+            raise TypeError(
+                f"load_video() got unexpected keyword arguments: {sorted(unknown)}"
+            )
+        sampling = (sampling or VideoSampling()).merge(VideoSampling(**sampling_kwargs))
+    resolved = (sampling or VideoSampling()).merge(DEFAULT_VIDEO_SAMPLING)
+    fps = resolved.fps
+    nframes = resolved.nframes
+    min_frames = resolved.min_frames
+    max_frames = resolved.max_frames
+    frame_factor = resolved.frame_factor
 
     if video_path.startswith("file://"):
         video_path = video_path[7:]
@@ -1956,8 +2033,70 @@ def load_video(
         raise ValueError("No frames read from the video.")
 
     video_np = np.transpose(np.stack(frames, axis=0), (0, 3, 1, 2))
-    sample_fps = n / max(total_frames, 1e-6) * video_fps
-    return video_np, sample_fps
+    metadata = VideoMetadata(
+        total_num_frames=total_frames,
+        fps=video_fps,
+        # Truncated where a read failed part-way, so this tracks the frames
+        # actually returned rather than the ones asked for.
+        frames_indices=indices[: len(frames)].tolist(),
+        height=int(video_np.shape[2]),
+        width=int(video_np.shape[3]),
+        duration=total_frames / video_fps,
+    )
+    return video_np, metadata
+
+
+_VIDEO_SAMPLING_FIELDS = tuple(f.name for f in fields(VideoSampling))
+
+
+def processor_video_sampling(processor) -> VideoSampling:
+    """The frame sampling a processor asks for, if it declares any.
+
+    A processor opts in either by exposing a ``video_sampling_defaults()``
+    hook — the way to declare a cap whose attribute is named something else,
+    such as Gemma 4's ``num_frames`` — or by carrying matching attributes on
+    its video processor component.
+    """
+    component = getattr(processor, "video_processor", None)
+    if component is None:
+        return VideoSampling()
+
+    for owner in (component, processor):
+        hook = getattr(owner, "video_sampling_defaults", None)
+        if callable(hook):
+            declared = hook()
+            return (
+                declared
+                if isinstance(declared, VideoSampling)
+                else VideoSampling(**declared)
+            )
+
+    return VideoSampling(
+        **{
+            name: getattr(component, name, None)
+            for name in ("fps", "min_frames", "max_frames")
+        }
+    )
+
+
+def resolve_video_sampling(processor, overrides: Dict[str, Any]) -> VideoSampling:
+    """Settle how a clip gets sampled.
+
+    Caller wins, then whatever the processor declares, then the library
+    defaults. Consumes the sampling keys from ``overrides`` so they do not
+    travel on to the processor, which only ever sees frames that were already
+    chosen here.
+    """
+    explicit = VideoSampling(
+        **{
+            name: overrides.pop(name)
+            for name in _VIDEO_SAMPLING_FIELDS
+            if name in overrides
+        }
+    )
+    return explicit.merge(processor_video_sampling(processor)).merge(
+        DEFAULT_VIDEO_SAMPLING
+    )
 
 
 def process_inputs(
@@ -2163,16 +2302,32 @@ def prepare_inputs(
     if has_videos:
         if not isinstance(videos, list):
             videos = [videos]
-        fps_hint = kwargs.pop("fps", 2.0)
+        sampling = resolve_video_sampling(processor, kwargs)
         loaded, video_fps = [], []
         for v in videos:
-            arr, s_fps = (
-                load_video(str(v), fps=fps_hint)
-                if isinstance(v, (str, bytes))
-                else (v, fps_hint)
-            )
+            if isinstance(v, (str, bytes)):
+                arr, metadata = load_video(str(v), sampling)
+                logger.info(
+                    "video %s: sampled %d of %d frames at %.2f fps "
+                    "(source %.2f fps, %.1fs)",
+                    v,
+                    len(metadata.frames_indices),
+                    metadata.total_num_frames,
+                    metadata.sampled_fps,
+                    metadata.fps,
+                    metadata.duration,
+                )
+            else:
+                # Already-decoded frames: nothing was sampled here, so report
+                # the requested rate and describe what we were handed.
+                arr = v
+                metadata = VideoMetadata(
+                    total_num_frames=len(v),
+                    fps=sampling.fps,
+                    frames_indices=list(range(len(v))),
+                )
             loaded.append(arr)
-            video_fps.append(s_fps)
+            video_fps.append(metadata.sampled_fps)
         videos = loaded
 
     model_inputs = {}

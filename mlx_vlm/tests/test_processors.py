@@ -3902,3 +3902,37 @@ class TestTrustRemoteCodePassthrough(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestVideoFrameCaps(unittest.TestCase):
+    """Processors that re-subsample declare their cap so the decoder can stop
+    reading frames that are about to be thrown away."""
+
+    def test_gemma4_declares_its_frame_count(self):
+        from mlx_vlm.models.gemma4.processing_gemma4 import Gemma4VideoProcessor
+
+        processor = Gemma4VideoProcessor()
+        self.assertEqual(
+            processor.video_sampling_defaults(), {"max_frames": processor.num_frames}
+        )
+
+    def test_gemma4_unified_inherits_the_declaration(self):
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedVideoProcessor,
+        )
+
+        processor = Gemma4UnifiedVideoProcessor()
+        self.assertEqual(
+            processor.video_sampling_defaults(), {"max_frames": processor.num_frames}
+        )
+
+    def test_minicpmv_declares_its_frame_count(self):
+        from mlx_vlm.models.minicpmv4_6.processing_minicpmv4_6 import (
+            MiniCPMVVideoProcessor,
+        )
+
+        processor = MiniCPMVVideoProcessor()
+        self.assertEqual(
+            processor.video_sampling_defaults(),
+            {"max_frames": processor.max_num_frames},
+        )

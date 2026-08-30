@@ -10,11 +10,14 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.utils import (
+    DEFAULT_VIDEO_SAMPLING,
     StoppingCriteria,
+    VideoSampling,
     _drop_modules_without_weights,
     _load_safetensors,
     _quantization_for_module_path,
@@ -29,9 +32,12 @@ from mlx_vlm.utils import (
     load_image,
     load_model,
     load_processor,
+    load_video,
     prepare_inputs,
     process_image,
     process_inputs_with_fallback,
+    processor_video_sampling,
+    resolve_video_sampling,
     sanitize_weights,
     update_module_configs,
 )
@@ -1526,3 +1532,152 @@ def test_modelopt_mixed_folds_many_tensors_without_exhausting_buffers():
 
     assert len(transformed) == 2 * count
     assert transformed[f"l.{count - 1}.scales"].dtype == mx.uint8
+
+
+@pytest.fixture(scope="module")
+def synthetic_video(tmp_path_factory):
+    """A deterministic 600-frame 64x64 clip at 30 fps, i.e. 20 seconds."""
+    cv2 = pytest.importorskip("cv2")
+    path = tmp_path_factory.mktemp("video") / "clip.mp4"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (64, 64))
+    for i in range(600):
+        writer.write(np.full((64, 64, 3), i % 256, np.uint8))
+    writer.release()
+    return str(path)
+
+
+class _AttributeVideoProcessor:
+    """A video processor naming its knobs the way load_video does."""
+
+    fps = 1.0
+    min_frames = 8
+    max_frames = 100
+
+
+class _HookVideoProcessor:
+    """A video processor whose cap is named something else entirely."""
+
+    num_frames = 32
+
+    def video_sampling_defaults(self):
+        return {"max_frames": self.num_frames}
+
+
+class TestVideoSampling:
+    def test_merge_fills_only_unset_fields(self):
+        merged = VideoSampling(fps=3.0).merge(VideoSampling(fps=1.0, max_frames=99))
+        assert merged.fps == 3.0
+        assert merged.max_frames == 99
+
+    def test_library_defaults_match_the_historical_load_video_signature(self):
+        assert DEFAULT_VIDEO_SAMPLING == VideoSampling(
+            fps=2.0, nframes=None, min_frames=4, max_frames=768, frame_factor=2
+        )
+
+
+class TestLoadVideo:
+    @pytest.mark.parametrize(
+        "kwargs,frames,sampled_fps",
+        [
+            ({}, 40, 2.0),
+            ({"fps": 0.5}, 10, 0.5),
+            ({"fps": 1.0}, 20, 1.0),
+            ({"fps": 8.0}, 160, 8.0),
+            ({"nframes": 12}, 12, 0.6),
+            ({"nframes": 7}, 8, 0.4),
+            ({"fps": 0.1, "min_frames": 30}, 30, 1.5),
+        ],
+    )
+    def test_frame_count_and_effective_fps(
+        self, synthetic_video, kwargs, frames, sampled_fps
+    ):
+        video, metadata = load_video(synthetic_video, **kwargs)
+        assert video.shape[0] == frames
+        assert metadata.sampled_fps == pytest.approx(sampled_fps)
+
+    @pytest.mark.parametrize(
+        "max_frames,frames,sampled_fps", [(8, 8, 0.4), (40, 40, 2.0), (768, 160, 8.0)]
+    )
+    def test_max_frames_clamps_the_requested_rate(
+        self, synthetic_video, max_frames, frames, sampled_fps
+    ):
+        """A cap below what ``fps`` asks for drags the effective rate well
+        under the requested one, which is what callers need reported back."""
+        video, metadata = load_video(synthetic_video, fps=8.0, max_frames=max_frames)
+        assert video.shape[0] == frames
+        assert metadata.sampled_fps == pytest.approx(sampled_fps)
+
+    def test_struct_and_keyword_forms_agree(self, synthetic_video):
+        by_struct = load_video(synthetic_video, VideoSampling(fps=8.0, max_frames=8))
+        by_kwargs = load_video(synthetic_video, fps=8.0, max_frames=8)
+        assert np.array_equal(by_struct[0], by_kwargs[0])
+        assert by_struct[1] == by_kwargs[1]
+
+    def test_struct_takes_precedence_over_keywords(self, synthetic_video):
+        _, metadata = load_video(synthetic_video, VideoSampling(fps=1.0), fps=8.0)
+        assert metadata.sampled_fps == pytest.approx(1.0)
+
+    def test_unknown_keyword_is_rejected(self, synthetic_video):
+        with pytest.raises(TypeError, match="fpss"):
+            load_video(synthetic_video, fpss=1.0)
+
+    def test_metadata_describes_the_source_clip(self, synthetic_video):
+        video, metadata = load_video(synthetic_video, fps=1.0)
+        assert metadata.total_num_frames == 600
+        assert metadata.fps == pytest.approx(30.0)
+        assert metadata.duration == pytest.approx(20.0)
+        assert (metadata.width, metadata.height) == (64, 64)
+        assert len(metadata.frames_indices) == video.shape[0]
+
+    def test_timestamps_span_the_clip_at_the_source_frame_rate(self, synthetic_video):
+        _, metadata = load_video(synthetic_video, fps=1.0)
+        assert metadata.timestamps[0] == pytest.approx(0.0)
+        assert metadata.timestamps[-1] == pytest.approx(20.0, abs=0.05)
+
+
+class TestProcessorVideoSampling:
+    def test_processor_without_a_video_component_declares_nothing(self):
+        assert processor_video_sampling(SimpleNamespace()) == VideoSampling()
+
+    def test_matching_attributes_are_picked_up(self):
+        processor = SimpleNamespace(video_processor=_AttributeVideoProcessor())
+        assert processor_video_sampling(processor) == VideoSampling(
+            fps=1.0, min_frames=8, max_frames=100
+        )
+
+    def test_hook_declares_a_differently_named_cap(self):
+        processor = SimpleNamespace(video_processor=_HookVideoProcessor())
+        assert processor_video_sampling(processor) == VideoSampling(max_frames=32)
+
+
+class TestResolveVideoSampling:
+    def test_falls_back_to_library_defaults(self):
+        assert resolve_video_sampling(SimpleNamespace(), {}) == DEFAULT_VIDEO_SAMPLING
+
+    def test_processor_beats_defaults(self):
+        processor = SimpleNamespace(video_processor=_AttributeVideoProcessor())
+        resolved = resolve_video_sampling(processor, {})
+        assert (resolved.fps, resolved.min_frames, resolved.max_frames) == (1.0, 8, 100)
+
+    def test_caller_beats_processor(self):
+        processor = SimpleNamespace(video_processor=_AttributeVideoProcessor())
+        resolved = resolve_video_sampling(processor, {"fps": 4.0, "max_frames": 20})
+        assert (resolved.fps, resolved.max_frames) == (4.0, 20)
+        assert resolved.min_frames == 8
+
+    def test_caller_beats_a_hook_declared_cap(self):
+        processor = SimpleNamespace(video_processor=_HookVideoProcessor())
+        assert resolve_video_sampling(processor, {"max_frames": 5}).max_frames == 5
+
+    def test_sampling_keys_do_not_travel_on_to_the_processor(self):
+        """The processor only ever sees frames that were already chosen, so
+        leaving these in kwargs would read as silently ignored."""
+        kwargs = {
+            "fps": 1.0,
+            "nframes": 4,
+            "min_frames": 6,
+            "max_frames": 20,
+            "temperature": 0.7,
+        }
+        resolve_video_sampling(SimpleNamespace(), kwargs)
+        assert kwargs == {"temperature": 0.7}

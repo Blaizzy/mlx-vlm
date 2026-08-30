@@ -2614,7 +2614,7 @@ def test_resolve_video_inputs_uses_one_global_frame_budget():
     assert resolution.frame_fps == pytest.approx(1.5)
     assert images == [still]
     assert videos == ["first.mp4", "second.mp4"]
-    mock_sample.assert_called_once_with(videos, 1.5)
+    mock_sample.assert_called_once_with(videos, 1.5, None)
 
 
 def test_resolve_video_inputs_does_not_partially_mutate_on_decode_failure():

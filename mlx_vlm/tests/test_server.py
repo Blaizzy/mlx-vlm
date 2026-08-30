@@ -3595,7 +3595,7 @@ def test_chat_completions_endpoint_falls_back_from_video_to_images(client):
     assert mock_template.call_args.kwargs["video"] is None
     assert mock_generate.call_args.kwargs["image"] == frames
     assert mock_generate.call_args.kwargs["video"] == []
-    mock_sample.assert_called_once_with(["clip.mp4"], 2.0)
+    mock_sample.assert_called_once_with(["clip.mp4"], 2.0, None)
 
 
 def test_chat_completions_endpoint_preserves_assistant_reasoning_content(client):
