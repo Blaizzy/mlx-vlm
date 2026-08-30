@@ -3881,47 +3881,19 @@ def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) -> 
 def _align_exact_batch_caches_to_kv_policy(
     caches: List[Any],
     kv_quant_config: dict,
-) -> Optional[List[Any]]:
+) -> List[Any]:
     """Align legacy float full-attn snapshots with live ``_make_cache``.
 
     Native quantized snapshots already merge into their matching batch cache
     and pass through unchanged. Older float snapshots still need conversion
     so continuous-batching joins use the same per-layer types as cold rows.
     """
-    from .models.cache import (
-        BatchKVCache,
-        BatchQuantizedKVCache,
-        should_quantize_kv_layer,
-    )
-    from .turboquant import BatchTurboQuantKVCache
+    from .models.cache import BatchKVCache, should_quantize_kv_layer
 
     n = len(caches)
-    policy = kv_quant_from_config(kv_quant_config)
-    _reject_mixed_batch_policy(policy)
     out: List[Any] = []
     for layer_idx, c in enumerate(caches):
         quantize = should_quantize_kv_layer(layer_idx, n)
-        if isinstance(c, BatchQuantizedKVCache):
-            if (
-                not quantize
-                or policy.is_turboquant
-                or int(c.bits) != int(policy.bits)
-                or int(c.group_size) != int(policy.group_size)
-            ):
-                return None
-            out.append(c)
-            continue
-        if isinstance(c, BatchTurboQuantKVCache):
-            if (
-                not quantize
-                or not policy.is_turboquant
-                or c.bits != policy.bits
-                or c.key_bits != policy.key.bits
-                or c.value_bits != policy.value.bits
-            ):
-                return None
-            out.append(c)
-            continue
         if not quantize or not isinstance(c, BatchKVCache):
             out.append(c)
             continue
@@ -3978,8 +3950,6 @@ def make_warm_batch_exact_cache_multi(
 
     if kv_quant_config is not None:
         out = _align_exact_batch_caches_to_kv_policy(out, kv_quant_config)
-        if out is None:
-            return None, 0
 
     eval_targets: List[mx.array] = []
     for c in out:

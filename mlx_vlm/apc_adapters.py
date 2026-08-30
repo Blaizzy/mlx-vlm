@@ -8,10 +8,10 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import mlx.core as mx
 
-# v5 stores quantized checkpoint components in their native packed form. Keep
-# them isolated from v4 float-expanded snapshots and from older readers that
-# do not understand the packed cache contracts.
-ADAPTER_SCHEMA_VERSION = 5
+# v4 invalidates v3 hybrid checkpoints captured with the old 16-token guard.
+# Reusing those 4,080-token snapshots would bypass the new prompt_length - 1
+# replay boundary and reintroduce batch-shape and mRoPE parity drift.
+ADAPTER_SCHEMA_VERSION = 4
 
 
 class Capability(str, Enum):
@@ -128,17 +128,6 @@ def _has_explicit_snapshot_contract(cache: Any) -> bool:
     for klass in type(cache).__mro__:
         if "prefix_cache_snapshot" in klass.__dict__:
             return klass.__dict__["prefix_cache_snapshot"] is not base_snapshot
-    return False
-
-
-def _has_explicit_merge_contract(cache: Any) -> bool:
-    """True when a cache type overrides the default no-op merge contract."""
-    from .models.cache import _BaseCache
-
-    base_merge = _BaseCache.__dict__.get("prefix_cache_merge")
-    for klass in type(cache).__mro__:
-        if "prefix_cache_merge" in klass.__dict__:
-            return klass.__dict__["prefix_cache_merge"] is not base_merge
     return False
 
 
@@ -643,9 +632,10 @@ def merge_cache_entries(entries, prefix_lens):
         return None
     first = entries[0]
     for entry in entries:
-        if not _has_explicit_merge_contract(entry):
+        merge = getattr(entry, "prefix_cache_merge", None)
+        if not callable(merge):
             continue
-        merged = entry.prefix_cache_merge(entries, prefix_lens)
+        merged = merge(entries, prefix_lens)
         if merged is not None:
             return merged
     for typ, adapter in _clone_rules():

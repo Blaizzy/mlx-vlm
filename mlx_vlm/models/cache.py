@@ -318,7 +318,7 @@ class QuantizedKVCache(_BaseCache):
         return n
 
     def dequantize_for_apc(self):
-        """Return raw float K/V for block-mode APC harvesting.
+        """Return raw float (keys, values) sliced to current offset for APC storage.
 
         Returns (None, None) if the cache is empty.
         """
@@ -335,10 +335,9 @@ class QuantizedKVCache(_BaseCache):
 
     def prefix_cache_restore(self, snapshot):
         """Restore a native packed snapshot into a fresh cache."""
-        offset, group_size, bits = map(int, snapshot["meta_state"])
-        self.__init__(group_size=group_size, bits=bits)
+        self.__init__()
         self.state = snapshot["state"]
-        self.offset = offset
+        self.meta_state = snapshot["meta_state"]
 
     def prefix_cache_reserve(self, min_capacity_tokens):
         """Reserve packed capacity for the first post-restore update."""
@@ -1974,7 +1973,7 @@ class BatchQuantizedKVCache(_BaseCache):
         )
 
     def dequantize_for_apc(self):
-        """Return raw float K/V for block-mode APC harvesting.
+        """Return raw float (keys, values) sliced to current _idx for APC storage.
 
         Returns (None, None) if the cache is empty.
         """

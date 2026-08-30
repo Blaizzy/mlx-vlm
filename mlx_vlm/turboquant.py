@@ -3951,74 +3951,6 @@ def _state_length(state) -> int:
     raise TypeError(f"Unsupported TurboQuant state type: {type(state)!r}")
 
 
-def _snapshot_state_tree(state):
-    """Convert a packed TurboQuant state into a serializer-friendly tree."""
-    if state is None:
-        return None
-    if isinstance(state, TurboQuantMSEState):
-        return {"kind": "mse", "norms": state.norms, "indices": state.indices}
-    if isinstance(state, TurboQuantProdState):
-        return {
-            "kind": "prod",
-            "norms": state.norms,
-            "mse_indices": state.mse_indices,
-            "residual_norms": state.residual_norms,
-            "qjl_signs": state.qjl_signs,
-        }
-    if isinstance(state, TurboQuantPolarState):
-        return {
-            "kind": "polar",
-            "radii": state.radii,
-            "level_indices": list(state.level_indices),
-        }
-    if isinstance(state, TurboQuantPolarProdState):
-        return {
-            "kind": "polar_prod",
-            "norms": state.norms,
-            "polar_state": _snapshot_state_tree(state.polar_state),
-            "residual_norms": state.residual_norms,
-            "qjl_signs": state.qjl_signs,
-        }
-    if isinstance(state, TurboQuantSplitState):
-        return {
-            "kind": "split",
-            "low": _snapshot_state_tree(state.low),
-            "high": _snapshot_state_tree(state.high),
-        }
-    raise TypeError(f"Unsupported TurboQuant state type: {type(state)!r}")
-
-
-def _restore_state_tree(snapshot):
-    """Rebuild the packed NamedTuple state produced by ``_snapshot_state_tree``."""
-    if snapshot is None:
-        return None
-    kind = snapshot.get("kind")
-    if kind == "mse":
-        return TurboQuantMSEState(snapshot["norms"], snapshot["indices"])
-    if kind == "prod":
-        return TurboQuantProdState(
-            snapshot["norms"],
-            snapshot["mse_indices"],
-            snapshot["residual_norms"],
-            snapshot["qjl_signs"],
-        )
-    if kind == "polar":
-        return TurboQuantPolarState(snapshot["radii"], tuple(snapshot["level_indices"]))
-    if kind == "polar_prod":
-        return TurboQuantPolarProdState(
-            snapshot["norms"],
-            _restore_state_tree(snapshot["polar_state"]),
-            snapshot["residual_norms"],
-            snapshot["qjl_signs"],
-        )
-    if kind == "split":
-        return TurboQuantSplitState(
-            _restore_state_tree(snapshot["low"]),
-            _restore_state_tree(snapshot["high"]),
-        )
-    raise ValueError(f"Unsupported TurboQuant snapshot state: {kind!r}")
-
-
 def _allocate_state_like(state, length: int):
     if isinstance(state, TurboQuantMSEState):
         return TurboQuantMSEState(
@@ -5036,49 +4968,46 @@ class _SplitCodec:
         return mx.take(merged, self.restore_order, axis=-1), denom, max_scores
 
 
-def _snapshot_codec(codec):
+def _snapshot_kv_codec(codec):
     if codec is None:
         return None
     if isinstance(codec, _SplitCodec):
-        return {
-            "kind": "split",
-            "dim": codec.dim,
-            "bits": codec.bits,
-            "mode": codec.mode,
-            "low_idx": codec.low_idx,
-            "high_idx": codec.high_idx,
-        }
+        return codec.dim, codec.low_idx, codec.high_idx
     if isinstance(codec, _TurboQuantMSECodec):
-        return {"kind": "mse", "dim": codec.dim, "bits": codec.bits}
-    if isinstance(codec, _TurboQuantProdCodec):
-        return {"kind": "prod", "dim": codec.dim, "bits": codec.bits}
-    if isinstance(codec, _TurboQuantPolarProdCodec):
-        return {"kind": "polar_prod", "dim": codec.dim, "bits": codec.bits}
-    raise TypeError(f"Unsupported TurboQuant codec type: {type(codec)!r}")
+        return codec.dim, None, None
+    raise TypeError(f"Unsupported TurboQuant KV codec: {type(codec)!r}")
 
 
-def _restore_codec(snapshot, seed: int):
+def _restore_kv_codec(snapshot, bits: float, seed: int):
     if snapshot is None:
         return None
-    kind = snapshot.get("kind")
-    dim = int(snapshot["dim"])
-    bits = snapshot["bits"]
-    if kind == "mse":
+    dim, low_idx, high_idx = snapshot
+    if low_idx is None and high_idx is None:
         return _TurboQuantMSECodec(dim, int(bits), seed)
-    if kind == "prod":
-        return _TurboQuantProdCodec(dim, int(bits), seed)
-    if kind == "polar_prod":
-        return _TurboQuantPolarProdCodec(dim, int(bits), seed)
-    if kind == "split":
+    if low_idx is not None and high_idx is not None:
         return _SplitCodec.from_indices(
             dim,
             float(bits),
-            snapshot["mode"],
+            "mse",
             seed,
-            np.asarray(snapshot["low_idx"]),
-            np.asarray(snapshot["high_idx"]),
+            low_idx,
+            high_idx,
         )
-    raise ValueError(f"Unsupported TurboQuant codec snapshot: {kind!r}")
+    raise ValueError("incomplete TurboQuant split-codec snapshot")
+
+
+def _restore_kv_state(state, codec):
+    """Restore NamedTuple types erased by the generic checkpoint serializer."""
+    if state is None:
+        return None
+    if isinstance(codec, _SplitCodec):
+        return TurboQuantSplitState(
+            _restore_kv_state(state[0], codec.low_codec),
+            _restore_kv_state(state[1], codec.high_codec),
+        )
+    if isinstance(codec, _TurboQuantMSECodec):
+        return TurboQuantMSEState(*state)
+    raise TypeError(f"Unsupported TurboQuant KV codec: {type(codec)!r}")
 
 
 def _codecs_compatible(lhs, rhs) -> bool:
@@ -5088,7 +5017,6 @@ def _codecs_compatible(lhs, rhs) -> bool:
     if isinstance(lhs, _SplitCodec):
         return (
             lhs.bits == rhs.bits
-            and lhs.mode == rhs.mode
             and lhs.dim == rhs.dim
             and bool(mx.array_equal(lhs.low_idx, rhs.low_idx).item())
             and bool(mx.array_equal(lhs.high_idx, rhs.high_idx).item())
@@ -5291,7 +5219,7 @@ class TurboQuantKVCache(_BaseCache):
         return keys, values
 
     def dequantize_for_apc(self):
-        """Return raw float K/V for block-mode APC harvesting.
+        """Return raw float (keys, values) for APC storage.
 
         Returns (None, None) if the cache is empty.
         """
@@ -5303,35 +5231,29 @@ class TurboQuantKVCache(_BaseCache):
         """Capture packed state and the codec coordinates needed to decode it."""
         return {
             "meta_state": self.meta_state,
-            "keys": _snapshot_state_tree(_slice_state(self.keys, self.offset)),
-            "values": _snapshot_state_tree(_slice_state(self.values, self.offset)),
-            "key_codec": _snapshot_codec(self.key_codec),
-            "value_codec": _snapshot_codec(self.value_codec),
+            "keys": _slice_state(self.keys, self.offset),
+            "values": _slice_state(self.values, self.offset),
+            "key_codec": _snapshot_kv_codec(self.key_codec),
+            "value_codec": _snapshot_kv_codec(self.value_codec),
         }
 
     def prefix_cache_restore(self, snapshot):
         """Restore packed state without dequantizing and re-quantizing it."""
         meta = snapshot["meta_state"]
-        offset = int(meta[0])
-        bits = float(meta[1])
-        seed = int(meta[2])
-        key_bits = float(meta[3]) if len(meta) > 3 else None
-        value_bits = float(meta[4]) if len(meta) > 4 else None
-        self.__init__(
-            bits=bits,
-            seed=seed,
-            key_bits=key_bits,
-            value_bits=value_bits,
+        self.__init__(bits=float(meta[1]))
+        self.meta_state = meta
+        self.key_codec = _restore_kv_codec(
+            snapshot.get("key_codec"), self.key_bits, self.seed
         )
-        self.keys = _restore_state_tree(snapshot["keys"])
-        self.values = _restore_state_tree(snapshot["values"])
-        self.offset = offset
-        self.key_codec = _restore_codec(snapshot.get("key_codec"), seed)
-        self.value_codec = _restore_codec(snapshot.get("value_codec"), seed + 1)
-        if self.keys is not None and (
+        self.value_codec = _restore_kv_codec(
+            snapshot.get("value_codec"), self.value_bits, self.seed + 1
+        )
+        if snapshot["keys"] is not None and (
             self.key_codec is None or self.value_codec is None
         ):
             raise ValueError("packed TurboQuant snapshot is missing codec metadata")
+        self.keys = _restore_kv_state(snapshot["keys"], self.key_codec)
+        self.values = _restore_kv_state(snapshot["values"], self.value_codec)
 
     def prefix_cache_reserve(self, min_capacity_tokens):
         """Reserve packed capacity for the first post-restore update."""
@@ -6617,7 +6539,7 @@ class BatchTurboQuantKVCache(_BaseCache):
         return k, v
 
     def dequantize_for_apc(self):
-        """Return raw float K/V for block-mode APC harvesting.
+        """Return raw float (keys, values) for APC storage.
 
         Returns (None, None) if the cache is empty.
         """

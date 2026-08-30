@@ -27,6 +27,7 @@ from mlx_vlm.apc import (
     make_warm_batch_kv_cache_multi,
     make_warm_kv_cache,
     model_apc_mode,
+    snapshot_prompt_cache_row,
 )
 from mlx_vlm.apc_adapters import apc_block_eligible, apc_exact_eligible
 from mlx_vlm.generate.ar import _extend_cache, _make_cache
@@ -77,6 +78,20 @@ def _assert_packed_state_equal(lhs, rhs):
         assert left.dtype == right.dtype
         assert left.shape == right.shape
         assert bool(mx.array_equal(left, right).item())
+
+
+def _disk_roundtrip(tmp_path, namespace, token_ids, snapshot):
+    disk = DiskBlockStore(tmp_path, namespace=namespace)
+    manager = APCManager(num_blocks=1, block_size=BLOCK_SIZE, disk=disk)
+    assert manager.store_exact_cache(token_ids, snapshot)
+    disk._q.join()
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace=namespace)
+    manager = APCManager(num_blocks=1, block_size=BLOCK_SIZE, disk=disk)
+    restored = manager.lookup_exact_cache(token_ids + [999])
+    manager.close()
+    return restored
 
 
 # ---------------------------------------------------------------------------
@@ -617,10 +632,10 @@ class TestExactModeQuantized:
 
 
 class TestNativePackedExactCheckpoints:
-    def test_uniform_snapshot_and_merge_never_requantize(self, monkeypatch):
-        from mlx_vlm.apc import snapshot_prompt_cache_row
-
+    def test_uniform_roundtrip_and_merge_stay_packed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
         seq_len = 32
+        token_ids = list(range(seq_len))
         source = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
         keys, values = _rand_kv(seq_len=seq_len)
         source.update_and_fetch(keys, values)
@@ -652,44 +667,18 @@ class TestNativePackedExactCheckpoints:
         assert isinstance(warm[0], BatchQuantizedKVCache)
         _assert_packed_state_equal(warm[0].extract(0).state, expected.state)
 
-    def test_uniform_disk_roundtrip_preserves_packed_state(self, tmp_path, monkeypatch):
-        from mlx_vlm.apc import snapshot_prompt_cache_row
-
-        monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
-        seq_len = 64
-        token_ids = list(range(seq_len))
-        source = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
-        keys, values = _rand_kv(seq_len=seq_len)
-        source.update_and_fetch(keys, values)
-        mx.eval(source.state)
-
-        def fail(*args, **kwargs):
-            raise AssertionError("disk checkpoint must stay packed")
-
-        monkeypatch.setattr(QuantizedKVCache, "dequantize_for_apc", fail)
-        snapshot = snapshot_prompt_cache_row([source], batch_idx=0)
-        assert snapshot is not None
-
-        disk = DiskBlockStore(tmp_path, namespace="native-uniform")
-        manager = APCManager(num_blocks=1, block_size=BLOCK_SIZE, disk=disk)
-        assert manager.store_exact_cache(token_ids, snapshot)
-        disk._q.join()
-        manager.close()
-
-        disk = DiskBlockStore(tmp_path, namespace="native-uniform")
-        manager = APCManager(num_blocks=1, block_size=BLOCK_SIZE, disk=disk)
-        restored, matched = manager.lookup_exact_cache(token_ids + [999])
+        restored, matched = _disk_roundtrip(
+            tmp_path, "native-uniform", token_ids, snapshot
+        )
         assert matched == seq_len
         assert restored is not None
         assert isinstance(restored[0], QuantizedKVCache)
         _assert_packed_state_equal(restored[0].state, snapshot[0].state)
-        manager.close()
 
     @pytest.mark.parametrize("bits", [4.0, 3.5])
     def test_turboquant_disk_roundtrip_preserves_packed_state(
         self, tmp_path, monkeypatch, bits
     ):
-        from mlx_vlm.apc import snapshot_prompt_cache_row
         from mlx_vlm.turboquant import TurboQuantKVCache
 
         monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
@@ -708,16 +697,9 @@ class TestNativePackedExactCheckpoints:
         assert snapshot is not None
         assert isinstance(snapshot[0], TurboQuantKVCache)
 
-        namespace = f"native-turbo-{bits}"
-        disk = DiskBlockStore(tmp_path, namespace=namespace)
-        manager = APCManager(num_blocks=1, block_size=BLOCK_SIZE, disk=disk)
-        assert manager.store_exact_cache(token_ids, snapshot)
-        disk._q.join()
-        manager.close()
-
-        disk = DiskBlockStore(tmp_path, namespace=namespace)
-        manager = APCManager(num_blocks=1, block_size=BLOCK_SIZE, disk=disk)
-        restored, matched = manager.lookup_exact_cache(token_ids + [999])
+        restored, matched = _disk_roundtrip(
+            tmp_path, f"native-turbo-{bits}", token_ids, snapshot
+        )
         assert matched == seq_len
         assert restored is not None
         assert isinstance(restored[0], TurboQuantKVCache)
@@ -740,7 +722,6 @@ class TestNativePackedExactCheckpoints:
         updated = warm[0].update_and_fetch(next_keys, next_values)
         mx.eval(updated)
         assert warm[0]._idx == seq_len + 1
-        manager.close()
 
 
 # ---------------------------------------------------------------------------
