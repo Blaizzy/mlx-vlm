@@ -73,6 +73,10 @@ def test_qwen4_decoder_layers_expose_normalized_layer_types_for_mtp():
     assert Qwen4ExpDecoderLayer(config, 1).layer_type == "qwen_sparse_attention"
 
 
+def test_qwen4_mtp_declares_continuous_batching_support():
+    assert Qwen4ExpMTPDraftModel.supports_continuous_batching is True
+
+
 def test_qwen4_mtp_fusion_matches_released_equations():
     config = _tiny_text_config()
     drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=config))
