@@ -1234,6 +1234,10 @@ def generate(
         text += response.text
         last_response = response
 
+    clean_output = getattr(processor, "clean_output", None)
+    if callable(clean_output):
+        text = clean_output(text)
+
     if last_response is None:
         return GenerationResult(text=text, peak_memory=mx.get_peak_memory() / 1e9)
 
