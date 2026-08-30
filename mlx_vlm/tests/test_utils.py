@@ -19,6 +19,7 @@ from mlx_vlm.utils import (
     _load_safetensors,
     _quantization_for_module_path,
     _quantization_path_aliases,
+    _transform_compressed_tensors_weights,
     _transform_modelopt_nvfp4_weights,
     apply_generation_config_defaults,
     estimate_num_image_tokens,
@@ -85,6 +86,50 @@ def test_transform_modelopt_mixed_nvfp4_fp8_weights():
     assert transformed["attention.weight"].tolist() == [[0.5, 1.0], [0.75, 1.0]]
     assert not any("weight_scale" in key or "input_scale" in key for key in transformed)
     assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
+def test_transform_compressed_tensors_pure_fp8_weights():
+    weights = {
+        "linear.weight": mx.array(
+            [
+                [56, 64, 56, 64],
+                [68, 72, 68, 72],
+                [56, 64, 56, 64],
+                [68, 72, 68, 72],
+            ],
+            dtype=mx.uint8,
+        ),
+        "linear.weight_scale": mx.array([[0.5, 0.25], [0.125, 1.0]], dtype=mx.bfloat16),
+        "linear.input_scale": mx.array(0.125, dtype=mx.float32),
+    }
+    config = {
+        "quant_method": "compressed-tensors",
+        "format": "float-quantized",
+        "config_groups": {
+            "group_0": {
+                "format": "float-quantized",
+                "weights": {
+                    "block_structure": [2, 2],
+                    "num_bits": 8,
+                    "strategy": "block",
+                    "type": "float",
+                },
+            }
+        },
+    }
+
+    transformed, quantization = _transform_compressed_tensors_weights(weights, config)
+
+    assert transformed["linear.weight"].dtype == mx.bfloat16
+    assert transformed["linear.weight"].tolist() == [
+        [0.5, 1.0, 0.25, 0.5],
+        [1.5, 2.0, 0.75, 1.0],
+        [0.125, 0.25, 1.0, 2.0],
+        [0.375, 0.5, 3.0, 4.0],
+    ]
+    assert "linear.weight_scale" not in transformed
+    assert "linear.input_scale" not in transformed
+    assert quantization is None
 
 
 class MockTensor:
