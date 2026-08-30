@@ -8,6 +8,7 @@ from .common import (
     _record_speculative_round,
     _speculative_walk,
     _speculative_walk_batch,
+    _speculative_walk_batch_uniform_acceptance,
     _SpeculativeSamplerRNG,
     generation_stream,
 )
@@ -77,6 +78,45 @@ def _dflash_committed_hidden_segments(
         hidden_full[i : i + 1, : len(new_tokens), :]
         for i, new_tokens in enumerate(new_tokens_list)
     ]
+
+
+def _target_requires_uniform_dflash_acceptance(model: nn.Module) -> bool:
+    target = getattr(model, "language_model", model)
+    return bool(getattr(target, "requires_uniform_dflash_acceptance", False))
+
+
+def _dflash_uniform_acceptance(
+    model: nn.Module,
+    draft_tokens: mx.array,
+    accepted_list: List[int],
+    new_tokens_list: List[List[int]],
+    budgets: List[int],
+    target_tokens: Optional[mx.array] = None,
+) -> Tuple[List[int], List[List[int]]]:
+    if (
+        len(accepted_list) <= 1
+        or not _target_requires_uniform_dflash_acceptance(model)
+        or len(set(accepted_list)) == 1
+    ):
+        return accepted_list, new_tokens_list
+
+    if target_tokens is not None:
+        return _speculative_walk_batch_uniform_acceptance(
+            draft_tokens, target_tokens, accepted_list, budgets
+        )
+
+    accepted = min(accepted_list)
+    draft_rows = draft_tokens.tolist()
+    uniform_tokens = []
+    for row, budget in enumerate(budgets):
+        tokens = draft_rows[row][:accepted]
+        if len(tokens) < budget:
+            if accepted_list[row] == accepted:
+                tokens.append(new_tokens_list[row][accepted])
+            else:
+                tokens.append(draft_rows[row][accepted])
+        uniform_tokens.append(tokens[:budget])
+    return [accepted] * len(accepted_list), uniform_tokens
 
 
 def _supports_positioned_target_sampling(sampler: Callable) -> bool:
@@ -498,6 +538,15 @@ def _dflash_rounds_batch(
                 base_positions=[emitted[active_idx[j]] for j in range(n_active)],
             )
             sampler_rng.target_sampled(sync_draft=not positioned_sampling)
+
+        accepted_list, new_tokens_list = _dflash_uniform_acceptance(
+            model,
+            draft_tokens,
+            accepted_list,
+            new_tokens_list,
+            budgets,
+            target_tokens if greedy_sampling else None,
+        )
 
         min_accepted = min(accepted_list)
         accepted_arr = mx.array(accepted_list)
