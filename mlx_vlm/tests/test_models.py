@@ -1951,6 +1951,80 @@ class TestModels(unittest.TestCase):
         self.assertFalse(any(".weight_global_scale" in key for key in sanitized))
         self.assertFalse(any(".input_global_scale" in key for key in sanitized))
 
+    def test_laguna_stacks_pure_fp8_experts_after_dequantization(self):
+        from mlx_vlm.models import laguna
+        from mlx_vlm.utils import _transform_compressed_tensors_weights
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=128,
+            mlp_layer_types=["dense", "sparse"],
+            num_attention_heads_per_layer=[2, 2],
+            num_experts=3,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+        )
+        model = laguna.Model(config)
+        weights = {}
+        for expert_idx in range(config.num_experts):
+            for proj in ["gate_proj", "up_proj", "down_proj"]:
+                prefix = f"model.layers.1.mlp.experts.{expert_idx}.{proj}"
+                weights[f"{prefix}.weight"] = mx.full(
+                    (16, 16), 56 + expert_idx, dtype=mx.uint8
+                )
+                weights[f"{prefix}.weight_scale"] = mx.full(
+                    (2, 2), 0.5, dtype=mx.bfloat16
+                )
+        for proj in ["gate_proj", "up_proj", "down_proj"]:
+            prefix = f"model.layers.1.mlp.shared_expert.{proj}"
+            weights[f"{prefix}.weight"] = mx.full((16, 16), 56, dtype=mx.uint8)
+            weights[f"{prefix}.weight_scale"] = mx.full((2, 2), 0.5, dtype=mx.bfloat16)
+
+        transformed, quantization = _transform_compressed_tensors_weights(
+            weights,
+            {
+                "quant_method": "compressed-tensors",
+                "format": "float-quantized",
+                "config_groups": {
+                    "group_0": {
+                        "format": "float-quantized",
+                        "weights": {
+                            "block_structure": [8, 8],
+                            "num_bits": 8,
+                            "strategy": "block",
+                            "type": "float",
+                        },
+                    }
+                },
+            },
+        )
+        sanitized = model.language_model.sanitize(transformed)
+
+        prefix = "model.layers.1.mlp"
+        assert sanitized[f"{prefix}.switch_mlp.gate_up_proj.weight"].shape == (
+            3,
+            32,
+            16,
+        )
+        assert sanitized[f"{prefix}.switch_mlp.down_proj.weight"].shape == (
+            3,
+            16,
+            16,
+        )
+        assert sanitized[f"{prefix}.shared_expert.gate_proj.weight"].dtype == (
+            mx.bfloat16
+        )
+        assert not any(key.endswith(".weight_scale") for key in sanitized)
+        assert quantization is None
+
     def test_laguna_folds_nvfp4_shared_experts(self):
         from unittest.mock import patch
 

@@ -407,37 +407,84 @@ def _compressed_tensors_group_weights(
 
 
 def _dequantize_compressed_tensors_fp8_weight(
-    weight: mx.array, scale: mx.array
+    weight: mx.array,
+    scale: mx.array,
+    block_structure: Optional[List[int]] = None,
 ) -> mx.array:
-    """Dequantize a channel-wise fp8 ``float-quantized`` weight to dense.
+    """Dequantize an fp8 ``float-quantized`` weight to dense.
 
-    ``float-quantized`` (``num_bits: 8``, ``strategy: channel``) stores the
-    weight as ``float8_e4m3fn`` -- which ``mx.load`` surfaces as raw ``uint8``
-    E4M3 bytes -- plus a per-output-channel ``weight_scale``. MLX has no
-    per-channel fp8 quantization mode, so we decode the E4M3 codes with the
-    shared LUT and rescale into a dense tensor: ``w = E4M3(byte) * weight_scale``.
-    The dense weight is emitted in ``weight_scale``'s dtype (the checkpoint's
-    compute dtype, typically ``bfloat16``).
+    ``float-quantized`` stores the weight as ``float8_e4m3fn`` -- which
+    ``mx.load`` surfaces as raw ``uint8`` E4M3 bytes -- plus either a
+    per-output-channel or blockwise ``weight_scale``. MLX has no matching FP8
+    mode, so decode the E4M3 codes and rescale into a dense tensor. The dense
+    weight is emitted in ``weight_scale``'s dtype (typically ``bfloat16``).
     """
+    if weight.dtype != mx.uint8 or weight.ndim < 2:
+        raise ValueError(
+            "Compressed-tensors FP8 weights must be E4M3 byte matrices; "
+            f"got dtype={weight.dtype}, shape={weight.shape}."
+        )
+
     out_dtype = scale.dtype if scale.dtype != mx.float32 else mx.bfloat16
     decoded = _E4M3_DECODE_LUT[weight.astype(mx.uint32)]  # float32 [out, in]
     scale = scale.astype(mx.float32)
-    if scale.ndim == 1:
-        scale = scale[:, None]
-    return (decoded * scale).astype(out_dtype)
+    if block_structure is None:
+        if scale.ndim == 1:
+            scale = scale[:, None]
+        return (decoded * scale).astype(out_dtype)
+
+    if len(block_structure) != 2 or any(size <= 0 for size in block_structure):
+        raise ValueError(
+            "Compressed-tensors FP8 block_structure must contain two positive "
+            f"dimensions; got {block_structure}."
+        )
+    block_rows, block_cols = block_structure
+    *batch_shape, rows, cols = weight.shape
+    row_blocks = (rows + block_rows - 1) // block_rows
+    col_blocks = (cols + block_cols - 1) // block_cols
+    expected_scale_shape = (*batch_shape, row_blocks, col_blocks)
+    if scale.shape != expected_scale_shape:
+        raise ValueError(
+            "Compressed-tensors FP8 scale shape does not match its weight: "
+            f"weight={weight.shape}, scales={scale.shape}, "
+            f"block_structure={block_structure}, expected={expected_scale_shape}."
+        )
+
+    pad_rows = row_blocks * block_rows - rows
+    pad_cols = col_blocks * block_cols - cols
+    if pad_rows or pad_cols:
+        decoded = mx.pad(
+            decoded,
+            [(0, 0)] * len(batch_shape) + [(0, pad_rows), (0, pad_cols)],
+        )
+    decoded = decoded.reshape(
+        *batch_shape,
+        row_blocks,
+        block_rows,
+        col_blocks,
+        block_cols,
+    )
+    decoded = (decoded * scale[..., :, None, :, None]).reshape(
+        *batch_shape,
+        rows + pad_rows,
+        cols + pad_cols,
+    )
+    return decoded[..., :rows, :cols].astype(out_dtype)
 
 
 def _transform_compressed_tensors_mixed_weights(
     weights: Dict[str, mx.array],
     quantization_config: Dict[str, Any],
 ) -> Tuple[Dict[str, mx.array], Optional[Dict[str, Any]]]:
-    """Route a compressed-tensors ``mixed-precision`` checkpoint per group.
+    """Route compressed-tensors mixed-precision or pure FP8 weights.
 
     A ``mixed-precision`` export keeps a single top-level ``format`` and puts
-    the real formats in per-group ``config_groups``. Rather than match each
-    group's regex ``targets``/``ignore`` against module paths (fragile -- the
-    HF names differ from MLX's), we route every quantized Linear by the tensors
-    it actually carries, which is exactly what the group assignment produced:
+    the real formats in per-group ``config_groups``. A pure ``float-quantized``
+    export uses the same FP8 tensor layout without any packed weights. Rather
+    than match each group's regex ``targets``/``ignore`` against module paths
+    (fragile -- the HF names differ from MLX's), route every quantized Linear
+    by the tensors it actually carries, which is exactly what the group
+    assignment produced:
 
     - ``.weight_packed`` + ``.weight_global_scale`` -> NVFP4
       (folded to MLX-native ``nvfp4``, as ``_transform_..._nvfp4_weights`` does)
@@ -468,11 +515,22 @@ def _transform_compressed_tensors_mixed_weights(
     int4_cfg = _compressed_tensors_group_weights(quantization_config, "pack-quantized")
     int4_bits = int4_cfg.get("num_bits", 4)
     int4_group_size = int4_cfg.get("group_size", 32)
+    fp8_cfg = _compressed_tensors_group_weights(quantization_config, "float-quantized")
+    fp8_block_structure = fp8_cfg.get("block_structure")
 
     new_weights: Dict[str, mx.array] = {}
     native_quant: Dict[str, Dict[str, Any]] = {}
+    pending: List[mx.array] = []
 
-    for key, value in weights.items():
+    def flush(force: bool = False) -> None:
+        if pending and (force or len(pending) >= 256):
+            mx.eval(pending)
+            pending.clear()
+
+    for key in list(weights):
+        if key not in weights:
+            continue
+        value = weights[key]
         if key.endswith(".weight_packed"):
             prefix = key[: -len(".weight_packed")]
             scale = weights[f"{prefix}.weight_scale"]
@@ -496,11 +554,18 @@ def _transform_compressed_tensors_mixed_weights(
         if key.endswith(".weight_scale"):
             prefix = key[: -len(".weight_scale")]
             if prefix in fp8_prefixes:
+                weight_key = f"{prefix}.weight"
+                source_weight = weights.pop(weight_key)
+                source_scale = weights.pop(key)
                 new_weights[f"{prefix}.weight"] = (
                     _dequantize_compressed_tensors_fp8_weight(
-                        weights[f"{prefix}.weight"], value
+                        source_weight,
+                        source_scale,
+                        fp8_block_structure,
                     )
                 )
+                pending.append(new_weights[f"{prefix}.weight"])
+                flush()
             # NVFP4 / INT4 scales are consumed with their ``.weight_packed``.
             continue
         if key.endswith(".weight") and key[: -len(".weight")] in fp8_prefixes:
@@ -508,6 +573,8 @@ def _transform_compressed_tensors_mixed_weights(
         if any(key.endswith(suffix) for suffix in _COMPRESSED_TENSORS_DROP_SUFFIXES):
             continue
         new_weights[key] = value
+
+    flush(force=True)
 
     if not native_quant:
         return new_weights, None
@@ -534,9 +601,14 @@ def _transform_compressed_tensors_weights(
     if quantization_config.get("quant_method") != "compressed-tensors":
         return weights, None
 
-    # ``mixed-precision`` puts the real formats in per-group ``config_groups``;
-    # route per group (some groups may be dense fp8 with no ``.weight_packed``).
-    if quantization_config.get("format") == "mixed-precision":
+    # Mixed-precision and pure float-quantized exports both use
+    # ``.weight``/``.weight_scale`` for FP8 tensors. Route these before the
+    # packed-weight guard because a pure FP8 checkpoint has no
+    # ``.weight_packed`` tensors at all.
+    if quantization_config.get("format") in {
+        "mixed-precision",
+        "float-quantized",
+    }:
         return _transform_compressed_tensors_mixed_weights(weights, quantization_config)
 
     if not any(key.endswith(".weight_packed") for key in weights):
