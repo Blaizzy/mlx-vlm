@@ -1241,6 +1241,8 @@ def _iter_leaf_caches(caches):
 
 
 class LanguageModel(nn.Module):
+    requires_uniform_batch_acceptance = True
+
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.args = config
@@ -1371,15 +1373,18 @@ class LanguageModel(nn.Module):
                     continue
                 kv_len = cache._idx
                 verify_start = kv_len - n
-                for bi, valid_end in enumerate(valid_ends.tolist()):
-                    start = verify_start + int(valid_end)
-                    if start < kv_len:
-                        zero_row_tail = getattr(cache, "zero_row_tail", None)
-                        if callable(zero_row_tail):
-                            zero_row_tail(bi, start, kv_len)
-                        else:
-                            cache.keys[bi, :, start:kv_len, :] = 0
-                            cache.values[bi, :, start:kv_len, :] = 0
+                if any(
+                    verify_start + int(valid_end) < kv_len
+                    for valid_end in valid_ends.tolist()
+                ):
+                    raise RuntimeError(
+                        "DeepSeek-V4 batched speculative rollback requires uniform "
+                        f"per-row acceptance; got ragged accepts {accepted.tolist()}. "
+                        "Zeroing a rejected row's KV tail leaves phantom keys "
+                        "attended (issue #1962); set "
+                        "requires_uniform_batch_acceptance on the drafter or target "
+                        "so accepts are clamped before rollback."
+                    )
 
         return max_a
 

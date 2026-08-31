@@ -1409,6 +1409,8 @@ class Qwen3_5Model(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    requires_uniform_batch_acceptance = True
+
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
         self.args = args
@@ -1508,14 +1510,15 @@ class LanguageModel(nn.Module):
             ):
                 kv_len = c._idx
                 verify_start = kv_len - n
-                for bi, ve in enumerate(valid_ends_list):
-                    start = verify_start + ve
-                    if start < kv_len:
-                        if hasattr(c, "zero_row_tail"):
-                            c.zero_row_tail(bi, start, kv_len)
-                        else:
-                            c.keys[bi, :, start:kv_len, :] = 0
-                            c.values[bi, :, start:kv_len, :] = 0
+                if any(verify_start + ve < kv_len for ve in valid_ends_list):
+                    raise RuntimeError(
+                        "Qwen3.5 batched speculative rollback requires uniform "
+                        f"per-row acceptance; got ragged accepts {accepted_list}. "
+                        "Zeroing a rejected row's KV tail leaves phantom keys "
+                        "attended (issue #1962); set "
+                        "requires_uniform_batch_acceptance on the drafter or target "
+                        "so accepts are clamped before rollback."
+                    )
 
         if not ssm_caches:
             return max_a

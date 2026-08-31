@@ -3306,23 +3306,19 @@ def test_qwen3_5_rollback_speculative_cache_trims_batch_rows_ragged():
     assert cache.left_padding.tolist() == [0, 2]
 
 
-def test_qwen3_5_rollback_speculative_cache_handles_turboquant_batch_kv():
+def test_qwen3_5_rollback_speculative_cache_raises_on_ragged_turboquant_batch_kv():
+    # A rectangular TurboQuant batch cache (single _idx, no prepare/finalize)
+    # cannot represent ragged accepts; zeroing the shorter row's tail would
+    # leave phantom keys attended (issue #1962), so it must fail loud instead.
     cache = BatchTurboQuantKVCache([0, 0], bits=3.5)
     keys = mx.arange(2 * 1 * 7 * 8, dtype=mx.float32).reshape(2, 1, 7, 8)
     values = keys + 100
     cache.update_and_fetch(keys, values)
 
-    qwen_language.LanguageModel.rollback_speculative_cache(
-        None, [cache], [], mx.array([0, 2]), block_size=5
-    )
-
-    mx.eval(cache.keys.norms, cache.keys.indices, cache.values.norms, cache.offset)
-    assert cache._idx == 5
-    assert cache.offset.tolist() == [5, 5]
-    assert mx.all(cache.keys.norms[0, :, 3:5] == 0).item()
-    assert mx.all(cache.keys.indices[0, :, 3:5, :] == 0).item()
-    assert mx.all(cache.values.norms[0, :, 3:5] == 0).item()
-    assert mx.any(cache.keys.norms[1, :, 3:5] != 0).item()
+    with pytest.raises(RuntimeError, match="uniform"):
+        qwen_language.LanguageModel.rollback_speculative_cache(
+            None, [cache], [], mx.array([0, 2]), block_size=5
+        )
 
 
 def test_qwen3_5_rollback_speculative_cache_handles_native_quantized_batch_kv():
@@ -3341,38 +3337,75 @@ def test_qwen3_5_rollback_speculative_cache_handles_native_quantized_batch_kv():
     assert cache.left_padding.tolist() == [2, 0]
 
 
-def test_gemma4_rollback_speculative_cache_handles_turboquant_batch_tail_zero():
+def test_gemma4_rollback_speculative_cache_raises_on_ragged_turboquant_batch():
     cache = BatchTurboQuantKVCache([0, 0], bits=3.5)
     keys = mx.arange(2 * 1 * 5 * 8, dtype=mx.float32).reshape(2, 1, 5, 8)
     values = keys + 100
     cache.update_and_fetch(keys, values)
 
-    gemma4_language.LanguageModel.rollback_speculative_cache(
-        None, [cache], [], mx.array([0, 2]), block_size=3
-    )
-
-    mx.eval(cache.keys.norms, cache.keys.indices, cache.values.norms)
-    assert mx.all(cache.keys.norms[0, :, 3:5] == 0).item()
-    assert mx.all(cache.keys.indices[0, :, 3:5, :] == 0).item()
-    assert mx.all(cache.values.norms[0, :, 3:5] == 0).item()
-    assert mx.any(cache.keys.norms[1, :, 3:5] != 0).item()
+    with pytest.raises(RuntimeError, match="uniform"):
+        gemma4_language.LanguageModel.rollback_speculative_cache(
+            None, [cache], [], mx.array([0, 2]), block_size=3
+        )
 
 
-def test_deepseek_v4_rollback_speculative_cache_handles_turboquant_batch_tail_zero():
+def test_deepseek_v4_rollback_speculative_cache_raises_on_ragged_turboquant_batch():
     cache = BatchTurboQuantKVCache([0, 0], bits=3.5)
     keys = mx.arange(2 * 1 * 5 * 8, dtype=mx.float32).reshape(2, 1, 5, 8)
     values = keys + 100
     cache.update_and_fetch(keys, values)
 
-    deepseek_language.LanguageModel.rollback_speculative_cache(
-        None, [cache], [], mx.array([0, 2]), block_size=3
-    )
+    with pytest.raises(RuntimeError, match="uniform"):
+        deepseek_language.LanguageModel.rollback_speculative_cache(
+            None, [cache], [], mx.array([0, 2]), block_size=3
+        )
 
-    mx.eval(cache.keys.norms, cache.keys.indices, cache.values.norms)
-    assert mx.all(cache.keys.norms[0, :, 3:5] == 0).item()
-    assert mx.all(cache.keys.indices[0, :, 3:5, :] == 0).item()
-    assert mx.all(cache.values.norms[0, :, 3:5] == 0).item()
-    assert mx.any(cache.keys.norms[1, :, 3:5] != 0).item()
+
+def test_uniform_turboquant_batch_rollback_trims_without_raising():
+    # With uniform per-row acceptance there is no ragged tail: rollback is a
+    # plain uniform trim, no phantom keys, no raise (issue #1962 fix).
+    for lm_cls, block in (
+        (qwen_language.LanguageModel, 5),
+        (gemma4_language.LanguageModel, 5),
+        (deepseek_language.LanguageModel, 5),
+    ):
+        cache = BatchTurboQuantKVCache([0, 0], bits=3.5)
+        keys = mx.arange(2 * 1 * 7 * 8, dtype=mx.float32).reshape(2, 1, 7, 8)
+        cache.update_and_fetch(keys, keys + 100)
+
+        max_a = lm_cls.rollback_speculative_cache(
+            None, [cache], [], mx.array([2, 2]), block_size=block
+        )
+        mx.eval(cache.offset)
+        assert max_a == 2
+        assert cache._idx == 5
+
+
+def test_uniform_batch_acceptance_flag_advertised_on_affected_models():
+    import mlx_vlm.models.minimax_m3_vl.language as minimax_language
+    import mlx_vlm.models.muse_glimmer.language as muse_glimmer_language
+
+    for module in (
+        gemma4_language,
+        deepseek_language,
+        qwen_language,
+        muse_glimmer_language,
+        minimax_language,
+    ):
+        assert module.LanguageModel.requires_uniform_batch_acceptance is True
+
+
+def test_requires_uniform_batch_acceptance_honors_drafter_or_target():
+    from mlx_vlm.speculative.common import _requires_uniform_batch_acceptance
+
+    plain = SimpleNamespace()
+    flagged = SimpleNamespace(requires_uniform_batch_acceptance=True)
+
+    assert _requires_uniform_batch_acceptance(plain) is False
+    assert _requires_uniform_batch_acceptance(flagged) is True
+    assert _requires_uniform_batch_acceptance(plain, flagged) is True
+    assert _requires_uniform_batch_acceptance(flagged, plain) is True
+    assert _requires_uniform_batch_acceptance(plain, plain) is False
 
 
 def test_qwen3_5_mtp_filter_batch_keeps_drafter_state_aligned():
