@@ -77,6 +77,7 @@ MODEL_CONFIG = {
     "smolvlm": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "llava": MessageFormat.LIST_WITH_IMAGE,
     "llava_next": MessageFormat.LIST_WITH_IMAGE,
+    "llava_onevision": MessageFormat.LIST_WITH_IMAGE,
     "granite_vision": MessageFormat.LIST_WITH_IMAGE,
     "granite4_vision": MessageFormat.LIST_WITH_IMAGE,
     "mllama": MessageFormat.LIST_WITH_IMAGE,
@@ -303,6 +304,7 @@ class MessageFormatter:
             "diffusion_gemma",
             "minicpmv4_6",
             "minimax_m3_vl",
+            "llava_onevision",
         ] and kwargs.get("video"):
             return self._format_video_message(
                 prompt,
