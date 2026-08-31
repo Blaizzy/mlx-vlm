@@ -2,20 +2,26 @@ from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import sum_gradients
 
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import CacheList, KVCache
+from ..cache import CacheList
 from ..deepseek_v32.language import (
     DeepseekV32Attention,
     DeepseekV32DecoderLayer,
     DeepseekV32Model,
+    DeepseekV32MoE,
 )
+from .cache import HyV4KVCache
 from .config import ModelConfig
+from .fused_switch_glu import FusedSwitchGLU
 from .hyper_connection import IdentityHyperConnection, IdentityHyperHead, hc_expand
+from .indexer import HyV4Indexer
+from .moe import weighted_expert_sum
 
 
 def make_quantization_config(model):
@@ -28,6 +34,8 @@ class HyV4Attention(DeepseekV32Attention):
         self.skip_topk = config.indexer_types[layer_idx] == "shared"
         if self.skip_topk:
             self.indexer = None
+        else:
+            self.indexer = HyV4Indexer(config)
         self.linear_gate = nn.Linear(
             config.hidden_size,
             self.num_heads * self.v_head_dim,
@@ -122,7 +130,6 @@ class HyV4Attention(DeepseekV32Attention):
         else:
             k = self.embed_q(kv_latent, transpose=False)
             v = self.unembed_out(kv_latent)
-
         output = scaled_dot_product_attention(
             q_nope,
             k,
@@ -140,10 +147,32 @@ class HyV4Attention(DeepseekV32Attention):
         return self.o_proj(output), topk_indices
 
 
+class HyV4MoE(DeepseekV32MoE):
+    def __call__(self, x):
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
+        indices, scores = self.gate(x)
+        y = weighted_expert_sum(self.switch_mlp(x, indices), scores)
+        if self.config.n_shared_experts is not None:
+            y = y + self.shared_experts(x)
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
+        return y
+
+
 class HyV4DecoderLayer(DeepseekV32DecoderLayer):
     def __init__(self, config: ModelConfig, layer_idx: int):
         super().__init__(config, layer_idx)
         self.self_attn = HyV4Attention(config, layer_idx)
+        if hasattr(self.mlp, "switch_mlp"):
+            self.mlp = HyV4MoE(config)
+            self.mlp.switch_mlp = FusedSwitchGLU(
+                config.hidden_size,
+                config.moe_intermediate_size,
+                config.n_routed_experts,
+            )
         self.hc_attn_layer = IdentityHyperConnection(config)
         self.hc_mlp_layer = IdentityHyperConnection(config)
 
@@ -157,7 +186,10 @@ class HyV4DecoderLayer(DeepseekV32DecoderLayer):
         residual = h
         x, post = self.hc_attn_layer(h)
         x, topk_indices = self.self_attn(
-            self.input_layernorm(x), mask, cache, prev_topk_indices
+            self.input_layernorm(x),
+            mask,
+            cache,
+            prev_topk_indices,
         )
         h = hc_expand(x, residual, post)
 
@@ -198,7 +230,10 @@ class HyV4Model(DeepseekV32Model):
         prev_topk_indices = None
         for index in range(self.num_layers):
             h, prev_topk_indices = self.layers[self.start_idx + index](
-                h, mask, cache[index], prev_topk_indices
+                h,
+                mask,
+                cache[index],
+                prev_topk_indices,
             )
 
         return self.norm(self.hc_head(h))
@@ -242,9 +277,9 @@ class LanguageModel(nn.Module):
         caches = []
         for layer in self.layers:
             if layer.self_attn.skip_topk:
-                caches.append(CacheList(KVCache()))
+                caches.append(CacheList(HyV4KVCache()))
             else:
-                caches.append(CacheList(KVCache(), KVCache()))
+                caches.append(CacheList(HyV4KVCache(), HyV4KVCache()))
         return caches
 
 
@@ -273,10 +308,15 @@ class Model(nn.Module):
         )
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+        supported_model_prefixes = (
+            "model.embed_tokens.",
+            "model.layers.",
+            "model.norm.",
+        )
         weights = {
             key: value
             for key, value in weights.items()
-            if not key.startswith("model.mtp_layers.")
+            if not key.startswith("model.") or key.startswith(supported_model_prefixes)
         }
 
         def pack_mxfp8(weight: mx.array) -> mx.array:
@@ -306,12 +346,19 @@ class Model(nn.Module):
             if fused_weight_key in weights:
                 gate_up = weights.pop(fused_weight_key)
                 gate_up_scale = weights.pop(fused_scale_key)
-                gate, up = mx.split(gate_up, 2, axis=1)
-                gate_scale, up_scale = mx.split(gate_up_scale, 2, axis=1)
-                weights[f"{mlp_prefix}.switch_mlp.gate_proj.weight"] = pack_mxfp8(gate)
-                weights[f"{mlp_prefix}.switch_mlp.gate_proj.scales"] = gate_scale
-                weights[f"{mlp_prefix}.switch_mlp.up_proj.weight"] = pack_mxfp8(up)
-                weights[f"{mlp_prefix}.switch_mlp.up_proj.scales"] = up_scale
+                weights[f"{mlp_prefix}.switch_mlp.gate_up_proj.weight"] = pack_mxfp8(
+                    gate_up
+                )
+                weights[f"{mlp_prefix}.switch_mlp.gate_up_proj.scales"] = gate_up_scale
+
+            switch_prefix = f"{mlp_prefix}.switch_mlp"
+            for suffix in ("weight", "scales", "biases"):
+                gate_key = f"{switch_prefix}.gate_proj.{suffix}"
+                up_key = f"{switch_prefix}.up_proj.{suffix}"
+                if gate_key in weights and up_key in weights:
+                    weights[f"{switch_prefix}.gate_up_proj.{suffix}"] = mx.concatenate(
+                        [weights.pop(gate_key), weights.pop(up_key)], axis=1
+                    )
 
             down_weight_key = f"{mlp_prefix}.experts.down_proj"
             down_scale_key = f"{mlp_prefix}.experts.down_proj_scale"

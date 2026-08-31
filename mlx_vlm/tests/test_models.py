@@ -114,14 +114,14 @@ class TestHyV4(unittest.TestCase):
                 "model.layers.1.self_attn.kv_b_proj.weight_scale": kv_b_scale,
                 "model.layers.1.self_attn.q_a_proj.weight": q_a,
                 "model.layers.1.self_attn.q_a_proj.weight_scale": q_a_scale,
-                "model.mtp_layers.0.eh_proj.weight": mx.zeros((64, 64)),
+                "model.auxiliary.weight": mx.zeros((64, 64)),
             }
         )
 
         prefix = "language_model.model.layers.1"
         self.assertEqual(
-            sanitized[f"{prefix}.mlp.switch_mlp.gate_proj.weight"].shape,
-            (2, 32, 16),
+            sanitized[f"{prefix}.mlp.switch_mlp.gate_up_proj.weight"].shape,
+            (2, 64, 16),
         )
         self.assertEqual(
             sanitized[f"{prefix}.mlp.switch_mlp.down_proj.scales"].shape,
@@ -136,7 +136,7 @@ class TestHyV4(unittest.TestCase):
         self.assertEqual(
             sanitized[f"{prefix}.self_attn.q_a_proj.scales"].shape, (16, 2)
         )
-        self.assertFalse(any("mtp_layers" in key for key in sanitized))
+        self.assertFalse(any("auxiliary" in key for key in sanitized))
 
     def test_loader_recognizes_modelopt_mxfp8(self):
         import json
@@ -206,8 +206,119 @@ class TestHyV4(unittest.TestCase):
             model = load_model(path, lazy=True, strict=False)
 
         layer = model.language_model.model.layers[1]
-        self.assertIsInstance(layer.mlp.switch_mlp.gate_proj, QuantizedSwitchLinear)
+        self.assertIsInstance(layer.mlp.switch_mlp.gate_up_proj, QuantizedSwitchLinear)
         self.assertIsInstance(layer.self_attn.q_a_proj, nn.QuantizedLinear)
+
+    def test_fused_switch_glu_matches_split_quantized_projections(self):
+        from mlx_vlm.models.hy_v4.fused_switch_glu import FusedSwitchGLU
+        from mlx_vlm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
+
+        input_dims, hidden_dims, num_experts = 32, 64, 4
+        gate = mx.random.normal((num_experts, hidden_dims, input_dims))
+        up = mx.random.normal((num_experts, hidden_dims, input_dims))
+        down = mx.random.normal((num_experts, input_dims, hidden_dims))
+
+        def quantized(weight):
+            packed, scales, biases = mx.quantize(weight, group_size=32, bits=4)
+            linear = QuantizedSwitchLinear(
+                weight.shape[-1],
+                weight.shape[-2],
+                weight.shape[0],
+                bias=False,
+                group_size=32,
+                bits=4,
+            )
+            linear.weight = packed
+            linear.scales = scales
+            linear.biases = biases
+            return linear
+
+        split = SwitchGLU(input_dims, hidden_dims, num_experts)
+        split.gate_proj = quantized(gate)
+        split.up_proj = quantized(up)
+        split.down_proj = quantized(down)
+
+        fused = FusedSwitchGLU(input_dims, hidden_dims, num_experts)
+        fused.gate_up_proj = quantized(mx.concatenate([gate, up], axis=1))
+        fused.down_proj = quantized(down)
+
+        for tokens in (1, 13):
+            x = mx.random.normal((1, tokens, input_dims))
+            indices = mx.random.randint(0, num_experts, (1, tokens, 2))
+            expected = split(x, indices)
+            actual = fused(x, indices)
+            mx.eval(expected, actual)
+            self.assertTrue(mx.array_equal(expected, actual).item())
+
+    def test_compiled_weighted_expert_sum_matches_eager(self):
+        from mlx_vlm.models.hy_v4.moe import weighted_expert_sum
+
+        outputs = mx.random.normal((1, 13, 8, 32)).astype(mx.bfloat16)
+        scores = mx.random.uniform(shape=(1, 13, 8)).astype(mx.float32)
+        expected = (outputs * scores[..., None]).sum(axis=-2).astype(outputs.dtype)
+        actual = weighted_expert_sum(outputs, scores)
+        mx.eval(expected, actual)
+        self.assertTrue(mx.array_equal(expected, actual).item())
+
+    def test_compiled_indexer_matches_deepseek_indexer(self):
+        from mlx_vlm.models.deepseek_v32.language import Indexer
+        from mlx_vlm.models.hy_v4.indexer import HyV4Indexer
+
+        config = self._config()
+        config.index_topk = 2
+        eager = Indexer(config)
+        compiled = HyV4Indexer(config)
+        compiled.load_weights(list(tree_flatten(eager.parameters())))
+
+        for sequence_length, mask in (
+            (3, None),
+            (13, mx.tri(13, 13, dtype=mx.bool_)[None, None]),
+        ):
+            x = mx.random.normal((1, sequence_length, config.hidden_size))
+            qr = mx.random.normal((1, sequence_length, config.q_lora_rank))
+            expected = eager(x, qr, mask)
+            actual = compiled(x, qr, mask)
+            mx.eval(expected, actual)
+            self.assertTrue(mx.array_equal(expected, actual).item())
+
+    def test_geometric_kv_cache_matches_stock_visible_state(self):
+        from mlx_vlm.models.cache import KVCache
+        from mlx_vlm.models.hy_v4.cache import HyV4KVCache
+
+        baseline = KVCache()
+        optimized = HyV4KVCache()
+        for length in (3, 5, 1):
+            keys = mx.random.normal((1, 1, length, 4))
+            values = mx.random.normal((1, 1, length, 8))
+            baseline_state = baseline.update_and_fetch(keys, values)
+            optimized_state = optimized.update_and_fetch(keys, values)
+            mx.eval(*baseline_state, *optimized_state)
+            for expected, actual in zip(baseline_state, optimized_state):
+                self.assertTrue(mx.array_equal(expected, actual).item())
+            self.assertGreaterEqual(optimized.keys.shape[2], optimized.offset)
+
+        keys = mx.random.normal((1, 1, 1, 4))
+        values = mx.random.normal((1, 1, 1, 8))
+        baseline_state = baseline.update_and_fetch(keys, values)
+        optimized_state = optimized.update_and_fetch(keys, values)
+        mx.eval(*baseline_state, *optimized_state)
+        for expected, actual in zip(baseline_state, optimized_state):
+            self.assertTrue(mx.array_equal(expected, actual).item())
+        self.assertEqual(optimized.keys.shape[2], baseline.keys.shape[2])
+
+        extracted = optimized.extract(0)
+        self.assertIsInstance(extracted, HyV4KVCache)
+        mx.eval(extracted.keys, extracted.values)
+        self.assertTrue(
+            mx.array_equal(
+                extracted.keys, optimized.keys[..., : optimized.offset, :]
+            ).item()
+        )
+        self.assertTrue(
+            mx.array_equal(
+                extracted.values, optimized.values[..., : optimized.offset, :]
+            ).item()
+        )
 
 
 class TestNanochatModel(unittest.TestCase):
