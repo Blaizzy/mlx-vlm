@@ -13,6 +13,7 @@ from mlx_vlm.models.qwen4_exp.language import (
     QSAQuantizedKVCache,
     Qwen4ExpGatedDeltaNet,
     Qwen4ExpNGramEmbedding,
+    Qwen4ExpRMSNorm,
     ShardedEmbedding,
 )
 from mlx_vlm.prompt_utils import MessageFormat, MessageFormatter
@@ -636,6 +637,75 @@ class Qwen4ExpTests(unittest.TestCase):
             predicate(path, None),
             {"fallback_group_size": 32},
         )
+
+
+class Qwen4ExpNormConventionTests(unittest.TestCase):
+    def test_rms_norm_applies_standard_gamma(self):
+        dim = 8
+        norm = Qwen4ExpRMSNorm(dim, eps=1e-6)
+        gamma = mx.array([1.3, 0.7, 1.1, 0.9, 1.5, 0.5, 1.2, 0.8])
+        norm.weight = gamma
+        x = mx.random.normal((2, 3, dim))
+        normalized = mx.fast.rms_norm(x, mx.ones(dim), 1e-6)
+        out = norm(x)
+        self.assertTrue(mx.allclose(out, normalized * gamma, atol=1e-4).item())
+        self.assertFalse(mx.allclose(out, normalized * (1.0 + gamma), atol=1e-3).item())
+
+    def test_default_gamma_is_plain_rms_norm(self):
+        dim = 8
+        norm = Qwen4ExpRMSNorm(dim, eps=1e-6)
+        x = mx.random.normal((2, dim))
+        self.assertTrue(
+            mx.allclose(
+                norm(x), mx.fast.rms_norm(x, mx.ones(dim), 1e-6), atol=1e-4
+            ).item()
+        )
+
+    def test_sanitize_keeps_converted_norm_weights(self):
+        model = qwen4_exp.Model(tiny_config())
+        key = "language_model.model.layers.1.self_attn.q_norm.weight"
+        gamma = mx.array([1.3, 0.7, 1.1, 0.9])
+        out = model.sanitize({key: gamma})
+        self.assertTrue(mx.array_equal(out[key], gamma).item())
+
+    def test_sanitize_shifts_raw_norm_weights(self):
+        model = qwen4_exp.Model(tiny_config())
+        norm_key = "language_model.model.layers.1.self_attn.q_norm.weight"
+        raw = [0.3, -0.3, 0.1, -0.1]
+        out = model.sanitize(
+            {
+                norm_key: mx.array(raw),
+                "language_model.model.layers.0.linear_attn.conv1d.weight": mx.zeros(
+                    (6, 1, 3)
+                ),
+            }
+        )
+        expected = mx.array([v + 1.0 for v in raw])
+        self.assertTrue(mx.allclose(out[norm_key], expected, atol=1e-6).item())
+
+    def test_sanitize_shifts_raw_prefixed_norm_weights(self):
+        model = qwen4_exp.Model(tiny_config())
+        raw = [0.3, -0.3, 0.1, -0.1]
+        out = model.sanitize(
+            {"model.language_model.layers.1.self_attn.q_norm.weight": mx.array(raw)}
+        )
+        key = "language_model.model.layers.1.self_attn.q_norm.weight"
+        expected = mx.array([v + 1.0 for v in raw])
+        self.assertTrue(mx.allclose(out[key], expected, atol=1e-6).item())
+
+    def test_sanitize_leaves_gated_delta_norm_unshifted(self):
+        model = qwen4_exp.Model(tiny_config())
+        key = "language_model.model.layers.0.linear_attn.norm.weight"
+        gamma = mx.array([0.9, 1.1, 0.8, 1.2, 0.7, 1.3, 0.6, 1.4])
+        out = model.sanitize(
+            {
+                key: gamma,
+                "language_model.model.layers.0.linear_attn.conv1d.weight": mx.zeros(
+                    (6, 1, 3)
+                ),
+            }
+        )
+        self.assertTrue(mx.array_equal(out[key], gamma).item())
 
 
 if __name__ == "__main__":

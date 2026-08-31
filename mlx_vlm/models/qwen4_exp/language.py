@@ -574,7 +574,7 @@ class QSAQuantizedKVCache(QuantizedKVCache):
 
 
 class Qwen4ExpRMSNorm(nn.Module):
-    """Qwen4 RMSNorm, whose checkpoint weights are centered at zero."""
+    """Qwen4 RMSNorm over standard gamma centered at one, matching qwen3_5."""
 
     def __init__(self, dim: int, group_size: int | None = None, eps: float = 1e-6):
         super().__init__()
@@ -582,7 +582,7 @@ class Qwen4ExpRMSNorm(nn.Module):
         self.group_size = group_size
         if group_size is not None and dim % group_size:
             raise ValueError(f"{dim=} must be divisible by {group_size=}")
-        self.weight = mx.zeros(dim)
+        self.weight = mx.ones(dim)
 
     def __call__(self, x: mx.array) -> mx.array:
         dtype = x.dtype
@@ -593,7 +593,7 @@ class Qwen4ExpRMSNorm(nn.Module):
         else:
             weight = self.weight
         y = y * mx.rsqrt(mx.mean(mx.square(y), axis=-1, keepdims=True) + self.eps)
-        y = y * (1.0 + weight.astype(mx.float32))
+        y = y * weight.astype(mx.float32)
         return y.reshape(x.shape).astype(dtype)
 
 

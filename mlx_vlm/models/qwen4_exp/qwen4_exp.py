@@ -3,13 +3,28 @@ import re
 import mlx.nn as nn
 
 from ..qwen3_5 import Model as Qwen3_5Model
-from ..qwen3_5.qwen3_5 import sanitize_key
+from ..qwen3_5.qwen3_5 import (
+    sanitize_key,
+    should_offset_norm_weight,
+    should_shift_norm_weights,
+)
 from .config import ModelConfig
 from .fp8 import convert_qwen4_exp_fp8_weights
 from .language import LanguageModel
 from .vision import VisionModel
 
 _NGRAM_SHARD_RE = re.compile(r"\.ngram_embedding\.shard_(\d+)(?=\.)")
+
+NORM_WEIGHT_SUFFIXES = (
+    ".q_norm.weight",
+    ".k_norm.weight",
+    ".q_layernorm.weight",
+    ".k_layernorm.weight",
+    ".hc_norm.weight",
+    ".norm_key.weight",
+    ".norm_query.weight",
+    ".norm_conv.weight",
+)
 
 
 class Model(Qwen3_5Model):
@@ -26,6 +41,7 @@ class Model(Qwen3_5Model):
             key: value for key, value in weights.items() if not key.startswith("mtp.")
         }
         weights = convert_qwen4_exp_fp8_weights(weights)
+        shift_norm_weights = should_shift_norm_weights(weights)
         if self.config.text_config.ple_storage:
             weights = {
                 key: value
@@ -54,10 +70,17 @@ class Model(Qwen3_5Model):
 
         sanitized = {}
         for key, value in weights.items():
+            original_key = key
             key = sanitize_key(key)
             key = _NGRAM_SHARD_RE.sub(r".ngram_embedding.shards.\1", key)
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
+            if (
+                value.ndim == 1
+                and key.endswith(NORM_WEIGHT_SUFFIXES)
+                and should_offset_norm_weight(original_key, shift_norm_weights)
+            ):
+                value += 1.0
             sanitized[key] = value
         return sanitized
 

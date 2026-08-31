@@ -78,10 +78,10 @@ def test_qwen4_mtp_fusion_matches_released_equations():
     drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=config))
     drafter.fc_embedding.weight = mx.eye(config.hidden_size)
     drafter.fc_hidden.weight = mx.eye(config.hidden_size)
-    embedding_weight = mx.linspace(-0.8, -0.2, config.hidden_size)
-    hidden_weight = mx.linspace(-0.6, 0.3, config.hc_count * config.hidden_size)
-    drafter.pre_fc_norm_embedding.weight = embedding_weight
-    drafter.pre_fc_norm_hidden.weight = hidden_weight
+    released_embedding_gain = mx.linspace(-0.8, -0.2, config.hidden_size)
+    released_hidden_gain = mx.linspace(-0.6, 0.3, config.hc_count * config.hidden_size)
+    drafter.pre_fc_norm_embedding.weight = 1 + released_embedding_gain
+    drafter.pre_fc_norm_hidden.weight = 1 + released_hidden_gain
     embedding = mx.arange(1, 33, dtype=mx.float32).reshape(1, 1, 32)
     hidden = mx.arange(1, 65, dtype=mx.float32).reshape(1, 1, 64)
 
@@ -89,11 +89,11 @@ def test_qwen4_mtp_fusion_matches_released_equations():
     expected_embedding = embedding * mx.rsqrt(
         mx.mean(embedding * embedding, axis=-1, keepdims=True) + config.rms_norm_eps
     )
-    expected_embedding = expected_embedding * (1 + embedding_weight)
+    expected_embedding = expected_embedding * (1 + released_embedding_gain)
     expected_hidden = hidden * mx.rsqrt(
         mx.mean(hidden * hidden, axis=-1, keepdims=True) + config.rms_norm_eps
     )
-    expected_hidden = expected_hidden * (1 + hidden_weight)
+    expected_hidden = expected_hidden * (1 + released_hidden_gain)
     expected_hidden = expected_hidden.reshape(1, 1, config.hc_count, 32)
     expected = (expected_embedding[..., None, :] + expected_hidden).reshape(1, 1, 64)
 
