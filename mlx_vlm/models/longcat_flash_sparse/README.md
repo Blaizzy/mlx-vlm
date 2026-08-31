@@ -36,7 +36,7 @@ rather than the dense `longcat_flash_ngram` form
 from mlx_vlm import generate, load
 
 model, processor = load(
-    "AlazarM/LongCat-Flash-Lite-Sparse-4bit", trust_remote_code=True
+    "mlx-community/LongCat-Flash-Lite-Sparse-4bit", trust_remote_code=True
 )
 print(generate(model, processor, "Explain multi-head latent attention.", max_tokens=256))
 ```
