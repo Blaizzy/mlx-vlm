@@ -1,5 +1,6 @@
 import importlib
 import inspect
+import math
 import threading
 import unittest
 from types import SimpleNamespace
@@ -4175,6 +4176,258 @@ class TestModels(unittest.TestCase):
             config.vision_config.num_channels,
             (config.vision_config.image_size, config.vision_config.image_size),
         )
+
+    def test_llava_onevision(self):
+        from mlx_vlm.models import llava_onevision
+
+        text_config = llava_onevision.TextConfig(
+            model_type="qwen2",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-6,
+            vocab_size=200,
+            rope_theta=1000000.0,
+            tie_word_embeddings=False,
+        )
+
+        vision_config = llava_onevision.VisionConfig(
+            model_type="siglip_vision_model",
+            num_hidden_layers=3,
+            hidden_size=48,
+            intermediate_size=96,
+            num_attention_heads=4,
+            image_size=56,
+            patch_size=14,
+            num_channels=3,
+            layer_norm_eps=1e-6,
+            vision_use_head=False,
+        )
+
+        config = llava_onevision.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="llava_onevision",
+            image_token_index=190,
+            video_token_index=191,
+            image_grid_pinpoints=[[56, 56], [56, 112], [112, 56], [112, 112]],
+            vocab_size=200,
+        )
+
+        model = llava_onevision.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.mm_projector_test_runner(
+            model.multi_modal_projector,
+            config.vision_config.hidden_size,
+            config.text_config.hidden_size,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
+    def _llava_onevision_test_model(self, **overrides):
+        from mlx_vlm.models import llava_onevision
+
+        config = llava_onevision.ModelConfig(
+            text_config=llava_onevision.TextConfig(
+                model_type="qwen2",
+                hidden_size=32,
+                num_hidden_layers=1,
+                intermediate_size=64,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                rms_norm_eps=1e-6,
+                vocab_size=200,
+                tie_word_embeddings=False,
+            ),
+            vision_config=llava_onevision.VisionConfig(
+                model_type="siglip_vision_model",
+                num_hidden_layers=1,
+                hidden_size=32,
+                intermediate_size=64,
+                num_attention_heads=4,
+                image_size=56,
+                patch_size=14,
+                num_channels=3,
+                layer_norm_eps=1e-6,
+                vision_use_head=False,
+            ),
+            model_type="llava_onevision",
+            image_token_index=190,
+            video_token_index=191,
+            image_grid_pinpoints=[
+                [56, 56],
+                [56, 112],
+                [112, 56],
+                [112, 112],
+                [224, 224],
+            ],
+            vocab_size=200,
+            **overrides,
+        )
+        return llava_onevision.Model(config)
+
+    def test_llava_onevision_packing_single_tile(self):
+        model = self._llava_onevision_test_model()
+        tokens = model.patches_per_side**2
+
+        features = mx.zeros((1, tokens, 32))
+        packed = model.pack_image_features([features], [[56, 56]])
+
+        # A single tile keeps the base features and appends exactly one newline row.
+        self.assertEqual(packed[0].shape, (tokens + 1, 32))
+
+    def test_llava_onevision_packing_matches_grid_layout(self):
+        model = self._llava_onevision_test_model()
+        side = model.patches_per_side
+        tokens = side**2
+
+        features = mx.random.normal((5, tokens, 32))
+        packed = model.pack_image_features([features], [[112, 112]])[0]
+
+        # 2x2 grid of tiles, no downsampling at this size: base + rows*(cols+newline).
+        expected = tokens + (2 * side) * (2 * side + 1)
+        self.assertEqual(packed.shape, (expected, 32))
+        self.assertTrue(mx.allclose(packed[:tokens], features[0]))
+
+    def test_llava_onevision_packing_downsamples_above_ratio(self):
+        model = self._llava_onevision_test_model()
+        side = model.patches_per_side
+        tokens = side**2
+
+        features = mx.random.normal((17, tokens, 32))
+        packed = model.pack_image_features([features], [[224, 224]])[0]
+
+        # 4x4 grid exceeds anyres_max_9, so the unpadded grid is scaled down.
+        ratio = math.sqrt((4 * side) ** 2 / (model.max_num_patches * side**2))
+        self.assertGreater(ratio, 1.1)
+        scaled = int(4 * side // ratio)
+        self.assertEqual(packed.shape, (tokens + scaled * (scaled + 1), 32))
+
+    def test_llava_onevision_video_pooling(self):
+        model = self._llava_onevision_test_model()
+        side = model.patches_per_side
+        pooled = math.ceil(side / 2)
+
+        frames = 3
+        features = mx.random.normal((frames, side**2, 32))
+        pooled_features = model.apply_pooling(features)
+
+        self.assertEqual(pooled_features.shape, (frames, pooled**2, 32))
+
+    def test_llava_onevision_scatter_rejects_count_mismatch(self):
+        model = self._llava_onevision_test_model()
+
+        input_ids = mx.array([[1, 190, 190, 2]])
+        inputs_embeds = mx.zeros((1, 4, 32))
+        features = mx.zeros((3, 32))
+
+        with self.assertRaises(ValueError):
+            model._scatter_features(inputs_embeds, input_ids, features, 190, "Image")
+
+    def test_llava_onevision_packing_matches_processor_token_count(self):
+        from mlx_vlm.models.llava_onevision.llava_onevision import (
+            get_anyres_image_grid_shape,
+        )
+        from mlx_vlm.models.llava_onevision.processing_llava_onevision import (
+            LlavaOnevisionProcessor,
+        )
+
+        model = self._llava_onevision_test_model()
+        side = model.patches_per_side
+        tile = model.config.vision_config.image_size
+
+        processor = LlavaOnevisionProcessor(
+            image_processor=SimpleNamespace(
+                image_grid_pinpoints=model.config.image_grid_pinpoints
+            ),
+            tokenizer=None,
+            num_image_tokens=side**2,
+            vision_aspect_ratio=model.config.vision_aspect_ratio,
+            vision_feature_select_strategy="full",
+        )
+
+        for image_size in ([56, 56], [112, 112], [56, 112], [224, 224], [112, 224]):
+            with self.subTest(image_size=image_size):
+                num_patch_height, num_patch_width = get_anyres_image_grid_shape(
+                    image_size, model.config.image_grid_pinpoints, tile
+                )
+                tiles = num_patch_height * num_patch_width + 1
+                features = mx.zeros((tiles, side**2, 32))
+
+                packed = model.pack_image_features([features], [image_size])[0]
+                predicted = processor._get_number_of_features(
+                    image_size[0], image_size[1], tile, tile
+                )
+
+                self.assertEqual(packed.shape[0], predicted)
+
+    def test_llava_onevision_keeps_untied_lm_head(self):
+        from mlx_vlm.models import llava_onevision
+        from mlx_vlm.models.llava_onevision.language import LanguageModel
+
+        # The 7b/72b checkpoints omit tie_word_embeddings and ship a real lm_head,
+        # so the default must not tie or their output projection is dropped.
+        self.assertFalse(llava_onevision.TextConfig().tie_word_embeddings)
+
+        def sanitized(tie):
+            config = llava_onevision.TextConfig(
+                hidden_size=16,
+                num_hidden_layers=1,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                vocab_size=32,
+                tie_word_embeddings=tie,
+            )
+            return LanguageModel(config).sanitize(
+                {"language_model.lm_head.weight": mx.zeros((32, 16))}
+            )
+
+        self.assertIn("language_model.lm_head.weight", sanitized(tie=False))
+        self.assertNotIn("language_model.lm_head.weight", sanitized(tie=True))
+
+    def test_llava_onevision_sanitize_accepts_both_layouts(self):
+        from mlx_vlm.models import llava_onevision
+
+        published = {
+            "language_model.model.embed_tokens.weight": 0,
+            "language_model.lm_head.weight": 1,
+            "vision_tower.vision_model.post_layernorm.weight": 2,
+            "multi_modal_projector.linear_1.weight": 3,
+            "image_newline": 4,
+        }
+        nested = {
+            "model.language_model.embed_tokens.weight": 0,
+            "lm_head.weight": 1,
+            "model.vision_tower.post_layernorm.weight": 2,
+            "model.multi_modal_projector.linear_1.weight": 3,
+            "model.image_newline": 4,
+        }
+
+        self.assertEqual(
+            llava_onevision.Model.sanitize(published),
+            llava_onevision.Model.sanitize(nested),
+        )
+        self.assertEqual(set(llava_onevision.Model.sanitize(nested)), set(published))
+
+        # Sanitizing twice must not rewrite already-normalized keys.
+        once = llava_onevision.Model.sanitize(nested)
+        self.assertEqual(llava_onevision.Model.sanitize(dict(once)), once)
 
     def test_llava(self):
         from mlx_vlm.models import llava
@@ -10287,6 +10540,41 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "llava_next")
+
+    def test_llava_onevision_input_embeddings(self):
+        from mlx_vlm.models import llava_onevision
+
+        model = llava_onevision.Model(
+            llava_onevision.ModelConfig(
+                text_config=llava_onevision.TextConfig(
+                    model_type="qwen2",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    vocab_size=32,
+                    rms_norm_eps=1e-6,
+                    tie_word_embeddings=False,
+                ),
+                vision_config=llava_onevision.VisionConfig(
+                    model_type="siglip_vision_model",
+                    num_hidden_layers=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                    num_channels=3,
+                    vision_use_head=False,
+                ),
+                model_type="llava_onevision",
+                image_token_index=31,
+                video_token_index=30,
+                vocab_size=32,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "llava_onevision")
 
     def test_qwen2_vl_input_embeddings(self):
         from mlx_vlm.models import qwen2_vl
