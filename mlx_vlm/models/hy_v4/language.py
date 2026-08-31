@@ -9,14 +9,13 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import CacheList
+from ..cache import CacheList, KVCache
 from ..deepseek_v32.language import (
     DeepseekV32Attention,
     DeepseekV32DecoderLayer,
     DeepseekV32Model,
     DeepseekV32MoE,
 )
-from .cache import HyV4KVCache
 from .config import ModelConfig
 from .fused_switch_glu import FusedSwitchGLU
 from .hyper_connection import IdentityHyperConnection, IdentityHyperHead, hc_expand
@@ -277,9 +276,9 @@ class LanguageModel(nn.Module):
         caches = []
         for layer in self.layers:
             if layer.self_attn.skip_topk:
-                caches.append(CacheList(HyV4KVCache()))
+                caches.append(CacheList(KVCache()))
             else:
-                caches.append(CacheList(HyV4KVCache(), HyV4KVCache()))
+                caches.append(CacheList(KVCache(), KVCache()))
         return caches
 
 

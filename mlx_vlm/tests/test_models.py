@@ -281,45 +281,6 @@ class TestHyV4(unittest.TestCase):
             mx.eval(expected, actual)
             self.assertTrue(mx.array_equal(expected, actual).item())
 
-    def test_geometric_kv_cache_matches_stock_visible_state(self):
-        from mlx_vlm.models.cache import KVCache
-        from mlx_vlm.models.hy_v4.cache import HyV4KVCache
-
-        baseline = KVCache()
-        optimized = HyV4KVCache()
-        for length in (3, 5, 1):
-            keys = mx.random.normal((1, 1, length, 4))
-            values = mx.random.normal((1, 1, length, 8))
-            baseline_state = baseline.update_and_fetch(keys, values)
-            optimized_state = optimized.update_and_fetch(keys, values)
-            mx.eval(*baseline_state, *optimized_state)
-            for expected, actual in zip(baseline_state, optimized_state):
-                self.assertTrue(mx.array_equal(expected, actual).item())
-            self.assertGreaterEqual(optimized.keys.shape[2], optimized.offset)
-
-        keys = mx.random.normal((1, 1, 1, 4))
-        values = mx.random.normal((1, 1, 1, 8))
-        baseline_state = baseline.update_and_fetch(keys, values)
-        optimized_state = optimized.update_and_fetch(keys, values)
-        mx.eval(*baseline_state, *optimized_state)
-        for expected, actual in zip(baseline_state, optimized_state):
-            self.assertTrue(mx.array_equal(expected, actual).item())
-        self.assertEqual(optimized.keys.shape[2], baseline.keys.shape[2])
-
-        extracted = optimized.extract(0)
-        self.assertIsInstance(extracted, HyV4KVCache)
-        mx.eval(extracted.keys, extracted.values)
-        self.assertTrue(
-            mx.array_equal(
-                extracted.keys, optimized.keys[..., : optimized.offset, :]
-            ).item()
-        )
-        self.assertTrue(
-            mx.array_equal(
-                extracted.values, optimized.values[..., : optimized.offset, :]
-            ).item()
-        )
-
 
 class TestNanochatModel(unittest.TestCase):
     def test_native_loader_and_cached_forward(self):
