@@ -238,10 +238,14 @@ def _make_gdn_state(
     )
 
 
-def _make_drafter_dir(tmp_path: Path, model_type: str | None) -> Path:
+def _make_drafter_dir(
+    tmp_path: Path, model_type: str | None, extra: dict | None = None
+) -> Path:
     d = tmp_path / "drafter"
     d.mkdir()
     cfg = {} if model_type is None else {"model_type": model_type}
+    if extra:
+        cfg.update(extra)
     (d / "config.json").write_text(json.dumps(cfg))
     return d
 
@@ -2705,6 +2709,31 @@ def test_kind_none_autodetects_mtp_for_glm4_moe_lite_mtp(tmp_path):
     path = _make_drafter_dir(tmp_path, "glm4_moe_lite_mtp")
     assert resolve_drafter_kind(path, None) == "mtp"
     assert resolve_drafter_kind(path, "dflash") == "mtp"
+
+
+def test_kind_none_autodetects_mtp_for_native_nextn_checkpoint(tmp_path):
+    path = _make_drafter_dir(tmp_path, "deepseek_v4", {"num_nextn_predict_layers": 1})
+    assert resolve_drafter_kind(path, None) == "mtp"
+    assert resolve_drafter_kind(path) == "mtp"
+
+
+def test_native_nextn_overrides_dflash_to_mtp(tmp_path, caplog):
+    path = _make_drafter_dir(tmp_path, "deepseek_v4", {"num_nextn_predict_layers": 1})
+    with caplog.at_level("WARNING"):
+        assert resolve_drafter_kind(path, "dflash") == "mtp"
+    assert any("requires --draft-kind='mtp'" in r.getMessage() for r in caplog.records)
+
+
+def test_mapped_type_wins_over_nextn_heuristic(tmp_path):
+    path = _make_drafter_dir(
+        tmp_path, "deepseek_v4_dspark", {"num_nextn_predict_layers": 1}
+    )
+    assert resolve_drafter_kind(path, None) == "dflash"
+
+
+def test_zero_nextn_falls_back_to_default(tmp_path):
+    path = _make_drafter_dir(tmp_path, "deepseek_v4", {"num_nextn_predict_layers": 0})
+    assert resolve_drafter_kind(path, None) == "dflash"
 
 
 def test_kind_none_autodetects_eagle3_speculators_config(tmp_path):
