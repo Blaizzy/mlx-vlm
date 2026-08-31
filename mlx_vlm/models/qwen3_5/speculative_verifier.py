@@ -17,6 +17,14 @@ from ..exact_speculative_verify import (
 )
 from .gated_delta import gated_delta_update_with_states
 
+_TARGET_VERIFY_FUSE_8BIT_LINEARS = False
+
+
+def set_target_verify_8bit_linear_fusion(enabled: bool) -> None:
+    """Opt in to exact fused QMV dispatch for adjacent 8-bit linears."""
+    global _TARGET_VERIFY_FUSE_8BIT_LINEARS
+    _TARGET_VERIFY_FUSE_8BIT_LINEARS = bool(enabled)
+
 
 def _use_target_verify_dense(linear, x: mx.array) -> bool:
     return (
@@ -1116,7 +1124,13 @@ def _target_verify_quantized_linears(linears, x: mx.array):
         or not 1 < x.shape[1] <= 8
         or not all(
             isinstance(linear, nn.QuantizedLinear)
-            and linear.bits == 4
+            and (
+                linear.bits == 4
+                or linear.bits == 8
+                and x.shape[1] < 6
+                and _TARGET_VERIFY_FUSE_8BIT_LINEARS
+            )
+            and linear.bits == linears[0].bits
             and linear.group_size == linears[0].group_size
             and linear.mode == linears[0].mode
             and "bias" not in linear
@@ -1136,7 +1150,14 @@ def _target_verify_quantized_linears(linears, x: mx.array):
         if streamed
         else _target_verify_fused_qmv_kernel
     )
-    kernel = kernel_factory(4, linears[0].group_size, x.dtype, T, K, n_sizes)
+    kernel = kernel_factory(
+        linears[0].bits,
+        linears[0].group_size,
+        x.dtype,
+        T,
+        K,
+        n_sizes,
+    )
     inputs = [x]
     for linear in linears:
         inputs.extend([linear.weight, linear.scales, linear.biases])
