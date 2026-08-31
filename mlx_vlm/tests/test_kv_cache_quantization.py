@@ -1,4 +1,5 @@
 import sys
+from math import ceil
 from unittest.mock import Mock, patch
 
 import mlx.core as mx
@@ -7,6 +8,7 @@ import pytest
 
 # Import the module to patch
 from mlx_vlm.generate import generate_step
+from mlx_vlm.generate.common import DEFAULT_PREFILL_STEP_SIZE
 
 
 class MockInputEmbeddingsFeatures:
@@ -81,6 +83,10 @@ class MockCacheLayer:
         self.offset = 0
         self.keys = mx.random.normal((1, 8, 100, 64))
         self.values = mx.random.normal((1, 8, 100, 64))
+
+    @property
+    def state(self):
+        return self.keys, self.values
 
 
 class MockCache:
@@ -192,8 +198,9 @@ class TestKVCacheQuantization:
                 assert first_call_kwargs["kv_group_size"] == 64
                 assert first_call_kwargs["kv_bits"] == 4
 
-                # Should be called once after initial forward pass and once per generated token
-                expected_calls = 1 + len(tokens)
+                prompt_len = input_ids.shape[1]
+                prefill_chunks = ceil((prompt_len - 1) / DEFAULT_PREFILL_STEP_SIZE)
+                expected_calls = prefill_chunks + 1 + len(tokens)
                 assert len(mock_quantize_calls) == expected_calls
 
     def test_different_quantization_bit_configurations(self):

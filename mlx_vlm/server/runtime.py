@@ -3,6 +3,9 @@ from typing import Any, Dict, Iterator, Optional
 
 from .runtime_config import RuntimeConfig
 
+MODEL_DISCOVERY_ENV = "MLX_VLM_MODEL_DISCOVERY"
+MODEL_DISCOVERY_MODES = ("served", "hf-cache")
+
 
 class ModelCacheRegistry:
     def __init__(self, default_kind: str = "text_generation"):
