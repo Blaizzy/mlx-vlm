@@ -1443,8 +1443,11 @@ def load_processor(
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
 
-        # Instantiate the detokenizer
-        processor.detokenizer = detokenizer_class(tokenizer_obj)
+        # Non-text models (depth, detection) have no decode(); skip detokenizer
+        try:
+            processor.detokenizer = detokenizer_class(tokenizer_obj)
+        except AttributeError:
+            return processor
 
         # Determine the EOS token IDs, prioritizing the function argument
         final_eos_token_ids = (
