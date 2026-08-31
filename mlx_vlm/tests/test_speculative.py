@@ -6,6 +6,7 @@ and Qwen3.5 DFlash cache rollback coverage in one place.
 
 import importlib
 import json
+import re
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
@@ -41,6 +42,13 @@ from mlx_vlm.speculative.drafters import (
     KNOWN_DRAFTER_KINDS,
     resolve_drafter_kind,
     validate_drafter_compatibility,
+)
+from mlx_vlm.speculative.drafters.deepseek_v4_dspark import DeepseekV4DsparkDraftModel
+from mlx_vlm.speculative.drafters.deepseek_v4_dspark.config import (
+    DeepseekV4DsparkConfig,
+)
+from mlx_vlm.speculative.drafters.deepseek_v4_dspark.split import (
+    split_deepseek_v4_dspark,
 )
 from mlx_vlm.speculative.drafters.deepseek_v4_mtp import DeepseekV4MTPDraftModel
 from mlx_vlm.speculative.drafters.deepseek_v4_mtp.config import DeepseekV4MTPConfig
@@ -3779,6 +3787,255 @@ def test_deepseek_v4_mtp_sanitize_maps_embedded_weights():
         cfg.n_routed_experts
     )
     assert out["decoder.attn.wo_a.weight"].shape == (1, cfg.o_lora_rank, 4)
+
+
+def test_deepseek_v4_mtp_sanitize_strips_nonzero_layer_index():
+    # DeepSeek-V4-Flash-0731 stores its MTP blocks at layer indices 1/2/…, not
+    # 0. The prefix strip must drop any `mtp.<idx>.` so the tensors land at the
+    # drafter's top level instead of keeping a stray `1.`.
+    cfg = _tiny_deepseek_v4_config()
+    context = SimpleNamespace(args=cfg)
+    weights = {
+        "mtp.1.enorm.weight": mx.ones((cfg.hidden_size,)),
+        "mtp.1.attn.wkv.weight": mx.ones((4, 4)),
+        "mtp.1.hc_head_scale": mx.ones((1,)),
+        "mtp.1.attn.wo_a.weight": mx.ones((cfg.o_lora_rank, 4)),
+    }
+    for expert in range(cfg.n_routed_experts):
+        weights[f"mtp.1.ffn.experts.{expert}.w1.weight"] = mx.zeros((4, 16))
+
+    out = DeepseekV4MTPDraftModel.sanitize(context, weights)
+
+    assert not any(re.match(r"\d+\.", key) for key in out)
+    assert "enorm.weight" in out
+    assert "decoder.attn.wkv.weight" in out
+    assert "hc_head.scale" in out
+    assert out["decoder.ffn.switch_mlp.gate_proj.weight"].shape[0] == (
+        cfg.n_routed_experts
+    )
+
+
+def _tiny_deepseek_v4_dspark_config():
+    return DeepseekV4DsparkConfig(
+        text_config=_tiny_deepseek_v4_config(),
+        n_mtp_layers=3,
+        target_layer_ids=[0, 1, 2],
+        mask_token_id=1,
+        markov_rank=8,
+        block_size=5,
+    )
+
+
+def _forge_dspark_source(model, cfg):
+    """Reconstruct the ``mtp.<stage>.*`` checkpoint tensors from the drafter's
+    own params, so the split->load round-trip can be exercised without the real
+    (multi-GB) DeepSeek-V4-Flash-0731 checkpoint."""
+    params = dict(tree_flatten(model.parameters()))
+    text = cfg.text_config
+    n_experts, o_groups, o_lora_rank = (
+        text.n_routed_experts,
+        text.o_groups,
+        text.o_lora_rank,
+    )
+    last_stage = cfg.n_mtp_layers - 1
+    proj_to_w = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+    hc = {"attn_hc": "hc_attn", "ffn_hc": "hc_ffn"}
+    src = {}
+    for key, value in params.items():
+        if key.startswith("markov_head."):
+            # the model-level markov head lives under the last stage on disk
+            src[f"mtp.{last_stage}.{key}"] = value
+            continue
+        _, stage, body = key.split(".", 2)
+        prefix = f"mtp.{stage}."
+        if body.startswith("ffn.switch_mlp."):
+            w = proj_to_w[body.split(".")[-2]]
+            for expert in range(n_experts):
+                src[f"{prefix}ffn.experts.{expert}.{w}.weight"] = value[expert]
+        elif body.startswith("ffn.shared_experts."):
+            w = proj_to_w[body.split(".")[-2]]
+            src[f"{prefix}ffn.shared_experts.{w}.weight"] = value
+        elif body == "ffn.gate.e_score_correction_bias":
+            src[f"{prefix}ffn.gate.bias"] = value
+        elif body == "attn.wo_a.weight":
+            src[f"{prefix}attn.wo_a.weight"] = (
+                value.reshape(o_groups * o_lora_rank, -1) if value.ndim == 3 else value
+            )
+        elif body.startswith("attn_hc.") or body.startswith("ffn_hc."):
+            module, param = body.split(".")
+            src[f"{prefix}{hc[module]}_{param}"] = value
+        elif body.startswith("hc_head."):
+            src[f"{prefix}hc_head_{body.split('.')[-1]}"] = value
+        else:
+            src[f"{prefix}{body}"] = value
+    return src
+
+
+def test_deepseek_v4_dspark_sanitize_round_trips_three_stage_layout():
+    cfg = _tiny_deepseek_v4_dspark_config()
+    model = DeepseekV4DsparkDraftModel(cfg)
+    mx.eval(model.parameters())
+    src = _forge_dspark_source(model, cfg)
+    # a trained checkpoint also ships an (unused) confidence head -> dropped
+    src["mtp.2.confidence_head.proj.weight"] = mx.zeros(
+        (1, cfg.hidden_size + cfg.markov_rank)
+    )
+
+    written = DeepseekV4DsparkDraftModel.sanitize(
+        SimpleNamespace(args=cfg.text_config), dict(src)
+    )
+    fresh = DeepseekV4DsparkDraftModel(cfg)
+    mx.eval(fresh.parameters())
+    sanitized = fresh.sanitize(dict(written))
+    fresh.load_weights(list(sanitized.items()), strict=True)
+
+    assert not any(key.startswith("mtp.") for key in sanitized)
+    assert not any("confidence_head" in key for key in sanitized)
+    assert any(key.startswith("stages.0.main_proj") for key in sanitized)
+    assert any(key.startswith("markov_head.") for key in sanitized)
+
+
+def test_deepseek_v4_dspark_draft_block_emits_proposal_tokens():
+    cfg = _tiny_deepseek_v4_dspark_config()
+    model = DeepseekV4DsparkDraftModel(cfg)
+    mx.eval(model.parameters())
+    text = cfg.text_config
+    target = SimpleNamespace(
+        embed_tokens=nn.Embedding(text.vocab_size, text.hidden_size),
+        lm_head=nn.Linear(text.hidden_size, text.vocab_size, bias=False),
+    )
+    mx.eval(target.embed_tokens.parameters(), target.lm_head.parameters())
+    draft_cache = model.reset(target)
+
+    ctx = 5
+    n_targets = len(cfg.target_layer_ids)
+    hidden = mx.random.normal((1, ctx, text.hidden_size * n_targets))
+    drafts = model.draft_block(
+        3,
+        hidden,
+        draft_cache,
+        cfg.block_size,
+        lambda logits: mx.argmax(logits, axis=-1),
+    )
+    assert drafts.shape == (1, cfg.block_size - 1)
+
+
+def test_deepseek_v4_capture_layer_ids_taps_mean_over_hc():
+    base = _tiny_deepseek_v4_config()
+    cfg = deepseek_language.ModelConfig(
+        **{
+            **base.to_dict(),
+            "num_hidden_layers": 3,
+            "compress_ratios": [0, 0, 0],
+        }
+    )
+    lm = deepseek_language.LanguageModel(cfg)
+    mx.eval(lm.parameters())
+
+    out = lm(mx.array([[1, 2, 3, 4]]), capture_layer_ids=[0, 2])
+
+    assert isinstance(out.hidden_states, list)
+    assert len(out.hidden_states) == 2
+    for hidden in out.hidden_states:
+        assert hidden.shape == (1, 4, cfg.hidden_size)
+
+
+def test_split_deepseek_v4_dspark_writes_dspark_config(tmp_path):
+    cfg = _tiny_deepseek_v4_dspark_config()
+    model = DeepseekV4DsparkDraftModel(cfg)
+    mx.eval(model.parameters())
+    src_weights = _forge_dspark_source(model, cfg)
+
+    source = tmp_path / "source"
+    source.mkdir()
+    text = cfg.text_config
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "deepseek_v4",
+                **text.to_dict(),
+                "dspark_block_size": cfg.block_size - 1,
+                "dspark_noise_token_id": cfg.mask_token_id,
+                "dspark_target_layer_ids": cfg.target_layer_ids,
+                "dspark_markov_rank": cfg.markov_rank,
+            }
+        )
+    )
+    mx.save_safetensors(str(source / "mtp.safetensors"), src_weights, metadata={})
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"model.foo": "model.safetensors"}})
+    )
+
+    output = tmp_path / "dspark"
+    split_deepseek_v4_dspark(str(source), str(output))
+
+    written_cfg = json.loads((output / "config.json").read_text())
+    weights = mx.load(str(output / "model.safetensors"))
+    assert written_cfg["model_type"] == "deepseek_v4_dspark"
+    assert written_cfg["n_mtp_layers"] == 3
+    assert written_cfg["target_layer_ids"] == cfg.target_layer_ids
+    assert written_cfg["mask_token_id"] == cfg.mask_token_id
+    assert any(key.startswith("stages.0.main_proj") for key in weights)
+    assert any(key.startswith("markov_head.") for key in weights)
+
+
+def test_deepseek_v4_dspark_uses_dflash_rounds_losslessly():
+    # deepseek_v4_dspark maps to the dflash kind. Losslessness comes from
+    # verification, not drafter quality: with a random (untrained) drafter every
+    # proposal is rejected, so speculative decoding must reproduce the target's
+    # plain-greedy trajectory exactly.
+    from mlx_vlm.speculative.dflash import _dflash_rounds
+
+    base = _tiny_deepseek_v4_config()
+    tgt_cfg = deepseek_language.ModelConfig(
+        **{**base.to_dict(), "num_hidden_layers": 4, "compress_ratios": [0, 0, 0, 0]}
+    )
+    target = deepseek_language.LanguageModel(tgt_cfg)
+    mx.eval(target.parameters())
+
+    dcfg = DeepseekV4DsparkConfig(
+        text_config=tgt_cfg,
+        n_mtp_layers=3,
+        target_layer_ids=[1, 2, 3],
+        mask_token_id=1,
+        markov_rank=8,
+        block_size=5,
+    )
+    drafter = DeepseekV4DsparkDraftModel(dcfg)
+    mx.eval(drafter.parameters())
+
+    prompt = mx.array([[5, 6, 7, 8, 9]])
+    n_new = 12
+
+    def argmax_last(logits):
+        return int(mx.argmax(logits[:, -1, :], axis=-1).item())
+
+    cache_ref = target.make_cache()
+    tok = argmax_last(target(prompt, cache=cache_ref).logits)
+    ref = [tok]
+    for _ in range(n_new - 1):
+        tok = argmax_last(target(mx.array([[tok]]), cache=cache_ref).logits)
+        ref.append(tok)
+
+    cache_spec = target.make_cache()
+    out = target(prompt, cache=cache_spec, capture_layer_ids=[1, 2, 3])
+    hidden = mx.concatenate([h[:, -1:, :] for h in out.hidden_states], axis=-1)
+    first_bonus = argmax_last(out.logits)
+    spec = [first_bonus]
+    for tok, _ in _dflash_rounds(
+        target,
+        drafter,
+        cache_spec,
+        hidden,
+        first_bonus=first_bonus,
+        max_tokens=n_new,
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        greedy_sampling=True,
+    ):
+        spec.append(tok)
+
+    n = min(len(ref), len(spec))
+    assert spec[:n] == ref[:n]
 
 
 def test_split_deepseek_v4_mtp_writes_sidecar_without_index_mtp_entries(tmp_path):

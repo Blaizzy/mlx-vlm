@@ -1016,6 +1016,8 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         hidden_sink: Optional[list] = None,
         skip_final_norm: bool = False,
+        capture_layer_ids: Optional[List[int]] = None,
+        capture_sink: Optional[list] = None,
     ) -> mx.array:
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         h = mx.broadcast_to(
@@ -1044,8 +1046,14 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
-        for layer, layer_cache in zip(self.pipeline_layers, cache):
+        capture_set = set(capture_layer_ids) if capture_layer_ids else None
+        for local_idx, (layer, layer_cache) in enumerate(
+            zip(self.pipeline_layers, cache)
+        ):
             h = layer(h, mask, layer_cache, inputs)
+            if capture_set is not None and (self.start_idx + local_idx) in capture_set:
+                # DSpark taps the mean over the hyper-connection copies.
+                capture_sink.append(h.mean(axis=2))
 
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
@@ -1263,8 +1271,10 @@ class LanguageModel(nn.Module):
         skip_logits = kwargs.pop("skip_logits", False)
         skip_final_norm = kwargs.pop("skip_final_norm", False)
         hidden_sink = kwargs.pop("hidden_sink", None)
+        capture_layer_ids = kwargs.pop("capture_layer_ids", None)
         if return_hidden and hidden_sink is None:
             hidden_sink = []
+        capture_sink = [] if capture_layer_ids else None
 
         out = self.model(
             inputs,
@@ -1272,11 +1282,13 @@ class LanguageModel(nn.Module):
             inputs_embeds=inputs_embeds,
             hidden_sink=hidden_sink,
             skip_final_norm=skip_final_norm,
+            capture_layer_ids=capture_layer_ids,
+            capture_sink=capture_sink,
         )
         logits = None if skip_logits else self.lm_head(out)
         return LanguageModelOutput(
             logits=logits,
-            hidden_states=hidden_sink,
+            hidden_states=capture_sink if capture_sink is not None else hidden_sink,
             shared_kv_states={} if return_shared_kv else None,
         )
 
