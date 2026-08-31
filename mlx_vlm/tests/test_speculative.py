@@ -56,11 +56,9 @@ from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
 )
 from mlx_vlm.speculative.drafters.gemma4_dflash import ModelConfig as Gemma4DFlashConfig
 from mlx_vlm.speculative.drafters.glm4_moe_lite_mtp.split import split_glm4_moe_lite_mtp
-from mlx_vlm.speculative.drafters.qwen3_5_mtp import (
-    CompactProposalHead,
-    ModelConfig as Qwen3_5MTPConfig,
-    Qwen3_5MTPDraftModel,
-)
+from mlx_vlm.speculative.drafters.qwen3_5_mtp import CompactProposalHead
+from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPConfig
+from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
 from mlx_vlm.speculative.drafters.qwen3_dflash import DFlashDraftModel, ModelConfig
 from mlx_vlm.speculative.eagle3 import (
