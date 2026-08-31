@@ -1124,6 +1124,28 @@ class ResponseGenerator:
                 draft_model = None
                 draft_kind = None
             else:
+                if draft_kind == "mtp":
+                    compact_head_path = os.environ.get(
+                        "MLX_VLM_DRAFT_COMPACT_HEAD"
+                    )
+                    if compact_head_path:
+                        from ..speculative.drafters.qwen3_5_mtp import (
+                            load_compact_proposal_head,
+                        )
+
+                        binder = getattr(
+                            draft_model, "set_compact_proposal_head", None
+                        )
+                        if not callable(binder):
+                            raise ValueError(
+                                "selected MTP drafter does not support a compact "
+                                "proposal head"
+                            )
+                        binder(load_compact_proposal_head(compact_head_path))
+                        logger.info(
+                            "Compact proposal head enabled: %s",
+                            compact_head_path,
+                        )
                 logger.info("Drafter ready; speculative decoding enabled.")
 
         self.model = model

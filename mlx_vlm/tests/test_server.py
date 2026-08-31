@@ -825,6 +825,45 @@ def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
     assert gen.draft_kind is None
 
 
+def test_server_loads_compact_mtp_proposal_head(monkeypatch):
+    target_config = SimpleNamespace(eos_token_id=[])
+    model = SimpleNamespace(language_model=SimpleNamespace(config=target_config))
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    drafter = SimpleNamespace(config=SimpleNamespace(block_size=4))
+    drafter.set_compact_proposal_head = MagicMock()
+    compact_head = object()
+    gen = _unstarted_response_generator()
+
+    monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "assistant")
+    monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
+    monkeypatch.setenv("MLX_VLM_DRAFT_COMPACT_HEAD", "/proposal/compact")
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, target_config),
+    )
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.drafters.load_drafter",
+        lambda *_args, **_kwargs: (drafter, "mtp"),
+    )
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.drafters.validate_drafter_compatibility",
+        lambda *_args, **_kwargs: None,
+    )
+    load_compact = MagicMock(return_value=compact_head)
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.drafters.qwen3_5_mtp.load_compact_proposal_head",
+        load_compact,
+    )
+
+    gen._initialize_model()
+
+    load_compact.assert_called_once_with("/proposal/compact")
+    drafter.set_compact_proposal_head.assert_called_once_with(compact_head)
+    assert gen.draft_model is drafter
+    assert gen.draft_kind == "mtp"
+
+
 def test_server_includes_processor_specific_stop_tokens(monkeypatch):
     config = SimpleNamespace(eos_token_id=[2])
     model = SimpleNamespace(language_model=SimpleNamespace(config=config))
@@ -6428,6 +6467,7 @@ class TestResponseGenerator:
             "MLX_VLM_PRELOAD_RERANKER_MODEL",
             "MLX_VLM_MODEL_DISCOVERY",
             "MLX_VLM_VISION_CACHE_SIZE",
+            "MLX_VLM_DRAFT_COMPACT_HEAD",
             "MLX_VLM_MAX_TOKENS",
             "MLX_VLM_THINKING_BUDGET",
             "MLX_VLM_THINKING_START_TOKEN",
@@ -6460,6 +6500,8 @@ class TestResponseGenerator:
                 "reranker-demo",
                 "--model-discovery",
                 "served",
+                "--draft-compact-head",
+                "/proposal/compact",
                 "--enable-thinking",
                 "--thinking-budget",
                 "128",
@@ -6491,6 +6533,7 @@ class TestResponseGenerator:
             assert os.environ["MLX_VLM_PRELOAD_STT_MODEL"] == "stt-demo"
             assert os.environ["MLX_VLM_PRELOAD_RERANKER_MODEL"] == "reranker-demo"
             assert os.environ["MLX_VLM_MODEL_DISCOVERY"] == "served"
+            assert os.environ["MLX_VLM_DRAFT_COMPACT_HEAD"] == "/proposal/compact"
             assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
             assert run_calls[0][1]["host"] == "127.0.0.1"
         finally:
@@ -6504,6 +6547,7 @@ class TestResponseGenerator:
                 "MLX_VLM_PRELOAD_RERANKER_MODEL",
                 "MLX_VLM_MODEL_DISCOVERY",
                 "MLX_VLM_VISION_CACHE_SIZE",
+                "MLX_VLM_DRAFT_COMPACT_HEAD",
                 "MLX_VLM_MAX_TOKENS",
                 "MLX_VLM_THINKING_BUDGET",
                 "MLX_VLM_THINKING_START_TOKEN",
