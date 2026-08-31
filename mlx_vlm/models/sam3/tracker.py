@@ -387,6 +387,10 @@ class TrackerModel(nn.Module):
         if memory_bank and len(memory_bank) > 0:
             memory = mx.concatenate(memory_bank, axis=1)
             src = self.memory_attention(src, memory)
+        else:
+            # Image-only interactive prediction has no temporal memory bank.
+            # SAM3 was trained with this learned sentinel in that case.
+            src = src + self.no_memory_embedding
 
         # Get image positional encoding
         image_pe = self.prompt_encoder.get_dense_pe()  # (1, HW, D)
@@ -453,8 +457,8 @@ class SharedImageEmbedding(nn.Module):
 
     def __call__(self, size: Tuple[int, int]) -> mx.array:
         H, W = size
-        grid_y = mx.arange(H).astype(mx.float32) / H
-        grid_x = mx.arange(W).astype(mx.float32) / W
+        grid_y = (mx.arange(H).astype(mx.float32) + 0.5) / H
+        grid_x = (mx.arange(W).astype(mx.float32) + 0.5) / W
         gy, gx = mx.meshgrid(grid_y, grid_x, indexing="ij")
         coords = mx.stack([gx.reshape(-1), gy.reshape(-1)], axis=-1)
         coords = 2 * coords - 1
