@@ -41,7 +41,9 @@ model, processor = load(
 print(generate(model, processor, "Explain multi-head latent attention.", max_tokens=256))
 ```
 
-4-bit MLX checkpoint: <https://huggingface.co/AlazarM/LongCat-Flash-Lite-Sparse-4bit>
+4-bit MLX checkpoint: <https://huggingface.co/mlx-community/LongCat-Flash-Lite-Sparse-4bit>
+6-bit MLX checkpoint: <https://huggingface.co/mlx-community/LongCat-Flash-Lite-Sparse-6bit>
+8-bit MLX checkpoint: <https://huggingface.co/mlx-community/LongCat-Flash-Lite-Sparse-8bit>
 
 ## Prefill optimizations
 
