@@ -3323,8 +3323,8 @@ def test_qwen_compact_proposal_falls_back_to_full_head_for_stochastic_drafting()
     compact_calls = []
     sampler_calls = []
     compact = SimpleNamespace(
-        propose=lambda hidden: compact_calls.append(hidden) or mx.zeros(
-            hidden.shape[:-1]
+        propose=lambda hidden: (
+            compact_calls.append(hidden) or mx.zeros(hidden.shape[:-1])
         )
     )
     draft = SimpleNamespace(
