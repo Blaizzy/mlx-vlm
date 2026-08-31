@@ -11,6 +11,7 @@ from ....models.qwen4_exp.language import (
     Qwen4ExpGatedResidual,
     Qwen4ExpRMSNorm,
 )
+from ....models.qwen4_exp.qwen4_exp import unshift_preshifted_norm_weights
 from ..deepseek_v4_mtp.deepseek_v4_mtp import DeepseekV4MTPDraftModel
 from .config import Qwen4ExpMTPConfig
 
@@ -181,4 +182,6 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
             stripped["layers.0.mlp.switch_mlp.down_proj.weight"] = stripped.pop(
                 down_key
             )
-        return stripped
+        return unshift_preshifted_norm_weights(
+            stripped, self.config.text_config.preshifted_norm_weights
+        )

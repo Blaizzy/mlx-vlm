@@ -1,7 +1,9 @@
+from types import SimpleNamespace
 from typing import Dict
 
 import mlx.core as mx
 
+from ....models.qwen4_exp.config import TextConfig
 from ....models.qwen4_exp.fp8 import convert_qwen4_exp_fp8_weights
 from ..mtp_split import MTPSplitter
 from .qwen4_exp_mtp import Qwen4ExpMTPDraftModel
@@ -28,6 +30,11 @@ class Qwen4ExpMTPSplitter(MTPSplitter):
     ) -> Dict[str, mx.array]:
         del text_config
         return convert_qwen4_exp_fp8_weights(tensors)
+
+    def sanitize_ctx(self, text_config: dict):
+        return SimpleNamespace(
+            config=SimpleNamespace(text_config=TextConfig.from_dict(text_config))
+        )
 
 
 def split_qwen4_exp_mtp(source: str, output: str, **kwargs):

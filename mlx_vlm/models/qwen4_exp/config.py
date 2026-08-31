@@ -54,6 +54,7 @@ class TextConfig(BaseModelConfig):
     split_ngram_parts: int = 128
     seed: int = 1234
     ple_storage: Optional[Dict] = None
+    preshifted_norm_weights: Optional[bool] = None
     indexer_n_heads: int = 4
     indexer_kv_heads: int = 1
     indexer_head_dim: int = 128

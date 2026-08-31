@@ -4,9 +4,18 @@ from types import SimpleNamespace
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx.utils import tree_flatten
 
 from mlx_vlm.models.qwen4_exp.config import TextConfig
-from mlx_vlm.models.qwen4_exp.language import LanguageModel, Qwen4ExpDecoderLayer
+from mlx_vlm.models.qwen4_exp.language import (
+    LanguageModel,
+    Qwen4ExpDecoderLayer,
+    Qwen4ExpRMSNorm,
+)
+from mlx_vlm.models.qwen4_exp.qwen4_exp import (
+    norm_weights_are_preshifted,
+    zero_centered_norm_keys,
+)
 from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_mtp_splitter
 from mlx_vlm.speculative.drafters.qwen4_exp_mtp import (
     ModelConfig,
@@ -308,3 +317,55 @@ def test_qwen4_mtp_splitter_converts_official_fp8_experts(tmp_path):
     assert down.shape == (2, 128, 128)
     assert not any(key.endswith("weight_scale_inv") for key in split_weights)
     assert "quantization" not in config
+
+
+def _released_drafter_checkpoint():
+    mx.random.seed(0)
+    drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=_tiny_text_config()))
+    released = dict(tree_flatten(drafter.parameters()))
+    keys = zero_centered_norm_keys(released)
+    for key in keys:
+        released[key] = mx.random.normal(released[key].shape) * 0.4 + 0.15
+    mx.eval(released)
+    return drafter, released, keys
+
+
+def test_drafter_zero_centered_norms_are_all_recognized():
+    drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=_tiny_text_config()))
+    expected = {
+        f"{name}.weight"
+        for name, module in drafter.named_modules()
+        if isinstance(module, Qwen4ExpRMSNorm)
+    }
+    matched = set(zero_centered_norm_keys(dict(tree_flatten(drafter.parameters()))))
+
+    assert expected
+    assert "pre_fc_norm_embedding.weight" in expected
+    assert "pre_fc_norm_hidden.weight" in expected
+    assert matched == expected
+
+
+def test_drafter_sanitize_unshifts_preshifted_norm_gains():
+    drafter, released, keys = _released_drafter_checkpoint()
+    shifted_keys = set(keys)
+    preshifted = {
+        key: (value + 1.0 if key in shifted_keys else value)
+        for key, value in released.items()
+    }
+    mx.eval(preshifted)
+
+    assert not norm_weights_are_preshifted(released, keys)
+    assert norm_weights_are_preshifted(preshifted, keys)
+
+    restored = drafter.sanitize(dict(preshifted))
+    for key in keys:
+        assert mx.allclose(restored[key], released[key], atol=1e-6).item(), key
+
+
+def test_drafter_sanitize_leaves_correct_gains_alone():
+    drafter, released, keys = _released_drafter_checkpoint()
+    once = drafter.sanitize(dict(released))
+    twice = drafter.sanitize(dict(once))
+    for key in keys:
+        assert mx.array_equal(once[key], released[key]).item(), key
+        assert mx.array_equal(twice[key], once[key]).item(), key

@@ -2,6 +2,7 @@ import unittest
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 
 from mlx_vlm.generate import maybe_quantize_kv_cache
 from mlx_vlm.generate.ar import _make_cache
@@ -13,9 +14,16 @@ from mlx_vlm.models.qwen4_exp.language import (
     QSAQuantizedKVCache,
     Qwen4ExpGatedDeltaNet,
     Qwen4ExpNGramEmbedding,
+    Qwen4ExpRMSNorm,
+    Qwen4ExpRMSNormGated,
     ShardedEmbedding,
 )
+from mlx_vlm.models.qwen4_exp.qwen4_exp import (
+    norm_weights_are_preshifted,
+    zero_centered_norm_keys,
+)
 from mlx_vlm.prompt_utils import MessageFormat, MessageFormatter
+from mlx_vlm.tests.sanitize_invariants import assert_sanitize_idempotent
 
 
 def tiny_config():
@@ -636,6 +644,127 @@ class Qwen4ExpTests(unittest.TestCase):
             predicate(path, None),
             {"fallback_group_size": 32},
         )
+
+
+class Qwen4ExpPreshiftedNormTests(unittest.TestCase):
+    """Guards against loading a checkpoint that already applied ``1 + w``."""
+
+    def released_checkpoint(self, config=None):
+        mx.random.seed(0)
+        config = config or tiny_config()
+        model = qwen4_exp.Model(config)
+        weights = dict(tree_flatten(model.parameters()))
+        keys = zero_centered_norm_keys(weights)
+        for key in keys:
+            weights[key] = mx.random.normal(weights[key].shape) * 0.4 + 0.15
+        mx.eval(weights)
+        return model, weights, keys
+
+    def preshift(self, released, keys):
+        preshifted = dict(released)
+        for key in keys:
+            preshifted[key] = released[key] + 1.0
+        mx.eval(preshifted)
+        return preshifted
+
+    def test_suffixes_cover_exactly_the_zero_centered_norms(self):
+        model = qwen4_exp.Model(tiny_config())
+        zero_centered = {
+            f"{name}.weight"
+            for name, module in model.named_modules()
+            if isinstance(module, Qwen4ExpRMSNorm)
+        }
+        gated = {
+            f"{name}.weight"
+            for name, module in model.named_modules()
+            if isinstance(module, Qwen4ExpRMSNormGated)
+        }
+        matched = set(zero_centered_norm_keys(dict(tree_flatten(model.parameters()))))
+
+        self.assertTrue(zero_centered)
+        self.assertTrue(gated)
+        self.assertEqual(matched, zero_centered)
+        self.assertEqual(matched & gated, set())
+
+    def test_detects_only_the_preshifted_checkpoint(self):
+        _, released, keys = self.released_checkpoint()
+        self.assertTrue(keys)
+        self.assertFalse(norm_weights_are_preshifted(released, keys))
+        self.assertTrue(
+            norm_weights_are_preshifted(self.preshift(released, keys), keys)
+        )
+        self.assertFalse(norm_weights_are_preshifted({}))
+
+    def test_preshifted_gains_are_restored(self):
+        model, released, keys = self.released_checkpoint()
+        preshifted = self.preshift(released, keys)
+        restored = model.sanitize(dict(preshifted))
+        for key in keys:
+            self.assertTrue(
+                mx.allclose(restored[key], released[key], atol=1e-6).item(), key
+            )
+
+    def test_gated_norm_is_never_shifted(self):
+        model, released, keys = self.released_checkpoint()
+        gated = [
+            f"{name}.weight"
+            for name, module in model.named_modules()
+            if isinstance(module, Qwen4ExpRMSNormGated)
+        ]
+        preshifted = self.preshift(released, keys)
+        restored = model.sanitize(dict(preshifted))
+        self.assertTrue(gated)
+        for key in gated:
+            self.assertTrue(mx.array_equal(restored[key], preshifted[key]).item(), key)
+
+    def test_released_checkpoint_is_left_alone(self):
+        model, released, keys = self.released_checkpoint()
+        sanitized = model.sanitize(dict(released))
+        for key in keys:
+            self.assertTrue(mx.array_equal(sanitized[key], released[key]).item(), key)
+
+    def test_sanitize_stays_idempotent(self):
+        model, released, keys = self.released_checkpoint()
+        assert_sanitize_idempotent(model, self.preshift(released, keys))
+        assert_sanitize_idempotent(model, dict(released))
+
+    def test_config_flag_overrides_detection(self):
+        config = tiny_config()
+        config.text_config.preshifted_norm_weights = False
+        model, released, keys = self.released_checkpoint(config)
+        preshifted = self.preshift(released, keys)
+        left_alone = model.sanitize(dict(preshifted))
+        for key in keys:
+            self.assertTrue(
+                mx.array_equal(left_alone[key], preshifted[key]).item(), key
+            )
+
+        config.text_config.preshifted_norm_weights = True
+        forced = model.sanitize(dict(released))
+        for key in keys:
+            self.assertTrue(
+                mx.allclose(forced[key], released[key] - 1.0, atol=1e-6).item(), key
+            )
+
+    def test_forward_pass_matches_the_released_checkpoint(self):
+        config = tiny_config()
+        config.text_config.layer_types = [
+            "qwen_sparse_attention",
+            "qwen_sparse_attention",
+        ]
+        model, released, keys = self.released_checkpoint(config)
+        tokens = mx.array([[2, 5, 9, 13, 21, 34, 40, 7]])
+
+        def logits(weights):
+            candidate = qwen4_exp.Model(config)
+            candidate.load_weights(list(model.sanitize(dict(weights)).items()))
+            candidate.eval()
+            return candidate.language_model(tokens, cache=None).logits
+
+        expected = logits(released)
+        actual = logits(self.preshift(released, keys))
+        mx.eval(expected, actual)
+        self.assertTrue(mx.allclose(expected, actual, atol=1e-4).item())
 
 
 if __name__ == "__main__":

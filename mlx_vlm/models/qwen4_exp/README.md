@@ -137,3 +137,10 @@ python -m mlx_vlm.split_mtp \
   requesting both raises an explicit error to preserve the QSA indexer state.
 - Long image or video prompts may benefit from a smaller
   `--prefill-step-size` to reduce peak memory.
+- MLX conversions published before #2032 folded `Qwen4ExpRMSNorm`'s `1 + w`
+  offset into their saved norm gains, so loading one would apply the offset
+  twice and generate noise. Such a checkpoint is now detected and the offset
+  subtracted back out, with a warning. Re-converting from
+  `Qwen/Qwen3.8-Flash-Next` avoids relying on that fixup, which cannot restore
+  gains the conversion rounded away. Set `text_config.preshifted_norm_weights`
+  to `true` or `false` to override the detection.
