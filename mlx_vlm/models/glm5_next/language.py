@@ -1,3 +1,5 @@
+import logging
+import os
 from typing import Any, List, Optional
 
 import mlx.core as mx
@@ -20,6 +22,8 @@ from ..mlp import DeepseekMLP
 from .config import ModelConfig, TextConfig
 from .speculative_verifier import Glm5NextExactSpeculativeVerifier, verify_logits
 
+logger = logging.getLogger(__name__)
+
 _SPECULATIVE_VERIFIER = Glm5NextExactSpeculativeVerifier()
 
 # Query chunk for gathered multi-query sparse attention: bounds the gathered
@@ -28,13 +32,52 @@ _SPECULATIVE_VERIFIER = Glm5NextExactSpeculativeVerifier()
 # always a single chunk.
 _GATHER_Q_CHUNK = 1024
 
-# Context length above which gathered prefill beats the dense masked path.
-# Measured crossover on M3 Ultra at GLM-5.3-Flash dims: dense is cheaper per
-# chunk below ~16k keys (0.74x at 8k), gathered wins beyond (1.65x at 32k,
-# 5.1x at 65k, 7.1x at 131k — near depth-flat). During a long chunked prefill
-# the early shallow chunks take the dense path and later chunks gather, per
-# chunk, automatically. Short verify blocks (L <= 8) always gather.
-_GATHER_MIN_CONTEXT = 16384
+# Key count above which the gathered path beats the dense masked path. The gate
+# is evaluated per chunk on the cumulative key count, so a long chunked prefill
+# runs its early chunks dense and starts gathering once the cache passes the
+# threshold. Short verify blocks (L <= 8) always gather.
+#
+# End-to-end prefill throughput on GLM-5.3-Flash, M3 Ultra, 4-bit, batch 1,
+# prefill_step_size=2048, measured by @avlp12 (tok/s, higher is better):
+#
+#   prompt   dense    16384    32768    65536
+#     16k    419.4    394.2        -    421.9
+#     32k    350.2    297.0    341.2    351.1
+#     65k    256.9    261.5    276.1    248.8
+#    131k    158.7    242.3    246.3    234.5
+#
+# The gate-32768 column and the 65k/65536 cell come from a second, identical
+# M3 Ultra, where the 32k/65536 control read 348.6.
+#
+# Dense wins the shallow band and gather wins above it, so a middle threshold
+# beats both extremes: 32768 is the best cell at 65k and 131k, for a real ~2%
+# cost at 32k -- only ~6% of that prompt's tokens sit above the threshold. The
+# two gate-65536 cells at 16k and 32k cannot fire at those lengths and so pin
+# the repeat spread at <= 0.6%. Peak memory at 131k is 237 GB dense vs 199 GB
+# always-gather, so a higher threshold trades some of the memory win back. An
+# isolated single-layer bench puts the crossover near 16k on the same box; the
+# gap between that and the end-to-end optimum has not been isolated.
+#
+# The crossover moves with hardware, topology and prefill step size: a
+# tensor-parallel deployment of this architecture (2 nodes, step size 4096,
+# 6-bit) measures its own crossover near 16384 keys, half the value above.
+# MLX_VLM_GLM5_GATHER_MIN_CONTEXT retunes it (0 always gathers, a very large
+# value keeps the dense path).
+DEFAULT_GATHER_MIN_CONTEXT = 32768
+
+
+def _gather_min_context() -> int:
+    raw = os.environ.get("MLX_VLM_GLM5_GATHER_MIN_CONTEXT")
+    if raw is None:
+        return DEFAULT_GATHER_MIN_CONTEXT
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("Ignoring invalid MLX_VLM_GLM5_GATHER_MIN_CONTEXT=%r", raw)
+        return DEFAULT_GATHER_MIN_CONTEXT
+
+
+_GATHER_MIN_CONTEXT = _gather_min_context()
 
 
 class Glm5NextRMSNormGated(nn.Module):

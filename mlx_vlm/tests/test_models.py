@@ -2979,6 +2979,31 @@ class TestModels(unittest.TestCase):
             glm5_lang._GATHER_MIN_CONTEXT = old_min
         self.assertTrue(mx.all(mx.isfinite(out2)).item())
 
+    def test_glm5_next_gather_min_context_env_override(self):
+        # The gathered-prefill crossover moves with hardware and prefill step
+        # size, so the threshold is env-tunable; a malformed value must fall
+        # back to the default rather than raise at import.
+        import os
+
+        from mlx_vlm.models.glm5_next import language as glm5_lang
+
+        var = "MLX_VLM_GLM5_GATHER_MIN_CONTEXT"
+        default = glm5_lang.DEFAULT_GATHER_MIN_CONTEXT
+        previous = os.environ.get(var)
+        try:
+            os.environ.pop(var, None)
+            self.assertEqual(glm5_lang._gather_min_context(), default)
+            for value, expected in (("65536", 65536), ("0", 0), ("-1", 0)):
+                os.environ[var] = value
+                self.assertEqual(glm5_lang._gather_min_context(), expected)
+            os.environ[var] = "not-an-int"
+            self.assertEqual(glm5_lang._gather_min_context(), default)
+        finally:
+            if previous is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = previous
+
     def test_glm5_next_kda_matches_recurrent(self):
         # The shared gated-delta path must match glm5_next's reference recurrence
         # (the KDA safe forget gate == gated_delta.compute_g_safe, term for term).
