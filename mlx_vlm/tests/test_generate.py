@@ -2002,6 +2002,50 @@ def test_generate_step_schedules_final_prefill_async():
     assert events[0] == "async"
 
 
+def test_generate_step_preserves_explicit_prompt_position_metadata():
+    model = MagicMock()
+    model.language_model.supports_logits_to_keep = False
+    model.language_model.return_value = MagicMock(
+        logits=mx.zeros((1, 1, 4)),
+        cross_attention_states=None,
+        encoder_outputs=None,
+    )
+
+    full_position_ids = mx.array([[10, 11]], dtype=mx.int32)
+    full_rope_deltas = mx.array([[7]], dtype=mx.int32)
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 2, 4))
+    embedding_output.to_dict.return_value = {
+        "position_ids": mx.array([[0, 1]], dtype=mx.int32),
+        "rope_deltas": mx.array([[0]], dtype=mx.int32),
+    }
+    model.get_input_embeddings.return_value = embedding_output
+
+    with (
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+    ):
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1, 2]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            prompt_cache=[],
+            max_tokens=1,
+            position_ids=full_position_ids,
+            rope_deltas=full_rope_deltas,
+        )
+        next(gen)
+
+    # The generator prepares the following decode step before yielding the
+    # current token, so inspect the first (prompt/suffix) forward call.
+    call_kwargs = model.language_model.call_args_list[0].kwargs
+    assert bool(mx.array_equal(call_kwargs["position_ids"], full_position_ids))
+    assert bool(mx.array_equal(call_kwargs["rope_deltas"], full_rope_deltas))
+
+
 @pytest.mark.parametrize(("verbose", "disabled"), [(False, True), (True, False)])
 def test_generate_step_prefill_tqdm_respects_verbose(verbose, disabled):
     pbar = MagicMock()
@@ -2157,13 +2201,79 @@ def test_stream_generate_forwards_verbose_to_generate_step():
     assert captured["verbose"] is True
 
 
+def test_stream_generate_stores_checkpoint_only_before_decode():
+    class FakeStoppingCriteria:
+        def __call__(self, token):
+            return False
+
+    class FakeDetokenizer:
+        last_segment = ""
+
+        def reset(self):
+            pass
+
+        def add_token(self, token, skip_special_token_ids=None):
+            pass
+
+        def finalize(self):
+            pass
+
+    coordinator = MagicMock()
+    coordinator.enabled = True
+    coordinator.is_checkpoint = True
+    coordinator.lookup.return_value = None
+    coordinator.checkpoint_len.return_value = 3
+
+    def fake_generate_step(*args, **kwargs):
+        kwargs["prompt_cache_checkpoint"](
+            kwargs["prompt_cache_checkpoint_len"], kwargs["prompt_cache"]
+        )
+        yield 7, mx.zeros((4,))
+
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(stopping_criteria=FakeStoppingCriteria()),
+        detokenizer=FakeDetokenizer(),
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test", eos_token_id=[]),
+        language_model=SimpleNamespace(),
+    )
+    prompt_cache = []
+
+    with (
+        patch.object(dispatch_module._apc, "APCCoordinator", return_value=coordinator),
+        patch.object(dispatch_module._apc, "semantic_extra_hash", return_value=0),
+        patch.object(
+            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
+        ),
+        patch.object(dispatch_module, "generate_step", side_effect=fake_generate_step),
+    ):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="",
+                input_ids=mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache=prompt_cache,
+                apc_manager=MagicMock(),
+                max_tokens=1,
+            )
+        )
+
+    coordinator.store_checkpoint.assert_called_once_with(
+        [1, 2, 3], prompt_cache, extra_hash=0
+    )
+
+
 def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
     captured = {}
     tokenizer = SimpleNamespace(stopping_criteria=SimpleNamespace())
     processor = SimpleNamespace(tokenizer=tokenizer)
     model = SimpleNamespace(
         config=SimpleNamespace(model_type="test"),
-        language_model=SimpleNamespace(),
+        language_model=SimpleNamespace(layers=[object()]),
     )
     prepared_mask = mx.ones((1, 4), dtype=mx.int32)
 
@@ -2185,7 +2295,11 @@ def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
             dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
         ),
         patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
-        patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(
+            dispatch_module.cache,
+            "make_prompt_cache",
+            return_value=[dispatch_module.cache.KVCache()],
+        ),
         patch.object(
             dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
         ),
@@ -2212,7 +2326,7 @@ def test_stream_generate_hashes_explicit_sequence_tensors_for_apc_safety():
     processor = SimpleNamespace(tokenizer=tokenizer)
     model = SimpleNamespace(
         config=SimpleNamespace(model_type="test"),
-        language_model=SimpleNamespace(),
+        language_model=SimpleNamespace(layers=[object()]),
     )
     custom_embeds = mx.ones((1, 4, 3))
     custom_mask = mx.array([[1, 1, 0, 0]], dtype=mx.int32)
@@ -2227,7 +2341,11 @@ def test_stream_generate_hashes_explicit_sequence_tensors_for_apc_safety():
             dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
         ),
         patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
-        patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(
+            dispatch_module.cache,
+            "make_prompt_cache",
+            return_value=[dispatch_module.cache.KVCache()],
+        ),
         patch.object(
             dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
         ),
@@ -2323,6 +2441,7 @@ def test_generate_cli_smoke(capsys):
         revision="main",
         trust_remote_code=False,
         quantize_activations=False,
+        expert_cache_gb=None,
         processor_kwargs={},
         prefill_step_size=128,
         enable_thinking=True,
@@ -2402,6 +2521,7 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
         revision=None,
         trust_remote_code=False,
         quantize_activations=False,
+        expert_cache_gb=None,
         processor_kwargs={},
         gen_kwargs={},
         prefill_step_size=None,
@@ -2494,7 +2614,7 @@ def test_resolve_video_inputs_uses_one_global_frame_budget():
     assert resolution.frame_fps == pytest.approx(1.5)
     assert images == [still]
     assert videos == ["first.mp4", "second.mp4"]
-    mock_sample.assert_called_once_with(videos, 1.5)
+    mock_sample.assert_called_once_with(videos, 1.5, None)
 
 
 def test_resolve_video_inputs_does_not_partially_mutate_on_decode_failure():
@@ -2563,6 +2683,7 @@ def test_generate_cli_video_frames_fallback_without_video_processor(capsys):
         revision=None,
         trust_remote_code=False,
         quantize_activations=False,
+        expert_cache_gb=None,
         processor_kwargs={},
         gen_kwargs={},
         prefill_step_size=None,
@@ -2703,10 +2824,40 @@ def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
         )
 
     assert ok is False
+    assert "position_ids" not in kwargs
     assert "rope_deltas" not in kwargs
     assert bool(mx.array_equal(language_model._rope_deltas, rope_deltas_before))
     assert bool(mx.array_equal(language_model._position_ids, position_ids_before))
     assert "falling back to cold prefill" in caplog.text
+
+
+def test_cached_prefix_rope_forwards_full_prompt_metadata():
+    position_ids = mx.array([[0, 1, 2, 3]], dtype=mx.int32)
+    rope_deltas = mx.array([[7]], dtype=mx.int32)
+
+    class RopeLanguageModel:
+        _position_ids = None
+        _rope_deltas = None
+
+        @staticmethod
+        def get_rope_index(*args, **kwargs):
+            return position_ids, rope_deltas
+
+    language_model = RopeLanguageModel()
+    kwargs = {}
+
+    ok = _prime_cached_prefix_rope_state(
+        SimpleNamespace(language_model=language_model),
+        mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+        None,
+        kwargs,
+    )
+
+    assert ok is True
+    assert bool(mx.array_equal(kwargs["position_ids"], position_ids))
+    assert bool(mx.array_equal(kwargs["rope_deltas"], rope_deltas))
+    assert bool(mx.array_equal(language_model._position_ids, position_ids))
+    assert bool(mx.array_equal(language_model._rope_deltas, rope_deltas))
 
 
 class TestPrefixCacheReuseTrim:

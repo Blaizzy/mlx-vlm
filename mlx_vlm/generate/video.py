@@ -48,16 +48,18 @@ def processor_handles_video(processor) -> bool:
     return "videos" in params and has_component
 
 
-def sample_video_frames(videos, fps=2.0):
-    """Decode ``videos`` at ``fps`` into one chronological list of PIL frames,
-    returned alongside the sampling fps actually used."""
-    from ..utils import load_video
+def sample_video_frames(videos, fps=2.0, sampling=None):
+    """Decode ``videos`` into one chronological list of PIL frames, returned
+    alongside the sampling fps actually used. ``sampling`` carries the
+    caller's frame-count overrides and wins over ``fps``."""
+    from ..utils import VideoSampling, load_video
 
+    resolved = (sampling or VideoSampling()).merge(VideoSampling(fps=fps))
     frames = []
     frame_fps = fps
     for video in videos:
-        arr, sampled_fps = load_video(str(video), fps=fps)
-        frame_fps = sampled_fps or frame_fps
+        arr, metadata = load_video(str(video), resolved)
+        frame_fps = metadata.sampled_fps or frame_fps
         for frame in arr:
             frames.append(Image.fromarray(np.transpose(frame, (1, 2, 0))))
     return frames, frame_fps
@@ -81,6 +83,7 @@ def resolve_video_inputs(
     images=None,
     fps=2.0,
     max_frames=16,
+    sampling=None,
 ) -> VideoInputResolution:
     """Resolve unsupported videos into a globally capped list of still images.
 
@@ -98,7 +101,7 @@ def resolve_video_inputs(
         )
 
     max_frames = max(2, int(max_frames or 16))
-    frames, frame_fps = sample_video_frames(resolved_videos, fps or 2.0)
+    frames, frame_fps = sample_video_frames(resolved_videos, fps or 2.0, sampling)
     sampled_count = len(frames)
     if not sampled_count:
         raise ValueError("Video frame fallback decoded no frames.")

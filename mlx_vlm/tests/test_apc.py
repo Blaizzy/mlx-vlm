@@ -374,6 +374,58 @@ def test_apc_max_pool_tensors_keeps_disk_persistence(tmp_path, monkeypatch):
     manager.close()
 
 
+def test_layer_major_disk_restore_uses_mlx_without_numpy_staging(tmp_path, monkeypatch):
+    monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "2")
+    block_size = 16
+    token_ids = list(range(3 * block_size))
+    layer_keys, layer_values = _make_fake_kv(num_layers=2, seq_len=len(token_ids))
+
+    disk = DiskBlockStore(tmp_path, namespace="mlx-direct")
+    manager = APCManager(num_blocks=1, block_size=block_size, disk=disk)
+    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
+    manager.release(stored)
+    disk._q.join()
+    manager.close()
+
+    def reject_numpy_staging(*_args, **_kwargs):
+        raise AssertionError("disk restore must not stage tensors through NumPy")
+
+    monkeypatch.setattr(apc_module.np, "frombuffer", reject_numpy_staging)
+    disk = DiskBlockStore(tmp_path, namespace="mlx-direct")
+    manager = APCManager(num_blocks=1, block_size=block_size, disk=disk)
+    warm, matched_tokens = manager.lookup_prefix_disk_cache(token_ids)
+
+    assert warm is not None
+    assert matched_tokens == len(token_ids)
+    for layer_idx, cache in enumerate(warm):
+        _assert_allclose(cache.keys[..., :matched_tokens, :], layer_keys[layer_idx])
+        _assert_allclose(cache.values[..., :matched_tokens, :], layer_values[layer_idx])
+    manager.close()
+
+
+def test_disk_writer_materializes_generation_stream_cache_on_producer(
+    tmp_path, monkeypatch
+):
+    from mlx_vlm.generate.common import generation_stream
+
+    monkeypatch.setenv("APC_MAX_POOL_TENSORS", "1")
+    block_size = 16
+    token_ids = list(range(block_size))
+    with mx.stream(generation_stream):
+        base = mx.arange(block_size * 4, dtype=mx.float32).reshape(1, 1, block_size, 4)
+        layer_keys = [base + 1, base + 2]
+        layer_values = [base + 3, base + 4]
+
+    disk = DiskBlockStore(tmp_path, namespace="generation-stream")
+    manager = APCManager(num_blocks=1, block_size=block_size, disk=disk)
+    assert manager.store_kv_blocks(token_ids, layer_keys, layer_values) == []
+    disk._q.join()
+
+    assert disk.num_blocks_indexed == 1
+    assert disk.disk_bytes > 0
+    manager.close()
+
+
 def test_disk_store_clears_each_writer_threads_streams(tmp_path, monkeypatch):
     cleared_threads = []
     monkeypatch.setattr(
@@ -584,6 +636,42 @@ def test_exact_cache_supports_mixed_kv_and_arrays_cache():
     )
 
 
+def test_exact_cache_restore_keeps_the_first_decode_growth_boundary():
+    """A warm replay must grow KV at the same token as an uncached replay."""
+    from mlx_vlm.models.cache import KVCache
+
+    prefix_len = KVCache.step - 16
+    full_prompt_len = KVCache.step
+    token_ids = list(range(prefix_len))
+    full_tokens = list(range(full_prompt_len))
+
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, KVCache.step, 2))
+    kv.values = mx.ones((1, 1, KVCache.step, 2)) * 2
+    kv.offset = prefix_len
+
+    manager = APCManager(num_blocks=4, block_size=16)
+    assert manager.store_exact_cache(token_ids, [kv])
+    warm, matched_tokens = manager.lookup_exact_cache(full_tokens)
+
+    assert matched_tokens == prefix_len
+    assert warm is not None
+    restored = warm[0]
+    assert restored.offset == prefix_len
+    assert restored.keys.shape[2] == KVCache.step
+
+    suffix_len = full_prompt_len - prefix_len
+    restored.update_and_fetch(
+        mx.ones((1, 1, suffix_len, 2)),
+        mx.ones((1, 1, suffix_len, 2)),
+    )
+    assert restored.offset == full_prompt_len
+    assert restored.keys.shape[2] == KVCache.step
+
+    restored.update_and_fetch(mx.ones((1, 1, 1, 2)), mx.ones((1, 1, 1, 2)))
+    assert restored.keys.shape[2] == 2 * KVCache.step
+
+
 def test_exact_cache_supports_rotating_and_chunked_kv_cache():
     from mlx_vlm.models.cache import ChunkedKVCache, KVCache, RotatingKVCache
 
@@ -675,6 +763,39 @@ def test_exact_cache_disk_restore_rebuilds_index(tmp_path, monkeypatch):
     manager.close()
 
 
+def test_exact_disk_restore_keeps_the_first_decode_growth_boundary(
+    tmp_path, monkeypatch
+):
+    from mlx_vlm.models.cache import KVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    prefix_len = KVCache.step - 16
+    full_prompt_len = KVCache.step
+    token_ids = list(range(prefix_len))
+
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, KVCache.step, 2))
+    kv.values = mx.ones((1, 1, KVCache.step, 2)) * 2
+    kv.offset = prefix_len
+
+    disk = DiskBlockStore(tmp_path, namespace="decode-growth-boundary")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [kv])
+    disk._q.join()
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="decode-growth-boundary")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    warm, matched_tokens = manager.lookup_exact_cache(list(range(full_prompt_len)))
+
+    assert matched_tokens == prefix_len
+    assert warm is not None
+    assert warm[0].offset == prefix_len
+    assert warm[0].keys.shape[2] == KVCache.step
+    assert manager.stats_snapshot()["disk_hits"] == 1
+    manager.close()
+
+
 def test_exact_cache_disk_restore_preserves_safetensors_dtypes(tmp_path, monkeypatch):
     from mlx_vlm.models.cache import ArraysCache
 
@@ -719,7 +840,7 @@ def test_exact_cache_disk_restore_preserves_qsa_state(tmp_path, monkeypatch):
     from mlx_vlm.models.cache import ArraysCache
     from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, QSAKVCache
 
-    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "1")
 
     token_ids = list(range(40))
     arrays = ArraysCache(size=1)
@@ -748,6 +869,9 @@ def test_exact_cache_disk_restore_preserves_qsa_state(tmp_path, monkeypatch):
     manager = APCManager(num_blocks=1, block_size=16, disk=disk)
     assert manager.store_exact_cache(token_ids, [arrays, qsa], extra_hash=19)
     disk._q.join()
+    snapshot_path = next(iter(disk._exact_index.values()))
+    _, metadata, _ = disk._open_shard_header(snapshot_path)
+    assert metadata["c1_kind"] == "checkpoint"
     manager.close()
 
     disk = DiskBlockStore(tmp_path, namespace="qsa-exact")
@@ -767,6 +891,14 @@ def test_exact_cache_disk_restore_preserves_qsa_state(tmp_path, monkeypatch):
     assert bool(
         mx.array_equal(warm[1].index_position_ids, qsa.index_position_ids).item()
     )
+
+    memory_warm, memory_matched_tokens = manager.lookup_exact_cache(
+        token_ids + [998], extra_hash=19
+    )
+    assert memory_matched_tokens == len(token_ids)
+    assert memory_warm is not None
+    assert memory_warm[1].keys.shape[2] >= len(token_ids) + 1
+    assert manager.stats_snapshot()["disk_hits"] == 1
 
     batch_cache, max_prefix = make_warm_batch_exact_cache_multi(
         [warm], [len(token_ids)]
@@ -821,6 +953,91 @@ def test_exact_cache_disk_restore_preserves_rotating_kv(tmp_path, monkeypatch):
     assert warm[1]._idx == rotating._idx
     _assert_allclose(warm[1].keys, rotating.keys)
     _assert_allclose(warm[1].values, rotating.values)
+    manager.close()
+
+
+def test_exact_cache_disk_restore_preserves_deepseek_v4_empty_values(
+    tmp_path, monkeypatch
+):
+    """DeepSeek V4's K-only local cache persists its zero-width V tensor."""
+    from mlx_vlm.models.cache import CacheList, PoolingCache, RotatingKVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+
+    token_ids = list(range(40))
+    rotating = RotatingKVCache(max_size=8, keep=0)
+    rotating.keys = (
+        mx.arange(1 * 1 * 8 * 4, dtype=mx.float32)
+        .reshape(1, 1, 8, 4)
+        .astype(mx.bfloat16)
+    )
+    rotating.values = mx.zeros((1, 1, 8, 0), dtype=mx.bfloat16)
+    rotating.offset = len(token_ids)
+    rotating._idx = 3
+
+    pooled = PoolingCache(ratio=4)
+    pooled.pooled = mx.ones((1, 6, 4), dtype=mx.bfloat16)
+    index = PoolingCache(ratio=4)
+    index.pooled = mx.ones((1, 6, 2), dtype=mx.float32)
+    cache = CacheList(rotating, pooled, index)
+    mx.eval(rotating.keys, rotating.values, pooled.pooled, index.pooled)
+
+    disk = DiskBlockStore(tmp_path, namespace="deepseek-v4-empty-values")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [cache], extra_hash=19)
+    disk._q.join()
+    stats = manager.stats_snapshot()
+    assert stats["disk_writes"] == 1
+    assert stats["disk_write_failures"] == 0
+    assert stats["disk_exact_indexed"] == 1
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="deepseek-v4-empty-values")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    warm, matched_tokens = manager.lookup_exact_cache(
+        token_ids + [999],
+        extra_hash=19,
+    )
+
+    assert matched_tokens == len(token_ids)
+    assert warm is not None
+    assert manager.stats_snapshot()["disk_hits"] == 1
+    restored = warm[0]
+    assert isinstance(restored, CacheList)
+    restored_rotating = restored.caches[0]
+    assert restored_rotating.values.shape == (1, 1, 8, 0)
+    assert restored_rotating.values.dtype == mx.bfloat16
+    _assert_allclose(restored_rotating.keys, rotating.keys)
+    _assert_allclose(restored.caches[1].pooled, pooled.pooled)
+    _assert_allclose(restored.caches[2].pooled, index.pooled)
+    manager.close()
+
+
+def test_exact_cache_disk_write_stats_only_count_committed_files(tmp_path, monkeypatch):
+    from mlx_vlm.models.cache import KVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    token_ids = list(range(40))
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 2))
+    kv.values = mx.ones((1, 1, len(token_ids), 2))
+    kv.offset = len(token_ids)
+
+    def fail_after_creating_partial(path, *_args, **_kwargs):
+        open(path, "wb").close()
+        raise RuntimeError("synthetic serialization failure")
+
+    monkeypatch.setattr(apc_module.mx, "save_safetensors", fail_after_creating_partial)
+    disk = DiskBlockStore(tmp_path, namespace="failed-exact-write")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [kv])
+    disk._q.join()
+
+    stats = manager.stats_snapshot()
+    assert stats["disk_writes"] == 0
+    assert stats["disk_write_failures"] == 1
+    assert stats["disk_exact_indexed"] == 0
+    assert not list(disk.dir.glob(f"*{disk.SUFFIX}"))
     manager.close()
 
 
@@ -1213,6 +1430,101 @@ def test_exact_lookup_memory_takes_priority_over_disk(tmp_path, monkeypatch):
     manager.close()
 
 
+def test_exact_disk_roundtrip_generic_composite_cache(tmp_path, monkeypatch):
+    """Checkpoint serialization covers in-tree composite/custom cache leaves."""
+    from mlx_vlm.models.cache import CacheList, PoolingCache, SimpleKVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    monkeypatch.setenv("APC_EXACT_MIN_TOKENS", "1")
+    token_ids = list(range(12))
+
+    simple = SimpleKVCache()
+    simple.update_and_fetch(mx.ones((1, 2, 12, 4)), mx.ones((1, 2, 12, 4)) * 2)
+
+    pooling = PoolingCache(ratio=2)
+    pooling.pooled = mx.ones((1, 5, 4)) * 3
+    pooling.buf_kv = mx.ones((1, 2, 4)) * 4
+    pooling.buf_gate = mx.ones((1, 2, 1)) * 5
+    pooling.remainder = 1
+    mx.eval(simple.keys, simple.values, pooling.state)
+
+    disk = DiskBlockStore(tmp_path, namespace="generic-checkpoint")
+    manager = APCManager(num_blocks=4, block_size=4, disk=disk)
+    assert manager.store_exact_cache(
+        token_ids, [(simple, SimpleKVCache()), CacheList(pooling)]
+    )
+    disk._q.join()
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="generic-checkpoint")
+    manager = APCManager(num_blocks=4, block_size=4, disk=disk)
+    restored, prefix_len = manager.lookup_exact_cache(token_ids + [99])
+    assert prefix_len == len(token_ids)
+    assert isinstance(restored[0], tuple)
+    assert isinstance(restored[0][0], SimpleKVCache)
+    assert restored[0][0].cache_length == len(token_ids)
+    assert isinstance(restored[1], CacheList)
+    restored_pool = restored[1].caches[0]
+    assert isinstance(restored_pool, PoolingCache)
+    assert restored_pool.ratio == 2 and restored_pool.remainder == 1
+    assert bool(mx.array_equal(restored_pool.pooled, pooling.pooled))
+    manager.close()
+
+
+def test_exact_disk_roundtrip_ring_and_indexed_kv_cache(tmp_path, monkeypatch):
+    """Subtype metadata survives checkpoint persistence and process restart."""
+    from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
+    from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    monkeypatch.setenv("APC_EXACT_MIN_TOKENS", "1")
+    token_ids = list(range(10))
+
+    ring = RingSlidingKVCache(window_size=4)
+    ring.keys = mx.ones((1, 2, 8, 4))
+    ring.values = mx.ones((1, 2, 8, 4)) * 2
+    ring.prefill_length = 4
+    ring.offset = 11
+    ring._ring_pos = 3
+
+    indexed = MiniMaxM3KVCache()
+    indexed.kv_cache.update_and_fetch(
+        mx.ones((1, 2, 10, 4)) * 3,
+        mx.ones((1, 2, 10, 4)) * 4,
+    )
+    indexed.update_index_and_fetch(mx.ones((1, 1, 10, 4)) * 5)
+    mx.eval(ring.keys, ring.values, indexed.state)
+
+    disk = DiskBlockStore(tmp_path, namespace="special-checkpoint")
+    manager = APCManager(num_blocks=4, block_size=4, disk=disk)
+    assert manager.store_exact_cache(token_ids, [ring, indexed])
+    disk._q.join()
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="special-checkpoint")
+    manager = APCManager(num_blocks=4, block_size=4, disk=disk)
+    restored, prefix_len = manager.lookup_exact_cache(token_ids + [99])
+    assert prefix_len == len(token_ids)
+    restored_ring, restored_indexed = restored
+    assert isinstance(restored_ring, RingSlidingKVCache)
+    assert (
+        restored_ring.window_size,
+        restored_ring.prefill_length,
+        restored_ring.offset,
+        restored_ring._ring_pos,
+    ) == (4, 4, 11, 3)
+    assert isinstance(restored_indexed, MiniMaxM3KVCache)
+    assert restored_indexed.offset == 10
+    assert restored_indexed.index_offset == 10
+    assert bool(
+        mx.array_equal(
+            restored_indexed.index_keys,
+            indexed.index_keys[..., : indexed.index_offset, :],
+        )
+    )
+    manager.close()
+
+
 def test_exact_disk_hit_promotion_clone_is_independent_of_returned_cache(
     tmp_path, monkeypatch
 ):
@@ -1312,15 +1624,38 @@ def _tiny_exact_cache(tokens):
     return [c]
 
 
-def test_a_short_first_prompt_does_not_store_a_one_token_snapshot():
+def test_default_checkpoint_guard_preserves_final_prefill_boundary(monkeypatch):
+    from mlx_vlm.models.cache import ArraysCache, KVCache
+
+    monkeypatch.delenv("APC_CHECKPOINT_GUARD_TOKENS", raising=False)
+    monkeypatch.delenv("APC_EXACT_PREFIX_GUARD_TOKENS", raising=False)
+
+    class HybridModel:
+        @staticmethod
+        def make_cache():
+            return [ArraysCache(size=1), KVCache()]
+
+    manager = APCManager(num_blocks=8, block_size=16)
+    coordinator = manager.coordinator(HybridModel())
+    tokens = list(range(64))
+
+    assert manager.exact_cache_guard_tokens == 1
+    assert coordinator.checkpoint_len(tokens, set()) == len(tokens) - 1
+
+
+def test_a_short_first_prompt_does_not_store_an_undersized_snapshot(monkeypatch):
+    monkeypatch.delenv("APC_CHECKPOINT_GUARD_TOKENS", raising=False)
+    monkeypatch.delenv("APC_EXACT_PREFIX_GUARD_TOKENS", raising=False)
     manager = APCManager(num_blocks=8, block_size=16)
     short = [1, 2, 3]
 
     desired = len(short) - manager.exact_cache_guard_tokens
     prefix_len = apc_module.adjust_prefix_to_text_suffix_boundary(short, desired, [])
 
-    assert prefix_len == 0
-    assert not manager.store_exact_cache(short[:1], _tiny_exact_cache(short[:1]))
+    assert prefix_len == len(short) - 1
+    assert not manager.store_exact_cache(
+        short[:prefix_len], _tiny_exact_cache(short[:prefix_len])
+    )
 
 
 def test_a_short_prompt_cannot_poison_later_lookups():

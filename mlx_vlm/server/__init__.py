@@ -15,6 +15,7 @@ from ..generate import (
     stream_generate,
 )
 from ..prompt_utils import apply_chat_template, extract_text_from_content
+from ..speculative.utils import run_speculative_server_rounds
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from ..version import __version__
@@ -89,7 +90,6 @@ from .generation import (
     get_top_logprobs_k,
     load_model_resources,
     make_streaming_detokenizer,
-    run_speculative_server_rounds,
 )
 from .openai import (
     chat_completions_endpoint,
