@@ -56,8 +56,8 @@ class TextConfig(BaseModelConfig):
     index_kpool: int = 16
     index_kpool_always_select_tail: bool = True
     index_kpool_compress: bool = True
-    index_hisa_block: int = 8
-    index_hisa_keep: int = 64
+    index_hisa_block: int = 0
+    index_hisa_keep: int = 0
     index_hisa_min_pools: int = 2048
     indexer_rope_interleave: bool = True
     mla_use_nope: bool = True

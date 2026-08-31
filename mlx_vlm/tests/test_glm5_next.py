@@ -6,11 +6,18 @@ import pytest
 
 from mlx_vlm.fp8 import transform_fp8_weights
 from mlx_vlm.generate.ar import _make_cache
-from mlx_vlm.models.cache import BatchPoolingCache, HierarchyCache, PoolingCache
+from mlx_vlm.models.cache import (
+    BatchKVCache,
+    BatchPoolingCache,
+    HierarchyCache,
+    KVCache,
+    PoolingCache,
+)
 from mlx_vlm.models.glm5_next.config import ModelConfig, TextConfig, VisionConfig
 from mlx_vlm.models.glm5_next.glm5_next import Model
 from mlx_vlm.models.glm5_next.language import (
     LanguageModel,
+    _exact_pool_select,
     _hisa_pool_select,
     _score_index_keys,
     _sparse_prefill_attention,
@@ -23,6 +30,7 @@ from mlx_vlm.models.glm5_next.processing import (
 )
 from mlx_vlm.models.sparse_attention import indexed_sparse_attention
 from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.utils import prepare_inputs
 
 
 def _text_config():
@@ -197,6 +205,8 @@ class _Tokenizer:
     image_token_id = 31
     video_token = "<|video|>"
     video_token_id = 30
+    pad_token = "<|pad|>"
+    eos_token = "<|end|>"
 
     def __init__(self):
         self.last_text = None
@@ -256,6 +266,8 @@ def test_glm5_next_config_builds_checkpoint_schedules():
     assert config.mlp_layer_types == ["dense", "dense", "dense", "sparse", "sparse"]
     assert config.linear_num_heads == 64
     assert config.linear_lower_bound == -5.0
+    assert config.index_hisa_block == 0
+    assert config.index_hisa_keep == 0
 
 
 def test_glm5_next_preprocessing_preserves_aspect_and_pads_temporally():
@@ -303,6 +315,69 @@ def test_glm5_next_processor_expands_video_frames_with_timestamps():
     assert "0.0 seconds" in rendered
     assert "1.0 seconds" in rendered
     assert int(np.asarray(output["mm_token_type_ids"]).sum()) == 12
+
+
+def test_glm5_next_prepare_inputs_propagates_video_metadata():
+    tokenizer = _Tokenizer()
+    processor = Glm5NextProcessor(
+        image_processor=_image_processor(),
+        tokenizer=tokenizer,
+        video_processor=_video_processor(),
+    )
+    video = np.full((3, 3, 5, 9), 255, dtype=np.uint8)
+
+    output = prepare_inputs(
+        processor,
+        videos=video,
+        prompts="<|video|>",
+        fps=2.0,
+    )
+
+    assert "pixel_values_videos" in output
+    assert "0.0 seconds" in tokenizer.last_text[0]
+    assert "1.0 seconds" in tokenizer.last_text[0]
+
+
+def test_glm5_next_prepare_inputs_samples_file_and_preserves_timestamps(tmp_path):
+    cv2 = pytest.importorskip("cv2")
+    video_path = tmp_path / "clip.avi"
+    writer = cv2.VideoWriter(
+        str(video_path),
+        cv2.VideoWriter_fourcc(*"MJPG"),
+        10.0,
+        (32, 32),
+    )
+    assert writer.isOpened()
+    for index in range(30):
+        writer.write(np.full((32, 32, 3), index, dtype=np.uint8))
+    writer.release()
+
+    tokenizer = _Tokenizer()
+    processor = Glm5NextProcessor(
+        image_processor=_image_processor(),
+        tokenizer=tokenizer,
+        video_processor=_video_processor(),
+    )
+    output = prepare_inputs(
+        processor,
+        videos=video_path,
+        prompts="<|video|>",
+        fps=2.0,
+        max_frames=4,
+    )
+
+    assert output["pixel_values_videos"].shape[0] > 0
+    assert "0.0 seconds" in tokenizer.last_text[0]
+    assert "1.9 seconds" in tokenizer.last_text[0]
+
+
+def test_glm5_next_frame_sampling_matches_transformers_capped_case():
+    processor = _video_processor()
+    metadata = SimpleNamespace(total_num_frames=300, fps=30.0, duration=10.0)
+
+    indices = processor.sample_frames(metadata, fps=2.0, max_frames=4)
+
+    assert indices.tolist() == [0, 99, 199, 299]
 
 
 def test_glm5_next_prompt_utils_formats_image_and_video_content():
@@ -451,6 +526,44 @@ def test_glm5_next_hisa_keep_all_matches_flat_indexer():
     assert bool(mx.all(mx.sort(hisa, axis=-1) == mx.sort(flat, axis=-1)).item())
 
 
+def test_glm5_next_exact_pool_select_matches_full_pool_scoring():
+    mx.random.seed(15)
+    batch, query_length, heads, dim = 2, 7, 3, 8
+    pool_count, select_k = 11, 3
+    q = mx.random.normal((batch, query_length, heads, dim)).astype(mx.bfloat16)
+    pool_keys = mx.random.normal((batch, pool_count, dim)).astype(mx.bfloat16)
+    weights = mx.random.normal((batch, query_length, heads)).astype(mx.float32)
+    pool_ends = mx.broadcast_to(
+        mx.arange(pool_count, dtype=mx.int32)[None], (batch, pool_count)
+    )
+    pool_valid = mx.ones((batch, pool_count), dtype=mx.bool_)
+    pool_valid[1, -1] = False
+    query_positions = mx.arange(4, 4 + query_length, dtype=mx.int32)
+
+    actual, actual_valid = _exact_pool_select(
+        q,
+        pool_keys,
+        weights,
+        pool_ends,
+        pool_valid,
+        query_positions,
+        select_k,
+        dim**-0.5,
+        chunk_size=3,
+    )
+    candidates = pool_valid[:, None] & (
+        pool_ends[:, None] <= query_positions[None, :, None]
+    )
+    scores = _score_index_keys(q, pool_keys, weights, dim**-0.5)
+    scores = mx.where(candidates, scores, mx.finfo(mx.float32).min)
+    expected = mx.argpartition(-scores, kth=select_k - 1, axis=-1)[..., :select_k]
+    expected_valid = mx.take_along_axis(candidates, expected, axis=-1)
+    mx.eval(actual, actual_valid, expected, expected_valid)
+
+    assert bool(mx.all(mx.sort(actual, axis=-1) == mx.sort(expected, axis=-1)).item())
+    assert bool(mx.all(actual_valid == expected_valid).item())
+
+
 def test_hierarchy_cache_incremental_means_and_state_roundtrip():
     mx.random.seed(13)
     values = mx.random.normal((1, 17, 8)).astype(mx.bfloat16)
@@ -542,9 +655,9 @@ def test_glm5_next_chunked_prefill_projects_only_new_tokens():
     assert isinstance(sparse_cache[2], PoolingCache)
     assert sparse_cache[2].pooled.shape[1] == 2
     assert sparse_cache[2].remainder == 1
-    assert isinstance(sparse_cache[3], HierarchyCache)
-    assert sparse_cache[3].remainders == [2]
-    assert sparse_cache[4].size() == 5
+    assert len(sparse_cache.caches) == 4
+    assert isinstance(sparse_cache[3], KVCache)
+    assert sparse_cache[3].size() == 5
     assert float(mx.max(mx.abs(full - chunked)).item()) < 1e-5
 
 
@@ -595,7 +708,8 @@ def test_glm5_next_incremental_pooling_matches_left_padded_batch():
     error = mx.where(valid, mx.abs(full - chunked), 0)
     assert isinstance(cache[1][2], BatchPoolingCache)
     assert cache[1][2]._pool_lengths == [2, 3]
-    assert cache[1][3].remainders == [2, 3]
+    assert len(cache[1].caches) == 4
+    assert isinstance(cache[1][3], BatchKVCache)
     assert float(mx.max(error).item()) < 1e-5
 
 

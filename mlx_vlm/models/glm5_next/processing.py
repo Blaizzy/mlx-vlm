@@ -254,6 +254,7 @@ class Glm5NextImageProcessor(ImageProcessingMixin):
 
 class Glm5NextVideoProcessor(Glm5NextImageProcessor):
     model_input_names = ["pixel_values_videos", "video_grid_thw"]
+    sample_frames_in_loader = True
 
     def __init__(
         self,
@@ -281,7 +282,7 @@ class Glm5NextVideoProcessor(Glm5NextImageProcessor):
         effective_duration = (
             duration if self.max_duration <= 0 else min(duration, self.max_duration)
         )
-        cap = kwargs.get("max_frames", self.max_frames)
+        cap = kwargs.get("max_frames")
         cap = self.max_frame_count_dynamic if cap is None else cap
         target_fps = self.fps if fps is None else fps
         count = min(int(effective_duration * target_fps), cap)
@@ -299,15 +300,28 @@ class Glm5NextVideoProcessor(Glm5NextImageProcessor):
                     indices.append(frame_index)
                     if current_second >= int(duration):
                         break
-        if len(indices) != count:
+        if len(indices) < count:
             start = indices[0] if indices else 0
             end = indices[-1] if indices else max(total_frames - 1, 0)
             indices = np.linspace(start, end, count, dtype=int).tolist()
+        elif len(indices) > count:
+            indices = np.linspace(0, total_frames - 1, count, dtype=int).tolist()
 
         indices = np.asarray(list(dict.fromkeys(indices)), dtype=int)
         if len(indices) & 1:
             indices = np.append(indices, indices[-1])
         return indices
+
+    def video_sampling_defaults(self):
+        cap = self.max_frames
+        if cap is None:
+            cap = self.max_frame_count_dynamic
+        return {
+            "fps": self.fps,
+            "min_frames": self.temporal_patch_size,
+            "max_frames": cap,
+            "frame_factor": self.temporal_patch_size,
+        }
 
     @staticmethod
     def _as_videos(videos):
@@ -441,7 +455,7 @@ class Glm5NextProcessor(ProcessorMixin):
             image_processor, tokenizer, video_processor, chat_template=chat_template
         )
 
-    def _video_replacement(self, grid, metadata=None):
+    def _video_replacement(self, grid, metadata=None, fps=None):
         grid_t, grid_h, grid_w = [int(value) for value in grid]
         per_frame = grid_h * grid_w // self.video_processor.merge_size**2
         timestamps = None
@@ -450,13 +464,15 @@ class Glm5NextProcessor(ProcessorMixin):
             if timestamps is None and isinstance(metadata, dict):
                 timestamps = metadata.get("timestamps")
         if timestamps is None:
-            warnings.warn(
-                "Video timestamps were not supplied; defaulting to 24 FPS.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+            fallback_fps = fps or 24
+            if fps is None:
+                warnings.warn(
+                    "Video timestamps were not supplied; defaulting to 24 FPS.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             timestamps = [
-                index * self.video_processor.temporal_patch_size / 24
+                index * self.video_processor.temporal_patch_size / fallback_fps
                 for index in range(grid_t)
             ]
         else:
@@ -475,6 +491,8 @@ class Glm5NextProcessor(ProcessorMixin):
         images=None,
         text: Union[str, List[str], None] = None,
         videos=None,
+        video_metadata=None,
+        fps=None,
         **kwargs,
     ):
         text_kwargs = dict(kwargs.pop("text_kwargs", {}))
@@ -508,9 +526,8 @@ class Glm5NextProcessor(ProcessorMixin):
             kwargs.pop("return_mm_token_type_ids", False),
         )
         return_tensors = kwargs.pop("return_tensors", None)
-        video_metadata = video_kwargs.pop(
-            "video_metadata", kwargs.pop("video_metadata", None)
-        )
+        video_metadata = video_kwargs.pop("video_metadata", video_metadata)
+        fps = video_kwargs.pop("fps", fps)
         video_kwargs.pop("return_metadata", None)
 
         image_inputs = (
@@ -552,6 +569,7 @@ class Glm5NextProcessor(ProcessorMixin):
             metadata = video_metadata or [None] * len(video_grids)
             if not isinstance(metadata, (list, tuple)):
                 metadata = [metadata]
+            fallback_fps = fps if isinstance(fps, (list, tuple)) else None
             for row in range(len(text)):
                 while self.video_token in text[row]:
                     if video_idx >= len(video_grids):
@@ -561,6 +579,12 @@ class Glm5NextProcessor(ProcessorMixin):
                     replacement = self._video_replacement(
                         video_grids[video_idx],
                         metadata[video_idx] if video_idx < len(metadata) else None,
+                        (
+                            fallback_fps[video_idx]
+                            if fallback_fps is not None
+                            and video_idx < len(fallback_fps)
+                            else fps
+                        ),
                     )
                     text[row] = text[row].replace(self.video_token, replacement, 1)
                     video_idx += 1

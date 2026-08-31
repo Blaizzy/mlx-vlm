@@ -87,15 +87,11 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
 
     def make_cache(self) -> List[CacheList]:
         indexer = self.mtp_block.self_attn.indexer
-        return [
-            CacheList(
-                KVCache(),
-                KVCache(),
-                PoolingCache(indexer.index_kpool),
-                HierarchyCache(max(1, indexer.hisa_block)),
-                KVCache(),
-            )
-        ]
+        caches = [KVCache(), KVCache(), PoolingCache(indexer.index_kpool)]
+        if indexer.hisa_block > 0:
+            caches.append(HierarchyCache(indexer.hisa_block))
+        caches.append(KVCache())
+        return [CacheList(*caches)]
 
     def reset(self, target_model) -> List[CacheList]:
         caches = super().reset(target_model)

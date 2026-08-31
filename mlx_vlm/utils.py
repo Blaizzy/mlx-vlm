@@ -865,7 +865,12 @@ def get_model_path(
     return model_path
 
 
-def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
+def load_model(
+    model_path: Path,
+    lazy: bool = False,
+    fp8_target_quantization: Optional[dict] = None,
+    **kwargs,
+) -> nn.Module:
     """
     Load and initialize the model from a given path.
 
@@ -879,6 +884,9 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
+        fp8_target_quantization (dict, optional): Native MLX quantization parameters
+            to use while converting a fine-grained block-FP8 checkpoint. Defaults to
+            MXFP8 when omitted.
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -987,7 +995,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     if transformed_quantization is None:
         from .fp8 import transform_fp8_weights
 
-        weights, transformed_quantization = transform_fp8_weights(weights, config)
+        weights, transformed_quantization = transform_fp8_weights(
+            weights,
+            config,
+            target_quantization=fp8_target_quantization,
+        )
     if transformed_quantization is not None:
         config["quantization"] = transformed_quantization
         config["quantization_config"] = transformed_quantization
@@ -1467,9 +1479,17 @@ def load_processor(
 
 
 def fetch_from_hub(
-    model_path: Path, lazy: bool = False, **kwargs
+    model_path: Path,
+    lazy: bool = False,
+    fp8_target_quantization: Optional[dict] = None,
+    **kwargs,
 ) -> Tuple[nn.Module, dict, ProcessorMixin]:
-    model = load_model(model_path, lazy, **kwargs)
+    model = load_model(
+        model_path,
+        lazy,
+        fp8_target_quantization=fp8_target_quantization,
+        **kwargs,
+    )
     config = load_config(model_path, **kwargs)
     processor = load_processor(
         model_path,
@@ -2033,15 +2053,15 @@ class VideoMetadata:
 def load_video(
     video_path: str,
     sampling: Optional[VideoSampling] = None,
+    frame_sampler=None,
     **sampling_kwargs,
-) -> Tuple[np.ndarray, "VideoMetadata"]:
+) -> Tuple[np.ndarray, VideoMetadata]:
     """Read a video file as a (T, C, H, W) numpy array.
 
-    Uniformly samples frames — either a fixed ``nframes`` or a count derived
-    from ``fps`` — and returns them alongside the :class:`VideoMetadata`
-    describing what was read. Sampling fields may be given either as a
-    :class:`VideoSampling` or as loose keyword arguments; the former wins
-    where both set the same field.
+    Samples ``nframes`` frames, a count derived from ``fps``, or indices from
+    ``frame_sampler``. Returns source-aware :class:`VideoMetadata` alongside
+    the frames. Sampling fields may be supplied as a :class:`VideoSampling`
+    or as loose keyword arguments; the former wins for overlapping fields.
     """
     import cv2
 
@@ -2067,6 +2087,9 @@ def load_video(
         raise ValueError(f"Cannot open video: {video_path}")
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    duration = total_frames / video_fps
 
     def _round(n):
         return round(n / frame_factor) * frame_factor
@@ -2077,21 +2100,41 @@ def load_video(
     def _ceil(n):
         return math.ceil(n / frame_factor) * frame_factor
 
+    used_frame_sampler = False
     if nframes is not None:
         n = _round(nframes)
+        indices = np.linspace(0, total_frames - 1, n).round().astype(int)
+    elif frame_sampler is not None:
+        used_frame_sampler = True
+        source_metadata = VideoMetadata(
+            total_num_frames=total_frames,
+            fps=video_fps,
+            frames_indices=list(range(total_frames)),
+            width=width,
+            height=height,
+            duration=duration,
+        )
+        indices = np.asarray(
+            frame_sampler(source_metadata, fps=fps, max_frames=max_frames), dtype=int
+        ).reshape(-1)
+        n = len(indices)
     else:
         lo = _ceil(min_frames)
         hi = _floor(min(max_frames, total_frames))
         n = total_frames / video_fps * fps
         n = min(max(n, lo), hi, total_frames)
         n = _floor(n)
-    if not (frame_factor <= n <= total_frames):
+        indices = np.linspace(0, total_frames - 1, n).round().astype(int)
+    if not used_frame_sampler and not (frame_factor <= n <= total_frames):
         cap.release()
         raise ValueError(
             f"nframes must be in [{frame_factor}, {total_frames}], got {n}."
         )
-
-    indices = np.linspace(0, total_frames - 1, n).round().astype(int)
+    if n == 0 or np.any(indices < 0) or np.any(indices >= total_frames):
+        cap.release()
+        raise ValueError(
+            f"Frame indices must be within a non-empty {total_frames}-frame video."
+        )
     frames = []
     for idx in indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -2131,7 +2174,6 @@ def processor_video_sampling(processor) -> VideoSampling:
     component = getattr(processor, "video_processor", None)
     if component is None:
         return VideoSampling()
-
     for owner in (component, processor):
         hook = getattr(owner, "video_sampling_defaults", None)
         if callable(hook):
@@ -2141,7 +2183,6 @@ def processor_video_sampling(processor) -> VideoSampling:
                 if isinstance(declared, VideoSampling)
                 else VideoSampling(**declared)
             )
-
     return VideoSampling(
         **{
             name: getattr(component, name, None)
@@ -2370,14 +2411,23 @@ def prepare_inputs(
         audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
 
     video_fps = None
+    video_metadata = None
     if has_videos:
         if not isinstance(videos, list):
             videos = [videos]
         sampling = resolve_video_sampling(processor, kwargs)
-        loaded, video_fps = [], []
+        component = getattr(processor, "video_processor", None)
+        frame_sampler = (
+            getattr(component, "sample_frames", None)
+            if getattr(component, "sample_frames_in_loader", False)
+            else None
+        )
+        loaded, video_fps, video_metadata = [], [], []
         for v in videos:
-            if isinstance(v, (str, bytes)):
-                arr, metadata = load_video(str(v), sampling)
+            if isinstance(v, (str, bytes, Path)):
+                arr, metadata = load_video(
+                    str(v), sampling, frame_sampler=frame_sampler
+                )
                 logger.info(
                     "video %s: sampled %d of %d frames at %.2f fps "
                     "(source %.2f fps, %.1fs)",
@@ -2399,6 +2449,7 @@ def prepare_inputs(
                 )
             loaded.append(arr)
             video_fps.append(metadata.sampled_fps)
+            video_metadata.append(metadata)
         videos = loaded
 
     model_inputs = {}
@@ -2444,6 +2495,8 @@ def prepare_inputs(
             extra["videos"] = videos
             if video_fps is not None:
                 extra["fps"] = video_fps
+            if video_metadata is not None:
+                extra["video_metadata"] = video_metadata
         inputs = process_inputs_with_fallback(
             processor,
             images=images,
