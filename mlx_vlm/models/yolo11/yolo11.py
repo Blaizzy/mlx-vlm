@@ -60,9 +60,7 @@ class C3k(nn.Module):
         self.cv2 = Conv(c1, c_, 1, 1)
         self.cv3 = Conv(2 * c_, c2, 1)
         # Python list of modules; weights are loaded by index (digit keys).
-        self.m = [
-            Bottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)
-        ]
+        self.m = [Bottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)]
 
     def __call__(self, x):
         b, h, w, _ = x.shape
@@ -85,7 +83,11 @@ class C2f(nn.Module):
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv((2 + n) * self.c, c2, 1)
         self.m = [
-            C3k(self.c, self.c, 2, shortcut, g) if c3k else Bottleneck(self.c, self.c, shortcut, g)
+            (
+                C3k(self.c, self.c, 2, shortcut, g)
+                if c3k
+                else Bottleneck(self.c, self.c, shortcut, g)
+            )
             for _ in range(n)
         ]
 
@@ -153,7 +155,7 @@ class Attention(nn.Module):
         # attn[b,h,i,j] = softmax_j( (q_i . k_j) * scale )
         attn = mx.matmul(q * self.scale, mx.swapaxes(k, -1, -2))  # (B,heads,N,N)
         attn = mx.softmax(attn, axis=-1)
-        out = mx.matmul(mx.swapaxes(v, -1, -2), mx.swapaxes(attn, -1, -2))  # (B,heads,hd,N)
+        out = mx.matmul(mx.swapaxes(v, -1, -2), mx.swapaxes(attn, -1, -2))
         out = mx.swapaxes(out, -1, -2)  # (B,heads,N,hd)
 
         out = mx.transpose(out, (0, 2, 1, 3)).reshape(b, h, w, c)
@@ -231,7 +233,9 @@ class Detect(nn.Module):
 
         # Box branch: Conv3x3 -> Conv3x3 -> Conv2d1x1 (per scale).
         self.cv2 = [
-            nn.Sequential(Conv(c, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, reg_max * 4, 1))
+            nn.Sequential(
+                Conv(c, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, reg_max * 4, 1)
+            )
             for c in ch
         ]
         # Classification branch (DW head): (DWConv -> Conv) x2 -> Conv2d1x1.
@@ -401,7 +405,9 @@ def xywh2xyxy(boxes):
     return mx.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], axis=-1)
 
 
-def non_max_suppression(prediction, conf_thresh=0.05, iou_thresh=0.1, max_det=300):
+def non_max_suppression(
+    prediction, conf_thresh=0.05, iou_thresh=0.1, max_det=300, max_nms=30000
+):
     """Greedy NMS on YOLO11 output.
 
     Args:
@@ -417,14 +423,16 @@ def non_max_suppression(prediction, conf_thresh=0.05, iou_thresh=0.1, max_det=30
         max_scores = mx.max(class_scores, axis=1)
         class_ids = mx.argmax(class_scores, axis=1)
 
-        k = min(int(mx.sum(max_scores > conf_thresh)), max_det)
-        if k == 0:
+        candidate_count = int(mx.sum(max_scores > conf_thresh).item())
+        if candidate_count == 0:
             output.append(mx.zeros((0, 6)))
             continue
-        topk_idx = mx.argsort(max_scores)[::-1][:k]
+        topk_idx = mx.argsort(max_scores)[::-1][: min(candidate_count, max_nms)]
         boxes_xyxy = xywh2xyxy(mx.take(boxes_xywh, topk_idx, axis=0))
         max_scores = mx.take(max_scores, topk_idx, axis=0)
         class_ids = mx.take(class_ids, topk_idx, axis=0)
+        offsets = class_ids.reshape(-1, 1) * (mx.max(mx.abs(boxes_xyxy)) + 1)
+        nms_boxes = boxes_xyxy + offsets
 
         # Sequential greedy suppression (small arrays; host-side loop).
         keep = []
@@ -432,8 +440,11 @@ def non_max_suppression(prediction, conf_thresh=0.05, iou_thresh=0.1, max_det=30
         while indices and len(keep) < max_det:
             idx = indices[0]
             keep.append(idx)
+            if len(indices) == 1:
+                break
             ious = box_iou(
-                boxes_xyxy[idx : idx + 1], mx.take(boxes_xyxy, mx.array(indices[1:]), axis=0)
+                nms_boxes[idx : idx + 1],
+                mx.take(nms_boxes, mx.array(indices[1:]), axis=0),
             ).squeeze(0)
             mask = [int(m) for m in (ious < iou_thresh)]
             indices = [j for j, m in zip(indices[1:], mask) if m]
@@ -467,7 +478,7 @@ def load_weights(model, mlx_weights, prefix="model."):
     for key, val in mlx_weights.items():
         if not key.startswith(prefix):
             continue
-        rest = key[len(prefix):]
+        rest = key[len(prefix) :]
         parts = rest.split(".")
         layer_idx = int(parts[0])
         subkey = ".".join(parts[1:])

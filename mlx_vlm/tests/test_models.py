@@ -9983,26 +9983,57 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.isfinite(out["pred_boxes"])).item())
 
     def test_yolo11_forward(self):
-        from mlx_vlm.models.yolo11 import YOLO11, non_max_suppression
+        from PIL import Image
+
+        from mlx_vlm.models.yolo11 import YOLO11, non_max_suppression, prepare_image
 
         model = YOLO11(nc=1)
         model.eval()
 
-        # Small input for fast test (must be divisible by 32)
         x = mx.random.normal((1, 64, 64, 3))
         pred = model(x)
         mx.eval(pred)
 
-        # nc=1: 4 box coords + 1 class score = 5 channels
-        # 64/32=2 -> 2x2=4 anchors at stride 32; 64/16=4 -> 16; 64/8=8 -> 64; total=84
-        self.assertEqual(pred.shape[0], 1)
-        self.assertEqual(pred.shape[1], 5)  # 4 + nc
+        self.assertEqual(pred.shape, (1, 5, 84))
         self.assertTrue(mx.all(mx.isfinite(pred)).item())
 
-        # NMS smoke test
-        dets = non_max_suppression(pred, conf_thresh=0.01, iou_thresh=0.5)
+        single = mx.array([[[16.0], [16.0], [8.0], [8.0], [0.9]]])
+        dets = non_max_suppression(single, conf_thresh=0.01, iou_thresh=0.5)
         self.assertEqual(len(dets), 1)
-        self.assertEqual(dets[0].shape[1], 6)  # x1,y1,x2,y2,score,class
+        self.assertEqual(dets[0].shape, (1, 6))
+
+        overlapping = mx.array(
+            [
+                [
+                    [10.0, 10.0, 30.0],
+                    [10.0, 10.0, 30.0],
+                    [8.0, 8.0, 8.0],
+                    [8.0, 8.0, 8.0],
+                    [0.9, 0.8, 0.7],
+                ]
+            ]
+        )
+        dets = non_max_suppression(overlapping, iou_thresh=0.5, max_det=2)
+        self.assertEqual(dets[0].shape, (2, 6))
+
+        multiclass = mx.array(
+            [
+                [
+                    [10.0, 10.0],
+                    [10.0, 10.0],
+                    [8.0, 8.0],
+                    [8.0, 8.0],
+                    [0.9, 0.1],
+                    [0.1, 0.8],
+                ]
+            ]
+        )
+        dets = non_max_suppression(multiclass, iou_thresh=0.5)
+        self.assertEqual(dets[0].shape, (2, 6))
+
+        prepared, _, gain, left, top = prepare_image(Image.new("RGB", (65, 33)))
+        self.assertEqual(prepared.shape, (1, 64, 96, 3))
+        self.assertEqual((gain, left, top), (1.0, 15, 15))
 
     def test_sam3_1_config_and_model(self):
         # Config source: mlx_vlm/models/sam3_1/config.py
