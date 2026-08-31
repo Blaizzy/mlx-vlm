@@ -43,6 +43,8 @@ class ModelConfig(BaseModelConfig):
     index_topk_pattern: Optional[Any] = None
     index_topk_freq: int = 1
     index_skip_topk_offset: int = 2
+    num_nextn_predict_layers: int = 0
+    index_share_for_mtp_iteration: bool = False
 
     def __post_init__(self):
         self.rope_scaling = self.rope_parameters

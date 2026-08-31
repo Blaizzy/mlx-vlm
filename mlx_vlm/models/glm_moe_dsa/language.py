@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -16,6 +16,9 @@ from ..deepseek_v32.language import (
 )
 from ..deepseek_v32.language import Model as DSV32Model
 from .config import ModelConfig
+from .speculative_verifier import GlmMoeDsaExactSpeculativeVerifier, verify_logits
+
+_SPECULATIVE_VERIFIER = GlmMoeDsaExactSpeculativeVerifier()
 
 
 class GlmMoeDsaAttention(DeepseekV32Attention):
@@ -197,10 +200,101 @@ class LanguageModel(nn.Module):
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
-        logits = self.lm_head(
-            self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+        capture_layer_ids = kwargs.get("capture_layer_ids")
+        speculative_verify = bool(kwargs.get("speculative_verify", False))
+        return_hidden = kwargs.get("return_hidden", False)
+        return_shared_kv = kwargs.get("return_shared_kv", False)
+        skip_logits = kwargs.get("skip_logits", False)
+
+        if speculative_verify:
+            return _SPECULATIVE_VERIFIER(
+                self,
+                inputs,
+                cache=cache,
+                inputs_embeds=inputs_embeds,
+                capture_layer_ids=capture_layer_ids,
+                return_hidden=return_hidden,
+                return_shared_kv=return_shared_kv,
+                skip_logits=skip_logits,
+            )
+
+        hidden = self.model(
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
         )
-        return LanguageModelOutput(logits=logits)
+        num_logits_to_keep = kwargs.get("num_logits_to_keep", 0)
+        if num_logits_to_keep:
+            hidden = hidden[:, -num_logits_to_keep:, :]
+        return LanguageModelOutput(
+            logits=None if skip_logits else self.lm_head(hidden),
+            hidden_states=[hidden] if return_hidden else None,
+            shared_kv_states={} if return_shared_kv else None,
+        )
+
+    def speculative_draft_hidden(self, hidden: mx.array) -> mx.array:
+        return hidden
+
+    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        return verify_logits(self, hidden)
+
+    def speculative_argmax_from_hidden(self, hidden: mx.array) -> mx.array:
+        return mx.argmax(self.speculative_logits_from_hidden(hidden), axis=-1)
+
+    def speculative_verify_hidden(self, inputs: mx.array, cache):
+        out = self(
+            inputs,
+            cache=cache,
+            capture_layer_ids=[],
+            speculative_verify=True,
+            return_hidden=True,
+            return_shared_kv=True,
+            skip_logits=True,
+        )
+        return out.hidden_states[-1], out.shared_kv_states, out.gdn_states
+
+    def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
+        out = self(
+            inputs,
+            cache=cache,
+            capture_layer_ids=[],
+            speculative_verify=True,
+            return_hidden=True,
+            return_shared_kv=True,
+        )
+        return (
+            out.hidden_states[-1],
+            out.shared_kv_states,
+            out.gdn_states,
+            sampler(out.logits),
+        )
+
+    def rollback_speculative_cache(
+        self,
+        caches: List[Any],
+        gdn_states: Optional[List],
+        accepted,
+        block_size: int,
+    ) -> int:
+        del gdn_states
+        if isinstance(accepted, int):
+            accepted_values = [accepted]
+        elif isinstance(accepted, mx.array):
+            accepted_values = [int(value) for value in accepted.reshape(-1).tolist()]
+        else:
+            accepted_values = [int(value) for value in accepted]
+        if len(set(accepted_values)) != 1:
+            raise ValueError("glm_moe_dsa requires uniform batch acceptance.")
+
+        max_accepted = accepted_values[0]
+        trim = int(block_size) - (max_accepted + 1)
+        if trim > 0:
+            for cache in caches:
+                if cache is not None and cache.is_trimmable():
+                    cache.trim(trim)
+        return max_accepted
+
+    requires_uniform_dflash_acceptance = True
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         return DSV32Model.sanitize(self, weights)
