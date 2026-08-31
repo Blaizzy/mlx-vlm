@@ -9911,6 +9911,66 @@ class TestModels(unittest.TestCase):
         self.assertIsInstance(cache[0], RotatingKVCache)
         self.assertIsInstance(cache[1], KVCache)
 
+    def test_muse_glimmer_sanitize_weight_layouts(self):
+        from mlx_vlm.models import muse_glimmer
+
+        model = muse_glimmer.Model(self._muse_glimmer_config())
+
+        # Raw HF nests both stacks under ``model.``; MLX conversions ship the
+        # already-sanitized paths; OptiQ/flattened quants store LM tensors under
+        # a bare ``model.`` with the vision stack and lm_head already at top
+        # level. All three must land on the same target module paths.
+        raw_hf = {
+            "model.language_model.embed_tokens.weight": mx.zeros((64, 32)),
+            "model.vision_tower.ln_pre.weight": mx.zeros((8,)),
+            "model.vision_adapter.fc1.weight": mx.zeros((16, 32)),
+            "model.vision_projection.weight": mx.zeros((32, 16)),
+            "lm_head.weight": mx.zeros((64, 32)),
+        }
+        mlx_std = {
+            "language_model.model.embed_tokens.weight": mx.zeros((64, 32)),
+            "language_model.lm_head.weight": mx.zeros((64, 32)),
+            "vision_tower.ln_pre.weight": mx.zeros((8,)),
+            "vision_adapter.fc1.weight": mx.zeros((16, 32)),
+            "vision_projection.weight": mx.zeros((32, 16)),
+        }
+        optiq = {
+            "model.embed_tokens.weight": mx.zeros((64, 32)),
+            "model.layers.0.self_attn.q_proj.weight": mx.zeros((32, 32)),
+            "model.norm.weight": mx.zeros((32,)),
+            "lm_head.weight": mx.zeros((64, 32)),
+            "vision_tower.ln_pre.weight": mx.zeros((8,)),
+            "vision_adapter.fc1.weight": mx.zeros((16, 32)),
+            "vision_projection.weight": mx.zeros((32, 16)),
+        }
+
+        expected_vision = {
+            "vision_tower.ln_pre.weight",
+            "vision_adapter.fc1.weight",
+            "vision_projection.weight",
+        }
+        for name, weights in (
+            ("raw_hf", raw_hf),
+            ("mlx_std", mlx_std),
+            ("optiq", optiq),
+        ):
+            keys = set(model.sanitize(weights))
+            self.assertFalse(
+                any(k.startswith(("model.", "lm_head.")) for k in keys),
+                f"{name}: unmapped top-level keys survived sanitize: {keys}",
+            )
+            self.assertIn("language_model.model.embed_tokens.weight", keys)
+            self.assertIn("language_model.lm_head.weight", keys)
+            self.assertTrue(expected_vision <= keys, f"{name}: {keys}")
+
+        self.assertIn(
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            model.sanitize(optiq),
+        )
+        self.assertIn("language_model.model.norm.weight", model.sanitize(optiq))
+        # Already-sanitized MLX paths must be idempotent (no double prefix).
+        self.assertEqual(set(mlx_std), set(model.sanitize(mlx_std)))
+
     def test_muse_glimmer_numerical_parity(self):
         from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm
         from mlx_vlm.models.muse_glimmer.vision import apply_rotary, rotate_half
