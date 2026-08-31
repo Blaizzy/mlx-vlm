@@ -465,8 +465,13 @@ def generate_step(
             else None
         )
         checkpoint_done = False
+        # Chunk whenever there is more than one prompt token left to process.
+        # The chunk loop discards its output, so the [B, N, vocab] logits are
+        # never evaluated; the unchunked path feeds the whole prompt to _step,
+        # which reads logits[:, -1, :] and so materializes every row. Gating on
+        # prefill_step_size made short prompts peak higher than long ones.
         should_chunk = (
-            prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size
+            prefill_step_size is not None and inputs_embeds.shape[1] > 1
         ) or (
             checkpoint_len is not None and 0 < checkpoint_len < inputs_embeds.shape[1]
         )
@@ -1851,7 +1856,9 @@ class PromptProcessingBatch:
             return self._next_apc_checkpoint_column() is not None
         if self._next_apc_checkpoint_column() is not None:
             return True
-        return self._inputs_embeds.shape[1] > self.prefill_step_size
+        # See the note in stream_generate: prompts at or below prefill_step_size
+        # would otherwise skip chunking and materialize the full logits tensor.
+        return self._inputs_embeds.shape[1] > 1
 
     def _apc_checkpoint_column_for_meta(
         self, batch_idx: int, meta: dict
