@@ -3316,6 +3316,7 @@ def test_compact_qwen_proposal_head_maps_argmax_to_real_vocab():
     expected = vocab_ids[mx.argmax(full_logits[..., vocab_ids], axis=-1)]
 
     assert mx.array_equal(head.propose(hidden), expected).item()
+    assert head.last_proposal_implementation == "quantized_matmul_argmax"
 
 
 def test_qwen_compact_proposal_falls_back_to_full_head_for_stochastic_drafting():

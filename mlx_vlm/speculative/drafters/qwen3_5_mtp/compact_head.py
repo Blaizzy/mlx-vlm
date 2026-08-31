@@ -51,6 +51,7 @@ class CompactProposalHead:
         self.group_size = int(group_size)
         self.bits = int(bits)
         self.mode = str(mode)
+        self.last_proposal_implementation = "not_run"
 
     @property
     def output_dims(self) -> int:
@@ -78,6 +79,7 @@ class CompactProposalHead:
 
     def propose(self, hidden: mx.array) -> mx.array:
         compact_ids = mx.argmax(self.logits(hidden), axis=-1)
+        self.last_proposal_implementation = "quantized_matmul_argmax"
         return self.vocab_ids[compact_ids]
 
 
