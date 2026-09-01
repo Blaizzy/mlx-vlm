@@ -385,22 +385,37 @@ class Glm5NextSpeculativeVerifier:
             accepted_values = [int(value) for value in accepted.tolist()]
         else:
             accepted_values = [int(value) for value in accepted]
-        if len(set(accepted_values)) != 1:
-            raise ValueError(
-                "GLM-5 MTP cache rollback requires uniform batch acceptance."
-            )
 
         cache_snapshot, verify_inputs = rollback_state
         _restore_cache(caches, cache_snapshot)
-        accepted_count = accepted_values[0]
-        keep = accepted_count + 1
-        if keep:
-            language_model(
-                verify_inputs[:, :keep],
-                cache=caches,
-                skip_logits=True,
+        valid_lengths = [value + 1 for value in accepted_values]
+        keep = max(valid_lengths, default=0)
+        if not keep:
+            return 0
+
+        ragged = len(set(valid_lengths)) > 1
+        if ragged:
+            right_padding = [keep - length for length in valid_lengths]
+            for cache in caches:
+                cache.prepare(lengths=valid_lengths, right_padding=right_padding)
+            attention_mask = (
+                mx.arange(keep)[None] < mx.array(valid_lengths, dtype=mx.int32)[:, None]
             )
-        return accepted_count
+        else:
+            right_padding = None
+            attention_mask = None
+
+        language_model(
+            verify_inputs[:, :keep],
+            cache=caches,
+            attention_mask=attention_mask,
+            skip_logits=True,
+        )
+
+        if ragged:
+            for cache in caches:
+                cache.finalize()
+        return max(accepted_values)
 
 
 __all__ = ["Glm5NextSpeculativeVerifier"]

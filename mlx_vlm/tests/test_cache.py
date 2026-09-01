@@ -3,6 +3,7 @@ import pytest
 
 from mlx_vlm.models.cache import (
     ArraysCache,
+    BatchKVCache,
     BatchPoolingCache,
     BatchRotatingKVCache,
     CacheList,
@@ -148,6 +149,18 @@ def test_empty_kv_cache_extracts_as_empty():
 
     assert extracted.empty()
     assert extracted.offset == 0
+
+
+def test_empty_batch_kv_cache_ignores_unapplied_right_padding():
+    cache = BatchKVCache([0, 0])
+
+    cache.prepare(right_padding=[0, 1])
+    cache.finalize()
+
+    assert cache.empty()
+    assert cache.offset.tolist() == [0, 0]
+    assert cache.left_padding.tolist() == [0, 0]
+    assert cache._right_padding is None
 
 
 def test_batch_rotating_merge_skips_zero_length_backing_storage():

@@ -4,8 +4,16 @@ from typing import Dict, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from ....models.cache import CacheList, HierarchyCache, KVCache, PoolingCache
+from ....models.cache import (
+    BatchKVCache,
+    BatchPoolingCache,
+    CacheList,
+    HierarchyCache,
+    KVCache,
+    PoolingCache,
+)
 from ....models.glm5_next.language import Glm5NextAttention, Glm5NextMoE
+from ...common import _prepare_ragged_mtp_replay
 from ..deepseek_v4_mtp.deepseek_v4_mtp import DeepseekV4MTPDraftModel
 from .config import Glm5NextMTPConfig
 
@@ -43,6 +51,8 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
     """Native GLM-5-Next MTP drafter backed by checkpoint decoder layer 45."""
 
     prefer_requested_block_size = False
+    requires_uniform_batch_acceptance = False
+    supports_ragged_batch_acceptance = True
 
     def __init__(self, config: Glm5NextMTPConfig):
         nn.Module.__init__(self)
@@ -85,18 +95,37 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
     def quant_predicate(self):
         return lambda _path, _module: True
 
-    def make_cache(self) -> List[CacheList]:
+    def make_cache(self, left_padding: Optional[List[int]] = None) -> List[CacheList]:
         indexer = self.mtp_block.self_attn.indexer
-        caches = [KVCache(), KVCache(), PoolingCache(indexer.index_kpool)]
+        if left_padding is None:
+            kv_cache = KVCache
+            pool_cache = PoolingCache(indexer.index_kpool)
+        else:
+            kv_cache = lambda: BatchKVCache(left_padding)
+            pool_cache = BatchPoolingCache(indexer.index_kpool, left_padding)
+        caches = [kv_cache(), kv_cache(), pool_cache]
         if indexer.hisa_block > 0:
-            caches.append(HierarchyCache(indexer.hisa_block))
-        caches.append(KVCache())
+            hierarchy = HierarchyCache(indexer.hisa_block)
+            caches.append(
+                hierarchy if left_padding is None else hierarchy.to_batch(left_padding)
+            )
+        caches.append(kv_cache())
         return [CacheList(*caches)]
 
-    def reset(self, target_model) -> List[CacheList]:
-        caches = super().reset(target_model)
+    def reset(
+        self, target_model, left_padding: Optional[List[int]] = None
+    ) -> List[CacheList]:
+        self.bind(target_model)
+        self.accept_lens = []
+        self.draft_lens = []
+        self._draft_round = 0
+        self._cache = self.make_cache(left_padding)
+        self._seed_token = None
+        self._seed_hidden = None
+        self._next_position = 0
+        self._round_appended = 0
         self._round_cache_snapshot = None
-        return caches
+        return self._cache
 
     def draft_eval_state(self):
         state = [self._seed_token, self._seed_hidden]
@@ -168,14 +197,21 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
         return h, h
 
     def draft_block(self, *args, **kwargs) -> mx.array:
-        block_size = kwargs.get("block_size")
-        if block_size is None and len(args) >= 4:
-            block_size = args[3]
-        if block_size is not None and int(block_size) > 2:
-            self._round_cache_snapshot = [
-                (_clone_tree(cache.state), _clone_tree(cache.meta_state))
-                for cache in self._cache
-            ]
+        if self._cache:
+            self._round_cache_snapshot = []
+            for cache in self._cache:
+                snapshots = []
+                for subcache in cache.caches:
+                    if isinstance(subcache, (KVCache, BatchKVCache)):
+                        snapshots.append(None)
+                    else:
+                        snapshots.append(
+                            (
+                                _clone_tree(subcache.state),
+                                _clone_tree(subcache.meta_state),
+                            )
+                        )
+                self._round_cache_snapshot.append(snapshots)
             self._round_snapshot_position = _clone_tree(self._next_position)
         else:
             self._round_cache_snapshot = None
@@ -185,11 +221,14 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
         rejected_appended = max(0, self._round_appended - int(accepted))
         if not rejected_appended or self._round_cache_snapshot is None:
             return
-        if all(cache.is_trimmable() for cache in self._cache):
-            return
-        for cache, (state, meta_state) in zip(self._cache, self._round_cache_snapshot):
-            cache.meta_state = _clone_tree(meta_state)
-            cache.state = _clone_tree(state)
+        for cache, snapshots in zip(self._cache, self._round_cache_snapshot):
+            for subcache, snapshot in zip(cache.caches, snapshots):
+                if snapshot is None:
+                    subcache.trim(self._round_appended)
+                    continue
+                state, meta_state = snapshot
+                subcache.meta_state = _clone_tree(meta_state)
+                subcache.state = _clone_tree(state)
         self._next_position = _clone_tree(self._round_snapshot_position)
         self._round_appended = 0
 
@@ -201,17 +240,81 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
         super().accept_verified_tokens(*args, **kwargs)
         self._round_cache_snapshot = None
 
-    def accept_verified_tokens_batch(self, *args, **kwargs) -> None:
-        accepted = kwargs.get("accepted")
-        if accepted is None and len(args) >= 3:
-            accepted = args[2]
-        accepted_values = [int(value) for value in accepted]
-        if len(set(accepted_values)) != 1:
-            raise ValueError(
-                "GLM-5-Next MTP batched cache update requires uniform acceptance."
+    def accept_verified_tokens_batch(
+        self,
+        verify_hidden: mx.array,
+        draft_tokens: mx.array,
+        accepted: List[int],
+        new_tokens: List[List[int]],
+        sampler,
+        token_dtype: mx.Dtype = mx.int32,
+        greedy: bool = False,
+    ) -> None:
+        if len(accepted) <= 1:
+            self.accept_verified_tokens(
+                verify_hidden,
+                draft_tokens,
+                int(accepted[0]),
+                new_tokens[0],
+                sampler,
+                token_dtype,
+                greedy,
             )
-        self._restore_untrimmable_round(accepted_values[0])
-        super().accept_verified_tokens_batch(*args, **kwargs)
+            return
+
+        accepted = [int(value) for value in accepted]
+        self._restore_untrimmable_round(min(accepted))
+
+        keep_appended = [min(value, self._round_appended) for value in accepted]
+        trims = [self._round_appended - keep for keep in keep_appended]
+        if any(trims):
+            if len(set(trims)) == 1:
+                for cache in self._cache:
+                    cache.trim(trims[0])
+                self._next_position = self._next_position - trims[0]
+            else:
+                for cache in self._cache:
+                    cache.prepare(right_padding=trims)
+                    cache.finalize()
+                self._next_position = self._next_position - mx.array(
+                    trims, dtype=mx.int32
+                )
+
+        tokens, hiddens, lengths, right_padding = _prepare_ragged_mtp_replay(
+            verify_hidden,
+            draft_tokens,
+            accepted,
+            new_tokens,
+            keep_appended,
+            token_dtype,
+        )
+        if tokens is not None:
+            if any(right_padding):
+                for cache in self._cache:
+                    cache.prepare(right_padding=right_padding, lengths=lengths)
+
+            logits_hidden, pre_hc_hidden = self._forward_tokens(
+                tokens, hiddens, token_dtype
+            )
+
+            if any(right_padding):
+                for cache in self._cache:
+                    cache.finalize()
+                self._next_position = self._next_position - mx.array(
+                    right_padding, dtype=mx.int32
+                )
+
+            last_idx = mx.array([length - 1 for length in lengths], dtype=mx.int32)
+            logits_hidden = mx.take_along_axis(
+                logits_hidden, last_idx[:, None, None], axis=1
+            )
+            pre_hc_hidden = mx.take_along_axis(
+                pre_hc_hidden, last_idx[:, None, None], axis=1
+            )
+            self._set_seed_from_hidden(logits_hidden, sampler, greedy)
+            self._seed_hidden = pre_hc_hidden
+
+        self._round_appended = 0
         self._round_cache_snapshot = None
 
     def filter_batch(self, keep) -> None:

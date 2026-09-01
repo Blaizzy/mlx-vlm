@@ -19,11 +19,13 @@ from mlx.utils import tree_flatten, tree_map
 
 import mlx_vlm.models.deepseek_v4.language as deepseek_language
 import mlx_vlm.models.gemma4.language as gemma4_language
+import mlx_vlm.models.glm5_next.language as glm5_next_language
 import mlx_vlm.models.laguna.language as laguna_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.models.qwen3_5.speculative_verifier as qwen_verifier
 import mlx_vlm.models.qwen3_5_moe.language as qwen_moe_language
 import mlx_vlm.speculative.mtp as mtp_utils
+from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models.base import kv_sequence_length
 from mlx_vlm.models.cache import (
     ArraysCache,
@@ -3936,7 +3938,7 @@ def test_glm5_next_mtp_sampler_state_tolerates_uninitialized_kv_cache():
     assert sampler_rng.draft_call(lambda: None) is None
 
 
-def test_glm5_next_mtp_batch_acceptance_keeps_rows_aligned():
+def test_glm5_next_mtp_batch_acceptance_keeps_ragged_rows_aligned():
     text_config = _tiny_glm5_next_text_config()
     drafter = Glm5NextMTPDraftModel(
         Glm5NextMTPConfig(text_config=text_config, block_size=2)
@@ -3946,8 +3948,13 @@ def test_glm5_next_mtp_batch_acceptance_keeps_rows_aligned():
             model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
         )
     )
-    drafter.reset(target)
-    drafter.set_shared_kv({}, kv_offset=4, position=4, kv_valid_len=4)
+    drafter.reset(target, left_padding=[0, 0])
+    drafter.set_shared_kv(
+        {},
+        kv_offset=4,
+        position=mx.array([4, 4], dtype=mx.int32),
+        kv_valid_len=mx.array([4, 4], dtype=mx.int32),
+    )
     hidden = mx.zeros((2, 1, 16))
     draft_tokens = drafter.draft_block(
         mx.array([7, 8], dtype=mx.int32),
@@ -3961,8 +3968,8 @@ def test_glm5_next_mtp_batch_acceptance_keeps_rows_aligned():
     drafter.accept_verified_tokens_batch(
         mx.zeros((2, 2, 16)),
         draft_tokens,
-        accepted=[0, 0],
-        new_tokens=[[3], [4]],
+        accepted=[1, 0],
+        new_tokens=[[int(draft_tokens[0, 0].item()), 3], [4]],
         sampler=lambda logits: mx.argmax(logits, axis=-1),
         token_dtype=mx.int32,
         greedy=True,
@@ -3971,8 +3978,35 @@ def test_glm5_next_mtp_batch_acceptance_keeps_rows_aligned():
 
     assert drafter._seed_token.shape == (2, 1)
     assert drafter._seed_hidden.shape == (2, 1, 16)
-    assert drafter._next_position == 5
-    assert drafter._cache[0][0].offset == 1
+    assert drafter._next_position.tolist() == [6, 5]
+    assert drafter._cache[0][0].offset.tolist() == [2, 1]
+    assert drafter._cache[0][0].left_padding.tolist() == [0, 1]
+    assert drafter._cache[0][2]._pool_lengths == [1, 0]
+    assert drafter._cache[0][2].remainder == [0, 1]
+    assert not drafter.requires_uniform_batch_acceptance
+    assert drafter.supports_ragged_batch_acceptance
+
+
+def test_glm5_next_target_rollback_replays_ragged_rows():
+    text_config = _tiny_glm5_next_text_config()
+    language = glm5_next_language.LanguageModel(text_config)
+    language.eval()
+    cache = _make_cache(language, left_padding=[0, 0])
+
+    language(mx.array([[1, 2], [3, 4]], dtype=mx.int32), cache=cache)
+    _, _, rollback_state = language.speculative_verify_hidden(
+        mx.array([[5, 6], [7, 8]], dtype=mx.int32), cache
+    )
+    language.rollback_speculative_cache(
+        cache, rollback_state, accepted=[1, 0], block_size=2
+    )
+
+    sparse_cache = cache[1]
+    mx.eval(sparse_cache[0].offset, sparse_cache[0].left_padding)
+    assert sparse_cache[0].offset.tolist() == [4, 3]
+    assert sparse_cache[0].left_padding.tolist() == [0, 1]
+    assert sparse_cache[2]._pool_lengths == [2, 1]
+    assert sparse_cache[2].remainder == [0, 1]
 
 
 def test_glm5_next_mtp_sanitize_fuses_native_layer_weights():
