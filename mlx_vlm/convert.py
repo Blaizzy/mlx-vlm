@@ -282,7 +282,19 @@ def convert(
     mtp: bool = False,
     mtp_output: Optional[str] = None,
     mtp_full_precision: bool = False,
+    mtp_q_group_size: Optional[int] = None,
+    mtp_q_bits: Optional[int] = None,
+    mtp_q_mode: Optional[str] = None,
 ):
+    mtp_quantization_requested = any(
+        value is not None for value in (mtp_q_group_size, mtp_q_bits, mtp_q_mode)
+    )
+    if mtp_full_precision and mtp_quantization_requested:
+        raise ValueError(
+            "Choose either --mtp-full-precision or MTP quantization options, "
+            "not both."
+        )
+
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
     fp8_target_quantization = (
@@ -424,13 +436,24 @@ def convert(
             else:
                 drafter_path = mtp_output or f"{mlx_path}-mtp"
                 print(f"[INFO] Extracting MTP drafter -> {drafter_path}")
+                if mtp_quantization_requested:
+                    drafter_q_group_size = mtp_q_group_size
+                    drafter_q_bits = mtp_q_bits
+                    drafter_q_mode = mtp_q_mode or "affine"
+                elif quantize and not mtp_full_precision:
+                    drafter_q_group_size = q_group_size
+                    drafter_q_bits = q_bits
+                    drafter_q_mode = q_mode
+                else:
+                    drafter_q_group_size = None
+                    drafter_q_bits = None
+                    drafter_q_mode = None
                 splitter.split(
                     str(model_path),
                     str(drafter_path),
-                    q_bits=(
-                        None if mtp_full_precision else (q_bits if quantize else None)
-                    ),
-                    q_group_size=q_group_size,
+                    q_bits=drafter_q_bits,
+                    q_group_size=drafter_q_group_size,
+                    q_mode=drafter_q_mode,
                     dequantize=mtp_full_precision,
                 )
         except Exception as exc:
@@ -568,6 +591,24 @@ def configure_parser() -> argparse.ArgumentParser:
         ),
         action="store_true",
         default=False,
+    )
+    parser.add_argument(
+        "--mtp-q-group-size",
+        help="Override the quantization group size for the MTP drafter.",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--mtp-q-bits",
+        help="Override the quantization bit width for the MTP drafter.",
+        type=int,
+        default=None,
+    )
+    parser.add_argument(
+        "--mtp-q-mode",
+        help="Override the quantization mode for the MTP drafter.",
+        choices=["affine", "mxfp4", "nvfp4", "mxfp8"],
+        default=None,
     )
     return parser
 

@@ -4068,6 +4068,39 @@ def test_split_glm5_next_mtp_honors_requested_quantization_for_fp8(tmp_path):
     assert not any(key.endswith("weight_scale_inv") for key in weights)
 
 
+def test_split_glm5_next_mtp_supports_independent_mxfp8_quantization(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    text_config = _tiny_glm5_next_text_config()
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "glm5_next",
+                "text_config": text_config.to_dict(),
+            }
+        )
+    )
+    prefix = f"model.language_model.layers.{text_config.num_hidden_layers}"
+    mx.save_safetensors(
+        str(source / "model.safetensors"),
+        {
+            f"{prefix}.eh_proj.weight": mx.ones((128, 128), dtype=mx.bfloat16),
+        },
+    )
+
+    split_mtp(str(source), str(output), q_mode="mxfp8")
+
+    config = json.loads((output / "config.json").read_text())
+    weights = mx.load(str(output / "model.safetensors"))
+    expected = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    assert config["quantization"] == expected
+    assert config["quantization_config"] == expected
+    assert weights["eh_proj.weight"].dtype == mx.uint32
+    assert weights["eh_proj.scales"].dtype == mx.uint8
+    assert "eh_proj.biases" not in weights
+
+
 def test_split_glm5_next_mtp_can_restore_dense_bfloat16_from_fp8(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "mtp"

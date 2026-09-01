@@ -119,10 +119,14 @@ class MTPSplitter:
             return existing
         # (b) fp drafter + a quantization was requested (e.g. convert --mtp --bits)
         q_bits = quant_opts.get("q_bits")
-        if q_bits is None:
+        q_mode = quant_opts.get("q_mode")
+        if q_bits is None and q_mode is None:
             return None
-        return self._affine_quantize(
-            tensors, q_bits, quant_opts.get("q_group_size", 64)
+        return self._quantize(
+            tensors,
+            quant_opts.get("q_group_size"),
+            q_bits,
+            q_mode or "affine",
         )
 
     def quantization_from_source(
@@ -135,9 +139,15 @@ class MTPSplitter:
         # and the fp32 correction bias fall out via the ndim/divisibility checks
         return key.endswith(".weight") and not key.endswith("mlp.gate.weight")
 
-    def _affine_quantize(
-        self, weights: Dict[str, mx.array], bits: int, group_size: int
+    def _quantize(
+        self,
+        weights: Dict[str, mx.array],
+        group_size: Optional[int],
+        bits: Optional[int],
+        mode: str,
     ) -> Optional[dict]:
+        quantization = get_quantization_params(group_size, bits, mode)
+        group_size = quantization["group_size"]
         quantized_any = False
         for key in list(weights):
             if not self.should_quantize_key(key):
@@ -145,14 +155,15 @@ class MTPSplitter:
             weight = weights[key]
             if weight.ndim < 2 or weight.shape[-1] % group_size != 0:
                 continue
-            wq, scales, biases = mx.quantize(weight, group_size=group_size, bits=bits)
-            weights[key] = wq
-            weights[key[: -len(".weight")] + ".scales"] = scales
-            weights[key[: -len(".weight")] + ".biases"] = biases
+            quantized = mx.quantize(weight, **quantization)
+            weights[key] = quantized[0]
+            weights[key[: -len(".weight")] + ".scales"] = quantized[1]
+            if len(quantized) == 3:
+                weights[key[: -len(".weight")] + ".biases"] = quantized[2]
             quantized_any = True
         if not quantized_any:
             return None
-        return {"group_size": group_size, "bits": bits, "mode": "affine"}
+        return quantization
 
     def depth(self, text_config: dict) -> int:
         return int(text_config.get(self.depth_field, 1) or 1)
@@ -221,16 +232,18 @@ class MTPSplitter:
             raise ValueError(f"No MTP tensors found in {source_path}.")
 
         q_bits = quant_opts.get("q_bits")
+        q_mode = quant_opts.get("q_mode")
+        quantize = q_bits is not None or q_mode is not None
         dequantize = bool(quant_opts.get("dequantize", False))
-        if dequantize and q_bits is not None:
+        if dequantize and quantize:
             raise ValueError(
                 "Choose either dense BF16 MTP extraction or MTP quantization, "
                 "not both."
             )
         fp8_target_quantization = None
-        if q_bits is not None:
+        if quantize:
             fp8_target_quantization = get_quantization_params(
-                quant_opts.get("q_group_size"), q_bits, "affine"
+                quant_opts.get("q_group_size"), q_bits, q_mode or "affine"
             )
         selected, transformed_quantization = transform_fp8_weights(
             selected,
