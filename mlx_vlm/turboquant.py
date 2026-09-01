@@ -4875,23 +4875,22 @@ class _SplitCodec:
         self.dim = int(dim)
         self.lower_bits = math.floor(bits)
         self.upper_bits = math.ceil(bits)
-        low_idx = np.asarray(low_idx, dtype=np.int32)
-        high_idx = np.asarray(high_idx, dtype=np.int32)
         self.low_idx = mx.array(low_idx, dtype=mx.int32)
         self.high_idx = mx.array(high_idx, dtype=mx.int32)
+        self.restore_order = mx.argsort(
+            mx.concatenate([self.low_idx, self.high_idx])
+        ).astype(mx.int32)
 
-        concat_order = np.concatenate([low_idx, high_idx])
-        self.restore_order = mx.array(np.argsort(concat_order), dtype=mx.int32)
+        dl = self.low_idx.shape[0]
+        dh = self.high_idx.shape[0]
 
         codec_cls = _TurboQuantProdCodec if mode == "prod" else _TurboQuantMSECodec
-        self.low_codec = codec_cls(len(low_idx), self.lower_bits, seed)
-        self.high_codec = codec_cls(len(high_idx), self.upper_bits, seed + 97)
+        self.low_codec = codec_cls(dl, self.lower_bits, seed)
+        self.high_codec = codec_cls(dh, self.upper_bits, seed + 97)
 
         # Pre-build combined query transform for fused decode:
         # single (D, 2*dim_low + 2*dim_high) matrix replaces 2 takes + 2 matmuls
         if mode == "prod" and isinstance(self.low_codec, _TurboQuantProdCodec):
-            dl = len(low_idx)
-            dh = len(high_idx)
             combined = mx.zeros((self.dim, 2 * dl + 2 * dh), dtype=mx.float32)
             combined[self.low_idx, :dl] = self.low_codec.query_transform_t[:, :dl]
             combined[self.low_idx, dl : 2 * dl] = self.low_codec.query_transform_t[
