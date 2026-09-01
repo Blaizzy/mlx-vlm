@@ -8,7 +8,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput
+from ..base import LanguageModelOutput, scaled_dot_product_attention
 from ..cache import ArraysCache, BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
 from ..qwen3_5.language import (
@@ -24,6 +24,7 @@ from ..qwen3_5.language import (
 from ..qwen3_5.speculative_verifier import Qwen3_5ExactSpeculativeVerifier
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
+from .qsa_kernel import qsa_sparse_attention
 
 
 def _append_indexer_positions(
@@ -794,12 +795,31 @@ class Qwen4ExpQSAIndexer(nn.Module):
             self.index_qk_proj(hidden_states), cache, position_ids
         )
 
+    def select(
+        self,
+        hidden_states: mx.array,
+        cache: Optional[QSAKVCache],
+        position_ids: Optional[mx.array],
+    ) -> Optional[SimpleNamespace]:
+        return self.select_from_projected(
+            self.index_qk_proj(hidden_states), cache, position_ids
+        )
+
     def from_projected(
         self,
         qk: mx.array,
         cache: Optional[QSAKVCache],
         position_ids: Optional[mx.array],
     ) -> Optional[mx.array]:
+        selection = self.select_from_projected(qk, cache, position_ids)
+        return None if selection is None else self.build_mask(selection)
+
+    def select_from_projected(
+        self,
+        qk: mx.array,
+        cache: Optional[QSAKVCache],
+        position_ids: Optional[mx.array],
+    ) -> Optional[SimpleNamespace]:
         batch, seq_len, _ = qk.shape
         past_len = cache.offset if cache is not None else 0
         past_index_len = getattr(cache, "index_offset", past_len)
@@ -934,6 +954,28 @@ class Qwen4ExpQSAIndexer(nn.Module):
             ..., -self.block_topk :
         ]
 
+        return SimpleNamespace(
+            selected_blocks=selected_blocks,
+            query_ends=mx.broadcast_to(query_ends[None], (batch, seq_len)),
+            complete_counts=complete_counts,
+            left_padding=left_padding,
+            key_len=key_len,
+            zero_padding=zero_padding,
+            all_sparse=(
+                zero_padding
+                and int(past_index_len) + 1
+                >= (self.block_topk + 1) * self.compress_ratio
+            ),
+        )
+
+    def build_mask(self, selection: SimpleNamespace) -> mx.array:
+        selected_blocks = selection.selected_blocks
+        query_ends = selection.query_ends
+        complete_counts = selection.complete_counts
+        left_padding = selection.left_padding
+        key_len = selection.key_len
+        batch, seq_len, _ = selected_blocks.shape
+
         # Scatter the winning blocks directly onto the token axis. Comparing
         # every token against every pick would cost seq_len * key_len *
         # block_topk bytes per prefill step.
@@ -956,10 +998,10 @@ class Qwen4ExpQSAIndexer(nn.Module):
         token_indices = mx.arange(key_len)
         tail_starts = left_padding[:, None] + complete_counts * self.compress_ratio
         tail = (token_indices[None, None, :] >= tail_starts[..., None]) & (
-            token_indices[None, None, :] < query_ends[None, :, None]
+            token_indices[None, None, :] < query_ends[..., None]
         )
         causal = (token_indices[None, None, :] >= left_padding[:, None, None]) & (
-            token_indices[None, None, :] < query_ends[None, :, None]
+            token_indices[None, None, :] < query_ends[..., None]
         )
         use_sparse = complete_counts > self.block_topk
         selected_tokens = mx.where(
@@ -983,9 +1025,34 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_ids: Optional[mx.array] = None,
         position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
-        qsa_mask = self.indexer(x, cache, position_ids)
+        selection = self.indexer.select(x, cache, position_ids)
+        if selection is None:
+            return super().__call__(
+                x,
+                mask=mask,
+                cache=cache,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )
+
+        standard_causal_mask = mask is None or (
+            isinstance(mask, str) and mask == "causal"
+        )
+        if isinstance(mask, str) and not standard_causal_mask:
+            # Qwen3.5 owns specialized string modes such as
+            # ``left_padded_decode``. The indexer state is already updated;
+            # delegate only the Q/K/V attention path to the parent.
+            return super().__call__(
+                x,
+                mask=mask,
+                cache=cache,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )
+        use_sparse_kernel = selection.all_sparse and standard_causal_mask
+        qsa_mask = None if use_sparse_kernel else self.indexer.build_mask(selection)
         if qsa_mask is not None:
-            if mask is None or (isinstance(mask, str) and mask == "causal"):
+            if standard_causal_mask:
                 mask = qsa_mask
             elif isinstance(mask, mx.array):
                 if mask.dtype == mx.bool_:
@@ -993,16 +1060,38 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 else:
                     sparse_bias = mx.where(qsa_mask, 0.0, -mx.inf).astype(mask.dtype)
                     mask = mask + sparse_bias
-            # The specialized left-padded decode path remains dense. It is
-            # uncommon, and preserving its row-specific cache semantics is
-            # preferable to applying an incorrectly aligned sparse mask.
-        return super().__call__(
-            x,
-            mask=mask,
-            cache=cache,
-            position_ids=position_ids,
-            position_embeddings=position_embeddings,
+
+        B, L, _ = x.shape
+        q_proj_output, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        queries, keys, values, gate, mask = self._prepare_projected_qkv(
+            q_proj_output,
+            keys,
+            values,
+            cache,
+            position_ids,
+            position_embeddings,
+            None if use_sparse_kernel else mask,
         )
+        output = None
+        if use_sparse_kernel:
+            output = qsa_sparse_attention(
+                queries,
+                keys,
+                values,
+                selection.selected_blocks,
+                selection.query_ends,
+                scale=self.scale,
+                block_size=self.indexer.compress_ratio,
+            )
+        if output is None:
+            if qsa_mask is None:
+                qsa_mask = self.indexer.build_mask(selection)
+                mask = qsa_mask
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            )
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(output * mx.sigmoid(gate))
 
 
 class Qwen4ExpGatedResidual(nn.Module):

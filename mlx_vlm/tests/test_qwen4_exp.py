@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -15,6 +16,7 @@ from mlx_vlm.models.qwen4_exp.language import (
     Qwen4ExpNGramEmbedding,
     ShardedEmbedding,
 )
+from mlx_vlm.models.qwen4_exp.qsa_kernel import qsa_sparse_attention
 from mlx_vlm.prompt_utils import MessageFormat, MessageFormatter
 
 
@@ -89,6 +91,83 @@ def tiny_config():
 
 
 class Qwen4ExpTests(unittest.TestCase):
+    def test_qsa_sparse_attention_matches_dense_mask(self):
+        mx.random.seed(37)
+        batch, query_heads, kv_heads = 1, 4, 2
+        query_length, key_length, head_dim = 5, 64, 32
+        block_size = 2
+        queries = mx.random.normal(
+            (batch, query_heads, query_length, head_dim), dtype=mx.bfloat16
+        )
+        keys = mx.random.normal(
+            (batch, kv_heads, key_length, head_dim), dtype=mx.bfloat16
+        )
+        values = mx.random.normal(
+            (batch, kv_heads, key_length, head_dim), dtype=mx.bfloat16
+        )
+        blocks = mx.broadcast_to(
+            mx.array([1, 4, 7, 12], dtype=mx.int32),
+            (batch, query_length, 4),
+        )
+        query_ends = mx.arange(55, 60, dtype=mx.int32)[None]
+
+        sparse = qsa_sparse_attention(
+            queries,
+            keys,
+            values,
+            blocks,
+            query_ends,
+            scale=head_dim**-0.5,
+            block_size=block_size,
+        )
+        if sparse is None:
+            self.skipTest("QSA sparse Metal kernel is unavailable")
+
+        selected = (
+            blocks[..., None] * block_size
+            + mx.arange(block_size, dtype=mx.int32)[None, None, None]
+        ).reshape(batch, query_length, -1)
+        mask = mx.put_along_axis(
+            mx.zeros((batch, query_length, key_length + 1), dtype=mx.bool_),
+            selected,
+            mx.ones(selected.shape, dtype=mx.bool_),
+            axis=-1,
+        )[..., :key_length]
+        token_ids = mx.arange(key_length, dtype=mx.int32)
+        tail_starts = (query_ends // block_size) * block_size
+        tail = (token_ids[None, None] >= tail_starts[..., None]) & (
+            token_ids[None, None] < query_ends[..., None]
+        )
+        dense = mx.fast.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale=head_dim**-0.5,
+            mask=(mask | tail)[:, None],
+        )
+        mx.eval(sparse, dense)
+
+        self.assertTrue(mx.allclose(sparse, dense, atol=5e-3, rtol=5e-3).item())
+
+    def test_qsa_attention_routes_long_prefix_to_sparse_kernel(self):
+        mx.random.seed(41)
+        model = qwen4_exp.Model(tiny_config())
+        attention = model.language_model.model.layers[1].self_attn
+        cache = QSAKVCache()
+        attention(mx.random.normal((1, 18, 32)), mask="causal", cache=cache)
+
+        def fake_sparse(queries, *args, **kwargs):
+            return mx.zeros_like(queries)
+
+        with patch(
+            "mlx_vlm.models.qwen4_exp.language.qsa_sparse_attention",
+            side_effect=fake_sparse,
+        ) as sparse:
+            output = attention(mx.random.normal((1, 2, 32)), mask="causal", cache=cache)
+            mx.eval(output)
+
+        sparse.assert_called_once()
+
     def test_config_normalizes_reference_layer_type(self):
         config = tiny_config()
         self.assertEqual(
