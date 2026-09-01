@@ -31,8 +31,13 @@ def _target_verify_qlinear_header(
     bits: int,
     group_size: int,
     results_per_simdgroup: int = 4,
-    q3_shifted: bool = False,
+    *,
+    q3_shifted_fields: bool = False,
 ) -> str:
+    # Shifted Q3 extraction is faster but changes floating-point operation
+    # order. Use it only for argmax kernels, where exact token IDs are
+    # verified; projection kernels retain the unshifted form for byte-identical
+    # singleton outputs.
     return (
         r"""
     using namespace metal;
@@ -196,7 +201,7 @@ def _target_verify_qlinear_header(
 """.replace("__BITS__", str(bits))
         .replace("__GS__", str(group_size))
         .replace("__RESULTS_PER_SIMDGROUP__", str(results_per_simdgroup))
-        .replace("__Q3_SHIFTED__", "true" if q3_shifted else "false")
+        .replace("__Q3_SHIFTED__", "true" if q3_shifted_fields else "false")
     )
 
 
@@ -795,7 +800,9 @@ def _target_verify_qargmax_kernel(bits, group_size, dtype, verify_t, k_size, n_s
         ),
         input_names=["x", "w", "scales", "biases"],
         output_names=["tile_values", "tile_indices"],
-        header=_target_verify_qlinear_header(bits, group_size, q3_shifted=bits == 3),
+        header=_target_verify_qlinear_header(
+            bits, group_size, q3_shifted_fields=bits == 3
+        ),
         source=_TARGET_VERIFY_QARGMAX_SOURCE,
     )
 
@@ -812,7 +819,9 @@ def _target_verify_masked_qargmax_kernel(
         ),
         input_names=["x", "w", "scales", "biases", "mask"],
         output_names=["tile_values", "tile_indices"],
-        header=_target_verify_qlinear_header(bits, group_size, q3_shifted=bits == 3),
+        header=_target_verify_qlinear_header(
+            bits, group_size, q3_shifted_fields=bits == 3
+        ),
         source=_TARGET_VERIFY_MASKED_QARGMAX_SOURCE,
     )
 
