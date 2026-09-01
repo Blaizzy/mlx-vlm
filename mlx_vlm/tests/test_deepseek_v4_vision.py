@@ -24,6 +24,7 @@ from mlx_vlm.speculative.drafters.deepseek_v4_dspark import DeepseekV4DsparkDraf
 from mlx_vlm.speculative.drafters.deepseek_v4_dspark.config import (
     DeepseekV4DsparkConfig,
 )
+from mlx_vlm.vision_cache import VisionFeatureCache
 
 
 class TestDeepseekV4VisionConfig(unittest.TestCase):
@@ -241,6 +242,58 @@ class TestDeepseekV4VisionLanguage(unittest.TestCase):
         self.assertTrue(mx.array_equal(combined[0], base_mask[0]).item())
         self.assertFalse(bool(mx.any(combined[1, :, :, :2]).item()))
         self.assertTrue(mx.array_equal(combined[1, :, :, 2:], image_mask[1]).item())
+
+    def test_mixed_warm_text_and_cold_image_prefill_uses_row_aware_mask(self):
+        class MixedCache:
+            offset = mx.array([2, 0], dtype=mx.int32)
+
+            def make_mask(self, length, **kwargs):
+                del kwargs
+                mask = mx.ones((2, 1, length, length + 2), dtype=mx.bool_)
+                mask[1, :, :, :2] = False
+                return mask
+
+        class CaptureLayer:
+            def __call__(self, hidden, mask, cache, input_ids):
+                del cache, input_ids
+                self.mask = mask
+                return hidden
+
+        config = tiny_vision_config(sliding_window=3, vision_max_n_token=16)
+        model = Model(config)
+        input_ids = mx.array(
+            [
+                [1, 2, 3, 4],
+                [1, config.vocab_size, config.vocab_size + 4, 2],
+            ],
+            dtype=mx.int32,
+        )
+        safe_ids = mx.where(input_ids < config.vocab_size, input_ids, 0)
+        inputs_embeds = model.language_model.model.embed_tokens(safe_ids)
+        layer = CaptureLayer()
+        model.language_model.model.layers = [layer]
+
+        result = model.language_model(
+            input_ids,
+            cache=[MixedCache()],
+            inputs_embeds=inputs_embeds,
+            skip_logits=True,
+        )
+        mx.eval(result.hidden_states if result.hidden_states is not None else [])
+
+        self.assertTrue(bool(mx.all(layer.mask[0, :, :, :2]).item()))
+        self.assertFalse(bool(mx.any(layer.mask[1, :, :, :2]).item()))
+        self.assertTrue(
+            mx.array_equal(
+                layer.mask[1, :, :, 2:],
+                create_image_attention_mask(
+                    input_ids,
+                    config.vocab_size,
+                    config.sliding_window,
+                    config.vision_max_n_token,
+                )[1],
+            ).item()
+        )
 
     def test_non_hash_gate_selects_text_and_vision_biases(self):
         config = tiny_vision_config(
@@ -691,6 +744,45 @@ class TestDeepseekV4ImageProcessor(unittest.TestCase):
             mx.eval(features.inputs_embeds)
 
         self.assertEqual(features.inputs_embeds.shape[:2], output["input_ids"].shape)
+
+    def test_server_vision_cache_reuses_packed_features(self):
+        processor = self.make_processor(vocab_size=16)
+        image = Image.new("RGB", (8, 4), (20, 40, 60))
+        output = processor(
+            f"before{IMAGE_PLACEHOLDER}after",
+            images=[image],
+            return_tensors="mlx",
+        )
+        model = Model(tiny_vision_config())
+        vision_cache = VisionFeatureCache()
+        image_kwargs = {
+            key: value for key, value in output.items() if key.startswith("image_")
+        }
+
+        with patch.object(
+            model, "_encode_images", wraps=model._encode_images
+        ) as encode:
+            first = model.get_input_embeddings(
+                output["input_ids"],
+                output["pixel_values"],
+                vision_cache=vision_cache,
+                _image_key=image,
+                **image_kwargs,
+            )
+            second = model.get_input_embeddings(
+                output["input_ids"],
+                output["pixel_values"],
+                vision_cache=vision_cache,
+                _image_key=image,
+                **image_kwargs,
+            )
+            mx.eval(first.inputs_embeds, second.inputs_embeds)
+
+        self.assertEqual(encode.call_count, 1)
+        self.assertEqual(len(vision_cache), 1)
+        self.assertTrue(
+            mx.array_equal(first.inputs_embeds, second.inputs_embeds).item()
+        )
 
 
 if __name__ == "__main__":

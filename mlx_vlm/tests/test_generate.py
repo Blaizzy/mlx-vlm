@@ -1163,6 +1163,26 @@ class TestBatchGenerator:
         gen.insert([[1, 2, 3]])
         assert gen.remove(9999) is False
 
+    def test_remove_cancels_image_prefill_and_releases_cache(
+        self, mock_model, mock_processor
+    ):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+        )
+        prompt_batch = SimpleNamespace(
+            uids=[7],
+            prompt_cache=[MagicMock()],
+            input_ids=mx.array([[1, mock_model.config.image_token_index, 2]]),
+        )
+        gen._prompt_batch = prompt_batch
+
+        assert gen.remove(7) is True
+        assert prompt_batch.uids == []
+        assert prompt_batch.prompt_cache == []
+        assert gen._prompt_batch is None
+
 
 # ============================================================================
 # Tests for batch_generate function
