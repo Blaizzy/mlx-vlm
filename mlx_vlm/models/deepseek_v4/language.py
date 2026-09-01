@@ -56,6 +56,46 @@ def _score_func(scores: mx.array, func: str) -> mx.array:
     raise ValueError(f"Unsupported DeepSeek-V4 scoring function: {func}")
 
 
+def get_image_visible(
+    input_ids: mx.array,
+    vocab_size: int,
+    max_image_tokens: int,
+) -> Tuple[mx.array, mx.array]:
+    """Return the number of visible image tokens to each side of every token."""
+    sequence_length = input_ids.shape[1]
+    positions = mx.arange(sequence_length, dtype=mx.int32)[None]
+    is_start = input_ids == vocab_size
+    is_end = input_ids == vocab_size + 4
+    valid = (mx.cumsum(is_start, axis=1) > mx.cumsum(is_end, axis=1)) | is_end
+
+    starts = mx.cummax(mx.where(is_start, positions, 0), axis=1)
+    left = (positions - starts) * valid
+    ends = mx.where(is_end, positions, sequence_length)
+    ends = mx.cummin(ends[:, ::-1], axis=1)[:, ::-1]
+    right = (ends - positions) * valid
+    return (
+        mx.minimum(left, max_image_tokens - 1),
+        mx.minimum(right, max_image_tokens),
+    )
+
+
+def create_image_attention_mask(
+    input_ids: mx.array,
+    vocab_size: int,
+    window_size: int,
+    max_image_tokens: int,
+) -> mx.array:
+    """Build the reference local mask with bidirectional image visibility."""
+    sequence_length = input_ids.shape[1]
+    positions = mx.arange(sequence_length, dtype=mx.int32)[None]
+    left, right = get_image_visible(input_ids, vocab_size, max_image_tokens)
+    left_extension = mx.maximum(left - (window_size - 1), 0)
+    starts = mx.maximum(positions - (window_size - 1) - left_extension, 0)
+    ends = positions + right
+    keys = mx.arange(sequence_length, dtype=mx.int32)[None, None]
+    return (keys >= starts[..., None]) & (keys <= ends[..., None])
+
+
 @mx.compile
 def _expert_select(
     logits: mx.array,
@@ -79,6 +119,30 @@ def _expert_select(
 
 
 @mx.compile
+def _vision_expert_select(
+    logits: mx.array,
+    e_score_correction_bias: mx.array,
+    bias_vl: mx.array,
+    image_mask: mx.array,
+    top_k: int,
+    routed_scaling_factor: float,
+    norm_topk_prob: bool,
+    scoring_func: str,
+) -> Tuple[mx.array, mx.array]:
+    logits = logits.astype(mx.float32)
+    scores = _score_func(logits, scoring_func)
+    correction = mx.where(image_mask[..., None], bias_vl, e_score_correction_bias)
+    inds = mx.argpartition(-(scores + correction), kth=top_k - 1, axis=-1)[
+        ..., :top_k
+    ].astype(mx.int32)
+    weights = mx.take_along_axis(scores, inds, axis=-1)
+    if scoring_func != "softmax" and norm_topk_prob:
+        weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+    weights = weights * routed_scaling_factor
+    return inds, weights
+
+
+@mx.compile
 def _hash_expert_select(
     input_ids: mx.array,
     logits: mx.array,
@@ -90,6 +154,34 @@ def _hash_expert_select(
     logits = logits.astype(mx.float32)
     scores = _score_func(logits, scoring_func)
     inds = tid2eid[input_ids].astype(mx.int32)
+    weights = mx.take_along_axis(scores, inds, axis=-1)
+    if scoring_func != "softmax" and norm_topk_prob:
+        weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+    weights = weights * routed_scaling_factor
+    return inds, weights
+
+
+@mx.compile
+def _vision_hash_expert_select(
+    input_ids: mx.array,
+    logits: mx.array,
+    tid2eid: mx.array,
+    bias_vl: mx.array,
+    vocab_size: int,
+    top_k: int,
+    routed_scaling_factor: float,
+    norm_topk_prob: bool,
+    scoring_func: str,
+) -> Tuple[mx.array, mx.array]:
+    logits = logits.astype(mx.float32)
+    scores = _score_func(logits, scoring_func)
+    image_mask = input_ids >= vocab_size
+    safe_ids = mx.where(image_mask, 0, input_ids)
+    inds = tid2eid[safe_ids].astype(mx.int32)
+    vision_inds = mx.argpartition(-(scores + bias_vl), kth=top_k - 1, axis=-1)[
+        ..., :top_k
+    ].astype(mx.int32)
+    inds = mx.where(image_mask[..., None], vision_inds, inds)
     weights = mx.take_along_axis(scores, inds, axis=-1)
     if scoring_func != "softmax" and norm_topk_prob:
         weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
@@ -212,6 +304,8 @@ def _extend_mask(mask: Optional[mx.array], pool_mask: Optional[mx.array], N: int
 
     if mask.ndim == 2:
         mask = mask[None, None]
+    elif mask.ndim == 3:
+        mask = mask[:, None]
     B, H, L, S = mask.shape
 
     if pool_mask is None:
@@ -335,13 +429,17 @@ class MoEGate(nn.Module):
         self.scoring_func = config.scoring_func
         self.routed_scaling_factor = config.routed_scaling_factor
         self.norm_topk_prob = config.norm_topk_prob
+        self.vocab_size = config.vocab_size
+        self.vision = config.vision_n_layers > 0
         self.weight = mx.zeros((self.num_experts, self.hidden_dim))
         if self.hash:
             self.tid2eid = mx.zeros((config.vocab_size, self.top_k), dtype=mx.int32)
-        else:
+        if not self.hash or self.vision:
             self.e_score_correction_bias = mx.zeros(
                 (self.num_experts,), dtype=mx.float32
             )
+        if self.vision:
+            self.bias_vl = mx.zeros((self.num_experts,), dtype=mx.float32)
 
     def __call__(self, x: mx.array, input_ids: Optional[mx.array] = None):
         logits = x @ self.weight.T
@@ -349,23 +447,50 @@ class MoEGate(nn.Module):
         if self.hash:
             if input_ids is None:
                 raise ValueError("DeepSeek-V4 hash routing requires input_ids.")
-            inds, weights = _hash_expert_select(
-                input_ids,
-                logits,
-                self.tid2eid,
-                self.routed_scaling_factor,
-                self.norm_topk_prob,
-                self.scoring_func,
-            )
+            if self.vision:
+                inds, weights = _vision_hash_expert_select(
+                    input_ids,
+                    logits,
+                    self.tid2eid,
+                    self.bias_vl,
+                    self.vocab_size,
+                    self.top_k,
+                    self.routed_scaling_factor,
+                    self.norm_topk_prob,
+                    self.scoring_func,
+                )
+            else:
+                inds, weights = _hash_expert_select(
+                    input_ids,
+                    logits,
+                    self.tid2eid,
+                    self.routed_scaling_factor,
+                    self.norm_topk_prob,
+                    self.scoring_func,
+                )
         else:
-            inds, weights = _expert_select(
-                logits,
-                self.e_score_correction_bias,
-                self.top_k,
-                self.routed_scaling_factor,
-                self.norm_topk_prob,
-                self.scoring_func,
-            )
+            if self.vision:
+                if input_ids is None:
+                    raise ValueError("DeepSeek-V4 vision routing requires input_ids.")
+                inds, weights = _vision_expert_select(
+                    logits,
+                    self.e_score_correction_bias,
+                    self.bias_vl,
+                    input_ids >= self.vocab_size,
+                    self.top_k,
+                    self.routed_scaling_factor,
+                    self.norm_topk_prob,
+                    self.scoring_func,
+                )
+            else:
+                inds, weights = _expert_select(
+                    logits,
+                    self.e_score_correction_bias,
+                    self.top_k,
+                    self.routed_scaling_factor,
+                    self.norm_topk_prob,
+                    self.scoring_func,
+                )
 
         return inds, weights
 
@@ -1036,12 +1161,28 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         mask_cache = (
             first_cache[0] if isinstance(first_cache, CacheList) else first_cache
         )
-        mask = create_attention_mask(
-            h[:, :, 0, :],
-            mask_cache,
-            window_size=self.args.sliding_window,
-            return_array=True,
+        has_image_tokens = self.args.vision_n_layers > 0 and bool(
+            mx.any(inputs >= self.vocab_size).item()
         )
+        if has_image_tokens:
+            cache_offset = getattr(mask_cache, "offset", 0)
+            if bool(mx.any(mx.array(cache_offset) > 0).item()):
+                raise ValueError(
+                    "DeepSeek-V4 image sentinels must be supplied in one prefill."
+                )
+            mask = create_image_attention_mask(
+                inputs,
+                self.vocab_size,
+                self.args.sliding_window,
+                self.args.vision_max_n_token,
+            )
+        else:
+            mask = create_attention_mask(
+                h[:, :, 0, :],
+                mask_cache,
+                window_size=self.args.sliding_window,
+                return_array=True,
+            )
 
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
@@ -1259,6 +1400,23 @@ class LanguageModel(nn.Module):
         self.model = DeepseekV4Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del inputs_embeds, prompt_cache, draft_kind, prefill_kwargs
+        if draft_model is not None:
+            return False
+        if input_ids is None or self.args.vision_n_layers == 0:
+            return True
+        return not bool(mx.any(input_ids >= self.args.vocab_size).item())
+
     def __call__(
         self,
         inputs: Optional[mx.array] = None,
@@ -1410,6 +1568,7 @@ class LanguageModel(nn.Module):
             return not (
                 "attn_sink" in k
                 or "e_score_correction_bias" in k
+                or "bias_vl" in k
                 or ".attn_hc." in k
                 or ".ffn_hc." in k
                 or ".hc_head." in k
@@ -1513,7 +1672,8 @@ class LanguageModel(nn.Module):
         w_remap = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
         for k, v in weights.items():
             nk = "model." + k if k.startswith("layers.") else k
-            nk = nk.replace(".ffn.gate.bias", ".ffn.gate.e_score_correction_bias")
+            if nk.endswith(".ffn.gate.bias"):
+                nk = nk[: -len(".ffn.gate.bias")] + ".ffn.gate.e_score_correction_bias"
             for sub in ("attn", "ffn"):
                 for param in ("fn", "base", "scale"):
                     nk = nk.replace(f".hc_{sub}_{param}", f".{sub}_hc.{param}")

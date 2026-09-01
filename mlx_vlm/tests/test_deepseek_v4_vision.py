@@ -6,6 +6,11 @@ from PIL import Image
 
 from mlx_vlm.models.deepseek_v4.config import ModelConfig
 from mlx_vlm.models.deepseek_v4.deepseek_v4 import Model
+from mlx_vlm.models.deepseek_v4.language import (
+    MoEGate,
+    create_image_attention_mask,
+    get_image_visible,
+)
 from mlx_vlm.models.deepseek_v4.processing_deepseek_v4 import (
     IMAGE_PLACEHOLDER,
     DeepseekV4Processor,
@@ -135,6 +140,169 @@ class TestDeepseekV4VisionTower(unittest.TestCase):
         self.assertFalse(hasattr(model, "vision"))
         output = model.get_input_embeddings(mx.array([[1, 2]], dtype=mx.int32))
         self.assertEqual(output.inputs_embeds.shape, (1, 2, 8))
+
+
+class TestDeepseekV4VisionLanguage(unittest.TestCase):
+    def test_image_visibility_matches_reference_span_rules(self):
+        config = tiny_vision_config(sliding_window=3, vision_max_n_token=16)
+        input_ids = mx.array([[1, 16, 17, 18, 19, 18, 20, 2]], dtype=mx.int32)
+
+        left, right = get_image_visible(
+            input_ids, config.vocab_size, config.vision_max_n_token
+        )
+        mask = create_image_attention_mask(
+            input_ids,
+            config.vocab_size,
+            config.sliding_window,
+            config.vision_max_n_token,
+        )
+        mx.eval(left, right, mask)
+
+        self.assertEqual(left.tolist(), [[0, 0, 1, 2, 3, 4, 5, 0]])
+        self.assertEqual(right.tolist(), [[0, 5, 4, 3, 2, 1, 0, 0]])
+        self.assertEqual(
+            mask.tolist(),
+            [
+                [
+                    [True, False, False, False, False, False, False, False],
+                    [True, True, True, True, True, True, True, False],
+                    [True, True, True, True, True, True, True, False],
+                    [False, True, True, True, True, True, True, False],
+                    [False, True, True, True, True, True, True, False],
+                    [False, True, True, True, True, True, True, False],
+                    [False, True, True, True, True, True, True, False],
+                    [False, False, False, False, False, True, True, True],
+                ]
+            ],
+        )
+
+    def test_hash_gate_uses_score_routing_for_image_tokens(self):
+        config = tiny_vision_config(scoring_func="sigmoid")
+        gate = MoEGate(config, layer_idx=0)
+        gate.weight = mx.zeros_like(gate.weight)
+        gate.tid2eid = mx.zeros_like(gate.tid2eid)
+        gate.tid2eid[1] = mx.array([0, 1])
+        gate.bias_vl = mx.array([0.0, 0.0, 10.0, 9.0])
+        hidden = mx.zeros((1, 2, config.hidden_size))
+        input_ids = mx.array([[1, config.vocab_size + 2]], dtype=mx.int32)
+
+        indices, weights = gate(hidden, input_ids)
+        mx.eval(indices, weights)
+
+        self.assertEqual(indices[0, 0].tolist(), [0, 1])
+        self.assertEqual(set(indices[0, 1].tolist()), {2, 3})
+        self.assertTrue(
+            mx.allclose(
+                weights, mx.full(weights.shape, 0.75, dtype=weights.dtype)
+            ).item()
+        )
+
+    def test_non_hash_gate_selects_text_and_vision_biases(self):
+        config = tiny_vision_config(
+            num_hash_layers=0,
+            scoring_func="sigmoid",
+            routed_scaling_factor=1.0,
+        )
+        gate = MoEGate(config, layer_idx=0)
+        gate.weight = mx.zeros_like(gate.weight)
+        gate.e_score_correction_bias = mx.array([10.0, 9.0, 0.0, 0.0])
+        gate.bias_vl = mx.array([0.0, 0.0, 10.0, 9.0])
+        hidden = mx.zeros((1, 2, config.hidden_size))
+        input_ids = mx.array([[1, config.vocab_size + 2]], dtype=mx.int32)
+
+        indices, weights = gate(hidden, input_ids)
+        mx.eval(indices, weights)
+
+        self.assertEqual(set(indices[0, 0].tolist()), {0, 1})
+        self.assertEqual(set(indices[0, 1].tolist()), {2, 3})
+        self.assertTrue(
+            mx.allclose(
+                weights, mx.full(weights.shape, 0.5, dtype=weights.dtype)
+            ).item()
+        )
+
+    def test_text_only_gate_keeps_original_parameters(self):
+        config = tiny_vision_config(vision_n_layers=0)
+        hash_gate = MoEGate(config, layer_idx=0)
+        score_gate = MoEGate(config, layer_idx=config.num_hash_layers)
+
+        self.assertFalse(hasattr(hash_gate, "bias_vl"))
+        self.assertFalse(hasattr(hash_gate, "e_score_correction_bias"))
+        self.assertTrue(hasattr(score_gate, "e_score_correction_bias"))
+        self.assertFalse(hasattr(score_gate, "bias_vl"))
+
+    def test_image_prefill_is_not_chunked(self):
+        model = Model(tiny_vision_config())
+        text = mx.array([[1, 2]], dtype=mx.int32)
+        image = mx.array([[1, model.config.vocab_size, 2]], dtype=mx.int32)
+
+        self.assertTrue(model.language_model.chunked_prefill_policy(input_ids=text))
+        self.assertFalse(model.language_model.chunked_prefill_policy(input_ids=image))
+        self.assertFalse(
+            model.language_model.chunked_prefill_policy(
+                input_ids=text, draft_model=object()
+            )
+        )
+
+    def test_image_sentinels_are_rejected_during_decode(self):
+        model = Model(tiny_vision_config())
+        cache = model.make_cache()
+        prefill = model(mx.array([[1]], dtype=mx.int32), cache=cache)
+        mx.eval(prefill.logits)
+
+        with self.assertRaisesRegex(ValueError, "one prefill"):
+            model(
+                mx.array([[model.config.vocab_size]], dtype=mx.int32),
+                cache=cache,
+            )
+
+    def test_sanitize_preserves_vision_gate_bias_name(self):
+        model = Model(tiny_vision_config())
+        weights = model.sanitize(
+            {
+                "layers.0.ffn.gate.bias": mx.zeros((4,)),
+                "layers.0.ffn.gate.bias_vl": mx.ones((4,)),
+            }
+        )
+
+        self.assertIn(
+            "language_model.model.layers.0.ffn.gate.e_score_correction_bias",
+            weights,
+        )
+        self.assertIn(
+            "language_model.model.layers.0.ffn.gate.bias_vl",
+            weights,
+        )
+
+    def test_image_prefill_and_text_decode_cover_all_compression_ratios(self):
+        processor = TestDeepseekV4ImageProcessor().make_processor(vocab_size=16)
+        processed = processor(
+            f"before{IMAGE_PLACEHOLDER}after",
+            images=[Image.new("RGB", (8, 4), (20, 40, 60))],
+            return_tensors="mlx",
+        )
+        image_kwargs = {
+            key: value for key, value in processed.items() if key.startswith("image_")
+        }
+
+        for ratio in (0, 4, 128):
+            with self.subTest(compress_ratio=ratio):
+                model = Model(tiny_vision_config(compress_ratios=[ratio]))
+                cache = model.make_cache()
+                prefill = model(
+                    processed["input_ids"],
+                    pixel_values=processed["pixel_values"],
+                    cache=cache,
+                    **image_kwargs,
+                )
+                decode = model(mx.array([[2]], dtype=mx.int32), cache=cache)
+                mx.eval(prefill.logits, decode.logits)
+
+                self.assertEqual(
+                    prefill.logits.shape,
+                    (*processed["input_ids"].shape, model.config.vocab_size),
+                )
+                self.assertEqual(decode.logits.shape, (1, 1, model.config.vocab_size))
 
 
 class ProcessorTokenizer:
