@@ -221,6 +221,12 @@ class MTPSplitter:
             raise ValueError(f"No MTP tensors found in {source_path}.")
 
         q_bits = quant_opts.get("q_bits")
+        dequantize = bool(quant_opts.get("dequantize", False))
+        if dequantize and q_bits is not None:
+            raise ValueError(
+                "Choose either dense BF16 MTP extraction or MTP quantization, "
+                "not both."
+            )
         fp8_target_quantization = None
         if q_bits is not None:
             fp8_target_quantization = get_quantization_params(
@@ -230,6 +236,7 @@ class MTPSplitter:
             selected,
             source_config,
             target_quantization=fp8_target_quantization,
+            dequantize=dequantize,
         )
         if transformed_quantization is not None:
             source_config = dict(source_config)

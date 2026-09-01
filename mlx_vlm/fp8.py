@@ -94,19 +94,30 @@ def transform_fp8_weights(
     weights: dict[str, mx.array],
     config: dict,
     target_quantization: dict | None = None,
+    *,
+    dequantize: bool = False,
 ) -> tuple[dict[str, mx.array], dict | None]:
-    """Convert a compatible block-FP8 checkpoint to native MLX quantization.
+    """Convert a compatible block-FP8 checkpoint to an MLX weight layout.
 
     The source format is detected from configuration rather than model type.
     Unsupported FP8 layouts pass through unchanged for their own loader or
     sanitizer to handle. By default the target is native MXFP8; callers may
     request another native MLX quantization layout to avoid an intermediate
-    requantization round trip.
+    requantization round trip, or reconstruct dense BF16 weights by setting
+    ``dequantize=True``.
     """
+    if dequantize and target_quantization is not None:
+        raise ValueError(
+            "Choose either dense FP8 dequantization or a target quantization, "
+            "not both."
+        )
+
     source_quantization = make_quantization_config(config)
     if source_quantization is None:
         return weights, None
-    quantization = dict(target_quantization or source_quantization)
+    quantization = (
+        None if dequantize else dict(target_quantization or source_quantization)
+    )
 
     scale_keys = [key for key in weights if key.endswith(".weight_scale_inv")]
     if not scale_keys:
@@ -120,6 +131,12 @@ def transform_fp8_weights(
 
         weight = converted.pop(weight_key)
         scale_inv = converted.pop(scale_key)
+        if dequantize:
+            converted[weight_key] = _dequantize_fp8_weight(weight, scale_inv).astype(
+                mx.bfloat16
+            )
+            continue
+
         quantized = _quantize_fp8_weight(weight, scale_inv, quantization)
         packed, scales = quantized[:2]
         converted[weight_key] = packed

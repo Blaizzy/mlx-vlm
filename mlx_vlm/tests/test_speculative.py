@@ -4068,6 +4068,50 @@ def test_split_glm5_next_mtp_honors_requested_quantization_for_fp8(tmp_path):
     assert not any(key.endswith("weight_scale_inv") for key in weights)
 
 
+def test_split_glm5_next_mtp_can_restore_dense_bfloat16_from_fp8(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    text_config = _tiny_glm5_next_text_config()
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "glm5_next",
+                "text_config": text_config.to_dict(),
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "fmt": "e4m3",
+                    "weight_block_size": [128, 128],
+                },
+            }
+        )
+    )
+    prefix = f"model.language_model.layers.{text_config.num_hidden_layers}"
+    source_weight = mx.to_fp8(mx.ones((128, 128), dtype=mx.bfloat16))
+    source_scale = mx.full((1, 1), 0.125, dtype=mx.float32)
+    mx.save_safetensors(
+        str(source / "model.safetensors"),
+        {
+            f"{prefix}.eh_proj.weight": source_weight,
+            f"{prefix}.eh_proj.weight_scale_inv": source_scale,
+        },
+    )
+
+    split_mtp(str(source), str(output), dequantize=True)
+
+    config = json.loads((output / "config.json").read_text())
+    weights = mx.load(str(output / "model.safetensors"))
+    mx.eval(weights["eh_proj.weight"])
+
+    assert "quantization" not in config
+    assert "quantization_config" not in config
+    assert weights["eh_proj.weight"].dtype == mx.bfloat16
+    assert mx.allclose(weights["eh_proj.weight"], mx.array(0.125)).item()
+    assert not any(
+        key.endswith((".scales", ".biases", ".weight_scale_inv")) for key in weights
+    )
+
+
 def test_deepseek_v4_mtp_runtime_block_size_defaults_to_native_nextn_depth():
     text_config = _tiny_deepseek_v4_config()
     cfg = DeepseekV4MTPConfig.from_dict(

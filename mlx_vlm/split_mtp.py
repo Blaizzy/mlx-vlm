@@ -27,7 +27,13 @@ def split_mtp(
     force_download: bool = False,
     q_bits: Optional[int] = None,
     q_group_size: int = 64,
+    dequantize: bool = False,
 ) -> Path:
+    if dequantize and q_bits is not None:
+        raise ValueError(
+            "Choose either dense BF16 MTP extraction or MTP quantization, not both."
+        )
+
     if model_type is not None:
         splitter = get_mtp_splitter(model_type)
         if splitter is None:
@@ -55,6 +61,7 @@ def split_mtp(
         force_download=force_download,
         q_bits=q_bits,
         q_group_size=q_group_size,
+        dequantize=dequantize,
     )
 
 
@@ -74,6 +81,16 @@ def configure_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force-download", action="store_true")
     parser.add_argument("--q-bits", type=int, default=None)
     parser.add_argument("--q-group-size", type=int, default=64)
+    parser.add_argument(
+        "--dequantize",
+        "--full-precision",
+        dest="dequantize",
+        action="store_true",
+        help=(
+            "Reconstruct block-FP8 MTP tensors as dense BF16 instead of "
+            "native MLX quantized weights."
+        ),
+    )
     return parser
 
 

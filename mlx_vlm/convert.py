@@ -281,6 +281,7 @@ def convert(
     quant_predicate: Optional[str] = None,
     mtp: bool = False,
     mtp_output: Optional[str] = None,
+    mtp_full_precision: bool = False,
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
@@ -426,8 +427,11 @@ def convert(
                 splitter.split(
                     str(model_path),
                     str(drafter_path),
-                    q_bits=q_bits if quantize else None,
+                    q_bits=(
+                        None if mtp_full_precision else (q_bits if quantize else None)
+                    ),
                     q_group_size=q_group_size,
+                    dequantize=mtp_full_precision,
                 )
         except Exception as exc:
             # the base conversion already succeeded; a drafter failure must not
@@ -555,6 +559,15 @@ def configure_parser() -> argparse.ArgumentParser:
         help="Output path for the MTP drafter (default: <mlx-path>-mtp).",
         type=str,
         default=None,
+    )
+    parser.add_argument(
+        "--mtp-full-precision",
+        help=(
+            "Keep the extracted MTP drafter dense BF16 even when the base model "
+            "is quantized. Block-FP8 source tensors are reconstructed to BF16."
+        ),
+        action="store_true",
+        default=False,
     )
     return parser
 
