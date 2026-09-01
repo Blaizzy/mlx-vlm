@@ -4056,3 +4056,31 @@ class TestVideoFrameCaps(unittest.TestCase):
             processor.video_sampling_defaults(),
             {"max_frames": processor.max_num_frames},
         )
+
+
+class TestMuseGlimmerCleanOutput(unittest.TestCase):
+    def _clean(self, text):
+        from mlx_vlm.models.muse_glimmer.processing_muse_glimmer import (
+            _extract_final_channel,
+        )
+
+        return _extract_final_channel(text)
+
+    def test_returns_only_final_user_channel(self):
+        raw = (
+            " to=self<|message|>Describe this image in one sentence.\n"
+            "Probably: two cats.\nLet's produce.<|eom|>"
+            "<|start|>assistant to=user<|message|>Two tabby cats sleep on a pink couch."
+        )
+        cleaned = self._clean(raw)
+        self.assertEqual(cleaned, "Two tabby cats sleep on a pink couch.")
+        self.assertNotIn("to=self", cleaned)
+        self.assertNotIn("<|message|>", cleaned)
+
+    def test_strips_trailing_channel_end_marker(self):
+        raw = "to=user<|message|>Final answer.<|return|>"
+        self.assertEqual(self._clean(raw), "Final answer.")
+
+    def test_noop_without_channels(self):
+        plain = "Two tabby cats sleep on a pink couch."
+        self.assertEqual(self._clean(plain), plain)
