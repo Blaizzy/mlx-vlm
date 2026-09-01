@@ -8,6 +8,7 @@ from mlx_vlm.generate import maybe_quantize_kv_cache
 from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models import qwen4_exp
 from mlx_vlm.models.cache import ArraysCache
+from mlx_vlm.models.exact_speculative_verify import exact_speculative_verify_weight
 from mlx_vlm.models.qwen4_exp.language import (
     BatchQSAKVCache,
     QSAKVCache,
@@ -96,6 +97,43 @@ def tiny_config():
 
 
 class Qwen4ExpTests(unittest.TestCase):
+    def test_dense_decode_reduction_is_batch_invariant(self):
+        if not mx.metal.is_available():
+            self.skipTest("The batch-invariant GEMV requires Metal")
+
+        mx.random.seed(2_560_027)
+        linear = nn.Linear(2560, 512, bias=False)
+        linear.set_dtype(mx.bfloat16)
+        singleton = mx.random.normal((1, 1, 2560)).astype(mx.bfloat16)
+        batch = mx.contiguous(mx.concatenate([singleton] * 4, axis=0))
+
+        expected = linear(singleton)
+        singleton_out = exact_speculative_verify_weight(linear.weight, singleton)
+        batch_out = exact_speculative_verify_weight(linear.weight, batch)
+        self.assertIsNotNone(singleton_out)
+        self.assertIsNotNone(batch_out)
+        mx.eval(expected, singleton_out, batch_out)
+
+        self.assertTrue(mx.array_equal(singleton_out, expected).item())
+        self.assertTrue(
+            mx.array_equal(
+                batch_out,
+                mx.broadcast_to(singleton_out, batch_out.shape),
+            ).item()
+        )
+
+    def test_quantized_decode_retains_the_native_fast_path(self):
+        model = qwen4_exp.Model(tiny_config())
+        self.assertTrue(model.language_model._supports_batch_invariant_decode())
+
+        model.language_model.lm_head = nn.QuantizedLinear.from_linear(
+            model.language_model.lm_head,
+            group_size=32,
+            bits=4,
+        )
+
+        self.assertFalse(model.language_model._supports_batch_invariant_decode())
+
     def test_qsa_sparse_attention_matches_dense_mask(self):
         mx.random.seed(37)
         batch, query_heads, kv_heads = 4, 4, 2
@@ -390,7 +428,10 @@ class Qwen4ExpTests(unittest.TestCase):
         self.assertEqual(cache[0][3].shape[1], 2)
 
     def test_batched_qsa_cache_decode_matches_singleton_rows(self):
+        mx.random.seed(47)
         model = qwen4_exp.Model(tiny_config())
+        model.set_dtype(mx.bfloat16)
+        mx.eval(model.parameters())
         prompts = mx.array([list(range(2, 12)), list(range(12, 22))], dtype=mx.int32)
         decode = mx.array([[22], [23]], dtype=mx.int32)
         prompt_positions = mx.broadcast_to(mx.arange(10)[None], (2, 10))
@@ -426,7 +467,7 @@ class Qwen4ExpTests(unittest.TestCase):
         row_logits = mx.concatenate(row_logits, axis=0)
         mx.eval(batch_logits, row_logits)
 
-        self.assertTrue(mx.allclose(batch_logits, row_logits, atol=1e-5).item())
+        self.assertTrue(mx.array_equal(batch_logits, row_logits).item())
         self.assertTrue(
             mx.array_equal(
                 mx.argmax(batch_logits, axis=-1),

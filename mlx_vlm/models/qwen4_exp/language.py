@@ -21,7 +21,7 @@ from ..qwen3_5.language import (
     _qwen3_5_left_padding_info,
     _restore_batch_padding_metadata,
 )
-from ..qwen3_5.speculative_verifier import Qwen3_5ExactSpeculativeVerifier
+from ..qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
 from .qsa_kernel import (
@@ -1678,8 +1678,8 @@ class Qwen4ExpModel(nn.Module):
         return self.hyper_connection_mixer(hidden_states)
 
 
-class Qwen4ExpExactSpeculativeVerifier(Qwen3_5ExactSpeculativeVerifier):
-    """Batched verifier with Qwen4's singleton-equivalent dense operations."""
+class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
+    """Qwen4 forward path with batch-invariant dense reductions."""
 
     @staticmethod
     def _normalize_gated_delta_qk(layer, q, k):
@@ -1848,7 +1848,9 @@ class Qwen4ExpExactSpeculativeVerifier(Qwen3_5ExactSpeculativeVerifier):
         )
 
 
-_QWEN4_EXACT_SPECULATIVE_VERIFIER = Qwen4ExpExactSpeculativeVerifier()
+_QWEN4_BATCH_INVARIANT_FORWARD = Qwen4ExpBatchInvariantForward()
+# Backward-compatible private alias for integrations that inspect the MTP helper.
+_QWEN4_EXACT_SPECULATIVE_VERIFIER = _QWEN4_BATCH_INVARIANT_FORWARD
 
 
 class LanguageModel(Qwen3_5LanguageModel):
@@ -1874,6 +1876,29 @@ class LanguageModel(Qwen3_5LanguageModel):
         if return_hidden and output.hidden_states:
             output.hidden_states = [output.hidden_states[0]]
         return output
+
+    def _batch_invariant_decode(
+        self,
+        inputs,
+        *,
+        cache,
+        inputs_embeds=None,
+        position_ids=None,
+        skip_logits=False,
+    ):
+        return _QWEN4_BATCH_INVARIANT_FORWARD(
+            self,
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            skip_logits=skip_logits,
+        )
+
+    def _supports_batch_invariant_decode(self):
+        if self.args.tie_word_embeddings:
+            return not isinstance(self.model.embed_tokens, nn.QuantizedEmbedding)
+        return not isinstance(self.lm_head, nn.QuantizedLinear)
 
     def _mtp_logits_hidden(self, hidden: mx.array) -> mx.array:
         hc_width = self.args.hc_count * self.args.hidden_size
@@ -1905,7 +1930,7 @@ class LanguageModel(Qwen3_5LanguageModel):
     ):
         if (
             self.args.tie_word_embeddings
-            or not _QWEN4_EXACT_SPECULATIVE_VERIFIER.can_quantized_head(self.lm_head)
+            or not _QWEN4_BATCH_INVARIANT_FORWARD.can_quantized_head(self.lm_head)
             or "bias" in self.lm_head
         ):
             return None
@@ -1923,7 +1948,7 @@ class LanguageModel(Qwen3_5LanguageModel):
                 ],
                 axis=0,
             )
-            token_mask = _QWEN4_EXACT_SPECULATIVE_VERIFIER.pad_token_mask(
+            token_mask = _QWEN4_BATCH_INVARIANT_FORWARD.pad_token_mask(
                 token_mask, self.lm_head.weight.shape[0]
             )
 
@@ -1935,7 +1960,7 @@ class LanguageModel(Qwen3_5LanguageModel):
             **kwargs,
         )
         hidden = self._mtp_logits_hidden(output.hidden_states[-1])
-        sampled = _QWEN4_EXACT_SPECULATIVE_VERIFIER.quantized_argmax(
+        sampled = _QWEN4_BATCH_INVARIANT_FORWARD.quantized_argmax(
             self.lm_head, hidden, token_mask=token_mask
         )
         if sampled is not None:
@@ -2005,7 +2030,7 @@ class LanguageModel(Qwen3_5LanguageModel):
         position_ids = offsets[:, None] + mx.arange(length, dtype=mx.int64)[None]
         if self._position_ids is not None and self._position_ids.ndim == 3:
             position_ids = mx.broadcast_to(position_ids[None], (3, batch, length))
-        output = _QWEN4_EXACT_SPECULATIVE_VERIFIER(
+        output = _QWEN4_BATCH_INVARIANT_FORWARD(
             self,
             inputs,
             cache=cache,
