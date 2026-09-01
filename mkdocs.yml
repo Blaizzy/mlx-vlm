@@ -85,7 +85,6 @@ nav:
     - Installation: installation.md
     - CLI Reference: cli_reference.md
     - Examples: examples.md
-    - DeepSeek-V4 Vision: deepseek-v4-vision.md
     - Contributing: contributing.md
     - Community Projects: community_projects.md
     - Report Issues: report_issues.md
