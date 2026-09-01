@@ -299,6 +299,22 @@ def convert(
             )
         print("[INFO] Streaming DeepSeek-V4 mixed FP8/FP4 conversion")
         convert_deepseek_v4_vision(model_path, mlx_path)
+        if mtp:
+            try:
+                from .speculative.drafters.mtp_split import detect_mtp_splitter
+
+                splitter = detect_mtp_splitter(model_path)
+                if splitter is None:
+                    print("[INFO] --mtp: no native DSpark tensors found; skipping")
+                else:
+                    drafter_path = mtp_output or f"{mlx_path}-mtp"
+                    print(f"[INFO] Extracting DSpark drafter -> {drafter_path}")
+                    splitter.split(str(model_path), str(drafter_path))
+            except Exception as exc:
+                print(
+                    f"[WARNING] --mtp: failed to extract DSpark drafter "
+                    f"({type(exc).__name__}: {exc}); base conversion is unaffected"
+                )
         hf_repo = None if Path(hf_path).exists() else hf_path
         create_model_card(mlx_path, hf_repo)
         if upload_repo is not None:
