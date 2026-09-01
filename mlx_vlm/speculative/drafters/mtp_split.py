@@ -20,6 +20,7 @@ import mlx.core as mx
 from safetensors import safe_open
 
 from ...fp8 import transform_fp8_weights
+from ...quant_utils import get_quantization_params
 from ...utils import get_model_path
 
 
@@ -219,7 +220,21 @@ class MTPSplitter:
         if not selected:
             raise ValueError(f"No MTP tensors found in {source_path}.")
 
-        selected, _ = transform_fp8_weights(selected, source_config)
+        q_bits = quant_opts.get("q_bits")
+        fp8_target_quantization = None
+        if q_bits is not None:
+            fp8_target_quantization = get_quantization_params(
+                quant_opts.get("q_group_size"), q_bits, "affine"
+            )
+        selected, transformed_quantization = transform_fp8_weights(
+            selected,
+            source_config,
+            target_quantization=fp8_target_quantization,
+        )
+        if transformed_quantization is not None:
+            source_config = dict(source_config)
+            source_config["quantization"] = transformed_quantization
+            source_config["quantization_config"] = transformed_quantization
         weights = self.transform(selected, text_config, source_is_mlx)
         quantization = self.quantization(
             weights, source_config, text_config, quant_opts

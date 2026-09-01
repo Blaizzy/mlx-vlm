@@ -96,6 +96,7 @@ from mlx_vlm.speculative.utils import (
     _speculative_walk_deferred_greedy,
     speculative_prefill_kwargs,
 )
+from mlx_vlm.split_mtp import split_mtp
 from mlx_vlm.turboquant import BatchTurboQuantKVCache
 from mlx_vlm.utils import get_model_and_args
 
@@ -4021,6 +4022,50 @@ def test_split_glm5_next_mtp_extracts_layer_after_target_stack(tmp_path):
         "hnorm.weight",
         "shared_head_norm.weight",
     }
+
+
+def test_split_glm5_next_mtp_honors_requested_quantization_for_fp8(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    text_config = _tiny_glm5_next_text_config()
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "glm5_next",
+                "text_config": text_config.to_dict(),
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "fmt": "e4m3",
+                    "weight_block_size": [128, 128],
+                },
+            }
+        )
+    )
+    prefix = f"model.language_model.layers.{text_config.num_hidden_layers}"
+    mx.save_safetensors(
+        str(source / "model.safetensors"),
+        {
+            f"{prefix}.eh_proj.weight": mx.to_fp8(
+                mx.ones((128, 128), dtype=mx.bfloat16)
+            ),
+            f"{prefix}.eh_proj.weight_scale_inv": mx.full(
+                (1, 1), 0.125, dtype=mx.bfloat16
+            ),
+        },
+    )
+
+    split_mtp(str(source), str(output), q_bits=4, q_group_size=64)
+
+    config = json.loads((output / "config.json").read_text())
+    weights = mx.load(str(output / "model.safetensors"))
+    expected = {"group_size": 64, "bits": 4, "mode": "affine"}
+    assert config["quantization"] == expected
+    assert config["quantization_config"] == expected
+    assert weights["eh_proj.weight"].dtype == mx.uint32
+    assert weights["eh_proj.scales"].dtype == mx.bfloat16
+    assert weights["eh_proj.biases"].dtype == mx.bfloat16
+    assert not any(key.endswith("weight_scale_inv") for key in weights)
 
 
 def test_deepseek_v4_mtp_runtime_block_size_defaults_to_native_nextn_depth():
