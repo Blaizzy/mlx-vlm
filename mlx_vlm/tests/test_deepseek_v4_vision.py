@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 from PIL import Image
 
 from mlx_vlm.models.deepseek_v4.config import ModelConfig
@@ -91,6 +92,13 @@ def tiny_vision_config(**kwargs):
 
 
 class TestDeepseekV4VisionTower(unittest.TestCase):
+    def test_vit_uses_official_ffn_parameter_namespace(self):
+        parameters = dict(tree_flatten(ViT(tiny_vision_config()).parameters()))
+
+        self.assertIn("blocks.0.ffn.w1.weight", parameters)
+        self.assertIn("blocks.0.ffn.w2.weight", parameters)
+        self.assertFalse(any(".mlp." in key for key in parameters))
+
     def test_vit_and_aligner_preserve_published_shapes(self):
         config = tiny_vision_config()
         patches = mx.random.normal((12, 3, 2, 2))

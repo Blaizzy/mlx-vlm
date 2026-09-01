@@ -76,11 +76,11 @@ class Block(nn.Module):
         self.norm1 = nn.RMSNorm(config.vision_dim)
         self.attn = Attention(config)
         self.norm2 = nn.RMSNorm(config.vision_dim)
-        self.mlp = MLP(config)
+        self.ffn = MLP(config)
 
     def __call__(self, x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
         x = x + self.attn(self.norm1(x), cos, sin)
-        return x + self.mlp(self.norm2(x))
+        return x + self.ffn(self.norm2(x))
 
 
 class ViT(nn.Module):
