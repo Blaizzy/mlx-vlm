@@ -284,8 +284,14 @@ def convert(
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
+    fp8_target_quantization = (
+        get_quantization_params(q_group_size, q_bits, q_mode) if quantize else None
+    )
     model, config, processor = fetch_from_hub(
-        model_path, lazy=True, trust_remote_code=trust_remote_code
+        model_path,
+        lazy=True,
+        trust_remote_code=trust_remote_code,
+        fp8_target_quantization=fp8_target_quantization,
     )
 
     model_quant_predicate = getattr(model, "quant_predicate", None)

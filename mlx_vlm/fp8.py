@@ -73,34 +73,40 @@ def _dequantize_fp8_weight(
 
 
 def _quantize_fp8_weight(
-    weight: mx.array, scale_inv: mx.array
-) -> tuple[mx.array, mx.array]:
-    """Convert one block-FP8 tensor to native MLX MXFP8 lazily."""
-    if weight.shape[-1] % MLX_MXFP8_QUANTIZATION["group_size"] != 0:
+    weight: mx.array,
+    scale_inv: mx.array,
+    target_quantization: dict | None = None,
+) -> tuple[mx.array, ...]:
+    """Convert one block-FP8 tensor to a native MLX quantized layout lazily."""
+    target_quantization = target_quantization or MLX_MXFP8_QUANTIZATION
+    group_size = target_quantization["group_size"]
+    if weight.shape[-1] % group_size != 0:
         raise ValueError(
-            "FP8 weight input dimension must be divisible by the MLX "
-            f"MXFP8 group size; got shape={weight.shape}."
+            "FP8 weight input dimension must be divisible by the target "
+            f"group size {group_size}; got shape={weight.shape}."
         )
 
     restored = _dequantize_fp8_weight(weight, scale_inv)
-    quantized = mx.quantize(restored, **MLX_MXFP8_QUANTIZATION)
-    if len(quantized) != 2:
-        raise ValueError("MLX MXFP8 quantization unexpectedly produced biases.")
-    return quantized
+    return mx.quantize(restored, **target_quantization)
 
 
 def transform_fp8_weights(
-    weights: dict[str, mx.array], config: dict
+    weights: dict[str, mx.array],
+    config: dict,
+    target_quantization: dict | None = None,
 ) -> tuple[dict[str, mx.array], dict | None]:
-    """Convert a compatible block-FP8 checkpoint to native MLX MXFP8.
+    """Convert a compatible block-FP8 checkpoint to native MLX quantization.
 
     The source format is detected from configuration rather than model type.
     Unsupported FP8 layouts pass through unchanged for their own loader or
-    sanitizer to handle.
+    sanitizer to handle. By default the target is native MXFP8; callers may
+    request another native MLX quantization layout to avoid an intermediate
+    requantization round trip.
     """
-    quantization = make_quantization_config(config)
-    if quantization is None:
+    source_quantization = make_quantization_config(config)
+    if source_quantization is None:
         return weights, None
+    quantization = dict(target_quantization or source_quantization)
 
     scale_keys = [key for key in weights if key.endswith(".weight_scale_inv")]
     if not scale_keys:
@@ -114,8 +120,12 @@ def transform_fp8_weights(
 
         weight = converted.pop(weight_key)
         scale_inv = converted.pop(scale_key)
-        packed, scales = _quantize_fp8_weight(weight, scale_inv)
+        quantized = _quantize_fp8_weight(weight, scale_inv, quantization)
+        packed, scales = quantized[:2]
         converted[weight_key] = packed
-        converted[weight_key[: -len(".weight")] + ".scales"] = scales
+        prefix = weight_key[: -len(".weight")]
+        converted[prefix + ".scales"] = scales
+        if len(quantized) == 3:
+            converted[prefix + ".biases"] = quantized[2]
 
     return converted, quantization
