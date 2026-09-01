@@ -43,6 +43,10 @@ class DFlashAttention(nn.Module):
         self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
+    def _project_kv(self, x: mx.array):
+        """Project keys and values. Subclasses may share one projection."""
+        return self.k_proj(x), self.v_proj(x)
+
     def __call__(self, x: mx.array, x_ctx: mx.array, rope, cache: KVCache):
         B, L, _ = x.shape
         S = x_ctx.shape[1]
@@ -60,10 +64,8 @@ class DFlashAttention(nn.Module):
 
         # Project context and proposal separately so only context KV
         queries = self.q_proj(x)
-        ctx_keys = self.k_proj(x_ctx)
-        ctx_values = self.v_proj(x_ctx)
-        prop_keys = self.k_proj(x)
-        prop_values = self.v_proj(x)
+        ctx_keys, ctx_values = self._project_kv(x_ctx)
+        prop_keys, prop_values = self._project_kv(x)
         queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(
             0, 2, 1, 3
         )
