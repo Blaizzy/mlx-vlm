@@ -36,3 +36,21 @@ RGB image and prompt. It contains `image_rgb`, `prompt`, `input_ids`,
 `first_token_logits`. Optional scalar `vision_atol`, `vision_rtol`,
 `logits_atol`, and `logits_rtol` values override the default mixed-precision
 tolerances.
+
+To create it, check out the official model repository at the revision recorded
+by the exporter, install `inference/requirements.txt`, and use the official
+`inference/convert.py` to produce a single-rank runtime checkpoint (`MP=1`).
+Then run:
+
+```bash
+python mlx_vlm/tests/export_deepseek_v4_reference.py \
+  --official-inference-dir /path/to/DeepSeek-V4-Flash-Vision-Exp/inference \
+  --checkpoint /path/to/DeepSeek-V4-Flash-Vision-Exp-TP1 \
+  --image /path/to/fixed-image.png \
+  --output /path/to/reference-fixture.npz
+```
+
+The exporter imports DeepSeek's own processor, vision tower, aligner, and model
+from that checkout. It records the source revision, uses the repository's
+actual image-placeholder token, and saves float32 views of BF16 intermediates so
+NumPy can read the fixture without custom dtype support.
