@@ -148,13 +148,24 @@ class Model(nn.Module):
                 "Missing DeepSeek-V4 image metadata: " + ", ".join(missing)
             )
 
+        vision_cache = kwargs.get("vision_cache")
+        image_key = kwargs.get("_image_key")
         image_features = kwargs.get("cached_image_features")
+        if (
+            image_features is None
+            and vision_cache is not None
+            and image_key is not None
+        ):
+            image_features = vision_cache.get(image_key)
         if image_features is None:
             image_features = self._encode_images(
                 pixel_values,
                 kwargs["image_grid_hw"],
                 kwargs["image_permutations"],
             )
+            if vision_cache is not None and image_key is not None:
+                mx.eval(*image_features)
+                vision_cache.put(image_key, image_features)
         inputs_embeds = self._merge_image_embeddings(
             input_ids,
             inputs_embeds,
