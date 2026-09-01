@@ -643,6 +643,126 @@ class TestLlavaNextProcessor(_ProcessorTestBase, unittest.TestCase):
         return {"text": ["<image> Describe"], "images": [_make_image()]}
 
 
+class TestLlavaOnevisionProcessor(_ProcessorTestBase, unittest.TestCase):
+    GRID = [[384, 384], [384, 768], [768, 384], [768, 768], [1536, 1536]]
+
+    def _make_processor(self, tiles=5, image_sizes=((768, 768),)):
+        from mlx_vlm.models.llava_onevision.processing_llava_onevision import (
+            LlavaOnevisionProcessor,
+        )
+
+        image_processor = type(
+            "IP",
+            (),
+            {
+                "model_input_names": ["pixel_values"],
+                "image_grid_pinpoints": self.GRID,
+                "size": {"height": 384, "width": 384},
+                "__call__": lambda self, images=None, **kw: {
+                    "pixel_values": np.random.randn(
+                        len(image_sizes), tiles, 3, 384, 384
+                    ).astype(np.float32),
+                    "image_sizes": [list(size) for size in image_sizes],
+                },
+            },
+        )()
+
+        return LlavaOnevisionProcessor(
+            image_processor=image_processor,
+            tokenizer=_mock_tokenizer(),
+            num_image_tokens=729,
+            vision_aspect_ratio="anyres_max_9",
+            vision_feature_select_strategy="full",
+        )
+
+    def _image_call_args(self):
+        return {"text": ["<image> Describe"], "images": [_make_image()]}
+
+    def test_expands_image_token_to_feature_count(self):
+        processor = self._make_processor()
+        expanded = processor._expand_placeholders(
+            "<image> Describe", iter([[768, 768]]), iter(()), (384, 384)
+        )
+
+        # 2x2 tile grid at 27 patches a side: 729 base + 54 * (54 + 1) newline column.
+        self.assertEqual(expanded.count("<image>"), 729 + 54 * 55)
+
+    def test_expands_video_token_per_frame_plus_newline(self):
+        processor = self._make_processor()
+        frames = 4
+        expanded = processor._expand_placeholders(
+            "<video> Describe",
+            iter(()),
+            iter([np.zeros((frames, 3, 384, 384), dtype=np.float32)]),
+            (384, 384),
+        )
+
+        # 27 patches a side pool to 14, and one newline closes the whole video.
+        self.assertEqual(expanded.count("<video>"), frames * 14 * 14 + 1)
+
+    def test_expands_image_and_video_tokens_in_one_prompt(self):
+        processor = self._make_processor()
+        expanded = processor._expand_placeholders(
+            "<image> and <video>",
+            iter([[384, 384]]),
+            iter([np.zeros((2, 3, 384, 384), dtype=np.float32)]),
+            (384, 384),
+        )
+
+        # A 384x384 image still yields base + one tile: 729 + 27 * (27 + 1).
+        self.assertEqual(expanded.count("<image>"), 729 + 27 * 28)
+        self.assertEqual(expanded.count("<video>"), 2 * 14 * 14 + 1)
+
+    def test_batched_prompts_consume_images_in_order(self):
+        processor = self._make_processor()
+        image_sizes = iter([[768, 768], [384, 384]])
+
+        first = processor._expand_placeholders(
+            "<image> first", image_sizes, iter(()), (384, 384)
+        )
+        second = processor._expand_placeholders(
+            "<image> second", image_sizes, iter(()), (384, 384)
+        )
+
+        # The iterator is shared across the batch, so each prompt gets its own image.
+        self.assertEqual(first.count("<image>"), 729 + 54 * 55)
+        self.assertEqual(second.count("<image>"), 729 + 27 * 28)
+
+    def test_rejects_more_placeholders_than_images(self):
+        processor = self._make_processor()
+        with self.assertRaises(ValueError):
+            processor._expand_placeholders(
+                "<image> <image>", iter([[384, 384]]), iter(()), (384, 384)
+            )
+
+    def test_declares_native_video_support(self):
+        from mlx_vlm.generate.video import processor_handles_video
+
+        self.assertTrue(processor_handles_video(self._make_processor()))
+
+    def test_video_preprocessing_normalizes_frames(self):
+        processor = self._make_processor()
+        frames = np.full((2, 40, 60, 3), 255, dtype=np.uint8)
+
+        pixel_values_videos = processor.video_processor([frames])
+
+        self.assertEqual(pixel_values_videos.shape, (1, 2, 3, 384, 384))
+        # 255 rescales to 1.0 and normalizes to (1 - 0.5) / 0.5 == 1.0
+        self.assertTrue(np.allclose(pixel_values_videos, 1.0, atol=1e-5))
+
+    def test_video_preprocessing_accepts_channels_first_frames(self):
+        processor = self._make_processor()
+        # load_video returns (frames, channels, height, width)
+        frames = np.zeros((2, 3, 40, 60), dtype=np.uint8)
+        frames[:, 0] = 255
+
+        pixel_values_videos = processor.video_processor([frames])
+
+        self.assertEqual(pixel_values_videos.shape, (1, 2, 3, 384, 384))
+        self.assertTrue(np.allclose(pixel_values_videos[:, :, 0], 1.0, atol=1e-5))
+        self.assertTrue(np.allclose(pixel_values_videos[:, :, 1], -1.0, atol=1e-5))
+
+
 class TestPaliGemmaProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
         from mlx_vlm.models.paligemma.processing_paligemma import PaliGemmaProcessor

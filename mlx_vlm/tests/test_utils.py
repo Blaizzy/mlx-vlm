@@ -729,7 +729,33 @@ def test_load_processor_preserves_additional_eos_tokens_on_reset():
     criteria = loaded.tokenizer.stopping_criteria
     assert criteria.eos_token_ids == [2, 3]
     criteria.reset([5])
-    assert criteria.eos_token_ids == [5, 3]
+    assert criteria.eos_token_ids == [5, 2, 3]
+
+
+def test_load_processor_keeps_tokenizer_eos_when_config_eos_differs():
+    # Chandra OCR 2 configures <|endoftext|> (248044) but ends turns with
+    # <|im_end|> (248046), so dropping either token never stops generation.
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=248046))
+
+    class Detokenizer:
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+
+    with (
+        patch(
+            "mlx_vlm.utils.AutoProcessor.from_pretrained",
+            return_value=processor,
+        ),
+        patch("mlx_vlm.utils.load_tokenizer", return_value=Detokenizer),
+    ):
+        loaded = load_processor("unused-model-path", eos_token_ids=248044)
+
+    criteria = loaded.tokenizer.stopping_criteria
+    assert criteria.eos_token_ids == [248044, 248046]
+
+    # generate() resets to the config EOS on every call.
+    criteria.reset(248044)
+    assert criteria.eos_token_ids == [248044, 248046]
 
 
 def test_load_passes_revision():

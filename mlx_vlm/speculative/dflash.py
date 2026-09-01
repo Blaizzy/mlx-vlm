@@ -6,6 +6,7 @@ import mlx.nn as nn
 from .common import (
     _dflash_block_total,
     _record_speculative_round,
+    _requires_uniform_batch_acceptance,
     _speculative_walk,
     _speculative_walk_batch,
     _SpeculativeSamplerRNG,
@@ -498,6 +499,15 @@ def _dflash_rounds_batch(
                 base_positions=[emitted[active_idx[j]] for j in range(n_active)],
             )
             sampler_rng.target_sampled(sync_draft=not positioned_sampling)
+
+        if (
+            n_active > 1
+            and _requires_uniform_batch_acceptance(draft_model, lm)
+            and len(set(accepted_list)) > 1
+        ):
+            uniform = min(len(nt) - 1 for nt in new_tokens_list)
+            new_tokens_list = [nt[: uniform + 1] for nt in new_tokens_list]
+            accepted_list = [uniform] * n_active
 
         min_accepted = min(accepted_list)
         accepted_arr = mx.array(accepted_list)
