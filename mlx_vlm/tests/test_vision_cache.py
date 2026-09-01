@@ -43,6 +43,18 @@ class TestVisionFeatureCache:
         assert cache.get(["img1.jpg", "img2.jpg"]) is not None
         assert cache.get(["img2.jpg", "img1.jpg"]) is None  # order matters
 
+    def test_multi_image_feature_collection(self):
+        cache = VisionFeatureCache()
+        features = [mx.ones((4, 8)), mx.full((6, 8), 2)]
+
+        cache.put(["img1.jpg", "img2.jpg"], features)
+        cached = cache.get(["img1.jpg", "img2.jpg"])
+
+        assert isinstance(cached, list)
+        assert len(cached) == 2
+        assert mx.array_equal(cached[0], features[0])
+        assert mx.array_equal(cached[1], features[1])
+
     def test_url_key(self):
         cache = VisionFeatureCache()
         url = "https://example.com/image.jpg"
