@@ -14249,6 +14249,34 @@ class TestSam3(unittest.TestCase):
         self.assertEqual(cos.shape, (64, 64))
         self.assertEqual(sin.shape, (64, 64))
 
+    def test_sam3_decoder_two_layer_mlps_have_no_output_activation(self):
+        """RefPointHead and BoxRPBEmbed mirror the reference 2-layer MLP.
+
+        The reference applies ReLU only between the layers, so a ReLU on the
+        output would clamp query_pos and the RPB deltas to non-negative values.
+        """
+        from mlx_vlm.models.sam3.decoder import BoxRPBEmbed, RefPointHead
+
+        hidden = 8
+        head = RefPointHead(hidden)
+        head.layer1.weight = mx.zeros((hidden, hidden * 2))
+        head.layer1.bias = mx.ones((hidden,))
+        head.layer2.weight = mx.eye(hidden) * -1.0
+        head.layer2.bias = mx.zeros((hidden,))
+        out = head(mx.zeros((1, 3, hidden * 2)))
+        mx.eval(out)
+        self.assertTrue(float(out.min()) < 0.0)
+        self.assertTrue(mx.allclose(out, -mx.ones_like(out), atol=1e-6).item())
+
+        rpb = BoxRPBEmbed(num_heads=hidden, hidden_size=hidden)
+        rpb.layer1.weight = mx.zeros((hidden, 2))
+        rpb.layer1.bias = mx.ones((hidden,))
+        rpb.layer2.weight = mx.eye(hidden) * -1.0
+        rpb.layer2.bias = mx.zeros((hidden,))
+        out = rpb(mx.zeros((1, 2, 2)))
+        mx.eval(out)
+        self.assertTrue(float(out.min()) < 0.0)
+
     def test_sam3_global_rope_uses_window_scaled_grid(self):
         """Global-attention RoPE keeps the window-sized coordinate stride.
 

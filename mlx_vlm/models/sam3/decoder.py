@@ -130,7 +130,7 @@ class RefPointHead(nn.Module):
         self.layer2 = nn.Linear(hidden_size, hidden_size)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return nn.relu(self.layer2(nn.relu(self.layer1(x))))
+        return self.layer2(nn.relu(self.layer1(x)))
 
 
 class BoxRPBEmbed(nn.Module):
