@@ -58,6 +58,8 @@ class QSAKVCache(KVCache):
         super().__init__()
         self.index_keys = None
         self.index_position_ids = None
+        self.index_block_keys = None
+        self.index_block_ratio = None
 
     def update_indexer(self, keys: mx.array, position_ids: mx.array):
         if self.index_keys is None:
@@ -73,18 +75,43 @@ class QSAKVCache(KVCache):
     @property
     def state(self):
         if self.keys is None:
-            return None, None, self.index_keys, self.index_position_ids
+            return (
+                None,
+                None,
+                self.index_keys,
+                self.index_position_ids,
+                self.index_block_keys,
+                self.index_block_ratio,
+            )
         return (
             self.keys[..., : self.offset, :],
             self.values[..., : self.offset, :],
             self.index_keys,
             self.index_position_ids,
+            self.index_block_keys,
+            self.index_block_ratio,
         )
 
     @state.setter
     def state(self, value):
-        self.keys, self.values, self.index_keys, self.index_position_ids = value
+        if len(value) == 4:
+            self.keys, self.values, self.index_keys, self.index_position_ids = value
+            self.index_block_keys = None
+            self.index_block_ratio = None
+        else:
+            (
+                self.keys,
+                self.values,
+                self.index_keys,
+                self.index_position_ids,
+                self.index_block_keys,
+                self.index_block_ratio,
+            ) = value
         self.offset = 0 if self.keys is None else self.keys.shape[2]
+
+    def clear_index_blocks(self):
+        self.index_block_keys = None
+        self.index_block_ratio = None
 
     def trim(self, n):
         n = min(self.offset, n)
@@ -92,6 +119,7 @@ class QSAKVCache(KVCache):
         if self.index_keys is not None:
             self.index_keys = self.index_keys[:, : self.offset]
             self.index_position_ids = self.index_position_ids[..., : self.offset]
+        self.clear_index_blocks()
         return n
 
     def extract(self, idx):
@@ -110,6 +138,9 @@ class QSAKVCache(KVCache):
                 cache.index_position_ids = mx.contiguous(
                     self.index_position_ids[idx : idx + 1]
                 )
+        if self.index_block_keys is not None:
+            cache.index_block_keys = mx.contiguous(self.index_block_keys[idx : idx + 1])
+            cache.index_block_ratio = self.index_block_ratio
         return cache
 
     def filter(self, batch_indices):
@@ -122,6 +153,8 @@ class QSAKVCache(KVCache):
                 self.index_position_ids = self.index_position_ids[:, batch_indices]
             else:
                 self.index_position_ids = self.index_position_ids[batch_indices]
+        if self.index_block_keys is not None:
+            self.index_block_keys = self.index_block_keys[batch_indices]
 
     def to_batch(self, left_padding):
         """Convert a singleton QSA cache, including its indexer state."""
@@ -163,6 +196,9 @@ class QSAKVCache(KVCache):
             batch.index_keys = index_keys
             batch.index_position_ids = positions
             batch.index_offset = index_keys.shape[1]
+        if pad == 0 and self.index_block_keys is not None:
+            batch.index_block_keys = self.index_block_keys
+            batch.index_block_ratio = self.index_block_ratio
         return batch
 
     @classmethod
@@ -180,6 +216,8 @@ class QSAKVCache(KVCache):
         cache.offset = base.offset
         cache.index_keys = self.index_keys
         cache.index_position_ids = self.index_position_ids
+        cache.index_block_keys = self.index_block_keys
+        cache.index_block_ratio = self.index_block_ratio
         return cache
 
     @property
@@ -187,6 +225,8 @@ class QSAKVCache(KVCache):
         size = super().nbytes
         if self.index_keys is not None:
             size += self.index_keys.nbytes + self.index_position_ids.nbytes
+        if self.index_block_keys is not None:
+            size += self.index_block_keys.nbytes
         return size
 
 
@@ -200,6 +240,12 @@ class BatchQSAKVCache:
         self.index_keys = None
         self.index_position_ids = None
         self.index_offset = 0
+        self.index_block_keys = None
+        self.index_block_ratio = None
+
+    def clear_index_blocks(self):
+        self.index_block_keys = None
+        self.index_block_ratio = None
 
     @property
     def offset(self):
@@ -239,6 +285,9 @@ class BatchQSAKVCache:
         return self.index_keys, self.index_position_ids
 
     def prepare(self, **kwargs):
+        right_padding = kwargs.get("right_padding")
+        if right_padding is not None and any(int(x) for x in right_padding):
+            self.clear_index_blocks()
         self.kv_cache.prepare(**kwargs)
 
     def finalize(self):
@@ -246,6 +295,7 @@ class BatchQSAKVCache:
         self.kv_cache.finalize()
         if right_padding is None or self.index_keys is None:
             return
+        self.clear_index_blocks()
         self.index_keys = dynamic_roll(self.index_keys, right_padding, axis=1)
         if self.index_position_ids.ndim == 3:
             self.index_position_ids = dynamic_roll(
@@ -262,6 +312,7 @@ class BatchQSAKVCache:
     def filter(self, batch_indices):
         min_left = int(self.left_padding[batch_indices].min().item())
         self.kv_cache.filter(batch_indices)
+        self.clear_index_blocks()
         if self.index_keys is None:
             return
         self.index_keys = self.index_keys[batch_indices]
@@ -345,6 +396,7 @@ class BatchQSAKVCache:
             left = self._pad_index(self, target, sample_keys, sample_positions)
             right = self._pad_index(other, target, sample_keys, sample_positions)
         self.kv_cache.extend(other.kv_cache)
+        self.clear_index_blocks()
         if sample_keys is not None:
             self.index_keys = mx.concatenate([left[0], right[0]], axis=0)
             position_axis = 1 if sample_positions.ndim == 3 else 0
@@ -377,6 +429,11 @@ class BatchQSAKVCache:
                 cache.index_position_ids = mx.contiguous(
                     self.index_position_ids[idx : idx + 1, padding : self.index_offset]
                 )
+            if padding == 0 and self.index_block_keys is not None:
+                cache.index_block_keys = mx.contiguous(
+                    self.index_block_keys[idx : idx + 1]
+                )
+                cache.index_block_ratio = self.index_block_ratio
         return cache
 
     @classmethod
@@ -417,6 +474,16 @@ class BatchQSAKVCache:
             [row[1] for row in rows], axis=position_axis
         )
         out.index_offset = target
+        summaries = [cache.index_block_keys for cache in caches]
+        ratios = [cache.index_block_ratio for cache in caches]
+        if (
+            all(summary is not None for summary in summaries)
+            and len(set(ratios)) == 1
+            and len({cache.offset for cache in caches}) == 1
+            and len({summary.shape[2] for summary in summaries}) == 1
+        ):
+            out.index_block_keys = mx.concatenate(summaries, axis=0)
+            out.index_block_ratio = ratios[0]
         return out
 
     def size(self):
@@ -431,6 +498,7 @@ class BatchQSAKVCache:
     def trim(self, n):
         trimmed = self.kv_cache.trim(n)
         self.index_offset = max(0, self.index_offset - trimmed)
+        self.clear_index_blocks()
         return trimmed
 
     @property
@@ -452,11 +520,24 @@ class BatchQSAKVCache:
                 if self.index_position_ids is None
                 else self.index_position_ids[..., : self.index_offset]
             ),
+            self.index_block_keys,
+            self.index_block_ratio,
         )
 
     @state.setter
     def state(self, value):
-        kv_state, self.index_keys, self.index_position_ids = value
+        if len(value) == 3:
+            kv_state, self.index_keys, self.index_position_ids = value
+            self.index_block_keys = None
+            self.index_block_ratio = None
+        else:
+            (
+                kv_state,
+                self.index_keys,
+                self.index_position_ids,
+                self.index_block_keys,
+                self.index_block_ratio,
+            ) = value
         left_padding = (
             [0]
             if kv_state is None or len(kv_state) < 4 or kv_state[3] is None
@@ -491,6 +572,8 @@ class BatchQSAKVCache:
         extra = 0
         if self.index_keys is not None:
             extra = self.index_keys.nbytes + self.index_position_ids.nbytes
+        if self.index_block_keys is not None:
+            extra += self.index_block_keys.nbytes
         return self.kv_cache.nbytes + extra
 
 
@@ -503,6 +586,8 @@ class QSAQuantizedKVCache(QuantizedKVCache):
         super().__init__(group_size=group_size, bits=bits)
         self.index_keys = None
         self.index_position_ids = None
+        self.index_block_keys = None
+        self.index_block_ratio = None
 
     def update_indexer(self, keys: mx.array, position_ids: mx.array):
         if self.index_keys is None:
@@ -521,12 +606,35 @@ class QSAQuantizedKVCache(QuantizedKVCache):
             keys, values = None, None
         else:
             keys, values = super().state
-        return keys, values, self.index_keys, self.index_position_ids
+        return (
+            keys,
+            values,
+            self.index_keys,
+            self.index_position_ids,
+            self.index_block_keys,
+            self.index_block_ratio,
+        )
 
     @state.setter
     def state(self, value):
-        self.keys, self.values, self.index_keys, self.index_position_ids = value
+        if len(value) == 4:
+            self.keys, self.values, self.index_keys, self.index_position_ids = value
+            self.index_block_keys = None
+            self.index_block_ratio = None
+        else:
+            (
+                self.keys,
+                self.values,
+                self.index_keys,
+                self.index_position_ids,
+                self.index_block_keys,
+                self.index_block_ratio,
+            ) = value
         self.offset = 0 if self.keys is None else self.keys[0].shape[2]
+
+    def clear_index_blocks(self):
+        self.index_block_keys = None
+        self.index_block_ratio = None
 
     def trim(self, n):
         n = min(self.offset, n)
@@ -534,6 +642,7 @@ class QSAQuantizedKVCache(QuantizedKVCache):
         if self.index_keys is not None:
             self.index_keys = self.index_keys[:, : self.offset]
             self.index_position_ids = self.index_position_ids[..., : self.offset]
+        self.clear_index_blocks()
         return n
 
     def extract(self, idx):
@@ -552,6 +661,9 @@ class QSAQuantizedKVCache(QuantizedKVCache):
                 cache.index_position_ids = mx.contiguous(
                     self.index_position_ids[idx : idx + 1]
                 )
+        if self.index_block_keys is not None:
+            cache.index_block_keys = mx.contiguous(self.index_block_keys[idx : idx + 1])
+            cache.index_block_ratio = self.index_block_ratio
         return cache
 
     def filter(self, batch_indices):
@@ -564,12 +676,16 @@ class QSAQuantizedKVCache(QuantizedKVCache):
                 self.index_position_ids = self.index_position_ids[:, batch_indices]
             else:
                 self.index_position_ids = self.index_position_ids[batch_indices]
+        if self.index_block_keys is not None:
+            self.index_block_keys = self.index_block_keys[batch_indices]
 
     @property
     def nbytes(self):
         size = 0 if self.keys is None else super().nbytes
         if self.index_keys is not None:
             size += self.index_keys.nbytes + self.index_position_ids.nbytes
+        if self.index_block_keys is not None:
+            size += self.index_block_keys.nbytes
         return size
 
 
@@ -716,12 +832,32 @@ class Qwen4ExpQSAIndexer(nn.Module):
 
         block_ids = mx.arange(max_complete_blocks, dtype=mx.int32)
         block_starts = left_padding[:, None] + block_ids[None] * self.compress_ratio
+        cached_block_keys = getattr(cache, "index_block_keys", None)
+        cached_block_ratio = getattr(cache, "index_block_ratio", None)
+        can_reuse_blocks = (
+            zero_padding
+            and isinstance(cached_block_keys, mx.array)
+            and cached_block_keys.ndim == 4
+            and cached_block_keys.shape[0] == batch
+            and cached_block_keys.shape[1] == 1
+            and cached_block_keys.shape[-1] == self.head_dim
+            and cached_block_keys.shape[2] <= max_complete_blocks
+            and cached_block_ratio == self.compress_ratio
+        )
+        first_new_block = cached_block_keys.shape[2] if can_reuse_blocks else 0
+        new_block_ids = mx.arange(first_new_block, max_complete_blocks, dtype=mx.int32)
         if zero_padding:
             # Use a reshape/view for batches without left padding to avoid
-            # gathering the full key history.
+            # gathering the full key history. Retain already normalized and
+            # rotated complete blocks on the cache, so each subsequent prefill
+            # chunk only summarizes newly completed blocks.
+            new_token_start = first_new_block * self.compress_ratio
             complete_key_len = max_complete_blocks * self.compress_ratio
-            pooled_keys = raw_keys[:, :complete_key_len].reshape(
-                batch, max_complete_blocks, self.compress_ratio, self.head_dim
+            pooled_keys = raw_keys[:, new_token_start:complete_key_len].reshape(
+                batch,
+                max_complete_blocks - first_new_block,
+                self.compress_ratio,
+                self.head_dim,
             )
         else:
             # Compressed blocks group the tokens visible to each row. With
@@ -740,30 +876,46 @@ class Qwen4ExpQSAIndexer(nn.Module):
             pooled_keys = pooled_keys.reshape(
                 batch, max_complete_blocks, self.compress_ratio, self.head_dim
             )
-        pooled_keys = mx.expand_dims(
-            self.k_layernorm(
-                mx.mean(pooled_keys.astype(mx.float32), axis=2).astype(raw_keys.dtype)
-            ),
-            axis=1,
-        )
-
-        if zero_padding:
-            block_position_ids = full_position_ids[..., block_ids * self.compress_ratio]
-        elif full_position_ids.ndim == 3:
-            safe_block_starts = mx.minimum(block_starts, key_len - 1)
-            position_indices = mx.broadcast_to(
-                safe_block_starts[None],
-                (full_position_ids.shape[0], *safe_block_starts.shape),
+        if max_complete_blocks > first_new_block:
+            pooled_keys = mx.expand_dims(
+                self.k_layernorm(
+                    mx.mean(pooled_keys.astype(mx.float32), axis=2).astype(
+                        raw_keys.dtype
+                    )
+                ),
+                axis=1,
             )
-            block_position_ids = mx.take_along_axis(
-                full_position_ids, position_indices, axis=2
-            )
+            if zero_padding:
+                block_position_ids = full_position_ids[
+                    ..., new_block_ids * self.compress_ratio
+                ]
+            elif full_position_ids.ndim == 3:
+                safe_block_starts = mx.minimum(block_starts, key_len - 1)
+                position_indices = mx.broadcast_to(
+                    safe_block_starts[None],
+                    (full_position_ids.shape[0], *safe_block_starts.shape),
+                )
+                block_position_ids = mx.take_along_axis(
+                    full_position_ids, position_indices, axis=2
+                )
+            else:
+                safe_block_starts = mx.minimum(block_starts, key_len - 1)
+                block_position_ids = mx.take_along_axis(
+                    full_position_ids, safe_block_starts, axis=1
+                )
+            pooled_keys = self._apply_rope(pooled_keys, block_position_ids)
+            if can_reuse_blocks and first_new_block > 0:
+                pooled_keys = mx.concatenate([cached_block_keys, pooled_keys], axis=2)
         else:
-            safe_block_starts = mx.minimum(block_starts, key_len - 1)
-            block_position_ids = mx.take_along_axis(
-                full_position_ids, safe_block_starts, axis=1
-            )
-        pooled_keys = self._apply_rope(pooled_keys, block_position_ids)
+            pooled_keys = cached_block_keys
+
+        if zero_padding and cache is not None:
+            cache.index_block_keys = pooled_keys
+            cache.index_block_ratio = self.compress_ratio
+        elif cache is not None:
+            clear_index_blocks = getattr(cache, "clear_index_blocks", None)
+            if callable(clear_index_blocks):
+                clear_index_blocks()
 
         # Score in float32, as the reference does: which blocks win is a discrete
         # choice, and rounding the products flips the ones near the cut-off.

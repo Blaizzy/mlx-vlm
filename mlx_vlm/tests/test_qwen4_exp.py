@@ -324,6 +324,46 @@ class Qwen4ExpTests(unittest.TestCase):
                 ).item()
             )
 
+    def test_qsa_indexer_incremental_blocks_survive_checkpoint_round_trip(self):
+        mx.random.seed(31)
+        model = qwen4_exp.Model(tiny_config())
+        indexer = model.language_model.model.layers[1].self_attn.indexer
+        qk = mx.random.normal((1, 14, 24))
+        positions = mx.arange(14, dtype=mx.int32)[None]
+
+        cache = QSAKVCache()
+        indexer.from_projected(qk[:, :10], cache, positions[:, :10])
+        cache.update_and_fetch(mx.zeros((1, 2, 10, 8)), mx.zeros((1, 2, 10, 8)))
+        mx.eval(cache.state)
+
+        self.assertEqual(cache.index_block_ratio, 2)
+        self.assertEqual(cache.index_block_keys.shape, (1, 1, 5, 8))
+
+        restored = QSAKVCache()
+        restored.state = cache.state
+        incremental_mask = indexer.from_projected(
+            qk[:, 10:], restored, positions[:, 10:]
+        )
+
+        cold_cache = QSAKVCache()
+        cold_mask = indexer.from_projected(qk, cold_cache, positions)
+        mx.eval(incremental_mask, cold_mask, restored.index_block_keys)
+
+        self.assertTrue(mx.array_equal(incremental_mask, cold_mask[:, :, 10:]).item())
+        self.assertEqual(restored.index_block_keys.shape, (1, 1, 7, 8))
+
+        batch = QSAKVCache.merge([restored])
+        extracted = batch.extract(0)
+        mx.eval(extracted.state)
+        self.assertEqual(extracted.index_block_ratio, 2)
+        self.assertTrue(
+            mx.array_equal(extracted.index_block_keys, restored.index_block_keys).item()
+        )
+
+        extracted.trim(1)
+        self.assertIsNone(extracted.index_block_keys)
+        self.assertIsNone(extracted.index_block_ratio)
+
     def test_chunked_ragged_prefill_handles_an_all_padding_row_chunk(self):
         mx.random.seed(29)
         model = qwen4_exp.Model(tiny_config())
