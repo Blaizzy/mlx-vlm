@@ -393,6 +393,16 @@ _TARGET_VERIFY_MXFP4_QARGMAX_SOURCE = _TARGET_VERIFY_MXFP4_QMV_SOURCE.replace(
     }""",
 )
 
+_TARGET_VERIFY_MASKED_MXFP4_QARGMAX_SOURCE = _TARGET_VERIFY_MXFP4_QARGMAX_SOURCE.replace(
+    "if (n < N_SIZE && rounded > best_value) {",
+    """if (
+          n < N_SIZE &&
+          ((as_type<uint>(mask[
+                (int(b_idx) * VERIFY_T + t) * mask_shape[1] + (n >> 5)]) >>
+            (n & 31)) & 1u) != 0u &&
+          rounded > best_value) {""",
+)
+
 
 _TARGET_VERIFY_QARGMAX_SOURCE = r"""
     uint n_tile = threadgroup_position_in_grid.y;
@@ -976,6 +986,21 @@ def _target_verify_mxfp4_qargmax_kernel(dtype, verify_t, k_size, n_size):
 
 
 @lru_cache(maxsize=None)
+def _target_verify_masked_mxfp4_qargmax_kernel(dtype, verify_t, k_size, n_size):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=(
+            "qwen3_5_target_verify_masked_mxfp4_qargmax_"
+            f"t{verify_t}_k{k_size}_n{n_size}_{dtype_name}"
+        ),
+        input_names=["x", "w", "scales", "mask"],
+        output_names=["tile_values", "tile_indices"],
+        header=_TARGET_VERIFY_MXFP4_HEADER,
+        source=_TARGET_VERIFY_MASKED_MXFP4_QARGMAX_SOURCE,
+    )
+
+
+@lru_cache(maxsize=None)
 def _target_verify_qargmax_kernel(bits, group_size, dtype, verify_t, k_size, n_size):
     dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     return mx.fast.metal_kernel(
@@ -1186,22 +1211,29 @@ def _can_target_verify_quantized_head(linear) -> bool:
     return K % 512 == 0 and N % 8 == 0
 
 
-def _can_target_verify_mxfp4(linear, x: mx.array) -> bool:
+def _can_target_verify_mxfp4_head(linear) -> bool:
     if (
         not isinstance(linear, nn.QuantizedLinear)
         or linear.mode != "mxfp4"
         or linear.bits != 4
         or linear.group_size != 32
         or linear.biases is not None
-        or x.ndim != 3
-        or not 1 < x.shape[1] <= 4
-        or x.dtype not in (mx.bfloat16, mx.float16)
     ):
         return False
 
     K = linear.weight.shape[1] * 32 // linear.bits
     N = linear.weight.shape[0]
-    return x.shape[-1] == K and K % 512 == 0 and N % 8 == 0
+    return K % 512 == 0 and N % 8 == 0
+
+
+def _can_target_verify_mxfp4(linear, x: mx.array) -> bool:
+    return (
+        _can_target_verify_mxfp4_head(linear)
+        and x.ndim == 3
+        and 1 <= x.shape[1] <= 4
+        and x.dtype in (mx.bfloat16, mx.float16)
+        and x.shape[-1] == linear.weight.shape[1] * 32 // linear.bits
+    )
 
 
 def _target_verify_mxfp4_linear(linear, x: mx.array) -> Optional[mx.array]:
@@ -1230,7 +1262,9 @@ def _target_verify_mxfp4_linear(linear, x: mx.array) -> Optional[mx.array]:
     return out
 
 
-def _target_verify_mxfp4_argmax(linear, x: mx.array) -> Optional[mx.array]:
+def _target_verify_mxfp4_argmax(
+    linear, x: mx.array, token_mask: Optional[mx.array] = None
+) -> Optional[mx.array]:
     if not _can_target_verify_mxfp4(linear, x):
         return None
 
@@ -1238,9 +1272,27 @@ def _target_verify_mxfp4_argmax(linear, x: mx.array) -> Optional[mx.array]:
     N = linear.weight.shape[0]
     num_tiles = N // 8
     x = mx.contiguous(x)
-    kernel = _target_verify_mxfp4_qargmax_kernel(x.dtype, T, K, N)
+    kernel_factory = (
+        _target_verify_masked_mxfp4_qargmax_kernel
+        if token_mask is not None
+        else _target_verify_mxfp4_qargmax_kernel
+    )
+    kernel = kernel_factory(x.dtype, T, K, N)
+    inputs = [x, linear.weight, linear.scales]
+    if token_mask is not None:
+        if token_mask.ndim == 1:
+            token_mask = token_mask[None, :]
+        if (
+            token_mask.dtype != mx.int32
+            or token_mask.shape[0] != B * T
+            or token_mask.shape[1] < (N + 31) // 32
+        ):
+            raise ValueError(
+                "packed token mask must be int32 with one complete row per token"
+            )
+        inputs.append(token_mask)
     tile_values, tile_indices = kernel(
-        inputs=[x, linear.weight, linear.scales],
+        inputs=inputs,
         template=[
             ("T", x.dtype),
             ("VERIFY_T", int(T)),
@@ -1603,14 +1655,15 @@ class Qwen3_5ExactSpeculativeVerifier:
         x: mx.array,
         token_mask: Optional[mx.array] = None,
     ) -> Optional[mx.array]:
-        if token_mask is None:
-            out = _target_verify_mxfp4_argmax(linear, x)
-            if out is not None:
-                return out
+        out = _target_verify_mxfp4_argmax(linear, x, token_mask=token_mask)
+        if out is not None:
+            return out
         return _target_verify_quantized_argmax(linear, x, token_mask=token_mask)
 
     def can_quantized_head(self, linear) -> bool:
-        return _can_target_verify_quantized_head(linear)
+        return _can_target_verify_mxfp4_head(
+            linear
+        ) or _can_target_verify_quantized_head(linear)
 
     def pad_token_mask(self, token_mask: mx.array, n_size: int) -> mx.array:
         return _pad_token_mask_to_head(token_mask, n_size)
