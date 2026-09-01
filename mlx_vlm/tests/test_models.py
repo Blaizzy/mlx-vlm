@@ -14249,6 +14249,42 @@ class TestSam3(unittest.TestCase):
         self.assertEqual(cos.shape, (64, 64))
         self.assertEqual(sin.shape, (64, 64))
 
+    def test_sam3_global_rope_uses_window_scaled_grid(self):
+        """Global-attention RoPE keeps the window-sized coordinate stride.
+
+        HF derives ``rotary_scale = window_size / rotary_input_size[0]``, which is
+        1.0 for windowed blocks and ``window_size / feat_size`` for global ones.
+        Dropping it makes global-block positions advance too fast.
+        """
+        from mlx_vlm.models.sam3.position import compute_axial_cis
+
+        dim, feat_size, window_size = 64, 6, 2
+        scale = window_size / feat_size
+
+        scaled_cos, scaled_sin = compute_axial_cis(
+            dim, feat_size, feat_size, scale=scale
+        )
+        unit_cos, unit_sin = compute_axial_cis(dim, feat_size, feat_size)
+
+        default_cos, default_sin = compute_axial_cis(
+            dim, feat_size, feat_size, scale=1.0
+        )
+        self.assertTrue(mx.array_equal(default_cos, unit_cos).item())
+        self.assertTrue(mx.array_equal(default_sin, unit_sin).item())
+
+        self.assertFalse(mx.allclose(scaled_cos, unit_cos, atol=1e-6).item())
+
+        freqs = 1.0 / (10000.0 ** (mx.arange(0, dim, 4).astype(mx.float32) / dim))
+        flat = mx.arange(feat_size * feat_size)
+        xs = (flat % feat_size).astype(mx.float32) * scale
+        ys = (flat // feat_size).astype(mx.float32) * scale
+        angles = mx.concatenate(
+            [xs[:, None] * freqs[None, :], ys[:, None] * freqs[None, :]], axis=-1
+        )
+        angles = mx.stack([angles, angles], axis=-1).reshape(angles.shape[0], -1)
+        self.assertTrue(mx.allclose(scaled_cos, mx.cos(angles), atol=1e-6).item())
+        self.assertTrue(mx.allclose(scaled_sin, mx.sin(angles), atol=1e-6).item())
+
 
 class TestRTDetrV2(unittest.TestCase):
     def test_config_from_dict(self):
