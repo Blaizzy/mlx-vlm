@@ -16,7 +16,7 @@ class TextConfig:
 class Glm5NextMTPConfig(BaseModelConfig):
     model_type: str = "glm5_next_mtp"
     text_config: Optional[object] = None
-    block_size: int = 2
+    block_size: int = 3
     tie_word_embeddings: bool = False
 
     def __post_init__(self):
@@ -31,9 +31,8 @@ class Glm5NextMTPConfig(BaseModelConfig):
     def from_dict(cls, params: dict) -> "Glm5NextMTPConfig":
         flat = dict(params)
         text_config = flat.get("text_config") or {}
-        # GLM-5-Next ships a single nextn layer -> default to proposing one token.
         depth = text_config.get("num_nextn_predict_layers", 1)
-        flat.setdefault("block_size", int(depth) + 1)
+        flat["block_size"] = max(int(flat.get("block_size", 0)), int(depth) + 2)
         sig = inspect.signature(cls).parameters
         return cls(**{k: v for k, v in flat.items() if k in sig})
 

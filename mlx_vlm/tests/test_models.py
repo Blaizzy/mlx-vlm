@@ -3481,6 +3481,22 @@ class TestModels(unittest.TestCase):
         vlogits = lm.speculative_logits_from_hidden(vout.hidden_states[-1])
         self.assertLess(float(mx.max(mx.abs(plain - vlogits))), 1e-2)
 
+        dense_config = self._glm5_next_mtp_text_config()
+        dense_config.index_topk = 32
+        dense_lm = LanguageModel(dense_config)
+        dense_lm.eval()
+        mx.eval(dense_lm.parameters())
+        dense_plain_cache = dense_lm.make_cache()
+        dense_lm(prompt, cache=dense_plain_cache)
+        dense_plain = dense_lm(block, cache=dense_plain_cache).logits
+        dense_verify_cache = dense_lm.make_cache()
+        dense_lm(prompt, cache=dense_verify_cache)
+        dense_hidden, _, _ = dense_lm.speculative_verify_hidden(
+            block, dense_verify_cache
+        )
+        dense_logits = dense_lm.speculative_logits_from_hidden(dense_hidden)
+        self.assertLess(float(mx.max(mx.abs(dense_plain - dense_logits))), 1e-2)
+
         # (b) rollback the verify cache to `accepted`; compare to a plain forward of the
         # kept prefix only.
         cref = lm.make_cache()
@@ -3571,6 +3587,63 @@ class TestModels(unittest.TestCase):
             greedy=True,
         )
 
+        prompt = mx.array([[2, 4, 6, 8, 10, 12, 14]])
+        out = lm(
+            prompt,
+            cache=lm.make_cache(),
+            capture_layer_ids=[],
+            return_hidden=True,
+            return_shared_kv=True,
+        )
+        hidden = out.hidden_states[-1]
+        bonus = int(mx.argmax(out.logits[:, -1, :]).item())
+        drafter.reset(lm)
+        drafter.prefill_from_target_hidden(prompt, hidden, bonus, sampler, greedy=True)
+        draft = drafter.draft_block(
+            bonus, hidden[:, -1:, :], None, 3, sampler, greedy=True
+        )
+        drafter.accept_verified_tokens(
+            mx.broadcast_to(hidden[:, -1:, :], (1, 3, hidden.shape[-1])),
+            draft,
+            0,
+            [bonus],
+            sampler,
+            greedy=True,
+        )
+        drafter.draft_block(bonus, hidden[:, -1:, :], None, 3, sampler, greedy=True)
+        side_cache = drafter._cache[0]
+        self.assertEqual(side_cache[1]._pool[3], side_cache[0].offset)
+
+        parsed = ModelConfig.from_dict(
+            {
+                "block_size": 2,
+                "text_config": vars(tcfg),
+            }
+        )
+        self.assertEqual(parsed.block_size, 3)
+
+    def test_glm5_next_mtp_ffn_compile_matches_eager(self):
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.models.glm5_next.mtp import Glm5NextMTP
+
+        mx.random.seed(0)
+        mtp = Glm5NextMTP(self._glm5_next_mtp_text_config())
+        mtp.eval()
+        mx.eval(mtp.parameters())
+        hidden = mx.random.normal((1, 1, mtp.eh_proj.weight.shape[-1] // 2))
+        embed = mx.random.normal((1, 1, hidden.shape[-1]))
+        outputs = {}
+        for enabled in (False, True):
+            mtp.compile_ffn = enabled
+            mtp._ffn_c = None
+            outputs[enabled] = mtp(
+                hidden,
+                embed,
+                cache=CacheList(KVCache(), KVCache()),
+            )
+        mx.eval(outputs)
+        self.assertLess(float(mx.max(mx.abs(outputs[True] - outputs[False]))), 1e-3)
+
     def test_glm5_next_mtp_never_lose_gate(self):
         # The never-lose gate has two parts: (1) the drafter yields an empty block at
         # block_size<=1 so the orchestrator can run a plain decode step, and (2) the
@@ -3622,7 +3695,7 @@ class TestModels(unittest.TestCase):
             def add_eos_token_ids(self, _tokens):
                 return None
 
-        def generate(target, prompts, max_tokens, drafter=None):
+        def generate(target, prompts, max_tokens, drafter=None, prefill_step_size=None):
             processor = SimpleNamespace(
                 tokenizer=SimpleNamespace(stopping_criteria=NeverStop())
             )
@@ -3631,7 +3704,7 @@ class TestModels(unittest.TestCase):
                 processor,
                 prefill_batch_size=2,
                 completion_batch_size=2,
-                prefill_step_size=None,
+                prefill_step_size=prefill_step_size,
                 draft_model=drafter,
                 draft_kind="mtp" if drafter is not None else None,
                 draft_block_size=2,
@@ -3679,6 +3752,27 @@ class TestModels(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual([len(row) for row in actual], max_tokens)
         self.assertIn(0, drafter.accept_lens)
+
+        single_prompt = [prompts[0]]
+        single_max_tokens = [max_tokens[0]]
+        expected = generate(
+            target,
+            single_prompt,
+            single_max_tokens,
+            prefill_step_size=2,
+        )
+        drafter = Model(ModelConfig(text_config=config, block_size=3))
+        drafter.eval()
+        mx.eval(drafter.parameters())
+        actual = generate(
+            target,
+            single_prompt,
+            single_max_tokens,
+            drafter=drafter,
+            prefill_step_size=2,
+        )
+        self.assertEqual(actual, expected)
+        self.assertGreater(drafter._cache[0][0].offset, len(single_prompt[0]))
 
     def test_glm5_next_swiglu_clamp(self):
         # The text stack must apply config.swiglu_limit (reference clamps every text MLP);

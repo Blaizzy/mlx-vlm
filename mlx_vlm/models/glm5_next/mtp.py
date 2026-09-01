@@ -24,6 +24,8 @@ class Glm5NextMTP(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(h, eps=config.rms_norm_eps)
         self.mlp = Glm5NextMoE(config)
         self.shared_head_norm = nn.RMSNorm(h, eps=config.rms_norm_eps)
+        self.compile_ffn = True
+        self._ffn_c = None
 
     def __call__(
         self,
@@ -36,8 +38,16 @@ class Glm5NextMTP(nn.Module):
             mx.concatenate([self.enorm(next_embed), self.hnorm(hidden)], axis=-1)
         )
         x = x + self.self_attn(self.input_layernorm(x), mask, cache)
-        x = x + self.mlp(self.post_attention_layernorm(x))
+        if self.compile_ffn and x.shape[0] == 1 and x.shape[1] <= 8:
+            if self._ffn_c is None:
+                self._ffn_c = mx.compile(self._ffn_block)
+            x = x + self._ffn_c(x)
+        else:
+            x = x + self._ffn_block(x)
         return self.shared_head_norm(x)
+
+    def _ffn_block(self, x: mx.array) -> mx.array:
+        return self.mlp(self.post_attention_layernorm(x))
 
 
 def load_mtp_weights(config: TextConfig, weights: dict, layer_idx: int = 45) -> dict:

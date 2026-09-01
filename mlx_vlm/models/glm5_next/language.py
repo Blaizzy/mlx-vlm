@@ -76,9 +76,6 @@ def recurrent_kimi_delta(
     beta: mx.array,
     state: Optional[mx.array] = None,
 ):
-    # Reference O(S) recurrence for Kimi Delta Attention, kept as the readable
-    # spec and the equivalence oracle for tests. The forward path runs this on
-    # the shared fused gated_delta kernel (see Glm5NextLinearAttention).
     dt = query.dtype
     query = _l2norm(query.astype(mx.float32))
     key = _l2norm(key.astype(mx.float32))
@@ -142,11 +139,6 @@ class Glm5NextLinearAttention(nn.Module):
         self._fused_ready = False
 
     def _fused_in_proj(self, inputs):
-        # q,k,v,f_a,g_a,b all take `inputs`; fuse into one matmul via a lossless
-        # output-axis concat of the (quantized) weights, built once and cached.
-        # Returns ``None`` (and disables fusion) if the six projections do not share a
-        # single quantization -- a mixed-precision conversion would otherwise dequantize
-        # five of them with mods[0]'s group_size/bits.
         if not self._fused_ready:
             mods = [
                 self.q_proj,
@@ -242,10 +234,6 @@ class Glm5NextLinearAttention(nn.Module):
         dt_bias = fg.dt_bias.reshape(self.num_heads, self.head_dim)
         lower_bound = fg.safe_gate_lower_bound
         if gdn_sink is not None:
-            # Speculative verify: run the fast kernel (no per-step capture) and stash the
-            # block inputs + entry state, so a rejected round can be replayed to the
-            # accepted token with the kernel in rollback_speculative_cache -- far cheaper
-            # than a per-step ops loop on the hot verify path.
             gdn_sink.append(
                 (
                     q,
@@ -364,8 +352,6 @@ class Glm5NextIndexer(nn.Module):
         else:
             valid_cur = mx.ones((B, S), dtype=mx.bool_)
 
-        # Pack per-token state and append to the indexer cache so pooling/selection
-        # run over the full cached sequence -- unifies prefill and incremental decode.
         packed = mx.concatenate(
             [k, gate_scores, valid_cur.astype(k.dtype)[..., None]], axis=-1
         )
@@ -375,10 +361,6 @@ class Glm5NextIndexer(nn.Module):
         else:
             packed_full = packed
         T = packed_full.shape[1]
-        # Short-context bypass: when the whole cache fits within index_topk the indexer
-        # would select every token, so skip the O(T) pooling/scoring/topk and let the
-        # DSA fall through to dense MLA. The cache is already updated above so state
-        # stays consistent; the full pool is rebuilt once when T first exceeds index_topk.
         if getattr(self, "bypass_short", True) and T <= self.index_topk:
             return None
         k_full, gate_full, valid_ch = mx.split(
@@ -390,14 +372,6 @@ class Glm5NextIndexer(nn.Module):
         kv_len = T
         kv_pos = mx.arange(T)
 
-        # Incremental pooling at decode: complete pools are stable across steps, so
-        # recompute only the suffix (last partial pool + any new pool) and reuse the
-        # cached complete pools -- turns the per-step pool cost from O(T) to O(kpool).
-        # Exact; falls back to full pooling on prefill, when padding is present, or when
-        # the cached pool's batch axis no longer matches the current batch. That last
-        # guard matters under continuous batching: BatchGenerator grows/shrinks the
-        # batch (extend/filter) on the batch axis but does not carry this per-cache
-        # _pool along, so a stale _pool must be discarded and rebuilt for one step.
         if (
             S == 1
             and cache is not None
@@ -430,9 +404,6 @@ class Glm5NextIndexer(nn.Module):
         tail_on = self.index_kpool_always_select_tail and self.index_kpool > 1
         output_width = self.index_topk + (self.index_kpool - 1 if tail_on else 0)
 
-        # Chunk over the query dimension. A one-shot prefill otherwise materializes
-        # [B, S, n_heads, P] scores (O(S*P)) and OOMs at long context; chunking bounds
-        # peak to O(chunk*P). Decode (S=1) is a single chunk -> identical to before.
         chunk = 512 if S > 512 else S
         out = []
         for c0 in range(0, S, chunk):
@@ -492,9 +463,6 @@ class Glm5NextSparseAttention(nn.Module):
         self.v_head_dim = config.v_head_dim
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.use_nope = config.mla_use_nope or config.qk_rope_head_dim == 0
-        # GLM-5-Next is NoPE by design (qk_rope_head_dim=0, mla_use_nope=True); the
-        # config carries no rope parameters. Fail loudly rather than run wrong math
-        # if a future config ever requests a RoPE MLA.
         if not self.use_nope:
             raise NotImplementedError(
                 "glm5_next implements NoPE MLA only; qk_rope_head_dim>0 with "
@@ -549,22 +517,22 @@ class Glm5NextSparseAttention(nn.Module):
             cache = [None] * 2
 
         topk_indices = self.indexer(x, qr, mask, cache=cache[1])
-        if topk_indices is not None and 1 < L <= 8:
-            # Short speculative-verify block: gather the top-k selected latents per query
-            # and attend O(L*topk), instead of masking over all Kv (O(L*Kv)). The indexer
-            # already selects causally per query, so no extra mask is needed. This is the
-            # decode-path selection generalized to a small block -- the win that makes
-            # verify affordable at long context.
-            if (
-                cache is not None
-                and cache[0] is not None
-                and cache[1] is not None
-                and cache[1].keys is not None
-            ):
-                cache[0].keys = mx.depends(
-                    cache[0].keys, (cache[1].keys, cache[1].values)
+        if 1 < L <= 8:
+            if topk_indices is None:
+                topk_indices = self._dense_verify_indices(
+                    B, L, kv_latent.shape[2], mask
                 )
-            return self._gathered_verify_attention(q, kv_latent, topk_indices)
+            if topk_indices is not None:
+                if (
+                    cache is not None
+                    and cache[0] is not None
+                    and cache[1] is not None
+                    and cache[1].keys is not None
+                ):
+                    cache[0].keys = mx.depends(
+                        cache[0].keys, (cache[1].keys, cache[1].values)
+                    )
+                return self._gathered_verify_attention(q, kv_latent, topk_indices)
         attn_mask = mask
         if topk_indices is not None:
             Kv = kv_latent.shape[2]
@@ -579,11 +547,6 @@ class Glm5NextSparseAttention(nn.Module):
                 )
                 sel_mask = valid_sel[:, :, 0, :][:, :, None, :]
                 if mask is not None and mask.dtype == mx.bool_:
-                    # Single-stream decode passes mask=None here; under continuous
-                    # batching the batched cache supplies a left-pad mask that can be
-                    # 4-D ([B, 1, 1, Kv]) while `clamped` is 3-D. At S=1 the mask is
-                    # purely per-key (no causal), so reduce it to [B, Kv] and gather the
-                    # selected key positions -- rank-agnostic and batch-safe.
                     mkeys = mask.reshape(B, -1, Kv)[:, 0, :]
                     gathered = mx.take_along_axis(
                         mx.broadcast_to(mkeys[:, None, :], (B, clamped.shape[1], Kv)),
@@ -629,37 +592,51 @@ class Glm5NextSparseAttention(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
+    @staticmethod
+    def _dense_verify_indices(B, L, kv_length, mask):
+        positions = kv_length - L + mx.arange(L)
+        indices = mx.broadcast_to(mx.arange(kv_length), (B, L, kv_length))
+        valid = indices <= positions[None, :, None]
+        if mask is not None:
+            if mask.dtype != mx.bool_:
+                return None
+            if mask.ndim == 4:
+                mask = mask[:, 0]
+            elif mask.ndim == 2:
+                if mask.shape[0] == B:
+                    mask = mask[:, None]
+                else:
+                    mask = mask[None]
+            if mask.ndim != 3 or mask.shape[-1] != kv_length:
+                return None
+            valid = valid & mx.broadcast_to(mask, (B, L, kv_length))
+        return mx.where(valid, indices, -1)[:, None]
+
     def _gathered_verify_attention(self, q, kv_latent, topk_indices):
-        # Per-query top-k gather for a short block (verify): each query attends only to
-        # its selected latents (O(L*topk)) rather than a mask over all Kv (O(L*Kv)).
         B, H, L, _ = q.shape
         Kv = kv_latent.shape[2]
         dim = kv_latent.shape[-1]
-        # topk_indices is [B, 1, L, topk] (axis 1 is the broadcast head); take per-query.
-        sel = topk_indices[:, 0, :, :]  # [B, L, topk]
+        sel = topk_indices[:, 0, :, :]
         topk = sel.shape[-1]
         clamped = mx.clip(sel, 0, Kv - 1)
         kv_g = mx.take_along_axis(
             mx.broadcast_to(kv_latent, (B, L, Kv, dim)),
             mx.broadcast_to(clamped[..., None], (B, L, topk, dim)),
             axis=2,
-        )  # [B, L, topk, dim]
-        q_e = self.embed_q(q)  # [B, H, L, dim]
+        )
+        q_e = self.embed_q(q)
         q_bl = q_e.transpose(0, 2, 1, 3).reshape(B * L, H, 1, dim)
         kv_bl = kv_g.reshape(B * L, 1, topk, dim)
         valid = (sel >= 0).reshape(B * L, 1, 1, topk)
         attn = scaled_dot_product_attention(
             q_bl, kv_bl, kv_bl, cache=None, scale=self.scale, mask=valid
-        )  # [B*L, H, 1, dim]
-        attn = attn.reshape(B, L, H, dim).transpose(0, 2, 1, 3)  # [B, H, L, dim]
+        )
+        attn = attn.reshape(B, L, H, dim).transpose(0, 2, 1, 3)
         out = self.unembed_out(attn).transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(out)
 
 
 class Glm5NextClampedSwiGLU(nn.Module):
-    # GLM-5-Next clamps the SwiGLU activation in the text stack (config.swiglu_limit):
-    # the gate is clamped above and the up projection on both sides before silu(gate)*up.
-    # SwitchGLU invokes activation(x_up, x_gate).
     def __init__(self, limit: Optional[float]):
         super().__init__()
         self.limit = limit
@@ -672,7 +649,6 @@ class Glm5NextClampedSwiGLU(nn.Module):
 
 
 class Glm5NextMLP(DeepseekMLP):
-    # Dense / shared-expert MLP with the clamped SwiGLU (matches the reference text MLP).
     def __init__(self, config, hidden_size=None, intermediate_size=None):
         super().__init__(
             config, hidden_size=hidden_size, intermediate_size=intermediate_size
@@ -689,8 +665,6 @@ class Glm5NextMLP(DeepseekMLP):
 
 
 class Glm5NextMoEGate(MoEGate):
-    # Router logits in fp32 (reference uses moe_router_dtype=float32) so near-tie top-k
-    # membership matches the reference rather than flipping under bf16 rounding.
     def __call__(self, x: mx.array):
         logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
         return group_expert_select(
@@ -705,8 +679,6 @@ class Glm5NextMoEGate(MoEGate):
 
 
 class Glm5NextMoE(DeepseekV32MoE):
-    # Sparse MoE with the clamped SwiGLU on both the routed experts and the shared expert,
-    # and an fp32 router.
     def __init__(self, config):
         super().__init__(config)
         self.switch_mlp.activation = Glm5NextClampedSwiGLU(config.swiglu_limit)
@@ -756,10 +728,6 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             r = self.self_attn(self.input_layernorm(xc), mask, cache)
         x = hc_expand(r, residual, post, comb)
-        # Compile the FFN block for single-stream decode (B=1) at small sequence lengths:
-        # S=1 decode and the short S=block_size speculative-verify block. mx.compile keeps
-        # a per-shape cache, so each small S compiles once. Batched/prefill shapes stay on
-        # the eager path (compiling the 288-expert MoE there spikes memory / can OOM).
         if self.compile_ffn and x.shape[0] == 1 and x.shape[1] <= 8:
             if self._ffn_c is None:
                 self._ffn_c = mx.compile(self._ffn_block)
@@ -767,7 +735,6 @@ class Glm5NextDecoderLayer(nn.Module):
         return self._ffn_block(x)
 
     def _ffn_block(self, x: mx.array) -> mx.array:
-        # Stateless FFN half (no cache) -> compiles cleanly at a fixed decode shape.
         residual = x
         xc, post, comb = self.ffn_hc(x)
         m = self.mlp(self.post_attention_layernorm(xc))
@@ -818,7 +785,7 @@ class Glm5NextModel(nn.Module):
 
         h = h.mean(axis=2)
         if hidden_sink is not None:
-            hidden_sink.append(h)  # pre-final-norm hidden for the nextn drafter
+            hidden_sink.append(h)
         return self.norm(h)
 
 
@@ -846,11 +813,7 @@ class LanguageModel(nn.Module):
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         skip_logits = kwargs.pop("skip_logits", False)
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
-        # Speculative verify runs when a capture list is supplied: collect each KDA
-        # layer's per-step recurrent state so a round can be rolled back on rejection.
         gdn_sink: Optional[list] = [] if capture_layer_ids is not None else None
-        # Capture the pre-final-norm hidden for the nextn (MTP) drafter, which applies
-        # its own norm -- the DeepSeek-derived convention.
         hidden_sink: Optional[list] = [] if return_hidden else None
 
         out = self.model(
@@ -860,8 +823,6 @@ class LanguageModel(nn.Module):
             gdn_sink=gdn_sink,
             hidden_sink=hidden_sink,
         )
-        # Only the last few positions' logits are ever needed for generation; slicing
-        # before the (vocab-wide) projection skips it on discarded prefill positions.
         nlk = kwargs.get("num_logits_to_keep", 0)
         logits = None
         if not skip_logits:
@@ -880,8 +841,6 @@ class LanguageModel(nn.Module):
         return self.lm_head(normed_hidden)
 
     def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
-        # `hidden` is the pre-final-norm hidden captured for the drafter; apply the
-        # final norm, then the (shared) exact-verify LM head.
         return verify_logits(self, self.model.norm(hidden))
 
     def speculative_argmax_from_hidden(self, hidden: mx.array) -> mx.array:
@@ -944,10 +903,6 @@ class LanguageModel(nn.Module):
             if c is None:
                 continue
             if isinstance(c, ArraysCache):
-                # KDA (linear-attention) layer: replay the fast gated-delta kernel from
-                # the entry state over just the accepted prefix (n tokens) to recover the
-                # rolled-back recurrent state, and slice the conv window to match. Uniform
-                # acceptance, so n is shared across the batch.
                 q_, k_, v_, a_, b_, A_log_, dt_bias_, init_state, conv_input, K, lb = (
                     gdn_states[gdn_idx]
                 )
@@ -967,11 +922,6 @@ class LanguageModel(nn.Module):
                 c[1] = state_n
                 c[0] = conv_input[:, n : n + K - 1]
             else:
-                # Sparse (MLA + lightning-indexer) layer: trim both KV caches, then roll
-                # the indexer pool back to the trimmed length by keeping only the pool
-                # blocks that are still fully in-range. The incremental decode path then
-                # rebuilds just the last partial block (O(index_kpool)) instead of the
-                # whole pool (O(T)) -- critical for long context.
                 if trim > 0 and c.is_trimmable():
                     c.trim(trim)
                 indexer_cache = c[1]
@@ -1033,8 +983,6 @@ class LanguageModel(nn.Module):
         for k, v in list(weights.items()):
             if "conv1d.weight" in k and v.ndim == 3 and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
-        # Heal already-converted checkpoints: mHC base/scale and KDA gate params must be
-        # fp32 (see cast_predicate); restore them on load if a prior convert cast to bf16.
         for k, v in list(weights.items()):
             keep = (
                 ".attn_hc." in k
@@ -1052,9 +1000,6 @@ class LanguageModel(nn.Module):
 
     @property
     def cast_predicate(self):
-        # Keep these in fp32 through convert: the fused mHC kernel reads attn_hc/ffn_hc
-        # `base` via a float4 pointer (a bf16 base yields a wrong comb matrix), and the
-        # KDA gate params (A_log, dt_bias) are fp32-sensitive.
         def predicate(k):
             if "e_score_correction_bias" in k:
                 return False

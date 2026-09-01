@@ -1473,6 +1473,24 @@ class SpeculativeGenerationBatch:
         self._finished = [False] * len(uids)
         self._sent_first = False
         self._rounds_iter = None
+        prime = getattr(draft_model, "prefill_from_target_hidden", None)
+        if (
+            draft_kind == "mtp"
+            and len(uids) == 1
+            and callable(prime)
+            and hidden.shape[1] == prompt_tokens.shape[1]
+        ):
+            draft_model.reset(model)
+            prime(
+                prompt_tokens,
+                hidden,
+                first_tokens,
+                sampler,
+                token_dtype,
+                greedy_sampling,
+            )
+            mx.eval(draft_model._seed_token)
+            draft_model._mtp_prompt_primed = True
 
     def __len__(self):
         return sum(not done for done in self._finished)
@@ -1667,6 +1685,12 @@ class PromptProcessingBatch:
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling
+        self._capture_prompt_hidden = (
+            len(uids) == 1
+            and draft_kind == "mtp"
+            and callable(getattr(draft_model, "prefill_from_target_hidden", None))
+        )
+        self._prompt_hidden_chunks = []
 
         lengths = [len(ids) for ids in input_ids]
         max_length = max(lengths)
@@ -1695,6 +1719,7 @@ class PromptProcessingBatch:
         self._left_padding_per_row = list(left_padding)
         self._total_prompt_tokens = sum(lengths)
         self._processed_prompt_columns = 0
+        self._speculative_prompt_ids = self._input_ids
 
         self.logits_processors = logits_processors or []
         self.thinking_budget_criteria = thinking_budget_criteria or []
@@ -1928,13 +1953,20 @@ class PromptProcessingBatch:
         if n <= 0:
             return 0
         prompt_kwargs = self._prompt_kwargs_for_step(n)
-        self.model(
+        if self._capture_prompt_hidden:
+            prompt_kwargs = {**prompt_kwargs, "return_hidden": True}
+        output = self.model(
             self._input_ids[:, :n],
             cache=self.prompt_cache,
             inputs_embeds=self._inputs_embeds[:, :n],
             n_to_process=n,
             **prompt_kwargs,
         )
+        if self._capture_prompt_hidden:
+            hidden_states = getattr(output, "hidden_states", None)
+            if hidden_states:
+                mx.eval(hidden_states)
+                self._prompt_hidden_chunks.append(hidden_states)
         mx.async_eval([c.state for c in self.prompt_cache])
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
@@ -1984,6 +2016,17 @@ class PromptProcessingBatch:
             inputs_embeds=self._inputs_embeds,
             **call_kwargs,
         )
+        hidden_states = getattr(output, "hidden_states", None)
+        if self._prompt_hidden_chunks and hidden_states:
+            output.hidden_states = [
+                mx.concatenate(
+                    [chunk[index] for chunk in self._prompt_hidden_chunks]
+                    + [hidden_states[index]],
+                    axis=1,
+                )
+                for index in range(len(hidden_states))
+            ]
+            self._prompt_hidden_chunks = []
         logits = output.logits if hasattr(output, "logits") else output
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
             # Per-row last *real* token sits at index (seq - 1 - right_pad[i]).
@@ -2058,7 +2101,7 @@ class PromptProcessingBatch:
                 shared_kv_states=(
                     output.shared_kv_states if self.draft_kind == "mtp" else None
                 ),
-                prompt_tokens=self._input_ids,
+                prompt_tokens=self._speculative_prompt_ids,
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
                 greedy_sampling=self.greedy_sampling,

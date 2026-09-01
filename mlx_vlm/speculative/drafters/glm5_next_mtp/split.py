@@ -9,9 +9,6 @@ from ..mtp_split import MTPSplitter
 
 
 class Glm5NextMTPSplitter(MTPSplitter):
-    # GLM-5-Next stores its nextn layer as a normal decoder layer at index
-    # ``num_hidden_layers`` (there is no top-level ``mtp.*`` block), so a normal MLX
-    # conversion drops it -- extract it here into a standalone glm5_next_mtp drafter.
     output_model_type = "glm5_next_mtp"
     draft_model_cls = None
     tie_word_embeddings_default = False
@@ -36,8 +33,6 @@ class Glm5NextMTPSplitter(MTPSplitter):
                 rest = "shared_head_norm." + rest[len("shared_head.norm.") :]
             out[rest] = value
 
-        # Absorb the fused MLA kv_b_proj into embed_q / unembed_out (as the base model's
-        # Glm5NextSparseAttention expects).
         kb = "self_attn.kv_b_proj.weight"
         if kb in out:
             v = out.pop(kb)
@@ -53,8 +48,6 @@ class Glm5NextMTPSplitter(MTPSplitter):
         return {f"mtp.{key}": value for key, value in out.items()}
 
     def postprocess(self, tensors: Dict[str, mx.array], text_config: dict) -> None:
-        # Stack per-expert MoE projections into the SwitchGLU layout when the source
-        # ships separate experts (already-stacked checkpoints skip this).
         n_experts = int(
             text_config.get("n_routed_experts", text_config.get("num_experts", 0)) or 0
         )

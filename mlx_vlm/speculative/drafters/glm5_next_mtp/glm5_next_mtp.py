@@ -16,14 +16,7 @@ class Glm5NextMTPDraftModel(nn.Module):
     supports_ragged_batch_acceptance = False
     requires_filterable_batch_cache = True
 
-    # Never-lose gate: a single nextn head caps the block at 2 tokens, so a round
-    # only pays off when the draft is accepted often enough to clear the verify
-    # overhead -- and that break-even shifts with context length and batch size
-    # (short context and large batches raise the bar). The MTP orchestrator's
-    # self-calibrating timing controller (opt-in via this flag) measures drafting
-    # against plain decoding and asks for an empty block when drafting is not
-    # actually faster; draft_block then yields nothing and a plain decode step runs.
-    adaptive_pause = True
+    adaptive_pause = False
 
     def __init__(self, config: Glm5NextMTPConfig):
         super().__init__()
@@ -31,9 +24,6 @@ class Glm5NextMTPDraftModel(nn.Module):
         text_config = config.text_config
         if text_config is None:
             raise ValueError("Glm5NextMTPConfig.text_config must be set")
-        # The GLM-5-Next nextn (layer-45) block: enorm/hnorm -> eh_proj -> DSA+MoE ->
-        # shared_head_norm. Drafts token t+2 from the target hidden h(t+1) and the
-        # embedding of the accepted token t+1; the (shared) lm_head is applied here.
         self.mtp = Glm5NextMTP(text_config)
 
         self._input_embed = None
@@ -78,8 +68,6 @@ class Glm5NextMTPDraftModel(nn.Module):
         return self
 
     def make_cache(self, left_padding: Optional[List[int]] = None) -> List[Any]:
-        # One sparse (MLA + lightning-indexer) self-attention -> one CacheList of two
-        # KV caches (MLA latents + indexer keys), matching Glm5NextSparseAttention.
         if left_padding is not None:
             return [CacheList(BatchKVCache(left_padding), BatchKVCache(left_padding))]
         return [CacheList(KVCache(), KVCache())]
@@ -110,8 +98,6 @@ class Glm5NextMTPDraftModel(nn.Module):
         kv_valid_len=None,
         left_padding=None,
     ) -> None:
-        # The nextn block keeps its own KV/indexer cache (MLA is NoPE, so there is no
-        # position to import); the target's shared K/V is not reused.
         del shared_kv_states, kv_offset, position, kv_valid_len, left_padding
 
     def _mask_for(self, x: mx.array, cache) -> Optional[mx.array]:
@@ -135,6 +121,28 @@ class Glm5NextMTPDraftModel(nn.Module):
         logits = self._lm_head_fn(hidden)
         self._seed_token = mx.argmax(logits, axis=-1) if greedy else sampler(logits)
         self._seed_hidden = hidden
+
+    def _trim_cache(self, trim: int) -> None:
+        if trim <= 0:
+            return
+        for cache in self._cache:
+            cache.trim(trim)
+            indexer_cache = cache[1]
+            pool = getattr(indexer_cache, "_pool", None)
+            if pool is None:
+                continue
+            pool_keys, pool_indices, pool_valid, length = pool
+            length -= trim
+            if length <= 0:
+                indexer_cache._pool = None
+                continue
+            stable = length // self.mtp.self_attn.indexer.index_kpool
+            indexer_cache._pool = (
+                pool_keys[:, :stable],
+                pool_indices[:, :stable],
+                pool_valid[:, :stable],
+                length,
+            )
 
     def prefill_from_target_hidden(
         self,
@@ -168,9 +176,7 @@ class Glm5NextMTPDraftModel(nn.Module):
     ) -> None:
         keep_appended = min(int(accepted), self._round_appended)
         trim = self._round_appended - keep_appended
-        if trim > 0:
-            for cache in self._cache:
-                cache.trim(trim)
+        self._trim_cache(trim)
 
         token_chunks = []
         hidden_chunks = []
@@ -199,15 +205,10 @@ class Glm5NextMTPDraftModel(nn.Module):
         token_dtype: mx.Dtype = mx.int32,
         greedy: bool = False,
     ) -> None:
-        # Uniform acceptance (requires_uniform_batch_acceptance=True): every row advances
-        # by the same count, but each row has its own accepted drafts + next token, so the
-        # appended tokens/hidden stay [B, n] (not the single-row [1, n]).
         a = int(accepted[0])
         keep = min(a, self._round_appended)
         trim = self._round_appended - keep
-        if trim > 0:
-            for cache in self._cache:
-                cache.trim(trim)
+        self._trim_cache(trim)
 
         token_chunks = []
         hidden_chunks = []
@@ -215,9 +216,7 @@ class Glm5NextMTPDraftModel(nn.Module):
             token_chunks.append(draft_tokens[:, draft_idx : draft_idx + 1])
             hidden_chunks.append(verify_hidden[:, draft_idx : draft_idx + 1, :])
         if all(len(nt) for nt in new_tokens):
-            nt_col = mx.array(
-                [[int(nt[-1])] for nt in new_tokens], dtype=token_dtype
-            )  # [B, 1]
+            nt_col = mx.array([[int(nt[-1])] for nt in new_tokens], dtype=token_dtype)
             token_chunks.append(nt_col)
             hidden_chunks.append(verify_hidden[:, a : a + 1, :])
 
@@ -252,9 +251,6 @@ class Glm5NextMTPDraftModel(nn.Module):
     ) -> mx.array:
         del cache
         if block_size <= 1:
-            # Paused round: yield no drafts so the orchestrator runs a plain decode
-            # step (verify sees only the bonus). Never slower than the baseline, and
-            # needs no bound embeddings/LM head.
             self._round_appended = 0
             B = 1 if isinstance(last_bonus, int) else int(last_bonus.shape[0])
             return mx.zeros((B, 0), dtype=token_dtype)
@@ -291,8 +287,6 @@ class Glm5NextMTPDraftModel(nn.Module):
         return mx.concatenate(tokens, axis=1)
 
     def sanitize(self, weights: dict) -> dict:
-        # A split drafter checkpoint already carries the mtp.* tree; raw layer-45
-        # tensors (a manual load) are mapped through load_mtp_weights.
         if any(k.startswith("language_model.model.layers.") for k in weights):
             mapped = load_mtp_weights(self.config.text_config, weights)
             return {f"mtp.{k}": v for k, v in mapped.items()}
