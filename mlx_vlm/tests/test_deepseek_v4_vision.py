@@ -93,11 +93,15 @@ def tiny_vision_config(**kwargs):
 
 class TestDeepseekV4VisionTower(unittest.TestCase):
     def test_vit_uses_official_ffn_parameter_namespace(self):
-        parameters = dict(tree_flatten(ViT(tiny_vision_config()).parameters()))
+        vision = ViT(tiny_vision_config())
+        parameters = dict(tree_flatten(vision.parameters()))
 
         self.assertIn("blocks.0.ffn.w1.weight", parameters)
         self.assertIn("blocks.0.ffn.w2.weight", parameters)
         self.assertFalse(any(".mlp." in key for key in parameters))
+        self.assertEqual(vision.blocks[0].norm1.eps, 1e-6)
+        self.assertEqual(vision.blocks[0].norm2.eps, 1e-6)
+        self.assertEqual(vision.norm.eps, 1e-6)
 
     def test_vit_and_aligner_preserve_published_shapes(self):
         config = tiny_vision_config()

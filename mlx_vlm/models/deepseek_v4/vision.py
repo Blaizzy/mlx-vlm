@@ -5,6 +5,8 @@ import mlx.nn as nn
 
 from .config import ModelConfig
 
+VISION_NORM_EPS = 1e-6
+
 
 def get_vision_cos_sin(
     n_h: int, n_w: int, dim: int, theta: float
@@ -73,9 +75,9 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.norm1 = nn.RMSNorm(config.vision_dim)
+        self.norm1 = nn.RMSNorm(config.vision_dim, eps=VISION_NORM_EPS)
         self.attn = Attention(config)
-        self.norm2 = nn.RMSNorm(config.vision_dim)
+        self.norm2 = nn.RMSNorm(config.vision_dim, eps=VISION_NORM_EPS)
         self.ffn = MLP(config)
 
     def __call__(self, x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
@@ -95,7 +97,7 @@ class ViT(nn.Module):
         self.rope_theta = config.vision_rope_theta
         self.patch_embed = PatchEmbed(config)
         self.blocks = [Block(config) for _ in range(config.vision_n_layers)]
-        self.norm = nn.RMSNorm(config.vision_dim)
+        self.norm = nn.RMSNorm(config.vision_dim, eps=VISION_NORM_EPS)
 
     def __call__(self, patches: mx.array, n_h: int, n_w: int) -> mx.array:
         if patches.shape[0] != n_h * n_w:
