@@ -675,19 +675,31 @@ class TestNativePackedExactCheckpoints:
         assert isinstance(restored[0], QuantizedKVCache)
         _assert_packed_state_equal(restored[0].state, snapshot[0].state)
 
-    @pytest.mark.parametrize("bits", [4.0, 3.5])
+    @pytest.mark.parametrize(
+        "bits,key_bits,value_bits",
+        [
+            pytest.param(4.0, None, None, id="integer"),
+            pytest.param(3.5, None, None, id="fractional-budget"),
+            pytest.param(3.5, 3.5, 3.5, id="fractional-split-codecs"),
+        ],
+    )
     def test_turboquant_disk_roundtrip_preserves_packed_state(
-        self, tmp_path, monkeypatch, bits
+        self, tmp_path, monkeypatch, bits, key_bits, value_bits
     ):
-        from mlx_vlm.turboquant import TurboQuantKVCache
+        from mlx_vlm.turboquant import TurboQuantKVCache, _SplitCodec
 
         monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
         seq_len = 32
         token_ids = list(range(seq_len))
-        source = BatchTurboQuantKVCache([0], bits=bits)
+        source = BatchTurboQuantKVCache(
+            [0], bits=bits, key_bits=key_bits, value_bits=value_bits
+        )
         keys, values = _rand_kv(seq_len=seq_len)
         source.update_and_fetch(keys, values)
         mx.eval(source.state)
+        if key_bits == 3.5:
+            assert isinstance(source.key_codec, _SplitCodec)
+            assert isinstance(source.value_codec, _SplitCodec)
 
         def fail(*args, **kwargs):
             raise AssertionError("TurboQuant checkpoint must stay packed")
@@ -698,21 +710,29 @@ class TestNativePackedExactCheckpoints:
         assert isinstance(snapshot[0], TurboQuantKVCache)
 
         restored, matched = _disk_roundtrip(
-            tmp_path, f"native-turbo-{bits}", token_ids, snapshot
+            tmp_path,
+            f"native-turbo-{bits}-{key_bits}-{value_bits}",
+            token_ids,
+            snapshot,
         )
         assert matched == seq_len
         assert restored is not None
         assert isinstance(restored[0], TurboQuantKVCache)
         _assert_packed_state_equal(restored[0].state, snapshot[0].state)
 
+        kv_quant_config = {
+            "bits": bits,
+            "group_size": GROUP_SIZE,
+            "scheme": "turboquant",
+        }
+        if key_bits is not None:
+            kv_quant_config["key_bits"] = key_bits
+        if value_bits is not None:
+            kv_quant_config["value_bits"] = value_bits
         warm, _ = make_warm_batch_exact_cache_multi(
             [restored, [KVCache()]],
             [seq_len, 0],
-            kv_quant_config={
-                "bits": bits,
-                "group_size": GROUP_SIZE,
-                "scheme": "turboquant",
-            },
+            kv_quant_config=kv_quant_config,
         )
         assert warm is not None
         assert isinstance(warm[0], BatchTurboQuantKVCache)

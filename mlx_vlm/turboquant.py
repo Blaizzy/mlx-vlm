@@ -4875,8 +4875,19 @@ class _SplitCodec:
         self.dim = int(dim)
         self.lower_bits = math.floor(bits)
         self.upper_bits = math.ceil(bits)
-        self.low_idx = mx.array(low_idx, dtype=mx.int32)
-        self.high_idx = mx.array(high_idx, dtype=mx.int32)
+        # APC restores detached index arrays that are materialized on the producer
+        # thread. Reuse them: wrapping them in mx.array would create a lazy graph
+        # that the asynchronous disk writer cannot evaluate on its own stream.
+        self.low_idx = (
+            low_idx
+            if isinstance(low_idx, mx.array) and low_idx.dtype == mx.int32
+            else mx.array(low_idx, dtype=mx.int32)
+        )
+        self.high_idx = (
+            high_idx
+            if isinstance(high_idx, mx.array) and high_idx.dtype == mx.int32
+            else mx.array(high_idx, dtype=mx.int32)
+        )
         self.restore_order = mx.argsort(
             mx.concatenate([self.low_idx, self.high_idx])
         ).astype(mx.int32)
