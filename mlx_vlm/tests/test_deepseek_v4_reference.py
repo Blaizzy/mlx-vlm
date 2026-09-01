@@ -64,8 +64,12 @@ def test_official_processor_token_and_layout_parity():
         "image_permutations",
     ):
         assert np.array_equal(np.asarray(processed[key]), fixture[key]), key
+    # The official processor rounds normalized patches to BF16 immediately;
+    # MLX keeps FP32 values until ``encode_image`` performs the same cast.
+    # Compare the values at that shared vision-input stage.
+    official_stage_pixels = processed["pixel_values"].astype(mx.bfloat16)
     assert np.allclose(
-        np.asarray(processed["pixel_values"]),
+        np.asarray(official_stage_pixels.astype(mx.float32)),
         fixture["pixel_values"],
         atol=0,
         rtol=0,
