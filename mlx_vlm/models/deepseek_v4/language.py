@@ -46,6 +46,27 @@ def make_quantization_config(model):
     }
 
 
+def normalize_checkpoint_key(key: str) -> str:
+    """Normalize official-inference and Transformers DeepSeek-V4 namespaces."""
+    if key.startswith("model."):
+        key = key[len("model.") :]
+        if key == "embed_tokens.weight":
+            key = "embed.weight"
+
+    key = key.replace(".self_attn.", ".attn.")
+    key = key.replace(".mlp.", ".ffn.")
+    key = key.replace(".weight_scale_inv", ".scale")
+
+    if ".ffn.experts." in key:
+        for projection, checkpoint_name in (
+            ("gate_proj", "w1"),
+            ("down_proj", "w2"),
+            ("up_proj", "w3"),
+        ):
+            key = key.replace(f".{projection}.", f".{checkpoint_name}.")
+    return key
+
+
 def _score_func(scores: mx.array, func: str) -> mx.array:
     if func == "softmax":
         return mx.softmax(scores, axis=-1, precise=True)
@@ -1611,6 +1632,8 @@ class LanguageModel(nn.Module):
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         n_layers = self.args.num_hidden_layers
+
+        weights = {normalize_checkpoint_key(k): v for k, v in weights.items()}
 
         new_weights = {}
         for k, v in weights.items():

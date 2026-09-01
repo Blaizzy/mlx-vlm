@@ -284,6 +284,27 @@ def convert(
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
+
+    from .models.deepseek_v4.convert import (
+        convert_deepseek_v4_vision,
+        is_deepseek_v4_vision_checkpoint,
+    )
+
+    if is_deepseek_v4_vision_checkpoint(model_path):
+        if quantize or dequantize or dtype is not None or quant_predicate is not None:
+            raise ValueError(
+                "DeepSeek-V4 vision checkpoints use their published mixed FP8/FP4 "
+                "weights; custom quantization, dequantization, and dtype conversion "
+                "are not supported by the streaming converter."
+            )
+        print("[INFO] Streaming DeepSeek-V4 mixed FP8/FP4 conversion")
+        convert_deepseek_v4_vision(model_path, mlx_path)
+        hf_repo = None if Path(hf_path).exists() else hf_path
+        create_model_card(mlx_path, hf_repo)
+        if upload_repo is not None:
+            upload_to_hub(mlx_path, upload_repo)
+        return
+
     model, config, processor = fetch_from_hub(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )
