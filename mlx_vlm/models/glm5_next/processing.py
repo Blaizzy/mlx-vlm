@@ -7,41 +7,32 @@ from typing import List, Optional, Union
 import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import ImageProcessingMixin
+from transformers.image_transforms import resize as resize_image
+from transformers.image_utils import ChannelDimension, PILImageResampling
 from transformers.processing_utils import ProcessorMixin
 
 from ..base import install_auto_processor_patch, load_chat_template
-from ..qwen3_vl.processing_qwen3_vl import (
-    _flatten_images,
-    _resize_video_frames,
-    _to_numpy_image,
-)
+from ..qwen3_vl.processing_qwen3_vl import _flatten_images
 
 
 def smart_resize(
     num_frames: int,
     height: int,
     width: int,
-    temporal_factor: int = 1,
-    height_factor: int = 28,
-    width_factor: int = 28,
-    min_pixels: int = 56 * 56,
-    max_pixels: int = 14 * 14 * 4 * 1280,
+    temporal_factor: int = 2,
+    factor: int = 28,
+    min_pixels: int = 16,
+    max_pixels: int = 8000,
 ):
-    """Return the aligned GLM-5-Next canvas under a token pixel budget."""
-    if (
-        min(
-            num_frames,
-            height,
-            width,
-            temporal_factor,
-            height_factor,
-            width_factor,
-        )
-        <= 0
-    ):
+    """Return the aligned GLM-5-Next canvas under a token budget."""
+    if min(num_frames, height, width, temporal_factor, factor) <= 0:
         raise ValueError("Image dimensions and alignment factors must be positive.")
     if min_pixels <= 0 or max_pixels <= 0 or min_pixels > max_pixels:
         raise ValueError("Expected 0 < min_pixels <= max_pixels.")
+
+    pixels_per_token = temporal_factor * factor**2
+    min_pixels *= pixels_per_token
+    max_pixels *= pixels_per_token
 
     def align(value, factor):
         return math.ceil(value / factor) * factor
@@ -51,20 +42,17 @@ def smart_resize(
     )
 
     def fit_within_budget():
-        minimum = aligned_frames * height_factor * width_factor
+        minimum = aligned_frames * factor**2
         if max_pixels < minimum:
             raise ValueError(
                 f"max_pixels={max_pixels} is too small; at least {minimum} is required."
             )
         low, high = 1, height
-        best = (height_factor, width_factor)
+        best = (factor, factor)
         while low <= high:
             content_h = (low + high) // 2
             content_w = max(1, math.floor(width * content_h / height))
-            candidate = (
-                align(content_h, height_factor),
-                align(content_w, width_factor),
-            )
+            candidate = (align(content_h, factor), align(content_w, factor))
             if aligned_frames * candidate[0] * candidate[1] <= max_pixels:
                 best = candidate
                 low = content_h + 1
@@ -72,17 +60,16 @@ def smart_resize(
                 high = content_h - 1
         return best
 
-    aligned_h = align(height, height_factor)
-    aligned_w = align(width, width_factor)
+    aligned_h = align(height, factor)
+    aligned_w = align(width, factor)
     pixels = aligned_frames * aligned_h * aligned_w
+    if pixels < min_pixels:
+        scale = math.sqrt(min_pixels / (num_frames * height * width))
+        aligned_h = align(max(1, math.ceil(height * scale)), factor)
+        aligned_w = align(max(1, math.ceil(width * scale)), factor)
+        pixels = aligned_frames * aligned_h * aligned_w
     if pixels > max_pixels:
         aligned_h, aligned_w = fit_within_budget()
-    elif pixels < min_pixels:
-        scale = math.sqrt(min_pixels / (num_frames * height * width))
-        aligned_h = align(max(1, math.ceil(height * scale)), height_factor)
-        aligned_w = align(max(1, math.ceil(width * scale)), width_factor)
-        if aligned_frames * aligned_h * aligned_w > max_pixels:
-            aligned_h, aligned_w = fit_within_budget()
     return aligned_h, aligned_w
 
 
@@ -99,16 +86,15 @@ def _resize_geometry(
     max_image_tokens,
 ):
     factor = patch_size * merge_size * patch_expand_factor
-    pixels_per_token = temporal_patch_size * (patch_size * merge_size) ** 2
+    pixels_per_token = temporal_patch_size * factor**2
     target_h, target_w = smart_resize(
         num_frames,
         height,
         width,
         temporal_factor=temporal_patch_size,
-        height_factor=factor,
-        width_factor=factor,
-        min_pixels=min_image_tokens * pixels_per_token,
-        max_pixels=max_image_tokens * pixels_per_token,
+        factor=factor,
+        min_pixels=min_image_tokens,
+        max_pixels=max_image_tokens,
     )
     scale = min(target_h / height, target_w / width)
     if num_frames * height * width >= min_image_tokens * pixels_per_token:
@@ -116,6 +102,47 @@ def _resize_geometry(
     content_h = max(1, min(target_h, math.floor(height * scale)))
     content_w = max(1, min(target_w, math.floor(width * scale)))
     return target_h, target_w, content_h, content_w
+
+
+def _to_numpy_processor_image(image, convert_rgb=True):
+    """Convert an image to channel-first NumPy without requiring Torch."""
+    from PIL import Image
+
+    if isinstance(image, (str, Path)):
+        image = Image.open(image)
+    if hasattr(image, "convert"):
+        if convert_rgb:
+            image = image.convert("RGB")
+        array = np.asarray(image)
+    else:
+        array = np.asarray(image)
+    if array.ndim == 2:
+        array = array[None]
+    elif array.ndim == 3 and array.shape[-1] in (1, 3, 4):
+        array = array.transpose(2, 0, 1)
+    if convert_rgb and array.shape[0] == 1:
+        array = np.repeat(array, 3, axis=0)
+    elif convert_rgb and array.shape[0] == 4:
+        array = array[:3]
+    return array
+
+
+def _resize_frames_pil(frames, target_h, target_w, resample):
+    """Match the official torch-free Transformers PIL resize backend."""
+    if frames.shape[-2:] == (target_h, target_w):
+        return frames
+    return np.stack(
+        [
+            resize_image(
+                frame,
+                (target_h, target_w),
+                resample=resample,
+                data_format=ChannelDimension.FIRST,
+                input_data_format=ChannelDimension.FIRST,
+            )
+            for frame in frames
+        ]
+    )
 
 
 class Glm5NextImageProcessor(ImageProcessingMixin):
@@ -134,6 +161,9 @@ class Glm5NextImageProcessor(ImageProcessingMixin):
         do_normalize: bool = True,
         image_mean: Optional[List[float]] = None,
         image_std: Optional[List[float]] = None,
+        do_resize: bool = True,
+        resample=PILImageResampling.BICUBIC,
+        size=None,
         do_convert_rgb: bool = True,
         **kwargs,
     ):
@@ -149,6 +179,10 @@ class Glm5NextImageProcessor(ImageProcessingMixin):
         self.do_normalize = do_normalize
         self.image_mean = image_mean or [0.48145466, 0.4578275, 0.40821073]
         self.image_std = image_std or [0.26862954, 0.26130258, 0.27577711]
+        self.do_resize = do_resize
+        self.resample = resample
+        self.size = size or {"longest_edge": 1}
+        self.default_to_square = False
         self.do_convert_rgb = do_convert_rgb
 
     def _settings(self, kwargs):
@@ -165,22 +199,30 @@ class Glm5NextImageProcessor(ImageProcessingMixin):
         }
 
     def _process_one(self, image, **kwargs):
-        image = _to_numpy_image(image)
-        if image.shape[0] == 1:
-            image = np.repeat(image, 3, axis=0)
+        image = _to_numpy_processor_image(
+            image, kwargs.get("do_convert_rgb", self.do_convert_rgb)
+        )
         channels, height, width = image.shape
         settings = self._settings(kwargs)
-        target_h, target_w, content_h, content_w = _resize_geometry(
-            settings["temporal_patch_size"],
-            height,
-            width,
-            **settings,
-        )
-        image = _resize_video_frames(image[None], content_h, content_w)[0]
-        image = np.pad(
-            image,
-            ((0, 0), (0, target_h - content_h), (0, target_w - content_w)),
-        )
+        if kwargs.get("do_resize", self.do_resize):
+            target_h, target_w, content_h, content_w = _resize_geometry(
+                settings["temporal_patch_size"],
+                height,
+                width,
+                **settings,
+            )
+            image = _resize_frames_pil(
+                image[None],
+                content_h,
+                content_w,
+                kwargs.get("resample", self.resample),
+            )[0]
+            image = np.pad(
+                image,
+                ((0, 0), (0, target_h - content_h), (0, target_w - content_w)),
+            )
+        else:
+            target_h, target_w = height, width
         image = image.astype(np.float32)
         if kwargs.get("do_rescale", self.do_rescale):
             image *= kwargs.get("rescale_factor", self.rescale_factor)
@@ -236,18 +278,11 @@ class Glm5NextImageProcessor(ImageProcessingMixin):
             height,
             width,
             temporal_factor=settings["temporal_patch_size"],
-            height_factor=settings["patch_size"]
+            factor=settings["patch_size"]
             * settings["merge_size"]
             * settings["patch_expand_factor"],
-            width_factor=settings["patch_size"]
-            * settings["merge_size"]
-            * settings["patch_expand_factor"],
-            min_pixels=settings["min_image_tokens"]
-            * settings["temporal_patch_size"]
-            * (settings["patch_size"] * settings["merge_size"]) ** 2,
-            max_pixels=settings["max_image_tokens"]
-            * settings["temporal_patch_size"]
-            * (settings["patch_size"] * settings["merge_size"]) ** 2,
+            min_pixels=settings["min_image_tokens"],
+            max_pixels=settings["max_image_tokens"],
         )
         return target_h // settings["patch_size"] * (target_w // settings["patch_size"])
 
@@ -261,15 +296,19 @@ class Glm5NextVideoProcessor(Glm5NextImageProcessor):
         max_image_tokens: int = 240000,
         fps: float = 2.0,
         max_duration: int = 0,
-        max_frames: Optional[int] = None,
-        max_frame_count_dynamic: int = 2048,
+        max_frames: Optional[int] = 2048,
+        do_sample_frames: bool = True,
+        num_frames: int = 16,
+        max_image_size=None,
         **kwargs,
     ):
         super().__init__(max_image_tokens=max_image_tokens, **kwargs)
         self.fps = fps
         self.max_duration = max_duration
         self.max_frames = max_frames
-        self.max_frame_count_dynamic = max_frame_count_dynamic
+        self.do_sample_frames = do_sample_frames
+        self.num_frames = num_frames
+        self.max_image_size = max_image_size or {"longest_edge": 28 * 28 * 2 * 30000}
 
     def sample_frames(self, metadata, fps=None, **kwargs):
         source_fps = getattr(metadata, "fps", None)
@@ -282,8 +321,8 @@ class Glm5NextVideoProcessor(Glm5NextImageProcessor):
         effective_duration = (
             duration if self.max_duration <= 0 else min(duration, self.max_duration)
         )
-        cap = kwargs.get("max_frames")
-        cap = self.max_frame_count_dynamic if cap is None else cap
+        cap = kwargs.get("max_frames", self.max_frames)
+        cap = 2048 if cap is None else cap
         target_fps = self.fps if fps is None else fps
         count = min(int(effective_duration * target_fps), cap)
 
@@ -313,9 +352,7 @@ class Glm5NextVideoProcessor(Glm5NextImageProcessor):
         return indices
 
     def video_sampling_defaults(self):
-        cap = self.max_frames
-        if cap is None:
-            cap = self.max_frame_count_dynamic
+        cap = 2048 if self.max_frames is None else self.max_frames
         return {
             "fps": self.fps,
             "min_frames": self.temporal_patch_size,
@@ -342,24 +379,42 @@ class Glm5NextVideoProcessor(Glm5NextImageProcessor):
             if frames.shape[-1] in (1, 3, 4):
                 frames = frames.transpose(0, 3, 1, 2)
         else:
-            frames = np.stack([_to_numpy_image(frame) for frame in video])
-        if frames.shape[1] == 4:
+            frames = np.stack(
+                [
+                    _to_numpy_processor_image(
+                        frame, kwargs.get("do_convert_rgb", self.do_convert_rgb)
+                    )
+                    for frame in video
+                ]
+            )
+        if kwargs.get("do_convert_rgb", self.do_convert_rgb) and frames.shape[1] == 1:
+            frames = np.repeat(frames, 3, axis=1)
+        elif kwargs.get("do_convert_rgb", self.do_convert_rgb) and frames.shape[1] == 4:
             frames = frames[:, :3]
         num_frames, channels, height, width = frames.shape
         settings = self._settings(kwargs)
-        target_h, target_w, content_h, content_w = _resize_geometry(
-            num_frames, height, width, **settings
-        )
-        frames = _resize_video_frames(frames, content_h, content_w)
-        frames = np.pad(
-            frames,
-            (
-                (0, 0),
-                (0, 0),
-                (0, target_h - content_h),
-                (0, target_w - content_w),
-            ),
-        ).astype(np.float32)
+        if kwargs.get("do_resize", self.do_resize):
+            target_h, target_w, content_h, content_w = _resize_geometry(
+                num_frames, height, width, **settings
+            )
+            frames = _resize_frames_pil(
+                frames,
+                content_h,
+                content_w,
+                kwargs.get("resample", self.resample),
+            )
+            frames = np.pad(
+                frames,
+                (
+                    (0, 0),
+                    (0, 0),
+                    (0, target_h - content_h),
+                    (0, target_w - content_w),
+                ),
+            )
+        else:
+            target_h, target_w = height, width
+        frames = frames.astype(np.float32)
         if kwargs.get("do_rescale", self.do_rescale):
             frames *= kwargs.get("rescale_factor", self.rescale_factor)
         if kwargs.get("do_normalize", self.do_normalize):
@@ -408,6 +463,31 @@ class Glm5NextVideoProcessor(Glm5NextImageProcessor):
             tensor_type=return_tensors,
         )
 
+    def preprocess(self, videos, **kwargs):
+        return self(videos, **kwargs)
+
+    def get_number_of_video_patches(
+        self, num_frames, height, width, videos_kwargs=None
+    ):
+        settings = self._settings(videos_kwargs or {})
+        target_h, target_w = smart_resize(
+            num_frames,
+            height,
+            width,
+            temporal_factor=settings["temporal_patch_size"],
+            factor=settings["patch_size"]
+            * settings["merge_size"]
+            * settings["patch_expand_factor"],
+            min_pixels=settings["min_image_tokens"],
+            max_pixels=settings["max_image_tokens"],
+        )
+        grid_t = math.ceil(num_frames / settings["temporal_patch_size"])
+        return (
+            grid_t
+            * (target_h // settings["patch_size"])
+            * (target_w // settings["patch_size"])
+        )
+
 
 def _load_json(model_path, filename):
     local = Path(model_path) / filename
@@ -451,8 +531,35 @@ class Glm5NextProcessor(ProcessorMixin):
         self.video_token_id = getattr(tokenizer, "video_token_id", None) or (
             tokenizer.convert_tokens_to_ids(self.video_token)
         )
+        self.video_start_id = tokenizer.convert_tokens_to_ids("<|begin_of_video|>")
+        self.video_end_id = tokenizer.convert_tokens_to_ids("<|end_of_video|>")
         super().__init__(
             image_processor, tokenizer, video_processor, chat_template=chat_template
+        )
+
+    def replace_image_token(self, image_inputs, image_idx, **kwargs):
+        del kwargs
+        merge_length = self.image_processor.merge_size**2
+        count = int(np.prod(image_inputs["image_grid_thw"][image_idx])) // merge_length
+        return self.image_token * count
+
+    def replace_video_token(self, video_inputs, video_idx, **kwargs):
+        metadata = kwargs.get("video_metadata")
+        if metadata is not None and not isinstance(metadata, (list, tuple)):
+            metadata = [metadata]
+        fps = kwargs.get("fps")
+        if isinstance(fps, (list, tuple)):
+            fps = fps[video_idx] if video_idx < len(fps) else None
+        return self._video_replacement(
+            video_inputs["video_grid_thw"][video_idx],
+            metadata[video_idx] if metadata and video_idx < len(metadata) else None,
+            fps,
+        )
+
+    def replace_frame_token_id(self, timestamp_sec, num_image_tokens=1):
+        return (
+            f"<|begin_of_image|>{self.image_token * num_image_tokens}"
+            f"<|end_of_image|>{timestamp_sec:.1f} seconds"
         )
 
     def _video_replacement(self, grid, metadata=None, fps=None):
@@ -481,9 +588,62 @@ class Glm5NextProcessor(ProcessorMixin):
             timestamps = [0.0]
         timestamps = (timestamps + [timestamps[-1]] * grid_t)[:grid_t]
         return "".join(
-            f"<|begin_of_image|>{self.image_token * per_frame}<|end_of_image|>"
-            f"{float(timestamp):.1f} seconds"
+            self.replace_frame_token_id(float(timestamp), per_frame)
             for timestamp in timestamps
+        )
+
+    def create_mm_token_type_ids(self, input_ids):
+        """Match Transformers: 0=text, 1=image, and 2=video image tokens."""
+        output = []
+        for row in input_ids:
+            if hasattr(row, "tolist"):
+                row = row.tolist()
+            ids = np.asarray(row)
+            token_types = np.zeros_like(ids)
+            starts = np.cumsum(ids == self.video_start_id)
+            ends = np.cumsum(ids == self.video_end_id)
+            in_video = starts > ends
+            token_types[(ids == self.image_token_id) & in_video] = 2
+            token_types[(ids == self.image_token_id) & ~in_video] = 1
+            output.append(token_types.tolist())
+        return output
+
+    def _get_num_multimodal_tokens(self, image_sizes=None, video_sizes=None, **kwargs):
+        data = {}
+        if image_sizes is not None:
+            merge_size = kwargs.get("merge_size", self.image_processor.merge_size)
+            patches = [
+                self.image_processor.get_number_of_image_patches(*size, kwargs)
+                for size in image_sizes
+            ]
+            data["num_image_patches"] = patches
+            data["num_image_tokens"] = [count // merge_size**2 for count in patches]
+        if video_sizes is not None:
+            merge_size = kwargs.get("merge_size", self.video_processor.merge_size)
+            patches = [
+                self.video_processor.get_number_of_video_patches(*size, kwargs)
+                for size in video_sizes
+            ]
+            data["num_video_tokens"] = [count // merge_size**2 for count in patches]
+        try:
+            from transformers.processing_utils import MultiModalData
+
+            return MultiModalData(**data)
+        except ImportError:
+            return data
+
+    def post_process_image_text_to_text(
+        self,
+        generated_outputs,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+        **kwargs,
+    ):
+        return self.tokenizer.batch_decode(
+            generated_outputs,
+            skip_special_tokens=skip_special_tokens,
+            clean_up_tokenization_spaces=clean_up_tokenization_spaces,
+            **kwargs,
         )
 
     def __call__(
@@ -499,7 +659,9 @@ class Glm5NextProcessor(ProcessorMixin):
         image_kwargs = dict(kwargs.pop("images_kwargs", {}))
         video_kwargs = dict(kwargs.pop("videos_kwargs", {}))
         vision_keys = {
+            "do_convert_rgb",
             "do_normalize",
+            "do_resize",
             "do_rescale",
             "image_mean",
             "image_std",
@@ -508,7 +670,9 @@ class Glm5NextProcessor(ProcessorMixin):
             "min_image_tokens",
             "patch_expand_factor",
             "patch_size",
+            "resample",
             "rescale_factor",
+            "size",
             "temporal_patch_size",
         }
         for name in tuple(kwargs):
@@ -523,12 +687,16 @@ class Glm5NextProcessor(ProcessorMixin):
         )
         return_mm_token_type_ids = text_kwargs.pop(
             "return_mm_token_type_ids",
-            kwargs.pop("return_mm_token_type_ids", False),
+            kwargs.pop("return_mm_token_type_ids", True),
         )
-        return_tensors = kwargs.pop("return_tensors", None)
+        return_tensors = text_kwargs.pop(
+            "return_tensors", kwargs.pop("return_tensors", None)
+        )
         video_metadata = video_kwargs.pop("video_metadata", video_metadata)
         fps = video_kwargs.pop("fps", fps)
+        return_metadata = kwargs.pop("return_metadata", False)
         video_kwargs.pop("return_metadata", None)
+        video_kwargs.pop("do_sample_frames", None)
 
         image_inputs = (
             self.image_processor(images, **image_kwargs) if images is not None else {}
@@ -597,14 +765,16 @@ class Glm5NextProcessor(ProcessorMixin):
             text,
             padding=padding,
             return_token_type_ids=return_token_type_ids,
+            return_tensors=return_tensors,
             **text_kwargs,
             **kwargs,
         )
         if return_mm_token_type_ids:
-            ids = np.asarray(text_inputs["input_ids"])
-            text_inputs["mm_token_type_ids"] = (ids == self.image_token_id).astype(
-                np.int64
+            text_inputs["mm_token_type_ids"] = self.create_mm_token_type_ids(
+                text_inputs["input_ids"]
             )
+        if return_metadata and video_metadata is not None:
+            video_inputs["video_metadata"] = video_metadata
         return BatchFeature(
             data={**text_inputs, **image_inputs, **video_inputs},
             tensor_type=return_tensors,

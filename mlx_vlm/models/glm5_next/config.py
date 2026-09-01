@@ -29,8 +29,11 @@ class TextConfig(BaseModelConfig):
     norm_topk_prob: bool = True
     hidden_act: str = "silu"
     max_position_embeddings: int = 1048576
+    initializer_range: float = 0.02
     rms_norm_eps: float = 1e-5
+    use_cache: bool = True
     pad_token_id: Optional[int] = 154820
+    bos_token_id: Optional[int] = None
     eos_token_id: Optional[Union[int, List[int]]] = None
     tie_word_embeddings: bool = False
     mlp_layer_types: Optional[List[str]] = None
@@ -42,6 +45,9 @@ class TextConfig(BaseModelConfig):
     head_dim: int = 0
     layer_types: Optional[List[str]] = None
     indexer_types: Optional[List[str]] = None
+    index_topk_pattern: Optional[Union[str, List[str]]] = None
+    index_topk_freq: int = 1
+    index_skip_topk_offset: int = 2
     swiglu_limit: float = 10.0
     linear_attn_config: Dict = field(default_factory=dict)
     linear_head_dim: int = 128
@@ -64,6 +70,7 @@ class TextConfig(BaseModelConfig):
     first_k_dense_replace: int = 3
     scoring_func: str = "sigmoid"
     topk_method: str = "noaux_tc"
+    qk_head_dim: int = 256
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -94,7 +101,25 @@ class TextConfig(BaseModelConfig):
         ]
 
         if self.indexer_types is None:
-            self.indexer_types = ["full"] * self.num_hidden_layers
+            if self.index_topk_pattern is not None:
+                if isinstance(self.index_topk_pattern, str):
+                    self.indexer_types = [
+                        {"F": "full", "S": "shared"}[value]
+                        for value in self.index_topk_pattern
+                    ]
+                else:
+                    self.indexer_types = list(self.index_topk_pattern)
+            else:
+                frequency = max(self.index_topk_freq, 1)
+                offset = self.index_skip_topk_offset
+                self.indexer_types = [
+                    (
+                        "full"
+                        if max(layer_idx - offset + 1, 0) % frequency == 0
+                        else "shared"
+                    )
+                    for layer_idx in range(self.num_hidden_layers)
+                ]
 
         if self.linear_attn_config:
             self.linear_head_dim = self.linear_attn_config.get(
@@ -115,6 +140,14 @@ class TextConfig(BaseModelConfig):
             ):
                 self.linear_lower_bound = -5.0
 
+        self.head_dim = self.qk_rope_head_dim
+        self.qk_head_dim = self.qk_rope_head_dim + self.qk_nope_head_dim
+
+        if self.num_attention_heads != self.num_key_value_heads:
+            raise ValueError(
+                "`num_attention_heads` must equal `num_key_value_heads` for "
+                "GLM-5-Next."
+            )
         if len(self.layer_types) != self.num_hidden_layers:
             raise ValueError("`layer_types` must have one entry per hidden layer.")
         if len(self.mlp_layer_types) != self.num_hidden_layers:

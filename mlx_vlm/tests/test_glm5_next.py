@@ -16,6 +16,7 @@ from mlx_vlm.models.cache import (
 from mlx_vlm.models.glm5_next.config import ModelConfig, TextConfig, VisionConfig
 from mlx_vlm.models.glm5_next.glm5_next import Model
 from mlx_vlm.models.glm5_next.language import (
+    Glm5NextLinearAttention,
     LanguageModel,
     _exact_pool_select,
     _hisa_pool_select,
@@ -205,6 +206,10 @@ class _Tokenizer:
     image_token_id = 31
     video_token = "<|video|>"
     video_token_id = 30
+    video_start_token = "<|begin_of_video|>"
+    video_start_token_id = 28
+    video_end_token = "<|end_of_video|>"
+    video_end_token_id = 29
     pad_token = "<|pad|>"
     eos_token = "<|end|>"
 
@@ -215,6 +220,8 @@ class _Tokenizer:
         return {
             self.image_token: self.image_token_id,
             self.video_token: self.video_token_id,
+            self.video_start_token: self.video_start_token_id,
+            self.video_end_token: self.video_end_token_id,
         }.get(token, 1)
 
     def __call__(self, text, **kwargs):
@@ -231,6 +238,12 @@ class _Tokenizer:
                 elif value.startswith(self.video_token, index):
                     ids.append(self.video_token_id)
                     index += len(self.video_token)
+                elif value.startswith(self.video_start_token, index):
+                    ids.append(self.video_start_token_id)
+                    index += len(self.video_start_token)
+                elif value.startswith(self.video_end_token, index):
+                    ids.append(self.video_end_token_id)
+                    index += len(self.video_end_token)
                 else:
                     ids.append(1)
                     index += 1
@@ -270,6 +283,30 @@ def test_glm5_next_config_builds_checkpoint_schedules():
     assert config.index_hisa_keep == 0
 
 
+def test_glm5_next_config_matches_transformers_indexer_schedule_and_validation():
+    config = TextConfig(
+        num_hidden_layers=5,
+        index_topk=8,
+        index_kpool=4,
+        index_topk_freq=2,
+        index_skip_topk_offset=2,
+    )
+    assert config.indexer_types == ["full", "full", "shared", "full", "shared"]
+    assert config.head_dim == config.qk_rope_head_dim
+    assert config.qk_head_dim == config.qk_nope_head_dim
+
+    pattern = TextConfig(
+        num_hidden_layers=5,
+        index_topk=8,
+        index_kpool=4,
+        index_topk_pattern="FSSFS",
+    )
+    assert pattern.indexer_types == ["full", "shared", "shared", "full", "shared"]
+
+    with pytest.raises(ValueError, match="num_attention_heads"):
+        TextConfig(num_attention_heads=2, num_key_value_heads=1)
+
+
 def test_glm5_next_preprocessing_preserves_aspect_and_pads_temporally():
     settings = {
         "patch_size": 2,
@@ -303,10 +340,9 @@ def test_glm5_next_processor_expands_video_frames_with_timestamps():
     metadata = SimpleNamespace(timestamps=[0.0, 0.5, 1.0, 1.5])
 
     output = processor(
-        text="<|video|>",
+        text="<|begin_of_video|><|video|><|end_of_video|>",
         videos=video,
         video_metadata=[metadata],
-        return_mm_token_type_ids=True,
     )
 
     rendered = tokenizer.last_text[0]
@@ -314,7 +350,40 @@ def test_glm5_next_processor_expands_video_frames_with_timestamps():
     assert rendered.count("<|image|>") == 12
     assert "0.0 seconds" in rendered
     assert "1.0 seconds" in rendered
-    assert int(np.asarray(output["mm_token_type_ids"]).sum()) == 12
+    token_types = np.asarray(output["mm_token_type_ids"])
+    assert int((token_types == 2).sum()) == 12
+    assert int((token_types == 1).sum()) == 0
+
+
+def test_glm5_next_processor_handles_ragged_multimodal_token_types():
+    processor = Glm5NextProcessor(
+        image_processor=_image_processor(),
+        tokenizer=_Tokenizer(),
+        video_processor=_video_processor(),
+    )
+    assert processor.create_mm_token_type_ids(
+        [
+            [31, 1],
+            [28, 31, 31, 29, 31],
+        ]
+    ) == [
+        [1, 0],
+        [0, 2, 2, 0, 1],
+    ]
+
+
+def test_glm5_next_tied_embeddings_match_transformers_behavior():
+    config = _text_config()
+    config.tie_word_embeddings = True
+    model = LanguageModel(config)
+    tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
+    hidden = model.model(tokens)
+    expected = model.model.embed_tokens.as_linear(hidden)
+    actual = model(tokens).logits
+    mx.eval(expected, actual)
+
+    assert not hasattr(model, "lm_head")
+    assert float(mx.max(mx.abs(actual - expected)).item()) == 0.0
 
 
 def test_glm5_next_prepare_inputs_propagates_video_metadata():
@@ -432,6 +501,21 @@ def test_glm5_next_hybrid_decoder_cache_matches_full_forward():
     chunked = mx.concatenate([first, second], axis=1)
     mx.eval(chunked)
     assert float(mx.max(mx.abs(full - chunked)).item()) < 1e-5
+
+
+def test_glm5_next_kda_masks_all_padding_dependent_projections():
+    mx.random.seed(16)
+    config = _text_config()
+    attention = Glm5NextLinearAttention(config, 0)
+    inputs = mx.random.normal((2, 5, config.hidden_size))
+    mask = mx.array([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]], dtype=mx.bool_)
+    masked_inputs = mx.where(mask[..., None], inputs, 0)
+
+    actual = attention(inputs, mask)
+    expected = attention(masked_inputs, mask)
+    mx.eval(actual, expected)
+
+    assert float(mx.max(mx.abs(actual - expected)).item()) == 0.0
 
 
 def test_glm5_next_sparse_prefill_uses_fused_sdpa_equivalent_math():

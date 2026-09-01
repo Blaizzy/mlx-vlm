@@ -195,6 +195,8 @@ class Glm5NextLinearAttention(nn.Module):
 
     def __call__(self, x, mask=None, cache=None):
         batch, length, _ = x.shape
+        if mask is not None and mask.dtype == mx.bool_:
+            x = mx.where(mask[..., None], x, 0)
         if cache is None:
             qkv_state = ssm_state = None
             lengths = None
@@ -274,8 +276,8 @@ def _sparse_head_gather(values: mx.array, indices: mx.array) -> mx.array:
 
 
 def _score_index_keys(q, keys, weights, scale):
-    scores = q @ keys[:, None].swapaxes(-1, -2)
-    scores = mx.maximum(scores, 0).astype(mx.float32)
+    scores = q.astype(mx.float32) @ keys[:, None].astype(mx.float32).swapaxes(-1, -2)
+    scores = mx.maximum(scores, 0)
     return (scores * (weights * scale)[..., None]).sum(axis=2)
 
 
@@ -1000,7 +1002,8 @@ class LanguageModel(nn.Module):
         self.config = config
         self.model_type = config.model_type
         self.model = Glm5NextTextModel(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if not config.tie_word_embeddings:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def chunked_prefill_policy(
         self,
@@ -1057,7 +1060,12 @@ class LanguageModel(nn.Module):
             attention_mask,
             hidden_sink=hidden_sink,
         )
-        logits = None if skip_logits else self.lm_head(hidden)
+        if skip_logits:
+            logits = None
+        elif self.args.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(hidden)
+        else:
+            logits = self.lm_head(hidden)
         return LanguageModelOutput(
             logits=logits,
             hidden_states=hidden_sink,
