@@ -710,10 +710,11 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
 
 
 @pytest.mark.parametrize("input_dims", [512, 6144])
-@pytest.mark.parametrize("verify_length", [3, 4])
+@pytest.mark.parametrize("verify_length", [2, 3, 4])
 @pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 def test_qwen_target_verify_mxfp4_linear_matches_singleton_path_exactly(
-    input_dims, verify_length, batch_size
+    input_dims, verify_length, batch_size, dtype
 ):
     mx.random.seed(25 + input_dims + verify_length + batch_size)
     linear = nn.QuantizedLinear(
@@ -724,7 +725,7 @@ def test_qwen_target_verify_mxfp4_linear_matches_singleton_path_exactly(
         bits=4,
         mode="mxfp4",
     )
-    x = mx.random.normal((batch_size, verify_length, input_dims)).astype(mx.bfloat16)
+    x = mx.random.normal((batch_size, verify_length, input_dims)).astype(dtype)
 
     ref = qwen_verifier._target_verify_timewise(linear, x)
     out = qwen_verifier._target_verify_linear(linear, x)
@@ -736,7 +737,12 @@ def test_qwen_target_verify_mxfp4_linear_matches_singleton_path_exactly(
 
 
 @pytest.mark.parametrize("output_dims", [(16, 24), (16, 24, 32)])
-def test_qwen_target_verify_mxfp4_linears_fuse_exactly(output_dims):
+@pytest.mark.parametrize("verify_length", [2, 4])
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_qwen_target_verify_mxfp4_linears_fuse_exactly(
+    output_dims, verify_length, batch_size, dtype
+):
     mx.random.seed(41 + len(output_dims))
     linears = tuple(
         nn.QuantizedLinear(
@@ -749,7 +755,7 @@ def test_qwen_target_verify_mxfp4_linears_fuse_exactly(output_dims):
         )
         for output_dim in output_dims
     )
-    x = mx.random.normal((1, 4, 512)).astype(mx.bfloat16)
+    x = mx.random.normal((batch_size, verify_length, 512)).astype(dtype)
 
     ref = tuple(qwen_verifier._target_verify_timewise(linear, x) for linear in linears)
     out = qwen_verifier._target_verify_linears(linears, x)
@@ -759,10 +765,11 @@ def test_qwen_target_verify_mxfp4_linears_fuse_exactly(output_dims):
 
 
 @pytest.mark.parametrize("output_dims", [16, 248])
-@pytest.mark.parametrize("verify_length", [3, 4])
+@pytest.mark.parametrize("verify_length", [2, 3, 4])
 @pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 def test_qwen_target_verify_mxfp4_argmax_matches_singletons(
-    output_dims, verify_length, batch_size
+    output_dims, verify_length, batch_size, dtype
 ):
     mx.random.seed(59 + output_dims + verify_length + batch_size)
     linear = nn.QuantizedLinear(
@@ -773,7 +780,7 @@ def test_qwen_target_verify_mxfp4_argmax_matches_singletons(
         bits=4,
         mode="mxfp4",
     )
-    x = mx.random.normal((batch_size, verify_length, 512)).astype(mx.bfloat16)
+    x = mx.random.normal((batch_size, verify_length, 512)).astype(dtype)
 
     ref = mx.argmax(qwen_verifier._target_verify_timewise(linear, x), axis=-1)
     out = qwen_verifier._target_verify_mxfp4_argmax(linear, x)
