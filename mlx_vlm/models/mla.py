@@ -4,6 +4,20 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
+def max_absorbed_queries(
+    kv_lora_rank: int, qk_nope_head_dim: int, v_head_dim: int
+) -> int:
+    """Query count below which folding into the query beats materializing K/V.
+
+    Absorbed cost scales with the number of new queries; materializing scales
+    with the cached length, so the crossover does not depend on context size.
+    """
+    denom = 2 * kv_lora_rank - qk_nope_head_dim - v_head_dim
+    if denom <= 0:
+        return 1
+    return max(1, int(kv_lora_rank * (qk_nope_head_dim + v_head_dim) / denom))
+
+
 class MultiLinear(nn.Module):
     def __init__(self, input_dims: int, output_dims: int, num_heads: int) -> None:
         super().__init__()
