@@ -725,6 +725,133 @@ def test_qwen_target_verify_4bit_linear_matches_singleton_path_exactly(
     assert bool(mx.array_equal(ref, out).item())
 
 
+@pytest.mark.parametrize("input_dims", [512, 6656])
+@pytest.mark.parametrize("verify_length", [2, 3, 4])
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("group_size", [32, 64])
+def test_qwen_target_verify_3bit_linear_uses_exact_kernel(
+    input_dims, verify_length, batch_size, dtype, group_size
+):
+    mx.random.seed(37 + input_dims + verify_length + batch_size)
+    linear = nn.QuantizedLinear(
+        input_dims, 16, bias=False, group_size=group_size, bits=3
+    )
+    linear.scales = linear.scales.astype(dtype)
+    linear.biases = linear.biases.astype(dtype)
+    x = mx.random.normal((batch_size, verify_length, input_dims)).astype(dtype)
+
+    ref = qwen_verifier._target_verify_timewise(linear, x)
+    out = qwen_verifier._target_verify_quantized_linear(linear, x)
+
+    assert out is not None
+    mx.eval(ref, out)
+    assert bool(mx.array_equal(ref, out).item())
+
+
+@pytest.mark.parametrize("output_dims", [(16, 24), (16, 24, 32), (8, 16, 24, 32)])
+@pytest.mark.parametrize("verify_length", [2, 4])
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("group_size", [32, 64])
+def test_qwen_target_verify_fused_3bit_linears_use_exact_kernel(
+    output_dims, verify_length, batch_size, dtype, group_size
+):
+    mx.random.seed(53 + len(output_dims) + verify_length + batch_size)
+    linears = tuple(
+        nn.QuantizedLinear(
+            512,
+            output_dim,
+            bias=False,
+            group_size=group_size,
+            bits=3,
+        )
+        for output_dim in output_dims
+    )
+    for linear in linears:
+        linear.scales = linear.scales.astype(dtype)
+        linear.biases = linear.biases.astype(dtype)
+    x = mx.random.normal((batch_size, verify_length, 512)).astype(dtype)
+
+    ref = tuple(qwen_verifier._target_verify_timewise(linear, x) for linear in linears)
+    out = qwen_verifier._target_verify_quantized_linears(linears, x)
+
+    assert out is not None
+    mx.eval(*ref, *out)
+    assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
+
+
+@pytest.mark.parametrize("output_dims", [16, 248])
+@pytest.mark.parametrize("verify_length", [2, 3, 4])
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("group_size", [32, 64])
+def test_qwen_target_verify_3bit_argmax_uses_exact_kernel(
+    output_dims, verify_length, batch_size, dtype, group_size
+):
+    mx.random.seed(61 + output_dims + verify_length + batch_size)
+    linear = nn.QuantizedLinear(
+        512, output_dims, bias=False, group_size=group_size, bits=3
+    )
+    linear.scales = linear.scales.astype(dtype)
+    linear.biases = linear.biases.astype(dtype)
+    x = mx.random.normal((batch_size, verify_length, 512)).astype(dtype)
+
+    ref = mx.argmax(qwen_verifier._target_verify_timewise(linear, x), axis=-1)
+    out = qwen_verifier._target_verify_quantized_argmax(linear, x)
+
+    assert qwen_verifier._can_target_verify_quantized_head(linear)
+    assert out is not None
+    mx.eval(ref, out)
+    assert bool(mx.array_equal(ref, out).item())
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("group_size", [32, 64])
+def test_qwen_target_verify_3bit_masked_argmax_uses_exact_kernel(dtype, group_size):
+    mx.random.seed(71 + group_size)
+    batch_size, verify_length, output_dims = 2, 3, 248
+    linear = nn.QuantizedLinear(
+        512, output_dims, bias=False, group_size=group_size, bits=3
+    )
+    linear.scales = linear.scales.astype(dtype)
+    linear.biases = linear.biases.astype(dtype)
+    x = mx.random.normal((batch_size, verify_length, 512)).astype(dtype)
+    allowed = [index * 32 + 7 for index in range(batch_size * verify_length)]
+    packed_mask = []
+    for token in allowed:
+        row = [0] * ((output_dims + 31) // 32)
+        row[token >> 5] = 1 << (token & 31)
+        packed_mask.append(row)
+    token_mask = mx.array(packed_mask, dtype=mx.int32)
+
+    logits = qwen_verifier._target_verify_timewise(linear, x).reshape(
+        batch_size * verify_length, output_dims
+    )
+    allowed_array = mx.array(allowed, dtype=mx.int32)
+    allowed_mask = mx.arange(output_dims)[None, :] == allowed_array[:, None]
+    ref = mx.argmax(mx.where(allowed_mask, logits, -mx.inf), axis=-1).reshape(
+        batch_size, verify_length
+    )
+    out = qwen_verifier._target_verify_quantized_argmax(
+        linear, x, token_mask=token_mask
+    )
+    mx.eval(ref, out)
+
+    assert out is not None
+    assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_3bit_exact_verifier_does_not_change_greedy_decode_routing():
+    linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=3)
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    verifier = qwen_verifier.Qwen3_5ExactSpeculativeVerifier()
+
+    assert qwen_verifier._can_target_verify_quantized_head(linear)
+    assert not verifier.can_quantized_head(linear)
+
+
 @pytest.mark.parametrize("output_dims", [(16, 24), (16, 24, 32), (8, 16, 24, 32)])
 @pytest.mark.parametrize("verify_length", [3, 6, 8])
 def test_qwen_target_verify_4bit_linears_fuse_exactly(output_dims, verify_length):
