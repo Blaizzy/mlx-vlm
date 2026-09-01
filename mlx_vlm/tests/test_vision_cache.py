@@ -139,6 +139,7 @@ class TestCachedImageFeaturesKwarg:
             "granite_vision.granite_vision",
             "granite4_vision.granite4_vision",
             "deepseek_vl_v2.deepseek_vl_v2",
+            "deepseek_v4.deepseek_v4",
             "multi_modality.multi_modality",
             "lfm2_vl.lfm2_vl",
             "idefics2.idefics2",

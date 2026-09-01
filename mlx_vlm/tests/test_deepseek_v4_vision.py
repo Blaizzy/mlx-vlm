@@ -308,6 +308,31 @@ class TestDeepseekV4VisionLanguage(unittest.TestCase):
                 )
                 self.assertEqual(decode.logits.shape, (1, 1, model.config.vocab_size))
 
+    def test_image_prompt_supports_multiple_decode_steps(self):
+        processor = TestDeepseekV4ImageProcessor().make_processor(vocab_size=16)
+        processed = processor(
+            f"before{IMAGE_PLACEHOLDER}after",
+            images=[Image.new("RGB", (8, 4), (20, 40, 60))],
+            return_tensors="mlx",
+        )
+        model = Model(tiny_vision_config())
+        cache = model.make_cache()
+        output = model(
+            processed["input_ids"],
+            pixel_values=processed["pixel_values"],
+            cache=cache,
+            **{
+                key: value
+                for key, value in processed.items()
+                if key.startswith("image_")
+            },
+        )
+        for token in (2, 3, 4):
+            output = model(mx.array([[token]], dtype=mx.int32), cache=cache)
+            mx.eval(output.logits)
+
+        self.assertEqual(output.logits.shape, (1, 1, model.config.vocab_size))
+
     def test_image_prefill_hidden_feeds_text_only_dspark(self):
         processor = TestDeepseekV4ImageProcessor().make_processor(vocab_size=16)
         processed = processor(
@@ -484,6 +509,24 @@ class TestDeepseekV4ImageProcessor(unittest.TestCase):
         self.assertLessEqual(len(types), 384)
         self.assertEqual(patches.shape[1:], (3, 14, 14))
 
+    def test_portrait_and_landscape_resize_constraints(self):
+        for size in ((120, 1600), (1600, 120), (512, 512)):
+            with self.subTest(size=size):
+                patches, n_h, n_w, n_llm_h, n_llm_w = preprocess_image(
+                    Image.new("RGB", size, (0, 0, 0)),
+                    patch_size=14,
+                    downsample_ratio=3,
+                    max_n_token=384,
+                    min_pixels=147456,
+                    max_wh_ratio=8,
+                )
+                types, _ = build_image_block(n_llm_h, n_llm_w, start_pos=0)
+
+                if size[0] >= size[1]:
+                    self.assertLessEqual(n_w / n_h, 8)
+                self.assertLessEqual(len(types), 384)
+                self.assertEqual(patches.shape[0], n_h * n_w)
+
     def test_packed_processor_output_feeds_model_wrapper(self):
         processor = self.make_processor(vocab_size=16)
         output = processor(
@@ -527,6 +570,84 @@ class TestDeepseekV4ImageProcessor(unittest.TestCase):
                 output["input_ids"][sample_idx, offset : offset + len(types)].tolist(),
                 (16 + types).tolist(),
             )
+
+    def test_multiple_images_preserve_offsets_within_one_prompt(self):
+        processor = self.make_processor(vocab_size=16)
+        output = processor(
+            f"a{IMAGE_PLACEHOLDER}b{IMAGE_PLACEHOLDER}c",
+            images=[
+                Image.new("RGB", (8, 4), (20, 40, 60)),
+                Image.new("RGB", (4, 8), (60, 40, 20)),
+            ],
+            return_tensors="mlx",
+        )
+
+        self.assertEqual(output["image_sample_indices"].tolist(), [0, 0])
+        self.assertEqual(len(output["image_offsets"]), 2)
+        self.assertLess(
+            int(output["image_offsets"][0].item()),
+            int(output["image_offsets"][1].item()),
+        )
+        model = Model(tiny_vision_config())
+        features = model.get_input_embeddings(
+            output["input_ids"],
+            output["pixel_values"],
+            **{key: value for key, value in output.items() if key.startswith("image_")},
+        )
+        mx.eval(features.inputs_embeds)
+        self.assertEqual(features.inputs_embeds.shape[:2], output["input_ids"].shape)
+
+    def test_mixed_text_and_image_batch_runs_one_forward(self):
+        processor = self.make_processor(vocab_size=16)
+        output = processor(
+            ["text only", f"before{IMAGE_PLACEHOLDER}after"],
+            images=[Image.new("RGB", (8, 4), (20, 40, 60))],
+            return_tensors="mlx",
+        )
+        model = Model(tiny_vision_config())
+        result = model(
+            output["input_ids"],
+            pixel_values=output["pixel_values"],
+            **{key: value for key, value in output.items() if key.startswith("image_")},
+        )
+        mx.eval(result.logits)
+
+        self.assertEqual(
+            result.logits.shape,
+            (*output["input_ids"].shape, model.config.vocab_size),
+        )
+
+    def test_cached_packed_features_skip_vision_tower(self):
+        processor = self.make_processor(vocab_size=16)
+        output = processor(
+            f"before{IMAGE_PLACEHOLDER}after",
+            images=[Image.new("RGB", (8, 4), (20, 40, 60))],
+            return_tensors="mlx",
+        )
+        model = Model(tiny_vision_config())
+        cached = model.encode_images(
+            output["pixel_values"],
+            image_grid_hw=output["image_grid_hw"],
+            image_permutations=output["image_permutations"],
+        )
+        mx.eval(*cached)
+
+        with patch.object(
+            model, "_encode_images", side_effect=AssertionError("cache miss")
+        ):
+            features = model.get_input_embeddings(
+                output["input_ids"],
+                output["pixel_values"],
+                cached_image_features=cached,
+                **{
+                    key: value
+                    for key, value in output.items()
+                    if key.startswith("image_")
+                },
+            )
+            mx.eval(features.inputs_embeds)
+
+        self.assertEqual(features.inputs_embeds.shape[:2], output["input_ids"].shape)
 
 
 if __name__ == "__main__":

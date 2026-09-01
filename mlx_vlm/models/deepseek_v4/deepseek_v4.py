@@ -63,6 +63,17 @@ class Model(nn.Module):
             )
         return image_features
 
+    def encode_images(self, pixel_values: mx.array, **kwargs) -> list[mx.array]:
+        """Encode packed images for the shared vision-feature cache."""
+        image_grid_hw = kwargs.get("image_grid_hw")
+        image_permutations = kwargs.get("image_permutations")
+        if image_grid_hw is None or image_permutations is None:
+            raise ValueError(
+                "DeepSeek-V4 packed image caching requires image grids and "
+                "permutations"
+            )
+        return self._encode_images(pixel_values, image_grid_hw, image_permutations)
+
     def _merge_image_embeddings(
         self,
         input_ids: mx.array,
