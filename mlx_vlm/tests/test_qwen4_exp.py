@@ -122,7 +122,7 @@ class Qwen4ExpTests(unittest.TestCase):
             ).item()
         )
 
-    def test_quantized_decode_retains_the_native_fast_path(self):
+    def test_quantized_decode_uses_the_batch_invariant_path(self):
         model = qwen4_exp.Model(tiny_config())
         self.assertTrue(model.language_model._supports_batch_invariant_decode())
 
@@ -133,6 +133,43 @@ class Qwen4ExpTests(unittest.TestCase):
         )
 
         self.assertFalse(model.language_model._supports_batch_invariant_decode())
+
+        supported_head = nn.Linear(512, 64, bias=False)
+        supported_head.set_dtype(mx.bfloat16)
+        model.language_model.lm_head = nn.QuantizedLinear.from_linear(
+            supported_head,
+            group_size=32,
+            bits=4,
+        )
+
+        self.assertTrue(model.language_model._supports_batch_invariant_decode())
+
+    def test_quantized_final_mixer_is_batch_invariant(self):
+        config = tiny_config()
+        config.text_config.hc_lowrank = 32
+        language_model = qwen4_exp.Model(config).language_model
+        mixer = language_model.model.hyper_connection_mixer
+        mixer.input_mix_weight_down = nn.QuantizedLinear.from_linear(
+            mixer.input_mix_weight_down,
+            group_size=32,
+            bits=5,
+        )
+        mixer.input_mix_weight_up = nn.QuantizedLinear.from_linear(
+            mixer.input_mix_weight_up,
+            group_size=32,
+            bits=5,
+        )
+
+        mx.random.seed(41)
+        singleton = mx.random.normal((1, 3, 64)).astype(mx.bfloat16)
+        batch = mx.broadcast_to(singleton, (4, 3, 64))
+        expected = language_model._mtp_logits_hidden(singleton)
+        actual = language_model._mtp_logits_hidden(batch)
+        mx.eval(expected, actual)
+
+        self.assertTrue(
+            mx.array_equal(actual, mx.broadcast_to(expected, actual.shape)).item()
+        )
 
     def test_qsa_sparse_attention_matches_dense_mask(self):
         mx.random.seed(37)

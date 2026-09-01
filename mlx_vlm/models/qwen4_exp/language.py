@@ -1898,12 +1898,16 @@ class LanguageModel(Qwen3_5LanguageModel):
     def _supports_batch_invariant_decode(self):
         if self.args.tie_word_embeddings:
             return not isinstance(self.model.embed_tokens, nn.QuantizedEmbedding)
-        return not isinstance(self.lm_head, nn.QuantizedLinear)
+        return not isinstance(
+            self.lm_head, nn.QuantizedLinear
+        ) or _QWEN4_BATCH_INVARIANT_FORWARD.can_quantized_head(self.lm_head)
 
     def _mtp_logits_hidden(self, hidden: mx.array) -> mx.array:
         hc_width = self.args.hc_count * self.args.hidden_size
         if hidden.shape[-1] == hc_width:
-            return self.model.hyper_connection_mixer(hidden)
+            return _QWEN4_BATCH_INVARIANT_FORWARD._hyper_connection(
+                self.model.hyper_connection_mixer, hidden
+            )
         return hidden
 
     def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:

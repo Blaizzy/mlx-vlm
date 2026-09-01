@@ -1099,6 +1099,8 @@ def _target_verify_linear(linear, x: mx.array) -> mx.array:
         out = _target_verify_quantized_linear(linear, x)
         if out is not None:
             return out
+        if x.shape[0] > 1:
+            return _target_verify_singletons(linear, x)
         return _target_verify_timewise(linear, x)
 
     if isinstance(linear, nn.Linear) and "bias" not in linear:
