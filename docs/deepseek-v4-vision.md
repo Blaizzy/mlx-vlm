@@ -7,7 +7,7 @@ FP8/FP4 conversion, and its checkpoint-local DSpark drafter.
 Convert the base checkpoint without materializing every source shard at once:
 
 ```bash
-mlx_vlm.convert \
+python -m mlx_vlm.models.deepseek_v4.convert \
   --hf-path deepseek-ai/DeepSeek-V4-Flash-Vision-Exp \
   --mlx-path DeepSeek-V4-Flash-Vision-Exp-MLX
 ```

@@ -1,8 +1,13 @@
 import json
+from pathlib import Path
 
 import mlx.core as mx
 
-from mlx_vlm.models.deepseek_v4.convert import convert_deepseek_v4_vision
+import mlx_vlm.models.deepseek_v4.convert as convert_module
+from mlx_vlm.models.deepseek_v4.convert import (
+    configure_parser,
+    convert_deepseek_v4_vision,
+)
 
 
 def _write_shard(path, weights):
@@ -122,3 +127,79 @@ def test_streaming_converter_refuses_nonempty_output(tmp_path):
         assert "not empty" in str(error)
     else:
         raise AssertionError("Expected non-empty output to be rejected")
+
+
+def test_dedicated_converter_resolves_source_and_extracts_dspark(tmp_path, monkeypatch):
+    source = _make_source(tmp_path)
+    output = tmp_path / "output"
+    drafter = tmp_path / "drafter"
+    calls = {}
+
+    monkeypatch.setattr(
+        convert_module,
+        "get_model_path",
+        lambda model, revision=None: calls.update(model=model, revision=revision)
+        or source,
+    )
+
+    def fake_convert(model_path, output_path):
+        calls.update(model_path=model_path, output_path=Path(output_path))
+        Path(output_path).mkdir()
+        return Path(output_path)
+
+    class Splitter:
+        def split(self, model_path, output_path):
+            calls.update(dspark_source=model_path, dspark_output=output_path)
+
+    from mlx_vlm.speculative.drafters import mtp_split
+
+    monkeypatch.setattr(convert_module, "convert_deepseek_v4_vision", fake_convert)
+    monkeypatch.setattr(mtp_split, "detect_mtp_splitter", lambda path: Splitter())
+    monkeypatch.setattr(
+        convert_module,
+        "create_model_card",
+        lambda path, source_id: calls.update(card=(path, source_id)),
+    )
+    monkeypatch.setattr(
+        convert_module,
+        "upload_to_hub",
+        lambda path, repo: calls.update(upload=(path, repo)),
+    )
+
+    result = convert_module.convert(
+        "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+        output,
+        revision="test-revision",
+        mtp=True,
+        mtp_output=drafter,
+        upload_repo="mlx-community/test-model",
+    )
+
+    assert result == output
+    assert calls["model"] == "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"
+    assert calls["revision"] == "test-revision"
+    assert calls["model_path"] == source
+    assert calls["output_path"] == output
+    assert calls["dspark_source"] == str(source)
+    assert calls["dspark_output"] == str(drafter)
+    assert calls["card"] == (
+        output,
+        "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+    )
+    assert calls["upload"] == (output, "mlx-community/test-model")
+
+
+def test_dedicated_converter_parser_uses_model_specific_options():
+    args = configure_parser().parse_args(
+        [
+            "--model",
+            "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+            "--mlx-path",
+            "converted",
+            "--mtp",
+        ]
+    )
+
+    assert args.model == "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"
+    assert args.output_path == "converted"
+    assert args.mtp is True

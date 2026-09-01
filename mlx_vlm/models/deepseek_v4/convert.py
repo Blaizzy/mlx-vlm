@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import gc
 import json
 import re
@@ -10,7 +11,7 @@ from typing import Any
 
 import mlx.core as mx
 
-from ...utils import _load_safetensors
+from ...utils import _load_safetensors, create_model_card, get_model_path, upload_to_hub
 from .config import ModelConfig
 from .language import LanguageModel, normalize_checkpoint_key
 
@@ -209,4 +210,96 @@ def convert_deepseek_v4_vision(
     return destination
 
 
-__all__ = ["convert_deepseek_v4_vision", "is_deepseek_v4_vision_checkpoint"]
+def convert(
+    model: str,
+    output_path: str | Path,
+    *,
+    revision: str | None = None,
+    mtp: bool = False,
+    mtp_output: str | Path | None = None,
+    upload_repo: str | None = None,
+) -> Path:
+    """Resolve and convert a DeepSeek-V4 Flash Vision checkpoint."""
+    model_path = get_model_path(model, revision=revision)
+    print("[INFO] Streaming DeepSeek-V4 mixed FP8/FP4 conversion")
+    destination = convert_deepseek_v4_vision(model_path, output_path)
+
+    if mtp:
+        try:
+            from ...speculative.drafters.mtp_split import detect_mtp_splitter
+
+            splitter = detect_mtp_splitter(model_path)
+            if splitter is None:
+                print("[INFO] --mtp: no native DSpark tensors found; skipping")
+            else:
+                drafter_path = mtp_output or f"{destination}-mtp"
+                print(f"[INFO] Extracting DSpark drafter -> {drafter_path}")
+                splitter.split(str(model_path), str(drafter_path))
+        except Exception as exc:
+            print(
+                f"[WARNING] --mtp: failed to extract DSpark drafter "
+                f"({type(exc).__name__}: {exc}); base conversion is unaffected"
+            )
+
+    source_id = None if Path(model).expanduser().exists() else model
+    create_model_card(destination, source_id)
+    if upload_repo is not None:
+        upload_to_hub(destination, upload_repo)
+    return destination
+
+
+def configure_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Convert DeepSeek-V4 Flash Vision's mixed checkpoint to MLX."
+    )
+    parser.add_argument(
+        "--hf-path",
+        "--model",
+        dest="model",
+        required=True,
+        help="Local checkpoint path or Hugging Face repository ID.",
+    )
+    parser.add_argument(
+        "--mlx-path",
+        dest="output_path",
+        default="mlx_model",
+        help="Directory for the converted MLX model.",
+    )
+    parser.add_argument(
+        "--revision",
+        default=None,
+        help="Hugging Face revision to download.",
+    )
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="Also extract the checkpoint's native DSpark drafter.",
+    )
+    parser.add_argument(
+        "--mtp-output",
+        default=None,
+        help="Output path for the DSpark drafter (default: <mlx-path>-mtp).",
+    )
+    parser.add_argument(
+        "--upload-repo",
+        default=None,
+        help="Hugging Face repository for the converted target.",
+    )
+    return parser
+
+
+def main() -> None:
+    args = configure_parser().parse_args()
+    convert(**vars(args))
+
+
+if __name__ == "__main__":
+    main()
+
+
+__all__ = [
+    "configure_parser",
+    "convert",
+    "convert_deepseek_v4_vision",
+    "is_deepseek_v4_vision_checkpoint",
+]
