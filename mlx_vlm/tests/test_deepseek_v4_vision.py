@@ -180,14 +180,16 @@ class TestDeepseekV4VisionLanguage(unittest.TestCase):
             mask.tolist(),
             [
                 [
-                    [True, False, False, False, False, False, False, False],
-                    [True, True, True, True, True, True, True, False],
-                    [True, True, True, True, True, True, True, False],
-                    [False, True, True, True, True, True, True, False],
-                    [False, True, True, True, True, True, True, False],
-                    [False, True, True, True, True, True, True, False],
-                    [False, True, True, True, True, True, True, False],
-                    [False, False, False, False, False, True, True, True],
+                    [
+                        [True, False, False, False, False, False, False, False],
+                        [True, True, True, True, True, True, True, False],
+                        [True, True, True, True, True, True, True, False],
+                        [False, True, True, True, True, True, True, False],
+                        [False, True, True, True, True, True, True, False],
+                        [False, True, True, True, True, True, True, False],
+                        [False, True, True, True, True, True, True, False],
+                        [False, False, False, False, False, True, True, True],
+                    ]
                 ]
             ],
         )
@@ -616,7 +618,9 @@ class TestDeepseekV4ImageProcessor(unittest.TestCase):
             images=[Image.new("RGB", (8, 4), (20, 40, 60))],
             return_tensors="mlx",
         )
-        model = Model(tiny_vision_config())
+        # Keep batch size different from the attention-head count so a missing
+        # singleton head axis cannot broadcast accidentally.
+        model = Model(tiny_vision_config(num_attention_heads=4))
         result = model(
             output["input_ids"],
             pixel_values=output["pixel_values"],

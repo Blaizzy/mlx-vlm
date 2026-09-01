@@ -114,7 +114,7 @@ def create_image_attention_mask(
     starts = mx.maximum(positions - (window_size - 1) - left_extension, 0)
     ends = positions + right
     keys = mx.arange(sequence_length, dtype=mx.int32)[None, None]
-    return (keys >= starts[..., None]) & (keys <= ends[..., None])
+    return ((keys >= starts[..., None]) & (keys <= ends[..., None]))[:, None]
 
 
 @mx.compile
