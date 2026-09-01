@@ -1,9 +1,17 @@
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
+from PIL import Image
 
 from mlx_vlm.models.deepseek_v4.config import ModelConfig
 from mlx_vlm.models.deepseek_v4.deepseek_v4 import Model
+from mlx_vlm.models.deepseek_v4.processing_deepseek_v4 import (
+    IMAGE_PLACEHOLDER,
+    DeepseekV4Processor,
+    build_image_block,
+    preprocess_image,
+)
 from mlx_vlm.models.deepseek_v4.vision import Aligner, ViT
 
 
@@ -127,6 +135,185 @@ class TestDeepseekV4VisionTower(unittest.TestCase):
         self.assertFalse(hasattr(model, "vision"))
         output = model.get_input_embeddings(mx.array([[1, 2]], dtype=mx.int32))
         self.assertEqual(output.inputs_embeds.shape, (1, 2, 8))
+
+
+class ProcessorTokenizer:
+    chat_template = None
+    pad_token_id = 0
+    eos_token_id = 1
+    unk_token_id = -1
+
+    def convert_tokens_to_ids(self, token):
+        return 99 if token == IMAGE_PLACEHOLDER else self.unk_token_id
+
+    def encode(self, text, **kwargs):
+        del kwargs
+        tokens = []
+        for index, part in enumerate(text.split(IMAGE_PLACEHOLDER)):
+            if part:
+                tokens.append(10 + index)
+            if index < text.count(IMAGE_PLACEHOLDER):
+                tokens.append(99)
+        return tokens
+
+    def __call__(self, text, **kwargs):
+        del kwargs
+        rows = [text] if isinstance(text, str) else text
+        return {"input_ids": [self.encode(row) for row in rows]}
+
+    def apply_chat_template(self, messages, **kwargs):
+        del kwargs
+        return "|".join(message["content"] for message in messages)
+
+
+class TestDeepseekV4ImageProcessor(unittest.TestCase):
+    def make_processor(self, vocab_size=128):
+        with patch.object(
+            DeepseekV4Processor,
+            "check_argument_for_proper_class",
+            return_value=None,
+        ):
+            return DeepseekV4Processor(
+                ProcessorTokenizer(),
+                vocab_size=vocab_size,
+                vision_patch_size=2,
+                vision_downsample_ratio=2,
+                vision_max_n_token=64,
+                vision_min_pixels=0,
+                vision_max_wh_ratio=8,
+            )
+
+    def test_build_image_block_matches_n_layout(self):
+        types, perm = build_image_block(2, 3, start_pos=0)
+
+        self.assertEqual(
+            types.tolist(),
+            [1, 1, 1, 0, 2, 2, 2, 2, 2, 2, 3, 3, 4],
+        )
+        self.assertEqual(perm.tolist(), [0, 3, 1, 4, 2, 5])
+
+    def test_openai_content_blocks_become_ordered_placeholders(self):
+        processor = self.make_processor()
+        rendered = processor.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "before"},
+                        {"type": "image_url", "image_url": {"url": "x"}},
+                        {"type": "text", "text": "after"},
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(rendered, f"before{IMAGE_PLACEHOLDER}after")
+
+    def test_prompt_helper_preserves_openai_image_position(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        processor = self.make_processor()
+        rendered = apply_chat_template(
+            processor,
+            {"model_type": "deepseek_v4"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "image_url", "image_url": {"url": "x"}},
+                    {"type": "text", "text": "after"},
+                ],
+            },
+            num_images=1,
+        )
+
+        self.assertEqual(rendered, f"before{IMAGE_PLACEHOLDER}after")
+
+    def test_processor_packs_patches_and_expands_sentinels(self):
+        processor = self.make_processor()
+        image = Image.new("RGB", (8, 4), (255, 0, 127))
+
+        output = processor(
+            f"before{IMAGE_PLACEHOLDER}after",
+            images=[image],
+            return_tensors="mlx",
+        )
+
+        self.assertEqual(output["pixel_values"].shape, (8, 3, 2, 2))
+        self.assertEqual(output["image_grid_hw"].tolist(), [[2, 4]])
+        self.assertEqual(output["image_sample_indices"].tolist(), [0])
+        self.assertEqual(output["image_offsets"].tolist(), [1])
+        self.assertEqual(output["image_type_offsets"].tolist(), [0, 12])
+        self.assertEqual(
+            output["image_types"].tolist(),
+            [1, 1, 0, 2, 1, 2, 1, 3, 1, 1, 1, 4],
+        )
+        self.assertEqual(output["image_permutations"].tolist(), [0, 1])
+        self.assertEqual(
+            output["input_ids"][0, 1:13].tolist(),
+            (128 + output["image_types"]).tolist(),
+        )
+        self.assertLessEqual(float(output["pixel_values"].max().item()), 1.0)
+        self.assertGreaterEqual(float(output["pixel_values"].min().item()), -1.0)
+
+    def test_extreme_landscape_respects_token_budget(self):
+        image = Image.new("RGB", (4000, 100), (0, 0, 0))
+        patches, _, _, n_llm_h, n_llm_w = preprocess_image(
+            image,
+            patch_size=14,
+            downsample_ratio=3,
+            max_n_token=384,
+            min_pixels=147456,
+            max_wh_ratio=8,
+        )
+        types, _ = build_image_block(n_llm_h, n_llm_w, start_pos=0)
+
+        self.assertLessEqual(len(types), 384)
+        self.assertEqual(patches.shape[1:], (3, 14, 14))
+
+    def test_packed_processor_output_feeds_model_wrapper(self):
+        processor = self.make_processor(vocab_size=16)
+        output = processor(
+            f"before{IMAGE_PLACEHOLDER}after",
+            images=[Image.new("RGB", (8, 4), (20, 40, 60))],
+            return_tensors="mlx",
+        )
+        model = Model(tiny_vision_config())
+
+        features = model.get_input_embeddings(
+            output["input_ids"],
+            output["pixel_values"],
+            **{key: value for key, value in output.items() if key.startswith("image_")},
+        )
+        mx.eval(features.inputs_embeds)
+
+        self.assertEqual(
+            features.inputs_embeds.shape,
+            (*output["input_ids"].shape, model.config.hidden_size),
+        )
+
+    def test_flat_images_are_allocated_across_batch_samples(self):
+        processor = self.make_processor(vocab_size=16)
+        image = Image.new("RGB", (8, 4), (20, 40, 60))
+        output = processor(
+            [
+                f"{IMAGE_PLACEHOLDER}after",
+                f"before{IMAGE_PLACEHOLDER}",
+            ],
+            images=[image, image],
+            return_tensors="mlx",
+        )
+
+        self.assertEqual(output["image_sample_indices"].tolist(), [0, 1])
+        for image_idx, sample_idx in enumerate([0, 1]):
+            type_start = int(output["image_type_offsets"][image_idx].item())
+            type_end = int(output["image_type_offsets"][image_idx + 1].item())
+            offset = int(output["image_offsets"][image_idx].item())
+            types = output["image_types"][type_start:type_end]
+            self.assertEqual(
+                output["input_ids"][sample_idx, offset : offset + len(types)].tolist(),
+                (16 + types).tolist(),
+            )
 
 
 if __name__ == "__main__":
