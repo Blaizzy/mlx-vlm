@@ -3920,6 +3920,22 @@ def test_glm5_next_mtp_draft_block_smoke():
     assert drafter.config.runtime_block_size == 2
 
 
+def test_glm5_next_mtp_sampler_state_tolerates_uninitialized_kv_cache():
+    text_config = _tiny_glm5_next_text_config()
+    drafter = Glm5NextMTPDraftModel(
+        Glm5NextMTPConfig(text_config=text_config, block_size=2)
+    )
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
+        )
+    )
+    drafter.reset(target)
+
+    sampler_rng = _SpeculativeSamplerRNG(drafter, enabled=False)
+    assert sampler_rng.draft_call(lambda: None) is None
+
+
 def test_glm5_next_mtp_batch_acceptance_keeps_rows_aligned():
     text_config = _tiny_glm5_next_text_config()
     drafter = Glm5NextMTPDraftModel(

@@ -98,6 +98,18 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
         self._round_cache_snapshot = None
         return caches
 
+    def draft_eval_state(self):
+        state = [self._seed_token, self._seed_hidden]
+        for cache in self._cache:
+            for subcache in cache.caches:
+                # A batch MTP round can update the accepted seed before the
+                # first draft forward initializes every KV cache. Only arrays
+                # need to be synchronized for sampler-state isolation.
+                if getattr(subcache, "keys", False) is None:
+                    continue
+                state.append(subcache.state)
+        return state
+
     def validate_target_compatibility(self, target_model) -> None:
         language_model = getattr(target_model, "language_model", target_model)
         target_args = getattr(language_model, "args", None)
