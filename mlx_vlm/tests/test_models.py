@@ -18093,3 +18093,118 @@ class TestMTPSplit(unittest.TestCase):
         self.assertNotIn("norm.scales", weights)
         self.assertEqual(config["quantization"]["mode"], "affine")
         self.assertEqual(config["quantization"]["bits"], 4)
+
+
+class TestVideoDepthAnything(unittest.TestCase):
+    # ─── Video Depth Anything Tests ────────────────────────────
+
+    def _tiny_config(self, **overrides):
+        from mlx_vlm.models.video_depth_anything.config import ModelConfig
+
+        args = dict(
+            encoder="vits",
+            embed_dim=64,
+            depth=4,
+            num_heads=4,
+            features=32,
+            out_channels=[32, 48, 64, 64],
+            intermediate_layer_idx=[0, 1, 2, 3],
+            num_frames=8,
+            norm_num_groups=8,
+        )
+        args.update(overrides)
+        return ModelConfig(**args)
+
+    def test_config_presets(self):
+        """Encoder presets fill in backbone/head dims."""
+        from mlx_vlm.models.video_depth_anything.config import ModelConfig
+
+        config = ModelConfig()
+        self.assertEqual(config.model_type, "video_depth_anything")
+        self.assertEqual(config.embed_dim, 1024)  # vitl default
+        self.assertEqual(config.depth, 24)
+        self.assertEqual(config.out_channels, [256, 512, 1024, 1024])
+        self.assertEqual(config.intermediate_layer_idx, [4, 11, 17, 23])
+
+        small = ModelConfig(encoder="vits")
+        self.assertEqual(small.embed_dim, 384)
+        self.assertEqual(small.features, 64)
+
+    def test_vision_backbone(self):
+        """DINOv2 backbone returns patch/cls tokens per requested layer."""
+        from mlx_vlm.models.video_depth_anything.vision import DINOv2
+
+        config = self._tiny_config()
+        backbone = DINOv2(config)
+        x = mx.random.normal((2, 70, 98, 3))
+        feats = backbone.get_intermediate_layers(x, [0, 1, 2, 3])
+        self.assertEqual(len(feats), 4)
+        for patches, cls in feats:
+            self.assertEqual(patches.shape, (2, 5 * 7, 64))
+            self.assertEqual(cls.shape, (2, 64))
+
+    def test_temporal_module_zero_proj_is_identity(self):
+        """With a zeroed proj_out the temporal module reduces to identity."""
+        from mlx_vlm.models.video_depth_anything.motion import TemporalModule
+
+        module = TemporalModule(
+            in_channels=32,
+            num_attention_heads=4,
+            num_transformer_block=1,
+            num_attention_blocks=2,
+            norm_num_groups=8,
+            temporal_max_len=8,
+        )
+        zeroed = {
+            "temporal_transformer.proj_out.weight": mx.zeros((32, 32)),
+            "temporal_transformer.proj_out.bias": mx.zeros((32,)),
+        }
+        module.load_weights(list(zeroed.items()), strict=False)
+
+        x = mx.random.normal((2, 4, 5, 7, 32))
+        out = module(x)
+        self.assertEqual(out.shape, x.shape)
+        self.assertTrue(mx.allclose(out, x, atol=1e-5))
+
+    def test_model_forward_shapes(self):
+        """Full model maps (B, T, H, W, 3) to (B, T, H, W) depth."""
+        from mlx_vlm.models.video_depth_anything.video_depth_anything import Model
+
+        model = Model(self._tiny_config())
+        for h, w in [(70, 70), (70, 98)]:
+            depth = model(mx.random.normal((1, 4, h, w, 3)))
+            self.assertEqual(depth.shape, (1, 4, h, w))
+            self.assertTrue(bool(mx.all(depth >= 0)))
+
+    def test_sanitize_conv_layouts(self):
+        """sanitize() transposes Conv2d and ConvTranspose2d weights correctly."""
+        from mlx_vlm.models.video_depth_anything.video_depth_anything import Model
+
+        weights = {
+            # Conv2d: (out, in, kh, kw) -> (out, kh, kw, in)
+            "pretrained.patch_embed.proj.weight": mx.zeros((64, 3, 14, 14)),
+            # ConvTranspose2d: (in, out, kh, kw) -> (out, kh, kw, in)
+            "head.resize_layers.0.weight": mx.zeros((48, 48, 4, 4)),
+            # resize_layers.3 is a strided Conv2d, not a transpose conv
+            "head.resize_layers.3.weight": mx.zeros((64, 64, 3, 3)),
+            "pretrained.blocks.0.attn.qkv.weight": mx.zeros((192, 64)),
+        }
+        out = Model.sanitize(weights)
+        self.assertEqual(
+            out["pretrained.patch_embed.proj.weight"].shape, (64, 14, 14, 3)
+        )
+        self.assertEqual(out["head.resize_layers.0.weight"].shape, (48, 4, 4, 48))
+        self.assertEqual(out["head.resize_layers.3.weight"].shape, (64, 3, 3, 64))
+        self.assertEqual(out["pretrained.blocks.0.attn.qkv.weight"].shape, (192, 64))
+
+    def test_processor_target_size(self):
+        """Processor keeps aspect ratio and snaps to multiples of 14."""
+        from mlx_vlm.models.video_depth_anything.processing_video_depth_anything import (
+            VideoDepthProcessor,
+        )
+
+        proc = VideoDepthProcessor(input_size=518)
+        h, w = proc.target_size(1080, 1920)
+        self.assertEqual((h % 14, w % 14), (0, 0))
+        self.assertGreaterEqual(min(h, w), 294)
+        self.assertAlmostEqual(h / w, 1080 / 1920, places=1)
