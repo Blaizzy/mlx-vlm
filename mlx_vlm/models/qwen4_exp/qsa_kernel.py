@@ -1,9 +1,20 @@
 """Indexed sparse attention kernel for Qwen Sparse Attention (QSA)."""
 
+from enum import Enum
 from functools import lru_cache
-from typing import Optional
 
 import mlx.core as mx
+
+
+class QSAExecutionPlan(str, Enum):
+    """Concrete attention implementation selected for one QSA invocation."""
+
+    INDEXED_SPARSE_PREFILL = "indexed_sparse_prefill"
+    DENSE_DECODE = "dense_decode"
+    DENSE_MASKED = "dense_masked"
+    DENSE_SHORT_CONTEXT = "dense_short_context"
+    DENSE_UNSUPPORTED = "dense_unsupported"
+
 
 _QSA_SPARSE_ATTENTION_SOURCE = r"""
     uint row_idx = threadgroup_position_in_grid.y;
@@ -192,6 +203,73 @@ def _qsa_sparse_attention_scalars(scale: float, key_length: int):
     )
 
 
+def select_qsa_execution_plan(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    block_indices: mx.array,
+    query_ends: mx.array,
+    *,
+    block_size: int,
+    causal: bool,
+    all_sparse: bool,
+) -> QSAExecutionPlan:
+    """Select one explicit QSA implementation without evaluating MLX arrays."""
+
+    if not causal:
+        return QSAExecutionPlan.DENSE_MASKED
+    if not all_sparse:
+        return QSAExecutionPlan.DENSE_SHORT_CONTEXT
+    if (
+        not isinstance(queries, mx.array)
+        or not isinstance(keys, mx.array)
+        or not isinstance(values, mx.array)
+        or not isinstance(block_indices, mx.array)
+        or not isinstance(query_ends, mx.array)
+        or queries.ndim != 4
+        or keys.ndim != 4
+        or values.ndim != 4
+        or block_indices.ndim != 3
+        or query_ends.ndim != 2
+    ):
+        return QSAExecutionPlan.DENSE_UNSUPPORTED
+
+    batch, q_heads, query_length, d_size = queries.shape
+    kv_heads = keys.shape[1]
+    key_length = keys.shape[2]
+    topk_blocks = block_indices.shape[-1]
+    selected_length = topk_blocks * block_size
+    if query_length <= 1:
+        # The vector SDPA kernel remains faster for singleton decode.
+        return QSAExecutionPlan.DENSE_DECODE
+    if (
+        kv_heads <= 0
+        or block_size <= 0
+        or selected_length <= 0
+        or selected_length >= key_length
+        or key_length < selected_length * 7
+    ):
+        # Sparse selection does not repay its dispatch cost below this crossover.
+        return QSAExecutionPlan.DENSE_SHORT_CONTEXT
+    if (
+        queries.dtype not in (mx.bfloat16, mx.float16)
+        or keys.dtype != queries.dtype
+        or values.dtype != queries.dtype
+        or mx.default_device() != mx.gpu
+        or not mx.metal.is_available()
+        or batch != block_indices.shape[0]
+        or batch != query_ends.shape[0]
+        or query_length != block_indices.shape[1]
+        or query_length != query_ends.shape[1]
+        or values.shape != keys.shape
+        or q_heads % kv_heads != 0
+        or d_size != values.shape[-1]
+        or d_size % 32 != 0
+    ):
+        return QSAExecutionPlan.DENSE_UNSUPPORTED
+    return QSAExecutionPlan.INDEXED_SPARSE_PREFILL
+
+
 def qsa_sparse_attention(
     queries: mx.array,
     keys: mx.array,
@@ -201,49 +279,30 @@ def qsa_sparse_attention(
     *,
     scale: float,
     block_size: int,
-) -> Optional[mx.array]:
+) -> mx.array:
     """Attend directly to QSA-selected blocks without gathering or a dense mask."""
 
-    if (
-        not isinstance(queries, mx.array)
-        or not isinstance(keys, mx.array)
-        or not isinstance(values, mx.array)
-        or queries.ndim != 4
-        or keys.ndim != 4
-        or values.ndim != 4
-        or block_indices.ndim != 3
-        or query_ends.ndim != 2
-        or queries.dtype not in (mx.bfloat16, mx.float16)
-        or keys.dtype != queries.dtype
-        or values.dtype != queries.dtype
-        or mx.default_device() != mx.gpu
-        or not mx.metal.is_available()
-    ):
-        return None
+    plan = select_qsa_execution_plan(
+        queries,
+        keys,
+        values,
+        block_indices,
+        query_ends,
+        block_size=block_size,
+        causal=True,
+        all_sparse=True,
+    )
+    if plan is not QSAExecutionPlan.INDEXED_SPARSE_PREFILL:
+        raise ValueError(
+            "The indexed QSA kernel was called for an incompatible execution "
+            f"plan: {plan.value}."
+        )
 
     batch, q_heads, query_length, d_size = queries.shape
     kv_heads = keys.shape[1]
     key_length = keys.shape[2]
     topk_blocks = block_indices.shape[-1]
     selected_length = topk_blocks * block_size
-    if (
-        batch != block_indices.shape[0]
-        or batch != query_ends.shape[0]
-        or query_length != block_indices.shape[1]
-        or query_length != query_ends.shape[1]
-        or values.shape != keys.shape
-        or q_heads % kv_heads != 0
-        or d_size != values.shape[-1]
-        or d_size % 32 != 0
-        # The dense vector kernel is faster for singleton decode; this kernel
-        # is designed to amortize its 1,024-thread launch across prefill rows.
-        or query_length <= 1
-        or block_size <= 0
-        or selected_length >= key_length
-        # Dense SDPA is faster while the selected set is a large fraction of K.
-        or key_length < selected_length * 7
-    ):
-        return None
 
     queries = mx.contiguous(queries)
     keys = mx.contiguous(keys)

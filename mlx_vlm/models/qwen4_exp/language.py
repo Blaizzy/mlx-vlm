@@ -24,7 +24,11 @@ from ..qwen3_5.language import (
 from ..qwen3_5.speculative_verifier import Qwen3_5ExactSpeculativeVerifier
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
-from .qsa_kernel import qsa_sparse_attention
+from .qsa_kernel import (
+    QSAExecutionPlan,
+    qsa_sparse_attention,
+    select_qsa_execution_plan,
+)
 
 
 def _append_indexer_positions(
@@ -1049,8 +1053,8 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 position_ids=position_ids,
                 position_embeddings=position_embeddings,
             )
-        use_sparse_kernel = selection.all_sparse and standard_causal_mask
-        qsa_mask = None if use_sparse_kernel else self.indexer.build_mask(selection)
+        sparse_candidate = selection.all_sparse and standard_causal_mask
+        qsa_mask = None if sparse_candidate else self.indexer.build_mask(selection)
         if qsa_mask is not None:
             if standard_causal_mask:
                 mask = qsa_mask
@@ -1070,10 +1074,19 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             cache,
             position_ids,
             position_embeddings,
-            None if use_sparse_kernel else mask,
+            None if sparse_candidate else mask,
         )
-        output = None
-        if use_sparse_kernel:
+        plan = select_qsa_execution_plan(
+            queries,
+            keys,
+            values,
+            selection.selected_blocks,
+            selection.query_ends,
+            block_size=self.indexer.compress_ratio,
+            causal=standard_causal_mask,
+            all_sparse=selection.all_sparse,
+        )
+        if plan is QSAExecutionPlan.INDEXED_SPARSE_PREFILL:
             output = qsa_sparse_attention(
                 queries,
                 keys,
@@ -1083,7 +1096,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 scale=self.scale,
                 block_size=self.indexer.compress_ratio,
             )
-        if output is None:
+        else:
             if qsa_mask is None:
                 qsa_mask = self.indexer.build_mask(selection)
                 mask = qsa_mask
@@ -1488,6 +1501,27 @@ class Qwen4ExpDecoderLayer(nn.Module):
         return hyper_input + injection.reshape(*hyper_input.shape)
 
 
+def _create_qwen4_exp_attention_mask(h: mx.array, cache):
+    """Preserve causal semantics for an equal-length QSA batch.
+
+    ``BatchKVCache`` normally materializes a boolean mask because it also
+    represents ragged batches. A QSA batch with no left or pending right
+    padding is ordinary causal attention, so keep that semantic marker and let
+    the QSA dispatcher choose the indexed sparse prefill kernel.
+    """
+
+    if isinstance(cache, BatchQSAKVCache):
+        padding_info = _qwen3_5_left_padding_info(cache)
+        pending_right_padding = getattr(cache.kv_cache, "_right_padding", None)
+        if (
+            padding_info is not None
+            and padding_info[1] == 0
+            and pending_right_padding is None
+        ):
+            return None if h.shape[1] == 1 else "causal"
+    return _create_qwen3_5_attention_mask(h, cache)
+
+
 class Qwen4ExpModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -1523,9 +1557,10 @@ class Qwen4ExpModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        # Ragged prefill has row-specific recurrent, PLE, RoPE, and QSA
-        # semantics. Process each row through the singleton-equivalent path,
-        # merge the resulting caches, and continue decode as a batch.
+        # Qwen4's quantized hyper-connections, recurrent state, and MoE routing
+        # are batch-shape sensitive. Build every batched prefill cache through
+        # singleton-equivalent rows, then merge the caches for batched decode.
+        # This covers equal-length and ragged batches with one invariant path.
         fa_cache = cache[self.fa_idx]
         if (
             hidden_states.shape[0] > 1
@@ -1540,92 +1575,83 @@ class Qwen4ExpModel(nn.Module):
             query_left_padding = mx.minimum(
                 mx.maximum(-fa_cache.offset, 0), hidden_states.shape[1]
             )
-            cache_left_padding = getattr(fa_cache, "left_padding", None)
-            has_left_padding = (
-                isinstance(cache_left_padding, mx.array)
-                and cache_left_padding.ndim > 0
-                and int(cache_left_padding.max().item()) > 0
-            )
-            if has_left_padding or int(query_left_padding.max().item()) > 0:
-                row_outputs = []
-                row_caches = [[] for _ in cache]
-                batch_offsets = []
+            row_outputs = []
+            row_caches = [[] for _ in cache]
+            batch_offsets = []
+            for cache_entry in cache:
+                offsets = getattr(cache_entry, "offset", None)
+                if (
+                    isinstance(offsets, mx.array)
+                    and offsets.ndim > 0
+                    and offsets.size >= hidden_states.shape[0]
+                ):
+                    batch_offsets.append(offsets[: hidden_states.shape[0]])
+                else:
+                    batch_offsets.append(None)
+
+            for row, pad in enumerate(query_left_padding.tolist()):
+                pad = min(max(int(pad), 0), hidden_states.shape[1])
+                current_cache = []
                 for cache_entry in cache:
-                    offsets = getattr(cache_entry, "offset", None)
-                    if (
-                        isinstance(offsets, mx.array)
-                        and offsets.ndim > 0
-                        and offsets.size >= hidden_states.shape[0]
-                    ):
-                        batch_offsets.append(offsets[: hidden_states.shape[0]])
+                    if cache_entry is None:
+                        current_cache.append(None)
+                    elif isinstance(cache_entry, BatchQSAKVCache):
+                        current_cache.append(cache_entry.extract(row))
                     else:
-                        batch_offsets.append(None)
-
-                for row, pad in enumerate(query_left_padding.tolist()):
-                    pad = min(max(int(pad), 0), hidden_states.shape[1])
-                    current_cache = []
-                    for cache_entry in cache:
-                        if cache_entry is None:
-                            current_cache.append(None)
-                        elif isinstance(cache_entry, BatchQSAKVCache):
-                            current_cache.append(cache_entry.extract(row))
-                        else:
-                            current_cache.append(_extract_row_cache(cache_entry, row))
-                    if pad == hidden_states.shape[1]:
-                        row_outputs.append(mx.zeros_like(hidden_states[row : row + 1]))
-                        for index, cache_entry in enumerate(current_cache):
-                            layer = self.layers[index]
-                            if (
-                                isinstance(cache_entry, ArraysCache)
-                                and "ple" in layer
-                                and cache_entry[3] is None
-                            ):
-                                embedding = layer.ple.ple_embedding
-                                cache_entry[3] = mx.full(
-                                    (1, embedding.context_len),
-                                    embedding.eos_token_id,
-                                    dtype=mx.int64,
-                                )
-                            row_caches[index].append(cache_entry)
-                        continue
-
-                    row_position_ids = None
-                    if position_ids is not None:
-                        if position_ids.ndim == 2:
-                            row_position_ids = position_ids[row : row + 1, pad:]
-                        else:
-                            row_position_ids = position_ids[:, row : row + 1, pad:]
-                    row_mask = mask
-                    if isinstance(mask, mx.array) and mask.ndim == 2:
-                        row_mask = mask[row : row + 1, pad:]
-                    row_output = self(
-                        inputs[row : row + 1, pad:],
-                        inputs_embeds=hidden_states[row : row + 1, pad:],
-                        mask=row_mask,
-                        cache=current_cache,
-                        position_ids=row_position_ids,
-                    )
-                    if pad > 0:
-                        row_output = _pad_row_time(
-                            row_output, pad, hidden_states.shape[1]
-                        )
-                    row_outputs.append(row_output)
+                        current_cache.append(_extract_row_cache(cache_entry, row))
+                if pad == hidden_states.shape[1]:
+                    row_outputs.append(mx.zeros_like(hidden_states[row : row + 1]))
                     for index, cache_entry in enumerate(current_cache):
+                        layer = self.layers[index]
+                        if (
+                            isinstance(cache_entry, ArraysCache)
+                            and "ple" in layer
+                            and cache_entry[3] is None
+                        ):
+                            embedding = layer.ple.ple_embedding
+                            cache_entry[3] = mx.full(
+                                (1, embedding.context_len),
+                                embedding.eos_token_id,
+                                dtype=mx.int64,
+                            )
                         row_caches[index].append(cache_entry)
+                    continue
 
-                for index, entries in enumerate(row_caches):
-                    if cache[index] is None:
-                        continue
-                    if hasattr(cache[index].__class__, "merge"):
-                        cache[index] = _restore_batch_padding_metadata(
-                            cache[index].__class__.merge(entries),
-                            batch_offsets[index],
-                            hidden_states.shape[1],
-                        )
-                return mx.concatenate(row_outputs, axis=0)
+                row_position_ids = None
+                if position_ids is not None:
+                    if position_ids.ndim == 2:
+                        row_position_ids = position_ids[row : row + 1, pad:]
+                    else:
+                        row_position_ids = position_ids[:, row : row + 1, pad:]
+                row_mask = mask
+                if isinstance(mask, mx.array) and mask.ndim == 2:
+                    row_mask = mask[row : row + 1, pad:]
+                row_output = self(
+                    inputs[row : row + 1, pad:],
+                    inputs_embeds=hidden_states[row : row + 1, pad:],
+                    mask=row_mask,
+                    cache=current_cache,
+                    position_ids=row_position_ids,
+                )
+                if pad > 0:
+                    row_output = _pad_row_time(row_output, pad, hidden_states.shape[1])
+                row_outputs.append(row_output)
+                for index, cache_entry in enumerate(current_cache):
+                    row_caches[index].append(cache_entry)
+
+            for index, entries in enumerate(row_caches):
+                if cache[index] is None:
+                    continue
+                if hasattr(cache[index].__class__, "merge"):
+                    cache[index] = _restore_batch_padding_metadata(
+                        cache[index].__class__.merge(entries),
+                        batch_offsets[index],
+                        hidden_states.shape[1],
+                    )
+            return mx.concatenate(row_outputs, axis=0)
 
         hidden_states = mx.tile(hidden_states, (1, 1, self.args.hc_count))
-        fa_mask = _create_qwen3_5_attention_mask(hidden_states, cache[self.fa_idx])
+        fa_mask = _create_qwen4_exp_attention_mask(hidden_states, cache[self.fa_idx])
         ssm_mask = _create_qwen3_5_ssm_mask(hidden_states, cache[self.ssm_idx])
         if mask is not None and isinstance(mask, mx.array) and mask.ndim == 2:
             ssm_mask = mask
