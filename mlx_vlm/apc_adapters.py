@@ -391,6 +391,21 @@ class KVCacheCloneAdapter:
 
         return lm.BatchKVCache.merge(caches)
 
+    def merge_rows_consuming(self, caches, prefix_lens):
+        """Transfer a single detached row into its batch cache without copying."""
+        from .models import cache as lm
+
+        if len(caches) == 1:
+            source = caches[0]
+            offset = int(getattr(source, "offset", 0) or 0)
+            out = lm.BatchKVCache([0])
+            out.keys = source.keys
+            out.values = source.values
+            out.offset = mx.array([offset])
+            out._idx = offset
+            return out
+        return self.merge_rows(caches, prefix_lens)
+
 
 class RotatingKVCacheCloneAdapter:
     capability = Capability.WINDOWED
@@ -622,7 +637,8 @@ def clone_cache_entry(c, *, min_capacity_tokens, eval_targets):
     return None
 
 
-def merge_cache_entries(entries, prefix_lens):
+def merge_cache_entries(entries, prefix_lens, *, consume_sources=False):
+    """Merge exact-cache rows, optionally transferring detached KV storage."""
     from .models import cache as lm
 
     if not entries:
@@ -634,16 +650,26 @@ def merge_cache_entries(entries, prefix_lens):
         else:
             ok = all(isinstance(c, typ) for c in entries)
         if ok:
+            if consume_sources and typ is lm.KVCache:
+                return adapter.merge_rows_consuming(entries, prefix_lens)
             return adapter.merge_rows(entries, prefix_lens)
     if all(isinstance(c, lm.CacheList) for c in entries):
         merged = [
-            merge_cache_entries([e.caches[i] for e in entries], prefix_lens)
+            merge_cache_entries(
+                [e.caches[i] for e in entries],
+                prefix_lens,
+                consume_sources=consume_sources,
+            )
             for i in range(len(first.caches))
         ]
         return None if any(m is None for m in merged) else lm.CacheList(*merged)
     if all(isinstance(c, tuple) for c in entries):
         merged = [
-            merge_cache_entries([e[i] for e in entries], prefix_lens)
+            merge_cache_entries(
+                [e[i] for e in entries],
+                prefix_lens,
+                consume_sources=consume_sources,
+            )
             for i in range(len(first))
         ]
         return None if any(m is None for m in merged) else lm.CacheList(*merged)

@@ -1929,21 +1929,23 @@ class PromptProcessingBatch:
                 continue
             if self._row_real_tokens_processed(batch_idx) != checkpoint_len:
                 continue
-            prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
-            if prompt_cache is None:
-                continue
             coordinator = getattr(self, "_apc_coordinator", None)
             if coordinator is not None:
                 coordinator.store_checkpoint(
                     meta["full_input_ids"][:checkpoint_len],
-                    prompt_cache,
+                    self.prompt_cache,
                     extra_hash=meta.get("extra_hash", 0),
+                    batch_idx=batch_idx,
                 )
             else:
+                prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
+                if prompt_cache is None:
+                    continue
                 self._apc_manager.store_exact_cache(
                     meta["full_input_ids"][:checkpoint_len],
                     prompt_cache,
                     extra_hash=meta.get("extra_hash", 0),
+                    take_ownership=True,
                 )
             meta["checkpoint_done"] = True
 
@@ -2191,6 +2193,7 @@ class PromptProcessingBatch:
                                 meta["full_input_ids"],
                                 prompt_cache,
                                 extra_hash=meta.get("extra_hash", 0),
+                                take_ownership=True,
                             )
                         self._apc_manager.release(meta.get("apc_blocks", []))
                     else:
@@ -2581,13 +2584,18 @@ class BatchGenerator:
             )
         elif apc_mode == "exact":
             row_caches = [
-                p["warm_cache"] if p is not None else self.model.make_cache()
+                (
+                    list(p.pop("warm_cache"))
+                    if p is not None
+                    else list(self.model.make_cache())
+                )
                 for p in picks
             ]
             warm_cache, _ = _apc.make_warm_batch_exact_cache_multi(
                 row_caches,
                 prefix_lens,
                 kv_quant_config=_quant_cfg,
+                consume_sources=True,
             )
         else:
             num_layers = (
