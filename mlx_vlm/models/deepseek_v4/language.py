@@ -117,6 +117,32 @@ def create_image_attention_mask(
     return ((keys >= starts[..., None]) & (keys <= ends[..., None]))[:, None]
 
 
+def combine_image_attention_mask(
+    base_mask: Optional[mx.array],
+    image_mask: mx.array,
+    image_rows: mx.array,
+) -> mx.array:
+    """Apply image visibility only to rows containing image sentinels."""
+    if base_mask is None:
+        return image_mask
+    if base_mask.ndim == 2:
+        base_mask = base_mask[None, None]
+    elif base_mask.ndim == 3:
+        base_mask = base_mask[:, None]
+
+    prefix_length = base_mask.shape[-1] - image_mask.shape[-1]
+    if prefix_length < 0:
+        raise ValueError("DeepSeek-V4 image mask exceeds the attention key length")
+    if prefix_length:
+        # Image-bearing rows are cold-prefilled, but a merged batch can contain
+        # physical left-padding for unrelated warm rows. Reuse the ordinary
+        # cache mask for those prefix columns so padding never becomes visible.
+        image_mask = mx.concatenate(
+            [base_mask[..., :prefix_length], image_mask], axis=-1
+        )
+    return mx.where(image_rows[:, None, None, None], image_mask, base_mask)
+
+
 @mx.compile
 def _expert_select(
     logits: mx.array,
@@ -1182,28 +1208,33 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         mask_cache = (
             first_cache[0] if isinstance(first_cache, CacheList) else first_cache
         )
+        image_rows = mx.any(inputs >= self.vocab_size, axis=1)
         has_image_tokens = self.args.vision_n_layers > 0 and bool(
-            mx.any(inputs >= self.vocab_size).item()
+            mx.any(image_rows).item()
+        )
+        base_mask = create_attention_mask(
+            h[:, :, 0, :],
+            mask_cache,
+            window_size=self.args.sliding_window,
+            return_array=True,
         )
         if has_image_tokens:
-            cache_offset = getattr(mask_cache, "offset", 0)
-            if bool(mx.any(mx.array(cache_offset) > 0).item()):
+            cache_offsets = mx.array(getattr(mask_cache, "offset", 0))
+            if cache_offsets.ndim == 0:
+                cache_offsets = mx.broadcast_to(cache_offsets, image_rows.shape)
+            if bool(mx.any(image_rows & (cache_offsets > 0)).item()):
                 raise ValueError(
                     "DeepSeek-V4 image sentinels must be supplied in one prefill."
                 )
-            mask = create_image_attention_mask(
+            image_mask = create_image_attention_mask(
                 inputs,
                 self.vocab_size,
                 self.args.sliding_window,
                 self.args.vision_max_n_token,
             )
+            mask = combine_image_attention_mask(base_mask, image_mask, image_rows)
         else:
-            mask = create_attention_mask(
-                h[:, :, 0, :],
-                mask_cache,
-                window_size=self.args.sliding_window,
-                return_array=True,
-            )
+            mask = base_mask
 
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))

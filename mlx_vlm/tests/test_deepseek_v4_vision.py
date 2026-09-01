@@ -9,6 +9,7 @@ from mlx_vlm.models.deepseek_v4.config import ModelConfig
 from mlx_vlm.models.deepseek_v4.deepseek_v4 import Model
 from mlx_vlm.models.deepseek_v4.language import (
     MoEGate,
+    combine_image_attention_mask,
     create_image_attention_mask,
     get_image_visible,
 )
@@ -214,6 +215,32 @@ class TestDeepseekV4VisionLanguage(unittest.TestCase):
                 weights, mx.full(weights.shape, 0.75, dtype=weights.dtype)
             ).item()
         )
+
+    def test_image_mask_preserves_unrelated_warm_rows_and_cold_padding(self):
+        config = tiny_vision_config(sliding_window=3, vision_max_n_token=16)
+        input_ids = mx.array(
+            [
+                [1, 2, 3, 4],
+                [1, config.vocab_size, config.vocab_size + 4, 2],
+            ],
+            dtype=mx.int32,
+        )
+        image_rows = mx.any(input_ids >= config.vocab_size, axis=1)
+        image_mask = create_image_attention_mask(
+            input_ids,
+            config.vocab_size,
+            config.sliding_window,
+            config.vision_max_n_token,
+        )
+        base_mask = mx.ones((2, 1, 4, 6), dtype=mx.bool_)
+        base_mask[1, :, :, :2] = False
+
+        combined = combine_image_attention_mask(base_mask, image_mask, image_rows)
+        mx.eval(combined)
+
+        self.assertTrue(mx.array_equal(combined[0], base_mask[0]).item())
+        self.assertFalse(bool(mx.any(combined[1, :, :, :2]).item()))
+        self.assertTrue(mx.array_equal(combined[1, :, :, 2:], image_mask[1]).item())
 
     def test_non_hash_gate_selects_text_and_vision_biases(self):
         config = tiny_vision_config(
