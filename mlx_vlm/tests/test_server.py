@@ -827,6 +827,25 @@ def test_server_includes_processor_specific_stop_tokens(monkeypatch):
     assert gen.stop_tokens == {2, 3}
 
 
+def test_server_includes_tokenizer_eos_in_stop_tokens(monkeypatch):
+    config = SimpleNamespace(eos_token_id=248044)
+    model = SimpleNamespace(language_model=SimpleNamespace(config=config))
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=248046))
+    gen = _unstarted_response_generator()
+
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.delenv("MLX_VLM_DRAFT_KIND", raising=False)
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+
+    gen._initialize_model()
+
+    assert gen.stop_tokens == {248044, 248046}
+
+
 def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
     config = SimpleNamespace(eos_token_id=[])
     language_model = SimpleNamespace()
@@ -3575,7 +3594,7 @@ def test_chat_completions_endpoint_falls_back_from_video_to_images(client):
     assert mock_template.call_args.kwargs["video"] is None
     assert mock_generate.call_args.kwargs["image"] == frames
     assert mock_generate.call_args.kwargs["video"] == []
-    mock_sample.assert_called_once_with(["clip.mp4"], 2.0)
+    mock_sample.assert_called_once_with(["clip.mp4"], 2.0, None)
 
 
 def test_chat_completions_endpoint_preserves_assistant_reasoning_content(client):

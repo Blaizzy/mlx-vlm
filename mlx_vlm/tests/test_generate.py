@@ -2614,7 +2614,7 @@ def test_resolve_video_inputs_uses_one_global_frame_budget():
     assert resolution.frame_fps == pytest.approx(1.5)
     assert images == [still]
     assert videos == ["first.mp4", "second.mp4"]
-    mock_sample.assert_called_once_with(videos, 1.5)
+    mock_sample.assert_called_once_with(videos, 1.5, None)
 
 
 def test_resolve_video_inputs_does_not_partially_mutate_on_decode_failure():
@@ -3416,3 +3416,67 @@ class TestPrePaddedBatchRows:
         assert mask.shape == (2, 8)
         assert mask[0].tolist() == [False] * 5 + [True] * 3
         assert mask[1].tolist() == [True] * 8
+
+
+def test_prompt_shorter_than_prefill_step_size_is_still_chunked():
+    """Short prompts must not skip chunking: the unchunked path feeds the whole
+    prompt to _step, which reads logits[:, -1, :] and materializes [1, N, vocab]."""
+    model = MagicMock()
+    model.chunked_prefill_policy = MagicMock(return_value=True)
+    output = SimpleNamespace(
+        logits=mx.zeros((1, 1, 8)),
+        hidden_states=[mx.zeros((1, 1, 4))],
+        shared_kv_states={},
+        cross_attention_states=None,
+        encoder_outputs=None,
+    )
+    model.language_model.return_value = output
+
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 5, 4))
+    embedding_output.to_dict.return_value = {}
+    model.get_input_embeddings.return_value = embedding_output
+
+    with (
+        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+    ):
+        # 5 prompt tokens, prefill_step_size 2048: previously unchunked.
+        list(
+            generate_module.generate_step(
+                input_ids=mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
+                model=model,
+                pixel_values=None,
+                mask=None,
+                max_tokens=1,
+                prefill_step_size=2048,
+            )
+        )
+
+    n_processed = [
+        c.kwargs["n_to_process"]
+        for c in model.language_model.call_args_list
+        if "n_to_process" in c.kwargs
+    ]
+    assert n_processed == [4], f"expected one 4-token prefill chunk, got {n_processed}"
+
+
+def test_paligemma_opts_out_of_chunked_prefill_when_bidirectional():
+    from mlx_vlm.models.paligemma.paligemma import Model as PaliGemmaModel
+
+    bidirectional = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(use_bidirectional_attention=True)
+        )
+    )
+    causal = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(use_bidirectional_attention=False)
+        )
+    )
+    policy = PaliGemmaModel.chunked_prefill_policy
+    assert policy(bidirectional) is False
+    assert policy(causal) is True
