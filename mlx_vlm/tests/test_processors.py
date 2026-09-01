@@ -3018,6 +3018,38 @@ class TestKimiVLPatch(unittest.TestCase):
         )
 
 
+class TestKimiVLProcessor(unittest.TestCase):
+    def test_turn_boundary_tokens_are_additional_eos_tokens(self):
+        from mlx_vlm.models.kimi_vl.processing_kimi_vl import KimiVLProcessor
+
+        token_ids = {
+            "<|im_end|>": 163584,
+            "<|im_user|>": 163585,
+            "<|im_assistant|>": 163586,
+            "<|im_system|>": 163587,
+        }
+        processor = KimiVLProcessor.__new__(KimiVLProcessor)
+        processor.tokenizer = SimpleNamespace(
+            convert_tokens_to_ids=lambda token: token_ids.get(token)
+        )
+
+        self.assertEqual(
+            processor.additional_eos_token_ids, [163584, 163585, 163586, 163587]
+        )
+
+    def test_missing_boundary_tokens_are_skipped(self):
+        from mlx_vlm.models.kimi_vl.processing_kimi_vl import KimiVLProcessor
+
+        processor = KimiVLProcessor.__new__(KimiVLProcessor)
+        processor.tokenizer = SimpleNamespace(
+            convert_tokens_to_ids=lambda token: (
+                163584 if token == "<|im_end|>" else None
+            )
+        )
+
+        self.assertEqual(processor.additional_eos_token_ids, [163584])
+
+
 class TestKimiK3Patch(unittest.TestCase):
     def test_patch_intercepts(self):
         _assert_patch_intercepts(
