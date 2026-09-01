@@ -7238,6 +7238,31 @@ class TestModels(unittest.TestCase):
         self.assertLessEqual(fp16_clipped[1], -MAX_FLOAT16_IMAGE_FEATURE + 16)
         self.assertEqual(fp16_clipped[2], 42.0)
 
+    def test_florence2_language_config_registered(self):
+        from transformers import AutoConfig
+
+        from mlx_vlm.models import florence2  # noqa: F401
+
+        self.assertEqual(
+            AutoConfig.for_model("florence2_language").model_type, "florence2_language"
+        )
+
+    def test_florence2_skips_chunked_prefill(self):
+        from mlx_vlm.generate.common import _chunked_prefill_enabled
+        from mlx_vlm.models import florence2
+
+        config = florence2.ModelConfig(
+            text_config=florence2.TextConfig(),
+            vision_config=florence2.VisionConfig(drop_path_rate=0.0),
+        )
+        model = florence2.Model(config)
+        self.assertTrue(model.no_chunked_prefill)
+        self.assertFalse(
+            _chunked_prefill_enabled(
+                model, inputs_embeds=mx.zeros((1, 8, 4)), prefill_kwargs={}
+            )
+        )
+
     def test_florence2(self):
         from mlx_vlm.models import florence2
 
