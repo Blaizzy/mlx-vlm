@@ -2743,6 +2743,79 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(converted[wkey] == weight.view(mx.uint32)))
         self.assertEqual(converted[skey].shape, (128, 4))
 
+    def test_deepseek_v4_official_layout_sanitize_is_idempotent(self):
+        from mlx_vlm.models import deepseek_v4
+
+        config = deepseek_v4.ModelConfig(
+            model_type="deepseek_v4",
+            vocab_size=32,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=8,
+            qk_rope_head_dim=4,
+            sliding_window=16,
+            compress_ratios=[0],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            hc_mult=2,
+            vision_n_layers=1,
+            vision_dim=8,
+            vision_n_heads=2,
+            vision_inter_dim=16,
+            vision_patch_size=2,
+            vision_downsample_ratio=2,
+        )
+        model = deepseek_v4.Model(config)
+        weights = {
+            "model.embed_tokens.weight": mx.zeros((32, 32), dtype=mx.bfloat16),
+            "model.vision.blocks.0.mlp.w1.weight": mx.zeros((16, 8), dtype=mx.bfloat16),
+            "model.aligner.proj.0.weight": mx.zeros((32, 32), dtype=mx.bfloat16),
+            "model.image_start": mx.zeros((32,), dtype=mx.bfloat16),
+            "model.layers.0.mlp.gate.bias_vl": mx.arange(4, dtype=mx.float32),
+            "model.layers.0.self_attn.wo_a.weight": mx.zeros(
+                (16, 32), dtype=mx.bfloat16
+            ),
+            "model.layers.0.self_attn.wq_a.weight": mx.zeros(
+                (128, 128), dtype=mx.uint8
+            ),
+            "model.layers.0.self_attn.wq_a.weight_scale_inv": mx.ones(
+                (1, 1), dtype=mx.uint8
+            ),
+        }
+        for expert in range(config.n_routed_experts):
+            for projection in ("gate_proj", "down_proj", "up_proj"):
+                prefix = f"model.layers.0.mlp.experts.{expert}.{projection}"
+                weights[f"{prefix}.weight"] = mx.zeros((16, 16), dtype=mx.int8)
+                weights[f"{prefix}.weight_scale_inv"] = mx.ones((16, 1), dtype=mx.uint8)
+
+        sanitized = assert_sanitize_idempotent(model, weights)
+
+        self.assertIn("vision.blocks.0.ffn.w1.weight", sanitized)
+        self.assertIn("aligner.proj.0.weight", sanitized)
+        self.assertIn("image_start", sanitized)
+        self.assertIn("language_model.model.layers.0.ffn.gate.bias_vl", sanitized)
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.attn.wo_a.weight"].shape,
+            (config.o_groups, config.o_lora_rank, config.hidden_size),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.ffn.switch_mlp.gate_proj.weight"
+            ].shape,
+            (config.n_routed_experts, 16, 4),
+        )
+
     def test_deepseek_v4_quantization_path_aliases(self):
         from mlx_vlm.models import deepseek_v4
 
