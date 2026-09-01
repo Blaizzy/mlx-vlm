@@ -10084,6 +10084,59 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.isfinite(out["pred_logits"])).item())
         self.assertTrue(mx.all(mx.isfinite(out["pred_boxes"])).item())
 
+    def test_yolo11_forward(self):
+        from PIL import Image
+
+        from mlx_vlm.models.yolo11 import YOLO11, non_max_suppression, prepare_image
+
+        model = YOLO11(nc=1)
+        model.eval()
+
+        x = mx.random.normal((1, 64, 64, 3))
+        pred = model(x)
+        mx.eval(pred)
+
+        self.assertEqual(pred.shape, (1, 5, 84))
+        self.assertTrue(mx.all(mx.isfinite(pred)).item())
+
+        single = mx.array([[[16.0], [16.0], [8.0], [8.0], [0.9]]])
+        dets = non_max_suppression(single, conf_thresh=0.01, iou_thresh=0.5)
+        self.assertEqual(len(dets), 1)
+        self.assertEqual(dets[0].shape, (1, 6))
+
+        overlapping = mx.array(
+            [
+                [
+                    [10.0, 10.0, 30.0],
+                    [10.0, 10.0, 30.0],
+                    [8.0, 8.0, 8.0],
+                    [8.0, 8.0, 8.0],
+                    [0.9, 0.8, 0.7],
+                ]
+            ]
+        )
+        dets = non_max_suppression(overlapping, iou_thresh=0.5, max_det=2)
+        self.assertEqual(dets[0].shape, (2, 6))
+
+        multiclass = mx.array(
+            [
+                [
+                    [10.0, 10.0],
+                    [10.0, 10.0],
+                    [8.0, 8.0],
+                    [8.0, 8.0],
+                    [0.9, 0.1],
+                    [0.1, 0.8],
+                ]
+            ]
+        )
+        dets = non_max_suppression(multiclass, iou_thresh=0.5)
+        self.assertEqual(dets[0].shape, (2, 6))
+
+        prepared, _, gain, left, top = prepare_image(Image.new("RGB", (65, 33)))
+        self.assertEqual(prepared.shape, (1, 64, 96, 3))
+        self.assertEqual((gain, left, top), (1.0, 15, 15))
+
     def test_sam3_1_config_and_model(self):
         # Config source: mlx_vlm/models/sam3_1/config.py
         from mlx_vlm.models.sam3_1 import Model, ModelConfig
