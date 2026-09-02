@@ -1,7 +1,8 @@
 # DeepSeek-V4 DSpark drafter
 
 `deepseek_v4_dspark` is the native DSpark speculative head shipped inside
-`deepseek-ai/DeepSeek-V4-Flash-0731`. It is a **DeepSeek-V4-backbone variant of
+DeepSeek-V4 checkpoints including `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp`.
+It is a **DeepSeek-V4-backbone variant of
 the model-agnostic `dspark` drafter**: it reuses the shared DSpark machinery —
 `VanillaMarkov` block sampling and the `dflash` round loop with its target-hidden
 tap — and only swaps the Qwen-style draft layers for DeepSeek-V4 blocks (MLA
@@ -34,10 +35,14 @@ from mlx_vlm.speculative.drafters.deepseek_v4_dspark.split import (
 )
 
 split_deepseek_v4_dspark(
-    "deepseek-ai/DeepSeek-V4-Flash-0731",
-    "DS-V4-DSpark-drafter",
+    "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
+    "DS-V4-Vision-DSpark-drafter",
 )
 ```
+
+Always extract the drafter from the same source checkpoint as the target. The
+vision checkpoint's DSpark and target weights belong to its continued-trained
+language model and must not be mixed with the older V4 Flash drafter.
 
 The written config carries `n_mtp_layers`, `block_size`, `target_layer_ids`,
 `mask_token_id` and `markov_rank`, so `load_drafter` resolves it to

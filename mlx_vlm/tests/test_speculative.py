@@ -3909,6 +3909,7 @@ def test_deepseek_v4_dspark_sanitize_round_trips_three_stage_layout():
     src["mtp.2.confidence_head.proj.weight"] = mx.zeros(
         (1, cfg.hidden_size + cfg.markov_rank)
     )
+    src["mtp.0.ffn.gate.bias_vl"] = mx.zeros((cfg.text_config.n_routed_experts,))
 
     written = DeepseekV4DsparkDraftModel.sanitize(
         SimpleNamespace(args=cfg.text_config), dict(src)
@@ -3920,6 +3921,7 @@ def test_deepseek_v4_dspark_sanitize_round_trips_three_stage_layout():
 
     assert not any(key.startswith("mtp.") for key in sanitized)
     assert not any("confidence_head" in key for key in sanitized)
+    assert not any("bias_vl" in key for key in sanitized)
     assert any(key.startswith("stages.0.main_proj") for key in sanitized)
     assert any(key.startswith("markov_head.") for key in sanitized)
 
@@ -3996,14 +3998,21 @@ def test_split_deepseek_v4_dspark_writes_dspark_config(tmp_path):
     )
 
     output = tmp_path / "dspark"
+    from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
+
+    assert type(detect_mtp_splitter(source)).__name__ == "DeepseekV4DsparkSplitter"
     split_deepseek_v4_dspark(str(source), str(output))
 
     written_cfg = json.loads((output / "config.json").read_text())
-    weights = mx.load(str(output / "model.safetensors"))
+    weights = {}
+    for shard in sorted(output.glob("model-*.safetensors")):
+        weights.update(mx.load(str(shard)))
     assert written_cfg["model_type"] == "deepseek_v4_dspark"
     assert written_cfg["n_mtp_layers"] == 3
     assert written_cfg["target_layer_ids"] == cfg.target_layer_ids
     assert written_cfg["mask_token_id"] == cfg.mask_token_id
+    assert len(list(output.glob("model-*.safetensors"))) == 3
+    assert (output / "model.safetensors.index.json").exists()
     assert any(key.startswith("stages.0.main_proj") for key in weights)
     assert any(key.startswith("markov_head.") for key in weights)
 
