@@ -9598,6 +9598,61 @@ class TestModels(unittest.TestCase):
             config.text_config.num_hidden_layers,
         )
 
+    def test_granite4_vision_chunked_prefill_aligns_deepstack(self):
+        from mlx_vlm.models import granite4_vision
+
+        text_config = granite4_vision.TextConfig(
+            model_type="granitemoehybrid",
+            hidden_size=64,
+            intermediate_size=128,
+            shared_intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=1000,
+            rms_norm_eps=1e-5,
+            rope_theta=10000000.0,
+            embedding_multiplier=12.0,
+            attention_multiplier=0.015625,
+            residual_multiplier=0.22,
+            logits_scaling=10.0,
+        )
+        vision_config = granite4_vision.VisionConfig(
+            model_type="siglip_vision_model",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            image_size=48,
+            patch_size=16,
+        )
+        config = granite4_vision.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="granite4_vision",
+            deepstack_layer_map=[[-1, 0]],
+            use_spatial_sampling=False,
+            downsample_rate="3/3",
+            use_image_newline_parameter=False,
+        )
+        inner = granite4_vision.Model(config).language_model.model
+        inner._deepstack_target_layers = [0]
+
+        full_len = 6
+        hidden = text_config.hidden_size
+        visual_pos_masks = mx.array([[True, True, False, False, False, False]])
+        deepstack_visual_embeds = [mx.ones((full_len, hidden))]
+
+        chunk_len = full_len - 1
+        out = inner(
+            mx.zeros((1, chunk_len), dtype=mx.int32),
+            inputs_embeds=mx.zeros((1, chunk_len, hidden)),
+            cache=None,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+        )
+        self.assertEqual(out.shape, (1, chunk_len, hidden))
+
     def test_granite4_1_vision(self):
         from mlx_vlm.models import granite4_vision
 
