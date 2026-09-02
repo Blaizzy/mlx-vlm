@@ -36,6 +36,7 @@ from mlx_vlm.models.cache import (
 )
 from mlx_vlm.quantization.one_bit import OneBitLinear
 from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
+from mlx_vlm.speculative.dflash import _dflash_verify_greedy
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
     DRAFTER_KIND_BY_MODEL_TYPE,
@@ -2320,6 +2321,53 @@ def test_dflash_committed_hidden_segments_keep_per_row_lengths():
     assert segments[1].tolist() == [[[6.0, 7.0]]]
 
 
+def test_dflash_target_cache_reserves_one_verification_block():
+    calls = []
+
+    class Cache:
+        offset = 512
+
+        def prefix_cache_reserve(self, capacity):
+            calls.append(capacity)
+            return ()
+
+    speculative_utils._reserve_dflash_target_cache([Cache()], 8)
+
+    assert calls == [520]
+
+
+def test_dflash_greedy_verify_prefers_hidden_argmax_hook():
+    captured = [mx.ones((1, 3, 2))]
+    final_hidden = mx.zeros((1, 3, 2))
+    target_tokens = mx.array([[4, 5, 6]])
+
+    class LM:
+        def speculative_verify_dflash_hidden(self, inputs, cache, layer_ids):
+            assert inputs.shape == (1, 3)
+            assert cache == ["cache"]
+            assert layer_ids == [1]
+            return captured, final_hidden, ["gdn"]
+
+        def speculative_argmax_from_hidden(self, hidden):
+            assert hidden is final_hidden
+            return target_tokens
+
+        def __call__(self, *args, **kwargs):
+            raise AssertionError("full target logits should not be materialized")
+
+    actual_captured, gdn_states, actual_tokens = _dflash_verify_greedy(
+        LM(),
+        mx.array([[1, 2, 3]]),
+        ["cache"],
+        [1],
+        lambda logits: mx.argmax(logits, axis=-1),
+    )
+
+    assert actual_captured is captured
+    assert gdn_states == ["gdn"]
+    assert actual_tokens is target_tokens
+
+
 def test_gemma4_26b_dflash_config_preserves_capture_layers():
     config = Gemma4DFlashConfig.from_dict(
         {
@@ -2402,6 +2450,56 @@ def test_generic_dflash_config_parses_gemma4_metadata_without_runtime_cap():
     assert config.runtime_block_size is None
 
 
+def test_generic_dflash_config_infers_target_depth_and_parses_rope_parameters():
+    config = ModelConfig.from_dict(
+        {
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 8,
+            "rope_parameters": {
+                "rope_theta": 10000.0,
+                "rope_type": "yarn",
+                "factor": 8.0,
+            },
+            "dflash_config": {
+                "target_layer_ids": [1, 5],
+                "mask_token_id": 4,
+            },
+        }
+    )
+
+    assert config.num_target_layers == 6
+    assert config.rope_theta == 10000.0
+    assert config.rope_scaling == {"rope_type": "yarn", "factor": 8.0}
+
+
+def test_dflash_sanitize_installs_checkpoint_embedding():
+    config = ModelConfig(
+        hidden_size=4,
+        intermediate_size=8,
+        num_hidden_layers=0,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=8,
+        target_layer_ids=[0],
+    )
+    drafter = DFlashDraftModel(config)
+    weight = mx.zeros((8, 4))
+
+    sanitized = drafter.sanitize(
+        {"model.embed_tokens.weight": weight, "model.norm.weight": mx.ones((4,))}
+    )
+
+    assert sanitized["embed_tokens.weight"] is weight
+    assert drafter.embed_tokens is not None
+    assert sanitized["norm.weight"] is not None
+
+
 def test_dflash_drafter_uses_bound_target_embedding_scale():
     class Embed:
         def __call__(self, inputs):
@@ -2429,6 +2527,31 @@ def test_dflash_drafter_uses_bound_target_embedding_scale():
 
     embedded = drafter._embed_input_tokens(mx.array([[1, 2]], dtype=mx.int32))
     assert embedded.tolist() == [[[2.0] * 4, [2.0] * 4]]
+
+
+def test_dflash_drafter_binds_backbone_embeddings():
+    config = ModelConfig(
+        hidden_size=4,
+        intermediate_size=8,
+        num_hidden_layers=0,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=8,
+        target_layer_ids=[0],
+    )
+    drafter = DFlashDraftModel(config)
+    embeddings = nn.Embedding(8, 4)
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            backbone=SimpleNamespace(embeddings=embeddings),
+            lm_head=nn.Linear(4, 8, bias=False),
+        )
+    )
+
+    drafter.bind(target)
+
+    assert drafter.embed_tokens is embeddings
 
 
 def test_dflash_config_parses_sliding_attention_metadata():
