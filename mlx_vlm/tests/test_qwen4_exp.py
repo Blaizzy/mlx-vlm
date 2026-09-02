@@ -1,9 +1,14 @@
 import unittest
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_vlm.generate import maybe_quantize_kv_cache
+from mlx_vlm.generate import (
+    BatchGenerator,
+    PromptProcessingBatch,
+    maybe_quantize_kv_cache,
+)
 from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models import qwen4_exp
 from mlx_vlm.models.cache import ArraysCache
@@ -16,6 +21,7 @@ from mlx_vlm.models.qwen4_exp.language import (
     ShardedEmbedding,
 )
 from mlx_vlm.prompt_utils import MessageFormat, MessageFormatter
+from mlx_vlm.utils import StoppingCriteria
 
 
 def tiny_config():
@@ -89,6 +95,17 @@ def tiny_config():
 
 
 class Qwen4ExpTests(unittest.TestCase):
+    @staticmethod
+    def _cancellation_model():
+        mx.random.seed(17)
+        config = tiny_config()
+        # Exercise inference kernels, which require at least 32 key dimensions.
+        config.text_config.linear_key_head_dim = 32
+        config.text_config.linear_value_head_dim = 32
+        model = qwen4_exp.Model(config).language_model
+        model.eval()
+        return model
+
     def test_config_normalizes_reference_layer_type(self):
         config = tiny_config()
         self.assertEqual(
@@ -372,6 +389,114 @@ class Qwen4ExpTests(unittest.TestCase):
                 mx.argmax(row_logits, axis=-1),
             ).item()
         )
+
+    def test_cancel_prefill_preserves_survivor_logits(self):
+        prompts = [[1, 2, 3, 4], list(range(1, 14))]
+        for step_size in (1, 3):
+            for chunks in (1, 3):
+                for cancel_row in (0, 1):
+                    with self.subTest(
+                        step_size=step_size, chunks=chunks, cancel_row=cancel_row
+                    ):
+                        model = self._cancellation_model()
+                        processor = SimpleNamespace(
+                            stopping_criteria=StoppingCriteria([-1])
+                        )
+                        gen = BatchGenerator(
+                            model,
+                            processor,
+                            max_tokens=5,
+                            prefill_batch_size=2,
+                            prefill_step_size=step_size,
+                        )
+                        try:
+                            uids = gen.insert(
+                                prompts,
+                                prompt_kwargs=[
+                                    {
+                                        "inputs_embeds": model.model.embed_tokens(
+                                            mx.array([ids])
+                                        ),
+                                        "position_ids": mx.broadcast_to(
+                                            mx.arange(len(ids))[None, None],
+                                            (3, 1, len(ids)),
+                                        ),
+                                        "rope_deltas": mx.zeros((1, 1), dtype=mx.int32),
+                                    }
+                                    for ids in prompts
+                                ],
+                            )
+                            for _ in range(chunks):
+                                gen.next()
+                            batch = gen._prompt_batch
+                            processed = batch._processed_prompt_columns
+                            self.assertTrue(gen.remove(uids[cancel_row]))
+                            self.assertIs(gen._prompt_batch, batch)
+                            self.assertEqual(batch._processed_prompt_columns, processed)
+                            self.assertEqual(batch.uids, [uids[1 - cancel_row]])
+                            self.assertFalse(gen.unprocessed_prompts)
+                            while batch.needs_processing():
+                                batch.prompt_step()
+                            actual = model(
+                                batch._input_ids,
+                                inputs_embeds=batch._inputs_embeds,
+                                cache=batch.prompt_cache,
+                                **batch._prompt_kwargs,
+                            ).logits[:, -1:]
+
+                            # Match real-token chunk boundaries in the standalone
+                            # reference, then compare several decode steps too.
+                            ids = mx.array([prompts[1 - cancel_row]])
+                            reference_cache = model.make_cache()
+                            for offset in range(0, ids.shape[1], step_size):
+                                chunk = ids[:, offset : offset + step_size]
+                                expected = model(
+                                    chunk,
+                                    cache=reference_cache,
+                                    position_ids=mx.broadcast_to(
+                                        mx.arange(offset, offset + chunk.shape[1])[
+                                            None, None
+                                        ],
+                                        (3, 1, chunk.shape[1]),
+                                    ),
+                                ).logits[:, -1:]
+                            for _ in range(4):
+                                self.assertTrue(
+                                    mx.allclose(
+                                        actual, expected, atol=1e-4, rtol=1e-4
+                                    ).item()
+                                )
+                                token = mx.argmax(expected[:, -1], axis=-1)[:, None]
+                                actual = model(token, cache=batch.prompt_cache).logits
+                                expected = model(token, cache=reference_cache).logits
+                        finally:
+                            gen.close()
+
+    def test_cancel_prefill_padding_preserves_ngram_history(self):
+        for step_size in (1, 3):
+            with self.subTest(step_size=step_size):
+                model = self._cancellation_model()
+                batch = PromptProcessingBatch(
+                    model=model,
+                    uids=[0, 1],
+                    input_ids=[[1, 2, 3, 4], list(range(1, 14))],
+                    max_tokens=[5, 5],
+                    inputs_embeds=mx.zeros((2, 13, 32)),
+                    prompt_kwargs={
+                        "position_ids": mx.broadcast_to(
+                            mx.arange(13)[None, None], (3, 2, 13)
+                        )
+                    },
+                    prefill_step_size=step_size,
+                )
+                batch.prompt_step()
+                batch.filter([0])
+                history = batch.prompt_cache[0][3]
+                # The next chunk is still entirely padding for the survivor.
+                batch.prompt_step()
+                self.assertTrue(
+                    mx.array_equal(history, batch.prompt_cache[0][3]).item()
+                )
 
     def test_multimodal_forward_uses_qwen3_vision_encoder(self):
         model = qwen4_exp.Model(tiny_config())

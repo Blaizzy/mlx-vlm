@@ -1273,6 +1273,7 @@ class Qwen4ExpModel(nn.Module):
         position_ids: Optional[mx.array] = None,
         capture_layer_ids=None,
         hidden_sink=None,
+        n_to_process: Optional[int] = None,
         **kwargs,
     ):
         del kwargs
@@ -1284,11 +1285,11 @@ class Qwen4ExpModel(nn.Module):
 
         # Ragged prefill has row-specific recurrent, PLE, RoPE, and QSA
         # semantics. Process each row through the singleton-equivalent path,
-        # merge the resulting caches, and continue decode as a batch.
+        # including a padded singleton left by cancellation and one-token
+        # prefill chunks, then merge the caches for subsequent steps.
         fa_cache = cache[self.fa_idx]
         if (
-            hidden_states.shape[0] > 1
-            and hidden_states.shape[1] > 1
+            (hidden_states.shape[1] > 1 or n_to_process is not None)
             and hidden_sink is None
             and fa_cache is not None
             and hasattr(fa_cache, "extract")
