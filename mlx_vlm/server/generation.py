@@ -1074,6 +1074,28 @@ class ResponseGenerator:
             pending, self._cancelled = self._cancelled, set()
             return pending
 
+    def _cancel_active_requests(self, batch_gen, active):
+        cancelled = self._drain_cancellations()
+        if batch_gen is None:
+            return
+        for uid in cancelled:
+            if uid not in active:
+                continue
+            if not batch_gen.remove(uid):
+                # Let the generation loop's error handler notify callers and
+                # discard the inconsistent batch, rather than hiding GPU work.
+                raise RuntimeError(f"Failed to remove cancelled active request {uid}")
+            info = active.pop(uid)
+            logger.info(
+                "Generation cancelled: request=%s generated_tokens=%d",
+                info.get("request_id", uid),
+                int(info.get("generated_tokens", 0) or 0),
+            )
+            try:
+                info["rqueue"].put(None)
+            except Exception:
+                pass
+
     def _initialize_model(self):
         model, processor, config = load_model_resources(
             self.model_path, self.adapter_path
@@ -1711,21 +1733,7 @@ class ResponseGenerator:
                     break
 
                 # Drop abandoned requests before doing more work.
-                cancelled = self._drain_cancellations()
-                if cancelled and batch_gen is not None:
-                    for uid in cancelled:
-                        if uid in active:
-                            batch_gen.remove(uid)
-                            info = active.pop(uid)
-                            logger.info(
-                                "Generation cancelled: request=%s generated_tokens=%d",
-                                info.get("request_id", uid),
-                                int(info.get("generated_tokens", 0) or 0),
-                            )
-                            try:
-                                info["rqueue"].put(None)
-                            except Exception:
-                                pass
+                self._cancel_active_requests(batch_gen, active)
 
                 if new_items and batch_gen is not None and not active:
                     if not batch_gen.has_work:

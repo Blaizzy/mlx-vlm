@@ -795,7 +795,7 @@ class ArraysCache(_BaseCache):
     def state(self, v):
         self.cache = v
 
-    def filter(self, batch_indices):
+    def filter(self, batch_indices, *, compact=True):
         """
         In-place filter to keep just the given indices in the cache.
         """
@@ -1023,12 +1023,15 @@ class CacheList(_BaseCache):
         for c, m in zip(self.caches, v[1]):
             c.meta_state = m
 
-    def filter(self, batch_indices):
+    def filter(self, batch_indices, *, compact=True):
         """
         In-place filter to keep just the given indices in the cache.
         """
         for c in self.caches:
-            c.filter(batch_indices)
+            if compact:
+                c.filter(batch_indices)
+            else:
+                c.filter(batch_indices, compact=False)
 
     def extend(self, other):
         """
@@ -1165,7 +1168,7 @@ class BatchKVCache(_BaseCache):
     @property
     def state(self):
         k, v = self.keys, self.values
-        if self._idx < k.shape[2]:
+        if k is not None and self._idx < k.shape[2]:
             k = k[..., : self._idx, :]
             v = v[..., : self._idx, :]
         return k, v, self.offset, self.left_padding
@@ -1173,7 +1176,7 @@ class BatchKVCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.keys, self.values, self.offset, self.left_padding = v
-        self._idx = self.keys.shape[2]
+        self._idx = 0 if self.keys is None else self.keys.shape[2]
 
     def is_trimmable(self):
         return True
@@ -1189,9 +1192,12 @@ class BatchKVCache(_BaseCache):
             N, offset=self._idx, left_padding=self.left_padding, **kwargs
         )
 
-    def filter(self, batch_indices):
+    def filter(self, batch_indices, *, compact=True):
         """
         In-place filter to keep just the given indices in the cache.
+
+        Set compact=False during prefill to preserve the token-axis layout,
+        including left padding that has not been processed yet.
         """
         if self.keys is not None:
             self.keys = self.keys[batch_indices]
@@ -1202,7 +1208,7 @@ class BatchKVCache(_BaseCache):
             self._right_padding = self._right_padding[batch_indices]
 
         # Shift left to reduce padding
-        min_left_pad = self.left_padding.min().item()
+        min_left_pad = self.left_padding.min().item() if compact else 0
         if min_left_pad > 0:
             if self.keys is not None:
                 self.keys = self.keys[..., min_left_pad:, :]
@@ -1547,7 +1553,7 @@ class BatchRotatingKVCache(_BaseCache):
 
         return mask
 
-    def filter(self, batch_indices):
+    def filter(self, batch_indices, *, compact=True):
         """
         In-place filter to keep just the given indices in the cache.
         """
@@ -1999,7 +2005,7 @@ class BatchQuantizedKVCache(_BaseCache):
         cache.offset = int(cache.keys[0].shape[2])
         return cache
 
-    def filter(self, batch_indices: mx.array):
+    def filter(self, batch_indices: mx.array, *, compact=True):
         """Keep only the sequences at *batch_indices*."""
         if self.keys is not None:
             self.keys = tuple(k[batch_indices] for k in self.keys)
@@ -2009,7 +2015,7 @@ class BatchQuantizedKVCache(_BaseCache):
         if self._right_padding is not None:
             self._right_padding = self._right_padding[batch_indices]
 
-        min_lp = self.left_padding.min().item()
+        min_lp = self.left_padding.min().item() if compact else 0
         if min_lp > 0:
             if self.keys is not None:
                 self.keys = tuple(k[..., min_lp:, :] for k in self.keys)
@@ -2579,7 +2585,7 @@ class BatchPoolingCache(_BaseCache):
             total += self.pooled.nbytes
         return total
 
-    def filter(self, batch_indices):
+    def filter(self, batch_indices, *, compact=True):
         if isinstance(batch_indices, mx.array):
             idx_list = batch_indices.tolist()
         else:

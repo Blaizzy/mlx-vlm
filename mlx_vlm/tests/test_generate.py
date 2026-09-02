@@ -176,6 +176,57 @@ def mock_processor():
     return MockProcessor()
 
 
+@pytest.fixture(params=["dense", "moe"])
+def tiny_cancellation_model(request):
+    from mlx_vlm.models import qwen3_5, qwen3_5_moe
+
+    mx.random.seed(17)
+    module = qwen3_5 if request.param == "dense" else qwen3_5_moe
+    model_type = "qwen3_5" if request.param == "dense" else "qwen3_5_moe"
+    mlp_config = (
+        {"intermediate_size": 64}
+        if request.param == "dense"
+        else {
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "shared_expert_intermediate_size": 64,
+            "moe_intermediate_size": 64,
+        }
+    )
+    config = module.TextConfig(
+        model_type=model_type,
+        hidden_size=32,
+        linear_num_value_heads=2,
+        linear_num_key_heads=2,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=3,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        rms_norm_eps=1e-5,
+        vocab_size=32,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+        head_dim=16,
+        full_attention_interval=2,
+        rope_parameters={
+            "type": "default",
+            "mrope_section": [1, 1, 0],
+            "rope_theta": 10000,
+            "partial_rotary_factor": 0.25,
+        },
+        **mlp_config,
+    )
+    return module.LanguageModel(
+        config,
+        module.ModelConfig(
+            text_config=config,
+            vision_config=module.VisionConfig(),
+            model_type=model_type,
+        ),
+    )
+
+
 def test_batch_generator_apc_media_token_ids_handles_text_only_model(mock_processor):
     model = SimpleNamespace(
         language_model=MockLanguageModel(),
@@ -1171,10 +1222,13 @@ class TestBatchGenerator:
             processor=mock_processor,
             max_tokens=50,
         )
-        prompt_batch = SimpleNamespace(
+        prompt_batch = PromptProcessingBatch(
+            model=mock_model.language_model,
             uids=[7],
-            prompt_cache=[MagicMock()],
-            input_ids=mx.array([[1, mock_model.config.image_token_index, 2]]),
+            input_ids=[[1, mock_model.config.image_token_index, 2]],
+            max_tokens=[50],
+            inputs_embeds=mx.zeros((1, 3, 768)),
+            prompt_kwargs={},
         )
         gen._prompt_batch = prompt_batch
 
@@ -1182,6 +1236,264 @@ class TestBatchGenerator:
         assert prompt_batch.uids == []
         assert prompt_batch.prompt_cache == []
         assert gen._prompt_batch is None
+
+    @pytest.mark.parametrize("cancel_row", [0, 1])
+    @pytest.mark.parametrize("chunks", [1, 3])
+    @pytest.mark.parametrize("step_size", [1, 3])
+    def test_cancel_prefill_row_preserves_survivor_logits(
+        self, mock_processor, tiny_cancellation_model, cancel_row, chunks, step_size
+    ):
+        model = tiny_cancellation_model
+        prompts = [[1, 2, 3, 4], list(range(1, 14))]
+        kwargs = [
+            {
+                "inputs_embeds": model.model.embed_tokens(mx.array([ids])),
+                "position_ids": mx.broadcast_to(
+                    mx.arange(len(ids))[None, None], (3, 1, len(ids))
+                ),
+                "rope_deltas": mx.zeros((1, 1), dtype=mx.int32),
+            }
+            for ids in prompts
+        ]
+        gen = BatchGenerator(
+            model,
+            mock_processor,
+            prefill_batch_size=2,
+            prefill_step_size=step_size,
+            max_tokens=5,
+        )
+        try:
+            uids = gen.insert(prompts, prompt_kwargs=kwargs)
+            for _ in range(chunks):
+                gen.next()
+            batch = gen._prompt_batch
+            assert batch is not None
+            processed = batch._processed_prompt_columns
+            remaining = batch._input_ids.shape[1]
+            assert gen.remove(uids[cancel_row]) is True
+            assert gen._prompt_batch is batch
+            assert batch._processed_prompt_columns == processed
+            assert batch._input_ids.shape == (1, remaining)
+            assert batch.uids == [uids[1 - cancel_row]]
+            assert not gen.unprocessed_prompts
+
+            # Compare final-prefill logits and several decode steps with a
+            # standalone survivor; no generated prose or full weights needed.
+            while batch.needs_processing():
+                batch.prompt_step()
+            output = model(
+                batch._input_ids,
+                inputs_embeds=batch._inputs_embeds,
+                cache=batch.prompt_cache,
+                **batch._prompt_kwargs,
+            ).logits[:, -1:]
+            baseline_cache = model.make_cache()
+            baseline = model(
+                mx.array([prompts[1 - cancel_row]]), cache=baseline_cache
+            ).logits[:, -1:]
+            for _ in range(4):
+                assert mx.allclose(output, baseline, atol=1e-4, rtol=1e-4).item()
+                token = mx.argmax(baseline[:, -1], axis=-1)[:, None]
+                output = model(token, cache=batch.prompt_cache).logits
+                baseline = model(token, cache=baseline_cache).logits
+        finally:
+            gen.close()
+
+    @pytest.mark.parametrize("cancel_row", [0, 1])
+    @pytest.mark.parametrize("speculative", [False, True])
+    def test_cancel_prefill_then_decode_matches_standalone(
+        self, mock_processor, tiny_cancellation_model, cancel_row, speculative
+    ):
+        from mlx_vlm.speculative.drafters.qwen3_5_mtp.config import Qwen3_5MTPConfig
+        from mlx_vlm.speculative.drafters.qwen3_5_mtp.qwen3_5_mtp import (
+            Qwen3_5MTPDraftModel,
+        )
+
+        model = tiny_cancellation_model
+        drafter = (
+            Qwen3_5MTPDraftModel(Qwen3_5MTPConfig(text_config=model.args))
+            if speculative
+            else None
+        )
+        prompts = [[1, 2, 3, 4], list(range(1, 14))]
+        mock_processor.tokenizer.stopping_criteria = MockStoppingCriteria([-1])
+        gen = BatchGenerator(
+            model,
+            mock_processor,
+            prefill_batch_size=2,
+            prefill_step_size=3,
+            max_tokens=5,
+            draft_model=drafter,
+            draft_kind="mtp" if speculative else None,
+            draft_block_size=3 if speculative else None,
+        )
+        try:
+            uids = gen.insert(
+                prompts,
+                prompt_kwargs=[
+                    {
+                        "inputs_embeds": model.model.embed_tokens(mx.array([ids])),
+                        "position_ids": mx.broadcast_to(
+                            mx.arange(len(ids))[None, None], (3, 1, len(ids))
+                        ),
+                        "rope_deltas": mx.zeros((1, 1), dtype=mx.int32),
+                    }
+                    for ids in prompts
+                ],
+            )
+            gen.next()
+            assert gen.remove(uids[cancel_row]) is True
+            tokens = []
+            for _ in range(30):
+                if not gen.has_work:
+                    break
+                progress, responses = gen.next()
+                assert all(p.uid == uids[1 - cancel_row] for p in progress)
+                assert all(r.uid == uids[1 - cancel_row] for r in responses)
+                tokens.extend(r.token for r in responses)
+            assert not gen.has_work
+
+            expected = []
+            baseline_cache = model.make_cache()
+            inputs = mx.array([prompts[1 - cancel_row]])
+            for _ in range(5):
+                output = model(inputs, cache=baseline_cache)
+                inputs = mx.argmax(output.logits[:, -1], axis=-1)[:, None]
+                expected.append(inputs.item())
+            assert tokens == expected
+        finally:
+            gen.close()
+
+    def test_cancel_all_prefill_rows_releases_apc_without_requeue(
+        self, mock_model, mock_processor
+    ):
+        manager = MagicMock()
+        meta = [
+            {"apc_blocks": [11], "full_input_ids": [1, 2, 3]},
+            {"apc_blocks": [22], "full_input_ids": [4, 5, 6]},
+        ]
+        gen = BatchGenerator(mock_model.language_model, mock_processor)
+        batch = PromptProcessingBatch(
+            model=mock_model.language_model,
+            uids=[7, 8],
+            input_ids=[[1, 2, 3], [4, 5, 6]],
+            max_tokens=[5, 5],
+            inputs_embeds=mx.zeros((2, 3, 768)),
+            prompt_kwargs={},
+            apc_meta=meta,
+            apc_manager=manager,
+        )
+        gen._prompt_batch = batch
+        try:
+            assert gen.remove(7) is True
+            manager.release.assert_called_once_with([11])
+            assert batch._apc_meta == [meta[1]]
+            assert gen.remove(8) is True
+            assert manager.release.call_args_list == [
+                (([11],), {}),
+                (([22],), {}),
+            ]
+            assert gen.remove(8) is False
+            assert gen._prompt_batch is None
+            assert not gen.has_work
+            assert batch.prompt_cache == []
+            assert batch._apc_meta == []
+            assert batch._inputs_embeds is None
+        finally:
+            gen.close()
+
+    @pytest.mark.parametrize("keep_row", [0, 1])
+    def test_prefill_filter_preserves_mixed_apc_suffix_metadata(self, keep_row):
+        calls = []
+
+        def model(ids, *, cache, inputs_embeds, **kwargs):
+            calls.append(ids.tolist())
+            kv = inputs_embeds[:, None]
+            cache[0].update_and_fetch(kv, kv)
+            return SimpleNamespace(logits=mx.zeros((*ids.shape, 16)))
+
+        manager = MagicMock()
+        meta = [
+            {"full_input_ids": list(range(10)), "prefix_len": 4, "apc_blocks": [11]},
+            {"full_input_ids": list(range(8)), "prefix_len": 0, "apc_blocks": []},
+        ]
+        warm_cache = BatchKVCache([0, 4])
+        warm_cache.update_and_fetch(mx.ones((2, 1, 4, 4)), mx.ones((2, 1, 4, 4)))
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=[7, 8],
+            input_ids=[list(range(4, 10)), list(range(8))],
+            max_tokens=[5, 5],
+            inputs_embeds=mx.ones((2, 8, 4)),
+            prompt_kwargs={},
+            warm_cache=[warm_cache],
+            prefill_step_size=3,
+            apc_meta=meta,
+            apc_manager=manager,
+            apc_mode="exact",
+            right_pad_per_row=[2, 0],
+            suffix_lens=[6, 8],
+        )
+        batch.prompt_step()
+        batch.filter([keep_row])
+        assert warm_cache._idx == 7
+        assert warm_cache.left_padding.tolist() == [[0], [4]][keep_row]
+        assert warm_cache._right_padding.tolist() == [[2], [0]][keep_row]
+        assert batch._right_pad_per_row == [[2], [0]][keep_row]
+        assert batch._suffix_lens == [[6], [8]][keep_row]
+        assert batch._cached_tokens_per_row == [[4], [0]][keep_row]
+        assert batch._prompt_tokens_per_row == [[10], [8]][keep_row]
+        assert batch._row_real_tokens_processed(0) == [7, 3][keep_row]
+        assert batch._apc_meta == [meta[keep_row]]
+        manager.release.assert_called_once_with(meta[1 - keep_row]["apc_blocks"])
+
+        batch.prompt_step()
+        assert batch._processed_prompt_columns == 6
+        assert calls == [
+            [[4, 5, 6], [0, 1, 2]],
+            [[[7, 8, 9]], [[3, 4, 5]]][keep_row],
+        ]
+        assert warm_cache._idx == 10
+
+    def test_prefill_filter_keeps_mrope_and_request_metadata_aligned(self, mock_model):
+        positions = mx.arange(3 * 3 * 6).reshape(3, 3, 6)
+        embeddings = mx.arange(3 * 6 * 4).reshape(3, 6, 4)
+        processors = [[MagicMock()] for _ in range(3)]
+        criteria = [MagicMock() for _ in range(3)]
+        batch = PromptProcessingBatch(
+            model=mock_model.language_model,
+            uids=[7, 8, 9],
+            input_ids=[[1, 2], [3, 4, 5, 6], [7, 8, 9, 10, 11, 12]],
+            max_tokens=[5, 6, 7],
+            inputs_embeds=embeddings,
+            prompt_kwargs={
+                "position_ids": positions,
+                "rope_deltas": mx.array([[10], [20], [30]]),
+                "attention_mask": mx.ones((3, 6)),
+                "shared_scalar": mx.array(42),
+            },
+            logits_processors=processors,
+            thinking_budget_criteria=criteria,
+        )
+        batch.record_prompt_time(1.0)
+        batch.filter([2, 0])
+        batch.filter([1])
+
+        assert batch.uids == [7]
+        assert batch.max_tokens == [5]
+        assert batch._left_padding_per_row == [4]
+        assert batch.logits_processors == [processors[0]]
+        assert batch.thinking_budget_criteria == [criteria[0]]
+        assert batch._token_context == [[1, 2]]
+        assert batch.total_prompt_tokens == 2
+        assert [p.uid for p in batch.prompt_progress()] == [7]
+        assert mx.array_equal(batch._inputs_embeds, embeddings[:1]).item()
+        assert mx.array_equal(
+            batch._prompt_kwargs["position_ids"], positions[:, :1]
+        ).item()
+        assert batch._prompt_kwargs["rope_deltas"].tolist() == [[10]]
+        assert batch._prompt_kwargs["attention_mask"].shape == (1, 6)
+        assert batch._prompt_kwargs["shared_scalar"].item() == 42
 
 
 # ============================================================================

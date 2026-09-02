@@ -259,9 +259,9 @@ class BatchQSAKVCache:
     def make_mask(self, *args, **kwargs):
         return self.kv_cache.make_mask(*args, **kwargs)
 
-    def filter(self, batch_indices):
-        min_left = int(self.left_padding[batch_indices].min().item())
-        self.kv_cache.filter(batch_indices)
+    def filter(self, batch_indices, *, compact=True):
+        min_left = int(self.left_padding[batch_indices].min().item()) if compact else 0
+        self.kv_cache.filter(batch_indices, compact=compact)
         if self.index_keys is None:
             return
         self.index_keys = self.index_keys[batch_indices]

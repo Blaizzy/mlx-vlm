@@ -7,6 +7,8 @@ dequant-aware block harvest. Uses real cache types with small dimensions.
 from __future__ import annotations
 
 import mlx.core as mx
+import pytest
+from mlx.utils import tree_flatten
 
 from mlx_vlm.apc import (
     APCManager,
@@ -596,6 +598,99 @@ def _fill_batch_turbo(left_padding, seq_len, bits=4.0):
     cache.update_and_fetch(k, v)
     mx.eval(cache.keys)
     return cache, k, v
+
+
+@pytest.mark.parametrize(
+    "kind", ["kv", "quantized", "turbo", "rotating", "qsa", "minimax"]
+)
+@pytest.mark.parametrize("processed", [0, 3])
+def test_prefill_filter_preserves_unprocessed_left_padding(kind, processed):
+    from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3BatchKVCache
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache
+    from mlx_vlm.turboquant import BatchTurboQuantKVCache
+
+    factories = {
+        "kv": lambda: BatchKVCache([8, 0]),
+        "quantized": lambda: BatchQuantizedKVCache([8, 0], group_size=32, bits=8),
+        "turbo": lambda: BatchTurboQuantKVCache([8, 0], bits=4.0),
+        "rotating": lambda: BatchRotatingKVCache(32, [8, 0]),
+        "qsa": lambda: BatchQSAKVCache([8, 0]),
+        "minimax": lambda: MiniMaxM3BatchKVCache([8, 0]),
+    }
+    cache = factories[kind]()
+    backend = getattr(cache, "kv_cache", cache)
+
+    def update(batch, length):
+        k, v = _rand_kv(batch=batch, seq_len=length, dim=64)
+        cache.update_and_fetch(k, v)
+        if kind == "qsa":
+            positions = mx.broadcast_to(
+                mx.arange(length)[None, None], (3, batch, length)
+            )
+            cache.update_indexer(k[:, 0], positions)
+        elif kind == "minimax":
+            cache.update_index_and_fetch(k)
+
+    if processed:
+        update(2, processed)
+        before = [v for _, v in tree_flatten((backend.keys, backend.values))]
+        if kind in ("qsa", "minimax"):
+            index_before = cache.index_keys
+    cache.filter(mx.array([0], dtype=mx.int32), compact=False)
+
+    assert cache._idx == processed
+    assert cache.left_padding.tolist() == [8]
+    assert cache.offset.tolist() == [processed - 8]
+    if processed:
+        after = [v for _, v in tree_flatten((backend.keys, backend.values))]
+        for expected, actual in zip(before, after):
+            assert mx.array_equal(actual, expected[:1]).item()
+        if kind in ("qsa", "minimax"):
+            assert cache.index_offset == processed
+            assert mx.array_equal(cache.index_keys, index_before[:1]).item()
+        if kind == "qsa":
+            assert cache.index_position_ids.shape == (3, 1, processed)
+
+    # Consume the remaining padding and real tokens, then retain the existing
+    # default decode behavior: compact only once prefill has finished.
+    update(1, 10 - processed)
+    assert cache._idx == 10
+    assert cache.offset.tolist() == [2]
+    cache.filter(mx.array([0], dtype=mx.int32))
+    assert cache._idx == (10 if kind == "rotating" else 2)
+    assert cache.left_padding.tolist() == ([8] if kind == "rotating" else [0])
+    if kind in ("qsa", "minimax"):
+        assert cache.index_offset == 2
+
+
+def test_prefill_filter_propagates_through_nested_and_recurrent_caches():
+    kv = BatchKVCache([8, 0])
+    recurrent = ArraysCache(2, left_padding=[8, 0])
+    recurrent[0] = mx.arange(8).reshape(2, 4)
+    recurrent[1] = mx.arange(12).reshape(2, 2, 3)
+    recurrent.prepare(lengths=[10, 10])
+    recurrent.advance(3)
+    pooling = BatchPoolingCache(4, [8, 0])
+    pooling.prepare(lengths=[10, 10])
+    pooling.accumulate_windows(
+        mx.ones((2, 3, 4)), mx.ones((2, 3, 4)), mx.array([-8, 0])
+    )
+    k, v = _rand_kv(batch=2, seq_len=3)
+    kv.update_and_fetch(k, v)
+    caches = CacheList(kv, CacheList(recurrent, pooling))
+
+    caches.filter(mx.array([0], dtype=mx.int32), compact=False)
+
+    assert kv._idx == 3
+    assert kv.left_padding.tolist() == [8]
+    assert recurrent.left_padding.tolist() == [5]
+    assert recurrent.lengths.tolist() == [7]
+    assert recurrent[0].tolist() == [[0, 1, 2, 3]]
+    assert recurrent[1].shape == (1, 2, 3)
+    assert pooling.left_padding == [5]
+    assert pooling.remainder == [0]
+    assert pooling._processed == [0]
+    assert pooling.buf_kv.shape[0] == 1
 
 
 class TestBatchRightPadPrefill:

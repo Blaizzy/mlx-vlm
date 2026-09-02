@@ -6664,14 +6664,14 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
     # Batch operations for Batch.filter / Batch.extend
     # ------------------------------------------------------------------
 
-    def filter(self, batch_indices: mx.array):
+    def filter(self, batch_indices: mx.array, *, compact=True):
         if self.keys is not None:
             self.keys = _filter_state(self.keys, batch_indices)
             self.values = _filter_state(self.values, batch_indices)
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
 
-        min_lp = self.left_padding.min().item()
+        min_lp = self.left_padding.min().item() if compact else 0
         if min_lp > 0:
             if self.keys is not None:
                 # Trim leading padding tokens
