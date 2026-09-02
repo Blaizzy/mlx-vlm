@@ -833,8 +833,6 @@ def _safetensors_dtype_info(dtype: str):
     if dtype == "BF16":
         return 2, "H", mx.uint16, mx.bfloat16
     mapping = {
-        # Python 3.10's memoryview.cast does not support the half-float "e"
-        # format. Load the bits as uint16 and reinterpret them in MLX instead.
         "F16": (2, "H", mx.uint16, mx.float16),
         "F32": (4, "f", mx.float32, None),
         "I64": (8, "q", mx.int64, None),
