@@ -606,6 +606,11 @@ def clone_cache_entry(c, *, min_capacity_tokens, eval_targets):
             for s in c
         ]
         return None if any(s is None for s in subs) else tuple(subs)
+    # A cache-defined snapshot contract takes precedence over the legacy
+    # float-K/V fallback. Quantized caches use this to preserve their packed
+    # representation end to end.
+    if _has_explicit_snapshot_contract(c):
+        return _snapshot_contract_clone(c, eval_targets, min_capacity_tokens)
     if hasattr(c, "dequantize_for_apc"):
         copy, _ = _apc_array_helpers()
         dk, dv = c.dequantize_for_apc()
@@ -615,8 +620,6 @@ def clone_cache_entry(c, *, min_capacity_tokens, eval_targets):
         out.keys, out.values, out.offset = copy(dk), copy(dv), dk.shape[-2]
         eval_targets.extend([out.keys, out.values])
         return out
-    if _has_explicit_snapshot_contract(c):
-        return _snapshot_contract_clone(c, eval_targets, min_capacity_tokens)
     if _custom_state_contract(c):
         return _state_clone(c, eval_targets, min_capacity_tokens)
     return None
@@ -628,6 +631,13 @@ def merge_cache_entries(entries, prefix_lens):
     if not entries:
         return None
     first = entries[0]
+    for entry in entries:
+        merge = getattr(entry, "prefix_cache_merge", None)
+        if not callable(merge):
+            continue
+        merged = merge(entries, prefix_lens)
+        if merged is not None:
+            return merged
     for typ, adapter in _clone_rules():
         if typ is lm.KVCache:
             ok = all(type(c) is typ for c in entries)

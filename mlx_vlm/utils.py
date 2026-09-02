@@ -744,6 +744,8 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
         model_type = "gliner2_5"
     elif "DFlash2DraftModel" in architectures:
         model_type = "dflash2"
+    elif "Gemma4DSparkModel" in architectures:
+        model_type = "gemma4_dspark"
     elif dflash_config is not None:
         is_dspark = (
             dflash_config.get("projector_type") == "dspark"
@@ -1443,8 +1445,11 @@ def load_processor(
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
 
-        # Instantiate the detokenizer
-        processor.detokenizer = detokenizer_class(tokenizer_obj)
+        # Non-text models (depth, detection) have no decode(); skip detokenizer
+        try:
+            processor.detokenizer = detokenizer_class(tokenizer_obj)
+        except AttributeError:
+            return processor
 
         # Create and assign the StoppingCriteria
         criteria = StoppingCriteria(

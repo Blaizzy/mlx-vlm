@@ -93,6 +93,7 @@ class DSparkStage(nn.Module):
             num_hidden_layers=1,
             compress_ratios=[0],
             num_hash_layers=0,
+            vision_n_layers=0,
         )
         self.is_first = stage_id == 0
         self.is_last = stage_id == config.n_mtp_layers - 1
@@ -280,6 +281,8 @@ class DeepseekV4DsparkDraftModel(nn.Module):
             for key, value in mapped.items():
                 body = key[len("decoder.") :] if key.startswith("decoder.") else key
                 if body.startswith("confidence_head."):
+                    continue
+                if body.endswith("ffn.gate.bias_vl"):
                     continue
                 if body.startswith("markov_head."):
                     out[body] = value

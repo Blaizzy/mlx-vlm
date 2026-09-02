@@ -188,6 +188,7 @@ _TARGET_VERIFY_QMV_SOURCE = r"""
         sums[t] = load_vector_exact<T>(xk + t * K_SIZE, x_thread[t]);
       }
 
+#pragma clang loop unroll_count(2)
       for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
         const device uint8_t* wl = ws + row * in_vec_size_w;
         const device T* sl = sc + row * in_vec_size_g;
@@ -259,6 +260,7 @@ _TARGET_VERIFY_QARGMAX_SOURCE = r"""
         sums[t] = load_vector_exact<T>(xk + t * K_SIZE, x_thread[t]);
       }
 
+#pragma clang loop unroll_count(2)
       for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
         const device uint8_t* wl = ws + row * in_vec_size_w;
         const device T* sl = sc + row * in_vec_size_g;
