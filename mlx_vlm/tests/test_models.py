@@ -1,5 +1,6 @@
 import importlib
 import inspect
+import math
 import threading
 import unittest
 from types import SimpleNamespace
@@ -1951,6 +1952,80 @@ class TestModels(unittest.TestCase):
         self.assertFalse(any(".weight_global_scale" in key for key in sanitized))
         self.assertFalse(any(".input_global_scale" in key for key in sanitized))
 
+    def test_laguna_stacks_pure_fp8_experts_after_dequantization(self):
+        from mlx_vlm.models import laguna
+        from mlx_vlm.utils import _transform_compressed_tensors_weights
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=128,
+            mlp_layer_types=["dense", "sparse"],
+            num_attention_heads_per_layer=[2, 2],
+            num_experts=3,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+        )
+        model = laguna.Model(config)
+        weights = {}
+        for expert_idx in range(config.num_experts):
+            for proj in ["gate_proj", "up_proj", "down_proj"]:
+                prefix = f"model.layers.1.mlp.experts.{expert_idx}.{proj}"
+                weights[f"{prefix}.weight"] = mx.full(
+                    (16, 16), 56 + expert_idx, dtype=mx.uint8
+                )
+                weights[f"{prefix}.weight_scale"] = mx.full(
+                    (2, 2), 0.5, dtype=mx.bfloat16
+                )
+        for proj in ["gate_proj", "up_proj", "down_proj"]:
+            prefix = f"model.layers.1.mlp.shared_expert.{proj}"
+            weights[f"{prefix}.weight"] = mx.full((16, 16), 56, dtype=mx.uint8)
+            weights[f"{prefix}.weight_scale"] = mx.full((2, 2), 0.5, dtype=mx.bfloat16)
+
+        transformed, quantization = _transform_compressed_tensors_weights(
+            weights,
+            {
+                "quant_method": "compressed-tensors",
+                "format": "float-quantized",
+                "config_groups": {
+                    "group_0": {
+                        "format": "float-quantized",
+                        "weights": {
+                            "block_structure": [8, 8],
+                            "num_bits": 8,
+                            "strategy": "block",
+                            "type": "float",
+                        },
+                    }
+                },
+            },
+        )
+        sanitized = model.language_model.sanitize(transformed)
+
+        prefix = "model.layers.1.mlp"
+        assert sanitized[f"{prefix}.switch_mlp.gate_up_proj.weight"].shape == (
+            3,
+            32,
+            16,
+        )
+        assert sanitized[f"{prefix}.switch_mlp.down_proj.weight"].shape == (
+            3,
+            16,
+            16,
+        )
+        assert sanitized[f"{prefix}.shared_expert.gate_proj.weight"].dtype == (
+            mx.bfloat16
+        )
+        assert not any(key.endswith(".weight_scale") for key in sanitized)
+        assert quantization is None
+
     def test_laguna_folds_nvfp4_shared_experts(self):
         from unittest.mock import patch
 
@@ -2515,6 +2590,67 @@ class TestModels(unittest.TestCase):
         self.assertEqual(current.image_token_index, 124907)
         self.assertEqual(legacy.image_token_index, 396)
 
+    def test_lfm2_vl_sanitize_maps_layouts_to_language_model_prefix(self):
+        from mlx_vlm.models import lfm2_vl
+
+        config = lfm2_vl.ModelConfig(
+            model_type="lfm2-vl",
+            text_config=lfm2_vl.TextConfig(
+                hidden_size=64,
+                num_hidden_layers=2,
+                intermediate_size=128,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                vocab_size=128,
+                layer_types=["full_attention", "full_attention"],
+            ),
+            vision_config=lfm2_vl.VisionConfig(
+                hidden_size=64,
+                num_hidden_layers=2,
+                intermediate_size=128,
+                num_attention_heads=4,
+            ),
+            projector_use_layernorm=True,
+        )
+        model = lfm2_vl.Model(config)
+
+        raw_hf = {
+            "model.language_model.embed_tokens.weight": mx.zeros((128, 64)),
+            "model.vision_tower.vision_encoder.layers.0.self_attn.q_proj.weight": mx.zeros(
+                (64, 64)
+            ),
+            "model.multi_modal_projector.linear_1.weight": mx.zeros((64, 64)),
+        }
+        mlx_std = {
+            "language_model.model.embed_tokens.weight": mx.zeros((128, 64)),
+            "vision_tower.encoder.layers.0.self_attn.q_proj.weight": mx.zeros((64, 64)),
+            "multi_modal_projector.linear_1.weight": mx.zeros((64, 64)),
+        }
+        optiq = {
+            "model.embed_tokens.weight": mx.zeros((128, 64)),
+            "model.layers.0.conv.in_proj.weight": mx.zeros((64, 64)),
+            "vision_tower.encoder.layers.0.self_attn.q_proj.weight": mx.zeros((64, 64)),
+            "multi_modal_projector.linear_1.weight": mx.zeros((64, 64)),
+        }
+
+        for weights in (raw_hf, mlx_std, optiq):
+            keys = set(model.sanitize(weights))
+            self.assertFalse(any(k.startswith("model.") for k in keys))
+
+        self.assertIn(
+            "language_model.model.embed_tokens.weight", model.sanitize(raw_hf)
+        )
+        self.assertIn("language_model.model.embed_tokens.weight", model.sanitize(optiq))
+        self.assertIn(
+            "language_model.model.layers.0.conv.in_proj.weight",
+            model.sanitize(optiq),
+        )
+        self.assertIn(
+            "vision_tower.encoder.layers.0.self_attn.q_proj.weight",
+            model.sanitize(optiq),
+        )
+        self.assertEqual(set(mlx_std), set(model.sanitize(mlx_std)))
+
     def test_deepseek_v4_language_model(self):
         from mlx_vlm.models import deepseek_v4
         from mlx_vlm.models.deepseek_v4.hyper_connection import (
@@ -2678,11 +2814,15 @@ class TestModels(unittest.TestCase):
             rope_parameters={"rope_theta": 10000.0},
             attention_bias=False,
             index_topk_pattern="FSFSFS",
+            num_nextn_predict_layers=1,
+            index_share_for_mtp_iteration=True,
         )
         self.assertEqual(
             config.indexer_types,
             ["full", "shared", "full", "shared", "full", "shared"],
         )
+        self.assertEqual(config.num_nextn_predict_layers, 1)
+        self.assertTrue(config.index_share_for_mtp_iteration)
 
         model = glm_moe_dsa.Model(config)
         has_indexer = [
@@ -2701,6 +2841,104 @@ class TestModels(unittest.TestCase):
         cache = model.make_cache()
         self.assertEqual(len(cache[0].caches), 2)
         self.assertEqual(len(cache[1].caches), 1)
+
+        from mlx_vlm.models.glm_moe_dsa.speculative_verifier import (
+            _quantized_head_logits,
+        )
+
+        tokens = mx.array([[1, 2, 3]])
+        target = model.language_model
+        target_out = target(
+            tokens,
+            capture_layer_ids=[],
+            speculative_verify=True,
+            return_hidden=True,
+            return_shared_kv=True,
+            skip_logits=True,
+        )
+        verified_hidden, shared_kv, gdn_states = target.speculative_verify_hidden(
+            tokens, cache=None
+        )
+        mx.eval(target_out.hidden_states, verified_hidden)
+        self.assertEqual(target_out.hidden_states[-1].shape, (1, 3, config.hidden_size))
+        self.assertTrue(
+            mx.array_equal(target_out.hidden_states[-1], verified_hidden).item()
+        )
+        self.assertEqual(shared_kv, {})
+        self.assertIsNone(gdn_states)
+
+        captured = target(
+            tokens,
+            capture_layer_ids=[0, 2, 5],
+            speculative_verify=True,
+        )
+        mx.eval(captured.hidden_states)
+        self.assertEqual(len(captured.hidden_states), 3)
+        self.assertTrue(
+            all(
+                hidden.shape == (1, tokens.shape[1], config.hidden_size)
+                for hidden in captured.hidden_states
+            )
+        )
+
+        linear = nn.Linear(512, 8, bias=False)
+        linear.weight = mx.random.normal(linear.weight.shape).astype(mx.bfloat16)
+        verifier_inputs = mx.random.normal((1, 2, 512)).astype(mx.bfloat16)
+        for bits in (4, 5, 8):
+            quantized_head = nn.QuantizedLinear.from_linear(
+                linear, group_size=64, bits=bits
+            )
+            verifier_logits = _quantized_head_logits(quantized_head, verifier_inputs)
+            reference_logits = mx.concatenate(
+                [
+                    quantized_head(verifier_inputs[:, index : index + 1])
+                    for index in range(verifier_inputs.shape[1])
+                ],
+                axis=1,
+            )
+            mx.eval(verifier_logits, reference_logits)
+            self.assertTrue(mx.all(verifier_logits == reference_logits).item())
+
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.models.glm_moe_dsa.language import GlmMoeDsaMTP
+        from mlx_vlm.speculative.drafters.glm_moe_dsa_mtp import GlmMoeDsaMTPDraftModel
+        from mlx_vlm.speculative.drafters.glm_moe_dsa_mtp import (
+            ModelConfig as GlmMoeDsaMTPConfig,
+        )
+
+        mtp = GlmMoeDsaMTP(config)
+        mtp_out = mtp(
+            target_out.hidden_states[-1],
+            target.model.embed_tokens(tokens),
+            cache=CacheList(KVCache(), KVCache()),
+        )
+        mx.eval(mtp_out)
+        self.assertIsNotNone(mtp.self_attn.indexer)
+        self.assertEqual(mtp_out.shape, (1, 3, config.hidden_size))
+
+        drafter = GlmMoeDsaMTPDraftModel(GlmMoeDsaMTPConfig(text_config=config))
+        draft_cache = drafter.reset(target)
+
+        def greedy(logits):
+            return mx.argmax(logits, axis=-1)
+
+        drafter.prefill_from_target_hidden(
+            tokens,
+            target_out.hidden_states[-1],
+            bonus_token=4,
+            sampler=greedy,
+            greedy=True,
+        )
+        drafted_tokens = drafter.draft_block(
+            last_bonus=4,
+            hidden=target_out.hidden_states[-1][:, -1:, :],
+            cache=draft_cache,
+            block_size=2,
+            sampler=greedy,
+            greedy=True,
+        )
+        mx.eval(drafted_tokens)
+        self.assertEqual(drafted_tokens.shape, (1, 1))
 
         sanitized = model.sanitize(
             {
@@ -3534,6 +3772,132 @@ class TestModels(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 1, config.vocab_size))
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
 
+    def test_longcat_flash_sparse_language_model(self):
+        from mlx.utils import tree_flatten
+
+        from mlx_vlm.models import longcat_flash_sparse as longcat_flash
+
+        def cfg(method, **kw):
+            return longcat_flash.ModelConfig(
+                model_type="longcat_flash_sparse",
+                attention_method=method,
+                hidden_size=64,
+                ffn_hidden_size=128,
+                expert_ffn_hidden_size=48,
+                moe_topk=4,
+                n_routed_experts=6,
+                zero_expert_num=2,
+                num_layers=2,
+                vocab_size=512,
+                max_position_embeddings=1024,
+                num_attention_heads=4,
+                kv_lora_rank=32,
+                q_lora_rank=48,
+                qk_rope_head_dim=16,
+                qk_nope_head_dim=16,
+                v_head_dim=16,
+                routed_scaling_factor=2.0,
+                rms_norm_eps=1e-5,
+                norm_topk_prob=True,
+                rope_scaling=None,
+                **kw,
+            )
+
+        lsa_config = cfg(
+            "LSA",
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=8,
+            index_init_tokens=2,
+            index_local_tokens=4,
+            cli_factor=2,
+        )
+        model = longcat_flash.Model(lsa_config)
+
+        self.language_test_runner(
+            model.language_model,
+            lsa_config.model_type,
+            lsa_config.vocab_size,
+            lsa_config.num_layers,
+        )
+
+        # LSA layer keeps 3 cache slots: latent(0), indexer(0), latent(1)
+        cache = model.make_cache()
+        self.assertEqual(len(cache), lsa_config.num_layers)
+        self.assertEqual(len(cache[0].caches), 3)
+
+        prompt = mx.arange(24).reshape(1, 24)
+        logits = model(prompt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 24, lsa_config.vocab_size))
+        nxt = mx.argmax(logits[:, -1:, :], axis=-1)
+        logits = model(nxt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 1, lsa_config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+        # dense variant keeps 2 cache slots (the two attention sub-blocks)
+        dense = longcat_flash.Model(cfg("MLA"))
+        self.assertEqual(len(dense.make_cache()[0].caches), 2)
+
+        # sanitize: stack experts, split dual-block kv_b_proj, drop MTP
+        h, kv = lsa_config.hidden_size, lsa_config.kv_lora_rank
+        hd = lsa_config.qk_nope_head_dim + lsa_config.v_head_dim
+        nh, ef = lsa_config.num_attention_heads, lsa_config.expert_ffn_hidden_size
+        raw = {"model.mtp.embed_tokens.weight": mx.zeros((4, h))}
+        for e in range(lsa_config.n_routed_experts):
+            raw[f"model.layers.0.mlp.experts.{e}.gate_proj.weight"] = mx.zeros((ef, h))
+            raw[f"model.layers.0.mlp.experts.{e}.up_proj.weight"] = mx.zeros((ef, h))
+            raw[f"model.layers.0.mlp.experts.{e}.down_proj.weight"] = mx.zeros((h, ef))
+        for i in range(2):
+            raw[f"model.layers.0.self_attn.{i}.kv_b_proj.weight"] = mx.zeros(
+                (nh * hd, kv)
+            )
+        clean = dense.language_model.sanitize(dict(raw))
+        keys = dict(tree_flatten(clean)) if isinstance(clean, list) else clean
+        self.assertIn("model.layers.0.mlp.switch_mlp.gate_proj.weight", keys)
+        self.assertEqual(
+            keys["model.layers.0.mlp.switch_mlp.gate_proj.weight"].shape,
+            (lsa_config.n_routed_experts, ef, h),
+        )
+        for i in range(2):
+            self.assertIn(f"model.layers.0.self_attn.{i}.embed_q.weight", keys)
+            self.assertIn(f"model.layers.0.self_attn.{i}.unembed_out.weight", keys)
+            self.assertNotIn(f"model.layers.0.self_attn.{i}.kv_b_proj.weight", keys)
+        self.assertFalse(any(k.startswith("model.mtp") for k in keys))
+
+        # degenerate limit: an LSA model whose indexer never fires (index_topk >= L)
+        # must reproduce the dense backbone bit-for-bit when weights are shared.
+        ref = longcat_flash.Model(cfg("MLA"))
+        mx.eval(ref.parameters())
+        deg = longcat_flash.Model(
+            cfg("LSA", index_n_heads=4, index_head_dim=32, index_topk=10_000)
+        )
+        deg.load_weights(list(tree_flatten(ref.parameters())), strict=False)
+        mx.eval(deg.parameters())
+        ldense = ref(prompt).logits
+        ldeg = deg(prompt).logits
+        self.assertLess(float(mx.max(mx.abs(ldense - ldeg))), 1e-4)
+
+        # n-gram input embedding (Lite-Sparse): cache gains a leading context slot
+        # and chunked prefill must match single-shot (context cache threads state).
+        ng = longcat_flash.Model(
+            cfg(
+                "LSA",
+                index_n_heads=4,
+                index_head_dim=32,
+                index_topk=10_000,
+                oe_vocab_size_ratio=2,
+                oe_neighbor_num=3,
+                oe_split_num=2,
+            )
+        )
+        mx.eval(ng.parameters())
+        self.assertEqual(len(ng.make_cache()), lsa_config.num_layers + 1)
+        single = ng(prompt, cache=ng.make_cache()).logits[:, -1, :]
+        cc = ng.make_cache()
+        ng(prompt[:, :16], cache=cc)
+        chunked = ng(prompt[:, 16:], cache=cc).logits[:, -1, :]
+        self.assertLess(float(mx.max(mx.abs(single - chunked))), 5e-3)
+
     def test_qwen2_language_model(self):
         from mlx_vlm.models import qwen2
 
@@ -4040,6 +4404,258 @@ class TestModels(unittest.TestCase):
             config.vision_config.num_channels,
             (config.vision_config.image_size, config.vision_config.image_size),
         )
+
+    def test_llava_onevision(self):
+        from mlx_vlm.models import llava_onevision
+
+        text_config = llava_onevision.TextConfig(
+            model_type="qwen2",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-6,
+            vocab_size=200,
+            rope_theta=1000000.0,
+            tie_word_embeddings=False,
+        )
+
+        vision_config = llava_onevision.VisionConfig(
+            model_type="siglip_vision_model",
+            num_hidden_layers=3,
+            hidden_size=48,
+            intermediate_size=96,
+            num_attention_heads=4,
+            image_size=56,
+            patch_size=14,
+            num_channels=3,
+            layer_norm_eps=1e-6,
+            vision_use_head=False,
+        )
+
+        config = llava_onevision.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="llava_onevision",
+            image_token_index=190,
+            video_token_index=191,
+            image_grid_pinpoints=[[56, 56], [56, 112], [112, 56], [112, 112]],
+            vocab_size=200,
+        )
+
+        model = llava_onevision.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.mm_projector_test_runner(
+            model.multi_modal_projector,
+            config.vision_config.hidden_size,
+            config.text_config.hidden_size,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
+    def _llava_onevision_test_model(self, **overrides):
+        from mlx_vlm.models import llava_onevision
+
+        config = llava_onevision.ModelConfig(
+            text_config=llava_onevision.TextConfig(
+                model_type="qwen2",
+                hidden_size=32,
+                num_hidden_layers=1,
+                intermediate_size=64,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                rms_norm_eps=1e-6,
+                vocab_size=200,
+                tie_word_embeddings=False,
+            ),
+            vision_config=llava_onevision.VisionConfig(
+                model_type="siglip_vision_model",
+                num_hidden_layers=1,
+                hidden_size=32,
+                intermediate_size=64,
+                num_attention_heads=4,
+                image_size=56,
+                patch_size=14,
+                num_channels=3,
+                layer_norm_eps=1e-6,
+                vision_use_head=False,
+            ),
+            model_type="llava_onevision",
+            image_token_index=190,
+            video_token_index=191,
+            image_grid_pinpoints=[
+                [56, 56],
+                [56, 112],
+                [112, 56],
+                [112, 112],
+                [224, 224],
+            ],
+            vocab_size=200,
+            **overrides,
+        )
+        return llava_onevision.Model(config)
+
+    def test_llava_onevision_packing_single_tile(self):
+        model = self._llava_onevision_test_model()
+        tokens = model.patches_per_side**2
+
+        features = mx.zeros((1, tokens, 32))
+        packed = model.pack_image_features([features], [[56, 56]])
+
+        # A single tile keeps the base features and appends exactly one newline row.
+        self.assertEqual(packed[0].shape, (tokens + 1, 32))
+
+    def test_llava_onevision_packing_matches_grid_layout(self):
+        model = self._llava_onevision_test_model()
+        side = model.patches_per_side
+        tokens = side**2
+
+        features = mx.random.normal((5, tokens, 32))
+        packed = model.pack_image_features([features], [[112, 112]])[0]
+
+        # 2x2 grid of tiles, no downsampling at this size: base + rows*(cols+newline).
+        expected = tokens + (2 * side) * (2 * side + 1)
+        self.assertEqual(packed.shape, (expected, 32))
+        self.assertTrue(mx.allclose(packed[:tokens], features[0]))
+
+    def test_llava_onevision_packing_downsamples_above_ratio(self):
+        model = self._llava_onevision_test_model()
+        side = model.patches_per_side
+        tokens = side**2
+
+        features = mx.random.normal((17, tokens, 32))
+        packed = model.pack_image_features([features], [[224, 224]])[0]
+
+        # 4x4 grid exceeds anyres_max_9, so the unpadded grid is scaled down.
+        ratio = math.sqrt((4 * side) ** 2 / (model.max_num_patches * side**2))
+        self.assertGreater(ratio, 1.1)
+        scaled = int(4 * side // ratio)
+        self.assertEqual(packed.shape, (tokens + scaled * (scaled + 1), 32))
+
+    def test_llava_onevision_video_pooling(self):
+        model = self._llava_onevision_test_model()
+        side = model.patches_per_side
+        pooled = math.ceil(side / 2)
+
+        frames = 3
+        features = mx.random.normal((frames, side**2, 32))
+        pooled_features = model.apply_pooling(features)
+
+        self.assertEqual(pooled_features.shape, (frames, pooled**2, 32))
+
+    def test_llava_onevision_scatter_rejects_count_mismatch(self):
+        model = self._llava_onevision_test_model()
+
+        input_ids = mx.array([[1, 190, 190, 2]])
+        inputs_embeds = mx.zeros((1, 4, 32))
+        features = mx.zeros((3, 32))
+
+        with self.assertRaises(ValueError):
+            model._scatter_features(inputs_embeds, input_ids, features, 190, "Image")
+
+    def test_llava_onevision_packing_matches_processor_token_count(self):
+        from mlx_vlm.models.llava_onevision.llava_onevision import (
+            get_anyres_image_grid_shape,
+        )
+        from mlx_vlm.models.llava_onevision.processing_llava_onevision import (
+            LlavaOnevisionProcessor,
+        )
+
+        model = self._llava_onevision_test_model()
+        side = model.patches_per_side
+        tile = model.config.vision_config.image_size
+
+        processor = LlavaOnevisionProcessor(
+            image_processor=SimpleNamespace(
+                image_grid_pinpoints=model.config.image_grid_pinpoints
+            ),
+            tokenizer=None,
+            num_image_tokens=side**2,
+            vision_aspect_ratio=model.config.vision_aspect_ratio,
+            vision_feature_select_strategy="full",
+        )
+
+        for image_size in ([56, 56], [112, 112], [56, 112], [224, 224], [112, 224]):
+            with self.subTest(image_size=image_size):
+                num_patch_height, num_patch_width = get_anyres_image_grid_shape(
+                    image_size, model.config.image_grid_pinpoints, tile
+                )
+                tiles = num_patch_height * num_patch_width + 1
+                features = mx.zeros((tiles, side**2, 32))
+
+                packed = model.pack_image_features([features], [image_size])[0]
+                predicted = processor._get_number_of_features(
+                    image_size[0], image_size[1], tile, tile
+                )
+
+                self.assertEqual(packed.shape[0], predicted)
+
+    def test_llava_onevision_keeps_untied_lm_head(self):
+        from mlx_vlm.models import llava_onevision
+        from mlx_vlm.models.llava_onevision.language import LanguageModel
+
+        # The 7b/72b checkpoints omit tie_word_embeddings and ship a real lm_head,
+        # so the default must not tie or their output projection is dropped.
+        self.assertFalse(llava_onevision.TextConfig().tie_word_embeddings)
+
+        def sanitized(tie):
+            config = llava_onevision.TextConfig(
+                hidden_size=16,
+                num_hidden_layers=1,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                vocab_size=32,
+                tie_word_embeddings=tie,
+            )
+            return LanguageModel(config).sanitize(
+                {"language_model.lm_head.weight": mx.zeros((32, 16))}
+            )
+
+        self.assertIn("language_model.lm_head.weight", sanitized(tie=False))
+        self.assertNotIn("language_model.lm_head.weight", sanitized(tie=True))
+
+    def test_llava_onevision_sanitize_accepts_both_layouts(self):
+        from mlx_vlm.models import llava_onevision
+
+        published = {
+            "language_model.model.embed_tokens.weight": 0,
+            "language_model.lm_head.weight": 1,
+            "vision_tower.vision_model.post_layernorm.weight": 2,
+            "multi_modal_projector.linear_1.weight": 3,
+            "image_newline": 4,
+        }
+        nested = {
+            "model.language_model.embed_tokens.weight": 0,
+            "lm_head.weight": 1,
+            "model.vision_tower.post_layernorm.weight": 2,
+            "model.multi_modal_projector.linear_1.weight": 3,
+            "model.image_newline": 4,
+        }
+
+        self.assertEqual(
+            llava_onevision.Model.sanitize(published),
+            llava_onevision.Model.sanitize(nested),
+        )
+        self.assertEqual(set(llava_onevision.Model.sanitize(nested)), set(published))
+
+        # Sanitizing twice must not rewrite already-normalized keys.
+        once = llava_onevision.Model.sanitize(nested)
+        self.assertEqual(llava_onevision.Model.sanitize(dict(once)), once)
 
     def test_llava(self):
         from mlx_vlm.models import llava
@@ -6621,6 +7237,31 @@ class TestModels(unittest.TestCase):
         self.assertGreaterEqual(fp16_clipped[1], -MAX_FLOAT16_IMAGE_FEATURE)
         self.assertLessEqual(fp16_clipped[1], -MAX_FLOAT16_IMAGE_FEATURE + 16)
         self.assertEqual(fp16_clipped[2], 42.0)
+
+    def test_florence2_language_config_registered(self):
+        from transformers import AutoConfig
+
+        from mlx_vlm.models import florence2  # noqa: F401
+
+        self.assertEqual(
+            AutoConfig.for_model("florence2_language").model_type, "florence2_language"
+        )
+
+    def test_florence2_skips_chunked_prefill(self):
+        from mlx_vlm.generate.common import _chunked_prefill_enabled
+        from mlx_vlm.models import florence2
+
+        config = florence2.ModelConfig(
+            text_config=florence2.TextConfig(),
+            vision_config=florence2.VisionConfig(drop_path_rate=0.0),
+        )
+        model = florence2.Model(config)
+        self.assertTrue(model.no_chunked_prefill)
+        self.assertFalse(
+            _chunked_prefill_enabled(
+                model, inputs_embeds=mx.zeros((1, 8, 4)), prefill_kwargs={}
+            )
+        )
 
     def test_florence2(self):
         from mlx_vlm.models import florence2
@@ -9468,6 +10109,59 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.isfinite(out["pred_logits"])).item())
         self.assertTrue(mx.all(mx.isfinite(out["pred_boxes"])).item())
 
+    def test_yolo11_forward(self):
+        from PIL import Image
+
+        from mlx_vlm.models.yolo11 import YOLO11, non_max_suppression, prepare_image
+
+        model = YOLO11(nc=1)
+        model.eval()
+
+        x = mx.random.normal((1, 64, 64, 3))
+        pred = model(x)
+        mx.eval(pred)
+
+        self.assertEqual(pred.shape, (1, 5, 84))
+        self.assertTrue(mx.all(mx.isfinite(pred)).item())
+
+        single = mx.array([[[16.0], [16.0], [8.0], [8.0], [0.9]]])
+        dets = non_max_suppression(single, conf_thresh=0.01, iou_thresh=0.5)
+        self.assertEqual(len(dets), 1)
+        self.assertEqual(dets[0].shape, (1, 6))
+
+        overlapping = mx.array(
+            [
+                [
+                    [10.0, 10.0, 30.0],
+                    [10.0, 10.0, 30.0],
+                    [8.0, 8.0, 8.0],
+                    [8.0, 8.0, 8.0],
+                    [0.9, 0.8, 0.7],
+                ]
+            ]
+        )
+        dets = non_max_suppression(overlapping, iou_thresh=0.5, max_det=2)
+        self.assertEqual(dets[0].shape, (2, 6))
+
+        multiclass = mx.array(
+            [
+                [
+                    [10.0, 10.0],
+                    [10.0, 10.0],
+                    [8.0, 8.0],
+                    [8.0, 8.0],
+                    [0.9, 0.1],
+                    [0.1, 0.8],
+                ]
+            ]
+        )
+        dets = non_max_suppression(multiclass, iou_thresh=0.5)
+        self.assertEqual(dets[0].shape, (2, 6))
+
+        prepared, _, gain, left, top = prepare_image(Image.new("RGB", (65, 33)))
+        self.assertEqual(prepared.shape, (1, 64, 96, 3))
+        self.assertEqual((gain, left, top), (1.0, 15, 15))
+
     def test_sam3_1_config_and_model(self):
         # Config source: mlx_vlm/models/sam3_1/config.py
         from mlx_vlm.models.sam3_1 import Model, ModelConfig
@@ -9775,6 +10469,66 @@ class TestModels(unittest.TestCase):
         cache = model.make_cache()
         self.assertIsInstance(cache[0], RotatingKVCache)
         self.assertIsInstance(cache[1], KVCache)
+
+    def test_muse_glimmer_sanitize_weight_layouts(self):
+        from mlx_vlm.models import muse_glimmer
+
+        model = muse_glimmer.Model(self._muse_glimmer_config())
+
+        # Raw HF nests both stacks under ``model.``; MLX conversions ship the
+        # already-sanitized paths; OptiQ/flattened quants store LM tensors under
+        # a bare ``model.`` with the vision stack and lm_head already at top
+        # level. All three must land on the same target module paths.
+        raw_hf = {
+            "model.language_model.embed_tokens.weight": mx.zeros((64, 32)),
+            "model.vision_tower.ln_pre.weight": mx.zeros((8,)),
+            "model.vision_adapter.fc1.weight": mx.zeros((16, 32)),
+            "model.vision_projection.weight": mx.zeros((32, 16)),
+            "lm_head.weight": mx.zeros((64, 32)),
+        }
+        mlx_std = {
+            "language_model.model.embed_tokens.weight": mx.zeros((64, 32)),
+            "language_model.lm_head.weight": mx.zeros((64, 32)),
+            "vision_tower.ln_pre.weight": mx.zeros((8,)),
+            "vision_adapter.fc1.weight": mx.zeros((16, 32)),
+            "vision_projection.weight": mx.zeros((32, 16)),
+        }
+        optiq = {
+            "model.embed_tokens.weight": mx.zeros((64, 32)),
+            "model.layers.0.self_attn.q_proj.weight": mx.zeros((32, 32)),
+            "model.norm.weight": mx.zeros((32,)),
+            "lm_head.weight": mx.zeros((64, 32)),
+            "vision_tower.ln_pre.weight": mx.zeros((8,)),
+            "vision_adapter.fc1.weight": mx.zeros((16, 32)),
+            "vision_projection.weight": mx.zeros((32, 16)),
+        }
+
+        expected_vision = {
+            "vision_tower.ln_pre.weight",
+            "vision_adapter.fc1.weight",
+            "vision_projection.weight",
+        }
+        for name, weights in (
+            ("raw_hf", raw_hf),
+            ("mlx_std", mlx_std),
+            ("optiq", optiq),
+        ):
+            keys = set(model.sanitize(weights))
+            self.assertFalse(
+                any(k.startswith(("model.", "lm_head.")) for k in keys),
+                f"{name}: unmapped top-level keys survived sanitize: {keys}",
+            )
+            self.assertIn("language_model.model.embed_tokens.weight", keys)
+            self.assertIn("language_model.lm_head.weight", keys)
+            self.assertTrue(expected_vision <= keys, f"{name}: {keys}")
+
+        self.assertIn(
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            model.sanitize(optiq),
+        )
+        self.assertIn("language_model.model.norm.weight", model.sanitize(optiq))
+        # Already-sanitized MLX paths must be idempotent (no double prefix).
+        self.assertEqual(set(mlx_std), set(model.sanitize(mlx_std)))
 
     def test_muse_glimmer_numerical_parity(self):
         from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm
@@ -10152,6 +10906,41 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "llava_next")
+
+    def test_llava_onevision_input_embeddings(self):
+        from mlx_vlm.models import llava_onevision
+
+        model = llava_onevision.Model(
+            llava_onevision.ModelConfig(
+                text_config=llava_onevision.TextConfig(
+                    model_type="qwen2",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    vocab_size=32,
+                    rms_norm_eps=1e-6,
+                    tie_word_embeddings=False,
+                ),
+                vision_config=llava_onevision.VisionConfig(
+                    model_type="siglip_vision_model",
+                    num_hidden_layers=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                    num_channels=3,
+                    vision_use_head=False,
+                ),
+                model_type="llava_onevision",
+                image_token_index=31,
+                video_token_index=30,
+                vocab_size=32,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "llava_onevision")
 
     def test_qwen2_vl_input_embeddings(self):
         from mlx_vlm.models import qwen2_vl
@@ -13459,6 +14248,70 @@ class TestSam3(unittest.TestCase):
         cos, sin = compute_axial_cis(64, 8, 8)
         self.assertEqual(cos.shape, (64, 64))
         self.assertEqual(sin.shape, (64, 64))
+
+    def test_sam3_decoder_two_layer_mlps_have_no_output_activation(self):
+        """RefPointHead and BoxRPBEmbed mirror the reference 2-layer MLP.
+
+        The reference applies ReLU only between the layers, so a ReLU on the
+        output would clamp query_pos and the RPB deltas to non-negative values.
+        """
+        from mlx_vlm.models.sam3.decoder import BoxRPBEmbed, RefPointHead
+
+        hidden = 8
+        head = RefPointHead(hidden)
+        head.layer1.weight = mx.zeros((hidden, hidden * 2))
+        head.layer1.bias = mx.ones((hidden,))
+        head.layer2.weight = mx.eye(hidden) * -1.0
+        head.layer2.bias = mx.zeros((hidden,))
+        out = head(mx.zeros((1, 3, hidden * 2)))
+        mx.eval(out)
+        self.assertTrue(float(out.min()) < 0.0)
+        self.assertTrue(mx.allclose(out, -mx.ones_like(out), atol=1e-6).item())
+
+        rpb = BoxRPBEmbed(num_heads=hidden, hidden_size=hidden)
+        rpb.layer1.weight = mx.zeros((hidden, 2))
+        rpb.layer1.bias = mx.ones((hidden,))
+        rpb.layer2.weight = mx.eye(hidden) * -1.0
+        rpb.layer2.bias = mx.zeros((hidden,))
+        out = rpb(mx.zeros((1, 2, 2)))
+        mx.eval(out)
+        self.assertTrue(float(out.min()) < 0.0)
+
+    def test_sam3_global_rope_uses_window_scaled_grid(self):
+        """Global-attention RoPE keeps the window-sized coordinate stride.
+
+        HF derives ``rotary_scale = window_size / rotary_input_size[0]``, which is
+        1.0 for windowed blocks and ``window_size / feat_size`` for global ones.
+        Dropping it makes global-block positions advance too fast.
+        """
+        from mlx_vlm.models.sam3.position import compute_axial_cis
+
+        dim, feat_size, window_size = 64, 6, 2
+        scale = window_size / feat_size
+
+        scaled_cos, scaled_sin = compute_axial_cis(
+            dim, feat_size, feat_size, scale=scale
+        )
+        unit_cos, unit_sin = compute_axial_cis(dim, feat_size, feat_size)
+
+        default_cos, default_sin = compute_axial_cis(
+            dim, feat_size, feat_size, scale=1.0
+        )
+        self.assertTrue(mx.array_equal(default_cos, unit_cos).item())
+        self.assertTrue(mx.array_equal(default_sin, unit_sin).item())
+
+        self.assertFalse(mx.allclose(scaled_cos, unit_cos, atol=1e-6).item())
+
+        freqs = 1.0 / (10000.0 ** (mx.arange(0, dim, 4).astype(mx.float32) / dim))
+        flat = mx.arange(feat_size * feat_size)
+        xs = (flat % feat_size).astype(mx.float32) * scale
+        ys = (flat // feat_size).astype(mx.float32) * scale
+        angles = mx.concatenate(
+            [xs[:, None] * freqs[None, :], ys[:, None] * freqs[None, :]], axis=-1
+        )
+        angles = mx.stack([angles, angles], axis=-1).reshape(angles.shape[0], -1)
+        self.assertTrue(mx.allclose(scaled_cos, mx.cos(angles), atol=1e-6).item())
+        self.assertTrue(mx.allclose(scaled_sin, mx.sin(angles), atol=1e-6).item())
 
 
 class TestRTDetrV2(unittest.TestCase):
@@ -17014,18 +17867,25 @@ class TestMTPSplit(unittest.TestCase):
 
     def test_registry_resolves_all_families(self):
         from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
+        from mlx_vlm.utils import get_model_and_args
 
         expected = {
             "qwen3_5": "qwen3_5_mtp",
             "qwen3_5_moe": "qwen3_5_mtp",
             "deepseek_v4": "deepseek_v4_mtp",
             "glm4_moe_lite": "glm4_moe_lite_mtp",
+            "glm_moe_dsa": "glm_moe_dsa_mtp",
             "inkling_mm_model": "inkling_mtp",
         }
         for base, out_type in expected.items():
             splitter = get_mtp_splitter(base)
             self.assertIsNotNone(splitter)
             self.assertEqual(splitter.output_model_type, out_type)
+        drafter_module, model_type = get_model_and_args(
+            {"model_type": "glm_moe_dsa_mtp"}
+        )
+        self.assertEqual(model_type, "glm_moe_dsa_mtp")
+        self.assertTrue(hasattr(drafter_module, "GlmMoeDsaMTPDraftModel"))
         self.assertIsNone(get_mtp_splitter("not_a_model"))
 
     def test_qwen_split_strips_prefix_and_shifts_norm(self):
@@ -17124,6 +17984,62 @@ class TestMTPSplit(unittest.TestCase):
         self.assertEqual(stacked.shape, (2, 8, 8))  # 2 experts stacked
         self.assertEqual(config["model_type"], "glm4_moe_lite_mtp")
         self.assertEqual(config["block_size"], 2)  # num_nextn_predict_layers(1) + 1
+
+    def test_glm_moe_dsa_split_extracts_layer_local_mtp(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.speculative.drafters.glm_moe_dsa_mtp.split import (
+            split_glm_moe_dsa_mtp,
+        )
+
+        layer = 2
+        prefix = f"model.layers.{layer}."
+        tensors = {
+            prefix + "enorm.weight": mx.random.normal((8,)),
+            prefix + "hnorm.weight": mx.random.normal((8,)),
+            prefix + "eh_proj.weight": mx.random.normal((8, 16)),
+            prefix + "input_layernorm.weight": mx.random.normal((8,)),
+            prefix + "post_attention_layernorm.weight": mx.random.normal((8,)),
+            prefix + "shared_head.norm.weight": mx.random.normal((8,)),
+            prefix + "self_attn.kv_b_proj.weight": mx.random.normal((8, 4)),
+            prefix + "mlp.gate.weight": mx.random.normal((2, 8)),
+        }
+        for expert in range(2):
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                tensors[prefix + f"mlp.experts.{expert}.{projection}.weight"] = (
+                    mx.random.normal((8, 8))
+                )
+        config = {
+            "model_type": "glm_moe_dsa",
+            "num_hidden_layers": layer,
+            "num_attention_heads": 2,
+            "qk_nope_head_dim": 2,
+            "v_head_dim": 2,
+            "n_routed_experts": 2,
+            "num_nextn_predict_layers": 1,
+            "index_share_for_mtp_iteration": True,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            source = self._write_source(tmp, config, tensors)
+            split_glm_moe_dsa_mtp(source, out)
+            weights = mx.load(str(Path(out) / "model.safetensors"))
+            sidecar = json.loads((Path(out) / "config.json").read_text())
+
+        self.assertEqual(sidecar["model_type"], "glm_moe_dsa_mtp")
+        self.assertEqual(sidecar["block_size"], 2)
+        self.assertTrue(sidecar["text_config"]["index_share_for_mtp_iteration"])
+        self.assertTrue(all(key.startswith("mtp.") for key in weights))
+        self.assertIn("mtp.shared_head_norm.weight", weights)
+        self.assertIn("mtp.self_attn.embed_q.weight", weights)
+        self.assertIn("mtp.self_attn.unembed_out.weight", weights)
+        self.assertNotIn("mtp.self_attn.kv_b_proj.weight", weights)
+        self.assertEqual(
+            weights["mtp.mlp.switch_mlp.gate_proj.weight"].shape,
+            (2, 8, 8),
+        )
 
     def test_detect_and_split_mtp_dispatch(self):
         import tempfile
@@ -17241,3 +18157,118 @@ class TestMTPSplit(unittest.TestCase):
         self.assertNotIn("norm.scales", weights)
         self.assertEqual(config["quantization"]["mode"], "affine")
         self.assertEqual(config["quantization"]["bits"], 4)
+
+
+class TestVideoDepthAnything(unittest.TestCase):
+    # ─── Video Depth Anything Tests ────────────────────────────
+
+    def _tiny_config(self, **overrides):
+        from mlx_vlm.models.video_depth_anything.config import ModelConfig
+
+        args = dict(
+            encoder="vits",
+            embed_dim=64,
+            depth=4,
+            num_heads=4,
+            features=32,
+            out_channels=[32, 48, 64, 64],
+            intermediate_layer_idx=[0, 1, 2, 3],
+            num_frames=8,
+            norm_num_groups=8,
+        )
+        args.update(overrides)
+        return ModelConfig(**args)
+
+    def test_config_presets(self):
+        """Encoder presets fill in backbone/head dims."""
+        from mlx_vlm.models.video_depth_anything.config import ModelConfig
+
+        config = ModelConfig()
+        self.assertEqual(config.model_type, "video_depth_anything")
+        self.assertEqual(config.embed_dim, 1024)  # vitl default
+        self.assertEqual(config.depth, 24)
+        self.assertEqual(config.out_channels, [256, 512, 1024, 1024])
+        self.assertEqual(config.intermediate_layer_idx, [4, 11, 17, 23])
+
+        small = ModelConfig(encoder="vits")
+        self.assertEqual(small.embed_dim, 384)
+        self.assertEqual(small.features, 64)
+
+    def test_vision_backbone(self):
+        """DINOv2 backbone returns patch/cls tokens per requested layer."""
+        from mlx_vlm.models.video_depth_anything.vision import DINOv2
+
+        config = self._tiny_config()
+        backbone = DINOv2(config)
+        x = mx.random.normal((2, 70, 98, 3))
+        feats = backbone.get_intermediate_layers(x, [0, 1, 2, 3])
+        self.assertEqual(len(feats), 4)
+        for patches, cls in feats:
+            self.assertEqual(patches.shape, (2, 5 * 7, 64))
+            self.assertEqual(cls.shape, (2, 64))
+
+    def test_temporal_module_zero_proj_is_identity(self):
+        """With a zeroed proj_out the temporal module reduces to identity."""
+        from mlx_vlm.models.video_depth_anything.motion import TemporalModule
+
+        module = TemporalModule(
+            in_channels=32,
+            num_attention_heads=4,
+            num_transformer_block=1,
+            num_attention_blocks=2,
+            norm_num_groups=8,
+            temporal_max_len=8,
+        )
+        zeroed = {
+            "temporal_transformer.proj_out.weight": mx.zeros((32, 32)),
+            "temporal_transformer.proj_out.bias": mx.zeros((32,)),
+        }
+        module.load_weights(list(zeroed.items()), strict=False)
+
+        x = mx.random.normal((2, 4, 5, 7, 32))
+        out = module(x)
+        self.assertEqual(out.shape, x.shape)
+        self.assertTrue(mx.allclose(out, x, atol=1e-5))
+
+    def test_model_forward_shapes(self):
+        """Full model maps (B, T, H, W, 3) to (B, T, H, W) depth."""
+        from mlx_vlm.models.video_depth_anything.video_depth_anything import Model
+
+        model = Model(self._tiny_config())
+        for h, w in [(70, 70), (70, 98)]:
+            depth = model(mx.random.normal((1, 4, h, w, 3)))
+            self.assertEqual(depth.shape, (1, 4, h, w))
+            self.assertTrue(bool(mx.all(depth >= 0)))
+
+    def test_sanitize_conv_layouts(self):
+        """sanitize() transposes Conv2d and ConvTranspose2d weights correctly."""
+        from mlx_vlm.models.video_depth_anything.video_depth_anything import Model
+
+        weights = {
+            # Conv2d: (out, in, kh, kw) -> (out, kh, kw, in)
+            "pretrained.patch_embed.proj.weight": mx.zeros((64, 3, 14, 14)),
+            # ConvTranspose2d: (in, out, kh, kw) -> (out, kh, kw, in)
+            "head.resize_layers.0.weight": mx.zeros((48, 48, 4, 4)),
+            # resize_layers.3 is a strided Conv2d, not a transpose conv
+            "head.resize_layers.3.weight": mx.zeros((64, 64, 3, 3)),
+            "pretrained.blocks.0.attn.qkv.weight": mx.zeros((192, 64)),
+        }
+        out = Model.sanitize(weights)
+        self.assertEqual(
+            out["pretrained.patch_embed.proj.weight"].shape, (64, 14, 14, 3)
+        )
+        self.assertEqual(out["head.resize_layers.0.weight"].shape, (48, 4, 4, 48))
+        self.assertEqual(out["head.resize_layers.3.weight"].shape, (64, 3, 3, 64))
+        self.assertEqual(out["pretrained.blocks.0.attn.qkv.weight"].shape, (192, 64))
+
+    def test_processor_target_size(self):
+        """Processor keeps aspect ratio and snaps to multiples of 14."""
+        from mlx_vlm.models.video_depth_anything.processing_video_depth_anything import (
+            VideoDepthProcessor,
+        )
+
+        proc = VideoDepthProcessor(input_size=518)
+        h, w = proc.target_size(1080, 1920)
+        self.assertEqual((h % 14, w % 14), (0, 0))
+        self.assertGreaterEqual(min(h, w), 294)
+        self.assertAlmostEqual(h / w, 1080 / 1920, places=1)

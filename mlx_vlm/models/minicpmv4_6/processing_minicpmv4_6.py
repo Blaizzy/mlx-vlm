@@ -488,6 +488,11 @@ class MiniCPMVVideoProcessor(MiniCPMVImageProcessor):
         self.max_num_frames = int(max_num_frames)
         self.stack_frames = int(stack_frames)
 
+    def video_sampling_defaults(self) -> dict:
+        """Cap decoding at the frame count this processor keeps, so the
+        decoder stops reading frames ``_select_frames`` would discard."""
+        return {"max_frames": self.max_num_frames}
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: Union[str, Path], **kwargs):
         model_dir = Path(pretrained_model_name_or_path)

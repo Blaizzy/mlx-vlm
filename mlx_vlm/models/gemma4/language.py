@@ -14,6 +14,9 @@ from ..base import (
 from ..cache import KVCache, RotatingKVCache
 from ..rope_utils import initialize_rope
 from .config import TextConfig
+from .speculative_verifier import Gemma4ExactSpeculativeVerifier
+
+_EXACT_SPECULATIVE_VERIFIER = Gemma4ExactSpeculativeVerifier()
 
 
 @partial(mx.compile, shapeless=True)
@@ -651,6 +654,7 @@ class Gemma4TextModel(nn.Module):
 
 class LanguageModel(nn.Module):
     supports_logits_to_keep = True
+    requires_uniform_batch_acceptance = True
 
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -717,6 +721,17 @@ class LanguageModel(nn.Module):
         capture_layer_ids: Optional[List[int]] = None,
         **kwargs,
     ):
+        if kwargs.pop("speculative_verify", False) and getattr(
+            self.config, "exact_speculative_verify", False
+        ):
+            return _EXACT_SPECULATIVE_VERIFIER(
+                self,
+                inputs,
+                cache=cache,
+                input_embeddings=inputs_embeds,
+                capture_layer_ids=capture_layer_ids,
+            )
+
         hidden_sink: Optional[list] = (
             []
             if capture_layer_ids is not None or kwargs.pop("return_hidden", False)
@@ -785,15 +800,18 @@ class LanguageModel(nn.Module):
                 kv_len = c._idx
                 ve = valid_ends.tolist()
                 verify_start = kv_len - n
-                for bi in range(accepted.shape[0]):
-                    start = verify_start + int(ve[bi])
-                    if start < kv_len:
-                        zero_row_tail = getattr(c, "zero_row_tail", None)
-                        if callable(zero_row_tail):
-                            zero_row_tail(bi, start, kv_len)
-                        else:
-                            c.keys[bi, :, start:kv_len, :] = 0
-                            c.values[bi, :, start:kv_len, :] = 0
+                if any(
+                    verify_start + int(ve[bi]) < kv_len
+                    for bi in range(accepted.shape[0])
+                ):
+                    raise RuntimeError(
+                        "Gemma 4 batched speculative rollback requires uniform "
+                        f"per-row acceptance; got ragged accepts {accepted.tolist()}. "
+                        "Zeroing a rejected row's KV tail leaves phantom keys "
+                        "attended (issue #1962); set "
+                        "requires_uniform_batch_acceptance on the drafter or target "
+                        "so accepts are clamped before rollback."
+                    )
         return max_a
 
     def sanitize(self, weights):
