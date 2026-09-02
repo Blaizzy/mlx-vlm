@@ -406,6 +406,12 @@ def multimodal_token_ids_from_config(config: Any) -> set[int]:
         token_id = getattr(config, attr, None)
         if token_id is not None:
             ids.add(int(token_id))
+    if (
+        getattr(config, "model_type", None) == "deepseek_v4"
+        and int(getattr(config, "vision_n_layers", 0) or 0) > 0
+    ):
+        vocab_size = int(getattr(config, "vocab_size"))
+        ids.update(range(vocab_size, vocab_size + 5))
     return ids
 
 

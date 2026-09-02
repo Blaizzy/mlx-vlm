@@ -1202,6 +1202,18 @@ def test_multimodal_token_ids_from_config():
     assert apc_module.multimodal_token_ids_from_config(config) == {42, 77}
 
 
+def test_deepseek_v4_multimodal_token_ids_cover_all_sentinels():
+    config = SimpleNamespace(
+        model_type="deepseek_v4",
+        vision_n_layers=32,
+        vocab_size=129280,
+    )
+
+    assert apc_module.multimodal_token_ids_from_config(config) == set(
+        range(129280, 129285)
+    )
+
+
 def test_media_token_spans_are_contiguous_ranges():
     token_ids = [1, 42, 42, 2, 77, 77, 77, 3]
 
