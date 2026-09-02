@@ -4084,3 +4084,95 @@ class TestMuseGlimmerCleanOutput(unittest.TestCase):
     def test_noop_without_channels(self):
         plain = "Two tabby cats sleep on a pink couch."
         self.assertEqual(self._clean(plain), plain)
+
+
+class Qwen3VLVideoTimestampTests(unittest.TestCase):
+    """The processor renders one timestamped vision block per temporal group."""
+
+    class _Tokenizer:
+        video_token = "<|video_pad|>"
+        video_token_id = 102
+        pad_token = "<pad>"
+        pad_token_id = 0
+
+        def __init__(self):
+            self.last_text = None
+
+        def __call__(self, text, **kwargs):
+            self.last_text = text
+            texts = [text] if isinstance(text, str) else text
+            ids = []
+            for item in texts:
+                row = []
+                remaining = item
+                while remaining:
+                    if remaining.startswith(self.video_token):
+                        row.append(self.video_token_id)
+                        remaining = remaining[len(self.video_token) :]
+                    else:
+                        row.append(1)
+                        remaining = remaining[1:]
+                ids.append(row)
+            return {"input_ids": ids, "attention_mask": [[1] * len(r) for r in ids]}
+
+    def _make_processor(self, grid_thw):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+
+        tokenizer = self._Tokenizer()
+        video_processor = SimpleNamespace(
+            merge_size=2,
+            temporal_patch_size=2,
+            fps=2.0,
+            __call__=None,
+        )
+        video_processor = type(
+            "StubVideoProcessor",
+            (),
+            {
+                "merge_size": 2,
+                "temporal_patch_size": 2,
+                "fps": 2.0,
+                "__call__": lambda self, videos=None, **kw: {
+                    "pixel_values_videos": np.zeros((1, 4), dtype=np.float32),
+                    "video_grid_thw": np.array([grid_thw], dtype=np.int64),
+                },
+            },
+        )()
+        processor = Qwen3VLProcessor.__new__(Qwen3VLProcessor)
+        processor.tokenizer = tokenizer
+        processor.image_processor = None
+        processor.video_processor = video_processor
+        processor.image_token = "<|image_pad|>"
+        processor.image_token_id = 100
+        processor.video_token = tokenizer.video_token
+        processor.video_token_id = tokenizer.video_token_id
+        processor.vision_start_token = "<|vision_start|>"
+        processor.vision_end_token = "<|vision_end|>"
+        processor.vision_start_token_id = 58
+        processor.vision_end_token_id = 59
+        return processor, tokenizer
+
+    def test_video_prompt_gets_one_timestamped_block_per_temporal_group(self):
+        processor, tokenizer = self._make_processor(grid_thw=[4, 2, 2])
+        prompt = "<|vision_start|><|video_pad|><|vision_end|>Describe the clip."
+
+        out = processor(text=[prompt], videos=["clip.mp4"], fps=[2.0])
+
+        rendered = tokenizer.last_text[0]
+        self.assertEqual(rendered.count(" seconds>"), 4)
+        self.assertIn("<0.2 seconds><|vision_start|>", rendered)
+        self.assertIn("<3.2 seconds><|vision_start|>", rendered)
+        self.assertEqual(rendered.count("<|vision_start|>"), 4)
+        ids = np.array(out["input_ids"])[0].tolist()
+        self.assertEqual(ids.count(tokenizer.video_token_id), 4)  # 4 groups x 1 token
+
+    def test_video_prompt_falls_back_to_processor_fps(self):
+        processor, tokenizer = self._make_processor(grid_thw=[2, 2, 2])
+        prompt = "<|vision_start|><|video_pad|><|vision_end|>Describe the clip."
+
+        processor(text=[prompt], videos=["clip.mp4"])
+
+        rendered = tokenizer.last_text[0]
+        self.assertEqual(rendered.count(" seconds>"), 2)
+        self.assertIn("<0.2 seconds>", rendered)
+        self.assertIn("<1.2 seconds>", rendered)

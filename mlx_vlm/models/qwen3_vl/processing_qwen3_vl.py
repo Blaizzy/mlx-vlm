@@ -64,6 +64,32 @@ def _drop_surplus_image_tokens(
     return text
 
 
+def _timestamped_video_placeholder(
+    grid_t: int,
+    frame_seqlen: int,
+    temporal_patch_size: int,
+    fps: float,
+    vision_start_token: str,
+    vision_end_token: str,
+) -> str:
+    """Render one ``<t.t seconds>`` marker plus vision block per temporal group.
+
+    The timestamp is the mean of the first and last frame of each group, the
+    convention used by the reference Qwen3-VL processor.
+    """
+    parts = []
+    for group in range(grid_t):
+        first = group * temporal_patch_size
+        seconds = (first + first + temporal_patch_size - 1) / 2 / fps
+        parts.append(
+            f"<{seconds:.1f} seconds>"
+            + vision_start_token
+            + "<|placeholder|>" * frame_seqlen
+            + vision_end_token
+        )
+    return "".join(parts)
+
+
 def _flatten_images(images):
     """Flatten grouped and array-batched images while retaining path support."""
     if isinstance(images, (list, tuple)):
@@ -810,18 +836,48 @@ class Qwen3VLProcessor(ProcessorMixin):
                     index += 1
                 text[i] = text[i].replace("<|placeholder|>", self.image_token)
 
+        # Qwen3-VL prompts carry one "<t.t seconds>" marker followed by its own
+        # vision_start/vision_end block per temporal patch group, exactly as the
+        # reference processor renders videos. Without the markers the model sees
+        # one timeless block of frames and describes motion as a spatial collage.
+        fps_list = kwargs.pop("fps", None)
         if video_grid_thw is not None:
             _video_proc = self.video_processor or self.image_processor
             merge_length = _video_proc.merge_size**2
+            temporal_patch_size = getattr(_video_proc, "temporal_patch_size", 2)
             index = 0
             for i in range(len(text)):
                 while self.video_token in text[i]:
-                    num_video_tokens = video_grid_thw[index].prod() // merge_length
-                    text[i] = text[i].replace(
-                        self.video_token,
-                        "<|placeholder|>" * num_video_tokens,
-                        1,
+                    grid_t = int(video_grid_thw[index][0])
+                    frame_seqlen = int(video_grid_thw[index][1:].prod() // merge_length)
+                    fps = (
+                        fps_list[index]
+                        if isinstance(fps_list, (list, tuple))
+                        else fps_list
                     )
+                    # Same fallback idea as the reference processor: use the
+                    # configured sampling rate when no per-video fps was given.
+                    fps = fps or getattr(_video_proc, "fps", None) or 2.0
+                    wrapped = f"{self.vision_start_token}{self.video_token}{self.vision_end_token}"
+                    if wrapped in text[i]:
+                        text[i] = text[i].replace(
+                            wrapped,
+                            _timestamped_video_placeholder(
+                                grid_t,
+                                frame_seqlen,
+                                temporal_patch_size,
+                                float(fps),
+                                self.vision_start_token,
+                                self.vision_end_token,
+                            ),
+                            1,
+                        )
+                    else:
+                        text[i] = text[i].replace(
+                            self.video_token,
+                            "<|placeholder|>" * (grid_t * frame_seqlen),
+                            1,
+                        )
                     index += 1
                 text[i] = text[i].replace("<|placeholder|>", self.video_token)
 
