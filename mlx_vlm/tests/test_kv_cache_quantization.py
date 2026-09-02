@@ -1,4 +1,5 @@
 import sys
+from math import ceil
 from unittest.mock import Mock, patch
 
 import mlx.core as mx
@@ -7,6 +8,7 @@ import pytest
 
 # Import the module to patch
 from mlx_vlm.generate import generate_step
+from mlx_vlm.generate.common import DEFAULT_PREFILL_STEP_SIZE
 
 
 class MockInputEmbeddingsFeatures:
@@ -81,6 +83,10 @@ class MockCacheLayer:
         self.offset = 0
         self.keys = mx.random.normal((1, 8, 100, 64))
         self.values = mx.random.normal((1, 8, 100, 64))
+
+    @property
+    def state(self):
+        return self.keys, self.values
 
 
 class MockCache:
@@ -192,8 +198,9 @@ class TestKVCacheQuantization:
                 assert first_call_kwargs["kv_group_size"] == 64
                 assert first_call_kwargs["kv_bits"] == 4
 
-                # Should be called once after initial forward pass and once per generated token
-                expected_calls = 1 + len(tokens)
+                prompt_len = input_ids.shape[1]
+                prefill_chunks = ceil((prompt_len - 1) / DEFAULT_PREFILL_STEP_SIZE)
+                expected_calls = prefill_chunks + 1 + len(tokens)
                 assert len(mock_quantize_calls) == expected_calls
 
     def test_different_quantization_bit_configurations(self):
@@ -682,6 +689,75 @@ class TestKVCacheQuantization:
                 assert first_call_kwargs["kv_bits"] == kv_bits
                 assert first_call_kwargs["kv_group_size"] == kv_group_size
                 assert first_call_kwargs["quantized_kv_start"] == quantized_kv_start
+
+
+class TestQuantizedCacheInHandRolledAttention:
+    """Models whose attention cannot go through scaled_dot_product_attention.
+
+    ``QuantizedKVCache.update_and_fetch`` hands back ``(packed, scales,
+    biases)`` tuples. Attention paths that build the scores by hand -- gemma2
+    because of its logit softcapping, phi3small because of its block-sparse
+    mask -- have to materialize that state before touching it, or every call
+    dies in ``mx.expand_dims`` on a tuple.
+    """
+
+    @pytest.mark.parametrize("kv_bits", [None, 4])
+    def test_gemma2_attention_with_quantized_cache(self, kv_bits):
+        from mlx_vlm.models.cache import KVCache, QuantizedKVCache
+        from mlx_vlm.models.gemma2.config import ModelConfig
+        from mlx_vlm.models.gemma2.language import Attention
+
+        args = ModelConfig(
+            model_type="gemma2",
+            hidden_size=128,
+            num_hidden_layers=1,
+            intermediate_size=256,
+            num_attention_heads=8,
+            head_dim=64,
+            rms_norm_eps=1e-6,
+            vocab_size=32,
+            num_key_value_heads=4,
+        )
+        attention = Attention(args)
+        assert attention.repeats > 1
+
+        cache = KVCache() if kv_bits is None else QuantizedKVCache(bits=kv_bits)
+        x = mx.random.normal((1, 6, args.hidden_size))
+
+        out = attention(x, mask=None, cache=cache)
+
+        assert out.shape == (1, 6, args.hidden_size)
+        assert not mx.any(mx.isnan(out))
+
+    @pytest.mark.parametrize("kv_bits", [None, 4])
+    def test_phi3small_block_sparse_attention_with_quantized_cache(self, kv_bits):
+        from mlx_vlm.models.cache import KVCache, QuantizedKVCache
+        from mlx_vlm.models.phi3small.config import ModelConfig
+        from mlx_vlm.models.phi3small.language import Attention
+
+        args = ModelConfig(
+            model_type="phi3small",
+            hidden_size=256,
+            dense_attention_every_n_layers=2,
+            ff_intermediate_size=512,
+            gegelu_limit=20.0,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            layer_norm_epsilon=1e-5,
+            vocab_size=32,
+            num_key_value_heads=2,
+        )
+        # layer 0 is a block-sparse layer, which is the hand-rolled path.
+        attention = Attention(args, layer_idx=0)
+        assert attention.block_sparse
+
+        cache = KVCache() if kv_bits is None else QuantizedKVCache(bits=kv_bits)
+        x = mx.random.normal((1, 6, args.hidden_size))
+
+        out = attention(x, mask=None, cache=cache)
+
+        assert out.shape == (1, 6, args.hidden_size)
+        assert not mx.any(mx.isnan(out))
 
 
 if __name__ == "__main__":

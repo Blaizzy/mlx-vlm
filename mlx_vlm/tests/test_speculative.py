@@ -6,6 +6,7 @@ and Qwen3.5 DFlash cache rollback coverage in one place.
 
 import importlib
 import json
+import re
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
@@ -19,7 +20,10 @@ from mlx.utils import tree_flatten, tree_map
 import mlx_vlm.models.deepseek_v4.language as deepseek_language
 import mlx_vlm.models.gemma4.language as gemma4_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
+import mlx_vlm.models.qwen3_5.speculative_verifier as qwen_verifier
+import mlx_vlm.models.qwen3_5_moe.language as qwen_moe_language
 import mlx_vlm.speculative.mtp as mtp_utils
+from mlx_vlm.models.base import kv_sequence_length
 from mlx_vlm.models.cache import (
     ArraysCache,
     BatchKVCache,
@@ -38,6 +42,13 @@ from mlx_vlm.speculative.drafters import (
     KNOWN_DRAFTER_KINDS,
     resolve_drafter_kind,
     validate_drafter_compatibility,
+)
+from mlx_vlm.speculative.drafters.deepseek_v4_dspark import DeepseekV4DsparkDraftModel
+from mlx_vlm.speculative.drafters.deepseek_v4_dspark.config import (
+    DeepseekV4DsparkConfig,
+)
+from mlx_vlm.speculative.drafters.deepseek_v4_dspark.split import (
+    split_deepseek_v4_dspark,
 )
 from mlx_vlm.speculative.drafters.deepseek_v4_mtp import DeepseekV4MTPDraftModel
 from mlx_vlm.speculative.drafters.deepseek_v4_mtp.config import DeepseekV4MTPConfig
@@ -84,6 +95,16 @@ from mlx_vlm.turboquant import BatchTurboQuantKVCache
 from mlx_vlm.utils import get_model_and_args
 
 speculative_utils = importlib.import_module("mlx_vlm.speculative.utils")
+
+
+def test_kv_sequence_length_supports_turboquant_state_proxy():
+    cache = BatchTurboQuantKVCache([0], bits=4)
+    keys, _ = cache.update_and_fetch(
+        mx.random.normal((1, 1, 5, 32)),
+        mx.random.normal((1, 1, 5, 32)),
+    )
+
+    assert kv_sequence_length(keys) == 5
 
 
 def test_speculative_sampler_rng_keeps_draft_sampling_off_target_stream():
@@ -217,10 +238,14 @@ def _make_gdn_state(
     )
 
 
-def _make_drafter_dir(tmp_path: Path, model_type: str | None) -> Path:
+def _make_drafter_dir(
+    tmp_path: Path, model_type: str | None, extra: dict | None = None
+) -> Path:
     d = tmp_path / "drafter"
     d.mkdir()
     cfg = {} if model_type is None else {"model_type": model_type}
+    if extra:
+        cfg.update(extra)
     (d / "config.json").write_text(json.dumps(cfg))
     return d
 
@@ -403,6 +428,26 @@ def test_qwen_gated_delta_accept_states_matches_python_gather():
     assert bool(mx.array_equal(ref_conv, out_conv).item())
 
 
+def test_qwen_gated_delta_accept_states_uses_live_state_after_last_saved_step():
+    intermediate_states = mx.zeros((1, 2, 2, 3, 5), dtype=mx.float32)
+    conv_input = mx.zeros((1, 5, 6), dtype=mx.float32)
+    live_state = mx.full((1, 2, 3, 5), 7.0, dtype=mx.float32)
+    live_conv = mx.full((1, 3, 6), 8.0, dtype=mx.float32)
+
+    state, conv = qwen_language.gated_delta_accept_states(
+        intermediate_states,
+        conv_input,
+        live_state,
+        live_conv,
+        mx.array([2], dtype=mx.int32),
+        kernel_size=4,
+    )
+    mx.eval(state, conv)
+
+    assert bool(mx.array_equal(state, live_state).item())
+    assert bool(mx.array_equal(conv, live_conv).item())
+
+
 def test_qwen_rollback_speculative_cache_zero_inits_missing_state():
     accepted = mx.array([1, 0], dtype=mx.int32)
     caches = [ArraysCache(size=2)]
@@ -442,26 +487,42 @@ def test_qwen_gdn_sink_captures_intermediate_states_for_batched_verify():
     layer = qwen_language.Qwen3_5GatedDeltaNet(config)
     sink = []
 
-    def fake_update(q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=True):
+    def fake_update(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        mask,
+        use_kernel=True,
+        state_steps=None,
+    ):
         del k, v, a, b, A_log, dt_bias, state, mask, use_kernel
         B, S = q.shape[:2]
+        state_steps = S if state_steps is None else state_steps
         out = mx.zeros((B, S, 2, 4), dtype=mx.float32)
         next_state = mx.zeros((B, 2, 4, 4), dtype=mx.float32)
-        states = mx.ones((B, S, 2, 4, 4), dtype=mx.float32)
+        states = mx.ones((B, state_steps, 2, 4, 4), dtype=mx.float32)
         return out, next_state, states
 
+    verifier = qwen_verifier.Qwen3_5ExactSpeculativeVerifier()
     with patch.object(
-        qwen_language, "gated_delta_update_with_states", side_effect=fake_update
+        qwen_verifier, "gated_delta_update_with_states", side_effect=fake_update
     ):
-        out = layer(
+        out = verifier._gated_delta(
+            layer,
             mx.zeros((2, 3, 16), dtype=mx.float32),
-            cache=ArraysCache(size=2),
-            gdn_sink=sink,
+            None,
+            ArraysCache(size=2),
+            sink,
         )
 
     mx.eval(out)
     assert out.shape == (2, 3, 16)
-    assert sink[0][11].shape == (2, 3, 2, 4, 4)
+    assert sink[0][11].shape == (2, 2, 2, 4, 4)
 
 
 def test_qwen_gdn_sink_captures_intermediate_states_for_singleton_verify():
@@ -477,26 +538,42 @@ def test_qwen_gdn_sink_captures_intermediate_states_for_singleton_verify():
     layer = qwen_language.Qwen3_5GatedDeltaNet(config)
     sink = []
 
-    def fake_update(q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=True):
+    def fake_update(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        mask,
+        use_kernel=True,
+        state_steps=None,
+    ):
         del k, v, a, b, A_log, dt_bias, state, mask, use_kernel
         B, S = q.shape[:2]
+        state_steps = S if state_steps is None else state_steps
         out = mx.zeros((B, S, 2, 4), dtype=mx.float32)
         next_state = mx.zeros((B, 2, 4, 4), dtype=mx.float32)
-        states = mx.ones((B, S, 2, 4, 4), dtype=mx.float32)
+        states = mx.ones((B, state_steps, 2, 4, 4), dtype=mx.float32)
         return out, next_state, states
 
+    verifier = qwen_verifier.Qwen3_5ExactSpeculativeVerifier()
     with patch.object(
-        qwen_language, "gated_delta_update_with_states", side_effect=fake_update
+        qwen_verifier, "gated_delta_update_with_states", side_effect=fake_update
     ):
-        out = layer(
+        out = verifier._gated_delta(
+            layer,
             mx.zeros((1, 3, 16), dtype=mx.float32),
-            cache=ArraysCache(size=2),
-            gdn_sink=sink,
+            None,
+            ArraysCache(size=2),
+            sink,
         )
 
     mx.eval(out)
     assert out.shape == (1, 3, 16)
-    assert sink[0][11].shape == (1, 3, 2, 4, 4)
+    assert sink[0][11].shape == (1, 2, 2, 4, 4)
 
 
 def test_qwen_gdn_verify_update_matches_stepwise_path():
@@ -531,12 +608,37 @@ def test_qwen_gdn_verify_update_matches_stepwise_path():
         states.append(current_state)
 
     ref = (mx.concatenate(outputs, axis=1), current_state, mx.stack(states, axis=1))
-    out = qwen_language._gated_delta_update_verify_decode(
+    out = qwen_verifier.gated_delta_update_with_states(
         q, k, v, a, b, A_log, dt_bias, state, None, use_kernel=False
     )
     mx.eval(*ref, *out)
 
     assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
+
+
+def test_qwen_gdn_verify_can_omit_the_live_final_state():
+    mx.random.seed(27)
+    B, S, Hk, D, Hv, Dv = 1, 3, 2, 64, 4, 16
+    q = mx.random.normal((B, S, Hk, D)).astype(mx.bfloat16)
+    k = mx.random.normal((B, S, Hk, D)).astype(mx.bfloat16)
+    v = mx.random.normal((B, S, Hv, Dv)).astype(mx.bfloat16)
+    a = mx.random.normal((B, S, Hv)).astype(mx.bfloat16)
+    b = mx.random.normal((B, S, Hv)).astype(mx.bfloat16)
+    A_log = mx.random.normal((Hv,)).astype(mx.bfloat16)
+    dt_bias = mx.ones((Hv,), dtype=mx.bfloat16)
+    state = mx.zeros((B, Hv, Dv, D), dtype=mx.float32)
+
+    full = qwen_verifier.gated_delta_update_with_states(
+        q, k, v, a, b, A_log, dt_bias, state, state_steps=S
+    )
+    shortened = qwen_verifier.gated_delta_update_with_states(
+        q, k, v, a, b, A_log, dt_bias, state, state_steps=S - 1
+    )
+    mx.eval(*full, *shortened)
+
+    assert bool(mx.array_equal(full[0], shortened[0]).item())
+    assert bool(mx.array_equal(full[1], shortened[1]).item())
+    assert bool(mx.array_equal(full[2][:, :-1], shortened[2]).item())
 
 
 def test_qwen_target_verify_linear_matches_singleton_dense_gemv():
@@ -556,7 +658,7 @@ def test_qwen_target_verify_linear_matches_singleton_dense_gemv():
         ],
         axis=0,
     )
-    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    out = qwen_verifier._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -569,7 +671,7 @@ def test_qwen_target_verify_gemv_kernel_matches_singleton_dense_gemv():
     x = mx.random.normal((1, 4, 256)).astype(mx.bfloat16)
 
     ref = mx.concatenate([linear(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
-    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    out = qwen_verifier._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -582,8 +684,8 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_path():
     linear.biases = linear.biases.astype(mx.bfloat16)
     x = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
 
-    ref = qwen_language._target_verify_timewise(linear, x)
-    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    ref = qwen_verifier._target_verify_timewise(linear, x)
+    out = qwen_verifier._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -597,7 +699,62 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
     x = mx.random.normal((1, 3, 512)).astype(mx.bfloat16)
 
     ref = linear(x)
-    out = qwen_language._target_verify_quantized_linear(linear, x)
+    out = qwen_verifier._target_verify_quantized_linear(linear, x)
+    mx.eval(ref, out)
+
+    # The target kernel and MLX's quantized GEMM accumulate in different
+    # orders, so BF16 rounding can differ by a small amount.
+    assert bool(mx.allclose(ref, out, rtol=1e-2, atol=1e-2).item())
+
+
+@pytest.mark.parametrize("input_dims", [512, 6144])
+@pytest.mark.parametrize("verify_length", [3, 4, 6, 7, 8])
+def test_qwen_target_verify_4bit_linear_matches_singleton_path_exactly(
+    input_dims, verify_length
+):
+    mx.random.seed(31 + input_dims + verify_length)
+    linear = nn.QuantizedLinear(input_dims, 16, bias=False, group_size=64, bits=4)
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    x = mx.random.normal((1, verify_length, input_dims)).astype(mx.bfloat16)
+
+    ref = qwen_verifier._target_verify_timewise(linear, x)
+    out = qwen_verifier._target_verify_linear(linear, x)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+@pytest.mark.parametrize("output_dims", [(16, 24), (16, 24, 32), (8, 16, 24, 32)])
+@pytest.mark.parametrize("verify_length", [3, 6, 8])
+def test_qwen_target_verify_4bit_linears_fuse_exactly(output_dims, verify_length):
+    mx.random.seed(51 + len(output_dims) + verify_length)
+    linears = tuple(
+        nn.QuantizedLinear(512, output_dim, bias=False, group_size=64, bits=4)
+        for output_dim in output_dims
+    )
+    for linear in linears:
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+    x = mx.random.normal((1, verify_length, 512)).astype(mx.bfloat16)
+
+    ref = tuple(qwen_verifier._target_verify_timewise(linear, x) for linear in linears)
+    out = qwen_verifier._target_verify_linears(linears, x)
+    mx.eval(*ref, *out)
+
+    assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
+
+
+@pytest.mark.parametrize("input_dims", [512, 6144])
+def test_qwen_target_verify_8bit_linear_matches_singleton_path_exactly(input_dims):
+    mx.random.seed(21 + input_dims)
+    linear = nn.QuantizedLinear(input_dims, 16, bias=False, group_size=64, bits=8)
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    x = mx.random.normal((1, 4, input_dims)).astype(mx.bfloat16)
+
+    ref = qwen_verifier._target_verify_timewise(linear, x)
+    out = qwen_verifier._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -611,10 +768,10 @@ def test_qwen_fused_greedy_decode_support_matches_lm_head():
         args=SimpleNamespace(tie_word_embeddings=False),
         lm_head=linear,
     )
-    assert qwen_language._can_target_verify_quantized_head(model.lm_head)
+    assert qwen_verifier._can_target_verify_quantized_head(model.lm_head)
 
     model.lm_head = OneBitLinear(512, 16, bias=False, group_size=32)
-    assert not qwen_language._can_target_verify_quantized_head(model.lm_head)
+    assert not qwen_verifier._can_target_verify_quantized_head(model.lm_head)
     assert (
         qwen_language.LanguageModel.fused_greedy_decode(
             model, mx.array([[1]], dtype=mx.int32), cache=[]
@@ -659,7 +816,7 @@ def test_qwen_fused_greedy_decode_uses_quantized_argmax():
     out = qwen_language.LanguageModel.fused_greedy_decode(
         model, inputs, cache=["cache"]
     )
-    ref = qwen_language._target_verify_quantized_argmax(model.lm_head, hidden)
+    ref = qwen_verifier._target_verify_quantized_argmax(model.lm_head, hidden)
     mx.eval(out, ref)
 
     assert bool(mx.array_equal(out, ref).item())
@@ -692,15 +849,16 @@ def test_qwen3_5_decode_quantized_linears_fused_matches_separate():
         assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
 
 
-def test_qwen_target_verify_quantized_argmax_matches_singleton_path():
-    mx.random.seed(16)
-    linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=4)
+@pytest.mark.parametrize("bits", [4, 8])
+def test_qwen_target_verify_quantized_argmax_matches_singleton_path(bits):
+    mx.random.seed(16 + bits)
+    linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=bits)
     linear.scales = linear.scales.astype(mx.bfloat16)
     linear.biases = linear.biases.astype(mx.bfloat16)
 
     x = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
-    ref = mx.argmax(qwen_language._target_verify_timewise(linear, x), axis=-1)
-    out = qwen_language._target_verify_quantized_argmax(linear, x)
+    ref = mx.argmax(qwen_verifier._target_verify_timewise(linear, x), axis=-1)
+    out = qwen_verifier._target_verify_quantized_argmax(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -713,10 +871,10 @@ def test_qwen3_5_quantized_argmax_batch_as_time_matches_rowwise():
     linear.biases = linear.biases.astype(mx.bfloat16)
     x = mx.random.normal((4, 1, 512), dtype=mx.bfloat16)
 
-    out = qwen_language._target_verify_quantized_argmax(linear, x)
+    out = qwen_verifier._target_verify_quantized_argmax(linear, x)
     ref = mx.concatenate(
         [
-            qwen_language._target_verify_quantized_argmax(linear, x[row : row + 1])
+            qwen_verifier._target_verify_quantized_argmax(linear, x[row : row + 1])
             for row in range(x.shape[0])
         ],
         axis=0,
@@ -724,6 +882,24 @@ def test_qwen3_5_quantized_argmax_batch_as_time_matches_rowwise():
     mx.eval(out, ref)
 
     assert bool(mx.array_equal(out, ref).item())
+
+
+@pytest.mark.parametrize("verify_length", [6, 7, 8])
+def test_qwen3_5_4bit_quantized_argmax_wide_blocks_match_singletons(verify_length):
+    mx.random.seed(32 + verify_length)
+    linear = nn.QuantizedLinear(512, 32, bias=False, group_size=64, bits=4)
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    x = mx.random.normal((1, verify_length, 512), dtype=mx.bfloat16)
+
+    out = qwen_verifier._target_verify_quantized_argmax(linear, x)
+    mask = mx.full((verify_length, 1), -1, dtype=mx.int32)
+    masked = qwen_verifier._target_verify_quantized_argmax(linear, x, token_mask=mask)
+    ref = mx.argmax(qwen_verifier._target_verify_timewise(linear, x), axis=-1)
+    mx.eval(out, masked, ref)
+
+    assert bool(mx.array_equal(out, ref).item())
+    assert bool(mx.array_equal(masked, ref).item())
 
 
 def _qwen3_5_ragged_attention_reference(queries, keys, values, pads, scale):
@@ -825,7 +1001,7 @@ def test_qwen_target_verify_small_projection_matches_singleton_dense_gemv():
         ],
         axis=0,
     )
-    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    out = qwen_verifier._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -840,10 +1016,33 @@ def test_qwen_target_verify_mlp_matches_singleton_dense_path():
     x = mx.random.normal((2, 3, 16)).astype(mx.bfloat16)
 
     ref = mx.concatenate([mlp(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
-    out = mlp(x, target_verify=True)
+    out = qwen_verifier.Qwen3_5ExactSpeculativeVerifier()._feed_forward(mlp, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_exact_verifier_moe_matches_singleton_path():
+    mx.random.seed(111)
+    config = SimpleNamespace(
+        hidden_size=16,
+        moe_intermediate_size=32,
+        shared_expert_intermediate_size=32,
+        num_experts=4,
+        num_experts_per_tok=2,
+    )
+    moe = qwen_moe_language.Qwen3_5MoeSparseMoeBlock(config)
+    moe.set_dtype(mx.bfloat16)
+    x = mx.random.normal((2, 3, 16)).astype(mx.bfloat16)
+
+    expected = mx.concatenate(
+        [moe(x[:, index : index + 1]) for index in range(x.shape[1])],
+        axis=1,
+    )
+    actual = qwen_verifier.Qwen3_5ExactSpeculativeVerifier()._feed_forward(moe, x)
+    mx.eval(expected, actual)
+
+    assert bool(mx.array_equal(expected, actual).item())
 
 
 def test_qwen_target_verify_norms_match_singleton_path():
@@ -898,7 +1097,7 @@ def test_qwen_gdn_verify_conv_matches_singleton_windows():
         ],
         axis=1,
     )
-    out = layer._causal_conv1d_verify(conv_input, steps)
+    out = layer.conv1d(conv_input)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -1083,6 +1282,61 @@ def test_qwen3_5_single_row_quantized_batch_cache_keeps_prompt_state():
     assert prompt_cache[1] is quantized_cache
     assert quantized_cache._idx == 4
     assert quantized_cache.offset.tolist() == [4]
+
+
+def test_qwen3_5_mtp_verify_supports_native_quantized_batch_cache():
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.hidden_size = 64
+    text_config.intermediate_size = 128
+    text_config.num_hidden_layers = 2
+    text_config.num_attention_heads = 2
+    text_config.num_key_value_heads = 1
+    text_config.head_dim = 32
+    text_config.full_attention_interval = 2
+    model_config = qwen_language.ModelConfig(
+        text_config=text_config,
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        model_type="qwen3_5",
+        image_token_id=101,
+        video_token_id=102,
+        image_token_index=101,
+        video_token_index=102,
+        vision_start_token_id=100,
+        vision_end_token_id=103,
+        vocab_size=text_config.vocab_size,
+    )
+    model = qwen_language.LanguageModel(text_config, config=model_config)
+
+    arrays = ArraysCache(size=2)
+    arrays.left_padding = mx.array([0, 0], dtype=mx.int32)
+    quantized = BatchQuantizedKVCache([0, 0], group_size=32, bits=4)
+    prompt_cache = [arrays, quantized]
+
+    prompt = mx.array([[1, 2, 3], [4, 5, 6]], dtype=mx.int32)
+    model(prompt, cache=prompt_cache)
+    mx.eval(prompt_cache[1].state)
+
+    verify = mx.array([[7, 8, 9], [10, 11, 12]], dtype=mx.int32)
+    hidden, shared_kv, rollback_state = model.speculative_verify_hidden(
+        verify, prompt_cache
+    )
+    mx.eval(hidden, prompt_cache[1].state)
+
+    assert hidden.shape == (2, 3, text_config.hidden_size)
+    assert shared_kv == {}
+    assert rollback_state is not None
+    assert quantized._idx == 6
+    assert quantized.offset.tolist() == [6, 6]
+
+    accepted = model.rollback_speculative_cache(
+        prompt_cache, rollback_state, mx.array([0, 1]), block_size=3
+    )
+    mx.eval(prompt_cache[1].state)
+
+    assert accepted == 1
+    assert quantized._idx == 5
+    assert quantized.offset.tolist() == [4, 5]
+    assert quantized.left_padding.tolist() == [1, 0]
 
 
 def test_qwen3_5_single_row_shortcut_skips_quantized_batch_caches():
@@ -2005,6 +2259,26 @@ def test_dflash_next_block_size_uses_model_initial_size():
     assert _dflash_next_block_size(draft_model, 16, 20, 4) == 4
 
 
+def test_dflash_next_block_size_honors_model_minimum():
+    draft_model = SimpleNamespace(
+        accept_lens=[0, 1],
+        draft_lens=[2, 3],
+        dflash_min_block_size=3,
+    )
+
+    assert _dflash_next_block_size(draft_model, 5, 20) == 3
+
+
+def test_dflash_next_block_size_grows_from_model_minimum():
+    draft_model = SimpleNamespace(
+        accept_lens=[2, 2, 2, 2],
+        draft_lens=[2, 2, 2, 2],
+        dflash_min_block_size=3,
+    )
+
+    assert _dflash_next_block_size(draft_model, 5, 20) == 5
+
+
 def test_dflash_next_block_size_backs_off_on_low_acceptance():
     draft_model = SimpleNamespace(accept_lens=[1, 2], draft_lens=[15, 7])
 
@@ -2435,6 +2709,31 @@ def test_kind_none_autodetects_mtp_for_glm4_moe_lite_mtp(tmp_path):
     path = _make_drafter_dir(tmp_path, "glm4_moe_lite_mtp")
     assert resolve_drafter_kind(path, None) == "mtp"
     assert resolve_drafter_kind(path, "dflash") == "mtp"
+
+
+def test_kind_none_autodetects_mtp_for_native_nextn_checkpoint(tmp_path):
+    path = _make_drafter_dir(tmp_path, "deepseek_v4", {"num_nextn_predict_layers": 1})
+    assert resolve_drafter_kind(path, None) == "mtp"
+    assert resolve_drafter_kind(path) == "mtp"
+
+
+def test_native_nextn_overrides_dflash_to_mtp(tmp_path, caplog):
+    path = _make_drafter_dir(tmp_path, "deepseek_v4", {"num_nextn_predict_layers": 1})
+    with caplog.at_level("WARNING"):
+        assert resolve_drafter_kind(path, "dflash") == "mtp"
+    assert any("requires --draft-kind='mtp'" in r.getMessage() for r in caplog.records)
+
+
+def test_mapped_type_wins_over_nextn_heuristic(tmp_path):
+    path = _make_drafter_dir(
+        tmp_path, "deepseek_v4_dspark", {"num_nextn_predict_layers": 1}
+    )
+    assert resolve_drafter_kind(path, None) == "dflash"
+
+
+def test_zero_nextn_falls_back_to_default(tmp_path):
+    path = _make_drafter_dir(tmp_path, "deepseek_v4", {"num_nextn_predict_layers": 0})
+    assert resolve_drafter_kind(path, None) == "dflash"
 
 
 def test_kind_none_autodetects_eagle3_speculators_config(tmp_path):
@@ -3044,57 +3343,106 @@ def test_qwen3_5_rollback_speculative_cache_trims_batch_rows_ragged():
     assert cache.left_padding.tolist() == [0, 2]
 
 
-def test_qwen3_5_rollback_speculative_cache_handles_turboquant_batch_kv():
+def test_qwen3_5_rollback_speculative_cache_raises_on_ragged_turboquant_batch_kv():
+    # A rectangular TurboQuant batch cache (single _idx, no prepare/finalize)
+    # cannot represent ragged accepts; zeroing the shorter row's tail would
+    # leave phantom keys attended (issue #1962), so it must fail loud instead.
     cache = BatchTurboQuantKVCache([0, 0], bits=3.5)
     keys = mx.arange(2 * 1 * 7 * 8, dtype=mx.float32).reshape(2, 1, 7, 8)
     values = keys + 100
+    cache.update_and_fetch(keys, values)
+
+    with pytest.raises(RuntimeError, match="uniform"):
+        qwen_language.LanguageModel.rollback_speculative_cache(
+            None, [cache], [], mx.array([0, 2]), block_size=5
+        )
+
+
+def test_qwen3_5_rollback_speculative_cache_handles_native_quantized_batch_kv():
+    cache = BatchQuantizedKVCache([0, 0], group_size=32, bits=4)
+    keys = mx.random.normal((2, 1, 7, 32))
+    values = mx.random.normal((2, 1, 7, 32))
     cache.update_and_fetch(keys, values)
 
     qwen_language.LanguageModel.rollback_speculative_cache(
         None, [cache], [], mx.array([0, 2]), block_size=5
     )
 
-    mx.eval(cache.keys.norms, cache.keys.indices, cache.values.norms, cache.offset)
+    mx.eval(cache.keys, cache.values, cache.offset)
     assert cache._idx == 5
-    assert cache.offset.tolist() == [5, 5]
-    assert mx.all(cache.keys.norms[0, :, 3:5] == 0).item()
-    assert mx.all(cache.keys.indices[0, :, 3:5, :] == 0).item()
-    assert mx.all(cache.values.norms[0, :, 3:5] == 0).item()
-    assert mx.any(cache.keys.norms[1, :, 3:5] != 0).item()
+    assert cache.offset.tolist() == [3, 5]
+    assert cache.left_padding.tolist() == [2, 0]
 
 
-def test_gemma4_rollback_speculative_cache_handles_turboquant_batch_tail_zero():
+def test_gemma4_rollback_speculative_cache_raises_on_ragged_turboquant_batch():
     cache = BatchTurboQuantKVCache([0, 0], bits=3.5)
     keys = mx.arange(2 * 1 * 5 * 8, dtype=mx.float32).reshape(2, 1, 5, 8)
     values = keys + 100
     cache.update_and_fetch(keys, values)
 
-    gemma4_language.LanguageModel.rollback_speculative_cache(
-        None, [cache], [], mx.array([0, 2]), block_size=3
-    )
-
-    mx.eval(cache.keys.norms, cache.keys.indices, cache.values.norms)
-    assert mx.all(cache.keys.norms[0, :, 3:5] == 0).item()
-    assert mx.all(cache.keys.indices[0, :, 3:5, :] == 0).item()
-    assert mx.all(cache.values.norms[0, :, 3:5] == 0).item()
-    assert mx.any(cache.keys.norms[1, :, 3:5] != 0).item()
+    with pytest.raises(RuntimeError, match="uniform"):
+        gemma4_language.LanguageModel.rollback_speculative_cache(
+            None, [cache], [], mx.array([0, 2]), block_size=3
+        )
 
 
-def test_deepseek_v4_rollback_speculative_cache_handles_turboquant_batch_tail_zero():
+def test_deepseek_v4_rollback_speculative_cache_raises_on_ragged_turboquant_batch():
     cache = BatchTurboQuantKVCache([0, 0], bits=3.5)
     keys = mx.arange(2 * 1 * 5 * 8, dtype=mx.float32).reshape(2, 1, 5, 8)
     values = keys + 100
     cache.update_and_fetch(keys, values)
 
-    deepseek_language.LanguageModel.rollback_speculative_cache(
-        None, [cache], [], mx.array([0, 2]), block_size=3
-    )
+    with pytest.raises(RuntimeError, match="uniform"):
+        deepseek_language.LanguageModel.rollback_speculative_cache(
+            None, [cache], [], mx.array([0, 2]), block_size=3
+        )
 
-    mx.eval(cache.keys.norms, cache.keys.indices, cache.values.norms)
-    assert mx.all(cache.keys.norms[0, :, 3:5] == 0).item()
-    assert mx.all(cache.keys.indices[0, :, 3:5, :] == 0).item()
-    assert mx.all(cache.values.norms[0, :, 3:5] == 0).item()
-    assert mx.any(cache.keys.norms[1, :, 3:5] != 0).item()
+
+def test_uniform_turboquant_batch_rollback_trims_without_raising():
+    # With uniform per-row acceptance there is no ragged tail: rollback is a
+    # plain uniform trim, no phantom keys, no raise (issue #1962 fix).
+    for lm_cls, block in (
+        (qwen_language.LanguageModel, 5),
+        (gemma4_language.LanguageModel, 5),
+        (deepseek_language.LanguageModel, 5),
+    ):
+        cache = BatchTurboQuantKVCache([0, 0], bits=3.5)
+        keys = mx.arange(2 * 1 * 7 * 8, dtype=mx.float32).reshape(2, 1, 7, 8)
+        cache.update_and_fetch(keys, keys + 100)
+
+        max_a = lm_cls.rollback_speculative_cache(
+            None, [cache], [], mx.array([2, 2]), block_size=block
+        )
+        mx.eval(cache.offset)
+        assert max_a == 2
+        assert cache._idx == 5
+
+
+def test_uniform_batch_acceptance_flag_advertised_on_affected_models():
+    import mlx_vlm.models.minimax_m3_vl.language as minimax_language
+    import mlx_vlm.models.muse_glimmer.language as muse_glimmer_language
+
+    for module in (
+        gemma4_language,
+        deepseek_language,
+        qwen_language,
+        muse_glimmer_language,
+        minimax_language,
+    ):
+        assert module.LanguageModel.requires_uniform_batch_acceptance is True
+
+
+def test_requires_uniform_batch_acceptance_honors_drafter_or_target():
+    from mlx_vlm.speculative.common import _requires_uniform_batch_acceptance
+
+    plain = SimpleNamespace()
+    flagged = SimpleNamespace(requires_uniform_batch_acceptance=True)
+
+    assert _requires_uniform_batch_acceptance(plain) is False
+    assert _requires_uniform_batch_acceptance(flagged) is True
+    assert _requires_uniform_batch_acceptance(plain, flagged) is True
+    assert _requires_uniform_batch_acceptance(flagged, plain) is True
+    assert _requires_uniform_batch_acceptance(plain, plain) is False
 
 
 def test_qwen3_5_mtp_filter_batch_keeps_drafter_state_aligned():
@@ -3212,6 +3560,52 @@ def test_split_qwen3_5_mtp_writes_sidecar_without_index_mtp_entries(tmp_path):
     assert cfg["block_size"] == 3
     assert "fc.weight" in weights
     assert weights["pre_fc_norm_hidden.weight"][0].item() == 1.0
+
+
+def test_split_qwen3_5_mtp_converts_fine_grained_fp8(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.mtp_num_hidden_layers = 1
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5",
+                "text_config": text_config.to_dict(),
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "fmt": "e4m3",
+                    "weight_block_size": [128, 128],
+                },
+            }
+        )
+    )
+    mx.save_safetensors(
+        str(source / "mtp.safetensors"),
+        {
+            "mtp.layers.0.mlp.down_proj.weight": mx.to_fp8(
+                mx.ones((128, 128), dtype=mx.bfloat16)
+            ),
+            "mtp.layers.0.mlp.down_proj.weight_scale_inv": mx.full(
+                (1, 1), 0.125, dtype=mx.bfloat16
+            ),
+            "mtp.pre_fc_norm_hidden.weight": mx.zeros((16,)),
+        },
+        metadata={},
+    )
+
+    split_qwen3_5_mtp(str(source), str(output))
+
+    with open(output / "config.json") as f:
+        cfg = json.load(f)
+    weights = mx.load(str(output / "model.safetensors"))
+    expected = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    assert cfg["quantization"] == expected
+    assert cfg["quantization_config"] == expected
+    assert weights["layers.0.mlp.down_proj.weight"].dtype == mx.uint32
+    assert weights["layers.0.mlp.down_proj.scales"].dtype == mx.uint8
+    assert not any(key.endswith("weight_scale_inv") for key in weights)
 
 
 def test_deepseek_v4_returns_mtp_hidden_and_trims_without_snapshot():
@@ -3422,6 +3816,264 @@ def test_deepseek_v4_mtp_sanitize_maps_embedded_weights():
         cfg.n_routed_experts
     )
     assert out["decoder.attn.wo_a.weight"].shape == (1, cfg.o_lora_rank, 4)
+
+
+def test_deepseek_v4_mtp_sanitize_strips_nonzero_layer_index():
+    # DeepSeek-V4-Flash-0731 stores its MTP blocks at layer indices 1/2/…, not
+    # 0. The prefix strip must drop any `mtp.<idx>.` so the tensors land at the
+    # drafter's top level instead of keeping a stray `1.`.
+    cfg = _tiny_deepseek_v4_config()
+    context = SimpleNamespace(args=cfg)
+    weights = {
+        "mtp.1.enorm.weight": mx.ones((cfg.hidden_size,)),
+        "mtp.1.attn.wkv.weight": mx.ones((4, 4)),
+        "mtp.1.hc_head_scale": mx.ones((1,)),
+        "mtp.1.attn.wo_a.weight": mx.ones((cfg.o_lora_rank, 4)),
+    }
+    for expert in range(cfg.n_routed_experts):
+        weights[f"mtp.1.ffn.experts.{expert}.w1.weight"] = mx.zeros((4, 16))
+
+    out = DeepseekV4MTPDraftModel.sanitize(context, weights)
+
+    assert not any(re.match(r"\d+\.", key) for key in out)
+    assert "enorm.weight" in out
+    assert "decoder.attn.wkv.weight" in out
+    assert "hc_head.scale" in out
+    assert out["decoder.ffn.switch_mlp.gate_proj.weight"].shape[0] == (
+        cfg.n_routed_experts
+    )
+
+
+def _tiny_deepseek_v4_dspark_config():
+    return DeepseekV4DsparkConfig(
+        text_config=_tiny_deepseek_v4_config(),
+        n_mtp_layers=3,
+        target_layer_ids=[0, 1, 2],
+        mask_token_id=1,
+        markov_rank=8,
+        block_size=5,
+    )
+
+
+def _forge_dspark_source(model, cfg):
+    """Reconstruct the ``mtp.<stage>.*`` checkpoint tensors from the drafter's
+    own params, so the split->load round-trip can be exercised without the real
+    (multi-GB) DeepSeek-V4-Flash-0731 checkpoint."""
+    params = dict(tree_flatten(model.parameters()))
+    text = cfg.text_config
+    n_experts, o_groups, o_lora_rank = (
+        text.n_routed_experts,
+        text.o_groups,
+        text.o_lora_rank,
+    )
+    last_stage = cfg.n_mtp_layers - 1
+    proj_to_w = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+    hc = {"attn_hc": "hc_attn", "ffn_hc": "hc_ffn"}
+    src = {}
+    for key, value in params.items():
+        if key.startswith("markov_head."):
+            # the model-level markov head lives under the last stage on disk
+            src[f"mtp.{last_stage}.{key}"] = value
+            continue
+        _, stage, body = key.split(".", 2)
+        prefix = f"mtp.{stage}."
+        if body.startswith("ffn.switch_mlp."):
+            w = proj_to_w[body.split(".")[-2]]
+            for expert in range(n_experts):
+                src[f"{prefix}ffn.experts.{expert}.{w}.weight"] = value[expert]
+        elif body.startswith("ffn.shared_experts."):
+            w = proj_to_w[body.split(".")[-2]]
+            src[f"{prefix}ffn.shared_experts.{w}.weight"] = value
+        elif body == "ffn.gate.e_score_correction_bias":
+            src[f"{prefix}ffn.gate.bias"] = value
+        elif body == "attn.wo_a.weight":
+            src[f"{prefix}attn.wo_a.weight"] = (
+                value.reshape(o_groups * o_lora_rank, -1) if value.ndim == 3 else value
+            )
+        elif body.startswith("attn_hc.") or body.startswith("ffn_hc."):
+            module, param = body.split(".")
+            src[f"{prefix}{hc[module]}_{param}"] = value
+        elif body.startswith("hc_head."):
+            src[f"{prefix}hc_head_{body.split('.')[-1]}"] = value
+        else:
+            src[f"{prefix}{body}"] = value
+    return src
+
+
+def test_deepseek_v4_dspark_sanitize_round_trips_three_stage_layout():
+    cfg = _tiny_deepseek_v4_dspark_config()
+    model = DeepseekV4DsparkDraftModel(cfg)
+    mx.eval(model.parameters())
+    src = _forge_dspark_source(model, cfg)
+    # a trained checkpoint also ships an (unused) confidence head -> dropped
+    src["mtp.2.confidence_head.proj.weight"] = mx.zeros(
+        (1, cfg.hidden_size + cfg.markov_rank)
+    )
+    src["mtp.0.ffn.gate.bias_vl"] = mx.zeros((cfg.text_config.n_routed_experts,))
+
+    written = DeepseekV4DsparkDraftModel.sanitize(
+        SimpleNamespace(args=cfg.text_config), dict(src)
+    )
+    fresh = DeepseekV4DsparkDraftModel(cfg)
+    mx.eval(fresh.parameters())
+    sanitized = fresh.sanitize(dict(written))
+    fresh.load_weights(list(sanitized.items()), strict=True)
+
+    assert not any(key.startswith("mtp.") for key in sanitized)
+    assert not any("confidence_head" in key for key in sanitized)
+    assert not any("bias_vl" in key for key in sanitized)
+    assert any(key.startswith("stages.0.main_proj") for key in sanitized)
+    assert any(key.startswith("markov_head.") for key in sanitized)
+
+
+def test_deepseek_v4_dspark_draft_block_emits_proposal_tokens():
+    cfg = _tiny_deepseek_v4_dspark_config()
+    model = DeepseekV4DsparkDraftModel(cfg)
+    mx.eval(model.parameters())
+    text = cfg.text_config
+    target = SimpleNamespace(
+        embed_tokens=nn.Embedding(text.vocab_size, text.hidden_size),
+        lm_head=nn.Linear(text.hidden_size, text.vocab_size, bias=False),
+    )
+    mx.eval(target.embed_tokens.parameters(), target.lm_head.parameters())
+    draft_cache = model.reset(target)
+
+    ctx = 5
+    n_targets = len(cfg.target_layer_ids)
+    hidden = mx.random.normal((1, ctx, text.hidden_size * n_targets))
+    drafts = model.draft_block(
+        3,
+        hidden,
+        draft_cache,
+        cfg.block_size,
+        lambda logits: mx.argmax(logits, axis=-1),
+    )
+    assert drafts.shape == (1, cfg.block_size - 1)
+
+
+def test_deepseek_v4_capture_layer_ids_taps_mean_over_hc():
+    base = _tiny_deepseek_v4_config()
+    cfg = deepseek_language.ModelConfig(
+        **{
+            **base.to_dict(),
+            "num_hidden_layers": 3,
+            "compress_ratios": [0, 0, 0],
+        }
+    )
+    lm = deepseek_language.LanguageModel(cfg)
+    mx.eval(lm.parameters())
+
+    out = lm(mx.array([[1, 2, 3, 4]]), capture_layer_ids=[0, 2])
+
+    assert isinstance(out.hidden_states, list)
+    assert len(out.hidden_states) == 2
+    for hidden in out.hidden_states:
+        assert hidden.shape == (1, 4, cfg.hidden_size)
+
+
+def test_split_deepseek_v4_dspark_writes_dspark_config(tmp_path):
+    cfg = _tiny_deepseek_v4_dspark_config()
+    model = DeepseekV4DsparkDraftModel(cfg)
+    mx.eval(model.parameters())
+    src_weights = _forge_dspark_source(model, cfg)
+
+    source = tmp_path / "source"
+    source.mkdir()
+    text = cfg.text_config
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "deepseek_v4",
+                **text.to_dict(),
+                "dspark_block_size": cfg.block_size - 1,
+                "dspark_noise_token_id": cfg.mask_token_id,
+                "dspark_target_layer_ids": cfg.target_layer_ids,
+                "dspark_markov_rank": cfg.markov_rank,
+            }
+        )
+    )
+    mx.save_safetensors(str(source / "mtp.safetensors"), src_weights, metadata={})
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"model.foo": "model.safetensors"}})
+    )
+
+    output = tmp_path / "dspark"
+    from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
+
+    assert type(detect_mtp_splitter(source)).__name__ == "DeepseekV4DsparkSplitter"
+    split_deepseek_v4_dspark(str(source), str(output))
+
+    written_cfg = json.loads((output / "config.json").read_text())
+    weights = {}
+    for shard in sorted(output.glob("model-*.safetensors")):
+        weights.update(mx.load(str(shard)))
+    assert written_cfg["model_type"] == "deepseek_v4_dspark"
+    assert written_cfg["n_mtp_layers"] == 3
+    assert written_cfg["target_layer_ids"] == cfg.target_layer_ids
+    assert written_cfg["mask_token_id"] == cfg.mask_token_id
+    assert len(list(output.glob("model-*.safetensors"))) == 3
+    assert (output / "model.safetensors.index.json").exists()
+    assert any(key.startswith("stages.0.main_proj") for key in weights)
+    assert any(key.startswith("markov_head.") for key in weights)
+
+
+def test_deepseek_v4_dspark_uses_dflash_rounds_losslessly():
+    # deepseek_v4_dspark maps to the dflash kind. Losslessness comes from
+    # verification, not drafter quality: with a random (untrained) drafter every
+    # proposal is rejected, so speculative decoding must reproduce the target's
+    # plain-greedy trajectory exactly.
+    from mlx_vlm.speculative.dflash import _dflash_rounds
+
+    base = _tiny_deepseek_v4_config()
+    tgt_cfg = deepseek_language.ModelConfig(
+        **{**base.to_dict(), "num_hidden_layers": 4, "compress_ratios": [0, 0, 0, 0]}
+    )
+    target = deepseek_language.LanguageModel(tgt_cfg)
+    mx.eval(target.parameters())
+
+    dcfg = DeepseekV4DsparkConfig(
+        text_config=tgt_cfg,
+        n_mtp_layers=3,
+        target_layer_ids=[1, 2, 3],
+        mask_token_id=1,
+        markov_rank=8,
+        block_size=5,
+    )
+    drafter = DeepseekV4DsparkDraftModel(dcfg)
+    mx.eval(drafter.parameters())
+
+    prompt = mx.array([[5, 6, 7, 8, 9]])
+    n_new = 12
+
+    def argmax_last(logits):
+        return int(mx.argmax(logits[:, -1, :], axis=-1).item())
+
+    cache_ref = target.make_cache()
+    tok = argmax_last(target(prompt, cache=cache_ref).logits)
+    ref = [tok]
+    for _ in range(n_new - 1):
+        tok = argmax_last(target(mx.array([[tok]]), cache=cache_ref).logits)
+        ref.append(tok)
+
+    cache_spec = target.make_cache()
+    out = target(prompt, cache=cache_spec, capture_layer_ids=[1, 2, 3])
+    hidden = mx.concatenate([h[:, -1:, :] for h in out.hidden_states], axis=-1)
+    first_bonus = argmax_last(out.logits)
+    spec = [first_bonus]
+    for tok, _ in _dflash_rounds(
+        target,
+        drafter,
+        cache_spec,
+        hidden,
+        first_bonus=first_bonus,
+        max_tokens=n_new,
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        greedy_sampling=True,
+    ):
+        spec.append(tok)
+
+    n = min(len(ref), len(spec))
+    assert spec[:n] == ref[:n]
 
 
 def test_split_deepseek_v4_mtp_writes_sidecar_without_index_mtp_entries(tmp_path):

@@ -10,14 +10,22 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.utils import (
+    DEFAULT_VIDEO_SAMPLING,
     StoppingCriteria,
+    VideoSampling,
     _drop_modules_without_weights,
     _load_safetensors,
+    _quantization_for_module_path,
+    _quantization_path_aliases,
+    _transform_compressed_tensors_weights,
+    _transform_modelopt_nvfp4_weights,
     apply_generation_config_defaults,
+    estimate_num_image_tokens,
     get_model_and_args,
     get_model_path,
     load,
@@ -25,12 +33,109 @@ from mlx_vlm.utils import (
     load_image,
     load_model,
     load_processor,
+    load_video,
     prepare_inputs,
     process_image,
     process_inputs_with_fallback,
+    processor_video_sampling,
+    resolve_video_sampling,
     sanitize_weights,
     update_module_configs,
 )
+
+
+@pytest.mark.parametrize("quant_method", ["modelopt", "modelopt_mixed"])
+def test_transform_modelopt_nvfp4_weights(quant_method):
+    packed = mx.arange(32, dtype=mx.uint8).reshape(2, 16)
+    weights = {
+        "layer.weight": packed,
+        "layer.weight_scale": mx.array([[56, 64], [72, 80]], dtype=mx.uint8),
+        "layer.weight_scale_2": mx.array(0.5, dtype=mx.float32),
+        "layer.input_scale": mx.array(0.25, dtype=mx.float32),
+        "layer.bias": mx.ones((2,)),
+    }
+
+    transformed, quantization = _transform_modelopt_nvfp4_weights(
+        weights,
+        {"quant_method": quant_method, "quant_algo": "NVFP4"},
+    )
+
+    assert transformed["layer.weight"].dtype == mx.uint32
+    assert transformed["layer.weight"].shape == (2, 4)
+    assert transformed["layer.scales"].tolist() == [[48, 56], [64, 72]]
+    assert mx.array_equal(transformed["layer.bias"], weights["layer.bias"])
+    assert "layer.weight_scale" not in transformed
+    assert "layer.weight_scale_2" not in transformed
+    assert "layer.input_scale" not in transformed
+    assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
+def test_transform_modelopt_mixed_nvfp4_fp8_weights():
+    weights = {
+        "experts.weight": mx.arange(32, dtype=mx.uint8).reshape(2, 16),
+        "experts.weight_scale": mx.array([[56, 64], [72, 80]], dtype=mx.uint8),
+        "experts.weight_scale_2": mx.array(0.5, dtype=mx.float32),
+        "experts.input_scale": mx.array(0.25, dtype=mx.float32),
+        "attention.weight": mx.array([[56, 64], [68, 72]], dtype=mx.uint8),
+        "attention.weight_scale": mx.array([0.5, 0.25], dtype=mx.bfloat16),
+        "attention.input_scale": mx.array(0.125, dtype=mx.float32),
+    }
+
+    transformed, quantization = _transform_modelopt_nvfp4_weights(
+        weights,
+        {"quant_method": "modelopt_mixed", "quant_algo": "MIXED_PRECISION"},
+    )
+
+    assert transformed["experts.weight"].dtype == mx.uint32
+    assert transformed["experts.scales"].dtype == mx.uint8
+    assert transformed["attention.weight"].dtype == mx.bfloat16
+    assert transformed["attention.weight"].tolist() == [[0.5, 1.0], [0.75, 1.0]]
+    assert not any("weight_scale" in key or "input_scale" in key for key in transformed)
+    assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
+def test_transform_compressed_tensors_pure_fp8_weights():
+    weights = {
+        "linear.weight": mx.array(
+            [
+                [56, 64, 56, 64],
+                [68, 72, 68, 72],
+                [56, 64, 56, 64],
+                [68, 72, 68, 72],
+            ],
+            dtype=mx.uint8,
+        ),
+        "linear.weight_scale": mx.array([[0.5, 0.25], [0.125, 1.0]], dtype=mx.bfloat16),
+        "linear.input_scale": mx.array(0.125, dtype=mx.float32),
+    }
+    config = {
+        "quant_method": "compressed-tensors",
+        "format": "float-quantized",
+        "config_groups": {
+            "group_0": {
+                "format": "float-quantized",
+                "weights": {
+                    "block_structure": [2, 2],
+                    "num_bits": 8,
+                    "strategy": "block",
+                    "type": "float",
+                },
+            }
+        },
+    }
+
+    transformed, quantization = _transform_compressed_tensors_weights(weights, config)
+
+    assert transformed["linear.weight"].dtype == mx.bfloat16
+    assert transformed["linear.weight"].tolist() == [
+        [0.5, 1.0, 0.25, 0.5],
+        [1.5, 2.0, 0.75, 1.0],
+        [0.125, 0.25, 1.0, 2.0],
+        [0.375, 0.5, 3.0, 4.0],
+    ]
+    assert "linear.weight_scale" not in transformed
+    assert "linear.input_scale" not in transformed
+    assert quantization is None
 
 
 class MockTensor:
@@ -274,6 +379,94 @@ def test_quantize_module():
     assert module.vision_model.group_size == 64
 
     # Check config is updated correctly
+    assert updated_config["quantization"] == {
+        "group_size": 64,
+        "bits": 4,
+        "mode": "affine",
+    }
+
+    # A model-owned group override must be evaluated before the default-group
+    # divisibility gate. Qwen4-Exp's PLE rows are 160-wide: divisible by 32,
+    # but not by the converter's default 64.
+    module = DummyModule((10, 160))
+    config = {}
+
+    def group32_predicate(_path: str, _module: nn.Module):
+        return {"fallback_group_size": 32}
+
+    _, updated_config = quantize_model(
+        module,
+        config,
+        group_size=64,
+        bits=4,
+        mode="affine",
+        quant_predicate=group32_predicate,
+    )
+    assert module.language_model.group_size == 32
+    assert module.vision_model.group_size == 32
+    assert updated_config["quantization"]["language_model"]["group_size"] == 32
+    assert updated_config["quantization"]["language_model"]["bits"] == 4
+    assert updated_config["quantization"]["language_model"]["mode"] == "affine"
+
+    # A compatible requested group remains authoritative. In particular,
+    # NVFP4 must retain its required group-16 layout rather than taking the
+    # affine fallback used for 160-wide PLE rows.
+    module = DummyModule((10, 160))
+    config = {}
+    _, updated_config = quantize_model(
+        module,
+        config,
+        group_size=16,
+        bits=4,
+        mode="nvfp4",
+        quant_predicate=group32_predicate,
+    )
+    assert module.language_model.group_size == 16
+    assert module.language_model.mode == "nvfp4"
+    assert updated_config["quantization"]["language_model"] == {
+        "group_size": 16,
+        "bits": 4,
+        "mode": "nvfp4",
+    }
+
+    # Existing partial overrides retain their implicit affine mode when the
+    # requested checkpoint format uses a mode with fixed group and bit sizes.
+    def affine8_predicate(_path: str, _module: nn.Module):
+        return {"group_size": 64, "bits": 8}
+
+    for mode, requested_group_size in (("nvfp4", 16), ("mxfp4", 32)):
+        module = DummyModule((10, 128))
+        _, updated_config = quantize_model(
+            module,
+            {},
+            group_size=requested_group_size,
+            bits=4,
+            mode=mode,
+            quant_predicate=affine8_predicate,
+        )
+        for name in ("language_model", "vision_model"):
+            quantized = getattr(module, name)
+            assert quantized.group_size == 64
+            assert quantized.bits == 8
+            assert quantized.mode == "affine"
+            assert updated_config["quantization"][name] == {
+                "group_size": 64,
+                "bits": 8,
+            }
+
+    # Only the explicit fallback protocol may bypass the requested group's
+    # divisibility check.
+    module = DummyModule((10, 96))
+    _, updated_config = quantize_model(
+        module,
+        {},
+        group_size=64,
+        bits=4,
+        mode="affine",
+        quant_predicate=lambda _path, _module: {"group_size": 32, "bits": 8},
+    )
+    assert not hasattr(module.language_model, "scales")
+    assert not hasattr(module.vision_model, "scales")
     assert updated_config["quantization"] == {
         "group_size": 64,
         "bits": 4,
@@ -536,7 +729,33 @@ def test_load_processor_preserves_additional_eos_tokens_on_reset():
     criteria = loaded.tokenizer.stopping_criteria
     assert criteria.eos_token_ids == [2, 3]
     criteria.reset([5])
-    assert criteria.eos_token_ids == [5, 3]
+    assert criteria.eos_token_ids == [5, 2, 3]
+
+
+def test_load_processor_keeps_tokenizer_eos_when_config_eos_differs():
+    # Chandra OCR 2 configures <|endoftext|> (248044) but ends turns with
+    # <|im_end|> (248046), so dropping either token never stops generation.
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=248046))
+
+    class Detokenizer:
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+
+    with (
+        patch(
+            "mlx_vlm.utils.AutoProcessor.from_pretrained",
+            return_value=processor,
+        ),
+        patch("mlx_vlm.utils.load_tokenizer", return_value=Detokenizer),
+    ):
+        loaded = load_processor("unused-model-path", eos_token_ids=248044)
+
+    criteria = loaded.tokenizer.stopping_criteria
+    assert criteria.eos_token_ids == [248044, 248046]
+
+    # generate() resets to the config EOS on every call.
+    criteria.reset(248044)
+    assert criteria.eos_token_ids == [248044, 248046]
 
 
 def test_load_passes_revision():
@@ -717,6 +936,113 @@ class TestDropModulesWithoutWeights:
         assert "vision_tower" in caplog.text
         assert model.loaded_strict is True
 
+    def test_keeps_module_declared_in_manifest_but_not_loaded(self):
+        # Manifest declares vision weights but none loaded -> keep, strict fails (#1963).
+        model = self.FakeModel()
+        weights = {"language_model.weight": mx.zeros((2, 2))}
+        declared = {
+            "language_model.weight",
+            "vision_tower.weight",
+            "vision_tower.bias",
+        }
+
+        _drop_modules_without_weights(model, weights, declared)
+
+        assert model.vision_tower is not None
+        with pytest.raises(ValueError, match="Missing"):
+            model.load_weights(list(weights.items()), strict=True)
+
+    def test_drops_module_absent_from_manifest(self, caplog):
+        # The manifest also omits vision -> an intentional text-only conversion.
+        model = self.FakeModel()
+        weights = {"language_model.weight": mx.zeros((2, 2))}
+        declared = {"language_model.weight"}
+
+        with caplog.at_level(logging.WARNING):
+            _drop_modules_without_weights(model, weights, declared)
+
+        assert model.vision_tower is None
+        assert "vision_tower" in caplog.text
+
+    def test_load_model_prunes_when_config_still_advertises_vision(self, caplog):
+        # Populated vision_config but no vision weights -> tower dropped (#1958).
+        class FakeConfig:
+            @classmethod
+            def from_dict(cls, config):
+                return cls()
+
+        class FakeModel(self.FakeModel):
+            def load_weights(self, weights, strict=True):
+                self.loaded_weights = weights
+                self.loaded_strict = strict
+
+        fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeModel)
+        weights = {"language_model.weight": mx.zeros((2, 2))}
+
+        with (
+            patch(
+                "mlx_vlm.utils.load_config",
+                return_value={
+                    "model_type": "fake",
+                    "vision_config": {"hidden_size": 8, "num_hidden_layers": 2},
+                },
+            ),
+            patch(
+                "mlx_vlm.utils.glob.glob",
+                return_value=["/tmp/model/model.safetensors"],
+            ),
+            patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+            patch(
+                "mlx_vlm.utils.get_model_and_args",
+                return_value=(fake_model_class, "fake"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            model = load_model(Path("/tmp/model"), lazy=True)
+
+        assert model.vision_tower is None
+        assert model.loaded_strict is True
+
+    def test_load_model_errors_when_manifest_shard_missing(self, tmp_path):
+        # Index declares vision weights but the shard is absent -> strict fails (#1963).
+        (tmp_path / "model.safetensors").write_bytes(b"")
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "language_model.weight": "model.safetensors",
+                        "vision_tower.weight": "model-vision.safetensors",
+                        "vision_tower.bias": "model-vision.safetensors",
+                    }
+                }
+            )
+        )
+
+        class FakeConfig:
+            @classmethod
+            def from_dict(cls, config):
+                return cls()
+
+        fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=self.FakeModel)
+        weights = {"language_model.weight": mx.zeros((2, 2))}
+
+        with (
+            patch(
+                "mlx_vlm.utils.load_config",
+                return_value={
+                    "model_type": "fake",
+                    "vision_config": {"hidden_size": 8, "num_hidden_layers": 2},
+                },
+            ),
+            patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+            patch(
+                "mlx_vlm.utils.get_model_and_args",
+                return_value=(fake_model_class, "fake"),
+            ),
+            pytest.raises(ValueError, match="Missing"),
+        ):
+            load_model(tmp_path, lazy=True)
+
 
 def test_load_safetensors_reinterprets_f8_e8m0_header(tmp_path):
     path = tmp_path / "model.safetensors"
@@ -799,6 +1125,169 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
     assert quantize.call_args.kwargs["group_size"] == 64
     assert quantize.call_args.kwargs["bits"] == 8
     assert quantize.call_args.kwargs["mode"] == "affine"
+
+
+def test_quantization_path_aliases_require_a_model_hook_for_model_specific_names():
+    module_path = "language_model.model.layers.0.ffn.shared_experts.gate_proj"
+
+    aliases = _quantization_path_aliases(module_path)
+
+    assert "model.layers.0.ffn.shared_experts.gate_proj" in aliases
+    assert "layers.0.ffn.shared_experts.gate_proj" not in aliases
+    assert "layers.0.ffn.shared_experts.w1" not in aliases
+
+
+def test_deepseek_v4_module_path_spelling_wins_over_sanitized_alias():
+    from mlx_vlm.models import deepseek_v4
+
+    class AliasModel(nn.Module):
+        @staticmethod
+        def quantization_path_aliases(path):
+            return deepseek_v4.Model.quantization_path_aliases(path)
+
+    module_path = "language_model.model.layers.0.ffn.shared_experts.gate_proj"
+    module_path_spec = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    sanitized_alias_spec = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    quantization = {
+        "model.layers.0.ffn.shared_experts.gate_proj": module_path_spec,
+        "layers.0.ffn.shared_experts.w1": sanitized_alias_spec,
+    }
+
+    resolved = _quantization_for_module_path(
+        quantization,
+        module_path,
+        AliasModel(),
+    )
+
+    assert resolved == module_path_spec
+
+
+def test_load_model_matches_deepseek_v4_quantization_aliases():
+    from mlx_vlm.models import deepseek_v4
+
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeDeepseekV4Model(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.language_model = nn.Module()
+            self.language_model.model = nn.Module()
+            self.language_model.model.layers = [nn.Module()]
+            self.language_model.model.layers[0].ffn = nn.Module()
+            self.language_model.model.layers[0].ffn.shared_experts = nn.Module()
+            self.language_model.model.layers[0].ffn.shared_experts.gate_proj = (
+                nn.Linear(64, 64, bias=False)
+            )
+            self.language_model.lm_head = nn.Linear(64, 64, bias=False)
+
+        def load_weights(self, weights, strict=True):
+            self.loaded_weights = weights
+            self.loaded_strict = strict
+
+        @staticmethod
+        def quantization_path_aliases(path):
+            return deepseek_v4.Model.quantization_path_aliases(path)
+
+    fake_model_class = SimpleNamespace(
+        ModelConfig=FakeConfig, Model=FakeDeepseekV4Model
+    )
+    mxfp8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    quantization = {
+        "group_size": 32,
+        "bits": 4,
+        "mode": "mxfp4",
+        "layers.0.ffn.shared_experts.w1": mxfp8,
+        "head": False,
+    }
+
+    with (
+        patch(
+            "mlx_vlm.utils.load_config",
+            return_value={
+                "model_type": "deepseek_v4",
+                "quantization": quantization,
+            },
+        ),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value={}),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "deepseek_v4"),
+        ),
+        patch("mlx_vlm.utils.nn.quantize") as quantize,
+    ):
+        load_model(Path("/tmp/model"), lazy=True)
+
+    predicate = quantize.call_args.kwargs["class_predicate"]
+    fake_model = FakeDeepseekV4Model(FakeConfig())
+    shared_expert_spec = predicate(
+        "language_model.model.layers.0.ffn.shared_experts.gate_proj",
+        fake_model.language_model.model.layers[0].ffn.shared_experts.gate_proj,
+    )
+    head_spec = predicate(
+        "language_model.lm_head",
+        fake_model.language_model.lm_head,
+    )
+
+    assert shared_expert_spec == mxfp8
+    assert head_spec == {}
+
+
+def test_load_model_uses_qwen_fine_grained_fp8_quantization_config():
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeQwenModel(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.proj = nn.Linear(128, 128, bias=False)
+
+        def load_weights(self, weights, strict=True):
+            self.loaded_weights = weights
+            self.loaded_strict = strict
+
+    fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeQwenModel)
+    source_config = {
+        "model_type": "qwen3_5",
+        "quantization_config": {
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "weight_block_size": [128, 128],
+        },
+    }
+
+    with (
+        patch("mlx_vlm.utils.load_config", return_value=source_config),
+        patch(
+            "mlx_vlm.utils.glob.glob",
+            return_value=["/tmp/model/model.safetensors"],
+        ),
+        patch(
+            "mlx_vlm.utils._load_safetensors",
+            return_value={
+                "proj.weight": mx.zeros((128, 32), dtype=mx.uint32),
+                "proj.scales": mx.zeros((128, 4), dtype=mx.uint8),
+            },
+        ),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "qwen3_5"),
+        ),
+        patch("mlx_vlm.utils.nn.quantize") as quantize,
+    ):
+        load_model(Path("/tmp/model"), lazy=True)
+
+    quantize.assert_called_once()
+    assert quantize.call_args.kwargs["group_size"] == 32
+    assert quantize.call_args.kwargs["bits"] == 8
+    assert quantize.call_args.kwargs["mode"] == "mxfp8"
 
 
 def test_load_model_quantizes_projector_with_scales_when_skip_vision():
@@ -1010,3 +1499,256 @@ class TestProcessImage:
             warnings.simplefilter("error")
             img = process_image(self._image(), None, None)
         assert img.size == (640, 480)
+
+
+class TestEstimateNumImageTokens:
+    def _processor(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+        return Qwen3VLImageProcessor()
+
+    def _actual_tokens(self, processor, width, height, **kwargs):
+        import numpy as np
+        from PIL import Image
+
+        img = Image.new("RGB", (width, height), color=(9, 30, 51))
+        grid = processor([img], **kwargs)["image_grid_thw"][0]
+        return int(np.prod(grid)) // processor.merge_size**2
+
+    @pytest.mark.parametrize(
+        "width,height",
+        [(64, 64), (640, 480), (1000, 1400), (2500, 1200), (333, 517)],
+    )
+    def test_estimate_matches_actual_processing(self, width, height):
+        processor = self._processor()
+        estimate = estimate_num_image_tokens(processor, height, width)
+        assert estimate == self._actual_tokens(processor, width, height)
+
+    @pytest.mark.parametrize("max_pixels", [256 * 256, 512 * 512])
+    def test_estimate_matches_actual_with_max_pixels(self, max_pixels):
+        processor = self._processor()
+        estimate = estimate_num_image_tokens(
+            processor, 1400, 1000, max_pixels=max_pixels
+        )
+        assert estimate == self._actual_tokens(
+            processor, 1000, 1400, max_pixels=max_pixels
+        )
+
+    def test_estimate_matches_actual_with_resized_dimensions(self):
+        processor = self._processor()
+        estimate = estimate_num_image_tokens(
+            processor, 1400, 1000, resized_height=448, resized_width=448
+        )
+        assert estimate == self._actual_tokens(
+            processor, 1000, 1400, resized_height=448, resized_width=448
+        )
+
+    def test_dispatcher_unwraps_wrapped_processor(self):
+        wrapped = SimpleNamespace(image_processor=self._processor())
+        direct = estimate_num_image_tokens(self._processor(), 480, 640)
+        assert estimate_num_image_tokens(wrapped, 480, 640) == direct
+
+    def test_unsupported_processor_raises(self):
+        with pytest.raises(NotImplementedError, match="num_image_tokens"):
+            estimate_num_image_tokens(SimpleNamespace(), 480, 640)
+
+
+def test_modelopt_mixed_drops_fp8_kv_cache_scales():
+    """ModelOpt emits per-layer KV-cache scales that MLX has no parameter for.
+
+    A real ``kv_cache_quant_algo: FP8`` export ships ``k_scale``/``v_scale`` on
+    every full-attention layer. MLX quantizes its KV cache at runtime, so these
+    must be dropped or ``load_weights(strict=True)`` rejects the checkpoint.
+    """
+    weights = {
+        "layer.weight": mx.arange(32, dtype=mx.uint8).reshape(2, 16),
+        "layer.weight_scale": mx.array([[56, 64], [72, 80]], dtype=mx.uint8),
+        "layer.weight_scale_2": mx.array(0.5, dtype=mx.float32),
+        "self_attn.k_proj.k_scale": mx.array(0.125, dtype=mx.float32),
+        "self_attn.v_proj.v_scale": mx.array(0.25, dtype=mx.float32),
+    }
+
+    transformed, quantization = _transform_modelopt_nvfp4_weights(
+        weights,
+        {"quant_method": "modelopt_mixed", "quant_algo": "MIXED_PRECISION"},
+    )
+
+    assert not any(
+        key.endswith(".k_scale") or key.endswith(".v_scale") for key in transformed
+    )
+    assert transformed["layer.weight"].dtype == mx.uint32
+    assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
+def test_modelopt_mixed_folds_many_tensors_without_exhausting_buffers():
+    """Folding must not accumulate one lazy graph across the whole checkpoint.
+
+    A 256-expert MoE export has tens of thousands of quantized tensors. If the
+    per-tensor folds are left unevaluated, the intermediates exceed Metal's
+    live-buffer limit and loading dies with ``[metal::malloc] Resource limit``.
+    24k tensors is below a real export (Apodex 1.1 mini NVFP4 has 30,720) but
+    above the point where an unbatched implementation fails.
+    """
+    count = 24000
+    weights = {}
+    for index in range(count):
+        weights[f"l.{index}.weight"] = mx.zeros((2, 16), dtype=mx.uint8)
+        weights[f"l.{index}.weight_scale"] = mx.zeros((2, 2), dtype=mx.uint8)
+        weights[f"l.{index}.weight_scale_2"] = mx.array(0.5, dtype=mx.float32)
+
+    transformed, _ = _transform_modelopt_nvfp4_weights(
+        weights,
+        {"quant_method": "modelopt_mixed", "quant_algo": "MIXED_PRECISION"},
+    )
+
+    assert len(transformed) == 2 * count
+    assert transformed[f"l.{count - 1}.scales"].dtype == mx.uint8
+
+
+@pytest.fixture(scope="module")
+def synthetic_video(tmp_path_factory):
+    """A deterministic 600-frame 64x64 clip at 30 fps, i.e. 20 seconds."""
+    cv2 = pytest.importorskip("cv2")
+    path = tmp_path_factory.mktemp("video") / "clip.mp4"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (64, 64))
+    for i in range(600):
+        writer.write(np.full((64, 64, 3), i % 256, np.uint8))
+    writer.release()
+    return str(path)
+
+
+class _AttributeVideoProcessor:
+    """A video processor naming its knobs the way load_video does."""
+
+    fps = 1.0
+    min_frames = 8
+    max_frames = 100
+
+
+class _HookVideoProcessor:
+    """A video processor whose cap is named something else entirely."""
+
+    num_frames = 32
+
+    def video_sampling_defaults(self):
+        return {"max_frames": self.num_frames}
+
+
+class TestVideoSampling:
+    def test_merge_fills_only_unset_fields(self):
+        merged = VideoSampling(fps=3.0).merge(VideoSampling(fps=1.0, max_frames=99))
+        assert merged.fps == 3.0
+        assert merged.max_frames == 99
+
+    def test_library_defaults_match_the_historical_load_video_signature(self):
+        assert DEFAULT_VIDEO_SAMPLING == VideoSampling(
+            fps=2.0, nframes=None, min_frames=4, max_frames=768, frame_factor=2
+        )
+
+
+class TestLoadVideo:
+    @pytest.mark.parametrize(
+        "kwargs,frames,sampled_fps",
+        [
+            ({}, 40, 2.0),
+            ({"fps": 0.5}, 10, 0.5),
+            ({"fps": 1.0}, 20, 1.0),
+            ({"fps": 8.0}, 160, 8.0),
+            ({"nframes": 12}, 12, 0.6),
+            ({"nframes": 7}, 8, 0.4),
+            ({"fps": 0.1, "min_frames": 30}, 30, 1.5),
+        ],
+    )
+    def test_frame_count_and_effective_fps(
+        self, synthetic_video, kwargs, frames, sampled_fps
+    ):
+        video, metadata = load_video(synthetic_video, **kwargs)
+        assert video.shape[0] == frames
+        assert metadata.sampled_fps == pytest.approx(sampled_fps)
+
+    @pytest.mark.parametrize(
+        "max_frames,frames,sampled_fps", [(8, 8, 0.4), (40, 40, 2.0), (768, 160, 8.0)]
+    )
+    def test_max_frames_clamps_the_requested_rate(
+        self, synthetic_video, max_frames, frames, sampled_fps
+    ):
+        """A cap below what ``fps`` asks for drags the effective rate well
+        under the requested one, which is what callers need reported back."""
+        video, metadata = load_video(synthetic_video, fps=8.0, max_frames=max_frames)
+        assert video.shape[0] == frames
+        assert metadata.sampled_fps == pytest.approx(sampled_fps)
+
+    def test_struct_and_keyword_forms_agree(self, synthetic_video):
+        by_struct = load_video(synthetic_video, VideoSampling(fps=8.0, max_frames=8))
+        by_kwargs = load_video(synthetic_video, fps=8.0, max_frames=8)
+        assert np.array_equal(by_struct[0], by_kwargs[0])
+        assert by_struct[1] == by_kwargs[1]
+
+    def test_struct_takes_precedence_over_keywords(self, synthetic_video):
+        _, metadata = load_video(synthetic_video, VideoSampling(fps=1.0), fps=8.0)
+        assert metadata.sampled_fps == pytest.approx(1.0)
+
+    def test_unknown_keyword_is_rejected(self, synthetic_video):
+        with pytest.raises(TypeError, match="fpss"):
+            load_video(synthetic_video, fpss=1.0)
+
+    def test_metadata_describes_the_source_clip(self, synthetic_video):
+        video, metadata = load_video(synthetic_video, fps=1.0)
+        assert metadata.total_num_frames == 600
+        assert metadata.fps == pytest.approx(30.0)
+        assert metadata.duration == pytest.approx(20.0)
+        assert (metadata.width, metadata.height) == (64, 64)
+        assert len(metadata.frames_indices) == video.shape[0]
+
+    def test_timestamps_span_the_clip_at_the_source_frame_rate(self, synthetic_video):
+        _, metadata = load_video(synthetic_video, fps=1.0)
+        assert metadata.timestamps[0] == pytest.approx(0.0)
+        assert metadata.timestamps[-1] == pytest.approx(20.0, abs=0.05)
+
+
+class TestProcessorVideoSampling:
+    def test_processor_without_a_video_component_declares_nothing(self):
+        assert processor_video_sampling(SimpleNamespace()) == VideoSampling()
+
+    def test_matching_attributes_are_picked_up(self):
+        processor = SimpleNamespace(video_processor=_AttributeVideoProcessor())
+        assert processor_video_sampling(processor) == VideoSampling(
+            fps=1.0, min_frames=8, max_frames=100
+        )
+
+    def test_hook_declares_a_differently_named_cap(self):
+        processor = SimpleNamespace(video_processor=_HookVideoProcessor())
+        assert processor_video_sampling(processor) == VideoSampling(max_frames=32)
+
+
+class TestResolveVideoSampling:
+    def test_falls_back_to_library_defaults(self):
+        assert resolve_video_sampling(SimpleNamespace(), {}) == DEFAULT_VIDEO_SAMPLING
+
+    def test_processor_beats_defaults(self):
+        processor = SimpleNamespace(video_processor=_AttributeVideoProcessor())
+        resolved = resolve_video_sampling(processor, {})
+        assert (resolved.fps, resolved.min_frames, resolved.max_frames) == (1.0, 8, 100)
+
+    def test_caller_beats_processor(self):
+        processor = SimpleNamespace(video_processor=_AttributeVideoProcessor())
+        resolved = resolve_video_sampling(processor, {"fps": 4.0, "max_frames": 20})
+        assert (resolved.fps, resolved.max_frames) == (4.0, 20)
+        assert resolved.min_frames == 8
+
+    def test_caller_beats_a_hook_declared_cap(self):
+        processor = SimpleNamespace(video_processor=_HookVideoProcessor())
+        assert resolve_video_sampling(processor, {"max_frames": 5}).max_frames == 5
+
+    def test_sampling_keys_do_not_travel_on_to_the_processor(self):
+        """The processor only ever sees frames that were already chosen, so
+        leaving these in kwargs would read as silently ignored."""
+        kwargs = {
+            "fps": 1.0,
+            "nframes": 4,
+            "min_frames": 6,
+            "max_frames": 20,
+            "temperature": 0.7,
+        }
+        resolve_video_sampling(SimpleNamespace(), kwargs)
+        assert kwargs == {"temperature": 0.7}

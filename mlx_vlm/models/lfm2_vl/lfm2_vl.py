@@ -144,7 +144,9 @@ class Model(nn.Module):
 
                 feature = feature[: img_feature_lengths[img_idx], :][None, ...]
 
-                feature_org_h, feature_org_w = spatial_shapes[img_idx]
+                feature_org_h, feature_org_w = (
+                    int(dim) for dim in spatial_shapes[img_idx]
+                )
                 feature = feature.reshape(1, feature_org_h, feature_org_w, -1)
                 feature = self.pixel_unshuffle(feature)
 
@@ -228,6 +230,9 @@ class Model(nn.Module):
                 key = key.replace(
                     "model.multi_modal_projector", "multi_modal_projector"
                 )
+
+            if key.startswith("model."):
+                key = "language_model." + key
 
             return key
 

@@ -203,6 +203,8 @@ class VisionModel(nn.Module):
             "qwen3_5_moe",
             "qwen3_5_vision",
             "qwen3_5_moe_vision",
+            "qwen4_exp",
+            "qwen4_exp_vision",
         ]:
             raise ValueError(f"Unsupported model type: {self.model_type}")
 
@@ -399,7 +401,7 @@ class VisionModel(nn.Module):
         cu_seqlens = []
         for i in range(batch_size):
             seq_len = grid_thw[i, 1] * grid_thw[i, 2]
-            cu_seqlens.append(mx.repeat(seq_len, grid_thw[i, 0]))
+            cu_seqlens.append(mx.repeat(seq_len, int(grid_thw[i, 0])))
 
         # Concatenate the cu_seqlens for all items in the batch
         cu_seqlens = mx.concatenate(cu_seqlens)

@@ -9,6 +9,37 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_reduce, tree_unflatten
 
+QUANTIZATION_MODE_DEFAULTS = {
+    "affine": (64, 4),
+    "mxfp4": (32, 4),
+    "nvfp4": (16, 4),
+    "mxfp8": (32, 8),
+}
+
+
+def get_quantization_params(
+    group_size: Optional[int],
+    bits: Optional[int],
+    mode: str,
+) -> dict:
+    if mode not in QUANTIZATION_MODE_DEFAULTS:
+        raise ValueError(f"Unsupported quantization mode: {mode}")
+    default_group_size, default_bits = QUANTIZATION_MODE_DEFAULTS[mode]
+    resolved_group_size = group_size or default_group_size
+    resolved_bits = bits or default_bits
+    if mode != "affine" and (resolved_group_size, resolved_bits) != (
+        default_group_size,
+        default_bits,
+    ):
+        raise ValueError(
+            f"{mode} requires group_size={default_group_size}, bits={default_bits}"
+        )
+    return {
+        "group_size": resolved_group_size,
+        "bits": resolved_bits,
+        "mode": mode,
+    }
+
 
 def get_total_parameters(model):
     leaf_modules = tree_flatten(
@@ -58,37 +89,56 @@ def quantize_model(
         Tuple: Tuple containing quantized model and config.
     """
 
-    def defaults_for_mode(mode, group_size, bits):
-        mode_defaults = {
-            "affine": (64, 4),
-            "mxfp4": (32, 4),
-            "nvfp4": (16, 4),
-            "mxfp8": (32, 8),
-        }
-        default_group_size, default_bits = mode_defaults[mode]
-        return group_size or default_group_size, bits or default_bits
-
     quantized_config = copy.deepcopy(config)
 
     quant_predicate = quant_predicate or getattr(model, "quant_predicate", None)
-    group_size, bits = defaults_for_mode(mode, group_size, bits)
-    quant_params = {"group_size": group_size, "bits": bits, "mode": mode}
+    quant_params = get_quantization_params(group_size, bits, mode)
+    group_size = quant_params["group_size"]
+    bits = quant_params["bits"]
     if "quantization" in quantized_config:
         # If the model is already partially quantized, return params so that
         # the config is set on a per-layer basis
         fine_grained_config = True
     else:
         fine_grained_config = False
-        quantized_config["quantization"] = quant_params
+        quantized_config["quantization"] = dict(quant_params)
 
     def wrapped_predicate(path, module):
         if not hasattr(module, "to_quantized"):
             return False
-        if module.weight.shape[-1] % group_size != 0:
-            return False
+
+        input_dims = module.weight.shape[-1]
         bool_or_params = True
-        if quant_predicate is not None:
+        default_group_is_compatible = input_dims % group_size == 0
+        if not default_group_is_compatible:
+            if quant_predicate is None:
+                return False
             bool_or_params = quant_predicate(path, module)
+            if not (
+                isinstance(bool_or_params, dict)
+                and "fallback_group_size" in bool_or_params
+            ):
+                return False
+        elif quant_predicate is not None:
+            bool_or_params = quant_predicate(path, module)
+
+        if isinstance(bool_or_params, dict) and "fallback_group_size" in bool_or_params:
+            overrides = dict(bool_or_params)
+            fallback_group_size = overrides.pop("fallback_group_size")
+            bool_or_params = {**quant_params, **overrides}
+            if (
+                input_dims % bool_or_params["group_size"]
+                and fallback_group_size is not None
+                and input_dims % fallback_group_size == 0
+            ):
+                bool_or_params["group_size"] = fallback_group_size
+        module_group_size = (
+            bool_or_params.get("group_size", group_size)
+            if isinstance(bool_or_params, dict)
+            else group_size
+        )
+        if input_dims % module_group_size != 0:
+            return False
         if isinstance(bool_or_params, dict):
             quantized_config["quantization"][path] = bool_or_params
         elif fine_grained_config and bool_or_params:
