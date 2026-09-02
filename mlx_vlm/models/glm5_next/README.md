@@ -58,6 +58,26 @@ proposes one token from the target's hidden state and the target verifies the
 See [`mlx_vlm/speculative/drafters/glm5_next_mtp/README.md`](../../speculative/drafters/glm5_next_mtp/README.md)
 for the split tool and usage.
 
+## Speculative decoding (DFlash2)
+
+GLM-5.3-Flash can also be driven by a **DFlash2** drafter -- a separate,
+multi-token block drafter (block size 8) trained against the target and published
+as `incoai/GLM-5.3-Flash-DFlash2`. Unlike the single-token nextn head it proposes
+a whole block per round, so acceptance clears the verify overhead by a wide
+margin.
+
+Each round the drafter reads the target's hidden state at the checkpoint's
+`target_layer_ids` and proposes a block; the target verifies the block in one
+forward and, on a partial accept, rolls the KDA recurrent state and the
+MLA/indexer caches back to the accepted prefix (the same rollback MTP uses).
+Output is bit-identical to plain decode.
+
+Target-side support is small: the model captures the per-layer hidden at
+`target_layer_ids` and returns it (with the KDA states) from the verify forward;
+the drafter, its round loop, and the converter are shared across DFlash targets.
+The drafter runs in bf16 as published -- it does not need quantizing to pair with
+a quantized target.
+
 ## Continuous batching
 
 Runs the batched `BatchGenerator` path unmodified. The lightning indexer's incremental

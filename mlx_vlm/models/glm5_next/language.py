@@ -795,6 +795,7 @@ class Glm5NextModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         gdn_sink: Optional[list] = None,
         hidden_sink: Optional[list] = None,
+        capture_layer_ids: Optional[list] = None,
     ) -> mx.array:
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
 
@@ -812,12 +813,15 @@ class Glm5NextModel(nn.Module):
         )
         h = mx.contiguous(h)
 
-        for layer, c in zip(self.layers, cache):
+        capture_set = set(capture_layer_ids) if capture_layer_ids else set()
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
             h = layer(h, mask=mask, cache=c, gdn_sink=gdn_sink)
+            if i in capture_set and hidden_sink is not None:
+                hidden_sink.append(h.mean(axis=2))
 
         h = h.mean(axis=2)
-        if hidden_sink is not None:
+        if hidden_sink is not None and not capture_set:
             hidden_sink.append(h)  # pre-final-norm hidden for the nextn drafter
         return self.norm(h)
 
@@ -846,12 +850,18 @@ class LanguageModel(nn.Module):
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         skip_logits = kwargs.pop("skip_logits", False)
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
-        # Speculative verify runs when a capture list is supplied: collect each KDA
+        # glm5_next verifies with a plain capturing forward (no exact kernel), so
+        # speculative_verify only needs to be consumed here.
+        kwargs.pop("speculative_verify", False)
+        # A capture list is supplied whenever a drafter is attached: collect each KDA
         # layer's per-step recurrent state so a round can be rolled back on rejection.
         gdn_sink: Optional[list] = [] if capture_layer_ids is not None else None
-        # Capture the pre-final-norm hidden for the nextn (MTP) drafter, which applies
-        # its own norm -- the DeepSeek-derived convention.
-        hidden_sink: Optional[list] = [] if return_hidden else None
+        # With a non-empty capture list the DFlash drafter reads the per-layer hidden;
+        # with an empty list (MTP) or return_hidden the nextn drafter reads the
+        # pre-final-norm hidden, applying its own norm (the DeepSeek-derived convention).
+        hidden_sink: Optional[list] = (
+            [] if (capture_layer_ids is not None or return_hidden) else None
+        )
 
         out = self.model(
             inputs,
@@ -859,6 +869,7 @@ class LanguageModel(nn.Module):
             inputs_embeds=inputs_embeds,
             gdn_sink=gdn_sink,
             hidden_sink=hidden_sink,
+            capture_layer_ids=capture_layer_ids,
         )
         # Only the last few positions' logits are ever needed for generation; slicing
         # before the (vocab-wide) projection skips it on discarded prefill positions.
