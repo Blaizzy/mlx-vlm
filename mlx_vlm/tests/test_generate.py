@@ -1455,6 +1455,65 @@ class TestBatchGenerator:
         ]
         assert warm_cache._idx == 10
 
+    @pytest.mark.parametrize(
+        "right_padding, keep",
+        [
+            ([2, 0], [1]),
+            ([2, 0], [0]),
+            ([2, 0, 0], [1, 2]),
+            ([1, 2, 0], [0, 2]),
+            ([0, 0], [1]),
+            (None, [1]),
+        ],
+    )
+    def test_cancel_prefill_finalizes_prepared_caches(self, right_padding, keep):
+        from mlx_vlm.models.cache import ArraysCache
+
+        def model(ids, *, cache, inputs_embeds=None, **kwargs):
+            if inputs_embeds is None:
+                inputs_embeds = mx.ones((*ids.shape, 4))
+            kv = inputs_embeds[:, None]
+            cache[0].update_and_fetch(kv, kv)
+            cache[1].advance(ids.shape[1])
+            return SimpleNamespace(logits=mx.zeros((*ids.shape, 16)))
+
+        padding = right_padding or [0, 0]
+        caches = [BatchKVCache([0] * len(padding)), ArraysCache(1)]
+        caches[1][0] = mx.zeros((len(padding), 4))
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=list(range(len(padding))),
+            input_ids=[list(range(1, 6 - pad)) for pad in padding],
+            max_tokens=[5] * len(padding),
+            inputs_embeds=mx.ones((len(padding), 5, 4)),
+            prompt_kwargs={},
+            warm_cache=caches,
+            right_pad_per_row=right_padding,
+            prefill_step_size=1,
+        )
+        batch.prompt_step()
+        batch.filter(keep)
+        while batch.needs_processing():
+            batch.prompt_step()
+
+        with contextlib.ExitStack() as stack:
+            finalizers = [
+                stack.enter_context(patch.object(c, "finalize", wraps=c.finalize))
+                for c in caches
+            ]
+            generation = batch.generate(
+                lambda logits: mx.argmax(logits, axis=-1), lambda _: False
+            )
+            for finalize in finalizers:
+                assert finalize.call_count == int(any(padding))
+
+        assert generation.prompt_cache[0]._right_padding is None
+        recurrent = generation.prompt_cache[1]
+        assert recurrent.lengths is None
+        assert recurrent.make_mask(1) is None
+        generation.next()
+        assert recurrent.lengths is None
+
     def test_prefill_filter_keeps_mrope_and_request_metadata_aligned(self, mock_model):
         positions = mx.arange(3 * 3 * 6).reshape(3, 3, 6)
         embeddings = mx.arange(3 * 6 * 4).reshape(3, 6, 4)

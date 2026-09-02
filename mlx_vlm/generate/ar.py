@@ -1803,6 +1803,7 @@ class PromptProcessingBatch:
 
         # Declare per-row right-padding on each cache so finalize() can roll
         # it into left-padding once the prefill forward pass is complete.
+        self._needs_cache_finalization = False
         if right_pad_per_row is not None and any(right_pad_per_row):
             for c in self.prompt_cache:
                 prepare = getattr(c, "prepare", None)
@@ -1813,6 +1814,7 @@ class PromptProcessingBatch:
                         "APC mixed prefill requires a prompt cache with prepare()"
                     )
                 prepare(right_padding=right_pad_per_row, lengths=self._suffix_lens)
+            self._needs_cache_finalization = True
 
         self.prefill_step_size = _default_prefill_step_size_for_offload(
             self.model, self.prefill_step_size, draft_model, DEFAULT_PREFILL_STEP_SIZE
@@ -1878,6 +1880,7 @@ class PromptProcessingBatch:
             self._inputs_embeds = None
             self._prompt_kwargs = {}
             self._prompt_length_aware_keys = []
+            self._needs_cache_finalization = False
 
         if self._apc_manager is not None:
             keep_set = set(keep)
@@ -2126,8 +2129,9 @@ class PromptProcessingBatch:
         mx.async_eval(first_tokens)
 
         # Roll any right-padding into left-padding so the cache decoded by
-        # GenerationBatch sees a canonical layout.
-        if self._right_pad_per_row is not None and any(self._right_pad_per_row):
+        # GenerationBatch sees a canonical layout. Prepared caches still need
+        # finalization if cancellation removed every right-padded row.
+        if self._needs_cache_finalization:
             for c in self.prompt_cache:
                 finalize = getattr(c, "finalize", None)
                 if not callable(finalize):
@@ -2137,6 +2141,7 @@ class PromptProcessingBatch:
                         "APC mixed prefill requires a prompt cache with finalize()"
                     )
                 finalize()
+            self._needs_cache_finalization = False
         if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
             c0 = self.prompt_cache[0] if self.prompt_cache else None
             if c0 is not None:
