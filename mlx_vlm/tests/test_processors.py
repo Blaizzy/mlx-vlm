@@ -3561,6 +3561,43 @@ class TestQwen4ExpPatch(unittest.TestCase):
         )
 
 
+class TestQwen3VLEmbeddingPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
+            "qwen3_vl_embedding",
+            "mlx_vlm.models.qwen3_vl_embedding",
+            "Qwen3VLProcessor",
+        )
+
+    def test_does_not_fall_through_to_torch_gated_hf_processor(self):
+        # Regression test: embedding checkpoints ship with model_type
+        # "qwen3_vl_embedding", distinct from "qwen3_vl". Before this class
+        # registered its own patch, AutoProcessor fell through to
+        # transformers' real Qwen3VLProcessor, which hard-requires
+        # torch/torchvision to build its video sub-processor even though the
+        # embedding server never uses one.
+        import importlib
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        importlib.import_module("mlx_vlm.models.qwen3_vl_embedding")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps({"model_type": "qwen3_vl_embedding"})
+            )
+            try:
+                AutoProcessor.from_pretrained(tmpdir)
+            except Exception as e:
+                err = str(e).lower()
+                self.assertNotIn("requires the pytorch library", err)
+                self.assertNotIn("requires the torchvision library", err)
+
+
 class TestQwen3OmniMoePatch(unittest.TestCase):
     def test_patch_intercepts_without_hf_video_processor(self):
         import json
