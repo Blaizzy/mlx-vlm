@@ -347,20 +347,30 @@ class Glm5NextIndexer(nn.Module):
         kv_len = T
         kv_pos = mx.arange(T)
 
-        # Incremental pooling at decode: complete pools are stable across steps, so
-        # recompute only the suffix (last partial pool + any new pool) and reuse the
-        # cached complete pools -- turns the per-step pool cost from O(T) to O(kpool).
-        # Exact; falls back to full pooling on prefill, when padding is present, or when
-        # the cached pool's batch axis no longer matches the current batch. That last
-        # guard matters under continuous batching: BatchGenerator grows/shrinks the
-        # batch (extend/filter) on the batch axis but does not carry this per-cache
-        # _pool along, so a stale _pool must be discarded and rebuilt for one step.
+        # Incremental pooling: complete pools are stable across steps, so recompute
+        # only the suffix (last partial pool + the new tokens) and reuse the cached
+        # complete pools -- turns the per-step pool cost from O(T) to O(kpool + S).
+        # Exact for any S: pools completed before s0 cannot change, because s0 is a
+        # multiple of index_kpool and new tokens only ever append. Falls back to full
+        # pooling on the first pass, when padding is present, or when the cached
+        # pool's batch axis no longer matches the current batch. That last guard
+        # matters under continuous batching: BatchGenerator grows/shrinks the batch
+        # (extend/filter) on the batch axis but does not carry this per-cache _pool
+        # along, so a stale _pool must be discarded and rebuilt for one step.
+        #
+        # The length check matters for speculative decoding: a rejection trims the
+        # KV cache, so a pool built at the pre-trim length would still describe the
+        # rejected tokens. Requiring it to match the cache length before this step's
+        # new tokens forces a rebuild after any trim. And `_no_pad` only records
+        # whether padding was present at the last full rebuild, so the new tokens are
+        # checked separately -- single-stream decode passes no mask and short-circuits.
         if (
-            S == 1
-            and cache is not None
+            cache is not None
             and getattr(cache, "_pool", None) is not None
             and getattr(cache, "_no_pad", False)
             and cache._pool[0].shape[0] == B
+            and cache._pool[3] == T - S
+            and (mask is None or bool(mx.all(valid_cur)))
         ):
             ck, ci, cv, t_prev = cache._pool
             n_stable = t_prev // self.index_kpool
