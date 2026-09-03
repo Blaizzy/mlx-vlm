@@ -374,8 +374,8 @@ def process_tool_calls(model_output: str, tool_module, tools):
                                 },
                             },
                         )
-                except Exception:
-                    logger.warning("Invalid tool call: %s", call)
+                except Exception as exc:
+                    logger.warning("Invalid tool call %r: %s", call, exc)
     return dict(calls=called_tools, remaining_text=remaining)
 
 

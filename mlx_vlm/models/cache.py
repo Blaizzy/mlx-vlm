@@ -346,6 +346,76 @@ class QuantizedKVCache(_BaseCache):
             self.keys, self.values, self.offset, self.group_size, self.bits
         )
 
+    def prefix_cache_snapshot(self):
+        """Capture the packed cache state without a float round-trip."""
+        state = (None, None) if self.keys is None else self.state
+        return {"state": state, "meta_state": self.meta_state}
+
+    def prefix_cache_restore(self, snapshot):
+        """Restore a native packed snapshot into a fresh cache."""
+        self.__init__()
+        self.state = snapshot["state"]
+        self.meta_state = snapshot["meta_state"]
+
+    def prefix_cache_reserve(self, min_capacity_tokens):
+        """Reserve packed capacity for the first post-restore update."""
+        if self.keys is None or self.values is None:
+            return ()
+        needed = int(min_capacity_tokens)
+        capacity = int(self.keys[0].shape[2])
+        if needed <= capacity:
+            return self.keys, self.values
+        capacity = ((needed + self.step - 1) // self.step) * self.step
+        pad_tokens = capacity - int(self.keys[0].shape[2])
+        pad = [(0, 0), (0, 0), (0, pad_tokens), (0, 0)]
+        self.keys = tuple(mx.pad(part, pad) for part in self.keys)
+        self.values = tuple(mx.pad(part, pad) for part in self.values)
+        return self.keys, self.values
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        """Merge packed rows directly into ``BatchQuantizedKVCache``.
+
+        Empty float ``KVCache`` rows are accepted because continuous batching
+        represents cold rows with the model's fresh, unquantized cache layout.
+        """
+        if not rows or len(rows) != len(prefix_lens):
+            return None
+
+        def is_cold_empty(row):
+            return type(row) is KVCache and row.keys is None and row.values is None
+
+        for row in rows:
+            if isinstance(row, QuantizedKVCache):
+                if row.group_size != self.group_size or row.bits != self.bits:
+                    return None
+            elif not is_cold_empty(row):
+                return None
+
+        prefix_lens = [int(length) for length in prefix_lens]
+        if any(
+            int(row.offset) != length
+            for row, length in zip(rows, prefix_lens)
+            if isinstance(row, QuantizedKVCache)
+        ):
+            return None
+
+        batch_rows = []
+        for row in rows:
+            batch = BatchQuantizedKVCache(
+                [0], group_size=self.group_size, bits=self.bits
+            )
+            if isinstance(row, QuantizedKVCache) and row.keys is not None:
+                batch.keys = row.keys
+                batch.values = row.values
+                batch._idx = int(row.offset)
+                batch.offset = mx.array([row.offset])
+            batch_rows.append(batch)
+
+        out = batch_rows[0]
+        for batch in batch_rows[1:]:
+            out.extend(batch)
+        return out
+
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 

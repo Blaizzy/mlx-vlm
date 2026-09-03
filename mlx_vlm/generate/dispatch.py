@@ -2,6 +2,7 @@ import argparse
 import codecs
 import json
 import logging
+import sys
 import time
 from collections.abc import Sequence
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
@@ -49,6 +50,40 @@ from .image import (
 from .video_generation import DEFAULT_VIDEO_STEPS, run_video_generation_cli
 
 logger = logging.getLogger("mlx_vlm.generate")
+
+
+def _video_sampling(args):
+    """The frame-sampling overrides the user actually set."""
+    from ..utils import VideoSampling
+
+    return VideoSampling(
+        fps=args.fps,
+        nframes=getattr(args, "video_num_frames", None),
+        min_frames=getattr(args, "video_min_frames", None),
+        max_frames=getattr(args, "video_max_frames", None),
+    )
+
+
+def _video_sampling_kwargs(args) -> dict:
+    """``_video_sampling`` flattened for generate()'s keyword interface."""
+    from dataclasses import asdict
+
+    return {k: v for k, v in asdict(_video_sampling(args)).items() if v is not None}
+
+
+def _enable_verbose_logging() -> None:
+    """Surface mlx_vlm's INFO records, such as how a video got sampled."""
+    package_logger = logging.getLogger("mlx_vlm")
+    if not any(
+        getattr(handler, "_mlx_vlm_verbose", False)
+        for handler in package_logger.handlers
+    ):
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler._mlx_vlm_verbose = True
+        package_logger.addHandler(handler)
+    package_logger.setLevel(logging.INFO)
+
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
@@ -201,11 +236,24 @@ def parse_arguments():
         help="Frames-per-second to sample from --video.",
     )
     parser.add_argument(
+        "--video-num-frames",
+        type=int,
+        default=None,
+        help="Exact number of frames to sample from --video, overriding --fps.",
+    )
+    parser.add_argument(
+        "--video-min-frames",
+        type=int,
+        default=None,
+        help="Lower bound on the frames sampled from --video.",
+    )
+    parser.add_argument(
         "--video-max-frames",
         type=int,
-        default=16,
-        help="Cap on frames sent when video falls back to ordered images "
-        "(long clips are re-sampled evenly to this count).",
+        default=None,
+        help="Upper bound on the frames taken from --video. Falls back to 16 "
+        "for processors without native video support, which are sent evenly "
+        "re-sampled stills instead.",
     )
     parser.add_argument(
         "--resize-shape",
@@ -815,6 +863,11 @@ def stream_generate(
         cached = vision_cache.get(image)
         if cached is not None:
             kwargs["cached_image_features"] = cached
+        elif hasattr(model, "encode_images"):
+            features = model.encode_images(pixel_values, **kwargs)
+            mx.eval(*features)
+            vision_cache.put(image, features)
+            kwargs["cached_image_features"] = features
         elif hasattr(model, "encode_image"):
             features = model.encode_image(pixel_values)
             mx.eval(features)
@@ -1186,6 +1239,10 @@ def generate(
         text += response.text
         last_response = response
 
+    clean_output = getattr(processor, "clean_output", None)
+    if callable(clean_output):
+        text = clean_output(text)
+
     if last_response is None:
         return GenerationResult(text=text, peak_memory=mx.get_peak_memory() / 1e9)
 
@@ -1327,7 +1384,9 @@ def main():
             max_frames = max(2, getattr(args, "video_max_frames", 16) or 16)
             pair_hook = getattr(model, "prepare_video_frame_pairs", None)
             if pair_hook is not None:
-                frames, frame_fps = sample_video_frames(args.video, args.fps or 2.0)
+                frames, frame_fps = sample_video_frames(
+                    args.video, args.fps or 2.0, _video_sampling(args)
+                )
                 anchors, first_frames, second_frames = pair_adjacent_frames(
                     frames, max_frames
                 )
@@ -1361,6 +1420,7 @@ def main():
                     images=args.image,
                     fps=args.fps or 2.0,
                     max_frames=max_frames,
+                    sampling=_video_sampling(args),
                 )
                 print(
                     f"{processor.__class__.__name__} has no native video "
@@ -1425,6 +1485,9 @@ def main():
             kwargs["thinking_start_token"] = args.thinking_start_token
 
     if args.chat:
+        if args.verbose:
+            _enable_verbose_logging()
+
         from ..vision_cache import VisionFeatureCache
 
         vision_cache = VisionFeatureCache()
@@ -1456,6 +1519,7 @@ def main():
                 "frequency_penalty": args.frequency_penalty,
                 "frequency_context_size": args.frequency_context_size,
                 "vision_cache": vision_cache,
+                **_video_sampling_kwargs(args),
                 **kwargs,
             }
             if args.resize_shape is not None:
@@ -1491,7 +1555,7 @@ def main():
             "image": args.image,
             "audio": args.audio,
             "video": args.video,
-            "fps": args.fps,
+            **_video_sampling_kwargs(args),
             "temperature": args.temperature,
             "top_p": args.top_p,
             "top_k": args.top_k,
@@ -1527,6 +1591,9 @@ def main():
             gen_kwargs["draft_kind"] = args.draft_kind
             if args.draft_block_size is not None:
                 gen_kwargs["draft_block_size"] = args.draft_block_size
+
+        if args.verbose:
+            _enable_verbose_logging()
 
         result = generate(
             model,

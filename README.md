@@ -58,6 +58,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
 | MiniCPM-V 4.6 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
 | GLiNER2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gliner2_5/README.md) |
+| LLaVA-OneVision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/llava_onevision/README.md) |
 
 ## Installation
 
@@ -1437,6 +1438,7 @@ The following models support video chat:
 3. Idefics3
 4. LLaVA
 5. MiniMax M3
+6. LLaVA-OneVision
 
 With more coming soon.
 

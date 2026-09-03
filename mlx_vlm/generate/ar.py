@@ -465,8 +465,13 @@ def generate_step(
             else None
         )
         checkpoint_done = False
+        # Chunk whenever there is more than one prompt token left to process.
+        # The chunk loop discards its output, so the [B, N, vocab] logits are
+        # never evaluated; the unchunked path feeds the whole prompt to _step,
+        # which reads logits[:, -1, :] and so materializes every row. Gating on
+        # prefill_step_size made short prompts peak higher than long ones.
         should_chunk = (
-            prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size
+            prefill_step_size is not None and inputs_embeds.shape[1] > 1
         ) or (
             checkpoint_len is not None and 0 < checkpoint_len < inputs_embeds.shape[1]
         )
@@ -662,6 +667,85 @@ def _split_prompt_kwargs_per_row(prompt_kwargs: dict, batch_size: int) -> List[d
             for row in rows:
                 row[k] = v
     return rows
+
+
+def _unpad_batch_prompts(
+    prompts: Union[mx.array, List[List[int]]],
+    attention_mask: Optional[mx.array],
+    prompt_kwargs: List[dict],
+) -> Tuple[List[List[int]], List[dict]]:
+    """Convert a masked dense batch to the generator's ragged row format.
+
+    ``BatchGenerator`` owns prompt padding and derives cache offsets from the
+    row lengths it receives. Remove processor padding, together with the
+    corresponding columns of every sequence-aligned prompt tensor, before the
+    rows are added to its queue.
+    """
+    if attention_mask is None:
+        if isinstance(prompts, mx.array):
+            if prompts.ndim != 2:
+                raise ValueError("Batched prompts must be a 2D array")
+            return prompts.tolist(), prompt_kwargs
+        return prompts, prompt_kwargs
+
+    if not isinstance(attention_mask, mx.array) or attention_mask.ndim != 2:
+        raise ValueError("attention_mask must be a 2D MLX array")
+
+    if isinstance(prompts, mx.array):
+        if prompts.ndim != 2 or attention_mask.shape != prompts.shape:
+            raise ValueError("attention_mask must have the same 2D shape as prompts")
+        batch_size, sequence_length = prompts.shape
+        # Materialize the tokenizer outputs together. Both are converted to
+        # Python metadata below, so one explicit boundary avoids row-by-row
+        # GPU syncs.
+        mx.eval(prompts, attention_mask)
+        input_rows = prompts.tolist()
+    else:
+        batch_size, sequence_length = attention_mask.shape
+        if len(prompts) != batch_size or any(
+            len(row) != sequence_length for row in prompts
+        ):
+            raise ValueError("attention_mask must have the same 2D shape as prompts")
+        mx.eval(attention_mask)
+        input_rows = [list(row) for row in prompts]
+
+    if len(prompt_kwargs) != batch_size:
+        raise ValueError("prompt_kwargs must contain one dictionary per prompt")
+
+    mask_rows = attention_mask.tolist()
+
+    unpadded_prompts: List[List[int]] = []
+    for row_idx, (ids, row_mask, kwargs) in enumerate(
+        zip(input_rows, mask_rows, prompt_kwargs)
+    ):
+        start = next((i for i, value in enumerate(row_mask) if bool(value)), None)
+        if start is None:
+            raise ValueError(f"attention_mask row {row_idx} contains no prompt tokens")
+        stop = sequence_length - next(
+            (i for i, value in enumerate(reversed(row_mask)) if bool(value)), 0
+        )
+        if any(not bool(value) for value in row_mask[start:stop]):
+            raise ValueError("attention_mask must contain one contiguous prompt span")
+
+        unpadded_prompts.append(ids[start:stop])
+        if start == 0 and stop == sequence_length:
+            continue
+
+        for key, value in list(kwargs.items()):
+            if not isinstance(value, mx.array):
+                continue
+            if key == "inputs_embeds":
+                sequence_aligned = value.ndim >= 2 and value.shape[1] == sequence_length
+            else:
+                sequence_aligned = _is_sequence_aligned_prompt_kwarg(
+                    key, value, sequence_length
+                )
+            if sequence_aligned:
+                kwargs[key] = _slice_sequence_aligned_prompt_kwarg(
+                    key, value, start=start, stop=stop
+                )
+
+    return unpadded_prompts, prompt_kwargs
 
 
 def _is_sequence_aligned_prompt_kwarg(
@@ -1665,7 +1749,6 @@ class PromptProcessingBatch:
         apc_manager: Optional["_apc.APCManager"] = None,
         apc_coordinator: Optional["_apc.APCCoordinator"] = None,
         right_pad_per_row: Optional[List[int]] = None,
-        existing_left_padding: Optional[List[int]] = None,
         suffix_lens: Optional[List[int]] = None,
         apc_mode: Optional[str] = None,
         draft_model: Optional[nn.Module] = None,
@@ -1701,11 +1784,6 @@ class PromptProcessingBatch:
             self._input_ids = _right_pad_prompts(input_ids, max_length=max_length)
         else:
             left_padding = [max_length - l for l in lengths]
-            if existing_left_padding is not None:
-                left_padding = [
-                    pad + int(existing)
-                    for pad, existing in zip(left_padding, existing_left_padding)
-                ]
             self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
         self._left_padding_per_row = list(left_padding)
         self._total_prompt_tokens = sum(lengths)
@@ -1851,7 +1929,9 @@ class PromptProcessingBatch:
             return self._next_apc_checkpoint_column() is not None
         if self._next_apc_checkpoint_column() is not None:
             return True
-        return self._inputs_embeds.shape[1] > self.prefill_step_size
+        # See the note in stream_generate: prompts at or below prefill_step_size
+        # would otherwise skip chunking and materialize the full logits tensor.
+        return self._inputs_embeds.shape[1] > 1
 
     def _apc_checkpoint_column_for_meta(
         self, batch_idx: int, meta: dict
@@ -2276,7 +2356,6 @@ class BatchGenerator:
         completion_batch_size: int = DEFAULT_COMPLETION_BATCH_SIZE,
         prefill_batch_size: int = DEFAULT_PREFILL_BATCH_SIZE,
         prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
-        existing_left_padding: Optional[List[int]] = None,
         prompt_cache=None,
         kv_bits=None,
         kv_key_bits=None,
@@ -2351,7 +2430,6 @@ class BatchGenerator:
             top_logprobs_k=self.top_logprobs_k,
             greedy_sampling=self.greedy_sampling,
         )
-        self._existing_left_padding = existing_left_padding
         self._prompt_batch: Optional[PromptProcessingBatch] = None
         self._unprocessed_sequences = []
 
@@ -2692,14 +2770,24 @@ class BatchGenerator:
             List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
         ] = None,
         thinking_budget_criteria: Optional[List[Any]] = None,
+        attention_mask: Optional[mx.array] = None,
     ):
+        """Queue prompts, consuming tokenizer padding metadata when provided.
+
+        A dense ``prompts`` array may include tokenizer padding when accompanied
+        by a same-shaped ``attention_mask``. The padded columns are removed from
+        tokens and sequence-aligned prompt tensors before anything is queued.
+        """
         uids = []
 
         if max_tokens is None or isinstance(max_tokens, int):
             max_tokens = [max_tokens or self.max_tokens] * len(prompts)
 
         if prompt_kwargs is None:
-            prompt_kwargs = [{}] * len(prompts)
+            prompt_kwargs = [{} for _ in range(len(prompts))]
+        prompts, prompt_kwargs = _unpad_batch_prompts(
+            prompts, attention_mask, prompt_kwargs
+        )
         if logits_processors is None:
             logits_processors = [self.logits_processors] * len(prompts)
         elif len(logits_processors) != len(prompts):
@@ -2930,7 +3018,6 @@ class BatchGenerator:
             self._prompt_batch = prompt_batch_cls(
                 model=self.model,
                 uids=uids,
-                existing_left_padding=getattr(self, "_existing_left_padding", None),
                 input_ids=input_ids,
                 max_tokens=max_tokens_list,
                 inputs_embeds=inputs_embeds,
@@ -3298,19 +3385,12 @@ def _generate_batch(
             kwargs["prefill_step_size"] = None
 
     # Use batch_size for prefill and completion to ensure consistent processing
-    existing_left_padding = None
-    if mask is not None and getattr(mask, "ndim", 0) == 2:
-        pads = [int(v) for v in (mask.shape[1] - mask.sum(axis=1)).tolist()]
-        if any(pads):
-            existing_left_padding = pads
-
     gen = BatchGenerator(
         model.language_model,
         processor,
         prefill_batch_size=batch_size,
         completion_batch_size=batch_size,
         compute_logprobs=False,
-        existing_left_padding=existing_left_padding,
         **kwargs,
     )
 
@@ -3322,11 +3402,13 @@ def _generate_batch(
             for _ in range(batch_size)
         ]
 
+    prompt_kwargs = _split_prompt_kwargs_per_row(gen_kwargs, batch_size)
     uids = gen.insert(
-        input_ids.tolist(),
+        input_ids,
         max_tokens,
-        prompt_kwargs=_split_prompt_kwargs_per_row(gen_kwargs, batch_size),
+        prompt_kwargs=prompt_kwargs,
         logits_processors=logits_processors,
+        attention_mask=mask,
     )
     results = {uid: [] for uid in uids}
 

@@ -320,7 +320,7 @@ class TestSnapshotPromptCacheRow:
         assert not isinstance(snap[0], BatchKVCache)
         assert not isinstance(snap[1], BatchQuantizedKVCache)
         assert isinstance(snap[0], KVCache)
-        assert isinstance(snap[1], KVCache)
+        assert isinstance(snap[1], QuantizedKVCache)
         assert snap[0].offset == seq_len
         assert snap[1].offset == seq_len
 
@@ -551,7 +551,7 @@ class TestAlwaysExtractSemantics:
         assert isinstance(row[0], QuantizedKVCache)
         cloned = _clone_prompt_cache_for_apc(row)
         assert cloned is not None
-        assert isinstance(cloned[0], KVCache)
+        assert isinstance(cloned[0], QuantizedKVCache)
 
     def test_snapshot_equivalent_for_b1_whether_or_not_batch(self):
         from mlx_vlm.apc import snapshot_prompt_cache_row
@@ -738,7 +738,7 @@ class TestBatchTurboQuantParity:
         assert isinstance(row[0], TurboQuantKVCache)
         cloned = _clone_prompt_cache_for_apc(row)
         assert cloned is not None
-        assert isinstance(cloned[0], KVCache)
+        assert isinstance(cloned[0], TurboQuantKVCache)
 
     def test_layer_kv_for_apc_batch_turbo(self):
         from mlx_vlm.apc import layer_kv_for_apc

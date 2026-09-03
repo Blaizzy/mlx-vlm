@@ -103,19 +103,7 @@ def _parse_tolerant_tool_call(text: str) -> dict[str, Any]:
     }
 
 
-def parse_tool_call(text: str, tools: Any | None = None):
-    try:
-        expression = ast.parse(text.strip(), mode="eval").body
-    except SyntaxError as exc:
-        try:
-            return _parse_tolerant_tool_call(text)
-        except ValueError as fallback_exc:
-            raise fallback_exc from exc
-
-    if not isinstance(expression, ast.List) or len(expression.elts) != 1:
-        raise ValueError("Expected a single tool call inside a list.")
-
-    call = expression.elts[0]
+def _parse_call(call: ast.expr) -> dict[str, Any]:
     if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
         raise TypeError("Expected a named function call.")
     if call.args:
@@ -135,6 +123,22 @@ def parse_tool_call(text: str, tools: Any | None = None):
             ) from exc
 
     return {"name": call.func.id, "arguments": arguments}
+
+
+def parse_tool_call(text: str, tools: Any | None = None):
+    try:
+        expression = ast.parse(text.strip(), mode="eval").body
+    except SyntaxError as exc:
+        try:
+            return _parse_tolerant_tool_call(text)
+        except ValueError as fallback_exc:
+            raise fallback_exc from exc
+
+    if not isinstance(expression, ast.List) or not expression.elts:
+        raise ValueError("Expected one or more tool calls inside a list.")
+
+    calls = [_parse_call(call) for call in expression.elts]
+    return calls[0] if len(calls) == 1 else calls
 
 
 tool_call_start = "<|tool_call_start|>"
