@@ -190,7 +190,7 @@ class ShortConv1d(nn.Module):
             padding=0,
         )
 
-    def __call__(self, x, state, mask, lengths):
+    def __call__(self, x, state, mask, lengths, return_input=False):
         if mask is not None:
             x = mx.where(mask[..., None], x, 0)
         if state is None:
@@ -206,6 +206,8 @@ class ShortConv1d(nn.Module):
             ends = mx.clip(lengths, 0, x.shape[1])
             positions = (ends[:, None] + mx.arange(keep))[..., None]
             state = mx.take_along_axis(conv_input, positions, axis=1)
+        if return_input:
+            return output, state, conv_input
         return output, state
 
 
@@ -235,7 +237,30 @@ class Glm5NextLinearAttention(nn.Module):
         self.o_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.o_proj = nn.Linear(self.projection_dim, config.hidden_size, bias=False)
 
-    def __call__(self, x, mask=None, cache=None):
+    def __call__(
+        self,
+        x,
+        mask=None,
+        cache=None,
+        rollback_sink=None,
+        linear_fn=None,
+        output_linear_fn=None,
+        timewise_fn=None,
+        output_gate_fn=None,
+        scaled_norm_fn=None,
+    ):
+        linear_fn = linear_fn or (lambda linear, inputs: linear(inputs))
+        output_linear_fn = output_linear_fn or linear_fn
+        timewise_fn = timewise_fn or (lambda fn, inputs: fn(inputs))
+        output_gate_fn = output_gate_fn or (
+            lambda norm, output, gate: norm(output) * mx.sigmoid(gate)
+        )
+        scaled_norm_fn = scaled_norm_fn or (
+            lambda inputs, scale, eps: timewise_fn(
+                lambda values: scale * mx.fast.rms_norm(values, None, eps),
+                inputs,
+            )
+        )
         batch, length, _ = x.shape
         if mask is not None and mask.dtype == mx.bool_:
             x = mx.where(mask[..., None], x, 0)
@@ -254,7 +279,18 @@ class Glm5NextLinearAttention(nn.Module):
             ssm_state = cache[3]
             lengths = cache.lengths
 
-        qkv, qkv_state = self.qkv_conv(self.qkv_proj(x), qkv_state, mask, lengths)
+        qkv_out = self.qkv_conv(
+            linear_fn(self.qkv_proj, x),
+            qkv_state,
+            mask,
+            lengths,
+            return_input=rollback_sink is not None,
+        )
+        if rollback_sink is None:
+            qkv, qkv_state = qkv_out
+            conv_input = None
+        else:
+            qkv, qkv_state, conv_input = qkv_out
         q, k, v = mx.split(qkv, 3, axis=-1)
         if cache is not None:
             cache[0] = qkv_state
@@ -263,16 +299,17 @@ class Glm5NextLinearAttention(nn.Module):
         shape = (batch, length, self.num_heads, self.head_dim)
         q, k, v = q.reshape(shape), k.reshape(shape), v.reshape(shape)
         eps = 1e-6 / self.head_dim
-        q = (self.scale**2) * mx.fast.rms_norm(q, None, eps)
-        k = self.scale * mx.fast.rms_norm(k, None, eps)
+        q = scaled_norm_fn(q, self.scale**2, eps)
+        k = scaled_norm_fn(k, self.scale, eps)
 
         f_a, b, g_a = mx.split(
-            self.fbg_a_proj(x),
+            linear_fn(self.fbg_a_proj, x),
             (self.head_dim, self.head_dim + self.num_heads),
             axis=-1,
         )
-        a = self.f_b_proj(f_a).reshape(shape)
+        a = linear_fn(self.f_b_proj, f_a).reshape(shape)
         b = b.reshape(batch, length, self.num_heads)
+        initial_state = ssm_state
         out, ssm_state = gated_delta_update(
             q,
             k,
@@ -286,13 +323,32 @@ class Glm5NextLinearAttention(nn.Module):
             use_kernel=not self.training,
             lower_bound=self.lower_bound,
         )
+        if rollback_sink is not None:
+            rollback_sink.append(
+                (
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
+                    self.A_log.reshape(self.num_heads, 1),
+                    self.dt_bias.reshape(self.num_heads, self.head_dim),
+                    initial_state,
+                    mask,
+                    conv_input,
+                    self.conv_kernel,
+                    self.lower_bound,
+                    qkv_state,
+                    ssm_state,
+                )
+            )
         if cache is not None:
             cache[3] = ssm_state
             cache.advance(length)
 
-        gate = self.g_b_proj(g_a).reshape(shape)
-        out = (self.o_norm(out) * mx.sigmoid(gate)).reshape(batch, length, -1)
-        return self.o_proj(out)
+        gate = linear_fn(self.g_b_proj, g_a).reshape(shape)
+        out = output_gate_fn(self.o_norm, out, gate).reshape(batch, length, -1)
+        return output_linear_fn(self.o_proj, out)
 
 
 def _batch_gather(values: mx.array, indices: mx.array) -> mx.array:
@@ -552,14 +608,40 @@ class Glm5NextIndexer(nn.Module):
         pool_cache=None,
         hierarchy_cache=None,
         offset=0,
+        cache_update_sink=None,
+        linear_fn=None,
+        projected=None,
     ):
+        linear_fn = linear_fn or (lambda linear, inputs: linear(inputs))
         batch, q_length, _ = x.shape
-        k = self.k_norm(self.wk(x))
-        gate = x.astype(mx.float32) @ self.index_kpool_compress_gate.T
+        if projected is None:
+            k = self.k_norm(linear_fn(self.wk, x))
+            if cache_update_sink is None:
+                gate = x.astype(mx.float32) @ self.index_kpool_compress_gate.T
+            else:
+                gate = mx.concatenate(
+                    [
+                        x[:, index : index + 1].astype(mx.float32)
+                        @ self.index_kpool_compress_gate.T
+                        for index in range(q_length)
+                    ],
+                    axis=1,
+                )
+            projected_q = projected_weights = None
+        else:
+            k, gate, projected_q, projected_weights = projected
         if padding_mask is None:
             query_valid = mx.ones((batch, q_length), dtype=mx.bool_)
         else:
             query_valid = padding_mask.astype(mx.bool_)
+        if cache_update_sink is not None:
+            cache_update_sink.update(
+                indexer=self,
+                index_keys=k,
+                index_gates=gate.astype(k.dtype),
+                query_valid=query_valid,
+                cache_offset=offset,
+            )
         if cache is not None:
             valid_state, _ = cache.update_and_fetch(
                 query_valid[:, None, :, None],
@@ -638,10 +720,17 @@ class Glm5NextIndexer(nn.Module):
                     self.softmax_scale,
                 )
             else:
-                q = self.wq_b(q_resid).reshape(
-                    batch, q_length, self.n_heads, self.head_dim
-                )
-                weights = self.weights_proj(x).astype(mx.float32) * self.n_heads**-0.5
+                q = projected_q
+                if q is None:
+                    q = linear_fn(self.wq_b, q_resid).reshape(
+                        batch, q_length, self.n_heads, self.head_dim
+                    )
+                weights = projected_weights
+                if weights is None:
+                    weights = (
+                        linear_fn(self.weights_proj, x).astype(mx.float32)
+                        * self.n_heads**-0.5
+                    )
                 # Keep the score matmul in the model dtype, as serving runtimes
                 # do, then aggregate heads in FP32. Query chunking bounds the
                 # [B, chunk, H, pools] temporary while evaluating every pool.
@@ -706,6 +795,19 @@ class Glm5NextIndexer(nn.Module):
                     self.softmax_scale,
                 )
 
+            # ``argpartition`` guarantees the selected set, but not its order.
+            # Ragged speculative batches can represent the same logical history
+            # with different physical padding, which otherwise changes the SDPA
+            # reduction order (and eventually close logit decisions).  Restore
+            # chronological pool order and keep invalid slots at the end.
+            selection_order = mx.argsort(
+                mx.where(selected_valid, selected, pool_count), axis=-1
+            )
+            selected = mx.take_along_axis(selected, selection_order, axis=-1)
+            selected_valid = mx.take_along_axis(
+                selected_valid, selection_order, axis=-1
+            )
+
             safe_selected = mx.clip(selected, 0, max(pool_count - 1, 0))
             expanded_pools = mx.broadcast_to(
                 pool_indices[:, None],
@@ -725,8 +827,10 @@ class Glm5NextIndexer(nn.Module):
                 -1,
             )
 
-        # Keep the pooled-key region at a fixed width so the optional tail
-        # always occupies the same slots across ragged batch rows.
+        # Keep the complete-pool region at a fixed width before appending the
+        # partial tail.  Otherwise the tail's attention slot depends on the
+        # largest pool count in another batch row, changing fused-SDPA
+        # reduction order for an otherwise identical logical sequence.
         if topk.shape[-1] < self.index_topk:
             topk = mx.pad(
                 topk,
@@ -734,7 +838,6 @@ class Glm5NextIndexer(nn.Module):
                 constant_values=-1,
             )
         topk = topk[..., : self.index_topk]
-
         output_width = self.index_topk
         if self.always_select_tail and self.index_kpool > 1:
             tail_width = self.index_kpool - 1
@@ -763,12 +866,6 @@ class Glm5NextIndexer(nn.Module):
             topk = mx.concatenate([topk, mx.where(tail_valid, tail, -1)], axis=-1)
             output_width += tail_width
 
-        if topk.shape[-1] < output_width:
-            topk = mx.pad(
-                topk,
-                [(0, 0), (0, 0), (0, output_width - topk.shape[-1])],
-                constant_values=-1,
-            )
         topk = topk[..., :output_width]
         return mx.where(query_valid[..., None], topk, -1).astype(mx.int32)
 
@@ -862,6 +959,7 @@ class Glm5NextAttention(nn.Module):
         padding_mask=None,
         cache=None,
         prev_topk_indices=None,
+        last_only: bool = False,
     ):
         batch, length, _ = x.shape
         q_a, kv_a = mx.split(self.qkv_a_proj(x), (self.q_lora_rank,), axis=-1)
@@ -947,9 +1045,13 @@ class Glm5NextAttention(nn.Module):
             else:
                 keys = self.embed_q(latent, transpose=False)
                 values = self.unembed_out(latent)
+            if last_only:
+                q = q[:, :, -1:]
+                topk = topk[:, -1:]
             out = _sparse_prefill_attention(q, keys, values, topk, self.scale)
 
-        out = out.transpose(0, 2, 1, 3).reshape(batch, length, -1)
+        output_length = 1 if last_only and length > 1 else length
+        out = out.transpose(0, 2, 1, 3).reshape(batch, output_length, -1)
         return self.o_proj(out), topk
 
 
@@ -1049,6 +1151,8 @@ class Glm5NextTextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    mtp_speculative_speedup_supported = True
+
     def __init__(self, config: TextConfig):
         super().__init__()
         self.args = config

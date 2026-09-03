@@ -20,6 +20,7 @@ from mlx.utils import tree_flatten, tree_map
 import mlx_vlm.models.deepseek_v4.language as deepseek_language
 import mlx_vlm.models.gemma4.language as gemma4_language
 import mlx_vlm.models.glm5_next.language as glm5_next_language
+import mlx_vlm.models.glm5_next.speculative_verifier as glm5_next_verifier
 import mlx_vlm.models.laguna.language as laguna_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.models.qwen3_5.speculative_verifier as qwen_verifier
@@ -36,6 +37,10 @@ from mlx_vlm.models.cache import (
     KVCache,
     PoolingCache,
     RotatingKVCache,
+)
+from mlx_vlm.models.glm5_next.speculative_kernels import (
+    exact_quantized_block_argmax,
+    exact_quantized_block_linear,
 )
 from mlx_vlm.quantization.one_bit import OneBitLinear
 from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
@@ -97,6 +102,7 @@ from mlx_vlm.speculative.utils import (
     _speculative_walk_batch_uniform_acceptance,
     _speculative_walk_deferred_greedy,
     speculative_prefill_kwargs,
+    speculative_runtime_supported,
 )
 from mlx_vlm.split_mtp import split_mtp
 from mlx_vlm.turboquant import BatchTurboQuantKVCache
@@ -1815,15 +1821,15 @@ def test_speculative_walk_batch_deferred_uniform_stops_at_batch_rejection():
     assert fake_head.calls == 1
 
 
-def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):
+def test_mtp_server_singleton_dispatches_prompt_aware_single_rounds(monkeypatch):
     calls = []
 
     def fake_batch(*args, **kwargs):
-        calls.append(("batch", args, kwargs))
-        yield [3], None
+        raise AssertionError("server MTP singleton should use single round path")
 
     def fake_single(*args, **kwargs):
-        raise AssertionError("server MTP singleton should use batch round path")
+        calls.append((args, kwargs))
+        yield 3, None
 
     monkeypatch.setattr(speculative_utils, "_mtp_rounds_batch", fake_batch)
     monkeypatch.setattr(speculative_utils, "_mtp_rounds", fake_single)
@@ -1831,7 +1837,7 @@ def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):
     result = list(
         speculative_utils.run_speculative_server_rounds(
             SimpleNamespace(language_model=SimpleNamespace()),
-            SimpleNamespace(),
+            SimpleNamespace(config=SimpleNamespace(block_size=2)),
             prompt_cache=[],
             hidden=mx.zeros((1, 1, 1), dtype=mx.float32),
             shared_kv_states={},
@@ -1841,14 +1847,15 @@ def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):
             sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
             token_dtype=mx.int32,
             greedy_sampling=False,
+            prompt_tokens=mx.array([[7, 8]], dtype=mx.int32),
             row_ids=[0],
         )
     )
 
     assert result == [([3], None)]
     assert calls
-    assert calls[0][2]["first_bonus"].tolist() == [2]
-    assert calls[0][2]["row_ids"] == [0]
+    assert calls[0][1]["first_bonus"] == 2
+    assert calls[0][1]["prompt_tokens"].tolist() == [[7, 8]]
 
 
 def test_dflash_server_singleton_dispatches_single_rounds(monkeypatch):
@@ -3920,6 +3927,168 @@ def test_glm5_next_mtp_draft_block_smoke():
     mx.eval(tokens)
     assert tokens.shape == (1, 1)
     assert drafter.config.runtime_block_size == 2
+    assert not drafter.prefer_requested_block_size
+
+
+def test_glm5_next_mtp_last_only_commit_preserves_cache_and_final_output():
+    text_config = _tiny_glm5_next_text_config()
+    drafter = Glm5NextMTPDraftModel(
+        Glm5NextMTPConfig(text_config=text_config, block_size=2)
+    )
+    drafter.apply(
+        lambda value: (
+            value.astype(mx.bfloat16)
+            if isinstance(value, mx.array) and value.dtype == mx.float32
+            else value
+        )
+    )
+
+    full_cache = drafter.make_cache()[0]
+    last_cache = drafter.make_cache()[0]
+    inputs = mx.arange(2 * text_config.hidden_size, dtype=mx.bfloat16).reshape(
+        1, 2, text_config.hidden_size
+    )
+
+    full_output = drafter.mtp_block(inputs, cache=full_cache)
+    last_output = drafter.mtp_block(inputs, cache=last_cache, last_only=True)
+    mx.eval(full_output, last_output, full_cache.state, last_cache.state)
+
+    assert full_output.shape == (1, 2, text_config.hidden_size)
+    assert last_output.shape == (1, 1, text_config.hidden_size)
+    assert mx.array_equal(full_output[:, -1:], last_output).item()
+
+    for full_subcache, last_subcache in zip(
+        full_cache.caches, last_cache.caches, strict=True
+    ):
+        assert full_subcache.meta_state == last_subcache.meta_state
+        for (_, full_value), (_, last_value) in zip(
+            tree_flatten(full_subcache.state),
+            tree_flatten(last_subcache.state),
+            strict=True,
+        ):
+            if full_value is None or last_value is None:
+                assert full_value is last_value
+            else:
+                assert mx.array_equal(full_value, last_value).item()
+
+
+def test_glm5_next_hc_ingress_fusion_is_single_batch_only(monkeypatch):
+    text_config = _tiny_glm5_next_text_config()
+    connection = glm5_next_language.HyperConnection(text_config)
+    norm = nn.RMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
+    inputs = mx.zeros(
+        (2, 2, text_config.hc_mult, text_config.hidden_size),
+        dtype=mx.float32,
+    )
+    calls = []
+
+    def fused(_connection, _norm, value):
+        calls.append(value.shape[0])
+        return (
+            mx.zeros((1, 2, text_config.hidden_size)),
+            mx.zeros((1, 2, text_config.hc_mult)),
+            mx.zeros((1, 2, text_config.hc_mult, text_config.hc_mult)),
+        )
+
+    monkeypatch.setattr(glm5_next_verifier, "exact_hc_normalized_norm", fused)
+    glm5_next_language._SPECULATIVE_VERIFIER._hc_norm(connection, norm, inputs)
+    assert calls == []
+
+    glm5_next_language._SPECULATIVE_VERIFIER._hc_norm(connection, norm, inputs[:1])
+    assert calls == [1]
+
+
+def test_glm5_next_mtp_speed_guard_falls_back_until_verifier_is_break_even():
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(mtp_speculative_speedup_supported=False)
+    )
+    drafter = SimpleNamespace(
+        requires_accelerated_target_verifier=True,
+        force_speculative=False,
+    )
+
+    with pytest.warns(RuntimeWarning, match="Base decoding will be used"):
+        assert not speculative_runtime_supported(target, drafter, "mtp")
+    assert drafter._speed_guard_warned
+
+    drafter.force_speculative = True
+    assert speculative_runtime_supported(target, drafter, "mtp")
+
+    drafter.force_speculative = False
+    target.language_model.mtp_speculative_speedup_supported = True
+    assert speculative_runtime_supported(target, drafter, "mtp")
+
+    drafter.max_speculative_batch_size = 1
+    assert not speculative_runtime_supported(
+        target, drafter, "mtp", batch_size=2, warn=False
+    )
+    assert speculative_runtime_supported(
+        target, drafter, "mtp", batch_size=1, warn=False
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "bits", "group_size", "batches"),
+    [
+        ("affine", 4, 64, (1, 2, 4)),
+        ("affine", 5, 64, (2, 4)),
+        ("mxfp8", 8, 32, (1, 2, 4)),
+    ],
+)
+def test_glm5_next_quantized_block_linear_keeps_decode_arithmetic(
+    mode,
+    bits,
+    group_size,
+    batches,
+):
+    mx.random.seed(21)
+    dense = nn.Linear(512, 16, bias=False)
+    dense.weight = dense.weight.astype(mx.bfloat16)
+    linear = nn.QuantizedLinear.from_linear(
+        dense,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+
+    for batch in batches:
+        inputs = mx.random.normal((batch, 2, 512)).astype(mx.bfloat16)
+        expected = mx.concatenate(
+            [linear(mx.contiguous(inputs[:, index : index + 1])) for index in range(2)],
+            axis=1,
+        )
+        actual = exact_quantized_block_linear(linear, inputs)
+        assert actual is not None
+        mx.eval(expected, actual)
+        assert mx.array_equal(actual, expected).item()
+        if mode == "affine" and batch > 1:
+            actual_tokens = exact_quantized_block_argmax(linear, inputs)
+            assert actual_tokens is not None
+            expected_tokens = mx.argmax(expected, axis=-1)
+            mx.eval(actual_tokens, expected_tokens)
+            assert mx.array_equal(actual_tokens, expected_tokens).item()
+
+
+def test_glm5_next_short_affine_block_uses_decode_exact_batch_fallback():
+    mx.random.seed(22)
+    dense = nn.Linear(128, 32, bias=False)
+    dense.weight = dense.weight.astype(mx.bfloat16)
+    linear = nn.QuantizedLinear.from_linear(
+        dense,
+        group_size=64,
+        bits=4,
+        mode="affine",
+    )
+    inputs = mx.random.normal((2, 2, 128)).astype(mx.bfloat16)
+    expected = mx.concatenate(
+        [linear(mx.contiguous(inputs[:, index : index + 1])) for index in range(2)],
+        axis=1,
+    )
+
+    assert exact_quantized_block_linear(linear, inputs) is None
+    actual = glm5_next_language._SPECULATIVE_VERIFIER._block_linear(linear, inputs)
+    mx.eval(expected, actual)
+    assert mx.array_equal(actual, expected).item()
 
 
 def test_glm5_next_mtp_sampler_state_tolerates_uninitialized_kv_cache():
@@ -3985,9 +4154,10 @@ def test_glm5_next_mtp_batch_acceptance_keeps_ragged_rows_aligned():
     assert drafter._cache[0][2].remainder == [0, 1]
     assert not drafter.requires_uniform_batch_acceptance
     assert drafter.supports_ragged_batch_acceptance
+    assert drafter.max_speculative_batch_size == 4
 
 
-def test_glm5_next_target_rollback_replays_ragged_rows():
+def test_glm5_next_target_rollback_restores_ragged_rows_without_model_replay():
     text_config = _tiny_glm5_next_text_config()
     language = glm5_next_language.LanguageModel(text_config)
     language.eval()
@@ -3997,9 +4167,14 @@ def test_glm5_next_target_rollback_replays_ragged_rows():
     _, _, rollback_state = language.speculative_verify_hidden(
         mx.array([[5, 6], [7, 8]], dtype=mx.int32), cache
     )
-    language.rollback_speculative_cache(
-        cache, rollback_state, accepted=[1, 0], block_size=2
-    )
+    with patch.object(
+        glm5_next_language.LanguageModel,
+        "__call__",
+        side_effect=AssertionError("rollback must not replay the target model"),
+    ):
+        language.rollback_speculative_cache(
+            cache, rollback_state, accepted=[1, 0], block_size=2
+        )
 
     sparse_cache = cache[1]
     mx.eval(sparse_cache[0].offset, sparse_cache[0].left_padding)

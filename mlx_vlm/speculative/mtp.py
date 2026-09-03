@@ -819,6 +819,7 @@ def _mtp_rounds_batch(
     hidden: mx.array,
     shared_kv_states: dict,
     *,
+    prompt_tokens: Optional[mx.array] = None,
     first_bonus: mx.array,
     max_tokens: int,
     sampler: Callable[[mx.array], mx.array],
@@ -848,8 +849,10 @@ def _mtp_rounds_batch(
     row_ids = list(range(B)) if row_ids is None else list(row_ids)
     block_total = _dflash_block_total(draft_model, draft_block_size)
     configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
+    L_prefill, positions = _mtp_cache_positions(prompt_cache, B)
+    left_padding = [L_prefill - position for position in positions]
     if getattr(draft_model, "supports_ragged_batch_acceptance", False):
-        draft_model.reset(model, left_padding=[0] * B)
+        draft_model.reset(model, left_padding=left_padding)
     else:
         draft_model.reset(model)
     sampler_rng = _SpeculativeSamplerRNG(
@@ -857,6 +860,19 @@ def _mtp_rounds_batch(
         enabled=not greedy_sampling
         and not _sampler_supports_positioned_target(sampler),
     )
+
+    prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
+    if callable(prefill_draft) and prompt_tokens is not None:
+        sampler_rng.draft_call(
+            prefill_draft,
+            prompt_tokens,
+            hidden,
+            first_bonus,
+            sampler,
+            token_dtype,
+            left_padding=left_padding,
+            **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
+        )
 
     # First-round hidden: prefill output may have shape [B, L, H]; reduce
     # to a single slot per row (last prompt token's hidden — see comment in
@@ -868,7 +884,6 @@ def _mtp_rounds_batch(
     # Per-row state. ``positions`` stores each row's valid target-KV length.
     # All rows start at ``L_prefill`` and advance by ``accepted_i + 1`` per
     # round.
-    L_prefill, positions = _mtp_cache_positions(prompt_cache, B)
     draft_model.set_shared_kv(
         shared_kv_states,
         kv_offset=L_prefill,

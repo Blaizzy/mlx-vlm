@@ -40,9 +40,15 @@ class Glm5NextMTPBlock(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-    def __call__(self, x, cache=None):
+    def __call__(self, x, cache=None, last_only: bool = False):
         residual = x
-        attention, _ = self.self_attn(self.input_layernorm(x), cache=cache)
+        attention, _ = self.self_attn(
+            self.input_layernorm(x),
+            cache=cache,
+            last_only=last_only,
+        )
+        if last_only and x.shape[1] > 1:
+            residual = residual[:, -1:]
         x = residual + attention
         return x + self.mlp(self.post_attention_layernorm(x))
 
@@ -53,6 +59,8 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
     prefer_requested_block_size = False
     requires_uniform_batch_acceptance = False
     supports_ragged_batch_acceptance = True
+    max_speculative_batch_size = 4
+    requires_accelerated_target_verifier = True
 
     def __init__(self, config: Glm5NextMTPConfig):
         nn.Module.__init__(self)
@@ -88,6 +96,7 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
         self._position = 0
         self._draft_round = 0
         self._round_cache_snapshot = None
+        self._last_only = False
         self.accept_lens: List[int] = []
         self.draft_lens: List[int] = []
 
@@ -125,6 +134,7 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
         self._next_position = 0
         self._round_appended = 0
         self._round_cache_snapshot = None
+        self._last_only = False
         return self._cache
 
     def draft_eval_state(self):
@@ -192,7 +202,11 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
         h = self.eh_proj(
             mx.concatenate([self.enorm(token_embed), self.hnorm(hidden)], axis=-1)
         )
-        h = self.mtp_block(h, None if cache is None else cache[0])
+        h = self.mtp_block(
+            h,
+            None if cache is None else cache[0],
+            last_only=self._last_only,
+        )
         h = self.shared_head_norm(h)
         return h, h
 
@@ -204,9 +218,48 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
                 for subcache in cache.caches:
                     if isinstance(subcache, (KVCache, BatchKVCache)):
                         snapshots.append(None)
+                    elif isinstance(subcache, PoolingCache):
+                        remainder = int(subcache.remainder)
+                        total = remainder + 1
+                        overwrite = (
+                            total % subcache.ratio if total >= subcache.ratio else total
+                        )
+                        preserve = min(remainder, overwrite)
+                        snapshots.append(
+                            (
+                                "pooling",
+                                remainder,
+                                (
+                                    None
+                                    if preserve == 0 or subcache.buf_kv is None
+                                    else _clone_tree(subcache.buf_kv[:, :preserve])
+                                ),
+                                (
+                                    None
+                                    if preserve == 0 or subcache.buf_gate is None
+                                    else _clone_tree(subcache.buf_gate[:, :preserve])
+                                ),
+                                (
+                                    None
+                                    if subcache.pooled is None
+                                    else subcache.pooled.shape[1]
+                                ),
+                            )
+                        )
+                    elif isinstance(subcache, HierarchyCache):
+                        snapshots.append(
+                            (
+                                "hierarchy",
+                                subcache.buffer,
+                                subcache.representatives,
+                                list(subcache.remainders),
+                                list(subcache.representative_lengths),
+                            )
+                        )
                     else:
                         snapshots.append(
                             (
+                                "full",
                                 _clone_tree(subcache.state),
                                 _clone_tree(subcache.meta_state),
                             )
@@ -226,7 +279,31 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
                 if snapshot is None:
                     subcache.trim(self._round_appended)
                     continue
-                state, meta_state = snapshot
+                kind = snapshot[0]
+                if kind == "pooling":
+                    _, remainder, buf_kv, buf_gate, pooled_length = snapshot
+                    subcache.remainder = remainder
+                    if buf_kv is not None:
+                        subcache.buf_kv[:, : buf_kv.shape[1]] = buf_kv
+                        subcache.buf_gate[:, : buf_gate.shape[1]] = buf_gate
+                    subcache.pooled = (
+                        None
+                        if pooled_length is None
+                        else subcache.pooled[:, :pooled_length]
+                    )
+                    continue
+                if kind == "hierarchy":
+                    (
+                        _,
+                        subcache.buffer,
+                        subcache.representatives,
+                        remainders,
+                        representative_lengths,
+                    ) = snapshot
+                    subcache.remainders = list(remainders)
+                    subcache.representative_lengths = list(representative_lengths)
+                    continue
+                _, state, meta_state = snapshot
                 subcache.meta_state = _clone_tree(meta_state)
                 subcache.state = _clone_tree(state)
         self._next_position = _clone_tree(self._round_snapshot_position)
@@ -237,7 +314,11 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
         if accepted is None and len(args) >= 3:
             accepted = args[2]
         self._restore_untrimmable_round(int(accepted))
-        super().accept_verified_tokens(*args, **kwargs)
+        self._last_only = True
+        try:
+            super().accept_verified_tokens(*args, **kwargs)
+        finally:
+            self._last_only = False
         self._round_cache_snapshot = None
 
     def accept_verified_tokens_batch(
