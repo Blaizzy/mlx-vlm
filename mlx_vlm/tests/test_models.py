@@ -3954,9 +3954,7 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.array_equal(sequential, verified).item())
 
     def test_glm5_next_mtp_split_dequantizes_fine_grained_fp8(self):
-        from mlx_vlm.speculative.drafters.glm5_next_mtp.split import (
-            Glm5NextMTPSplitter,
-        )
+        from mlx_vlm.speculative.drafters.glm5_next_mtp.split import Glm5NextMTPSplitter
 
         weight = mx.full((128, 128), 56, dtype=mx.uint8)
         scale_inv = mx.full((1, 1), 2.0, dtype=mx.bfloat16)
