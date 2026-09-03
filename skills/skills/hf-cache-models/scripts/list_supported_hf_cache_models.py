@@ -10,8 +10,8 @@ from huggingface_hub import scan_cache_dir
 from huggingface_hub.constants import HF_HUB_CACHE
 from huggingface_hub.errors import CacheNotFound
 
-# Mirrors the server /v1/models cache filter (mlx_vlm/server/app.py: models_endpoint).
-# Keep in sync with that endpoint; a cached repo is "server-visible" when these hold.
+# Mirrors the opt-in server /v1/models cache filter used by
+# --model-discovery hf-cache (mlx_vlm/server/app.py: models_endpoint).
 REQUIRED_FILES = {"config.json", "tokenizer_config.json"}
 
 
@@ -95,7 +95,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "List Hugging Face cache model repos that MLX-VLM can expose through "
-            "the server /v1/models endpoint."
+            "the server's opt-in hf-cache discovery mode."
         )
     )
     parser.add_argument(
@@ -112,7 +112,7 @@ def main() -> None:
         action="store_true",
         help=(
             "Also require an mlx_vlm arch for the model_type (folder in mlx_vlm/models). "
-            "Narrows the list from 'server-visible' to 'probably loadable by mlx-vlm'."
+            "Narrows the list from 'cache candidate' to 'probably loadable by mlx-vlm'."
         ),
     )
     args = parser.parse_args()

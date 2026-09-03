@@ -10,6 +10,7 @@ from .common import (
     _batch_cache_left_padding,
     _dflash_block_total,
     _record_speculative_round,
+    _requires_uniform_batch_acceptance,
     _speculative_walk,
     _speculative_walk_batch,
     _speculative_walk_batch_uniform_acceptance,
@@ -375,11 +376,12 @@ def _mtp_use_uniform_deferred_walk(
     n_active: int,
     greedy_sampling: bool,
     sampler: Callable[[mx.array], mx.array],
+    target_model: Optional[nn.Module] = None,
 ) -> bool:
     if n_active <= 1:
         return False
 
-    if getattr(draft_model, "requires_uniform_batch_acceptance", False):
+    if _requires_uniform_batch_acceptance(draft_model, target_model):
         return True
 
     if _sampler_supports_positioned_target(sampler):
@@ -1090,7 +1092,7 @@ def _mtp_rounds_batch(
             sampler_rng.sync_draft_to_target()
             if (
                 n_active > 1
-                and getattr(draft_model, "requires_uniform_batch_acceptance", False)
+                and _requires_uniform_batch_acceptance(draft_model, lm)
                 and len(set(accepted_list)) > 1
             ):
                 accepted_list, new_tokens_list = (
@@ -1108,6 +1110,7 @@ def _mtp_rounds_batch(
                 n_active=n_active,
                 greedy_sampling=greedy_sampling,
                 sampler=sampler,
+                target_model=lm,
             ):
                 accepted_list, new_tokens_list = (
                     _speculative_walk_batch_deferred_uniform(

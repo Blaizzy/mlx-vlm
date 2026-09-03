@@ -18,8 +18,7 @@ import pytest
 
 from mlx_vlm.apc import (
     APCManager,
-    _cache_entry_supports_block_apc,
-    _cache_entry_supports_exact_apc,
+    DiskBlockStore,
     _clone_cache_entry_for_apc,
     _clone_prompt_cache_for_apc,
     harvest_blocks_from_batch_cache,
@@ -28,7 +27,9 @@ from mlx_vlm.apc import (
     make_warm_batch_kv_cache_multi,
     make_warm_kv_cache,
     model_apc_mode,
+    snapshot_prompt_cache_row,
 )
+from mlx_vlm.apc_adapters import apc_block_eligible, apc_exact_eligible
 from mlx_vlm.generate.ar import _extend_cache, _make_cache
 from mlx_vlm.models.cache import (
     ArraysCache,
@@ -57,6 +58,40 @@ def _rand_kv(batch=B, seq_len=32, heads=H, dim=D):
 
 def _max_abs_error(a: mx.array, b: mx.array) -> float:
     return mx.max(mx.abs(a - b)).item()
+
+
+def _array_leaves(value):
+    if isinstance(value, mx.array):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [leaf for item in value for leaf in _array_leaves(item)]
+    if isinstance(value, dict):
+        return [leaf for item in value.values() for leaf in _array_leaves(item)]
+    return []
+
+
+def _assert_packed_state_equal(lhs, rhs):
+    lhs_leaves = _array_leaves(lhs)
+    rhs_leaves = _array_leaves(rhs)
+    assert len(lhs_leaves) == len(rhs_leaves)
+    for left, right in zip(lhs_leaves, rhs_leaves):
+        assert left.dtype == right.dtype
+        assert left.shape == right.shape
+        assert bool(mx.array_equal(left, right).item())
+
+
+def _disk_roundtrip(tmp_path, namespace, token_ids, snapshot):
+    disk = DiskBlockStore(tmp_path, namespace=namespace)
+    manager = APCManager(num_blocks=1, block_size=BLOCK_SIZE, disk=disk)
+    assert manager.store_exact_cache(token_ids, snapshot)
+    disk._q.join()
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace=namespace)
+    manager = APCManager(num_blocks=1, block_size=BLOCK_SIZE, disk=disk)
+    restored = manager.lookup_exact_cache(token_ids + [999])
+    manager.close()
+    return restored
 
 
 # ---------------------------------------------------------------------------
@@ -401,18 +436,18 @@ class TestCacheEntrySupport:
     def test_quantized_supports_block_apc(self):
         """QuantizedKVCache should be recognized as block-APC compatible."""
         cache = QuantizedKVCache(group_size=GROUP_SIZE, bits=BITS)
-        assert _cache_entry_supports_block_apc(cache) is True
+        assert apc_block_eligible(cache) is True
 
     def test_quantized_supports_exact_apc(self):
         """QuantizedKVCache should be recognized as exact-APC compatible."""
         cache = QuantizedKVCache(group_size=GROUP_SIZE, bits=BITS)
-        assert _cache_entry_supports_exact_apc(cache) is True
+        assert apc_exact_eligible(cache) is True
 
     def test_plain_kv_still_works(self):
         """Existing KVCache support is not broken."""
         cache = KVCache()
-        assert _cache_entry_supports_block_apc(cache) is True
-        assert _cache_entry_supports_exact_apc(cache) is True
+        assert apc_block_eligible(cache) is True
+        assert apc_exact_eligible(cache) is True
 
 
 # ---------------------------------------------------------------------------
@@ -566,9 +601,9 @@ class TestExactModeQuantized:
         mx.eval(batch_kv.keys, batch_q.keys)
 
         prompt_cache = [arrays, batch_kv, batch_q]
-        assert all(_cache_entry_supports_exact_apc(c) for c in prompt_cache)
+        assert all(apc_exact_eligible(c) for c in prompt_cache)
 
-        # Clone path: BatchKVCache collapses to KVCache; quant dequants to KVCache.
+        # Batch KV collapses to KVCache; quantized state stays packed.
         eval_targets: list = []
         cloned_bk = _clone_cache_entry_for_apc(
             batch_kv, min_capacity_tokens=None, eval_targets=eval_targets
@@ -581,7 +616,7 @@ class TestExactModeQuantized:
         assert len(cloned) == 3
         assert isinstance(cloned[0], ArraysCache)
         assert isinstance(cloned[1], KVCache)
-        assert isinstance(cloned[2], KVCache)
+        assert isinstance(cloned[2], QuantizedKVCache)
 
         manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE)
         stored = manager.store_exact_cache(token_ids, prompt_cache, extra_hash=0)
@@ -594,6 +629,119 @@ class TestExactModeQuantized:
         assert matched_tokens == len(token_ids)
         assert warm is not None
         assert len(warm) == 3
+
+
+class TestNativePackedExactCheckpoints:
+    def test_uniform_roundtrip_and_merge_stay_packed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+        seq_len = 32
+        token_ids = list(range(seq_len))
+        source = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
+        keys, values = _rand_kv(seq_len=seq_len)
+        source.update_and_fetch(keys, values)
+        mx.eval(source.state)
+        expected = source.extract(0)
+
+        def fail(*args, **kwargs):
+            raise AssertionError("native exact APC must not quantize or dequantize")
+
+        monkeypatch.setattr(QuantizedKVCache, "dequantize_for_apc", fail)
+        monkeypatch.setattr(mx, "quantize", fail)
+
+        snapshot = snapshot_prompt_cache_row([source], batch_idx=0)
+        assert snapshot is not None
+        assert isinstance(snapshot[0], QuantizedKVCache)
+        _assert_packed_state_equal(snapshot[0].state, expected.state)
+
+        warm, matched = make_warm_batch_exact_cache_multi(
+            [snapshot, [KVCache()]],
+            [seq_len, 0],
+            kv_quant_config={
+                "bits": BITS,
+                "group_size": GROUP_SIZE,
+                "scheme": "uniform",
+            },
+        )
+        assert matched == seq_len
+        assert warm is not None
+        assert isinstance(warm[0], BatchQuantizedKVCache)
+        _assert_packed_state_equal(warm[0].extract(0).state, expected.state)
+
+        restored, matched = _disk_roundtrip(
+            tmp_path, "native-uniform", token_ids, snapshot
+        )
+        assert matched == seq_len
+        assert restored is not None
+        assert isinstance(restored[0], QuantizedKVCache)
+        _assert_packed_state_equal(restored[0].state, snapshot[0].state)
+
+    @pytest.mark.parametrize(
+        "bits,key_bits,value_bits",
+        [
+            pytest.param(4.0, None, None, id="integer"),
+            pytest.param(3.5, None, None, id="fractional-budget"),
+            pytest.param(3.5, 3.5, 3.5, id="fractional-split-codecs"),
+        ],
+    )
+    def test_turboquant_disk_roundtrip_preserves_packed_state(
+        self, tmp_path, monkeypatch, bits, key_bits, value_bits
+    ):
+        from mlx_vlm.turboquant import TurboQuantKVCache, _SplitCodec
+
+        monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+        seq_len = 32
+        token_ids = list(range(seq_len))
+        source = BatchTurboQuantKVCache(
+            [0], bits=bits, key_bits=key_bits, value_bits=value_bits
+        )
+        keys, values = _rand_kv(seq_len=seq_len)
+        source.update_and_fetch(keys, values)
+        mx.eval(source.state)
+        if key_bits == 3.5:
+            assert isinstance(source.key_codec, _SplitCodec)
+            assert isinstance(source.value_codec, _SplitCodec)
+
+        def fail(*args, **kwargs):
+            raise AssertionError("TurboQuant checkpoint must stay packed")
+
+        monkeypatch.setattr(TurboQuantKVCache, "dequantize_for_apc", fail)
+        snapshot = snapshot_prompt_cache_row([source], batch_idx=0)
+        assert snapshot is not None
+        assert isinstance(snapshot[0], TurboQuantKVCache)
+
+        restored, matched = _disk_roundtrip(
+            tmp_path,
+            f"native-turbo-{bits}-{key_bits}-{value_bits}",
+            token_ids,
+            snapshot,
+        )
+        assert matched == seq_len
+        assert restored is not None
+        assert isinstance(restored[0], TurboQuantKVCache)
+        _assert_packed_state_equal(restored[0].state, snapshot[0].state)
+
+        kv_quant_config = {
+            "bits": bits,
+            "group_size": GROUP_SIZE,
+            "scheme": "turboquant",
+        }
+        if key_bits is not None:
+            kv_quant_config["key_bits"] = key_bits
+        if value_bits is not None:
+            kv_quant_config["value_bits"] = value_bits
+        warm, _ = make_warm_batch_exact_cache_multi(
+            [restored, [KVCache()]],
+            [seq_len, 0],
+            kv_quant_config=kv_quant_config,
+        )
+        assert warm is not None
+        assert isinstance(warm[0], BatchTurboQuantKVCache)
+        _assert_packed_state_equal(warm[0].extract(0).state, snapshot[0].state)
+
+        next_keys, next_values = _rand_kv(batch=2, seq_len=1)
+        updated = warm[0].update_and_fetch(next_keys, next_values)
+        mx.eval(updated)
+        assert warm[0]._idx == seq_len + 1
 
 
 # ---------------------------------------------------------------------------

@@ -65,7 +65,7 @@ The server exposes more than chat — cover or route to these as needed:
 - **Audio:** `/v1/audio/speech` (TTS), `/v1/audio/transcriptions` and `/v1/audio/translations` (STT).
 - **Images:** `/v1/images/generations` and `/v1/images/edits` (diffusion image models).
 - **Cache & metrics:** `/v1/cache/stats`, `/v1/cache/reset`, `/v1/metrics`.
-- **Models:** `/v1/models` lists cached + currently-loaded models — see `Skill("mlx-vlm-skills:hf-cache-models")`.
+- **Models:** `/v1/models` lists models loaded by this process by default. Use `--model-discovery hf-cache` for shared Hugging Face cache discovery — see `Skill("mlx-vlm-skills:hf-cache-models")`.
 
 Match the model kind to the endpoint (an image endpoint needs a diffusion/image model, audio endpoints need an audio model); a mismatch returns a clear 4xx, not a crash.
 

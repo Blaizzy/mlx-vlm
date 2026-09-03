@@ -34,6 +34,17 @@ class Glm5NextExactSpeculativeVerifier:
     per-step recurrent state used by ``rollback_speculative_cache``.
     """
 
+    @staticmethod
+    def requires_tokenwise(language_model) -> bool:
+        for layer in language_model.model.layers:
+            projection = getattr(layer.self_attn, "q_proj", None)
+            if projection is not None:
+                mode = getattr(projection, "mode", None)
+                return mode == "mxfp8" or (
+                    mode == "affine" and getattr(projection, "bits", None) == 8
+                )
+        return False
+
     def __call__(
         self,
         language_model,
@@ -43,7 +54,14 @@ class Glm5NextExactSpeculativeVerifier:
         capture_layer_ids: Optional[List[int]] = None,
         skip_logits: bool = False,
     ) -> LanguageModelOutput:
-        del capture_layer_ids  # glm5_next MTP uses the final hidden only
+        if self.requires_tokenwise(language_model) and inputs.shape[1] > 1:
+            return self._tokenwise(
+                language_model,
+                inputs,
+                cache=cache,
+                capture_layer_ids=capture_layer_ids,
+                skip_logits=skip_logits,
+            )
         gdn_sink: List = []
         hidden_sink: List = []
         normed = language_model.model(
@@ -56,6 +74,77 @@ class Glm5NextExactSpeculativeVerifier:
             gdn_states=gdn_sink,
             shared_kv_states={},
         )
+
+    def _tokenwise(
+        self,
+        language_model,
+        inputs: mx.array,
+        *,
+        cache: Any,
+        capture_layer_ids: Optional[List[int]],
+        skip_logits: bool,
+    ) -> LanguageModelOutput:
+        del capture_layer_ids
+        gdn_steps = []
+        hidden_steps = []
+        normed_steps = []
+        for position in range(inputs.shape[1]):
+            gdn_sink: List = []
+            hidden_sink: List = []
+            normed_steps.append(
+                language_model.model(
+                    inputs[:, position : position + 1],
+                    cache=cache,
+                    gdn_sink=gdn_sink,
+                    hidden_sink=hidden_sink,
+                )
+            )
+            gdn_steps.append(gdn_sink)
+            hidden_steps.append(hidden_sink)
+        gdn_sink = self._merge_gdn_steps(gdn_steps)
+        hidden_sink = [
+            mx.concatenate([step[index] for step in hidden_steps], axis=1)
+            for index in range(len(hidden_steps[0]))
+        ]
+        normed = mx.concatenate(normed_steps, axis=1)
+        logits = None if skip_logits else verify_logits(language_model, normed)
+        return LanguageModelOutput(
+            logits=logits,
+            hidden_states=hidden_sink,
+            gdn_states=gdn_sink,
+            shared_kv_states={},
+        )
+
+    @staticmethod
+    def _merge_gdn_steps(gdn_steps: List[List]) -> List:
+        if not gdn_steps:
+            return []
+        merged = []
+        for states in zip(*gdn_steps):
+            first = states[0]
+            sequence = [
+                mx.concatenate([state[index] for state in states], axis=1)
+                for index in range(5)
+            ]
+            conv_input = mx.concatenate(
+                [
+                    first[8][:, : first[9] - 1],
+                    *[state[8][:, -1:] for state in states],
+                ],
+                axis=1,
+            )
+            merged.append(
+                (
+                    *sequence,
+                    first[5],
+                    first[6],
+                    first[7],
+                    conv_input,
+                    first[9],
+                    first[10],
+                )
+            )
+        return merged
 
 
 __all__ = ["Glm5NextExactSpeculativeVerifier", "verify_logits"]

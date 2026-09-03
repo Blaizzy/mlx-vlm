@@ -13,6 +13,7 @@ if __name__ == "__main__":
         "chat",
         "chat_ui",
         "server",
+        "moe_offload",
     }
 
     if len(sys.argv) < 2:

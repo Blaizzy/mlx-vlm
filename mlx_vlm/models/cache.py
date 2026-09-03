@@ -147,6 +147,11 @@ class _BaseCache:
         self.state = snapshot["state"]
         self.meta_state = snapshot["meta_state"]
 
+    def prefix_cache_reserve(self, min_capacity_tokens):
+        """Reserve optional post-restore capacity and return arrays to evaluate."""
+        del min_capacity_tokens
+        return ()
+
     def prefix_cache_merge(self, rows, prefix_lens):
         """Merge single-row snapshots into a batched cache, or ``None``.
 
@@ -323,6 +328,76 @@ class QuantizedKVCache(_BaseCache):
             self.keys, self.values, self.offset, self.group_size, self.bits
         )
 
+    def prefix_cache_snapshot(self):
+        """Capture the packed cache state without a float round-trip."""
+        state = (None, None) if self.keys is None else self.state
+        return {"state": state, "meta_state": self.meta_state}
+
+    def prefix_cache_restore(self, snapshot):
+        """Restore a native packed snapshot into a fresh cache."""
+        self.__init__()
+        self.state = snapshot["state"]
+        self.meta_state = snapshot["meta_state"]
+
+    def prefix_cache_reserve(self, min_capacity_tokens):
+        """Reserve packed capacity for the first post-restore update."""
+        if self.keys is None or self.values is None:
+            return ()
+        needed = int(min_capacity_tokens)
+        capacity = int(self.keys[0].shape[2])
+        if needed <= capacity:
+            return self.keys, self.values
+        capacity = ((needed + self.step - 1) // self.step) * self.step
+        pad_tokens = capacity - int(self.keys[0].shape[2])
+        pad = [(0, 0), (0, 0), (0, pad_tokens), (0, 0)]
+        self.keys = tuple(mx.pad(part, pad) for part in self.keys)
+        self.values = tuple(mx.pad(part, pad) for part in self.values)
+        return self.keys, self.values
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        """Merge packed rows directly into ``BatchQuantizedKVCache``.
+
+        Empty float ``KVCache`` rows are accepted because continuous batching
+        represents cold rows with the model's fresh, unquantized cache layout.
+        """
+        if not rows or len(rows) != len(prefix_lens):
+            return None
+
+        def is_cold_empty(row):
+            return type(row) is KVCache and row.keys is None and row.values is None
+
+        for row in rows:
+            if isinstance(row, QuantizedKVCache):
+                if row.group_size != self.group_size or row.bits != self.bits:
+                    return None
+            elif not is_cold_empty(row):
+                return None
+
+        prefix_lens = [int(length) for length in prefix_lens]
+        if any(
+            int(row.offset) != length
+            for row, length in zip(rows, prefix_lens)
+            if isinstance(row, QuantizedKVCache)
+        ):
+            return None
+
+        batch_rows = []
+        for row in rows:
+            batch = BatchQuantizedKVCache(
+                [0], group_size=self.group_size, bits=self.bits
+            )
+            if isinstance(row, QuantizedKVCache) and row.keys is not None:
+                batch.keys = row.keys
+                batch.values = row.values
+                batch._idx = int(row.offset)
+                batch.offset = mx.array([row.offset])
+            batch_rows.append(batch)
+
+        out = batch_rows[0]
+        for batch in batch_rows[1:]:
+            out.extend(batch)
+        return out
+
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 
@@ -383,6 +458,37 @@ class KVCache(_BaseCache):
     def state(self, v):
         self.keys, self.values = v
         self.offset = self.keys.shape[2]
+
+    def prefix_cache_reserve(self, min_capacity_tokens):
+        if self.keys is None or self.values is None:
+            return ()
+        capacity = max(self.offset, int(min_capacity_tokens))
+        if self.step > 0:
+            capacity = ((capacity + self.step - 1) // self.step) * self.step
+        if capacity <= self.keys.shape[2]:
+            return ()
+        pad_tokens = capacity - self.keys.shape[2]
+        self.keys = mx.concatenate(
+            [
+                self.keys,
+                mx.zeros(
+                    (*self.keys.shape[:2], pad_tokens, self.keys.shape[3]),
+                    dtype=self.keys.dtype,
+                ),
+            ],
+            axis=2,
+        )
+        self.values = mx.concatenate(
+            [
+                self.values,
+                mx.zeros(
+                    (*self.values.shape[:2], pad_tokens, self.values.shape[3]),
+                    dtype=self.values.dtype,
+                ),
+            ],
+            axis=2,
+        )
+        return self.keys, self.values
 
     def is_trimmable(self):
         return True
@@ -799,11 +905,21 @@ class ChunkedKVCache(_BaseCache):
         self.start_position = 0
 
     def maybe_trim_front(self):
-        # Maintain the cache below the chunk size
-        if self.keys is not None and self.keys.shape[2] >= self.chunk_size:
-            self.start_position += self.keys.shape[2] - self.chunk_size
-            self.keys = self.keys[..., -self.chunk_size :, :]
-            self.values = self.values[..., -self.chunk_size :, :]
+        # Maintain the cache below the chunk size.
+        #
+        # Trim on the number of valid cached tokens, not on the allocated
+        # buffer width: update_and_fetch pads the buffer up to a multiple of
+        # ``step``, so ``self.keys.shape[2]`` overstates how much live data is
+        # there and the old arithmetic dropped up to ``step - 1`` valid tokens
+        # off the front of the attention window on every trim.
+        if self.keys is None:
+            return
+        valid = self.offset - self.start_position
+        if valid > self.chunk_size:
+            trim = valid - self.chunk_size
+            self.start_position += trim
+            self.keys = self.keys[..., trim:valid, :]
+            self.values = self.values[..., trim:valid, :]
 
     def update_and_fetch(self, keys, values):
         prev = self.offset - self.start_position
@@ -2671,6 +2787,51 @@ class SimpleKVCache:
         self.keys = keys
         self.values = values
         self.cache_length += keys.shape[2]
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return None, None
+        return (
+            self.keys[..., : self.cache_length, :],
+            self.values[..., : self.cache_length, :],
+        )
+
+    @state.setter
+    def state(self, value):
+        self.keys, self.values = value
+        self.cache_length = 0 if self.keys is None else int(self.keys.shape[2])
+
+    @property
+    def meta_state(self):
+        return str(self.cache_length)
+
+    @meta_state.setter
+    def meta_state(self, value):
+        self.cache_length = int(value or 0)
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        cache = cls()
+        cache.state = state
+        cache.meta_state = meta_state
+        return cache
+
+    def prefix_cache_snapshot(self):
+        return {"state": self.state, "meta_state": self.meta_state}
+
+    def prefix_cache_restore(self, snapshot):
+        self.state = snapshot["state"]
+        self.meta_state = snapshot["meta_state"]
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
 
 
 class StaticPrefixKVCache(_BaseCache):

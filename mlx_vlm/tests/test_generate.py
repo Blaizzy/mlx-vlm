@@ -1163,6 +1163,26 @@ class TestBatchGenerator:
         gen.insert([[1, 2, 3]])
         assert gen.remove(9999) is False
 
+    def test_remove_cancels_image_prefill_and_releases_cache(
+        self, mock_model, mock_processor
+    ):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+        )
+        prompt_batch = SimpleNamespace(
+            uids=[7],
+            prompt_cache=[MagicMock()],
+            input_ids=mx.array([[1, mock_model.config.image_token_index, 2]]),
+        )
+        gen._prompt_batch = prompt_batch
+
+        assert gen.remove(7) is True
+        assert prompt_batch.uids == []
+        assert prompt_batch.prompt_cache == []
+        assert gen._prompt_batch is None
+
 
 # ============================================================================
 # Tests for batch_generate function
@@ -1195,10 +1215,10 @@ class TestBatchGenerate:
         assert response.texts == ["Response 1", "Response 2"]
         mock_generate_batch.assert_called_once()
 
-    def test_generate_batch_splits_batched_prompt_kwargs_per_row(
+    def test_generate_batch_passes_mask_and_split_prompt_kwargs_to_generator(
         self, mock_model, mock_processor
     ):
-        """Regression test for Gemma 4-style batched ``inputs_embeds``."""
+        """BatchGenerator receives the dense rows and their padding metadata."""
 
         class _EmbeddingOutput:
             def __init__(self, inputs_embeds, position_ids):
@@ -1219,12 +1239,17 @@ class TestBatchGenerate:
         hidden_size = 7
         input_ids = mx.array(
             [
-                [11, 12, 13, 14, 15],
+                [0, 0, 11, 12, 13],
                 [21, 22, 23, 24, 25],
-                [31, 32, 33, 34, 35],
+                [0, 31, 32, 33, 34],
             ],
             dtype=mx.int32,
         )
+        attention_mask = mx.array(
+            [[0, 0, 1, 1, 1], [1, 1, 1, 1, 1], [0, 1, 1, 1, 1]],
+            dtype=mx.int32,
+        )
+        prepared_attention_mask = attention_mask
         inputs_embeds = mx.arange(
             batch_size * seq_len * hidden_size, dtype=mx.float32
         ).reshape(batch_size, seq_len, hidden_size)
@@ -1234,9 +1259,15 @@ class TestBatchGenerate:
         embedding_output = _EmbeddingOutput(inputs_embeds, position_ids)
 
         def fake_insert(
-            self, prompts, max_tokens, prompt_kwargs=None, logits_processors=None
+            self,
+            prompts,
+            max_tokens,
+            prompt_kwargs=None,
+            logits_processors=None,
+            attention_mask=None,
         ):
-            assert len(prompts) == batch_size
+            assert mx.array_equal(prompts, input_ids)
+            assert mx.array_equal(attention_mask, prepared_attention_mask)
             assert len(prompt_kwargs) == batch_size
             for i, kw in enumerate(prompt_kwargs):
                 assert kw["inputs_embeds"].shape == (1, seq_len, hidden_size)
@@ -1256,7 +1287,7 @@ class TestBatchGenerate:
                 "prepare_inputs",
                 return_value={
                     "input_ids": input_ids,
-                    "attention_mask": mx.ones((batch_size, seq_len), dtype=mx.int32),
+                    "attention_mask": attention_mask,
                 },
             ),
             patch.object(
@@ -2002,6 +2033,50 @@ def test_generate_step_schedules_final_prefill_async():
     assert events[0] == "async"
 
 
+def test_generate_step_preserves_explicit_prompt_position_metadata():
+    model = MagicMock()
+    model.language_model.supports_logits_to_keep = False
+    model.language_model.return_value = MagicMock(
+        logits=mx.zeros((1, 1, 4)),
+        cross_attention_states=None,
+        encoder_outputs=None,
+    )
+
+    full_position_ids = mx.array([[10, 11]], dtype=mx.int32)
+    full_rope_deltas = mx.array([[7]], dtype=mx.int32)
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 2, 4))
+    embedding_output.to_dict.return_value = {
+        "position_ids": mx.array([[0, 1]], dtype=mx.int32),
+        "rope_deltas": mx.array([[0]], dtype=mx.int32),
+    }
+    model.get_input_embeddings.return_value = embedding_output
+
+    with (
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+    ):
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1, 2]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            prompt_cache=[],
+            max_tokens=1,
+            position_ids=full_position_ids,
+            rope_deltas=full_rope_deltas,
+        )
+        next(gen)
+
+    # The generator prepares the following decode step before yielding the
+    # current token, so inspect the first (prompt/suffix) forward call.
+    call_kwargs = model.language_model.call_args_list[0].kwargs
+    assert bool(mx.array_equal(call_kwargs["position_ids"], full_position_ids))
+    assert bool(mx.array_equal(call_kwargs["rope_deltas"], full_rope_deltas))
+
+
 @pytest.mark.parametrize(("verbose", "disabled"), [(False, True), (True, False)])
 def test_generate_step_prefill_tqdm_respects_verbose(verbose, disabled):
     pbar = MagicMock()
@@ -2157,13 +2232,79 @@ def test_stream_generate_forwards_verbose_to_generate_step():
     assert captured["verbose"] is True
 
 
+def test_stream_generate_stores_checkpoint_only_before_decode():
+    class FakeStoppingCriteria:
+        def __call__(self, token):
+            return False
+
+    class FakeDetokenizer:
+        last_segment = ""
+
+        def reset(self):
+            pass
+
+        def add_token(self, token, skip_special_token_ids=None):
+            pass
+
+        def finalize(self):
+            pass
+
+    coordinator = MagicMock()
+    coordinator.enabled = True
+    coordinator.is_checkpoint = True
+    coordinator.lookup.return_value = None
+    coordinator.checkpoint_len.return_value = 3
+
+    def fake_generate_step(*args, **kwargs):
+        kwargs["prompt_cache_checkpoint"](
+            kwargs["prompt_cache_checkpoint_len"], kwargs["prompt_cache"]
+        )
+        yield 7, mx.zeros((4,))
+
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(stopping_criteria=FakeStoppingCriteria()),
+        detokenizer=FakeDetokenizer(),
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test", eos_token_id=[]),
+        language_model=SimpleNamespace(),
+    )
+    prompt_cache = []
+
+    with (
+        patch.object(dispatch_module._apc, "APCCoordinator", return_value=coordinator),
+        patch.object(dispatch_module._apc, "semantic_extra_hash", return_value=0),
+        patch.object(
+            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
+        ),
+        patch.object(dispatch_module, "generate_step", side_effect=fake_generate_step),
+    ):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="",
+                input_ids=mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache=prompt_cache,
+                apc_manager=MagicMock(),
+                max_tokens=1,
+            )
+        )
+
+    coordinator.store_checkpoint.assert_called_once_with(
+        [1, 2, 3], prompt_cache, extra_hash=0
+    )
+
+
 def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
     captured = {}
     tokenizer = SimpleNamespace(stopping_criteria=SimpleNamespace())
     processor = SimpleNamespace(tokenizer=tokenizer)
     model = SimpleNamespace(
         config=SimpleNamespace(model_type="test"),
-        language_model=SimpleNamespace(),
+        language_model=SimpleNamespace(layers=[object()]),
     )
     prepared_mask = mx.ones((1, 4), dtype=mx.int32)
 
@@ -2185,7 +2326,11 @@ def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
             dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
         ),
         patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
-        patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(
+            dispatch_module.cache,
+            "make_prompt_cache",
+            return_value=[dispatch_module.cache.KVCache()],
+        ),
         patch.object(
             dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
         ),
@@ -2212,7 +2357,7 @@ def test_stream_generate_hashes_explicit_sequence_tensors_for_apc_safety():
     processor = SimpleNamespace(tokenizer=tokenizer)
     model = SimpleNamespace(
         config=SimpleNamespace(model_type="test"),
-        language_model=SimpleNamespace(),
+        language_model=SimpleNamespace(layers=[object()]),
     )
     custom_embeds = mx.ones((1, 4, 3))
     custom_mask = mx.array([[1, 1, 0, 0]], dtype=mx.int32)
@@ -2227,7 +2372,11 @@ def test_stream_generate_hashes_explicit_sequence_tensors_for_apc_safety():
             dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
         ),
         patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
-        patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(
+            dispatch_module.cache,
+            "make_prompt_cache",
+            return_value=[dispatch_module.cache.KVCache()],
+        ),
         patch.object(
             dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
         ),
@@ -2323,6 +2472,7 @@ def test_generate_cli_smoke(capsys):
         revision="main",
         trust_remote_code=False,
         quantize_activations=False,
+        expert_cache_gb=None,
         processor_kwargs={},
         prefill_step_size=128,
         enable_thinking=True,
@@ -2402,6 +2552,7 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
         revision=None,
         trust_remote_code=False,
         quantize_activations=False,
+        expert_cache_gb=None,
         processor_kwargs={},
         gen_kwargs={},
         prefill_step_size=None,
@@ -2494,7 +2645,7 @@ def test_resolve_video_inputs_uses_one_global_frame_budget():
     assert resolution.frame_fps == pytest.approx(1.5)
     assert images == [still]
     assert videos == ["first.mp4", "second.mp4"]
-    mock_sample.assert_called_once_with(videos, 1.5)
+    mock_sample.assert_called_once_with(videos, 1.5, None)
 
 
 def test_resolve_video_inputs_does_not_partially_mutate_on_decode_failure():
@@ -2563,6 +2714,7 @@ def test_generate_cli_video_frames_fallback_without_video_processor(capsys):
         revision=None,
         trust_remote_code=False,
         quantize_activations=False,
+        expert_cache_gb=None,
         processor_kwargs={},
         gen_kwargs={},
         prefill_step_size=None,
@@ -2703,10 +2855,40 @@ def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
         )
 
     assert ok is False
+    assert "position_ids" not in kwargs
     assert "rope_deltas" not in kwargs
     assert bool(mx.array_equal(language_model._rope_deltas, rope_deltas_before))
     assert bool(mx.array_equal(language_model._position_ids, position_ids_before))
     assert "falling back to cold prefill" in caplog.text
+
+
+def test_cached_prefix_rope_forwards_full_prompt_metadata():
+    position_ids = mx.array([[0, 1, 2, 3]], dtype=mx.int32)
+    rope_deltas = mx.array([[7]], dtype=mx.int32)
+
+    class RopeLanguageModel:
+        _position_ids = None
+        _rope_deltas = None
+
+        @staticmethod
+        def get_rope_index(*args, **kwargs):
+            return position_ids, rope_deltas
+
+    language_model = RopeLanguageModel()
+    kwargs = {}
+
+    ok = _prime_cached_prefix_rope_state(
+        SimpleNamespace(language_model=language_model),
+        mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+        None,
+        kwargs,
+    )
+
+    assert ok is True
+    assert bool(mx.array_equal(kwargs["position_ids"], position_ids))
+    assert bool(mx.array_equal(kwargs["rope_deltas"], rope_deltas))
+    assert bool(mx.array_equal(language_model._position_ids, position_ids))
+    assert bool(mx.array_equal(language_model._rope_deltas, rope_deltas))
 
 
 class TestPrefixCacheReuseTrim:
@@ -3197,20 +3379,19 @@ class TestBatchTurboQuantizedKVStart:
         assert "BatchTurboQuantKVCache" in kinds
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+class TestTokenizerPaddedBatchRows:
+    """BatchGenerator canonicalizes masked dense rows before queueing them."""
 
+    def _generator(self):
+        gen = object.__new__(BatchGenerator)
+        gen.max_tokens = 4
+        gen.logits_processors = []
+        gen._unprocessed_sequences = []
+        gen.uid_count = 0
+        gen._wire_stack = None
+        return gen
 
-class TestPrePaddedBatchRows:
-    """Rows that arrive already padded must still declare that padding.
-
-    The tokenizer squares a batch off with left padding and reports it in the
-    attention mask. If that never reaches the caches, every row looks the same
-    length: a causal mask does not exclude padding that comes first, and a
-    recurrent layer walks it like any other column.
-    """
-
-    def _batch(self, rows, existing_left_padding):
+    def _batch(self, rows):
         import mlx.nn as nn
 
         from mlx_vlm.generate.ar import PromptProcessingBatch
@@ -3228,29 +3409,70 @@ class TestPrePaddedBatchRows:
             max_tokens=[4] * len(rows),
             inputs_embeds=None,
             prompt_kwargs={},
-            existing_left_padding=existing_left_padding,
         )
 
-    def test_declared_padding_reaches_the_caches(self):
-        rows = [list(range(8)), list(range(8))]
+    def test_unpads_tokens_and_sequence_aligned_prompt_tensors(self):
+        input_ids = mx.array([[0, 0, 4, 5], [6, 7, 8, 9], [10, 11, 0, 0]])
+        attention_mask = mx.array([[0, 0, 1, 1], [1, 1, 1, 1], [1, 1, 0, 0]])
+        inputs_embeds = mx.arange(3 * 4 * 3).reshape(3, 4, 3)
+        position_ids = mx.arange(3 * 3 * 4).reshape(3, 3, 4)
+        prompt_kwargs = ar_module._split_prompt_kwargs_per_row(
+            {
+                "inputs_embeds": inputs_embeds,
+                "position_ids": position_ids,
+                "rope_deltas": mx.array([[2], [3], [4]]),
+            },
+            batch_size=3,
+        )
 
-        batch = self._batch(rows, existing_left_padding=[5, 0])
+        gen = self._generator()
+        assert gen.insert(
+            input_ids,
+            prompt_kwargs=prompt_kwargs,
+            attention_mask=attention_mask,
+        ) == [0, 1, 2]
+        queued = {sequence[0]: sequence for sequence in gen._unprocessed_sequences}
 
-        assert batch._left_padding_per_row == [5, 0]
+        assert queued[0][1] == [4, 5]
+        assert queued[1][1] == [6, 7, 8, 9]
+        assert queued[2][1] == [10, 11]
+        assert queued[0][3]["inputs_embeds"].shape == (1, 2, 3)
+        assert queued[1][3]["inputs_embeds"].shape == (1, 4, 3)
+        assert queued[2][3]["inputs_embeds"].shape == (1, 2, 3)
+        assert queued[0][3]["position_ids"].shape == (3, 1, 2)
+        assert queued[1][3]["position_ids"].shape == (3, 1, 4)
+        assert queued[2][3]["position_ids"].shape == (3, 1, 2)
+        assert queued[0][3]["rope_deltas"].tolist() == [[2]]
+        assert queued[2][3]["rope_deltas"].tolist() == [[4]]
 
-    def test_uniform_rows_without_a_declaration_record_none(self):
-        rows = [list(range(8)), list(range(8))]
+    def test_rejects_noncontiguous_padding_mask(self):
+        gen = self._generator()
+        with pytest.raises(ValueError, match="one contiguous prompt span"):
+            gen.insert(
+                mx.array([[0, 4, 0, 5]]),
+                prompt_kwargs=[{"inputs_embeds": mx.ones((1, 4, 3))}],
+                attention_mask=mx.array([[0, 1, 0, 1]]),
+            )
+        assert gen._unprocessed_sequences == []
 
-        batch = self._batch(rows, existing_left_padding=None)
+    def test_accepts_mask_with_existing_python_prompt_rows(self):
+        gen = self._generator()
 
-        assert batch._left_padding_per_row == [0, 0]
+        gen.insert(
+            [[0, 4, 5], [6, 7, 8]],
+            attention_mask=mx.array([[0, 1, 1], [1, 1, 1]]),
+        )
 
-    def test_a_declaration_adds_to_the_generator_s_own_padding(self):
-        rows = [list(range(4)), list(range(8))]
+        queued = {sequence[0]: sequence[1] for sequence in gen._unprocessed_sequences}
+        assert queued == {0: [4, 5], 1: [6, 7, 8]}
 
-        batch = self._batch(rows, existing_left_padding=[2, 1])
+    def test_ragged_rows_initialize_both_cache_types(self):
+        batch = self._batch([[4, 5], [6, 7, 8, 9]])
 
-        assert batch._left_padding_per_row == [6, 1]
+        assert batch._left_padding_per_row == [2, 0]
+        assert batch.total_prompt_tokens == 6
+        assert batch.prompt_cache[0].offset.tolist() == [-2, 0]
+        assert batch.prompt_cache[1].left_padding.tolist() == [2, 0]
 
     def test_arrays_cache_masks_the_declared_padding(self):
         import mlx.core as mx
@@ -3258,10 +3480,78 @@ class TestPrePaddedBatchRows:
         from mlx_vlm.models.cache import ArraysCache
 
         entry = ArraysCache(1)
-        entry.left_padding = mx.array([5, 0])
+        entry.left_padding = mx.array([2, 0])
 
-        mask = entry.make_mask(8)
+        mask = entry.make_mask(4)
 
-        assert mask.shape == (2, 8)
-        assert mask[0].tolist() == [False] * 5 + [True] * 3
-        assert mask[1].tolist() == [True] * 8
+        assert mask.shape == (2, 4)
+        assert mask[0].tolist() == [False, False, True, True]
+        assert mask[1].tolist() == [True] * 4
+
+
+def test_prompt_shorter_than_prefill_step_size_is_still_chunked():
+    """Short prompts must not skip chunking: the unchunked path feeds the whole
+    prompt to _step, which reads logits[:, -1, :] and materializes [1, N, vocab]."""
+    model = MagicMock()
+    model.chunked_prefill_policy = MagicMock(return_value=True)
+    output = SimpleNamespace(
+        logits=mx.zeros((1, 1, 8)),
+        hidden_states=[mx.zeros((1, 1, 4))],
+        shared_kv_states={},
+        cross_attention_states=None,
+        encoder_outputs=None,
+    )
+    model.language_model.return_value = output
+
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 5, 4))
+    embedding_output.to_dict.return_value = {}
+    model.get_input_embeddings.return_value = embedding_output
+
+    with (
+        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+    ):
+        # 5 prompt tokens, prefill_step_size 2048: previously unchunked.
+        list(
+            generate_module.generate_step(
+                input_ids=mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
+                model=model,
+                pixel_values=None,
+                mask=None,
+                max_tokens=1,
+                prefill_step_size=2048,
+            )
+        )
+
+    n_processed = [
+        c.kwargs["n_to_process"]
+        for c in model.language_model.call_args_list
+        if "n_to_process" in c.kwargs
+    ]
+    assert n_processed == [4], f"expected one 4-token prefill chunk, got {n_processed}"
+
+
+def test_paligemma_opts_out_of_chunked_prefill_when_bidirectional():
+    from mlx_vlm.models.paligemma.paligemma import Model as PaliGemmaModel
+
+    bidirectional = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(use_bidirectional_attention=True)
+        )
+    )
+    causal = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(use_bidirectional_attention=False)
+        )
+    )
+    policy = PaliGemmaModel.chunked_prefill_policy
+    assert policy(bidirectional) is False
+    assert policy(causal) is True
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

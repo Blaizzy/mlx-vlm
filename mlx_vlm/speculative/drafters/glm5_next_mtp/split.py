@@ -22,9 +22,71 @@ class Glm5NextMTPSplitter(MTPSplitter):
     def select_keys(self, key: str, text_config: dict) -> bool:
         return f"layers.{self._layer_idx(text_config)}." in key
 
+    @staticmethod
+    def _dequantize_fine_grained_fp8(
+        tensors: Dict[str, mx.array], block_size: int = 128
+    ) -> Dict[str, mx.array]:
+        scale_keys = [key for key in tensors if key.endswith("weight_scale_inv")]
+        if not scale_keys:
+            return tensors
+
+        converted = dict(tensors)
+        for scale_key in scale_keys:
+            weight_key = scale_key[: -len("_scale_inv")]
+            if weight_key not in converted:
+                raise ValueError(f"Missing FP8 weight for scale tensor {scale_key!r}.")
+            weight = converted.pop(weight_key)
+            scale_inv = converted.pop(scale_key)
+            if weight.dtype != mx.uint8 or weight.ndim < 2:
+                raise ValueError(
+                    "GLM fine-grained FP8 weights must be uint8 matrices; "
+                    f"got dtype={weight.dtype}, shape={weight.shape}."
+                )
+
+            *batch_shape, rows, cols = weight.shape
+            expected_scale_shape = (
+                *batch_shape,
+                (rows + block_size - 1) // block_size,
+                (cols + block_size - 1) // block_size,
+            )
+            if scale_inv.shape != expected_scale_shape:
+                raise ValueError(
+                    "GLM fine-grained FP8 scale shape does not match its weight: "
+                    f"weight={weight.shape}, scales={scale_inv.shape}, "
+                    f"expected={expected_scale_shape}."
+                )
+
+            pad_rows = (-rows) % block_size
+            pad_cols = (-cols) % block_size
+            decoded = mx.from_fp8(weight, dtype=mx.bfloat16)
+            if pad_rows or pad_cols:
+                decoded = mx.pad(
+                    decoded,
+                    [(0, 0)] * len(batch_shape) + [(0, pad_rows), (0, pad_cols)],
+                )
+            decoded = decoded.reshape(
+                *batch_shape,
+                (rows + pad_rows) // block_size,
+                block_size,
+                (cols + pad_cols) // block_size,
+                block_size,
+            )
+            scales = scale_inv.reshape(
+                *batch_shape,
+                (rows + pad_rows) // block_size,
+                1,
+                (cols + pad_cols) // block_size,
+                1,
+            )
+            converted[weight_key] = (decoded * scales).reshape(
+                *batch_shape, rows + pad_rows, cols + pad_cols
+            )[..., :rows, :cols]
+        return converted
+
     def run_sanitize(
         self, tensors: Dict[str, mx.array], text_config: dict
     ) -> Dict[str, mx.array]:
+        tensors = self._dequantize_fine_grained_fp8(tensors)
         marker = f"layers.{self._layer_idx(text_config)}."
         out: Dict[str, mx.array] = {}
         for key, value in tensors.items():

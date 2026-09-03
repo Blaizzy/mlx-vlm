@@ -152,7 +152,12 @@ class Glm5NextLinearAttention(nn.Module):
             homogeneous = all(quantized) or not any(quantized)
             if homogeneous and all(quantized):
                 homogeneous = (
-                    len({m.group_size for m in mods}) == 1
+                    all(
+                        getattr(m, "mode", None) == "affine"
+                        and getattr(m, "biases", None) is not None
+                        for m in mods
+                    )
+                    and len({m.group_size for m in mods}) == 1
                     and len({m.bits for m in mods}) == 1
                 )
             if not homogeneous:
