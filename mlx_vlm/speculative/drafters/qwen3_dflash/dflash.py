@@ -4,7 +4,12 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ....models.activations import swiglu
-from ....models.cache import BufferedRotatingKVCache, KVCache, RotatingKVCache
+from ....models.cache import (
+    BufferedRotatingKVCache,
+    KVCache,
+    RotatingKVCache,
+    create_causal_mask,
+)
 from ....models.rope_utils import initialize_rope
 from .config import DFlashConfig
 
@@ -36,6 +41,12 @@ class DFlashAttention(nn.Module):
         )
         self.is_sliding = layer_types[layer_idx] == "sliding_attention"
         self.sliding_window = config.sliding_window if self.is_sliding else None
+        self.is_causal = bool(getattr(config, "is_causal", self.is_sliding))
+        self.attention_sink_bias = (
+            mx.zeros((self.n_heads,))
+            if getattr(config, "attention_sink_bias", False)
+            else None
+        )
         self.q_proj = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
@@ -47,7 +58,14 @@ class DFlashAttention(nn.Module):
         """Project keys and values. Subclasses may share one projection."""
         return self.k_proj(x), self.v_proj(x)
 
-    def __call__(self, x: mx.array, x_ctx: mx.array, rope, cache: KVCache):
+    def __call__(
+        self,
+        x: mx.array,
+        x_ctx: mx.array,
+        rope,
+        cache: KVCache,
+        projected_context=None,
+    ):
         B, L, _ = x.shape
         S = x_ctx.shape[1]
         if self.is_sliding:
@@ -59,12 +77,18 @@ class DFlashAttention(nn.Module):
             if S > keep_ctx:
                 skip = S - keep_ctx
                 x_ctx = x_ctx[:, skip:]
+                if projected_context is not None:
+                    projected_context = tuple(
+                        value[:, skip:] for value in projected_context
+                    )
                 S = x_ctx.shape[1]
                 cache.offset += skip
 
         # Project context and proposal separately so only context KV
         queries = self.q_proj(x)
-        ctx_keys, ctx_values = self._project_kv(x_ctx)
+        ctx_keys, ctx_values = (
+            self._project_kv(x_ctx) if projected_context is None else projected_context
+        )
         prop_keys, prop_values = self._project_kv(x)
         queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(
             0, 2, 1, 3
@@ -85,12 +109,22 @@ class DFlashAttention(nn.Module):
         keys, values = cache.update_and_fetch(ctx_keys, ctx_values)
         keys = mx.concatenate([keys, prop_keys], axis=2)
         values = mx.concatenate([values, prop_values], axis=2)
-        # DFlash denoises the whole proposed block at once, so draft-block
-        # self-attention is intentionally non-causal. Sliding layers already
-        # limit resident prefix context through the rotating cache above.
-        mask = None
+        mask = (
+            create_causal_mask(
+                L,
+                offset=keys.shape[2] - L,
+                window_size=self.sliding_window,
+            )
+            if self.is_causal
+            else None
+        )
         o = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
+            queries,
+            keys,
+            values,
+            scale=self.scale,
+            mask=mask,
+            sinks=self.attention_sink_bias,
         )
         return self.o_proj(o.transpose(0, 2, 1, 3).reshape(B, L, -1))
 
@@ -118,8 +152,14 @@ class DFlashDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-    def __call__(self, x, x_ctx, rope, cache):
-        h = x + self.self_attn(self.input_layernorm(x), x_ctx, rope, cache)
+    def __call__(self, x, x_ctx, rope, cache, projected_context=None):
+        h = x + self.self_attn(
+            self.input_layernorm(x),
+            x_ctx,
+            rope,
+            cache,
+            projected_context,
+        )
         return h + self.mlp(self.post_attention_layernorm(h))
 
 
@@ -142,36 +182,50 @@ class DFlashDraftModel(nn.Module):
         self.embed_tokens = None
         self.embed_scale = 1.0
         self.lm_head = None
+        self.argmax_from_hidden = None
+        self._fused_context_kv_weight = None
         self.accept_lens: List[int] = []
         self.draft_lens: List[int] = []
 
     def bind(self, target_model) -> "DFlashDraftModel":
-        if hasattr(target_model, "embed_tokens"):
-            inner = target_model
-        elif hasattr(target_model, "model") and hasattr(
-            target_model.model, "embed_tokens"
-        ):
-            inner = target_model.model
-        elif (
-            hasattr(target_model, "language_model")
-            and hasattr(target_model.language_model, "model")
-            and hasattr(target_model.language_model.model, "embed_tokens")
-        ):
-            inner = target_model.language_model.model
-        else:
-            raise AttributeError(
-                f"Cannot find embed_tokens in {type(target_model).__name__}"
+        if self.embed_tokens is None:
+            if hasattr(target_model, "embed_tokens"):
+                inner = target_model
+            elif hasattr(target_model, "model") and hasattr(
+                target_model.model, "embed_tokens"
+            ):
+                inner = target_model.model
+            elif (
+                hasattr(target_model, "language_model")
+                and hasattr(target_model.language_model, "model")
+                and hasattr(target_model.language_model.model, "embed_tokens")
+            ):
+                inner = target_model.language_model.model
+            elif (
+                hasattr(target_model, "language_model")
+                and hasattr(target_model.language_model, "backbone")
+                and hasattr(target_model.language_model.backbone, "embeddings")
+            ):
+                inner = target_model.language_model.backbone
+            else:
+                raise AttributeError(
+                    f"Cannot find embed_tokens in {type(target_model).__name__}"
+                )
+            self.embed_tokens = (
+                inner.embed_tokens
+                if hasattr(inner, "embed_tokens")
+                else inner.embeddings
             )
-        self.embed_tokens = inner.embed_tokens
-        self.embed_scale = getattr(
-            self.embed_tokens, "embed_scale", getattr(inner, "embed_scale", 1.0)
-        )
+            self.embed_scale = getattr(
+                self.embed_tokens, "embed_scale", getattr(inner, "embed_scale", 1.0)
+            )
         lm = getattr(target_model, "language_model", target_model)
         self.lm_head = (
             getattr(target_model, "lm_head", None)
             or getattr(lm, "lm_head", None)
             or self.embed_tokens.as_linear
         )
+        self.argmax_from_hidden = getattr(lm, "speculative_argmax_from_hidden", None)
         return self
 
     def make_cache(self) -> List[KVCache]:
@@ -226,6 +280,39 @@ class DFlashDraftModel(nn.Module):
         draft_logits = self._logits(draft_hidden[:, 1:])
         return sampler(draft_logits)
 
+    def draft_block_greedy(
+        self,
+        last_bonus,
+        hidden: mx.array,
+        cache: List[KVCache],
+        block_size: int,
+        sampler,
+        token_dtype: mx.Dtype = mx.int32,
+    ) -> mx.array:
+        if not callable(self.argmax_from_hidden):
+            return self.draft_block(
+                last_bonus,
+                hidden,
+                cache,
+                block_size,
+                sampler,
+                token_dtype,
+            )
+        mask_id = int(self.config.mask_token_id)
+        if isinstance(last_bonus, int):
+            block = mx.array(
+                [[last_bonus] + [mask_id] * (block_size - 1)],
+                dtype=token_dtype,
+            )
+        else:
+            batch = last_bonus.shape[0]
+            masks = mx.full((batch, block_size - 1), mask_id, dtype=token_dtype)
+            block = mx.concatenate(
+                [last_bonus[:, None].astype(token_dtype), masks], axis=1
+            )
+        draft_hidden = self._hidden(block, hidden, cache)
+        return self.argmax_from_hidden(draft_hidden[:, 1:]).astype(token_dtype)
+
     def _hidden(
         self,
         inputs: mx.array,
@@ -234,9 +321,32 @@ class DFlashDraftModel(nn.Module):
     ) -> mx.array:
         h = self._embed_input_tokens(inputs)
         h_ctx = self.hidden_norm(self.fc(target_hidden))
-        for layer, c in zip(self.layers, cache):
-            h = layer(h, h_ctx, self.rope, c)
+        projected_context = self._project_context_kv(h_ctx)
+        for index, (layer, c) in enumerate(zip(self.layers, cache)):
+            layer_context = (
+                None if projected_context is None else projected_context[index]
+            )
+            h = layer(h, h_ctx, self.rope, c, layer_context)
         return self.norm(h)
+
+    def _project_context_kv(self, hidden: mx.array):
+        projections = [
+            projection
+            for layer in self.layers
+            for projection in (
+                layer.self_attn.k_proj,
+                layer.self_attn.v_proj,
+            )
+        ]
+        if not all(isinstance(projection, nn.Linear) for projection in projections):
+            return None
+        if self._fused_context_kv_weight is None:
+            self._fused_context_kv_weight = mx.concatenate(
+                [projection.weight for projection in projections], axis=0
+            )
+        projected = hidden @ self._fused_context_kv_weight.T
+        chunks = mx.split(projected, len(projections), axis=-1)
+        return list(zip(chunks[::2], chunks[1::2]))
 
     def _embed_input_tokens(self, inputs: mx.array) -> mx.array:
         return self.embed_tokens(inputs) * self.embed_scale
@@ -262,6 +372,10 @@ class DFlashDraftModel(nn.Module):
             if k.startswith("model."):
                 k = k[len("model.") :]
             out[k] = v
+        if "embed_tokens.weight" in out and self.embed_tokens is None:
+            self.embed_tokens = nn.Embedding(
+                self.config.vocab_size, self.config.hidden_size
+            )
         return out
 
 

@@ -18400,3 +18400,255 @@ class TestVideoDepthAnything(unittest.TestCase):
         self.assertEqual((h % 14, w % 14), (0, 0))
         self.assertGreaterEqual(min(h, w), 294)
         self.assertAlmostEqual(h / w, 1080 / 1920, places=1)
+
+
+class TestNemotronHSpeculativeVerifier(unittest.TestCase):
+    @staticmethod
+    def _language_model():
+        from mlx_vlm.models import nemotron_h
+
+        config = nemotron_h.ModelConfig(
+            model_type="nemotron_h",
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=4,
+            max_position_embeddings=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            attention_bias=False,
+            mamba_num_heads=4,
+            mamba_head_dim=8,
+            mamba_proj_bias=False,
+            ssm_state_size=32,
+            conv_kernel=3,
+            n_groups=2,
+            mlp_bias=False,
+            layer_norm_epsilon=1e-5,
+            use_bias=False,
+            use_conv_bias=True,
+            hybrid_override_pattern=["M", "*", "-", "E"],
+            moe_intermediate_size=16,
+            n_group=1,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            moe_shared_expert_intermediate_size=16,
+            topk_group=1,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            routed_scaling_factor=1.0,
+        )
+        mx.random.seed(7)
+        model = nemotron_h.Model(config).language_model
+        model.set_dtype(mx.bfloat16)
+        model.eval()
+        mx.eval(model.parameters())
+        return model
+
+    def test_sanitize_stacks_quantized_expert_parameters(self):
+        model = self._language_model()
+        weights = {}
+        for expert in range(model.args.n_routed_experts):
+            for source in ("down_proj", "up_proj"):
+                prefix = f"backbone.layers.3.mixer.experts.{expert}.{source}"
+                weights[f"{prefix}.weight"] = mx.full((2, 3), expert)
+                weights[f"{prefix}.scales"] = mx.full((2, 1), expert + 4)
+
+        sanitized = model.sanitize(weights)
+
+        for target in ("fc2", "fc1"):
+            prefix = f"backbone.layers.3.mixer.switch_mlp.{target}"
+            self.assertEqual(sanitized[f"{prefix}.weight"].shape, (4, 2, 3))
+            self.assertEqual(sanitized[f"{prefix}.scales"].shape, (4, 2, 1))
+        self.assertFalse(any(".experts." in key for key in sanitized))
+
+    def test_verifier_matches_singleton_mamba_moe_and_captures(self):
+        from mlx_vlm.models.nemotron_h import speculative_verifier
+
+        speculative_verifier._mamba_verify_kernel.cache_clear()
+        model = self._language_model()
+        prompt = mx.array([[1, 2, 3]])
+        verify = mx.array([[4, 5, 6, 7]])
+        verifier_cache = model.make_cache()
+        reference_cache = model.make_cache()
+        model(prompt, cache=verifier_cache)
+        model(prompt, cache=reference_cache)
+
+        actual = model(
+            verify,
+            cache=verifier_cache,
+            capture_layer_ids=[0, 3],
+            speculative_verify=True,
+        )
+        logits = []
+        captures = [[], []]
+        for position in range(verify.shape[1]):
+            output = model(
+                verify[:, position : position + 1],
+                cache=reference_cache,
+                capture_layer_ids=[0, 3],
+            )
+            logits.append(output.logits)
+            for index, hidden in enumerate(output.hidden_states):
+                captures[index].append(hidden)
+
+        expected_logits = mx.concatenate(logits, axis=1)
+        expected_captures = [
+            mx.concatenate(layer_tokens, axis=1) for layer_tokens in captures
+        ]
+        mx.eval(actual.logits, expected_logits, actual.hidden_states, expected_captures)
+        self.assertTrue(mx.array_equal(actual.logits, expected_logits).item())
+        for actual_hidden, expected_hidden in zip(
+            actual.hidden_states, expected_captures
+        ):
+            self.assertTrue(mx.array_equal(actual_hidden, expected_hidden).item())
+        if mx.metal.is_available():
+            self.assertGreater(
+                speculative_verifier._mamba_verify_kernel.cache_info().misses, 0
+            )
+
+    def test_verifier_uses_masked_mamba_fallback_for_left_padding(self):
+        from mlx_vlm.models.nemotron_h import speculative_verifier
+
+        speculative_verifier._mamba_verify_kernel.cache_clear()
+        model = self._language_model()
+        inputs = mx.array([[0, 4, 5, 6], [1, 2, 3, 4]])
+        verifier_cache = model.make_cache()
+        reference_cache = model.make_cache()
+        verifier_cache[0].left_padding = mx.array([1, 0])
+        reference_cache[0].left_padding = mx.array([1, 0])
+
+        actual = model(inputs, cache=verifier_cache, speculative_verify=True)
+        expected = model(inputs, cache=reference_cache)
+        mx.eval(actual.logits, expected.logits)
+
+        self.assertTrue(mx.array_equal(actual.logits, expected.logits).item())
+        self.assertEqual(
+            speculative_verifier._mamba_verify_kernel.cache_info().misses, 0
+        )
+
+    def test_nvfp4_argmax_matches_singleton_qmv_with_tail(self):
+        if not mx.metal.is_available():
+            self.skipTest("NVFP4 argmax requires Metal")
+        from mlx_vlm.models.nemotron_h.speculative_verifier import _nvfp4_argmax
+
+        mx.random.seed(19)
+        linear = nn.QuantizedLinear.from_linear(
+            nn.Linear(272, 64, bias=False),
+            group_size=16,
+            bits=4,
+            mode="nvfp4",
+        )
+        hidden = mx.random.normal((2, 6, 272)).astype(mx.bfloat16)
+        expected = mx.concatenate(
+            [linear(hidden[:, index : index + 1]) for index in range(6)], axis=1
+        ).argmax(axis=-1)
+        actual = _nvfp4_argmax(linear, hidden)
+        mx.eval(expected, actual)
+
+        self.assertTrue(mx.array_equal(actual, expected).item())
+
+    def test_rollback_restores_mamba_and_attention_to_accepted_prefix(self):
+        model = self._language_model()
+        prompt = mx.array([[1, 2, 3]])
+        verify = mx.array([[4, 5, 6, 7]])
+        actual_cache = model.make_cache()
+        expected_cache = model.make_cache()
+        model(prompt, cache=actual_cache)
+        model(prompt, cache=expected_cache)
+
+        _, _, rollback_state = model.speculative_verify_hidden(verify, actual_cache)
+        model(verify[:, :2], cache=expected_cache, speculative_verify=True)
+        accepted = model.rollback_speculative_cache(
+            actual_cache,
+            rollback_state,
+            accepted=1,
+            block_size=verify.shape[1],
+        )
+        self.assertEqual(accepted, 1)
+
+        for actual_state, expected_state in zip(
+            actual_cache[0].state, expected_cache[0].state
+        ):
+            mx.eval(actual_state, expected_state)
+            self.assertTrue(mx.array_equal(actual_state, expected_state).item())
+        self.assertEqual(actual_cache[1].offset, expected_cache[1].offset)
+        for actual_state, expected_state in zip(
+            actual_cache[1].state, expected_cache[1].state
+        ):
+            mx.eval(actual_state, expected_state)
+            self.assertTrue(mx.array_equal(actual_state, expected_state).item())
+
+    def test_rollback_rejects_ragged_batch_acceptance(self):
+        model = self._language_model()
+        cache = model.make_cache()
+        verify = mx.array([[1, 2], [3, 4]])
+        _, _, rollback_state = model.speculative_verify_hidden(verify, cache)
+        with self.assertRaisesRegex(ValueError, "uniform acceptance"):
+            model.rollback_speculative_cache(
+                cache,
+                rollback_state,
+                accepted=[0, 1],
+                block_size=2,
+            )
+
+    def test_verifier_supports_embeds_hidden_only_and_shared_kv_contract(self):
+        model = self._language_model()
+        inputs = mx.array([[1, 2, 3]])
+        inputs_embeds = model.backbone.embeddings(inputs)
+        cache = model.make_cache()
+
+        output = model(
+            None,
+            inputs_embeds=inputs_embeds,
+            cache=cache,
+            capture_layer_ids=[],
+            speculative_verify=True,
+            return_hidden=True,
+            return_shared_kv=True,
+            skip_logits=True,
+        )
+        mx.eval(output.hidden_states)
+
+        self.assertIsNone(output.logits)
+        self.assertEqual(len(output.hidden_states), 1)
+        self.assertEqual(output.hidden_states[0].shape, (1, 3, 32))
+        self.assertEqual(output.shared_kv_states, {})
+        self.assertIsNotNone(output.gdn_states)
+
+    def test_dflash_hidden_verification_returns_captures_and_final_hidden(self):
+        model = self._language_model()
+        cache = model.make_cache()
+        model(mx.array([[1, 2, 3]]), cache=cache)
+
+        captured, final_hidden, gdn_states = model.speculative_verify_dflash_hidden(
+            mx.array([[4, 5, 6]]), cache, [0, 3]
+        )
+        mx.eval(captured, final_hidden, gdn_states)
+
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[0].shape, (1, 3, model.args.hidden_size))
+        self.assertEqual(captured[1].shape, (1, 3, model.args.hidden_size))
+        self.assertEqual(final_hidden.shape, (1, 3, model.args.hidden_size))
+        self.assertEqual(len(gdn_states), 1)
+
+    def test_rollback_rejects_invalid_acceptance(self):
+        model = self._language_model()
+        cache = model.make_cache()
+        verify = mx.array([[1, 2]])
+        _, _, rollback_state = model.speculative_verify_hidden(verify, cache)
+
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            model.rollback_speculative_cache(
+                cache,
+                rollback_state,
+                accepted=-1,
+                block_size=2,
+            )
+        with self.assertRaisesRegex(ValueError, "exceed"):
+            model.rollback_speculative_cache(
+                cache,
+                rollback_state,
+                accepted=2,
+                block_size=2,
+            )

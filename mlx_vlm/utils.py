@@ -184,7 +184,11 @@ def _transform_modelopt_nvfp4_weights(
     if quantization_config.get("quant_method") not in {
         "modelopt",
         "modelopt_mixed",
-    } or quantization_config.get("quant_algo") not in {"NVFP4", "MIXED_PRECISION"}:
+    } or quantization_config.get("quant_algo") not in {
+        "NVFP4",
+        "W4A16_NVFP4",
+        "MIXED_PRECISION",
+    }:
         return weights, None
 
     scale_2_suffix = ".weight_scale_2"
