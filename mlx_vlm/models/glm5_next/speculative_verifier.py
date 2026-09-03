@@ -39,7 +39,10 @@ class Glm5NextExactSpeculativeVerifier:
         for layer in language_model.model.layers:
             projection = getattr(layer.self_attn, "q_proj", None)
             if projection is not None:
-                return getattr(projection, "mode", None) is not None
+                mode = getattr(projection, "mode", None)
+                return mode == "mxfp8" or (
+                    mode == "affine" and getattr(projection, "bits", None) == 8
+                )
         return False
 
     def __call__(
