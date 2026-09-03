@@ -16,6 +16,48 @@ from .speculative_verifier import Glm5NextSpeculativeVerifier
 _SPECULATIVE_VERIFIER = Glm5NextSpeculativeVerifier()
 
 
+def _l2norm(x: mx.array, eps: float = 1e-6) -> mx.array:
+    """Reference L2 normalization used by the GLM KDA parity oracle."""
+    return x * mx.rsqrt((x * x).sum(axis=-1, keepdims=True) + eps)
+
+
+def recurrent_kimi_delta(
+    query: mx.array,
+    key: mx.array,
+    value: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    state: Optional[mx.array] = None,
+):
+    """Readable recurrent KDA reference used for implementation parity tests."""
+    dtype = query.dtype
+    query = _l2norm(query.astype(mx.float32))
+    key = _l2norm(key.astype(mx.float32))
+    value = value.astype(mx.float32)
+    g = g.astype(mx.float32)
+    beta = beta.astype(mx.float32)
+    batch, length, heads, key_dim = key.shape
+    value_dim = value.shape[-1]
+    query = query * (key_dim**-0.5)
+    if state is None:
+        state = mx.zeros((batch, heads, key_dim, value_dim), dtype=mx.float32)
+    else:
+        state = state.astype(mx.float32)
+    outputs = []
+    for index in range(length):
+        q_i = query[:, index]
+        k_i = key[:, index]
+        v_i = value[:, index]
+        g_i = mx.exp(g[:, index])[..., None]
+        beta_i = beta[:, index][..., None]
+        state = state * g_i
+        memory = (state * k_i[..., None]).sum(axis=-2)
+        delta = (v_i - memory) * beta_i
+        state = state + k_i[..., None] * delta[..., None, :]
+        outputs.append((state * q_i[..., None]).sum(axis=-2))
+    return mx.stack(outputs, axis=1).astype(dtype), state
+
+
 @mx.compile
 def _limited_swiglu(gate: mx.array, up: mx.array, limit: float) -> mx.array:
     gate = mx.minimum(gate, limit)
@@ -168,7 +210,7 @@ class ShortConv1d(nn.Module):
 
 
 class Glm5NextLinearAttention(nn.Module):
-    def __init__(self, config: TextConfig, layer_idx: int):
+    def __init__(self, config: TextConfig, layer_idx: int = 0):
         super().__init__()
         self.layer_idx = layer_idx
         self.num_heads = config.linear_num_heads
@@ -683,6 +725,16 @@ class Glm5NextIndexer(nn.Module):
                 -1,
             )
 
+        # Keep the pooled-key region at a fixed width so the optional tail
+        # always occupies the same slots across ragged batch rows.
+        if topk.shape[-1] < self.index_topk:
+            topk = mx.pad(
+                topk,
+                [(0, 0), (0, 0), (0, self.index_topk - topk.shape[-1])],
+                constant_values=-1,
+            )
+        topk = topk[..., : self.index_topk]
+
         output_width = self.index_topk
         if self.always_select_tail and self.index_kpool > 1:
             tail_width = self.index_kpool - 1
@@ -905,6 +957,7 @@ class DecoderLayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
         self.block_type = config.layer_types[layer_idx]
+        self.is_linear = self.block_type == "linear_attention"
         self.self_attn = (
             Glm5NextLinearAttention(config, layer_idx)
             if self.block_type == "linear_attention"
@@ -1060,6 +1113,9 @@ class LanguageModel(nn.Module):
             attention_mask,
             hidden_sink=hidden_sink,
         )
+        num_logits_to_keep = kwargs.get("num_logits_to_keep", 0)
+        if num_logits_to_keep:
+            hidden = hidden[:, -num_logits_to_keep:, :]
         if skip_logits:
             logits = None
         elif self.args.tie_word_embeddings:

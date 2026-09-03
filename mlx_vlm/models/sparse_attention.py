@@ -3,7 +3,6 @@ from typing import Optional
 
 import mlx.core as mx
 
-
 _INDEXED_SPARSE_ATTENTION_SOURCE = r"""
     uint row_idx = threadgroup_position_in_grid.y;
     uint simd_gid = simdgroup_index_in_threadgroup;

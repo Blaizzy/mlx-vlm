@@ -2,7 +2,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..qwen3_5 import Model as Qwen3_5Model
-from ..qwen3_5.fp8 import convert_qwen_fp8_weights
 from ..qwen3_5.qwen3_5 import (
     NORM_WEIGHT_SUFFIXES,
     sanitize_key,
@@ -27,7 +26,6 @@ class Model(Qwen3_5Model):
         # The MTP draft shard is separate from the base model. Its presence
         # must not select the base model's RMSNorm loading convention.
         weights = {key: value for key, value in weights.items() if "mtp." not in key}
-        weights = convert_qwen_fp8_weights(weights)
         shift_norm_weights = should_shift_norm_weights(weights)
 
         if self.config.text_config.tie_word_embeddings:
