@@ -97,9 +97,13 @@ class Gemma4DSparkDecoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(config.hidden_size, eps=eps)
         self.layer_scalar = mx.ones((1,))
 
-    def __call__(self, x: mx.array, x_ctx: mx.array, rope, cache) -> mx.array:
+    def __call__(
+        self, x: mx.array, x_ctx: mx.array, rope, cache, projected_context=None
+    ) -> mx.array:
         residual = x
-        h = self.self_attn(self.input_layernorm(x), x_ctx, rope, cache)
+        h = self.self_attn(
+            self.input_layernorm(x), x_ctx, rope, cache, projected_context
+        )
         h = residual + self.post_attention_layernorm(h)
 
         residual = h
