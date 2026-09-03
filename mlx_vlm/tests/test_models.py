@@ -3875,6 +3875,45 @@ class TestModels(unittest.TestCase):
         # indexer pool rolled back to the trimmed length (not fully rebuilt each round)
         self.assertEqual(cver[fa][1]._pool[3], cref[fa][0].offset)
 
+    def test_glm5_next_affine4_verify_matches_singleton_decode(self):
+        import mlx.nn as nn
+
+        from mlx_vlm.models.glm5_next.language import LanguageModel
+
+        mx.random.seed(0)
+        lm = LanguageModel(self._glm5_next_mtp_text_config())
+        nn.quantize(
+            lm,
+            group_size=64,
+            bits=4,
+            mode="affine",
+            class_predicate=lambda _, module: hasattr(module, "to_quantized"),
+        )
+        lm.eval()
+        prompt = mx.array([[2, 4, 6, 8], [3, 5, 7, 9]])
+        block = mx.array([[1, 3], [5, 7]])
+
+        sequential_cache = lm.make_cache()
+        lm(prompt, cache=sequential_cache, skip_logits=True)
+        sequential = mx.concatenate(
+            [
+                lm(
+                    block[:, position : position + 1],
+                    cache=sequential_cache,
+                    return_hidden=True,
+                    skip_logits=True,
+                ).hidden_states[-1]
+                for position in range(block.shape[1])
+            ],
+            axis=1,
+        )
+
+        verify_cache = lm.make_cache()
+        lm(prompt, cache=verify_cache, skip_logits=True)
+        verified, _, _ = lm.speculative_verify_hidden(block, verify_cache)
+        mx.eval(sequential, verified)
+        self.assertTrue(mx.array_equal(sequential, verified).item())
+
     def test_glm5_next_affine8_verify_matches_singleton_decode(self):
         import mlx.nn as nn
 
