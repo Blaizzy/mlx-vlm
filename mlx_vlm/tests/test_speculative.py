@@ -38,7 +38,7 @@ from mlx_vlm.models.cache import (
     PoolingCache,
     RotatingKVCache,
 )
-from mlx_vlm.models.glm5_next.speculative_kernels import (
+from mlx_vlm.models.glm5_next.speculative_verifier import (
     exact_quantized_block_argmax,
     exact_quantized_block_linear,
 )
