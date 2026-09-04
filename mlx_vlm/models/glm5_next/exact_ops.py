@@ -413,69 +413,6 @@ if (tid < D4) {
 """
 
 
-_DENSE_BLOCK_GEMV_SOURCE = r"""
-uint tile = threadgroup_position_in_grid.y * SIMDS +
-    simdgroup_index_in_threadgroup;
-uint lane = thread_index_in_simdgroup;
-constexpr int TM = 4;
-constexpr int TN = 4;
-constexpr int BLOCK_N = 32 * TN;
-int out_row = int(tile) * TM;
-int column = int(lane) * TN;
-float result[BATCH_SIZE][VERIFY_T][TM] = {0.0f};
-
-for (int k = 0; k < K_SIZE; k += BLOCK_N) {
-  float vectors[BATCH_SIZE][VERIFY_T][TN];
-  for (int b = 0; b < BATCH_SIZE; ++b) {
-    for (int t = 0; t < VERIFY_T; ++t) {
-      const device T* source =
-          x + (b * VERIFY_T + t) * K_SIZE + k + column;
-      for (int tn = 0; tn < TN; ++tn) {
-        vectors[b][t][tn] = float(source[tn]);
-      }
-    }
-  }
-  for (int tm = 0; tm < TM; ++tm) {
-    const device T* source = weight + (out_row + tm) * K_SIZE + k + column;
-    T values[TN];
-    for (int tn = 0; tn < TN; ++tn) {
-      values[tn] = source[tn];
-    }
-    for (int b = 0; b < BATCH_SIZE; ++b) {
-      for (int t = 0; t < VERIFY_T; ++t) {
-        for (int tn = 0; tn < TN; ++tn) {
-          result[b][t][tm] += values[tn] * vectors[b][t][tn];
-        }
-      }
-    }
-  }
-}
-
-for (int b = 0; b < BATCH_SIZE; ++b) {
-  for (int t = 0; t < VERIFY_T; ++t) {
-    for (int tm = 0; tm < TM; ++tm) {
-      for (ushort offset = 16; offset >= 1; offset >>= 1) {
-        result[b][t][tm] += simd_shuffle_down(result[b][t][tm], offset);
-      }
-    }
-  }
-}
-if (lane == 0) {
-  for (int b = 0; b < BATCH_SIZE; ++b) {
-    for (int t = 0; t < VERIFY_T; ++t) {
-      for (int tm = 0; tm < TM; ++tm) {
-        out[(b * VERIFY_T + t) * OUT_SIZE + out_row + tm] =
-            T(result[b][t][tm]);
-      }
-    }
-  }
-}
-"""
-
-
-_DENSE_BLOCK_MIN_WEIGHT_SIZE = 50_000_000
-
-
 _HC_EXPAND_SOURCE = r"""
 uint group = threadgroup_position_in_grid.x;
 uint lane = thread_index_in_simdgroup;
@@ -905,36 +842,6 @@ def _hc_normalized_norm_kernel(
 
 
 @lru_cache(maxsize=None)
-def _fp32_decode_block_gemv_kernel(weight_dtype, length, k_size, out_size):
-    return mx.fast.metal_kernel(
-        name=(
-            "glm5_next_verify_fp32_decode_block_gemv_"
-            f"{_dtype_name(weight_dtype)}_t{length}_k{k_size}_o{out_size}"
-        ),
-        input_names=["x", "weight"],
-        output_names=["out"],
-        header=_COMMON_HEADER,
-        source=_HC_MIX_GEMV_SOURCE.replace(
-            "constexpr int BN = 8;", "constexpr int BN = 1;"
-        ),
-    )
-
-
-@lru_cache(maxsize=None)
-def _dense_block_gemv_kernel(dtype, batch, length, k_size, out_size):
-    return mx.fast.metal_kernel(
-        name=(
-            "glm5_next_verify_dense_block_gemv_"
-            f"{_dtype_name(dtype)}_b{batch}_t{length}_k{k_size}_o{out_size}"
-        ),
-        input_names=["x", "weight"],
-        output_names=["out"],
-        header=_COMMON_HEADER,
-        source=_DENSE_BLOCK_GEMV_SOURCE,
-    )
-
-
-@lru_cache(maxsize=None)
 def _hc_expand_kernel(dtype, rows, hc_mult, width):
     return mx.fast.metal_kernel(
         name=(
@@ -1015,47 +922,26 @@ def _affine_moe_down_kernel(
 
 
 def exact_dense_block_linear(linear, x: mx.array) -> Optional[mx.array]:
-    """Decode-exact B=1 dense projection with weight reuse across time."""
+    """Project every verifier position with the target's native batch shape."""
     if (
-        not mx.metal.is_available()
-        or not isinstance(linear, nn.Linear)
+        not isinstance(linear, nn.Linear)
         or "bias" in linear
         or x.ndim != 3
-        or not 1 <= x.shape[0] <= 4
-        or not 1 < x.shape[1] <= 4
+        or x.shape[0] < 1
+        or x.shape[1] <= 1
         or x.dtype not in (mx.bfloat16, mx.float16)
         or linear.weight.dtype != x.dtype
-        or linear.weight.size < _DENSE_BLOCK_MIN_WEIGHT_SIZE
         or linear.weight.shape[1] != x.shape[-1]
-        or x.shape[-1] % 128
-        or linear.weight.shape[0] % 16
     ):
         return None
 
-    batch, length, k_size = x.shape
-    out_size = linear.weight.shape[0]
-    x = mx.contiguous(x)
-    kernel = _dense_block_gemv_kernel(x.dtype, batch, length, k_size, out_size)
-    return kernel(
-        inputs=[x, linear.weight],
-        template=[
-            ("T", x.dtype),
-            ("BATCH_SIZE", int(batch)),
-            ("VERIFY_T", int(length)),
-            ("K_SIZE", int(k_size)),
-            ("OUT_SIZE", int(out_size)),
-            # The launch uses four SIMD groups per threadgroup.  Keeping this
-            # stride in sync with ``threadgroup=(32, 4, 1)`` is required to
-            # cover every output tile; a stride of eight leaves alternate
-            # regions unwritten and can surface as NaNs when buffers are
-            # reused by an FP8 target.
-            ("SIMDS", 4),
+    return mx.concatenate(
+        [
+            linear(mx.contiguous(x[:, position : position + 1]))
+            for position in range(x.shape[1])
         ],
-        grid=(32, out_size // 4, 1),
-        threadgroup=(32, 4, 1),
-        output_shapes=[(batch, length, out_size)],
-        output_dtypes=[x.dtype],
-    )[0]
+        axis=1,
+    )
 
 
 def exact_affine_switch_gate_up(switch, x: mx.array, indices: mx.array):
@@ -1335,37 +1221,28 @@ def exact_hc_norm(connection, norm, x: mx.array, mixes: mx.array):
 
 
 def exact_fp32_decode_block_gemv(x: mx.array, weight: mx.array) -> Optional[mx.array]:
-    """Share a BF16 weight across FP32 verifier rows using GEMV arithmetic."""
+    """Project FP32 verifier positions with the target's native batch shape."""
     if (
-        not mx.metal.is_available()
-        or x.ndim != 3
-        or x.shape[0] != 1
-        or not 1 < x.shape[1] <= 4
+        x.ndim != 3
+        or x.shape[0] < 1
+        or x.shape[1] <= 1
         or x.dtype != mx.float32
         or weight.ndim != 2
         or weight.dtype not in (mx.bfloat16, mx.float16, mx.float32)
         or x.shape[-1] != weight.shape[-1]
-        or x.shape[-1] != 4096
-        or weight.shape[0] % 4
     ):
         return None
 
-    _, length, k_size = x.shape
-    out_size = weight.shape[0]
-    kernel = _fp32_decode_block_gemv_kernel(weight.dtype, length, k_size, out_size)
-    return kernel(
-        inputs=[mx.contiguous(x), weight],
-        template=[
-            ("W", weight.dtype),
-            ("VERIFY_T", int(length)),
-            ("K_SIZE", int(k_size)),
-            ("OUT_SIZE", int(out_size)),
+    return mx.concatenate(
+        [
+            mx.matmul(
+                mx.contiguous(x[:, position : position + 1]),
+                weight.T,
+            )
+            for position in range(x.shape[1])
         ],
-        grid=(32 * (out_size // 4), 1, 1),
-        threadgroup=(32, 1, 1),
-        output_shapes=[(1, length, out_size)],
-        output_dtypes=[mx.float32],
-    )[0]
+        axis=1,
+    )
 
 
 def exact_hc_expand(

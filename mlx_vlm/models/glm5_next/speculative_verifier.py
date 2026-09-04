@@ -17,13 +17,10 @@ from ..qwen3_5.speculative_verifier import _target_verify_linear
 from .exact_ops import (
     clamped_swiglu,
     combine_moe_outputs,
-    exact_affine_moe_down,
-    exact_affine_switch_gate_up,
     exact_dense_block_linear,
     exact_fp32_decode_block_gemv,
     exact_hc_expand,
     exact_hc_norm,
-    exact_hc_normalized_norm,
     scaled_rms_norm,
 )
 
@@ -76,8 +73,6 @@ class Glm5NextSpeculativeVerifier:
         output = exact_quantized_linear(linear, x)
         if output is not None:
             return output
-        if x.shape[0] == 1:
-            return self._singleton_linear(linear, x)
         return self._singleton_linear(linear, x)
 
     def _dense_mlp(self, mlp, x):
@@ -115,22 +110,18 @@ class Glm5NextSpeculativeVerifier:
         flat_x = mx.contiguous(x).reshape(batch * length, width)
         flat_indices = indices.reshape(batch * length, top_k)
         switch = moe.switch_mlp
-        gate_up = exact_affine_switch_gate_up(switch, x, indices)
-        if gate_up is None:
-            up = exact_quantized_switch_linear(switch.up_proj, x, indices)
-            gate = exact_quantized_switch_linear(switch.gate_proj, x, indices)
-            if up is None or gate is None:
-                projected = mx.expand_dims(flat_x, (-2, -3))
-                up = switch.up_proj(projected, flat_indices, sorted_indices=False)
-                gate = switch.gate_proj(
-                    projected,
-                    flat_indices,
-                    sorted_indices=False,
-                )
-                up = up.squeeze(-2).reshape(batch, length, top_k, -1)
-                gate = gate.squeeze(-2).reshape(batch, length, top_k, -1)
-        else:
-            up, gate = gate_up
+        up = exact_quantized_switch_linear(switch.up_proj, x, indices)
+        gate = exact_quantized_switch_linear(switch.gate_proj, x, indices)
+        if up is None or gate is None:
+            projected = mx.expand_dims(flat_x, (-2, -3))
+            up = switch.up_proj(projected, flat_indices, sorted_indices=False)
+            gate = switch.gate_proj(
+                projected,
+                flat_indices,
+                sorted_indices=False,
+            )
+            up = up.squeeze(-2).reshape(batch, length, top_k, -1)
+            gate = gate.squeeze(-2).reshape(batch, length, top_k, -1)
         activated = switch.activation(up, gate)
         shared_gate, shared_up = mx.split(
             self._block_linear(moe.shared_experts.gate_up_proj, x),
@@ -142,25 +133,6 @@ class Glm5NextSpeculativeVerifier:
             shared_up,
             moe.shared_experts.swiglu_limit,
         )
-        # Affine-4/5 verification can consume the routed and shared expert
-        # activations together.  Prefer that path before materializing the
-        # shared down projection; it removes one full 4096-wide quantized
-        # dispatch per MoE layer.
-        fused_moe = (
-            exact_affine_moe_down(
-                switch.down_proj,
-                activated,
-                indices,
-                weights,
-                moe.shared_experts.down_proj,
-                shared_hidden,
-            )
-            if gate_up is not None
-            else None
-        )
-        if fused_moe is not None:
-            return fused_moe
-
         shared = self._block_linear(
             moe.shared_experts.down_proj,
             shared_hidden,
@@ -408,19 +380,6 @@ class Glm5NextSpeculativeVerifier:
         )
 
     def _hc_norm(self, connection, norm, x):
-        # The fixed GLM verifier shape can keep the complete HC ingress in one
-        # dispatch: input RMSNorm, mix projection, Sinkhorn/collapse, and the
-        # decoder RMSNorm.  Besides avoiding three intermediate arrays, this
-        # preserves the decode reduction tree used by the split exact path.
-        # The single-row Metal kernel is decode exact at B=1. At B>1 its
-        # FP32 post/comb rounding can differ from the target's batched HC path
-        # by one ULP, which is enough to flip a later greedy token. Keep the
-        # exact split mix/collapse kernel below for batched verification.
-        output = (
-            exact_hc_normalized_norm(connection, norm, x) if x.shape[0] == 1 else None
-        )
-        if output is not None:
-            return output
         if _hc_kernel is not None:
             _y, mixes = self._hc_inputs(connection, x)
             output = self._hc_norm_from_mixes(connection, norm, x, mixes)

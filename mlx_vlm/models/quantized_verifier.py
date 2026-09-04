@@ -35,27 +35,14 @@ def _input_dims(module) -> int:
 
 
 def _exact_time_batch(linear: nn.QuantizedLinear, x: mx.array) -> mx.array:
-    """Run all verifier positions together while retaining decode's M dimension."""
-    length = x.shape[1]
-    transposed = mx.contiguous(x.transpose(1, 0, 2))
-    weight = mx.broadcast_to(linear.weight[None], (length, *linear.weight.shape))
-    scales = mx.broadcast_to(linear.scales[None], (length, *linear.scales.shape))
-    biases = linear.get("biases")
-    if biases is not None:
-        biases = mx.broadcast_to(biases[None], (length, *biases.shape))
-    output = mx.quantized_matmul(
-        transposed,
-        weight,
-        scales=scales,
-        biases=biases,
-        transpose=True,
-        group_size=linear.group_size,
-        bits=linear.bits,
-        mode=linear.mode,
-    ).transpose(1, 0, 2)
-    if "bias" in linear:
-        output = output + linear["bias"]
-    return output
+    """Run every verifier position with the target's native batch shape."""
+    return mx.concatenate(
+        [
+            linear(mx.contiguous(x[:, position : position + 1]))
+            for position in range(x.shape[1])
+        ],
+        axis=1,
+    )
 
 
 def exact_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
@@ -1043,6 +1030,12 @@ def _can_optimized_affine_head(linear) -> bool:
 
 
 def _can_optimized_affine_linear(linear, x: mx.array) -> bool:
+    """Check the singleton path whose reduction matches B=1 decode exactly.
+
+    Batched decode uses MLX's qmv-wide/qmm dispatch and has a different
+    accumulation tree.  Those inputs intentionally fall through to
+    ``exact_quantized_linear`` instead of being reinterpreted as verifier time.
+    """
     if (
         not _can_optimized_affine_head(linear)
         or x.ndim != 3
@@ -1105,13 +1098,6 @@ def optimized_affine_argmax(
         return None
 
     B, T, K = x.shape
-    if T == 1 and 1 < B <= 4:
-        out = optimized_affine_argmax(
-            linear, x.transpose(1, 0, 2), token_mask=token_mask
-        )
-        if out is not None:
-            return out.transpose(1, 0)
-
     N = linear.weight.shape[0]
     streamed = linear.bits == 4 and 6 <= T <= 8
     token_tiled = linear.bits == 4 and T >= 6 and not streamed
@@ -1479,10 +1465,7 @@ class QuantizedVerifierOps:
         return mx.argmax(logits, axis=-1)
 
 
-DEFAULT_QUANTIZED_VERIFIER = QuantizedVerifierOps(
-    linear_backends=(optimized_affine_linear,),
-    argmax_backends=(optimized_affine_argmax, optimized_nvfp4_argmax),
-)
+DEFAULT_QUANTIZED_VERIFIER = QuantizedVerifierOps()
 
 
 __all__ = [

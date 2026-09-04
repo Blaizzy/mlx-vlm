@@ -21,8 +21,8 @@ from mlx.utils import tree_flatten, tree_map
 
 import mlx_vlm.models.deepseek_v4.language as deepseek_language
 import mlx_vlm.models.gemma4.language as gemma4_language
+import mlx_vlm.models.glm5_next.exact_ops as glm5_next_exact_ops
 import mlx_vlm.models.glm5_next.language as glm5_next_language
-import mlx_vlm.models.glm5_next.speculative_verifier as glm5_next_verifier
 import mlx_vlm.models.laguna.language as laguna_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.models.qwen3_5.speculative_verifier as qwen_verifier
@@ -4126,30 +4126,26 @@ def test_glm5_next_mtp_last_only_commit_preserves_cache_and_final_output():
                 assert mx.array_equal(full_value, last_value).item()
 
 
-def test_glm5_next_hc_ingress_fusion_is_single_batch_only(monkeypatch):
-    text_config = _tiny_glm5_next_text_config()
-    connection = glm5_next_language.HyperConnection(text_config)
-    norm = nn.RMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
-    inputs = mx.zeros(
-        (2, 2, text_config.hc_mult, text_config.hidden_size),
-        dtype=mx.float32,
+@pytest.mark.parametrize("batch", [1, 2, 4, 5, 8, 9, 16, 32, 64])
+@pytest.mark.parametrize("length", [2, 4, 6])
+def test_glm5_next_dense_verifier_matches_batched_decode(batch, length):
+    mx.random.seed(90 + batch)
+    linear = nn.Linear(512, 32, bias=False)
+    linear.weight = linear.weight.astype(mx.bfloat16)
+    inputs = mx.random.normal((batch, length, 512)).astype(mx.bfloat16)
+    expected = mx.concatenate(
+        [
+            linear(mx.contiguous(inputs[:, position : position + 1]))
+            for position in range(inputs.shape[1])
+        ],
+        axis=1,
     )
-    calls = []
 
-    def fused(_connection, _norm, value):
-        calls.append(value.shape[0])
-        return (
-            mx.zeros((1, 2, text_config.hidden_size)),
-            mx.zeros((1, 2, text_config.hc_mult)),
-            mx.zeros((1, 2, text_config.hc_mult, text_config.hc_mult)),
-        )
+    actual = glm5_next_exact_ops.exact_dense_block_linear(linear, inputs)
+    mx.eval(expected, actual)
 
-    monkeypatch.setattr(glm5_next_verifier, "exact_hc_normalized_norm", fused)
-    glm5_next_language._SPECULATIVE_VERIFIER._hc_norm(connection, norm, inputs)
-    assert calls == []
-
-    glm5_next_language._SPECULATIVE_VERIFIER._hc_norm(connection, norm, inputs[:1])
-    assert calls == [1]
+    assert actual is not None
+    assert mx.array_equal(actual, expected).item()
 
 
 @pytest.mark.parametrize(
@@ -4161,7 +4157,7 @@ def test_glm5_next_hc_ingress_fusion_is_single_batch_only(monkeypatch):
         ("nvfp4", 4, 16),
     ],
 )
-@pytest.mark.parametrize("batch", [1, 2, 4])
+@pytest.mark.parametrize("batch", [1, 2, 4, 5, 8, 9, 16, 32, 64])
 def test_general_quantized_verifier_matches_decode(
     mode,
     bits,
@@ -4195,6 +4191,7 @@ def test_general_quantized_verifier_matches_decode(
     assert mx.array_equal(tokens, mx.argmax(expected, axis=-1)).item()
 
 
+@pytest.mark.parametrize("batch", [1, 2, 5, 8, 9, 16, 32, 64])
 @pytest.mark.parametrize(
     ("mode", "bits", "group_size"),
     [
@@ -4204,7 +4201,9 @@ def test_general_quantized_verifier_matches_decode(
         ("nvfp4", 4, 16),
     ],
 )
-def test_general_quantized_switch_verifier_matches_decode(mode, bits, group_size):
+def test_general_quantized_switch_verifier_matches_decode(
+    mode, bits, group_size, batch
+):
     mx.random.seed(200 + bits)
     linear = QuantizedSwitchLinear(
         512,
@@ -4215,14 +4214,8 @@ def test_general_quantized_switch_verifier_matches_decode(mode, bits, group_size
         bits=bits,
         mode=mode,
     )
-    inputs = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
-    indices = mx.array(
-        [
-            [[0, 1], [2, 3], [1, 2]],
-            [[3, 2], [1, 0], [2, 0]],
-        ],
-        dtype=mx.int32,
-    )
+    inputs = mx.random.normal((batch, 3, 512)).astype(mx.bfloat16)
+    indices = mx.arange(batch * 3 * 2, dtype=mx.int32).reshape(batch, 3, 2) % 4
     expected = []
     for position in range(inputs.shape[1]):
         hidden = mx.expand_dims(mx.contiguous(inputs[:, position]), (-2, -3))
@@ -4237,6 +4230,7 @@ def test_general_quantized_switch_verifier_matches_decode(mode, bits, group_size
     assert mx.array_equal(actual, expected).item()
 
 
+@pytest.mark.parametrize("batch", [1, 2, 5, 8, 9, 16, 32, 64])
 @pytest.mark.parametrize(
     ("mode", "bits", "group_size"),
     [
@@ -4250,6 +4244,7 @@ def test_general_quantized_selected_verifier_matches_decode(
     mode,
     bits,
     group_size,
+    batch,
 ):
     mx.random.seed(300 + bits)
     linear = QuantizedSwitchLinear(
@@ -4261,14 +4256,8 @@ def test_general_quantized_selected_verifier_matches_decode(
         bits=bits,
         mode=mode,
     )
-    inputs = mx.random.normal((2, 3, 2, 512)).astype(mx.bfloat16)
-    indices = mx.array(
-        [
-            [[0, 1], [2, 3], [1, 2]],
-            [[3, 2], [1, 0], [2, 0]],
-        ],
-        dtype=mx.int32,
-    )
+    inputs = mx.random.normal((batch, 3, 2, 512)).astype(mx.bfloat16)
+    indices = mx.arange(batch * 3 * 2, dtype=mx.int32).reshape(batch, 3, 2) % 4
     expected = []
     for position in range(inputs.shape[1]):
         hidden = mx.expand_dims(mx.contiguous(inputs[:, position]), -2)
