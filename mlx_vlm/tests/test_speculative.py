@@ -2325,7 +2325,12 @@ def test_dflash_committed_hidden_segments_keep_per_row_lengths():
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize(
     "config_fields,expected_eos",
-    [({"eos_token_id": 99}, {99}), ({"eos_token_id": [98, 99]}, {98, 99}), ({}, None)],
+    [
+        ({"eos_token_id": 99}, {99}),
+        ({"eos_token_id": [98, 99]}, {98, 99}),
+        ({}, None),
+        (None, None),
+    ],
 )
 def test_dflash_direct_dispatch_propagates_model_eos(
     monkeypatch, batch_size, config_fields, expected_eos
@@ -2344,7 +2349,11 @@ def test_dflash_direct_dispatch_propagates_model_eos(
     monkeypatch.setattr(speculative_utils, "_dflash_rounds_batch", batch)
     output = list(
         speculative_utils.run_speculative_rounds(
-            SimpleNamespace(config=SimpleNamespace(**config_fields)),
+            (
+                SimpleNamespace(config=SimpleNamespace(**config_fields))
+                if config_fields is not None
+                else SimpleNamespace()
+            ),
             SimpleNamespace(),
             [],
             mx.ones((batch_size, 1), dtype=mx.int32),

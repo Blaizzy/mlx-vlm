@@ -369,7 +369,7 @@ def run_speculative_rounds(
         )
 
     hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)
-    eos = getattr(model.config, "eos_token_id", None)
+    eos = getattr(getattr(model, "config", None), "eos_token_id", None)
     if isinstance(eos, int):
         eos_set = {eos}
     elif eos is None:
