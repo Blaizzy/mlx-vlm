@@ -16,6 +16,7 @@ _TEMPLATE_MARKERS = [
     (("<minimax:tool_call>",), "minimax_m2"),
     (("<start_function_call>",), "function_gemma"),
     (("<longcat_tool_call>",), "longcat"),
+    (("<tool_call>", "<arg_key>", "<arg_value>"), "poolside_v1"),
     (("<arg_key>",), "glm47"),
     (("<|tool_call_start|>", "<|tool_call_end|>"), "pythonic"),
     (("<|tool_list_start|>",), "pythonic"),
