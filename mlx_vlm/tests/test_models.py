@@ -18403,6 +18403,43 @@ def test_glm5_next_speculative_verify_matches_sequential_decode_arithmetic():
     assert mx.allclose(verify_hidden, sequential_hidden, atol=1e-5, rtol=1e-5).item()
 
 
+@pytest.mark.parametrize(("batch", "length"), [(1, 2), (2, 4), (4, 2)])
+def test_glm5_next_dense_verifier_kernel_covers_all_outputs(
+    monkeypatch, batch, length
+):
+    import mlx_vlm.models.glm5_next.speculative_verifier as verifier
+
+    if not mx.metal.is_available():
+        pytest.skip("Metal is required for the fused verifier kernel")
+
+    mx.random.seed(23)
+    monkeypatch.setattr(verifier, "_DENSE_BLOCK_MIN_WEIGHT_SIZE", 0)
+    linear = nn.Linear(128, 16, bias=False)
+    linear.weight = mx.random.uniform(
+        low=-0.25,
+        high=0.25,
+        shape=linear.weight.shape,
+    ).astype(mx.bfloat16)
+    inputs = mx.random.uniform(
+        low=-0.25,
+        high=0.25,
+        shape=(batch, length, 128),
+    ).astype(mx.bfloat16)
+
+    actual = verifier.exact_dense_block_linear(linear, inputs)
+    expected = mx.concatenate(
+        [
+            linear(mx.contiguous(inputs[:, position : position + 1]))
+            for position in range(inputs.shape[1])
+        ],
+        axis=1,
+    )
+    mx.eval(actual, expected)
+
+    assert actual is not None
+    assert mx.array_equal(actual, expected).item()
+
+
 def test_glm5_next_chunked_prefill_policy_supports_mtp_capture():
     language_model = LanguageModel(_text_config())
     draft_model = object()

@@ -490,6 +490,9 @@ if (lane == 0) {
 """
 
 
+_DENSE_BLOCK_MIN_WEIGHT_SIZE = 50_000_000
+
+
 _HC_EXPAND_SOURCE = r"""
 uint group = threadgroup_position_in_grid.x;
 uint lane = thread_index_in_simdgroup;
@@ -1512,10 +1515,10 @@ def exact_dense_block_linear(linear, x: mx.array) -> Optional[mx.array]:
         or not 1 < x.shape[1] <= 4
         or x.dtype not in (mx.bfloat16, mx.float16)
         or linear.weight.dtype != x.dtype
-        or linear.weight.size < 50_000_000
+        or linear.weight.size < _DENSE_BLOCK_MIN_WEIGHT_SIZE
         or linear.weight.shape[1] != x.shape[-1]
         or x.shape[-1] % 128
-        or linear.weight.shape[0] % 4
+        or linear.weight.shape[0] % 16
     ):
         return None
 
@@ -1531,7 +1534,12 @@ def exact_dense_block_linear(linear, x: mx.array) -> Optional[mx.array]:
             ("VERIFY_T", int(length)),
             ("K_SIZE", int(k_size)),
             ("OUT_SIZE", int(out_size)),
-            ("SIMDS", 8),
+            # The launch uses four SIMD groups per threadgroup.  Keeping this
+            # stride in sync with ``threadgroup=(32, 4, 1)`` is required to
+            # cover every output tile; a stride of eight leaves alternate
+            # regions unwritten and can surface as NaNs when buffers are
+            # reused by an FP8 target.
+            ("SIMDS", 4),
         ],
         grid=(32, out_size // 4, 1),
         threadgroup=(32, 4, 1),
