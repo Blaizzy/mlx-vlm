@@ -66,6 +66,7 @@ from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
 )
 from mlx_vlm.speculative.drafters.gemma4_dflash import ModelConfig as Gemma4DFlashConfig
 from mlx_vlm.speculative.drafters.glm4_moe_lite_mtp.split import split_glm4_moe_lite_mtp
+from mlx_vlm.speculative.drafters.qwen3_5_mtp import CompactProposalHead
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
@@ -3447,6 +3448,63 @@ def test_qwen3_5_mtp_batch_accept_updates_ragged_cache():
     assert drafter._cache[0].offset.tolist() == [2, 1]
     assert drafter._cache[0].left_padding.tolist() == [1, 2]
     assert drafter._next_position.tolist() == [6, 5]
+
+
+def test_compact_qwen_proposal_head_maps_argmax_to_real_vocab():
+    dense = mx.random.uniform(shape=(16, 64), dtype=mx.float16)
+    weight, scales, biases = mx.quantize(dense, group_size=32, bits=4)
+    vocab_ids = mx.array([1, 3, 5, 7, 9, 11, 13, 15], dtype=mx.int32)
+    head = CompactProposalHead(
+        weight=weight[vocab_ids],
+        scales=scales[vocab_ids],
+        biases=biases[vocab_ids],
+        vocab_ids=vocab_ids,
+        group_size=32,
+        bits=4,
+    )
+    hidden = mx.random.uniform(shape=(2, 1, 64), dtype=mx.float16)
+    full_logits = mx.quantized_matmul(
+        hidden,
+        weight,
+        scales=scales,
+        biases=biases,
+        transpose=True,
+        group_size=32,
+        bits=4,
+    )
+    expected = vocab_ids[mx.argmax(full_logits[..., vocab_ids], axis=-1)]
+
+    assert mx.array_equal(head.propose(hidden), expected).item()
+    assert head.last_proposal_implementation == "quantized_matmul_argmax"
+
+
+def test_qwen_compact_proposal_falls_back_to_full_head_for_stochastic_drafting():
+    compact_calls = []
+    sampler_calls = []
+    compact = SimpleNamespace(
+        propose=lambda hidden: (
+            compact_calls.append(hidden) or mx.zeros(hidden.shape[:-1])
+        )
+    )
+    draft = SimpleNamespace(
+        _compact_proposal_head=compact,
+        _lm_head_fn=lambda hidden: hidden + mx.array([[[0.0, 1.0]]]),
+    )
+
+    def sampler(logits):
+        sampler_calls.append(logits)
+        return mx.argmax(logits, axis=-1)
+
+    token = Qwen3_5MTPDraftModel._propose_token(
+        draft,
+        mx.zeros((1, 1, 2)),
+        sampler,
+        False,
+    )
+
+    assert token.item() == 1
+    assert compact_calls == []
+    assert len(sampler_calls) == 1
 
 
 def test_qwen3_5_rollback_speculative_cache_trims_batch_rows_ragged():

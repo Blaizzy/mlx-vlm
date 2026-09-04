@@ -51,6 +51,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         self._input_embed = None
         self._input_embed_scale: float = 1.0
         self._lm_head_fn = None
+        self._compact_proposal_head = None
         self._cache: List[KVCache] = []
         self._seed_token: Optional[mx.array] = None
         self._seed_hidden: Optional[mx.array] = None
@@ -92,6 +93,20 @@ class Qwen3_5MTPDraftModel(nn.Module):
             or self._input_embed.as_linear
         )
         return self
+
+    def set_compact_proposal_head(self, head) -> None:
+        if head is not None and not callable(getattr(head, "propose", None)):
+            raise TypeError("compact proposal head must provide propose(hidden)")
+        self._compact_proposal_head = head
+
+    def _propose_token(self, hidden: mx.array, sampler, greedy: bool) -> mx.array:
+        if self._compact_proposal_head is not None and greedy:
+            return self._compact_proposal_head.propose(hidden)
+        # Compact heads are proposal-only argmax accelerators. For stochastic
+        # drafting, preserve the original full-head sampler and its independent
+        # drafter RNG stream rather than applying a truncated vocabulary.
+        logits = self._lm_head_fn(hidden)
+        return mx.argmax(logits, axis=-1) if greedy else sampler(logits)
 
     def make_cache(self, left_padding: Optional[List[int]] = None) -> List[KVCache]:
         if left_padding is not None:
@@ -203,8 +218,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         return self._forward_tokens(tok, hidden, token_dtype)
 
     def _set_seed_from_hidden(self, hidden: mx.array, sampler, greedy: bool) -> None:
-        logits = self._lm_head_fn(hidden)
-        self._seed_token = mx.argmax(logits, axis=-1) if greedy else sampler(logits)
+        self._seed_token = self._propose_token(hidden, sampler, greedy)
         self._seed_hidden = hidden
 
     def prefill_from_target_hidden(
@@ -461,8 +475,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         while len(tokens) < block_size - 1:
             h_prev = self._forward_token(tok, h_prev, token_dtype)
             self._round_appended += 1
-            logits = self._lm_head_fn(h_prev)
-            tok = mx.argmax(logits, axis=-1) if greedy else sampler(logits)
+            tok = self._propose_token(h_prev, sampler, greedy)
             tokens.append(tok)
 
         self._draft_round += 1
