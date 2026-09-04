@@ -3145,6 +3145,81 @@ class TestModels(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 1, config.text_config.vocab_size))
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
 
+    def test_glm5_next_indexer_pool_rewind_guard(self):
+        # Companion to test_glm5_next_indexer_stale_pool_guard (batch-axis
+        # staleness): a cache REWIND between decode steps (a multi-turn trim, a
+        # speculative rollback) leaves the incremental _pool with t_prev at or
+        # ahead of the cache length T. The time-continuity guard must fall back
+        # to a full pooling pass -- the unguarded fast path pools an empty
+        # suffix and argmaxes a zero-size array (#2084). The rewound decode must
+        # also equal a clean decode from a fresh prefill of the same prefix.
+        from mlx_vlm.models import glm5_next
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.models.glm5_next.language import Glm5NextSparseAttention
+
+        mx.random.seed(0)
+        cfg = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=4,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=2,
+            layer_types=["deepseek_sparse_attention"],
+            mlp_layer_types=["dense"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        dsa = Glm5NextSparseAttention(cfg)
+        dsa.eval()
+        S0, N = 12, 7  # full prefill, then rewind to N (> index_topk, still pooling)
+        x0 = mx.random.normal((1, S0, cfg.hidden_size))
+        qpos = mx.arange(S0)[:, None]
+        kpos = mx.arange(S0)[None, :]
+        xs = mx.random.normal((1, 1, cfg.hidden_size))
+
+        # reference: fresh prefill of the N-token prefix, then a clean decode step
+        c_ref = CacheList(KVCache(), KVCache())
+        dsa(x0[:, :N], (kpos <= qpos)[:N, :N], c_ref)
+        ref = dsa(xs, None, c_ref)
+
+        # rewound: full prefill + a decode step (arms the incremental _pool with
+        # t_prev = S0 + 1), then trim back to N and decode again
+        c2 = CacheList(KVCache(), KVCache())
+        dsa(x0, kpos <= qpos, c2)
+        dsa(xs, None, c2)
+        c2.trim(S0 + 1 - N)
+        out = dsa(xs, None, c2)  # unguarded: argmax over an empty pooling suffix
+        self.assertLess(float(mx.max(mx.abs(out - ref))), 1e-3)
+        self.assertEqual(c2[1]._pool[3], c2[1].offset)
+
     def test_glm5_next_kda_matches_recurrent(self):
         # The shared gated-delta path must match glm5_next's reference recurrence
         # (the KDA safe forget gate == gated_delta.compute_g_safe, term for term).
