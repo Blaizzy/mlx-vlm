@@ -1876,6 +1876,7 @@ class PromptProcessingBatch:
 
         # Declare per-row right-padding on each cache so finalize() can roll
         # it into left-padding once the prefill forward pass is complete.
+        self._needs_cache_finalization = False
         if right_pad_per_row is not None and any(right_pad_per_row):
             for c in self.prompt_cache:
                 prepare = getattr(c, "prepare", None)
@@ -1886,6 +1887,7 @@ class PromptProcessingBatch:
                         "APC mixed prefill requires a prompt cache with prepare()"
                     )
                 prepare(right_padding=right_pad_per_row, lengths=self._suffix_lens)
+            self._needs_cache_finalization = True
 
         self.prefill_step_size = _default_prefill_step_size_for_offload(
             self.model, self.prefill_step_size, draft_model, DEFAULT_PREFILL_STEP_SIZE
@@ -1909,6 +1911,75 @@ class PromptProcessingBatch:
 
     def __len__(self):
         return len(self.uids)
+
+    def filter(self, keep: List[int]) -> None:
+        """Keep prompt rows without changing their in-flight token positions."""
+        batch_size = len(self.uids)
+        if keep == list(range(batch_size)):
+            return
+
+        # Materialize the submitted chunk before mutating or releasing its
+        # cache state (including any borrowed APC blocks).
+        states = []
+        for c in self.prompt_cache:
+            try:
+                states.append(c.state)
+            except (AttributeError, TypeError):
+                pass
+        mx.eval(states)
+
+        if keep:
+            keep_arr = mx.array(keep, dtype=mx.int32)
+            for c in self.prompt_cache:
+                # Decode filters may compact common left padding. During
+                # prefill some of that padding still belongs to future chunks.
+                c.filter(keep_arr, compact=False)
+            self._input_ids = self._input_ids[keep_arr]
+            if self._inputs_embeds is not None:
+                self._inputs_embeds = self._inputs_embeds[keep_arr]
+            for key, value in self._prompt_kwargs.items():
+                if (
+                    isinstance(value, mx.array)
+                    and _prompt_kwarg_batch_size(key, value) == batch_size
+                ):
+                    self._prompt_kwargs[key] = (
+                        value[:, keep_arr, :]
+                        if _is_mrope_position_ids_prompt_kwarg(key, value)
+                        else value[keep_arr]
+                    )
+        else:
+            self.prompt_cache = []
+            self._input_ids = mx.zeros((0, 0), dtype=self._input_ids.dtype)
+            self._inputs_embeds = None
+            self._prompt_kwargs = {}
+            self._prompt_length_aware_keys = []
+            self._needs_cache_finalization = False
+
+        if self._apc_manager is not None:
+            keep_set = set(keep)
+            for idx, meta in enumerate(self._apc_meta):
+                if idx not in keep_set and meta is not None:
+                    self._apc_manager.release(meta.get("apc_blocks", []))
+        if self._apc_meta:
+            self._apc_meta = [self._apc_meta[idx] for idx in keep]
+        self.uids = [self.uids[idx] for idx in keep]
+        self._prompt_uids = [self._prompt_uids[idx] for idx in keep]
+        self.max_tokens = [self.max_tokens[idx] for idx in keep]
+        self._left_padding_per_row = [self._left_padding_per_row[idx] for idx in keep]
+        if self._right_pad_per_row is not None:
+            self._right_pad_per_row = [self._right_pad_per_row[idx] for idx in keep]
+        self._suffix_lens = [self._suffix_lens[idx] for idx in keep]
+        self._prompt_tokens_per_row = [self._prompt_tokens_per_row[idx] for idx in keep]
+        self._cached_tokens_per_row = [self._cached_tokens_per_row[idx] for idx in keep]
+        self._total_prompt_tokens = sum(self._suffix_lens)
+        if self.logits_processors:
+            self.logits_processors = [self.logits_processors[idx] for idx in keep]
+        if self.thinking_budget_criteria:
+            self.thinking_budget_criteria = [
+                self.thinking_budget_criteria[idx] for idx in keep
+            ]
+        if self._token_context:
+            self._token_context = [self._token_context[idx] for idx in keep]
 
     def _release_apc_meta_blocks(self):
         if self._apc_manager is None:
@@ -2131,8 +2202,9 @@ class PromptProcessingBatch:
         mx.async_eval(first_tokens)
 
         # Roll any right-padding into left-padding so the cache decoded by
-        # GenerationBatch sees a canonical layout.
-        if self._right_pad_per_row is not None and any(self._right_pad_per_row):
+        # GenerationBatch sees a canonical layout. Prepared caches still need
+        # finalization if cancellation removed every right-padded row.
+        if self._needs_cache_finalization:
             for c in self.prompt_cache:
                 finalize = getattr(c, "finalize", None)
                 if not callable(finalize):
@@ -2142,6 +2214,7 @@ class PromptProcessingBatch:
                         "APC mixed prefill requires a prompt cache with finalize()"
                     )
                 finalize()
+            self._needs_cache_finalization = False
         if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
             c0 = self.prompt_cache[0] if self.prompt_cache else None
             if c0 is not None:
@@ -2824,12 +2897,16 @@ class BatchGenerator:
 
             # Being prefilled
             if self._prompt_batch is not None and uid in self._prompt_batch.uids:
-                if len(self._prompt_batch.uids) == 1:
-                    self._prompt_batch.uids = []
-                    self._prompt_batch.prompt_cache = []
+                keep = [
+                    idx
+                    for idx, prompt_uid in enumerate(self._prompt_batch.uids)
+                    if prompt_uid != uid
+                ]
+                self._prompt_batch.filter(keep)
+                if not keep:
                     self._prompt_batch = None
-                    mx.clear_cache()
-                    return True
+                mx.clear_cache()
+                return True
 
             # Already decoding.
             if uid in self._generation_batch.uids:

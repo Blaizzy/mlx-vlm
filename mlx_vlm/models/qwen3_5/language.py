@@ -1259,6 +1259,7 @@ class Qwen3_5Model(nn.Module):
         position_ids: Optional[mx.array] = None,
         capture_layer_ids: Optional[List[int]] = None,
         hidden_sink: Optional[list] = None,
+        n_to_process: Optional[int] = None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -1269,37 +1270,11 @@ class Qwen3_5Model(nn.Module):
             cache = [None] * len(self.layers)
 
         fa_cache = cache[self.fa_idx]
+        # A cancelled prefill peer can leave a singleton whose next chunk is
+        # still partly (or entirely) left padding. Handle it before the
+        # singleton decode shortcut, including one-token prefill chunks.
         if (
-            h.shape[0] == 1
-            and hidden_sink is None
-            and fa_cache is not None
-            and _is_single_row_batch_cache(fa_cache)
-        ):
-            row_cache = []
-            for cache_entry in cache:
-                if cache_entry is None:
-                    row_cache.append(None)
-                elif _is_single_row_batch_cache(cache_entry):
-                    row_cache.append(_extract_row_cache(cache_entry, 0))
-                else:
-                    row_cache.append(cache_entry)
-
-            row_out = self(
-                inputs,
-                inputs_embeds=h,
-                cache=row_cache,
-                position_ids=position_ids,
-            )
-            for i, cache_entry in enumerate(row_cache):
-                if cache[i] is None or cache_entry is None:
-                    continue
-                if hasattr(cache[i].__class__, "merge"):
-                    cache[i] = cache[i].__class__.merge([cache_entry])
-            return row_out
-
-        if (
-            h.shape[0] > 1
-            and h.shape[1] > 1
+            (h.shape[1] > 1 or n_to_process is not None)
             and hidden_sink is None
             and fa_cache is not None
             and hasattr(fa_cache, "extract")
@@ -1372,6 +1347,34 @@ class Qwen3_5Model(nn.Module):
                             h.shape[1],
                         )
                 return mx.concatenate(row_outputs, axis=0)
+
+        if (
+            h.shape[0] == 1
+            and hidden_sink is None
+            and fa_cache is not None
+            and _is_single_row_batch_cache(fa_cache)
+        ):
+            row_cache = []
+            for cache_entry in cache:
+                if cache_entry is None:
+                    row_cache.append(None)
+                elif _is_single_row_batch_cache(cache_entry):
+                    row_cache.append(_extract_row_cache(cache_entry, 0))
+                else:
+                    row_cache.append(cache_entry)
+
+            row_out = self(
+                inputs,
+                inputs_embeds=h,
+                cache=row_cache,
+                position_ids=position_ids,
+            )
+            for i, cache_entry in enumerate(row_cache):
+                if cache[i] is None or cache_entry is None:
+                    continue
+                if hasattr(cache[i].__class__, "merge"):
+                    cache[i] = cache[i].__class__.merge([cache_entry])
+            return row_out
 
         fa_mask = _create_qwen3_5_attention_mask(h, cache[self.fa_idx])
         ssm_mask = _create_qwen3_5_ssm_mask(h, cache[self.ssm_idx])
@@ -2087,6 +2090,7 @@ class LanguageModel(nn.Module):
             position_ids=position_ids,
             capture_layer_ids=capture_layer_ids,
             hidden_sink=hidden_sink,
+            n_to_process=kwargs.get("n_to_process"),
         )
         if return_hidden:
             if hidden_sink is None:

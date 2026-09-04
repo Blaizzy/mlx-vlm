@@ -760,9 +760,9 @@ class MiniMaxM3BatchKVCache:
             return None
         return self.kv_cache.make_mask(*args, **kwargs)
 
-    def filter(self, batch_indices):
-        min_left_pad = self.left_padding[batch_indices].min().item()
-        self.kv_cache.filter(batch_indices)
+    def filter(self, batch_indices, *, compact=True):
+        min_left_pad = self.left_padding[batch_indices].min().item() if compact else 0
+        self.kv_cache.filter(batch_indices, compact=compact)
         if self.index_keys is not None:
             self.index_keys = self.index_keys[batch_indices]
             if min_left_pad > 0:

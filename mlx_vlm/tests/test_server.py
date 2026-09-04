@@ -58,6 +58,43 @@ def test_response_generator_prefill_step_override_wins_over_environment(monkeypa
     assert overridden_generator.prefill_step_size == 3072
 
 
+def test_response_generator_cancels_only_the_matching_active_request():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen._cancelled = {7, 99}
+    gen._cancel_lock = Lock()
+    queues = [Queue(), Queue()]
+    active = {7: {"rqueue": queues[0]}, 8: {"rqueue": queues[1]}}
+    batch_gen = MagicMock()
+    batch_gen.remove.return_value = True
+
+    gen._cancel_active_requests(batch_gen, active)
+
+    batch_gen.remove.assert_called_once_with(7)
+    assert list(active) == [8]
+    assert queues[0].get_nowait() is None
+    assert queues[1].empty()
+    assert gen._drain_cancellations() == set()
+
+
+def test_response_generator_does_not_hide_failed_cancellation():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen._cancelled = {7}
+    gen._cancel_lock = Lock()
+    rqueue = Queue()
+    active = {7: {"rqueue": rqueue}}
+    batch_gen = MagicMock()
+    batch_gen.remove.return_value = False
+
+    with pytest.raises(
+        RuntimeError, match="Failed to remove cancelled active request 7"
+    ):
+        gen._cancel_active_requests(batch_gen, active)
+
+    # The outer error handler still has the queue it must notify on failure.
+    assert 7 in active
+    assert rqueue.empty()
+
+
 def test_response_generator_clears_worker_streams(monkeypatch):
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
     error = RuntimeError("worker failed")
