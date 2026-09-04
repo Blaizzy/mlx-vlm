@@ -805,6 +805,32 @@ def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
     assert gen.draft_kind is None
 
 
+def test_server_enables_exact_8bit_verifier_linear_fusion(monkeypatch):
+    config = SimpleNamespace(eos_token_id=[])
+    model = SimpleNamespace(language_model=SimpleNamespace(config=config))
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    gen = _unstarted_response_generator()
+
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.delenv("MLX_VLM_DRAFT_KIND", raising=False)
+    monkeypatch.setenv("MLX_VLM_TARGET_VERIFY_FUSE_8BIT_LINEARS", "1")
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+    set_fusion = MagicMock()
+    monkeypatch.setattr(
+        "mlx_vlm.models.qwen3_5.speculative_verifier.set_target_verify_8bit_linear_fusion",
+        set_fusion,
+    )
+
+    gen._initialize_model()
+
+    set_fusion.assert_called_once_with(True)
+    assert gen.model is model
+
+
 def test_server_includes_processor_specific_stop_tokens(monkeypatch):
     config = SimpleNamespace(eos_token_id=[2])
     model = SimpleNamespace(language_model=SimpleNamespace(config=config))
@@ -6427,6 +6453,7 @@ class TestResponseGenerator:
             "MLX_VLM_PRELOAD_RERANKER_MODEL",
             "MLX_VLM_MODEL_DISCOVERY",
             "MLX_VLM_VISION_CACHE_SIZE",
+            "MLX_VLM_TARGET_VERIFY_FUSE_8BIT_LINEARS",
             "MLX_VLM_MAX_TOKENS",
             "MLX_VLM_THINKING_BUDGET",
             "MLX_VLM_THINKING_START_TOKEN",
@@ -6459,6 +6486,7 @@ class TestResponseGenerator:
                 "reranker-demo",
                 "--model-discovery",
                 "served",
+                "--target-verify-fuse-8bit-linears",
                 "--enable-thinking",
                 "--thinking-budget",
                 "128",
@@ -6490,6 +6518,7 @@ class TestResponseGenerator:
             assert os.environ["MLX_VLM_PRELOAD_STT_MODEL"] == "stt-demo"
             assert os.environ["MLX_VLM_PRELOAD_RERANKER_MODEL"] == "reranker-demo"
             assert os.environ["MLX_VLM_MODEL_DISCOVERY"] == "served"
+            assert os.environ["MLX_VLM_TARGET_VERIFY_FUSE_8BIT_LINEARS"] == "1"
             assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
             assert run_calls[0][1]["host"] == "127.0.0.1"
         finally:
@@ -6503,6 +6532,7 @@ class TestResponseGenerator:
                 "MLX_VLM_PRELOAD_RERANKER_MODEL",
                 "MLX_VLM_MODEL_DISCOVERY",
                 "MLX_VLM_VISION_CACHE_SIZE",
+                "MLX_VLM_TARGET_VERIFY_FUSE_8BIT_LINEARS",
                 "MLX_VLM_MAX_TOKENS",
                 "MLX_VLM_THINKING_BUDGET",
                 "MLX_VLM_THINKING_START_TOKEN",

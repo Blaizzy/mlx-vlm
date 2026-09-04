@@ -64,6 +64,10 @@ def _get_draft_block_size_from_env():
     return int(draft_block_size_str) if draft_block_size_str else None
 
 
+def _env_enabled(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _notify_queues(queues, *items):
     for queue in queues:
         for item in items:
@@ -1075,6 +1079,15 @@ class ResponseGenerator:
             return pending
 
     def _initialize_model(self):
+        from ..models.qwen3_5.speculative_verifier import (
+            set_target_verify_8bit_linear_fusion,
+        )
+
+        fuse_8bit_linears = _env_enabled("MLX_VLM_TARGET_VERIFY_FUSE_8BIT_LINEARS")
+        set_target_verify_8bit_linear_fusion(fuse_8bit_linears)
+        if fuse_8bit_linears:
+            logger.info("Exact 8-bit verifier linear fusion enabled.")
+
         model, processor, config = load_model_resources(
             self.model_path, self.adapter_path
         )
