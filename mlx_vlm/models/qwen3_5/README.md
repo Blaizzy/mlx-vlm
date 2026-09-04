@@ -11,9 +11,10 @@ changes.
 
 | Model | Repository | Variant | Notes |
 |---|---|---|---|
+| Qwen3.6 35B-A3B | `Qwen/Qwen3.6-35B-A3B` | MoE (`qwen3_5_moe`) | Same architecture and MTP head |
 | Ornith 1.5 9B | `ornith-ai/Ornith-1.5-9B` | dense (`qwen3_5`) | Vision-language, image and video |
 | Ornith 1.5 35B-A3B | `ornith-ai/Ornith-1.5-35B-A3B` | MoE (`qwen3_5_moe`) | 256 experts, 8 active (~3B active) |
-| Qwen3.6 35B-A3B | `Qwen/Qwen3.6-35B-A3B` | MoE (`qwen3_5_moe`) | Same architecture and MTP head |
+
 
 ## Details
 
