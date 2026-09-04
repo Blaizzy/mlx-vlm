@@ -863,6 +863,13 @@ def _mtp_rounds_batch(
 
     prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
     if callable(prefill_draft) and prompt_tokens is not None:
+        prefill_kwargs = _mtp_draft_kwargs(
+            draft_model,
+            greedy_sampling,
+            sampler,
+        )
+        if getattr(draft_model, "supports_left_padded_prefill", False):
+            prefill_kwargs["left_padding"] = left_padding
         sampler_rng.draft_call(
             prefill_draft,
             prompt_tokens,
@@ -870,8 +877,7 @@ def _mtp_rounds_batch(
             first_bonus,
             sampler,
             token_dtype,
-            left_padding=left_padding,
-            **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
+            **prefill_kwargs,
         )
 
     # First-round hidden: prefill output may have shape [B, L, H]; reduce

@@ -255,7 +255,6 @@ class DeepseekV4MTPDraftModel(nn.Module):
         sampler,
         token_dtype: mx.Dtype = mx.int32,
         greedy: bool = False,
-        left_padding: Optional[List[int]] = None,
     ) -> None:
         if input_ids.shape[1] == 0:
             return
@@ -265,9 +264,7 @@ class DeepseekV4MTPDraftModel(nn.Module):
             bonus = bonus_token[:, None].astype(token_dtype)
 
         shifted = mx.concatenate([input_ids[:, 1:].astype(token_dtype), bonus], axis=1)
-        self._next_position = (
-            0 if left_padding is None else -mx.array(left_padding, dtype=mx.int32)
-        )
+        self._next_position = 0
         logits_hidden, pre_hc_hidden = self._forward_tokens(
             shifted,
             hidden[:, : shifted.shape[1], ...],

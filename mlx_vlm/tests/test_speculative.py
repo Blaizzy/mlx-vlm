@@ -5,6 +5,7 @@ and Qwen3.5 DFlash cache rollback coverage in one place.
 """
 
 import importlib
+import inspect
 import json
 import re
 from pathlib import Path
@@ -3925,6 +3926,41 @@ def test_glm5_next_mtp_draft_block_smoke():
     assert tokens.shape == (1, 1)
     assert drafter.config.runtime_block_size == 2
     assert not drafter.prefer_requested_block_size
+
+
+def test_glm5_next_mtp_owns_left_padded_prefill(monkeypatch):
+    text_config = _tiny_glm5_next_text_config()
+    drafter = Glm5NextMTPDraftModel(
+        Glm5NextMTPConfig(text_config=text_config, block_size=2)
+    )
+    captured = {}
+
+    def forward_tokens(self, tokens, hidden, token_dtype):
+        del token_dtype
+        captured["start"] = self._next_position
+        self._next_position = self._next_position + tokens.shape[1]
+        return hidden, hidden
+
+    monkeypatch.setattr(Glm5NextMTPDraftModel, "_forward_tokens", forward_tokens)
+    monkeypatch.setattr(
+        Glm5NextMTPDraftModel,
+        "_set_seed_from_hidden",
+        lambda self, hidden, sampler, greedy: None,
+    )
+    drafter.prefill_from_target_hidden(
+        mx.array([[0, 0, 1, 2], [1, 2, 3, 4]], dtype=mx.int32),
+        mx.zeros((2, 4, text_config.hidden_size)),
+        mx.array([3, 5], dtype=mx.int32),
+        lambda logits: mx.argmax(logits, axis=-1),
+        left_padding=[2, 0],
+    )
+    mx.eval(captured["start"], drafter._next_position)
+
+    assert "left_padding" not in inspect.signature(
+        DeepseekV4MTPDraftModel.prefill_from_target_hidden
+    ).parameters
+    assert captured["start"].tolist() == [-2, 0]
+    assert drafter._next_position.tolist() == [2, 4]
 
 
 def test_glm5_next_mtp_last_only_commit_preserves_cache_and_final_output():

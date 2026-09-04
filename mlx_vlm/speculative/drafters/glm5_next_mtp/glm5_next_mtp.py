@@ -58,6 +58,7 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
     prefer_requested_block_size = False
     requires_uniform_batch_acceptance = False
     supports_ragged_batch_acceptance = True
+    supports_left_padded_prefill = True
 
     def __init__(self, config: Glm5NextMTPConfig):
         nn.Module.__init__(self)
@@ -177,6 +178,35 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
                 "[batch, tokens, hidden_size]."
             )
         return hidden
+
+    def prefill_from_target_hidden(
+        self,
+        input_ids: mx.array,
+        hidden: mx.array,
+        bonus_token,
+        sampler,
+        token_dtype: mx.Dtype = mx.int32,
+        greedy: bool = False,
+        left_padding: Optional[List[int]] = None,
+    ) -> None:
+        if input_ids.shape[1] == 0:
+            return
+        if isinstance(bonus_token, int):
+            bonus = mx.array([[bonus_token]], dtype=token_dtype)
+        else:
+            bonus = bonus_token[:, None].astype(token_dtype)
+
+        shifted = mx.concatenate([input_ids[:, 1:].astype(token_dtype), bonus], axis=1)
+        self._next_position = (
+            0 if left_padding is None else -mx.array(left_padding, dtype=mx.int32)
+        )
+        logits_hidden, pre_hc_hidden = self._forward_tokens(
+            shifted,
+            hidden[:, : shifted.shape[1], ...],
+            token_dtype,
+        )
+        self._set_seed_from_hidden(logits_hidden[:, -1:, :], sampler, greedy)
+        self._seed_hidden = pre_hc_hidden[:, -1:, ...]
 
     def _forward_hidden(
         self,
