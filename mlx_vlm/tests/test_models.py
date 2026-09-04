@@ -6078,6 +6078,62 @@ class TestModels(unittest.TestCase):
         self.assertEqual(config.vision_end_token_id, 151653)
         self.assertEqual(config.vision_config.patch_size, 16)
 
+    def test_ornith_1_5_configs_route_to_qwen3_5_family(self):
+        from mlx_vlm.models import qwen3_5, qwen3_5_moe
+        from mlx_vlm.utils import get_model_and_args
+
+        common = {
+            "image_token_id": 248056,
+            "video_token_id": 248057,
+            "vision_start_token_id": 248053,
+            "vision_end_token_id": 248054,
+            "tie_word_embeddings": False,
+        }
+        cases = [
+            (
+                qwen3_5,
+                {
+                    "model_type": "qwen3_5",
+                    "architectures": ["Qwen3_5ForConditionalGeneration"],
+                    "text_config": {
+                        "model_type": "qwen3_5_text",
+                        "vocab_size": 248320,
+                    },
+                    "vision_config": {"model_type": "qwen3_5_vision", "patch_size": 16},
+                    **common,
+                },
+            ),
+            (
+                qwen3_5_moe,
+                {
+                    "model_type": "qwen3_5_moe",
+                    "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+                    "text_config": {
+                        "model_type": "qwen3_5_moe_text",
+                        "vocab_size": 248320,
+                        "num_experts": 256,
+                        "num_experts_per_tok": 8,
+                    },
+                    "vision_config": {
+                        "model_type": "qwen3_5_moe_vision",
+                        "patch_size": 16,
+                    },
+                    **common,
+                },
+            ),
+        ]
+        for module, raw in cases:
+            with self.subTest(model_type=raw["model_type"]):
+                model_class, _ = get_model_and_args(config=dict(raw))
+                self.assertIs(model_class, module)
+
+                config = module.ModelConfig.from_dict(dict(raw))
+                self.assertEqual(config.image_token_id, 248056)
+                self.assertEqual(config.video_token_id, 248057)
+                self.assertEqual(config.vision_start_token_id, 248053)
+                self.assertEqual(config.vision_end_token_id, 248054)
+                self.assertEqual(config.vision_config.patch_size, 16)
+
     def test_qwen3_5_decode_uses_rope_deltas_kwarg(self):
         from mlx_vlm.models import qwen3_5
 
