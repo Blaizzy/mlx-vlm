@@ -41,8 +41,10 @@ from mlx_vlm.models.cache import (
     PoolingCache,
     RotatingKVCache,
 )
+from mlx_vlm.models.gated_delta import gated_delta_update
 from mlx_vlm.models.quantized_verifier import (
     DEFAULT_QUANTIZED_VERIFIER,
+    exact_quantized_linear,
     exact_quantized_selected_linear,
     exact_quantized_switch_linear,
 )
@@ -4148,6 +4150,80 @@ def test_glm5_next_dense_verifier_matches_batched_decode(batch, length):
     assert mx.array_equal(actual, expected).item()
 
 
+def _bf16_quantization_parameters(linear):
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    if linear.biases is not None:
+        linear.biases = linear.biases.astype(mx.bfloat16)
+    return linear
+
+
+@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 32, 64])
+def test_glm5_next_affine_gate_up_fusion_matches_batched_decode(bits, batch):
+    mx.random.seed(400 + bits + batch)
+    switch = SimpleNamespace(
+        up_proj=_bf16_quantization_parameters(
+            QuantizedSwitchLinear(512, 16, 4, False, 64, bits)
+        ),
+        gate_proj=_bf16_quantization_parameters(
+            QuantizedSwitchLinear(512, 16, 4, False, 64, bits)
+        ),
+    )
+    inputs = mx.random.normal((batch, 2, 512)).astype(mx.bfloat16)
+    indices = mx.arange(batch * 4, dtype=mx.int32).reshape(batch, 2, 2) % 4
+    expected_up = exact_quantized_switch_linear(switch.up_proj, inputs, indices)
+    expected_gate = exact_quantized_switch_linear(switch.gate_proj, inputs, indices)
+
+    actual = glm5_next_exact_ops.exact_affine_switch_gate_up(switch, inputs, indices)
+    mx.eval(expected_up, expected_gate, *actual)
+
+    assert actual is not None
+    assert mx.array_equal(actual[0], expected_up).item()
+    assert mx.array_equal(actual[1], expected_gate).item()
+
+
+@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 32, 64])
+def test_glm5_next_affine_moe_fusion_matches_batched_decode(bits, batch):
+    mx.random.seed(500 + bits + batch)
+    routed_linear = _bf16_quantization_parameters(
+        QuantizedSwitchLinear(512, 16, 4, False, 64, bits)
+    )
+    dense = nn.Linear(512, 16, bias=False)
+    dense.weight = dense.weight.astype(mx.bfloat16)
+    shared_linear = _bf16_quantization_parameters(
+        nn.QuantizedLinear.from_linear(
+            dense,
+            group_size=64,
+            bits=bits,
+            mode="affine",
+        )
+    )
+    routed_inputs = mx.random.normal((batch, 2, 2, 512)).astype(mx.bfloat16)
+    shared_inputs = mx.random.normal((batch, 2, 512)).astype(mx.bfloat16)
+    indices = mx.arange(batch * 4, dtype=mx.int32).reshape(batch, 2, 2) % 4
+    weights = mx.softmax(mx.random.normal((batch, 2, 2)), axis=-1)
+    routed = exact_quantized_selected_linear(
+        routed_linear,
+        routed_inputs,
+        indices,
+    )
+    shared = exact_quantized_linear(shared_linear, shared_inputs)
+    expected = glm5_next_exact_ops.combine_moe_outputs(routed, weights, shared)
+
+    actual = glm5_next_exact_ops.exact_affine_moe_down(
+        routed_linear,
+        routed_inputs,
+        indices,
+        weights,
+        shared,
+    )
+    mx.eval(expected, actual)
+
+    assert actual is not None
+    assert mx.array_equal(actual, expected).item()
+
+
 @pytest.mark.parametrize(
     ("mode", "bits", "group_size"),
     [
@@ -4189,6 +4265,34 @@ def test_general_quantized_verifier_matches_decode(
     assert actual is not None
     assert mx.array_equal(actual, expected).item()
     assert mx.array_equal(tokens, mx.argmax(expected, axis=-1)).item()
+
+
+@pytest.mark.parametrize("input_dims", [64, 128])
+@pytest.mark.parametrize("bits", [2, 4, 8])
+def test_general_quantized_verifier_matches_narrow_qmv_quad(input_dims, bits):
+    mx.random.seed(700 + input_dims + bits)
+    dense = nn.Linear(input_dims, 8192, bias=False)
+    dense.weight = dense.weight.astype(mx.bfloat16)
+    linear = nn.QuantizedLinear.from_linear(
+        dense,
+        group_size=64,
+        bits=bits,
+        mode="affine",
+    )
+    inputs = mx.random.normal((8, 2, input_dims)).astype(mx.bfloat16)
+    expected = mx.concatenate(
+        [
+            linear(mx.contiguous(inputs[:, position : position + 1]))
+            for position in range(2)
+        ],
+        axis=1,
+    )
+
+    actual = DEFAULT_QUANTIZED_VERIFIER.linear(linear, inputs)
+    mx.eval(expected, actual)
+
+    assert actual is not None
+    assert mx.array_equal(actual, expected).item()
 
 
 @pytest.mark.parametrize("batch", [1, 2, 5, 8, 9, 16, 32, 64])
@@ -4381,10 +4485,19 @@ def test_glm5_next_target_rollback_restores_ragged_rows_without_model_replay():
     _, _, rollback_state = language.speculative_verify_hidden(
         mx.array([[5, 6], [7, 8]], dtype=mx.int32), cache
     )
-    with patch.object(
-        glm5_next_language.LanguageModel,
-        "__call__",
-        side_effect=AssertionError("rollback must not replay the target model"),
+    linear_update = rollback_state[1][0]
+    assert linear_update[12].shape[1] == 1
+    assert linear_update[13].shape[1] == 1
+    with (
+        patch.object(
+            glm5_next_language.LanguageModel,
+            "__call__",
+            side_effect=AssertionError("rollback must not replay the target model"),
+        ),
+        patch(
+            "mlx_vlm.models.glm5_next.speculative_verifier.gated_delta_update",
+            side_effect=AssertionError("rollback must select captured GDN states"),
+        ),
     ):
         language.rollback_speculative_cache(
             cache, rollback_state, accepted=[1, 0], block_size=2
@@ -4396,6 +4509,65 @@ def test_glm5_next_target_rollback_restores_ragged_rows_without_model_replay():
     assert sparse_cache[0].left_padding.tolist() == [0, 1]
     assert sparse_cache[2]._pool_lengths == [2, 1]
     assert sparse_cache[2].remainder == [0, 1]
+
+
+@pytest.mark.parametrize("batch", [1, 8])
+def test_glm5_next_gated_delta_captured_states_match_stepwise(batch):
+    mx.random.seed(800 + batch)
+    length, heads, width, value_width = 3, 2, 64, 8
+    q = mx.random.normal((batch, length, heads, width)).astype(mx.bfloat16)
+    k = mx.random.normal((batch, length, heads, width)).astype(mx.bfloat16)
+    v = mx.random.normal((batch, length, heads, value_width)).astype(mx.bfloat16)
+    a = mx.random.normal((batch, length, heads, width)).astype(mx.bfloat16)
+    b = mx.random.normal((batch, length, heads)).astype(mx.bfloat16)
+    A_log = mx.random.normal((heads, 1)).astype(mx.float32)
+    dt_bias = mx.random.normal((heads, width)).astype(mx.float32)
+    initial = mx.zeros((batch, heads, value_width, width), dtype=mx.float32)
+
+    outputs = []
+    states = []
+    state = initial
+    for position in range(length):
+        output, state = gated_delta_update(
+            q[:, position : position + 1],
+            k[:, position : position + 1],
+            v[:, position : position + 1],
+            a[:, position : position + 1],
+            b[:, position : position + 1],
+            A_log,
+            dt_bias,
+            state=state,
+            lower_bound=-5.0,
+        )
+        outputs.append(output)
+        states.append(state)
+
+    expected_output = mx.concatenate(outputs, axis=1)
+    expected_states = mx.stack(states[:-1], axis=1)
+    output, final_state, captured_states = gated_delta_update(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state=initial,
+        lower_bound=-5.0,
+        state_steps=length - 1,
+    )
+    mx.eval(
+        expected_output,
+        state,
+        expected_states,
+        output,
+        final_state,
+        captured_states,
+    )
+
+    assert mx.array_equal(output, expected_output).item()
+    assert mx.array_equal(final_state, state).item()
+    assert mx.array_equal(captured_states, expected_states).item()
 
 
 def test_glm5_next_mtp_sanitize_fuses_native_layer_weights():

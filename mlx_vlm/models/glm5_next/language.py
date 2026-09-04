@@ -310,7 +310,7 @@ class Glm5NextLinearAttention(nn.Module):
         a = linear_fn(self.f_b_proj, f_a).reshape(shape)
         b = b.reshape(batch, length, self.num_heads)
         initial_state = ssm_state
-        out, ssm_state = gated_delta_update(
+        delta_output = gated_delta_update(
             q,
             k,
             v,
@@ -322,8 +322,27 @@ class Glm5NextLinearAttention(nn.Module):
             mask=mask,
             use_kernel=not self.training,
             lower_bound=self.lower_bound,
+            state_steps=(
+                length - 1 if rollback_sink is not None and length > 1 else None
+            ),
         )
+        if rollback_sink is None or length <= 1:
+            out, ssm_state = delta_output
+            intermediate_states = None
+        else:
+            out, ssm_state, intermediate_states = delta_output
         if rollback_sink is not None:
+            conv_states = (
+                None
+                if length <= 1
+                else mx.stack(
+                    [
+                        conv_input[:, position + 1 : position + self.conv_kernel]
+                        for position in range(length - 1)
+                    ],
+                    axis=1,
+                )
+            )
             rollback_sink.append(
                 (
                     q,
@@ -338,8 +357,8 @@ class Glm5NextLinearAttention(nn.Module):
                     conv_input,
                     self.conv_kernel,
                     self.lower_bound,
-                    qkv_state,
-                    ssm_state,
+                    conv_states,
+                    intermediate_states,
                 )
             )
         if cache is not None:

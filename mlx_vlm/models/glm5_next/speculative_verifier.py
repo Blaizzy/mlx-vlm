@@ -14,13 +14,17 @@ from ..quantized_verifier import (
     exact_quantized_switch_linear,
 )
 from ..qwen3_5.speculative_verifier import _target_verify_linear
+from ..switch_layers import _gather_sort, _scatter_unsort
 from .exact_ops import (
     clamped_swiglu,
     combine_moe_outputs,
+    exact_affine_moe_down,
+    exact_affine_switch_gate_up,
     exact_dense_block_linear,
     exact_fp32_decode_block_gemv,
     exact_hc_expand,
     exact_hc_norm,
+    exact_hc_normalized_norm,
     scaled_rms_norm,
 )
 
@@ -110,18 +114,39 @@ class Glm5NextSpeculativeVerifier:
         flat_x = mx.contiguous(x).reshape(batch * length, width)
         flat_indices = indices.reshape(batch * length, top_k)
         switch = moe.switch_mlp
-        up = exact_quantized_switch_linear(switch.up_proj, x, indices)
-        gate = exact_quantized_switch_linear(switch.gate_proj, x, indices)
-        if up is None or gate is None:
-            projected = mx.expand_dims(flat_x, (-2, -3))
-            up = switch.up_proj(projected, flat_indices, sorted_indices=False)
-            gate = switch.gate_proj(
-                projected,
-                flat_indices,
-                sorted_indices=False,
+        # Match SwitchGLU's decode-time sorting decision using the target's
+        # per-position route count.  Once selected, sort both verifier
+        # positions together so all three expert projections reuse the same
+        # order and one inverse permutation.
+        sort_routes = batch * top_k >= 64
+        route_order = None
+        if sort_routes:
+            projected, route_indices, route_order = _gather_sort(
+                mx.expand_dims(x, (-2, -3)), indices
             )
-            up = up.squeeze(-2).reshape(batch, length, top_k, -1)
-            gate = gate.squeeze(-2).reshape(batch, length, top_k, -1)
+            up = switch.up_proj(projected, route_indices, sorted_indices=True)
+            gate = switch.gate_proj(projected, route_indices, sorted_indices=True)
+        else:
+            gate_up = exact_affine_switch_gate_up(switch, x, indices)
+            if gate_up is None:
+                up = exact_quantized_switch_linear(switch.up_proj, x, indices)
+                gate = exact_quantized_switch_linear(switch.gate_proj, x, indices)
+                if up is None or gate is None:
+                    projected = mx.expand_dims(flat_x, (-2, -3))
+                    up = switch.up_proj(
+                        projected,
+                        flat_indices,
+                        sorted_indices=False,
+                    )
+                    gate = switch.gate_proj(
+                        projected,
+                        flat_indices,
+                        sorted_indices=False,
+                    )
+                    up = up.squeeze(-2).reshape(batch, length, top_k, -1)
+                    gate = gate.squeeze(-2).reshape(batch, length, top_k, -1)
+            else:
+                up, gate = gate_up
         activated = switch.activation(up, gate)
         shared_gate, shared_up = mx.split(
             self._block_linear(moe.shared_experts.gate_up_proj, x),
@@ -137,6 +162,24 @@ class Glm5NextSpeculativeVerifier:
             moe.shared_experts.down_proj,
             shared_hidden,
         )
+        if sort_routes:
+            routed = switch.down_proj(
+                activated,
+                route_indices,
+                sorted_indices=True,
+            )
+            routed = _scatter_unsort(routed, route_order, indices.shape).squeeze(-2)
+            return combine_moe_outputs(routed, weights, shared)
+
+        fused_moe = exact_affine_moe_down(
+            switch.down_proj,
+            activated,
+            indices,
+            weights,
+            shared,
+        )
+        if fused_moe is not None:
+            return fused_moe
         routed = exact_quantized_selected_linear(
             switch.down_proj,
             activated,
@@ -165,7 +208,7 @@ class Glm5NextSpeculativeVerifier:
             output_gate_fn=self._linear_output_gate_timewise,
             scaled_norm_fn=scaled_rms_norm,
         )
-        return output, updates[0][:12]
+        return output, updates[0]
 
     @staticmethod
     def _linear_output_gate_timewise(norm, output, gate):
@@ -380,6 +423,10 @@ class Glm5NextSpeculativeVerifier:
         )
 
     def _hc_norm(self, connection, norm, x):
+        if x.shape[0] == 1:
+            output = exact_hc_normalized_norm(connection, norm, x)
+            if output is not None:
+                return output
         if _hc_kernel is not None:
             _y, mixes = self._hc_inputs(connection, x)
             output = self._hc_norm_from_mixes(connection, norm, x, mixes)
@@ -781,7 +828,10 @@ class Glm5NextSpeculativeVerifier:
         if not entries:
             return
 
-        if all(len(update) > 13 for _cache, update in entries):
+        if all(
+            len(update) > 13 and update[12] is not None and update[13] is not None
+            for _cache, update in entries
+        ):
             indices = mx.array(valid_lengths, dtype=mx.int32) - 1
             for cache, update in entries:
                 conv_states = update[12]

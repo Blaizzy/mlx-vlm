@@ -34,12 +34,83 @@ def _input_dims(module) -> int:
     return int(module.scales.shape[-1]) * int(module.group_size)
 
 
+@lru_cache(maxsize=None)
+def _metal_architecture() -> tuple[int, str]:
+    if not mx.metal.is_available() or mx.default_device() != mx.gpu:
+        return 0, ""
+
+    device_info = (
+        mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+    )
+    architecture = str(device_info.get("architecture", ""))
+    marker = architecture.rsplit("_g", 1)[-1]
+    generation_text = "".join(character for character in marker if character.isdigit())
+    generation = int(generation_text) if generation_text else 0
+    size = marker[-1] if marker and marker[-1].isalpha() else ""
+    return generation, size
+
+
+@lru_cache(maxsize=None)
+def _native_qmv_batch_limit(input_size: int, output_size: int) -> int:
+    """Mirror MLX Metal's shape/device qmv-to-qmm dispatch threshold."""
+    generation, size = _metal_architecture()
+    if not generation:
+        return 0
+
+    small = input_size <= 2048 and output_size <= 2048
+    medium = input_size <= 4096 and output_size <= 4096
+    if generation >= 17 and size != "d":
+        return 33 if small else 25 if medium else 13
+    if generation >= 15 and size != "d":
+        return 13 if small else 15 if medium else 13
+    if generation >= 13:
+        if size == "d":
+            return 32 if small else 18 if medium else 12
+        return 14 if small else 10 if medium else 6
+    if size == "d":
+        return 32 if small else 18 if medium else 12
+    return 18 if small else 12 if medium else 10
+
+
 def _exact_time_batch(linear: nn.QuantizedLinear, x: mx.array) -> mx.array:
-    """Run every verifier position with the target's native batch shape."""
+    """Fuse verifier time while matching native qmv/qmm decode arithmetic."""
+    batch, length, input_size = x.shape
+    output_size = linear.weight.shape[0]
+    vector_limit = _native_qmv_batch_limit(input_size, output_size)
+
+    if vector_limit and batch > 1 and batch * length < vector_limit:
+        flat = linear(mx.contiguous(x.reshape(batch * length, input_size)))
+        return flat.reshape(batch, length, output_size)
+
+    if vector_limit and batch < vector_limit:
+        transposed = mx.contiguous(x.transpose(1, 0, 2))
+        weight = mx.broadcast_to(linear.weight[None], (length, *linear.weight.shape))
+        scales = mx.broadcast_to(linear.scales[None], (length, *linear.scales.shape))
+        biases = linear.get("biases")
+        if biases is not None:
+            biases = mx.broadcast_to(biases[None], (length, *biases.shape))
+        output = mx.quantized_matmul(
+            transposed,
+            weight,
+            scales=scales,
+            biases=biases,
+            transpose=True,
+            group_size=linear.group_size,
+            bits=linear.bits,
+            mode=linear.mode,
+        ).transpose(1, 0, 2)
+        if "bias" in linear:
+            output = output + linear["bias"]
+        return output
+
+    if vector_limit:
+        flat = linear(mx.contiguous(x.reshape(batch * length, input_size)))
+        return flat.reshape(batch, length, output_size)
+
     return mx.concatenate(
         [
             linear(mx.contiguous(x[:, position : position + 1]))
-            for position in range(x.shape[1])
+            for position in range(length)
         ],
         axis=1,
     )

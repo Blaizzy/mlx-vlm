@@ -594,19 +594,23 @@ uint simd_lid = thread_index_in_simdgroup;
 int out_row = int(n_tile) * ROWS_PER_TG +
     int(simd_gid) * RESULTS_PER_SIMDGROUP;
 int token = int(route) / TOP_K;
-int route_index = int(route) - token * TOP_K;
+int batch = token / VERIFY_T;
+int time = token - batch * VERIFY_T;
+int batch_route = batch * VERIFY_T * TOP_K;
 int expert = int(indices[route]);
 int paired_route = -1;
-if (token == 0) {
+if ((time & 1) == 0 && time + 1 < VERIFY_T) {
+  int next_route = batch_route + (time + 1) * TOP_K;
   for (int other = 0; other < TOP_K; ++other) {
-    if (int(indices[TOP_K + other]) == expert) {
-      paired_route = TOP_K + other;
+    if (int(indices[next_route + other]) == expert) {
+      paired_route = next_route + other;
       break;
     }
   }
-} else {
+} else if ((time & 1) != 0) {
+  int previous_route = batch_route + (time - 1) * TOP_K;
   for (int other = 0; other < TOP_K; ++other) {
-    if (int(indices[other]) == expert) {
+    if (int(indices[previous_route + other]) == expert) {
       return;
     }
   }
@@ -633,7 +637,9 @@ const device T* gate_bs = gate_biases + expert * S_EXPERT_SIZE +
     out_row * GROUPS + int(simd_lid) / SCALE_STEP_PER_THREAD;
 const device T* xk[2];
 xk[0] = x + token * K_SIZE + int(simd_lid) * VALUES_PER_THREAD;
-xk[1] = x + K_SIZE + int(simd_lid) * VALUES_PER_THREAD;
+int paired_token = paired_route >= 0 ? paired_route / TOP_K : token;
+xk[1] = x + paired_token * K_SIZE +
+    int(simd_lid) * VALUES_PER_THREAD;
 
 float up_result[2][RESULTS_PER_SIMDGROUP] = {0.0f};
 float gate_result[2][RESULTS_PER_SIMDGROUP] = {0.0f};
@@ -737,36 +743,11 @@ for (int route = 0; route < TOP_K; ++route) {
   }
 }
 
-const device uint8_t* shared_ws = (const device uint8_t*)shared_w +
-    out_row * W_ROW_BYTES + int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
-const device T* shared_sc = shared_scales + out_row * GROUPS +
-    int(simd_lid) / SCALE_STEP_PER_THREAD;
-const device T* shared_bs = shared_biases + out_row * GROUPS +
-    int(simd_lid) / SCALE_STEP_PER_THREAD;
-const device T* shared_xk = shared_x + int(token) * K_SIZE +
-    int(simd_lid) * VALUES_PER_THREAD;
-float shared_result[RESULTS_PER_SIMDGROUP] = {0.0f};
-float shared_x_thread[VALUES_PER_THREAD];
-for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
-  float sum = load_affine5_vector_exact<T>(shared_xk, shared_x_thread);
-  for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
-    const device uint8_t* wr = shared_ws + row * W_ROW_BYTES;
-    const device T* sr = shared_sc + row * GROUPS;
-    const device T* br = shared_bs + row * GROUPS;
-    shared_result[row] += affine5_qdot_exact(
-        wr, shared_x_thread, float(sr[0]), float(br[0]), sum);
-  }
-  shared_ws += BLOCK_SIZE * 5 / 8;
-  shared_sc += BLOCK_SIZE / GROUP_SIZE;
-  shared_bs += BLOCK_SIZE / GROUP_SIZE;
-  shared_xk += BLOCK_SIZE;
-}
-
 for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
   int n = out_row + row;
-  float shared_value = simd_sum(shared_result[row]);
   if (simd_lid == 0 && n < N_SIZE) {
-    y[int(token) * N_SIZE + n] = T(routed_sum[row] + T(shared_value));
+    y[int(token) * N_SIZE + n] =
+        T(routed_sum[row] + shared_y[int(token) * N_SIZE + n]);
   }
 }
 """
@@ -882,7 +863,7 @@ def _affine_switch_gate_up_kernel(
             "gate_biases",
         ],
         output_names=["up_y", "gate_y"],
-        header=_affine_exact_header(bits, group_size, 1, 4),
+        header=_affine_exact_header(bits, group_size, 4, 2),
         source=_affine_source(_AFFINE5_SWITCH_GATE_UP_SOURCE, bits),
     )
 
@@ -910,10 +891,7 @@ def _affine_moe_down_kernel(
             "w",
             "scales",
             "biases",
-            "shared_x",
-            "shared_w",
-            "shared_scales",
-            "shared_biases",
+            "shared_y",
         ],
         output_names=["y"],
         header=_affine_exact_header(bits, group_size, 2, 4),
@@ -952,8 +930,8 @@ def exact_affine_switch_gate_up(switch, x: mx.array, indices: mx.array):
     if (
         not mx.metal.is_available()
         or x.ndim != 3
-        or x.shape[0] != 1
-        or not 1 < x.shape[1] <= 4
+        or x.shape[0] < 1
+        or x.shape[1] <= 1
         or indices.ndim != 3
         or indices.shape[:2] != x.shape[:2]
         or x.dtype not in (mx.bfloat16, mx.float16)
@@ -972,7 +950,7 @@ def exact_affine_switch_gate_up(switch, x: mx.array, indices: mx.array):
     ):
         return None
 
-    _, length, k_size = x.shape
+    batch, length, k_size = x.shape
     top_k = indices.shape[-1]
     n_size = up.weight.shape[1]
     if (
@@ -986,6 +964,13 @@ def exact_affine_switch_gate_up(switch, x: mx.array, indices: mx.array):
 
     x = mx.contiguous(x)
     indices = mx.contiguous(indices.astype(mx.int32))
+    if batch > 1:
+        projected = mx.expand_dims(x, (-2, -3))
+        return (
+            up(projected, indices, sorted_indices=False).squeeze(-2),
+            gate(projected, indices, sorted_indices=False).squeeze(-2),
+        )
+
     kernel = _affine_switch_gate_up_kernel(
         up.bits,
         x.dtype,
@@ -1014,11 +999,11 @@ def exact_affine_switch_gate_up(switch, x: mx.array, indices: mx.array):
             ("TOP_K", int(top_k)),
             ("GROUP_SIZE", int(up.group_size)),
         ],
-        grid=(32, 16 * (n_size // 16), length * top_k),
-        threadgroup=(32, 4, 1),
+        grid=(32, 2 * (n_size // 8), batch * length * top_k),
+        threadgroup=(32, 2, 1),
         output_shapes=[
-            (1, length, top_k, n_size),
-            (1, length, top_k, n_size),
+            (batch, length, top_k, n_size),
+            (batch, length, top_k, n_size),
         ],
         output_dtypes=[x.dtype, x.dtype],
     )
@@ -1029,10 +1014,9 @@ def exact_affine_moe_down(
     x: mx.array,
     indices: mx.array,
     route_weights: mx.array,
-    shared_linear,
-    shared_x: mx.array,
+    shared: mx.array,
 ):
-    """Fuse affine routed/shared down projections and exact BF16 reduction."""
+    """Fuse affine routed down projection, weighting, and shared addition."""
     if (
         not mx.metal.is_available()
         or not isinstance(linear, QuantizedSwitchLinear)
@@ -1041,8 +1025,8 @@ def exact_affine_moe_down(
         or linear.biases is None
         or "bias" in linear
         or x.ndim != 4
-        or x.shape[0] != 1
-        or not 1 < x.shape[1] <= 4
+        or x.shape[0] < 1
+        or x.shape[1] <= 1
         or x.shape[2] != indices.shape[-1]
         or indices.shape != x.shape[:3]
         or route_weights.shape != indices.shape
@@ -1050,25 +1034,15 @@ def exact_affine_moe_down(
         or x.dtype not in (mx.bfloat16, mx.float16)
         or linear.scales.dtype != x.dtype
         or linear.biases.dtype != x.dtype
-        or not isinstance(shared_linear, nn.QuantizedLinear)
-        or shared_linear.mode != "affine"
-        or shared_linear.bits != linear.bits
-        or shared_linear.biases is None
-        or "bias" in shared_linear
-        or shared_x.shape != (1, x.shape[1], x.shape[-1])
-        or shared_x.dtype != x.dtype
-        or shared_linear.scales.dtype != x.dtype
-        or shared_linear.biases.dtype != x.dtype
-        or shared_linear.group_size != linear.group_size
+        or shared.shape != (x.shape[0], x.shape[1], linear.weight.shape[1])
+        or shared.dtype != x.dtype
     ):
         return None
 
-    _, length, top_k, k_size = x.shape
+    batch, length, top_k, k_size = x.shape
     n_size = linear.weight.shape[1]
     if (
         k_size != linear.input_dims
-        or k_size != shared_linear.weight.shape[1] * 32 // shared_linear.bits
-        or shared_linear.weight.shape[0] != n_size
         or k_size % 512
         or n_size % 8
         or linear.group_size % 16
@@ -1078,7 +1052,7 @@ def exact_affine_moe_down(
     x = mx.contiguous(x)
     indices = mx.contiguous(indices.astype(mx.int32))
     route_weights = mx.contiguous(route_weights)
-    shared_x = mx.contiguous(shared_x)
+    shared = mx.contiguous(shared)
     kernel = _affine_moe_down_kernel(
         linear.bits,
         x.dtype,
@@ -1096,10 +1070,7 @@ def exact_affine_moe_down(
             linear.weight,
             linear.scales,
             linear.biases,
-            shared_x,
-            shared_linear.weight,
-            shared_linear.scales,
-            shared_linear.biases,
+            shared,
         ],
         template=[
             ("T", x.dtype),
@@ -1109,9 +1080,9 @@ def exact_affine_moe_down(
             ("TOP_K", int(top_k)),
             ("GROUP_SIZE", int(linear.group_size)),
         ],
-        grid=(32, n_size // 2, length),
+        grid=(32, n_size // 2, batch * length),
         threadgroup=(32, 4, 1),
-        output_shapes=[(1, length, n_size)],
+        output_shapes=[(batch, length, n_size)],
         output_dtypes=[x.dtype],
     )[0]
 
