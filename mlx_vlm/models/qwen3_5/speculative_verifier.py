@@ -22,7 +22,7 @@ def _use_target_verify_dense(linear, x: mx.array) -> bool:
     return (
         exact_speculative_verify_dense_available()
         and x.ndim == 3
-        and x.shape[1] > 1
+        and (x.shape[0] > 1 or x.shape[1] > 1)
         and isinstance(linear, (nn.Linear, nn.QuantizedLinear))
     )
 
@@ -1101,6 +1101,8 @@ def _target_verify_linear(linear, x: mx.array) -> mx.array:
         out = _target_verify_quantized_linear(linear, x)
         if out is not None:
             return out
+        if x.shape[0] > 1:
+            return _target_verify_singletons(linear, x)
         return _target_verify_timewise(linear, x)
 
     if isinstance(linear, nn.Linear) and "bias" not in linear:
@@ -1166,7 +1168,7 @@ def _target_verify_quantized_linears(linears, x: mx.array):
 def _target_verify_linears(linears, x: mx.array):
     if not (
         x.ndim == 3
-        and x.shape[1] > 1
+        and (x.shape[0] > 1 or x.shape[1] > 1)
         and all(
             isinstance(linear, (nn.Linear, nn.QuantizedLinear)) for linear in linears
         )
@@ -1185,7 +1187,7 @@ def _target_verify_linears(linears, x: mx.array):
 
 
 def _target_verify_embedding_as_linear(embedding, x: mx.array):
-    if not (x.ndim == 3 and x.shape[1] > 1):
+    if not (x.ndim == 3 and (x.shape[0] > 1 or x.shape[1] > 1)):
         return embedding.as_linear(x)
 
     out = _target_verify_weight(embedding.weight, x)
@@ -1195,8 +1197,8 @@ def _target_verify_embedding_as_linear(embedding, x: mx.array):
     return _target_verify_timewise(embedding.as_linear, x)
 
 
-class Qwen3_5ExactSpeculativeVerifier:
-    """Run Qwen3.5 block verification with singleton-equivalent numerics."""
+class Qwen3_5BatchInvariantForward:
+    """Run Qwen3.5 rows with singleton-equivalent reductions."""
 
     @staticmethod
     def _helpers():
@@ -1597,4 +1599,7 @@ class Qwen3_5ExactSpeculativeVerifier:
         )
 
 
-__all__ = ["Qwen3_5ExactSpeculativeVerifier"]
+Qwen3_5ExactSpeculativeVerifier = Qwen3_5BatchInvariantForward
+
+
+__all__ = ["Qwen3_5BatchInvariantForward", "Qwen3_5ExactSpeculativeVerifier"]
