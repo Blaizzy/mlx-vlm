@@ -18405,13 +18405,13 @@ def test_glm5_next_speculative_verify_matches_sequential_decode_arithmetic():
 
 @pytest.mark.parametrize(("batch", "length"), [(1, 2), (2, 4), (4, 2)])
 def test_glm5_next_dense_verifier_kernel_covers_all_outputs(monkeypatch, batch, length):
-    import mlx_vlm.models.glm5_next.speculative_verifier as verifier
+    import mlx_vlm.models.glm5_next.exact_ops as exact_ops
 
     if not mx.metal.is_available():
         pytest.skip("Metal is required for the fused verifier kernel")
 
     mx.random.seed(23)
-    monkeypatch.setattr(verifier, "_DENSE_BLOCK_MIN_WEIGHT_SIZE", 0)
+    monkeypatch.setattr(exact_ops, "_DENSE_BLOCK_MIN_WEIGHT_SIZE", 0)
     linear = nn.Linear(128, 16, bias=False)
     linear.weight = mx.random.uniform(
         low=-0.25,
@@ -18424,7 +18424,7 @@ def test_glm5_next_dense_verifier_kernel_covers_all_outputs(monkeypatch, batch, 
         shape=(batch, length, 128),
     ).astype(mx.bfloat16)
 
-    actual = verifier.exact_dense_block_linear(linear, inputs)
+    actual = exact_ops.exact_dense_block_linear(linear, inputs)
     expected = mx.concatenate(
         [
             linear(mx.contiguous(inputs[:, position : position + 1]))
