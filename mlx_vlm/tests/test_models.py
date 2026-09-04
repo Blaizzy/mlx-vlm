@@ -18618,3 +18618,88 @@ class TestNemotronHSpeculativeVerifier(unittest.TestCase):
                 accepted=2,
                 block_size=2,
             )
+
+
+class TestK2HorizonModel(unittest.TestCase):
+    def _config(self, **overrides):
+        from mlx_vlm.models import k2_horizon
+
+        params = dict(
+            model_type="k2_horizon",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=8,
+            vocab_size=128,
+            max_position_embeddings=512,
+            rope_theta=1e6,
+        )
+        params.update(overrides)
+        return k2_horizon.ModelConfig(**params)
+
+    def test_dense_forward_and_cached_decode(self):
+        from mlx_vlm.models import k2_horizon
+        from mlx_vlm.utils import get_model_and_args
+
+        cfg = self._config()
+        model = k2_horizon.Model(cfg)
+
+        full_logits, _ = assert_cached_forward_matches_full(model)
+
+        self.assertEqual(full_logits.shape[0], 1)
+        self.assertEqual(full_logits.shape[-1], cfg.vocab_size)
+        self.assertEqual(len(model.layers), cfg.num_hidden_layers)
+
+        module, model_type = get_model_and_args({"model_type": "k2_horizon"})
+        self.assertIs(module, k2_horizon)
+        self.assertEqual(model_type, "k2_horizon")
+
+    def test_sanitize_adds_language_model_prefix(self):
+        from mlx_vlm.models import k2_horizon
+
+        model = k2_horizon.Model(self._config())
+        weights = {
+            "model.embed_tokens.weight": mx.zeros((128, 64)),
+            "lm_head.weight": mx.zeros((128, 64)),
+        }
+
+        sanitized = model.sanitize(weights)
+
+        self.assertTrue(all(k.startswith("language_model.") for k in sanitized))
+        self.assertIn("language_model.lm_head.weight", sanitized)
+
+    def test_rope_parameters_translated_to_scaling(self):
+        from mlx_vlm.models import k2_horizon
+
+        # yarn keeps the scaling dict; "default" collapses to plain rope.
+        yarn = k2_horizon.ModelConfig.from_dict(
+            {
+                "model_type": "k2_horizon",
+                "rope_theta": 1_000_000.0,
+                "rope_parameters": {
+                    "rope_type": "yarn",
+                    "factor": 16.0,
+                    "beta_fast": 128.0,
+                    "beta_slow": 4.0,
+                    "original_max_position_embeddings": 8192,
+                },
+            }
+        )
+        self.assertEqual(yarn.rope_theta, 1_000_000.0)
+        self.assertEqual((yarn.rope_scaling or {}).get("rope_type"), "yarn")
+
+        default = k2_horizon.ModelConfig.from_dict(
+            {
+                "model_type": "k2_horizon",
+                "rope_parameters": {"rope_type": "default", "rope_theta": 1e7},
+            }
+        )
+        self.assertEqual(default.rope_theta, 1e7)
+        self.assertIsNone(default.rope_scaling)
+
+        # a yarn-configured model still builds and runs
+        model = k2_horizon.Model(self._config(rope_scaling=yarn.rope_scaling))
+        out = model(mx.array([[1, 2, 3, 4]])).logits
+        self.assertEqual(out.shape, (1, 4, 128))
