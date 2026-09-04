@@ -207,6 +207,7 @@ class Model(nn.Module):
                 "return_shared_kv",
                 "mm_token_type_ids",
                 "token_type_ids",
+                "logits_to_keep",
             )
             if k in kwargs
         }
