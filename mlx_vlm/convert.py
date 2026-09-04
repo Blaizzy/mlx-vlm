@@ -281,23 +281,11 @@ def convert(
     quant_predicate: Optional[str] = None,
     mtp: bool = False,
     mtp_output: Optional[str] = None,
-    mtp_q_group_size: Optional[int] = None,
-    mtp_q_bits: Optional[int] = None,
-    mtp_q_mode: Optional[str] = None,
 ):
-    mtp_quantization_requested = any(
-        value is not None for value in (mtp_q_group_size, mtp_q_bits, mtp_q_mode)
-    )
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
-    fp8_target_quantization = (
-        get_quantization_params(q_group_size, q_bits, q_mode) if quantize else None
-    )
     model, config, processor = fetch_from_hub(
-        model_path,
-        lazy=True,
-        trust_remote_code=trust_remote_code,
-        fp8_target_quantization=fp8_target_quantization,
+        model_path, lazy=True, trust_remote_code=trust_remote_code
     )
 
     model_quant_predicate = getattr(model, "quant_predicate", None)
@@ -429,24 +417,11 @@ def convert(
             else:
                 drafter_path = mtp_output or f"{mlx_path}-mtp"
                 print(f"[INFO] Extracting MTP drafter -> {drafter_path}")
-                if mtp_quantization_requested:
-                    drafter_q_group_size = mtp_q_group_size
-                    drafter_q_bits = mtp_q_bits
-                    drafter_q_mode = mtp_q_mode or "affine"
-                elif quantize:
-                    drafter_q_group_size = q_group_size
-                    drafter_q_bits = q_bits
-                    drafter_q_mode = q_mode
-                else:
-                    drafter_q_group_size = None
-                    drafter_q_bits = None
-                    drafter_q_mode = None
                 splitter.split(
                     str(model_path),
                     str(drafter_path),
-                    q_bits=drafter_q_bits,
-                    q_group_size=drafter_q_group_size,
-                    q_mode=drafter_q_mode,
+                    q_bits=q_bits if quantize else None,
+                    q_group_size=q_group_size,
                 )
         except Exception as exc:
             # the base conversion already succeeded; a drafter failure must not
@@ -573,24 +548,6 @@ def configure_parser() -> argparse.ArgumentParser:
         "--mtp-output",
         help="Output path for the MTP drafter (default: <mlx-path>-mtp).",
         type=str,
-        default=None,
-    )
-    parser.add_argument(
-        "--mtp-q-group-size",
-        help="Override the quantization group size for the MTP drafter.",
-        type=int,
-        default=None,
-    )
-    parser.add_argument(
-        "--mtp-q-bits",
-        help="Override the quantization bit width for the MTP drafter.",
-        type=int,
-        default=None,
-    )
-    parser.add_argument(
-        "--mtp-q-mode",
-        help="Override the quantization mode for the MTP drafter.",
-        choices=["affine", "mxfp4", "nvfp4", "mxfp8"],
         default=None,
     )
     return parser
