@@ -169,6 +169,13 @@ def _speculative_walk_batch(
     corresponds to one sequence in the batch.
     """
     B = int(draft_tokens.shape[0])
+    if len(budgets) != B:
+        raise ValueError(f"expected {B} token budgets, got {len(budgets)}")
+    if any(budget < 0 for budget in budgets):
+        raise ValueError("token budgets must be non-negative")
+    if B == 0:
+        return [], []
+
     n_draft = int(draft_tokens.shape[1])
     mismatches = draft_tokens != target_tokens[:, :n_draft]
     mismatches = mx.concatenate([mismatches, mx.ones((B, 1), dtype=mx.bool_)], axis=1)
@@ -185,15 +192,15 @@ def _speculative_walk_batch(
         mx.where(positions == accepted[:, None], bonus, 0),
     )
 
-    # The generation API emits Python token IDs, so one host transfer remains
-    # necessary. Evaluate both arrays together instead of synchronizing each
-    # row and verifier position through Python control flow.
-    mx.eval(accepted, walked)
-    accepted_list = accepted.tolist()
-    walked_rows = walked.tolist()
+    # Python owns ragged emission and cache rollback. Pack both decisions so
+    # one conversion evaluates the complete graph and crosses that boundary.
+    decision_rows = mx.concatenate(
+        [accepted[:, None].astype(walked.dtype), walked], axis=1
+    ).tolist()
+    accepted_list = [int(row[0]) for row in decision_rows]
     new_tokens_list = [
-        row[: min(accepted_i + 1, budget)]
-        for row, accepted_i, budget in zip(walked_rows, accepted_list, budgets)
+        row[1 : 1 + min(accepted_i + 1, budget)]
+        for row, accepted_i, budget in zip(decision_rows, accepted_list, budgets)
     ]
     return accepted_list, new_tokens_list
 

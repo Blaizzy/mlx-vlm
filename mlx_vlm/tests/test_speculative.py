@@ -15,6 +15,7 @@ from unittest.mock import patch
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
+import numpy as np
 import pytest
 from mlx.utils import tree_flatten, tree_map
 
@@ -1397,6 +1398,119 @@ def test_speculative_walk_batch_matches_per_row_acceptance():
 
     assert accepted == [1, 2]
     assert new_tokens == [[11, 90], [21, 22]]
+
+
+def test_speculative_walk_batch_handles_acceptance_and_budget_boundaries():
+    accepted, new_tokens = _speculative_walk_batch(
+        mx.array(
+            [
+                [11, 12, 13],
+                [0, 22, 23],
+                [31, 32, 33],
+                [41, 42, 43],
+            ],
+            dtype=mx.int32,
+        ),
+        mx.array(
+            [
+                [99, 12, 13, 14],
+                [0, 98, 23, 24],
+                [31, 32, 33, 34],
+                [41, 42, 97, 44],
+            ],
+            dtype=mx.int32,
+        ),
+        budgets=[1, 2, 8, 0],
+    )
+
+    assert accepted == [0, 1, 3, 2]
+    assert new_tokens == [[99], [0, 98], [31, 32, 33, 34], []]
+
+
+def test_speculative_walk_batch_handles_empty_draft_block():
+    accepted, new_tokens = _speculative_walk_batch(
+        mx.zeros((2, 0), dtype=mx.int32),
+        mx.array([[0], [13]], dtype=mx.int32),
+        budgets=[1, 0],
+    )
+
+    assert accepted == [0, 0]
+    assert new_tokens == [[0], []]
+
+
+def test_speculative_walk_batch_handles_empty_active_batch():
+    accepted, new_tokens = _speculative_walk_batch(
+        mx.zeros((0, 2), dtype=mx.int32),
+        mx.zeros((0, 3), dtype=mx.int32),
+        budgets=[],
+    )
+
+    assert accepted == []
+    assert new_tokens == []
+
+
+@pytest.mark.parametrize("dtype", (mx.int32, mx.int64, mx.uint32))
+def test_speculative_walk_batch_preserves_integer_token_dtype(dtype):
+    accepted, new_tokens = _speculative_walk_batch(
+        mx.array([[0, 12]], dtype=dtype),
+        mx.array([[0, 99, 42]], dtype=dtype),
+        budgets=[3],
+    )
+
+    assert accepted == [1]
+    assert new_tokens == [[0, 99]]
+
+
+@pytest.mark.parametrize("budgets", ([1], [1, 1, 1], [1, -1]))
+def test_speculative_walk_batch_rejects_invalid_budgets(budgets):
+    drafts = mx.array([[1], [2]], dtype=mx.int32)
+    targets = mx.array([[1, 3], [2, 4]], dtype=mx.int32)
+
+    with pytest.raises(ValueError):
+        _speculative_walk_batch(drafts, targets, budgets)
+
+
+def test_speculative_walk_batch_async_stress_matches_python_reference():
+    rng = np.random.default_rng(20260904)
+    stream = mx.new_stream(mx.default_device())
+
+    for iteration in range(100):
+        batch = iteration % 4 + 1
+        draft_count = iteration % 7
+        drafts_np = rng.integers(0, 64, size=(batch, draft_count), dtype=np.int32)
+        targets_np = rng.integers(
+            0,
+            64,
+            size=(batch, draft_count + 1),
+            dtype=np.int32,
+        )
+        accepted_expected = []
+        tokens_expected = []
+        budgets = []
+        for row in range(batch):
+            accepted = (iteration + row) % (draft_count + 1)
+            targets_np[row, :accepted] = drafts_np[row, :accepted]
+            if accepted < draft_count:
+                targets_np[row, accepted] = (drafts_np[row, accepted] + 1) % 64
+            budget = (2 * iteration + row) % (draft_count + 2)
+            accepted_expected.append(accepted)
+            budgets.append(budget)
+            walked = drafts_np[row, :accepted].tolist()
+            walked.append(int(targets_np[row, accepted]))
+            tokens_expected.append(walked[:budget])
+
+        with mx.stream(stream):
+            drafts = mx.array(drafts_np) + mx.array(0, dtype=mx.int32)
+            targets = mx.array(targets_np) + mx.array(0, dtype=mx.int32)
+            mx.async_eval(drafts, targets)
+            accepted_actual, tokens_actual = _speculative_walk_batch(
+                drafts,
+                targets,
+                budgets,
+            )
+
+        assert accepted_actual == accepted_expected
+        assert tokens_actual == tokens_expected
 
 
 def test_mtp_drafter_masks_support_batched_offsets():
