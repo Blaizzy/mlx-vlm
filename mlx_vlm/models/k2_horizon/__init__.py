@@ -1,2 +1,4 @@
-from .config import K2HorizonConfig as ModelConfig
+from .config import ModelConfig
 from .k2_horizon import Model
+
+__all__ = ["Model", "ModelConfig"]
