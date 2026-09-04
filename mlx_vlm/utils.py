@@ -988,32 +988,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         weights, transformed_quantization = _transform_compressed_tensors_weights(
             weights, quantization_config
         )
-    if transformed_quantization is None:
-        from .fp8 import transform_fp8_weights
-
-        weights, transformed_quantization = transform_fp8_weights(weights, config)
     if transformed_quantization is not None:
         config["quantization"] = transformed_quantization
         config["quantization_config"] = transformed_quantization
-
-    # Sanitize weights
-    weights = sanitize_weights(model, weights)
-
-    if hasattr(model_class, "VisionModel"):
-        if hasattr(model_config, "vision_config"):
-            weights = sanitize_weights(
-                model_class.VisionModel, weights, model_config.vision_config
-            )
-    if hasattr(model_class, "LanguageModel"):
-        if hasattr(model_config, "text_config"):
-            weights = sanitize_weights(
-                model_class.LanguageModel, weights, model_config.text_config
-            )
-    if hasattr(model_class, "AudioModel"):
-        if hasattr(model_config, "audio_config"):
-            weights = sanitize_weights(
-                model_class.AudioModel, weights, model_config.audio_config
-            )
 
     if not has_quantization:
         quantization_config = config.get("quantization_config", None)
@@ -1046,10 +1023,14 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             elif quant_method == "mxfp4":
                 quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
-            elif quant_method == "fp8" and config.get("model_type") == "deepseek_v4":
-                from .models.deepseek_v4.language import make_quantization_config
+            elif quant_method == "fp8":
+                from .fp8 import transform_fp8_weights
 
-                quantization = make_quantization_config(model)
+                weights, quantization = transform_fp8_weights(weights, config)
+                if quantization is None and config.get("model_type") == "deepseek_v4":
+                    from .models.deepseek_v4.language import make_quantization_config
+
+                    quantization = make_quantization_config(model)
             elif quant_method in ("awq", "gptq"):
                 logging.warning(
                     "Quantization method %s is not supported in mlx_vlm.load_model()",
@@ -1065,6 +1046,27 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             quantization_value = getattr(model_config, quantization_key, None)
             if quantization_value is not None:
                 config[quantization_key] = quantization_value
+
+    # Sanitize weights after source-format conversion. In particular, GLM
+    # merges projections and stacks experts, so raw FP8 weight/scale pairs must
+    # be transformed before those model-specific rewrites.
+    weights = sanitize_weights(model, weights)
+
+    if hasattr(model_class, "VisionModel"):
+        if hasattr(model_config, "vision_config"):
+            weights = sanitize_weights(
+                model_class.VisionModel, weights, model_config.vision_config
+            )
+    if hasattr(model_class, "LanguageModel"):
+        if hasattr(model_config, "text_config"):
+            weights = sanitize_weights(
+                model_class.LanguageModel, weights, model_config.text_config
+            )
+    if hasattr(model_class, "AudioModel"):
+        if hasattr(model_config, "audio_config"):
+            weights = sanitize_weights(
+                model_class.AudioModel, weights, model_config.audio_config
+            )
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may or may not have vision quantized.
