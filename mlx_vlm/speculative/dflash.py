@@ -6,8 +6,10 @@ import mlx.nn as nn
 from .common import (
     _dflash_block_total,
     _record_speculative_round,
+    _requires_uniform_batch_acceptance,
     _speculative_walk,
     _speculative_walk_batch,
+    _SpeculativeSamplerRNG,
     generation_stream,
 )
 
@@ -44,7 +46,10 @@ def _dflash_next_block_size(
         return block_total
 
     current = min(block_total, max(2, recent[-1][1] + 1))
-    min_total = min(block_total, 4)
+    min_total = min(
+        block_total,
+        max(2, int(getattr(draft_model, "dflash_min_block_size", 4))),
+    )
     drafted = sum(d for _, d in recent)
     accepted = sum(a for a, _ in recent)
     accept_rate = accepted / drafted
@@ -75,6 +80,193 @@ def _dflash_committed_hidden_segments(
     ]
 
 
+def _reserve_dflash_target_cache(prompt_cache: List[Any], block_size: int) -> None:
+    pending = []
+    for entry in prompt_cache:
+        reserve = getattr(entry, "prefix_cache_reserve", None)
+        offset = getattr(entry, "offset", None)
+        if not callable(reserve) or not isinstance(offset, int):
+            continue
+        pending.extend(reserve(offset + block_size))
+    if pending:
+        mx.async_eval(*pending)
+
+
+def _dflash_verify_greedy(
+    lm: nn.Module,
+    verify_input: mx.array,
+    prompt_cache: List[Any],
+    target_layer_ids: List[int],
+    sampler: Callable[[mx.array], mx.array],
+):
+    verify_hidden = getattr(lm, "speculative_verify_dflash_hidden", None)
+    argmax_from_hidden = getattr(lm, "speculative_argmax_from_hidden", None)
+    if callable(verify_hidden) and callable(argmax_from_hidden):
+        captured, final_hidden, gdn_states = verify_hidden(
+            verify_input, prompt_cache, target_layer_ids
+        )
+        target_tokens = argmax_from_hidden(final_hidden)
+        if target_tokens is None:
+            raise RuntimeError(
+                "speculative_argmax_from_hidden returned no greedy target tokens"
+            )
+        return captured, gdn_states, target_tokens
+
+    verify_out = lm(
+        verify_input,
+        cache=prompt_cache,
+        capture_layer_ids=target_layer_ids,
+        speculative_verify=True,
+    )
+    return verify_out.hidden_states, verify_out.gdn_states, sampler(verify_out.logits)
+
+
+def _supports_positioned_target_sampling(sampler: Callable) -> bool:
+    return callable(getattr(sampler, "sample_target", None))
+
+
+class _PositionedDraftSampler:
+    def __init__(
+        self,
+        sampler: Callable,
+        *,
+        row_ids: List[int],
+        positions: List[int],
+    ):
+        self.sampler = sampler
+        self.row_ids = [int(row_id) for row_id in row_ids]
+        self.positions = [int(position) for position in positions]
+
+    def __call__(self, logits: mx.array) -> mx.array:
+        if logits.ndim == 1:
+            batch, length = 1, 1
+        elif logits.ndim == 2:
+            batch, length = logits.shape[0], 1
+        else:
+            batch, length = logits.shape[0], logits.shape[1]
+        if batch != len(self.row_ids):
+            raise ValueError(
+                "Draft sampler row count does not match logits batch size."
+            )
+
+        rows = [row_id for row_id in self.row_ids for _ in range(length)]
+        positions = [
+            position + offset for position in self.positions for offset in range(length)
+        ]
+        sampled = self.sampler.sample_target(
+            logits.reshape(batch * length, logits.shape[-1]),
+            row_ids=rows,
+            positions=positions,
+        )
+        self.positions = [position + length for position in self.positions]
+        return sampled.reshape(logits.shape[:-1])
+
+    def sample_proposal(self, logits: mx.array) -> mx.array:
+        sample_proposal = getattr(self.sampler, "sample_proposal", None)
+        if not callable(sample_proposal):
+            return mx.argmax(logits, axis=-1)
+        if logits.ndim == 1:
+            batch, length = 1, 1
+        elif logits.ndim == 2:
+            batch, length = logits.shape[0], 1
+        else:
+            batch, length = logits.shape[0], logits.shape[1]
+        if batch != len(self.row_ids):
+            raise ValueError(
+                "Draft sampler row count does not match logits batch size."
+            )
+        rows = [row_id for row_id in self.row_ids for _ in range(length)]
+        positions = [
+            position + offset for position in self.positions for offset in range(length)
+        ]
+        sampled = sample_proposal(
+            logits.reshape(batch * length, logits.shape[-1]),
+            row_ids=rows,
+            positions=positions,
+        )
+        self.positions = [position + length for position in self.positions]
+        return sampled.reshape(logits.shape[:-1])
+
+
+def _sample_dflash_target_block(
+    logits: mx.array,
+    sampler: Callable[[mx.array], mx.array],
+    *,
+    row_ids: List[int],
+    base_positions: List[int],
+) -> mx.array:
+    batch, length, vocab_size = logits.shape
+    logprobs = _dflash_target_logprobs(logits)
+    flat_logprobs = logprobs.reshape(batch * length, vocab_size)
+    positions = [
+        int(base_position) + position
+        for base_position in base_positions
+        for position in range(length)
+    ]
+    rows = [int(row_id) for row_id in row_ids for _ in range(length)]
+    return sampler.sample_target(
+        flat_logprobs,
+        row_ids=rows,
+        positions=positions,
+    ).reshape(batch, length)
+
+
+def _dflash_target_logprobs(logits: mx.array) -> mx.array:
+    return mx.stack(
+        [
+            row - mx.logsumexp(row, axis=-1, keepdims=True)
+            for row in (logits[:, position, :] for position in range(logits.shape[1]))
+        ],
+        axis=1,
+    )
+
+
+def _sample_dflash_target_walk(
+    logits: mx.array,
+    draft_tokens: mx.array,
+    sampler: Callable[[mx.array], mx.array],
+    budgets: List[int],
+    *,
+    row_ids: List[int],
+    base_positions: List[int],
+) -> Tuple[List[int], List[List[int]]]:
+    if _supports_positioned_target_sampling(sampler):
+        target_tokens = _sample_dflash_target_block(
+            logits,
+            sampler,
+            row_ids=row_ids,
+            base_positions=base_positions,
+        )
+        mx.async_eval(target_tokens)
+        return _speculative_walk_batch(draft_tokens, target_tokens, budgets)
+
+    batch, length, _ = logits.shape
+    draft_count = int(draft_tokens.shape[1])
+    draft_rows = draft_tokens.tolist()
+    logprobs = _dflash_target_logprobs(logits)
+
+    for position in range(length):
+        target_tokens = sampler(logprobs[:, position, :])
+        mx.eval(target_tokens)
+        target_rows = [int(token) for token in target_tokens.reshape(-1).tolist()]
+        if position < draft_count and all(
+            target_rows[row] == draft_rows[row][position] for row in range(batch)
+        ):
+            continue
+
+        new_tokens = []
+        for row, budget in enumerate(budgets):
+            tokens = draft_rows[row][:position]
+            if len(tokens) < budget:
+                tokens.append(target_rows[row])
+            new_tokens.append(tokens[:budget])
+        return [position] * batch, new_tokens
+
+    return [draft_count] * batch, [
+        draft_rows[row][: budgets[row]] for row in range(batch)
+    ]
+
+
 def _dflash_rounds(
     model: nn.Module,
     draft_model: nn.Module,
@@ -88,6 +280,7 @@ def _dflash_rounds(
     token_dtype: mx.Dtype = mx.int32,
     use_model_initial_block_size: bool = True,
     eos_token_ids: Optional[set] = None,
+    greedy_sampling: bool = True,
 ) -> Generator[Tuple[int, None], None, None]:
     """DFlash speculative-decoding **round loop**.
 
@@ -104,7 +297,23 @@ def _dflash_rounds(
 
     target_layer_ids = list(draft_model.config.target_layer_ids)
     block_total = _dflash_block_total(draft_model, draft_block_size)
+    choose_block_ceiling = getattr(draft_model, "choose_block_ceiling", None)
+    if callable(choose_block_ceiling):
+        block_total = choose_block_ceiling(int(hidden.shape[1]), block_total)
+    initial_block_size = getattr(draft_model, "dflash_initial_block_size", None)
+    choose_initial_block_size = getattr(draft_model, "choose_initial_block_size", None)
+    if use_model_initial_block_size and callable(choose_initial_block_size):
+        initial_block_size = choose_initial_block_size(
+            int(hidden.shape[1]), block_total
+        )
     draft_cache = draft_model.reset(model)
+    with mx.stream(generation_stream):
+        _reserve_dflash_target_cache(prompt_cache, block_total)
+    positioned_sampling = _supports_positioned_target_sampling(sampler)
+    sampler_rng = _SpeculativeSamplerRNG(
+        draft_model,
+        enabled=not greedy_sampling and not positioned_sampling,
+    )
     prepare_target_hidden = getattr(draft_model, "prepare_target_hidden", None)
     hidden_is_prepared = callable(prepare_target_hidden)
     if hidden_is_prepared:
@@ -121,22 +330,33 @@ def _dflash_rounds(
             draft_model,
             block_total,
             max_tokens - emitted + 1,
-            (
-                getattr(draft_model, "dflash_initial_block_size", None)
-                if use_model_initial_block_size
-                else None
-            ),
+            (initial_block_size if use_model_initial_block_size else None),
         )
         if bs <= 1:
             break
 
         draft_kwargs = {"target_hidden_prepared": True} if hidden_is_prepared else {}
-        draft_tokens = draft_model.draft_block(
+        draft_sampler = (
+            _PositionedDraftSampler(
+                sampler,
+                row_ids=[0],
+                positions=[emitted],
+            )
+            if not greedy_sampling and positioned_sampling
+            else sampler
+        )
+        draft_fn = (
+            getattr(draft_model, "draft_block_greedy", draft_model.draft_block)
+            if greedy_sampling
+            else draft_model.draft_block
+        )
+        draft_tokens = sampler_rng.draft_tokens(
+            draft_fn,
             b,
             hidden,
             draft_cache,
             bs,
-            sampler,
+            draft_sampler,
             token_dtype,
             **draft_kwargs,
         )
@@ -147,19 +367,45 @@ def _dflash_rounds(
                 [mx.array([[b]], dtype=token_dtype), draft_tokens],
                 axis=1,
             )
-            verify_out = lm(
-                verify_input,
-                cache=prompt_cache,
-                capture_layer_ids=target_layer_ids,
-            )
-            hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
-            target_tokens = sampler(verify_out.logits)
-        mx.async_eval(target_tokens, hidden)
+            if greedy_sampling:
+                captured, gdn_states, target_tokens = _dflash_verify_greedy(
+                    lm,
+                    verify_input,
+                    prompt_cache,
+                    target_layer_ids,
+                    sampler,
+                )
+                hidden = mx.concatenate(captured, axis=-1)
+            else:
+                verify_out = lm(
+                    verify_input,
+                    cache=prompt_cache,
+                    capture_layer_ids=target_layer_ids,
+                    speculative_verify=True,
+                )
+                gdn_states = verify_out.gdn_states
+                hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
+        if greedy_sampling:
+            mx.async_eval(target_tokens, hidden)
+        else:
+            mx.async_eval(hidden)
 
-        # Walk
-        accepted, new_tokens = _speculative_walk(
-            draft_tokens, target_tokens, max_tokens - emitted
-        )
+        if greedy_sampling:
+            accepted, new_tokens = _speculative_walk(
+                draft_tokens, target_tokens, max_tokens - emitted
+            )
+        else:
+            accepted_list, new_tokens_list = _sample_dflash_target_walk(
+                verify_out.logits,
+                draft_tokens,
+                sampler,
+                [max_tokens - emitted],
+                row_ids=[0],
+                base_positions=[emitted],
+            )
+            accepted = accepted_list[0]
+            new_tokens = new_tokens_list[0]
+            sampler_rng.target_sampled(sync_draft=not positioned_sampling)
         _record_speculative_round(draft_model, accepted, bs - 1)
 
         if accepted < bs - 1:
@@ -168,9 +414,7 @@ def _dflash_rounds(
 
         if accepted < bs - 1:
             with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(
-                    prompt_cache, verify_out.gdn_states, accepted, bs
-                )
+                lm.rollback_speculative_cache(prompt_cache, gdn_states, accepted, bs)
 
         if hidden_is_prepared and emitted + len(new_tokens) < max_tokens:
             hidden = prepare_target_hidden(hidden)
@@ -202,6 +446,8 @@ def _dflash_rounds_batch(
     token_dtype: mx.Dtype = mx.int32,
     stop_check: Optional[Callable[[int, int], bool]] = None,
     eos_token_ids: Optional[set] = None,
+    greedy_sampling: bool = True,
+    row_ids: Optional[List[int]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batch DFlash speculative-decoding round loop (B > 1).
 
@@ -223,9 +469,26 @@ def _dflash_rounds_batch(
         )
 
     B = first_bonus.shape[0]
+    row_ids = list(range(B)) if row_ids is None else list(row_ids)
     target_layer_ids = list(draft_model.config.target_layer_ids)
     block_total = _dflash_block_total(draft_model, draft_block_size)
+    choose_block_ceiling = getattr(draft_model, "choose_block_ceiling", None)
+    if callable(choose_block_ceiling):
+        block_total = choose_block_ceiling(int(hidden.shape[1]), block_total)
+    initial_block_size = getattr(draft_model, "dflash_initial_block_size", None)
+    choose_initial_block_size = getattr(draft_model, "choose_initial_block_size", None)
+    if callable(choose_initial_block_size):
+        initial_block_size = choose_initial_block_size(
+            int(hidden.shape[1]), block_total
+        )
     draft_model.reset(model)
+    with mx.stream(generation_stream):
+        _reserve_dflash_target_cache(prompt_cache, block_total)
+    positioned_sampling = _supports_positioned_target_sampling(sampler)
+    sampler_rng = _SpeculativeSamplerRNG(
+        draft_model,
+        enabled=not greedy_sampling and not positioned_sampling,
+    )
     draft_caches = [draft_model.make_cache() for _ in range(B)]
 
     # Per-sequence state tracked by ORIGINAL index so the caller sees
@@ -248,7 +511,12 @@ def _dflash_rounds_batch(
             max(1, max_tokens - emitted[active_idx[j]] + 1)
             for j in range(len(active_idx))
         ]
-        bs = _dflash_next_block_size(draft_model, block_total, min(remaining))
+        bs = _dflash_next_block_size(
+            draft_model,
+            block_total,
+            min(remaining),
+            initial_block_size,
+        )
         if bs <= 1:
             break
 
@@ -259,39 +527,91 @@ def _dflash_rounds_batch(
         # Draft rowwise: the DFlash drafter cache is scalar-offset and has
         # proven unsafe as a single batched cache on MLX/Metal. Target verify
         # remains batched below.
-        draft_tokens = mx.concatenate(
-            [
-                draft_model.draft_block(
-                    int(b_active[j]),
-                    hidden_by_orig[active_idx[j]],
-                    draft_caches[active_idx[j]],
-                    bs,
-                    sampler,
-                    token_dtype,
-                )
-                for j in range(n_active)
-            ],
-            axis=0,
-        )
-        mx.async_eval(draft_tokens)
+        def draft_active_rows():
+            return mx.concatenate(
+                [
+                    (
+                        getattr(
+                            draft_model,
+                            "draft_block_greedy",
+                            draft_model.draft_block,
+                        )
+                        if greedy_sampling
+                        else draft_model.draft_block
+                    )(
+                        int(b_active[j]),
+                        hidden_by_orig[active_idx[j]],
+                        draft_caches[active_idx[j]],
+                        bs,
+                        (
+                            _PositionedDraftSampler(
+                                sampler,
+                                row_ids=[row_ids[active_idx[j]]],
+                                positions=[emitted[active_idx[j]]],
+                            )
+                            if not greedy_sampling and positioned_sampling
+                            else sampler
+                        ),
+                        token_dtype,
+                    )
+                    for j in range(n_active)
+                ],
+                axis=0,
+            )
 
-        # Verify
+        draft_tokens = sampler_rng.draft_tokens(
+            draft_active_rows,
+        )
+
         with mx.stream(generation_stream):
             verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
-            verify_out = lm(
-                verify_input,
-                cache=prompt_cache,
-                capture_layer_ids=target_layer_ids,
-            )
-            hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
-            target_tokens = sampler(verify_out.logits)
-        mx.async_eval(target_tokens, hidden_full)
+            if greedy_sampling:
+                captured, gdn_states, target_tokens = _dflash_verify_greedy(
+                    lm,
+                    verify_input,
+                    prompt_cache,
+                    target_layer_ids,
+                    sampler,
+                )
+                hidden_full = mx.concatenate(captured, axis=-1)
+            else:
+                verify_out = lm(
+                    verify_input,
+                    cache=prompt_cache,
+                    capture_layer_ids=target_layer_ids,
+                    speculative_verify=True,
+                )
+                gdn_states = verify_out.gdn_states
+                hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
+        if greedy_sampling:
+            mx.async_eval(target_tokens, hidden_full)
+        else:
+            mx.async_eval(hidden_full)
 
-        # Walk (per-sequence)
         budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
-        accepted_list, new_tokens_list = _speculative_walk_batch(
-            draft_tokens, target_tokens, budgets
-        )
+        if greedy_sampling:
+            accepted_list, new_tokens_list = _speculative_walk_batch(
+                draft_tokens, target_tokens, budgets
+            )
+        else:
+            accepted_list, new_tokens_list = _sample_dflash_target_walk(
+                verify_out.logits,
+                draft_tokens,
+                sampler,
+                budgets,
+                row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
+                base_positions=[emitted[active_idx[j]] for j in range(n_active)],
+            )
+            sampler_rng.target_sampled(sync_draft=not positioned_sampling)
+
+        if (
+            n_active > 1
+            and _requires_uniform_batch_acceptance(draft_model, lm)
+            and len(set(accepted_list)) > 1
+        ):
+            uniform = min(len(nt) - 1 for nt in new_tokens_list)
+            new_tokens_list = [nt[: uniform + 1] for nt in new_tokens_list]
+            accepted_list = [uniform] * n_active
 
         min_accepted = min(accepted_list)
         accepted_arr = mx.array(accepted_list)
@@ -334,7 +654,7 @@ def _dflash_rounds_batch(
         if min_accepted < bs - 1:
             with mx.stream(generation_stream):
                 lm.rollback_speculative_cache(
-                    prompt_cache, verify_out.gdn_states, accepted_arr, bs
+                    prompt_cache, gdn_states, accepted_arr, bs
                 )
 
         # --- Continuous batching: filter out finished sequences ---

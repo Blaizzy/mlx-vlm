@@ -269,7 +269,18 @@ class Model(nn.Module):
 
         Handles Conv2d/ConvTranspose2d transpositions and key remapping
         for SAM 3.1 architecture.
+
+        Conv transposes are skipped for checkpoints already in MLX layout, so
+        sanitize is idempotent and does not double-transpose (see #1871).
         """
+        already_mlx = any(
+            k.endswith("patch_embeddings.projection.weight")
+            and v.ndim == 4
+            and v.shape[-1] == 3
+            and v.shape[1] != 3
+            for k, v in weights.items()
+        )
+
         sanitized = {}
 
         conv_transpose_patterns = ["scale_layers.", "upscale_conv", "output_upscaling"]
@@ -303,7 +314,7 @@ class Model(nn.Module):
                     "mask_downsampler.final_conv.",
                 )
 
-            if value.ndim == 4:
+            if value.ndim == 4 and not already_mlx:
                 if any(p in key for p in skip_patterns):
                     sanitized[key] = value
                     continue

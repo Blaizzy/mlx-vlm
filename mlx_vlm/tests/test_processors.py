@@ -643,6 +643,126 @@ class TestLlavaNextProcessor(_ProcessorTestBase, unittest.TestCase):
         return {"text": ["<image> Describe"], "images": [_make_image()]}
 
 
+class TestLlavaOnevisionProcessor(_ProcessorTestBase, unittest.TestCase):
+    GRID = [[384, 384], [384, 768], [768, 384], [768, 768], [1536, 1536]]
+
+    def _make_processor(self, tiles=5, image_sizes=((768, 768),)):
+        from mlx_vlm.models.llava_onevision.processing_llava_onevision import (
+            LlavaOnevisionProcessor,
+        )
+
+        image_processor = type(
+            "IP",
+            (),
+            {
+                "model_input_names": ["pixel_values"],
+                "image_grid_pinpoints": self.GRID,
+                "size": {"height": 384, "width": 384},
+                "__call__": lambda self, images=None, **kw: {
+                    "pixel_values": np.random.randn(
+                        len(image_sizes), tiles, 3, 384, 384
+                    ).astype(np.float32),
+                    "image_sizes": [list(size) for size in image_sizes],
+                },
+            },
+        )()
+
+        return LlavaOnevisionProcessor(
+            image_processor=image_processor,
+            tokenizer=_mock_tokenizer(),
+            num_image_tokens=729,
+            vision_aspect_ratio="anyres_max_9",
+            vision_feature_select_strategy="full",
+        )
+
+    def _image_call_args(self):
+        return {"text": ["<image> Describe"], "images": [_make_image()]}
+
+    def test_expands_image_token_to_feature_count(self):
+        processor = self._make_processor()
+        expanded = processor._expand_placeholders(
+            "<image> Describe", iter([[768, 768]]), iter(()), (384, 384)
+        )
+
+        # 2x2 tile grid at 27 patches a side: 729 base + 54 * (54 + 1) newline column.
+        self.assertEqual(expanded.count("<image>"), 729 + 54 * 55)
+
+    def test_expands_video_token_per_frame_plus_newline(self):
+        processor = self._make_processor()
+        frames = 4
+        expanded = processor._expand_placeholders(
+            "<video> Describe",
+            iter(()),
+            iter([np.zeros((frames, 3, 384, 384), dtype=np.float32)]),
+            (384, 384),
+        )
+
+        # 27 patches a side pool to 14, and one newline closes the whole video.
+        self.assertEqual(expanded.count("<video>"), frames * 14 * 14 + 1)
+
+    def test_expands_image_and_video_tokens_in_one_prompt(self):
+        processor = self._make_processor()
+        expanded = processor._expand_placeholders(
+            "<image> and <video>",
+            iter([[384, 384]]),
+            iter([np.zeros((2, 3, 384, 384), dtype=np.float32)]),
+            (384, 384),
+        )
+
+        # A 384x384 image still yields base + one tile: 729 + 27 * (27 + 1).
+        self.assertEqual(expanded.count("<image>"), 729 + 27 * 28)
+        self.assertEqual(expanded.count("<video>"), 2 * 14 * 14 + 1)
+
+    def test_batched_prompts_consume_images_in_order(self):
+        processor = self._make_processor()
+        image_sizes = iter([[768, 768], [384, 384]])
+
+        first = processor._expand_placeholders(
+            "<image> first", image_sizes, iter(()), (384, 384)
+        )
+        second = processor._expand_placeholders(
+            "<image> second", image_sizes, iter(()), (384, 384)
+        )
+
+        # The iterator is shared across the batch, so each prompt gets its own image.
+        self.assertEqual(first.count("<image>"), 729 + 54 * 55)
+        self.assertEqual(second.count("<image>"), 729 + 27 * 28)
+
+    def test_rejects_more_placeholders_than_images(self):
+        processor = self._make_processor()
+        with self.assertRaises(ValueError):
+            processor._expand_placeholders(
+                "<image> <image>", iter([[384, 384]]), iter(()), (384, 384)
+            )
+
+    def test_declares_native_video_support(self):
+        from mlx_vlm.generate.video import processor_handles_video
+
+        self.assertTrue(processor_handles_video(self._make_processor()))
+
+    def test_video_preprocessing_normalizes_frames(self):
+        processor = self._make_processor()
+        frames = np.full((2, 40, 60, 3), 255, dtype=np.uint8)
+
+        pixel_values_videos = processor.video_processor([frames])
+
+        self.assertEqual(pixel_values_videos.shape, (1, 2, 3, 384, 384))
+        # 255 rescales to 1.0 and normalizes to (1 - 0.5) / 0.5 == 1.0
+        self.assertTrue(np.allclose(pixel_values_videos, 1.0, atol=1e-5))
+
+    def test_video_preprocessing_accepts_channels_first_frames(self):
+        processor = self._make_processor()
+        # load_video returns (frames, channels, height, width)
+        frames = np.zeros((2, 3, 40, 60), dtype=np.uint8)
+        frames[:, 0] = 255
+
+        pixel_values_videos = processor.video_processor([frames])
+
+        self.assertEqual(pixel_values_videos.shape, (1, 2, 3, 384, 384))
+        self.assertTrue(np.allclose(pixel_values_videos[:, :, 0], 1.0, atol=1e-5))
+        self.assertTrue(np.allclose(pixel_values_videos[:, :, 1], -1.0, atol=1e-5))
+
+
 class TestPaliGemmaProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
         from mlx_vlm.models.paligemma.processing_paligemma import PaliGemmaProcessor
@@ -1108,6 +1228,83 @@ class TestSmolVLMProcessor(_ProcessorTestBase, unittest.TestCase):
     def _image_call_args(self):
         return {"text": ["<image> Describe"], "images": [[_make_image()]]}
 
+    def test_split_image_prompt_matches_flattened_feature_rows(self):
+        from mlx_vlm.models.smolvlm.processing_smolvlm import get_image_prompt_string
+
+        image_seq_len = 81
+        single = get_image_prompt_string(0, 0, image_seq_len, "<F>", "<image>", "<G>")
+        split = get_image_prompt_string(3, 4, image_seq_len, "<F>", "<image>", "<G>")
+
+        self.assertEqual(single.count("<image>"), image_seq_len)
+        self.assertEqual(split.count("<image>"), 13 * image_seq_len)
+        self.assertIn("<row_1_col_1>", split)
+        self.assertIn("<row_3_col_4>", split)
+
+    def test_split_image_requests_row_col_info_and_expands_tokens(self):
+        """SmolVLM2-2.2B (#1919): 3x4 tiles + global, image_seq_len=81.
+
+        The vision encoder emits 13 x 81 feature rows. Without
+        return_row_col_info the prompt stays on the single-image template
+        (81 <image> tokens) and Idefics3 scatter raises
+        tokens: 81, features 1053.
+        """
+        from mlx_vlm.models.smolvlm.processing_smolvlm import SmolVLMProcessor
+
+        image_seq_len = 81
+        rows, cols = 3, 4
+        n_tiles = rows * cols + 1
+        seen = {}
+        recorded = {}
+
+        class RecordingTokenizer:
+            model_input_names = ["input_ids", "attention_mask"]
+
+            def __call__(self, text, **kw):
+                recorded["text"] = text
+                texts = [text] if isinstance(text, str) else text
+                return {
+                    "input_ids": [list(range(10)) for _ in texts],
+                    "attention_mask": [[1] * 10 for _ in texts],
+                }
+
+        class SplittingImageProcessor:
+            model_input_names = ["pixel_values"]
+
+            def fetch_images(self, images):
+                return [images] if not isinstance(images, list) else images
+
+            def __call__(self, images=None, **kw):
+                seen.update(kw)
+                out = {
+                    "pixel_values": np.random.randn(1, n_tiles, 3, 32, 32).astype(
+                        np.float32
+                    )
+                }
+                if kw.get("return_row_col_info"):
+                    out["rows"] = [[rows]]
+                    out["cols"] = [[cols]]
+                return out
+
+        p = SmolVLMProcessor.__new__(SmolVLMProcessor)
+        p.fake_image_token = "<fake_token_around_image>"
+        p.image_token = "<image>"
+        p.image_token_id = 100
+        p.end_of_utterance_token = "<end_of_utterance>"
+        p.global_image_token = "<global-img>"
+        p.image_seq_len = image_seq_len
+        p.video_token = "<video>"
+        p.image_processor = SplittingImageProcessor()
+        p.tokenizer = RecordingTokenizer()
+
+        p(text=["<image> Describe"], images=[[_make_image()]])
+
+        self.assertTrue(seen.get("return_row_col_info"))
+        expanded = recorded["text"][0]
+        self.assertEqual(expanded.count("<image>"), n_tiles * image_seq_len)
+        self.assertIn("<row_1_col_1>", expanded)
+        self.assertIn("<row_3_col_4>", expanded)
+        self.assertIn("<global-img>", expanded)
+
 
 class TestMllamaProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
@@ -1333,6 +1530,197 @@ class TestQwen3VLProcessor(_ProcessorTestBase, unittest.TestCase):
     def _image_call_args(self):
         return {"text": ["<|image_pad|> Describe"], "images": [_make_image()]}
 
+    def _make_capturing_processor(self, image_grid_thw):
+        captured = {}
+        image_grid_thw = np.array(image_grid_thw, dtype=np.int64)
+
+        class ImageProcessor:
+            model_input_names = ["pixel_values"]
+            merge_size = 2
+
+            def __call__(self, images=None, **kwargs):
+                return {
+                    "pixel_values": np.zeros(
+                        (len(image_grid_thw), 3, 224, 224), dtype=np.float32
+                    ),
+                    "image_grid_thw": image_grid_thw,
+                }
+
+        class Tokenizer:
+            model_input_names = ["input_ids", "attention_mask"]
+
+            def __call__(self, text, **kwargs):
+                captured["text"] = text
+                return {
+                    "input_ids": [list(range(len(item))) for item in text],
+                    "attention_mask": [[1] * len(item) for item in text],
+                }
+
+        processor = self._make_processor()
+        processor.image_processor = ImageProcessor()
+        processor.tokenizer = Tokenizer()
+        return processor, captured
+
+    def test_surplus_image_tokens_are_removed_in_prompt_order(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import (
+            _drop_surplus_image_tokens,
+        )
+
+        text = "old <|image_pad|> new <|vs|><|image_pad|><|ve|>"
+
+        result = _drop_surplus_image_tokens(
+            text,
+            image_token="<|image_pad|>",
+            vision_start_token="<|vs|>",
+            vision_end_token="<|ve|>",
+            count=1,
+        )
+
+        self.assertEqual(result, "old  new <|vs|><|image_pad|><|ve|>")
+
+    def test_surplus_wrapped_image_token_is_removed_before_expansion(self):
+        processor, captured = self._make_capturing_processor([[1, 16, 16]])
+        prompt = "old <|vs|><|image_pad|><|ve|> " "new <|vs|><|image_pad|><|ve|>"
+
+        processor(text=[prompt], images=[_make_image()])
+
+        rendered = captured["text"][0]
+        self.assertTrue(rendered.startswith("old  new <|vs|>"))
+        self.assertEqual(rendered.count("<|vs|>"), 1)
+        self.assertEqual(rendered.count("<|ve|>"), 1)
+        self.assertEqual(rendered.count("<|image_pad|>"), 64)
+
+    def test_multiple_surplus_image_tokens_keep_latest_marker(self):
+        processor, captured = self._make_capturing_processor([[1, 16, 16]])
+        prompt = (
+            "first <|vs|><|image_pad|><|ve|> "
+            "second <|vs|><|image_pad|><|ve|> "
+            "third <|vs|><|image_pad|><|ve|>"
+        )
+
+        processor(text=[prompt], images=[_make_image()])
+
+        expected = "first  second  third <|vs|>" + "<|image_pad|>" * 64 + "<|ve|>"
+        self.assertEqual(captured["text"], [expected])
+
+    def test_matching_image_tokens_expand_in_grid_order(self):
+        processor, captured = self._make_capturing_processor([[1, 4, 4], [1, 4, 8]])
+        prompt = "first <|vs|><|image_pad|><|ve|> " "second <|vs|><|image_pad|><|ve|>"
+
+        processor(text=[prompt], images=[_make_image(), _make_image()])
+
+        expected = (
+            "first <|vs|>"
+            + "<|image_pad|>" * 4
+            + "<|ve|> second <|vs|>"
+            + "<|image_pad|>" * 8
+            + "<|ve|>"
+        )
+        self.assertEqual(captured["text"], [expected])
+
+    def test_surplus_image_tokens_do_not_cross_batch_entries(self):
+        processor, captured = self._make_capturing_processor([[1, 4, 4], [1, 4, 8]])
+        text = [
+            "first <|vs|><|image_pad|><|ve|>",
+            "stale <|vs|><|image_pad|><|ve|> " "current <|vs|><|image_pad|><|ve|>",
+        ]
+
+        processor(text=text, images=[_make_image(), _make_image()])
+
+        expected_first = "first <|vs|>" + "<|image_pad|>" * 4 + "<|ve|>"
+        expected_second = "stale  current <|vs|>" + "<|image_pad|>" * 8 + "<|ve|>"
+        self.assertEqual(captured["text"], [expected_first, expected_second])
+
+    def test_grouped_images_resolve_variable_batch_counts(self):
+        processor, captured = self._make_capturing_processor(
+            [[1, 4, 4], [1, 4, 8], [1, 4, 12]]
+        )
+        text = [
+            "stale <|vs|><|image_pad|><|ve|> " "current <|vs|><|image_pad|><|ve|>",
+            "first <|vs|><|image_pad|><|ve|> " "second <|vs|><|image_pad|><|ve|>",
+        ]
+
+        processor(
+            text=text,
+            images=[[_make_image()], [_make_image(), _make_image()]],
+        )
+
+        expected_first = "stale  current <|vs|>" + "<|image_pad|>" * 4 + "<|ve|>"
+        expected_second = (
+            "first <|vs|>"
+            + "<|image_pad|>" * 8
+            + "<|ve|> second <|vs|>"
+            + "<|image_pad|>" * 12
+            + "<|ve|>"
+        )
+        self.assertEqual(captured["text"], [expected_first, expected_second])
+
+    def test_grouped_images_allow_rows_without_current_images(self):
+        processor, captured = self._make_capturing_processor([[1, 4, 4]])
+        text = [
+            "stale <|vs|><|image_pad|><|ve|>",
+            "stale <|vs|><|image_pad|><|ve|> " "current <|vs|><|image_pad|><|ve|>",
+        ]
+
+        processor(text=text, images=[[], [_make_image()]])
+
+        expected = "stale  current <|vs|>" + "<|image_pad|>" * 4 + "<|ve|>"
+        self.assertEqual(captured["text"], ["stale ", expected])
+
+    def test_ambiguous_flat_image_batch_is_rejected(self):
+        processor, _ = self._make_capturing_processor(
+            [[1, 4, 4], [1, 4, 8], [1, 4, 12]]
+        )
+        text = [
+            "first <|image_pad|> second <|image_pad|>",
+            "first <|image_pad|> second <|image_pad|>",
+        ]
+
+        with self.assertRaisesRegex(ValueError, "Cannot unambiguously map"):
+            processor(
+                text=text,
+                images=[_make_image(), _make_image(), _make_image()],
+            )
+
+    def test_flat_variable_image_counts_require_explicit_groups(self):
+        processor, _ = self._make_capturing_processor(
+            [[1, 4, 4], [1, 4, 8], [1, 4, 12]]
+        )
+        text = [
+            "first <|image_pad|>",
+            "stale <|image_pad|> first <|image_pad|> second <|image_pad|>",
+        ]
+
+        with self.assertRaisesRegex(ValueError, "Cannot unambiguously map"):
+            processor(
+                text=text,
+                images=[_make_image(), _make_image(), _make_image()],
+            )
+
+    def test_more_grouped_images_than_row_markers_is_rejected(self):
+        processor, _ = self._make_capturing_processor(
+            [[1, 4, 4], [1, 4, 8], [1, 4, 12]]
+        )
+        text = ["first <|image_pad|>", "second <|image_pad|>"]
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Text entry 0 contains 1 image placeholders, but 2 images were supplied",
+        ):
+            processor(
+                text=text,
+                images=[[_make_image(), _make_image()], [_make_image()]],
+            )
+
+    def test_image_processor_flattens_grouped_images(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+        processor = Qwen3VLImageProcessor()
+
+        output = processor(images=[[_make_image()], [_make_image()]])
+
+        self.assertEqual(output["image_grid_thw"].shape, (2, 3))
+
     def test_image_processor_honors_per_call_max_pixels(self):
         from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
 
@@ -1493,6 +1881,14 @@ class TestIdefics3Processor(_ProcessorTestBase, unittest.TestCase):
         result = get_image_prompt_string(2, 2, 4, "<F>", "<I>", "<G>")
         self.assertIn("<row_1_col_1>", result)
         self.assertIn("<row_2_col_2>", result)
+
+    def test_end_of_utterance_is_an_additional_eos_token(self):
+        processor = self._make_processor()
+        processor.tokenizer.convert_tokens_to_ids = lambda token: (
+            128258 if token == "<end_of_utterance>" else None
+        )
+
+        self.assertEqual(processor.additional_eos_token_ids, [128258])
 
 
 class TestAyaVisionProcessor(_ProcessorTestBase, unittest.TestCase):
@@ -2101,6 +2497,179 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertEqual(int(result["pixel_attention_mask"].sum()), 256)
         self.assertEqual(_num_image_tokens_from_patch_grid(16, 16, 2), 64)
 
+    def test_large_image_is_split_into_tiles_and_thumbnail(self):
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlNumpyImageProcessor
+
+        processor = Lfm2VlNumpyImageProcessor(
+            encoder_patch_size=16,
+            downsample_factor=2,
+            min_image_tokens=64,
+            max_image_tokens=256,
+            max_num_patches=1024,
+        )
+
+        # 2560x1440 screenshot: 8 tiles in a 4x2 grid + one thumbnail
+        image = Image.fromarray(
+            np.random.randint(0, 255, (1440, 2560, 3), dtype=np.uint8)
+        )
+        result = processor([image], return_tensors="np")
+
+        self.assertEqual(result["pixel_values"].shape, (9, 1024, 768))
+        self.assertEqual(result["spatial_shapes"].tolist(), [[32, 32]] * 8 + [[24, 42]])
+        self.assertEqual(result["image_rows"].tolist(), [2])
+        self.assertEqual(result["image_cols"].tolist(), [4])
+        self.assertEqual(result["image_sizes"].tolist(), [[384, 672]])
+        self.assertEqual(
+            result["pixel_attention_mask"].sum(axis=1).tolist(), [1024] * 8 + [1008]
+        )
+
+    def test_small_image_stays_single_view_with_tiling_enabled(self):
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlNumpyImageProcessor
+
+        processor = Lfm2VlNumpyImageProcessor()
+
+        # Below the too-large threshold: identical to the pre-tiling behavior
+        image = Image.fromarray(
+            np.random.randint(0, 255, (540, 960, 3), dtype=np.uint8)
+        )
+        result = processor([image], return_tensors="np")
+
+        self.assertEqual(result["pixel_values"].shape, (1, 1024, 768))
+        self.assertEqual(result["spatial_shapes"].tolist(), [[24, 42]])
+        self.assertEqual(result["image_rows"].tolist(), [1])
+        self.assertEqual(result["image_cols"].tolist(), [1])
+        self.assertEqual(result["image_sizes"].tolist(), [[384, 672]])
+
+        # Explicitly disabling splitting on a large image keeps one view
+        large = Image.fromarray(
+            np.random.randint(0, 255, (1440, 2560, 3), dtype=np.uint8)
+        )
+        result = processor([large], return_tensors="np", do_image_splitting=False)
+        self.assertEqual(result["pixel_values"].shape, (1, 1024, 768))
+        self.assertEqual(result["image_rows"].tolist(), [1])
+        self.assertEqual(result["image_cols"].tolist(), [1])
+
+    def test_patched_call_expands_multi_tile_markers(self):
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import (
+            Lfm2VlNumpyImageProcessor,
+            _patched_call,
+        )
+
+        class RecordingTokenizer(type(_mock_tokenizer())):
+            def __init__(self):
+                self.texts = []
+
+            def __call__(self, text, **kwargs):
+                self.texts.append(text)
+                return super().__call__(text, **kwargs)
+
+        tokenizer = RecordingTokenizer()
+
+        class DummyProcessor:
+            pass
+
+        processor = DummyProcessor()
+        processor.image_processor = Lfm2VlNumpyImageProcessor()
+        processor.tokenizer = tokenizer
+        processor.image_token = "<image>"
+        processor.image_start_token = "<|image_start|>"
+        processor.image_end_token = "<|image_end|>"
+        processor.image_thumbnail_token = "<|img_thumbnail|>"
+        processor._merge_kwargs = lambda *args, **kwargs: {
+            "text_kwargs": {},
+            "images_kwargs": {},
+        }
+
+        image = Image.fromarray(
+            np.random.randint(0, 255, (1440, 2560, 3), dtype=np.uint8)
+        )
+        result = _patched_call(
+            processor,
+            images=[image],
+            text="<image>Describe this image",
+        )
+
+        self.assertEqual(result["pixel_values"].shape, (9, 1024, 768))
+
+        expanded = tokenizer.texts[0][0]
+        self.assertTrue(expanded.startswith("<|image_start|><|img_row_1_col_1|>"))
+        # Row-major tile markers, thumbnail marker last, then the image end
+        markers = [
+            f"<|img_row_{row}_col_{col}|>" for row in (1, 2) for col in (1, 2, 3, 4)
+        ]
+        for marker in markers:
+            self.assertIn(marker, expanded)
+        self.assertLess(
+            expanded.index(markers[-1]), expanded.index("<|img_thumbnail|>")
+        )
+        self.assertIn("<|img_thumbnail|>" + "<image>" * 252 + "<|image_end|>", expanded)
+        self.assertTrue(expanded.endswith("Describe this image"))
+        # 8 tiles * 256 tokens + 252 thumbnail tokens
+        self.assertEqual(expanded.count("<image>"), 8 * 256 + 252)
+
+    def test_non_numpy_image_processor_swapped_with_tiling(self):
+        # Regression test for the torch-installed case: the real
+        # Siglip2ImageProcessor (no tiling, (B, C, H, W) output) must be
+        # swapped for the NumPy processor before any image is processed.
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import _patched_call
+
+        class FakeTorchSiglip2:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+            def to_dict(self):
+                return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
+
+            def __call__(self, images, **kwargs):
+                raise AssertionError(
+                    "non-NumPy image processor should have been swapped out"
+                )
+
+        class RecordingTokenizer(type(_mock_tokenizer())):
+            def __init__(self):
+                self.texts = []
+
+            def __call__(self, text, **kwargs):
+                self.texts.append(text)
+                return super().__call__(text, **kwargs)
+
+        tokenizer = RecordingTokenizer()
+
+        class DummyProcessor:
+            pass
+
+        processor = DummyProcessor()
+        processor.image_processor = FakeTorchSiglip2(do_resize=True)
+        processor.tokenizer = tokenizer
+        processor.image_token = "<image>"
+        processor.image_start_token = "<|image_start|>"
+        processor.image_end_token = "<|image_end|>"
+        processor.image_thumbnail_token = "<|img_thumbnail|>"
+        processor._merge_kwargs = lambda *args, **kwargs: {
+            "text_kwargs": {},
+            "images_kwargs": {},
+        }
+
+        image = Image.fromarray(
+            np.random.randint(0, 255, (1440, 2560, 3), dtype=np.uint8)
+        )
+        result = _patched_call(
+            processor,
+            images=[image],
+            text="<image>Describe this image",
+        )
+
+        self.assertEqual(
+            type(processor.image_processor).__name__, "Lfm2VlNumpyImageProcessor"
+        )
+        self.assertEqual(result["pixel_values"].shape, (9, 1024, 768))
+        self.assertEqual(result["spatial_shapes"].tolist()[:8], [[32, 32]] * 8)
+        expanded = tokenizer.texts[0][0]
+        self.assertTrue(expanded.startswith("<|image_start|><|img_row_1_col_1|>"))
+        self.assertIn("<|img_thumbnail|>", expanded)
+        # 8 tiles * 256 tokens + 252 thumbnail tokens
+        self.assertEqual(expanded.count("<image>"), 8 * 256 + 252)
+
     def test_scalar_image_rows_and_cols_are_supported(self):
         from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import _patched_call
 
@@ -2146,13 +2715,20 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertIn("input_ids", result)
         self.assertIn("attention_mask", result)
 
-    def test_from_pretrained_uses_slow_image_processor(self):
+    def test_from_pretrained_uses_numpy_image_processor_despite_siglip2(self):
+        # Even when the real Siglip2ImageProcessor is importable (torch
+        # installed), from_pretrained must build the NumPy processor: it is
+        # the only implementation with official tiling and the packed-patch
+        # output the MLX model consumes.
         import json
         import tempfile
         from pathlib import Path
         from unittest.mock import patch
 
-        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlProcessor
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import (
+            Lfm2VlNumpyImageProcessor,
+            Lfm2VlProcessor,
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             (Path(tmpdir) / "processor_config.json").write_text(
@@ -2212,14 +2788,67 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
             ):
                 processor = Lfm2VlProcessor.from_pretrained(tmpdir)
 
-        self.assertIsInstance(processor.image_processor, DummySiglip2ImageProcessor)
+        self.assertIsInstance(processor.image_processor, Lfm2VlNumpyImageProcessor)
         self.assertTrue(processor.image_processor.do_resize)
-        self.assertFalse(processor.image_processor.do_image_splitting)
+        # The official tiling defaults are re-applied even when the repo config
+        # ships `do_image_splitting: false` (the LiquidAI MLX repos do).
+        self.assertTrue(processor.image_processor.do_image_splitting)
         tokenizer_from_pretrained.assert_called_once_with(
             tmpdir,
             trust_remote_code=False,
             local_files_only=True,
         )
+
+    def test_from_pretrained_honors_explicit_splitting_override(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlProcessor
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "processor_config.json").write_text(
+                json.dumps({"processor_class": "Lfm2VlProcessor"})
+            )
+
+            class DummySiglip2ImageProcessor:
+                def __init__(self, **kwargs):
+                    self.do_image_splitting = kwargs.get("do_image_splitting")
+                    self.use_thumbnail = kwargs.get("use_thumbnail")
+
+            def _fake_init(
+                self, image_processor, tokenizer, chat_template=None, **kwargs
+            ):
+                self.image_processor = image_processor
+                self.tokenizer = tokenizer
+                self.chat_template = chat_template
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=_mock_tokenizer(),
+                ),
+                patch(
+                    "mlx_vlm.models.lfm2_vl.processing_lfm2_vl.Siglip2ImageProcessor",
+                    DummySiglip2ImageProcessor,
+                    create=True,
+                ),
+                patch(
+                    "mlx_vlm.models.lfm2_vl.processing_lfm2_vl._SLOW_PROCESSOR_AVAILABLE",
+                    True,
+                ),
+                patch(
+                    "mlx_vlm.models.lfm2_vl.processing_lfm2_vl._original_init",
+                    _fake_init,
+                ),
+            ):
+                processor = Lfm2VlProcessor.from_pretrained(
+                    tmpdir, do_image_splitting=False
+                )
+
+        self.assertFalse(processor.image_processor.do_image_splitting)
+        self.assertTrue(processor.image_processor.use_thumbnail)
 
 
 class TestMolmoPointProcessor(unittest.TestCase):
@@ -2922,6 +3551,53 @@ class TestQwen3_5MoePatch(unittest.TestCase):
         )
 
 
+class TestQwen4ExpPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
+            "qwen4_exp",
+            "mlx_vlm.models.qwen4_exp",
+            "Qwen3VLProcessor",
+        )
+
+
+class TestQwen3VLEmbeddingPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
+            "qwen3_vl_embedding",
+            "mlx_vlm.models.qwen3_vl_embedding",
+            "Qwen3VLProcessor",
+        )
+
+    def test_does_not_fall_through_to_torch_gated_hf_processor(self):
+        # Regression test: embedding checkpoints ship with model_type
+        # "qwen3_vl_embedding", distinct from "qwen3_vl". Before this class
+        # registered its own patch, AutoProcessor fell through to
+        # transformers' real Qwen3VLProcessor, which hard-requires
+        # torch/torchvision to build its video sub-processor even though the
+        # embedding server never uses one.
+        import importlib
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        importlib.import_module("mlx_vlm.models.qwen3_vl_embedding")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps({"model_type": "qwen3_vl_embedding"})
+            )
+            try:
+                AutoProcessor.from_pretrained(tmpdir)
+            except Exception as e:
+                err = str(e).lower()
+                self.assertNotIn("requires the pytorch library", err)
+                self.assertNotIn("requires the torchvision library", err)
+
+
 class TestQwen3OmniMoePatch(unittest.TestCase):
     def test_patch_intercepts_without_hf_video_processor(self):
         import json
@@ -3142,6 +3818,38 @@ class TestDeepseekV4Processor(unittest.TestCase):
         self.assertIsInstance(processor, DeepseekV4Processor)
 
 
+class TestPlamo2VLPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        import importlib
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        module = importlib.import_module("mlx_vlm.models.plamo2vl")
+        sentinel = object()
+
+        def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+            self.assertEqual(Path(pretrained_model_name_or_path), Path(tmpdir))
+            self.assertTrue(kwargs.get("trust_remote_code"))
+            return sentinel
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps({"model_type": "plamo2vl"}),
+                encoding="utf-8",
+            )
+            with patch.object(
+                module.Plamo2VLProcessor,
+                "from_pretrained",
+                classmethod(from_pretrained),
+            ):
+                processor = AutoProcessor.from_pretrained(tmpdir)
+
+        self.assertIs(processor, sentinel)
+
+
 class TestPatchChainsForUnknownModelType(unittest.TestCase):
     def test_falls_through(self):
         import importlib
@@ -3351,3 +4059,157 @@ class TestTrustRemoteCodePassthrough(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestVideoFrameCaps(unittest.TestCase):
+    """Processors that re-subsample declare their cap so the decoder can stop
+    reading frames that are about to be thrown away."""
+
+    def test_gemma4_declares_its_frame_count(self):
+        from mlx_vlm.models.gemma4.processing_gemma4 import Gemma4VideoProcessor
+
+        processor = Gemma4VideoProcessor()
+        self.assertEqual(
+            processor.video_sampling_defaults(), {"max_frames": processor.num_frames}
+        )
+
+    def test_gemma4_unified_inherits_the_declaration(self):
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedVideoProcessor,
+        )
+
+        processor = Gemma4UnifiedVideoProcessor()
+        self.assertEqual(
+            processor.video_sampling_defaults(), {"max_frames": processor.num_frames}
+        )
+
+    def test_minicpmv_declares_its_frame_count(self):
+        from mlx_vlm.models.minicpmv4_6.processing_minicpmv4_6 import (
+            MiniCPMVVideoProcessor,
+        )
+
+        processor = MiniCPMVVideoProcessor()
+        self.assertEqual(
+            processor.video_sampling_defaults(),
+            {"max_frames": processor.max_num_frames},
+        )
+
+
+class TestMuseGlimmerCleanOutput(unittest.TestCase):
+    def _clean(self, text):
+        from mlx_vlm.models.muse_glimmer.processing_muse_glimmer import (
+            _extract_final_channel,
+        )
+
+        return _extract_final_channel(text)
+
+    def test_returns_only_final_user_channel(self):
+        raw = (
+            " to=self<|message|>Describe this image in one sentence.\n"
+            "Probably: two cats.\nLet's produce.<|eom|>"
+            "<|start|>assistant to=user<|message|>Two tabby cats sleep on a pink couch."
+        )
+        cleaned = self._clean(raw)
+        self.assertEqual(cleaned, "Two tabby cats sleep on a pink couch.")
+        self.assertNotIn("to=self", cleaned)
+        self.assertNotIn("<|message|>", cleaned)
+
+    def test_strips_trailing_channel_end_marker(self):
+        raw = "to=user<|message|>Final answer.<|return|>"
+        self.assertEqual(self._clean(raw), "Final answer.")
+
+    def test_noop_without_channels(self):
+        plain = "Two tabby cats sleep on a pink couch."
+        self.assertEqual(self._clean(plain), plain)
+
+
+class Qwen3VLVideoTimestampTests(unittest.TestCase):
+    """The processor renders one timestamped vision block per temporal group."""
+
+    class _Tokenizer:
+        video_token = "<|video_pad|>"
+        video_token_id = 102
+        pad_token = "<pad>"
+        pad_token_id = 0
+
+        def __init__(self):
+            self.last_text = None
+
+        def __call__(self, text, **kwargs):
+            self.last_text = text
+            texts = [text] if isinstance(text, str) else text
+            ids = []
+            for item in texts:
+                row = []
+                remaining = item
+                while remaining:
+                    if remaining.startswith(self.video_token):
+                        row.append(self.video_token_id)
+                        remaining = remaining[len(self.video_token) :]
+                    else:
+                        row.append(1)
+                        remaining = remaining[1:]
+                ids.append(row)
+            return {"input_ids": ids, "attention_mask": [[1] * len(r) for r in ids]}
+
+    def _make_processor(self, grid_thw):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+
+        tokenizer = self._Tokenizer()
+        video_processor = SimpleNamespace(
+            merge_size=2,
+            temporal_patch_size=2,
+            fps=2.0,
+            __call__=None,
+        )
+        video_processor = type(
+            "StubVideoProcessor",
+            (),
+            {
+                "merge_size": 2,
+                "temporal_patch_size": 2,
+                "fps": 2.0,
+                "__call__": lambda self, videos=None, **kw: {
+                    "pixel_values_videos": np.zeros((1, 4), dtype=np.float32),
+                    "video_grid_thw": np.array([grid_thw], dtype=np.int64),
+                },
+            },
+        )()
+        processor = Qwen3VLProcessor.__new__(Qwen3VLProcessor)
+        processor.tokenizer = tokenizer
+        processor.image_processor = None
+        processor.video_processor = video_processor
+        processor.image_token = "<|image_pad|>"
+        processor.image_token_id = 100
+        processor.video_token = tokenizer.video_token
+        processor.video_token_id = tokenizer.video_token_id
+        processor.vision_start_token = "<|vision_start|>"
+        processor.vision_end_token = "<|vision_end|>"
+        processor.vision_start_token_id = 58
+        processor.vision_end_token_id = 59
+        return processor, tokenizer
+
+    def test_video_prompt_gets_one_timestamped_block_per_temporal_group(self):
+        processor, tokenizer = self._make_processor(grid_thw=[4, 2, 2])
+        prompt = "<|vision_start|><|video_pad|><|vision_end|>Describe the clip."
+
+        out = processor(text=[prompt], videos=["clip.mp4"], fps=[2.0])
+
+        rendered = tokenizer.last_text[0]
+        self.assertEqual(rendered.count(" seconds>"), 4)
+        self.assertIn("<0.2 seconds><|vision_start|>", rendered)
+        self.assertIn("<3.2 seconds><|vision_start|>", rendered)
+        self.assertEqual(rendered.count("<|vision_start|>"), 4)
+        ids = np.array(out["input_ids"])[0].tolist()
+        self.assertEqual(ids.count(tokenizer.video_token_id), 4)  # 4 groups x 1 token
+
+    def test_video_prompt_falls_back_to_processor_fps(self):
+        processor, tokenizer = self._make_processor(grid_thw=[2, 2, 2])
+        prompt = "<|vision_start|><|video_pad|><|vision_end|>Describe the clip."
+
+        processor(text=[prompt], videos=["clip.mp4"])
+
+        rendered = tokenizer.last_text[0]
+        self.assertEqual(rendered.count(" seconds>"), 2)
+        self.assertIn("<0.2 seconds>", rendered)
+        self.assertIn("<1.2 seconds>", rendered)

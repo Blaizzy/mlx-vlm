@@ -1,5 +1,6 @@
 import importlib
 import inspect
+import math
 import threading
 import unittest
 from types import SimpleNamespace
@@ -8,6 +9,1676 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten, tree_map
+
+from mlx_vlm.tests.cache_invariants import assert_cached_forward_matches_full
+from mlx_vlm.tests.sanitize_invariants import assert_sanitize_idempotent
+
+
+class TestNanochatModel(unittest.TestCase):
+    def test_native_loader_and_cached_forward(self):
+        from mlx_vlm.models import nanochat
+        from mlx_vlm.utils import get_model_and_args
+
+        config = nanochat.ModelConfig(
+            model_type="nanochat",
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=64,
+            max_position_embeddings=128,
+            intermediate_size=64,
+            rope_theta=10000.0,
+        )
+        model = nanochat.Model(config)
+
+        full_logits, _ = assert_cached_forward_matches_full(model)
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertEqual(len(model.layers), config.num_hidden_layers)
+
+        model_module, model_type = get_model_and_args(config.to_dict())
+        self.assertIs(model_module, nanochat)
+        self.assertEqual(model_type, "nanochat")
+
+    def test_sanitize_adds_native_wrapper_prefix(self):
+        from mlx_vlm.models import nanochat
+
+        model = nanochat.Model(
+            nanochat.ModelConfig(
+                vocab_size=8,
+                hidden_size=8,
+                intermediate_size=16,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+            )
+        )
+        weights = {"transformer.wte.weight": mx.zeros((8, 8))}
+
+        sanitized = model.sanitize(weights)
+
+        self.assertEqual(set(sanitized), {"language_model.transformer.wte.weight"})
+
+
+class TestMamba2Model(unittest.TestCase):
+    def _config(self, tied=True):
+        from mlx_vlm.models import mamba2
+
+        return mamba2.ModelConfig(
+            model_type="mamba2",
+            num_heads=4,
+            head_dim=8,
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=32,
+            state_size=8,
+            num_hidden_layers=2,
+            layer_norm_epsilon=1e-5,
+            conv_kernel=4,
+            n_groups=2,
+            use_bias=False,
+            use_conv_bias=True,
+            tie_word_embeddings=tied,
+            time_step_limit=(0.0, float("inf")),
+            time_step_rank="auto",
+        )
+
+    def test_native_loader_cached_forward_and_conv_sanitize(self):
+        from mlx_vlm.models import mamba2
+        from mlx_vlm.models.cache import ArraysCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = mamba2.Model(config)
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, cache=cache
+        )
+        sanitized = model.sanitize(
+            {"backbone.layers.0.mixer.conv1d.weight": mx.zeros((64, 1, 4))}
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(all(isinstance(item, ArraysCache) for item in cache))
+        self.assertEqual(
+            sanitized["language_model.backbone.layers.0.mixer.conv1d.weight"].shape,
+            (64, 4, 1),
+        )
+        self.assertEqual(config.time_step_rank, 2)
+        self.assertEqual(config.ssm_state_size, config.state_size)
+        self.assertIs(model_module, mamba2)
+        self.assertEqual(model_type, "mamba2")
+
+
+class TestPlamo2Model(unittest.TestCase):
+    def test_native_loader_cached_forward_and_conv_sanitize(self):
+        from mlx_vlm.models import plamo2
+        from mlx_vlm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = plamo2.ModelConfig(
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            hidden_size_per_head=8,
+            intermediate_size=64,
+            mamba_num_heads=4,
+            mamba_d_state=8,
+            mamba_d_conv=4,
+            mamba_step=2,
+            vocab_size=64,
+        )
+        mx.random.seed(0)
+        model = plamo2.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache, atol=2e-3
+        )
+        sanitized = model.sanitize(
+            {"model.layers.layers.0.mixer.conv1d.weight": mx.zeros((32, 1, 4))}
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertEqual(
+            sanitized["language_model.model.layers.layers.0.mixer.conv1d.weight"].shape,
+            (32, 4, 1),
+        )
+        self.assertIs(model_module, plamo2)
+        self.assertEqual(model_type, "plamo2")
+
+
+class TestAFM7Model(unittest.TestCase):
+    def test_concatenate_kv_cache(self):
+        from mlx_vlm.models.cache import ConcatenateKVCache
+
+        cache = ConcatenateKVCache()
+        keys = mx.arange(16).reshape(1, 2, 2, 4)
+        values = keys + 16
+        cache.update_and_fetch(keys[:, :, :1], values[:, :, :1])
+        cached_keys, cached_values = cache.update_and_fetch(
+            keys[:, :, 1:], values[:, :, 1:]
+        )
+        mx.eval(cached_keys, cached_values)
+
+        self.assertEqual(cache.offset, 2)
+        self.assertEqual(cached_keys.tolist(), keys.tolist())
+        self.assertEqual(cached_values.tolist(), values.tolist())
+        self.assertEqual(cache.trim(1), 1)
+        self.assertEqual(cache.state[0].shape[-2], 1)
+
+        restored = ConcatenateKVCache()
+        restored.prefix_cache_restore(cache.prefix_cache_snapshot())
+        self.assertEqual(restored.offset, 1)
+        self.assertEqual(restored.state[0].tolist(), cache.state[0].tolist())
+
+    def test_native_loader_cached_forward_and_kv_reuse(self):
+        from mlx_vlm.models import afm7
+        from mlx_vlm.models.afm7.language import FusedLinear
+        from mlx_vlm.models.cache import KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = afm7.ModelConfig(
+            model_type="afm7",
+            vocab_size=64,
+            hidden_dim=32,
+            num_layers=4,
+            num_kv_reuse_layers=2,
+            num_heads=4,
+            num_kv_heads=2,
+            hidden_dim_scale_factor=2.0,
+        )
+        mx.random.seed(0)
+        model = afm7.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        sanitized = model.sanitize({"model.embedding.weight": mx.zeros((64, 32))})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertEqual(len(model.language_model.model.layers), 2)
+        self.assertEqual(len(model.language_model.model.kv_reuse_layers), 2)
+        self.assertEqual(len(model.layers), config.num_layers)
+        self.assertTrue(all(isinstance(item, KVCache) for item in cache))
+        self.assertEqual(cache[-1].offset, inputs.shape[1])
+        self.assertIsInstance(
+            model.language_model.model.layers[0].self_attn.qkv_proj, FusedLinear
+        )
+        self.assertEqual(
+            model.language_model.model.layers[0].self_attn.qkv_proj.output_dims,
+            [32, 16, 16],
+        )
+        self.assertEqual(set(sanitized), {"language_model.model.embedding.weight"})
+        self.assertIs(model_module, afm7)
+        self.assertEqual(model_type, "afm7")
+
+
+class TestJambaModel(unittest.TestCase):
+    def test_native_loader_hybrid_cache_and_expert_sanitize(self):
+        from mlx_vlm.models import jamba
+        from mlx_vlm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = jamba.ModelConfig(
+            model_type="jamba",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            attn_layer_offset=1,
+            attn_layer_period=2,
+            expert_layer_offset=0,
+            expert_layer_period=2,
+            mamba_d_conv=4,
+            mamba_d_state=8,
+            mamba_expand=2,
+            num_experts=2,
+            num_experts_per_tok=2,
+            rms_norm_eps=1e-5,
+            max_position_embeddings=128,
+            vocab_size=64,
+        )
+        mx.random.seed(0)
+        model = jamba.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        sanitized = model.sanitize(
+            {
+                "model.layers.0.mamba.conv1d.weight": mx.zeros((64, 1, 4)),
+                "model.layers.0.feed_forward.experts.0.gate_proj.weight": mx.zeros(
+                    (64, 32)
+                ),
+                "model.layers.0.feed_forward.experts.1.gate_proj.weight": mx.ones(
+                    (64, 32)
+                ),
+                "lm_head.weight": mx.zeros((64, 32)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertEqual(config.mamba_dt_rank, 2)
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.mamba.conv1d.weight"].shape,
+            (64, 4, 1),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.feed_forward.switch_mlp.gate_proj.weight"
+            ].shape,
+            (2, 64, 32),
+        )
+        self.assertNotIn("language_model.lm_head.weight", sanitized)
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.router", None),
+            {
+                "group_size": 64,
+                "bits": 8,
+            },
+        )
+        self.assertIs(model_module, jamba)
+        self.assertEqual(model_type, "jamba")
+
+
+class TestBailingMoeLinearModel(unittest.TestCase):
+    def test_native_loader_hybrid_cache_expert_sanitize_and_predicates(self):
+        from mlx_vlm.models import bailing_moe_linear
+        from mlx_vlm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = bailing_moe_linear.ModelConfig(
+            model_type="bailing_moe_linear",
+            hidden_size=32,
+            intermediate_size=64,
+            max_position_embeddings=128,
+            moe_intermediate_size=48,
+            num_experts=4,
+            num_shared_experts=1,
+            norm_topk_prob=True,
+            num_attention_heads=4,
+            num_experts_per_tok=2,
+            num_hidden_layers=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            vocab_size=64,
+            first_k_dense_replace=1,
+            layer_group_size=2,
+            group_norm_size=4,
+            use_qk_norm=True,
+            norm_head=True,
+            moe_router_enable_expert_bias=True,
+            score_function="sigmoid",
+            n_group=2,
+            topk_group=1,
+            head_dim=8,
+        )
+        mx.random.seed(0)
+        model = bailing_moe_linear.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        sanitized = model.sanitize(
+            {
+                **{
+                    f"model.layers.1.mlp.experts.{expert}.gate_proj.weight": mx.full(
+                        (48, 32), expert
+                    )
+                    for expert in range(config.num_experts)
+                },
+                "model.layers.1.mlp.gate.weight": mx.ones((4, 32)),
+                "lm_head.weight": mx.ones((64, 32)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertIsInstance(cache[2], ArraysCache)
+        self.assertIsInstance(cache[3], KVCache)
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight"
+            ].shape,
+            (4, 48, 32),
+        )
+        self.assertIn(
+            "language_model.model.layers.1.mlp.gate.gate_proj.weight", sanitized
+        )
+        self.assertTrue(
+            mx.allclose(
+                mx.linalg.norm(sanitized["language_model.lm_head.weight"], axis=0),
+                mx.ones((32,)),
+                atol=1e-5,
+            ).item()
+        )
+        self.assertFalse(model.cast_predicate("model.layers.1.mlp.gate.expert_bias"))
+        self.assertEqual(
+            model.quant_predicate("model.layers.1.mlp.gate.gate_proj", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, bailing_moe_linear)
+        self.assertEqual(model_type, "bailing_moe_linear")
+
+
+class TestGraniteMoeHybridModel(unittest.TestCase):
+    def _config(self, use_moe=True):
+        from mlx_vlm.models import granitemoehybrid
+
+        return granitemoehybrid.ModelConfig(
+            model_type="granitemoehybrid",
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=48,
+            num_hidden_layers=4,
+            max_position_embeddings=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            attention_bias=False,
+            embedding_multiplier=2.0,
+            attention_multiplier=0.5,
+            logits_scaling=4.0,
+            residual_multiplier=0.75,
+            layer_types=["mamba", "attention", "mamba", "attention"],
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            num_local_experts=4 if use_moe else None,
+            num_experts_per_tok=2 if use_moe else None,
+            shared_intermediate_size=40 if use_moe else None,
+            mamba_n_heads=4,
+            mamba_d_head=8,
+            mamba_proj_bias=False,
+            mamba_d_state=8,
+            mamba_d_conv=4,
+            mamba_n_groups=2,
+            mamba_conv_bias=True,
+            tie_word_embeddings=False,
+        )
+
+    def test_native_loader_hybrid_cache_moe_sanitize_and_predicate(self):
+        from mlx_vlm.models import granitemoehybrid
+        from mlx_vlm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        mx.random.seed(0)
+        model = granitemoehybrid.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        input_weights = {
+            f"model.layers.{layer}.block_sparse_moe.input_linear.weight": mx.ones(
+                (4, 96, 32)
+            )
+            for layer in range(config.num_hidden_layers)
+        }
+        output_weights = {
+            f"model.layers.{layer}.block_sparse_moe.output_linear.weight": mx.ones(
+                (4, 32, 48)
+            )
+            for layer in range(config.num_hidden_layers)
+        }
+        sanitized = model.sanitize(
+            {
+                **input_weights,
+                **output_weights,
+                "model.layers.0.mamba.conv1d.weight": mx.ones((80, 1, 4)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertIsInstance(cache[2], ArraysCache)
+        self.assertIsInstance(cache[3], KVCache)
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.block_sparse_moe.switch_mlp.gate_proj.weight"
+            ].shape,
+            (4, 48, 32),
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.mamba.conv1d.weight"].shape,
+            (80, 4, 1),
+        )
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.block_sparse_moe.router.layer", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, granitemoehybrid)
+        self.assertEqual(model_type, "granitemoehybrid")
+
+    def test_dense_checkpoint_sanitize(self):
+        from mlx_vlm.models import granitemoehybrid
+
+        config = self._config(use_moe=False)
+        model = granitemoehybrid.Model(config)
+        weights = {
+            f"model.layers.{layer}.shared_mlp.input_linear.weight": mx.ones((96, 32))
+            for layer in range(config.num_hidden_layers)
+        }
+        weights.update(
+            {
+                f"model.layers.{layer}.shared_mlp.output_linear.weight": mx.ones(
+                    (32, 48)
+                )
+                for layer in range(config.num_hidden_layers)
+            }
+        )
+
+        sanitized = model.sanitize(weights)
+
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.mlp.gate_proj.weight"].shape,
+            (48, 32),
+        )
+        self.assertTrue(
+            model.quant_predicate("model.layers.0.block_sparse_moe.router.layer", None)
+        )
+
+
+class TestKimiLinearModel(unittest.TestCase):
+    def test_native_loader_hybrid_cache_sanitize_and_predicates(self):
+        from mlx_vlm.models import kimi_linear
+        from mlx_vlm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = kimi_linear.ModelConfig(
+            model_type="kimi_linear",
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            intermediate_size=64,
+            head_dim=8,
+            rope_theta=10000.0,
+            rms_norm_eps=1e-5,
+            linear_attn_config={
+                "kda_layers": [1, 3],
+                "num_heads": 4,
+                "head_dim": 8,
+                "short_conv_kernel_size": 4,
+            },
+            model_max_length=128,
+            num_experts=4,
+            moe_intermediate_size=48,
+            kv_lora_rank=8,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            num_experts_per_token=2,
+            num_shared_experts=1,
+            moe_router_activation_func="sigmoid",
+            num_expert_group=2,
+            topk_group=1,
+        )
+        mx.random.seed(0)
+        model = kimi_linear.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        weights = {
+            **{
+                f"model.layers.0.block_sparse_moe.experts.{expert}.{projection}.weight": mx.full(
+                    (
+                        48 if projection != "w2" else 32,
+                        32 if projection != "w2" else 48,
+                    ),
+                    expert,
+                )
+                for expert in range(config.num_experts)
+                for projection in ("w1", "w2", "w3")
+            },
+            "model.layers.0.block_sparse_moe.gate.weight": mx.ones((4, 32)),
+            "model.layers.0.block_sparse_moe.gate.e_score_correction_bias": mx.ones(
+                (4,)
+            ),
+            "model.layers.0.self_attn.q_conv1d.weight": mx.ones((32, 1, 4)),
+            "model.layers.0.self_attn.dt_bias": mx.ones((4, 8)),
+            "model.layers.1.self_attn.kv_b_proj.weight": mx.ones((32, 8)),
+            "model.mtp.layers.0.weight": mx.ones((1,)),
+        }
+        sanitized = model.sanitize(weights)
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertIsInstance(cache[2], ArraysCache)
+        self.assertIsInstance(cache[3], KVCache)
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
+            ].shape,
+            (4, 48, 32),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.self_attn.q_conv.conv.weight"
+            ].shape,
+            (32, 4, 1),
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.self_attn.dt_bias"].shape,
+            (32,),
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.1.self_attn.embed_q.weight"].shape,
+            (4, 8, 4),
+        )
+        self.assertFalse(
+            model.cast_predicate("model.layers.0.mlp.e_score_correction_bias")
+        )
+        self.assertFalse(model.cast_predicate("model.layers.0.self_attn.A_log"))
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.mlp.gate", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, kimi_linear)
+        self.assertEqual(model_type, "kimi_linear")
+
+
+class TestStep3p5Model(unittest.TestCase):
+    def _config(self):
+        from mlx_vlm.models import step3p5
+
+        return step3p5.ModelConfig(
+            model_type="step3p5",
+            hidden_size=32,
+            num_hidden_layers=4,
+            vocab_size=64,
+            num_attention_heads=4,
+            num_attention_groups=2,
+            head_dim=8,
+            intermediate_size=64,
+            rms_norm_eps=1e-5,
+            rope_theta=[10000.0, 12000.0, 14000.0, 16000.0],
+            max_position_embeddings=128,
+            sliding_window=8,
+            layer_types=[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            yarn_only_types=["full_attention"],
+            partial_rotary_factors=[0.5, 1.0, 0.5, 1.0],
+            attention_other_setting={
+                "num_attention_heads": 2,
+                "num_attention_groups": 1,
+            },
+            use_head_wise_attn_gate=True,
+            moe_num_experts=4,
+            moe_top_k=2,
+            moe_intermediate_size=48,
+            share_expert_dim=40,
+            moe_layers_enum="1,3",
+            moe_router_scaling_factor=0.75,
+            norm_expert_weight=True,
+            swiglu_limits=[0.0, 1.5, 0.0, 2.0],
+            swiglu_limits_shared=[1.0, 1.25, 1.5, 1.75],
+        )
+
+    def test_native_loader_dual_cache_sanitize_and_predicates(self):
+        from mlx_vlm.models import step3p5
+        from mlx_vlm.models.cache import KVCache, RotatingKVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        mx.random.seed(0)
+        model = step3p5.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        sanitized = model.sanitize(
+            {
+                "model.layers.1.moe.gate_proj.weight": mx.ones((4, 48, 32)),
+                "model.layers.1.moe.router_bias": mx.ones((4,)),
+                "model.layers.1.share_expert.gate_proj.weight": mx.ones((40, 32)),
+                "model.layers.1.input_layernorm.weight": mx.zeros((32,)),
+                "model.layers.4.moe.gate_proj.weight": mx.ones((4, 48, 32)),
+                "model.mtp.layers.0.weight": mx.ones((1,)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertIsInstance(cache[0], RotatingKVCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertIsInstance(cache[2], RotatingKVCache)
+        self.assertIsInstance(cache[3], KVCache)
+        self.assertIn(
+            "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight",
+            sanitized,
+        )
+        self.assertIn("language_model.model.layers.1.mlp.gate.router_bias", sanitized)
+        self.assertIn(
+            "language_model.model.layers.1.mlp.share_expert.gate_proj.weight",
+            sanitized,
+        )
+        self.assertTrue(
+            mx.allclose(
+                sanitized["language_model.model.layers.1.input_layernorm.weight"],
+                mx.ones((32,)),
+            ).item()
+        )
+        self.assertNotIn(
+            "language_model.model.layers.4.mlp.switch_mlp.gate_proj.weight",
+            sanitized,
+        )
+        self.assertFalse(model.cast_predicate("model.layers.1.mlp.gate.router_bias"))
+        self.assertEqual(
+            model.quant_predicate("model.layers.1.mlp.gate.gate", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, step3p5)
+        self.assertEqual(model_type, "step3p5")
+
+    def test_sharding_path(self):
+        from unittest.mock import patch
+
+        from mlx_vlm.models import step3p5
+
+        class Group:
+            @staticmethod
+            def size():
+                return 1
+
+        model = step3p5.Model(self._config())
+        with (
+            patch(
+                "mlx_vlm.models.step3p5.language.shard_linear",
+                side_effect=lambda layer, *args, **kwargs: layer,
+            ) as shard_linear,
+            patch("mlx_vlm.models.step3p5.language.shard_inplace") as shard_inplace,
+        ):
+            model.shard(Group())
+
+        self.assertEqual(shard_linear.call_count, 26)
+        self.assertEqual(shard_inplace.call_count, 12)
+
+
+class TestMiniMaxModel(unittest.TestCase):
+    def test_native_loader_cache_expert_sanitize_and_predicates(self):
+        from mlx_vlm.models import minimax
+        from mlx_vlm.models.cache import KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = minimax.ModelConfig(
+            model_type="minimax",
+            hidden_size=32,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            num_experts_per_tok=2,
+            num_local_experts=4,
+            shared_intermediate_size=64,
+            num_hidden_layers=2,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            rotary_dim=4,
+            vocab_size=64,
+            tie_word_embeddings=False,
+            head_dim=8,
+            use_qk_norm=True,
+        )
+        mx.random.seed(0)
+        model = minimax.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        sanitized = model.sanitize(
+            {
+                f"model.layers.0.block_sparse_moe.experts.{expert}.w1.weight": mx.full(
+                    (64, 32), expert
+                )
+                for expert in range(config.num_local_experts)
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(all(isinstance(item, KVCache) for item in cache))
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.block_sparse_moe.switch_mlp.gate_proj.weight"
+            ].shape,
+            (4, 64, 32),
+        )
+        self.assertFalse(model.cast_predicate("e_score_correction_bias"))
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.block_sparse_moe.gate", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, minimax)
+        self.assertEqual(model_type, "minimax")
+
+
+class TestLongcatFlashModel(unittest.TestCase):
+    def test_native_loader_dual_cache_sanitize_and_predicates(self):
+        from mlx_vlm.models import longcat_flash
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = longcat_flash.ModelConfig(
+            model_type="longcat_flash",
+            attention_method="mla",
+            zero_expert_type="identity",
+            hidden_size=32,
+            ffn_hidden_size=64,
+            moe_topk=2,
+            expert_ffn_hidden_size=48,
+            n_routed_experts=3,
+            zero_expert_num=1,
+            num_layers=1,
+            vocab_size=64,
+            max_position_embeddings=128,
+            num_attention_heads=4,
+            kv_lora_rank=8,
+            q_lora_rank=8,
+            qk_rope_head_dim=4,
+            qk_nope_head_dim=4,
+            v_head_dim=4,
+            routed_scaling_factor=1.0,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            mla_scale_q_lora=True,
+            mla_scale_kv_lora=True,
+            attention_bias=False,
+            norm_topk_prob=True,
+            router_bias=False,
+        )
+        mx.random.seed(0)
+        model = longcat_flash.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        weights = {
+            f"model.layers.0.mlp.experts.{expert}.gate_proj.weight": mx.full(
+                (48, 32), expert
+            )
+            for expert in range(config.n_routed_experts)
+        }
+        for index in range(2):
+            weights[f"model.layers.0.self_attn.{index}.kv_b_proj.weight"] = mx.zeros(
+                (32, 8)
+            )
+        weights["model.mtp.layers.0.weight"] = mx.zeros((1,))
+        sanitized = model.sanitize(weights)
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertEqual(len(cache), config.num_layers)
+        self.assertIsInstance(cache[0], CacheList)
+        self.assertTrue(all(isinstance(item, KVCache) for item in cache[0].caches))
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
+            ].shape,
+            (3, 48, 32),
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.self_attn.0.embed_q.weight"].shape,
+            (4, 8, 4),
+        )
+        self.assertFalse(any("model.mtp" in key for key in sanitized))
+        self.assertFalse(model.cast_predicate("e_score_correction_bias"))
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.mlp.router.classifier", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, longcat_flash)
+        self.assertEqual(model_type, "longcat_flash")
+
+
+class TestLongcatFlashNgramModel(unittest.TestCase):
+    def test_native_loader_ngram_context_and_dual_cache(self):
+        from mlx_vlm.models import longcat_flash_ngram
+        from mlx_vlm.models.cache import ArraysCache, CacheList
+        from mlx_vlm.utils import get_model_and_args
+
+        config = longcat_flash_ngram.ModelConfig(
+            model_type="longcat_flash_ngram",
+            hidden_size=32,
+            ffn_hidden_size=64,
+            moe_topk=2,
+            expert_ffn_hidden_size=48,
+            n_routed_experts=3,
+            zero_expert_num=1,
+            num_layers=1,
+            vocab_size=64,
+            max_position_embeddings=128,
+            num_attention_heads=4,
+            kv_lora_rank=8,
+            q_lora_rank=8,
+            qk_rope_head_dim=4,
+            qk_nope_head_dim=4,
+            v_head_dim=4,
+            routed_scaling_factor=1.0,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            mla_scale_q_lora=True,
+            mla_scale_kv_lora=True,
+            ngram_vocab_size_ratio=2,
+            emb_neighbor_num=3,
+            emb_split_num=2,
+            norm_topk_prob=True,
+        )
+        mx.random.seed(0)
+        model = longcat_flash_ngram.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        sanitized = model.sanitize({"model.embed_tokens.weight": mx.zeros((64, 32))})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], CacheList)
+        self.assertEqual(cache[0][0].tolist(), [[3, 4]])
+        self.assertEqual(
+            set(sanitized),
+            {"language_model.model.ngram_embeddings.word_embeddings.weight"},
+        )
+        self.assertIs(model_module, longcat_flash_ngram)
+        self.assertEqual(model_type, "longcat_flash_ngram")
+
+
+class TestGlm4MoeLiteModel(unittest.TestCase):
+    @staticmethod
+    def _config():
+        from mlx_vlm.models import glm4_moe_lite
+
+        return glm4_moe_lite.ModelConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            moe_intermediate_size=48,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            routed_scaling_factor=1.25,
+            kv_lora_rank=8,
+            q_lora_rank=8,
+            qk_rope_head_dim=4,
+            qk_nope_head_dim=4,
+            v_head_dim=4,
+            norm_topk_prob=True,
+            n_group=2,
+            topk_group=1,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            max_position_embeddings=128,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+        )
+
+    def test_native_loader_mla_cache_and_checkpoint_sanitize(self):
+        from mlx_vlm.models import glm4_moe_lite
+        from mlx_vlm.models.cache import KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        mx.random.seed(0)
+        model = glm4_moe_lite.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        weights = {
+            f"model.layers.1.mlp.experts.{expert}.gate_proj.weight": mx.full(
+                (48, 32), expert
+            )
+            for expert in range(config.n_routed_experts)
+        }
+        weights["model.layers.0.self_attn.kv_b_proj.weight"] = mx.zeros((32, 8))
+        weights["model.layers.3.weight"] = mx.zeros((1,))
+        sanitized = model.sanitize(weights)
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(all(isinstance(item, KVCache) for item in cache))
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight"
+            ].shape,
+            (4, 48, 32),
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.self_attn.embed_q.weight"].shape,
+            (4, 8, 4),
+        )
+        self.assertNotIn("language_model.model.layers.3.weight", sanitized)
+        self.assertFalse(model.cast_predicate("e_score_correction_bias"))
+        self.assertIs(model.language_model.config, config)
+        self.assertIs(model_module, glm4_moe_lite)
+        self.assertEqual(model_type, "glm4_moe_lite")
+
+    def test_batch_turboquant_prefill_and_decode(self):
+        from mlx_vlm.models import glm4_moe_lite
+        from mlx_vlm.turboquant import BatchTurboQuantKVCache
+
+        config = self._config()
+        mx.random.seed(0)
+        model = glm4_moe_lite.Model(config)
+        cache = [
+            BatchTurboQuantKVCache([0], bits=3.5) for _ in model.language_model.layers
+        ]
+        inputs = mx.array([[1, 2, 3, 4]])
+
+        prefill_logits = model(inputs[:, :3], cache=cache).logits
+        decode_logits = model(inputs[:, 3:], cache=cache).logits
+        mx.eval(prefill_logits, decode_logits)
+
+        self.assertEqual(prefill_logits.shape, (1, 3, config.vocab_size))
+        self.assertEqual(decode_logits.shape, (1, 1, config.vocab_size))
+        for layer_cache in cache:
+            self.assertEqual(layer_cache.key_codec.dim, config.kv_lora_rank)
+            self.assertEqual(layer_cache.value_codec.dim, config.qk_rope_head_dim)
+            self.assertEqual(layer_cache.offset.tolist(), [4])
+            self.assertEqual(layer_cache._idx, 4)
+
+
+class TestRWKV7Model(unittest.TestCase):
+    def test_native_loader_recurrent_cache_kernel_and_sanitize(self):
+        from mlx_vlm.models import rwkv7
+        from mlx_vlm.models.cache import ArraysCache
+        from mlx_vlm.models.rwkv7 import language
+        from mlx_vlm.utils import get_model_and_args
+
+        config = rwkv7.ModelConfig(
+            model_type="rwkv7",
+            vocab_size=64,
+            hidden_size=64,
+            intermediate_size=128,
+            norm_eps=1e-5,
+            head_dim=32,
+            num_hidden_layers=2,
+            a_low_rank_dim=8,
+            v_low_rank_dim=8,
+            gate_low_rank_dim=16,
+            decay_low_rank_dim=16,
+            tie_word_embeddings=False,
+        )
+        mx.random.seed(0)
+        model = rwkv7.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        sanitized = model.sanitize({"model.layers.0.attn.k_k": mx.zeros((64,))})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(all(isinstance(item, ArraysCache) for item in cache))
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.attn.k_k"].shape, (2, 32)
+        )
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.attn.w_lora.lora.2", None),
+            {"bits": 8},
+        )
+        if mx.metal.is_available():
+            self.assertIsNotNone(language._wkv7_kernel)
+        self.assertIs(model_module, rwkv7)
+        self.assertEqual(model_type, "rwkv7")
+
+
+class TestFalconH1Model(unittest.TestCase):
+    def test_native_loader_hybrid_cache_and_multiplier_sanitize(self):
+        from mlx_vlm.models import falcon_h1
+        from mlx_vlm.models.cache import ArraysCache, CacheList, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = falcon_h1.ModelConfig(
+            hidden_size=32,
+            head_dim=8,
+            intermediate_size=64,
+            mamba_d_ssm=32,
+            mamba_d_state=8,
+            mamba_d_conv=4,
+            mamba_d_head=8,
+            mamba_n_groups=2,
+            mamba_n_heads=4,
+            mamba_chunk_size=16,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            vocab_size=64,
+            tie_word_embeddings=False,
+        )
+        mx.random.seed(0)
+        model = falcon_h1.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        sanitized = model.sanitize(
+            {
+                "model.layers.0.mamba.conv1d.weight": mx.ones((64, 1, 4)),
+                "model.layers.0.mamba.in_proj.weight": mx.ones((100, 32)),
+                "model.embed_tokens.weight": mx.ones((64, 32)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertEqual(len(model.layers), config.num_hidden_layers)
+        self.assertTrue(all(isinstance(item, CacheList) for item in cache))
+        self.assertIsInstance(cache[0][0], ArraysCache)
+        self.assertIsInstance(cache[0][1], KVCache)
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.mamba.conv1d.weight"].shape,
+            (64, 4, 1),
+        )
+        self.assertTrue(
+            mx.allclose(
+                sanitized["language_model.model.embed_tokens.weight"],
+                mx.full((64, 32), config.embedding_multiplier),
+            ).item()
+        )
+        self.assertIs(model_module, falcon_h1)
+        self.assertEqual(model_type, "falcon_h1")
+
+
+class TestBitNetModel(unittest.TestCase):
+    def _config(self, tied=True):
+        from mlx_vlm.models import bitnet
+
+        return bitnet.ModelConfig(
+            model_type="bitnet",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            tie_word_embeddings=tied,
+        )
+
+    def test_packed_ternary_kernel_and_loader(self):
+        from mlx_vlm.models import bitnet
+        from mlx_vlm.models.bitnet.bitlinear import BitLinear
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = bitnet.Model(config)
+        layer = BitLinear(4, 4, bias=False)
+        layer.weight = mx.array([[0b11100100] * 4], dtype=mx.uint8)
+        layer.weight_scale = mx.array([0.5], dtype=mx.float32)
+        output = layer(mx.ones((1, 4), dtype=mx.float32))
+        mx.eval(output)
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(output.tolist(), [[-2.0, 0.0, 2.0, 4.0]])
+        self.assertIsInstance(
+            model.language_model.model.layers[0].self_attn.q_proj, BitLinear
+        )
+        self.assertIs(model_module, bitnet)
+        self.assertEqual(model_type, "bitnet")
+
+    def test_cached_forward_and_sanitize(self):
+        from mlx_vlm.models import bitnet
+
+        config = self._config()
+        model = bitnet.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        sanitized = model.sanitize(
+            {
+                "model.embed_tokens.weight": mx.zeros((64, 32)),
+                "model.layers.0.self_attn.rotary_emb.inv_freq": mx.zeros((4,)),
+                "lm_head.weight": mx.zeros((64, 32)),
+            }
+        )
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertEqual(set(sanitized), {"language_model.model.embed_tokens.weight"})
+
+
+class TestMambaModel(unittest.TestCase):
+    def _config(self, model_type="mamba", tied=True):
+        from mlx_vlm.models import mamba
+
+        return mamba.ModelConfig(
+            model_type=model_type,
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            state_size=8,
+            num_hidden_layers=2,
+            conv_kernel=4,
+            use_bias=False,
+            use_conv_bias=True,
+            time_step_rank="auto",
+            tie_word_embeddings=tied,
+        )
+
+    def test_native_loader_cached_forward_and_conv_sanitize(self):
+        from mlx_vlm.models import mamba
+        from mlx_vlm.models.cache import ArraysCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = mamba.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        original = mx.zeros((64, 1, 4))
+        sanitized = model.sanitize({"backbone.layers.0.mixer.conv1d.weight": original})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(all(isinstance(item, ArraysCache) for item in cache))
+        self.assertEqual(
+            sanitized["language_model.backbone.layers.0.mixer.conv1d.weight"].shape,
+            (64, 4, 1),
+        )
+        self.assertEqual(config.time_step_rank, 2)
+        self.assertIs(model_module, mamba)
+        self.assertEqual(model_type, "mamba")
+
+    def test_falcon_mamba_rms_and_untied_head(self):
+        from mlx_vlm.models import mamba
+
+        config = self._config(model_type="falcon_mamba", tied=False)
+        model = mamba.Model(config)
+        self.assertTrue(config.use_bcdt_rms)
+        self.assertEqual(model(mx.array([[1]])).logits.shape, (1, 1, 64))
+
+
+class TestMellumModel(unittest.TestCase):
+    def _config(self, tie_word_embeddings=True):
+        from mlx_vlm.models import mellum
+
+        return mellum.ModelConfig(
+            model_type="mellum",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_experts=3,
+            num_experts_per_tok=2,
+            moe_intermediate_size=48,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            num_key_value_heads=2,
+            head_dim=8,
+            tie_word_embeddings=tie_word_embeddings,
+            max_position_embeddings=128,
+            norm_topk_prob=True,
+            sliding_window=4,
+            layer_types=["full_attention", "sliding_attention"],
+            rope_parameters={
+                "full_attention": {"rope_theta": 10000.0},
+                "sliding_attention": {"rope_theta": 10000.0},
+            },
+        )
+
+    def test_native_loader_mixed_cache_and_quant_predicate(self):
+        from mlx_vlm.models import mellum
+        from mlx_vlm.models.cache import KVCache, RotatingKVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = mellum.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertIsInstance(cache[0], KVCache)
+        self.assertIsInstance(cache[1], RotatingKVCache)
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.mlp.gate", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, mellum)
+        self.assertEqual(model_type, "mellum")
+
+    def test_sanitize_stacks_experts_and_drops_tied_head(self):
+        from mlx_vlm.models import mellum
+
+        config = self._config()
+        model = mellum.Model(config)
+        weights = {"lm_head.weight": mx.zeros((64, 32))}
+        for layer_idx in range(config.num_hidden_layers):
+            for expert_idx in range(config.num_experts):
+                for name in ("up_proj", "down_proj", "gate_proj"):
+                    weights[
+                        f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{name}.weight"
+                    ] = mx.full((2, 2), expert_idx)
+        sanitized = model.sanitize(weights)
+        key = "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight"
+
+        self.assertNotIn("language_model.lm_head.weight", sanitized)
+        self.assertEqual(sanitized[key].shape, (config.num_experts, 2, 2))
+
+
+class TestIQuestLoopCoderModel(unittest.TestCase):
+    def _config(self):
+        from mlx_vlm.models import iquestloopcoder
+
+        return iquestloopcoder.ModelConfig(
+            model_type="iquestloopcoder",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            head_dim=8,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            tie_word_embeddings=False,
+            loop_num=2,
+            loop_window_size=4,
+        )
+
+    def test_native_loader_dual_cache_and_checkpoint_prefix(self):
+        from mlx_vlm.models import iquestloopcoder
+        from mlx_vlm.models.cache import KVCache, RotatingKVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = iquestloopcoder.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        sanitized = model.sanitize({"model.embed_tokens.weight": mx.zeros((64, 32))})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(all(isinstance(item, KVCache) for item in cache[:2]))
+        self.assertTrue(all(isinstance(item, RotatingKVCache) for item in cache[2:]))
+        self.assertEqual(set(sanitized), {"language_model.model.embed_tokens.weight"})
+        self.assertIs(model_module, iquestloopcoder)
+        self.assertEqual(model_type, "iquestloopcoder")
+
+    def test_rejects_unsupported_loop_count(self):
+        from mlx_vlm.models import iquestloopcoder
+
+        config = self._config()
+        config.loop_num = 3
+        with self.assertRaisesRegex(ValueError, "Only loop_num=2"):
+            iquestloopcoder.Model(config)
+
+
+class TestYoutuLLMModel(unittest.TestCase):
+    def _config(self, q_lora_rank=16, tie_word_embeddings=True):
+        from mlx_vlm.models import youtu_llm
+
+        return youtu_llm.ModelConfig(
+            model_type="youtu_llm",
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            kv_lora_rank=16,
+            q_lora_rank=q_lora_rank,
+            qk_rope_head_dim=4,
+            v_head_dim=8,
+            qk_nope_head_dim=4,
+            max_position_embeddings=128,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            rope_traditional=True,
+            tie_word_embeddings=tie_word_embeddings,
+        )
+
+    def test_native_loader_cached_forward_and_tied_sanitize(self):
+        from mlx_vlm.models import youtu_llm
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = youtu_llm.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        sanitized = model.sanitize(
+            {
+                "model.embed_tokens.weight": mx.zeros((64, 32)),
+                "lm_head.weight": mx.zeros((64, 32)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertEqual(set(sanitized), {"language_model.model.embed_tokens.weight"})
+        self.assertIs(model_module, youtu_llm)
+        self.assertEqual(model_type, "youtu_llm")
+
+    def test_direct_query_projection_and_untied_output(self):
+        from mlx_vlm.models import youtu_llm
+
+        config = self._config(q_lora_rank=None, tie_word_embeddings=False)
+        model = youtu_llm.Model(config)
+        self.assertEqual(model(mx.array([[1]])).logits.shape, (1, 1, 64))
+        self.assertTrue(
+            hasattr(model.language_model.model.layers[0].self_attn, "q_proj")
+        )
+
+
+class TestKlearModel(unittest.TestCase):
+    def _config(self):
+        from mlx_vlm.models import klear
+
+        return klear.ModelConfig(
+            model_type="Klear",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            attention_bias=False,
+            mlp_only_layers=[],
+            num_experts=2,
+            num_experts_per_tok=1,
+            decoder_sparse_step=1,
+            n_shared_experts=1,
+            moe_intermediate_size=48,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            num_key_value_heads=2,
+            rope_theta=10000.0,
+            max_position_embeddings=128,
+            norm_topk_prob=True,
+        )
+
+    def test_native_loader_cached_forward_and_predicates(self):
+        from mlx_vlm.models import klear
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = klear.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertIs(model_module, klear)
+        self.assertEqual(model_type, "klear")
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.mlp.gate", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertFalse(model.cast_predicate("model.layers.0.mlp.expert_bias"))
+
+    def test_sanitize_stacks_experts(self):
+        from mlx_vlm.models import klear
+
+        config = self._config()
+        model = klear.Model(config)
+        weights = {}
+        for layer_idx in range(config.num_hidden_layers):
+            prefix = f"model.layers.{layer_idx}.mlp.experts"
+            for expert_idx in range(config.num_experts):
+                for name in ("gate_proj", "up_proj", "down_proj"):
+                    weights[f"{prefix}.{expert_idx}.{name}.weight"] = mx.full(
+                        (2, 2), expert_idx
+                    )
+
+        sanitized = model.sanitize(weights)
+        key = "language_model.model.layers.0.mlp.experts.gate_proj.weight"
+        self.assertIn(key, sanitized)
+        self.assertEqual(sanitized[key].shape, (config.num_experts, 2, 2))
+
+
+class TestPlamoModel(unittest.TestCase):
+    def test_native_loader_cached_forward_and_checkpoint_prefix(self):
+        from mlx_vlm.models import plamo
+        from mlx_vlm.utils import get_model_and_args
+
+        config = plamo.ModelConfig(
+            model_type="plamo",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            n_shared_head=2,
+        )
+        model = plamo.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+        sanitized = model.sanitize({"model.embed_tokens.weight": mx.zeros((64, 32))})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertEqual(set(sanitized), {"language_model.model.embed_tokens.weight"})
+        self.assertIs(model_module, plamo)
+        self.assertEqual(model_type, "plamo")
+
+
+class TestLille130mModel(unittest.TestCase):
+    def test_cached_forward_and_checkpoint_prefix(self):
+        from mlx_vlm.models import lille_130m
+        from mlx_vlm.utils import get_model_and_args
+
+        config = lille_130m.ModelConfig(
+            model_type="lille-130m",
+            block_size=128,
+            layer_norm_eps=1e-5,
+            n_embd=64,
+            n_head=4,
+            n_kv_heads=2,
+            n_layer=2,
+            rope_theta=10000.0,
+            vocab_size=64,
+        )
+        model = lille_130m.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache, splits=(1,)
+        )
+        sanitized = model.sanitize(
+            {
+                "transformer.tok_embeddings.weight": mx.zeros((64, 64)),
+                "transformer.layers.0.attention.rotary_emb.inv_freq": mx.zeros((4,)),
+            }
+        )
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertEqual(
+            set(sanitized), {"language_model.transformer.tok_embeddings.weight"}
+        )
+        self.assertEqual(len(model.layers), config.n_layer)
+        model_module, model_type = get_model_and_args(config.to_dict())
+        self.assertIs(model_module, lille_130m)
+        self.assertEqual(model_type, "lille_130m")
+
+
+class TestOlmoModel(unittest.TestCase):
+    def _config(self, weight_tying=True):
+        from mlx_vlm.models import olmo
+
+        return olmo.ModelConfig(
+            model_type="olmo",
+            d_model=32,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=64,
+            embedding_size=64,
+            mlp_hidden_size=None,
+            mlp_ratio=4,
+            weight_tying=weight_tying,
+        )
+
+    def test_native_loader_and_cached_forward(self):
+        from mlx_vlm.models import olmo
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = olmo.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+
+        cache = model.make_cache()
+        full_logits, cached_logits = assert_cached_forward_matches_full(
+            model, tokens=inputs, cache=cache
+        )
+
+        self.assertEqual(full_logits.shape, (1, 4, config.embedding_size))
+        self.assertEqual(config.mlp_hidden_size, config.mlp_ratio * config.d_model)
+
+        model_module, model_type = get_model_and_args(config.to_dict())
+        self.assertIs(model_module, olmo)
+        self.assertEqual(model_type, "olmo")
+
+    def test_untied_output_and_checkpoint_prefix(self):
+        from mlx_vlm.models import olmo
+
+        config = self._config(weight_tying=False)
+        model = olmo.Model(config)
+        output = model(mx.array([[1]])).logits
+        sanitized = model.sanitize({"model.transformer.wte.weight": mx.zeros((64, 32))})
+
+        self.assertEqual(output.shape, (1, 1, config.embedding_size))
+        self.assertEqual(
+            set(sanitized), {"language_model.model.transformer.wte.weight"}
+        )
+
+
+class TestSmolVLMFlattenedImageFeatures(unittest.TestCase):
+    def test_get_input_embeddings_uses_flattened_connector_output(self):
+        from mlx_vlm.models import smolvlm
+
+        text_config = smolvlm.TextConfig(
+            hidden_size=8,
+            intermediate_size=16,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_hidden_layers=1,
+            vocab_size=32,
+        )
+        vision_config = smolvlm.VisionConfig(
+            hidden_size=8,
+            intermediate_size=16,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            image_size=4,
+            patch_size=2,
+        )
+        model = smolvlm.Model(
+            smolvlm.ModelConfig(
+                text_config=text_config,
+                vision_config=vision_config,
+                image_token_id=31,
+                scale_factor=1,
+            )
+        )
+        input_ids = mx.array([[1, 31, 31, 31, 31, 2]])
+        pixel_values = mx.random.uniform(shape=(1, 1, 3, 4, 4))
+
+        output = model.get_input_embeddings(input_ids, pixel_values=pixel_values)
+
+        self.assertEqual(output.inputs_embeds.shape, (1, 6, 8))
+
+    def test_prepare_inputs_accepts_flattened_image_features(self):
+        from mlx_vlm.models import smolvlm
+
+        model = SimpleNamespace(config=SimpleNamespace(image_token_index=9))
+        input_ids = mx.array([[1, 9, 2, 9, 3]])
+        inputs_embeds = mx.arange(15).reshape(1, 5, 3)
+        image_features = mx.array([[101, 102, 103], [201, 202, 203]])
+
+        output = smolvlm.Model._prepare_inputs_for_multimodal(
+            model, image_features, inputs_embeds, input_ids
+        )
+
+        expected = mx.stack(
+            [
+                inputs_embeds[0, 0],
+                image_features[0],
+                inputs_embeds[0, 2],
+                image_features[1],
+                inputs_embeds[0, 4],
+            ]
+        )[None]
+        self.assertEqual(output.shape, inputs_embeds.shape)
+        self.assertTrue(mx.array_equal(output, expected).item())
+
+    def test_prepare_inputs_rejects_split_image_token_mismatch(self):
+        """#1919 production shape: 81 placeholders vs 13 flattened tiles.
+
+        The Idefics3 1:1 scatter must keep rejecting this. The processor is
+        what expands the prompt to 13 x 81 tokens; do not paper over the
+        mismatch by dropping extra tiles.
+        """
+        from mlx_vlm.models import smolvlm
+
+        model = SimpleNamespace(config=SimpleNamespace(image_token_index=9))
+        n_tokens, n_tiles, hidden = 81, 13, 3
+        seq = 1 + n_tokens + 1
+        input_ids = mx.array([[1] + [9] * n_tokens + [2]])
+        inputs_embeds = mx.zeros((1, seq, hidden))
+        image_features = mx.zeros((n_tiles * n_tokens, hidden))
+
+        with self.assertRaisesRegex(ValueError, r"tokens: 81, features 1053"):
+            smolvlm.Model._prepare_inputs_for_multimodal(
+                model, image_features, inputs_embeds, input_ids
+            )
 
 
 class TestModels(unittest.TestCase):
@@ -280,6 +1951,80 @@ class TestModels(unittest.TestCase):
         self.assertFalse(any(".weight_scale" in key for key in sanitized))
         self.assertFalse(any(".weight_global_scale" in key for key in sanitized))
         self.assertFalse(any(".input_global_scale" in key for key in sanitized))
+
+    def test_laguna_stacks_pure_fp8_experts_after_dequantization(self):
+        from mlx_vlm.models import laguna
+        from mlx_vlm.utils import _transform_compressed_tensors_weights
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=128,
+            mlp_layer_types=["dense", "sparse"],
+            num_attention_heads_per_layer=[2, 2],
+            num_experts=3,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+        )
+        model = laguna.Model(config)
+        weights = {}
+        for expert_idx in range(config.num_experts):
+            for proj in ["gate_proj", "up_proj", "down_proj"]:
+                prefix = f"model.layers.1.mlp.experts.{expert_idx}.{proj}"
+                weights[f"{prefix}.weight"] = mx.full(
+                    (16, 16), 56 + expert_idx, dtype=mx.uint8
+                )
+                weights[f"{prefix}.weight_scale"] = mx.full(
+                    (2, 2), 0.5, dtype=mx.bfloat16
+                )
+        for proj in ["gate_proj", "up_proj", "down_proj"]:
+            prefix = f"model.layers.1.mlp.shared_expert.{proj}"
+            weights[f"{prefix}.weight"] = mx.full((16, 16), 56, dtype=mx.uint8)
+            weights[f"{prefix}.weight_scale"] = mx.full((2, 2), 0.5, dtype=mx.bfloat16)
+
+        transformed, quantization = _transform_compressed_tensors_weights(
+            weights,
+            {
+                "quant_method": "compressed-tensors",
+                "format": "float-quantized",
+                "config_groups": {
+                    "group_0": {
+                        "format": "float-quantized",
+                        "weights": {
+                            "block_structure": [8, 8],
+                            "num_bits": 8,
+                            "strategy": "block",
+                            "type": "float",
+                        },
+                    }
+                },
+            },
+        )
+        sanitized = model.language_model.sanitize(transformed)
+
+        prefix = "model.layers.1.mlp"
+        assert sanitized[f"{prefix}.switch_mlp.gate_up_proj.weight"].shape == (
+            3,
+            32,
+            16,
+        )
+        assert sanitized[f"{prefix}.switch_mlp.down_proj.weight"].shape == (
+            3,
+            16,
+            16,
+        )
+        assert sanitized[f"{prefix}.shared_expert.gate_proj.weight"].dtype == (
+            mx.bfloat16
+        )
+        assert not any(key.endswith(".weight_scale") for key in sanitized)
+        assert quantization is None
 
     def test_laguna_folds_nvfp4_shared_experts(self):
         from unittest.mock import patch
@@ -685,6 +2430,24 @@ class TestModels(unittest.TestCase):
         self.assertEqual(type(cache[0]).__name__, "ArraysCache")
         self.assertEqual(type(cache[1]).__name__, "KVCache")
 
+    def test_olmoe_config_uses_upstream_rms_norm_default(self):
+        from mlx_vlm.models import olmoe
+
+        config = olmoe.ModelConfig.from_dict(
+            {
+                "model_type": "olmoe",
+                "hidden_size": 32,
+                "num_hidden_layers": 1,
+                "intermediate_size": 16,
+                "num_attention_heads": 4,
+                "vocab_size": 64,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+            }
+        )
+
+        self.assertEqual(config.rms_norm_eps, 1e-5)
+
     def test_cohere2_moe_language_model(self):
         from mlx_vlm.models import cohere2_moe
 
@@ -827,6 +2590,67 @@ class TestModels(unittest.TestCase):
         self.assertEqual(current.image_token_index, 124907)
         self.assertEqual(legacy.image_token_index, 396)
 
+    def test_lfm2_vl_sanitize_maps_layouts_to_language_model_prefix(self):
+        from mlx_vlm.models import lfm2_vl
+
+        config = lfm2_vl.ModelConfig(
+            model_type="lfm2-vl",
+            text_config=lfm2_vl.TextConfig(
+                hidden_size=64,
+                num_hidden_layers=2,
+                intermediate_size=128,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                vocab_size=128,
+                layer_types=["full_attention", "full_attention"],
+            ),
+            vision_config=lfm2_vl.VisionConfig(
+                hidden_size=64,
+                num_hidden_layers=2,
+                intermediate_size=128,
+                num_attention_heads=4,
+            ),
+            projector_use_layernorm=True,
+        )
+        model = lfm2_vl.Model(config)
+
+        raw_hf = {
+            "model.language_model.embed_tokens.weight": mx.zeros((128, 64)),
+            "model.vision_tower.vision_encoder.layers.0.self_attn.q_proj.weight": mx.zeros(
+                (64, 64)
+            ),
+            "model.multi_modal_projector.linear_1.weight": mx.zeros((64, 64)),
+        }
+        mlx_std = {
+            "language_model.model.embed_tokens.weight": mx.zeros((128, 64)),
+            "vision_tower.encoder.layers.0.self_attn.q_proj.weight": mx.zeros((64, 64)),
+            "multi_modal_projector.linear_1.weight": mx.zeros((64, 64)),
+        }
+        optiq = {
+            "model.embed_tokens.weight": mx.zeros((128, 64)),
+            "model.layers.0.conv.in_proj.weight": mx.zeros((64, 64)),
+            "vision_tower.encoder.layers.0.self_attn.q_proj.weight": mx.zeros((64, 64)),
+            "multi_modal_projector.linear_1.weight": mx.zeros((64, 64)),
+        }
+
+        for weights in (raw_hf, mlx_std, optiq):
+            keys = set(model.sanitize(weights))
+            self.assertFalse(any(k.startswith("model.") for k in keys))
+
+        self.assertIn(
+            "language_model.model.embed_tokens.weight", model.sanitize(raw_hf)
+        )
+        self.assertIn("language_model.model.embed_tokens.weight", model.sanitize(optiq))
+        self.assertIn(
+            "language_model.model.layers.0.conv.in_proj.weight",
+            model.sanitize(optiq),
+        )
+        self.assertIn(
+            "vision_tower.encoder.layers.0.self_attn.q_proj.weight",
+            model.sanitize(optiq),
+        )
+        self.assertEqual(set(mlx_std), set(model.sanitize(mlx_std)))
+
     def test_deepseek_v4_language_model(self):
         from mlx_vlm.models import deepseek_v4
         from mlx_vlm.models.deepseek_v4.hyper_connection import (
@@ -919,6 +2743,114 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(converted[wkey] == weight.view(mx.uint32)))
         self.assertEqual(converted[skey].shape, (128, 4))
 
+    def test_deepseek_v4_official_layout_sanitize_is_idempotent(self):
+        from mlx_vlm.models import deepseek_v4
+
+        config = deepseek_v4.ModelConfig(
+            model_type="deepseek_v4",
+            vocab_size=32,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=8,
+            qk_rope_head_dim=4,
+            sliding_window=16,
+            compress_ratios=[0],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            hc_mult=2,
+            vision_n_layers=1,
+            vision_dim=8,
+            vision_n_heads=2,
+            vision_inter_dim=16,
+            vision_patch_size=2,
+            vision_downsample_ratio=2,
+        )
+        model = deepseek_v4.Model(config)
+        weights = {
+            "model.embed_tokens.weight": mx.zeros((32, 32), dtype=mx.bfloat16),
+            "model.vision.blocks.0.mlp.w1.weight": mx.zeros((16, 8), dtype=mx.bfloat16),
+            "model.aligner.proj.0.weight": mx.zeros((32, 32), dtype=mx.bfloat16),
+            "model.image_start": mx.zeros((32,), dtype=mx.bfloat16),
+            "model.layers.0.mlp.gate.bias_vl": mx.arange(4, dtype=mx.float32),
+            "model.layers.0.self_attn.wo_a.weight": mx.zeros(
+                (16, 32), dtype=mx.bfloat16
+            ),
+            "model.layers.0.self_attn.wq_a.weight": mx.zeros(
+                (128, 128), dtype=mx.uint8
+            ),
+            "model.layers.0.self_attn.wq_a.weight_scale_inv": mx.ones(
+                (1, 1), dtype=mx.uint8
+            ),
+        }
+        for expert in range(config.n_routed_experts):
+            for projection in ("gate_proj", "down_proj", "up_proj"):
+                prefix = f"model.layers.0.mlp.experts.{expert}.{projection}"
+                weights[f"{prefix}.weight"] = mx.zeros((16, 16), dtype=mx.int8)
+                weights[f"{prefix}.weight_scale_inv"] = mx.ones((16, 1), dtype=mx.uint8)
+
+        sanitized = assert_sanitize_idempotent(model, weights)
+
+        self.assertIn("vision.blocks.0.ffn.w1.weight", sanitized)
+        self.assertIn("aligner.proj.0.weight", sanitized)
+        self.assertIn("image_start", sanitized)
+        self.assertIn("language_model.model.layers.0.ffn.gate.bias_vl", sanitized)
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.attn.wo_a.weight"].shape,
+            (config.o_groups, config.o_lora_rank, config.hidden_size),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.ffn.switch_mlp.gate_proj.weight"
+            ].shape,
+            (config.n_routed_experts, 16, 4),
+        )
+
+    def test_deepseek_v4_quantization_path_aliases(self):
+        from mlx_vlm.models import deepseek_v4
+
+        cases = (
+            (
+                "language_model.model.layers.0.attn.wq_a",
+                "layers.0.attn.wq_a",
+            ),
+            ("model.layers.0.attn.wq_a", "layers.0.attn.wq_a"),
+            ("language_model.model.embed_tokens", "embed"),
+            ("language_model.model.norm", "norm"),
+            ("language_model.lm_head", "head"),
+            (
+                "language_model.model.layers.0.ffn.shared_experts.gate_proj",
+                "layers.0.ffn.shared_experts.w1",
+            ),
+            (
+                "language_model.model.layers.0.ffn.shared_experts.down_proj",
+                "layers.0.ffn.shared_experts.w2",
+            ),
+            (
+                "language_model.model.layers.0.ffn.shared_experts.up_proj",
+                "layers.0.ffn.shared_experts.w3",
+            ),
+            (
+                "language_model.model.layers.0.ffn.shared_experts.gate_proj.weight",
+                "layers.0.ffn.shared_experts.w1.weight",
+            ),
+        )
+
+        for module_path, checkpoint_path in cases:
+            with self.subTest(module_path=module_path):
+                aliases = deepseek_v4.Model.quantization_path_aliases(module_path)
+                self.assertIn(checkpoint_path, aliases)
+
     def test_glm_moe_dsa_language_model(self):
         from mlx_vlm.models import glm_moe_dsa
 
@@ -955,11 +2887,15 @@ class TestModels(unittest.TestCase):
             rope_parameters={"rope_theta": 10000.0},
             attention_bias=False,
             index_topk_pattern="FSFSFS",
+            num_nextn_predict_layers=1,
+            index_share_for_mtp_iteration=True,
         )
         self.assertEqual(
             config.indexer_types,
             ["full", "shared", "full", "shared", "full", "shared"],
         )
+        self.assertEqual(config.num_nextn_predict_layers, 1)
+        self.assertTrue(config.index_share_for_mtp_iteration)
 
         model = glm_moe_dsa.Model(config)
         has_indexer = [
@@ -978,6 +2914,104 @@ class TestModels(unittest.TestCase):
         cache = model.make_cache()
         self.assertEqual(len(cache[0].caches), 2)
         self.assertEqual(len(cache[1].caches), 1)
+
+        from mlx_vlm.models.glm_moe_dsa.speculative_verifier import (
+            _quantized_head_logits,
+        )
+
+        tokens = mx.array([[1, 2, 3]])
+        target = model.language_model
+        target_out = target(
+            tokens,
+            capture_layer_ids=[],
+            speculative_verify=True,
+            return_hidden=True,
+            return_shared_kv=True,
+            skip_logits=True,
+        )
+        verified_hidden, shared_kv, gdn_states = target.speculative_verify_hidden(
+            tokens, cache=None
+        )
+        mx.eval(target_out.hidden_states, verified_hidden)
+        self.assertEqual(target_out.hidden_states[-1].shape, (1, 3, config.hidden_size))
+        self.assertTrue(
+            mx.array_equal(target_out.hidden_states[-1], verified_hidden).item()
+        )
+        self.assertEqual(shared_kv, {})
+        self.assertIsNone(gdn_states)
+
+        captured = target(
+            tokens,
+            capture_layer_ids=[0, 2, 5],
+            speculative_verify=True,
+        )
+        mx.eval(captured.hidden_states)
+        self.assertEqual(len(captured.hidden_states), 3)
+        self.assertTrue(
+            all(
+                hidden.shape == (1, tokens.shape[1], config.hidden_size)
+                for hidden in captured.hidden_states
+            )
+        )
+
+        linear = nn.Linear(512, 8, bias=False)
+        linear.weight = mx.random.normal(linear.weight.shape).astype(mx.bfloat16)
+        verifier_inputs = mx.random.normal((1, 2, 512)).astype(mx.bfloat16)
+        for bits in (4, 5, 8):
+            quantized_head = nn.QuantizedLinear.from_linear(
+                linear, group_size=64, bits=bits
+            )
+            verifier_logits = _quantized_head_logits(quantized_head, verifier_inputs)
+            reference_logits = mx.concatenate(
+                [
+                    quantized_head(verifier_inputs[:, index : index + 1])
+                    for index in range(verifier_inputs.shape[1])
+                ],
+                axis=1,
+            )
+            mx.eval(verifier_logits, reference_logits)
+            self.assertTrue(mx.all(verifier_logits == reference_logits).item())
+
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.models.glm_moe_dsa.language import GlmMoeDsaMTP
+        from mlx_vlm.speculative.drafters.glm_moe_dsa_mtp import GlmMoeDsaMTPDraftModel
+        from mlx_vlm.speculative.drafters.glm_moe_dsa_mtp import (
+            ModelConfig as GlmMoeDsaMTPConfig,
+        )
+
+        mtp = GlmMoeDsaMTP(config)
+        mtp_out = mtp(
+            target_out.hidden_states[-1],
+            target.model.embed_tokens(tokens),
+            cache=CacheList(KVCache(), KVCache()),
+        )
+        mx.eval(mtp_out)
+        self.assertIsNotNone(mtp.self_attn.indexer)
+        self.assertEqual(mtp_out.shape, (1, 3, config.hidden_size))
+
+        drafter = GlmMoeDsaMTPDraftModel(GlmMoeDsaMTPConfig(text_config=config))
+        draft_cache = drafter.reset(target)
+
+        def greedy(logits):
+            return mx.argmax(logits, axis=-1)
+
+        drafter.prefill_from_target_hidden(
+            tokens,
+            target_out.hidden_states[-1],
+            bonus_token=4,
+            sampler=greedy,
+            greedy=True,
+        )
+        drafted_tokens = drafter.draft_block(
+            last_bonus=4,
+            hidden=target_out.hidden_states[-1][:, -1:, :],
+            cache=draft_cache,
+            block_size=2,
+            sampler=greedy,
+            greedy=True,
+        )
+        mx.eval(drafted_tokens)
+        self.assertEqual(drafted_tokens.shape, (1, 1))
 
         sanitized = model.sanitize(
             {
@@ -1000,6 +3034,623 @@ class TestModels(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 1, config.vocab_size))
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
         mx.eval([c.state for c in cache])
+
+    def test_glm5_next_language_model(self):
+        from mlx_vlm.models import glm5_next
+
+        text = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=6,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=3,
+            layer_types=["linear_attention", "deepseek_sparse_attention"],
+            mlp_layer_types=["dense", "sparse"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        vision = glm5_next.VisionConfig(
+            model_type="glm_ocr_vision",
+            depth=2,
+            hidden_size=64,
+            intermediate_size=64,
+            num_heads=2,
+            patch_size=14,
+            out_hidden_size=128,
+            projection_intermediate_size=128,
+            image_size=28,
+            spatial_merge_size=1,
+            temporal_patch_size=2,
+        )
+        config = glm5_next.ModelConfig(
+            text_config=text,
+            vision_config=vision,
+            model_type="glm5_next",
+            image_token_id=7,
+            video_token_id=8,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+
+        model = glm5_next.Model(config)
+
+        # hybrid per-layer schedule: layer 0 linear-attn, layer 1 sparse (DSA)
+        is_linear = [layer.is_linear for layer in model.language_model.model.layers]
+        self.assertEqual(is_linear, [True, False])
+
+        cache = model.make_cache()
+        self.assertEqual(len(cache), config.text_config.num_hidden_layers)
+
+        # sanitize: HF flat hyper-connection / forget-gate names + separate q/k/v
+        # convs -> our module names + a single fused, transposed depthwise conv.
+        san = model.sanitize(
+            {
+                "model.language_model.layers.0.hc_attn_base": mx.zeros((4, 4)),
+                "model.language_model.layers.0.self_attn.A_log": mx.zeros((2,)),
+                "model.language_model.layers.0.self_attn.q_conv1d.weight": mx.zeros(
+                    (128, 1, 2)
+                ),
+                "model.language_model.layers.0.self_attn.k_conv1d.weight": mx.zeros(
+                    (128, 1, 2)
+                ),
+                "model.language_model.layers.0.self_attn.v_conv1d.weight": mx.zeros(
+                    (128, 1, 2)
+                ),
+            }
+        )
+        self.assertIn("language_model.model.layers.0.attn_hc.base", san)
+        self.assertIn("language_model.model.layers.0.self_attn.forget_gate.A_log", san)
+        self.assertIn("language_model.model.layers.0.self_attn.conv1d.weight", san)
+        self.assertEqual(
+            san["language_model.model.layers.0.self_attn.conv1d.weight"].shape,
+            (384, 2, 1),
+        )
+
+        prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+        logits = model(prompt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 8, config.text_config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+        # incremental decode step (exercises the cached indexer + KDA/MLA caches)
+        nxt = mx.argmax(logits[:, -1:, :], axis=-1)
+        logits = model(nxt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 1, config.text_config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+    def test_glm5_next_kda_matches_recurrent(self):
+        # The shared gated-delta path must match glm5_next's reference recurrence
+        # (the KDA safe forget gate == gated_delta.compute_g_safe, term for term).
+        from mlx_vlm.models.gated_delta import gated_delta_update
+        from mlx_vlm.models.glm5_next.language import _l2norm, recurrent_kimi_delta
+
+        mx.random.seed(0)
+        B, S, H, D, lb = 2, 17, 4, 32, -5.0
+        q = mx.random.normal((B, S, H, D))
+        k = mx.random.normal((B, S, H, D))
+        v = mx.random.normal((B, S, H, D))
+        a = mx.random.normal((B, S, H, D)) * 0.5
+        b = mx.random.normal((B, S, H))
+        A_log = mx.random.normal((H,)) * 0.3
+        dt_bias = mx.random.normal((H, D)) * 0.1
+
+        A = mx.exp(A_log).reshape(1, 1, H, 1)
+        g = lb * mx.sigmoid(A * (a + dt_bias))
+        oracle, _ = recurrent_kimi_delta(q, k, v, g, mx.sigmoid(b), None)
+
+        qn = _l2norm(q.astype(mx.float32)) * (D**-0.5)
+        kn = _l2norm(k.astype(mx.float32))
+        out, _ = gated_delta_update(
+            qn,
+            kn,
+            v,
+            a,
+            b,
+            A_log.reshape(H, 1),
+            dt_bias,
+            state=None,
+            use_kernel=False,
+            lower_bound=lb,
+        )
+        self.assertLess(float(mx.max(mx.abs(oracle - out))), 1e-4)
+
+    def test_glm5_next_batched_matches_individual(self):
+        # Batched inference must match per-sequence runs. Every glm5_next path
+        # (KDA, DSA, indexer, MLA, hyper-connections) is exactly batch-invariant;
+        # only the shared SwitchGLU grouped-expert dispatch adds small reduction-
+        # order jitter across batch composition, hence the loose tolerance.
+        from mlx_vlm.models import glm5_next
+
+        text = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=6,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=3,
+            layer_types=["linear_attention", "deepseek_sparse_attention"],
+            mlp_layer_types=["dense", "sparse"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        vision = glm5_next.VisionConfig(
+            model_type="glm_ocr_vision",
+            depth=2,
+            hidden_size=64,
+            intermediate_size=64,
+            num_heads=2,
+            patch_size=14,
+            out_hidden_size=128,
+            projection_intermediate_size=128,
+            image_size=28,
+            spatial_merge_size=1,
+            temporal_patch_size=2,
+        )
+        config = glm5_next.ModelConfig(
+            text_config=text,
+            vision_config=vision,
+            model_type="glm5_next",
+            image_token_id=7,
+            video_token_id=8,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        lm = glm5_next.Model(config).language_model
+        prompts = [
+            [3, 5, 7, 9, 11, 13, 15, 17],
+            [2, 4, 6, 8, 10, 12, 14, 16],
+            [1, 1, 2, 3, 5, 8, 13, 21],
+        ]
+        batched = lm(mx.array(prompts), cache=lm.make_cache()).logits
+        for i, p in enumerate(prompts):
+            indiv = lm(mx.array([p]), cache=lm.make_cache()).logits
+            d = float(
+                mx.max(
+                    mx.abs(
+                        batched[i : i + 1].astype(mx.float32) - indiv.astype(mx.float32)
+                    )
+                )
+            )
+            self.assertLess(d, 5e-2)
+
+    def test_glm5_next_fused_kda_matches_unfused(self):
+        # Fusing the six KDA input-projections (q, k, v, f_a, g_a, b -- all take the
+        # same input) into one matmul is a lossless output-axis concat of the
+        # quantized weights, so the fused path must be bit-exact vs the separate one.
+        import mlx.nn as nn
+
+        from mlx_vlm.models import glm5_next
+        from mlx_vlm.models.cache import ArraysCache
+        from mlx_vlm.models.glm5_next.language import Glm5NextLinearAttention
+
+        mx.random.seed(0)
+        cfg = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=6,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=3,
+            layer_types=["linear_attention"],
+            mlp_layer_types=["dense"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        kda = Glm5NextLinearAttention(cfg)
+        nn.quantize(kda, class_predicate=lambda p, m: hasattr(m, "to_quantized"))
+        kda.eval()
+        for S in (1, 6):
+            x = mx.random.normal((1, S, cfg.hidden_size))
+            kda.fuse_in = False
+            c1 = ArraysCache(size=2)
+            c1[0] = None
+            c1[1] = None
+            ref = kda(x, None, c1)
+            kda.fuse_in = True
+            c2 = ArraysCache(size=2)
+            c2[0] = None
+            c2[1] = None
+            fused = kda(x, None, c2)
+            self.assertEqual(float(mx.max(mx.abs(ref - fused))), 0.0)
+
+    def test_glm5_next_indexer_bypass_matches_dense(self):
+        # When the whole cache fits within index_topk the indexer selects every token,
+        # so bypassing it (dense MLA) must match the full sparse path to fp tolerance.
+        from mlx_vlm.models import glm5_next
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.models.glm5_next.language import Glm5NextSparseAttention
+
+        mx.random.seed(0)
+        cfg = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=16,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=3,
+            layer_types=["deepseek_sparse_attention"],
+            mlp_layer_types=["dense"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        dsa = Glm5NextSparseAttention(cfg)
+        dsa.eval()
+        S = 8  # <= index_topk (16) -> the indexer would select all, so bypass == dense
+        x = mx.random.normal((1, S, cfg.hidden_size))
+        qpos = mx.arange(S)[:, None]
+        kpos = mx.arange(S)[None, :]
+        outs = {}
+        for bp in (True, False):
+            dsa.indexer.bypass_short = bp
+            c = CacheList(KVCache(), KVCache())
+            outs[bp] = dsa(x, kpos <= qpos, c)
+        self.assertLess(float(mx.max(mx.abs(outs[True] - outs[False]))), 1e-3)
+
+    def test_glm5_next_num_logits_to_keep(self):
+        # num_logits_to_keep=k returns exactly the last k positions' logits (so prefill
+        # can skip the vocab projection on discarded positions).
+        from mlx_vlm.models import glm5_next
+        from mlx_vlm.models.glm5_next.language import LanguageModel
+
+        mx.random.seed(0)
+        cfg = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=6,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=3,
+            layer_types=["linear_attention", "deepseek_sparse_attention"],
+            mlp_layer_types=["dense", "sparse"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        lm = LanguageModel(cfg)
+        p = mx.array([[3, 5, 7, 9, 11, 13, 15, 17]])
+        full = lm(p, cache=lm.make_cache()).logits
+        last = lm(p, cache=lm.make_cache(), num_logits_to_keep=1).logits
+        self.assertEqual(last.shape[1], 1)
+        self.assertLess(float(mx.max(mx.abs(last[:, -1] - full[:, -1]))), 1e-4)
+
+    def test_glm5_next_ffn_compile_matches_eager(self):
+        # Compiling the stateless FFN block (mx.compile) must match the eager path.
+        from mlx_vlm.models import glm5_next
+        from mlx_vlm.models.glm5_next.language import LanguageModel
+
+        mx.random.seed(0)
+        cfg = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=6,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=3,
+            layer_types=["linear_attention", "deepseek_sparse_attention"],
+            mlp_layer_types=["dense", "sparse"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        lm = LanguageModel(cfg)
+        p = mx.array([[3, 5, 7, 9, 11, 13, 15, 17]])
+        outs = {}
+        for on in (False, True):
+            for L in lm.model.layers:
+                L.compile_ffn = on
+                L._ffn_c = None
+            c = lm.make_cache()
+            lm(p, cache=c)  # prefill (S>1: eager either way)
+            # decode step is single-stream (B=1, S=1) -> the compiled FFN path is active
+            outs[on] = lm(mx.array([[19]]), cache=c).logits
+        self.assertLess(float(mx.max(mx.abs(outs[True] - outs[False]))), 1e-3)
+
+    def test_glm5_next_indexer_stale_pool_guard(self):
+        # Under continuous batching, BatchGenerator grows/shrinks the batch axis
+        # (extend/filter) but does not carry the indexer's cached _pool along, leaving
+        # a _pool whose batch axis no longer matches the live batch. The batch-axis
+        # guard must discard such a stale _pool and recompute, rather than crash on a
+        # concatenate shape mismatch. Here we prime the indexer past index_topk (so it
+        # actually pools), then plant a stale _pool with a mismatched batch axis (as a
+        # filter/extend would) and take a decode step: it must not crash and must equal
+        # the clean incremental result.
+        from mlx_vlm.models import glm5_next
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.models.glm5_next.language import Glm5NextSparseAttention
+
+        mx.random.seed(0)
+        cfg = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=4,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=2,
+            layer_types=["deepseek_sparse_attention"],
+            mlp_layer_types=["dense"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        dsa = Glm5NextSparseAttention(cfg)
+        dsa.eval()
+        S0 = 12  # > index_topk (4) so the indexer actually pools (no short-ctx bypass)
+        x0 = mx.random.normal((1, S0, cfg.hidden_size))
+        qpos = mx.arange(S0)[:, None]
+        kpos = mx.arange(S0)[None, :]
+        xs = mx.random.normal((1, 1, cfg.hidden_size))
+
+        c1 = CacheList(KVCache(), KVCache())
+        dsa(x0, kpos <= qpos, c1)
+        ref = dsa(xs, None, c1)  # clean incremental decode step
+
+        c2 = CacheList(KVCache(), KVCache())
+        dsa(x0, kpos <= qpos, c2)
+        pk, pi, pv, t = c2[
+            1
+        ]._pool  # plant a stale, batch-mismatched _pool (as filter/extend would)
+        c2[1]._pool = (
+            mx.concatenate([pk, pk], axis=0),
+            mx.concatenate([pi, pi], axis=0),
+            mx.concatenate([pv, pv], axis=0),
+            t,
+        )
+        out = dsa(xs, None, c2)  # must not crash; guard -> full recompute
+        self.assertLess(float(mx.max(mx.abs(out - ref))), 1e-3)
+
+    def test_glm5_next_indexer_batched_mask(self):
+        # Single-stream decode passes mask=None; under continuous batching the batched
+        # cache supplies a 4-D left-pad mask at decode. The DSA decode branch must accept
+        # it (rank-agnostic gather); an all-True 4-D mask must equal the mask=None result.
+        from mlx_vlm.models import glm5_next
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.models.glm5_next.language import Glm5NextSparseAttention
+
+        mx.random.seed(0)
+        cfg = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=128,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=4,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=2,
+            layer_types=["deepseek_sparse_attention"],
+            mlp_layer_types=["dense"],
+            linear_attn_config={
+                "num_heads": 2,
+                "head_dim": 64,
+                "short_conv_kernel_size": 2,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        dsa = Glm5NextSparseAttention(cfg)
+        dsa.eval()
+        S0 = 12  # > index_topk -> indexer active at decode
+        x0 = mx.random.normal((1, S0, cfg.hidden_size))
+        qpos = mx.arange(S0)[:, None]
+        kpos = mx.arange(S0)[None, :]
+        xs = mx.random.normal((1, 1, cfg.hidden_size))
+
+        c1 = CacheList(KVCache(), KVCache())
+        dsa(x0, kpos <= qpos, c1)
+        ref = dsa(xs, None, c1)  # single-stream: mask=None
+
+        c2 = CacheList(KVCache(), KVCache())
+        dsa(x0, kpos <= qpos, c2)
+        mask4d = mx.ones(
+            (1, 1, 1, S0 + 1), dtype=mx.bool_
+        )  # batched-style all-True left-pad mask
+        out = dsa(xs, mask4d, c2)  # must accept the 4-D mask and equal the None case
+        self.assertLess(float(mx.max(mx.abs(out - ref))), 1e-3)
 
     def test_nemotron_h_language_model(self):
         from mlx_vlm.models import nemotron_h
@@ -1194,6 +3845,132 @@ class TestModels(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 1, config.vocab_size))
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
 
+    def test_longcat_flash_sparse_language_model(self):
+        from mlx.utils import tree_flatten
+
+        from mlx_vlm.models import longcat_flash_sparse as longcat_flash
+
+        def cfg(method, **kw):
+            return longcat_flash.ModelConfig(
+                model_type="longcat_flash_sparse",
+                attention_method=method,
+                hidden_size=64,
+                ffn_hidden_size=128,
+                expert_ffn_hidden_size=48,
+                moe_topk=4,
+                n_routed_experts=6,
+                zero_expert_num=2,
+                num_layers=2,
+                vocab_size=512,
+                max_position_embeddings=1024,
+                num_attention_heads=4,
+                kv_lora_rank=32,
+                q_lora_rank=48,
+                qk_rope_head_dim=16,
+                qk_nope_head_dim=16,
+                v_head_dim=16,
+                routed_scaling_factor=2.0,
+                rms_norm_eps=1e-5,
+                norm_topk_prob=True,
+                rope_scaling=None,
+                **kw,
+            )
+
+        lsa_config = cfg(
+            "LSA",
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=8,
+            index_init_tokens=2,
+            index_local_tokens=4,
+            cli_factor=2,
+        )
+        model = longcat_flash.Model(lsa_config)
+
+        self.language_test_runner(
+            model.language_model,
+            lsa_config.model_type,
+            lsa_config.vocab_size,
+            lsa_config.num_layers,
+        )
+
+        # LSA layer keeps 3 cache slots: latent(0), indexer(0), latent(1)
+        cache = model.make_cache()
+        self.assertEqual(len(cache), lsa_config.num_layers)
+        self.assertEqual(len(cache[0].caches), 3)
+
+        prompt = mx.arange(24).reshape(1, 24)
+        logits = model(prompt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 24, lsa_config.vocab_size))
+        nxt = mx.argmax(logits[:, -1:, :], axis=-1)
+        logits = model(nxt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 1, lsa_config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+        # dense variant keeps 2 cache slots (the two attention sub-blocks)
+        dense = longcat_flash.Model(cfg("MLA"))
+        self.assertEqual(len(dense.make_cache()[0].caches), 2)
+
+        # sanitize: stack experts, split dual-block kv_b_proj, drop MTP
+        h, kv = lsa_config.hidden_size, lsa_config.kv_lora_rank
+        hd = lsa_config.qk_nope_head_dim + lsa_config.v_head_dim
+        nh, ef = lsa_config.num_attention_heads, lsa_config.expert_ffn_hidden_size
+        raw = {"model.mtp.embed_tokens.weight": mx.zeros((4, h))}
+        for e in range(lsa_config.n_routed_experts):
+            raw[f"model.layers.0.mlp.experts.{e}.gate_proj.weight"] = mx.zeros((ef, h))
+            raw[f"model.layers.0.mlp.experts.{e}.up_proj.weight"] = mx.zeros((ef, h))
+            raw[f"model.layers.0.mlp.experts.{e}.down_proj.weight"] = mx.zeros((h, ef))
+        for i in range(2):
+            raw[f"model.layers.0.self_attn.{i}.kv_b_proj.weight"] = mx.zeros(
+                (nh * hd, kv)
+            )
+        clean = dense.language_model.sanitize(dict(raw))
+        keys = dict(tree_flatten(clean)) if isinstance(clean, list) else clean
+        self.assertIn("model.layers.0.mlp.switch_mlp.gate_proj.weight", keys)
+        self.assertEqual(
+            keys["model.layers.0.mlp.switch_mlp.gate_proj.weight"].shape,
+            (lsa_config.n_routed_experts, ef, h),
+        )
+        for i in range(2):
+            self.assertIn(f"model.layers.0.self_attn.{i}.embed_q.weight", keys)
+            self.assertIn(f"model.layers.0.self_attn.{i}.unembed_out.weight", keys)
+            self.assertNotIn(f"model.layers.0.self_attn.{i}.kv_b_proj.weight", keys)
+        self.assertFalse(any(k.startswith("model.mtp") for k in keys))
+
+        # degenerate limit: an LSA model whose indexer never fires (index_topk >= L)
+        # must reproduce the dense backbone bit-for-bit when weights are shared.
+        ref = longcat_flash.Model(cfg("MLA"))
+        mx.eval(ref.parameters())
+        deg = longcat_flash.Model(
+            cfg("LSA", index_n_heads=4, index_head_dim=32, index_topk=10_000)
+        )
+        deg.load_weights(list(tree_flatten(ref.parameters())), strict=False)
+        mx.eval(deg.parameters())
+        ldense = ref(prompt).logits
+        ldeg = deg(prompt).logits
+        self.assertLess(float(mx.max(mx.abs(ldense - ldeg))), 1e-4)
+
+        # n-gram input embedding (Lite-Sparse): cache gains a leading context slot
+        # and chunked prefill must match single-shot (context cache threads state).
+        ng = longcat_flash.Model(
+            cfg(
+                "LSA",
+                index_n_heads=4,
+                index_head_dim=32,
+                index_topk=10_000,
+                oe_vocab_size_ratio=2,
+                oe_neighbor_num=3,
+                oe_split_num=2,
+            )
+        )
+        mx.eval(ng.parameters())
+        self.assertEqual(len(ng.make_cache()), lsa_config.num_layers + 1)
+        single = ng(prompt, cache=ng.make_cache()).logits[:, -1, :]
+        cc = ng.make_cache()
+        ng(prompt[:, :16], cache=cc)
+        chunked = ng(prompt[:, 16:], cache=cc).logits[:, -1, :]
+        self.assertLess(float(mx.max(mx.abs(single - chunked))), 5e-3)
+
     def test_qwen2_language_model(self):
         from mlx_vlm.models import qwen2
 
@@ -1297,6 +4074,75 @@ class TestModels(unittest.TestCase):
         logits = model(nxt, cache=cache).logits
         self.assertEqual(logits.shape, (1, 1, config.vocab_size))
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+    def test_gemma3_rope_scaling_applies_only_to_global_attention(self):
+        from mlx_vlm.models import gemma3
+        from mlx_vlm.models.gemma3.language import LanguageModel
+
+        config = gemma3.TextConfig(
+            model_type="gemma3_text",
+            hidden_size=16,
+            num_hidden_layers=6,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            vocab_size=32,
+            sliding_window_pattern=3,
+            rope_scaling={"rope_type": "linear", "factor": 8.0},
+        )
+
+        model = LanguageModel(config)
+
+        for layer_idx, layer in enumerate(model.layers):
+            expected_scale = 0.125 if (layer_idx + 1) % 3 == 0 else 1.0
+            self.assertEqual(layer.self_attn.rope.scale, expected_scale)
+
+    def test_gemma3_rope_without_scaling(self):
+        from mlx_vlm.models import gemma3
+        from mlx_vlm.models.gemma3.language import LanguageModel
+
+        config = gemma3.TextConfig(
+            model_type="gemma3_text",
+            hidden_size=16,
+            num_hidden_layers=3,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            vocab_size=32,
+            sliding_window_pattern=3,
+        )
+
+        model = LanguageModel(config)
+
+        for layer in model.layers:
+            self.assertEqual(layer.self_attn.rope.scale, 1.0)
+
+    def test_gemma3n_rope_scaling_applies_only_to_global_attention(self):
+        from mlx_vlm.models import gemma3n
+        from mlx_vlm.models.gemma3n.language import Gemma3nAttention
+
+        config = gemma3n.TextConfig(
+            model_type="gemma3n_text",
+            hidden_size=16,
+            num_hidden_layers=2,
+            intermediate_size=[32, 32],
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            vocab_size=32,
+            layer_types=["sliding_attention", "full_attention"],
+            rope_scaling={"rope_type": "linear", "factor": 8.0},
+        )
+
+        sliding = Gemma3nAttention(config, layer_idx=0, is_kv_shared_layer=False)
+        global_attention = Gemma3nAttention(
+            config, layer_idx=1, is_kv_shared_layer=False
+        )
+
+        self.assertEqual(sliding.rope.scale, 1.0)
+        self.assertEqual(global_attention.rope.scale, 0.125)
 
     def test_llama_language_model(self):
         from mlx_vlm.models import llama
@@ -1631,6 +4477,258 @@ class TestModels(unittest.TestCase):
             config.vision_config.num_channels,
             (config.vision_config.image_size, config.vision_config.image_size),
         )
+
+    def test_llava_onevision(self):
+        from mlx_vlm.models import llava_onevision
+
+        text_config = llava_onevision.TextConfig(
+            model_type="qwen2",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-6,
+            vocab_size=200,
+            rope_theta=1000000.0,
+            tie_word_embeddings=False,
+        )
+
+        vision_config = llava_onevision.VisionConfig(
+            model_type="siglip_vision_model",
+            num_hidden_layers=3,
+            hidden_size=48,
+            intermediate_size=96,
+            num_attention_heads=4,
+            image_size=56,
+            patch_size=14,
+            num_channels=3,
+            layer_norm_eps=1e-6,
+            vision_use_head=False,
+        )
+
+        config = llava_onevision.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="llava_onevision",
+            image_token_index=190,
+            video_token_index=191,
+            image_grid_pinpoints=[[56, 56], [56, 112], [112, 56], [112, 112]],
+            vocab_size=200,
+        )
+
+        model = llava_onevision.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.mm_projector_test_runner(
+            model.multi_modal_projector,
+            config.vision_config.hidden_size,
+            config.text_config.hidden_size,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
+    def _llava_onevision_test_model(self, **overrides):
+        from mlx_vlm.models import llava_onevision
+
+        config = llava_onevision.ModelConfig(
+            text_config=llava_onevision.TextConfig(
+                model_type="qwen2",
+                hidden_size=32,
+                num_hidden_layers=1,
+                intermediate_size=64,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                rms_norm_eps=1e-6,
+                vocab_size=200,
+                tie_word_embeddings=False,
+            ),
+            vision_config=llava_onevision.VisionConfig(
+                model_type="siglip_vision_model",
+                num_hidden_layers=1,
+                hidden_size=32,
+                intermediate_size=64,
+                num_attention_heads=4,
+                image_size=56,
+                patch_size=14,
+                num_channels=3,
+                layer_norm_eps=1e-6,
+                vision_use_head=False,
+            ),
+            model_type="llava_onevision",
+            image_token_index=190,
+            video_token_index=191,
+            image_grid_pinpoints=[
+                [56, 56],
+                [56, 112],
+                [112, 56],
+                [112, 112],
+                [224, 224],
+            ],
+            vocab_size=200,
+            **overrides,
+        )
+        return llava_onevision.Model(config)
+
+    def test_llava_onevision_packing_single_tile(self):
+        model = self._llava_onevision_test_model()
+        tokens = model.patches_per_side**2
+
+        features = mx.zeros((1, tokens, 32))
+        packed = model.pack_image_features([features], [[56, 56]])
+
+        # A single tile keeps the base features and appends exactly one newline row.
+        self.assertEqual(packed[0].shape, (tokens + 1, 32))
+
+    def test_llava_onevision_packing_matches_grid_layout(self):
+        model = self._llava_onevision_test_model()
+        side = model.patches_per_side
+        tokens = side**2
+
+        features = mx.random.normal((5, tokens, 32))
+        packed = model.pack_image_features([features], [[112, 112]])[0]
+
+        # 2x2 grid of tiles, no downsampling at this size: base + rows*(cols+newline).
+        expected = tokens + (2 * side) * (2 * side + 1)
+        self.assertEqual(packed.shape, (expected, 32))
+        self.assertTrue(mx.allclose(packed[:tokens], features[0]))
+
+    def test_llava_onevision_packing_downsamples_above_ratio(self):
+        model = self._llava_onevision_test_model()
+        side = model.patches_per_side
+        tokens = side**2
+
+        features = mx.random.normal((17, tokens, 32))
+        packed = model.pack_image_features([features], [[224, 224]])[0]
+
+        # 4x4 grid exceeds anyres_max_9, so the unpadded grid is scaled down.
+        ratio = math.sqrt((4 * side) ** 2 / (model.max_num_patches * side**2))
+        self.assertGreater(ratio, 1.1)
+        scaled = int(4 * side // ratio)
+        self.assertEqual(packed.shape, (tokens + scaled * (scaled + 1), 32))
+
+    def test_llava_onevision_video_pooling(self):
+        model = self._llava_onevision_test_model()
+        side = model.patches_per_side
+        pooled = math.ceil(side / 2)
+
+        frames = 3
+        features = mx.random.normal((frames, side**2, 32))
+        pooled_features = model.apply_pooling(features)
+
+        self.assertEqual(pooled_features.shape, (frames, pooled**2, 32))
+
+    def test_llava_onevision_scatter_rejects_count_mismatch(self):
+        model = self._llava_onevision_test_model()
+
+        input_ids = mx.array([[1, 190, 190, 2]])
+        inputs_embeds = mx.zeros((1, 4, 32))
+        features = mx.zeros((3, 32))
+
+        with self.assertRaises(ValueError):
+            model._scatter_features(inputs_embeds, input_ids, features, 190, "Image")
+
+    def test_llava_onevision_packing_matches_processor_token_count(self):
+        from mlx_vlm.models.llava_onevision.llava_onevision import (
+            get_anyres_image_grid_shape,
+        )
+        from mlx_vlm.models.llava_onevision.processing_llava_onevision import (
+            LlavaOnevisionProcessor,
+        )
+
+        model = self._llava_onevision_test_model()
+        side = model.patches_per_side
+        tile = model.config.vision_config.image_size
+
+        processor = LlavaOnevisionProcessor(
+            image_processor=SimpleNamespace(
+                image_grid_pinpoints=model.config.image_grid_pinpoints
+            ),
+            tokenizer=None,
+            num_image_tokens=side**2,
+            vision_aspect_ratio=model.config.vision_aspect_ratio,
+            vision_feature_select_strategy="full",
+        )
+
+        for image_size in ([56, 56], [112, 112], [56, 112], [224, 224], [112, 224]):
+            with self.subTest(image_size=image_size):
+                num_patch_height, num_patch_width = get_anyres_image_grid_shape(
+                    image_size, model.config.image_grid_pinpoints, tile
+                )
+                tiles = num_patch_height * num_patch_width + 1
+                features = mx.zeros((tiles, side**2, 32))
+
+                packed = model.pack_image_features([features], [image_size])[0]
+                predicted = processor._get_number_of_features(
+                    image_size[0], image_size[1], tile, tile
+                )
+
+                self.assertEqual(packed.shape[0], predicted)
+
+    def test_llava_onevision_keeps_untied_lm_head(self):
+        from mlx_vlm.models import llava_onevision
+        from mlx_vlm.models.llava_onevision.language import LanguageModel
+
+        # The 7b/72b checkpoints omit tie_word_embeddings and ship a real lm_head,
+        # so the default must not tie or their output projection is dropped.
+        self.assertFalse(llava_onevision.TextConfig().tie_word_embeddings)
+
+        def sanitized(tie):
+            config = llava_onevision.TextConfig(
+                hidden_size=16,
+                num_hidden_layers=1,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                vocab_size=32,
+                tie_word_embeddings=tie,
+            )
+            return LanguageModel(config).sanitize(
+                {"language_model.lm_head.weight": mx.zeros((32, 16))}
+            )
+
+        self.assertIn("language_model.lm_head.weight", sanitized(tie=False))
+        self.assertNotIn("language_model.lm_head.weight", sanitized(tie=True))
+
+    def test_llava_onevision_sanitize_accepts_both_layouts(self):
+        from mlx_vlm.models import llava_onevision
+
+        published = {
+            "language_model.model.embed_tokens.weight": 0,
+            "language_model.lm_head.weight": 1,
+            "vision_tower.vision_model.post_layernorm.weight": 2,
+            "multi_modal_projector.linear_1.weight": 3,
+            "image_newline": 4,
+        }
+        nested = {
+            "model.language_model.embed_tokens.weight": 0,
+            "lm_head.weight": 1,
+            "model.vision_tower.post_layernorm.weight": 2,
+            "model.multi_modal_projector.linear_1.weight": 3,
+            "model.image_newline": 4,
+        }
+
+        self.assertEqual(
+            llava_onevision.Model.sanitize(published),
+            llava_onevision.Model.sanitize(nested),
+        )
+        self.assertEqual(set(llava_onevision.Model.sanitize(nested)), set(published))
+
+        # Sanitizing twice must not rewrite already-normalized keys.
+        once = llava_onevision.Model.sanitize(nested)
+        self.assertEqual(llava_onevision.Model.sanitize(dict(once)), once)
 
     def test_llava(self):
         from mlx_vlm.models import llava
@@ -2105,6 +5203,16 @@ class TestModels(unittest.TestCase):
             config.vision_config.num_channels,
             (config.vision_config.image_size, config.vision_config.image_size),
         )
+
+        sanitized = model.sanitize(
+            {
+                "model.embed_tokens.weight": mx.zeros((2, 2)),
+                "lm_head.weight": mx.zeros((2, 2)),
+                "language_model.lm_head.weight": mx.zeros((2, 2)),
+            }
+        )
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        self.assertNotIn("language_model.lm_head.weight", sanitized)
 
     def test_paligemma(self):
         from mlx_vlm.models import paligemma
@@ -3948,6 +7056,39 @@ class TestModels(unittest.TestCase):
 
         self.assertEqual(output.shape, (1, 1, 1, 4))
 
+    def test_mllama_rope_scaling_is_applied(self):
+        from mlx_vlm.models import mllama
+        from mlx_vlm.models.rope_utils import Llama3RoPE
+
+        config = mllama.TextConfig(
+            hidden_size=16,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            rope_scaling={
+                "rope_type": "llama3",
+                "factor": 8.0,
+                "high_freq_factor": 4.0,
+                "low_freq_factor": 1.0,
+                "original_max_position_embeddings": 8192,
+            },
+        )
+
+        attn = mllama.language.MllamaTextSelfAttention(config, layer_idx=0)
+        self.assertIsInstance(attn.rope, Llama3RoPE)
+
+    def test_mllama_without_rope_scaling_is_plain(self):
+        from mlx_vlm.models import mllama
+
+        config = mllama.TextConfig(
+            hidden_size=16,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            rope_scaling=None,
+        )
+        attn = mllama.language.MllamaTextSelfAttention(config, layer_idx=0)
+
+        self.assertAlmostEqual(attn.rope.scale, 1.0)
+
     def test_mllama(self):
         from mlx_vlm.models import mllama
 
@@ -4122,6 +7263,28 @@ class TestModels(unittest.TestCase):
 
         self.assertEqual(config.eos_token_id, [151645, 151646])
 
+    def test_molmo_point_applies_rope_scaling_only_to_configured_layers(self):
+        from mlx_vlm.models import molmo_point
+
+        config = molmo_point.TextConfig(
+            hidden_size=16,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=4,
+            vocab_size=16,
+            additional_vocab_size=4,
+            num_hidden_layers=2,
+            intermediate_size=32,
+            max_position_embeddings=16,
+            rope_scaling={"type": "linear", "factor": 2.0},
+            rope_scaling_layers=[1],
+        )
+
+        transformer = molmo_point.language.Molmo2Transformer(config)
+
+        self.assertAlmostEqual(transformer.blocks[0].self_attn.rotary_emb.scale, 1.0)
+        self.assertAlmostEqual(transformer.blocks[1].self_attn.rotary_emb.scale, 0.5)
+
     def test_molmo2_sanitizes_non_finite_image_features(self):
         from mlx_vlm.models.molmo2.molmo2 import (
             MAX_FLOAT16_IMAGE_FEATURE,
@@ -4147,6 +7310,31 @@ class TestModels(unittest.TestCase):
         self.assertGreaterEqual(fp16_clipped[1], -MAX_FLOAT16_IMAGE_FEATURE)
         self.assertLessEqual(fp16_clipped[1], -MAX_FLOAT16_IMAGE_FEATURE + 16)
         self.assertEqual(fp16_clipped[2], 42.0)
+
+    def test_florence2_language_config_registered(self):
+        from transformers import AutoConfig
+
+        from mlx_vlm.models import florence2  # noqa: F401
+
+        self.assertEqual(
+            AutoConfig.for_model("florence2_language").model_type, "florence2_language"
+        )
+
+    def test_florence2_skips_chunked_prefill(self):
+        from mlx_vlm.generate.common import _chunked_prefill_enabled
+        from mlx_vlm.models import florence2
+
+        config = florence2.ModelConfig(
+            text_config=florence2.TextConfig(),
+            vision_config=florence2.VisionConfig(drop_path_rate=0.0),
+        )
+        model = florence2.Model(config)
+        self.assertTrue(model.no_chunked_prefill)
+        self.assertFalse(
+            _chunked_prefill_enabled(
+                model, inputs_embeds=mx.zeros((1, 8, 4)), prefill_kwargs={}
+            )
+        )
 
     def test_florence2(self):
         from mlx_vlm.models import florence2
@@ -4190,6 +7378,218 @@ class TestModels(unittest.TestCase):
             config.vision_config.image_size,
             channel_first=True,
         )
+
+    def test_nemotron_parse(self):
+        from mlx_vlm.models import nemotron_parse
+
+        text_config = nemotron_parse.TextConfig(
+            d_model=64,
+            decoder_attention_heads=8,
+            decoder_ffn_dim=128,
+            decoder_layers=2,
+            vocab_size=128,
+        )
+        vision_config = nemotron_parse.VisionConfig(
+            hidden_size=64,
+            num_heads=8,
+            mlp_ratio=2.0,
+            num_layers=2,
+            neck_dim=64,
+        )
+        config = nemotron_parse.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            vocab_size=128,
+        )
+        model = nemotron_parse.Model(config)
+
+        batch_size = 1
+        pixel_values = mx.random.normal((batch_size, 3, 64, 64))
+
+        # Forward with no cache (the cache=None fallback path).
+        output = model(pixel_values=pixel_values)
+        self.assertEqual(
+            output.logits.shape, (batch_size, 1, config.text_config.vocab_size)
+        )
+        self.assertEqual(output.encoder_outputs.shape, (batch_size, 5, 64))
+
+        # Every decoder layer must own a distinct cache pair: the cache=None
+        # fallback and make_cache() must produce identical logits.
+        output_cached = model(pixel_values=pixel_values, cache=model.make_cache())
+        self.assertTrue(mx.array_equal(output.logits, output_cached.logits).item())
+        # And the two cache paths must not alias objects across layers.
+        cache = model.make_cache()
+        self.assertEqual(len(cache), config.text_config.decoder_layers)
+        self.assertEqual(
+            len({id(c[0]) for c in cache}), config.text_config.decoder_layers
+        )
+        self.assertEqual(
+            len({id(c[1]) for c in cache}), config.text_config.decoder_layers
+        )
+
+        # Multi-step decode with the cache must advance.
+        cache = model.make_cache()
+        enc = output.encoder_outputs
+        dec = mx.array([[config.text_config.decoder_start_token_id]])
+        for _ in range(3):
+            out = model.language_model(
+                decoder_input_ids=dec,
+                encoder_outputs=enc,
+                cache=cache,
+            )
+            dec = mx.argmax(out.logits[:, -1, :], axis=-1, keepdims=True)
+        self.assertEqual(dec.shape, (batch_size, 1))
+
+    def test_nemotron_parse_input_embeddings(self):
+        from mlx_vlm.models import nemotron_parse
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        text_config = nemotron_parse.TextConfig(
+            d_model=64,
+            decoder_attention_heads=8,
+            decoder_ffn_dim=128,
+            decoder_layers=2,
+            vocab_size=128,
+        )
+        vision_config = nemotron_parse.VisionConfig(
+            hidden_size=64,
+            num_heads=8,
+            mlp_ratio=2.0,
+            num_layers=2,
+            neck_dim=64,
+        )
+        model = nemotron_parse.Model(
+            nemotron_parse.ModelConfig(
+                text_config=text_config,
+                vision_config=vision_config,
+                vocab_size=128,
+            )
+        )
+
+        pixel_values = mx.random.normal((1, 3, 64, 64))
+        result = model.get_input_embeddings(pixel_values=pixel_values)
+        self.assertIsInstance(result, InputEmbeddingsFeatures)
+        self.assertIsNotNone(result.inputs_embeds)
+        self.assertIsNotNone(result.decoder_inputs_embeds)
+
+        # Deliberate image-only contract: without pixel_values there are no
+        # encoder states to decode against, so this must raise.
+        with self.assertRaises(ValueError):
+            model.get_input_embeddings(input_ids=mx.array([[1, 2, 3]]))
+
+    def test_nemotron_parse_untied_lm_head(self):
+        from mlx_vlm.models import nemotron_parse
+
+        # v1.x checkpoints carry a real, untied lm_head (and no text_config
+        # key at the top level); the config pipeline must keep the decoder's
+        # vocab_size and the sanitize must map lm_head.weight, not rebuild it
+        # from the shared embedding.
+        config_dict = {
+            "model_type": "nemotron_parse",
+            "vocab_size": 52329,
+            "image_size": [2048, 1664],
+            "decoder_start_token_id": 2,
+            "text_config": {},
+            "encoder": {"hidden_size": 64, "num_layers": 2, "patch_size": 16},
+            "decoder": {
+                "d_model": 64,
+                "decoder_attention_heads": 8,
+                "decoder_ffn_dim": 128,
+                "decoder_layers": 2,
+                "vocab_size": 128,
+                "decoder_start_token_id": None,
+            },
+        }
+        config = nemotron_parse.ModelConfig.from_dict(config_dict)
+        self.assertEqual(config.text_config.vocab_size, 128)
+        # The loader pipeline re-derives the text config from the text_config
+        # key after from_dict; it must see the decoder params (with the
+        # top-level decoder_start_token_id override), not the seed {}.
+        self.assertEqual(config_dict["text_config"]["vocab_size"], 128)
+        self.assertEqual(
+            nemotron_parse.TextConfig.from_dict(config_dict["text_config"]).vocab_size,
+            128,
+        )
+
+        weights = {
+            "decoder.embed_tokens.weight": mx.zeros((128, 64)),
+            "lm_head.weight": mx.ones((128, 64)),
+        }
+        sanitized = nemotron_parse.Model.sanitize(weights)
+        # The untied head keeps its own values under language_model.lm_head;
+        # the tied reconstruction would have overwritten it with the shared
+        # embedding.
+        self.assertTrue(
+            mx.array_equal(
+                sanitized["language_model.lm_head.weight"], mx.ones((128, 64))
+            ).item()
+        )
+        self.assertTrue(
+            mx.array_equal(
+                sanitized["language_model.model.shared.weight"], mx.zeros((128, 64))
+            ).item()
+        )
+
+        # Without lm_head.weight the tied fallback still reconstructs it from
+        # the shared embedding (2.0 checkpoints).
+        tied = {k: v for k, v in weights.items() if k != "lm_head.weight"}
+        sanitized_tied = nemotron_parse.Model.sanitize(tied)
+        self.assertTrue(
+            mx.array_equal(
+                sanitized_tied["language_model.lm_head.weight"],
+                sanitized_tied["language_model.model.shared.weight"],
+            ).item()
+        )
+
+    def test_nemotron_parse_prompt_seed_strips_automatic_specials(self):
+        from mlx_vlm.models import nemotron_parse
+
+        text_config = nemotron_parse.TextConfig(
+            d_model=64,
+            decoder_attention_heads=8,
+            decoder_ffn_dim=128,
+            decoder_layers=2,
+            vocab_size=128,
+            bos_token_id=0,
+            eos_token_id=2,
+        )
+        vision_config = nemotron_parse.VisionConfig(
+            hidden_size=64,
+            num_heads=8,
+            mlp_ratio=2.0,
+            num_layers=2,
+            neck_dim=64,
+        )
+        model = nemotron_parse.Model(
+            nemotron_parse.ModelConfig(
+                text_config=text_config,
+                vision_config=vision_config,
+                vocab_size=128,
+            )
+        )
+
+        pixel_values = mx.random.normal((1, 3, 64, 64))
+        encoder_outputs = model.vision_tower(pixel_values)
+
+        # The generate loop hands the tokenizer-wrapped prompt to the
+        # language model together with the start-token embedding; the decoder
+        # must seed from the raw prompt (like the HF reference), so the
+        # wrapped length 8 collapses to the raw length 6.
+        wrapped = mx.array([[0, 2, 0, 7, 8, 9, 10, 2]])
+        start_embed = model.language_model.model.shared(mx.array([[2]]))
+        out = model.language_model(
+            inputs=wrapped,
+            encoder_outputs=encoder_outputs,
+            decoder_inputs_embeds=start_embed,
+        )
+        self.assertEqual(out.logits.shape, (1, 6, 128))
+
+        # A single-token decoder step passes through unchanged.
+        out = model.language_model(
+            decoder_input_ids=mx.array([[3]]),
+            encoder_outputs=encoder_outputs,
+        )
+        self.assertEqual(out.logits.shape, (1, 1, 128))
 
     def test_deepseek_vl_v2(self):
         from mlx_vlm.models import deepseek_vl_v2
@@ -4396,9 +7796,8 @@ class TestModels(unittest.TestCase):
         import tempfile
         from pathlib import Path
 
-        from mlx_lm.utils import quantize_model
-
         from mlx_vlm.models import gemma4
+        from mlx_vlm.quant_utils import quantize_model
         from mlx_vlm.utils import load_model, save_config, save_weights
 
         text_config = gemma4.TextConfig(
@@ -5603,6 +9002,29 @@ class TestModels(unittest.TestCase):
             vision_feature_layer=0,
         )
 
+    def test_phi4mm_longrope_uses_top_level_original_context_length(self):
+        from mlx_vlm.models import phi4mm
+        from mlx_vlm.models.rope_utils import SuScaledRoPE
+
+        config = phi4mm.ModelConfig(
+            hidden_size=16,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=16,
+            original_max_position_embeddings=8,
+            rope_scaling={
+                "type": "longrope",
+                "short_factor": [1.0, 1.0],
+                "long_factor": [2.0, 2.0],
+            },
+        )
+
+        attn = phi4mm.language.Attention(config)
+
+        self.assertIsInstance(attn.rope, SuScaledRoPE)
+        self.assertEqual(attn.rope.original_max_position_embeddings, 8)
+
     def test_phi4mm(self):
         from mlx_vlm.models import phi4mm
 
@@ -6249,6 +9671,61 @@ class TestModels(unittest.TestCase):
             config.text_config.num_hidden_layers,
         )
 
+    def test_granite4_vision_chunked_prefill_aligns_deepstack(self):
+        from mlx_vlm.models import granite4_vision
+
+        text_config = granite4_vision.TextConfig(
+            model_type="granitemoehybrid",
+            hidden_size=64,
+            intermediate_size=128,
+            shared_intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=1000,
+            rms_norm_eps=1e-5,
+            rope_theta=10000000.0,
+            embedding_multiplier=12.0,
+            attention_multiplier=0.015625,
+            residual_multiplier=0.22,
+            logits_scaling=10.0,
+        )
+        vision_config = granite4_vision.VisionConfig(
+            model_type="siglip_vision_model",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            image_size=48,
+            patch_size=16,
+        )
+        config = granite4_vision.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="granite4_vision",
+            deepstack_layer_map=[[-1, 0]],
+            use_spatial_sampling=False,
+            downsample_rate="3/3",
+            use_image_newline_parameter=False,
+        )
+        inner = granite4_vision.Model(config).language_model.model
+        inner._deepstack_target_layers = [0]
+
+        full_len = 6
+        hidden = text_config.hidden_size
+        visual_pos_masks = mx.array([[True, True, False, False, False, False]])
+        deepstack_visual_embeds = [mx.ones((full_len, hidden))]
+
+        chunk_len = full_len - 1
+        out = inner(
+            mx.zeros((1, chunk_len), dtype=mx.int32),
+            inputs_embeds=mx.zeros((1, chunk_len, hidden)),
+            cache=None,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+        )
+        self.assertEqual(out.shape, (1, chunk_len, hidden))
+
     def test_granite4_1_vision(self):
         from mlx_vlm.models import granite4_vision
 
@@ -6760,6 +10237,59 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.isfinite(out["pred_logits"])).item())
         self.assertTrue(mx.all(mx.isfinite(out["pred_boxes"])).item())
 
+    def test_yolo11_forward(self):
+        from PIL import Image
+
+        from mlx_vlm.models.yolo11 import YOLO11, non_max_suppression, prepare_image
+
+        model = YOLO11(nc=1)
+        model.eval()
+
+        x = mx.random.normal((1, 64, 64, 3))
+        pred = model(x)
+        mx.eval(pred)
+
+        self.assertEqual(pred.shape, (1, 5, 84))
+        self.assertTrue(mx.all(mx.isfinite(pred)).item())
+
+        single = mx.array([[[16.0], [16.0], [8.0], [8.0], [0.9]]])
+        dets = non_max_suppression(single, conf_thresh=0.01, iou_thresh=0.5)
+        self.assertEqual(len(dets), 1)
+        self.assertEqual(dets[0].shape, (1, 6))
+
+        overlapping = mx.array(
+            [
+                [
+                    [10.0, 10.0, 30.0],
+                    [10.0, 10.0, 30.0],
+                    [8.0, 8.0, 8.0],
+                    [8.0, 8.0, 8.0],
+                    [0.9, 0.8, 0.7],
+                ]
+            ]
+        )
+        dets = non_max_suppression(overlapping, iou_thresh=0.5, max_det=2)
+        self.assertEqual(dets[0].shape, (2, 6))
+
+        multiclass = mx.array(
+            [
+                [
+                    [10.0, 10.0],
+                    [10.0, 10.0],
+                    [8.0, 8.0],
+                    [8.0, 8.0],
+                    [0.9, 0.1],
+                    [0.1, 0.8],
+                ]
+            ]
+        )
+        dets = non_max_suppression(multiclass, iou_thresh=0.5)
+        self.assertEqual(dets[0].shape, (2, 6))
+
+        prepared, _, gain, left, top = prepare_image(Image.new("RGB", (65, 33)))
+        self.assertEqual(prepared.shape, (1, 64, 96, 3))
+        self.assertEqual((gain, left, top), (1.0, 15, 15))
+
     def test_sam3_1_config_and_model(self):
         # Config source: mlx_vlm/models/sam3_1/config.py
         from mlx_vlm.models.sam3_1 import Model, ModelConfig
@@ -7067,6 +10597,66 @@ class TestModels(unittest.TestCase):
         cache = model.make_cache()
         self.assertIsInstance(cache[0], RotatingKVCache)
         self.assertIsInstance(cache[1], KVCache)
+
+    def test_muse_glimmer_sanitize_weight_layouts(self):
+        from mlx_vlm.models import muse_glimmer
+
+        model = muse_glimmer.Model(self._muse_glimmer_config())
+
+        # Raw HF nests both stacks under ``model.``; MLX conversions ship the
+        # already-sanitized paths; OptiQ/flattened quants store LM tensors under
+        # a bare ``model.`` with the vision stack and lm_head already at top
+        # level. All three must land on the same target module paths.
+        raw_hf = {
+            "model.language_model.embed_tokens.weight": mx.zeros((64, 32)),
+            "model.vision_tower.ln_pre.weight": mx.zeros((8,)),
+            "model.vision_adapter.fc1.weight": mx.zeros((16, 32)),
+            "model.vision_projection.weight": mx.zeros((32, 16)),
+            "lm_head.weight": mx.zeros((64, 32)),
+        }
+        mlx_std = {
+            "language_model.model.embed_tokens.weight": mx.zeros((64, 32)),
+            "language_model.lm_head.weight": mx.zeros((64, 32)),
+            "vision_tower.ln_pre.weight": mx.zeros((8,)),
+            "vision_adapter.fc1.weight": mx.zeros((16, 32)),
+            "vision_projection.weight": mx.zeros((32, 16)),
+        }
+        optiq = {
+            "model.embed_tokens.weight": mx.zeros((64, 32)),
+            "model.layers.0.self_attn.q_proj.weight": mx.zeros((32, 32)),
+            "model.norm.weight": mx.zeros((32,)),
+            "lm_head.weight": mx.zeros((64, 32)),
+            "vision_tower.ln_pre.weight": mx.zeros((8,)),
+            "vision_adapter.fc1.weight": mx.zeros((16, 32)),
+            "vision_projection.weight": mx.zeros((32, 16)),
+        }
+
+        expected_vision = {
+            "vision_tower.ln_pre.weight",
+            "vision_adapter.fc1.weight",
+            "vision_projection.weight",
+        }
+        for name, weights in (
+            ("raw_hf", raw_hf),
+            ("mlx_std", mlx_std),
+            ("optiq", optiq),
+        ):
+            keys = set(model.sanitize(weights))
+            self.assertFalse(
+                any(k.startswith(("model.", "lm_head.")) for k in keys),
+                f"{name}: unmapped top-level keys survived sanitize: {keys}",
+            )
+            self.assertIn("language_model.model.embed_tokens.weight", keys)
+            self.assertIn("language_model.lm_head.weight", keys)
+            self.assertTrue(expected_vision <= keys, f"{name}: {keys}")
+
+        self.assertIn(
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            model.sanitize(optiq),
+        )
+        self.assertIn("language_model.model.norm.weight", model.sanitize(optiq))
+        # Already-sanitized MLX paths must be idempotent (no double prefix).
+        self.assertEqual(set(mlx_std), set(model.sanitize(mlx_std)))
 
     def test_muse_glimmer_numerical_parity(self):
         from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm
@@ -7445,6 +11035,41 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self._check_returns_input_embeddings_features(model, "llava_next")
 
+    def test_llava_onevision_input_embeddings(self):
+        from mlx_vlm.models import llava_onevision
+
+        model = llava_onevision.Model(
+            llava_onevision.ModelConfig(
+                text_config=llava_onevision.TextConfig(
+                    model_type="qwen2",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    vocab_size=32,
+                    rms_norm_eps=1e-6,
+                    tie_word_embeddings=False,
+                ),
+                vision_config=llava_onevision.VisionConfig(
+                    model_type="siglip_vision_model",
+                    num_hidden_layers=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                    num_channels=3,
+                    vision_use_head=False,
+                ),
+                model_type="llava_onevision",
+                image_token_index=31,
+                video_token_index=30,
+                vocab_size=32,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "llava_onevision")
+
     def test_qwen2_vl_input_embeddings(self):
         from mlx_vlm.models import qwen2_vl
 
@@ -7675,6 +11300,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
                     rms_norm_eps=1e-6,
                     num_key_value_heads=2,
                     head_dim=8,
+                    mm_tokens_per_image=4,
                 ),
                 vision_config=gemma3.VisionConfig(
                     model_type="gemma3",
@@ -8681,7 +12307,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
             ),
         }
 
-        sanitized = model.sanitize(dict(hf_weights))
+        sanitized = assert_sanitize_idempotent(model, hf_weights)
         self.assertIn("language_model.model.embed_tokens.weight", sanitized)
         self.assertIn("language_model.model.layers.0.input_layernorm.weight", sanitized)
         self.assertIn("language_model.lm_head.weight", sanitized)
@@ -8692,10 +12318,113 @@ class TestGetInputEmbeddings(unittest.TestCase):
             sanitized["visual.layers.0.self_attn.qkv.weight"].shape, (48, 16)
         )
 
-        self.assertIs(model.sanitize(sanitized), sanitized)
-
         for key in sanitized:
             self.assertNotIn("language_language_model", key)
+
+    def _got_tiny_config(self):
+        from mlx_vlm.models import got
+
+        return got.ModelConfig(
+            text_config=got.TextConfig(
+                model_type="qwen2",
+                hidden_size=8,
+                num_hidden_layers=1,
+                intermediate_size=16,
+                num_attention_heads=2,
+                rms_norm_eps=1e-6,
+                vocab_size=32,
+            ),
+            vision_config=got.VisionConfig(
+                img_size=32,
+                patch_size=16,
+                embed_dim=8,
+                depth=1,
+                num_heads=2,
+                out_chans=4,
+                out_dim=8,
+                window_size=2,
+                global_attn_indexes=(0,),
+            ),
+            model_type="GOT",
+        )
+
+    def test_got_sanitize_is_idempotent(self):
+        from mlx_vlm.models import got
+
+        model = got.Model(self._got_tiny_config())
+
+        hf_weights = {
+            # torch conv layout: (out_channels, in_channels, kH, kW)
+            "model.vision_tower_high.patch_embed.proj.weight": mx.zeros((8, 3, 16, 16)),
+            "model.vision_tower_high.neck.0.weight": mx.zeros((4, 8, 1, 1)),
+            "model.vision_tower_high.neck.1.weight": mx.zeros((4,)),
+            "model.vision_tower_high.net_2.weight": mx.zeros((8, 4, 3, 3)),
+            "model.mm_projector_vary.weight": mx.zeros((8, 8)),
+            "model.embed_tokens.weight": mx.zeros((32, 8)),
+            "lm_head.weight": mx.zeros((32, 8)),
+        }
+
+        sanitized = model.sanitize(dict(hf_weights))
+
+        self.assertEqual(
+            sanitized["vision_tower.patch_embed.proj.weight"].shape, (8, 16, 16, 3)
+        )
+        self.assertEqual(sanitized["vision_tower.conv1.weight"].shape, (4, 1, 1, 8))
+        self.assertEqual(sanitized["vision_tower.norm1.weight"].shape, (4,))
+        self.assertEqual(sanitized["vision_tower.net_2.weight"].shape, (8, 3, 3, 4))
+        self.assertIn("multi_modal_projector.weight", sanitized)
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        # tie_word_embeddings is on, so the stored lm_head is dropped
+        self.assertNotIn("language_model.lm_head.weight", sanitized)
+
+        # Converted checkpoints go through sanitize again on load. Transposing a
+        # second time would give (8, 16, 3, 16) and fail load_weights (#1871).
+        twice = model.sanitize(dict(sanitized))
+        for key, value in sanitized.items():
+            self.assertEqual(twice[key].shape, value.shape, key)
+
+    def test_got_config_adds_im_end_to_stop_ids(self):
+        from mlx_vlm.models import got
+
+        params = {
+            "model_type": "GOT",
+            "hidden_size": 8,
+            "num_hidden_layers": 1,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 32,
+            "eos_token_id": 151643,
+        }
+        config = got.ModelConfig.from_dict(params)
+
+        # GOT ends a turn with <|im_end|>, which upstream does not declare.
+        self.assertEqual(config.eos_token_id, [151643, 151645])
+        # Written back, because load_model reapplies the raw dict afterwards.
+        self.assertEqual(params["eos_token_id"], [151643, 151645])
+
+    def test_got_prompt_matches_reference_conversation(self):
+        from mlx_vlm.models.got.processing_got import build_got_prompt
+
+        prompt = build_got_prompt("OCR: ")
+
+        self.assertTrue(prompt.startswith("<|im_start|>system\n"))
+        self.assertIn("<img>" + "<imgpad>" * 256 + "</img>\nOCR: ", prompt)
+        self.assertTrue(prompt.endswith("<|im_end|><|im_start|>assistant\n"))
+        # An already wrapped prompt is passed through untouched.
+        self.assertEqual(build_got_prompt(prompt), prompt)
+        # Without an image there are no patch tokens.
+        self.assertNotIn("<imgpad>", build_got_prompt("OCR: ", has_image=False))
+
+    def test_got_vision_produces_one_token_per_downsampled_patch(self):
+        from mlx_vlm.models import got
+
+        config = self._got_tiny_config()
+        vision_tower = got.Model(config).vision_tower
+
+        # 32/16 = 2x2 patches, then two stride-2 convs -> 1x1 grid.
+        out = vision_tower(mx.zeros((1, 32, 32, 3)))
+        self.assertEqual(out.shape, (1, 1, config.vision_config.out_dim))
 
     def test_paddleocr_vl_text_only_clears_mrope_state(self):
         from mlx_vlm.models import paddleocr_vl
@@ -9082,11 +12811,8 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
             key = f"thinker.audio_tower.{local_key}"
 
-            sanitized = model.sanitize({key: mx.zeros(source_shape)})
+            sanitized = assert_sanitize_idempotent(model, {key: mx.zeros(source_shape)})
             self.assertEqual(sanitized[key].shape, target_shape)
-
-            resanitized = model.sanitize(dict(sanitized))
-            self.assertEqual(resanitized[key].shape, target_shape)
 
             already_mlx = model.sanitize({key: mx.zeros(target_shape)})
             self.assertEqual(already_mlx[key].shape, target_shape)
@@ -9140,11 +12866,8 @@ class TestGetInputEmbeddings(unittest.TestCase):
                 continue
 
             key = f"code2wav.{local_key}"
-            sanitized = model.sanitize({key: mx.zeros(source_shape)})
+            sanitized = assert_sanitize_idempotent(model, {key: mx.zeros(source_shape)})
             self.assertEqual(sanitized[key].shape, target_shape)
-
-            resanitized = model.sanitize(dict(sanitized))
-            self.assertEqual(resanitized[key].shape, target_shape)
 
             already_mlx = model.sanitize({key: mx.zeros(target_shape)})
             self.assertEqual(already_mlx[key].shape, target_shape)
@@ -10654,6 +14377,70 @@ class TestSam3(unittest.TestCase):
         self.assertEqual(cos.shape, (64, 64))
         self.assertEqual(sin.shape, (64, 64))
 
+    def test_sam3_decoder_two_layer_mlps_have_no_output_activation(self):
+        """RefPointHead and BoxRPBEmbed mirror the reference 2-layer MLP.
+
+        The reference applies ReLU only between the layers, so a ReLU on the
+        output would clamp query_pos and the RPB deltas to non-negative values.
+        """
+        from mlx_vlm.models.sam3.decoder import BoxRPBEmbed, RefPointHead
+
+        hidden = 8
+        head = RefPointHead(hidden)
+        head.layer1.weight = mx.zeros((hidden, hidden * 2))
+        head.layer1.bias = mx.ones((hidden,))
+        head.layer2.weight = mx.eye(hidden) * -1.0
+        head.layer2.bias = mx.zeros((hidden,))
+        out = head(mx.zeros((1, 3, hidden * 2)))
+        mx.eval(out)
+        self.assertTrue(float(out.min()) < 0.0)
+        self.assertTrue(mx.allclose(out, -mx.ones_like(out), atol=1e-6).item())
+
+        rpb = BoxRPBEmbed(num_heads=hidden, hidden_size=hidden)
+        rpb.layer1.weight = mx.zeros((hidden, 2))
+        rpb.layer1.bias = mx.ones((hidden,))
+        rpb.layer2.weight = mx.eye(hidden) * -1.0
+        rpb.layer2.bias = mx.zeros((hidden,))
+        out = rpb(mx.zeros((1, 2, 2)))
+        mx.eval(out)
+        self.assertTrue(float(out.min()) < 0.0)
+
+    def test_sam3_global_rope_uses_window_scaled_grid(self):
+        """Global-attention RoPE keeps the window-sized coordinate stride.
+
+        HF derives ``rotary_scale = window_size / rotary_input_size[0]``, which is
+        1.0 for windowed blocks and ``window_size / feat_size`` for global ones.
+        Dropping it makes global-block positions advance too fast.
+        """
+        from mlx_vlm.models.sam3.position import compute_axial_cis
+
+        dim, feat_size, window_size = 64, 6, 2
+        scale = window_size / feat_size
+
+        scaled_cos, scaled_sin = compute_axial_cis(
+            dim, feat_size, feat_size, scale=scale
+        )
+        unit_cos, unit_sin = compute_axial_cis(dim, feat_size, feat_size)
+
+        default_cos, default_sin = compute_axial_cis(
+            dim, feat_size, feat_size, scale=1.0
+        )
+        self.assertTrue(mx.array_equal(default_cos, unit_cos).item())
+        self.assertTrue(mx.array_equal(default_sin, unit_sin).item())
+
+        self.assertFalse(mx.allclose(scaled_cos, unit_cos, atol=1e-6).item())
+
+        freqs = 1.0 / (10000.0 ** (mx.arange(0, dim, 4).astype(mx.float32) / dim))
+        flat = mx.arange(feat_size * feat_size)
+        xs = (flat % feat_size).astype(mx.float32) * scale
+        ys = (flat // feat_size).astype(mx.float32) * scale
+        angles = mx.concatenate(
+            [xs[:, None] * freqs[None, :], ys[:, None] * freqs[None, :]], axis=-1
+        )
+        angles = mx.stack([angles, angles], axis=-1).reshape(angles.shape[0], -1)
+        self.assertTrue(mx.allclose(scaled_cos, mx.cos(angles), atol=1e-6).item())
+        self.assertTrue(mx.allclose(scaled_sin, mx.sin(angles), atol=1e-6).item())
+
 
 class TestRTDetrV2(unittest.TestCase):
     def test_config_from_dict(self):
@@ -11082,6 +14869,75 @@ class TestQwen35NormSanitization(unittest.TestCase):
         self.assertTrue(mx.allclose(out[self._MLX_KEY], mx.zeros(4)).item())
 
 
+class TestQwen38FP8(unittest.TestCase):
+    def test_released_architecture_uses_qwen3_5_path(self):
+        from mlx_vlm.models import qwen3_5
+        from mlx_vlm.utils import get_model_and_args
+
+        released_config = {
+            "model_type": "qwen3_5",
+            "image_token_id": 248056,
+            "video_token_id": 248057,
+            "vision_start_token_id": 248053,
+            "vision_end_token_id": 248054,
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 5120,
+                "intermediate_size": 17408,
+                "linear_num_value_heads": 48,
+                "linear_num_key_heads": 16,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "num_hidden_layers": 64,
+                "num_attention_heads": 24,
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 248320,
+                "num_key_value_heads": 4,
+                "max_position_embeddings": 262144,
+                "head_dim": 256,
+                "eos_token_id": 248044,
+                "rope_parameters": {
+                    "rope_type": "default",
+                    "mrope_interleaved": True,
+                    "mrope_section": [11, 11, 10],
+                    "rope_theta": 10000000,
+                    "partial_rotary_factor": 0.25,
+                },
+                "full_attention_interval": 4,
+                "mtp_num_hidden_layers": 1,
+            },
+            "vision_config": {
+                "model_type": "qwen3_5",
+                "depth": 27,
+                "hidden_size": 1152,
+                "out_hidden_size": 5120,
+                "patch_size": 16,
+                "deepstack_visual_indexes": [],
+            },
+            "quantization_config": {
+                "activation_scheme": "dynamic",
+                "fmt": "e4m3",
+                "quant_method": "fp8",
+                "weight_block_size": [128, 128],
+            },
+        }
+
+        model_module, model_type = get_model_and_args(released_config)
+        config = qwen3_5.ModelConfig.from_dict(released_config)
+
+        self.assertIs(model_module, qwen3_5)
+        self.assertEqual(model_type, "qwen3_5")
+        self.assertEqual(config.text_config.hidden_size, 5120)
+        self.assertEqual(config.text_config.num_hidden_layers, 64)
+        self.assertEqual(config.text_config.head_dim, 256)
+        self.assertEqual(config.vision_config.depth, 27)
+        self.assertEqual(config.vision_config.out_hidden_size, 5120)
+        self.assertEqual(config.eos_token_id, [248044, 248046])
+        self.assertEqual(config.quantization_config["quant_method"], "fp8")
+        self.assertEqual(config.quantization_config["weight_block_size"], [128, 128])
+
+
 class TestQwen35StructuredOutputMaskWidth(unittest.TestCase):
     """Structured output must not be capped at the tokenizer vocab width (#1797).
 
@@ -11119,7 +14975,7 @@ class TestQwen35StructuredOutputMaskWidth(unittest.TestCase):
         return self._mask(rows, (self.VOCAB + 31) // 32)
 
     def test_pad_widens_mask_and_disallows_padding_rows(self):
-        from mlx_vlm.models.qwen3_5.language import _pad_token_mask_to_head
+        from mlx_vlm.models.qwen3_5.speculative_verifier import _pad_token_mask_to_head
 
         narrow = self._narrow()
         padded = _pad_token_mask_to_head(narrow, self.N)
@@ -11130,13 +14986,15 @@ class TestQwen35StructuredOutputMaskWidth(unittest.TestCase):
         self.assertTrue(mx.all(padded[:, narrow.shape[1] :] == 0).item())
 
     def test_pad_is_noop_when_already_wide_enough(self):
-        from mlx_vlm.models.qwen3_5.language import _pad_token_mask_to_head
+        from mlx_vlm.models.qwen3_5.speculative_verifier import _pad_token_mask_to_head
 
         wide = self._mask(1, (self.N + 31) // 32)
         self.assertIs(_pad_token_mask_to_head(wide, self.N), wide)
 
     def test_narrow_mask_still_rejected(self):
-        from mlx_vlm.models.qwen3_5.language import _target_verify_quantized_argmax
+        from mlx_vlm.models.qwen3_5.speculative_verifier import (
+            _target_verify_quantized_argmax,
+        )
 
         head = self._head()
         x = mx.zeros((1, 1, self.K), dtype=mx.bfloat16)
@@ -11144,7 +15002,7 @@ class TestQwen35StructuredOutputMaskWidth(unittest.TestCase):
             _target_verify_quantized_argmax(head, x, token_mask=self._narrow())
 
     def test_padded_mask_samples_within_the_real_vocabulary(self):
-        from mlx_vlm.models.qwen3_5.language import (
+        from mlx_vlm.models.qwen3_5.speculative_verifier import (
             _pad_token_mask_to_head,
             _target_verify_quantized_argmax,
         )
@@ -11168,7 +15026,7 @@ class TestQwen35StructuredOutputMaskWidth(unittest.TestCase):
         self.assertEqual(token, int(expected.reshape(-1)[0]))
 
     def test_padded_mask_handles_multi_row_batch(self):
-        from mlx_vlm.models.qwen3_5.language import (
+        from mlx_vlm.models.qwen3_5.speculative_verifier import (
             _pad_token_mask_to_head,
             _target_verify_quantized_argmax,
         )
@@ -12258,6 +16116,110 @@ class TestGptOssMixedQuant(unittest.TestCase):
         self.assertTrue(hasattr(q_proj, "biases"))
 
 
+class TestRerankerLoader(unittest.TestCase):
+    def test_identifies_sequence_classifier_architectures(self):
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        architectures = [
+            "BertForSequenceClassification",
+            "ModernBertForSequenceClassification",
+            "XLMRobertaForSequenceClassification",
+        ]
+        for architecture in architectures:
+            with self.subTest(architecture=architecture):
+                self.assertTrue(
+                    reranker_loader.is_sequence_classifier_config(
+                        {"architectures": [architecture]}
+                    )
+                )
+
+    def test_loads_supported_native_sequence_classifier(self):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        for model_type in ("bert", "modernbert", "xlm-roberta"):
+            with self.subTest(model_type=model_type):
+                config = {
+                    "architectures": ["ExampleForSequenceClassification"],
+                    "model_type": model_type,
+                    "num_labels": 1,
+                }
+                sentinel = object()
+                captured = {}
+
+                def fake_load_encoder_model(model_path, **kwargs):
+                    captured["model_path"] = model_path
+                    captured.update(kwargs)
+                    return sentinel
+
+                with patch.object(
+                    reranker_loader,
+                    "load_encoder_model",
+                    side_effect=fake_load_encoder_model,
+                ):
+                    model = reranker_loader.load_sequence_classification_model(
+                        Path("model"), config=config
+                    )
+
+                self.assertIs(model, sentinel)
+                self.assertEqual(
+                    captured["model_class_name"], "SequenceClassificationModel"
+                )
+                self.assertEqual(captured["config"], config)
+                self.assertEqual(captured["config_overrides"], {"num_labels": 1})
+
+    def test_rejects_multi_label_sequence_classifier(self):
+        from pathlib import Path
+
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        config = {
+            "architectures": ["BertForSequenceClassification"],
+            "model_type": "bert",
+            "num_labels": 2,
+        }
+
+        with self.assertRaisesRegex(ValueError, "exactly one output label"):
+            reranker_loader.load_sequence_classification_model(
+                Path("model"), config=config
+            )
+
+    def test_rejects_unsupported_sequence_classifier_family(self):
+        from pathlib import Path
+
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        config = {
+            "architectures": ["DebertaV2ForSequenceClassification"],
+            "model_type": "deberta-v2",
+            "num_labels": 1,
+        }
+
+        with self.assertRaisesRegex(ValueError, "Unsupported reranker model type"):
+            reranker_loader.load_sequence_classification_model(
+                Path("model"), config=config
+            )
+
+    def test_rejects_embedding_checkpoint_as_reranker(self):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        config = {
+            "architectures": ["BertModel"],
+            "model_type": "bert",
+        }
+        with (
+            patch.object(reranker_loader, "get_model_path", return_value=Path("model")),
+            patch.object(reranker_loader, "load_config", return_value=config),
+            self.assertRaisesRegex(ValueError, "sequence-classification checkpoints"),
+        ):
+            reranker_loader.load_reranker("embedding-model")
+
+
 class TestBert(unittest.TestCase):
     def test_bert_embedding_forward(self):
         from mlx_vlm.models import bert
@@ -12281,6 +16243,52 @@ class TestBert(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+    def test_bert_sequence_classification_forward(self):
+        from mlx_vlm.models import bert
+
+        config = bert.ModelConfig(
+            model_type="bert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = bert.SequenceClassificationModel(config)
+        output = model(
+            mx.array(np.random.randint(0, config.vocab_size, (2, 5))),
+            attention_mask=mx.ones((2, 5)),
+            token_type_ids=mx.zeros((2, 5), dtype=mx.int32),
+        )
+
+        self.assertEqual(output.logits.shape, (2, 1))
+
+    def test_bert_sequence_classifier_sanitize_keeps_head(self):
+        from mlx_vlm.models import bert
+
+        config = bert.ModelConfig(
+            model_type="bert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = bert.SequenceClassificationModel(config)
+        weights = model.sanitize(
+            {
+                "bert.embeddings.word_embeddings.weight": mx.zeros((99, 32)),
+                "bert.pooler.dense.weight": mx.zeros((32, 32)),
+                "classifier.weight": mx.zeros((1, 32)),
+            }
+        )
+
+        self.assertIn("embeddings.word_embeddings.weight", weights)
+        self.assertIn("pooler.dense.weight", weights)
+        self.assertIn("classifier.weight", weights)
 
 
 class TestXLMRoberta(unittest.TestCase):
@@ -12307,6 +16315,51 @@ class TestXLMRoberta(unittest.TestCase):
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
 
+    def test_xlm_roberta_sequence_classification_forward(self):
+        from mlx_vlm.models import xlm_roberta
+
+        config = xlm_roberta.ModelConfig(
+            model_type="xlm_roberta",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = xlm_roberta.SequenceClassificationModel(config)
+        output = model(
+            mx.array(np.random.randint(2, config.vocab_size, (2, 5))),
+            attention_mask=mx.ones((2, 5)),
+        )
+
+        self.assertEqual(output.logits.shape, (2, 1))
+
+    def test_xlm_roberta_sequence_classifier_sanitize_keeps_head(self):
+        from mlx_vlm.models import xlm_roberta
+
+        config = xlm_roberta.ModelConfig(
+            model_type="xlm_roberta",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = xlm_roberta.SequenceClassificationModel(config)
+        weights = model.sanitize(
+            {
+                "roberta.embeddings.word_embeddings.weight": mx.zeros((99, 32)),
+                "classifier.dense.weight": mx.zeros((32, 32)),
+                "classifier.out_proj.weight": mx.zeros((1, 32)),
+            }
+        )
+
+        self.assertIn("embeddings.word_embeddings.weight", weights)
+        self.assertIn("classifier.dense.weight", weights)
+        self.assertIn("classifier.out_proj.weight", weights)
+
 
 class TestModernBert(unittest.TestCase):
     def test_modernbert_embedding_forward(self):
@@ -12332,6 +16385,52 @@ class TestModernBert(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+    def test_modernbert_sequence_classification_forward(self):
+        from mlx_vlm.models import modernbert
+
+        config = modernbert.ModelConfig(
+            model_type="modernbert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=3,
+            intermediate_size=48,
+            num_attention_heads=4,
+            global_attn_every_n_layers=2,
+            local_attention=8,
+            classifier_pooling="mean",
+        )
+        model = modernbert.SequenceClassificationModel(config)
+        output = model(
+            mx.array(np.random.randint(0, config.vocab_size, (2, 6))),
+            attention_mask=mx.array([[1, 1, 1, 1, 1, 1], [1, 1, 1, 0, 0, 0]]),
+        )
+
+        self.assertEqual(output.logits.shape, (2, 1))
+
+    def test_modernbert_sequence_classifier_sanitize_keeps_head(self):
+        from mlx_vlm.models import modernbert
+
+        config = modernbert.ModelConfig(
+            model_type="modernbert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=1,
+            intermediate_size=48,
+            num_attention_heads=4,
+        )
+        model = modernbert.SequenceClassificationModel(config)
+        weights = model.sanitize(
+            {
+                "model.embeddings.tok_embeddings.weight": mx.zeros((99, 32)),
+                "head.dense.weight": mx.zeros((32, 32)),
+                "classifier.weight": mx.zeros((1, 32)),
+            }
+        )
+
+        self.assertIn("embeddings.tok_embeddings.weight", weights)
+        self.assertIn("head.dense.weight", weights)
+        self.assertIn("classifier.weight", weights)
 
 
 class TestQwen3Embedding(unittest.TestCase):
@@ -12428,6 +16527,789 @@ class TestLfm2Embedding(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestMoEOffload(unittest.TestCase):
+    """Repacks a real (tiny) checkpoint via mlx-vlm's own save_weights/
+    nn.quantize path and confirms the offloaded model matches resident.
+    2% relative tolerance: batched vs. looped matmul differs by ~1e-3
+    relative from GEMM reduction order alone, not a bug."""
+
+    def _tiny_deepseek_v3_config(self):
+        from mlx_vlm.models import deepseek_v3
+
+        return deepseek_v3.ModelConfig(
+            model_type="deepseek_v3",
+            vocab_size=256,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=128,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=16,
+            q_lora_rank=24,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+            topk_method="noaux_tc",
+            scoring_func="sigmoid",
+            norm_topk_prob=True,
+            n_group=2,
+            topk_group=1,
+            num_experts_per_tok=2,
+            moe_layer_freq=1,
+            first_k_dense_replace=1,
+            max_position_embeddings=256,
+            rms_norm_eps=1e-5,
+            rope_scaling=None,
+            attention_bias=False,
+        )
+
+    def _build_and_repack(self, tmp_dir, quantize):
+        import dataclasses
+        import json
+        import os
+        from pathlib import Path
+
+        from mlx_vlm.models import deepseek_v3
+        from mlx_vlm.moe_offload import repack
+        from mlx_vlm.utils import save_weights
+
+        config = self._tiny_deepseek_v3_config()
+        model = deepseek_v3.Model(config)
+        mx.eval(model.parameters())
+
+        group_size, bits = 32, 4
+        if quantize:
+
+            def only_switch_mlp(path, module):
+                return "switch_mlp" in path and hasattr(module, "to_quantized")
+
+            nn.quantize(
+                model,
+                group_size=group_size,
+                bits=bits,
+                class_predicate=only_switch_mlp,
+            )
+            mx.eval(model.parameters())
+
+        build = os.path.join(tmp_dir, "build")
+        offload = os.path.join(tmp_dir, "offload")
+        save_weights(build, model)
+
+        cfg_dict = dataclasses.asdict(config)
+        if quantize:
+            cfg_dict["quantization"] = {
+                "group_size": group_size,
+                "bits": bits,
+                "mode": "affine",
+            }
+        with open(os.path.join(build, "config.json"), "w") as f:
+            json.dump(cfg_dict, f)
+
+        repack(build, offload)
+        return Path(build), Path(offload)
+
+    def _assert_offload_matches_resident(self, quantize, seq_len=6):
+        import shutil
+        import tempfile
+
+        from mlx_vlm.utils import load_model
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            build, offload = self._build_and_repack(tmp_dir, quantize)
+
+            prompt = mx.array([[(i % 250) + 1 for i in range(seq_len)]])
+
+            resident_model = load_model(build)
+            logits_resident = resident_model(prompt).logits
+            mx.eval(logits_resident)
+
+            offload_model = load_model(offload)
+            store = getattr(offload_model, "moe_offload_store", None)
+            self.assertIsNotNone(store, "load_model did not auto-patch the offload dir")
+            self.assertEqual(store.swapped, 2)  # first_k_dense_replace=1, 3 layers
+
+            logits_offload = offload_model(prompt).logits
+            mx.eval(logits_offload)
+
+            diff = mx.abs(logits_resident - logits_offload).max().item()
+            rel = diff / float(mx.abs(logits_resident).max())
+            self.assertLess(rel, 0.02, f"offloaded output diverged: {rel:.4f} relative")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_offload_matches_resident_quantized(self):
+        self._assert_offload_matches_resident(quantize=True)
+
+    def test_offload_matches_resident_unquantized(self):
+        self._assert_offload_matches_resident(quantize=False)
+
+    def test_offload_matches_resident_quantized_many_tokens(self):
+        """num_experts_per_tok=2 x seq_len=40 = 80 flat (token, slot) pairs,
+        with far more repeated/duplicated per-token rows across experts than
+        the other resident-parity tests (6 tokens x 2 = 12) exercise -- this
+        combination is exactly what caught a real bug during development
+        (mx.gather_mm's sorted_indices=True silently returning wrong results
+        once a batch has duplicated source rows, which every token
+        contributing K rows guarantees here)."""
+        self._assert_offload_matches_resident(quantize=True, seq_len=40)
+
+    def test_offload_matches_resident_unquantized_many_tokens(self):
+        self._assert_offload_matches_resident(quantize=False, seq_len=40)
+
+    def test_offload_resolves_per_projection_quantization_override(self):
+        """mlx-vlm's mixed-precision recipes can give down_proj different
+        bits than gate_proj/up_proj within one layer; patch_model must
+        resolve group_size/bits/mode per projection, not one uniform triple."""
+        import dataclasses
+        import json
+        import os
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models import deepseek_v3
+        from mlx_vlm.moe_offload import repack
+        from mlx_vlm.utils import load_model, save_weights
+
+        config = self._tiny_deepseek_v3_config()
+        model = deepseek_v3.Model(config)
+        mx.eval(model.parameters())
+
+        # 4 vs 8 bits: far enough apart that a wrong-bits bug isn't mistakable for noise.
+        def mixed_predicate(path, module):
+            if not (hasattr(module, "to_quantized") and "switch_mlp" in path):
+                return False
+            if path.endswith("down_proj"):
+                return {"group_size": 32, "bits": 8}
+            return {"group_size": 32, "bits": 4}
+
+        nn.quantize(model, group_size=32, bits=4, class_predicate=mixed_predicate)
+        mx.eval(model.parameters())
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            build = Path(os.path.join(tmp_dir, "build"))
+            offload = Path(os.path.join(tmp_dir, "offload"))
+            save_weights(build, model)
+
+            cfg_dict = dataclasses.asdict(config)
+            cfg_dict["quantization"] = {
+                "group_size": 32,
+                "bits": 4,
+                "mode": "affine",
+                "language_model.model.layers.1.mlp.switch_mlp.down_proj": {
+                    "group_size": 32,
+                    "bits": 8,
+                },
+                "language_model.model.layers.2.mlp.switch_mlp.down_proj": {
+                    "group_size": 32,
+                    "bits": 8,
+                },
+            }
+            with open(build / "config.json", "w") as f:
+                json.dump(cfg_dict, f)
+
+            repack(str(build), str(offload))
+
+            prompt = mx.array([[1, 2, 3, 4, 5, 6]])
+            logits_resident = load_model(build)(prompt).logits
+            mx.eval(logits_resident)
+
+            offload_model = load_model(offload)
+            switch_mlp = offload_model.language_model.model.layers[1].mlp.switch_mlp
+            self.assertEqual(switch_mlp.gate_quant, (32, 4, "affine"))
+            self.assertEqual(switch_mlp.up_quant, (32, 4, "affine"))
+            self.assertEqual(
+                switch_mlp.down_quant,
+                (32, 8, "affine"),
+                "down_proj's per-path override (8 bits) was not resolved -- "
+                "got the layer's default (4 bits) instead",
+            )
+
+            logits_offload = offload_model(prompt).logits
+            mx.eval(logits_offload)
+            diff = mx.abs(logits_resident - logits_offload).max().item()
+            rel = diff / float(mx.abs(logits_resident).max())
+            self.assertLess(
+                rel, 0.02, f"mixed-precision offload output diverged: {rel:.4f}"
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_patch_model_raises_on_empty_offload_dir(self):
+        """A malformed offload dir (index present, no expert files) must
+        fail loudly via patch_model, not silently load fully resident."""
+        import json
+        import os
+        import shutil
+        import tempfile
+
+        import mlx.nn as nn_mod
+
+        from mlx_vlm.moe_offload import patch_model
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(tmp_dir, "experts"))  # present but empty
+            json.dump(
+                {"layers": [], "num_experts": 4},
+                open(os.path.join(tmp_dir, "offload_index.json"), "w"),
+            )
+            json.dump({}, open(os.path.join(tmp_dir, "config.json"), "w"))
+
+            with self.assertRaises(ValueError):
+                patch_model(nn_mod.Module(), tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_repack_raises_on_insufficient_disk_headroom(self):
+        """repack() must refuse up front when free space can't cover source
+        + growing offload dir coexisting, rather than fail mid-write with a
+        partially-corrupted offload dir."""
+        import os
+        import shutil
+        import tempfile
+        from unittest import mock
+
+        from mlx_vlm.moe_offload import repack
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            build = os.path.join(tmp_dir, "build")
+            offload = os.path.join(tmp_dir, "offload")
+            os.makedirs(build)
+            with open(
+                os.path.join(build, "model-00001-of-00001.safetensors"), "wb"
+            ) as f:
+                f.write(b"\0" * 1024)
+
+            fake_usage = shutil.disk_usage(tmp_dir)._replace(free=0)
+            with mock.patch(
+                "mlx_vlm.moe_offload.shutil.disk_usage", return_value=fake_usage
+            ):
+                with self.assertRaises(ValueError):
+                    repack(build, offload)
+            self.assertFalse(
+                os.path.exists(
+                    os.path.join(offload, "experts", "layer_0000.safetensors")
+                )
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_patch_model_skips_wrong_expert_count(self):
+        """A SwitchGLU-family module whose expert count doesn't match the
+        store (e.g. always-on shared experts modeled as their own switch
+        layer) must stay resident, not get offloaded and collide indices."""
+        from mlx_vlm.models.switch_layers import SwitchGLU
+        from mlx_vlm.moe_offload import _n_experts
+
+        four_experts = SwitchGLU(16, 32, 4)
+        eight_experts = SwitchGLU(16, 32, 8)
+        mx.eval(four_experts.parameters(), eight_experts.parameters())
+
+        self.assertEqual(_n_experts(four_experts), 4)
+        self.assertEqual(_n_experts(eight_experts), 8)
+
+    def test_plan_partitions_stacked_and_shared_experts(self):
+        from mlx_vlm.moe_offload import plan
+
+        names = [
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight",
+            "language_model.model.layers.1.mlp.switch_mlp.gate_proj.scales",
+            "language_model.model.layers.1.mlp.shared_experts.gate_proj.weight",
+            "language_model.model.layers.2.mlp.experts.3.gate_proj.weight",
+        ]
+        result = plan(names)
+
+        self.assertIn(
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            result["resident"],
+        )
+        self.assertIn(
+            "language_model.model.layers.1.mlp.shared_experts.gate_proj.weight",
+            result["resident"],
+        )
+        self.assertEqual(result["layers"], [1, 2])
+        stacked_entries = result["experts"][1]
+        self.assertEqual(stacked_entries[0][2], "STACK")
+        perexpert_entries = result["experts"][2]
+        self.assertEqual(perexpert_entries[0][0], "e3.gate_proj.weight")
+
+    def test_plan_partitions_fused_gate_up_proj(self):
+        from mlx_vlm.moe_offload import plan
+
+        names = [
+            "language_model.model.layers.3.mlp.switch_mlp.gate_up_proj.weight",
+            "language_model.model.layers.3.mlp.switch_mlp.gate_up_proj.scales",
+            "language_model.model.layers.3.mlp.switch_mlp.down_proj.weight",
+        ]
+        result = plan(names)
+
+        self.assertEqual(result["layers"], [3])
+        modes = {mode for _, _, mode in result["experts"][3]}
+        self.assertEqual(modes, {"STACK_FUSED", "STACK"})
+
+    def test_expert_store_get_is_thread_safe(self):
+        """get() reads only immutable post-init state (no LRU cache -- removed
+        after measuring a 0% hit rate for single-request serving), so
+        concurrent calls need no locking. Verify under real concurrent
+        pressure: no exception, and every returned value matches a
+        single-threaded reference call for the same (layer, expert)."""
+        import shutil
+        import tempfile
+        import threading
+
+        from mlx_vlm.moe_offload import ExpertStore
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            build, offload = self._build_and_repack(tmp_dir, quantize=True)
+            store = ExpertStore(str(offload))
+            reference = {
+                (layer, j): store.get(layer, j) for layer in (1, 2) for j in range(4)
+            }
+
+            n_threads, n_iters = 8, 200
+            errors = []
+            # mx.load()'s mmap'd arrays can only be *evaluated* from the
+            # thread that loaded them (a pre-existing mx.load() constraint,
+            # not this store's), so workers only collect unevaluated results
+            # -- get() itself is pure dict access, no eval -- and every
+            # value check happens on the main thread after joining.
+            results = [[] for _ in range(n_threads)]
+
+            def worker(tid):
+                for i in range(n_iters):
+                    layer, j = 1 + (i % 2), (i + tid) % 4
+                    try:
+                        val = store.get(layer, j)
+                        assert len(val) == 3
+                        results[tid].append(((layer, j), val))
+                    except Exception as e:
+                        errors.append(e)
+                        return
+
+            threads = [
+                threading.Thread(target=worker, args=(t,)) for t in range(n_threads)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(errors, [])
+            self.assertEqual(sum(len(r) for r in results), n_threads * n_iters)
+            for thread_results in results:
+                for key, val in thread_results:
+                    want = reference[key]
+                    for got, want_trip in zip(val, want):
+                        for g, w in zip(got, want_trip):
+                            self.assertEqual(g is None, w is None)
+                            if g is not None:
+                                self.assertTrue(mx.array_equal(g, w))
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_fused_switch_layer_offloads_correctly(self):
+        """Laguna/MiniMax-M3-VL use a fused gate_up_proj instead of separate
+        gate_proj/up_proj; confirm the repack-time split reconstructs it."""
+        import json
+        import os
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.laguna.language import LagunaPackedSwitchGLU
+        from mlx_vlm.moe_offload import repack
+        from mlx_vlm.utils import save_weights
+
+        class FusedMLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.switch_mlp = LagunaPackedSwitchGLU(32, 64, 4)
+
+        class InnerModel(nn.Module):
+            """Named ``model`` so paths read ``model.layers.N...``, matching
+            the ``\\.layers\\.`` regex repack()/patch_model() rely on."""
+
+            def __init__(self):
+                super().__init__()
+                self.router = nn.Linear(32, 4, bias=False)
+                self.layers = [FusedMLP()]
+
+        class FusedTestModel(nn.Module):
+            """One MoE layer, fused switch_mlp, top-2-of-4 routing."""
+
+            def __init__(self, config):
+                super().__init__()
+                self.config = config
+                self.model_type = "fused_test_model"
+                self.model = InnerModel()
+
+            def __call__(self, x):
+                g = self.model.router(x)
+                indices = mx.argsort(-g, axis=-1)[..., :2].astype(mx.uint32)
+                weights = mx.softmax(mx.take_along_axis(g, indices, axis=-1), axis=-1)
+                y = self.model.layers[0].switch_mlp(x, indices)
+                return (y * weights[..., None]).sum(-2)
+
+        model = FusedTestModel({"model_type": "fused_test_model"})
+        mx.eval(model.parameters())
+
+        group_size, bits = 32, 4
+        nn.quantize(
+            model,
+            group_size=group_size,
+            bits=bits,
+            class_predicate=lambda p, m: "switch_mlp" in p
+            and hasattr(m, "to_quantized"),
+        )
+        mx.eval(model.parameters())
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            build = Path(os.path.join(tmp_dir, "build"))
+            offload = Path(os.path.join(tmp_dir, "offload"))
+            save_weights(build, model)
+            json.dump(
+                {
+                    "model_type": "fused_test_model",
+                    "quantization": {
+                        "group_size": group_size,
+                        "bits": bits,
+                        "mode": "affine",
+                    },
+                },
+                open(build / "config.json", "w"),
+            )
+            repack(str(build), str(offload))
+
+            x = mx.random.normal((3, 32))
+            mx.eval(x)
+
+            resident_out = model(x)
+            mx.eval(resident_out)
+
+            # Patch the already-loaded resident model directly, skipping
+            # load_model's full model-registry plumbing for this test-only class.
+            from mlx_vlm.moe_offload import patch_model
+
+            store = patch_model(model, str(offload))
+            self.assertEqual(store.swapped, 1)
+            offload_out = model(x)
+            mx.eval(offload_out)
+
+            diff = mx.abs(resident_out - offload_out).max().item()
+            rel = diff / float(mx.abs(resident_out).max())
+            self.assertLess(
+                rel, 0.02, f"fused switch layer offload diverged: {rel:.4f}"
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_offloaded_switch_glu_uses_the_original_activation_object(self):
+        """Must call the same activation object the original SwitchGLU
+        held, not reimplement silu(gate)*x inline (a real divergence was
+        found on gpt-oss-20b-MXFP4-Q8); swap in a non-silu activation."""
+        from mlx_vlm.models.switch_layers import OffloadedSwitchGLU
+
+        class NegateGateActivation:
+            def __call__(self, x, gate):
+                return -gate * x
+
+        class FakeStore:
+            def __init__(self, gw, uw, dw):
+                self.gw, self.uw, self.dw = gw, uw, dw
+                self.num_experts = 4
+
+            def get(self, layer_id, j):
+                return (
+                    (self.gw, None, None),
+                    (self.uw, None, None),
+                    (self.dw, None, None),
+                )
+
+        D, H = 4, 6
+        gw = mx.random.normal((H, D))
+        uw = mx.random.normal((H, D))
+        dw = mx.random.normal((D, H))
+        mx.eval(gw, uw, dw)
+
+        x = mx.random.normal((3, D))
+        indices = mx.array([[0], [0], [0]], dtype=mx.uint32)
+
+        quant = (64, 4, "affine")
+        glu = OffloadedSwitchGLU(
+            FakeStore(gw, uw, dw),
+            layer_id=0,
+            gate_quant=quant,
+            up_quant=quant,
+            down_quant=quant,
+            activation=NegateGateActivation(),
+        )
+        out = glu(x, indices)
+        mx.eval(out)
+
+        x_gate = x @ gw.T
+        x_up = x @ uw.T
+        expected = ((-x_gate * x_up) @ dw.T)[:, None, :]
+        mx.eval(expected)
+
+        self.assertTrue(mx.allclose(out, expected, atol=1e-5).item())
+
+    def test_fused_switch_layer_loads_through_load_model(self):
+        """load_model()'s malformed-offload-dir check only recognized
+        PEREXPERT_RE/STACKED_RE, not STACKED_FUSED_RE -- so a fused
+        gate_up_proj checkpoint (Laguna/MiniMax-M3-VL) repacked correctly
+        still failed to load through the real, documented mlx_vlm.load()
+        path with "malformed repack() output?", even though patch_model()
+        itself handled it fine. Unlike test_fused_switch_layer_offloads_
+        correctly (which calls patch_model() directly, bypassing this
+        check), this goes through load_model() end-to-end."""
+        import dataclasses
+        import json
+        import os
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models import laguna
+        from mlx_vlm.moe_offload import repack
+        from mlx_vlm.utils import load_model, save_weights
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=256,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=16,
+            max_position_embeddings=256,
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=64,
+            shared_expert_intermediate_size=64,
+            mlp_only_layers=[],
+        )
+        model = laguna.Model(config)
+        mx.eval(model.parameters())
+
+        group_size, bits = 32, 4
+
+        def only_switch_mlp(path, module):
+            return "switch_mlp" in path and hasattr(module, "to_quantized")
+
+        nn.quantize(
+            model, group_size=group_size, bits=bits, class_predicate=only_switch_mlp
+        )
+        mx.eval(model.parameters())
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            build = os.path.join(tmp_dir, "build")
+            offload = os.path.join(tmp_dir, "offload")
+            save_weights(build, model)
+            cfg_dict = dataclasses.asdict(config)
+            cfg_dict["quantization"] = {
+                "group_size": group_size,
+                "bits": bits,
+                "mode": "affine",
+            }
+            with open(os.path.join(build, "config.json"), "w") as f:
+                json.dump(cfg_dict, f)
+            repack(build, offload)
+
+            prompt = mx.array([[1, 2, 3, 4, 5, 6]])
+            resident_model = load_model(Path(build))
+            logits_resident = resident_model(prompt).logits
+            mx.eval(logits_resident)
+
+            offload_model = load_model(Path(offload))
+            store = getattr(offload_model, "moe_offload_store", None)
+            self.assertIsNotNone(
+                store, "load_model did not auto-patch the fused offload dir"
+            )
+            self.assertEqual(store.swapped, 2)
+
+            logits_offload = offload_model(prompt).logits
+            mx.eval(logits_offload)
+
+            diff = mx.abs(logits_resident - logits_offload).max().item()
+            rel = diff / float(mx.abs(logits_resident).max())
+            self.assertLess(
+                rel, 0.02, f"fused offload output diverged: {rel:.4f} relative"
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_patch_model_raises_on_missing_expert_layer_file(self):
+        """patch_model()'s only completeness check was the global
+        swapped[0]==0 count -- a single missing/corrupted
+        experts/layer_*.safetensors (partial repack, interrupted transfer)
+        left that one layer un-swapped with no error anywhere, silently
+        running it on random-init weights, so long as at least one other
+        layer swapped fine. Must now raise instead."""
+        import os
+        import shutil
+        import tempfile
+
+        from mlx_vlm.models import deepseek_v3
+        from mlx_vlm.moe_offload import patch_model
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            build, offload = self._build_and_repack(tmp_dir, quantize=True)
+
+            # Corrupt the repack: delete one (of two) MoE layers' expert file.
+            experts_dir = os.path.join(str(offload), "experts")
+            layer_files = sorted(os.listdir(experts_dir))
+            self.assertGreaterEqual(len(layer_files), 2)
+            os.remove(os.path.join(experts_dir, layer_files[0]))
+
+            config = self._tiny_deepseek_v3_config()
+            model = deepseek_v3.Model(config)
+            mx.eval(model.parameters())
+
+            with self.assertRaises(ValueError) as ctx:
+                patch_model(model, str(offload))
+            self.assertIn("missing", str(ctx.exception).lower())
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_repack_sanitizes_raw_mixtral_style_expert_naming(self):
+        """MiniMax's real upstream checkpoint uses Mixtral-style per-expert
+        ``block_sparse_moe.experts.{e}.{w1,w2,w3}.weight`` naming, not the
+        ``experts.{e}.{gate,up,down}_proj.weight`` convention plan() expects
+        directly -- repack() must fall back to the model's own sanitize()
+        (already used for regular, non-offload loading) to normalize it
+        first. Regression coverage for two real bugs caught building that
+        fallback: (1) calling sanitize() on a later layer's tensors alone,
+        with no layer-0 key present at all, silently no-ops for any
+        sanitize() that gates its whole MoE-restructuring block on "is
+        layer 0's raw key present" as a one-shot global probe rather than a
+        true per-layer guard (minimax's does) -- both layers must still be
+        offloaded, not just layer 0; (2) some models put the real
+        restructuring on Model.sanitize() and delegate to LanguageModel from
+        inside it (minimax doesn't even re-export LanguageModel from its
+        __init__.py), so calling only one step misses the other's family."""
+        import dataclasses
+        import json
+        import os
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models import minimax
+        from mlx_vlm.moe_offload import repack
+        from mlx_vlm.utils import load_model, save_weights
+
+        config = minimax.ModelConfig(
+            model_type="minimax_m2",
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            max_position_embeddings=256,
+            num_experts_per_tok=2,
+            num_local_experts=4,
+            shared_intermediate_size=128,
+            num_hidden_layers=2,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            rotary_dim=16,
+            vocab_size=256,
+            head_dim=16,
+        )
+        model = minimax.Model(config)
+        mx.eval(model.parameters())
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            build_prefixed = os.path.join(tmp_dir, "build_prefixed")
+            build_raw = os.path.join(tmp_dir, "build_raw")
+            offload_raw = os.path.join(tmp_dir, "offload_raw")
+
+            save_weights(build_prefixed, model)
+            weights = {}
+            for fn in sorted(os.listdir(build_prefixed)):
+                if fn.endswith(".safetensors"):
+                    weights.update(mx.load(os.path.join(build_prefixed, fn)))
+
+            # Invert LanguageModel.sanitize()'s w1/w2/w3 -> switch_mlp
+            # stacking, to reconstruct MiniMax-M2's genuine raw (Mixtral-
+            # style) upstream checkpoint from this already-canonical model.
+            mapping = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+            raw_weights = {}
+            for k, v in weights.items():
+                handled = False
+                for new_name, orig_name in mapping.items():
+                    suffix = f".block_sparse_moe.switch_mlp.{new_name}.weight"
+                    if k.startswith("language_model.") and suffix in k:
+                        layer_prefix = k[len("language_model.") :].split(
+                            ".block_sparse_moe"
+                        )[0]
+                        for e in range(v.shape[0]):
+                            raw_weights[
+                                f"{layer_prefix}.block_sparse_moe.experts.{e}.{orig_name}.weight"
+                            ] = v[e]
+                        handled = True
+                        break
+                if not handled:
+                    k2 = (
+                        k[len("language_model.") :]
+                        if k.startswith("language_model.")
+                        else k
+                    )
+                    raw_weights[k2] = v
+
+            os.makedirs(build_raw, exist_ok=True)
+            mx.save_safetensors(
+                os.path.join(build_raw, "model.safetensors"), raw_weights
+            )
+            with open(os.path.join(build_raw, "config.json"), "w") as f:
+                json.dump(dataclasses.asdict(config), f)
+
+            repack(build_raw, offload_raw)
+
+            idx = json.load(open(os.path.join(offload_raw, "offload_index.json")))
+            self.assertEqual(
+                idx["layers"],
+                [0, 1],
+                "layer 1 was silently skipped -- sanitize() was only called "
+                "with layer 1's own tensors, tripping a global layer-0 guard",
+            )
+            self.assertEqual(idx["num_experts"], 4)
+
+            prompt = mx.array([[1, 2, 3, 4, 5]])
+            logits_true = model(prompt).logits
+            mx.eval(logits_true)
+
+            offload_model = load_model(Path(offload_raw))
+            store = getattr(offload_model, "moe_offload_store", None)
+            self.assertIsNotNone(
+                store, "load_model did not auto-patch the sanitize-fallback offload dir"
+            )
+            logits_offload = offload_model(prompt).logits
+            mx.eval(logits_offload)
+
+            diff = mx.abs(logits_true - logits_offload).max().item()
+            rel = diff / float(mx.abs(logits_true).max())
+            self.assertLess(
+                rel, 0.02, f"sanitize-fallback offload output diverged: {rel:.4f}"
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 class TestCohereCompass(unittest.TestCase):
@@ -12991,3 +17873,782 @@ class TestCohereCompass(unittest.TestCase):
         processor(text=["short", "longer"], padding=True)
 
         self.assertEqual(processor.tokenizer.last_kwargs["padding_side"], "left")
+
+
+class TestMinistral3Embedding(unittest.TestCase):
+    @staticmethod
+    def _model():
+        from mlx_vlm.models import ministral3_embedding
+
+        config = ministral3_embedding.ModelConfig(
+            model_type="ministral3",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=99,
+            head_dim=8,
+            max_position_embeddings=64,
+            rope_parameters={
+                "rope_theta": 10000.0,
+                "llama_4_scaling_beta": 0.1,
+                "original_max_position_embeddings": 64,
+            },
+        )
+        mx.random.seed(0)
+        return ministral3_embedding.Model(config), config
+
+    @staticmethod
+    def _cosine(a, b):
+        return (a * b).sum() / (mx.linalg.norm(a) * mx.linalg.norm(b))
+
+    def test_ministral3_embedding_forward(self):
+        model, config = self._model()
+
+        batch, seq = 2, 5
+        input_ids = mx.array(np.random.randint(0, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+    def test_ministral3_embedding_attends_to_later_tokens(self):
+        model, _ = self._model()
+        mask = mx.ones((1, 4))
+
+        first = model(mx.array([[1, 2, 3, 4]]), attention_mask=mask)
+        changed = model(mx.array([[1, 2, 3, 42]]), attention_mask=mask)
+
+        # A causal backbone would leave token 0 untouched by a later token.
+        delta = mx.abs(
+            first.last_hidden_state[0, 0] - changed.last_hidden_state[0, 0]
+        ).max()
+        self.assertGreater(delta.item(), 1e-3)
+
+    def test_ministral3_embedding_ignores_masked_positions(self):
+        model, _ = self._model()
+        mask = mx.array([[1.0, 1.0, 1.0, 0.0, 0.0]])
+
+        kept = model(mx.array([[1, 2, 3, 0, 0]]), attention_mask=mask).text_embeds
+        swapped = model(mx.array([[1, 2, 3, 77, 88]]), attention_mask=mask).text_embeds
+
+        self.assertTrue(mx.allclose(kept, swapped, atol=1e-6).item())
+
+    def test_ministral3_embedding_is_invariant_to_padding(self):
+        model, _ = self._model()
+
+        alone = model(mx.array([[1, 2, 3]]), attention_mask=mx.ones((1, 3))).text_embeds
+        padded = model(
+            mx.array([[1, 2, 3, 0, 0]]),
+            attention_mask=mx.array([[1.0, 1.0, 1.0, 0.0, 0.0]]),
+        ).text_embeds
+
+        self.assertGreater(self._cosine(alone[0], padded[0]).item(), 1 - 1e-5)
+
+    def test_ministral3_embedding_is_invariant_to_batch_order(self):
+        model, _ = self._model()
+        input_ids = mx.array([[1, 2, 3], [5, 6, 7]])
+        mask = mx.ones((2, 3))
+
+        out = model(input_ids, attention_mask=mask).text_embeds
+        reversed_out = model(input_ids[::-1], attention_mask=mask).text_embeds
+
+        self.assertGreater(self._cosine(out[0], reversed_out[1]).item(), 1 - 1e-5)
+
+    def test_ministral3_embedding_sanitize_drops_lm_head(self):
+        model, _ = self._model()
+
+        weights = model.sanitize(
+            {
+                "lm_head.weight": mx.zeros((2, 2)),
+                "embed_tokens.weight": mx.zeros((2, 2)),
+                "model.norm.weight": mx.zeros((2,)),
+            }
+        )
+
+        self.assertEqual(
+            sorted(weights), ["model.embed_tokens.weight", "model.norm.weight"]
+        )
+
+    def test_ministral3_is_remapped_to_the_embedding_model(self):
+        from mlx_vlm.embedding_loader import EMBEDDING_MODEL_REMAPPING
+
+        self.assertEqual(
+            EMBEDDING_MODEL_REMAPPING["ministral3"], "ministral3_embedding"
+        )
+
+
+class TestMTPSplit(unittest.TestCase):
+    def _write_source(self, tmp, config, tensors):
+        import json
+        from pathlib import Path
+
+        path = Path(tmp)
+        (path / "config.json").write_text(json.dumps(config))
+        # no mlx metadata -> splitter treats it as an HF source (sanitize path)
+        mx.save_safetensors(str(path / "model.safetensors"), tensors)
+        return str(path)
+
+    def test_registry_resolves_all_families(self):
+        from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
+        from mlx_vlm.utils import get_model_and_args
+
+        expected = {
+            "qwen3_5": "qwen3_5_mtp",
+            "qwen3_5_moe": "qwen3_5_mtp",
+            "deepseek_v4": "deepseek_v4_mtp",
+            "glm4_moe_lite": "glm4_moe_lite_mtp",
+            "glm_moe_dsa": "glm_moe_dsa_mtp",
+            "inkling_mm_model": "inkling_mtp",
+        }
+        for base, out_type in expected.items():
+            splitter = get_mtp_splitter(base)
+            self.assertIsNotNone(splitter)
+            self.assertEqual(splitter.output_model_type, out_type)
+        drafter_module, model_type = get_model_and_args(
+            {"model_type": "glm_moe_dsa_mtp"}
+        )
+        self.assertEqual(model_type, "glm_moe_dsa_mtp")
+        self.assertTrue(hasattr(drafter_module, "GlmMoeDsaMTPDraftModel"))
+        self.assertIsNone(get_mtp_splitter("not_a_model"))
+
+    def test_qwen_split_strips_prefix_and_shifts_norm(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
+
+        norm = mx.random.normal((8,))
+        qproj = mx.random.normal((8, 8))
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            src = self._write_source(
+                tmp,
+                {
+                    "model_type": "qwen3_5",
+                    "text_config": {
+                        "model_type": "qwen3_5",
+                        "mtp_num_hidden_layers": 1,
+                        "tie_word_embeddings": True,
+                    },
+                },
+                {
+                    "mtp.norm.weight": norm,
+                    "mtp.layers.0.self_attn.q_proj.weight": qproj,
+                },
+            )
+            split_qwen3_5_mtp(src, out)
+            weights = mx.load(str(Path(out) / "model.safetensors"))
+            config = json.loads((Path(out) / "config.json").read_text())
+
+        self.assertEqual(
+            set(weights), {"norm.weight", "layers.0.self_attn.q_proj.weight"}
+        )
+        # HF-layout norm weights get the +1.0 shift; the projection passes through
+        self.assertTrue(mx.allclose(weights["norm.weight"], norm + 1.0).item())
+        self.assertTrue(
+            mx.array_equal(weights["layers.0.self_attn.q_proj.weight"], qproj).item()
+        )
+        self.assertEqual(config["model_type"], "qwen3_5_mtp")
+        self.assertEqual(config["block_size"], 3)  # mtp_num_hidden_layers(1) + 2
+        self.assertTrue(config["tie_word_embeddings"])
+
+    def test_glm_split_flattens_splits_mla_and_stacks_experts(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.speculative.drafters.glm4_moe_lite_mtp.split import (
+            split_glm4_moe_lite_mtp,
+        )
+
+        N = 2
+        p = f"model.layers.{N}."
+        tensors = {
+            p + "enorm.weight": mx.random.normal((8,)),
+            p + "hnorm.weight": mx.random.normal((8,)),
+            p + "eh_proj.weight": mx.random.normal((8, 16)),
+            p + "embed_tokens.weight": mx.random.normal((10, 8)),
+            p + "shared_head.norm.weight": mx.random.normal((8,)),
+            p + "shared_head.head.weight": mx.random.normal((10, 8)),
+            p + "input_layernorm.weight": mx.random.normal((8,)),
+            p + "self_attn.kv_b_proj.weight": mx.random.normal((8, 3)),
+            p + "self_attn.o_proj.weight": mx.random.normal((8, 8)),
+            p + "mlp.gate.weight": mx.random.normal((2, 8)),
+        }
+        for e in range(2):
+            for proj in ("gate_proj", "down_proj", "up_proj"):
+                tensors[p + f"mlp.experts.{e}.{proj}.weight"] = mx.random.normal((8, 8))
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            src = self._write_source(
+                tmp,
+                {
+                    "text_config": {
+                        "model_type": "glm4_moe_lite",
+                        "num_hidden_layers": N,
+                        "num_attention_heads": 2,
+                        "qk_nope_head_dim": 2,
+                        "v_head_dim": 2,
+                        "n_routed_experts": 2,
+                        "num_nextn_predict_layers": 1,
+                    }
+                },
+                tensors,
+            )
+            split_glm4_moe_lite_mtp(src, out)
+            weights = mx.load(str(Path(out) / "model.safetensors"))
+            config = json.loads((Path(out) / "config.json").read_text())
+
+        self.assertIn("model.embed_tokens.weight", weights)
+        self.assertIn("lm_head.weight", weights)
+        self.assertIn("model.mtp_block.self_attn.embed_q.weight", weights)
+        self.assertIn("model.mtp_block.self_attn.unembed_out.weight", weights)
+        self.assertNotIn("model.mtp_block.self_attn.kv_b_proj.weight", weights)
+        stacked = weights["model.mtp_block.mlp.switch_mlp.gate_proj.weight"]
+        self.assertEqual(stacked.shape, (2, 8, 8))  # 2 experts stacked
+        self.assertEqual(config["model_type"], "glm4_moe_lite_mtp")
+        self.assertEqual(config["block_size"], 2)  # num_nextn_predict_layers(1) + 1
+
+    def test_glm_moe_dsa_split_extracts_layer_local_mtp(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.speculative.drafters.glm_moe_dsa_mtp.split import (
+            split_glm_moe_dsa_mtp,
+        )
+
+        layer = 2
+        prefix = f"model.layers.{layer}."
+        tensors = {
+            prefix + "enorm.weight": mx.random.normal((8,)),
+            prefix + "hnorm.weight": mx.random.normal((8,)),
+            prefix + "eh_proj.weight": mx.random.normal((8, 16)),
+            prefix + "input_layernorm.weight": mx.random.normal((8,)),
+            prefix + "post_attention_layernorm.weight": mx.random.normal((8,)),
+            prefix + "shared_head.norm.weight": mx.random.normal((8,)),
+            prefix + "self_attn.kv_b_proj.weight": mx.random.normal((8, 4)),
+            prefix + "mlp.gate.weight": mx.random.normal((2, 8)),
+        }
+        for expert in range(2):
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                tensors[prefix + f"mlp.experts.{expert}.{projection}.weight"] = (
+                    mx.random.normal((8, 8))
+                )
+        config = {
+            "model_type": "glm_moe_dsa",
+            "num_hidden_layers": layer,
+            "num_attention_heads": 2,
+            "qk_nope_head_dim": 2,
+            "v_head_dim": 2,
+            "n_routed_experts": 2,
+            "num_nextn_predict_layers": 1,
+            "index_share_for_mtp_iteration": True,
+        }
+
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            source = self._write_source(tmp, config, tensors)
+            split_glm_moe_dsa_mtp(source, out)
+            weights = mx.load(str(Path(out) / "model.safetensors"))
+            sidecar = json.loads((Path(out) / "config.json").read_text())
+
+        self.assertEqual(sidecar["model_type"], "glm_moe_dsa_mtp")
+        self.assertEqual(sidecar["block_size"], 2)
+        self.assertTrue(sidecar["text_config"]["index_share_for_mtp_iteration"])
+        self.assertTrue(all(key.startswith("mtp.") for key in weights))
+        self.assertIn("mtp.shared_head_norm.weight", weights)
+        self.assertIn("mtp.self_attn.embed_q.weight", weights)
+        self.assertIn("mtp.self_attn.unembed_out.weight", weights)
+        self.assertNotIn("mtp.self_attn.kv_b_proj.weight", weights)
+        self.assertEqual(
+            weights["mtp.mlp.switch_mlp.gate_proj.weight"].shape,
+            (2, 8, 8),
+        )
+
+    def test_detect_and_split_mtp_dispatch(self):
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
+        from mlx_vlm.split_mtp import split_mtp
+
+        cfg = {
+            "model_type": "qwen3_5",
+            "text_config": {"model_type": "qwen3_5", "mtp_num_hidden_layers": 1},
+        }
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            src = self._write_source(
+                tmp, cfg, {"mtp.norm.weight": mx.random.normal((8,))}
+            )
+            splitter = detect_mtp_splitter(Path(src))
+            self.assertIsNotNone(splitter)
+            self.assertEqual(splitter.output_model_type, "qwen3_5_mtp")
+            split_mtp(src, out)  # auto-detect dispatch
+            self.assertTrue((Path(out) / "model.safetensors").exists())
+
+    def test_detect_returns_none_when_flag_but_no_tensors(self):
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
+
+        # config declares MTP but ships no mtp.* tensors (the MiniMax-M2 trap)
+        cfg = {
+            "model_type": "qwen3_5",
+            "text_config": {"model_type": "qwen3_5", "mtp_num_hidden_layers": 1},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._write_source(
+                tmp, cfg, {"model.embed_tokens.weight": mx.random.normal((4, 8))}
+            )
+            self.assertIsNone(detect_mtp_splitter(Path(src)))
+
+    def test_qwen3_next_split_stacks_separate_experts(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
+        from mlx_vlm.split_mtp import split_mtp
+
+        norm = mx.random.normal((8,))
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            tensors = {
+                "mtp.pre_fc_norm_embedding.weight": norm,
+                "mtp.fc.weight": mx.random.normal((8, 16)),
+                "mtp.norm.weight": mx.random.normal((8,)),
+                "mtp.layers.0.input_layernorm.weight": mx.random.normal((8,)),
+            }
+            for e in range(2):
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    tensors[f"mtp.layers.0.mlp.experts.{e}.{proj}.weight"] = (
+                        mx.random.normal((8, 8))
+                    )
+            src = self._write_source(
+                tmp,
+                {"text_config": {"model_type": "qwen3_next", "num_experts": 2}},
+                tensors,
+            )
+            splitter = detect_mtp_splitter(Path(src))
+            self.assertIsNotNone(splitter)
+            self.assertEqual(splitter.output_model_type, "qwen3_5_mtp")
+            split_mtp(src, out)
+            weights = mx.load(str(Path(out) / "model.safetensors"))
+            config = json.loads((Path(out) / "config.json").read_text())
+
+        self.assertTrue(all(not k.startswith("mtp.") for k in weights))
+        # zero-centered-norm +1.0 shift applies to Qwen3-Next norms too
+        self.assertTrue(
+            mx.allclose(weights["pre_fc_norm_embedding.weight"], norm + 1.0).item()
+        )
+        # separate up/down/gate experts collapse into a stacked switch_mlp
+        self.assertEqual(
+            weights["layers.0.mlp.switch_mlp.gate_proj.weight"].shape, (2, 8, 8)
+        )
+        self.assertNotIn("layers.0.mlp.experts.0.gate_proj.weight", weights)
+        self.assertEqual(config["model_type"], "qwen3_5_mtp")
+        self.assertEqual(config["block_size"], 3)  # depth defaults to 1 (+2)
+
+    def test_requested_quantization_quantizes_fp_drafter(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.split_mtp import split_mtp
+
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            src = self._write_source(
+                tmp,
+                {
+                    "model_type": "qwen3_5",
+                    "text_config": {
+                        "model_type": "qwen3_5",
+                        "mtp_num_hidden_layers": 1,
+                    },
+                },
+                {
+                    "mtp.norm.weight": mx.random.normal((64,)),
+                    "mtp.layers.0.self_attn.q_proj.weight": mx.random.normal((64, 64)),
+                },
+            )
+            split_mtp(src, out, q_bits=4, q_group_size=64)
+            weights = mx.load(str(Path(out) / "model.safetensors"))
+            config = json.loads((Path(out) / "config.json").read_text())
+
+        # the 2D projection got affine-quantized; the 1D norm did not
+        self.assertIn("layers.0.self_attn.q_proj.scales", weights)
+        self.assertIn("layers.0.self_attn.q_proj.biases", weights)
+        self.assertNotIn("norm.scales", weights)
+        self.assertEqual(config["quantization"]["mode"], "affine")
+        self.assertEqual(config["quantization"]["bits"], 4)
+
+
+class TestVideoDepthAnything(unittest.TestCase):
+    # ─── Video Depth Anything Tests ────────────────────────────
+
+    def _tiny_config(self, **overrides):
+        from mlx_vlm.models.video_depth_anything.config import ModelConfig
+
+        args = dict(
+            encoder="vits",
+            embed_dim=64,
+            depth=4,
+            num_heads=4,
+            features=32,
+            out_channels=[32, 48, 64, 64],
+            intermediate_layer_idx=[0, 1, 2, 3],
+            num_frames=8,
+            norm_num_groups=8,
+        )
+        args.update(overrides)
+        return ModelConfig(**args)
+
+    def test_config_presets(self):
+        """Encoder presets fill in backbone/head dims."""
+        from mlx_vlm.models.video_depth_anything.config import ModelConfig
+
+        config = ModelConfig()
+        self.assertEqual(config.model_type, "video_depth_anything")
+        self.assertEqual(config.embed_dim, 1024)  # vitl default
+        self.assertEqual(config.depth, 24)
+        self.assertEqual(config.out_channels, [256, 512, 1024, 1024])
+        self.assertEqual(config.intermediate_layer_idx, [4, 11, 17, 23])
+
+        small = ModelConfig(encoder="vits")
+        self.assertEqual(small.embed_dim, 384)
+        self.assertEqual(small.features, 64)
+
+    def test_vision_backbone(self):
+        """DINOv2 backbone returns patch/cls tokens per requested layer."""
+        from mlx_vlm.models.video_depth_anything.vision import DINOv2
+
+        config = self._tiny_config()
+        backbone = DINOv2(config)
+        x = mx.random.normal((2, 70, 98, 3))
+        feats = backbone.get_intermediate_layers(x, [0, 1, 2, 3])
+        self.assertEqual(len(feats), 4)
+        for patches, cls in feats:
+            self.assertEqual(patches.shape, (2, 5 * 7, 64))
+            self.assertEqual(cls.shape, (2, 64))
+
+    def test_temporal_module_zero_proj_is_identity(self):
+        """With a zeroed proj_out the temporal module reduces to identity."""
+        from mlx_vlm.models.video_depth_anything.motion import TemporalModule
+
+        module = TemporalModule(
+            in_channels=32,
+            num_attention_heads=4,
+            num_transformer_block=1,
+            num_attention_blocks=2,
+            norm_num_groups=8,
+            temporal_max_len=8,
+        )
+        zeroed = {
+            "temporal_transformer.proj_out.weight": mx.zeros((32, 32)),
+            "temporal_transformer.proj_out.bias": mx.zeros((32,)),
+        }
+        module.load_weights(list(zeroed.items()), strict=False)
+
+        x = mx.random.normal((2, 4, 5, 7, 32))
+        out = module(x)
+        self.assertEqual(out.shape, x.shape)
+        self.assertTrue(mx.allclose(out, x, atol=1e-5))
+
+    def test_model_forward_shapes(self):
+        """Full model maps (B, T, H, W, 3) to (B, T, H, W) depth."""
+        from mlx_vlm.models.video_depth_anything.video_depth_anything import Model
+
+        model = Model(self._tiny_config())
+        for h, w in [(70, 70), (70, 98)]:
+            depth = model(mx.random.normal((1, 4, h, w, 3)))
+            self.assertEqual(depth.shape, (1, 4, h, w))
+            self.assertTrue(bool(mx.all(depth >= 0)))
+
+    def test_sanitize_conv_layouts(self):
+        """sanitize() transposes Conv2d and ConvTranspose2d weights correctly."""
+        from mlx_vlm.models.video_depth_anything.video_depth_anything import Model
+
+        weights = {
+            # Conv2d: (out, in, kh, kw) -> (out, kh, kw, in)
+            "pretrained.patch_embed.proj.weight": mx.zeros((64, 3, 14, 14)),
+            # ConvTranspose2d: (in, out, kh, kw) -> (out, kh, kw, in)
+            "head.resize_layers.0.weight": mx.zeros((48, 48, 4, 4)),
+            # resize_layers.3 is a strided Conv2d, not a transpose conv
+            "head.resize_layers.3.weight": mx.zeros((64, 64, 3, 3)),
+            "pretrained.blocks.0.attn.qkv.weight": mx.zeros((192, 64)),
+        }
+        out = Model.sanitize(weights)
+        self.assertEqual(
+            out["pretrained.patch_embed.proj.weight"].shape, (64, 14, 14, 3)
+        )
+        self.assertEqual(out["head.resize_layers.0.weight"].shape, (48, 4, 4, 48))
+        self.assertEqual(out["head.resize_layers.3.weight"].shape, (64, 3, 3, 64))
+        self.assertEqual(out["pretrained.blocks.0.attn.qkv.weight"].shape, (192, 64))
+
+    def test_processor_target_size(self):
+        """Processor keeps aspect ratio and snaps to multiples of 14."""
+        from mlx_vlm.models.video_depth_anything.processing_video_depth_anything import (
+            VideoDepthProcessor,
+        )
+
+        proc = VideoDepthProcessor(input_size=518)
+        h, w = proc.target_size(1080, 1920)
+        self.assertEqual((h % 14, w % 14), (0, 0))
+        self.assertGreaterEqual(min(h, w), 294)
+        self.assertAlmostEqual(h / w, 1080 / 1920, places=1)
+
+
+class TestNemotronHSpeculativeVerifier(unittest.TestCase):
+    @staticmethod
+    def _language_model():
+        from mlx_vlm.models import nemotron_h
+
+        config = nemotron_h.ModelConfig(
+            model_type="nemotron_h",
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=4,
+            max_position_embeddings=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            attention_bias=False,
+            mamba_num_heads=4,
+            mamba_head_dim=8,
+            mamba_proj_bias=False,
+            ssm_state_size=32,
+            conv_kernel=3,
+            n_groups=2,
+            mlp_bias=False,
+            layer_norm_epsilon=1e-5,
+            use_bias=False,
+            use_conv_bias=True,
+            hybrid_override_pattern=["M", "*", "-", "E"],
+            moe_intermediate_size=16,
+            n_group=1,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            moe_shared_expert_intermediate_size=16,
+            topk_group=1,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            routed_scaling_factor=1.0,
+        )
+        mx.random.seed(7)
+        model = nemotron_h.Model(config).language_model
+        model.set_dtype(mx.bfloat16)
+        model.eval()
+        mx.eval(model.parameters())
+        return model
+
+    def test_sanitize_stacks_quantized_expert_parameters(self):
+        model = self._language_model()
+        weights = {}
+        for expert in range(model.args.n_routed_experts):
+            for source in ("down_proj", "up_proj"):
+                prefix = f"backbone.layers.3.mixer.experts.{expert}.{source}"
+                weights[f"{prefix}.weight"] = mx.full((2, 3), expert)
+                weights[f"{prefix}.scales"] = mx.full((2, 1), expert + 4)
+
+        sanitized = model.sanitize(weights)
+
+        for target in ("fc2", "fc1"):
+            prefix = f"backbone.layers.3.mixer.switch_mlp.{target}"
+            self.assertEqual(sanitized[f"{prefix}.weight"].shape, (4, 2, 3))
+            self.assertEqual(sanitized[f"{prefix}.scales"].shape, (4, 2, 1))
+        self.assertFalse(any(".experts." in key for key in sanitized))
+
+    def test_verifier_matches_singleton_mamba_moe_and_captures(self):
+        from mlx_vlm.models.nemotron_h import speculative_verifier
+
+        speculative_verifier._mamba_verify_kernel.cache_clear()
+        model = self._language_model()
+        prompt = mx.array([[1, 2, 3]])
+        verify = mx.array([[4, 5, 6, 7]])
+        verifier_cache = model.make_cache()
+        reference_cache = model.make_cache()
+        model(prompt, cache=verifier_cache)
+        model(prompt, cache=reference_cache)
+
+        actual = model(
+            verify,
+            cache=verifier_cache,
+            capture_layer_ids=[0, 3],
+            speculative_verify=True,
+        )
+        logits = []
+        captures = [[], []]
+        for position in range(verify.shape[1]):
+            output = model(
+                verify[:, position : position + 1],
+                cache=reference_cache,
+                capture_layer_ids=[0, 3],
+            )
+            logits.append(output.logits)
+            for index, hidden in enumerate(output.hidden_states):
+                captures[index].append(hidden)
+
+        expected_logits = mx.concatenate(logits, axis=1)
+        expected_captures = [
+            mx.concatenate(layer_tokens, axis=1) for layer_tokens in captures
+        ]
+        mx.eval(actual.logits, expected_logits, actual.hidden_states, expected_captures)
+        self.assertTrue(mx.array_equal(actual.logits, expected_logits).item())
+        for actual_hidden, expected_hidden in zip(
+            actual.hidden_states, expected_captures
+        ):
+            self.assertTrue(mx.array_equal(actual_hidden, expected_hidden).item())
+        if mx.metal.is_available():
+            self.assertGreater(
+                speculative_verifier._mamba_verify_kernel.cache_info().misses, 0
+            )
+
+    def test_verifier_uses_masked_mamba_fallback_for_left_padding(self):
+        from mlx_vlm.models.nemotron_h import speculative_verifier
+
+        speculative_verifier._mamba_verify_kernel.cache_clear()
+        model = self._language_model()
+        inputs = mx.array([[0, 4, 5, 6], [1, 2, 3, 4]])
+        verifier_cache = model.make_cache()
+        reference_cache = model.make_cache()
+        verifier_cache[0].left_padding = mx.array([1, 0])
+        reference_cache[0].left_padding = mx.array([1, 0])
+
+        actual = model(inputs, cache=verifier_cache, speculative_verify=True)
+        expected = model(inputs, cache=reference_cache)
+        mx.eval(actual.logits, expected.logits)
+
+        self.assertTrue(mx.array_equal(actual.logits, expected.logits).item())
+        self.assertEqual(
+            speculative_verifier._mamba_verify_kernel.cache_info().misses, 0
+        )
+
+    def test_nvfp4_argmax_matches_singleton_qmv_with_tail(self):
+        if not mx.metal.is_available():
+            self.skipTest("NVFP4 argmax requires Metal")
+        from mlx_vlm.models.nemotron_h.speculative_verifier import _nvfp4_argmax
+
+        mx.random.seed(19)
+        linear = nn.QuantizedLinear.from_linear(
+            nn.Linear(272, 64, bias=False),
+            group_size=16,
+            bits=4,
+            mode="nvfp4",
+        )
+        hidden = mx.random.normal((2, 6, 272)).astype(mx.bfloat16)
+        expected = mx.concatenate(
+            [linear(hidden[:, index : index + 1]) for index in range(6)], axis=1
+        ).argmax(axis=-1)
+        actual = _nvfp4_argmax(linear, hidden)
+        mx.eval(expected, actual)
+
+        self.assertTrue(mx.array_equal(actual, expected).item())
+
+    def test_rollback_restores_mamba_and_attention_to_accepted_prefix(self):
+        model = self._language_model()
+        prompt = mx.array([[1, 2, 3]])
+        verify = mx.array([[4, 5, 6, 7]])
+        actual_cache = model.make_cache()
+        expected_cache = model.make_cache()
+        model(prompt, cache=actual_cache)
+        model(prompt, cache=expected_cache)
+
+        _, _, rollback_state = model.speculative_verify_hidden(verify, actual_cache)
+        model(verify[:, :2], cache=expected_cache, speculative_verify=True)
+        accepted = model.rollback_speculative_cache(
+            actual_cache,
+            rollback_state,
+            accepted=1,
+            block_size=verify.shape[1],
+        )
+        self.assertEqual(accepted, 1)
+
+        for actual_state, expected_state in zip(
+            actual_cache[0].state, expected_cache[0].state
+        ):
+            mx.eval(actual_state, expected_state)
+            self.assertTrue(mx.array_equal(actual_state, expected_state).item())
+        self.assertEqual(actual_cache[1].offset, expected_cache[1].offset)
+        for actual_state, expected_state in zip(
+            actual_cache[1].state, expected_cache[1].state
+        ):
+            mx.eval(actual_state, expected_state)
+            self.assertTrue(mx.array_equal(actual_state, expected_state).item())
+
+    def test_rollback_rejects_ragged_batch_acceptance(self):
+        model = self._language_model()
+        cache = model.make_cache()
+        verify = mx.array([[1, 2], [3, 4]])
+        _, _, rollback_state = model.speculative_verify_hidden(verify, cache)
+        with self.assertRaisesRegex(ValueError, "uniform acceptance"):
+            model.rollback_speculative_cache(
+                cache,
+                rollback_state,
+                accepted=[0, 1],
+                block_size=2,
+            )
+
+    def test_verifier_supports_embeds_hidden_only_and_shared_kv_contract(self):
+        model = self._language_model()
+        inputs = mx.array([[1, 2, 3]])
+        inputs_embeds = model.backbone.embeddings(inputs)
+        cache = model.make_cache()
+
+        output = model(
+            None,
+            inputs_embeds=inputs_embeds,
+            cache=cache,
+            capture_layer_ids=[],
+            speculative_verify=True,
+            return_hidden=True,
+            return_shared_kv=True,
+            skip_logits=True,
+        )
+        mx.eval(output.hidden_states)
+
+        self.assertIsNone(output.logits)
+        self.assertEqual(len(output.hidden_states), 1)
+        self.assertEqual(output.hidden_states[0].shape, (1, 3, 32))
+        self.assertEqual(output.shared_kv_states, {})
+        self.assertIsNotNone(output.gdn_states)
+
+    def test_dflash_hidden_verification_returns_captures_and_final_hidden(self):
+        model = self._language_model()
+        cache = model.make_cache()
+        model(mx.array([[1, 2, 3]]), cache=cache)
+
+        captured, final_hidden, gdn_states = model.speculative_verify_dflash_hidden(
+            mx.array([[4, 5, 6]]), cache, [0, 3]
+        )
+        mx.eval(captured, final_hidden, gdn_states)
+
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[0].shape, (1, 3, model.args.hidden_size))
+        self.assertEqual(captured[1].shape, (1, 3, model.args.hidden_size))
+        self.assertEqual(final_hidden.shape, (1, 3, model.args.hidden_size))
+        self.assertEqual(len(gdn_states), 1)
+
+    def test_rollback_rejects_invalid_acceptance(self):
+        model = self._language_model()
+        cache = model.make_cache()
+        verify = mx.array([[1, 2]])
+        _, _, rollback_state = model.speculative_verify_hidden(verify, cache)
+
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            model.rollback_speculative_cache(
+                cache,
+                rollback_state,
+                accepted=-1,
+                block_size=2,
+            )
+        with self.assertRaisesRegex(ValueError, "exceed"):
+            model.rollback_speculative_cache(
+                cache,
+                rollback_state,
+                accepted=2,
+                block_size=2,
+            )

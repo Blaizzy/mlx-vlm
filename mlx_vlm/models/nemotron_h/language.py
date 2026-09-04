@@ -14,6 +14,9 @@ from ..cache import ArraysCache, KVCache
 from ..ssm import ssm_update
 from ..switch_layers import SwitchMLP
 from .config import ModelConfig
+from .speculative_verifier import NemotronHExactSpeculativeVerifier
+
+_EXACT_SPECULATIVE_VERIFIER = NemotronHExactSpeculativeVerifier()
 
 
 class MambaRMSNormGated(nn.Module):
@@ -74,6 +77,27 @@ class NemotronHMamba2Mixer(nn.Module):
             self.intermediate_size, self.hidden_size, bias=args.mamba_proj_bias
         )
 
+    def _split_projected_states(self, projected: mx.array):
+        # Nemotron-H checkpoints may tensor-core-pad the projection with two
+        # unused ``d_mlp`` branches. The reference derives their width from the
+        # loaded weight rather than the config and discards them before gate.
+        base_size = self.intermediate_size + self.conv_dim + self.num_heads
+        extra_size = projected.shape[-1] - base_size
+        if extra_size < 0 or extra_size % 2:
+            raise ValueError(
+                "invalid Nemotron-H Mamba projection width: "
+                f"got {projected.shape[-1]}, expected {base_size} plus an even padding"
+            )
+        d_mlp = extra_size // 2
+        gate_start = 2 * d_mlp
+        conv_start = gate_start + self.intermediate_size
+        dt_start = conv_start + self.conv_dim
+        return (
+            projected[..., gate_start:conv_start],
+            projected[..., conv_start:dt_start],
+            projected[..., dt_start:],
+        )
+
     def _conv(
         self,
         conv_input: mx.array,
@@ -126,9 +150,8 @@ class NemotronHMamba2Mixer(nn.Module):
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
         if cache:
             state = cache[1]
-            lengths = cache.lengths
         else:
-            state, lengths = None, None
+            state = None
 
         y, state = ssm_update(
             hidden_states,
@@ -156,11 +179,7 @@ class NemotronHMamba2Mixer(nn.Module):
 
         projected = self.in_proj(hidden_states)
 
-        gate, conv_input, dt = mx.split(
-            projected,
-            [self.intermediate_size, self.intermediate_size + self.conv_dim],
-            axis=-1,
-        )
+        gate, conv_input, dt = self._split_projected_states(projected)
         conv_output = self._conv(conv_input, cache, mask)
         hidden_states_ssm, B, C = mx.split(
             conv_output,
@@ -397,9 +416,11 @@ class NemotronHBlock(nn.Module):
 
 
 class NemotronHModel(nn.Module):
-    def __init__(self, args: ModelConfig):
+    def __init__(self, args: ModelConfig, with_embeddings: bool = True):
         super().__init__()
-        self.embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.with_embeddings = with_embeddings
+        if with_embeddings:
+            self.embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
             NemotronHBlock(args, block_type)
             for block_type in args.hybrid_override_pattern
@@ -420,18 +441,33 @@ class NemotronHModel(nn.Module):
 
     def __call__(
         self,
-        inputs,
+        inputs=None,
         cache: Optional[Any] = None,
+        inputs_embeds: Optional[mx.array] = None,
+        capture_layer_ids: Optional[list[int]] = None,
+        hidden_sink: Optional[list[mx.array]] = None,
     ):
-        hidden_states = self.embeddings(inputs)
+        if inputs is None and inputs_embeds is None:
+            raise ValueError("Provide either inputs or inputs_embeds")
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        elif self.with_embeddings:
+            hidden_states = self.embeddings(inputs)
+        else:
+            raise ValueError("This Nemotron-H backbone has no token embedding table")
 
         if cache is None:
             cache = [None] * len(self.layers)
-        attn_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
+        has_attention = any(layer.block_type == "*" for layer in self.layers)
+        has_mamba = any(layer.block_type == "M" for layer in self.layers)
+        attn_cache = cache[self.fa_idx] if has_attention else None
+        ssm_cache = cache[self.ssm_idx] if has_mamba else None
+        attn_mask = create_attention_mask(hidden_states, attn_cache)
+        ssm_mask = create_ssm_mask(hidden_states, ssm_cache)
 
+        capture_set = set(capture_layer_ids) if capture_layer_ids else set()
         cache_counter = 0
-        for layer in self.layers:
+        for index, layer in enumerate(self.layers):
             if layer.block_type == "M" or layer.block_type == "*":
                 c = cache[cache_counter]
                 cache_counter += 1
@@ -443,6 +479,8 @@ class NemotronHModel(nn.Module):
             else:
                 mask = ssm_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
+            if hidden_sink is not None and index in capture_set:
+                hidden_sink.append(hidden_states)
 
         return self.norm_f(hidden_states)
 
@@ -469,10 +507,10 @@ class Model(nn.Module):
 
     def make_cache(self):
         caches = []
-        for l in self.layers:
-            if l.block_type == "M":
+        for layer in self.layers:
+            if layer.block_type == "M":
                 caches.append(ArraysCache(size=2))
-            elif l.block_type == "*":
+            elif layer.block_type == "*":
                 caches.append(KVCache())
         return caches
 
@@ -482,15 +520,18 @@ class Model(nn.Module):
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
 
-        for l in range(self.args.num_hidden_layers):
-            prefix = f"backbone.layers.{l}.mixer"
+        for layer_idx in range(self.args.num_hidden_layers):
+            prefix = f"backbone.layers.{layer_idx}.mixer"
             for m, n in [("down_proj", "fc2"), ("up_proj", "fc1")]:
-                if f"{prefix}.experts.0.{m}.weight" in weights:
+                for suffix in ("weight", "scales", "biases"):
+                    first_key = f"{prefix}.experts.0.{m}.{suffix}"
+                    if first_key not in weights:
+                        continue
                     to_join = [
-                        weights.pop(f"{prefix}.experts.{e}.{m}.weight")
+                        weights.pop(f"{prefix}.experts.{e}.{m}.{suffix}")
                         for e in range(self.args.n_routed_experts)
                     ]
-                    weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(to_join)
+                    weights[f"{prefix}.switch_mlp.{n}.{suffix}"] = mx.stack(to_join)
 
         return weights
 
@@ -503,6 +544,8 @@ class Model(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    requires_uniform_batch_acceptance = True
+
     def __init__(self, args: ModelConfig):
         super().__init__()
         self.args = args
@@ -520,8 +563,174 @@ class LanguageModel(nn.Module):
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
-        out = self.backbone(inputs, cache=cache)
-        return LanguageModelOutput(logits=self.lm_head(out))
+        capture_layer_ids = kwargs.pop("capture_layer_ids", None)
+        speculative_verify = bool(kwargs.pop("speculative_verify", False))
+        return_hidden = kwargs.pop("return_hidden", False)
+        return_shared_kv = kwargs.pop("return_shared_kv", False)
+        skip_logits = kwargs.pop("skip_logits", False)
+
+        if speculative_verify:
+            return _EXACT_SPECULATIVE_VERIFIER(
+                self,
+                inputs,
+                cache=cache,
+                inputs_embeds=inputs_embeds,
+                capture_layer_ids=capture_layer_ids,
+                return_hidden=return_hidden,
+                return_shared_kv=return_shared_kv,
+                skip_logits=skip_logits,
+            )
+
+        hidden_sink = [] if capture_layer_ids is not None else None
+        out = self.backbone(
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            capture_layer_ids=capture_layer_ids,
+            hidden_sink=hidden_sink,
+        )
+        if return_hidden:
+            if hidden_sink is None:
+                hidden_sink = []
+            hidden_sink.append(out)
+        return LanguageModelOutput(
+            logits=None if skip_logits else self.lm_head(out),
+            hidden_states=hidden_sink,
+            shared_kv_states={} if return_shared_kv else None,
+        )
+
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del input_ids, inputs_embeds, prompt_cache
+        if draft_model is None:
+            return True
+        prefill_kwargs = prefill_kwargs or {}
+        if draft_kind in ("dflash", "dspark"):
+            return prefill_kwargs.get("capture_layer_ids") is not None
+        return False
+
+    def speculative_draft_hidden(self, hidden: mx.array) -> mx.array:
+        return hidden
+
+    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        return _EXACT_SPECULATIVE_VERIFIER.linear(self.lm_head, hidden)
+
+    def speculative_argmax_from_hidden(self, hidden: mx.array) -> mx.array:
+        output = _EXACT_SPECULATIVE_VERIFIER.quantized_argmax(self.lm_head, hidden)
+        if output is not None:
+            return output
+        return mx.argmax(self.speculative_logits_from_hidden(hidden), axis=-1)
+
+    def speculative_verify_hidden(self, inputs: mx.array, cache):
+        out = self(
+            inputs,
+            cache=cache,
+            capture_layer_ids=[],
+            speculative_verify=True,
+            return_hidden=True,
+            return_shared_kv=True,
+            skip_logits=True,
+        )
+        return out.hidden_states[-1], out.shared_kv_states, out.gdn_states
+
+    def speculative_verify_dflash_hidden(
+        self, inputs: mx.array, cache, capture_layer_ids: list[int]
+    ):
+        out = self(
+            inputs,
+            cache=cache,
+            capture_layer_ids=capture_layer_ids,
+            speculative_verify=True,
+            return_hidden=True,
+            skip_logits=True,
+        )
+        return out.hidden_states[:-1], out.hidden_states[-1], out.gdn_states
+
+    def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
+        out = self(
+            inputs,
+            cache=cache,
+            capture_layer_ids=[],
+            speculative_verify=True,
+            return_hidden=True,
+            return_shared_kv=True,
+        )
+        return (
+            out.hidden_states[-1],
+            out.shared_kv_states,
+            out.gdn_states,
+            sampler(out.logits),
+        )
+
+    def rollback_speculative_cache(
+        self,
+        caches: list[Any],
+        gdn_states: Any,
+        accepted: Any,
+        block_size: int,
+    ) -> int:
+        if isinstance(accepted, int):
+            accepted_values = [accepted]
+        elif isinstance(accepted, mx.array):
+            accepted_values = [int(value) for value in accepted.reshape(-1).tolist()]
+        else:
+            accepted_values = [int(value) for value in accepted]
+        if len(set(accepted_values)) != 1:
+            raise ValueError(
+                "Nemotron-H speculative rollback requires uniform acceptance."
+            )
+        if gdn_states is None:
+            raise RuntimeError(
+                "Nemotron-H speculative rollback requires verifier Mamba states."
+            )
+
+        max_accepted = accepted_values[0]
+        if max_accepted < 0:
+            raise ValueError("Accepted tokens must be non-negative.")
+        retained = max_accepted + 1
+        if retained > int(block_size):
+            raise ValueError("Accepted tokens exceed the speculative block size.")
+        trim = int(block_size) - retained
+        state_index = 0
+        for cache in caches:
+            if cache is None:
+                continue
+            if isinstance(cache, ArraysCache):
+                if state_index >= len(gdn_states):
+                    raise RuntimeError(
+                        "Nemotron-H verifier did not return every Mamba state."
+                    )
+                state_history, conv_input, kernel_size = gdn_states[state_index]
+                state_index += 1
+                if isinstance(state_history, dict):
+                    from .speculative_verifier import replay_mamba_state
+
+                    cache[1] = replay_mamba_state(state_history, retained)
+                else:
+                    cache[1] = state_history[:, max_accepted]
+                cache[0] = conv_input[:, retained : retained + int(kernel_size) - 1]
+                if cache._lengths is not None:
+                    cache._lengths_advance -= trim
+                if cache._left_padding is not None:
+                    cache._left_padding_advance -= trim
+                continue
+            if not cache.is_trimmable():
+                raise NotImplementedError(
+                    "Nemotron-H speculative rollback requires trimmable attention caches."
+                )
+            if trim:
+                cache.trim(trim)
+        if state_index != len(gdn_states):
+            raise RuntimeError("Nemotron-H verifier returned extra Mamba states.")
+        return max_accepted
 
     def sanitize(self, weights):
         return Model.sanitize(self, weights)

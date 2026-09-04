@@ -10,19 +10,22 @@ import mlx.core as mx
 
 from mlx_vlm.apc import (
     APCManager,
-    _cache_entry_supports_exact_apc,
     _clone_cache_entry_for_apc,
     _clone_prompt_cache_for_apc,
     extract_prompt_cache_from_batch,
     harvest_blocks_from_batch_cache,
     model_apc_mode,
 )
+from mlx_vlm.apc_adapters import apc_exact_eligible
 from mlx_vlm.models.cache import (
     ArraysCache,
     BatchKVCache,
+    BatchPoolingCache,
     BatchQuantizedKVCache,
     BatchRotatingKVCache,
+    CacheList,
     KVCache,
+    PoolingCache,
     QuantizedKVCache,
     RotatingKVCache,
 )
@@ -44,6 +47,129 @@ def _rand_kv(batch=B, seq_len=32, heads=H, dim=D):
 
 def _max_abs_error(a: mx.array, b: mx.array) -> float:
     return mx.max(mx.abs(a - b)).item()
+
+
+def test_snapshot_single_row_cache_list_clones_nested_pooling_cache():
+    from mlx_vlm.apc import snapshot_prompt_cache_row
+
+    rotating = RotatingKVCache(max_size=16)
+    keys, values = _rand_kv(batch=1, seq_len=3, heads=1, dim=2)
+    rotating.update_and_fetch(keys, values)
+    pooling = PoolingCache(ratio=4)
+    kv = mx.arange(6, dtype=mx.float32).reshape(1, 3, 2)
+    gate = mx.arange(3, dtype=mx.float32).reshape(1, 3, 1)
+    pooling.accumulate_windows(kv, gate, offset=0)
+
+    snapshot = snapshot_prompt_cache_row([CacheList(rotating, pooling)], batch_idx=0)
+
+    assert snapshot is not None
+    cloned_rotating, cloned = snapshot[0].caches
+    assert isinstance(cloned_rotating, RotatingKVCache)
+    assert cloned_rotating.offset == 3
+    assert isinstance(cloned, PoolingCache)
+    assert cloned.ratio == 4
+    assert cloned.remainder == 3
+    mx.eval(*[value for value in cloned.state if value is not None])
+    assert mx.array_equal(cloned.state[0], kv).item()
+    assert mx.array_equal(cloned.state[1], gate).item()
+
+
+def test_snapshot_batch_cache_list_extracts_nested_pooling_cache():
+    from mlx_vlm.apc import snapshot_prompt_cache_row
+
+    rotating, _, _ = _fill_batch_rotating([0], seq_len=3, max_size=16)
+    pooling = BatchPoolingCache(ratio=4, left_padding=[0])
+    kv = mx.arange(6, dtype=mx.float32).reshape(1, 3, 2)
+    gate = mx.arange(3, dtype=mx.float32).reshape(1, 3, 1)
+    pooling.prepare(lengths=[3])
+    pooling.accumulate_windows(kv, gate, offset=0)
+    pooling.finalize()
+
+    snapshot = snapshot_prompt_cache_row([CacheList(rotating, pooling)], batch_idx=0)
+
+    assert snapshot is not None
+    cloned_rotating, cloned = snapshot[0].caches
+    assert isinstance(cloned_rotating, RotatingKVCache)
+    assert isinstance(cloned, PoolingCache)
+    assert cloned.ratio == 4
+    assert cloned.remainder == 3
+    mx.eval(*[value for value in cloned.state if value is not None])
+    assert mx.array_equal(cloned.state[0], kv).item()
+    assert mx.array_equal(cloned.state[1], gate).item()
+
+
+def test_pooling_cache_exact_apc_round_trips_warm_and_cold_rows():
+    from mlx_vlm.apc import make_warm_batch_exact_cache_multi, snapshot_prompt_cache_row
+
+    def make_row(prompt_length):
+        rotating = RotatingKVCache(max_size=16)
+        pooling = PoolingCache(ratio=4)
+        if prompt_length > 0:
+            keys = mx.arange(prompt_length * 3, dtype=mx.float32).reshape(
+                1, 1, prompt_length, 3
+            )
+            rotating.update_and_fetch(keys, keys + 1)
+            kv = keys.reshape(1, prompt_length, 3)
+            gate = mx.ones((1, prompt_length, 2), dtype=mx.float32)
+            ready_kv, _, _ = pooling.accumulate_windows(kv, gate, offset=0)
+            pooled_length = ready_kv.shape[1] // pooling.ratio
+            pooling.update_and_fetch(mx.ones((1, pooled_length, 3), dtype=mx.float32))
+        return [CacheList(rotating, pooling)]
+
+    warm = snapshot_prompt_cache_row(make_row(6), batch_idx=0)
+    cold = snapshot_prompt_cache_row(make_row(0), batch_idx=0)
+
+    assert warm is not None
+    assert cold is not None
+    merged, max_prefix = make_warm_batch_exact_cache_multi(
+        [warm, cold], prefix_lens=[6, 0]
+    )
+
+    assert merged is not None
+    assert max_prefix == 6
+    rotating, pooling = merged[0].caches
+    assert isinstance(rotating, BatchRotatingKVCache)
+    assert rotating.offset.tolist() == [6, 0]
+    assert isinstance(pooling, BatchPoolingCache)
+    assert pooling.ratio == 4
+    assert pooling.remainder == [2, 0]
+    assert pooling._pool_lengths == [1, 0]
+    assert pooling._processed == [6, 0]
+
+
+def test_batch_pooling_cache_merge_accepts_prefix_lengths():
+    merged = BatchPoolingCache.merge(
+        [PoolingCache(ratio=4), PoolingCache(ratio=4)],
+        prefix_lens=[0, 0],
+    )
+
+    assert isinstance(merged, BatchPoolingCache)
+    assert merged.remainder == [0, 0]
+    assert merged._pool_lengths == [0, 0]
+    assert merged._processed == [0, 0]
+
+
+def test_pooling_cache_exact_batch_merge_forwards_prefix_lengths():
+    from mlx_vlm.apc_adapters import merge_cache_entries
+
+    warm = PoolingCache(ratio=4)
+    kv = mx.arange(18, dtype=mx.float32).reshape(1, 6, 3)
+    gate = mx.ones((1, 6, 2), dtype=mx.float32)
+    warm.accumulate_windows(kv, gate, offset=0)
+    warm.update_and_fetch(mx.ones((1, 1, 3), dtype=mx.float32))
+    cold = PoolingCache(ratio=4)
+
+    merged = merge_cache_entries([warm, cold], [6, 0])
+
+    assert isinstance(merged, BatchPoolingCache)
+    assert merged.remainder == [2, 0]
+    assert merged._pool_lengths == [1, 0]
+    assert merged._processed == [6, 0]
+    extracted_warm = merged.extract(0)
+    extracted_cold = merged.extract(1)
+    assert extracted_warm.remainder == 2
+    assert extracted_warm.pooled.shape == (1, 1, 3)
+    assert extracted_cold.empty()
 
 
 def _fill_batch_kv(left_padding, seq_len):
@@ -194,7 +320,7 @@ class TestSnapshotPromptCacheRow:
         assert not isinstance(snap[0], BatchKVCache)
         assert not isinstance(snap[1], BatchQuantizedKVCache)
         assert isinstance(snap[0], KVCache)
-        assert isinstance(snap[1], KVCache)
+        assert isinstance(snap[1], QuantizedKVCache)
         assert snap[0].offset == seq_len
         assert snap[1].offset == seq_len
 
@@ -258,7 +384,7 @@ class TestGemmaLikeHybridExact:
 
     def test_supports_exact_apc_for_batch_rotating(self):
         cache, _, _ = _fill_batch_rotating([0], seq_len=16)
-        assert _cache_entry_supports_exact_apc(cache) is True
+        assert apc_exact_eligible(cache) is True
 
     def test_extract_batch_rotating_then_clone(self):
         cache, _, _ = _fill_batch_rotating([0], seq_len=20)
@@ -278,7 +404,7 @@ class TestGemmaLikeHybridExact:
         token_ids = list(range(seq_len))
         prompt_cache = self._gemma_like_layout(batch_size=1, seq_len=seq_len)
 
-        assert all(_cache_entry_supports_exact_apc(c) for c in prompt_cache)
+        assert all(apc_exact_eligible(c) for c in prompt_cache)
 
         snap = snapshot_prompt_cache_row(prompt_cache, batch_idx=0)
         assert snap is not None
@@ -425,7 +551,7 @@ class TestAlwaysExtractSemantics:
         assert isinstance(row[0], QuantizedKVCache)
         cloned = _clone_prompt_cache_for_apc(row)
         assert cloned is not None
-        assert isinstance(cloned[0], KVCache)
+        assert isinstance(cloned[0], QuantizedKVCache)
 
     def test_snapshot_equivalent_for_b1_whether_or_not_batch(self):
         from mlx_vlm.apc import snapshot_prompt_cache_row
@@ -472,7 +598,40 @@ def _fill_batch_turbo(left_padding, seq_len, bits=4.0):
     return cache, k, v
 
 
-class TestBatchRotatingRightPadPrefill:
+class TestBatchRightPadPrefill:
+    @staticmethod
+    def _filter_reordered_row(cache):
+        cache.prepare(right_padding=[2, 0], lengths=[4, 6])
+        k, v = _rand_kv(batch=2, seq_len=3)
+        cache.update_and_fetch(k, v)
+
+        cache.filter(mx.array([1, 0], dtype=mx.int32))
+        cache.filter(mx.array([1], dtype=mx.int32))
+
+    def test_batch_kv_filter_keeps_pending_right_padding_aligned(self):
+        cache = BatchKVCache([0, 0])
+
+        self._filter_reordered_row(cache)
+
+        assert cache._right_padding.tolist() == [2]
+        cache.finalize()
+        assert cache.keys.shape[0] == 1
+        assert cache.values.shape[0] == 1
+        assert cache.offset.tolist() == [1]
+        assert cache.left_padding.tolist() == [2]
+
+    def test_batch_quantized_filter_keeps_pending_right_padding_aligned(self):
+        cache = BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS)
+
+        self._filter_reordered_row(cache)
+
+        assert cache._right_padding.tolist() == [2]
+        cache.finalize()
+        assert all(part.shape[0] == 1 for part in cache.keys)
+        assert all(part.shape[0] == 1 for part in cache.values)
+        assert cache.offset.tolist() == [1]
+        assert cache.left_padding.tolist() == [2]
+
     def test_single_token_update_while_lengths_pending(self):
         cache = BatchRotatingKVCache(32, [0, 0])
         k, v = _rand_kv(batch=2, seq_len=4)
@@ -486,6 +645,24 @@ class TestBatchRotatingRightPadPrefill:
         assert cache._lengths is None
         k2, v2 = _rand_kv(batch=2, seq_len=1)
         cache.update_and_fetch(k2, v2)
+
+    def test_rotating_filter_keeps_pending_lengths_aligned(self):
+        cache = BatchRotatingKVCache(32, [0, 0])
+
+        self._filter_reordered_row(cache)
+
+        assert cache._lengths.tolist() == [4]
+        k, v = _rand_kv(batch=1, seq_len=2)
+        out_k, out_v = cache.update_and_fetch(k, v)
+        mx.eval(out_k, out_v)
+        assert out_k.shape[0] == 1
+        assert out_v.shape[0] == 1
+
+        cache.finalize()
+        assert cache.keys.shape[0] == 1
+        assert cache.values.shape[0] == 1
+        assert cache.offset.tolist() == [4]
+        assert cache.left_padding.tolist() == [1]
 
 
 class TestBatchTurboQuantParity:
@@ -561,7 +738,7 @@ class TestBatchTurboQuantParity:
         assert isinstance(row[0], TurboQuantKVCache)
         cloned = _clone_prompt_cache_for_apc(row)
         assert cloned is not None
-        assert isinstance(cloned[0], KVCache)
+        assert isinstance(cloned[0], TurboQuantKVCache)
 
     def test_layer_kv_for_apc_batch_turbo(self):
         from mlx_vlm.apc import layer_kv_for_apc
@@ -576,4 +753,4 @@ class TestBatchTurboQuantParity:
 
     def test_supports_exact_apc(self):
         cache, _, _ = _fill_batch_turbo([0], seq_len=8)
-        assert _cache_entry_supports_exact_apc(cache) is True
+        assert apc_exact_eligible(cache) is True

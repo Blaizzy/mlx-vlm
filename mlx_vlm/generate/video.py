@@ -6,6 +6,8 @@ only processes them when a ``video_processor`` component exists, and silently
 discards them otherwise; the model then hallucinates an answer with no visual
 input at all. When that would happen, the caller samples the video into frames
 and sends them as ordered images, which any image-capable model handles.
+``resolve_video_inputs`` is the shared entrypoint for that generic fallback so
+CLI and server callers apply the same capability check and global frame budget.
 
 Models whose vision patches carry two temporal slots can opt into a richer
 fallback by defining a ``prepare_video_frame_pairs(processor, second_frames)``
@@ -15,9 +17,22 @@ returned generation kwargs.
 """
 
 import inspect
+from dataclasses import dataclass
 
 import numpy as np
 from PIL import Image
+
+
+@dataclass(frozen=True)
+class VideoInputResolution:
+    """Image/video inputs after resolving the generic frames fallback."""
+
+    images: list
+    videos: list
+    used_fallback: bool = False
+    sampled_count: int = 0
+    selected_count: int = 0
+    frame_fps: float | None = None
 
 
 def processor_handles_video(processor) -> bool:
@@ -33,16 +48,18 @@ def processor_handles_video(processor) -> bool:
     return "videos" in params and has_component
 
 
-def sample_video_frames(videos, fps=2.0):
-    """Decode ``videos`` at ``fps`` into one chronological list of PIL frames,
-    returned alongside the sampling fps actually used."""
-    from ..utils import load_video
+def sample_video_frames(videos, fps=2.0, sampling=None):
+    """Decode ``videos`` into one chronological list of PIL frames, returned
+    alongside the sampling fps actually used. ``sampling`` carries the
+    caller's frame-count overrides and wins over ``fps``."""
+    from ..utils import VideoSampling, load_video
 
+    resolved = (sampling or VideoSampling()).merge(VideoSampling(fps=fps))
     frames = []
     frame_fps = fps
     for video in videos:
-        arr, sampled_fps = load_video(str(video), fps=fps)
-        frame_fps = sampled_fps or frame_fps
+        arr, metadata = load_video(str(video), resolved)
+        frame_fps = metadata.sampled_fps or frame_fps
         for frame in arr:
             frames.append(Image.fromarray(np.transpose(frame, (1, 2, 0))))
     return frames, frame_fps
@@ -57,6 +74,46 @@ def subsample_evenly(frames, max_frames):
         return frames
     idxs = [round(i * (len(frames) - 1) / (max_frames - 1)) for i in range(max_frames)]
     return [frames[i] for i in idxs]
+
+
+def resolve_video_inputs(
+    processor,
+    videos=None,
+    *,
+    images=None,
+    fps=2.0,
+    max_frames=16,
+    sampling=None,
+) -> VideoInputResolution:
+    """Resolve unsupported videos into a globally capped list of still images.
+
+    Native-video processors receive their inputs unchanged. Otherwise all videos
+    are decoded first, then subsampled once so ``max_frames`` is a request-wide
+    budget rather than a per-video budget. Inputs are copied and only returned
+    after the complete conversion succeeds, avoiding partially converted media.
+    """
+    resolved_images = list(images or [])
+    resolved_videos = list(videos or [])
+    if not resolved_videos or processor_handles_video(processor):
+        return VideoInputResolution(
+            images=resolved_images,
+            videos=resolved_videos,
+        )
+
+    max_frames = max(2, int(max_frames or 16))
+    frames, frame_fps = sample_video_frames(resolved_videos, fps or 2.0, sampling)
+    sampled_count = len(frames)
+    if not sampled_count:
+        raise ValueError("Video frame fallback decoded no frames.")
+    selected = subsample_evenly(frames, max_frames)
+    return VideoInputResolution(
+        images=resolved_images + selected,
+        videos=[],
+        used_fallback=True,
+        sampled_count=sampled_count,
+        selected_count=len(selected),
+        frame_fps=frame_fps,
+    )
 
 
 def pair_adjacent_frames(frames, max_pairs):

@@ -8,6 +8,7 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
+from ..rope_utils import initialize_rope
 from .config import TextConfig
 
 
@@ -26,10 +27,12 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=config.attention_bias)
 
-        self.rope = nn.RoPE(
-            head_dim,
-            traditional=config.rope_traditional,
+        self.rope = initialize_rope(
+            dims=head_dim,
             base=config.rope_theta,
+            traditional=config.rope_traditional,
+            scaling_config=config.rope_scaling,
+            max_position_embeddings=config.max_position_embeddings,
         )
 
     def __call__(self, x, mask=None, cache=None):
@@ -156,8 +159,9 @@ class Granite(nn.Module):
                 h, cache[0] if cache and cache[0] is not None else cache
             )
 
+        prefill_offset = cache[0].offset if cache and cache[0] is not None else 0
+
         for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
-            # Inject deepstack features at target layers
             if (
                 deepstack_visual_embeds is not None
                 and deepstack_target_layers is not None
@@ -165,13 +169,14 @@ class Granite(nn.Module):
             ):
                 for feat_idx, target_layer in enumerate(deepstack_target_layers):
                     if layer_idx == target_layer:
-                        features = deepstack_visual_embeds[feat_idx]
-                        # Add features at image positions
-                        h = mx.where(
-                            visual_pos_masks[..., None],
-                            h + features,
-                            h,
-                        )
+                        seq_len = h.shape[1]
+                        pos_mask = visual_pos_masks[
+                            ..., prefill_offset : prefill_offset + seq_len
+                        ]
+                        features = deepstack_visual_embeds[feat_idx][
+                            prefill_offset : prefill_offset + seq_len
+                        ]
+                        h = mx.where(pos_mask[..., None], h + features, h)
 
             h = layer(h, mask, c)
 

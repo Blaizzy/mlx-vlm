@@ -26,6 +26,7 @@ from mlx_audio.audio_io import read as audio_read
 from mlx_audio.audio_io import write as audio_write
 from pydantic import Field
 
+from .._stream_cleanup import clear_mlx_streams
 from .runtime import runtime
 from .schemas import FlexibleBaseModel
 
@@ -187,6 +188,12 @@ class AudioRequestQueue:
         self._thread.join(timeout=timeout)
 
     def _run(self) -> None:
+        try:
+            self._run_impl()
+        finally:
+            clear_mlx_streams()
+
+    def _run_impl(self) -> None:
         while not self._stop.is_set():
             request = self._requests.get()
             if request is None:
@@ -520,11 +527,13 @@ def _run_stt_request(request: AudioInferenceRequest) -> None:
     transcription_request = payload.request
     model, _, _ = get_cached_model(transcription_request.model, model_kind="audio_stt")
 
-    suffix = os.path.splitext(payload.filename or "")[1] or ".wav"
     tmp_path = None
     emitted = False
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        # The audio is already decoded PCM and this file only gives the model a
+        # path to open, so always write WAV. Re-encoding the upload's own
+        # container is lossy at best and impossible for m4a/mp4/aac.
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
             tmp_path = tmp.name
         audio_write(tmp_path, payload.audio, payload.sample_rate)
 

@@ -266,6 +266,20 @@ def test_audio_request_queue_serializes_requests(monkeypatch):
         audio_queue.stop_and_join()
 
 
+def test_audio_request_queue_clears_worker_streams(monkeypatch):
+    cleared_threads = []
+    monkeypatch.setattr(
+        server_audio,
+        "clear_mlx_streams",
+        lambda: cleared_threads.append(server_audio.threading.current_thread().name),
+    )
+
+    audio_queue = server_audio.AudioRequestQueue()
+    audio_queue.stop_and_join()
+
+    assert cleared_threads == [audio_queue._thread.name]
+
+
 def test_get_cached_model_loads_tts_audio_model(monkeypatch):
     fake_model = SimpleNamespace(model_type="fake_audio")
     monkeypatch.setattr(server, "load_audio_model", lambda model_path: fake_model)
@@ -352,3 +366,46 @@ def _drain(handle, timeout=2.0):
         elif chunk.kind == "done":
             return chunks
     raise TimeoutError("timed out waiting for audio queue results")
+
+
+def test_audio_transcriptions_accepts_m4a_upload(client, monkeypatch):
+    fake_model = FakeSTTModel({"text": "Transcribed from m4a."})
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda model, **kwargs: (fake_model, None, SimpleNamespace(model_type="audio")),
+    )
+    monkeypatch.setattr(
+        server_audio,
+        "audio_read",
+        lambda buffer, always_2d=False: (np.zeros(160, dtype=np.float32), 16000),
+    )
+    # Intentionally exercises the real writer: the bug was that the temp file
+    # inherited the upload's extension and m4a is not an encodable format.
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("meeting.m4a", b"audio-bytes", "audio/mp4")},
+        data={"model": "fake-stt"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"text": "Transcribed from m4a."}
+    assert fake_model.calls[0]["path"].endswith(".wav")
+
+
+def test_audio_transcriptions_undecodable_upload_returns_400(client, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda model, **kwargs: pytest.fail("model must not load for a bad upload"),
+    )
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("broken.m4a", b"not-audio", "audio/mp4")},
+        data={"model": "fake-stt"},
+    )
+
+    assert response.status_code == 400
+    assert "Invalid audio file" in response.json()["detail"]

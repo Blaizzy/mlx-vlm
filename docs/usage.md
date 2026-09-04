@@ -35,6 +35,21 @@ output = generate(model, processor, formatted_prompt, image, verbose=False)
 print(output)
 ```
 
+## MoE Offloading
+
+Run a mixture-of-experts checkpoint that is larger than available RAM by paging routed experts from disk. Repack the checkpoint into an offloaded store once, then load it as usual — `load()` detects the offloaded layout automatically:
+
+```bash
+python -m mlx_vlm moe_offload --build /path/to/checkpoint --out /path/to/offloaded
+python -m mlx_vlm.generate --model /path/to/offloaded --prompt "Explain how photosynthesis works." --max-tokens 100
+```
+
+Serving works the same way. Bound the resident expert set with `--expert-cache-gb`, and inspect cache hits/misses/evictions at `/v1/moe-offload/stats`:
+
+```bash
+python -m mlx_vlm.server --model /path/to/offloaded --expert-cache-gb 8
+```
+
 ## Speculative Decoding
 
 Speed up generation 2–3× using a lightweight drafter model that predicts multiple tokens per round, verified in parallel by the target model.
@@ -48,6 +63,18 @@ python -m mlx_vlm.generate \
     --prompt "Write a quicksort in Python." \
     --max-tokens 512 --temperature 0 --enable-thinking
 ```
+
+Liquid AI's LFM2.5 DSpark drafter is also auto-detected:
+
+```bash
+python -m mlx_vlm.generate \
+    --model LiquidAI/LFM2.5-2.6B \
+    --draft-model LiquidAI/LFM2.5-2.6B-DSpark \
+    --prompt "Write a concise note about speculative decoding." \
+    --max-tokens 256 --temperature 0
+```
+
+DSpark decoding currently supports greedy sampling (`temperature=0`).
 
 EAGLE-3 speculators are also supported and auto-detected from Speculators configs:
 
@@ -192,6 +219,7 @@ for i in range(B):
 | Target | Drafter | Notes |
 |--------|---------|-------|
 | `Qwen/Qwen3.5-4B` | `z-lab/Qwen3.5-4B-DFlash` | Text + image. ~2.5× speedup on code/reasoning. |
+| `LiquidAI/LFM2.5-2.6B` | `LiquidAI/LFM2.5-2.6B-DSpark` | Text. Nine Markov-corrected proposals with exact LFM2 target verification. |
 | `meta-models/Muse-Glimmer-30B` | `meta-models/Muse-Glimmer-30B-assistant` | Text + image. Native 5-layer, 16-token DFlash assistant. |
 | `MiniMaxAI/MiniMax-M3` | `Inferact/MiniMax-M3-EAGLE3` | Text, image, and video target. Uses `--draft-kind eagle3`. |
 
@@ -208,6 +236,34 @@ python -m mlx_vlm.server
 ```
 
 See `README.md` for a complete `curl` example.
+
+### Live settings (`/v1/settings`)
+
+Read and change a curated set of server settings at runtime, without a
+restart. `GET` lists the settings the server accepts; `PATCH` changes them.
+
+```bash
+# list the available settings and their current values
+curl http://127.0.0.1:8080/v1/settings
+
+# merge: only the settings you list are changed
+curl -X PATCH http://127.0.0.1:8080/v1/settings \
+  -H 'Content-Type: application/json' \
+  -d '{"kv_quant_scheme": "turboquant"}'
+
+# replace: reset everything to its boot-time default, then apply these
+curl -X PATCH http://127.0.0.1:8080/v1/settings \
+  -H 'Content-Type: application/json' \
+  -d '{"op": "replace", "values": {"apc_enabled": true}}'
+```
+
+Changes take effect on the next request. Most settings reload the affected
+model first — KV, APC, and speculative-decoding settings reload text models,
+`vision_cache_size` reloads image models — while `max_kv_size` and
+`token_queue_timeout` apply to new requests without a reload.
+
+The response reports which settings were applied and which were rejected;
+unknown names and invalid values are rejected and never applied.
 
 ## Distributed Inference
 

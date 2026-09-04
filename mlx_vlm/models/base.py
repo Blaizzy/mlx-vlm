@@ -62,6 +62,11 @@ class LanguageModelOutput:
 
 
 @dataclass
+class SequenceClassifierOutput:
+    logits: mx.array
+
+
+@dataclass
 class InputEmbeddingsFeatures:
     inputs_embeds: mx.array
     attention_mask_4d: Optional[mx.array] = None
@@ -197,7 +202,7 @@ def kv_sequence_length(keys) -> int:
     a ``(packed, scales, biases)`` tuple and TurboQuant caches return
     codec-state named tuples.
     """
-    if isinstance(keys, mx.array):
+    if isinstance(keys, mx.array) or hasattr(keys, "shape"):
         return keys.shape[-2]
     # Plain tuple/list only: TurboQuant states are NamedTuples with a
     # different layout and get measured by their own helper.
@@ -206,11 +211,59 @@ def kv_sequence_length(keys) -> int:
     return _turboquant_state_length(keys)
 
 
+def slice_kv_sequence(state, end: int):
+    """Return the ``[:end]`` sequence prefix of a KV state.
+
+    Uniform quantized caches return a tuple of packed values, scales and
+    biases instead of a single array. Slice every component so callers such
+    as speculative target verification can narrow the prefix without first
+    dequantizing it. Other state wrappers implement the same four-axis slice
+    directly.
+    """
+    if type(state) in (tuple, list):
+        return tree_map(lambda x: x[:, :, :end, :], state)
+    return state[:, :, :end, :]
+
+
+def dequantize_kv_state(cache, keys, values):
+    """Return plain ``[B, H, S, D]`` arrays for a state ``update_and_fetch`` returned.
+
+    Unquantized caches already hand back arrays and are passed through. Uniform
+    quantized caches return ``(packed, scales, biases)`` tuples and TurboQuant
+    caches return codec-state named tuples, neither of which can be indexed,
+    expanded or matmul'd like an array. Attention paths that cannot go through
+    :func:`scaled_dot_product_attention` -- logit softcapping, block-sparse
+    masking -- need real arrays, so they materialize the state here first.
+    """
+    if isinstance(keys, mx.array) or hasattr(keys, "shape"):
+        return keys, values
+    # Plain tuple/list only: TurboQuant states are NamedTuples and dequantize
+    # through their own cache method.
+    if type(keys) in (tuple, list):
+        return (
+            mx.dequantize(
+                *(mx.contiguous(x) for x in keys),
+                group_size=cache.group_size,
+                bits=cache.bits,
+            ),
+            mx.dequantize(
+                *(mx.contiguous(x) for x in values),
+                group_size=cache.group_size,
+                bits=cache.bits,
+            ),
+        )
+    return cache.dequantize(keys, values)
+
+
 def create_attention_mask(
     h, cache=None, window_size: Optional[int] = None, return_array: bool = False
 ):
     N = h.shape[1]
-    if cache and hasattr(cache, "make_mask"):
+    if (
+        cache is not None
+        and not isinstance(cache, mx.array)
+        and hasattr(cache, "make_mask")
+    ):
         return cache.make_mask(N, return_array=return_array, window_size=window_size)
     if N == 1:
         return None
@@ -220,7 +273,11 @@ def create_attention_mask(
 
 
 def create_ssm_mask(h, cache=None):
-    if cache and hasattr(cache, "make_mask"):
+    if (
+        cache is not None
+        and not isinstance(cache, mx.array)
+        and hasattr(cache, "make_mask")
+    ):
         return cache.make_mask(h.shape[1])
     return None
 
@@ -289,6 +346,21 @@ def quantized_scaled_dot_product_attention(
     return out
 
 
+def _turboquant_attention_applies(cache) -> bool:
+    """Whether the fused TurboQuant kernels can serve this cache.
+
+    They read the quantized state directly, so they need one contiguous
+    sequence starting at index 0. That always holds for the single-sequence
+    cache; the batch cache qualifies only while it carries a single row with
+    no left padding (padded rows would be attended to as real tokens).
+    """
+    if not isinstance(cache, BatchTurboQuantKVCache):
+        return True
+    if not cache.is_single_row():
+        return False
+    return cache.fused_attention_eligible
+
+
 def scaled_dot_product_attention(
     queries,
     keys,
@@ -298,26 +370,28 @@ def scaled_dot_product_attention(
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
-    if isinstance(cache, TurboQuantKVCache):
-        if sinks is not None:
-            raise ValueError("TurboQuant KV cache does not support attention sinks.")
-        if queries.shape[-2] == 1:
-            return cache.decode_attention(
+    if isinstance(cache, (TurboQuantKVCache, BatchTurboQuantKVCache)):
+        # The fused kernels have no sink term, and the batch cache only shares
+        # them when it holds a single unpadded row. Anything else dequantizes,
+        # which is also the only path that can apply sinks.
+        if sinks is None and _turboquant_attention_applies(cache):
+            if queries.shape[-2] == 1:
+                return cache.decode_attention(
+                    queries,
+                    keys_state=keys,
+                    values_state=values,
+                    scale=scale,
+                    mask=mask,
+                )
+            result = cache.prefill_attention(
                 queries,
                 keys_state=keys,
                 values_state=values,
                 scale=scale,
                 mask=mask,
             )
-        result = cache.prefill_attention(
-            queries,
-            keys_state=keys,
-            values_state=values,
-            scale=scale,
-            mask=mask,
-        )
-        if result is not None:
-            return result
+            if result is not None:
+                return result
         dequantized_keys, dequantized_values = cache.dequantize(keys, values)
         return mx.fast.scaled_dot_product_attention(
             queries,
@@ -325,16 +399,7 @@ def scaled_dot_product_attention(
             dequantized_values.astype(queries.dtype),
             scale=scale,
             mask=mask,
-        )
-
-    if isinstance(cache, BatchTurboQuantKVCache):
-        dequantized_keys, dequantized_values = cache.dequantize(keys, values)
-        return mx.fast.scaled_dot_product_attention(
-            queries,
-            dequantized_keys.astype(queries.dtype),
-            dequantized_values.astype(queries.dtype),
-            scale=scale,
-            mask=mask,
+            sinks=sinks,
         )
 
     if hasattr(cache, "bits"):

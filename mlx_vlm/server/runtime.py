@@ -1,6 +1,11 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, Optional
 
+from .runtime_config import RuntimeConfig
+
+MODEL_DISCOVERY_ENV = "MLX_VLM_MODEL_DISCOVERY"
+MODEL_DISCOVERY_MODES = ("served", "hf-cache")
+
 
 class ModelCacheRegistry:
     def __init__(self, default_kind: str = "text_generation"):
@@ -63,9 +68,11 @@ class ServerRuntime:
     model_cache: ModelCacheRegistry = field(default_factory=ModelCacheRegistry)
     response_generator: Optional[Any] = None
     audio_queue: Optional[Any] = None
+    realtime_engine: Optional[Any] = None
     apc_manager: Optional[Any] = None
     metrics: Optional[Any] = None
     preload_failures: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    config: RuntimeConfig = field(default_factory=RuntimeConfig.from_env)
 
 
 runtime = ServerRuntime()

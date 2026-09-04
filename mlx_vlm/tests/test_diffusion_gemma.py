@@ -2,6 +2,7 @@ import contextlib
 import importlib
 import io
 import json
+import os
 import unittest
 from pathlib import Path
 from queue import Queue
@@ -690,6 +691,78 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(responses[-1].diffusion_canvas_tokens, 3)
         self.assertEqual(responses[-1].diffusion_denoising_steps, 1)
         self.assertEqual(responses[-1].diffusion_work_tokens, 3)
+
+    def test_stream_generate_reuses_hybrid_prompt_cache_with_apc(self):
+        from mlx_vlm.apc import APCManager
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        processor = FakeProcessor()
+        input_ids = mx.array([[2, 3, 4, 5]], dtype=mx.int32)
+        recorder = RecordingEncoder(model.model.encoder)
+        model.model.encoder = recorder
+
+        with patch.dict(
+            os.environ,
+            {
+                "APC_CHECKPOINT_ENTRIES": "4",
+                "APC_EXACT_MIN_TOKENS": "1",
+            },
+        ):
+            manager = APCManager(num_blocks=4, block_size=2)
+
+        try:
+            mx.random.seed(7)
+            cold = list(
+                stream_generate(
+                    model,
+                    processor,
+                    "",
+                    input_ids=input_ids,
+                    max_tokens=2,
+                    max_denoising_steps=1,
+                    _apc_manager=manager,
+                    _apc_semantic_hash=11,
+                )
+            )
+            cold_prefill_shapes = list(recorder.input_lengths)
+            recorder.input_lengths.clear()
+
+            mx.random.seed(7)
+            warm = list(
+                stream_generate(
+                    model,
+                    processor,
+                    "",
+                    input_ids=input_ids,
+                    max_tokens=2,
+                    max_denoising_steps=1,
+                    _apc_manager=manager,
+                    _apc_semantic_hash=11,
+                )
+            )
+            warm_prefill_shapes = list(recorder.input_lengths)
+
+            cold_tokens = [
+                response.token
+                for response in cold
+                if response.token is not None and not response.is_draft
+            ]
+            warm_tokens = [
+                response.token
+                for response in warm
+                if response.token is not None and not response.is_draft
+            ]
+            self.assertEqual(cold_tokens, warm_tokens)
+            self.assertEqual(cold[-1].cached_tokens, 0)
+            self.assertEqual(warm[-1].cached_tokens, 3)
+            self.assertEqual(cold_prefill_shapes[-1], 1)
+            self.assertEqual(warm_prefill_shapes, [1])
+            self.assertEqual(manager.stats_snapshot()["exact_hits"], 1)
+        finally:
+            manager.close()
 
     def test_stream_generate_uses_model_owned_generator(self):
         from mlx_vlm.generate import stream_generate
@@ -1485,6 +1558,70 @@ class TestDiffusionGemma4(unittest.TestCase):
             self.assertNotEqual(
                 tokenizer.convert_tokens_to_ids(token), tokenizer.unk_token_id
             )
+
+    def test_strip_channel_scaffolding_removes_leaked_header(self):
+        from mlx_vlm.models.diffusion_gemma.processing_diffusion_gemma import (
+            _strip_channel_scaffolding,
+        )
+
+        raw = (
+            "<|channel>thought\n"
+            "<channel|>Title: White motor cruiser Wavey Katey II cruising on a river\n"
+            "Description: A white cabin motor cruiser named Wavey Katey II cruises "
+            "along a calm waterway.\n"
+            "Keywords: Boat, cabin cruiser, motorboat, river"
+        )
+
+        cleaned = _strip_channel_scaffolding(raw)
+
+        self.assertNotIn("<|channel>", cleaned)
+        self.assertNotIn("<channel|>", cleaned)
+        self.assertNotIn("thought", cleaned)
+        self.assertTrue(cleaned.startswith("Title: White motor cruiser"))
+        self.assertIn("Keywords: Boat, cabin cruiser, motorboat, river", cleaned)
+
+    def test_strip_channel_scaffolding_is_noop_without_markers(self):
+        from mlx_vlm.models.diffusion_gemma.processing_diffusion_gemma import (
+            _strip_channel_scaffolding,
+        )
+
+        plain = "Title: A calm river cruise\nKeywords: boat, river"
+        self.assertEqual(_strip_channel_scaffolding(plain), plain)
+
+    def test_generate_strips_diffusion_channel_scaffolding(self):
+        dispatch_module = importlib.import_module("mlx_vlm.generate.dispatch")
+        from mlx_vlm.generate import GenerationResult, generate
+
+        class Config:
+            model_type = "diffusion_gemma"
+            eos_token_id = 999999
+
+        class Model:
+            config = Config()
+
+        processor = tiny_diffusion_gemma_processor()
+        processor.tokenizer.stopping_criteria = StoppingCriteria(
+            [999999], processor.tokenizer
+        )
+
+        chunks = [
+            GenerationResult(
+                text="<|channel>thought\n<channel|>Title: A calm river cruise",
+                token=1,
+                prompt_tokens=3,
+                generation_tokens=8,
+                total_tokens=11,
+                prompt_tps=10.0,
+                generation_tps=5.0,
+            )
+        ]
+
+        with patch.object(
+            dispatch_module, "stream_generate", return_value=iter(chunks)
+        ):
+            result = generate(Model(), processor, "")
+
+        self.assertEqual(result.text, "Title: A calm river cruise")
 
     def test_processor_returns_video_frames_as_pixel_values(self):
         processor = tiny_diffusion_gemma_processor()

@@ -19,7 +19,12 @@ from .. import apc as _apc
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
-from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
+from ..sample_utils import (
+    apply_top_k,
+    make_logits_processors,
+    make_sampler,
+    top_p_sampling,
+)
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_rounds,
@@ -30,10 +35,20 @@ from ..speculative.utils import (
 from ..turboquant import BatchTurboQuantKVCache, turboquant_enabled
 from ..utils import group_images_by_shape, prepare_inputs, should_add_special_tokens
 from .common import (
+    DEFAULT_COMPLETION_BATCH_SIZE,
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_MIN_P,
+    DEFAULT_PREFILL_BATCH_SIZE,
+    DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
+    DEFAULT_REPETITION_CONTEXT_SIZE,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_K,
+    DEFAULT_TOP_P,
     _chunked_prefill_enabled,
+    _default_prefill_step_size_for_offload,
     generation_stream,
     maybe_quantize_kv_cache,
     wired_limit,
@@ -42,16 +57,7 @@ from .types import GenerateKwargs, ProcessorLike, Unpack
 
 logger = logging.getLogger("mlx_vlm.generate")
 
-DEFAULT_MAX_TOKENS = 2048
-DEFAULT_TEMPERATURE = 0.0
-DEFAULT_TOP_P = 1.0
-DEFAULT_TOP_K = 0
-DEFAULT_MIN_P = 0.0
 DEFAULT_TOP_N_SIGMA = 0.0
-DEFAULT_REPETITION_CONTEXT_SIZE = 20
-DEFAULT_PREFILL_STEP_SIZE = 2048
-DEFAULT_COMPLETION_BATCH_SIZE = 32
-DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
 
 
@@ -88,12 +94,24 @@ def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.ar
 class _PositionedTargetSampler:
     """Sampler with stateless target draws keyed by generated-token position."""
 
-    def __init__(self, *, temperature: float, top_p: float, seed: int):
+    def __init__(
+        self,
+        *,
+        temperature: float,
+        top_p: float,
+        top_k: int = 0,
+        seed: int,
+    ):
         self.temperature = float(temperature)
         self.top_p = float(top_p)
+        self.top_k = int(top_k)
         self.seed = int(seed)
 
+    def _apply_top_k(self, logprobs: mx.array) -> mx.array:
+        return apply_top_k(logprobs, self.top_k) if self.top_k > 0 else logprobs
+
     def __call__(self, logprobs: mx.array) -> mx.array:
+        logprobs = self._apply_top_k(logprobs)
         if self.top_p > 0 and self.top_p < 1.0:
             return top_p_sampling(logprobs, self.top_p, self.temperature)
         return mx.random.categorical(logprobs * (1 / self.temperature))
@@ -107,9 +125,20 @@ class _PositionedTargetSampler:
     ) -> mx.array:
         if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
             raise ValueError("row_ids and positions must match logprobs batch size.")
+        logprobs = self._apply_top_k(logprobs)
         keys = _position_keys(self.seed, row_ids, positions)
         if self.top_p > 0 and self.top_p < 1.0:
             return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
+        return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
+
+    def sample_proposal(
+        self,
+        logprobs: mx.array,
+        *,
+        row_ids: List[int],
+        positions: List[int],
+    ) -> mx.array:
+        keys = _position_keys(self.seed ^ 0x0DFA5202, row_ids, positions)
         return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
 
     def _sample_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
@@ -266,7 +295,6 @@ def generate_step(
             seed is not None
             and temperature > 0
             and min_p == DEFAULT_MIN_P
-            and top_k == DEFAULT_TOP_K
             and top_n_sigma == DEFAULT_TOP_N_SIGMA
             and not p_less
             and typical_p == 1.0
@@ -274,6 +302,7 @@ def generate_step(
             sampler = _PositionedTargetSampler(
                 temperature=temperature,
                 top_p=top_p,
+                top_k=top_k,
                 seed=seed,
             )
         else:
@@ -389,6 +418,15 @@ def generate_step(
             return y, logprobs.squeeze(0) if logprobs.shape[0] == 1 else logprobs
 
     with mx.stream(generation_stream):
+        # APC may supply position metadata computed from the complete prompt
+        # before trimming to an uncached suffix. Embedding helpers see only the
+        # suffix and may return local positions, so explicit caller metadata
+        # must take precedence over their derived values.
+        explicit_prompt_metadata = {
+            key: kwargs[key]
+            for key in ("position_ids", "rope_deltas")
+            if kwargs.get(key) is not None
+        }
         # Get input embeddings (handles both multimodal and text-only)
         embedding_output = model.get_input_embeddings(
             input_ids, pixel_values, mask=mask, **kwargs
@@ -403,9 +441,13 @@ def generate_step(
                 if k != "inputs_embeds" and v is not None
             }
         )
+        kwargs.update(explicit_prompt_metadata)
         policy_kwargs = kwargs
         if speculative_prefill_capture_kwargs:
             policy_kwargs = {**kwargs, **speculative_prefill_capture_kwargs}
+        prefill_step_size = _default_prefill_step_size_for_offload(
+            model, prefill_step_size, draft_model, DEFAULT_PREFILL_STEP_SIZE
+        )
         if prefill_step_size is not None and not _chunked_prefill_enabled(
             model,
             input_ids=input_ids,
@@ -423,8 +465,13 @@ def generate_step(
             else None
         )
         checkpoint_done = False
+        # Chunk whenever there is more than one prompt token left to process.
+        # The chunk loop discards its output, so the [B, N, vocab] logits are
+        # never evaluated; the unchunked path feeds the whole prompt to _step,
+        # which reads logits[:, -1, :] and so materializes every row. Gating on
+        # prefill_step_size made short prompts peak higher than long ones.
         should_chunk = (
-            prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size
+            prefill_step_size is not None and inputs_embeds.shape[1] > 1
         ) or (
             checkpoint_len is not None and 0 < checkpoint_len < inputs_embeds.shape[1]
         )
@@ -622,6 +669,85 @@ def _split_prompt_kwargs_per_row(prompt_kwargs: dict, batch_size: int) -> List[d
     return rows
 
 
+def _unpad_batch_prompts(
+    prompts: Union[mx.array, List[List[int]]],
+    attention_mask: Optional[mx.array],
+    prompt_kwargs: List[dict],
+) -> Tuple[List[List[int]], List[dict]]:
+    """Convert a masked dense batch to the generator's ragged row format.
+
+    ``BatchGenerator`` owns prompt padding and derives cache offsets from the
+    row lengths it receives. Remove processor padding, together with the
+    corresponding columns of every sequence-aligned prompt tensor, before the
+    rows are added to its queue.
+    """
+    if attention_mask is None:
+        if isinstance(prompts, mx.array):
+            if prompts.ndim != 2:
+                raise ValueError("Batched prompts must be a 2D array")
+            return prompts.tolist(), prompt_kwargs
+        return prompts, prompt_kwargs
+
+    if not isinstance(attention_mask, mx.array) or attention_mask.ndim != 2:
+        raise ValueError("attention_mask must be a 2D MLX array")
+
+    if isinstance(prompts, mx.array):
+        if prompts.ndim != 2 or attention_mask.shape != prompts.shape:
+            raise ValueError("attention_mask must have the same 2D shape as prompts")
+        batch_size, sequence_length = prompts.shape
+        # Materialize the tokenizer outputs together. Both are converted to
+        # Python metadata below, so one explicit boundary avoids row-by-row
+        # GPU syncs.
+        mx.eval(prompts, attention_mask)
+        input_rows = prompts.tolist()
+    else:
+        batch_size, sequence_length = attention_mask.shape
+        if len(prompts) != batch_size or any(
+            len(row) != sequence_length for row in prompts
+        ):
+            raise ValueError("attention_mask must have the same 2D shape as prompts")
+        mx.eval(attention_mask)
+        input_rows = [list(row) for row in prompts]
+
+    if len(prompt_kwargs) != batch_size:
+        raise ValueError("prompt_kwargs must contain one dictionary per prompt")
+
+    mask_rows = attention_mask.tolist()
+
+    unpadded_prompts: List[List[int]] = []
+    for row_idx, (ids, row_mask, kwargs) in enumerate(
+        zip(input_rows, mask_rows, prompt_kwargs)
+    ):
+        start = next((i for i, value in enumerate(row_mask) if bool(value)), None)
+        if start is None:
+            raise ValueError(f"attention_mask row {row_idx} contains no prompt tokens")
+        stop = sequence_length - next(
+            (i for i, value in enumerate(reversed(row_mask)) if bool(value)), 0
+        )
+        if any(not bool(value) for value in row_mask[start:stop]):
+            raise ValueError("attention_mask must contain one contiguous prompt span")
+
+        unpadded_prompts.append(ids[start:stop])
+        if start == 0 and stop == sequence_length:
+            continue
+
+        for key, value in list(kwargs.items()):
+            if not isinstance(value, mx.array):
+                continue
+            if key == "inputs_embeds":
+                sequence_aligned = value.ndim >= 2 and value.shape[1] == sequence_length
+            else:
+                sequence_aligned = _is_sequence_aligned_prompt_kwarg(
+                    key, value, sequence_length
+                )
+            if sequence_aligned:
+                kwargs[key] = _slice_sequence_aligned_prompt_kwarg(
+                    key, value, start=start, stop=stop
+                )
+
+    return unpadded_prompts, prompt_kwargs
+
+
 def _is_sequence_aligned_prompt_kwarg(
     key: str, v: mx.array, sequence_length: int
 ) -> bool:
@@ -722,6 +848,15 @@ def _merge_prefill_prompt_kwargs(
     return inputs_embeds, merged_kwargs
 
 
+def _is_batch_cache_entry(entry) -> bool:
+    """Return whether a cache entry already owns a batch dimension."""
+    if isinstance(entry, cache.CacheList):
+        return all(_is_batch_cache_entry(child) for child in entry.caches)
+    return callable(getattr(entry, "filter", None)) and callable(
+        getattr(entry, "extend", None)
+    )
+
+
 def _extend_cache(cache_a, cache_b):
     """Extend cache_a with cache_b along the batch dimension."""
     if not cache_a:
@@ -730,9 +865,9 @@ def _extend_cache(cache_a, cache_b):
         return cache_a
     extended = []
     for ca, cb in zip(cache_a, cache_b):
-        if not hasattr(ca, "left_padding") and hasattr(ca.__class__, "merge"):
+        if not _is_batch_cache_entry(ca) and hasattr(ca.__class__, "merge"):
             ca = ca.__class__.merge([ca])
-        if not hasattr(cb, "left_padding") and hasattr(cb.__class__, "merge"):
+        if not _is_batch_cache_entry(cb) and hasattr(cb.__class__, "merge"):
             cb = cb.__class__.merge([cb])
         ca.extend(cb)
         extended.append(ca)
@@ -763,6 +898,10 @@ def _make_cache(
     *kv_quant_scheme* selects the quantization backend:
     - ``"uniform"`` → ``BatchQuantizedKVCache`` (``mx.quantize``)
     - ``"turboquant"`` or fractional *kv_bits* → ``BatchTurboQuantKVCache``
+
+    Model-specific ``to_batch()`` conversions preserve auxiliary cache state.
+    Quantized continuous batching with these caches raises
+    ``NotImplementedError``.
     """
     _batch_policy = kv_quant_from_legacy(
         kv_bits,
@@ -800,7 +939,13 @@ def _make_cache(
     def to_batch_cache(c, quantize=True):
         # Caches that ship their own batch-conversion (e.g. MiniMax M3 sparse
         # index-key side cache) know how to build the correct batch cache.
-        if hasattr(c, "to_batch") and not isinstance(c, cache.KVCache):
+        if hasattr(c, "to_batch"):
+            if kv_bits is not None and quantize:
+                raise NotImplementedError(
+                    f"{type(c).__name__} does not support quantized continuous "
+                    "batching with model-specific cache state; "
+                    "disable KV quantization for continuous batching"
+                )
             return c.to_batch(left_padding)
         if isinstance(c, cache.KVCache):
             if kv_bits is not None and quantize:
@@ -817,6 +962,8 @@ def _make_cache(
         elif isinstance(c, cache.ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c
+        elif isinstance(c, cache.PoolingCache):
+            return cache.BatchPoolingCache(c.ratio, left_padding)
         elif isinstance(c, cache.RotatingKVCache):
             if c.keep > 0:
                 raise ValueError("RotatingKVCache with keep tokens is not supported.")
@@ -1380,7 +1527,7 @@ class GenerationBatch:
 
 
 class SpeculativeGenerationBatch:
-    """GenerationBatch-compatible wrapper for server-side MTP decode."""
+    """GenerationBatch-compatible wrapper for server-side speculative decode."""
 
     is_speculative = True
     Response = GenerationBatch.Response
@@ -1600,6 +1747,7 @@ class PromptProcessingBatch:
         warm_cache: Optional[List[Any]] = None,
         apc_meta: Optional[List[dict]] = None,
         apc_manager: Optional["_apc.APCManager"] = None,
+        apc_coordinator: Optional["_apc.APCCoordinator"] = None,
         right_pad_per_row: Optional[List[int]] = None,
         suffix_lens: Optional[List[int]] = None,
         apc_mode: Optional[str] = None,
@@ -1665,6 +1813,7 @@ class PromptProcessingBatch:
         # APC metadata used for post-prefill block harvest (per-row).
         self._apc_meta = apc_meta or []
         self._apc_manager = apc_manager
+        self._apc_coordinator = apc_coordinator
         self._apc_mode = apc_mode
         self._apc_harvest_enabled = True
         self._prompt_time_s = 0.0
@@ -1738,6 +1887,9 @@ class PromptProcessingBatch:
                     )
                 prepare(right_padding=right_pad_per_row, lengths=self._suffix_lens)
 
+        self.prefill_step_size = _default_prefill_step_size_for_offload(
+            self.model, self.prefill_step_size, draft_model, DEFAULT_PREFILL_STEP_SIZE
+        )
         if self.prefill_step_size is not None:
             policy_kwargs = dict(self._prompt_kwargs)
             if draft_model is not None and draft_kind is not None:
@@ -1765,20 +1917,28 @@ class PromptProcessingBatch:
             if meta is not None:
                 self._apc_manager.release(meta.get("apc_blocks", []))
 
+    def _apc_uses_checkpoints(self) -> bool:
+        coordinator = getattr(self, "_apc_coordinator", None)
+        if coordinator is not None:
+            return coordinator.is_checkpoint
+        return self._apc_mode == "exact"
+
     def needs_processing(self):
         """True if prompt needs chunked processing before generate()."""
         if self._inputs_embeds is None or self.prefill_step_size is None:
             return self._next_apc_checkpoint_column() is not None
         if self._next_apc_checkpoint_column() is not None:
             return True
-        return self._inputs_embeds.shape[1] > self.prefill_step_size
+        # See the note in stream_generate: prompts at or below prefill_step_size
+        # would otherwise skip chunking and materialize the full logits tensor.
+        return self._inputs_embeds.shape[1] > 1
 
     def _apc_checkpoint_column_for_meta(
         self, batch_idx: int, meta: dict
     ) -> Optional[int]:
         checkpoint_len = int(meta.get("checkpoint_len") or 0)
         if (
-            self._apc_mode != "exact"
+            not self._apc_uses_checkpoints()
             or checkpoint_len <= 0
             or meta.get("checkpoint_done")
         ):
@@ -1797,7 +1957,7 @@ class PromptProcessingBatch:
     def _next_apc_checkpoint_column(self) -> Optional[int]:
         if (
             self._apc_manager is None
-            or self._apc_mode != "exact"
+            or not self._apc_uses_checkpoints()
             or not self._apc_meta
             or self._inputs_embeds is None
         ):
@@ -1832,7 +1992,7 @@ class PromptProcessingBatch:
         return _apc.snapshot_prompt_cache_row(self.prompt_cache, batch_idx)
 
     def _store_apc_exact_checkpoints(self) -> None:
-        if self._apc_manager is None or self._apc_mode != "exact":
+        if self._apc_manager is None or not self._apc_uses_checkpoints():
             return
         for batch_idx, meta in enumerate(self._apc_meta):
             if meta is None or meta.get("checkpoint_done"):
@@ -1845,11 +2005,19 @@ class PromptProcessingBatch:
             prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
             if prompt_cache is None:
                 continue
-            self._apc_manager.store_exact_cache(
-                meta["full_input_ids"][:checkpoint_len],
-                prompt_cache,
-                extra_hash=meta.get("extra_hash", 0),
-            )
+            coordinator = getattr(self, "_apc_coordinator", None)
+            if coordinator is not None:
+                coordinator.store_checkpoint(
+                    meta["full_input_ids"][:checkpoint_len],
+                    prompt_cache,
+                    extra_hash=meta.get("extra_hash", 0),
+                )
+            else:
+                self._apc_manager.store_exact_cache(
+                    meta["full_input_ids"][:checkpoint_len],
+                    prompt_cache,
+                    extra_hash=meta.get("extra_hash", 0),
+                )
             meta["checkpoint_done"] = True
 
     def _prompt_kwargs_for_step(self, n: Optional[int] = None) -> dict:
@@ -2079,7 +2247,17 @@ class PromptProcessingBatch:
                 for batch_idx, meta in enumerate(self._apc_meta):
                     if meta is None:
                         continue
-                    if self._apc_mode == "exact":
+                    coordinator = getattr(self, "_apc_coordinator", None)
+                    if coordinator is not None:
+                        coordinator.commit(
+                            self.prompt_cache,
+                            meta["full_input_ids"],
+                            batch_idx=batch_idx,
+                            extra_hash=meta.get("extra_hash", 0),
+                            skip_first_n_tokens=meta.get("prefix_len", 0),
+                            blocks_in_use=meta.get("apc_blocks", []),
+                        )
+                    elif self._apc_mode == "exact":
                         prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
                         if prompt_cache is not None:
                             self._apc_manager.store_exact_cache(
@@ -2222,13 +2400,14 @@ class BatchGenerator:
             top_logprobs_k = 0
             self.compute_logprobs = False
             self.top_logprobs_k = 0
-        # APC mode detection: plain KV models use block APC;
-        # mixed/custom cache models use exact prompt-cache snapshots.
-        self.apc_mode = None
-        if apc_manager is not None:
-            self.apc_mode = _apc.model_apc_mode(model)
-            if self.apc_mode is None:
-                apc_manager = None
+        self.apc = (
+            _apc.APCCoordinator(apc_manager, model) if apc_manager is not None else None
+        )
+        if self.apc is not None and not self.apc.enabled:
+            self.apc = None
+            apc_manager = None
+        # Compatibility attribute for callers/tests that still inspect it.
+        self.apc_mode = self.apc.legacy_mode if self.apc is not None else None
         self.apc_manager = apc_manager
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
@@ -2322,6 +2501,9 @@ class BatchGenerator:
         )
 
     def _apc_exact_checkpoint_len(self, ids_list: List[int]) -> int:
+        coordinator = getattr(self, "apc", None)
+        if coordinator is not None:
+            return coordinator.checkpoint_len(ids_list, self._apc_media_token_ids())
         if self.apc_manager is None or getattr(self, "apc_mode", "block") != "exact":
             return 0
         return _apc.adjust_prefix_to_text_suffix_boundary(
@@ -2340,14 +2522,24 @@ class BatchGenerator:
         uid, ids_list, max_toks, prompt_kwargs, lps, criteria = sequence
         if not ids_list or len(ids_list) < 2:
             return None
+        coordinator = getattr(self, "apc", None)
+        lookup_kwargs = {
+            "extra_hash": self._apc_extra_hash(prompt_kwargs or {}),
+            "safe_lookup_min": self._apc_safe_prefix_lookup_min(ids_list),
+            "suffix_is_text_only": lambda pl: self._apc_suffix_is_text_only(
+                ids_list, pl
+            ),
+            "prefix_has_media": lambda pl: self._apc_prefix_has_media_tokens(
+                ids_list, pl
+            ),
+        }
+        if coordinator is not None:
+            return coordinator.lookup(ids_list, **lookup_kwargs)
         return _apc.apc_lookup_plan(
             self.apc_manager,
             ids_list,
-            extra_hash=self._apc_extra_hash(prompt_kwargs or {}),
             apc_mode=getattr(self, "apc_mode", "block"),
-            safe_lookup_min=self._apc_safe_prefix_lookup_min(ids_list),
-            suffix_is_text_only=lambda pl: self._apc_suffix_is_text_only(ids_list, pl),
-            prefix_has_media=lambda pl: self._apc_prefix_has_media_tokens(ids_list, pl),
+            **lookup_kwargs,
         )
 
     def _build_mixed_prompt_batch(
@@ -2451,30 +2643,36 @@ class BatchGenerator:
             getattr(self, "kv_value_scheme", None),
         )
         _quant_cfg = _quant_policy.to_config() if _quant_policy is not None else None
-        if apc_mode == "exact":
+        coordinator = getattr(self, "apc", None)
+        if coordinator is not None:
+            warm_cache, _ = coordinator.merge_rows(
+                picks,
+                prefix_lens,
+                kv_quant_config=_quant_cfg,
+            )
+        elif apc_mode == "exact":
             row_caches = [
                 p["warm_cache"] if p is not None else self.model.make_cache()
                 for p in picks
             ]
-            # Pass kv_quant_config so exact multi warm matches live _make_cache
-            # layer types under --kv-bits (cold quant row + exact float join).
             warm_cache, _ = _apc.make_warm_batch_exact_cache_multi(
                 row_caches,
                 prefix_lens,
                 kv_quant_config=_quant_cfg,
             )
-            if warm_cache is None:
-                return None
         else:
-            # Build the multi-row warm cache (zeros for cold rows, K/V for warm).
             num_layers = (
                 len(self.model.make_cache())
                 if hasattr(self.model, "make_cache")
                 else len(self.model.layers)
             )
             warm_cache, _ = _apc.make_warm_batch_kv_cache_multi(
-                picks, num_layers=num_layers, kv_quant_config=_quant_cfg
+                picks,
+                num_layers=num_layers,
+                kv_quant_config=_quant_cfg,
             )
+        if warm_cache is None:
+            return None
 
         apc_meta = [
             {
@@ -2517,6 +2715,7 @@ class BatchGenerator:
             warm_cache=warm_cache,
             apc_meta=apc_meta,
             apc_manager=self.apc_manager,
+            apc_coordinator=getattr(self, "apc", None),
             right_pad_per_row=right_pad_per_row,
             suffix_lens=suffix_lens,
             apc_mode=apc_mode,
@@ -2571,14 +2770,24 @@ class BatchGenerator:
             List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
         ] = None,
         thinking_budget_criteria: Optional[List[Any]] = None,
+        attention_mask: Optional[mx.array] = None,
     ):
+        """Queue prompts, consuming tokenizer padding metadata when provided.
+
+        A dense ``prompts`` array may include tokenizer padding when accompanied
+        by a same-shaped ``attention_mask``. The padded columns are removed from
+        tokens and sequence-aligned prompt tensors before anything is queued.
+        """
         uids = []
 
         if max_tokens is None or isinstance(max_tokens, int):
             max_tokens = [max_tokens or self.max_tokens] * len(prompts)
 
         if prompt_kwargs is None:
-            prompt_kwargs = [{}] * len(prompts)
+            prompt_kwargs = [{} for _ in range(len(prompts))]
+        prompts, prompt_kwargs = _unpad_batch_prompts(
+            prompts, attention_mask, prompt_kwargs
+        )
         if logits_processors is None:
             logits_processors = [self.logits_processors] * len(prompts)
         elif len(logits_processors) != len(prompts):
@@ -2722,11 +2931,10 @@ class BatchGenerator:
         if self._prompt_batch is not None:
             if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
-                n = self._prompt_batch.prompt_step()
+                self._prompt_batch.prompt_step()
                 elapsed = time.perf_counter() - tic
                 self._prompt_time_counter += elapsed
                 self._record_prompt_batch_time(self._prompt_batch, elapsed)
-                self._prompt_tokens_counter += n
                 return prompt_responses, generation_responses
 
             tic = time.perf_counter()
@@ -2829,6 +3037,7 @@ class BatchGenerator:
                 ),
                 apc_meta=apc_meta,
                 apc_manager=self.apc_manager,
+                apc_coordinator=getattr(self, "apc", None),
                 apc_mode=self.apc_mode,
                 draft_model=getattr(self, "draft_model", None),
                 draft_kind=getattr(self, "draft_kind", None),
@@ -3152,6 +3361,12 @@ def _generate_batch(
         **{k: v for k, v in embedding_output.to_dict().items() if v is not None},
     }
 
+    kwargs["prefill_step_size"] = _default_prefill_step_size_for_offload(
+        model,
+        kwargs.get("prefill_step_size", DEFAULT_PREFILL_STEP_SIZE),
+        kwargs.get("draft_model"),
+        DEFAULT_PREFILL_STEP_SIZE,
+    )
     if kwargs.get("prefill_step_size", DEFAULT_PREFILL_STEP_SIZE) is not None:
         policy_kwargs = dict(gen_kwargs)
         draft_model = kwargs.get("draft_model")
@@ -3187,11 +3402,13 @@ def _generate_batch(
             for _ in range(batch_size)
         ]
 
+    prompt_kwargs = _split_prompt_kwargs_per_row(gen_kwargs, batch_size)
     uids = gen.insert(
-        input_ids.tolist(),
+        input_ids,
         max_tokens,
-        prompt_kwargs=_split_prompt_kwargs_per_row(gen_kwargs, batch_size),
+        prompt_kwargs=prompt_kwargs,
         logits_processors=logits_processors,
+        attention_mask=mask,
     )
     results = {uid: [] for uid in uids}
 

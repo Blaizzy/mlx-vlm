@@ -17,6 +17,9 @@ from ..models.diffusion_visualizer import (
 )
 from ..tokenizer_utils import make_streaming_detokenizer
 from .common import (
+    DEFAULT_DIFFUSION_MAX_DENOISING_STEPS,
+    DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
+    DEFAULT_TEMPERATURE,
     GenerationResult,
     _chunked_prefill_enabled,
     generation_stream,
@@ -25,9 +28,6 @@ from .common import (
 
 logger = logging.getLogger("mlx_vlm.generate")
 
-DEFAULT_TEMPERATURE = 0.0
-DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
-DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 DEFAULT_DIFFUSION_UNMASKING_WIDTH = 0
 DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD = 0.9
 
@@ -561,6 +561,8 @@ def stream_diffusion_generate(
     mm_token_type_ids: Optional[mx.array] = None,
     prefill_step_size: Optional[int] = None,
     decoder_input_ids: Optional[mx.array] = None,
+    apc_manager: Optional[Any] = None,
+    apc_extra_hash: int = 0,
 ) -> Generator[GenerationResult, None, None]:
     if input_ids.shape[0] != 1:
         raise ValueError(
@@ -658,6 +660,55 @@ def stream_diffusion_generate(
     else:
         attention_mask = attention_mask.astype(mx.bool_)
 
+    # DiffusionGemma's encoder cache is hybrid: rotating K/V for sliding
+    # attention and ordinary K/V for global attention. Reuse it through APC's
+    # exact checkpoint path; block concatenation would lose rotating-cache
+    # state. Static caches intentionally stay request-local because their
+    # preallocated layout is not interchangeable with dynamic checkpoints.
+    apc = None
+    apc_hit = None
+    cached_tokens = 0
+    checkpoint_len = 0
+    full_token_ids = [int(token_id) for token_id in input_ids[0].tolist()]
+    prompt_tic = time.perf_counter()
+    if apc_manager is not None and not diffusion_static_cache:
+        from ..apc import (
+            media_safe_prefix_min,
+            multimodal_token_ids_from_config,
+            prefix_contains_media_tokens,
+            prefix_leaves_text_only_suffix,
+        )
+        from ..apc_coordinator import APCCoordinator
+
+        candidate = APCCoordinator(apc_manager, model)
+        if candidate.enabled and candidate.is_checkpoint:
+            apc = candidate
+            media_token_ids = multimodal_token_ids_from_config(model.config)
+            safe_lookup_min = max(
+                0,
+                media_safe_prefix_min(full_token_ids, media_token_ids) - 1,
+            )
+            apc_hit = apc.lookup(
+                full_token_ids,
+                extra_hash=int(apc_extra_hash or 0),
+                safe_lookup_min=safe_lookup_min,
+                suffix_is_text_only=lambda prefix_len: (
+                    prefix_leaves_text_only_suffix(
+                        full_token_ids,
+                        prefix_len,
+                        media_token_ids,
+                    )
+                ),
+                prefix_has_media=lambda prefix_len: prefix_contains_media_tokens(
+                    full_token_ids,
+                    prefix_len,
+                    media_token_ids,
+                ),
+            )
+            checkpoint_len = apc.checkpoint_len(full_token_ids, media_token_ids)
+            if apc_hit is not None:
+                cached_tokens = int(apc_hit.get("prefix_len", 0) or 0)
+
     static_cache_length = _diffusion_static_cache_length(
         prompt_length,
         max_new_tokens,
@@ -675,7 +726,14 @@ def stream_diffusion_generate(
     else:
         decoder_attention_mask = attention_mask if has_padding else None
         cached_sequence_length = prompt_length
-        kv_cache = model.make_cache()
+        kv_cache = (
+            apc.materialize_single(
+                apc_hit,
+                min_capacity_tokens=prompt_length,
+            )
+            if apc is not None and apc_hit is not None
+            else model.make_cache()
+        )
     detokenizer = make_streaming_detokenizer(processor)
     prefill_policy_kwargs = {
         "attention_mask": attention_mask,
@@ -702,7 +760,7 @@ def stream_diffusion_generate(
     last_token = None
     prompt_time = 0.0
     generation_tic = time.perf_counter()
-    tic = time.perf_counter()
+    tic = prompt_tic
     is_prefill = True
     current_canvas = None
     stopped = False
@@ -731,6 +789,7 @@ def stream_diffusion_generate(
             generation_tps=generated_tokens / generation_time,
             peak_memory=mx.get_peak_memory() / 1e9,
             finish_reason=finish_reason,
+            cached_tokens=cached_tokens,
             diffusion_canvas_tokens=diffusion_canvas_tokens,
             diffusion_denoising_steps=diffusion_denoising_steps,
             diffusion_work_tokens=diffusion_work_tokens,
@@ -747,19 +806,68 @@ def stream_diffusion_generate(
     with mx.stream(generation_stream):
         self_conditioning_context = model.diffusion_prepare_self_conditioning()
         canvas_index = 0
+
+        def prefill_range(start: int, end: int) -> None:
+            nonlocal kv_cache
+            if end <= start:
+                return
+            segment_len = end - start
+            segment_attention_mask = (
+                (
+                    attention_mask
+                    if start == 0 and end == prompt_length
+                    else attention_mask[:, :end]
+                )
+                if has_padding
+                else None
+            )
+            segment_token_types = (
+                (
+                    mm_token_type_ids
+                    if start == 0 and end == prompt_length
+                    else mm_token_type_ids[:, start:end]
+                )
+                if mm_token_type_ids is not None
+                else None
+            )
+            kv_cache = model.diffusion_prefill_cache(
+                input_ids[:, start:end],
+                attention_mask=segment_attention_mask,
+                cache=kv_cache,
+                # APC only restores prefixes whose remaining suffix is text.
+                # Vision features therefore belong exclusively to the cold
+                # segment beginning at token zero.
+                pixel_values=pixel_values if start == 0 else None,
+                mm_token_type_ids=segment_token_types,
+                prefill_step_size=prefill_step_size,
+                chunk_prefill=(
+                    chunk_prefill
+                    and prefill_step_size is not None
+                    and segment_len > prefill_step_size
+                ),
+            )
+
         while generated_tokens < max_new_tokens:
             canvas_index += 1
             unprocessed_input_ids = input_ids if is_prefill else current_canvas
             if is_prefill:
-                kv_cache = model.diffusion_prefill_cache(
-                    unprocessed_input_ids,
-                    attention_mask=attention_mask if has_padding else None,
-                    cache=kv_cache,
-                    pixel_values=pixel_values,
-                    mm_token_type_ids=mm_token_type_ids,
-                    prefill_step_size=prefill_step_size,
-                    chunk_prefill=chunk_prefill,
-                )
+                prefill_start = cached_tokens
+                if checkpoint_len > prefill_start:
+                    prefill_range(prefill_start, checkpoint_len)
+                    apc.store_checkpoint(
+                        full_token_ids[:checkpoint_len],
+                        kv_cache,
+                        extra_hash=int(apc_extra_hash or 0),
+                    )
+                    prefill_start = checkpoint_len
+                prefill_range(prefill_start, prompt_length)
+                if apc is not None:
+                    apc.commit(
+                        kv_cache,
+                        full_token_ids,
+                        extra_hash=int(apc_extra_hash or 0),
+                        skip_first_n_tokens=cached_tokens,
+                    )
             else:
                 kv_cache = model.diffusion_update_cache(
                     unprocessed_input_ids,

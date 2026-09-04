@@ -6,6 +6,7 @@ import mlx.nn as nn
 from .common import (
     _batch_cache_left_padding,
     _record_speculative_round,
+    _requires_uniform_batch_acceptance,
     _SpeculativeSamplerRNG,
     generation_stream,
 )
@@ -194,6 +195,7 @@ def _eagle3_verify_target(
         verify_input,
         cache=prompt_cache,
         capture_layer_ids=target_layer_ids,
+        speculative_verify=True,
     )
     hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
     target_tokens = sampler(verify_out.logits)
@@ -606,7 +608,7 @@ def _eagle3_rounds_batch(
         )
         if (
             n_active > 1
-            and getattr(draft_model, "requires_uniform_batch_acceptance", False)
+            and _requires_uniform_batch_acceptance(draft_model, lm)
             and len(set(accepted_list)) > 1
         ):
             accepted_list, new_tokens_list = _eagle3_walk_batch_uniform_acceptance(
