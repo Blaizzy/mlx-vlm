@@ -280,6 +280,7 @@ def _dflash_rounds(
     token_dtype: mx.Dtype = mx.int32,
     use_model_initial_block_size: bool = True,
     greedy_sampling: bool = True,
+    eos_token_ids: Optional[set] = None,
 ) -> Generator[Tuple[int, None], None, None]:
     """DFlash speculative-decoding **round loop**.
 
@@ -321,6 +322,8 @@ def _dflash_rounds(
 
     b = first_bonus
     emitted = 1  # the first bonus has already been yielded by the caller
+    if eos_token_ids is not None and b in eos_token_ids:
+        return
 
     while emitted < max_tokens:
         bs = _dflash_next_block_size(
@@ -422,7 +425,9 @@ def _dflash_rounds(
         for tok in new_tokens:
             yield tok, None
             emitted += 1
-            if emitted >= max_tokens:
+            if emitted >= max_tokens or (
+                eos_token_ids is not None and tok in eos_token_ids
+            ):
                 return
 
         verify_out = None
@@ -442,6 +447,7 @@ def _dflash_rounds_batch(
     stop_check: Optional[Callable[[int, int], bool]] = None,
     greedy_sampling: bool = True,
     row_ids: Optional[List[int]] = None,
+    eos_token_ids: Optional[set] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batch DFlash speculative-decoding round loop (B > 1).
 
@@ -489,8 +495,13 @@ def _dflash_rounds_batch(
     # stable indices in the yielded token lists.
     b = first_bonus.tolist()  # active bonus tokens
     emitted = [1] * B
-    finished = [False] * B
-    active_idx = list(range(B))  # maps active-slot → original-index
+    finished = [eos_token_ids is not None and token in eos_token_ids for token in b]
+    active_idx = [i for i in range(B) if not finished[i]]
+    if 0 < len(active_idx) < B:
+        keep_mx = mx.array(active_idx, dtype=mx.int32)
+        for c in prompt_cache:
+            if hasattr(c, "filter"):
+                c.filter(keep_mx)
     hidden_by_orig = [hidden[i : i + 1] for i in range(B)]
 
     total_emitted = sum(emitted)
@@ -627,6 +638,8 @@ def _dflash_rounds_batch(
                     tokens_out[orig] = tok
                     emitted[orig] += 1
                     if emitted[orig] >= max_tokens:
+                        finished[orig] = True
+                    if eos_token_ids is not None and tok in eos_token_ids:
                         finished[orig] = True
                     if stop_check is not None and stop_check(orig, tok):
                         finished[orig] = True
