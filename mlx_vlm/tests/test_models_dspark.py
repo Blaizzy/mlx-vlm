@@ -1174,6 +1174,28 @@ def test_gemma4_dspark_attention_shares_key_and_value_projection():
     assert keys.shape == values.shape == (1, 3, 512)
 
 
+def test_gemma4_dspark_attention_forward_runs():
+    """A forward must not raise: the custom __init__ still has to set is_causal and
+    attention_sink_bias, which the inherited DFlashAttention.__call__ reads."""
+    from mlx_vlm.models.cache import KVCache
+    from mlx_vlm.speculative.drafters.gemma4_dspark import Model as G4Model
+    from mlx_vlm.speculative.drafters.gemma4_dspark import ModelConfig as G4Config
+    from mlx_vlm.speculative.drafters.gemma4_dspark.gemma4_dspark import (
+        Gemma4DSparkAttention,
+    )
+
+    config = G4Config.from_dict(_published_gemma4_dspark_config())
+    rope = G4Model(config).rope
+    attention = Gemma4DSparkAttention(config, 0)
+    x = mx.zeros((1, 2, config.hidden_size))
+    x_ctx = mx.zeros((1, 3, config.hidden_size))
+
+    out = attention(x, x_ctx, rope, KVCache())
+    mx.eval(out)
+
+    assert out.shape == (1, 2, config.hidden_size)
+
+
 def test_generic_loader_routes_gemma4_dspark_checkpoint(tmp_path):
     """The checkpoint declares gemma4_text, so routing keys off the architecture tag."""
     from mlx_vlm.speculative.drafters.gemma4_dspark import Model as G4Model

@@ -68,6 +68,14 @@ class Gemma4DSparkAttention(DFlashAttention):
         else:
             self.n_kv_heads = config.num_key_value_heads
         self.scale = 1.0
+        # Set here too: this __init__ bypasses DFlashAttention.__init__ for Gemma 4's
+        # geometry, but the inherited __call__ still reads both of these.
+        self.is_causal = bool(getattr(config, "is_causal", self.is_sliding))
+        self.attention_sink_bias = (
+            mx.zeros((self.n_heads,))
+            if getattr(config, "attention_sink_bias", False)
+            else None
+        )
 
         dim = config.hidden_size
         self.q_proj = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
