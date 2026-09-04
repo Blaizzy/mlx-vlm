@@ -26,6 +26,7 @@ import mlx_vlm.models.laguna.language as laguna_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.models.qwen3_5.speculative_verifier as qwen_verifier
 import mlx_vlm.models.qwen3_5_moe.language as qwen_moe_language
+import mlx_vlm.speculative.cache_state as speculative_cache_state
 import mlx_vlm.speculative.mtp as mtp_utils
 from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models.base import kv_sequence_length
@@ -3774,9 +3775,9 @@ def test_deepseek_v4_replay_snapshot_required_only_when_pooling_can_cross_window
     pool = PoolingCache(4)
     pool.accumulate_windows(mx.array([[[10.0]]]), mx.ones((1, 1, 1)), offset=0)
 
-    assert not deepseek_language._needs_replay_snapshot_for_cache([pool], 2)
-    assert deepseek_language._needs_replay_snapshot_for_cache([pool], 3)
-    assert not deepseek_language._needs_replay_snapshot_for_cache(
+    assert not speculative_cache_state.needs_replay_snapshot_for_cache([pool], 2)
+    assert speculative_cache_state.needs_replay_snapshot_for_cache([pool], 3)
+    assert not speculative_cache_state.needs_replay_snapshot_for_cache(
         [RotatingKVCache(max_size=8)], 3
     )
 
@@ -3787,7 +3788,7 @@ def test_deepseek_v4_pooling_snapshot_skips_clone_when_verify_does_not_overwrite
     old_gate = mx.array([[[1.0]]])
     pool.accumulate_windows(old_kv, old_gate, offset=0)
 
-    snapshot = deepseek_language._snapshot_cache_state([pool], incoming_tokens=3)
+    snapshot = speculative_cache_state.snapshot_cache_state([pool], incoming_tokens=3)
     assert snapshot[0][2] is None
 
     new_kv = mx.array([[[20.0], [21.0], [22.0]]])
@@ -3795,7 +3796,7 @@ def test_deepseek_v4_pooling_snapshot_skips_clone_when_verify_does_not_overwrite
     pooled, _, _ = pool.accumulate_windows(new_kv, new_gate, offset=1)
     pool.update_and_fetch(pooled)
 
-    deepseek_language._restore_cache_state([pool], snapshot)
+    speculative_cache_state.restore_cache_state([pool], snapshot)
 
     assert pool.remainder == 1
     assert pool.pooled is None
@@ -3808,7 +3809,7 @@ def test_deepseek_v4_pooling_snapshot_restores_only_overwritten_prefix():
     old_gate = mx.ones_like(old_kv)
     pool.accumulate_windows(old_kv, old_gate, offset=0)
 
-    snapshot = deepseek_language._snapshot_cache_state([pool], incoming_tokens=3)
+    snapshot = speculative_cache_state.snapshot_cache_state([pool], incoming_tokens=3)
     assert snapshot[0][2].shape == (1, 2, 1)
 
     new_kv = mx.array([[[20.0], [21.0], [22.0]]])
@@ -3816,7 +3817,7 @@ def test_deepseek_v4_pooling_snapshot_restores_only_overwritten_prefix():
     pooled, _, _ = pool.accumulate_windows(new_kv, new_gate, offset=3)
     pool.update_and_fetch(pooled)
 
-    deepseek_language._restore_cache_state([pool], snapshot)
+    speculative_cache_state.restore_cache_state([pool], snapshot)
 
     assert pool.remainder == 3
     assert pool.pooled is None

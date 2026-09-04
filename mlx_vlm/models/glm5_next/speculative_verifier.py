@@ -2,6 +2,7 @@ from typing import Any, Callable, List, Optional
 
 import mlx.core as mx
 
+from ...speculative.cache_state import restore_cache_state, snapshot_cache_state
 from ..base import LanguageModelOutput, create_ssm_mask, scaled_dot_product_attention
 from ..deepseek_v4.hyper_connection import _hc_kernel, hc_expand
 from ..exact_speculative_verify import exact_speculative_verify_weight
@@ -25,7 +26,6 @@ from .exact_ops import (
     exact_hc_normalized_norm,
     scaled_rms_norm,
 )
-from .speculative_state import _restore_cache, _snapshot_cache
 
 
 class Glm5NextSpeculativeVerifier:
@@ -718,7 +718,7 @@ class Glm5NextSpeculativeVerifier:
         cache,
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
     ):
-        cache_snapshot = _snapshot_cache(cache, inputs.shape[1])
+        cache_snapshot = snapshot_cache_state(cache, inputs.shape[1])
         hidden_sink = []
         rollback_updates = []
         output = self(
@@ -934,7 +934,7 @@ class Glm5NextSpeculativeVerifier:
             accepted_values = [int(value) for value in accepted]
 
         cache_snapshot, rollback_updates = rollback_state
-        _restore_cache(caches, cache_snapshot)
+        restore_cache_state(caches, cache_snapshot)
         valid_lengths = [value + 1 for value in accepted_values]
         keep = max(valid_lengths, default=0)
         if not keep:
