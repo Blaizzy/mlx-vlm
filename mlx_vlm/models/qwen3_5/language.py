@@ -2076,6 +2076,28 @@ class LanguageModel(nn.Module):
                 skip_logits=skip_logits,
             )
 
+        batch_invariant_decode = getattr(self, "_batch_invariant_decode", None)
+        supports_batch_invariant_decode = getattr(
+            self, "_supports_batch_invariant_decode", None
+        )
+        if (
+            cache is not None
+            and inputs.ndim == 2
+            and inputs.shape[1] == 1
+            and callable(batch_invariant_decode)
+            and (
+                supports_batch_invariant_decode is None
+                or supports_batch_invariant_decode()
+            )
+        ):
+            return batch_invariant_decode(
+                inputs,
+                cache=cache,
+                inputs_embeds=inputs_embeds,
+                position_ids=position_ids,
+                skip_logits=skip_logits,
+            )
+
         hidden_sink: Optional[List[mx.array]] = (
             [] if capture_layer_ids is not None else None
         )

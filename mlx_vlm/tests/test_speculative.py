@@ -3129,6 +3129,38 @@ def _tiny_qwen3_5_text_config():
     )
 
 
+def _tiny_qwen3_5_moe_text_config(num_experts=4, moe_intermediate_size=8):
+    from mlx_vlm.models.qwen3_5_moe.config import TextConfig as MoeTextConfig
+
+    return MoeTextConfig(
+        model_type="qwen3_5_moe_text",
+        hidden_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        linear_num_value_heads=2,
+        linear_num_key_heads=2,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_conv_kernel_dim=4,
+        num_experts=num_experts,
+        num_experts_per_tok=2,
+        shared_expert_intermediate_size=moe_intermediate_size,
+        moe_intermediate_size=moe_intermediate_size,
+        rms_norm_eps=1e-6,
+        vocab_size=32,
+        num_key_value_heads=1,
+        max_position_embeddings=128,
+        head_dim=8,
+        full_attention_interval=1,
+        rope_parameters={
+            "type": "default",
+            "mrope_section": [1, 0, 0],
+            "rope_theta": 10000,
+            "partial_rotary_factor": 0.25,
+        },
+    )
+
+
 def _tiny_deepseek_v4_config():
     return deepseek_language.ModelConfig(
         vocab_size=32,
@@ -3453,6 +3485,44 @@ def test_eagle3_draft_vocab_mapping_uses_d2t_offsets():
     mapped = model._draft_to_target(mx.array([[0, 1, 3]], dtype=mx.int32), mx.int32)
 
     assert mapped.tolist() == [[0, 5, 15]]
+
+
+def test_qwen3_5_moe_mtp_builds_moe_layer_and_sanitizes_both_expert_layouts():
+    num_experts, moe_inter, hidden = 4, 8, 16
+    drafter = Qwen3_5MTPDraftModel(
+        Qwen3_5MTPConfig(
+            text_config=_tiny_qwen3_5_moe_text_config(
+                num_experts=num_experts, moe_intermediate_size=moe_inter
+            ),
+            block_size=3,
+        )
+    )
+    from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
+
+    self_mlp = drafter.layers[0].mlp
+    assert isinstance(self_mlp, Qwen3_5MoeSparseMoeBlock)
+    assert hasattr(self_mlp, "switch_mlp")
+
+    p = "mtp.layers.0.mlp"
+    split = {}
+    for e in range(num_experts):
+        split[f"{p}.experts.{e}.gate_proj.weight"] = mx.ones((moe_inter, hidden))
+        split[f"{p}.experts.{e}.up_proj.weight"] = mx.ones((moe_inter, hidden))
+        split[f"{p}.experts.{e}.down_proj.weight"] = mx.ones((hidden, moe_inter))
+    fused = {
+        f"{p}.experts.gate_up_proj": mx.ones((num_experts, 2 * moe_inter, hidden)),
+        f"{p}.experts.down_proj": mx.ones((num_experts, hidden, moe_inter)),
+    }
+
+    for label, weights in (("split", split), ("fused", fused)):
+        out = drafter.sanitize(dict(weights))
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            key = f"layers.0.mlp.switch_mlp.{proj}.weight"
+            assert key in out, f"[{label}] missing {key}"
+            assert out[key].shape[0] == num_experts, f"[{label}] {key} not stacked"
+        assert not any(
+            ".experts." in k and "switch_mlp" not in k for k in out
+        ), f"[{label}] raw expert keys leaked"
 
 
 def test_qwen3_5_mtp_draft_block_smoke():
