@@ -1821,15 +1821,15 @@ def test_speculative_walk_batch_deferred_uniform_stops_at_batch_rejection():
     assert fake_head.calls == 1
 
 
-def test_mtp_server_singleton_dispatches_prompt_aware_single_rounds(monkeypatch):
+def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):
     calls = []
 
     def fake_batch(*args, **kwargs):
-        raise AssertionError("server MTP singleton should use single round path")
+        calls.append(("batch", args, kwargs))
+        yield [3], None
 
     def fake_single(*args, **kwargs):
-        calls.append((args, kwargs))
-        yield 3, None
+        raise AssertionError("server MTP singleton should use batch round path")
 
     monkeypatch.setattr(speculative_utils, "_mtp_rounds_batch", fake_batch)
     monkeypatch.setattr(speculative_utils, "_mtp_rounds", fake_single)
@@ -1837,7 +1837,7 @@ def test_mtp_server_singleton_dispatches_prompt_aware_single_rounds(monkeypatch)
     result = list(
         speculative_utils.run_speculative_server_rounds(
             SimpleNamespace(language_model=SimpleNamespace()),
-            SimpleNamespace(config=SimpleNamespace(block_size=2)),
+            SimpleNamespace(),
             prompt_cache=[],
             hidden=mx.zeros((1, 1, 1), dtype=mx.float32),
             shared_kv_states={},
@@ -1854,8 +1854,9 @@ def test_mtp_server_singleton_dispatches_prompt_aware_single_rounds(monkeypatch)
 
     assert result == [([3], None)]
     assert calls
-    assert calls[0][1]["first_bonus"] == 2
-    assert calls[0][1]["prompt_tokens"].tolist() == [[7, 8]]
+    assert calls[0][2]["first_bonus"].tolist() == [2]
+    assert calls[0][2]["prompt_tokens"].tolist() == [[7, 8]]
+    assert calls[0][2]["row_ids"] == [0]
 
 
 def test_dflash_server_singleton_dispatches_single_rounds(monkeypatch):

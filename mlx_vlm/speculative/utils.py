@@ -190,27 +190,6 @@ def run_speculative_server_rounds(
         return
 
     if draft_kind == "mtp":
-        if batch_size == 1:
-            _buffer_mtp_target_cache(prompt_cache, draft_model, draft_block_size)
-            for tok, state in _mtp_rounds(
-                model,
-                draft_model,
-                prompt_cache,
-                hidden,
-                shared_kv_states,
-                prompt_tokens=prompt_tokens,
-                first_bonus=int(first_bonus.reshape(-1).item()),
-                max_tokens=max_tokens,
-                sampler=sampler,
-                draft_block_size=draft_block_size,
-                token_dtype=token_dtype,
-                greedy_sampling=greedy_sampling,
-            ):
-                yield [tok], state
-                if stop_check is not None and stop_check(0, tok):
-                    return
-            return
-
         yield from _mtp_rounds_batch(
             model,
             draft_model,
