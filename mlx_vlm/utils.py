@@ -1042,6 +1042,14 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 from .models.deepseek_v4.language import make_quantization_config
 
                 quantization = make_quantization_config(model)
+            elif (
+                quant_method == "modelopt"
+                and quantization_config.get("quant_algo") == "MXFP8"
+                and config.get("model_type") == "hy_v4"
+            ):
+                from .models.hy_v4.language import make_quantization_config
+
+                quantization = make_quantization_config(model)
             elif quant_method == "fp8" and config.get("model_type") in {
                 "qwen3_5",
                 "qwen3_5_moe",
