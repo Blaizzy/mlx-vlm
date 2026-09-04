@@ -1047,9 +1047,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             if quantization_value is not None:
                 config[quantization_key] = quantization_value
 
-    # Sanitize weights after source-format conversion. In particular, GLM
-    # merges projections and stacks experts, so raw FP8 weight/scale pairs must
-    # be transformed before those model-specific rewrites.
     weights = sanitize_weights(model, weights)
 
     if hasattr(model_class, "VisionModel"):
