@@ -18404,9 +18404,7 @@ def test_glm5_next_speculative_verify_matches_sequential_decode_arithmetic():
 
 
 @pytest.mark.parametrize(("batch", "length"), [(1, 2), (2, 4), (4, 2)])
-def test_glm5_next_dense_verifier_kernel_covers_all_outputs(
-    monkeypatch, batch, length
-):
+def test_glm5_next_dense_verifier_kernel_covers_all_outputs(monkeypatch, batch, length):
     import mlx_vlm.models.glm5_next.speculative_verifier as verifier
 
     if not mx.metal.is_available():

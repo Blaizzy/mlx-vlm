@@ -3957,9 +3957,12 @@ def test_glm5_next_mtp_owns_left_padded_prefill(monkeypatch):
     )
     mx.eval(captured["start"], drafter._next_position)
 
-    assert "left_padding" not in inspect.signature(
-        DeepseekV4MTPDraftModel.prefill_from_target_hidden
-    ).parameters
+    assert (
+        "left_padding"
+        not in inspect.signature(
+            DeepseekV4MTPDraftModel.prefill_from_target_hidden
+        ).parameters
+    )
     assert captured["start"].tolist() == [-2, 0]
     assert drafter._next_position.tolist() == [2, 4]
 
