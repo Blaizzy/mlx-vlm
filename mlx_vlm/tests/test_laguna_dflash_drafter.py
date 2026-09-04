@@ -154,6 +154,7 @@ def test_generic_drafter_gate_invokes_laguna_target_validation():
     target = SimpleNamespace(
         config=SimpleNamespace(num_hidden_layers=48, vocab_size=100352),
         model=SimpleNamespace(layers=[object()] * 48),
+        rollback_speculative_cache=lambda *args: 0,
     )
 
     validate_drafter_compatibility(target, draft, "dflash")
@@ -203,3 +204,17 @@ def test_weight_key_drift_is_rejected():
 
     with pytest.raises(ValueError, match="weight keys"):
         validate_laguna_dflash_weights(weights, config)
+
+
+def test_target_without_rollback_support_is_rejected():
+    config = ModelConfig.from_dict(_config_dict())
+
+    with pytest.raises(ValueError, match="rollback"):
+        validate_laguna_dflash_target(
+            config,
+            target_model_config=SimpleNamespace(
+                num_hidden_layers=48, vocab_size=100352
+            ),
+            target_tokenizer_length=100352,
+            target_language_model=SimpleNamespace(),
+        )

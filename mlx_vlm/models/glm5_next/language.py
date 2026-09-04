@@ -14,7 +14,7 @@ from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
 from ..deepseek_v32.language import DeepseekV32MoE
 from ..deepseek_v32.language import Model as DSV32Model
 from ..gated_delta import gated_delta_update
-from ..mla import MultiLinear
+from ..mla import MultiLinear, latent_length, max_absorbed_queries
 from ..mlp import DeepseekMLP
 from .config import ModelConfig, TextConfig
 
@@ -477,6 +477,11 @@ class Glm5NextSparseAttention(nn.Module):
         self.unembed_out = MultiLinear(
             self.kv_lora_rank, self.v_head_dim, self.num_heads
         )
+        self._absorbed_dims = (
+            self.kv_lora_rank,
+            self.qk_nope_head_dim,
+            self.v_head_dim,
+        )
         self.o_proj = nn.Linear(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
@@ -554,7 +559,10 @@ class Glm5NextSparseAttention(nn.Module):
         ):
             cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
 
-        if L == 1:
+        absorbed = L == 1 or L <= max_absorbed_queries(
+            *self._absorbed_dims, latent_length(kv_latent)
+        )
+        if absorbed:
             q = self.embed_q(q)
             k = v = kv_latent
         else:
@@ -564,7 +572,7 @@ class Glm5NextSparseAttention(nn.Module):
         output = scaled_dot_product_attention(
             q, k, v, cache=cache, scale=self.scale, mask=attn_mask
         )
-        if L == 1:
+        if absorbed:
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
