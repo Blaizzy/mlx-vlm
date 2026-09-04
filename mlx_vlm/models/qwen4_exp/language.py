@@ -1682,6 +1682,34 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
     """Qwen4 forward path with batch-invariant dense reductions."""
 
     @staticmethod
+    def can_quantized_head(linear):
+        if (
+            not isinstance(linear, nn.QuantizedLinear)
+            or linear.bits not in (4, 5, 8)
+            or linear.mode != "affine"
+            or linear.biases is None
+            or linear.scales.dtype not in (mx.bfloat16, mx.float16)
+            or linear.biases.dtype != linear.scales.dtype
+        ):
+            return False
+
+        input_size = linear.weight.shape[1] * 32 // linear.bits
+        output_size = linear.weight.shape[0]
+        return input_size % 512 == 0 and output_size % 8 == 0
+
+    def _linear(self, linear, x: mx.array) -> mx.array:
+        if isinstance(linear, nn.QuantizedLinear) and x.ndim == 3 and x.shape[0] > 1:
+            linear_fn = super()._linear
+            return mx.concatenate(
+                [
+                    linear_fn(linear, mx.contiguous(x[row : row + 1]))
+                    for row in range(x.shape[0])
+                ],
+                axis=0,
+            )
+        return super()._linear(linear, x)
+
+    @staticmethod
     def _normalize_gated_delta_qk(layer, q, k):
         return layer._normalize_qk(q, k)
 
