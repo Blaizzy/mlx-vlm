@@ -1,4 +1,3 @@
-import warnings
 from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
@@ -63,58 +62,11 @@ __all__ = [
     "make_speculative_prompt_cache",
     "run_speculative_rounds",
     "run_speculative_server_rounds",
-    "speculative_runtime_supported",
     "speculative_hidden_state",
     "speculative_prefill_kwargs",
     "speculative_stats_since",
     "speculative_stats_snapshot",
 ]
-
-
-def speculative_runtime_supported(
-    model: nn.Module,
-    draft_model: Optional[nn.Module],
-    draft_kind: Optional[str],
-    *,
-    batch_size: int = 1,
-    warn: bool = True,
-) -> bool:
-    """Return whether the requested drafter should replace base decoding.
-
-    Some MTP checkpoints are functionally supported before their target has a
-    verifier that does less work than sequential decode.  Such a path must not
-    silently reduce throughput.  The drafter opts into this guard and the
-    target opts out once its verifier has demonstrated break-even performance.
-    """
-    if draft_model is None or draft_kind is None:
-        return False
-    max_batch_size = getattr(draft_model, "max_speculative_batch_size", None)
-    if (
-        max_batch_size is not None
-        and batch_size > int(max_batch_size)
-        and not getattr(draft_model, "force_speculative", False)
-    ):
-        return False
-    if getattr(draft_model, "force_speculative", False):
-        return True
-    if not getattr(draft_model, "requires_accelerated_target_verifier", False):
-        return True
-
-    language_model = getattr(model, "language_model", model)
-    if getattr(language_model, "mtp_speculative_speedup_supported", False):
-        return True
-
-    if warn and not getattr(draft_model, "_speed_guard_warned", False):
-        warnings.warn(
-            f"{type(draft_model).__name__} was disabled because this target's "
-            "decode-exact MTP verifier has not demonstrated break-even "
-            "throughput. Base decoding will be used; set "
-            "draft_model.force_speculative=True to benchmark the verifier.",
-            RuntimeWarning,
-            stacklevel=3,
-        )
-        draft_model._speed_guard_warned = True
-    return False
 
 
 def format_speculative_stats(draft_model: nn.Module) -> Optional[str]:

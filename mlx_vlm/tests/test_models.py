@@ -14,13 +14,7 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_vlm.fp8 import transform_fp8_weights
 from mlx_vlm.generate.ar import _make_cache
-from mlx_vlm.models.cache import (
-    BatchKVCache,
-    BatchPoolingCache,
-    HierarchyCache,
-    KVCache,
-    PoolingCache,
-)
+from mlx_vlm.models.cache import BatchKVCache, BatchPoolingCache, KVCache, PoolingCache
 from mlx_vlm.models.glm5_next.config import ModelConfig, TextConfig, VisionConfig
 from mlx_vlm.models.glm5_next.glm5_next import Model
 from mlx_vlm.models.glm5_next.language import (
@@ -28,7 +22,6 @@ from mlx_vlm.models.glm5_next.language import (
     Glm5NextLinearAttention,
     LanguageModel,
     _exact_pool_select,
-    _hisa_pool_select,
     _score_index_keys,
     _sparse_prefill_attention,
 )
@@ -18532,8 +18525,6 @@ def test_glm5_next_config_builds_checkpoint_schedules():
     assert config.mlp_layer_types == ["dense", "dense", "dense", "sparse", "sparse"]
     assert config.linear_num_heads == 64
     assert config.linear_lower_bound == -5.0
-    assert config.index_hisa_block == 0
-    assert config.index_hisa_keep == 0
 
 
 def test_glm5_next_config_matches_transformers_indexer_schedule_and_validation():
@@ -18827,42 +18818,6 @@ def test_indexed_sparse_attention_metal_matches_fallback():
     assert float(mx.mean(error).item()) <= 2e-3
 
 
-def test_glm5_next_hisa_keep_all_matches_flat_indexer():
-    mx.random.seed(12)
-    batch, query_length, heads, dim = 2, 7, 3, 8
-    pool_count, block_size, select_k = 24, 4, 6
-    q = mx.random.normal((batch, query_length, heads, dim)).astype(mx.bfloat16)
-    pool_keys = mx.random.normal((batch, pool_count, dim)).astype(mx.bfloat16)
-    weights = mx.random.normal((batch, query_length, heads))
-    candidates = mx.arange(pool_count)[None, None] <= (
-        mx.arange(query_length)[None, :, None] + 17
-    )
-    candidates = mx.broadcast_to(candidates, (batch, query_length, pool_count))
-    representatives = pool_keys.reshape(
-        batch, pool_count // block_size, block_size, dim
-    ).mean(axis=2)
-
-    hisa = _hisa_pool_select(
-        q,
-        pool_keys,
-        weights,
-        candidates,
-        representatives,
-        [pool_count // block_size] * batch,
-        select_k,
-        dim**-0.5,
-        block_size,
-        pool_count // block_size,
-        chunk_size=3,
-    )
-    flat_scores = _score_index_keys(q, pool_keys, weights, dim**-0.5)
-    flat_scores = mx.where(candidates, flat_scores, mx.finfo(mx.float32).min)
-    flat = mx.argpartition(-flat_scores, kth=select_k - 1, axis=-1)[..., :select_k]
-    mx.eval(hisa, flat)
-
-    assert bool(mx.all(mx.sort(hisa, axis=-1) == mx.sort(flat, axis=-1)).item())
-
-
 def test_glm5_next_exact_pool_select_matches_full_pool_scoring():
     mx.random.seed(15)
     batch, query_length, heads, dim = 2, 7, 3, 8
@@ -18901,68 +18856,6 @@ def test_glm5_next_exact_pool_select_matches_full_pool_scoring():
     assert bool(mx.all(actual_valid == expected_valid).item())
 
 
-def test_hierarchy_cache_incremental_means_and_state_roundtrip():
-    mx.random.seed(13)
-    values = mx.random.normal((1, 17, 8)).astype(mx.bfloat16)
-    cache = HierarchyCache(block_size=4)
-    cache.update_and_fetch(values[:, :3])
-    cache.update_and_fetch(values[:, 3:8])
-    representatives, lengths = cache.update_and_fetch(values[:, 8:])
-    expected = values[:, :16].reshape(1, 4, 4, 8).mean(axis=2)
-    mx.eval(representatives, expected)
-
-    assert lengths == [4]
-    assert cache.remainders == [1]
-    assert float(mx.max(mx.abs(representatives - expected)).item()) == 0.0
-
-    restored = HierarchyCache.from_state(cache.state, cache.meta_state)
-    mx.eval(restored.representatives)
-    assert restored.block_size == 4
-    assert restored.remainders == [1]
-    assert restored.representative_lengths == [4]
-    assert (
-        float(mx.max(mx.abs(restored.representatives - representatives)).item()) == 0.0
-    )
-
-
-def test_hierarchy_cache_merge_preserves_variable_length_rows():
-    first = mx.arange(20).reshape(1, 10, 2).astype(mx.bfloat16)
-    second = (100 + mx.arange(10)).reshape(1, 5, 2).astype(mx.bfloat16)
-    first_cache = HierarchyCache(block_size=4)
-    second_cache = HierarchyCache(block_size=4)
-    first_cache.update_and_fetch(first)
-    second_cache.update_and_fetch(second)
-
-    merged = HierarchyCache.merge([first_cache, second_cache])
-    additions = mx.array(
-        [
-            [[20, 21], [22, 23], [0, 0]],
-            [[110, 111], [112, 113], [114, 115]],
-        ],
-        dtype=mx.bfloat16,
-    )
-    representatives, lengths = merged.update_and_fetch(additions, new_counts=[2, 3])
-    expected_first = (
-        mx.concatenate([first, additions[:1, :2]], axis=1)
-        .reshape(1, 3, 4, 2)
-        .mean(axis=2)
-    )
-    expected_second = (
-        mx.concatenate([second, additions[1:, :3]], axis=1)
-        .reshape(1, 2, 4, 2)
-        .mean(axis=2)
-    )
-    mx.eval(representatives, expected_first, expected_second)
-
-    assert lengths == [3, 2]
-    assert merged.remainders == [0, 0]
-    assert float(mx.max(mx.abs(representatives[:1, :3] - expected_first)).item()) == 0
-    assert float(mx.max(mx.abs(representatives[1:, :2] - expected_second)).item()) == 0
-    assert merged.extract(0).representative_lengths == [3]
-    merged.filter(mx.array([1], dtype=mx.int32))
-    assert merged.representative_lengths == [2]
-
-
 def test_glm5_next_chunked_prefill_projects_only_new_tokens():
     mx.random.seed(2)
     model = LanguageModel(_text_config())
@@ -18995,31 +18888,6 @@ def test_glm5_next_chunked_prefill_projects_only_new_tokens():
     assert len(sparse_cache.caches) == 4
     assert isinstance(sparse_cache[3], KVCache)
     assert sparse_cache[3].size() == 5
-    assert float(mx.max(mx.abs(full - chunked)).item()) < 1e-5
-
-
-def test_glm5_next_chunked_hisa_matches_full_forward():
-    mx.random.seed(14)
-    config = _text_config()
-    config.index_hisa_block = 2
-    config.index_hisa_keep = 2
-    config.index_hisa_min_pools = 0
-    model = LanguageModel(config)
-    model.eval()
-    tokens = mx.array([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]])
-
-    full = model(tokens).logits
-    cache = model.make_cache()
-    chunks = [
-        model(tokens[:, start : start + 4], cache=cache).logits
-        for start in range(0, 12, 4)
-    ]
-    chunked = mx.concatenate(chunks, axis=1)
-    mx.eval(full, chunked)
-
-    hierarchy = cache[1][3]
-    assert hierarchy.representative_lengths == [3]
-    assert hierarchy.remainders == [0]
     assert float(mx.max(mx.abs(full - chunked)).item()) < 1e-5
 
 

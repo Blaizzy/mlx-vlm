@@ -4,7 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import LanguageModelOutput, create_ssm_mask, scaled_dot_product_attention
-from ..cache import ArraysCache, CacheList, HierarchyCache, KVCache, PoolingCache
+from ..cache import ArraysCache, CacheList, KVCache, PoolingCache
 from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
 from ..gated_delta import gated_delta_update
 from ..mla import MultiLinear
@@ -427,108 +427,6 @@ def _exact_pool_select(
     )
 
 
-def _hisa_pool_select(
-    q,
-    pool_keys,
-    weights,
-    candidates,
-    representatives,
-    representative_lengths,
-    select_k,
-    scale,
-    block_size,
-    keep_blocks,
-    chunk_size=256,
-):
-    """Select index pools through cached coarse blocks and exact reranking."""
-
-    batch, query_length, _, dim = q.shape
-    pool_count = pool_keys.shape[1]
-    block_count = representatives.shape[1]
-    keep_blocks = min(keep_blocks, block_count)
-
-    block_ends = (mx.arange(block_count, dtype=mx.int32) + 1) * block_size - 1
-    coarse_visible = mx.take_along_axis(
-        candidates,
-        mx.broadcast_to(block_ends[None, None], (batch, query_length, block_count)),
-        axis=-1,
-    )
-    rep_lengths = mx.array(representative_lengths, dtype=mx.int32)
-    coarse_visible = coarse_visible & (
-        mx.arange(block_count)[None, None] < rep_lengths[:, None, None]
-    )
-
-    coarse_scores = _score_index_keys(q, representatives, weights, scale)
-    coarse_scores = mx.where(coarse_visible, coarse_scores, mx.finfo(mx.float32).min)
-
-    # Preserve the attention sink and the most local complete block. Partial
-    # local blocks are appended directly to the refinement set below.
-    visible_blocks = coarse_visible.astype(mx.int32).sum(axis=-1)
-    block_positions = mx.arange(block_count)[None, None]
-    last_visible = mx.maximum(visible_blocks - 1, 0)
-    forced = (block_positions == 0) | (block_positions == last_visible[..., None])
-    coarse_scores = mx.where(
-        forced & coarse_visible, mx.finfo(mx.float32).max, coarse_scores
-    )
-
-    if keep_blocks == block_count:
-        selected_blocks = mx.broadcast_to(
-            mx.arange(block_count, dtype=mx.int32)[None, None],
-            (batch, query_length, block_count),
-        )
-    else:
-        selected_blocks = mx.argpartition(-coarse_scores, kth=keep_blocks - 1, axis=-1)[
-            ..., :keep_blocks
-        ].astype(mx.int32)
-
-    block_offsets = mx.arange(block_size, dtype=mx.int32)
-    selected_pools = (selected_blocks[..., None] * block_size + block_offsets).reshape(
-        batch, query_length, -1
-    )
-    selected_block_valid = mx.take_along_axis(coarse_visible, selected_blocks, axis=-1)
-    selected_valid = mx.repeat(
-        selected_block_valid[..., None], block_size, axis=-1
-    ).reshape(batch, query_length, -1)
-    selected_valid = selected_valid & mx.take_along_axis(
-        candidates, selected_pools, axis=-1
-    )
-
-    partial_width = block_size - 1
-    if partial_width:
-        visible_pools = candidates.astype(mx.int32).sum(axis=-1)
-        partial_count = visible_pools % block_size
-        partial_start = visible_pools - partial_count
-        partial_offsets = mx.arange(partial_width, dtype=mx.int32)
-        partial_pools = partial_start[..., None] + partial_offsets
-        safe_partial = mx.clip(partial_pools, 0, max(pool_count - 1, 0))
-        partial_valid = partial_offsets[None, None] < partial_count[..., None]
-        partial_valid = partial_valid & mx.take_along_axis(
-            candidates, safe_partial, axis=-1
-        )
-        selected_pools = mx.concatenate([selected_pools, safe_partial], axis=-1)
-        selected_valid = mx.concatenate([selected_valid, partial_valid], axis=-1)
-
-    outputs = []
-    for start in range(0, query_length, chunk_size):
-        end = min(start + chunk_size, query_length)
-        pool_idx = selected_pools[:, start:end]
-        fine_keys = _batch_gather(pool_keys, pool_idx)
-        fine_scores = mx.matmul(q[:, start:end], fine_keys.swapaxes(-1, -2))
-        fine_scores = mx.maximum(fine_scores, 0).astype(mx.float32)
-        fine_scores = (fine_scores * (weights[:, start:end] * scale)[..., None]).sum(
-            axis=2
-        )
-        fine_valid = selected_valid[:, start:end]
-        fine_scores = mx.where(fine_valid, fine_scores, mx.finfo(mx.float32).min)
-        ranked = mx.argpartition(-fine_scores, kth=select_k - 1, axis=-1)[
-            ..., :select_k
-        ]
-        chosen = mx.take_along_axis(pool_idx, ranked, axis=-1)
-        chosen_valid = mx.take_along_axis(fine_valid, ranked, axis=-1)
-        outputs.append(mx.where(chosen_valid, chosen, -1))
-    return outputs[0] if len(outputs) == 1 else mx.concatenate(outputs, axis=1)
-
-
 class Glm5NextIndexer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
@@ -538,9 +436,6 @@ class Glm5NextIndexer(nn.Module):
         self.index_topk = config.index_topk
         self.index_kpool = config.index_kpool
         self.always_select_tail = config.index_kpool_always_select_tail
-        self.hisa_block = config.index_hisa_block
-        self.hisa_keep = config.index_hisa_keep
-        self.hisa_min_pools = config.index_hisa_min_pools
         self.wq_b = nn.Linear(
             config.q_lora_rank, self.n_heads * self.head_dim, bias=False
         )
@@ -606,7 +501,6 @@ class Glm5NextIndexer(nn.Module):
         padding_mask=None,
         cache=None,
         pool_cache=None,
-        hierarchy_cache=None,
         offset=0,
         cache_update_sink=None,
         linear_fn=None,
@@ -653,28 +547,7 @@ class Glm5NextIndexer(nn.Module):
                 k, gate.astype(k.dtype), offset
             )
             new_pool_keys = self._compress_pools(ready_k, ready_gate)
-            previous_pool_lengths = pool_cache.pool_lengths
-            if not isinstance(previous_pool_lengths, int):
-                previous_pool_lengths = list(previous_pool_lengths)
             pool_keys = pool_cache.update_and_fetch(new_pool_keys)
-            if hierarchy_cache is not None:
-                current_pool_lengths = pool_cache.pool_lengths
-                if isinstance(previous_pool_lengths, int):
-                    previous_pool_lengths = [previous_pool_lengths] * batch
-                    current_pool_lengths = [current_pool_lengths] * batch
-                new_pool_counts = [
-                    current - previous
-                    for previous, current in zip(
-                        previous_pool_lengths, current_pool_lengths
-                    )
-                ]
-                representatives, representative_lengths = (
-                    hierarchy_cache.update_and_fetch(
-                        new_pool_keys, new_counts=new_pool_counts
-                    )
-                )
-            else:
-                representatives = representative_lengths = None
 
             pool_count = pool_keys.shape[1]
             first_key = mx.where(
@@ -696,7 +569,6 @@ class Glm5NextIndexer(nn.Module):
                 axis=-1,
             )
             pool_keys, pool_indices, pool_valid, key_valid = self._pooled_states(packed)
-            representatives = representative_lengths = None
 
         kv_length = key_valid.shape[1]
         query_positions = kv_length - q_length + mx.arange(q_length)
@@ -707,7 +579,6 @@ class Glm5NextIndexer(nn.Module):
             topk = mx.zeros((batch, q_length, 0), dtype=mx.int32)
         else:
             pool_end = mx.clip(pool_indices[..., -1], 0, max(kv_length - 1, 0))
-            use_hisa = False
             if select_k == pool_count:
                 selected, selected_valid = _exact_pool_select(
                     None,
@@ -734,56 +605,6 @@ class Glm5NextIndexer(nn.Module):
                 # Keep the score matmul in the model dtype, as serving runtimes
                 # do, then aggregate heads in FP32. Query chunking bounds the
                 # [B, chunk, H, pools] temporary while evaluating every pool.
-                use_hisa = (
-                    self.hisa_block > 0
-                    and pool_count >= self.hisa_min_pools
-                    and pool_count > self.hisa_block * self.hisa_keep
-                )
-            if select_k < pool_count and use_hisa:
-                visible = (
-                    mx.arange(kv_length)[None, None] <= query_positions[None, :, None]
-                ) & key_valid[:, None]
-                candidates = (
-                    mx.take_along_axis(
-                        visible,
-                        mx.broadcast_to(
-                            pool_end[:, None], (batch, q_length, pool_end.shape[1])
-                        ),
-                        axis=-1,
-                    )
-                    & pool_valid[:, None]
-                )
-                if representatives is None:
-                    block_count = pool_count // self.hisa_block
-                    usable = block_count * self.hisa_block
-                    representatives = (
-                        pool_keys[:, :usable]
-                        .reshape(
-                            batch,
-                            block_count,
-                            self.hisa_block,
-                            self.head_dim,
-                        )
-                        .mean(axis=2)
-                    )
-                    representative_lengths = [block_count] * batch
-                selected = _hisa_pool_select(
-                    q,
-                    pool_keys,
-                    weights,
-                    candidates,
-                    representatives,
-                    representative_lengths,
-                    select_k,
-                    self.softmax_scale,
-                    self.hisa_block,
-                    self.hisa_keep,
-                )
-                safe_selected = mx.clip(selected, 0, max(pool_count - 1, 0))
-                selected_valid = (selected >= 0) & mx.take_along_axis(
-                    candidates, safe_selected, axis=-1
-                )
-            elif select_k < pool_count:
                 selected, selected_valid = _exact_pool_select(
                     q,
                     pool_keys,
@@ -972,7 +793,7 @@ class Glm5NextAttention(nn.Module):
         new_latent = self.kv_a_layernorm(kv_a)[:, None]
 
         if cache is None:
-            kv_cache = index_cache = pool_cache = hierarchy_cache = None
+            kv_cache = index_cache = pool_cache = None
             projected_cache = None
             cache_offset = 0
             latent = new_latent
@@ -980,18 +801,12 @@ class Glm5NextAttention(nn.Module):
             kv_cache = cache[0]
             cache_offset = kv_cache.offset
             if self.indexer is None:
-                index_cache = pool_cache = hierarchy_cache = None
+                index_cache = pool_cache = None
                 projected_cache = cache[1]
             else:
                 index_cache = cache[1]
                 pool_cache = cache[2]
-                if len(cache.caches) >= 5:
-                    hierarchy_cache = cache[3]
-                    projected_cache = cache[4]
-                else:
-                    # Backward-compatible with caches serialized before HISA.
-                    hierarchy_cache = None
-                    projected_cache = cache[3]
+                projected_cache = cache[3]
             latent, _ = kv_cache.update_and_fetch(
                 new_latent,
                 mx.zeros((batch, 1, length, 0), dtype=new_latent.dtype),
@@ -1008,7 +823,6 @@ class Glm5NextAttention(nn.Module):
                 padding_mask,
                 index_cache,
                 pool_cache,
-                hierarchy_cache,
                 cache_offset,
             )
 
@@ -1151,8 +965,6 @@ class Glm5NextTextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    mtp_speculative_speedup_supported = True
-
     def __init__(self, config: TextConfig):
         super().__init__()
         self.args = config
@@ -1296,15 +1108,14 @@ class LanguageModel(nn.Module):
                 caches.append(CacheList(KVCache(), KVCache()))
             else:
                 indexer = layer.self_attn.indexer
-                layer_caches = [
-                    KVCache(),
-                    KVCache(),
-                    PoolingCache(indexer.index_kpool),
-                ]
-                if indexer.hisa_block > 0:
-                    layer_caches.append(HierarchyCache(indexer.hisa_block))
-                layer_caches.append(KVCache())
-                caches.append(CacheList(*layer_caches))
+                caches.append(
+                    CacheList(
+                        KVCache(),
+                        KVCache(),
+                        PoolingCache(indexer.index_kpool),
+                        KVCache(),
+                    )
+                )
         return caches
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:

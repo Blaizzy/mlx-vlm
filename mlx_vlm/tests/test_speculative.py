@@ -102,7 +102,6 @@ from mlx_vlm.speculative.utils import (
     _speculative_walk_batch_uniform_acceptance,
     _speculative_walk_deferred_greedy,
     speculative_prefill_kwargs,
-    speculative_runtime_supported,
 )
 from mlx_vlm.split_mtp import split_mtp
 from mlx_vlm.turboquant import BatchTurboQuantKVCache
@@ -3890,8 +3889,6 @@ def _tiny_glm5_next_text_config():
         index_kpool=2,
         index_head_dim=4,
         index_n_heads=2,
-        index_hisa_block=0,
-        index_hisa_keep=0,
         linear_attn_config={
             "num_heads": 2,
             "head_dim": 4,
@@ -3996,35 +3993,6 @@ def test_glm5_next_hc_ingress_fusion_is_single_batch_only(monkeypatch):
 
     glm5_next_language._SPECULATIVE_VERIFIER._hc_norm(connection, norm, inputs[:1])
     assert calls == [1]
-
-
-def test_glm5_next_mtp_speed_guard_falls_back_until_verifier_is_break_even():
-    target = SimpleNamespace(
-        language_model=SimpleNamespace(mtp_speculative_speedup_supported=False)
-    )
-    drafter = SimpleNamespace(
-        requires_accelerated_target_verifier=True,
-        force_speculative=False,
-    )
-
-    with pytest.warns(RuntimeWarning, match="Base decoding will be used"):
-        assert not speculative_runtime_supported(target, drafter, "mtp")
-    assert drafter._speed_guard_warned
-
-    drafter.force_speculative = True
-    assert speculative_runtime_supported(target, drafter, "mtp")
-
-    drafter.force_speculative = False
-    target.language_model.mtp_speculative_speedup_supported = True
-    assert speculative_runtime_supported(target, drafter, "mtp")
-
-    drafter.max_speculative_batch_size = 1
-    assert not speculative_runtime_supported(
-        target, drafter, "mtp", batch_size=2, warn=False
-    )
-    assert speculative_runtime_supported(
-        target, drafter, "mtp", batch_size=1, warn=False
-    )
 
 
 @pytest.mark.parametrize(
@@ -4154,7 +4122,6 @@ def test_glm5_next_mtp_batch_acceptance_keeps_ragged_rows_aligned():
     assert drafter._cache[0][2].remainder == [0, 1]
     assert not drafter.requires_uniform_batch_acceptance
     assert drafter.supports_ragged_batch_acceptance
-    assert drafter.max_speculative_batch_size == 4
 
 
 def test_glm5_next_target_rollback_restores_ragged_rows_without_model_replay():
@@ -4324,50 +4291,6 @@ def test_split_glm5_next_mtp_supports_independent_mxfp8_quantization(tmp_path):
     assert weights["eh_proj.weight"].dtype == mx.uint32
     assert weights["eh_proj.scales"].dtype == mx.uint8
     assert "eh_proj.biases" not in weights
-
-
-def test_split_glm5_next_mtp_can_restore_dense_bfloat16_from_fp8(tmp_path):
-    source = tmp_path / "source"
-    output = tmp_path / "mtp"
-    source.mkdir()
-    text_config = _tiny_glm5_next_text_config()
-    (source / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "glm5_next",
-                "text_config": text_config.to_dict(),
-                "quantization_config": {
-                    "quant_method": "fp8",
-                    "fmt": "e4m3",
-                    "weight_block_size": [128, 128],
-                },
-            }
-        )
-    )
-    prefix = f"model.language_model.layers.{text_config.num_hidden_layers}"
-    source_weight = mx.to_fp8(mx.ones((128, 128), dtype=mx.bfloat16))
-    source_scale = mx.full((1, 1), 0.125, dtype=mx.float32)
-    mx.save_safetensors(
-        str(source / "model.safetensors"),
-        {
-            f"{prefix}.eh_proj.weight": source_weight,
-            f"{prefix}.eh_proj.weight_scale_inv": source_scale,
-        },
-    )
-
-    split_mtp(str(source), str(output), dequantize=True)
-
-    config = json.loads((output / "config.json").read_text())
-    weights = mx.load(str(output / "model.safetensors"))
-    mx.eval(weights["eh_proj.weight"])
-
-    assert "quantization" not in config
-    assert "quantization_config" not in config
-    assert weights["eh_proj.weight"].dtype == mx.bfloat16
-    assert mx.allclose(weights["eh_proj.weight"], mx.array(0.125)).item()
-    assert not any(
-        key.endswith((".scales", ".biases", ".weight_scale_inv")) for key in weights
-    )
 
 
 def test_deepseek_v4_mtp_runtime_block_size_defaults_to_native_nextn_depth():

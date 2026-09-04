@@ -28,13 +28,7 @@ def split_mtp(
     q_bits: Optional[int] = None,
     q_group_size: Optional[int] = None,
     q_mode: Optional[str] = None,
-    dequantize: bool = False,
 ) -> Path:
-    if dequantize and (q_bits is not None or q_mode is not None):
-        raise ValueError(
-            "Choose either dense BF16 MTP extraction or MTP quantization, not both."
-        )
-
     if model_type is not None:
         splitter = get_mtp_splitter(model_type)
         if splitter is None:
@@ -63,7 +57,6 @@ def split_mtp(
         q_bits=q_bits,
         q_group_size=q_group_size,
         q_mode=q_mode,
-        dequantize=dequantize,
     )
 
 
@@ -88,16 +81,6 @@ def configure_parser() -> argparse.ArgumentParser:
         choices=["affine", "mxfp4", "nvfp4", "mxfp8"],
         default=None,
         help="MTP quantization mode; mode-specific bits/group defaults are used.",
-    )
-    parser.add_argument(
-        "--dequantize",
-        "--full-precision",
-        dest="dequantize",
-        action="store_true",
-        help=(
-            "Reconstruct block-FP8 MTP tensors as dense BF16 instead of "
-            "native MLX quantized weights."
-        ),
     )
     return parser
 

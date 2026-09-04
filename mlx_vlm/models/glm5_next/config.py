@@ -62,9 +62,6 @@ class TextConfig(BaseModelConfig):
     index_kpool: int = 16
     index_kpool_always_select_tail: bool = True
     index_kpool_compress: bool = True
-    index_hisa_block: int = 0
-    index_hisa_keep: int = 0
-    index_hisa_min_pools: int = 2048
     indexer_rope_interleave: bool = True
     mla_use_nope: bool = True
     first_k_dense_replace: int = 3
@@ -158,17 +155,6 @@ class TextConfig(BaseModelConfig):
             raise ValueError("GLM-5-Next requires NoPE sparse attention.")
         if self.index_kpool < 1 or self.index_topk % self.index_kpool:
             raise ValueError("`index_topk` must be divisible by `index_kpool`.")
-        if self.index_hisa_block < 0 or self.index_hisa_keep < 0:
-            raise ValueError("HISA block and keep sizes cannot be negative.")
-        if bool(self.index_hisa_block) != bool(self.index_hisa_keep):
-            raise ValueError("HISA block and keep sizes must be enabled together.")
-        if self.index_hisa_min_pools < 0:
-            raise ValueError("`index_hisa_min_pools` cannot be negative.")
-        if self.index_hisa_block and (
-            self.index_hisa_block * self.index_hisa_keep
-            < self.index_topk // self.index_kpool
-        ):
-            raise ValueError("HISA candidate capacity must cover the final top-k.")
 
 
 @dataclass

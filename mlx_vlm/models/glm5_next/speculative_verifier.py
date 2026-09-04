@@ -11,14 +11,12 @@ from ..cache import (
     BatchPoolingCache,
     BatchQuantizedKVCache,
     CacheList,
-    HierarchyCache,
     KVCache,
     PoolingCache,
 )
 from ..deepseek_v4.hyper_connection import _hc_kernel, hc_expand
 from ..exact_speculative_verify import exact_speculative_verify_weight
 from ..gated_delta import gated_delta_update
-from ..mla import QuantizedMultiLinear
 from ..qwen3_5.speculative_verifier import (
     _target_verify_linear,
     _target_verify_quantized_argmax,
@@ -428,112 +426,6 @@ if (tid < D4) {
       weight.y * scaled.y,
       weight.z * scaled.z,
       weight.w * scaled.w);
-}
-"""
-
-
-_HC_INV_RMS_SOURCE = r"""
-uint token = threadgroup_position_in_grid.y;
-uint simd_gid = simdgroup_index_in_threadgroup;
-uint lane = thread_index_in_simdgroup;
-constexpr int SN = 32;
-constexpr int TN = 4;
-constexpr int NORM_SIMDS = 32;
-constexpr int NORM_BLOCK = NORM_SIMDS * SN * TN;
-uint tid = simd_gid * SN + lane;
-
-float sum = 0.0f;
-for (int k = int(tid) * TN; k < K_SIZE; k += NORM_BLOCK) {
-  const device float4* source = (const device float4*)(x + token * K_SIZE + k);
-  float4 value = source[0];
-  sum += value.x * value.x;
-  sum += value.y * value.y;
-  sum += value.z * value.z;
-  sum += value.w * value.w;
-}
-sum = simd_sum(sum);
-
-threadgroup float partials[NORM_SIMDS];
-if (lane == 0) {
-  partials[simd_gid] = sum;
-}
-threadgroup_barrier(mem_flags::mem_threadgroup);
-if (simd_gid == 0) {
-  sum = simd_sum(partials[lane]);
-  if (lane == 0) {
-    inv_norm[token] = metal::precise::rsqrt(sum / K_SIZE + NORM_EPS);
-  }
-}
-"""
-
-
-_HC_SCALED_MIX_GEMV_SOURCE = r"""
-uint out_block = threadgroup_position_in_grid.x;
-uint simd_gid = simdgroup_index_in_threadgroup;
-uint lane = thread_index_in_simdgroup;
-
-constexpr int TM = 4;
-constexpr int TN = 4;
-constexpr int SN = 32;
-constexpr int BN = 8;
-constexpr int BLOCK_N = BN * SN * TN;
-
-int out_row = int(out_block) * TM;
-int bn = (int(simd_gid) * SN + int(lane)) * TN;
-float result[VERIFY_T][TM] = {0.0f};
-
-for (int k = 0; k < K_SIZE; k += BLOCK_N) {
-  float vectors[VERIFY_T][TN];
-  for (int t = 0; t < VERIFY_T; ++t) {
-    const device float* source = x + t * K_SIZE + k + bn;
-    float inv = inv_norm[t];
-    for (int tn = 0; tn < TN; ++tn) {
-      vectors[t][tn] = source[tn] * inv;
-    }
-  }
-
-  for (int tm = 0; tm < TM; ++tm) {
-    const device W* source = weight + (out_row + tm) * K_SIZE + k + bn;
-    W values[TN];
-    for (int tn = 0; tn < TN; ++tn) {
-      values[tn] = source[tn];
-    }
-    for (int t = 0; t < VERIFY_T; ++t) {
-      for (int tn = 0; tn < TN; ++tn) {
-        result[t][tm] += values[tn] * vectors[t][tn];
-      }
-    }
-  }
-}
-
-for (int t = 0; t < VERIFY_T; ++t) {
-  for (int tm = 0; tm < TM; ++tm) {
-    for (ushort offset = SN / 2; offset >= 1; offset >>= 1) {
-      result[t][tm] += simd_shuffle_down(result[t][tm], offset);
-    }
-  }
-}
-
-threadgroup float partials[VERIFY_T][BN][TM];
-if (lane == 0) {
-  for (int t = 0; t < VERIFY_T; ++t) {
-    for (int tm = 0; tm < TM; ++tm) {
-      partials[t][simd_gid][tm] = result[t][tm];
-    }
-  }
-}
-threadgroup_barrier(mem_flags::mem_threadgroup);
-
-if (simd_gid == 0 && lane == 0) {
-  for (int t = 0; t < VERIFY_T; ++t) {
-    for (int tm = 0; tm < TM; ++tm) {
-      float value = partials[t][0][tm];
-      for (int group = 1; group < BN; ++group) {
-        value += partials[t][group][tm];
-      }
-      out[t * OUT_SIZE + out_row + tm] = value;
-    }
-  }
 }
 """
 
@@ -1102,330 +994,6 @@ for (int token = 0; token < VERIFY_T; ++token) {
 """
 
 
-_AFFINE5_MULTI_BLOCK_SOURCE = r"""
-uint n_tile = threadgroup_position_in_grid.y;
-uint head = threadgroup_position_in_grid.z;
-uint simd_gid = simdgroup_index_in_threadgroup;
-uint simd_lid = thread_index_in_simdgroup;
-
-int out_row = int(n_tile) * ROWS_PER_TG +
-    int(simd_gid) * RESULTS_PER_SIMDGROUP;
-constexpr int W_ROW_BYTES = K_SIZE * 5 / 8;
-constexpr int W_HEAD_BYTES = N_SIZE * W_ROW_BYTES;
-constexpr int GROUPS = K_SIZE / GROUP_SIZE;
-
-const device uint8_t* ws = (const device uint8_t*)w +
-    int(head) * W_HEAD_BYTES + out_row * W_ROW_BYTES +
-    int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
-const device T* sc = scales + int(head) * N_SIZE * GROUPS +
-    out_row * GROUPS + int(simd_lid) / SCALE_STEP_PER_THREAD;
-const device T* bs = biases + int(head) * N_SIZE * GROUPS +
-    out_row * GROUPS + int(simd_lid) / SCALE_STEP_PER_THREAD;
-
-float result[VERIFY_T][RESULTS_PER_SIMDGROUP] = {0.0f};
-float x_thread[VERIFY_T][VALUES_PER_THREAD];
-const device T* xk = x + int(head) * VERIFY_T * K_SIZE +
-    int(simd_lid) * VALUES_PER_THREAD;
-
-for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
-  float sums[VERIFY_T];
-  bool active = k + int(simd_lid) * VALUES_PER_THREAD < K_SIZE;
-  for (int token = 0; token < VERIFY_T; ++token) {
-    if (active) {
-      sums[token] = load_affine5_vector_exact<T>(
-          xk + token * K_SIZE,
-          x_thread[token]);
-    } else {
-      sums[token] = 0.0f;
-      for (int i = 0; i < VALUES_PER_THREAD; ++i) {
-        x_thread[token][i] = 0.0f;
-      }
-    }
-  }
-  for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
-    const device uint8_t* wr = ws + row * W_ROW_BYTES;
-    const device T* sr = sc + row * GROUPS;
-    const device T* br = bs + row * GROUPS;
-    for (int token = 0; token < VERIFY_T; ++token) {
-      if (active) {
-        result[token][row] += affine5_qdot_exact(
-            wr,
-            x_thread[token],
-            float(sr[0]),
-            float(br[0]),
-            sums[token]);
-      }
-    }
-  }
-  ws += BLOCK_SIZE * 5 / 8;
-  sc += BLOCK_SIZE / GROUP_SIZE;
-  bs += BLOCK_SIZE / GROUP_SIZE;
-  xk += BLOCK_SIZE;
-}
-
-for (int token = 0; token < VERIFY_T; ++token) {
-  for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
-    int n = out_row + row;
-    float value = simd_sum(result[token][row]);
-    if (simd_lid == 0 && n < N_SIZE) {
-      y[(int(head) * VERIFY_T + token) * N_SIZE + n] = T(value);
-    }
-  }
-}
-"""
-
-
-_AFFINE5_DENSE_BLOCK_ARGMAX_SOURCE = _AFFINE5_DENSE_BLOCK_SOURCE.replace(
-    r"""for (int token = 0; token < VERIFY_T; ++token) {
-  for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
-    int n = out_row + row;
-    float value = simd_sum(result[token][row]);
-    if (simd_lid == 0 && n < N_SIZE) {
-      y[token * N_SIZE + n] = T(value);
-    }
-  }
-}
-""",
-    r"""threadgroup T simd_best_values[VERIFY_T][NUM_SIMDGROUPS];
-threadgroup int simd_best_indices[VERIFY_T][NUM_SIMDGROUPS];
-for (int token = 0; token < VERIFY_T; ++token) {
-  T best = T(simd_sum(result[token][0]));
-  int best_index = out_row;
-  for (int row = 1; row < RESULTS_PER_SIMDGROUP; ++row) {
-    T candidate = T(simd_sum(result[token][row]));
-    if (candidate > best) {
-      best = candidate;
-      best_index = out_row + row;
-    }
-  }
-  if (simd_lid == 0) {
-    simd_best_values[token][simd_gid] = best;
-    simd_best_indices[token][simd_gid] = best_index;
-  }
-}
-threadgroup_barrier(mem_flags::mem_threadgroup);
-if (simd_gid == 0 && simd_lid == 0) {
-  int tile = int(n_tile);
-  for (int token = 0; token < VERIFY_T; ++token) {
-    T best = simd_best_values[token][0];
-    int best_index = simd_best_indices[token][0];
-    for (int group = 1; group < NUM_SIMDGROUPS; ++group) {
-      T candidate = simd_best_values[token][group];
-      if (candidate > best) {
-        best = candidate;
-        best_index = simd_best_indices[token][group];
-      }
-    }
-    tile_values[token * NUM_TILES + tile] = best;
-    tile_indices[token * NUM_TILES + tile] = best_index;
-  }
-}
-""",
-)
-
-
-_AFFINE5_SWITCH_DOWN_SOURCE = r"""
-uint n_tile = threadgroup_position_in_grid.y;
-uint route = threadgroup_position_in_grid.z;
-uint simd_gid = simdgroup_index_in_threadgroup;
-uint simd_lid = thread_index_in_simdgroup;
-
-int out_row = int(n_tile) * ROWS_PER_TG +
-    int(simd_gid) * RESULTS_PER_SIMDGROUP;
-int token = int(route) / TOP_K;
-int route_index = int(route) - token * TOP_K;
-int expert = int(indices[route]);
-constexpr int W_ROW_BYTES = K_SIZE * 5 / 8;
-constexpr int W_EXPERT_BYTES = N_SIZE * W_ROW_BYTES;
-constexpr int GROUPS = K_SIZE / GROUP_SIZE;
-constexpr int S_EXPERT_SIZE = N_SIZE * GROUPS;
-
-const device uint8_t* ws = (const device uint8_t*)w +
-    expert * W_EXPERT_BYTES + out_row * W_ROW_BYTES +
-    int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
-const device T* sc = scales + expert * S_EXPERT_SIZE +
-    out_row * GROUPS + int(simd_lid) / SCALE_STEP_PER_THREAD;
-const device T* bs = biases + expert * S_EXPERT_SIZE +
-    out_row * GROUPS + int(simd_lid) / SCALE_STEP_PER_THREAD;
-const device T* xk = x + int(route) * K_SIZE +
-    int(simd_lid) * VALUES_PER_THREAD;
-const device uint8_t* shared_ws = (const device uint8_t*)shared_w +
-    out_row * W_ROW_BYTES + int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
-const device T* shared_sc = shared_scales + out_row * GROUPS +
-    int(simd_lid) / SCALE_STEP_PER_THREAD;
-const device T* shared_bs = shared_biases + out_row * GROUPS +
-    int(simd_lid) / SCALE_STEP_PER_THREAD;
-const device T* shared_xk = shared_x + token * K_SIZE +
-    int(simd_lid) * VALUES_PER_THREAD;
-
-float result[RESULTS_PER_SIMDGROUP] = {0.0f};
-float shared_result[RESULTS_PER_SIMDGROUP] = {0.0f};
-float x_thread[VALUES_PER_THREAD];
-float shared_x_thread[VALUES_PER_THREAD];
-
-for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
-  float sum = load_affine5_vector_exact<T>(xk, x_thread);
-  float shared_sum = 0.0f;
-  if (route_index == 0) {
-    shared_sum = load_affine5_vector_exact<T>(shared_xk, shared_x_thread);
-  }
-  for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
-    const device uint8_t* wr = ws + row * W_ROW_BYTES;
-    const device T* sr = sc + row * GROUPS;
-    const device T* br = bs + row * GROUPS;
-    result[row] += affine5_qdot_exact(
-        wr, x_thread, float(sr[0]), float(br[0]), sum);
-    if (route_index == 0) {
-      const device uint8_t* swr = shared_ws + row * W_ROW_BYTES;
-      const device T* ssr = shared_sc + row * GROUPS;
-      const device T* sbr = shared_bs + row * GROUPS;
-      shared_result[row] += affine5_qdot_exact(
-          swr,
-          shared_x_thread,
-          float(ssr[0]),
-          float(sbr[0]),
-          shared_sum);
-    }
-  }
-  ws += BLOCK_SIZE * 5 / 8;
-  sc += BLOCK_SIZE / GROUP_SIZE;
-  bs += BLOCK_SIZE / GROUP_SIZE;
-  xk += BLOCK_SIZE;
-  shared_ws += BLOCK_SIZE * 5 / 8;
-  shared_sc += BLOCK_SIZE / GROUP_SIZE;
-  shared_bs += BLOCK_SIZE / GROUP_SIZE;
-  shared_xk += BLOCK_SIZE;
-}
-
-for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
-  int n = out_row + row;
-  float value = simd_sum(result[row]);
-  float shared_value = simd_sum(shared_result[row]);
-  if (simd_lid == 0 && n < N_SIZE) {
-    y[route * N_SIZE + n] = T(value);
-    if (route_index == 0) {
-      shared_y[token * N_SIZE + n] = T(shared_value);
-    }
-  }
-}
-"""
-
-
-_AFFINE5_SWITCH_DOWN_PAIRED_SOURCE = r"""
-uint n_tile = threadgroup_position_in_grid.y;
-uint route = threadgroup_position_in_grid.z;
-uint simd_gid = simdgroup_index_in_threadgroup;
-uint simd_lid = thread_index_in_simdgroup;
-
-int out_row = int(n_tile) * ROWS_PER_TG +
-    int(simd_gid) * RESULTS_PER_SIMDGROUP;
-int token = int(route) / TOP_K;
-int route_index = int(route) - token * TOP_K;
-int expert = int(indices[route]);
-int paired_route = -1;
-if (token == 0) {
-  for (int other = 0; other < TOP_K; ++other) {
-    if (int(indices[TOP_K + other]) == expert) {
-      paired_route = TOP_K + other;
-      break;
-    }
-  }
-} else if (route_index != 0) {
-  for (int other = 0; other < TOP_K; ++other) {
-    if (int(indices[other]) == expert) {
-      return;
-    }
-  }
-}
-int pair_count = paired_route >= 0 ? 2 : 1;
-constexpr int W_ROW_BYTES = K_SIZE * 5 / 8;
-constexpr int W_EXPERT_BYTES = N_SIZE * W_ROW_BYTES;
-constexpr int GROUPS = K_SIZE / GROUP_SIZE;
-constexpr int S_EXPERT_SIZE = N_SIZE * GROUPS;
-
-const device uint8_t* ws = (const device uint8_t*)w +
-    expert * W_EXPERT_BYTES + out_row * W_ROW_BYTES +
-    int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
-const device T* sc = scales + expert * S_EXPERT_SIZE +
-    out_row * GROUPS + int(simd_lid) / SCALE_STEP_PER_THREAD;
-const device T* bs = biases + expert * S_EXPERT_SIZE +
-    out_row * GROUPS + int(simd_lid) / SCALE_STEP_PER_THREAD;
-const device T* xk[2];
-xk[0] = x + int(route) * K_SIZE + int(simd_lid) * VALUES_PER_THREAD;
-xk[1] = x + paired_route * K_SIZE + int(simd_lid) * VALUES_PER_THREAD;
-
-const device uint8_t* shared_ws = (const device uint8_t*)shared_w +
-    out_row * W_ROW_BYTES + int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
-const device T* shared_sc = shared_scales + out_row * GROUPS +
-    int(simd_lid) / SCALE_STEP_PER_THREAD;
-const device T* shared_bs = shared_biases + out_row * GROUPS +
-    int(simd_lid) / SCALE_STEP_PER_THREAD;
-const device T* shared_xk = shared_x + token * K_SIZE +
-    int(simd_lid) * VALUES_PER_THREAD;
-
-float result[2][RESULTS_PER_SIMDGROUP] = {0.0f};
-float shared_result[RESULTS_PER_SIMDGROUP] = {0.0f};
-float x_thread[2][VALUES_PER_THREAD];
-float shared_x_thread[VALUES_PER_THREAD];
-
-for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
-  float sums[2];
-  for (int pair = 0; pair < pair_count; ++pair) {
-    sums[pair] = load_affine5_vector_exact<T>(xk[pair], x_thread[pair]);
-  }
-  float shared_sum = 0.0f;
-  if (route_index == 0) {
-    shared_sum = load_affine5_vector_exact<T>(shared_xk, shared_x_thread);
-  }
-  for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
-    const device uint8_t* wr = ws + row * W_ROW_BYTES;
-    const device T* sr = sc + row * GROUPS;
-    const device T* br = bs + row * GROUPS;
-    for (int pair = 0; pair < pair_count; ++pair) {
-      result[pair][row] += affine5_qdot_exact(
-          wr, x_thread[pair], float(sr[0]), float(br[0]), sums[pair]);
-    }
-    if (route_index == 0) {
-      const device uint8_t* swr = shared_ws + row * W_ROW_BYTES;
-      const device T* ssr = shared_sc + row * GROUPS;
-      const device T* sbr = shared_bs + row * GROUPS;
-      shared_result[row] += affine5_qdot_exact(
-          swr,
-          shared_x_thread,
-          float(ssr[0]),
-          float(sbr[0]),
-          shared_sum);
-    }
-  }
-  ws += BLOCK_SIZE * 5 / 8;
-  sc += BLOCK_SIZE / GROUP_SIZE;
-  bs += BLOCK_SIZE / GROUP_SIZE;
-  for (int pair = 0; pair < pair_count; ++pair) {
-    xk[pair] += BLOCK_SIZE;
-  }
-  shared_ws += BLOCK_SIZE * 5 / 8;
-  shared_sc += BLOCK_SIZE / GROUP_SIZE;
-  shared_bs += BLOCK_SIZE / GROUP_SIZE;
-  shared_xk += BLOCK_SIZE;
-}
-
-for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
-  int n = out_row + row;
-  for (int pair = 0; pair < pair_count; ++pair) {
-    T value = T(simd_sum(result[pair][row]));
-    if (simd_lid == 0 && n < N_SIZE) {
-      int output_route = pair == 0 ? int(route) : paired_route;
-      y[output_route * N_SIZE + n] = value;
-    }
-  }
-  T shared_value = T(simd_sum(shared_result[row]));
-  if (simd_lid == 0 && n < N_SIZE && route_index == 0) {
-    shared_y[token * N_SIZE + n] = shared_value;
-  }
-}
-"""
-
-
 _AFFINE5_MOE_DOWN_SOURCE = r"""
 uint n_tile = threadgroup_position_in_grid.y;
 uint token = threadgroup_position_in_grid.z;
@@ -1513,19 +1081,6 @@ for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
   }
 }
 """
-
-
-_AFFINE5_MOE_DOWN_PRECOMPUTED_SOURCE = (
-    _AFFINE5_MOE_DOWN_SOURCE.split("const device uint8_t* shared_ws", 1)[0] + r"""
-for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
-  int n = out_row + row;
-  if (simd_lid == 0 && n < N_SIZE) {
-    y[int(token) * N_SIZE + n] =
-        T(routed_sum[row] + shared_y[int(token) * N_SIZE + n]);
-  }
-}
-"""
-)
 
 
 _MXFP8_HEADER = _COMMON_HEADER + r"""
@@ -1750,20 +1305,6 @@ def _hc_normalized_norm_kernel(
 
 
 @lru_cache(maxsize=None)
-def _hc_mix_gemv_kernel(weight_dtype, length, k_size, out_size):
-    return mx.fast.metal_kernel(
-        name=(
-            "glm5_next_verify_hc_mix_gemv_"
-            f"{_dtype_name(weight_dtype)}_t{length}_k{k_size}_o{out_size}"
-        ),
-        input_names=["x", "weight"],
-        output_names=["out"],
-        header=_COMMON_HEADER,
-        source=_HC_MIX_GEMV_SOURCE,
-    )
-
-
-@lru_cache(maxsize=None)
 def _fp32_decode_block_gemv_kernel(weight_dtype, length, k_size, out_size):
     return mx.fast.metal_kernel(
         name=(
@@ -1776,37 +1317,6 @@ def _fp32_decode_block_gemv_kernel(weight_dtype, length, k_size, out_size):
         source=_HC_MIX_GEMV_SOURCE.replace(
             "constexpr int BN = 8;", "constexpr int BN = 1;"
         ),
-    )
-
-
-@lru_cache(maxsize=None)
-def _hc_inv_rms_kernel(length, k_size, norm_eps):
-    return mx.fast.metal_kernel(
-        name=(
-            "glm5_next_verify_hc_inv_rms_"
-            f"t{length}_k{k_size}_e{round(norm_eps / 1e-9)}"
-        ),
-        input_names=["x"],
-        output_names=["inv_norm"],
-        header=(
-            _COMMON_HEADER
-            + f"\nconstant constexpr float NORM_EPS = {float(norm_eps)!r};\n"
-        ),
-        source=_HC_INV_RMS_SOURCE,
-    )
-
-
-@lru_cache(maxsize=None)
-def _hc_scaled_mix_gemv_kernel(weight_dtype, length, k_size, out_size):
-    return mx.fast.metal_kernel(
-        name=(
-            "glm5_next_verify_hc_scaled_mix_gemv_"
-            f"{_dtype_name(weight_dtype)}_t{length}_k{k_size}_o{out_size}"
-        ),
-        input_names=["x", "inv_norm", "weight"],
-        output_names=["out"],
-        header=_COMMON_HEADER,
-        source=_HC_SCALED_MIX_GEMV_SOURCE,
     )
 
 
@@ -1930,90 +1440,6 @@ def _affine_dense_block_kernel(
 
 
 @lru_cache(maxsize=None)
-def _affine_multi_block_kernel(
-    bits,
-    dtype,
-    length,
-    heads,
-    k_size,
-    n_size,
-    group_size,
-):
-    return mx.fast.metal_kernel(
-        name=(
-            f"glm5_next_verify_affine{bits}_multi_block_"
-            f"{_dtype_name(dtype)}_t{length}_h{heads}_k{k_size}_"
-            f"n{n_size}_g{group_size}"
-        ),
-        input_names=["x", "w", "scales", "biases"],
-        output_names=["y"],
-        header=_affine_exact_header(bits, group_size, 1, 1, 2),
-        source=_affine_source(_AFFINE5_MULTI_BLOCK_SOURCE, bits),
-    )
-
-
-@lru_cache(maxsize=None)
-def _affine_dense_block_argmax_kernel(
-    bits,
-    dtype,
-    length,
-    k_size,
-    n_size,
-    group_size,
-):
-    return mx.fast.metal_kernel(
-        name=(
-            f"glm5_next_verify_affine{bits}_dense_block_argmax_"
-            f"{_dtype_name(dtype)}_t{length}_k{k_size}_n{n_size}_g{group_size}"
-        ),
-        input_names=["x", "w", "scales", "biases"],
-        output_names=["tile_values", "tile_indices"],
-        header=_affine_exact_header(bits, group_size, 4, 4, 2),
-        source=_affine_source(_AFFINE5_DENSE_BLOCK_ARGMAX_SOURCE, bits),
-    )
-
-
-@lru_cache(maxsize=None)
-def _affine_switch_down_kernel(
-    bits,
-    dtype,
-    length,
-    k_size,
-    n_size,
-    top_k,
-    group_size,
-):
-    return mx.fast.metal_kernel(
-        name=(
-            f"glm5_next_verify_affine{bits}_switch_down_"
-            f"{_dtype_name(dtype)}_t{length}_k{k_size}_n{n_size}_"
-            f"e{top_k}_g{group_size}"
-        ),
-        input_names=[
-            "x",
-            "indices",
-            "w",
-            "scales",
-            "biases",
-            "shared_x",
-            "shared_w",
-            "shared_scales",
-            "shared_biases",
-        ],
-        output_names=["y", "shared_y"],
-        header=_affine_exact_header(bits, group_size, 2, 4),
-        source=_affine_source(
-            (
-                _AFFINE5_SWITCH_DOWN_PAIRED_SOURCE
-                if length == 2
-                else _AFFINE5_SWITCH_DOWN_SOURCE
-            ),
-            bits,
-        ),
-    )
-
-
-@lru_cache(maxsize=None)
 def _affine_moe_down_kernel(
     bits,
     dtype,
@@ -2044,37 +1470,6 @@ def _affine_moe_down_kernel(
         output_names=["y"],
         header=_affine_exact_header(bits, group_size, 2, 4),
         source=_affine_source(_AFFINE5_MOE_DOWN_SOURCE, bits),
-    )
-
-
-@lru_cache(maxsize=None)
-def _affine_moe_down_precomputed_kernel(
-    bits,
-    dtype,
-    length,
-    k_size,
-    n_size,
-    top_k,
-    group_size,
-):
-    return mx.fast.metal_kernel(
-        name=(
-            f"glm5_next_verify_affine{bits}_moe_down_precomputed_"
-            f"{_dtype_name(dtype)}_t{length}_k{k_size}_n{n_size}_"
-            f"e{top_k}_g{group_size}"
-        ),
-        input_names=[
-            "x",
-            "indices",
-            "route_weights",
-            "w",
-            "scales",
-            "biases",
-            "shared_y",
-        ],
-        output_names=["y"],
-        header=_affine_exact_header(bits, group_size, 2, 2),
-        source=_affine_source(_AFFINE5_MOE_DOWN_PRECOMPUTED_SOURCE, bits),
     )
 
 
@@ -2263,63 +1658,6 @@ def exact_quantized_block_linear(linear, x: mx.array) -> Optional[mx.array]:
     return output
 
 
-def exact_affine_multi_block(
-    linear,
-    x: mx.array,
-) -> Optional[mx.array]:
-    """Project all verifier positions through independent affine heads."""
-    if (
-        not mx.metal.is_available()
-        or not isinstance(linear, QuantizedMultiLinear)
-        or linear.mode != "affine"
-        or linear.bits not in (4, 5)
-        or linear.biases is None
-        or x.ndim != 4
-        or x.shape[0] != 1
-        or not 1 < x.shape[2] <= 4
-        or x.dtype not in (mx.bfloat16, mx.float16)
-        or linear.scales.dtype != x.dtype
-        or linear.biases.dtype != x.dtype
-        or linear.group_size % 16
-    ):
-        return None
-
-    _, heads, length, k_size = x.shape
-    weight_heads, n_size, packed_k = linear.weight.shape
-    if (
-        heads != weight_heads
-        or packed_k * 32 // linear.bits != k_size
-        or k_size % linear.group_size
-        or n_size % 16
-    ):
-        return None
-
-    x = mx.contiguous(x)
-    kernel = _affine_multi_block_kernel(
-        linear.bits,
-        x.dtype,
-        length,
-        heads,
-        k_size,
-        n_size,
-        linear.group_size,
-    )
-    return kernel(
-        inputs=[x, linear.weight, linear.scales, linear.biases],
-        template=[
-            ("T", x.dtype),
-            ("VERIFY_T", int(length)),
-            ("K_SIZE", int(k_size)),
-            ("N_SIZE", int(n_size)),
-            ("GROUP_SIZE", int(linear.group_size)),
-        ],
-        grid=(32, 16 * (n_size // 16), heads),
-        threadgroup=(32, 1, 1),
-        output_shapes=[(1, heads, length, n_size)],
-        output_dtypes=[x.dtype],
-    )[0]
-
-
 def exact_affine_switch_gate_up(switch, x: mx.array, indices: mx.array):
     """Project selected affine up/gate weights in one verifier dispatch."""
     up = getattr(switch, "up_proj", None)
@@ -2395,96 +1733,6 @@ def exact_affine_switch_gate_up(switch, x: mx.array, indices: mx.array):
         output_shapes=[
             (1, length, top_k, n_size),
             (1, length, top_k, n_size),
-        ],
-        output_dtypes=[x.dtype, x.dtype],
-    )
-
-
-def exact_affine_switch_down(
-    linear,
-    x: mx.array,
-    indices: mx.array,
-    shared_linear,
-    shared_x: mx.array,
-):
-    """Fuse routed and shared affine down projections."""
-    if (
-        not mx.metal.is_available()
-        or not isinstance(linear, QuantizedSwitchLinear)
-        or linear.mode != "affine"
-        or linear.bits not in (4, 5)
-        or linear.biases is None
-        or "bias" in linear
-        or x.ndim != 4
-        or x.shape[0] != 1
-        or x.shape[1] != 2
-        or x.shape[2] != indices.shape[-1]
-        or indices.shape != x.shape[:3]
-        or x.dtype not in (mx.bfloat16, mx.float16)
-        or linear.scales.dtype != x.dtype
-        or linear.biases.dtype != x.dtype
-        or not isinstance(shared_linear, nn.QuantizedLinear)
-        or shared_linear.mode != "affine"
-        or shared_linear.bits != linear.bits
-        or shared_linear.biases is None
-        or "bias" in shared_linear
-        or shared_x.shape != (1, 2, x.shape[-1])
-        or shared_x.dtype != x.dtype
-        or shared_linear.scales.dtype != x.dtype
-        or shared_linear.biases.dtype != x.dtype
-        or shared_linear.group_size != linear.group_size
-    ):
-        return None
-
-    _, length, top_k, k_size = x.shape
-    n_size = linear.weight.shape[1]
-    if (
-        k_size != linear.input_dims
-        or k_size != shared_linear.weight.shape[1] * 32 // shared_linear.bits
-        or shared_linear.weight.shape[0] != n_size
-        or k_size % 512
-        or n_size % 8
-        or linear.group_size % 16
-    ):
-        return None
-
-    x = mx.contiguous(x)
-    shared_x = mx.contiguous(shared_x)
-    indices = mx.contiguous(indices.astype(mx.int32))
-    kernel = _affine_switch_down_kernel(
-        linear.bits,
-        x.dtype,
-        length,
-        k_size,
-        n_size,
-        top_k,
-        linear.group_size,
-    )
-    return kernel(
-        inputs=[
-            x,
-            indices,
-            linear.weight,
-            linear.scales,
-            linear.biases,
-            shared_x,
-            shared_linear.weight,
-            shared_linear.scales,
-            shared_linear.biases,
-        ],
-        template=[
-            ("T", x.dtype),
-            ("VERIFY_T", int(length)),
-            ("K_SIZE", int(k_size)),
-            ("N_SIZE", int(n_size)),
-            ("TOP_K", int(top_k)),
-            ("GROUP_SIZE", int(linear.group_size)),
-        ],
-        grid=(32, 8 * (n_size // 16), length * top_k),
-        threadgroup=(32, 4, 1),
-        output_shapes=[
-            (1, length, top_k, n_size),
-            (1, length, n_size),
         ],
         output_dtypes=[x.dtype, x.dtype],
     )
@@ -2577,84 +1825,6 @@ def exact_affine_moe_down(
         ],
         grid=(32, n_size // 2, length),
         threadgroup=(32, 4, 1),
-        output_shapes=[(1, length, n_size)],
-        output_dtypes=[x.dtype],
-    )[0]
-
-
-def exact_affine_moe_down_precomputed(
-    linear,
-    x: mx.array,
-    indices: mx.array,
-    route_weights: mx.array,
-    shared_y: mx.array,
-):
-    """Fuse selected affine downs after a block-shared expert projection."""
-    if (
-        not mx.metal.is_available()
-        or not isinstance(linear, QuantizedSwitchLinear)
-        or linear.mode != "affine"
-        or linear.bits not in (4, 5)
-        or linear.biases is None
-        or "bias" in linear
-        or x.ndim != 4
-        or x.shape[0] != 1
-        or not 1 < x.shape[1] <= 4
-        or x.shape[2] != indices.shape[-1]
-        or indices.shape != x.shape[:3]
-        or route_weights.shape != indices.shape
-        or route_weights.dtype != mx.float32
-        or x.dtype not in (mx.bfloat16, mx.float16)
-        or linear.scales.dtype != x.dtype
-        or linear.biases.dtype != x.dtype
-        or shared_y.shape != (1, x.shape[1], linear.output_dims)
-        or shared_y.dtype != x.dtype
-    ):
-        return None
-
-    _, length, top_k, k_size = x.shape
-    n_size = linear.weight.shape[1]
-    if (
-        k_size != linear.input_dims
-        or k_size % 512
-        or n_size % 8
-        or linear.group_size % 16
-    ):
-        return None
-
-    x = mx.contiguous(x)
-    indices = mx.contiguous(indices.astype(mx.int32))
-    route_weights = mx.contiguous(route_weights)
-    shared_y = mx.contiguous(shared_y)
-    kernel = _affine_moe_down_precomputed_kernel(
-        linear.bits,
-        x.dtype,
-        length,
-        k_size,
-        n_size,
-        top_k,
-        linear.group_size,
-    )
-    return kernel(
-        inputs=[
-            x,
-            indices,
-            route_weights,
-            linear.weight,
-            linear.scales,
-            linear.biases,
-            shared_y,
-        ],
-        template=[
-            ("T", x.dtype),
-            ("VERIFY_T", int(length)),
-            ("K_SIZE", int(k_size)),
-            ("N_SIZE", int(n_size)),
-            ("TOP_K", int(top_k)),
-            ("GROUP_SIZE", int(linear.group_size)),
-        ],
-        grid=(32, 8 * (n_size // 16), length),
-        threadgroup=(32, 2, 1),
         output_shapes=[(1, length, n_size)],
         output_dtypes=[x.dtype],
     )[0]
@@ -2764,40 +1934,6 @@ def exact_hc_norm(connection, norm, x: mx.array, mixes: mx.array):
     )
 
 
-def exact_hc_mix_gemv(x: mx.array, weight: mx.array) -> Optional[mx.array]:
-    """Project B=1 verifier positions with MLX decode-GEMV reductions."""
-    if (
-        not mx.metal.is_available()
-        or x.ndim != 3
-        or x.shape[0] != 1
-        or not 1 < x.shape[1] <= 4
-        or x.dtype != mx.float32
-        or weight.ndim != 2
-        or weight.dtype not in (mx.bfloat16, mx.float16, mx.float32)
-        or x.shape[-1] != weight.shape[-1]
-        or x.shape[-1] % 1024
-        or weight.shape[0] % 4
-    ):
-        return None
-
-    _, length, k_size = x.shape
-    out_size = weight.shape[0]
-    kernel = _hc_mix_gemv_kernel(weight.dtype, length, k_size, out_size)
-    return kernel(
-        inputs=[x, weight],
-        template=[
-            ("W", weight.dtype),
-            ("VERIFY_T", int(length)),
-            ("K_SIZE", int(k_size)),
-            ("OUT_SIZE", int(out_size)),
-        ],
-        grid=(32 * (out_size // 4), 8, 1),
-        threadgroup=(32, 8, 1),
-        output_shapes=[(1, length, out_size)],
-        output_dtypes=[mx.float32],
-    )[0]
-
-
 def exact_fp32_decode_block_gemv(x: mx.array, weight: mx.array) -> Optional[mx.array]:
     """Share a BF16 weight across FP32 verifier rows using GEMV arithmetic."""
     if (
@@ -2827,59 +1963,6 @@ def exact_fp32_decode_block_gemv(x: mx.array, weight: mx.array) -> Optional[mx.a
         ],
         grid=(32 * (out_size // 4), 1, 1),
         threadgroup=(32, 1, 1),
-        output_shapes=[(1, length, out_size)],
-        output_dtypes=[mx.float32],
-    )[0]
-
-
-def exact_hc_normalized_mix_gemv(
-    x: mx.array,
-    weight: mx.array,
-    norm_eps: float,
-) -> Optional[mx.array]:
-    """Fuse the FP32 RMS normalization feeding a verifier HC projection."""
-    if (
-        not mx.metal.is_available()
-        or x.ndim != 3
-        or x.shape[0] != 1
-        or not 1 < x.shape[1] <= 4
-        or x.dtype != mx.float32
-        or weight.ndim != 2
-        or weight.dtype not in (mx.bfloat16, mx.float16, mx.float32)
-        or x.shape[-1] != weight.shape[-1]
-        or x.shape[-1] % 4096
-        or weight.shape[0] % 4
-    ):
-        return None
-
-    _, length, k_size = x.shape
-    out_size = weight.shape[0]
-    x = mx.contiguous(x)
-    inv_kernel = _hc_inv_rms_kernel(length, k_size, float(norm_eps))
-    inv_norm = inv_kernel(
-        inputs=[x],
-        template=[("K_SIZE", int(k_size))],
-        grid=(32, 32 * length, 1),
-        threadgroup=(32, 32, 1),
-        output_shapes=[(length,)],
-        output_dtypes=[mx.float32],
-    )[0]
-    mix_kernel = _hc_scaled_mix_gemv_kernel(
-        weight.dtype,
-        length,
-        k_size,
-        out_size,
-    )
-    return mix_kernel(
-        inputs=[x, inv_norm, weight],
-        template=[
-            ("W", weight.dtype),
-            ("VERIFY_T", int(length)),
-            ("K_SIZE", int(k_size)),
-            ("OUT_SIZE", int(out_size)),
-        ],
-        grid=(32 * (out_size // 4), 8, 1),
-        threadgroup=(32, 8, 1),
         output_shapes=[(1, length, out_size)],
         output_dtypes=[mx.float32],
     )[0]
@@ -2954,44 +2037,6 @@ def exact_quantized_block_argmax(linear, x: mx.array) -> Optional[mx.array]:
     n_size = linear.weight.shape[0]
     if k_size % linear.group_size or linear.group_size % 8 or n_size < 8 or n_size % 8:
         return None
-
-    if batch == 1:
-        if k_size % 512 or n_size % 16:
-            return None
-        num_tiles = n_size // 16
-        x = mx.contiguous(x)
-        kernel = _affine_dense_block_argmax_kernel(
-            linear.bits,
-            x.dtype,
-            length,
-            k_size,
-            n_size,
-            linear.group_size,
-        )
-        tile_values, tile_indices = kernel(
-            inputs=[x, linear.weight, linear.scales, linear.biases],
-            template=[
-                ("T", x.dtype),
-                ("VERIFY_T", int(length)),
-                ("K_SIZE", int(k_size)),
-                ("N_SIZE", int(n_size)),
-                ("GROUP_SIZE", int(linear.group_size)),
-                ("NUM_TILES", int(num_tiles)),
-            ],
-            grid=(32, 4 * num_tiles, 1),
-            threadgroup=(32, 4, 1),
-            output_shapes=[
-                (batch, length, num_tiles),
-                (batch, length, num_tiles),
-            ],
-            output_dtypes=[x.dtype, mx.int32],
-        )
-        best_tile = mx.argmax(tile_values, axis=-1)
-        return mx.take_along_axis(
-            tile_indices,
-            best_tile[..., None],
-            axis=-1,
-        ).squeeze(-1)
 
     num_tiles = n_size // 8
     x = mx.contiguous(x)
@@ -3110,16 +2155,6 @@ def _snapshot_single_cache(cache, incoming_tokens):
             buf_gate,
             None if cache.pooled is None else cache.pooled.shape[1],
         )
-    if isinstance(cache, HierarchyCache):
-        # HierarchyCache constructs replacement buffers/representatives, so
-        # its old array references are immutable during verification.
-        return (
-            "hierarchy",
-            cache.buffer,
-            cache.representatives,
-            list(cache.remainders),
-            list(cache.representative_lengths),
-        )
     if isinstance(cache, KVCache):
         return ("append", cache.empty(), int(cache.offset))
     return (
@@ -3193,13 +2228,6 @@ def _restore_single_cache(cache, snapshot):
             None if pooled_length is None else cache.pooled[:, :pooled_length]
         )
         return
-    if kind == "hierarchy":
-        _, buffer, representatives, remainders, representative_lengths = snapshot
-        cache.buffer = buffer
-        cache.representatives = representatives
-        cache.remainders = remainders
-        cache.representative_lengths = representative_lengths
-        return
     if kind == "append":
         _, was_empty, offset = snapshot
         if was_empty:
@@ -3227,11 +2255,6 @@ def _clamped_swiglu(gate, up, limit):
     gate = mx.minimum(gate, limit)
     up = mx.clip(up, -limit, limit)
     return nn.silu(gate) * up
-
-
-@mx.compile
-def _linear_output_gate(output, gate, weight, eps):
-    return mx.fast.rms_norm(output, weight, eps) * mx.sigmoid(gate)
 
 
 @mx.compile
@@ -3268,18 +2291,6 @@ class Glm5NextSpeculativeVerifier:
             if logits is not None:
                 return logits
         return self._block_linear(head, hidden)
-
-    @staticmethod
-    def _linear(linear, x: mx.array) -> mx.array:
-        if x.ndim != 3 or x.shape[1] <= 1:
-            return linear(x)
-        return mx.concatenate(
-            [
-                linear(mx.contiguous(x[:, index : index + 1]))
-                for index in range(x.shape[1])
-            ],
-            axis=1,
-        )
 
     @staticmethod
     def _singleton_linear(linear, x: mx.array) -> mx.array:
@@ -3431,89 +2442,15 @@ class Glm5NextSpeculativeVerifier:
             moe.shared_experts.down_proj,
             shared_hidden,
         )
-        fused_moe = (
-            exact_affine_moe_down_precomputed(
-                switch.down_proj,
-                activated,
-                indices,
-                weights,
-                shared,
-            )
-            if gate_up is not None
-            else None
+        if gate_up is not None:
+            activated = activated.reshape(batch * length, top_k, 1, -1)
+        routed = switch.down_proj(
+            activated,
+            flat_indices,
+            sorted_indices=False,
         )
-        if fused_moe is not None:
-            return fused_moe
-        fused_down = (
-            exact_affine_switch_down(
-                switch.down_proj,
-                activated,
-                indices,
-                moe.shared_experts.down_proj,
-                shared_hidden,
-            )
-            if gate_up is not None
-            else None
-        )
-        if fused_down is None:
-            if gate_up is not None:
-                activated = activated.reshape(batch * length, top_k, 1, -1)
-            routed = switch.down_proj(
-                activated,
-                flat_indices,
-                sorted_indices=False,
-            )
-            routed = routed.squeeze(-2).reshape(batch, length, top_k, -1)
-            shared = self._block_linear(
-                moe.shared_experts.down_proj,
-                shared_hidden,
-            )
-        else:
-            routed, shared = fused_down
+        routed = routed.squeeze(-2).reshape(batch, length, top_k, -1)
         return _combine_moe_outputs(routed, weights, shared)
-
-    @staticmethod
-    def _merge_linear_updates(updates):
-        q, k, v, a, b = (
-            mx.concatenate([update[index] for update in updates], axis=1)
-            for index in range(5)
-        )
-        masks = [update[8] for update in updates]
-        mask = (
-            None
-            if all(value is None for value in masks)
-            else mx.concatenate(
-                [
-                    (
-                        value
-                        if value is not None
-                        else mx.ones(update[0].shape[:2], dtype=mx.bool_)
-                    )
-                    for update, value in zip(updates, masks)
-                ],
-                axis=1,
-            )
-        )
-        conv_input = mx.concatenate(
-            [updates[0][9]] + [update[9][:, -1:] for update in updates[1:]],
-            axis=1,
-        )
-        return (
-            q,
-            k,
-            v,
-            a,
-            b,
-            updates[0][5],
-            updates[0][6],
-            updates[0][7],
-            mask,
-            conv_input,
-            updates[0][10],
-            updates[0][11],
-            mx.stack([update[12] for update in updates], axis=1),
-            mx.stack([update[13] for update in updates], axis=1),
-        )
 
     def _linear_attention(self, attention, inputs, mask, cache):
         updates = []
@@ -3686,9 +2623,6 @@ class Glm5NextSpeculativeVerifier:
     def _head_timewise(fn, x: mx.array) -> mx.array:
         if x.ndim != 4 or x.shape[2] <= 1:
             return fn(x)
-        output = exact_affine_multi_block(fn, x)
-        if output is not None:
-            return output
         outputs = []
         for index in range(x.shape[2]):
             output = fn(mx.contiguous(x[:, :, index : index + 1]))
@@ -3717,13 +2651,6 @@ class Glm5NextSpeculativeVerifier:
         # At B=1, flattening verifier time changes MLX's FP32 matmul reduction
         # order. Keep each mix projection decode-shaped while sharing the
         # Sinkhorn/collapse work across the complete verifier block.
-        mixed = exact_hc_normalized_mix_gemv(
-            y.flatten(-2),
-            connection.fn,
-            connection.norm_eps,
-        )
-        if mixed is not None:
-            return y, mixed
         mixes = []
         normalized_steps = []
         for index in range(x.shape[1]):
@@ -3733,10 +2660,6 @@ class Glm5NextSpeculativeVerifier:
                 connection.norm_eps,
             )
             normalized_steps.append(normalized)
-        normalized = mx.concatenate(normalized_steps, axis=1)
-        mixed = exact_hc_mix_gemv(normalized, connection.fn)
-        if mixed is not None:
-            return y, mixed
         for normalized in normalized_steps:
             mixes.append(normalized @ connection.fn.T)
         return y, mx.concatenate(mixes, axis=1)
@@ -3824,18 +2747,17 @@ class Glm5NextSpeculativeVerifier:
             q_resid, q, new_latent, index_projected = projected
 
         if cache is None:
-            kv_cache = index_cache = pool_cache = hierarchy_cache = None
+            kv_cache = index_cache = pool_cache = None
             latent = new_latent
             cache_offset = 0
         else:
             kv_cache = cache[0]
             cache_offset = kv_cache.offset
             if attention.indexer is None:
-                index_cache = pool_cache = hierarchy_cache = None
+                index_cache = pool_cache = None
             else:
                 index_cache = cache[1]
                 pool_cache = cache[2]
-                hierarchy_cache = cache[3] if len(cache.caches) >= 5 else None
             latent, _ = kv_cache.update_and_fetch(
                 new_latent,
                 mx.zeros((batch, 1, length, 0), dtype=new_latent.dtype),
@@ -3862,7 +2784,6 @@ class Glm5NextSpeculativeVerifier:
                         ),
                         index_cache,
                         pool_cache,
-                        hierarchy_cache,
                         cache_offset + index,
                         cache_update_sink=index_update,
                         linear_fn=self._singleton_linear,
@@ -3890,7 +2811,6 @@ class Glm5NextSpeculativeVerifier:
                 padding_mask,
                 index_cache,
                 pool_cache,
-                hierarchy_cache,
                 cache_offset,
                 cache_update_sink=cache_update,
                 linear_fn=self._singleton_linear,
@@ -4123,10 +3043,7 @@ class Glm5NextSpeculativeVerifier:
         if indexer is not None:
             index_cache = cache[1]
             pool_cache = cache[2]
-            hierarchy_cache = cache[3] if len(cache.caches) >= 5 else None
             touched.extend([index_cache, pool_cache])
-            if hierarchy_cache is not None:
-                touched.append(hierarchy_cache)
 
         if ragged:
             for entry in touched:
@@ -4157,26 +3074,7 @@ class Glm5NextSpeculativeVerifier:
                     update["cache_offset"] + index,
                 )
                 new_pool_keys = indexer._compress_pools(ready_keys, ready_gates)
-                previous_pool_lengths = pool_cache.pool_lengths
-                if not isinstance(previous_pool_lengths, int):
-                    previous_pool_lengths = list(previous_pool_lengths)
                 pool_cache.update_and_fetch(new_pool_keys)
-
-                if hierarchy_cache is not None:
-                    current_pool_lengths = pool_cache.pool_lengths
-                    if isinstance(previous_pool_lengths, int):
-                        previous_pool_lengths = [previous_pool_lengths] * batch
-                        current_pool_lengths = [current_pool_lengths] * batch
-                    new_pool_counts = [
-                        current - previous
-                        for previous, current in zip(
-                            previous_pool_lengths, current_pool_lengths
-                        )
-                    ]
-                    hierarchy_cache.update_and_fetch(
-                        new_pool_keys,
-                        new_counts=new_pool_counts,
-                    )
 
         if ragged:
             for entry in touched:

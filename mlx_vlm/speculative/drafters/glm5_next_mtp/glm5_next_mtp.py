@@ -8,7 +8,6 @@ from ....models.cache import (
     BatchKVCache,
     BatchPoolingCache,
     CacheList,
-    HierarchyCache,
     KVCache,
     PoolingCache,
 )
@@ -59,8 +58,6 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
     prefer_requested_block_size = False
     requires_uniform_batch_acceptance = False
     supports_ragged_batch_acceptance = True
-    max_speculative_batch_size = 4
-    requires_accelerated_target_verifier = True
 
     def __init__(self, config: Glm5NextMTPConfig):
         nn.Module.__init__(self)
@@ -112,14 +109,7 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
         else:
             kv_cache = lambda: BatchKVCache(left_padding)
             pool_cache = BatchPoolingCache(indexer.index_kpool, left_padding)
-        caches = [kv_cache(), kv_cache(), pool_cache]
-        if indexer.hisa_block > 0:
-            hierarchy = HierarchyCache(indexer.hisa_block)
-            caches.append(
-                hierarchy if left_padding is None else hierarchy.to_batch(left_padding)
-            )
-        caches.append(kv_cache())
-        return [CacheList(*caches)]
+        return [CacheList(kv_cache(), kv_cache(), pool_cache, kv_cache())]
 
     def reset(
         self, target_model, left_padding: Optional[List[int]] = None
@@ -246,16 +236,6 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
                                 ),
                             )
                         )
-                    elif isinstance(subcache, HierarchyCache):
-                        snapshots.append(
-                            (
-                                "hierarchy",
-                                subcache.buffer,
-                                subcache.representatives,
-                                list(subcache.remainders),
-                                list(subcache.representative_lengths),
-                            )
-                        )
                     else:
                         snapshots.append(
                             (
@@ -291,17 +271,6 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
                         if pooled_length is None
                         else subcache.pooled[:, :pooled_length]
                     )
-                    continue
-                if kind == "hierarchy":
-                    (
-                        _,
-                        subcache.buffer,
-                        subcache.representatives,
-                        remainders,
-                        representative_lengths,
-                    ) = snapshot
-                    subcache.remainders = list(remainders)
-                    subcache.representative_lengths = list(representative_lengths)
                     continue
                 _, state, meta_state = snapshot
                 subcache.meta_state = _clone_tree(meta_state)

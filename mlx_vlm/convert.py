@@ -281,7 +281,6 @@ def convert(
     quant_predicate: Optional[str] = None,
     mtp: bool = False,
     mtp_output: Optional[str] = None,
-    mtp_full_precision: bool = False,
     mtp_q_group_size: Optional[int] = None,
     mtp_q_bits: Optional[int] = None,
     mtp_q_mode: Optional[str] = None,
@@ -289,12 +288,6 @@ def convert(
     mtp_quantization_requested = any(
         value is not None for value in (mtp_q_group_size, mtp_q_bits, mtp_q_mode)
     )
-    if mtp_full_precision and mtp_quantization_requested:
-        raise ValueError(
-            "Choose either --mtp-full-precision or MTP quantization options, "
-            "not both."
-        )
-
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
     fp8_target_quantization = (
@@ -440,7 +433,7 @@ def convert(
                     drafter_q_group_size = mtp_q_group_size
                     drafter_q_bits = mtp_q_bits
                     drafter_q_mode = mtp_q_mode or "affine"
-                elif quantize and not mtp_full_precision:
+                elif quantize:
                     drafter_q_group_size = q_group_size
                     drafter_q_bits = q_bits
                     drafter_q_mode = q_mode
@@ -454,7 +447,6 @@ def convert(
                     q_bits=drafter_q_bits,
                     q_group_size=drafter_q_group_size,
                     q_mode=drafter_q_mode,
-                    dequantize=mtp_full_precision,
                 )
         except Exception as exc:
             # the base conversion already succeeded; a drafter failure must not
@@ -582,15 +574,6 @@ def configure_parser() -> argparse.ArgumentParser:
         help="Output path for the MTP drafter (default: <mlx-path>-mtp).",
         type=str,
         default=None,
-    )
-    parser.add_argument(
-        "--mtp-full-precision",
-        help=(
-            "Keep the extracted MTP drafter dense BF16 even when the base model "
-            "is quantized. Block-FP8 source tensors are reconstructed to BF16."
-        ),
-        action="store_true",
-        default=False,
     )
     parser.add_argument(
         "--mtp-q-group-size",

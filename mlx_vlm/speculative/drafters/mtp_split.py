@@ -234,12 +234,6 @@ class MTPSplitter:
         q_bits = quant_opts.get("q_bits")
         q_mode = quant_opts.get("q_mode")
         quantize = q_bits is not None or q_mode is not None
-        dequantize = bool(quant_opts.get("dequantize", False))
-        if dequantize and quantize:
-            raise ValueError(
-                "Choose either dense BF16 MTP extraction or MTP quantization, "
-                "not both."
-            )
         fp8_target_quantization = None
         if quantize:
             fp8_target_quantization = get_quantization_params(
@@ -249,7 +243,6 @@ class MTPSplitter:
             selected,
             source_config,
             target_quantization=fp8_target_quantization,
-            dequantize=dequantize,
         )
         if transformed_quantization is not None:
             source_config = dict(source_config)
