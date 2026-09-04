@@ -19,6 +19,7 @@ from mlx.utils import tree_flatten, tree_map
 
 import mlx_vlm.models.deepseek_v4.language as deepseek_language
 import mlx_vlm.models.gemma4.language as gemma4_language
+import mlx_vlm.models.laguna.language as laguna_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.models.qwen3_5.speculative_verifier as qwen_verifier
 import mlx_vlm.models.qwen3_5_moe.language as qwen_moe_language
@@ -36,6 +37,7 @@ from mlx_vlm.models.cache import (
 )
 from mlx_vlm.quantization.one_bit import OneBitLinear
 from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
+from mlx_vlm.speculative.dflash import _dflash_verify_greedy
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
     DRAFTER_KIND_BY_MODEL_TYPE,
@@ -2320,6 +2322,53 @@ def test_dflash_committed_hidden_segments_keep_per_row_lengths():
     assert segments[1].tolist() == [[[6.0, 7.0]]]
 
 
+def test_dflash_target_cache_reserves_one_verification_block():
+    calls = []
+
+    class Cache:
+        offset = 512
+
+        def prefix_cache_reserve(self, capacity):
+            calls.append(capacity)
+            return ()
+
+    speculative_utils._reserve_dflash_target_cache([Cache()], 8)
+
+    assert calls == [520]
+
+
+def test_dflash_greedy_verify_prefers_hidden_argmax_hook():
+    captured = [mx.ones((1, 3, 2))]
+    final_hidden = mx.zeros((1, 3, 2))
+    target_tokens = mx.array([[4, 5, 6]])
+
+    class LM:
+        def speculative_verify_dflash_hidden(self, inputs, cache, layer_ids):
+            assert inputs.shape == (1, 3)
+            assert cache == ["cache"]
+            assert layer_ids == [1]
+            return captured, final_hidden, ["gdn"]
+
+        def speculative_argmax_from_hidden(self, hidden):
+            assert hidden is final_hidden
+            return target_tokens
+
+        def __call__(self, *args, **kwargs):
+            raise AssertionError("full target logits should not be materialized")
+
+    actual_captured, gdn_states, actual_tokens = _dflash_verify_greedy(
+        LM(),
+        mx.array([[1, 2, 3]]),
+        ["cache"],
+        [1],
+        lambda logits: mx.argmax(logits, axis=-1),
+    )
+
+    assert actual_captured is captured
+    assert gdn_states == ["gdn"]
+    assert actual_tokens is target_tokens
+
+
 def test_gemma4_26b_dflash_config_preserves_capture_layers():
     config = Gemma4DFlashConfig.from_dict(
         {
@@ -2402,6 +2451,56 @@ def test_generic_dflash_config_parses_gemma4_metadata_without_runtime_cap():
     assert config.runtime_block_size is None
 
 
+def test_generic_dflash_config_infers_target_depth_and_parses_rope_parameters():
+    config = ModelConfig.from_dict(
+        {
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 8,
+            "rope_parameters": {
+                "rope_theta": 10000.0,
+                "rope_type": "yarn",
+                "factor": 8.0,
+            },
+            "dflash_config": {
+                "target_layer_ids": [1, 5],
+                "mask_token_id": 4,
+            },
+        }
+    )
+
+    assert config.num_target_layers == 6
+    assert config.rope_theta == 10000.0
+    assert config.rope_scaling == {"rope_type": "yarn", "factor": 8.0}
+
+
+def test_dflash_sanitize_installs_checkpoint_embedding():
+    config = ModelConfig(
+        hidden_size=4,
+        intermediate_size=8,
+        num_hidden_layers=0,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=8,
+        target_layer_ids=[0],
+    )
+    drafter = DFlashDraftModel(config)
+    weight = mx.zeros((8, 4))
+
+    sanitized = drafter.sanitize(
+        {"model.embed_tokens.weight": weight, "model.norm.weight": mx.ones((4,))}
+    )
+
+    assert sanitized["embed_tokens.weight"] is weight
+    assert drafter.embed_tokens is not None
+    assert sanitized["norm.weight"] is not None
+
+
 def test_dflash_drafter_uses_bound_target_embedding_scale():
     class Embed:
         def __call__(self, inputs):
@@ -2429,6 +2528,31 @@ def test_dflash_drafter_uses_bound_target_embedding_scale():
 
     embedded = drafter._embed_input_tokens(mx.array([[1, 2]], dtype=mx.int32))
     assert embedded.tolist() == [[[2.0] * 4, [2.0] * 4]]
+
+
+def test_dflash_drafter_binds_backbone_embeddings():
+    config = ModelConfig(
+        hidden_size=4,
+        intermediate_size=8,
+        num_hidden_layers=0,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=8,
+        target_layer_ids=[0],
+    )
+    drafter = DFlashDraftModel(config)
+    embeddings = nn.Embedding(8, 4)
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            backbone=SimpleNamespace(embeddings=embeddings),
+            lm_head=nn.Linear(4, 8, bias=False),
+        )
+    )
+
+    drafter.bind(target)
+
+    assert drafter.embed_tokens is embeddings
 
 
 def test_dflash_config_parses_sliding_attention_metadata():
@@ -4184,3 +4308,148 @@ def test_split_glm4_moe_lite_mtp_flattens_nextn_layer(tmp_path):
     assert out["model.mtp_block.mlp.gate.e_score_correction_bias"].dtype == mx.float32
     # non-parameter buffers are dropped
     assert not any(k.endswith("rotary_emb.inv_freq") for k in out)
+
+
+def _laguna_language_model(num_hidden_layers=4):
+    from mlx_vlm.models.laguna.config import ModelConfig
+
+    config = ModelConfig(
+        model_type="laguna",
+        vocab_size=256,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=num_hidden_layers,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=512,
+        sliding_window=32,
+        layer_types=["sliding_attention", "full_attention"] * (num_hidden_layers // 2),
+    )
+    model = laguna_language.LanguageModel(config)
+    mx.eval(model.parameters())
+    return model
+
+
+def test_laguna_exposes_speculative_cache_rollback():
+    assert hasattr(laguna_language.LanguageModel, "rollback_speculative_cache")
+
+
+def test_laguna_rollback_trims_rejected_speculative_tail():
+    class DummyCache:
+        def __init__(self):
+            self.trims = []
+
+        def trim(self, n):
+            self.trims.append(n)
+
+    cache = DummyCache()
+    max_accepted = laguna_language.LanguageModel.rollback_speculative_cache(
+        SimpleNamespace(), [cache], None, 1, block_size=4
+    )
+
+    assert max_accepted == 1
+    assert cache.trims == [2]
+
+
+def test_laguna_rollback_skips_trim_when_block_fully_accepted():
+    class DummyCache:
+        def __init__(self):
+            self.trims = []
+
+        def trim(self, n):
+            self.trims.append(n)
+
+    cache = DummyCache()
+    laguna_language.LanguageModel.rollback_speculative_cache(
+        SimpleNamespace(), [cache], None, 3, block_size=4
+    )
+
+    assert cache.trims == []
+
+
+def test_laguna_rollback_rejects_ragged_batch_acceptance():
+    with pytest.raises(RuntimeError, match="uniform per-row"):
+        laguna_language.LanguageModel.rollback_speculative_cache(
+            SimpleNamespace(), [None], None, [0, 2], block_size=4
+        )
+
+
+def test_laguna_rollback_advances_real_cache_offsets():
+    model = _laguna_language_model()
+    cache = model.make_cache()
+    model(mx.array([[1, 2, 3, 4]]), cache=cache)
+    assert [c.offset for c in cache] == [4, 4, 4, 4]
+
+    model.rollback_speculative_cache(cache, None, 1, block_size=4)
+
+    assert [c.offset for c in cache] == [2, 2, 2, 2]
+
+
+def test_laguna_captures_target_hidden_states_for_dflash():
+    model = _laguna_language_model()
+    out = model(
+        mx.array([[1, 2, 3, 4]]),
+        cache=model.make_cache(),
+        capture_layer_ids=[1, 2],
+        speculative_verify=True,
+    )
+
+    assert out.hidden_states is not None
+    assert [h.shape for h in out.hidden_states] == [(1, 4, 64), (1, 4, 64)]
+    assert mx.concatenate(out.hidden_states, axis=-1).shape == (1, 4, 128)
+
+
+def test_laguna_omits_hidden_states_without_capture_request():
+    model = _laguna_language_model()
+    out = model(mx.array([[1, 2, 3, 4]]), cache=model.make_cache())
+
+    assert out.hidden_states is None
+
+
+def test_laguna_dflash_binding_requires_target_rollback_hook():
+    from mlx_vlm.speculative.drafters.laguna_dflash.config import (
+        validate_laguna_dflash_target,
+    )
+
+    config = SimpleNamespace(num_target_layers=4, vocab_size=256)
+    with pytest.raises(ValueError, match="rollback"):
+        validate_laguna_dflash_target(
+            config,
+            target_model_layer_count=4,
+            target_tokenizer_length=256,
+            target_language_model=SimpleNamespace(),
+        )
+
+
+def test_laguna_dflash_config_derives_sliding_windows_when_absent():
+    from mlx_vlm.speculative.drafters.laguna_dflash.config import DFlashConfig
+
+    params = {
+        "model_type": "laguna",
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "vocab_size": 256,
+        "draft_vocab_size": 256,
+        "max_position_embeddings": 512,
+        "rope_theta": 500000.0,
+        "layer_types": ["sliding_attention"] * 2,
+        "sliding_window": 512,
+        "gating": "per-head",
+        "eagle_aux_hidden_state_layer_ids": [2, 4],
+        "dflash_config": {
+            "block_size": 16,
+            "mask_token_id": 3,
+            "target_layer_ids": [1, 3],
+            "num_target_layers": 4,
+            "causal": True,
+        },
+    }
+
+    config = DFlashConfig.from_dict(params)
+
+    assert config.sliding_windows == [512, 512]

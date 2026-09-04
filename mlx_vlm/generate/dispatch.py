@@ -740,11 +740,14 @@ def _prefix_cache_trim_amount(kv_cache: List[Any], prefix_len: int) -> Optional[
     silent output corruption, or a broadcast crash once speculative decoding wraps
     the cache in ``BufferedRotatingKVCache``. Returns the number of tokens to drop
     (``0`` when the whole cache is reusable), or ``None`` when an entry has already
-    evicted part of the prefix and the caller must cold-prefill instead.
+    evicted part of the prefix, or holds untrimmable state (e.g. the ``ArraysCache``
+    of hybrid/linear-attention layers), and the caller must cold-prefill instead.
     """
     cached_len = max((int(getattr(c, "offset", 0) or 0) for c in kv_cache), default=0)
     n_drop = max(0, cached_len - prefix_len)
-    if n_drop and not all(_cache_fully_retained(c) for c in kv_cache):
+    if n_drop and not all(
+        c.is_trimmable() and _cache_fully_retained(c) for c in kv_cache
+    ):
         return None
     return n_drop
 

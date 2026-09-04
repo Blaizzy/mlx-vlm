@@ -17,9 +17,8 @@ def _is_strictly_increasing_ints(values: list[int]) -> bool:
 class DSparkConfig(BaseModelConfig):
     """Model-agnostic configuration for a DSpark drafter.
 
-    Checkpoints publish ``block_size`` as the number of proposals (gamma),
-    while mlx-vlm's DFlash loop uses the verification width (anchor plus
-    proposals). ``from_dict`` normalizes that boundary once.
+    ``from_dict`` normalizes checkpoint block semantics to mlx-vlm's
+    verification width, which includes the anchor token.
     """
 
     model_type: str = "dspark"
@@ -43,6 +42,9 @@ class DSparkConfig(BaseModelConfig):
     final_logit_softcapping: float | None = None
     layer_types: list[str] = field(default_factory=list)
     sliding_window: int | None = None
+    is_causal: bool = False
+    attention_sink_bias: bool = False
+    sample_from_anchor: bool = True
 
     # mlx-vlm verification width (anchor + proposals).
     block_size: int = 0
@@ -59,7 +61,7 @@ class DSparkConfig(BaseModelConfig):
 
     markov_rank: int = 256
     markov_head_type: str = "vanilla"
-    enable_confidence_head: bool = True
+    enable_confidence_head: bool = False
     confidence_head_with_markov: bool = True
 
     def __post_init__(self) -> None:
@@ -111,10 +113,6 @@ class DSparkConfig(BaseModelConfig):
             raise ValueError(
                 "DSpark dflash_initial_block_size must be between 2 and block_size."
             )
-        if self.hidden_size != self.num_attention_heads * self.head_dim:
-            raise ValueError(
-                "DSpark hidden_size must equal attention heads * head_dim."
-            )
         if self.num_attention_heads % self.num_key_value_heads:
             raise ValueError("DSpark attention heads must be divisible by KV heads.")
         if self.hidden_act != "silu":
@@ -126,9 +124,12 @@ class DSparkConfig(BaseModelConfig):
         if not 0 <= self.mask_token_id < self.vocab_size:
             raise ValueError("DSpark mask_token_id must be inside the vocabulary.")
         if len(self.layer_types) != self.num_hidden_layers or any(
-            layer_type != "full_attention" for layer_type in self.layer_types
+            layer_type not in {"full_attention", "sliding_attention"}
+            for layer_type in self.layer_types
         ):
-            raise ValueError("DSpark requires one full_attention type per draft layer.")
+            raise ValueError("DSpark requires one supported type per draft layer.")
+        if "sliding_attention" in self.layer_types and self.sliding_window is None:
+            raise ValueError("DSpark requires sliding_window for sliding layers.")
         if (
             not self.target_layer_ids
             or not _is_strictly_increasing_ints(self.target_layer_ids)
@@ -156,6 +157,9 @@ class DSparkConfig(BaseModelConfig):
                 f"{projector_type!r}."
             )
 
+        architectures = flat.get("architectures") or []
+        uses_qwen3_dspark_runtime = "Qwen3DSparkModel" in architectures
+
         flat["backbone_model_type"] = str(flat.pop("model_type", "qwen3"))
         flat["model_type"] = "dspark"
 
@@ -175,6 +179,19 @@ class DSparkConfig(BaseModelConfig):
             if key in dflash:
                 flat[key] = dflash[key]
 
+        if "num_target_layers" not in flat and flat.get("target_layer_ids"):
+            flat["num_target_layers"] = max(flat["target_layer_ids"]) + 1
+        if "causal" in dflash:
+            flat["is_causal"] = bool(dflash["causal"])
+        elif "dflash_query_causal" in flat:
+            flat["is_causal"] = bool(flat.pop("dflash_query_causal"))
+        if "attention_sink_bias" in dflash:
+            flat["attention_sink_bias"] = bool(dflash["attention_sink_bias"])
+        if "sample_from_anchor" in dflash:
+            flat["sample_from_anchor"] = bool(dflash["sample_from_anchor"])
+        if "swa_window_size" in dflash:
+            flat["sliding_window"] = int(dflash["swa_window_size"])
+
         rope_parameters = flat.pop("rope_parameters", None)
         if isinstance(rope_parameters, Mapping):
             rope_parameters = dict(rope_parameters)
@@ -185,8 +202,9 @@ class DSparkConfig(BaseModelConfig):
         raw_block_size = dflash.get("block_size", flat.get("block_size"))
         if raw_block_size is None:
             raise ValueError("DSpark requires a checkpoint block_size.")
-        flat["proposal_length"] = int(raw_block_size)
-        flat["block_size"] = int(raw_block_size) + 1
+        includes_anchor = bool(flat.pop("dspark_bonus_anchor", False))
+        flat["block_size"] = int(raw_block_size) + (0 if includes_anchor else 1)
+        flat["proposal_length"] = flat["block_size"] - 1
 
         if "runtime_block_size" not in flat:
             flat["runtime_block_size"] = min(8, flat["block_size"])
@@ -204,7 +222,9 @@ class DSparkConfig(BaseModelConfig):
                 )
             else:
                 flat["block_size_policy"] = (
-                    "adaptive" if projector_type == "dspark" else "fixed"
+                    "adaptive"
+                    if projector_type == "dspark" or uses_qwen3_dspark_runtime
+                    else "fixed"
                 )
 
         if (

@@ -69,6 +69,13 @@ class Gemma4DSparkAttention(DFlashAttention):
             self.n_kv_heads = config.num_key_value_heads
         self.scale = 1.0
 
+        self.is_causal = bool(getattr(config, "is_causal", self.is_sliding))
+        self.attention_sink_bias = (
+            mx.zeros((self.n_heads,))
+            if getattr(config, "attention_sink_bias", False)
+            else None
+        )
+
         dim = config.hidden_size
         self.q_proj = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
@@ -97,9 +104,13 @@ class Gemma4DSparkDecoderLayer(nn.Module):
         self.post_feedforward_layernorm = RMSNorm(config.hidden_size, eps=eps)
         self.layer_scalar = mx.ones((1,))
 
-    def __call__(self, x: mx.array, x_ctx: mx.array, rope, cache) -> mx.array:
+    def __call__(
+        self, x: mx.array, x_ctx: mx.array, rope, cache, projected_context=None
+    ) -> mx.array:
         residual = x
-        h = self.self_attn(self.input_layernorm(x), x_ctx, rope, cache)
+        h = self.self_attn(
+            self.input_layernorm(x), x_ctx, rope, cache, projected_context
+        )
         h = residual + self.post_attention_layernorm(h)
 
         residual = h
