@@ -51,6 +51,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         self._input_embed = None
         self._input_embed_scale: float = 1.0
         self._lm_head_fn = None
+        self._greedy_argmax_fn = None
         self._cache: List[KVCache] = []
         self._seed_token: Optional[mx.array] = None
         self._seed_hidden: Optional[mx.array] = None
@@ -91,6 +92,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
             or getattr(lm, "lm_head", None)
             or self._input_embed.as_linear
         )
+        self._greedy_argmax_fn = getattr(lm, "speculative_argmax_from_hidden", None)
         return self
 
     def make_cache(self, left_padding: Optional[List[int]] = None) -> List[KVCache]:
@@ -202,9 +204,18 @@ class Qwen3_5MTPDraftModel(nn.Module):
     ) -> mx.array:
         return self._forward_tokens(tok, hidden, token_dtype)
 
+    def _greedy_token(self, hidden: mx.array) -> mx.array:
+        if self._greedy_argmax_fn is not None:
+            token = self._greedy_argmax_fn(hidden)
+            if token is not None:
+                return token
+        return mx.argmax(self._lm_head_fn(hidden), axis=-1)
+
     def _set_seed_from_hidden(self, hidden: mx.array, sampler, greedy: bool) -> None:
-        logits = self._lm_head_fn(hidden)
-        self._seed_token = mx.argmax(logits, axis=-1) if greedy else sampler(logits)
+        if greedy:
+            self._seed_token = self._greedy_token(hidden)
+        else:
+            self._seed_token = sampler(self._lm_head_fn(hidden))
         self._seed_hidden = hidden
 
     def prefill_from_target_hidden(
@@ -461,8 +472,10 @@ class Qwen3_5MTPDraftModel(nn.Module):
         while len(tokens) < block_size - 1:
             h_prev = self._forward_token(tok, h_prev, token_dtype)
             self._round_appended += 1
-            logits = self._lm_head_fn(h_prev)
-            tok = mx.argmax(logits, axis=-1) if greedy else sampler(logits)
+            if greedy:
+                tok = self._greedy_token(h_prev)
+            else:
+                tok = sampler(self._lm_head_fn(h_prev))
             tokens.append(tok)
 
         self._draft_round += 1
