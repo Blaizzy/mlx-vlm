@@ -402,7 +402,10 @@ def _sse_event(event_type: str, payload: Dict[str, Any]) -> str:
 def _clean_reasoning(reasoning: str, start_marker: str) -> str:
     reasoning = reasoning.replace(start_marker, "")
     if start_marker == "<|channel>thought":
-        reasoning = reasoning.lstrip("thought")
+        # removeprefix, not lstrip: lstrip takes a character *set*, so
+        # lstrip("thought") eats every leading t/h/o/u/g of the reasoning
+        # itself when the opener is absent ("got it" -> "it").
+        reasoning = reasoning.removeprefix("thought")
     return reasoning.strip()
 
 

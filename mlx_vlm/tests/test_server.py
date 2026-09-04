@@ -6864,6 +6864,31 @@ class TestSplitThinking:
         assert reasoning == "Only thinking."
         assert content == ""
 
+    def test_channel_close_only_keeps_leading_reasoning_characters(self):
+        # Without the opener, the reasoning is whatever precedes <channel|>.
+        # It must survive verbatim, including a leading t/h/o/u/g.
+        for text, expected in (
+            ("got it, the answer is 42<channel|>42", "got it, the answer is 42"),
+            (
+                "the user wants the capital of France<channel|>Paris",
+                "the user wants the capital of France",
+            ),
+            (
+                "hoping to use the tool here<channel|>Done.",
+                "hoping to use the tool here",
+            ),
+        ):
+            reasoning, _ = server._split_thinking(text)
+            assert reasoning == expected
+
+    def test_channel_close_only_still_drops_a_literal_thought_prefix(self):
+        from mlx_vlm.server.responses_state import _clean_reasoning
+
+        assert (
+            _clean_reasoning("thought\nThe user asks X", "<|channel>thought")
+            == "The user asks X"
+        )
+
     def test_custom_thinking_markers(self):
         text = "<analysis>Custom reasoning.</analysis>Custom answer."
         reasoning, content = server._split_thinking(text, "<analysis>", "</analysis>")
