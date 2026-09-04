@@ -279,8 +279,8 @@ def _dflash_rounds(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     use_model_initial_block_size: bool = True,
-    eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = True,
+    eos_token_ids: Optional[set] = None,
 ) -> Generator[Tuple[int, None], None, None]:
     """DFlash speculative-decoding **round loop**.
 
@@ -445,9 +445,9 @@ def _dflash_rounds_batch(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     stop_check: Optional[Callable[[int, int], bool]] = None,
-    eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = True,
     row_ids: Optional[List[int]] = None,
+    eos_token_ids: Optional[set] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batch DFlash speculative-decoding round loop (B > 1).
 
