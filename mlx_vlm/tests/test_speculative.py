@@ -39,10 +39,12 @@ from mlx_vlm.models.cache import (
     PoolingCache,
     RotatingKVCache,
 )
-from mlx_vlm.models.glm5_next.speculative_verifier import (
-    exact_quantized_block_argmax,
-    exact_quantized_block_linear,
+from mlx_vlm.models.quantized_verifier import (
+    DEFAULT_QUANTIZED_VERIFIER,
+    exact_quantized_selected_linear,
+    exact_quantized_switch_linear,
 )
+from mlx_vlm.models.switch_layers import QuantizedSwitchLinear
 from mlx_vlm.quantization.one_bit import OneBitLinear
 from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
 from mlx_vlm.speculative.dflash import _dflash_verify_greedy
@@ -4036,20 +4038,22 @@ def test_glm5_next_hc_ingress_fusion_is_single_batch_only(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("mode", "bits", "group_size", "batches"),
+    ("mode", "bits", "group_size"),
     [
-        ("affine", 4, 64, (1, 2, 4)),
-        ("affine", 5, 64, (2, 4)),
-        ("mxfp8", 8, 32, (1, 2, 4)),
+        *[("affine", bits, 64) for bits in (2, 3, 4, 5, 6, 8)],
+        ("mxfp4", 4, 32),
+        ("mxfp8", 8, 32),
+        ("nvfp4", 4, 16),
     ],
 )
-def test_glm5_next_quantized_block_linear_keeps_decode_arithmetic(
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_general_quantized_verifier_matches_decode(
     mode,
     bits,
     group_size,
-    batches,
+    batch,
 ):
-    mx.random.seed(21)
+    mx.random.seed(100 + bits + batch)
     dense = nn.Linear(512, 16, bias=False)
     dense.weight = dense.weight.astype(mx.bfloat16)
     linear = nn.QuantizedLinear.from_linear(
@@ -4058,45 +4062,144 @@ def test_glm5_next_quantized_block_linear_keeps_decode_arithmetic(
         bits=bits,
         mode=mode,
     )
-
-    for batch in batches:
-        inputs = mx.random.normal((batch, 2, 512)).astype(mx.bfloat16)
-        expected = mx.concatenate(
-            [linear(mx.contiguous(inputs[:, index : index + 1])) for index in range(2)],
-            axis=1,
-        )
-        actual = exact_quantized_block_linear(linear, inputs)
-        assert actual is not None
-        mx.eval(expected, actual)
-        assert mx.array_equal(actual, expected).item()
-        if mode == "affine" and batch > 1:
-            actual_tokens = exact_quantized_block_argmax(linear, inputs)
-            assert actual_tokens is not None
-            expected_tokens = mx.argmax(expected, axis=-1)
-            mx.eval(actual_tokens, expected_tokens)
-            assert mx.array_equal(actual_tokens, expected_tokens).item()
-
-
-def test_glm5_next_short_affine_block_uses_decode_exact_batch_fallback():
-    mx.random.seed(22)
-    dense = nn.Linear(128, 32, bias=False)
-    dense.weight = dense.weight.astype(mx.bfloat16)
-    linear = nn.QuantizedLinear.from_linear(
-        dense,
-        group_size=64,
-        bits=4,
-        mode="affine",
-    )
-    inputs = mx.random.normal((2, 2, 128)).astype(mx.bfloat16)
+    inputs = mx.random.normal((batch, 3, 512)).astype(mx.bfloat16)
     expected = mx.concatenate(
-        [linear(mx.contiguous(inputs[:, index : index + 1])) for index in range(2)],
+        [
+            linear(mx.contiguous(inputs[:, position : position + 1]))
+            for position in range(3)
+        ],
         axis=1,
     )
 
-    assert exact_quantized_block_linear(linear, inputs) is None
-    actual = glm5_next_language._SPECULATIVE_VERIFIER._block_linear(linear, inputs)
-    mx.eval(expected, actual)
+    actual = DEFAULT_QUANTIZED_VERIFIER.linear(linear, inputs)
+    tokens = DEFAULT_QUANTIZED_VERIFIER.argmax(linear, inputs)
+    mx.eval(expected, actual, tokens)
+
+    assert actual is not None
     assert mx.array_equal(actual, expected).item()
+    assert mx.array_equal(tokens, mx.argmax(expected, axis=-1)).item()
+
+
+@pytest.mark.parametrize(
+    ("mode", "bits", "group_size"),
+    [
+        *[("affine", bits, 64) for bits in (2, 3, 4, 5, 6, 8)],
+        ("mxfp4", 4, 32),
+        ("mxfp8", 8, 32),
+        ("nvfp4", 4, 16),
+    ],
+)
+def test_general_quantized_switch_verifier_matches_decode(mode, bits, group_size):
+    mx.random.seed(200 + bits)
+    linear = QuantizedSwitchLinear(
+        512,
+        16,
+        4,
+        bias=False,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+    inputs = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
+    indices = mx.array(
+        [
+            [[0, 1], [2, 3], [1, 2]],
+            [[3, 2], [1, 0], [2, 0]],
+        ],
+        dtype=mx.int32,
+    )
+    expected = []
+    for position in range(inputs.shape[1]):
+        hidden = mx.expand_dims(mx.contiguous(inputs[:, position]), (-2, -3))
+        projected = linear(hidden, indices[:, position], sorted_indices=False)
+        expected.append(projected.squeeze(-2)[:, None])
+    expected = mx.concatenate(expected, axis=1)
+
+    actual = exact_quantized_switch_linear(linear, inputs, indices)
+    mx.eval(expected, actual)
+
+    assert actual is not None
+    assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.parametrize(
+    ("mode", "bits", "group_size"),
+    [
+        *[("affine", bits, 64) for bits in (2, 3, 4, 5, 6, 8)],
+        ("mxfp4", 4, 32),
+        ("mxfp8", 8, 32),
+        ("nvfp4", 4, 16),
+    ],
+)
+def test_general_quantized_selected_verifier_matches_decode(
+    mode,
+    bits,
+    group_size,
+):
+    mx.random.seed(300 + bits)
+    linear = QuantizedSwitchLinear(
+        512,
+        16,
+        4,
+        bias=False,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+    inputs = mx.random.normal((2, 3, 2, 512)).astype(mx.bfloat16)
+    indices = mx.array(
+        [
+            [[0, 1], [2, 3], [1, 2]],
+            [[3, 2], [1, 0], [2, 0]],
+        ],
+        dtype=mx.int32,
+    )
+    expected = []
+    for position in range(inputs.shape[1]):
+        hidden = mx.expand_dims(mx.contiguous(inputs[:, position]), -2)
+        projected = linear(hidden, indices[:, position], sorted_indices=False)
+        expected.append(projected.squeeze(-2)[:, None])
+    expected = mx.concatenate(expected, axis=1)
+
+    actual = exact_quantized_selected_linear(linear, inputs, indices)
+    mx.eval(expected, actual)
+
+    assert actual is not None
+    assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.parametrize(
+    ("mode", "bits", "group_size"),
+    [
+        *[("affine", bits, 64) for bits in (2, 3, 4, 5, 6, 8)],
+        ("mxfp4", 4, 32),
+        ("mxfp8", 8, 32),
+        ("nvfp4", 4, 16),
+    ],
+)
+def test_general_quantized_argmax_supports_packed_mask(mode, bits, group_size):
+    mx.random.seed(400 + bits)
+    dense = nn.Linear(512, 16, bias=False)
+    dense.weight = dense.weight.astype(mx.bfloat16)
+    linear = nn.QuantizedLinear.from_linear(
+        dense,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+    inputs = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
+    allowed = mx.array([[1, 3, 5], [7, 9, 11]], dtype=mx.int32)
+    token_mask = (mx.array(1, dtype=mx.int32) << allowed).reshape(-1, 1)
+
+    actual = DEFAULT_QUANTIZED_VERIFIER.argmax(
+        linear,
+        inputs,
+        token_mask=token_mask,
+    )
+    mx.eval(actual)
+
+    assert actual is not None
+    assert mx.array_equal(actual, allowed).item()
 
 
 def test_glm5_next_mtp_sampler_state_tolerates_uninitialized_kv_cache():

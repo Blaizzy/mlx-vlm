@@ -6,12 +6,14 @@ from ..base import LanguageModelOutput, create_ssm_mask, scaled_dot_product_atte
 from ..deepseek_v4.hyper_connection import _hc_kernel, hc_expand
 from ..exact_speculative_verify import exact_speculative_verify_weight
 from ..gated_delta import gated_delta_update
-from ..qwen3_5.speculative_verifier import (
-    _target_verify_linear,
-    _target_verify_quantized_argmax,
+from ..quantized_verifier import (
+    DEFAULT_QUANTIZED_VERIFIER,
+    exact_quantized_linear,
+    exact_quantized_selected_linear,
+    exact_quantized_switch_linear,
 )
+from ..qwen3_5.speculative_verifier import _target_verify_linear
 from .exact_ops import (
-    batched_time_quantized_linear,
     clamped_swiglu,
     combine_moe_outputs,
     exact_affine_moe_down,
@@ -21,8 +23,6 @@ from .exact_ops import (
     exact_hc_expand,
     exact_hc_norm,
     exact_hc_normalized_norm,
-    exact_quantized_block_argmax,
-    exact_quantized_block_linear,
     scaled_rms_norm,
 )
 from .speculative_state import _restore_cache, _snapshot_cache
@@ -70,14 +70,14 @@ class Glm5NextSpeculativeVerifier:
         output = exact_dense_block_linear(linear, x)
         if output is not None:
             return output
-        output = exact_quantized_block_linear(linear, x)
+        # Keep batch as quantized_matmul's M dimension, matching Bx1 decode.
+        # Optional B=1 kernels use a different accumulation strategy and are
+        # selected by the shared dispatcher only where a caller wants them.
+        output = exact_quantized_linear(linear, x)
         if output is not None:
             return output
         if x.shape[0] == 1:
             return self._singleton_linear(linear, x)
-        output = batched_time_quantized_linear(linear, x)
-        if output is not None:
-            return output
         return self._singleton_linear(linear, x)
 
     def _dense_mlp(self, mlp, x):
@@ -86,19 +86,9 @@ class Glm5NextSpeculativeVerifier:
         return self._block_linear(mlp.down_proj, hidden)
 
     def _moe(self, moe, x):
-        if x.shape[0] > 1:
-            # Keeping verifier time as the matrix-row dimension lets MLX reuse
-            # every selected/shared expert dispatch. For B2-B4 this follows
-            # the same quantized accumulation path as decode and is exact.
-            return moe(x)
-
-        # Routing and the shared expert must keep the decode Bx1 shape. The
-        # selected-expert gather-QMVs, however, are row independent and remain
-        # bit-exact when verifier time is flattened into their row dimension.
-        # Flatten only that dominant path so one set of launches handles the
-        # complete verifier block without changing greedy output.
-        # The FP32 gate produces identical routes and weights at B=1 when the
-        # two verifier positions share one call.
+        # Routing and shared projections retain the decode Bx1 arithmetic.
+        # Selected-expert projections keep verifier time in an outer dimension,
+        # so the same exact path works for every batch and quantization format.
         batch, length, width = x.shape
         gate = moe.gate
         fp32_x = x.astype(mx.float32)
@@ -127,9 +117,18 @@ class Glm5NextSpeculativeVerifier:
         switch = moe.switch_mlp
         gate_up = exact_affine_switch_gate_up(switch, x, indices)
         if gate_up is None:
-            projected = mx.expand_dims(flat_x, (-2, -3))
-            up = switch.up_proj(projected, flat_indices, sorted_indices=False)
-            gate = switch.gate_proj(projected, flat_indices, sorted_indices=False)
+            up = exact_quantized_switch_linear(switch.up_proj, x, indices)
+            gate = exact_quantized_switch_linear(switch.gate_proj, x, indices)
+            if up is None or gate is None:
+                projected = mx.expand_dims(flat_x, (-2, -3))
+                up = switch.up_proj(projected, flat_indices, sorted_indices=False)
+                gate = switch.gate_proj(
+                    projected,
+                    flat_indices,
+                    sorted_indices=False,
+                )
+                up = up.squeeze(-2).reshape(batch, length, top_k, -1)
+                gate = gate.squeeze(-2).reshape(batch, length, top_k, -1)
         else:
             up, gate = gate_up
         activated = switch.activation(up, gate)
@@ -166,14 +165,19 @@ class Glm5NextSpeculativeVerifier:
             moe.shared_experts.down_proj,
             shared_hidden,
         )
-        if gate_up is not None:
-            activated = activated.reshape(batch * length, top_k, 1, -1)
-        routed = switch.down_proj(
+        routed = exact_quantized_selected_linear(
+            switch.down_proj,
             activated,
-            flat_indices,
-            sorted_indices=False,
+            indices,
         )
-        routed = routed.squeeze(-2).reshape(batch, length, top_k, -1)
+        if routed is None:
+            activated = activated.reshape(batch * length, top_k, 1, -1)
+            routed = switch.down_proj(
+                activated,
+                flat_indices,
+                sorted_indices=False,
+            )
+            routed = routed.squeeze(-2).reshape(batch, length, top_k, -1)
         return combine_moe_outputs(routed, weights, shared)
 
     def _linear_attention(self, attention, inputs, mask, cache):
@@ -432,13 +436,9 @@ class Glm5NextSpeculativeVerifier:
     def argmax_from_hidden(self, language_model, hidden: mx.array) -> mx.array:
         if not language_model.args.tie_word_embeddings:
             head = language_model.lm_head
-            output = exact_quantized_block_argmax(head, hidden)
+            output = DEFAULT_QUANTIZED_VERIFIER.argmax(head, hidden)
             if output is not None:
                 return output
-            if hidden.ndim == 3 and hidden.shape[0] == 1 and hidden.shape[1] > 1:
-                output = _target_verify_quantized_argmax(head, hidden)
-                if output is not None:
-                    return output
         return mx.argmax(self.logits_from_hidden(language_model, hidden), axis=-1)
 
     def _attention(

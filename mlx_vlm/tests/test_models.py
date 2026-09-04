@@ -19354,7 +19354,7 @@ class TestNemotronHSpeculativeVerifier(unittest.TestCase):
     def test_nvfp4_argmax_matches_singleton_qmv_with_tail(self):
         if not mx.metal.is_available():
             self.skipTest("NVFP4 argmax requires Metal")
-        from mlx_vlm.models.nemotron_h.speculative_verifier import _nvfp4_argmax
+        from mlx_vlm.models.quantized_verifier import optimized_nvfp4_argmax
 
         mx.random.seed(19)
         linear = nn.QuantizedLinear.from_linear(
@@ -19367,7 +19367,7 @@ class TestNemotronHSpeculativeVerifier(unittest.TestCase):
         expected = mx.concatenate(
             [linear(hidden[:, index : index + 1]) for index in range(6)], axis=1
         ).argmax(axis=-1)
-        actual = _nvfp4_argmax(linear, hidden)
+        actual = optimized_nvfp4_argmax(linear, hidden)
         mx.eval(expected, actual)
 
         self.assertTrue(mx.array_equal(actual, expected).item())
