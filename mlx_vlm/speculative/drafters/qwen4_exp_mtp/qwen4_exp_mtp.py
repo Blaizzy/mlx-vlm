@@ -172,13 +172,17 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
 
         gate_up_key = "layers.0.mlp.experts.gate_up_proj"
         down_key = "layers.0.mlp.experts.down_proj"
-        if gate_up_key in stripped:
-            gate_up = stripped.pop(gate_up_key)
+        for parameter in (None, "weight", "scales", "biases"):
+            suffix = "" if parameter is None else f".{parameter}"
+            source_key = gate_up_key + suffix
+            if source_key not in stripped:
+                continue
+            gate_up = stripped.pop(source_key)
             gate, up = mx.split(gate_up, 2, axis=-2)
-            stripped["layers.0.mlp.switch_mlp.gate_proj.weight"] = gate
-            stripped["layers.0.mlp.switch_mlp.up_proj.weight"] = up
-        if down_key in stripped:
-            stripped["layers.0.mlp.switch_mlp.down_proj.weight"] = stripped.pop(
-                down_key
+            destination = parameter or "weight"
+            stripped[f"layers.0.mlp.switch_mlp.gate_proj.{destination}"] = gate
+            stripped[f"layers.0.mlp.switch_mlp.up_proj.{destination}"] = up
+            stripped[f"layers.0.mlp.switch_mlp.down_proj.{destination}"] = stripped.pop(
+                down_key + suffix
             )
         return stripped

@@ -303,8 +303,16 @@ def test_qwen4_mtp_splitter_converts_official_fp8_experts(tmp_path):
     up = split_weights["layers.0.mlp.switch_mlp.up_proj.weight"]
     down = split_weights["layers.0.mlp.switch_mlp.down_proj.weight"]
     mx.eval(gate, up, down)
-    assert gate.shape == (2, 128, 128)
-    assert up.shape == (2, 128, 128)
-    assert down.shape == (2, 128, 128)
+    assert gate.shape == (2, 128, 32)
+    assert up.shape == (2, 128, 32)
+    assert down.shape == (2, 128, 32)
+    assert gate.dtype == mx.uint32
+    assert "layers.0.mlp.switch_mlp.gate_proj.scales" in split_weights
+    assert "layers.0.mlp.switch_mlp.up_proj.scales" in split_weights
+    assert "layers.0.mlp.switch_mlp.down_proj.scales" in split_weights
     assert not any(key.endswith("weight_scale_inv") for key in split_weights)
-    assert "quantization" not in config
+    assert config["quantization"] == {
+        "group_size": 32,
+        "bits": 8,
+        "mode": "mxfp8",
+    }

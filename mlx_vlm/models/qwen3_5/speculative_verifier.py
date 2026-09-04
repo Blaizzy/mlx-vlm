@@ -18,6 +18,7 @@ from ..quantized_verifier import DEFAULT_QUANTIZED_VERIFIER
 from ..quantized_verifier import (
     optimized_affine_linears as _target_verify_quantized_linears,
 )
+from ..quantized_verifier import pad_token_mask as _pad_token_mask_to_head
 from .gated_delta import gated_delta_update_with_states
 
 
