@@ -743,6 +743,53 @@ class TestNativePackedExactCheckpoints:
         mx.eval(updated)
         assert warm[0]._idx == seq_len + 1
 
+    def test_affine4_disk_roundtrip_preserves_packed_state(
+        self, tmp_path, monkeypatch
+    ):
+        from mlx_vlm.affine4 import Affine4KVCache, BatchAffine4KVCache
+
+        monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+        seq_len = 32
+        token_ids = list(range(seq_len))
+        source = BatchAffine4KVCache([0])
+        keys, values = _rand_kv(seq_len=seq_len)
+        source.update_and_fetch(keys, values)
+        mx.eval(source.state)
+
+        def fail(*args, **kwargs):
+            raise AssertionError("affine4 checkpoint must stay packed")
+
+        monkeypatch.setattr(Affine4KVCache, "dequantize_for_apc", fail)
+        snapshot = snapshot_prompt_cache_row([source], batch_idx=0)
+        assert snapshot is not None
+        assert type(snapshot[0]) is Affine4KVCache
+
+        restored, matched = _disk_roundtrip(
+            tmp_path, "native-affine4", token_ids, snapshot
+        )
+        assert matched == seq_len
+        assert restored is not None
+        assert type(restored[0]) is Affine4KVCache
+        _assert_packed_state_equal(restored[0].state, snapshot[0].state)
+
+        warm, _ = make_warm_batch_exact_cache_multi(
+            [restored, [KVCache()]],
+            [seq_len, 0],
+            kv_quant_config={
+                "bits": 4,
+                "group_size": GROUP_SIZE,
+                "scheme": "affine4",
+            },
+        )
+        assert warm is not None
+        assert type(warm[0]) is BatchAffine4KVCache
+        _assert_packed_state_equal(warm[0].extract(0).state, snapshot[0].state)
+
+        next_keys, next_values = _rand_kv(batch=2, seq_len=1)
+        updated = warm[0].update_and_fetch(next_keys, next_values)
+        mx.eval(updated)
+        assert warm[0]._idx == seq_len + 1
+
 
 # ---------------------------------------------------------------------------
 # Test 11: Stored blocks are decoupled from quantized source

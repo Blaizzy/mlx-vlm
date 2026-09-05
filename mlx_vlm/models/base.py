@@ -354,6 +354,9 @@ def _turboquant_attention_applies(cache) -> bool:
     cache; the batch cache qualifies only while it carries a single row with
     no left padding (padded rows would be attended to as real tokens).
     """
+    applies = getattr(cache, "quantized_attention_applies", None)
+    if callable(applies):
+        return bool(applies())
     if not isinstance(cache, BatchTurboQuantKVCache):
         return True
     if not cache.is_single_row():
@@ -371,9 +374,9 @@ def scaled_dot_product_attention(
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
     if isinstance(cache, (TurboQuantKVCache, BatchTurboQuantKVCache)):
-        # The fused kernels have no sink term, and the batch cache only shares
-        # them when it holds a single unpadded row. Anything else dequantizes,
-        # which is also the only path that can apply sinks.
+        # Packed-cache implementations decide which masks and batch layouts
+        # their direct attention kernels can consume. Sinks always use dense
+        # dequantization because packed kernels do not implement sink terms.
         if sinks is None and _turboquant_attention_applies(cache):
             if queries.shape[-2] == 1:
                 return cache.decode_attention(
@@ -393,6 +396,9 @@ def scaled_dot_product_attention(
             if result is not None:
                 return result
         dequantized_keys, dequantized_values = cache.dequantize(keys, values)
+        materialize_mask = getattr(cache, "materialize_attention_mask", None)
+        if callable(materialize_mask):
+            mask = materialize_mask(mask, queries.shape[-2])
         return mx.fast.scaled_dot_product_attention(
             queries,
             dequantized_keys.astype(queries.dtype),

@@ -233,10 +233,13 @@ def register_default_capabilities() -> None:
         register_capability(cls, Capability.CHECKPOINT)
     register_capability(c.CacheList, Capability.COMPOSITE)
     try:
+        from .affine4 import Affine4KVCache, BatchAffine4KVCache
         from .turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
 
         register_capability(TurboQuantKVCache, Capability.PAGEABLE)
         register_capability(BatchTurboQuantKVCache, Capability.PAGEABLE)
+        register_capability(Affine4KVCache, Capability.PAGEABLE)
+        register_capability(BatchAffine4KVCache, Capability.PAGEABLE)
     except ImportError:
         # TurboQuant is optional in stripped-down installations.
         pass

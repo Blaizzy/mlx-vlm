@@ -9,9 +9,10 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
 
+from ..affine4 import Affine4KVCache
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
-from ..turboquant import HybridQuantKVCache, TurboQuantKVCache, turboquant_enabled
+from ..turboquant import HybridQuantKVCache, TurboQuantKVCache
 
 DEFAULT_KV_GROUP_SIZE = 64
 DEFAULT_KV_QUANT_SCHEME = "uniform"
@@ -156,11 +157,27 @@ def maybe_quantize_kv_cache(
             prompt_cache[index] = hybridize(layer_cache)
         return
 
-    if turboquant_enabled(kv_bits, kv_quant_scheme):
+    if policy is not None and (policy.is_turboquant or policy.is_affine4):
+        cache_type = Affine4KVCache if policy.is_affine4 else TurboQuantKVCache
 
         def quantize_entry(entry):
-            if isinstance(entry, TurboQuantKVCache):
+            if type(entry) is cache_type:
                 return entry
+            if isinstance(entry, (TurboQuantKVCache, Affine4KVCache)):
+                if entry.empty():
+                    return cache_type(
+                        bits=kv_bits,
+                        key_bits=kv_key_bits,
+                        value_bits=kv_value_bits,
+                    )
+                keys, values = entry.dequantize()
+                converted = cache_type(
+                    bits=kv_bits,
+                    key_bits=kv_key_bits,
+                    value_bits=kv_value_bits,
+                )
+                converted.update_and_fetch(keys, values)
+                return converted
             if isinstance(entry, cache.RotatingKVCache):
                 return entry
             if getattr(entry, "preserve_auxiliary_kv_state", False):
@@ -168,14 +185,14 @@ def maybe_quantize_kv_cache(
             if isinstance(entry, cache.KVCache):
                 if entry.offset == 0:
                     # Empty: replace so update_and_fetch quantizes on the fly
-                    return TurboQuantKVCache(
+                    return cache_type(
                         bits=kv_bits,
                         key_bits=kv_key_bits,
                         value_bits=kv_value_bits,
                     )
                 if entry.offset < quantized_kv_start:
                     return entry
-                return TurboQuantKVCache.from_cache(
+                return cache_type.from_cache(
                     entry,
                     bits=kv_bits,
                     key_bits=kv_key_bits,

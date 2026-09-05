@@ -5310,7 +5310,7 @@ class _TurboQuantAttentionMixin:
         return self.keys, self.values
 
     def prefix_cache_merge(self, rows, prefix_lens):
-        """Merge compatible packed rows into ``BatchTurboQuantKVCache``."""
+        """Merge compatible packed rows into matching batch cache."""
         from .models.cache import KVCache
 
         if not rows or len(rows) != len(prefix_lens):
@@ -5321,7 +5321,7 @@ class _TurboQuantAttentionMixin:
 
         populated = []
         for row in rows:
-            if isinstance(row, TurboQuantKVCache):
+            if type(row) is type(self):
                 if (
                     row.bits != self.bits
                     or row.key_bits != self.key_bits
@@ -5337,20 +5337,14 @@ class _TurboQuantAttentionMixin:
         prefix_lens = [int(length) for length in prefix_lens]
         max_prefix = max(prefix_lens, default=0)
         left_padding = [max_prefix - length for length in prefix_lens]
-        out = BatchTurboQuantKVCache(
-            left_padding,
-            bits=self.bits,
-            seed=self.seed,
-            key_bits=self.key_bits,
-            value_bits=self.value_bits,
-        )
+        out = self._new_batch_cache(left_padding)
         if not populated:
             out.offset = mx.array(prefix_lens)
             return out
         if any(
             int(row.offset) != length
             for row, length in zip(rows, prefix_lens)
-            if isinstance(row, TurboQuantKVCache) and row.keys is not None
+            if type(row) is type(self) and row.keys is not None
         ):
             return None
 
@@ -5365,7 +5359,7 @@ class _TurboQuantAttentionMixin:
             reference_state = getattr(reference, attr)
             merged = None
             for row, left in zip(rows, left_padding):
-                if isinstance(row, TurboQuantKVCache) and row.keys is not None:
+                if type(row) is type(self) and row.keys is not None:
                     state = _slice_state(getattr(row, attr), row.offset)
                     state = _pad_state_tokens(
                         state, left, max_prefix - left - _state_length(state)
@@ -6303,6 +6297,15 @@ class _TurboQuantAttentionMixin:
 class TurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
     cache_step = 256
 
+    def _new_batch_cache(self, left_padding):
+        return BatchTurboQuantKVCache(
+            left_padding,
+            bits=self.bits,
+            seed=self.seed,
+            key_bits=self.key_bits,
+            value_bits=self.value_bits,
+        )
+
     def __init__(
         self,
         bits: float,
@@ -6608,12 +6611,14 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
     # Core cache operation
     # ------------------------------------------------------------------
 
+    def _quantize_kv(self, keys, values):
+        return self.key_codec.quantize(keys), self.value_codec.quantize(values)
+
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         self._ensure_codecs(keys, values)
         prev = self._idx
 
-        new_keys = self.key_codec.quantize(keys)
-        new_values = self.value_codec.quantize(values)
+        new_keys, new_values = self._quantize_kv(keys, values)
 
         new_end = prev + keys.shape[2]
         if self.keys is None:
@@ -6771,14 +6776,17 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
             return None, None
         return self.dequantize()
 
-    def extract(self, idx):
-        """Extract one batch row as a single-sequence TurboQuantKVCache."""
-        cache = TurboQuantKVCache(
+    def _new_single_cache(self):
+        return TurboQuantKVCache(
             bits=self.bits,
             seed=self.seed,
             key_bits=self.key_bits,
             value_bits=self.value_bits,
         )
+
+    def extract(self, idx):
+        """Extract one batch row as a single-sequence TurboQuantKVCache."""
+        cache = self._new_single_cache()
         if self.keys is None or self._idx == 0:
             return cache
         cache.key_codec = self.key_codec

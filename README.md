@@ -1605,6 +1605,32 @@ TurboQuant automatically quantizes `KVCache` layers (global attention). Models w
 
 TurboQuant is supported in both single-request generation and continuous batching on the server. In continuous batching mode, KV states are stored in TurboQuant's compressed format and dequantized at attention time (custom Metal kernels are not yet batch-aware).
 
+### Native Affine4 on M5
+
+Apple M5 GPUs can execute signed 4-bit matrix operands directly through Metal
+Performance Primitives TensorOps. The `affine4` KV scheme uses a native-friendly
+signed-int4 cache format instead of TurboQuant's nonlinear codebook:
+
+```sh
+mlx_vlm generate \
+  --model mlx-community/Qwen3.5-4B-4bit \
+  --kv-bits 4 \
+  --kv-quant-scheme affine4 \
+  --prompt "Your long prompt here..."
+```
+
+Affine4 applies a deterministic orthonormal rotation, stores one FP16 scale per
+KV vector, and keeps two signed values in each byte. On M5, decode attention
+consumes packed K/V directly with `int4b_format` TensorOps. Standard attention
+geometries whose head dimension is divisible by 32 and at most 512 use the
+native path, including grouped-query attention, short causal speculative
+verification, and left-padded batches. Other hardware and unsupported attention
+shapes use the portable affine4 implementation without changing cache semantics.
+
+`affine4` and `turboquant` are distinct formats. Affine4 requires exactly four
+bits for both keys and values; fractional widths and mixed affine4 schemes are
+rejected. Existing `uniform` and `turboquant` defaults are unchanged.
+
 ## Distributed Inference
 
 mlx-vlm supports distributed inference across multiple computers. It works by sharding the language model (not the vision tower), because the LLM is much larger and vision embeddings only need to be computed once.

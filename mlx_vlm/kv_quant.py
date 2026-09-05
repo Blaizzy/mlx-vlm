@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
+AFFINE4_SCHEME = "affine4"
 TURBOQUANT_SCHEME = "turboquant"
 UNIFORM_SCHEME = "uniform"
 
@@ -17,6 +18,10 @@ class KVQuantSpec:
     @property
     def is_turboquant(self) -> bool:
         return self.scheme == TURBOQUANT_SCHEME
+
+    @property
+    def is_affine4(self) -> bool:
+        return self.scheme == AFFINE4_SCHEME
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,10 @@ class KVQuantPolicy:
     @property
     def is_turboquant(self) -> bool:
         return self.key.is_turboquant and self.value.is_turboquant
+
+    @property
+    def is_affine4(self) -> bool:
+        return self.key.is_affine4 and self.value.is_affine4
 
     @property
     def scheme(self) -> str:
@@ -116,7 +125,12 @@ def from_legacy(
 
     from .turboquant import resolve_kv_bits, turboquant_enabled
 
-    if turboquant_enabled(kv_bits, kv_quant_scheme):
+    if kv_quant_scheme == AFFINE4_SCHEME:
+        bits = float(kv_bits)
+        default_key_bits = float(kv_key_bits) if kv_key_bits is not None else bits
+        default_value_bits = float(kv_value_bits) if kv_value_bits is not None else bits
+        scheme = AFFINE4_SCHEME
+    elif turboquant_enabled(kv_bits, kv_quant_scheme):
         bits, default_key_bits, default_value_bits = resolve_kv_bits(
             kv_bits, kv_key_bits, kv_value_bits
         )
@@ -135,6 +149,11 @@ def from_legacy(
     value_bits = _bits_for_scheme(
         value_scheme, scheme, default_value_bits, kv_value_bits, bits
     )
+    if AFFINE4_SCHEME in (key_scheme, value_scheme):
+        if key_scheme != AFFINE4_SCHEME or value_scheme != AFFINE4_SCHEME:
+            raise ValueError("affine4 requires the same scheme for keys and values")
+        if not math.isclose(key_bits, 4.0) or not math.isclose(value_bits, 4.0):
+            raise ValueError("affine4 requires exactly 4 bits for keys and values")
 
     return KVQuantPolicy(
         bits=bits,
@@ -146,10 +165,10 @@ def from_legacy(
 def _validate_scheme(scheme: Optional[str], fallback: str) -> str:
     if scheme is None:
         return fallback
-    if scheme not in (UNIFORM_SCHEME, TURBOQUANT_SCHEME):
+    if scheme not in (UNIFORM_SCHEME, TURBOQUANT_SCHEME, AFFINE4_SCHEME):
         raise ValueError(
-            f"unknown KV quantization scheme {scheme!r}; "
-            f"expected {UNIFORM_SCHEME!r} or {TURBOQUANT_SCHEME!r}"
+            f"unknown KV quantization scheme {scheme!r}; expected "
+            f"{UNIFORM_SCHEME!r}, {TURBOQUANT_SCHEME!r}, or {AFFINE4_SCHEME!r}"
         )
     return scheme
 

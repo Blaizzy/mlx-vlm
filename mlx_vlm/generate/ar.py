@@ -16,6 +16,7 @@ import mlx.nn as nn
 from tqdm import tqdm
 
 from .. import apc as _apc
+from ..affine4 import BatchAffine4KVCache
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
@@ -32,7 +33,7 @@ from ..speculative.utils import (
     speculative_hidden_state,
     speculative_prefill_kwargs,
 )
-from ..turboquant import BatchTurboQuantKVCache, turboquant_enabled
+from ..turboquant import BatchTurboQuantKVCache
 from ..utils import group_images_by_shape, prepare_inputs, should_add_special_tokens
 from .common import (
     DEFAULT_COMPLETION_BATCH_SIZE,
@@ -898,6 +899,7 @@ def _make_cache(
     *kv_quant_scheme* selects the quantization backend:
     - ``"uniform"`` → ``BatchQuantizedKVCache`` (``mx.quantize``)
     - ``"turboquant"`` or fractional *kv_bits* → ``BatchTurboQuantKVCache``
+    - ``"affine4"`` → ``BatchAffine4KVCache``
 
     Model-specific ``to_batch()`` conversions preserve auxiliary cache state.
     Quantized continuous batching with these caches raises
@@ -919,15 +921,26 @@ def _make_cache(
             "continuous batching"
         )
 
-    use_turbo = kv_bits is not None and turboquant_enabled(kv_bits, kv_quant_scheme)
+    use_turbo = _batch_policy is not None and _batch_policy.is_turboquant
+    use_affine4 = _batch_policy is not None and _batch_policy.is_affine4
+    use_packed = use_turbo or use_affine4
 
-    defer_turbo = (
-        use_turbo and quantized_kv_start > 0 and prefill_length < quantized_kv_start
+    defer_packed = (
+        use_packed and quantized_kv_start > 0 and prefill_length < quantized_kv_start
     )
 
     def _make_quant_cache(lp):
+        if use_affine4:
+            if defer_packed:
+                return cache.BatchKVCache(lp)
+            return BatchAffine4KVCache(
+                lp,
+                bits=kv_bits,
+                key_bits=kv_key_bits,
+                value_bits=kv_value_bits,
+            )
         if use_turbo:
-            if defer_turbo:
+            if defer_packed:
                 return cache.BatchKVCache(lp)
             return BatchTurboQuantKVCache(
                 lp, bits=kv_bits, key_bits=kv_key_bits, value_bits=kv_value_bits

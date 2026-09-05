@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 TEXT_KINDS: Tuple[str, ...] = ("text_generation",)
 VISION_KINDS: Tuple[str, ...] = ("image_generation", "image_edit")
 
-KV_SCHEMES: Tuple[str, ...] = ("uniform", "turboquant")
+KV_SCHEMES: Tuple[str, ...] = ("uniform", "turboquant", "affine4")
 DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
 
 logger = logging.getLogger("mlx_vlm.server")

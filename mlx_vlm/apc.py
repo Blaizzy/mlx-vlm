@@ -3537,12 +3537,17 @@ def _fill_stream_layer_cache(
 
     if quantize and kv_quant_config is not None:
         policy = kv_quant_from_config(kv_quant_config)
+        from .affine4 import Affine4KVCache
         from .turboquant import HybridQuantKVCache, TurboQuantKVCache
 
         if not policy.is_homogeneous:
             c = HybridQuantKVCache(policy)
             c.update_and_fetch(merged_k, merged_v)
             c.offset = prefix_len
+            return c
+        if policy.is_affine4:
+            c = Affine4KVCache(bits=policy.bits)
+            c.update_and_fetch(merged_k, merged_v)
             return c
         if policy.is_turboquant:
             c = TurboQuantKVCache(
@@ -3588,16 +3593,21 @@ def _fill_batch_layer_cache(
     """Build one batch-path layer cache matching ``_make_cache`` layout.
 
     When quantizing, select the same backend as live generation:
-    TurboQuant (``BatchTurboQuantKVCache``) if ``turboquant_enabled(bits, scheme)``,
-    otherwise uniform ``BatchQuantizedKVCache`` with integer bits.
+    Packed affine4 and TurboQuant use their batch cache classes; other policies
+    use uniform ``BatchQuantizedKVCache`` with integer bits.
     """
     from .models.cache import BatchKVCache, BatchQuantizedKVCache
 
     if quantize and kv_quant_config is not None:
         policy = kv_quant_from_config(kv_quant_config)
+        from .affine4 import BatchAffine4KVCache
         from .turboquant import BatchTurboQuantKVCache
 
         _reject_mixed_batch_policy(policy)
+        if policy.is_affine4:
+            c = BatchAffine4KVCache(left_padding, bits=policy.bits)
+            c.update_and_fetch(merged_k, merged_v)
+            return c
         if policy.is_turboquant:
             c = BatchTurboQuantKVCache(
                 left_padding,
@@ -3863,9 +3873,12 @@ def _merge_exact_cache_entries(
 def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) -> Any:
     """Empty quantized batch cache matching live ``_make_cache`` backend."""
     policy = kv_quant_from_config(kv_quant_config)
+    from .affine4 import BatchAffine4KVCache
     from .turboquant import BatchTurboQuantKVCache
 
     _reject_mixed_batch_policy(policy)
+    if policy.is_affine4:
+        return BatchAffine4KVCache(left_padding, bits=policy.bits)
     if policy.is_turboquant:
         return BatchTurboQuantKVCache(
             left_padding,

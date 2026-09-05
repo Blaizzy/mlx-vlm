@@ -489,21 +489,21 @@ def parse_arguments():
     parser.add_argument(
         "--kv-key-scheme",
         type=str,
-        choices=("uniform", "turboquant"),
+        choices=("uniform", "turboquant", "affine4"),
         default=None,
         help="Override the KV quantization backend for keys only.",
     )
     parser.add_argument(
         "--kv-value-scheme",
         type=str,
-        choices=("uniform", "turboquant"),
+        choices=("uniform", "turboquant", "affine4"),
         default=None,
         help="Override the KV quantization backend for values only.",
     )
     parser.add_argument(
         "--kv-quant-scheme",
         type=str,
-        choices=("uniform", "turboquant"),
+        choices=("uniform", "turboquant", "affine4"),
         default=DEFAULT_KV_QUANT_SCHEME,
         help="KV cache quantization backend. Fractional --kv-bits values use "
         "TurboQuant automatically.",
