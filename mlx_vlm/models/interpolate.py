@@ -1,5 +1,10 @@
+import math
+from functools import lru_cache
+
 import mlx.core as mx
 import numpy as np
+
+from .kernels import _cubic_weight, separable_interpolate
 
 
 def gaussian_blur_axis(image, sigma, axis):
@@ -179,3 +184,71 @@ def resize_bilinear(image, new_size, align_corners=False, antialias=True):
 
     else:
         raise ValueError("Unsupported image dimensions.")
+
+
+@lru_cache(maxsize=64)
+def _bilinear_weights_1d(in_size, out_size, align_corners=False, antialias=False):
+    """(out, taps) indices and weights matching ATen ``upsample_bilinear2d``
+    and, for antialiased downscales, ``_upsample_bilinear2d_aa``."""
+    if align_corners:
+        scale = (in_size - 1) / (out_size - 1) if out_size > 1 else 0.0
+        src = mx.arange(out_size, dtype=mx.float32) * scale
+    else:
+        scale = in_size / out_size
+        src = (mx.arange(out_size, dtype=mx.float32) + 0.5) * scale - 0.5
+    if antialias and scale > 1.0:
+        lo = mx.maximum(mx.floor(src - scale + 1), 0)
+        hi = mx.minimum(mx.floor(src + scale), in_size - 1)
+        # hi - lo + 1 <= ceil(2 * scale) for every pixel, so the tap count is static
+        n_taps = math.ceil(2 * scale)
+        pos = lo[:, None] + mx.arange(n_taps, dtype=mx.float32)[None, :]
+        w = mx.maximum(0.0, 1.0 - mx.abs(pos - src[:, None]) / scale)
+        w = mx.where(pos <= hi[:, None], w, 0.0)
+        w = w / w.sum(axis=1, keepdims=True)
+        # Zero-weight taps past hi are clamped so the gather stays in bounds
+        idx = mx.minimum(pos, in_size - 1).astype(mx.int32)
+    else:
+        src = mx.maximum(src, 0.0)
+        base = mx.floor(src)
+        frac = src - base
+        pos = base[:, None] + mx.arange(2, dtype=mx.float32)[None, :]
+        idx = mx.clip(pos.astype(mx.int32), 0, in_size - 1)
+        w = mx.stack([1.0 - frac, frac], axis=1)
+    return idx, w
+
+
+@lru_cache(maxsize=64)
+def _bicubic_weights_1d(in_size, out_size, scale):
+    """(out, 4) indices and a=-0.75 cubic weights sampled at the given scale,
+    with border taps clamped and not renormalized, as in ATen ``upsample_bicubic2d``."""
+    src = (mx.arange(out_size, dtype=mx.float32) + 0.5) / scale - 0.5
+    taps = mx.floor(src)[:, None] + mx.arange(-1, 3, dtype=mx.float32)[None, :]
+    w = _cubic_weight(src[:, None] - taps)
+    idx = mx.clip(taps.astype(mx.int32), 0, in_size - 1)
+    return idx, w
+
+
+def resize_bilinear_nhwc(x, new_size, align_corners=False, antialias=False):
+    """Channel-last bilinear resize matching ``F.interpolate``; ``antialias``
+    is PyTorch's triangle filter rather than ``resize_bilinear``'s Gaussian blur."""
+    _, H, W, _ = x.shape
+    new_height, new_width = new_size
+    if (H, W) == (new_height, new_width):
+        return x
+    iy, wy = _bilinear_weights_1d(H, new_height, align_corners, antialias)
+    ix, wx = _bilinear_weights_1d(W, new_width, align_corners, antialias)
+    return separable_interpolate(x, iy, wy, ix, wx)
+
+
+def resize_bicubic_nhwc(x, new_size=None, scale_factor=None):
+    """Channel-last ``F.interpolate(mode="bicubic")``; with ``scale_factor`` the
+    output size is floored and sampling uses the given scale, not the effective one."""
+    _, in_h, in_w, _ = x.shape
+    if scale_factor is not None:
+        scale_h, scale_w = scale_factor
+        new_size = (int(in_h * scale_h), int(in_w * scale_w))
+    else:
+        scale_h, scale_w = new_size[0] / in_h, new_size[1] / in_w
+    iy, wy = _bicubic_weights_1d(in_h, new_size[0], scale_h)
+    ix, wx = _bicubic_weights_1d(in_w, new_size[1], scale_w)
+    return separable_interpolate(x, iy, wy, ix, wx)

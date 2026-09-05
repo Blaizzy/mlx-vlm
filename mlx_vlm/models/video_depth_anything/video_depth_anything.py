@@ -9,9 +9,9 @@ from typing import Dict
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..dinov2.dinov2 import DINOv2
 from .config import ModelConfig
 from .dpt import DPTHeadTemporal, upsample_bilinear
-from .vision import DINOv2
 
 
 class Model(nn.Module):
