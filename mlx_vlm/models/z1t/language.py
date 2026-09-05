@@ -25,6 +25,11 @@ def _sparse_count(fan_in: Optional[int], dim: int) -> int:
     return max(1, min(fan_in, dim))
 
 
+# Cap the transient (B, chunk, out, k) gather so a long prefill stays in memory;
+# the gather is split along the sequence axis, which is exact.
+_SPARSE_CHUNK_ELEMS = 8_000_000
+
+
 class SparseLinear(nn.Module):
     """y = sum_k weight * x[indices] + bias. `indices` is a fixed, non-trained
     (out, k) fan-in table stored as an int param so it loads from the checkpoint."""
@@ -35,12 +40,22 @@ class SparseLinear(nn.Module):
         self.bias = mx.zeros((out_features,))
         self.indices = mx.zeros((out_features, k), dtype=mx.int32)
 
+    def _gather(self, x: mx.array, idx: mx.array) -> mx.array:
+        return (mx.take(x, idx, axis=-1) * self.weight).sum(axis=-1) + self.bias
+
     def __call__(self, x: mx.array) -> mx.array:
         idx = self.indices
         if idx.dtype not in (mx.int32, mx.int64, mx.uint32):
             idx = idx.astype(mx.int32)
-        g = mx.take(x, idx, axis=-1)
-        return (g * self.weight).sum(axis=-1) + self.bias
+        out_features = self.weight.shape[0]
+        if x.ndim == 3 and x.shape[1] * out_features > _SPARSE_CHUNK_ELEMS:
+            step = max(1, _SPARSE_CHUNK_ELEMS // out_features)
+            parts = [
+                self._gather(x[:, s : s + step], idx)
+                for s in range(0, x.shape[1], step)
+            ]
+            return mx.concatenate(parts, axis=1)
+        return self._gather(x, idx)
 
 
 def _make_linear(in_features: int, out_features: int, fan_in: Optional[int]):
