@@ -2223,6 +2223,59 @@ class TestModels(unittest.TestCase):
         self.assertNotIn(f"{prefix}.gate_proj.weight", sanitized)
         self.assertNotIn(f"{prefix}.up_proj.weight", sanitized)
 
+    def test_z1t_language_model(self):
+        from mlx_vlm.models import z1t
+
+        mx.random.seed(0)
+        config = z1t.ModelConfig(
+            model_type="z1t",
+            vocab_size=97,
+            hidden_size=32,
+            num_hidden_layers=2,
+            max_position_embeddings=64,
+            aft_kind="conv",
+            aft_heads=4,
+            aft_ksize=4,
+            dyt_alpha=0.5,
+            linear_fan_in=4,
+            tanh_linear=True,
+            tanh_mlp=True,
+        )
+        model = z1t.Model(config)
+
+        inputs = mx.array([[1, 2, 3]])
+        embeddings = model.get_input_embeddings(inputs)
+        self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, config.hidden_size))
+
+        cache = model.make_cache()
+        self.assertEqual(len(cache), config.num_hidden_layers)
+        self.assertEqual(type(cache[0]).__name__, "Z1TCache")
+
+        # O(1) streaming decode matches the flat forward on the clean fp32 model
+        # (run before language_test_runner, which recasts params to fp16).
+        ids = mx.array([[3, 1, 4, 1, 5, 9, 2, 6]])
+        flat = model(ids).logits
+        cache = model.make_cache()
+        model(ids[:, :5], cache=cache)
+        for t in range(5, 8):
+            step = model(ids[:, t : t + 1], cache=cache).logits
+            self.assertEqual(step.shape, (1, 1, config.vocab_size))
+            self.assertLess(float(mx.abs(step[0, 0] - flat[0, t]).max()), 2e-3)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        # sanitize maps the flat checkpoint scheme onto the module tree
+        sanitized = model.sanitize(
+            {"clf.weight": mx.zeros((97, 32)), "pe.pe": mx.zeros((64, 32))}
+        )
+        self.assertIn("language_model.lm_head.weight", sanitized)
+        self.assertIn("language_model.model.pe", sanitized)
+
     def test_hrm_text_language_model(self):
         from mlx_vlm.models import hrm_text
 
