@@ -14,3 +14,4 @@ starlette>=1.0.1
 uvicorn
 websockets>=14.0
 numpy
+jinja2

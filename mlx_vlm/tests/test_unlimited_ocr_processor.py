@@ -3,6 +3,8 @@
 import json
 
 import pytest
+
+pytest.importorskip("jinja2")
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 
