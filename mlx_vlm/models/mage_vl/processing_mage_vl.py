@@ -6,9 +6,16 @@ torch-native — its ``__call__`` builds torch tensors, so mlx-vlm's ``prepare_i
 ``qwen3_vl`` pattern: numpy/mlx end to end, installed over AutoProcessor for ``model_type
 mage_vl`` so ``mlx_vlm.load`` returns it without ``trust_remote_code``.
 
-Image path only. Upstream's video path is either codec-derived (the ``codec-video-prep`` native
-extension — manylinux wheels only, cannot run on macOS) or a torch-based frame sampler; a
-torch-free video path is a follow-up.
+Video is supported through uniform frame sampling, reusing ``utils.load_video`` (OpenCV,
+already a dependency) and ``Qwen3VLVideoProcessor`` (the existing numpy/PIL port). That
+covers the frame-sampled path requested in #1766 without adding any dependency.
+
+Upstream's *codec-native* path is a separate matter: it needs ``codec-video-prep``, a
+native extension shipping patched FFmpeg with manylinux-only wheels, so it cannot run on
+macOS at all. The tower itself is already sparsity-agnostic — ``patch_positions`` accepts
+arbitrary ``(L, 3)`` coordinates and ``VisionModel.__call__`` now takes explicit
+``cu_seqlens`` — so a codec-selected patch set can be supplied by a caller without further
+changes here.
 
 ``patch_positions`` is deliberately NOT emitted: the model derives positions from
 ``image_grid_thw`` in the processor's 2x2 block order, and that derivation is pinned
@@ -27,6 +34,7 @@ from ..base import install_auto_processor_patch, load_chat_template, to_mlx
 VISION_START = "<|vision_start|>"
 VISION_END = "<|vision_end|>"
 IMAGE_PAD = "<|image_pad|>"
+VIDEO_PAD = "<|video_pad|>"
 
 
 class MageVLProcessor(ProcessorMixin):
@@ -37,11 +45,24 @@ class MageVLProcessor(ProcessorMixin):
     def __init__(
         self, image_processor=None, tokenizer=None, chat_template=None, **kwargs
     ):
+        # video_processor is carried in kwargs, not as a declared attribute or an
+        # __init__ parameter. transformers 5.x infers a processor's required attributes
+        # from the signature and then type-checks each against its Auto* class:
+        # declaring it raises "requires 3 arguments ... Got 2", and registering
+        # video_processor_class = "AutoVideoProcessor" rejects the numpy port with
+        # "Received a Qwen3VLVideoProcessor, but a BaseVideoProcessor was expected".
+        # Either error is swallowed by the AutoProcessor dispatcher, which then falls
+        # back to the checkpoint's torch remote code -- the exact failure this class
+        # exists to prevent. The image path sidesteps AutoImageProcessor for the same
+        # reason.
+        video_processor = kwargs.pop("video_processor", None)
         if chat_template is None and tokenizer is not None:
             chat_template = getattr(tokenizer, "chat_template", None)
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
         self.spatial_merge_size = getattr(image_processor, "merge_size", 2)
         self.image_token = IMAGE_PAD
+        self.video_token = VIDEO_PAD
+        self.video_processor = video_processor
 
     # The subset of preprocessor_config.json Qwen3VLImageProcessor consumes.
     _IMAGE_PROCESSOR_KEYS = (
@@ -84,7 +105,10 @@ class MageVLProcessor(ProcessorMixin):
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         from transformers import AutoTokenizer
 
-        from ..qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+        from ..qwen3_vl.processing_qwen3_vl import (
+            Qwen3VLImageProcessor,
+            Qwen3VLVideoProcessor,
+        )
 
         kwargs.pop("use_fast", None)
         kwargs.pop("trust_remote_code", None)
@@ -104,10 +128,16 @@ class MageVLProcessor(ProcessorMixin):
         # numpy/PIL port with the same schema (Mage-VL's config: patch 16, merge 2,
         # temporal_patch_size 1, CLIP statistics).
         config = cls._load_preprocessor_config(pretrained_model_name_or_path)
-        image_processor = Qwen3VLImageProcessor(
-            **{k: config[k] for k in cls._IMAGE_PROCESSOR_KEYS if k in config}
+        shared = {k: config[k] for k in cls._IMAGE_PROCESSOR_KEYS if k in config}
+        image_processor = Qwen3VLImageProcessor(**shared)
+        # Same schema, same statistics -- Mage-VL treats a still image as a degenerate
+        # one-frame video, so the two processors must agree on patch/merge/normalisation.
+        video_processor = Qwen3VLVideoProcessor(**shared)
+        return cls(
+            image_processor=image_processor,
+            video_processor=video_processor,
+            tokenizer=tokenizer,
         )
-        return cls(image_processor=image_processor, tokenizer=tokenizer)
 
     def __call__(
         self,
@@ -118,11 +148,6 @@ class MageVLProcessor(ProcessorMixin):
         return_tensors: Optional[str] = None,
         **kwargs,
     ) -> BatchFeature:
-        if videos is not None:
-            raise NotImplementedError(
-                "mage_vl video input needs the upstream codec pipeline (not available as a "
-                "torch-free path yet); image input only for now"
-            )
         if isinstance(text, str):
             text = [text]
         text = list(text or [])
@@ -138,23 +163,54 @@ class MageVLProcessor(ProcessorMixin):
             # (t*h*w / merge^2) — mirrors the reference processor's `_expand_image_pads`.
             merge = self.spatial_merge_size
             counts = [(t * h * w) // (merge * merge) for t, h, w in grids]
-            img_idx = 0
+            text = [self._expand(s, IMAGE_PAD, counts) for s in text]
 
-            def expand(s: str) -> str:
-                nonlocal img_idx
-                while IMAGE_PAD in s and img_idx < len(counts):
-                    s = s.replace(IMAGE_PAD, "<|placeholder|>" * counts[img_idx], 1)
-                    img_idx += 1
-                return s.replace("<|placeholder|>", IMAGE_PAD)
-
-            text = [expand(s) for s in text]
+        video_inputs = {}
+        if videos is not None:
+            if self.video_processor is None:
+                raise ValueError("this processor was built without a video_processor")
+            video_inputs = dict(self.video_processor(self._as_arrays(videos)))
+            grids = mx.array(video_inputs["video_grid_thw"]).tolist()
+            merge = self.spatial_merge_size
+            counts = [(t * h * w) // (merge * merge) for t, h, w in grids]
+            text = [self._expand(s, VIDEO_PAD, counts) for s in text]
 
         # mlx-vlm's process_inputs passes padding in kwargs; hardcoding it too collides.
         padding = kwargs.pop("padding", True)
         text_inputs = self.tokenizer(
             text, return_tensors="np", padding=padding, **kwargs
         )
-        return BatchFeature(data=to_mlx({**dict(text_inputs), **image_inputs}))
+        return BatchFeature(
+            data=to_mlx({**dict(text_inputs), **image_inputs, **video_inputs})
+        )
+
+    @staticmethod
+    def _expand(text: str, token: str, counts: list) -> str:
+        """Expand each placeholder to its grid's merged-token count.
+
+        Mirrors the reference processor's ``_expand_image_pads``: the language side finds
+        visual features by matching token ids, so the placeholder count has to equal the
+        number of merged tokens the tower will emit.
+        """
+        idx = 0
+        while token in text and idx < len(counts):
+            text = text.replace(token, "<|placeholder|>" * counts[idx], 1)
+            idx += 1
+        return text.replace("<|placeholder|>", token)
+
+    @staticmethod
+    def _as_arrays(videos):
+        """Accept file paths or already-decoded (T, C, H, W) arrays."""
+        import numpy as np
+
+        from ...utils import load_video
+
+        if not isinstance(videos, list):
+            videos = [videos]
+        out = []
+        for v in videos:
+            out.append(load_video(v)[0] if isinstance(v, str) else np.asarray(v))
+        return out
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)
@@ -164,7 +220,11 @@ class MageVLProcessor(ProcessorMixin):
 
     @property
     def model_input_names(self):
-        return ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"]
+        return [
+            "input_ids", "attention_mask",
+            "pixel_values", "image_grid_thw",
+            "pixel_values_videos", "video_grid_thw",
+        ]
 
 
 __all__ = ["MageVLProcessor"]
