@@ -1,3 +1,4 @@
+import os
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -17,6 +18,37 @@ from ..gated_delta import gated_delta_update
 from ..mla import MultiLinear, latent_length, max_absorbed_queries
 from ..mlp import DeepseekMLP
 from .config import ModelConfig, TextConfig
+from .fused_kda import (
+    fused_kda_decode_step,
+    fused_kda_probe,
+    fused_kda_qproj_supported,
+    fused_kda_supported,
+)
+
+_FUSED_KDA_ENV = None
+_FUSED_KDA_QPROJ_ENV = None
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
+
+
+def _fused_kda_enabled() -> bool:
+    # MLX_VLM_GLM5_FUSED_KDA: collapse a KDA layer's post-projection decode chain
+    # (~30 dispatches) into one custom Metal kernel.  Opt-in.
+    global _FUSED_KDA_ENV
+    if _FUSED_KDA_ENV is None:
+        _FUSED_KDA_ENV = _env_flag("MLX_VLM_GLM5_FUSED_KDA")
+    return _FUSED_KDA_ENV
+
+
+def _fused_kda_qproj_enabled() -> bool:
+    # MLX_VLM_GLM5_FUSED_KDA_QPROJ: additionally fold f_b_proj / g_b_proj into the
+    # kernel.  Requires MLX_VLM_GLM5_FUSED_KDA.
+    global _FUSED_KDA_QPROJ_ENV
+    if _FUSED_KDA_QPROJ_ENV is None:
+        _FUSED_KDA_QPROJ_ENV = _env_flag("MLX_VLM_GLM5_FUSED_KDA_QPROJ")
+    return _FUSED_KDA_QPROJ_ENV
 
 
 class Glm5NextRMSNormGated(nn.Module):
@@ -136,6 +168,129 @@ class Glm5NextLinearAttention(nn.Module):
         self.o_proj = nn.Linear(self.qkv_dim, self.hidden_size, bias=False)
         self.fuse_in = True
         self._fused_ready = False
+        self._fused_kda = None
+        self._fused_kda_qproj = None
+        self._fused_kda_ty = None
+        self._fused_kda_qproj_ty = None
+
+    def _fused_kda_ready(self) -> bool:
+        # Config-level capability, resolved once per module.
+        if self._fused_kda is None:
+            self._fused_kda = _fused_kda_enabled() and fused_kda_supported(
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                conv_kernel_size=self.conv_kernel_size,
+                lower_bound=self.forget_gate.safe_gate_lower_bound,
+            )
+        return self._fused_kda
+
+    def _fused_kda_qproj_ready(self, dtype=None, state_dtype=None) -> bool:
+        # Needs the dtypes to probe the device: the fold is a separate pipeline
+        # with its own threadgroup limit, so it can be declined (or run at a
+        # smaller threadgroup) independently of the base kernel.
+        if self._fused_kda_qproj is None:
+            if dtype is None:
+                return False
+            supported = (
+                _fused_kda_qproj_enabled()
+                and self._fused_kda_ready()
+                and fused_kda_qproj_supported(
+                    self.forget_gate.f_b_proj,
+                    self.g_b_proj,
+                    head_dim=self.head_dim,
+                )
+            )
+            ty = None
+            if supported:
+                ty = fused_kda_probe(
+                    kind="qproj",
+                    num_heads=self.num_heads,
+                    head_dim=self.head_dim,
+                    conv_kernel_size=self.conv_kernel_size,
+                    dtype=dtype,
+                    state_dtype=state_dtype,
+                    bits=int(self.forget_gate.f_b_proj.bits),
+                    group_size=int(self.forget_gate.f_b_proj.group_size),
+                )
+            self._fused_kda_qproj_ty = ty
+            self._fused_kda_qproj = ty is not None
+        return self._fused_kda_qproj
+
+    def _fused_kda_eligible(self, B, S, mask, cache, ref) -> bool:
+        # Per-step preconditions.  Prefill, S>1, batched or masked decode and any
+        # unexpected cache layout fall back to the eager path.
+        if B != 1 or S != 1 or mask is not None:
+            return False
+        if cache is None or cache[0] is None or cache[1] is None:
+            return False
+        H, D, K = self.num_heads, self.head_dim, self.conv_kernel_size
+        if cache[0].shape != (1, K - 1, 3 * H * D):
+            return False
+        if cache[1].shape != (1, H, D, D):
+            return False
+        fg = self.forget_gate
+        if fg.A_log.size != H or fg.dt_bias.size != H * D:
+            return False
+        dt = ref.dtype
+        if not (
+            self.conv1d.weight.dtype == dt
+            and cache[0].dtype == dt
+            and self.conv1d.weight.shape == (3 * H * D, K, 1)
+            and self.o_norm.weight.size == D
+        ):
+            return False
+        # Device capability, probed once (see fused_kda_probe): a GPU may cap
+        # this pipeline's threads-per-threadgroup below the default launch.
+        if self._fused_kda_ty is None:
+            ty = fused_kda_probe(
+                kind="base",
+                num_heads=H,
+                head_dim=D,
+                conv_kernel_size=K,
+                dtype=dt,
+                state_dtype=cache[1].dtype,
+            )
+            if ty is None:
+                self._fused_kda = False  # stop retrying; stay on the eager path
+                return False
+            self._fused_kda_ty = ty
+        return True
+
+    def _fused_kda_step(self, q_o, k_o, v_o, fa_o, ga_o, b_o, cache) -> mx.array:
+        # One custom Metal kernel for the whole post-projection chain: conv1d
+        # window update + silu, both L2 norms, the safe forget gate, beta, the
+        # gated delta-rule state update and the gated RMSNorm.
+        fg = self.forget_gate
+        use_qproj = self._fused_kda_qproj_ready(q_o.dtype, cache[1].dtype)
+        qproj = (fa_o, fg.f_b_proj, ga_o, self.g_b_proj) if use_qproj else None
+        ty = self._fused_kda_qproj_ty if use_qproj else self._fused_kda_ty
+        a = None if use_qproj else fg.f_b_proj(fa_o)
+        gate = None if use_qproj else self.g_b_proj(ga_o)
+        y, state, conv_state = fused_kda_decode_step(
+            q_o,
+            k_o,
+            v_o,
+            cache[0],
+            self.conv1d.weight,
+            a,
+            b_o,
+            fg.A_log,
+            fg.dt_bias,
+            cache[1],
+            gate,
+            self.o_norm.weight,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            conv_kernel_size=self.conv_kernel_size,
+            lower_bound=fg.safe_gate_lower_bound,
+            norm_eps=self.o_norm.eps,
+            ty=ty,
+            qproj=qproj,
+        )
+        cache[0] = conv_state
+        cache[1] = state
+        cache.advance(1)
+        return self.o_proj(y)
 
     def _fused_in_proj(self, inputs):
         # q,k,v,f_a,g_a,b all take `inputs`; fuse into one matmul via a lossless
@@ -184,14 +339,25 @@ class Glm5NextLinearAttention(nn.Module):
         B, S, _ = inputs.shape
         if self.fuse_in:
             q_o, k_o, v_o, fa_o, ga_o, b_o = self._fused_in_proj(inputs)
+            if self._fused_kda_ready() and self._fused_kda_eligible(
+                B, S, mask, cache, q_o
+            ):
+                return self._fused_kda_step(q_o, k_o, v_o, fa_o, ga_o, b_o, cache)
             mixed = mx.concatenate([q_o, k_o, v_o], axis=-1)
         else:
-            mixed = mx.concatenate(
-                [self.q_proj(inputs), self.k_proj(inputs), self.v_proj(inputs)], axis=-1
+            q_o, k_o, v_o = (
+                self.q_proj(inputs),
+                self.k_proj(inputs),
+                self.v_proj(inputs),
             )
+            mixed = mx.concatenate([q_o, k_o, v_o], axis=-1)
             fa_o = self.forget_gate.f_a_proj(inputs)
             ga_o = self.g_a_proj(inputs)
             b_o = self.b_proj(inputs)
+            if self._fused_kda_ready() and self._fused_kda_eligible(
+                B, S, mask, cache, q_o
+            ):
+                return self._fused_kda_step(q_o, k_o, v_o, fa_o, ga_o, b_o, cache)
         if mask is not None and mask.dtype == mx.bool_:
             mixed = mx.where(mask[..., None], mixed, 0)
 
