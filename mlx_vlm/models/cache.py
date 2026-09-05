@@ -5,6 +5,24 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 
+def _drop_key_only_values(cache, cached_keys, cached_values, incoming_values):
+    if incoming_values.shape[-1] == 0 and cache.keys is not None:
+        cache.values = cache.keys[..., :0]
+        return cached_keys, cached_keys[..., :0]
+    return cached_keys, cached_values
+
+
+def _key_only_guard(cls):
+    inner = cls.update_and_fetch
+
+    def update_and_fetch(self, keys, values):
+        cached_keys, cached_values = inner(self, keys, values)
+        return _drop_key_only_values(self, cached_keys, cached_values, values)
+
+    cls.update_and_fetch = update_and_fetch
+    return cls
+
+
 def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:
     """Whether layer ``layer_idx`` should use a quantized KV cache.
 
@@ -409,6 +427,7 @@ class QuantizedKVCache(_BaseCache):
         return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
 
 
+@_key_only_guard
 class KVCache(_BaseCache):
     step = 256
 
@@ -545,6 +564,7 @@ class KVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+@_key_only_guard
 class RotatingKVCache(_BaseCache):
     step = 256
 
@@ -1085,6 +1105,7 @@ def dynamic_roll(x, shifts, axis):
     return rolled
 
 
+@_key_only_guard
 class BatchKVCache(_BaseCache):
     step = 256
 
@@ -1317,6 +1338,7 @@ class BatchKVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+@_key_only_guard
 class BatchRotatingKVCache(_BaseCache):
     step = 256
 
@@ -1693,6 +1715,7 @@ class BatchRotatingKVCache(_BaseCache):
 # MLX-VLM cache extensions.
 
 
+@_key_only_guard
 class BufferedRotatingKVCache(RotatingKVCache):
     """Temporal sliding-window cache with rollback slack for speculative blocks."""
 
