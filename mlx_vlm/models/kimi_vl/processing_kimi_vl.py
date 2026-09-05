@@ -327,6 +327,13 @@ class KimiVLProcessor(ProcessorMixin):
     image_processor_class = "KimiVLImageProcessor"
     tokenizer_class = "AutoTokenizer"
 
+    @property
+    def additional_eos_token_ids(self):
+        token_id = self.tokenizer.convert_tokens_to_ids("<|im_assistant|>")
+        if token_id == getattr(self.tokenizer, "unk_token_id", None):
+            return []
+        return [token_id]
+
     def __init__(
         self,
         image_processor=None,
