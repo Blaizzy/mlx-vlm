@@ -18,7 +18,8 @@ from .generation import (
     get_server_thinking_end_token,
     get_server_thinking_start_token,
 )
-from .runtime import MODEL_DISCOVERY_ENV, MODEL_DISCOVERY_MODES
+from .runtime import MODEL_DISCOVERY_ENV, MODEL_DISCOVERY_MODES, runtime
+from .runtime_config import RuntimeConfig
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
@@ -237,6 +238,12 @@ def main():
         ),
     )
     parser.add_argument(
+        "--draft-compact-head",
+        type=str,
+        default=None,
+        help="Optional local compact proposal-only head for an MTP drafter.",
+    )
+    parser.add_argument(
         "--draft-kind",
         type=str,
         default=None,
@@ -314,6 +321,8 @@ def main():
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     if args.draft_model:
         os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
+    if args.draft_compact_head:
+        os.environ["MLX_VLM_DRAFT_COMPACT_HEAD"] = args.draft_compact_head
     if args.draft_kind is not None:
         os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
     if args.draft_block_size is not None:
@@ -352,6 +361,11 @@ def main():
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
     if args.api_key:
         os.environ["MLX_VLM_SERVER_API_KEY"] = args.api_key
+
+    # ``runtime`` is imported before CLI arguments are parsed. Re-read all
+    # boot-time environment defaults so cache identity and settings reset
+    # semantics match the command line that will start the server.
+    runtime.config = RuntimeConfig.from_env()
 
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(

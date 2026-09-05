@@ -124,6 +124,14 @@ KNOBS: Tuple[
         "Speculative draft kind (auto if unset).",
     ),
     (
+        "spec_draft_compact_head",
+        "str_or_none",
+        None,
+        TEXT_KINDS,
+        None,
+        "Compact proposal-head path for a Qwen MTP drafter.",
+    ),
+    (
         "vision_cache_size",
         "int",
         20,
@@ -197,6 +205,7 @@ class RuntimeConfig:
     token_queue_timeout: Optional[float] = DEFAULT_TOKEN_QUEUE_TIMEOUT
     spec_draft_model: Optional[str] = None
     spec_draft_kind: Optional[str] = None
+    spec_draft_compact_head: Optional[str] = None
     vision_cache_size: int = 20
 
     _lock: threading.Lock = field(
@@ -227,6 +236,9 @@ class RuntimeConfig:
             token_queue_timeout=_env_token_queue_timeout(),
             spec_draft_model=os.environ.get("MLX_VLM_DRAFT_MODEL") or None,
             spec_draft_kind=os.environ.get("MLX_VLM_DRAFT_KIND") or None,
+            spec_draft_compact_head=(
+                os.environ.get("MLX_VLM_DRAFT_COMPACT_HEAD") or None
+            ),
             vision_cache_size=int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20")),
         )
         cfg._env_defaults = {name: getattr(cfg, name) for name in _KNOB_SPEC}

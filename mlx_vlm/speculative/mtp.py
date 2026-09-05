@@ -727,9 +727,14 @@ def _mtp_draft_kwargs(
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
 ) -> Dict[str, bool]:
     greedy_draft = greedy_sampling or _sampler_supports_positioned_target(sampler)
+    kwargs = {}
     if greedy_draft and getattr(draft_model, "supports_greedy_draft_argmax", False):
-        return {"greedy": True}
-    return {}
+        kwargs["greedy"] = True
+    if getattr(draft_model, "supports_compact_proposal_head", False):
+        # Positioned target sampling may use greedy proposals without making the
+        # request itself greedy. Keep compact vocabularies disabled there.
+        kwargs["compact_proposals"] = greedy_sampling
+    return kwargs
 
 
 def _mtp_draft_block_active(

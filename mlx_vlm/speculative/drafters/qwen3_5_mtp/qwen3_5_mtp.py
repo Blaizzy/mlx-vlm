@@ -10,11 +10,13 @@ from ....models.cache import BatchKVCache, KVCache
 from ....models.qwen3_5.fp8 import convert_qwen_fp8_weights
 from ....models.qwen3_5.language import Qwen3_5DecoderLayer
 from ....models.qwen3_5_moe.language import Qwen3_5MoeDecoderLayer
+from .compact_head import CompactProposalHead
 from .config import Qwen3_5MTPConfig
 
 
 class Qwen3_5MTPDraftModel(nn.Module):
     supports_greedy_draft_argmax = True
+    supports_compact_proposal_head = True
     prefer_requested_block_size = True
     requires_uniform_batch_acceptance = False
     supports_ragged_batch_acceptance = True
@@ -52,6 +54,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         self._input_embed_scale: float = 1.0
         self._lm_head_fn = None
         self._greedy_argmax_fn = None
+        self._compact_proposal_head: Optional[CompactProposalHead] = None
         self._cache: List[KVCache] = []
         self._seed_token: Optional[mx.array] = None
         self._seed_hidden: Optional[mx.array] = None
@@ -94,6 +97,30 @@ class Qwen3_5MTPDraftModel(nn.Module):
         )
         self._greedy_argmax_fn = getattr(lm, "speculative_argmax_from_hidden", None)
         return self
+
+    def set_compact_proposal_head(self, head: Optional[CompactProposalHead]) -> None:
+        if head is not None:
+            if not isinstance(head, CompactProposalHead):
+                raise TypeError("compact proposal head has an unsupported type")
+            head.validate_target(self.config.text_config)
+        self._compact_proposal_head = head
+
+    def _propose_token(
+        self,
+        hidden: mx.array,
+        sampler,
+        greedy: bool,
+        compact_proposals: Optional[bool] = None,
+    ) -> mx.array:
+        use_compact = greedy if compact_proposals is None else compact_proposals
+        if self._compact_proposal_head is not None and greedy and use_compact:
+            return self._compact_proposal_head.propose(hidden)
+        # Compact heads are proposal-only argmax accelerators. Sampled target
+        # requests keep the original full-head proposal path rather than
+        # applying a truncated vocabulary.
+        if greedy:
+            return self._greedy_token(hidden)
+        return sampler(self._lm_head_fn(hidden))
 
     def make_cache(self, left_padding: Optional[List[int]] = None) -> List[KVCache]:
         if left_padding is not None:
@@ -211,11 +238,16 @@ class Qwen3_5MTPDraftModel(nn.Module):
                 return token
         return mx.argmax(self._lm_head_fn(hidden), axis=-1)
 
-    def _set_seed_from_hidden(self, hidden: mx.array, sampler, greedy: bool) -> None:
-        if greedy:
-            self._seed_token = self._greedy_token(hidden)
-        else:
-            self._seed_token = sampler(self._lm_head_fn(hidden))
+    def _set_seed_from_hidden(
+        self,
+        hidden: mx.array,
+        sampler,
+        greedy: bool,
+        compact_proposals: Optional[bool] = None,
+    ) -> None:
+        self._seed_token = self._propose_token(
+            hidden, sampler, greedy, compact_proposals
+        )
         self._seed_hidden = hidden
 
     def prefill_from_target_hidden(
@@ -226,6 +258,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         sampler,
         token_dtype: mx.Dtype = mx.int32,
         greedy: bool = False,
+        compact_proposals: Optional[bool] = None,
     ) -> None:
         if input_ids.shape[1] == 0:
             return
@@ -241,7 +274,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
             hidden[:, : shifted.shape[1], :],
             token_dtype,
         )
-        self._set_seed_from_hidden(h[:, -1:, :], sampler, greedy)
+        self._set_seed_from_hidden(h[:, -1:, :], sampler, greedy, compact_proposals)
 
     def accept_verified_tokens(
         self,
@@ -252,6 +285,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         sampler,
         token_dtype: mx.Dtype = mx.int32,
         greedy: bool = False,
+        compact_proposals: Optional[bool] = None,
     ) -> None:
         keep_appended = min(int(accepted), self._round_appended)
         trim = self._round_appended - keep_appended
@@ -278,7 +312,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
             tokens = mx.concatenate(token_chunks, axis=1).astype(token_dtype)
             hiddens = mx.concatenate(hidden_chunks, axis=1)
             h = self._forward_tokens(tokens, hiddens, token_dtype)
-            self._set_seed_from_hidden(h[:, -1:, :], sampler, greedy)
+            self._set_seed_from_hidden(h[:, -1:, :], sampler, greedy, compact_proposals)
         self._round_appended = 0
 
     def accept_verified_tokens_batch(
@@ -290,6 +324,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         sampler,
         token_dtype: mx.Dtype = mx.int32,
         greedy: bool = False,
+        compact_proposals: Optional[bool] = None,
     ) -> None:
         """Extend the Qwen MTP drafter cache after a batched verify step."""
         if len(accepted) <= 1:
@@ -301,6 +336,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
                 sampler,
                 token_dtype,
                 greedy,
+                compact_proposals,
             )
             return
 
@@ -410,7 +446,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
 
             last_idx = mx.array([length - 1 for length in lengths], dtype=mx.int32)
             last_hidden = mx.take_along_axis(h, last_idx[:, None, None], axis=1)
-            self._set_seed_from_hidden(last_hidden, sampler, greedy)
+            self._set_seed_from_hidden(last_hidden, sampler, greedy, compact_proposals)
         self._round_appended = 0
 
     def filter_batch(self, keep) -> None:
@@ -445,6 +481,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         sampler,
         token_dtype: mx.Dtype = mx.int32,
         greedy: bool = False,
+        compact_proposals: Optional[bool] = None,
     ) -> mx.array:
         del cache
         if self._input_embed is None or self._lm_head_fn is None:
@@ -472,10 +509,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         while len(tokens) < block_size - 1:
             h_prev = self._forward_token(tok, h_prev, token_dtype)
             self._round_appended += 1
-            if greedy:
-                tok = self._greedy_token(h_prev)
-            else:
-                tok = sampler(self._lm_head_fn(h_prev))
+            tok = self._propose_token(h_prev, sampler, greedy, compact_proposals)
             tokens.append(tok)
 
         self._draft_round += 1

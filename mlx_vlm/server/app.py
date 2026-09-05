@@ -893,6 +893,7 @@ def get_cached_model(
         apc_manager=runtime.apc_manager,
         draft_model_path=cfg.spec_draft_model,
         draft_kind=cfg.spec_draft_kind,
+        draft_compact_head_path=cfg.spec_draft_compact_head,
     )
     try:
         model, processor, config = response_generator.wait_until_ready()

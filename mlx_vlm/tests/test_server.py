@@ -46,16 +46,20 @@ def test_response_generator_prefill_step_override_wins_over_environment(monkeypa
             pass
 
     monkeypatch.setenv("PREFILL_STEP_SIZE", "2048")
+    monkeypatch.setenv("MLX_VLM_DRAFT_COMPACT_HEAD", "/proposal/from-env")
     monkeypatch.setattr(server_generation, "Thread", DormantThread)
 
     default_generator = server.ResponseGenerator(model_path="default")
     overridden_generator = server.ResponseGenerator(
         model_path="overridden",
+        draft_compact_head_path=None,
         prefill_step_size=3072,
     )
 
     assert default_generator.prefill_step_size == 2048
+    assert default_generator.draft_compact_head_path == "/proposal/from-env"
     assert overridden_generator.prefill_step_size == 3072
+    assert overridden_generator.draft_compact_head_path is None
 
 
 def test_response_generator_clears_worker_streams(monkeypatch):
@@ -752,6 +756,7 @@ def _unstarted_response_generator():
     gen.draft_kind = None
     gen.draft_model_path = None
     gen.draft_kind_override = None
+    gen.draft_compact_head_path = None
     gen.kv_bits = None
     gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
     gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
@@ -803,6 +808,105 @@ def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
     assert gen.processor is processor
     assert gen.draft_model is None
     assert gen.draft_kind is None
+
+
+def test_server_loads_compact_mtp_proposal_head(monkeypatch):
+    target_text_config = SimpleNamespace(
+        hidden_size=16, vocab_size=32, model_type="qwen3_5"
+    )
+    target_config = SimpleNamespace(eos_token_id=[], text_config=target_text_config)
+    model = SimpleNamespace(language_model=SimpleNamespace(config=target_config))
+    target_tokenizer = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=target_tokenizer)
+    draft_text_config = SimpleNamespace(
+        hidden_size=16, vocab_size=32, model_type="qwen3_5"
+    )
+    drafter = SimpleNamespace(
+        config=SimpleNamespace(block_size=4, text_config=draft_text_config)
+    )
+    drafter.set_compact_proposal_head = MagicMock()
+    compact_head = object()
+    gen = _unstarted_response_generator()
+
+    monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "assistant")
+    monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
+    monkeypatch.setenv("MLX_VLM_DRAFT_COMPACT_HEAD", "/proposal/compact")
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, target_config),
+    )
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.drafters.load_drafter",
+        lambda *_args, **_kwargs: (drafter, "mtp"),
+    )
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.drafters.validate_drafter_compatibility",
+        lambda *_args, **_kwargs: None,
+    )
+    load_compact = MagicMock(return_value=compact_head)
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.drafters.qwen3_5_mtp.load_compact_proposal_head",
+        load_compact,
+    )
+
+    gen._initialize_model()
+
+    load_compact.assert_called_once_with(
+        "/proposal/compact",
+        target_config=target_text_config,
+        tokenizer=target_tokenizer,
+    )
+    drafter.set_compact_proposal_head.assert_called_once_with(compact_head)
+    assert gen.draft_model is drafter
+    assert gen.draft_kind == "mtp"
+
+
+def test_server_rejects_compact_head_without_drafter(monkeypatch):
+    target_config = SimpleNamespace(eos_token_id=[])
+    model = SimpleNamespace(language_model=SimpleNamespace(config=target_config))
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    gen = _unstarted_response_generator()
+
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.delenv("MLX_VLM_DRAFT_KIND", raising=False)
+    monkeypatch.setenv("MLX_VLM_DRAFT_COMPACT_HEAD", "/proposal/compact")
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, target_config),
+    )
+
+    with pytest.raises(ValueError, match="requires a draft model"):
+        gen._initialize_model()
+
+
+def test_server_rejects_compact_head_for_non_mtp_drafter(monkeypatch):
+    target_config = SimpleNamespace(eos_token_id=[])
+    model = SimpleNamespace(language_model=SimpleNamespace(config=target_config))
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    drafter = SimpleNamespace(config=SimpleNamespace(block_size=4))
+    gen = _unstarted_response_generator()
+
+    monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "assistant")
+    monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "eagle3")
+    monkeypatch.setenv("MLX_VLM_DRAFT_COMPACT_HEAD", "/proposal/compact")
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, target_config),
+    )
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.drafters.load_drafter",
+        lambda *_args, **_kwargs: (drafter, "eagle3"),
+    )
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.drafters.validate_drafter_compatibility",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(ValueError, match="requires an MTP drafter"):
+        gen._initialize_model()
 
 
 def test_server_includes_processor_specific_stop_tokens(monkeypatch):
@@ -6427,6 +6531,7 @@ class TestResponseGenerator:
             "MLX_VLM_PRELOAD_RERANKER_MODEL",
             "MLX_VLM_MODEL_DISCOVERY",
             "MLX_VLM_VISION_CACHE_SIZE",
+            "MLX_VLM_DRAFT_COMPACT_HEAD",
             "MLX_VLM_MAX_TOKENS",
             "MLX_VLM_THINKING_BUDGET",
             "MLX_VLM_THINKING_START_TOKEN",
@@ -6459,6 +6564,8 @@ class TestResponseGenerator:
                 "reranker-demo",
                 "--model-discovery",
                 "served",
+                "--draft-compact-head",
+                "/proposal/compact",
                 "--enable-thinking",
                 "--thinking-budget",
                 "128",
@@ -6471,6 +6578,11 @@ class TestResponseGenerator:
             ],
         )
         run_calls = []
+        monkeypatch.setattr(
+            server_cli.runtime,
+            "config",
+            RuntimeConfig.from_env(),
+        )
         monkeypatch.setattr(
             server_cli.uvicorn,
             "run",
@@ -6490,6 +6602,16 @@ class TestResponseGenerator:
             assert os.environ["MLX_VLM_PRELOAD_STT_MODEL"] == "stt-demo"
             assert os.environ["MLX_VLM_PRELOAD_RERANKER_MODEL"] == "reranker-demo"
             assert os.environ["MLX_VLM_MODEL_DISCOVERY"] == "served"
+            assert os.environ["MLX_VLM_DRAFT_COMPACT_HEAD"] == "/proposal/compact"
+            assert (
+                server_cli.runtime.config.spec_draft_compact_head == "/proposal/compact"
+            )
+            server_cli.runtime.config.apply_changes({"spec_draft_compact_head": None})
+            assert server_cli.runtime.config.spec_draft_compact_head is None
+            server_cli.runtime.config.apply_changes({}, op="replace")
+            assert (
+                server_cli.runtime.config.spec_draft_compact_head == "/proposal/compact"
+            )
             assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
             assert run_calls[0][1]["host"] == "127.0.0.1"
         finally:
@@ -6503,6 +6625,7 @@ class TestResponseGenerator:
                 "MLX_VLM_PRELOAD_RERANKER_MODEL",
                 "MLX_VLM_MODEL_DISCOVERY",
                 "MLX_VLM_VISION_CACHE_SIZE",
+                "MLX_VLM_DRAFT_COMPACT_HEAD",
                 "MLX_VLM_MAX_TOKENS",
                 "MLX_VLM_THINKING_BUDGET",
                 "MLX_VLM_THINKING_START_TOKEN",
@@ -7387,9 +7510,19 @@ class TestRuntimeConfigAdditions:
             "token_queue_timeout",
             "spec_draft_model",
             "spec_draft_kind",
+            "spec_draft_compact_head",
         ):
             assert name in spec
             assert spec[name]["reload_kinds"] == ["text_generation"]
+
+    def test_compact_head_env_is_part_of_runtime_identity(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_DRAFT_COMPACT_HEAD", raising=False)
+        without_compact = RuntimeConfig.from_env()
+        monkeypatch.setenv("MLX_VLM_DRAFT_COMPACT_HEAD", "/proposal/compact")
+        with_compact = RuntimeConfig.from_env()
+
+        assert with_compact.spec_draft_compact_head == "/proposal/compact"
+        assert with_compact.fingerprint() != without_compact.fingerprint()
 
     def test_token_queue_timeout_is_live(self, client, monkeypatch):
         monkeypatch.delenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", raising=False)
@@ -7444,10 +7577,18 @@ class TestRuntimeConfigAdditions:
         monkeypatch.setattr(server.runtime, "apc_manager", None)
         monkeypatch.setattr(server.runtime.config, "spec_draft_model", "draft-x")
         monkeypatch.setattr(server.runtime.config, "spec_draft_kind", "auto")
+        monkeypatch.setattr(
+            server.runtime.config,
+            "spec_draft_compact_head",
+            "compact-x",
+        )
 
         server.get_cached_model("demo-model")
         assert FakeResponseGenerator.last_kwargs["draft_model_path"] == "draft-x"
         assert FakeResponseGenerator.last_kwargs["draft_kind"] == "auto"
+        assert (
+            FakeResponseGenerator.last_kwargs["draft_compact_head_path"] == "compact-x"
+        )
 
     def test_settings_patch_replace_semantics(self, client, monkeypatch):
         monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())

@@ -51,6 +51,7 @@ logger = logging.getLogger("mlx_vlm.server")
 DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
 DEFAULT_LOG_PROGRESS_INTERVAL = 10
 DEFAULT_ENABLE_THINKING = False
+_UNSET = object()
 METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
 
@@ -1001,6 +1002,7 @@ class ResponseGenerator:
         apc_manager: Optional["_apc.APCManager"] = None,
         draft_model_path: Optional[str] = None,
         draft_kind: Optional[str] = None,
+        draft_compact_head_path=_UNSET,
         prefill_step_size: Optional[int] = None,
     ):
         self.model_path = model_path
@@ -1012,6 +1014,11 @@ class ResponseGenerator:
         self.vision_cache = vision_cache
         self.draft_model_path = draft_model_path
         self.draft_kind_override = draft_kind
+        self.draft_compact_head_path = (
+            os.environ.get("MLX_VLM_DRAFT_COMPACT_HEAD")
+            if draft_compact_head_path is _UNSET
+            else draft_compact_head_path
+        )
         self.draft_model = None
         self.kv_bits = kv_bits
         self.kv_key_bits = kv_key_bits
@@ -1092,6 +1099,9 @@ class ResponseGenerator:
         draft_model_path = self.draft_model_path or os.environ.get(
             "MLX_VLM_DRAFT_MODEL"
         )
+        compact_head_path = self.draft_compact_head_path
+        if compact_head_path and not draft_model_path:
+            raise ValueError("a compact proposal head requires a draft model")
         if draft_model_path:
             from ..speculative.drafters import (
                 load_drafter,
@@ -1116,6 +1126,11 @@ class ResponseGenerator:
             try:
                 validate_drafter_compatibility(model, draft_model, draft_kind)
             except ValueError as e:
+                if compact_head_path:
+                    raise ValueError(
+                        "compact proposal head cannot be used with an incompatible "
+                        "drafter"
+                    ) from e
                 logger.warning(
                     "Speculative drafter is incompatible with the target model; "
                     "falling back to autoregressive generation: %s",
@@ -1124,6 +1139,36 @@ class ResponseGenerator:
                 draft_model = None
                 draft_kind = None
             else:
+                if compact_head_path:
+                    if draft_kind != "mtp":
+                        raise ValueError(
+                            "a compact proposal head requires an MTP drafter"
+                        )
+                    from ..speculative.drafters.qwen3_5_mtp import (
+                        load_compact_proposal_head,
+                    )
+
+                    binder = getattr(draft_model, "set_compact_proposal_head", None)
+                    if not callable(binder):
+                        raise ValueError(
+                            "selected MTP drafter does not support a compact "
+                            "proposal head"
+                        )
+                    target_tokenizer = getattr(processor, "tokenizer", processor)
+                    target_text_config = getattr(config, "text_config", None)
+                    if target_text_config is None:
+                        language_model = getattr(model, "language_model", model)
+                        target_text_config = getattr(language_model, "args", config)
+                    compact_head = load_compact_proposal_head(
+                        compact_head_path,
+                        target_config=target_text_config,
+                        tokenizer=target_tokenizer,
+                    )
+                    binder(compact_head)
+                    logger.info(
+                        "Compact proposal head enabled: %s",
+                        compact_head_path,
+                    )
                 logger.info("Drafter ready; speculative decoding enabled.")
 
         self.model = model
@@ -1424,8 +1469,7 @@ class ResponseGenerator:
             )
         elif crossed_interval and not debug_enabled:
             logger.info(
-                "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs "
-                "rate=%s",
+                "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs rate=%s",
                 request_id,
                 generated_tokens,
                 elapsed,
