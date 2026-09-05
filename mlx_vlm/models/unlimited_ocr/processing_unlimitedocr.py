@@ -15,6 +15,17 @@ from ..deepseekocr.processing_deepseekocr import (
 
 
 class UnlimitedOCRProcessor(DeepseekOCRProcessor):
+    @property
+    def default_chat_template(self):
+        # Completed user tasks must not gain a suffix token. Keep the inherited
+        # separators between messages and after assistant content unchanged.
+        return (
+            "{% for message in messages %}"
+            "{{message['content']}}"
+            "{% if not loop.last or message['role'] != 'user' %} {% endif %}"
+            "{% endfor %}"
+        )
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         kwargs.pop("trust_remote_code", None)
