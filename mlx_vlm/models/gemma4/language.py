@@ -685,7 +685,7 @@ class LanguageModel(nn.Module):
         draft_kind=None,
         prefill_kwargs=None,
     ) -> bool:
-        del input_ids, inputs_embeds, prompt_cache
+        del input_ids, inputs_embeds, prompt_cache, draft_model, draft_kind
         prefill_kwargs = prefill_kwargs or {}
         if getattr(self, "no_chunked_prefill", False):
             return False
@@ -701,13 +701,6 @@ class LanguageModel(nn.Module):
             has_audio = int(mx.sum(token_types == 3).item()) > 0
             if has_visual and not has_audio:
                 return False
-
-        if draft_model is not None:
-            return (
-                draft_kind == "mtp"
-                and bool(prefill_kwargs.get("return_hidden", False))
-                and bool(prefill_kwargs.get("return_shared_kv", False))
-            )
 
         return True
 

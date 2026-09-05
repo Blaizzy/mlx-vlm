@@ -96,9 +96,18 @@ def _chunked_prefill_enabled(
     if any(getattr(candidate, "no_chunked_prefill", False) for candidate in candidates):
         return False
 
-    # Hidden-state speculative prefill is model-contract dependent. Keep unknown
-    # target models conservative unless they expose a chunked_prefill_policy.
-    return draft_model is None
+    if draft_model is None:
+        return True
+
+    # Chunked prefill re-joins the per-chunk hidden captures before handing
+    # them to the drafter, so the speculative contract is the same one an
+    # unchunked prefill already has to satisfy. Requiring the target to
+    # implement the round loops' rollback hook keeps models that cannot
+    # speculate at all from silently opting in here.
+    return any(
+        callable(getattr(candidate, "rollback_speculative_cache", None))
+        for candidate in candidates
+    )
 
 
 def maybe_quantize_kv_cache(
