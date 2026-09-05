@@ -59,6 +59,39 @@ def exact_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
     return _exact_time_batch(linear, x)
 
 
+def singleton_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
+    """Fuse a runtime-sized batch while retaining singleton qmv arithmetic."""
+    if (
+        not supports_quantization(linear)
+        or not isinstance(linear, nn.QuantizedLinear)
+        or x.ndim != 3
+        or x.shape[-1] != _input_dims(linear)
+    ):
+        return None
+
+    indices = mx.zeros((*x.shape[:2], 1), dtype=mx.int32)
+    projected = mx.expand_dims(mx.contiguous(x), (-2, -3))
+    output = (
+        mx.gather_qmm(
+            projected,
+            linear.weight[None],
+            linear.scales[None],
+            None if linear.biases is None else linear.biases[None],
+            rhs_indices=indices,
+            transpose=True,
+            group_size=linear.group_size,
+            bits=linear.bits,
+            mode=linear.mode,
+            sorted_indices=False,
+        )
+        .squeeze(-2)
+        .squeeze(-2)
+    )
+    if "bias" in linear:
+        output = output + linear["bias"]
+    return output
+
+
 def exact_quantized_switch_linear(
     linear,
     x: mx.array,
@@ -126,6 +159,34 @@ def _masked_argmax(logits: mx.array, token_mask: mx.array) -> mx.array:
     flat_logits = logits.reshape(rows, output_size)
     masked = mx.where(allowed, flat_logits, -float("inf"))
     return mx.argmax(masked, axis=-1).reshape(logits.shape[:2])
+
+
+def singleton_quantized_argmax(
+    linear,
+    x: mx.array,
+    token_mask: Optional[mx.array] = None,
+) -> Optional[mx.array]:
+    """Argmax over the batch-generic singleton-equivalent projection."""
+    logits = singleton_quantized_linear(linear, x)
+    if logits is None:
+        return None
+    if token_mask is not None:
+        return _masked_argmax(logits, token_mask)
+    return mx.argmax(logits, axis=-1)
+
+
+def _stable_nvfp4_linear(linear, x: mx.array) -> Optional[mx.array]:
+    if not isinstance(linear, nn.QuantizedLinear) or linear.mode != "nvfp4":
+        return None
+    return singleton_quantized_linear(linear, x)
+
+
+def _stable_nvfp4_argmax(
+    linear, x: mx.array, token_mask: Optional[mx.array] = None
+) -> Optional[mx.array]:
+    if not isinstance(linear, nn.QuantizedLinear) or linear.mode != "nvfp4":
+        return None
+    return singleton_quantized_argmax(linear, x, token_mask)
 
 
 def _target_verify_qlinear_header(
@@ -1013,7 +1074,8 @@ def _target_verify_fused_qmv_streamed_kernel(
     )
 
 
-def _can_optimized_affine_head(linear) -> bool:
+def supports_optimized_affine_head(linear) -> bool:
+    """Return whether the exact affine verifier kernel supports ``linear``."""
     if (
         not isinstance(linear, nn.QuantizedLinear)
         or linear.bits not in (4, 5, 8)
@@ -1030,18 +1092,14 @@ def _can_optimized_affine_head(linear) -> bool:
 
 
 def _can_optimized_affine_linear(linear, x: mx.array) -> bool:
-    """Check the singleton path whose reduction matches B=1 decode exactly.
-
-    Batched decode uses MLX's qmv-wide/qmm dispatch and has a different
-    accumulation tree.  Those inputs intentionally fall through to
-    ``exact_quantized_linear`` instead of being reinterpreted as verifier time.
-    """
+    """Check the exact affine kernel for a runtime-sized batch."""
     if (
-        not _can_optimized_affine_head(linear)
+        not supports_optimized_affine_head(linear)
         or x.ndim != 3
-        or x.shape[0] != 1
         or x.shape[1] < 1
         or x.dtype != linear.scales.dtype
+        or not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
     ):
         return False
 
@@ -1162,13 +1220,15 @@ def optimized_affine_argmax(
 
 
 def optimized_affine_linears(linears, x: mx.array):
+    bits = getattr(linears[0], "bits", None) if linears else None
     if (
         not 2 <= len(linears) <= 4
         or x.ndim != 3
         or not 1 < x.shape[1] <= 8
+        or bits not in (4, 5, 8)
         or not all(
             isinstance(linear, nn.QuantizedLinear)
-            and linear.bits == 4
+            and linear.bits == bits
             and linear.group_size == linears[0].group_size
             and linear.mode == linears[0].mode
             and "bias" not in linear
@@ -1182,13 +1242,13 @@ def optimized_affine_linears(linears, x: mx.array):
     n_sizes = tuple(int(linear.weight.shape[0]) for linear in linears)
     total_n = sum(n_sizes)
     x = mx.contiguous(x)
-    streamed = T >= 6
+    streamed = bits == 4 and T >= 6
     kernel_factory = (
         _target_verify_fused_qmv_streamed_kernel
         if streamed
         else _target_verify_fused_qmv_kernel
     )
-    kernel = kernel_factory(4, linears[0].group_size, x.dtype, T, K, n_sizes)
+    kernel = kernel_factory(bits, linears[0].group_size, x.dtype, T, K, n_sizes)
     inputs = [x]
     for linear in linears:
         inputs.extend([linear.weight, linear.scales, linear.biases])
@@ -1465,7 +1525,10 @@ class QuantizedVerifierOps:
         return mx.argmax(logits, axis=-1)
 
 
-DEFAULT_QUANTIZED_VERIFIER = QuantizedVerifierOps()
+DEFAULT_QUANTIZED_VERIFIER = QuantizedVerifierOps(
+    linear_backends=(_stable_nvfp4_linear,),
+    argmax_backends=(_stable_nvfp4_argmax,),
+)
 
 
 __all__ = [
@@ -1481,5 +1544,8 @@ __all__ = [
     "optimized_affine_linears",
     "optimized_nvfp4_argmax",
     "pad_token_mask",
+    "singleton_quantized_argmax",
+    "singleton_quantized_linear",
+    "supports_optimized_affine_head",
     "supports_quantization",
 ]

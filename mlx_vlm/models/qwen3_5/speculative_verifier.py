@@ -16,9 +16,24 @@ from ..exact_speculative_verify import (
 )
 from ..quantized_verifier import DEFAULT_QUANTIZED_VERIFIER
 from ..quantized_verifier import (
+    optimized_affine_argmax as _target_verify_optimized_affine_argmax,
+)
+from ..quantized_verifier import (
+    optimized_affine_linear as _target_verify_optimized_affine_linear,
+)
+from ..quantized_verifier import (
     optimized_affine_linears as _target_verify_quantized_linears,
 )
+from ..quantized_verifier import (
+    optimized_nvfp4_argmax as _target_verify_optimized_nvfp4_argmax,
+)
 from ..quantized_verifier import pad_token_mask as _pad_token_mask_to_head
+from ..quantized_verifier import (
+    singleton_quantized_argmax as _target_verify_singleton_quantized_argmax,
+)
+from ..quantized_verifier import (
+    singleton_quantized_linear as _target_verify_singleton_quantized_linear,
+)
 from .gated_delta import gated_delta_update_with_states
 
 
@@ -32,13 +47,22 @@ def _use_target_verify_dense(linear, x: mx.array) -> bool:
 
 
 def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
-    return DEFAULT_QUANTIZED_VERIFIER.linear(linear, x)
+    output = _target_verify_optimized_affine_linear(linear, x)
+    if output is not None:
+        return output
+    return _target_verify_singleton_quantized_linear(linear, x)
 
 
 def _target_verify_quantized_argmax(
     linear, x: mx.array, token_mask: Optional[mx.array] = None
 ) -> Optional[mx.array]:
-    return DEFAULT_QUANTIZED_VERIFIER.argmax(linear, x, token_mask=token_mask)
+    output = _target_verify_optimized_affine_argmax(linear, x, token_mask=token_mask)
+    if output is not None:
+        return output
+    output = _target_verify_optimized_nvfp4_argmax(linear, x, token_mask=token_mask)
+    if output is not None:
+        return output
+    return _target_verify_singleton_quantized_argmax(linear, x, token_mask=token_mask)
 
 
 def _can_target_verify_quantized_head(linear) -> bool:
@@ -192,7 +216,23 @@ class Qwen3_5BatchInvariantForward:
                 mask=mask,
             )
 
-        if output is None and length > 1:
+        if output is None and length == 2:
+            if isinstance(mask, str) and mask == "causal":
+                key_length = kv_sequence_length(keys)
+                prefix_length = key_length - length
+                mask = (
+                    mx.arange(key_length)[None, None, None, :]
+                    < (prefix_length + mx.arange(length) + 1)[None, None, :, None]
+                )
+            output = scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                cache=cache,
+                scale=attention.scale,
+                mask=mask,
+            )
+        elif output is None and length > 1:
             prefix_length = kv_sequence_length(keys) - length
             output = mx.concatenate(
                 [
@@ -230,7 +270,10 @@ class Qwen3_5BatchInvariantForward:
         return self._linear(attention.o_proj, output * mx.sigmoid(gate))
 
     def _switch_glu(self, switch_mlp, x, indices):
-        if x.ndim != 3 or x.shape[1] <= 1:
+        if x.ndim != 3 or not all(
+            hasattr(switch_mlp, name)
+            for name in ("up_proj", "gate_proj", "down_proj", "activation")
+        ):
             return switch_mlp(x, indices)
 
         batch, length, width = x.shape
@@ -260,14 +303,13 @@ class Qwen3_5BatchInvariantForward:
             scores = mx.take_along_axis(gates, indices, axis=-1)
             scores = scores / scores.sum(axis=-1, keepdims=True)
 
-            output = self._switch_glu(feed_forward.switch_mlp, x, indices)
-            output = (output * scores[..., None]).sum(axis=-2)
-
             shared_output = self._feed_forward(feed_forward.shared_expert, x)
             shared_output = (
                 mx.sigmoid(self._linear(feed_forward.shared_expert_gate, x))
                 * shared_output
             )
+            output = self._switch_glu(feed_forward.switch_mlp, x, indices)
+            output = (output * scores[..., None]).sum(axis=-2)
             return output + shared_output
 
         if all(

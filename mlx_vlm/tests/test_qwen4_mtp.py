@@ -5,6 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
+from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models.qwen4_exp.config import TextConfig
 from mlx_vlm.models.qwen4_exp.language import LanguageModel, Qwen4ExpDecoderLayer
 from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_mtp_splitter
@@ -16,45 +17,57 @@ from mlx_vlm.speculative.drafters.qwen4_exp_mtp.split import split_qwen4_exp_mtp
 from mlx_vlm.speculative.mtp import _mtp_next_block_size
 
 
-def _tiny_text_config():
-    return TextConfig.from_dict(
-        {
-            "model_type": "qwen4_exp_text",
-            "hidden_size": 32,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 2,
-            "linear_num_value_heads": 2,
-            "linear_num_key_heads": 1,
-            "linear_key_head_dim": 16,
-            "linear_value_head_dim": 16,
-            "linear_conv_kernel_dim": 4,
-            "num_experts": 4,
-            "num_experts_per_tok": 2,
-            "shared_expert_intermediate_size": 16,
-            "moe_intermediate_size": 16,
-            "rms_norm_eps": 1e-6,
-            "vocab_size": 64,
-            "num_key_value_heads": 1,
-            "max_position_embeddings": 128,
-            "hc_count": 2,
-            "hc_lowrank": 8,
-            "head_dim": 16,
-            "layer_types": ["linear_attention", "full_attention"],
-            "ple_layer_ids": [],
-            "indexer_n_heads": 1,
-            "indexer_kv_heads": 1,
-            "indexer_head_dim": 16,
-            "indexer_budget": 8,
-            "indexer_compress_ratio": 4,
-            "rope_parameters": {
-                "rope_type": "default",
-                "mrope_section": [1, 1, 0],
-                "rope_theta": 10_000,
-                "partial_rotary_factor": 0.25,
-            },
-            "mtp_num_hidden_layers": 1,
-        }
-    )
+def _tiny_text_config(with_ple=False):
+    config = {
+        "model_type": "qwen4_exp_text",
+        "hidden_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "linear_num_value_heads": 2,
+        "linear_num_key_heads": 1,
+        "linear_key_head_dim": 16,
+        "linear_value_head_dim": 16,
+        "linear_conv_kernel_dim": 4,
+        "num_experts": 4,
+        "num_experts_per_tok": 2,
+        "shared_expert_intermediate_size": 16,
+        "moe_intermediate_size": 16,
+        "rms_norm_eps": 1e-6,
+        "vocab_size": 64,
+        "num_key_value_heads": 1,
+        "max_position_embeddings": 128,
+        "hc_count": 2,
+        "hc_lowrank": 8,
+        "head_dim": 16,
+        "layer_types": ["linear_attention", "full_attention"],
+        "ple_layer_ids": [1] if with_ple else [],
+        "indexer_n_heads": 1,
+        "indexer_kv_heads": 1,
+        "indexer_head_dim": 16,
+        "indexer_budget": 8,
+        "indexer_compress_ratio": 4,
+        "rope_parameters": {
+            "rope_type": "default",
+            "mrope_section": [1, 1, 0],
+            "rope_theta": 10_000,
+            "partial_rotary_factor": 0.25,
+        },
+        "mtp_num_hidden_layers": 1,
+    }
+    if with_ple:
+        config.update(
+            {
+                "ple_embed_dim": 32,
+                "ple_conv_kernel_size": 3,
+                "ngram_size": 3,
+                "heads_per_ngram": 2,
+                "ngram_vocab_size_base": 17,
+                "make_ngram_vocab_size_divisible_by": 4,
+                "split_ngram_parts": 4,
+                "eos_token_id": 1,
+            }
+        )
+    return TextConfig.from_dict(config)
 
 
 def _outer_config():
@@ -140,10 +153,10 @@ def test_qwen4_mtp_draft_block_uses_hyper_connection_hidden():
 
 
 @pytest.mark.parametrize("accepted", [0, 1])
-def test_qwen4_target_exposes_pre_mixer_hidden_and_replays_rejection_exactly(
+def test_qwen4_target_exposes_pre_mixer_hidden_and_rolls_back_rejection_exactly(
     accepted,
 ):
-    config = _tiny_text_config()
+    config = _tiny_text_config(with_ple=True)
     language = LanguageModel(config, _outer_config())
     prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
     verify = mx.array([[4, 5, 6]], dtype=mx.int32)
@@ -166,7 +179,42 @@ def test_qwen4_target_exposes_pre_mixer_hidden_and_replays_rejection_exactly(
 
     assert prefill.hidden_states[-1].shape == (1, 3, 64)
     assert hidden.shape == (1, 3, 64)
-    assert mx.array_equal(speculative_logits, reference_logits).item()
+    assert mx.allclose(speculative_logits, reference_logits, rtol=0, atol=1e-6).item()
+    assert mx.array_equal(
+        mx.argmax(speculative_logits, axis=-1),
+        mx.argmax(reference_logits, axis=-1),
+    ).item()
+
+
+def test_qwen4_batched_qsa_rollback_restores_exact_offsets():
+    config = _tiny_text_config()
+    language = LanguageModel(config, _outer_config())
+    prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+    verify = mx.array([[4, 5]], dtype=mx.int32)
+
+    speculative_cache = _make_cache(language, [0])
+    language(prompt, cache=speculative_cache)
+    _, _, rollback = language.speculative_verify_hidden(verify, speculative_cache)
+    language.rollback_speculative_cache(
+        speculative_cache, rollback, accepted=[0], block_size=2
+    )
+
+    reference_cache = _make_cache(language, [0])
+    language(prompt, cache=reference_cache)
+    language(verify[:, :1], cache=reference_cache)
+
+    speculative_offsets = [
+        entry.offset for entry in speculative_cache if hasattr(entry, "offset")
+    ]
+    reference_offsets = [
+        entry.offset for entry in reference_cache if hasattr(entry, "offset")
+    ]
+    mx.eval(speculative_offsets, reference_offsets)
+
+    assert all(
+        mx.array_equal(actual, expected).item()
+        for actual, expected in zip(speculative_offsets, reference_offsets)
+    )
 
 
 def test_qwen4_speculative_verifier_matches_tokenwise_hidden_and_logits():

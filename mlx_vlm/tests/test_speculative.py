@@ -48,7 +48,7 @@ from mlx_vlm.models.quantized_verifier import (
     exact_quantized_selected_linear,
     exact_quantized_switch_linear,
 )
-from mlx_vlm.models.switch_layers import QuantizedSwitchLinear
+from mlx_vlm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
 from mlx_vlm.quantization.one_bit import OneBitLinear
 from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
 from mlx_vlm.speculative.dflash import _dflash_verify_greedy
@@ -704,11 +704,57 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_path():
     linear.biases = linear.biases.astype(mx.bfloat16)
     x = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
 
-    ref = qwen_verifier._target_verify_timewise(linear, x)
+    ref = qwen_verifier._target_verify_singletons(linear, x)
     out = qwen_verifier._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
+
+
+@pytest.mark.parametrize("bits", [4, 5, 8])
+@pytest.mark.parametrize("batch", [2, 8, 64])
+def test_qwen_batch_invariant_forward_fuses_quantized_linears(bits, batch):
+    mx.random.seed(2100 + bits + batch)
+    linears = []
+    for output_dims in (16, 24, 32):
+        dense = nn.Linear(512, output_dims, bias=False)
+        dense.set_dtype(mx.bfloat16)
+        linears.append(nn.QuantizedLinear.from_linear(dense, group_size=64, bits=bits))
+
+    forward = qwen_verifier.Qwen3_5BatchInvariantForward()
+    singleton = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
+    inputs = mx.broadcast_to(singleton, (batch, 1, 512))
+    expected = tuple(
+        mx.broadcast_to(output, (batch, *output.shape[1:]))
+        for output in forward._linears(linears, singleton)
+    )
+    actual = forward._linears(linears, inputs)
+    mx.eval(*expected, *actual)
+
+    assert all(mx.array_equal(x, y).item() for x, y in zip(actual, expected))
+
+
+@pytest.mark.parametrize("bits", [4, 5, 8])
+@pytest.mark.parametrize("batch", [4, 64])
+def test_qwen_batch_invariant_forward_quantized_moe_matches_rows(bits, batch):
+    mx.random.seed(2200 + bits + batch)
+    switch = SwitchGLU(512, 128, 4, bias=False)
+    switch.set_dtype(mx.bfloat16)
+    switch.gate_proj = switch.gate_proj.to_quantized(group_size=64, bits=bits)
+    switch.up_proj = switch.up_proj.to_quantized(group_size=64, bits=bits)
+    switch.down_proj = switch.down_proj.to_quantized(group_size=64, bits=bits)
+
+    forward = qwen_verifier.Qwen3_5BatchInvariantForward()
+    singleton = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
+    singleton_indices = mx.array([[[0, 2]]], dtype=mx.int32)
+    inputs = mx.broadcast_to(singleton, (batch, 1, 512))
+    indices = mx.broadcast_to(singleton_indices, (batch, 1, 2))
+    singleton_output = forward._switch_glu(switch, singleton, singleton_indices)
+    expected = mx.broadcast_to(singleton_output, (batch, *singleton_output.shape[1:]))
+    actual = forward._switch_glu(switch, inputs, indices)
+    mx.eval(expected, actual)
+
+    assert mx.array_equal(actual, expected).item()
 
 
 def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
@@ -745,12 +791,15 @@ def test_qwen_target_verify_4bit_linear_matches_singleton_path_exactly(
     assert bool(mx.array_equal(ref, out).item())
 
 
+@pytest.mark.parametrize("bits", [4, 5, 8])
 @pytest.mark.parametrize("output_dims", [(16, 24), (16, 24, 32), (8, 16, 24, 32)])
-@pytest.mark.parametrize("verify_length", [3, 6, 8])
-def test_qwen_target_verify_4bit_linears_fuse_exactly(output_dims, verify_length):
-    mx.random.seed(51 + len(output_dims) + verify_length)
+@pytest.mark.parametrize("verify_length", [2, 3, 6, 8])
+def test_qwen_target_verify_affine_linears_fuse_exactly(
+    bits, output_dims, verify_length
+):
+    mx.random.seed(51 + bits + len(output_dims) + verify_length)
     linears = tuple(
-        nn.QuantizedLinear(512, output_dim, bias=False, group_size=64, bits=4)
+        nn.QuantizedLinear(512, output_dim, bias=False, group_size=64, bits=bits)
         for output_dim in output_dims
     )
     for linear in linears:
@@ -4303,7 +4352,7 @@ def test_glm5_next_affine_moe_fusion_matches_batched_decode(bits, batch):
         ("nvfp4", 4, 16),
     ],
 )
-@pytest.mark.parametrize("batch", [1, 2, 4, 5, 8, 9, 16, 32, 64])
+@pytest.mark.parametrize("batch", [1, 2, 4, 5, 8, 9, 16, 32, 64, 127])
 def test_general_quantized_verifier_matches_decode(
     mode,
     bits,
@@ -4320,13 +4369,16 @@ def test_general_quantized_verifier_matches_decode(
         mode=mode,
     )
     inputs = mx.random.normal((batch, 3, 512)).astype(mx.bfloat16)
-    expected = mx.concatenate(
-        [
-            linear(mx.contiguous(inputs[:, position : position + 1]))
-            for position in range(3)
-        ],
-        axis=1,
-    )
+    if mode == "nvfp4":
+        expected = qwen_verifier._target_verify_singletons(linear, inputs)
+    else:
+        expected = mx.concatenate(
+            [
+                linear(mx.contiguous(inputs[:, position : position + 1]))
+                for position in range(3)
+            ],
+            axis=1,
+        )
 
     actual = DEFAULT_QUANTIZED_VERIFIER.linear(linear, inputs)
     tokens = DEFAULT_QUANTIZED_VERIFIER.argmax(linear, inputs)
