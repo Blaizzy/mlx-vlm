@@ -169,23 +169,105 @@ def _speculative_walk_batch(
     corresponds to one sequence in the batch.
     """
     B = int(draft_tokens.shape[0])
+    if len(budgets) != B:
+        raise ValueError(f"expected {B} token budgets, got {len(budgets)}")
+    if any(budget < 0 for budget in budgets):
+        raise ValueError("token budgets must be non-negative")
+    if B == 0:
+        return [], []
+
     n_draft = int(draft_tokens.shape[1])
-    draft_rows = draft_tokens.tolist()
-    target_rows = target_tokens.tolist()
-    accepted_list = []
-    new_tokens_list: List[List[int]] = []
-    for i in range(B):
-        accepted = n_draft
-        for j, (draft_tok, target_tok) in enumerate(
-            zip(draft_rows[i][:n_draft], target_rows[i])
-        ):
-            if draft_tok != target_tok:
-                accepted = j
-                break
-        accepted_list.append(accepted)
-        new_tokens = draft_rows[i][:accepted] + target_rows[i][accepted : accepted + 1]
-        new_tokens_list.append(new_tokens[: budgets[i]])
+    mismatches = draft_tokens != target_tokens[:, :n_draft]
+    mismatches = mx.concatenate([mismatches, mx.ones((B, 1), dtype=mx.bool_)], axis=1)
+    accepted = mx.argmax(mismatches.astype(mx.int32), axis=1)
+
+    bonus = mx.take_along_axis(target_tokens, accepted[:, None], axis=1)
+    positions = mx.arange(n_draft + 1, dtype=mx.int32)[None]
+    draft_with_pad = mx.concatenate(
+        [draft_tokens, mx.zeros((B, 1), dtype=draft_tokens.dtype)], axis=1
+    )
+    walked = mx.where(
+        positions < accepted[:, None],
+        draft_with_pad,
+        mx.where(positions == accepted[:, None], bonus, 0),
+    )
+
+    # Python owns ragged emission and cache rollback. Pack both decisions so
+    # one conversion evaluates the complete graph and crosses that boundary.
+    decision_rows = mx.concatenate(
+        [accepted[:, None].astype(walked.dtype), walked], axis=1
+    ).tolist()
+    accepted_list = [int(row[0]) for row in decision_rows]
+    new_tokens_list = [
+        row[1 : 1 + min(accepted_i + 1, budget)]
+        for row, accepted_i, budget in zip(decision_rows, accepted_list, budgets)
+    ]
     return accepted_list, new_tokens_list
+
+
+def _prepare_ragged_mtp_replay(
+    verify_hidden: mx.array,
+    draft_tokens: mx.array,
+    accepted: List[int],
+    new_tokens: List[List[int]],
+    keep_appended: List[int],
+    token_dtype: mx.Dtype,
+) -> Tuple[Optional[mx.array], Optional[mx.array], List[int], List[int]]:
+    """Pack per-row accepted drafts and verifier bonuses for one MTP replay."""
+    token_rows = []
+    hidden_rows = []
+    lengths = []
+    for row, (accepted_i, keep_i) in enumerate(zip(accepted, keep_appended)):
+        token_parts = []
+        hidden_parts = []
+        if accepted_i > keep_i:
+            token_parts.append(draft_tokens[row : row + 1, keep_i:accepted_i])
+            hidden_parts.append(verify_hidden[row : row + 1, keep_i:accepted_i, ...])
+        if new_tokens[row]:
+            token_parts.append(
+                mx.array([[int(new_tokens[row][-1])]], dtype=token_dtype)
+            )
+            hidden_parts.append(
+                verify_hidden[row : row + 1, accepted_i : accepted_i + 1, ...]
+            )
+
+        if token_parts:
+            token_row = mx.concatenate(token_parts, axis=1).astype(token_dtype)
+            hidden_row = mx.concatenate(hidden_parts, axis=1)
+        else:
+            token_row = mx.zeros((1, 0), dtype=token_dtype)
+            hidden_row = mx.zeros(
+                (1, 0, *verify_hidden.shape[2:]), dtype=verify_hidden.dtype
+            )
+        token_rows.append(token_row)
+        hidden_rows.append(hidden_row)
+        lengths.append(int(token_row.shape[1]))
+
+    max_len = max(lengths, default=0)
+    if max_len == 0:
+        return None, None, lengths, [0] * len(lengths)
+
+    right_padding = [max_len - length for length in lengths]
+    for row, pad in enumerate(right_padding):
+        if not pad:
+            continue
+        token_rows[row] = mx.concatenate(
+            [token_rows[row], mx.zeros((1, pad), dtype=token_dtype)], axis=1
+        )
+        hidden_rows[row] = mx.concatenate(
+            [
+                hidden_rows[row],
+                mx.zeros((1, pad, *verify_hidden.shape[2:]), dtype=verify_hidden.dtype),
+            ],
+            axis=1,
+        )
+
+    return (
+        mx.concatenate(token_rows, axis=0),
+        mx.concatenate(hidden_rows, axis=0),
+        lengths,
+        right_padding,
+    )
 
 
 def _speculative_walk_batch_uniform_acceptance(

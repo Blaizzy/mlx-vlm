@@ -5,6 +5,7 @@ and Qwen3.5 DFlash cache rollback coverage in one place.
 """
 
 import importlib
+import inspect
 import json
 import re
 from pathlib import Path
@@ -14,16 +15,21 @@ from unittest.mock import patch
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
+import numpy as np
 import pytest
 from mlx.utils import tree_flatten, tree_map
 
 import mlx_vlm.models.deepseek_v4.language as deepseek_language
 import mlx_vlm.models.gemma4.language as gemma4_language
+import mlx_vlm.models.glm5_next.exact_ops as glm5_next_exact_ops
+import mlx_vlm.models.glm5_next.language as glm5_next_language
 import mlx_vlm.models.laguna.language as laguna_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.models.qwen3_5.speculative_verifier as qwen_verifier
 import mlx_vlm.models.qwen3_5_moe.language as qwen_moe_language
+import mlx_vlm.speculative.cache_state as speculative_cache_state
 import mlx_vlm.speculative.mtp as mtp_utils
+from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models.base import kv_sequence_length
 from mlx_vlm.models.cache import (
     ArraysCache,
@@ -35,6 +41,14 @@ from mlx_vlm.models.cache import (
     PoolingCache,
     RotatingKVCache,
 )
+from mlx_vlm.models.gated_delta import gated_delta_update
+from mlx_vlm.models.quantized_verifier import (
+    DEFAULT_QUANTIZED_VERIFIER,
+    exact_quantized_linear,
+    exact_quantized_selected_linear,
+    exact_quantized_switch_linear,
+)
+from mlx_vlm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
 from mlx_vlm.quantization.one_bit import OneBitLinear
 from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
 from mlx_vlm.speculative.dflash import _dflash_verify_greedy
@@ -66,6 +80,9 @@ from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
 )
 from mlx_vlm.speculative.drafters.gemma4_dflash import ModelConfig as Gemma4DFlashConfig
 from mlx_vlm.speculative.drafters.glm4_moe_lite_mtp.split import split_glm4_moe_lite_mtp
+from mlx_vlm.speculative.drafters.glm5_next_mtp import Glm5NextMTPDraftModel
+from mlx_vlm.speculative.drafters.glm5_next_mtp import ModelConfig as Glm5NextMTPConfig
+from mlx_vlm.speculative.drafters.glm5_next_mtp.split import split_glm5_next_mtp
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
@@ -93,6 +110,7 @@ from mlx_vlm.speculative.utils import (
     _speculative_walk_deferred_greedy,
     speculative_prefill_kwargs,
 )
+from mlx_vlm.split_mtp import split_mtp
 from mlx_vlm.turboquant import BatchTurboQuantKVCache
 from mlx_vlm.utils import get_model_and_args
 
@@ -686,11 +704,57 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_path():
     linear.biases = linear.biases.astype(mx.bfloat16)
     x = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
 
-    ref = qwen_verifier._target_verify_timewise(linear, x)
+    ref = qwen_verifier._target_verify_singletons(linear, x)
     out = qwen_verifier._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
+
+
+@pytest.mark.parametrize("bits", [4, 5, 8])
+@pytest.mark.parametrize("batch", [2, 8, 64])
+def test_qwen_batch_invariant_forward_fuses_quantized_linears(bits, batch):
+    mx.random.seed(2100 + bits + batch)
+    linears = []
+    for output_dims in (16, 24, 32):
+        dense = nn.Linear(512, output_dims, bias=False)
+        dense.set_dtype(mx.bfloat16)
+        linears.append(nn.QuantizedLinear.from_linear(dense, group_size=64, bits=bits))
+
+    forward = qwen_verifier.Qwen3_5BatchInvariantForward()
+    singleton = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
+    inputs = mx.broadcast_to(singleton, (batch, 1, 512))
+    expected = tuple(
+        mx.broadcast_to(output, (batch, *output.shape[1:]))
+        for output in forward._linears(linears, singleton)
+    )
+    actual = forward._linears(linears, inputs)
+    mx.eval(*expected, *actual)
+
+    assert all(mx.array_equal(x, y).item() for x, y in zip(actual, expected))
+
+
+@pytest.mark.parametrize("bits", [4, 5, 8])
+@pytest.mark.parametrize("batch", [4, 64])
+def test_qwen_batch_invariant_forward_quantized_moe_matches_rows(bits, batch):
+    mx.random.seed(2200 + bits + batch)
+    switch = SwitchGLU(512, 128, 4, bias=False)
+    switch.set_dtype(mx.bfloat16)
+    switch.gate_proj = switch.gate_proj.to_quantized(group_size=64, bits=bits)
+    switch.up_proj = switch.up_proj.to_quantized(group_size=64, bits=bits)
+    switch.down_proj = switch.down_proj.to_quantized(group_size=64, bits=bits)
+
+    forward = qwen_verifier.Qwen3_5BatchInvariantForward()
+    singleton = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
+    singleton_indices = mx.array([[[0, 2]]], dtype=mx.int32)
+    inputs = mx.broadcast_to(singleton, (batch, 1, 512))
+    indices = mx.broadcast_to(singleton_indices, (batch, 1, 2))
+    singleton_output = forward._switch_glu(switch, singleton, singleton_indices)
+    expected = mx.broadcast_to(singleton_output, (batch, *singleton_output.shape[1:]))
+    actual = forward._switch_glu(switch, inputs, indices)
+    mx.eval(expected, actual)
+
+    assert mx.array_equal(actual, expected).item()
 
 
 def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
@@ -727,12 +791,15 @@ def test_qwen_target_verify_4bit_linear_matches_singleton_path_exactly(
     assert bool(mx.array_equal(ref, out).item())
 
 
+@pytest.mark.parametrize("bits", [4, 5, 8])
 @pytest.mark.parametrize("output_dims", [(16, 24), (16, 24, 32), (8, 16, 24, 32)])
-@pytest.mark.parametrize("verify_length", [3, 6, 8])
-def test_qwen_target_verify_4bit_linears_fuse_exactly(output_dims, verify_length):
-    mx.random.seed(51 + len(output_dims) + verify_length)
+@pytest.mark.parametrize("verify_length", [2, 3, 6, 8])
+def test_qwen_target_verify_affine_linears_fuse_exactly(
+    bits, output_dims, verify_length
+):
+    mx.random.seed(51 + bits + len(output_dims) + verify_length)
     linears = tuple(
-        nn.QuantizedLinear(512, output_dim, bias=False, group_size=64, bits=4)
+        nn.QuantizedLinear(512, output_dim, bias=False, group_size=64, bits=bits)
         for output_dim in output_dims
     )
     for linear in linears:
@@ -1384,6 +1451,119 @@ def test_speculative_walk_batch_matches_per_row_acceptance():
     assert new_tokens == [[11, 90], [21, 22]]
 
 
+def test_speculative_walk_batch_handles_acceptance_and_budget_boundaries():
+    accepted, new_tokens = _speculative_walk_batch(
+        mx.array(
+            [
+                [11, 12, 13],
+                [0, 22, 23],
+                [31, 32, 33],
+                [41, 42, 43],
+            ],
+            dtype=mx.int32,
+        ),
+        mx.array(
+            [
+                [99, 12, 13, 14],
+                [0, 98, 23, 24],
+                [31, 32, 33, 34],
+                [41, 42, 97, 44],
+            ],
+            dtype=mx.int32,
+        ),
+        budgets=[1, 2, 8, 0],
+    )
+
+    assert accepted == [0, 1, 3, 2]
+    assert new_tokens == [[99], [0, 98], [31, 32, 33, 34], []]
+
+
+def test_speculative_walk_batch_handles_empty_draft_block():
+    accepted, new_tokens = _speculative_walk_batch(
+        mx.zeros((2, 0), dtype=mx.int32),
+        mx.array([[0], [13]], dtype=mx.int32),
+        budgets=[1, 0],
+    )
+
+    assert accepted == [0, 0]
+    assert new_tokens == [[0], []]
+
+
+def test_speculative_walk_batch_handles_empty_active_batch():
+    accepted, new_tokens = _speculative_walk_batch(
+        mx.zeros((0, 2), dtype=mx.int32),
+        mx.zeros((0, 3), dtype=mx.int32),
+        budgets=[],
+    )
+
+    assert accepted == []
+    assert new_tokens == []
+
+
+@pytest.mark.parametrize("dtype", (mx.int32, mx.int64, mx.uint32))
+def test_speculative_walk_batch_preserves_integer_token_dtype(dtype):
+    accepted, new_tokens = _speculative_walk_batch(
+        mx.array([[0, 12]], dtype=dtype),
+        mx.array([[0, 99, 42]], dtype=dtype),
+        budgets=[3],
+    )
+
+    assert accepted == [1]
+    assert new_tokens == [[0, 99]]
+
+
+@pytest.mark.parametrize("budgets", ([1], [1, 1, 1], [1, -1]))
+def test_speculative_walk_batch_rejects_invalid_budgets(budgets):
+    drafts = mx.array([[1], [2]], dtype=mx.int32)
+    targets = mx.array([[1, 3], [2, 4]], dtype=mx.int32)
+
+    with pytest.raises(ValueError):
+        _speculative_walk_batch(drafts, targets, budgets)
+
+
+def test_speculative_walk_batch_async_stress_matches_python_reference():
+    rng = np.random.default_rng(20260904)
+    stream = mx.new_stream(mx.default_device())
+
+    for iteration in range(100):
+        batch = iteration % 4 + 1
+        draft_count = iteration % 7
+        drafts_np = rng.integers(0, 64, size=(batch, draft_count), dtype=np.int32)
+        targets_np = rng.integers(
+            0,
+            64,
+            size=(batch, draft_count + 1),
+            dtype=np.int32,
+        )
+        accepted_expected = []
+        tokens_expected = []
+        budgets = []
+        for row in range(batch):
+            accepted = (iteration + row) % (draft_count + 1)
+            targets_np[row, :accepted] = drafts_np[row, :accepted]
+            if accepted < draft_count:
+                targets_np[row, accepted] = (drafts_np[row, accepted] + 1) % 64
+            budget = (2 * iteration + row) % (draft_count + 2)
+            accepted_expected.append(accepted)
+            budgets.append(budget)
+            walked = drafts_np[row, :accepted].tolist()
+            walked.append(int(targets_np[row, accepted]))
+            tokens_expected.append(walked[:budget])
+
+        with mx.stream(stream):
+            drafts = mx.array(drafts_np) + mx.array(0, dtype=mx.int32)
+            targets = mx.array(targets_np) + mx.array(0, dtype=mx.int32)
+            mx.async_eval(drafts, targets)
+            accepted_actual, tokens_actual = _speculative_walk_batch(
+                drafts,
+                targets,
+                budgets,
+            )
+
+        assert accepted_actual == accepted_expected
+        assert tokens_actual == tokens_expected
+
+
 def test_mtp_drafter_masks_support_batched_offsets():
     kv = (mx.zeros((2, 1, 8, 4)), mx.zeros((2, 1, 8, 4)))
 
@@ -1835,6 +2015,7 @@ def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):
             sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
             token_dtype=mx.int32,
             greedy_sampling=False,
+            prompt_tokens=mx.array([[7, 8]], dtype=mx.int32),
             row_ids=[0],
         )
     )
@@ -1842,6 +2023,7 @@ def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):
     assert result == [([3], None)]
     assert calls
     assert calls[0][2]["first_bonus"].tolist() == [2]
+    assert calls[0][2]["prompt_tokens"].tolist() == [[7, 8]]
     assert calls[0][2]["row_ids"] == [0]
 
 
@@ -3828,9 +4010,9 @@ def test_deepseek_v4_replay_snapshot_required_only_when_pooling_can_cross_window
     pool = PoolingCache(4)
     pool.accumulate_windows(mx.array([[[10.0]]]), mx.ones((1, 1, 1)), offset=0)
 
-    assert not deepseek_language._needs_replay_snapshot_for_cache([pool], 2)
-    assert deepseek_language._needs_replay_snapshot_for_cache([pool], 3)
-    assert not deepseek_language._needs_replay_snapshot_for_cache(
+    assert not speculative_cache_state.needs_replay_snapshot_for_cache([pool], 2)
+    assert speculative_cache_state.needs_replay_snapshot_for_cache([pool], 3)
+    assert not speculative_cache_state.needs_replay_snapshot_for_cache(
         [RotatingKVCache(max_size=8)], 3
     )
 
@@ -3841,7 +4023,7 @@ def test_deepseek_v4_pooling_snapshot_skips_clone_when_verify_does_not_overwrite
     old_gate = mx.array([[[1.0]]])
     pool.accumulate_windows(old_kv, old_gate, offset=0)
 
-    snapshot = deepseek_language._snapshot_cache_state([pool], incoming_tokens=3)
+    snapshot = speculative_cache_state.snapshot_cache_state([pool], incoming_tokens=3)
     assert snapshot[0][2] is None
 
     new_kv = mx.array([[[20.0], [21.0], [22.0]]])
@@ -3849,7 +4031,7 @@ def test_deepseek_v4_pooling_snapshot_skips_clone_when_verify_does_not_overwrite
     pooled, _, _ = pool.accumulate_windows(new_kv, new_gate, offset=1)
     pool.update_and_fetch(pooled)
 
-    deepseek_language._restore_cache_state([pool], snapshot)
+    speculative_cache_state.restore_cache_state([pool], snapshot)
 
     assert pool.remainder == 1
     assert pool.pooled is None
@@ -3862,7 +4044,7 @@ def test_deepseek_v4_pooling_snapshot_restores_only_overwritten_prefix():
     old_gate = mx.ones_like(old_kv)
     pool.accumulate_windows(old_kv, old_gate, offset=0)
 
-    snapshot = deepseek_language._snapshot_cache_state([pool], incoming_tokens=3)
+    snapshot = speculative_cache_state.snapshot_cache_state([pool], incoming_tokens=3)
     assert snapshot[0][2].shape == (1, 2, 1)
 
     new_kv = mx.array([[[20.0], [21.0], [22.0]]])
@@ -3870,7 +4052,7 @@ def test_deepseek_v4_pooling_snapshot_restores_only_overwritten_prefix():
     pooled, _, _ = pool.accumulate_windows(new_kv, new_gate, offset=3)
     pool.update_and_fetch(pooled)
 
-    deepseek_language._restore_cache_state([pool], snapshot)
+    speculative_cache_state.restore_cache_state([pool], snapshot)
 
     assert pool.remainder == 3
     assert pool.pooled is None
@@ -3920,6 +4102,736 @@ def test_deepseek_v4_mtp_draft_block_smoke():
     )
     mx.eval(tokens)
     assert tokens.shape == (1, 2)
+
+
+def _tiny_glm5_next_text_config():
+    from mlx_vlm.models.glm5_next.config import TextConfig
+
+    return TextConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        moe_intermediate_size=8,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        n_shared_experts=1,
+        n_routed_experts=2,
+        num_experts_per_tok=1,
+        kv_lora_rank=4,
+        q_lora_rank=8,
+        qk_nope_head_dim=4,
+        v_head_dim=4,
+        mlp_layer_types=["dense", "sparse"],
+        layer_types=["linear_attention", "deepseek_sparse_attention"],
+        indexer_types=["full", "full"],
+        index_topk=4,
+        index_kpool=2,
+        index_head_dim=4,
+        index_n_heads=2,
+        linear_attn_config={
+            "num_heads": 2,
+            "head_dim": 4,
+            "short_conv_kernel_size": 2,
+            "gate_lower_bound": -5.0,
+        },
+        hc_mult=2,
+        max_position_embeddings=64,
+    )
+
+
+def test_glm5_next_mtp_draft_block_smoke():
+    text_config = _tiny_glm5_next_text_config()
+    drafter = Glm5NextMTPDraftModel(
+        Glm5NextMTPConfig(text_config=text_config, block_size=2)
+    )
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
+        )
+    )
+    drafter.reset(target)
+    drafter.set_shared_kv({}, kv_offset=4, position=4, kv_valid_len=4)
+    tokens = drafter.draft_block(
+        7,
+        mx.zeros((1, 1, 16)),
+        None,
+        2,
+        lambda logits: mx.argmax(logits, axis=-1),
+        mx.int32,
+        greedy=True,
+    )
+    mx.eval(tokens)
+    assert tokens.shape == (1, 1)
+    assert drafter.config.runtime_block_size == 2
+    assert not drafter.prefer_requested_block_size
+
+
+def test_glm5_next_mtp_owns_left_padded_prefill(monkeypatch):
+    text_config = _tiny_glm5_next_text_config()
+    drafter = Glm5NextMTPDraftModel(
+        Glm5NextMTPConfig(text_config=text_config, block_size=2)
+    )
+    captured = {}
+
+    def forward_tokens(self, tokens, hidden, token_dtype):
+        del token_dtype
+        captured["start"] = self._next_position
+        self._next_position = self._next_position + tokens.shape[1]
+        return hidden, hidden
+
+    monkeypatch.setattr(Glm5NextMTPDraftModel, "_forward_tokens", forward_tokens)
+    monkeypatch.setattr(
+        Glm5NextMTPDraftModel,
+        "_set_seed_from_hidden",
+        lambda self, hidden, sampler, greedy: None,
+    )
+    drafter.prefill_from_target_hidden(
+        mx.array([[0, 0, 1, 2], [1, 2, 3, 4]], dtype=mx.int32),
+        mx.zeros((2, 4, text_config.hidden_size)),
+        mx.array([3, 5], dtype=mx.int32),
+        lambda logits: mx.argmax(logits, axis=-1),
+        left_padding=[2, 0],
+    )
+    mx.eval(captured["start"], drafter._next_position)
+
+    assert (
+        "left_padding"
+        not in inspect.signature(
+            DeepseekV4MTPDraftModel.prefill_from_target_hidden
+        ).parameters
+    )
+    assert captured["start"].tolist() == [-2, 0]
+    assert drafter._next_position.tolist() == [2, 4]
+
+
+def test_glm5_next_mtp_last_only_commit_preserves_cache_and_final_output():
+    text_config = _tiny_glm5_next_text_config()
+    drafter = Glm5NextMTPDraftModel(
+        Glm5NextMTPConfig(text_config=text_config, block_size=2)
+    )
+    drafter.apply(
+        lambda value: (
+            value.astype(mx.bfloat16)
+            if isinstance(value, mx.array) and value.dtype == mx.float32
+            else value
+        )
+    )
+
+    full_cache = drafter.make_cache()[0]
+    last_cache = drafter.make_cache()[0]
+    inputs = mx.arange(2 * text_config.hidden_size, dtype=mx.bfloat16).reshape(
+        1, 2, text_config.hidden_size
+    )
+
+    full_output = drafter.mtp_block(inputs, cache=full_cache)
+    last_output = drafter.mtp_block(inputs, cache=last_cache, last_only=True)
+    mx.eval(full_output, last_output, full_cache.state, last_cache.state)
+
+    assert full_output.shape == (1, 2, text_config.hidden_size)
+    assert last_output.shape == (1, 1, text_config.hidden_size)
+    assert mx.array_equal(full_output[:, -1:], last_output).item()
+
+    for full_subcache, last_subcache in zip(
+        full_cache.caches, last_cache.caches, strict=True
+    ):
+        assert full_subcache.meta_state == last_subcache.meta_state
+        for (_, full_value), (_, last_value) in zip(
+            tree_flatten(full_subcache.state),
+            tree_flatten(last_subcache.state),
+            strict=True,
+        ):
+            if full_value is None or last_value is None:
+                assert full_value is last_value
+            else:
+                assert mx.array_equal(full_value, last_value).item()
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4, 5, 8, 9, 16, 32, 64])
+@pytest.mark.parametrize("length", [2, 4, 6])
+def test_glm5_next_dense_verifier_matches_batched_decode(batch, length):
+    mx.random.seed(90 + batch)
+    linear = nn.Linear(512, 32, bias=False)
+    linear.weight = linear.weight.astype(mx.bfloat16)
+    inputs = mx.random.normal((batch, length, 512)).astype(mx.bfloat16)
+    expected = mx.concatenate(
+        [
+            linear(mx.contiguous(inputs[:, position : position + 1]))
+            for position in range(inputs.shape[1])
+        ],
+        axis=1,
+    )
+
+    actual = glm5_next_exact_ops.exact_dense_block_linear(linear, inputs)
+    mx.eval(expected, actual)
+
+    assert actual is not None
+    assert mx.array_equal(actual, expected).item()
+
+
+def _bf16_quantization_parameters(linear):
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    if linear.biases is not None:
+        linear.biases = linear.biases.astype(mx.bfloat16)
+    return linear
+
+
+@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 32, 64])
+def test_glm5_next_affine_gate_up_fusion_matches_batched_decode(bits, batch):
+    mx.random.seed(400 + bits + batch)
+    switch = SimpleNamespace(
+        up_proj=_bf16_quantization_parameters(
+            QuantizedSwitchLinear(512, 16, 4, False, 64, bits)
+        ),
+        gate_proj=_bf16_quantization_parameters(
+            QuantizedSwitchLinear(512, 16, 4, False, 64, bits)
+        ),
+    )
+    inputs = mx.random.normal((batch, 2, 512)).astype(mx.bfloat16)
+    indices = mx.arange(batch * 4, dtype=mx.int32).reshape(batch, 2, 2) % 4
+    expected_up = exact_quantized_switch_linear(switch.up_proj, inputs, indices)
+    expected_gate = exact_quantized_switch_linear(switch.gate_proj, inputs, indices)
+
+    actual = glm5_next_exact_ops.exact_affine_switch_gate_up(switch, inputs, indices)
+    mx.eval(expected_up, expected_gate, *actual)
+
+    assert actual is not None
+    assert mx.array_equal(actual[0], expected_up).item()
+    assert mx.array_equal(actual[1], expected_gate).item()
+
+
+@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 32, 64])
+def test_glm5_next_affine_moe_fusion_matches_batched_decode(bits, batch):
+    mx.random.seed(500 + bits + batch)
+    routed_linear = _bf16_quantization_parameters(
+        QuantizedSwitchLinear(512, 16, 4, False, 64, bits)
+    )
+    dense = nn.Linear(512, 16, bias=False)
+    dense.weight = dense.weight.astype(mx.bfloat16)
+    shared_linear = _bf16_quantization_parameters(
+        nn.QuantizedLinear.from_linear(
+            dense,
+            group_size=64,
+            bits=bits,
+            mode="affine",
+        )
+    )
+    routed_inputs = mx.random.normal((batch, 2, 2, 512)).astype(mx.bfloat16)
+    shared_inputs = mx.random.normal((batch, 2, 512)).astype(mx.bfloat16)
+    indices = mx.arange(batch * 4, dtype=mx.int32).reshape(batch, 2, 2) % 4
+    weights = mx.softmax(mx.random.normal((batch, 2, 2)), axis=-1)
+    routed = exact_quantized_selected_linear(
+        routed_linear,
+        routed_inputs,
+        indices,
+    )
+    shared = exact_quantized_linear(shared_linear, shared_inputs)
+    expected = glm5_next_exact_ops.combine_moe_outputs(routed, weights, shared)
+
+    actual = glm5_next_exact_ops.exact_affine_moe_down(
+        routed_linear,
+        routed_inputs,
+        indices,
+        weights,
+        shared,
+    )
+    mx.eval(expected, actual)
+
+    assert actual is not None
+    assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.parametrize(
+    ("mode", "bits", "group_size"),
+    [
+        *[("affine", bits, 64) for bits in (2, 3, 4, 5, 6, 8)],
+        ("mxfp4", 4, 32),
+        ("mxfp8", 8, 32),
+        ("nvfp4", 4, 16),
+    ],
+)
+@pytest.mark.parametrize("batch", [1, 2, 4, 5, 8, 9, 16, 32, 64, 127])
+def test_general_quantized_verifier_matches_decode(
+    mode,
+    bits,
+    group_size,
+    batch,
+):
+    mx.random.seed(100 + bits + batch)
+    dense = nn.Linear(512, 16, bias=False)
+    dense.weight = dense.weight.astype(mx.bfloat16)
+    linear = nn.QuantizedLinear.from_linear(
+        dense,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+    inputs = mx.random.normal((batch, 3, 512)).astype(mx.bfloat16)
+    if mode == "nvfp4":
+        expected = qwen_verifier._target_verify_singletons(linear, inputs)
+    else:
+        expected = mx.concatenate(
+            [
+                linear(mx.contiguous(inputs[:, position : position + 1]))
+                for position in range(3)
+            ],
+            axis=1,
+        )
+
+    actual = DEFAULT_QUANTIZED_VERIFIER.linear(linear, inputs)
+    tokens = DEFAULT_QUANTIZED_VERIFIER.argmax(linear, inputs)
+    mx.eval(expected, actual, tokens)
+
+    assert actual is not None
+    assert mx.array_equal(actual, expected).item()
+    assert mx.array_equal(tokens, mx.argmax(expected, axis=-1)).item()
+
+
+@pytest.mark.parametrize("input_dims", [64, 128])
+@pytest.mark.parametrize("bits", [2, 4, 8])
+def test_general_quantized_verifier_matches_narrow_qmv_quad(input_dims, bits):
+    mx.random.seed(700 + input_dims + bits)
+    dense = nn.Linear(input_dims, 8192, bias=False)
+    dense.weight = dense.weight.astype(mx.bfloat16)
+    linear = nn.QuantizedLinear.from_linear(
+        dense,
+        group_size=64,
+        bits=bits,
+        mode="affine",
+    )
+    inputs = mx.random.normal((8, 2, input_dims)).astype(mx.bfloat16)
+    expected = mx.concatenate(
+        [
+            linear(mx.contiguous(inputs[:, position : position + 1]))
+            for position in range(2)
+        ],
+        axis=1,
+    )
+
+    actual = DEFAULT_QUANTIZED_VERIFIER.linear(linear, inputs)
+    mx.eval(expected, actual)
+
+    assert actual is not None
+    assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.parametrize("batch", [1, 2, 5, 8, 9, 16, 32, 64])
+@pytest.mark.parametrize(
+    ("mode", "bits", "group_size"),
+    [
+        *[("affine", bits, 64) for bits in (2, 3, 4, 5, 6, 8)],
+        ("mxfp4", 4, 32),
+        ("mxfp8", 8, 32),
+        ("nvfp4", 4, 16),
+    ],
+)
+def test_general_quantized_switch_verifier_matches_decode(
+    mode, bits, group_size, batch
+):
+    mx.random.seed(200 + bits)
+    linear = QuantizedSwitchLinear(
+        512,
+        16,
+        4,
+        bias=False,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+    inputs = mx.random.normal((batch, 3, 512)).astype(mx.bfloat16)
+    indices = mx.arange(batch * 3 * 2, dtype=mx.int32).reshape(batch, 3, 2) % 4
+    expected = []
+    for position in range(inputs.shape[1]):
+        hidden = mx.expand_dims(mx.contiguous(inputs[:, position]), (-2, -3))
+        projected = linear(hidden, indices[:, position], sorted_indices=False)
+        expected.append(projected.squeeze(-2)[:, None])
+    expected = mx.concatenate(expected, axis=1)
+
+    actual = exact_quantized_switch_linear(linear, inputs, indices)
+    mx.eval(expected, actual)
+
+    assert actual is not None
+    assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.parametrize("batch", [1, 2, 5, 8, 9, 16, 32, 64])
+@pytest.mark.parametrize(
+    ("mode", "bits", "group_size"),
+    [
+        *[("affine", bits, 64) for bits in (2, 3, 4, 5, 6, 8)],
+        ("mxfp4", 4, 32),
+        ("mxfp8", 8, 32),
+        ("nvfp4", 4, 16),
+    ],
+)
+def test_general_quantized_selected_verifier_matches_decode(
+    mode,
+    bits,
+    group_size,
+    batch,
+):
+    mx.random.seed(300 + bits)
+    linear = QuantizedSwitchLinear(
+        512,
+        16,
+        4,
+        bias=False,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+    inputs = mx.random.normal((batch, 3, 2, 512)).astype(mx.bfloat16)
+    indices = mx.arange(batch * 3 * 2, dtype=mx.int32).reshape(batch, 3, 2) % 4
+    expected = []
+    for position in range(inputs.shape[1]):
+        hidden = mx.expand_dims(mx.contiguous(inputs[:, position]), -2)
+        projected = linear(hidden, indices[:, position], sorted_indices=False)
+        expected.append(projected.squeeze(-2)[:, None])
+    expected = mx.concatenate(expected, axis=1)
+
+    actual = exact_quantized_selected_linear(linear, inputs, indices)
+    mx.eval(expected, actual)
+
+    assert actual is not None
+    assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.parametrize(
+    ("mode", "bits", "group_size"),
+    [
+        *[("affine", bits, 64) for bits in (2, 3, 4, 5, 6, 8)],
+        ("mxfp4", 4, 32),
+        ("mxfp8", 8, 32),
+        ("nvfp4", 4, 16),
+    ],
+)
+def test_general_quantized_argmax_supports_packed_mask(mode, bits, group_size):
+    mx.random.seed(400 + bits)
+    dense = nn.Linear(512, 16, bias=False)
+    dense.weight = dense.weight.astype(mx.bfloat16)
+    linear = nn.QuantizedLinear.from_linear(
+        dense,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+    )
+    inputs = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
+    allowed = mx.array([[1, 3, 5], [7, 9, 11]], dtype=mx.int32)
+    token_mask = (mx.array(1, dtype=mx.int32) << allowed).reshape(-1, 1)
+
+    actual = DEFAULT_QUANTIZED_VERIFIER.argmax(
+        linear,
+        inputs,
+        token_mask=token_mask,
+    )
+    mx.eval(actual)
+
+    assert actual is not None
+    assert mx.array_equal(actual, allowed).item()
+
+
+def test_glm5_next_mtp_sampler_state_tolerates_uninitialized_kv_cache():
+    text_config = _tiny_glm5_next_text_config()
+    drafter = Glm5NextMTPDraftModel(
+        Glm5NextMTPConfig(text_config=text_config, block_size=2)
+    )
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
+        )
+    )
+    drafter.reset(target)
+
+    sampler_rng = _SpeculativeSamplerRNG(drafter, enabled=False)
+    assert sampler_rng.draft_call(lambda: None) is None
+
+
+def test_glm5_next_mtp_batch_acceptance_keeps_ragged_rows_aligned():
+    text_config = _tiny_glm5_next_text_config()
+    drafter = Glm5NextMTPDraftModel(
+        Glm5NextMTPConfig(text_config=text_config, block_size=2)
+    )
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
+        )
+    )
+    drafter.reset(target, left_padding=[0, 0])
+    drafter.set_shared_kv(
+        {},
+        kv_offset=4,
+        position=mx.array([4, 4], dtype=mx.int32),
+        kv_valid_len=mx.array([4, 4], dtype=mx.int32),
+    )
+    hidden = mx.zeros((2, 1, 16))
+    draft_tokens = drafter.draft_block(
+        mx.array([7, 8], dtype=mx.int32),
+        hidden,
+        None,
+        2,
+        lambda logits: mx.argmax(logits, axis=-1),
+        mx.int32,
+        greedy=True,
+    )
+    drafter.accept_verified_tokens_batch(
+        mx.zeros((2, 2, 16)),
+        draft_tokens,
+        accepted=[1, 0],
+        new_tokens=[[int(draft_tokens[0, 0].item()), 3], [4]],
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        token_dtype=mx.int32,
+        greedy=True,
+    )
+    mx.eval(drafter._seed_token, drafter._seed_hidden)
+
+    assert drafter._seed_token.shape == (2, 1)
+    assert drafter._seed_hidden.shape == (2, 1, 16)
+    assert drafter._next_position.tolist() == [6, 5]
+    assert drafter._cache[0][0].offset.tolist() == [2, 1]
+    assert drafter._cache[0][0].left_padding.tolist() == [0, 1]
+    assert drafter._cache[0][2]._pool_lengths == [1, 0]
+    assert drafter._cache[0][2].remainder == [0, 1]
+    assert not drafter.requires_uniform_batch_acceptance
+    assert drafter.supports_ragged_batch_acceptance
+
+
+def test_glm5_next_target_rollback_restores_ragged_rows_without_model_replay():
+    text_config = _tiny_glm5_next_text_config()
+    language = glm5_next_language.LanguageModel(text_config)
+    language.eval()
+    cache = _make_cache(language, left_padding=[0, 0])
+
+    language(mx.array([[1, 2], [3, 4]], dtype=mx.int32), cache=cache)
+    _, _, rollback_state = language.speculative_verify_hidden(
+        mx.array([[5, 6], [7, 8]], dtype=mx.int32), cache
+    )
+    linear_update = rollback_state[1][0]
+    assert linear_update[12].shape[1] == 1
+    assert linear_update[13].shape[1] == 1
+    with (
+        patch.object(
+            glm5_next_language.LanguageModel,
+            "__call__",
+            side_effect=AssertionError("rollback must not replay the target model"),
+        ),
+        patch(
+            "mlx_vlm.models.glm5_next.speculative_verifier.gated_delta_update",
+            side_effect=AssertionError("rollback must select captured GDN states"),
+        ),
+    ):
+        language.rollback_speculative_cache(
+            cache, rollback_state, accepted=[1, 0], block_size=2
+        )
+
+    sparse_cache = cache[1]
+    mx.eval(sparse_cache[0].offset, sparse_cache[0].left_padding)
+    assert sparse_cache[0].offset.tolist() == [4, 3]
+    assert sparse_cache[0].left_padding.tolist() == [0, 1]
+    assert sparse_cache[2]._pool_lengths == [2, 1]
+    assert sparse_cache[2].remainder == [0, 1]
+
+
+@pytest.mark.parametrize("batch", [1, 8])
+def test_glm5_next_gated_delta_captured_states_match_stepwise(batch):
+    mx.random.seed(800 + batch)
+    length, heads, width, value_width = 3, 2, 64, 8
+    q = mx.random.normal((batch, length, heads, width)).astype(mx.bfloat16)
+    k = mx.random.normal((batch, length, heads, width)).astype(mx.bfloat16)
+    v = mx.random.normal((batch, length, heads, value_width)).astype(mx.bfloat16)
+    a = mx.random.normal((batch, length, heads, width)).astype(mx.bfloat16)
+    b = mx.random.normal((batch, length, heads)).astype(mx.bfloat16)
+    A_log = mx.random.normal((heads, 1)).astype(mx.float32)
+    dt_bias = mx.random.normal((heads, width)).astype(mx.float32)
+    initial = mx.zeros((batch, heads, value_width, width), dtype=mx.float32)
+
+    outputs = []
+    states = []
+    state = initial
+    for position in range(length):
+        output, state = gated_delta_update(
+            q[:, position : position + 1],
+            k[:, position : position + 1],
+            v[:, position : position + 1],
+            a[:, position : position + 1],
+            b[:, position : position + 1],
+            A_log,
+            dt_bias,
+            state=state,
+            lower_bound=-5.0,
+        )
+        outputs.append(output)
+        states.append(state)
+
+    expected_output = mx.concatenate(outputs, axis=1)
+    expected_states = mx.stack(states[:-1], axis=1)
+    output, final_state, captured_states = gated_delta_update(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state=initial,
+        lower_bound=-5.0,
+        state_steps=length - 1,
+    )
+    mx.eval(
+        expected_output,
+        state,
+        expected_states,
+        output,
+        final_state,
+        captured_states,
+    )
+
+    assert mx.array_equal(output, expected_output).item()
+    assert mx.array_equal(final_state, state).item()
+    assert mx.array_equal(captured_states, expected_states).item()
+
+
+def test_glm5_next_mtp_sanitize_fuses_native_layer_weights():
+    config = _tiny_glm5_next_text_config()
+    context = SimpleNamespace(args=config)
+    weights = {
+        "mtp_block.mlp.shared_experts.gate_proj.weight": mx.zeros((8, 16)),
+        "mtp_block.mlp.shared_experts.up_proj.weight": mx.zeros((8, 16)),
+        "mtp_block.self_attn.q_a_proj.weight": mx.zeros((8, 16)),
+        "mtp_block.self_attn.kv_a_proj_with_mqa.weight": mx.zeros((4, 16)),
+        "mtp_block.self_attn.kv_b_proj.weight": mx.zeros((16, 4)),
+    }
+    for expert in range(config.n_routed_experts):
+        weights[f"mtp_block.mlp.experts.{expert}.gate_proj.weight"] = mx.zeros((8, 16))
+        weights[f"mtp_block.mlp.experts.{expert}.up_proj.weight"] = mx.zeros((8, 16))
+        weights[f"mtp_block.mlp.experts.{expert}.down_proj.weight"] = mx.zeros((16, 8))
+
+    out = Glm5NextMTPDraftModel.sanitize(context, weights)
+
+    assert out["mtp_block.mlp.shared_experts.gate_up_proj.weight"].shape == (
+        16,
+        16,
+    )
+    assert out["mtp_block.mlp.switch_mlp.gate_proj.weight"].shape == (2, 8, 16)
+    assert out["mtp_block.self_attn.qkv_a_proj.weight"].shape == (12, 16)
+    assert out["mtp_block.self_attn.embed_q.weight"].shape == (2, 4, 4)
+    assert out["mtp_block.self_attn.unembed_out.weight"].shape == (2, 4, 4)
+
+
+def test_split_glm5_next_mtp_extracts_layer_after_target_stack(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    text_config = _tiny_glm5_next_text_config()
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "glm5_next",
+                "text_config": text_config.to_dict(),
+            }
+        )
+    )
+    prefix = f"model.language_model.layers.{text_config.num_hidden_layers}"
+    mx.save_safetensors(
+        str(source / "model.safetensors"),
+        {
+            f"{prefix}.enorm.weight": mx.ones((16,)),
+            f"{prefix}.hnorm.weight": mx.ones((16,)),
+            f"{prefix}.eh_proj.weight": mx.ones((16, 32)),
+            f"{prefix}.shared_head.norm.weight": mx.ones((16,)),
+        },
+    )
+
+    split_glm5_next_mtp(str(source), str(output))
+
+    config = json.loads((output / "config.json").read_text())
+    weights = mx.load(str(output / "model.safetensors"))
+    assert config["model_type"] == "glm5_next_mtp"
+    assert config["block_size"] == 2
+    assert set(weights) == {
+        "eh_proj.weight",
+        "enorm.weight",
+        "hnorm.weight",
+        "shared_head_norm.weight",
+    }
+
+
+def test_split_glm5_next_mtp_honors_requested_quantization_for_fp8(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    text_config = _tiny_glm5_next_text_config()
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "glm5_next",
+                "text_config": text_config.to_dict(),
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "fmt": "e4m3",
+                    "weight_block_size": [128, 128],
+                },
+            }
+        )
+    )
+    prefix = f"model.language_model.layers.{text_config.num_hidden_layers}"
+    mx.save_safetensors(
+        str(source / "model.safetensors"),
+        {
+            f"{prefix}.eh_proj.weight": mx.to_fp8(
+                mx.ones((128, 128), dtype=mx.bfloat16)
+            ),
+            f"{prefix}.eh_proj.weight_scale_inv": mx.full(
+                (1, 1), 0.125, dtype=mx.bfloat16
+            ),
+        },
+    )
+
+    split_mtp(str(source), str(output), q_bits=4, q_group_size=64)
+
+    config = json.loads((output / "config.json").read_text())
+    weights = mx.load(str(output / "model.safetensors"))
+    expected = {"group_size": 64, "bits": 4, "mode": "affine"}
+    assert config["quantization"] == expected
+    assert config["quantization_config"] == expected
+    assert weights["eh_proj.weight"].dtype == mx.uint32
+    assert weights["eh_proj.scales"].dtype == mx.bfloat16
+    assert weights["eh_proj.biases"].dtype == mx.bfloat16
+    assert not any(key.endswith("weight_scale_inv") for key in weights)
+
+
+def test_split_glm5_next_mtp_supports_independent_mxfp8_quantization(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    text_config = _tiny_glm5_next_text_config()
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "glm5_next",
+                "text_config": text_config.to_dict(),
+            }
+        )
+    )
+    prefix = f"model.language_model.layers.{text_config.num_hidden_layers}"
+    mx.save_safetensors(
+        str(source / "model.safetensors"),
+        {
+            f"{prefix}.eh_proj.weight": mx.ones((128, 128), dtype=mx.bfloat16),
+        },
+    )
+
+    split_mtp(str(source), str(output), q_mode="mxfp8")
+
+    config = json.loads((output / "config.json").read_text())
+    weights = mx.load(str(output / "model.safetensors"))
+    expected = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    assert config["quantization"] == expected
+    assert config["quantization_config"] == expected
+    assert weights["eh_proj.weight"].dtype == mx.uint32
+    assert weights["eh_proj.scales"].dtype == mx.uint8
+    assert "eh_proj.biases" not in weights
 
 
 def test_deepseek_v4_mtp_runtime_block_size_defaults_to_native_nextn_depth():

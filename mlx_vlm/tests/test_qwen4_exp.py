@@ -464,11 +464,7 @@ class Qwen4ExpTests(unittest.TestCase):
         self.assertEqual(cache[0][2].shape[1], 6)
         self.assertEqual(cache[0][3].shape[1], 2)
 
-    def test_batched_qsa_cache_decode_matches_singleton_rows(self):
-        mx.random.seed(47)
-        model = qwen4_exp.Model(tiny_config())
-        model.set_dtype(mx.bfloat16)
-        mx.eval(model.parameters())
+    def _assert_batched_qsa_decode_matches_singleton_rows(self, model):
         prompts = mx.array([list(range(2, 12)), list(range(12, 22))], dtype=mx.int32)
         decode = mx.array([[22], [23]], dtype=mx.int32)
         prompt_positions = mx.broadcast_to(mx.arange(10)[None], (2, 10))
@@ -511,6 +507,39 @@ class Qwen4ExpTests(unittest.TestCase):
                 mx.argmax(row_logits, axis=-1),
             ).item()
         )
+
+    def test_batched_qsa_cache_decode_matches_singleton_rows(self):
+        mx.random.seed(47)
+        model = qwen4_exp.Model(tiny_config())
+        model.set_dtype(mx.bfloat16)
+        mx.eval(model.parameters())
+
+        self._assert_batched_qsa_decode_matches_singleton_rows(model)
+
+    def test_quantized_batched_qsa_decode_matches_singleton_rows(self):
+        mx.random.seed(48)
+        model = qwen4_exp.Model(tiny_config())
+        model.set_dtype(mx.bfloat16)
+
+        def quantizable(path, module):
+            weight = getattr(module, "weight", None)
+            return (
+                path != "lm_head"
+                and hasattr(module, "to_quantized")
+                and weight is not None
+                and weight.shape[-1] % 32 == 0
+            )
+
+        nn.quantize(
+            model.language_model,
+            group_size=32,
+            bits=5,
+            mode="affine",
+            class_predicate=quantizable,
+        )
+        mx.eval(model.parameters())
+
+        self._assert_batched_qsa_decode_matches_singleton_rows(model)
 
     def test_left_padded_batched_qsa_decode_matches_singleton_rows(self):
         mx.random.seed(17)

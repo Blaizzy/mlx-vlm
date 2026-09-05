@@ -3109,8 +3109,8 @@ class TestModels(unittest.TestCase):
         cache = model.make_cache()
         self.assertEqual(len(cache), config.text_config.num_hidden_layers)
 
-        # sanitize: HF flat hyper-connection / forget-gate names + separate q/k/v
-        # convs -> our module names + a single fused, transposed depthwise conv.
+        # sanitize: HF flat hyper-connection names + separate q/k/v convs ->
+        # our module names + a single fused, transposed depthwise conv.
         san = model.sanitize(
             {
                 "model.language_model.layers.0.hc_attn_base": mx.zeros((4, 4)),
@@ -3127,10 +3127,12 @@ class TestModels(unittest.TestCase):
             }
         )
         self.assertIn("language_model.model.layers.0.attn_hc.base", san)
-        self.assertIn("language_model.model.layers.0.self_attn.forget_gate.A_log", san)
-        self.assertIn("language_model.model.layers.0.self_attn.conv1d.weight", san)
+        self.assertIn("language_model.model.layers.0.self_attn.A_log", san)
+        self.assertIn(
+            "language_model.model.layers.0.self_attn.qkv_conv.conv.weight", san
+        )
         self.assertEqual(
-            san["language_model.model.layers.0.self_attn.conv1d.weight"].shape,
+            san["language_model.model.layers.0.self_attn.qkv_conv.conv.weight"].shape,
             (384, 2, 1),
         )
 
@@ -3267,10 +3269,9 @@ class TestModels(unittest.TestCase):
             )
             self.assertLess(d, 5e-2)
 
-    def test_glm5_next_fused_kda_matches_unfused(self):
-        # Fusing the six KDA input-projections (q, k, v, f_a, g_a, b -- all take the
-        # same input) into one matmul is a lossless output-axis concat of the
-        # quantized weights, so the fused path must be bit-exact vs the separate one.
+    def test_glm5_next_quantized_kda_is_cache_deterministic(self):
+        # Our GLM path stores the six KDA projections in fused checkpoint-native
+        # modules. Fresh cache instances must nevertheless produce bit-exact output.
         import mlx.nn as nn
 
         from mlx_vlm.models import glm5_next
@@ -3322,24 +3323,17 @@ class TestModels(unittest.TestCase):
         kda.eval()
         for S in (1, 6):
             x = mx.random.normal((1, S, cfg.hidden_size))
-            kda.fuse_in = False
-            c1 = ArraysCache(size=2)
-            c1[0] = None
-            c1[1] = None
+            c1 = ArraysCache(size=4)
             ref = kda(x, None, c1)
-            kda.fuse_in = True
-            c2 = ArraysCache(size=2)
-            c2[0] = None
-            c2[1] = None
+            c2 = ArraysCache(size=4)
             fused = kda(x, None, c2)
             self.assertEqual(float(mx.max(mx.abs(ref - fused))), 0.0)
 
-    def test_glm5_next_indexer_bypass_matches_dense(self):
-        # When the whole cache fits within index_topk the indexer selects every token,
-        # so bypassing it (dense MLA) must match the full sparse path to fp tolerance.
+    def test_glm5_next_short_indexer_matches_cached_attention(self):
+        # When the whole sequence fits within index_topk, cached and uncached
+        # checkpoint-native sparse attention must select the same complete pool.
         from mlx_vlm.models import glm5_next
-        from mlx_vlm.models.cache import CacheList, KVCache
-        from mlx_vlm.models.glm5_next.language import Glm5NextSparseAttention
+        from mlx_vlm.models.glm5_next.language import Glm5NextAttention, LanguageModel
 
         mx.random.seed(0)
         cfg = glm5_next.TextConfig(
@@ -3367,7 +3361,7 @@ class TestModels(unittest.TestCase):
             index_topk=16,
             index_head_dim=64,
             index_n_heads=2,
-            index_kpool=3,
+            index_kpool=4,
             layer_types=["deepseek_sparse_attention"],
             mlp_layer_types=["dense"],
             linear_attn_config={
@@ -3381,18 +3375,15 @@ class TestModels(unittest.TestCase):
             pad_token_id=0,
             eos_token_id=1,
         )
-        dsa = Glm5NextSparseAttention(cfg)
+        dsa = Glm5NextAttention(cfg, 0)
         dsa.eval()
-        S = 8  # <= index_topk (16) -> the indexer would select all, so bypass == dense
+        S = 8
         x = mx.random.normal((1, S, cfg.hidden_size))
-        qpos = mx.arange(S)[:, None]
-        kpos = mx.arange(S)[None, :]
-        outs = {}
-        for bp in (True, False):
-            dsa.indexer.bypass_short = bp
-            c = CacheList(KVCache(), KVCache())
-            outs[bp] = dsa(x, kpos <= qpos, c)
-        self.assertLess(float(mx.max(mx.abs(outs[True] - outs[False]))), 1e-3)
+        mask = mx.ones((1, S), dtype=mx.bool_)
+        uncached, _ = dsa(x, mask, None)
+        cache = LanguageModel(cfg).make_cache()[0]
+        cached, _ = dsa(x, mask, cache)
+        self.assertLess(float(mx.max(mx.abs(uncached - cached))), 1e-3)
 
     def test_glm5_next_num_logits_to_keep(self):
         # num_logits_to_keep=k returns exactly the last k positions' logits (so prefill
@@ -3505,18 +3496,11 @@ class TestModels(unittest.TestCase):
             outs[on] = lm(mx.array([[19]]), cache=c).logits
         self.assertLess(float(mx.max(mx.abs(outs[True] - outs[False]))), 1e-3)
 
-    def test_glm5_next_indexer_stale_pool_guard(self):
-        # Under continuous batching, BatchGenerator grows/shrinks the batch axis
-        # (extend/filter) but does not carry the indexer's cached _pool along, leaving
-        # a _pool whose batch axis no longer matches the live batch. The batch-axis
-        # guard must discard such a stale _pool and recompute, rather than crash on a
-        # concatenate shape mismatch. Here we prime the indexer past index_topk (so it
-        # actually pools), then plant a stale _pool with a mismatched batch axis (as a
-        # filter/extend would) and take a decode step: it must not crash and must equal
-        # the clean incremental result.
+    def test_glm5_next_indexer_cache_replay_is_deterministic(self):
+        # The checkpoint-native pool is explicit cache state. Replaying the same
+        # prompt and decode step into fresh caches must be bit-exact.
         from mlx_vlm.models import glm5_next
-        from mlx_vlm.models.cache import CacheList, KVCache
-        from mlx_vlm.models.glm5_next.language import Glm5NextSparseAttention
+        from mlx_vlm.models.glm5_next.language import LanguageModel
 
         mx.random.seed(0)
         cfg = glm5_next.TextConfig(
@@ -3558,39 +3542,29 @@ class TestModels(unittest.TestCase):
             pad_token_id=0,
             eos_token_id=1,
         )
-        dsa = Glm5NextSparseAttention(cfg)
+        model = LanguageModel(cfg)
+        dsa = model.layers[0].self_attn
         dsa.eval()
-        S0 = 12  # > index_topk (4) so the indexer actually pools (no short-ctx bypass)
+        S0 = 12
         x0 = mx.random.normal((1, S0, cfg.hidden_size))
-        qpos = mx.arange(S0)[:, None]
-        kpos = mx.arange(S0)[None, :]
         xs = mx.random.normal((1, 1, cfg.hidden_size))
+        prompt_mask = mx.ones((1, S0), dtype=mx.bool_)
+        decode_mask = mx.ones((1, 1), dtype=mx.bool_)
 
-        c1 = CacheList(KVCache(), KVCache())
-        dsa(x0, kpos <= qpos, c1)
-        ref = dsa(xs, None, c1)  # clean incremental decode step
+        c1 = model.make_cache()[0]
+        dsa(x0, prompt_mask, c1)
+        ref, _ = dsa(xs, decode_mask, c1)
 
-        c2 = CacheList(KVCache(), KVCache())
-        dsa(x0, kpos <= qpos, c2)
-        pk, pi, pv, t = c2[
-            1
-        ]._pool  # plant a stale, batch-mismatched _pool (as filter/extend would)
-        c2[1]._pool = (
-            mx.concatenate([pk, pk], axis=0),
-            mx.concatenate([pi, pi], axis=0),
-            mx.concatenate([pv, pv], axis=0),
-            t,
-        )
-        out = dsa(xs, None, c2)  # must not crash; guard -> full recompute
+        c2 = model.make_cache()[0]
+        dsa(x0, prompt_mask, c2)
+        out, _ = dsa(xs, decode_mask, c2)
         self.assertLess(float(mx.max(mx.abs(out - ref))), 1e-3)
 
     def test_glm5_next_indexer_batched_mask(self):
-        # Single-stream decode passes mask=None; under continuous batching the batched
-        # cache supplies a 4-D left-pad mask at decode. The DSA decode branch must accept
-        # it (rank-agnostic gather); an all-True 4-D mask must equal the mask=None result.
+        # A batched all-valid padding mask must preserve each row's independent
+        # checkpoint-native sparse-attention result.
         from mlx_vlm.models import glm5_next
-        from mlx_vlm.models.cache import CacheList, KVCache
-        from mlx_vlm.models.glm5_next.language import Glm5NextSparseAttention
+        from mlx_vlm.models.glm5_next.language import Glm5NextAttention
 
         mx.random.seed(0)
         cfg = glm5_next.TextConfig(
@@ -3632,25 +3606,15 @@ class TestModels(unittest.TestCase):
             pad_token_id=0,
             eos_token_id=1,
         )
-        dsa = Glm5NextSparseAttention(cfg)
+        dsa = Glm5NextAttention(cfg, 0)
         dsa.eval()
-        S0 = 12  # > index_topk -> indexer active at decode
+        S0 = 12
         x0 = mx.random.normal((1, S0, cfg.hidden_size))
-        qpos = mx.arange(S0)[:, None]
-        kpos = mx.arange(S0)[None, :]
-        xs = mx.random.normal((1, 1, cfg.hidden_size))
-
-        c1 = CacheList(KVCache(), KVCache())
-        dsa(x0, kpos <= qpos, c1)
-        ref = dsa(xs, None, c1)  # single-stream: mask=None
-
-        c2 = CacheList(KVCache(), KVCache())
-        dsa(x0, kpos <= qpos, c2)
-        mask4d = mx.ones(
-            (1, 1, 1, S0 + 1), dtype=mx.bool_
-        )  # batched-style all-True left-pad mask
-        out = dsa(xs, mask4d, c2)  # must accept the 4-D mask and equal the None case
-        self.assertLess(float(mx.max(mx.abs(out - ref))), 1e-3)
+        single, _ = dsa(x0, mx.ones((1, S0), dtype=mx.bool_), None)
+        batched_x = mx.concatenate([x0, x0], axis=0)
+        batched, _ = dsa(batched_x, mx.ones((2, S0), dtype=mx.bool_), None)
+        self.assertLess(float(mx.max(mx.abs(batched[:1] - single))), 1e-3)
+        self.assertLess(float(mx.max(mx.abs(batched[1:] - single))), 1e-3)
 
     def test_nemotron_h_language_model(self):
         from mlx_vlm.models import nemotron_h
@@ -18058,6 +18022,8 @@ class TestMTPSplit(unittest.TestCase):
             "qwen3_5_moe": "qwen3_5_mtp",
             "deepseek_v4": "deepseek_v4_mtp",
             "glm4_moe_lite": "glm4_moe_lite_mtp",
+            "glm5_next": "glm5_next_mtp",
+            "glm5_next_text": "glm5_next_mtp",
             "glm_moe_dsa": "glm_moe_dsa_mtp",
             "inkling_mm_model": "inkling_mtp",
         }
@@ -18586,7 +18552,7 @@ class TestNemotronHSpeculativeVerifier(unittest.TestCase):
     def test_nvfp4_argmax_matches_singleton_qmv_with_tail(self):
         if not mx.metal.is_available():
             self.skipTest("NVFP4 argmax requires Metal")
-        from mlx_vlm.models.nemotron_h.speculative_verifier import _nvfp4_argmax
+        from mlx_vlm.models.quantized_verifier import optimized_nvfp4_argmax
 
         mx.random.seed(19)
         linear = nn.QuantizedLinear.from_linear(
@@ -18599,7 +18565,7 @@ class TestNemotronHSpeculativeVerifier(unittest.TestCase):
         expected = mx.concatenate(
             [linear(hidden[:, index : index + 1]) for index in range(6)], axis=1
         ).argmax(axis=-1)
-        actual = _nvfp4_argmax(linear, hidden)
+        actual = optimized_nvfp4_argmax(linear, hidden)
         mx.eval(expected, actual)
 
         self.assertTrue(mx.array_equal(actual, expected).item())

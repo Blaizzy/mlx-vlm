@@ -1,66 +1,23 @@
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import (
-    LanguageModelOutput,
-    create_attention_mask,
-    create_ssm_mask,
-    scaled_dot_product_attention,
-)
-from ..cache import ArraysCache, CacheList, KVCache
+from ..base import LanguageModelOutput, create_ssm_mask, scaled_dot_product_attention
+from ..cache import ArraysCache, CacheList, KVCache, PoolingCache
 from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
-from ..deepseek_v32.language import DeepseekV32MoE
-from ..deepseek_v32.language import Model as DSV32Model
 from ..gated_delta import gated_delta_update
-from ..mla import MultiLinear, latent_length, max_absorbed_queries
-from ..mlp import DeepseekMLP
-from .config import ModelConfig, TextConfig
+from ..mla import MultiLinear
+from ..sparse_attention import indexed_sparse_attention
+from ..switch_layers import SwitchGLU
+from .config import TextConfig
+from .speculative_verifier import Glm5NextSpeculativeVerifier
 
-
-class Glm5NextRMSNormGated(nn.Module):
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = mx.ones(hidden_size)
-
-    def __call__(self, hidden_states: mx.array, gate: mx.array) -> mx.array:
-        dt = hidden_states.dtype
-        x = hidden_states.astype(mx.float32)
-        var = (x * x).mean(-1, keepdims=True)
-        x = x * mx.rsqrt(var + self.eps)
-        x = self.weight.astype(mx.float32) * x
-        x = x * mx.sigmoid(gate.astype(mx.float32))
-        return x.astype(dt)
-
-
-class Glm5NextForgetGate(nn.Module):
-    def __init__(self, config: TextConfig):
-        super().__init__()
-        self.head_dim = config.linear_head_dim
-        self.num_heads = config.linear_num_heads
-        self.qkv_dim = self.head_dim * self.num_heads
-        self.f_a_proj = nn.Linear(config.hidden_size, self.head_dim, bias=False)
-        self.f_b_proj = nn.Linear(self.head_dim, self.qkv_dim, bias=False)
-        self.dt_bias = mx.zeros(self.qkv_dim)
-        self.A_log = mx.zeros(self.num_heads)
-        self.safe_gate_lower_bound = config.linear_lower_bound
-
-    def __call__(self, hidden_states: mx.array) -> mx.array:
-        B, S, _ = hidden_states.shape
-        fg = self.f_b_proj(self.f_a_proj(hidden_states))
-        g = (fg.astype(mx.float32) + self.dt_bias.astype(mx.float32)).reshape(
-            B, S, self.num_heads, self.head_dim
-        )
-        decay = mx.exp(self.A_log.astype(mx.float32)).reshape(1, 1, self.num_heads, 1)
-        if self.safe_gate_lower_bound is not None:
-            return self.safe_gate_lower_bound * mx.sigmoid(decay * g)
-        g_softplus = mx.where(g > 20.0, g, mx.log(1.0 + mx.exp(g)))
-        return -decay * g_softplus
+_SPECULATIVE_VERIFIER = Glm5NextSpeculativeVerifier()
 
 
 def _l2norm(x: mx.array, eps: float = 1e-6) -> mx.array:
+    """Reference L2 normalization used by the GLM KDA parity oracle."""
     return x * mx.rsqrt((x * x).sum(axis=-1, keepdims=True) + eps)
 
 
@@ -72,686 +29,1066 @@ def recurrent_kimi_delta(
     beta: mx.array,
     state: Optional[mx.array] = None,
 ):
-    # Reference O(S) recurrence for Kimi Delta Attention, kept as the readable
-    # spec and the equivalence oracle for tests. The forward path runs this on
-    # the shared fused gated_delta kernel (see Glm5NextLinearAttention).
-    dt = query.dtype
+    """Readable recurrent KDA reference used for implementation parity tests."""
+    dtype = query.dtype
     query = _l2norm(query.astype(mx.float32))
     key = _l2norm(key.astype(mx.float32))
     value = value.astype(mx.float32)
     g = g.astype(mx.float32)
     beta = beta.astype(mx.float32)
-    B, S, H, Dk = key.shape
-    Dv = value.shape[-1]
-    query = query * (Dk**-0.5)
+    batch, length, heads, key_dim = key.shape
+    value_dim = value.shape[-1]
+    query = query * (key_dim**-0.5)
     if state is None:
-        state = mx.zeros((B, H, Dk, Dv), dtype=mx.float32)
+        state = mx.zeros((batch, heads, key_dim, value_dim), dtype=mx.float32)
     else:
         state = state.astype(mx.float32)
-    outs = []
-    for i in range(S):
-        q_i = query[:, i]
-        k_i = key[:, i]
-        v_i = value[:, i]
-        g_i = mx.exp(g[:, i])[..., None]
-        b_i = beta[:, i][..., None]
+    outputs = []
+    for index in range(length):
+        q_i = query[:, index]
+        k_i = key[:, index]
+        v_i = value[:, index]
+        g_i = mx.exp(g[:, index])[..., None]
+        beta_i = beta[:, index][..., None]
         state = state * g_i
-        kv_mem = (state * k_i[..., None]).sum(axis=-2)
-        delta = (v_i - kv_mem) * b_i
+        memory = (state * k_i[..., None]).sum(axis=-2)
+        delta = (v_i - memory) * beta_i
         state = state + k_i[..., None] * delta[..., None, :]
-        out_i = (state * q_i[..., None]).sum(axis=-2)
-        outs.append(out_i)
-    out = mx.stack(outs, axis=1).astype(dt)
-    return out, state
+        outputs.append((state * q_i[..., None]).sum(axis=-2))
+    return mx.stack(outputs, axis=1).astype(dtype), state
 
 
-class Glm5NextLinearAttention(nn.Module):
+@mx.compile
+def _limited_swiglu(gate: mx.array, up: mx.array, limit: float) -> mx.array:
+    gate = mx.minimum(gate, limit)
+    up = mx.clip(up, -limit, limit)
+    return nn.silu(gate) * up
+
+
+class LimitedSwiGLU(nn.Module):
+    def __init__(self, limit: float):
+        super().__init__()
+        self.limit = limit
+
+    def __call__(self, up, gate):
+        return _limited_swiglu(gate, up, self.limit)
+
+
+class Glm5NextMLP(nn.Module):
+    def __init__(self, config: TextConfig, intermediate_size: Optional[int] = None):
+        super().__init__()
+        intermediate_size = intermediate_size or config.intermediate_size
+        self.gate_up_proj = nn.Linear(
+            config.hidden_size, 2 * intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
+        self.swiglu_limit = config.swiglu_limit
+
+    def __call__(self, x):
+        gate, up = mx.split(self.gate_up_proj(x), 2, axis=-1)
+        return self.down_proj(_limited_swiglu(gate, up, self.swiglu_limit))
+
+
+@mx.compile
+def _expert_select(
+    logits: mx.array,
+    correction_bias: mx.array,
+    top_k: int,
+    n_group: int,
+    topk_group: int,
+    routed_scaling_factor: float,
+    norm_topk_prob: bool,
+) -> Tuple[mx.array, mx.array]:
+    scores = mx.sigmoid(logits.astype(mx.float32))
+    choice_scores = scores + correction_bias
+    if n_group > 1:
+        grouped = mx.unflatten(choice_scores, -1, (n_group, -1))
+        group_scores = mx.topk(grouped, 2, axis=-1).sum(axis=-1)
+        drop_count = n_group - topk_group
+        if drop_count:
+            drop = mx.argpartition(group_scores, kth=drop_count - 1, axis=-1)[
+                ..., :drop_count
+            ]
+            group_mask = mx.ones(group_scores.shape, dtype=mx.bool_)
+            group_mask = mx.put_along_axis(group_mask, drop, mx.array(False), axis=-1)
+            choice_scores = mx.where(
+                mx.repeat(group_mask[..., None], grouped.shape[-1], axis=-1).reshape(
+                    choice_scores.shape
+                ),
+                choice_scores,
+                -float("inf"),
+            )
+
+    indices = mx.argpartition(-choice_scores, kth=top_k - 1, axis=-1)[
+        ..., :top_k
+    ].astype(mx.int32)
+    weights = mx.take_along_axis(scores, indices, axis=-1)
+    if top_k > 1 and norm_topk_prob:
+        weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+    return indices, weights * routed_scaling_factor
+
+
+class MoEGate(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.linear_num_heads
-        self.head_dim = config.linear_head_dim
-        self.qkv_dim = self.num_heads * self.head_dim
-        self.conv_kernel_size = config.linear_conv_kernel_dim
+        self.top_k = config.num_experts_per_tok
+        self.n_group = config.n_group
+        self.topk_group = config.topk_group
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.norm_topk_prob = config.norm_topk_prob
+        self.weight = mx.zeros(
+            (config.n_routed_experts, config.hidden_size), dtype=mx.float32
+        )
+        self.e_score_correction_bias = mx.zeros(
+            (config.n_routed_experts,), dtype=mx.float32
+        )
 
-        self.q_proj = nn.Linear(self.hidden_size, self.qkv_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.qkv_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.qkv_dim, bias=False)
+    def __call__(self, x):
+        return _expert_select(
+            x.astype(mx.float32) @ self.weight.T,
+            self.e_score_correction_bias,
+            self.top_k,
+            self.n_group,
+            self.topk_group,
+            self.routed_scaling_factor,
+            self.norm_topk_prob,
+        )
 
-        self.conv_dim = self.qkv_dim * 3
-        self.conv1d = nn.Conv1d(
-            in_channels=self.conv_dim,
-            out_channels=self.conv_dim,
+
+class Glm5NextMoE(nn.Module):
+    def __init__(self, config: TextConfig):
+        super().__init__()
+        self.gate = MoEGate(config)
+        self.switch_mlp = SwitchGLU(
+            config.hidden_size,
+            config.moe_intermediate_size,
+            config.n_routed_experts,
+            activation=LimitedSwiGLU(config.swiglu_limit),
+        )
+        self.shared_experts = Glm5NextMLP(
+            config,
+            intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
+        )
+
+    def __call__(self, x):
+        indices, weights = self.gate(x)
+        routed = self.switch_mlp(x, indices)
+        routed = (routed * weights[..., None].astype(routed.dtype)).sum(axis=-2)
+        return routed + self.shared_experts(x)
+
+
+class ShortConv1d(nn.Module):
+    def __init__(self, channels: int, kernel_size: int):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.conv = nn.Conv1d(
+            channels,
+            channels,
+            kernel_size=kernel_size,
             bias=False,
-            kernel_size=self.conv_kernel_size,
-            groups=self.conv_dim,
+            groups=channels,
             padding=0,
         )
 
-        self.forget_gate = Glm5NextForgetGate(config)
-        self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
-        self.g_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
-        self.g_b_proj = nn.Linear(self.head_dim, self.qkv_dim, bias=False)
-        self.o_norm = Glm5NextRMSNormGated(self.head_dim, eps=config.rms_norm_eps)
-        self.o_proj = nn.Linear(self.qkv_dim, self.hidden_size, bias=False)
-        self.fuse_in = True
-        self._fused_ready = False
-
-    def _fused_in_proj(self, inputs):
-        # q,k,v,f_a,g_a,b all take `inputs`; fuse into one matmul via a lossless
-        # output-axis concat of the (quantized) weights, built once and cached.
-        if not self._fused_ready:
-            mods = [
-                self.q_proj,
-                self.k_proj,
-                self.v_proj,
-                self.forget_gate.f_a_proj,
-                self.g_a_proj,
-                self.b_proj,
-            ]
-            pts, acc = [], 0
-            for m in mods[:-1]:
-                acc += m.weight.shape[0]
-                pts.append(acc)
-            self._split_pts = pts
-            self._fq = hasattr(mods[0], "scales")
-            self._fw = mx.concatenate([m.weight for m in mods], axis=0)
-            if self._fq:
-                self._fs = mx.concatenate([m.scales for m in mods], axis=0)
-                self._fb = mx.concatenate([m.biases for m in mods], axis=0)
-                self._gs, self._bits = mods[0].group_size, mods[0].bits
-            self._fused_ready = True
-        if self._fq:
-            out = mx.quantized_matmul(
-                inputs,
-                self._fw,
-                self._fs,
-                self._fb,
-                transpose=True,
-                group_size=self._gs,
-                bits=self._bits,
+    def __call__(self, x, state, mask, lengths, return_input=False):
+        if mask is not None:
+            x = mx.where(mask[..., None], x, 0)
+        if state is None:
+            state = mx.zeros(
+                (x.shape[0], self.kernel_size - 1, x.shape[-1]), dtype=x.dtype
             )
+        conv_input = mx.concatenate([state, x], axis=1)
+        output = nn.silu(self.conv(conv_input))
+        keep = self.kernel_size - 1
+        if lengths is None:
+            state = mx.contiguous(conv_input[:, -keep:])
         else:
-            out = inputs @ self._fw.T
-        return mx.split(out, self._split_pts, axis=-1)
+            ends = mx.clip(lengths, 0, x.shape[1])
+            positions = (ends[:, None] + mx.arange(keep))[..., None]
+            state = mx.take_along_axis(conv_input, positions, axis=1)
+        if return_input:
+            return output, state, conv_input
+        return output, state
+
+
+class Glm5NextLinearAttention(nn.Module):
+    def __init__(self, config: TextConfig, layer_idx: int = 0):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.num_heads = config.linear_num_heads
+        self.head_dim = config.linear_head_dim
+        self.conv_kernel = config.linear_conv_kernel_dim
+        self.projection_dim = self.num_heads * self.head_dim
+        self.scale = self.head_dim**-0.5
+        self.lower_bound = config.linear_lower_bound
+
+        self.qkv_proj = nn.Linear(
+            config.hidden_size, 3 * self.projection_dim, bias=False
+        )
+        self.qkv_conv = ShortConv1d(3 * self.projection_dim, self.conv_kernel)
+
+        self.fbg_a_proj = nn.Linear(
+            config.hidden_size, 2 * self.head_dim + self.num_heads, bias=False
+        )
+        self.f_b_proj = nn.Linear(self.head_dim, self.projection_dim, bias=False)
+        self.g_b_proj = nn.Linear(self.head_dim, self.projection_dim, bias=False)
+        self.A_log = mx.zeros((self.num_heads,), dtype=mx.float32)
+        self.dt_bias = mx.zeros((self.projection_dim,), dtype=mx.float32)
+        self.o_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.o_proj = nn.Linear(self.projection_dim, config.hidden_size, bias=False)
 
     def __call__(
         self,
-        inputs: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
-        B, S, _ = inputs.shape
-        if self.fuse_in:
-            q_o, k_o, v_o, fa_o, ga_o, b_o = self._fused_in_proj(inputs)
-            mixed = mx.concatenate([q_o, k_o, v_o], axis=-1)
-        else:
-            mixed = mx.concatenate(
-                [self.q_proj(inputs), self.k_proj(inputs), self.v_proj(inputs)], axis=-1
+        x,
+        mask=None,
+        cache=None,
+        rollback_sink=None,
+        linear_fn=None,
+        output_linear_fn=None,
+        timewise_fn=None,
+        output_gate_fn=None,
+        scaled_norm_fn=None,
+    ):
+        linear_fn = linear_fn or (lambda linear, inputs: linear(inputs))
+        output_linear_fn = output_linear_fn or linear_fn
+        timewise_fn = timewise_fn or (lambda fn, inputs: fn(inputs))
+        output_gate_fn = output_gate_fn or (
+            lambda norm, output, gate: norm(output) * mx.sigmoid(gate)
+        )
+        scaled_norm_fn = scaled_norm_fn or (
+            lambda inputs, scale, eps: timewise_fn(
+                lambda values: scale * mx.fast.rms_norm(values, None, eps),
+                inputs,
             )
-            fa_o = self.forget_gate.f_a_proj(inputs)
-            ga_o = self.g_a_proj(inputs)
-            b_o = self.b_proj(inputs)
+        )
+        batch, length, _ = x.shape
         if mask is not None and mask.dtype == mx.bool_:
-            mixed = mx.where(mask[..., None], mixed, 0)
-
-        if cache is not None and cache[0] is not None:
-            conv_state = cache[0]
+            x = mx.where(mask[..., None], x, 0)
+        if cache is None:
+            qkv_state = ssm_state = None
+            lengths = None
         else:
-            conv_state = mx.zeros(
-                (B, self.conv_kernel_size - 1, self.conv_dim), dtype=inputs.dtype
-            )
-        conv_input = mx.concatenate([conv_state, mixed], axis=1)
+            qkv_state = cache[0]
+            if qkv_state is not None and qkv_state.shape[-1] == self.projection_dim:
+                states = [cache[index] for index in range(3)]
+                qkv_state = (
+                    None
+                    if any(state is None for state in states)
+                    else mx.concatenate(states, axis=-1)
+                )
+            ssm_state = cache[3]
+            lengths = cache.lengths
+
+        qkv_out = self.qkv_conv(
+            linear_fn(self.qkv_proj, x),
+            qkv_state,
+            mask,
+            lengths,
+            return_input=rollback_sink is not None,
+        )
+        if rollback_sink is None:
+            qkv, qkv_state = qkv_out
+            conv_input = None
+        else:
+            qkv, qkv_state, conv_input = qkv_out
+        q, k, v = mx.split(qkv, 3, axis=-1)
         if cache is not None:
-            cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :, :])
-        conv_out = nn.silu(self.conv1d(conv_input))
+            cache[0] = qkv_state
+            cache[1] = cache[2] = None
 
-        q, k, v = mx.split(conv_out, [self.qkv_dim, 2 * self.qkv_dim], axis=-1)
-        q = q.reshape(B, S, self.num_heads, self.head_dim)
-        k = k.reshape(B, S, self.num_heads, self.head_dim)
-        v = v.reshape(B, S, self.num_heads, self.head_dim)
+        shape = (batch, length, self.num_heads, self.head_dim)
+        q, k, v = q.reshape(shape), k.reshape(shape), v.reshape(shape)
+        eps = 1e-6 / self.head_dim
+        q = scaled_norm_fn(q, self.scale**2, eps)
+        k = scaled_norm_fn(k, self.scale, eps)
 
-        fg = self.forget_gate
-        a = fg.f_b_proj(fa_o).reshape(B, S, self.num_heads, self.head_dim)
-        in_dtype = q.dtype
-        q = (_l2norm(q.astype(mx.float32)) * (self.head_dim**-0.5)).astype(in_dtype)
-        k = _l2norm(k.astype(mx.float32)).astype(in_dtype)
-
-        state = cache[1] if cache is not None else None
-        out, state = gated_delta_update(
+        f_a, b, g_a = mx.split(
+            linear_fn(self.fbg_a_proj, x),
+            (self.head_dim, self.head_dim + self.num_heads),
+            axis=-1,
+        )
+        a = linear_fn(self.f_b_proj, f_a).reshape(shape)
+        b = b.reshape(batch, length, self.num_heads)
+        initial_state = ssm_state
+        delta_output = gated_delta_update(
             q,
             k,
             v,
             a,
-            b_o,
-            fg.A_log.reshape(self.num_heads, 1),
-            fg.dt_bias.reshape(self.num_heads, self.head_dim),
-            state=state,
-            lower_bound=fg.safe_gate_lower_bound,
+            b,
+            self.A_log.reshape(self.num_heads, 1),
+            self.dt_bias.reshape(self.num_heads, self.head_dim),
+            state=ssm_state,
+            mask=mask,
+            use_kernel=not self.training,
+            lower_bound=self.lower_bound,
+            state_steps=(
+                length - 1 if rollback_sink is not None and length > 1 else None
+            ),
         )
+        if rollback_sink is None or length <= 1:
+            out, ssm_state = delta_output
+            intermediate_states = None
+        else:
+            out, ssm_state, intermediate_states = delta_output
+        if rollback_sink is not None:
+            conv_states = (
+                None
+                if length <= 1
+                else mx.stack(
+                    [
+                        conv_input[:, position + 1 : position + self.conv_kernel]
+                        for position in range(length - 1)
+                    ],
+                    axis=1,
+                )
+            )
+            rollback_sink.append(
+                (
+                    q,
+                    k,
+                    v,
+                    a,
+                    b,
+                    self.A_log.reshape(self.num_heads, 1),
+                    self.dt_bias.reshape(self.num_heads, self.head_dim),
+                    initial_state,
+                    mask,
+                    conv_input,
+                    self.conv_kernel,
+                    self.lower_bound,
+                    conv_states,
+                    intermediate_states,
+                )
+            )
         if cache is not None:
-            cache[1] = state
-            cache.advance(S)
+            cache[3] = ssm_state
+            cache.advance(length)
 
-        gate = self.g_b_proj(ga_o).reshape(B, S, self.num_heads, self.head_dim)
-        out = self.o_norm(out, gate).reshape(B, S, -1)
-        return self.o_proj(out)
+        gate = linear_fn(self.g_b_proj, g_a).reshape(shape)
+        out = output_gate_fn(self.o_norm, out, gate).reshape(batch, length, -1)
+        return output_linear_fn(self.o_proj, out)
+
+
+def _batch_gather(values: mx.array, indices: mx.array) -> mx.array:
+    batch, length = values.shape[:2]
+    offsets_shape = (batch,) + (1,) * (indices.ndim - 1)
+    offsets = mx.arange(batch).reshape(offsets_shape) * length
+    flat_indices = (indices + offsets).reshape(-1)
+    return values.reshape(batch * length, *values.shape[2:])[flat_indices].reshape(
+        *indices.shape, *values.shape[2:]
+    )
+
+
+def _sparse_head_gather(values: mx.array, indices: mx.array) -> mx.array:
+    """Gather per-query positions directly into fused-SDPA batch layout."""
+    batch, heads, kv_length, dim = values.shape
+    query_length, topk = indices.shape[1:]
+    batch_offsets = (mx.arange(batch) * heads * kv_length)[:, None, None, None]
+    head_offsets = (mx.arange(heads) * kv_length)[None, None, :, None]
+    flat_indices = batch_offsets + head_offsets + indices[:, :, None]
+    return values.reshape(batch * heads * kv_length, dim)[
+        flat_indices.reshape(-1)
+    ].reshape(batch * query_length, heads, topk, dim)
+
+
+def _score_index_keys(q, keys, weights, scale):
+    scores = q.astype(mx.float32) @ keys[:, None].astype(mx.float32).swapaxes(-1, -2)
+    scores = mx.maximum(scores, 0)
+    return (scores * (weights * scale)[..., None]).sum(axis=2)
+
+
+def _exact_pool_select(
+    q,
+    pool_keys,
+    weights,
+    pool_ends,
+    pool_valid,
+    query_positions,
+    select_k,
+    scale,
+    chunk_size=512,
+):
+    """Select exact top-scoring pools with bounded query-side temporaries."""
+
+    batch = pool_valid.shape[0]
+    query_length = query_positions.shape[0]
+    pool_count = pool_keys.shape[1]
+    selected_chunks = []
+    valid_chunks = []
+    for start in range(0, query_length, chunk_size):
+        end = min(start + chunk_size, query_length)
+        length = end - start
+        candidates = pool_valid[:, None] & (
+            pool_ends[:, None] <= query_positions[None, start:end, None]
+        )
+        if select_k == pool_count:
+            selected = mx.broadcast_to(
+                mx.arange(pool_count, dtype=mx.int32)[None, None],
+                (batch, length, pool_count),
+            )
+        else:
+            scores = _score_index_keys(
+                q[:, start:end], pool_keys, weights[:, start:end], scale
+            )
+            scores = mx.where(candidates, scores, mx.finfo(mx.float32).min)
+            selected = mx.argpartition(-scores, kth=select_k - 1, axis=-1)[
+                ..., :select_k
+            ].astype(mx.int32)
+        selected_chunks.append(selected)
+        valid_chunks.append(mx.take_along_axis(candidates, selected, axis=-1))
+
+    if len(selected_chunks) == 1:
+        return selected_chunks[0], valid_chunks[0]
+    return (
+        mx.concatenate(selected_chunks, axis=1),
+        mx.concatenate(valid_chunks, axis=1),
+    )
 
 
 class Glm5NextIndexer(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
-        self.dim = args.hidden_size
-        self.n_heads = args.index_n_heads
-        self.head_dim = args.index_head_dim
-        self.index_topk = args.index_topk
-        self.index_kpool = args.index_kpool
-        self.index_kpool_always_select_tail = args.index_kpool_always_select_tail
-        self.q_lora_rank = args.q_lora_rank
+        self.layer_idx = layer_idx
+        self.n_heads = config.index_n_heads
+        self.head_dim = config.index_head_dim
+        self.index_topk = config.index_topk
+        self.index_kpool = config.index_kpool
+        self.always_select_tail = config.index_kpool_always_select_tail
         self.wq_b = nn.Linear(
-            self.q_lora_rank, self.n_heads * self.head_dim, bias=False
+            config.q_lora_rank, self.n_heads * self.head_dim, bias=False
         )
-        self.wk = nn.Linear(self.dim, self.head_dim, bias=False)
-        self.k_norm = nn.LayerNorm(self.head_dim)
-        self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False)
+        self.wk = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+        self.k_norm = nn.LayerNorm(self.head_dim, eps=1e-6)
+        self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
         self.softmax_scale = self.head_dim**-0.5
-        self.index_kpool_compress_ape = mx.zeros((self.index_kpool, self.head_dim))
-        self.index_kpool_compress_gate = mx.zeros((self.head_dim, self.dim))
+        self.index_kpool_compress_ape = mx.zeros(
+            (self.index_kpool, self.head_dim), dtype=mx.float32
+        )
+        self.index_kpool_compress_gate = mx.zeros(
+            (self.head_dim, config.hidden_size), dtype=mx.float32
+        )
 
-    def _pooled_states(self, keys, gate_scores, valid):
-        B, S, hd = keys.shape
-        kp = self.index_kpool
-        P = (S + kp - 1) // kp
-        any_valid = mx.any(valid, axis=-1)
+    def _pooled_states(self, packed):
+        keys = packed[..., : self.head_dim]
+        gates = packed[..., self.head_dim : 2 * self.head_dim]
+        valid = packed[..., -1].astype(mx.bool_)
+        batch, length = valid.shape
+        pool_count = (length + self.index_kpool - 1) // self.index_kpool
+
+        has_key = mx.any(valid, axis=-1)
         first_key = mx.where(
-            any_valid, mx.argmax(valid.astype(mx.int32), axis=-1), mx.array(S)
+            has_key,
+            mx.argmax(valid.astype(mx.int32), axis=-1),
+            mx.array(length),
         )
-        pool_offsets = mx.arange(P * kp).reshape(1, P, kp)
-        pool_indices = first_key[:, None, None] + pool_offsets
-        safe = mx.clip(pool_indices, 0, S - 1)
-        flat = safe.reshape(B, P * kp)
-        idxC = mx.broadcast_to(flat[..., None], (B, P * kp, hd))
-        grouped_keys = mx.take_along_axis(keys, idxC, axis=1).reshape(B, P, kp, hd)
-        grouped_gate = mx.take_along_axis(gate_scores, idxC, axis=1).reshape(
-            B, P, kp, hd
+        offsets = mx.arange(pool_count * self.index_kpool).reshape(
+            1, pool_count, self.index_kpool
         )
-        grouped_valid = (
-            mx.take_along_axis(valid.astype(mx.int32), flat, axis=1).reshape(B, P, kp)
-            > 0
-        )
-        grouped_valid = grouped_valid & (pool_indices < S)
+        indices = first_key[:, None, None] + offsets
+        safe = mx.clip(indices, 0, max(length - 1, 0))
+        grouped_keys = _batch_gather(keys, safe)
+        grouped_gates = _batch_gather(gates, safe)
+        grouped_valid = _batch_gather(valid[..., None], safe).squeeze(-1)
+        grouped_valid = grouped_valid & (indices < length)
         pool_valid = mx.all(grouped_valid, axis=-1)
-        pool_indices = mx.where(grouped_valid, pool_indices, -1)
-        logits = grouped_gate + self.index_kpool_compress_ape[None, None]
-        logits = mx.where(grouped_valid[..., None], logits, -1e30)
-        probs = mx.softmax(logits, axis=2)
-        probs = mx.where(mx.isnan(probs), 0.0, probs)
-        pool_keys = mx.sum(probs * grouped_keys, axis=2)
-        return pool_keys, pool_indices, pool_valid
+        indices = mx.where(grouped_valid, indices, -1)
 
-    def _visible_tail(self, visible, valid):
-        B, S, Kv = visible.shape
-        kp = self.index_kpool
-        mtw = kp - 1
-        any_valid = mx.any(valid, axis=-1)
-        first_key = mx.where(
-            any_valid, mx.argmax(valid.astype(mx.int32), axis=-1), mx.array(Kv)
-        )
-        visible_count = mx.sum(visible.astype(mx.int32), axis=-1)
-        tail_count = visible_count - (visible_count // kp) * kp
-        tail_offsets = mx.arange(mtw)
-        tail_start = first_key[:, None] + visible_count - tail_count
-        tail_indices = tail_start[..., None] + tail_offsets
-        tail_valid = (tail_offsets[None, None, :] < tail_count[..., None]) & (
-            tail_indices < Kv
-        )
-        kv_idx = mx.clip(tail_indices, 0, Kv - 1)
-        tail_vis = mx.take_along_axis(visible, kv_idx, axis=-1)
-        tail_indices = mx.where(tail_valid & tail_vis, tail_indices, -1)
-        return tail_indices
+        logits = grouped_gates.astype(mx.float32)
+        logits = logits + self.index_kpool_compress_ape[None, None]
+        logits = mx.where(grouped_valid[..., None], logits, -float("inf"))
+        probs = mx.nan_to_num(mx.softmax(logits, axis=2, precise=True))
+        pool_keys = (probs.astype(grouped_keys.dtype) * grouped_keys).sum(axis=2)
+        return pool_keys, indices, pool_valid, valid
 
-    def __call__(self, x, qr, mask, cache=None):
-        B, S, _ = x.shape
-        q = self.wq_b(qr).reshape(B, S, self.n_heads, self.head_dim)
-        k = self.k_norm(self.wk(x)).reshape(B, S, self.head_dim)
-        gate_scores = x @ self.index_kpool_compress_gate.swapaxes(-1, -2)
+    def _compress_pools(self, keys, gates):
+        batch = keys.shape[0]
+        if keys.shape[1] == 0:
+            return mx.zeros((batch, 0, self.head_dim), dtype=keys.dtype)
 
-        if mask is not None and mask.dtype == mx.bool_ and mask.shape == (B, S):
-            valid_cur = mask
-        else:
-            valid_cur = mx.ones((B, S), dtype=mx.bool_)
+        keys = mx.unflatten(keys, 1, (-1, self.index_kpool))
+        gates = mx.unflatten(gates, 1, (-1, self.index_kpool))
+        logits = gates.astype(mx.float32)
+        logits = logits + self.index_kpool_compress_ape[None, None]
+        probs = mx.softmax(logits, axis=2, precise=True).astype(keys.dtype)
+        return (probs * keys).sum(axis=2)
 
-        # Pack per-token state and append to the indexer cache so pooling/selection
-        # run over the full cached sequence -- unifies prefill and incremental decode.
-        packed = mx.concatenate(
-            [k, gate_scores, valid_cur.astype(k.dtype)[..., None]], axis=-1
-        )
-        if cache is not None:
-            keys, _ = cache.update_and_fetch(packed[:, None], mx.zeros((B, 1, S, 0)))
-            packed_full = keys[:, 0]
-        else:
-            packed_full = packed
-        T = packed_full.shape[1]
-        # Short-context bypass: when the whole cache fits within index_topk the indexer
-        # would select every token, so skip the O(T) pooling/scoring/topk and let the
-        # DSA fall through to dense MLA. The cache is already updated above so state
-        # stays consistent; the full pool is rebuilt once when T first exceeds index_topk.
-        if getattr(self, "bypass_short", True) and T <= self.index_topk:
-            return None
-        k_full, gate_full, valid_ch = mx.split(
-            packed_full, [self.head_dim, 2 * self.head_dim], axis=-1
-        )
-        valid = valid_ch[..., 0] > 0
-
-        offset = T - S
-        kv_len = T
-        kv_pos = mx.arange(T)
-
-        # Incremental pooling at decode: complete pools are stable across steps, so
-        # recompute only the suffix (last partial pool + any new pool) and reuse the
-        # cached complete pools -- turns the per-step pool cost from O(T) to O(kpool).
-        # Exact; falls back to full pooling on prefill, when padding is present, or when
-        # the cached pool's batch axis no longer matches the current batch. That last
-        # guard matters under continuous batching: BatchGenerator grows/shrinks the
-        # batch (extend/filter) on the batch axis but does not carry this per-cache
-        # _pool along, so a stale _pool must be discarded and rebuilt for one step.
-        if (
-            S == 1
-            and cache is not None
-            and getattr(cache, "_pool", None) is not None
-            and getattr(cache, "_no_pad", False)
-            and cache._pool[0].shape[0] == B
-        ):
-            ck, ci, cv, t_prev = cache._pool
-            n_stable = t_prev // self.index_kpool
-            s0 = n_stable * self.index_kpool
-            pk_s, pi_s, pv_s = self._pooled_states(
-                k_full[:, s0:], gate_full[:, s0:], valid[:, s0:]
-            )
-            pi_s = mx.where(pi_s >= 0, pi_s + s0, -1)
-            pool_keys = mx.concatenate([ck[:, :n_stable], pk_s], axis=1)
-            pool_indices = mx.concatenate([ci[:, :n_stable], pi_s], axis=1)
-            pool_valid = mx.concatenate([cv[:, :n_stable], pv_s], axis=1)
-        else:
-            pool_keys, pool_indices, pool_valid = self._pooled_states(
-                k_full, gate_full, valid
-            )
-            if cache is not None:
-                cache._no_pad = bool(mx.all(valid))
-        if cache is not None:
-            cache._pool = (pool_keys, pool_indices, pool_valid, T)
-        P = pool_keys.shape[1]
-        select_k = min(self.index_topk // self.index_kpool, P)
-        pool_end = mx.clip(pool_indices[..., -1], 0, kv_len - 1)
-        pool_keys_t = pool_keys[:, None].swapaxes(-1, -2)
-        tail_on = self.index_kpool_always_select_tail and self.index_kpool > 1
-        output_width = self.index_topk + (self.index_kpool - 1 if tail_on else 0)
-
-        # Chunk over the query dimension. A one-shot prefill otherwise materializes
-        # [B, S, n_heads, P] scores (O(S*P)) and OOMs at long context; chunking bounds
-        # peak to O(chunk*P). Decode (S=1) is a single chunk -> identical to before.
-        chunk = 512 if S > 512 else S
-        out = []
-        for c0 in range(0, S, chunk):
-            c1 = min(c0 + chunk, S)
-            cs = c1 - c0
-            q_pos = offset + mx.arange(c0, c1)
-            visible = (kv_pos[None, None, :] <= q_pos[None, :, None]) & valid[
-                :, None, :
-            ]
-            scores = q[:, c0:c1] @ pool_keys_t
-            scores = mx.maximum(scores * self.softmax_scale, 0.0)
-            weights = self.weights_proj(x[:, c0:c1]) * (self.n_heads**-0.5)
-            index_scores = mx.sum(weights[..., None] * scores, axis=2)
-            pool_visible = mx.take_along_axis(
-                visible, mx.broadcast_to(pool_end[:, None, :], (B, cs, P)), axis=-1
-            )
-            valid_candidates = pool_visible & pool_valid[:, None]
-            index_scores = mx.where(valid_candidates, index_scores, -1e30)
-            order = mx.argsort(-index_scores, axis=-1)
-            selected = order[..., :select_k]
-            selected_valid = mx.take_along_axis(valid_candidates, selected, axis=-1)
-            pi = mx.broadcast_to(pool_indices[:, None], (B, cs, P, self.index_kpool))
-            sel_exp = mx.broadcast_to(
-                selected[..., None], (B, cs, select_k, self.index_kpool)
-            )
-            selected_indices = mx.take_along_axis(pi, sel_exp, axis=2)
-            topk = selected_indices.reshape(B, cs, select_k * self.index_kpool)
-            sv = mx.broadcast_to(
-                selected_valid[..., None], (B, cs, select_k, self.index_kpool)
-            ).reshape(B, cs, select_k * self.index_kpool)
-            topk = mx.where(sv, topk, -1)
-            if tail_on:
-                topk = mx.concatenate(
-                    [topk, self._visible_tail(visible, valid)], axis=-1
+    def __call__(
+        self,
+        x,
+        q_resid,
+        padding_mask=None,
+        cache=None,
+        pool_cache=None,
+        offset=0,
+        cache_update_sink=None,
+        linear_fn=None,
+        projected=None,
+    ):
+        linear_fn = linear_fn or (lambda linear, inputs: linear(inputs))
+        batch, q_length, _ = x.shape
+        if projected is None:
+            k = self.k_norm(linear_fn(self.wk, x))
+            if cache_update_sink is None:
+                gate = x.astype(mx.float32) @ self.index_kpool_compress_gate.T
+            else:
+                gate = mx.concatenate(
+                    [
+                        x[:, index : index + 1].astype(mx.float32)
+                        @ self.index_kpool_compress_gate.T
+                        for index in range(q_length)
+                    ],
+                    axis=1,
                 )
-            if topk.shape[-1] < output_width:
-                pad = mx.full(
-                    (B, cs, output_width - topk.shape[-1]), -1, dtype=topk.dtype
+            projected_q = projected_weights = None
+        else:
+            k, gate, projected_q, projected_weights = projected
+        if padding_mask is None:
+            query_valid = mx.ones((batch, q_length), dtype=mx.bool_)
+        else:
+            query_valid = padding_mask.astype(mx.bool_)
+        if cache_update_sink is not None:
+            cache_update_sink.update(
+                indexer=self,
+                index_keys=k,
+                index_gates=gate.astype(k.dtype),
+                query_valid=query_valid,
+                cache_offset=offset,
+            )
+        if cache is not None:
+            valid_state, _ = cache.update_and_fetch(
+                query_valid[:, None, :, None],
+                mx.zeros((batch, 1, q_length, 0), dtype=mx.bool_),
+            )
+            key_valid = valid_state[:, 0, :, 0].astype(mx.bool_)
+
+            ready_k, ready_gate, _ = pool_cache.accumulate_windows(
+                k, gate.astype(k.dtype), offset
+            )
+            new_pool_keys = self._compress_pools(ready_k, ready_gate)
+            pool_keys = pool_cache.update_and_fetch(new_pool_keys)
+
+            pool_count = pool_keys.shape[1]
+            first_key = mx.where(
+                mx.any(key_valid, axis=-1),
+                mx.argmax(key_valid.astype(mx.int32), axis=-1),
+                key_valid.shape[1],
+            )
+            pool_offsets = mx.arange(pool_count * self.index_kpool).reshape(
+                1, pool_count, self.index_kpool
+            )
+            pool_indices = first_key[:, None, None] + pool_offsets
+            if isinstance(pool_cache.offset, mx.array):
+                pool_valid = mx.arange(pool_count)[None] < pool_cache.offset[:, None]
+            else:
+                pool_valid = mx.ones((batch, pool_count), dtype=mx.bool_)
+        else:
+            packed = mx.concatenate(
+                [k, gate.astype(k.dtype), query_valid[..., None].astype(k.dtype)],
+                axis=-1,
+            )
+            pool_keys, pool_indices, pool_valid, key_valid = self._pooled_states(packed)
+
+        kv_length = key_valid.shape[1]
+        query_positions = kv_length - q_length + mx.arange(q_length)
+
+        pool_count = pool_indices.shape[1]
+        select_k = min(self.index_topk // self.index_kpool, pool_count)
+        if pool_count == 0:
+            topk = mx.zeros((batch, q_length, 0), dtype=mx.int32)
+        else:
+            pool_end = mx.clip(pool_indices[..., -1], 0, max(kv_length - 1, 0))
+            if select_k == pool_count:
+                selected, selected_valid = _exact_pool_select(
+                    None,
+                    pool_keys,
+                    None,
+                    pool_end,
+                    pool_valid,
+                    query_positions,
+                    select_k,
+                    self.softmax_scale,
                 )
-                topk = mx.concatenate([topk, pad], axis=-1)
-            topk = topk[..., :output_width]
-            topk = mx.where(valid_cur[:, c0:c1][..., None], topk, -1)
-            out.append(topk)
-        topk = out[0] if len(out) == 1 else mx.concatenate(out, axis=1)
-        return topk[:, None].astype(mx.int32)
+            else:
+                q = projected_q
+                if q is None:
+                    q = linear_fn(self.wq_b, q_resid).reshape(
+                        batch, q_length, self.n_heads, self.head_dim
+                    )
+                weights = projected_weights
+                if weights is None:
+                    weights = (
+                        linear_fn(self.weights_proj, x).astype(mx.float32)
+                        * self.n_heads**-0.5
+                    )
+                # Keep the score matmul in the model dtype, as serving runtimes
+                # do, then aggregate heads in FP32. Query chunking bounds the
+                # [B, chunk, H, pools] temporary while evaluating every pool.
+                selected, selected_valid = _exact_pool_select(
+                    q,
+                    pool_keys,
+                    weights,
+                    pool_end,
+                    pool_valid,
+                    query_positions,
+                    select_k,
+                    self.softmax_scale,
+                )
+
+            # ``argpartition`` guarantees the selected set, but not its order.
+            # Ragged speculative batches can represent the same logical history
+            # with different physical padding, which otherwise changes the SDPA
+            # reduction order (and eventually close logit decisions).  Restore
+            # chronological pool order and keep invalid slots at the end.
+            selection_order = mx.argsort(
+                mx.where(selected_valid, selected, pool_count), axis=-1
+            )
+            selected = mx.take_along_axis(selected, selection_order, axis=-1)
+            selected_valid = mx.take_along_axis(
+                selected_valid, selection_order, axis=-1
+            )
+
+            safe_selected = mx.clip(selected, 0, max(pool_count - 1, 0))
+            expanded_pools = mx.broadcast_to(
+                pool_indices[:, None],
+                (batch, q_length, *pool_indices.shape[1:]),
+            )
+            selected_indices = mx.take_along_axis(
+                expanded_pools,
+                safe_selected[..., None],
+                axis=2,
+            )
+            topk = selected_indices.reshape(batch, q_length, -1)
+            topk = mx.where(
+                mx.repeat(selected_valid[..., None], self.index_kpool, axis=-1).reshape(
+                    batch, q_length, -1
+                ),
+                topk,
+                -1,
+            )
+
+        # Keep the complete-pool region at a fixed width before appending the
+        # partial tail.  Otherwise the tail's attention slot depends on the
+        # largest pool count in another batch row, changing fused-SDPA
+        # reduction order for an otherwise identical logical sequence.
+        if topk.shape[-1] < self.index_topk:
+            topk = mx.pad(
+                topk,
+                [(0, 0), (0, 0), (0, self.index_topk - topk.shape[-1])],
+                constant_values=-1,
+            )
+        topk = topk[..., : self.index_topk]
+        output_width = self.index_topk
+        if self.always_select_tail and self.index_kpool > 1:
+            tail_width = self.index_kpool - 1
+            valid_prefix = mx.cumsum(key_valid.astype(mx.int32), axis=-1)
+            safe_query_positions = mx.clip(query_positions, 0, max(kv_length - 1, 0))
+            visible_count = mx.take_along_axis(
+                valid_prefix,
+                mx.broadcast_to(safe_query_positions[None], (batch, q_length)),
+                axis=-1,
+            )
+            tail_count = visible_count % self.index_kpool
+            first_key = mx.where(
+                mx.any(key_valid, axis=-1),
+                mx.argmax(key_valid.astype(mx.int32), axis=-1),
+                kv_length,
+            )
+            tail_start = first_key[:, None] + visible_count - tail_count
+            tail = tail_start[..., None] + mx.arange(tail_width)
+            tail_valid = (mx.arange(tail_width)[None, None] < tail_count[..., None]) & (
+                tail < kv_length
+            )
+            safe_tail = mx.clip(tail, 0, max(kv_length - 1, 0))
+            tail_valid = tail_valid & _batch_gather(
+                key_valid[..., None], safe_tail
+            ).squeeze(-1)
+            topk = mx.concatenate([topk, mx.where(tail_valid, tail, -1)], axis=-1)
+            output_width += tail_width
+
+        topk = topk[..., :output_width]
+        return mx.where(query_valid[..., None], topk, -1).astype(mx.int32)
 
 
-class Glm5NextSparseAttention(nn.Module):
-    def __init__(self, config: TextConfig):
+def _sparse_prefill_attention(q, k, v, indices, scale, chunk_size=16, use_kernel=True):
+    if use_kernel:
+        output = indexed_sparse_attention(q, k, v, indices, scale)
+        if output is not None:
+            return output
+
+    batch, heads, q_length, dim = q.shape
+    kv_length = k.shape[2]
+    outputs = []
+    for start in range(0, q_length, chunk_size):
+        end = min(start + chunk_size, q_length)
+        idx = indices[:, start:end]
+        valid = (idx >= 0) & (idx < kv_length)
+        safe = mx.clip(idx, 0, max(kv_length - 1, 0))
+        chunk_length = end - start
+
+        # Gather once from [B, H, N, D], then fold each query row into the
+        # batch dimension so MLX can use its fused SDPA kernel. The outer loop
+        # is only memory tiling; score, mask, softmax, and value reduction are
+        # fused rather than materialized as separate FP32 tensors.
+        selected_k = _sparse_head_gather(k, safe)
+        selected_v = _sparse_head_gather(v, safe)
+        chunk_q = (
+            q[:, :, start:end]
+            .transpose(0, 2, 1, 3)
+            .reshape(batch * chunk_length, heads, 1, dim)
+        )
+        mask = valid.reshape(batch * chunk_length, 1, 1, idx.shape[-1])
+        out = mx.fast.scaled_dot_product_attention(
+            chunk_q,
+            selected_k,
+            selected_v,
+            scale=scale,
+            mask=mask,
+        )
+        outputs.append(
+            out.reshape(batch, chunk_length, heads, v.shape[-1]).transpose(0, 2, 1, 3)
+        )
+    return mx.concatenate(outputs, axis=2)
+
+
+# Projected MLA keys/values make prefill much faster, but unlike the latent
+# cache they grow by every attention head. Bound the transient optimization so
+# million-token contexts retain the compressed-cache memory advantage.
+_MAX_PROJECTED_PREFILL_TOKENS = 32768
+
+
+class Glm5NextAttention(nn.Module):
+    def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.q_lora_rank = config.q_lora_rank
-        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.q_head_dim = config.qk_nope_head_dim
         self.kv_lora_rank = config.kv_lora_rank
         self.v_head_dim = config.v_head_dim
-        self.qk_nope_head_dim = config.qk_nope_head_dim
-        self.use_nope = config.mla_use_nope or config.qk_rope_head_dim == 0
-        # GLM-5-Next is NoPE by design (qk_rope_head_dim=0, mla_use_nope=True); the
-        # config carries no rope parameters. Fail loudly rather than run wrong math
-        # if a future config ever requests a RoPE MLA.
-        if not self.use_nope:
-            raise NotImplementedError(
-                "glm5_next implements NoPE MLA only; qk_rope_head_dim>0 with "
-                "mla_use_nope=False is not supported."
-            )
-        self.q_head_dim = config.qk_nope_head_dim
         self.scale = self.q_head_dim**-0.5
-
-        self.q_a_proj = nn.Linear(
-            self.hidden_size, self.q_lora_rank, bias=config.attention_bias
+        self.skip_topk = config.indexer_types[layer_idx] == "shared"
+        self.qkv_a_proj = nn.Linear(
+            config.hidden_size,
+            config.q_lora_rank + config.kv_lora_rank,
+            bias=config.attention_bias,
         )
-        self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=1e-6)
+        self.q_a_layernorm = nn.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
         self.q_b_proj = nn.Linear(
-            self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
+            config.q_lora_rank,
+            self.num_heads * self.q_head_dim,
+            bias=False,
         )
-        self.kv_a_proj_with_mqa = nn.Linear(
-            self.hidden_size, self.kv_lora_rank, bias=config.attention_bias
-        )
-        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=1e-6)
+        self.kv_a_layernorm = nn.RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
         self.embed_q = MultiLinear(
             self.qk_nope_head_dim, self.kv_lora_rank, self.num_heads
         )
         self.unembed_out = MultiLinear(
             self.kv_lora_rank, self.v_head_dim, self.num_heads
         )
-        self._absorbed_dims = (
-            self.kv_lora_rank,
-            self.qk_nope_head_dim,
-            self.v_head_dim,
-        )
         self.o_proj = nn.Linear(
             self.num_heads * self.v_head_dim,
-            self.hidden_size,
+            config.hidden_size,
             bias=config.attention_bias,
         )
-        self.indexer = Glm5NextIndexer(config)
+        self.indexer = None if self.skip_topk else Glm5NextIndexer(config, layer_idx)
 
     def __call__(
         self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
-        B, L, D = x.shape
+        x,
+        padding_mask=None,
+        cache=None,
+        prev_topk_indices=None,
+        last_only: bool = False,
+    ):
+        batch, length, _ = x.shape
+        q_a, kv_a = mx.split(self.qkv_a_proj(x), (self.q_lora_rank,), axis=-1)
+        q_resid = self.q_a_layernorm(q_a)
+        q = (
+            self.q_b_proj(q_resid)
+            .reshape(batch, length, self.num_heads, self.q_head_dim)
+            .transpose(0, 2, 1, 3)
+        )
+        new_latent = self.kv_a_layernorm(kv_a)[:, None]
 
-        qr = self.q_a_layernorm(self.q_a_proj(x))
-        q = self.q_b_proj(qr)
-        q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
-
-        compressed_kv = self.kv_a_proj_with_mqa(x)
-        kv_latent = self.kv_a_layernorm(compressed_kv)
-        kv_latent = mx.expand_dims(kv_latent, axis=1)
-
-        if cache is not None:
-            kv_latent, _ = cache[0].update_and_fetch(kv_latent, kv_latent)
+        if cache is None:
+            kv_cache = index_cache = pool_cache = None
+            projected_cache = None
+            cache_offset = 0
+            latent = new_latent
         else:
-            cache = [None] * 2
-
-        topk_indices = self.indexer(x, qr, mask, cache=cache[1])
-        attn_mask = mask
-        if topk_indices is not None:
-            Kv = kv_latent.shape[2]
-            valid_sel = topk_indices >= 0
-            if L == 1:
-                clamped = mx.clip(topk_indices[:, :, 0, :], 0, Kv - 1)
-                idx = clamped[..., None]
-                kv_latent = mx.take_along_axis(
-                    kv_latent,
-                    mx.broadcast_to(idx, idx.shape[:-1] + (kv_latent.shape[-1],)),
-                    axis=2,
-                )
-                sel_mask = valid_sel[:, :, 0, :][:, :, None, :]
-                if mask is not None and mask.dtype == mx.bool_:
-                    # Single-stream decode passes mask=None here; under continuous
-                    # batching the batched cache supplies a left-pad mask that can be
-                    # 4-D ([B, 1, 1, Kv]) while `clamped` is 3-D. At S=1 the mask is
-                    # purely per-key (no causal), so reduce it to [B, Kv] and gather the
-                    # selected key positions -- rank-agnostic and batch-safe.
-                    mkeys = mask.reshape(B, -1, Kv)[:, 0, :]
-                    gathered = mx.take_along_axis(
-                        mx.broadcast_to(mkeys[:, None, :], (B, clamped.shape[1], Kv)),
-                        clamped,
-                        axis=-1,
-                    )
-                    sel_mask = sel_mask & gathered[:, :, None, :]
-                attn_mask = sel_mask
+            kv_cache = cache[0]
+            cache_offset = kv_cache.offset
+            if self.indexer is None:
+                index_cache = pool_cache = None
+                projected_cache = cache[1]
             else:
-                shape = list(topk_indices.shape)
-                shape[-1] = Kv + 1
-                safe_idx = mx.where(valid_sel, topk_indices, Kv)
-                sparse_mask = mx.zeros(shape, dtype=mx.bool_)
-                sparse_mask = mx.put_along_axis(
-                    sparse_mask, safe_idx, mx.array(True), axis=-1
-                )
-                sparse_mask = sparse_mask[..., :Kv]
-                if mask is not None and mask.dtype == mx.bool_:
-                    sparse_mask = sparse_mask & mask
-                attn_mask = sparse_mask
+                index_cache = cache[1]
+                pool_cache = cache[2]
+                projected_cache = cache[3]
+            latent, _ = kv_cache.update_and_fetch(
+                new_latent,
+                mx.zeros((batch, 1, length, 0), dtype=new_latent.dtype),
+            )
 
-        if (
-            cache is not None
-            and cache[0] is not None
-            and cache[1] is not None
-            and cache[1].keys is not None
-        ):
-            cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
-
-        absorbed = L == 1 or L <= max_absorbed_queries(
-            *self._absorbed_dims, latent_length(kv_latent)
-        )
-        if absorbed:
-            q = self.embed_q(q)
-            k = v = kv_latent
+        if self.indexer is None:
+            if prev_topk_indices is None:
+                raise ValueError("Shared indexer layer has no previous top-k indices.")
+            topk = prev_topk_indices
         else:
-            k = self.embed_q(kv_latent, transpose=False)
-            v = self.unembed_out(kv_latent)
+            topk = self.indexer(
+                x,
+                q_resid,
+                padding_mask,
+                index_cache,
+                pool_cache,
+                cache_offset,
+            )
 
-        output = scaled_dot_product_attention(
-            q, k, v, cache=cache, scale=self.scale, mask=attn_mask
-        )
-        if absorbed:
-            output = self.unembed_out(output)
+        if length == 1:
+            kv_length = latent.shape[2]
+            valid = (topk >= 0) & (topk < kv_length)
+            safe = mx.clip(topk, 0, max(kv_length - 1, 0))
+            selected = mx.take_along_axis(
+                latent,
+                safe[:, None, 0, :, None],
+                axis=2,
+            )
+            q = self.embed_q(q)
+            out = scaled_dot_product_attention(
+                q,
+                selected,
+                selected,
+                cache=kv_cache,
+                scale=self.scale,
+                mask=valid[:, None],
+            )
+            out = self.unembed_out(out)
+        else:
+            previous_length = latent.shape[2] - length
+            cache_matches = (
+                projected_cache is not None
+                and projected_cache.size() == previous_length
+                and latent.shape[2] <= _MAX_PROJECTED_PREFILL_TOKENS
+            )
+            if cache_matches:
+                new_keys = self.embed_q(new_latent, transpose=False)
+                new_values = self.unembed_out(new_latent)
+                keys, values = projected_cache.update_and_fetch(new_keys, new_values)
+            else:
+                keys = self.embed_q(latent, transpose=False)
+                values = self.unembed_out(latent)
+            if last_only:
+                q = q[:, :, -1:]
+                topk = topk[:, -1:]
+            out = _sparse_prefill_attention(q, keys, values, topk, self.scale)
 
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+        output_length = 1 if last_only and length > 1 else length
+        out = out.transpose(0, 2, 1, 3).reshape(batch, output_length, -1)
+        return self.o_proj(out), topk
 
 
-class Glm5NextDecoderLayer(nn.Module):
+class DecoderLayer(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
-        layer_type = config.layer_types[layer_idx]
-        self.is_linear = layer_type == "linear_attention"
-        if self.is_linear:
-            self.self_attn = Glm5NextLinearAttention(config)
-        else:
-            self.self_attn = Glm5NextSparseAttention(config)
-
-        is_sparse = (
-            config.n_routed_experts is not None
-            and layer_idx >= config.first_k_dense_replace
-            and config.mlp_layer_types[layer_idx] == "sparse"
+        self.block_type = config.layer_types[layer_idx]
+        self.is_linear = self.block_type == "linear_attention"
+        self.self_attn = (
+            Glm5NextLinearAttention(config, layer_idx)
+            if self.block_type == "linear_attention"
+            else Glm5NextAttention(config, layer_idx)
         )
-        self.mlp = DeepseekV32MoE(config) if is_sparse else DeepseekMLP(config)
-
+        self.mlp = (
+            Glm5NextMoE(config)
+            if config.mlp_layer_types[layer_idx] == "sparse"
+            else Glm5NextMLP(config)
+        )
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.attn_hc = HyperConnection(config)
         self.ffn_hc = HyperConnection(config)
-        self.compile_ffn = True
-        self._ffn_c = None
 
     def __call__(
         self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
+        x,
+        mask=None,
+        cache=None,
+        prev_topk_indices=None,
+    ):
         residual = x
-        xc, post, comb = self.attn_hc(x)
-        r = self.self_attn(self.input_layernorm(xc), mask, cache)
-        x = hc_expand(r, residual, post, comb)
-        # Compile the FFN block only for single-stream decode (B=1, S=1) -- the shape it
-        # was validated on and where its win lives. Compiling the 288-expert MoE at a
-        # batched or prefill shape spikes memory (it can OOM alongside the resident
-        # weights), so those shapes take the eager path.
-        if self.compile_ffn and x.shape[0] == 1 and x.shape[1] == 1:
-            if self._ffn_c is None:
-                self._ffn_c = mx.compile(self._ffn_block)
-            return self._ffn_c(x)
-        return self._ffn_block(x)
+        collapsed, post, comb = self.attn_hc(x)
+        collapsed = self.input_layernorm(collapsed)
+        if self.block_type == "linear_attention":
+            collapsed = self.self_attn(collapsed, mask, cache)
+            topk = prev_topk_indices
+        else:
+            collapsed, topk = self.self_attn(
+                collapsed,
+                mask,
+                cache,
+                prev_topk_indices,
+            )
+        x = hc_expand(collapsed, residual, post, comb)
 
-    def _ffn_block(self, x: mx.array) -> mx.array:
-        # Stateless FFN half (no cache) -> compiles cleanly at a fixed decode shape.
         residual = x
-        xc, post, comb = self.ffn_hc(x)
-        m = self.mlp(self.post_attention_layernorm(xc))
-        return hc_expand(m, residual, post, comb)
+        collapsed, post, comb = self.ffn_hc(x)
+        collapsed = self.mlp(self.post_attention_layernorm(collapsed))
+        return hc_expand(collapsed, residual, post, comb), topk
 
 
-class Glm5NextModel(nn.Module):
+class Glm5NextTextModel(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
-        self.hc_mult = config.hc_mult
-        self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
-            Glm5NextDecoderLayer(config, idx) for idx in range(config.num_hidden_layers)
+            DecoderLayer(config, layer_idx)
+            for layer_idx in range(config.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.ssm_idx = next((i for i, l in enumerate(self.layers) if l.is_linear), 0)
-        self.fa_idx = next((i for i, l in enumerate(self.layers) if not l.is_linear), 0)
 
     def __call__(
         self,
-        inputs: mx.array,
-        cache: Optional[Any] = None,
+        inputs: Optional[mx.array],
         inputs_embeds: Optional[mx.array] = None,
-    ) -> mx.array:
+        cache: Optional[List[Any]] = None,
+        attention_mask: Optional[mx.array] = None,
+        hidden_sink: Optional[List[mx.array]] = None,
+    ):
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
-
         if cache is None:
             cache = [None] * len(self.layers)
+        if attention_mask is not None:
+            attention_mask = attention_mask.astype(mx.bool_)
+            if attention_mask.shape[-1] != h.shape[1]:
+                attention_mask = attention_mask[..., -h.shape[1] :]
 
-        fa_cache = cache[self.fa_idx]
-        fa_mask = create_attention_mask(
-            h, fa_cache[0] if fa_cache else None, return_array=True
-        )
-        ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
-
-        h = mx.broadcast_to(
-            h[:, :, None, :], (h.shape[0], h.shape[1], self.hc_mult, h.shape[2])
-        )
-        h = mx.contiguous(h)
-
-        for layer, c in zip(self.layers, cache):
-            mask = ssm_mask if layer.is_linear else fa_mask
-            h = layer(h, mask=mask, cache=c)
-
-        h = h.mean(axis=2)
-        return self.norm(h)
+        h = mx.repeat(h[:, :, None], self.config.hc_mult, axis=2)
+        topk = None
+        for layer, layer_cache in zip(self.layers, cache):
+            layer_mask = attention_mask
+            if layer.block_type == "linear_attention" and layer_cache is not None:
+                layer_mask = create_ssm_mask(h[:, :, 0], layer_cache)
+            h, topk = layer(
+                h,
+                layer_mask,
+                layer_cache,
+                topk,
+            )
+        h = self.norm(h.mean(axis=2))
+        if hidden_sink is not None:
+            hidden_sink.append(h)
+        return h
 
 
 class LanguageModel(nn.Module):
-    def __init__(self, args: TextConfig, config: ModelConfig = None):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.args = args
-        self.config = args
-        self.model_type = args.model_type
-        self.model = Glm5NextModel(args)
-        if not args.tie_word_embeddings:
-            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.args = config
+        self.config = config
+        self.model_type = config.model_type
+        self.model = Glm5NextTextModel(config)
+        if not config.tie_word_embeddings:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del input_ids, inputs_embeds, prompt_cache
+        prefill_kwargs = prefill_kwargs or {}
+        if draft_model is None:
+            return True
+        if draft_kind == "mtp":
+            return bool(prefill_kwargs.get("return_hidden", False)) and bool(
+                prefill_kwargs.get("return_shared_kv", False)
+            )
+        return draft_kind is None
 
     def __call__(
         self,
         inputs: Optional[mx.array] = None,
+        cache=None,
         inputs_embeds: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-        mask: Optional[mx.array] = None,
         **kwargs,
     ) -> LanguageModelOutput:
+        return_hidden = kwargs.pop("return_hidden", False)
+        return_shared_kv = kwargs.pop("return_shared_kv", False)
+        skip_logits = kwargs.pop("skip_logits", False)
+        speculative_verify = kwargs.pop("speculative_verify", False)
+        hidden_sink = kwargs.pop("hidden_sink", None)
+        if return_hidden and hidden_sink is None:
+            hidden_sink = []
         if inputs is None:
             inputs = kwargs.get("input_ids")
-        out = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
-        # Only the last few positions' logits are ever needed for generation; slicing
-        # before the (vocab-wide) projection skips it on discarded prefill positions.
-        nlk = kwargs.get("num_logits_to_keep", 0)
-        if nlk:
-            out = out[:, -nlk:, :]
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
+        attention_mask = kwargs.get("attention_mask")
+        if speculative_verify:
+            return _SPECULATIVE_VERIFIER(
+                self,
+                inputs,
+                inputs_embeds=inputs_embeds,
+                cache=cache,
+                attention_mask=attention_mask,
+                hidden_sink=hidden_sink,
+                return_shared_kv=return_shared_kv,
+                skip_logits=skip_logits,
+            )
+        hidden = self.model(
+            inputs,
+            inputs_embeds,
+            cache,
+            attention_mask,
+            hidden_sink=hidden_sink,
+        )
+        num_logits_to_keep = kwargs.get("num_logits_to_keep", 0)
+        if num_logits_to_keep:
+            hidden = hidden[:, -num_logits_to_keep:, :]
+        if skip_logits:
+            logits = None
+        elif self.args.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(hidden)
         else:
-            out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
+            logits = self.lm_head(hidden)
+        return LanguageModelOutput(
+            logits=logits,
+            hidden_states=hidden_sink,
+            shared_kv_states={} if return_shared_kv else None,
+        )
 
-    def sanitize(self, weights):
-        weights = {k: v for k, v in weights.items() if "mtp." not in k}
-        weights = DSV32Model.sanitize(self, weights)
+    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        return _SPECULATIVE_VERIFIER.logits_from_hidden(self, hidden)
 
-        remapped = {}
-        conv_parts = {}
-        fg_parts = ("A_log", "dt_bias", "f_a_proj.weight", "f_b_proj.weight")
-        for k, v in weights.items():
-            nk = k.replace(".hc_attn_", ".attn_hc.").replace(".hc_ffn_", ".ffn_hc.")
+    def speculative_argmax_from_hidden(self, hidden: mx.array) -> mx.array:
+        return _SPECULATIVE_VERIFIER.argmax_from_hidden(self, hidden)
 
-            fused = False
-            for part in ("q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight"):
-                suffix = ".self_attn." + part
-                if nk.endswith(suffix):
-                    prefix = nk[: -len(part)]
-                    conv_parts.setdefault(prefix, {})[part[0]] = v
-                    fused = True
-                    break
-            if fused:
-                continue
+    def speculative_verify_logits(self, inputs, cache, sampler):
+        return _SPECULATIVE_VERIFIER.verify(self, inputs, cache, sampler)
 
-            for p in fg_parts:
-                suffix = ".self_attn." + p
-                if nk.endswith(suffix):
-                    nk = nk[: -len(p)] + "forget_gate." + p
-                    break
+    def speculative_verify_hidden(self, inputs, cache):
+        return _SPECULATIVE_VERIFIER.verify(self, inputs, cache)
 
-            remapped[nk] = v
-
-        for prefix, parts in conv_parts.items():
-            if all(c in parts for c in ("q", "k", "v")):
-                remapped[prefix + "conv1d.weight"] = mx.concatenate(
-                    [parts["q"], parts["k"], parts["v"]], axis=0
-                )
-            else:
-                for c, w in parts.items():
-                    remapped[prefix + c + "_conv1d.weight"] = w
-
-        weights = remapped
-        for k, v in list(weights.items()):
-            if "conv1d.weight" in k and v.ndim == 3 and v.shape[-1] != 1:
-                weights[k] = v.moveaxis(2, 1)
-        return weights
+    def rollback_speculative_cache(
+        self,
+        caches: List[Any],
+        rollback_state,
+        accepted,
+        block_size: int,
+    ) -> int:
+        return _SPECULATIVE_VERIFIER.rollback(
+            self,
+            caches,
+            rollback_state,
+            accepted,
+            block_size,
+        )
 
     @property
     def layers(self):
@@ -759,20 +1096,24 @@ class LanguageModel(nn.Module):
 
     @property
     def cast_predicate(self):
-        def predicate(k):
-            return "e_score_correction_bias" not in k
+        def predicate(path):
+            return not (
+                path.endswith(("A_log", "dt_bias", "e_score_correction_bias"))
+                or ".attn_hc." in path
+                or ".ffn_hc." in path
+                or "index_kpool_compress" in path
+            )
 
         return predicate
 
     @property
     def quant_predicate(self):
         def predicate(path, _):
-            if (
-                path.endswith("mlp.gate")
-                or "e_score_correction_bias" in path
-                or ".indexer" in path
+            if any(
+                marker in path
+                for marker in ("attn_hc", "ffn_hc", "index_kpool_compress")
             ):
-                return {"group_size": 64, "bits": 8}
+                return False
             return True
 
         return predicate
@@ -780,8 +1121,178 @@ class LanguageModel(nn.Module):
     def make_cache(self):
         caches = []
         for layer in self.layers:
-            if layer.is_linear:
-                caches.append(ArraysCache(size=2))
-            else:
+            if layer.block_type == "linear_attention":
+                caches.append(ArraysCache(size=4))
+            elif layer.self_attn.indexer is None:
                 caches.append(CacheList(KVCache(), KVCache()))
+            else:
+                indexer = layer.self_attn.indexer
+                caches.append(
+                    CacheList(
+                        KVCache(),
+                        KVCache(),
+                        PoolingCache(indexer.index_kpool),
+                        KVCache(),
+                    )
+                )
         return caches
+
+    def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+        prefixes = ("language_model.model.", "model.", "")
+        cleaned = {}
+        for key, value in weights.items():
+            drop = False
+            for prefix in prefixes[:-1]:
+                layer_prefix = f"{prefix}layers."
+                if key.startswith(layer_prefix):
+                    try:
+                        layer_idx = int(key[len(layer_prefix) :].split(".", 1)[0])
+                        drop = layer_idx >= self.args.num_hidden_layers
+                    except ValueError:
+                        pass
+                    break
+            if not drop:
+                cleaned[key] = value
+        weights = cleaned
+
+        remapped = {}
+        for key, value in weights.items():
+            for site in ("attn", "ffn"):
+                for name in ("fn", "base", "scale"):
+                    key = key.replace(f".hc_{site}_{name}", f".{site}_hc.{name}")
+            for old, new in (
+                ("q_conv1d", "q_conv.conv"),
+                ("k_conv1d", "k_conv.conv"),
+                ("v_conv1d", "v_conv.conv"),
+            ):
+                if key.endswith(f".{old}.weight"):
+                    key = key.replace(f".{old}.weight", f".{new}.weight")
+                    if value.ndim == 3:
+                        value = value.moveaxis(2, 1)
+            remapped[key] = value
+        weights = remapped
+
+        for layer_idx, layer in enumerate(self.layers):
+            prefix = f"language_model.model.layers.{layer_idx}"
+            mlp_prefixes = []
+            if isinstance(layer.mlp, Glm5NextMLP):
+                mlp_prefixes.append(f"{prefix}.mlp")
+            elif isinstance(layer.mlp, Glm5NextMoE):
+                mlp_prefixes.append(f"{prefix}.mlp.shared_experts")
+            for mlp_prefix in mlp_prefixes:
+                for suffix in ("weight", "scales", "biases"):
+                    source_keys = [
+                        f"{mlp_prefix}.{projection}.{suffix}"
+                        for projection in ("gate_proj", "up_proj")
+                    ]
+                    present = [key in weights for key in source_keys]
+                    if not any(present):
+                        continue
+                    if not all(present):
+                        continue
+                    weights[f"{mlp_prefix}.gate_up_proj.{suffix}"] = mx.concatenate(
+                        [weights.pop(key) for key in source_keys], axis=0
+                    )
+
+            if isinstance(layer.self_attn, Glm5NextLinearAttention):
+                attn_prefix = f"{prefix}.self_attn"
+                for destination, sources in (
+                    ("qkv_proj", ("q_proj", "k_proj", "v_proj")),
+                    ("fbg_a_proj", ("f_a_proj", "b_proj", "g_a_proj")),
+                    (
+                        "qkv_conv.conv",
+                        ("q_conv.conv", "k_conv.conv", "v_conv.conv"),
+                    ),
+                ):
+                    for suffix in ("weight", "scales", "biases"):
+                        source_keys = [
+                            f"{attn_prefix}.{source}.{suffix}" for source in sources
+                        ]
+                        present = [key in weights for key in source_keys]
+                        if not any(present):
+                            continue
+                        if not all(present):
+                            continue
+                        weights[f"{attn_prefix}.{destination}.{suffix}"] = (
+                            mx.concatenate(
+                                [weights.pop(key) for key in source_keys], axis=0
+                            )
+                        )
+
+            if isinstance(layer.mlp, Glm5NextMoE):
+                for name in ("gate_proj", "up_proj", "down_proj"):
+                    for suffix in ("weight", "scales", "biases"):
+                        key0 = f"{prefix}.mlp.experts.0.{name}.{suffix}"
+                        if key0 in weights:
+                            values = [
+                                weights.pop(
+                                    f"{prefix}.mlp.experts.{expert}.{name}.{suffix}"
+                                )
+                                for expert in range(self.args.n_routed_experts)
+                            ]
+                            weights[f"{prefix}.mlp.switch_mlp.{name}.{suffix}"] = (
+                                mx.stack(values)
+                            )
+
+            attn_prefix = f"{prefix}.self_attn"
+            if isinstance(layer.self_attn, Glm5NextAttention):
+                for suffix in ("weight", "scales", "biases", "bias"):
+                    source_keys = [
+                        f"{attn_prefix}.{projection}.{suffix}"
+                        for projection in ("q_a_proj", "kv_a_proj_with_mqa")
+                    ]
+                    present = [key in weights for key in source_keys]
+                    if not any(present):
+                        continue
+                    if not all(present):
+                        continue
+                    weights[f"{attn_prefix}.qkv_a_proj.{suffix}"] = mx.concatenate(
+                        [weights.pop(key) for key in source_keys], axis=0
+                    )
+
+            kv_b_key = f"{attn_prefix}.kv_b_proj.weight"
+            if isinstance(layer.self_attn, Glm5NextAttention) and kv_b_key in weights:
+                value = weights.pop(kv_b_key)
+                quantized = f"{attn_prefix}.kv_b_proj.scales" in weights
+                if quantized:
+                    scales = weights.pop(f"{attn_prefix}.kv_b_proj.scales")
+                    biases = weights.pop(f"{attn_prefix}.kv_b_proj.biases", None)
+                    bits = value.shape[-1] * 32 // self.args.kv_lora_rank
+                    group_size = self.args.kv_lora_rank // scales.shape[-1]
+                    mode = "mxfp8" if biases is None and bits == 8 else "affine"
+                    dequantize_kwargs = {
+                        "bits": bits,
+                        "group_size": group_size,
+                        "mode": mode,
+                    }
+                    if biases is None:
+                        value = mx.dequantize(value, scales, **dequantize_kwargs)
+                    else:
+                        value = mx.dequantize(
+                            value, scales, biases, **dequantize_kwargs
+                        )
+                value = value.reshape(
+                    self.args.num_attention_heads,
+                    self.args.qk_nope_head_dim + self.args.v_head_dim,
+                    self.args.kv_lora_rank,
+                )
+                wk = mx.contiguous(
+                    value[:, : self.args.qk_nope_head_dim].swapaxes(-1, -2)
+                )
+                wv = mx.contiguous(value[:, self.args.qk_nope_head_dim :])
+                if quantized:
+                    wk, wk_s, *wk_b = mx.quantize(
+                        wk, bits=bits, group_size=group_size, mode=mode
+                    )
+                    wv, wv_s, *wv_b = mx.quantize(
+                        wv, bits=bits, group_size=group_size, mode=mode
+                    )
+                    weights[f"{attn_prefix}.embed_q.scales"] = wk_s
+                    weights[f"{attn_prefix}.unembed_out.scales"] = wv_s
+                    if wk_b:
+                        weights[f"{attn_prefix}.embed_q.biases"] = wk_b[0]
+                    if wv_b:
+                        weights[f"{attn_prefix}.unembed_out.biases"] = wv_b[0]
+                weights[f"{attn_prefix}.embed_q.weight"] = wk
+                weights[f"{attn_prefix}.unembed_out.weight"] = wv
+        return weights

@@ -865,7 +865,11 @@ def get_model_path(
     return model_path
 
 
-def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
+def load_model(
+    model_path: Path,
+    lazy: bool = False,
+    **kwargs,
+) -> nn.Module:
     """
     Load and initialize the model from a given path.
 
@@ -988,25 +992,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         config["quantization"] = transformed_quantization
         config["quantization_config"] = transformed_quantization
 
-    # Sanitize weights
-    weights = sanitize_weights(model, weights)
-
-    if hasattr(model_class, "VisionModel"):
-        if hasattr(model_config, "vision_config"):
-            weights = sanitize_weights(
-                model_class.VisionModel, weights, model_config.vision_config
-            )
-    if hasattr(model_class, "LanguageModel"):
-        if hasattr(model_config, "text_config"):
-            weights = sanitize_weights(
-                model_class.LanguageModel, weights, model_config.text_config
-            )
-    if hasattr(model_class, "AudioModel"):
-        if hasattr(model_config, "audio_config"):
-            weights = sanitize_weights(
-                model_class.AudioModel, weights, model_config.audio_config
-            )
-
     if not has_quantization:
         quantization_config = config.get("quantization_config", None)
         if quantization_config is None:
@@ -1038,17 +1023,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             elif quant_method == "mxfp4":
                 quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
-            elif quant_method == "fp8" and config.get("model_type") == "deepseek_v4":
-                from .models.deepseek_v4.language import make_quantization_config
+            elif quant_method == "fp8":
+                from .fp8 import transform_fp8_weights
 
-                quantization = make_quantization_config(model)
-            elif quant_method == "fp8" and config.get("model_type") in {
-                "qwen3_5",
-                "qwen3_5_moe",
-            }:
-                from .models.qwen3_5.fp8 import make_quantization_config
+                weights, quantization = transform_fp8_weights(weights, config)
+                # TODO: Refactor DeepSeek-V4 to use the shared FP8 transform.
+                if quantization is None and config.get("model_type") == "deepseek_v4":
+                    from .models.deepseek_v4.language import make_quantization_config
 
-                quantization = make_quantization_config(config)
+                    quantization = make_quantization_config(model)
             elif quant_method in ("awq", "gptq"):
                 logging.warning(
                     "Quantization method %s is not supported in mlx_vlm.load_model()",
@@ -1064,6 +1047,24 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             quantization_value = getattr(model_config, quantization_key, None)
             if quantization_value is not None:
                 config[quantization_key] = quantization_value
+
+    weights = sanitize_weights(model, weights)
+
+    if hasattr(model_class, "VisionModel"):
+        if hasattr(model_config, "vision_config"):
+            weights = sanitize_weights(
+                model_class.VisionModel, weights, model_config.vision_config
+            )
+    if hasattr(model_class, "LanguageModel"):
+        if hasattr(model_config, "text_config"):
+            weights = sanitize_weights(
+                model_class.LanguageModel, weights, model_config.text_config
+            )
+    if hasattr(model_class, "AudioModel"):
+        if hasattr(model_config, "audio_config"):
+            weights = sanitize_weights(
+                model_class.AudioModel, weights, model_config.audio_config
+            )
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may or may not have vision quantized.
@@ -2036,15 +2037,15 @@ class VideoMetadata:
 def load_video(
     video_path: str,
     sampling: Optional[VideoSampling] = None,
+    frame_sampler=None,
     **sampling_kwargs,
-) -> Tuple[np.ndarray, "VideoMetadata"]:
+) -> Tuple[np.ndarray, VideoMetadata]:
     """Read a video file as a (T, C, H, W) numpy array.
 
-    Uniformly samples frames — either a fixed ``nframes`` or a count derived
-    from ``fps`` — and returns them alongside the :class:`VideoMetadata`
-    describing what was read. Sampling fields may be given either as a
-    :class:`VideoSampling` or as loose keyword arguments; the former wins
-    where both set the same field.
+    Samples ``nframes`` frames, a count derived from ``fps``, or indices from
+    ``frame_sampler``. Returns source-aware :class:`VideoMetadata` alongside
+    the frames. Sampling fields may be supplied as a :class:`VideoSampling`
+    or as loose keyword arguments; the former wins for overlapping fields.
     """
     import cv2
 
@@ -2070,6 +2071,9 @@ def load_video(
         raise ValueError(f"Cannot open video: {video_path}")
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    duration = total_frames / video_fps
 
     def _round(n):
         return round(n / frame_factor) * frame_factor
@@ -2080,21 +2084,41 @@ def load_video(
     def _ceil(n):
         return math.ceil(n / frame_factor) * frame_factor
 
+    used_frame_sampler = False
     if nframes is not None:
         n = _round(nframes)
+        indices = np.linspace(0, total_frames - 1, n).round().astype(int)
+    elif frame_sampler is not None:
+        used_frame_sampler = True
+        source_metadata = VideoMetadata(
+            total_num_frames=total_frames,
+            fps=video_fps,
+            frames_indices=list(range(total_frames)),
+            width=width,
+            height=height,
+            duration=duration,
+        )
+        indices = np.asarray(
+            frame_sampler(source_metadata, fps=fps, max_frames=max_frames), dtype=int
+        ).reshape(-1)
+        n = len(indices)
     else:
         lo = _ceil(min_frames)
         hi = _floor(min(max_frames, total_frames))
         n = total_frames / video_fps * fps
         n = min(max(n, lo), hi, total_frames)
         n = _floor(n)
-    if not (frame_factor <= n <= total_frames):
+        indices = np.linspace(0, total_frames - 1, n).round().astype(int)
+    if not used_frame_sampler and not (frame_factor <= n <= total_frames):
         cap.release()
         raise ValueError(
             f"nframes must be in [{frame_factor}, {total_frames}], got {n}."
         )
-
-    indices = np.linspace(0, total_frames - 1, n).round().astype(int)
+    if n == 0 or np.any(indices < 0) or np.any(indices >= total_frames):
+        cap.release()
+        raise ValueError(
+            f"Frame indices must be within a non-empty {total_frames}-frame video."
+        )
     frames = []
     for idx in indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -2134,7 +2158,6 @@ def processor_video_sampling(processor) -> VideoSampling:
     component = getattr(processor, "video_processor", None)
     if component is None:
         return VideoSampling()
-
     for owner in (component, processor):
         hook = getattr(owner, "video_sampling_defaults", None)
         if callable(hook):
@@ -2144,7 +2167,6 @@ def processor_video_sampling(processor) -> VideoSampling:
                 if isinstance(declared, VideoSampling)
                 else VideoSampling(**declared)
             )
-
     return VideoSampling(
         **{
             name: getattr(component, name, None)
@@ -2373,14 +2395,23 @@ def prepare_inputs(
         audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
 
     video_fps = None
+    video_metadata = None
     if has_videos:
         if not isinstance(videos, list):
             videos = [videos]
         sampling = resolve_video_sampling(processor, kwargs)
-        loaded, video_fps = [], []
+        component = getattr(processor, "video_processor", None)
+        frame_sampler = (
+            getattr(component, "sample_frames", None)
+            if getattr(component, "sample_frames_in_loader", False)
+            else None
+        )
+        loaded, video_fps, video_metadata = [], [], []
         for v in videos:
-            if isinstance(v, (str, bytes)):
-                arr, metadata = load_video(str(v), sampling)
+            if isinstance(v, (str, bytes, Path)):
+                arr, metadata = load_video(
+                    str(v), sampling, frame_sampler=frame_sampler
+                )
                 logger.info(
                     "video %s: sampled %d of %d frames at %.2f fps "
                     "(source %.2f fps, %.1fs)",
@@ -2402,6 +2433,7 @@ def prepare_inputs(
                 )
             loaded.append(arr)
             video_fps.append(metadata.sampled_fps)
+            video_metadata.append(metadata)
         videos = loaded
 
     model_inputs = {}
@@ -2447,6 +2479,8 @@ def prepare_inputs(
             extra["videos"] = videos
             if video_fps is not None:
                 extra["fps"] = video_fps
+            if video_metadata is not None:
+                extra["video_metadata"] = video_metadata
         inputs = process_inputs_with_fallback(
             processor,
             images=images,

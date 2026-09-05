@@ -213,6 +213,7 @@ def select_qsa_execution_plan(
     block_size: int,
     causal: bool,
     all_sparse: bool,
+    allow_sparse_decode: bool = False,
 ) -> QSAExecutionPlan:
     """Select one explicit QSA implementation without evaluating MLX arrays."""
 
@@ -239,7 +240,7 @@ def select_qsa_execution_plan(
     key_length = keys.shape[2]
     topk_blocks = block_indices.shape[-1]
     selected_length = topk_blocks * block_size
-    if query_length <= 1:
+    if query_length <= 1 and not allow_sparse_decode:
         # The vector SDPA kernel remains faster for singleton decode.
         return QSAExecutionPlan.DENSE_DECODE
     if (
@@ -279,6 +280,7 @@ def qsa_sparse_attention(
     *,
     scale: float,
     block_size: int,
+    allow_sparse_decode: bool = False,
 ) -> mx.array:
     """Attend directly to QSA-selected blocks without gathering or a dense mask."""
 
@@ -291,6 +293,7 @@ def qsa_sparse_attention(
         block_size=block_size,
         causal=True,
         all_sparse=True,
+        allow_sparse_decode=allow_sparse_decode,
     )
     if plan is not QSAExecutionPlan.INDEXED_SPARSE_PREFILL:
         raise ValueError(

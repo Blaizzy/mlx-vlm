@@ -1155,6 +1155,12 @@ class BatchKVCache(_BaseCache):
 
     def finalize(self):
         if self._right_padding is not None:
+            if self.keys is None:
+                # Some sparse-attention side caches are prepared with the
+                # layer cache list but are not updated on single-token decode.
+                # There is no appended padding to roll back in that case.
+                self._right_padding = None
+                return
             padding = self._right_padding
             self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
             self.values = dynamic_roll(self.values, padding[:, None], axis=2)
