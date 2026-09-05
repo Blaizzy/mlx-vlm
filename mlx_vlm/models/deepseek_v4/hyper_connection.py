@@ -163,14 +163,7 @@ _hc_sinkhorn_collapse_kernel = _make_hc_sinkhorn_collapse_kernel()
 def _hc_kernel(x, y, mixes, scale, base, hc_mult, sinkhorn_iters, eps):
     B, L, H, D = x.shape
 
-    # The kernel reads mixes/scale/base as float32: it type-puns them through
-    # `*(const device float4*)` and indexes `scale[0]` / `base[llane]`.
-    # HyperConnection allocates all three as float32, so that holds for a freshly
-    # constructed module -- but load_weights replaces them with whatever dtype
-    # the checkpoint stores, which is bfloat16 in every GLM-5.3-Flash and
-    # DeepSeek-V4 release. The kernel then reinterprets those bytes as float32.
-    # Sinkhorn still normalises the result into a plausible doubly-stochastic
-    # matrix, so nothing raises and the model silently emits garbage.
+
     return _hc_sinkhorn_collapse_kernel(
         inputs=[
             x,
