@@ -87,6 +87,28 @@ def _mock_ip(**extra):
     )()
 
 
+class TestOutputControlTokens(unittest.TestCase):
+    def test_glm46v_strips_box_markers(self):
+        from mlx_vlm.models.glm4v.processing import _strip_box_markers
+
+        self.assertEqual(
+            _strip_box_markers("<|begin_of_box|>answer<|end_of_box|>"), "answer"
+        )
+
+    def test_kimi_vl_stops_on_assistant_marker(self):
+        from mlx_vlm.models.kimi_vl.processing_kimi_vl import KimiVLProcessor
+
+        processor = object.__new__(KimiVLProcessor)
+        processor.tokenizer = SimpleNamespace(
+            unk_token_id=0,
+            convert_tokens_to_ids=lambda token: (
+                163586 if token == "<|im_assistant|>" else 0
+            ),
+        )
+
+        self.assertEqual(processor.additional_eos_token_ids, [163586])
+
+
 class TestGemma4UnifiedProcessor(unittest.TestCase):
     # Test fixtures
 
