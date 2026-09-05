@@ -17,6 +17,7 @@ from transformers.image_processing_utils import ImageProcessingMixin
 from transformers.processing_utils import ProcessorMixin
 
 from ..base import install_auto_processor_patch, load_chat_template
+from ..qwen3_vl.processing_qwen3_vl import _resize_video_frames, _to_numpy_image
 
 
 def smart_resize(
@@ -105,42 +106,19 @@ def llm_image_tokens(
     return (grid_h * grid_w) // (merge_size**2)
 
 
-def _to_numpy_image(img) -> np.ndarray:
-    from PIL import Image
-
-    if isinstance(img, str):
-        img = Image.open(img)
-    if hasattr(img, "convert"):
-        img = img.convert("RGB")
-        arr = np.array(img)
-        return np.transpose(arr, (2, 0, 1))
-    arr = np.asarray(img)
-    if arr.ndim == 3 and arr.shape[-1] in (1, 3, 4):
-        arr = np.transpose(arr, (2, 0, 1))
-    if arr.shape[0] == 4:
-        arr = arr[:3]
-    if arr.shape[0] == 1:
-        arr = np.repeat(arr, 3, axis=0)
-    return arr
-
-
 def _resize_chw(chw: np.ndarray, height: int, width: int) -> np.ndarray:
-    from PIL import Image
+    """Bicubic resize of one ``(C, H, W)`` image via the shared qwen3_vl helper.
 
+    Float inputs are resized in uint8 space and restored to ``[0, 1]`` floats,
+    which is what ``_process_one`` relies on when a caller hands in floats.
+    """
     if chw.shape[-2:] == (height, width):
         return chw
-    arr = np.transpose(chw, (1, 2, 0))
-    if arr.dtype in (np.float32, np.float64):
-        arr = (arr * 255.0).clip(0, 255).astype(np.uint8)
-        restore_float = True
-    else:
-        restore_float = False
-    pil = Image.fromarray(arr)
-    pil = pil.resize((width, height), resample=Image.BICUBIC)
-    out = np.transpose(np.array(pil), (2, 0, 1))
-    if restore_float:
-        out = out.astype(np.float32) / 255.0
-    return out
+    if chw.dtype in (np.float32, np.float64):
+        as_u8 = (chw * 255.0).clip(0, 255).astype(np.uint8)
+        out = _resize_video_frames(as_u8[None], height, width)[0]
+        return out.astype(np.float32) / 255.0
+    return _resize_video_frames(chw[None], height, width)[0]
 
 
 class Glm5NextImageProcessor(ImageProcessingMixin):
@@ -338,9 +316,12 @@ def _image_processor_kwargs(pretrained_model_name_or_path):
 class Glm5NextProcessor(ProcessorMixin):
     """Tokenizer + image processor. Expands `<|image|>` to grid-sized placeholders.
 
-    Upstream `chat_template.jinja` stubs image content with a "no multimodal"
-    reminder. Use `chat_template_vlm.jinja` (this package) or put
-    `<|begin_of_image|><|image|><|end_of_image|>` in the prompt yourself.
+    The checkpoint's own `chat_template.jinja` (upstream revision 690b7052 or
+    later) emits `<|begin_of_image|><|image|><|end_of_image|>` for image parts;
+    this processor expands each `<|image|>` slot to `prod(image_grid_thw) /
+    merge_size**2` tokens. Expansion splits on the original slots first, so an
+    already-expanded run is never re-expanded (a `while token in text` loop
+    would reconsume it and ask for extra `image_grid_thw` rows).
     """
 
     attributes = ["image_processor", "tokenizer"]
@@ -499,9 +480,6 @@ class Glm5NextProcessor(ProcessorMixin):
             **kwargs,
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)
-        vlm_template = Path(__file__).with_name("chat_template_vlm.jinja")
-        if vlm_template.exists():
-            tokenizer.chat_template = vlm_template.read_text()
         proc_cfg = _load_json(pretrained_model_name_or_path, "processor_config.json")
         proc_kwargs = dict(proc_cfg or {})
         proc_kwargs.pop("image_processor", None)

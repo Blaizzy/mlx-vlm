@@ -32,9 +32,11 @@ are easy to get wrong if you reuse GLM-OCR helpers:
    the original slots before inserting the run. A `while token in text` loop
    reconsumes the expansion and asks for extra `image_grid_thw` rows.
 
-The Hub `chat_template.jinja` on GLM-5.3-Flash currently stubs image content with
-an "unable to process" reminder. `from_pretrained` loads
-`chat_template_vlm.jinja` from this package instead.
+Image markers come from the checkpoint's own `chat_template.jinja`: upstream
+revision `690b7052` (2026-09-04) and later emit
+`<|begin_of_image|><|image|><|end_of_image|>` for image parts. Older snapshots of
+the template rendered images as an "unable to process" reminder, so re-download
+`chat_template.jinja` if your local copy predates that revision.
 
 ```python
 from mlx_vlm import generate, load

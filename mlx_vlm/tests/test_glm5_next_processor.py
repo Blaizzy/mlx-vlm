@@ -97,16 +97,72 @@ class TestGlm5NextProcessor(unittest.TestCase):
             "<|begin_of_image|>" + ("<|image|>" * 256) + "<|end_of_image|>",
         )
 
-    def test_vlm_chat_template_emits_image_slots(self):
-        jinja = (
-            Path(__file__).resolve().parents[1]
-            / "models"
-            / "glm5_next"
-            / "chat_template_vlm.jinja"
+
+
+
+# ---------------------------------------------------------------------------
+# Numeric parity with transformers' Glm5NextImageProcessor (weight-free).
+# ---------------------------------------------------------------------------
+_GLM53_IMAGE_PROCESSOR_KWARGS = {
+    "patch_size": 14,
+    "merge_size": 2,
+    "temporal_patch_size": 2,
+    "min_image_tokens": 16,
+    "max_image_tokens": 8000,
+    "image_mean": [0.48145466, 0.4578275, 0.40821073],
+    "image_std": [0.26862954, 0.26130258, 0.27577711],
+}
+_EXAMPLE_IMAGES = Path(__file__).resolve().parents[2] / "examples" / "images"
+
+
+def _hf_glm5_next_image_processor():
+    try:
+        from transformers.models.glm5_next.image_processing_glm5_next import (
+            Glm5NextImageProcessor as HFProc,
         )
-        text = jinja.read_text()
-        self.assertIn("<|begin_of_image|><|image|><|end_of_image|>", text)
-        self.assertTrue(jinja.exists())
+    except Exception:  # pragma: no cover - older transformers
+        return None
+    return HFProc(**_GLM53_IMAGE_PROCESSOR_KWARGS)
+
+
+class TestParityWithTransformers(unittest.TestCase):
+    """pixel_values / image_grid_thw must match transformers on real images."""
+
+    def setUp(self):
+        self.hf = _hf_glm5_next_image_processor()
+        if self.hf is None:
+            self.skipTest("transformers Glm5NextImageProcessor not importable")
+        from PIL import Image
+
+        self.images = []
+        for name in ("cats.jpg", "graph.png"):
+            path = _EXAMPLE_IMAGES / name
+            if path.exists():
+                self.images.append((name, Image.open(path).convert("RGB")))
+        if not self.images:
+            self.skipTest("examples/images not available")
+        self.ours = Glm5NextImageProcessor(**_GLM53_IMAGE_PROCESSOR_KWARGS)
+
+    def test_grid_and_pixels_match(self):
+        merge = _GLM53_IMAGE_PROCESSOR_KWARGS["merge_size"]
+        for name, img in self.images:
+            with self.subTest(image=name):
+                ref = self.hf(images=[img], return_tensors="np")
+                out = self.ours(images=[img])
+                ref_grid = np.asarray(ref["image_grid_thw"]).reshape(-1, 3)
+                our_grid = np.asarray(out["image_grid_thw"]).reshape(-1, 3)
+                np.testing.assert_array_equal(our_grid, ref_grid)
+                ref_px = np.asarray(ref["pixel_values"], dtype=np.float32)
+                our_px = np.asarray(out["pixel_values"], dtype=np.float32)
+                self.assertEqual(our_px.shape, ref_px.shape)
+                self.assertLess(float(np.max(np.abs(our_px - ref_px))), 1e-5)
+                # Patch count from the size helper equals the grid volume; the
+                # prompt expander divides it by merge_size**2.
+                self.assertEqual(
+                    self.ours.get_number_of_image_patches(img.height, img.width),
+                    int(np.prod(our_grid[0])),
+                )
+                self.assertEqual(int(np.prod(our_grid[0])) % (merge * merge), 0)
 
 
 if __name__ == "__main__":
