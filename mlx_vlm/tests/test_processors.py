@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 from PIL import Image
 
 # ── Shared mocks ──────────────────────────────────────────────────────────────
@@ -89,7 +90,7 @@ def _mock_ip(**extra):
 
 class TestUnlimitedOCRProcessor(unittest.TestCase):
     def test_default_chat_template_omits_trailing_space(self):
-        from jinja2 import Template
+        Template = pytest.importorskip("jinja2").Template
 
         from mlx_vlm.models.unlimited_ocr.processing_unlimitedocr import (
             UnlimitedOCRProcessor,
