@@ -18422,6 +18422,198 @@ class TestDinov2(unittest.TestCase):
             self.assertEqual(grid.shape, (2, 5, 7, 32))
             self.assertEqual(cls.shape, (2, 32))
 
+    def _tiny_config(self, **overrides):
+        from mlx_vlm.models.dinov2.config import ModelConfig
+
+        args = dict(
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            image_size=28,
+            patch_size=14,
+        )
+        args.update(overrides)
+        return ModelConfig(**args)
+
+    def _tiny_hf_state_dict(self, config):
+        d = config.hidden_size
+        p = config.patch_size
+        num_patches = (config.image_size // p) ** 2
+        weights = {
+            "embeddings.cls_token": mx.zeros((1, 1, d)),
+            "embeddings.mask_token": mx.zeros((1, d)),
+            "embeddings.position_embeddings": mx.zeros((1, num_patches + 1, d)),
+            "embeddings.patch_embeddings.projection.weight": mx.zeros((d, 3, p, p)),
+            "embeddings.patch_embeddings.projection.bias": mx.zeros((d,)),
+            "layernorm.weight": mx.ones((d,)),
+            "layernorm.bias": mx.zeros((d,)),
+        }
+        if config.num_register_tokens:
+            weights["embeddings.register_tokens"] = mx.zeros(
+                (1, config.num_register_tokens, d)
+            )
+        for i in range(config.num_hidden_layers):
+            prefix = f"encoder.layer.{i}."
+            weights.update(
+                {
+                    prefix + "attention.attention.query.weight": mx.full((d, d), 1.0),
+                    prefix + "attention.attention.key.weight": mx.full((d, d), 2.0),
+                    prefix + "attention.attention.value.weight": mx.full((d, d), 3.0),
+                    prefix + "attention.attention.query.bias": mx.zeros((d,)),
+                    prefix + "attention.attention.key.bias": mx.zeros((d,)),
+                    prefix + "attention.attention.value.bias": mx.zeros((d,)),
+                    prefix + "attention.output.dense.weight": mx.zeros((d, d)),
+                    prefix + "attention.output.dense.bias": mx.zeros((d,)),
+                    prefix + "layer_scale1.lambda1": mx.ones((d,)),
+                    prefix + "layer_scale2.lambda1": mx.ones((d,)),
+                    prefix + "norm1.weight": mx.ones((d,)),
+                    prefix + "norm1.bias": mx.zeros((d,)),
+                    prefix + "norm2.weight": mx.ones((d,)),
+                    prefix + "norm2.bias": mx.zeros((d,)),
+                }
+            )
+            if config.use_swiglu_ffn:
+                h = (int(d * config.mlp_ratio * 2 / 3) + 7) // 8 * 8
+                weights.update(
+                    {
+                        prefix + "mlp.weights_in.weight": mx.zeros((2 * h, d)),
+                        prefix + "mlp.weights_in.bias": mx.zeros((2 * h,)),
+                        prefix + "mlp.weights_out.weight": mx.zeros((d, h)),
+                        prefix + "mlp.weights_out.bias": mx.zeros((d,)),
+                    }
+                )
+            else:
+                hidden = int(d * config.mlp_ratio)
+                weights.update(
+                    {
+                        prefix + "mlp.fc1.weight": mx.zeros((hidden, d)),
+                        prefix + "mlp.fc1.bias": mx.zeros((hidden,)),
+                        prefix + "mlp.fc2.weight": mx.zeros((d, hidden)),
+                        prefix + "mlp.fc2.bias": mx.zeros((d,)),
+                    }
+                )
+        return weights
+
+    def test_config_aliases(self):
+        """HF-style config fields map to the shared backbone's field names."""
+        from mlx_vlm.models.dinov2.config import ModelConfig
+
+        config = self._tiny_config()
+        self.assertEqual(config.embed_dim, 32)
+        self.assertEqual(config.depth, 2)
+        self.assertEqual(config.num_heads, 4)
+        self.assertEqual(config.img_size, 28)
+        self.assertEqual(config.ffn, "mlp")
+        self.assertEqual(ModelConfig(use_swiglu_ffn=True).ffn, "swiglu")
+        self.assertEqual(ModelConfig(image_size=[518, 518]).img_size, 518)
+
+        # A dinov2_with_registers Hub config loads; unknown keys are dropped.
+        config = ModelConfig.from_dict(
+            {
+                "model_type": "dinov2_with_registers",
+                "hidden_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_register_tokens": 4,
+                "out_features": ["stage1"],
+                "stage_names": ["stem", "stage1"],
+            }
+        )
+        self.assertEqual(config.model_type, "dinov2_with_registers")
+        self.assertEqual(config.num_register_tokens, 4)
+
+    def test_forward_features_registers(self):
+        """Register tokens go after the cls token; patch tokens exclude them."""
+        from mlx_vlm.models.dinov2 import Model
+
+        model = Model(self._tiny_config(num_register_tokens=2))
+        x = mx.random.normal((2, 28, 28, 3))
+        features = model.forward_features(x)
+        self.assertEqual(features["x_norm_clstoken"].shape, (2, 32))
+        self.assertEqual(features["x_norm_regtokens"].shape, (2, 2, 32))
+        self.assertEqual(features["x_norm_patchtokens"].shape, (2, 4, 32))
+        self.assertEqual(features["x_prenorm"].shape, (2, 1 + 2 + 4, 32))
+
+        for patches, cls in model.get_intermediate_layers(x, [0, 1]):
+            self.assertEqual(patches.shape, (2, 4, 32))
+            self.assertEqual(cls.shape, (2, 32))
+
+    def test_prepare_tokens_masks(self):
+        """Masked patch embeddings are replaced by the mask token."""
+        from mlx_vlm.models.dinov2 import Model
+
+        model = Model(self._tiny_config())
+        model.load_weights(
+            [
+                ("mask_token", mx.full((1, 32), 2.0)),
+                ("pos_embed", mx.random.normal((1, 5, 32))),
+            ],
+            strict=False,
+        )
+        x = mx.random.normal((2, 28, 28, 3))
+        masks = mx.array([[True, False, True, False], [False, True, False, True]])
+        tokens = model.prepare_tokens(x, masks)
+        patches = tokens[:, 1:]  # after the cls token
+        for b, j in [(0, 0), (0, 2), (1, 1), (1, 3)]:
+            expected = model.mask_token[0] + model.pos_embed[0, j + 1]
+            self.assertTrue(mx.allclose(patches[b, j], expected))
+        # Unmasked positions keep their patch embedding.
+        for b, j in [(0, 1), (1, 0)]:
+            unexpected = model.mask_token[0] + model.pos_embed[0, j + 1]
+            self.assertFalse(bool(mx.allclose(patches[b, j], unexpected)))
+
+    def test_model_call_output(self):
+        """The standalone model returns HF-style pooled and sequence outputs."""
+        from mlx_vlm.models.dinov2 import Model
+
+        model = Model(self._tiny_config())
+        out = model(mx.random.normal((2, 28, 28, 3)))
+        self.assertEqual(out["last_hidden_state"].shape, (2, 5, 32))
+        self.assertEqual(out["pooler_output"].shape, (2, 32))
+        self.assertTrue(
+            mx.allclose(out["pooler_output"], out["last_hidden_state"][:, 0])
+        )
+        self.assertEqual(out["hidden_patch_tokens"].shape, (2, 4, 32))
+
+    def test_sanitize_hf_checkpoint(self):
+        """HF keys are renamed (and qkv fused) to the exact model parameters."""
+        from mlx.utils import tree_flatten
+
+        from mlx_vlm.models.dinov2 import Model
+
+        for overrides in ({"num_register_tokens": 2}, {"use_swiglu_ffn": True}):
+            config = self._tiny_config(**overrides)
+            model = Model(config)
+            weights = model.sanitize(self._tiny_hf_state_dict(config))
+            self.assertEqual(
+                set(weights), {k for k, _ in tree_flatten(model.parameters())}
+            )
+            model.load_weights(list(weights.items()), strict=True)
+            d = config.hidden_size
+            qkv_w = model.blocks[0].attn.qkv.weight
+            self.assertTrue(bool(mx.all(qkv_w[:d] == 1.0)))
+            self.assertTrue(bool(mx.all(qkv_w[d : 2 * d] == 2.0)))
+            self.assertTrue(bool(mx.all(qkv_w[2 * d :] == 3.0)))
+            self.assertEqual(model.patch_embed.proj.weight.shape, (d, 14, 14, 3))
+
+    def test_sanitize_strips_prefix_and_classifier(self):
+        """A ``dinov2.`` prefix is stripped and classifier weights dropped."""
+        from mlx_vlm.models.dinov2 import Model
+
+        config = self._tiny_config()
+        model = Model(config)
+        weights = {
+            f"dinov2.{k}": v for k, v in self._tiny_hf_state_dict(config).items()
+        }
+        weights["dinov2.classifier.weight"] = mx.zeros((10, config.hidden_size))
+        sanitized = model.sanitize(weights)
+        self.assertNotIn("dinov2.classifier.weight", sanitized)
+        self.assertNotIn("classifier.weight", sanitized)
+        self.assertIn("blocks.0.attn.qkv.weight", sanitized)
+        # Original-layout checkpoints pass through unchanged.
+        original = {"blocks.0.attn.qkv.weight": mx.zeros((96, 32))}
+        self.assertEqual(model.sanitize(original), original)
+
 
 class TestVideoDepthAnything(unittest.TestCase):
     # ─── Video Depth Anything Tests ────────────────────────────
