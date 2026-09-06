@@ -438,6 +438,38 @@ class Qwen4ExpTests(unittest.TestCase):
         self.assertTrue(mx.array_equal(actual, expected).item())
         self.assertEqual(calls, [1, 0, 1])
 
+    def test_fused_quantized_embedding_matches_sharded_lookup(self):
+        formats = [
+            *[(32, bits, "affine") for bits in (2, 3, 4, 5, 6, 8)],
+            (32, 4, "mxfp4"),
+            (32, 8, "mxfp8"),
+            (16, 4, "nvfp4"),
+        ]
+        indices = mx.array([[0, 3, 7, 9, 1, 7]], dtype=mx.int32)
+
+        for group_size, bits, mode in formats:
+            with self.subTest(group_size=group_size, bits=bits, mode=mode):
+                mx.random.seed(43)
+                embedding = ShardedEmbedding(num_embeddings=10, dims=32, num_shards=3)
+                embedding.shards = [
+                    nn.QuantizedEmbedding.from_embedding(
+                        shard,
+                        group_size=group_size,
+                        bits=bits,
+                        mode=mode,
+                    )
+                    for shard in embedding.shards
+                ]
+
+                expected = embedding(indices)
+                embedding.fuse_quantized()
+                actual = embedding(indices)
+                mx.eval(expected, actual)
+
+                self.assertTrue(mx.array_equal(actual, expected).item())
+                self.assertEqual(embedding.shards, [])
+                self.assertEqual(embedding.fused.weight.shape[0], 10)
+
     def test_gated_delta_uses_reference_l2_normalization(self):
         layer = Qwen4ExpGatedDeltaNet(tiny_config().text_config)
         query = mx.random.normal((1, 3, 2, 8))

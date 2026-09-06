@@ -1216,8 +1216,47 @@ class ShardedEmbedding(nn.Module):
             offsets.append(offsets[-1] + size)
         self.shard_offsets = tuple(offsets)
         self.dims = dims
+        self.fused = None
+
+    def fuse_quantized(self):
+        """Consolidate lazy quantized shards into one device-indexed table.
+
+        Materializing the table before the rest of a lazy model prevents the
+        source shards, destination table, and all other weights from being live
+        at the same time.
+        """
+        if self.fused is not None:
+            return self
+
+        shards = list(self.shards)
+        if not shards:
+            raise ValueError("cannot fuse an empty sharded embedding")
+        if not all(isinstance(shard, nn.QuantizedEmbedding) for shard in shards):
+            raise TypeError("PLE fusion requires quantized embedding shards")
+
+        formats = {(shard.group_size, shard.bits, shard.mode) for shard in shards}
+        if len(formats) != 1:
+            raise ValueError("embedding shards use different quantization formats")
+        group_size, bits, mode = formats.pop()
+        fused = nn.QuantizedEmbedding(1, self.dims, group_size, bits, mode=mode)
+        fused.weight = mx.concatenate([shard.weight for shard in shards], axis=0)
+        fused.scales = mx.concatenate([shard.scales for shard in shards], axis=0)
+        biases = [shard.get("biases") for shard in shards]
+        if any((bias is None) != (biases[0] is None) for bias in biases):
+            raise ValueError("embedding shards disagree on quantized biases")
+        fused.biases = None if biases[0] is None else mx.concatenate(biases, axis=0)
+        fused.num_embeddings = self.shard_offsets[-1]
+
+        self.fused = fused
+        self.shards = []
+        mx.eval(fused.parameters())
+        mx.clear_cache()
+        return self
 
     def __call__(self, indices: mx.array) -> mx.array:
+        if self.fused is not None:
+            return self.fused(indices)
+
         flat = indices.reshape(-1)
         # One tiny host sync avoids scheduling gathers against all 128 giant
         # PLE shards for every token.
@@ -2056,6 +2095,16 @@ class LanguageModel(Qwen3_5LanguageModel):
         self._rope_deltas = None
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def fuse_ple_embeddings(self):
+        """Consolidate resident PLE shards for device-side indexed lookup."""
+        for layer in self.model.layers:
+            if "ple" not in layer:
+                continue
+            embedding = layer.ple.ple_embedding.ngram_embedding
+            if isinstance(embedding, ShardedEmbedding):
+                embedding.fuse_quantized()
+        return self
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         return_hidden = bool(kwargs.get("return_hidden", False))
