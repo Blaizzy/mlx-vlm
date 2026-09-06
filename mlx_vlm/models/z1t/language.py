@@ -93,6 +93,32 @@ class Z1TCache:
         self.win_eKV = None
         self.win_eK = None
 
+    # APC prefix-cache contract: snapshot/restore the streaming state so a
+    # reused prefix restores the pool sums and conv window (auto-detected as a
+    # CHECKPOINT cache; see mlx_vlm.apc_adapters).
+    @property
+    def state(self):
+        return (self.cum_eKV, self.cum_eK, self.win_eKV, self.win_eK)
+
+    @state.setter
+    def state(self, value):
+        self.cum_eKV, self.cum_eK, self.win_eKV, self.win_eK = value
+
+    @property
+    def meta_state(self):
+        return str(self.offset)
+
+    @meta_state.setter
+    def meta_state(self, value):
+        self.offset = int(value) if value else 0
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        cache = cls.__new__(cls)
+        cache.state = state
+        cache.meta_state = meta_state
+        return cache
+
 
 class AFTConv(nn.Module):
     """AFT-conv (causal): depthwise conv stencil + causal cumulative pool.
