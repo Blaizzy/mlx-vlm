@@ -1727,20 +1727,6 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
     def can_quantized_head(linear):
         return supports_optimized_affine_head(linear)
 
-    def _linear(self, linear, x: mx.array) -> mx.array:
-        if isinstance(linear, nn.QuantizedLinear) and x.ndim == 3 and x.shape[1] == 2:
-            return linear(x)
-        return super()._linear(linear, x)
-
-    def _linears(self, linears, x: mx.array):
-        if (
-            x.ndim == 3
-            and x.shape[1] == 2
-            and all(isinstance(linear, nn.QuantizedLinear) for linear in linears)
-        ):
-            return tuple(linear(x) for linear in linears)
-        return super()._linears(linears, x)
-
     @staticmethod
     def _normalize_gated_delta_qk(layer, q, k):
         del layer

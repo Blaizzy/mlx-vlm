@@ -13,6 +13,7 @@ from mlx_vlm.models.qwen4_exp.language import (
     BatchQSAKVCache,
     QSAKVCache,
     QSAQuantizedKVCache,
+    Qwen4ExpBatchInvariantForward,
     Qwen4ExpGatedDeltaNet,
     Qwen4ExpNGramEmbedding,
     ShardedEmbedding,
@@ -143,6 +144,25 @@ class Qwen4ExpTests(unittest.TestCase):
         )
 
         self.assertTrue(model.language_model._supports_batch_invariant_decode())
+
+    def test_quantized_verifier_time_matches_singleton_decode(self):
+        if not mx.metal.is_available():
+            self.skipTest("The quantized verifier requires Metal")
+
+        mx.random.seed(2_026_090_6)
+        linear = nn.Linear(2560, 512, bias=False)
+        linear.set_dtype(mx.bfloat16)
+        linear = nn.QuantizedLinear.from_linear(linear, group_size=32, bits=5)
+        hidden = mx.random.normal((1, 2, 2560)).astype(mx.bfloat16)
+
+        expected = mx.concatenate(
+            [linear(hidden[:, index : index + 1]) for index in range(2)],
+            axis=1,
+        )
+        actual = Qwen4ExpBatchInvariantForward()._linear(linear, hidden)
+        mx.eval(expected, actual)
+
+        self.assertTrue(mx.array_equal(actual, expected).item())
 
     def test_quantized_final_mixer_is_batch_invariant(self):
         config = tiny_config()
