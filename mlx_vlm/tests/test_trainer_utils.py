@@ -6,13 +6,12 @@ from unittest.mock import MagicMock, patch
 
 import mlx.nn as nn
 
-from mlx_vlm.trainer.lora_layers import LoRALinear
-from mlx_vlm.trainer.utils import (
+from mlx_vlm.trainer.core import get_module_by_name, set_module_by_name
+from mlx_vlm.trainer.peft.lora_layers import LoRALinear
+from mlx_vlm.trainer.peft.utils import (
     apply_lora_layers,
     find_all_linear_names,
-    get_module_by_name,
     get_peft_model,
-    set_module_by_name,
 )
 
 
@@ -32,8 +31,8 @@ class TestTrainerUtils(unittest.TestCase):
         set_module_by_name(model, "layer1.layer2.layer3", new_module)
         self.assertEqual(model.layer1.layer2.layer3, new_module)
 
-    @patch("mlx_vlm.trainer.utils.freeze_model")
-    @patch("mlx_vlm.trainer.utils.print_trainable_parameters")
+    @patch("mlx_vlm.trainer.peft.utils.freeze_model")
+    @patch("mlx_vlm.trainer.peft.utils.print_trainable_parameters")
     def test_get_peft_model(self, mock_print, mock_freeze):
         class DummyLanguageModel(nn.Module):
             def __init__(self):
@@ -78,7 +77,7 @@ class TestTrainerUtils(unittest.TestCase):
         result = find_all_linear_names(model)
         self.assertEqual(set(result), {"layer1", "layer2"})
 
-    @patch("mlx_vlm.trainer.utils.get_peft_model")
+    @patch("mlx_vlm.trainer.peft.utils.get_peft_model")
     def test_apply_lora_layers_keeps_vlm_adapter_schema(self, mock_get_peft):
         with TemporaryDirectory() as tmpdir:
             adapter_dir = Path(tmpdir) / "adapter"
