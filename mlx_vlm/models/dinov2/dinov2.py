@@ -1,4 +1,4 @@
-"""DINOv2 vision backbone for Video Depth Anything (channel-last MLX port)."""
+"""DINOv2 vision transformer (channel-last MLX port)."""
 
 import math
 from typing import List, Tuple
@@ -6,44 +6,7 @@ from typing import List, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from .config import ModelConfig
-
-
-def _cubic_weight(t, a=-0.75):
-    at = mx.abs(t)
-    at2 = at * at
-    at3 = at2 * at
-    w1 = (a + 2) * at3 - (a + 3) * at2 + 1.0
-    w2 = a * at3 - 5 * a * at2 + 8 * a * at - 4 * a
-    return mx.where(at <= 1.0, w1, mx.where(at < 2.0, w2, mx.zeros_like(t)))
-
-
-def bicubic_scale_factor(x, scale_h, scale_w):
-    """Match ``F.interpolate(scale_factor=..., mode='bicubic')`` exactly.
-
-    Differs from the generic helper: PyTorch samples with the given
-    (fractional) scale, floors the output size, and clamps border taps
-    without renormalizing the weights.
-    """
-    B, C, in_h, in_w = x.shape
-    out_h = int(in_h * scale_h)
-    out_w = int(in_w * scale_w)
-
-    def axis_weights(in_size, out_size, scale):
-        src = (mx.arange(out_size, dtype=mx.float32) + 0.5) / scale - 0.5
-        base = mx.floor(src)
-        taps = base[:, None] + mx.arange(-1, 3, dtype=mx.float32)[None, :]
-        w = _cubic_weight(src[:, None] - taps)
-        idx = mx.clip(taps.astype(mx.int32), 0, in_size - 1)
-        return idx, w
-
-    iy, wy = axis_weights(in_h, out_h, scale_h)
-    ix, wx = axis_weights(in_w, out_w, scale_w)
-
-    g = x[:, :, iy.reshape(-1), :].reshape(B, C, out_h, 4, in_w)
-    t = mx.sum(g * wy[None, None, :, :, None], axis=3)
-    g = t[:, :, :, ix.reshape(-1)].reshape(B, C, out_h, out_w, 4)
-    return mx.sum(g * wx[None, None, None, :, :], axis=4)
+from ..interpolate import resize_bicubic_nhwc, resize_bilinear_nhwc
 
 
 class PatchEmbed(nn.Module):
@@ -61,7 +24,7 @@ class PatchEmbed(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         B, H, W, _ = x.shape
         assert H % self.patch_size == 0 and W % self.patch_size == 0
-        x = self.proj(x)  # (B, H/14, W/14, D)
+        x = self.proj(x)  # (B, H/p, W/p, D)
         return x.reshape(B, -1, x.shape[-1])
 
 
@@ -94,6 +57,23 @@ class Mlp(nn.Module):
         return self.fc2(nn.gelu(self.fc1(x)))
 
 
+class SwiGLUFFN(nn.Module):
+    """Fused SwiGLU FFN (dinov2 vit-g): hidden dim rounded up to a multiple of 8."""
+
+    def __init__(self, dim: int, hidden_dim: int):
+        super().__init__()
+        hidden_dim = (int(hidden_dim * 2 / 3) + 7) // 8 * 8
+        self.w12 = nn.Linear(dim, 2 * hidden_dim, bias=True)
+        self.w3 = nn.Linear(hidden_dim, dim, bias=True)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        x1, x2 = mx.split(self.w12(x), 2, axis=-1)
+        return self.w3(nn.silu(x1) * x2)
+
+
+_FFN_LAYERS = {"mlp": Mlp, "swiglu": SwiGLUFFN}
+
+
 class LayerScale(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
@@ -104,14 +84,20 @@ class LayerScale(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config):
         super().__init__()
         dim = config.embed_dim
+        hidden = int(dim * config.mlp_ratio)
         self.norm1 = nn.LayerNorm(dim, eps=config.layer_norm_eps)
         self.attn = Attention(dim, config.num_heads)
         self.ls1 = LayerScale(dim)
         self.norm2 = nn.LayerNorm(dim, eps=config.layer_norm_eps)
-        self.mlp = Mlp(dim, int(dim * config.mlp_ratio))
+        ffn = getattr(config, "ffn", None) or "mlp"
+        if ffn not in _FFN_LAYERS:
+            raise ValueError(
+                f"Unknown DINOv2 ffn {ffn!r}; expected one of {list(_FFN_LAYERS)}"
+            )
+        self.mlp = _FFN_LAYERS[ffn](dim, hidden)
         self.ls2 = LayerScale(dim)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -121,7 +107,7 @@ class Block(nn.Module):
 
 
 class DINOv2(nn.Module):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.embed_dim = config.embed_dim
@@ -149,16 +135,14 @@ class DINOv2(nn.Module):
         w0 = w // self.patch_size + self.config.interpolate_offset
         h0 = h // self.patch_size + self.config.interpolate_offset
         sqrt_N = math.sqrt(N)
+        # (sy, sx) because the reference derives w0 from the pixel height and
+        # applies it to the W axis.
         sx, sy = float(w0) / sqrt_N, float(h0) / sqrt_N
-        # (B, C, H, W) for the interpolation; (sy, sx) because the reference
-        # derives w0 from the pixel height and applies it to the W axis
-        patch_pos_embed = patch_pos_embed.reshape(
-            1, int(sqrt_N), int(sqrt_N), dim
-        ).transpose(0, 3, 1, 2)
-        patch_pos_embed = bicubic_scale_factor(
-            patch_pos_embed.astype(mx.float32), sy, sx
+        patch_pos_embed = patch_pos_embed.reshape(1, int(sqrt_N), int(sqrt_N), dim)
+        patch_pos_embed = resize_bicubic_nhwc(
+            patch_pos_embed.astype(mx.float32), scale_factor=(sy, sx)
         )
-        patch_pos_embed = patch_pos_embed.transpose(0, 2, 3, 1).reshape(1, -1, dim)
+        patch_pos_embed = patch_pos_embed.reshape(1, -1, dim)
         return mx.concatenate([class_pos_embed, patch_pos_embed], axis=1).astype(
             x.dtype
         )
@@ -183,3 +167,31 @@ class DINOv2(nn.Module):
                 outputs.append((out[:, 1:], out[:, 0]))
         assert len(outputs) == len(indices)
         return outputs
+
+
+class DINOv2Encoder(nn.Module):
+    """Resize [0, 1] RGB images to a token grid, normalize, return per-layer grids."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.backbone = DINOv2(config)
+        self.image_mean = mx.array([0.485, 0.456, 0.406]).reshape(1, 1, 1, 3)
+        self.image_std = mx.array([0.229, 0.224, 0.225]).reshape(1, 1, 1, 3)
+
+    def __call__(
+        self, image: mx.array, token_rows: int, token_cols: int
+    ) -> List[Tuple[mx.array, mx.array]]:
+        """image: (B, H, W, 3) in [0, 1] -> [((B, rows, cols, D), (B, D) cls), ...]."""
+        p = self.config.patch_size
+        x = resize_bilinear_nhwc(
+            image, (token_rows * p, token_cols * p), antialias=True
+        )
+        x = (x - self.image_mean) / self.image_std
+        B = x.shape[0]
+        return [
+            (tokens.reshape(B, token_rows, token_cols, -1), cls)
+            for tokens, cls in self.backbone.get_intermediate_layers(
+                x, self.config.intermediate_layers
+            )
+        ]

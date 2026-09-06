@@ -18343,6 +18343,33 @@ class TestMTPSplit(unittest.TestCase):
         self.assertEqual(config["quantization"]["bits"], 4)
 
 
+class TestDinov2(unittest.TestCase):
+    def test_encoder_feature_grids(self):
+        """Encoder resizes to the token grid and returns per-layer grids and cls tokens."""
+        from types import SimpleNamespace
+
+        from mlx_vlm.models.dinov2.dinov2 import DINOv2Encoder
+
+        config = SimpleNamespace(
+            embed_dim=32,
+            depth=4,
+            num_heads=4,
+            img_size=518,
+            patch_size=14,
+            mlp_ratio=4.0,
+            layer_norm_eps=1e-6,
+            interpolate_offset=0.1,
+            ffn="mlp",
+            intermediate_layers=[1, 3],
+        )
+        encoder = DINOv2Encoder(config)
+        features = encoder(mx.random.uniform(shape=(2, 60, 90, 3)), 5, 7)
+        self.assertEqual(len(features), 2)
+        for grid, cls in features:
+            self.assertEqual(grid.shape, (2, 5, 7, 32))
+            self.assertEqual(cls.shape, (2, 32))
+
+
 class TestVideoDepthAnything(unittest.TestCase):
     # ─── Video Depth Anything Tests ────────────────────────────
 
@@ -18380,7 +18407,7 @@ class TestVideoDepthAnything(unittest.TestCase):
 
     def test_vision_backbone(self):
         """DINOv2 backbone returns patch/cls tokens per requested layer."""
-        from mlx_vlm.models.video_depth_anything.vision import DINOv2
+        from mlx_vlm.models.dinov2.dinov2 import DINOv2
 
         config = self._tiny_config()
         backbone = DINOv2(config)
@@ -18793,3 +18820,407 @@ class TestK2HorizonModel(unittest.TestCase):
         model = k2_horizon.Model(self._config(rope_scaling=yarn.rope_scaling))
         out = model(mx.array([[1, 2, 3, 4]])).logits
         self.assertEqual(out.shape, (1, 4, 128))
+
+
+class TestMoge3(unittest.TestCase):
+    # ─── MoGe-3 Tests ──────────────────────────────────────────
+
+    def _tiny_config(self, **overrides):
+        from mlx_vlm.models.moge3.config import (
+            ConvStackConfig,
+            EncoderConfig,
+            ModelConfig,
+            RefinerConfig,
+            ScaleHeadConfig,
+        )
+
+        dim_res = [16, 8, 4]
+
+        def stack(dim_in, dim_out=None):
+            return ConvStackConfig(
+                dim_in=dim_in,
+                dim_res_blocks=list(dim_res),
+                dim_out=dim_out,
+                num_res_blocks=[0, 1, 0],
+                res_block_in_norm="none",
+                res_block_hidden_norm="none",
+                resamplers=["conv_transpose", "bilinear"],
+            )
+
+        args = dict(
+            encoder=EncoderConfig(
+                backbone="dinov2_vits14",
+                intermediate_layers=[0, 1],
+                dim_out=16,
+                depth=2,
+                embed_dim=32,
+                num_heads=4,
+            ),
+            neck=stack([18, 2, 2]),
+            points_head=stack(list(dim_res), [None, None, 3]),
+            mask_head=stack(list(dim_res), [None, None, 1]),
+            normal_head=None,
+            scale_head=ScaleHeadConfig(dims=[32, 16, 1]),
+            refiner=RefinerConfig(
+                encoder_channels=18,
+                model_channels=[8, 16, 32],
+                downsample_factors=[2, 2],
+                encoder_downsample=4,
+            ),
+        )
+        args.update(overrides)
+        return ModelConfig(**args)
+
+    def test_registry_exposes_model(self):
+        """The package resolves through the shared loader like other models."""
+        import dataclasses
+
+        from mlx_vlm.utils import get_model_and_args
+
+        model_module, model_type = get_model_and_args({"model_type": "moge3"})
+        self.assertEqual(model_type, "moge3")
+        config = model_module.ModelConfig.from_dict(
+            dataclasses.asdict(self._tiny_config())
+        )
+        self.assertIsNone(config.normal_head)
+        self.assertEqual(config.encoder.embed_dim, 32)
+        self.assertIsInstance(model_module.Model(config), model_module.Model)
+
+    def test_config_defaults(self):
+        """Default config reproduces the released MoGe-3 ViT-L model."""
+        from mlx_vlm.models.moge3.config import ModelConfig
+
+        config = ModelConfig()
+        self.assertEqual(config.model_type, "moge3")
+        self.assertEqual(config.encoder.backbone, "dinov2_vitl14")
+        self.assertEqual(config.encoder.embed_dim, 1024)
+        self.assertEqual(config.encoder.depth, 24)
+        self.assertEqual(config.encoder.intermediate_layers, [5, 11, 17, 23])
+        self.assertEqual(config.neck.dim_in, [1026, 2, 2, 2, 2])
+        self.assertEqual(config.refiner.model_channels, [32, 64, 128, 256, 512])
+        self.assertEqual(config.refiner_depth_resolution, 256)
+
+    def test_config_from_dict_nested(self):
+        """from_dict parses nested sub-configs like the checkpoint JSON."""
+        from mlx_vlm.models.moge3.config import ModelConfig
+
+        config = ModelConfig.from_dict(
+            {
+                "model_type": "moge3",
+                "encoder": {"backbone": "dinov2_vitg14", "unknown_key": 1},
+                "refiner": None,
+                "points_head": None,
+                "mask_head": None,
+                "normal_head": None,
+                "scale_head": None,
+            }
+        )
+        self.assertEqual(config.encoder.embed_dim, 1536)
+        self.assertEqual(config.encoder.ffn, "swiglu")
+        self.assertIsNone(config.refiner)
+        self.assertIsNone(config.points_head)
+
+    def test_encoder_shapes(self):
+        """Encoder returns (B, rows, cols, dim_out) features and a cls token."""
+        from mlx_vlm.models.moge3.vision import MoGe3Encoder
+
+        config = self._tiny_config()
+        encoder = MoGe3Encoder(config.encoder)
+        x = mx.random.normal((2, 70, 98, 3))
+        features, cls = encoder(x, 5, 7)
+        self.assertEqual(features.shape, (2, 5, 7, 16))
+        self.assertEqual(cls.shape, (2, 32))
+
+    def test_conv_stack_shapes(self):
+        """ConvStack upsamples x2 per level and emits per-level outputs."""
+        from mlx_vlm.models.moge3.conv_stack import ConvStack
+
+        config = self._tiny_config()
+        stack = ConvStack(config.neck)
+        inputs = [
+            mx.random.normal((1, 5, 7, 18)),
+            mx.random.normal((1, 10, 14, 2)),
+            mx.random.normal((1, 20, 28, 2)),
+        ]
+        outputs = stack(inputs)
+        self.assertEqual(len(outputs), 3)
+        self.assertEqual(outputs[0].shape, (1, 5, 7, 16))
+        self.assertEqual(outputs[1].shape, (1, 10, 14, 8))
+        self.assertEqual(outputs[2].shape, (1, 20, 28, 4))
+
+    def test_sanitize_conv_transpose_layout(self):
+        """Torch-layout ConvTranspose2d weights are relaid out; MLX layout is untouched."""
+        from mlx_vlm.models.moge3.moge3 import Model
+
+        model = Model(self._tiny_config())
+        narrow = self._tiny_config()
+        narrow.neck.dim_res_blocks = [16, 2, 4]
+        narrow_model = Model(narrow)
+        torch_w = mx.random.normal((16, 2, 2, 2))
+        sanitized = narrow_model.sanitize({"neck.resamplers.0.0.weight": torch_w})
+        self.assertEqual(sanitized["neck.resamplers.0.0.weight"].shape, (2, 2, 2, 16))
+        assert_sanitize_idempotent(
+            narrow_model, {"neck.resamplers.0.0.weight": torch_w}
+        )
+
+        mlx_weights = dict(tree_flatten(model.parameters()))
+        torch_layout = {
+            k: v.transpose(3, 0, 1, 2) if k.endswith("resamplers.0.0.weight") else v
+            for k, v in mlx_weights.items()
+        }
+        self.assertEqual(
+            torch_layout["neck.resamplers.0.0.weight"].shape, (16, 8, 2, 2)
+        )
+        sanitized = assert_sanitize_idempotent(model, torch_layout)
+        self.assertEqual(sanitized["neck.resamplers.0.0.weight"].shape, (8, 2, 2, 16))
+        for k in mlx_weights:
+            self.assertTrue(mx.array_equal(sanitized[k], mlx_weights[k]), k)
+        model.load_weights(list(sanitized.items()), strict=True)
+
+    def test_submanifold_conv_single_voxel(self):
+        """Degenerate case: one voxel -> bias + center-tap @ feat only."""
+        import numpy as np
+
+        from mlx_vlm.models.moge3.sparse import SubmanifoldConv3d
+
+        conv = SubmanifoldConv3d(3, 4)
+        conv.weight = mx.random.normal((4, 3, 3, 3, 3))
+        conv.bias = mx.random.normal((4,))
+        feats = mx.random.normal((1, 3))
+        coords = mx.array([[0, 2, 3, 1]], dtype=mx.int32)
+        shape = (1, 6, 7, 5)
+        out, _ = conv(feats, coords, shape)
+        want = feats[0] @ conv.weight[:, 1, 1, 1, :].T + conv.bias
+        self.assertTrue(np.allclose(np.array(out[0]), np.array(want), atol=1e-5))
+
+    @staticmethod
+    def _random_sparse_coords(rng, shape, density=0.5):
+        """Raster-ordered (M, 4) int32 coords over ``shape`` (B, H, W, Z)."""
+        import numpy as np
+
+        B, H, W, Z = shape
+        grid = np.stack(np.meshgrid(*(np.arange(n) for n in shape), indexing="ij"))
+        coords = grid.reshape(4, -1).T
+        keep = rng.random(len(coords)) < density
+        return mx.array(coords[keep].astype(np.int32))
+
+    def test_neighbor_map_matches_brute_force(self):
+        """Key-offset neighbor lookup equals an explicit coordinate search."""
+        import numpy as np
+
+        from mlx_vlm.models.moge3.sparse import submanifold_conv3d_neighbor_map
+
+        rng = np.random.default_rng(0)
+        # Z of 1 and W of 2 make edge offsets alias onto neighbouring rows.
+        for shape in [(2, 5, 4, 3), (1, 3, 2, 1), (1, 4, 4, 4)]:
+            coords = self._random_sparse_coords(rng, shape)
+            got = np.array(submanifold_conv3d_neighbor_map(coords, shape))
+            c = np.array(coords)
+            lookup = {tuple(row): m for m, row in enumerate(c.tolist())}
+            offsets = [
+                (0, di, dj, dz)
+                for di in (-1, 0, 1)
+                for dj in (-1, 0, 1)
+                for dz in (-1, 0, 1)
+            ]
+            want = np.array(
+                [[lookup.get(tuple(row + off), -1) for off in offsets] for row in c]
+            )
+            self.assertTrue(np.array_equal(got, want), shape)
+
+    def test_submanifold_conv_chunked_gemm_matches_reference(self):
+        """Chunked im2col GEMM equals the per-tap gather + matmul sum."""
+        from unittest import mock
+
+        import numpy as np
+
+        from mlx_vlm.models.moge3 import sparse
+        from mlx_vlm.models.moge3.sparse import SubmanifoldConv3d
+
+        rng = np.random.default_rng(1)
+        shape = (2, 6, 5, 4)
+        coords = self._random_sparse_coords(rng, shape, density=0.7)
+        M, Ci, Co = coords.shape[0], 6, 5
+        conv = SubmanifoldConv3d(Ci, Co)
+        conv.weight = mx.random.normal((Co, 3, 3, 3, Ci))
+        conv.bias = mx.random.normal((Co,))
+        feats = mx.random.normal((M, Ci))
+
+        nmap = sparse.submanifold_conv3d_neighbor_map(coords, shape)
+        feats_pad = mx.concatenate([feats, mx.zeros((1, Ci))])
+        idx = mx.where(nmap >= 0, nmap, M)
+        w = conv.weight.reshape(Co, 27, Ci)
+        want = mx.broadcast_to(conv.bias, (M, Co))
+        for v in range(27):
+            want = want + feats_pad[idx[:, v]] @ w[:, v, :].T
+
+        # Force several gather chunks (4 rows each) to exercise the split.
+        with mock.patch.object(sparse, "_GATHER_CHUNK_BYTES", 27 * Ci * 4 * 4):
+            out, _ = conv(feats, coords, shape, neighbor_map=nmap)
+        self.assertTrue(np.allclose(np.array(out), np.array(want), atol=1e-5))
+
+    def test_lazy_depth_extent_in_shape(self):
+        """The voxelizer's Z extent may be a lazy scalar; sparse ops accept it."""
+        import numpy as np
+
+        from mlx_vlm.models.moge3.sparse import (
+            sparse_pool2x_mean,
+            submanifold_conv3d_neighbor_map,
+        )
+
+        rng = np.random.default_rng(2)
+        shape = (1, 4, 4, 5)
+        coords = self._random_sparse_coords(rng, shape)
+        lazy_shape = (1, 4, 4, coords[:, 3].max() + 1)
+        self.assertTrue(
+            mx.array_equal(
+                submanifold_conv3d_neighbor_map(coords, shape),
+                submanifold_conv3d_neighbor_map(coords, lazy_shape),
+            )
+        )
+        feats = mx.random.normal((coords.shape[0], 3))
+        out, out_coords, _, _ = sparse_pool2x_mean(feats, coords, shape)
+        out_lazy, out_coords_lazy, _, _ = sparse_pool2x_mean(feats, coords, lazy_shape)
+        self.assertTrue(mx.array_equal(out, out_lazy))
+        self.assertTrue(mx.array_equal(out_coords, out_coords_lazy))
+
+    def test_replicate_padding_matches_edge_pad(self):
+        """Gather-based replicate padding is bit-identical to mx.pad(mode="edge")."""
+        from mlx_vlm.models.moge3.conv_stack import Conv2dReplicate
+
+        conv = Conv2dReplicate(3, 4, kernel_size=3)
+        x = mx.random.normal((2, 7, 5, 3))
+        want = mx.conv2d(
+            mx.pad(x, [(0, 0), (1, 1), (1, 1), (0, 0)], mode="edge"), conv.weight
+        )
+        self.assertTrue(mx.array_equal(conv(x), want + conv.bias))
+
+    def test_processor_resize_and_scaling(self):
+        """resize_to caps the long side, keeps aspect, and handles batches."""
+        import numpy as np
+
+        from mlx_vlm.models.moge3.processing_moge3 import MogeProcessor
+
+        processor = MogeProcessor(resize_to=800)
+        portrait = np.zeros((1000, 500, 3), dtype=np.uint8)
+        self.assertEqual(processor.preprocess_image(portrait).shape, (800, 400, 3))
+        landscape = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        self.assertEqual(processor.preprocess_image(landscape).shape, (450, 800, 3))
+        batch = np.zeros((2, 500, 1000, 3), dtype=np.uint8)
+        self.assertEqual(processor.preprocess_image(batch).shape, (2, 400, 800, 3))
+
+        processor = MogeProcessor()
+        out = processor.preprocess_image(np.full((4, 6, 3), 255, dtype=np.uint8))
+        self.assertEqual(out.dtype, np.float32)
+        self.assertTrue(np.allclose(out, 1.0))
+        out = processor.preprocess_image(np.full((4, 6, 3), 65535, dtype=np.uint16))
+        self.assertTrue(np.allclose(out, 1.0))
+        with self.assertRaises(ValueError):
+            processor.preprocess_image(np.full((4, 6, 3), 255.0, dtype=np.float32))
+
+    def test_loader_disabled_modules_are_skipped(self):
+        """Modules the loader nulls out (no checkpoint weights) are not called."""
+        from mlx_vlm.models.moge3.moge3 import Model
+
+        model = Model(self._tiny_config())
+        model.mask_head = None
+        model.refiner = None
+        image = mx.random.uniform(0, 1, (1, 96, 128, 3))
+        out = model(image, num_tokens=35, refine_steps=0)
+        self.assertNotIn("mask", out)
+        self.assertIn("points", out)
+        with self.assertRaises(ValueError):
+            model(image, num_tokens=35, refine_steps=1)
+
+    def test_focal_shift_uv_grid_matches_subsampled_full_grid(self):
+        """The 64x64 solver grid equals nearest-subsampling the full UV map."""
+        from mlx_vlm.models.moge3.geometry import (
+            _nearest_indices,
+            _view_plane_axes,
+            normalized_view_plane_uv,
+        )
+
+        for height, width in [(1080, 1920), (97, 131), (64, 64), (50, 70)]:
+            ii = _nearest_indices(height, 64)
+            jj = _nearest_indices(width, 64)
+            want = normalized_view_plane_uv(width, height)[ii][:, jj]
+            u, v = _view_plane_axes(width, height)
+            u, v = mx.meshgrid(u[jj], v[ii], indexing="xy")
+            self.assertTrue(mx.array_equal(mx.stack([u, v], axis=-1), want))
+
+    def test_sparse_pool_upsample_roundtrip(self):
+        """Nearest upsample of a 2x2x2 mean pool reproduces parent values."""
+        import numpy as np
+
+        from mlx_vlm.models.moge3.sparse import (
+            sparse_pool2x_mean,
+            sparse_upsample2x_nearest,
+        )
+
+        # Two voxels in the same 2x2x2 block and one outside it.
+        coords = mx.array([[0, 0, 0, 0], [0, 1, 1, 1], [0, 2, 2, 3]], dtype=mx.int32)
+        feats = mx.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        shape = (1, 4, 4, 4)
+        out, out_coords, out_shape, parent_idx = sparse_pool2x_mean(
+            feats, coords, shape
+        )
+        self.assertEqual(out.shape[0], 2)
+        self.assertTrue(np.allclose(np.array(out[0]), [2.0, 3.0]))
+        self.assertTrue(np.allclose(np.array(out[1]), [5.0, 6.0]))
+        self.assertEqual(np.array(out_coords).tolist(), [[0, 0, 0, 0], [0, 1, 1, 1]])
+
+        up, up_coords, _ = sparse_upsample2x_nearest(out, parent_idx, coords, shape)
+        want = np.array([[2.0, 3.0], [2.0, 3.0], [5.0, 6.0]])
+        self.assertTrue(np.allclose(np.array(up), want, atol=1e-6))
+
+    def test_forward_and_infer_shapes(self):
+        """Full forward + infer on a tiny random-weight model."""
+        config = self._tiny_config()
+        from mlx_vlm.models.moge3.moge3 import Model
+
+        model = Model(config)
+        image = mx.random.uniform(0, 1, (1, 96, 128, 3))
+        out = model(image, num_tokens=35, refine_steps=1)
+        self.assertEqual(out["points"].shape, (1, 96, 128, 3))
+        self.assertEqual(out["mask"].shape, (1, 96, 128))
+        self.assertEqual(out["metric_scale"].shape, (1,))
+        self.assertNotIn("normal", out)
+
+        out = model.infer(image[0], num_tokens=35, refine_steps=1)
+        self.assertEqual(out["points"].shape, (96, 128, 3))
+        self.assertEqual(out["depth"].shape, (96, 128))
+        self.assertEqual(out["intrinsics"].shape, (3, 3))
+        self.assertEqual(out["mask"].shape, (96, 128))
+        self.assertNotIn("points_per_step", out)
+
+    def test_zero_refiner_is_identity(self):
+        """With a zeroed out_proj the refiner leaves the point map unchanged."""
+        import numpy as np
+
+        from mlx_vlm.models.moge3.moge3 import Model
+
+        config = self._tiny_config()
+        model = Model(config)
+        model.refiner.out_proj.weight = mx.zeros_like(model.refiner.out_proj.weight)
+        model.refiner.out_proj.bias = mx.zeros_like(model.refiner.out_proj.bias)
+
+        image = mx.random.uniform(0, 1, (1, 96, 128, 3))
+        coarse = model(image, num_tokens=35, refine_steps=0)
+        refined = model(image, num_tokens=35, refine_steps=2, return_per_step=True)
+        self.assertTrue(
+            np.allclose(
+                np.array(coarse["points"]), np.array(refined["points"]), atol=1e-5
+            )
+        )
+        self.assertEqual(len(refined["points_per_step"]), 3)
+
+    def test_per_step_outputs(self):
+        """return_per_step yields initial + one map per refinement step."""
+        from mlx_vlm.models.moge3.moge3 import Model
+
+        model = Model(self._tiny_config())
+        image = mx.random.uniform(0, 1, (1, 96, 128, 3))
+        out = model.infer(image, num_tokens=35, refine_steps=2, return_per_step=True)
+        self.assertEqual(len(out["points_per_step"]), 3)
+        self.assertEqual(len(out["depth_per_step"]), 3)
+        self.assertEqual(out["points_per_step"][-1].shape, (1, 96, 128, 3))
