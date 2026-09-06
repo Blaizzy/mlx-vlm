@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map_with_path
 
+from .quant_utils import get_quantization_params
 from .utils import (
     MODEL_CONVERSION_DTYPES,
     create_model_card,
@@ -30,23 +31,6 @@ QUANT_RECIPES = [
 ]
 
 
-def _quantization_params(
-    q_group_size: Optional[int], q_bits: Optional[int], q_mode: str
-):
-    mode_defaults = {
-        "affine": (64, 4),
-        "mxfp4": (32, 4),
-        "nvfp4": (16, 4),
-        "mxfp8": (32, 8),
-    }
-    group_size, bits = mode_defaults[q_mode]
-    return {
-        "group_size": q_group_size or group_size,
-        "bits": q_bits or bits,
-        "mode": q_mode,
-    }
-
-
 def _preserve_existing_deepseek_v4_quantization(
     config: dict,
     model: nn.Module,
@@ -66,7 +50,7 @@ def _preserve_existing_deepseek_v4_quantization(
     from .models.deepseek_v4.language import make_quantization_config
 
     quantization = make_quantization_config(model)
-    quantization.update(_quantization_params(q_group_size, q_bits, q_mode))
+    quantization.update(get_quantization_params(q_group_size, q_bits, q_mode))
     config["quantization"] = quantization
     config["quantization_config"] = quantization
 

@@ -1,3 +1,4 @@
+import re
 from dataclasses import replace
 from typing import Any, List, Optional
 
@@ -50,6 +51,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         self._input_embed = None
         self._input_embed_scale: float = 1.0
         self._lm_head_fn = None
+        self._greedy_argmax_fn = None
         self._cache: List[KVCache] = []
         self._seed_token: Optional[mx.array] = None
         self._seed_hidden: Optional[mx.array] = None
@@ -90,6 +92,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
             or getattr(lm, "lm_head", None)
             or self._input_embed.as_linear
         )
+        self._greedy_argmax_fn = getattr(lm, "speculative_argmax_from_hidden", None)
         return self
 
     def make_cache(self, left_padding: Optional[List[int]] = None) -> List[KVCache]:
@@ -201,9 +204,18 @@ class Qwen3_5MTPDraftModel(nn.Module):
     ) -> mx.array:
         return self._forward_tokens(tok, hidden, token_dtype)
 
+    def _greedy_token(self, hidden: mx.array) -> mx.array:
+        if self._greedy_argmax_fn is not None:
+            token = self._greedy_argmax_fn(hidden)
+            if token is not None:
+                return token
+        return mx.argmax(self._lm_head_fn(hidden), axis=-1)
+
     def _set_seed_from_hidden(self, hidden: mx.array, sampler, greedy: bool) -> None:
-        logits = self._lm_head_fn(hidden)
-        self._seed_token = mx.argmax(logits, axis=-1) if greedy else sampler(logits)
+        if greedy:
+            self._seed_token = self._greedy_token(hidden)
+        else:
+            self._seed_token = sampler(self._lm_head_fn(hidden))
         self._seed_hidden = hidden
 
     def prefill_from_target_hidden(
@@ -460,8 +472,10 @@ class Qwen3_5MTPDraftModel(nn.Module):
         while len(tokens) < block_size - 1:
             h_prev = self._forward_token(tok, h_prev, token_dtype)
             self._round_appended += 1
-            logits = self._lm_head_fn(h_prev)
-            tok = mx.argmax(logits, axis=-1) if greedy else sampler(logits)
+            if greedy:
+                tok = self._greedy_token(h_prev)
+            else:
+                tok = sampler(self._lm_head_fn(h_prev))
             tokens.append(tok)
 
         self._draft_round += 1
@@ -469,20 +483,6 @@ class Qwen3_5MTPDraftModel(nn.Module):
 
     def sanitize(self, weights: dict) -> dict:
         out = {}
-        expert_prefixes = [
-            key[: -len(".experts.gate_up_proj")]
-            for key in weights
-            if key.endswith(".experts.gate_up_proj")
-        ]
-        for prefix in expert_prefixes:
-            gate_up_weight = weights.pop(f"{prefix}.experts.gate_up_proj")
-            gate_weight, up_weights = mx.split(gate_up_weight, 2, axis=-2)
-            weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight
-            weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_weights
-            weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
-                f"{prefix}.experts.down_proj"
-            )
-
         norm_suffixes = (
             ".input_layernorm.weight",
             ".post_attention_layernorm.weight",
@@ -500,4 +500,57 @@ class Qwen3_5MTPDraftModel(nn.Module):
                 if value.ndim == 1 and mx.issubdtype(value.dtype, mx.floating):
                     value = value + 1.0
             out[key] = value
-        return convert_qwen_fp8_weights(out)
+        out = convert_qwen_fp8_weights(out)
+
+        expert_prefixes = [
+            key[: -len(".experts.gate_up_proj")]
+            for key in out
+            if key.endswith(".experts.gate_up_proj")
+        ]
+        for prefix in expert_prefixes:
+            gate_up_key = f"{prefix}.experts.gate_up_proj"
+            gate_up_weight = out.pop(gate_up_key)
+            gate_weight, up_weight = mx.split(gate_up_weight, 2, axis=-2)
+            out[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight
+            out[f"{prefix}.switch_mlp.up_proj.weight"] = up_weight
+
+            gate_up_scales_key = f"{gate_up_key}_scales"
+            if gate_up_scales_key in out:
+                gate_scales, up_scales = mx.split(
+                    out.pop(gate_up_scales_key), 2, axis=-2
+                )
+                out[f"{prefix}.switch_mlp.gate_proj.scales"] = gate_scales
+                out[f"{prefix}.switch_mlp.up_proj.scales"] = up_scales
+
+            down_key = f"{prefix}.experts.down_proj"
+            out[f"{prefix}.switch_mlp.down_proj.weight"] = out.pop(down_key)
+            if f"{down_key}_scales" in out:
+                out[f"{prefix}.switch_mlp.down_proj.scales"] = out.pop(
+                    f"{down_key}_scales"
+                )
+
+        pattern = re.compile(
+            r"(.*\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\."
+            r"(weight|scales|biases)$"
+        )
+        groups = {}
+        for key in out:
+            if match := pattern.fullmatch(key):
+                expert_prefix, expert, projection, suffix = match.groups()
+                groups.setdefault((expert_prefix, projection, suffix), {})[
+                    int(expert)
+                ] = key
+
+        for (expert_prefix, projection, suffix), expert_keys in groups.items():
+            experts = sorted(expert_keys)
+            if experts != list(range(len(experts))):
+                raise ValueError(
+                    f"Qwen MTP expert indexes are not contiguous for {expert_prefix}: "
+                    f"{experts}."
+                )
+            base = expert_prefix[: -len(".experts")]
+            out[f"{base}.switch_mlp.{projection}.{suffix}"] = mx.stack(
+                [out.pop(expert_keys[expert]) for expert in experts]
+            )
+
+        return out

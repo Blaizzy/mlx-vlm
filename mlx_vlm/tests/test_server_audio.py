@@ -366,3 +366,46 @@ def _drain(handle, timeout=2.0):
         elif chunk.kind == "done":
             return chunks
     raise TimeoutError("timed out waiting for audio queue results")
+
+
+def test_audio_transcriptions_accepts_m4a_upload(client, monkeypatch):
+    fake_model = FakeSTTModel({"text": "Transcribed from m4a."})
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda model, **kwargs: (fake_model, None, SimpleNamespace(model_type="audio")),
+    )
+    monkeypatch.setattr(
+        server_audio,
+        "audio_read",
+        lambda buffer, always_2d=False: (np.zeros(160, dtype=np.float32), 16000),
+    )
+    # Intentionally exercises the real writer: the bug was that the temp file
+    # inherited the upload's extension and m4a is not an encodable format.
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("meeting.m4a", b"audio-bytes", "audio/mp4")},
+        data={"model": "fake-stt"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"text": "Transcribed from m4a."}
+    assert fake_model.calls[0]["path"].endswith(".wav")
+
+
+def test_audio_transcriptions_undecodable_upload_returns_400(client, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda model, **kwargs: pytest.fail("model must not load for a bad upload"),
+    )
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("broken.m4a", b"not-audio", "audio/mp4")},
+        data={"model": "fake-stt"},
+    )
+
+    assert response.status_code == 400
+    assert "Invalid audio file" in response.json()["detail"]

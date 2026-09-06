@@ -231,6 +231,9 @@ class Model(nn.Module):
                     "model.multi_modal_projector", "multi_modal_projector"
                 )
 
+            if key.startswith("model."):
+                key = "language_model." + key
+
             return key
 
         weights = {transform_key(k): v for k, v in weights.items()}

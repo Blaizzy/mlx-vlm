@@ -516,9 +516,11 @@ def _gated_delta_with_states_ops(
     beta: mx.array,
     state: mx.array,
     mask: Optional[mx.array] = None,
+    state_steps: Optional[int] = None,
 ):
     B, T, Hk, _Dk = q.shape
     Hv = v.shape[-2]
+    state_steps = T if state_steps is None else int(state_steps)
     if (repeat_factor := Hv // Hk) > 1:
         q = mx.repeat(q, repeat_factor, -2)
         k = mx.repeat(k, repeat_factor, -2)
@@ -540,8 +542,12 @@ def _gated_delta_with_states_ops(
             y = mx.where(valid[:, None, None], y, 0)
 
         ys.append(y.astype(q.dtype))
-        states.append(state)
-    stacked_states = mx.stack(states, axis=1)
+        if t < state_steps:
+            states.append(state)
+    if states:
+        stacked_states = mx.stack(states, axis=1)
+    else:
+        stacked_states = mx.zeros((B, 0, *state.shape[1:]), dtype=state.dtype)
     return mx.stack(ys, axis=1), state, stacked_states
 
 
@@ -556,10 +562,14 @@ def gated_delta_update_with_states(
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
+    state_steps: Optional[int] = None,
 ):
     g, beta = _compute_g_beta(A_log, a, b, dt_bias)
+    B, T, Hk, Dk = k.shape
+    state_steps = T if state_steps is None else int(state_steps)
+    if not 0 <= state_steps <= T:
+        raise ValueError("state_steps must be between zero and the sequence length.")
     if state is None:
-        B, _, _Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
@@ -569,11 +579,9 @@ def gated_delta_update_with_states(
         or mx.default_device() != mx.gpu
         or not mx.metal.is_available()
     ):
-        return _gated_delta_with_states_ops(q, k, v, g, beta, state, mask)
+        return _gated_delta_with_states_ops(q, k, v, g, beta, state, mask, state_steps)
 
-    B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
-    state_steps = T
 
     input_type = q.dtype
     state_type = state.dtype
@@ -583,7 +591,7 @@ def gated_delta_update_with_states(
         kernel = _gated_delta_with_states_kernel_masked
         inputs.append(mask)
     if kernel is None:
-        return _gated_delta_with_states_ops(q, k, v, g, beta, state, mask)
+        return _gated_delta_with_states_ops(q, k, v, g, beta, state, mask, state_steps)
 
     return kernel(
         inputs=inputs,

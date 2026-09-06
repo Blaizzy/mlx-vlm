@@ -2,6 +2,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..qwen3_5 import Model as Qwen3_5Model
+from ..qwen3_5.fp8 import convert_qwen_fp8_weights
 from ..qwen3_5.qwen3_5 import (
     NORM_WEIGHT_SUFFIXES,
     sanitize_key,
@@ -26,13 +27,14 @@ class Model(Qwen3_5Model):
         # The MTP draft shard is separate from the base model. Its presence
         # must not select the base model's RMSNorm loading convention.
         weights = {key: value for key, value in weights.items() if "mtp." not in key}
+        weights = convert_qwen_fp8_weights(weights)
         shift_norm_weights = should_shift_norm_weights(weights)
 
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        for l in range(self.config.text_config.num_hidden_layers):
-            prefix = f"model.language_model.layers.{l}.mlp"
+        for layer_idx in range(self.config.text_config.num_hidden_layers):
+            prefix = f"model.language_model.layers.{layer_idx}.mlp"
             gate_up_key = f"{prefix}.experts.gate_up_proj"
             if gate_up_key in weights:
                 # process gate_up_proj [num_experts, 2 * intermediate_size, hidden_size]
@@ -44,18 +46,34 @@ class Model(Qwen3_5Model):
                 weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up_weight[
                     ..., mid:, :
                 ]
+                gate_up_scales_key = f"{gate_up_key}_scales"
+                if gate_up_scales_key in weights:
+                    gate_up_scales = weights.pop(gate_up_scales_key)
+                    weights[f"{prefix}.switch_mlp.gate_proj.scales"] = gate_up_scales[
+                        ..., :mid, :
+                    ]
+                    weights[f"{prefix}.switch_mlp.up_proj.scales"] = gate_up_scales[
+                        ..., mid:, :
+                    ]
                 # down_proj
-                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
-                    f"{prefix}.experts.down_proj"
-                )
+                down_key = f"{prefix}.experts.down_proj"
+                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(down_key)
+                if f"{down_key}_scales" in weights:
+                    weights[f"{prefix}.switch_mlp.down_proj.scales"] = weights.pop(
+                        f"{down_key}_scales"
+                    )
             elif f"{prefix}.experts.0.up_proj.weight" in weights:
                 for name in ["up_proj", "down_proj", "gate_proj"]:
-                    weights[f"{prefix}.switch_mlp.{name}.weight"] = mx.stack(
-                        [
-                            weights.pop(f"{prefix}.experts.{e}.{name}.weight")
-                            for e in range(self.config.text_config.num_experts)
-                        ]
-                    )
+                    for suffix in ["weight", "scales", "biases"]:
+                        first_key = f"{prefix}.experts.0.{name}.{suffix}"
+                        if first_key not in weights:
+                            continue
+                        weights[f"{prefix}.switch_mlp.{name}.{suffix}"] = mx.stack(
+                            [
+                                weights.pop(f"{prefix}.experts.{e}.{name}.{suffix}")
+                                for e in range(self.config.text_config.num_experts)
+                            ]
+                        )
 
         sanitized_weights = {}
         for key, value in weights.items():

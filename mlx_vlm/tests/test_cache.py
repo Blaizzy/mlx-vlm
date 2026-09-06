@@ -6,6 +6,7 @@ from mlx_vlm.models.cache import (
     BatchPoolingCache,
     BatchRotatingKVCache,
     CacheList,
+    ChunkedKVCache,
     KVCache,
     RotatingKVCache,
     UnboundedKVCache,
@@ -45,6 +46,40 @@ def test_cache_list_can_extract_an_already_extracted_kv_cache():
     assert extracted_again[0].offset == first.offset
     assert mx.array_equal(extracted_again[0].keys, first.state[0]).item()
     assert mx.array_equal(extracted_again[0].values, first.state[1]).item()
+
+
+def test_arrays_cache_advance_matches_decremented_values():
+    cache = ArraysCache(1, left_padding=[3, 1])
+    cache.prepare(lengths=[10, 7])
+    cache.advance(1)
+    cache.advance(2)
+
+    assert cache.left_padding.tolist() == [0, -2]
+    assert cache.lengths.tolist() == [7, 4]
+
+    mask = cache.make_mask(4)
+    assert mask.tolist() == [[p >= lp for p in range(4)] for lp in (0, -2)]
+
+    cache.filter([1, 0])
+    assert cache.left_padding.tolist() == [-2, 0]
+    assert cache.lengths.tolist() == [4, 7]
+
+    cache.finalize()
+    assert cache.left_padding is None and cache.lengths is None
+
+
+def test_arrays_cache_advance_does_not_accumulate_buffers():
+    cache = ArraysCache(1, left_padding=[0, 0])
+    cache.prepare(lengths=[8, 8])
+
+    mx.clear_cache()
+    base = mx.get_active_memory()
+    for _ in range(20000):
+        cache.advance(1)
+    delta = mx.get_active_memory() - base
+
+    assert delta < 4096, f"advance leaked {delta} bytes over 20k steps"
+    assert cache.lengths.tolist() == [8 - 20000, 8 - 20000]
 
 
 def test_kv_cache_extract_validates_row_index():
@@ -233,3 +268,31 @@ def test_no_bound_requested_leaves_the_model_cache_untouched():
         "KVCache",
         "ArraysCache",
     ]
+
+
+def test_chunked_kv_cache_trims_on_valid_length_not_buffer_width():
+    # Regression test for maybe_trim_front: update_and_fetch pads the backing
+    # buffer up to a multiple of ``step``, so trimming on ``keys.shape[2]``
+    # discarded up to ``step - 1`` live tokens per trim and left the attention
+    # window narrower than ``chunk_size``.
+    chunk_size, n_tokens = 8, 14
+    original_step = ChunkedKVCache.step
+    ChunkedKVCache.step = 4
+    try:
+        cache = ChunkedKVCache(chunk_size)
+        window = []
+        for token in range(n_tokens):
+            # llama4/language.py trims before every update on chunked layers.
+            cache.maybe_trim_front()
+            kv = mx.full((1, 1, 1, 2), float(token))
+            keys, _ = cache.update_and_fetch(kv, kv)
+            window = [int(k) for k in keys[0, 0, :, 0]]
+    finally:
+        ChunkedKVCache.step = original_step
+
+    # The window must never fall below chunk_size once that many tokens exist,
+    # and must be the contiguous run ending at the newest token.
+    assert len(window) >= chunk_size
+    assert window[-1] == n_tokens - 1
+    assert window == list(range(window[0], window[0] + len(window)))
+    assert cache.start_position <= cache.offset
