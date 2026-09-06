@@ -1803,6 +1803,34 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
         return gated_values + nn.silu(module.conv1d(conv_input))
 
     def _qsa_attention(self, attention, hidden_states, cache, position_ids, mask):
+        padding_info = _qwen3_5_left_padding_info(cache)
+        standard_causal = padding_info is None or padding_info[1] == 0
+        past_index_len = getattr(cache, "index_offset", getattr(cache, "offset", 0))
+        sparse_active = (
+            not isinstance(past_index_len, mx.array)
+            and int(past_index_len) + 1
+            >= (attention.indexer.block_topk + 1) * attention.indexer.compress_ratio
+        )
+        if hidden_states.shape[1] > 2 and standard_causal and sparse_active:
+            # QSA's two-position verifier matches sequential decode exactly;
+            # keep wider speculative blocks as ordered pairs of that geometry.
+            return mx.concatenate(
+                [
+                    self._qsa_attention(
+                        attention,
+                        hidden_states[:, index : index + 2],
+                        cache,
+                        (
+                            None
+                            if position_ids is None
+                            else position_ids[..., index : index + 2]
+                        ),
+                        None,
+                    )
+                    for index in range(0, hidden_states.shape[1], 2)
+                ],
+                axis=1,
+            )
         projected = self._linear(attention.indexer.index_qk_proj, hidden_states)
         if hidden_states.shape[1] > 2 or (
             isinstance(mask, str) and mask == "left_padded_decode"

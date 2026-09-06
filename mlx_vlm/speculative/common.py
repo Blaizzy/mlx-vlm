@@ -360,7 +360,8 @@ def _dflash_block_total(draft_model: nn.Module, draft_block_size: Optional[int])
     configured = int(draft_model.config.block_size)
     runtime = getattr(draft_model.config, "runtime_block_size", None)
     if runtime is None:
-        return configured
+        runtime = getattr(draft_model, "default_runtime_block_size", None)
+        return configured if runtime is None else max(1, int(runtime))
     return min(configured, max(1, int(runtime)))
 
 

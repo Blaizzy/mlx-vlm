@@ -8,6 +8,7 @@ import pytest
 from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models.qwen4_exp.config import TextConfig
 from mlx_vlm.models.qwen4_exp.language import LanguageModel, Qwen4ExpDecoderLayer
+from mlx_vlm.speculative.common import _dflash_block_total
 from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_mtp_splitter
 from mlx_vlm.speculative.drafters.qwen4_exp_mtp import (
     ModelConfig,
@@ -113,15 +114,16 @@ def test_qwen4_mtp_fusion_matches_released_equations():
     assert mx.allclose(actual, expected, atol=2e-5).item()
 
 
-def test_qwen4_mtp_uses_requested_block_size_as_adaptive_ceiling():
+def test_qwen4_mtp_uses_shared_adaptive_policy_with_three_draft_ceiling():
     drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=_tiny_text_config()))
 
+    assert _dflash_block_total(drafter, None) == 4
     assert _mtp_next_block_size(drafter, 4, 2, 32) == 2
-
     drafter.accept_lens.extend([1] * 8)
     assert _mtp_next_block_size(drafter, 4, 2, 32) == 4
+    assert _dflash_block_total(drafter, 3) == 3
 
-    drafter.accept_lens.extend([0] * 16)
+    drafter.accept_lens[:] = [1] * 5 + [0] * 3
     assert _mtp_next_block_size(drafter, 4, 2, 32) == 2
 
 
@@ -152,20 +154,20 @@ def test_qwen4_mtp_draft_block_uses_hyper_connection_hidden():
     assert drafter._cache[0].offset == 1
 
 
-@pytest.mark.parametrize("accepted", [0, 1])
+@pytest.mark.parametrize("accepted", range(6))
 def test_qwen4_target_exposes_pre_mixer_hidden_and_rolls_back_rejection_exactly(
     accepted,
 ):
     config = _tiny_text_config(with_ple=True)
     language = LanguageModel(config, _outer_config())
-    prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
-    verify = mx.array([[4, 5, 6]], dtype=mx.int32)
+    prompt = mx.arange(1, 17, dtype=mx.int32)[None]
+    verify = mx.array([[17, 18, 19, 20, 21, 22]], dtype=mx.int32)
 
     speculative_cache = language.make_cache()
     prefill = language(prompt, cache=speculative_cache, return_hidden=True)
     hidden, _, rollback = language.speculative_verify_hidden(verify, speculative_cache)
     language.rollback_speculative_cache(
-        speculative_cache, rollback, accepted=accepted, block_size=3
+        speculative_cache, rollback, accepted=accepted, block_size=6
     )
 
     reference_cache = language.make_cache()
@@ -177,8 +179,8 @@ def test_qwen4_target_exposes_pre_mixer_hidden_and_rolls_back_rejection_exactly(
     reference_logits = language(probe, cache=reference_cache).logits
     mx.eval(prefill.hidden_states, hidden, speculative_logits, reference_logits)
 
-    assert prefill.hidden_states[-1].shape == (1, 3, 64)
-    assert hidden.shape == (1, 3, 64)
+    assert prefill.hidden_states[-1].shape == (1, 16, 64)
+    assert hidden.shape == (1, 6, 64)
     assert mx.allclose(speculative_logits, reference_logits, rtol=0, atol=1e-6).item()
     assert mx.array_equal(
         mx.argmax(speculative_logits, axis=-1),
