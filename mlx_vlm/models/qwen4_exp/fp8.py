@@ -12,7 +12,6 @@ _EXPERT_WEIGHT_RE = re.compile(
     r"(gate_proj|up_proj|down_proj)\.weight$"
 )
 _PLE_SCALE_SUFFIX = ".ple.ple_embedding.ngram_embedding.weight_scale"
-_PLE_SHARD_MARKER = ".ple.ple_embedding.ngram_embedding.shard_"
 
 
 def convert_qwen4_exp_fp8_weights(weights: dict[str, mx.array]):
