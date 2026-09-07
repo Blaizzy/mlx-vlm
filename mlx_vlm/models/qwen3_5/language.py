@@ -1106,6 +1106,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
         return q, k
 
+    def _project_gates(self, inputs: mx.array):
+        return self.in_proj_b(inputs), self.in_proj_a(inputs)
+
     def __call__(
         self,
         inputs: mx.array,
@@ -1113,12 +1116,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
-        mixed_qkv, z, b, a = (
-            self.in_proj_qkv(inputs),
-            self.in_proj_z(inputs),
-            self.in_proj_b(inputs),
-            self.in_proj_a(inputs),
-        )
+        mixed_qkv = self.in_proj_qkv(inputs)
+        z = self.in_proj_z(inputs)
+        b, a = self._project_gates(inputs)
 
         z = z.reshape(B, S, -1, self.head_v_dim)
 

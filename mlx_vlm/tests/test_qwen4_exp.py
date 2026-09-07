@@ -18,6 +18,7 @@ from mlx_vlm.models.qwen4_exp.language import (
     Qwen4ExpNGramEmbedding,
     ShardedEmbedding,
     _create_qwen4_exp_attention_mask,
+    _row_invariant_quantized_projection,
 )
 from mlx_vlm.models.qwen4_exp.qsa_kernel import (
     QSAExecutionPlan,
@@ -98,6 +99,44 @@ def tiny_config():
 
 
 class Qwen4ExpTests(unittest.TestCase):
+    def test_small_quantized_projections_are_chunk_invariant(self):
+        if not mx.metal.is_available():
+            self.skipTest("The row-invariant quantized kernel requires Metal")
+
+        formats = [
+            *[(32, bits, "affine") for bits in (2, 3, 4, 5, 6, 8)],
+            (32, 4, "mxfp4"),
+            (32, 8, "mxfp8"),
+            (16, 4, "nvfp4"),
+        ]
+        chunk_sizes = (1, 3, 5, 7, 15)
+        for group_size, bits, mode in formats:
+            with self.subTest(group_size=group_size, bits=bits, mode=mode):
+                mx.random.seed(11)
+                linear = nn.Linear(128, 4, bias=False)
+                linear.set_dtype(mx.bfloat16)
+                linear = nn.QuantizedLinear.from_linear(
+                    linear, group_size=group_size, bits=bits, mode=mode
+                )
+                hidden = mx.random.normal((1, sum(chunk_sizes), 128)).astype(
+                    mx.bfloat16
+                )
+
+                full = _row_invariant_quantized_projection(linear, hidden)
+                start = 0
+                pieces = []
+                for size in chunk_sizes:
+                    pieces.append(
+                        _row_invariant_quantized_projection(
+                            linear, hidden[:, start : start + size]
+                        )
+                    )
+                    start += size
+                chunked = mx.concatenate(pieces, axis=1)
+                mx.eval(full, chunked)
+
+                self.assertTrue(mx.array_equal(full, chunked).item())
+
     def test_dense_decode_reduction_is_batch_invariant(self):
         if not mx.metal.is_available():
             self.skipTest("The batch-invariant GEMV requires Metal")
@@ -221,7 +260,6 @@ class Qwen4ExpTests(unittest.TestCase):
             query_ends,
             block_size=block_size,
             causal=True,
-            all_sparse=True,
         )
         if plan is not QSAExecutionPlan.INDEXED_SPARSE_PREFILL:
             self.skipTest("QSA sparse Metal kernel is unavailable")
@@ -261,6 +299,68 @@ class Qwen4ExpTests(unittest.TestCase):
 
         self.assertTrue(mx.allclose(sparse, dense, atol=5e-3, rtol=5e-3).item())
 
+    def test_qsa_sparse_attention_is_chunk_invariant(self):
+        if not mx.metal.is_available():
+            self.skipTest("The QSA sparse kernel requires Metal")
+
+        mx.random.seed(39)
+        query_length, head_dim, block_size, top_k = 32, 32, 2, 4
+        queries = mx.random.normal((1, 4, query_length, head_dim)).astype(mx.bfloat16)
+        keys = mx.random.normal((1, 2, query_length, head_dim)).astype(mx.bfloat16)
+        values = mx.random.normal((1, 2, query_length, head_dim)).astype(mx.bfloat16)
+        query_ends = mx.arange(1, query_length + 1, dtype=mx.int32)[None]
+        selected = []
+        for query_end in range(1, query_length + 1):
+            complete = query_end // block_size
+            blocks = list(range(max(0, complete - top_k), complete))
+            selected.append([-1] * (top_k - len(blocks)) + blocks)
+        selected = mx.array([selected], dtype=mx.int32)
+
+        full = qsa_sparse_attention(
+            queries,
+            keys,
+            values,
+            selected,
+            query_ends,
+            scale=head_dim**-0.5,
+            block_size=block_size,
+        )
+        pieces = []
+        for start in range(0, query_length, 8):
+            end = start + 8
+            pieces.append(
+                qsa_sparse_attention(
+                    queries[:, :, start:end],
+                    keys[:, :, :end],
+                    values[:, :, :end],
+                    selected[:, start:end],
+                    query_ends[:, start:end],
+                    scale=head_dim**-0.5,
+                    block_size=block_size,
+                )
+            )
+        chunked = mx.concatenate(pieces, axis=2)
+        mx.eval(full, chunked)
+
+        self.assertTrue(mx.array_equal(full, chunked).item())
+
+    def test_qsa_short_prefix_selection_uses_sentinels(self):
+        model = qwen4_exp.Model(tiny_config())
+        indexer = model.language_model.model.layers[1].self_attn.indexer
+        selection = indexer.select(
+            mx.random.normal((1, 6, 32)), cache=QSAKVCache(), position_ids=None
+        )
+        mx.eval(selection.selected_blocks, selection.complete_counts)
+
+        self.assertEqual(selection.selected_blocks.shape, (1, 6, 4))
+        for position in range(6):
+            complete = int(selection.complete_counts[0, position].item())
+            blocks = sorted(selection.selected_blocks[0, position].tolist())
+            self.assertEqual(blocks.count(-1), 4 - complete)
+            self.assertEqual(
+                [block for block in blocks if block >= 0], list(range(complete))
+            )
+
     def test_qsa_attention_routes_long_prefix_to_sparse_kernel(self):
         mx.random.seed(41)
         model = qwen4_exp.Model(tiny_config())
@@ -268,23 +368,17 @@ class Qwen4ExpTests(unittest.TestCase):
         cache = QSAKVCache()
         attention(mx.random.normal((1, 18, 32)), mask="causal", cache=cache)
 
-        def fake_sparse(queries, *args, **kwargs):
+        def fake_dispatch(queries, *args, **kwargs):
             return mx.zeros_like(queries)
 
-        with (
-            patch(
-                "mlx_vlm.models.qwen4_exp.language.select_qsa_execution_plan",
-                return_value=QSAExecutionPlan.INDEXED_SPARSE_PREFILL,
-            ),
-            patch(
-                "mlx_vlm.models.qwen4_exp.language.qsa_sparse_attention",
-                side_effect=fake_sparse,
-            ) as sparse,
-        ):
+        with patch(
+            "mlx_vlm.models.qwen4_exp.language.dispatch_qsa_attention",
+            side_effect=fake_dispatch,
+        ) as dispatch:
             output = attention(mx.random.normal((1, 2, 32)), mask="causal", cache=cache)
             mx.eval(output)
 
-        sparse.assert_called_once()
+        dispatch.assert_called_once()
 
     def test_equal_length_qsa_batch_preserves_causal_mask_semantics(self):
         hidden = mx.zeros((4, 32, 64))
@@ -303,28 +397,22 @@ class Qwen4ExpTests(unittest.TestCase):
             cache=cache,
         )
 
-        def fake_sparse(queries, *args, **kwargs):
+        def fake_dispatch(queries, *args, **kwargs):
             return mx.zeros_like(queries)
 
-        with (
-            patch(
-                "mlx_vlm.models.qwen4_exp.language.select_qsa_execution_plan",
-                return_value=QSAExecutionPlan.INDEXED_SPARSE_PREFILL,
-            ),
-            patch(
-                "mlx_vlm.models.qwen4_exp.language.qsa_sparse_attention",
-                side_effect=fake_sparse,
-            ) as sparse,
-        ):
+        with patch(
+            "mlx_vlm.models.qwen4_exp.language.dispatch_qsa_attention",
+            side_effect=fake_dispatch,
+        ) as dispatch:
             output = model.language_model(
                 mx.random.randint(0, 64, (4, 2)),
                 cache=cache,
             ).logits
             mx.eval(output)
 
-        self.assertEqual(sparse.call_count, 4)
+        self.assertEqual(dispatch.call_count, 4)
         self.assertTrue(
-            all(call.args[0].shape[0] == 1 for call in sparse.call_args_list)
+            all(call.args[0].shape[0] == 1 for call in dispatch.call_args_list)
         )
 
     def test_ragged_qsa_batch_retains_explicit_mask(self):
@@ -351,7 +439,6 @@ class Qwen4ExpTests(unittest.TestCase):
             query_ends,
             block_size=2,
             causal=True,
-            all_sparse=True,
         )
         masked = select_qsa_execution_plan(
             queries,
@@ -361,7 +448,6 @@ class Qwen4ExpTests(unittest.TestCase):
             query_ends,
             block_size=2,
             causal=False,
-            all_sparse=True,
         )
 
         self.assertIs(decode, QSAExecutionPlan.DENSE_DECODE)

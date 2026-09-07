@@ -2,8 +2,11 @@
 
 from enum import Enum
 from functools import lru_cache
+from typing import Callable, Optional
 
 import mlx.core as mx
+
+from ..base import scaled_dot_product_attention
 
 
 class QSAExecutionPlan(str, Enum):
@@ -212,15 +215,12 @@ def select_qsa_execution_plan(
     *,
     block_size: int,
     causal: bool,
-    all_sparse: bool,
     allow_sparse_decode: bool = False,
 ) -> QSAExecutionPlan:
     """Select one explicit QSA implementation without evaluating MLX arrays."""
 
     if not causal:
         return QSAExecutionPlan.DENSE_MASKED
-    if not all_sparse:
-        return QSAExecutionPlan.DENSE_SHORT_CONTEXT
     if (
         not isinstance(queries, mx.array)
         or not isinstance(keys, mx.array)
@@ -237,20 +237,14 @@ def select_qsa_execution_plan(
 
     batch, q_heads, query_length, d_size = queries.shape
     kv_heads = keys.shape[1]
-    key_length = keys.shape[2]
     topk_blocks = block_indices.shape[-1]
     selected_length = topk_blocks * block_size
     if query_length <= 1 and not allow_sparse_decode:
         # The vector SDPA kernel remains faster for singleton decode.
         return QSAExecutionPlan.DENSE_DECODE
-    if (
-        kv_heads <= 0
-        or block_size <= 0
-        or selected_length <= 0
-        or selected_length >= key_length
-        or key_length < selected_length * 7
-    ):
-        # Sparse selection does not repay its dispatch cost below this crossover.
+    # Short prefixes are represented by sentinel blocks, so causal prefill can
+    # retain one reduction geometry regardless of the outer chunk length.
+    if kv_heads <= 0 or block_size <= 0 or selected_length <= 0:
         return QSAExecutionPlan.DENSE_SHORT_CONTEXT
     if (
         queries.dtype not in (mx.bfloat16, mx.float16)
@@ -281,10 +275,11 @@ def qsa_sparse_attention(
     scale: float,
     block_size: int,
     allow_sparse_decode: bool = False,
+    _plan: Optional[QSAExecutionPlan] = None,
 ) -> mx.array:
     """Attend directly to QSA-selected blocks without gathering or a dense mask."""
 
-    plan = select_qsa_execution_plan(
+    plan = _plan or select_qsa_execution_plan(
         queries,
         keys,
         values,
@@ -292,7 +287,6 @@ def qsa_sparse_attention(
         query_ends,
         block_size=block_size,
         causal=True,
-        all_sparse=True,
         allow_sparse_decode=allow_sparse_decode,
     )
     if plan is not QSAExecutionPlan.INDEXED_SPARSE_PREFILL:
@@ -350,3 +344,53 @@ def qsa_sparse_attention(
         output_shapes=[queries.shape],
         output_dtypes=[queries.dtype],
     )[0]
+
+
+def dispatch_qsa_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    block_indices: mx.array,
+    query_ends: mx.array,
+    *,
+    cache,
+    scale: float,
+    block_size: int,
+    causal: bool,
+    mask: Optional[mx.array],
+    mask_factory: Callable[[], mx.array],
+    allow_sparse_decode: bool = False,
+) -> mx.array:
+    """Dispatch one QSA invocation to indexed or masked dense attention."""
+
+    plan = select_qsa_execution_plan(
+        queries,
+        keys,
+        values,
+        block_indices,
+        query_ends,
+        block_size=block_size,
+        causal=causal,
+        allow_sparse_decode=allow_sparse_decode,
+    )
+    if plan is QSAExecutionPlan.INDEXED_SPARSE_PREFILL:
+        return qsa_sparse_attention(
+            queries,
+            keys,
+            values,
+            block_indices,
+            query_ends,
+            scale=scale,
+            block_size=block_size,
+            _plan=plan,
+        )
+    if mask is None:
+        mask = mask_factory()
+    return scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        cache=cache,
+        scale=scale,
+        mask=mask,
+    )

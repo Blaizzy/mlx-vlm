@@ -9,9 +9,12 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput, scaled_dot_product_attention
+from ..base import LanguageModelOutput
 from ..cache import ArraysCache, BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
-from ..quantized_verifier import supports_optimized_affine_head
+from ..quantized_verifier import (
+    singleton_quantized_linear,
+    supports_optimized_affine_head,
+)
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
 from ..qwen3_5.language import (
     Qwen3_5Attention,
@@ -26,11 +29,17 @@ from ..qwen3_5.language import (
 from ..qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
-from .qsa_kernel import (
-    QSAExecutionPlan,
-    qsa_sparse_attention,
-    select_qsa_execution_plan,
-)
+from .qsa_kernel import dispatch_qsa_attention
+
+
+def _row_invariant_quantized_projection(linear, x: mx.array) -> mx.array:
+    """Use decode-equivalent quantized reductions for each token row."""
+
+    if x.ndim == 3 and x.shape[1] > 1:
+        output = singleton_quantized_linear(linear, x)
+        if output is not None:
+            return output
+    return linear(x)
 
 
 def _append_indexer_positions(
@@ -762,6 +771,12 @@ class Qwen4ExpGatedDeltaNet(Qwen3_5GatedDeltaNet):
         k = k * mx.rsqrt(mx.sum(mx.square(k), axis=-1, keepdims=True) + 1e-6)
         return q * scale, k
 
+    def _project_gates(self, inputs: mx.array):
+        return (
+            _row_invariant_quantized_projection(self.in_proj_b, inputs),
+            _row_invariant_quantized_projection(self.in_proj_a, inputs),
+        )
+
 
 class Qwen4ExpQSAIndexer(nn.Module):
     """Select compressed key blocks using Qwen Sparse Attention scores."""
@@ -851,7 +866,7 @@ class Qwen4ExpQSAIndexer(nn.Module):
 
         key_len = raw_keys.shape[1]
         max_complete_blocks = key_len // self.compress_ratio
-        if max_complete_blocks <= self.block_topk:
+        if seq_len == 1 and max_complete_blocks <= self.block_topk:
             return None
 
         query = self._apply_rope(query, position_ids)
@@ -940,7 +955,11 @@ class Qwen4ExpQSAIndexer(nn.Module):
             if can_reuse_blocks and first_new_block > 0:
                 pooled_keys = mx.concatenate([cached_block_keys, pooled_keys], axis=2)
         else:
-            pooled_keys = cached_block_keys
+            pooled_keys = (
+                cached_block_keys
+                if cached_block_keys is not None
+                else mx.zeros((batch, 1, 0, self.head_dim), dtype=raw_keys.dtype)
+            )
 
         if zero_padding and cache is not None:
             cache.index_block_keys = pooled_keys
@@ -963,9 +982,20 @@ class Qwen4ExpQSAIndexer(nn.Module):
         complete_counts = visible_counts // self.compress_ratio
         valid_blocks = block_ids[None, None] < complete_counts[..., None]
         scores = mx.where(valid_blocks, scores, -mx.inf)
+        # A fixed selection width gives every causal prefill call the same
+        # indexed-attention reduction, including prefixes shorter than top-k.
+        if max_complete_blocks < self.block_topk:
+            scores = mx.pad(
+                scores,
+                [(0, 0), (0, 0), (0, self.block_topk - max_complete_blocks)],
+                constant_values=-mx.inf,
+            )
         selected_blocks = mx.argpartition(scores, kth=-self.block_topk, axis=-1)[
             ..., -self.block_topk :
-        ]
+        ].astype(mx.int32)
+        selected_blocks = mx.where(
+            selected_blocks < complete_counts[..., None], selected_blocks, -1
+        )
 
         return SimpleNamespace(
             selected_blocks=selected_blocks,
@@ -974,11 +1004,6 @@ class Qwen4ExpQSAIndexer(nn.Module):
             left_padding=left_padding,
             key_len=key_len,
             zero_padding=zero_padding,
-            all_sparse=(
-                zero_padding
-                and int(past_index_len) + 1
-                >= (self.block_topk + 1) * self.compress_ratio
-            ),
         )
 
     def build_mask(self, selection: SimpleNamespace) -> mx.array:
@@ -1062,7 +1087,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 position_ids=position_ids,
                 position_embeddings=position_embeddings,
             )
-        sparse_candidate = selection.all_sparse and standard_causal_mask
+        sparse_candidate = selection.zero_padding and standard_causal_mask
         qsa_mask = None if sparse_candidate else self.indexer.build_mask(selection)
         if qsa_mask is not None:
             if standard_causal_mask:
@@ -1085,33 +1110,19 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             position_embeddings,
             None if sparse_candidate else mask,
         )
-        plan = select_qsa_execution_plan(
+        output = dispatch_qsa_attention(
             queries,
             keys,
             values,
             selection.selected_blocks,
             selection.query_ends,
+            cache=cache,
+            scale=self.scale,
             block_size=self.indexer.compress_ratio,
             causal=standard_causal_mask,
-            all_sparse=selection.all_sparse,
+            mask=mask,
+            mask_factory=lambda: self.indexer.build_mask(selection),
         )
-        if plan is QSAExecutionPlan.INDEXED_SPARSE_PREFILL:
-            output = qsa_sparse_attention(
-                queries,
-                keys,
-                values,
-                selection.selected_blocks,
-                selection.query_ends,
-                scale=self.scale,
-                block_size=self.indexer.compress_ratio,
-            )
-        else:
-            if qsa_mask is None:
-                qsa_mask = self.indexer.build_mask(selection)
-                mask = qsa_mask
-            output = scaled_dot_product_attention(
-                queries, keys, values, cache=cache, scale=self.scale, mask=mask
-            )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output * mx.sigmoid(gate))
 
@@ -1147,8 +1158,17 @@ class Qwen4ExpGatedResidual(nn.Module):
         mixed_input = mix_streams(self.input_mix_weight_up(mix), normed)
         if "block_inject_weight" not in self:
             return mixed_input
-        injection_weights = injection_gate(self.block_inject_weight(normed))
+        injection = _row_invariant_quantized_projection(
+            self.block_inject_weight, normed
+        )
+        injection_weights = injection_gate(injection)
         return mixed_input, hyper_input, injection_weights
+
+
+class Qwen4ExpSparseMoeBlock(Qwen3_5MoeSparseMoeBlock):
+    def _shared_expert_scale(self, x: mx.array) -> mx.array:
+        gate = _row_invariant_quantized_projection(self.shared_expert_gate, x)
+        return mx.sigmoid(gate)
 
 
 _MASK64 = (1 << 64) - 1
@@ -1505,7 +1525,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             self.linear_attn = Qwen4ExpGatedDeltaNet(config)
         else:
             self.self_attn = Qwen4ExpAttention(config)
-        self.mlp = Qwen3_5MoeSparseMoeBlock(config)
+        self.mlp = Qwen4ExpSparseMoeBlock(config)
         ple_index = (
             config.ple_layer_ids.index(layer_idx + 1)
             if layer_idx + 1 in config.ple_layer_ids
@@ -1909,7 +1929,7 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
             )
 
         standard_causal = selection.zero_padding
-        sparse_candidate = selection.all_sparse and standard_causal
+        sparse_candidate = standard_causal
         qsa_mask = None if sparse_candidate else attention.indexer.build_mask(selection)
         if qsa_mask is not None:
             if standard_causal:
@@ -1934,35 +1954,20 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
             None,
             None if sparse_candidate else mask,
         )
-        plan = select_qsa_execution_plan(
+        output = dispatch_qsa_attention(
             queries,
             keys,
             values,
             selection.selected_blocks,
             selection.query_ends,
+            cache=cache,
+            scale=attention.scale,
             block_size=attention.indexer.compress_ratio,
             causal=standard_causal,
-            all_sparse=selection.all_sparse,
+            mask=mask,
+            mask_factory=lambda: attention.indexer.build_mask(selection),
             allow_sparse_decode=True,
         )
-        if plan is QSAExecutionPlan.INDEXED_SPARSE_PREFILL:
-            output = qsa_sparse_attention(
-                queries,
-                keys,
-                values,
-                selection.selected_blocks,
-                selection.query_ends,
-                scale=attention.scale,
-                block_size=attention.indexer.compress_ratio,
-                allow_sparse_decode=True,
-            )
-        else:
-            if qsa_mask is None:
-                qsa_mask = attention.indexer.build_mask(selection)
-                mask = qsa_mask
-            output = scaled_dot_product_attention(
-                queries, keys, values, cache=cache, scale=attention.scale, mask=mask
-            )
         output = output.transpose(0, 2, 1, 3).reshape(batch, length, -1)
         return self._linear(attention.o_proj, output * mx.sigmoid(gate))
 
