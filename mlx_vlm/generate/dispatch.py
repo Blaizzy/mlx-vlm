@@ -910,6 +910,8 @@ def stream_generate(
         if not apc_coordinator.enabled:
             apc_coordinator = None
             apc_manager = None
+        else:
+            apc_coordinator.prepare_prefill(len(full_input_ids_list))
 
     if apc_manager is not None:
         image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)

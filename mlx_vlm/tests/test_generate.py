@@ -2260,6 +2260,7 @@ def test_stream_generate_stores_checkpoint_only_before_decode(reused_prefix):
     coordinator.checkpoint_lengths.return_value = [2, 3]
 
     def fake_generate_step(*args, **kwargs):
+        coordinator.prepare_prefill.assert_called_once_with(4)
         assert args[0].shape[1] == 4 - reused_prefix
         for n in kwargs["prompt_cache_checkpoint_lengths"]:
             kwargs["prompt_cache_checkpoint"](n, kwargs["prompt_cache"])

@@ -17,9 +17,10 @@ overhead).
 Eviction is LRU with reference counting: blocks are kept alive while
 ``ref_cnt > 0`` and the free queue is a doubly-linked list embedded in
 ``APCBlock`` for O(1) move-to-tail. All blocks are pre-allocated as a pool
-to avoid Python object churn. When ``APC_DISK_PATH`` is configured, full
-blocks are also written to a shard-based SSD tier and can be restored after
-process restart through a direct-read prompt-cache path.
+to avoid Python object churn. Environment-configured APC also persists caches
+in a size-capped SSD tier by default. A shared byte budget bounds resident
+blocks and checkpoints; prefill admission evicts idle state to leave room for
+the incoming request. Disk writes apply byte backpressure to retained tensors.
 
 Numerical note: APC itself is *exact*. The K/V tensors stored in the block
 pool are byte-identical to what a fresh prefill would produce — the cache
@@ -69,12 +70,48 @@ logger = logging.getLogger("mlx_vlm.apc")
 
 DEFAULT_BLOCK_SIZE = 16
 DEFAULT_NUM_BLOCKS = 2048
+DEFAULT_DISK_MAX_GB = 20
 SEED_PARENT_HASH = 0
 
 
 def _env_truthy(name: str, default: str = "") -> bool:
     """Return True when env var is a common truthy string (1/true/yes)."""
     return os.environ.get(name, default).lower() in ("1", "true", "yes")
+
+
+def default_disk_path() -> Path:
+    root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return root / "mlx-vlm" / "apc"
+
+
+def _cache_nbytes(value: Any, seen: Optional[set[int]] = None) -> int:
+    """Account cache buffers without evaluating or cloning their contents."""
+    if value is None:
+        return 0
+    seen = set() if seen is None else seen
+    if id(value) in seen:
+        return 0
+    seen.add(id(value))
+    if isinstance(value, dict):
+        return sum(_cache_nbytes(v, seen) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_cache_nbytes(v, seen) for v in value)
+    try:
+        size = value.nbytes
+        if isinstance(size, int):
+            return size
+    except (AttributeError, NotImplementedError):
+        pass
+    return _cache_nbytes(getattr(value, "state", None), seen) + _cache_nbytes(
+        getattr(value, "meta_state", None), seen
+    )
+
+
+def _metal_working_set_bytes() -> Optional[int]:
+    try:
+        return int(mx.device_info()["max_recommended_working_set_size"])
+    except (AttributeError, RuntimeError, KeyError):
+        return None
 
 
 def apc_trace_enabled() -> bool:
@@ -621,6 +658,8 @@ class APCStats:
     disk_write_failures: int = 0
     exact_hits: int = 0
     exact_stores: int = 0
+    memory_evictions: int = 0
+    memory_skips: int = 0
     rejects: int = 0
     rejects_by_reason: Dict[str, int] = field(default_factory=dict)
     last_reject: Optional[Dict[str, Any]] = None
@@ -650,6 +689,8 @@ class APCStats:
             "disk_write_failures": self.disk_write_failures,
             "exact_hits": self.exact_hits,
             "exact_stores": self.exact_stores,
+            "memory_evictions": self.memory_evictions,
+            "memory_skips": self.memory_skips,
             "rejects": self.rejects,
             "rejects_by_reason": dict(self.rejects_by_reason),
             "last_reject": (
@@ -1112,6 +1153,12 @@ class DiskBlockStore:
         self.max_bytes = max_bytes
         self.evictions = 0  # cumulative shard deletions by _maybe_evict
         self._q: queue.Queue = queue.Queue(maxsize=4096)
+        self.queue_max_bytes = max(
+            0, int(float(os.environ.get("APC_DISK_QUEUE_MAX_GB", "1")) * (1 << 30))
+        )
+        self._pending_bytes = 0
+        self._pending_lock = threading.Lock()
+        self._write_lock = threading.Lock()
         self._write_success_callback: Optional[Callable[[int], None]] = None
         self._write_failure_callback: Optional[Callable[[int], None]] = None
         # Track in-flight hashes (across pending shard writes) so a lookup
@@ -1527,6 +1574,26 @@ class DiskBlockStore:
         return self._load_exact_cache_file(
             path, min_capacity_tokens=min_capacity_tokens, prefix_len=prefix_len
         )
+
+    def exact_cache_bytes(self, cache_hash: int) -> int:
+        with self._index_lock:
+            path = self._exact_index.get(cache_hash)
+        try:
+            return path.stat().st_size if path is not None else 0
+        except OSError:
+            return 0
+
+    def prefix_cache_bytes(self, block_hashes: Sequence[int]) -> int:
+        """Conservative restore size, including each source shard's capacity."""
+        with self._index_lock:
+            paths = {self._index[h][0] for h in block_hashes if h in self._index}
+        size = 0
+        for path in paths:
+            try:
+                size += path.stat().st_size
+            except OSError:
+                pass
+        return size
 
     def _load_exact_cache_file(
         self,
@@ -2427,7 +2494,9 @@ class DiskBlockStore:
         token_ids: Sequence[int],
         extra_hash: int,
         prompt_cache: Sequence[Any],
-    ) -> None:
+        *,
+        synchronous: bool = False,
+    ) -> bool:
         """Schedule an exact prompt-cache snapshot write.
 
         Exact snapshots are used for custom cache layouts that cannot be
@@ -2435,14 +2504,14 @@ class DiskBlockStore:
         """
         token_tuple = tuple(int(t) for t in token_ids)
         if not token_tuple or not prompt_cache:
-            return
+            return False
         snapshot = _DiskExactCacheSnapshot(
             cache_hash=int(cache_hash),
             token_ids=token_tuple,
             extra_hash=int(extra_hash),
             prompt_cache=list(prompt_cache),
         )
-        self._enqueue_exact_snapshot(snapshot)
+        return self._enqueue_exact_snapshot(snapshot, synchronous=synchronous)
 
     def save_layer_major_blocks(
         self,
@@ -2486,56 +2555,89 @@ class DiskBlockStore:
                 self._shard_id_for(block_hashes), block_hashes, snapshot
             )
 
-    def _enqueue_exact_snapshot(self, snapshot: _DiskExactCacheSnapshot) -> None:
+    def _enqueue_exact_snapshot(
+        self, snapshot: _DiskExactCacheSnapshot, *, synchronous: bool = False
+    ) -> bool:
         cache_hash = int(snapshot.cache_hash)
         shard_id = self._exact_id_for(cache_hash)
-        path = self._shard_path(shard_id)
-        if path.exists():
-            with self._index_lock:
-                self._exact_index.setdefault(cache_hash, path)
-            return
-
-        ev = threading.Event()
-        with self._in_flight_lock:
-            self._in_flight[cache_hash] = ev
-        try:
-            self._q.put_nowait((shard_id, [cache_hash], snapshot, ev))
-        except queue.Full:
-            with self._in_flight_lock:
-                self._in_flight.pop(cache_hash, None)
-            ev.set()
-            logger.warning("APC disk write queue full; dropping exact-cache snapshot")
+        return self._enqueue_shard(
+            shard_id, [cache_hash], snapshot, synchronous=synchronous
+        )
 
     def _enqueue_shard(
         self,
         shard_id: str,
         block_hashes: Sequence[int],
         payload: Any,
-    ) -> None:
+        *,
+        synchronous: bool = False,
+    ) -> bool:
         path = self._shard_path(shard_id)
         # Already on disk? Just dedup.
         if path.exists():
             with self._index_lock:
                 # Make sure index reflects it (e.g. after restart).
-                for idx, block_hash in enumerate(block_hashes):
-                    self._index.setdefault(int(block_hash), (path, idx))
-            return
+                if isinstance(payload, _DiskExactCacheSnapshot):
+                    self._exact_index.setdefault(int(block_hashes[0]), path)
+                else:
+                    for idx, block_hash in enumerate(block_hashes):
+                        self._index.setdefault(int(block_hash), (path, idx))
+            return True
 
         ev = threading.Event()
         with self._in_flight_lock:
+            if all(int(h) in self._in_flight for h in block_hashes):
+                return True
             for block_hash in block_hashes:
                 self._in_flight[int(block_hash)] = ev
-        try:
-            self._q.put_nowait((shard_id, list(block_hashes), payload, ev))
-        except queue.Full:
-            with self._in_flight_lock:
-                for block_hash in block_hashes:
-                    self._in_flight.pop(int(block_hash), None)
-            ev.set()
-            logger.warning(
-                "APC disk write queue full; dropping shard with %d blocks",
-                len(block_hashes),
+        size = (
+            _cache_nbytes(payload.prompt_cache)
+            if isinstance(payload, _DiskExactCacheSnapshot)
+            else _cache_nbytes(payload.layer_keys + payload.layer_values)
+        )
+        with self._pending_lock:
+            queued = (
+                not synchronous and self._pending_bytes + size <= self.queue_max_bytes
             )
+            if queued:
+                self._pending_bytes += size
+        if queued:
+            try:
+                self._q.put_nowait((shard_id, list(block_hashes), payload, ev, size))
+                return True
+            except queue.Full:
+                with self._pending_lock:
+                    self._pending_bytes -= size
+        # Backpressure: write on the producer before it can start another
+        # prefill. A large payload must not sit in an unbounded tensor queue.
+        try:
+            return self._write_payload(shard_id, block_hashes, payload)
+        finally:
+            self._finish_write(block_hashes, ev)
+
+    def _finish_write(self, block_hashes: Sequence[int], ev: threading.Event) -> None:
+        with self._in_flight_lock:
+            for block_hash in block_hashes:
+                self._in_flight.pop(int(block_hash), None)
+        try:
+            # The completed shard is now evictable too. Without this second
+            # pass, one oversized last write can leave disk usage over its cap.
+            if self.max_bytes is not None and self._disk_bytes > self.max_bytes:
+                with self._write_lock:
+                    self._maybe_evict()
+        except OSError as e:
+            logger.warning("APC disk eviction failed: %s", e)
+        finally:
+            ev.set()
+
+    @property
+    def pending_bytes(self) -> int:
+        with self._pending_lock:
+            return self._pending_bytes
+
+    def flush(self) -> None:
+        """Finish queued writes and release their tensors before admission."""
+        self._q.join()
 
     @staticmethod
     def _pad_layer_major_arrays(
@@ -2694,10 +2796,10 @@ class DiskBlockStore:
             metadata[f"{prefix}_offset"] = str(int(c.offset))
             metadata[f"{prefix}_index_offset"] = str(int(c.index_offset))
             if not c.kv_cache.empty():
-                arrays[f"{prefix}_k"] = c.kv_cache.keys
-                arrays[f"{prefix}_v"] = c.kv_cache.values
+                arrays[f"{prefix}_k"] = c.kv_cache.keys[..., : c.offset, :]
+                arrays[f"{prefix}_v"] = c.kv_cache.values[..., : c.offset, :]
             if c.index_keys is not None:
-                arrays[f"{prefix}_index_keys"] = c.index_keys
+                arrays[f"{prefix}_index_keys"] = c.index_keys[..., : c.index_offset, :]
             return True
 
         if isinstance(c, lm_cache.CacheList):
@@ -2777,10 +2879,9 @@ class DiskBlockStore:
                 empty_specs, separators=(",", ":"), sort_keys=True
             )
 
-        # ``store_exact_cache`` materializes the detached snapshot before it is
-        # queued. Do not create/evaluate MLX graphs in this worker thread: MLX
-        # streams are thread-local and recent releases reject that implicit
-        # cross-thread evaluation.
+        # Queued snapshots are detached and materialized on the producer.
+        # A borrowed live cache is serialized synchronously on that producer,
+        # so its state cannot change during the write.
         tag = f"{os.getpid()}-{threading.get_ident()}"
         tmp = path.parent / f"{path.stem}.{tag}{self.SUFFIX}"
         try:
@@ -2890,43 +2991,48 @@ class DiskBlockStore:
         finally:
             clear_mlx_streams()
 
+    def _write_payload(
+        self, shard_id: str, block_hashes: Sequence[int], payload: Any
+    ) -> bool:
+        path = self._shard_path(shard_id)
+        try:
+            # Serialize disk/index updates for background and producer writes.
+            # Callbacks run outside this lock: they may acquire the manager lock.
+            with self._write_lock:
+                if isinstance(payload, _DiskExactCacheSnapshot):
+                    self._write_exact_cache_snapshot(path, payload)
+                elif isinstance(payload, _DiskLayerMajorSnapshot):
+                    self._write_layer_major_snapshot(path, payload)
+                else:
+                    raise TypeError(f"unsupported APC disk payload: {type(payload)!r}")
+        except Exception as e:
+            logger.warning("APC disk shard save failed for %s: %s", path, e)
+            self._notify_write_callback(self._write_failure_callback, len(block_hashes))
+            return False
+        else:
+            self._notify_write_callback(self._write_success_callback, len(block_hashes))
+            return True
+
     def _writer_loop_impl(self) -> None:
         while True:
             item = self._q.get()
             if item is None:
                 self._q.task_done()
                 break
-            shard_id, block_hashes, payload, ev = item
-            path = self._shard_path(shard_id)
-            attempted_count = len(block_hashes)
+            shard_id, block_hashes, payload, ev, size = item
             try:
-                if isinstance(payload, _DiskExactCacheSnapshot):
-                    block_hashes = self._write_exact_cache_snapshot(path, payload)
-                elif isinstance(payload, _DiskLayerMajorSnapshot):
-                    block_hashes = self._write_layer_major_snapshot(path, payload)
-                else:
-                    raise TypeError(f"unsupported APC disk payload: {type(payload)!r}")
-            except Exception as e:
-                logger.warning("APC disk shard save failed for %s: %s", path, e)
-                self._notify_write_callback(
-                    self._write_failure_callback, attempted_count
-                )
-            else:
-                self._notify_write_callback(
-                    self._write_success_callback, len(block_hashes)
-                )
+                self._write_payload(shard_id, block_hashes, payload)
             finally:
-                with self._in_flight_lock:
-                    for block_hash in block_hashes:
-                        self._in_flight.pop(int(block_hash), None)
-                ev.set()
-                self._q.task_done()
                 # Layer-major segment payloads share references to the full
                 # source KV cache. Drop the last processed payload promptly
                 # instead of retaining it in this thread's frame until the
                 # next queue item arrives.
                 payload = None
                 item = None
+                with self._pending_lock:
+                    self._pending_bytes -= size
+                self._finish_write(block_hashes, ev)
+                self._q.task_done()
 
     def close(self) -> None:
         for _ in self._workers:
@@ -3010,6 +3116,30 @@ class APCManager:
         self._layer_major_memory_min_tokens = max(
             0, int(os.environ.get("APC_LAYER_MAJOR_MEMORY_MIN_TOKENS", "50000"))
         )
+        self._working_set_bytes = _metal_working_set_bytes()
+        automatic_budget = min(8 << 30, (self._working_set_bytes or (10 << 30)) // 10)
+        automatic_reserve = max(1 << 30, (self._working_set_bytes or 0) // 10)
+        self.memory_max_bytes = max(
+            0,
+            int(
+                float(os.environ.get("APC_MEMORY_MAX_GB", automatic_budget / (1 << 30)))
+                * (1 << 30)
+            ),
+        )
+        self.memory_reserve_bytes = max(
+            0,
+            int(
+                float(
+                    os.environ.get(
+                        "APC_MEMORY_RESERVE_GB", automatic_reserve / (1 << 30)
+                    )
+                )
+                * (1 << 30)
+            ),
+        )
+        self._bytes_per_token = 0.0
+        self._prefill_reserve_bytes = 0
+        self._prefill_tokens = 0
 
     def _record_disk_writes(self, count: int) -> None:
         with self.lock:
@@ -3076,11 +3206,95 @@ class APCManager:
                 self._release_one(b)
 
     def _resident_bytes_locked(self) -> int:
-        return sum(b.resident_bytes() for b in self.pool)
+        return sum(b.resident_bytes() for b in self.pool) + sum(
+            _cache_nbytes(entry.prompt_cache) for entry in self._exact_cache.values()
+        )
 
     def resident_bytes(self) -> int:
         with self.lock:
             return self._resident_bytes_locked()
+
+    def _memory_headroom(self) -> int:
+        limits = []
+        if self._working_set_bytes is not None:
+            limits.append(self._working_set_bytes - mx.get_active_memory())
+        available = _free_ram_bytes()
+        if available is not None:
+            # MLX's allocator cache can be released, unlike live model/cache state.
+            limits.append(available + mx.get_cache_memory())
+        return (
+            min(limits) if limits else self.memory_max_bytes + self.memory_reserve_bytes
+        )
+
+    def _make_room(self, allocation_bytes: int = 0, *, retain_bytes: int = 0) -> bool:
+        """Evict idle APC state before allocating; never alter leased blocks."""
+        required = self.memory_reserve_bytes + (
+            self._prefill_reserve_bytes + allocation_bytes
+            if retain_bytes
+            else max(self._prefill_reserve_bytes, allocation_bytes)
+        )
+        with self.lock:
+            resident = self._resident_bytes_locked()
+            target = max(
+                0,
+                min(
+                    self.memory_max_bytes - retain_bytes,
+                    resident + self._memory_headroom() - required,
+                ),
+            )
+            evicted = 0
+            while resident > target:
+                if self._exact_cache:
+                    resident -= _cache_nbytes(
+                        self._exact_cache[next(iter(self._exact_cache))].prompt_cache
+                    )
+                    self._exact_cache.popitem(last=False)
+                else:
+                    block = self._free_head
+                    while block is not None and block.block_hash is None:
+                        block = block.next
+                    if block is None:
+                        break
+                    self._free_remove(block)
+                    resident -= block.resident_bytes()
+                    self.hash_table.pop(block.block_hash, None)
+                    block.block_hash = None
+                    block.token_ids = ()
+                    block.release_components()
+                    self._free_push(block)
+                self.stats.evictions += 1
+                self.stats.memory_evictions += 1
+                evicted += 1
+        if evicted or self._memory_headroom() < required:
+            mx.clear_cache()
+        return (
+            resident + retain_bytes <= self.memory_max_bytes
+            and self._memory_headroom() >= required
+        )
+
+    def _observe_cache_size(self, size: int, token_count: int) -> None:
+        if token_count > 0:
+            with self.lock:
+                self._bytes_per_token = max(self._bytes_per_token, size / token_count)
+                self._prefill_reserve_bytes = int(
+                    max(0, 2 * self._prefill_tokens - token_count)
+                    * self._bytes_per_token
+                )
+
+    def prepare_prefill(self, token_count: int) -> None:
+        """Make room for the incoming request before lookup, embeddings or prefill.
+
+        Reserve two cache footprints for growth/restore temporaries in addition
+        to the device headroom. Keep this conservative reserve during snapshot
+        admission, so intermediate checkpoints cannot refill the space we freed.
+        """
+        if self.disk is not None:
+            self.disk.flush()
+        self._prefill_tokens = max(0, token_count)
+        self._prefill_reserve_bytes = int(
+            2 * self._prefill_tokens * self._bytes_per_token
+        )
+        self._make_room()
 
     # ---------- Public API ----------
     def lookup_exact_cache(
@@ -3164,6 +3378,18 @@ class APCManager:
             )
             if disk_match is not None:
                 cache_hash, disk_prefix_len = disk_match
+                # Include capacity for an extending prompt and temporary read /
+                # padding buffers, including the first restore after a restart.
+                restore_bytes = int(
+                    disk.exact_cache_bytes(cache_hash)
+                    * max(1, prompt_capacity_tokens / disk_prefix_len)
+                )
+                if not self._make_room(2 * restore_bytes):
+                    with self.lock:
+                        self.stats.memory_skips += 1
+                    disk_match = None
+            if disk_match is not None:
+                cache_hash, disk_prefix_len = disk_match
                 loaded = disk.load_exact_cache(
                     cache_hash,
                     min_capacity_tokens=prompt_capacity_tokens,
@@ -3176,6 +3402,8 @@ class APCManager:
                         and len(stored_tokens) == disk_prefix_len
                         and token_tuple[:disk_prefix_len] == stored_tokens
                     ):
+                        size = _cache_nbytes(prompt_cache)
+                        self._observe_cache_size(size, disk_prefix_len)
                         # Promote the disk-restored entry to the in-memory LRU
                         # so subsequent identical requests get the fast clone
                         # path instead of paying disk-restore latency again.
@@ -3186,7 +3414,11 @@ class APCManager:
                         # happen outside the manager lock. If clear()/reset_stats()
                         # races here, the restored tensors are still valid; only
                         # the hit counter lands in the new stats window.
-                        if self._exact_cache_max > 0:
+                        if (
+                            self._exact_cache_max > 0
+                            and size <= self.memory_max_bytes
+                            and self._make_room(size, retain_bytes=size)
+                        ):
                             storage_copy = _clone_prompt_cache_for_apc(prompt_cache)
                             if storage_copy is not None:
                                 promote_key = _sequence_hash(
@@ -3221,6 +3453,13 @@ class APCManager:
 
         if source_cache is None:
             return None, 0
+        restore_bytes = int(
+            _cache_nbytes(source_cache) * max(1, prompt_capacity_tokens / prefix_len)
+        )
+        if not self._make_room(restore_bytes):
+            with self.lock:
+                self.stats.memory_skips += 1
+            return None, 0
         prompt_cache = _clone_prompt_cache_for_apc(
             source_cache,
             min_capacity_tokens=prompt_capacity_tokens,
@@ -3246,6 +3485,32 @@ class APCManager:
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
             return False
         token_tuple = tuple(int(t) for t in token_ids)
+        size = _cache_nbytes(prompt_cache)
+        self._observe_cache_size(size, len(token_tuple))
+        if self.disk is not None:
+            self.disk.flush()
+        retain = (
+            self._exact_cache_max > 0
+            and size <= self.memory_max_bytes
+            and self._make_room(size, retain_bytes=size)
+        )
+        if not retain:
+            self._make_room()
+            with self.lock:
+                self.stats.memory_skips += 1
+            if self.disk is None:
+                return False
+            # Serialize the live state on its producer thread. It cannot be
+            # queued by reference: generation will mutate it after this call.
+            # This path avoids a second full snapshot just to spill to disk.
+            key = _sequence_hash(token_tuple, extra_hash, self.block_size)
+            stored = self.disk.save_exact_cache(
+                key, token_tuple, extra_hash, prompt_cache, synchronous=True
+            )
+            if stored:
+                with self.lock:
+                    self.stats.exact_stores += 1
+            return stored
         copied = _clone_prompt_cache_for_apc(prompt_cache)
         if copied is None:
             types = [type(c).__name__ for c in prompt_cache]
@@ -3357,6 +3622,10 @@ class APCManager:
             if matched_tokens <= min_prefix_tokens:
                 return None, 0
 
+        if not self._make_room(2 * disk.prefix_cache_bytes(block_hashes)):
+            with self.lock:
+                self.stats.memory_skips += 1
+            return None, 0
         loaded = disk.load_layer_major_prefix(block_hashes)
         if loaded is None:
             return None, 0
@@ -3375,6 +3644,7 @@ class APCManager:
                 return None, 0
 
         warm_cache = make_warm_kv_cache_from_layers(keys, values, matched_tokens)
+        self._observe_cache_size(_cache_nbytes(warm_cache), matched_tokens)
         # Disk reads and warm-cache construction intentionally happen outside
         # the manager lock. If clear()/reset_stats() races here, the restored
         # tensors are still valid; only the hit counter lands in the new stats
@@ -3432,7 +3702,36 @@ class APCManager:
 
         Returns newly acquired blocks (caller must release).
         """
+        size = _cache_nbytes(layer_keys + layer_values)
+        self._observe_cache_size(size, len(token_ids))
+        # Reserve no more than the pool can retain. Larger requests continue
+        # directly to disk once the byte budget is exhausted.
+        per_token_bytes = size / max(1, layer_keys[0].shape[2]) if layer_keys else 0
+        block_bytes = int(per_token_bytes * self.block_size)
+        compact_tokens = (
+            max(0, (len(token_ids) - self.exact_cache_guard_tokens) // self.block_size)
+            * self.block_size
+        )
+        compact_size = int(compact_tokens * per_token_bytes)
+        want_compact = (
+            self._layer_major_memory_min_tokens > 0
+            and self._exact_cache_max > 0
+            and compact_tokens >= self._layer_major_memory_min_tokens
+        )
+        admission = min(
+            self.memory_max_bytes,
+            compact_size if want_compact else min(size, self.num_blocks * block_bytes),
+        )
+        can_store_memory = self.memory_max_bytes > 0 and self._make_room(
+            admission, retain_bytes=admission
+        )
         with self.lock:
+            memory_slots = (
+                max(0, self.memory_max_bytes - self._resident_bytes_locked())
+                // max(1, block_bytes)
+                if can_store_memory
+                else 0
+            )
             n_full = len(token_ids) // self.block_size
             skip_full = skip_first_n_tokens // self.block_size
             full_prefix_tokens = n_full * self.block_size
@@ -3451,6 +3750,8 @@ class APCManager:
             if (
                 self._layer_major_memory_min_tokens > 0
                 and self._exact_cache_max > 0
+                and can_store_memory
+                and compact_size <= admission
                 and layer_major_prefix_tokens >= self._layer_major_memory_min_tokens
             ):
                 copied = _clone_layer_major_kv_cache_for_apc(
@@ -3504,6 +3805,9 @@ class APCManager:
                     new_blocks.append(acquired)
                     parent = h
                     continue
+                if memory_slots <= 0:
+                    parent = h
+                    continue
                 if (
                     self._max_pool_tensors > 0
                     and per_block_tensors > 0
@@ -3545,6 +3849,7 @@ class APCManager:
                 b.set_kv(k_slabs, v_slabs)
                 b.ref_cnt = 1
                 self.hash_table[h] = b
+                memory_slots -= 1
                 new_blocks.append(b)
                 self.stats.stores += 1
                 self.stats.served_tokens += self.block_size
@@ -3564,7 +3869,15 @@ class APCManager:
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
             snap = self.stats.snapshot(self.num_blocks, self.block_size)
             snap["resident_bytes"] = self._resident_bytes_locked()
+            snap["exact_resident_bytes"] = sum(
+                _cache_nbytes(entry.prompt_cache)
+                for entry in self._exact_cache.values()
+            )
+            snap["memory_max_bytes"] = self.memory_max_bytes
+            snap["prefill_reserve_bytes"] = self._prefill_reserve_bytes
             if self.disk is not None:
+                snap["disk_pending_bytes"] = self.disk.pending_bytes
+                snap["disk_queue_max_bytes"] = self.disk.queue_max_bytes
                 snap["disk_bytes"] = self.disk.disk_bytes
                 snap["disk_max_bytes"] = self.disk.max_bytes
                 snap["disk_evictions"] = self.disk.evictions
@@ -4101,11 +4414,14 @@ def snapshot_prompt_cache_row(
     batch_idx: int = 0,
     *,
     min_capacity_tokens: Optional[int] = None,
+    clone: bool = True,
 ) -> Optional[List[Any]]:
     """Row-normalize a prompt cache for APC store/lookup.
 
     Batch-shaped layouts (every entry has ``extract``) are extracted first.
-    Single-row caches are cloned in place. Quantized layers with an explicit
+    Single-row caches are cloned by default. Stores can borrow the normalized
+    row with ``clone=False`` and decide whether to clone or write it synchronously.
+    Quantized layers with an explicit
     checkpoint contract retain their native packed representation.
     """
     if not caches:
@@ -4116,6 +4432,8 @@ def snapshot_prompt_cache_row(
         if row is None:
             return None
         source = row
+    if not clone:
+        return list(source)
     return _clone_prompt_cache_for_apc(source, min_capacity_tokens=min_capacity_tokens)
 
 
@@ -4590,13 +4908,15 @@ def from_env(
     if overrides is not None and overrides.get("disk_path") is not None:
         disk_path = overrides["disk_path"]
     else:
-        disk_path = os.environ.get("APC_DISK_PATH")
+        disk_path = os.environ.get("APC_DISK_PATH", str(default_disk_path()))
+    if not _env_truthy("APC_DISK_ENABLED", "1"):
+        disk_path = None
     if disk_path:
         ns = model_namespace or os.environ.get("APC_DISK_NAMESPACE", "default")
         if overrides is not None and overrides.get("disk_max_gb") is not None:
             max_gb = float(overrides["disk_max_gb"])
         else:
-            max_gb = float(os.environ.get("APC_DISK_MAX_GB", 0))
+            max_gb = float(os.environ.get("APC_DISK_MAX_GB", DEFAULT_DISK_MAX_GB))
         max_bytes = int(max_gb * (1 << 30)) if max_gb > 0 else None
         workers = int(os.environ.get("APC_DISK_WORKERS", "1"))
         try:

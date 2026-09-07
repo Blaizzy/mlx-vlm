@@ -683,6 +683,7 @@ def stream_diffusion_generate(
         candidate = APCCoordinator(apc_manager, model)
         if candidate.enabled and candidate.is_checkpoint:
             apc = candidate
+            apc.prepare_prefill(len(full_token_ids))
             media_token_ids = multimodal_token_ids_from_config(model.config)
             safe_lookup_min = max(
                 0,

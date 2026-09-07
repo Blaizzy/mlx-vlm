@@ -5533,7 +5533,7 @@ class TestResponseGenerator:
         gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
         gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
         gen.top_logprobs_k = 0
-        apc_manager = object()
+        apc_manager = SimpleNamespace(prepare_prefill=MagicMock())
         gen.apc_manager = apc_manager
         gen.prefill_step_size = 3072
         gen.tokenizer = SimpleNamespace()
@@ -5595,6 +5595,8 @@ class TestResponseGenerator:
         assert kwargs["compute_logprobs"] is False
         assert kwargs["prefill_step_size"] == 3072
         assert kwargs["apc_manager"] is apc_manager
+        assert apc_manager.prepare_prefill.call_count == 2
+        apc_manager.prepare_prefill.assert_called_with(1)
         assert batch_state["instance"].next_active_sizes == [2]
 
     @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])

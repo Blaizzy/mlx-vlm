@@ -2006,17 +2006,18 @@ class PromptProcessingBatch:
                 continue
             if self._row_real_tokens_processed(batch_idx) != checkpoint_len:
                 continue
-            prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
-            if prompt_cache is None:
-                continue
             coordinator = getattr(self, "_apc_coordinator", None)
             if coordinator is not None:
                 stored = coordinator.store_checkpoint(
                     meta["full_input_ids"][:checkpoint_len],
-                    prompt_cache,
+                    self.prompt_cache,
+                    batch_idx=batch_idx,
                     extra_hash=meta.get("extra_hash", 0),
                 )
             else:
+                prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
+                if prompt_cache is None:
+                    continue
                 stored = self._apc_manager.store_exact_cache(
                     meta["full_input_ids"][:checkpoint_len],
                     prompt_cache,
@@ -2991,6 +2992,9 @@ class BatchGenerator:
             # warm and cold rows prefill in a single forward pass.
             n = min(self.prefill_batch_size, len(self._unprocessed_sequences))
             sequences = self._unprocessed_sequences[:n]
+            coordinator = getattr(self, "apc", None)
+            if coordinator is not None:
+                coordinator.prepare_prefill(sum(len(s[1]) for s in sequences))
             if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
                 logger.warning(
                     "APC admit n=%d (pending=%d)",

@@ -875,7 +875,9 @@ APC_NUM_BLOCKS=4096 \
 mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --kv-bits 8 --port 8080
 ```
 
-Enable the persistent disk tier:
+APC persists caches to disk by default when enabled, under
+`$XDG_CACHE_HOME/mlx-vlm/apc` (or `~/.cache/mlx-vlm/apc`), with a 20 GiB cap per
+model namespace. Customize the location and cap:
 
 ```sh
 APC_ENABLED=1 \
@@ -921,8 +923,12 @@ Common APC environment variables:
 | `APC_CHECKPOINT_ENTRIES` | `2` | In-memory checkpoint entries; also bounds snapshots captured per hybrid prompt (disk-only mode captures two) |
 | `APC_CHECKPOINT_GUARD_TOKENS` | `1` | Tokens retained after a reusable hybrid checkpoint boundary; the default preserves the normal final-token prefill boundary |
 | `APC_CHECKPOINT_INTERVAL_TOKENS` | `2048` | Spacing of intermediate hybrid checkpoints, rounded up to a multiple of `APC_BLOCK_SIZE`; `0` keeps only the final checkpoint |
-| `APC_DISK_PATH` | unset | Directory for persistent disk shards |
-| `APC_DISK_MAX_GB` | `0` | Disk cap in GB; `0` means uncapped |
+| `APC_MEMORY_MAX_GB` | auto | Resident block and checkpoint budget in GiB: 10% of Metal's recommended working set, capped at 8 GiB; `0` retains caches only on disk |
+| `APC_MEMORY_RESERVE_GB` | auto | Additional memory headroom in GiB: 10% of Metal's recommended working set, at least 1 GiB |
+| `APC_DISK_ENABLED` | `1` | Set to `0` to disable disk persistence |
+| `APC_DISK_PATH` | cache directory above | Directory for persistent disk shards; an empty value disables persistence |
+| `APC_DISK_MAX_GB` | `20` | Disk cap per model namespace in GiB; `0` means uncapped |
+| `APC_DISK_QUEUE_MAX_GB` | `1` | Maximum tensor bytes held by queued disk writes in GiB; larger writes run synchronously; `0` makes all writes synchronous |
 | `APC_DISK_SHARD_MAX_BLOCKS` | `256` | Max blocks per disk segment shard |
 | `APC_MAX_POOL_TENSORS` | `450000` | Stops adding memory blocks before the Metal resource limit; disk writes continue |
 | `APC_LAYER_MAJOR_MEMORY_MIN_TOKENS` | `50000` | Store long warm-memory prefixes as compact layer-major snapshots instead of per-block tensors |
@@ -954,6 +960,21 @@ divergence before the earliest retained checkpoint, and evicted checkpoints can
 miss. Media checkpoints include all media tokens so the remaining suffix is text.
 Changing checkpoint boundaries can change floating-point execution shapes, as
 with other chunked or cached prefill paths.
+
+The resident byte budget includes exact snapshots as well as pageable blocks.
+Before embeddings and prefill, APC drains pending disk writes and evicts idle
+checkpoints and blocks in LRU order within each tier. Admission uses current
+Metal allocations, available system RAM, and the incoming prompt's estimated
+cache growth, based on observed bytes per token. Leased blocks remain valid for
+active requests. Snapshots that exceed the budget are written directly to disk
+without making another resident copy, and disk restores stay out of the memory
+LRU when promotion would exceed the budget. Disk pressure may therefore trade
+latency for lower memory use.
+
+These controls limit APC's memory overhead; model weights and an individual
+request must still fit in memory. Tune the reserve for models with larger
+prefill or vision temporaries. `/v1/cache/stats` reports resident bytes,
+the memory budget, prefill reserve, memory evictions, and pending disk bytes.
 
 #### KV Cache Quantization
 

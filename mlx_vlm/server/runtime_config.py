@@ -79,7 +79,7 @@ KNOBS: Tuple[
         None,
         TEXT_KINDS,
         None,
-        "APC disk tier directory.",
+        "APC disk tier directory; None uses the default mlx-vlm cache directory.",
     ),
     ("apc_block_size", "int", 16, TEXT_KINDS, None, "APC block size (tokens)."),
     ("apc_num_blocks", "int", 2048, TEXT_KINDS, None, "APC block pool capacity."),
@@ -89,7 +89,7 @@ KNOBS: Tuple[
         None,
         TEXT_KINDS,
         None,
-        "APC disk tier cap (GB).",
+        "APC disk tier cap (GiB); None defaults to 20, 0 is uncapped.",
     ),
     (
         "max_kv_size",
