@@ -1782,6 +1782,7 @@ class PromptProcessingBatch:
         self._left_padding_per_row = list(left_padding)
         self._total_prompt_tokens = sum(lengths)
         self._processed_prompt_columns = 0
+        self._finished_prompt_logits: dict[int, mx.array] = {}
 
         self.logits_processors = logits_processors or []
         self.thinking_budget_criteria = thinking_budget_criteria or []
@@ -2046,20 +2047,39 @@ class PromptProcessingBatch:
 
         step = self.prefill_step_size or self._inputs_embeds.shape[1]
         n = min(step, self._inputs_embeds.shape[1] - 1)
+        # Finish shorter right-padded rows at a chunk boundary so we can keep
+        # their last real token's logits before subsequent chunks consume pad.
+        # Some models only return the final column's logits during prefill.
+        finished_rows = []
+        if self._right_pad_per_row is not None:
+            start = self._processed_prompt_columns
+            pending_ends = [length for length in self._suffix_lens if length > start]
+            if pending_ends:
+                n = min(n, min(pending_ends) - start)
         checkpoint_col = self._next_apc_checkpoint_column()
         if checkpoint_col is not None:
             n = min(n, checkpoint_col - self._processed_prompt_columns)
         if n <= 0:
             return 0
         prompt_kwargs = self._prompt_kwargs_for_step(n)
-        self.model(
+        output = self.model(
             self._input_ids[:, :n],
             cache=self.prompt_cache,
             inputs_embeds=self._inputs_embeds[:, :n],
             n_to_process=n,
             **prompt_kwargs,
         )
-        mx.async_eval([c.state for c in self.prompt_cache])
+        if self._right_pad_per_row is not None:
+            end = self._processed_prompt_columns + n
+            finished_rows = [
+                i for i, length in enumerate(self._suffix_lens) if length == end
+            ]
+            logits = output.logits if hasattr(output, "logits") else output
+            for i in finished_rows:
+                self._finished_prompt_logits[i] = mx.contiguous(mx.array(logits[i, -1]))
+        eval_targets = [c.state for c in self.prompt_cache]
+        eval_targets.extend(self._finished_prompt_logits[i] for i in finished_rows)
+        mx.async_eval(eval_targets)
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
         self._inputs_embeds = self._inputs_embeds[:, n:]
@@ -2110,13 +2130,19 @@ class PromptProcessingBatch:
         )
         logits = output.logits if hasattr(output, "logits") else output
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
-            # Per-row last *real* token sits at index (seq - 1 - right_pad[i]).
-            seq = logits.shape[1]
-            last_idx = mx.array(
-                [seq - 1 - p for p in self._right_pad_per_row], dtype=mx.int32
-            )[:, None, None]
-            last_idx = mx.broadcast_to(last_idx, (logits.shape[0], 1, logits.shape[-1]))
-            logits = mx.take_along_axis(logits, last_idx, axis=1).squeeze(1)
+            # Short rows may have finished in an earlier prefill chunk. Their
+            # real-token logits no longer occur in this final padded chunk.
+            logits = mx.stack(
+                [
+                    (
+                        self._finished_prompt_logits[i]
+                        if i in self._finished_prompt_logits
+                        else logits[i, logits.shape[1] - 1 - padding]
+                    )
+                    for i, padding in enumerate(self._right_pad_per_row)
+                ]
+            )
+            self._finished_prompt_logits.clear()
         else:
             logits = logits[:, -1, :]
         if self.logits_processors and any(self.logits_processors):

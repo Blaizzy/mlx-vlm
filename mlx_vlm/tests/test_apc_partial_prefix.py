@@ -231,6 +231,97 @@ def _embeddings(lm, tokens):
     return lm.model.embed_tokens(tokens) * getattr(lm.model, "embed_scale", 1)
 
 
+@pytest.mark.parametrize("prefill_step_size", [None, 4, 16, 32])
+def test_lfm_mixed_prefill_keeps_logits_before_right_padding(
+    manager_factory, prefill_step_size
+):
+    from mlx_vlm.apc import make_warm_batch_exact_cache_multi
+    from mlx_vlm.generate.ar import PromptProcessingBatch
+    from mlx_vlm.models.lfm2 import Model, ModelConfig
+
+    mx.random.seed(19)
+    lm = Model(
+        ModelConfig(
+            model_type="lfm2",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            norm_eps=1e-5,
+            conv_bias=False,
+            conv_L_cache=3,
+            block_dim=64,
+            block_ff_dim=128,
+            block_multiple_of=16,
+            block_ffn_dim_multiplier=1.0,
+            block_auto_adjust_ff_dim=True,
+            layer_types=["conv", "full_attention"],
+        )
+    ).language_model
+    manager = manager_factory()
+    manager._exact_cache_max = 8
+    manager.checkpoint_interval_tokens = 16
+    coordinator = manager.coordinator(lm)
+    warm_tokens = [i % 50 + 1 for i in range(71)]
+    cold_tokens = [i % 30 + 51 for i in range(25)]
+    seed_cache = lm.make_cache()
+    lm(mx.array([warm_tokens[:64]]), cache=seed_cache)
+    assert manager.store_exact_cache(warm_tokens[:64], seed_cache)
+    restored, count = manager.lookup_exact_cache(warm_tokens)
+    assert count == 64
+    caches, _ = make_warm_batch_exact_cache_multi([restored, lm.make_cache()], [64, 0])
+    suffixes = [warm_tokens[64:], cold_tokens]
+    padded = mx.array([suffixes[0] + [0] * 18, suffixes[1]])
+    batch = PromptProcessingBatch(
+        model=lm,
+        uids=[0, 1],
+        input_ids=suffixes,
+        max_tokens=[1, 1],
+        inputs_embeds=_embeddings(lm, padded),
+        prompt_kwargs={},
+        warm_cache=caches,
+        prefill_step_size=prefill_step_size,
+        right_pad_per_row=[18, 0],
+        suffix_lens=[7, 25],
+        apc_manager=manager,
+        apc_coordinator=coordinator,
+        apc_meta=[
+            {
+                "full_input_ids": tokens,
+                "prefix_len": prefix,
+                "checkpoint_lengths": coordinator.checkpoint_lengths(tokens, set()),
+            }
+            for tokens, prefix in [(warm_tokens, 64), (cold_tokens, 0)]
+        ],
+    )
+    while batch.needs_processing():
+        assert batch.prompt_step() > 0
+    sampled = []
+
+    def sample(logprobs):
+        sampled.append(logprobs)
+        return mx.argmax(logprobs, axis=-1)
+
+    batch.generate(sample, [lambda _: False, lambda _: False])
+    for row, tokens in enumerate([warm_tokens, cold_tokens]):
+        reference = lm.make_cache()
+        for start in range(0, len(tokens) - 1, 4):
+            lm(
+                mx.array([tokens[start : min(start + 4, len(tokens) - 1)]]),
+                cache=reference,
+            )
+        logits = lm(mx.array([tokens[-1:]]), cache=reference).logits[0, -1]
+        logprobs = logits - mx.logsumexp(logits)
+        assert mx.allclose(sampled[0][row], logprobs, atol=1e-4, rtol=1e-4).item()
+        assert mx.argmax(sampled[0][row]).item() == mx.argmax(logits).item()
+        # Right-padding must preserve LFM's final real convolution state too.
+        assert mx.allclose(
+            caches[0][0][row : row + 1], reference[0][0], atol=1e-4, rtol=1e-4
+        ).item()
+
+
 @pytest.mark.parametrize("tier", ["memory", "disk"])
 def test_diffusion_prefills_only_divergent_suffix(manager_factory, tier):
     from mlx_vlm.generate import stream_generate
