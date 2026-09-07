@@ -159,7 +159,10 @@ def _advance_pooling_cache(cache, values):
 
 @pytest.mark.parametrize("initial_length", range(4))
 @pytest.mark.parametrize("keep", range(5))
-def test_pooling_cache_speculative_commit_matches_prefix_replay(initial_length, keep):
+@pytest.mark.parametrize("incremental", [False, True])
+def test_pooling_cache_speculative_commit_matches_prefix_replay(
+    initial_length, keep, incremental
+):
     actual = PoolingCache(ratio=4)
     reference = PoolingCache(ratio=4)
     initial = mx.arange(initial_length, dtype=mx.float32).reshape(1, -1, 1)
@@ -169,7 +172,11 @@ def test_pooling_cache_speculative_commit_matches_prefix_replay(initial_length, 
         _advance_pooling_cache(reference, initial)
 
     generation = actual.start_speculation(block.shape[1])
-    _advance_pooling_cache(actual, block)
+    if incremental:
+        for index in range(block.shape[1]):
+            _advance_pooling_cache(actual, block[:, index : index + 1])
+    else:
+        _advance_pooling_cache(actual, block)
     if keep:
         _advance_pooling_cache(reference, block[:, :keep])
     actual.commit_speculation(keep, generation)
@@ -192,7 +199,8 @@ def test_pooling_cache_speculative_commit_matches_prefix_replay(initial_length, 
         assert mx.array_equal(actual.pooled, reference.pooled).item()
 
 
-def test_batch_pooling_cache_speculative_commit_matches_ragged_prefixes():
+@pytest.mark.parametrize("incremental", [False, True])
+def test_batch_pooling_cache_speculative_commit_matches_ragged_prefixes(incremental):
     batch, ratio = 4, 4
     padding = [3, 2, 1, 0]
     actual = BatchPoolingCache(ratio=ratio, left_padding=padding)
@@ -209,7 +217,11 @@ def test_batch_pooling_cache_speculative_commit_matches_ragged_prefixes():
             )
 
     generation = actual.start_speculation(block.shape[1])
-    _advance_pooling_cache(actual, block)
+    if incremental:
+        for index in range(block.shape[1]):
+            _advance_pooling_cache(actual, block[:, index : index + 1])
+    else:
+        _advance_pooling_cache(actual, block)
     actual.commit_speculation(keep, generation)
     for row, length in enumerate(keep):
         _advance_pooling_cache(references[row], block[row : row + 1, :length])

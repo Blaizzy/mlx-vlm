@@ -374,6 +374,43 @@ def test_arrays_cache_transaction_handles_boundaries_abort_and_stale_commit():
     assert not hasattr(cache, "_qwen3_5_lengths_info")
 
 
+def test_cache_transaction_rolls_back_only_caches_advanced_by_verifier():
+    updated = BatchKVCache([0, 0])
+    untouched = BatchKVCache([0, 0])
+    initial = mx.zeros((2, 1, 2, 1))
+    for cache in (updated, untouched):
+        cache.update_and_fetch(initial, initial)
+
+    transaction = speculative_cache_state.start_speculative_cache(
+        [updated, untouched], 2
+    )
+    appended = mx.ones((2, 1, 2, 1))
+    updated.update_and_fetch(appended, appended)
+    speculative_cache_state.rollback_speculative_cache(
+        [updated, untouched], transaction, [1, 0], block_size=2
+    )
+    mx.eval(updated.offset, untouched.offset)
+
+    assert updated.offset.tolist() == [4, 3]
+    assert updated.left_padding.tolist() == [0, 1]
+    assert untouched.offset.tolist() == [2, 2]
+    assert untouched.left_padding.tolist() == [0, 0]
+
+
+def test_cache_transaction_abort_rewinds_append_only_cache():
+    cache = KVCache()
+    initial = mx.zeros((1, 1, 2, 1))
+    cache.update_and_fetch(initial, initial)
+    transaction = speculative_cache_state.start_speculative_cache([cache], 3)
+    appended = mx.ones((1, 1, 3, 1))
+    cache.update_and_fetch(appended, appended)
+
+    transaction.abort()
+
+    assert cache.offset == 2
+    assert not transaction.active
+
+
 def test_qwen_gdn_cache_captures_intermediate_states_for_batched_verify():
     config = SimpleNamespace(
         hidden_size=16,
@@ -3892,6 +3929,7 @@ def test_deepseek_v4_returns_mtp_hidden_and_trims_without_snapshot():
 
 @pytest.mark.parametrize("accepted", range(3))
 def test_deepseek_v4_pooling_rollback_commits_without_model_replay(accepted):
+    mx.random.seed(3893 + accepted)
     cfg = _tiny_deepseek_v4_config()
     cfg.compress_ratios = [4]
     language = deepseek_language.LanguageModel(cfg)
@@ -3900,8 +3938,12 @@ def test_deepseek_v4_pooling_rollback_commits_without_model_replay(accepted):
     verify = mx.array([[4, 5, 6]], dtype=mx.int32)
 
     speculative_cache = language.make_cache()
-    language(prompt, cache=speculative_cache)
-    _, _, transaction = language.speculative_verify_hidden(verify, speculative_cache)
+    prompt_output = language(prompt, cache=speculative_cache)
+    mx.eval(prompt_output.logits)
+    hidden, _, transaction = language.speculative_verify_hidden(
+        verify, speculative_cache
+    )
+    mx.eval(hidden)
     assert transaction.active
     with patch.object(
         deepseek_language.LanguageModel,
@@ -3916,8 +3958,10 @@ def test_deepseek_v4_pooling_rollback_commits_without_model_replay(accepted):
         )
 
     reference_cache = language.make_cache()
-    language(prompt, cache=reference_cache)
-    language(verify[:, : accepted + 1], cache=reference_cache)
+    reference_prompt = language(prompt, cache=reference_cache)
+    mx.eval(reference_prompt.logits)
+    reference_verify = language(verify[:, : accepted + 1], cache=reference_cache)
+    mx.eval(reference_verify.logits)
     probe = mx.array([[7]], dtype=mx.int32)
     speculative_logits = language(probe, cache=speculative_cache).logits
     reference_logits = language(probe, cache=reference_cache).logits
@@ -3928,48 +3972,6 @@ def test_deepseek_v4_pooling_rollback_commits_without_model_replay(accepted):
     assert speculative_pool.remainder == reference_pool.remainder
     assert speculative_pool.offset == reference_pool.offset
     assert mx.allclose(speculative_logits, reference_logits, rtol=0, atol=1e-5).item()
-
-
-def test_pooling_snapshot_skips_clone_when_verify_does_not_overwrite_remainder():
-    pool = PoolingCache(4)
-    old_kv = mx.array([[[10.0]]])
-    old_gate = mx.array([[[1.0]]])
-    pool.accumulate_windows(old_kv, old_gate, offset=0)
-
-    snapshot = speculative_cache_state.snapshot_cache_state([pool], incoming_tokens=3)
-    assert snapshot[0][2] is None
-
-    new_kv = mx.array([[[20.0], [21.0], [22.0]]])
-    new_gate = mx.ones_like(new_kv)
-    pooled, _, _ = pool.accumulate_windows(new_kv, new_gate, offset=1)
-    pool.update_and_fetch(pooled)
-
-    speculative_cache_state.restore_cache_state([pool], snapshot)
-
-    assert pool.remainder == 1
-    assert pool.pooled is None
-    assert pool.buf_kv[:, :1].reshape(-1).tolist() == [10.0]
-
-
-def test_pooling_snapshot_restores_only_overwritten_prefix():
-    pool = PoolingCache(4)
-    old_kv = mx.array([[[10.0], [11.0], [12.0]]])
-    old_gate = mx.ones_like(old_kv)
-    pool.accumulate_windows(old_kv, old_gate, offset=0)
-
-    snapshot = speculative_cache_state.snapshot_cache_state([pool], incoming_tokens=3)
-    assert snapshot[0][2].shape == (1, 2, 1)
-
-    new_kv = mx.array([[[20.0], [21.0], [22.0]]])
-    new_gate = mx.ones_like(new_kv)
-    pooled, _, _ = pool.accumulate_windows(new_kv, new_gate, offset=3)
-    pool.update_and_fetch(pooled)
-
-    speculative_cache_state.restore_cache_state([pool], snapshot)
-
-    assert pool.remainder == 3
-    assert pool.pooled is None
-    assert pool.buf_kv[:, :3].reshape(-1).tolist() == [10.0, 11.0, 12.0]
 
 
 def test_deepseek_v4_language_ignores_generation_metadata_kwargs():
@@ -4511,20 +4513,24 @@ def test_glm5_next_mtp_batch_acceptance_keeps_ragged_rows_aligned():
 
 
 def test_glm5_next_target_rollback_restores_ragged_rows_without_model_replay():
+    mx.random.seed(4513)
     text_config = _tiny_glm5_next_text_config()
     language = glm5_next_language.LanguageModel(text_config)
     language.eval()
     cache = _make_cache(language, left_padding=[0, 0])
 
-    language(mx.array([[1, 2], [3, 4]], dtype=mx.int32), cache=cache)
-    _, _, rollback_state = language.speculative_verify_hidden(
+    prompt_output = language(mx.array([[1, 2], [3, 4]], dtype=mx.int32), cache=cache)
+    mx.eval(prompt_output.logits)
+    hidden, _, rollback_state = language.speculative_verify_hidden(
         mx.array([[5, 6], [7, 8]], dtype=mx.int32), cache
     )
-    transaction = rollback_state[2]
-    assert transaction.active
+    mx.eval(hidden)
+    assert rollback_state.active
     records = cache[0]._speculation["records"]
     assert records[0][0] == "window"
     assert records[3][1].shape[1] == 1
+    assert cache[1][2]._speculation["input_length"] == 2
+    assert len(cache[1][2]._speculation["inputs"]) == 2
     with patch.object(
         glm5_next_language.LanguageModel,
         "__call__",
@@ -4540,6 +4546,9 @@ def test_glm5_next_target_rollback_restores_ragged_rows_without_model_replay():
     assert sparse_cache[0].left_padding.tolist() == [0, 1]
     assert sparse_cache[2]._pool_lengths == [2, 1]
     assert sparse_cache[2].remainder == [0, 1]
+    assert sparse_cache[3].offset.tolist() == [2, 2]
+    assert sparse_cache[3].left_padding.tolist() == [0, 0]
+    assert not rollback_state.active
 
 
 @pytest.mark.parametrize("batch", [1, 8])

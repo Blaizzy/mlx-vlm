@@ -2440,6 +2440,35 @@ def _speculative_lengths(lengths, batch_size: int, total: int) -> List[int]:
     return values
 
 
+def _record_pooling_speculative_inputs(transaction, kv, gate) -> None:
+    """Retain verifier inputs without joining tokenwise updates eagerly."""
+    if transaction is None or not transaction["needs_history"]:
+        return
+    next_length = transaction["input_length"] + kv.shape[1]
+    if next_length > transaction["length"]:
+        raise ValueError(
+            f"Speculative pooling inputs exceed length {transaction['length']}."
+        )
+    transaction["inputs"].append((kv, gate))
+    transaction["input_length"] = next_length
+
+
+def _pooling_speculative_inputs(transaction):
+    inputs = transaction["inputs"]
+    if len(inputs) == 1:
+        return inputs[0]
+    return tuple(
+        mx.concatenate([segment[index] for segment in inputs], axis=1)
+        for index in range(2)
+    )
+
+
+def _pooling_speculative_nbytes(transaction, arrays) -> None:
+    for kv, gate in transaction["inputs"]:
+        arrays[id(kv)] = kv
+        arrays[id(gate)] = gate
+
+
 class PoolingCache(_BaseCache):
     """Cache for pooled (compressed) KV tokens with a remainder buffer.
 
@@ -2493,24 +2522,13 @@ class PoolingCache(_BaseCache):
             "pooled": self.pooled,
             "pooled_length": self.offset,
             "needs_history": needs_history,
-            "inputs": None,
+            "inputs": [],
+            "input_length": 0,
         }
         return self._speculation_generation
 
     def _record_speculative_inputs(self, kv, gate):
-        transaction = self._speculation
-        if transaction is None or not transaction["needs_history"]:
-            return
-        if transaction["inputs"] is not None:
-            raise RuntimeError(
-                "Pooling cache was updated twice during one transaction."
-            )
-        if kv.shape[1] != transaction["length"]:
-            raise ValueError(
-                f"Speculative pooling input has length {kv.shape[1]}, "
-                f"expected {transaction['length']}."
-            )
-        transaction["inputs"] = (kv, gate)
+        _record_pooling_speculative_inputs(self._speculation, kv, gate)
 
     def validate_speculation(self, lengths, generation: Optional[int] = None):
         transaction = self._speculation
@@ -2521,8 +2539,14 @@ class PoolingCache(_BaseCache):
         lengths = _speculative_lengths(lengths, self.batch_size, transaction["length"])
         if len(set(lengths)) != 1:
             raise ValueError("PoolingCache requires uniform batch commit lengths.")
-        if transaction["needs_history"] and transaction["inputs"] is None:
-            raise RuntimeError("Speculative pooling inputs were not recorded.")
+        if (
+            transaction["needs_history"]
+            and transaction["input_length"] != transaction["length"]
+        ):
+            raise RuntimeError(
+                "Speculative pooling inputs cover "
+                f"{transaction['input_length']} of {transaction['length']} tokens."
+            )
         return transaction, lengths
 
     def commit_speculation(self, lengths, generation: Optional[int] = None) -> None:
@@ -2530,7 +2554,7 @@ class PoolingCache(_BaseCache):
         keep = lengths[0]
         initial_remainder = transaction["remainder"]
         if transaction["needs_history"]:
-            kv, gate = transaction["inputs"]
+            kv, gate = _pooling_speculative_inputs(transaction)
             remainders = [initial_remainder] * self.batch_size
             starts = [0] * self.batch_size
             valid_lengths = [keep] * self.batch_size
@@ -2726,9 +2750,7 @@ class PoolingCache(_BaseCache):
                 value = self._speculation[key]
                 if isinstance(value, mx.array):
                     arrays[id(value)] = value
-            if self._speculation["inputs"] is not None:
-                for value in self._speculation["inputs"]:
-                    arrays[id(value)] = value
+            _pooling_speculative_nbytes(self._speculation, arrays)
         return sum(value.nbytes for value in arrays.values())
 
     @classmethod
@@ -2820,24 +2842,13 @@ class BatchPoolingCache(_BaseCache):
             ),
             "pooled": self.pooled,
             "needs_history": needs_history,
-            "inputs": None,
+            "inputs": [],
+            "input_length": 0,
         }
         return self._speculation_generation
 
     def _record_speculative_inputs(self, kv, gate):
-        transaction = self._speculation
-        if transaction is None or not transaction["needs_history"]:
-            return
-        if transaction["inputs"] is not None:
-            raise RuntimeError(
-                "Pooling cache was updated twice during one transaction."
-            )
-        if kv.shape[1] != transaction["length"]:
-            raise ValueError(
-                f"Speculative pooling input has length {kv.shape[1]}, "
-                f"expected {transaction['length']}."
-            )
-        transaction["inputs"] = (kv, gate)
+        _record_pooling_speculative_inputs(self._speculation, kv, gate)
 
     def validate_speculation(self, lengths, generation: Optional[int] = None):
         transaction = self._speculation
@@ -2846,8 +2857,14 @@ class BatchPoolingCache(_BaseCache):
         if generation is not None and generation != transaction["generation"]:
             raise RuntimeError("Attempted to commit a stale cache transaction.")
         lengths = _speculative_lengths(lengths, self.batch_size, transaction["length"])
-        if transaction["needs_history"] and transaction["inputs"] is None:
-            raise RuntimeError("Speculative pooling inputs were not recorded.")
+        if (
+            transaction["needs_history"]
+            and transaction["input_length"] != transaction["length"]
+        ):
+            raise RuntimeError(
+                "Speculative pooling inputs cover "
+                f"{transaction['input_length']} of {transaction['length']} tokens."
+            )
         return transaction, lengths
 
     def commit_speculation(self, lengths, generation: Optional[int] = None) -> None:
@@ -2860,7 +2877,7 @@ class BatchPoolingCache(_BaseCache):
         starts, valid = self._speculative_valid_lengths(lengths)
 
         if transaction["needs_history"]:
-            kv, gate = transaction["inputs"]
+            kv, gate = _pooling_speculative_inputs(transaction)
             self.buf_kv = _select_pooling_remainder(
                 transaction["buf_kv"],
                 kv,
@@ -3180,9 +3197,7 @@ class BatchPoolingCache(_BaseCache):
                 value = self._speculation[key]
                 if isinstance(value, mx.array):
                     arrays[id(value)] = value
-            if self._speculation["inputs"] is not None:
-                for value in self._speculation["inputs"]:
-                    arrays[id(value)] = value
+            _pooling_speculative_nbytes(self._speculation, arrays)
         return sum(value.nbytes for value in arrays.values())
 
     def filter(self, batch_indices):

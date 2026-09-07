@@ -3,12 +3,10 @@ from typing import Any, Callable, List, Optional
 import mlx.core as mx
 
 from ...speculative.cache_state import (
-    restore_cache_state,
-    snapshot_cache_state,
+    rollback_speculative_cache,
     start_speculative_cache,
 )
 from ..base import LanguageModelOutput, create_ssm_mask, scaled_dot_product_attention
-from ..cache import ArraysCache
 from ..deepseek_v4.hyper_connection import _hc_kernel, hc_expand
 from ..exact_speculative_verify import exact_speculative_verify_weight
 from ..quantized_verifier import (
@@ -221,31 +219,6 @@ class Glm5NextSpeculativeVerifier:
         mx.async_eval(result)
         return result
 
-    @staticmethod
-    def _merge_sparse_updates(updates):
-        merged = {
-            "new_latent": mx.concatenate(
-                [update["new_latent"] for update in updates],
-                axis=2,
-            )
-        }
-        if "indexer" not in updates[0]:
-            return merged
-        merged.update(
-            indexer=updates[0]["indexer"],
-            index_keys=mx.concatenate(
-                [update["index_keys"] for update in updates], axis=1
-            ),
-            index_gates=mx.concatenate(
-                [update["index_gates"] for update in updates], axis=1
-            ),
-            query_valid=mx.concatenate(
-                [update["query_valid"] for update in updates], axis=1
-            ),
-            cache_offset=updates[0]["cache_offset"],
-        )
-        return merged
-
     def _sparse_attention(
         self,
         attention,
@@ -317,9 +290,7 @@ class Glm5NextSpeculativeVerifier:
             )
         outputs = []
         topks = []
-        updates = []
         for index in range(inputs.shape[1]):
-            step_updates = []
             output, topk = self._attention(
                 attention,
                 mx.contiguous(inputs[:, index : index + 1]),
@@ -330,7 +301,6 @@ class Glm5NextSpeculativeVerifier:
                     if prev_topk_indices is None
                     else prev_topk_indices[:, index : index + 1]
                 ),
-                step_updates,
                 projected=(
                     q_resid[:, index : index + 1],
                     q[:, :, index : index + 1],
@@ -349,14 +319,12 @@ class Glm5NextSpeculativeVerifier:
             mx.async_eval(output, topk)
             outputs.append(output)
             topks.append(topk)
-            updates.append(step_updates[0])
         return (
             self._block_linear(
                 attention.o_proj,
                 mx.concatenate(outputs, axis=1),
             ),
             mx.concatenate(topks, axis=1),
-            self._merge_sparse_updates(updates),
         )
 
     @staticmethod
@@ -455,7 +423,6 @@ class Glm5NextSpeculativeVerifier:
         padding_mask,
         cache,
         prev_topk_indices,
-        rollback_sink,
         projected=None,
         project_output=True,
     ):
@@ -494,16 +461,13 @@ class Glm5NextSpeculativeVerifier:
                 mx.zeros((batch, 1, length, 0), dtype=new_latent.dtype),
             )
 
-        cache_update = {"new_latent": new_latent}
         if attention.indexer is None:
             if prev_topk_indices is None:
                 raise ValueError("Shared indexer layer has no previous top-k indices.")
             topk = prev_topk_indices
         elif length > 1:
             topk_parts = []
-            index_updates = []
             for index in range(length):
-                index_update = {}
                 topk_parts.append(
                     attention.indexer(
                         x[:, index : index + 1],
@@ -516,25 +480,10 @@ class Glm5NextSpeculativeVerifier:
                         index_cache,
                         pool_cache,
                         cache_offset + index,
-                        cache_update_sink=index_update,
                         linear_fn=self._singleton_linear,
                     )
                 )
-                index_updates.append(index_update)
             topk = mx.concatenate(topk_parts, axis=1)
-            cache_update.update(
-                indexer=attention.indexer,
-                index_keys=mx.concatenate(
-                    [update["index_keys"] for update in index_updates], axis=1
-                ),
-                index_gates=mx.concatenate(
-                    [update["index_gates"] for update in index_updates], axis=1
-                ),
-                query_valid=mx.concatenate(
-                    [update["query_valid"] for update in index_updates], axis=1
-                ),
-                cache_offset=cache_offset,
-            )
         else:
             topk = attention.indexer(
                 x,
@@ -543,11 +492,9 @@ class Glm5NextSpeculativeVerifier:
                 index_cache,
                 pool_cache,
                 cache_offset,
-                cache_update_sink=cache_update,
                 linear_fn=self._singleton_linear,
                 projected=index_projected,
             )
-        rollback_sink.append(cache_update)
 
         kv_length = latent.shape[2]
         valid = (topk >= 0) & (topk < kv_length)
@@ -607,7 +554,6 @@ class Glm5NextSpeculativeVerifier:
         mask,
         cache,
         prev_topk_indices,
-        rollback_sink,
     ):
         residual = hidden
         collapsed, post, comb = self._hc_norm(
@@ -622,17 +568,15 @@ class Glm5NextSpeculativeVerifier:
                 mask,
                 cache,
             )
-            rollback_sink.append(None)
             topk = prev_topk_indices
         else:
-            collapsed, topk, sparse_update = self._sparse_attention(
+            collapsed, topk = self._sparse_attention(
                 layer.self_attn,
                 collapsed,
                 mask,
                 cache,
                 prev_topk_indices,
             )
-            rollback_sink.append(sparse_update)
         hidden = self._hc_expand_timewise(collapsed, residual, post, comb)
 
         residual = hidden
@@ -655,7 +599,6 @@ class Glm5NextSpeculativeVerifier:
         cache,
         attention_mask,
         hidden_sink,
-        rollback_sink,
     ):
         hidden = model.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         if cache is None:
@@ -677,7 +620,6 @@ class Glm5NextSpeculativeVerifier:
                 layer_mask,
                 layer_cache,
                 topk,
-                rollback_sink,
             )
 
         hidden = self._timewise(model.norm, hidden.mean(axis=2))
@@ -694,12 +636,9 @@ class Glm5NextSpeculativeVerifier:
         cache=None,
         attention_mask=None,
         hidden_sink=None,
-        rollback_sink=None,
         return_shared_kv=False,
         skip_logits=False,
     ) -> LanguageModelOutput:
-        if rollback_sink is None:
-            rollback_sink = []
         hidden = self._model(
             language_model.model,
             inputs,
@@ -707,7 +646,6 @@ class Glm5NextSpeculativeVerifier:
             cache,
             attention_mask,
             hidden_sink,
-            rollback_sink,
         )
         logits = (
             None if skip_logits else self.logits_from_hidden(language_model, hidden)
@@ -725,19 +663,14 @@ class Glm5NextSpeculativeVerifier:
         cache,
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
     ):
-        cache_snapshot = snapshot_cache_state(cache, inputs.shape[1])
-        transaction = start_speculative_cache(
-            cache, inputs.shape[1], cache_types=(ArraysCache,)
-        )
+        transaction = start_speculative_cache(cache, inputs.shape[1])
         hidden_sink = []
-        rollback_updates = []
         try:
             output = self(
                 language_model,
                 inputs,
                 cache=cache,
                 hidden_sink=hidden_sink,
-                rollback_sink=rollback_updates,
                 return_shared_kv=True,
                 skip_logits=True,
             )
@@ -745,78 +678,14 @@ class Glm5NextSpeculativeVerifier:
             transaction.abort()
             raise
         hidden = output.hidden_states[-1]
-        rollback_state = (cache_snapshot, rollback_updates, transaction)
         if sampler is None:
-            return hidden, {}, rollback_state
+            return hidden, {}, transaction
         return (
             hidden,
             {},
-            rollback_state,
+            transaction,
             sampler(self.logits_from_hidden(language_model, hidden)),
         )
-
-    @staticmethod
-    def _prepare_cache(cache, valid_lengths, right_padding):
-        prepare = getattr(cache, "prepare", None)
-        if callable(prepare):
-            prepare(lengths=valid_lengths, right_padding=right_padding)
-
-    @staticmethod
-    def _finalize_cache(cache):
-        finalize = getattr(cache, "finalize", None)
-        if callable(finalize):
-            finalize()
-
-    def _replay_attention_cache(self, cache, update, valid_lengths, keep):
-        if cache is None:
-            return
-
-        batch = len(valid_lengths)
-        ragged = len(set(valid_lengths)) > 1
-        right_padding = [keep - length for length in valid_lengths] if ragged else None
-        kv_cache = cache[0]
-        touched = [kv_cache]
-
-        indexer = update.get("indexer")
-        if indexer is not None:
-            index_cache = cache[1]
-            pool_cache = cache[2]
-            touched.extend([index_cache, pool_cache])
-
-        if ragged:
-            for entry in touched:
-                self._prepare_cache(entry, valid_lengths, right_padding)
-
-        new_latent = update["new_latent"][:, :, :keep]
-        kv_cache.update_and_fetch(
-            new_latent,
-            mx.zeros((batch, 1, keep, 0), dtype=new_latent.dtype),
-        )
-
-        if indexer is not None:
-            valid = (
-                mx.arange(keep)[None] < mx.array(valid_lengths, dtype=mx.int32)[:, None]
-            )
-            query_valid = update["query_valid"][:, :keep] & valid
-            keys = update["index_keys"][:, :keep]
-            gates = update["index_gates"][:, :keep]
-            for index in range(keep):
-                index_cache.update_and_fetch(
-                    query_valid[:, None, index : index + 1, None],
-                    mx.zeros((batch, 1, 1, 0), dtype=mx.bool_),
-                )
-
-                ready_keys, ready_gates, _ = pool_cache.accumulate_windows(
-                    keys[:, index : index + 1],
-                    gates[:, index : index + 1],
-                    update["cache_offset"] + index,
-                )
-                new_pool_keys = indexer._compress_pools(ready_keys, ready_gates)
-                pool_cache.update_and_fetch(new_pool_keys)
-
-        if ragged:
-            for entry in touched:
-                self._finalize_cache(entry)
 
     def rollback(
         self,
@@ -826,30 +695,13 @@ class Glm5NextSpeculativeVerifier:
         accepted,
         block_size: int,
     ) -> int:
-        del block_size
-        if isinstance(accepted, int):
-            accepted_values = [accepted]
-        elif isinstance(accepted, mx.array):
-            accepted_values = [int(value) for value in accepted.tolist()]
-        else:
-            accepted_values = [int(value) for value in accepted]
-
-        cache_snapshot, rollback_updates, transaction = rollback_state
-        restore_cache_state(caches, cache_snapshot)
-        valid_lengths = [value + 1 for value in accepted_values]
-        keep = max(valid_lengths, default=0)
-        if not keep:
-            return 0
-
-        for layer, cache, update in zip(
-            language_model.model.layers,
+        del language_model
+        return rollback_speculative_cache(
             caches,
-            rollback_updates,
-        ):
-            if layer.block_type != "linear_attention":
-                self._replay_attention_cache(cache, update, valid_lengths, keep)
-        transaction.commit(valid_lengths)
-        return max(accepted_values)
+            rollback_state,
+            accepted,
+            block_size,
+        )
 
 
 __all__ = ["Glm5NextSpeculativeVerifier"]

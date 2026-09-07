@@ -498,7 +498,6 @@ class Glm5NextIndexer(nn.Module):
         cache=None,
         pool_cache=None,
         offset=0,
-        cache_update_sink=None,
         linear_fn=None,
         projected=None,
     ):
@@ -506,17 +505,7 @@ class Glm5NextIndexer(nn.Module):
         batch, q_length, _ = x.shape
         if projected is None:
             k = self.k_norm(linear_fn(self.wk, x))
-            if cache_update_sink is None:
-                gate = x.astype(mx.float32) @ self.index_kpool_compress_gate.T
-            else:
-                gate = mx.concatenate(
-                    [
-                        x[:, index : index + 1].astype(mx.float32)
-                        @ self.index_kpool_compress_gate.T
-                        for index in range(q_length)
-                    ],
-                    axis=1,
-                )
+            gate = x.astype(mx.float32) @ self.index_kpool_compress_gate.T
             projected_q = projected_weights = None
         else:
             k, gate, projected_q, projected_weights = projected
@@ -524,14 +513,6 @@ class Glm5NextIndexer(nn.Module):
             query_valid = mx.ones((batch, q_length), dtype=mx.bool_)
         else:
             query_valid = padding_mask.astype(mx.bool_)
-        if cache_update_sink is not None:
-            cache_update_sink.update(
-                indexer=self,
-                index_keys=k,
-                index_gates=gate.astype(k.dtype),
-                query_valid=query_valid,
-                cache_offset=offset,
-            )
         if cache is not None:
             valid_state, _ = cache.update_and_fetch(
                 query_valid[:, None, :, None],
