@@ -199,8 +199,10 @@ class TwoWayAttentionBlock(nn.Module):
         num_heads: int,
         mlp_dim: int = 2048,
         attention_downsample_rate: int = 2,
+        skip_first_layer_pe: bool = False,
     ):
         super().__init__()
+        self.skip_first_layer_pe = skip_first_layer_pe
         self.self_attn = SAMAttention(hidden_size, num_heads)
         self.layer_norm1 = nn.LayerNorm(hidden_size)
 
@@ -225,9 +227,13 @@ class TwoWayAttentionBlock(nn.Module):
         key_pe: mx.array,
     ) -> Tuple[mx.array, mx.array]:
         # Self-attention on queries
-        q = queries + query_pe
-        attn_out = self.self_attn(q, q, queries)
-        queries = queries + attn_out
+        if self.skip_first_layer_pe:
+            # First layer: no query PE, and the output replaces the queries
+            queries = self.self_attn(queries, queries, queries)
+        else:
+            q = queries + query_pe
+            attn_out = self.self_attn(q, q, queries)
+            queries = queries + attn_out
         queries = self.layer_norm1(queries)
 
         # Cross-attention: tokens to image
@@ -269,9 +275,13 @@ class TwoWayTransformer(nn.Module):
         super().__init__()
         self.layers = [
             TwoWayAttentionBlock(
-                hidden_size, num_heads, mlp_dim, attention_downsample_rate
+                hidden_size,
+                num_heads,
+                mlp_dim,
+                attention_downsample_rate,
+                skip_first_layer_pe=(i == 0),
             )
-            for _ in range(num_layers)
+            for i in range(num_layers)
         ]
 
         self.final_attn_token_to_image = SAMAttention(

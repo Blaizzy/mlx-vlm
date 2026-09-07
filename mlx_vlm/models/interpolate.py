@@ -240,7 +240,28 @@ def resize_bilinear_nhwc(x, new_size, align_corners=False, antialias=False):
     return separable_interpolate(x, iy, wy, ix, wx)
 
 
-def resize_bicubic_nhwc(x, new_size=None, scale_factor=None):
+@lru_cache(maxsize=64)
+def _bicubic_aa_weights_1d(in_size, out_size):
+    """(out, taps) indices and a=-0.5 cubic weights matching ATen
+    ``_upsample_bicubic2d_aa``: stretched kernel, normalized per output pixel."""
+    scale = in_size / out_size
+    support = 2.0 * scale if scale >= 1.0 else 2.0
+    max_taps = math.ceil(support) * 2 + 1
+    invscale = 1.0 / scale if scale >= 1.0 else 1.0
+    center = scale * (mx.arange(out_size, dtype=mx.float32) + 0.5)
+    xmin = mx.maximum(mx.floor(center - support + 0.5), 0.0)
+    xmax = mx.minimum(mx.floor(center + support + 0.5), float(in_size))
+    xsize = mx.clip(xmax - xmin, 0, max_taps)
+    pos = xmin[:, None] + mx.arange(max_taps, dtype=mx.float32)[None, :]
+    w = _cubic_weight((pos - center[:, None] + 0.5) * invscale, a=-0.5)
+    w = mx.where(pos - xmin[:, None] < xsize[:, None], w, 0.0)
+    total = w.sum(axis=1, keepdims=True)
+    w = mx.where(total > 0, w / mx.maximum(total, 1e-30), w)
+    idx = mx.minimum(pos, in_size - 1).astype(mx.int32)
+    return idx, w
+
+
+def resize_bicubic_nhwc(x, new_size=None, scale_factor=None, antialias=False):
     """Channel-last ``F.interpolate(mode="bicubic")``; with ``scale_factor`` the
     output size is floored and sampling uses the given scale, not the effective one."""
     _, in_h, in_w, _ = x.shape
@@ -249,6 +270,12 @@ def resize_bicubic_nhwc(x, new_size=None, scale_factor=None):
         new_size = (int(in_h * scale_h), int(in_w * scale_w))
     else:
         scale_h, scale_w = new_size[0] / in_h, new_size[1] / in_w
-    iy, wy = _bicubic_weights_1d(in_h, new_size[0], scale_h)
-    ix, wx = _bicubic_weights_1d(in_w, new_size[1], scale_w)
+    if (in_h, in_w) == tuple(new_size):
+        return x
+    if antialias:
+        iy, wy = _bicubic_aa_weights_1d(in_h, new_size[0])
+        ix, wx = _bicubic_aa_weights_1d(in_w, new_size[1])
+    else:
+        iy, wy = _bicubic_weights_1d(in_h, new_size[0], scale_h)
+        ix, wx = _bicubic_weights_1d(in_w, new_size[1], scale_w)
     return separable_interpolate(x, iy, wy, ix, wx)
