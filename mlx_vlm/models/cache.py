@@ -2448,12 +2448,6 @@ class PoolingCache(_BaseCache):
       2. A small remainder buffer of tokens not yet forming a full window.
     """
 
-    def __new__(cls, *args, **kwargs):
-        instance = super().__new__(cls)
-        instance._speculation = None
-        instance._speculation_generation = 0
-        return instance
-
     def __init__(self, ratio: int):
         self.ratio = ratio
 

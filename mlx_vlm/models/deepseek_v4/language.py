@@ -1365,7 +1365,6 @@ class LanguageModel(nn.Module):
                 inputs,
                 cache=cache,
                 return_hidden=True,
-                return_shared_kv=True,
                 skip_logits=not sample_logits,
                 skip_final_norm=not sample_logits,
             )

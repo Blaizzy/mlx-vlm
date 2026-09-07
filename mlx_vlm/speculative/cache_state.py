@@ -113,29 +113,6 @@ def snapshot_cache_state(caches: Iterable[Any], incoming_tokens: int = 0):
     return [_snapshot_single_cache(cache, incoming_tokens) for cache in caches]
 
 
-def _needs_replay_snapshot(cache, incoming_tokens: int) -> bool:
-    if cache is None:
-        return False
-    if isinstance(cache, CacheList):
-        return any(
-            _needs_replay_snapshot(child, incoming_tokens) for child in cache.caches
-        )
-    if isinstance(cache, PoolingCache):
-        return int(cache.remainder) + int(incoming_tokens) >= int(cache.ratio)
-    if isinstance(cache, RotatingKVCache):
-        return False
-    return not callable(getattr(cache, "trim", None))
-
-
-def needs_replay_snapshot_for_cache(
-    caches: Optional[Iterable[Any]], incoming_tokens: int = 0
-) -> bool:
-    """Return whether trimming cannot safely undo the verifier block."""
-    if caches is None:
-        return False
-    return any(_needs_replay_snapshot(cache, incoming_tokens) for cache in caches)
-
-
 def _clear_cache_state(cache) -> None:
     if isinstance(cache, CacheList):
         for child in cache.caches:
@@ -273,9 +250,8 @@ def iter_leaf_caches(caches: Iterable[Any]):
 class SpeculativeCacheTransaction:
     """A bounded transaction over caches that retain temporal state."""
 
-    def __init__(self, entries, length: int):
+    def __init__(self, entries):
         self._entries = entries
-        self.length = int(length)
         self._active = True
 
     @property
@@ -316,7 +292,7 @@ def start_speculative_cache(
         start = getattr(cache, "start_speculation", None)
         if callable(start):
             entries.append((cache, start(length)))
-    return SpeculativeCacheTransaction(entries, length)
+    return SpeculativeCacheTransaction(entries)
 
 
 def rollback_speculative_cache(
@@ -340,9 +316,8 @@ def rollback_speculative_cache(
     right_padding = [max_accepted - value for value in accepted_values]
     has_ragged_tail = is_batch and any(right_padding)
 
-    validate = getattr(transaction, "validate", None)
-    if callable(validate):
-        validate(retained)
+    if isinstance(transaction, SpeculativeCacheTransaction):
+        transaction.validate(retained)
 
     for cache in iter_leaf_caches(caches):
         if getattr(cache, "is_speculating", False):
@@ -379,20 +354,14 @@ def rollback_speculative_cache(
                 f"{type(cache).__name__}."
             )
 
-    commit_validated = getattr(transaction, "_commit_validated", None)
-    if callable(commit_validated):
-        commit_validated(retained)
-    else:
-        commit = getattr(transaction, "commit", None)
-        if callable(commit):
-            commit(retained)
+    if isinstance(transaction, SpeculativeCacheTransaction):
+        transaction._commit_validated(retained)
     return max_accepted
 
 
 __all__ = [
     "SpeculativeCacheTransaction",
     "iter_leaf_caches",
-    "needs_replay_snapshot_for_cache",
     "rollback_speculative_cache",
     "restore_cache_state",
     "snapshot_cache_state",

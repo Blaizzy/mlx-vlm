@@ -3930,18 +3930,7 @@ def test_deepseek_v4_pooling_rollback_commits_without_model_replay(accepted):
     assert mx.allclose(speculative_logits, reference_logits, rtol=0, atol=1e-5).item()
 
 
-def test_deepseek_v4_replay_snapshot_required_only_when_pooling_can_cross_window():
-    pool = PoolingCache(4)
-    pool.accumulate_windows(mx.array([[[10.0]]]), mx.ones((1, 1, 1)), offset=0)
-
-    assert not speculative_cache_state.needs_replay_snapshot_for_cache([pool], 2)
-    assert speculative_cache_state.needs_replay_snapshot_for_cache([pool], 3)
-    assert not speculative_cache_state.needs_replay_snapshot_for_cache(
-        [RotatingKVCache(max_size=8)], 3
-    )
-
-
-def test_deepseek_v4_pooling_snapshot_skips_clone_when_verify_does_not_overwrite_remainder():
+def test_pooling_snapshot_skips_clone_when_verify_does_not_overwrite_remainder():
     pool = PoolingCache(4)
     old_kv = mx.array([[[10.0]]])
     old_gate = mx.array([[[1.0]]])
@@ -3962,7 +3951,7 @@ def test_deepseek_v4_pooling_snapshot_skips_clone_when_verify_does_not_overwrite
     assert pool.buf_kv[:, :1].reshape(-1).tolist() == [10.0]
 
 
-def test_deepseek_v4_pooling_snapshot_restores_only_overwritten_prefix():
+def test_pooling_snapshot_restores_only_overwritten_prefix():
     pool = PoolingCache(4)
     old_kv = mx.array([[[10.0], [11.0], [12.0]]])
     old_gate = mx.ones_like(old_kv)
