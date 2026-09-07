@@ -1662,7 +1662,16 @@ class ResponseGenerator:
         try:
             self._run_impl()
         finally:
-            clear_mlx_streams()
+            try:
+                # The worker can outlive stop_and_join's timeout. Retire its
+                # disk writer only after its final request/store has finished.
+                manager = getattr(self, "apc_manager", None)
+                if manager is not None:
+                    manager.close()
+            except Exception:
+                logger.exception("Error closing APC after generation worker shutdown")
+            finally:
+                clear_mlx_streams()
 
     def _run_impl(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
