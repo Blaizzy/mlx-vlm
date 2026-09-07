@@ -2232,7 +2232,8 @@ def test_stream_generate_forwards_verbose_to_generate_step():
     assert captured["verbose"] is True
 
 
-def test_stream_generate_stores_checkpoint_only_before_decode():
+@pytest.mark.parametrize("reused_prefix", [0, 1, 2])
+def test_stream_generate_stores_checkpoint_only_before_decode(reused_prefix):
     class FakeStoppingCriteria:
         def __call__(self, token):
             return False
@@ -2252,13 +2253,16 @@ def test_stream_generate_stores_checkpoint_only_before_decode():
     coordinator = MagicMock()
     coordinator.enabled = True
     coordinator.is_checkpoint = True
-    coordinator.lookup.return_value = None
-    coordinator.checkpoint_len.return_value = 3
+    coordinator.lookup.return_value = (
+        {"prefix_len": reused_prefix, "warm_cache": []} if reused_prefix else None
+    )
+    coordinator.materialize_single.return_value = []
+    coordinator.checkpoint_lengths.return_value = [2, 3]
 
     def fake_generate_step(*args, **kwargs):
-        kwargs["prompt_cache_checkpoint"](
-            kwargs["prompt_cache_checkpoint_len"], kwargs["prompt_cache"]
-        )
+        assert args[0].shape[1] == 4 - reused_prefix
+        for n in kwargs["prompt_cache_checkpoint_lengths"]:
+            kwargs["prompt_cache_checkpoint"](n, kwargs["prompt_cache"])
         yield 7, mx.zeros((4,))
 
     processor = SimpleNamespace(
@@ -2293,9 +2297,12 @@ def test_stream_generate_stores_checkpoint_only_before_decode():
             )
         )
 
-    coordinator.store_checkpoint.assert_called_once_with(
-        [1, 2, 3], prompt_cache, extra_hash=0
-    )
+    calls = coordinator.store_checkpoint.call_args_list
+    assert [call.args[0] for call in calls] == [
+        [1, 2, 3, 4][:n] for n in [2, 3] if n > reused_prefix
+    ]
+    assert all(call.args[1] == prompt_cache for call in calls)
+    assert all(call.kwargs == {"extra_hash": 0} for call in calls)
 
 
 def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():

@@ -1025,21 +1025,22 @@ def stream_generate(
         detokenizer = make_streaming_detokenizer(processor)
         thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
         exact_checkpoint_len = None
+        exact_checkpoint_lengths = []
         exact_checkpoint = None
-        if (
-            apc_coordinator is not None
-            and apc_coordinator.is_checkpoint
-            and reused_prefix_len == 0
-        ):
-            exact_checkpoint_len = apc_coordinator.checkpoint_len(
-                full_input_ids_list, multimodal_token_ids
-            )
-            if exact_checkpoint_len <= 0:
-                exact_checkpoint_len = None
+        if apc_coordinator is not None and apc_coordinator.is_checkpoint:
+            exact_checkpoint_lengths = [
+                n - reused_prefix_len
+                for n in apc_coordinator.checkpoint_lengths(
+                    full_input_ids_list, multimodal_token_ids
+                )
+                if n > reused_prefix_len
+            ]
+            if exact_checkpoint_lengths:
+                exact_checkpoint_len = exact_checkpoint_lengths[-1]
 
             def exact_checkpoint(prefix_len: int, prompt_cache: List[Any]) -> None:
                 apc_coordinator.store_checkpoint(
-                    full_input_ids_list[:prefix_len],
+                    full_input_ids_list[: reused_prefix_len + prefix_len],
                     prompt_cache,
                     extra_hash=apc_extra_hash,
                 )
@@ -1051,6 +1052,7 @@ def stream_generate(
             mask,
             prompt_cache_checkpoint=exact_checkpoint,
             prompt_cache_checkpoint_len=exact_checkpoint_len,
+            prompt_cache_checkpoint_lengths=exact_checkpoint_lengths,
             verbose=verbose,
             **kwargs,
         )

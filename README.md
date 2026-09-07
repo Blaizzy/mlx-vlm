@@ -918,8 +918,9 @@ Common APC environment variables:
 | `APC_ENABLED` | `0` | Set to `1` to enable APC |
 | `APC_NUM_BLOCKS` | `2048` | Number of in-memory APC blocks |
 | `APC_BLOCK_SIZE` | `16` | Tokens per APC block |
-| `APC_CHECKPOINT_ENTRIES` | `2` | In-memory checkpoint entries for hybrid/stateful cache layouts |
+| `APC_CHECKPOINT_ENTRIES` | `2` | In-memory checkpoint entries; also bounds snapshots captured per hybrid prompt (disk-only mode captures two) |
 | `APC_CHECKPOINT_GUARD_TOKENS` | `1` | Tokens retained after a reusable hybrid checkpoint boundary; the default preserves the normal final-token prefill boundary |
+| `APC_CHECKPOINT_INTERVAL_TOKENS` | `2048` | Spacing of intermediate hybrid checkpoints, rounded up to a multiple of `APC_BLOCK_SIZE`; `0` keeps only the final checkpoint |
 | `APC_DISK_PATH` | unset | Directory for persistent disk shards |
 | `APC_DISK_MAX_GB` | `0` | Disk cap in GB; `0` means uncapped |
 | `APC_DISK_SHARD_MAX_BLOCKS` | `256` | Max blocks per disk segment shard |
@@ -930,6 +931,29 @@ Common APC environment variables:
 
 Custom cache layouts can opt in without APC model-name checks by implementing `prefix_cache_snapshot()` and `prefix_cache_restore(snapshot)`. In-tree dense, sliding-window, recurrent, composite, VLM, and Omni cache layouts are detected automatically. APC works with `--kv-bits` (including TurboQuant): the live KV cache stays quantized; pageable APC K/V blocks are stored as dequantized float K/V, so block-pool size does not shrink with quant.
 When APC is enabled on the server, a non-fatal layout self-check runs at model load.
+
+Requests with a shared document and different questions can reuse their common
+prefix. Dense K/V caches, including compact layer-major memory snapshots, match
+complete blocks before the first differing token. Hybrid, recurrent and sliding
+window caches must restore a state captured before that divergence: their final
+state cannot be rolled back by slicing K/V tensors.
+
+Hybrid prefill now captures intermediate checkpoints as well as the final guard
+checkpoint, in streaming, continuous batching and DiffusionGemma generation.
+With the defaults, each prompt stores its latest 2,048-token boundary before the
+final checkpoint and the final checkpoint itself. For example, a 30,000-token
+document followed by 20 instruction tokens can reuse 28,672 tokens when the
+instructions change. The same checkpoints persist across server restarts when
+the disk tier is enabled.
+
+Captures are bounded by `APC_CHECKPOINT_ENTRIES` to avoid copying the growing
+hybrid cache at every prefill chunk. More entries retain more earlier boundaries;
+a smaller interval gives finer reuse near the end. Reuse still requires a
+retained boundary before the divergence. Short prompts below the interval,
+divergence before the earliest retained checkpoint, and evicted checkpoints can
+miss. Media checkpoints include all media tokens so the remaining suffix is text.
+Changing checkpoint boundaries can change floating-point execution shapes, as
+with other chunked or cached prefill paths.
 
 #### KV Cache Quantization
 

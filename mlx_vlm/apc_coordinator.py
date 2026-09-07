@@ -94,6 +94,38 @@ class APCCoordinator:
             max_prefix_tokens=len(token_ids) - 1,
         )
 
+    def checkpoint_lengths(
+        self, token_ids: Sequence[int], media_token_ids: set[int]
+    ) -> List[int]:
+        """Bounded intermediate states plus the final conversation checkpoint.
+
+        Stateful caches cannot roll back the final snapshot to a divergence.
+        Capture earlier states while prefilling, aligned across requests. Limit
+        captures to the resident entry budget (two for a disk-only manager),
+        rather than copying an ever-growing cache at every prefill chunk.
+        """
+        final = self.checkpoint_len(token_ids, media_token_ids)
+        if final <= 0:
+            return []
+        interval = self.manager.checkpoint_interval_tokens
+        budget = self.manager._exact_cache_max or (2 if self.manager.disk else 1)
+        if interval <= 0 or budget <= 1:
+            return [final]
+        from .apc import adjust_prefix_to_text_suffix_boundary
+
+        block_size = self.manager.block_size
+        interval = ((interval + block_size - 1) // block_size) * block_size
+        last = ((final - 1) // interval) * interval
+        first = max(interval, last - (budget - 2) * interval)
+        lengths = {final}
+        for boundary in range(first, last + 1, interval):
+            boundary = adjust_prefix_to_text_suffix_boundary(
+                token_ids, boundary, media_token_ids, max_prefix_tokens=final
+            )
+            if self.manager.exact_cache_min_tokens <= boundary < final:
+                lengths.add(boundary)
+        return sorted(lengths)
+
     def merge_rows(
         self,
         picks: Sequence[Optional[dict]],

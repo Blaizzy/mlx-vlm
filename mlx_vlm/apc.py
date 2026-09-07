@@ -326,6 +326,60 @@ def _clone_prompt_cache_for_apc(
     return out
 
 
+def _dense_checkpoint_trimmable(prompt_cache: Sequence[Any], token_len: int) -> bool:
+    """Only ordinary dense K/V contains the state for every earlier prefix."""
+    from .models.cache import KVCache
+
+    return bool(prompt_cache) and all(
+        type(c) is KVCache
+        and c.offset == token_len
+        and c.keys is not None
+        and c.values is not None
+        and c.keys.shape[2] >= token_len
+        and c.values.shape[2] >= token_len
+        for c in prompt_cache
+    )
+
+
+def _checkpoint_match_len(
+    tokens: tuple[int, ...],
+    stored: tuple[int, ...],
+    max_len: int,
+    block_size: int,
+    trimmable: bool,
+) -> int:
+    if len(stored) <= max_len and tokens[: len(stored)] == stored:
+        return len(stored)
+    if not trimmable:
+        return 0
+    # Compare in Python's tuple implementation instead of visiting every token
+    # in Python. Only complete blocks before the divergence may be restored.
+    low, high = 0, min(max_len, len(stored)) // block_size
+    while low < high:
+        mid = (low + high + 1) // 2
+        end = mid * block_size
+        if tokens[:end] == stored[:end]:
+            low = mid
+        else:
+            high = mid - 1
+    return low * block_size
+
+
+def _dense_checkpoint_prefix(prompt_cache: Sequence[Any], prefix_len: int) -> List[Any]:
+    """Build views for cloning without allocating the discarded dense suffix."""
+    from .models.cache import KVCache
+
+    out = []
+    for source in prompt_cache:
+        c = KVCache()
+        c.step = source.step
+        c.keys = source.keys[..., :prefix_len, :]
+        c.values = source.values[..., :prefix_len, :]
+        c.offset = prefix_len
+        out.append(c)
+    return out
+
+
 def _clone_layer_major_kv_cache_for_apc(
     layer_keys: Sequence[mx.array],
     layer_values: Sequence[mx.array],
@@ -1409,6 +1463,7 @@ class DiskBlockStore:
         extra_hash: int = 0,
         max_prefix_tokens: Optional[int] = None,
         min_prefix_tokens: int = 0,
+        block_size: int = DEFAULT_BLOCK_SIZE,
     ) -> Optional[Tuple[int, int]]:
         token_tuple = tuple(int(t) for t in token_ids)
         max_len = len(token_tuple) - 1
@@ -1435,13 +1490,16 @@ class DiskBlockStore:
                 )
             except (TypeError, ValueError):
                 continue
-            prefix_len = len(stored_tokens)
-            if (
-                stored_extra != extra_hash
-                or prefix_len <= min_prefix_tokens
-                or prefix_len > max_len
-                or token_tuple[:prefix_len] != stored_tokens
-            ):
+            if stored_extra != extra_hash:
+                continue
+            prefix_len = _checkpoint_match_len(
+                token_tuple,
+                stored_tokens,
+                max_len,
+                block_size,
+                metadata.get("prefix_trimmable") == "1",
+            )
+            if prefix_len <= min_prefix_tokens:
                 continue
             if best is None or prefix_len > best[1]:
                 best = (int(cache_hash), prefix_len)
@@ -1453,6 +1511,7 @@ class DiskBlockStore:
         *,
         wait_in_flight_ms: float = 0.0,
         min_capacity_tokens: Optional[int] = None,
+        prefix_len: Optional[int] = None,
     ) -> Optional[Tuple[Tuple[int, ...], int, List[Any]]]:
         with self._index_lock:
             path = self._exact_index.get(cache_hash)
@@ -1466,7 +1525,7 @@ class DiskBlockStore:
             if path is None:
                 return None
         return self._load_exact_cache_file(
-            path, min_capacity_tokens=min_capacity_tokens
+            path, min_capacity_tokens=min_capacity_tokens, prefix_len=prefix_len
         )
 
     def _load_exact_cache_file(
@@ -1474,6 +1533,7 @@ class DiskBlockStore:
         path: Path,
         *,
         min_capacity_tokens: Optional[int],
+        prefix_len: Optional[int] = None,
     ) -> Optional[Tuple[Tuple[int, ...], int, List[Any]]]:
         parsed = self._open_shard_header(path)
         if parsed is None:
@@ -1494,6 +1554,16 @@ class DiskBlockStore:
             return None
         if n_entries <= 0:
             return None
+        trim_len = None
+        if prefix_len is not None and prefix_len != len(token_ids):
+            if (
+                not 0 < prefix_len < len(token_ids)
+                or metadata.get("prefix_trimmable") != "1"
+                or any(metadata.get(f"c{i}_kind") != "kv" for i in range(n_entries))
+            ):
+                return None
+            trim_len = prefix_len
+            token_ids = token_ids[:prefix_len]
 
         prompt_cache: List[Any] = []
         eval_targets: List[mx.array] = []
@@ -1506,6 +1576,7 @@ class DiskBlockStore:
                 f"c{i}",
                 min_capacity_tokens=min_capacity_tokens,
                 eval_targets=eval_targets,
+                prefix_len=trim_len,
             )
             if loaded is None:
                 return None
@@ -1528,6 +1599,7 @@ class DiskBlockStore:
         *,
         min_capacity_tokens: Optional[int],
         eval_targets: List[mx.array],
+        prefix_len: Optional[int] = None,
     ) -> Optional[Any]:
         from .models import cache as lm_cache
 
@@ -1580,6 +1652,11 @@ class DiskBlockStore:
                 step = int(metadata.get(f"{prefix}_step", "256"))
             except (TypeError, ValueError):
                 return None
+            if prefix_len is not None:
+                if prefix_len > min(off, k.shape[2], v.shape[2]):
+                    return None
+                off = prefix_len
+                k, v = k[..., :off, :], v[..., :off, :]
             k, v = _pad_kv_for_capacity(
                 k,
                 v,
@@ -2681,6 +2758,13 @@ class DiskBlockStore:
             "extra_hash": str(int(snapshot.extra_hash)),
             "token_ids": ",".join(str(int(t)) for t in snapshot.token_ids),
             "num_entries": str(len(snapshot.prompt_cache)),
+            "prefix_trimmable": str(
+                int(
+                    _dense_checkpoint_trimmable(
+                        snapshot.prompt_cache, len(snapshot.token_ids)
+                    )
+                )
+            ),
             "store_id": self._exact_id_for(snapshot.cache_hash),
         }
         arrays: dict[str, mx.array] = {}
@@ -2900,6 +2984,9 @@ class APCManager:
         self.exact_cache_min_tokens = max(
             1, int(os.environ.get("APC_EXACT_MIN_TOKENS", "16"))
         )
+        self.checkpoint_interval_tokens = max(
+            0, int(os.environ.get("APC_CHECKPOINT_INTERVAL_TOKENS", "2048"))
+        )
         # If free RAM (best-effort reading) drops below this, skip disk
         # promotion this turn and fall back to memory-only matching. The
         # request still serves correctly — it just doesn't get the warm-
@@ -3003,11 +3090,12 @@ class APCManager:
         max_prefix_tokens: Optional[int] = None,
         min_prefix_tokens: int = 0,
     ) -> Tuple[Optional[List[Any]], int]:
-        """Return an exact-prefix prompt-cache snapshot for custom caches.
+        """Return the longest restorable prefix from prompt-cache snapshots.
 
         Mixed architectures such as Nemotron-H use recurrent SSM state in
         addition to attention KV. That state is not block-concatenable, so the
         safe reuse unit is an exact prompt-cache snapshot at a prefix boundary.
+        Plain dense K/V snapshots can also be sliced to the last matching block.
         """
         disk = self.disk
         if self._exact_cache_max <= 0 and disk is None:
@@ -3030,23 +3118,30 @@ class APCManager:
             best_entry: Optional[APCExactCacheEntry] = None
             if self._exact_cache_max > 0:
                 for key, entry in self._exact_cache.items():
-                    candidate_len = len(entry.token_ids)
-                    if (
-                        entry.extra_hash != extra_hash
-                        or candidate_len <= min_prefix_tokens
-                        or candidate_len > max_len
-                    ):
+                    if entry.extra_hash != extra_hash:
                         continue
-                    if token_tuple[:candidate_len] != entry.token_ids:
+                    candidate_len = _checkpoint_match_len(
+                        token_tuple,
+                        entry.token_ids,
+                        max_len,
+                        self.block_size,
+                        _dense_checkpoint_trimmable(
+                            entry.prompt_cache, len(entry.token_ids)
+                        ),
+                    )
+                    if candidate_len <= max(min_prefix_tokens, prefix_len):
                         continue
-                    if best_entry is None or candidate_len > len(best_entry.token_ids):
-                        best_key = key
-                        best_entry = entry
+                    best_key = key
+                    best_entry = entry
+                    prefix_len = candidate_len
 
                 if best_entry is not None and best_key is not None:
                     self._exact_cache.move_to_end(best_key)
-                    prefix_len = len(best_entry.token_ids)
                     source_cache = best_entry.prompt_cache
+                    if prefix_len < len(best_entry.token_ids):
+                        source_cache = _dense_checkpoint_prefix(
+                            source_cache, prefix_len
+                        )
 
         can_try_disk = disk is not None and prefix_len < max_len
         if can_try_disk and self._disk_min_free_ram_bytes > 0:
@@ -3065,12 +3160,14 @@ class APCManager:
                 extra_hash=extra_hash,
                 max_prefix_tokens=max_prefix_tokens,
                 min_prefix_tokens=max(min_prefix_tokens, prefix_len),
+                block_size=self.block_size,
             )
             if disk_match is not None:
                 cache_hash, disk_prefix_len = disk_match
                 loaded = disk.load_exact_cache(
                     cache_hash,
                     min_capacity_tokens=prompt_capacity_tokens,
+                    prefix_len=disk_prefix_len,
                 )
                 if loaded is not None:
                     stored_tokens, stored_extra_hash, prompt_cache = loaded
