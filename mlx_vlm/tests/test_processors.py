@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 from PIL import Image
 
 # ── Shared mocks ──────────────────────────────────────────────────────────────
@@ -85,6 +86,49 @@ def _mock_ip(**extra):
             ),
         },
     )()
+
+
+class TestUnlimitedOCRProcessor(unittest.TestCase):
+    def test_default_chat_template_omits_trailing_space(self):
+        Template = pytest.importorskip("jinja2").Template
+
+        from mlx_vlm.models.unlimited_ocr.processing_unlimitedocr import (
+            UnlimitedOCRProcessor,
+        )
+
+        processor = object.__new__(UnlimitedOCRProcessor)
+        rendered = Template(processor.default_chat_template).render(
+            messages=[
+                {"role": "user", "content": "<image>document parsing."},
+                {"role": "assistant", "content": "partial"},
+                {"role": "user", "content": "continue"},
+            ],
+            add_generation_prompt=True,
+        )
+
+        self.assertEqual(rendered, "<image>document parsing. partial continue")
+
+
+class TestOutputControlTokens(unittest.TestCase):
+    def test_glm46v_strips_box_markers(self):
+        from mlx_vlm.models.glm4v.processing import _strip_box_markers
+
+        self.assertEqual(
+            _strip_box_markers("<|begin_of_box|>answer<|end_of_box|>"), "answer"
+        )
+
+    def test_kimi_vl_stops_on_assistant_marker(self):
+        from mlx_vlm.models.kimi_vl.processing_kimi_vl import KimiVLProcessor
+
+        processor = object.__new__(KimiVLProcessor)
+        processor.tokenizer = SimpleNamespace(
+            unk_token_id=0,
+            convert_tokens_to_ids=lambda token: (
+                163586 if token == "<|im_assistant|>" else 0
+            ),
+        )
+
+        self.assertEqual(processor.additional_eos_token_ids, [163586])
 
 
 class TestGemma4UnifiedProcessor(unittest.TestCase):
