@@ -10900,6 +10900,216 @@ class TestModels(unittest.TestCase):
         np.testing.assert_allclose(embedded, normalized, rtol=1e-5, atol=1e-7)
 
 
+class TestSam31MultiplexTracker(unittest.TestCase):
+    """SAM 3.1 multiplex video tracker (video_tracking_multiplex port)."""
+
+    def _make_tracker(self):
+        from mlx_vlm.models.sam3_1.config import (
+            PromptEncoderConfig,
+            TrackerConfig,
+            TrackerMaskDecoderConfig,
+        )
+        from mlx_vlm.models.sam3_1.tracker import MultiplexTrackerModel
+
+        config = TrackerConfig(
+            image_size=112,
+            multiplex_count=2,
+            memory_attention_hidden_size=32,
+            memory_attention_num_layers=2,
+            memory_attention_num_attention_heads=2,
+            memory_attention_feed_forward_hidden_size=64,
+            memory_attention_rope_feat_sizes=[8, 8],
+            memory_encoder_hidden_size=32,
+            mask_downsampler_embed_dim=32,
+            mask_downsampler_first_channels=2,
+            mask_downsampler_input_size=128,
+            memory_fuser_embed_dim=32,
+            memory_fuser_intermediate_dim=64,
+            mask_decoder_config=TrackerMaskDecoderConfig(
+                hidden_size=32,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                mlp_dim=64,
+                multiplex_count=2,
+                multimask_outputs_only=True,
+            ),
+            prompt_encoder_config=PromptEncoderConfig(
+                hidden_size=32, image_size=112, patch_size=14, mask_input_channels=16
+            ),
+        )
+        return MultiplexTrackerModel(config)
+
+    def _fake_frame(self, tracker, seed):
+        mx.random.seed(seed)
+        fpn_i = [
+            mx.random.normal((1, 32, 32, 32)),
+            mx.random.normal((1, 16, 16, 32)),
+            mx.random.normal((1, 8, 8, 32)),
+        ]
+        mx.random.seed(seed + 1)
+        fpn_p = [
+            mx.random.normal((1, 32, 32, 32)),
+            mx.random.normal((1, 16, 16, 32)),
+            mx.random.normal((1, 8, 8, 32)),
+        ]
+        return tracker.prepare_frame_features(fpn_i, fpn_p)
+
+    def test_multiplex_state_mux_demux(self):
+        from mlx_vlm.models.sam3_1.multiplex import MultiplexController
+
+        controller = MultiplexController(multiplex_count=4)
+        state = controller.get_state(7, random=False)
+        self.assertEqual(state.num_buckets, 2)
+        self.assertEqual(state.total_valid_entries, 7)
+
+        x = mx.random.normal((7, 3, 5))
+        muxed = state.mux(x)
+        self.assertEqual(muxed.shape, (2, 4, 3, 5))
+        # padding slot is zero-filled
+        np.testing.assert_array_equal(np.array(muxed[1, 3]), np.zeros((3, 5)))
+        # demux is the exact inverse on valid entries
+        np.testing.assert_array_equal(np.array(state.demux(muxed)), np.array(x))
+
+        valid = np.array(state.get_valid_object_mask())
+        self.assertEqual(valid.sum(), 7)
+
+        # add / remove objects
+        state.add_objects([7], allow_new_buckets=False)
+        self.assertEqual(state.total_valid_entries, 8)
+        state.remove_objects([2])
+        self.assertEqual(state.total_valid_entries, 7)
+
+    def test_multiplex_mask_decoder_shapes(self):
+        from mlx_vlm.models.sam3_1.config import TrackerMaskDecoderConfig
+        from mlx_vlm.models.sam3_1.sam_components import MultiplexMaskDecoder
+
+        # propagation decoder: multimask tokens only, 2 slots per bucket
+        dec = MultiplexMaskDecoder(
+            TrackerMaskDecoderConfig(
+                hidden_size=32,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                mlp_dim=64,
+                multiplex_count=2,
+                num_multimask_outputs=3,
+                multimask_outputs_only=True,
+            )
+        )
+        image_embeddings = mx.random.normal((2, 64, 32))
+        image_pe = mx.random.normal((1, 64, 32))
+        extra = mx.random.normal((2, 2, 32))
+        out = dec(
+            image_embeddings=image_embeddings,
+            image_pe=image_pe,
+            multimask_output=True,
+            extra_per_object_embeddings=extra,
+        )
+        self.assertEqual(out["masks"].shape, (2, 2, 3, 32, 32))
+        self.assertEqual(out["iou_pred"].shape, (2, 2, 3))
+        self.assertEqual(out["sam_tokens_out"].shape, (2, 2, 3, 32))
+        self.assertEqual(out["object_score_logits"].shape, (2, 2, 1))
+
+        # interactive decoder: one slot, single-mask token + 3 multimask tokens
+        dec_i = MultiplexMaskDecoder(
+            TrackerMaskDecoderConfig(
+                hidden_size=32,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                mlp_dim=64,
+                multiplex_count=1,
+                num_multimask_outputs=3,
+                multimask_outputs_only=False,
+                dynamic_multimask_via_stability=False,
+            )
+        )
+        out_i = dec_i(
+            image_embeddings=mx.random.normal((1, 64, 32)),
+            image_pe=image_pe,
+            multimask_output=True,
+            sparse_prompt_embeddings=mx.random.normal((3, 2, 32)),
+            dense_prompt_embeddings=mx.random.normal((3, 64, 32)),
+        )
+        self.assertEqual(out_i["masks"].shape, (3, 1, 3, 32, 32))
+        out_i1 = dec_i(
+            image_embeddings=mx.random.normal((1, 64, 32)),
+            image_pe=image_pe,
+            multimask_output=False,
+            sparse_prompt_embeddings=mx.random.normal((3, 2, 32)),
+            dense_prompt_embeddings=mx.random.normal((3, 64, 32)),
+        )
+        self.assertEqual(out_i1["masks"].shape, (3, 1, 1, 32, 32))
+
+    def test_track_step_modes(self):
+        """Mask-as-output init, propagation, interaction, object addition."""
+        tracker = self._make_tracker()
+        state = tracker.init_state(3, object_ids=[10, 11, 12])
+        self.assertEqual(state.multiplex_state.assignments, [[0, 1], [2, -1]])
+
+        # frame 0: mask prompts (mask-as-output)
+        masks = mx.zeros((3, 112, 112))
+        masks[0, 20:60, 20:60] = 1.0
+        masks[1, 40:80, 40:90] = 1.0
+        masks[2, 10:30, 60:100] = 1.0
+        out0 = tracker.add_mask_prompt(state, 0, self._fake_frame(tracker, 0), masks)
+        mx.eval(out0)
+        # mask-as-output: low-res is image_size / 4, high-res is image_size
+        self.assertEqual(out0["pred_masks"].shape, (3, 1, 28, 28))
+        self.assertEqual(out0["pred_masks_high_res"].shape, (3, 1, 112, 112))
+        # mask-as-output passes the input masks through as +-10 logits
+        np.testing.assert_allclose(
+            np.array(out0["pred_masks_high_res"][0, 0, 30, 30]), 10.0, atol=1e-4
+        )
+        self.assertEqual(out0["maskmem_features"].shape, (2, 8, 8, 32))
+        self.assertEqual(out0["obj_ptr"].shape, (2, 2, 32))  # muxed
+        self.assertIn(0, state.cond_frame_outputs)
+
+        # frames 1-2: memory-conditioned propagation
+        for t in (1, 2):
+            out = tracker.propagate(state, t, self._fake_frame(tracker, 10 + t))
+            mx.eval(out)
+            # decoder low-res is 4x the 8x8 feature grid
+            self.assertEqual(out["pred_masks"].shape, (3, 1, 32, 32))
+            self.assertEqual(out["pred_masks_high_res"].shape, (3, 1, 112, 112))
+            self.assertEqual(out["object_score_logits"].shape, (3, 1))
+            self.assertIn(t, state.non_cond_frame_outputs)
+
+        # frame 3: add a new object mid-video
+        ff = self._fake_frame(tracker, 13)
+        new_mask = mx.zeros((1, 112, 112))
+        new_mask[0, 5:25, 5:25] = 1.0
+        out3 = tracker.track_step(
+            state,
+            frame_idx=3,
+            is_init_cond_frame=False,
+            frame_features=ff,
+            new_object_masks=new_mask[:, None],
+            new_object_idxs=[3],
+            new_object_ids=[13],
+        )
+        mx.eval(out3)
+        self.assertEqual(state.num_objects, 4)
+        self.assertEqual(out3["pred_masks"].shape[0], 4)
+        self.assertEqual(state.multiplex_state.object_ids, [10, 11, 12, 13])
+
+        # frame 4: point interaction on top of propagation
+        pts = {
+            "point_coords": mx.array(
+                [[[40.0, 40.0]], [[60.0, 60.0]], [[80.0, 15.0]], [[15.0, 15.0]]]
+            ),
+            "point_labels": mx.ones((4, 1), mx.int32),
+        }
+        out4 = tracker.track_step(
+            state,
+            frame_idx=4,
+            is_init_cond_frame=False,
+            frame_features=self._fake_frame(tracker, 14),
+            point_inputs=pts,
+            objects_to_interact=[0, 1, 2, 3],
+        )
+        mx.eval(out4)
+        self.assertEqual(out4["pred_masks"].shape[0], 4)
+
+
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
 

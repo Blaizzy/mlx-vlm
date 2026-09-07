@@ -159,61 +159,74 @@ class Model(nn.Module):
         self.detector_model = DetectorModel(config)
         self.tracker_model = MultiplexTrackerModel(config.tracker_config)
 
-    def _get_tracker_features(self, backbone_features: mx.array):
-        """Get propagation FPN features from TriViTDetNeck for tracking."""
-        _, _, prop_features = self.detector_model.vision_encoder.neck(
+    def tracker_frame_features(
+        self,
+        backbone_features: mx.array,
+        need_interactive: bool = True,
+        need_propagation: bool = True,
+    ) -> dict:
+        """Run the interactive/propagation FPN heads and prepare the frame
+        features for the multiplex tracker (mirrors forward_image)."""
+        _, interactive_fpn, propagation_fpn = self.detector_model.vision_encoder.neck(
             backbone_features,
             need_det=False,
-            need_interactive=False,
-            need_propagation=True,
+            need_interactive=need_interactive,
+            need_propagation=need_propagation,
         )
-        return prop_features
+        frame_features = self.tracker_model.prepare_frame_features(
+            interactive_fpn if need_interactive else None,
+            propagation_fpn if need_propagation else None,
+        )
+        mx.eval(frame_features)
+        return frame_features
 
-    def tracker_neck(self, backbone_features: mx.array):
-        """Compat shim for Sam3VideoPredictor — returns propagation FPN features."""
-        return self._get_tracker_features(backbone_features)
+    def tracker_init_state(
+        self, num_objects: int, object_ids: Optional[List[int]] = None
+    ):
+        """Create a fresh multiplex tracking session state."""
+        return self.tracker_model.init_state(num_objects, object_ids=object_ids)
 
     def track_init(
         self,
         backbone_features: mx.array,
         detection_masks: mx.array,
-    ) -> Dict[str, mx.array]:
-        """Initialize tracker with detection results."""
-        prop_fpn = self._get_tracker_features(backbone_features)
-        features = prop_fpn[2]  # 1x scale (72x72)
-        B, H, W, D = features.shape
+        state=None,
+    ):
+        """Initialize a tracking session from detection masks on frame 0.
 
-        mask_input = detection_masks[:, :1].transpose(0, 2, 3, 1)  # (B, H, W, 1)
-        memory = self.tracker_model.memory_encoder(features, mask_input)
-
-        return {
-            "memory": memory.reshape(B, -1, memory.shape[-1]),
-            "features": features,
-        }
+        Returns (state, frame_output). frame_output["pred_masks_high_res"] holds
+        the (N, 1, H, W) per-object mask logits.
+        """
+        if detection_masks.ndim == 3:
+            detection_masks = detection_masks[:, None]
+        if state is None:
+            state = self.tracker_init_state(detection_masks.shape[0])
+        frame_features = self.tracker_frame_features(backbone_features)
+        out = self.tracker_model.add_mask_prompt(
+            state, 0, frame_features, detection_masks
+        )
+        mx.eval(out)
+        return state, out
 
     def track_step(
         self,
+        state,
         backbone_features: mx.array,
-        memory_bank: Optional[List[mx.array]] = None,
-        prompt_points=None,
-        prompt_boxes=None,
-        prompt_masks=None,
-        multimask_output: bool = False,
+        frame_idx: int,
+        run_mem_encoder: bool = True,
     ) -> Dict[str, mx.array]:
-        """Run one tracking step using propagation FPN."""
-        prop_fpn = self._get_tracker_features(backbone_features)
-        features = prop_fpn[2]
-        high_res = [prop_fpn[0], prop_fpn[1]] if len(prop_fpn) > 1 else None
-
-        return self.tracker_model.track_step(
-            current_features=features,
-            memory_bank=memory_bank,
-            prompt_points=prompt_points,
-            prompt_boxes=prompt_boxes,
-            prompt_masks=prompt_masks,
-            multimask_output=multimask_output,
-            high_res_features=high_res,
+        """Propagate all tracked objects to the next frame."""
+        frame_features = self.tracker_frame_features(
+            backbone_features, need_interactive=False
         )
+        out = self.tracker_model.propagate(
+            state,
+            frame_idx,
+            frame_features,
+            run_mem_encoder=run_mem_encoder,
+        )
+        mx.eval(out)
+        return out
 
     def detect(
         self,
