@@ -1,7 +1,8 @@
 """DINOv2 vision transformer (channel-last MLX port)."""
 
 import math
-from typing import List, Tuple
+import re
+from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -29,12 +30,12 @@ class PatchEmbed(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int, qkv_bias: bool = True):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim**-0.5
-        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim, bias=True)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -89,7 +90,9 @@ class Block(nn.Module):
         dim = config.embed_dim
         hidden = int(dim * config.mlp_ratio)
         self.norm1 = nn.LayerNorm(dim, eps=config.layer_norm_eps)
-        self.attn = Attention(dim, config.num_heads)
+        self.attn = Attention(
+            dim, config.num_heads, qkv_bias=getattr(config, "qkv_bias", True)
+        )
         self.ls1 = LayerScale(dim)
         self.norm2 = nn.LayerNorm(dim, eps=config.layer_norm_eps)
         ffn = getattr(config, "ffn", None) or "mlp"
@@ -112,6 +115,7 @@ class DINOv2(nn.Module):
         self.config = config
         self.embed_dim = config.embed_dim
         self.patch_size = config.patch_size
+        self.num_register_tokens = getattr(config, "num_register_tokens", 0) or 0
         self.patch_embed = PatchEmbed(
             config.img_size, config.patch_size, 3, config.embed_dim
         )
@@ -120,6 +124,11 @@ class DINOv2(nn.Module):
             (1, self.patch_embed.num_patches + 1, config.embed_dim)
         )
         self.mask_token = mx.zeros((1, config.embed_dim))
+        self.register_tokens = (
+            mx.zeros((1, self.num_register_tokens, config.embed_dim))
+            if self.num_register_tokens
+            else None
+        )
         self.blocks = [Block(config) for _ in range(config.depth)]
         self.norm = nn.LayerNorm(config.embed_dim, eps=config.layer_norm_eps)
 
@@ -131,28 +140,74 @@ class DINOv2(nn.Module):
         dim = x.shape[-1]
         class_pos_embed = self.pos_embed[:, :1]
         patch_pos_embed = self.pos_embed[:, 1:]
-        # Small offset to avoid floating point error in the interpolation
-        w0 = w // self.patch_size + self.config.interpolate_offset
-        h0 = h // self.patch_size + self.config.interpolate_offset
         sqrt_N = math.sqrt(N)
-        # (sy, sx) because the reference derives w0 from the pixel height and
-        # applies it to the W axis.
-        sx, sy = float(w0) / sqrt_N, float(h0) / sqrt_N
         patch_pos_embed = patch_pos_embed.reshape(1, int(sqrt_N), int(sqrt_N), dim)
-        patch_pos_embed = resize_bicubic_nhwc(
-            patch_pos_embed.astype(mx.float32), scale_factor=(sy, sx)
-        )
+        offset = getattr(self.config, "interpolate_offset", 0.1)
+        if offset:
+            # Small offset to avoid floating point error in the interpolation
+            w0 = w // self.patch_size + offset
+            h0 = h // self.patch_size + offset
+            # (sy, sx) because the reference derives w0 from the pixel height
+            # and applies it to the W axis.
+            sx, sy = float(w0) / sqrt_N, float(h0) / sqrt_N
+            patch_pos_embed = resize_bicubic_nhwc(
+                patch_pos_embed.astype(mx.float32), scale_factor=(sy, sx)
+            )
+        else:
+            # HF style: explicit output size instead of a scale factor
+            size = (h // self.patch_size, w // self.patch_size)
+            patch_pos_embed = resize_bicubic_nhwc(
+                patch_pos_embed.astype(mx.float32),
+                size,
+                antialias=getattr(self.config, "interpolate_antialias", False),
+            )
         patch_pos_embed = patch_pos_embed.reshape(1, -1, dim)
         return mx.concatenate([class_pos_embed, patch_pos_embed], axis=1).astype(
             x.dtype
         )
 
-    def prepare_tokens(self, x: mx.array) -> mx.array:
+    def prepare_tokens(self, x: mx.array, masks: Optional[mx.array] = None) -> mx.array:
+        """Patch embed, then add cls token, position and register tokens.
+
+        ``masks`` is an optional (B, N) bool array; masked patches are replaced
+        by the mask token before the cls token is prepended.
+        """
         B, H, W, _ = x.shape
         x = self.patch_embed(x)
+        if masks is not None:
+            x = mx.where(masks[..., None], self.mask_token.astype(x.dtype), x)
         cls = mx.broadcast_to(self.cls_token, (B, 1, self.embed_dim))
         x = mx.concatenate([cls, x], axis=1)
-        return x + self.interpolate_pos_encoding(x, H, W)
+        x = x + self.interpolate_pos_encoding(x, H, W)
+        if self.register_tokens is not None:
+            registers = mx.broadcast_to(
+                self.register_tokens, (B, self.num_register_tokens, self.embed_dim)
+            )
+            x = mx.concatenate([x[:, :1], registers, x[:, 1:]], axis=1)
+        return x
+
+    def _encode(
+        self, x: mx.array, masks: Optional[mx.array] = None
+    ) -> Tuple[mx.array, mx.array]:
+        """Run the full backbone; return (prenorm, normed) token sequences."""
+        x = self.prepare_tokens(x, masks)
+        for blk in self.blocks:
+            x = blk(x)
+        return x, self.norm(x)
+
+    def forward_features(
+        self, x: mx.array, masks: Optional[mx.array] = None
+    ) -> Dict[str, mx.array]:
+        """Full forward pass; returns the reference implementation's feature dict."""
+        x, x_norm = self._encode(x, masks)
+        r = self.num_register_tokens
+        return {
+            "x_norm_clstoken": x_norm[:, 0],
+            "x_norm_regtokens": x_norm[:, 1 : r + 1],
+            "x_norm_patchtokens": x_norm[:, r + 1 :],
+            "x_prenorm": x,
+            "masks": masks,
+        }
 
     def get_intermediate_layers(
         self, x: mx.array, indices: List[int]
@@ -164,9 +219,99 @@ class DINOv2(nn.Module):
             x = blk(x)
             if i in indices:
                 out = self.norm(x)
-                outputs.append((out[:, 1:], out[:, 0]))
+                outputs.append((out[:, 1 + self.num_register_tokens :], out[:, 0]))
         assert len(outputs) == len(indices)
         return outputs
+
+
+_HF_EMBED_KEYS = {
+    "embeddings.cls_token": "cls_token",
+    "embeddings.mask_token": "mask_token",
+    "embeddings.register_tokens": "register_tokens",
+    "embeddings.position_embeddings": "pos_embed",
+    "embeddings.patch_embeddings.projection.weight": "patch_embed.proj.weight",
+    "embeddings.patch_embeddings.projection.bias": "patch_embed.proj.bias",
+    "layernorm.weight": "norm.weight",
+    "layernorm.bias": "norm.bias",
+}
+
+_HF_BLOCK_KEYS = {
+    "attention.output.dense.weight": "attn.proj.weight",
+    "attention.output.dense.bias": "attn.proj.bias",
+    "layer_scale1.lambda1": "ls1.gamma",
+    "layer_scale2.lambda1": "ls2.gamma",
+    "norm1.weight": "norm1.weight",
+    "norm1.bias": "norm1.bias",
+    "norm2.weight": "norm2.weight",
+    "norm2.bias": "norm2.bias",
+    "mlp.fc1.weight": "mlp.fc1.weight",
+    "mlp.fc1.bias": "mlp.fc1.bias",
+    "mlp.fc2.weight": "mlp.fc2.weight",
+    "mlp.fc2.bias": "mlp.fc2.bias",
+    "mlp.weights_in.weight": "mlp.w12.weight",
+    "mlp.weights_in.bias": "mlp.w12.bias",
+    "mlp.weights_out.weight": "mlp.w3.weight",
+    "mlp.weights_out.bias": "mlp.w3.bias",
+}
+
+_HF_BLOCK_KEY = re.compile(r"encoder\.layer\.(\d+)\.(.+)")
+_HF_QKV_KEY = re.compile(r"attention\.attention\.(query|key|value)\.(weight|bias)")
+
+
+class Model(DINOv2):
+    """Standalone DINOv2 image encoder.
+
+    Loads the Hugging Face ``facebook/dinov2-*`` and
+    ``facebook/dinov2-with-registers-*`` checkpoints (HF key layout) as well
+    as checkpoints already in the original DINOv2 layout.
+    """
+
+    def __call__(
+        self, pixel_values: mx.array, bool_masked_pos: Optional[mx.array] = None
+    ) -> Dict[str, mx.array]:
+        """pixel_values: (B, H, W, C) -> dict with the normed token sequence
+        (``last_hidden_state``), the cls token (``pooler_output``), the patch
+        tokens without cls/registers, and the pre-norm sequence."""
+        x, x_norm = self._encode(pixel_values, bool_masked_pos)
+        r = self.num_register_tokens
+        return {
+            "last_hidden_state": x_norm,
+            "pooler_output": x_norm[:, 0],
+            "hidden_patch_tokens": x_norm[:, r + 1 :],
+            "x_prenorm": x,
+        }
+
+    def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+        """Rename HF ``dinov2``/``dinov2_with_registers`` keys to the backbone
+        layout. Checkpoints already in the original DINOv2 layout pass through
+        unchanged."""
+        out, qkv = {}, {}
+        for key, value in weights.items():
+            key = key.removeprefix("dinov2.")
+            if key.startswith("classifier."):
+                continue  # classification head is not part of the encoder
+            if key in _HF_EMBED_KEYS:
+                key = _HF_EMBED_KEYS[key]
+                if key == "patch_embed.proj.weight":
+                    value = value.transpose(0, 2, 3, 1)  # (O, I, H, W) -> (O, H, W, I)
+                out[key] = value
+                continue
+            match = _HF_BLOCK_KEY.fullmatch(key)
+            if match is None:
+                out[key] = value
+                continue
+            idx, rest = match.groups()
+            proj = _HF_QKV_KEY.fullmatch(rest)
+            if proj is not None:
+                name, kind = proj.groups()
+                qkv.setdefault(f"blocks.{idx}.attn.qkv.{kind}", {})[name] = value
+            else:
+                out[f"blocks.{idx}.{_HF_BLOCK_KEYS.get(rest, rest)}"] = value
+        for key, parts in qkv.items():
+            out[key] = mx.concatenate(
+                [parts["query"], parts["key"], parts["value"]], axis=0
+            )
+        return out
 
 
 class DINOv2Encoder(nn.Module):
