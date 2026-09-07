@@ -9,6 +9,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ...speculative.cache_state import start_speculative_cache
 from ..base import LanguageModelOutput
 from ..cache import ArraysCache, BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
 from ..quantized_verifier import (
@@ -1807,7 +1808,7 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
     def _inject(branch, hyper_input, injection_weights):
         return _qwen4_inject(branch, hyper_input, injection_weights)
 
-    def _ple(self, module, hidden_states, input_ids, cache, mask, ple_sink):
+    def _ple(self, module, hidden_states, input_ids, cache, mask):
         batch = input_ids.shape[0]
         embedding = module.ple_embedding
         if cache is not None and cache[3] is not None:
@@ -1851,14 +1852,16 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
         conv_input = mx.concatenate([conv_state, normed], axis=1)
         if cache is not None:
             cache[2] = mx.contiguous(conv_input[:, -module.short_conv_state_len :])
-        ple_sink.append(
-            (
+            cache.record_speculative_window(
+                2,
                 conv_input,
                 module.short_conv_state_len,
+            )
+            cache.record_speculative_window(
+                3,
                 token_history,
                 embedding.context_len,
             )
-        )
         return gated_values + nn.silu(module.conv1d(conv_input))
 
     def _qsa_attention(self, attention, hidden_states, cache, position_ids, mask):
@@ -1979,8 +1982,6 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
         mask,
         cache,
         position_ids,
-        gdn_sink,
-        ple_sink,
     ):
         if "ple" in layer:
             hidden = hidden + self._ple(
@@ -1989,14 +1990,13 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
                 input_ids,
                 cache,
                 mask,
-                ple_sink,
             )
 
         mixed, hyper_input, injection = self._hyper_connection(
             layer.attn_hyper_connection, hidden
         )
         if layer.is_linear:
-            branch = self._gated_delta(layer.linear_attn, mixed, mask, cache, gdn_sink)
+            branch = self._gated_delta(layer.linear_attn, mixed, mask, cache)
         else:
             branch = self._qsa_attention(
                 layer.self_attn,
@@ -2020,8 +2020,6 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
         cache,
         inputs_embeds,
         position_ids,
-        gdn_sink,
-        ple_sink,
     ):
         hidden = model.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         hidden = mx.tile(hidden, (1, 1, model.args.hc_count))
@@ -2038,8 +2036,6 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
                 layer_mask,
                 layer_cache,
                 position_ids,
-                gdn_sink,
-                ple_sink,
             )
             mx.async_eval(hidden)
         return hidden
@@ -2054,17 +2050,18 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
         position_ids=None,
         skip_logits=False,
     ):
-        gdn_sink = []
-        ple_sink = []
-        hidden = self._model(
-            language_model.model,
-            inputs,
-            cache,
-            inputs_embeds,
-            position_ids,
-            gdn_sink,
-            ple_sink,
-        )
+        transaction = start_speculative_cache(cache or [], inputs.shape[1])
+        try:
+            hidden = self._model(
+                language_model.model,
+                inputs,
+                cache,
+                inputs_embeds,
+                position_ids,
+            )
+        except Exception:
+            transaction.abort()
+            raise
         logits_hidden = self._hyper_connection(
             language_model.model.hyper_connection_mixer, hidden
         )
@@ -2079,7 +2076,7 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
         return LanguageModelOutput(
             logits=logits,
             hidden_states=[hidden],
-            gdn_states=(gdn_sink, ple_sink),
+            gdn_states=transaction,
             shared_kv_states={},
         )
 
@@ -2255,74 +2252,6 @@ class LanguageModel(Qwen3_5LanguageModel):
 
     def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
         return self._speculative_verify(inputs, cache, sampler)
-
-    def rollback_speculative_cache(
-        self,
-        caches,
-        rollback_state,
-        accepted,
-        block_size: int,
-    ) -> int:
-        if isinstance(accepted, int):
-            accepted_list = [accepted]
-        elif isinstance(accepted, mx.array):
-            accepted_list = [int(x) for x in accepted.reshape(-1).tolist()]
-        else:
-            accepted_list = [int(x) for x in accepted]
-        if len(set(accepted_list)) != 1:
-            raise ValueError(
-                "Qwen4-Exp MTP batched rollback requires uniform acceptance."
-            )
-
-        gdn_states, ple_states = rollback_state
-        accepted_value = accepted_list[0]
-        result = super().rollback_speculative_cache(
-            caches,
-            gdn_states,
-            accepted_list,
-            block_size,
-        )
-
-        ple_caches = [
-            cache
-            for cache in caches
-            if isinstance(cache, ArraysCache) and len(cache.state) > 2
-        ]
-        if len(ple_caches) != len(ple_states):
-            raise RuntimeError(
-                "Qwen4-Exp verifier did not capture every PLE rollback state."
-            )
-        for cache, state in zip(ple_caches, ple_states):
-            conv_input, conv_state_len, token_history, context_len = state
-            keep = accepted_value + 1
-            cache[2] = mx.contiguous(conv_input[:, keep : keep + conv_state_len])
-            history_end = context_len + keep
-            cache[3] = mx.contiguous(
-                token_history[:, history_end - context_len : history_end]
-            )
-
-        rejected = block_size - (accepted_value + 1)
-        if rejected:
-            for cache in caches:
-                if not isinstance(cache, ArraysCache):
-                    continue
-                cache._left_padding_advance = max(
-                    0, cache._left_padding_advance - rejected
-                )
-                cache._lengths_advance = max(0, cache._lengths_advance - rejected)
-                left_info = getattr(cache, "_qwen3_5_left_padding_info", None)
-                if left_info is not None:
-                    source, pads, _ = left_info
-                    pads = tuple(pad + rejected for pad in pads)
-                    cache._qwen3_5_left_padding_info = (source, pads, max(pads))
-                lengths_info = getattr(cache, "_qwen3_5_lengths_info", None)
-                if lengths_info is not None:
-                    source, minimum = lengths_info
-                    cache._qwen3_5_lengths_info = (
-                        source,
-                        minimum + rejected,
-                    )
-        return result
 
     def make_cache(self):
         caches = []

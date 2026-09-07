@@ -3,6 +3,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ...speculative.cache_state import start_speculative_cache
 from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
@@ -329,7 +330,7 @@ class Qwen3_5BatchInvariantForward:
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
         return q, k
 
-    def _gated_delta(self, layer, inputs, mask, cache, gdn_sink):
+    def _gated_delta(self, layer, inputs, mask, cache):
         helpers = self._helpers()
         batch, length, _ = inputs.shape
         mixed_qkv, z, b, a = self._linears(
@@ -381,7 +382,6 @@ class Qwen3_5BatchInvariantForward:
             state = None
         q, k = self._normalize_gated_delta_qk(layer, q, k)
 
-        initial_state = state
         output, state, intermediate_states = gated_delta_update_with_states(
             q,
             k,
@@ -395,25 +395,15 @@ class Qwen3_5BatchInvariantForward:
             use_kernel=not layer.training,
             state_steps=length - 1,
         )
-        gdn_sink.append(
-            (
-                q,
-                k,
-                v,
-                a,
-                b,
-                layer.A_log,
-                layer.dt_bias,
-                initial_state,
-                mask,
-                conv_input,
-                layer.conv_kernel_size,
-                intermediate_states,
-            )
-        )
 
         if cache is not None:
             cache[1] = state
+            cache.record_speculative_window(
+                0,
+                conv_input,
+                layer.conv_kernel_size - 1,
+            )
+            cache.record_speculative_states(1, intermediate_states, state)
             if hasattr(cache, "advance"):
                 cache.advance(length)
                 helpers._qwen3_5_advance_left_padding_info(cache, length)
@@ -430,7 +420,6 @@ class Qwen3_5BatchInvariantForward:
         cache,
         position_ids,
         position_embeddings,
-        gdn_sink,
     ):
         normed = layer.input_layernorm(hidden)
         if layer.is_linear:
@@ -439,7 +428,6 @@ class Qwen3_5BatchInvariantForward:
                 normed,
                 mask,
                 cache,
-                gdn_sink,
             )
         else:
             residual = self._attention(
@@ -465,7 +453,6 @@ class Qwen3_5BatchInvariantForward:
         position_ids,
         capture_layer_ids,
         hidden_sink,
-        gdn_sink,
     ):
         helpers = self._helpers()
         hidden = model.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
@@ -503,7 +490,6 @@ class Qwen3_5BatchInvariantForward:
                 layer_cache,
                 position_ids,
                 position_embeddings,
-                gdn_sink,
             )
             if hidden_sink is not None and index in capture_set:
                 hidden_sink.append(hidden)
@@ -526,17 +512,20 @@ class Qwen3_5BatchInvariantForward:
         hidden_sink: list[mx.array] | None = (
             [] if capture_layer_ids is not None else None
         )
-        gdn_sink: list = []
-        hidden = self._model(
-            language_model.model,
-            inputs,
-            cache,
-            inputs_embeds,
-            position_ids,
-            capture_layer_ids,
-            hidden_sink,
-            gdn_sink,
-        )
+        transaction = start_speculative_cache(cache or [], inputs.shape[1])
+        try:
+            hidden = self._model(
+                language_model.model,
+                inputs,
+                cache,
+                inputs_embeds,
+                position_ids,
+                capture_layer_ids,
+                hidden_sink,
+            )
+        except Exception:
+            transaction.abort()
+            raise
         if return_hidden:
             if hidden_sink is None:
                 hidden_sink = []
@@ -554,7 +543,7 @@ class Qwen3_5BatchInvariantForward:
         return LanguageModelOutput(
             logits=logits,
             hidden_states=hidden_sink,
-            gdn_states=gdn_sink,
+            gdn_states=transaction,
             shared_kv_states={} if return_shared_kv else None,
         )
 

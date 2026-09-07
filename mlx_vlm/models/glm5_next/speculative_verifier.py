@@ -2,11 +2,14 @@ from typing import Any, Callable, List, Optional
 
 import mlx.core as mx
 
-from ...speculative.cache_state import restore_cache_state, snapshot_cache_state
+from ...speculative.cache_state import (
+    restore_cache_state,
+    snapshot_cache_state,
+    start_speculative_cache,
+)
 from ..base import LanguageModelOutput, create_ssm_mask, scaled_dot_product_attention
 from ..deepseek_v4.hyper_connection import _hc_kernel, hc_expand
 from ..exact_speculative_verify import exact_speculative_verify_weight
-from ..gated_delta import gated_delta_update
 from ..quantized_verifier import (
     DEFAULT_QUANTIZED_VERIFIER,
     exact_quantized_linear,
@@ -196,19 +199,16 @@ class Glm5NextSpeculativeVerifier:
         return combine_moe_outputs(routed, weights, shared)
 
     def _linear_attention(self, attention, inputs, mask, cache):
-        updates = []
-        output = attention(
+        return attention(
             inputs,
             mask,
             cache,
-            rollback_sink=updates,
             linear_fn=self._block_linear,
             output_linear_fn=self._block_linear,
             timewise_fn=self._timewise,
             output_gate_fn=self._linear_output_gate_timewise,
             scaled_norm_fn=scaled_rms_norm,
         )
-        return output, updates[0]
 
     @staticmethod
     def _linear_output_gate_timewise(norm, output, gate):
@@ -615,13 +615,13 @@ class Glm5NextSpeculativeVerifier:
             hidden,
         )
         if layer.block_type == "linear_attention":
-            collapsed, linear_update = self._linear_attention(
+            collapsed = self._linear_attention(
                 layer.self_attn,
                 collapsed,
                 mask,
                 cache,
             )
-            rollback_sink.append(linear_update)
+            rollback_sink.append(None)
             topk = prev_topk_indices
         else:
             collapsed, topk, sparse_update = self._sparse_attention(
@@ -725,19 +725,24 @@ class Glm5NextSpeculativeVerifier:
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
     ):
         cache_snapshot = snapshot_cache_state(cache, inputs.shape[1])
+        transaction = start_speculative_cache(cache, inputs.shape[1])
         hidden_sink = []
         rollback_updates = []
-        output = self(
-            language_model,
-            inputs,
-            cache=cache,
-            hidden_sink=hidden_sink,
-            rollback_sink=rollback_updates,
-            return_shared_kv=True,
-            skip_logits=True,
-        )
+        try:
+            output = self(
+                language_model,
+                inputs,
+                cache=cache,
+                hidden_sink=hidden_sink,
+                rollback_sink=rollback_updates,
+                return_shared_kv=True,
+                skip_logits=True,
+            )
+        except Exception:
+            transaction.abort()
+            raise
         hidden = output.hidden_states[-1]
-        rollback_state = (cache_snapshot, rollback_updates)
+        rollback_state = (cache_snapshot, rollback_updates, transaction)
         if sampler is None:
             return hidden, {}, rollback_state
         return (
@@ -810,122 +815,6 @@ class Glm5NextSpeculativeVerifier:
             for entry in touched:
                 self._finalize_cache(entry)
 
-    @staticmethod
-    def _initial_linear_state(update):
-        q, _k, v, *_rest = update
-        initial_state = update[7]
-        if initial_state is not None:
-            return initial_state
-        batch = q.shape[0]
-        heads, value_dim = v.shape[-2:]
-        key_dim = q.shape[-1]
-        return mx.zeros(
-            (batch, heads, value_dim, key_dim),
-            dtype=mx.float32,
-        )
-
-    def _replay_linear_caches(self, entries, valid_lengths, keep):
-        if not entries:
-            return
-
-        if all(
-            len(update) > 13 and update[12] is not None and update[13] is not None
-            for _cache, update in entries
-        ):
-            indices = mx.array(valid_lengths, dtype=mx.int32) - 1
-            for cache, update in entries:
-                conv_states = update[12]
-                ssm_states = update[13]
-                conv_indices = indices.reshape(
-                    indices.shape[0], 1, *([1] * (conv_states.ndim - 2))
-                )
-                ssm_indices = indices.reshape(
-                    indices.shape[0], 1, *([1] * (ssm_states.ndim - 2))
-                )
-                cache[0] = mx.take_along_axis(
-                    conv_states,
-                    conv_indices,
-                    axis=1,
-                ).squeeze(1)
-                cache[1] = cache[2] = None
-                cache[3] = mx.take_along_axis(
-                    ssm_states,
-                    ssm_indices,
-                    axis=1,
-                ).squeeze(1)
-                self._finalize_cache(cache)
-            return
-
-        batch = len(valid_lengths)
-        valid = mx.arange(keep)[None] < mx.array(valid_lengths, dtype=mx.int32)[:, None]
-        q_parts, k_parts, v_parts, a_parts, b_parts = [], [], [], [], []
-        A_log_parts, dt_bias_parts, state_parts, mask_parts = [], [], [], []
-        lower_bounds = []
-
-        for _cache, update in entries:
-            q, k, v, a, b, A_log, dt_bias, *_ = update
-            q_parts.append(q[:, :keep])
-            k_parts.append(k[:, :keep])
-            v_parts.append(v[:, :keep])
-            a_parts.append(a[:, :keep])
-            b_parts.append(b[:, :keep])
-            A_log_parts.append(
-                mx.broadcast_to(
-                    A_log[None, None],
-                    (batch, 1, *A_log.shape),
-                )
-            )
-            dt_bias_parts.append(
-                mx.broadcast_to(
-                    dt_bias[None, None],
-                    (batch, 1, *dt_bias.shape),
-                )
-            )
-            state_parts.append(self._initial_linear_state(update))
-            layer_mask = update[8]
-            if layer_mask is None:
-                layer_mask = valid
-            else:
-                layer_mask = layer_mask[:, :keep] & valid
-            mask_parts.append(layer_mask)
-            lower_bounds.append(update[11])
-
-        if len(set(lower_bounds)) != 1:
-            raise ValueError("GLM Gated Delta layers must share a lower bound.")
-
-        _output, states = gated_delta_update(
-            mx.concatenate(q_parts, axis=0),
-            mx.concatenate(k_parts, axis=0),
-            mx.concatenate(v_parts, axis=0),
-            mx.concatenate(a_parts, axis=0),
-            mx.concatenate(b_parts, axis=0),
-            mx.concatenate(A_log_parts, axis=0),
-            mx.concatenate(dt_bias_parts, axis=0),
-            state=mx.concatenate(state_parts, axis=0),
-            mask=mx.concatenate(mask_parts, axis=0),
-            use_kernel=True,
-            lower_bound=lower_bounds[0],
-        )
-
-        offset = 0
-        for cache, update in entries:
-            conv_input = update[9]
-            kernel_size = int(update[10])
-            cache[0] = mx.concatenate(
-                [
-                    conv_input[
-                        row : row + 1,
-                        length : length + kernel_size - 1,
-                    ]
-                    for row, length in enumerate(valid_lengths)
-                ],
-                axis=0,
-            )
-            cache[1] = cache[2] = None
-            cache[3] = states[offset : offset + batch]
-            offset += batch
-            self._finalize_cache(cache)
-
     def rollback(
         self,
         language_model,
@@ -942,24 +831,21 @@ class Glm5NextSpeculativeVerifier:
         else:
             accepted_values = [int(value) for value in accepted]
 
-        cache_snapshot, rollback_updates = rollback_state
+        cache_snapshot, rollback_updates, transaction = rollback_state
         restore_cache_state(caches, cache_snapshot)
         valid_lengths = [value + 1 for value in accepted_values]
         keep = max(valid_lengths, default=0)
         if not keep:
             return 0
 
-        linear_entries = []
         for layer, cache, update in zip(
             language_model.model.layers,
             caches,
             rollback_updates,
         ):
-            if layer.block_type == "linear_attention":
-                linear_entries.append((cache, update))
-            else:
+            if layer.block_type != "linear_attention":
                 self._replay_attention_cache(cache, update, valid_lengths, keep)
-        self._replay_linear_caches(linear_entries, valid_lengths, keep)
+        transaction.commit(valid_lengths)
         return max(accepted_values)
 
 

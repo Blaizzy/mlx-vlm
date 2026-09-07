@@ -242,7 +242,6 @@ class Glm5NextLinearAttention(nn.Module):
         x,
         mask=None,
         cache=None,
-        rollback_sink=None,
         linear_fn=None,
         output_linear_fn=None,
         timewise_fn=None,
@@ -284,9 +283,9 @@ class Glm5NextLinearAttention(nn.Module):
             qkv_state,
             mask,
             lengths,
-            return_input=rollback_sink is not None,
+            return_input=cache is not None and cache.is_speculating,
         )
-        if rollback_sink is None:
+        if cache is None or not cache.is_speculating:
             qkv, qkv_state = qkv_out
             conv_input = None
         else:
@@ -309,7 +308,6 @@ class Glm5NextLinearAttention(nn.Module):
         )
         a = linear_fn(self.f_b_proj, f_a).reshape(shape)
         b = b.reshape(batch, length, self.num_heads)
-        initial_state = ssm_state
         delta_output = gated_delta_update(
             q,
             k,
@@ -323,46 +321,25 @@ class Glm5NextLinearAttention(nn.Module):
             use_kernel=not self.training,
             lower_bound=self.lower_bound,
             state_steps=(
-                length - 1 if rollback_sink is not None and length > 1 else None
+                length - 1
+                if cache is not None and cache.is_speculating and length > 1
+                else None
             ),
         )
-        if rollback_sink is None or length <= 1:
+        if cache is None or not cache.is_speculating or length <= 1:
             out, ssm_state = delta_output
             intermediate_states = None
         else:
             out, ssm_state, intermediate_states = delta_output
-        if rollback_sink is not None:
-            conv_states = (
-                None
-                if length <= 1
-                else mx.stack(
-                    [
-                        conv_input[:, position + 1 : position + self.conv_kernel]
-                        for position in range(length - 1)
-                    ],
-                    axis=1,
-                )
-            )
-            rollback_sink.append(
-                (
-                    q,
-                    k,
-                    v,
-                    a,
-                    b,
-                    self.A_log.reshape(self.num_heads, 1),
-                    self.dt_bias.reshape(self.num_heads, self.head_dim),
-                    initial_state,
-                    mask,
-                    conv_input,
-                    self.conv_kernel,
-                    self.lower_bound,
-                    conv_states,
-                    intermediate_states,
-                )
-            )
         if cache is not None:
             cache[3] = ssm_state
+            if cache.is_speculating:
+                cache.record_speculative_window(
+                    0,
+                    conv_input,
+                    self.conv_kernel - 1,
+                )
+                cache.record_speculative_states(3, intermediate_states, ssm_state)
             cache.advance(length)
 
         gate = linear_fn(self.g_b_proj, g_a).reshape(shape)

@@ -270,9 +270,112 @@ def iter_leaf_caches(caches: Iterable[Any]):
             yield cache
 
 
+class SpeculativeCacheTransaction:
+    """A bounded transaction over caches that retain temporal state."""
+
+    def __init__(self, entries, length: int):
+        self._entries = entries
+        self.length = int(length)
+        self._active = True
+
+    @property
+    def active(self):
+        return self._active
+
+    def commit(self, lengths) -> None:
+        if not self._active:
+            raise RuntimeError("Speculative cache transaction is no longer active.")
+        for cache, generation in self._entries:
+            cache.validate_speculation(lengths, generation)
+        for cache, generation in self._entries:
+            cache.commit_speculation(lengths, generation)
+        self._active = False
+
+    def abort(self) -> None:
+        if not self._active:
+            return
+        for cache, generation in self._entries:
+            cache.abort_speculation(generation)
+        self._active = False
+
+
+def start_speculative_cache(caches: Iterable[Any], length: int):
+    """Start a temporal transaction on every capable cache in ``caches``."""
+    entries = []
+    for cache in iter_leaf_caches(caches):
+        start = getattr(cache, "start_speculation", None)
+        if callable(start):
+            entries.append((cache, start(length)))
+    return SpeculativeCacheTransaction(entries, length)
+
+
+def rollback_speculative_cache(
+    caches: Iterable[Any],
+    transaction: SpeculativeCacheTransaction,
+    accepted,
+    block_size: int,
+) -> int:
+    """Commit accepted prefixes and rewind ordinary append-only caches."""
+    if isinstance(accepted, int):
+        accepted_values = [int(accepted)]
+    elif isinstance(accepted, mx.array):
+        accepted_values = [int(value) for value in accepted.reshape(-1).tolist()]
+    else:
+        accepted_values = [int(value) for value in accepted]
+
+    max_accepted = max(accepted_values)
+    retained = [value + 1 for value in accepted_values]
+    trim = int(block_size) - (max_accepted + 1)
+    is_batch = len(accepted_values) > 1
+    right_padding = [max_accepted - value for value in accepted_values]
+    has_ragged_tail = is_batch and any(right_padding)
+
+    for cache in caches:
+        if cache is None or isinstance(cache, ArraysCache):
+            continue
+        if not cache.is_trimmable():
+            raise RuntimeError(
+                f"{type(cache).__name__} cannot roll back a speculative block."
+            )
+        if trim > 0:
+            cache.trim(trim)
+
+        right_trimmed = False
+        if has_ragged_tail:
+            prepare = getattr(cache, "prepare", None)
+            finalize = getattr(cache, "finalize", None)
+            if (
+                getattr(cache, "keys", None) is not None
+                and callable(prepare)
+                and callable(finalize)
+            ):
+                prepare(right_padding=right_padding)
+                finalize()
+                right_trimmed = True
+        if (
+            has_ragged_tail
+            and not right_trimmed
+            and hasattr(cache, "_idx")
+            and getattr(cache, "keys", None) is not None
+        ):
+            raise RuntimeError(
+                "Batched speculative rollback requires uniform acceptance or "
+                "a cache with per-row tail trimming; got "
+                f"{type(cache).__name__}."
+            )
+
+    commit = getattr(transaction, "commit", None)
+    if callable(commit):
+        commit(retained)
+    return max_accepted
+
+
 __all__ = [
+    "SpeculativeCacheTransaction",
     "iter_leaf_caches",
     "needs_replay_snapshot_for_cache",
+    "rollback_speculative_cache",
     "restore_cache_state",
     "snapshot_cache_state",
+    "start_speculative_cache",
 ]

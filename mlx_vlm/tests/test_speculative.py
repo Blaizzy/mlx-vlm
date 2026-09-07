@@ -225,39 +225,6 @@ def test_speculative_sampler_rng_async_evals_greedy_draft_call_state(monkeypatch
     assert calls[0][1] is state_array
 
 
-def _make_conv_input(batch_size: int, layer_offset: int, length: int = 5) -> mx.array:
-    rows = []
-    for row in range(batch_size):
-        rows.append([[layer_offset * 100 + row * 10 + t] for t in range(length)])
-    return mx.array(rows, dtype=mx.float32)
-
-
-def _make_gdn_state(
-    batch_size: int, layer_offset: int, *, init_state: mx.array | None
-) -> tuple:
-    q = mx.full((batch_size, 3, 3, 4), layer_offset + 0.1, dtype=mx.float32)
-    k = mx.full((batch_size, 3, 3, 4), layer_offset + 0.2, dtype=mx.float32)
-    v = mx.full((batch_size, 3, 3, 5), layer_offset + 0.3, dtype=mx.float32)
-    a = mx.full((batch_size, 3, 3), layer_offset + 0.4, dtype=mx.float32)
-    b = mx.full((batch_size, 3, 3), layer_offset + 0.5, dtype=mx.float32)
-    A_log = mx.full((3,), layer_offset + 0.6, dtype=mx.float32)
-    dt_bias = mx.full((3,), layer_offset + 0.7, dtype=mx.float32)
-    conv_input = _make_conv_input(batch_size, layer_offset)
-    return (
-        q,
-        k,
-        v,
-        a,
-        b,
-        A_log,
-        dt_bias,
-        init_state,
-        None,
-        conv_input,
-        4,
-    )
-
-
 def _make_drafter_dir(
     tmp_path: Path, model_type: str | None, extra: dict | None = None
 ) -> Path:
@@ -340,161 +307,74 @@ def test_gemma4_rollback_speculative_cache_accepts_python_list():
     assert cache.trims == [1]
 
 
-def test_qwen_rollback_speculative_cache_flattens_batch_per_layer():
-    batch_size = 2
-    accepted = mx.array([0, 1], dtype=mx.int32)
-    caches = [ArraysCache(size=2), ArraysCache(size=2)]
-    state0 = mx.full((batch_size, 3, 5, 4), 10.0, dtype=mx.float32)
-    state1 = mx.full((batch_size, 3, 5, 4), 20.0, dtype=mx.float32)
-    gdn_states = [
-        _make_gdn_state(batch_size, 0, init_state=state0),
-        _make_gdn_state(batch_size, 1, init_state=state1),
-    ]
-    captured = {}
-
-    def fake_gated_delta_state_update(
-        k, v, a, b, A_log, dt_bias, state, steps, mask, use_kernel=True
-    ):
-        del v, a, b, use_kernel
-        captured["k_shape"] = k.shape
-        captured["A_log_shape"] = A_log.shape
-        captured["dt_bias_shape"] = dt_bias.shape
-        captured["steps"] = steps
-        captured["mask"] = mask
-        row_ids = mx.arange(state.shape[0], dtype=mx.float32).reshape(-1, 1, 1, 1)
-        return mx.broadcast_to(row_ids, state.shape)
-
-    with patch.object(
-        qwen_language,
-        "gated_delta_state_update",
-        side_effect=fake_gated_delta_state_update,
-    ):
-        max_a = qwen_language.LanguageModel.rollback_speculative_cache(
-            SimpleNamespace(), caches, gdn_states, accepted, block_size=3
-        )
-
-    assert max_a == 1
-    assert captured["k_shape"] == (4, 2, 3, 4)
-    assert captured["A_log_shape"] == (4, 1, 3)
-    assert captured["dt_bias_shape"] == (4, 1, 3)
-    assert captured["steps"].tolist() == [1, 2, 1, 2]
-    assert captured["mask"] is None
-    assert caches[0][1][:, 0, 0, 0].tolist() == [0.0, 1.0]
-    assert caches[1][1][:, 0, 0, 0].tolist() == [2.0, 3.0]
-    assert caches[0][0][:, :, 0].tolist() == [[1.0, 2.0, 3.0], [12.0, 13.0, 14.0]]
-    assert caches[1][0][:, :, 0].tolist() == [
-        [101.0, 102.0, 103.0],
-        [112.0, 113.0, 114.0],
-    ]
-
-
-def test_qwen_rollback_speculative_cache_uses_intermediate_states():
-    batch_size = 2
-    accepted = mx.array([0, 1], dtype=mx.int32)
-    caches = [ArraysCache(size=2)]
-    state = mx.arange(batch_size * 3 * 3 * 5 * 4, dtype=mx.float32).reshape(
-        batch_size, 3, 3, 5, 4
+@pytest.mark.parametrize("batch", [1, 4, 17, 64])
+def test_arrays_cache_commits_temporal_states_for_any_batch(batch):
+    total, width = 4, 3
+    cache = ArraysCache(size=2)
+    initial_window = mx.arange(batch * width * 2, dtype=mx.float32).reshape(
+        batch, width, 2
     )
-    gdn_states = [_make_gdn_state(batch_size, 0, init_state=None) + (state,)]
+    initial_state = mx.arange(batch * 2 * 3, dtype=mx.float32).reshape(batch, 2, 3)
+    cache[0] = initial_window
+    cache[1] = initial_state
 
-    with patch.object(
-        qwen_language,
-        "gated_delta_state_update",
-        side_effect=AssertionError("state replay should not run"),
-    ):
-        max_a = qwen_language.LanguageModel.rollback_speculative_cache(
-            SimpleNamespace(), caches, gdn_states, accepted, block_size=3
-        )
+    transaction = speculative_cache_state.start_speculative_cache([cache], total)
+    appended = mx.arange(batch * total * 2, dtype=mx.float32).reshape(batch, total, 2)
+    window_source = mx.concatenate([initial_window, appended], axis=1)
+    intermediate = mx.stack([initial_state + step for step in range(1, total)], axis=1)
+    final_state = initial_state + total
+    cache[0] = window_source[:, total : total + width]
+    cache[1] = final_state
+    cache.record_speculative_window(0, window_source, width)
+    cache.record_speculative_states(1, intermediate, final_state)
 
-    assert max_a == 1
-    expected_state = mx.stack([state[0, 0], state[1, 1]])
-    assert caches[0][1].tolist() == expected_state.tolist()
-    assert caches[0][0][:, :, 0].tolist() == [
-        [1.0, 2.0, 3.0],
-        [12.0, 13.0, 14.0],
-    ]
-
-
-def test_qwen_gated_delta_accept_states_matches_python_gather():
-    accepted = mx.array([0, 2, 1, 3], dtype=mx.int32)
-    intermediate_states = mx.arange(4 * 4 * 2 * 3 * 5, dtype=mx.float32).reshape(
-        4, 4, 2, 3, 5
+    lengths = [(row % total) + 1 for row in range(batch)]
+    transaction.commit(lengths)
+    expected_window = mx.stack(
+        [window_source[row, keep : keep + width] for row, keep in enumerate(lengths)]
     )
-    conv_input = mx.arange(4 * 7 * 6, dtype=mx.float32).reshape(4, 7, 6)
-    live_state = mx.full((4, 2, 3, 5), -1.0, dtype=mx.float32)
-    live_conv = mx.full((4, 3, 6), -2.0, dtype=mx.float32)
-
-    ref_state, ref_conv = qwen_language.gated_delta_accept_states(
-        intermediate_states,
-        conv_input,
-        live_state,
-        live_conv,
-        accepted,
-        kernel_size=4,
-        use_kernel=False,
+    expected_state = mx.stack(
+        [initial_state[row] + keep for row, keep in enumerate(lengths)]
     )
-    out_state, out_conv = qwen_language.gated_delta_accept_states(
-        intermediate_states,
-        conv_input,
-        live_state,
-        live_conv,
-        accepted,
-        kernel_size=4,
-        use_kernel=True,
-    )
-    mx.eval(ref_state, ref_conv, out_state, out_conv)
+    mx.eval(cache.state, expected_window, expected_state)
 
-    assert bool(mx.array_equal(ref_state, out_state).item())
-    assert bool(mx.array_equal(ref_conv, out_conv).item())
+    assert mx.array_equal(cache[0], expected_window).item()
+    assert mx.array_equal(cache[1], expected_state).item()
+    assert not cache.is_speculating
 
 
-def test_qwen_gated_delta_accept_states_uses_live_state_after_last_saved_step():
-    intermediate_states = mx.zeros((1, 2, 2, 3, 5), dtype=mx.float32)
-    conv_input = mx.zeros((1, 5, 6), dtype=mx.float32)
-    live_state = mx.full((1, 2, 3, 5), 7.0, dtype=mx.float32)
-    live_conv = mx.full((1, 3, 6), 8.0, dtype=mx.float32)
+def test_arrays_cache_transaction_handles_boundaries_abort_and_stale_commit():
+    cache = ArraysCache(size=1)
+    initial = mx.arange(6, dtype=mx.float32).reshape(2, 3)
+    cache[0] = initial
 
-    state, conv = qwen_language.gated_delta_accept_states(
-        intermediate_states,
-        conv_input,
-        live_state,
-        live_conv,
-        mx.array([2], dtype=mx.int32),
-        kernel_size=4,
-    )
-    mx.eval(state, conv)
+    transaction = speculative_cache_state.start_speculative_cache([cache], 3)
+    intermediate = mx.stack([initial + 1, initial + 2], axis=1)
+    final = initial + 3
+    cache[0] = final
+    cache.record_speculative_states(0, intermediate, final)
+    transaction.commit([0, 3])
+    assert cache[0].tolist() == [initial[0].tolist(), final[1].tolist()]
 
-    assert bool(mx.array_equal(state, live_state).item())
-    assert bool(mx.array_equal(conv, live_conv).item())
+    stale = speculative_cache_state.start_speculative_cache([cache], 2)
+    current = speculative_cache_state.start_speculative_cache([cache], 2)
+    with pytest.raises(RuntimeError, match="stale"):
+        stale.commit([1, 1])
+    current.abort()
+    assert not cache.is_speculating
 
-
-def test_qwen_rollback_speculative_cache_zero_inits_missing_state():
-    accepted = mx.array([1, 0], dtype=mx.int32)
-    caches = [ArraysCache(size=2)]
-    gdn_states = [_make_gdn_state(batch_size=2, layer_offset=0, init_state=None)]
-    captured = {}
-
-    def fake_gated_delta_state_update(
-        k, v, a, b, A_log, dt_bias, state, steps, mask, use_kernel=True
-    ):
-        del k, v, a, b, A_log, dt_bias, steps, mask, use_kernel
-        captured["state"] = state
-        return state
-
-    with patch.object(
-        qwen_language,
-        "gated_delta_state_update",
-        side_effect=fake_gated_delta_state_update,
-    ):
-        qwen_language.LanguageModel.rollback_speculative_cache(
-            SimpleNamespace(), caches, gdn_states, accepted, block_size=3
-        )
-
-    assert captured["state"].shape == (2, 3, 5, 4)
-    assert float(mx.sum(mx.abs(captured["state"])).item()) == 0.0
+    missing = speculative_cache_state.start_speculative_cache([cache], 2)
+    before = cache[0]
+    cache[0] = before + 1
+    cache._qwen3_5_lengths_info = (mx.array([3, 3]), 3)
+    with pytest.raises(RuntimeError, match="without temporal records"):
+        missing.commit([1, 1])
+    missing.abort()
+    assert cache[0] is before
+    assert not hasattr(cache, "_qwen3_5_lengths_info")
 
 
-def test_qwen_gdn_sink_captures_intermediate_states_for_batched_verify():
+def test_qwen_gdn_cache_captures_intermediate_states_for_batched_verify():
     config = SimpleNamespace(
         hidden_size=16,
         linear_num_value_heads=2,
@@ -505,7 +385,6 @@ def test_qwen_gdn_sink_captures_intermediate_states_for_batched_verify():
         rms_norm_eps=1e-6,
     )
     layer = qwen_language.Qwen3_5GatedDeltaNet(config)
-    sink = []
 
     def fake_update(
         q,
@@ -529,6 +408,8 @@ def test_qwen_gdn_sink_captures_intermediate_states_for_batched_verify():
         return out, next_state, states
 
     verifier = qwen_verifier.Qwen3_5ExactSpeculativeVerifier()
+    cache = ArraysCache(size=2)
+    cache.start_speculation(3)
     with patch.object(
         qwen_verifier, "gated_delta_update_with_states", side_effect=fake_update
     ):
@@ -536,16 +417,17 @@ def test_qwen_gdn_sink_captures_intermediate_states_for_batched_verify():
             layer,
             mx.zeros((2, 3, 16), dtype=mx.float32),
             None,
-            ArraysCache(size=2),
-            sink,
+            cache,
         )
 
     mx.eval(out)
     assert out.shape == (2, 3, 16)
-    assert sink[0][11].shape == (2, 2, 2, 4, 4)
+    assert cache._speculation["records"][1][1].shape == (2, 2, 2, 4, 4)
+    cache.commit_speculation([1, 2])
+    assert cache[1].shape == (2, 2, 4, 4)
 
 
-def test_qwen_gdn_sink_captures_intermediate_states_for_singleton_verify():
+def test_qwen_gdn_cache_captures_intermediate_states_for_singleton_verify():
     config = SimpleNamespace(
         hidden_size=16,
         linear_num_value_heads=2,
@@ -556,7 +438,6 @@ def test_qwen_gdn_sink_captures_intermediate_states_for_singleton_verify():
         rms_norm_eps=1e-6,
     )
     layer = qwen_language.Qwen3_5GatedDeltaNet(config)
-    sink = []
 
     def fake_update(
         q,
@@ -580,6 +461,8 @@ def test_qwen_gdn_sink_captures_intermediate_states_for_singleton_verify():
         return out, next_state, states
 
     verifier = qwen_verifier.Qwen3_5ExactSpeculativeVerifier()
+    cache = ArraysCache(size=2)
+    cache.start_speculation(3)
     with patch.object(
         qwen_verifier, "gated_delta_update_with_states", side_effect=fake_update
     ):
@@ -587,13 +470,14 @@ def test_qwen_gdn_sink_captures_intermediate_states_for_singleton_verify():
             layer,
             mx.zeros((1, 3, 16), dtype=mx.float32),
             None,
-            ArraysCache(size=2),
-            sink,
+            cache,
         )
 
     mx.eval(out)
     assert out.shape == (1, 3, 16)
-    assert sink[0][11].shape == (1, 2, 2, 4, 4)
+    assert cache._speculation["records"][1][1].shape == (1, 2, 2, 4, 4)
+    cache.commit_speculation(2)
+    assert cache[1].shape == (1, 2, 4, 4)
 
 
 def test_qwen_gdn_verify_update_matches_stepwise_path():
@@ -4607,19 +4491,15 @@ def test_glm5_next_target_rollback_restores_ragged_rows_without_model_replay():
     _, _, rollback_state = language.speculative_verify_hidden(
         mx.array([[5, 6], [7, 8]], dtype=mx.int32), cache
     )
-    linear_update = rollback_state[1][0]
-    assert linear_update[12].shape[1] == 1
-    assert linear_update[13].shape[1] == 1
-    with (
-        patch.object(
-            glm5_next_language.LanguageModel,
-            "__call__",
-            side_effect=AssertionError("rollback must not replay the target model"),
-        ),
-        patch(
-            "mlx_vlm.models.glm5_next.speculative_verifier.gated_delta_update",
-            side_effect=AssertionError("rollback must select captured GDN states"),
-        ),
+    transaction = rollback_state[2]
+    assert transaction.active
+    records = cache[0]._speculation["records"]
+    assert records[0][0] == "window"
+    assert records[3][1].shape[1] == 1
+    with patch.object(
+        glm5_next_language.LanguageModel,
+        "__call__",
+        side_effect=AssertionError("rollback must not replay the target model"),
     ):
         language.rollback_speculative_cache(
             cache, rollback_state, accepted=[1, 0], block_size=2

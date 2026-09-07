@@ -4,6 +4,9 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ...speculative.cache_state import (
+    rollback_speculative_cache as rollback_cache_transaction,
+)
 from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
@@ -14,11 +17,7 @@ from ..cache import ArraysCache, KVCache
 from ..rope_utils import MRoPERotaryEmbedding
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
 from .config import ModelConfig, TextConfig
-from .gated_delta import (
-    gated_delta_accept_states,
-    gated_delta_state_update,
-    gated_delta_update,
-)
+from .gated_delta import gated_delta_update
 from .speculative_verifier import Qwen3_5ExactSpeculativeVerifier
 
 _EXACT_SPECULATIVE_VERIFIER = Qwen3_5ExactSpeculativeVerifier()
@@ -1448,286 +1447,16 @@ class LanguageModel(nn.Module):
     def rollback_speculative_cache(
         self,
         caches: List[Any],
-        gdn_states: List,
+        rollback_state,
         accepted,
         block_size: int,
     ) -> int:
-        if isinstance(accepted, int):
-            accepted_list = [int(accepted)]
-        elif isinstance(accepted, mx.array):
-            accepted_list = [int(x) for x in accepted.reshape(-1).tolist()]
-        else:
-            accepted_list = [int(x) for x in accepted]
-
-        max_a = max(accepted_list)
-        n = max_a + 1
-        trim = block_size - n
-        is_batch = len(accepted_list) > 1
-        valid_ends_list = [a + 1 for a in accepted_list]
-        accepted_mx = None
-        valid_ends_mx = None
-
-        def accepted_array():
-            nonlocal accepted_mx
-            if accepted_mx is None:
-                accepted_mx = mx.array(accepted_list, dtype=mx.int32)
-            return accepted_mx
-
-        def valid_ends_array():
-            nonlocal valid_ends_mx
-            if valid_ends_mx is None:
-                valid_ends_mx = mx.array(valid_ends_list, dtype=mx.int32)
-            return valid_ends_mx
-
-        def _is_ssm_cache(c):
-            return not c.is_trimmable() and not hasattr(c, "zero_row_tail")
-
-        ssm_caches = []
-        for c in caches:
-            if c is None:
-                continue
-            if _is_ssm_cache(c):
-                ssm_caches.append(c)
-                continue
-            if c.is_trimmable() and trim > 0:
-                c.trim(trim)
-            right_trimmed = False
-            if is_batch and max_a > 0:
-                extra_trim_list = [max_a - a for a in accepted_list]
-                if any(extra_trim_list):
-                    prepare = getattr(c, "prepare", None)
-                    finalize = getattr(c, "finalize", None)
-                    if c.keys is not None and callable(prepare) and callable(finalize):
-                        prepare(right_padding=extra_trim_list)
-                        finalize()
-                        right_trimmed = True
-            if (
-                is_batch
-                and not right_trimmed
-                and hasattr(c, "_idx")
-                and c.keys is not None
-                and max_a > 0
-            ):
-                kv_len = c._idx
-                verify_start = kv_len - n
-                if any(verify_start + ve < kv_len for ve in valid_ends_list):
-                    raise RuntimeError(
-                        "Qwen3.5 batched speculative rollback requires uniform "
-                        f"per-row acceptance; got ragged accepts {accepted_list}. "
-                        "Zeroing a rejected row's KV tail leaves phantom keys "
-                        "attended (issue #1962); set "
-                        "requires_uniform_batch_acceptance on the drafter or target "
-                        "so accepts are clamped before rollback."
-                    )
-
-        if not ssm_caches:
-            return max_a
-
-        if all(len(s) > 11 and s[11] is not None for s in gdn_states):
-            a0 = accepted_list[0] if not is_batch else None
-            if is_batch:
-                intermediate_parts = []
-                conv_input_parts = []
-                live_state_parts = []
-                live_conv_parts = []
-                layer_batch_sizes = []
-                kernel_sizes = []
-
-                for j, c in enumerate(ssm_caches):
-                    (
-                        _q,
-                        _k,
-                        _v,
-                        _a,
-                        _b,
-                        _A_log,
-                        _dt_bias,
-                        _init_state,
-                        _mask,
-                        conv_input,
-                        K,
-                        intermediate_states,
-                        *_,
-                    ) = gdn_states[j]
-                    rows = intermediate_states.shape[0]
-                    layer_batch_sizes.append(rows)
-                    kernel_sizes.append(int(K))
-                    intermediate_parts.append(intermediate_states)
-                    conv_input_parts.append(conv_input)
-
-                    live_state = c[1]
-                    if live_state is None:
-                        live_state = mx.zeros(
-                            (
-                                rows,
-                                intermediate_states.shape[2],
-                                intermediate_states.shape[3],
-                                intermediate_states.shape[4],
-                            ),
-                            dtype=intermediate_states.dtype,
-                        )
-                    live_state_parts.append(live_state)
-
-                    live_conv = c[0]
-                    if live_conv is None:
-                        live_conv = mx.zeros(
-                            (rows, int(K) - 1, conv_input.shape[-1]),
-                            dtype=conv_input.dtype,
-                        )
-                    live_conv_parts.append(live_conv)
-
-                if len(set(kernel_sizes)) != 1:
-                    raise ValueError("Qwen GDN layers must share conv kernel size.")
-
-                accepted_mx = accepted_array()
-                accepted_bat = mx.concatenate([accepted_mx for _ in ssm_caches], axis=0)
-                state_bat, conv_bat = gated_delta_accept_states(
-                    mx.concatenate(intermediate_parts, axis=0),
-                    mx.concatenate(conv_input_parts, axis=0),
-                    mx.concatenate(live_state_parts, axis=0),
-                    mx.concatenate(live_conv_parts, axis=0),
-                    accepted_bat,
-                    kernel_sizes[0],
-                    use_kernel=True,
-                )
-
-                offset = 0
-                for c, rows in zip(ssm_caches, layer_batch_sizes):
-                    c[1] = state_bat[offset : offset + rows]
-                    c[0] = conv_bat[offset : offset + rows]
-                    offset += rows
-            else:
-                for j, c in enumerate(ssm_caches):
-                    (
-                        _q,
-                        _k,
-                        _v,
-                        _a,
-                        _b,
-                        _A_log,
-                        _dt_bias,
-                        _init_state,
-                        _mask,
-                        conv_input,
-                        K,
-                        intermediate_states,
-                        *_,
-                    ) = gdn_states[j]
-                    if a0 < intermediate_states.shape[1]:
-                        c[1] = intermediate_states[:, a0]
-                        c[0] = conv_input[:, a0 + 1 : a0 + K]
-            return max_a
-
-        # Batch all SSM rollbacks into a single state-only gated delta kernel.
-        # Rollback does not need the layer output, so this avoids the verifier
-        # replay's q projection and y materialization.
-        N = len(ssm_caches)
-
-        k_list, v_list, a_list, b_list = [], [], [], []
-        A_log_list, dt_bias_list, state_list = [], [], []
-        steps_list = []
-        mask_parts = []
-        layer_batch_sizes = []
-        conv_data = []
-        for j in range(N):
-            (
-                _q,
-                k,
-                v,
-                a,
-                b,
-                A_log,
-                dt_bias,
-                init_state,
-                mask,
-                conv_input,
-                K,
-                *_,
-            ) = gdn_states[j]
-            k = k[:, :n]
-            v = v[:, :n]
-            a = a[:, :n]
-            b = b[:, :n]
-            batch_rows = k.shape[0]
-            k_list.append(k)
-            v_list.append(v)
-            a_list.append(a)
-            b_list.append(b)
-            if is_batch:
-                steps_list.append(valid_ends_array())
-            else:
-                steps_list.append(mx.full((batch_rows,), n, dtype=mx.int32))
-            A_log_list.append(
-                mx.broadcast_to(A_log[None, None, :], (batch_rows, 1, A_log.shape[0]))
-            )
-            dt_bias_list.append(
-                mx.broadcast_to(
-                    dt_bias[None, None, :], (batch_rows, 1, dt_bias.shape[0])
-                )
-            )
-            if init_state is None:
-                init_state = mx.zeros(
-                    (batch_rows, v.shape[-2], v.shape[-1], k.shape[-1]),
-                    dtype=mx.float32,
-                )
-            state_list.append(init_state)
-            layer_batch_sizes.append(batch_rows)
-            conv_data.append((conv_input, K))
-            mask_parts.append(None if mask is None else mask[:, :n])
-
-        # Stack along batch dim: (N, n, H, D) — one kernel launch for all layers.
-        k_bat = mx.concatenate(k_list, axis=0)
-        v_bat = mx.concatenate(v_list, axis=0)
-        a_bat = mx.concatenate(a_list, axis=0)
-        b_bat = mx.concatenate(b_list, axis=0)
-        A_log_bat = mx.concatenate(A_log_list, axis=0)  # (N, 1, Hv)
-        dt_bias_bat = mx.concatenate(dt_bias_list, axis=0)  # (N, 1, Hv)
-        state_bat = mx.concatenate(state_list, axis=0)  # (N, Hv, Dv, Dk)
-        steps_bat = mx.concatenate(steps_list, axis=0)
-
-        replay_mask = None
-        if any(mask is not None for mask in mask_parts):
-            replay_mask = mx.concatenate(
-                [
-                    (mask if mask is not None else mx.ones((rows, n), dtype=mx.bool_))
-                    for mask, rows in zip(mask_parts, layer_batch_sizes)
-                ],
-                axis=0,
-            )
-
-        states_out = gated_delta_state_update(
-            k_bat,
-            v_bat,
-            a_bat,
-            b_bat,
-            A_log_bat,
-            dt_bias_bat,
-            state_bat,
-            steps_bat,
-            replay_mask,
-            use_kernel=True,
+        return rollback_cache_transaction(
+            caches,
+            rollback_state,
+            accepted,
+            block_size,
         )
-
-        # Scatter results back to individual caches.
-        a0 = accepted_list[0] if not is_batch else None
-        state_offset = 0
-        for j, c in enumerate(ssm_caches):
-            batch_rows = layer_batch_sizes[j]
-            c[1] = states_out[state_offset : state_offset + batch_rows]
-            state_offset += batch_rows
-            conv_input, K = conv_data[j]
-            if is_batch:
-                slices = [
-                    conv_input[
-                        bi : bi + 1,
-                        accepted_list[bi] + 1 : accepted_list[bi] + K,
-                    ]
-                    for bi in range(len(accepted_list))
-                ]
-                c[0] = mx.concatenate(slices, axis=0)
-            else:
-                c[0] = conv_input[:, a0 + 1 : a0 + K]
-        return max_a
 
     def get_rope_index(
         self,

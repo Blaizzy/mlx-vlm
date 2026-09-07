@@ -736,6 +736,8 @@ class ArraysCache(_BaseCache):
         instance._left_padding_advance = 0
         instance._lengths = None
         instance._lengths_advance = 0
+        instance._speculation = None
+        instance._speculation_generation = 0
         return instance
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
@@ -788,6 +790,250 @@ class ArraysCache(_BaseCache):
         return self.cache[idx]
 
     @property
+    def is_speculating(self):
+        """Whether this cache is recording a bounded speculative timeline."""
+        return self._speculation is not None
+
+    def start_speculation(self, length: int) -> int:
+        """Start recording state transitions for a speculative block.
+
+        State producers record either recurrent states after each token or a
+        source array whose fixed-width windows are the temporal cache states.
+        The records exist only for the active block and are discarded when the
+        next block starts or the transaction is committed.
+        """
+        length = int(length)
+        if length < 1:
+            raise ValueError("Speculative cache length must be positive.")
+        self._speculation_generation += 1
+        self._speculation = {
+            "generation": self._speculation_generation,
+            "length": length,
+            "initial_state": list(self.cache),
+            "initial_metadata": (
+                self._left_padding,
+                self._left_padding_advance,
+                self._lengths,
+                self._lengths_advance,
+            ),
+            "records": {},
+        }
+        return self._speculation_generation
+
+    def record_speculative_states(
+        self,
+        index: int,
+        intermediate_states: Optional[mx.array],
+        final_state: mx.array,
+    ) -> None:
+        """Record post-token recurrent states for one cache slot.
+
+        ``intermediate_states[:, i]`` is the state after token ``i``. The
+        already-installed ``final_state`` is kept separately, avoiding a
+        concatenation and duplicate full-state allocation.
+        """
+        transaction = self._speculation
+        if transaction is None:
+            return
+        length = transaction["length"]
+        expected = length - 1
+        if intermediate_states is None:
+            if expected:
+                raise ValueError(
+                    "A speculative recurrent cache requires one state for "
+                    "every non-final token."
+                )
+        elif intermediate_states.shape[1] != expected:
+            raise ValueError(
+                "Speculative recurrent-state history has length "
+                f"{intermediate_states.shape[1]}, expected {expected}."
+            )
+        transaction["records"][int(index)] = (
+            "states",
+            intermediate_states,
+            final_state,
+        )
+
+    def record_speculative_window(
+        self,
+        index: int,
+        source: mx.array,
+        width: int,
+    ) -> None:
+        """Record fixed-width temporal states as views into ``source``.
+
+        ``source[:, t:t + width]`` is the cache state after retaining ``t``
+        tokens from the active block. This covers short convolutions, token
+        histories, and similar causal windows without materializing a stack.
+        """
+        transaction = self._speculation
+        if transaction is None:
+            return
+        width = int(width)
+        if width < 0:
+            raise ValueError("Speculative cache window width cannot be negative.")
+        required = transaction["length"] + width
+        if source.shape[1] < required:
+            raise ValueError(
+                f"Speculative window source has length {source.shape[1]}, "
+                f"expected at least {required}."
+            )
+        transaction["records"][int(index)] = ("window", source, width)
+
+    @staticmethod
+    def _select_speculative_states(record, initial, lengths, total):
+        _, intermediate, final = record
+        if len(set(lengths)) == 1:
+            keep = lengths[0]
+            if keep == 0:
+                return initial
+            if keep == total:
+                return final
+            return intermediate[:, keep - 1]
+
+        keep = mx.array(lengths, dtype=mx.int32)
+        batch = len(lengths)
+        if intermediate is None:
+            selected = final
+        else:
+            indices = mx.clip(keep - 1, 0, intermediate.shape[1] - 1)
+            indices = indices.reshape(batch, 1, *([1] * (intermediate.ndim - 2)))
+            selected = mx.take_along_axis(intermediate, indices, axis=1).squeeze(1)
+            final_rows = (keep == total).reshape(batch, *([1] * (final.ndim - 1)))
+            selected = mx.where(final_rows, final, selected)
+
+        if any(length == 0 for length in lengths):
+            if initial is None:
+                initial = mx.zeros_like(final)
+            initial_rows = (keep == 0).reshape(batch, *([1] * (final.ndim - 1)))
+            selected = mx.where(initial_rows, initial, selected)
+        return selected
+
+    @staticmethod
+    def _select_speculative_window(record, lengths):
+        _, source, width = record
+        if len(set(lengths)) == 1:
+            keep = lengths[0]
+            return mx.contiguous(source[:, keep : keep + width])
+        positions = mx.array(lengths, dtype=mx.int32)[:, None] + mx.arange(width)
+        positions = positions[..., None]
+        return mx.take_along_axis(source, positions, axis=1)
+
+    def _invalidate_derived_metadata(self):
+        """Discard model-specific views derived from temporal metadata."""
+        for attribute in (
+            "_qwen3_5_left_padding_info",
+            "_qwen3_5_lengths_info",
+            "_qwen3_5_ssm_no_mask_batch_size",
+        ):
+            if hasattr(self, attribute):
+                delattr(self, attribute)
+
+    def _restore_speculative_metadata(self, lengths, initial_metadata):
+        left_padding, left_advance, valid_lengths, lengths_advance = initial_metadata
+        if len(set(lengths)) == 1:
+            keep = lengths[0]
+            self._left_padding = left_padding
+            self._left_padding_advance = left_advance + (
+                keep if left_padding is not None else 0
+            )
+            self._lengths = valid_lengths
+            self._lengths_advance = lengths_advance + (
+                keep if valid_lengths is not None else 0
+            )
+        else:
+            keep = mx.array(lengths, dtype=mx.int32)
+            self._left_padding = (
+                None if left_padding is None else left_padding - left_advance - keep
+            )
+            self._left_padding_advance = 0
+            self._lengths = (
+                None
+                if valid_lengths is None
+                else valid_lengths - lengths_advance - keep
+            )
+            self._lengths_advance = 0
+
+        self._invalidate_derived_metadata()
+
+    def validate_speculation(self, lengths, generation: Optional[int] = None):
+        transaction = self._speculation
+        if transaction is None:
+            raise RuntimeError("No speculative cache transaction is active.")
+        if generation is not None and generation != transaction["generation"]:
+            raise RuntimeError("Attempted to commit a stale cache transaction.")
+
+        if isinstance(lengths, int):
+            lengths = [int(lengths)] * self.batch_size
+        elif isinstance(lengths, mx.array):
+            lengths = [int(value) for value in lengths.reshape(-1).tolist()]
+        else:
+            lengths = [int(value) for value in lengths]
+        if len(lengths) != self.batch_size:
+            raise ValueError(
+                f"Speculative cache has batch {self.batch_size}, got "
+                f"{len(lengths)} commit lengths."
+            )
+
+        total = transaction["length"]
+        if any(length < 0 or length > total for length in lengths):
+            raise ValueError(
+                f"Speculative commit lengths must be between 0 and {total}."
+            )
+        records = transaction["records"]
+        initial_state = transaction["initial_state"]
+        missing = [
+            index
+            for index, (initial, current) in enumerate(zip(initial_state, self.cache))
+            if initial is not current and index not in records
+        ]
+        if missing:
+            raise RuntimeError(
+                "Speculative cache state changed without temporal records for "
+                f"slots {missing}."
+            )
+        return transaction, lengths
+
+    def commit_speculation(self, lengths, generation: Optional[int] = None) -> None:
+        """Keep a per-row prefix of the active speculative block."""
+        transaction, lengths = self.validate_speculation(lengths, generation)
+        total = transaction["length"]
+
+        initial_state = transaction["initial_state"]
+        for index, record in transaction["records"].items():
+            if record[0] == "states":
+                self.cache[index] = self._select_speculative_states(
+                    record,
+                    initial_state[index],
+                    lengths,
+                    total,
+                )
+            else:
+                self.cache[index] = self._select_speculative_window(record, lengths)
+        self._restore_speculative_metadata(
+            lengths,
+            transaction["initial_metadata"],
+        )
+        self._speculation = None
+
+    def abort_speculation(self, generation: Optional[int] = None) -> None:
+        """Restore the state that preceded the active speculative block."""
+        transaction = self._speculation
+        if transaction is None:
+            return
+        if generation is not None and generation != transaction["generation"]:
+            raise RuntimeError("Attempted to abort a stale cache transaction.")
+        self.cache = transaction["initial_state"]
+        (
+            self._left_padding,
+            self._left_padding_advance,
+            self._lengths,
+            self._lengths_advance,
+        ) = transaction["initial_metadata"]
+        self._invalidate_derived_metadata()
+        self._speculation = None
+
+    @property
     def state(self):
         return self.cache
 
@@ -837,7 +1083,7 @@ class ArraysCache(_BaseCache):
         self.lengths = cat(self.lengths, other.lengths)
 
     def extract(self, idx):
-        cache = ArraysCache(len(self.cache))
+        cache = type(self)(len(self.cache))
         cache.cache = [c[idx : idx + 1] for c in self.cache]
         return cache
 
@@ -891,7 +1137,16 @@ class ArraysCache(_BaseCache):
 
     @property
     def nbytes(self):
-        return sum(c.nbytes for c in self.cache if c is not None)
+        arrays = {id(c): c for c in self.cache if isinstance(c, mx.array)}
+        if self._speculation is not None:
+            for value in self._speculation["initial_state"]:
+                if isinstance(value, mx.array):
+                    arrays[id(value)] = value
+            for record in self._speculation["records"].values():
+                for value in record[1:]:
+                    if isinstance(value, mx.array):
+                        arrays[id(value)] = value
+        return sum(array.nbytes for array in arrays.values())
 
 
 class ChunkedKVCache(_BaseCache):
