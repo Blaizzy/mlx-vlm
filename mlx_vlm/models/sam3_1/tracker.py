@@ -964,9 +964,7 @@ class MultiplexTrackerModel(nn.Module):
                         == len(objects_to_interact)
                     )
 
-                multimask_output = self._use_multimask(
-                    is_init_cond_frame, point_inputs
-                )
+                multimask_output = self._use_multimask(is_init_cond_frame, point_inputs)
                 interaction_out = self._forward_sam_heads(
                     backbone_features=interactive_pix_feat,
                     point_inputs=point_inputs,
@@ -1165,9 +1163,7 @@ class MultiplexTrackerModel(nn.Module):
                 prev_output["pred_masks_high_res"].shape[0]
                 == multiplex_state.total_valid_entries
             )
-            self._reencode_memory(
-                prev_output, propagation_vision_feat, multiplex_state
-            )
+            self._reencode_memory(prev_output, propagation_vision_feat, multiplex_state)
 
     def recondition_masks_in_existing_state(
         self,
@@ -1206,9 +1202,7 @@ class MultiplexTrackerModel(nn.Module):
 
         # Step 3: re-encode the spatial memory
         if add_mask_to_memory:
-            self._reencode_memory(
-                prev_output, propagation_vision_feat, multiplex_state
-            )
+            self._reencode_memory(prev_output, propagation_vision_feat, multiplex_state)
 
     # ------------------------------------------------------------------
     # Convenience session API
