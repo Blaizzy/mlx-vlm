@@ -48,6 +48,7 @@ MODEL_REMAPPING = {
     "granite4-vision": "granite4_vision",
     "granite4_vision": "granite4_vision",
     "rf-detr": "rfdetr",
+    "dinov2_with_registers": "dinov2",
     "falcon-perception": "falcon_perception",
     "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
     "cohere2moe": "cohere2_moe",
@@ -184,7 +185,11 @@ def _transform_modelopt_nvfp4_weights(
     if quantization_config.get("quant_method") not in {
         "modelopt",
         "modelopt_mixed",
-    } or quantization_config.get("quant_algo") not in {"NVFP4", "MIXED_PRECISION"}:
+    } or quantization_config.get("quant_algo") not in {
+        "NVFP4",
+        "W4A16_NVFP4",
+        "MIXED_PRECISION",
+    }:
         return weights, None
 
     scale_2_suffix = ".weight_scale_2"
@@ -744,6 +749,8 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
         model_type = "gliner2_5"
     elif "DFlash2DraftModel" in architectures:
         model_type = "dflash2"
+    elif "Gemma4DSparkModel" in architectures:
+        model_type = "gemma4_dspark"
     elif dflash_config is not None:
         is_dspark = (
             dflash_config.get("projector_type") == "dspark"
@@ -1443,8 +1450,11 @@ def load_processor(
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
 
-        # Instantiate the detokenizer
-        processor.detokenizer = detokenizer_class(tokenizer_obj)
+        # Non-text models (depth, detection) have no decode(); skip detokenizer
+        try:
+            processor.detokenizer = detokenizer_class(tokenizer_obj)
+        except AttributeError:
+            return processor
 
         # Create and assign the StoppingCriteria
         criteria = StoppingCriteria(

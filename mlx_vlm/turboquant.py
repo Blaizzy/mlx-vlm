@@ -4844,29 +4844,65 @@ def _select_outlier_indices(
 
 class _SplitCodec:
     def __init__(self, tensor: mx.array, bits: float, mode: str, seed: int):
+        low_idx, high_idx = _select_outlier_indices(tensor, bits)
+        self._init_from_indices(tensor.shape[-1], bits, mode, seed, low_idx, high_idx)
+
+    @classmethod
+    def from_indices(
+        cls,
+        dim: int,
+        bits: float,
+        mode: str,
+        seed: int,
+        low_idx,
+        high_idx,
+    ):
+        obj = cls.__new__(cls)
+        obj._init_from_indices(dim, bits, mode, seed, low_idx, high_idx)
+        return obj
+
+    def _init_from_indices(
+        self,
+        dim: int,
+        bits: float,
+        mode: str,
+        seed: int,
+        low_idx,
+        high_idx,
+    ) -> None:
         self.bits = bits
         self.mode = mode
-        self.dim = tensor.shape[-1]
+        self.dim = int(dim)
         self.lower_bits = math.floor(bits)
         self.upper_bits = math.ceil(bits)
-        low_idx, high_idx = _select_outlier_indices(tensor, bits)
-        self.low_idx = mx.array(low_idx, dtype=mx.int32)
-        self.high_idx = mx.array(high_idx, dtype=mx.int32)
+        # APC restores detached index arrays that are materialized on the producer
+        # thread. Reuse them: wrapping them in mx.array would create a lazy graph
+        # that the asynchronous disk writer cannot evaluate on its own stream.
+        self.low_idx = (
+            low_idx
+            if isinstance(low_idx, mx.array) and low_idx.dtype == mx.int32
+            else mx.array(low_idx, dtype=mx.int32)
+        )
+        self.high_idx = (
+            high_idx
+            if isinstance(high_idx, mx.array) and high_idx.dtype == mx.int32
+            else mx.array(high_idx, dtype=mx.int32)
+        )
+        self.restore_order = mx.argsort(
+            mx.concatenate([self.low_idx, self.high_idx])
+        ).astype(mx.int32)
 
-        concat_order = np.concatenate([low_idx, high_idx])
-        self.restore_order = mx.array(np.argsort(concat_order), dtype=mx.int32)
+        dl = self.low_idx.shape[0]
+        dh = self.high_idx.shape[0]
 
         codec_cls = _TurboQuantProdCodec if mode == "prod" else _TurboQuantMSECodec
-        self.low_codec = codec_cls(len(low_idx), self.lower_bits, seed)
-        self.high_codec = codec_cls(len(high_idx), self.upper_bits, seed + 97)
+        self.low_codec = codec_cls(dl, self.lower_bits, seed)
+        self.high_codec = codec_cls(dh, self.upper_bits, seed + 97)
 
         # Pre-build combined query transform for fused decode:
         # single (D, 2*dim_low + 2*dim_high) matrix replaces 2 takes + 2 matmuls
         if mode == "prod" and isinstance(self.low_codec, _TurboQuantProdCodec):
-            dim = tensor.shape[-1]
-            dl = len(low_idx)
-            dh = len(high_idx)
-            combined = mx.zeros((dim, 2 * dl + 2 * dh), dtype=mx.float32)
+            combined = mx.zeros((self.dim, 2 * dl + 2 * dh), dtype=mx.float32)
             combined[self.low_idx, :dl] = self.low_codec.query_transform_t[:, :dl]
             combined[self.low_idx, dl : 2 * dl] = self.low_codec.query_transform_t[
                 :, dl:
@@ -4940,6 +4976,64 @@ class _SplitCodec:
         )
         merged = mx.concatenate([low_tensor, high_tensor], axis=-1)
         return mx.take(merged, self.restore_order, axis=-1), denom, max_scores
+
+
+def _snapshot_kv_codec(codec):
+    if codec is None:
+        return None
+    if isinstance(codec, _SplitCodec):
+        return codec.dim, codec.low_idx, codec.high_idx
+    if isinstance(codec, _TurboQuantMSECodec):
+        return codec.dim, None, None
+    raise TypeError(f"Unsupported TurboQuant KV codec: {type(codec)!r}")
+
+
+def _restore_kv_codec(snapshot, bits: float, seed: int):
+    if snapshot is None:
+        return None
+    dim, low_idx, high_idx = snapshot
+    if low_idx is None and high_idx is None:
+        return _TurboQuantMSECodec(dim, int(bits), seed)
+    if low_idx is not None and high_idx is not None:
+        return _SplitCodec.from_indices(
+            dim,
+            float(bits),
+            "mse",
+            seed,
+            low_idx,
+            high_idx,
+        )
+    raise ValueError("incomplete TurboQuant split-codec snapshot")
+
+
+def _restore_kv_state(state, codec):
+    """Restore NamedTuple types erased by the generic checkpoint serializer."""
+    if state is None:
+        return None
+    if isinstance(codec, _SplitCodec):
+        return TurboQuantSplitState(
+            _restore_kv_state(state[0], codec.low_codec),
+            _restore_kv_state(state[1], codec.high_codec),
+        )
+    if isinstance(codec, _TurboQuantMSECodec):
+        return TurboQuantMSEState(*state)
+    raise TypeError(f"Unsupported TurboQuant KV codec: {type(codec)!r}")
+
+
+def _codecs_compatible(lhs, rhs) -> bool:
+    """Whether two rows use the same packed coordinate system."""
+    if type(lhs) is not type(rhs):
+        return False
+    if isinstance(lhs, _SplitCodec):
+        return (
+            lhs.bits == rhs.bits
+            and lhs.dim == rhs.dim
+            and bool(mx.array_equal(lhs.low_idx, rhs.low_idx).item())
+            and bool(mx.array_equal(lhs.high_idx, rhs.high_idx).item())
+        )
+    return getattr(lhs, "bits", None) == getattr(rhs, "bits", None) and getattr(
+        lhs, "dim", None
+    ) == getattr(rhs, "dim", None)
 
 
 def _build_codec(tensor: mx.array, bits: float, mode: str, seed: int):
@@ -5173,6 +5267,122 @@ class _TurboQuantAttentionMixin:
         """
         state = self.state
         return state[0], state[1]
+
+    def prefix_cache_snapshot(self):
+        """Capture packed state and the codec coordinates needed to decode it."""
+        return {
+            "meta_state": self.meta_state,
+            "keys": _slice_state(self.keys, self.offset),
+            "values": _slice_state(self.values, self.offset),
+            "key_codec": _snapshot_kv_codec(self.key_codec),
+            "value_codec": _snapshot_kv_codec(self.value_codec),
+        }
+
+    def prefix_cache_restore(self, snapshot):
+        """Restore packed state without dequantizing and re-quantizing it."""
+        meta = snapshot["meta_state"]
+        self.__init__(bits=float(meta[1]))
+        self.meta_state = meta
+        self.key_codec = _restore_kv_codec(
+            snapshot.get("key_codec"), self.key_bits, self.seed
+        )
+        self.value_codec = _restore_kv_codec(
+            snapshot.get("value_codec"), self.value_bits, self.seed + 1
+        )
+        if snapshot["keys"] is not None and (
+            self.key_codec is None or self.value_codec is None
+        ):
+            raise ValueError("packed TurboQuant snapshot is missing codec metadata")
+        self.keys = _restore_kv_state(snapshot["keys"], self.key_codec)
+        self.values = _restore_kv_state(snapshot["values"], self.value_codec)
+
+    def prefix_cache_reserve(self, min_capacity_tokens):
+        """Reserve packed capacity for the first post-restore update."""
+        if self.keys is None or self.values is None:
+            return ()
+        needed = int(min_capacity_tokens)
+        self.keys = _reserve_state_capacity(
+            self.keys, self.offset, needed, self.cache_step
+        )
+        self.values = _reserve_state_capacity(
+            self.values, self.offset, needed, self.cache_step
+        )
+        return self.keys, self.values
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        """Merge compatible packed rows into ``BatchTurboQuantKVCache``."""
+        from .models.cache import KVCache
+
+        if not rows or len(rows) != len(prefix_lens):
+            return None
+
+        def is_cold_empty(row):
+            return type(row) is KVCache and row.keys is None and row.values is None
+
+        populated = []
+        for row in rows:
+            if isinstance(row, TurboQuantKVCache):
+                if (
+                    row.bits != self.bits
+                    or row.key_bits != self.key_bits
+                    or row.value_bits != self.value_bits
+                    or row.seed != self.seed
+                ):
+                    return None
+                if row.keys is not None:
+                    populated.append(row)
+            elif not is_cold_empty(row):
+                return None
+
+        prefix_lens = [int(length) for length in prefix_lens]
+        max_prefix = max(prefix_lens, default=0)
+        left_padding = [max_prefix - length for length in prefix_lens]
+        out = BatchTurboQuantKVCache(
+            left_padding,
+            bits=self.bits,
+            seed=self.seed,
+            key_bits=self.key_bits,
+            value_bits=self.value_bits,
+        )
+        if not populated:
+            out.offset = mx.array(prefix_lens)
+            return out
+        if any(
+            int(row.offset) != length
+            for row, length in zip(rows, prefix_lens)
+            if isinstance(row, TurboQuantKVCache) and row.keys is not None
+        ):
+            return None
+
+        reference = populated[0]
+        for row in populated[1:]:
+            if not _codecs_compatible(reference.key_codec, row.key_codec):
+                return None
+            if not _codecs_compatible(reference.value_codec, row.value_codec):
+                return None
+
+        def merge_states(attr):
+            reference_state = getattr(reference, attr)
+            merged = None
+            for row, left in zip(rows, left_padding):
+                if isinstance(row, TurboQuantKVCache) and row.keys is not None:
+                    state = _slice_state(getattr(row, attr), row.offset)
+                    state = _pad_state_tokens(
+                        state, left, max_prefix - left - _state_length(state)
+                    )
+                else:
+                    state = _allocate_state_like(reference_state, max_prefix)
+                merged = state if merged is None else _concat_state_batch(merged, state)
+            return merged
+
+        out.keys = merge_states("keys")
+        out.values = merge_states("values")
+        out.key_codec = reference.key_codec
+        out.value_codec = reference.value_codec
+        out.offset = mx.array(prefix_lens)
+        out.left_padding = mx.array(left_padding)
+        out._idx = max_prefix
+        return out
 
     def _apply_attention_mask(
         self,

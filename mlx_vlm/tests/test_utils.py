@@ -44,8 +44,15 @@ from mlx_vlm.utils import (
 )
 
 
-@pytest.mark.parametrize("quant_method", ["modelopt", "modelopt_mixed"])
-def test_transform_modelopt_nvfp4_weights(quant_method):
+@pytest.mark.parametrize(
+    ("quant_method", "quant_algo"),
+    [
+        ("modelopt", "NVFP4"),
+        ("modelopt", "W4A16_NVFP4"),
+        ("modelopt_mixed", "NVFP4"),
+    ],
+)
+def test_transform_modelopt_nvfp4_weights(quant_method, quant_algo):
     packed = mx.arange(32, dtype=mx.uint8).reshape(2, 16)
     weights = {
         "layer.weight": packed,
@@ -57,7 +64,7 @@ def test_transform_modelopt_nvfp4_weights(quant_method):
 
     transformed, quantization = _transform_modelopt_nvfp4_weights(
         weights,
-        {"quant_method": quant_method, "quant_algo": "NVFP4"},
+        {"quant_method": quant_method, "quant_algo": quant_algo},
     )
 
     assert transformed["layer.weight"].dtype == mx.uint32

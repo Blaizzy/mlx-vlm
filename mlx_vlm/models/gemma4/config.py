@@ -90,6 +90,7 @@ class TextConfig(BaseModelConfig):
     use_double_wide_mlp: bool = True
     enable_moe_block: bool = False
     use_second_mlp_block: bool = False
+    exact_speculative_verify: bool = False
     num_experts: Optional[int] = None
     top_k_experts: Optional[int] = None
     moe_intermediate_size: Optional[int] = None

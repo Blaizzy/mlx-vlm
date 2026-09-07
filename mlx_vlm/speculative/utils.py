@@ -17,6 +17,7 @@ from .dflash import (
     _dflash_next_block_size,
     _dflash_rounds,
     _dflash_rounds_batch,
+    _reserve_dflash_target_cache,
 )
 from .eagle3 import _eagle3_capture_layer_ids, _eagle3_rounds, _eagle3_rounds_batch
 from .mtp import (
@@ -39,6 +40,7 @@ __all__ = [
     "_dflash_block_total",
     "_dflash_committed_hidden_segments",
     "_dflash_next_block_size",
+    "_reserve_dflash_target_cache",
     "_dflash_rounds",
     "_dflash_rounds_batch",
     "_effective_mtp_block_size",
