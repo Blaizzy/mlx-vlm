@@ -84,6 +84,15 @@ def default_disk_path() -> Path:
     return root / "mlx-vlm" / "apc"
 
 
+def _setting(overrides: Optional[dict], key: str, env: str, default: Any) -> Any:
+    # Explicit null restores the built-in/automatic default. An absent key
+    # inherits the environment; zero and an empty disk path remain meaningful.
+    if overrides is not None and key in overrides:
+        value = overrides[key]
+        return default if value is None else value
+    return os.environ.get(env, default)
+
+
 def _cache_nbytes(value: Any, seen: Optional[set[int]] = None) -> int:
     """Account cache buffers without evaluating or cloning their contents."""
     if value is None:
@@ -1147,6 +1156,8 @@ class DiskBlockStore:
         namespace: str = "default",
         num_workers: int = 1,
         max_bytes: Optional[int] = None,
+        *,
+        overrides: Optional[dict] = None,
     ):
         self.dir = Path(root) / _safe_namespace(namespace)
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -1154,7 +1165,13 @@ class DiskBlockStore:
         self.evictions = 0  # cumulative shard deletions by _maybe_evict
         self._q: queue.Queue = queue.Queue(maxsize=4096)
         self.queue_max_bytes = max(
-            0, int(float(os.environ.get("APC_DISK_QUEUE_MAX_GB", "1")) * (1 << 30))
+            0,
+            int(
+                float(
+                    _setting(overrides, "disk_queue_max_gb", "APC_DISK_QUEUE_MAX_GB", 1)
+                )
+                * (1 << 30)
+            ),
         )
         self._pending_bytes = 0
         self._pending_lock = threading.Lock()
@@ -1180,7 +1197,12 @@ class DiskBlockStore:
         # is ~2.25 MiB, so 256 blocks is roughly a 576 MiB shard before the
         # small KV step padding.
         self._shard_max_blocks = max(
-            1, int(os.environ.get("APC_DISK_SHARD_MAX_BLOCKS", "256"))
+            1,
+            int(
+                _setting(
+                    overrides, "disk_shard_max_blocks", "APC_DISK_SHARD_MAX_BLOCKS", 256
+                )
+            ),
         )
         # Layer-major warm-disk restore concatenates segment shards one layer
         # at a time. Clearing MLX's allocator cache after each layer keeps the
@@ -3051,6 +3073,8 @@ class APCManager:
         num_blocks: int = DEFAULT_NUM_BLOCKS,
         block_size: int = DEFAULT_BLOCK_SIZE,
         disk: Optional["DiskBlockStore"] = None,
+        *,
+        overrides: Optional[dict] = None,
     ):
         self.block_size = block_size
         self.num_blocks = num_blocks
@@ -3072,7 +3096,9 @@ class APCManager:
         self._exact_cache_max = max(
             0,
             int(
-                os.environ.get(
+                _setting(
+                    overrides,
+                    "checkpoint_entries",
                     "APC_CHECKPOINT_ENTRIES",
                     os.environ.get("APC_EXACT_CACHE_ENTRIES", "2"),
                 )
@@ -3081,7 +3107,9 @@ class APCManager:
         self.exact_cache_guard_tokens = max(
             1,
             int(
-                os.environ.get(
+                _setting(
+                    overrides,
+                    "checkpoint_guard_tokens",
                     "APC_CHECKPOINT_GUARD_TOKENS",
                     os.environ.get("APC_EXACT_PREFIX_GUARD_TOKENS", "1"),
                 )
@@ -3091,7 +3119,15 @@ class APCManager:
             1, int(os.environ.get("APC_EXACT_MIN_TOKENS", "16"))
         )
         self.checkpoint_interval_tokens = max(
-            0, int(os.environ.get("APC_CHECKPOINT_INTERVAL_TOKENS", "2048"))
+            0,
+            int(
+                _setting(
+                    overrides,
+                    "checkpoint_interval_tokens",
+                    "APC_CHECKPOINT_INTERVAL_TOKENS",
+                    2048,
+                )
+            ),
         )
         # If free RAM (best-effort reading) drops below this, skip disk
         # promotion this turn and fall back to memory-only matching. The
@@ -3122,7 +3158,14 @@ class APCManager:
         self.memory_max_bytes = max(
             0,
             int(
-                float(os.environ.get("APC_MEMORY_MAX_GB", automatic_budget / (1 << 30)))
+                float(
+                    _setting(
+                        overrides,
+                        "memory_max_gb",
+                        "APC_MEMORY_MAX_GB",
+                        automatic_budget / (1 << 30),
+                    )
+                )
                 * (1 << 30)
             ),
         )
@@ -3130,8 +3173,11 @@ class APCManager:
             0,
             int(
                 float(
-                    os.environ.get(
-                        "APC_MEMORY_RESERVE_GB", automatic_reserve / (1 << 30)
+                    _setting(
+                        overrides,
+                        "memory_reserve_gb",
+                        "APC_MEMORY_RESERVE_GB",
+                        automatic_reserve / (1 << 30),
                     )
                 )
                 * (1 << 30)
@@ -4878,9 +4924,11 @@ def from_env(
     model_namespace: Optional[str] = None,
     overrides: Optional[dict] = None,
 ) -> Optional[APCManager]:
-    """Build an APCManager when enabled; read knobs from env (default) or
-    ``overrides`` (keys: enabled, disk_path, block_size, num_blocks,
-    disk_max_gb) so live settings can drive APC without env mutation."""
+    """Build APC from env or live settings, without mutating the environment.
+
+    Override keys are server APC setting names without the ``apc_`` prefix.
+    Explicit null selects the built-in/automatic default; omitted keys use env.
+    """
     if overrides is not None and "enabled" in overrides:
         enabled = bool(overrides["enabled"])
     else:
@@ -4893,30 +4941,25 @@ def from_env(
         return None
 
     def _ov_int(override_key: str, env_name: str, default: int) -> int:
-        if (
-            overrides is not None
-            and override_key in overrides
-            and overrides[override_key] is not None
-        ):
-            return int(overrides[override_key])
-        return int(os.environ.get(env_name, default))
+        return int(_setting(overrides, override_key, env_name, default))
 
     block_size = _ov_int("block_size", "APC_BLOCK_SIZE", DEFAULT_BLOCK_SIZE)
     num_blocks = _ov_int("num_blocks", "APC_NUM_BLOCKS", DEFAULT_NUM_BLOCKS)
 
     disk: Optional[DiskBlockStore] = None
-    if overrides is not None and overrides.get("disk_path") is not None:
-        disk_path = overrides["disk_path"]
-    else:
-        disk_path = os.environ.get("APC_DISK_PATH", str(default_disk_path()))
-    if not _env_truthy("APC_DISK_ENABLED", "1"):
+    disk_path = _setting(
+        overrides, "disk_path", "APC_DISK_PATH", str(default_disk_path())
+    )
+    disk_enabled = str(
+        _setting(overrides, "disk_enabled", "APC_DISK_ENABLED", True)
+    ).lower() in ("1", "true", "yes")
+    if not disk_enabled:
         disk_path = None
     if disk_path:
         ns = model_namespace or os.environ.get("APC_DISK_NAMESPACE", "default")
-        if overrides is not None and overrides.get("disk_max_gb") is not None:
-            max_gb = float(overrides["disk_max_gb"])
-        else:
-            max_gb = float(os.environ.get("APC_DISK_MAX_GB", DEFAULT_DISK_MAX_GB))
+        max_gb = float(
+            _setting(overrides, "disk_max_gb", "APC_DISK_MAX_GB", DEFAULT_DISK_MAX_GB)
+        )
         max_bytes = int(max_gb * (1 << 30)) if max_gb > 0 else None
         workers = int(os.environ.get("APC_DISK_WORKERS", "1"))
         try:
@@ -4925,6 +4968,7 @@ def from_env(
                 namespace=ns,
                 num_workers=workers,
                 max_bytes=max_bytes,
+                overrides=overrides,
             )
             cap_str = f"{max_gb:.1f} GB" if max_bytes else "unbounded"
             logger.info(
@@ -4943,4 +4987,6 @@ def from_env(
         "sha256" if _hash_use_sha256() else "fast",
         bool(disk),
     )
-    return APCManager(num_blocks=num_blocks, block_size=block_size, disk=disk)
+    return APCManager(
+        num_blocks=num_blocks, block_size=block_size, disk=disk, overrides=overrides
+    )

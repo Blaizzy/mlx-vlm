@@ -913,6 +913,44 @@ curl http://localhost:8080/v1/cache/stats
 curl -X POST http://localhost:8080/v1/cache/reset
 ```
 
+Configure APC on a running server with `PATCH /v1/settings`. Use
+`GET /v1/settings` to discover supported settings and read their current values:
+
+```sh
+curl http://localhost:8080/v1/settings
+
+curl -X PATCH http://localhost:8080/v1/settings \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "apc_enabled": true,
+    "apc_disk_enabled": true,
+    "apc_memory_max_gb": 2,
+    "apc_disk_max_gb": 20,
+    "apc_checkpoint_interval_tokens": 1024
+  }'
+```
+
+The endpoint also accepts `apc_memory_reserve_gb`, `apc_disk_queue_max_gb`,
+`apc_disk_path`, `apc_disk_shard_max_blocks`, `apc_block_size`, `apc_num_blocks`,
+`apc_checkpoint_entries`, and `apc_checkpoint_guard_tokens`. When
+`MLX_VLM_SERVER_API_KEY` is configured, include `Authorization: Bearer <key>`.
+
+Settings apply on the next text-generation request through the existing model
+reload path; the server process stays running. Reloading clears resident caches
+and retires the previous disk writer after its generation worker finishes.
+Existing disk files remain available. Updating APC options while APC is disabled
+stages them for the next enable. The response reports `applied`, `rejected`,
+`reload_kinds`, and the resulting settings; invalid sizes are rejected without
+changing those values. Unchanged settings do not trigger a reload.
+
+Use `null` for automatic memory budgets or the default disk path/cap. Zero has
+specific meanings: `apc_memory_max_gb: 0` retains caches only on disk,
+`apc_disk_max_gb: 0` removes the disk cap, and `apc_disk_queue_max_gb: 0` writes
+synchronously. An empty `apc_disk_path` or `apc_disk_enabled: false` disables
+persistence. PATCH merges with current settings; the optional
+`{"op": "replace", "values": {...}}` form first restores startup environment
+defaults. `/v1/cache/stats` shows the active manager after the next request.
+
 Common APC environment variables:
 
 | Variable | Default | Description |
