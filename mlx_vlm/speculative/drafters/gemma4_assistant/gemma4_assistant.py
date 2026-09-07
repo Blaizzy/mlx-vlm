@@ -28,6 +28,9 @@ class _DraftInner(nn.Module):
 
 class Gemma4AssistantDraftModel(nn.Module):
     supports_greedy_draft_argmax = True
+    # The drafter owns no cache; batched target KV is normalized per call.
+    supports_continuous_batching = True
+    requires_verified_token_reconciliation = False
 
     def __init__(self, config: Gemma4AssistantConfig):
         super().__init__()

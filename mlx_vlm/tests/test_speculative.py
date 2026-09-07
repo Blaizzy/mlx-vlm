@@ -2768,6 +2768,15 @@ def test_gemma4_assistant_overrides_dflash_to_mtp(tmp_path, caplog):
     assert any("requires --draft-kind='mtp'" in r.getMessage() for r in caplog.records)
 
 
+def test_gemma4_assistant_declares_continuous_batching_support():
+    assert Gemma4AssistantDraftModel.supports_continuous_batching is True
+    assert Gemma4AssistantDraftModel.requires_verified_token_reconciliation is False
+
+
+def test_deepseek_v4_mtp_declares_owned_state_reconciliation():
+    assert DeepseekV4MTPDraftModel.requires_verified_token_reconciliation is True
+
+
 def test_explicit_mtp_kept_for_gemma4_assistant(tmp_path, caplog):
     path = _make_drafter_dir(tmp_path, "gemma4_assistant")
     with caplog.at_level("WARNING"):
