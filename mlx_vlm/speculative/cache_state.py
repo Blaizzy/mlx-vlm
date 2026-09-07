@@ -282,14 +282,20 @@ class SpeculativeCacheTransaction:
     def active(self):
         return self._active
 
-    def commit(self, lengths) -> None:
+    def validate(self, lengths) -> None:
         if not self._active:
             raise RuntimeError("Speculative cache transaction is no longer active.")
         for cache, generation in self._entries:
             cache.validate_speculation(lengths, generation)
+
+    def _commit_validated(self, lengths) -> None:
         for cache, generation in self._entries:
             cache.commit_speculation(lengths, generation)
         self._active = False
+
+    def commit(self, lengths) -> None:
+        self.validate(lengths)
+        self._commit_validated(lengths)
 
     def abort(self) -> None:
         if not self._active:
@@ -299,10 +305,14 @@ class SpeculativeCacheTransaction:
         self._active = False
 
 
-def start_speculative_cache(caches: Iterable[Any], length: int):
+def start_speculative_cache(
+    caches: Iterable[Any], length: int, cache_types: Optional[tuple] = None
+):
     """Start a temporal transaction on every capable cache in ``caches``."""
     entries = []
     for cache in iter_leaf_caches(caches):
+        if cache_types is not None and not isinstance(cache, cache_types):
+            continue
         start = getattr(cache, "start_speculation", None)
         if callable(start):
             entries.append((cache, start(length)))
@@ -330,15 +340,20 @@ def rollback_speculative_cache(
     right_padding = [max_accepted - value for value in accepted_values]
     has_ragged_tail = is_batch and any(right_padding)
 
-    for cache in caches:
-        if cache is None or isinstance(cache, ArraysCache):
+    validate = getattr(transaction, "validate", None)
+    if callable(validate):
+        validate(retained)
+
+    for cache in iter_leaf_caches(caches):
+        if getattr(cache, "is_speculating", False):
             continue
-        if not cache.is_trimmable():
+        trim_cache = getattr(cache, "trim", None)
+        if not callable(trim_cache):
             raise RuntimeError(
                 f"{type(cache).__name__} cannot roll back a speculative block."
             )
         if trim > 0:
-            cache.trim(trim)
+            trim_cache(trim)
 
         right_trimmed = False
         if has_ragged_tail:
@@ -364,9 +379,13 @@ def rollback_speculative_cache(
                 f"{type(cache).__name__}."
             )
 
-    commit = getattr(transaction, "commit", None)
-    if callable(commit):
-        commit(retained)
+    commit_validated = getattr(transaction, "_commit_validated", None)
+    if callable(commit_validated):
+        commit_validated(retained)
+    else:
+        commit = getattr(transaction, "commit", None)
+        if callable(commit):
+            commit(retained)
     return max_accepted
 
 

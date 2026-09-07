@@ -8,6 +8,7 @@ from ...speculative.cache_state import (
     start_speculative_cache,
 )
 from ..base import LanguageModelOutput, create_ssm_mask, scaled_dot_product_attention
+from ..cache import ArraysCache
 from ..deepseek_v4.hyper_connection import _hc_kernel, hc_expand
 from ..exact_speculative_verify import exact_speculative_verify_weight
 from ..quantized_verifier import (
@@ -725,7 +726,9 @@ class Glm5NextSpeculativeVerifier:
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
     ):
         cache_snapshot = snapshot_cache_state(cache, inputs.shape[1])
-        transaction = start_speculative_cache(cache, inputs.shape[1])
+        transaction = start_speculative_cache(
+            cache, inputs.shape[1], cache_types=(ArraysCache,)
+        )
         hidden_sink = []
         rollback_updates = []
         try:

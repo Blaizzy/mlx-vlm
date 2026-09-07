@@ -8,17 +8,15 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx.utils import tree_flatten
 
 from ...speculative.cache_state import (
-    iter_leaf_caches,
-    needs_replay_snapshot_for_cache,
-    restore_cache_state,
-    snapshot_cache_state,
+    rollback_speculative_cache as rollback_cache_transaction,
 )
+from ...speculative.cache_state import start_speculative_cache
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import CacheList, PoolingCache, RotatingKVCache
+from ..cache import BatchPoolingCache, CacheList, PoolingCache, RotatingKVCache
 from ..mla import MultiLinear
 from ..pipeline import PipelineMixin
 from ..switch_layers import SwitchGLU
@@ -1356,30 +1354,29 @@ class LanguageModel(nn.Module):
         return self._target_hidden(hidden)
 
     def _speculative_verify(self, inputs: mx.array, cache, sampler=None):
-        incoming_tokens = int(inputs.shape[1])
-        cache_snapshot = (
-            snapshot_cache_state(cache, incoming_tokens)
-            if needs_replay_snapshot_for_cache(cache, incoming_tokens)
-            else None
-        )
         sample_logits = sampler is not None
-
-        out = self(
-            inputs,
-            cache=cache,
-            return_hidden=True,
-            return_shared_kv=True,
-            skip_logits=not sample_logits,
-            skip_final_norm=not sample_logits,
+        transaction = start_speculative_cache(
+            cache or [],
+            inputs.shape[1],
+            cache_types=(PoolingCache, BatchPoolingCache),
         )
+        try:
+            out = self(
+                inputs,
+                cache=cache,
+                return_hidden=True,
+                return_shared_kv=True,
+                skip_logits=not sample_logits,
+                skip_final_norm=not sample_logits,
+            )
+        except Exception:
+            transaction.abort()
+            raise
         hidden = out.hidden_states[-1]
-        rollback_state = (
-            (cache_snapshot, inputs) if cache_snapshot is not None else None
-        )
         if not sample_logits:
-            return hidden, {}, rollback_state
+            return hidden, {}, transaction
 
-        return hidden, {}, rollback_state, sampler(out.logits)
+        return hidden, {}, transaction, sampler(out.logits)
 
     def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
         # Greedy MTP verification is faster with one batched LM-head projection
@@ -1396,52 +1393,12 @@ class LanguageModel(nn.Module):
         accepted,
         block_size: int,
     ) -> int:
-        if isinstance(accepted, int):
-            accepted = mx.array([accepted])
-
-        max_a = int(accepted.max().item())
-        if gdn_states:
-            cache_snapshot, verify_inputs = gdn_states
-            accepted_list = [int(a) for a in accepted.tolist()]
-            if len(set(accepted_list)) != 1:
-                raise ValueError(
-                    "DeepSeek-V4 speculative rollback requires uniform acceptance."
-                )
-            restore_cache_state(caches, cache_snapshot)
-            keep = max_a + 1
-            if keep > 0:
-                self(verify_inputs[:, :keep], cache=caches, skip_logits=True)
-            return max_a
-
-        n = max_a + 1
-        trim = block_size - n
-        is_batch = accepted.size > 1
-        valid_ends = accepted + 1
-
-        for cache in iter_leaf_caches(caches):
-            if trim > 0 and hasattr(cache, "trim"):
-                cache.trim(trim)
-            if is_batch and hasattr(cache, "_idx") and max_a > 0:
-                keys = getattr(cache, "keys", None)
-                values = getattr(cache, "values", None)
-                if keys is None or values is None:
-                    continue
-                kv_len = cache._idx
-                verify_start = kv_len - n
-                if any(
-                    verify_start + int(valid_end) < kv_len
-                    for valid_end in valid_ends.tolist()
-                ):
-                    raise RuntimeError(
-                        "DeepSeek-V4 batched speculative rollback requires uniform "
-                        f"per-row acceptance; got ragged accepts {accepted.tolist()}. "
-                        "Zeroing a rejected row's KV tail leaves phantom keys "
-                        "attended (issue #1962); set "
-                        "requires_uniform_batch_acceptance on the drafter or target "
-                        "so accepts are clamped before rollback."
-                    )
-
-        return max_a
+        return rollback_cache_transaction(
+            caches,
+            gdn_states,
+            accepted,
+            block_size,
+        )
 
     @property
     def layers(self):

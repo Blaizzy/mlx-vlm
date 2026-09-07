@@ -9,6 +9,7 @@ from mlx_vlm.models.cache import (
     CacheList,
     ChunkedKVCache,
     KVCache,
+    PoolingCache,
     RotatingKVCache,
 )
 
@@ -142,6 +143,93 @@ def test_batch_pooling_cache_tracks_left_padding_through_batch_operations():
     assert restored.left_padding == [2, 3]
     restored.prepare(left_padding=[1, 2])
     assert restored.left_padding == [3, 5]
+
+
+def _advance_pooling_cache(cache, values):
+    gate = values + 1000
+    ready, _, _ = cache.accumulate_windows(values, gate, offset=0)
+    if ready.shape[1]:
+        pooled = ready.reshape(ready.shape[0], -1, cache.ratio, ready.shape[-1]).sum(
+            axis=2
+        )
+    else:
+        pooled = mx.zeros((ready.shape[0], 0, ready.shape[-1]), dtype=ready.dtype)
+    cache.update_and_fetch(pooled)
+
+
+@pytest.mark.parametrize("initial_length", range(4))
+@pytest.mark.parametrize("keep", range(5))
+def test_pooling_cache_speculative_commit_matches_prefix_replay(initial_length, keep):
+    actual = PoolingCache(ratio=4)
+    reference = PoolingCache(ratio=4)
+    initial = mx.arange(initial_length, dtype=mx.float32).reshape(1, -1, 1)
+    block = mx.arange(10, 14, dtype=mx.float32).reshape(1, 4, 1)
+    if initial_length:
+        _advance_pooling_cache(actual, initial)
+        _advance_pooling_cache(reference, initial)
+
+    generation = actual.start_speculation(block.shape[1])
+    _advance_pooling_cache(actual, block)
+    if keep:
+        _advance_pooling_cache(reference, block[:, :keep])
+    actual.commit_speculation(keep, generation)
+    mx.eval(actual.state, reference.state)
+
+    assert actual.remainder == reference.remainder
+    assert actual.offset == reference.offset
+    if actual.remainder:
+        assert mx.array_equal(
+            actual.buf_kv[:, : actual.remainder],
+            reference.buf_kv[:, : reference.remainder],
+        ).item()
+        assert mx.array_equal(
+            actual.buf_gate[:, : actual.remainder],
+            reference.buf_gate[:, : reference.remainder],
+        ).item()
+    if reference.pooled is None:
+        assert actual.pooled is None
+    else:
+        assert mx.array_equal(actual.pooled, reference.pooled).item()
+
+
+def test_batch_pooling_cache_speculative_commit_matches_ragged_prefixes():
+    batch, ratio = 4, 4
+    padding = [3, 2, 1, 0]
+    actual = BatchPoolingCache(ratio=ratio, left_padding=padding)
+    references = [PoolingCache(ratio=ratio) for _ in range(batch)]
+    initial = mx.arange(batch * 3, dtype=mx.float32).reshape(batch, 3, 1)
+    block = mx.arange(100, 100 + batch * 4, dtype=mx.float32).reshape(batch, 4, 1)
+    keep = [1, 2, 3, 4]
+
+    _advance_pooling_cache(actual, initial)
+    for row, left_padding in enumerate(padding):
+        if left_padding < initial.shape[1]:
+            _advance_pooling_cache(
+                references[row], initial[row : row + 1, left_padding:]
+            )
+
+    generation = actual.start_speculation(block.shape[1])
+    _advance_pooling_cache(actual, block)
+    actual.commit_speculation(keep, generation)
+    for row, length in enumerate(keep):
+        _advance_pooling_cache(references[row], block[row : row + 1, :length])
+
+    mx.eval(actual.state, [reference.state for reference in references])
+    assert actual.remainder == [reference.remainder for reference in references]
+    assert actual._pool_lengths == [reference.offset for reference in references]
+    assert actual._processed == [3 - padding[row] + keep[row] for row in range(batch)]
+    for row, reference in enumerate(references):
+        remainder = reference.remainder
+        assert mx.array_equal(
+            actual.buf_kv[row : row + 1, :remainder],
+            reference.buf_kv[:, :remainder],
+        ).item()
+        pooled_length = reference.offset
+        if pooled_length:
+            assert mx.array_equal(
+                actual.pooled[row : row + 1, :pooled_length],
+                reference.pooled,
+            ).item()
 
 
 def test_empty_kv_cache_extracts_as_empty():

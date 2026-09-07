@@ -3879,7 +3879,7 @@ def test_deepseek_v4_returns_mtp_hidden_and_trims_without_snapshot():
 
     assert hidden.shape == (1, 3, cfg.hc_mult, cfg.hidden_size)
     assert shared_kv == {}
-    assert rollback_state is None
+    assert rollback_state.active
     assert cache[0].offset == 3
 
     lm.rollback_speculative_cache(cache, rollback_state, accepted=0, block_size=3)
@@ -3888,6 +3888,46 @@ def test_deepseek_v4_returns_mtp_hidden_and_trims_without_snapshot():
     logits = lm.speculative_logits_from_hidden(hidden[:, :1])
     mx.eval(logits)
     assert logits.shape == (1, 1, cfg.vocab_size)
+
+
+@pytest.mark.parametrize("accepted", range(3))
+def test_deepseek_v4_pooling_rollback_commits_without_model_replay(accepted):
+    cfg = _tiny_deepseek_v4_config()
+    cfg.compress_ratios = [4]
+    language = deepseek_language.LanguageModel(cfg)
+    language.eval()
+    prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+    verify = mx.array([[4, 5, 6]], dtype=mx.int32)
+
+    speculative_cache = language.make_cache()
+    language(prompt, cache=speculative_cache)
+    _, _, transaction = language.speculative_verify_hidden(verify, speculative_cache)
+    assert transaction.active
+    with patch.object(
+        deepseek_language.LanguageModel,
+        "__call__",
+        side_effect=AssertionError("rollback must not replay the target model"),
+    ):
+        language.rollback_speculative_cache(
+            speculative_cache,
+            transaction,
+            accepted=accepted,
+            block_size=verify.shape[1],
+        )
+
+    reference_cache = language.make_cache()
+    language(prompt, cache=reference_cache)
+    language(verify[:, : accepted + 1], cache=reference_cache)
+    probe = mx.array([[7]], dtype=mx.int32)
+    speculative_logits = language(probe, cache=speculative_cache).logits
+    reference_logits = language(probe, cache=reference_cache).logits
+    mx.eval(speculative_logits, reference_logits)
+
+    speculative_pool = speculative_cache[0][1]
+    reference_pool = reference_cache[0][1]
+    assert speculative_pool.remainder == reference_pool.remainder
+    assert speculative_pool.offset == reference_pool.offset
+    assert mx.allclose(speculative_logits, reference_logits, rtol=0, atol=1e-5).item()
 
 
 def test_deepseek_v4_replay_snapshot_required_only_when_pooling_can_cross_window():
