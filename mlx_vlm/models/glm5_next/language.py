@@ -203,16 +203,7 @@ class Glm5NextLinearAttention(nn.Module):
             )
         conv_input = mx.concatenate([conv_state, mixed], axis=1)
         if cache is not None:
-            if cache.lengths is not None:
-                ends = mx.clip(cache.lengths, 0, S)
-                positions = ends[:, None] + mx.arange(self.conv_kernel_size - 1)
-                cache[0] = mx.contiguous(
-                    mx.take_along_axis(conv_input, positions[..., None], axis=1)
-                )
-            else:
-                cache[0] = mx.contiguous(
-                    conv_input[:, -(self.conv_kernel_size - 1) :, :]
-                )
+            cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :, :])
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = mx.split(conv_out, [self.qkv_dim, 2 * self.qkv_dim], axis=-1)
@@ -236,7 +227,6 @@ class Glm5NextLinearAttention(nn.Module):
             fg.A_log.reshape(self.num_heads, 1),
             fg.dt_bias.reshape(self.num_heads, self.head_dim),
             state=state,
-            mask=mask,
             lower_bound=fg.safe_gate_lower_bound,
         )
         if cache is not None:
@@ -352,9 +342,6 @@ class Glm5NextIndexer(nn.Module):
             packed_full, [self.head_dim, 2 * self.head_dim], axis=-1
         )
         valid = valid_ch[..., 0] > 0
-        left_padding = getattr(cache, "left_padding", None)
-        if left_padding is not None:
-            valid = valid & (mx.arange(T)[None, :] >= left_padding[:, None])
 
         offset = T - S
         kv_len = T
@@ -364,13 +351,13 @@ class Glm5NextIndexer(nn.Module):
         # recompute only the suffix (last partial pool + any new pool) and reuse the
         # cached complete pools -- turns the per-step pool cost from O(T) to O(kpool).
         # Exact; falls back to full pooling on prefill, when padding is present, or when
-        # the cache is managed by continuous batching. Batched caches can roll padding
-        # or filter/extend rows without updating derived pools, even at the same batch
-        # size, so their pools must be rebuilt from the current token layout.
+        # the cached pool's batch axis no longer matches the current batch. That last
+        # guard matters under continuous batching: BatchGenerator grows/shrinks the
+        # batch (extend/filter) on the batch axis but does not carry this per-cache
+        # _pool along, so a stale _pool must be discarded and rebuilt for one step.
         if (
             S == 1
             and cache is not None
-            and left_padding is None
             and getattr(cache, "_pool", None) is not None
             and getattr(cache, "_no_pad", False)
             and cache._pool[0].shape[0] == B
@@ -724,46 +711,11 @@ class LanguageModel(nn.Module):
 
     def sanitize(self, weights):
         weights = {k: v for k, v in weights.items() if "mtp." not in k}
-        # Converted MLX exports can fuse projection output rows. Split their
-        # packed weights and quantization parameters together without requantizing.
-        unfused = {}
-        projections = {
-            "qkv_proj": (("q_proj", "k_proj", "v_proj"), 3),
-            "fbg_a_proj": (
-                ("f_a_proj", "b_proj", "g_a_proj"),
-                (
-                    self.args.linear_head_dim,
-                    self.args.linear_head_dim + self.args.linear_num_heads,
-                ),
-            ),
-            "qkv_a_proj": (
-                ("q_a_proj", "kv_a_proj_with_mqa"),
-                (self.args.q_lora_rank,),
-            ),
-            "gate_up_proj": (("gate_proj", "up_proj"), 2),
-        }
-        for key, value in weights.items():
-            parts = key.rsplit(".", 2)
-            if (
-                len(parts) == 3
-                and parts[1] in projections
-                and parts[2] in ("weight", "scales", "biases", "bias")
-            ):
-                names, splits = projections[parts[1]]
-                for name, part in zip(names, mx.split(value, splits, axis=0)):
-                    unfused[f"{parts[0]}.{name}.{parts[2]}"] = part
-            else:
-                unfused[key.replace(".qkv_conv.conv.", ".conv1d.")] = value
-        weights = unfused
         weights = DSV32Model.sanitize(self, weights)
 
         remapped = {}
         conv_parts = {}
-        fg_parts = ("A_log", "dt_bias") + tuple(
-            f"{projection}.{suffix}"
-            for projection in ("f_a_proj", "f_b_proj")
-            for suffix in ("weight", "scales", "biases", "bias")
-        )
+        fg_parts = ("A_log", "dt_bias", "f_a_proj.weight", "f_b_proj.weight")
         for k, v in weights.items():
             nk = k.replace(".hc_attn_", ".attn_hc.").replace(".hc_ffn_", ".ffn_hc.")
 

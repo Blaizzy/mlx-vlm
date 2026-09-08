@@ -532,9 +532,6 @@ def _unload_model_cache_group(cache_group: str) -> bool:
         cache["vision_cache"].clear()
 
     registry.pop(cache_group)
-    # Release local owners before collecting compiled-method cycles and clearing
-    # Metal allocations; otherwise a reload can temporarily hold two models.
-    del cache, response_generator, apc_manager
     gc.collect()
     mx.clear_cache()
     return True
@@ -617,7 +614,6 @@ def get_cached_model(
     # If this kind has a different model cached, clear only that cache group.
     if cached_cache:
         logger.info("New %s model requested; clearing its existing cache.", cache_group)
-        cached_cache = None
         _unload_model_cache_group(cache_group)
 
     if load_as_edit:
