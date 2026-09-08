@@ -2,9 +2,8 @@ from functools import lru_cache
 from typing import Optional
 
 import mlx.core as mx
-import mlx.nn as nn
 
-from ..switch_layers import QuantizedSwitchLinear
+from ...models.switch_layers import QuantizedSwitchLinear
 
 _COMMON_HEADER = r"""
 #include <metal_simdgroup>
@@ -829,29 +828,6 @@ def _affine_moe_down_kernel(
     )
 
 
-def exact_dense_block_linear(linear, x: mx.array) -> Optional[mx.array]:
-    """Project every verifier position with the target's native batch shape."""
-    if (
-        not isinstance(linear, nn.Linear)
-        or "bias" in linear
-        or x.ndim != 3
-        or x.shape[0] < 1
-        or x.shape[1] <= 1
-        or x.dtype not in (mx.bfloat16, mx.float16)
-        or linear.weight.dtype != x.dtype
-        or linear.weight.shape[1] != x.shape[-1]
-    ):
-        return None
-
-    return mx.concatenate(
-        [
-            linear(mx.contiguous(x[:, position : position + 1]))
-            for position in range(x.shape[1])
-        ],
-        axis=1,
-    )
-
-
 def exact_affine_switch_gate_up(switch, x: mx.array, indices: mx.array):
     """Project selected affine up/gate weights in one verifier dispatch."""
     up = getattr(switch, "up_proj", None)
@@ -1211,15 +1187,3 @@ def exact_hc_expand(
 def combine_moe_outputs(routed, weights, shared):
     routed = (routed * weights[..., None].astype(routed.dtype)).sum(axis=-2)
     return routed + shared
-
-
-@mx.compile
-def clamped_swiglu(gate, up, limit):
-    gate = mx.minimum(gate, limit)
-    up = mx.clip(up, -limit, limit)
-    return nn.silu(gate) * up
-
-
-@mx.compile
-def scaled_rms_norm(inputs, scale, eps):
-    return scale * mx.fast.rms_norm(inputs, None, eps)

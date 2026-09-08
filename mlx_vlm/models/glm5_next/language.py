@@ -5,57 +5,12 @@ import mlx.nn as nn
 
 from ..base import LanguageModelOutput, create_ssm_mask, scaled_dot_product_attention
 from ..cache import ArraysCache, CacheList, KVCache, PoolingCache
-from ..deepseek_v4.hyper_connection import HyperConnection, hc_expand
+from ..deepseek_v4.hyper_connection import HyperConnection
 from ..gated_delta import gated_delta_update
 from ..mla import MultiLinear
 from ..sparse_attention import indexed_sparse_attention
 from ..switch_layers import SwitchGLU
 from .config import TextConfig
-from .speculative_verifier import Glm5NextSpeculativeVerifier
-
-_SPECULATIVE_VERIFIER = Glm5NextSpeculativeVerifier()
-
-
-def _l2norm(x: mx.array, eps: float = 1e-6) -> mx.array:
-    """Reference L2 normalization used by the GLM KDA parity oracle."""
-    return x * mx.rsqrt((x * x).sum(axis=-1, keepdims=True) + eps)
-
-
-def recurrent_kimi_delta(
-    query: mx.array,
-    key: mx.array,
-    value: mx.array,
-    g: mx.array,
-    beta: mx.array,
-    state: Optional[mx.array] = None,
-):
-    """Readable recurrent KDA reference used for implementation parity tests."""
-    dtype = query.dtype
-    query = _l2norm(query.astype(mx.float32))
-    key = _l2norm(key.astype(mx.float32))
-    value = value.astype(mx.float32)
-    g = g.astype(mx.float32)
-    beta = beta.astype(mx.float32)
-    batch, length, heads, key_dim = key.shape
-    value_dim = value.shape[-1]
-    query = query * (key_dim**-0.5)
-    if state is None:
-        state = mx.zeros((batch, heads, key_dim, value_dim), dtype=mx.float32)
-    else:
-        state = state.astype(mx.float32)
-    outputs = []
-    for index in range(length):
-        q_i = query[:, index]
-        k_i = key[:, index]
-        v_i = value[:, index]
-        g_i = mx.exp(g[:, index])[..., None]
-        beta_i = beta[:, index][..., None]
-        state = state * g_i
-        memory = (state * k_i[..., None]).sum(axis=-2)
-        delta = (v_i - memory) * beta_i
-        state = state + k_i[..., None] * delta[..., None, :]
-        outputs.append((state * q_i[..., None]).sum(axis=-2))
-    return mx.stack(outputs, axis=1).astype(dtype), state
 
 
 @mx.compile
@@ -237,78 +192,19 @@ class Glm5NextLinearAttention(nn.Module):
         self.o_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.o_proj = nn.Linear(self.projection_dim, config.hidden_size, bias=False)
 
-    def __call__(
-        self,
-        x,
-        mask=None,
-        cache=None,
-        linear_fn=None,
-        output_linear_fn=None,
-        timewise_fn=None,
-        output_gate_fn=None,
-        scaled_norm_fn=None,
-    ):
-        linear_fn = linear_fn or (lambda linear, inputs: linear(inputs))
-        output_linear_fn = output_linear_fn or linear_fn
-        timewise_fn = timewise_fn or (lambda fn, inputs: fn(inputs))
-        output_gate_fn = output_gate_fn or (
-            lambda norm, output, gate: norm(output) * mx.sigmoid(gate)
-        )
-        scaled_norm_fn = scaled_norm_fn or (
-            lambda inputs, scale, eps: timewise_fn(
-                lambda values: scale * mx.fast.rms_norm(values, None, eps),
-                inputs,
-            )
-        )
-        batch, length, _ = x.shape
-        if mask is not None and mask.dtype == mx.bool_:
-            x = mx.where(mask[..., None], x, 0)
-        if cache is None:
-            qkv_state = ssm_state = None
-            lengths = None
-        else:
-            qkv_state = cache[0]
-            if qkv_state is not None and qkv_state.shape[-1] == self.projection_dim:
-                states = [cache[index] for index in range(3)]
-                qkv_state = (
-                    None
-                    if any(state is None for state in states)
-                    else mx.concatenate(states, axis=-1)
-                )
-            ssm_state = cache[3]
-            lengths = cache.lengths
-
-        qkv_out = self.qkv_conv(
-            linear_fn(self.qkv_proj, x),
-            qkv_state,
+    def _convolve(self, projected, mask, cache):
+        output, state = self.qkv_conv(
+            projected,
+            None if cache is None else cache[0],
             mask,
-            lengths,
-            return_input=cache is not None and cache.is_speculating,
+            None if cache is None else cache.lengths,
         )
-        if cache is None or not cache.is_speculating:
-            qkv, qkv_state = qkv_out
-            conv_input = None
-        else:
-            qkv, qkv_state, conv_input = qkv_out
-        q, k, v = mx.split(qkv, 3, axis=-1)
         if cache is not None:
-            cache[0] = qkv_state
-            cache[1] = cache[2] = None
+            cache[0] = state
+        return output
 
-        shape = (batch, length, self.num_heads, self.head_dim)
-        q, k, v = q.reshape(shape), k.reshape(shape), v.reshape(shape)
-        eps = 1e-6 / self.head_dim
-        q = scaled_norm_fn(q, self.scale**2, eps)
-        k = scaled_norm_fn(k, self.scale, eps)
-
-        f_a, b, g_a = mx.split(
-            linear_fn(self.fbg_a_proj, x),
-            (self.head_dim, self.head_dim + self.num_heads),
-            axis=-1,
-        )
-        a = linear_fn(self.f_b_proj, f_a).reshape(shape)
-        b = b.reshape(batch, length, self.num_heads)
-        delta_output = gated_delta_update(
+    def _recur(self, q, k, v, a, b, mask, cache):
+        output, state = gated_delta_update(
             q,
             k,
             v,
@@ -316,35 +212,37 @@ class Glm5NextLinearAttention(nn.Module):
             b,
             self.A_log.reshape(self.num_heads, 1),
             self.dt_bias.reshape(self.num_heads, self.head_dim),
-            state=ssm_state,
+            state=None if cache is None else cache[1],
             mask=mask,
             use_kernel=not self.training,
             lower_bound=self.lower_bound,
-            state_steps=(
-                length - 1
-                if cache is not None and cache.is_speculating and length > 1
-                else None
-            ),
         )
-        if cache is None or not cache.is_speculating or length <= 1:
-            out, ssm_state = delta_output
-            intermediate_states = None
-        else:
-            out, ssm_state, intermediate_states = delta_output
         if cache is not None:
-            cache[3] = ssm_state
-            if cache.is_speculating:
-                cache.record_speculative_window(
-                    0,
-                    conv_input,
-                    self.conv_kernel - 1,
-                )
-                cache.record_speculative_states(3, intermediate_states, ssm_state)
-            cache.advance(length)
+            cache[1] = state
+            cache.advance(q.shape[1])
+        return output
 
-        gate = linear_fn(self.g_b_proj, g_a).reshape(shape)
-        out = output_gate_fn(self.o_norm, out, gate).reshape(batch, length, -1)
-        return output_linear_fn(self.o_proj, out)
+    def __call__(self, x, mask=None, cache=None):
+        batch, length, _ = x.shape
+        if mask is not None and mask.dtype == mx.bool_:
+            x = mx.where(mask[..., None], x, 0)
+        qkv = self._convolve(self.qkv_proj(x), mask, cache)
+        shape = (batch, length, self.num_heads, self.head_dim)
+        q, k, v = (value.reshape(shape) for value in mx.split(qkv, 3, axis=-1))
+        eps = 1e-6 / self.head_dim
+        q = self.scale**2 * mx.fast.rms_norm(q, None, eps)
+        k = self.scale * mx.fast.rms_norm(k, None, eps)
+        f_a, b, g_a = mx.split(
+            self.fbg_a_proj(x),
+            (self.head_dim, self.head_dim + self.num_heads),
+            axis=-1,
+        )
+        a = self.f_b_proj(f_a).reshape(shape)
+        b = b.reshape(batch, length, self.num_heads)
+        output = self._recur(q, k, v, a, b, mask, cache)
+        gate = self.g_b_proj(g_a).reshape(shape)
+        output = (self.o_norm(output) * mx.sigmoid(gate)).reshape(batch, length, -1)
+        return self.o_proj(output)
 
 
 def _batch_gather(values: mx.array, indices: mx.array) -> mx.array:
@@ -490,6 +388,12 @@ class Glm5NextIndexer(nn.Module):
         probs = mx.softmax(logits, axis=2, precise=True).astype(keys.dtype)
         return (probs * keys).sum(axis=2)
 
+    def _project_keys(self, x):
+        return (
+            self.k_norm(self.wk(x)),
+            x.astype(mx.float32) @ self.index_kpool_compress_gate.T,
+        )
+
     def __call__(
         self,
         x,
@@ -498,17 +402,9 @@ class Glm5NextIndexer(nn.Module):
         cache=None,
         pool_cache=None,
         offset=0,
-        linear_fn=None,
-        projected=None,
     ):
-        linear_fn = linear_fn or (lambda linear, inputs: linear(inputs))
         batch, q_length, _ = x.shape
-        if projected is None:
-            k = self.k_norm(linear_fn(self.wk, x))
-            gate = x.astype(mx.float32) @ self.index_kpool_compress_gate.T
-            projected_q = projected_weights = None
-        else:
-            k, gate, projected_q, projected_weights = projected
+        k, gate = self._project_keys(x)
         if padding_mask is None:
             query_valid = mx.ones((batch, q_length), dtype=mx.bool_)
         else:
@@ -568,17 +464,10 @@ class Glm5NextIndexer(nn.Module):
                     self.softmax_scale,
                 )
             else:
-                q = projected_q
-                if q is None:
-                    q = linear_fn(self.wq_b, q_resid).reshape(
-                        batch, q_length, self.n_heads, self.head_dim
-                    )
-                weights = projected_weights
-                if weights is None:
-                    weights = (
-                        linear_fn(self.weights_proj, x).astype(mx.float32)
-                        * self.n_heads**-0.5
-                    )
+                q = self.wq_b(q_resid).reshape(
+                    batch, q_length, self.n_heads, self.head_dim
+                )
+                weights = self.weights_proj(x).astype(mx.float32) * self.n_heads**-0.5
                 # Keep the score matmul in the model dtype, as serving runtimes
                 # do, then aggregate heads in FP32. Query chunking bounds the
                 # [B, chunk, H, pools] temporary while evaluating every pool.
@@ -803,6 +692,15 @@ class Glm5NextAttention(nn.Module):
                 cache_offset,
             )
 
+        out, topk = self._attend(
+            q, latent, new_latent, topk, kv_cache, projected_cache, last_only
+        )
+        return self.o_proj(out), topk
+
+    def _attend(
+        self, q, latent, new_latent, topk, kv_cache, projected_cache, last_only=False
+    ):
+        batch, _, length, _ = q.shape
         if length == 1:
             kv_length = latent.shape[2]
             valid = (topk >= 0) & (topk < kv_length)
@@ -843,7 +741,7 @@ class Glm5NextAttention(nn.Module):
 
         output_length = 1 if last_only and length > 1 else length
         out = out.transpose(0, 2, 1, 3).reshape(batch, output_length, -1)
-        return self.o_proj(out), topk
+        return out, topk
 
 
 class DecoderLayer(nn.Module):
@@ -875,25 +773,28 @@ class DecoderLayer(nn.Module):
         cache=None,
         prev_topk_indices=None,
     ):
-        residual = x
-        collapsed, post, comb = self.attn_hc(x)
-        collapsed = self.input_layernorm(collapsed)
-        if self.block_type == "linear_attention":
-            collapsed = self.self_attn(collapsed, mask, cache)
+        if self.is_linear:
+            x = self.attn_hc.apply_branch(
+                x,
+                self.input_layernorm,
+                self.self_attn,
+                mask,
+                cache,
+            )
             topk = prev_topk_indices
         else:
-            collapsed, topk = self.self_attn(
-                collapsed,
+            x, topk = self.attn_hc.apply_branch(
+                x,
+                self.input_layernorm,
+                self.self_attn,
                 mask,
                 cache,
                 prev_topk_indices,
             )
-        x = hc_expand(collapsed, residual, post, comb)
-
-        residual = x
-        collapsed, post, comb = self.ffn_hc(x)
-        collapsed = self.mlp(self.post_attention_layernorm(collapsed))
-        return hc_expand(collapsed, residual, post, comb), topk
+        return (
+            self.ffn_hc.apply_branch(x, self.post_attention_layernorm, self.mlp),
+            topk,
+        )
 
 
 class Glm5NextTextModel(nn.Module):
@@ -981,24 +882,12 @@ class LanguageModel(nn.Module):
         return_hidden = kwargs.pop("return_hidden", False)
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         skip_logits = kwargs.pop("skip_logits", False)
-        speculative_verify = kwargs.pop("speculative_verify", False)
         hidden_sink = kwargs.pop("hidden_sink", None)
         if return_hidden and hidden_sink is None:
             hidden_sink = []
         if inputs is None:
             inputs = kwargs.get("input_ids")
         attention_mask = kwargs.get("attention_mask")
-        if speculative_verify:
-            return _SPECULATIVE_VERIFIER(
-                self,
-                inputs,
-                inputs_embeds=inputs_embeds,
-                cache=cache,
-                attention_mask=attention_mask,
-                hidden_sink=hidden_sink,
-                return_shared_kv=return_shared_kv,
-                skip_logits=skip_logits,
-            )
         hidden = self.model(
             inputs,
             inputs_embeds,
@@ -1019,33 +908,6 @@ class LanguageModel(nn.Module):
             logits=logits,
             hidden_states=hidden_sink,
             shared_kv_states={} if return_shared_kv else None,
-        )
-
-    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
-        return _SPECULATIVE_VERIFIER.logits_from_hidden(self, hidden)
-
-    def speculative_argmax_from_hidden(self, hidden: mx.array) -> mx.array:
-        return _SPECULATIVE_VERIFIER.argmax_from_hidden(self, hidden)
-
-    def speculative_verify_logits(self, inputs, cache, sampler):
-        return _SPECULATIVE_VERIFIER.verify(self, inputs, cache, sampler)
-
-    def speculative_verify_hidden(self, inputs, cache):
-        return _SPECULATIVE_VERIFIER.verify(self, inputs, cache)
-
-    def rollback_speculative_cache(
-        self,
-        caches: List[Any],
-        rollback_state,
-        accepted,
-        block_size: int,
-    ) -> int:
-        return _SPECULATIVE_VERIFIER.rollback(
-            self,
-            caches,
-            rollback_state,
-            accepted,
-            block_size,
         )
 
     @property
@@ -1080,7 +942,7 @@ class LanguageModel(nn.Module):
         caches = []
         for layer in self.layers:
             if layer.block_type == "linear_attention":
-                caches.append(ArraysCache(size=4))
+                caches.append(ArraysCache(size=2))
             elif layer.self_attn.indexer is None:
                 caches.append(CacheList(KVCache(), KVCache()))
             else:

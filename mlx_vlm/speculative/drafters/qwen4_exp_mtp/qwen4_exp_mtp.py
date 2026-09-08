@@ -11,27 +11,24 @@ from ....models.qwen4_exp.language import (
     Qwen4ExpGatedResidual,
     Qwen4ExpRMSNorm,
 )
-from ..deepseek_v4_mtp.deepseek_v4_mtp import DeepseekV4MTPDraftModel
+from ..mtp_base import AutoregressiveMTPDraftModel
 from .config import Qwen4ExpMTPConfig
 
 
-class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
+class Qwen4ExpMTPDraftModel(AutoregressiveMTPDraftModel):
     """Standalone runtime for Qwen4's native hyper-connection MTP head.
 
-    The draft lifecycle is shared with the DeepSeek-V4 hyper-connection head,
+    The autoregressive draft lifecycle is shared with other MTP heads,
     while input fusion and the decoder block follow Qwen4's released tensors.
     """
 
-    supports_greedy_draft_argmax = True
     # Reuse the released next-token head autoregressively with the shared
     # adaptive policy, using three drafts as the runtime ceiling.
     default_runtime_block_size = 4
     prefer_requested_block_size = False
-    requires_uniform_batch_acceptance = True
 
     def __init__(self, config: Qwen4ExpMTPConfig):
-        nn.Module.__init__(self)
-        self.config = config
+        super().__init__(config)
         text_config = config.text_config
         if text_config is None:
             raise ValueError("Qwen4ExpMTPConfig.text_config must be set")
@@ -61,20 +58,6 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
         self.hyper_connection_mixer = Qwen4ExpGatedResidual(
             layer_config, use_combine=False
         )
-
-        self._input_embed = None
-        self._lm_head_fn = None
-        self._cache: List[QSAKVCache] = []
-        self._seed_token: Optional[mx.array] = None
-        self._seed_hidden: Optional[mx.array] = None
-        self._next_position = 0
-        self._round_appended = 0
-        self._kv_valid_len = 0
-        self._position = 0
-        self._draft_round = 0
-
-        self.accept_lens: List[int] = []
-        self.draft_lens: List[int] = []
 
     @property
     def quant_predicate(self):
@@ -145,20 +128,6 @@ class Qwen4ExpMTPDraftModel(DeepseekV4MTPDraftModel):
                 position_ids=position_ids,
             )
         return self.hyper_connection_mixer(hidden), hidden
-
-    def filter_batch(self, keep) -> None:
-        if not isinstance(keep, mx.array):
-            keep = mx.array(keep, dtype=mx.int32)
-        for cache in self._cache:
-            cache.filter(keep)
-        if self._seed_token is not None:
-            self._seed_token = self._seed_token[keep]
-        if self._seed_hidden is not None:
-            self._seed_hidden = self._seed_hidden[keep]
-        for attr in ("_next_position", "_kv_valid_len", "_position"):
-            value = getattr(self, attr)
-            if isinstance(value, mx.array) and value.ndim > 0 and value.size > 1:
-                setattr(self, attr, value[keep])
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         weights = dict(weights)

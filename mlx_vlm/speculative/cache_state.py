@@ -21,7 +21,9 @@ def iter_leaf_caches(caches: Iterable[Any]):
 class SpeculativeCacheTransaction:
     """A bounded transaction over temporal and append-only caches."""
 
-    def __init__(self, entries, positions):
+    def __init__(self, entries, positions, caches, length):
+        self.caches = tuple(caches)
+        self.length = int(length)
         self._entries = entries
         self._positions = positions
         self._active = True
@@ -36,22 +38,35 @@ class SpeculativeCacheTransaction:
         for cache, generation in self._entries:
             cache.validate_speculation(lengths, generation)
 
-    def _commit_validated(self, lengths) -> None:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.abort()
+
+    def commit(self, lengths) -> None:
+        """Retain exactly these input positions, including append-only caches."""
+        if isinstance(lengths, int):
+            batch = next((c.batch_size for c, _ in self._entries), 1)
+            lengths = [lengths] * batch
+        elif isinstance(lengths, mx.array):
+            lengths = lengths.reshape(-1).tolist()
+        lengths = [int(value) for value in lengths]
+        if not lengths or any(value < 0 or value > self.length for value in lengths):
+            raise ValueError(f"Commit lengths must be between 0 and {self.length}.")
+        self.validate(lengths)
+        _trim_append_caches(self.caches, lengths, self.length, self)
         for cache, generation in self._entries:
             cache.commit_speculation(lengths, generation)
         self._active = False
-
-    def commit(self, lengths) -> None:
-        self.validate(lengths)
-        self._commit_validated(lengths)
 
     def abort(self) -> None:
         if not self._active:
             return
         for cache, generation in self._entries:
             cache.abort_speculation(generation)
-        for cache, initial in self._positions.values():
-            advance = _cache_position(cache) - initial
+        for cache, read_position, initial in self._positions.values():
+            advance = read_position() - initial
             if advance > 0:
                 cache.trim(advance)
         self._active = False
@@ -60,45 +75,41 @@ class SpeculativeCacheTransaction:
         entry = self._positions.get(id(cache))
         if entry is None:
             return None
-        return _cache_position(cache) - entry[1]
+        return entry[1]() - entry[2]
 
 
-def _cache_position(cache) -> Optional[int]:
-    offset = getattr(cache, "offset", None)
-    if isinstance(offset, int):
-        return offset
-    physical_offset = getattr(cache, "_offset", None)
-    if isinstance(physical_offset, int):
-        return physical_offset
-    physical_index = getattr(cache, "_idx", None)
-    if isinstance(physical_index, int):
-        return physical_index
+def _cache_position_reader(cache):
+    """Resolve each legacy cache's physical cursor once when binding a round."""
+    for name in ("offset", "_offset", "_idx"):
+        if isinstance(getattr(cache, name, None), int):
+            return lambda name=name: getattr(cache, name)
     size = getattr(cache, "size", None)
-    if callable(size):
-        value = size()
-        if isinstance(value, int):
-            return value
-    return None
+    return size if callable(size) and isinstance(size(), int) else None
 
 
 def start_speculative_cache(
     caches: Iterable[Any], length: int, cache_types: Optional[tuple] = None
 ):
     """Track append positions and start each capable temporal cache."""
+    leaves = tuple({id(c): c for c in iter_leaf_caches(caches)}.values())
     entries = []
     positions = {}
-    temporal = set()
-    for cache in iter_leaf_caches(caches):
-        position = _cache_position(cache)
-        if position is not None and callable(getattr(cache, "trim", None)):
-            positions.setdefault(id(cache), (cache, position))
-        if cache_types is not None and not isinstance(cache, cache_types):
-            continue
-        start = getattr(cache, "start_speculation", None)
-        if callable(start) and id(cache) not in temporal:
-            entries.append((cache, start(length)))
-            temporal.add(id(cache))
-    return SpeculativeCacheTransaction(entries, positions)
+    transaction = SpeculativeCacheTransaction(entries, positions, leaves, length)
+    try:
+        for cache in leaves:
+            start = getattr(cache, "start_speculation", None)
+            if callable(start) and (
+                cache_types is None or isinstance(cache, cache_types)
+            ):
+                entries.append((cache, start(length)))
+            else:
+                read_position = _cache_position_reader(cache)
+                if read_position is not None and callable(getattr(cache, "trim", None)):
+                    positions[id(cache)] = (cache, read_position, read_position())
+    except BaseException:
+        transaction.abort()
+        raise
+    return transaction
 
 
 def rollback_speculative_cache(
@@ -115,18 +126,43 @@ def rollback_speculative_cache(
     else:
         accepted_values = [int(value) for value in accepted]
 
-    max_accepted = max(accepted_values)
     retained = [value + 1 for value in accepted_values]
-    trim = int(block_size) - (max_accepted + 1)
-    is_batch = len(accepted_values) > 1
-    right_padding = [max_accepted - value for value in accepted_values]
-    has_ragged_tail = is_batch and any(right_padding)
-
     if isinstance(transaction, SpeculativeCacheTransaction):
-        transaction.validate(retained)
+        transaction.commit(retained)
+    else:
+        # Compatibility for model adapters that still return legacy state.
+        _trim_append_caches(iter_leaf_caches(caches), retained, block_size)
+    return max(accepted_values)
+
+
+def abort_speculative_round(state):
+    """Release and restore an unfinished transaction returned by a target."""
+    if isinstance(state, SpeculativeCacheTransaction):
+        state.abort()
+
+
+def commit_speculative_round(model, caches, state, accepted, block_size):
+    """Translate accepted draft counts once at the legacy target boundary."""
+    if isinstance(accepted, int):
+        values = [accepted]
+    elif isinstance(accepted, mx.array):
+        values = accepted.reshape(-1).tolist()
+    else:
+        values = list(accepted)
+    if isinstance(state, SpeculativeCacheTransaction):
+        state.commit([value + 1 for value in values])
+    elif any(value < block_size - 1 for value in values):
+        model.rollback_speculative_cache(caches, state, accepted, block_size)
+
+
+def _trim_append_caches(caches, retained, block_size, transaction=None):
+    max_retained = max(retained)
+    trim = int(block_size) - max_retained
+    right_padding = [max_retained - value for value in retained]
+    has_ragged_tail = any(right_padding)
 
     actions = []
-    for cache in iter_leaf_caches(caches):
+    for cache in caches:
         if getattr(cache, "is_speculating", False):
             continue
         trim_cache = getattr(cache, "trim", None)
@@ -140,7 +176,7 @@ def rollback_speculative_cache(
             if advance is not None:
                 if advance == 0:
                     continue
-                cache_trim = max(0, advance - (max_accepted + 1))
+                cache_trim = max(0, advance - max_retained)
                 if has_ragged_tail and advance != int(block_size):
                     raise RuntimeError(
                         f"{type(cache).__name__} advanced by {advance} tokens "
@@ -177,13 +213,11 @@ def rollback_speculative_cache(
             cache.prepare(right_padding=right_padding)
             cache.finalize()
 
-    if isinstance(transaction, SpeculativeCacheTransaction):
-        transaction._commit_validated(retained)
-    return max_accepted
-
 
 __all__ = [
     "SpeculativeCacheTransaction",
+    "abort_speculative_round",
+    "commit_speculative_round",
     "iter_leaf_caches",
     "rollback_speculative_cache",
     "start_speculative_cache",

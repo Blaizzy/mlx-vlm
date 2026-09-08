@@ -1368,14 +1368,14 @@ class LanguageModel(nn.Module):
                 skip_logits=not sample_logits,
                 skip_final_norm=not sample_logits,
             )
-        except Exception:
+            hidden = out.hidden_states[-1]
+            if not sample_logits:
+                return hidden, {}, transaction
+
+            return hidden, {}, transaction, sampler(out.logits)
+        except BaseException:
             transaction.abort()
             raise
-        hidden = out.hidden_states[-1]
-        if not sample_logits:
-            return hidden, {}, transaction
-
-        return hidden, {}, transaction, sampler(out.logits)
 
     def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
         # Greedy MTP verification is faster with one batched LM-head projection

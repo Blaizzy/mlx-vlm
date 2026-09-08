@@ -5,6 +5,11 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..models import cache
+from .cache_state import (
+    abort_speculative_round,
+    commit_speculative_round,
+    iter_leaf_caches,
+)
 from .common import (
     _batch_cache_left_padding,
     _dflash_block_total,
@@ -16,6 +21,7 @@ from .common import (
     _SpeculativeSamplerRNG,
     generation_stream,
 )
+from .targets import bind_speculative_target
 
 
 @dataclass
@@ -23,7 +29,15 @@ class _MTPVerifyResult:
     hidden: mx.array
     shared_kv_states: dict
     target_tokens: Optional[mx.array] = None
-    gdn_states: Optional[list] = None
+    rollback_state: Any = None
+
+    def abort(self):
+        abort_speculative_round(self.rollback_state)
+
+    def commit(self, model, caches, accepted, block_size):
+        commit_speculative_round(
+            model, caches, self.rollback_state, accepted, block_size
+        )
 
 
 def _mtp_shared_kv_from_prompt_cache(
@@ -82,7 +96,7 @@ def _mtp_verify_without_logits(
         return _MTPVerifyResult(
             hidden=hidden,
             shared_kv_states=shared_kv_states or {},
-            gdn_states=gdn_states,
+            rollback_state=gdn_states,
         )
 
     layers = getattr(getattr(lm, "model", None), "layers", [])
@@ -130,7 +144,7 @@ def _mtp_verify_with_model_method(
         hidden=hidden,
         shared_kv_states=shared_kv_states or {},
         target_tokens=target_tokens,
-        gdn_states=gdn_states,
+        rollback_state=gdn_states,
     )
 
 
@@ -142,37 +156,55 @@ def _mtp_verify_target(
     *,
     sample_target_tokens: bool = True,
 ) -> _MTPVerifyResult:
-    if sample_target_tokens:
-        argmax_from_hidden = getattr(lm, "speculative_argmax_from_hidden", None)
-        if callable(argmax_from_hidden):
-            result = _mtp_verify_without_logits(lm, verify_input, prompt_cache)
-            if result is not None:
-                target_tokens = argmax_from_hidden(result.hidden)
-                if target_tokens is not None:
+    lm = bind_speculative_target(lm)
+    result = None
+    try:
+        if sample_target_tokens:
+            argmax_from_hidden = getattr(lm, "speculative_argmax_from_hidden", None)
+            if callable(argmax_from_hidden):
+                result = _mtp_verify_without_logits(lm, verify_input, prompt_cache)
+                if result is not None:
+                    target_tokens = argmax_from_hidden(result.hidden)
+                    if target_tokens is None:
+                        # Reuse this forward: running the fallback verifier again
+                        # would append the same input twice and lose its transaction.
+                        project = getattr(lm, "speculative_logits_from_hidden", None)
+                        if not callable(project):
+                            raise RuntimeError(
+                                "Target argmax fallback requires hidden-to-logits projection."
+                            )
+                        target_tokens = sampler(project(result.hidden))
                     result.target_tokens = target_tokens
                     return result
 
-        result = _mtp_verify_with_model_method(lm, verify_input, prompt_cache, sampler)
-        if result is not None:
-            return result
+            result = _mtp_verify_with_model_method(
+                lm, verify_input, prompt_cache, sampler
+            )
+            if result is not None:
+                return result
 
-    if hasattr(lm, "speculative_logits_from_hidden"):
-        result = _mtp_verify_without_logits(lm, verify_input, prompt_cache)
-        if result is not None:
-            return result
+        if hasattr(lm, "speculative_logits_from_hidden"):
+            result = _mtp_verify_without_logits(lm, verify_input, prompt_cache)
+            if result is not None:
+                return result
 
-    verify_out = lm(
-        verify_input,
-        cache=prompt_cache,
-        return_hidden=True,
-        return_shared_kv=True,
-    )
-    return _MTPVerifyResult(
-        hidden=verify_out.hidden_states[-1],
-        shared_kv_states=verify_out.shared_kv_states,
-        target_tokens=sampler(verify_out.logits),
-        gdn_states=verify_out.gdn_states,
-    )
+        verify_out = lm(
+            verify_input,
+            cache=prompt_cache,
+            return_hidden=True,
+            return_shared_kv=True,
+        )
+        result = _MTPVerifyResult(
+            hidden=verify_out.hidden_states[-1],
+            shared_kv_states=verify_out.shared_kv_states,
+            rollback_state=verify_out.gdn_states,
+        )
+        result.target_tokens = sampler(verify_out.logits)
+        return result
+    except BaseException:
+        if result is not None:
+            result.abort()
+        raise
 
 
 def _mtp_draft_hidden(lm: nn.Module, hidden: mx.array) -> mx.array:
@@ -537,20 +569,13 @@ def _mtp_rounds(
     token_dtype: mx.Dtype = mx.int32,
     greedy_sampling: bool = False,
 ) -> Generator[Tuple[int, None], None, None]:
-    """Gemma 4 MTP (Single-Position Multi-Token) speculative-decoding round loop.
-
-    Mirrors ``_dflash_rounds`` but with three differences:
-    (1) the drafter consumes the target's last-layer hidden + last-layer
-    shared K/V per layer-type rather than concatenated multi-layer hiddens;
-    (2) ``draft_block`` is autoregressive (K small forwards) rather than a
-    single masked forward; (3) ``rollback_speculative_cache`` ignores
-    ``gdn_states`` (Gemma 4 has no SSM/GDN state).
-    """
-    lm = model.language_model if hasattr(model, "language_model") else model
+    """Verify autoregressive MTP drafts and commit accepted state before emission."""
+    lm = bind_speculative_target(
+        model.language_model if hasattr(model, "language_model") else model
+    )
     if not hasattr(lm, "rollback_speculative_cache"):
         raise RuntimeError(
             f"{type(lm).__name__} does not implement rollback_speculative_cache. "
-            "MTP speculative decoding currently only supports gemma4."
         )
 
     block_total = _dflash_block_total(draft_model, draft_block_size)
@@ -607,41 +632,65 @@ def _mtp_rounds(
         if bs <= 1:
             break
 
-        draft_tokens = sampler_rng.draft_tokens(
-            draft_model.draft_block,
-            b,
-            hidden,
-            None,
-            bs,
-            sampler,
-            token_dtype,
-            **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
-        )
-
-        with mx.stream(generation_stream):
-            verify_input = mx.concatenate(
-                [mx.array([[b]], dtype=token_dtype), draft_tokens], axis=1
-            )
-            verify = _mtp_verify_target(
-                lm,
-                verify_input,
-                prompt_cache,
+        verify = None
+        try:
+            draft_tokens = sampler_rng.draft_tokens(
+                draft_model.draft_block,
+                b,
+                hidden,
+                None,
+                bs,
                 sampler,
-                sample_target_tokens=greedy_sampling,
+                token_dtype,
+                **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
             )
-        accepted, new_tokens = _mtp_acceptance_walk(
-            lm,
-            verify,
-            draft_tokens,
-            sampler,
-            max_tokens - emitted,
-            row_id=0,
-            base_position=emitted,
-        )
-        sampler_rng.target_sampled(
-            sync_draft=not _sampler_supports_positioned_target(sampler)
-        )
-        _record_speculative_round(draft_model, accepted, bs - 1)
+
+            with mx.stream(generation_stream):
+                verify_input = mx.concatenate(
+                    [mx.array([[b]], dtype=token_dtype), draft_tokens], axis=1
+                )
+                verify = _mtp_verify_target(
+                    lm,
+                    verify_input,
+                    prompt_cache,
+                    sampler,
+                    sample_target_tokens=greedy_sampling,
+                )
+            accepted, new_tokens = _mtp_acceptance_walk(
+                lm,
+                verify,
+                draft_tokens,
+                sampler,
+                max_tokens - emitted,
+                row_id=0,
+                base_position=emitted,
+            )
+            sampler_rng.target_sampled(
+                sync_draft=not _sampler_supports_positioned_target(sampler)
+            )
+            _record_speculative_round(draft_model, accepted, bs - 1)
+
+            accept_verified = getattr(draft_model, "accept_verified_tokens", None)
+            if callable(accept_verified):
+                sampler_rng.draft_call(
+                    accept_verified,
+                    verify.hidden,
+                    draft_tokens,
+                    accepted,
+                    new_tokens,
+                    sampler,
+                    token_dtype,
+                    **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
+                )
+
+            verify.commit(lm, prompt_cache, accepted, bs)
+        except BaseException:
+            if verify is not None:
+                verify.abort()
+            abort_draft = getattr(draft_model, "abort_draft_round", None)
+            if callable(abort_draft):
+                abort_draft()
+            raise
 
         for tok in new_tokens:
             yield tok, None
@@ -649,27 +698,9 @@ def _mtp_rounds(
             if emitted >= max_tokens:
                 return
 
-        accept_verified = getattr(draft_model, "accept_verified_tokens", None)
-        if callable(accept_verified):
-            sampler_rng.draft_call(
-                accept_verified,
-                verify.hidden,
-                draft_tokens,
-                accepted,
-                new_tokens,
-                sampler,
-                token_dtype,
-                **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
-            )
-
         # Hidden for next round: pick the slot of the newly accepted bonus.
         hidden = _mtp_draft_hidden(lm, verify.hidden[:, accepted : accepted + 1, :])
         b = new_tokens[-1] if new_tokens else b
-
-        rollback = getattr(lm, "rollback_speculative_cache", None)
-        if accepted < bs - 1 and callable(rollback):
-            with mx.stream(generation_stream):
-                rollback(prompt_cache, verify.gdn_states, accepted, bs)
 
         next_shared_kv = _slice_shared_kv_after_reject(
             verify.shared_kv_states, bs - (accepted + 1)
@@ -687,11 +718,12 @@ def _mtp_rounds(
 
 
 def _mtp_cache_offset(prompt_cache: List[Any]) -> Any:
-    for cache_entry in prompt_cache:
+    entries = tuple(iter_leaf_caches(prompt_cache))
+    for cache_entry in entries:
         offset = getattr(cache_entry, "offset", None)
         if offset is not None:
             return offset
-    for cache_entry in prompt_cache:
+    for cache_entry in entries:
         idx = getattr(cache_entry, "_idx", None)
         if idx is not None:
             return idx
@@ -839,7 +871,9 @@ def _mtp_rounds_batch(
     autoregressive, and the per-round ``shared_kv`` snapshot is normalized
     back to the unbatched prefix-valid layout before each drafter rebind.
     """
-    lm = model.language_model if hasattr(model, "language_model") else model
+    lm = bind_speculative_target(
+        model.language_model if hasattr(model, "language_model") else model
+    )
     if not hasattr(lm, "rollback_speculative_cache"):
         raise RuntimeError(
             f"{type(lm).__name__} does not implement rollback_speculative_cache."
@@ -924,109 +958,120 @@ def _mtp_rounds_batch(
 
         # Draft (autoregressive K-step). hidden / shared_kv state was set
         # via set_shared_kv above; the drafter pulls it from there.
-        draft_tokens = sampler_rng.draft_tokens(
-            _mtp_draft_block_active,
-            draft_model,
-            b_active,
-            hidden,
-            bs,
-            sampler,
-            token_dtype,
-            positions_active,
-            greedy_sampling=greedy_sampling,
-        )
-
-        # Verify
-        with mx.stream(generation_stream):
-            verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
-            verify = _mtp_verify_target(
-                lm,
-                verify_input,
-                prompt_cache,
-                sampler,
-                sample_target_tokens=greedy_sampling,
-            )
-            hidden_full = verify.hidden  # [B_active, bs, H]
-
-        # Walk per-row
-        budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
-        if verify.target_tokens is not None:
-            sampler_rng.target_eval(verify.target_tokens, hidden_full)
-            accepted_list, new_tokens_list = _speculative_walk_batch(
-                draft_tokens, verify.target_tokens, budgets
-            )
-            sampler_rng.sync_draft_to_target()
-            if (
-                n_active > 1
-                and _requires_uniform_batch_acceptance(draft_model, lm)
-                and len(set(accepted_list)) > 1
-            ):
-                accepted_list, new_tokens_list = (
-                    _speculative_walk_batch_uniform_acceptance(
-                        draft_tokens,
-                        verify.target_tokens,
-                        accepted_list,
-                        budgets,
-                    )
-                )
-        else:
-            sampler_rng.target_eval(hidden_full)
-            if _mtp_use_uniform_deferred_walk(
+        verify = None
+        try:
+            draft_tokens = sampler_rng.draft_tokens(
+                _mtp_draft_block_active,
                 draft_model,
-                n_active=n_active,
-                greedy_sampling=greedy_sampling,
-                sampler=sampler,
-                target_model=lm,
-            ):
-                accepted_list, new_tokens_list = (
-                    _speculative_walk_batch_deferred_uniform(
-                        lm,
-                        hidden_full,
-                        draft_tokens,
-                        sampler,
-                        budgets,
-                    )
-                )
-            else:
-                accepted_list, new_tokens_list = (
-                    _speculative_walk_batch_deferred_greedy(
-                        lm,
-                        hidden_full,
-                        draft_tokens,
-                        sampler,
-                        budgets,
-                        row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
-                        base_positions=[
-                            emitted[active_idx[j]] for j in range(n_active)
-                        ],
-                    )
-                )
-            sampler_rng.target_sampled(
-                sync_draft=not _sampler_supports_positioned_target(sampler)
-            )
-        # Keep the adaptive block-size history on a per-round basis so
-        # batched MTP reacts like the singleton loop instead of letting
-        # batch size change the controller signal.
-        _record_speculative_round(
-            draft_model,
-            sum(accepted_list) / len(accepted_list),
-            bs - 1,
-        )
-
-        max_a = max(accepted_list)
-
-        accept_verified = getattr(draft_model, "accept_verified_tokens_batch", None)
-        if callable(accept_verified):
-            sampler_rng.draft_call(
-                accept_verified,
-                hidden_full,
-                draft_tokens,
-                accepted_list,
-                new_tokens_list,
+                b_active,
+                hidden,
+                bs,
                 sampler,
                 token_dtype,
-                **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
+                positions_active,
+                greedy_sampling=greedy_sampling,
             )
+
+            # Verify
+            with mx.stream(generation_stream):
+                verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
+                verify = _mtp_verify_target(
+                    lm,
+                    verify_input,
+                    prompt_cache,
+                    sampler,
+                    sample_target_tokens=greedy_sampling,
+                )
+                hidden_full = verify.hidden  # [B_active, bs, H]
+
+            # Walk per-row
+            budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
+            if verify.target_tokens is not None:
+                sampler_rng.target_eval(verify.target_tokens, hidden_full)
+                accepted_list, new_tokens_list = _speculative_walk_batch(
+                    draft_tokens, verify.target_tokens, budgets
+                )
+                sampler_rng.sync_draft_to_target()
+                if (
+                    n_active > 1
+                    and _requires_uniform_batch_acceptance(draft_model, lm)
+                    and len(set(accepted_list)) > 1
+                ):
+                    accepted_list, new_tokens_list = (
+                        _speculative_walk_batch_uniform_acceptance(
+                            draft_tokens,
+                            verify.target_tokens,
+                            accepted_list,
+                            budgets,
+                        )
+                    )
+            else:
+                sampler_rng.target_eval(hidden_full)
+                if _mtp_use_uniform_deferred_walk(
+                    draft_model,
+                    n_active=n_active,
+                    greedy_sampling=greedy_sampling,
+                    sampler=sampler,
+                    target_model=lm,
+                ):
+                    accepted_list, new_tokens_list = (
+                        _speculative_walk_batch_deferred_uniform(
+                            lm,
+                            hidden_full,
+                            draft_tokens,
+                            sampler,
+                            budgets,
+                        )
+                    )
+                else:
+                    accepted_list, new_tokens_list = (
+                        _speculative_walk_batch_deferred_greedy(
+                            lm,
+                            hidden_full,
+                            draft_tokens,
+                            sampler,
+                            budgets,
+                            row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
+                            base_positions=[
+                                emitted[active_idx[j]] for j in range(n_active)
+                            ],
+                        )
+                    )
+                sampler_rng.target_sampled(
+                    sync_draft=not _sampler_supports_positioned_target(sampler)
+                )
+            # Keep the adaptive block-size history on a per-round basis so
+            # batched MTP reacts like the singleton loop instead of letting
+            # batch size change the controller signal.
+            _record_speculative_round(
+                draft_model,
+                sum(accepted_list) / len(accepted_list),
+                bs - 1,
+            )
+
+            max_a = max(accepted_list)
+
+            accept_verified = getattr(draft_model, "accept_verified_tokens_batch", None)
+            if callable(accept_verified):
+                sampler_rng.draft_call(
+                    accept_verified,
+                    hidden_full,
+                    draft_tokens,
+                    accepted_list,
+                    new_tokens_list,
+                    sampler,
+                    token_dtype,
+                    **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
+                )
+
+            verify.commit(lm, prompt_cache, accepted_list, bs)
+        except BaseException:
+            if verify is not None:
+                verify.abort()
+            abort_draft = getattr(draft_model, "abort_draft_round", None)
+            if callable(abort_draft):
+                abort_draft()
+            raise
 
         # Per-row hidden: each row picks its own accepted slot from
         # hidden_full. Build [B_active, 1, H] with row-i's hidden at
@@ -1064,14 +1109,6 @@ def _mtp_rounds_batch(
             if new_tokens_list[j]:
                 b[orig] = new_tokens_list[j][-1]
             positions[orig] = positions[orig] + accepted_list[j] + 1
-
-        # Rollback target cache (uniform trim by ``bs - max_a - 1`` plus
-        # per-row tail-zero on rows that accepted less).
-        if any(a < bs - 1 for a in accepted_list):
-            with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(
-                    prompt_cache, verify.gdn_states, accepted_list, bs
-                )
 
         # Slice + tail-zero ``verify.shared_kv_states`` to match the
         # post-rollback target cache. ``set_shared_kv()`` will normalize the

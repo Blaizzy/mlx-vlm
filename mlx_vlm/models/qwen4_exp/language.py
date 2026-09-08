@@ -1237,47 +1237,8 @@ class ShardedEmbedding(nn.Module):
             offsets.append(offsets[-1] + size)
         self.shard_offsets = tuple(offsets)
         self.dims = dims
-        self.fused = None
-
-    def fuse_quantized(self):
-        """Consolidate lazy quantized shards into one device-indexed table.
-
-        Materializing the table before the rest of a lazy model prevents the
-        source shards, destination table, and all other weights from being live
-        at the same time.
-        """
-        if self.fused is not None:
-            return self
-
-        shards = list(self.shards)
-        if not shards:
-            raise ValueError("cannot fuse an empty sharded embedding")
-        if not all(isinstance(shard, nn.QuantizedEmbedding) for shard in shards):
-            raise TypeError("PLE fusion requires quantized embedding shards")
-
-        formats = {(shard.group_size, shard.bits, shard.mode) for shard in shards}
-        if len(formats) != 1:
-            raise ValueError("embedding shards use different quantization formats")
-        group_size, bits, mode = formats.pop()
-        fused = nn.QuantizedEmbedding(1, self.dims, group_size, bits, mode=mode)
-        fused.weight = mx.concatenate([shard.weight for shard in shards], axis=0)
-        fused.scales = mx.concatenate([shard.scales for shard in shards], axis=0)
-        biases = [shard.get("biases") for shard in shards]
-        if any((bias is None) != (biases[0] is None) for bias in biases):
-            raise ValueError("embedding shards disagree on quantized biases")
-        fused.biases = None if biases[0] is None else mx.concatenate(biases, axis=0)
-        fused.num_embeddings = self.shard_offsets[-1]
-
-        self.fused = fused
-        self.shards = []
-        mx.eval(fused.parameters())
-        mx.clear_cache()
-        return self
 
     def __call__(self, indices: mx.array) -> mx.array:
-        if self.fused is not None:
-            return self.fused(indices)
-
         flat = indices.reshape(-1)
         # One tiny host sync avoids scheduling gathers against all 128 giant
         # PLE shards for every token.
@@ -2050,18 +2011,13 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
         position_ids=None,
         skip_logits=False,
     ):
-        transaction = start_speculative_cache(cache or [], inputs.shape[1])
-        try:
-            hidden = self._model(
-                language_model.model,
-                inputs,
-                cache,
-                inputs_embeds,
-                position_ids,
-            )
-        except Exception:
-            transaction.abort()
-            raise
+        hidden = self._model(
+            language_model.model,
+            inputs,
+            cache,
+            inputs_embeds,
+            position_ids,
+        )
         logits_hidden = self._hyper_connection(
             language_model.model.hyper_connection_mixer, hidden
         )
@@ -2076,7 +2032,6 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
         return LanguageModelOutput(
             logits=logits,
             hidden_states=[hidden],
-            gdn_states=transaction,
             shared_kv_states={},
         )
 
@@ -2097,16 +2052,6 @@ class LanguageModel(Qwen3_5LanguageModel):
         self._rope_deltas = None
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
-
-    def fuse_ple_embeddings(self):
-        """Consolidate resident PLE shards for device-side indexed lookup."""
-        for layer in self.model.layers:
-            if "ple" not in layer:
-                continue
-            embedding = layer.ple.ple_embedding.ngram_embedding
-            if isinstance(embedding, ShardedEmbedding):
-                embedding.fuse_quantized()
-        return self
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
         return_hidden = bool(kwargs.get("return_hidden", False))
@@ -2234,18 +2179,23 @@ class LanguageModel(Qwen3_5LanguageModel):
         position_ids = offsets[:, None] + mx.arange(length, dtype=mx.int64)[None]
         if self._position_ids is not None and self._position_ids.ndim == 3:
             position_ids = mx.broadcast_to(position_ids[None], (3, batch, length))
-        output = _QWEN4_BATCH_INVARIANT_FORWARD(
-            self,
-            inputs,
-            cache=cache,
-            position_ids=position_ids,
-            skip_logits=sampler is None,
-        )
-        rollback_state = output.gdn_states
-        hidden = output.hidden_states[-1]
-        if sampler is None:
-            return hidden, {}, rollback_state
-        return hidden, {}, rollback_state, sampler(output.logits)
+        transaction = start_speculative_cache(cache, inputs.shape[1])
+        try:
+            output = _QWEN4_BATCH_INVARIANT_FORWARD(
+                self,
+                inputs,
+                cache=cache,
+                position_ids=position_ids,
+                skip_logits=sampler is None,
+            )
+            rollback_state = transaction
+            hidden = output.hidden_states[-1]
+            if sampler is None:
+                return hidden, {}, rollback_state
+            return hidden, {}, rollback_state, sampler(output.logits)
+        except BaseException:
+            transaction.abort()
+            raise
 
     def speculative_verify_hidden(self, inputs: mx.array, cache):
         return self._speculative_verify(inputs, cache)

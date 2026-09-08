@@ -12,19 +12,10 @@ from ....models.cache import (
     PoolingCache,
 )
 from ....models.glm5_next.language import Glm5NextAttention, Glm5NextMoE
+from ...cache_state import start_speculative_cache
 from ...common import _prepare_ragged_mtp_replay
-from ..deepseek_v4_mtp.deepseek_v4_mtp import DeepseekV4MTPDraftModel
+from ..mtp_base import AutoregressiveMTPDraftModel
 from .config import Glm5NextMTPConfig
-
-
-def _clone_tree(value):
-    if isinstance(value, mx.array):
-        return mx.array(value)
-    if isinstance(value, tuple):
-        return tuple(_clone_tree(item) for item in value)
-    if isinstance(value, list):
-        return [_clone_tree(item) for item in value]
-    return value
 
 
 class Glm5NextMTPBlock(nn.Module):
@@ -52,7 +43,7 @@ class Glm5NextMTPBlock(nn.Module):
         return x + self.mlp(self.post_attention_layernorm(x))
 
 
-class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
+class Glm5NextMTPDraftModel(AutoregressiveMTPDraftModel):
     """Native GLM-5-Next MTP drafter backed by checkpoint decoder layer 45."""
 
     prefer_requested_block_size = False
@@ -61,8 +52,7 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
     supports_left_padded_prefill = True
 
     def __init__(self, config: Glm5NextMTPConfig):
-        nn.Module.__init__(self)
-        self.config = config
+        super().__init__(config)
         text_config = config.text_config
         if text_config is None:
             raise ValueError("Glm5NextMTPConfig.text_config must be set")
@@ -83,20 +73,8 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
         self.mtp_block = Glm5NextMTPBlock(layer_config, layer_idx)
         self.shared_head_norm = nn.RMSNorm(hidden_size, eps=text_config.rms_norm_eps)
 
-        self._input_embed = None
-        self._lm_head_fn = None
-        self._cache: List[CacheList] = []
-        self._seed_token: Optional[mx.array] = None
-        self._seed_hidden: Optional[mx.array] = None
-        self._next_position = 0
-        self._round_appended = 0
-        self._kv_valid_len = 0
-        self._position = 0
-        self._draft_round = 0
-        self._round_cache_snapshot = None
-        self._last_only = False
-        self.accept_lens: List[int] = []
-        self.draft_lens: List[int] = []
+        self._round_transaction = None
+        self._round_initial = None
 
     @property
     def quant_predicate(self):
@@ -115,6 +93,7 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
     def reset(
         self, target_model, left_padding: Optional[List[int]] = None
     ) -> List[CacheList]:
+        self.abort_draft_round()
         self.bind(target_model)
         self.accept_lens = []
         self.draft_lens = []
@@ -124,8 +103,7 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
         self._seed_hidden = None
         self._next_position = 0
         self._round_appended = 0
-        self._round_cache_snapshot = None
-        self._last_only = False
+        self._round_transaction = None
         return self._cache
 
     def draft_eval_state(self):
@@ -161,13 +139,9 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
         kv_valid_len=None,
         left_padding=None,
     ) -> None:
-        del shared_kv_states, left_padding
+        del shared_kv_states, left_padding, position
         if kv_valid_len is None:
             kv_valid_len = kv_offset
-        if position is None:
-            position = kv_valid_len
-        self._kv_valid_len = kv_valid_len
-        self._position = position
         if not self._cache or all(cache.empty() for cache in self._cache):
             self._next_position = kv_valid_len
 
@@ -214,6 +188,8 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
         hidden: mx.array,
         tokens: mx.array,
         cache: Optional[List[CacheList]],
+        *,
+        last_only=False,
     ) -> Tuple[mx.array, mx.array]:
         del tokens
         hidden = self._target_hidden(hidden)
@@ -225,177 +201,118 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
         h = self.mtp_block(
             h,
             None if cache is None else cache[0],
-            last_only=self._last_only,
+            last_only=last_only,
         )
         h = self.shared_head_norm(h)
         return h, h
 
-    def draft_block(self, *args, **kwargs) -> mx.array:
-        if self._cache:
-            self._round_cache_snapshot = []
-            for cache in self._cache:
-                snapshots = []
-                for subcache in cache.caches:
-                    if isinstance(subcache, (KVCache, BatchKVCache)):
-                        snapshots.append(None)
-                    elif isinstance(subcache, PoolingCache):
-                        remainder = int(subcache.remainder)
-                        total = remainder + 1
-                        overwrite = (
-                            total % subcache.ratio if total >= subcache.ratio else total
-                        )
-                        preserve = min(remainder, overwrite)
-                        snapshots.append(
-                            (
-                                "pooling",
-                                remainder,
-                                (
-                                    None
-                                    if preserve == 0 or subcache.buf_kv is None
-                                    else _clone_tree(subcache.buf_kv[:, :preserve])
-                                ),
-                                (
-                                    None
-                                    if preserve == 0 or subcache.buf_gate is None
-                                    else _clone_tree(subcache.buf_gate[:, :preserve])
-                                ),
-                                (
-                                    None
-                                    if subcache.pooled is None
-                                    else subcache.pooled.shape[1]
-                                ),
-                            )
-                        )
-                    else:
-                        snapshots.append(
-                            (
-                                "full",
-                                _clone_tree(subcache.state),
-                                _clone_tree(subcache.meta_state),
-                            )
-                        )
-                self._round_cache_snapshot.append(snapshots)
-            self._round_snapshot_position = _clone_tree(self._next_position)
-        else:
-            self._round_cache_snapshot = None
-        return super().draft_block(*args, **kwargs)
+    def draft_block(
+        self,
+        last_bonus,
+        hidden,
+        cache,
+        block_size,
+        sampler,
+        token_dtype=mx.int32,
+        greedy=False,
+    ):
+        self._round_initial = (self._next_position, self._seed_token, self._seed_hidden)
+        # A cached seed contributes a token without appending a draft state.
+        seeded = self._seed_token is not None and self._seed_hidden is not None
+        steps = block_size - 1 - int(seeded)
+        self._round_transaction = (
+            start_speculative_cache(self._cache, steps) if steps > 0 else None
+        )
+        try:
+            return super().draft_block(
+                last_bonus, hidden, cache, block_size, sampler, token_dtype, greedy
+            )
+        except BaseException:
+            self.abort_draft_round()
+            raise
 
-    def _restore_untrimmable_round(self, accepted: int) -> None:
-        rejected_appended = max(0, self._round_appended - int(accepted))
-        if not rejected_appended or self._round_cache_snapshot is None:
-            return
-        for cache, snapshots in zip(self._cache, self._round_cache_snapshot):
-            for subcache, snapshot in zip(cache.caches, snapshots):
-                if snapshot is None:
-                    subcache.trim(self._round_appended)
-                    continue
-                kind = snapshot[0]
-                if kind == "pooling":
-                    _, remainder, buf_kv, buf_gate, pooled_length = snapshot
-                    subcache.remainder = remainder
-                    if buf_kv is not None:
-                        subcache.buf_kv[:, : buf_kv.shape[1]] = buf_kv
-                        subcache.buf_gate[:, : buf_gate.shape[1]] = buf_gate
-                    subcache.pooled = (
-                        None
-                        if pooled_length is None
-                        else subcache.pooled[:, :pooled_length]
-                    )
-                    continue
-                _, state, meta_state = snapshot
-                subcache.meta_state = _clone_tree(meta_state)
-                subcache.state = _clone_tree(state)
-        self._next_position = _clone_tree(self._round_snapshot_position)
+    def abort_draft_round(self):
+        if self._round_transaction is not None:
+            self._round_transaction.abort()
+            self._round_transaction = None
+        if self._round_initial is not None:
+            self._next_position, self._seed_token, self._seed_hidden = (
+                self._round_initial
+            )
+            self._round_initial = None
         self._round_appended = 0
 
-    def accept_verified_tokens(self, *args, **kwargs) -> None:
-        accepted = kwargs.get("accepted")
-        if accepted is None and len(args) >= 3:
-            accepted = args[2]
-        self._restore_untrimmable_round(int(accepted))
-        self._last_only = True
-        try:
-            super().accept_verified_tokens(*args, **kwargs)
-        finally:
-            self._last_only = False
-        self._round_cache_snapshot = None
+    def accept_verified_tokens(
+        self,
+        verify_hidden,
+        draft_tokens,
+        accepted,
+        new_tokens,
+        sampler,
+        token_dtype=mx.int32,
+        greedy=False,
+    ):
+        self.accept_verified_tokens_batch(
+            verify_hidden,
+            draft_tokens,
+            [accepted],
+            [new_tokens],
+            sampler,
+            token_dtype,
+            greedy,
+        )
 
     def accept_verified_tokens_batch(
         self,
-        verify_hidden: mx.array,
-        draft_tokens: mx.array,
-        accepted: List[int],
-        new_tokens: List[List[int]],
+        verify_hidden,
+        draft_tokens,
+        accepted,
+        new_tokens,
         sampler,
-        token_dtype: mx.Dtype = mx.int32,
-        greedy: bool = False,
-    ) -> None:
-        if len(accepted) <= 1:
-            self.accept_verified_tokens(
-                verify_hidden,
-                draft_tokens,
-                int(accepted[0]),
-                new_tokens[0],
-                sampler,
-                token_dtype,
-                greedy,
-            )
-            return
-
-        accepted = [int(value) for value in accepted]
-        self._restore_untrimmable_round(min(accepted))
-
-        keep_appended = [min(value, self._round_appended) for value in accepted]
-        trims = [self._round_appended - keep for keep in keep_appended]
-        if any(trims):
-            if len(set(trims)) == 1:
-                for cache in self._cache:
-                    cache.trim(trims[0])
-                self._next_position = self._next_position - trims[0]
-            else:
-                for cache in self._cache:
-                    cache.prepare(right_padding=trims)
-                    cache.finalize()
-                self._next_position = self._next_position - mx.array(
-                    trims, dtype=mx.int32
-                )
+        token_dtype=mx.int32,
+        greedy=False,
+    ):
+        kept = [min(int(value), self._round_appended) for value in accepted]
+        if self._round_transaction is not None:
+            self._round_transaction.commit(kept)
+            self._round_transaction = None
+        self._round_initial = None
+        trims = [self._round_appended - value for value in kept]
+        self._next_position -= (
+            trims[0] if len(trims) == 1 else mx.array(trims, dtype=mx.int32)
+        )
+        self._round_appended = 0
 
         tokens, hiddens, lengths, right_padding = _prepare_ragged_mtp_replay(
             verify_hidden,
             draft_tokens,
             accepted,
             new_tokens,
-            keep_appended,
+            kept,
             token_dtype,
         )
-        if tokens is not None:
-            if any(right_padding):
-                for cache in self._cache:
-                    cache.prepare(right_padding=right_padding, lengths=lengths)
-
-            logits_hidden, pre_hc_hidden = self._forward_tokens(
-                tokens, hiddens, token_dtype
-            )
-
-            if any(right_padding):
-                for cache in self._cache:
-                    cache.finalize()
-                self._next_position = self._next_position - mx.array(
-                    right_padding, dtype=mx.int32
-                )
-
-            last_idx = mx.array([length - 1 for length in lengths], dtype=mx.int32)
-            logits_hidden = mx.take_along_axis(
-                logits_hidden, last_idx[:, None, None], axis=1
-            )
-            pre_hc_hidden = mx.take_along_axis(
-                pre_hc_hidden, last_idx[:, None, None], axis=1
-            )
-            self._set_seed_from_hidden(logits_hidden, sampler, greedy)
-            self._seed_hidden = pre_hc_hidden
-
-        self._round_appended = 0
-        self._round_cache_snapshot = None
+        if tokens is None:
+            return
+        if any(right_padding):
+            for cache in self._cache:
+                cache.prepare(right_padding=right_padding, lengths=lengths)
+        last_only = len(accepted) == 1
+        logits_hidden, draft_hidden = self._forward_tokens(
+            tokens,
+            hiddens,
+            token_dtype,
+            last_only=last_only,
+        )
+        if any(right_padding):
+            for cache in self._cache:
+                cache.finalize()
+            self._next_position -= mx.array(right_padding, dtype=mx.int32)
+        if not last_only:
+            last = mx.array(lengths, dtype=mx.int32)[:, None, None] - 1
+            logits_hidden = mx.take_along_axis(logits_hidden, last, axis=1)
+            draft_hidden = mx.take_along_axis(draft_hidden, last, axis=1)
+        self._set_seed_from_hidden(logits_hidden, sampler, greedy)
+        self._seed_hidden = draft_hidden
 
     def filter_batch(self, keep) -> None:
         if not isinstance(keep, mx.array):
@@ -406,10 +323,9 @@ class Glm5NextMTPDraftModel(DeepseekV4MTPDraftModel):
             self._seed_token = self._seed_token[keep]
         if self._seed_hidden is not None:
             self._seed_hidden = self._seed_hidden[keep]
-        for attr in ("_next_position", "_kv_valid_len", "_position"):
-            value = getattr(self, attr)
-            if isinstance(value, mx.array) and value.ndim > 0 and value.size > 1:
-                setattr(self, attr, value[keep])
+        value = self._next_position
+        if isinstance(value, mx.array) and value.ndim > 0 and value.size > 1:
+            self._next_position = value[keep]
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         weights = dict(weights)

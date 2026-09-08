@@ -73,59 +73,6 @@ def _qwen3_5_decode_depthwise_conv(conv_input: mx.array, weight: mx.array):
     return out.astype(conv_input.dtype)[:, None, :]
 
 
-def _decode_quantized_linears_fused(linears, x: mx.array):
-    if (
-        x.ndim != 3
-        or x.shape[1] != 1
-        or len(linears) != 4
-        or not all(isinstance(linear, nn.QuantizedLinear) for linear in linears)
-    ):
-        return None
-
-    first = linears[0]
-    if not all(
-        linear.bits == first.bits
-        and linear.group_size == first.group_size
-        and linear.mode == first.mode
-        and linear.biases is not None
-        and linear.scales.dtype == x.dtype
-        and linear.biases.dtype == x.dtype
-        and "bias" not in linear
-        for linear in linears
-    ):
-        return None
-
-    cache_key = tuple(
-        (id(linear.weight), id(linear.scales), id(linear.biases)) for linear in linears
-    )
-    cached = getattr(first, "_qwen3_5_fused_decode_linears", None)
-    if cached is None or cached[0] != cache_key:
-        weights = mx.concatenate([linear.weight for linear in linears], axis=0)
-        scales = mx.concatenate([linear.scales for linear in linears], axis=0)
-        biases = mx.concatenate([linear.biases for linear in linears], axis=0)
-        split_indices = []
-        offset = 0
-        for linear in linears[:-1]:
-            offset += linear.weight.shape[0]
-            split_indices.append(offset)
-        mx.eval(weights, scales, biases)
-        cached = (cache_key, weights, scales, biases, split_indices)
-        first._qwen3_5_fused_decode_linears = cached
-
-    _, weights, scales, biases, split_indices = cached
-    output = mx.quantized_matmul(
-        x,
-        weights,
-        scales=scales,
-        biases=biases,
-        transpose=True,
-        group_size=first.group_size,
-        bits=first.bits,
-        mode=first.mode,
-    )
-    return tuple(mx.split(output, split_indices, axis=-1))
-
-
 def _extract_row_cache(cache_entry, row: int):
     if isinstance(cache_entry, ArraysCache):
         row_cache = ArraysCache(size=len(cache_entry.cache))
@@ -188,7 +135,22 @@ def _restore_batch_padding_metadata(cache_entry, offsets, steps: int):
     return cache_entry
 
 
+def _qwen3_5_refresh_metadata(cache):
+    revision = getattr(cache, "metadata_revision", 0)
+    if getattr(cache, "_qwen3_5_metadata_revision", None) != revision:
+        for name in (
+            "_qwen3_5_left_padding_info",
+            "_qwen3_5_lengths_info",
+            "_qwen3_5_ssm_no_mask_batch_size",
+        ):
+            if hasattr(cache, name):
+                delattr(cache, name)
+        cache._qwen3_5_metadata_revision = revision
+
+
 def _qwen3_5_left_padding_info(cache):
+    if cache is not None:
+        _qwen3_5_refresh_metadata(cache)
     left_padding = getattr(cache, "left_padding", None)
     if not (
         isinstance(left_padding, mx.array)
@@ -206,6 +168,8 @@ def _qwen3_5_left_padding_info(cache):
 
 
 def _qwen3_5_set_left_padding_info(cache, pads):
+    if cache is not None:
+        _qwen3_5_refresh_metadata(cache)
     left_padding = getattr(cache, "left_padding", None)
     if not isinstance(left_padding, mx.array):
         return
@@ -226,6 +190,8 @@ def _qwen3_5_advance_left_padding_info(cache, steps: int):
 
 
 def _qwen3_5_lengths_info(cache):
+    if cache is not None:
+        _qwen3_5_refresh_metadata(cache)
     lengths = getattr(cache, "lengths", None)
     if not (isinstance(lengths, mx.array) and lengths.ndim > 0 and lengths.size > 0):
         return None
@@ -247,6 +213,8 @@ def _qwen3_5_advance_lengths_info(cache, steps: int):
 
 
 def _create_qwen3_5_ssm_mask(h: mx.array, cache):
+    if cache is not None:
+        _qwen3_5_refresh_metadata(cache)
     if not (cache and hasattr(cache, "make_mask")):
         return None
 
@@ -1793,7 +1761,7 @@ class LanguageModel(nn.Module):
                     )
 
         if speculative_verify:
-            return _EXACT_SPECULATIVE_VERIFIER(
+            return _EXACT_SPECULATIVE_VERIFIER.verify(
                 self,
                 inputs,
                 cache=cache,
@@ -1944,12 +1912,16 @@ class LanguageModel(nn.Module):
             return_hidden=True,
             return_shared_kv=True,
         )
-        return (
-            out.hidden_states[-1],
-            out.shared_kv_states,
-            out.gdn_states,
-            sampler(out.logits),
-        )
+        try:
+            return (
+                out.hidden_states[-1],
+                out.shared_kv_states,
+                out.gdn_states,
+                sampler(out.logits),
+            )
+        except BaseException:
+            out.gdn_states.abort()
+            raise
 
     def speculative_verify_hidden(self, inputs: mx.array, cache):
         out = self(

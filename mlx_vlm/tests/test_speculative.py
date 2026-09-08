@@ -21,7 +21,6 @@ from mlx.utils import tree_flatten, tree_map
 
 import mlx_vlm.models.deepseek_v4.language as deepseek_language
 import mlx_vlm.models.gemma4.language as gemma4_language
-import mlx_vlm.models.glm5_next.exact_ops as glm5_next_exact_ops
 import mlx_vlm.models.glm5_next.language as glm5_next_language
 import mlx_vlm.models.laguna.language as laguna_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
@@ -29,6 +28,8 @@ import mlx_vlm.models.qwen3_5.speculative_verifier as qwen_verifier
 import mlx_vlm.models.qwen3_5_moe.language as qwen_moe_language
 import mlx_vlm.speculative.cache_state as speculative_cache_state
 import mlx_vlm.speculative.mtp as mtp_utils
+import mlx_vlm.speculative.ops.glm5_next as glm5_next_exact_ops
+import mlx_vlm.speculative.ops.linear as verifier_linear
 from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models.base import kv_sequence_length
 from mlx_vlm.models.cache import (
@@ -43,8 +44,10 @@ from mlx_vlm.models.cache import (
 )
 from mlx_vlm.models.gated_delta import gated_delta_update
 from mlx_vlm.models.quantized_verifier import (
-    DEFAULT_QUANTIZED_VERIFIER,
+    decode_quantized_argmax,
+    decode_quantized_linear,
     exact_quantized_linear,
+    exact_quantized_moe_hc_expand,
     exact_quantized_selected_linear,
     exact_quantized_switch_linear,
 )
@@ -93,6 +96,7 @@ from mlx_vlm.speculative.eagle3 import (
     _eagle3_verify_target,
     _eagle3_verify_target_hot,
 )
+from mlx_vlm.speculative.targets import bind_speculative_target
 from mlx_vlm.speculative.utils import (
     _dflash_next_block_size,
     _effective_mtp_block_size,
@@ -371,6 +375,7 @@ def test_arrays_cache_transaction_handles_boundaries_abort_and_stale_commit():
         missing.commit([1, 1])
     missing.abort()
     assert cache[0] is before
+    qwen_language._qwen3_5_lengths_info(cache)
     assert not hasattr(cache, "_qwen3_5_lengths_info")
 
 
@@ -599,7 +604,7 @@ def test_qwen_target_verify_linear_matches_singleton_dense_gemv():
         ],
         axis=0,
     )
-    out = qwen_verifier._target_verify_linear(linear, x)
+    out = verifier_linear._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -612,7 +617,7 @@ def test_qwen_target_verify_gemv_kernel_matches_singleton_dense_gemv():
     x = mx.random.normal((1, 4, 256)).astype(mx.bfloat16)
 
     ref = mx.concatenate([linear(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
-    out = qwen_verifier._target_verify_linear(linear, x)
+    out = verifier_linear._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -625,8 +630,8 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_path():
     linear.biases = linear.biases.astype(mx.bfloat16)
     x = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
 
-    ref = qwen_verifier._target_verify_singletons(linear, x)
-    out = qwen_verifier._target_verify_linear(linear, x)
+    ref = verifier_linear._target_verify_singletons(linear, x)
+    out = verifier_linear._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -686,7 +691,7 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
     x = mx.random.normal((1, 3, 512)).astype(mx.bfloat16)
 
     ref = linear(x)
-    out = qwen_verifier._target_verify_quantized_linear(linear, x)
+    out = verifier_linear._target_verify_quantized_linear(linear, x)
     mx.eval(ref, out)
 
     # The target kernel and MLX's quantized GEMM accumulate in different
@@ -705,8 +710,8 @@ def test_qwen_target_verify_4bit_linear_matches_singleton_path_exactly(
     linear.biases = linear.biases.astype(mx.bfloat16)
     x = mx.random.normal((1, verify_length, input_dims)).astype(mx.bfloat16)
 
-    ref = qwen_verifier._target_verify_timewise(linear, x)
-    out = qwen_verifier._target_verify_linear(linear, x)
+    ref = verifier_linear._target_verify_timewise(linear, x)
+    out = verifier_linear._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -728,8 +733,10 @@ def test_qwen_target_verify_affine_linears_fuse_exactly(
         linear.biases = linear.biases.astype(mx.bfloat16)
     x = mx.random.normal((1, verify_length, 512)).astype(mx.bfloat16)
 
-    ref = tuple(qwen_verifier._target_verify_timewise(linear, x) for linear in linears)
-    out = qwen_verifier._target_verify_linears(linears, x)
+    ref = tuple(
+        verifier_linear._target_verify_timewise(linear, x) for linear in linears
+    )
+    out = verifier_linear._target_verify_linears(linears, x)
     mx.eval(*ref, *out)
 
     assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
@@ -743,8 +750,8 @@ def test_qwen_target_verify_8bit_linear_matches_singleton_path_exactly(input_dim
     linear.biases = linear.biases.astype(mx.bfloat16)
     x = mx.random.normal((1, 4, input_dims)).astype(mx.bfloat16)
 
-    ref = qwen_verifier._target_verify_timewise(linear, x)
-    out = qwen_verifier._target_verify_linear(linear, x)
+    ref = verifier_linear._target_verify_timewise(linear, x)
+    out = verifier_linear._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -806,7 +813,7 @@ def test_qwen_fused_greedy_decode_uses_quantized_argmax():
     out = qwen_language.LanguageModel.fused_greedy_decode(
         model, inputs, cache=["cache"]
     )
-    ref = qwen_verifier._target_verify_quantized_argmax(model.lm_head, hidden)
+    ref = verifier_linear._target_verify_quantized_argmax(model.lm_head, hidden)
     mx.eval(out, ref)
 
     assert bool(mx.array_equal(out, ref).item())
@@ -832,7 +839,7 @@ def test_qwen3_5_decode_quantized_linears_fused_matches_separate():
         x = mx.random.normal((4, 1, 512), dtype=mx.bfloat16)
 
         ref = tuple(linear(x) for linear in linears)
-        out = qwen_language._decode_quantized_linears_fused(tuple(linears), x)
+        out = verifier_linear._decode_quantized_linears_fused(tuple(linears), x)
         mx.eval(*ref, *out)
 
         assert out is not None
@@ -847,8 +854,8 @@ def test_qwen_target_verify_quantized_argmax_matches_singleton_path(bits):
     linear.biases = linear.biases.astype(mx.bfloat16)
 
     x = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
-    ref = mx.argmax(qwen_verifier._target_verify_timewise(linear, x), axis=-1)
-    out = qwen_verifier._target_verify_quantized_argmax(linear, x)
+    ref = mx.argmax(verifier_linear._target_verify_timewise(linear, x), axis=-1)
+    out = verifier_linear._target_verify_quantized_argmax(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -861,10 +868,10 @@ def test_qwen3_5_quantized_argmax_batch_as_time_matches_rowwise():
     linear.biases = linear.biases.astype(mx.bfloat16)
     x = mx.random.normal((4, 1, 512), dtype=mx.bfloat16)
 
-    out = qwen_verifier._target_verify_quantized_argmax(linear, x)
+    out = verifier_linear._target_verify_quantized_argmax(linear, x)
     ref = mx.concatenate(
         [
-            qwen_verifier._target_verify_quantized_argmax(linear, x[row : row + 1])
+            verifier_linear._target_verify_quantized_argmax(linear, x[row : row + 1])
             for row in range(x.shape[0])
         ],
         axis=0,
@@ -882,10 +889,10 @@ def test_qwen3_5_4bit_quantized_argmax_wide_blocks_match_singletons(verify_lengt
     linear.biases = linear.biases.astype(mx.bfloat16)
     x = mx.random.normal((1, verify_length, 512), dtype=mx.bfloat16)
 
-    out = qwen_verifier._target_verify_quantized_argmax(linear, x)
+    out = verifier_linear._target_verify_quantized_argmax(linear, x)
     mask = mx.full((verify_length, 1), -1, dtype=mx.int32)
-    masked = qwen_verifier._target_verify_quantized_argmax(linear, x, token_mask=mask)
-    ref = mx.argmax(qwen_verifier._target_verify_timewise(linear, x), axis=-1)
+    masked = verifier_linear._target_verify_quantized_argmax(linear, x, token_mask=mask)
+    ref = mx.argmax(verifier_linear._target_verify_timewise(linear, x), axis=-1)
     mx.eval(out, masked, ref)
 
     assert bool(mx.array_equal(out, ref).item())
@@ -991,7 +998,7 @@ def test_qwen_target_verify_small_projection_matches_singleton_dense_gemv():
         ],
         axis=0,
     )
-    out = qwen_verifier._target_verify_linear(linear, x)
+    out = verifier_linear._target_verify_linear(linear, x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -2064,7 +2071,7 @@ def test_mtp_verify_target_uses_model_logits_hook():
     assert calls[0][1] == ["cache"]
     assert result.hidden is hidden
     assert result.shared_kv_states == {"full": ("k", "v")}
-    assert result.gdn_states == ["gdn"]
+    assert result.rollback_state == ["gdn"]
     assert result.target_tokens is target_tokens
 
 
@@ -2097,7 +2104,7 @@ def test_mtp_verify_target_prefers_argmax_hidden_hook_for_greedy_tokens():
     assert calls[0][1] == ["cache"]
     assert result.hidden is hidden
     assert result.shared_kv_states == {"full": ("k", "v")}
-    assert result.gdn_states == ["gdn"]
+    assert result.rollback_state == ["gdn"]
     assert result.target_tokens is target_tokens
 
 
@@ -2128,7 +2135,7 @@ def test_mtp_rounds_rolls_back_gemma_without_gdn_states():
     verify = speculative_utils._MTPVerifyResult(
         hidden=mx.zeros((1, 3, 2), dtype=mx.float32),
         shared_kv_states={},
-        gdn_states=None,
+        rollback_state=None,
     )
 
     with (
@@ -2188,7 +2195,7 @@ def test_mtp_rounds_skips_rollback_after_full_accept_with_gdn_states():
     verify = speculative_utils._MTPVerifyResult(
         hidden=mx.zeros((1, 3, 2), dtype=mx.float32),
         shared_kv_states={},
-        gdn_states=gdn_states,
+        rollback_state=gdn_states,
     )
 
     with (
@@ -4177,7 +4184,7 @@ def test_glm5_next_dense_verifier_matches_batched_decode(batch, length):
         axis=1,
     )
 
-    actual = glm5_next_exact_ops.exact_dense_block_linear(linear, inputs)
+    actual = verifier_linear.native_batch_linear(linear, inputs)
     mx.eval(expected, actual)
 
     assert actual is not None
@@ -4311,7 +4318,7 @@ def test_general_quantized_moe_hc_matches_separate_kernels(
         "mlx_vlm.models.quantized_verifier.exact_quantized_selected_linear",
         side_effect=AssertionError("supported formats must use the fused backend"),
     ):
-        actual = DEFAULT_QUANTIZED_VERIFIER.moe_hc_expand(
+        actual = exact_quantized_moe_hc_expand(
             routed_linear,
             routed_inputs,
             indices,
@@ -4354,7 +4361,7 @@ def test_general_quantized_verifier_matches_decode(
     )
     inputs = mx.random.normal((batch, 3, 512)).astype(mx.bfloat16)
     if mode == "nvfp4":
-        expected = qwen_verifier._target_verify_singletons(linear, inputs)
+        expected = verifier_linear._target_verify_singletons(linear, inputs)
     else:
         expected = mx.concatenate(
             [
@@ -4364,8 +4371,8 @@ def test_general_quantized_verifier_matches_decode(
             axis=1,
         )
 
-    actual = DEFAULT_QUANTIZED_VERIFIER.linear(linear, inputs)
-    tokens = DEFAULT_QUANTIZED_VERIFIER.argmax(linear, inputs)
+    actual = decode_quantized_linear(linear, inputs)
+    tokens = decode_quantized_argmax(linear, inputs)
     mx.eval(expected, actual, tokens)
 
     assert actual is not None
@@ -4394,7 +4401,7 @@ def test_general_quantized_verifier_matches_narrow_qmv_quad(input_dims, bits):
         axis=1,
     )
 
-    actual = DEFAULT_QUANTIZED_VERIFIER.linear(linear, inputs)
+    actual = decode_quantized_linear(linear, inputs)
     mx.eval(expected, actual)
 
     assert actual is not None
@@ -4505,7 +4512,7 @@ def test_general_quantized_argmax_supports_packed_mask(mode, bits, group_size):
     allowed = mx.array([[1, 3, 5], [7, 9, 11]], dtype=mx.int32)
     token_mask = (mx.array(1, dtype=mx.int32) << allowed).reshape(-1, 1)
 
-    actual = DEFAULT_QUANTIZED_VERIFIER.argmax(
+    actual = decode_quantized_argmax(
         linear,
         inputs,
         token_mask=token_mask,
@@ -4584,7 +4591,7 @@ def test_glm5_next_mtp_batch_acceptance_keeps_ragged_rows_aligned():
 def test_glm5_next_target_rollback_restores_ragged_rows_without_model_replay():
     mx.random.seed(4513)
     text_config = _tiny_glm5_next_text_config()
-    language = glm5_next_language.LanguageModel(text_config)
+    language = bind_speculative_target(glm5_next_language.LanguageModel(text_config))
     language.eval()
     cache = _make_cache(language, left_padding=[0, 0])
 
@@ -4597,7 +4604,7 @@ def test_glm5_next_target_rollback_restores_ragged_rows_without_model_replay():
     assert rollback_state.active
     records = cache[0]._speculation["records"]
     assert records[0][0] == "window"
-    assert records[3][1].shape[1] == 1
+    assert records[1][1].shape[1] == 1
     assert cache[1][2]._speculation["input_length"] == 2
     assert len(cache[1][2]._speculation["inputs"]) == 1
     assert cache[1][2]._speculation["inputs"][0][0].shape[1] == 2
@@ -4625,46 +4632,11 @@ def test_glm5_next_target_rollback_restores_ragged_rows_without_model_replay():
 def test_glm5_next_cached_indexer_block_matches_stepwise(batch):
     mx.random.seed(4700 + batch)
     text_config = _tiny_glm5_next_text_config()
-    language = glm5_next_language.LanguageModel(text_config)
+    language = bind_speculative_target(glm5_next_language.LanguageModel(text_config))
     language.eval()
     indexer = language.model.layers[1].self_attn.indexer
     step_cache = _make_cache(language, left_padding=[0] * batch)[1]
     block_cache = _make_cache(language, left_padding=[0] * batch)[1]
-
-    def projected(inputs, q_resid):
-        keys = mx.concatenate(
-            [
-                indexer.k_norm(indexer.wk(inputs[:, position : position + 1]))
-                for position in range(inputs.shape[1])
-            ],
-            axis=1,
-        )
-        gates = mx.concatenate(
-            [
-                inputs[:, position : position + 1].astype(mx.float32)
-                @ indexer.index_kpool_compress_gate.T
-                for position in range(inputs.shape[1])
-            ],
-            axis=1,
-        )
-        queries = mx.concatenate(
-            [
-                indexer.wq_b(q_resid[:, position : position + 1])
-                for position in range(inputs.shape[1])
-            ],
-            axis=1,
-        ).reshape(batch, inputs.shape[1], indexer.n_heads, indexer.head_dim)
-        weights = (
-            mx.concatenate(
-                [
-                    indexer.weights_proj(inputs[:, position : position + 1])
-                    for position in range(inputs.shape[1])
-                ],
-                axis=1,
-            ).astype(mx.float32)
-            * indexer.n_heads**-0.5
-        )
-        return keys, gates, queries, weights
 
     prefix_length = 5
     prefix = mx.random.normal((batch, prefix_length, text_config.hidden_size)).astype(
@@ -4673,14 +4645,12 @@ def test_glm5_next_cached_indexer_block_matches_stepwise(batch):
     prefix_q = mx.random.normal((batch, prefix_length, text_config.q_lora_rank)).astype(
         mx.bfloat16
     )
-    prefix_projected = projected(prefix, prefix_q)
     indexer(
         prefix,
         prefix_q,
         cache=step_cache[1],
         pool_cache=step_cache[2],
         offset=0,
-        projected=prefix_projected,
     )
     indexer(
         prefix,
@@ -4688,12 +4658,10 @@ def test_glm5_next_cached_indexer_block_matches_stepwise(batch):
         cache=block_cache[1],
         pool_cache=block_cache[2],
         offset=0,
-        projected=prefix_projected,
     )
 
     inputs = mx.random.normal((batch, 2, text_config.hidden_size)).astype(mx.bfloat16)
     q_resid = mx.random.normal((batch, 2, text_config.q_lora_rank)).astype(mx.bfloat16)
-    block_projected = projected(inputs, q_resid)
     expected = mx.concatenate(
         [
             indexer(
@@ -4702,9 +4670,6 @@ def test_glm5_next_cached_indexer_block_matches_stepwise(batch):
                 cache=step_cache[1],
                 pool_cache=step_cache[2],
                 offset=prefix_length + position,
-                projected=tuple(
-                    value[:, position : position + 1] for value in block_projected
-                ),
             )
             for position in range(2)
         ],
@@ -4716,7 +4681,6 @@ def test_glm5_next_cached_indexer_block_matches_stepwise(batch):
         cache=block_cache[1],
         pool_cache=block_cache[2],
         offset=prefix_length,
-        projected=block_projected,
     )
     mx.eval(expected, actual, step_cache[1].state, block_cache[1].state)
 

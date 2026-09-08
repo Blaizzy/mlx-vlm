@@ -229,6 +229,14 @@ class HyperConnection(nn.Module):
         self.base = mx.zeros((mix,), dtype=mx.float32)
         self.scale = mx.ones((3,), dtype=mx.float32)
 
+    def apply_branch(self, x, norm, branch, *args, **kwargs):
+        """Collapse, normalize, evaluate a branch, and expand its residual."""
+        collapsed, post, comb = self(x)
+        output = branch(norm(collapsed), *args, **kwargs)
+        if isinstance(output, tuple):
+            return (hc_expand(output[0], x, post, comb), *output[1:])
+        return hc_expand(output, x, post, comb)
+
     def __call__(self, x: mx.array):
         B, L, H, D = x.shape
         y = x.astype(mx.float32)
@@ -236,7 +244,8 @@ class HyperConnection(nn.Module):
         mixes = z @ self.fn.T
 
         use_ops = (
-            self.training
+            self.hc_mult != 4
+            or self.training
             or mx.default_device() != mx.gpu
             or not mx.metal.is_available()
         )

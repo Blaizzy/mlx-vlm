@@ -524,7 +524,7 @@ class Qwen4ExpTests(unittest.TestCase):
         self.assertTrue(mx.array_equal(actual, expected).item())
         self.assertEqual(calls, [1, 0, 1])
 
-    def test_fused_quantized_embedding_matches_sharded_lookup(self):
+    def test_quantized_sharded_embedding_matches_independent_lookups(self):
         formats = [
             *[(32, bits, "affine") for bits in (2, 3, 4, 5, 6, 8)],
             (32, 4, "mxfp4"),
@@ -547,14 +547,15 @@ class Qwen4ExpTests(unittest.TestCase):
                     for shard in embedding.shards
                 ]
 
-                expected = embedding(indices)
-                embedding.fuse_quantized()
+                tables = [
+                    shard(mx.arange(shard.weight.shape[0]))
+                    for shard in embedding.shards
+                ]
+                expected = mx.concatenate(tables, axis=0)[indices]
                 actual = embedding(indices)
                 mx.eval(expected, actual)
 
                 self.assertTrue(mx.array_equal(actual, expected).item())
-                self.assertEqual(embedding.shards, [])
-                self.assertEqual(embedding.fused.weight.shape[0], 10)
 
     def test_gated_delta_uses_reference_l2_normalization(self):
         layer = Qwen4ExpGatedDeltaNet(tiny_config().text_config)

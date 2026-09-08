@@ -738,6 +738,7 @@ class ArraysCache(_BaseCache):
         instance._lengths_advance = 0
         instance._speculation = None
         instance._speculation_generation = 0
+        instance.metadata_revision = 0
         return instance
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
@@ -920,14 +921,7 @@ class ArraysCache(_BaseCache):
         return mx.take_along_axis(source, positions, axis=1)
 
     def _invalidate_derived_metadata(self):
-        """Discard model-specific views derived from temporal metadata."""
-        for attribute in (
-            "_qwen3_5_left_padding_info",
-            "_qwen3_5_lengths_info",
-            "_qwen3_5_ssm_no_mask_batch_size",
-        ):
-            if hasattr(self, attribute):
-                delattr(self, attribute)
+        self.metadata_revision += 1
 
     def _restore_speculative_metadata(self, lengths, initial_metadata):
         left_padding, left_advance, valid_lengths, lengths_advance = initial_metadata
@@ -963,23 +957,8 @@ class ArraysCache(_BaseCache):
         if generation is not None and generation != transaction["generation"]:
             raise RuntimeError("Attempted to commit a stale cache transaction.")
 
-        if isinstance(lengths, int):
-            lengths = [int(lengths)] * self.batch_size
-        elif isinstance(lengths, mx.array):
-            lengths = [int(value) for value in lengths.reshape(-1).tolist()]
-        else:
-            lengths = [int(value) for value in lengths]
-        if len(lengths) != self.batch_size:
-            raise ValueError(
-                f"Speculative cache has batch {self.batch_size}, got "
-                f"{len(lengths)} commit lengths."
-            )
-
         total = transaction["length"]
-        if any(length < 0 or length > total for length in lengths):
-            raise ValueError(
-                f"Speculative commit lengths must be between 0 and {total}."
-            )
+        lengths = _speculative_lengths(lengths, self.batch_size, total)
         records = transaction["records"]
         initial_state = transaction["initial_state"]
         missing = [

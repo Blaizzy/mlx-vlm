@@ -3151,7 +3151,7 @@ class TestModels(unittest.TestCase):
         # The shared gated-delta path must match glm5_next's reference recurrence
         # (the KDA safe forget gate == gated_delta.compute_g_safe, term for term).
         from mlx_vlm.models.gated_delta import gated_delta_update
-        from mlx_vlm.models.glm5_next.language import _l2norm, recurrent_kimi_delta
+        from mlx_vlm.tests.glm5_next_reference import _l2norm, recurrent_kimi_delta
 
         mx.random.seed(0)
         B, S, H, D, lb = 2, 17, 4, 32, -5.0
@@ -14995,7 +14995,9 @@ class TestQwen35StructuredOutputMaskWidth(unittest.TestCase):
         return self._mask(rows, (self.VOCAB + 31) // 32)
 
     def test_pad_widens_mask_and_disallows_padding_rows(self):
-        from mlx_vlm.models.qwen3_5.speculative_verifier import _pad_token_mask_to_head
+        from mlx_vlm.models.quantized_verifier import (
+            pad_token_mask as _pad_token_mask_to_head,
+        )
 
         narrow = self._narrow()
         padded = _pad_token_mask_to_head(narrow, self.N)
@@ -15006,15 +15008,15 @@ class TestQwen35StructuredOutputMaskWidth(unittest.TestCase):
         self.assertTrue(mx.all(padded[:, narrow.shape[1] :] == 0).item())
 
     def test_pad_is_noop_when_already_wide_enough(self):
-        from mlx_vlm.models.qwen3_5.speculative_verifier import _pad_token_mask_to_head
+        from mlx_vlm.models.quantized_verifier import (
+            pad_token_mask as _pad_token_mask_to_head,
+        )
 
         wide = self._mask(1, (self.N + 31) // 32)
         self.assertIs(_pad_token_mask_to_head(wide, self.N), wide)
 
     def test_narrow_mask_still_rejected(self):
-        from mlx_vlm.models.qwen3_5.speculative_verifier import (
-            _target_verify_quantized_argmax,
-        )
+        from mlx_vlm.speculative.ops.linear import _target_verify_quantized_argmax
 
         head = self._head()
         x = mx.zeros((1, 1, self.K), dtype=mx.bfloat16)
@@ -15022,10 +15024,10 @@ class TestQwen35StructuredOutputMaskWidth(unittest.TestCase):
             _target_verify_quantized_argmax(head, x, token_mask=self._narrow())
 
     def test_padded_mask_samples_within_the_real_vocabulary(self):
-        from mlx_vlm.models.qwen3_5.speculative_verifier import (
-            _pad_token_mask_to_head,
-            _target_verify_quantized_argmax,
+        from mlx_vlm.models.quantized_verifier import (
+            pad_token_mask as _pad_token_mask_to_head,
         )
+        from mlx_vlm.speculative.ops.linear import _target_verify_quantized_argmax
 
         head = self._head()
         mx.random.seed(1)
@@ -15046,10 +15048,10 @@ class TestQwen35StructuredOutputMaskWidth(unittest.TestCase):
         self.assertEqual(token, int(expected.reshape(-1)[0]))
 
     def test_padded_mask_handles_multi_row_batch(self):
-        from mlx_vlm.models.qwen3_5.speculative_verifier import (
-            _pad_token_mask_to_head,
-            _target_verify_quantized_argmax,
+        from mlx_vlm.models.quantized_verifier import (
+            pad_token_mask as _pad_token_mask_to_head,
         )
+        from mlx_vlm.speculative.ops.linear import _target_verify_quantized_argmax
 
         head = self._head()
         mx.random.seed(2)

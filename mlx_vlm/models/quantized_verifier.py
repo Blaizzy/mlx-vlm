@@ -1,7 +1,7 @@
 """Format-independent quantized operations for exact speculative verification."""
 
 from functools import lru_cache
-from typing import Callable, Iterable, Optional
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -14,12 +14,6 @@ FIXED_FORMATS = {
     "mxfp8": (8, 32),
     "nvfp4": (4, 16),
 }
-
-LinearBackend = Callable[[nn.QuantizedLinear, mx.array], Optional[mx.array]]
-ArgmaxBackend = Callable[
-    [nn.QuantizedLinear, mx.array, Optional[mx.array]], Optional[mx.array]
-]
-
 
 _QUANTIZED_MOE_HC_HEADER = r"""
 #include <metal_simdgroup>
@@ -2036,103 +2030,40 @@ def optimized_nvfp4_argmax(
     return mx.take_along_axis(tile_indices, best_tile[..., None], axis=-1).squeeze(-1)
 
 
-class QuantizedVerifierOps:
-    """One exact verifier API with optional format/shape-specialized backends."""
-
-    def __init__(
-        self,
-        *,
-        linear_backends: Iterable[LinearBackend] = (),
-        argmax_backends: Iterable[ArgmaxBackend] = (),
-    ):
-        self.linear_backends = tuple(linear_backends)
-        self.argmax_backends = tuple(argmax_backends)
-
-    @staticmethod
-    def supports(module) -> bool:
-        return supports_quantization(module)
-
-    def linear(self, linear, x: mx.array) -> Optional[mx.array]:
-        if not supports_quantization(linear):
-            return None
-        for backend in self.linear_backends:
-            output = backend(linear, x)
-            if output is not None:
-                return output
-        return exact_quantized_linear(linear, x)
-
-    @staticmethod
-    def switch_linear(
-        linear,
-        x: mx.array,
-        indices: mx.array,
-    ) -> Optional[mx.array]:
-        return exact_quantized_switch_linear(linear, x, indices)
-
-    @staticmethod
-    def selected_linear(
-        linear,
-        x: mx.array,
-        indices: mx.array,
-    ) -> Optional[mx.array]:
-        return exact_quantized_selected_linear(linear, x, indices)
-
-    @staticmethod
-    def moe_hc_expand(
-        linear,
-        x: mx.array,
-        indices: mx.array,
-        route_weights: mx.array,
-        shared: mx.array,
-        residual: mx.array,
-        post: mx.array,
-        comb: mx.array,
-        *,
-        routed: Optional[mx.array] = None,
-    ) -> Optional[mx.array]:
-        return exact_quantized_moe_hc_expand(
-            linear,
-            x,
-            indices,
-            route_weights,
-            shared,
-            residual,
-            post,
-            comb,
-            routed=routed,
-        )
-
-    def argmax(
-        self,
-        linear,
-        x: mx.array,
-        token_mask: Optional[mx.array] = None,
-    ) -> Optional[mx.array]:
-        if not supports_quantization(linear):
-            return None
-        for backend in self.argmax_backends:
-            output = backend(linear, x, token_mask)
-            if output is not None:
-                return output
-        logits = self.linear(linear, x)
-        if logits is None:
-            return None
-        if token_mask is not None:
-            return _masked_argmax(logits, token_mask)
-        return mx.argmax(logits, axis=-1)
+def decode_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
+    """Decode projection: singleton arithmetic for NVFP4, native batch otherwise."""
+    if not supports_quantization(linear):
+        return None
+    output = _stable_nvfp4_linear(linear, x)
+    return output if output is not None else exact_quantized_linear(linear, x)
 
 
-DEFAULT_QUANTIZED_VERIFIER = QuantizedVerifierOps(
-    linear_backends=(_stable_nvfp4_linear,),
-    argmax_backends=(_stable_nvfp4_argmax,),
-)
+def decode_quantized_argmax(
+    linear,
+    x: mx.array,
+    token_mask: Optional[mx.array] = None,
+) -> Optional[mx.array]:
+    """Argmax using the same numerical contract as decode_quantized_linear."""
+    if not supports_quantization(linear):
+        return None
+    output = _stable_nvfp4_argmax(linear, x, token_mask)
+    if output is not None:
+        return output
+    logits = decode_quantized_linear(linear, x)
+    if logits is None:
+        return None
+    return (
+        _masked_argmax(logits, token_mask)
+        if token_mask is not None
+        else mx.argmax(logits, axis=-1)
+    )
 
 
 __all__ = [
     "AFFINE_BITS",
     "FIXED_FORMATS",
-    "DEFAULT_QUANTIZED_VERIFIER",
-    "QuantizedVerifierOps",
+    "decode_quantized_linear",
+    "decode_quantized_argmax",
     "exact_quantized_linear",
     "exact_quantized_moe_hc_expand",
     "exact_quantized_selected_linear",
