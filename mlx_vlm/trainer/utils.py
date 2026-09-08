@@ -330,6 +330,10 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
         if "rank" not in config and "lora_parameters" not in config:
             raise ValueError("The adapter does not have lora params in the config")
 
+    # Freeze the base before attaching adapters so resuming matches a fresh
+    # start.
+    freeze_model(model)
+
     if "lora_parameters" in config:
         model = _apply_lora_layers(model, config)
     else:

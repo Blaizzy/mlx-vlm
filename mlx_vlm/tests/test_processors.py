@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 from PIL import Image
 
 # ── Shared mocks ──────────────────────────────────────────────────────────────
@@ -85,6 +86,27 @@ def _mock_ip(**extra):
             ),
         },
     )()
+
+
+class TestUnlimitedOCRProcessor(unittest.TestCase):
+    def test_default_chat_template_omits_trailing_space(self):
+        Template = pytest.importorskip("jinja2").Template
+
+        from mlx_vlm.models.unlimited_ocr.processing_unlimitedocr import (
+            UnlimitedOCRProcessor,
+        )
+
+        processor = object.__new__(UnlimitedOCRProcessor)
+        rendered = Template(processor.default_chat_template).render(
+            messages=[
+                {"role": "user", "content": "<image>document parsing."},
+                {"role": "assistant", "content": "partial"},
+                {"role": "user", "content": "continue"},
+            ],
+            add_generation_prompt=True,
+        )
+
+        self.assertEqual(rendered, "<image>document parsing. partial continue")
 
 
 class TestOutputControlTokens(unittest.TestCase):

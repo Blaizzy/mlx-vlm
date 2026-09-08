@@ -2223,6 +2223,59 @@ class TestModels(unittest.TestCase):
         self.assertNotIn(f"{prefix}.gate_proj.weight", sanitized)
         self.assertNotIn(f"{prefix}.up_proj.weight", sanitized)
 
+    def test_z1t_language_model(self):
+        from mlx_vlm.models import z1t
+
+        mx.random.seed(0)
+        config = z1t.ModelConfig(
+            model_type="z1t",
+            vocab_size=97,
+            hidden_size=32,
+            num_hidden_layers=2,
+            max_position_embeddings=64,
+            aft_kind="conv",
+            aft_heads=4,
+            aft_ksize=4,
+            dyt_alpha=0.5,
+            linear_fan_in=4,
+            tanh_linear=True,
+            tanh_mlp=True,
+        )
+        model = z1t.Model(config)
+
+        inputs = mx.array([[1, 2, 3]])
+        embeddings = model.get_input_embeddings(inputs)
+        self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, config.hidden_size))
+
+        cache = model.make_cache()
+        self.assertEqual(len(cache), config.num_hidden_layers)
+        self.assertEqual(type(cache[0]).__name__, "Z1TCache")
+
+        # O(1) streaming decode matches the flat forward on the clean fp32 model
+        # (run before language_test_runner, which recasts params to fp16).
+        ids = mx.array([[3, 1, 4, 1, 5, 9, 2, 6]])
+        flat = model(ids).logits
+        cache = model.make_cache()
+        model(ids[:, :5], cache=cache)
+        for t in range(5, 8):
+            step = model(ids[:, t : t + 1], cache=cache).logits
+            self.assertEqual(step.shape, (1, 1, config.vocab_size))
+            self.assertLess(float(mx.abs(step[0, 0] - flat[0, t]).max()), 2e-3)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        # sanitize maps the flat checkpoint scheme onto the module tree
+        sanitized = model.sanitize(
+            {"clf.weight": mx.zeros((97, 32)), "pe.pe": mx.zeros((64, 32))}
+        )
+        self.assertIn("language_model.lm_head.weight", sanitized)
+        self.assertIn("language_model.model.pe", sanitized)
+
     def test_hrm_text_language_model(self):
         from mlx_vlm.models import hrm_text
 
@@ -10847,6 +10900,216 @@ class TestModels(unittest.TestCase):
         np.testing.assert_allclose(embedded, normalized, rtol=1e-5, atol=1e-7)
 
 
+class TestSam31MultiplexTracker(unittest.TestCase):
+    """SAM 3.1 multiplex video tracker (video_tracking_multiplex port)."""
+
+    def _make_tracker(self):
+        from mlx_vlm.models.sam3_1.config import (
+            PromptEncoderConfig,
+            TrackerConfig,
+            TrackerMaskDecoderConfig,
+        )
+        from mlx_vlm.models.sam3_1.tracker import MultiplexTrackerModel
+
+        config = TrackerConfig(
+            image_size=112,
+            multiplex_count=2,
+            memory_attention_hidden_size=32,
+            memory_attention_num_layers=2,
+            memory_attention_num_attention_heads=2,
+            memory_attention_feed_forward_hidden_size=64,
+            memory_attention_rope_feat_sizes=[8, 8],
+            memory_encoder_hidden_size=32,
+            mask_downsampler_embed_dim=32,
+            mask_downsampler_first_channels=2,
+            mask_downsampler_input_size=128,
+            memory_fuser_embed_dim=32,
+            memory_fuser_intermediate_dim=64,
+            mask_decoder_config=TrackerMaskDecoderConfig(
+                hidden_size=32,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                mlp_dim=64,
+                multiplex_count=2,
+                multimask_outputs_only=True,
+            ),
+            prompt_encoder_config=PromptEncoderConfig(
+                hidden_size=32, image_size=112, patch_size=14, mask_input_channels=16
+            ),
+        )
+        return MultiplexTrackerModel(config)
+
+    def _fake_frame(self, tracker, seed):
+        mx.random.seed(seed)
+        fpn_i = [
+            mx.random.normal((1, 32, 32, 32)),
+            mx.random.normal((1, 16, 16, 32)),
+            mx.random.normal((1, 8, 8, 32)),
+        ]
+        mx.random.seed(seed + 1)
+        fpn_p = [
+            mx.random.normal((1, 32, 32, 32)),
+            mx.random.normal((1, 16, 16, 32)),
+            mx.random.normal((1, 8, 8, 32)),
+        ]
+        return tracker.prepare_frame_features(fpn_i, fpn_p)
+
+    def test_multiplex_state_mux_demux(self):
+        from mlx_vlm.models.sam3_1.multiplex import MultiplexController
+
+        controller = MultiplexController(multiplex_count=4)
+        state = controller.get_state(7, random=False)
+        self.assertEqual(state.num_buckets, 2)
+        self.assertEqual(state.total_valid_entries, 7)
+
+        x = mx.random.normal((7, 3, 5))
+        muxed = state.mux(x)
+        self.assertEqual(muxed.shape, (2, 4, 3, 5))
+        # padding slot is zero-filled
+        np.testing.assert_array_equal(np.array(muxed[1, 3]), np.zeros((3, 5)))
+        # demux is the exact inverse on valid entries
+        np.testing.assert_array_equal(np.array(state.demux(muxed)), np.array(x))
+
+        valid = np.array(state.get_valid_object_mask())
+        self.assertEqual(valid.sum(), 7)
+
+        # add / remove objects
+        state.add_objects([7], allow_new_buckets=False)
+        self.assertEqual(state.total_valid_entries, 8)
+        state.remove_objects([2])
+        self.assertEqual(state.total_valid_entries, 7)
+
+    def test_multiplex_mask_decoder_shapes(self):
+        from mlx_vlm.models.sam3_1.config import TrackerMaskDecoderConfig
+        from mlx_vlm.models.sam3_1.sam_components import MultiplexMaskDecoder
+
+        # propagation decoder: multimask tokens only, 2 slots per bucket
+        dec = MultiplexMaskDecoder(
+            TrackerMaskDecoderConfig(
+                hidden_size=32,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                mlp_dim=64,
+                multiplex_count=2,
+                num_multimask_outputs=3,
+                multimask_outputs_only=True,
+            )
+        )
+        image_embeddings = mx.random.normal((2, 64, 32))
+        image_pe = mx.random.normal((1, 64, 32))
+        extra = mx.random.normal((2, 2, 32))
+        out = dec(
+            image_embeddings=image_embeddings,
+            image_pe=image_pe,
+            multimask_output=True,
+            extra_per_object_embeddings=extra,
+        )
+        self.assertEqual(out["masks"].shape, (2, 2, 3, 32, 32))
+        self.assertEqual(out["iou_pred"].shape, (2, 2, 3))
+        self.assertEqual(out["sam_tokens_out"].shape, (2, 2, 3, 32))
+        self.assertEqual(out["object_score_logits"].shape, (2, 2, 1))
+
+        # interactive decoder: one slot, single-mask token + 3 multimask tokens
+        dec_i = MultiplexMaskDecoder(
+            TrackerMaskDecoderConfig(
+                hidden_size=32,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                mlp_dim=64,
+                multiplex_count=1,
+                num_multimask_outputs=3,
+                multimask_outputs_only=False,
+                dynamic_multimask_via_stability=False,
+            )
+        )
+        out_i = dec_i(
+            image_embeddings=mx.random.normal((1, 64, 32)),
+            image_pe=image_pe,
+            multimask_output=True,
+            sparse_prompt_embeddings=mx.random.normal((3, 2, 32)),
+            dense_prompt_embeddings=mx.random.normal((3, 64, 32)),
+        )
+        self.assertEqual(out_i["masks"].shape, (3, 1, 3, 32, 32))
+        out_i1 = dec_i(
+            image_embeddings=mx.random.normal((1, 64, 32)),
+            image_pe=image_pe,
+            multimask_output=False,
+            sparse_prompt_embeddings=mx.random.normal((3, 2, 32)),
+            dense_prompt_embeddings=mx.random.normal((3, 64, 32)),
+        )
+        self.assertEqual(out_i1["masks"].shape, (3, 1, 1, 32, 32))
+
+    def test_track_step_modes(self):
+        """Mask-as-output init, propagation, interaction, object addition."""
+        tracker = self._make_tracker()
+        state = tracker.init_state(3, object_ids=[10, 11, 12])
+        self.assertEqual(state.multiplex_state.assignments, [[0, 1], [2, -1]])
+
+        # frame 0: mask prompts (mask-as-output)
+        masks = mx.zeros((3, 112, 112))
+        masks[0, 20:60, 20:60] = 1.0
+        masks[1, 40:80, 40:90] = 1.0
+        masks[2, 10:30, 60:100] = 1.0
+        out0 = tracker.add_mask_prompt(state, 0, self._fake_frame(tracker, 0), masks)
+        mx.eval(out0)
+        # mask-as-output: low-res is image_size / 4, high-res is image_size
+        self.assertEqual(out0["pred_masks"].shape, (3, 1, 28, 28))
+        self.assertEqual(out0["pred_masks_high_res"].shape, (3, 1, 112, 112))
+        # mask-as-output passes the input masks through as +-10 logits
+        np.testing.assert_allclose(
+            np.array(out0["pred_masks_high_res"][0, 0, 30, 30]), 10.0, atol=1e-4
+        )
+        self.assertEqual(out0["maskmem_features"].shape, (2, 8, 8, 32))
+        self.assertEqual(out0["obj_ptr"].shape, (2, 2, 32))  # muxed
+        self.assertIn(0, state.cond_frame_outputs)
+
+        # frames 1-2: memory-conditioned propagation
+        for t in (1, 2):
+            out = tracker.propagate(state, t, self._fake_frame(tracker, 10 + t))
+            mx.eval(out)
+            # decoder low-res is 4x the 8x8 feature grid
+            self.assertEqual(out["pred_masks"].shape, (3, 1, 32, 32))
+            self.assertEqual(out["pred_masks_high_res"].shape, (3, 1, 112, 112))
+            self.assertEqual(out["object_score_logits"].shape, (3, 1))
+            self.assertIn(t, state.non_cond_frame_outputs)
+
+        # frame 3: add a new object mid-video
+        ff = self._fake_frame(tracker, 13)
+        new_mask = mx.zeros((1, 112, 112))
+        new_mask[0, 5:25, 5:25] = 1.0
+        out3 = tracker.track_step(
+            state,
+            frame_idx=3,
+            is_init_cond_frame=False,
+            frame_features=ff,
+            new_object_masks=new_mask[:, None],
+            new_object_idxs=[3],
+            new_object_ids=[13],
+        )
+        mx.eval(out3)
+        self.assertEqual(state.num_objects, 4)
+        self.assertEqual(out3["pred_masks"].shape[0], 4)
+        self.assertEqual(state.multiplex_state.object_ids, [10, 11, 12, 13])
+
+        # frame 4: point interaction on top of propagation
+        pts = {
+            "point_coords": mx.array(
+                [[[40.0, 40.0]], [[60.0, 60.0]], [[80.0, 15.0]], [[15.0, 15.0]]]
+            ),
+            "point_labels": mx.ones((4, 1), mx.int32),
+        }
+        out4 = tracker.track_step(
+            state,
+            frame_idx=4,
+            is_init_cond_frame=False,
+            frame_features=self._fake_frame(tracker, 14),
+            point_inputs=pts,
+            objects_to_interact=[0, 1, 2, 3],
+        )
+        mx.eval(out4)
+        self.assertEqual(out4["pred_masks"].shape[0], 4)
+
+
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
 
@@ -18343,6 +18606,225 @@ class TestMTPSplit(unittest.TestCase):
         self.assertEqual(config["quantization"]["bits"], 4)
 
 
+class TestDinov2(unittest.TestCase):
+    def test_encoder_feature_grids(self):
+        """Encoder resizes to the token grid and returns per-layer grids and cls tokens."""
+        from types import SimpleNamespace
+
+        from mlx_vlm.models.dinov2.dinov2 import DINOv2Encoder
+
+        config = SimpleNamespace(
+            embed_dim=32,
+            depth=4,
+            num_heads=4,
+            img_size=518,
+            patch_size=14,
+            mlp_ratio=4.0,
+            layer_norm_eps=1e-6,
+            interpolate_offset=0.1,
+            ffn="mlp",
+            intermediate_layers=[1, 3],
+        )
+        encoder = DINOv2Encoder(config)
+        features = encoder(mx.random.uniform(shape=(2, 60, 90, 3)), 5, 7)
+        self.assertEqual(len(features), 2)
+        for grid, cls in features:
+            self.assertEqual(grid.shape, (2, 5, 7, 32))
+            self.assertEqual(cls.shape, (2, 32))
+
+    def _tiny_config(self, **overrides):
+        from mlx_vlm.models.dinov2.config import ModelConfig
+
+        args = dict(
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            image_size=28,
+            patch_size=14,
+        )
+        args.update(overrides)
+        return ModelConfig(**args)
+
+    def _tiny_hf_state_dict(self, config):
+        d = config.hidden_size
+        p = config.patch_size
+        num_patches = (config.image_size // p) ** 2
+        weights = {
+            "embeddings.cls_token": mx.zeros((1, 1, d)),
+            "embeddings.mask_token": mx.zeros((1, d)),
+            "embeddings.position_embeddings": mx.zeros((1, num_patches + 1, d)),
+            "embeddings.patch_embeddings.projection.weight": mx.zeros((d, 3, p, p)),
+            "embeddings.patch_embeddings.projection.bias": mx.zeros((d,)),
+            "layernorm.weight": mx.ones((d,)),
+            "layernorm.bias": mx.zeros((d,)),
+        }
+        if config.num_register_tokens:
+            weights["embeddings.register_tokens"] = mx.zeros(
+                (1, config.num_register_tokens, d)
+            )
+        for i in range(config.num_hidden_layers):
+            prefix = f"encoder.layer.{i}."
+            weights.update(
+                {
+                    prefix + "attention.attention.query.weight": mx.full((d, d), 1.0),
+                    prefix + "attention.attention.key.weight": mx.full((d, d), 2.0),
+                    prefix + "attention.attention.value.weight": mx.full((d, d), 3.0),
+                    prefix + "attention.attention.query.bias": mx.zeros((d,)),
+                    prefix + "attention.attention.key.bias": mx.zeros((d,)),
+                    prefix + "attention.attention.value.bias": mx.zeros((d,)),
+                    prefix + "attention.output.dense.weight": mx.zeros((d, d)),
+                    prefix + "attention.output.dense.bias": mx.zeros((d,)),
+                    prefix + "layer_scale1.lambda1": mx.ones((d,)),
+                    prefix + "layer_scale2.lambda1": mx.ones((d,)),
+                    prefix + "norm1.weight": mx.ones((d,)),
+                    prefix + "norm1.bias": mx.zeros((d,)),
+                    prefix + "norm2.weight": mx.ones((d,)),
+                    prefix + "norm2.bias": mx.zeros((d,)),
+                }
+            )
+            if config.use_swiglu_ffn:
+                h = (int(d * config.mlp_ratio * 2 / 3) + 7) // 8 * 8
+                weights.update(
+                    {
+                        prefix + "mlp.weights_in.weight": mx.zeros((2 * h, d)),
+                        prefix + "mlp.weights_in.bias": mx.zeros((2 * h,)),
+                        prefix + "mlp.weights_out.weight": mx.zeros((d, h)),
+                        prefix + "mlp.weights_out.bias": mx.zeros((d,)),
+                    }
+                )
+            else:
+                hidden = int(d * config.mlp_ratio)
+                weights.update(
+                    {
+                        prefix + "mlp.fc1.weight": mx.zeros((hidden, d)),
+                        prefix + "mlp.fc1.bias": mx.zeros((hidden,)),
+                        prefix + "mlp.fc2.weight": mx.zeros((d, hidden)),
+                        prefix + "mlp.fc2.bias": mx.zeros((d,)),
+                    }
+                )
+        return weights
+
+    def test_config_aliases(self):
+        """HF-style config fields map to the shared backbone's field names."""
+        from mlx_vlm.models.dinov2.config import ModelConfig
+
+        config = self._tiny_config()
+        self.assertEqual(config.embed_dim, 32)
+        self.assertEqual(config.depth, 2)
+        self.assertEqual(config.num_heads, 4)
+        self.assertEqual(config.img_size, 28)
+        self.assertEqual(config.ffn, "mlp")
+        self.assertEqual(ModelConfig(use_swiglu_ffn=True).ffn, "swiglu")
+        self.assertEqual(ModelConfig(image_size=[518, 518]).img_size, 518)
+
+        # A dinov2_with_registers Hub config loads; unknown keys are dropped.
+        config = ModelConfig.from_dict(
+            {
+                "model_type": "dinov2_with_registers",
+                "hidden_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_register_tokens": 4,
+                "out_features": ["stage1"],
+                "stage_names": ["stem", "stage1"],
+            }
+        )
+        self.assertEqual(config.model_type, "dinov2_with_registers")
+        self.assertEqual(config.num_register_tokens, 4)
+
+    def test_forward_features_registers(self):
+        """Register tokens go after the cls token; patch tokens exclude them."""
+        from mlx_vlm.models.dinov2 import Model
+
+        model = Model(self._tiny_config(num_register_tokens=2))
+        x = mx.random.normal((2, 28, 28, 3))
+        features = model.forward_features(x)
+        self.assertEqual(features["x_norm_clstoken"].shape, (2, 32))
+        self.assertEqual(features["x_norm_regtokens"].shape, (2, 2, 32))
+        self.assertEqual(features["x_norm_patchtokens"].shape, (2, 4, 32))
+        self.assertEqual(features["x_prenorm"].shape, (2, 1 + 2 + 4, 32))
+
+        for patches, cls in model.get_intermediate_layers(x, [0, 1]):
+            self.assertEqual(patches.shape, (2, 4, 32))
+            self.assertEqual(cls.shape, (2, 32))
+
+    def test_prepare_tokens_masks(self):
+        """Masked patch embeddings are replaced by the mask token."""
+        from mlx_vlm.models.dinov2 import Model
+
+        model = Model(self._tiny_config())
+        model.load_weights(
+            [
+                ("mask_token", mx.full((1, 32), 2.0)),
+                ("pos_embed", mx.random.normal((1, 5, 32))),
+            ],
+            strict=False,
+        )
+        x = mx.random.normal((2, 28, 28, 3))
+        masks = mx.array([[True, False, True, False], [False, True, False, True]])
+        tokens = model.prepare_tokens(x, masks)
+        patches = tokens[:, 1:]  # after the cls token
+        for b, j in [(0, 0), (0, 2), (1, 1), (1, 3)]:
+            expected = model.mask_token[0] + model.pos_embed[0, j + 1]
+            self.assertTrue(mx.allclose(patches[b, j], expected))
+        # Unmasked positions keep their patch embedding.
+        for b, j in [(0, 1), (1, 0)]:
+            unexpected = model.mask_token[0] + model.pos_embed[0, j + 1]
+            self.assertFalse(bool(mx.allclose(patches[b, j], unexpected)))
+
+    def test_model_call_output(self):
+        """The standalone model returns HF-style pooled and sequence outputs."""
+        from mlx_vlm.models.dinov2 import Model
+
+        model = Model(self._tiny_config())
+        out = model(mx.random.normal((2, 28, 28, 3)))
+        self.assertEqual(out["last_hidden_state"].shape, (2, 5, 32))
+        self.assertEqual(out["pooler_output"].shape, (2, 32))
+        self.assertTrue(
+            mx.allclose(out["pooler_output"], out["last_hidden_state"][:, 0])
+        )
+        self.assertEqual(out["hidden_patch_tokens"].shape, (2, 4, 32))
+
+    def test_sanitize_hf_checkpoint(self):
+        """HF keys are renamed (and qkv fused) to the exact model parameters."""
+        from mlx.utils import tree_flatten
+
+        from mlx_vlm.models.dinov2 import Model
+
+        for overrides in ({"num_register_tokens": 2}, {"use_swiglu_ffn": True}):
+            config = self._tiny_config(**overrides)
+            model = Model(config)
+            weights = model.sanitize(self._tiny_hf_state_dict(config))
+            self.assertEqual(
+                set(weights), {k for k, _ in tree_flatten(model.parameters())}
+            )
+            model.load_weights(list(weights.items()), strict=True)
+            d = config.hidden_size
+            qkv_w = model.blocks[0].attn.qkv.weight
+            self.assertTrue(bool(mx.all(qkv_w[:d] == 1.0)))
+            self.assertTrue(bool(mx.all(qkv_w[d : 2 * d] == 2.0)))
+            self.assertTrue(bool(mx.all(qkv_w[2 * d :] == 3.0)))
+            self.assertEqual(model.patch_embed.proj.weight.shape, (d, 14, 14, 3))
+
+    def test_sanitize_strips_prefix_and_classifier(self):
+        """A ``dinov2.`` prefix is stripped and classifier weights dropped."""
+        from mlx_vlm.models.dinov2 import Model
+
+        config = self._tiny_config()
+        model = Model(config)
+        weights = {
+            f"dinov2.{k}": v for k, v in self._tiny_hf_state_dict(config).items()
+        }
+        weights["dinov2.classifier.weight"] = mx.zeros((10, config.hidden_size))
+        sanitized = model.sanitize(weights)
+        self.assertNotIn("dinov2.classifier.weight", sanitized)
+        self.assertNotIn("classifier.weight", sanitized)
+        self.assertIn("blocks.0.attn.qkv.weight", sanitized)
+        # Original-layout checkpoints pass through unchanged.
+        original = {"blocks.0.attn.qkv.weight": mx.zeros((96, 32))}
+        self.assertEqual(model.sanitize(original), original)
+
+
 class TestVideoDepthAnything(unittest.TestCase):
     # ─── Video Depth Anything Tests ────────────────────────────
 
@@ -18380,7 +18862,7 @@ class TestVideoDepthAnything(unittest.TestCase):
 
     def test_vision_backbone(self):
         """DINOv2 backbone returns patch/cls tokens per requested layer."""
-        from mlx_vlm.models.video_depth_anything.vision import DINOv2
+        from mlx_vlm.models.dinov2.dinov2 import DINOv2
 
         config = self._tiny_config()
         backbone = DINOv2(config)
@@ -18793,3 +19275,407 @@ class TestK2HorizonModel(unittest.TestCase):
         model = k2_horizon.Model(self._config(rope_scaling=yarn.rope_scaling))
         out = model(mx.array([[1, 2, 3, 4]])).logits
         self.assertEqual(out.shape, (1, 4, 128))
+
+
+class TestMoge3(unittest.TestCase):
+    # ─── MoGe-3 Tests ──────────────────────────────────────────
+
+    def _tiny_config(self, **overrides):
+        from mlx_vlm.models.moge3.config import (
+            ConvStackConfig,
+            EncoderConfig,
+            ModelConfig,
+            RefinerConfig,
+            ScaleHeadConfig,
+        )
+
+        dim_res = [16, 8, 4]
+
+        def stack(dim_in, dim_out=None):
+            return ConvStackConfig(
+                dim_in=dim_in,
+                dim_res_blocks=list(dim_res),
+                dim_out=dim_out,
+                num_res_blocks=[0, 1, 0],
+                res_block_in_norm="none",
+                res_block_hidden_norm="none",
+                resamplers=["conv_transpose", "bilinear"],
+            )
+
+        args = dict(
+            encoder=EncoderConfig(
+                backbone="dinov2_vits14",
+                intermediate_layers=[0, 1],
+                dim_out=16,
+                depth=2,
+                embed_dim=32,
+                num_heads=4,
+            ),
+            neck=stack([18, 2, 2]),
+            points_head=stack(list(dim_res), [None, None, 3]),
+            mask_head=stack(list(dim_res), [None, None, 1]),
+            normal_head=None,
+            scale_head=ScaleHeadConfig(dims=[32, 16, 1]),
+            refiner=RefinerConfig(
+                encoder_channels=18,
+                model_channels=[8, 16, 32],
+                downsample_factors=[2, 2],
+                encoder_downsample=4,
+            ),
+        )
+        args.update(overrides)
+        return ModelConfig(**args)
+
+    def test_registry_exposes_model(self):
+        """The package resolves through the shared loader like other models."""
+        import dataclasses
+
+        from mlx_vlm.utils import get_model_and_args
+
+        model_module, model_type = get_model_and_args({"model_type": "moge3"})
+        self.assertEqual(model_type, "moge3")
+        config = model_module.ModelConfig.from_dict(
+            dataclasses.asdict(self._tiny_config())
+        )
+        self.assertIsNone(config.normal_head)
+        self.assertEqual(config.encoder.embed_dim, 32)
+        self.assertIsInstance(model_module.Model(config), model_module.Model)
+
+    def test_config_defaults(self):
+        """Default config reproduces the released MoGe-3 ViT-L model."""
+        from mlx_vlm.models.moge3.config import ModelConfig
+
+        config = ModelConfig()
+        self.assertEqual(config.model_type, "moge3")
+        self.assertEqual(config.encoder.backbone, "dinov2_vitl14")
+        self.assertEqual(config.encoder.embed_dim, 1024)
+        self.assertEqual(config.encoder.depth, 24)
+        self.assertEqual(config.encoder.intermediate_layers, [5, 11, 17, 23])
+        self.assertEqual(config.neck.dim_in, [1026, 2, 2, 2, 2])
+        self.assertEqual(config.refiner.model_channels, [32, 64, 128, 256, 512])
+        self.assertEqual(config.refiner_depth_resolution, 256)
+
+    def test_config_from_dict_nested(self):
+        """from_dict parses nested sub-configs like the checkpoint JSON."""
+        from mlx_vlm.models.moge3.config import ModelConfig
+
+        config = ModelConfig.from_dict(
+            {
+                "model_type": "moge3",
+                "encoder": {"backbone": "dinov2_vitg14", "unknown_key": 1},
+                "refiner": None,
+                "points_head": None,
+                "mask_head": None,
+                "normal_head": None,
+                "scale_head": None,
+            }
+        )
+        self.assertEqual(config.encoder.embed_dim, 1536)
+        self.assertEqual(config.encoder.ffn, "swiglu")
+        self.assertIsNone(config.refiner)
+        self.assertIsNone(config.points_head)
+
+    def test_encoder_shapes(self):
+        """Encoder returns (B, rows, cols, dim_out) features and a cls token."""
+        from mlx_vlm.models.moge3.vision import MoGe3Encoder
+
+        config = self._tiny_config()
+        encoder = MoGe3Encoder(config.encoder)
+        x = mx.random.normal((2, 70, 98, 3))
+        features, cls = encoder(x, 5, 7)
+        self.assertEqual(features.shape, (2, 5, 7, 16))
+        self.assertEqual(cls.shape, (2, 32))
+
+    def test_conv_stack_shapes(self):
+        """ConvStack upsamples x2 per level and emits per-level outputs."""
+        from mlx_vlm.models.moge3.conv_stack import ConvStack
+
+        config = self._tiny_config()
+        stack = ConvStack(config.neck)
+        inputs = [
+            mx.random.normal((1, 5, 7, 18)),
+            mx.random.normal((1, 10, 14, 2)),
+            mx.random.normal((1, 20, 28, 2)),
+        ]
+        outputs = stack(inputs)
+        self.assertEqual(len(outputs), 3)
+        self.assertEqual(outputs[0].shape, (1, 5, 7, 16))
+        self.assertEqual(outputs[1].shape, (1, 10, 14, 8))
+        self.assertEqual(outputs[2].shape, (1, 20, 28, 4))
+
+    def test_sanitize_conv_transpose_layout(self):
+        """Torch-layout ConvTranspose2d weights are relaid out; MLX layout is untouched."""
+        from mlx_vlm.models.moge3.moge3 import Model
+
+        model = Model(self._tiny_config())
+        narrow = self._tiny_config()
+        narrow.neck.dim_res_blocks = [16, 2, 4]
+        narrow_model = Model(narrow)
+        torch_w = mx.random.normal((16, 2, 2, 2))
+        sanitized = narrow_model.sanitize({"neck.resamplers.0.0.weight": torch_w})
+        self.assertEqual(sanitized["neck.resamplers.0.0.weight"].shape, (2, 2, 2, 16))
+        assert_sanitize_idempotent(
+            narrow_model, {"neck.resamplers.0.0.weight": torch_w}
+        )
+
+        mlx_weights = dict(tree_flatten(model.parameters()))
+        torch_layout = {
+            k: v.transpose(3, 0, 1, 2) if k.endswith("resamplers.0.0.weight") else v
+            for k, v in mlx_weights.items()
+        }
+        self.assertEqual(
+            torch_layout["neck.resamplers.0.0.weight"].shape, (16, 8, 2, 2)
+        )
+        sanitized = assert_sanitize_idempotent(model, torch_layout)
+        self.assertEqual(sanitized["neck.resamplers.0.0.weight"].shape, (8, 2, 2, 16))
+        for k in mlx_weights:
+            self.assertTrue(mx.array_equal(sanitized[k], mlx_weights[k]), k)
+        model.load_weights(list(sanitized.items()), strict=True)
+
+    def test_submanifold_conv_single_voxel(self):
+        """Degenerate case: one voxel -> bias + center-tap @ feat only."""
+        import numpy as np
+
+        from mlx_vlm.models.moge3.sparse import SubmanifoldConv3d
+
+        conv = SubmanifoldConv3d(3, 4)
+        conv.weight = mx.random.normal((4, 3, 3, 3, 3))
+        conv.bias = mx.random.normal((4,))
+        feats = mx.random.normal((1, 3))
+        coords = mx.array([[0, 2, 3, 1]], dtype=mx.int32)
+        shape = (1, 6, 7, 5)
+        out, _ = conv(feats, coords, shape)
+        want = feats[0] @ conv.weight[:, 1, 1, 1, :].T + conv.bias
+        self.assertTrue(np.allclose(np.array(out[0]), np.array(want), atol=1e-5))
+
+    @staticmethod
+    def _random_sparse_coords(rng, shape, density=0.5):
+        """Raster-ordered (M, 4) int32 coords over ``shape`` (B, H, W, Z)."""
+        import numpy as np
+
+        B, H, W, Z = shape
+        grid = np.stack(np.meshgrid(*(np.arange(n) for n in shape), indexing="ij"))
+        coords = grid.reshape(4, -1).T
+        keep = rng.random(len(coords)) < density
+        return mx.array(coords[keep].astype(np.int32))
+
+    def test_neighbor_map_matches_brute_force(self):
+        """Key-offset neighbor lookup equals an explicit coordinate search."""
+        import numpy as np
+
+        from mlx_vlm.models.moge3.sparse import submanifold_conv3d_neighbor_map
+
+        rng = np.random.default_rng(0)
+        # Z of 1 and W of 2 make edge offsets alias onto neighbouring rows.
+        for shape in [(2, 5, 4, 3), (1, 3, 2, 1), (1, 4, 4, 4)]:
+            coords = self._random_sparse_coords(rng, shape)
+            got = np.array(submanifold_conv3d_neighbor_map(coords, shape))
+            c = np.array(coords)
+            lookup = {tuple(row): m for m, row in enumerate(c.tolist())}
+            offsets = [
+                (0, di, dj, dz)
+                for di in (-1, 0, 1)
+                for dj in (-1, 0, 1)
+                for dz in (-1, 0, 1)
+            ]
+            want = np.array(
+                [[lookup.get(tuple(row + off), -1) for off in offsets] for row in c]
+            )
+            self.assertTrue(np.array_equal(got, want), shape)
+
+    def test_submanifold_conv_chunked_gemm_matches_reference(self):
+        """Chunked im2col GEMM equals the per-tap gather + matmul sum."""
+        from unittest import mock
+
+        import numpy as np
+
+        from mlx_vlm.models.moge3 import sparse
+        from mlx_vlm.models.moge3.sparse import SubmanifoldConv3d
+
+        rng = np.random.default_rng(1)
+        shape = (2, 6, 5, 4)
+        coords = self._random_sparse_coords(rng, shape, density=0.7)
+        M, Ci, Co = coords.shape[0], 6, 5
+        conv = SubmanifoldConv3d(Ci, Co)
+        conv.weight = mx.random.normal((Co, 3, 3, 3, Ci))
+        conv.bias = mx.random.normal((Co,))
+        feats = mx.random.normal((M, Ci))
+
+        nmap = sparse.submanifold_conv3d_neighbor_map(coords, shape)
+        feats_pad = mx.concatenate([feats, mx.zeros((1, Ci))])
+        idx = mx.where(nmap >= 0, nmap, M)
+        w = conv.weight.reshape(Co, 27, Ci)
+        want = mx.broadcast_to(conv.bias, (M, Co))
+        for v in range(27):
+            want = want + feats_pad[idx[:, v]] @ w[:, v, :].T
+
+        # Force several gather chunks (4 rows each) to exercise the split.
+        with mock.patch.object(sparse, "_GATHER_CHUNK_BYTES", 27 * Ci * 4 * 4):
+            out, _ = conv(feats, coords, shape, neighbor_map=nmap)
+        self.assertTrue(np.allclose(np.array(out), np.array(want), atol=1e-5))
+
+    def test_lazy_depth_extent_in_shape(self):
+        """The voxelizer's Z extent may be a lazy scalar; sparse ops accept it."""
+        import numpy as np
+
+        from mlx_vlm.models.moge3.sparse import (
+            sparse_pool2x_mean,
+            submanifold_conv3d_neighbor_map,
+        )
+
+        rng = np.random.default_rng(2)
+        shape = (1, 4, 4, 5)
+        coords = self._random_sparse_coords(rng, shape)
+        lazy_shape = (1, 4, 4, coords[:, 3].max() + 1)
+        self.assertTrue(
+            mx.array_equal(
+                submanifold_conv3d_neighbor_map(coords, shape),
+                submanifold_conv3d_neighbor_map(coords, lazy_shape),
+            )
+        )
+        feats = mx.random.normal((coords.shape[0], 3))
+        out, out_coords, _, _ = sparse_pool2x_mean(feats, coords, shape)
+        out_lazy, out_coords_lazy, _, _ = sparse_pool2x_mean(feats, coords, lazy_shape)
+        self.assertTrue(mx.array_equal(out, out_lazy))
+        self.assertTrue(mx.array_equal(out_coords, out_coords_lazy))
+
+    def test_replicate_padding_matches_edge_pad(self):
+        """Gather-based replicate padding is bit-identical to mx.pad(mode="edge")."""
+        from mlx_vlm.models.moge3.conv_stack import Conv2dReplicate
+
+        conv = Conv2dReplicate(3, 4, kernel_size=3)
+        x = mx.random.normal((2, 7, 5, 3))
+        want = mx.conv2d(
+            mx.pad(x, [(0, 0), (1, 1), (1, 1), (0, 0)], mode="edge"), conv.weight
+        )
+        self.assertTrue(mx.array_equal(conv(x), want + conv.bias))
+
+    def test_processor_resize_and_scaling(self):
+        """resize_to caps the long side, keeps aspect, and handles batches."""
+        import numpy as np
+
+        from mlx_vlm.models.moge3.processing_moge3 import MogeProcessor
+
+        processor = MogeProcessor(resize_to=800)
+        portrait = np.zeros((1000, 500, 3), dtype=np.uint8)
+        self.assertEqual(processor.preprocess_image(portrait).shape, (800, 400, 3))
+        landscape = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        self.assertEqual(processor.preprocess_image(landscape).shape, (450, 800, 3))
+        batch = np.zeros((2, 500, 1000, 3), dtype=np.uint8)
+        self.assertEqual(processor.preprocess_image(batch).shape, (2, 400, 800, 3))
+
+        processor = MogeProcessor()
+        out = processor.preprocess_image(np.full((4, 6, 3), 255, dtype=np.uint8))
+        self.assertEqual(out.dtype, np.float32)
+        self.assertTrue(np.allclose(out, 1.0))
+        out = processor.preprocess_image(np.full((4, 6, 3), 65535, dtype=np.uint16))
+        self.assertTrue(np.allclose(out, 1.0))
+        with self.assertRaises(ValueError):
+            processor.preprocess_image(np.full((4, 6, 3), 255.0, dtype=np.float32))
+
+    def test_loader_disabled_modules_are_skipped(self):
+        """Modules the loader nulls out (no checkpoint weights) are not called."""
+        from mlx_vlm.models.moge3.moge3 import Model
+
+        model = Model(self._tiny_config())
+        model.mask_head = None
+        model.refiner = None
+        image = mx.random.uniform(0, 1, (1, 96, 128, 3))
+        out = model(image, num_tokens=35, refine_steps=0)
+        self.assertNotIn("mask", out)
+        self.assertIn("points", out)
+        with self.assertRaises(ValueError):
+            model(image, num_tokens=35, refine_steps=1)
+
+    def test_focal_shift_uv_grid_matches_subsampled_full_grid(self):
+        """The 64x64 solver grid equals nearest-subsampling the full UV map."""
+        from mlx_vlm.models.moge3.geometry import (
+            _nearest_indices,
+            _view_plane_axes,
+            normalized_view_plane_uv,
+        )
+
+        for height, width in [(1080, 1920), (97, 131), (64, 64), (50, 70)]:
+            ii = _nearest_indices(height, 64)
+            jj = _nearest_indices(width, 64)
+            want = normalized_view_plane_uv(width, height)[ii][:, jj]
+            u, v = _view_plane_axes(width, height)
+            u, v = mx.meshgrid(u[jj], v[ii], indexing="xy")
+            self.assertTrue(mx.array_equal(mx.stack([u, v], axis=-1), want))
+
+    def test_sparse_pool_upsample_roundtrip(self):
+        """Nearest upsample of a 2x2x2 mean pool reproduces parent values."""
+        import numpy as np
+
+        from mlx_vlm.models.moge3.sparse import (
+            sparse_pool2x_mean,
+            sparse_upsample2x_nearest,
+        )
+
+        # Two voxels in the same 2x2x2 block and one outside it.
+        coords = mx.array([[0, 0, 0, 0], [0, 1, 1, 1], [0, 2, 2, 3]], dtype=mx.int32)
+        feats = mx.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        shape = (1, 4, 4, 4)
+        out, out_coords, out_shape, parent_idx = sparse_pool2x_mean(
+            feats, coords, shape
+        )
+        self.assertEqual(out.shape[0], 2)
+        self.assertTrue(np.allclose(np.array(out[0]), [2.0, 3.0]))
+        self.assertTrue(np.allclose(np.array(out[1]), [5.0, 6.0]))
+        self.assertEqual(np.array(out_coords).tolist(), [[0, 0, 0, 0], [0, 1, 1, 1]])
+
+        up, up_coords, _ = sparse_upsample2x_nearest(out, parent_idx, coords, shape)
+        want = np.array([[2.0, 3.0], [2.0, 3.0], [5.0, 6.0]])
+        self.assertTrue(np.allclose(np.array(up), want, atol=1e-6))
+
+    def test_forward_and_infer_shapes(self):
+        """Full forward + infer on a tiny random-weight model."""
+        config = self._tiny_config()
+        from mlx_vlm.models.moge3.moge3 import Model
+
+        model = Model(config)
+        image = mx.random.uniform(0, 1, (1, 96, 128, 3))
+        out = model(image, num_tokens=35, refine_steps=1)
+        self.assertEqual(out["points"].shape, (1, 96, 128, 3))
+        self.assertEqual(out["mask"].shape, (1, 96, 128))
+        self.assertEqual(out["metric_scale"].shape, (1,))
+        self.assertNotIn("normal", out)
+
+        out = model.infer(image[0], num_tokens=35, refine_steps=1)
+        self.assertEqual(out["points"].shape, (96, 128, 3))
+        self.assertEqual(out["depth"].shape, (96, 128))
+        self.assertEqual(out["intrinsics"].shape, (3, 3))
+        self.assertEqual(out["mask"].shape, (96, 128))
+        self.assertNotIn("points_per_step", out)
+
+    def test_zero_refiner_is_identity(self):
+        """With a zeroed out_proj the refiner leaves the point map unchanged."""
+        import numpy as np
+
+        from mlx_vlm.models.moge3.moge3 import Model
+
+        config = self._tiny_config()
+        model = Model(config)
+        model.refiner.out_proj.weight = mx.zeros_like(model.refiner.out_proj.weight)
+        model.refiner.out_proj.bias = mx.zeros_like(model.refiner.out_proj.bias)
+
+        image = mx.random.uniform(0, 1, (1, 96, 128, 3))
+        coarse = model(image, num_tokens=35, refine_steps=0)
+        refined = model(image, num_tokens=35, refine_steps=2, return_per_step=True)
+        self.assertTrue(
+            np.allclose(
+                np.array(coarse["points"]), np.array(refined["points"]), atol=1e-5
+            )
+        )
+        self.assertEqual(len(refined["points_per_step"]), 3)
+
+    def test_per_step_outputs(self):
+        """return_per_step yields initial + one map per refinement step."""
+        from mlx_vlm.models.moge3.moge3 import Model
+
+        model = Model(self._tiny_config())
+        image = mx.random.uniform(0, 1, (1, 96, 128, 3))
+        out = model.infer(image, num_tokens=35, refine_steps=2, return_per_step=True)
+        self.assertEqual(len(out["points_per_step"]), 3)
+        self.assertEqual(len(out["depth_per_step"]), 3)
+        self.assertEqual(out["points_per_step"][-1].shape, (1, 96, 128, 3))
