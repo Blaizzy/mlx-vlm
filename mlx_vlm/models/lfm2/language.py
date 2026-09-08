@@ -393,24 +393,6 @@ class LanguageModel(nn.Module):
             gdn_states=None,
         )
 
-    def chunked_prefill_policy(
-        self,
-        *,
-        input_ids=None,
-        inputs_embeds=None,
-        prompt_cache=None,
-        draft_model=None,
-        draft_kind=None,
-        prefill_kwargs=None,
-    ) -> bool:
-        del input_ids, inputs_embeds, prompt_cache
-        if draft_model is None:
-            return True
-        prefill_kwargs = prefill_kwargs or {}
-        if draft_kind == "dflash":
-            return prefill_kwargs.get("capture_layer_ids") is not None
-        return False
-
     @staticmethod
     def _restore_conv_cache(
         cache: ArraysCache,
