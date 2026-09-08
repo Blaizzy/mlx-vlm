@@ -177,6 +177,8 @@ def gated_delta_kernel(
     mask: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:
     B, T, Hk, Dk = k.shape
+    if Dk < 32 or Dk % 32:
+        return gated_delta_ops(q, k, v, g, beta, state, mask)
     Hv, Dv = v.shape[2:]
     input_type = q.dtype
     state_type = state.dtype

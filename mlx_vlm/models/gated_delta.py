@@ -185,6 +185,8 @@ def gated_delta_kernel(
     mask: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:
     B, T, Hk, Dk = k.shape
+    if Dk < 32 or Dk % 32:
+        return gated_delta_ops(q, k, v, g, beta, state, mask)
     Hv, Dv = v.shape[2:]
     input_type = q.dtype
     state_type = state.dtype
@@ -289,12 +291,6 @@ def gated_delta_update(
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-    if (
-        not use_kernel
-        or mx.default_device() != mx.gpu
-        or not mx.metal.is_available()
-        or k.shape[-1] < 32
-        or k.shape[-1] % 32 != 0
-    ):
+    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
         return gated_delta_ops(q, k, v, g, beta, state, mask)
     return gated_delta_kernel(q, k, v, g, beta, state, mask)

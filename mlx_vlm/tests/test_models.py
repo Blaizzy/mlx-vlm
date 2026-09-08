@@ -61,6 +61,91 @@ class TestNanochatModel(unittest.TestCase):
         self.assertEqual(set(sanitized), {"language_model.transformer.wte.weight"})
 
 
+@unittest.skipUnless(mx.metal.is_available(), "Metal kernel coverage")
+class TestRecurrentKernelDimensions(unittest.TestCase):
+    def assert_outputs_close(self, actual, expected):
+        mx.eval(actual, expected)
+        for result, reference in zip(actual, expected):
+            np.testing.assert_allclose(
+                np.array(result), np.array(reference), atol=2e-5, rtol=2e-5
+            )
+
+    def test_ssm_dispatch_preserves_every_state_dimension(self):
+        from mlx_vlm.models.ssm import ssm_attn, ssm_update, ssm_update_kernel
+
+        for dim in (1, 8, 31, 32, 33, 48, 64, 65):
+            with self.subTest(dim=dim):
+                mx.random.seed(dim)
+                x = mx.random.normal((2, 1, 4, 8)) * 0.1
+                bc = [mx.random.normal((2, 1, 2, dim)) * 0.1 for _ in range(2)]
+                a_log = mx.zeros(4)
+                d = mx.ones(4)
+                dt = mx.zeros((2, 1, 4))
+                bias = mx.zeros(4)
+                state = mx.random.normal((2, 4, 8, dim)) * 0.1
+                args = (x, a_log, *bc, d, dt, bias, state)
+                if dim % 32 == 0:
+                    # Avoid reduced-precision GPU matmuls in the kernel reference.
+                    with mx.stream(mx.cpu):
+                        expected = ssm_attn(*args)
+                else:
+                    expected = ssm_attn(*args)
+                self.assert_outputs_close(ssm_update(*args), expected)
+                self.assert_outputs_close(
+                    ssm_update_kernel(*args, time_step_limit=(0.001, 100.0)),
+                    expected,
+                )
+
+    def test_gated_delta_dispatch_preserves_every_state_dimension(self):
+        from mlx_vlm.models import gated_delta as shared
+        from mlx_vlm.models.qwen3_5 import gated_delta as qwen
+
+        for module in (shared, qwen):
+            for dim in (1, 8, 31, 32, 33, 48, 64, 65):
+                for vector_gate in (False, True):
+                    with self.subTest(
+                        module=module.__name__, dim=dim, vector=vector_gate
+                    ):
+                        mx.random.seed(dim)
+                        q, k = [
+                            mx.random.normal((2, 3, 2, dim)) * 0.1 for _ in range(2)
+                        ]
+                        v = mx.random.normal((2, 3, 4, 8)) * 0.1
+                        shape = (2, 3, 4, dim) if vector_gate else (2, 3, 4)
+                        g = mx.full(shape, 0.9)
+                        beta = mx.full((2, 3, 4), 0.5)
+                        state = mx.random.normal((2, 4, 8, dim)) * 0.1
+                        expected = module.gated_delta_ops(q, k, v, g, beta, state)
+                        actual = module.gated_delta_kernel(q, k, v, g, beta, state)
+                        self.assert_outputs_close(actual, expected)
+
+    def test_unsupported_masked_dimensions_use_reference_semantics(self):
+        from mlx_vlm.models import gated_delta as shared
+        from mlx_vlm.models.qwen3_5 import gated_delta as qwen
+        from mlx_vlm.models.ssm import ssm_attn, ssm_update_kernel
+
+        dim = 8
+        x = mx.ones((2, 1, 2, 8))
+        bc = mx.ones((2, 1, 1, dim))
+        args = (x, mx.zeros(2), bc, bc, mx.ones(2), mx.zeros((2, 1, 2)), mx.zeros(2))
+        state = mx.ones((2, 2, 8, dim))
+        mask = mx.array([[False], [True]])
+        lengths = mx.array([-1, 1])
+        self.assert_outputs_close(
+            ssm_update_kernel(*args, state, (0.001, 100.0), mask=mask, lengths=lengths),
+            ssm_attn(*args, state, mask=mask, lengths=lengths),
+        )
+        for module in (shared, qwen):
+            q = mx.full((2, 3, 1, dim), 0.1)
+            v = mx.ones((2, 3, 2, 8))
+            g = mx.full((2, 3, 2), 0.9)
+            beta = mx.full((2, 3, 2), 0.5)
+            mask = mx.array([[False, True, True], [True, True, False]])
+            expected = module.gated_delta_ops(q, q, v, g, beta, state, mask)
+            actual = module.gated_delta_kernel(q, q, v, g, beta, state, mask)
+            self.assert_outputs_close(actual, expected)
+
+
 class TestMamba2Model(unittest.TestCase):
     def _config(self, tied=True):
         from mlx_vlm.models import mamba2

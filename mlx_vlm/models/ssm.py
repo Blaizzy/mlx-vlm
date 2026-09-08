@@ -74,11 +74,27 @@ def ssm_update_kernel(
     dt_bias: mx.array,
     state: mx.array,
     time_step_limit: Tuple[float, float],
+    mask: Optional[mx.array] = None,
+    lengths: Optional[mx.array] = None,
 ):
     n, _, h, d = hidden_states.shape
     input_type = hidden_states.dtype
     state_type = state.dtype
     hb, ds = B.shape[-2:]
+    if ds < 32 or ds % 32:
+        return ssm_attn(
+            hidden_states,
+            A_log,
+            B,
+            C,
+            D,
+            dt,
+            dt_bias,
+            state,
+            time_step_limit,
+            mask=mask,
+            lengths=lengths,
+        )
     dt = compute_dt(dt, dt_bias, time_step_limit)
     return _ssm_kernel(
         inputs=[hidden_states, A_log, B, C, D, dt, state],
@@ -239,4 +255,6 @@ def ssm_update(
             dt_bias,
             state,
             time_step_limit,
+            mask=mask,
+            lengths=lengths,
         )
