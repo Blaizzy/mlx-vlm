@@ -14,6 +14,9 @@ from ..base import (
 from ..cache import KVCache, RotatingKVCache
 from ..rope_utils import initialize_rope
 from .config import TextConfig
+from .speculative_verifier import Gemma4ExactSpeculativeVerifier
+
+_EXACT_SPECULATIVE_VERIFIER = Gemma4ExactSpeculativeVerifier()
 
 
 @partial(mx.compile, shapeless=True)
@@ -718,6 +721,17 @@ class LanguageModel(nn.Module):
         capture_layer_ids: Optional[List[int]] = None,
         **kwargs,
     ):
+        if kwargs.pop("speculative_verify", False) and getattr(
+            self.config, "exact_speculative_verify", False
+        ):
+            return _EXACT_SPECULATIVE_VERIFIER(
+                self,
+                inputs,
+                cache=cache,
+                input_embeddings=inputs_embeds,
+                capture_layer_ids=capture_layer_ids,
+            )
+
         hidden_sink: Optional[list] = (
             []
             if capture_layer_ids is not None or kwargs.pop("return_hidden", False)

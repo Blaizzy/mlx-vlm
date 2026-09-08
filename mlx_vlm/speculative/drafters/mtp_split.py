@@ -264,6 +264,7 @@ MTP_SPLITTERS: Dict[str, str] = {
     "qwen4_exp_text": "mlx_vlm.speculative.drafters.qwen4_exp_mtp.split:Qwen4ExpMTPSplitter",
     "deepseek_v4": "mlx_vlm.speculative.drafters.deepseek_v4_mtp.split:DeepseekV4MTPSplitter",
     "glm4_moe_lite": "mlx_vlm.speculative.drafters.glm4_moe_lite_mtp.split:Glm4MoeLiteMTPSplitter",
+    "glm_moe_dsa": "mlx_vlm.speculative.drafters.glm_moe_dsa_mtp.split:GlmMoeDsaMTPSplitter",
     "inkling_mm_model": "mlx_vlm.speculative.drafters.inkling_mtp.split:InklingMTPSplitter",
 }
 
@@ -290,6 +291,21 @@ def detect_mtp_splitter(model_path: Path) -> Optional[MTPSplitter]:
     with open(config_path) as f:
         source_config = json.load(f)
     text_config = source_config.get("text_config") or source_config
+    model_types = {
+        text_config.get("model_type"),
+        source_config.get("model_type"),
+    }
+    if "deepseek_v4" in model_types and (
+        text_config.get("dspark_target_layer_ids")
+        or source_config.get("dspark_target_layer_ids")
+    ):
+        from .deepseek_v4_dspark.split import DeepseekV4DsparkSplitter
+
+        splitter = DeepseekV4DsparkSplitter()
+        tc = splitter.read_text_config(source_config)
+        for _ in splitter.iter_selected(model_path, tc):
+            return splitter
+
     # Some checkpoints name the inner text stack separately from the
     # architecture (Apodex 1.1 uses text_config "qwen3_5_moe_text" under a
     # root "qwen3_5_moe"), so fall back to the root type before giving up.

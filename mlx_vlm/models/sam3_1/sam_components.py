@@ -22,13 +22,15 @@ from .config import TrackerMaskDecoderConfig
 class MultiplexMaskDecoder(nn.Module):
     """SAM mask decoder that processes multiplex_count objects simultaneously.
 
-    Key differences from SAMMaskDecoder:
-    - iou_token: (multiplex_count, D) instead of (1, D)
-    - mask_tokens: (multiplex_count * num_masks, D) instead of (num_masks, D)
-    - obj_score_token: (multiplex_count, D) instead of (1, D)
-    - Output: (B, multiplex_count, num_masks, H, W)
+    Port of sam3/model/multiplex_mask_decoder.py. Also covers the interactive
+    (single-slot) MaskDecoder when multiplex_count=1 with sparse/dense prompts.
 
-    Weight keys: tracker_model.sam_mask_decoder.*
+    - Token layout: [obj_score(M), iou(M), mask(M * num_per_object), sparse...]
+    - multimask_outputs_only: no extra single-mask token (propagation decoder)
+    - extra_per_object_embeddings: (B, M, D) added to every mask token
+      (used by the output-suppression embeddings)
+
+    Weight keys: tracker_model.sam_mask_decoder.* / tracker_model.interactive_sam_mask_decoder.*
     """
 
     def __init__(self, config: TrackerMaskDecoderConfig):
@@ -36,14 +38,20 @@ class MultiplexMaskDecoder(nn.Module):
         d = config.hidden_size
         self.multiplex_count = config.multiplex_count
         self.num_multimask_outputs = config.num_multimask_outputs
-        self.num_mask_tokens = config.num_multimask_outputs  # 3
+        self.multimask_outputs_only = config.multimask_outputs_only
+        self.use_multimask_token_for_obj_ptr = config.use_multimask_token_for_obj_ptr
+
+        if self.multimask_outputs_only:
+            self.num_mask_output_per_object = self.num_multimask_outputs
+        else:
+            # +1 for the single (best) mask token
+            self.num_mask_output_per_object = self.num_multimask_outputs + 1
+        self.num_mask_tokens = self.multiplex_count * self.num_mask_output_per_object
 
         # Tokens sized for multiplex
-        self.iou_token = nn.Embedding(config.multiplex_count, d)  # (16, 256)
-        self.mask_tokens = nn.Embedding(
-            config.multiplex_count * self.num_mask_tokens, d
-        )  # (48, 256)
-        self.obj_score_token = nn.Embedding(config.multiplex_count, d)  # (16, 256)
+        self.iou_token = nn.Embedding(self.multiplex_count, d)
+        self.mask_tokens = nn.Embedding(self.num_mask_tokens, d)
+        self.obj_score_token = nn.Embedding(self.multiplex_count, d)
 
         # TwoWayTransformer (same architecture as SAM 3)
         self.transformer = TwoWayTransformer(
@@ -54,11 +62,11 @@ class MultiplexMaskDecoder(nn.Module):
             attention_downsample_rate=config.attention_downsample_rate,
         )
 
-        # Output MLPs — shared across multiplex slots (only num_mask_tokens MLPs)
+        # Output MLPs — one per mask token of an object (shared across slots)
         self.output_hypernetworks_mlps = [
-            OutputMLP(d, d, d // 8) for _ in range(self.num_mask_tokens)
+            OutputMLP(d, d, d // 8) for _ in range(self.num_mask_output_per_object)
         ]
-        self.iou_prediction_head = OutputMLP(d, d, self.num_mask_tokens)
+        self.iou_prediction_head = OutputMLP(d, d, self.num_mask_output_per_object)
         self.pred_obj_score_head = OutputMLP(d, d, 1)
 
         # Upscaling
@@ -66,110 +74,222 @@ class MultiplexMaskDecoder(nn.Module):
         self.upscale_conv2 = nn.ConvTranspose2d(d // 4, d // 8, kernel_size=2, stride=2)
         self.upscale_layer_norm = LayerNorm2d(d // 4)
 
-        # High-res skip connections
+        # 1x1 projections of the high-res FPN levels; applied by the caller
+        # before decoding (as in the reference forward_image)
         self.conv_s0 = nn.Conv2d(d, d // 8, kernel_size=1, bias=True)
         self.conv_s1 = nn.Conv2d(d, d // 4, kernel_size=1, bias=True)
+
+        self.dynamic_multimask_via_stability = config.dynamic_multimask_via_stability
+        self.dynamic_multimask_stability_delta = (
+            config.dynamic_multimask_stability_delta
+        )
+        self.dynamic_multimask_stability_thresh = (
+            config.dynamic_multimask_stability_thresh
+        )
 
     def __call__(
         self,
         image_embeddings: mx.array,
         image_pe: mx.array,
-        sparse_prompt_embeddings: mx.array,
-        dense_prompt_embeddings: mx.array,
-        multimask_output: bool = True,
+        multimask_output: bool,
         high_res_features: Optional[List[mx.array]] = None,
-    ) -> Tuple[mx.array, mx.array, mx.array, mx.array]:
+        extra_per_object_embeddings: Optional[mx.array] = None,
+        sparse_prompt_embeddings: Optional[mx.array] = None,
+        dense_prompt_embeddings: Optional[mx.array] = None,
+    ) -> dict:
         """
+        Args:
+            image_embeddings: (B, HW, D) memory-conditioned image features
+            image_pe: (1, HW, D) dense positional encoding
+            multimask_output: return all mask tokens (else best/single token)
+            high_res_features: [feat_s0, feat_s1] pre-projected by conv_s0/conv_s1
+            extra_per_object_embeddings: (B, M, D) added to the mask tokens
+            sparse/dense_prompt_embeddings: interactive prompts (multiplex_count=1)
+
         Returns:
-            masks, iou_pred, sam_tokens, obj_score
+            dict with masks (B, M, K, H, W), iou_pred (B, M, K),
+            sam_tokens_out (B, M, K, D), object_score_logits (B, M, 1)
         """
-        B = image_embeddings.shape[0]
-        d = image_embeddings.shape[-1]
+        if self.multimask_outputs_only:
+            assert (
+                multimask_output
+            ), "multimask_output must be True with multimask_outputs_only"
 
-        # Build token sequence: iou + mask + obj_score + sparse prompts
-        tokens = mx.concatenate(
-            [
-                mx.broadcast_to(
-                    self.iou_token.weight[None], (B, self.multiplex_count, d)
-                ),
-                mx.broadcast_to(
-                    self.mask_tokens.weight[None],
-                    (B, self.multiplex_count * self.num_mask_tokens, d),
-                ),
-                mx.broadcast_to(
-                    self.obj_score_token.weight[None], (B, self.multiplex_count, d)
-                ),
-            ],
-            axis=1,
+        out = self.predict_masks(
+            image_embeddings=image_embeddings,
+            image_pe=image_pe,
+            high_res_features=high_res_features,
+            extra_per_object_embeddings=extra_per_object_embeddings,
+            sparse_prompt_embeddings=sparse_prompt_embeddings,
+            dense_prompt_embeddings=dense_prompt_embeddings,
         )
-        tokens = mx.concatenate([tokens, sparse_prompt_embeddings], axis=1)
 
-        src = image_embeddings + dense_prompt_embeddings
+        masks = out["masks"]  # (B, M, P, H, W)
+        iou_pred = out["iou_pred"]  # (B, M, P)
+        mask_tokens_out = out["mask_tokens_out"]  # (B, M, P, D)
+
+        # Select the correct mask or masks for output
+        if multimask_output:
+            if not self.multimask_outputs_only:
+                # drop the single-mask token, keep the multimask tokens
+                masks = masks[:, :, 1:]
+                iou_pred = iou_pred[:, :, 1:]
+        elif self.dynamic_multimask_via_stability:
+            masks, iou_pred = self._dynamic_multimask_via_stability(masks, iou_pred)
+        else:
+            masks = masks[:, :, 0:1]
+            iou_pred = iou_pred[:, :, 0:1]
+
+        if multimask_output and self.use_multimask_token_for_obj_ptr:
+            if self.multimask_outputs_only:
+                sam_tokens_out = mask_tokens_out
+            else:
+                sam_tokens_out = mask_tokens_out[:, :, 1:]
+        else:
+            # Always take the single-mask token for the object pointer
+            sam_tokens_out = mask_tokens_out[:, :, 0:1]
+
+        return {
+            "masks": masks,
+            "iou_pred": iou_pred,
+            "sam_tokens_out": sam_tokens_out,
+            "object_score_logits": out["object_score_logits"],
+        }
+
+    def predict_masks(
+        self,
+        image_embeddings: mx.array,
+        image_pe: mx.array,
+        high_res_features: Optional[List[mx.array]] = None,
+        extra_per_object_embeddings: Optional[mx.array] = None,
+        sparse_prompt_embeddings: Optional[mx.array] = None,
+        dense_prompt_embeddings: Optional[mx.array] = None,
+    ) -> dict:
+        B_img, HW, d = image_embeddings.shape
+        M = self.multiplex_count
+        P = self.num_mask_output_per_object
+
+        if sparse_prompt_embeddings is not None:
+            B = sparse_prompt_embeddings.shape[0]
+        else:
+            B = B_img
+
+        # Repeat the image embeddings to the token batch size if needed
+        if B_img != B:
+            assert B_img == 1
+            src = mx.broadcast_to(image_embeddings, (B, HW, d))
+        else:
+            src = image_embeddings
+        if dense_prompt_embeddings is not None:
+            src = src + dense_prompt_embeddings
+
+        # Token layout: [obj_score(M), iou(M), mask(M * P), sparse...]
+        tokens = [
+            mx.broadcast_to(self.obj_score_token.weight[None], (B, M, d)),
+            mx.broadcast_to(self.iou_token.weight[None], (B, M, d)),
+        ]
+        mask_tokens = self.mask_tokens.weight.reshape(1, M, P, d)
+        if extra_per_object_embeddings is not None:
+            mask_tokens = mask_tokens + extra_per_object_embeddings[:, :, None, :]
+        else:
+            mask_tokens = mx.broadcast_to(mask_tokens, (B, M, P, d))
+        tokens.append(mask_tokens.reshape(B, M * P, d))
+        if sparse_prompt_embeddings is not None:
+            tokens.append(sparse_prompt_embeddings)
+        tokens = mx.concatenate(tokens, axis=1)
+
+        image_pe = mx.broadcast_to(image_pe, (B, HW, d))
         hs, src = self.transformer(src, image_pe, tokens)
 
-        # Extract outputs
-        M = self.multiplex_count
-        N_mask = self.num_mask_tokens
-        iou_out = hs[:, :M]
-        mask_out = hs[:, M : M + M * N_mask]
-        obj_out = hs[:, M + M * N_mask : 2 * M + M * N_mask]
+        obj_score_token_out = hs[:, :M]  # (B, M, D)
+        iou_token_out = hs[:, M : 2 * M]  # (B, M, D)
+        mask_tokens_out = hs[:, 2 * M : 2 * M + M * P]  # (B, M * P, D)
 
-        # Upscale
-        HW = src.shape[1]
+        # Upscale image features (72 -> 144 -> 288) with high-res skip fusion
         H = W = int(HW**0.5)
         src = src.reshape(B, H, W, d)
 
         upscaled = self.upscale_conv1(src)
+        if high_res_features is not None:
+            feat_s0, feat_s1 = high_res_features
+            upscaled = upscaled + feat_s1
         upscaled = self.upscale_layer_norm(upscaled)
         upscaled = nn.gelu(upscaled)
 
-        if high_res_features is not None and len(high_res_features) >= 1:
-            s1_feat = self.conv_s1(high_res_features[0])
-            if s1_feat.shape[1:3] == upscaled.shape[1:3]:
-                upscaled = upscaled + s1_feat
-
         upscaled = self.upscale_conv2(upscaled)
+        if high_res_features is not None:
+            upscaled = upscaled + feat_s0
         upscaled = nn.gelu(upscaled)
-
-        if high_res_features is not None and len(high_res_features) >= 2:
-            s0_feat = self.conv_s0(high_res_features[1])
-            if s0_feat.shape[1:3] == upscaled.shape[1:3]:
-                upscaled = upscaled + s0_feat
 
         B, H_up, W_up, C_up = upscaled.shape
         upscaled_flat = upscaled.reshape(B, H_up * W_up, C_up)
 
-        # Generate masks — MLPs are shared across multiplex slots
-        masks = []
-        for obj_i in range(M):
-            for mask_j in range(N_mask):
-                token_idx = obj_i * N_mask + mask_j
-                hyper_out = self.output_hypernetworks_mlps[mask_j](
-                    mask_out[:, token_idx]
-                )
-                mask = (upscaled_flat * hyper_out[:, None, :]).sum(axis=-1)
-                masks.append(mask.reshape(B, 1, H_up, W_up))
-        masks = mx.concatenate(masks, axis=1)  # (B, M*N_mask, H, W)
-        masks = masks.reshape(B, M, N_mask, H_up, W_up)
+        # Hypernetwork projections of the mask tokens: (B, M, P, C_up)
+        mask_tokens_out = mask_tokens_out.reshape(B, M, P, d)
+        hyper_in = mx.stack(
+            [
+                self.output_hypernetworks_mlps[i](mask_tokens_out[:, :, i])
+                for i in range(P)
+            ],
+            axis=2,
+        )
 
-        # IoU prediction — per multiplex slot
-        iou_pred = mx.stack(
-            [self.iou_prediction_head(iou_out[:, i]) for i in range(M)], axis=1
-        )  # (B, M, N_mask)
+        # Generate masks: (B, M*P, C) @ (B, C, HW) -> (B, M, P, H, W)
+        masks = (
+            hyper_in.reshape(B, M * P, C_up) @ upscaled_flat.transpose(0, 2, 1)
+        ).reshape(B, M, P, H_up, W_up)
 
-        # Object score
-        obj_score = mx.stack(
-            [self.pred_obj_score_head(obj_out[:, i]) for i in range(M)], axis=1
-        )  # (B, M, 1)
+        # Per-slot mask quality and object existence predictions
+        iou_pred = self.iou_prediction_head(iou_token_out)  # (B, M, P)
+        object_score_logits = self.pred_obj_score_head(obj_score_token_out)  # (B, M, 1)
 
-        if multimask_output:
-            out_masks = masks
-            out_iou = iou_pred
-        else:
-            out_masks = masks[:, :, 0:1]
-            out_iou = iou_pred[:, :, 0:1]
+        return {
+            "masks": masks,
+            "iou_pred": iou_pred,
+            "mask_tokens_out": mask_tokens_out,
+            "object_score_logits": object_score_logits,
+        }
 
-        return out_masks, out_iou, hs, obj_score
+    def _get_stability_scores(self, mask_logits: mx.array) -> mx.array:
+        """IoU between upper/lower thresholded masks, per mask."""
+        mask_logits = mask_logits.reshape(*mask_logits.shape[:-2], -1)
+        delta = self.dynamic_multimask_stability_delta
+        area_i = (mask_logits > delta).sum(axis=-1).astype(mx.float32)
+        area_u = (mask_logits > -delta).sum(axis=-1).astype(mx.float32)
+        return mx.where(area_u > 0, area_i / area_u, mx.array(1.0, mx.float32))
+
+    def _dynamic_multimask_via_stability(self, all_mask_logits, all_iou_scores):
+        """Fall back to the best multimask output when the single-mask output
+        has a low stability score."""
+        B, M = all_mask_logits.shape[:2]
+        all_mask_logits = all_mask_logits.reshape(-1, *all_mask_logits.shape[2:])
+        all_iou_scores = all_iou_scores.reshape(-1, all_iou_scores.shape[-1])
+
+        # Best mask among multimask output tokens (1..P-1)
+        multimask_logits = all_mask_logits[:, 1:]
+        multimask_iou = all_iou_scores[:, 1:]
+        best_inds = mx.argmax(multimask_iou, axis=-1)  # (B*M,)
+        best_multimask_logits = mx.take_along_axis(
+            multimask_logits, best_inds[:, None, None, None], axis=1
+        )
+        best_multimask_iou = mx.take_along_axis(
+            multimask_iou, best_inds[:, None], axis=1
+        )
+
+        # Single-mask output token 0 and its stability score
+        singlemask_logits = all_mask_logits[:, 0:1]
+        singlemask_iou = all_iou_scores[:, 0:1]
+        stability = self._get_stability_scores(singlemask_logits)[:, :, None, None]
+        is_stable = stability >= self.dynamic_multimask_stability_thresh
+
+        mask_logits_out = mx.where(is_stable, singlemask_logits, best_multimask_logits)
+        iou_scores_out = mx.where(
+            is_stable[:, :, 0, 0], singlemask_iou, best_multimask_iou
+        )
+
+        mask_logits_out = mask_logits_out.reshape(B, M, *mask_logits_out.shape[1:])
+        iou_scores_out = iou_scores_out.reshape(B, M, -1)
+        return mask_logits_out, iou_scores_out
 
 
 class SimpleRoPEAttention(nn.Module):
@@ -298,17 +418,25 @@ class DecoupledMemoryAttentionLayer(nn.Module):
 
     def __call__(
         self,
+        image: mx.array,
         src: mx.array,
+        memory_image: mx.array,
         memory: mx.array,
+        memory_image_pos: Optional[mx.array] = None,
         num_k_exclude_rope: int = 0,
     ) -> mx.array:
         """
+        Pre-norm decoupled layer (DecoupledTransformerDecoderLayerv2 port).
+
         Args:
-            src: (B, HW, D) current frame features
-            memory: (B, N_mem, D) memory features
-            num_k_exclude_rope: keys to exclude from RoPE
+            image: (1, HW, D) raw current-frame image features (not normed)
+            src: (B, HW, D) current frame features (self-attention)
+            memory_image: (1, N, D) image features of the memory frames
+            memory: (B, N, D) mask-memory features (+ object pointers)
+            memory_image_pos: (1, N, D) positional encodings for the memory keys
+            num_k_exclude_rope: trailing keys excluded from RoPE (obj pointers)
         """
-        # 1. Self-attention with RoPE (pre-norm)
+        # 1. Self-attention with RoPE (pre-norm, no pos enc at attention)
         residual = src
         src_normed = self.norm1(src)
         q = self.self_attn_q_proj(src_normed)
@@ -319,23 +447,23 @@ class DecoupledMemoryAttentionLayer(nn.Module):
         src = residual + src2
 
         # 2. Cross-attention to memory with RoPE (pre-norm)
+        # q/k get additional projections of the (raw) image features
         residual = src
         src_normed = self.norm2(src)
-        q = self.cross_attn_q_proj(src_normed)
-        k = self.cross_attn_k_proj(memory)
+        q = self.image_cross_attn_q_proj(image) + self.cross_attn_q_proj(src_normed)
+        k = self.image_cross_attn_k_proj(memory_image) + self.cross_attn_k_proj(memory)
+        if memory_image_pos is not None:
+            # pos enc at cross-attention keys only
+            k = k + memory_image_pos
         v = self.cross_attn_v_proj(memory)
-
-        # Add image cross-attention projections
-        q = q + self.image_cross_attn_q_proj(src_normed)
-        k = k + self.image_cross_attn_k_proj(memory)
 
         src2 = self.cross_attention_rope(q, k, v, num_k_exclude_rope=num_k_exclude_rope)
         src2 = self.cross_attn_out_proj(src2)
         src = residual + src2
 
-        # 3. FFN (pre-norm)
+        # 3. FFN (pre-norm, gelu)
         residual = src
-        src2 = self.linear2(nn.relu(self.linear1(self.norm3(src))))
+        src2 = self.linear2(nn.gelu(self.linear1(self.norm3(src))))
         src = residual + src2
 
         mx.eval(src)  # Free attention intermediates
@@ -377,10 +505,56 @@ class DecoupledMemoryAttention(nn.Module):
 
     def __call__(
         self,
+        image: mx.array,
         src: mx.array,
+        memory_image: mx.array,
         memory: mx.array,
+        src_pos: Optional[mx.array] = None,
+        memory_pos: Optional[mx.array] = None,
+        memory_image_pos: Optional[mx.array] = None,
         num_k_exclude_rope: int = 0,
     ) -> mx.array:
+        """TransformerEncoderDecoupledCrossAttention port (batch-first).
+
+        Args:
+            image: (1, HW, D) raw current-frame image features
+            src: (B, HW, D) current-frame features
+            memory_image: (1, N_img, D) image features of memory frames
+            memory: (B, N_mem, D) mask memories + object pointer tokens
+            src_pos: (B, HW, D) pos enc added to src at input (scaled by 0.1)
+            memory_pos: (B, N_mem, D) pos enc; only its object-pointer tail is
+                used (to extend memory_image_pos)
+            memory_image_pos: (1, N_img, D) pos enc for the memory image keys
+            num_k_exclude_rope: number of trailing object-pointer tokens
+        """
+        # pos enc at input (scaled by 0.1 as in the reference)
+        if src_pos is not None:
+            src = src + 0.1 * src_pos
+
+        # Pad the image memories with zeros for the object pointer tokens
+        if memory_image.shape[1] != memory.shape[1]:
+            pad = memory.shape[1] - memory_image.shape[1]
+            assert pad == num_k_exclude_rope
+            memory_image = mx.concatenate(
+                [
+                    memory_image,
+                    mx.zeros((memory_image.shape[0], pad, memory_image.shape[2])),
+                ],
+                axis=1,
+            )
+            if memory_image_pos is not None and memory_pos is not None:
+                memory_image_pos = mx.concatenate(
+                    [memory_image_pos, memory_pos[0:1, -pad:]], axis=1
+                )
+
         for layer in self.layers:
-            src = layer(src, memory, num_k_exclude_rope=num_k_exclude_rope)
+            src = layer(
+                image,
+                src,
+                memory_image,
+                memory,
+                memory_image_pos=memory_image_pos,
+                num_k_exclude_rope=num_k_exclude_rope,
+            )
+        # use_image_in_output=False: norm the output only
         return self.layer_norm(src)
