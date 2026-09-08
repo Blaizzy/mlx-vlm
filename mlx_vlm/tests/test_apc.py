@@ -480,7 +480,7 @@ def test_disk_store_recovers_when_cache_dir_is_deleted(tmp_path):
 def test_from_env_respects_opt_in_and_disk_config(tmp_path, monkeypatch):
     monkeypatch.delenv("APC_ENABLED", raising=False)
     monkeypatch.delenv("APC_DISK_PATH", raising=False)
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("MLX_VLM_CACHE_HOME", str(tmp_path / "cache"))
     assert from_env() is None
 
     monkeypatch.setenv("APC_ENABLED", "1")
@@ -491,7 +491,7 @@ def test_from_env_respects_opt_in_and_disk_config(tmp_path, monkeypatch):
     assert manager is not None
     assert manager.block_size == 8
     assert manager.num_blocks == 3
-    assert manager.disk.dir == tmp_path / "cache" / "mlx-vlm" / "apc" / "default"
+    assert manager.disk.dir == tmp_path / "cache" / "apc" / "default"
     assert manager.disk.max_bytes == 20 * (1 << 30)
     manager.close()
 

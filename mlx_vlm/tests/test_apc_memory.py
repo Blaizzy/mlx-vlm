@@ -358,7 +358,7 @@ def test_completed_oversized_disk_write_obeys_cap(tmp_path, synchronous):
 
 @pytest.mark.parametrize("opt_out", ["environment", "empty_path"])
 def test_default_disk_opt_out(tmp_path, monkeypatch, opt_out):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setenv("MLX_VLM_CACHE_HOME", str(tmp_path))
     monkeypatch.setenv("APC_ENABLED", "1")
     if opt_out == "environment":
         monkeypatch.setenv("APC_DISK_ENABLED", "0")
@@ -367,7 +367,7 @@ def test_default_disk_opt_out(tmp_path, monkeypatch, opt_out):
         overrides = {"disk_path": ""}
     manager = from_env(overrides=overrides)
     assert manager.disk is None
-    assert not (tmp_path / "mlx-vlm").exists()
+    assert not (tmp_path / "apc").exists()
 
 
 def test_automatic_budget_and_overrides(monkeypatch):

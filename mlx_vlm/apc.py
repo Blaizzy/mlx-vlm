@@ -80,8 +80,10 @@ def _env_truthy(name: str, default: str = "") -> bool:
 
 
 def default_disk_path() -> Path:
-    root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-    return root / "mlx-vlm" / "apc"
+    root = Path(
+        os.environ.get("MLX_VLM_CACHE_HOME") or Path.home() / ".cache" / "mlx-vlm"
+    )
+    return root / "apc"
 
 
 def _setting(overrides: Optional[dict], key: str, env: str, default: Any) -> Any:

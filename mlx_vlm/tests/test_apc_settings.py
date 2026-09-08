@@ -21,7 +21,7 @@ def settings_client(monkeypatch, tmp_path):
         if name.startswith("APC_"):
             monkeypatch.delenv(name)
     monkeypatch.delenv("MLX_VLM_SERVER_API_KEY", raising=False)
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("MLX_VLM_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
     monkeypatch.setattr(server.runtime, "model_cache", server.ModelCacheRegistry())
     monkeypatch.setattr(server.runtime, "response_generator", None)

@@ -877,7 +877,7 @@ mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --kv-bits 8 --port 8080
 ```
 
 APC persists caches to disk by default when enabled, under
-`$XDG_CACHE_HOME/mlx-vlm/apc` (or `~/.cache/mlx-vlm/apc`), with a 20 GiB cap per
+`$MLX_VLM_CACHE_HOME/apc` (or `~/.cache/mlx-vlm/apc`), with a 20 GiB cap per
 model namespace. Customize the location and cap:
 
 ```sh
@@ -965,6 +965,7 @@ Common APC environment variables:
 | `APC_MEMORY_MAX_GB` | auto | Resident block and checkpoint budget in GiB: 10% of Metal's recommended working set, capped at 8 GiB; `0` retains caches only on disk |
 | `APC_MEMORY_RESERVE_GB` | auto | Additional memory headroom in GiB: 10% of Metal's recommended working set, at least 1 GiB |
 | `APC_DISK_ENABLED` | `1` | Set to `0` to disable disk persistence |
+| `MLX_VLM_CACHE_HOME` | `~/.cache/mlx-vlm` | Base cache directory; APC uses its `apc` subdirectory unless `APC_DISK_PATH` is set |
 | `APC_DISK_PATH` | cache directory above | Directory for persistent disk shards; an empty value disables persistence |
 | `APC_DISK_MAX_GB` | `20` | Disk cap per model namespace in GiB; `0` means uncapped |
 | `APC_DISK_QUEUE_MAX_GB` | `1` | Maximum tensor bytes held by queued disk writes in GiB; larger writes run synchronously; `0` makes all writes synchronous |
