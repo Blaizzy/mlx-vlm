@@ -668,7 +668,7 @@ def stream_diffusion_generate(
     apc = None
     apc_hit = None
     cached_tokens = 0
-    checkpoint_len = 0
+    checkpoint_lengths = []
     full_token_ids = [int(token_id) for token_id in input_ids[0].tolist()]
     prompt_tic = time.perf_counter()
     if apc_manager is not None and not diffusion_static_cache:
@@ -683,6 +683,7 @@ def stream_diffusion_generate(
         candidate = APCCoordinator(apc_manager, model)
         if candidate.enabled and candidate.is_checkpoint:
             apc = candidate
+            apc.prepare_prefill(len(full_token_ids))
             media_token_ids = multimodal_token_ids_from_config(model.config)
             safe_lookup_min = max(
                 0,
@@ -705,7 +706,7 @@ def stream_diffusion_generate(
                     media_token_ids,
                 ),
             )
-            checkpoint_len = apc.checkpoint_len(full_token_ids, media_token_ids)
+            checkpoint_lengths = apc.checkpoint_lengths(full_token_ids, media_token_ids)
             if apc_hit is not None:
                 cached_tokens = int(apc_hit.get("prefix_len", 0) or 0)
 
@@ -852,16 +853,20 @@ def stream_diffusion_generate(
             unprocessed_input_ids = input_ids if is_prefill else current_canvas
             if is_prefill:
                 prefill_start = cached_tokens
-                if checkpoint_len > prefill_start:
+                checkpoint_saved = cached_tokens > 0
+                for checkpoint_len in checkpoint_lengths:
+                    if checkpoint_len <= prefill_start:
+                        continue
                     prefill_range(prefill_start, checkpoint_len)
-                    apc.store_checkpoint(
+                    stored = apc.store_checkpoint(
                         full_token_ids[:checkpoint_len],
                         kv_cache,
                         extra_hash=int(apc_extra_hash or 0),
                     )
+                    checkpoint_saved = checkpoint_saved or stored
                     prefill_start = checkpoint_len
                 prefill_range(prefill_start, prompt_length)
-                if apc is not None:
+                if apc is not None and not checkpoint_saved:
                     apc.commit(
                         kv_cache,
                         full_token_ids,
