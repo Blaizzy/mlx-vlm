@@ -3013,6 +3013,188 @@ class TestGemma4LogitsToKeep:
         assert lm(ids).logits.shape == (1, 6, 8)
         assert lm(ids, logits_to_keep=1).logits.shape == (1, 1, 8)
 
+    @staticmethod
+    def _shared_config(config_cls, **kwargs):
+        return config_cls(
+            hidden_size=16,
+            num_hidden_layers=4,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            global_head_dim=8,
+            vocab_size=32,
+            vocab_size_per_layer_input=32,
+            hidden_size_per_layer_input=8,
+            num_kv_shared_layers=2,
+            sliding_window=32,
+            sliding_window_pattern=2,
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize("bidirectional", [False, True])
+    def test_gemma4_trims_hidden_before_shared_kv_tail(self, bidirectional):
+        from mlx_vlm.models.gemma4 import language
+        from mlx_vlm.models.gemma4.config import TextConfig
+
+        config = self._shared_config(
+            TextConfig,
+            use_bidirectional_attention="vision" if bidirectional else None,
+        )
+        lm = language.LanguageModel(config)
+        ids = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        kwargs = (
+            {"mm_token_type_ids": mx.array([[0, 1, 1, 0, 0]])} if bidirectional else {}
+        )
+        full = lm(ids, **kwargs).logits
+        mx.eval(full)
+
+        lengths = []
+        original_call = language.DecoderLayer.__call__
+
+        def traced_call(layer, hidden, *args, **call_kwargs):
+            lengths.append(hidden.shape[1])
+            return original_call(layer, hidden, *args, **call_kwargs)
+
+        with patch.object(language.DecoderLayer, "__call__", traced_call):
+            last = lm(ids, logits_to_keep=1, **kwargs).logits
+            mx.eval(last)
+
+        assert lengths == [5, 5, 1, 1]
+        assert bool(mx.allclose(last, full[:, -1:], rtol=1e-3, atol=2e-3))
+
+    def test_gemma4_trims_only_after_full_width_hidden_captures(self):
+        from mlx_vlm.models.gemma4 import language
+        from mlx_vlm.models.gemma4.config import TextConfig
+
+        lm = language.LanguageModel(self._shared_config(TextConfig))
+        ids = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        full = lm(ids, capture_layer_ids=[0, 2])
+        mx.eval(full.logits, full.hidden_states)
+        lengths = []
+        original_call = language.DecoderLayer.__call__
+
+        def traced_call(layer, hidden, *args, **kwargs):
+            lengths.append(hidden.shape[1])
+            return original_call(layer, hidden, *args, **kwargs)
+
+        with patch.object(language.DecoderLayer, "__call__", traced_call):
+            output = lm(ids, logits_to_keep=1, capture_layer_ids=[0, 2])
+            mx.eval(output.logits, output.hidden_states)
+
+        assert lengths == [5, 5, 5, 1]
+        assert [hidden.shape[1] for hidden in output.hidden_states] == [5, 5]
+        assert all(
+            bool(mx.array_equal(actual, expected))
+            for actual, expected in zip(output.hidden_states, full.hidden_states)
+        )
+        assert bool(
+            mx.allclose(output.logits, full.logits[:, -1:], rtol=1e-3, atol=2e-3)
+        )
+
+    def test_gemma4_text_trims_hidden_before_shared_kv_tail(self):
+        from mlx_vlm.models.gemma4_text import language
+        from mlx_vlm.models.gemma4_text.config import ModelConfig
+
+        lm = language.LanguageModel(self._shared_config(ModelConfig))
+        ids = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        full = lm(ids).logits
+        mx.eval(full)
+
+        lengths = []
+        original_call = language.DecoderLayer.__call__
+
+        def traced_call(layer, hidden, *args, **kwargs):
+            lengths.append(hidden.shape[1])
+            return original_call(layer, hidden, *args, **kwargs)
+
+        with patch.object(language.DecoderLayer, "__call__", traced_call):
+            last = lm(ids, logits_to_keep=1).logits
+            mx.eval(last)
+
+        assert lengths == [5, 5, 1, 1]
+        assert bool(mx.allclose(last, full[:, -1:], rtol=1e-3, atol=2e-3))
+
+    def test_gemma4_wrappers_forward_logits_to_keep(self):
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+        from mlx_vlm.models.gemma4.gemma4 import Model as Gemma4Model
+        from mlx_vlm.models.gemma4_unified.gemma4_unified import (
+            Model as Gemma4UnifiedModel,
+        )
+
+        ids = mx.array([[1, 2, 3]], dtype=mx.int32)
+        features = InputEmbeddingsFeatures(mx.zeros((1, 3, 4)))
+        for model_cls in (Gemma4Model, Gemma4UnifiedModel):
+            model = model_cls.__new__(model_cls)
+            model.get_input_embeddings = MagicMock(return_value=features)
+            model.language_model = MagicMock(return_value=object())
+
+            model_cls.__call__(model, ids, logits_to_keep=1)
+
+            assert model.language_model.call_args.kwargs["logits_to_keep"] == 1
+
+
+@pytest.mark.parametrize(
+    ("right_padding", "input_ids", "expected_logits_to_keep"),
+    [
+        (None, [[1, 2, 3, 4, 5]], 1),
+        ([0, 2], [[1, 2, 3, 4, 5], [6, 7, 8, 0, 0]], 3),
+    ],
+)
+def test_prompt_processing_requests_only_required_trailing_logits(
+    right_padding, input_ids, expected_logits_to_keep
+):
+    calls = []
+
+    class Model:
+        language_model = SimpleNamespace(supports_logits_to_keep=True)
+
+        def __call__(self, input_ids, **kwargs):
+            calls.append((input_ids.shape[1], kwargs))
+            length = min(
+                kwargs.get("logits_to_keep", input_ids.shape[1]), input_ids.shape[1]
+            )
+            return SimpleNamespace(logits=mx.zeros((input_ids.shape[0], length, 4)))
+
+    batch = object.__new__(PromptProcessingBatch)
+    batch.model = Model()
+    batch._prompt_kwargs = {}
+    batch._prompt_length_aware_keys = []
+    batch._processed_prompt_columns = 0
+    batch.draft_model = None
+    batch.draft_kind = None
+    batch._right_pad_per_row = right_padding
+    batch.prefill_step_size = 2
+    batch._input_ids = mx.array(input_ids, dtype=mx.int32)
+    batch._inputs_embeds = mx.zeros((*batch._input_ids.shape, 4))
+    batch.prompt_cache = []
+    batch.logits_processors = []
+    batch._token_context = []
+    batch.uids = list(range(batch._input_ids.shape[0]))
+    batch.max_tokens = [1] * len(batch.uids)
+    batch.greedy_sampling = True
+    batch.thinking_budget_criteria = []
+    batch._apc_manager = None
+    batch._apc_meta = []
+    batch._apc_harvest_enabled = False
+    batch._next_apc_checkpoint_column = lambda: None
+    batch._store_apc_exact_checkpoints = lambda: None
+
+    while batch.needs_processing():
+        assert batch.prompt_step() > 0
+
+    assert batch._input_ids.shape[1] == expected_logits_to_keep
+
+    batch.generate(
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        stop_criteria=[MagicMock()] * len(batch.uids),
+        compute_logprobs=False,
+    )
+
+    final_input_width, final_kwargs = calls[-1]
+    assert final_input_width == expected_logits_to_keep
+    assert final_kwargs["logits_to_keep"] == expected_logits_to_keep
+
 
 def test_batch_apc_extra_hash_uses_precomputed_image_hash():
     batch_generator = SimpleNamespace(apc_manager=object())

@@ -1925,13 +1925,18 @@ class PromptProcessingBatch:
 
     def needs_processing(self):
         """True if prompt needs chunked processing before generate()."""
-        if self._inputs_embeds is None or self.prefill_step_size is None:
+        if self._inputs_embeds is None:
             return self._next_apc_checkpoint_column() is not None
-        if self._next_apc_checkpoint_column() is not None:
-            return True
+        if self._inputs_embeds.shape[1] <= self._final_prompt_width():
+            return False
+        if self.prefill_step_size is None:
+            return self._next_apc_checkpoint_column() is not None
         # See the note in stream_generate: prompts at or below prefill_step_size
         # would otherwise skip chunking and materialize the full logits tensor.
-        return self._inputs_embeds.shape[1] > 1
+        return True
+
+    def _final_prompt_width(self) -> int:
+        return 1 + max(self._right_pad_per_row or [0])
 
     def _apc_checkpoint_column_for_meta(
         self, batch_idx: int, meta: dict
@@ -2034,7 +2039,10 @@ class PromptProcessingBatch:
             return 0
 
         step = self.prefill_step_size or self._inputs_embeds.shape[1]
-        n = min(step, self._inputs_embeds.shape[1] - 1)
+        n = min(
+            step,
+            self._inputs_embeds.shape[1] - self._final_prompt_width(),
+        )
         checkpoint_col = self._next_apc_checkpoint_column()
         if checkpoint_col is not None:
             n = min(n, checkpoint_col - self._processed_prompt_columns)
@@ -2090,6 +2098,10 @@ class PromptProcessingBatch:
             call_kwargs.update(
                 speculative_prefill_kwargs(self.draft_kind, self.draft_model)
             )
+
+        language_model = getattr(self.model, "language_model", self.model)
+        if getattr(language_model, "supports_logits_to_keep", False):
+            call_kwargs["logits_to_keep"] = self._final_prompt_width()
 
         output = self.model(
             self._input_ids,
@@ -2208,7 +2220,6 @@ class PromptProcessingBatch:
             gen_batch._next_top_idx = top_idx
             gen_batch._next_top_lp = top_lp
 
-        language_model = getattr(self.model, "language_model", self.model)
         rope_deltas = self._capture_rope_deltas_from_prompt_kwargs(
             call_kwargs, language_model, len(gen_batch.uids)
         )
