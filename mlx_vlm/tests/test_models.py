@@ -16782,6 +16782,58 @@ class TestQwen3Embedding(unittest.TestCase):
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
 
 
+class TestGemma3RopeConfig(unittest.TestCase):
+    def config_values(self):
+        return dict(
+            model_type="gemma3_text",
+            hidden_size=32,
+            num_hidden_layers=6,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            vocab_size=64,
+        )
+
+    def test_checkpoint_rope_theta_reaches_global_attention(self):
+        from mlx_vlm.models.gemma3.config import TextConfig
+        from mlx_vlm.models.gemma3.language import Attention
+        from mlx_vlm.models.gemma3_text.config import ModelConfig
+
+        for config_type in (TextConfig, ModelConfig):
+            params = dict(self.config_values(), rope_theta=12345.0)
+            config = config_type.from_dict(params)
+            self.assertEqual(Attention(config, 5).rope.base, 12345.0)
+            self.assertEqual(Attention(config, 0).rope.base, 10000.0)
+            self.assertEqual(params["rope_theta"], 12345.0)
+            self.assertNotIn("rope_global_base_freq", params)
+            self.assertEqual(config_type.from_dict(config.to_dict()), config)
+
+    def test_default_and_legacy_config_keep_their_behavior(self):
+        from mlx_vlm.models.gemma3.config import TextConfig
+
+        for params, expected in (
+            ({}, 1000000.0),
+            ({"rope_global_base_freq": 23456.0}, 23456.0),
+            ({"rope_theta": 23456.0, "rope_global_base_freq": 23456.0}, 23456.0),
+        ):
+            with self.subTest(params=params):
+                config = TextConfig.from_dict(dict(self.config_values(), **params))
+                self.assertEqual(config.rope_global_base_freq, expected)
+
+    def test_conflicting_rope_aliases_fail_clearly(self):
+        from mlx_vlm.models.gemma3.config import TextConfig
+
+        with self.assertRaisesRegex(ValueError, "rope_theta.*rope_global_base_freq"):
+            TextConfig.from_dict(
+                dict(
+                    self.config_values(),
+                    rope_theta=12345.0,
+                    rope_global_base_freq=54321.0,
+                )
+            )
+
+
 class TestGemma3Embedding(unittest.TestCase):
     def test_gemma3_embedding_forward(self):
         from mlx_vlm.models import gemma3_embedding
