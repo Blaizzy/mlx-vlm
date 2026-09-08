@@ -857,12 +857,17 @@ def test_exact_cache_disk_restore_preserves_qsa_state(tmp_path, monkeypatch):
     qsa.index_position_ids = mx.arange(3 * len(token_ids), dtype=mx.int64).reshape(
         3, 1, len(token_ids)
     )
+    qsa.index_block_keys = mx.arange(1 * 1 * 10 * 6, dtype=mx.float32).reshape(
+        1, 1, 10, 6
+    )
+    qsa.index_block_ratio = 4
     mx.eval(
         arrays[0],
         qsa.keys,
         qsa.values,
         qsa.index_keys,
         qsa.index_position_ids,
+        qsa.index_block_keys,
     )
 
     disk = DiskBlockStore(tmp_path, namespace="qsa-exact")
@@ -891,6 +896,8 @@ def test_exact_cache_disk_restore_preserves_qsa_state(tmp_path, monkeypatch):
     assert bool(
         mx.array_equal(warm[1].index_position_ids, qsa.index_position_ids).item()
     )
+    _assert_allclose(warm[1].index_block_keys, qsa.index_block_keys)
+    assert warm[1].index_block_ratio == qsa.index_block_ratio
 
     memory_warm, memory_matched_tokens = manager.lookup_exact_cache(
         token_ids + [998], extra_hash=19
@@ -908,6 +915,8 @@ def test_exact_cache_disk_restore_preserves_qsa_state(tmp_path, monkeypatch):
     assert isinstance(batch_cache[1], BatchQSAKVCache)
     extracted = batch_cache[1].extract(0)
     _assert_allclose(extracted.index_keys, qsa.index_keys)
+    _assert_allclose(extracted.index_block_keys, qsa.index_block_keys)
+    assert extracted.index_block_ratio == qsa.index_block_ratio
     assert bool(
         mx.array_equal(extracted.index_position_ids, qsa.index_position_ids).item()
     )
@@ -1200,6 +1209,18 @@ def test_multimodal_token_ids_from_config():
     )
 
     assert apc_module.multimodal_token_ids_from_config(config) == {42, 77}
+
+
+def test_deepseek_v4_multimodal_token_ids_cover_all_sentinels():
+    config = SimpleNamespace(
+        model_type="deepseek_v4",
+        vision_n_layers=32,
+        vocab_size=129280,
+    )
+
+    assert apc_module.multimodal_token_ids_from_config(config) == set(
+        range(129280, 129285)
+    )
 
 
 def test_media_token_spans_are_contiguous_ranges():

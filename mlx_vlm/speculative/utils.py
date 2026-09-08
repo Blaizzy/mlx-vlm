@@ -3,7 +3,6 @@ from typing import Any, Callable, Generator, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..models import cache
 from .common import (
     _dflash_block_total,
     _format_speculative_stats,
@@ -18,6 +17,7 @@ from .dflash import (
     _dflash_next_block_size,
     _dflash_rounds,
     _dflash_rounds_batch,
+    _reserve_dflash_target_cache,
 )
 from .eagle3 import _eagle3_capture_layer_ids, _eagle3_rounds, _eagle3_rounds_batch
 from .mtp import (
@@ -40,6 +40,7 @@ __all__ = [
     "_dflash_block_total",
     "_dflash_committed_hidden_segments",
     "_dflash_next_block_size",
+    "_reserve_dflash_target_cache",
     "_dflash_rounds",
     "_dflash_rounds_batch",
     "_effective_mtp_block_size",
@@ -122,8 +123,10 @@ def make_speculative_prompt_cache(
     left_padding,
     make_cache: Callable,
 ):
-    if batch_size == 1:
-        return cache.make_prompt_cache(lm)
+    # Every drafter builds its prompt cache through `make_cache`, so the cache
+    # type the server asked for with --kv-bits is what speculation runs on. The
+    # batch caches it returns satisfy the rollback contract speculation needs
+    # (`is_trimmable`/`trim`/`zero_row_tail`).
     return make_cache(lm, left_padding)
 
 

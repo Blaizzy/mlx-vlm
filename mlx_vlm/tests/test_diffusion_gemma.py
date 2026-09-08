@@ -1559,6 +1559,70 @@ class TestDiffusionGemma4(unittest.TestCase):
                 tokenizer.convert_tokens_to_ids(token), tokenizer.unk_token_id
             )
 
+    def test_strip_channel_scaffolding_removes_leaked_header(self):
+        from mlx_vlm.models.diffusion_gemma.processing_diffusion_gemma import (
+            _strip_channel_scaffolding,
+        )
+
+        raw = (
+            "<|channel>thought\n"
+            "<channel|>Title: White motor cruiser Wavey Katey II cruising on a river\n"
+            "Description: A white cabin motor cruiser named Wavey Katey II cruises "
+            "along a calm waterway.\n"
+            "Keywords: Boat, cabin cruiser, motorboat, river"
+        )
+
+        cleaned = _strip_channel_scaffolding(raw)
+
+        self.assertNotIn("<|channel>", cleaned)
+        self.assertNotIn("<channel|>", cleaned)
+        self.assertNotIn("thought", cleaned)
+        self.assertTrue(cleaned.startswith("Title: White motor cruiser"))
+        self.assertIn("Keywords: Boat, cabin cruiser, motorboat, river", cleaned)
+
+    def test_strip_channel_scaffolding_is_noop_without_markers(self):
+        from mlx_vlm.models.diffusion_gemma.processing_diffusion_gemma import (
+            _strip_channel_scaffolding,
+        )
+
+        plain = "Title: A calm river cruise\nKeywords: boat, river"
+        self.assertEqual(_strip_channel_scaffolding(plain), plain)
+
+    def test_generate_strips_diffusion_channel_scaffolding(self):
+        dispatch_module = importlib.import_module("mlx_vlm.generate.dispatch")
+        from mlx_vlm.generate import GenerationResult, generate
+
+        class Config:
+            model_type = "diffusion_gemma"
+            eos_token_id = 999999
+
+        class Model:
+            config = Config()
+
+        processor = tiny_diffusion_gemma_processor()
+        processor.tokenizer.stopping_criteria = StoppingCriteria(
+            [999999], processor.tokenizer
+        )
+
+        chunks = [
+            GenerationResult(
+                text="<|channel>thought\n<channel|>Title: A calm river cruise",
+                token=1,
+                prompt_tokens=3,
+                generation_tokens=8,
+                total_tokens=11,
+                prompt_tps=10.0,
+                generation_tps=5.0,
+            )
+        ]
+
+        with patch.object(
+            dispatch_module, "stream_generate", return_value=iter(chunks)
+        ):
+            result = generate(Model(), processor, "")
+
+        self.assertEqual(result.text, "Title: A calm river cruise")
+
     def test_processor_returns_video_frames_as_pixel_values(self):
         processor = tiny_diffusion_gemma_processor()
 

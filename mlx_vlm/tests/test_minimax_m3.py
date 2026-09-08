@@ -2,6 +2,7 @@ import math
 
 import mlx.core as mx
 import numpy as np
+import pytest
 
 import mlx_vlm.models.minimax_m3_vl.language as minimax_language
 from mlx_vlm.models.minimax_m3_vl.config import ModelConfig, TextConfig, VisionConfig
@@ -1329,7 +1330,10 @@ def test_minimax_m3_rollback_speculative_cache_trims_index_cache():
     assert cache.index_offset == 3
 
 
-def test_minimax_m3_batch_rollback_zeroes_rejected_index_tails():
+def test_minimax_m3_batch_rollback_raises_on_ragged_accepts():
+    # Ragged accepts on a rectangular batch cache would zero the shorter row's
+    # KV and indexer tails, leaving phantom keys attended (issue #1962). The
+    # rollback must fail loud so callers clamp to uniform acceptance instead.
     lm = LanguageModel(_tiny_minimax_text_config(num_hidden_layers=1))
     cache = MiniMaxM3BatchKVCache([0, 0])
     keys = mx.ones((2, 1, 5, 4), dtype=mx.float32)
@@ -1338,18 +1342,10 @@ def test_minimax_m3_batch_rollback_zeroes_rejected_index_tails():
 
     cache.update_and_fetch(keys, values)
     cache.update_index_and_fetch(index_keys)
-    accepted = lm.rollback_speculative_cache(
-        [cache], None, accepted=mx.array([2, 0], dtype=mx.int32), block_size=4
-    )
-
-    assert accepted == 2
-    assert cache._idx == 4
-    assert cache.index_offset == 4
-    assert cache.kv_cache.keys[0, :, 1:4, :].sum().item() > 0
-    assert cache.index_keys[0, :, 1:4, :].sum().item() > 0
-    assert cache.kv_cache.keys[1, :, 2:4, :].sum().item() == 0
-    assert cache.kv_cache.values[1, :, 2:4, :].sum().item() == 0
-    assert cache.index_keys[1, :, 2:4, :].sum().item() == 0
+    with pytest.raises(RuntimeError, match="uniform"):
+        lm.rollback_speculative_cache(
+            [cache], None, accepted=mx.array([2, 0], dtype=mx.int32), block_size=4
+        )
 
 
 def test_minimax_m3_batch_index_cache_filter_extend_extract():

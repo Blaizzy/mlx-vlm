@@ -531,53 +531,33 @@ def test_speculative_server_hidden_state_concatenates_for_dflash():
     assert result.shape == (1, 1, 8)
 
 
-@pytest.mark.parametrize("draft_kind", ["mtp", "dflash", "eagle3"])
-def test_speculative_prompt_cache_uses_unbatched_cache_for_singleton(
-    monkeypatch, draft_kind
+@pytest.mark.parametrize(
+    "draft_kind,batch_size,left_padding",
+    [
+        ("mtp", 1, [0]),
+        ("mtp", 2, [0, 1]),
+        ("dflash", 1, [0]),
+        ("dflash", 2, [0, 1]),
+        ("eagle3", 1, [0]),
+        (None, 1, [0]),
+    ],
+)
+def test_speculative_prompt_cache_always_uses_supplied_make_cache(
+    draft_kind, batch_size, left_padding
 ):
-    lm = object()
-    unbatched_cache = object()
-    batched_cache = object()
-
-    monkeypatch.setattr(
-        speculative_utils.cache, "make_prompt_cache", lambda target: unbatched_cache
-    )
-
-    result = speculative_utils.make_speculative_prompt_cache(
-        lm,
-        draft_kind=draft_kind,
-        batch_size=1,
-        left_padding=[0],
-        make_cache=lambda *args, **kwargs: batched_cache,
-    )
-
-    assert result is unbatched_cache
-
-
-def test_speculative_prompt_cache_uses_batched_cache_for_batch(monkeypatch):
+    # `make_cache` is what applies --kv-bits. Single-row speculation used to
+    # bypass it for `cache.make_prompt_cache`, which left the KV unquantized
+    # however the server was configured.  That shortcut covered every drafter
+    # routed through here, so each one is checked for the single-row case.
     lm = object()
     batched_cache = object()
-
-    monkeypatch.setattr(
-        speculative_utils.cache, "make_prompt_cache", lambda target: pytest.fail()
-    )
 
     assert (
         speculative_utils.make_speculative_prompt_cache(
             lm,
-            draft_kind="mtp",
-            batch_size=2,
-            left_padding=[0, 1],
-            make_cache=lambda *args, **kwargs: batched_cache,
-        )
-        is batched_cache
-    )
-    assert (
-        speculative_utils.make_speculative_prompt_cache(
-            lm,
-            draft_kind="dflash",
-            batch_size=2,
-            left_padding=[0, 1],
+            draft_kind=draft_kind,
+            batch_size=batch_size,
+            left_padding=left_padding,
             make_cache=lambda *args, **kwargs: batched_cache,
         )
         is batched_cache
@@ -847,6 +827,25 @@ def test_server_includes_processor_specific_stop_tokens(monkeypatch):
     assert gen.stop_tokens == {2, 3}
 
 
+def test_server_includes_tokenizer_eos_in_stop_tokens(monkeypatch):
+    config = SimpleNamespace(eos_token_id=248044)
+    model = SimpleNamespace(language_model=SimpleNamespace(config=config))
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=248046))
+    gen = _unstarted_response_generator()
+
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.delenv("MLX_VLM_DRAFT_KIND", raising=False)
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+
+    gen._initialize_model()
+
+    assert gen.stop_tokens == {248044, 248046}
+
+
 def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
     config = SimpleNamespace(eos_token_id=[])
     language_model = SimpleNamespace()
@@ -1009,6 +1008,8 @@ def test_ar_thread_exception_reaches_pending_client_queue(monkeypatch):
 
 
 def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatch):
+    monkeypatch.setenv("MLX_VLM_MODEL_DISCOVERY", "hf-cache")
+
     def repo(repo_id, file_names):
         return SimpleNamespace(
             repo_id=repo_id,
@@ -1058,6 +1059,7 @@ def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatc
 def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
     client, monkeypatch
 ):
+    monkeypatch.delenv("MLX_VLM_MODEL_DISCOVERY", raising=False)
     monkeypatch.setattr(
         server,
         "scan_cache_dir",
@@ -1078,6 +1080,8 @@ def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
 
 
 def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(client, monkeypatch):
+    monkeypatch.setenv("MLX_VLM_MODEL_DISCOVERY", "hf-cache")
+
     def repo(repo_id, file_names):
         return SimpleNamespace(
             repo_id=repo_id,
@@ -1117,6 +1121,59 @@ def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(client, monkeyp
     assert [model["id"] for model in response.json()["data"]].count(
         "local/sharded-model"
     ) == 1
+
+
+def test_models_endpoint_default_does_not_advertise_shared_hf_cache(
+    client, monkeypatch
+):
+    monkeypatch.delenv("MLX_VLM_MODEL_DISCOVERY", raising=False)
+    scan_cache = MagicMock(
+        return_value=SimpleNamespace(
+            repos=[
+                SimpleNamespace(
+                    repo_id="sentence-transformers/all-MiniLM-L6-v2",
+                    repo_type="model",
+                    last_modified=123.0,
+                    refs={
+                        "main": SimpleNamespace(
+                            files=[
+                                SimpleNamespace(
+                                    file_path=SimpleNamespace(name=file_name)
+                                )
+                                for file_name in (
+                                    "config.json",
+                                    "tokenizer_config.json",
+                                    "model.safetensors",
+                                )
+                            ]
+                        )
+                    },
+                )
+            ]
+        )
+    )
+    monkeypatch.setattr(server, "scan_cache_dir", scan_cache)
+    registry = server.ModelCacheRegistry()
+    registry.set(
+        "text_generation",
+        {
+            "model_path": "/models/loaded-chat-model",
+            "model_kind": "text_generation",
+        },
+    )
+    monkeypatch.setattr(server.runtime, "model_cache", registry)
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    assert response.json()["data"] == [
+        {
+            "id": "/models/loaded-chat-model",
+            "object": "model",
+            "created": response.json()["data"][0]["created"],
+        }
+    ]
+    scan_cache.assert_not_called()
 
 
 def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
@@ -3537,7 +3594,7 @@ def test_chat_completions_endpoint_falls_back_from_video_to_images(client):
     assert mock_template.call_args.kwargs["video"] is None
     assert mock_generate.call_args.kwargs["image"] == frames
     assert mock_generate.call_args.kwargs["video"] == []
-    mock_sample.assert_called_once_with(["clip.mp4"], 2.0)
+    mock_sample.assert_called_once_with(["clip.mp4"], 2.0, None)
 
 
 def test_chat_completions_endpoint_preserves_assistant_reasoning_content(client):
@@ -6368,6 +6425,7 @@ class TestResponseGenerator:
             "MLX_VLM_PRELOAD_TTS_MODEL",
             "MLX_VLM_PRELOAD_STT_MODEL",
             "MLX_VLM_PRELOAD_RERANKER_MODEL",
+            "MLX_VLM_MODEL_DISCOVERY",
             "MLX_VLM_VISION_CACHE_SIZE",
             "MLX_VLM_MAX_TOKENS",
             "MLX_VLM_THINKING_BUDGET",
@@ -6399,6 +6457,8 @@ class TestResponseGenerator:
                 "stt-demo",
                 "--reranker-model",
                 "reranker-demo",
+                "--model-discovery",
+                "served",
                 "--enable-thinking",
                 "--thinking-budget",
                 "128",
@@ -6429,6 +6489,7 @@ class TestResponseGenerator:
             assert os.environ["MLX_VLM_PRELOAD_TTS_MODEL"] == "tts-demo"
             assert os.environ["MLX_VLM_PRELOAD_STT_MODEL"] == "stt-demo"
             assert os.environ["MLX_VLM_PRELOAD_RERANKER_MODEL"] == "reranker-demo"
+            assert os.environ["MLX_VLM_MODEL_DISCOVERY"] == "served"
             assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
             assert run_calls[0][1]["host"] == "127.0.0.1"
         finally:
@@ -6440,6 +6501,7 @@ class TestResponseGenerator:
                 "MLX_VLM_PRELOAD_TTS_MODEL",
                 "MLX_VLM_PRELOAD_STT_MODEL",
                 "MLX_VLM_PRELOAD_RERANKER_MODEL",
+                "MLX_VLM_MODEL_DISCOVERY",
                 "MLX_VLM_VISION_CACHE_SIZE",
                 "MLX_VLM_MAX_TOKENS",
                 "MLX_VLM_THINKING_BUDGET",
