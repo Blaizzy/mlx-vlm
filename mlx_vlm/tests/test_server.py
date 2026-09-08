@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
 from threading import Event, Lock, Thread
@@ -8026,3 +8027,153 @@ class TestReranking:
         loaded = server.get_cached_model("reranker", None, model_kind="reranker")
 
         assert loaded == (model, processor, model.config)
+
+
+@dataclass
+class _FakeAlignedToken:
+    id: int
+    text: str
+    start: float
+    duration: float
+    end: float = 0.0
+
+    def __post_init__(self):
+        self.end = self.start + self.duration
+
+
+@dataclass
+class _FakeAlignedSentence:
+    text: str
+    tokens: list
+    start: float = 0.0
+    end: float = 0.0
+
+    def __post_init__(self):
+        self.start = self.tokens[0].start
+        self.end = self.tokens[-1].end
+
+
+@dataclass
+class _FakeAlignedResult:
+    text: str
+    sentences: list
+
+
+@dataclass
+class _FakeSTTOutput:
+    text: str
+    segments: list = None
+    language: str = None
+
+
+@dataclass
+class _FakeStreamingResult:
+    text: str
+    tokens: list
+    is_final: bool
+    start_time: float
+    end_time: float
+
+
+def _fake_parakeet_result():
+    first = _FakeAlignedSentence(
+        "Hello world.",
+        [
+            _FakeAlignedToken(1, "Hello", 0.0, 0.4),
+            _FakeAlignedToken(2, " world.", 0.4, 0.5),
+        ],
+    )
+    second = _FakeAlignedSentence("Bye.", [_FakeAlignedToken(3, "Bye.", 1.0, 0.3)])
+    return _FakeAlignedResult("Hello world. Bye.", [first, second])
+
+
+class TestSTTSegmentSerialization:
+    """Serialization of STT results into OpenAI-style transcription payloads.
+
+    Regression coverage for NeMo-alignment models (Parakeet/Canary) whose
+    ``AlignedResult`` exposes ``sentences`` rather than ``segments`` (issue 2183).
+    """
+
+    def test_derives_segments_from_nemo_sentences(self):
+        from mlx_vlm.server.audio import _stt_item_to_dict
+
+        data = _stt_item_to_dict(_fake_parakeet_result())
+
+        assert "segments" in data
+        segments = data["segments"]
+        assert [s["text"] for s in segments] == ["Hello world.", "Bye."]
+        assert segments[0]["start"] == 0.0
+        assert abs(segments[0]["end"] - 0.9) < 1e-6
+        assert segments[1]["start"] == 1.0
+        assert abs(segments[1]["end"] - 1.3) < 1e-6
+
+    def test_pipeline_preserves_nemo_segments(self):
+        from mlx_vlm.server.audio import (
+            _iter_stt_items,
+            _sanitize_for_json,
+            _stt_item_to_dict,
+            _transcription_result_from_chunks,
+        )
+
+        chunks = [
+            json.dumps(_sanitize_for_json(_stt_item_to_dict(item))) + "\n"
+            for item in _iter_stt_items(_fake_parakeet_result())
+        ]
+        result = _transcription_result_from_chunks(chunks)
+
+        assert result["text"].startswith("Hello world.")
+        assert len(result.get("segments") or []) == 2
+
+    def test_whisper_segments_unchanged(self):
+        from mlx_vlm.server.audio import _stt_item_to_dict
+
+        whisper = _FakeSTTOutput(
+            "hi", segments=[{"start": 0.0, "end": 1.0, "text": "hi"}], language="en"
+        )
+        data = _stt_item_to_dict(whisper)
+
+        assert data["segments"] == [{"start": 0.0, "end": 1.0, "text": "hi"}]
+        assert data["language"] == "en"
+        assert "sentences" not in data
+
+    def test_plain_text_item_unchanged(self):
+        from mlx_vlm.server.audio import _stt_item_to_dict
+
+        assert _stt_item_to_dict("just text") == {"text": "just text"}
+
+    def test_streaming_result_gets_no_segments(self):
+        from mlx_vlm.server.audio import _stt_item_to_dict
+
+        data = _stt_item_to_dict(
+            _FakeStreamingResult("partial", [1, 2], False, 0.0, 0.5)
+        )
+
+        assert "segments" not in data
+        assert data["is_final"] is False
+
+    def test_real_aligned_result_if_available(self):
+        pytest.importorskip("mlx_audio.stt.models.nemo.alignment")
+        from mlx_audio.stt.models.nemo.alignment import (
+            AlignedSentence,
+            AlignedToken,
+            sentences_to_result,
+        )
+
+        from mlx_vlm.server.audio import _stt_item_to_dict
+
+        result = sentences_to_result(
+            [
+                AlignedSentence(
+                    "hello",
+                    [
+                        AlignedToken(id=1, text="hel", start=0.0, duration=0.2),
+                        AlignedToken(id=2, text="lo", start=0.2, duration=0.3),
+                    ],
+                )
+            ]
+        )
+        data = _stt_item_to_dict(result)
+
+        assert data["segments"] == [
+            {"id": 0, "start": 0.0, "end": 0.5, "text": "hello"}
+        ]
