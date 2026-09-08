@@ -19277,3 +19277,70 @@ class TestMoge3(unittest.TestCase):
         self.assertEqual(len(out["points_per_step"]), 3)
         self.assertEqual(len(out["depth_per_step"]), 3)
         self.assertEqual(out["points_per_step"][-1].shape, (1, 96, 128, 3))
+
+
+class TestSpark2_5Model(unittest.TestCase):
+    def _config(self, **overrides):
+        from mlx_vlm.models import spark2_5
+
+        params = dict(
+            model_type="spark2_5",
+            hidden_size=64,
+            num_hidden_layers=4,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=128,
+            sliding_window=8,
+            max_position_embeddings=512,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            rope_parameters={
+                "full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 5e6},
+                "sliding_attention": {"partial_rotary_factor": 1.0, "rope_theta": 1e4},
+            },
+        )
+        params.update(overrides)
+        return spark2_5.ModelConfig.from_dict(params)
+
+    def test_dense_forward_and_cached_decode(self):
+        from mlx_vlm.models import spark2_5
+        from mlx_vlm.utils import get_model_and_args
+
+        cfg = self._config()
+        model = spark2_5.Model(cfg)
+
+        full_logits, _ = assert_cached_forward_matches_full(model)
+        self.assertEqual(full_logits.shape[0], 1)
+        self.assertEqual(full_logits.shape[-1], cfg.vocab_size)
+        self.assertEqual(len(model.layers), cfg.num_hidden_layers)
+
+        module, model_type = get_model_and_args({"model_type": "spark2_5"})
+        self.assertIs(module, spark2_5)
+        self.assertEqual(model_type, "spark2_5")
+
+    def test_partial_rope_and_headwise_gate(self):
+        from mlx_vlm.models import spark2_5
+
+        cfg = self._config()
+        # full-attention layers use a 0.25 partial rotary; sliding use full.
+        self.assertEqual(cfg.rope_for("full_attention"), (4, 5e6))
+        self.assertEqual(cfg.rope_for("sliding_attention"), (16, 1e4))
+
+        attn = spark2_5.Model(cfg).language_model.model.layers[0].self_attn
+        self.assertTrue(attn.headwise_gate)
+        self.assertEqual(attn.g_proj.weight.shape[0], cfg.num_attention_heads)
+        self.assertEqual(attn.sliding_window, cfg.sliding_window)
+
+    def test_sanitize_adds_language_model_prefix(self):
+        from mlx_vlm.models import spark2_5
+
+        model = spark2_5.Model(self._config())
+        weights = {"model.embedding.weight": mx.zeros((128, 64))}
+        sanitized = model.sanitize(weights)
+        self.assertIn("language_model.model.embedding.weight", sanitized)
