@@ -8,7 +8,7 @@ import pytest
 
 from mlx_vlm import apc
 from mlx_vlm.apc import APCManager, DiskBlockStore, _cache_nbytes, from_env
-from mlx_vlm.models.cache import ArraysCache, KVCache
+from mlx_vlm.models.cache import ArraysCache, CacheList, KVCache
 
 
 def _kv(length, value=1):
@@ -173,6 +173,33 @@ def test_prefill_evicts_oldest_before_new_allocation(manager_factory, monkeypatc
     assert manager.resident_bytes() == 0
 
 
+@pytest.mark.parametrize("sequence_count", [1, 3])
+def test_short_hybrid_prompt_does_not_inflate_long_prefill_reserve(
+    manager_factory, monkeypatch, sequence_count
+):
+    manager = manager_factory(budget=1 << 20)
+    recurrent = ArraysCache(1)
+    recurrent[0] = mx.zeros((1, 128, 128))
+    # Only 16 tokens occupy a capacity-rounded KV buffer. Nested caches model
+    # GLM's latent attention and indexer layout.
+    kv = _kv(256)
+    kv.offset = 16
+    prompt_cache = [recurrent, CacheList(kv)]
+    assert manager.store_exact_cache(list(range(16)), prompt_cache)
+    fixed = recurrent.nbytes + (256 - 16) * 32
+    expected = 2 * (fixed * sequence_count + 30_000 * 32)
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: expected + (1 << 20))
+    manager.prepare_prefill(30_000, sequence_count=sequence_count)
+    assert manager.stats_snapshot()["prefill_reserve_bytes"] == expected
+    assert manager.stats_snapshot()["memory_evictions"] == 0
+    # Observing a long checkpoint preserves a per-token estimate of 32 bytes,
+    # while the fixed recurrent state remains counted once per sequence.
+    manager._observe_cache_size(
+        recurrent.nbytes + 30_000 * 32, 30_000, [recurrent, CacheList(_kv(30_000))]
+    )
+    assert manager._bytes_per_token == 32
+
+
 def test_memory_restore_accounts_for_extended_prompt_capacity(
     manager_factory, monkeypatch
 ):
@@ -186,6 +213,30 @@ def test_memory_restore_accounts_for_extended_prompt_capacity(
     # The stored 512 bytes fit, but allocating capacity for 1,000 tokens does not.
     assert manager.lookup_exact_cache(tokens + [99] * 984) == (None, 0)
     assert manager.stats_snapshot()["memory_skips"] == 1
+
+
+@pytest.mark.parametrize("disk", [False, True])
+def test_hybrid_short_prefix_restore_counts_fixed_state_once(
+    manager_factory, monkeypatch, disk
+):
+    manager = manager_factory(budget=4 << 20, disk=disk)
+    recurrent = ArraysCache(1)
+    recurrent[0] = mx.ones((1, 512, 512))
+    tokens = list(range(16))
+    assert manager.store_exact_cache(tokens, [recurrent, CacheList(_kv(16))])
+    if disk:
+        manager.disk.flush()
+        manager.clear()
+        # A fresh manager must read the persisted growth profile before loading
+        # tensors; no in-memory observations survive a server restart.
+        manager = manager_factory(budget=4 << 20, disk=True)
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: 6 << 20)
+    manager.prepare_prefill(4096)
+    restored, length = manager.lookup_exact_cache(tokens + [99] * (4096 - 16))
+    assert length == 16
+    assert mx.array_equal(restored[0][0], recurrent[0]).item()
+    assert restored[1].caches[0].keys.shape[2] >= 4096
+    assert manager.stats_snapshot()["memory_skips"] == 0
 
 
 def test_prefill_waits_for_writes_before_evicting(manager_factory, monkeypatch):

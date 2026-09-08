@@ -123,6 +123,24 @@ def _metal_working_set_bytes() -> Optional[int]:
         return None
 
 
+def _cache_growth_nbytes(value: Any) -> Tuple[int, int]:
+    """Split fixed state/capacity overhead from token-dependent cache bytes."""
+    from .models.cache import ArraysCache, CacheList
+
+    if isinstance(value, CacheList):
+        value = value.caches
+    if isinstance(value, (list, tuple)):
+        parts = [_cache_growth_nbytes(c) for c in value]
+        return sum(p[0] for p in parts), sum(p[1] for p in parts)
+    size = _cache_nbytes(value)
+    if isinstance(value, ArraysCache):
+        return size, 0
+    # KV state exposes only the occupied tokens, unlike capacity-rounded keys
+    # and values. Count unused capacity once instead of scaling it with context.
+    logical = _cache_nbytes(getattr(value, "state", value))
+    return max(0, size - logical), min(size, logical)
+
+
 def apc_trace_enabled() -> bool:
     """Optional request-path tracing (``APC_TRACE=1``), sibling of ``APC_DISK_TRACE``."""
     return _env_truthy("APC_TRACE")
@@ -1597,13 +1615,26 @@ class DiskBlockStore:
             path, min_capacity_tokens=min_capacity_tokens, prefix_len=prefix_len
         )
 
-    def exact_cache_bytes(self, cache_hash: int) -> int:
+    def exact_cache_bytes(self, cache_hash: int, capacity_ratio: float = 1) -> int:
         with self._index_lock:
             path = self._exact_index.get(cache_hash)
         try:
-            return path.stat().st_size if path is not None else 0
+            size = path.stat().st_size if path is not None else 0
         except OSError:
             return 0
+        if path is not None and capacity_ratio > 1:
+            parsed = self._open_shard_header(path)
+            if parsed is not None:
+                _, metadata, _ = parsed
+                try:
+                    fixed = int(metadata["fixed_cache_bytes"])
+                    growing = int(metadata["growing_cache_bytes"])
+                    if fixed >= 0 and growing >= 0:
+                        return max(size, int(fixed + growing * capacity_ratio))
+                except (KeyError, ValueError, TypeError):
+                    pass
+        # Older snapshots have no growth profile; retain their conservative bound.
+        return int(size * max(1, capacity_ratio))
 
     def prefix_cache_bytes(self, block_hashes: Sequence[int]) -> int:
         """Conservative restore size, including each source shard's capacity."""
@@ -2891,6 +2922,9 @@ class DiskBlockStore:
             ),
             "store_id": self._exact_id_for(snapshot.cache_hash),
         }
+        fixed, growing = _cache_growth_nbytes(snapshot.prompt_cache)
+        metadata["fixed_cache_bytes"] = str(fixed)
+        metadata["growing_cache_bytes"] = str(growing)
         arrays: dict[str, mx.array] = {}
         for i, c in enumerate(snapshot.prompt_cache):
             if not self._snapshot_exact_cache_entry(c, f"c{i}", arrays, metadata):
@@ -3184,6 +3218,8 @@ class APCManager:
             ),
         )
         self._bytes_per_token = 0.0
+        self._fixed_cache_bytes = 0
+        self._prefill_sequences = 1
         self._prefill_reserve_bytes = 0
         self._prefill_tokens = 0
 
@@ -3318,16 +3354,33 @@ class APCManager:
             and self._memory_headroom() >= required
         )
 
-    def _observe_cache_size(self, size: int, token_count: int) -> None:
+    def _observe_cache_size(
+        self, size: int, token_count: int, prompt_cache: Any = None
+    ) -> None:
         if token_count > 0:
+            fixed, growing = (
+                _cache_growth_nbytes(prompt_cache)
+                if prompt_cache is not None
+                else (0, size)
+            )
             with self.lock:
-                self._bytes_per_token = max(self._bytes_per_token, size / token_count)
+                self._fixed_cache_bytes = max(self._fixed_cache_bytes, fixed)
+                self._bytes_per_token = max(
+                    self._bytes_per_token, growing / token_count
+                )
                 self._prefill_reserve_bytes = int(
-                    max(0, 2 * self._prefill_tokens - token_count)
-                    * self._bytes_per_token
+                    max(
+                        0,
+                        2
+                        * (
+                            self._fixed_cache_bytes * self._prefill_sequences
+                            + self._prefill_tokens * self._bytes_per_token
+                        )
+                        - size,
+                    )
                 )
 
-    def prepare_prefill(self, token_count: int) -> None:
+    def prepare_prefill(self, token_count: int, sequence_count: int = 1) -> None:
         """Make room for the incoming request before lookup, embeddings or prefill.
 
         Reserve two cache footprints for growth/restore temporaries in addition
@@ -3337,8 +3390,13 @@ class APCManager:
         if self.disk is not None:
             self.disk.flush()
         self._prefill_tokens = max(0, token_count)
+        self._prefill_sequences = max(1, sequence_count)
         self._prefill_reserve_bytes = int(
-            2 * self._prefill_tokens * self._bytes_per_token
+            2
+            * (
+                self._fixed_cache_bytes * self._prefill_sequences
+                + self._prefill_tokens * self._bytes_per_token
+            )
         )
         self._make_room()
 
@@ -3426,9 +3484,9 @@ class APCManager:
                 cache_hash, disk_prefix_len = disk_match
                 # Include capacity for an extending prompt and temporary read /
                 # padding buffers, including the first restore after a restart.
-                restore_bytes = int(
-                    disk.exact_cache_bytes(cache_hash)
-                    * max(1, prompt_capacity_tokens / disk_prefix_len)
+                restore_bytes = disk.exact_cache_bytes(
+                    cache_hash,
+                    capacity_ratio=max(1, prompt_capacity_tokens / disk_prefix_len),
                 )
                 if not self._make_room(2 * restore_bytes):
                     with self.lock:
@@ -3449,7 +3507,7 @@ class APCManager:
                         and token_tuple[:disk_prefix_len] == stored_tokens
                     ):
                         size = _cache_nbytes(prompt_cache)
-                        self._observe_cache_size(size, disk_prefix_len)
+                        self._observe_cache_size(size, disk_prefix_len, prompt_cache)
                         # Promote the disk-restored entry to the in-memory LRU
                         # so subsequent identical requests get the fast clone
                         # path instead of paying disk-restore latency again.
@@ -3499,8 +3557,9 @@ class APCManager:
 
         if source_cache is None:
             return None, 0
+        fixed, growing = _cache_growth_nbytes(source_cache)
         restore_bytes = int(
-            _cache_nbytes(source_cache) * max(1, prompt_capacity_tokens / prefix_len)
+            fixed + growing * max(1, prompt_capacity_tokens / prefix_len)
         )
         if not self._make_room(restore_bytes):
             with self.lock:
@@ -3532,7 +3591,7 @@ class APCManager:
             return False
         token_tuple = tuple(int(t) for t in token_ids)
         size = _cache_nbytes(prompt_cache)
-        self._observe_cache_size(size, len(token_tuple))
+        self._observe_cache_size(size, len(token_tuple), prompt_cache)
         if self.disk is not None:
             self.disk.flush()
         retain = (
@@ -3690,7 +3749,7 @@ class APCManager:
                 return None, 0
 
         warm_cache = make_warm_kv_cache_from_layers(keys, values, matched_tokens)
-        self._observe_cache_size(_cache_nbytes(warm_cache), matched_tokens)
+        self._observe_cache_size(_cache_nbytes(warm_cache), matched_tokens, warm_cache)
         # Disk reads and warm-cache construction intentionally happen outside
         # the manager lock. If clear()/reset_stats() races here, the restored
         # tensors are still valid; only the hit counter lands in the new stats
