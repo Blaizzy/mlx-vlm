@@ -21,6 +21,341 @@ ArgmaxBackend = Callable[
 ]
 
 
+_QUANTIZED_MOE_HC_HEADER = r"""
+#include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
+#include <metal_stdlib>
+using namespace metal;
+"""
+
+
+_AFFINE_MOE_HC_HEADER = _QUANTIZED_MOE_HC_HEADER + r"""
+constant constexpr int PACK_FACTOR =
+    (BITS == 3 || BITS == 5) ? 8 : (BITS == 6 ? 4 : 32 / BITS);
+constant constexpr int BYTES_PER_PACK =
+    ((BITS & (BITS - 1)) == 0) ? 4 : (BITS == 5 ? 5 : 3);
+constant constexpr int PACKS_PER_THREAD = BITS == 2 ? 1 : 2;
+constant constexpr int VALUES_PER_THREAD = PACK_FACTOR * PACKS_PER_THREAD;
+constant constexpr int BLOCK_SIZE = VALUES_PER_THREAD * 32;
+constant constexpr int SCALE_STEP_PER_THREAD =
+    GROUP_SIZE / VALUES_PER_THREAD;
+constant constexpr bool HAS_AFFINE_BIAS = true;
+
+template <typename T>
+inline float load_quantized_vector(
+    const device T* x,
+    thread float* x_thread) {
+  float sum = 0.0f;
+  if constexpr (BITS == 3 || BITS == 5) {
+    for (int i = 0; i < VALUES_PER_THREAD; i += 8) {
+      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
+          x[i + 6] + x[i + 7];
+    }
+  } else if constexpr (BITS == 8) {
+    for (int i = 0; i < VALUES_PER_THREAD; ++i) {
+      sum += x[i];
+    }
+  } else {
+    for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
+      sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+    }
+  }
+  for (int i = 0; i < VALUES_PER_THREAD; ++i) {
+    int shift = (i * BITS) % 8;
+    x_thread[i] = x[i] / float(1 << shift);
+  }
+  return sum;
+}
+
+inline float quantized_dot(
+    const device uint8_t* w,
+    const thread float* x,
+    float scale,
+    float bias,
+    float sum) {
+  float accum = 0.0f;
+  constexpr uint MASK = (1u << BITS) - 1;
+  if constexpr (BITS == 2 || BITS == 4) {
+    for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
+      float partial = 0.0f;
+      for (int element = 0; element < 4; ++element) {
+        int value_index = i + element;
+        int bit = value_index * BITS;
+        int byte = bit / 8;
+        int shift = bit % 8;
+        partial += x[value_index] * (w[byte] & ((MASK << shift) & 0xff));
+      }
+      accum += partial;
+    }
+  } else {
+    for (int i = 0; i < VALUES_PER_THREAD; ++i) {
+      int bit = i * BITS;
+      int byte = bit / 8;
+      int shift = bit % 8;
+      accum += x[i] * (w[byte] & ((MASK << shift) & 0xff));
+      if (shift + BITS > 8) {
+        uint high_mask = MASK >> (8 - shift);
+        accum += (w[byte + 1] & high_mask) * (x[i] * 256.0f);
+      }
+    }
+  }
+  return scale * accum + sum * bias;
+}
+
+template <typename T>
+inline float quantized_scale(T value) {
+  return float(value);
+}
+"""
+
+
+_FP_MOE_HC_HEADER = _QUANTIZED_MOE_HC_HEADER + r"""
+constant constexpr int PACK_FACTOR = 32 / BITS;
+constant constexpr int BYTES_PER_PACK = 4;
+constant constexpr int PACKS_PER_THREAD = 2;
+constant constexpr int VALUES_PER_THREAD = PACK_FACTOR * PACKS_PER_THREAD;
+constant constexpr int BLOCK_SIZE = VALUES_PER_THREAD * 32;
+constant constexpr int SCALE_STEP_PER_THREAD =
+    GROUP_SIZE / VALUES_PER_THREAD;
+constant constexpr bool HAS_AFFINE_BIAS = false;
+
+inline float decode_fp8_e4m3(uint8_t value) {
+  half decoded = as_type<half>(ushort((value & 127) << 7));
+  decoded *= 256.0f;
+  return float(value & 128 ? -decoded : decoded);
+}
+
+inline float decode_fp8_e8m0(uint8_t value) {
+  uint32_t decoded = value == 0 ? 0x400000 : uint32_t(value) << 23;
+  return as_type<float>(decoded);
+}
+
+inline float decode_fp4_e2m1(uint8_t value) {
+  half decoded = as_type<half>(ushort((value & 7) << 9));
+  decoded *= 16384.0f;
+  return float(value & 8 ? -decoded : decoded);
+}
+
+template <typename T>
+inline float load_quantized_vector(
+    const device T* x,
+    thread float* x_thread) {
+  for (int i = 0; i < VALUES_PER_THREAD; ++i) {
+    x_thread[i] = x[i];
+  }
+  return 0.0f;
+}
+
+inline float quantized_dot(
+    const device uint8_t* w,
+    const thread float* x,
+    float scale,
+    float,
+    float) {
+  float accum = 0.0f;
+  if constexpr (BITS == 4) {
+    const device uint16_t* ws = (const device uint16_t*)w;
+    for (int i = 0; i < VALUES_PER_THREAD / 4; ++i) {
+      accum += x[4 * i] * decode_fp4_e2m1(ws[i]) +
+          x[4 * i + 1] * decode_fp4_e2m1(ws[i] >> 4) +
+          x[4 * i + 2] * decode_fp4_e2m1(ws[i] >> 8) +
+          x[4 * i + 3] * decode_fp4_e2m1(ws[i] >> 12);
+    }
+  } else {
+    for (int i = 0; i < VALUES_PER_THREAD; ++i) {
+      accum += x[i] * decode_fp8_e4m3(w[i]);
+    }
+  }
+  return scale * accum;
+}
+
+inline float quantized_scale(uint8_t value) {
+  if constexpr (GROUP_SIZE == 16) {
+    return decode_fp8_e4m3(value);
+  }
+  return decode_fp8_e8m0(value);
+}
+"""
+
+
+_FUSED_QUANTIZED_MOE_HC_SOURCE = r"""
+uint n_tile = threadgroup_position_in_grid.y;
+uint token = threadgroup_position_in_grid.z;
+uint simd_gid = simdgroup_index_in_threadgroup;
+uint lane = thread_index_in_simdgroup;
+
+constexpr int RESULTS_PER_SIMDGROUP = 2;
+constexpr int NUM_SIMDGROUPS = 4;
+constexpr int ROWS_PER_TG = RESULTS_PER_SIMDGROUP * NUM_SIMDGROUPS;
+constexpr int W_ROW_BYTES = K_SIZE * BITS / 8;
+constexpr int W_EXPERT_BYTES = N_SIZE * W_ROW_BYTES;
+constexpr int GROUPS = K_SIZE / GROUP_SIZE;
+constexpr int S_EXPERT_SIZE = N_SIZE * GROUPS;
+int out_row = int(n_tile) * ROWS_PER_TG +
+    int(simd_gid) * RESULTS_PER_SIMDGROUP;
+
+T routed_sum[RESULTS_PER_SIMDGROUP] = {T(0)};
+for (int route = 0; route < TOP_K; ++route) {
+  int route_offset = int(token) * TOP_K + route;
+  int expert = int(indices[route_offset]);
+  const device uint8_t* ws = (const device uint8_t*)w +
+      expert * W_EXPERT_BYTES + out_row * W_ROW_BYTES +
+      int(lane) * PACKS_PER_THREAD * BYTES_PER_PACK;
+  const device auto* sc = scales + expert * S_EXPERT_SIZE +
+      out_row * GROUPS + int(lane) / SCALE_STEP_PER_THREAD;
+  const device T* bs = biases;
+  if constexpr (HAS_AFFINE_BIAS) {
+    bs += expert * S_EXPERT_SIZE + out_row * GROUPS +
+        int(lane) / SCALE_STEP_PER_THREAD;
+  }
+  const device T* xk = x + route_offset * K_SIZE +
+      int(lane) * VALUES_PER_THREAD;
+
+  float result[RESULTS_PER_SIMDGROUP] = {0.0f};
+  float x_thread[VALUES_PER_THREAD];
+  for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
+    float sum = load_quantized_vector<T>(xk, x_thread);
+    for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+      const device uint8_t* wr = ws + row * W_ROW_BYTES;
+      const device auto* sr = sc + row * GROUPS;
+      const device T* br = bs + (HAS_AFFINE_BIAS ? row * GROUPS : 0);
+      float bias = HAS_AFFINE_BIAS ? float(br[0]) : 0.0f;
+      result[row] += quantized_dot(
+          wr, x_thread, quantized_scale(sr[0]), bias, sum);
+    }
+    ws += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+    sc += BLOCK_SIZE / GROUP_SIZE;
+    if constexpr (HAS_AFFINE_BIAS) {
+      bs += BLOCK_SIZE / GROUP_SIZE;
+    }
+    xk += BLOCK_SIZE;
+  }
+
+  T route_weight = T(route_weights[route_offset]);
+  for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+    float value = simd_sum(result[row]);
+    if (lane == 0) {
+      T product = T(T(value) * route_weight);
+      routed_sum[row] = T(routed_sum[row] + product);
+    }
+  }
+}
+
+threadgroup T collapsed_tile[ROWS_PER_TG];
+for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+  int n = out_row + row;
+  if (lane == 0) {
+    collapsed_tile[int(simd_gid) * RESULTS_PER_SIMDGROUP + row] =
+        T(routed_sum[row] + shared[int(token) * N_SIZE + n]);
+  }
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+if (simd_gid == 0) {
+  short qid = lane / 4;
+  short matrix_row = (qid & 4) + ((lane / 2) % 4);
+  short matrix_col = (qid & 2) * 2 + (lane % 2) * 2;
+  float2 a_values = 0.0f;
+  float2 b_values = 0.0f;
+  if (matrix_row < HC) {
+    for (short element = 0; element < 2; ++element) {
+      short source = matrix_col + element;
+      if (source < HC) {
+        a_values[element] = comb[
+            int(token) * HC * HC + source * HC + matrix_row];
+      }
+      b_values[element] = float(residual[
+          int(token) * HC * N_SIZE + matrix_row * N_SIZE +
+          int(n_tile) * ROWS_PER_TG + matrix_col + element]);
+    }
+  }
+
+  simdgroup_matrix<float, 8, 8> a_matrix;
+  simdgroup_matrix<float, 8, 8> b_matrix;
+  simdgroup_matrix<float, 8, 8> c_matrix;
+  simdgroup_matrix<float, 8, 8> d_matrix;
+  reinterpret_cast<thread float2&>(a_matrix.thread_elements()) = a_values;
+  reinterpret_cast<thread float2&>(b_matrix.thread_elements()) = b_values;
+  reinterpret_cast<thread float2&>(c_matrix.thread_elements()) = float2(0.0f);
+  simdgroup_multiply_accumulate(d_matrix, a_matrix, b_matrix, c_matrix);
+
+  float2 values =
+      reinterpret_cast<thread float2&>(d_matrix.thread_elements());
+  if (matrix_row < HC) {
+    for (short element = 0; element < 2; ++element) {
+      int column = int(n_tile) * ROWS_PER_TG + matrix_col + element;
+      volatile float product = post[int(token) * HC + matrix_row] *
+          float(collapsed_tile[matrix_col + element]);
+      values[element] = product + values[element];
+      out[int(token) * HC * N_SIZE + matrix_row * N_SIZE + column] =
+          T(values[element]);
+    }
+  }
+}
+"""
+
+
+_QUANTIZED_MOE_HC_SOURCE = r"""
+uint group = threadgroup_position_in_grid.x;
+uint lane = thread_index_in_simdgroup;
+uint simd_gid = simdgroup_index_in_threadgroup;
+constexpr uint TILES = D / 8;
+uint flat_tile = group * SIMDS + simd_gid;
+uint row = flat_tile / TILES;
+uint tile = flat_tile - row * TILES;
+if (row >= ROWS) {
+  return;
+}
+
+short qid = lane / 4;
+short matrix_row = (qid & 4) + ((lane / 2) % 4);
+short matrix_col = (qid & 2) * 2 + (lane % 2) * 2;
+
+float2 a_values = 0.0f;
+float2 b_values = 0.0f;
+if (matrix_row < HC) {
+  for (short element = 0; element < 2; ++element) {
+    short source = matrix_col + element;
+    if (source < HC) {
+      a_values[element] = comb[
+          row * HC * HC + source * HC + matrix_row];
+    }
+    b_values[element] = float(residual[
+        row * HC * D + matrix_row * D + tile * 8 + matrix_col + element]);
+  }
+}
+
+simdgroup_matrix<float, 8, 8> a_matrix;
+simdgroup_matrix<float, 8, 8> b_matrix;
+simdgroup_matrix<float, 8, 8> c_matrix;
+simdgroup_matrix<float, 8, 8> d_matrix;
+reinterpret_cast<thread float2&>(a_matrix.thread_elements()) = a_values;
+reinterpret_cast<thread float2&>(b_matrix.thread_elements()) = b_values;
+reinterpret_cast<thread float2&>(c_matrix.thread_elements()) = float2(0.0f);
+simdgroup_multiply_accumulate(d_matrix, a_matrix, b_matrix, c_matrix);
+
+float2 values =
+    reinterpret_cast<thread float2&>(d_matrix.thread_elements());
+if (matrix_row < HC) {
+  for (short element = 0; element < 2; ++element) {
+    uint column = tile * 8 + matrix_col + element;
+    T routed_sum = T(0);
+    for (int route = 0; route < TOP_K; ++route) {
+      int route_offset = (row * TOP_K + route) * D + column;
+      T route_weight = T(route_weights[row * TOP_K + route]);
+      T routed_product = T(routed[route_offset] * route_weight);
+      routed_sum = T(routed_sum + routed_product);
+    }
+    T collapsed = T(routed_sum + shared[row * D + column]);
+    volatile float product =
+        post[row * HC + matrix_row] * float(collapsed);
+    values[element] = product + values[element];
+    out[row * HC * D + matrix_row * D + column] = T(values[element]);
+  }
+}
+"""
+
+
 def supports_quantization(module) -> bool:
     """Return whether ``module`` uses one of MLX's native weight formats."""
     if not isinstance(module, (nn.QuantizedLinear, QuantizedSwitchLinear)):
@@ -128,6 +463,243 @@ def exact_quantized_selected_linear(
         return None
     projected = mx.expand_dims(mx.contiguous(x), -2)
     return linear(projected, indices, sorted_indices=False).squeeze(-2)
+
+
+@lru_cache(maxsize=None)
+def _fused_quantized_moe_hc_kernel(
+    mode,
+    bits,
+    group_size,
+    dtype,
+    length,
+    input_size,
+    output_size,
+    top_k,
+    hc_mult,
+):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unknown")
+    header = _AFFINE_MOE_HC_HEADER if mode == "affine" else _FP_MOE_HC_HEADER
+    header = header.replace("BITS", str(bits)).replace("GROUP_SIZE", str(group_size))
+    return mx.fast.metal_kernel(
+        name=(
+            f"quantized_verify_fused_{mode}{bits}_moe_hc_{dtype_name}_"
+            f"t{length}_k{input_size}_n{output_size}_e{top_k}_h{hc_mult}_"
+            f"g{group_size}"
+        ),
+        input_names=[
+            "x",
+            "indices",
+            "route_weights",
+            "w",
+            "scales",
+            "biases",
+            "shared",
+            "residual",
+            "post",
+            "comb",
+        ],
+        output_names=["out"],
+        header=header,
+        source=_FUSED_QUANTIZED_MOE_HC_SOURCE,
+    )
+
+
+def _fused_quantized_moe_hc_expand(
+    linear,
+    x: mx.array,
+    indices: mx.array,
+    route_weights: mx.array,
+    shared: mx.array,
+    residual: mx.array,
+    post: mx.array,
+    comb: mx.array,
+) -> Optional[mx.array]:
+    if (
+        not mx.metal.is_available()
+        or not supports_quantization(linear)
+        or not isinstance(linear, QuantizedSwitchLinear)
+        or "bias" in linear
+        or x.ndim != 4
+        or x.shape[0] < 1
+        or indices.shape != x.shape[:3]
+        or route_weights.shape != indices.shape
+        or route_weights.dtype != mx.float32
+        or x.dtype not in (mx.bfloat16, mx.float16)
+        or shared.shape != (x.shape[0], x.shape[1], linear.output_dims)
+        or shared.dtype != x.dtype
+        or residual.ndim != 4
+        or residual.shape != (*x.shape[:2], residual.shape[2], linear.output_dims)
+        or residual.dtype != x.dtype
+        or post.shape != residual.shape[:-1]
+        or comb.shape != (*residual.shape[:-1], residual.shape[2])
+        or post.dtype != mx.float32
+        or comb.dtype != mx.float32
+        or residual.shape[2] > 8
+    ):
+        return None
+
+    if linear.mode == "affine":
+        if (
+            linear.biases is None
+            or linear.scales.dtype != x.dtype
+            or linear.biases.dtype != x.dtype
+        ):
+            return None
+    elif linear.scales.dtype != mx.uint8 or linear.biases is not None:
+        return None
+
+    batch, length, top_k, input_size = x.shape
+    output_size = linear.output_dims
+    pack_factor = (
+        8 if linear.bits in (3, 5) else 4 if linear.bits == 6 else 32 // linear.bits
+    )
+    packs_per_thread = 1 if linear.mode == "affine" and linear.bits == 2 else 2
+    block_size = pack_factor * packs_per_thread * 32
+    if (
+        input_size != linear.input_dims
+        or input_size % block_size
+        or output_size % 8
+        or linear.group_size % (pack_factor * packs_per_thread)
+    ):
+        return None
+
+    kernel = _fused_quantized_moe_hc_kernel(
+        linear.mode,
+        linear.bits,
+        linear.group_size,
+        x.dtype,
+        length,
+        input_size,
+        output_size,
+        top_k,
+        residual.shape[2],
+    )
+    return kernel(
+        inputs=[
+            mx.contiguous(x),
+            mx.contiguous(indices.astype(mx.int32)),
+            mx.contiguous(route_weights),
+            linear.weight,
+            linear.scales,
+            linear.biases if linear.biases is not None else shared,
+            mx.contiguous(shared),
+            mx.contiguous(residual),
+            mx.contiguous(post),
+            mx.contiguous(comb),
+        ],
+        template=[
+            ("T", x.dtype),
+            ("BITS", int(linear.bits)),
+            ("GROUP_SIZE", int(linear.group_size)),
+            ("K_SIZE", int(input_size)),
+            ("N_SIZE", int(output_size)),
+            ("TOP_K", int(top_k)),
+            ("HC", int(residual.shape[2])),
+        ],
+        grid=(32, output_size // 2, batch * length),
+        threadgroup=(32, 4, 1),
+        output_shapes=[residual.shape],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
+@lru_cache(maxsize=None)
+def _quantized_moe_hc_kernel(dtype, rows, hc_mult, width, top_k):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unknown")
+    return mx.fast.metal_kernel(
+        name=(
+            "quantized_verify_moe_hc_expand_"
+            f"{dtype_name}_r{rows}_h{hc_mult}_d{width}_e{top_k}"
+        ),
+        input_names=["routed", "route_weights", "shared", "residual", "post", "comb"],
+        output_names=["out"],
+        header=_QUANTIZED_MOE_HC_HEADER,
+        source=_QUANTIZED_MOE_HC_SOURCE,
+    )
+
+
+def exact_quantized_moe_hc_expand(
+    linear,
+    x: mx.array,
+    indices: mx.array,
+    route_weights: mx.array,
+    shared: mx.array,
+    residual: mx.array,
+    post: mx.array,
+    comb: mx.array,
+    *,
+    routed: Optional[mx.array] = None,
+) -> Optional[mx.array]:
+    """Project quantized experts and apply one format-independent MoE/HC epilogue."""
+    if routed is None:
+        fused = _fused_quantized_moe_hc_expand(
+            linear,
+            x,
+            indices,
+            route_weights,
+            shared,
+            residual,
+            post,
+            comb,
+        )
+        if fused is not None:
+            return fused
+        routed = exact_quantized_selected_linear(linear, x, indices)
+        if routed is None:
+            return None
+    if (
+        not mx.metal.is_available()
+        or routed.ndim != 4
+        or routed.dtype not in (mx.bfloat16, mx.float16)
+        or route_weights.shape != routed.shape[:-1]
+        or route_weights.dtype != mx.float32
+        or shared.shape != (*routed.shape[:2], routed.shape[-1])
+        or shared.dtype != routed.dtype
+        or residual.shape[:2] != routed.shape[:2]
+        or residual.shape[-1] != routed.shape[-1]
+        or residual.dtype != routed.dtype
+        or post.shape != residual.shape[:-1]
+        or comb.shape != (*residual.shape[:-1], residual.shape[2])
+        or post.dtype != mx.float32
+        or comb.dtype != mx.float32
+        or residual.shape[2] > 8
+        or routed.shape[-1] % 8
+    ):
+        return None
+
+    batch, length, top_k, width = routed.shape
+    rows = batch * length
+    simds = 8
+    tiles = rows * (width // 8)
+    kernel = _quantized_moe_hc_kernel(
+        routed.dtype,
+        rows,
+        residual.shape[2],
+        width,
+        top_k,
+    )
+    return kernel(
+        inputs=[
+            mx.contiguous(routed),
+            mx.contiguous(route_weights),
+            mx.contiguous(shared),
+            mx.contiguous(residual),
+            mx.contiguous(post),
+            mx.contiguous(comb),
+        ],
+        template=[
+            ("T", routed.dtype),
+            ("ROWS", int(rows)),
+            ("HC", int(residual.shape[2])),
+            ("D", int(width)),
+            ("SIMDS", simds),
+            ("TOP_K", int(top_k)),
+        ],
+        grid=(32 * ((tiles + simds - 1) // simds), simds, 1),
+        threadgroup=(32, simds, 1),
+        output_shapes=[residual.shape],
+        output_dtypes=[routed.dtype],
+    )[0]
 
 
 def pad_token_mask(token_mask: mx.array, output_size: int) -> mx.array:
@@ -1505,6 +2077,31 @@ class QuantizedVerifierOps:
     ) -> Optional[mx.array]:
         return exact_quantized_selected_linear(linear, x, indices)
 
+    @staticmethod
+    def moe_hc_expand(
+        linear,
+        x: mx.array,
+        indices: mx.array,
+        route_weights: mx.array,
+        shared: mx.array,
+        residual: mx.array,
+        post: mx.array,
+        comb: mx.array,
+        *,
+        routed: Optional[mx.array] = None,
+    ) -> Optional[mx.array]:
+        return exact_quantized_moe_hc_expand(
+            linear,
+            x,
+            indices,
+            route_weights,
+            shared,
+            residual,
+            post,
+            comb,
+            routed=routed,
+        )
+
     def argmax(
         self,
         linear,
@@ -1537,6 +2134,7 @@ __all__ = [
     "DEFAULT_QUANTIZED_VERIFIER",
     "QuantizedVerifierOps",
     "exact_quantized_linear",
+    "exact_quantized_moe_hc_expand",
     "exact_quantized_selected_linear",
     "exact_quantized_switch_linear",
     "optimized_affine_argmax",

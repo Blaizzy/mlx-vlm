@@ -4261,6 +4261,75 @@ def test_glm5_next_affine_moe_fusion_matches_batched_decode(bits, batch):
 @pytest.mark.parametrize(
     ("mode", "bits", "group_size"),
     [
+        *[
+            ("affine", bits, group_size)
+            for group_size in (32, 64, 128)
+            for bits in (2, 3, 4, 5, 6, 8)
+        ],
+        ("mxfp4", 4, 32),
+        ("mxfp8", 8, 32),
+        ("nvfp4", 4, 16),
+    ],
+)
+@pytest.mark.parametrize("batch", [1, 4, 8, 64, 127])
+def test_general_quantized_moe_hc_matches_separate_kernels(
+    mode, bits, group_size, batch
+):
+    mx.random.seed(600 + bits + batch)
+    routed_linear = QuantizedSwitchLinear(
+        512,
+        16,
+        4,
+        False,
+        group_size,
+        bits,
+        mode=mode,
+    )
+    if mode == "affine":
+        routed_linear = _bf16_quantization_parameters(routed_linear)
+    routed_inputs = mx.random.normal((batch, 2, 2, 512)).astype(mx.bfloat16)
+    indices = mx.arange(batch * 4, dtype=mx.int32).reshape(batch, 2, 2) % 4
+    weights = mx.softmax(mx.random.normal((batch, 2, 2)), axis=-1)
+    shared = mx.random.normal((batch, 2, 16)).astype(mx.bfloat16)
+    residual = mx.random.normal((batch, 2, 4, 16)).astype(mx.bfloat16)
+    post = mx.random.normal((batch, 2, 4))
+    comb = mx.random.normal((batch, 2, 4, 4))
+
+    routed = exact_quantized_selected_linear(
+        routed_linear,
+        routed_inputs,
+        indices,
+    )
+    collapsed = glm5_next_exact_ops.combine_moe_outputs(routed, weights, shared)
+    expected = glm5_next_exact_ops.exact_hc_expand(
+        collapsed,
+        residual,
+        post,
+        comb,
+    )
+    with patch(
+        "mlx_vlm.models.quantized_verifier.exact_quantized_selected_linear",
+        side_effect=AssertionError("supported formats must use the fused backend"),
+    ):
+        actual = DEFAULT_QUANTIZED_VERIFIER.moe_hc_expand(
+            routed_linear,
+            routed_inputs,
+            indices,
+            weights,
+            shared,
+            residual,
+            post,
+            comb,
+        )
+    mx.eval(expected, actual)
+
+    assert actual is not None
+    assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.parametrize(
+    ("mode", "bits", "group_size"),
+    [
         *[("affine", bits, 64) for bits in (2, 3, 4, 5, 6, 8)],
         ("mxfp4", 4, 32),
         ("mxfp8", 8, 32),
@@ -4530,7 +4599,8 @@ def test_glm5_next_target_rollback_restores_ragged_rows_without_model_replay():
     assert records[0][0] == "window"
     assert records[3][1].shape[1] == 1
     assert cache[1][2]._speculation["input_length"] == 2
-    assert len(cache[1][2]._speculation["inputs"]) == 2
+    assert len(cache[1][2]._speculation["inputs"]) == 1
+    assert cache[1][2]._speculation["inputs"][0][0].shape[1] == 2
     with patch.object(
         glm5_next_language.LanguageModel,
         "__call__",
@@ -4549,6 +4619,123 @@ def test_glm5_next_target_rollback_restores_ragged_rows_without_model_replay():
     assert sparse_cache[3].offset.tolist() == [2, 2]
     assert sparse_cache[3].left_padding.tolist() == [0, 0]
     assert not rollback_state.active
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+def test_glm5_next_cached_indexer_block_matches_stepwise(batch):
+    mx.random.seed(4700 + batch)
+    text_config = _tiny_glm5_next_text_config()
+    language = glm5_next_language.LanguageModel(text_config)
+    language.eval()
+    indexer = language.model.layers[1].self_attn.indexer
+    step_cache = _make_cache(language, left_padding=[0] * batch)[1]
+    block_cache = _make_cache(language, left_padding=[0] * batch)[1]
+
+    def projected(inputs, q_resid):
+        keys = mx.concatenate(
+            [
+                indexer.k_norm(indexer.wk(inputs[:, position : position + 1]))
+                for position in range(inputs.shape[1])
+            ],
+            axis=1,
+        )
+        gates = mx.concatenate(
+            [
+                inputs[:, position : position + 1].astype(mx.float32)
+                @ indexer.index_kpool_compress_gate.T
+                for position in range(inputs.shape[1])
+            ],
+            axis=1,
+        )
+        queries = mx.concatenate(
+            [
+                indexer.wq_b(q_resid[:, position : position + 1])
+                for position in range(inputs.shape[1])
+            ],
+            axis=1,
+        ).reshape(batch, inputs.shape[1], indexer.n_heads, indexer.head_dim)
+        weights = (
+            mx.concatenate(
+                [
+                    indexer.weights_proj(inputs[:, position : position + 1])
+                    for position in range(inputs.shape[1])
+                ],
+                axis=1,
+            ).astype(mx.float32)
+            * indexer.n_heads**-0.5
+        )
+        return keys, gates, queries, weights
+
+    prefix_length = 5
+    prefix = mx.random.normal((batch, prefix_length, text_config.hidden_size)).astype(
+        mx.bfloat16
+    )
+    prefix_q = mx.random.normal((batch, prefix_length, text_config.q_lora_rank)).astype(
+        mx.bfloat16
+    )
+    prefix_projected = projected(prefix, prefix_q)
+    indexer(
+        prefix,
+        prefix_q,
+        cache=step_cache[1],
+        pool_cache=step_cache[2],
+        offset=0,
+        projected=prefix_projected,
+    )
+    indexer(
+        prefix,
+        prefix_q,
+        cache=block_cache[1],
+        pool_cache=block_cache[2],
+        offset=0,
+        projected=prefix_projected,
+    )
+
+    inputs = mx.random.normal((batch, 2, text_config.hidden_size)).astype(mx.bfloat16)
+    q_resid = mx.random.normal((batch, 2, text_config.q_lora_rank)).astype(mx.bfloat16)
+    block_projected = projected(inputs, q_resid)
+    expected = mx.concatenate(
+        [
+            indexer(
+                inputs[:, position : position + 1],
+                q_resid[:, position : position + 1],
+                cache=step_cache[1],
+                pool_cache=step_cache[2],
+                offset=prefix_length + position,
+                projected=tuple(
+                    value[:, position : position + 1] for value in block_projected
+                ),
+            )
+            for position in range(2)
+        ],
+        axis=1,
+    )
+    actual = indexer(
+        inputs,
+        q_resid,
+        cache=block_cache[1],
+        pool_cache=block_cache[2],
+        offset=prefix_length,
+        projected=block_projected,
+    )
+    mx.eval(expected, actual, step_cache[1].state, block_cache[1].state)
+
+    assert mx.array_equal(actual, expected).item()
+    assert step_cache[2].remainder == block_cache[2].remainder
+    assert step_cache[2]._pool_lengths == block_cache[2]._pool_lengths
+    for cache_index in (1, 2):
+        for (_, step_value), (_, block_value) in zip(
+            tree_flatten(step_cache[cache_index].state),
+            tree_flatten(block_cache[cache_index].state),
+            strict=True,
+        ):
+            if step_value is None or block_value is None:
+                assert step_value is block_value
+            else:
+                assert mx.array_equal(step_value, block_value).item(), (
+                    cache_index,
+                    mx.max(mx.abs(step_value - block_value)).item(),
+                )
 
 
 @pytest.mark.parametrize("batch", [1, 8])

@@ -86,7 +86,7 @@ class Glm5NextSpeculativeVerifier:
         hidden = clamped_swiglu(gate, up, mlp.swiglu_limit)
         return self._block_linear(mlp.down_proj, hidden)
 
-    def _moe(self, moe, x):
+    def _moe(self, moe, x, hc_state=None):
         # Routing and shared projections retain the decode Bx1 arithmetic.
         # Selected-expert projections keep verifier time in an outer dimension,
         # so the same exact path works for every batch and quantization format.
@@ -171,8 +171,34 @@ class Glm5NextSpeculativeVerifier:
                 sorted_indices=True,
             )
             routed = _scatter_unsort(routed, route_order, indices.shape).squeeze(-2)
-            return combine_moe_outputs(routed, weights, shared)
+            if hc_state is not None:
+                output = DEFAULT_QUANTIZED_VERIFIER.moe_hc_expand(
+                    switch.down_proj,
+                    activated,
+                    indices,
+                    weights,
+                    shared,
+                    *hc_state,
+                    routed=routed,
+                )
+                if output is not None:
+                    return output
+            output = combine_moe_outputs(routed, weights, shared)
+            if hc_state is not None:
+                output = self._hc_expand_timewise(output, *hc_state)
+            return output
 
+        if hc_state is not None:
+            output = DEFAULT_QUANTIZED_VERIFIER.moe_hc_expand(
+                switch.down_proj,
+                activated,
+                indices,
+                weights,
+                shared,
+                *hc_state,
+            )
+            if output is not None:
+                return output
         fused_moe = exact_affine_moe_down(
             switch.down_proj,
             activated,
@@ -181,7 +207,11 @@ class Glm5NextSpeculativeVerifier:
             shared,
         )
         if fused_moe is not None:
-            return fused_moe
+            return (
+                self._hc_expand_timewise(fused_moe, *hc_state)
+                if hc_state
+                else fused_moe
+            )
         routed = exact_quantized_selected_linear(
             switch.down_proj,
             activated,
@@ -195,7 +225,22 @@ class Glm5NextSpeculativeVerifier:
                 sorted_indices=False,
             )
             routed = routed.squeeze(-2).reshape(batch, length, top_k, -1)
-        return combine_moe_outputs(routed, weights, shared)
+        if hc_state is not None:
+            output = DEFAULT_QUANTIZED_VERIFIER.moe_hc_expand(
+                switch.down_proj,
+                activated,
+                indices,
+                weights,
+                shared,
+                *hc_state,
+                routed=routed,
+            )
+            if output is not None:
+                return output
+        output = combine_moe_outputs(routed, weights, shared)
+        if hc_state is not None:
+            output = self._hc_expand_timewise(output, *hc_state)
+        return output
 
     def _linear_attention(self, attention, inputs, mask, cache):
         return attention(
@@ -288,44 +333,79 @@ class Glm5NextSpeculativeVerifier:
                 index_q,
                 index_weights,
             )
-        outputs = []
-        topks = []
-        for index in range(inputs.shape[1]):
-            output, topk = self._attention(
-                attention,
-                mx.contiguous(inputs[:, index : index + 1]),
-                None if mask is None else mask[:, index : index + 1],
-                cache,
-                (
-                    None
-                    if prev_topk_indices is None
-                    else prev_topk_indices[:, index : index + 1]
-                ),
-                projected=(
-                    q_resid[:, index : index + 1],
-                    q[:, :, index : index + 1],
-                    new_latent[:, :, index : index + 1],
-                    (
-                        None
-                        if index_projected is None
-                        else tuple(
-                            None if value is None else value[:, index : index + 1]
-                            for value in index_projected
-                        )
-                    ),
-                ),
-                project_output=False,
+        if cache is None:
+            kv_cache = index_cache = pool_cache = None
+            cache_offset = 0
+            latent = new_latent
+        else:
+            kv_cache = cache[0]
+            cache_offset = kv_cache.offset
+            if attention.indexer is None:
+                index_cache = pool_cache = None
+            else:
+                index_cache = cache[1]
+                pool_cache = cache[2]
+            latent, _ = kv_cache.update_and_fetch(
+                new_latent,
+                mx.zeros((batch, 1, length, 0), dtype=new_latent.dtype),
             )
-            mx.async_eval(output, topk)
+
+        if attention.indexer is None:
+            if prev_topk_indices is None:
+                raise ValueError("Shared indexer layer has no previous top-k indices.")
+            topk = prev_topk_indices
+        else:
+            topk = attention.indexer(
+                inputs,
+                q_resid,
+                mask,
+                index_cache,
+                pool_cache,
+                cache_offset,
+                linear_fn=self._block_linear,
+                projected=index_projected,
+            )
+
+        outputs = []
+        for index in range(length):
+            output = self._latent_attention(
+                attention,
+                q[:, :, index : index + 1],
+                latent,
+                topk[:, index : index + 1],
+                kv_cache,
+            )
+            mx.async_eval(output, topk[:, index : index + 1])
             outputs.append(output)
-            topks.append(topk)
         return (
             self._block_linear(
                 attention.o_proj,
                 mx.concatenate(outputs, axis=1),
             ),
-            mx.concatenate(topks, axis=1),
+            topk,
         )
+
+    def _latent_attention(self, attention, q, latent, topk, cache):
+        batch = q.shape[0]
+        kv_length = latent.shape[2]
+        valid = (topk >= 0) & (topk < kv_length)
+        safe = mx.clip(topk, 0, max(kv_length - 1, 0))
+        selected = mx.take_along_axis(
+            latent,
+            safe[:, None, 0, :, None],
+            axis=2,
+        )
+        q = self._head_timewise(attention.embed_q, q)
+        output = scaled_dot_product_attention(
+            q,
+            selected,
+            selected,
+            cache=cache,
+            scale=attention.scale,
+            mask=valid[:, None],
+        )
+        output = self._head_timewise(attention.unembed_out, output)
+        return output.transpose(0, 2, 1, 3).reshape(batch, 1, -1)
 
     @staticmethod
     def _timewise(fn, x: mx.array) -> mx.array:
@@ -416,137 +496,6 @@ class Glm5NextSpeculativeVerifier:
                 return output
         return mx.argmax(self.logits_from_hidden(language_model, hidden), axis=-1)
 
-    def _attention(
-        self,
-        attention,
-        x,
-        padding_mask,
-        cache,
-        prev_topk_indices,
-        projected=None,
-        project_output=True,
-    ):
-        batch, length, _ = x.shape
-        if projected is None:
-            q_a, kv_a = mx.split(
-                self._block_linear(attention.qkv_a_proj, x),
-                (attention.q_lora_rank,),
-                axis=-1,
-            )
-            q_resid = self._timewise(attention.q_a_layernorm, q_a)
-            q = (
-                self._block_linear(attention.q_b_proj, q_resid)
-                .reshape(batch, length, attention.num_heads, attention.q_head_dim)
-                .transpose(0, 2, 1, 3)
-            )
-            new_latent = self._timewise(attention.kv_a_layernorm, kv_a)[:, None]
-            index_projected = None
-        else:
-            q_resid, q, new_latent, index_projected = projected
-
-        if cache is None:
-            kv_cache = index_cache = pool_cache = None
-            latent = new_latent
-            cache_offset = 0
-        else:
-            kv_cache = cache[0]
-            cache_offset = kv_cache.offset
-            if attention.indexer is None:
-                index_cache = pool_cache = None
-            else:
-                index_cache = cache[1]
-                pool_cache = cache[2]
-            latent, _ = kv_cache.update_and_fetch(
-                new_latent,
-                mx.zeros((batch, 1, length, 0), dtype=new_latent.dtype),
-            )
-
-        if attention.indexer is None:
-            if prev_topk_indices is None:
-                raise ValueError("Shared indexer layer has no previous top-k indices.")
-            topk = prev_topk_indices
-        elif length > 1:
-            topk_parts = []
-            for index in range(length):
-                topk_parts.append(
-                    attention.indexer(
-                        x[:, index : index + 1],
-                        q_resid[:, index : index + 1],
-                        (
-                            None
-                            if padding_mask is None
-                            else padding_mask[:, index : index + 1]
-                        ),
-                        index_cache,
-                        pool_cache,
-                        cache_offset + index,
-                        linear_fn=self._singleton_linear,
-                    )
-                )
-            topk = mx.concatenate(topk_parts, axis=1)
-        else:
-            topk = attention.indexer(
-                x,
-                q_resid,
-                padding_mask,
-                index_cache,
-                pool_cache,
-                cache_offset,
-                linear_fn=self._singleton_linear,
-                projected=index_projected,
-            )
-
-        kv_length = latent.shape[2]
-        valid = (topk >= 0) & (topk < kv_length)
-        safe = mx.clip(topk, 0, max(kv_length - 1, 0))
-        if length == 1:
-            selected = mx.take_along_axis(
-                latent,
-                safe[:, None, 0, :, None],
-                axis=2,
-            )
-            q = self._head_timewise(attention.embed_q, q)
-            out = scaled_dot_product_attention(
-                q,
-                selected,
-                selected,
-                cache=kv_cache,
-                scale=attention.scale,
-                mask=valid[:, None],
-            )
-            out = self._head_timewise(attention.unembed_out, out)
-        else:
-            # Retain latent-MLA decode arithmetic. Reprojecting the complete
-            # latent cache is algebraically equivalent but changes MXFP8
-            # rounding and can flip a close greedy target token.
-            selected = self._helpers()._sparse_head_gather(latent, safe)
-            latent_q = self._head_timewise(attention.embed_q, q)
-            folded_q = latent_q.transpose(0, 2, 1, 3).reshape(
-                batch * length,
-                attention.num_heads,
-                1,
-                attention.kv_lora_rank,
-            )
-            folded_mask = valid.reshape(batch * length, 1, 1, topk.shape[-1])
-            out = scaled_dot_product_attention(
-                folded_q,
-                selected,
-                selected,
-                cache=None,
-                scale=attention.scale,
-                mask=folded_mask,
-            )
-            out = out.reshape(
-                batch, length, attention.num_heads, attention.kv_lora_rank
-            )
-            out = out.transpose(0, 2, 1, 3)
-            out = self._head_timewise(attention.unembed_out, out)
-
-        out = out.transpose(0, 2, 1, 3).reshape(batch, length, -1)
-        if project_output:
-            out = self._block_linear(attention.o_proj, out)
-        return out, topk
-
     def _layer(
         self,
         layer,
@@ -586,10 +535,11 @@ class Glm5NextSpeculativeVerifier:
             hidden,
         )
         if hasattr(layer.mlp, "switch_mlp"):
-            collapsed = self._moe(layer.mlp, collapsed)
+            hidden = self._moe(layer.mlp, collapsed, (residual, post, comb))
         else:
             collapsed = self._dense_mlp(layer.mlp, collapsed)
-        return self._hc_expand_timewise(collapsed, residual, post, comb), topk
+            hidden = self._hc_expand_timewise(collapsed, residual, post, comb)
+        return hidden, topk
 
     def _model(
         self,

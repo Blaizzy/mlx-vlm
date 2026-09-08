@@ -939,14 +939,13 @@ def exact_affine_switch_gate_up(switch, x: mx.array, indices: mx.array):
     )
 
 
-def exact_affine_moe_down(
+def _affine_moe_down_shape(
     linear,
     x: mx.array,
     indices: mx.array,
     route_weights: mx.array,
     shared: mx.array,
 ):
-    """Fuse affine routed down projection, weighting, and shared addition."""
     if (
         not mx.metal.is_available()
         or not isinstance(linear, QuantizedSwitchLinear)
@@ -978,6 +977,21 @@ def exact_affine_moe_down(
         or linear.group_size % 16
     ):
         return None
+    return batch, length, top_k, k_size, n_size
+
+
+def exact_affine_moe_down(
+    linear,
+    x: mx.array,
+    indices: mx.array,
+    route_weights: mx.array,
+    shared: mx.array,
+):
+    """Fuse affine routed down projection, weighting, and shared addition."""
+    shape = _affine_moe_down_shape(linear, x, indices, route_weights, shared)
+    if shape is None:
+        return None
+    batch, length, top_k, k_size, n_size = shape
 
     x = mx.contiguous(x)
     indices = mx.contiguous(indices.astype(mx.int32))
