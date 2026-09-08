@@ -277,6 +277,7 @@ class PromptCacheState:
     def __init__(self):
         self.cache: Optional[List[Any]] = None
         self.token_ids: Optional[List[int]] = None
+        self.max_kv_size: Optional[int] = None
 
     def find_prefix_length(self, new_ids: list) -> int:
         """Return the number of leading tokens that match the cached ids."""
@@ -288,7 +289,10 @@ class PromptCacheState:
                 return i
         return max_len
 
-    def update(self, token_ids: list, kv_cache: list):
+    def update(
+        self, token_ids: list, kv_cache: list, *, max_kv_size: Optional[int] = None
+    ):
         """Store the full token sequence and corresponding KV cache."""
         self.token_ids = list(token_ids)
         self.cache = kv_cache
+        self.max_kv_size = max_kv_size

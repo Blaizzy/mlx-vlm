@@ -2251,6 +2251,7 @@ def test_stream_generate_stores_checkpoint_only_before_decode(reused_prefix):
             pass
 
     coordinator = MagicMock()
+    coordinator.scope_hash.side_effect = lambda value: value
     coordinator.enabled = True
     coordinator.is_checkpoint = True
     coordinator.lookup.return_value = (
@@ -3152,6 +3153,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
             return 0
 
     bg = object.__new__(BatchGenerator)
+    bg.max_kv_size = None
     bg._generation_batch = EmptyGenerationBatch()
     bg._prompt_batch = None
     bg._prompt_tokens_counter = 0
@@ -3260,6 +3262,7 @@ def test_prompt_processing_batch_slices_native_mrope_position_ids():
 
 def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
     bg = object.__new__(BatchGenerator)
+    bg.max_kv_size = None
     bg.apc_manager = object()
     bg.model = SimpleNamespace(layers=[object()])
     bg.prefill_step_size = None

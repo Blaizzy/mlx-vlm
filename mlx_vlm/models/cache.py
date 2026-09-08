@@ -49,25 +49,39 @@ def make_prompt_cache(
     """
     Construct the model's cache for use in generation.
 
-    This function will defer the cache construction to the model if it has a
-    ``make_cache`` method, otherwise it will make a default KV cache.
+    Models choose their cache layout. Each cache owns whether and how that
+    layout can retain a bounded token history.
 
     Args:
         model (nn.Module): The language model.
-        max_kv_size (Optional[int]): If provided and the model does not have a
-            ``make_cache`` method, a ``RotatingKVCache`` is used with a maximum
-            size of ``max_kv_size``
+        max_kv_size (Optional[int]): Maximum retained token history. Unsupported
+            cache layouts raise rather than silently ignoring this limit.
     """
-    if hasattr(model, "make_cache"):
-        return model.make_cache()
+    if max_kv_size is not None and (
+        isinstance(max_kv_size, bool)
+        or not isinstance(max_kv_size, int)
+        or max_kv_size <= 0
+    ):
+        raise ValueError("max_kv_size must be a positive integer")
+    caches = (
+        model.make_cache()
+        if hasattr(model, "make_cache")
+        else [KVCache() for _ in model.layers]
+    )
+    if max_kv_size is None:
+        return caches
+    return [_bounded_cache(entry, max_kv_size) for entry in caches]
 
-    num_layers = len(model.layers)
-    if max_kv_size is not None:
-        return [
-            RotatingKVCache(max_size=max_kv_size, keep=4) for _ in range(num_layers)
-        ]
-    else:
-        return [KVCache() for _ in range(num_layers)]
+
+def _bounded_cache(entry, max_size):
+    if isinstance(entry, tuple):
+        return tuple(_bounded_cache(child, max_size) for child in entry)
+    bound = getattr(entry, "with_max_size", None)
+    if bound is None:
+        raise NotImplementedError(
+            f"{type(entry).__name__} does not support max_kv_size"
+        )
+    return bound(max_size)
 
 
 def create_attention_mask(
@@ -84,6 +98,14 @@ def create_attention_mask(
 
 
 class _BaseCache:
+    def with_max_size(self, max_size):
+        """Build an empty cache with bounded history and the same semantics.
+
+        Specialized caches must opt in: bounding only their K/V arrays can
+        leave auxiliary sequence state unbounded or misaligned.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support max_kv_size")
+
     @property
     def state(self):
         return []
@@ -410,6 +432,13 @@ class QuantizedKVCache(_BaseCache):
 
 
 class KVCache(_BaseCache):
+    def with_max_size(self, max_size):
+        if type(self) is not KVCache:
+            return super().with_max_size(max_size)
+        if not self.empty():
+            raise ValueError("Cannot change the limit of a populated KVCache")
+        return RotatingKVCache(max_size, keep=min(4, max_size - 1))
+
     step = 256
 
     def __init__(self):
@@ -546,6 +575,16 @@ class KVCache(_BaseCache):
 
 
 class RotatingKVCache(_BaseCache):
+    def with_max_size(self, max_size):
+        if type(self) is not RotatingKVCache:
+            return super().with_max_size(max_size)
+        if not self.empty():
+            raise ValueError("Cannot change the limit of a populated RotatingKVCache")
+        max_size = min(self.max_size, max_size)
+        if max_size <= self.keep:
+            raise ValueError("max_kv_size must exceed the preserved prefix length")
+        return RotatingKVCache(max_size, keep=self.keep)
+
     step = 256
 
     def __init__(self, max_size, keep=0):
@@ -692,6 +731,17 @@ class RotatingKVCache(_BaseCache):
     def make_mask(
         self, N: int, window_size: Optional[int] = None, return_array: bool = False
     ):
+        if self.keep and N > 1:
+            retained = min(self.max_size - 1, self.offset)
+            positions = mx.arange(retained + N)
+            positions = mx.where(
+                positions < self.keep, positions, positions + self.offset - retained
+            )
+            queries = mx.arange(self.offset, self.offset + N)[:, None]
+            recent = min(window_size or self.max_size, self.max_size - self.keep)
+            return (queries >= positions) & (
+                (positions < self.keep) | (queries < positions + recent)
+            )
         if N > 1:
             window_size = window_size or self.max_size
             offset = min(self.max_size - 1, self.offset)
@@ -702,6 +752,14 @@ class RotatingKVCache(_BaseCache):
         else:
             if window_size is None:
                 return None
+            if self.keep:
+                if self.offset < self.keep:
+                    return None
+                mask_size = min(self.offset + 1, self.max_size)
+                idx = self._idx if self._idx < self.max_size else self.keep
+                positions = mx.arange(mask_size)
+                age = (idx - positions) % (mask_size - self.keep)
+                return (positions < self.keep) | (age < window_size)
             # May need a mask for when window_size < max_size
             if self.offset >= window_size and self.max_size > window_size:
                 idx = self._idx
@@ -717,6 +775,8 @@ class RotatingKVCache(_BaseCache):
 
     @classmethod
     def merge(_, caches):
+        if caches[0].keep:
+            return BatchPrefixKVCache.merge(caches)
         return BatchRotatingKVCache.merge(caches)
 
     def empty(self):
@@ -730,6 +790,11 @@ class RotatingKVCache(_BaseCache):
 
 
 class ArraysCache(_BaseCache):
+    def with_max_size(self, max_size):
+        if type(self) is not ArraysCache:
+            return super().with_max_size(max_size)
+        return self
+
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
         instance._left_padding = None
@@ -988,6 +1053,11 @@ class ChunkedKVCache(_BaseCache):
 
 
 class CacheList(_BaseCache):
+    def with_max_size(self, max_size):
+        if type(self) is not CacheList:
+            return super().with_max_size(max_size)
+        return CacheList(*(_bounded_cache(c, max_size) for c in self.caches))
+
     def __init__(self, *caches):
         self.caches = caches
 
@@ -1257,6 +1327,8 @@ class BatchKVCache(_BaseCache):
 
     def extract(self, idx):
         cache = KVCache()
+        if self.empty():
+            return cache
         padding = self.left_padding[idx].item()
         cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
         cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
@@ -1485,7 +1557,7 @@ class BatchRotatingKVCache(_BaseCache):
     @property
     def state(self):
         k, v = self.keys, self.values
-        if self._offset < k.shape[2]:
+        if k is not None and self._offset < k.shape[2]:
             k, v = k[..., : self._offset, :], v[..., : self._offset, :]
         return k, v, self.offset, self.left_padding
 
@@ -1503,7 +1575,8 @@ class BatchRotatingKVCache(_BaseCache):
             int,
             v[:3],
         )
-        self.rotated = bool(v[3])
+        self.rotated = str(v[3]) == "True"
+        self._lengths = None
 
     def is_trimmable(self):
         return self._offset < self.max_size
@@ -1608,6 +1681,8 @@ class BatchRotatingKVCache(_BaseCache):
         self._offset = max(self._offset, other._offset)
 
     def extract(self, idx):
+        if self.empty():
+            return RotatingKVCache(self.max_size)
         mx.eval(self.left_padding, self.offset)
         cache = RotatingKVCache(self.max_size)
         padding = max(0, self.left_padding.tolist()[idx])
@@ -1627,6 +1702,8 @@ class BatchRotatingKVCache(_BaseCache):
 
     @classmethod
     def merge(cls, caches):
+        if any(c.keep for c in caches):
+            return BatchPrefixKVCache.merge(caches)
         if not all(c.max_size == caches[0].max_size for c in caches):
             raise ValueError(
                 "BatchRotatingKVCache can only merge caches with the same maximum size"
@@ -1688,6 +1765,228 @@ class BatchRotatingKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+
+class BatchPrefixKVCache(_BaseCache):
+    """A per-sequence fixed prefix plus a rotating recent-token window."""
+
+    def __init__(self, max_size, left_padding, keep=4):
+        if not 0 < keep < max_size:
+            raise ValueError("keep must be positive and smaller than max_size")
+        self.max_size = max_size
+        self.keep = keep
+        self.tail = BatchRotatingKVCache(max_size - keep, left_padding)
+        self.prefix_keys = None
+        self.prefix_values = None
+
+    @property
+    def offset(self):
+        return self.tail.offset
+
+    @offset.setter
+    def offset(self, value):
+        self.tail.offset = value
+
+    @property
+    def left_padding(self):
+        return self.tail.left_padding
+
+    @left_padding.setter
+    def left_padding(self, value):
+        self.tail.left_padding = value
+
+    @property
+    def _idx(self):
+        return self.tail._idx
+
+    @property
+    def batch_size(self):
+        return self.tail.batch_size
+
+    def is_single_row(self):
+        return self.batch_size == 1
+
+    def update_and_fetch(self, keys, values):
+        positions = mx.arange(self.keep)[None]
+        source = positions - self.offset[:, None]
+        valid = (source >= 0) & (source < keys.shape[2])
+        if self.tail._lengths is not None:
+            valid &= positions < self.tail._lengths[:, None]
+        source = mx.clip(source, 0, keys.shape[2] - 1)[:, None, :, None]
+        valid = valid[:, None, :, None]
+        prefix = []
+        for old, incoming in ((self.prefix_keys, keys), (self.prefix_values, values)):
+            selected = mx.take_along_axis(incoming, source, axis=2)
+            if old is None:
+                old = mx.zeros_like(selected)
+            prefix.append(mx.where(valid, selected, old))
+        self.prefix_keys, self.prefix_values = prefix
+        tail_keys, tail_values = self.tail.update_and_fetch(keys, values)
+        return (
+            mx.concatenate([self.prefix_keys, tail_keys], axis=2),
+            mx.concatenate([self.prefix_values, tail_values], axis=2),
+        )
+
+    def make_mask(self, N, window_size=None, return_array=False):
+        tail_mask = self.tail.make_mask(N, window_size, return_array=True)
+        retained = min(self.tail.max_size - 1, self.tail._offset)
+        queries = self.offset[:, None] + mx.arange(N)[None]
+        prefix_mask = queries[..., None] >= mx.arange(self.keep)
+        positions = self.offset[:, None] - retained + mx.arange(retained + N)
+        tail_valid = positions >= self.keep
+        if N == 1 and (self.tail.rotated or self.tail._idx >= self.tail.max_size):
+            idx = self.tail._idx if self.tail._idx < self.tail.max_size else 0
+            tail_valid = mx.roll(tail_valid, idx + 1, axis=-1)
+        tail_mask = tail_mask & tail_valid[:, None, None, :]
+        return mx.concatenate([prefix_mask[:, None], tail_mask], axis=-1)
+
+    def prepare(self, **kwargs):
+        self.tail.prepare(**kwargs)
+
+    def finalize(self):
+        self.tail.finalize()
+
+    def is_trimmable(self):
+        return self.tail.is_trimmable()
+
+    def trim(self, n):
+        return self.tail.trim(n)
+
+    def filter(self, batch_indices):
+        self.tail.filter(batch_indices)
+        if self.prefix_keys is not None:
+            self.prefix_keys = self.prefix_keys[batch_indices]
+            self.prefix_values = self.prefix_values[batch_indices]
+
+    def extend(self, other):
+        if self.max_size != other.max_size or self.keep != other.keep:
+            raise ValueError("Cannot extend prefix caches with different limits")
+        prefix = []
+        for a, b in (
+            (self.prefix_keys, other.prefix_keys),
+            (self.prefix_values, other.prefix_values),
+        ):
+            if a is None and b is None:
+                prefix.append(None)
+                continue
+            template = a if a is not None else b
+            if a is None:
+                a = mx.zeros(
+                    (self.batch_size, *template.shape[1:]), dtype=template.dtype
+                )
+            if b is None:
+                b = mx.zeros(
+                    (other.batch_size, *template.shape[1:]), dtype=template.dtype
+                )
+            prefix.append(mx.concatenate([a, b], axis=0))
+        self.tail.extend(other.tail)
+        self.prefix_keys, self.prefix_values = prefix
+
+    def extract(self, idx):
+        if self.empty():
+            return RotatingKVCache(self.max_size, self.keep)
+        tail = self.tail.extract(idx)
+        cache = RotatingKVCache(self.max_size, self.keep)
+        cache.offset = max(0, tail.offset)
+        prefix_length = min(self.keep, max(0, tail.offset))
+        tail_length = min(max(0, tail.offset - self.keep), self.tail.max_size)
+        for attr, prefix in (
+            ("keys", self.prefix_keys),
+            ("values", self.prefix_values),
+        ):
+            values = getattr(tail, attr)
+            recent = (
+                values[..., -tail_length:, :] if tail_length else values[..., :0, :]
+            )
+            setattr(
+                cache,
+                attr,
+                mx.concatenate(
+                    [prefix[idx : idx + 1, :, :prefix_length], recent], axis=2
+                ),
+            )
+        cache._idx = cache.keys.shape[2]
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        max_size, keep = caches[0].max_size, caches[0].keep
+        if any(c.max_size != max_size or c.keep != keep for c in caches):
+            raise ValueError("Cannot merge prefix caches with different limits")
+        result = cls(max_size, [0] * len(caches), keep)
+        if all(c.empty() for c in caches):
+            return result
+        tails = []
+        prefixes = [[], []]
+        exemplar = next(c for c in caches if not c.empty())
+        for cache in caches:
+            tail = RotatingKVCache(max_size - keep)
+            tail.offset = cache.offset
+            for i, attr in enumerate(("keys", "values")):
+                template = getattr(exemplar, attr)
+                prefix = mx.zeros(
+                    (1, template.shape[1], keep, template.shape[-1]),
+                    dtype=template.dtype,
+                )
+                if not cache.empty():
+                    temporal = cache._temporal_order(getattr(cache, attr))
+                    count = min(keep, max(0, cache.offset))
+                    prefix[..., :count, :] = temporal[..., :count, :]
+                    length = min(max(0, cache.offset), tail.max_size)
+                    recent = (
+                        temporal[..., -length:, :] if length else temporal[..., :0, :]
+                    )
+                    setattr(tail, attr, recent)
+                    tail._idx = recent.shape[2]
+                prefixes[i].append(prefix)
+            tails.append(tail)
+        result.tail = BatchRotatingKVCache.merge(tails)
+        result.tail._offset = max(c.offset for c in caches)
+        result.prefix_keys, result.prefix_values = [
+            mx.concatenate(p, axis=0) for p in prefixes
+        ]
+        return result
+
+    @property
+    def state(self):
+        return self.tail.state, self.prefix_keys, self.prefix_values
+
+    @state.setter
+    def state(self, value):
+        self.tail.state, self.prefix_keys, self.prefix_values = value
+
+    @property
+    def meta_state(self):
+        return self.max_size, self.keep, self.tail.meta_state
+
+    @meta_state.setter
+    def meta_state(self, value):
+        self.max_size, self.keep, tail_meta = value
+        self.tail.meta_state = tail_meta
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        max_size, keep, tail_meta = meta_state
+        result = cls(max_size, [], keep)
+        result.tail.state = state[0]
+        result.tail.meta_state = tail_meta
+        result.prefix_keys, result.prefix_values = state[1:]
+        return result
+
+    def size(self):
+        return min(self.tail._offset, self.max_size)
+
+    def empty(self):
+        return self.tail.empty()
+
+    @property
+    def nbytes(self):
+        prefix = (
+            0
+            if self.prefix_keys is None
+            else self.prefix_keys.nbytes + self.prefix_values.nbytes
+        )
+        return self.tail.nbytes + prefix
 
 
 # MLX-VLM cache extensions.
@@ -2742,6 +3041,15 @@ class BatchPoolingCache(_BaseCache):
 
 
 class SimpleKVCache:
+    def with_max_size(self, max_size):
+        if type(self) is not SimpleKVCache:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support max_kv_size"
+            )
+        if not self.empty():
+            raise ValueError("Cannot change the limit of a populated SimpleKVCache")
+        return RotatingKVCache(max_size, keep=min(4, max_size - 1))
+
     """A simple key-value cache for transformer attention layers.
 
     Stores and concatenates key/value tensors along sequence dimension.
