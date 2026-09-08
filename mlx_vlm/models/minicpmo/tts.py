@@ -3,10 +3,11 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import KVCache
-from mlx_lm.models.llama import LlamaModel, ModelArgs
-from mlx_lm.sample_utils import apply_top_k, apply_top_p
 
+from ...sample_utils import apply_top_k, apply_top_p
+from ..cache import KVCache
+from ..llama.config import ModelConfig as LlamaConfig
+from ..llama.language import LlamaModel
 from .config import MiniCPMTTSConfig
 
 
@@ -105,7 +106,7 @@ class MiniCPMTTS(nn.Module):
                 f"Unsupported MiniCPM-o TTS backbone: {config.backbone_model}"
             )
 
-        llama_args = ModelArgs(
+        llama_args = LlamaConfig(
             model_type="llama",
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,

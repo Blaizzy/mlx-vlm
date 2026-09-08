@@ -1,3 +1,4 @@
+import subprocess
 import sys
 import types
 import unittest
@@ -366,7 +367,7 @@ def _tiny_speech_model():
 
 
 def test_speech_hidden_states_match_cached_forward():
-    from mlx_lm.models.cache import KVCache
+    from mlx_vlm.models.cache import KVCache
 
     model = _tiny_speech_model()
     ids = mx.array([[1, 2, 3, 4]])
@@ -399,6 +400,35 @@ def test_speech_tokens_run_with_tiny_model():
     )
     assert tokens.shape == (1, 2, 1)
     assert mx.all(tokens < 15).item()
+
+
+def test_speech_generation_without_mlx_lm():
+    # Use a fresh interpreter so an installed or already-imported mlx-lm cannot
+    # hide an undeclared dependency, as it did in the original local test run.
+    script = """
+import sys
+sys.modules["mlx_lm"] = None
+
+import mlx.core as mx
+from mlx_vlm.models.minicpmo import TTSSamplingParams
+from mlx_vlm.tests.test_minicpmo_tts import _tiny_speech_model
+
+model = _tiny_speech_model()
+tokens = model.generate_speech_tokens(
+    mx.array([[1, 10, 3, 4, 11]]),
+    tts_start_id=10,
+    tts_end_id=11,
+    tts_max_new_token=2,
+    tts_sampling_params=TTSSamplingParams(temperature=0.8, top_p=0.85, top_k=5),
+)
+mx.eval(tokens)
+assert tokens.shape == (1, 2, 1)
+assert mx.all(tokens < 15).item()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_tts_eos_is_never_sent_to_codec():
