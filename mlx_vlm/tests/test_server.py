@@ -6,6 +6,7 @@ import math
 import os
 import sys
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import Queue
@@ -611,6 +612,40 @@ def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     assert cache_key[:3] == ("demo-model", "adapter-a", "text_generation")
     assert cache_key[3] == server.runtime.config.fingerprint(kinds={"text_generation"})
     assert server.runtime.model_cache["adapter_path"] == "adapter-a"
+
+
+def test_settings_reload_releases_old_model_before_loading_replacement(monkeypatch):
+    models = []
+
+    class FakeModel:
+        def __init__(self):
+            # Compiled model methods can form cycles that need collection after
+            # the registry and worker have released their references.
+            self.cycle = self
+
+    class FakeResponseGenerator:
+        def __init__(self, *args, **kwargs):
+            assert all(model() is None for model in models)
+            self.model = FakeModel()
+            models.append(weakref.ref(self.model))
+
+        def wait_until_ready(self):
+            return self.model, SimpleNamespace(), SimpleNamespace(model_type="qwen2_vl")
+
+        def stop_and_join(self):
+            pass
+
+    config = RuntimeConfig.from_env()
+    monkeypatch.setattr(server.runtime, "config", config)
+    monkeypatch.setattr(server.runtime, "model_cache", {})
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    monkeypatch.setattr(server.runtime, "apc_manager", None)
+    monkeypatch.setattr(server._app_module, "ResponseGenerator", FakeResponseGenerator)
+    monkeypatch.setattr(server._app_module._apc, "from_env", lambda *_, **__: None)
+    server.get_cached_model("demo-model")
+    config.apply_changes({"apc_enabled": not config.apc_enabled})
+    server.get_cached_model("demo-model")
+    assert len(models) == 2
 
 
 def test_unload_model_cache_group_resets_apc_around_generator_shutdown(
