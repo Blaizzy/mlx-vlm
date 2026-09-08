@@ -98,6 +98,41 @@ def _published_qwen38_config():
     }
 
 
+def _published_nemotron_config():
+    return {
+        "architectures": ["Qwen3DSparkModel"],
+        "model_type": "qwen3",
+        "hidden_size": 2688,
+        "intermediate_size": 6144,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "rms_norm_eps": 1e-6,
+        "vocab_size": 131072,
+        "max_position_embeddings": 1048576,
+        "rope_theta": 10000,
+        "layer_types": ["sliding_attention"] * 6,
+        "sliding_window": 1024,
+        "block_size": 8,
+        "dspark_bonus_anchor": True,
+        "dflash_query_causal": True,
+        "attention_sink_bias": True,
+        "markov_rank": 512,
+        "markov_head_type": "vanilla",
+        "dflash_config": {
+            "attention_sink_bias": True,
+            "causal": True,
+            "mask_token_id": 990,
+            "swa_window_size": 1024,
+            "target_layer_ids": [1, 5, 19, 29, 41, 51],
+            "use_swa": True,
+            "sample_from_anchor": False,
+        },
+    }
+
+
 def _tiny_draft_config():
     return ModelConfig.from_dict(
         {
@@ -357,6 +392,100 @@ def test_published_qwen38_config_normalizes_dspark_contract_and_yarn():
     assert config.dflash_initial_block_size == 4
     assert drafter.prefer_requested_block_size is False
     assert drafter.rope.traditional is False
+
+
+def test_published_nemotron_config_normalizes_dspark_contract():
+    config = ModelConfig.from_dict(_published_nemotron_config())
+    drafter = DSparkDraftModel(config)
+
+    assert config.proposal_length == 7
+    assert config.block_size == 8
+    assert config.runtime_block_size == 8
+    assert config.target_layer_ids == [1, 5, 19, 29, 41, 51]
+    assert config.num_target_layers == 52
+    assert config.sliding_window == 1024
+    assert config.is_causal is True
+    assert config.attention_sink_bias is True
+    assert config.sample_from_anchor is False
+    assert config.enable_confidence_head is False
+    assert config.block_size_policy == "adaptive"
+    assert config.dflash_initial_block_size == 4
+    assert drafter.prefer_requested_block_size is False
+    assert drafter.choose_initial_block_size(512, 8) == 6
+    assert drafter.choose_initial_block_size(1024, 8) == 6
+    assert drafter.choose_initial_block_size(1025, 8) == 4
+    assert drafter.choose_block_ceiling(512, 8) == 6
+    assert drafter.choose_block_ceiling(1024, 8) == 6
+    assert drafter.choose_block_ceiling(1025, 8) == 4
+    assert drafter.confidence_head is None
+    assert all(layer.self_attn.is_causal for layer in drafter.layers)
+    assert all(
+        layer.self_attn.attention_sink_bias is not None for layer in drafter.layers
+    )
+
+
+def test_nemotron_dspark_sanitize_installs_checkpoint_embedding():
+    config_dict = _published_nemotron_config()
+    config_dict["hidden_size"] = 8
+    config_dict["intermediate_size"] = 16
+    config_dict["num_hidden_layers"] = 1
+    config_dict["num_attention_heads"] = 2
+    config_dict["num_key_value_heads"] = 1
+    config_dict["head_dim"] = 4
+    config_dict["vocab_size"] = 32
+    config_dict["layer_types"] = ["sliding_attention"]
+    config_dict["markov_rank"] = 4
+    config_dict["dflash_config"]["mask_token_id"] = 31
+    config_dict["dflash_config"]["target_layer_ids"] = [0]
+    config = ModelConfig.from_dict(config_dict)
+    drafter = DSparkDraftModel(config)
+    weight = mx.zeros((32, 8))
+
+    sanitized = drafter.sanitize({"model.embed_tokens.weight": weight})
+
+    assert sanitized["embed_tokens.weight"] is weight
+    assert drafter.embed_tokens is not None
+
+
+def test_dspark_bonus_anchor_uses_mask_position_logits():
+    config_dict = _published_nemotron_config()
+    config_dict["hidden_size"] = 8
+    config_dict["intermediate_size"] = 16
+    config_dict["num_hidden_layers"] = 1
+    config_dict["num_attention_heads"] = 2
+    config_dict["num_key_value_heads"] = 1
+    config_dict["head_dim"] = 4
+    config_dict["vocab_size"] = 32
+    config_dict["layer_types"] = ["sliding_attention"]
+    config_dict["markov_rank"] = 4
+    config_dict["dflash_config"]["mask_token_id"] = 31
+    config_dict["dflash_config"]["target_layer_ids"] = [0]
+    config = ModelConfig.from_dict(config_dict)
+    drafter = DSparkDraftModel(config)
+    seen = {}
+
+    def hidden(inputs, target_hidden, cache):
+        seen["inputs"] = inputs
+        return mx.zeros((1, inputs.shape[1], config.hidden_size))
+
+    def logits(states):
+        seen["states"] = states
+        return mx.zeros((1, states.shape[1], config.vocab_size))
+
+    drafter._hidden = hidden
+    drafter._logits = logits
+    drafter.draft_block(
+        3,
+        mx.zeros((1, 1, config.hidden_size)),
+        [],
+        config.block_size,
+        lambda values: mx.argmax(values, axis=-1),
+    )
+
+    assert seen["inputs"].shape[1] == config.block_size
+    assert seen["inputs"][0, 0].item() == 3
+    assert seen["inputs"][0, 1:].tolist() == [31] * config.proposal_length
+    assert seen["states"].shape[1] == config.proposal_length
 
 
 def test_dspark_config_uses_explicit_rope_capability_not_architecture_name():
@@ -948,3 +1077,173 @@ def test_target_compatibility_rejects_wrong_size():
 
     with pytest.raises(ValueError, match="hidden-size mismatch"):
         validate_drafter_compatibility(target, drafter, "dflash")
+
+
+def _published_gemma4_dspark_config():
+    """Fields the published deepseek-ai/dspark_gemma4_12b_block7 config carries."""
+    return {
+        "architectures": ["Gemma4DSparkModel"],
+        "model_type": "gemma4_text",
+        "attention_k_eq_v": True,
+        "block_size": 7,
+        "confidence_head_with_markov": True,
+        "enable_confidence_head": True,
+        "final_logit_softcapping": 30.0,
+        "global_head_dim": 512,
+        "head_dim": 256,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "hidden_size": 3840,
+        "intermediate_size": 15360,
+        "layer_types": ["full_attention"] * 5,
+        "markov_head_type": "vanilla",
+        "markov_rank": 256,
+        "mask_token_id": 4,
+        "max_position_embeddings": 262144,
+        "num_attention_heads": 16,
+        "num_global_key_value_heads": 1,
+        "num_hidden_layers": 5,
+        "num_key_value_heads": 8,
+        "num_target_layers": 48,
+        "rms_norm_eps": 1e-06,
+        "rope_parameters": {
+            "full_attention": {
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 1000000.0,
+                "rope_type": "proportional",
+            },
+            "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"},
+        },
+        "sliding_window": 1024,
+        "target_layer_ids": [5, 17, 29, 41, 46],
+        "tie_word_embeddings": False,
+        "vocab_size": 262144,
+    }
+
+
+def test_published_gemma4_dspark_config_reads_flat_contract():
+    """The Gemma 4 checkpoint publishes DSpark fields flat, not under dflash_config."""
+    from mlx_vlm.speculative.drafters.gemma4_dspark import ModelConfig as G4Config
+
+    config = G4Config.from_dict(_published_gemma4_dspark_config())
+
+    assert config.model_type == "gemma4_dspark"
+    assert config.backbone_model_type == "gemma4_text"
+    assert config.proposal_length == 7
+    assert config.block_size == 8
+    assert config.target_layer_ids == [5, 17, 29, 41, 46]
+    assert config.num_target_layers == 48
+    assert config.attention_k_eq_v is True
+    assert config.global_head_dim == 512
+    assert config.final_logit_softcapping == 30.0
+
+
+def test_gemma4_dspark_rope_uses_full_attention_parameters():
+    """RoPE must follow Gemma 4's per-layer-type theta and rotate global_head_dim.
+
+    The generic DFlash helper would key off head_dim and a flat rope_theta,
+    which for this checkpoint means 256 dims at 1e7 instead of 512 at 1e6.
+    """
+    from mlx_vlm.speculative.drafters.gemma4_dspark import Model as G4Model
+    from mlx_vlm.speculative.drafters.gemma4_dspark import ModelConfig as G4Config
+
+    config = G4Config.from_dict(_published_gemma4_dspark_config())
+    drafter = G4Model(config)
+
+    assert drafter.rope.dims == 512
+    assert type(drafter.rope).__name__ == "ProportionalRoPE"
+
+
+def test_gemma4_dspark_attention_shares_key_and_value_projection():
+    """attention_k_eq_v layers publish no v_proj; values reuse the key projection."""
+    from mlx_vlm.speculative.drafters.gemma4_dspark import ModelConfig as G4Config
+    from mlx_vlm.speculative.drafters.gemma4_dspark.gemma4_dspark import (
+        Gemma4DSparkAttention,
+    )
+
+    config = G4Config.from_dict(_published_gemma4_dspark_config())
+    attention = Gemma4DSparkAttention(config, 0)
+
+    assert attention.use_k_eq_v is True
+    assert "v_proj" not in attention
+    assert attention.head_dim == 512
+    assert attention.n_kv_heads == 1
+    assert attention.scale == 1.0
+
+    x = mx.zeros((1, 3, config.hidden_size))
+    keys, values = attention._project_kv(x)
+    assert keys.shape == values.shape == (1, 3, 512)
+
+
+def test_gemma4_dspark_attention_forward_runs():
+    """A forward must not raise: the custom __init__ still has to set is_causal and
+    attention_sink_bias, which the inherited DFlashAttention.__call__ reads."""
+    from mlx_vlm.models.cache import KVCache
+    from mlx_vlm.speculative.drafters.gemma4_dspark import Model as G4Model
+    from mlx_vlm.speculative.drafters.gemma4_dspark import ModelConfig as G4Config
+    from mlx_vlm.speculative.drafters.gemma4_dspark.gemma4_dspark import (
+        Gemma4DSparkAttention,
+    )
+
+    config = G4Config.from_dict(_published_gemma4_dspark_config())
+    rope = G4Model(config).rope
+    attention = Gemma4DSparkAttention(config, 0)
+    x = mx.zeros((1, 2, config.hidden_size))
+    x_ctx = mx.zeros((1, 3, config.hidden_size))
+
+    out = attention(x, x_ctx, rope, KVCache())
+    mx.eval(out)
+
+    assert out.shape == (1, 2, config.hidden_size)
+
+
+def test_generic_loader_routes_gemma4_dspark_checkpoint(tmp_path):
+    """The checkpoint declares gemma4_text, so routing keys off the architecture tag."""
+    from mlx_vlm.speculative.drafters.gemma4_dspark import Model as G4Model
+
+    published = _published_gemma4_dspark_config()
+    architecture, model_type = get_model_and_args(published)
+
+    assert model_type == "gemma4_dspark"
+    assert architecture.Model is G4Model
+
+    (tmp_path / "config.json").write_text(json.dumps(published))
+    assert resolve_drafter_kind(tmp_path) == "dflash"
+
+
+def test_gemma4_exact_verifier_is_opt_in():
+    """Exact block verification is off unless the checkpoint asks for it.
+
+    Singleton-equivalent numerics roughly halve decode throughput, and the
+    other DSpark targets verify with the plain path, so Gemma 4 matches them
+    by default and exposes the trade as a config flag.
+    """
+    from mlx_vlm.models.gemma4.config import TextConfig
+
+    assert TextConfig().exact_speculative_verify is False
+    assert TextConfig(exact_speculative_verify=True).exact_speculative_verify is True
+
+    routed = []
+
+    class _Spy:
+        def __call__(self, *a, **kw):
+            routed.append(True)
+            return "verified"
+
+    import mlx_vlm.models.gemma4.language as g4
+
+    real = g4._EXACT_SPECULATIVE_VERIFIER
+    g4._EXACT_SPECULATIVE_VERIFIER = _Spy()
+    try:
+        model = g4.LanguageModel(TextConfig(exact_speculative_verify=True))
+        assert model(mx.array([[1]]), speculative_verify=True) == "verified"
+        assert routed == [True]
+
+        routed.clear()
+        off = g4.LanguageModel(TextConfig(exact_speculative_verify=False))
+        try:
+            off(mx.array([[1]]), speculative_verify=True)
+        except Exception:
+            pass
+        assert routed == []
+    finally:
+        g4._EXACT_SPECULATIVE_VERIFIER = real

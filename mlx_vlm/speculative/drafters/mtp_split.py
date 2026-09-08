@@ -291,6 +291,21 @@ def detect_mtp_splitter(model_path: Path) -> Optional[MTPSplitter]:
     with open(config_path) as f:
         source_config = json.load(f)
     text_config = source_config.get("text_config") or source_config
+    model_types = {
+        text_config.get("model_type"),
+        source_config.get("model_type"),
+    }
+    if "deepseek_v4" in model_types and (
+        text_config.get("dspark_target_layer_ids")
+        or source_config.get("dspark_target_layer_ids")
+    ):
+        from .deepseek_v4_dspark.split import DeepseekV4DsparkSplitter
+
+        splitter = DeepseekV4DsparkSplitter()
+        tc = splitter.read_text_config(source_config)
+        for _ in splitter.iter_selected(model_path, tc):
+            return splitter
+
     # Some checkpoints name the inner text stack separately from the
     # architecture (Apodex 1.1 uses text_config "qwen3_5_moe_text" under a
     # root "qwen3_5_moe"), so fall back to the root type before giving up.

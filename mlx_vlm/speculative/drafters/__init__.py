@@ -16,6 +16,7 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
     "deepseek_v4_mtp": "mtp",
     "deepseek_v4_dspark": "dflash",
     "dspark": "dflash",
+    "gemma4_dspark": "dflash",
     "eagle3": "eagle3",
     "gemma4_assistant": "mtp",
     "gemma4_unified_assistant": "mtp",
@@ -26,6 +27,7 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
     "qwen4_exp_mtp": "mtp",
     "laguna": "dflash",
     "muse_glimmer_assistant": "dflash",
+    "qwen3_dspark": "dflash",
 }
 
 DEFAULT_DRAFTER_KIND = "dflash"
