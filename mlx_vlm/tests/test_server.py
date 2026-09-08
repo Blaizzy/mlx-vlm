@@ -36,6 +36,7 @@ from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
+from mlx_vlm.tool_parsers import _infer_tool_parser, minicpm5
 
 
 def test_response_generator_prefill_step_override_wins_over_environment(monkeypatch):
@@ -7202,6 +7203,69 @@ class TestProcessToolCalls:
         assert json.loads(result["calls"][1]["function"]["arguments"]) == {
             "path": "file.py"
         }
+
+    minicpm5_call = (
+        '<function name="write_file"><param name="content">'
+        "<![CDATA[  <html>\nA & B\n</html>  ]]></param>"
+        '<param name="version">123</param><param name="count">3</param>'
+        '<param name="enabled">True</param></function>'
+    )
+
+    def test_detects_minicpm5_chat_template(self):
+        template = """{{ '<function name="' ~ tool_call.name ~ '">' }}
+    {{ '<param name="' ~ param_name ~ '">' }}"""
+        assert server.load_tool_module(_infer_tool_parser(template)) is minicpm5
+
+    def test_minicpm5_cdata_and_argument_types(self):
+        tools = [
+            {
+                "function": {
+                    "name": "write_file",
+                    "parameters": {"properties": {"version": {"type": "string"}}},
+                }
+            }
+        ]
+        result = minicpm5.parse_tool_call(self.minicpm5_call, tools)
+
+        assert result == {
+            "name": "write_file",
+            "arguments": {
+                "content": "  <html>\nA & B\n</html>  ",
+                "version": "123",
+                "count": 3,
+                "enabled": True,
+            },
+        }
+
+    def test_minicpm5_multiple_calls_and_streamed_markup(self):
+        text = f'Before{self.minicpm5_call}Between<function name="get_time"></function>After'
+        result = server.process_tool_calls(text, minicpm5, tools=None)
+
+        assert result["remaining_text"] == "Before Between After"
+        assert [call["function"]["name"] for call in result["calls"]] == [
+            "write_file",
+            "get_time",
+        ]
+        assert json.loads(result["calls"][1]["function"]["arguments"]) == {}
+
+        state = server.ToolCallStreamState(
+            minicpm5.tool_call_start, minicpm5.tool_call_end
+        )
+        visible = "".join(state.feed(char) or "" for char in text)
+        visible += state.feed("", last=True) or ""
+        assert visible == "BeforeBetweenAfter"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '<function name="lookup"><param name="value">unfinished',
+            '<function name=""></function>',
+            '<function name="lookup"><param>3</param></function>',
+        ],
+    )
+    def test_minicpm5_rejects_malformed_calls(self, text):
+        with pytest.raises(ValueError):
+            minicpm5.parse_tool_call(text)
 
 
 class TestCountThinkingTagTokens:
