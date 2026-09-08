@@ -457,7 +457,7 @@ def test_gemma4_cache_layer_types_match_expected_pattern():
     (KVCache) vs exact-only (RotatingKVCache). This test documents and enforces
     that invariant.
     """
-    from mlx_vlm.apc import _cache_entry_supports_block_apc
+    from mlx_vlm.apc_adapters import apc_block_eligible
     from mlx_vlm.models.cache import KVCache, RotatingKVCache
 
     lm = _make_tiny_gemma4()
@@ -465,7 +465,7 @@ def test_gemma4_cache_layer_types_match_expected_pattern():
 
     assert len(cache) == 6
 
-    block_eligible = [_cache_entry_supports_block_apc(c) for c in cache]
+    block_eligible = [apc_block_eligible(c) for c in cache]
     # Pattern with sliding_window_pattern=3: [sliding, sliding, full] × 2
     assert block_eligible == [False, False, True, False, False, True]
 
@@ -482,7 +482,7 @@ def test_qwen35_cache_layer_types_match_expected_pattern():
     (KVCache) vs exact-only (ArraysCache). This test documents and enforces
     that invariant.
     """
-    from mlx_vlm.apc import _cache_entry_supports_block_apc
+    from mlx_vlm.apc_adapters import apc_block_eligible
     from mlx_vlm.models.cache import ArraysCache, KVCache
 
     lm = _make_tiny_qwen35()
@@ -490,7 +490,7 @@ def test_qwen35_cache_layer_types_match_expected_pattern():
 
     assert len(cache) == 4
 
-    block_eligible = [_cache_entry_supports_block_apc(c) for c in cache]
+    block_eligible = [apc_block_eligible(c) for c in cache]
     # Pattern: layers 0,1,2 are linear (ArraysCache), layer 3 is attention (KVCache)
     assert block_eligible == [False, False, False, True]
 
@@ -531,7 +531,7 @@ def test_block_eligible_layers_have_extractable_kv_after_prefill():
     and store them as blocks. This verifies the data is actually there and
     non-trivial.
     """
-    from mlx_vlm.apc import _cache_entry_supports_block_apc
+    from mlx_vlm.apc_adapters import apc_block_eligible
 
     lm = _make_tiny_gemma4()
     cache = lm.make_cache()
@@ -541,7 +541,7 @@ def test_block_eligible_layers_have_extractable_kv_after_prefill():
     mx.eval([c for c in cache if c is not None])
 
     for i, c in enumerate(cache):
-        if _cache_entry_supports_block_apc(c):
+        if apc_block_eligible(c):
             assert c.keys is not None, f"Block-eligible layer {i} has no keys"
             assert c.values is not None, f"Block-eligible layer {i} has no values"
             assert c.keys.shape[2] > 0, f"Block-eligible layer {i} keys are empty"

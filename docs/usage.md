@@ -35,6 +35,21 @@ output = generate(model, processor, formatted_prompt, image, verbose=False)
 print(output)
 ```
 
+## MoE Offloading
+
+Run a mixture-of-experts checkpoint that is larger than available RAM by paging routed experts from disk. Repack the checkpoint into an offloaded store once, then load it as usual — `load()` detects the offloaded layout automatically:
+
+```bash
+python -m mlx_vlm moe_offload --build /path/to/checkpoint --out /path/to/offloaded
+python -m mlx_vlm.generate --model /path/to/offloaded --prompt "Explain how photosynthesis works." --max-tokens 100
+```
+
+Serving works the same way. Bound the resident expert set with `--expert-cache-gb`, and inspect cache hits/misses/evictions at `/v1/moe-offload/stats`:
+
+```bash
+python -m mlx_vlm.server --model /path/to/offloaded --expert-cache-gb 8
+```
+
 ## Speculative Decoding
 
 Speed up generation 2–3× using a lightweight drafter model that predicts multiple tokens per round, verified in parallel by the target model.

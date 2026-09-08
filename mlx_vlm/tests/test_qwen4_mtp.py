@@ -6,13 +6,14 @@ import mlx.nn as nn
 import pytest
 
 from mlx_vlm.models.qwen4_exp.config import TextConfig
-from mlx_vlm.models.qwen4_exp.language import LanguageModel
+from mlx_vlm.models.qwen4_exp.language import LanguageModel, Qwen4ExpDecoderLayer
 from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_mtp_splitter
 from mlx_vlm.speculative.drafters.qwen4_exp_mtp import (
     ModelConfig,
     Qwen4ExpMTPDraftModel,
 )
 from mlx_vlm.speculative.drafters.qwen4_exp_mtp.split import split_qwen4_exp_mtp
+from mlx_vlm.speculative.mtp import _mtp_next_block_size
 
 
 def _tiny_text_config():
@@ -65,6 +66,13 @@ def _outer_config():
     )
 
 
+def test_qwen4_decoder_layers_expose_normalized_layer_types_for_mtp():
+    config = _tiny_text_config()
+
+    assert Qwen4ExpDecoderLayer(config, 0).layer_type == "linear_attention"
+    assert Qwen4ExpDecoderLayer(config, 1).layer_type == "qwen_sparse_attention"
+
+
 def test_qwen4_mtp_fusion_matches_released_equations():
     config = _tiny_text_config()
     drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=config))
@@ -90,6 +98,18 @@ def test_qwen4_mtp_fusion_matches_released_equations():
     expected = (expected_embedding[..., None, :] + expected_hidden).reshape(1, 1, 64)
 
     assert mx.allclose(actual, expected, atol=2e-5).item()
+
+
+def test_qwen4_mtp_uses_requested_block_size_as_adaptive_ceiling():
+    drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=_tiny_text_config()))
+
+    assert _mtp_next_block_size(drafter, 4, 2, 32) == 2
+
+    drafter.accept_lens.extend([1] * 8)
+    assert _mtp_next_block_size(drafter, 4, 2, 32) == 4
+
+    drafter.accept_lens.extend([0] * 16)
+    assert _mtp_next_block_size(drafter, 4, 2, 32) == 2
 
 
 def test_qwen4_mtp_draft_block_uses_hyper_connection_hidden():
@@ -247,3 +267,44 @@ def test_qwen4_mtp_splitter_maps_fused_experts_and_quantizes(tmp_path):
         "bits": 3,
         "mode": "affine",
     }
+
+
+def test_qwen4_mtp_splitter_converts_official_fp8_experts(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    text_config = _tiny_text_config().to_dict()
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen4_exp",
+                "text_config": text_config,
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "fmt": "e4m3",
+                    "weight_block_size": [128, 128],
+                },
+            }
+        )
+    )
+    weights = {"mtp.pre_fc_norm_hidden.weight": mx.zeros((64,))}
+    for expert in range(2):
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            key = f"mtp.layers.0.mlp.experts.{expert}.{projection}.weight"
+            weights[key] = mx.to_fp8(mx.ones((128, 128)) * (expert + 1))
+            weights[f"{key}_scale_inv"] = mx.ones((1, 1))
+    mx.save_safetensors(str(source / "model.safetensors"), weights)
+
+    split_qwen4_exp_mtp(str(source), str(output))
+
+    split_weights = mx.load(str(output / "model.safetensors"))
+    config = json.loads((output / "config.json").read_text())
+    gate = split_weights["layers.0.mlp.switch_mlp.gate_proj.weight"]
+    up = split_weights["layers.0.mlp.switch_mlp.up_proj.weight"]
+    down = split_weights["layers.0.mlp.switch_mlp.down_proj.weight"]
+    mx.eval(gate, up, down)
+    assert gate.shape == (2, 128, 128)
+    assert up.shape == (2, 128, 128)
+    assert down.shape == (2, 128, 128)
+    assert not any(key.endswith("weight_scale_inv") for key in split_weights)
+    assert "quantization" not in config

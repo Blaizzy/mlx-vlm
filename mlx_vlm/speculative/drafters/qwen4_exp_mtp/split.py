@@ -2,6 +2,7 @@ from typing import Dict
 
 import mlx.core as mx
 
+from ....models.qwen4_exp.fp8 import convert_qwen4_exp_fp8_weights
 from ..mtp_split import MTPSplitter
 from .qwen4_exp_mtp import Qwen4ExpMTPDraftModel
 
@@ -26,7 +27,7 @@ class Qwen4ExpMTPSplitter(MTPSplitter):
         self, tensors: Dict[str, mx.array], text_config: dict
     ) -> Dict[str, mx.array]:
         del text_config
-        return tensors
+        return convert_qwen4_exp_fp8_weights(tensors)
 
 
 def split_qwen4_exp_mtp(source: str, output: str, **kwargs):

@@ -101,16 +101,44 @@ def quantize_model(
         fine_grained_config = True
     else:
         fine_grained_config = False
-        quantized_config["quantization"] = quant_params
+        quantized_config["quantization"] = dict(quant_params)
 
     def wrapped_predicate(path, module):
         if not hasattr(module, "to_quantized"):
             return False
-        if module.weight.shape[-1] % group_size != 0:
-            return False
+
+        input_dims = module.weight.shape[-1]
         bool_or_params = True
-        if quant_predicate is not None:
+        default_group_is_compatible = input_dims % group_size == 0
+        if not default_group_is_compatible:
+            if quant_predicate is None:
+                return False
             bool_or_params = quant_predicate(path, module)
+            if not (
+                isinstance(bool_or_params, dict)
+                and "fallback_group_size" in bool_or_params
+            ):
+                return False
+        elif quant_predicate is not None:
+            bool_or_params = quant_predicate(path, module)
+
+        if isinstance(bool_or_params, dict) and "fallback_group_size" in bool_or_params:
+            overrides = dict(bool_or_params)
+            fallback_group_size = overrides.pop("fallback_group_size")
+            bool_or_params = {**quant_params, **overrides}
+            if (
+                input_dims % bool_or_params["group_size"]
+                and fallback_group_size is not None
+                and input_dims % fallback_group_size == 0
+            ):
+                bool_or_params["group_size"] = fallback_group_size
+        module_group_size = (
+            bool_or_params.get("group_size", group_size)
+            if isinstance(bool_or_params, dict)
+            else group_size
+        )
+        if input_dims % module_group_size != 0:
+            return False
         if isinstance(bool_or_params, dict):
             quantized_config["quantization"][path] = bool_or_params
         elif fine_grained_config and bool_or_params:

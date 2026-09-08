@@ -527,11 +527,13 @@ def _run_stt_request(request: AudioInferenceRequest) -> None:
     transcription_request = payload.request
     model, _, _ = get_cached_model(transcription_request.model, model_kind="audio_stt")
 
-    suffix = os.path.splitext(payload.filename or "")[1] or ".wav"
     tmp_path = None
     emitted = False
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        # The audio is already decoded PCM and this file only gives the model a
+        # path to open, so always write WAV. Re-encoding the upload's own
+        # container is lossy at best and impossible for m4a/mp4/aac.
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
             tmp_path = tmp.name
         audio_write(tmp_path, payload.audio, payload.sample_rate)
 

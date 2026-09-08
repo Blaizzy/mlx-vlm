@@ -1,17 +1,27 @@
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_vlm.generate import maybe_quantize_kv_cache
+from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models import qwen4_exp
 from mlx_vlm.models.cache import ArraysCache
+from mlx_vlm.models.exact_speculative_verify import exact_speculative_verify_weight
 from mlx_vlm.models.qwen4_exp.language import (
+    BatchQSAKVCache,
     QSAKVCache,
     QSAQuantizedKVCache,
     Qwen4ExpGatedDeltaNet,
     Qwen4ExpNGramEmbedding,
     ShardedEmbedding,
+    _create_qwen4_exp_attention_mask,
+)
+from mlx_vlm.models.qwen4_exp.qsa_kernel import (
+    QSAExecutionPlan,
+    qsa_sparse_attention,
+    select_qsa_execution_plan,
 )
 from mlx_vlm.prompt_utils import MessageFormat, MessageFormatter
 
@@ -87,6 +97,256 @@ def tiny_config():
 
 
 class Qwen4ExpTests(unittest.TestCase):
+    def test_dense_decode_reduction_is_batch_invariant(self):
+        if not mx.metal.is_available():
+            self.skipTest("The batch-invariant GEMV requires Metal")
+
+        mx.random.seed(2_560_027)
+        linear = nn.Linear(2560, 512, bias=False)
+        linear.set_dtype(mx.bfloat16)
+        singleton = mx.random.normal((1, 1, 2560)).astype(mx.bfloat16)
+        batch = mx.contiguous(mx.concatenate([singleton] * 4, axis=0))
+
+        expected = linear(singleton)
+        singleton_out = exact_speculative_verify_weight(linear.weight, singleton)
+        batch_out = exact_speculative_verify_weight(linear.weight, batch)
+        self.assertIsNotNone(singleton_out)
+        self.assertIsNotNone(batch_out)
+        mx.eval(expected, singleton_out, batch_out)
+
+        self.assertTrue(mx.array_equal(singleton_out, expected).item())
+        self.assertTrue(
+            mx.array_equal(
+                batch_out,
+                mx.broadcast_to(singleton_out, batch_out.shape),
+            ).item()
+        )
+
+    def test_quantized_decode_uses_the_batch_invariant_path(self):
+        model = qwen4_exp.Model(tiny_config())
+        self.assertTrue(model.language_model._supports_batch_invariant_decode())
+
+        model.language_model.lm_head = nn.QuantizedLinear.from_linear(
+            model.language_model.lm_head,
+            group_size=32,
+            bits=4,
+        )
+
+        self.assertFalse(model.language_model._supports_batch_invariant_decode())
+
+        supported_head = nn.Linear(512, 64, bias=False)
+        supported_head.set_dtype(mx.bfloat16)
+        model.language_model.lm_head = nn.QuantizedLinear.from_linear(
+            supported_head,
+            group_size=32,
+            bits=4,
+        )
+
+        self.assertTrue(model.language_model._supports_batch_invariant_decode())
+
+    def test_quantized_final_mixer_is_batch_invariant(self):
+        config = tiny_config()
+        config.text_config.hc_lowrank = 32
+        language_model = qwen4_exp.Model(config).language_model
+        mixer = language_model.model.hyper_connection_mixer
+        mixer.input_mix_weight_down = nn.QuantizedLinear.from_linear(
+            mixer.input_mix_weight_down,
+            group_size=32,
+            bits=5,
+        )
+        mixer.input_mix_weight_up = nn.QuantizedLinear.from_linear(
+            mixer.input_mix_weight_up,
+            group_size=32,
+            bits=5,
+        )
+
+        mx.random.seed(41)
+        singleton = mx.random.normal((1, 3, 64)).astype(mx.bfloat16)
+        batch = mx.broadcast_to(singleton, (4, 3, 64))
+        expected = language_model._mtp_logits_hidden(singleton)
+        actual = language_model._mtp_logits_hidden(batch)
+        mx.eval(expected, actual)
+
+        self.assertTrue(
+            mx.array_equal(actual, mx.broadcast_to(expected, actual.shape)).item()
+        )
+
+    def test_qsa_sparse_attention_matches_dense_mask(self):
+        mx.random.seed(37)
+        batch, query_heads, kv_heads = 4, 4, 2
+        query_length, key_length, head_dim = 5, 64, 32
+        block_size = 2
+        queries = mx.random.normal(
+            (batch, query_heads, query_length, head_dim), dtype=mx.bfloat16
+        )
+        keys = mx.random.normal(
+            (batch, kv_heads, key_length, head_dim), dtype=mx.bfloat16
+        )
+        values = mx.random.normal(
+            (batch, kv_heads, key_length, head_dim), dtype=mx.bfloat16
+        )
+        blocks = mx.broadcast_to(
+            mx.array([1, 4, 7, 12], dtype=mx.int32),
+            (batch, query_length, 4),
+        )
+        query_ends = mx.broadcast_to(
+            mx.arange(55, 60, dtype=mx.int32)[None], (batch, query_length)
+        )
+
+        plan = select_qsa_execution_plan(
+            queries,
+            keys,
+            values,
+            blocks,
+            query_ends,
+            block_size=block_size,
+            causal=True,
+            all_sparse=True,
+        )
+        if plan is not QSAExecutionPlan.INDEXED_SPARSE_PREFILL:
+            self.skipTest("QSA sparse Metal kernel is unavailable")
+        sparse = qsa_sparse_attention(
+            queries,
+            keys,
+            values,
+            blocks,
+            query_ends,
+            scale=head_dim**-0.5,
+            block_size=block_size,
+        )
+
+        selected = (
+            blocks[..., None] * block_size
+            + mx.arange(block_size, dtype=mx.int32)[None, None, None]
+        ).reshape(batch, query_length, -1)
+        mask = mx.put_along_axis(
+            mx.zeros((batch, query_length, key_length + 1), dtype=mx.bool_),
+            selected,
+            mx.ones(selected.shape, dtype=mx.bool_),
+            axis=-1,
+        )[..., :key_length]
+        token_ids = mx.arange(key_length, dtype=mx.int32)
+        tail_starts = (query_ends // block_size) * block_size
+        tail = (token_ids[None, None] >= tail_starts[..., None]) & (
+            token_ids[None, None] < query_ends[..., None]
+        )
+        dense = mx.fast.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale=head_dim**-0.5,
+            mask=(mask | tail)[:, None],
+        )
+        mx.eval(sparse, dense)
+
+        self.assertTrue(mx.allclose(sparse, dense, atol=5e-3, rtol=5e-3).item())
+
+    def test_qsa_attention_routes_long_prefix_to_sparse_kernel(self):
+        mx.random.seed(41)
+        model = qwen4_exp.Model(tiny_config())
+        attention = model.language_model.model.layers[1].self_attn
+        cache = QSAKVCache()
+        attention(mx.random.normal((1, 18, 32)), mask="causal", cache=cache)
+
+        def fake_sparse(queries, *args, **kwargs):
+            return mx.zeros_like(queries)
+
+        with (
+            patch(
+                "mlx_vlm.models.qwen4_exp.language.select_qsa_execution_plan",
+                return_value=QSAExecutionPlan.INDEXED_SPARSE_PREFILL,
+            ),
+            patch(
+                "mlx_vlm.models.qwen4_exp.language.qsa_sparse_attention",
+                side_effect=fake_sparse,
+            ) as sparse,
+        ):
+            output = attention(mx.random.normal((1, 2, 32)), mask="causal", cache=cache)
+            mx.eval(output)
+
+        sparse.assert_called_once()
+
+    def test_equal_length_qsa_batch_preserves_causal_mask_semantics(self):
+        hidden = mx.zeros((4, 32, 64))
+        cache = BatchQSAKVCache([0, 0, 0, 0])
+
+        mask = _create_qwen4_exp_attention_mask(hidden, cache)
+
+        self.assertEqual(mask, "causal")
+
+    def test_equal_length_qsa_batch_routes_to_sparse_prefill(self):
+        mx.random.seed(43)
+        model = qwen4_exp.Model(tiny_config())
+        cache = _make_cache(model.language_model, [0, 0, 0, 0])
+        model.language_model(
+            mx.random.randint(0, 64, (4, 18)),
+            cache=cache,
+        )
+
+        def fake_sparse(queries, *args, **kwargs):
+            return mx.zeros_like(queries)
+
+        with (
+            patch(
+                "mlx_vlm.models.qwen4_exp.language.select_qsa_execution_plan",
+                return_value=QSAExecutionPlan.INDEXED_SPARSE_PREFILL,
+            ),
+            patch(
+                "mlx_vlm.models.qwen4_exp.language.qsa_sparse_attention",
+                side_effect=fake_sparse,
+            ) as sparse,
+        ):
+            output = model.language_model(
+                mx.random.randint(0, 64, (4, 2)),
+                cache=cache,
+            ).logits
+            mx.eval(output)
+
+        self.assertEqual(sparse.call_count, 4)
+        self.assertTrue(
+            all(call.args[0].shape[0] == 1 for call in sparse.call_args_list)
+        )
+
+    def test_ragged_qsa_batch_retains_explicit_mask(self):
+        hidden = mx.zeros((2, 32, 64))
+        cache = BatchQSAKVCache([3, 0])
+
+        mask = _create_qwen4_exp_attention_mask(hidden, cache)
+
+        self.assertIsInstance(mask, mx.array)
+        self.assertEqual(mask.shape, (2, 1, 32, 32))
+
+    def test_qsa_dispatch_is_explicit_for_decode_and_masked_attention(self):
+        queries = mx.zeros((2, 4, 1, 32), dtype=mx.bfloat16)
+        keys = mx.zeros((2, 2, 64, 32), dtype=mx.bfloat16)
+        values = mx.zeros_like(keys)
+        blocks = mx.zeros((2, 1, 4), dtype=mx.int32)
+        query_ends = mx.full((2, 1), 64, dtype=mx.int32)
+
+        decode = select_qsa_execution_plan(
+            queries,
+            keys,
+            values,
+            blocks,
+            query_ends,
+            block_size=2,
+            causal=True,
+            all_sparse=True,
+        )
+        masked = select_qsa_execution_plan(
+            queries,
+            keys,
+            values,
+            blocks,
+            query_ends,
+            block_size=2,
+            causal=False,
+            all_sparse=True,
+        )
+
+        self.assertIs(decode, QSAExecutionPlan.DENSE_DECODE)
+        self.assertIs(masked, QSAExecutionPlan.DENSE_MASKED)
+
     def test_config_normalizes_reference_layer_type(self):
         config = tiny_config()
         self.assertEqual(
@@ -204,6 +464,222 @@ class Qwen4ExpTests(unittest.TestCase):
         self.assertEqual(cache[0][2].shape[1], 6)
         self.assertEqual(cache[0][3].shape[1], 2)
 
+    def test_batched_qsa_cache_decode_matches_singleton_rows(self):
+        mx.random.seed(47)
+        model = qwen4_exp.Model(tiny_config())
+        model.set_dtype(mx.bfloat16)
+        mx.eval(model.parameters())
+        prompts = mx.array([list(range(2, 12)), list(range(12, 22))], dtype=mx.int32)
+        decode = mx.array([[22], [23]], dtype=mx.int32)
+        prompt_positions = mx.broadcast_to(mx.arange(10)[None], (2, 10))
+        decode_positions = mx.full((2, 1), 10, dtype=mx.int32)
+
+        batch_cache = _make_cache(model.language_model, [0, 0])
+        model.language_model(
+            prompts,
+            cache=batch_cache,
+            position_ids=prompt_positions,
+        )
+        batch_logits = model.language_model(
+            decode,
+            cache=batch_cache,
+            position_ids=decode_positions,
+        ).logits
+
+        row_logits = []
+        for row in range(2):
+            row_cache = model.language_model.make_cache()
+            model.language_model(
+                prompts[row : row + 1],
+                cache=row_cache,
+                position_ids=prompt_positions[row : row + 1],
+            )
+            row_logits.append(
+                model.language_model(
+                    decode[row : row + 1],
+                    cache=row_cache,
+                    position_ids=decode_positions[row : row + 1],
+                ).logits
+            )
+        row_logits = mx.concatenate(row_logits, axis=0)
+        mx.eval(batch_logits, row_logits)
+
+        self.assertTrue(mx.array_equal(batch_logits, row_logits).item())
+        self.assertTrue(
+            mx.array_equal(
+                mx.argmax(batch_logits, axis=-1),
+                mx.argmax(row_logits, axis=-1),
+            ).item()
+        )
+
+    def test_left_padded_batched_qsa_decode_matches_singleton_rows(self):
+        mx.random.seed(17)
+        model = qwen4_exp.Model(tiny_config())
+        row_prompts = [list(range(2, 12)), list(range(12, 24))]
+        prompts = mx.array([[0, 0, *row_prompts[0]], row_prompts[1]], dtype=mx.int32)
+        prompt_positions = mx.array(
+            [[-2, -1, *range(10)], list(range(12))], dtype=mx.int32
+        )
+        decode = mx.array([[24], [25]], dtype=mx.int32)
+        decode_positions = mx.array([[10], [12]], dtype=mx.int32)
+
+        batch_cache = _make_cache(model.language_model, [2, 0])
+        model.language_model(
+            prompts,
+            cache=batch_cache,
+            position_ids=prompt_positions,
+        )
+        batch_logits = model.language_model(
+            decode,
+            cache=batch_cache,
+            position_ids=decode_positions,
+        ).logits
+
+        row_logits = []
+        for row, prompt in enumerate(row_prompts):
+            row_cache = model.language_model.make_cache()
+            positions = mx.arange(len(prompt), dtype=mx.int32)[None]
+            model.language_model(
+                mx.array(prompt, dtype=mx.int32)[None],
+                cache=row_cache,
+                position_ids=positions,
+            )
+            row_logits.append(
+                model.language_model(
+                    decode[row : row + 1],
+                    cache=row_cache,
+                    position_ids=decode_positions[row : row + 1],
+                ).logits
+            )
+        row_logits = mx.concatenate(row_logits, axis=0)
+        mx.eval(batch_logits, row_logits)
+
+        # Ragged decode deliberately uses batched kernels, whose reduction
+        # order can differ slightly from singleton GEMVs. The generated token
+        # must nevertheless be identical row-for-row.
+        self.assertTrue(
+            mx.array_equal(
+                mx.argmax(batch_logits, axis=-1),
+                mx.argmax(row_logits, axis=-1),
+            ).item()
+        )
+
+    def test_left_padded_qsa_mask_matches_singleton_rows(self):
+        mx.random.seed(23)
+        model = qwen4_exp.Model(tiny_config())
+        indexer = model.language_model.model.layers[1].self_attn.indexer
+        qk = mx.random.normal((2, 12, 24))
+        positions = mx.array([[-2, -1, *range(10)], list(range(12))], dtype=mx.int32)
+
+        batch_mask = indexer.from_projected(
+            qk,
+            BatchQSAKVCache([2, 0]),
+            positions,
+        )
+        self.assertIsNotNone(batch_mask)
+
+        for row, pad in enumerate((2, 0)):
+            row_mask = indexer.from_projected(
+                qk[row : row + 1, pad:],
+                QSAKVCache(),
+                positions[row : row + 1, pad:],
+            )
+            mx.eval(batch_mask, row_mask)
+            self.assertTrue(
+                mx.array_equal(
+                    batch_mask[row : row + 1, :, pad:, pad:], row_mask
+                ).item()
+            )
+
+    def test_qsa_indexer_incremental_blocks_survive_checkpoint_round_trip(self):
+        mx.random.seed(31)
+        model = qwen4_exp.Model(tiny_config())
+        indexer = model.language_model.model.layers[1].self_attn.indexer
+        qk = mx.random.normal((1, 14, 24))
+        positions = mx.arange(14, dtype=mx.int32)[None]
+
+        cache = QSAKVCache()
+        indexer.from_projected(qk[:, :10], cache, positions[:, :10])
+        cache.update_and_fetch(mx.zeros((1, 2, 10, 8)), mx.zeros((1, 2, 10, 8)))
+        mx.eval(cache.state)
+
+        self.assertEqual(cache.index_block_ratio, 2)
+        self.assertEqual(cache.index_block_keys.shape, (1, 1, 5, 8))
+
+        restored = QSAKVCache()
+        restored.state = cache.state
+        incremental_mask = indexer.from_projected(
+            qk[:, 10:], restored, positions[:, 10:]
+        )
+
+        cold_cache = QSAKVCache()
+        cold_mask = indexer.from_projected(qk, cold_cache, positions)
+        mx.eval(incremental_mask, cold_mask, restored.index_block_keys)
+
+        self.assertTrue(mx.array_equal(incremental_mask, cold_mask[:, :, 10:]).item())
+        self.assertEqual(restored.index_block_keys.shape, (1, 1, 7, 8))
+
+        batch = QSAKVCache.merge([restored])
+        extracted = batch.extract(0)
+        mx.eval(extracted.state)
+        self.assertEqual(extracted.index_block_ratio, 2)
+        self.assertTrue(
+            mx.array_equal(extracted.index_block_keys, restored.index_block_keys).item()
+        )
+
+        extracted.trim(1)
+        self.assertIsNone(extracted.index_block_keys)
+        self.assertIsNone(extracted.index_block_ratio)
+
+    def test_chunked_ragged_prefill_handles_an_all_padding_row_chunk(self):
+        mx.random.seed(29)
+        model = qwen4_exp.Model(tiny_config())
+        row_prompts = [list(range(2, 12)), list(range(12, 26))]
+        prompts = mx.array(
+            [[0, 0, 0, 0, *row_prompts[0]], row_prompts[1]], dtype=mx.int32
+        )
+        positions = mx.array(
+            [[-4, -3, -2, -1, *range(10)], list(range(14))], dtype=mx.int32
+        )
+        decode = mx.array([[26], [27]], dtype=mx.int32)
+        decode_positions = mx.array([[10], [14]], dtype=mx.int32)
+
+        batch_cache = _make_cache(model.language_model, [4, 0])
+        model.language_model(
+            prompts[:, :2], cache=batch_cache, position_ids=positions[:, :2]
+        )
+        model.language_model(
+            prompts[:, 2:], cache=batch_cache, position_ids=positions[:, 2:]
+        )
+        batch_logits = model.language_model(
+            decode, cache=batch_cache, position_ids=decode_positions
+        ).logits
+
+        row_logits = []
+        for row, prompt in enumerate(row_prompts):
+            row_cache = model.language_model.make_cache()
+            model.language_model(
+                mx.array(prompt, dtype=mx.int32)[None],
+                cache=row_cache,
+                position_ids=mx.arange(len(prompt), dtype=mx.int32)[None],
+            )
+            row_logits.append(
+                model.language_model(
+                    decode[row : row + 1],
+                    cache=row_cache,
+                    position_ids=decode_positions[row : row + 1],
+                ).logits
+            )
+        row_logits = mx.concatenate(row_logits, axis=0)
+        mx.eval(batch_logits, row_logits)
+
+        self.assertTrue(
+            mx.array_equal(
+                mx.argmax(batch_logits, axis=-1),
+                mx.argmax(row_logits, axis=-1),
+            ).item()
+        )
+
     def test_multimodal_forward_uses_qwen3_vision_encoder(self):
         model = qwen4_exp.Model(tiny_config())
         input_ids = mx.array([[58, 60, 59, 1]], dtype=mx.int32)
@@ -240,6 +716,158 @@ class Qwen4ExpTests(unittest.TestCase):
         self.assertEqual(quantized.index_keys.shape, (1, 12, 8))
         self.assertEqual(quantized.offset, 12)
 
+    def test_qsa_cache_merges_ragged_rows_and_round_trips_extract(self):
+        rows = []
+        for length in (3, 1):
+            cache = QSAKVCache()
+            cache.update_and_fetch(
+                mx.ones((1, 2, length, 8)) * length,
+                mx.ones((1, 2, length, 8)) * (length + 1),
+            )
+            cache.update_indexer(
+                mx.arange(length * 8).reshape(1, length, 8),
+                mx.arange(length, dtype=mx.int32)[None],
+            )
+            rows.append(cache)
+
+        batch = QSAKVCache.merge(rows)
+        self.assertIsInstance(batch, BatchQSAKVCache)
+        self.assertEqual(batch.index_keys.shape, (2, 3, 8))
+        self.assertEqual(batch.index_position_ids.shape, (2, 3))
+        self.assertEqual(batch.left_padding.tolist(), [0, 2])
+
+        restored = batch.extract(1)
+        mx.eval(*restored.state)
+        self.assertEqual(restored.offset, 1)
+        self.assertTrue(mx.array_equal(restored.index_keys, rows[1].index_keys).item())
+        self.assertTrue(
+            mx.array_equal(
+                restored.index_position_ids, rows[1].index_position_ids
+            ).item()
+        )
+
+        cloned = BatchQSAKVCache.from_state(batch.state, batch.meta_state)
+        cloned_row = cloned.extract(1)
+        mx.eval(*cloned_row.state)
+        self.assertEqual(cloned.offset.tolist(), [3, 1])
+        self.assertTrue(
+            mx.array_equal(cloned_row.index_keys, rows[1].index_keys).item()
+        )
+
+    def test_qsa_batch_cache_promotes_mixed_text_and_mrope_positions(self):
+        text = QSAKVCache()
+        text.update_and_fetch(mx.zeros((1, 2, 2, 8)), mx.zeros((1, 2, 2, 8)))
+        text_positions = mx.arange(2, dtype=mx.int32)[None]
+        text.update_indexer(mx.zeros((1, 2, 8)), text_positions)
+
+        multimodal = QSAKVCache()
+        multimodal.update_and_fetch(mx.zeros((1, 2, 1, 8)), mx.zeros((1, 2, 1, 8)))
+        mrope_positions = mx.array([[[7]], [[8]], [[9]]], dtype=mx.int32)
+        multimodal.update_indexer(mx.zeros((1, 1, 8)), mrope_positions)
+
+        batch = QSAKVCache.merge([text, multimodal])
+        restored_text = batch.extract(0)
+        restored_multimodal = batch.extract(1)
+        mx.eval(
+            restored_text.index_position_ids, restored_multimodal.index_position_ids
+        )
+
+        self.assertEqual(batch.index_position_ids.shape, (3, 2, 2))
+        self.assertEqual(restored_text.index_position_ids.shape, (3, 1, 2))
+        for axis in range(3):
+            self.assertTrue(
+                mx.array_equal(
+                    restored_text.index_position_ids[axis], text_positions
+                ).item()
+            )
+        self.assertTrue(
+            mx.array_equal(
+                restored_multimodal.index_position_ids, mrope_positions
+            ).item()
+        )
+
+        extended = QSAKVCache.merge([text])
+        extended.extend(QSAKVCache.merge([multimodal]))
+        extended_text = extended.extract(0)
+        extended_multimodal = extended.extract(1)
+        mx.eval(
+            extended_text.index_position_ids,
+            extended_multimodal.index_position_ids,
+        )
+
+        self.assertEqual(extended.index_position_ids.shape, (3, 2, 2))
+        for axis in range(3):
+            self.assertTrue(
+                mx.array_equal(
+                    extended_text.index_position_ids[axis], text_positions
+                ).item()
+            )
+        self.assertTrue(
+            mx.array_equal(
+                extended_multimodal.index_position_ids, mrope_positions
+            ).item()
+        )
+
+    def test_qsa_batch_cache_extends_empty_rows_without_duplicating_them(self):
+        empty = BatchQSAKVCache([0, 0])
+        filled = QSAKVCache()
+        filled.update_and_fetch(mx.ones((1, 2, 1, 8)), mx.ones((1, 2, 1, 8)))
+        filled.update_indexer(mx.ones((1, 1, 8)), mx.array([[0]], dtype=mx.int32))
+
+        empty.extend(QSAKVCache.merge([filled]))
+
+        self.assertEqual(empty.offset.shape, (3,))
+        self.assertEqual(empty.index_keys.shape, (3, 1, 8))
+        self.assertEqual(empty.index_position_ids.shape, (3, 1))
+        self.assertEqual(empty.extract(0).offset, 0)
+        self.assertEqual(empty.extract(2).offset, 1)
+
+    def test_empty_qsa_batch_cache_state_round_trip(self):
+        batch = BatchQSAKVCache([0, 2])
+        state = batch.state
+        restored = BatchQSAKVCache([0])
+        restored.state = state
+
+        self.assertIsNone(state[0][0])
+        self.assertEqual(restored.left_padding.tolist(), [0, 2])
+        self.assertEqual(restored.offset.tolist(), [0, -2])
+        self.assertTrue(restored.empty())
+
+    def test_generation_cache_factory_keeps_qsa_batch_type(self):
+        model = qwen4_exp.Model(tiny_config())
+        caches = _make_cache(model.language_model, [0])
+
+        self.assertEqual(len(caches), 2)
+        self.assertIsInstance(caches[1], BatchQSAKVCache)
+
+    def test_qsa_prefix_cache_merge_accepts_apc_prefix_lengths(self):
+        rows = []
+        for length in (2, 3):
+            cache = QSAKVCache()
+            cache.update_and_fetch(
+                mx.zeros((1, 2, length, 8)), mx.zeros((1, 2, length, 8))
+            )
+            cache.update_indexer(
+                mx.zeros((1, length, 8)),
+                mx.arange(length, dtype=mx.int32)[None],
+            )
+            rows.append(cache)
+
+        merged = rows[0].prefix_cache_merge(rows, [2, 3])
+
+        self.assertIsInstance(merged, BatchQSAKVCache)
+        self.assertEqual(merged.offset.tolist(), [2, 3])
+        self.assertEqual(merged.index_keys.shape, (2, 3, 8))
+
+    def test_generation_cache_factory_rejects_qsa_batch_quantization(self):
+        model = qwen4_exp.Model(tiny_config())
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "QSAKVCache does not support quantized continuous batching",
+        ):
+            _make_cache(model.language_model, [0], kv_bits=8)
+
     def test_sanitize_maps_packed_experts_and_ngram_shards(self):
         model = qwen4_exp.Model(tiny_config())
         prefix = "model.language_model.layers.0"
@@ -264,6 +892,57 @@ class Qwen4ExpTests(unittest.TestCase):
         )
         self.assertEqual(sanitized[f"{mapped}.ple.conv1d.weight"].shape, (64, 3, 1))
         self.assertFalse(any(key.startswith("mtp.") for key in sanitized))
+
+    def test_sanitize_restores_official_fp8_experts_and_ple(self):
+        model = qwen4_exp.Model(tiny_config())
+        weights = {}
+        prefix = "model.language_model.layers.0.mlp"
+        for expert in range(2):
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                key = f"{prefix}.experts.{expert}.{projection}.weight"
+                weights[key] = mx.to_fp8(mx.ones((128, 128)) * (expert + 1))
+                weights[f"{key}_scale_inv"] = mx.ones((1, 1))
+        ple = "model.language_model.layers.0.ple.ple_embedding.ngram_embedding"
+        weights[f"{ple}.shard_0.weight"] = mx.to_fp8(mx.ones((4, 8)))
+        weights[f"{ple}.weight_scale"] = mx.array([0.5], dtype=mx.bfloat16)
+
+        sanitized = model.sanitize(weights)
+        mapped = "language_model.model.layers.0"
+        gate = sanitized[f"{mapped}.mlp.switch_mlp.gate_proj.weight"]
+        up = sanitized[f"{mapped}.mlp.switch_mlp.up_proj.weight"]
+        down = sanitized[f"{mapped}.mlp.switch_mlp.down_proj.weight"]
+        ple_weight = sanitized[
+            f"{mapped}.ple.ple_embedding.ngram_embedding.shards.0.weight"
+        ]
+        mx.eval(gate, up, down, ple_weight)
+        self.assertEqual(gate.shape, (2, 128, 128))
+        self.assertEqual(up.shape, (2, 128, 128))
+        self.assertEqual(down.shape, (2, 128, 128))
+        self.assertTrue(mx.allclose(ple_weight, mx.ones((4, 8)) * 0.5).item())
+        self.assertFalse(any("scale" in key for key in sanitized))
+
+    def test_sanitize_leaves_non_fp8_expert_layout_unchanged(self):
+        model = qwen4_exp.Model(tiny_config())
+        key = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight"
+        weights = {key: mx.ones((2, 2), dtype=mx.bfloat16)}
+
+        sanitized = model.sanitize(weights)
+
+        mapped = "language_model.model.layers.0.mlp.experts.0.gate_proj.weight"
+        self.assertIn(mapped, sanitized)
+        self.assertEqual(sanitized[mapped].dtype, mx.bfloat16)
+
+    def test_quantization_uses_compatible_group_for_ple_shards(self):
+        model = qwen4_exp.Model(tiny_config())
+        predicate = model.quant_predicate
+        path = (
+            "language_model.model.layers.0.ple.ple_embedding."
+            "ngram_embedding.shards.0"
+        )
+        self.assertEqual(
+            predicate(path, None),
+            {"fallback_group_size": 32},
+        )
 
 
 if __name__ == "__main__":

@@ -98,6 +98,24 @@ class DSparkDraftModel(DFlashDraftModel):
     def validate_target_compatibility(self, target_model) -> None:
         validate_dspark_target(self.config, target_model)
 
+    def choose_initial_block_size(
+        self, context_length: int, requested_block_size: int
+    ) -> int | None:
+        window = self.config.sliding_window
+        if window is not None and context_length <= window:
+            return min(6, requested_block_size)
+        return self.dflash_initial_block_size
+
+    def choose_block_ceiling(
+        self, context_length: int, requested_block_size: int
+    ) -> int:
+        window = self.config.sliding_window
+        if window is not None and context_length <= window:
+            return min(6, requested_block_size)
+        if window is not None:
+            return min(4, requested_block_size)
+        return requested_block_size
+
     def bind(self, target_model) -> "DSparkDraftModel":
         self.validate_target_compatibility(target_model)
         super().bind(target_model)
@@ -136,19 +154,40 @@ class DSparkDraftModel(DFlashDraftModel):
             if isinstance(last_bonus, int)
             else last_bonus.reshape(-1).astype(token_dtype)
         )
+        mask_count = proposal_length - int(self.config.sample_from_anchor)
         masks = mx.full(
-            (anchor.shape[0], proposal_length - 1),
+            (anchor.shape[0], mask_count),
             int(self.config.mask_token_id),
             dtype=token_dtype,
         )
         draft_inputs = mx.concatenate([anchor[:, None], masks], axis=1)
         draft_hidden = self._hidden(draft_inputs, hidden, cache)
+        if not self.config.sample_from_anchor:
+            draft_hidden = draft_hidden[:, 1:]
         base_logits = self._logits(draft_hidden)
         return self.markov_head.sample_block(
             base_logits,
             first_prev_tokens=anchor,
             sampler=sampler,
         ).astype(token_dtype)
+
+    def draft_block_greedy(
+        self,
+        last_bonus,
+        hidden: mx.array,
+        cache,
+        block_size: int,
+        sampler: Callable[[mx.array], mx.array],
+        token_dtype: mx.Dtype = mx.int32,
+    ) -> mx.array:
+        return self.draft_block(
+            last_bonus,
+            hidden,
+            cache,
+            block_size,
+            sampler,
+            token_dtype,
+        )
 
     def sanitize(self, weights: Mapping[str, mx.array]) -> dict[str, mx.array]:
         normalized = {}
@@ -159,6 +198,10 @@ class DSparkDraftModel(DFlashDraftModel):
                     f"Duplicate DSpark weight key after sanitization: {key}"
                 )
             normalized[key] = value
+        if "embed_tokens.weight" in normalized and self.embed_tokens is None:
+            self.embed_tokens = nn.Embedding(
+                self.config.vocab_size, self.config.hidden_size
+            )
         return normalized
 
 

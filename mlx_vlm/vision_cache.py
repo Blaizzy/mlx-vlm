@@ -7,17 +7,19 @@ expensive re-computation when the same image is discussed across turns.
 
 import hashlib
 from collections import OrderedDict
-from typing import Any, Optional
+from typing import Any, Optional, Sequence, Union
 
 import mlx.core as mx
+
+VisionFeatures = Union[mx.array, Sequence[mx.array]]
 
 
 class VisionFeatureCache:
     """LRU cache for vision features projected into language model space.
 
     Cache keys are derived from image paths (for file/URL images) or content
-    hashes (for PIL images). Cached values are mx.array features after
-    vision_tower + embed_vision, ready for masked_scatter.
+    hashes (for PIL images). Cached values are either one feature array or an
+    ordered collection of per-image feature arrays after vision projection.
 
     Cleanup is handled by three mechanisms:
     - **LRU eviction**: oldest entry is dropped when max_size is exceeded.
@@ -30,7 +32,7 @@ class VisionFeatureCache:
 
     def __init__(self, max_size: int = 20):
         self.max_size = max_size
-        self._cache: OrderedDict[str, mx.array] = OrderedDict()
+        self._cache: OrderedDict[str, VisionFeatures] = OrderedDict()
 
     def _make_key(self, image_source: Any) -> str:
         """Derive a cache key from an image source.
@@ -49,7 +51,7 @@ class VisionFeatureCache:
                 return f"pil:{h}"
             return f"obj:{id(image_source)}"
 
-    def get(self, image_source: Any) -> Optional[mx.array]:
+    def get(self, image_source: Any) -> Optional[VisionFeatures]:
         """Look up cached features. Returns None on miss."""
         key = self._make_key(image_source)
         if key in self._cache:
@@ -57,7 +59,7 @@ class VisionFeatureCache:
             return self._cache[key]
         return None
 
-    def put(self, image_source: Any, features: mx.array) -> None:
+    def put(self, image_source: Any, features: VisionFeatures) -> None:
         """Store features in the cache, evicting LRU if full."""
         key = self._make_key(image_source)
         if key in self._cache:
