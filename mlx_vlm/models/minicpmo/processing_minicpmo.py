@@ -255,6 +255,7 @@ class MiniCPMOProcessor(ProcessorMixin):
     audio_processor_class = "AutoFeatureExtractor"
     tokenizer_class = "AutoTokenizer"
     valid_kwargs = ["chat_template"]
+    supports_multiple_audio = True
 
     _IMAGE_MARKER_PATTERN = re.compile(r"<image>\./</image>|<image>")
     _AUDIO_MARKER_PATTERN = re.compile(r"<audio>\./</audio>|<audio>")
@@ -295,6 +296,8 @@ class MiniCPMOProcessor(ProcessorMixin):
             "audio_end": "<|audio_end|>",
             "spk_start": "<|spk_bos|>",
             "spk_end": "<|spk_eos|>",
+            "tts_start": "<|tts_bos|>",
+            "tts_end": "<|tts_eos|>",
         }
 
         for attr, token in token_map.items():
@@ -324,6 +327,48 @@ class MiniCPMOProcessor(ProcessorMixin):
     @classmethod
     def _count_audio_markers(cls, text: str) -> int:
         return len(cls._AUDIO_MARKER_PATTERN.findall(text or ""))
+
+    def prepare_audio_generation(self, prompt, *, audio=None, ref_audio_path=None):
+        """Condition the LLM on the reference voice, as in upstream get_sys_prompt.
+
+        TTS uses the LLM's hidden states in addition to text. Passing a reference
+        only to the waveform decoder leaves those states unconditioned.
+        """
+        if audio is None:
+            audio_inputs = []
+        elif isinstance(audio, list):
+            audio_inputs = list(audio)
+        else:
+            audio_inputs = [audio]
+        reference = ref_audio_path or (audio_inputs[0] if audio_inputs else None)
+        if reference is None:
+            raise ValueError("MiniCPM-o speech requires a reference audio file.")
+
+        # Preserve user-audio placement before introducing a system-audio marker.
+        prompt = self._inject_audio_placeholders(
+            prompt, ["<audio>"] * len(audio_inputs)
+        )
+        system_tag = "<|im_start|>system\n"
+        has_system = prompt.startswith(system_tag)
+        if has_system:
+            system_content = prompt[len(system_tag) :].split("<|im_end|>", 1)[0]
+            if (
+                self._count_audio_markers(system_content)
+                and audio_inputs
+                and Path(audio_inputs[0]).resolve() == Path(reference).resolve()
+            ):
+                # Respect a caller-supplied voice-conditioning system prompt.
+                return prompt, audio_inputs
+
+        voice_instruction = (
+            "Clone the voice in the provided audio prompt.\n<audio>\n"
+            "As an assistant, you will speak using this voice style."
+        )
+        if has_system:
+            prompt = system_tag + voice_instruction + "\n\n" + prompt[len(system_tag) :]
+        else:
+            prompt = system_tag + voice_instruction + "<|im_end|>\n" + prompt
+        return prompt, [reference, *audio_inputs]
 
     def _normalize_images(
         self,
@@ -508,6 +553,14 @@ class MiniCPMOProcessor(ProcessorMixin):
             return np.zeros((0, 2), dtype=np.int32)
         return np.stack([start_idx[:n], end_idx[:n]], axis=1).astype(np.int32)
 
+    def _compute_spk_bounds(self, input_ids: np.ndarray) -> np.ndarray:
+        start_idx = np.where(input_ids == self.tokenizer.spk_start_id)[0] + 1
+        end_idx = np.where(input_ids == self.tokenizer.spk_end_id)[0]
+        n = min(len(start_idx), len(end_idx))
+        if n == 0:
+            return np.zeros((0, 2), dtype=np.int32)
+        return np.stack([start_idx[:n], end_idx[:n]], axis=1).astype(np.int32)
+
     def _extract_audio_inputs(
         self,
         batched_audios: List[List[np.ndarray]],
@@ -624,6 +677,7 @@ class MiniCPMOProcessor(ProcessorMixin):
         input_ids_list: List[np.ndarray] = []
         image_bounds_list: List[np.ndarray] = []
         audio_bounds_list: List[np.ndarray] = []
+        spk_bounds_list: List[np.ndarray] = []
 
         for i, prompt in enumerate(texts):
             prompt = self._inject_image_placeholders(prompt, len(batched_images[i]))
@@ -638,6 +692,7 @@ class MiniCPMOProcessor(ProcessorMixin):
             input_ids_list.append(ids_array)
             image_bounds_list.append(self._compute_image_bounds(ids_array))
             audio_bounds_list.append(self._compute_audio_bounds(ids_array))
+            spk_bounds_list.append(self._compute_spk_bounds(ids_array))
 
         if not padding and len(input_ids_list) == 1:
             padded_input_ids = np.expand_dims(input_ids_list[0], axis=0)
@@ -655,6 +710,8 @@ class MiniCPMOProcessor(ProcessorMixin):
                 image_bounds_list[i] = image_bounds_list[i] + offset
             if offset > 0 and audio_bounds_list[i].size > 0:
                 audio_bounds_list[i] = audio_bounds_list[i] + offset
+            if offset > 0 and spk_bounds_list[i].size > 0:
+                spk_bounds_list[i] = spk_bounds_list[i] + offset
 
         return {
             "input_ids": padded_input_ids,
@@ -666,7 +723,7 @@ class MiniCPMOProcessor(ProcessorMixin):
             "audio_features": audio_features,
             "audio_feature_lens": audio_feature_lens,
             "audio_bounds": audio_bounds_list,
-            "spk_bounds": [np.zeros((0, 2), dtype=np.int32) for _ in range(batch_size)],
+            "spk_bounds": spk_bounds_list,
         }
 
     def apply_chat_template(self, *args, **kwargs):

@@ -2359,7 +2359,7 @@ def prepare_inputs(
         if not isinstance(audio, list):
             audio = [audio]
 
-        if len(audio) > 1:
+        if len(audio) > 1 and not getattr(processor, "supports_multiple_audio", False):
             print(
                 "\033[33mWarning\033[0m: Single prompt with multiple audio files is not supported yet. Using the first audio file.\n"
             )
