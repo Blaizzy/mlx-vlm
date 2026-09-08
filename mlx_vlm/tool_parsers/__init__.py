@@ -15,6 +15,7 @@ _TEMPLATE_MARKERS = [
     (("<mm:think>",), "minimax_m3"),
     (("<minimax:tool_call>",), "minimax_m2"),
     (("<start_function_call>",), "function_gemma"),
+    (("<function name=", "<param name="), "minicpm5"),
     (("<longcat_tool_call>",), "longcat"),
     (("<arg_key>",), "glm47"),
     (("<|tool_call_start|>", "<|tool_call_end|>"), "pythonic"),
