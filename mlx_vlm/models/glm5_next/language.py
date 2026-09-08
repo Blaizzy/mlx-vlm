@@ -1,3 +1,4 @@
+import os  # noqa: E402  (kept next to the toggle it serves)
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -17,6 +18,31 @@ from ..gated_delta import gated_delta_update
 from ..mla import MultiLinear, latent_length, max_absorbed_queries
 from ..mlp import DeepseekMLP
 from .config import ModelConfig, TextConfig
+
+_IDX_FAST_ENV = None
+
+# Pools per growth step for the incremental indexer pool buffers (one pool is
+# ``index_kpool`` tokens, so 512 pools = 2048 tokens of headroom per growth).
+_IDX_POOL_STEP = 512
+
+
+def _idx_fast_enabled() -> bool:
+    # Opt-in fast decode path for the DSA indexer's *active* regime
+    # (T > index_topk).  The eager path redoes O(T) work every step -- a
+    # full-context ``visible`` mask, an O(T) reduction inside ``_visible_tail``
+    # and an O(P) re-concatenation of the pool cache -- none of which can change
+    # between steps when the sequence is unpadded and single-stream.  Off by
+    # default until it has live mileage; the bypass regime and prefill are
+    # untouched.
+    global _IDX_FAST_ENV
+    if _IDX_FAST_ENV is None:
+        _IDX_FAST_ENV = os.environ.get("MLX_VLM_GLM5_IDX_FAST", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+    return _IDX_FAST_ENV
 
 
 class Glm5NextRMSNormGated(nn.Module):
@@ -310,6 +336,169 @@ class Glm5NextIndexer(nn.Module):
         tail_indices = mx.where(tail_valid & tail_vis, tail_indices, -1)
         return tail_indices
 
+    # ------------------------------------------------------------------ fast
+    # Incremental decode path for the ACTIVE indexer regime (T > index_topk).
+    #
+    # The eager path recomputes, every step and for every one of the 11 DSA
+    # layers, three things that provably cannot change:
+    #   (a) ``valid`` / ``kv_pos`` / ``visible`` / ``pool_visible`` -- with a
+    #       single unpadded stream every cached position is valid and every
+    #       position is <= the current query position, so ``visible`` is all-True
+    #       and ``valid_candidates`` collapses to ``pool_valid``;
+    #   (b) ``_visible_tail`` -- an O(T) reduction whose result, once (a) holds,
+    #       is a closed form in T alone;
+    #   (c) ``mx.concatenate`` of the stable pool prefix -- pools are append-only
+    #       during decode, so this is an O(P) copy of data that is already there.
+    # This path keeps (per step) only the work that genuinely depends on the new
+    # token: repooling the one incomplete pool, the query-dependent pool scoring,
+    # and the top-k.  It is written to be bit-identical to the eager path.
+
+    def _pool_buffers(self, cache):
+        """Preallocated append-only pool store; seeded from ``cache._pool``."""
+        kp = self.index_kpool
+        buf = getattr(cache, "_fpool", None)
+        if buf is not None:
+            return buf
+        ck, ci, cv, t_prev = cache._pool
+        B, n = ck.shape[0], ck.shape[1]
+        cap = ((n + _IDX_POOL_STEP - 1) // _IDX_POOL_STEP + 1) * _IDX_POOL_STEP
+        pk = mx.zeros((B, cap, self.head_dim), dtype=ck.dtype)
+        pi = mx.zeros((B, cap, kp), dtype=ci.dtype)
+        pv = mx.zeros((B, cap), dtype=cv.dtype)
+        pk[:, :n] = ck
+        pi[:, :n] = ci
+        pv[:, :n] = cv
+        buf = [pk, pi, pv, t_prev, cap]
+        cache._fpool = buf
+        # The eager incremental path keys off ``_pool``; drop it so that if this
+        # path ever becomes ineligible mid-stream the fallback is a correct full
+        # rebuild rather than a stale prefix.
+        cache._pool = None
+        return buf
+
+    def _decode_fast(self, x, q, packed_full, cache, T):
+        kp, hd = self.index_kpool, self.head_dim
+        B = packed_full.shape[0]
+        buf = self._pool_buffers(cache)
+        pk, pi, pv, t_prev, cap = buf
+
+        # --- (c) repool only the trailing incomplete pool, in place ----------
+        n_stable = t_prev // kp
+        s0 = n_stable * kp
+        tail = packed_full[:, s0:]
+        pk_s, pi_s, pv_s = self._pool_tail(tail, s0, T - s0)
+        P = n_stable + 1
+        if P > cap:
+            cap += _IDX_POOL_STEP
+            grow = [
+                mx.zeros((B, cap) + a.shape[2:], dtype=a.dtype) for a in (pk, pi, pv)
+            ]
+            for g, a in zip(grow, (pk, pi, pv)):
+                g[:, : a.shape[1]] = a
+            pk, pi, pv = grow
+        pk[:, n_stable:P] = pk_s
+        pi[:, n_stable:P] = pi_s
+        pv[:, n_stable:P] = pv_s
+        buf[:] = [pk, pi, pv, T, cap]
+
+        # `pool_end` is never needed here: it exists only to gather `visible`,
+        # which is all-True on this path, so no buffer is kept for it.
+        pool_keys, pool_indices, pool_valid = pk[:, :P], pi[:, :P], pv[:, :P]
+
+        # --- scoring: genuinely query-dependent, recomputed in full ----------
+        select_k = min(self.index_topk // kp, P)
+        scores = q @ pool_keys[:, None].swapaxes(-1, -2)
+        scores = mx.maximum(scores * self.softmax_scale, 0.0)
+        weights = self.weights_proj(x) * (self.n_heads**-0.5)
+        index_scores = mx.sum(weights[..., None] * scores, axis=2)
+        # (a) valid_candidates == pool_valid: `visible` is all-True here.
+        valid_candidates = mx.broadcast_to(pool_valid[:, None], (B, 1, P))
+        index_scores = mx.where(valid_candidates, index_scores, -1e30)
+
+        order = mx.argsort(-index_scores, axis=-1)
+        selected = order[..., :select_k]
+        selected_valid = mx.take_along_axis(valid_candidates, selected, axis=-1)
+        sel_exp = mx.broadcast_to(selected[..., None], (B, 1, select_k, kp))
+        topk = mx.take_along_axis(
+            mx.broadcast_to(pool_indices[:, None], (B, 1, P, kp)), sel_exp, axis=2
+        ).reshape(B, 1, select_k * kp)
+        sv = mx.broadcast_to(selected_valid[..., None], (B, 1, select_k, kp)).reshape(
+            B, 1, select_k * kp
+        )
+        topk = mx.where(sv, topk, -1)
+
+        # --- (b) closed-form _visible_tail ----------------------------------
+        if self.index_kpool_always_select_tail and kp > 1:
+            topk = mx.concatenate([topk, self._tail_fast(B, T, topk.dtype)], axis=-1)
+        width = self.index_topk + (
+            kp - 1 if (self.index_kpool_always_select_tail and kp > 1) else 0
+        )
+        if topk.shape[-1] < width:
+            topk = mx.concatenate(
+                [topk, mx.full((B, 1, width - topk.shape[-1]), -1, dtype=topk.dtype)],
+                axis=-1,
+            )
+        # `valid_cur` is all-True on this path, so the final mask is the identity.
+        return topk[:, None, ..., :width].astype(mx.int32)
+
+    def _pool_tail(self, tail, s0, n):
+        """`_pooled_states` specialised to the one trailing pool at decode.
+
+        With `n = T - s0` in [1, kpool] and every cached position valid, the
+        whole index apparatus of `_pooled_states` -- any/argmax/where for
+        `first_key`, the arange, the clip, three `take_along_axis` calls and the
+        validity reductions -- collapses to constants known on the host:
+            first_key    = 0
+            safe[j]      = min(j, n-1)
+            grouped_valid[j] = (j < n)
+            pool_valid   = (n == kpool)
+            pool_indices[j]  = s0 + j  if j < n else -1
+        Only the gather, the gate softmax and the weighted sum remain, and each
+        is left byte-for-byte as the eager path performs it.
+        """
+        kp, hd = self.index_kpool, self.head_dim
+        B = tail.shape[0]
+        # Load-bearing: the caller's `t_prev == T - 1` guard is what bounds the
+        # tail to a single pool (n = (t_prev % kp) + 1).  Fail loudly rather than
+        # silently pool only the first kp tokens if that ever stops holding.
+        if not 1 <= n <= kp:
+            raise ValueError(f"indexer fast tail expects 1..{kp} tokens, got {n}")
+        key = (kp, n, s0)
+        cached = getattr(self, "_ptc", None)
+        if cached is None or cached[0] != key:
+            idx = mx.array([min(j, n - 1) for j in range(kp)], dtype=mx.int32)
+            gv = mx.array([[j < n] for j in range(kp)], dtype=mx.bool_)
+            pi = mx.array(
+                [[[s0 + j if j < n else -1 for j in range(kp)]]], dtype=mx.int32
+            )
+            pv = mx.array([[n == kp]], dtype=mx.bool_)
+            self._ptc = cached = (key, idx, gv, pi, pv)
+        _, idx, gv, pi, pv = cached
+
+        gk = mx.take(tail[..., :hd], idx, axis=1)[:, None]
+        gg = mx.take(tail[..., hd : 2 * hd], idx, axis=1)[:, None]
+        logits = gg + self.index_kpool_compress_ape[None, None]
+        logits = mx.where(gv, logits, -1e30)
+        probs = mx.softmax(logits, axis=2)
+        probs = mx.where(mx.isnan(probs), 0.0, probs)
+        pool_keys = mx.sum(probs * gk, axis=2)
+        return (
+            pool_keys,
+            mx.broadcast_to(pi, (B, 1, kp)),
+            mx.broadcast_to(pv, (B, 1)),
+        )
+
+    def _tail_fast(self, B, T, dtype):
+        # With every position visible and valid, _visible_tail collapses to a
+        # closed form: first_key = 0, visible_count = T, tail_count = T % kp,
+        # tail_start = T - tail_count, tail_vis all-True, so
+        #   tail_valid[o] = (o < tail_count) & (tail_start + o < T) = o < tail_count.
+        # Built host-side: 3 int32s, no GPU reduction over T.
+        kp = self.index_kpool
+        c = T % kp
+        vals = [(T - c + o) if o < c else -1 for o in range(kp - 1)]
+        return mx.broadcast_to(mx.array(vals, dtype=dtype), (B, 1, kp - 1))
+
     def __call__(self, x, qr, mask, cache=None):
         B, S, _ = x.shape
         q = self.wq_b(qr).reshape(B, S, self.n_heads, self.head_dim)
@@ -338,6 +527,35 @@ class Glm5NextIndexer(nn.Module):
         # stays consistent; the full pool is rebuilt once when T first exceeds index_topk.
         if getattr(self, "bypass_short", True) and T <= self.index_topk:
             return None
+        # Fast incremental decode: single unpadded stream, exactly one new token
+        # since the pool cache was last built, and a pool state to build on.
+        # Anything else (prefill, S>1 verify block, batched or left-padded
+        # decode, a rollback that shortened the cache) takes the eager path.
+        if (
+            _idx_fast_enabled()
+            and S == 1
+            and B == 1
+            and cache is not None
+            and mask is None
+            and getattr(cache, "_no_pad", False)
+            and (
+                getattr(cache, "_fpool", None) is not None
+                or getattr(cache, "_pool", None) is not None
+            )
+            and (
+                cache._fpool[3]
+                if getattr(cache, "_fpool", None) is not None
+                else cache._pool[3]
+            )
+            == T - 1
+            and (
+                cache._fpool[0]
+                if getattr(cache, "_fpool", None) is not None
+                else cache._pool[0]
+            ).shape[0]
+            == B
+        ):
+            return self._decode_fast(x, q, packed_full, cache, T)
         k_full, gate_full, valid_ch = mx.split(
             packed_full, [self.head_dim, 2 * self.head_dim], axis=-1
         )
@@ -361,6 +579,11 @@ class Glm5NextIndexer(nn.Module):
             and getattr(cache, "_pool", None) is not None
             and getattr(cache, "_no_pad", False)
             and cache._pool[0].shape[0] == B
+            # The cached prefix describes a cache of t_prev tokens; if anything
+            # shortened the cache since (APC prefix reuse trims the DSA caches
+            # via dispatch.py's c.trim(n_drop) without touching _pool), reusing
+            # it would splice stale pools onto a shorter sequence.
+            and cache._pool[3] == T - S
         ):
             ck, ci, cv, t_prev = cache._pool
             n_stable = t_prev // self.index_kpool
@@ -380,6 +603,7 @@ class Glm5NextIndexer(nn.Module):
                 cache._no_pad = bool(mx.all(valid))
         if cache is not None:
             cache._pool = (pool_keys, pool_indices, pool_valid, T)
+            cache._fpool = None
         P = pool_keys.shape[1]
         select_k = min(self.index_topk // self.index_kpool, P)
         pool_end = mx.clip(pool_indices[..., -1], 0, kv_len - 1)
