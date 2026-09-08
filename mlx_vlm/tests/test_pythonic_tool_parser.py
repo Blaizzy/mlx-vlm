@@ -45,6 +45,37 @@ def test_lfm_tool_call_output_parses_for_server_response():
     }
 
 
+def test_multiple_tool_calls_are_parsed():
+    result = parse_tool_call(
+        "[read_file(path='brick.html'), read_file(path='game.html')]"
+    )
+
+    assert result == [
+        {"name": "read_file", "arguments": {"path": "brick.html"}},
+        {"name": "read_file", "arguments": {"path": "game.html"}},
+    ]
+
+
+def test_multiple_tool_calls_parse_for_server_response():
+    parser = load_tool_module("pythonic")
+    result = process_tool_calls(
+        "<|tool_call_start|>[read_file(path='brick.html'), "
+        "read_file(path='game.html')]<|tool_call_end|>",
+        parser,
+        tools=[{"type": "function", "function": {"name": "read_file"}}],
+    )
+
+    assert result["remaining_text"] == ""
+    assert [call["function"]["name"] for call in result["calls"]] == [
+        "read_file",
+        "read_file",
+    ]
+    assert [json.loads(call["function"]["arguments"]) for call in result["calls"]] == [
+        {"path": "brick.html"},
+        {"path": "game.html"},
+    ]
+
+
 def test_single_quoted_string_preserves_embedded_commas():
     result = parse_tool_call(
         "[write_file(path='game.js', content='const player = { x: 0, y: 1 };')]"

@@ -34,6 +34,25 @@ class Model(nn.Module):
         self.language_model = LanguageModel(config.text_config)
         self.multi_modal_projector = PaliGemmaMultiModalProjector(config)
 
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del input_ids, inputs_embeds, prompt_cache, draft_model
+        del draft_kind, prefill_kwargs
+        # The prefix-LM mask is built across the whole prompt, so splitting the
+        # prompt into causal chunks changes the attention pattern and with it
+        # the generated text. Prefill this model in one pass.
+        return not bool(
+            getattr(self.config.text_config, "use_bidirectional_attention", False)
+        )
+
     def get_input_embeddings(
         self,
         input_ids: Optional[mx.array] = None,

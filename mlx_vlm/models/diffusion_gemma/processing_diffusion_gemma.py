@@ -6,6 +6,7 @@ token expansion + ``mm_token_type_ids``), so no torch/torchvision is pulled in.
 Audio inputs are rejected: this model port supports text, images, and videos.
 """
 
+import re
 from typing import List, Optional, Union
 
 import mlx.core as mx
@@ -55,6 +56,27 @@ def _make_tool_parser_tokens_non_special(tokenizer):
     ]
 
 
+_CHANNEL_OPEN = "<|channel>"
+_CHANNEL_CLOSE = "<channel|>"
+# Header scaffolding the model emits around a response channel:
+#   <|channel>{name}<channel|>{message}
+# These markers are non-special (see _make_tool_parser_tokens_non_special) so
+# the tool parser can read them from text, which means they leak verbatim into
+# ordinary output. Drop the header span, keep the message body.
+_CHANNEL_HEADER_RE = re.compile(
+    re.escape(_CHANNEL_OPEN) + r".*?" + re.escape(_CHANNEL_CLOSE),
+    re.DOTALL,
+)
+
+
+def _strip_channel_scaffolding(text: str) -> str:
+    if _CHANNEL_OPEN not in text and _CHANNEL_CLOSE not in text:
+        return text
+    cleaned = _CHANNEL_HEADER_RE.sub("", text)
+    cleaned = cleaned.replace(_CHANNEL_OPEN, "").replace(_CHANNEL_CLOSE, "")
+    return cleaned.lstrip()
+
+
 def _materialize_mx_arrays(inputs: BatchFeature) -> BatchFeature:
     arrays = [
         value for _, value in tree_flatten(inputs.data) if isinstance(value, mx.array)
@@ -73,6 +95,10 @@ class DiffusionGemma4Processor(Gemma4Processor):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         _make_tool_parser_tokens_non_special(self.tokenizer)
+
+    def clean_output(self, text: str) -> str:
+        """Strip response-channel scaffolding the model emits as plain text."""
+        return _strip_channel_scaffolding(text)
 
     @staticmethod
     def _flatten_visual_items(values):

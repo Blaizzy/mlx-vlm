@@ -72,11 +72,11 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             config.hidden_size, config.conv_kernel_size, config.conv_group_size
         )
 
-    def __call__(self, x, x_ctx, rope, cache):
+    def __call__(self, x, x_ctx, rope, cache, projected_context=None):
         residual = x
         x, kernel = self.attention_conv.prepare(self.input_layernorm(x))
         x = residual + self.attention_conv.finish(
-            self.self_attn(x, x_ctx, rope, cache), kernel
+            self.self_attn(x, x_ctx, rope, cache, projected_context), kernel
         )
         residual = x
         x, kernel = self.mlp_conv.prepare(self.post_attention_layernorm(x))

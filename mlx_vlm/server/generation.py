@@ -43,7 +43,7 @@ from ..sample_utils import (
 from ..speculative.utils import speculative_stats_since, speculative_stats_snapshot
 from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
-from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
+from ..utils import ThinkingBudgetCriteria, load, prepare_inputs, resolve_eos_token_ids
 from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -1079,12 +1079,12 @@ class ResponseGenerator:
             self.model_path, self.adapter_path
         )
 
-        stop_tokens = set()
-        if hasattr(config, "eos_token_id"):
-            if isinstance(config.eos_token_id, list):
-                stop_tokens.update(config.eos_token_id)
-            elif config.eos_token_id is not None:
-                stop_tokens.add(config.eos_token_id)
+        stop_tokens = set(
+            resolve_eos_token_ids(
+                getattr(config, "eos_token_id", None),
+                getattr(processor, "tokenizer", processor),
+            )
+        )
         stop_tokens.update(getattr(processor, "additional_eos_token_ids", ()))
 
         draft_model = None

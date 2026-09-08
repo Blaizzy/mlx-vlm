@@ -6,13 +6,14 @@ import mlx.nn as nn
 import pytest
 
 from mlx_vlm.models.qwen4_exp.config import TextConfig
-from mlx_vlm.models.qwen4_exp.language import LanguageModel
+from mlx_vlm.models.qwen4_exp.language import LanguageModel, Qwen4ExpDecoderLayer
 from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_mtp_splitter
 from mlx_vlm.speculative.drafters.qwen4_exp_mtp import (
     ModelConfig,
     Qwen4ExpMTPDraftModel,
 )
 from mlx_vlm.speculative.drafters.qwen4_exp_mtp.split import split_qwen4_exp_mtp
+from mlx_vlm.speculative.mtp import _mtp_next_block_size
 
 
 def _tiny_text_config():
@@ -65,6 +66,13 @@ def _outer_config():
     )
 
 
+def test_qwen4_decoder_layers_expose_normalized_layer_types_for_mtp():
+    config = _tiny_text_config()
+
+    assert Qwen4ExpDecoderLayer(config, 0).layer_type == "linear_attention"
+    assert Qwen4ExpDecoderLayer(config, 1).layer_type == "qwen_sparse_attention"
+
+
 def test_qwen4_mtp_fusion_matches_released_equations():
     config = _tiny_text_config()
     drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=config))
@@ -90,6 +98,18 @@ def test_qwen4_mtp_fusion_matches_released_equations():
     expected = (expected_embedding[..., None, :] + expected_hidden).reshape(1, 1, 64)
 
     assert mx.allclose(actual, expected, atol=2e-5).item()
+
+
+def test_qwen4_mtp_uses_requested_block_size_as_adaptive_ceiling():
+    drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=_tiny_text_config()))
+
+    assert _mtp_next_block_size(drafter, 4, 2, 32) == 2
+
+    drafter.accept_lens.extend([1] * 8)
+    assert _mtp_next_block_size(drafter, 4, 2, 32) == 4
+
+    drafter.accept_lens.extend([0] * 16)
+    assert _mtp_next_block_size(drafter, 4, 2, 32) == 2
 
 
 def test_qwen4_mtp_draft_block_uses_hyper_connection_hidden():

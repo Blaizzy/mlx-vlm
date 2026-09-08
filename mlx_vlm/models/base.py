@@ -346,6 +346,21 @@ def quantized_scaled_dot_product_attention(
     return out
 
 
+def _turboquant_attention_applies(cache) -> bool:
+    """Whether the fused TurboQuant kernels can serve this cache.
+
+    They read the quantized state directly, so they need one contiguous
+    sequence starting at index 0. That always holds for the single-sequence
+    cache; the batch cache qualifies only while it carries a single row with
+    no left padding (padded rows would be attended to as real tokens).
+    """
+    if not isinstance(cache, BatchTurboQuantKVCache):
+        return True
+    if not cache.is_single_row():
+        return False
+    return cache.fused_attention_eligible
+
+
 def scaled_dot_product_attention(
     queries,
     keys,
@@ -355,26 +370,28 @@ def scaled_dot_product_attention(
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
-    if isinstance(cache, TurboQuantKVCache):
-        if sinks is not None:
-            raise ValueError("TurboQuant KV cache does not support attention sinks.")
-        if queries.shape[-2] == 1:
-            return cache.decode_attention(
+    if isinstance(cache, (TurboQuantKVCache, BatchTurboQuantKVCache)):
+        # The fused kernels have no sink term, and the batch cache only shares
+        # them when it holds a single unpadded row. Anything else dequantizes,
+        # which is also the only path that can apply sinks.
+        if sinks is None and _turboquant_attention_applies(cache):
+            if queries.shape[-2] == 1:
+                return cache.decode_attention(
+                    queries,
+                    keys_state=keys,
+                    values_state=values,
+                    scale=scale,
+                    mask=mask,
+                )
+            result = cache.prefill_attention(
                 queries,
                 keys_state=keys,
                 values_state=values,
                 scale=scale,
                 mask=mask,
             )
-        result = cache.prefill_attention(
-            queries,
-            keys_state=keys,
-            values_state=values,
-            scale=scale,
-            mask=mask,
-        )
-        if result is not None:
-            return result
+            if result is not None:
+                return result
         dequantized_keys, dequantized_values = cache.dequantize(keys, values)
         return mx.fast.scaled_dot_product_attention(
             queries,
@@ -382,16 +399,7 @@ def scaled_dot_product_attention(
             dequantized_values.astype(queries.dtype),
             scale=scale,
             mask=mask,
-        )
-
-    if isinstance(cache, BatchTurboQuantKVCache):
-        dequantized_keys, dequantized_values = cache.dequantize(keys, values)
-        return mx.fast.scaled_dot_product_attention(
-            queries,
-            dequantized_keys.astype(queries.dtype),
-            dequantized_values.astype(queries.dtype),
-            scale=scale,
-            mask=mask,
+            sinks=sinks,
         )
 
     if hasattr(cache, "bits"):

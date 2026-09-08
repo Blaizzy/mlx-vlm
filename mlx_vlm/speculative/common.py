@@ -209,6 +209,22 @@ def _speculative_walk_batch_uniform_acceptance(
     return [accepted] * len(accepted_list), new_tokens_list
 
 
+def _requires_uniform_batch_acceptance(
+    draft_model: nn.Module, target_model: Optional[nn.Module] = None
+) -> bool:
+    """Whether ragged per-row acceptance must be clamped to a uniform count.
+
+    The flag is honored on either the drafter or the target model. A target's
+    dedicated drafter (e.g. qwen3_5 -> qwen3_5_mtp) may not advertise it, yet
+    the target's rectangular batch KV cache (single ``_idx``) cannot represent
+    ragged accepts without leaving phantom zeroed keys attended (issue #1962),
+    so the target may require it independently of the drafter.
+    """
+    if getattr(draft_model, "requires_uniform_batch_acceptance", False):
+        return True
+    return bool(getattr(target_model, "requires_uniform_batch_acceptance", False))
+
+
 def _record_speculative_round(
     draft_model: nn.Module, accepted: float, draft_count: int
 ) -> None:

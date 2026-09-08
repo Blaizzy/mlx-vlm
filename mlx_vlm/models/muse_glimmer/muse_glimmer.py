@@ -8,6 +8,13 @@ from .config import ModelConfig
 from .language import LanguageModel, RMSNormNoScale
 from .vision import VisionModel, gelu
 
+_NESTED_VISION_PREFIXES = (
+    "model.vision_tower.",
+    "model.vision_adapter.",
+    "model.vision_projection.",
+    "model.perception_emb_norm.",
+)
+
 
 def masked_scatter(input_tensor: mx.array, mask: mx.array, source: mx.array):
     shape = input_tensor.shape
@@ -126,9 +133,9 @@ class Model(nn.Module):
                 continue
             if key.startswith("model.language_model."):
                 key = key.replace("model.language_model.", "language_model.model.", 1)
-            elif key.startswith("model."):
+            elif key.startswith(_NESTED_VISION_PREFIXES):
                 key = key[len("model.") :]
-            elif key.startswith("lm_head."):
+            elif key.startswith(("model.", "lm_head.")):
                 key = "language_model." + key
             sanitized[key] = value
         return sanitized
