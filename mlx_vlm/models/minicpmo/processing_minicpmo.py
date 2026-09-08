@@ -329,11 +329,7 @@ class MiniCPMOProcessor(ProcessorMixin):
         return len(cls._AUDIO_MARKER_PATTERN.findall(text or ""))
 
     def prepare_audio_generation(self, prompt, *, audio=None, ref_audio_path=None):
-        """Condition the LLM on the reference voice, as in upstream get_sys_prompt.
-
-        TTS uses the LLM's hidden states in addition to text. Passing a reference
-        only to the waveform decoder leaves those states unconditioned.
-        """
+        """Condition the LLM on the reference voice."""
         if audio is None:
             audio_inputs = []
         elif isinstance(audio, list):
