@@ -688,9 +688,11 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_path():
 
     ref = qwen_verifier._target_verify_timewise(linear, x)
     out = qwen_verifier._target_verify_linear(linear, x)
-    mx.eval(ref, out)
+    public = qwen_verifier.Qwen3_5ExactSpeculativeVerifier().quantized_linear(linear, x)
+    mx.eval(ref, out, public)
 
     assert bool(mx.array_equal(ref, out).item())
+    assert bool(mx.array_equal(ref, public).item())
 
 
 def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
@@ -707,6 +709,134 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
     # The target kernel and MLX's quantized GEMM accumulate in different
     # orders, so BF16 rounding can differ by a small amount.
     assert bool(mx.allclose(ref, out, rtol=1e-2, atol=1e-2).item())
+
+
+@pytest.mark.parametrize("input_dims", [512, 6144])
+@pytest.mark.parametrize("verify_length", [1, 2, 3, 4])
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_qwen_target_verify_mxfp4_linear_matches_singleton_path_exactly(
+    input_dims, verify_length, batch_size, dtype
+):
+    mx.random.seed(25 + input_dims + verify_length + batch_size)
+    linear = nn.QuantizedLinear(
+        input_dims,
+        16,
+        bias=False,
+        group_size=32,
+        bits=4,
+        mode="mxfp4",
+    )
+    x = mx.random.normal((batch_size, verify_length, input_dims)).astype(dtype)
+
+    ref = qwen_verifier._target_verify_timewise(linear, x)
+    out = qwen_verifier._target_verify_linear(linear, x)
+    public = qwen_verifier.Qwen3_5ExactSpeculativeVerifier().quantized_linear(linear, x)
+    mx.eval(ref, out, public)
+
+    assert bool(mx.array_equal(ref, out).item())
+    assert bool(mx.array_equal(ref, public).item())
+
+
+@pytest.mark.parametrize("output_dims", [(16, 24), (16, 24, 32)])
+@pytest.mark.parametrize("verify_length", [2, 4])
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_qwen_target_verify_mxfp4_linears_fuse_exactly(
+    output_dims, verify_length, batch_size, dtype
+):
+    mx.random.seed(41 + len(output_dims))
+    linears = tuple(
+        nn.QuantizedLinear(
+            512,
+            output_dim,
+            bias=False,
+            group_size=32,
+            bits=4,
+            mode="mxfp4",
+        )
+        for output_dim in output_dims
+    )
+    x = mx.random.normal((batch_size, verify_length, 512)).astype(dtype)
+
+    ref = tuple(qwen_verifier._target_verify_timewise(linear, x) for linear in linears)
+    out = qwen_verifier._target_verify_linears(linears, x)
+    mx.eval(*ref, *out)
+
+    assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
+
+
+@pytest.mark.parametrize("output_dims", [16, 248])
+@pytest.mark.parametrize("verify_length", [2, 3, 4])
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_qwen_target_verify_mxfp4_argmax_matches_singletons(
+    output_dims, verify_length, batch_size, dtype
+):
+    mx.random.seed(59 + output_dims + verify_length + batch_size)
+    linear = nn.QuantizedLinear(
+        512,
+        output_dims,
+        bias=False,
+        group_size=32,
+        bits=4,
+        mode="mxfp4",
+    )
+    x = mx.random.normal((batch_size, verify_length, 512)).astype(dtype)
+
+    ref = mx.argmax(qwen_verifier._target_verify_timewise(linear, x), axis=-1)
+    out = qwen_verifier._target_verify_mxfp4_argmax(linear, x)
+    public = qwen_verifier.Qwen3_5ExactSpeculativeVerifier().quantized_argmax(linear, x)
+    mx.eval(ref, out, public)
+
+    assert bool(mx.array_equal(ref, out).item())
+    assert bool(mx.array_equal(ref, public).item())
+
+
+@pytest.mark.parametrize("output_dims", [16, 248])
+@pytest.mark.parametrize("verify_length", [1, 2, 4])
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_qwen_target_verify_mxfp4_masked_argmax_matches_singletons(
+    output_dims, verify_length, batch_size, dtype
+):
+    mx.random.seed(67 + output_dims + verify_length + batch_size)
+    linear = nn.QuantizedLinear(
+        512,
+        output_dims,
+        bias=False,
+        group_size=32,
+        bits=4,
+        mode="mxfp4",
+    )
+    x = mx.random.normal((batch_size, verify_length, 512)).astype(dtype)
+    allowed = [
+        (index * 32 + 7) % output_dims for index in range(batch_size * verify_length)
+    ]
+    mask_words = (output_dims + 31) // 32
+    packed_mask = []
+    for token in allowed:
+        row = [0] * mask_words
+        row[token >> 5] = 1 << (token & 31)
+        packed_mask.append(row)
+    token_mask = mx.array(packed_mask, dtype=mx.int32)
+
+    logits = qwen_verifier._target_verify_timewise(linear, x).reshape(
+        batch_size * verify_length, output_dims
+    )
+    allowed_array = mx.array(allowed, dtype=mx.int32)
+    allowed_mask = mx.arange(output_dims)[None, :] == allowed_array[:, None]
+    ref = mx.argmax(mx.where(allowed_mask, logits, -mx.inf), axis=-1).reshape(
+        batch_size, verify_length
+    )
+    out = qwen_verifier._target_verify_mxfp4_argmax(linear, x, token_mask=token_mask)
+    public = qwen_verifier.Qwen3_5ExactSpeculativeVerifier().quantized_argmax(
+        linear, x, token_mask=token_mask
+    )
+    mx.eval(ref, out, public)
+
+    assert bool(mx.array_equal(ref, out).item())
+    assert bool(mx.array_equal(ref, public).item())
 
 
 @pytest.mark.parametrize("input_dims", [512, 6144])
@@ -829,6 +959,54 @@ def test_qwen_fused_greedy_decode_uses_quantized_argmax():
             {"return_hidden": True, "skip_logits": True},
         )
     ]
+
+
+def test_qwen_fused_greedy_decode_uses_masked_mxfp4_argmax():
+    mx.random.seed(23)
+    hidden = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
+    allowed_token = 7
+
+    class MaskProcessor:
+        def prepare_next_token_mask(self, token):
+            assert token == 1
+            return mx.array([[1 << allowed_token]], dtype=mx.int32)
+
+    class Model:
+        args = SimpleNamespace(tie_word_embeddings=False)
+
+        def __init__(self):
+            self.lm_head = nn.QuantizedLinear(
+                512,
+                16,
+                bias=False,
+                group_size=32,
+                bits=4,
+                mode="mxfp4",
+            )
+
+        def __call__(self, inputs, cache=None, **kwargs):
+            return SimpleNamespace(hidden_states=[hidden])
+
+        def supports_fused_greedy_logits_processors(self, logits_processors):
+            return qwen_language.LanguageModel.supports_fused_greedy_logits_processors(
+                self, logits_processors
+            )
+
+    model = Model()
+    processors = [[MaskProcessor()]]
+    assert qwen_language.LanguageModel.supports_fused_greedy_logits_processors(
+        model, processors
+    )
+
+    out = qwen_language.LanguageModel.fused_greedy_decode(
+        model,
+        mx.array([[1]], dtype=mx.int32),
+        cache=["cache"],
+        logits_processors=processors,
+    )
+    mx.eval(out)
+
+    assert out.tolist() == [[allowed_token]]
 
 
 def test_qwen3_5_decode_quantized_linears_fused_matches_separate():
