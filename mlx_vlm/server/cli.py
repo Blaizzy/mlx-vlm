@@ -237,6 +237,11 @@ def main():
         ),
     )
     parser.add_argument(
+        "--target-verify-fuse-8bit-linears",
+        action="store_true",
+        help="Enable exact fused QMV dispatch for adjacent 8-bit verifier linears.",
+    )
+    parser.add_argument(
         "--draft-kind",
         type=str,
         default=None,
@@ -314,6 +319,9 @@ def main():
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     if args.draft_model:
         os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
+    os.environ["MLX_VLM_TARGET_VERIFY_FUSE_8BIT_LINEARS"] = (
+        "1" if args.target_verify_fuse_8bit_linears else "0"
+    )
     if args.draft_kind is not None:
         os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
     if args.draft_block_size is not None:
