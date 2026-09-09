@@ -15195,13 +15195,16 @@ class TestCacheCapacity(unittest.TestCase):
             ):
                 make_prompt_cache(object(), max_kv_size=limit)
 
-    def assert_visible_tokens(self, cache, chunks, positions=None, window_size=None):
+    def assert_visible_tokens(
+        self, cache, chunks, positions=None, window_size=None, lengths=None
+    ):
         if positions is None:
             positions = np.array(cache.offset).reshape(-1)
+        keep = getattr(cache, "keep", 0)
         for length in chunks:
             p = positions[:, None] + np.arange(length)
             data = mx.array(p[:, None, :, None], dtype=mx.float32)
-            mask = cache.make_mask(length, window_size=window_size)
+            mask = cache.make_mask(length, window_size=window_size, return_array=True)
             keys, values = cache.update_and_fetch(data, data)
             mx.eval(mask, keys, values)
             keys = np.array(keys)
@@ -15216,15 +15219,17 @@ class TestCacheCapacity(unittest.TestCase):
                     position = int(p[row, col])
                     if position < 0:
                         continue
-                    expected = set(range(min(position + 1, cache.keep)))
+                    if lengths is not None and position >= lengths[row]:
+                        continue
+                    expected = set(range(min(position + 1, keep)))
                     expected.update(
                         range(
                             max(
-                                cache.keep,
+                                keep,
                                 position
                                 - min(
                                     window_size or cache.max_size,
-                                    cache.max_size - cache.keep,
+                                    cache.max_size - keep,
                                 )
                                 + 1,
                             ),
@@ -15245,9 +15250,13 @@ class TestCacheCapacity(unittest.TestCase):
                 with self.subTest(padding=padding, chunks=chunks):
                     cache = BatchPrefixKVCache(8, padding, keep=2)
                     positions = self.assert_visible_tokens(cache, chunks)
-                    restored = BatchPrefixKVCache.from_state(
-                        cache.state, cache.meta_state
+                    snapshot = tree_map(
+                        lambda x: (
+                            mx.array(np.array(x)) if isinstance(x, mx.array) else x
+                        ),
+                        cache.state,
                     )
+                    restored = BatchPrefixKVCache.from_state(snapshot, cache.meta_state)
                     self.assert_visible_tokens(restored, [1, 3], positions.copy())
                     merged = BatchPrefixKVCache.merge(
                         [cache.extract(i) for i in range(2)]
@@ -15265,6 +15274,64 @@ class TestCacheCapacity(unittest.TestCase):
                 BatchPrefixKVCache(8, [0], keep=4),
             ):
                 self.assert_visible_tokens(cache, chunks, window_size=2)
+
+    def test_attention_window_cannot_exceed_retained_history(self):
+        from mlx_vlm.models.cache import (
+            BatchPrefixKVCache,
+            BatchRotatingKVCache,
+            RotatingKVCache,
+        )
+
+        for capacity, keep in ((2, 0), (2, 1), (8, 0), (8, 4)):
+            for chunks in ([1] * 25, [4, 7, 14]):
+                for window in (1, capacity, capacity * 2):
+                    with self.subTest(
+                        capacity=capacity, keep=keep, chunks=chunks, window=window
+                    ):
+                        batched = (
+                            BatchPrefixKVCache(capacity, [0], keep)
+                            if keep
+                            else BatchRotatingKVCache(capacity, [0])
+                        )
+                        for cache in (RotatingKVCache(capacity, keep), batched):
+                            self.assert_visible_tokens(
+                                cache, chunks, window_size=window
+                            )
+
+    def test_padded_prefill_mask_matches_concat_layout(self):
+        from mlx_vlm.models.cache import BatchPrefixKVCache, BatchRotatingKVCache
+
+        for keep in (0, 2, 4):
+            for window in (None, 2, 16):
+                for warm_chunks in ([], [11, 1]):
+                    for chunks in ([1] * 20, [5, 7, 7, 1]):
+                        with self.subTest(
+                            keep=keep, window=window, warm=warm_chunks, chunks=chunks
+                        ):
+                            cache = (
+                                BatchPrefixKVCache(8, [0, 0], keep)
+                                if keep
+                                else BatchRotatingKVCache(8, [0, 0])
+                            )
+                            positions = self.assert_visible_tokens(
+                                cache, warm_chunks, window_size=window
+                            )
+                            lengths = positions + np.array([5, 20])
+                            cache.prepare(lengths=[5, 20], right_padding=[15, 0])
+                            self.assert_visible_tokens(
+                                cache,
+                                chunks,
+                                positions.copy(),
+                                window_size=window,
+                                lengths=lengths,
+                            )
+                            cache.finalize()
+                            np.testing.assert_array_equal(
+                                np.array(cache.offset), lengths
+                            )
+                            self.assert_visible_tokens(
+                                cache, [1, 3], lengths.copy(), window_size=window
+                            )
 
     def test_batch_generation_receives_the_requested_limit(self):
         from mlx_vlm.generate.ar import BatchGenerator
@@ -15356,7 +15423,8 @@ class TestCacheCapacity(unittest.TestCase):
             num_key_value_heads=2,
             head_dim=8,
             vocab_size=64,
-            sliding_window_pattern=1,
+            sliding_window=16,
+            sliding_window_pattern=2,
         )
         model = LanguageModel(config)
         model.eval()

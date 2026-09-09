@@ -743,7 +743,7 @@ class RotatingKVCache(_BaseCache):
                 (positions < self.keep) | (queries < positions + recent)
             )
         if N > 1:
-            window_size = window_size or self.max_size
+            window_size = min(window_size or self.max_size, self.max_size)
             offset = min(self.max_size - 1, self.offset)
             if offset + N > window_size or return_array:
                 return create_causal_mask(N, offset, window_size=window_size)
@@ -1523,12 +1523,15 @@ class BatchRotatingKVCache(_BaseCache):
             )
         return self.keys, self.values
 
+    def _uses_in_place_update(self, N):
+        return N == 1 and self._lengths is None
+
     def update_and_fetch(self, keys, values):
         # Single-token updates normally use the in-place decode path. While
         # right-padding bookkeeping is active (_lengths set by prepare()), the
         # last prefill step may still be S=1; that must go through concat so
         # pad tokens are tracked until finalize() rolls them out.
-        if keys.shape[2] == 1 and self._lengths is None:
+        if self._uses_in_place_update(keys.shape[2]):
             return self._update_in_place(keys, values)
         return self._update_concat(keys, values)
 
@@ -1595,7 +1598,8 @@ class BatchRotatingKVCache(_BaseCache):
         self, N: int, window_size: Optional[int] = None, return_array: bool = False
     ):
         left_padding = self.left_padding
-        window_size = window_size or self.max_size
+        window_size = min(window_size or self.max_size, self.max_size)
+        in_place = self._uses_in_place_update(N)
         offset = min(self.max_size - 1, self._offset)
         rinds = mx.arange(offset + N)
         linds = mx.arange(offset, offset + N) if offset else rinds
@@ -1603,10 +1607,11 @@ class BatchRotatingKVCache(_BaseCache):
         rinds = rinds[None]
         mask = linds >= rinds
         mask &= linds < rinds + window_size
-        if (trim_size := self._idx - self.max_size + int(N > 1)) > 0:
+        idx = self.keys.shape[2] if self.rotated and not in_place else self._idx
+        if (trim_size := idx - self.max_size + int(not in_place)) > 0:
             left_padding = left_padding - trim_size
 
-        rotated = N == 1 and (self.rotated or self._idx >= self.max_size)
+        rotated = in_place and (self.rotated or self._idx >= self.max_size)
         if rotated:
             left_padding = left_padding - 1
 
@@ -1834,7 +1839,9 @@ class BatchPrefixKVCache(_BaseCache):
         prefix_mask = queries[..., None] >= mx.arange(self.keep)
         positions = self.offset[:, None] - retained + mx.arange(retained + N)
         tail_valid = positions >= self.keep
-        if N == 1 and (self.tail.rotated or self.tail._idx >= self.tail.max_size):
+        if self.tail._uses_in_place_update(N) and (
+            self.tail.rotated or self.tail._idx >= self.tail.max_size
+        ):
             idx = self.tail._idx if self.tail._idx < self.tail.max_size else 0
             tail_valid = mx.roll(tail_valid, idx + 1, axis=-1)
         tail_mask = tail_mask & tail_valid[:, None, None, :]
