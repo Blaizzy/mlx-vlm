@@ -2396,11 +2396,16 @@ def prepare_inputs(
         audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
 
     video_fps = None
+    supplied_video_metadata = kwargs.pop("video_metadata", None)
     video_metadata = None
     if has_videos:
         if not isinstance(videos, list):
             videos = [videos]
         sampling = resolve_video_sampling(processor, kwargs)
+        if supplied_video_metadata is not None and len(supplied_video_metadata) != len(
+            videos
+        ):
+            raise ValueError("Expected one video_metadata entry per video.")
         component = getattr(processor, "video_processor", None)
         frame_sampler = (
             getattr(component, "sample_frames", None)
@@ -2408,7 +2413,7 @@ def prepare_inputs(
             else None
         )
         loaded, video_fps, video_metadata = [], [], []
-        for v in videos:
+        for video_index, v in enumerate(videos):
             if isinstance(v, (str, bytes, Path)):
                 arr, metadata = load_video(
                     str(v), sampling, frame_sampler=frame_sampler
@@ -2432,6 +2437,10 @@ def prepare_inputs(
                     fps=sampling.fps,
                     frames_indices=list(range(len(v))),
                 )
+                if supplied_video_metadata is not None:
+                    metadata = supplied_video_metadata[video_index]
+                    if isinstance(metadata, dict):
+                        metadata = VideoMetadata(**metadata)
             loaded.append(arr)
             video_fps.append(metadata.sampled_fps)
             video_metadata.append(metadata)
