@@ -1244,7 +1244,7 @@ def test_load_model_matches_deepseek_v4_quantization_aliases():
     assert head_spec == {}
 
 
-def test_load_model_uses_qwen_fine_grained_fp8_quantization_config():
+def test_load_model_transforms_fine_grained_fp8_by_format():
     class FakeConfig:
         @classmethod
         def from_dict(cls, config):
@@ -1262,7 +1262,7 @@ def test_load_model_uses_qwen_fine_grained_fp8_quantization_config():
 
     fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeQwenModel)
     source_config = {
-        "model_type": "qwen3_5",
+        "model_type": "future_compatible_model",
         "quantization_config": {
             "quant_method": "fp8",
             "fmt": "e4m3",
@@ -1279,22 +1279,26 @@ def test_load_model_uses_qwen_fine_grained_fp8_quantization_config():
         patch(
             "mlx_vlm.utils._load_safetensors",
             return_value={
-                "proj.weight": mx.zeros((128, 32), dtype=mx.uint32),
-                "proj.scales": mx.zeros((128, 4), dtype=mx.uint8),
+                "proj.weight": mx.zeros((128, 128), dtype=mx.uint8),
+                "proj.weight_scale_inv": mx.ones((1, 1), dtype=mx.bfloat16),
             },
         ),
         patch(
             "mlx_vlm.utils.get_model_and_args",
-            return_value=(fake_model_class, "qwen3_5"),
+            return_value=(fake_model_class, "future_compatible_model"),
         ),
         patch("mlx_vlm.utils.nn.quantize") as quantize,
     ):
-        load_model(Path("/tmp/model"), lazy=True)
+        model = load_model(Path("/tmp/model"), lazy=True)
 
     quantize.assert_called_once()
     assert quantize.call_args.kwargs["group_size"] == 32
     assert quantize.call_args.kwargs["bits"] == 8
     assert quantize.call_args.kwargs["mode"] == "mxfp8"
+    loaded = dict(model.loaded_weights)
+    assert loaded["proj.weight"].dtype == mx.uint32
+    assert loaded["proj.scales"].dtype == mx.uint8
+    assert "proj.weight_scale_inv" not in loaded
 
 
 def test_load_model_quantizes_projector_with_scales_when_skip_vision():

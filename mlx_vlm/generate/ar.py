@@ -26,6 +26,7 @@ from ..sample_utils import (
     top_p_sampling,
 )
 from ..speculative.utils import (
+    SpeculativePrefill,
     make_speculative_prompt_cache,
     run_speculative_rounds,
     run_speculative_server_rounds,
@@ -346,6 +347,7 @@ def generate_step(
 
     # Speculative decoding setup
     last_outputs = None
+    speculative_prefill = SpeculativePrefill(draft_kind, draft_model)
     speculative_prefill_capture_kwargs = {}
     if draft_model is not None:
         from ..speculative.drafters import validate_drafter_compatibility
@@ -489,16 +491,18 @@ def generate_step(
                         and processed_tokens + n_to_process > checkpoint_lengths[0]
                     ):
                         n_to_process = checkpoint_lengths[0] - processed_tokens
-                    chunk_kwargs = kwargs
+                    chunk_kwargs = {**kwargs, **speculative_prefill.kwargs}
                     if getattr(model.language_model, "supports_logits_to_keep", False):
-                        chunk_kwargs = {**kwargs, "logits_to_keep": 1}
-                    model.language_model(
+                        chunk_kwargs = {**chunk_kwargs, "logits_to_keep": 1}
+                    chunk_output = model.language_model(
                         inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
                         cache=prompt_cache,
                         n_to_process=n_to_process,
                         **chunk_kwargs,
                     )
+                    speculative_prefill.append(chunk_output)
+                    del chunk_output
                     quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
                     processed_tokens += n_to_process
@@ -518,6 +522,7 @@ def generate_step(
 
     # Speculative decoding
     if draft_model is not None:
+        last_outputs = speculative_prefill.finish(last_outputs)
         yield from run_speculative_rounds(
             model,
             draft_model,
@@ -1755,6 +1760,7 @@ class PromptProcessingBatch:
         self._prompt_uids = list(uids)
         self.max_tokens = max_tokens
         self.prefill_step_size = prefill_step_size
+        self._speculative_prefill = SpeculativePrefill(draft_kind, draft_model)
         self.draft_model = draft_model
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
@@ -2061,7 +2067,10 @@ class PromptProcessingBatch:
             n = min(n, checkpoint_col - self._processed_prompt_columns)
         if n <= 0:
             return 0
-        prompt_kwargs = self._prompt_kwargs_for_step(n)
+        prompt_kwargs = {
+            **self._prompt_kwargs_for_step(n),
+            **self._speculative_prefill.kwargs,
+        }
         output = self.model(
             self._input_ids[:, :n],
             cache=self.prompt_cache,
@@ -2069,6 +2078,7 @@ class PromptProcessingBatch:
             n_to_process=n,
             **prompt_kwargs,
         )
+        self._speculative_prefill.append(output)
         if self._right_pad_per_row is not None:
             end = self._processed_prompt_columns + n
             finished_rows = [
@@ -2128,6 +2138,7 @@ class PromptProcessingBatch:
             inputs_embeds=self._inputs_embeds,
             **call_kwargs,
         )
+        output = self._speculative_prefill.finish(output)
         logits = output.logits if hasattr(output, "logits") else output
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
             # Short rows may have finished in an earlier prefill chunk. Their
