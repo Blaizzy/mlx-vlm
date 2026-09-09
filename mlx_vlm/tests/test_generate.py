@@ -210,49 +210,9 @@ class TestGenerationResult:
         assert result.generation_tps == 0.0
         assert result.peak_memory == 0.0
 
-    def test_with_values(self):
-        result = GenerationResult(
-            text="Hello world",
-            token=42,
-            logprobs=[0.1, 0.2, 0.3],
-            prompt_tokens=10,
-            generation_tokens=5,
-            total_tokens=15,
-            prompt_tps=100.0,
-            generation_tps=50.0,
-            peak_memory=2.5,
-        )
-        assert result.text == "Hello world"
-        assert result.token == 42
-        assert result.logprobs == [0.1, 0.2, 0.3]
-        assert result.prompt_tokens == 10
-        assert result.generation_tokens == 5
-        assert result.total_tokens == 15
-        assert result.prompt_tps == 100.0
-        assert result.generation_tps == 50.0
-        assert result.peak_memory == 2.5
-
 
 class TestBatchGenerationResult:
     """Tests for BatchGenerationResult dataclass."""
-
-    def test_creation(self):
-        result = BatchGenerationResult(
-            texts=["Hello", "World"],
-            tokens=[1, 2],
-            logprobs=[[0.1], [0.2]],
-            prompt_tokens=[10, 12],
-            generation_tokens=[5, 6],
-            total_tokens=[15, 18],
-            prompt_tps=[100.0, 110.0],
-            generation_tps=[50.0, 55.0],
-            peak_memory=3.0,
-            image_sizes=[(224, 224), (336, 336)],
-        )
-        assert result.texts == ["Hello", "World"]
-        assert result.tokens == [1, 2]
-        assert result.peak_memory == 3.0
-        assert result.image_sizes == [(224, 224), (336, 336)]
 
     def test_optional_image_sizes(self):
         result = BatchGenerationResult(
@@ -281,34 +241,9 @@ class TestBatchStats:
         assert stats.generation_time == 0
         assert stats.peak_memory == 0
 
-    def test_with_values(self):
-        stats = BatchStats(
-            prompt_tokens=100,
-            prompt_tps=500.0,
-            prompt_time=0.2,
-            generation_tokens=50,
-            generation_tps=250.0,
-            generation_time=0.2,
-            peak_memory=4.0,
-        )
-        assert stats.prompt_tokens == 100
-        assert stats.prompt_tps == 500.0
-        assert stats.generation_tokens == 50
-
 
 class TestBatchResponse:
     """Tests for BatchResponse dataclass."""
-
-    def test_creation(self):
-        stats = BatchStats(prompt_tokens=100)
-        response = BatchResponse(
-            texts=["Hello", "World"],
-            stats=stats,
-            image_sizes=[(224, 224), (336, 336)],
-        )
-        assert response.texts == ["Hello", "World"]
-        assert response.stats.prompt_tokens == 100
-        assert response.image_sizes == [(224, 224), (336, 336)]
 
     def test_optional_image_sizes(self):
         stats = BatchStats()
@@ -764,15 +699,6 @@ class TestBatchGenerator:
         async_eval_mock.assert_called_once_with([cache_state])
         eval_mock.assert_not_called()
         batch._store_apc_exact_checkpoints.assert_called_once_with()
-
-    def test_response_dataclass(self):
-        response = GenerationBatch.Response(
-            uid=0, token=42, token_logprob=-0.5, finish_reason="stop"
-        )
-
-        assert response.uid == 0
-        assert response.token == 42
-        assert response.finish_reason == "stop"
 
     def test_generation_batch_applies_per_sequence_logits_processors(self):
         class FixedLogitModel:
@@ -1390,9 +1316,22 @@ class TestBatchGenerate:
         mock_generate_batch.side_effect = [
             (
                 ["Response 1", "Response 3"],
-                BatchStats(prompt_tokens=20, generation_tokens=10),
+                BatchStats(
+                    prompt_tokens=20,
+                    prompt_time=0.1,
+                    generation_tokens=10,
+                    generation_time=0.2,
+                ),
             ),
-            (["Response 2"], BatchStats(prompt_tokens=10, generation_tokens=5)),
+            (
+                ["Response 2"],
+                BatchStats(
+                    prompt_tokens=10,
+                    prompt_time=0.15,
+                    generation_tokens=5,
+                    generation_time=0.3,
+                ),
+            ),
         ]
 
         prompts = ["Prompt 1", "Prompt 2", "Prompt 3"]
@@ -1410,6 +1349,13 @@ class TestBatchGenerate:
         assert mock_generate_batch.call_count == 2
         # All 3 responses should be present
         assert len(response.texts) == 3
+        # Check aggregation through batch_generate itself, across both groups.
+        assert response.stats.prompt_tokens == 30
+        assert response.stats.prompt_time == pytest.approx(0.25)
+        assert response.stats.generation_tokens == 15
+        assert response.stats.generation_time == pytest.approx(0.5)
+        assert response.stats.prompt_tps == pytest.approx(120.0)
+        assert response.stats.generation_tps == pytest.approx(30.0)
 
     @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
@@ -1602,57 +1548,6 @@ class TestBatchGenerate:
 
 
 # ============================================================================
-# Tests for stats aggregation
-# ============================================================================
-
-
-class TestBatchStatsAggregation:
-    """Tests for stats aggregation in batch generation."""
-
-    def test_stats_accumulation(self):
-        """Test that stats are properly accumulated across batches."""
-        total_stats = BatchStats()
-
-        # Simulate processing multiple batches
-        batch_stats = [
-            BatchStats(
-                prompt_tokens=100,
-                prompt_time=0.1,
-                generation_tokens=50,
-                generation_time=0.2,
-            ),
-            BatchStats(
-                prompt_tokens=150,
-                prompt_time=0.15,
-                generation_tokens=75,
-                generation_time=0.3,
-            ),
-        ]
-
-        for stats in batch_stats:
-            total_stats.prompt_tokens += stats.prompt_tokens
-            total_stats.prompt_time += stats.prompt_time
-            total_stats.generation_tokens += stats.generation_tokens
-            total_stats.generation_time += stats.generation_time
-
-        assert total_stats.prompt_tokens == 250
-        assert total_stats.prompt_time == pytest.approx(0.25)
-        assert total_stats.generation_tokens == 125
-        assert total_stats.generation_time == pytest.approx(0.5)
-
-        # Calculate TPS
-        if total_stats.prompt_time > 0:
-            total_stats.prompt_tps = total_stats.prompt_tokens / total_stats.prompt_time
-        if total_stats.generation_time > 0:
-            total_stats.generation_tps = (
-                total_stats.generation_tokens / total_stats.generation_time
-            )
-
-        assert total_stats.prompt_tps == pytest.approx(1000.0)
-        assert total_stats.generation_tps == pytest.approx(250.0)
-
-
-# ============================================================================
 # Edge Cases
 # ============================================================================
 
@@ -1690,14 +1585,6 @@ class TestEdgeCases:
         # First prompt should have 998 padding tokens
         assert padded[0, 0].item() == 0
         assert padded[0, -1].item() == 2
-
-    def test_batch_response_with_empty_texts(self):
-        """Test BatchResponse with empty texts."""
-        stats = BatchStats()
-        response = BatchResponse(texts=[], stats=stats)
-
-        assert response.texts == []
-        assert response.image_sizes is None
 
 
 # ============================================================================

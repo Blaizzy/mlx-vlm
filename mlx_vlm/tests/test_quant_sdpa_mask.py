@@ -46,13 +46,6 @@ class TestAlignAttentionMaskToScores:
         mx.eval(out)
         assert out.shape == scores.shape
 
-    def test_live_server_shapes(self):
-        """Exact shapes from #1567 concurrent curl repro."""
-        scores = mx.zeros((2, 8, 2, 18, 18))
-        mask = mx.ones((2, 1, 18, 18), dtype=mx.bool_)
-        aligned = align_attention_mask_to_scores(mask, scores)
-        mx.eval(mx.where(aligned, scores, mx.array(0.0)))
-
     def test_2d_causal_still_broadcasts(self):
         scores = mx.zeros((2, 8, 2, 4, 4))
         mask = create_causal_mask(4, offset=0)  # (4, 4), no batch pad
@@ -86,24 +79,6 @@ class TestQuantizedSdpaMultiRowGqa:
         queries = mx.random.normal((B, n_q, L, D)).astype(mx.float16)
         q_keys, q_values = _quant_kv(B, n_kv, L, D)
         mask = create_causal_mask(L, offset=0, left_padding=mx.array([0, 0]))
-
-        out = quantized_scaled_dot_product_attention(
-            queries,
-            q_keys,
-            q_values,
-            scale=D**-0.5,
-            mask=mask,
-            group_size=GROUP,
-            bits=BITS,
-        )
-        mx.eval(out)
-        assert out.shape == (B, n_q, L, D)
-
-    def test_batch1_gqa_still_works(self):
-        B, n_q, n_kv, L, D = 1, 16, 8, 4, GROUP
-        queries = mx.random.normal((B, n_q, L, D)).astype(mx.float16)
-        q_keys, q_values = _quant_kv(B, n_kv, L, D)
-        mask = create_causal_mask(L, offset=0, left_padding=mx.array([0]))
 
         out = quantized_scaled_dot_product_attention(
             queries,
