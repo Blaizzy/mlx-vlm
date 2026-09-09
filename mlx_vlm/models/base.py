@@ -1,5 +1,6 @@
 import inspect
 import math
+import warnings
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -100,19 +101,26 @@ class InputEmbeddingsFeatures:
         }
 
 
+class UnusedConfigKeysWarning(UserWarning):
+    """Keys were dropped by a model configuration parser."""
+
+
 @dataclass
 class BaseModelConfig:
     @classmethod
     def from_dict(cls, params):
         if not params:
             return cls()
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+        parameters = inspect.signature(cls).parameters
+        unused = sorted(params.keys() - parameters.keys())
+        if unused:
+            warnings.warn(
+                f"{cls.__module__}.{cls.__name__} does not use configuration keys: "
+                + ", ".join(unused),
+                UnusedConfigKeysWarning,
+                stacklevel=2,
+            )
+        return cls(**{k: v for k, v in params.items() if k in parameters})
 
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items() if v is not None}
