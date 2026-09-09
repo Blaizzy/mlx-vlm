@@ -1,102 +1,112 @@
-"""Shared cache transactions for speculative verification rollback."""
+"""Request-owned speculative state and bounded cache transactions.
 
-from typing import Any, Iterable, Optional
+Models perform ordinary forwards. The cache records temporal states, discards
+unaccepted inputs, and aligns the MTP tokens with verified target features.
+"""
+
+from dataclasses import dataclass
 
 import mlx.core as mx
 
-from ..models.cache import BatchRotatingKVCache, CacheList, RotatingKVCache
+from ..models.cache import (
+    ArraysCache,
+    BatchKVCache,
+    BatchPoolingCache,
+    BatchQuantizedKVCache,
+    CacheList,
+    KVCache,
+    PoolingCache,
+    QuantizedKVCache,
+)
 
 
-class _RotatingCacheTransaction:
-    """Record incoming KV while the serving cache keeps its native layout."""
-
-    def __init__(self, cache):
-        self.cache = cache
-        self.update = cache.update_and_fetch
-        if isinstance(self.update, _RotatingCacheTransaction):
-            raise RuntimeError("A rotating cache transaction is already active.")
-        self.original = {
-            name: mx.array(value) if isinstance(value, mx.array) else value
-            for name, value in cache.__dict__.items()
-        }
-        self.updates = []
-        cache.update_and_fetch = self
-
-    def __call__(self, keys, values):
-        self.updates.append((mx.array(keys), mx.array(values)))
-        return self.update(keys, values)
-
-    def abort(self):
-        self.cache.__dict__.clear()
-        self.cache.__dict__.update(self.original)
-        self.updates.clear()
-
-    def validate(self, lengths):
-        if len(set(lengths)) > 1 and not isinstance(self.cache, BatchRotatingKVCache):
-            raise RuntimeError("This rotating cache requires uniform acceptance.")
-
-    def commit(self, lengths, length):
-        cache = self.cache
-        if all(value == length for value in lengths):
-            if "update_and_fetch" in self.original:
-                cache.update_and_fetch = self.original["update_and_fetch"]
-            else:
-                del cache.update_and_fetch
-        else:
-            updates = self.updates[:]
-            self.abort()
-            keep = max(lengths)
-            ragged = len(set(lengths)) > 1
-            if ragged:
-                cache.prepare(
-                    lengths=lengths,
-                    right_padding=[keep - value for value in lengths],
-                )
-            for keys, values in updates:
-                count = min(keep, keys.shape[2])
-                if count:
-                    cache.update_and_fetch(keys[..., :count, :], values[..., :count, :])
-                    keep -= count
-                if not keep:
-                    break
-            if ragged:
-                cache.finalize()
-        self.updates.clear()
-
-
-def iter_leaf_caches(caches: Iterable[Any]):
-    """Yield non-container caches from a possibly nested cache sequence."""
+def iter_leaf_caches(caches):
     for cache in caches:
-        if cache is None:
-            continue
         if isinstance(cache, CacheList):
             yield from iter_leaf_caches(cache.caches)
-        else:
+        elif cache is not None:
             yield cache
 
 
-class SpeculativeCacheTransaction:
-    """A bounded transaction over temporal and append-only caches."""
+class CacheTransaction:
+    """Retain a per-row input prefix, using each cache's own rollback logic.
 
-    def __init__(self, entries, positions, caches, length):
-        self.caches = tuple(caches)
-        self.length = int(length)
-        self._entries = entries
-        self._positions = positions
-        self._rotating = {}
-        self._active = True
+    Append-only caches need only a cursor. Recurrent and pooling caches own
+    their bounded histories. Unsupported cache types fail before any forward.
+    """
 
-    @property
-    def active(self):
-        return self._active
+    temporal_types = (ArraysCache, PoolingCache, BatchPoolingCache)
+    append_types = (KVCache, QuantizedKVCache, BatchKVCache, BatchQuantizedKVCache)
+    batch_types = (BatchKVCache, BatchQuantizedKVCache)
 
-    def validate(self, lengths) -> None:
-        if not self._active:
-            raise RuntimeError("Speculative cache transaction is no longer active.")
-        for cache, generation in self._entries:
+    @classmethod
+    def check_types(cls, caches):
+        for cache in iter_leaf_caches(caches):
+            if type(cache) not in cls.temporal_types + cls.append_types:
+                raise ValueError(
+                    f"Speculative decoding does not support {type(cache).__name__}."
+                )
+
+    def __init__(self, caches, length):
+        if length < 1:
+            raise ValueError("A cache transaction requires a positive input length.")
+        self.length = length
+        self.active = True
+        self.temporal = []
+        self.append = []
+        leaves = tuple({id(c): c for c in iter_leaf_caches(caches)}.values())
+        self.check_types(leaves)
+        try:
+            for cache in leaves:
+                if isinstance(cache, self.temporal_types):
+                    self.temporal.append((cache, cache.start_speculation(length)))
+                else:
+                    cursor = "_idx" if isinstance(cache, self.batch_types) else "offset"
+                    self.append.append((cache, cursor, getattr(cache, cursor)))
+        except BaseException:
+            self.abort()
+            raise
+
+    def validate(self, lengths):
+        if not self.active:
+            raise RuntimeError("The cache transaction has already finished.")
+        if not lengths or any(n < 0 or n > self.length for n in lengths):
+            raise ValueError(f"Retained lengths must be between 0 and {self.length}.")
+        for cache, generation in self.temporal:
             cache.validate_speculation(lengths, generation)
-        for transaction in self._rotating.values():
-            transaction.validate(lengths)
+        for cache, cursor, initial in self.append:
+            advance = getattr(cache, cursor) - initial
+            if advance not in (0, self.length):
+                raise RuntimeError(
+                    "Cache did not consume the complete verification block."
+                )
+            if len(set(lengths)) > 1 and not isinstance(cache, self.batch_types):
+                raise ValueError("Ragged acceptance requires a batch cache.")
+
+    def commit(self, lengths):
+        lengths = list(lengths)
+        self.validate(lengths)
+        keep = max(lengths)
+        padding = [keep - n for n in lengths]
+        for cache, generation in self.temporal:
+            cache.commit_speculation(lengths, generation)
+        for cache, cursor, initial in self.append:
+            if getattr(cache, cursor) == initial:
+                continue  # Optional attention side cache was not used.
+            cache.trim(self.length - keep)
+            if any(padding):
+                cache.prepare(right_padding=padding)
+                cache.finalize()
+        self.active = False
+
+    def abort(self):
+        if not self.active:
+            return
+        for cache, generation in self.temporal:
+            cache.abort_speculation(generation)
+        for cache, cursor, initial in self.append:
+            cache.trim(getattr(cache, cursor) - initial)
+        self.active = False
 
     def __enter__(self):
         return self
@@ -104,195 +114,146 @@ class SpeculativeCacheTransaction:
     def __exit__(self, *_):
         self.abort()
 
-    def commit(self, lengths) -> None:
-        """Retain exactly these input positions, including append-only caches."""
-        if isinstance(lengths, int):
-            batch = next((c.batch_size for c, _ in self._entries), 1)
-            lengths = [lengths] * batch
-        elif isinstance(lengths, mx.array):
-            lengths = lengths.reshape(-1).tolist()
-        lengths = [int(value) for value in lengths]
-        if not lengths or any(value < 0 or value > self.length for value in lengths):
-            raise ValueError(f"Commit lengths must be between 0 and {self.length}.")
-        self.validate(lengths)
-        _trim_append_caches(self.caches, lengths, self.length, self)
-        for cache, generation in self._entries:
-            cache.commit_speculation(lengths, generation)
-        for transaction in self._rotating.values():
-            transaction.commit(lengths, self.length)
-        self._rotating.clear()
-        self._active = False
 
-    def abort(self) -> None:
-        if not self._active:
+class SpeculativePrefill:
+    """Collect target features across chunks for the shifted MTP prefill."""
+
+    def __init__(self, draft_kind, drafter, tokens=None):
+        self.kwargs = {"return_hidden": True} if drafter is not None else {}
+        self.tokens = tokens
+        self.chunks = []
+
+    def append(self, output):
+        if self.kwargs:
+            hidden = output.hidden_states[-1]
+            mx.async_eval(hidden)
+            self.chunks.append(hidden)
+
+    def finish(self, output):
+        if self.chunks:
+            output.hidden_states = [
+                mx.concatenate([*self.chunks, output.hidden_states[-1]], axis=1)
+            ]
+            self.chunks.clear()
+        return output
+
+
+@dataclass
+class DraftState:
+    token: mx.array
+    hidden: mx.array
+
+
+class SpeculativeCache:
+    """One request's target cache, MTP cache, positions, and hidden states.
+
+    Both caches end each round at the same logical position. Draft expansions
+    are temporary: after verification, MTP extends only with accepted tokens
+    and *target* hidden states. No model holds a seed or a rollback snapshot.
+    """
+
+    def __init__(self, target_cache, draft_cache, position, bonus):
+        self.target = target_cache
+        self.draft = draft_cache
+        self.position = mx.array(position, dtype=mx.int32).reshape(-1)
+        self.bonus = bonus.reshape(-1, 1)
+        self.seed = None
+        self._target_round = None
+        self._draft_round = None
+        self._verified_hidden = None
+
+    def prefill(self, tokens, hidden, forward):
+        if tokens.shape[:2] != hidden.shape[:2] or tokens.shape[1] == 0:
+            raise ValueError(
+                "MTP requires target hidden states for every prompt token."
+            )
+        if max((c.size() for c in self.target), default=0) > tokens.shape[1]:
+            raise ValueError(
+                "MTP requires a complete prompt prefill; target-only prefix caches cannot restore its draft state."
+            )
+        shifted = mx.concatenate([tokens[:, 1:], self.bonus], axis=1)
+        logits, draft_hidden = forward(shifted, hidden, self.draft, self.position)
+        self.position = self.position + tokens.shape[1]
+        self.seed = DraftState(mx.argmax(logits, axis=-1), draft_hidden[:, -1:])
+
+    def propose(self, count, forward):
+        if self._target_round is not None:
+            raise RuntimeError("The previous speculative round has not finished.")
+        if count < 0 or self.seed is None:
+            raise ValueError("Prefill the MTP cache before proposing tokens.")
+        self._target_round = CacheTransaction(self.target, count + 1)
+        try:
+            if count == 0:
+                return self.bonus[:, :0]
+            token, hidden = self.seed.token, self.seed.hidden
+            proposals = [token]
+            if count > 1:
+                self._draft_round = CacheTransaction(self.draft, count - 1)
+            for step in range(count - 1):
+                logits, hidden = forward(
+                    token, hidden, self.draft, self.position + step
+                )
+                token = mx.argmax(logits, axis=-1)
+                proposals.append(token)
+            return mx.concatenate(proposals, axis=1).astype(self.bonus.dtype)
+        except BaseException:
+            self.abort()
+            raise
+
+    def verify_inputs(self, proposals):
+        return mx.concatenate([self.bonus, proposals], axis=1)
+
+    def record_verification(self, hidden):
+        self._verified_hidden = hidden
+
+    def commit(self, tokens, forward):
+        """Commit exactly the outputs delivered to each row, even on close()."""
+        lengths = [len(row) for row in tokens]
+        if not any(lengths):
+            self.abort()
             return
-        for cache, generation in self._entries:
-            cache.abort_speculation(generation)
-        for transaction in self._rotating.values():
-            transaction.abort()
-        self._rotating.clear()
-        for cache, read_position, initial in self._positions.values():
-            advance = read_position() - initial
-            if advance > 0:
-                cache.trim(advance)
-        self._active = False
-
-    def cache_advance(self, cache) -> Optional[int]:
-        entry = self._positions.get(id(cache))
-        if entry is None:
-            return None
-        return entry[1]() - entry[2]
-
-
-def _cache_position_reader(cache):
-    """Resolve each legacy cache's physical cursor once when binding a round."""
-    for name in ("offset", "_offset", "_idx"):
-        if isinstance(getattr(cache, name, None), int):
-            return lambda name=name: getattr(cache, name)
-    size = getattr(cache, "size", None)
-    return size if callable(size) and isinstance(size(), int) else None
-
-
-def start_speculative_cache(
-    caches: Iterable[Any], length: int, cache_types: Optional[tuple] = None
-):
-    """Track append positions and start each capable temporal cache."""
-    leaves = tuple({id(c): c for c in iter_leaf_caches(caches)}.values())
-    entries = []
-    positions = {}
-    transaction = SpeculativeCacheTransaction(entries, positions, leaves, length)
-    try:
-        for cache in leaves:
-            if isinstance(cache, (RotatingKVCache, BatchRotatingKVCache)):
-                # A block append may evict or rotate the serving window. Merely
-                # decrementing its cursor exposes rejected keys on the next
-                # decode. Retain the bounded window and replay accepted KV only.
-                transaction._rotating[id(cache)] = _RotatingCacheTransaction(cache)
-                continue
-            start = getattr(cache, "start_speculation", None)
-            if callable(start) and (
-                cache_types is None or isinstance(cache, cache_types)
-            ):
-                entries.append((cache, start(length)))
-            else:
-                read_position = _cache_position_reader(cache)
-                if read_position is not None and callable(getattr(cache, "trim", None)):
-                    positions[id(cache)] = (cache, read_position, read_position())
-    except BaseException:
-        transaction.abort()
-        raise
-    return transaction
-
-
-def rollback_speculative_cache(
-    caches: Iterable[Any],
-    transaction: SpeculativeCacheTransaction,
-    accepted,
-    block_size: int,
-) -> int:
-    """Commit accepted prefixes and rewind ordinary append-only caches."""
-    if isinstance(accepted, int):
-        accepted_values = [int(accepted)]
-    elif isinstance(accepted, mx.array):
-        accepted_values = [int(value) for value in accepted.reshape(-1).tolist()]
-    else:
-        accepted_values = [int(value) for value in accepted]
-
-    retained = [value + 1 for value in accepted_values]
-    if isinstance(transaction, SpeculativeCacheTransaction):
-        transaction.commit(retained)
-    else:
-        # Compatibility for model adapters that still return legacy state.
-        _trim_append_caches(iter_leaf_caches(caches), retained, block_size)
-    return max(accepted_values)
-
-
-def abort_speculative_round(state):
-    """Release and restore an unfinished transaction returned by a target."""
-    if isinstance(state, SpeculativeCacheTransaction):
-        state.abort()
-
-
-def commit_speculative_round(model, caches, state, accepted, block_size):
-    """Translate accepted draft counts once at the legacy target boundary."""
-    if isinstance(accepted, int):
-        values = [accepted]
-    elif isinstance(accepted, mx.array):
-        values = accepted.reshape(-1).tolist()
-    else:
-        values = list(accepted)
-    if isinstance(state, SpeculativeCacheTransaction):
-        state.commit([value + 1 for value in values])
-    elif any(value < block_size - 1 for value in values):
-        model.rollback_speculative_cache(caches, state, accepted, block_size)
-
-
-def _trim_append_caches(caches, retained, block_size, transaction=None):
-    max_retained = max(retained)
-    trim = int(block_size) - max_retained
-    right_padding = [max_retained - value for value in retained]
-    has_ragged_tail = any(right_padding)
-
-    actions = []
-    for cache in caches:
-        if transaction is not None and id(cache) in transaction._rotating:
-            continue
-        if getattr(cache, "is_speculating", False):
-            continue
-        trim_cache = getattr(cache, "trim", None)
-        if not callable(trim_cache):
-            raise RuntimeError(
-                f"{type(cache).__name__} cannot roll back a speculative block."
+        try:
+            self._target_round.validate(lengths)
+            if self._draft_round is not None:
+                self._draft_round.abort()
+                self._draft_round = None
+            width = max(lengths)
+            padding = [width - n for n in lengths]
+            inputs = mx.array(
+                [row + [0] * pad for row, pad in zip(tokens, padding)],
+                dtype=self.bonus.dtype,
             )
-        cache_trim = trim
-        if isinstance(transaction, SpeculativeCacheTransaction):
-            advance = transaction.cache_advance(cache)
-            if advance is not None:
-                if advance == 0:
-                    continue
-                cache_trim = max(0, advance - max_retained)
-                if has_ragged_tail and advance != int(block_size):
-                    raise RuntimeError(
-                        f"{type(cache).__name__} advanced by {advance} tokens "
-                        f"during a {block_size}-token speculative block."
-                    )
-
-        right_trimmed = False
-        if has_ragged_tail:
-            prepare = getattr(cache, "prepare", None)
-            finalize = getattr(cache, "finalize", None)
-            if (
-                getattr(cache, "keys", None) is not None
-                and callable(prepare)
-                and callable(finalize)
-            ):
-                right_trimmed = True
-        if (
-            has_ragged_tail
-            and not right_trimmed
-            and hasattr(cache, "_idx")
-            and getattr(cache, "keys", None) is not None
-        ):
-            raise RuntimeError(
-                "Batched speculative rollback requires uniform acceptance or "
-                "a cache with per-row tail trimming; got "
-                f"{type(cache).__name__}."
+            # The same transaction handles ragged padding and replay failure.
+            # Replay only runs the small MTP head, never the target model.
+            with CacheTransaction(self.draft, width) as replay:
+                logits, hidden = forward(
+                    inputs,
+                    self._verified_hidden[:, :width],
+                    self.draft,
+                    self.position,
+                    lengths=lengths,
+                )
+                replay.validate(lengths)
+                self._target_round.commit(lengths)
+                replay.commit(lengths)
+            indices = mx.maximum(mx.array(lengths), 1)[:, None, None] - 1
+            self.seed = DraftState(
+                mx.argmax(logits, axis=-1),
+                mx.take_along_axis(hidden, indices, axis=1),
             )
-        actions.append((cache, trim_cache, cache_trim, right_trimmed))
+            self.bonus = mx.where(
+                mx.array(lengths)[:, None] > 0,
+                mx.take_along_axis(inputs, indices.squeeze(-1), axis=1),
+                self.bonus,
+            )
+            self.position = self.position + mx.array(lengths)
+        finally:
+            self.abort()
 
-    for cache, trim_cache, cache_trim, right_trimmed in actions:
-        if cache_trim > 0:
-            trim_cache(cache_trim)
-        if right_trimmed:
-            cache.prepare(right_padding=right_padding)
-            cache.finalize()
-
-
-__all__ = [
-    "SpeculativeCacheTransaction",
-    "abort_speculative_round",
-    "commit_speculative_round",
-    "iter_leaf_caches",
-    "rollback_speculative_cache",
-    "start_speculative_cache",
-]
+    def abort(self):
+        if self._target_round is not None:
+            self._target_round.abort()
+        if self._draft_round is not None:
+            self._draft_round.abort()
+        self._target_round = self._draft_round = None
+        self._verified_hidden = None

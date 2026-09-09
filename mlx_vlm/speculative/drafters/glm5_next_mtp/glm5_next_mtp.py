@@ -1,5 +1,5 @@
 from dataclasses import replace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -12,9 +12,7 @@ from ....models.cache import (
     PoolingCache,
 )
 from ....models.glm5_next.language import Glm5NextAttention, Glm5NextMoE
-from ...cache_state import start_speculative_cache
-from ...common import _prepare_ragged_mtp_replay
-from ..mtp_base import AutoregressiveMTPDraftModel
+from ....models.linear import linear
 from .config import Glm5NextMTPConfig
 
 
@@ -30,11 +28,12 @@ class Glm5NextMTPBlock(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-    def __call__(self, x, cache=None, last_only: bool = False):
+    def __call__(self, x, cache=None, padding_mask=None, last_only: bool = False):
         residual = x
         attention, _ = self.self_attn(
             self.input_layernorm(x),
             cache=cache,
+            padding_mask=padding_mask,
             last_only=last_only,
         )
         if last_only and x.shape[1] > 1:
@@ -43,20 +42,12 @@ class Glm5NextMTPBlock(nn.Module):
         return x + self.mlp(self.post_attention_layernorm(x))
 
 
-class Glm5NextMTPDraftModel(AutoregressiveMTPDraftModel):
-    """Native GLM-5-Next MTP drafter backed by checkpoint decoder layer 45."""
-
-    prefer_requested_block_size = False
-    # Start at native depth; the shared acceptance policy may extend to two
-    # draft tokens once the native prefix is accepted reliably.
-    default_runtime_block_size = 3
-    default_batched_sampling_block_size = 2
-    requires_uniform_batch_acceptance = False
-    supports_ragged_batch_acceptance = True
-    supports_left_padded_prefill = True
+class Glm5NextMTPDraftModel(nn.Module):
+    """GLM-5.3-Flash's native MTP head. All request state belongs to the cache."""
 
     def __init__(self, config: Glm5NextMTPConfig):
-        super().__init__(config)
+        super().__init__()
+        self.config = config
         text_config = config.text_config
         if text_config is None:
             raise ValueError("Glm5NextMTPConfig.text_config must be set")
@@ -77,9 +68,6 @@ class Glm5NextMTPDraftModel(AutoregressiveMTPDraftModel):
         self.mtp_block = Glm5NextMTPBlock(layer_config, layer_idx)
         self.shared_head_norm = nn.RMSNorm(hidden_size, eps=text_config.rms_norm_eps)
 
-        self._round_transaction = None
-        self._round_initial = None
-
     @property
     def quant_predicate(self):
         return lambda _path, _module: True
@@ -94,242 +82,37 @@ class Glm5NextMTPDraftModel(AutoregressiveMTPDraftModel):
             pool_cache = BatchPoolingCache(indexer.index_kpool, left_padding)
         return [CacheList(kv_cache(), kv_cache(), pool_cache, kv_cache())]
 
-    def reset(
-        self, target_model, left_padding: Optional[List[int]] = None
-    ) -> List[CacheList]:
-        self.abort_draft_round()
-        self.bind(target_model)
-        self.accept_lens = []
-        self.draft_lens = []
-        self._draft_round = 0
-        self._cache = self.make_cache(left_padding)
-        self._seed_token = None
-        self._seed_hidden = None
-        self._next_position = 0
-        self._round_appended = 0
-        self._round_transaction = None
-        return self._cache
-
-    def draft_eval_state(self):
-        state = [self._seed_token, self._seed_hidden]
-        for cache in self._cache:
-            for subcache in cache.caches:
-                # A batch MTP round can update the accepted seed before the
-                # first draft forward initializes every KV cache. Only arrays
-                # need to be synchronized for sampler-state isolation.
-                if getattr(subcache, "keys", False) is None:
-                    continue
-                state.append(subcache.state)
-        return state
-
-    def validate_target_compatibility(self, target_model) -> None:
-        language_model = getattr(target_model, "language_model", target_model)
-        target_args = getattr(language_model, "args", None)
-        target_type = getattr(target_args, "model_type", None)
-        if target_type is not None and target_type not in (
-            "glm5_next",
-            "glm5_next_text",
-        ):
-            raise ValueError(
-                "GLM-5-Next MTP must be paired with a GLM-5-Next target; "
-                f"got model_type={target_type!r}."
-            )
-
-    def set_shared_kv(
-        self,
-        shared_kv_states: dict,
-        kv_offset,
-        position=None,
-        kv_valid_len=None,
-        left_padding=None,
-    ) -> None:
-        del shared_kv_states, left_padding, position
-        if kv_valid_len is None:
-            kv_valid_len = kv_offset
-        if not self._cache or all(cache.empty() for cache in self._cache):
-            self._next_position = kv_valid_len
-
-    def _target_hidden(self, hidden: mx.array) -> mx.array:
+    def __call__(self, tokens, hidden, cache, position, target_model, lengths=None):
+        """Predict from shifted tokens and target (or previous MTP) features."""
         if hidden.ndim != 3 or hidden.shape[-1] != self.args.hidden_size:
             raise ValueError(
-                "GLM-5-Next MTP expects target hidden shape "
-                "[batch, tokens, hidden_size]."
+                "MTP hidden states must have shape [batch, tokens, hidden_size]."
             )
-        return hidden
-
-    def prefill_from_target_hidden(
-        self,
-        input_ids: mx.array,
-        hidden: mx.array,
-        bonus_token,
-        sampler,
-        token_dtype: mx.Dtype = mx.int32,
-        greedy: bool = False,
-        left_padding: Optional[List[int]] = None,
-    ) -> None:
-        if input_ids.shape[1] == 0:
-            return
-        if isinstance(bonus_token, int):
-            bonus = mx.array([[bonus_token]], dtype=token_dtype)
-        else:
-            bonus = bonus_token[:, None].astype(token_dtype)
-
-        shifted = mx.concatenate([input_ids[:, 1:].astype(token_dtype), bonus], axis=1)
-        self._next_position = (
-            0 if left_padding is None else -mx.array(left_padding, dtype=mx.int32)
+        positions = mx.array(position, dtype=mx.int32).reshape(-1, 1)
+        positions = positions + mx.arange(tokens.shape[1], dtype=mx.int32)[None]
+        embeddings = target_model.model.embed_tokens(tokens)
+        embeddings = mx.where(positions[..., None] == 0, 0, embeddings)
+        hidden = linear(
+            self.eh_proj,
+            mx.concatenate([self.enorm(embeddings), self.hnorm(hidden)], axis=-1),
         )
-        logits_hidden, pre_hc_hidden = self._forward_tokens(
-            shifted,
-            hidden[:, : shifted.shape[1], ...],
-            token_dtype,
+        hidden = self.shared_head_norm(
+            self.mtp_block(hidden, cache[0], padding_mask=positions >= 0)
         )
-        self._set_seed_from_hidden(logits_hidden[:, -1:, :], sampler, greedy)
-        self._seed_hidden = pre_hc_hidden[:, -1:, ...]
-
-    def _forward_hidden(
-        self,
-        token_embed: mx.array,
-        hidden: mx.array,
-        tokens: mx.array,
-        cache: Optional[List[CacheList]],
-        *,
-        last_only=False,
-    ) -> Tuple[mx.array, mx.array]:
-        del tokens
-        hidden = self._target_hidden(hidden)
-        position_ids = self._position_ids(length=token_embed.shape[1])
-        token_embed = mx.where(position_ids[..., None] == 0, 0, token_embed)
-        h = self.eh_proj(
-            mx.concatenate([self.enorm(token_embed), self.hnorm(hidden)], axis=-1)
+        head = (
+            target_model.model.embed_tokens.as_linear
+            if target_model.args.tie_word_embeddings
+            else target_model.lm_head
         )
-        h = self.mtp_block(
-            h,
-            None if cache is None else cache[0],
-            last_only=last_only,
-        )
-        h = self.shared_head_norm(h)
-        return h, h
-
-    def draft_block(
-        self,
-        last_bonus,
-        hidden,
-        cache,
-        block_size,
-        sampler,
-        token_dtype=mx.int32,
-        greedy=False,
-    ):
-        self._round_initial = (self._next_position, self._seed_token, self._seed_hidden)
-        # A cached seed contributes a token without appending a draft state.
-        seeded = self._seed_token is not None and self._seed_hidden is not None
-        steps = block_size - 1 - int(seeded)
-        self._round_transaction = (
-            start_speculative_cache(self._cache, steps) if steps > 0 else None
-        )
-        try:
-            return super().draft_block(
-                last_bonus, hidden, cache, block_size, sampler, token_dtype, greedy
+        # Only the final prediction seeds the next draft step.
+        last = (
+            hidden[:, -1:]
+            if lengths is None
+            else mx.take_along_axis(
+                hidden, mx.maximum(mx.array(lengths), 1)[:, None, None] - 1, axis=1
             )
-        except BaseException:
-            self.abort_draft_round()
-            raise
-
-    def abort_draft_round(self):
-        if self._round_transaction is not None:
-            self._round_transaction.abort()
-            self._round_transaction = None
-        if self._round_initial is not None:
-            self._next_position, self._seed_token, self._seed_hidden = (
-                self._round_initial
-            )
-            self._round_initial = None
-        self._round_appended = 0
-
-    def accept_verified_tokens(
-        self,
-        verify_hidden,
-        draft_tokens,
-        accepted,
-        new_tokens,
-        sampler,
-        token_dtype=mx.int32,
-        greedy=False,
-    ):
-        self.accept_verified_tokens_batch(
-            verify_hidden,
-            draft_tokens,
-            [accepted],
-            [new_tokens],
-            sampler,
-            token_dtype,
-            greedy,
         )
-
-    def accept_verified_tokens_batch(
-        self,
-        verify_hidden,
-        draft_tokens,
-        accepted,
-        new_tokens,
-        sampler,
-        token_dtype=mx.int32,
-        greedy=False,
-    ):
-        kept = [min(int(value), self._round_appended) for value in accepted]
-        if self._round_transaction is not None:
-            self._round_transaction.commit(kept)
-            self._round_transaction = None
-        self._round_initial = None
-        trims = [self._round_appended - value for value in kept]
-        self._next_position -= (
-            trims[0] if len(trims) == 1 else mx.array(trims, dtype=mx.int32)
-        )
-        self._round_appended = 0
-
-        tokens, hiddens, lengths, right_padding = _prepare_ragged_mtp_replay(
-            verify_hidden,
-            draft_tokens,
-            accepted,
-            new_tokens,
-            kept,
-            token_dtype,
-        )
-        if tokens is None:
-            return
-        if any(right_padding):
-            for cache in self._cache:
-                cache.prepare(right_padding=right_padding, lengths=lengths)
-        last_only = len(accepted) == 1
-        logits_hidden, draft_hidden = self._forward_tokens(
-            tokens,
-            hiddens,
-            token_dtype,
-            last_only=last_only,
-        )
-        if any(right_padding):
-            for cache in self._cache:
-                cache.finalize()
-            self._next_position -= mx.array(right_padding, dtype=mx.int32)
-        if not last_only:
-            last = mx.array(lengths, dtype=mx.int32)[:, None, None] - 1
-            logits_hidden = mx.take_along_axis(logits_hidden, last, axis=1)
-            draft_hidden = mx.take_along_axis(draft_hidden, last, axis=1)
-        self._set_seed_from_hidden(logits_hidden, sampler, greedy)
-        self._seed_hidden = draft_hidden
-
-    def filter_batch(self, keep) -> None:
-        if not isinstance(keep, mx.array):
-            keep = mx.array(keep, dtype=mx.int32)
-        for cache in self._cache:
-            cache.filter(keep)
-        if self._seed_token is not None:
-            self._seed_token = self._seed_token[keep]
-        if self._seed_hidden is not None:
-            self._seed_hidden = self._seed_hidden[keep]
-        value = self._next_position
-        if isinstance(value, mx.array) and value.ndim > 0 and value.size > 1:
-            self._next_position = value[keep]
+        return linear(head, last), hidden
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         weights = dict(weights)

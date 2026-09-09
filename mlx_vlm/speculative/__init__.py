@@ -1,8 +1,4 @@
-from .ddtree import DDTreeNode, build_ddtree
+from .cache_state import SpeculativeCache
 from .drafters import load_drafter
 
-__all__ = [
-    "DDTreeNode",
-    "build_ddtree",
-    "load_drafter",
-]
+__all__ = ["SpeculativeCache", "load_drafter"]

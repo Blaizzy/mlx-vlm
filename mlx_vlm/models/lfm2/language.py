@@ -13,9 +13,6 @@ from ..base import (
 from ..cache import ArraysCache, KVCache
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
-from .speculative_verifier import Lfm2ExactSpeculativeVerifier
-
-_EXACT_SPECULATIVE_VERIFIER = Lfm2ExactSpeculativeVerifier()
 
 
 class Attention(nn.Module):
@@ -362,15 +359,6 @@ class LanguageModel(nn.Module):
             inputs_embeds = input_embeddings
 
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
-        exact_speculative_verify = bool(kwargs.pop("speculative_verify", False))
-        if exact_speculative_verify:
-            return _EXACT_SPECULATIVE_VERIFIER(
-                self,
-                inputs,
-                cache=cache,
-                input_embeddings=inputs_embeds,
-                capture_layer_ids=capture_layer_ids,
-            )
 
         hidden_sink: list[mx.array] | None = (
             [] if capture_layer_ids is not None else None
@@ -390,146 +378,7 @@ class LanguageModel(nn.Module):
         return LanguageModelOutput(
             logits=out,
             hidden_states=hidden_sink,
-            gdn_states=None,
         )
-
-    def chunked_prefill_policy(
-        self,
-        *,
-        input_ids=None,
-        inputs_embeds=None,
-        prompt_cache=None,
-        draft_model=None,
-        draft_kind=None,
-        prefill_kwargs=None,
-    ) -> bool:
-        del input_ids, inputs_embeds, prompt_cache
-        if draft_model is None:
-            return True
-        prefill_kwargs = prefill_kwargs or {}
-        if draft_kind == "dflash":
-            return prefill_kwargs.get("capture_layer_ids") is not None
-        return False
-
-    @staticmethod
-    def _restore_conv_cache(
-        cache: ArraysCache,
-        previous_state: mx.array | None,
-        previous_left_padding: mx.array | None,
-        previous_lengths: mx.array | None,
-        conv_inputs: mx.array,
-        valid_lengths: list[int],
-        state_size: int,
-    ) -> None:
-        rows = []
-        for row, valid in enumerate(valid_lengths):
-            if previous_state is None:
-                state = mx.zeros(
-                    (1, state_size, conv_inputs.shape[-1]),
-                    dtype=conv_inputs.dtype,
-                )
-            else:
-                state = previous_state[row : row + 1]
-            committed = conv_inputs[row : row + 1, :valid]
-            rows.append(mx.concatenate([state, committed], axis=1)[:, -state_size:])
-        cache[0] = mx.concatenate(rows, axis=0)
-        cache.left_padding = (
-            None
-            if previous_left_padding is None
-            else previous_left_padding
-            - mx.array(valid_lengths, dtype=previous_left_padding.dtype)
-        )
-        cache.lengths = (
-            None
-            if previous_lengths is None
-            else previous_lengths
-            - mx.array(valid_lengths, dtype=previous_lengths.dtype)
-        )
-
-    def rollback_speculative_cache(
-        self,
-        caches: list[Any],
-        gdn_states: Any,
-        accepted: Any,
-        block_size: int,
-    ) -> int:
-        """Commit the accepted LFM2 prefix across attention and conv caches."""
-        if isinstance(accepted, int):
-            accepted = mx.array([accepted], dtype=mx.int32)
-        elif not isinstance(accepted, mx.array):
-            accepted = mx.array(accepted, dtype=mx.int32)
-        if accepted.ndim == 0:
-            accepted = accepted.reshape(1)
-
-        accepted_values = [int(value) for value in accepted.tolist()]
-        valid_lengths = [value + 1 for value in accepted_values]
-        max_accepted = max(accepted_values)
-        max_valid = max_accepted + 1
-        trim = int(block_size) - max_valid
-        is_batch = len(accepted_values) > 1
-
-        for cache in caches:
-            if cache is None or isinstance(cache, ArraysCache):
-                continue
-            if trim > 0 and hasattr(cache, "trim"):
-                cache.trim(trim)
-
-            if not is_batch:
-                continue
-            extra_trim = [max_accepted - value for value in accepted_values]
-            prepare = getattr(cache, "prepare", None)
-            finalize = getattr(cache, "finalize", None)
-            keys = getattr(cache, "keys", None)
-            values = getattr(cache, "values", None)
-            if any(extra_trim) and callable(prepare) and callable(finalize):
-                prepare(right_padding=extra_trim)
-                finalize()
-                continue
-
-            # Dense caches without row-wise padding retain a common physical
-            # width, so clear rejected tails inside the committed window.
-            if not hasattr(cache, "_idx"):
-                continue
-            if not isinstance(keys, mx.array) or not isinstance(values, mx.array):
-                raise NotImplementedError(
-                    "Ragged LFM2 DSpark rollback currently requires dense KV caches."
-                )
-            kv_length = int(cache._idx)
-            verify_start = kv_length - max_valid
-            for row, valid in enumerate(valid_lengths):
-                start = verify_start + valid
-                if start < kv_length:
-                    keys[row, :, start:kv_length, :] = 0
-                    values[row, :, start:kv_length, :] = 0
-
-        if gdn_states is None:
-            raise RuntimeError(
-                "LFM2 speculative rollback requires convolution state captured "
-                "with speculative_verify=True."
-            )
-        for (
-            layer_index,
-            previous_state,
-            previous_left_padding,
-            previous_lengths,
-            conv_inputs,
-        ) in gdn_states:
-            cache = caches[layer_index]
-            if not isinstance(cache, ArraysCache):
-                raise TypeError(
-                    "LFM2 convolution rollback expected ArraysCache at layer "
-                    f"{layer_index}, got {type(cache).__name__}."
-                )
-            self._restore_conv_cache(
-                cache,
-                previous_state,
-                previous_left_padding,
-                previous_lengths,
-                conv_inputs,
-                valid_lengths,
-                self.args.conv_L_cache - 1,
-            )
-        return max_accepted
 
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:

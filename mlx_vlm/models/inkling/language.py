@@ -3,68 +3,12 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
 
 from ..base import LanguageModelOutput, scaled_dot_product_attention
 from ..cache import ArraysCache, CacheList, KVCache
 from ..mlp import SwiGLUMLP
 from ..switch_layers import SwitchGLU, _gather_sort, _scatter_unsort
 from .config import TextConfig as ModelConfig
-
-
-def _clone_cache_tree(value):
-    if isinstance(value, mx.array):
-        return mx.array(value)
-    if isinstance(value, tuple):
-        return tuple(_clone_cache_tree(v) for v in value)
-    if isinstance(value, list):
-        return [_clone_cache_tree(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _clone_cache_tree(v) for k, v in value.items()}
-    return value
-
-
-_CACHE_DICT_STATE = object()
-
-
-def _subcaches(cache):
-    return getattr(cache, "caches", None) or (cache,)
-
-
-def _snapshot_cache_state(caches):
-    """Copy cache state for speculative restore-and-replay."""
-    snapshot = []
-    for cache in caches:
-        if cache is None:
-            snapshot.append(None)
-            continue
-        states = []
-        for subcache in _subcaches(cache):
-            if (
-                isinstance(subcache, ArraysCache)
-                or getattr(subcache, "keys", False) is None
-            ):
-                states.append((_CACHE_DICT_STATE, _clone_cache_tree(vars(subcache))))
-            else:
-                states.append(_clone_cache_tree(subcache.state))
-        snapshot.append(states)
-    arrays = [v for _, v in tree_flatten(snapshot) if isinstance(v, mx.array)]
-    if arrays:
-        mx.eval(arrays)
-    return snapshot
-
-
-def _restore_cache_state(caches, snapshot):
-    for cache, states in zip(caches, snapshot):
-        if cache is None or states is None:
-            continue
-        for subcache, state in zip(_subcaches(cache), states):
-            if isinstance(state, tuple) and state and state[0] is _CACHE_DICT_STATE:
-                subcache.__dict__.clear()
-                subcache.__dict__.update(_clone_cache_tree(state[1]))
-            else:
-                subcache.state = _clone_cache_tree(state)
-
 
 _MASK_SRC = r"""
     uint j  = thread_position_in_grid.x;   // key   position [0, S)
@@ -949,37 +893,6 @@ class LanguageModel(nn.Module):
             hidden_states=[pre_norm] if return_hidden else None,
             shared_kv_states={} if return_shared_kv else None,
         )
-
-    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
-        return self._logits_from_norm(self.model.norm(hidden))
-
-    def speculative_argmax_from_hidden(self, hidden: mx.array) -> Optional[mx.array]:
-        return mx.argmax(self.speculative_logits_from_hidden(hidden), axis=-1)
-
-    def speculative_verify_hidden(self, inputs: mx.array, cache):
-        snapshot = _snapshot_cache_state(cache)
-        out = self(
-            inputs,
-            cache=cache,
-            return_hidden=True,
-            return_shared_kv=True,
-            skip_logits=True,
-        )
-        return out.hidden_states[-1], out.shared_kv_states, (snapshot, inputs)
-
-    def rollback_speculative_cache(
-        self, caches, gdn_states, accepted, block_size
-    ) -> int:
-        if isinstance(accepted, mx.array):
-            accepted = int(accepted.max().item()) if accepted.size else 0
-        elif not isinstance(accepted, int):
-            accepted = max(int(a) for a in accepted)
-        snapshot, verify_inputs = gdn_states
-        _restore_cache_state(caches, snapshot)
-        keep = accepted + 1
-        if keep > 0:
-            self(verify_inputs[:, :keep], cache=caches, skip_logits=True)
-        return accepted
 
     @property
     def layers(self):

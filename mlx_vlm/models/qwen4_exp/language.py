@@ -9,13 +9,13 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ...speculative.cache_state import start_speculative_cache
 from ..base import LanguageModelOutput
 from ..cache import ArraysCache, BatchKVCache, KVCache, QuantizedKVCache, dynamic_roll
 from ..quantized_verifier import (
     singleton_quantized_linear,
     supports_optimized_affine_head,
 )
+from ..qwen3_5.batch_invariant import Qwen3_5BatchInvariantForward
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
 from ..qwen3_5.language import (
     Qwen3_5Attention,
@@ -27,7 +27,6 @@ from ..qwen3_5.language import (
     _qwen3_5_left_padding_info,
     _restore_batch_padding_metadata,
 )
-from ..qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 from ..qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 from .config import ModelConfig, TextConfig
 from .qsa_kernel import dispatch_qsa_attention
@@ -2026,7 +2025,7 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
 
 _QWEN4_BATCH_INVARIANT_FORWARD = Qwen4ExpBatchInvariantForward()
 # Backward-compatible private alias for integrations that inspect the MTP helper.
-_QWEN4_EXACT_SPECULATIVE_VERIFIER = _QWEN4_BATCH_INVARIANT_FORWARD
+_QWEN4_BATCH_INVARIANT_FORWARD = _QWEN4_BATCH_INVARIANT_FORWARD
 
 
 class LanguageModel(Qwen3_5LanguageModel):
@@ -2086,20 +2085,11 @@ class LanguageModel(Qwen3_5LanguageModel):
             )
         return hidden
 
-    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
-        return super().speculative_logits_from_hidden(self._mtp_logits_hidden(hidden))
+    def logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        return super().logits_from_hidden(self._mtp_logits_hidden(hidden))
 
-    def speculative_argmax_from_hidden(self, hidden: mx.array):
-        return super().speculative_argmax_from_hidden(self._mtp_logits_hidden(hidden))
-
-    def speculative_draft_hidden(self, hidden: mx.array) -> mx.array:
-        expected = self.args.hc_count * self.args.hidden_size
-        if hidden.ndim != 3 or hidden.shape[-1] != expected:
-            raise ValueError(
-                "Qwen4-Exp MTP expects target hidden shape "
-                "[batch, tokens, hc_count * hidden_size]."
-            )
-        return hidden
+    def argmax_from_hidden(self, hidden: mx.array):
+        return super().argmax_from_hidden(self._mtp_logits_hidden(hidden))
 
     def fused_greedy_decode(
         self,
@@ -2147,49 +2137,7 @@ class LanguageModel(Qwen3_5LanguageModel):
             return sampled
         if token_mask is not None:
             raise RuntimeError("masked fused greedy decode became unsupported")
-        return mx.argmax(self.speculative_logits_from_hidden(hidden), axis=-1)
-
-    def _speculative_verify(self, inputs: mx.array, cache, sampler=None):
-        batch, length = inputs.shape
-        # Queue any lazy prefix-cache writes before the verifier appends to the
-        # same backing buffers. This preserves dependency order without adding
-        # a host synchronization point.
-        mx.async_eval([entry.state for entry in cache])
-        cache_entry = cache[self.model.fa_idx]
-        cache_offset = getattr(cache_entry, "offset", 0)
-        if isinstance(cache_offset, mx.array) and cache_offset.ndim > 0:
-            offsets = cache_offset[:batch].astype(mx.int64)
-        else:
-            offsets = mx.full((batch,), int(cache_offset), dtype=mx.int64)
-        rope_deltas = self._rope_deltas
-        if rope_deltas is not None:
-            offsets = offsets + rope_deltas[:batch].reshape(-1).astype(mx.int64)
-        position_ids = offsets[:, None] + mx.arange(length, dtype=mx.int64)[None]
-        if self._position_ids is not None and self._position_ids.ndim == 3:
-            position_ids = mx.broadcast_to(position_ids[None], (3, batch, length))
-        transaction = start_speculative_cache(cache, inputs.shape[1])
-        try:
-            output = _QWEN4_BATCH_INVARIANT_FORWARD(
-                self,
-                inputs,
-                cache=cache,
-                position_ids=position_ids,
-                skip_logits=sampler is None,
-            )
-            rollback_state = transaction
-            hidden = output.hidden_states[-1]
-            if sampler is None:
-                return hidden, {}, rollback_state
-            return hidden, {}, rollback_state, sampler(output.logits)
-        except BaseException:
-            transaction.abort()
-            raise
-
-    def speculative_verify_hidden(self, inputs: mx.array, cache):
-        return self._speculative_verify(inputs, cache)
-
-    def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
-        return self._speculative_verify(inputs, cache, sampler)
+        return mx.argmax(self.logits_from_hidden(hidden), axis=-1)
 
     def make_cache(self):
         caches = []

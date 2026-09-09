@@ -589,23 +589,20 @@ def parse_arguments():
         "--draft-model",
         type=str,
         default=None,
-        help="Speculative drafter path or HF id (e.g. z-lab/Qwen3.5-4B-DFlash).",
+        help="GLM-5.3-Flash native MTP checkpoint path or HF id.",
     )
     parser.add_argument(
         "--draft-kind",
         type=str,
         default=None,
-        choices=["dflash", "eagle3", "mtp"],
-        help="Drafter family. Supported: 'dflash' (Qwen3.5 DFlash), "
-        "'eagle3' (Speculators/SGLang EAGLE-3), "
-        "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model). "
-        "Default: auto-detected from the drafter's HF model_type.",
+        choices=["mtp"],
+        help="Speculative method (currently GLM-5.3-Flash MTP).",
     )
     parser.add_argument(
         "--draft-block-size",
         type=int,
         default=None,
-        help="Override the drafter's configured block size.",
+        help="Verification block size: number of draft tokens plus one (default: 2).",
     )
     parser.add_argument(
         "--enable-thinking",
@@ -853,6 +850,10 @@ def stream_generate(
     vision_cache = kwargs.pop("vision_cache", None)
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
     apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
+    # APC stores target KV only. MTP needs its aligned features and draft cache
+    # as well, so this first implementation always prefills the complete prompt.
+    if kwargs.get("draft_model") is not None:
+        apc_manager = None
     apc_tenant: Optional[str] = kwargs.pop("apc_tenant", None)
     image = image or None
     audio = audio or None
@@ -946,7 +947,11 @@ def stream_generate(
             processor=processor,
         )
 
-    if prompt_cache_state is not None and prompt_cache_state.cache is not None:
+    if (
+        kwargs.get("draft_model") is None
+        and prompt_cache_state is not None
+        and prompt_cache_state.cache is not None
+    ):
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
         kv_cache = prompt_cache_state.cache
         # None => a cache can't be trimmed back to the shared prefix (wrapped

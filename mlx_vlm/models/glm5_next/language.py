@@ -854,9 +854,7 @@ class LanguageModel(nn.Module):
         if draft_model is None:
             return True
         if draft_kind == "mtp":
-            return bool(prefill_kwargs.get("return_hidden", False)) and bool(
-                prefill_kwargs.get("return_shared_kv", False)
-            )
+            return bool(prefill_kwargs.get("return_hidden", False))
         return draft_kind is None
 
     def __call__(

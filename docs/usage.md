@@ -52,182 +52,26 @@ python -m mlx_vlm.server --model /path/to/offloaded --expert-cache-gb 8
 
 ## Speculative Decoding
 
-Speed up generation 2–3× using a lightweight drafter model that predicts multiple tokens per round, verified in parallel by the target model.
-
-### CLI
+The rebuilt path supports GLM-5.3-Flash with its native MTP head.
 
 ```bash
-python -m mlx_vlm.generate \
-    --model Qwen/Qwen3.5-4B \
-    --draft-model z-lab/Qwen3.5-4B-DFlash \
-    --prompt "Write a quicksort in Python." \
-    --max-tokens 512 --temperature 0 --enable-thinking
+python -m mlx_vlm.split_mtp --model zai-org/GLM-5.3-Flash \
+    --output GLM-5.3-Flash-MTP-FP8 --q-mode mxfp8
+
+mlx_vlm.generate --model zai-org/GLM-5.3-Flash \
+    --draft-model GLM-5.3-Flash-MTP-FP8 --draft-kind mtp \
+    --draft-block-size 2 --temperature 0 \
+    --prompt "Explain why the sky is blue."
+
+mlx_vlm.server --model zai-org/GLM-5.3-Flash \
+    --draft-model GLM-5.3-Flash-MTP-FP8 --draft-kind mtp
 ```
 
-Liquid AI's LFM2.5 DSpark drafter is also auto-detected:
-
-```bash
-python -m mlx_vlm.generate \
-    --model LiquidAI/LFM2.5-2.6B \
-    --draft-model LiquidAI/LFM2.5-2.6B-DSpark \
-    --prompt "Write a concise note about speculative decoding." \
-    --max-tokens 256 --temperature 0
-```
-
-DSpark decoding currently supports greedy sampling (`temperature=0`).
-
-EAGLE-3 speculators are also supported and auto-detected from Speculators configs:
-
-```bash
-python -m mlx_vlm.generate \
-    --model mlx-community/gemma-4-31B-it-bf16 \
-    --draft-model RedHatAI/gemma-4-31B-it-speculator.eagle3 \
-    --prompt "Write a concise note about speculative decoding." \
-    --max-tokens 256 --temperature 0
-```
-
-MiniMax M3 uses the same `eagle3` path with the released
-`Inferact/MiniMax-M3-EAGLE3` drafter:
-
-```bash
-python -m mlx_vlm.generate \
-    --model ~/MiniMax-M3-4bit \
-    --draft-model ~/MiniMax-M3-EAGLE3 \
-    --draft-kind eagle3 \
-    --draft-block-size 3 \
-    --prompt "Write a concise note about MiniMax Sparse Attention." \
-    --max-tokens 256 --temperature 0
-```
-
-The public MiniMax M3 BF16 checkpoint advertises MTP metadata but does not
-publish `mtp` or `nextn` tensors; use `Inferact/MiniMax-M3-EAGLE3` for that
-checkpoint.
-
-Works with images too:
-
-```bash
-python -m mlx_vlm.generate \
-    --model Qwen/Qwen3.5-4B \
-    --draft-model z-lab/Qwen3.5-4B-DFlash \
-    --image examples/images/cats.jpg \
-    --prompt "Describe this image." \
-    --max-tokens 256 --temperature 0 --enable-thinking
-```
-
-### Python — Single Sequence
-
-```python
-from mlx_vlm import load
-from mlx_vlm.generate import stream_generate
-from mlx_vlm.speculative.drafters import load_drafter
-
-model, processor = load("Qwen/Qwen3.5-4B")
-drafter = load_drafter("z-lab/Qwen3.5-4B-DFlash")
-
-for result in stream_generate(
-    model, processor,
-    prompt="Write a quicksort in Python.",
-    max_tokens=512,
-    temperature=0,
-    draft_model=drafter,
-    enable_thinking=True,
-):
-    print(result.text, end="", flush=True)
-
-# Acceptance stats
-print(f"\nAccepted {sum(drafter.accept_lens)/len(drafter.accept_lens):.1f} tokens/round")
-```
-
-### Python — Batch Generate
-
-Process multiple prompts in parallel:
-
-```python
-import mlx.core as mx
-from mlx_vlm import load
-from mlx_vlm.generate import (
-    _dflash_rounds_batch,
-    _make_cache,
-    generation_stream,
-)
-from mlx_vlm.speculative.drafters import load_drafter
-from mlx_vlm.prompt_utils import apply_chat_template
-from mlx_vlm.sample_utils import make_sampler
-
-model, processor = load("Qwen/Qwen3.5-4B")
-drafter = load_drafter("z-lab/Qwen3.5-4B-DFlash")
-tok = processor.tokenizer
-lm = model.language_model
-sampler = make_sampler(temp=0)
-eos_id = tok.eos_token_id
-
-prompts = [
-    "Write a quicksort in Python.",
-    "What is the capital of France?",
-    "Explain hash tables in 3 sentences.",
-]
-
-# Tokenize and left-pad to uniform length
-texts = [
-    apply_chat_template(
-        processor, model.config, p,
-        num_images=0, num_audios=0, enable_thinking=True,
-    )
-    for p in prompts
-]
-encoded = [tok.encode(t) for t in texts]
-max_len = max(len(e) for e in encoded)
-padded = [[0] * (max_len - len(e)) + e for e in encoded]
-input_ids = mx.array(padded, dtype=mx.int32)
-B = len(prompts)
-
-# Create batch-aware caches and prefill
-prompt_cache = _make_cache(lm, [0] * B)
-lm._position_ids = None
-lm._rope_deltas = None
-
-target_layer_ids = list(drafter.config.target_layer_ids)
-out = lm(input_ids, cache=prompt_cache, capture_layer_ids=target_layer_ids)
-hidden = mx.concatenate(out.hidden_states, axis=-1)
-first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
-mx.eval(first_bonus, hidden, out.logits)
-
-# Generate — finished sequences are automatically removed from
-# the batch and the drafter restarts for the new batch size.
-tokens_per_seq = [[] for _ in range(B)]
-for tok_list, _ in _dflash_rounds_batch(
-    model, drafter, prompt_cache, hidden,
-    first_bonus=first_bonus,
-    max_tokens=256,
-    sampler=sampler,
-    token_dtype=mx.int32,
-    stop_check=lambda seq_idx, token_id: token_id == eos_id,
-):
-    for i, t in enumerate(tok_list):
-        if t is not None:
-            tokens_per_seq[i].append(t)
-
-# Decode results
-for i in range(B):
-    all_toks = [int(first_bonus[i].item())] + tokens_per_seq[i]
-    print(f"--- {prompts[i]}")
-    print(tok.decode(all_toks))
-```
-
-### Supported Models
-
-| Target | Drafter | Notes |
-|--------|---------|-------|
-| `Qwen/Qwen3.5-4B` | `z-lab/Qwen3.5-4B-DFlash` | Text + image. ~2.5× speedup on code/reasoning. |
-| `LiquidAI/LFM2.5-2.6B` | `LiquidAI/LFM2.5-2.6B-DSpark` | Text. Nine Markov-corrected proposals with exact LFM2 target verification. |
-| `meta-models/Muse-Glimmer-30B` | `meta-models/Muse-Glimmer-30B-assistant` | Text + image. Native 5-layer, 16-token DFlash assistant. |
-| `MiniMaxAI/MiniMax-M3` | `Inferact/MiniMax-M3-EAGLE3` | Text, image, and video target. Uses `--draft-kind eagle3`. |
-
-The drafter is loaded via the shared `load_model` path. DFlash checkpoints are
-detected from `dflash_config` or the `muse_glimmer_assistant` model type;
-EAGLE-3 checkpoints are detected from
-`speculators_model_type` or EAGLE-3 architecture metadata. Native MTP sidecars
-for supported model families are detected from their `model_type`.
+The verification block size includes one target token. Start with `2` (one
+draft), then measure larger blocks on your workload. The former DFlash,
+EAGLE, and other MTP implementations have been removed.
+See [speculative decoding](speculative-decoding.md) for the cache contract,
+sampling behavior, current limits, and FP8 parity benchmark.
 
 ## Server (FastAPI)
 

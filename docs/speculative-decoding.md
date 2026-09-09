@@ -1,158 +1,118 @@
-# Implementing speculative decoding
+# GLM-5.3-Flash MTP decoding
 
-Speculative decoding is a lossless decode optimization. A small drafter proposes
-several tokens, the target verifies the whole block, and MLX-VLM accepts the
-matching prefix plus one target token. Rejected cache entries are then removed
-before the next round.
+The speculative implementation starts with one target, GLM-5.3-Flash, and
+its native next-token prediction layer. Its FP8 checkpoint can be loaded
+through the shared FP8-to-MXFP8 conversion and used with an extracted MXFP8
+MTP head. Existing converted GLM-5.3-Flash MTP checkpoints remain loadable.
+Other drafter families and their legacy verification/rollback APIs have been
+removed in this rebuild.
 
-```text
-target prefill and hidden capture
-              ↓
-draft block → target block verification → accept prefix + target token
-     ↑                                      ↓
-     └──────────── cache rollback ──────────┘
+## Ownership
+
+| Component | Responsibility |
+| --- | --- |
+| `speculative/cache_state.py` | Request state, target/draft caches, positions, feature alignment, commit/abort |
+| `models/cache.py` | KV storage and bounded recurrent/pooling histories |
+| `speculative/mtp.py` | Propose, run the target, accept, emit |
+| `speculative/sampling.py` | Model-independent prefix acceptance and target sampling |
+| `speculative/drafters/glm5_next_mtp/` | Checkpoint extraction and stateless MTP forward |
+| `speculative/utils.py` | CLI and server generation entry points |
+
+The MTP model owns weights. It has no request cache, hidden-state seed,
+position cursor, reset method, or rollback callback. Two simultaneous requests
+can use the same model with independent `SpeculativeCache` objects.
+
+## Round contract
+
+1. Prefill the target and retain its final normalized hidden states across
+   every prompt chunk. MTP consumes those features paired with tokens shifted
+   one position to the left, ending with the first sampled target token.
+2. The cache stores the next MTP prediction and its hidden state. Reuse that
+   seed and run additional MTP steps to propose a fixed number of tokens.
+3. Verify `[previous target token, drafts...]` with ordinary target forwards
+   inside a bounded cache transaction.
+4. Accept the matching draft prefix and emit one target correction or bonus.
+5. Retain exactly as many target input positions as were emitted. Each
+   recurrent/pooling cache restores its own accepted state; KV caches trim
+   their unaccepted tails. No rollback replays the target.
+6. Discard hypothetical draft expansions. Extend the MTP cache with committed
+   output tokens paired with the verified *target* features, then retain only
+   the last prediction and hidden state for the next round.
+
+Both target and draft caches end a round at the same logical position. The
+last emitted token remains pending for the target's next forward, matching
+ordinary autoregressive generation. Ragged batches commit per-row lengths;
+finished rows retain no further input positions. The last output of a round
+is yielded only after commit. Closing a generator partway through a round
+commits only the prefix actually delivered. Failures abort open transactions.
+
+Drafts use argmax. At nonzero temperature, a target draw is accepted when it
+matches that deterministic proposal. Otherwise the draw is the correction.
+This is rejection sampling with a point-mass proposal distribution; it needs
+no draft RNG or probability buffer. Positioned target samplers retain their
+per-request generated-token positions.
+
+## Shared operations
+
+No new model-specific Metal kernels are introduced. Acceptance is a small
+compiled MLX operation. Attention, gated-delta history, hyperconnections, and
+quantized projections use shared operators in `models/`. Shared operators
+are available to ordinary decoding and future model adapters. The Qwen batch
+forward used by ordinary AR generation is retained as `batch_invariant.py`;
+it is no longer a speculative verifier or a source of rollback callbacks.
+
+A future model adapter must return the required target features and implement
+an ordinary draft forward. Its cache types must implement the same transaction
+contract. It must not add model-name dispatch or rollback hooks to the loop.
+
+## Run and validate
+
+```sh
+python -m mlx_vlm.split_mtp --model zai-org/GLM-5.3-Flash \
+  --output GLM-5.3-Flash-MTP-FP8 --q-mode mxfp8
+
+mlx_vlm.generate --model zai-org/GLM-5.3-Flash \
+  --draft-model GLM-5.3-Flash-MTP-FP8 --draft-kind mtp \
+  --draft-block-size 2 --temperature 0 --prompt "Explain why the sky is blue."
+
+PYTHONPATH=. python examples/benchmark_glm53_mtp.py \
+  --model /path/to/GLM-5.3-Flash-FP8 \
+  --draft-model /path/to/GLM-5.3-Flash-MTP-FP8 \
+  --batch-size 1 --block-sizes 2 3 5 --output results.json
+
+python -m pytest mlx_vlm/tests/test_speculative.py \
+  mlx_vlm/tests/test_speculative_transactions.py mlx_vlm/tests/test_cache.py
 ```
 
-## Code ownership
+Block size includes the target bonus (`2` means one draft). A caller's explicit
+block size is honored; there is no model-specific adaptive policy.
 
-| Area | Responsibility |
-|---|---|
-| `generate/ar.py` | Prefill, target cache creation, and speculative dispatch |
-| `speculative/drafters/` | Checkpoint loading, drafter architecture, and target compatibility |
-| `speculative/dflash.py` | DFlash, DFlash2, and DSpark round loops |
-| `speculative/mtp.py` | Native and assistant MTP round loops |
-| `speculative/eagle3.py` | EAGLE-3 round loops |
-| `speculative/common.py` | Ordinary verification forwards, acceptance, sampling state, and batch safeguards |
-| `models/<family>/language.py` | Normal model traversal and hidden-state capture |
-| `models/cache.py` | Bounded temporal state retention and accepted-state selection |
-| `models/linear.py`, `models/switch_layers.py`, `models/fast_ops.py` | Shared decode-equivalent operations and fused kernels |
-| `speculative/ops/` | Existing Qwen verifier operations |
-| `speculative/cache_state.py` | Commit and abort of speculative cache transactions |
+The initial scope includes greedy and temperature sampling, chunked prefill,
+and left-padded/ragged batches. APC target-only snapshots do not contain the
+MTP state, so prefix reuse is disabled for this path. Logits processors and
+rotating/TurboQuant caches are rejected explicitly. Native KV and batch KV
+caches, native quantized KV, recurrent arrays, and pooling caches participate
+in transactions. Model weights may be FP8 independently of the KV format.
 
-`draft_kind` selects the round loop, not the checkpoint architecture. Drafter
-`model_type` values are mapped to `dflash`, `mtp`, or `eagle3` in
-`speculative/drafters/__init__.py`.
+## FP8 validation
 
-## Adding a model
+[Recorded short-run results](benchmarks/glm53-mtp-fp8.json) cover 12 MTP
+comparisons against ordinary decoding: batch sizes 1 and 2, block sizes
+2/3/5, and explanation, code, and counting prompts. Every generated token
+matched its baseline. With one draft, measured throughput was 22.2–22.5
+versus 17.8 tokens/s for batch one, and 31.0–33.0 versus 27.3–27.4 aggregate
+tokens/s for batch two. A two-draft coding run reached 24.9 tokens/s; larger
+blocks also slowed other prompts. These are short runs, not a general speedup
+guarantee or a long-context benchmark.
 
-1. Inspect the real `config.json` and tensor names. Define the target layers,
-   hidden-state inputs, block-size meaning, cache ownership, and quantization
-   before implementing the drafter.
-2. Add or reuse a drafter under `speculative/drafters/<family>/`. Implement its
-   config normalization, checkpoint sanitization, `draft_block`, cache reset,
-   and target compatibility checks.
-3. Register its `model_type` with the correct `draft_kind`. Prefer architecture
-   and config fields over repository-name checks.
-4. Make target prefill return the hidden states the drafter consumes. DFlash and
-   EAGLE-3 normally capture configured layers; MTP normally consumes final
-   hidden state and may share target K/V.
-5. Use the model's ordinary forward with a shared cache transaction. Stateful
-   operators write through the temporal cache interface so rollback works
-   without a second implementation of the layer. Put numerical dispatch in
-   ordinary shared operators, using the same weights and module instances.
-   Keep acceptance decisions and history-retention policy out of model layers.
-6. Add synthetic contract tests, then validate the real target and drafter
-   checkpoints before reporting support.
+## Upstream references
 
-GLM and DeepSeek use `verify_forward` in the shared runtime. It starts one
-cache transaction, calls the normal model, and returns the output and
-transaction. MTP requests final hidden states; DFlash requests its configured
-capture layers. The loop owns sampling, commit, and abort. Neither model needs
-a speculative verifier or rollback method.
+The organization follows the proposal/verification/acceptance split visible
+in [vLLM's proposer](https://github.com/vllm-project/vllm/blob/main/vllm/v1/spec_decode/llm_base_proposer.py)
+and [SGLang's speculative state](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/speculative/eagle_info.py).
+This implementation adapts that split to MLX's caches and lazy execution;
+it does not copy CUDA scheduling or paged allocation.
 
-Normal forward calls expose hidden states through `return_hidden` or
-`capture_layer_ids`. An ordinary `logits_from_hidden` method is useful when the
-captured state needs architecture-specific normalization before the LM head.
-Drafters own reshaping their inputs.
-
-Existing model hooks remain supported for other architectures during migration;
-new models should use the ordinary forward/cache contract. There is no target
-registry, copied model view, or parameter-wrapper layer.
-
-## Exact verification
-
-A normal multi-token target forward is not automatically equivalent to repeated
-one-token decoding. Kernel dispatch can change floating-point order, while
-Mamba, gated-delta, convolution, or rotating caches need an explicit state for
-the accepted position. Near an argmax tie, a small numerical change can alter
-the generated sequence.
-
-Use repeated ordinary one-token forwards as the reference. Short-block linear,
-expert, and hyperconnection operators preserve that reduction order. Causal
-attention preserves per-position cache ordering; image-prefill masks retain
-their full visibility rules. The runtime splits larger verification blocks at
-`DECODE_BLOCK_SIZE` while keeping one transaction across all parts. Large
-ordinary prefill calls retain their bulk execution path. Verification must:
-
-- produce the same greedy target tokens as autoregressive decoding;
-- advance every cache through the verification block;
-- restore stateful caches at `accepted + 1` tokens;
-- handle zero, partial, and full acceptance;
-- either support per-row batch rollback or require uniform acceptance;
-- preserve the full required prompt hidden state through chunked prefill; and
-- match every supported weight format, including quantized output heads.
-
-Fused argmax and custom Metal kernels are optimizations, not correctness
-shortcuts. Keep the full-logit fallback until parity is proven.
-
-## Temporal caches for linear attention
-
-`ArraysCache` owns a bounded history for the active verification window. Normal
-decoding retains only the latest state. The same forward call can run inside a
-cache transaction: no model-specific checkpoint or recurrent-layer replacement
-is needed.
-
-The shared gated-delta operators accept `cache` and a `cache_index`. They delegate
-to `cache.update_recurrent`, which requests intermediate states from the kernel
-only while history is needed. `cache.update_window` stores convolution or token
-windows and retains their temporal views. Both methods support one block update
-or several smaller updates within the fixed capacity.
-
-Commit selects each row's accepted state; abort restores the starting state.
-Both release the history. Over-capacity updates and incomplete histories are
-rejected. A new recurrent operator needs to support the shared state-production
-contract once; models using it do not need to know about MTP or draft lengths.
-Numerical projection and attention dispatch is part of the ordinary operators,
-independent of cache history retention.
-
-## Validation and maintenance
-
-Start with cheap tests for config normalization, strict weight loading, capture
-layer order, block sizing, sampling state, and cache rollback. Compare cache
-state and the next target token after zero, partial, and full acceptance for
-single and batched generation.
-
-Then run real-checkpoint greedy generation against the same autoregressive
-baseline. Require token-for-token equality across several prompts and context
-lengths before benchmarking. Measure all variants against one shared baseline
-in the same process, report median decode throughput and acceptance, and reject
-changes that improve an isolated kernel but not end-to-end decoding.
-
-When changing target layers, caches, quantization, sampling, batching, or
-chunked prefill, rerun both synthetic rollback tests and real-model exactness.
-Treat a new checkpoint layout or architecture tag as a compatibility change,
-not as proof that an existing adapter applies.
-
-For rotating caches, test beyond the window boundary and across repeated
-accept/reject rounds. Restoring only the cursor is insufficient after eviction
-or rotation. Transactions retain the serving window and incoming KV, then replay
-the accepted updates in their original order. Test batch rows independently:
-an incorrect stride in an intermediate-state kernel can write beyond its output
-allocation even when batch-one tests pass.
-
-## Runtime block sizes
-
-GLM-5-Next starts at its native MTP depth and can extend to a three-token block
-(two proposals) when the shared acceptance policy observes reliable acceptance.
-This reduced round overhead in the GLM-5.3-Flash greedy batch-one and batch-four
-checks. Batched stochastic sampling keeps a two-token ceiling by default because
-the extra proposal did not repay its verification cost in that workload.
-Explicit `runtime_block_size` and `--draft-block-size` settings take precedence.
-
-DeepSeek-V4 DSpark defaults to a two-token block (one proposal). Its ordinary
-operators preserve decode arithmetic and physical attention-window order. Larger
-blocks can cost more than their accepted tokens save. The current exact path
-remains slower than baseline on the measured M3 Ultra workloads; use ordinary
-decode when throughput is the priority. Text prefill remains chunked with the
-drafter attached; captured features are retained across chunks. Image spans
-still use the model's whole-image prefill policy.
+See also [vLLM MTP](https://docs.vllm.ai/en/latest/features/speculative_decoding/mtp/),
+[SGLang speculative decoding](https://docs.sglang.io/docs/advanced_features/speculative_decoding),
+and the [official FP8 checkpoint](https://huggingface.co/zai-org/GLM-5.3-Flash).

@@ -736,7 +736,7 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
         spec.loader.exec_module(arch)
         return arch, "custom"
 
-    raw_model_type = config.get("model_type") or config.get("speculators_model_type")
+    raw_model_type = config.get("model_type")
     if raw_model_type is None:
         raise KeyError("model_type")
     model_type = raw_model_type.lower()
@@ -744,20 +744,8 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
     architectures = set(config.get("architectures") or ())
-    dflash_config = config.get("dflash_config")
     if "BoundaryExtractor" in architectures:
         model_type = "gliner2_5"
-    elif "DFlash2DraftModel" in architectures:
-        model_type = "dflash2"
-    elif "Gemma4DSparkModel" in architectures:
-        model_type = "gemma4_dspark"
-    elif dflash_config is not None:
-        is_dspark = (
-            dflash_config.get("projector_type") == "dspark"
-            or int(config.get("markov_rank") or dflash_config.get("markov_rank") or 0)
-            > 0
-        )
-        model_type = "dspark" if is_dspark else f"{model_type}_dflash"
 
     last_err: Optional[ImportError] = None
     for pkg in ("mlx_vlm.models", "mlx_vlm.speculative.drafters"):

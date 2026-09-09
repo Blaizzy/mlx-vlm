@@ -1,4 +1,4 @@
-"""Format-independent quantized operations for exact speculative verification."""
+"""Format-independent quantized projections shared by AR and block decoding."""
 
 from functools import lru_cache
 from typing import Optional

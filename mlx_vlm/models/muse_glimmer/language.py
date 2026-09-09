@@ -267,7 +267,6 @@ class TextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    requires_uniform_batch_acceptance = True
 
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -278,24 +277,6 @@ class LanguageModel(nn.Module):
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
         self.final_logit_softcapping = args.final_logit_softcapping
         self.output_multiplier = args.output_multiplier
-
-    def chunked_prefill_policy(
-        self,
-        *,
-        input_ids=None,
-        inputs_embeds=None,
-        prompt_cache=None,
-        draft_model=None,
-        draft_kind=None,
-        prefill_kwargs=None,
-    ) -> bool:
-        del input_ids, inputs_embeds, prompt_cache
-        if draft_model is None:
-            return True
-        prefill_kwargs = prefill_kwargs or {}
-        if draft_kind in ("dflash", "eagle3"):
-            return prefill_kwargs.get("capture_layer_ids") is not None
-        return False
 
     def __call__(
         self,
@@ -321,54 +302,6 @@ class LanguageModel(nn.Module):
         softcap = self.final_logit_softcapping
         logits = mx.tanh(logits / softcap) * softcap
         return LanguageModelOutput(logits=logits, hidden_states=hidden_sink)
-
-    def rollback_speculative_cache(
-        self,
-        caches: list[Any],
-        gdn_states: Any,
-        accepted: Any,
-        block_size: int,
-    ) -> int:
-        """Rewind target KV caches to the accepted speculative prefix."""
-
-        del gdn_states
-        if isinstance(accepted, int):
-            accepted = mx.array([accepted])
-        if isinstance(accepted, (list, tuple)):
-            accepted = mx.array(accepted, dtype=mx.int32)
-
-        max_accepted = int(accepted.max().item())
-        retained = max_accepted + 1
-        trim = block_size - retained
-        is_batch = accepted.size > 1
-        valid_ends = accepted + 1
-
-        for cache in caches:
-            if cache is None:
-                continue
-            if trim > 0 and hasattr(cache, "trim"):
-                cache.trim(trim)
-            if (
-                is_batch
-                and hasattr(cache, "_idx")
-                and cache.keys is not None
-                and max_accepted > 0
-            ):
-                cache_length = cache._idx
-                verify_start = cache_length - retained
-                if any(
-                    verify_start + int(valid_end) < cache_length
-                    for valid_end in valid_ends.tolist()
-                ):
-                    raise RuntimeError(
-                        "Muse Glimmer batched speculative rollback requires uniform "
-                        f"per-row acceptance; got ragged accepts {accepted.tolist()}. "
-                        "Zeroing a rejected row's KV tail leaves phantom keys "
-                        "attended (issue #1962); set "
-                        "requires_uniform_batch_acceptance on the drafter or target "
-                        "so accepts are clamped before rollback."
-                    )
-        return max_accepted
 
     @property
     def layers(self):

@@ -129,10 +129,9 @@ def test_streaming_converter_refuses_nonempty_output(tmp_path):
         raise AssertionError("Expected non-empty output to be rejected")
 
 
-def test_dedicated_converter_resolves_source_and_extracts_dspark(tmp_path, monkeypatch):
+def test_dedicated_converter_resolves_source(tmp_path, monkeypatch):
     source = _make_source(tmp_path)
     output = tmp_path / "output"
-    drafter = tmp_path / "drafter"
     calls = {}
 
     monkeypatch.setattr(
@@ -147,14 +146,7 @@ def test_dedicated_converter_resolves_source_and_extracts_dspark(tmp_path, monke
         Path(output_path).mkdir()
         return Path(output_path)
 
-    class Splitter:
-        def split(self, model_path, output_path):
-            calls.update(dspark_source=model_path, dspark_output=output_path)
-
-    from mlx_vlm.speculative.drafters import mtp_split
-
     monkeypatch.setattr(convert_module, "convert_deepseek_v4_vision", fake_convert)
-    monkeypatch.setattr(mtp_split, "detect_mtp_splitter", lambda path: Splitter())
     monkeypatch.setattr(
         convert_module,
         "create_model_card",
@@ -170,8 +162,6 @@ def test_dedicated_converter_resolves_source_and_extracts_dspark(tmp_path, monke
         "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
         output,
         revision="test-revision",
-        mtp=True,
-        mtp_output=drafter,
         upload_repo="mlx-community/test-model",
     )
 
@@ -180,8 +170,6 @@ def test_dedicated_converter_resolves_source_and_extracts_dspark(tmp_path, monke
     assert calls["revision"] == "test-revision"
     assert calls["model_path"] == source
     assert calls["output_path"] == output
-    assert calls["dspark_source"] == str(source)
-    assert calls["dspark_output"] == str(drafter)
     assert calls["card"] == (
         output,
         "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
@@ -196,10 +184,8 @@ def test_dedicated_converter_parser_uses_model_specific_options():
             "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
             "--mlx-path",
             "converted",
-            "--mtp",
         ]
     )
 
     assert args.model == "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp"
     assert args.output_path == "converted"
-    assert args.mtp is True

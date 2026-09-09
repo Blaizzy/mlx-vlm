@@ -213,7 +213,7 @@ def generate_step(
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
     draft_model: Optional[nn.Module] = None,
-    draft_kind: str = "dflash",
+    draft_kind: str = "mtp",
     draft_block_size: Optional[int] = None,
     prompt_cache_checkpoint: Optional[Callable[[int, List[Any]], None]] = None,
     prompt_cache_checkpoint_len: Optional[int] = None,
@@ -266,11 +266,11 @@ def generate_step(
           memory usage.
         draft_model (nn.Module, optional): A drafter for speculative decoding.
           When set, the decode loop is replaced by the drafter's speculative
-          loop (e.g. DFlash block-diffusion). VLM prefill with image/audio
+          MTP loop. VLM prefill with image/audio
           is supported via the same ``get_input_embeddings`` path the normal
           decoder uses; decode itself is text-only. ``temperature`` and
-          ``sampler`` are respected; ``logprobs`` is always ``None`` on the
-          speculative path.
+          ``sampler`` are respected; continuation ``logprobs`` are unavailable
+          on the speculative path.
         draft_block_size (int, optional): Override the drafter's configured
           block size.
 
@@ -331,6 +331,8 @@ def generate_step(
     )
     if logits_processors is not None:
         processors.extend(logits_processors)
+    if draft_model is not None and processors:
+        raise ValueError("Logits processors are not yet supported by MTP decoding.")
 
     y = input_ids
     tokens = mx.array([], dtype=input_ids.dtype)
@@ -347,12 +349,18 @@ def generate_step(
 
     # Speculative decoding setup
     last_outputs = None
-    speculative_prefill = SpeculativePrefill(draft_kind, draft_model)
+    speculative_prefill = SpeculativePrefill(draft_kind, draft_model, input_ids)
     speculative_prefill_capture_kwargs = {}
     if draft_model is not None:
+        from ..speculative.cache_state import CacheTransaction
         from ..speculative.drafters import validate_drafter_compatibility
 
         validate_drafter_compatibility(model, draft_model, draft_kind)
+        CacheTransaction.check_types(prompt_cache)
+        if any(not entry.empty() for entry in prompt_cache):
+            raise ValueError(
+                "MTP requires a fresh prompt cache; target-only prefix reuse is not supported."
+            )
         speculative_prefill_capture_kwargs = speculative_prefill_kwargs(
             draft_kind, draft_model
         )
@@ -527,7 +535,7 @@ def generate_step(
             model,
             draft_model,
             prompt_cache,
-            input_ids,
+            speculative_prefill.tokens,
             y,
             logprobs,
             last_outputs,
@@ -1543,7 +1551,6 @@ class SpeculativeGenerationBatch:
         stop_criteria,
         max_tokens: List[int],
         hidden: mx.array,
-        shared_kv_states: Optional[dict],
         prompt_tokens: mx.array,
         *,
         draft_block_size: Optional[int] = None,
@@ -1561,7 +1568,6 @@ class SpeculativeGenerationBatch:
         self.stop_criteria = stop_criteria
         self.max_tokens = list(max_tokens)
         self.hidden = hidden
-        self.shared_kv_states = shared_kv_states
         self.prompt_tokens = prompt_tokens
         self.draft_block_size = draft_block_size
         self.token_dtype = token_dtype
@@ -1578,6 +1584,9 @@ class SpeculativeGenerationBatch:
         self.uids = [
             uid for uid, done in zip(self._all_uids, self._finished) if not done
         ]
+        if not self.uids and self._rounds_iter is not None:
+            self._rounds_iter.close()
+            self._rounds_iter = None
 
     def extend(self, other: "SpeculativeGenerationBatch"):
         if len(self) == 0:
@@ -1642,13 +1651,12 @@ class SpeculativeGenerationBatch:
             self.hidden,
             draft_kind=self.draft_kind,
             first_bonus=self.first_tokens,
-            max_tokens=max(self.max_tokens) if self.max_tokens else 0,
+            max_tokens=self.max_tokens,
             sampler=self.sampler,
             draft_block_size=self.draft_block_size,
             token_dtype=self.token_dtype,
             stop_check=stop_check,
             greedy_sampling=self.greedy_sampling,
-            shared_kv_states=self.shared_kv_states,
             eos_token_ids=None,
             prompt_tokens=self.prompt_tokens,
             row_ids=[0] * len(self._all_uids),
@@ -1761,6 +1769,15 @@ class PromptProcessingBatch:
         self.max_tokens = max_tokens
         self.prefill_step_size = prefill_step_size
         self._speculative_prefill = SpeculativePrefill(draft_kind, draft_model)
+        if draft_model is not None:
+            if warm_cache is not None:
+                raise ValueError("MTP requires a fresh prompt cache.")
+            if right_pad_per_row is not None and any(right_pad_per_row):
+                raise ValueError("MTP prefill requires left-padded prompts.")
+            if logits_processors and any(logits_processors):
+                raise ValueError(
+                    "Logits processors are not yet supported by MTP decoding."
+                )
         self.draft_model = draft_model
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
@@ -1786,6 +1803,8 @@ class PromptProcessingBatch:
             left_padding = [max_length - l for l in lengths]
             self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
         self._left_padding_per_row = list(left_padding)
+        if draft_model is not None:
+            self._speculative_prefill.tokens = self._input_ids
         self._total_prompt_tokens = sum(lengths)
         self._processed_prompt_columns = 0
         self._finished_prompt_logits: dict[int, mx.array] = {}
@@ -1874,6 +1893,11 @@ class PromptProcessingBatch:
                 quantized_kv_start=quantized_kv_start,
                 prefill_length=max_length,
             )
+
+        if draft_model is not None:
+            from ..speculative.cache_state import CacheTransaction
+
+            CacheTransaction.check_types(self.prompt_cache)
 
         # Declare per-row right-padding on each cache so finalize() can roll
         # it into left-padding once the prefill forward pass is complete.
@@ -2216,10 +2240,7 @@ class PromptProcessingBatch:
                 stop_criteria=stop_criteria,
                 max_tokens=list(self.max_tokens),
                 hidden=speculative_hidden_state(self.draft_kind, output),
-                shared_kv_states=(
-                    output.shared_kv_states if self.draft_kind == "mtp" else None
-                ),
-                prompt_tokens=self._input_ids,
+                prompt_tokens=self._speculative_prefill.tokens,
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
                 greedy_sampling=self.greedy_sampling,
@@ -2452,12 +2473,15 @@ class BatchGenerator:
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling or sampler is None
         if self.draft_model is not None:
+            apc_manager = None
             compute_logprobs = False
             top_logprobs_k = 0
             self.compute_logprobs = False
             self.top_logprobs_k = 0
         self.apc = (
-            _apc.APCCoordinator(apc_manager, model) if apc_manager is not None else None
+            _apc.APCCoordinator(apc_manager, model)
+            if apc_manager is not None and draft_model is None
+            else None
         )
         if self.apc is not None and not self.apc.enabled:
             self.apc = None
