@@ -269,6 +269,7 @@ class GenerationResult:
     diffusion_total_steps: int = 0
     diffusion_canvas_index: int = 0
     diffusion_block_complete: bool = False
+    token_ids: Optional[List[int]] = None
 
 
 class PromptCacheState:

@@ -24,6 +24,7 @@ from ..utils import (
     prepare_inputs,
     should_add_special_tokens,
 )
+from .audio import generate_audio
 from .common import (
     DEFAULT_DIFFUSION_MAX_DENOISING_STEPS,
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
@@ -97,7 +98,7 @@ DEFAULT_THINKING_END_TOKEN = "</think>"
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Generate text, an image, or a video with a supported model."
+        description="Generate text, an image, a video, or audio with a supported model."
     )
     parser.add_argument(
         "--model",
@@ -108,18 +109,24 @@ def parse_arguments():
     parser.add_argument(
         "--output-modality",
         type=str,
-        choices=("text", "image", "video"),
+        choices=("text", "image", "video", "audio"),
         default="text",
         help=(
             "Generate text with a VLM, an image with a supported image model, "
-            "or a video with a supported video model."
+            "a video with a supported video model, or speech with an omni model."
         ),
     )
     parser.add_argument(
         "--output",
         type=str,
         default=None,
-        help="Output path for image or video generation.",
+        help="Output path for image, video, or audio generation (.wav for audio).",
+    )
+    parser.add_argument(
+        "--ref-audio",
+        type=str,
+        default=None,
+        help="Reference voice audio for --output-modality audio.",
     )
     parser.add_argument(
         "--task",
@@ -656,13 +663,48 @@ def normalize_resize_shape(
 
 from .diffusion import (
     DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD,
-    DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
     DiffusionOutputHandler,
     diffusion_kwargs_from_args,
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
 from .types import GenerateKwargs, ProcessorLike, Unpack
+
+
+def _prepare_generation_inputs(model, processor, prompt, image, audio, video, kwargs):
+    """Prepare multimodal inputs once, or consume caller-prepared tensors."""
+    resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
+    if kwargs.get("input_ids") is not None:
+        input_ids = kwargs.pop("input_ids")
+        pixel_values = kwargs.pop("pixel_values", None)
+        mask = kwargs.pop("mask", None)
+        return input_ids, pixel_values, mask, dict(kwargs)
+
+    inputs = prepare_inputs(
+        processor,
+        images=image or None,
+        audio=audio or None,
+        videos=video or None,
+        prompts=prompt,
+        image_token_index=getattr(model.config, "image_token_index", None),
+        resize_shape=resize_shape,
+        add_special_tokens=should_add_special_tokens(
+            model.config.model_type, processor
+        ),
+        **kwargs,
+    )
+    data_kwargs = {
+        key: value
+        for key, value in inputs.items()
+        if key not in ("input_ids", "pixel_values", "attention_mask")
+    }
+    kwargs.update(data_kwargs)
+    return (
+        inputs.get("input_ids"),
+        inputs.get("pixel_values"),
+        inputs.get("attention_mask"),
+        data_kwargs,
+    )
 
 
 def _prime_cached_prefix_rope_state(
@@ -808,10 +850,6 @@ def stream_generate(
         else []
     )
 
-    add_special_tokens = should_add_special_tokens(model.config.model_type, processor)
-
-    resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
-    image_token_index = getattr(model.config, "image_token_index", None)
     vision_cache = kwargs.pop("vision_cache", None)
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
     apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
@@ -820,31 +858,9 @@ def stream_generate(
     audio = audio or None
     video = video or None
 
-    if kwargs.get("input_ids", None) is not None:
-        input_ids = kwargs.pop("input_ids")
-        pixel_values = kwargs.pop("pixel_values", None)
-        mask = kwargs.pop("mask", None)
-    else:
-        inputs = prepare_inputs(
-            processor,
-            images=image,
-            audio=audio,
-            videos=video,
-            prompts=prompt,
-            image_token_index=image_token_index,
-            resize_shape=resize_shape,
-            add_special_tokens=add_special_tokens,
-            **kwargs,
-        )
-        input_ids = inputs.get("input_ids", None)
-        pixel_values = inputs.get("pixel_values", None)
-        mask = inputs.get("attention_mask", None)
-        data_kwargs = {
-            k: v
-            for k, v in inputs.items()
-            if k not in ["input_ids", "pixel_values", "attention_mask"]
-        }
-        kwargs.update(data_kwargs)
+    input_ids, pixel_values, mask, _ = _prepare_generation_inputs(
+        model, processor, prompt, image, audio, video, kwargs
+    )
 
     if is_diffusion_model(model, kwargs):
         yield from stream_diffusion_generate_from_kwargs(
@@ -1121,6 +1137,7 @@ def stream_generate(
                 peak_memory=mx.get_peak_memory() / 1e9,
                 cached_tokens=reused_prefix_len,
                 finish_reason="length",
+                token_ids=[],
             )
             return
 
@@ -1137,6 +1154,10 @@ def stream_generate(
             peak_memory=mx.get_peak_memory() / 1e9,
             cached_tokens=reused_prefix_len,
             finish_reason=finish_reason,
+            token_ids=[
+                int(t.item()) if hasattr(t, "item") else int(t)
+                for t in generated_tokens
+            ],
         )
 
         # Save cache state for potential reuse on next turn
@@ -1281,6 +1302,7 @@ def generate(
     return GenerationResult(
         text=text,
         token=last_response.token,
+        token_ids=last_response.token_ids,
         logprobs=last_response.logprobs,
         prompt_tokens=last_response.prompt_tokens,
         generation_tokens=last_response.generation_tokens,
@@ -1300,13 +1322,21 @@ def generate(
 
 def main():
     args = parse_arguments()
+    output_modality = getattr(args, "output_modality", "text")
 
-    if getattr(args, "output_modality", "text") == "image":
+    if output_modality == "image":
         run_image_generation_cli(args)
         return
-    if getattr(args, "output_modality", "text") == "video":
+    if output_modality == "video":
         run_video_generation_cli(args)
         return
+    if output_modality == "audio":
+        if getattr(args, "output", None) is None:
+            raise ValueError(
+                "--output is required when --output-modality audio is selected"
+            )
+        if args.chat:
+            raise ValueError("--output-modality audio does not support --chat")
 
     if getattr(args, "seed", None) is not None:
         mx.random.seed(args.seed)
@@ -1452,6 +1482,8 @@ def main():
     num_audios = len(args.audio) if args.audio is not None else 0
 
     chat_template_kwargs = {"enable_thinking": args.enable_thinking}
+    if output_modality == "audio":
+        chat_template_kwargs["use_tts_template"] = True
     if args.thinking_mode is not None:
         chat_template_kwargs["thinking_mode"] = args.thinking_mode
     if args.video:
@@ -1612,7 +1644,12 @@ def main():
         if args.verbose:
             _enable_verbose_logging()
 
-        result = generate(
+        generate_fn = generate
+        if output_modality == "audio":
+            generate_fn = generate_audio
+            gen_kwargs["output_audio_path"] = args.output
+            gen_kwargs["ref_audio_path"] = args.ref_audio
+        result = generate_fn(
             model,
             processor,
             prompt,
@@ -1620,6 +1657,8 @@ def main():
         )
         if not args.verbose:
             print(result.text)
+        if output_modality == "audio":
+            print(f"Audio written to {result.path}")
 
         if draft_model is not None:
             stats = format_speculative_stats(draft_model)
