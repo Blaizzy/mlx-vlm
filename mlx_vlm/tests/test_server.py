@@ -6829,6 +6829,10 @@ class TestSplitThinking:
         assert reasoning == "Thinking text"
         assert content == "Answer."
 
+    @pytest.mark.parametrize("prefix", ["", "thought\n"])
+    def test_channel_close_only(self, prefix):
+        assert server._split_thinking(f"{prefix}got it<channel|>42") == ("got it", "42")
+
     def test_no_thinking(self):
         text = "Just plain text."
         reasoning, content = server._split_thinking(text)
