@@ -8,15 +8,19 @@ and reading order. The model does not transcribe text.
 
 ## Detect page regions
 
-Run the [example script](../../../examples/pp_doclayout_v3.py) from the repository root:
+Replace `page.png` with your input image:
 
-```sh
-python -m examples.pp_doclayout_v3 \
-  --image path/to/page.png \
-  --output-json output/layout.json \
-  --output-image output/layout.png
+```python
+from mlx_vlm.utils import get_model_path, load_model
+
+model = load_model(get_model_path("HashNuke/pp-doclayout-v3-mlx"))
+regions = sorted(
+    model.detect("page.png"),
+    key=lambda region: region["reading_order"],
+)
+print(regions)
 ```
 
-Saves reading-ordered detections as JSON and an annotated image. Each JSON
-region contains `label`, `score`, `reading_order` (one-based), and `bbox`
+Prints reading-ordered detections. Each region contains `label`, `score`,
+`reading_order` (one-based), and `bbox`
 (`[y0, x0, y1, x1]`, normalized to 0–1000).
