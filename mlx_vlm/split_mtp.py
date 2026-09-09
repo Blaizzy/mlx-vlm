@@ -26,7 +26,8 @@ def split_mtp(
     block_size: Optional[int] = None,
     force_download: bool = False,
     q_bits: Optional[int] = None,
-    q_group_size: int = 64,
+    q_group_size: Optional[int] = None,
+    q_mode: Optional[str] = None,
 ) -> Path:
     if model_type is not None:
         splitter = get_mtp_splitter(model_type)
@@ -55,6 +56,7 @@ def split_mtp(
         force_download=force_download,
         q_bits=q_bits,
         q_group_size=q_group_size,
+        q_mode=q_mode,
     )
 
 
@@ -73,7 +75,13 @@ def configure_parser() -> argparse.ArgumentParser:
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--force-download", action="store_true")
     parser.add_argument("--q-bits", type=int, default=None)
-    parser.add_argument("--q-group-size", type=int, default=64)
+    parser.add_argument("--q-group-size", type=int, default=None)
+    parser.add_argument(
+        "--q-mode",
+        choices=["affine", "mxfp4", "nvfp4", "mxfp8"],
+        default=None,
+        help="MTP quantization mode; mode-specific bits/group defaults are used.",
+    )
     return parser
 
 

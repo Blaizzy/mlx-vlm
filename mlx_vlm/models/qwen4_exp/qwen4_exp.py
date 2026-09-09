@@ -39,17 +39,23 @@ class Model(Qwen3_5Model):
         for layer_idx in range(self.config.text_config.num_hidden_layers):
             prefix = f"model.language_model.layers.{layer_idx}.mlp"
             gate_up_key = f"{prefix}.experts.gate_up_proj"
-            if gate_up_key in weights:
-                gate_up = weights.pop(gate_up_key)
+            for parameter in (None, "weight", "scales", "biases"):
+                suffix = "" if parameter is None else f".{parameter}"
+                source_key = gate_up_key + suffix
+                if source_key not in weights:
+                    continue
+                gate_up = weights.pop(source_key)
                 midpoint = gate_up.shape[-2] // 2
-                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[
+                destination = parameter or "weight"
+                weights[f"{prefix}.switch_mlp.gate_proj.{destination}"] = gate_up[
                     ..., :midpoint, :
                 ]
-                weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[
+                weights[f"{prefix}.switch_mlp.up_proj.{destination}"] = gate_up[
                     ..., midpoint:, :
                 ]
-                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
-                    f"{prefix}.experts.down_proj"
+                down_key = f"{prefix}.experts.down_proj{suffix}"
+                weights[f"{prefix}.switch_mlp.down_proj.{destination}"] = weights.pop(
+                    down_key
                 )
 
         sanitized = {}
