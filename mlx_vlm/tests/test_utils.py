@@ -44,8 +44,15 @@ from mlx_vlm.utils import (
 )
 
 
-@pytest.mark.parametrize("quant_method", ["modelopt", "modelopt_mixed"])
-def test_transform_modelopt_nvfp4_weights(quant_method):
+@pytest.mark.parametrize(
+    ("quant_method", "quant_algo"),
+    [
+        ("modelopt", "NVFP4"),
+        ("modelopt", "W4A16_NVFP4"),
+        ("modelopt_mixed", "NVFP4"),
+    ],
+)
+def test_transform_modelopt_nvfp4_weights(quant_method, quant_algo):
     packed = mx.arange(32, dtype=mx.uint8).reshape(2, 16)
     weights = {
         "layer.weight": packed,
@@ -57,7 +64,7 @@ def test_transform_modelopt_nvfp4_weights(quant_method):
 
     transformed, quantization = _transform_modelopt_nvfp4_weights(
         weights,
-        {"quant_method": quant_method, "quant_algo": "NVFP4"},
+        {"quant_method": quant_method, "quant_algo": quant_algo},
     )
 
     assert transformed["layer.weight"].dtype == mx.uint32
@@ -729,7 +736,33 @@ def test_load_processor_preserves_additional_eos_tokens_on_reset():
     criteria = loaded.tokenizer.stopping_criteria
     assert criteria.eos_token_ids == [2, 3]
     criteria.reset([5])
-    assert criteria.eos_token_ids == [5, 3]
+    assert criteria.eos_token_ids == [5, 2, 3]
+
+
+def test_load_processor_keeps_tokenizer_eos_when_config_eos_differs():
+    # Chandra OCR 2 configures <|endoftext|> (248044) but ends turns with
+    # <|im_end|> (248046), so dropping either token never stops generation.
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=248046))
+
+    class Detokenizer:
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+
+    with (
+        patch(
+            "mlx_vlm.utils.AutoProcessor.from_pretrained",
+            return_value=processor,
+        ),
+        patch("mlx_vlm.utils.load_tokenizer", return_value=Detokenizer),
+    ):
+        loaded = load_processor("unused-model-path", eos_token_ids=248044)
+
+    criteria = loaded.tokenizer.stopping_criteria
+    assert criteria.eos_token_ids == [248044, 248046]
+
+    # generate() resets to the config EOS on every call.
+    criteria.reset(248044)
+    assert criteria.eos_token_ids == [248044, 248046]
 
 
 def test_load_passes_revision():

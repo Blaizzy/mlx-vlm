@@ -85,6 +85,7 @@ nav:
     - Installation: installation.md
     - CLI Reference: cli_reference.md
     - Examples: examples.md
+    - Speculative Decoding: speculative-decoding.md
     - Contributing: contributing.md
     - Community Projects: community_projects.md
     - Report Issues: report_issues.md

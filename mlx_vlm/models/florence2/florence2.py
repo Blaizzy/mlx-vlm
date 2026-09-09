@@ -124,6 +124,11 @@ class PositionalEmbeddingCosine1D(nn.Module):
 class Model(nn.Module):
     """Florence-2 model for conditional generation."""
 
+    # Florence-2 is encoder-decoder: the encoder consumes the whole prompt in
+    # one pass, so the decoder-only chunked prefill (which drops the last token
+    # while keeping the full attention mask) must not run.
+    no_chunked_prefill = True
+
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config

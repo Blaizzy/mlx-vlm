@@ -740,11 +740,14 @@ def _prefix_cache_trim_amount(kv_cache: List[Any], prefix_len: int) -> Optional[
     silent output corruption, or a broadcast crash once speculative decoding wraps
     the cache in ``BufferedRotatingKVCache``. Returns the number of tokens to drop
     (``0`` when the whole cache is reusable), or ``None`` when an entry has already
-    evicted part of the prefix and the caller must cold-prefill instead.
+    evicted part of the prefix, or holds untrimmable state (e.g. the ``ArraysCache``
+    of hybrid/linear-attention layers), and the caller must cold-prefill instead.
     """
     cached_len = max((int(getattr(c, "offset", 0) or 0) for c in kv_cache), default=0)
     n_drop = max(0, cached_len - prefix_len)
-    if n_drop and not all(_cache_fully_retained(c) for c in kv_cache):
+    if n_drop and not all(
+        c.is_trimmable() and _cache_fully_retained(c) for c in kv_cache
+    ):
         return None
     return n_drop
 
@@ -863,6 +866,11 @@ def stream_generate(
         cached = vision_cache.get(image)
         if cached is not None:
             kwargs["cached_image_features"] = cached
+        elif hasattr(model, "encode_images"):
+            features = model.encode_images(pixel_values, **kwargs)
+            mx.eval(*features)
+            vision_cache.put(image, features)
+            kwargs["cached_image_features"] = features
         elif hasattr(model, "encode_image"):
             features = model.encode_image(pixel_values)
             mx.eval(features)
@@ -902,6 +910,8 @@ def stream_generate(
         if not apc_coordinator.enabled:
             apc_coordinator = None
             apc_manager = None
+        else:
+            apc_coordinator.prepare_prefill(len(full_input_ids_list))
 
     if apc_manager is not None:
         image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)
@@ -1017,21 +1027,22 @@ def stream_generate(
         detokenizer = make_streaming_detokenizer(processor)
         thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
         exact_checkpoint_len = None
+        exact_checkpoint_lengths = []
         exact_checkpoint = None
-        if (
-            apc_coordinator is not None
-            and apc_coordinator.is_checkpoint
-            and reused_prefix_len == 0
-        ):
-            exact_checkpoint_len = apc_coordinator.checkpoint_len(
-                full_input_ids_list, multimodal_token_ids
-            )
-            if exact_checkpoint_len <= 0:
-                exact_checkpoint_len = None
+        if apc_coordinator is not None and apc_coordinator.is_checkpoint:
+            exact_checkpoint_lengths = [
+                n - reused_prefix_len
+                for n in apc_coordinator.checkpoint_lengths(
+                    full_input_ids_list, multimodal_token_ids
+                )
+                if n > reused_prefix_len
+            ]
+            if exact_checkpoint_lengths:
+                exact_checkpoint_len = exact_checkpoint_lengths[-1]
 
             def exact_checkpoint(prefix_len: int, prompt_cache: List[Any]) -> None:
                 apc_coordinator.store_checkpoint(
-                    full_input_ids_list[:prefix_len],
+                    full_input_ids_list[: reused_prefix_len + prefix_len],
                     prompt_cache,
                     extra_hash=apc_extra_hash,
                 )
@@ -1043,6 +1054,7 @@ def stream_generate(
             mask,
             prompt_cache_checkpoint=exact_checkpoint,
             prompt_cache_checkpoint_len=exact_checkpoint_len,
+            prompt_cache_checkpoint_lengths=exact_checkpoint_lengths,
             verbose=verbose,
             **kwargs,
         )

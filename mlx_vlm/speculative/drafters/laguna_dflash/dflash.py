@@ -275,15 +275,16 @@ class LagunaDFlashDraftModel(nn.Module):
         tokenizer_length = len(tokenizer) if tokenizer is not None else None
         if tokenizer_length is None and target_config is not None:
             tokenizer_length = getattr(target_config, "vocab_size", None)
+        lm = getattr(target_model, "language_model", target_model)
         validate_laguna_dflash_target(
             self.config,
             target_model_config=target_config,
             target_model_layer_count=target_layer_count,
             target_tokenizer_length=tokenizer_length,
+            target_language_model=lm,
         )
         self.embed_tokens = inner.embed_tokens
         self.embed_scale = getattr(self.embed_tokens, "embed_scale", 1.0)
-        lm = getattr(target_model, "language_model", target_model)
         self.lm_head = getattr(lm, "lm_head", None) or self.embed_tokens.as_linear
         return self
 
@@ -297,6 +298,7 @@ class LagunaDFlashDraftModel(nn.Module):
             target_model_layer_count=(
                 len(target_layers) if target_layers is not None else None
             ),
+            target_language_model=target,
         )
 
     def make_cache(self) -> List[KVCache]:

@@ -48,6 +48,7 @@ MODEL_REMAPPING = {
     "granite4-vision": "granite4_vision",
     "granite4_vision": "granite4_vision",
     "rf-detr": "rfdetr",
+    "dinov2_with_registers": "dinov2",
     "falcon-perception": "falcon_perception",
     "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
     "cohere2moe": "cohere2_moe",
@@ -184,7 +185,11 @@ def _transform_modelopt_nvfp4_weights(
     if quantization_config.get("quant_method") not in {
         "modelopt",
         "modelopt_mixed",
-    } or quantization_config.get("quant_algo") not in {"NVFP4", "MIXED_PRECISION"}:
+    } or quantization_config.get("quant_algo") not in {
+        "NVFP4",
+        "W4A16_NVFP4",
+        "MIXED_PRECISION",
+    }:
         return weights, None
 
     scale_2_suffix = ".weight_scale_2"
@@ -744,6 +749,8 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
         model_type = "gliner2_5"
     elif "DFlash2DraftModel" in architectures:
         model_type = "dflash2"
+    elif "Gemma4DSparkModel" in architectures:
+        model_type = "gemma4_dspark"
     elif dflash_config is not None:
         is_dspark = (
             dflash_config.get("projector_type") == "dspark"
@@ -1443,19 +1450,15 @@ def load_processor(
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
 
-        # Instantiate the detokenizer
-        processor.detokenizer = detokenizer_class(tokenizer_obj)
-
-        # Determine the EOS token IDs, prioritizing the function argument
-        final_eos_token_ids = (
-            eos_token_ids
-            or getattr(tokenizer_obj, "eos_token_ids", None)
-            or getattr(tokenizer_obj, "eos_token_id", None)
-        )
+        # Non-text models (depth, detection) have no decode(); skip detokenizer
+        try:
+            processor.detokenizer = detokenizer_class(tokenizer_obj)
+        except AttributeError:
+            return processor
 
         # Create and assign the StoppingCriteria
         criteria = StoppingCriteria(
-            final_eos_token_ids,
+            eos_token_ids,
             tokenizer_obj,
             additional_eos_token_ids=getattr(processor, "additional_eos_token_ids", ()),
         )
@@ -2531,6 +2534,29 @@ def group_images_by_shape(
     return grouped_images, grouped_indices
 
 
+def resolve_eos_token_ids(eos_token_ids, tokenizer) -> List[int]:
+    """Union configured EOS token ids with the tokenizer's own EOS.
+
+    A checkpoint's ``eos_token_id`` can disagree with the token its chat template
+    ends turns on -- Chandra OCR 2 configures ``<|endoftext|>`` but emits
+    ``<|im_end|>`` -- so neither source alone is enough to stop generation.
+    """
+    resolved: List[int] = []
+    for source in (
+        eos_token_ids,
+        getattr(tokenizer, "eos_token_ids", None),
+        getattr(tokenizer, "eos_token_id", None),
+    ):
+        if isinstance(source, int):
+            source = [source]
+        if not isinstance(source, (list, tuple, set)):
+            continue
+        for token_id in source:
+            if isinstance(token_id, int) and token_id not in resolved:
+                resolved.append(token_id)
+    return resolved
+
+
 class StoppingCriteria:
     def __init__(
         self,
@@ -2572,14 +2598,7 @@ class StoppingCriteria:
             self.eos_token_ids.extend(resolved)
 
     def reset(self, eos_token_ids: List[int] = None):
-        eos_token_ids = (
-            eos_token_ids if eos_token_ids is not None else self.tokenizer.eos_token_ids
-        )
-
-        if isinstance(eos_token_ids, int):
-            eos_token_ids = [eos_token_ids]
-
-        resolved = list(eos_token_ids)
+        resolved = resolve_eos_token_ids(eos_token_ids, self.tokenizer)
         resolved.extend(
             token_id
             for token_id in self.additional_eos_token_ids

@@ -335,6 +335,14 @@ class LanguageModel(nn.Module):
         video_token_id = self.config.video_token_id
         vision_start_token_id = self.config.vision_start_token_id
         mrope_position_deltas = []
+        # The processor emits one vision block per temporal patch group, so
+        # expand each video grid (t, h, w) into t rows of (1, h, w) — the same
+        # split the reference implementation performs before indexing.
+        if video_grid_thw is not None:
+            rows = []
+            for thw in video_grid_thw.tolist():
+                rows.extend([[1, thw[1], thw[2]]] * int(thw[0]))
+            video_grid_thw = mx.array(rows, dtype=mx.int32)
         if input_ids is not None and (
             image_grid_thw is not None or video_grid_thw is not None
         ):

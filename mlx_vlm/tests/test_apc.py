@@ -480,6 +480,7 @@ def test_disk_store_recovers_when_cache_dir_is_deleted(tmp_path):
 def test_from_env_respects_opt_in_and_disk_config(tmp_path, monkeypatch):
     monkeypatch.delenv("APC_ENABLED", raising=False)
     monkeypatch.delenv("APC_DISK_PATH", raising=False)
+    monkeypatch.setenv("MLX_VLM_CACHE_HOME", str(tmp_path / "cache"))
     assert from_env() is None
 
     monkeypatch.setenv("APC_ENABLED", "1")
@@ -490,7 +491,8 @@ def test_from_env_respects_opt_in_and_disk_config(tmp_path, monkeypatch):
     assert manager is not None
     assert manager.block_size == 8
     assert manager.num_blocks == 3
-    assert manager.disk is None
+    assert manager.disk.dir == tmp_path / "cache" / "apc" / "default"
+    assert manager.disk.max_bytes == 20 * (1 << 30)
     manager.close()
 
     monkeypatch.setenv("APC_DISK_PATH", str(tmp_path))
@@ -857,12 +859,17 @@ def test_exact_cache_disk_restore_preserves_qsa_state(tmp_path, monkeypatch):
     qsa.index_position_ids = mx.arange(3 * len(token_ids), dtype=mx.int64).reshape(
         3, 1, len(token_ids)
     )
+    qsa.index_block_keys = mx.arange(1 * 1 * 10 * 6, dtype=mx.float32).reshape(
+        1, 1, 10, 6
+    )
+    qsa.index_block_ratio = 4
     mx.eval(
         arrays[0],
         qsa.keys,
         qsa.values,
         qsa.index_keys,
         qsa.index_position_ids,
+        qsa.index_block_keys,
     )
 
     disk = DiskBlockStore(tmp_path, namespace="qsa-exact")
@@ -891,6 +898,8 @@ def test_exact_cache_disk_restore_preserves_qsa_state(tmp_path, monkeypatch):
     assert bool(
         mx.array_equal(warm[1].index_position_ids, qsa.index_position_ids).item()
     )
+    _assert_allclose(warm[1].index_block_keys, qsa.index_block_keys)
+    assert warm[1].index_block_ratio == qsa.index_block_ratio
 
     memory_warm, memory_matched_tokens = manager.lookup_exact_cache(
         token_ids + [998], extra_hash=19
@@ -908,6 +917,8 @@ def test_exact_cache_disk_restore_preserves_qsa_state(tmp_path, monkeypatch):
     assert isinstance(batch_cache[1], BatchQSAKVCache)
     extracted = batch_cache[1].extract(0)
     _assert_allclose(extracted.index_keys, qsa.index_keys)
+    _assert_allclose(extracted.index_block_keys, qsa.index_block_keys)
+    assert extracted.index_block_ratio == qsa.index_block_ratio
     assert bool(
         mx.array_equal(extracted.index_position_ids, qsa.index_position_ids).item()
     )
@@ -1030,7 +1041,8 @@ def test_exact_cache_disk_write_stats_only_count_committed_files(tmp_path, monke
     monkeypatch.setattr(apc_module.mx, "save_safetensors", fail_after_creating_partial)
     disk = DiskBlockStore(tmp_path, namespace="failed-exact-write")
     manager = APCManager(num_blocks=1, block_size=16, disk=disk)
-    assert manager.store_exact_cache(token_ids, [kv])
+    # Disk-only snapshots write synchronously, so failure is known on return.
+    assert not manager.store_exact_cache(token_ids, [kv])
     disk._q.join()
 
     stats = manager.stats_snapshot()
@@ -1200,6 +1212,18 @@ def test_multimodal_token_ids_from_config():
     )
 
     assert apc_module.multimodal_token_ids_from_config(config) == {42, 77}
+
+
+def test_deepseek_v4_multimodal_token_ids_cover_all_sentinels():
+    config = SimpleNamespace(
+        model_type="deepseek_v4",
+        vision_n_layers=32,
+        vocab_size=129280,
+    )
+
+    assert apc_module.multimodal_token_ids_from_config(config) == set(
+        range(129280, 129285)
+    )
 
 
 def test_media_token_spans_are_contiguous_ranges():

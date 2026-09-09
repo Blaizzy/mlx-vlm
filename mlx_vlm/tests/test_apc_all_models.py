@@ -39,6 +39,7 @@ from mlx_vlm.models.cache import (
 from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
 from mlx_vlm.models.qwen4_exp.language import QSAKVCache
 from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
+from mlx_vlm.models.z1t.language import Z1TCache
 
 
 def _model_source_root() -> Path:
@@ -89,6 +90,7 @@ def _cache_samples():
         "RotatingKVCache": RotatingKVCache(max_size=16),
         "SimpleKVCache": SimpleKVCache(),
         "StaticPrefixKVCache": StaticPrefixKVCache(max_size=16),
+        "Z1TCache": Z1TCache(),
     }
 
 
@@ -235,6 +237,14 @@ def _populated_cache(name: str, token_count: int):
             _populated_cache("KVCache", token_count),
             _populated_cache("ArraysCache", token_count),
         )
+    if name == "Z1TCache":
+        cache = Z1TCache()
+        cache.offset = token_count
+        cache.cum_eKV = mx.ones((1, 4))
+        cache.cum_eK = mx.ones((1, 4)) * 2
+        cache.win_eKV = mx.ones((1, 3, 4)) * 3
+        cache.win_eK = mx.ones((1, 3, 4)) * 4
+        return cache
     raise AssertionError(f"No populated APC sample for {name}")
 
 
