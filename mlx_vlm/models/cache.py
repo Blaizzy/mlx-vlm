@@ -795,11 +795,69 @@ class ArraysCache(_BaseCache):
         """Whether this cache is recording a bounded speculative timeline."""
         return self._speculation is not None
 
+    @property
+    def history_capacity(self):
+        """Maximum post-token states retained per slot in the current window."""
+        return 0 if self._speculation is None else self._speculation["length"]
+
+    def _recorded_length(self, index):
+        record = self._speculation["records"].get(index)
+        if record is None:
+            return 0
+        if record[0] == "window":
+            return record[1].shape[1] - record[2]
+        return 1 if record[1] is None else record[1].shape[1] + 1
+
+    def update_recurrent(self, index, length, update):
+        """Run a state transition and retain only the requested temporal history.
+
+        ``update(state, state_steps)`` returns output, final state, and optional
+        intermediate states. The operator knows how to produce states; this
+        cache owns whether and how many to retain. Both one block update and
+        several smaller updates can fill the same bounded window.
+        """
+        if length < 1:
+            raise ValueError("Recurrent updates must contain at least one token.")
+        if self.history_capacity:
+            if self._recorded_length(index) + length > self.history_capacity:
+                raise ValueError("Recurrent update exceeds the cache history capacity.")
+            state_steps = length - 1 if length > 1 else None
+        else:
+            state_steps = None
+        result = update(self.cache[index], state_steps)
+        output, state = result[:2]
+        if self.history_capacity:
+            intermediate = result[2] if len(result) > 2 else None
+            if (0 if intermediate is None else intermediate.shape[1]) != length - 1:
+                raise ValueError(
+                    "Recurrent update did not return the requested history."
+                )
+            self.record_speculative_states(index, intermediate, state)
+        self.cache[index] = state
+        return output, state
+
+    def update_window(self, index, source, width, *, lengths=None):
+        """Store the trailing causal window and retain its temporal views."""
+        width = int(width)
+        length = source.shape[1] - width
+        if width < 0 or length < 0:
+            raise ValueError("Invalid causal cache window width.")
+        if self.history_capacity:
+            self.record_speculative_window(index, source, width)
+        if lengths is None:
+            state = mx.contiguous(source[:, length : length + width])
+        else:
+            positions = mx.clip(lengths, 0, length)[:, None] + mx.arange(width)
+            positions = positions.reshape(*positions.shape, *([1] * (source.ndim - 2)))
+            state = mx.take_along_axis(source, positions, axis=1)
+        self.cache[index] = state
+        return state
+
     def start_speculation(self, length: int) -> int:
         """Start recording state transitions for a speculative block.
 
-        State producers record either recurrent states after each token or a
-        source array whose fixed-width windows are the temporal cache states.
+        Cache-aware operators use ``update_recurrent`` or ``update_window``;
+        the cache retains recurrent states or views into causal-window inputs.
         The records exist only for the active block and are discarded when the
         next block starts or the transaction is committed.
         """
@@ -829,27 +887,26 @@ class ArraysCache(_BaseCache):
     ) -> None:
         """Record post-token recurrent states for one cache slot.
 
-        ``intermediate_states[:, i]`` is the state after token ``i``. The
-        already-installed ``final_state`` is kept separately, avoiding a
-        concatenation and duplicate full-state allocation.
+        ``intermediate_states[:, i]`` is the state after token ``i`` of this
+        update. Keeping ``final_state`` separately avoids a concatenation and
+        duplicate full-state allocation for a single block update.
         """
         transaction = self._speculation
         if transaction is None:
             return
-        length = transaction["length"]
-        expected = length - 1
-        if intermediate_states is None:
-            if expected:
-                raise ValueError(
-                    "A speculative recurrent cache requires one state for "
-                    "every non-final token."
-                )
-        elif intermediate_states.shape[1] != expected:
-            raise ValueError(
-                "Speculative recurrent-state history has length "
-                f"{intermediate_states.shape[1]}, expected {expected}."
+        index = int(index)
+        length = 1 if intermediate_states is None else intermediate_states.shape[1] + 1
+        previous = transaction["records"].get(index)
+        if self._recorded_length(index) + length > self.history_capacity:
+            raise ValueError("Recurrent update exceeds the cache history capacity.")
+        if previous is not None:
+            if previous[0] != "states":
+                raise ValueError("A cache slot cannot change its temporal state kind.")
+            parts = [previous[1], previous[2][:, None], intermediate_states]
+            intermediate_states = mx.concatenate(
+                [part for part in parts if part is not None], axis=1
             )
-        transaction["records"][int(index)] = (
+        transaction["records"][index] = (
             "states",
             intermediate_states,
             final_state,
@@ -873,13 +930,16 @@ class ArraysCache(_BaseCache):
         width = int(width)
         if width < 0:
             raise ValueError("Speculative cache window width cannot be negative.")
-        required = transaction["length"] + width
-        if source.shape[1] < required:
-            raise ValueError(
-                f"Speculative window source has length {source.shape[1]}, "
-                f"expected at least {required}."
-            )
-        transaction["records"][int(index)] = ("window", source, width)
+        index = int(index)
+        length = source.shape[1] - width
+        if length < 0 or self._recorded_length(index) + length > self.history_capacity:
+            raise ValueError("Window update exceeds the cache history capacity.")
+        previous = transaction["records"].get(index)
+        if previous is not None:
+            if previous[0] != "window" or previous[2] != width:
+                raise ValueError("A cache slot cannot change its temporal window.")
+            source = mx.concatenate([previous[1], source[:, width:]], axis=1)
+        transaction["records"][index] = ("window", source, width)
 
     @staticmethod
     def _select_speculative_states(record, initial, lengths, total):
@@ -917,7 +977,7 @@ class ArraysCache(_BaseCache):
             keep = lengths[0]
             return mx.contiguous(source[:, keep : keep + width])
         positions = mx.array(lengths, dtype=mx.int32)[:, None] + mx.arange(width)
-        positions = positions[..., None]
+        positions = positions.reshape(*positions.shape, *([1] * (source.ndim - 2)))
         return mx.take_along_axis(source, positions, axis=1)
 
     def _invalidate_derived_metadata(self):
@@ -971,6 +1031,8 @@ class ArraysCache(_BaseCache):
                 "Speculative cache state changed without temporal records for "
                 f"slots {missing}."
             )
+        if any(self._recorded_length(index) != total for index in records):
+            raise RuntimeError("Temporal cache history does not cover the full window.")
         return transaction, lengths
 
     def commit_speculation(self, lengths, generation: Optional[int] = None) -> None:

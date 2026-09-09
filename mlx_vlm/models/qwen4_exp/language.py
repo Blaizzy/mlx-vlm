@@ -1372,7 +1372,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         token_history = mx.concatenate([previous_context, input_ids], axis=-1)
         if cache is not None:
-            cache[3] = mx.contiguous(token_history[:, -self.context_len :])
+            cache.update_window(3, token_history, self.context_len)
 
         shifted_tokens = [
             self._shift_right_ignore_eos(token_history, shift)
@@ -1447,7 +1447,7 @@ class Qwen4ExpPLELayer(nn.Module):
             )
         conv_input = mx.concatenate([state, x], axis=1)
         if cache is not None:
-            cache[2] = mx.contiguous(conv_input[:, -self.short_conv_state_len :])
+            cache.update_window(2, conv_input, self.short_conv_state_len)
         return nn.silu(self.conv1d(conv_input))
 
     def __call__(
@@ -1770,19 +1770,6 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
         return _qwen4_inject(branch, hyper_input, injection_weights)
 
     def _ple(self, module, hidden_states, input_ids, cache, mask):
-        batch = input_ids.shape[0]
-        embedding = module.ple_embedding
-        if cache is not None and cache[3] is not None:
-            previous_context = cache[3]
-        else:
-            previous_context = mx.full(
-                (batch, embedding.context_len),
-                embedding.eos_token_id,
-                dtype=mx.int64,
-            )
-        token_history = mx.concatenate(
-            [previous_context, input_ids.astype(mx.int64)], axis=-1
-        )
         embeddings = module.ple_embedding(input_ids, cache)
         keys = module.norm_key(self._linear(module.key_proj, embeddings)).reshape(
             *hidden_states.shape[:-1], module.hc_count, module.hidden_size
@@ -1803,27 +1790,7 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
             gated_values = mx.where(mask[..., None], gated_values, 0)
             normed = mx.where(mask[..., None], normed, 0)
 
-        if cache is not None and cache[2] is not None:
-            conv_state = cache[2]
-        else:
-            conv_state = mx.zeros(
-                (batch, module.short_conv_state_len, normed.shape[-1]),
-                dtype=normed.dtype,
-            )
-        conv_input = mx.concatenate([conv_state, normed], axis=1)
-        if cache is not None:
-            cache[2] = mx.contiguous(conv_input[:, -module.short_conv_state_len :])
-            cache.record_speculative_window(
-                2,
-                conv_input,
-                module.short_conv_state_len,
-            )
-            cache.record_speculative_window(
-                3,
-                token_history,
-                embedding.context_len,
-            )
-        return gated_values + nn.silu(module.conv1d(conv_input))
+        return gated_values + module._short_conv(normed, cache)
 
     def _qsa_attention(self, attention, hidden_states, cache, position_ids, mask):
         padding_info = _qwen3_5_left_padding_info(cache)

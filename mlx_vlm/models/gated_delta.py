@@ -355,7 +355,30 @@ def gated_delta_update(
     use_kernel: bool = True,
     lower_bound: Optional[float] = None,
     state_steps: Optional[int] = None,
+    cache=None,
+    cache_index: int = 1,
 ) -> Tuple[mx.array, ...]:
+    if cache is not None:
+        if state is not None or state_steps is not None:
+            raise ValueError("The cache owns recurrent state and history retention.")
+        return cache.update_recurrent(
+            cache_index,
+            q.shape[1],
+            lambda initial, steps: gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                state=initial,
+                mask=mask,
+                use_kernel=use_kernel,
+                lower_bound=lower_bound,
+                state_steps=steps,
+            ),
+        )
     beta = mx.sigmoid(b)
     if lower_bound is None:
         g = compute_g(A_log, a, dt_bias)

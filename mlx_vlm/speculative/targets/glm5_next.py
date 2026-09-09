@@ -7,11 +7,9 @@ import mlx.nn as nn
 
 from ...models.base import scaled_dot_product_attention
 from ...models.deepseek_v4.hyper_connection import HyperConnection
-from ...models.gated_delta import gated_delta_update
 from ...models.glm5_next.language import (
     Glm5NextAttention,
     Glm5NextIndexer,
-    Glm5NextLinearAttention,
     _expert_select,
 )
 from ...models.quantized_verifier import (
@@ -224,46 +222,6 @@ class _HyperConnection(HyperConnection):
         return _OPS._hc_expand(output, x, post, comb)
 
 
-class _LinearAttention(Glm5NextLinearAttention):
-    def _convolve(self, projected, mask, cache):
-        output, state, source = self.qkv_conv(
-            projected,
-            None if cache is None else cache[0],
-            mask,
-            None if cache is None else cache.lengths,
-            return_input=True,
-        )
-        if cache is not None:
-            cache[0] = state
-            cache.record_speculative_window(0, source, self.conv_kernel - 1)
-        return output
-
-    def _recur(self, q, k, v, a, b, mask, cache):
-        length = q.shape[1]
-        result = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log.reshape(self.num_heads, 1),
-            self.dt_bias.reshape(self.num_heads, self.head_dim),
-            state=None if cache is None else cache[1],
-            mask=mask,
-            use_kernel=not self.training,
-            lower_bound=self.lower_bound,
-            state_steps=length - 1 if length > 1 and cache is not None else None,
-        )
-        output, state = result[:2]
-        if cache is not None:
-            cache[1] = state
-            cache.record_speculative_states(
-                1, result[2] if len(result) == 3 else None, state
-            )
-            cache.advance(length)
-        return output
-
-
 class _Indexer(Glm5NextIndexer):
     def _project_queries(self, x, q_resid):
         q = self.wq_b(q_resid).reshape(*x.shape[:2], self.n_heads, self.head_dim)
@@ -341,7 +299,7 @@ class Glm5NextSpeculativeTarget:
             view.ffn_hc = copy(layer.ffn_hc)
             view.ffn_hc.__class__ = _HyperConnection
             if layer.is_linear:
-                view.self_attn = _view(layer.self_attn, _LinearAttention)
+                view.self_attn = _view(layer.self_attn)
             else:
                 view.self_attn = _view(layer.self_attn, _Attention)
                 if layer.self_attn.indexer is not None:

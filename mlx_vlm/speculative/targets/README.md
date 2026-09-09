@@ -3,13 +3,19 @@
 Bind a loaded language model with `bind_speculative_target` once per generation
 session, after loading, quantizing, and casting its weights. GLM-5-Next uses an
 isolated execution view: it copies module containers, shares parameter arrays,
-and specializes projections, temporal state capture, sparse attention execution,
+and specializes projections, sparse attention execution,
 and fused hyperconnection operations. The model's normal decoder traversal owns
 the architecture. Changes to that traversal apply to both execution paths.
 
 The serving model has no speculative methods or flags. Its normal calls also
 remain available through the bound target. Other architectures retain their
 existing target hooks while migrating to this boundary.
+
+Temporal state capture is independent of the target view. GLM and Qwen's
+ordinary recurrent operators use `ArraysCache.update_recurrent`; their causal
+windows use `ArraysCache.update_window`. The cache decides whether to retain
+history and handles block or repeated single-token updates. Target adapters
+must not replace recurrent layers to request or record draft-window states.
 
 DeepSeek-V4's DSpark drafter uses the DFlash runtime. Its bound target starts
 pooling-cache transactions before verification, preserves native projection and

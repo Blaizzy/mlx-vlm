@@ -24,6 +24,7 @@ draft block → target block verification → accept prefix + target token
 | `speculative/eagle3.py` | EAGLE-3 round loops |
 | `speculative/common.py` | Acceptance, sampling state, statistics, and batch safeguards |
 | `models/<family>/language.py` | Normal model traversal and hidden-state capture |
+| `models/cache.py` | Bounded temporal state retention and accepted-state selection |
 | `speculative/targets/` | Bound target views and verification policies |
 | `speculative/ops/` | Decode-equivalent operations and Metal kernels |
 | `speculative/cache_state.py` | Commit and abort of speculative cache transactions |
@@ -45,10 +46,11 @@ draft block → target block verification → accept prefix + target token
 4. Make target prefill return the hidden states the drafter consumes. DFlash and
    EAGLE-3 normally capture configured layers; MTP normally consumes final
    hidden state and may share target K/V.
-5. Bind a target view under `speculative/targets/`. Reuse the normal model
-   traversal, specialize operations at ordinary mathematical boundaries, and
-   start a shared cache transaction before verification. Keep speculative
-   flags, acceptance decisions, and rollback bookkeeping out of model layers.
+5. Use the model's ordinary forward with a shared cache transaction. Stateful
+   operators write through the temporal cache interface so rollback works
+   without a second implementation of the layer. Bind a target view under
+   `speculative/targets/` only when numerical execution policies are needed.
+   Keep acceptance decisions and history-retention policy out of model layers.
 6. Add synthetic contract tests, then validate the real target and drafter
    checkpoints before reporting support.
 
@@ -90,6 +92,25 @@ verifier must:
 
 Fused argmax and custom Metal kernels are optimizations, not correctness
 shortcuts. Keep the full-logit fallback until parity is proven.
+
+## Temporal caches for linear attention
+
+`ArraysCache` owns a bounded history for the active verification window. Normal
+decoding retains only the latest state. The same forward call can run inside a
+cache transaction: no model-specific checkpoint or recurrent-layer replacement
+is needed.
+
+The shared gated-delta operators accept `cache` and a `cache_index`. They delegate
+to `cache.update_recurrent`, which requests intermediate states from the kernel
+only while history is needed. `cache.update_window` stores convolution or token
+windows and retains their temporal views. Both methods support one block update
+or several smaller updates within the fixed capacity.
+
+Commit selects each row's accepted state; abort restores the starting state.
+Both release the history. Over-capacity updates and incomplete histories are
+rejected. A new recurrent operator needs to support the shared state-production
+contract once; models using it do not need to know about MTP or draft lengths.
+Numerical projection and attention policies are separate from cache ownership.
 
 ## Validation and maintenance
 

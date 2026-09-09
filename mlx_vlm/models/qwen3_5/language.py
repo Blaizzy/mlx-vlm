@@ -1109,13 +1109,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
         if cache is not None:
-            n_keep = self.conv_kernel_size - 1
-            if getattr(cache, "lengths", None) is not None:
-                ends = mx.clip(cache.lengths, 0, S)
-                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
-                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
-            else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
+            cache.update_window(
+                0, conv_input, self.conv_kernel_size - 1, lengths=cache.lengths
+            )
         if (
             S == 1
             and conv_input.shape[1] == self.conv_kernel_size
@@ -1134,12 +1130,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         ]
 
-        state = cache[1] if cache else None
-        if state is not None and state.shape[0] != B:
-            state = None
         q, k = self._normalize_qk(q, k)
 
-        out, state = gated_delta_update(
+        out, _ = gated_delta_update(
             q,
             k,
             v,
@@ -1147,13 +1140,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             b,
             self.A_log,
             self.dt_bias,
-            state,
-            mask,
+            mask=mask,
             use_kernel=not self.training,
+            cache=cache,
         )
 
         if cache is not None:
-            cache[1] = state
             if hasattr(cache, "advance"):
                 cache.advance(S)
                 _qwen3_5_advance_left_padding_info(cache, S)

@@ -23,6 +23,7 @@ import mlx_vlm.models.deepseek_v4.language as deepseek_language
 import mlx_vlm.models.gemma4.language as gemma4_language
 import mlx_vlm.models.glm5_next.language as glm5_next_language
 import mlx_vlm.models.laguna.language as laguna_language
+import mlx_vlm.models.qwen3_5.gated_delta as qwen_gated_delta
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.models.qwen3_5.speculative_verifier as qwen_verifier
 import mlx_vlm.models.qwen3_5_moe.language as qwen_moe_language
@@ -416,7 +417,8 @@ def test_cache_transaction_abort_rewinds_append_only_cache():
     assert not transaction.active
 
 
-def test_qwen_gdn_cache_captures_intermediate_states_for_batched_verify():
+@pytest.mark.parametrize("batch", [1, 2])
+def test_qwen_gdn_cache_captures_intermediate_states(batch):
     config = SimpleNamespace(
         hidden_size=16,
         linear_num_value_heads=2,
@@ -453,73 +455,20 @@ def test_qwen_gdn_cache_captures_intermediate_states_for_batched_verify():
     cache = ArraysCache(size=2)
     cache.start_speculation(3)
     with patch.object(
-        qwen_verifier, "gated_delta_update_with_states", side_effect=fake_update
+        qwen_gated_delta, "gated_delta_update_with_states", side_effect=fake_update
     ):
         out = verifier._gated_delta(
             layer,
-            mx.zeros((2, 3, 16), dtype=mx.float32),
+            mx.zeros((batch, 3, 16), dtype=mx.float32),
             None,
             cache,
         )
 
     mx.eval(out)
-    assert out.shape == (2, 3, 16)
-    assert cache._speculation["records"][1][1].shape == (2, 2, 2, 4, 4)
-    cache.commit_speculation([1, 2])
-    assert cache[1].shape == (2, 2, 4, 4)
-
-
-def test_qwen_gdn_cache_captures_intermediate_states_for_singleton_verify():
-    config = SimpleNamespace(
-        hidden_size=16,
-        linear_num_value_heads=2,
-        linear_num_key_heads=2,
-        linear_key_head_dim=4,
-        linear_value_head_dim=4,
-        linear_conv_kernel_dim=4,
-        rms_norm_eps=1e-6,
-    )
-    layer = qwen_language.Qwen3_5GatedDeltaNet(config)
-
-    def fake_update(
-        q,
-        k,
-        v,
-        a,
-        b,
-        A_log,
-        dt_bias,
-        state,
-        mask,
-        use_kernel=True,
-        state_steps=None,
-    ):
-        del k, v, a, b, A_log, dt_bias, state, mask, use_kernel
-        B, S = q.shape[:2]
-        state_steps = S if state_steps is None else state_steps
-        out = mx.zeros((B, S, 2, 4), dtype=mx.float32)
-        next_state = mx.zeros((B, 2, 4, 4), dtype=mx.float32)
-        states = mx.ones((B, state_steps, 2, 4, 4), dtype=mx.float32)
-        return out, next_state, states
-
-    verifier = qwen_verifier.Qwen3_5ExactSpeculativeVerifier()
-    cache = ArraysCache(size=2)
-    cache.start_speculation(3)
-    with patch.object(
-        qwen_verifier, "gated_delta_update_with_states", side_effect=fake_update
-    ):
-        out = verifier._gated_delta(
-            layer,
-            mx.zeros((1, 3, 16), dtype=mx.float32),
-            None,
-            cache,
-        )
-
-    mx.eval(out)
-    assert out.shape == (1, 3, 16)
-    assert cache._speculation["records"][1][1].shape == (1, 2, 2, 4, 4)
-    cache.commit_speculation(2)
-    assert cache[1].shape == (1, 2, 4, 4)
+    assert out.shape == (batch, 3, 16)
+    assert cache._speculation["records"][1][1].shape == (batch, 2, 2, 4, 4)
+    cache.commit_speculation([2] if batch == 1 else [1, 2])
+    assert cache[1].shape == (batch, 2, 4, 4)
 
 
 def test_qwen_gdn_verify_update_matches_stepwise_path():
@@ -554,7 +503,7 @@ def test_qwen_gdn_verify_update_matches_stepwise_path():
         states.append(current_state)
 
     ref = (mx.concatenate(outputs, axis=1), current_state, mx.stack(states, axis=1))
-    out = qwen_verifier.gated_delta_update_with_states(
+    out = qwen_gated_delta.gated_delta_update_with_states(
         q, k, v, a, b, A_log, dt_bias, state, None, use_kernel=False
     )
     mx.eval(*ref, *out)
@@ -574,10 +523,10 @@ def test_qwen_gdn_verify_can_omit_the_live_final_state():
     dt_bias = mx.ones((Hv,), dtype=mx.bfloat16)
     state = mx.zeros((B, Hv, Dv, D), dtype=mx.float32)
 
-    full = qwen_verifier.gated_delta_update_with_states(
+    full = qwen_gated_delta.gated_delta_update_with_states(
         q, k, v, a, b, A_log, dt_bias, state, state_steps=S
     )
-    shortened = qwen_verifier.gated_delta_update_with_states(
+    shortened = qwen_gated_delta.gated_delta_update_with_states(
         q, k, v, a, b, A_log, dt_bias, state, state_steps=S - 1
     )
     mx.eval(*full, *shortened)

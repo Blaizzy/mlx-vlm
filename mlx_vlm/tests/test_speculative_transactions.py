@@ -366,6 +366,52 @@ def test_ordinary_qwen4_decode_does_not_record_speculation():
                 )
 
 
+@pytest.mark.parametrize("family", ["glm", "qwen"])
+@pytest.mark.parametrize("step", [1, 2, 5])
+def test_ordinary_linear_attention_uses_temporal_cache_without_adapter(family, step):
+    from mlx_vlm.models.glm5_next.language import Glm5NextLinearAttention
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5GatedDeltaNet
+
+    mx.random.seed(2127)
+    if family == "glm":
+        config = _tiny_glm5_next_text_config()
+        config.linear_head_dim = 32
+        layer = Glm5NextLinearAttention(config)
+    else:
+        config = _tiny_text_config()
+        config.linear_key_head_dim = config.linear_value_head_dim = 32
+        layer = Qwen3_5GatedDeltaNet(config)
+    layer.eval()
+    cache = ArraysCache(2, left_padding=[0] * 3)
+    cache.prepare(lengths=[100] * 3)
+    prefix = mx.random.normal((3, 4, config.hidden_size))
+    mx.eval(layer(prefix, cache=cache), cache.state)
+    assert cache.history_capacity == 0
+
+    for retained in ([0, 2, 5], [3, 1, 4]):
+        inputs = mx.random.normal((3, 5, config.hidden_size))
+        reference = deepcopy(cache)
+        states = [list(reference.state)]
+        for index in range(5):
+            mx.eval(layer(inputs[:, index : index + 1], cache=reference))
+            states.append(list(reference.state))
+        initial_lengths = cache.lengths
+        transaction = start_speculative_cache([cache], 5)
+        for index in range(0, 5, step):
+            mx.eval(layer(inputs[:, index : index + step], cache=cache))
+        transaction.commit(retained)
+        for slot in range(2):
+            expected = mx.concatenate(
+                [states[keep][slot][row : row + 1] for row, keep in enumerate(retained)]
+            )
+            assert mx.allclose(cache[slot], expected, rtol=0, atol=1e-6).item()
+        assert mx.array_equal(
+            cache.lengths, initial_lengths - mx.array(retained)
+        ).item()
+        assert cache.history_capacity == 0
+        assert cache.nbytes == sum(value.nbytes for value in cache.state)
+
+
 def test_glm_sampler_failure_restores_temporal_and_append_caches():
     model = GlmLanguageModel(_tiny_glm5_next_text_config())
     model.eval()
@@ -395,6 +441,9 @@ def test_glm_adapter_shares_weights_and_preserves_serving_model():
     assert target.model is not model.model
     assert target.model.layers[0] is not model.model.layers[0]
     assert target.model.layers[0].self_attn.qkv_proj.module is original_projection
+    assert type(target.model.layers[0].self_attn) is type(
+        model.model.layers[0].self_attn
+    )
     assert not hasattr(model, "speculative_verify_hidden")
     caches = model.make_cache()
     hidden, _, transaction = target.speculative_verify_hidden(inputs, caches)

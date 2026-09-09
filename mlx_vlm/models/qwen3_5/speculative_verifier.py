@@ -20,7 +20,7 @@ from ..base import (
     slice_kv_sequence,
 )
 from ..quantized_verifier import pad_token_mask as _pad_token_mask_to_head
-from .gated_delta import gated_delta_update_with_states
+from .gated_delta import gated_delta_update
 
 
 class Qwen3_5BatchInvariantForward:
@@ -253,13 +253,9 @@ class Qwen3_5BatchInvariantForward:
                 mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
         if cache is not None:
-            n_keep = layer.conv_kernel_size - 1
-            if getattr(cache, "lengths", None) is not None:
-                ends = mx.clip(cache.lengths, 0, length)
-                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
-                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
-            else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
+            cache.update_window(
+                0, conv_input, layer.conv_kernel_size - 1, lengths=cache.lengths
+            )
 
         conv_output = nn.silu(layer.conv1d(conv_input))
         q, k, v = [
@@ -271,12 +267,9 @@ class Qwen3_5BatchInvariantForward:
             )
         ]
 
-        state = cache[1] if cache else None
-        if state is not None and state.shape[0] != batch:
-            state = None
         q, k = self._normalize_gated_delta_qk(layer, q, k)
 
-        output, state, intermediate_states = gated_delta_update_with_states(
+        output, _ = gated_delta_update(
             q,
             k,
             v,
@@ -284,20 +277,12 @@ class Qwen3_5BatchInvariantForward:
             b,
             layer.A_log,
             layer.dt_bias,
-            state,
-            mask,
+            mask=mask,
             use_kernel=not layer.training,
-            state_steps=length - 1,
+            cache=cache,
         )
 
         if cache is not None:
-            cache[1] = state
-            cache.record_speculative_window(
-                0,
-                conv_input,
-                layer.conv_kernel_size - 1,
-            )
-            cache.record_speculative_states(1, intermediate_states, state)
             if hasattr(cache, "advance"):
                 cache.advance(length)
                 helpers._qwen3_5_advance_left_padding_info(cache, length)

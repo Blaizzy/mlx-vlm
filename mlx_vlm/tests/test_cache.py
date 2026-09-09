@@ -82,6 +82,129 @@ def test_arrays_cache_advance_does_not_accumulate_buffers():
     assert cache.lengths.tolist() == [8 - 20000, 8 - 20000]
 
 
+@pytest.mark.parametrize("family", ["shared", "qwen"])
+@pytest.mark.parametrize("use_kernel", [False, True])
+@pytest.mark.parametrize("parts", [(4,), (1, 1, 1, 1), (1, 3), (2, 2)])
+@pytest.mark.parametrize("retained", [[0, 1, 3, 4], [1] * 4, [4] * 4])
+def test_temporal_recurrence_commits_exact_states(family, use_kernel, parts, retained):
+    from mlx_vlm.models.gated_delta import gated_delta_update as shared_update
+    from mlx_vlm.models.qwen3_5.gated_delta import gated_delta_update as qwen_update
+
+    update = shared_update if family == "shared" else qwen_update
+    mx.random.seed(2127)
+    batch, length, heads, width = 4, 4, 2, 32
+    q, k, v = [
+        mx.random.normal((batch, length, heads, width)).astype(mx.bfloat16) * 0.1
+        for _ in range(3)
+    ]
+    gate_shape = q.shape if family == "shared" else q.shape[:-1]
+    a = mx.random.normal(gate_shape).astype(mx.bfloat16)
+    b = mx.random.normal(q.shape[:-1]).astype(mx.bfloat16)
+    weights_shape = (heads, 1) if family == "shared" else (heads,)
+    decay, bias = mx.zeros(weights_shape), mx.zeros(weights_shape)
+    kwargs = {"lower_bound": -5.0} if family == "shared" else {}
+    initial = mx.random.normal((batch, heads, width, width)) * 0.01
+    cache = ArraysCache(1)
+    cache[0] = initial
+    generation = cache.start_speculation(length)
+    position = 0
+    outputs = []
+    for size in parts:
+        output, _ = update(
+            *(x[:, position : position + size] for x in (q, k, v, a, b)),
+            decay,
+            bias,
+            cache=cache,
+            cache_index=0,
+            use_kernel=use_kernel,
+            **kwargs,
+        )
+        outputs.append(output)
+        position += size
+        assert cache._recorded_length(0) == position
+        assert cache.nbytes <= initial.nbytes * (length + 1)
+
+    expected_outputs = []
+    states = [initial]
+    for position in range(length):
+        output, state = update(
+            *(x[:, position : position + 1] for x in (q, k, v, a, b)),
+            decay,
+            bias,
+            state=states[-1],
+            use_kernel=use_kernel,
+            **kwargs,
+        )
+        expected_outputs.append(output)
+        states.append(state)
+    assert mx.array_equal(
+        mx.concatenate(outputs, axis=1), mx.concatenate(expected_outputs, axis=1)
+    ).item()
+    cache.commit_speculation(retained, generation)
+    expected = mx.concatenate(
+        [states[keep][row : row + 1] for row, keep in enumerate(retained)]
+    )
+    assert mx.array_equal(cache[0], expected).item()
+    assert cache.history_capacity == 0
+    assert cache.nbytes == cache[0].nbytes
+
+
+@pytest.mark.parametrize("width", [0, 1, 3])
+@pytest.mark.parametrize("ndim", [2, 3])
+@pytest.mark.parametrize("parts", [(4,), (1, 1, 1, 1), (1, 3)])
+def test_temporal_windows_support_split_updates_and_ragged_commits(width, ndim, parts):
+    source = mx.arange(4 * (width + 4)).reshape(4, width + 4)
+    if ndim == 3:
+        source = source[..., None]
+    cache = ArraysCache(1)
+    cache[0] = source[:, :width]
+    generation = cache.start_speculation(4)
+    position = width
+    for size in parts:
+        chunk = mx.concatenate(
+            [cache[0], source[:, position : position + size]], axis=1
+        )
+        cache.update_window(0, chunk, width)
+        position += size
+    retained = [0, 1, 3, 4]
+    cache.commit_speculation(retained, generation)
+    expected = mx.stack(
+        [source[row, keep : keep + width] for row, keep in enumerate(retained)]
+    )
+    assert mx.array_equal(cache[0], expected).item()
+    assert cache.history_capacity == 0
+
+
+def test_temporal_cache_retention_is_bounded_and_abort_restores_state():
+    cache = ArraysCache(1)
+    initial = mx.ones((2, 3))
+    cache[0] = initial
+    requested = []
+
+    def step(state, state_steps):
+        requested.append(state_steps)
+        return state, state + 1
+
+    cache.update_recurrent(0, 1, step)
+    assert requested == [None]
+    assert cache.nbytes == initial.nbytes
+    initial = cache[0]
+    for _ in range(8):
+        generation = cache.start_speculation(2)
+        cache.update_recurrent(0, 1, step)
+        with pytest.raises(RuntimeError, match="full window"):
+            cache.commit_speculation(1, generation)
+        cache.update_recurrent(0, 1, step)
+        count = len(requested)
+        with pytest.raises(ValueError, match="capacity"):
+            cache.update_recurrent(0, 1, step)
+        assert len(requested) == count
+        assert cache.nbytes <= initial.nbytes * 3
+        cache.abort_speculation(generation)
+        assert cache[0] is initial
+        assert cache.nbytes == initial.nbytes
+
+
 def test_kv_cache_extract_validates_row_index():
     cache, _, _ = _make_kv_cache(batch_size=2)
 

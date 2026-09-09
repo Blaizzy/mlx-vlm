@@ -390,7 +390,48 @@ def gated_delta_update(
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
+    state_steps: Optional[int] = None,
+    cache=None,
+    cache_index: int = 1,
 ):
+    if cache is not None:
+        if state is not None or state_steps is not None:
+            raise ValueError("The cache owns recurrent state and history retention.")
+        return cache.update_recurrent(
+            cache_index,
+            q.shape[1],
+            lambda initial, steps: gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                state=(
+                    initial
+                    if initial is None or initial.shape[0] == q.shape[0]
+                    else None
+                ),
+                mask=mask,
+                use_kernel=use_kernel,
+                state_steps=steps,
+            ),
+        )
+    if state_steps is not None:
+        return gated_delta_update_with_states(
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            state,
+            mask,
+            use_kernel=use_kernel,
+            state_steps=state_steps,
+        )
     g, beta = _compute_g_beta(A_log, a, b, dt_bias)
     if state is None:
         B, _, _Hk, Dk = q.shape

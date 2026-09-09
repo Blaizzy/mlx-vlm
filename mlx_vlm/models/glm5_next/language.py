@@ -146,7 +146,8 @@ class ShortConv1d(nn.Module):
             padding=0,
         )
 
-    def __call__(self, x, state, mask, lengths, return_input=False):
+    def __call__(self, x, mask=None, cache=None):
+        state = None if cache is None else cache[0]
         if mask is not None:
             x = mx.where(mask[..., None], x, 0)
         if state is None:
@@ -156,15 +157,9 @@ class ShortConv1d(nn.Module):
         conv_input = mx.concatenate([state, x], axis=1)
         output = nn.silu(self.conv(conv_input))
         keep = self.kernel_size - 1
-        if lengths is None:
-            state = mx.contiguous(conv_input[:, -keep:])
-        else:
-            ends = mx.clip(lengths, 0, x.shape[1])
-            positions = (ends[:, None] + mx.arange(keep))[..., None]
-            state = mx.take_along_axis(conv_input, positions, axis=1)
-        if return_input:
-            return output, state, conv_input
-        return output, state
+        if cache is not None:
+            cache.update_window(0, conv_input, keep, lengths=cache.lengths)
+        return output
 
 
 class Glm5NextLinearAttention(nn.Module):
@@ -193,41 +188,11 @@ class Glm5NextLinearAttention(nn.Module):
         self.o_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.o_proj = nn.Linear(self.projection_dim, config.hidden_size, bias=False)
 
-    def _convolve(self, projected, mask, cache):
-        output, state = self.qkv_conv(
-            projected,
-            None if cache is None else cache[0],
-            mask,
-            None if cache is None else cache.lengths,
-        )
-        if cache is not None:
-            cache[0] = state
-        return output
-
-    def _recur(self, q, k, v, a, b, mask, cache):
-        output, state = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log.reshape(self.num_heads, 1),
-            self.dt_bias.reshape(self.num_heads, self.head_dim),
-            state=None if cache is None else cache[1],
-            mask=mask,
-            use_kernel=not self.training,
-            lower_bound=self.lower_bound,
-        )
-        if cache is not None:
-            cache[1] = state
-            cache.advance(q.shape[1])
-        return output
-
     def __call__(self, x, mask=None, cache=None):
         batch, length, _ = x.shape
         if mask is not None and mask.dtype == mx.bool_:
             x = mx.where(mask[..., None], x, 0)
-        qkv = self._convolve(self.qkv_proj(x), mask, cache)
+        qkv = self.qkv_conv(self.qkv_proj(x), mask=mask, cache=cache)
         shape = (batch, length, self.num_heads, self.head_dim)
         q, k, v = (value.reshape(shape) for value in mx.split(qkv, 3, axis=-1))
         eps = 1e-6 / self.head_dim
@@ -240,7 +205,21 @@ class Glm5NextLinearAttention(nn.Module):
         )
         a = self.f_b_proj(f_a).reshape(shape)
         b = b.reshape(batch, length, self.num_heads)
-        output = self._recur(q, k, v, a, b, mask, cache)
+        output, _ = gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b,
+            self.A_log.reshape(self.num_heads, 1),
+            self.dt_bias.reshape(self.num_heads, self.head_dim),
+            cache=cache,
+            mask=mask,
+            use_kernel=not self.training,
+            lower_bound=self.lower_bound,
+        )
+        if cache is not None:
+            cache.advance(q.shape[1])
         gate = self.g_b_proj(g_a).reshape(shape)
         output = (self.o_norm(output) * mx.sigmoid(gate)).reshape(batch, length, -1)
         return self.o_proj(output)
