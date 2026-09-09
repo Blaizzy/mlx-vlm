@@ -29,8 +29,12 @@ from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
 from mlx_vlm.models.cache import (
     BatchKVCache,
+    BatchPoolingCache,
+    BatchRotatingKVCache,
     BufferedRotatingKVCache,
+    CacheList,
     KVCache,
+    PoolingCache,
     RotatingKVCache,
 )
 from mlx_vlm.utils import ThinkingBudgetCriteria
@@ -206,49 +210,9 @@ class TestGenerationResult:
         assert result.generation_tps == 0.0
         assert result.peak_memory == 0.0
 
-    def test_with_values(self):
-        result = GenerationResult(
-            text="Hello world",
-            token=42,
-            logprobs=[0.1, 0.2, 0.3],
-            prompt_tokens=10,
-            generation_tokens=5,
-            total_tokens=15,
-            prompt_tps=100.0,
-            generation_tps=50.0,
-            peak_memory=2.5,
-        )
-        assert result.text == "Hello world"
-        assert result.token == 42
-        assert result.logprobs == [0.1, 0.2, 0.3]
-        assert result.prompt_tokens == 10
-        assert result.generation_tokens == 5
-        assert result.total_tokens == 15
-        assert result.prompt_tps == 100.0
-        assert result.generation_tps == 50.0
-        assert result.peak_memory == 2.5
-
 
 class TestBatchGenerationResult:
     """Tests for BatchGenerationResult dataclass."""
-
-    def test_creation(self):
-        result = BatchGenerationResult(
-            texts=["Hello", "World"],
-            tokens=[1, 2],
-            logprobs=[[0.1], [0.2]],
-            prompt_tokens=[10, 12],
-            generation_tokens=[5, 6],
-            total_tokens=[15, 18],
-            prompt_tps=[100.0, 110.0],
-            generation_tps=[50.0, 55.0],
-            peak_memory=3.0,
-            image_sizes=[(224, 224), (336, 336)],
-        )
-        assert result.texts == ["Hello", "World"]
-        assert result.tokens == [1, 2]
-        assert result.peak_memory == 3.0
-        assert result.image_sizes == [(224, 224), (336, 336)]
 
     def test_optional_image_sizes(self):
         result = BatchGenerationResult(
@@ -277,34 +241,9 @@ class TestBatchStats:
         assert stats.generation_time == 0
         assert stats.peak_memory == 0
 
-    def test_with_values(self):
-        stats = BatchStats(
-            prompt_tokens=100,
-            prompt_tps=500.0,
-            prompt_time=0.2,
-            generation_tokens=50,
-            generation_tps=250.0,
-            generation_time=0.2,
-            peak_memory=4.0,
-        )
-        assert stats.prompt_tokens == 100
-        assert stats.prompt_tps == 500.0
-        assert stats.generation_tokens == 50
-
 
 class TestBatchResponse:
     """Tests for BatchResponse dataclass."""
-
-    def test_creation(self):
-        stats = BatchStats(prompt_tokens=100)
-        response = BatchResponse(
-            texts=["Hello", "World"],
-            stats=stats,
-            image_sizes=[(224, 224), (336, 336)],
-        )
-        assert response.texts == ["Hello", "World"]
-        assert response.stats.prompt_tokens == 100
-        assert response.image_sizes == [(224, 224), (336, 336)]
 
     def test_optional_image_sizes(self):
         stats = BatchStats()
@@ -596,6 +535,50 @@ class TestBatchGenerator:
         assert stats.prompt_tps == 200.0  # 100 / 0.5
         assert stats.prompt_tokens == 100
 
+    def test_extend_active_deepseek_cache_with_concurrent_request(self):
+        def make_row(prompt_length):
+            rotating = BatchRotatingKVCache(max_size=16, left_padding=[0])
+            keys = mx.random.normal((1, 1, prompt_length, 4))
+            values = mx.random.normal((1, 1, prompt_length, 4))
+            rotating.update_and_fetch(keys, values)
+            rotating.finalize()
+
+            pooling = BatchPoolingCache(ratio=4, left_padding=[0])
+            pooling.prepare(lengths=[prompt_length])
+            kv = mx.random.normal((1, prompt_length, 3))
+            gate = mx.random.normal((1, prompt_length, 2))
+            ready_kv, _, _ = pooling.accumulate_windows(kv, gate, offset=0)
+            pooled = mx.random.normal((1, ready_kv.shape[1] // 4, 3))
+            pooling.update_and_fetch(pooled)
+            pooling.finalize()
+            return [CacheList(rotating, pooling)]
+
+        active = make_row(6)
+        joining = make_row(5)
+
+        extended = ar_module._extend_cache(active, joining)
+
+        rotating, pooling = extended[0].caches
+        assert isinstance(rotating, BatchRotatingKVCache)
+        assert rotating.offset.shape == (2,)
+        assert rotating.keys.shape[0] == 2
+        assert isinstance(pooling, BatchPoolingCache)
+        assert pooling.remainder == [2, 1]
+        assert pooling.pooled.shape[0] == 2
+
+    def test_make_cache_converts_left_padded_pooling_cache(self):
+        class PoolingModel:
+            def make_cache(self):
+                return [PoolingCache(ratio=4)]
+
+        caches = ar_module._make_cache(PoolingModel(), [2, 0])
+
+        assert len(caches) == 1
+        assert isinstance(caches[0], BatchPoolingCache)
+        assert caches[0].ratio == 4
+        assert caches[0].remainder == [0, 0]
+        assert caches[0].left_padding == [2, 0]
+
     def test_next_reports_prompt_progress_for_completed_prefill(
         self, mock_model, mock_processor, monkeypatch
     ):
@@ -716,15 +699,6 @@ class TestBatchGenerator:
         async_eval_mock.assert_called_once_with([cache_state])
         eval_mock.assert_not_called()
         batch._store_apc_exact_checkpoints.assert_called_once_with()
-
-    def test_response_dataclass(self):
-        response = GenerationBatch.Response(
-            uid=0, token=42, token_logprob=-0.5, finish_reason="stop"
-        )
-
-        assert response.uid == 0
-        assert response.token == 42
-        assert response.finish_reason == "stop"
 
     def test_generation_batch_applies_per_sequence_logits_processors(self):
         class FixedLogitModel:
@@ -1115,6 +1089,26 @@ class TestBatchGenerator:
         gen.insert([[1, 2, 3]])
         assert gen.remove(9999) is False
 
+    def test_remove_cancels_image_prefill_and_releases_cache(
+        self, mock_model, mock_processor
+    ):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+        )
+        prompt_batch = SimpleNamespace(
+            uids=[7],
+            prompt_cache=[MagicMock()],
+            input_ids=mx.array([[1, mock_model.config.image_token_index, 2]]),
+        )
+        gen._prompt_batch = prompt_batch
+
+        assert gen.remove(7) is True
+        assert prompt_batch.uids == []
+        assert prompt_batch.prompt_cache == []
+        assert gen._prompt_batch is None
+
 
 # ============================================================================
 # Tests for batch_generate function
@@ -1147,10 +1141,10 @@ class TestBatchGenerate:
         assert response.texts == ["Response 1", "Response 2"]
         mock_generate_batch.assert_called_once()
 
-    def test_generate_batch_splits_batched_prompt_kwargs_per_row(
+    def test_generate_batch_passes_mask_and_split_prompt_kwargs_to_generator(
         self, mock_model, mock_processor
     ):
-        """Regression test for Gemma 4-style batched ``inputs_embeds``."""
+        """BatchGenerator receives the dense rows and their padding metadata."""
 
         class _EmbeddingOutput:
             def __init__(self, inputs_embeds, position_ids):
@@ -1171,12 +1165,17 @@ class TestBatchGenerate:
         hidden_size = 7
         input_ids = mx.array(
             [
-                [11, 12, 13, 14, 15],
+                [0, 0, 11, 12, 13],
                 [21, 22, 23, 24, 25],
-                [31, 32, 33, 34, 35],
+                [0, 31, 32, 33, 34],
             ],
             dtype=mx.int32,
         )
+        attention_mask = mx.array(
+            [[0, 0, 1, 1, 1], [1, 1, 1, 1, 1], [0, 1, 1, 1, 1]],
+            dtype=mx.int32,
+        )
+        prepared_attention_mask = attention_mask
         inputs_embeds = mx.arange(
             batch_size * seq_len * hidden_size, dtype=mx.float32
         ).reshape(batch_size, seq_len, hidden_size)
@@ -1186,9 +1185,15 @@ class TestBatchGenerate:
         embedding_output = _EmbeddingOutput(inputs_embeds, position_ids)
 
         def fake_insert(
-            self, prompts, max_tokens, prompt_kwargs=None, logits_processors=None
+            self,
+            prompts,
+            max_tokens,
+            prompt_kwargs=None,
+            logits_processors=None,
+            attention_mask=None,
         ):
-            assert len(prompts) == batch_size
+            assert mx.array_equal(prompts, input_ids)
+            assert mx.array_equal(attention_mask, prepared_attention_mask)
             assert len(prompt_kwargs) == batch_size
             for i, kw in enumerate(prompt_kwargs):
                 assert kw["inputs_embeds"].shape == (1, seq_len, hidden_size)
@@ -1208,7 +1213,7 @@ class TestBatchGenerate:
                 "prepare_inputs",
                 return_value={
                     "input_ids": input_ids,
-                    "attention_mask": mx.ones((batch_size, seq_len), dtype=mx.int32),
+                    "attention_mask": attention_mask,
                 },
             ),
             patch.object(
@@ -1311,9 +1316,22 @@ class TestBatchGenerate:
         mock_generate_batch.side_effect = [
             (
                 ["Response 1", "Response 3"],
-                BatchStats(prompt_tokens=20, generation_tokens=10),
+                BatchStats(
+                    prompt_tokens=20,
+                    prompt_time=0.1,
+                    generation_tokens=10,
+                    generation_time=0.2,
+                ),
             ),
-            (["Response 2"], BatchStats(prompt_tokens=10, generation_tokens=5)),
+            (
+                ["Response 2"],
+                BatchStats(
+                    prompt_tokens=10,
+                    prompt_time=0.15,
+                    generation_tokens=5,
+                    generation_time=0.3,
+                ),
+            ),
         ]
 
         prompts = ["Prompt 1", "Prompt 2", "Prompt 3"]
@@ -1331,6 +1349,13 @@ class TestBatchGenerate:
         assert mock_generate_batch.call_count == 2
         # All 3 responses should be present
         assert len(response.texts) == 3
+        # Check aggregation through batch_generate itself, across both groups.
+        assert response.stats.prompt_tokens == 30
+        assert response.stats.prompt_time == pytest.approx(0.25)
+        assert response.stats.generation_tokens == 15
+        assert response.stats.generation_time == pytest.approx(0.5)
+        assert response.stats.prompt_tps == pytest.approx(120.0)
+        assert response.stats.generation_tps == pytest.approx(30.0)
 
     @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
@@ -1523,57 +1548,6 @@ class TestBatchGenerate:
 
 
 # ============================================================================
-# Tests for stats aggregation
-# ============================================================================
-
-
-class TestBatchStatsAggregation:
-    """Tests for stats aggregation in batch generation."""
-
-    def test_stats_accumulation(self):
-        """Test that stats are properly accumulated across batches."""
-        total_stats = BatchStats()
-
-        # Simulate processing multiple batches
-        batch_stats = [
-            BatchStats(
-                prompt_tokens=100,
-                prompt_time=0.1,
-                generation_tokens=50,
-                generation_time=0.2,
-            ),
-            BatchStats(
-                prompt_tokens=150,
-                prompt_time=0.15,
-                generation_tokens=75,
-                generation_time=0.3,
-            ),
-        ]
-
-        for stats in batch_stats:
-            total_stats.prompt_tokens += stats.prompt_tokens
-            total_stats.prompt_time += stats.prompt_time
-            total_stats.generation_tokens += stats.generation_tokens
-            total_stats.generation_time += stats.generation_time
-
-        assert total_stats.prompt_tokens == 250
-        assert total_stats.prompt_time == pytest.approx(0.25)
-        assert total_stats.generation_tokens == 125
-        assert total_stats.generation_time == pytest.approx(0.5)
-
-        # Calculate TPS
-        if total_stats.prompt_time > 0:
-            total_stats.prompt_tps = total_stats.prompt_tokens / total_stats.prompt_time
-        if total_stats.generation_time > 0:
-            total_stats.generation_tps = (
-                total_stats.generation_tokens / total_stats.generation_time
-            )
-
-        assert total_stats.prompt_tps == pytest.approx(1000.0)
-        assert total_stats.generation_tps == pytest.approx(250.0)
-
-
-# ============================================================================
 # Edge Cases
 # ============================================================================
 
@@ -1611,14 +1585,6 @@ class TestEdgeCases:
         # First prompt should have 998 padding tokens
         assert padded[0, 0].item() == 0
         assert padded[0, -1].item() == 2
-
-    def test_batch_response_with_empty_texts(self):
-        """Test BatchResponse with empty texts."""
-        stats = BatchStats()
-        response = BatchResponse(texts=[], stats=stats)
-
-        assert response.texts == []
-        assert response.image_sizes is None
 
 
 # ============================================================================
@@ -1844,6 +1810,69 @@ class TestSamplerArgs:
             {3: -0.75}, 1.15, 512, 0.2, 256, 0.3, 128
         )
 
+    @patch.object(generate_module.cache, "make_prompt_cache", return_value=[])
+    @patch.object(generate_module, "make_logits_processors", return_value=[])
+    @patch.object(ar_module, "_PositionedTargetSampler")
+    def test_seeded_top_k_uses_positioned_target_sampler(
+        self,
+        mock_positioned_sampler,
+        _mock_logits_processors,
+        _mock_prompt_cache,
+    ):
+        mock_positioned_sampler.return_value = lambda logprobs: mx.array([0])
+        model = MagicMock()
+        model.language_model.return_value = MagicMock(
+            logits=mx.zeros((1, 1, 4)),
+            cross_attention_states=None,
+            encoder_outputs=None,
+        )
+        embedding_output = MagicMock()
+        embedding_output.inputs_embeds = mx.zeros((1, 1, 4))
+        embedding_output.to_dict.return_value = {}
+        model.get_input_embeddings.return_value = embedding_output
+
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            max_tokens=1,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=40,
+            seed=7,
+        )
+        next(gen)
+
+        mock_positioned_sampler.assert_called_once_with(
+            temperature=1.0,
+            top_p=0.95,
+            top_k=40,
+            seed=7,
+        )
+
+
+@pytest.mark.parametrize("top_p", [1.0, 0.95])
+def test_positioned_target_sampler_honors_top_k(top_p):
+    sampler = ar_module._PositionedTargetSampler(
+        temperature=1.0,
+        top_p=top_p,
+        top_k=2,
+        seed=42,
+    )
+    logits = mx.array([[0.0, 1.0, 2.0, 3.0]], dtype=mx.float32)
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    repeated = mx.repeat(logprobs, 32, axis=0)
+
+    tokens = sampler.sample_target(
+        repeated,
+        row_ids=[0] * 32,
+        positions=list(range(32)),
+    )
+    mx.eval(tokens)
+
+    assert set(tokens.tolist()) <= {2, 3}
+
 
 def test_generate_step_schedules_final_prefill_async():
     model = MagicMock()
@@ -1889,6 +1918,50 @@ def test_generate_step_schedules_final_prefill_async():
         next(gen)
 
     assert events[0] == "async"
+
+
+def test_generate_step_preserves_explicit_prompt_position_metadata():
+    model = MagicMock()
+    model.language_model.supports_logits_to_keep = False
+    model.language_model.return_value = MagicMock(
+        logits=mx.zeros((1, 1, 4)),
+        cross_attention_states=None,
+        encoder_outputs=None,
+    )
+
+    full_position_ids = mx.array([[10, 11]], dtype=mx.int32)
+    full_rope_deltas = mx.array([[7]], dtype=mx.int32)
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 2, 4))
+    embedding_output.to_dict.return_value = {
+        "position_ids": mx.array([[0, 1]], dtype=mx.int32),
+        "rope_deltas": mx.array([[0]], dtype=mx.int32),
+    }
+    model.get_input_embeddings.return_value = embedding_output
+
+    with (
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+    ):
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1, 2]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            prompt_cache=[],
+            max_tokens=1,
+            position_ids=full_position_ids,
+            rope_deltas=full_rope_deltas,
+        )
+        next(gen)
+
+    # The generator prepares the following decode step before yielding the
+    # current token, so inspect the first (prompt/suffix) forward call.
+    call_kwargs = model.language_model.call_args_list[0].kwargs
+    assert bool(mx.array_equal(call_kwargs["position_ids"], full_position_ids))
+    assert bool(mx.array_equal(call_kwargs["rope_deltas"], full_rope_deltas))
 
 
 @pytest.mark.parametrize(("verbose", "disabled"), [(False, True), (True, False)])
@@ -2046,13 +2119,87 @@ def test_stream_generate_forwards_verbose_to_generate_step():
     assert captured["verbose"] is True
 
 
+@pytest.mark.parametrize("reused_prefix", [0, 1, 2])
+def test_stream_generate_stores_checkpoint_only_before_decode(reused_prefix):
+    class FakeStoppingCriteria:
+        def __call__(self, token):
+            return False
+
+    class FakeDetokenizer:
+        last_segment = ""
+
+        def reset(self):
+            pass
+
+        def add_token(self, token, skip_special_token_ids=None):
+            pass
+
+        def finalize(self):
+            pass
+
+    coordinator = MagicMock()
+    coordinator.enabled = True
+    coordinator.is_checkpoint = True
+    coordinator.lookup.return_value = (
+        {"prefix_len": reused_prefix, "warm_cache": []} if reused_prefix else None
+    )
+    coordinator.materialize_single.return_value = []
+    coordinator.checkpoint_lengths.return_value = [2, 3]
+
+    def fake_generate_step(*args, **kwargs):
+        coordinator.prepare_prefill.assert_called_once_with(4)
+        assert args[0].shape[1] == 4 - reused_prefix
+        for n in kwargs["prompt_cache_checkpoint_lengths"]:
+            kwargs["prompt_cache_checkpoint"](n, kwargs["prompt_cache"])
+        yield 7, mx.zeros((4,))
+
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(stopping_criteria=FakeStoppingCriteria()),
+        detokenizer=FakeDetokenizer(),
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test", eos_token_id=[]),
+        language_model=SimpleNamespace(),
+    )
+    prompt_cache = []
+
+    with (
+        patch.object(dispatch_module._apc, "APCCoordinator", return_value=coordinator),
+        patch.object(dispatch_module._apc, "semantic_extra_hash", return_value=0),
+        patch.object(
+            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
+        ),
+        patch.object(dispatch_module, "generate_step", side_effect=fake_generate_step),
+    ):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="",
+                input_ids=mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache=prompt_cache,
+                apc_manager=MagicMock(),
+                max_tokens=1,
+            )
+        )
+
+    calls = coordinator.store_checkpoint.call_args_list
+    assert [call.args[0] for call in calls] == [
+        [1, 2, 3, 4][:n] for n in [2, 3] if n > reused_prefix
+    ]
+    assert all(call.args[1] == prompt_cache for call in calls)
+    assert all(call.kwargs == {"extra_hash": 0} for call in calls)
+
+
 def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
     captured = {}
     tokenizer = SimpleNamespace(stopping_criteria=SimpleNamespace())
     processor = SimpleNamespace(tokenizer=tokenizer)
     model = SimpleNamespace(
         config=SimpleNamespace(model_type="test"),
-        language_model=SimpleNamespace(),
+        language_model=SimpleNamespace(layers=[object()]),
     )
     prepared_mask = mx.ones((1, 4), dtype=mx.int32)
 
@@ -2074,7 +2221,11 @@ def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
             dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
         ),
         patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
-        patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(
+            dispatch_module.cache,
+            "make_prompt_cache",
+            return_value=[dispatch_module.cache.KVCache()],
+        ),
         patch.object(
             dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
         ),
@@ -2101,7 +2252,7 @@ def test_stream_generate_hashes_explicit_sequence_tensors_for_apc_safety():
     processor = SimpleNamespace(tokenizer=tokenizer)
     model = SimpleNamespace(
         config=SimpleNamespace(model_type="test"),
-        language_model=SimpleNamespace(),
+        language_model=SimpleNamespace(layers=[object()]),
     )
     custom_embeds = mx.ones((1, 4, 3))
     custom_mask = mx.array([[1, 1, 0, 0]], dtype=mx.int32)
@@ -2116,7 +2267,11 @@ def test_stream_generate_hashes_explicit_sequence_tensors_for_apc_safety():
             dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
         ),
         patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
-        patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(
+            dispatch_module.cache,
+            "make_prompt_cache",
+            return_value=[dispatch_module.cache.KVCache()],
+        ),
         patch.object(
             dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
         ),
@@ -2191,6 +2346,9 @@ def test_generate_cli_smoke(capsys):
         system=None,
         max_tokens=12,
         temperature=0.7,
+        top_p=1.0,
+        top_k=0,
+        min_p=0.0,
         repetition_penalty=None,
         repetition_context_size=20,
         presence_penalty=None,
@@ -2209,6 +2367,7 @@ def test_generate_cli_smoke(capsys):
         revision="main",
         trust_remote_code=False,
         quantize_activations=False,
+        expert_cache_gb=None,
         processor_kwargs={},
         prefill_step_size=128,
         enable_thinking=True,
@@ -2266,6 +2425,9 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
         system=None,
         max_tokens=8,
         temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        min_p=0.0,
         repetition_penalty=None,
         repetition_context_size=20,
         presence_penalty=None,
@@ -2285,6 +2447,7 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
         revision=None,
         trust_remote_code=False,
         quantize_activations=False,
+        expert_cache_gb=None,
         processor_kwargs={},
         gen_kwargs={},
         prefill_step_size=None,
@@ -2377,7 +2540,7 @@ def test_resolve_video_inputs_uses_one_global_frame_budget():
     assert resolution.frame_fps == pytest.approx(1.5)
     assert images == [still]
     assert videos == ["first.mp4", "second.mp4"]
-    mock_sample.assert_called_once_with(videos, 1.5)
+    mock_sample.assert_called_once_with(videos, 1.5, None)
 
 
 def test_resolve_video_inputs_does_not_partially_mutate_on_decode_failure():
@@ -2424,6 +2587,9 @@ def test_generate_cli_video_frames_fallback_without_video_processor(capsys):
         system=None,
         max_tokens=8,
         temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        min_p=0.0,
         repetition_penalty=None,
         repetition_context_size=20,
         presence_penalty=None,
@@ -2443,6 +2609,7 @@ def test_generate_cli_video_frames_fallback_without_video_processor(capsys):
         revision=None,
         trust_remote_code=False,
         quantize_activations=False,
+        expert_cache_gb=None,
         processor_kwargs={},
         gen_kwargs={},
         prefill_step_size=None,
@@ -2583,10 +2750,40 @@ def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
         )
 
     assert ok is False
+    assert "position_ids" not in kwargs
     assert "rope_deltas" not in kwargs
     assert bool(mx.array_equal(language_model._rope_deltas, rope_deltas_before))
     assert bool(mx.array_equal(language_model._position_ids, position_ids_before))
     assert "falling back to cold prefill" in caplog.text
+
+
+def test_cached_prefix_rope_forwards_full_prompt_metadata():
+    position_ids = mx.array([[0, 1, 2, 3]], dtype=mx.int32)
+    rope_deltas = mx.array([[7]], dtype=mx.int32)
+
+    class RopeLanguageModel:
+        _position_ids = None
+        _rope_deltas = None
+
+        @staticmethod
+        def get_rope_index(*args, **kwargs):
+            return position_ids, rope_deltas
+
+    language_model = RopeLanguageModel()
+    kwargs = {}
+
+    ok = _prime_cached_prefix_rope_state(
+        SimpleNamespace(language_model=language_model),
+        mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+        None,
+        kwargs,
+    )
+
+    assert ok is True
+    assert bool(mx.array_equal(kwargs["position_ids"], position_ids))
+    assert bool(mx.array_equal(kwargs["rope_deltas"], rope_deltas))
+    assert bool(mx.array_equal(language_model._position_ids, position_ids))
+    assert bool(mx.array_equal(language_model._rope_deltas, rope_deltas))
 
 
 class TestPrefixCacheReuseTrim:
@@ -3077,20 +3274,19 @@ class TestBatchTurboQuantizedKVStart:
         assert "BatchTurboQuantKVCache" in kinds
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+class TestTokenizerPaddedBatchRows:
+    """BatchGenerator canonicalizes masked dense rows before queueing them."""
 
+    def _generator(self):
+        gen = object.__new__(BatchGenerator)
+        gen.max_tokens = 4
+        gen.logits_processors = []
+        gen._unprocessed_sequences = []
+        gen.uid_count = 0
+        gen._wire_stack = None
+        return gen
 
-class TestPrePaddedBatchRows:
-    """Rows that arrive already padded must still declare that padding.
-
-    The tokenizer squares a batch off with left padding and reports it in the
-    attention mask. If that never reaches the caches, every row looks the same
-    length: a causal mask does not exclude padding that comes first, and a
-    recurrent layer walks it like any other column.
-    """
-
-    def _batch(self, rows, existing_left_padding):
+    def _batch(self, rows):
         import mlx.nn as nn
 
         from mlx_vlm.generate.ar import PromptProcessingBatch
@@ -3108,29 +3304,70 @@ class TestPrePaddedBatchRows:
             max_tokens=[4] * len(rows),
             inputs_embeds=None,
             prompt_kwargs={},
-            existing_left_padding=existing_left_padding,
         )
 
-    def test_declared_padding_reaches_the_caches(self):
-        rows = [list(range(8)), list(range(8))]
+    def test_unpads_tokens_and_sequence_aligned_prompt_tensors(self):
+        input_ids = mx.array([[0, 0, 4, 5], [6, 7, 8, 9], [10, 11, 0, 0]])
+        attention_mask = mx.array([[0, 0, 1, 1], [1, 1, 1, 1], [1, 1, 0, 0]])
+        inputs_embeds = mx.arange(3 * 4 * 3).reshape(3, 4, 3)
+        position_ids = mx.arange(3 * 3 * 4).reshape(3, 3, 4)
+        prompt_kwargs = ar_module._split_prompt_kwargs_per_row(
+            {
+                "inputs_embeds": inputs_embeds,
+                "position_ids": position_ids,
+                "rope_deltas": mx.array([[2], [3], [4]]),
+            },
+            batch_size=3,
+        )
 
-        batch = self._batch(rows, existing_left_padding=[5, 0])
+        gen = self._generator()
+        assert gen.insert(
+            input_ids,
+            prompt_kwargs=prompt_kwargs,
+            attention_mask=attention_mask,
+        ) == [0, 1, 2]
+        queued = {sequence[0]: sequence for sequence in gen._unprocessed_sequences}
 
-        assert batch._left_padding_per_row == [5, 0]
+        assert queued[0][1] == [4, 5]
+        assert queued[1][1] == [6, 7, 8, 9]
+        assert queued[2][1] == [10, 11]
+        assert queued[0][3]["inputs_embeds"].shape == (1, 2, 3)
+        assert queued[1][3]["inputs_embeds"].shape == (1, 4, 3)
+        assert queued[2][3]["inputs_embeds"].shape == (1, 2, 3)
+        assert queued[0][3]["position_ids"].shape == (3, 1, 2)
+        assert queued[1][3]["position_ids"].shape == (3, 1, 4)
+        assert queued[2][3]["position_ids"].shape == (3, 1, 2)
+        assert queued[0][3]["rope_deltas"].tolist() == [[2]]
+        assert queued[2][3]["rope_deltas"].tolist() == [[4]]
 
-    def test_uniform_rows_without_a_declaration_record_none(self):
-        rows = [list(range(8)), list(range(8))]
+    def test_rejects_noncontiguous_padding_mask(self):
+        gen = self._generator()
+        with pytest.raises(ValueError, match="one contiguous prompt span"):
+            gen.insert(
+                mx.array([[0, 4, 0, 5]]),
+                prompt_kwargs=[{"inputs_embeds": mx.ones((1, 4, 3))}],
+                attention_mask=mx.array([[0, 1, 0, 1]]),
+            )
+        assert gen._unprocessed_sequences == []
 
-        batch = self._batch(rows, existing_left_padding=None)
+    def test_accepts_mask_with_existing_python_prompt_rows(self):
+        gen = self._generator()
 
-        assert batch._left_padding_per_row == [0, 0]
+        gen.insert(
+            [[0, 4, 5], [6, 7, 8]],
+            attention_mask=mx.array([[0, 1, 1], [1, 1, 1]]),
+        )
 
-    def test_a_declaration_adds_to_the_generator_s_own_padding(self):
-        rows = [list(range(4)), list(range(8))]
+        queued = {sequence[0]: sequence[1] for sequence in gen._unprocessed_sequences}
+        assert queued == {0: [4, 5], 1: [6, 7, 8]}
 
-        batch = self._batch(rows, existing_left_padding=[2, 1])
+    def test_ragged_rows_initialize_both_cache_types(self):
+        batch = self._batch([[4, 5], [6, 7, 8, 9]])
 
-        assert batch._left_padding_per_row == [6, 1]
+        assert batch._left_padding_per_row == [2, 0]
+        assert batch.total_prompt_tokens == 6
+        assert batch.prompt_cache[0].offset.tolist() == [-2, 0]
+        assert batch.prompt_cache[1].left_padding.tolist() == [2, 0]
 
     def test_arrays_cache_masks_the_declared_padding(self):
         import mlx.core as mx
@@ -3138,10 +3375,78 @@ class TestPrePaddedBatchRows:
         from mlx_vlm.models.cache import ArraysCache
 
         entry = ArraysCache(1)
-        entry.left_padding = mx.array([5, 0])
+        entry.left_padding = mx.array([2, 0])
 
-        mask = entry.make_mask(8)
+        mask = entry.make_mask(4)
 
-        assert mask.shape == (2, 8)
-        assert mask[0].tolist() == [False] * 5 + [True] * 3
-        assert mask[1].tolist() == [True] * 8
+        assert mask.shape == (2, 4)
+        assert mask[0].tolist() == [False, False, True, True]
+        assert mask[1].tolist() == [True] * 4
+
+
+def test_prompt_shorter_than_prefill_step_size_is_still_chunked():
+    """Short prompts must not skip chunking: the unchunked path feeds the whole
+    prompt to _step, which reads logits[:, -1, :] and materializes [1, N, vocab]."""
+    model = MagicMock()
+    model.chunked_prefill_policy = MagicMock(return_value=True)
+    output = SimpleNamespace(
+        logits=mx.zeros((1, 1, 8)),
+        hidden_states=[mx.zeros((1, 1, 4))],
+        shared_kv_states={},
+        cross_attention_states=None,
+        encoder_outputs=None,
+    )
+    model.language_model.return_value = output
+
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 5, 4))
+    embedding_output.to_dict.return_value = {}
+    model.get_input_embeddings.return_value = embedding_output
+
+    with (
+        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+    ):
+        # 5 prompt tokens, prefill_step_size 2048: previously unchunked.
+        list(
+            generate_module.generate_step(
+                input_ids=mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
+                model=model,
+                pixel_values=None,
+                mask=None,
+                max_tokens=1,
+                prefill_step_size=2048,
+            )
+        )
+
+    n_processed = [
+        c.kwargs["n_to_process"]
+        for c in model.language_model.call_args_list
+        if "n_to_process" in c.kwargs
+    ]
+    assert n_processed == [4], f"expected one 4-token prefill chunk, got {n_processed}"
+
+
+def test_paligemma_opts_out_of_chunked_prefill_when_bidirectional():
+    from mlx_vlm.models.paligemma.paligemma import Model as PaliGemmaModel
+
+    bidirectional = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(use_bidirectional_attention=True)
+        )
+    )
+    causal = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(use_bidirectional_attention=False)
+        )
+    )
+    policy = PaliGemmaModel.chunked_prefill_policy
+    assert policy(bidirectional) is False
+    assert policy(causal) is True
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

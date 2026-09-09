@@ -4,7 +4,7 @@ import pytest
 from fastapi import HTTPException
 
 from mlx_vlm.prompt_utils import apply_chat_template
-from mlx_vlm.server.responses_state import _response_items_to_chat
+from mlx_vlm.server.responses_state import ToolCallStreamState, _response_items_to_chat
 
 
 def test_function_output_image_stays_after_tool_result():
@@ -179,3 +179,93 @@ def test_unknown_function_output_blocks_remain_text():
 
     assert images == []
     assert json.loads(messages[0]["content"]) == [unknown]
+
+
+def _stream_tool_content(chunks, tc_start="<tool_call>", tc_end="</tool_call>"):
+    state = ToolCallStreamState(tc_start, tc_end)
+    visible = []
+    for index, chunk in enumerate(chunks):
+        delta = state.feed(chunk, last=index == len(chunks) - 1)
+        if delta:
+            visible.append(delta)
+    return "".join(visible)
+
+
+def test_tool_content_resumes_after_completed_call():
+    content = _stream_tool_content(
+        [
+            "Let me look. ",
+            "<tool_call>",
+            '{"name": "get_weather"}',
+            "</tool_call>",
+            " The weather is sunny.",
+        ]
+    )
+
+    assert content == "Let me look.  The weather is sunny."
+
+
+def test_tool_content_preserves_both_sides_of_coalesced_call():
+    content = _stream_tool_content(
+        ['Before <tool_call>{"name": "a"}</tool_call> after.']
+    )
+
+    assert content == "Before  after."
+
+
+def test_tool_content_preserves_text_between_coalesced_calls():
+    content = _stream_tool_content(
+        [
+            '<tool_call>{"name": "a"}</tool_call>'
+            " between "
+            '<tool_call>{"name": "b"}</tool_call>'
+            " done."
+        ]
+    )
+
+    assert content == " between  done."
+
+
+def test_tool_content_handles_markers_split_across_chunks():
+    content = _stream_tool_content(
+        [
+            "Before <tool",
+            '_call>{"name": "a"}</tool',
+            "_call> after.",
+        ]
+    )
+
+    assert content == "Before  after."
+
+
+def test_tool_content_is_invariant_to_chunk_boundaries():
+    source = (
+        'Before <tool_call>{"name": "a"}</tool_call>'
+        ' between <tool_call>{"name": "b"}</tool_call> after.'
+    )
+    expected = "Before  between  after."
+
+    assert _stream_tool_content(list(source)) == expected
+    for split_at in range(len(source) + 1):
+        assert _stream_tool_content([source[:split_at], source[split_at:]]) == expected
+
+
+def test_tool_content_suppresses_unfinished_call():
+    content = _stream_tool_content(["Before ", "<tool_call>", '{"name": "a"}'])
+
+    assert content == "Before "
+
+
+def test_tool_content_without_end_marker_keeps_latching_behavior():
+    content = _stream_tool_content(
+        ["Before ", "<tool_call>", '{"name": "a"}', " trailing"],
+        tc_end="",
+    )
+
+    assert content == "Before "
+
+
+def test_unfinished_start_marker_is_released_when_stream_ends():
+    content = _stream_tool_content(["A literal <tool"])
+
+    assert content == "A literal <tool"

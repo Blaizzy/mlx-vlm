@@ -15,6 +15,7 @@ _TEMPLATE_MARKERS = [
     (("<mm:think>",), "minimax_m3"),
     (("<minimax:tool_call>",), "minimax_m2"),
     (("<start_function_call>",), "function_gemma"),
+    (("<function name=", "<param name="), "minicpm5"),
     (("<longcat_tool_call>",), "longcat"),
     (("<tool_call>", "<arg_key>", "<arg_value>"), "poolside_v1"),
     (("<arg_key>",), "glm47"),

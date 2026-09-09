@@ -351,6 +351,20 @@ class Thinker(nn.Module):
             **kwargs,
         }
 
+        c0 = cache[0] if cache else None
+        if c0 is not None:
+            offset = getattr(c0, "_idx", None)
+            if offset is None:
+                offset = getattr(c0, "offset", 0)
+            offset = (
+                int(offset.max().item())
+                if isinstance(offset, mx.array)
+                else int(offset)
+            )
+            if offset > 0:
+                kwargs.pop("position_ids", None)
+                kwargs.pop("rope_deltas", None)
+
         logits = self.language_model(input_ids, mask=mask, cache=cache, **kwargs)
 
         return logits

@@ -80,16 +80,18 @@ class Flux2ImageGenerationModel(ImageGenerationModel):
 
     def generate(self, request: ImageGenerationRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
+        steps = request.resolve_steps()
+        guidance = request.resolve_guidance()
         max_sequence_length = request.extra.get("max_sequence_length", None)
         tiled_vae = request.extra.get("tiled_vae", None)
         quantization_config = getattr(self.pipeline, "quantization_config", None)
         array = self.pipeline.generate_array(
             request.prompt,
             seed=seed,
-            steps=request.steps,
+            steps=steps,
             width=request.width,
             height=request.height,
-            guidance=request.guidance,
+            guidance=guidance,
             max_sequence_length=max_sequence_length,
             tiled_vae=tiled_vae,
         )
@@ -105,11 +107,11 @@ class Flux2ImageGenerationModel(ImageGenerationModel):
             seed=seed,
             width=request.width,
             height=request.height,
-            steps=request.steps,
+            steps=steps,
             model=self.model_id,
             family=self.family,
             variant=self.variant,
-            guidance=request.guidance,
+            guidance=guidance,
             prompt_tokens=self.count_prompt_tokens(request.prompt),
             peak_memory=mx.get_peak_memory() / 1e9,
             metadata=metadata,
@@ -172,6 +174,8 @@ class Flux2ImageEditModel(ImageEditModel):
 
     def edit(self, request: ImageEditRequest) -> ImageGenerationResult:
         seed = 0 if request.seed is None else request.seed
+        steps = request.resolve_steps()
+        guidance = request.resolve_guidance()
         max_sequence_length = request.extra.get("max_sequence_length", None)
         tiled_vae = request.extra.get("tiled_vae", None)
         quantization_config = getattr(self.pipeline, "quantization_config", None)
@@ -179,10 +183,10 @@ class Flux2ImageEditModel(ImageEditModel):
             request.prompt,
             request.image_paths,
             seed=seed,
-            steps=request.steps,
+            steps=steps,
             width=request.width,
             height=request.height,
-            guidance=request.guidance,
+            guidance=guidance,
             max_sequence_length=max_sequence_length,
             tiled_vae=tiled_vae,
         )
@@ -200,11 +204,11 @@ class Flux2ImageEditModel(ImageEditModel):
             seed=seed,
             width=array.shape[1],
             height=array.shape[0],
-            steps=request.steps,
+            steps=steps,
             model=self.model_id,
             family=self.family,
             variant=self.variant,
-            guidance=request.guidance,
+            guidance=guidance,
             prompt_tokens=self.count_prompt_tokens(request.prompt),
             peak_memory=mx.get_peak_memory() / 1e9,
             metadata=metadata,

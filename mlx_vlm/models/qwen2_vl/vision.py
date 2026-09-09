@@ -220,7 +220,7 @@ class VisionModel(nn.Module):
         pos_ids = []
 
         for t, h, w in grid_thw:
-            h, w = int(h), int(w)  # Ensure h and w are integers
+            t, h, w = int(t), int(h), int(w)
             hpos_ids = mx.expand_dims(mx.arange(h), 1)
             hpos_ids = mx.repeat(hpos_ids, w, axis=1)
             hpos_ids = hpos_ids.reshape(
@@ -270,7 +270,7 @@ class VisionModel(nn.Module):
         cu_seqlens = []
         for i in range(batch_size):
             seq_len = grid_thw[i, 1] * grid_thw[i, 2]
-            cu_seqlens.append(mx.repeat(seq_len, grid_thw[i, 0]))
+            cu_seqlens.append(mx.repeat(seq_len, int(grid_thw[i, 0])))
 
         # Concatenate the cu_seqlens for all items in the batch
         cu_seqlens = mx.concatenate(cu_seqlens)

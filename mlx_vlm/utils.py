@@ -1,11 +1,13 @@
 import glob
 import importlib
+import importlib.util
 import inspect
 import json
 import logging
 import math
 import struct
 import warnings
+from dataclasses import dataclass, fields
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -26,6 +28,8 @@ from .quantization.one_bit import _quantization_for_path, replace_one_bit_module
 from .tokenizer_utils import load_tokenizer
 from .trainer.utils import apply_lora_layers
 
+logger = logging.getLogger(__name__)
+
 # Modes that support activation quantization
 ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
 
@@ -44,6 +48,7 @@ MODEL_REMAPPING = {
     "granite4-vision": "granite4_vision",
     "granite4_vision": "granite4_vision",
     "rf-detr": "rfdetr",
+    "dinov2_with_registers": "dinov2",
     "falcon-perception": "falcon_perception",
     "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
     "cohere2moe": "cohere2_moe",
@@ -168,28 +173,65 @@ def _transform_modelopt_nvfp4_weights(
     weights: Dict[str, mx.array],
     quantization_config: Optional[Dict[str, Any]],
 ) -> Tuple[Dict[str, mx.array], Optional[Dict[str, Any]]]:
+    """Convert ModelOpt NVFP4 and mixed NVFP4/FP8 checkpoints.
+
+    ModelOpt's mixed export uses ``weight_scale_2`` to identify NVFP4
+    linears and a lone ``weight_scale`` for FP8 linears. MLX can load the
+    former natively; the latter are decoded to dense weights because its FP8
+    mode uses block scales rather than ModelOpt's per-tensor/channel scale.
+    """
     if quantization_config is None:
         return weights, None
-    if (
-        quantization_config.get("quant_method") != "modelopt"
-        or quantization_config.get("quant_algo") != "NVFP4"
-    ):
+    if quantization_config.get("quant_method") not in {
+        "modelopt",
+        "modelopt_mixed",
+    } or quantization_config.get("quant_algo") not in {
+        "NVFP4",
+        "W4A16_NVFP4",
+        "MIXED_PRECISION",
+    }:
         return weights, None
 
     scale_2_suffix = ".weight_scale_2"
-    prefixes = {
+    nvfp4_prefixes = {
         key[: -len(scale_2_suffix)] for key in weights if key.endswith(scale_2_suffix)
     }
-    if not prefixes:
+    scale_suffix = ".weight_scale"
+    scaled_prefixes = {
+        key[: -len(scale_suffix)] for key in weights if key.endswith(scale_suffix)
+    }
+    fp8_prefixes = scaled_prefixes - nvfp4_prefixes
+    if not nvfp4_prefixes and not fp8_prefixes:
         return weights, None
 
-    consumed = {
+    nvfp4_consumed = {
         f"{prefix}.{suffix}"
-        for prefix in prefixes
+        for prefix in nvfp4_prefixes
         for suffix in ("weight", "weight_scale", "input_scale")
     }
+    fp8_consumed = {
+        f"{prefix}.{suffix}"
+        for prefix in fp8_prefixes
+        for suffix in ("weight", "input_scale")
+    }
     transformed = {}
+    # Each fold below builds a deep lazy graph. A large MoE export has tens of
+    # thousands of quantized tensors, so the unevaluated intermediates blow past
+    # Metal's live-buffer limit before the dict is ever consumed. Flush in
+    # batches to keep the graph shallow; this also frees the intermediates.
+    pending: List[mx.array] = []
+
+    def _flush(force: bool = False) -> None:
+        if pending and (force or len(pending) >= 256):
+            mx.eval(pending)
+            pending.clear()
+
     for key, value in weights.items():
+        # ModelOpt emits per-layer FP8 KV-cache scales when kv_cache_quant_algo
+        # is set. MLX quantizes the KV cache at runtime and has no parameter to
+        # hold them, so drop them rather than fail the strict load.
+        if key.endswith(".k_scale") or key.endswith(".v_scale"):
+            continue
         if key.endswith(scale_2_suffix):
             prefix = key[: -len(scale_2_suffix)]
             weight_key = f"{prefix}.weight"
@@ -218,12 +260,31 @@ def _transform_modelopt_nvfp4_weights(
             transformed[f"{prefix}.scales"] = _f32_to_e4m3(
                 decoded_scale * value.astype(mx.float32)
             )
-        elif key in consumed:
+            pending.append(transformed[f"{prefix}.scales"])
+            _flush()
+        elif key.endswith(scale_suffix) and key[: -len(scale_suffix)] in fp8_prefixes:
+            prefix = key[: -len(scale_suffix)]
+            weight_key = f"{prefix}.weight"
+            if weight_key not in weights or weights[weight_key].dtype != mx.uint8:
+                raise ValueError(f"Invalid ModelOpt FP8 tensors for {prefix}.")
+            if not mx.issubdtype(value.dtype, mx.floating):
+                raise ValueError(f"Invalid ModelOpt FP8 scale for {prefix}.")
+            transformed[weight_key] = _dequantize_compressed_tensors_fp8_weight(
+                weights[weight_key], value
+            )
+            pending.append(transformed[weight_key])
+            _flush()
+        elif key in nvfp4_consumed or key in fp8_consumed:
             continue
         else:
             transformed[key] = value
 
-    return transformed, {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    _flush(force=True)
+
+    quantization = None
+    if nvfp4_prefixes:
+        quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    return transformed, quantization
 
 
 def _transform_compressed_tensors_nvfp4_weights(
@@ -351,37 +412,84 @@ def _compressed_tensors_group_weights(
 
 
 def _dequantize_compressed_tensors_fp8_weight(
-    weight: mx.array, scale: mx.array
+    weight: mx.array,
+    scale: mx.array,
+    block_structure: Optional[List[int]] = None,
 ) -> mx.array:
-    """Dequantize a channel-wise fp8 ``float-quantized`` weight to dense.
+    """Dequantize an fp8 ``float-quantized`` weight to dense.
 
-    ``float-quantized`` (``num_bits: 8``, ``strategy: channel``) stores the
-    weight as ``float8_e4m3fn`` -- which ``mx.load`` surfaces as raw ``uint8``
-    E4M3 bytes -- plus a per-output-channel ``weight_scale``. MLX has no
-    per-channel fp8 quantization mode, so we decode the E4M3 codes with the
-    shared LUT and rescale into a dense tensor: ``w = E4M3(byte) * weight_scale``.
-    The dense weight is emitted in ``weight_scale``'s dtype (the checkpoint's
-    compute dtype, typically ``bfloat16``).
+    ``float-quantized`` stores the weight as ``float8_e4m3fn`` -- which
+    ``mx.load`` surfaces as raw ``uint8`` E4M3 bytes -- plus either a
+    per-output-channel or blockwise ``weight_scale``. MLX has no matching FP8
+    mode, so decode the E4M3 codes and rescale into a dense tensor. The dense
+    weight is emitted in ``weight_scale``'s dtype (typically ``bfloat16``).
     """
+    if weight.dtype != mx.uint8 or weight.ndim < 2:
+        raise ValueError(
+            "Compressed-tensors FP8 weights must be E4M3 byte matrices; "
+            f"got dtype={weight.dtype}, shape={weight.shape}."
+        )
+
     out_dtype = scale.dtype if scale.dtype != mx.float32 else mx.bfloat16
     decoded = _E4M3_DECODE_LUT[weight.astype(mx.uint32)]  # float32 [out, in]
     scale = scale.astype(mx.float32)
-    if scale.ndim == 1:
-        scale = scale[:, None]
-    return (decoded * scale).astype(out_dtype)
+    if block_structure is None:
+        if scale.ndim == 1:
+            scale = scale[:, None]
+        return (decoded * scale).astype(out_dtype)
+
+    if len(block_structure) != 2 or any(size <= 0 for size in block_structure):
+        raise ValueError(
+            "Compressed-tensors FP8 block_structure must contain two positive "
+            f"dimensions; got {block_structure}."
+        )
+    block_rows, block_cols = block_structure
+    *batch_shape, rows, cols = weight.shape
+    row_blocks = (rows + block_rows - 1) // block_rows
+    col_blocks = (cols + block_cols - 1) // block_cols
+    expected_scale_shape = (*batch_shape, row_blocks, col_blocks)
+    if scale.shape != expected_scale_shape:
+        raise ValueError(
+            "Compressed-tensors FP8 scale shape does not match its weight: "
+            f"weight={weight.shape}, scales={scale.shape}, "
+            f"block_structure={block_structure}, expected={expected_scale_shape}."
+        )
+
+    pad_rows = row_blocks * block_rows - rows
+    pad_cols = col_blocks * block_cols - cols
+    if pad_rows or pad_cols:
+        decoded = mx.pad(
+            decoded,
+            [(0, 0)] * len(batch_shape) + [(0, pad_rows), (0, pad_cols)],
+        )
+    decoded = decoded.reshape(
+        *batch_shape,
+        row_blocks,
+        block_rows,
+        col_blocks,
+        block_cols,
+    )
+    decoded = (decoded * scale[..., :, None, :, None]).reshape(
+        *batch_shape,
+        rows + pad_rows,
+        cols + pad_cols,
+    )
+    return decoded[..., :rows, :cols].astype(out_dtype)
 
 
 def _transform_compressed_tensors_mixed_weights(
     weights: Dict[str, mx.array],
     quantization_config: Dict[str, Any],
 ) -> Tuple[Dict[str, mx.array], Optional[Dict[str, Any]]]:
-    """Route a compressed-tensors ``mixed-precision`` checkpoint per group.
+    """Route compressed-tensors mixed-precision or pure FP8 weights.
 
     A ``mixed-precision`` export keeps a single top-level ``format`` and puts
-    the real formats in per-group ``config_groups``. Rather than match each
-    group's regex ``targets``/``ignore`` against module paths (fragile -- the
-    HF names differ from MLX's), we route every quantized Linear by the tensors
-    it actually carries, which is exactly what the group assignment produced:
+    the real formats in per-group ``config_groups``. A pure ``float-quantized``
+    export uses the same FP8 tensor layout without any packed weights. Rather
+    than match each group's regex ``targets``/``ignore`` against module paths
+    (fragile -- the HF names differ from MLX's), route every quantized Linear
+    by the tensors it actually carries, which is exactly what the group
+    assignment produced:
 
     - ``.weight_packed`` + ``.weight_global_scale`` -> NVFP4
       (folded to MLX-native ``nvfp4``, as ``_transform_..._nvfp4_weights`` does)
@@ -412,11 +520,22 @@ def _transform_compressed_tensors_mixed_weights(
     int4_cfg = _compressed_tensors_group_weights(quantization_config, "pack-quantized")
     int4_bits = int4_cfg.get("num_bits", 4)
     int4_group_size = int4_cfg.get("group_size", 32)
+    fp8_cfg = _compressed_tensors_group_weights(quantization_config, "float-quantized")
+    fp8_block_structure = fp8_cfg.get("block_structure")
 
     new_weights: Dict[str, mx.array] = {}
     native_quant: Dict[str, Dict[str, Any]] = {}
+    pending: List[mx.array] = []
 
-    for key, value in weights.items():
+    def flush(force: bool = False) -> None:
+        if pending and (force or len(pending) >= 256):
+            mx.eval(pending)
+            pending.clear()
+
+    for key in list(weights):
+        if key not in weights:
+            continue
+        value = weights[key]
         if key.endswith(".weight_packed"):
             prefix = key[: -len(".weight_packed")]
             scale = weights[f"{prefix}.weight_scale"]
@@ -440,11 +559,18 @@ def _transform_compressed_tensors_mixed_weights(
         if key.endswith(".weight_scale"):
             prefix = key[: -len(".weight_scale")]
             if prefix in fp8_prefixes:
+                weight_key = f"{prefix}.weight"
+                source_weight = weights.pop(weight_key)
+                source_scale = weights.pop(key)
                 new_weights[f"{prefix}.weight"] = (
                     _dequantize_compressed_tensors_fp8_weight(
-                        weights[f"{prefix}.weight"], value
+                        source_weight,
+                        source_scale,
+                        fp8_block_structure,
                     )
                 )
+                pending.append(new_weights[f"{prefix}.weight"])
+                flush()
             # NVFP4 / INT4 scales are consumed with their ``.weight_packed``.
             continue
         if key.endswith(".weight") and key[: -len(".weight")] in fp8_prefixes:
@@ -452,6 +578,8 @@ def _transform_compressed_tensors_mixed_weights(
         if any(key.endswith(suffix) for suffix in _COMPRESSED_TENSORS_DROP_SUFFIXES):
             continue
         new_weights[key] = value
+
+    flush(force=True)
 
     if not native_quant:
         return new_weights, None
@@ -478,9 +606,14 @@ def _transform_compressed_tensors_weights(
     if quantization_config.get("quant_method") != "compressed-tensors":
         return weights, None
 
-    # ``mixed-precision`` puts the real formats in per-group ``config_groups``;
-    # route per group (some groups may be dense fp8 with no ``.weight_packed``).
-    if quantization_config.get("format") == "mixed-precision":
+    # Mixed-precision and pure float-quantized exports both use
+    # ``.weight``/``.weight_scale`` for FP8 tensors. Route these before the
+    # packed-weight guard because a pure FP8 checkpoint has no
+    # ``.weight_packed`` tensors at all.
+    if quantization_config.get("format") in {
+        "mixed-precision",
+        "float-quantized",
+    }:
         return _transform_compressed_tensors_mixed_weights(weights, quantization_config)
 
     if not any(key.endswith(".weight_packed") for key in weights):
@@ -584,8 +717,25 @@ def get_class_predicate(skip_vision=False, weights=None, quantization_config=Non
     return predicate
 
 
-def get_model_and_args(config: dict):
-    """Resolve a model package and its normalized model type."""
+def get_model_and_args(config: dict, model_path: Optional[Path] = None):
+    """Resolve a model package and its normalized model type.
+
+    If the config declares ``model_file`` and ``model_path`` is provided, the
+    model module is imported from that file inside the checkpoint (the same
+    mechanism mlx_lm supports) instead of the built-in registry.
+    """
+    if model_path is not None and (model_file := config.get("model_file")):
+        model_file_path = Path(model_path) / model_file
+        if not model_file_path.is_file():
+            raise FileNotFoundError(
+                f"config.json declares model_file={model_file!r} but "
+                f"{model_file_path} does not exist"
+            )
+        spec = importlib.util.spec_from_file_location("custom_model", model_file_path)
+        arch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(arch)
+        return arch, "custom"
+
     raw_model_type = config.get("model_type") or config.get("speculators_model_type")
     if raw_model_type is None:
         raise KeyError("model_type")
@@ -593,9 +743,21 @@ def get_model_and_args(config: dict):
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
-    is_dflash = config.get("dflash_config", None) is not None
-    if is_dflash:
-        model_type += "_dflash"
+    architectures = set(config.get("architectures") or ())
+    dflash_config = config.get("dflash_config")
+    if "BoundaryExtractor" in architectures:
+        model_type = "gliner2_5"
+    elif "DFlash2DraftModel" in architectures:
+        model_type = "dflash2"
+    elif "Gemma4DSparkModel" in architectures:
+        model_type = "gemma4_dspark"
+    elif dflash_config is not None:
+        is_dspark = (
+            dflash_config.get("projector_type") == "dspark"
+            or int(config.get("markov_rank") or dflash_config.get("markov_rank") or 0)
+            > 0
+        )
+        model_type = "dspark" if is_dspark else f"{model_type}_dflash"
 
     last_err: Optional[ImportError] = None
     for pkg in ("mlx_vlm.models", "mlx_vlm.speculative.drafters"):
@@ -613,33 +775,53 @@ def get_model_and_args(config: dict):
     raise ValueError(msg)
 
 
-def _has_config(config: dict, key: str) -> bool:
-    value = config.get(key)
-    return value is not None and value != {}
+def _quantization_path_aliases(
+    path: str, model: Optional[nn.Module] = None
+) -> Tuple[str, ...]:
+    """Return checkpoint quantization keys that may refer to a module path."""
+    aliases = [path]
+    if path.startswith("language_model."):
+        aliases.append(path[len("language_model.") :])
+
+    model_aliases = getattr(model, "quantization_path_aliases", None)
+    if callable(model_aliases):
+        aliases.extend(model_aliases(path))
+
+    return tuple(dict.fromkeys(aliases))
 
 
-def _is_text_only_config(config: dict) -> bool:
-    return not any(
-        _has_config(config, key)
-        for key in ("vision_config", "audio_config", "dflash_config")
-    )
+def _quantization_for_module_path(
+    quantization: dict, path: str, model: Optional[nn.Module] = None
+) -> Optional[dict]:
+    for alias in _quantization_path_aliases(path, model):
+        value = quantization.get(alias)
+        if isinstance(value, dict):
+            return value
+        if value is False:
+            return {}
+    return None
 
 
-def _drop_modules_without_weights(model: nn.Module, weights: dict) -> None:
+def _drop_modules_without_weights(
+    model: nn.Module, weights: dict, declared_keys: Optional[set] = None
+) -> None:
+    """Drop weightless top-level VLM modules the checkpoint manifest also omits."""
     weighted_modules = {key.partition(".")[0] for key in weights}
+    declared_modules = {key.partition(".")[0] for key in (declared_keys or weights)}
     dropped_modules = []
     for name, child in list(model.items()):
         if name == "language_model" or not isinstance(child, nn.Module):
             continue
         if not tree_flatten(child.parameters()) or name in weighted_modules:
             continue
+        if name in declared_modules:
+            continue
         setattr(model, name, None)
         dropped_modules.append(name)
 
     if dropped_modules:
         logging.warning(
-            "Text-only checkpoint has no weights for VLM module(s): %s. "
-            "Disabling those modules.",
+            "Checkpoint has no weights for module(s): %s. Disabling them.",
             ", ".join(dropped_modules),
         )
 
@@ -684,7 +866,11 @@ def get_model_path(
     return model_path
 
 
-def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
+def load_model(
+    model_path: Path,
+    lazy: bool = False,
+    **kwargs,
+) -> nn.Module:
     """
     Load and initialize the model from a given path.
 
@@ -707,14 +893,24 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
     strict = kwargs.pop("strict", True)
+    # An expert-offload dir (mlx_vlm.moe_offload) is missing routed-expert
+    # keys by design; defer eval until patch_model swaps those modules, or
+    # their random-init resident weights get eagerly materialized -- the OOM
+    # this feature exists to avoid.
+    is_offload_dir = (model_path / "offload_index.json").exists()
+    if is_offload_dir:
+        strict = False
+        requested_lazy, lazy = lazy, True
     config = load_config(model_path, **kwargs)
 
     index_file = model_path / "model.safetensors.index.json"
     weight_files = []
+    declared_keys: set = set()
     if index_file.exists():
         try:
             with open(index_file) as f:
                 weight_map = json.load(f).get("weight_map", {})
+            declared_keys = set(weight_map)
             weight_files = [
                 str(model_path / shard)
                 for shard in sorted(set(weight_map.values()))
@@ -722,6 +918,7 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
             ]
         except (ValueError, OSError):
             weight_files = []
+            declared_keys = set()
     if not weight_files:
         weight_files = [
             wf
@@ -755,13 +952,17 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(_load_safetensors(wf))
 
-    model_class, _ = get_model_and_args(config=config)
-    text_only_config = _is_text_only_config(config)
+    model_class, _ = get_model_and_args(config=config, model_path=model_path)
 
     # Initialize text and vision configs if not present
     config.setdefault("text_config", config.pop("llm_config", {}))
     config.setdefault("vision_config", {})
     config.setdefault("audio_config", {})
+    ple_storage = config["text_config"].get("ple_storage")
+    if ple_storage and (manifest := ple_storage.get("manifest")):
+        manifest_path = Path(manifest)
+        if not manifest_path.is_absolute():
+            ple_storage["manifest"] = str(model_path / manifest_path)
 
     has_quantization = "quantization" in config
 
@@ -791,25 +992,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     if transformed_quantization is not None:
         config["quantization"] = transformed_quantization
         config["quantization_config"] = transformed_quantization
-
-    # Sanitize weights
-    weights = sanitize_weights(model, weights)
-
-    if hasattr(model_class, "VisionModel"):
-        if hasattr(model_config, "vision_config"):
-            weights = sanitize_weights(
-                model_class.VisionModel, weights, model_config.vision_config
-            )
-    if hasattr(model_class, "LanguageModel"):
-        if hasattr(model_config, "text_config"):
-            weights = sanitize_weights(
-                model_class.LanguageModel, weights, model_config.text_config
-            )
-    if hasattr(model_class, "AudioModel"):
-        if hasattr(model_config, "audio_config"):
-            weights = sanitize_weights(
-                model_class.AudioModel, weights, model_config.audio_config
-            )
 
     if not has_quantization:
         quantization_config = config.get("quantization_config", None)
@@ -842,14 +1024,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             elif quant_method == "mxfp4":
                 quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
-            elif quant_method == "fp8" and config.get("model_type") == "deepseek_v4":
-                from .models.deepseek_v4.language import make_quantization_config
+            elif quant_method == "fp8":
+                from .fp8 import transform_fp8_weights
 
-                quantization = make_quantization_config(model)
-            elif quant_method == "fp8" and config.get("model_type") == "qwen3_5":
-                from .models.qwen3_5.fp8 import make_quantization_config
+                weights, quantization = transform_fp8_weights(weights, config)
+                # TODO: Refactor DeepSeek-V4 to use the shared FP8 transform.
+                if quantization is None and config.get("model_type") == "deepseek_v4":
+                    from .models.deepseek_v4.language import make_quantization_config
 
-                quantization = make_quantization_config(config)
+                    quantization = make_quantization_config(model)
             elif quant_method in ("awq", "gptq"):
                 logging.warning(
                     "Quantization method %s is not supported in mlx_vlm.load_model()",
@@ -866,6 +1049,24 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             if quantization_value is not None:
                 config[quantization_key] = quantization_value
 
+    weights = sanitize_weights(model, weights)
+
+    if hasattr(model_class, "VisionModel"):
+        if hasattr(model_config, "vision_config"):
+            weights = sanitize_weights(
+                model_class.VisionModel, weights, model_config.vision_config
+            )
+    if hasattr(model_class, "LanguageModel"):
+        if hasattr(model_config, "text_config"):
+            weights = sanitize_weights(
+                model_class.LanguageModel, weights, model_config.text_config
+            )
+    if hasattr(model_class, "AudioModel"):
+        if hasattr(model_config, "audio_config"):
+            weights = sanitize_weights(
+                model_class.AudioModel, weights, model_config.audio_config
+            )
+
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may or may not have vision quantized.
         # text-only quants of unified VLM families set vision_config to null,
@@ -878,6 +1079,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         replace_one_bit_modules(quantized_model, quantization, weights)
 
         def get_class_predicate(p, m):
+            per_module_quantization = _quantization_for_module_path(
+                config["quantization"], p, model
+            )
             # Skip legacy multimodal layers unless the checkpoint has quantized
             # tensors for this exact module.
             if (
@@ -887,17 +1091,17 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             ):
                 return False
             # Skip 1-bit layers already replaced above.
-            if _quantization_for_path(config["quantization"], p).get("bits") == 1:
+            module_quantization = (
+                per_module_quantization
+                if per_module_quantization is not None
+                else _quantization_for_path(config["quantization"], p)
+            )
+            if module_quantization.get("bits") == 1:
                 return False
-            # Handle custom per layer quantizations. Config keys from the
-            # underlying text checkpoint omit the mlx-vlm ``language_model.``
-            # wrapper prefix that loaded module paths carry, so also match with
-            # that prefix stripped (e.g. per-layer 8-bit MoE router gates).
-            override = config["quantization"].get(p)
-            if override is None and p.startswith("language_model."):
-                override = config["quantization"].get(p[len("language_model.") :])
-            if isinstance(override, dict):
-                return override
+            # Handle custom per-layer quantization, including aliases supplied
+            # by the model.
+            if per_module_quantization is not None:
+                return per_module_quantization
             if not hasattr(m, "to_quantized"):
                 return False
             # Skip layers not divisible by 64
@@ -922,10 +1126,44 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         model = quantize_activations(model)
 
-    if text_only_config:
-        _drop_modules_without_weights(model, weights)
+    if is_offload_dir:
+        # strict=False above must not swallow a genuinely malformed offload
+        # dir: verify every parameter left at random-init is actually an
+        # expected expert-weight path, and fail loudly on anything else.
+        from .moe_offload import PEREXPERT_RE, STACKED_FUSED_RE, STACKED_RE
+
+        expected = {k for k, _ in tree_flatten(model.parameters())}
+        missing = expected - set(weights)
+        unexpected_missing = [
+            k
+            for k in missing
+            if not (
+                PEREXPERT_RE.match(k)
+                or STACKED_RE.match(k)
+                or STACKED_FUSED_RE.match(k)
+            )
+        ]
+        if unexpected_missing:
+            raise ValueError(
+                f"Offload dir {model_path} is missing {len(unexpected_missing)} "
+                "resident parameters that aren't routed-expert weights (malformed "
+                "repack() output?): " + ", ".join(sorted(unexpected_missing)[:10])
+            )
+
+    _drop_modules_without_weights(model, weights, declared_keys)
 
     model.load_weights(list(weights.items()), strict=strict)
+
+    if is_offload_dir:
+        from .moe_offload import patch_model
+
+        model.moe_offload_store = patch_model(
+            model,
+            str(model_path),
+            expert_cache_gb=kwargs.get("expert_cache_gb"),
+            max_kv_size=kwargs.get("max_kv_size"),
+        )
+        lazy = requested_lazy
 
     if not lazy:
         mx.eval(model.parameters())
@@ -1152,10 +1390,23 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
             except json.JSONDecodeError:
                 pass
 
-        return config
-
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"Config not found at {model_path}") from exc
+
+    # GLiNER2.5 ships its encoder config in a sidecar directory instead of
+    # inline, so fold it in alongside the other config files. Raised outside the
+    # block above so the missing file is not reported as a missing config.json.
+    if "BoundaryExtractor" in (config.get("architectures") or ()):
+        if "encoder_config" not in config:
+            encoder_config_path = model_path / "encoder_config" / "config.json"
+            if not encoder_config_path.is_file():
+                raise FileNotFoundError(
+                    f"GLiNER2.5 encoder config not found: {encoder_config_path}"
+                )
+            with open(encoder_config_path, encoding="utf-8") as f:
+                config["encoder_config"] = json.load(f)
+
+    return config
 
 
 def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImageProcessor:
@@ -1200,19 +1451,15 @@ def load_processor(
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
 
-        # Instantiate the detokenizer
-        processor.detokenizer = detokenizer_class(tokenizer_obj)
-
-        # Determine the EOS token IDs, prioritizing the function argument
-        final_eos_token_ids = (
-            eos_token_ids
-            or getattr(tokenizer_obj, "eos_token_ids", None)
-            or getattr(tokenizer_obj, "eos_token_id", None)
-        )
+        # Non-text models (depth, detection) have no decode(); skip detokenizer
+        try:
+            processor.detokenizer = detokenizer_class(tokenizer_obj)
+        except AttributeError:
+            return processor
 
         # Create and assign the StoppingCriteria
         criteria = StoppingCriteria(
-            final_eos_token_ids,
+            eos_token_ids,
             tokenizer_obj,
             additional_eos_token_ids=getattr(processor, "additional_eos_token_ids", ()),
         )
@@ -1727,21 +1974,95 @@ def load_audio(
     return audio.mean(axis=1) if audio.ndim > 1 else audio
 
 
+@dataclass(frozen=True)
+class VideoSampling:
+    """How many frames to take from a clip, and at what rate.
+
+    Every field is optional so an unset one can be filled from a
+    lower-precedence source via :meth:`merge`, with
+    :data:`DEFAULT_VIDEO_SAMPLING` terminating the chain.
+    """
+
+    fps: Optional[float] = None
+    nframes: Optional[int] = None
+    min_frames: Optional[int] = None
+    max_frames: Optional[int] = None
+    frame_factor: Optional[int] = None
+
+    def merge(self, fallback: "VideoSampling") -> "VideoSampling":
+        """Return a copy with every unset field taken from ``fallback``."""
+        return VideoSampling(
+            **{
+                f.name: (
+                    getattr(self, f.name)
+                    if getattr(self, f.name) is not None
+                    else getattr(fallback, f.name)
+                )
+                for f in fields(self)
+            }
+        )
+
+
+DEFAULT_VIDEO_SAMPLING = VideoSampling(
+    fps=2.0, min_frames=4, max_frames=768, frame_factor=2
+)
+
+
+@dataclass
+class VideoMetadata:
+    """What the decode step knew about a clip, carried alongside its frames.
+
+    Field names mirror ``transformers.video_utils.VideoMetadata`` so a
+    processor ported from upstream can consume this unchanged.
+    """
+
+    total_num_frames: int
+    fps: float
+    frames_indices: List[int]
+    width: Optional[int] = None
+    height: Optional[int] = None
+    duration: Optional[float] = None
+
+    @property
+    def timestamps(self) -> List[float]:
+        """Seconds into the clip for each sampled frame."""
+        return [idx / self.fps for idx in self.frames_indices]
+
+    @property
+    def sampled_fps(self) -> float:
+        """Frame rate actually achieved, which clamping can push well below
+        the requested ``fps``."""
+        return len(self.frames_indices) / max(self.total_num_frames, 1e-6) * self.fps
+
+
 def load_video(
     video_path: str,
-    fps: float = 2.0,
-    nframes: Optional[int] = None,
-    min_frames: int = 4,
-    max_frames: int = 768,
-    frame_factor: int = 2,
-) -> Tuple[np.ndarray, float]:
+    sampling: Optional[VideoSampling] = None,
+    frame_sampler=None,
+    **sampling_kwargs,
+) -> Tuple[np.ndarray, VideoMetadata]:
     """Read a video file as a (T, C, H, W) numpy array.
 
-    Uniformly samples ``nframes`` frames — either a fixed count or derived
-    from ``fps`` — and returns the sampled frames alongside the effective
-    sampling fps.
+    Samples ``nframes`` frames, a count derived from ``fps``, or indices from
+    ``frame_sampler``. Returns source-aware :class:`VideoMetadata` alongside
+    the frames. Sampling fields may be supplied as a :class:`VideoSampling`
+    or as loose keyword arguments; the former wins for overlapping fields.
     """
     import cv2
+
+    if sampling_kwargs:
+        unknown = set(sampling_kwargs) - {f.name for f in fields(VideoSampling)}
+        if unknown:
+            raise TypeError(
+                f"load_video() got unexpected keyword arguments: {sorted(unknown)}"
+            )
+        sampling = (sampling or VideoSampling()).merge(VideoSampling(**sampling_kwargs))
+    resolved = (sampling or VideoSampling()).merge(DEFAULT_VIDEO_SAMPLING)
+    fps = resolved.fps
+    nframes = resolved.nframes
+    min_frames = resolved.min_frames
+    max_frames = resolved.max_frames
+    frame_factor = resolved.frame_factor
 
     if video_path.startswith("file://"):
         video_path = video_path[7:]
@@ -1751,6 +2072,9 @@ def load_video(
         raise ValueError(f"Cannot open video: {video_path}")
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    duration = total_frames / video_fps
 
     def _round(n):
         return round(n / frame_factor) * frame_factor
@@ -1761,21 +2085,41 @@ def load_video(
     def _ceil(n):
         return math.ceil(n / frame_factor) * frame_factor
 
+    used_frame_sampler = False
     if nframes is not None:
         n = _round(nframes)
+        indices = np.linspace(0, total_frames - 1, n).round().astype(int)
+    elif frame_sampler is not None:
+        used_frame_sampler = True
+        source_metadata = VideoMetadata(
+            total_num_frames=total_frames,
+            fps=video_fps,
+            frames_indices=list(range(total_frames)),
+            width=width,
+            height=height,
+            duration=duration,
+        )
+        indices = np.asarray(
+            frame_sampler(source_metadata, fps=fps, max_frames=max_frames), dtype=int
+        ).reshape(-1)
+        n = len(indices)
     else:
         lo = _ceil(min_frames)
         hi = _floor(min(max_frames, total_frames))
         n = total_frames / video_fps * fps
         n = min(max(n, lo), hi, total_frames)
         n = _floor(n)
-    if not (frame_factor <= n <= total_frames):
+        indices = np.linspace(0, total_frames - 1, n).round().astype(int)
+    if not used_frame_sampler and not (frame_factor <= n <= total_frames):
         cap.release()
         raise ValueError(
             f"nframes must be in [{frame_factor}, {total_frames}], got {n}."
         )
-
-    indices = np.linspace(0, total_frames - 1, n).round().astype(int)
+    if n == 0 or np.any(indices < 0) or np.any(indices >= total_frames):
+        cap.release()
+        raise ValueError(
+            f"Frame indices must be within a non-empty {total_frames}-frame video."
+        )
     frames = []
     for idx in indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -1788,8 +2132,68 @@ def load_video(
         raise ValueError("No frames read from the video.")
 
     video_np = np.transpose(np.stack(frames, axis=0), (0, 3, 1, 2))
-    sample_fps = n / max(total_frames, 1e-6) * video_fps
-    return video_np, sample_fps
+    metadata = VideoMetadata(
+        total_num_frames=total_frames,
+        fps=video_fps,
+        # Truncated where a read failed part-way, so this tracks the frames
+        # actually returned rather than the ones asked for.
+        frames_indices=indices[: len(frames)].tolist(),
+        height=int(video_np.shape[2]),
+        width=int(video_np.shape[3]),
+        duration=total_frames / video_fps,
+    )
+    return video_np, metadata
+
+
+_VIDEO_SAMPLING_FIELDS = tuple(f.name for f in fields(VideoSampling))
+
+
+def processor_video_sampling(processor) -> VideoSampling:
+    """The frame sampling a processor asks for, if it declares any.
+
+    A processor opts in either by exposing a ``video_sampling_defaults()``
+    hook — the way to declare a cap whose attribute is named something else,
+    such as Gemma 4's ``num_frames`` — or by carrying matching attributes on
+    its video processor component.
+    """
+    component = getattr(processor, "video_processor", None)
+    if component is None:
+        return VideoSampling()
+    for owner in (component, processor):
+        hook = getattr(owner, "video_sampling_defaults", None)
+        if callable(hook):
+            declared = hook()
+            return (
+                declared
+                if isinstance(declared, VideoSampling)
+                else VideoSampling(**declared)
+            )
+    return VideoSampling(
+        **{
+            name: getattr(component, name, None)
+            for name in ("fps", "min_frames", "max_frames")
+        }
+    )
+
+
+def resolve_video_sampling(processor, overrides: Dict[str, Any]) -> VideoSampling:
+    """Settle how a clip gets sampled.
+
+    Caller wins, then whatever the processor declares, then the library
+    defaults. Consumes the sampling keys from ``overrides`` so they do not
+    travel on to the processor, which only ever sees frames that were already
+    chosen here.
+    """
+    explicit = VideoSampling(
+        **{
+            name: overrides.pop(name)
+            for name in _VIDEO_SAMPLING_FIELDS
+            if name in overrides
+        }
+    )
+    return explicit.merge(processor_video_sampling(processor)).merge(
+        DEFAULT_VIDEO_SAMPLING
+    )
 
 
 def process_inputs(
@@ -1977,7 +2381,7 @@ def prepare_inputs(
         if not isinstance(audio, list):
             audio = [audio]
 
-        if len(audio) > 1:
+        if len(audio) > 1 and not getattr(processor, "supports_multiple_audio", False):
             print(
                 "\033[33mWarning\033[0m: Single prompt with multiple audio files is not supported yet. Using the first audio file.\n"
             )
@@ -1992,19 +2396,54 @@ def prepare_inputs(
         audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
 
     video_fps = None
+    supplied_video_metadata = kwargs.pop("video_metadata", None)
+    video_metadata = None
     if has_videos:
         if not isinstance(videos, list):
             videos = [videos]
-        fps_hint = kwargs.pop("fps", 2.0)
-        loaded, video_fps = [], []
-        for v in videos:
-            arr, s_fps = (
-                load_video(str(v), fps=fps_hint)
-                if isinstance(v, (str, bytes))
-                else (v, fps_hint)
-            )
+        sampling = resolve_video_sampling(processor, kwargs)
+        if supplied_video_metadata is not None and len(supplied_video_metadata) != len(
+            videos
+        ):
+            raise ValueError("Expected one video_metadata entry per video.")
+        component = getattr(processor, "video_processor", None)
+        frame_sampler = (
+            getattr(component, "sample_frames", None)
+            if getattr(component, "sample_frames_in_loader", False)
+            else None
+        )
+        loaded, video_fps, video_metadata = [], [], []
+        for video_index, v in enumerate(videos):
+            if isinstance(v, (str, bytes, Path)):
+                arr, metadata = load_video(
+                    str(v), sampling, frame_sampler=frame_sampler
+                )
+                logger.info(
+                    "video %s: sampled %d of %d frames at %.2f fps "
+                    "(source %.2f fps, %.1fs)",
+                    v,
+                    len(metadata.frames_indices),
+                    metadata.total_num_frames,
+                    metadata.sampled_fps,
+                    metadata.fps,
+                    metadata.duration,
+                )
+            else:
+                # Already-decoded frames: nothing was sampled here, so report
+                # the requested rate and describe what we were handed.
+                arr = v
+                metadata = VideoMetadata(
+                    total_num_frames=len(v),
+                    fps=sampling.fps,
+                    frames_indices=list(range(len(v))),
+                )
+                if supplied_video_metadata is not None:
+                    metadata = supplied_video_metadata[video_index]
+                    if isinstance(metadata, dict):
+                        metadata = VideoMetadata(**metadata)
             loaded.append(arr)
-            video_fps.append(s_fps)
+            video_fps.append(metadata.sampled_fps)
+            video_metadata.append(metadata)
         videos = loaded
 
     model_inputs = {}
@@ -2050,6 +2489,8 @@ def prepare_inputs(
             extra["videos"] = videos
             if video_fps is not None:
                 extra["fps"] = video_fps
+            if video_metadata is not None:
+                extra["video_metadata"] = video_metadata
         inputs = process_inputs_with_fallback(
             processor,
             images=images,
@@ -2136,6 +2577,29 @@ def group_images_by_shape(
     return grouped_images, grouped_indices
 
 
+def resolve_eos_token_ids(eos_token_ids, tokenizer) -> List[int]:
+    """Union configured EOS token ids with the tokenizer's own EOS.
+
+    A checkpoint's ``eos_token_id`` can disagree with the token its chat template
+    ends turns on -- Chandra OCR 2 configures ``<|endoftext|>`` but emits
+    ``<|im_end|>`` -- so neither source alone is enough to stop generation.
+    """
+    resolved: List[int] = []
+    for source in (
+        eos_token_ids,
+        getattr(tokenizer, "eos_token_ids", None),
+        getattr(tokenizer, "eos_token_id", None),
+    ):
+        if isinstance(source, int):
+            source = [source]
+        if not isinstance(source, (list, tuple, set)):
+            continue
+        for token_id in source:
+            if isinstance(token_id, int) and token_id not in resolved:
+                resolved.append(token_id)
+    return resolved
+
+
 class StoppingCriteria:
     def __init__(
         self,
@@ -2177,14 +2641,7 @@ class StoppingCriteria:
             self.eos_token_ids.extend(resolved)
 
     def reset(self, eos_token_ids: List[int] = None):
-        eos_token_ids = (
-            eos_token_ids if eos_token_ids is not None else self.tokenizer.eos_token_ids
-        )
-
-        if isinstance(eos_token_ids, int):
-            eos_token_ids = [eos_token_ids]
-
-        resolved = list(eos_token_ids)
+        resolved = resolve_eos_token_ids(eos_token_ids, self.tokenizer)
         resolved.extend(
             token_id
             for token_id in self.additional_eos_token_ids

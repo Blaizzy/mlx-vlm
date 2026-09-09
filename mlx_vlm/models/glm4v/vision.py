@@ -107,10 +107,16 @@ class Glm4vVisionEmbeddings(nn.Module):
 
             # Calculate target dimensions for each patch
             target_h = mx.concatenate(
-                [mx.repeat(image_shapes[i, 1], lengths[i]) for i in range(len(lengths))]
+                [
+                    mx.repeat(image_shapes[i, 1], int(lengths[i]))
+                    for i in range(len(lengths))
+                ]
             ).astype(mx.float32)
             target_w = mx.concatenate(
-                [mx.repeat(image_shapes[i, 2], lengths[i]) for i in range(len(lengths))]
+                [
+                    mx.repeat(image_shapes[i, 2], int(lengths[i]))
+                    for i in range(len(lengths))
+                ]
             ).astype(mx.float32)
 
             # Normalize coordinates to [-1, 1] range for grid_sample

@@ -25,10 +25,10 @@ class ImageEditRequest:
     prompt: str
     image_paths: tuple[str | Path, ...]
     seed: int | None = None
-    steps: int = DEFAULT_IMAGE_STEPS
+    steps: int | None = None
     width: int | None = None
     height: int | None = None
-    guidance: float = DEFAULT_IMAGE_GUIDANCE
+    guidance: float | None = None
     output_format: Literal["png"] = DEFAULT_IMAGE_FORMAT
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -37,6 +37,12 @@ class ImageEditRequest:
             self.image_paths = (self.image_paths,)
         else:
             self.image_paths = tuple(self.image_paths)
+
+    def resolve_steps(self, default: int = DEFAULT_IMAGE_STEPS) -> int:
+        return default if self.steps is None else self.steps
+
+    def resolve_guidance(self, default: float = DEFAULT_IMAGE_GUIDANCE) -> float:
+        return default if self.guidance is None else self.guidance
 
 
 class ImageEditModel(Protocol):

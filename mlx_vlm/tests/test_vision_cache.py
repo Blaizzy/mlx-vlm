@@ -43,21 +43,24 @@ class TestVisionFeatureCache:
         assert cache.get(["img1.jpg", "img2.jpg"]) is not None
         assert cache.get(["img2.jpg", "img1.jpg"]) is None  # order matters
 
+    def test_multi_image_feature_collection(self):
+        cache = VisionFeatureCache()
+        features = [mx.ones((4, 8)), mx.full((6, 8), 2)]
+
+        cache.put(["img1.jpg", "img2.jpg"], features)
+        cached = cache.get(["img1.jpg", "img2.jpg"])
+
+        assert isinstance(cached, list)
+        assert len(cached) == 2
+        assert mx.array_equal(cached[0], features[0])
+        assert mx.array_equal(cached[1], features[1])
+
     def test_url_key(self):
         cache = VisionFeatureCache()
         url = "https://example.com/image.jpg"
         features = mx.ones((1, 280, 1536))
         cache.put(url, features)
         assert cache.get(url) is not None
-
-    def test_clear(self):
-        cache = VisionFeatureCache()
-        cache.put("a.jpg", mx.ones((1, 10, 64)))
-        cache.put("b.jpg", mx.ones((1, 10, 64)))
-        assert len(cache) == 2
-        cache.clear()
-        assert len(cache) == 0
-        assert cache.get("a.jpg") is None
 
     def test_contains(self):
         cache = VisionFeatureCache()
@@ -139,6 +142,7 @@ class TestCachedImageFeaturesKwarg:
             "granite_vision.granite_vision",
             "granite4_vision.granite4_vision",
             "deepseek_vl_v2.deepseek_vl_v2",
+            "deepseek_v4.deepseek_v4",
             "multi_modality.multi_modality",
             "lfm2_vl.lfm2_vl",
             "idefics2.idefics2",

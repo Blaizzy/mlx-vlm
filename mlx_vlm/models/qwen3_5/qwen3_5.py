@@ -8,7 +8,6 @@ from ..qwen3_vl import Model as Qwen3VLModel
 from ..qwen3_vl import processing_qwen3_vl  # noqa: F401
 from ..qwen3_vl.qwen3_vl import masked_scatter
 from .config import ModelConfig
-from .fp8 import convert_qwen_fp8_weights
 from .language import LanguageModel
 from .vision import VisionModel
 
@@ -146,7 +145,6 @@ class Model(Qwen3VLModel):
         # The MTP draft shard is separate from the base model. Its presence
         # must not select the base model's RMSNorm loading convention.
         weights = {key: value for key, value in weights.items() if "mtp." not in key}
-        weights = convert_qwen_fp8_weights(weights)
         shift_norm_weights = should_shift_norm_weights(weights)
 
         if self.config.text_config.tie_word_embeddings:
@@ -159,6 +157,13 @@ class Model(Qwen3VLModel):
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
+            # Qwen3.8 ships the Conv3d patch embed in PyTorch NCDHW order,
+            # while MLX convolutions expect NDHWC. Guard on the trailing axis
+            # so re-sanitizing already-converted weights is a no-op.
+            if key.endswith("patch_embed.proj.weight") and value.ndim == 5:
+                in_ch = self.config.vision_config.in_channels
+                if value.shape[-1] != in_ch and value.shape[1] == in_ch:
+                    value = value.transpose(0, 2, 3, 4, 1)
             if any(key.endswith(sfx) for sfx in NORM_WEIGHT_SUFFIXES):
                 if value.ndim == 1 and should_offset_norm_weight(
                     original_key, shift_norm_weights

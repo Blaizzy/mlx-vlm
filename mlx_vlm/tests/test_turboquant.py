@@ -166,6 +166,23 @@ def test_batch_turboquant_filter_supports_uniform_single_item_offsets():
     assert cache.left_padding.tolist() == [0]
 
 
+def test_batch_turboquant_uses_value_shape_for_value_codec():
+    keys = mx.random.normal((1, 1, 3, 32))
+    values = mx.random.normal((1, 1, 3, 8))
+    cache = BatchTurboQuantKVCache([0], bits=3.5)
+
+    quantized_keys, quantized_values = cache.update_and_fetch(keys, values)
+    dequantized_keys, dequantized_values = cache.dequantize(
+        quantized_keys, quantized_values
+    )
+    mx.eval(dequantized_keys, dequantized_values)
+
+    assert cache.key_codec.dim == keys.shape[-1]
+    assert cache.value_codec.dim == values.shape[-1]
+    assert dequantized_keys.shape == keys.shape
+    assert dequantized_values.shape == values.shape
+
+
 def test_batch_turboquant_cache_supports_uniform_right_trim():
     cache = BatchTurboQuantKVCache([0, 1], bits=3.5)
     keys = mx.ones((2, 2, 5, 8), dtype=mx.float16)

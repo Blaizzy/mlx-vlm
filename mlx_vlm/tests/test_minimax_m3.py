@@ -2,6 +2,7 @@ import math
 
 import mlx.core as mx
 import numpy as np
+import pytest
 
 import mlx_vlm.models.minimax_m3_vl.language as minimax_language
 from mlx_vlm.models.minimax_m3_vl.config import ModelConfig, TextConfig, VisionConfig
@@ -1329,7 +1330,10 @@ def test_minimax_m3_rollback_speculative_cache_trims_index_cache():
     assert cache.index_offset == 3
 
 
-def test_minimax_m3_batch_rollback_zeroes_rejected_index_tails():
+def test_minimax_m3_batch_rollback_raises_on_ragged_accepts():
+    # Ragged accepts on a rectangular batch cache would zero the shorter row's
+    # KV and indexer tails, leaving phantom keys attended (issue #1962). The
+    # rollback must fail loud so callers clamp to uniform acceptance instead.
     lm = LanguageModel(_tiny_minimax_text_config(num_hidden_layers=1))
     cache = MiniMaxM3BatchKVCache([0, 0])
     keys = mx.ones((2, 1, 5, 4), dtype=mx.float32)
@@ -1338,18 +1342,10 @@ def test_minimax_m3_batch_rollback_zeroes_rejected_index_tails():
 
     cache.update_and_fetch(keys, values)
     cache.update_index_and_fetch(index_keys)
-    accepted = lm.rollback_speculative_cache(
-        [cache], None, accepted=mx.array([2, 0], dtype=mx.int32), block_size=4
-    )
-
-    assert accepted == 2
-    assert cache._idx == 4
-    assert cache.index_offset == 4
-    assert cache.kv_cache.keys[0, :, 1:4, :].sum().item() > 0
-    assert cache.index_keys[0, :, 1:4, :].sum().item() > 0
-    assert cache.kv_cache.keys[1, :, 2:4, :].sum().item() == 0
-    assert cache.kv_cache.values[1, :, 2:4, :].sum().item() == 0
-    assert cache.index_keys[1, :, 2:4, :].sum().item() == 0
+    with pytest.raises(RuntimeError, match="uniform"):
+        lm.rollback_speculative_cache(
+            [cache], None, accepted=mx.array([2, 0], dtype=mx.int32), block_size=4
+        )
 
 
 def test_minimax_m3_batch_index_cache_filter_extend_extract():
@@ -3111,3 +3107,28 @@ def test_minimax_m3_get_input_embeddings_uses_cached_video_without_pixels():
     assert output.visual_pos_masks.tolist() == [[False, True, True, False]]
     assert output.inputs_embeds[0, 1].tolist() == [4.0, 5.0, 6.0]
     assert output.inputs_embeds[0, 2].tolist() == [7.0, 8.0, 9.0]
+
+
+def test_sparse_index_helpers_are_not_shape_compiled():
+    """The sparse index helpers must stay uncompiled.
+
+    Both take `idx_keys` straight from `update_index_and_fetch`, whose sequence
+    dimension is the running context length. A non-shapeless `mx.compile` keys
+    on input shapes, so it re-traces every decode step: the compiled artifact is
+    never reused and each trace leaves permanent state in MLX's compiler cache
+    that `mx.clear_cache()` does not release, eventually tripping
+    `[metal::malloc] Resource limit (499000) exceeded` on a long-running server.
+
+    If either of these ever needs compiling again, it has to be `shapeless=True`
+    with the shape-dependent work (`idx_keys.shape[2]`, `mx.arange(total_len)`)
+    lifted out first.
+    """
+
+    def is_compiled(fn):
+        return type(fn).__name__ == "gc_func"
+
+    assert not is_compiled(minimax_language._build_sparse_causal_mask_compiled)
+    assert not is_compiled(minimax_language._select_sparse_block_indices_compiled)
+
+    # Guard the check itself: a compiled function must be detected as one.
+    assert is_compiled(mx.compile(lambda x: x + 1))

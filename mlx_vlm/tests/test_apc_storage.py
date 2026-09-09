@@ -38,7 +38,7 @@ def test_kv_block_handle_empty():
 
 
 def test_apcblock_is_node_and_delegates():
-    block = APCBlock(block_id=0)
+    block = APCBlock()
     assert isinstance(block, APCNode)
     assert block.components == {}
     assert block.keys is None and block.values is None
@@ -46,7 +46,6 @@ def test_apcblock_is_node_and_delegates():
 
     keys, values = _fake_kv(num_layers=2, seq_len=16)
     block.block_hash = 123
-    block.parent_hash = 7
     block.token_ids = tuple(range(16))
     block.ref_cnt = 2
     block.set_kv(keys, values)
@@ -54,8 +53,6 @@ def test_apcblock_is_node_and_delegates():
     assert set(block.components) == {"kv"}
     assert block.keys[0] is keys[0] and block.values[1] is values[1]
     assert block.resident_bytes() == sum(t.nbytes for t in keys + values)
-    assert block.node_key == 123 and block.parent_key == 7
-    assert block.prefix_len == 16 and block.lock_count == 2
 
     block.release_components()
     assert block.components == {}

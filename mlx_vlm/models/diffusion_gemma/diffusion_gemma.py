@@ -278,6 +278,8 @@ class Model(nn.Module):
             mm_token_type_ids=mm_token_type_ids,
             prefill_step_size=kwargs.pop("prefill_step_size", None),
             decoder_input_ids=kwargs.pop("decoder_input_ids", None),
+            apc_manager=kwargs.pop("_apc_manager", None),
+            apc_extra_hash=kwargs.pop("_apc_semantic_hash", 0),
         )
 
         generated_tokens = []
