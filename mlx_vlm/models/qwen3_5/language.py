@@ -1497,7 +1497,20 @@ class LanguageModel(nn.Module):
                 if any(extra_trim_list):
                     prepare = getattr(c, "prepare", None)
                     finalize = getattr(c, "finalize", None)
-                    if c.keys is not None and callable(prepare) and callable(finalize):
+                    # BatchQSAKVCache keeps its KV inside a wrapped BatchKVCache and
+                    # exposes no ``keys`` attribute, so a direct ``c.keys`` here raises
+                    # AttributeError before this branch can run -- even though its
+                    # ``prepare``/``finalize`` implement a correct ragged right-padding
+                    # trim (dynamic_roll, not a zero-fill, so it is not affected by the
+                    # phantom-key issue #1962 that the KV-zeroing fallback below guards
+                    # against). Check prepare/finalize first and read ``keys`` via
+                    # getattr so caches with real ``keys`` still gate on it (None-check
+                    # preserved) while wrapper caches take their own correct trim path.
+                    if (
+                        callable(prepare)
+                        and callable(finalize)
+                        and getattr(c, "keys", True) is not None
+                    ):
                         prepare(right_padding=extra_trim_list)
                         finalize()
                         right_trimmed = True
