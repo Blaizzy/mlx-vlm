@@ -5393,10 +5393,6 @@ def _laguna_language_model(num_hidden_layers=4):
     return model
 
 
-def test_laguna_exposes_speculative_cache_rollback():
-    assert hasattr(laguna_language.LanguageModel, "rollback_speculative_cache")
-
-
 def test_laguna_rollback_trims_rejected_speculative_tail():
     class DummyCache:
         def __init__(self):
