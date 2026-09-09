@@ -47,7 +47,10 @@ class DeepseekV4DsparkConfig(BaseModelConfig):
         if not self.block_size:
             self.block_size = self.proposal_length + 1
         if self.runtime_block_size is None:
-            self.runtime_block_size = self.block_size
+            # Exact verification pays for each retained attention window. A
+            # single proposal avoids spending most of that work on rejected
+            # tails; an explicit runtime width still takes precedence.
+            self.runtime_block_size = min(2, self.block_size)
 
     def _sync_from_text_config(self):
         text = self.text_config

@@ -288,6 +288,20 @@ def _positioned_target_tokens(
     return target_tokens[None, :]
 
 
+def _sample_mtp_target(sampler, logprobs, row_ids, base_positions, offset):
+    if not _sampler_supports_positioned_target(sampler):
+        return sampler(logprobs)
+    if row_ids is None or base_positions is None:
+        raise ValueError(
+            "positioned target sampling requires row_ids and base_positions."
+        )
+    return sampler.sample_target(
+        logprobs,
+        row_ids=row_ids,
+        positions=[int(position) + offset for position in base_positions],
+    )
+
+
 def _speculative_walk_batch_deferred_greedy(
     lm: nn.Module,
     target_hidden: mx.array,
@@ -316,19 +330,9 @@ def _speculative_walk_batch_deferred_greedy(
             if logits.ndim == 3 and logits.shape[1] == 1:
                 logits = logits[:, 0, :]
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-            if _sampler_supports_positioned_target(sampler):
-                if row_ids is None or base_positions is None:
-                    raise ValueError(
-                        "positioned target sampling requires row_ids and "
-                        "base_positions."
-                    )
-                target_tokens = sampler.sample_target(
-                    logprobs,
-                    row_ids=row_ids,
-                    positions=[int(position) + pos for position in base_positions],
-                )
-            else:
-                target_tokens = sampler(logprobs)
+            target_tokens = _sample_mtp_target(
+                sampler, logprobs, row_ids, base_positions, pos
+            )
         mx.eval(target_tokens)
         target_list = [int(token) for token in target_tokens.reshape(-1).tolist()]
 
@@ -354,6 +358,8 @@ def _speculative_walk_batch_deferred_uniform(
     draft_tokens: mx.array,
     sampler: Callable[[mx.array], mx.array],
     budgets: List[int],
+    row_ids: Optional[List[int]] = None,
+    base_positions: Optional[List[int]] = None,
 ) -> Tuple[List[int], List[List[int]]]:
     """Deferred walk for models whose batched drafter cache needs lockstep rows.
 
@@ -374,7 +380,9 @@ def _speculative_walk_batch_deferred_uniform(
             if logits.ndim == 3 and logits.shape[1] == 1:
                 logits = logits[:, 0, :]
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-            target_tokens = sampler(logprobs)
+            target_tokens = _sample_mtp_target(
+                sampler, logprobs, row_ids, base_positions, pos
+            )
         mx.eval(target_tokens)
         target_list = [int(token) for token in target_tokens.reshape(-1).tolist()]
 
@@ -882,6 +890,16 @@ def _mtp_rounds_batch(
     B = first_bonus.shape[0]
     row_ids = list(range(B)) if row_ids is None else list(row_ids)
     block_total = _dflash_block_total(draft_model, draft_block_size)
+    if (
+        B > 1
+        and not greedy_sampling
+        and draft_block_size is None
+        and getattr(draft_model.config, "runtime_block_size", None) is None
+    ):
+        block_total = min(
+            block_total,
+            getattr(draft_model, "default_batched_sampling_block_size", block_total),
+        )
     configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
     L_prefill, positions = _mtp_cache_positions(prompt_cache, B)
     left_padding = [L_prefill - position for position in positions]
@@ -1007,36 +1025,26 @@ def _mtp_rounds_batch(
                     )
             else:
                 sampler_rng.target_eval(hidden_full)
-                if _mtp_use_uniform_deferred_walk(
-                    draft_model,
-                    n_active=n_active,
-                    greedy_sampling=greedy_sampling,
-                    sampler=sampler,
-                    target_model=lm,
-                ):
-                    accepted_list, new_tokens_list = (
-                        _speculative_walk_batch_deferred_uniform(
-                            lm,
-                            hidden_full,
-                            draft_tokens,
-                            sampler,
-                            budgets,
-                        )
+                walk = (
+                    _speculative_walk_batch_deferred_uniform
+                    if _mtp_use_uniform_deferred_walk(
+                        draft_model,
+                        n_active=n_active,
+                        greedy_sampling=greedy_sampling,
+                        sampler=sampler,
+                        target_model=lm,
                     )
-                else:
-                    accepted_list, new_tokens_list = (
-                        _speculative_walk_batch_deferred_greedy(
-                            lm,
-                            hidden_full,
-                            draft_tokens,
-                            sampler,
-                            budgets,
-                            row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
-                            base_positions=[
-                                emitted[active_idx[j]] for j in range(n_active)
-                            ],
-                        )
-                    )
+                    else _speculative_walk_batch_deferred_greedy
+                )
+                accepted_list, new_tokens_list = walk(
+                    lm,
+                    hidden_full,
+                    draft_tokens,
+                    sampler,
+                    budgets,
+                    row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
+                    base_positions=[emitted[active_idx[j]] for j in range(n_active)],
+                )
                 sampler_rng.target_sampled(
                     sync_draft=not _sampler_supports_positioned_target(sampler)
                 )

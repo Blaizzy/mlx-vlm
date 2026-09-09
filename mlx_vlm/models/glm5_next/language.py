@@ -7,6 +7,7 @@ from ..base import LanguageModelOutput, create_ssm_mask, scaled_dot_product_atte
 from ..cache import ArraysCache, CacheList, KVCache, PoolingCache
 from ..deepseek_v4.hyper_connection import HyperConnection
 from ..gated_delta import gated_delta_update
+from ..linear import tiled_linear
 from ..mla import MultiLinear
 from ..sparse_attention import indexed_sparse_attention
 from ..switch_layers import SwitchGLU
@@ -100,7 +101,7 @@ class MoEGate(nn.Module):
 
     def __call__(self, x):
         return _expert_select(
-            x.astype(mx.float32) @ self.weight.T,
+            tiled_linear(lambda x: x @ self.weight.T, x.astype(mx.float32)),
             self.e_score_correction_bias,
             self.top_k,
             self.n_group,
@@ -390,9 +391,20 @@ class Glm5NextIndexer(nn.Module):
 
     def _project_keys(self, x):
         return (
-            self.k_norm(self.wk(x)),
-            x.astype(mx.float32) @ self.index_kpool_compress_gate.T,
+            self.k_norm(tiled_linear(self.wk, x)),
+            tiled_linear(
+                lambda x: x @ self.index_kpool_compress_gate.T, x.astype(mx.float32)
+            ),
         )
+
+    def _project_queries(self, x, q_resid):
+        q = tiled_linear(self.wq_b, q_resid).reshape(
+            *x.shape[:2], self.n_heads, self.head_dim
+        )
+        weights = (
+            tiled_linear(self.weights_proj, x).astype(mx.float32) * self.n_heads**-0.5
+        )
+        return q, weights
 
     def __call__(
         self,
@@ -464,10 +476,7 @@ class Glm5NextIndexer(nn.Module):
                     self.softmax_scale,
                 )
             else:
-                q = self.wq_b(q_resid).reshape(
-                    batch, q_length, self.n_heads, self.head_dim
-                )
-                weights = self.weights_proj(x).astype(mx.float32) * self.n_heads**-0.5
+                q, weights = self._project_queries(x, q_resid)
                 # Keep the score matmul in the model dtype, as serving runtimes
                 # do, then aggregate heads in FP32. Query chunking bounds the
                 # [B, chunk, H, pools] temporary while evaluating every pool.

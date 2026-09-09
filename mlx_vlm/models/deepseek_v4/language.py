@@ -22,7 +22,7 @@ from ..pipeline import PipelineMixin
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 from .hisa_kernel import hisa_select
-from .hyper_connection import HyperConnection, HyperHead, hc_expand
+from .hyper_connection import HyperConnection, HyperHead
 
 
 def make_quantization_config(model):
@@ -839,34 +839,21 @@ class LocalAttention(nn.Module):
         position_offset: Optional[Union[int, mx.array]] = None,
     ) -> mx.array:
         B, L, _ = x.shape
+        local_cache = cache[0] if self.compress_ratio and cache is not None else cache
         offset = (
             position_offset
             if position_offset is not None
-            else (cache.offset if cache is not None else 0)
+            else (local_cache.offset if local_cache is not None else 0)
         )
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.reshape(B, L, self.n_heads, self.head_dim)
+        q_residual = self.q_norm(self.wq_a(x))
+        q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
         q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
-        q = q.transpose(0, 2, 1, 3)
-        q = self.rope(q, offset)
-
+        q = self.rope(q.transpose(0, 2, 1, 3), offset)
         kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
-        if cache is not None:
-            kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
-        mask = _align_local_mask(mask, kv.shape[2])
-
-        out = scaled_dot_product_attention(
-            q,
-            kv,
-            kv,
-            cache=cache,
-            scale=self.scale,
-            mask=mask,
-            sinks=self.attn_sink.astype(q.dtype),
-        )
+        out = self._attend(x, q, kv, q_residual, mask, cache, offset)
         out = self.rope(out, offset, inverse=True)
 
         out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
@@ -880,42 +867,30 @@ class LocalAttention(nn.Module):
 
         return out
 
+    def _attend(self, x, q, kv, q_residual, mask, cache, offset):
+        B, L = x.shape[:2]
+        if cache is not None:
+            kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+        mask = _align_local_mask(mask, kv.shape[2])
 
-class CompressedAttention(nn.Module):
+        out = scaled_dot_product_attention(
+            q,
+            kv,
+            kv,
+            cache=cache,
+            scale=self.scale,
+            mask=mask,
+            sinks=self.attn_sink.astype(q.dtype),
+        )
+        return out
+
+
+class CompressedAttention(LocalAttention):
     """DeepSeek V4 attention with pooled KV compression."""
 
     def __init__(self, config: ModelConfig, layer_idx: int):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
+        super().__init__(config, layer_idx)
         self.compress_ratio = config.compress_ratios[layer_idx]
-        self.hidden_size = config.hidden_size
-        self.n_heads = config.num_attention_heads
-        self.head_dim = config.head_dim
-        self.o_groups = config.o_groups
-        self.o_lora_rank = config.o_lora_rank
-        self.scale = self.head_dim**-0.5
-
-        self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
-        self.q_norm = nn.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
-        self.wq_b = nn.Linear(
-            config.q_lora_rank, self.n_heads * self.head_dim, bias=False
-        )
-        self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
-        self.kv_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.wo_a = MultiLinear(
-            self.n_heads * self.head_dim // config.o_groups,
-            config.o_lora_rank,
-            config.o_groups,
-        )
-        self.wo_b = nn.Linear(
-            config.o_groups * config.o_lora_rank,
-            config.hidden_size,
-            bias=config.attention_bias,
-        )
-        self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
-
-        # Compressed layers use Yarn-scaled RoPE
         self.rope = DeepseekV4RoPE(
             config.qk_rope_head_dim,
             config.compress_rope_theta,
@@ -924,33 +899,10 @@ class CompressedAttention(nn.Module):
         )
         self.compressor = Compressor(config, self.compress_ratio, self.head_dim)
 
-        self.sharding_group = None
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-        position_offset: Optional[Union[int, mx.array]] = None,
-    ) -> mx.array:
-        B, L, _ = x.shape
+    def _attend(self, x, q, kv, q_residual, mask, cache, offset):
+        B, L = x.shape[:2]
         local_cache = cache[0] if cache is not None else None
         pool_cache = cache[1] if cache is not None else None
-        offset = (
-            position_offset
-            if position_offset is not None
-            else (local_cache.offset if local_cache is not None else 0)
-        )
-        offset = mx.array(offset) if isinstance(offset, mx.array) else offset
-
-        q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.reshape(B, L, self.n_heads, self.head_dim)
-        q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
-        q = q.transpose(0, 2, 1, 3)
-        q = self.rope(q, offset)
-
-        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
-        kv = self.rope(kv, offset)
         if local_cache is not None:
             kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
         mask = _align_local_mask(mask, kv.shape[2])
@@ -975,91 +927,21 @@ class CompressedAttention(nn.Module):
             mask=mask,
             sinks=self.attn_sink.astype(q.dtype),
         )
-        out = self.rope(out, offset, inverse=True)
-
-        out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
-        out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
-        out = self.wo_a(out)
-        out = out.transpose(0, 2, 1, 3).flatten(-2)
-        out = self.wo_b(out)
-
-        if self.sharding_group is not None:
-            out = mx.distributed.all_sum(out, group=self.sharding_group)
-
         return out
 
 
-class SparseCompressedAttention(nn.Module):
+class SparseCompressedAttention(CompressedAttention):
     """DeepSeek V4 attention with sparse indexed pooled KV compression."""
 
     def __init__(self, config: ModelConfig, layer_idx: int):
-        super().__init__()
-        self.config = config
-        self.layer_idx = layer_idx
-        self.compress_ratio = config.compress_ratios[layer_idx]
-        self.hidden_size = config.hidden_size
-        self.n_heads = config.num_attention_heads
-        self.head_dim = config.head_dim
-        self.o_groups = config.o_groups
-        self.o_lora_rank = config.o_lora_rank
-        self.scale = self.head_dim**-0.5
-
-        self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
-        self.q_norm = nn.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
-        self.wq_b = nn.Linear(
-            config.q_lora_rank, self.n_heads * self.head_dim, bias=False
-        )
-        self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
-        self.kv_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.wo_a = MultiLinear(
-            self.n_heads * self.head_dim // config.o_groups,
-            config.o_lora_rank,
-            config.o_groups,
-        )
-        self.wo_b = nn.Linear(
-            config.o_groups * config.o_lora_rank,
-            config.hidden_size,
-            bias=config.attention_bias,
-        )
-        self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
-
-        self.rope = DeepseekV4RoPE(
-            config.qk_rope_head_dim,
-            config.compress_rope_theta,
-            config.rope_scaling,
-            config.max_position_embeddings,
-        )
-        self.compressor = Compressor(config, self.compress_ratio, self.head_dim)
+        super().__init__(config, layer_idx)
         self.indexer = Indexer(config, self.compress_ratio)
 
-        self.sharding_group = None
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-        position_offset: Optional[Union[int, mx.array]] = None,
-    ) -> mx.array:
-        B, L, _ = x.shape
+    def _attend(self, x, q, kv, q_residual, mask, cache, offset):
+        B, L = x.shape[:2]
         local_cache = cache[0] if cache is not None else None
         comp_cache = cache[1] if cache is not None else None
         idx_cache = cache[2] if cache is not None else None
-        offset = (
-            position_offset
-            if position_offset is not None
-            else (local_cache.offset if local_cache is not None else 0)
-        )
-        offset = mx.array(offset) if isinstance(offset, mx.array) else offset
-
-        q_residual = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
-        q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
-        q = q.transpose(0, 2, 1, 3)
-        q = self.rope(q, offset)
-
-        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
-        kv = self.rope(kv, offset)
         if local_cache is not None:
             kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
         mask = _align_local_mask(mask, kv.shape[2])
@@ -1115,17 +997,6 @@ class SparseCompressedAttention(nn.Module):
                 sinks,
             )
 
-        out = self.rope(out, offset, inverse=True)
-
-        out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
-        out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
-        out = self.wo_a(out)
-        out = out.transpose(0, 2, 1, 3).flatten(-2)
-        out = self.wo_b(out)
-
-        if self.sharding_group is not None:
-            out = mx.distributed.all_sum(out, group=self.sharding_group)
-
         return out
 
 
@@ -1157,20 +1028,15 @@ class DeepseekV4Block(nn.Module):
         input_ids: mx.array,
         position_offset: Optional[Union[int, mx.array]] = None,
     ) -> mx.array:
-        residual = h
-        x, post, comb = self.attn_hc(h)
-        x = self.attn(
-            self.attn_norm(x),
+        h = self.attn_hc.apply_branch(
+            h,
+            self.attn_norm,
+            self.attn,
             mask=mask,
             cache=cache,
             position_offset=position_offset,
         )
-        h = hc_expand(x, residual, post, comb)
-
-        residual = h
-        x, post, comb = self.ffn_hc(h)
-        x = self.ffn(self.ffn_norm(x), input_ids)
-        return hc_expand(x, residual, post, comb)
+        return self.ffn_hc.apply_branch(h, self.ffn_norm, self.ffn, input_ids)
 
 
 class DeepseekV4Model(PipelineMixin, nn.Module):
@@ -1293,9 +1159,7 @@ class LanguageModel(nn.Module):
         draft_kind=None,
         prefill_kwargs=None,
     ) -> bool:
-        del inputs_embeds, prompt_cache, draft_kind, prefill_kwargs
-        if draft_model is not None:
-            return False
+        del inputs_embeds, prompt_cache, draft_model, draft_kind, prefill_kwargs
         if input_ids is None or self.args.vision_n_layers == 0:
             return True
         return not bool(mx.any(input_ids >= self.args.vocab_size).item())

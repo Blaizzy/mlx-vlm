@@ -255,6 +255,55 @@ def test_qwen4_speculative_verifier_matches_tokenwise_hidden_and_logits():
     ).item()
 
 
+@pytest.mark.parametrize("batch", [1, 2, 4])
+@pytest.mark.parametrize("prefix_length", [512, 2050, 2051, 2052])
+@pytest.mark.parametrize("block_size", [2, 4])
+def test_qwen4_qsa_verifier_matches_decode_across_sparse_boundary(
+    batch, prefix_length, block_size
+):
+    from mlx_vlm.models.qwen4_exp.language import (
+        BatchQSAKVCache,
+        Qwen4ExpAttention,
+        Qwen4ExpBatchInvariantForward,
+    )
+
+    mx.random.seed(2127)
+    config = _tiny_text_config()
+    config.hidden_size = 512
+    config.num_attention_heads = 4
+    config.head_dim = 128
+    config.indexer_head_dim = 32
+    config.indexer_budget = 2048
+    attention = Qwen4ExpAttention(config)
+    attention.set_dtype(mx.bfloat16)
+    nn.quantize(attention, group_size=32, bits=4)
+    verifier = Qwen4ExpBatchInvariantForward()
+    caches = [BatchQSAKVCache([0] * batch) for _ in range(2)]
+    hidden = mx.random.normal(
+        (batch, prefix_length + block_size, config.hidden_size)
+    ).astype(mx.bfloat16)
+    for cache in caches:
+        mx.eval(attention(hidden[:, :prefix_length], cache=cache, mask="causal"))
+
+    # Budget 2048 and compression 4 first select sparse attention at length 2052.
+    # Test fully dense blocks, blocks spanning the transition, and sparse blocks.
+    proposal = hidden[:, prefix_length:]
+    expected = mx.concatenate(
+        [
+            verifier._qsa_attention(
+                attention, proposal[:, index : index + 1], caches[0], None, None
+            )
+            for index in range(block_size)
+        ],
+        axis=1,
+    )
+    actual = verifier._qsa_attention(attention, proposal, caches[1], None, "causal")
+    mx.eval(expected, actual)
+    assert mx.array_equal(actual, expected).item()
+    assert caches[0].index_offset == caches[1].index_offset
+    assert mx.array_equal(caches[0].index_keys, caches[1].index_keys).item()
+
+
 def test_qwen4_fused_greedy_mixes_captured_hyper_state_before_lm_head(monkeypatch):
     from mlx_vlm.models.qwen4_exp import language as qwen4_language
 

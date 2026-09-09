@@ -1816,7 +1816,8 @@ def test_speculative_walk_batch_deferred_greedy_matches_batch_walk():
     assert fake_head.calls == 3
 
 
-def test_speculative_walk_batch_deferred_greedy_uses_positioned_sampler():
+@pytest.mark.parametrize("uniform", [False, True])
+def test_speculative_walk_batch_deferred_uses_positioned_sampler(uniform):
     class FakeEmbed:
         def __init__(self):
             self.calls = 0
@@ -1856,7 +1857,12 @@ def test_speculative_walk_batch_deferred_greedy_uses_positioned_sampler():
     )
     draft_tokens = mx.array([[2, 3], [0, 2]], dtype=mx.int32)
 
-    accepted, new_tokens = _speculative_walk_batch_deferred_greedy(
+    walk = (
+        mtp_utils._speculative_walk_batch_deferred_uniform
+        if uniform
+        else _speculative_walk_batch_deferred_greedy
+    )
+    accepted, new_tokens = walk(
         lm,
         target_hidden,
         draft_tokens,
@@ -1866,14 +1872,17 @@ def test_speculative_walk_batch_deferred_greedy_uses_positioned_sampler():
         base_positions=[7, 12],
     )
 
-    assert accepted == [1, 2]
+    assert accepted == ([1, 1] if uniform else [1, 2])
     assert new_tokens == [[2, 1], [0, 2]]
-    assert fake_head.calls == 3
-    assert sampler.calls == [
-        ([10, 11], [7, 12]),
-        ([10, 11], [8, 13]),
-        ([10, 11], [9, 14]),
-    ]
+    assert fake_head.calls == (2 if uniform else 3)
+    assert (
+        sampler.calls
+        == [
+            ([10, 11], [7, 12]),
+            ([10, 11], [8, 13]),
+            ([10, 11], [9, 14]),
+        ][: fake_head.calls]
+    )
 
 
 def test_speculative_walk_batch_deferred_uniform_stops_at_batch_rejection():
@@ -4085,7 +4094,8 @@ def test_glm5_next_mtp_draft_block_smoke():
     )
     mx.eval(tokens)
     assert tokens.shape == (1, 1)
-    assert drafter.config.runtime_block_size == 2
+    assert drafter.config.runtime_block_size is None
+    assert mtp_utils._dflash_block_total(drafter, None) == 3
     assert not drafter.prefer_requested_block_size
 
 
@@ -5028,6 +5038,15 @@ def _tiny_deepseek_v4_dspark_config():
         markov_rank=8,
         block_size=5,
     )
+
+
+def test_deepseek_v4_dspark_defaults_to_one_proposal_and_keeps_explicit_width():
+    config = _tiny_deepseek_v4_dspark_config()
+    drafter = SimpleNamespace(config=config)
+    assert mtp_utils._dflash_block_total(drafter, None) == 2
+    config.runtime_block_size = 4
+    assert mtp_utils._dflash_block_total(drafter, None) == 4
+    assert mtp_utils._dflash_block_total(drafter, 3) == 3
 
 
 def _forge_dspark_source(model, cfg):

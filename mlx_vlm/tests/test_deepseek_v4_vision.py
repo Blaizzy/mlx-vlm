@@ -336,9 +336,14 @@ class TestDeepseekV4VisionLanguage(unittest.TestCase):
 
         self.assertTrue(model.language_model.chunked_prefill_policy(input_ids=text))
         self.assertFalse(model.language_model.chunked_prefill_policy(input_ids=image))
-        self.assertFalse(
+        self.assertTrue(
             model.language_model.chunked_prefill_policy(
                 input_ids=text, draft_model=object()
+            )
+        )
+        self.assertFalse(
+            model.language_model.chunked_prefill_policy(
+                input_ids=image, draft_model=object()
             )
         )
 

@@ -4,7 +4,64 @@ from typing import Any, Iterable, Optional
 
 import mlx.core as mx
 
-from ..models.cache import CacheList
+from ..models.cache import BatchRotatingKVCache, CacheList, RotatingKVCache
+
+
+class _RotatingCacheTransaction:
+    """Record incoming KV while the serving cache keeps its native layout."""
+
+    def __init__(self, cache):
+        self.cache = cache
+        self.update = cache.update_and_fetch
+        if isinstance(self.update, _RotatingCacheTransaction):
+            raise RuntimeError("A rotating cache transaction is already active.")
+        self.original = {
+            name: mx.array(value) if isinstance(value, mx.array) else value
+            for name, value in cache.__dict__.items()
+        }
+        self.updates = []
+        cache.update_and_fetch = self
+
+    def __call__(self, keys, values):
+        self.updates.append((mx.array(keys), mx.array(values)))
+        return self.update(keys, values)
+
+    def abort(self):
+        self.cache.__dict__.clear()
+        self.cache.__dict__.update(self.original)
+        self.updates.clear()
+
+    def validate(self, lengths):
+        if len(set(lengths)) > 1 and not isinstance(self.cache, BatchRotatingKVCache):
+            raise RuntimeError("This rotating cache requires uniform acceptance.")
+
+    def commit(self, lengths, length):
+        cache = self.cache
+        if all(value == length for value in lengths):
+            if "update_and_fetch" in self.original:
+                cache.update_and_fetch = self.original["update_and_fetch"]
+            else:
+                del cache.update_and_fetch
+        else:
+            updates = self.updates[:]
+            self.abort()
+            keep = max(lengths)
+            ragged = len(set(lengths)) > 1
+            if ragged:
+                cache.prepare(
+                    lengths=lengths,
+                    right_padding=[keep - value for value in lengths],
+                )
+            for keys, values in updates:
+                count = min(keep, keys.shape[2])
+                if count:
+                    cache.update_and_fetch(keys[..., :count, :], values[..., :count, :])
+                    keep -= count
+                if not keep:
+                    break
+            if ragged:
+                cache.finalize()
+        self.updates.clear()
 
 
 def iter_leaf_caches(caches: Iterable[Any]):
@@ -26,6 +83,7 @@ class SpeculativeCacheTransaction:
         self.length = int(length)
         self._entries = entries
         self._positions = positions
+        self._rotating = {}
         self._active = True
 
     @property
@@ -37,6 +95,8 @@ class SpeculativeCacheTransaction:
             raise RuntimeError("Speculative cache transaction is no longer active.")
         for cache, generation in self._entries:
             cache.validate_speculation(lengths, generation)
+        for transaction in self._rotating.values():
+            transaction.validate(lengths)
 
     def __enter__(self):
         return self
@@ -58,6 +118,9 @@ class SpeculativeCacheTransaction:
         _trim_append_caches(self.caches, lengths, self.length, self)
         for cache, generation in self._entries:
             cache.commit_speculation(lengths, generation)
+        for transaction in self._rotating.values():
+            transaction.commit(lengths, self.length)
+        self._rotating.clear()
         self._active = False
 
     def abort(self) -> None:
@@ -65,6 +128,9 @@ class SpeculativeCacheTransaction:
             return
         for cache, generation in self._entries:
             cache.abort_speculation(generation)
+        for transaction in self._rotating.values():
+            transaction.abort()
+        self._rotating.clear()
         for cache, read_position, initial in self._positions.values():
             advance = read_position() - initial
             if advance > 0:
@@ -97,6 +163,12 @@ def start_speculative_cache(
     transaction = SpeculativeCacheTransaction(entries, positions, leaves, length)
     try:
         for cache in leaves:
+            if isinstance(cache, (RotatingKVCache, BatchRotatingKVCache)):
+                # A block append may evict or rotate the serving window. Merely
+                # decrementing its cursor exposes rejected keys on the next
+                # decode. Retain the bounded window and replay accepted KV only.
+                transaction._rotating[id(cache)] = _RotatingCacheTransaction(cache)
+                continue
             start = getattr(cache, "start_speculation", None)
             if callable(start) and (
                 cache_types is None or isinstance(cache, cache_types)
@@ -163,6 +235,8 @@ def _trim_append_caches(caches, retained, block_size, transaction=None):
 
     actions = []
     for cache in caches:
+        if transaction is not None and id(cache) in transaction._rotating:
+            continue
         if getattr(cache, "is_speculating", False):
             continue
         trim_cache = getattr(cache, "trim", None)

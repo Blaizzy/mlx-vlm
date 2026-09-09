@@ -425,7 +425,7 @@ def _make_gated_delta_with_states_kernel(has_mask: bool = False):
 
         auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
         y += b_idx * T * Hv * Dv + hv_idx * Dv;
-        states += ((b_idx * T * Hv + hv_idx) * Dv) * Dk;
+        states += ((b_idx * StateT * Hv + hv_idx) * Dv) * Dk;
 
         auto dk_idx = thread_position_in_threadgroup.x;
         auto dv_idx = thread_position_in_grid.y;

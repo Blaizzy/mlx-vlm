@@ -23,8 +23,10 @@ draft block → target block verification → accept prefix + target token
 | `speculative/mtp.py` | Native and assistant MTP round loops |
 | `speculative/eagle3.py` | EAGLE-3 round loops |
 | `speculative/common.py` | Acceptance, sampling state, statistics, and batch safeguards |
-| `models/<family>/language.py` | Target hidden-state capture and rollback contract |
-| `models/<family>/speculative_verifier.py` | Exact model-specific block verification and Metal kernels |
+| `models/<family>/language.py` | Normal model traversal and hidden-state capture |
+| `speculative/targets/` | Bound target views and verification policies |
+| `speculative/ops/` | Decode-equivalent operations and Metal kernels |
+| `speculative/cache_state.py` | Commit and abort of speculative cache transactions |
 
 `draft_kind` selects the round loop, not the checkpoint architecture. Drafter
 `model_type` values are mapped to `dflash`, `mtp`, or `eagle3` in
@@ -43,9 +45,10 @@ draft block → target block verification → accept prefix + target token
 4. Make target prefill return the hidden states the drafter consumes. DFlash and
    EAGLE-3 normally capture configured layers; MTP normally consumes final
    hidden state and may share target K/V.
-5. Implement target verification and rollback. Keep `language.py` as the thin
-   public contract and put model-specific verification kernels in
-   `speculative_verifier.py`.
+5. Bind a target view under `speculative/targets/`. Reuse the normal model
+   traversal, specialize operations at ordinary mathematical boundaries, and
+   start a shared cache transaction before verification. Keep speculative
+   flags, acceptance decisions, and rollback bookkeeping out of model layers.
 6. Add synthetic contract tests, then validate the real target and drafter
    checkpoints before reporting support.
 
@@ -73,9 +76,9 @@ Mamba, gated-delta, convolution, or rotating caches need an explicit state for
 the accepted position. Near an argmax tie, a small numerical change can alter
 the generated sequence.
 
-Use the nearest existing `speculative_verifier.py` as the structural reference,
-but follow the new model's layer order and cache semantics exactly. The verifier
-must:
+Use an existing bound target as a reference. Share parameter arrays while keeping
+operation policies private to the view. The normal model owns layer order; the
+verifier must:
 
 - produce the same greedy target tokens as autoregressive decoding;
 - advance every cache through the verification block;
@@ -105,3 +108,27 @@ When changing target layers, caches, quantization, sampling, batching, or
 chunked prefill, rerun both synthetic rollback tests and real-model exactness.
 Treat a new checkpoint layout or architecture tag as a compatibility change,
 not as proof that an existing adapter applies.
+
+For rotating caches, test beyond the window boundary and across repeated
+accept/reject rounds. Restoring only the cursor is insufficient after eviction
+or rotation. Transactions retain the serving window and incoming KV, then replay
+the accepted updates in their original order. Test batch rows independently:
+an incorrect stride in an intermediate-state kernel can write beyond its output
+allocation even when batch-one tests pass.
+
+## Runtime block sizes
+
+GLM-5-Next starts at its native MTP depth and can extend to a three-token block
+(two proposals) when the shared acceptance policy observes reliable acceptance.
+This reduced round overhead in the GLM-5.3-Flash greedy batch-one and batch-four
+checks. Batched stochastic sampling keeps a two-token ceiling by default because
+the extra proposal did not repay its verification cost in that workload.
+Explicit `runtime_block_size` and `--draft-block-size` settings take precedence.
+
+DeepSeek-V4 DSpark defaults to a two-token block (one proposal). Its exact target
+adapter preserves decode arithmetic and physical attention-window order. Larger
+blocks can cost more than their accepted tokens save. The current exact path
+remains slower than baseline on the measured M3 Ultra workloads; use ordinary
+decode when throughput is the priority. Text prefill remains chunked with the
+drafter attached; captured features are retained across chunks. Image spans
+still use the model's whole-image prefill policy.

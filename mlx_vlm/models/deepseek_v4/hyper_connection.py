@@ -5,6 +5,8 @@ from typing import Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..linear import tiled_linear
+
 
 def _make_hc_sinkhorn_collapse_kernel():
     """Fused sinkhorn + collapse: eliminates one dispatch per HC cycle.
@@ -241,7 +243,7 @@ class HyperConnection(nn.Module):
         B, L, H, D = x.shape
         y = x.astype(mx.float32)
         z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
-        mixes = z @ self.fn.T
+        mixes = tiled_linear(lambda x: x @ self.fn.T, z)
 
         use_ops = (
             self.hc_mult != 4
@@ -289,6 +291,6 @@ class HyperHead(nn.Module):
     def __call__(self, x: mx.array):
         y = x.astype(mx.float32)
         z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
-        mixes = z @ self.fn.T
+        mixes = tiled_linear(lambda x: x @ self.fn.T, z)
         pre = mx.sigmoid(mixes * self.scale + self.base) + self.hc_eps
         return (pre[..., None] * y).sum(axis=2).astype(x.dtype)

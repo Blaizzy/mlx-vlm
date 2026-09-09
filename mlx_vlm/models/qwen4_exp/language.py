@@ -1829,28 +1829,42 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
         padding_info = _qwen3_5_left_padding_info(cache)
         standard_causal = padding_info is None or padding_info[1] == 0
         past_index_len = getattr(cache, "index_offset", getattr(cache, "offset", 0))
+        sparse_start = (
+            attention.indexer.block_topk + 1
+        ) * attention.indexer.compress_ratio
         sparse_active = (
             not isinstance(past_index_len, mx.array)
-            and int(past_index_len) + 1
-            >= (attention.indexer.block_topk + 1) * attention.indexer.compress_ratio
+            and int(past_index_len) + 1 >= sparse_start
         )
-        if hidden_states.shape[1] > 2 and standard_causal and sparse_active:
+        crosses_sparse_start = (
+            not isinstance(past_index_len, mx.array)
+            and int(past_index_len) + 1
+            < sparse_start
+            <= int(past_index_len) + hidden_states.shape[1]
+        )
+        step = 1 if crosses_sparse_start else 2
+        if (
+            hidden_states.shape[1] > step
+            and standard_causal
+            and (sparse_active or crosses_sparse_start)
+        ):
             # QSA's two-position verifier matches sequential decode exactly;
-            # keep wider speculative blocks as ordered pairs of that geometry.
+            # keep wider blocks as ordered pairs. At the dense/sparse boundary,
+            # each position must select the same attention path as decode.
             return mx.concatenate(
                 [
                     self._qsa_attention(
                         attention,
-                        hidden_states[:, index : index + 2],
+                        hidden_states[:, index : index + step],
                         cache,
                         (
                             None
                             if position_ids is None
-                            else position_ids[..., index : index + 2]
+                            else position_ids[..., index : index + step]
                         ),
                         None,
                     )
-                    for index in range(0, hidden_states.shape[1], 2)
+                    for index in range(0, hidden_states.shape[1], step)
                 ],
                 axis=1,
             )
@@ -1882,7 +1896,14 @@ class Qwen4ExpBatchInvariantForward(Qwen3_5BatchInvariantForward):
         selection = attention.indexer.select_from_projected(
             projected, cache, position_ids
         )
-        if selection is None:
+        if (
+            selection is None
+            or selection.key_len // attention.indexer.compress_ratio
+            <= attention.indexer.block_topk
+        ):
+            # Decode uses dense attention while the entire prefix fits the
+            # indexer's budget. A two-token verifier must use that reduction
+            # too, rather than an equivalent but differently rounded gather.
             return self._attention(
                 attention,
                 hidden_states,

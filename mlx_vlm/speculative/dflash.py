@@ -13,6 +13,7 @@ from .common import (
     _SpeculativeSamplerRNG,
     generation_stream,
 )
+from .targets import bind_speculative_target
 
 
 def _dflash_next_block_size(
@@ -295,7 +296,9 @@ def _dflash_rounds(
     for prefill, sampling the first bonus token, and packaging the
     captured hidden states into ``hidden``.
     """
-    lm = model.language_model if hasattr(model, "language_model") else model
+    lm = bind_speculative_target(
+        model.language_model if hasattr(model, "language_model") else model
+    )
     if not hasattr(lm, "rollback_speculative_cache"):
         raise RuntimeError(
             f"{type(lm).__name__} does not implement rollback_speculative_cache. "
@@ -469,7 +472,9 @@ def _dflash_rounds_batch(
     token for sequence ``i`` (or ``None`` if that sequence has nothing
     to emit this step).
     """
-    lm = model.language_model if hasattr(model, "language_model") else model
+    lm = bind_speculative_target(
+        model.language_model if hasattr(model, "language_model") else model
+    )
     if not hasattr(lm, "rollback_speculative_cache"):
         raise RuntimeError(
             f"{type(lm).__name__} does not implement " "rollback_speculative_cache."

@@ -47,6 +47,10 @@ class Glm5NextMTPDraftModel(AutoregressiveMTPDraftModel):
     """Native GLM-5-Next MTP drafter backed by checkpoint decoder layer 45."""
 
     prefer_requested_block_size = False
+    # Start at native depth; the shared acceptance policy may extend to two
+    # draft tokens once the native prefix is accepted reliably.
+    default_runtime_block_size = 3
+    default_batched_sampling_block_size = 2
     requires_uniform_batch_acceptance = False
     supports_ragged_batch_acceptance = True
     supports_left_padded_prefill = True

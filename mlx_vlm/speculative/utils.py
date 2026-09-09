@@ -115,6 +115,33 @@ def speculative_hidden_state(draft_kind: str, outputs):
     )
 
 
+class SpeculativePrefill:
+    """Retain the target features needed by a drafter across prompt chunks."""
+
+    def __init__(self, draft_kind, drafter):
+        self.kwargs = (
+            speculative_prefill_kwargs(draft_kind, drafter)
+            if drafter is not None and draft_kind in ("dflash", "eagle3")
+            else {}
+        )
+        self.chunks = []
+
+    def append(self, output):
+        if self.kwargs:
+            hidden = output.hidden_states
+            mx.async_eval(hidden)
+            self.chunks.append(hidden)
+
+    def finish(self, output):
+        if self.chunks:
+            self.chunks.append(output.hidden_states)
+            output.hidden_states = [
+                mx.concatenate(parts, axis=1) for parts in zip(*self.chunks)
+            ]
+            self.chunks.clear()
+        return output
+
+
 def make_speculative_prompt_cache(
     lm,
     *,

@@ -23,9 +23,6 @@ class Glm5NextMTPConfig(BaseModelConfig):
     def __post_init__(self):
         if isinstance(self.text_config, dict):
             self.text_config = TextConfig.from_dict(self.text_config)
-        if self.runtime_block_size is None and self.text_config is not None:
-            depth = int(getattr(self.text_config, "num_nextn_predict_layers", 1))
-            self.runtime_block_size = min(self.block_size, depth + 1)
 
     @classmethod
     def from_dict(cls, params: dict) -> "Glm5NextMTPConfig":
