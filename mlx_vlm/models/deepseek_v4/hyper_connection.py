@@ -163,8 +163,14 @@ _hc_sinkhorn_collapse_kernel = _make_hc_sinkhorn_collapse_kernel()
 def _hc_kernel(x, y, mixes, scale, base, hc_mult, sinkhorn_iters, eps):
     B, L, H, D = x.shape
 
+
     return _hc_sinkhorn_collapse_kernel(
-        inputs=[x, mixes, scale, base],
+        inputs=[
+            x,
+            mixes.astype(mx.float32),
+            scale.astype(mx.float32),
+            base.astype(mx.float32),
+        ],
         template=[
             ("T", x.dtype),
             ("U", x.dtype),
