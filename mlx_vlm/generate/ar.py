@@ -217,6 +217,7 @@ def generate_step(
     draft_block_size: Optional[int] = None,
     prompt_cache_checkpoint: Optional[Callable[[int, List[Any]], None]] = None,
     prompt_cache_checkpoint_len: Optional[int] = None,
+    prompt_cache_checkpoint_lengths: Optional[List[int]] = None,
     seed: Optional[int] = None,
     verbose: bool = False,
     **kwargs,
@@ -460,13 +461,14 @@ def generate_step(
             prefill_kwargs=policy_kwargs,
         ):
             prefill_step_size = None
-        checkpoint_len = (
-            int(prompt_cache_checkpoint_len)
-            if prompt_cache_checkpoint is not None
-            and prompt_cache_checkpoint_len is not None
-            else None
+        checkpoint_lengths = set(prompt_cache_checkpoint_lengths or [])
+        if prompt_cache_checkpoint_len is not None:
+            checkpoint_lengths.add(int(prompt_cache_checkpoint_len))
+        checkpoint_lengths = sorted(
+            int(n)
+            for n in checkpoint_lengths
+            if prompt_cache_checkpoint is not None and 0 < n < inputs_embeds.shape[1]
         )
-        checkpoint_done = False
         # Chunk whenever there is more than one prompt token left to process.
         # The chunk loop discards its output, so the [B, N, vocab] logits are
         # never evaluated; the unchunked path feeds the whole prompt to _step,
@@ -474,9 +476,7 @@ def generate_step(
         # prefill_step_size made short prompts peak higher than long ones.
         should_chunk = (
             prefill_step_size is not None and inputs_embeds.shape[1] > 1
-        ) or (
-            checkpoint_len is not None and 0 < checkpoint_len < inputs_embeds.shape[1]
-        )
+        ) or bool(checkpoint_lengths)
         if prefill_step_size is not None and should_chunk:
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
@@ -487,12 +487,10 @@ def generate_step(
                 while inputs_embeds.shape[1] > 1:
                     n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
                     if (
-                        checkpoint_len is not None
-                        and not checkpoint_done
-                        and processed_tokens < checkpoint_len
-                        and processed_tokens + n_to_process > checkpoint_len
+                        checkpoint_lengths
+                        and processed_tokens + n_to_process > checkpoint_lengths[0]
                     ):
-                        n_to_process = checkpoint_len - processed_tokens
+                        n_to_process = checkpoint_lengths[0] - processed_tokens
                     chunk_kwargs = {**kwargs, **speculative_prefill.kwargs}
                     if getattr(model.language_model, "supports_logits_to_keep", False):
                         chunk_kwargs = {**chunk_kwargs, "logits_to_keep": 1}
@@ -508,13 +506,9 @@ def generate_step(
                     quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
                     processed_tokens += n_to_process
-                    if (
-                        checkpoint_len is not None
-                        and not checkpoint_done
-                        and processed_tokens == checkpoint_len
-                    ):
+                    if checkpoint_lengths and processed_tokens == checkpoint_lengths[0]:
                         prompt_cache_checkpoint(processed_tokens, prompt_cache)
-                        checkpoint_done = True
+                        checkpoint_lengths.pop(0)
                     inputs_embeds = inputs_embeds[:, n_to_process:]
                     input_ids = input_ids[:, n_to_process:]
                     mx.clear_cache()
@@ -1794,6 +1788,7 @@ class PromptProcessingBatch:
         self._left_padding_per_row = list(left_padding)
         self._total_prompt_tokens = sum(lengths)
         self._processed_prompt_columns = 0
+        self._finished_prompt_logits: dict[int, mx.array] = {}
 
         self.logits_processors = logits_processors or []
         self.thinking_budget_criteria = thinking_budget_criteria or []
@@ -1942,7 +1937,7 @@ class PromptProcessingBatch:
     def _apc_checkpoint_column_for_meta(
         self, batch_idx: int, meta: dict
     ) -> Optional[int]:
-        checkpoint_len = int(meta.get("checkpoint_len") or 0)
+        checkpoint_len = self._apc_pending_checkpoint(meta)
         if (
             not self._apc_uses_checkpoints()
             or checkpoint_len <= 0
@@ -1958,7 +1953,17 @@ class PromptProcessingBatch:
             if suffix_checkpoint >= self._suffix_lens[batch_idx]:
                 return None
             return suffix_checkpoint
-        return self._left_padding_per_row[batch_idx] + checkpoint_len
+        return self._left_padding_per_row[batch_idx] + checkpoint_len - prefix_len
+
+    def _apc_pending_checkpoint(self, meta: dict) -> int:
+        lengths = meta.get("checkpoint_lengths")
+        if lengths is None:
+            return int(meta.get("checkpoint_len") or 0)
+        processed = max(
+            int(meta.get("prefix_len") or 0),
+            int(meta.get("checkpoint_stored") or 0),
+        )
+        return next((n for n in lengths if n > processed), 0)
 
     def _next_apc_checkpoint_column(self) -> Optional[int]:
         if (
@@ -2003,28 +2008,35 @@ class PromptProcessingBatch:
         for batch_idx, meta in enumerate(self._apc_meta):
             if meta is None or meta.get("checkpoint_done"):
                 continue
-            checkpoint_len = int(meta.get("checkpoint_len") or 0)
+            checkpoint_len = self._apc_pending_checkpoint(meta)
             if checkpoint_len <= 0:
                 continue
             if self._row_real_tokens_processed(batch_idx) != checkpoint_len:
                 continue
-            prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
-            if prompt_cache is None:
-                continue
             coordinator = getattr(self, "_apc_coordinator", None)
             if coordinator is not None:
-                coordinator.store_checkpoint(
+                stored = coordinator.store_checkpoint(
                     meta["full_input_ids"][:checkpoint_len],
-                    prompt_cache,
+                    self.prompt_cache,
+                    batch_idx=batch_idx,
                     extra_hash=meta.get("extra_hash", 0),
                 )
             else:
-                self._apc_manager.store_exact_cache(
+                prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
+                if prompt_cache is None:
+                    continue
+                stored = self._apc_manager.store_exact_cache(
                     meta["full_input_ids"][:checkpoint_len],
                     prompt_cache,
                     extra_hash=meta.get("extra_hash", 0),
                 )
-            meta["checkpoint_done"] = True
+            meta["checkpoint_stored"] = checkpoint_len
+            meta["checkpoint_saved"] = meta.get("checkpoint_saved", False) or stored
+            meta["checkpoint_done"] = (
+                not self._apc_pending_checkpoint(meta)
+                if "checkpoint_lengths" in meta
+                else True
+            )
 
     def _prompt_kwargs_for_step(self, n: Optional[int] = None) -> dict:
         if n is None or not self._prompt_length_aware_keys:
@@ -2041,6 +2053,15 @@ class PromptProcessingBatch:
 
         step = self.prefill_step_size or self._inputs_embeds.shape[1]
         n = min(step, self._inputs_embeds.shape[1] - 1)
+        # Finish shorter right-padded rows at a chunk boundary so we can keep
+        # their last real token's logits before subsequent chunks consume pad.
+        # Some models only return the final column's logits during prefill.
+        finished_rows = []
+        if self._right_pad_per_row is not None:
+            start = self._processed_prompt_columns
+            pending_ends = [length for length in self._suffix_lens if length > start]
+            if pending_ends:
+                n = min(n, min(pending_ends) - start)
         checkpoint_col = self._next_apc_checkpoint_column()
         if checkpoint_col is not None:
             n = min(n, checkpoint_col - self._processed_prompt_columns)
@@ -2058,7 +2079,17 @@ class PromptProcessingBatch:
             **prompt_kwargs,
         )
         self._speculative_prefill.append(output)
-        mx.async_eval([c.state for c in self.prompt_cache])
+        if self._right_pad_per_row is not None:
+            end = self._processed_prompt_columns + n
+            finished_rows = [
+                i for i, length in enumerate(self._suffix_lens) if length == end
+            ]
+            logits = output.logits if hasattr(output, "logits") else output
+            for i in finished_rows:
+                self._finished_prompt_logits[i] = mx.contiguous(mx.array(logits[i, -1]))
+        eval_targets = [c.state for c in self.prompt_cache]
+        eval_targets.extend(self._finished_prompt_logits[i] for i in finished_rows)
+        mx.async_eval(eval_targets)
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
         self._inputs_embeds = self._inputs_embeds[:, n:]
@@ -2110,13 +2141,19 @@ class PromptProcessingBatch:
         output = self._speculative_prefill.finish(output)
         logits = output.logits if hasattr(output, "logits") else output
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
-            # Per-row last *real* token sits at index (seq - 1 - right_pad[i]).
-            seq = logits.shape[1]
-            last_idx = mx.array(
-                [seq - 1 - p for p in self._right_pad_per_row], dtype=mx.int32
-            )[:, None, None]
-            last_idx = mx.broadcast_to(last_idx, (logits.shape[0], 1, logits.shape[-1]))
-            logits = mx.take_along_axis(logits, last_idx, axis=1).squeeze(1)
+            # Short rows may have finished in an earlier prefill chunk. Their
+            # real-token logits no longer occur in this final padded chunk.
+            logits = mx.stack(
+                [
+                    (
+                        self._finished_prompt_logits[i]
+                        if i in self._finished_prompt_logits
+                        else logits[i, logits.shape[1] - 1 - padding]
+                    )
+                    for i, padding in enumerate(self._right_pad_per_row)
+                ]
+            )
+            self._finished_prompt_logits.clear()
         else:
             logits = logits[:, -1, :]
         if self.logits_processors and any(self.logits_processors):
@@ -2257,6 +2294,14 @@ class PromptProcessingBatch:
             try:
                 for batch_idx, meta in enumerate(self._apc_meta):
                     if meta is None:
+                        continue
+                    if self._apc_uses_checkpoints() and (
+                        meta.get("checkpoint_saved") or meta.get("prefix_len", 0) > 0
+                    ):
+                        # A third, full-prompt copy would evict the intermediate
+                        # checkpoint from the default two-entry LRU. The guard
+                        # checkpoint also serves conversation extensions.
+                        self._apc_manager.release(meta.get("apc_blocks", []))
                         continue
                     coordinator = getattr(self, "_apc_coordinator", None)
                     if coordinator is not None:
@@ -2524,6 +2569,13 @@ class BatchGenerator:
             max_prefix_tokens=len(ids_list) - 1,
         )
 
+    def _apc_exact_checkpoint_lengths(self, ids_list: List[int]) -> List[int]:
+        coordinator = getattr(self, "apc", None)
+        if coordinator is not None:
+            return coordinator.checkpoint_lengths(ids_list, self._apc_media_token_ids())
+        boundary = self._apc_exact_checkpoint_len(ids_list)
+        return [boundary] if boundary > 0 else []
+
     def _apc_pick_for(self, sequence) -> Optional[dict]:
         """Look up an APC prefix for ``sequence``. Returns dict with matched
         blocks + suffix metadata when there is a usable hit, else None.
@@ -2696,6 +2748,7 @@ class BatchGenerator:
                 ),
                 "apc_blocks": picks[i].get("matched_blocks", []) if picks[i] else [],
                 "checkpoint_len": self._apc_exact_checkpoint_len(full_ids[i]),
+                "checkpoint_lengths": self._apc_exact_checkpoint_lengths(full_ids[i]),
             }
             for i in range(len(sequences))
         ]
@@ -2756,6 +2809,9 @@ class BatchGenerator:
                     "extra_hash": extra_hash,
                     "apc_blocks": [],
                     "checkpoint_len": self._apc_exact_checkpoint_len(list(ids_list)),
+                    "checkpoint_lengths": self._apc_exact_checkpoint_lengths(
+                        list(ids_list)
+                    ),
                 }
             )
         return meta
@@ -2973,6 +3029,9 @@ class BatchGenerator:
             # warm and cold rows prefill in a single forward pass.
             n = min(self.prefill_batch_size, len(self._unprocessed_sequences))
             sequences = self._unprocessed_sequences[:n]
+            coordinator = getattr(self, "apc", None)
+            if coordinator is not None:
+                coordinator.prepare_prefill(sum(len(s[1]) for s in sequences))
             if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
                 logger.warning(
                     "APC admit n=%d (pending=%d)",
