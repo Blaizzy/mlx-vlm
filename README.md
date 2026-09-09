@@ -1529,6 +1529,7 @@ The following models support video chat:
 4. LLaVA
 5. MiniMax M3
 6. LLaVA-OneVision
+7. Mage-VL
 
 With more coming soon.
 

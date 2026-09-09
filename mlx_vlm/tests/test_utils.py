@@ -17,6 +17,7 @@ from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.utils import (
     DEFAULT_VIDEO_SAMPLING,
     StoppingCriteria,
+    VideoMetadata,
     VideoSampling,
     _drop_modules_without_weights,
     _load_safetensors,
@@ -1759,3 +1760,48 @@ class TestResolveVideoSampling:
         }
         resolve_video_sampling(SimpleNamespace(), kwargs)
         assert kwargs == {"temperature": 0.7}
+
+
+class TestVideoMetadataForwarding:
+    def test_metadata_is_only_forwarded_to_declaring_processors(self):
+        class Processor:
+            tokenizer = SimpleNamespace(pad_token="<pad>")
+
+            def __call__(self, text, images=None, videos=None, fps=None, **kwargs):
+                self.kwargs = kwargs
+                self.fps = fps
+                return {"input_ids": np.array([[1]]), "attention_mask": np.array([[1]])}
+
+        processor = Processor()
+        metadata = VideoMetadata(total_num_frames=30, fps=30, frames_indices=[0, 29])
+        video = np.zeros((2, 3, 32, 32), dtype=np.uint8)
+        with patch("mlx_vlm.utils.load_video", return_value=(video, metadata)):
+            prepare_inputs(processor, videos=["clip.mp4"], prompts="Describe this.")
+        assert "video_metadata" not in processor.kwargs
+        assert processor.fps == [metadata.sampled_fps]
+
+    def test_each_clip_keeps_its_metadata(self):
+        class Processor:
+            tokenizer = SimpleNamespace(pad_token="<pad>")
+
+            def __call__(
+                self, text, images=None, videos=None, video_metadata=None, **kwargs
+            ):
+                self.metadata = video_metadata
+                return {"input_ids": np.array([[1]]), "attention_mask": np.array([[1]])}
+
+        processor = Processor()
+        metadata = [
+            VideoMetadata(total_num_frames=60, fps=30, frames_indices=[0, 59]),
+            VideoMetadata(total_num_frames=240, fps=24, frames_indices=[10, 120, 239]),
+        ]
+        videos = [
+            np.zeros((len(m.frames_indices), 3, 32, 32), dtype=np.uint8)
+            for m in metadata
+        ]
+        with patch("mlx_vlm.utils.load_video", side_effect=list(zip(videos, metadata))):
+            prepare_inputs(
+                processor, videos=["first.mp4", "second.mp4"], prompts="Compare."
+            )
+        assert processor.metadata == metadata
+        assert processor.metadata[1].timestamps[-1] == 239 / 24

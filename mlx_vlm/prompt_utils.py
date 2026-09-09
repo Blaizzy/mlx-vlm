@@ -294,6 +294,7 @@ class MessageFormatter:
             "qwen2_vl",
             "qwen2_5_vl",
             "qwen3_vl",
+            "mage_vl",
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
@@ -550,6 +551,8 @@ class MessageFormatter:
             MessageBuilder.video_message(v, max_pixels, f)
             for v, f in zip(videos, fps_list)
         ]
+        if role == "user" and not skip_image_token:
+            content = [MessageBuilder.image_message()] * num_images + content
         if role == "user" and not skip_audio_token and num_audios > 0:
             content.extend([MessageBuilder.audio_message()] * num_audios)
         content.append(MessageBuilder.text_message(prompt))
