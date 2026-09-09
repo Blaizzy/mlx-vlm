@@ -1,5 +1,9 @@
 """Tests for prompt_utils module, specifically multimodal content handling."""
 
+from copy import deepcopy
+
+import pytest
+
 from mlx_vlm.prompt_utils import apply_chat_template, extract_text_from_content
 
 
@@ -146,6 +150,136 @@ class TestExtractTextFromContent:
         ]
         result = extract_text_from_content(content)
         assert result == "이미지에서 상품명, 가격, 설명을 추출해주세요."
+
+
+class TestQwenAssistantReasoning:
+    @pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
+    @pytest.mark.parametrize("as_list", [False, True])
+    @pytest.mark.parametrize(
+        "reasoning_fields",
+        [
+            {},
+            {"reasoning_content": None},
+            {"reasoning_content": ""},
+            {"reasoning_content": "Prior thought"},
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("content", "expected_text"),
+        [
+            ("Answer", "Answer"),
+            (None, ""),
+            ([{"type": "text", "text": "Answer"}], "Answer"),
+            ([{"type": "input_text", "text": "Answer"}], "Answer"),
+            ([{"type": "text", "content": "Answer"}], "Answer"),
+            (
+                [
+                    {"type": "text", "text": "First"},
+                    {"type": "input_text", "text": "", "content": "second"},
+                ],
+                "First second",
+            ),
+        ],
+    )
+    def test_preserves_reasoning_after_content_normalization(
+        self, model_type, as_list, reasoning_fields, content, expected_text
+    ):
+        message = {"role": "assistant", "content": content, **reasoning_fields}
+        prompt = [message] if as_list else message
+        original = deepcopy(prompt)
+
+        result = apply_chat_template(
+            None, {"model_type": model_type}, prompt, return_messages=True
+        )
+
+        assert result == [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": expected_text, "content": expected_text}
+                ],
+                **reasoning_fields,
+            }
+        ]
+        assert prompt == original
+
+    @pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
+    def test_preserves_reasoning_through_tool_continuation(self, model_type):
+        tool_call = _assistant_tool_call(None)
+        tool_call["reasoning_content"] = "Check the weather"
+        tool_call["tool_calls"][0]["function"]["arguments"] = '{"city":"Paris"}'
+        prompt = [
+            {"role": "user", "content": "Check the weather."},
+            {"role": "assistant", "content": "Checking", "reasoning_content": "Plan"},
+            tool_call,
+            {"role": "tool", "tool_call_id": "call_1", "content": "Sunny"},
+            {"role": "assistant", "content": "Sunny", "reasoning_content": "Done"},
+        ]
+        original = deepcopy(prompt)
+
+        result = apply_chat_template(
+            None, {"model_type": model_type}, prompt, return_messages=True
+        )
+
+        assert result[1]["reasoning_content"] == "Plan"
+        assert result[2]["reasoning_content"] == "Check the weather"
+        assert result[2]["content"] == ""
+        assert result[2]["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}
+        assert result[3] == prompt[3]
+        assert result[4]["reasoning_content"] == "Done"
+        assert prompt == original
+
+    @pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
+    @pytest.mark.parametrize("role", ["system", "user"])
+    @pytest.mark.parametrize("as_list", [False, True])
+    def test_does_not_add_reasoning_to_other_roles(self, model_type, role, as_list):
+        message = {"role": role, "content": "Hello", "reasoning_content": "Ignored"}
+        prompt = [message] if as_list else message
+
+        result = apply_chat_template(
+            None, {"model_type": model_type}, prompt, return_messages=True
+        )
+
+        assert result == [
+            {
+                "role": role,
+                "content": [{"type": "text", "text": "Hello", "content": "Hello"}],
+            }
+        ]
+
+    @pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
+    @pytest.mark.parametrize("prompt", ["Hello", ["Hello"]])
+    def test_string_prompts_are_unchanged(self, model_type, prompt):
+        assert apply_chat_template(
+            None, {"model_type": model_type}, prompt, return_messages=True
+        ) == [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "Hello", "content": "Hello"}],
+            }
+        ]
+
+    @pytest.mark.parametrize("model_type", ["qwen2_vl", "qwen3_vl", "gemma3"])
+    @pytest.mark.parametrize("as_list", [False, True])
+    def test_other_model_families_are_unchanged(self, model_type, as_list):
+        message = {"role": "assistant", "content": "Answer"}
+        with_reasoning = {**message, "reasoning_content": "Prior thought"}
+        expected = apply_chat_template(
+            None,
+            {"model_type": model_type},
+            [message] if as_list else message,
+            return_messages=True,
+        )
+
+        assert (
+            apply_chat_template(
+                None,
+                {"model_type": model_type},
+                [with_reasoning] if as_list else with_reasoning,
+                return_messages=True,
+            )
+            == expected
+        )
 
 
 class TestApplyChatTemplateIntegration:

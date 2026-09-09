@@ -932,6 +932,12 @@ def apply_chat_template(
                     **kwargs,
                 )
             )
+            if (
+                model_type in ("qwen3_5", "qwen3_5_moe")
+                and role == "assistant"
+                and "reasoning_content" in prompt
+            ):
+                messages[-1]["reasoning_content"] = prompt["reasoning_content"]
     elif isinstance(prompt, list):
         # Preserve explicit media markers on their originating user message.
         # Any legacy side-channel media without markers remains attached to the
@@ -1010,6 +1016,13 @@ def apply_chat_template(
                             **kwargs,
                         )
                     )
+                    if (
+                        model_type in ("qwen3_5", "qwen3_5_moe")
+                        and role == "assistant"
+                        and isinstance(p, dict)
+                        and "reasoning_content" in p
+                    ):
+                        messages[-1]["reasoning_content"] = p["reasoning_content"]
 
     if return_messages:
         return messages

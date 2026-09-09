@@ -3647,6 +3647,70 @@ def test_chat_completions_endpoint_preserves_assistant_reasoning_content(client)
     }
 
 
+@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
+def test_chat_completions_renders_assistant_reasoning_content(client, model_type):
+    from jinja2 import Template
+
+    # A synthetic template checks field propagation through the real normalizer.
+    # The official Qwen3.5-4B template reads the same reasoning_content field:
+    # https://huggingface.co/Qwen/Qwen3.5-4B/blob/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a/chat_template.jinja
+    template = """{%- for message in messages %}
+{%- if message.role == 'assistant' %}
+{%- if message.reasoning_content is string %}
+{{- '<think>' + message.reasoning_content + '</think>' }}
+{%- endif %}
+{%- for part in message.content %}{{ part.text }}{% endfor %}
+{%- endif %}
+{%- endfor %}"""
+    processor = SimpleNamespace(
+        chat_template=template,
+        apply_chat_template=lambda messages, **kwargs: Template(template).render(
+            messages=messages
+        ),
+    )
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+
+    with (
+        patch.object(
+            server,
+            "get_cached_model",
+            return_value=(
+                SimpleNamespace(),
+                processor,
+                SimpleNamespace(model_type=model_type),
+            ),
+        ),
+        patch.object(server, "generate", return_value=result) as mock_generate,
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {"role": "user", "content": "Hi"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Hello"}],
+                        "reasoning_content": "Prior thought",
+                    },
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert (
+        mock_generate.call_args.kwargs["prompt"] == "<think>Prior thought</think>Hello"
+    )
+
+
 def test_anthropic_messages_endpoint_maps_text_and_images(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
