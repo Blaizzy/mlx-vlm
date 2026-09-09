@@ -3204,7 +3204,45 @@ class TestModels(unittest.TestCase):
         # The shared gated-delta path must match glm5_next's reference recurrence
         # (the KDA safe forget gate == gated_delta.compute_g_safe, term for term).
         from mlx_vlm.models.gated_delta import gated_delta_update
-        from mlx_vlm.tests.glm5_next_reference import _l2norm, recurrent_kimi_delta
+
+        def _l2norm(x: mx.array, eps: float = 1e-6) -> mx.array:
+            return x * mx.rsqrt((x * x).sum(axis=-1, keepdims=True) + eps)
+
+        def recurrent_kimi_delta(
+            query: mx.array,
+            key: mx.array,
+            value: mx.array,
+            g: mx.array,
+            beta: mx.array,
+            state: mx.array | None = None,
+        ):
+            """Independent, token-by-token KDA reference for this parity test."""
+            dtype = query.dtype
+            query = _l2norm(query.astype(mx.float32))
+            key = _l2norm(key.astype(mx.float32))
+            value = value.astype(mx.float32)
+            g = g.astype(mx.float32)
+            beta = beta.astype(mx.float32)
+            batch, length, heads, key_dim = key.shape
+            value_dim = value.shape[-1]
+            query = query * (key_dim**-0.5)
+            if state is None:
+                state = mx.zeros((batch, heads, key_dim, value_dim), dtype=mx.float32)
+            else:
+                state = state.astype(mx.float32)
+            outputs = []
+            for index in range(length):
+                q_i = query[:, index]
+                k_i = key[:, index]
+                v_i = value[:, index]
+                g_i = mx.exp(g[:, index])[..., None]
+                beta_i = beta[:, index][..., None]
+                state = state * g_i
+                memory = (state * k_i[..., None]).sum(axis=-2)
+                delta = (v_i - memory) * beta_i
+                state = state + k_i[..., None] * delta[..., None, :]
+                outputs.append((state * q_i[..., None]).sum(axis=-2))
+            return mx.stack(outputs, axis=1).astype(dtype), state
 
         mx.random.seed(0)
         B, S, H, D, lb = 2, 17, 4, 32, -5.0
