@@ -5,7 +5,9 @@ from typing import Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..linear import tiled_linear
+from ..fast_ops import exact_hc_expand, exact_hc_norm, exact_hc_normalized_norm
+from ..linear import DECODE_BLOCK_SIZE, tiled_linear, tokenwise
+from ..switch_layers import MoE
 
 
 def _make_hc_sinkhorn_collapse_kernel():
@@ -233,17 +235,46 @@ class HyperConnection(nn.Module):
 
     def apply_branch(self, x, norm, branch, *args, **kwargs):
         """Collapse, normalize, evaluate a branch, and expand its residual."""
-        collapsed, post, comb = self(x)
-        output = branch(norm(collapsed), *args, **kwargs)
+        fused = None
+        if 1 < x.shape[1] <= DECODE_BLOCK_SIZE and not self.training:
+            if x.shape[0] == 1:
+                fused = exact_hc_normalized_norm(self, norm, x)
+            if fused is None and _hc_kernel is not None:
+                y = x.astype(mx.float32)
+                z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
+                mixes = self._mix(z)
+                fused = exact_hc_norm(self, norm, x, mixes)
+        if fused is None:
+            collapsed, post, comb = self(x)
+            collapsed = norm(collapsed)
+        else:
+            collapsed, post, comb = fused
+        if (
+            isinstance(branch, MoE)
+            and 1 < x.shape[1] <= DECODE_BLOCK_SIZE
+            and not self.training
+        ):
+            return branch(collapsed, *args, residual=(x, post, comb), **kwargs)
+        output = branch(collapsed, *args, **kwargs)
         if isinstance(output, tuple):
-            return (hc_expand(output[0], x, post, comb), *output[1:])
-        return hc_expand(output, x, post, comb)
+            return (
+                hc_expand(output[0], x, post, comb, use_kernel=not self.training),
+                *output[1:],
+            )
+        return hc_expand(output, x, post, comb, use_kernel=not self.training)
+
+    def _mix(self, z):
+        if z.shape[1] <= DECODE_BLOCK_SIZE:
+            if z.shape[0] == 1 and z.shape[1] > 1 and not self.training:
+                return tokenwise(lambda part: part @ self.fn.T, z)
+            return z @ self.fn.T
+        return tiled_linear(lambda part: part @ self.fn.T, z)
 
     def __call__(self, x: mx.array):
         B, L, H, D = x.shape
         y = x.astype(mx.float32)
         z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
-        mixes = tiled_linear(lambda x: x @ self.fn.T, z)
+        mixes = self._mix(z)
 
         use_ops = (
             self.hc_mult != 4
@@ -272,7 +303,11 @@ def _hc_expand_op(x, residual, post, comb):
     return y.astype(x.dtype)
 
 
-def hc_expand(x, residual, post, comb):
+def hc_expand(x, residual, post, comb, *, use_kernel=True):
+    if use_kernel and 1 < x.shape[1] <= DECODE_BLOCK_SIZE:
+        output = exact_hc_expand(x, residual, post, comb)
+        if output is not None:
+            return output
     return _hc_expand_op(x, residual, post, comb)
 
 
@@ -289,6 +324,8 @@ class HyperHead(nn.Module):
         self.scale = mx.ones((1,), dtype=mx.float32)
 
     def __call__(self, x: mx.array):
+        if 1 < x.shape[1] <= DECODE_BLOCK_SIZE and not self.training:
+            return tokenwise(self, x)
         y = x.astype(mx.float32)
         z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)
         mixes = tiled_linear(lambda x: x @ self.fn.T, z)

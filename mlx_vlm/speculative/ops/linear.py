@@ -7,7 +7,6 @@ from ...models.exact_speculative_verify import exact_speculative_verify_dense_av
 from ...models.exact_speculative_verify import (
     exact_speculative_verify_weight as _target_verify_weight,
 )
-from ...models.quantized_verifier import exact_quantized_linear
 from ...models.quantized_verifier import (
     optimized_affine_argmax as _target_verify_optimized_affine_argmax,
 )
@@ -180,17 +179,3 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
         mode=first.mode,
     )
     return tuple(mx.split(output, split_indices, axis=-1))
-
-
-def native_batch_linear(linear, x: mx.array) -> mx.array:
-    """Match independent Bx1 calls, keeping the native batch reduction order.
-
-    Unlike singleton-row projections above, this must retain B for mixed
-    dtypes and dense fallbacks as well as supported quantized projections.
-    """
-    if x.ndim != 3 or x.shape[1] <= 1:
-        return linear(x)
-    output = exact_quantized_linear(linear, x)
-    if output is not None:
-        return output
-    return _target_verify_timewise(linear, x)

@@ -5,6 +5,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..models import cache
+from ..models.linear import native_batch_linear
+from ..models.quantized_verifier import decode_quantized_argmax
 from .cache_state import (
     abort_speculative_round,
     commit_speculative_round,
@@ -20,8 +22,8 @@ from .common import (
     _speculative_walk_batch_uniform_acceptance,
     _SpeculativeSamplerRNG,
     generation_stream,
+    verify_forward,
 )
-from .targets import bind_speculative_target
 
 
 @dataclass
@@ -156,7 +158,6 @@ def _mtp_verify_target(
     *,
     sample_target_tokens: bool = True,
 ) -> _MTPVerifyResult:
-    lm = bind_speculative_target(lm)
     result = None
     try:
         if sample_target_tokens:
@@ -188,23 +189,50 @@ def _mtp_verify_target(
             if result is not None:
                 return result
 
-        verify_out = lm(
-            verify_input,
-            cache=prompt_cache,
-            return_hidden=True,
-            return_shared_kv=True,
-        )
+        legacy = callable(getattr(lm, "rollback_speculative_cache", None))
+        forward_kwargs = dict(return_hidden=True, return_shared_kv=True)
+        if legacy:
+            verify_out = lm(verify_input, cache=prompt_cache, **forward_kwargs)
+            transaction = verify_out.gdn_states
+        else:
+            verify_out, transaction = verify_forward(
+                lm, verify_input, prompt_cache, skip_logits=True, **forward_kwargs
+            )
         result = _MTPVerifyResult(
-            hidden=verify_out.hidden_states[-1],
-            shared_kv_states=verify_out.shared_kv_states,
-            rollback_state=verify_out.gdn_states,
+            hidden=None, shared_kv_states={}, rollback_state=transaction
         )
-        result.target_tokens = sampler(verify_out.logits)
+        result.hidden = verify_out.hidden_states[-1]
+        result.shared_kv_states = verify_out.shared_kv_states or {}
+        if verify_out.logits is not None:
+            result.target_tokens = sampler(verify_out.logits)
+        elif sample_target_tokens:
+            # Fused greedy readout is safe for already-normalized hidden states.
+            head = getattr(lm, "lm_head", None)
+            tokens = None
+            if head is not None and not hasattr(lm, "logits_from_hidden"):
+                tokens = decode_quantized_argmax(head, result.hidden)
+            result.target_tokens = (
+                sampler(_mtp_logits_from_hidden(lm, result.hidden))
+                if tokens is None
+                else tokens
+            )
         return result
     except BaseException:
         if result is not None:
             result.abort()
         raise
+
+
+def _mtp_logits_from_hidden(lm, hidden):
+    project = getattr(lm, "speculative_logits_from_hidden", None)
+    if project is None:
+        project = getattr(lm, "logits_from_hidden", None)
+    if project is not None:
+        return project(hidden)
+    head = getattr(lm, "lm_head", None)
+    if head is None:
+        head = lm.model.embed_tokens.as_linear
+    return native_batch_linear(head, hidden)
 
 
 def _mtp_draft_hidden(lm: nn.Module, hidden: mx.array) -> mx.array:
@@ -229,9 +257,7 @@ def _speculative_walk_deferred_greedy(
 
     for pos in range(n_draft + 1):
         with mx.stream(generation_stream):
-            logits = lm.speculative_logits_from_hidden(
-                target_hidden[:, pos : pos + 1, :]
-            )
+            logits = _mtp_logits_from_hidden(lm, target_hidden[:, pos : pos + 1, :])
             if logits.ndim == 3 and logits.shape[1] == 1:
                 logits = logits[:, 0, :]
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
@@ -273,7 +299,7 @@ def _positioned_target_tokens(
         return None
 
     with mx.stream(generation_stream):
-        logits = lm.speculative_logits_from_hidden(target_hidden)
+        logits = _mtp_logits_from_hidden(lm, target_hidden)
         if logits.ndim == 3:
             if logits.shape[0] != 1:
                 return None
@@ -324,9 +350,7 @@ def _speculative_walk_batch_deferred_greedy(
         if all(done):
             break
         with mx.stream(generation_stream):
-            logits = lm.speculative_logits_from_hidden(
-                target_hidden[:, pos : pos + 1, :]
-            )
+            logits = _mtp_logits_from_hidden(lm, target_hidden[:, pos : pos + 1, :])
             if logits.ndim == 3 and logits.shape[1] == 1:
                 logits = logits[:, 0, :]
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
@@ -374,9 +398,7 @@ def _speculative_walk_batch_deferred_uniform(
     accepted = 0
     for pos in range(n_draft + 1):
         with mx.stream(generation_stream):
-            logits = lm.speculative_logits_from_hidden(
-                target_hidden[:, pos : pos + 1, :]
-            )
+            logits = _mtp_logits_from_hidden(lm, target_hidden[:, pos : pos + 1, :])
             if logits.ndim == 3 and logits.shape[1] == 1:
                 logits = logits[:, 0, :]
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
@@ -578,13 +600,7 @@ def _mtp_rounds(
     greedy_sampling: bool = False,
 ) -> Generator[Tuple[int, None], None, None]:
     """Verify autoregressive MTP drafts and commit accepted state before emission."""
-    lm = bind_speculative_target(
-        model.language_model if hasattr(model, "language_model") else model
-    )
-    if not hasattr(lm, "rollback_speculative_cache"):
-        raise RuntimeError(
-            f"{type(lm).__name__} does not implement rollback_speculative_cache. "
-        )
+    lm = model.language_model if hasattr(model, "language_model") else model
 
     block_total = _dflash_block_total(draft_model, draft_block_size)
     configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
@@ -879,13 +895,7 @@ def _mtp_rounds_batch(
     autoregressive, and the per-round ``shared_kv`` snapshot is normalized
     back to the unbatched prefix-valid layout before each drafter rebind.
     """
-    lm = bind_speculative_target(
-        model.language_model if hasattr(model, "language_model") else model
-    )
-    if not hasattr(lm, "rollback_speculative_cache"):
-        raise RuntimeError(
-            f"{type(lm).__name__} does not implement rollback_speculative_cache."
-        )
+    lm = model.language_model if hasattr(model, "language_model") else model
 
     B = first_bonus.shape[0]
     row_ids = list(range(B)) if row_ids is None else list(row_ids)

@@ -7,10 +7,10 @@ from ..base import LanguageModelOutput, create_ssm_mask, scaled_dot_product_atte
 from ..cache import ArraysCache, CacheList, KVCache, PoolingCache
 from ..deepseek_v4.hyper_connection import HyperConnection
 from ..gated_delta import gated_delta_update
-from ..linear import tiled_linear
+from ..linear import DECODE_BLOCK_SIZE, linear, tiled_linear
 from ..mla import MultiLinear
 from ..sparse_attention import indexed_sparse_attention
-from ..switch_layers import SwitchGLU
+from ..switch_layers import MoE, SwitchGLU
 from .config import TextConfig
 
 
@@ -41,8 +41,8 @@ class Glm5NextMLP(nn.Module):
         self.swiglu_limit = config.swiglu_limit
 
     def __call__(self, x):
-        gate, up = mx.split(self.gate_up_proj(x), 2, axis=-1)
-        return self.down_proj(_limited_swiglu(gate, up, self.swiglu_limit))
+        gate, up = mx.split(linear(self.gate_up_proj, x), 2, axis=-1)
+        return linear(self.down_proj, _limited_swiglu(gate, up, self.swiglu_limit))
 
 
 @mx.compile
@@ -111,7 +111,7 @@ class MoEGate(nn.Module):
         )
 
 
-class Glm5NextMoE(nn.Module):
+class Glm5NextMoE(MoE):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.gate = MoEGate(config)
@@ -125,12 +125,6 @@ class Glm5NextMoE(nn.Module):
             config,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
         )
-
-    def __call__(self, x):
-        indices, weights = self.gate(x)
-        routed = self.switch_mlp(x, indices)
-        routed = (routed * weights[..., None].astype(routed.dtype)).sum(axis=-2)
-        return routed + self.shared_experts(x)
 
 
 class ShortConv1d(nn.Module):
@@ -192,18 +186,18 @@ class Glm5NextLinearAttention(nn.Module):
         batch, length, _ = x.shape
         if mask is not None and mask.dtype == mx.bool_:
             x = mx.where(mask[..., None], x, 0)
-        qkv = self.qkv_conv(self.qkv_proj(x), mask=mask, cache=cache)
+        qkv = self.qkv_conv(linear(self.qkv_proj, x), mask=mask, cache=cache)
         shape = (batch, length, self.num_heads, self.head_dim)
         q, k, v = (value.reshape(shape) for value in mx.split(qkv, 3, axis=-1))
         eps = 1e-6 / self.head_dim
         q = self.scale**2 * mx.fast.rms_norm(q, None, eps)
         k = self.scale * mx.fast.rms_norm(k, None, eps)
         f_a, b, g_a = mx.split(
-            self.fbg_a_proj(x),
+            linear(self.fbg_a_proj, x),
             (self.head_dim, self.head_dim + self.num_heads),
             axis=-1,
         )
-        a = self.f_b_proj(f_a).reshape(shape)
+        a = linear(self.f_b_proj, f_a).reshape(shape)
         b = b.reshape(batch, length, self.num_heads)
         output, _ = gated_delta_update(
             q,
@@ -220,9 +214,9 @@ class Glm5NextLinearAttention(nn.Module):
         )
         if cache is not None:
             cache.advance(q.shape[1])
-        gate = self.g_b_proj(g_a).reshape(shape)
+        gate = linear(self.g_b_proj, g_a).reshape(shape)
         output = (self.o_norm(output) * mx.sigmoid(gate)).reshape(batch, length, -1)
-        return self.o_proj(output)
+        return linear(self.o_proj, output)
 
 
 def _batch_gather(values: mx.array, indices: mx.array) -> mx.array:
@@ -637,10 +631,10 @@ class Glm5NextAttention(nn.Module):
         last_only: bool = False,
     ):
         batch, length, _ = x.shape
-        q_a, kv_a = mx.split(self.qkv_a_proj(x), (self.q_lora_rank,), axis=-1)
+        q_a, kv_a = mx.split(linear(self.qkv_a_proj, x), (self.q_lora_rank,), axis=-1)
         q_resid = self.q_a_layernorm(q_a)
         q = (
-            self.q_b_proj(q_resid)
+            linear(self.q_b_proj, q_resid)
             .reshape(batch, length, self.num_heads, self.q_head_dim)
             .transpose(0, 2, 1, 3)
         )
@@ -683,31 +677,36 @@ class Glm5NextAttention(nn.Module):
         out, topk = self._attend(
             q, latent, new_latent, topk, kv_cache, projected_cache, last_only
         )
-        return self.o_proj(out), topk
+        return linear(self.o_proj, out), topk
 
     def _attend(
         self, q, latent, new_latent, topk, kv_cache, projected_cache, last_only=False
     ):
         batch, _, length, _ = q.shape
-        if length == 1:
-            kv_length = latent.shape[2]
-            valid = (topk >= 0) & (topk < kv_length)
-            safe = mx.clip(topk, 0, max(kv_length - 1, 0))
-            selected = mx.take_along_axis(
-                latent,
-                safe[:, None, 0, :, None],
-                axis=2,
-            )
-            q = self.embed_q(q)
-            out = scaled_dot_product_attention(
-                q,
-                selected,
-                selected,
-                cache=kv_cache,
-                scale=self.scale,
-                mask=valid[:, None],
-            )
-            out = self.unembed_out(out)
+        if length <= DECODE_BLOCK_SIZE and not self.training:
+            outputs = []
+            start = length - 1 if last_only else 0
+            for index in range(start, length):
+                selected_indices = topk[:, index : index + 1]
+                valid = (selected_indices >= 0) & (selected_indices < latent.shape[2])
+                safe = mx.clip(selected_indices, 0, max(latent.shape[2] - 1, 0))
+                selected = mx.take_along_axis(latent, safe[:, None, 0, :, None], axis=2)
+                query = self.embed_q(q[:, :, index : index + 1])
+                output = scaled_dot_product_attention(
+                    query,
+                    selected,
+                    selected,
+                    cache=kv_cache,
+                    scale=self.scale,
+                    mask=valid[:, None],
+                )
+                output = self.unembed_out(output)
+                if length > 1:
+                    mx.async_eval(output)
+                outputs.append(output)
+            out = mx.concatenate(outputs, axis=2)
+            if last_only:
+                topk = topk[:, -1:]
         else:
             previous_length = latent.shape[2] - length
             cache_matches = (
@@ -889,9 +888,9 @@ class LanguageModel(nn.Module):
         if skip_logits:
             logits = None
         elif self.args.tie_word_embeddings:
-            logits = self.model.embed_tokens.as_linear(hidden)
+            logits = linear(self.model.embed_tokens.as_linear, hidden)
         else:
-            logits = self.lm_head(hidden)
+            logits = linear(self.lm_head, hidden)
         return LanguageModelOutput(
             logits=logits,
             hidden_states=hidden_sink,

@@ -254,8 +254,9 @@ class TestDeepseekV4VisionLanguage(unittest.TestCase):
                 return mask
 
         class CaptureLayer:
-            def __call__(self, hidden, mask, cache, input_ids):
+            def __call__(self, hidden, mask, cache, input_ids, causal):
                 del cache, input_ids
+                self.causal = causal
                 self.mask = mask
                 return hidden
 
@@ -281,6 +282,7 @@ class TestDeepseekV4VisionLanguage(unittest.TestCase):
         )
         mx.eval(result.hidden_states if result.hidden_states is not None else [])
 
+        self.assertFalse(layer.causal)
         self.assertTrue(bool(mx.all(layer.mask[0, :, :, :2]).item()))
         self.assertFalse(bool(mx.any(layer.mask[1, :, :, :2]).item()))
         self.assertTrue(

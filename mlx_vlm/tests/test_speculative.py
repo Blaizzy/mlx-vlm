@@ -20,6 +20,7 @@ import pytest
 from mlx.utils import tree_flatten, tree_map
 
 import mlx_vlm.models.deepseek_v4.language as deepseek_language
+import mlx_vlm.models.fast_ops as fast_ops
 import mlx_vlm.models.gemma4.language as gemma4_language
 import mlx_vlm.models.glm5_next.language as glm5_next_language
 import mlx_vlm.models.laguna.language as laguna_language
@@ -29,7 +30,6 @@ import mlx_vlm.models.qwen3_5.speculative_verifier as qwen_verifier
 import mlx_vlm.models.qwen3_5_moe.language as qwen_moe_language
 import mlx_vlm.speculative.cache_state as speculative_cache_state
 import mlx_vlm.speculative.mtp as mtp_utils
-import mlx_vlm.speculative.ops.glm5_next as glm5_next_exact_ops
 import mlx_vlm.speculative.ops.linear as verifier_linear
 from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models.base import kv_sequence_length
@@ -44,6 +44,7 @@ from mlx_vlm.models.cache import (
     RotatingKVCache,
 )
 from mlx_vlm.models.gated_delta import gated_delta_update
+from mlx_vlm.models.linear import native_batch_linear
 from mlx_vlm.models.quantized_verifier import (
     decode_quantized_argmax,
     decode_quantized_linear,
@@ -97,7 +98,6 @@ from mlx_vlm.speculative.eagle3 import (
     _eagle3_verify_target,
     _eagle3_verify_target_hot,
 )
-from mlx_vlm.speculative.targets import bind_speculative_target
 from mlx_vlm.speculative.utils import (
     _dflash_next_block_size,
     _effective_mtp_block_size,
@@ -3655,8 +3655,8 @@ def test_deepseek_v4_rollback_speculative_cache_raises_on_ragged_turboquant_batc
     cache.update_and_fetch(keys, values)
 
     with pytest.raises(RuntimeError, match="uniform"):
-        deepseek_language.LanguageModel.rollback_speculative_cache(
-            None, [cache], [], mx.array([0, 2]), block_size=3
+        speculative_cache_state.rollback_speculative_cache(
+            [cache], None, mx.array([0, 2]), block_size=3
         )
 
 
@@ -3666,15 +3666,20 @@ def test_uniform_turboquant_batch_rollback_trims_without_raising():
     for lm_cls, block in (
         (qwen_language.LanguageModel, 5),
         (gemma4_language.LanguageModel, 5),
-        (deepseek_language.LanguageModel, 5),
+        (None, 5),
     ):
         cache = BatchTurboQuantKVCache([0, 0], bits=3.5)
         keys = mx.arange(2 * 1 * 7 * 8, dtype=mx.float32).reshape(2, 1, 7, 8)
         cache.update_and_fetch(keys, keys + 100)
 
-        max_a = lm_cls.rollback_speculative_cache(
-            None, [cache], [], mx.array([2, 2]), block_size=block
-        )
+        if lm_cls is None:
+            max_a = speculative_cache_state.rollback_speculative_cache(
+                [cache], None, mx.array([2, 2]), block_size=block
+            )
+        else:
+            max_a = lm_cls.rollback_speculative_cache(
+                None, [cache], [], mx.array([2, 2]), block_size=block
+            )
         mx.eval(cache.offset)
         assert max_a == 2
         assert cache._idx == 5
@@ -3876,7 +3881,12 @@ def test_deepseek_v4_returns_mtp_hidden_and_trims_without_snapshot():
     cache = lm.make_cache()
     inputs = mx.array([[1, 2, 3]], dtype=mx.int32)
 
-    hidden, shared_kv, rollback_state = lm.speculative_verify_hidden(inputs, cache)
+    result = _mtp_verify_target(lm, inputs, cache, None, sample_target_tokens=False)
+    hidden, shared_kv, rollback_state = (
+        result.hidden,
+        result.shared_kv_states,
+        result.rollback_state,
+    )
     mx.eval(hidden)
 
     assert hidden.shape == (1, 3, cfg.hc_mult, cfg.hidden_size)
@@ -3884,10 +3894,12 @@ def test_deepseek_v4_returns_mtp_hidden_and_trims_without_snapshot():
     assert rollback_state.active
     assert cache[0].offset == 3
 
-    lm.rollback_speculative_cache(cache, rollback_state, accepted=0, block_size=3)
+    speculative_cache_state.commit_speculative_round(
+        lm, cache, rollback_state, accepted=0, block_size=3
+    )
     assert cache[0].offset == 1
 
-    logits = lm.speculative_logits_from_hidden(hidden[:, :1])
+    logits = lm.logits_from_hidden(hidden[:, :1])
     mx.eval(logits)
     assert logits.shape == (1, 1, cfg.vocab_size)
 
@@ -3905,9 +3917,10 @@ def test_deepseek_v4_pooling_rollback_commits_without_model_replay(accepted):
     speculative_cache = language.make_cache()
     prompt_output = language(prompt, cache=speculative_cache)
     mx.eval(prompt_output.logits)
-    hidden, _, transaction = language.speculative_verify_hidden(
-        verify, speculative_cache
+    result = _mtp_verify_target(
+        language, verify, speculative_cache, None, sample_target_tokens=False
     )
+    hidden, transaction = result.hidden, result.rollback_state
     mx.eval(hidden)
     assert transaction.active
     with patch.object(
@@ -3915,7 +3928,8 @@ def test_deepseek_v4_pooling_rollback_commits_without_model_replay(accepted):
         "__call__",
         side_effect=AssertionError("rollback must not replay the target model"),
     ):
-        language.rollback_speculative_cache(
+        speculative_cache_state.commit_speculative_round(
+            language,
             speculative_cache,
             transaction,
             accepted=accepted,
@@ -4143,7 +4157,7 @@ def test_glm5_next_dense_verifier_matches_batched_decode(batch, length):
         axis=1,
     )
 
-    actual = verifier_linear.native_batch_linear(linear, inputs)
+    actual = native_batch_linear(linear, inputs)
     mx.eval(expected, actual)
 
     assert actual is not None
@@ -4155,6 +4169,24 @@ def _bf16_quantization_parameters(linear):
     if linear.biases is not None:
         linear.biases = linear.biases.astype(mx.bfloat16)
     return linear
+
+
+@pytest.mark.parametrize("width", [64, 128, 512])
+@pytest.mark.parametrize("output_width", [16, 512])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("bits", [4, 8])
+def test_native_projection_preserves_narrow_and_mixed_dtype_reductions(
+    width, output_width, dtype, bits
+):
+    mx.random.seed(2127)
+    dense = nn.Linear(width, output_width, bias=False)
+    dense.weight = dense.weight.astype(mx.bfloat16)
+    projection = nn.QuantizedLinear.from_linear(dense, group_size=64, bits=bits)
+    inputs = mx.random.normal((1, 3, width)).astype(dtype)
+    expected = mx.concatenate(
+        [projection(mx.contiguous(inputs[:, i : i + 1])) for i in range(3)], axis=1
+    )
+    assert mx.array_equal(native_batch_linear(projection, inputs), expected).item()
 
 
 @pytest.mark.parametrize("bits", [4, 5])
@@ -4174,7 +4206,7 @@ def test_glm5_next_affine_gate_up_fusion_matches_batched_decode(bits, batch):
     expected_up = exact_quantized_switch_linear(switch.up_proj, inputs, indices)
     expected_gate = exact_quantized_switch_linear(switch.gate_proj, inputs, indices)
 
-    actual = glm5_next_exact_ops.exact_affine_switch_gate_up(switch, inputs, indices)
+    actual = fast_ops.exact_affine_switch_gate_up(switch, inputs, indices)
     mx.eval(expected_up, expected_gate, *actual)
 
     assert actual is not None
@@ -4209,9 +4241,9 @@ def test_glm5_next_affine_moe_fusion_matches_batched_decode(bits, batch):
         indices,
     )
     shared = exact_quantized_linear(shared_linear, shared_inputs)
-    expected = glm5_next_exact_ops.combine_moe_outputs(routed, weights, shared)
+    expected = SwitchGLU._combine(routed, weights, shared)
 
-    actual = glm5_next_exact_ops.exact_affine_moe_down(
+    actual = fast_ops.exact_affine_moe_down(
         routed_linear,
         routed_inputs,
         indices,
@@ -4266,8 +4298,8 @@ def test_general_quantized_moe_hc_matches_separate_kernels(
         routed_inputs,
         indices,
     )
-    collapsed = glm5_next_exact_ops.combine_moe_outputs(routed, weights, shared)
-    expected = glm5_next_exact_ops.exact_hc_expand(
+    collapsed = SwitchGLU._combine(routed, weights, shared)
+    expected = fast_ops.exact_hc_expand(
         collapsed,
         residual,
         post,
@@ -4330,6 +4362,11 @@ def test_general_quantized_verifier_matches_decode(
             axis=1,
         )
 
+    native_reference = mx.concatenate(
+        [linear(mx.contiguous(inputs[:, i : i + 1])) for i in range(inputs.shape[1])],
+        axis=1,
+    )
+    assert mx.array_equal(native_batch_linear(linear, inputs), native_reference).item()
     actual = decode_quantized_linear(linear, inputs)
     tokens = decode_quantized_argmax(linear, inputs)
     mx.eval(expected, actual, tokens)
@@ -4550,15 +4587,21 @@ def test_glm5_next_mtp_batch_acceptance_keeps_ragged_rows_aligned():
 def test_glm5_next_target_rollback_restores_ragged_rows_without_model_replay():
     mx.random.seed(4513)
     text_config = _tiny_glm5_next_text_config()
-    language = bind_speculative_target(glm5_next_language.LanguageModel(text_config))
+    language = glm5_next_language.LanguageModel(text_config)
     language.eval()
     cache = _make_cache(language, left_padding=[0, 0])
 
     prompt_output = language(mx.array([[1, 2], [3, 4]], dtype=mx.int32), cache=cache)
     mx.eval(prompt_output.logits)
-    hidden, _, rollback_state = language.speculative_verify_hidden(
-        mx.array([[5, 6], [7, 8]], dtype=mx.int32), cache
+    projected_offset = cache[1][3].offset.tolist()
+    result = _mtp_verify_target(
+        language,
+        mx.array([[5, 6], [7, 8]], dtype=mx.int32),
+        cache,
+        None,
+        sample_target_tokens=False,
     )
+    hidden, rollback_state = result.hidden, result.rollback_state
     mx.eval(hidden)
     assert rollback_state.active
     records = cache[0]._speculation["records"]
@@ -4572,8 +4615,8 @@ def test_glm5_next_target_rollback_restores_ragged_rows_without_model_replay():
         "__call__",
         side_effect=AssertionError("rollback must not replay the target model"),
     ):
-        language.rollback_speculative_cache(
-            cache, rollback_state, accepted=[1, 0], block_size=2
+        speculative_cache_state.commit_speculative_round(
+            language, cache, rollback_state, accepted=[1, 0], block_size=2
         )
 
     sparse_cache = cache[1]
@@ -4582,7 +4625,7 @@ def test_glm5_next_target_rollback_restores_ragged_rows_without_model_replay():
     assert sparse_cache[0].left_padding.tolist() == [0, 1]
     assert sparse_cache[2]._pool_lengths == [2, 1]
     assert sparse_cache[2].remainder == [0, 1]
-    assert sparse_cache[3].offset.tolist() == [2, 2]
+    assert sparse_cache[3].offset.tolist() == projected_offset
     assert sparse_cache[3].left_padding.tolist() == [0, 0]
     assert not rollback_state.active
 
@@ -4591,7 +4634,7 @@ def test_glm5_next_target_rollback_restores_ragged_rows_without_model_replay():
 def test_glm5_next_cached_indexer_block_matches_stepwise(batch):
     mx.random.seed(4700 + batch)
     text_config = _tiny_glm5_next_text_config()
-    language = bind_speculative_target(glm5_next_language.LanguageModel(text_config))
+    language = glm5_next_language.LanguageModel(text_config)
     language.eval()
     indexer = language.model.layers[1].self_attn.indexer
     step_cache = _make_cache(language, left_padding=[0] * batch)[1]

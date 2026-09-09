@@ -1,9 +1,9 @@
+"""Fused short-block projection, expert, and hyperconnection kernels."""
+
 from functools import lru_cache
 from typing import Optional
 
 import mlx.core as mx
-
-from ...models.switch_layers import QuantizedSwitchLinear
 
 _COMMON_HEADER = r"""
 #include <metal_simdgroup>
@@ -706,7 +706,7 @@ def _affine_exact_header(
 def _hc_norm_kernel(dtype, hc_mult, width, sinkhorn_iters, hc_eps, norm_eps):
     return mx.fast.metal_kernel(
         name=(
-            "glm5_next_verify_hc_norm_"
+            "short_block_hc_norm_"
             f"{_dtype_name(dtype)}_h{hc_mult}_d{width}_i{sinkhorn_iters}_"
             f"he{round(hc_eps / 1e-9)}_ne{round(norm_eps / 1e-9)}"
         ),
@@ -734,7 +734,7 @@ def _hc_normalized_norm_kernel(
 ):
     return mx.fast.metal_kernel(
         name=(
-            "glm5_next_verify_hc_normalized_norm_"
+            "short_block_hc_normalized_norm_"
             f"{_dtype_name(dtype)}_{_dtype_name(weight_dtype)}_h{hc_mult}_"
             f"d{width}_i{sinkhorn_iters}_he{round(hc_eps / 1e-9)}_"
             f"ne{round(norm_eps / 1e-9)}"
@@ -755,8 +755,7 @@ def _hc_normalized_norm_kernel(
 def _hc_expand_kernel(dtype, rows, hc_mult, width):
     return mx.fast.metal_kernel(
         name=(
-            "glm5_next_verify_hc_expand_"
-            f"{_dtype_name(dtype)}_r{rows}_h{hc_mult}_d{width}"
+            "short_block_hc_expand_" f"{_dtype_name(dtype)}_r{rows}_h{hc_mult}_d{width}"
         ),
         input_names=["x", "residual", "post", "comb"],
         output_names=["out"],
@@ -777,7 +776,7 @@ def _affine_switch_gate_up_kernel(
 ):
     return mx.fast.metal_kernel(
         name=(
-            f"glm5_next_verify_affine{bits}_switch_gate_up_"
+            f"short_block_affine{bits}_switch_gate_up_"
             f"{_dtype_name(dtype)}_t{length}_k{k_size}_n{n_size}_"
             f"e{top_k}_g{group_size}"
         ),
@@ -809,7 +808,7 @@ def _affine_moe_down_kernel(
 ):
     return mx.fast.metal_kernel(
         name=(
-            f"glm5_next_verify_affine{bits}_moe_down_"
+            f"short_block_affine{bits}_moe_down_"
             f"{_dtype_name(dtype)}_t{length}_k{k_size}_n{n_size}_"
             f"e{top_k}_g{group_size}"
         ),
@@ -829,12 +828,15 @@ def _affine_moe_down_kernel(
 
 
 def exact_affine_switch_gate_up(switch, x: mx.array, indices: mx.array):
-    """Project selected affine up/gate weights in one verifier dispatch."""
+    """Project selected affine up/gate weights in one dispatch."""
+    from .switch_layers import QuantizedSwitchLinear
+
     up = getattr(switch, "up_proj", None)
     gate = getattr(switch, "gate_proj", None)
     linears = (up, gate)
     if (
         not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
         or x.ndim != 3
         or x.shape[0] < 1
         or x.shape[1] <= 1
@@ -922,8 +924,11 @@ def _affine_moe_down_shape(
     route_weights: mx.array,
     shared: mx.array,
 ):
+    from .switch_layers import QuantizedSwitchLinear
+
     if (
         not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
         or not isinstance(linear, QuantizedSwitchLinear)
         or linear.mode != "affine"
         or linear.bits not in (4, 5)
@@ -1012,6 +1017,7 @@ def exact_hc_normalized_norm(connection, norm, x: mx.array):
     weight = connection.fn
     if (
         not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
         or x.ndim != 4
         or x.dtype not in (mx.bfloat16, mx.float16)
         or x.shape[2:] != (4, 4096)
@@ -1064,6 +1070,7 @@ def exact_hc_norm(connection, norm, x: mx.array, mixes: mx.array):
     """Fuse HC collapse and its following RMSNorm with exact reductions."""
     if (
         not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
         or x.ndim != 4
         or x.dtype not in (mx.bfloat16, mx.float16)
         or x.shape[2] != 4
@@ -1111,40 +1118,16 @@ def exact_hc_norm(connection, norm, x: mx.array, mixes: mx.array):
     )
 
 
-def exact_fp32_decode_block_gemv(x: mx.array, weight: mx.array) -> Optional[mx.array]:
-    """Project FP32 verifier positions with the target's native batch shape."""
-    if (
-        x.ndim != 3
-        or x.shape[0] < 1
-        or x.shape[1] <= 1
-        or x.dtype != mx.float32
-        or weight.ndim != 2
-        or weight.dtype not in (mx.bfloat16, mx.float16, mx.float32)
-        or x.shape[-1] != weight.shape[-1]
-    ):
-        return None
-
-    return mx.concatenate(
-        [
-            mx.matmul(
-                mx.contiguous(x[:, position : position + 1]),
-                weight.T,
-            )
-            for position in range(x.shape[1])
-        ],
-        axis=1,
-    )
-
-
 def exact_hc_expand(
     x: mx.array,
     residual: mx.array,
     post: mx.array,
     comb: mx.array,
 ) -> Optional[mx.array]:
-    """Expand verifier hyperconnections with decode-exact FMA ordering."""
+    """Expand short-block hyperconnections with decode-exact FMA ordering."""
     if (
         not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
         or x.ndim != 3
         or residual.ndim != 4
         or residual.shape[:2] != x.shape[:2]
@@ -1181,9 +1164,3 @@ def exact_hc_expand(
         output_dtypes=[x.dtype],
     )[0]
     return output
-
-
-@mx.compile
-def combine_moe_outputs(routed, weights, shared):
-    routed = (routed * weights[..., None].astype(routed.dtype)).sum(axis=-2)
-    return routed + shared

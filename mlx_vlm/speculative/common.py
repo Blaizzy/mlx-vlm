@@ -3,7 +3,45 @@ from typing import Any, Callable, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..models.base import LanguageModelOutput
+from ..models.linear import DECODE_BLOCK_SIZE
+from .cache_state import start_speculative_cache
+
 generation_stream = mx.new_thread_local_stream(mx.default_device())
+
+
+def verify_forward(model, inputs, cache, **kwargs):
+    """Run ordinary short-block forwards inside one cache transaction."""
+    transaction = start_speculative_cache(cache, inputs.shape[1])
+    try:
+        outputs = [
+            model(inputs[:, start : start + DECODE_BLOCK_SIZE], cache=cache, **kwargs)
+            for start in range(0, inputs.shape[1], DECODE_BLOCK_SIZE)
+        ]
+        if len(outputs) == 1:
+            return outputs[0], transaction
+        return (
+            LanguageModelOutput(
+                logits=(
+                    None
+                    if outputs[0].logits is None
+                    else mx.concatenate([out.logits for out in outputs], axis=1)
+                ),
+                hidden_states=(
+                    None
+                    if outputs[0].hidden_states is None
+                    else [
+                        mx.concatenate(parts, axis=1)
+                        for parts in zip(*(out.hidden_states for out in outputs))
+                    ]
+                ),
+                shared_kv_states=outputs[-1].shared_kv_states,
+            ),
+            transaction,
+        )
+    except BaseException:
+        transaction.abort()
+        raise
 
 
 def _copy_rng_state() -> List[mx.array]:

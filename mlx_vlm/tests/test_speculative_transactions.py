@@ -22,14 +22,18 @@ from mlx_vlm.models.deepseek_v4.language import LanguageModel as DeepseekLanguag
 from mlx_vlm.models.glm5_next.language import LanguageModel as GlmLanguageModel
 from mlx_vlm.models.qwen4_exp.language import LanguageModel as QwenLanguageModel
 from mlx_vlm.speculative.cache_state import start_speculative_cache
-from mlx_vlm.speculative.dflash import _dflash_rounds, _dflash_rounds_batch
+from mlx_vlm.speculative.common import verify_forward
+from mlx_vlm.speculative.dflash import (
+    _dflash_rounds,
+    _dflash_rounds_batch,
+    _dflash_verify,
+)
 from mlx_vlm.speculative.drafters.glm5_next_mtp import (
     Glm5NextMTPDraftModel,
     ModelConfig,
 )
 from mlx_vlm.speculative.eagle3 import _eagle3_rounds, _eagle3_rounds_batch
-from mlx_vlm.speculative.mtp import _mtp_rounds, _mtp_rounds_batch
-from mlx_vlm.speculative.targets import bind_speculative_target
+from mlx_vlm.speculative.mtp import _mtp_rounds, _mtp_rounds_batch, _mtp_verify_target
 from mlx_vlm.tests.test_qwen4_mtp import _outer_config, _tiny_text_config
 from mlx_vlm.tests.test_speculative import (
     _tiny_deepseek_v4_config,
@@ -122,7 +126,6 @@ def test_deepseek_dflash_commit_restores_compressed_history(
     config.compress_ratios = [4]
     model = DeepseekLanguageModel(config)
     model.eval()
-    target = bind_speculative_target(model)
     prompt = mx.broadcast_to((mx.arange(prefix)[None] % 30) + 1, (batch, prefix))
     proposed = mx.array([[4, 5, 6, 7]] * batch)
 
@@ -132,12 +135,10 @@ def test_deepseek_dflash_commit_restores_compressed_history(
     reference, speculative = make_cache(), make_cache()
     for caches in (reference, speculative):
         mx.eval(model(prompt, cache=caches).logits)
-    output = target(
-        proposed, cache=speculative, capture_layer_ids=[0], speculative_verify=True
-    )
+    output, transaction = _dflash_verify(model, proposed, speculative, [0])
     mx.eval(output.logits, output.hidden_states)
-    assert output.gdn_states.active
-    output.gdn_states.commit([retained] * batch)
+    assert transaction.active
+    transaction.commit([retained] * batch)
     mx.eval(model(proposed[:, :retained], cache=reference).logits)
     for actual, expected in zip(speculative[0].caches[1:], reference[0].caches[1:]):
         assert actual.remainder == expected.remainder
@@ -267,7 +268,6 @@ def test_deepseek_native_quantized_verifier_matches_repeated_decode(batch, forma
         ),
     )
     model.eval()
-    target = bind_speculative_target(model)
     reference, speculative = [_make_cache(model, [0] * batch) for _ in range(2)]
     prompt = mx.broadcast_to((mx.arange(131)[None] % 30) + 1, (batch, 131))
     for caches in (reference, speculative):
@@ -286,16 +286,11 @@ def test_deepseek_native_quantized_verifier_matches_repeated_decode(batch, forma
             mx.eval(output.logits, output.hidden_states)
             expected.append(output.logits)
             expected_features.append(output.hidden_states)
-        output = target(
-            tokens,
-            cache=speculative,
-            speculative_verify=True,
-            capture_layer_ids=[0, 1, 2],
-        )
+        output, transaction = _dflash_verify(model, tokens, speculative, [0, 1, 2])
         assert mx.array_equal(output.logits, mx.concatenate(expected, axis=1)).item()
         for actual, parts in zip(output.hidden_states, zip(*expected_features)):
             assert mx.array_equal(actual, mx.concatenate(parts, axis=1)).item()
-        output.gdn_states.commit([retained] * batch)
+        transaction.commit([retained] * batch)
         for index in range(retained):
             mx.eval(model(tokens[:, index : index + 1], cache=reference).logits)
 
@@ -412,10 +407,103 @@ def test_ordinary_linear_attention_uses_temporal_cache_without_adapter(family, s
         assert cache.nbytes == sum(value.nbytes for value in cache.state)
 
 
+@pytest.mark.parametrize("family", ["glm", "deepseek"])
+@pytest.mark.parametrize("batch", [1, 2])
+def test_ordinary_verification_spans_multiple_short_blocks(family, batch):
+    mx.random.seed(2127)
+    if family == "glm":
+        config = _tiny_glm5_next_text_config()
+        config.hc_mult = 4
+        model = GlmLanguageModel(config)
+        capture = dict(return_hidden=True, return_shared_kv=True)
+    else:
+        config = _tiny_deepseek_v4_config()
+        config.compress_ratios = [4]
+        model = DeepseekLanguageModel(config)
+        capture = dict(capture_layer_ids=[0])
+    model.eval()
+    caches = [_make_cache(model, [0] * batch) for _ in range(2)]
+    prefix = mx.broadcast_to((mx.arange(19)[None] % 30) + 1, (batch, 19))
+    for cache in caches:
+        mx.eval(model(prefix, cache=cache).logits)
+    tokens = mx.broadcast_to((mx.arange(13)[None] % 30) + 1, (batch, 13))
+    oracle = deepcopy(caches[0])
+    expected = [model(tokens[:, i : i + 1], cache=oracle, **capture) for i in range(13)]
+    actual, transaction = verify_forward(model, tokens, caches[1], **capture)
+    assert mx.array_equal(
+        actual.logits, mx.concatenate([out.logits for out in expected], axis=1)
+    ).item()
+    for value, parts in zip(
+        actual.hidden_states, zip(*(out.hidden_states for out in expected))
+    ):
+        assert mx.array_equal(value, mx.concatenate(parts, axis=1)).item()
+    transaction.commit([9] * batch)
+    for i in range(9):
+        mx.eval(model(tokens[:, i : i + 1], cache=caches[0]).logits)
+    probe = mx.full((batch, 1), 20)
+    assert mx.array_equal(
+        model(probe, cache=caches[0]).logits, model(probe, cache=caches[1]).logits
+    ).item()
+
+
+@pytest.mark.parametrize("family", ["glm", "deepseek"])
+def test_shared_moe_preserves_expert_gradients_and_unweighted_replacements(family):
+    from mlx_vlm.models.deepseek_v4.language import DeepseekV4MoE
+    from mlx_vlm.models.glm5_next.language import Glm5NextMoE
+    from mlx_vlm.models.switch_layers import SwitchGLU
+
+    if family == "glm":
+        config = _tiny_glm5_next_text_config()
+        module = Glm5NextMoE(config)
+        kwargs = {}
+    else:
+        config = _tiny_deepseek_v4_config()
+        module = DeepseekV4MoE(config, 0)
+        kwargs = dict(input_ids=mx.array([[1, 2, 3]]))
+    inputs = mx.random.normal((1, 3, config.hidden_size))
+    module.gate.freeze()
+    value, grad = nn.value_and_grad(module, lambda m: m(inputs, **kwargs).sum())(module)
+    mx.eval(value, grad)
+    assert mx.isfinite(value).item()
+    module.eval()
+    original = module.switch_mlp
+    expected = module(inputs, **kwargs)
+
+    class ExternalExperts(nn.Module):
+        def __call__(self, x, indices):
+            return original(x, indices)
+
+    module.switch_mlp = ExternalExperts()
+    actual = module(inputs, **kwargs)
+    assert mx.allclose(actual, expected, atol=1e-5).item()
+    assert not isinstance(module.switch_mlp, SwitchGLU)
+
+
+def test_ordinary_forward_failure_aborts_all_verification_parts():
+    cache = ArraysCache(1)
+    initial = mx.zeros((1, 1), dtype=mx.int32)
+    cache[0] = initial
+    calls = []
+
+    def model(tokens, cache):
+        calls.append(tokens.shape[1])
+        cache[0].update_window(0, mx.concatenate([cache[0][0], tokens], axis=1), 1)
+        if len(calls) == 2:
+            raise RuntimeError("second forward failed")
+        return LanguageModelOutput(
+            logits=tokens[..., None], hidden_states=[tokens[..., None]]
+        )
+
+    with pytest.raises(RuntimeError, match="second forward failed"):
+        verify_forward(model, mx.ones((1, 13), dtype=mx.int32), [cache])
+    assert calls == [8, 5]
+    assert cache[0] is initial
+    assert not cache.is_speculating
+
+
 def test_glm_sampler_failure_restores_temporal_and_append_caches():
     model = GlmLanguageModel(_tiny_glm5_next_text_config())
     model.eval()
-    target = bind_speculative_target(model)
     caches = model.make_cache()
     mx.eval(model(mx.array([[1, 2]]), cache=caches).logits)
     initial = list(caches[0].state)
@@ -424,29 +512,23 @@ def test_glm_sampler_failure_restores_temporal_and_append_caches():
         raise RuntimeError("injected sampler failure")
 
     with pytest.raises(RuntimeError, match="injected sampler failure"):
-        target.speculative_verify_logits(mx.array([[3, 4]]), caches, fail)
+        _mtp_verify_target(model, mx.array([[3, 4]]), caches, fail)
     assert not caches[0].is_speculating
     assert all(a is b for a, b in zip(initial, caches[0].state))
     assert caches[1][0].offset == 2
 
 
-def test_glm_adapter_shares_weights_and_preserves_serving_model():
+def test_glm_verification_uses_original_modules_and_preserves_weights():
     model = GlmLanguageModel(_tiny_glm5_next_text_config())
     model.eval()
     inputs = mx.array([[1, 2, 3]])
     before = model(inputs).logits
     mx.eval(before)
     original_projection = model.model.layers[0].self_attn.qkv_proj
-    target = bind_speculative_target(model)
-    assert target.model is not model.model
-    assert target.model.layers[0] is not model.model.layers[0]
-    assert target.model.layers[0].self_attn.qkv_proj.module is original_projection
-    assert type(target.model.layers[0].self_attn) is type(
-        model.model.layers[0].self_attn
-    )
     assert not hasattr(model, "speculative_verify_hidden")
     caches = model.make_cache()
-    hidden, _, transaction = target.speculative_verify_hidden(inputs, caches)
+    result = _mtp_verify_target(model, inputs, caches, None, sample_target_tokens=False)
+    hidden, transaction = result.hidden, result.rollback_state
     mx.eval(hidden)
     transaction.commit(inputs.shape[1])
     after = model(inputs).logits
@@ -472,7 +554,6 @@ def test_glm_block_verification_matches_stepwise_bfloat16(batch):
         ]
     )
     model.eval()
-    target = bind_speculative_target(model)
     caches = [_make_cache(model, left_padding=[0] * batch) for _ in range(2)]
     prefix = mx.array([[1, 2, 3]] * batch)
     for cache in caches:
@@ -480,13 +561,21 @@ def test_glm_block_verification_matches_stepwise_bfloat16(batch):
     tokens = mx.array([[4, 5, 6, 7]] * batch)
     steps = []
     for position in range(tokens.shape[1]):
-        hidden, _, transaction = target.speculative_verify_hidden(
-            tokens[:, position : position + 1], caches[0]
+        result = _mtp_verify_target(
+            model,
+            tokens[:, position : position + 1],
+            caches[0],
+            None,
+            sample_target_tokens=False,
         )
+        hidden, transaction = result.hidden, result.rollback_state
         mx.eval(hidden)
         transaction.commit(1)
         steps.append(hidden)
-    actual, _, transaction = target.speculative_verify_hidden(tokens, caches[1])
+    result = _mtp_verify_target(
+        model, tokens, caches[1], None, sample_target_tokens=False
+    )
+    actual, transaction = result.hidden, result.rollback_state
     mx.eval(actual)
     transaction.commit(tokens.shape[1])
     expected = mx.concatenate(steps, axis=1)

@@ -22,11 +22,11 @@ draft block → target block verification → accept prefix + target token
 | `speculative/dflash.py` | DFlash, DFlash2, and DSpark round loops |
 | `speculative/mtp.py` | Native and assistant MTP round loops |
 | `speculative/eagle3.py` | EAGLE-3 round loops |
-| `speculative/common.py` | Acceptance, sampling state, statistics, and batch safeguards |
+| `speculative/common.py` | Ordinary verification forwards, acceptance, sampling state, and batch safeguards |
 | `models/<family>/language.py` | Normal model traversal and hidden-state capture |
 | `models/cache.py` | Bounded temporal state retention and accepted-state selection |
-| `speculative/targets/` | Bound target views and verification policies |
-| `speculative/ops/` | Decode-equivalent operations and Metal kernels |
+| `models/linear.py`, `models/switch_layers.py`, `models/fast_ops.py` | Shared decode-equivalent operations and fused kernels |
+| `speculative/ops/` | Existing Qwen verifier operations |
 | `speculative/cache_state.py` | Commit and abort of speculative cache transactions |
 
 `draft_kind` selects the round loop, not the checkpoint architecture. Drafter
@@ -37,7 +37,7 @@ draft block → target block verification → accept prefix + target token
 
 1. Inspect the real `config.json` and tensor names. Define the target layers,
    hidden-state inputs, block-size meaning, cache ownership, and quantization
-   before writing the adapter.
+   before implementing the drafter.
 2. Add or reuse a drafter under `speculative/drafters/<family>/`. Implement its
    config normalization, checkpoint sanitization, `draft_block`, cache reset,
    and target compatibility checks.
@@ -48,27 +48,26 @@ draft block → target block verification → accept prefix + target token
    hidden state and may share target K/V.
 5. Use the model's ordinary forward with a shared cache transaction. Stateful
    operators write through the temporal cache interface so rollback works
-   without a second implementation of the layer. Bind a target view under
-   `speculative/targets/` only when numerical execution policies are needed.
+   without a second implementation of the layer. Put numerical dispatch in
+   ordinary shared operators, using the same weights and module instances.
    Keep acceptance decisions and history-retention policy out of model layers.
 6. Add synthetic contract tests, then validate the real target and drafter
    checkpoints before reporting support.
 
-The target hooks used by the round loops are:
+GLM and DeepSeek use `verify_forward` in the shared runtime. It starts one
+cache transaction, calls the normal model, and returns the output and
+transaction. MTP requests final hidden states; DFlash requests its configured
+capture layers. The loop owns sampling, commit, and abort. Neither model needs
+a speculative verifier or rollback method.
 
-- `speculative_verify_hidden(inputs, cache)` returns verified hidden state,
-  shared K/V state, and optional rollback state.
-- `speculative_verify_logits(inputs, cache, sampler)` may additionally return
-  target tokens when hidden-only verification is unavailable.
-- `speculative_verify_dflash_hidden(inputs, cache, capture_layer_ids)` returns
-  captured drafter inputs, final hidden state, and rollback state.
-- `speculative_argmax_from_hidden(hidden)` is an optional greedy fast path that
-  must match sampling from full target logits.
-- `rollback_speculative_cache(caches, rollback_state, accepted, block_size)`
-  commits the accepted prefix and target correction token.
+Normal forward calls expose hidden states through `return_hidden` or
+`capture_layer_ids`. An ordinary `logits_from_hidden` method is useful when the
+captured state needs architecture-specific normalization before the LM head.
+Drafters own reshaping their inputs.
 
-Only implement the hooks a model needs; the shared loops retain generic
-fallbacks where they are safe.
+Existing model hooks remain supported for other architectures during migration;
+new models should use the ordinary forward/cache contract. There is no target
+registry, copied model view, or parameter-wrapper layer.
 
 ## Exact verification
 
@@ -78,9 +77,12 @@ Mamba, gated-delta, convolution, or rotating caches need an explicit state for
 the accepted position. Near an argmax tie, a small numerical change can alter
 the generated sequence.
 
-Use an existing bound target as a reference. Share parameter arrays while keeping
-operation policies private to the view. The normal model owns layer order; the
-verifier must:
+Use repeated ordinary one-token forwards as the reference. Short-block linear,
+expert, and hyperconnection operators preserve that reduction order. Causal
+attention preserves per-position cache ordering; image-prefill masks retain
+their full visibility rules. The runtime splits larger verification blocks at
+`DECODE_BLOCK_SIZE` while keeping one transaction across all parts. Large
+ordinary prefill calls retain their bulk execution path. Verification must:
 
 - produce the same greedy target tokens as autoregressive decoding;
 - advance every cache through the verification block;
@@ -110,7 +112,8 @@ Commit selects each row's accepted state; abort restores the starting state.
 Both release the history. Over-capacity updates and incomplete histories are
 rejected. A new recurrent operator needs to support the shared state-production
 contract once; models using it do not need to know about MTP or draft lengths.
-Numerical projection and attention policies are separate from cache ownership.
+Numerical projection and attention dispatch is part of the ordinary operators,
+independent of cache history retention.
 
 ## Validation and maintenance
 
@@ -146,8 +149,8 @@ checks. Batched stochastic sampling keeps a two-token ceiling by default because
 the extra proposal did not repay its verification cost in that workload.
 Explicit `runtime_block_size` and `--draft-block-size` settings take precedence.
 
-DeepSeek-V4 DSpark defaults to a two-token block (one proposal). Its exact target
-adapter preserves decode arithmetic and physical attention-window order. Larger
+DeepSeek-V4 DSpark defaults to a two-token block (one proposal). Its ordinary
+operators preserve decode arithmetic and physical attention-window order. Larger
 blocks can cost more than their accepted tokens save. The current exact path
 remains slower than baseline on the measured M3 Ultra workloads; use ordinary
 decode when throughput is the priority. Text prefill remains chunked with the

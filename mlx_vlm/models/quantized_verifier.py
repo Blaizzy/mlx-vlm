@@ -510,6 +510,7 @@ def _fused_quantized_moe_hc_expand(
 ) -> Optional[mx.array]:
     if (
         not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
         or not supports_quantization(linear)
         or not isinstance(linear, QuantizedSwitchLinear)
         or "bias" in linear
@@ -643,6 +644,7 @@ def exact_quantized_moe_hc_expand(
             return None
     if (
         not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
         or routed.ndim != 4
         or routed.dtype not in (mx.bfloat16, mx.float16)
         or route_weights.shape != routed.shape[:-1]

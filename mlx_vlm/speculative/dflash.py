@@ -12,8 +12,8 @@ from .common import (
     _speculative_walk_batch,
     _SpeculativeSamplerRNG,
     generation_stream,
+    verify_forward,
 )
-from .targets import bind_speculative_target
 
 
 def _dflash_next_block_size(
@@ -94,6 +94,20 @@ def _reserve_dflash_target_cache(prompt_cache: List[Any], block_size: int) -> No
         mx.async_eval(*pending)
 
 
+def _dflash_verify(lm, inputs, cache, capture_layer_ids):
+    # Older architectures still own their verifier entry point. Models using
+    # ordinary forward calls need only the shared cache transaction.
+    if callable(getattr(lm, "rollback_speculative_cache", None)):
+        output = lm(
+            inputs,
+            cache=cache,
+            capture_layer_ids=capture_layer_ids,
+            speculative_verify=True,
+        )
+        return output, output.gdn_states
+    return verify_forward(lm, inputs, cache, capture_layer_ids=capture_layer_ids)
+
+
 def _dflash_verify_greedy(
     lm: nn.Module,
     verify_input: mx.array,
@@ -116,13 +130,9 @@ def _dflash_verify_greedy(
                 )
             return captured, gdn_states, target_tokens
 
-        verify_out = lm(
-            verify_input,
-            cache=prompt_cache,
-            capture_layer_ids=target_layer_ids,
-            speculative_verify=True,
+        verify_out, gdn_states = _dflash_verify(
+            lm, verify_input, prompt_cache, target_layer_ids
         )
-        gdn_states = verify_out.gdn_states
         return verify_out.hidden_states, gdn_states, sampler(verify_out.logits)
 
     except BaseException:
@@ -296,14 +306,7 @@ def _dflash_rounds(
     for prefill, sampling the first bonus token, and packaging the
     captured hidden states into ``hidden``.
     """
-    lm = bind_speculative_target(
-        model.language_model if hasattr(model, "language_model") else model
-    )
-    if not hasattr(lm, "rollback_speculative_cache"):
-        raise RuntimeError(
-            f"{type(lm).__name__} does not implement rollback_speculative_cache. "
-            "This target does not currently support DFlash speculative decoding."
-        )
+    lm = model.language_model if hasattr(model, "language_model") else model
 
     target_layer_ids = list(draft_model.config.target_layer_ids)
     block_total = _dflash_block_total(draft_model, draft_block_size)
@@ -387,13 +390,9 @@ def _dflash_rounds(
                     )
                     hidden = mx.concatenate(captured, axis=-1)
                 else:
-                    verify_out = lm(
-                        verify_input,
-                        cache=prompt_cache,
-                        capture_layer_ids=target_layer_ids,
-                        speculative_verify=True,
+                    verify_out, gdn_states = _dflash_verify(
+                        lm, verify_input, prompt_cache, target_layer_ids
                     )
-                    gdn_states = verify_out.gdn_states
                     hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
             if greedy_sampling:
                 mx.async_eval(target_tokens, hidden)
@@ -472,13 +471,7 @@ def _dflash_rounds_batch(
     token for sequence ``i`` (or ``None`` if that sequence has nothing
     to emit this step).
     """
-    lm = bind_speculative_target(
-        model.language_model if hasattr(model, "language_model") else model
-    )
-    if not hasattr(lm, "rollback_speculative_cache"):
-        raise RuntimeError(
-            f"{type(lm).__name__} does not implement " "rollback_speculative_cache."
-        )
+    lm = model.language_model if hasattr(model, "language_model") else model
 
     B = first_bonus.shape[0]
     row_ids = list(range(B)) if row_ids is None else list(row_ids)
@@ -584,13 +577,9 @@ def _dflash_rounds_batch(
                     )
                     hidden_full = mx.concatenate(captured, axis=-1)
                 else:
-                    verify_out = lm(
-                        verify_input,
-                        cache=prompt_cache,
-                        capture_layer_ids=target_layer_ids,
-                        speculative_verify=True,
+                    verify_out, gdn_states = _dflash_verify(
+                        lm, verify_input, prompt_cache, target_layer_ids
                     )
-                    gdn_states = verify_out.gdn_states
                     hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
             if greedy_sampling:
                 mx.async_eval(target_tokens, hidden_full)

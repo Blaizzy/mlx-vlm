@@ -4,22 +4,19 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
+from mlx.nn.layers.distributed import shard_inplace, shard_linear
 from mlx.utils import tree_flatten
 
-from ...speculative.cache_state import (
-    rollback_speculative_cache as rollback_cache_transaction,
-)
-from ...speculative.cache_state import start_speculative_cache
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import BatchPoolingCache, CacheList, PoolingCache, RotatingKVCache
+from ..cache import CacheList, PoolingCache, RotatingKVCache
+from ..linear import DECODE_BLOCK_SIZE, linear, tokenwise
 from ..mla import MultiLinear
 from ..pipeline import PipelineMixin
-from ..switch_layers import SwitchGLU
+from ..switch_layers import MoE, SwitchGLU
 from .config import ModelConfig
 from .hisa_kernel import hisa_select
 from .hyper_connection import HyperConnection, HyperHead
@@ -493,6 +490,9 @@ class MoEGate(nn.Module):
             self.bias_vl = mx.zeros((self.num_experts,), dtype=mx.float32)
 
     def __call__(self, x: mx.array, input_ids: Optional[mx.array] = None):
+        if 1 < x.shape[1] <= DECODE_BLOCK_SIZE and not self.training:
+            args = () if input_ids is None else (input_ids,)
+            return tokenwise(self, x, *args)
         logits = x @ self.weight.T
 
         if self.hash:
@@ -562,12 +562,15 @@ class DeepseekV4MLP(nn.Module):
         self.swiglu_limit = swiglu_limit
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(
-            _limited_swiglu(self.gate_proj(x), self.up_proj(x), self.swiglu_limit)
+        return linear(
+            self.down_proj,
+            _limited_swiglu(
+                linear(self.gate_proj, x), linear(self.up_proj, x), self.swiglu_limit
+            ),
         )
 
 
-class DeepseekV4MoE(nn.Module):
+class DeepseekV4MoE(MoE):
     def __init__(self, config: ModelConfig, layer_idx: int):
         super().__init__()
         self.config = config
@@ -584,19 +587,6 @@ class DeepseekV4MoE(nn.Module):
             swiglu_limit=config.swiglu_limit,
         )
         self.sharding_group = None
-
-    def __call__(self, x: mx.array, input_ids: mx.array) -> mx.array:
-        if self.sharding_group is not None:
-            x = sum_gradients(self.sharding_group)(x)
-
-        inds, scores = self.gate(x, input_ids)
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None].astype(y.dtype)).sum(-2)
-        y = y + self.shared_experts(x)
-
-        if self.sharding_group is not None:
-            y = mx.distributed.all_sum(y, group=self.sharding_group)
-        return y
 
 
 class Compressor(nn.Module):
@@ -837,6 +827,7 @@ class LocalAttention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         position_offset: Optional[Union[int, mx.array]] = None,
+        causal: bool = False,
     ) -> mx.array:
         B, L, _ = x.shape
         local_cache = cache[0] if self.compress_ratio and cache is not None else cache
@@ -847,20 +838,52 @@ class LocalAttention(nn.Module):
         )
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
-        q_residual = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q_residual).reshape(B, L, self.n_heads, self.head_dim)
+        q_residual = self.q_norm(linear(self.wq_a, x))
+        q = linear(self.wq_b, q_residual).reshape(B, L, self.n_heads, self.head_dim)
         q = mx.fast.rms_norm(q, None, self.config.rms_norm_eps)
         q = self.rope(q.transpose(0, 2, 1, 3), offset)
-        kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
+        kv = self.kv_norm(linear(self.wkv, x)).reshape(B, 1, L, self.head_dim)
         kv = self.rope(kv, offset)
-        out = self._attend(x, q, kv, q_residual, mask, cache, offset)
+        if (
+            causal
+            and cache is not None
+            and 1 < L <= DECODE_BLOCK_SIZE
+            and not self.training
+        ):
+            outputs = []
+            for index in range(L):
+                part = mx.contiguous(x[:, index : index + 1])
+                part_mask = create_attention_mask(
+                    part,
+                    local_cache,
+                    window_size=self.config.sliding_window,
+                    return_array=True,
+                )
+                output = self._attend(
+                    part,
+                    mx.contiguous(q[:, :, index : index + 1]),
+                    mx.contiguous(kv[:, :, index : index + 1]),
+                    mx.contiguous(q_residual[:, index : index + 1]),
+                    part_mask,
+                    cache,
+                    offset + index,
+                )
+                mx.async_eval(output)
+                outputs.append(output)
+            out = mx.concatenate(outputs, axis=2)
+        else:
+            out = self._attend(x, q, kv, q_residual, mask, cache, offset)
         out = self.rope(out, offset, inverse=True)
 
         out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
         out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
-        out = self.wo_a(out)
+        out = (
+            tokenwise(self.wo_a, out, axis=2)
+            if 1 < L <= DECODE_BLOCK_SIZE and not self.training
+            else self.wo_a(out)
+        )
         out = out.transpose(0, 2, 1, 3).flatten(-2)
-        out = self.wo_b(out)
+        out = linear(self.wo_b, out)
 
         if self.sharding_group is not None:
             out = mx.distributed.all_sum(out, group=self.sharding_group)
@@ -1027,6 +1050,7 @@ class DeepseekV4Block(nn.Module):
         cache: Optional[Any],
         input_ids: mx.array,
         position_offset: Optional[Union[int, mx.array]] = None,
+        causal: bool = False,
     ) -> mx.array:
         h = self.attn_hc.apply_branch(
             h,
@@ -1035,6 +1059,7 @@ class DeepseekV4Block(nn.Module):
             mask=mask,
             cache=cache,
             position_offset=position_offset,
+            causal=causal,
         )
         return self.ffn_hc.apply_branch(h, self.ffn_norm, self.ffn, input_ids)
 
@@ -1113,7 +1138,7 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         for local_idx, (layer, layer_cache) in enumerate(
             zip(self.pipeline_layers, cache)
         ):
-            h = layer(h, mask, layer_cache, inputs)
+            h = layer(h, mask, layer_cache, inputs, causal=not has_image_tokens)
             if capture_set is not None and (self.start_idx + local_idx) in capture_set:
                 # DSpark taps the mean over the hyper-connection copies.
                 capture_sink.append(h.mean(axis=2))
@@ -1190,14 +1215,15 @@ class LanguageModel(nn.Module):
             capture_layer_ids=capture_layer_ids,
             capture_sink=capture_sink,
         )
-        logits = None if skip_logits else self.lm_head(out)
+        logits = None if skip_logits else linear(self.lm_head, out)
         return LanguageModelOutput(
             logits=logits,
             hidden_states=capture_sink if capture_sink is not None else hidden_sink,
             shared_kv_states={} if return_shared_kv else None,
         )
 
-    def _target_hidden(self, hidden: mx.array) -> mx.array:
+    def logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        """Project captured hyperconnection states through the ordinary readout."""
         if (
             hidden.ndim == 3
             and hidden.shape[-1] == self.args.hc_mult * self.args.hidden_size
@@ -1205,63 +1231,10 @@ class LanguageModel(nn.Module):
             hidden = hidden.reshape(*hidden.shape[:-1], self.args.hc_mult, -1)
         if hidden.ndim != 4:
             raise ValueError(
-                "DeepSeek-V4 speculative hidden must have shape "
+                "DeepSeek-V4 hidden states must have shape "
                 "[batch, tokens, hc_mult, hidden_size]."
             )
-        return hidden
-
-    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
-        hidden = self._target_hidden(hidden)
-        return self.lm_head(self.model.norm(self.model.hc_head(hidden)))
-
-    def speculative_draft_hidden(self, hidden: mx.array) -> mx.array:
-        return self._target_hidden(hidden)
-
-    def _speculative_verify(self, inputs: mx.array, cache, sampler=None):
-        sample_logits = sampler is not None
-        transaction = start_speculative_cache(
-            cache or [],
-            inputs.shape[1],
-            cache_types=(PoolingCache, BatchPoolingCache),
-        )
-        try:
-            out = self(
-                inputs,
-                cache=cache,
-                return_hidden=True,
-                skip_logits=not sample_logits,
-                skip_final_norm=not sample_logits,
-            )
-            hidden = out.hidden_states[-1]
-            if not sample_logits:
-                return hidden, {}, transaction
-
-            return hidden, {}, transaction, sampler(out.logits)
-        except BaseException:
-            transaction.abort()
-            raise
-
-    def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
-        # Greedy MTP verification is faster with one batched LM-head projection
-        # than with per-position deferred projections on Metal.
-        return self._speculative_verify(inputs, cache, sampler)
-
-    def speculative_verify_hidden(self, inputs: mx.array, cache):
-        return self._speculative_verify(inputs, cache)
-
-    def rollback_speculative_cache(
-        self,
-        caches: List[Any],
-        gdn_states: Any,
-        accepted,
-        block_size: int,
-    ) -> int:
-        return rollback_cache_transaction(
-            caches,
-            gdn_states,
-            accepted,
-            block_size,
-        )
+        return linear(self.lm_head, self.model.norm(self.model.hc_head(hidden)))
 
     @property
     def layers(self):
