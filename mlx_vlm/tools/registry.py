@@ -70,21 +70,49 @@ SPECS: Tuple[ParserSpec, ...] = (
 _BY_NAME = {spec.name: spec for spec in SPECS}
 
 
+def _template_text(chat_template) -> Optional[str]:
+    """Resolve a tokenizer ``chat_template`` to the string used for tool-call
+    detection.
+
+    A tokenizer may carry several named templates -- transformers exposes them
+    as a dict ``{name: template}`` (or, from config, a list of
+    ``{"name", "template"}``). The ``tool_use`` variant is the one rendered when
+    tools are passed, so it is authoritative for detecting the tool-call format;
+    fall back to ``default`` and then any variant.
+    """
+    if isinstance(chat_template, str):
+        return chat_template
+    if isinstance(chat_template, list):
+        chat_template = {
+            entry.get("name"): entry.get("template")
+            for entry in chat_template
+            if isinstance(entry, dict)
+        }
+    if isinstance(chat_template, dict):
+        for key in ("tool_use", "default"):
+            if isinstance(chat_template.get(key), str):
+                return chat_template[key]
+        return next((v for v in chat_template.values() if isinstance(v, str)), None)
+    return None
+
+
 def _infer_tool_parser(chat_template, override: Optional[str] = None) -> Optional[str]:
     """Return the tool parser name for a chat template, or ``None``.
 
-    When ``override`` is given it is validated against :data:`SPECS` and
-    returned as-is, skipping template inference.
+    ``chat_template`` may be a plain string or a multi-variant dict/list (see
+    :func:`_template_text`). When ``override`` is given it is validated against
+    :data:`SPECS` and returned as-is, skipping template inference.
     """
     if override is not None:
         if override not in _BY_NAME:
             raise ValueError(f"Unknown tool parser override: {override!r}")
         return override
 
-    if not isinstance(chat_template, str):
+    text = _template_text(chat_template)
+    if text is None:
         return None
 
-    matches = [spec for spec in SPECS if spec.matches(chat_template)]
+    matches = [spec for spec in SPECS if spec.matches(text)]
     if not matches:
         logger.debug("No tool parser matched the chat template.")
         return None
