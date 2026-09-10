@@ -717,6 +717,15 @@ def get_class_predicate(skip_vision=False, weights=None, quantization_config=Non
     return predicate
 
 
+def _language_model_quantization_config(model):
+    """The model's own make_quantization_config, if its language module defines one."""
+    language_model = getattr(model, "language_model", None)
+    if language_model is None:
+        return None
+    module = importlib.import_module(type(language_model).__module__)
+    return getattr(module, "make_quantization_config", None)
+
+
 def get_model_and_args(config: dict, model_path: Optional[Path] = None):
     """Resolve a model package and its normalized model type.
 
@@ -1036,11 +1045,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             elif (
                 quant_method == "modelopt"
                 and quantization_config.get("quant_algo") == "MXFP8"
-                and config.get("model_type") == "hy_v4"
             ):
-                from .models.hy_v4.language import make_quantization_config
-
-                quantization = make_quantization_config(model)
+                make_config = _language_model_quantization_config(model)
+                if make_config is not None:
+                    quantization = make_config(model)
             elif quant_method in ("awq", "gptq"):
                 logging.warning(
                     "Quantization method %s is not supported in mlx_vlm.load_model()",
