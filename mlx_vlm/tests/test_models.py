@@ -20020,3 +20020,615 @@ class TestSpark2_5Model(unittest.TestCase):
         weights = {"model.embedding.weight": mx.zeros((128, 64))}
         sanitized = model.sanitize(weights)
         self.assertIn("language_model.model.embedding.weight", sanitized)
+
+
+class TestDeepseekV41Basics(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            hidden_size=32,
+            vision_hidden_size=32,
+            vision_num_heads=4,
+            vision_num_layers=1,
+            vision_intermediate_size=16,
+            vision_patch_size=2,
+            hc_mult=2,
+            engram_layer_ids=[1],
+            engram_num_embeddings=[1024],
+            engram_max_ngram_size=3,
+            engram_vocab_size=512,
+            engram_n_heads=2,
+            engram_head_dim=8,
+            engram_compressed_vocab_size=7,
+        )
+
+    def test_deepseek_v41_config_defaults(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = deepseek_v41.ModelConfig()
+        self.assertEqual(config.model_type, "deepseek_v41")
+        self.assertEqual(
+            len(config.compress_ratios),
+            config.num_hidden_layers + config.num_nextn_predict_layers,
+        )
+        self.assertEqual(config.compress_ratios[2], 2)
+        self.assertEqual(config.compress_ratios[20], 1)
+        self.assertEqual(config.compress_ratios[40:], [0, 0, 0])
+        self.assertEqual(
+            config.kv_source_layer_ids,
+            [2, 8, 14, 20],
+        )
+
+        loaded = deepseek_v41.ModelConfig.from_dict(
+            {"model_type": "deepseek_v41", "eos_token_id": 1}
+        )
+        self.assertEqual(loaded.eos_token_id, 1)
+
+    def test_deepseek_v41_vision_shapes(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        vit = deepseek_v41.ViT(config)
+        mx.eval(vit.parameters())
+        out = vit(mx.random.normal((36, 12)), 6, 6)
+        mx.eval(out)
+        self.assertEqual(out.shape, (36, 32))
+
+        aligner = deepseek_v41.Aligner(config)
+        mx.eval(aligner.parameters())
+        emb = aligner(mx.random.normal((36, 32)), 6, 6)
+        mx.eval(emb)
+        self.assertEqual(emb.shape, (4, 32))
+
+    def test_deepseek_v41_engram_shapes(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        layout = deepseek_v41.EngramLayout.from_config(config)
+        self.assertIsNotNone(layout)
+        self.assertEqual(len(layout.primes), 1)
+
+        eng = deepseek_v41.Engram(config, 1, layout)
+        mx.eval(eng.parameters())
+        x = mx.random.normal((1, 3, 2, 32))
+        hash_ids = mx.zeros((1, 3, (3 - 1) * 2), dtype=mx.int32)
+        y = eng(x, hash_ids)
+        mx.eval(y)
+        self.assertEqual(y.shape, x.shape)
+
+    def test_deepseek_v41_dspark_heads(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = deepseek_v41.ModelConfig(
+            hidden_size=32, vocab_size=64, dspark_markov_rank=8
+        )
+        markov = deepseek_v41.DSparkMarkovHead(config)
+        mx.eval(markov.parameters())
+        token_ids = mx.array([[1, 2, 3]])
+        logits, embed = markov(token_ids)
+        mx.eval(logits, embed)
+        self.assertEqual(logits.shape, (1, 3, 64))
+        self.assertEqual(embed.shape, (1, 3, 8))
+
+        confidence = deepseek_v41.DSparkConfidenceHead(config)
+        mx.eval(confidence.parameters())
+        scores = confidence(mx.random.normal((1, 3, 32)), mx.random.normal((1, 3, 8)))
+        mx.eval(scores)
+        self.assertEqual(scores.shape, (1, 3))
+        self.assertEqual(scores.dtype, mx.float32)
+
+    def test_deepseek_v41_dspark_topk_idxs(self):
+        from mlx_vlm.models import deepseek_v41
+
+        idxs = deepseek_v41.get_dspark_topk_idxs(128, 2, 5, 10)
+        mx.eval(idxs)
+        self.assertEqual(idxs.shape, (2, 5, 11 + 5))
+        self.assertTrue(bool(mx.all(idxs[0, 0, :11] == mx.arange(11))))
+        with self.assertRaises(AssertionError):
+            deepseek_v41.get_dspark_topk_idxs(128, 2, 5, 0)
+
+
+class TestDeepseekV41Indexer(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            num_hidden_layers=3,
+            compress_ratios=[2, 2, 2],
+            hidden_size=16,
+            head_dim=16,
+            q_lora_rank=8,
+            index_n_heads=2,
+            index_head_dim=8,
+            qk_rope_head_dim=4,
+            index_topk=4,
+            kv_source_layer_ids=[0],
+            candidate_source_layer_id=1,
+            candidate_topk_blocks=4,
+            candidate_block_size=2,
+        )
+
+    def test_deepseek_v41_indexer_prefill_decode(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        indexer = deepseek_v41.Indexer(config, 0)
+        self.assertTrue(indexer.owns_k)
+        mx.eval(indexer.parameters())
+        shared = deepseek_v41.SharedIndexState()
+
+        x = mx.random.normal((1, 4, 16))
+        qr = mx.random.normal((1, 4, 8))
+        latent = mx.random.normal((1, 2, 16))
+        idxs = indexer(x, qr, latent, 0, 0, shared)
+        mx.eval(idxs)
+        self.assertEqual(idxs.shape, (1, 4, 2))
+        self.assertEqual(idxs[0, 0].tolist(), [-1, -1])
+        self.assertEqual(idxs[0, 1].tolist(), [0, -1])
+        self.assertIsNotNone(shared.index_k)
+
+        x1 = mx.random.normal((1, 1, 16))
+        qr1 = mx.random.normal((1, 1, 8))
+        idxs1 = indexer(x1, qr1, None, 4, 0, shared)
+        mx.eval(idxs1)
+        self.assertEqual(idxs1.shape, (1, 1, 2))
+
+    def test_deepseek_v41_indexer_two_level(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        source = deepseek_v41.Indexer(config, 1)
+        self.assertTrue(source.is_candidate_source)
+        consumer = deepseek_v41.Indexer(config, 2)
+        self.assertTrue(consumer.uses_candidates)
+        mx.eval(source.parameters(), consumer.parameters())
+        shared = deepseek_v41.SharedIndexState()
+
+        seed = deepseek_v41.Indexer(config, 0)
+        mx.eval(seed.parameters())
+        x = mx.random.normal((1, 4, 16))
+        qr = mx.random.normal((1, 4, 8))
+        seed(x, qr, mx.random.normal((1, 2, 16)), 0, 0, shared)
+        source(x, qr, None, 0, 0, shared)
+        self.assertIsNotNone(shared.candidates)
+        idxs = consumer(x, qr, None, 0, 0, shared)
+        mx.eval(idxs)
+        self.assertEqual(idxs.shape, (1, 4, 2))
+
+
+class TestDeepseekV41SharedPrimitives(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            hidden_size=16,
+            moe_intermediate_size=8,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+        )
+
+    def test_deepseek_v41_moe_gate_vl_bias(self):
+        from mlx_vlm.models import deepseek_v41
+
+        gate = deepseek_v41.DeepseekV41MoEGate(self._tiny_config())
+        mx.eval(gate.parameters())
+        gate.weight = mx.broadcast_to(mx.arange(4, dtype=mx.float32)[:, None], (4, 16))
+        gate.bias_vl = mx.array([0.0, 0.0, 0.0, 1e6], dtype=mx.float32)
+
+        x = mx.random.normal((1, 3, 16))
+        mask = mx.array([[False, True, False]])
+        inds, weights = gate(x, mask)
+        mx.eval(inds, weights)
+        self.assertEqual(inds.shape, (1, 3, 2))
+        self.assertEqual(weights.shape, (1, 3, 2))
+        self.assertIn(3, inds[0, 1].tolist())
+        self.assertTrue(
+            bool(mx.allclose(weights.sum(-1), mx.full((1, 3), 1.5), atol=1e-5))
+        )
+
+    def test_deepseek_v41_moe_forward(self):
+        from mlx_vlm.models import deepseek_v41
+
+        moe = deepseek_v41.DeepseekV41MoE(self._tiny_config())
+        mx.eval(moe.parameters())
+        x = mx.random.normal((1, 3, 16))
+        y = moe(x)
+        mx.eval(y)
+        self.assertEqual(y.shape, (1, 3, 16))
+        self.assertTrue(bool(mx.all(mx.isfinite(y))))
+        y_masked = moe(x, mx.array([[True, False, True]]))
+        mx.eval(y_masked)
+        self.assertEqual(y_masked.shape, (1, 3, 16))
+
+    def test_deepseek_v41_rope_yarn_dict(self):
+        from mlx_vlm.models.deepseek_v4.language import DeepseekV4RoPE
+
+        rope = DeepseekV4RoPE(
+            64,
+            10000.0,
+            {
+                "rope_type": "yarn",
+                "factor": 16,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "original_max_position_embeddings": 65536,
+            },
+        )
+        x = mx.random.uniform(shape=(1, 2, 3, 64))
+        y = rope(x, offset=1)
+        y_inv = rope(y, offset=1, inverse=True)
+        self.assertTrue(mx.allclose(y_inv, x, rtol=1e-5, atol=1e-5))
+
+
+class TestDeepseekV41Compressor(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            num_hidden_layers=2,
+            compress_ratios=[2, 1],
+            hidden_size=16,
+            head_dim=8,
+        )
+
+    def test_deepseek_v41_compressor_prefill_decode(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        comp = deepseek_v41.Compressor(config, 0)
+        mx.eval(comp.parameters())
+
+        latent = comp(mx.random.normal((1, 5, 16)), 0)
+        mx.eval(latent)
+        self.assertEqual(latent.shape, (1, 2, 8))
+
+        step = comp(mx.random.normal((1, 1, 16)), 5)
+        mx.eval(step)
+        self.assertEqual(step.shape, (1, 1, 8))
+
+    def test_deepseek_v41_compressor_holds_partial_group(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        comp = deepseek_v41.Compressor(config, 0)
+        mx.eval(comp.parameters())
+
+        self.assertIsNone(comp(mx.random.normal((1, 1, 16)), 2))
+        step = comp(mx.random.normal((1, 1, 16)), 3)
+        mx.eval(step)
+        self.assertEqual(step.shape, (1, 1, 8))
+
+    def test_deepseek_v41_compressor_ratio_one(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        comp = deepseek_v41.Compressor(config, 1)
+        mx.eval(comp.parameters())
+        self.assertFalse(hasattr(comp, "wgate"))
+
+        out = comp(mx.random.normal((1, 4, 16)), 0)
+        mx.eval(out)
+        self.assertEqual(out.shape, (1, 4, 8))
+
+
+class TestDeepseekV41Attention(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            num_hidden_layers=4,
+            compress_ratios=[2, 2, 1, 0],
+            hidden_size=16,
+            num_attention_heads=2,
+            head_dim=8,
+            qk_rope_head_dim=4,
+            q_lora_rank=8,
+            o_lora_rank=4,
+            o_groups=1,
+            sliding_window=4,
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=4,
+            kv_source_layer_ids=[0],
+            index_source_layer_ids=[0, 1, 2],
+            candidate_source_layer_id=1,
+            candidate_topk_blocks=2,
+            candidate_block_size=2,
+        )
+
+    def test_deepseek_v41_attention_modes(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        full = deepseek_v41.DeepseekV41Attention(config, 0)
+        reindex = deepseek_v41.DeepseekV41Attention(config, 1)
+        consumer = deepseek_v41.DeepseekV41Attention(config, 2)
+        local = deepseek_v41.DeepseekV41Attention(config, 3)
+        self.assertEqual(
+            [a.mode for a in (full, reindex, consumer, local)],
+            ["full", "reindex", "reindex", "local"],
+        )
+        self.assertIsNotNone(full.compressor)
+        self.assertIsNone(reindex.compressor)
+        self.assertIsNotNone(reindex.indexer)
+        self.assertIsNone(local.indexer)
+        self.assertTrue(reindex.indexer.is_candidate_source)
+        self.assertTrue(consumer.indexer.uses_candidates)
+
+    def test_deepseek_v41_attention_prefill_decode(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        layers = [deepseek_v41.DeepseekV41Attention(config, i) for i in range(4)]
+        for layer in layers:
+            mx.eval(layer.parameters())
+        shared = deepseek_v41.SharedIndexState()
+
+        x = mx.random.normal((1, 5, 16))
+        for layer in layers:
+            x = layer(x, 0, shared)
+            mx.eval(x)
+            self.assertEqual(x.shape, (1, 5, 16))
+        self.assertIsNotNone(shared.compress_kv)
+        self.assertIsNotNone(shared.topk_idxs)
+        self.assertIsNotNone(shared.candidates)
+        self.assertTrue(bool(mx.all(mx.isfinite(x))))
+
+        x1 = mx.random.normal((1, 1, 16))
+        for layer in layers:
+            x1 = layer(x1, 5, shared)
+            mx.eval(x1)
+            self.assertEqual(x1.shape, (1, 1, 16))
+        self.assertTrue(bool(mx.all(mx.isfinite(x1))))
+
+
+class TestDeepseekV41Block(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            num_hidden_layers=4,
+            compress_ratios=[2, 2, 1, 0],
+            hidden_size=16,
+            num_attention_heads=2,
+            head_dim=8,
+            qk_rope_head_dim=4,
+            q_lora_rank=8,
+            o_lora_rank=4,
+            o_groups=1,
+            sliding_window=4,
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=4,
+            kv_source_layer_ids=[0],
+            index_source_layer_ids=[0, 1],
+            candidate_source_layer_id=1,
+            candidate_topk_blocks=2,
+            candidate_block_size=2,
+            moe_intermediate_size=8,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            engram_layer_ids=[1],
+            engram_num_embeddings=[256],
+            engram_max_ngram_size=3,
+            engram_vocab_size=512,
+            engram_n_heads=2,
+            engram_head_dim=8,
+        )
+
+    def test_deepseek_v41_block_prefill_decode(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        layout = deepseek_v41.EngramLayout.from_config(config)
+        block0 = deepseek_v41.DeepseekV41Block(config, 0, layout)
+        block1 = deepseek_v41.DeepseekV41Block(config, 1, layout)
+        self.assertIsNone(block0.engram)
+        self.assertIsNotNone(block1.engram)
+        for block in (block0, block1):
+            mx.eval(block.parameters())
+        shared = deepseek_v41.SharedIndexState()
+
+        pre_mix = deepseek_v41.make_identity_pre_mix(1, 3, 2)
+        self.assertEqual(pre_mix.shape, (1, 3, 2))
+        self.assertTrue(bool(mx.all(pre_mix[..., 0] == 1)))
+
+        h = mx.random.normal((1, 3, 2, 16))
+        h, pre_mix = block0(h, 0, pre_mix, None, shared)
+        mx.eval(h, pre_mix)
+        self.assertEqual(h.shape, (1, 3, 2, 16))
+        self.assertEqual(pre_mix.shape, (1, 3, 2))
+
+        hashes = mx.zeros((1, 3, 4), dtype=mx.int32)
+        h = block1.engram(h, hashes, None)
+        mx.eval(h)
+        h, pre_mix = block1(h, 0, pre_mix, None, shared)
+        mx.eval(h, pre_mix)
+        self.assertEqual(h.shape, (1, 3, 2, 16))
+        self.assertTrue(bool(mx.all(mx.isfinite(h))))
+
+        hd = mx.random.normal((1, 1, 2, 16))
+        pre_d = deepseek_v41.make_identity_pre_mix(1, 1, 2)
+        hd, pre_d = block0(hd, 3, pre_d, None, shared)
+        mx.eval(hd, pre_d)
+        hashes_d = mx.zeros((1, 1, 4), dtype=mx.int32)
+        hd = block1.engram(hd, hashes_d, None)
+        hd, _ = block1(hd, 3, pre_d, None, shared)
+        mx.eval(hd)
+        self.assertEqual(hd.shape, (1, 1, 2, 16))
+        self.assertTrue(bool(mx.all(mx.isfinite(hd))))
+
+
+class TestDeepseekV41EndToEnd(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            num_hidden_layers=2,
+            compress_ratios=[2, 1],
+            hidden_size=16,
+            vocab_size=64,
+            num_attention_heads=2,
+            head_dim=8,
+            qk_rope_head_dim=4,
+            q_lora_rank=8,
+            o_lora_rank=4,
+            o_groups=1,
+            sliding_window=4,
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=4,
+            kv_source_layer_ids=[0],
+            index_source_layer_ids=[0, 1],
+            candidate_source_layer_id=1,
+            candidate_topk_blocks=2,
+            candidate_block_size=2,
+            moe_intermediate_size=8,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            engram_layer_ids=[1],
+            engram_num_embeddings=[256],
+            engram_max_ngram_size=3,
+            engram_vocab_size=512,
+            engram_n_heads=2,
+            engram_head_dim=8,
+            dspark_target_layer_ids=[1],
+            dspark_block_size=2,
+        )
+
+    def test_deepseek_v41_full_forward(self):
+        from mlx_vlm.models import deepseek_v41
+
+        model = deepseek_v41.Model(self._tiny_config())
+        mx.eval(model.parameters())
+
+        cache = model.make_cache()
+        ids = mx.array([[1, 2, 3]])
+        out = model.language_model(ids, cache=cache)
+        mx.eval(out.logits)
+        self.assertEqual(out.logits.shape, (1, 3, 64))
+        self.assertTrue(bool(mx.all(mx.isfinite(out.logits))))
+        self.assertIsNotNone(out.hidden_states)
+        self.assertEqual(out.hidden_states[0].shape, (1, 3, 16))
+
+        step = model.language_model(mx.array([[4]]), cache=cache)
+        mx.eval(step.logits)
+        self.assertEqual(step.logits.shape, (1, 1, 64))
+
+        fresh = model.make_cache()
+        again = model.language_model(ids, cache=fresh)
+        mx.eval(again.logits)
+        self.assertTrue(bool(mx.allclose(out.logits, again.logits)))
+
+    def test_deepseek_v41_model_wrapper(self):
+        from mlx_vlm.models import deepseek_v41
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        model = deepseek_v41.Model(self._tiny_config())
+        mx.eval(model.parameters())
+        self.assertEqual(len(model.layers), 2)
+
+        result = model.get_input_embeddings(mx.array([[1, 2, 3]]))
+        self.assertIsInstance(result, InputEmbeddingsFeatures)
+        self.assertEqual(result.inputs_embeds.shape, (1, 3, 16))
+
+        sanitized = model.sanitize(
+            {
+                "model.embed_tokens.weight": mx.zeros((4, 4)),
+                "lm_head.weight": mx.zeros((4, 4)),
+                "other.weight": mx.zeros((4, 4)),
+            }
+        )
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        self.assertIn("language_model.lm_head.weight", sanitized)
+        self.assertIn("other.weight", sanitized)
+
+
+class TestDeepseekV41Processing(unittest.TestCase):
+    @staticmethod
+    def _image_record(width=160, height=112):
+        import io
+
+        import numpy as np
+        from PIL import Image
+
+        pixels = (np.random.rand(height, width, 3) * 255).astype(np.uint8)
+        buffer = io.BytesIO()
+        Image.fromarray(pixels).save(buffer, format="PNG")
+        return {"data": buffer.getvalue()}
+
+    def test_deepseek_v41_plan_image_grid(self):
+        from mlx_vlm.models import deepseek_v41
+        from mlx_vlm.models.deepseek_v41 import processing_deepseek_v41 as proc
+
+        config = deepseek_v41.ModelConfig()
+        n_llm_h, n_llm_w, best_h, best_w = proc.plan_image_grid(800, 600, config)
+        self.assertLessEqual(
+            proc.num_image_tokens(n_llm_h, n_llm_w), config.vision_max_image_tokens
+        )
+        self.assertEqual(best_h % 14, 0)
+        self.assertEqual(best_w % 14, 0)
+
+        tiny = proc.plan_image_grid(32, 32, config)
+        self.assertGreater(tiny[2] * tiny[3], 32 * 32)
+
+    def test_deepseek_v41_load_image(self):
+        from mlx_vlm.models import deepseek_v41
+        from mlx_vlm.models.deepseek_v41 import processing_deepseek_v41 as proc
+
+        config = deepseek_v41.ModelConfig()
+        patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = proc.load_image(
+            self._image_record(), config
+        )
+        mx.eval(patches)
+        self.assertEqual(patches.shape, (n_vit_h * n_vit_w, 3, 14, 14))
+        self.assertEqual(
+            len(proc.image_token_types(n_llm_h, n_llm_w)),
+            proc.num_image_tokens(n_llm_h, n_llm_w),
+        )
+
+    def test_deepseek_v41_prepare_vl_inputs(self):
+        from mlx_vlm.models import deepseek_v41
+        from mlx_vlm.models.deepseek_v41 import processing_deepseek_v41 as proc
+
+        config = deepseek_v41.ModelConfig()
+        image_id = config.image_token_id
+        tokens, types, inputs = proc.prepare_vl_inputs(
+            [1, image_id, 2], [self._image_record()], config
+        )
+        self.assertEqual(len(inputs), 1)
+        self.assertEqual(len(tokens), len(types))
+        self.assertEqual(tokens[0], 1)
+        self.assertEqual(tokens[-1], 2)
+        self.assertIn(proc.TEXT, types)
+        self.assertIn(proc.IMAGE, types)
+        self.assertIn(proc.IMAGE_START, types)
+        self.assertNotIn(image_id, tokens[:1] + tokens[-1:])
+        with self.assertRaises(ValueError):
+            proc.prepare_vl_inputs([1, image_id, 2], [], config)
+
+    def test_deepseek_v41_chat_template_markers(self):
+        from mlx_vlm.models.deepseek_v41 import processing_deepseek_v41 as proc
+
+        template = proc.DEFAULT_CHAT_TEMPLATE
+        for marker in (
+            "<｜begin▁of▁sentence｜>",
+            "<｜User｜>",
+            "<｜Assistant｜>",
+            "<｜end▁of▁sentence｜>",
+            "<｜Assistant｜></think>",
+        ):
+            self.assertIn(marker, template)
