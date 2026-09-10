@@ -17181,6 +17181,25 @@ class TestMoEOffload(unittest.TestCase):
         modes = {mode for _, _, mode in result["experts"][3]}
         self.assertEqual(modes, {"STACK_FUSED", "STACK"})
 
+    def test_plan_partitions_nested_switch_glu_experts(self):
+        """Gemma 4's MoE wraps SwitchGLU inside an Experts module
+        (experts.switch_glu.{gate,up,down}_proj), so the anchor regex needs
+        to tolerate an optional .switch_glu segment before matching."""
+        from mlx_vlm.moe_offload import plan
+
+        names = [
+            "language_model.model.layers.0.experts.switch_glu.gate_proj.weight",
+            "language_model.model.layers.0.experts.switch_glu.up_proj.weight",
+            "language_model.model.layers.0.experts.switch_glu.down_proj.weight",
+        ]
+        result = plan(names)
+
+        self.assertEqual(result["layers"], [0])
+        stacked_entries = result["experts"][0]
+        self.assertEqual(len(stacked_entries), 3)
+        modes = {mode for _, _, mode in stacked_entries}
+        self.assertEqual(modes, {"STACK"})
+
     def test_expert_store_get_is_thread_safe(self):
         """get() reads only immutable post-init state (no LRU cache -- removed
         after measuring a 0% hit rate for single-request serving), so

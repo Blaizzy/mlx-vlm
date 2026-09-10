@@ -32,10 +32,11 @@ PEREXPERT_RE = re.compile(
     r"^.*\.layers\.(?P<layer>\d+)\..*?experts\.(?P<j>\d+)\." + _PROJ
 )
 STACKED_RE = re.compile(
-    r"^.*\.layers\.(?P<layer>\d+)\..*?(?:experts|switch_mlp)\." + _PROJ
+    r"^.*\.layers\.(?P<layer>\d+)\..*?(?:experts|switch_mlp)(?:\.switch_glu)?\." + _PROJ
 )
 STACKED_FUSED_RE = re.compile(
-    r"^.*\.layers\.(?P<layer>\d+)\..*?(?:experts|switch_mlp)\." + _FUSED_PROJ
+    r"^.*\.layers\.(?P<layer>\d+)\..*?(?:experts|switch_mlp)(?:\.switch_glu)?\."
+    + _FUSED_PROJ
 )
 
 
