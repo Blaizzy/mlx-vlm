@@ -362,6 +362,7 @@ class Model(nn.Module):
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         supported_model_prefixes = (
             "model.embed_tokens.",
+            "model.hc_head.",
             "model.layers.",
             "model.norm.",
         )
