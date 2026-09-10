@@ -3,6 +3,7 @@ from .dspark import DSparkConfidenceHead, DSparkMarkovHead, get_dspark_topk_idxs
 from .engram import Engram, EngramEmbedding, EngramLayout, NgramHashState
 from .language import (
     Compressor,
+    DeepseekV41Attention,
     DeepseekV41MoE,
     DeepseekV41MoEGate,
     Indexer,
@@ -17,6 +18,7 @@ __all__ = [
     "DSparkMarkovHead",
     "get_dspark_topk_idxs",
     "Compressor",
+    "DeepseekV41Attention",
     "DeepseekV41MoE",
     "DeepseekV41MoEGate",
     "Engram",

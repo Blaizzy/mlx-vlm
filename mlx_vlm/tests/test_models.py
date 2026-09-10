@@ -20047,3 +20047,75 @@ class TestDeepseekV41Compressor(unittest.TestCase):
         out = comp(mx.random.normal((1, 4, 16)), 0)
         mx.eval(out)
         self.assertEqual(out.shape, (1, 4, 8))
+
+
+class TestDeepseekV41Attention(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            num_hidden_layers=4,
+            compress_ratios=[2, 2, 1, 0],
+            hidden_size=16,
+            num_attention_heads=2,
+            head_dim=8,
+            qk_rope_head_dim=4,
+            q_lora_rank=8,
+            o_lora_rank=4,
+            o_groups=1,
+            sliding_window=4,
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=4,
+            kv_source_layer_ids=[0],
+            index_source_layer_ids=[0, 1, 2],
+            candidate_source_layer_id=1,
+            candidate_topk_blocks=2,
+            candidate_block_size=2,
+        )
+
+    def test_deepseek_v41_attention_modes(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        full = deepseek_v41.DeepseekV41Attention(config, 0)
+        reindex = deepseek_v41.DeepseekV41Attention(config, 1)
+        consumer = deepseek_v41.DeepseekV41Attention(config, 2)
+        local = deepseek_v41.DeepseekV41Attention(config, 3)
+        self.assertEqual(
+            [a.mode for a in (full, reindex, consumer, local)],
+            ["full", "reindex", "reindex", "local"],
+        )
+        self.assertIsNotNone(full.compressor)
+        self.assertIsNone(reindex.compressor)
+        self.assertIsNotNone(reindex.indexer)
+        self.assertIsNone(local.indexer)
+        self.assertTrue(reindex.indexer.is_candidate_source)
+        self.assertTrue(consumer.indexer.uses_candidates)
+
+    def test_deepseek_v41_attention_prefill_decode(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        layers = [deepseek_v41.DeepseekV41Attention(config, i) for i in range(4)]
+        for layer in layers:
+            mx.eval(layer.parameters())
+        shared = deepseek_v41.SharedIndexState()
+
+        x = mx.random.normal((1, 5, 16))
+        for layer in layers:
+            x = layer(x, 0, shared)
+            mx.eval(x)
+            self.assertEqual(x.shape, (1, 5, 16))
+        self.assertIsNotNone(shared.compress_kv)
+        self.assertIsNotNone(shared.topk_idxs)
+        self.assertIsNotNone(shared.candidates)
+        self.assertTrue(bool(mx.all(mx.isfinite(x))))
+
+        x1 = mx.random.normal((1, 1, 16))
+        for layer in layers:
+            x1 = layer(x1, 5, shared)
+            mx.eval(x1)
+            self.assertEqual(x1.shape, (1, 1, 16))
+        self.assertTrue(bool(mx.all(mx.isfinite(x1))))

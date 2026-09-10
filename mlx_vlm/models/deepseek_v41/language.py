@@ -5,7 +5,12 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..deepseek_v4.language import LimitedSwiGLU
+from ..deepseek_v4.language import (
+    DeepseekV4RoPE,
+    LimitedSwiGLU,
+    _sparse_pooled_attention,
+)
+from ..mla import MultiLinear
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 
@@ -20,6 +25,8 @@ class SharedIndexState:
     def __init__(self):
         self.index_k = None
         self.candidates = None
+        self.compress_kv = None
+        self.topk_idxs = None
 
 
 @lru_cache(64)
@@ -82,10 +89,16 @@ def select_candidate_blocks(
     blocks again.
     """
     width = logits.shape[-1]
-    trimmed = width - width % block_size
-    scores = (
-        logits[..., :trimmed].reshape(*logits.shape[:-1], -1, block_size).max(axis=-1)
-    )
+    pad_len = (-width) % block_size
+    if pad_len:
+        logits = mx.concatenate(
+            [
+                logits,
+                mx.full(logits.shape[:-1] + (pad_len,), -mx.inf),
+            ],
+            axis=-1,
+        )
+    scores = logits.reshape(*logits.shape[:-1], -1, block_size).max(axis=-1)
     num_blocks = scores.shape[-1]
 
     last = (compress_lens - 1) // block_size
@@ -344,6 +357,255 @@ class DeepseekV41MoE(nn.Module):
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None].astype(y.dtype)).sum(-2)
         return y + self.shared_w2(self.shared_act(self.shared_w3(x), self.shared_w1(x)))
+
+
+def _apply_rope_at_positions(
+    x: mx.array, positions: mx.array, rope_dim: int, theta: float, yarn: tuple
+) -> mx.array:
+    """Rotate strided positions (compressor latents) with explicit tables."""
+    table_len = int(mx.max(positions).item()) + 1 if positions.size else 1
+    cos, sin = _index_cos_sin(table_len, rope_dim, theta, yarn)
+    shape = (1,) * (x.ndim - positions.ndim - 1) + positions.shape + (cos.shape[-1],)
+    rows = cos[positions].reshape(shape)
+    return _apply_index_rotary(x, rows, sin[positions].reshape(shape), rope_dim)
+
+
+class DeepseekV41Attention(nn.Module):
+    """Latent attention over window KV plus top-k compressed positions.
+
+    Modes derive from layer role: kv sources run Full (own compressor and indexer),
+    index-source non-owners run Reindex (shared KV and K, own rescoring), the rest
+    run Reuse (shared KV and shared Top-K, no indexer), and ratio-0 layers run
+    window-only. Every mode computes its own queries and sliding-window KV.
+    Deliberate deviations from the reference: an ordered shift ring replaces the
+    indexed ring buffer (same visible sets, mask-addressed); window and compressed
+    KV stay in separate gathers so no concatenation offset is needed; the extra
+    query rms-norm in the V4 port is omitted (the reference has none); fp4/fp8
+    activation quantization of KV lands with the quantization work.
+    """
+
+    def __init__(self, config: ModelConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.compress_ratio = config.compress_ratios[layer_idx]
+        self.is_kv_source = layer_idx in config.kv_source_layer_ids
+        self.is_index_source = layer_idx in config.index_source_layer_ids
+        if self.compress_ratio == 0:
+            self.mode = "local"
+        elif self.is_kv_source:
+            self.mode = "full"
+        elif self.is_index_source:
+            self.mode = "reindex"
+        else:
+            self.mode = "reuse"
+        self.n_heads = config.num_attention_heads
+        self.head_dim = config.head_dim
+        self.o_groups = config.o_groups
+        self.scale = self.head_dim**-0.5
+        self.window_size = config.sliding_window
+
+        self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
+        self.q_norm = nn.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
+        self.wq_b = nn.Linear(
+            config.q_lora_rank, self.n_heads * self.head_dim, bias=False
+        )
+        self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+        self.kv_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.wo_a = MultiLinear(
+            self.n_heads * self.head_dim // config.o_groups,
+            config.o_lora_rank,
+            config.o_groups,
+        )
+        self.wo_b = nn.Linear(
+            config.o_groups * config.o_lora_rank,
+            config.hidden_size,
+            bias=config.attention_bias,
+        )
+        self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
+
+        if self.compress_ratio:
+            self.rope = DeepseekV4RoPE(
+                config.qk_rope_head_dim,
+                config.compress_rope_theta,
+                config.rope_scaling,
+                config.max_position_embeddings,
+            )
+        else:
+            self.rope = DeepseekV4RoPE(
+                config.qk_rope_head_dim,
+                config.rope_theta,
+                None,
+                config.max_position_embeddings,
+            )
+        self.compressor = Compressor(config, layer_idx) if self.is_kv_source else None
+        self.indexer = Indexer(config, layer_idx) if self.is_index_source else None
+        self._latent_theta = config.compress_rope_theta
+        scaling = config.rope_scaling or {}
+        self._latent_yarn = (
+            scaling.get("factor", 1),
+            scaling.get("beta_fast", 32),
+            scaling.get("beta_slow", 1),
+            scaling.get("original_max_position_embeddings", 65536),
+        )
+        self._window_cache = None
+        self._compress_cache = None
+        self._cache_len = 0
+
+    def _grow_cache(self, cache, batch: int, length: int, dim: int):
+        if cache is None:
+            return mx.zeros((batch, length, dim), dtype=mx.float32)
+        if cache.shape[0] < batch:
+            cache = mx.concatenate(
+                [
+                    cache,
+                    mx.zeros(
+                        (batch - cache.shape[0], cache.shape[1], dim),
+                        dtype=mx.float32,
+                    ),
+                ],
+                axis=0,
+            )
+        if cache.shape[1] < length:
+            cache = mx.concatenate(
+                [
+                    cache,
+                    mx.zeros(
+                        (cache.shape[0], length - cache.shape[1], dim),
+                        dtype=mx.float32,
+                    ),
+                ],
+                axis=1,
+            )
+        return cache
+
+    def _window_part(self, x: mx.array, start_pos: int):
+        """Rotated window KV for this step plus its validity mask.
+
+        Prefill attends over the current chunk; later steps attend the ordered
+        ring of the last `window_size` tokens.
+        """
+        batch, seqlen = x.shape[0], x.shape[1]
+        win = self.window_size
+        kv = self.kv_norm(self.wkv(x)).reshape(batch, 1, seqlen, self.head_dim)
+        kv = self.rope(kv, start_pos).reshape(batch, seqlen, self.head_dim)
+        self._window_cache = self._grow_cache(
+            self._window_cache, batch, win, self.head_dim
+        )
+        hist_len = min(self._cache_len, win) if start_pos else 0
+        hist = self._window_cache[:batch, win - hist_len :] if hist_len else None
+        if start_pos == 0:
+            part, base = kv, 0
+            tail = kv[:, -win:]
+        else:
+            full = kv if hist is None else mx.concatenate([hist, kv], axis=1)
+            tail = full[:, -win:]
+            part, base = tail, max(0, start_pos + seqlen - tail.shape[1])
+        keep = (
+            tail
+            if tail.shape[1] == win
+            else mx.concatenate(
+                [mx.zeros((batch, win - tail.shape[1], self.head_dim)), tail], axis=1
+            )
+        )
+        ring = self._window_cache
+        if ring.shape[0] >= batch:
+            ring = mx.concatenate(
+                [keep] + ([ring[batch:]] if ring.shape[0] > batch else []), axis=0
+            )
+        else:
+            ring = keep
+        self._window_cache = ring
+        self._cache_len = start_pos + seqlen
+        positions = mx.arange(base, base + part.shape[1])
+        queries = mx.arange(start_pos, start_pos + seqlen)
+        valid = (
+            (positions[None, :] <= queries[:, None])
+            & (positions[None, :] > queries[:, None] - win)
+            & (positions[None, :] >= 0)
+        )
+        return part, valid[None, None]
+
+    def _compress_part(self, x: mx.array, qr: mx.array, start_pos: int, shared):
+        """Shared compressed KV slice plus this layer's Top-K indices."""
+        batch, seqlen = x.shape[0], x.shape[1]
+        ratio = self.compress_ratio
+        latent = None
+        if self.is_kv_source:
+            latent = self.compressor(x, start_pos)
+            if latent is not None:
+                n_latent = latent.shape[1]
+                if start_pos == 0:
+                    positions = mx.arange(n_latent) * ratio
+                else:
+                    positions = mx.array([start_pos + 1 - ratio])
+                latent = _apply_rope_at_positions(
+                    latent.astype(mx.float32),
+                    positions,
+                    self.config.qk_rope_head_dim,
+                    self._latent_theta,
+                    self._latent_yarn,
+                )
+                base = start_pos // ratio
+                cache = self._grow_cache(
+                    self._compress_cache, batch, base + n_latent, self.head_dim
+                )
+                parts = []
+                if base > 0:
+                    parts.append(cache[:batch, :base])
+                parts.append(latent)
+                if cache.shape[1] > base + n_latent:
+                    parts.append(cache[:batch, base + n_latent :])
+                head = mx.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
+                if cache.shape[0] > batch:
+                    cache = mx.concatenate([head, cache[batch:]], axis=0)
+                else:
+                    cache = head
+                self._compress_cache = cache
+                shared.compress_kv = cache
+        compress_len = (start_pos + seqlen) // ratio
+        pool = shared.compress_kv[:batch, :compress_len]
+        if self.is_index_source:
+            idxs = self.indexer(x, qr, latent, start_pos, 0, shared)
+            shared.topk_idxs = idxs
+        else:
+            idxs = shared.topk_idxs
+        return pool, idxs
+
+    def __call__(self, x: mx.array, start_pos: int, shared: SharedIndexState):
+        batch, seqlen = x.shape[0], x.shape[1]
+        qr = self.q_norm(self.wq_a(x))
+        q = self.wq_b(qr).reshape(batch, seqlen, self.n_heads, self.head_dim)
+        q = q.transpose(0, 2, 1, 3)
+        q = self.rope(q, start_pos)
+
+        window_kv, window_mask = self._window_part(x, start_pos)
+        out = None
+        if self.compress_ratio:
+            pool, idxs = self._compress_part(x, qr, start_pos, shared)
+            out = _sparse_pooled_attention(
+                q,
+                window_kv[:, None],
+                pool,
+                idxs,
+                window_mask,
+                (idxs != -1)[:, None],
+                self.scale,
+                self.attn_sink.astype(q.dtype),
+            )
+        if out is None:
+            mask = window_mask
+            kv = window_kv[:, None]
+            out = mx.fast.scaled_dot_product_attention(
+                q, kv, kv, scale=self.scale, mask=mask, sinks=self.attn_sink
+            )
+        out = self.rope(out, start_pos, inverse=True)
+
+        out = out.reshape(batch, self.o_groups, -1, seqlen, self.head_dim)
+        out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
+        out = self.wo_a(out)
+        out = out.transpose(0, 2, 1, 3).flatten(-2)
+        return self.wo_b(out)
 
 
 class Compressor(nn.Module):

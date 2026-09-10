@@ -40,6 +40,9 @@ class ModelConfig(BaseModelConfig):
     index_source_layer_ids: List[int] = field(
         default_factory=lambda: [2, 8, 14, 20, 24, 28, 32, 36]
     )
+    index_source_layer_ids: List[int] = field(
+        default_factory=lambda: [2, 8, 14, 20, 24, 28, 32, 36]
+    )
     index_n_heads: int = 32
     index_head_dim: int = 128
     index_topk: int = 512
