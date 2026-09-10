@@ -19752,3 +19752,76 @@ class TestSpark2_5Model(unittest.TestCase):
         weights = {"model.embedding.weight": mx.zeros((128, 64))}
         sanitized = model.sanitize(weights)
         self.assertIn("language_model.model.embedding.weight", sanitized)
+
+
+class TestDeepseekV41Basics(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            hidden_size=32,
+            vision_hidden_size=32,
+            vision_num_heads=4,
+            vision_num_layers=1,
+            vision_intermediate_size=16,
+            vision_patch_size=2,
+            hc_mult=2,
+            engram_layer_ids=[1],
+            engram_num_embeddings=[1024],
+            engram_max_ngram_size=3,
+            engram_vocab_size=512,
+            engram_n_heads=2,
+            engram_head_dim=8,
+            engram_compressed_vocab_size=7,
+        )
+
+    def test_deepseek_v41_config_defaults(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = deepseek_v41.ModelConfig()
+        self.assertEqual(config.model_type, "deepseek_v41")
+        self.assertEqual(len(config.compress_ratios), config.num_hidden_layers)
+        self.assertEqual(config.compress_ratios[2], 2)
+        self.assertEqual(config.compress_ratios[20], 1)
+        self.assertEqual(
+            config.kv_source_layer_ids,
+            [2, 8, 14, 20],
+        )
+
+        loaded = deepseek_v41.ModelConfig.from_dict(
+            {"model_type": "deepseek_v41", "eos_token_id": 1}
+        )
+        self.assertEqual(loaded.eos_token_id, 1)
+
+    def test_deepseek_v41_vision_shapes(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        vit = deepseek_v41.ViT(config)
+        mx.eval(vit.parameters())
+        out = vit(mx.random.normal((36, 12)), 6, 6)
+        mx.eval(out)
+        self.assertEqual(out.shape, (36, 32))
+
+        aligner = deepseek_v41.Aligner(config)
+        mx.eval(aligner.parameters())
+        emb = aligner(mx.random.normal((36, 32)), 6, 6)
+        mx.eval(emb)
+        self.assertEqual(emb.shape, (4, 32))
+
+    def test_deepseek_v41_engram_shapes(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        layout = deepseek_v41.EngramLayout.from_config(config)
+        self.assertIsNotNone(layout)
+        self.assertEqual(len(layout.primes), 1)
+
+        eng = deepseek_v41.Engram(config, 1, layout)
+        mx.eval(eng.parameters())
+        x = mx.random.normal((1, 3, 2, 32))
+        hash_ids = mx.zeros((1, 3, (3 - 1) * 2), dtype=mx.int32)
+        y = eng(x, hash_ids)
+        mx.eval(y)
+        self.assertEqual(y.shape, x.shape)
