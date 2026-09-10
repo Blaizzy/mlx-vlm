@@ -1,3 +1,5 @@
+import mlx_vlm.models.deepseek_v41.processing_deepseek_v41  # noqa: F401 (installs processor patch)
+
 from .config import ModelConfig
 from .deepseek_v41 import Model
 from .dspark import DSparkConfidenceHead, DSparkMarkovHead, get_dspark_topk_idxs

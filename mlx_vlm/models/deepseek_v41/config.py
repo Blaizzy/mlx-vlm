@@ -81,6 +81,9 @@ class ModelConfig(BaseModelConfig):
     vision_patch_size: int = 14
     vision_rope_theta: float = 10000.0
     vision_downsample_ratio: int = 3
+    vision_min_pixels: int = 295936
+    vision_max_image_tokens: int = 1024
+    vision_max_wh_ratio: Optional[float] = None
 
     def __post_init__(self):
         if not self.compress_ratios:

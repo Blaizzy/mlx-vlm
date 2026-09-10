@@ -20287,3 +20287,80 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
         self.assertIn("language_model.model.embed_tokens.weight", sanitized)
         self.assertIn("language_model.lm_head.weight", sanitized)
         self.assertIn("other.weight", sanitized)
+
+
+class TestDeepseekV41Processing(unittest.TestCase):
+    @staticmethod
+    def _image_record(width=160, height=112):
+        import io
+
+        import numpy as np
+        from PIL import Image
+
+        pixels = (np.random.rand(height, width, 3) * 255).astype(np.uint8)
+        buffer = io.BytesIO()
+        Image.fromarray(pixels).save(buffer, format="PNG")
+        return {"data": buffer.getvalue()}
+
+    def test_deepseek_v41_plan_image_grid(self):
+        from mlx_vlm.models import deepseek_v41
+        from mlx_vlm.models.deepseek_v41 import processing_deepseek_v41 as proc
+
+        config = deepseek_v41.ModelConfig()
+        n_llm_h, n_llm_w, best_h, best_w = proc.plan_image_grid(800, 600, config)
+        self.assertLessEqual(
+            proc.num_image_tokens(n_llm_h, n_llm_w), config.vision_max_image_tokens
+        )
+        self.assertEqual(best_h % 14, 0)
+        self.assertEqual(best_w % 14, 0)
+
+        tiny = proc.plan_image_grid(32, 32, config)
+        self.assertGreater(tiny[2] * tiny[3], 32 * 32)
+
+    def test_deepseek_v41_load_image(self):
+        from mlx_vlm.models import deepseek_v41
+        from mlx_vlm.models.deepseek_v41 import processing_deepseek_v41 as proc
+
+        config = deepseek_v41.ModelConfig()
+        patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = proc.load_image(
+            self._image_record(), config
+        )
+        mx.eval(patches)
+        self.assertEqual(patches.shape, (n_vit_h * n_vit_w, 3, 14, 14))
+        self.assertEqual(
+            len(proc.image_token_types(n_llm_h, n_llm_w)),
+            proc.num_image_tokens(n_llm_h, n_llm_w),
+        )
+
+    def test_deepseek_v41_prepare_vl_inputs(self):
+        from mlx_vlm.models import deepseek_v41
+        from mlx_vlm.models.deepseek_v41 import processing_deepseek_v41 as proc
+
+        config = deepseek_v41.ModelConfig()
+        image_id = config.image_token_id
+        tokens, types, inputs = proc.prepare_vl_inputs(
+            [1, image_id, 2], [self._image_record()], config
+        )
+        self.assertEqual(len(inputs), 1)
+        self.assertEqual(len(tokens), len(types))
+        self.assertEqual(tokens[0], 1)
+        self.assertEqual(tokens[-1], 2)
+        self.assertIn(proc.TEXT, types)
+        self.assertIn(proc.IMAGE, types)
+        self.assertIn(proc.IMAGE_START, types)
+        self.assertNotIn(image_id, tokens[:1] + tokens[-1:])
+        with self.assertRaises(ValueError):
+            proc.prepare_vl_inputs([1, image_id, 2], [], config)
+
+    def test_deepseek_v41_chat_template_markers(self):
+        from mlx_vlm.models.deepseek_v41 import processing_deepseek_v41 as proc
+
+        template = proc.DEFAULT_CHAT_TEMPLATE
+        for marker in (
+            "<｜begin▁of▁sentence｜>",
+            "<｜User｜>",
+            "<｜Assistant｜>",
+            "<｜end▁of▁sentence｜>",
+            "<｜Assistant｜></think>",
+        ):
+            self.assertIn(marker, template)
