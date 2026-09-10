@@ -19856,3 +19856,72 @@ class TestDeepseekV41Basics(unittest.TestCase):
         self.assertTrue(bool(mx.all(idxs[0, 0, :11] == mx.arange(11))))
         with self.assertRaises(AssertionError):
             deepseek_v41.get_dspark_topk_idxs(128, 2, 5, 0)
+
+
+class TestDeepseekV41Indexer(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            num_hidden_layers=3,
+            compress_ratios=[2, 2, 2],
+            hidden_size=16,
+            head_dim=16,
+            q_lora_rank=8,
+            index_n_heads=2,
+            index_head_dim=8,
+            qk_rope_head_dim=4,
+            index_topk=4,
+            kv_source_layer_ids=[0],
+            candidate_source_layer_id=1,
+            candidate_topk_blocks=4,
+            candidate_block_size=2,
+        )
+
+    def test_deepseek_v41_indexer_prefill_decode(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        indexer = deepseek_v41.Indexer(config, 0)
+        self.assertTrue(indexer.owns_k)
+        mx.eval(indexer.parameters())
+        shared = deepseek_v41.SharedIndexState()
+
+        x = mx.random.normal((1, 4, 16))
+        qr = mx.random.normal((1, 4, 8))
+        latent = mx.random.normal((1, 2, 16))
+        idxs = indexer(x, qr, latent, 0, 0, shared)
+        mx.eval(idxs)
+        self.assertEqual(idxs.shape, (1, 4, 2))
+        self.assertEqual(idxs[0, 0].tolist(), [-1, -1])
+        self.assertEqual(idxs[0, 1].tolist(), [0, -1])
+        self.assertIsNotNone(shared.index_k)
+
+        x1 = mx.random.normal((1, 1, 16))
+        qr1 = mx.random.normal((1, 1, 8))
+        idxs1 = indexer(x1, qr1, None, 4, 0, shared)
+        mx.eval(idxs1)
+        self.assertEqual(idxs1.shape, (1, 1, 2))
+
+    def test_deepseek_v41_indexer_two_level(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        source = deepseek_v41.Indexer(config, 1)
+        self.assertTrue(source.is_candidate_source)
+        consumer = deepseek_v41.Indexer(config, 2)
+        self.assertTrue(consumer.uses_candidates)
+        mx.eval(source.parameters(), consumer.parameters())
+        shared = deepseek_v41.SharedIndexState()
+
+        seed = deepseek_v41.Indexer(config, 0)
+        mx.eval(seed.parameters())
+        x = mx.random.normal((1, 4, 16))
+        qr = mx.random.normal((1, 4, 8))
+        seed(x, qr, mx.random.normal((1, 2, 16)), 0, 0, shared)
+        source(x, qr, None, 0, 0, shared)
+        self.assertIsNotNone(shared.candidates)
+        idxs = consumer(x, qr, None, 0, 0, shared)
+        mx.eval(idxs)
+        self.assertEqual(idxs.shape, (1, 4, 2))
