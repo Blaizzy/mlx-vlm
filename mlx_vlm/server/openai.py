@@ -24,7 +24,12 @@ from ..generate.image import ImageGenerationRequest as CoreImageGenerationReques
 from ..generate.image import generate_image, parse_size
 from ..generate.video import resolve_video_inputs
 from ..prompt_utils import apply_chat_template, extract_text_from_content
-from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
+from ..tools import (
+    _infer_tool_parser_from_processor,
+    _prepare_chat_tool_choice,
+    load_tool_module,
+    process_tool_calls,
+)
 from ..utils import prepare_inputs
 from .generation import (
     GenerationMetrics,
@@ -44,7 +49,6 @@ from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
     _store_response,
     make_response_stream_state,
-    process_tool_calls,
     prompt_has_open_thinking,
     response_store,
     response_store_lock,
@@ -157,110 +161,6 @@ def _ensure_effective_input(messages, *, images=None, audio=None):
     if any(_message_has_effective_input(message) for message in messages or []):
         return
     raise HTTPException(status_code=400, detail=_MISSING_INPUT_DETAIL)
-
-
-def _tool_function_name(tool: Any) -> Optional[str]:
-    if hasattr(tool, "model_dump"):
-        tool = tool.model_dump(exclude_none=True)
-    if not isinstance(tool, dict) or tool.get("type") != "function":
-        return None
-    function = tool.get("function")
-    if hasattr(function, "model_dump"):
-        function = function.model_dump(exclude_none=True)
-    if not isinstance(function, dict):
-        return None
-    name = function.get("name")
-    return name if isinstance(name, str) and name else None
-
-
-def _with_tool_choice_instruction(messages, instruction: str):
-    messages = [dict(message) for message in messages]
-    if messages and messages[0].get("role") == "system":
-        content = messages[0].get("content") or ""
-        messages[0]["content"] = f"{content}\n\n{instruction}".strip()
-    user_instruction_added = False
-    for message in reversed(messages):
-        if message.get("role") == "user" and isinstance(message.get("content"), str):
-            message["content"] = f"{message['content']}\n\n{instruction}".strip()
-            user_instruction_added = True
-            break
-    if not user_instruction_added and not (
-        messages and messages[0].get("role") == "system"
-    ):
-        messages.insert(0, {"role": "system", "content": instruction})
-    return messages
-
-
-def _prepare_chat_tool_choice(messages, tools, tool_choice):
-    """Validate and enforce OpenAI Chat Completions tool_choice semantics."""
-    available_tools = list(tools or [])
-    if tool_choice is None:
-        return messages, available_tools or None, None
-
-    if hasattr(tool_choice, "model_dump"):
-        tool_choice = tool_choice.model_dump(exclude_none=True)
-
-    if isinstance(tool_choice, str):
-        if tool_choice not in ("none", "auto", "required"):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Invalid tool_choice. Expected 'none', 'auto', 'required', "
-                    "or a specific function."
-                ),
-            )
-        if tool_choice == "none":
-            return messages, None, tool_choice
-        if tool_choice == "auto":
-            return messages, available_tools or None, tool_choice
-        if not available_tools:
-            raise HTTPException(
-                status_code=400,
-                detail="tool_choice 'required' requires at least one tool.",
-            )
-        instruction = (
-            "You must call one or more of the available functions to answer the "
-            "user's request. Do not answer directly without calling a function."
-        )
-        return (
-            _with_tool_choice_instruction(messages, instruction),
-            available_tools,
-            tool_choice,
-        )
-
-    if not isinstance(tool_choice, dict):
-        raise HTTPException(status_code=400, detail="Invalid tool_choice.")
-
-    function = tool_choice.get("function")
-    if hasattr(function, "model_dump"):
-        function = function.model_dump(exclude_none=True)
-    name = function.get("name") if isinstance(function, dict) else None
-    if tool_choice.get("type") != "function" or not isinstance(name, str) or not name:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "A specific tool_choice must be "
-                "{'type':'function','function':{'name':'...'}}."
-            ),
-        )
-
-    selected_tools = [
-        tool for tool in available_tools if _tool_function_name(tool) == name
-    ]
-    if not selected_tools:
-        raise HTTPException(
-            status_code=400,
-            detail=f"tool_choice references unknown function {name!r}.",
-        )
-    instruction = (
-        f"You must call the {name!r} function to answer the user's request. "
-        "Do not call any other function and do not answer directly."
-    )
-    return (
-        _with_tool_choice_instruction(messages, instruction),
-        selected_tools,
-        tool_choice,
-    )
 
 
 def _runtime_cache_get(key, default=None, *, kind=None):
@@ -982,7 +882,9 @@ async def responses_endpoint(request: Request):
         )
 
         chat_tools, tool_registry = _response_tool_registry(openai_request.tools)
-        tool_parser_type = _infer_tool_parser_from_processor(processor)
+        tool_parser_type = _infer_tool_parser_from_processor(
+            processor, override=openai_request.tool_parser
+        )
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
 
         try:
@@ -1717,7 +1619,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             )
 
         # Detect tool parser from chat template
-        tool_parser_type = _infer_tool_parser_from_processor(processor)
+        tool_parser_type = _infer_tool_parser_from_processor(
+            processor, override=request.tool_parser
+        )
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
         if not tools:
             tool_module = None
@@ -1902,7 +1806,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         terminal_emitted = False
                         if tool_module is not None:
                             tc = process_tool_calls(full_output, tool_module, tools)
-                            if tc["calls"]:
+                            if tc.calls:
                                 tool_calls_made = True
                                 finish_reason = "tool_calls"
                                 terminal_emitted = True
@@ -1911,7 +1815,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                         finish_reason="tool_calls",
                                         delta=ChatMessage(
                                             role="assistant",
-                                            tool_calls=tc["calls"],
+                                            tool_calls=tc.calls,
                                         ),
                                     )
                                 ]
@@ -2235,11 +2139,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         tool_module=tool_module,
                         tools=tools,
                     )
-                    if tc["calls"]:
-                        parsed_tool_calls = tc["calls"]
+                    if tc.calls:
+                        parsed_tool_calls = tc.calls
                         # Clean thinking tags and control tokens from remaining text
                         _, clean_remaining = _split_thinking(
-                            tc["remaining_text"] or "",
+                            tc.remaining_text or "",
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
                         )

@@ -120,6 +120,20 @@ class TestTopPSampling(unittest.TestCase):
         self.assertEqual(tokens.shape, (3,))
 
 
+class TestMakeSampler(unittest.TestCase):
+    def test_default_filters_leave_categorical_sampling_unchanged(self):
+        """Default filtering must preserve the sampled tokens, not just shape."""
+        logits = mx.array([[0.0, 1.0, 2.0, 3.0, 4.0]] * 64)
+        mx.random.seed(0)
+        expected = mx.random.categorical(logits)
+        mx.eval(expected)
+        mx.random.seed(0)
+        actual = make_sampler(temp=1.0)(logits)
+        mx.eval(actual)
+        self.assertEqual(actual.shape, (64,))
+        self.assertEqual(actual.tolist(), expected.tolist())
+
+
 class TestTopNSigma(unittest.TestCase):
     LOGITS = mx.array([0.0, 1.0, 2.0, 3.0, 4.0])
 
@@ -164,13 +178,6 @@ class TestTopNSigma(unittest.TestCase):
         toks = sampler(logits)
         mx.eval(toks)
         self.assertTrue(all(t in (3, 4) for t in toks.tolist()))
-
-    def test_disabled_by_default(self):
-        """top_n_sigma=0 (default) leaves the sampler unfiltered."""
-        sampler = make_sampler(temp=1.0)
-        toks = sampler(mx.array([[0.0, 1.0, 2.0, 3.0, 4.0]] * 16))
-        mx.eval(toks)
-        self.assertEqual(toks.shape, (16,))
 
     def test_float16_large_vocab(self):
         """std must be computed in float32: summing a large float16 vocab
@@ -241,13 +248,6 @@ class TestPLess(unittest.TestCase):
         mx.eval(toks)
         self.assertTrue(all(t == 0 for t in toks.tolist()))
 
-    def test_disabled_by_default(self):
-        """p_less=False (default) leaves the sampler unfiltered."""
-        sampler = make_sampler(temp=1.0)
-        toks = sampler(mx.array([[1.0, 2.0, 3.0, 4.0, 5.0]] * 16))
-        mx.eval(toks)
-        self.assertEqual(toks.shape, (16,))
-
 
 def _np_typical_keep(logits, typical_p):
     logp = np.asarray(logits, dtype=np.float64)
@@ -309,13 +309,6 @@ class TestTypicalP(unittest.TestCase):
         toks = sampler(mx.array([[10.0, 0.0, 0.0, 0.0, 0.0]] * 64))
         mx.eval(toks)
         self.assertTrue(all(t == 0 for t in toks.tolist()))
-
-    def test_disabled_by_default(self):
-        """typical_p=1.0 (default) leaves the sampler unfiltered."""
-        sampler = make_sampler(temp=1.0)
-        toks = sampler(mx.array([[1.0, 2.0, 3.0, 4.0, 5.0]] * 16))
-        mx.eval(toks)
-        self.assertEqual(toks.shape, (16,))
 
     def test_invalid_raises(self):
         x = mx.array([0.0, 1.0, 2.0])

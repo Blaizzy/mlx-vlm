@@ -2,9 +2,9 @@
   "model": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
   "draft_model": "extracted/Qwen3.5-0.8B-MTP",
   "settings": {
-    "model": "/Users/prince_canuma/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17",
-    "draft_model": "/tmp/Qwen3.5-0.8B-MTP",
-    "output": "/tmp/qwen35-mtp-final.json",
+    "model": "Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17",
+    "draft_model": "extracted/Qwen3.5-0.8B-MTP",
+    "output": "qwen35-mtp.json",
     "max_tokens": 128,
     "batch_size": [
       1,

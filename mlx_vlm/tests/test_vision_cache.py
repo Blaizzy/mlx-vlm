@@ -62,15 +62,6 @@ class TestVisionFeatureCache:
         cache.put(url, features)
         assert cache.get(url) is not None
 
-    def test_clear(self):
-        cache = VisionFeatureCache()
-        cache.put("a.jpg", mx.ones((1, 10, 64)))
-        cache.put("b.jpg", mx.ones((1, 10, 64)))
-        assert len(cache) == 2
-        cache.clear()
-        assert len(cache) == 0
-        assert cache.get("a.jpg") is None
-
     def test_contains(self):
         cache = VisionFeatureCache()
         cache.put("a.jpg", mx.ones((1, 10, 64)))

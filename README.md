@@ -50,6 +50,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Gemma 4 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
 | MiniMax M3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
 | Falcon-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
+| PP-DocLayoutV3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/pp_doclayout_v3/README.md) |
 | Granite Vision 3.2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
 | Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
 | MiniCPM-V 4.6 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
@@ -178,7 +179,8 @@ Requests can override the server defaults with `enable_thinking`, `thinking_budg
 
 ### Speculative Decoding
 
-The speculative path currently supports **GLM-5.3-Flash with its native MTP head**.
+The speculative path supports **GLM-5.3-Flash with its native MTP head**,
+with Qwen3.5 as a second adapter using the same cache contract.
 The request cache owns target and draft KV, recurrent history, hidden states,
 and rollback. The MTP model shares the target's embeddings and output head.
 
@@ -197,8 +199,9 @@ mlx_vlm.generate --model zai-org/GLM-5.3-Flash \
 one token, `3` proposes two. Greedy and temperature sampling use the same
 cache commit path. FP8 source weights use the shared MXFP8 loader.
 
-This rebuild retires the former DFlash, EAGLE, and other MTP adapters. Prefix
-reuse and logits processors are not enabled for this initial MTP path.
+This rebuild retires the former DFlash, EAGLE, and other MTP adapters. Atomic
+prefix reuse restores target and draft state together. Logits processors use
+full committed-token histories, including after prefix reuse.
 See [the implementation guide](docs/speculative-decoding.md) for the cache
 contract and a reproducible FP8 parity benchmark.
 
@@ -1019,7 +1022,8 @@ Structured outputs are also supported with:
 - The responses API via `text.format` on `/v1/responses`
 - Text-only requests using the same `response_format` shape
 
-Structured outputs are not currently supported with speculative decoding.
+Structured output processors use one-token target steps with MTP enabled,
+preserving per-token grammar updates without speculative speedup.
 
 #### How It Works
 
