@@ -22,7 +22,7 @@ from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
 from ..reranker import RerankerKind, reranker_kind
 from ..structured import build_json_schema_logits_processor
-from ..tool_parsers import _infer_tool_parser_from_processor
+from ..tools import _infer_tool_parser_from_processor
 from ..version import __version__
 from ..vision_cache import VisionFeatureCache
 from . import request_normalization as _request_normalization

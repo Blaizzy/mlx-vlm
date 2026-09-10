@@ -13,7 +13,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..generate import generate, stream_generate
 from ..prompt_utils import apply_chat_template
-from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
+from ..tools import (
+    _infer_tool_parser_from_processor,
+    _prepare_chat_tool_choice,
+    load_tool_module,
+    process_tool_calls,
+)
 from ..utils import prepare_inputs
 from .generation import (
     GenerationMetrics,
@@ -21,11 +26,9 @@ from .generation import (
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
-from .openai import _prepare_chat_tool_choice
 from .responses_state import (
     ToolCallStreamState,
     make_response_stream_state,
-    process_tool_calls,
     prompt_has_open_thinking,
 )
 from .runtime import runtime
@@ -749,8 +752,8 @@ async def anthropic_messages_endpoint(http_request: Request):
                     parsed_tool_calls = None
                     if tool_module is not None and tools:
                         tc = process_tool_calls(full_output, tool_module, tools)
-                        if tc["calls"]:
-                            parsed_tool_calls = tc["calls"]
+                        if tc.calls:
+                            parsed_tool_calls = tc.calls
 
                     if parsed_tool_calls:
                         for call in parsed_tool_calls:
@@ -966,10 +969,10 @@ async def anthropic_messages_endpoint(http_request: Request):
             parsed_tool_calls = None
             if tool_module is not None and tools:
                 tc = process_tool_calls(full_text, tool_module, tools)
-                if tc["calls"]:
-                    parsed_tool_calls = tc["calls"]
+                if tc.calls:
+                    parsed_tool_calls = tc.calls
                     _, content = _split_thinking(
-                        tc["remaining_text"] or "",
+                        tc.remaining_text or "",
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
                         processor=processor,

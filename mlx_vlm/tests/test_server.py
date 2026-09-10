@@ -36,7 +36,8 @@ from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
-from mlx_vlm.tool_parsers import _infer_tool_parser, minicpm5
+from mlx_vlm.tools import _infer_tool_parser
+from mlx_vlm.tools.parsers import minicpm5
 
 
 def test_response_generator_prefill_step_override_wins_over_environment(monkeypatch):
@@ -3388,7 +3389,7 @@ def test_chat_completions_streaming_response_template_tool_calls(client, monkeyp
                 ]
             )
 
-    from mlx_vlm.tool_parsers import atem as tool_module
+    from mlx_vlm.tools.parsers import atem as tool_module
 
     monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
 
@@ -3998,7 +3999,7 @@ def test_anthropic_nonstreaming_preserves_thinking_with_tool_use(client, monkeyp
         generation_tps=0.0,
         peak_memory=0.0,
     )
-    from mlx_vlm.tool_parsers import atem as tool_module
+    from mlx_vlm.tools.parsers import atem as tool_module
 
     with (
         patch.object(
@@ -7184,8 +7185,8 @@ class TestProcessToolCalls:
         # Minimal tool module mock
         module = SimpleNamespace(tool_call_start="<tc>", tool_call_end="</tc>")
         result = server.process_tool_calls("Just text.", module, [])
-        assert result["calls"] == []
-        assert result["remaining_text"] == "Just text."
+        assert result.calls == []
+        assert result.remaining_text == "Just text."
 
     def test_parser_can_return_multiple_tool_calls(self):
         module = SimpleNamespace(
@@ -7199,15 +7200,15 @@ class TestProcessToolCalls:
 
         result = server.process_tool_calls("Before <tc>[]</tc> after", module, [])
 
-        assert result["remaining_text"] == "Before   after"
-        assert [call["function"]["name"] for call in result["calls"]] == [
+        assert result.remaining_text == "Before   after"
+        assert [call["function"]["name"] for call in result.calls] == [
             "grep",
             "read",
         ]
-        assert json.loads(result["calls"][0]["function"]["arguments"]) == {
+        assert json.loads(result.calls[0]["function"]["arguments"]) == {
             "pattern": "foo"
         }
-        assert json.loads(result["calls"][1]["function"]["arguments"]) == {
+        assert json.loads(result.calls[1]["function"]["arguments"]) == {
             "path": "file.py"
         }
 
@@ -7248,12 +7249,12 @@ class TestProcessToolCalls:
         text = f'Before{self.minicpm5_call}Between<function name="get_time"></function>After'
         result = server.process_tool_calls(text, minicpm5, tools=None)
 
-        assert result["remaining_text"] == "Before Between After"
-        assert [call["function"]["name"] for call in result["calls"]] == [
+        assert result.remaining_text == "Before Between After"
+        assert [call["function"]["name"] for call in result.calls] == [
             "write_file",
             "get_time",
         ]
-        assert json.loads(result["calls"][1]["function"]["arguments"]) == {}
+        assert json.loads(result.calls[1]["function"]["arguments"]) == {}
 
         state = server.ToolCallStreamState(
             minicpm5.tool_call_start, minicpm5.tool_call_end
