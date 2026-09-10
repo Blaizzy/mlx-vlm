@@ -489,7 +489,9 @@ async def anthropic_messages_endpoint(http_request: Request):
             )
         except HTTPException as e:
             return _anthropic_error_response(e.status_code, str(e.detail))
-        tool_parser_type = _infer_tool_parser_from_processor(processor)
+        tool_parser_type = _infer_tool_parser_from_processor(
+            processor, override=request.tool_parser
+        )
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
 
         try:

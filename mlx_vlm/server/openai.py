@@ -882,7 +882,9 @@ async def responses_endpoint(request: Request):
         )
 
         chat_tools, tool_registry = _response_tool_registry(openai_request.tools)
-        tool_parser_type = _infer_tool_parser_from_processor(processor)
+        tool_parser_type = _infer_tool_parser_from_processor(
+            processor, override=openai_request.tool_parser
+        )
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
 
         try:
@@ -1617,7 +1619,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             )
 
         # Detect tool parser from chat template
-        tool_parser_type = _infer_tool_parser_from_processor(processor)
+        tool_parser_type = _infer_tool_parser_from_processor(
+            processor, override=request.tool_parser
+        )
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
         if not tools:
             tool_module = None

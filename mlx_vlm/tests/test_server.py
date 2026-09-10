@@ -290,6 +290,59 @@ def test_chat_completions_tool_choice_none_disables_tools(client, monkeypatch):
     assert mock_template.call_args.kwargs["tool_choice"] == "none"
 
 
+def test_chat_completions_tool_parser_override(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    # A template with no tool markers: inference alone selects no parser.
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(chat_template="a plain template, no tool markers")
+    )
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(
+        text='<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>',
+        prompt_tokens=5,
+        generation_tokens=3,
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+        }
+    ]
+
+    def post(extra):
+        with (
+            patch.object(
+                server, "get_cached_model", return_value=(model, processor, config)
+            ),
+            patch.object(server, "apply_chat_template", return_value="prompt"),
+            patch.object(server, "generate", return_value=result),
+        ):
+            return client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "demo",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": tools,
+                    **extra,
+                },
+            )
+
+    # Without an override the markerless template routes to no parser: no calls.
+    base = post({})
+    assert base.status_code == 200
+    assert base.json()["choices"][0]["message"]["tool_calls"] is None
+
+    # The override forces json_tools, which parses the emitted call.
+    overridden = post({"tool_parser": "json_tools"})
+    assert overridden.status_code == 200
+    calls = overridden.json()["choices"][0]["message"]["tool_calls"]
+    assert calls and calls[0]["function"]["name"] == "get_weather"
+
+    # An unknown parser name is rejected at request validation.
+    assert post({"tool_parser": "bogus"}).status_code == 422
+
+
 def test_chat_completions_required_tool_choice_adds_instruction(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
