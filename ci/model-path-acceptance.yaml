@@ -1,0 +1,30 @@
+schema_version: 1
+model: qwen2_vl
+changed_path: mlx_vlm/models/qwen2_vl/vision.py
+phases:
+  - synthetic
+  - hf_checkpoint
+synthetic:
+  adapter: qwen2_vl
+  profile: dense_vlm
+  seed: 0
+  max_abs_diff: 0.00001
+hf_checkpoint:
+  repo: mlx-community/Qwen2-VL-2B-Instruct-4bit
+  revision: 01af461cdb9574acc09084a0ef94e216e142b085
+  weight_bytes: 1245868907
+input:
+  asset: ci/assets/cat.jpg
+  asset_sha256: 6103ebb6dca0de69d02f9f90dc391e8380c66734e726937d21f176c8849c808d
+  prompt: Describe the animal in this image in one sentence.
+  max_tokens: 16
+thresholds:
+  performance_percent: 5.0
+expected_comment_fields:
+  - commit
+  - attempt
+  - terminal_status
+  - runner
+  - cache
+  - correctness
+  - performance

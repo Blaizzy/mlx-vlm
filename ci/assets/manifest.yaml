@@ -1,0 +1,22 @@
+schema_version: 1
+assets:
+  cat:
+    path: ci/assets/cat.jpg
+    media_type: image/jpeg
+    width: 960
+    height: 640
+    sha256: 6103ebb6dca0de69d02f9f90dc391e8380c66734e726937d21f176c8849c808d
+    expected_label: cat
+    source: https://commons.wikimedia.org/wiki/File:Domestic_shorthair_cat_portrait_in_grass.jpg
+    license: CC0-1.0
+    license_url: https://creativecommons.org/publicdomain/zero/1.0/
+  dog:
+    path: ci/assets/dog.jpg
+    media_type: image/jpeg
+    width: 960
+    height: 640
+    sha256: 3d7124dd3dd12544571816d152a8ae1e3174a731a7c78f583a93990ca60cf65a
+    expected_label: dog
+    source: https://commons.wikimedia.org/wiki/File:Dog_resting_on_the_grass.jpg
+    license: CC0-1.0
+    license_url: https://creativecommons.org/publicdomain/zero/1.0/

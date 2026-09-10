@@ -1,0 +1,1880 @@
+schema_version: 1
+synthetic_profiles:
+  dense_vlm:
+    seed: 0
+    dtype: float32
+    weight_initializer:
+      distribution: normal
+      standard_deviation: 0.02
+    text:
+      hidden_size: 64
+      intermediate_size: 128
+      num_hidden_layers: 2
+      num_attention_heads: 4
+      num_key_value_heads: 2
+      head_dim: 16
+      vocab_size: 256
+      max_position_embeddings: 512
+    vision:
+      hidden_size: 32
+      intermediate_size: 64
+      num_hidden_layers: 2
+      num_attention_heads: 4
+      patch_size: 14
+      image_size: 28
+      num_channels: 3
+    projector:
+      input_size: 32
+      output_size: 64
+      num_query_tokens: 4
+    inputs:
+      batch_size: 1
+      sequence_length: 8
+      image_count: 1
+      image_height: 28
+      image_width: 28
+      image_channels: 3
+      max_new_tokens: 1
+    checks:
+      - instantiate
+      - language_forward
+      - vision_forward
+      - multimodal_forward
+      - finite_logits
+  moe_vlm:
+    base: dense_vlm
+    mixture_of_experts:
+      num_experts: 4
+      num_experts_per_token: 2
+      expert_intermediate_size: 64
+  cross_attention_vlm:
+    base: dense_vlm
+    cross_attention:
+      num_layers: 1
+      interval: 1
+  anyres_vlm:
+    base: dense_vlm
+    inputs:
+      image_grid_pinpoints:
+        - [28, 28]
+        - [28, 56]
+  audio_vision_language:
+    base: dense_vlm
+    inputs:
+      audio_frames: 16
+      audio_features: 80
+    checks:
+      - instantiate
+      - language_forward
+      - vision_forward
+      - audio_forward
+      - multimodal_forward
+      - finite_logits
+  ocr_vlm:
+    base: dense_vlm
+    inputs:
+      task: ocr
+      prompt: Read the text in this image.
+      image_height: 56
+      image_width: 56
+  embedding_encoder:
+    seed: 0
+    dtype: float32
+    weight_initializer:
+      distribution: normal
+      standard_deviation: 0.02
+    text:
+      hidden_size: 32
+      intermediate_size: 64
+      num_hidden_layers: 2
+      num_attention_heads: 4
+      vocab_size: 256
+      max_position_embeddings: 64
+    inputs:
+      batch_size: 3
+      sequence_length: 8
+    checks:
+      - instantiate
+      - embedding_forward
+      - finite_embeddings
+      - normalized_embeddings
+models:
+  afm7:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  afmoe:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  apertus:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  aya_vision:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  baichuan_m1:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  bailing_moe:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  bailing_moe_linear:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  bert:
+    capabilities:
+      - embedding
+    scenarios:
+      - embedding
+    synthetic:
+      status: configured
+      adapter: bert
+      profile: embedding_encoder
+    hf_checkpoint:
+      status: configured
+      repo: sentence-transformers/all-MiniLM-L6-v2
+      revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+      expected_model_type: bert
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 90868376
+        gib: 0.08
+  bitnet:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  bonsai:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  cohere:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  cohere2:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  cohere2_moe:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  cohere_compass:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  colidefics3:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  colqwen2_5:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  dbrx:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  deepseek:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  deepseek_v2:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  deepseek_v3:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  deepseek_v32:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  deepseek_v4:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  deepseek_vl_v2:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: configured
+      adapter: deepseek_vl_v2
+      profile: moe_vlm
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/deepseek-vl2-tiny-4bit
+      revision: 4772de7c997d0b115d14593051621bcf0fdcce84
+      expected_model_type: deepseek_vl_v2
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 2099712075
+        gib: 1.96
+  deepseekocr:
+    capabilities:
+      - ocr
+    scenarios:
+      - ocr
+    synthetic:
+      status: TODO
+      adapter: deepseekocr
+      profile: ocr_vlm
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/DeepSeek-OCR-4bit
+      revision: 4958b6b0d46d7dc3cf27556989dab659996ea426
+      expected_model_type: deepseekocr
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 2451214926
+        gib: 2.28
+  deepseekocr_2:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  diffusion_gemma:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  dinov2:
+    capabilities:
+      - embedding
+    scenarios:
+      - embedding
+    synthetic:
+      status: TODO
+      adapter: dinov2
+      profile: dense_vlm
+    hf_checkpoint:
+      status: TODO
+      repo: facebook/dinov2-with-registers-small
+      revision: 0d9846e56b43a21fa46d7f3f5070f0506a5795a9
+      expected_model_type: dinov2_with_registers
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 88256200
+        gib: 0.08
+  dots1:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  dots_ocr:
+    capabilities:
+      - ocr
+    scenarios:
+      - ocr
+    synthetic:
+      status: TODO
+      adapter: dots_ocr
+      profile: ocr_vlm
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/dots.ocr-4bit
+      revision: 4ab989e403d4f8cafa5fdeede5b2290a706c2405
+      expected_model_type: dots_ocr
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 3524130967
+        gib: 3.28
+  ernie4_5:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  ernie4_5_moe:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  ernie4_5_moe_vl:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  ernie_image:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  exaone:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  exaone4:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  exaone_moe:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  falcon_h1:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  falcon_ocr:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  falcon_perception:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  fastvlm:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  florence2:
+    capabilities:
+      - vision_language
+      - ocr
+      - detection
+    scenarios:
+      - ocr
+      - detection
+    synthetic:
+      status: TODO
+      adapter: florence2
+      profile: ocr_vlm
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/Florence-2-base-ft-4bit
+      revision: cfed5ed3e86826b6aa2902abf6cf2e406fd94504
+      expected_model_type: florence2
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 163524711
+        gib: 0.15
+  flux2:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  gemma:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  gemma2:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  gemma3:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: gemma3
+      profile: dense_vlm
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/gemma-3-4b-it-qat-4bit
+      revision: 3d9ef289111449933c22761961f16a5df237ce2a
+      expected_model_type: gemma3
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 2995351814
+        gib: 2.79
+  gemma3_embedding:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  gemma3_text:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  gemma3n:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: gemma3n
+      profile: dense_vlm
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/gemma-3n-E2B-it-4bit
+      revision: 66e7276cfc589073b4f92ebed58c05301f990222
+      expected_model_type: gemma3n
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 4462976625
+        gib: 4.16
+  gemma4:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  gemma4_text:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  gemma4_unified:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  gliner2_5:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  glm:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  glm4:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  glm4_moe:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  glm4_moe_lite:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  glm4v:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: glm4v
+      profile: dense_vlm
+      overrides:
+        vision:
+          temporal_patch_size: 2
+          spatial_merge_size: 2
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/GLM-4.1V-9B-Thinking-4bit
+      revision: 74017f107021b8ade1aa0f1f5422e0a0dee0e86c
+      expected_model_type: glm4v
+      weight:
+        format: safetensors
+        files: 2
+        bytes: 7074017754
+        gib: 6.59
+  glm4v_moe:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: glm4v_moe
+      profile: moe_vlm
+      overrides:
+        vision:
+          temporal_patch_size: 2
+          spatial_merge_size: 2
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/GLM-4.5V-4bit
+      revision: 355a83dee508784046339f5a5a3b4154733db54d
+      expected_model_type: glm4v_moe
+      weight:
+        format: safetensors
+        files: 12
+        bytes: 61857424876
+        gib: 57.61
+  glm5_next:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  glm_moe_dsa:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  glm_ocr:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  got:
+    capabilities:
+      - ocr
+    scenarios:
+      - ocr
+    synthetic:
+      status: TODO
+      adapter: got
+      profile: ocr_vlm
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/GOT-OCR2_0-4bit
+      revision: 0e28c87720de5d8af67389a0444cf8397524cb61
+      expected_model_type: got
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 454463407
+        gib: 0.42
+  gpt2:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  gpt_bigcode:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  gpt_neox:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  gpt_oss:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  granite:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  granite4_vision:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  granite_vision:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: configured
+      adapter: granite_vision
+      profile: dense_vlm
+      overrides:
+        model:
+          vision_feature_layers: [-2, -1]
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/granite-vision-3.2-2b-4bit
+      revision: 351831ab5218b1f66bbfdfd57bd8f20d81ce8baf
+      expected_model_type: granite_vision
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 2346291044
+        gib: 2.19
+  granitemoe:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  granitemoehybrid:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  helium:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  hrm_text:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  hunyuan:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  hunyuan_v1_dense:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  hunyuan_vl:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  hy_v4:
+    capabilities:
+      - text_completion
+    scenarios:
+      - text_completion
+    synthetic:
+      status: TODO
+      adapter: hy_v4
+      profile: moe_vlm
+    hf_checkpoint:
+      status: TODO
+      repo: mlx-community/Hy4-preview-4bit
+      revision: 6c83660fe83ef0626bfbb70d7281cfb77d3f4245
+      expected_model_type: hy_v4
+      weight:
+        format: safetensors
+        files: 103
+        bytes: 433355075408
+        gib: 403.59
+  idefics2:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: idefics2
+      profile: dense_vlm
+      overrides:
+        perceiver:
+          num_latents: 4
+          depth: 1
+          num_attention_heads: 4
+          head_dim: 16
+    hf_checkpoint:
+      status: TODO
+  idefics3:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: idefics3
+      profile: dense_vlm
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/Idefics3-8B-Llama3-4bit
+      revision: b9a23281b47a4f6da5b00edf1bcfe09695c3125b
+      expected_model_type: idefics3
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 5354033292
+        gib: 4.99
+  ideogram4:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  inkling:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  internlm2:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  internlm3:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  internvl_chat:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: configured
+      adapter: internvl_chat
+      profile: dense_vlm
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/InternVL3-1B-4bit
+      revision: 7927bb6b86987f19398a14eee20a73c45fdb1867
+      expected_model_type: internvl_chat
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 964986994
+        gib: 0.90
+  iquestloopcoder:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  jamba:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  jina_vlm:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  k2_horizon:
+    capabilities:
+      - text_instruction
+    scenarios:
+      - text_instruction
+    synthetic:
+      status: TODO
+      adapter: k2_horizon
+      profile: dense_vlm
+    hf_checkpoint:
+      status: TODO
+      repo: IFM/K2-Horizon-0.9B
+      revision: 02d0da0fefe5a2f8dc3db091cad29b15c9d8e4fa
+      expected_model_type: k2_horizon
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 2156600968
+        gib: 2.01
+  kimi_k25:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  kimi_k3:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  kimi_linear:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  kimi_vl:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  klear:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  laguna:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  lfm2:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  lfm2_embedding:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  lfm2_moe:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  lfm2_vl:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  lille_130m:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  llada2_moe:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  llama:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  llama4:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: llama4
+      profile: moe_vlm
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit
+      revision: f89d3ebf0bb8f9b512d6c732aff83937deb55c3e
+      expected_model_type: llama4
+      weight:
+        format: safetensors
+        files: 12
+        bytes: 61115340220
+        gib: 56.92
+  llama4_text:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  llama_bidirec:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  llama_nemotron_vl_embedding:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  llava:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: llava
+      profile: dense_vlm
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/llava-1.5-7b-4bit
+      revision: 9c5dd50281d1abcf34ed128b5bf0013997f2af3f
+      expected_model_type: llava
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 3975094479
+        gib: 3.70
+  llava_bunny:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  llava_next:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: llava_next
+      profile: anyres_vlm
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/llava-v1.6-mistral-7b-4bit
+      revision: e3f381cf0bb6388d01ae1fc9a736948c4057c955
+      expected_model_type: llava_next
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 4258218323
+        gib: 3.97
+  llava_onevision:
+    capabilities:
+      - vision_language
+    scenarios:
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: llava_onevision
+      profile: anyres_vlm
+    hf_checkpoint:
+      status: TODO
+      repo: llava-hf/llava-onevision-qwen2-0.5b-ov-hf
+      revision: 74dd0bf867a4cda7950c17663794267c60cf4b40
+      expected_model_type: llava_onevision
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 1787445680
+        gib: 1.66
+  llmjpvl:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  locateanything:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  longcat_flash:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  longcat_flash_ngram:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  longcat_flash_sparse:
+    capabilities:
+      - text_completion
+    scenarios:
+      - text_completion
+    synthetic:
+      status: TODO
+      adapter: longcat_flash_sparse
+      profile: moe_vlm
+    hf_checkpoint:
+      status: TODO
+      repo: mlx-community/LongCat-Flash-Lite-Sparse-4bit
+      revision: 03296f3f32078f19d5c553021bf3c06a0042c315
+      expected_model_type: longcat_flash_sparse
+      weight:
+        format: safetensors
+        files: 8
+        bytes: 38604498864
+        gib: 35.95
+  mage_flow:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  mage_vl:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  mamba:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  mamba2:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  mellum:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  mimo:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  mimo_v2_flash:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  minicpm:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  minicpm3:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  minicpmo:
+    capabilities:
+      - text_instruction
+      - vision_language
+      - audio_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+      - audio_language
+    synthetic:
+      status: TODO
+      adapter: minicpmo
+      profile: audio_vision_language
+      overrides:
+        model:
+          query_num: 4
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/MiniCPM-o-4_5-4bit
+      revision: 592c09d85e7bffbc8f8e45a417aa8e9a96119814
+      expected_model_type: minicpmo
+      weight:
+        format: safetensors
+        files: 2
+        bytes: 6143475931
+        gib: 5.72
+  minicpmv4_6:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: minicpmv4_6
+      profile: dense_vlm
+      overrides:
+        model:
+          query_num: 4
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/MiniCPM-V-4.6-4bit
+      revision: 86cd463d33a946e4481b77e3c10fc63121b60a19
+      expected_model_type: minicpmv4_6
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 2157823786
+        gib: 2.01
+  minimax:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  minimax_h3:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  minimax_m3:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  minimax_m3_vl:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  ministral3:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  ministral3_embedding:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  mistral3:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: mistral3
+      profile: dense_vlm
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/Ministral-3-3B-Instruct-2512-4bit
+      revision: a962dcb09eee4169c890e544c9eb938f1113fdee
+      expected_model_type: mistral3
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 2745210934
+        gib: 2.56
+  mistral4:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  mixtral:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  mllama:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: mllama
+      profile: cross_attention_vlm
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/Llama-3.2-11B-Vision-Instruct-4bit
+      revision: 82f31be9840fa0d4c7e99257fe2e28b59a46df97
+      expected_model_type: mllama
+      weight:
+        format: safetensors
+        files: 2
+        bytes: 6007438436
+        gib: 5.59
+  modernbert:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  moge3:
+    capabilities:
+      - depth_estimation
+    scenarios:
+      - depth_estimation
+    synthetic:
+      status: TODO
+      adapter: moge3
+      profile: dense_vlm
+    hf_checkpoint:
+      status: TODO
+      repo: mlx-community/moge-3-vitl-mlx-fp32
+      revision: f5ceca7512506731fb1c50307c313da76aac500f
+      expected_model_type: moge3
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 1481204170
+        gib: 1.38
+  molmo:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: molmo
+      profile: dense_vlm
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/Molmo-7B-D-0924-4bit
+      revision: 5c04b3a418979597b1968e41414ad799c87533e8
+      expected_model_type: molmo
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 5298715127
+        gib: 4.93
+  molmo2:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  molmo_point:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  moondream2:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  moondream3:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  multi_modality:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  muse_glimmer:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  nanochat:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  nemotron:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  nemotron_h:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  nemotron_h_nano_omni:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  nemotron_labs_diffusion:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  nemotron_nas:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  nemotron_parse:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  nemotron_voicechat:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  olmo:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  olmo2:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  olmo3:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  olmoe:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  openai_privacy_filter:
+    capabilities:
+      - token_classification
+    scenarios:
+      - token_classification
+    synthetic:
+      status: TODO
+      adapter: openai_privacy_filter
+      profile: moe_vlm
+    hf_checkpoint:
+      status: TODO
+      repo: mlx-community/openai-privacy-filter-4bit
+      revision: 8b784df48dd38a36b757f50c73d23e5bd38f3db0
+      expected_model_type: openai_privacy_filter
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 790435150
+        gib: 0.74
+  openelm:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  paddleocr_vl:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  paligemma:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: paligemma
+      profile: dense_vlm
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/paligemma2-3b-mix-224-4bit
+      revision: 92d7b1bdd82b493d6d640a567529d480c1c68887
+      expected_model_type: paligemma
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 2299016937
+        gib: 2.14
+  phi:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  phi3:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  phi3_v:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: phi3_v
+      profile: dense_vlm
+      overrides:
+        vision:
+          image_feature_size: 32
+          num_image_tokens: 4
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/Phi-3.5-vision-instruct-4bit
+      revision: 9055619fe9dec921b8323f689064c23cd2c540d3
+      expected_model_type: phi3_v
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 2334279041
+        gib: 2.17
+  phi3small:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  phi4_siglip:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  phi4mm:
+    capabilities:
+      - text_instruction
+      - vision_language
+      - audio_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+      - audio_language
+    synthetic:
+      status: TODO
+      adapter: phi4mm
+      profile: audio_vision_language
+    hf_checkpoint:
+      status: configured
+      repo: Ferox-AI/Phi-4-multimodal-instruct-mlx-4bit
+      revision: 91363904916b98aacb9942e9e8c6d3a9a4962221
+      expected_model_type: phi4mm
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 3894257630
+        gib: 3.63
+  phimoe:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  phixtral:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  pixtral:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: pixtral
+      profile: dense_vlm
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/pixtral-12b-4bit
+      revision: 710ad583fa02c1e57424a066abb5dee2ea5d1f7a
+      expected_model_type: pixtral
+      weight:
+        format: safetensors
+        files: 2
+        bytes: 7136056634
+        gib: 6.65
+  plamo:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  plamo2:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  plamo2vl:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  pp_doclayout_v3:
+    capabilities:
+      - detection
+    scenarios:
+      - detection
+    synthetic:
+      status: TODO
+      adapter: pp_doclayout_v3
+      profile: dense_vlm
+    hf_checkpoint:
+      status: TODO
+      repo: HashNuke/pp-doclayout-v3-mlx
+      revision: cd50996ad0c7e35a7e20c27480f99cec1822cf7b
+      expected_model_type: pp_doclayout_v3
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 133232741
+        gib: 0.12
+  qwen:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  qwen2:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  qwen2_5_vl:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: configured
+      adapter: qwen2_5_vl
+      profile: dense_vlm
+      overrides:
+        vision:
+          temporal_patch_size: 2
+          spatial_merge_size: 2
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/Qwen2.5-VL-3B-Instruct-4bit
+      revision: 46d4cf06a06ffc1a766c214174f9cbed2f45bcab
+      expected_model_type: qwen2_5_vl
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 3073720461
+        gib: 2.86
+  qwen2_moe:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  qwen2_vl:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: configured
+      adapter: qwen2_vl
+      profile: dense_vlm
+      overrides:
+        vision:
+          temporal_patch_size: 2
+          spatial_merge_size: 2
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/Qwen2-VL-2B-Instruct-4bit
+      revision: 01af461cdb9574acc09084a0ef94e216e142b085
+      expected_model_type: qwen2_vl
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 1245868907
+        gib: 1.16
+  qwen3:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  qwen3_5:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  qwen3_5_moe:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  qwen3_embedding:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  qwen3_moe:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  qwen3_next:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  qwen3_omni_moe:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  qwen3_vl:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: qwen3_vl
+      profile: dense_vlm
+      overrides:
+        vision:
+          temporal_patch_size: 2
+          spatial_merge_size: 2
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/Qwen3-VL-2B-Instruct-4bit
+      revision: 9c4f5209e57b31f4b9dfba735de3fb983739c9cc
+      expected_model_type: qwen3_vl
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 1782040921
+        gib: 1.66
+  qwen3_vl_embedding:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  qwen3_vl_moe:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: qwen3_vl_moe
+      profile: moe_vlm
+      overrides:
+        vision:
+          temporal_patch_size: 2
+          spatial_merge_size: 2
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit
+      revision: 0555d34cb1ed80c0e61a5635194c70027b4c2ff3
+      expected_model_type: qwen3_vl_moe
+      weight:
+        format: safetensors
+        files: 4
+        bytes: 18252103673
+        gib: 17.00
+  qwen4_exp:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  recurrent_gemma:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  rfdetr:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  rt_detr_v2:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  rwkv7:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  sam3:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  sam3_1:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  sam3d_body:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  seed_oss:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  siglip:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  smollm3:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  smolvlm:
+    capabilities:
+      - text_instruction
+      - vision_language
+    scenarios:
+      - text_instruction
+      - vlm_animal
+    synthetic:
+      status: TODO
+      adapter: smolvlm
+      profile: dense_vlm
+      overrides:
+        model:
+          scale_factor: 2
+    hf_checkpoint:
+      status: configured
+      repo: mlx-community/SmolVLM2-256M-Video-Instruct-mlx
+      revision: 79901655c1a3d7ed6646c91325e3fde47e40e611
+      expected_model_type: smolvlm
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 513026834
+        gib: 0.48
+  solar_open:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  spark2_5:
+    capabilities:
+      - text_instruction
+    scenarios:
+      - text_instruction
+    synthetic:
+      status: TODO
+      adapter: spark2_5
+      profile: dense_vlm
+    hf_checkpoint:
+      status: TODO
+      repo: dakerholdings/Spark-X2.5-1.7B-ridge_4_6_8-mlx
+      revision: f9148170e2a85f70a02e0f3f96aa4e003a8d0d54
+      expected_model_type: spark2_5
+      weight:
+        format: safetensors
+        files: 4
+        bytes: 1184101622
+        gib: 1.10
+  stablelm:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  starcoder2:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  step3p5:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  step3p7:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  telechat3:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  unlimited_ocr:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  video_depth_anything:
+    capabilities:
+      - depth_estimation
+    scenarios:
+      - depth_estimation
+    synthetic:
+      status: TODO
+      adapter: video_depth_anything
+      profile: dense_vlm
+    hf_checkpoint:
+      status: TODO
+      repo: mlx-community/Video-Depth-Anything-Small-MLX
+      revision: a12a442242291eed6b885b196cbbdb51f3bcdb87
+      expected_model_type: video_depth_anything
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 116362301
+        gib: 0.11
+  xlm_roberta:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  yolo11:
+    capabilities:
+      - detection
+    scenarios:
+      - detection
+    synthetic:
+      status: TODO
+      adapter: yolo11
+      profile: dense_vlm
+    hf_checkpoint:
+      status: TODO
+      repo: axiom-of-choice/OmniParser-v2-icon-detect
+      revision: e19ddc689414659b9a98a950c0af5a04aff96053
+      expected_model_type: yolo11
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 80451504
+        gib: 0.07
+  youtu_llm:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  youtu_vl:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  z1t:
+    capabilities:
+      - text_completion
+    scenarios:
+      - text_completion
+    synthetic:
+      status: TODO
+      adapter: z1t
+      profile: dense_vlm
+    hf_checkpoint:
+      status: TODO
+      repo: mlx-community/Z1T-0-mlx
+      revision: 41b0e1b5ee701c95d7369836e952928946290df0
+      expected_model_type: z1t
+      weight:
+        format: safetensors
+        files: 1
+        bytes: 4968297160
+        gib: 4.63
+  z_image:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO
+  zaya1_vl:
+    synthetic:
+      status: TODO
+    hf_checkpoint:
+      status: TODO

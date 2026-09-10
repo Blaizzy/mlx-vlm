@@ -1,0 +1,10 @@
+refuse:
+  - .github/workflows/
+  - ci/protected_paths.yaml
+  - pyproject.toml
+  - uv.lock
+  - setup.py
+  - setup.cfg
+
+warn:
+  - ci/

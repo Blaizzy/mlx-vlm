@@ -1,0 +1,135 @@
+name: CI control
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: ci-control-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      has_hosted_checks: ${{ steps.control.outputs.has_hosted_checks || 'false' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: control
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: head
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Detect trusted repository adapter
+        id: interface
+        run: |
+          if [[ -f control/ci/repository_adapter.py && -f control/ci/hosted-requirements.txt ]]; then
+            printf 'available=true\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'available=false\n' >> "$GITHUB_OUTPUT"
+            printf 'Repository CI activates after its trusted adapter lands on the base branch.\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Install repository-owned hosted dependencies
+        if: steps.interface.outputs.available == 'true'
+        run: python -m pip install --quiet --require-hashes -r control/ci/hosted-requirements.txt
+      - name: Build trusted repository plan
+        id: control
+        if: steps.interface.outputs.available == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          PYTHONPATH=control python -m ci.repository_adapter plan \
+            --repository-path control \
+            --base-checkout control \
+            --head-checkout head \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" \
+            --repository "$REPOSITORY" \
+            --contract-sha "$BASE_SHA" \
+            --pr-number "$PR_NUMBER" \
+            --run-url "$RUN_URL" \
+            --output control.json \
+            --summary summary.md \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Publish planning summary
+        if: steps.interface.outputs.available == 'true'
+        run: cat summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: steps.interface.outputs.available == 'true'
+        with:
+          name: repository-plan-${{ github.run_id }}
+          path: control.json
+          retention-days: 1
+      - name: Enforce planning blockers
+        if: steps.interface.outputs.available == 'true' && steps.control.outputs.outcome == 'blocked'
+        run: exit 1
+
+  hosted_checks:
+    needs: plan
+    if: needs.plan.result == 'success' && needs.plan.outputs.has_hosted_checks == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: control
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: head
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: repository-plan-${{ github.run_id }}
+      - name: Install repository-owned hosted dependencies
+        run: python -m pip install --quiet --require-hashes -r control/ci/hosted-requirements.txt
+      - name: Run trusted hosted checks
+        id: hosted
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          PYTHONPATH=control python -m ci.repository_adapter hosted-checks \
+            --control control.json \
+            --repository-path control \
+            --base-checkout control \
+            --head-checkout head \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" \
+            --output resolved-control.json \
+            --summary hosted-summary.md \
+            --github-output "$GITHUB_OUTPUT"
+          cat hosted-summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Enforce hosted-check result
+        if: steps.hosted.outputs.outcome != 'passed'
+        run: exit 1

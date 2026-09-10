@@ -1,0 +1,234 @@
+schema_version: 1
+defaults:
+  seed: 0
+  temperature: 0.0
+defaults_by_capability:
+  text_completion: text_completion
+  text_instruction: text_instruction
+  vision_language: vlm_animal
+  ocr: ocr
+  diffusion: diffusion_text_to_image
+  image_generation: image_generation
+  image_editing: image_editing
+  embedding: embedding
+  detection: detection
+  segmentation: segmentation
+  audio_language: audio_language
+fixtures:
+  red_square:
+    generator: raster_shapes
+    width: 256
+    height: 256
+    background: [255, 255, 255]
+    shapes:
+      - type: rectangle
+        bounds: [64, 64, 192, 192]
+        color: [255, 0, 0]
+  mlx_42:
+    generator: text_canvas
+    width: 512
+    height: 256
+    background: [255, 255, 255]
+    text: MLX 42
+    text_color: [0, 0, 0]
+    font_size: 72
+  tone:
+    generator: sine_wave
+    sample_rate: 16000
+    frequency_hz: 440
+    duration_seconds: 1.0
+scenarios:
+  text_completion:
+    capability: text_completion
+    input:
+      interface: completion
+      prompt: "The sequence is 1, 2, 3,"
+    generation:
+      max_tokens: 4
+    assertions:
+      synthetic:
+        - finite_logits
+        - output_shape
+      real:
+        - non_empty
+  text_instruction:
+    capability: text_instruction
+    input:
+      interface: chat
+      prompt: "Reply with only the number: What is 2 + 2?"
+    generation:
+      max_tokens: 4
+    assertions:
+      synthetic:
+        - finite_logits
+        - output_shape
+      real:
+        - type: normalized_equals
+          value: "4"
+  vlm_animal:
+    capability: vision_language
+    input:
+      interface: chat
+      prompt: "What animal is shown? Answer with one lowercase word."
+      cases:
+        - asset: cat
+          expected: cat
+        - asset: dog
+          expected: dog
+    generation:
+      max_tokens: 4
+    assertions:
+      synthetic:
+        - finite_logits
+        - output_shape
+      real:
+        - normalized_equals_expected
+  vlm_color:
+    capability: vision_language
+    input:
+      interface: chat
+      fixture: red_square
+      prompt: "What color is the square? Answer with one lowercase word."
+    generation:
+      max_tokens: 4
+    assertions:
+      synthetic:
+        - finite_logits
+        - output_shape
+      real:
+        - type: normalized_equals
+          value: red
+  ocr:
+    capability: ocr
+    input:
+      fixture: mlx_42
+      prompt: "Transcribe all visible text exactly."
+    generation:
+      max_tokens: 8
+    assertions:
+      synthetic:
+        - finite_logits
+        - output_shape
+      real:
+        - type: normalized_contains
+          value: MLX 42
+  diffusion_text_to_image:
+    capability: diffusion
+    input:
+      prompt: "A studio photograph of a golden dog lying on green grass, centered, natural daylight."
+    generation:
+      width: 64
+      height: 64
+      steps: 2
+    assertions:
+      synthetic:
+        - finite_pixels
+        - output_shape
+      real:
+        - non_uniform_image
+  image_generation:
+    capability: image_generation
+    input:
+      prompt: "Generate a square image of a gray cat sitting on green grass."
+    generation:
+      width: 64
+      height: 64
+      max_tokens: 256
+    assertions:
+      synthetic:
+        - finite_pixels
+        - output_shape
+      real:
+        - non_uniform_image
+  image_editing:
+    capability: image_editing
+    input:
+      asset: cat
+      prompt: "Replace the grassy background with a blue studio background. Keep the cat unchanged."
+    generation:
+      width: 64
+      height: 64
+      steps: 2
+    assertions:
+      synthetic:
+        - finite_pixels
+        - output_shape
+      real:
+        - non_uniform_image
+        - blue_channel_dominant
+  embedding:
+    capability: embedding
+    input:
+      texts:
+        - "a gray cat is resting on the grass"
+        - "a feline is lying outdoors"
+        - "an airplane is taking off"
+    assertions:
+      synthetic:
+        - finite_embeddings
+        - output_shape
+        - normalized_embeddings
+      real:
+        - finite_embeddings
+        - normalized_embeddings
+        - related_pair_similarity_above_unrelated
+  detection:
+    capability: detection
+    input:
+      asset: dog
+      prompt: "Locate the dog."
+    assertions:
+      synthetic:
+        - finite_outputs
+        - output_schema
+      real:
+        - coordinates_in_bounds
+        - non_empty_detections
+  segmentation:
+    capability: segmentation
+    input:
+      asset: cat
+      prompt: "Segment the cat."
+    assertions:
+      synthetic:
+        - finite_outputs
+        - output_shape
+      real:
+        - valid_mask
+        - non_empty_mask
+  depth_estimation:
+    capability: depth_estimation
+    input:
+      asset: dog
+    assertions:
+      synthetic:
+        - finite_outputs
+        - output_shape
+      real:
+        - finite_depth
+        - non_constant_depth
+  token_classification:
+    capability: token_classification
+    input:
+      text: "Alice can be reached at alice@example.com."
+    assertions:
+      synthetic:
+        - finite_logits
+        - output_shape
+      real:
+        - valid_spans
+        - redacts_email
+  audio_language:
+    capability: audio_language
+    input:
+      interface: chat
+      fixture: tone
+      prompt: "Describe this audio briefly."
+    generation:
+      max_tokens: 8
+    assertions:
+      synthetic:
+        - finite_logits
+        - output_shape
+      real:
+        - non_empty

@@ -18,6 +18,23 @@ After that, add the model file to the
 directory. You can see other examples there. We recommend starting from a model
 that is similar to the model you are porting.
 
+## Apple Silicon CI
+
+CI maps every changed file to an independent change type. Documentation-only
+changes run hosted documentation checks. Changes inside
+`mlx_vlm/models/<family>/` create one `ModelPath` job per touched family; each
+job checks a deterministic synthetic forward pass before running its pinned
+Hugging Face checkpoint. Correctness determines the result, while performance
+measurements are reported separately.
+
+Embedding models use the same `ModelPath` flow with embedding-specific inputs,
+normalization and semantic-similarity checks, and latency and throughput metrics.
+
+For a new model family, add its synthetic configuration and immutable checkpoint
+metadata to `ci/model_path.yaml`. The initial run waits for a maintainer to issue
+`/ci run`; later commits and reruns produce separate results tied to their exact
+commit.
+
 Make sure the name of the new model file is the same as the `model_type` in the
 `config.json`, for example
 [llava](https://huggingface.co/llava-hf/llava-1.5-7b-hf/blob/main/config.json#L7).
