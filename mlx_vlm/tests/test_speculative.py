@@ -7,7 +7,6 @@ import pytest
 from mlx.utils import tree_flatten
 
 from mlx_vlm.generate.ar import _make_cache, _PositionedTargetSampler
-from mlx_vlm.models.base import LanguageModelOutput
 from mlx_vlm.models.gated_delta import gated_delta_update
 from mlx_vlm.models.glm5_next import language as glm5_next_language
 from mlx_vlm.speculative.cache_state import (
@@ -181,14 +180,26 @@ def test_target_sampling_preserves_positioned_draws():
     assert actual == expected
 
 
-def test_chunked_prefill_retains_all_target_features():
-    prefill = SpeculativePrefill("mtp", object())
-    prefill.append(LanguageModelOutput(logits=None, hidden_states=[mx.ones((1, 3, 4))]))
-    output = prefill.finish(
-        LanguageModelOutput(logits=None, hidden_states=[mx.zeros((1, 2, 4))])
+def test_chunked_prefill_keeps_only_draft_seed():
+    target, draft = models()
+    tokens = mx.array([[1, 2, 3, 4, 5]])
+    cache = target.make_cache()
+    prefill = SpeculativePrefill("mtp", draft, tokens)
+    positions = []
+    prefill.start(
+        target,
+        cache,
+        draft,
+        checkpoint=lambda state: positions.append(state.position.item()),
     )
-    assert output.hidden_states[-1].shape == (1, 5, 4)
-    assert not prefill.chunks
+    for chunk in (tokens[:, :2], tokens[:, 2:4]):
+        prefill.append(target(chunk, cache=cache, return_hidden=True))
+    output = target(tokens[:, 4:], cache=cache, return_hidden=True)
+    prefill.finish(output, mx.argmax(output.logits[:, -1], axis=-1))
+    assert positions == [2, 4]
+    assert prefill.state.position.item() == 5
+    assert prefill.state.seed.hidden.shape[1] == 1
+    assert not hasattr(prefill, "chunks")
 
 
 @pytest.mark.parametrize("chunk", [1, 2, 16])

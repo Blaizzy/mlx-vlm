@@ -18,7 +18,18 @@ def accept_greedy(proposals, logits, budgets):
     ]
 
 
-def accept_sampled(proposals, logits, budgets, sampler, row_ids, positions):
+def accept_sampled(
+    proposals,
+    logits,
+    budgets,
+    sampler,
+    row_ids,
+    positions,
+    *,
+    processors=None,
+    contexts=None,
+    greedy=False,
+):
     """Sample the target only through the first rejection in each row.
 
     A deterministic draft has q(d)=1. Accepting iff a target draw equals d,
@@ -29,17 +40,28 @@ def accept_sampled(proposals, logits, budgets, sampler, row_ids, positions):
     rows = []
     for row, budget in enumerate(budgets):
         tokens = []
+        row_processors = processors[row] if processors else []
+        context = list(contexts[row]) if row_processors else []
         for pos in range(min(len(drafts[row]) + 1, budget)):
             scores = logits[row : row + 1, pos]
-            logprobs = scores - mx.logsumexp(scores, axis=-1, keepdims=True)
-            if hasattr(sampler, "sample_target"):
-                token = sampler.sample_target(
-                    logprobs, row_ids=[row_ids[row]], positions=[positions[row] + pos]
-                )
+            for processor in row_processors or []:
+                scores = processor(mx.array(context, dtype=mx.int32), scores)
+            if greedy:
+                token = mx.argmax(scores, axis=-1)
             else:
-                token = sampler(logprobs)
+                logprobs = scores - mx.logsumexp(scores, axis=-1, keepdims=True)
+                if hasattr(sampler, "sample_target"):
+                    token = sampler.sample_target(
+                        logprobs,
+                        row_ids=[row_ids[row]],
+                        positions=[positions[row] + pos],
+                    )
+                else:
+                    token = sampler(logprobs)
             token = int(token.item())
             tokens.append(token)
+            if row_processors:
+                context.append(token)
             if pos == len(drafts[row]) or token != drafts[row][pos]:
                 break
         rows.append(tokens)

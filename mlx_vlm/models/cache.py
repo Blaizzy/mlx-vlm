@@ -1447,7 +1447,7 @@ class BatchKVCache(_BaseCache):
                     "Left padding can only be added to an empty BatchKVCache"
                 )
             left_padding = mx.array(left_padding)
-            self.left_padding += left_padding
+            self.left_padding = self.left_padding + left_padding
             self.offset -= left_padding
 
         if right_padding is not None and max(right_padding) > 0:
@@ -1465,7 +1465,7 @@ class BatchKVCache(_BaseCache):
             self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
             self.values = dynamic_roll(self.values, padding[:, None], axis=2)
             self.offset -= padding
-            self.left_padding += padding
+            self.left_padding = self.left_padding + padding
             self._right_padding = None
 
     @property
@@ -1517,7 +1517,7 @@ class BatchKVCache(_BaseCache):
                 self.keys = self.keys[..., min_left_pad:, :]
                 self.values = self.values[..., min_left_pad:, :]
             self._idx -= min_left_pad
-            self.left_padding -= min_left_pad
+            self.left_padding = self.left_padding - min_left_pad
 
     def extend(self, other):
         """
@@ -1567,6 +1567,8 @@ class BatchKVCache(_BaseCache):
     def extract(self, idx):
         cache = KVCache()
         padding = self.left_padding[idx].item()
+        if self.keys is None:
+            return cache
         cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
         cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
         cache.offset = cache.keys.shape[2]
@@ -2204,7 +2206,7 @@ class BatchQuantizedKVCache(_BaseCache):
                     "Left padding can only be added to an empty BatchQuantizedKVCache"
                 )
             left_padding = mx.array(left_padding)
-            self.left_padding += left_padding
+            self.left_padding = self.left_padding + left_padding
             self.offset -= left_padding
 
         if right_padding is not None and max(right_padding) > 0:
@@ -2224,7 +2226,7 @@ class BatchQuantizedKVCache(_BaseCache):
                 dynamic_roll(v, padding[:, None], axis=2) for v in self.values
             )
         self.offset -= padding
-        self.left_padding += padding
+        self.left_padding = self.left_padding + padding
         self._right_padding = None
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
@@ -2324,7 +2326,7 @@ class BatchQuantizedKVCache(_BaseCache):
                 self.keys = tuple(k[..., min_lp:, :] for k in self.keys)
                 self.values = tuple(v[..., min_lp:, :] for v in self.values)
             self._idx -= min_lp
-            self.left_padding -= min_lp
+            self.left_padding = self.left_padding - min_lp
 
     def extend(self, other: "BatchQuantizedKVCache"):
         """Concatenate *other* batch into this cache along the batch dim."""

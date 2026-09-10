@@ -486,7 +486,7 @@ def test_speculative_server_prefill_kwargs_are_drafter_specific():
     assert speculative_utils.speculative_prefill_kwargs("mtp", drafter) == {
         "return_hidden": True,
     }
-    with pytest.raises(ValueError, match="Only GLM"):
+    with pytest.raises(ValueError, match="Only native MTP"):
         speculative_utils.speculative_prefill_kwargs("dflash", drafter)
 
 

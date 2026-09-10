@@ -26,6 +26,10 @@ def mtp_rounds(
     eos_token_ids=None,
     greedy_sampling=False,
     row_ids=None,
+    phase_observer=None,
+    logits_processors=None,
+    token_context=None,
+    state=None,
 ):
     """Yield one token per live row. ``max_tokens`` includes ``first_bonus``.
 
@@ -46,6 +50,11 @@ def mtp_rounds(
         raise ValueError(
             "MTP block size must be at least 2 (one draft plus one target token)."
         )
+    immediate_yield = any(
+        getattr(processor, "requires_immediate_decode_yield", False)
+        for processors in logits_processors or []
+        for processor in processors or []
+    )
     target = getattr(model, "language_model", model)
     row_ids = list(range(batch)) if row_ids is None else row_ids
     padding = None
@@ -55,14 +64,27 @@ def mtp_rounds(
             break
     if batch > 1 and padding is None:
         raise ValueError("Batched MTP requires batch prompt caches.")
-    state = SpeculativeCache(
-        prompt_cache,
-        draft_model.make_cache(padding),
-        [0] * batch if padding is None else [-p for p in padding],
-        first_bonus.astype(token_dtype),
-    )
     forward = partial(draft_model, target_model=target)
-    state.prefill(prompt_tokens, hidden, forward)
+    if phase_observer:
+        phase_observer("start", [])
+    if state is None:
+        state = SpeculativeCache.create(prompt_cache, draft_model, batch)
+        state.bonus = first_bonus.astype(token_dtype).reshape(-1, 1)
+        state.prefill(prompt_tokens, hidden, forward)
+    contexts = (
+        token_context
+        if token_context is not None
+        else [
+            row[(padding[i] if padding else 0) :]
+            for i, row in enumerate(prompt_tokens.tolist())
+        ]
+    )
+    state.tokens = [
+        list(context) + [token]
+        for context, token in zip(contexts, first_bonus.reshape(-1).tolist())
+    ]
+    if phase_observer:
+        phase_observer("draft_prefill", [state.seed.token, state.seed.hidden])
     produced = [1] * batch
     stopped = [False] * batch
     eos = eos_token_ids or set()
@@ -77,18 +99,35 @@ def mtp_rounds(
                 0 if stopped[i] else max(0, limits[i] - n)
                 for i, n in enumerate(produced)
             ]
-            depth = min(count, max(budgets) - 1)
+            depth = 0 if immediate_yield else min(count, max(budgets) - 1)
             proposals = state.propose(depth, forward)
+            if phase_observer:
+                phase_observer("draft", [proposals])
             output = target(
-                state.verify_inputs(proposals), cache=state.target, return_hidden=True
+                state.verify_inputs(proposals),
+                cache=state.target,
+                return_hidden=True,
+                position_ids=state.positions(proposals.shape[1] + 1),
             )
             state.record_verification(output.hidden_states[-1])
-            if greedy_sampling:
+            if phase_observer:
+                phase_observer("verify", [output.logits, output.hidden_states[-1]])
+            if greedy_sampling and not (logits_processors and any(logits_processors)):
                 rows = accept_greedy(proposals, output.logits, budgets)
             else:
                 rows = accept_sampled(
-                    proposals, output.logits, budgets, sampler, row_ids, produced
+                    proposals,
+                    output.logits,
+                    budgets,
+                    sampler,
+                    row_ids,
+                    produced,
+                    processors=logits_processors,
+                    contexts=state.tokens,
+                    greedy=greedy_sampling,
                 )
+            if phase_observer:
+                phase_observer("accept", [])
             for row, values in enumerate(rows):
                 for pos, token in enumerate(values):
                     if token in eos or (stop_check and stop_check(row, token)):
@@ -109,6 +148,10 @@ def mtp_rounds(
                             produced[row] += 1
                     if pos + 1 == width:
                         state.commit(emitted, forward)
+                        if phase_observer:
+                            phase_observer(
+                                "commit", [state.seed.token, state.seed.hidden]
+                            )
                         record_round(draft_model, proposals, emitted)
                         committed = True
                     yield tokens, {"round_pos": pos, "round_len": width}

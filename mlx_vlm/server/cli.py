@@ -231,14 +231,14 @@ def main():
         "--draft-model",
         type=str,
         default=None,
-        help="GLM-5.3-Flash native MTP checkpoint path or HF id.",
+        help="Native MTP checkpoint path or HF id (GLM-5.3-Flash or Qwen3.5).",
     )
     parser.add_argument(
         "--draft-kind",
         type=str,
         default=None,
         choices=["mtp"],
-        help="Speculative method (currently GLM-5.3-Flash MTP).",
+        help="Speculative method (native MTP).",
     )
     parser.add_argument(
         "--draft-block-size",

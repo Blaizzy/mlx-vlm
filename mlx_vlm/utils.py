@@ -1157,6 +1157,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         mx.eval(model.parameters())
 
     model.model_path = model_path
+    if hasattr(model, "language_model"):
+        model.language_model.model_path = model_path
     model.eval()
     return model
 

@@ -11,6 +11,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
+from ..linear import DECODE_BLOCK_SIZE, linear
 from ..rope_utils import MRoPERotaryEmbedding
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
 from .batch_invariant import Qwen3_5BatchInvariantForward
@@ -800,6 +801,21 @@ def _qwen3_5_left_padded_attention(
     if max(pads) <= 0:
         return None
 
+    if 1 < queries.shape[2] <= DECODE_BLOCK_SIZE:
+        prefix = keys.shape[2] - queries.shape[2]
+        outputs = [
+            _qwen3_5_ragged_decode_attention(
+                queries[:, :, i : i + 1],
+                keys[:, :, : prefix + i + 1],
+                values[:, :, : prefix + i + 1],
+                pads,
+                scale,
+            )
+            for i in range(queries.shape[2])
+        ]
+        if all(output is not None for output in outputs):
+            return mx.concatenate(outputs, axis=2)
+
     output = _qwen3_5_ragged_decode_attention(queries, keys, values, pads, scale)
     if output is not None:
         return output
@@ -893,9 +909,9 @@ class Qwen3_5Attention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
         q_proj_output, keys, values = (
-            self.q_proj(x),
-            self.k_proj(x),
-            self.v_proj(x),
+            linear(self.q_proj, x),
+            linear(self.k_proj, x),
+            linear(self.v_proj, x),
         )
         queries, keys, values, gate, mask = self._prepare_projected_qkv(
             q_proj_output,
@@ -910,8 +926,9 @@ class Qwen3_5Attention(nn.Module):
         left_padded_decode = (
             mask == "left_padded_decode" if isinstance(mask, str) else False
         )
-        if left_padded_decode:
-            mask = None
+        if left_padded_decode or 1 < L <= DECODE_BLOCK_SIZE:
+            if left_padded_decode:
+                mask = None
             output = _qwen3_5_left_padded_attention(
                 queries, keys, values, cache=cache, scale=self.scale, mask=mask
             )
@@ -924,7 +941,7 @@ class Qwen3_5Attention(nn.Module):
             )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return self.o_proj(output * mx.sigmoid(gate))
+        return linear(self.o_proj, output * mx.sigmoid(gate))
 
     def _prepare_projected_qkv(
         self,
@@ -1005,7 +1022,9 @@ class Qwen3_5MLP(nn.Module):
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+        return linear(
+            self.down_proj, swiglu(linear(self.gate_proj, x), linear(self.up_proj, x))
+        )
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -1071,7 +1090,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return q, k
 
     def _project_gates(self, inputs: mx.array):
-        return self.in_proj_b(inputs), self.in_proj_a(inputs)
+        return linear(self.in_proj_b, inputs), linear(self.in_proj_a, inputs)
 
     def __call__(
         self,
@@ -1080,8 +1099,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
-        mixed_qkv = self.in_proj_qkv(inputs)
-        z = self.in_proj_z(inputs)
+        mixed_qkv = linear(self.in_proj_qkv, inputs)
+        z = linear(self.in_proj_z, inputs)
         b, a = self._project_gates(inputs)
 
         z = z.reshape(B, S, -1, self.head_v_dim)
@@ -1110,11 +1129,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 0, conv_input, self.conv_kernel_size - 1, lengths=cache.lengths
             )
         if (
-            S == 1
-            and conv_input.shape[1] == self.conv_kernel_size
+            S <= DECODE_BLOCK_SIZE
+            and not self.training
             and self.conv1d.weight.dtype in (mx.bfloat16, mx.float16)
         ):
-            conv_out = nn.silu(self._causal_conv1d_decode(conv_input))
+            conv_out = nn.silu(
+                mx.concatenate(
+                    [
+                        self._causal_conv1d_decode(
+                            conv_input[:, i : i + self.conv_kernel_size]
+                        )
+                        for i in range(S)
+                    ],
+                    axis=1,
+                )
+            )
         else:
             conv_out = nn.silu(self.conv1d(conv_input))
 
@@ -1149,7 +1178,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 _qwen3_5_advance_lengths_info(cache, S)
 
         out = self.norm(out, z)
-        return self.out_proj(out.reshape(B, S, -1))
+        return linear(self.out_proj, out.reshape(B, S, -1))
 
 
 class Qwen3_5DecoderLayer(nn.Module):
@@ -1225,8 +1254,12 @@ class Qwen3_5Model(nn.Module):
             cache = [None] * len(self.layers)
 
         fa_cache = cache[self.fa_idx]
+        # Row extraction replaces cache objects. Preserve their identity while
+        # the native caches are recording a bounded temporal history.
+        recording = any(getattr(entry, "is_speculating", False) for entry in cache)
         if (
             h.shape[0] == 1
+            and not recording
             and hidden_sink is None
             and fa_cache is not None
             and _is_single_row_batch_cache(fa_cache)
@@ -1255,6 +1288,7 @@ class Qwen3_5Model(nn.Module):
 
         if (
             h.shape[0] > 1
+            and not recording
             and h.shape[1] > 1
             and hidden_sink is None
             and fa_cache is not None
@@ -1365,6 +1399,10 @@ class Qwen3_5Model(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    def chunked_prefill_policy(
+        self, *, draft_model=None, prefill_kwargs=None, **kwargs
+    ):
+        return draft_model is None or bool((prefill_kwargs or {}).get("return_hidden"))
 
     def __init__(self, args: TextConfig, config: ModelConfig = None):
         super().__init__()
@@ -1753,9 +1791,9 @@ class LanguageModel(nn.Module):
         if skip_logits:
             logits = None
         elif self.args.tie_word_embeddings:
-            logits = self.model.embed_tokens.as_linear(out)
+            logits = linear(self.model.embed_tokens.as_linear, out)
         else:
-            logits = self.lm_head(out)
+            logits = linear(self.lm_head, out)
         return LanguageModelOutput(
             logits=logits,
             hidden_states=hidden_sink,

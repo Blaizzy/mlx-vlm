@@ -1,4 +1,4 @@
-"""Generation entry points for the GLM-5.3-Flash MTP implementation."""
+"""Generation entry points for native MTP adapters."""
 
 from .cache_state import SpeculativePrefill
 from .drafters import validate_drafter_compatibility
@@ -24,7 +24,7 @@ __all__ = [
 
 def speculative_prefill_kwargs(draft_kind, drafter):
     if draft_kind != "mtp":
-        raise ValueError("Only GLM-5.3-Flash MTP speculative decoding is supported.")
+        raise ValueError("Only native MTP speculative decoding is supported.")
     return {"return_hidden": True}
 
 
@@ -65,6 +65,9 @@ def run_speculative_rounds(
     sampler,
     draft_block_size=None,
     sampler_is_greedy=False,
+    logits_processors=None,
+    token_context=None,
+    state=None,
 ):
     if max_tokens <= 0:
         return
@@ -89,6 +92,9 @@ def run_speculative_rounds(
         token_dtype=input_ids.dtype,
         eos_token_ids=eos,
         greedy_sampling=sampler_is_greedy,
+        logits_processors=[logits_processors or []] * batch,
+        token_context=token_context,
+        state=state,
     )
     try:
         for tokens, _ in rounds:

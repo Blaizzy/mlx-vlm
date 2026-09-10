@@ -5,6 +5,7 @@ unaccepted inputs, and aligns the MTP tokens with verified target features.
 """
 
 from dataclasses import dataclass
+from functools import partial
 
 import mlx.core as mx
 
@@ -54,7 +55,9 @@ class CacheTransaction:
         self.active = True
         self.temporal = []
         self.append = []
+        self.caches = caches
         leaves = tuple({id(c): c for c in iter_leaf_caches(caches)}.values())
+        self.identities = {id(c) for c in leaves}
         self.check_types(leaves)
         try:
             for cache in leaves:
@@ -70,6 +73,10 @@ class CacheTransaction:
     def validate(self, lengths):
         if not self.active:
             raise RuntimeError("The cache transaction has already finished.")
+        if {id(c) for c in iter_leaf_caches(self.caches)} != self.identities:
+            raise RuntimeError(
+                "A forward replaced cache objects during an active transaction."
+            )
         if not lengths or any(n < 0 or n > self.length for n in lengths):
             raise ValueError(f"Retained lengths must be between 0 and {self.length}.")
         for cache, generation in self.temporal:
@@ -116,25 +123,65 @@ class CacheTransaction:
 
 
 class SpeculativePrefill:
-    """Collect target features across chunks for the shifted MTP prefill."""
+    """Stream target features into the shifted MTP cache, retaining one seed."""
 
     def __init__(self, draft_kind, drafter, tokens=None):
         self.kwargs = {"return_hidden": True} if drafter is not None else {}
         self.tokens = tokens
-        self.chunks = []
+        self.state = None
+        self.consumed = 0
+        self.checkpoint = None
+
+    def start(
+        self,
+        model,
+        target_cache,
+        drafter,
+        *,
+        state=None,
+        checkpoint=None,
+        position_offset=None,
+    ):
+        """Stream target features into MTP, keeping only the next draft seed."""
+        self.forward = partial(
+            drafter, target_model=getattr(model, "language_model", model)
+        )
+        self.state = state or SpeculativeCache.create(
+            target_cache, drafter, self.tokens.shape[0]
+        )
+        self.checkpoint = checkpoint
+        if position_offset is not None:
+            self.state.position_offset = position_offset.reshape(-1)
 
     def append(self, output):
         if self.kwargs:
             hidden = output.hidden_states[-1]
-            mx.async_eval(hidden)
-            self.chunks.append(hidden)
+            if self.state is not None:
+                end = self.consumed + hidden.shape[1]
+                self.state.bonus = self.tokens[:, end : end + 1]
+                self.state.prefill(
+                    self.tokens[:, self.consumed : end], hidden, self.forward
+                )
+                mx.async_eval(
+                    [entry.state for entry in self.state.draft],
+                    self.state.seed.token,
+                    self.state.seed.hidden,
+                )
+                self.consumed = end
+                if self.checkpoint:
+                    self.checkpoint(self.state)
+                return
+            raise RuntimeError("Initialize the speculative cache before prefill.")
 
-    def finish(self, output):
-        if self.chunks:
-            output.hidden_states = [
-                mx.concatenate([*self.chunks, output.hidden_states[-1]], axis=1)
-            ]
-            self.chunks.clear()
+    def finish(self, output, first_bonus=None):
+        if self.state is not None:
+            self.state.bonus = first_bonus.reshape(-1, 1)
+            self.state.prefill(
+                self.tokens[:, self.consumed :], output.hidden_states[-1], self.forward
+            )
+            return output
+        if self.kwargs:
+            raise RuntimeError("Initialize the speculative cache before prefill.")
         return output
 
 
@@ -156,23 +203,97 @@ class SpeculativeCache:
         self.target = target_cache
         self.draft = draft_cache
         self.position = mx.array(position, dtype=mx.int32).reshape(-1)
+        self.position_offset = mx.zeros_like(self.position)
         self.bonus = bonus.reshape(-1, 1)
         self.seed = None
+        self.tokens = None
         self._target_round = None
         self._draft_round = None
         self._verified_hidden = None
+
+    @classmethod
+    def create(cls, target_cache, drafter, batch):
+        padding = next(
+            (
+                c.left_padding.tolist()
+                for c in iter_leaf_caches(target_cache)
+                if isinstance(c, CacheTransaction.batch_types)
+            ),
+            None,
+        )
+        if batch > 1 and padding is None:
+            raise ValueError("Batched MTP requires batch prompt caches.")
+        return cls(
+            target_cache,
+            drafter.make_cache(padding),
+            [0] * batch if padding is None else [-p for p in padding],
+            mx.zeros((batch, 1), dtype=mx.int32),
+        )
+
+    def checkpoint(self, row=0):
+        """Return an atomic target/draft/seed checkpoint using native APC types."""
+        from ..apc import snapshot_prompt_cache_row
+
+        if self._target_round is not None or self.seed is None:
+            raise RuntimeError("Only committed speculative state can be checkpointed.")
+        target = snapshot_prompt_cache_row(self.target, row, clone=False)
+        draft = snapshot_prompt_cache_row(self.draft, row, clone=False)
+        if target is None or draft is None:
+            raise ValueError("Cache cannot extract a prefix checkpoint row.")
+        metadata = ArraysCache(5)
+        metadata.cache = [
+            self.position[row : row + 1, None],
+            self.bonus[row : row + 1],
+            self.seed.token[row : row + 1],
+            self.seed.hidden[row : row + 1],
+            self.position_offset[row : row + 1, None],
+        ]
+        return [CacheList(*target), CacheList(*draft), metadata]
+
+    @classmethod
+    def restore(cls, checkpoint):
+        target, draft, metadata = checkpoint
+        position, bonus, token, hidden, position_offset = metadata.cache
+        state = cls(target.caches, draft.caches, position, bonus)
+        state.position_offset = position_offset.reshape(-1)
+        state.seed = DraftState(token, hidden)
+        return state
+
+    @classmethod
+    def merge(cls, states):
+        """Join independently prefilled rows without replaying either model."""
+        from ..apc import make_warm_batch_exact_cache_multi
+
+        checkpoints = [state.checkpoint() for state in states]
+        positions = [int(state.position.item()) for state in states]
+        target, _ = make_warm_batch_exact_cache_multi(
+            [c[0].caches for c in checkpoints], positions
+        )
+        draft, _ = make_warm_batch_exact_cache_multi(
+            [c[1].caches for c in checkpoints], positions
+        )
+        if target is None or draft is None:
+            raise ValueError("Cache types cannot merge speculative request rows.")
+        state = cls(target, draft, positions, mx.concatenate([s.bonus for s in states]))
+        state.seed = DraftState(
+            mx.concatenate([s.seed.token for s in states]),
+            mx.concatenate([s.seed.hidden for s in states]),
+        )
+        state.position_offset = mx.concatenate([s.position_offset for s in states])
+        return state
+
+    def positions(self, length):
+        return (self.position + self.position_offset)[:, None] + mx.arange(length)[None]
 
     def prefill(self, tokens, hidden, forward):
         if tokens.shape[:2] != hidden.shape[:2] or tokens.shape[1] == 0:
             raise ValueError(
                 "MTP requires target hidden states for every prompt token."
             )
-        if max((c.size() for c in self.target), default=0) > tokens.shape[1]:
-            raise ValueError(
-                "MTP requires a complete prompt prefill; target-only prefix caches cannot restore its draft state."
-            )
         shifted = mx.concatenate([tokens[:, 1:], self.bonus], axis=1)
-        logits, draft_hidden = forward(shifted, hidden, self.draft, self.position)
+        logits, draft_hidden = forward(
+            shifted, hidden, self.draft, self.position + self.position_offset
+        )
         self.position = self.position + tokens.shape[1]
         self.seed = DraftState(mx.argmax(logits, axis=-1), draft_hidden[:, -1:])
 
@@ -191,7 +312,10 @@ class SpeculativeCache:
                 self._draft_round = CacheTransaction(self.draft, count - 1)
             for step in range(count - 1):
                 logits, hidden = forward(
-                    token, hidden, self.draft, self.position + step
+                    token,
+                    hidden,
+                    self.draft,
+                    self.position + self.position_offset + step,
                 )
                 token = mx.argmax(logits, axis=-1)
                 proposals.append(token)
@@ -230,23 +354,31 @@ class SpeculativeCache:
                     inputs,
                     self._verified_hidden[:, :width],
                     self.draft,
-                    self.position,
+                    self.position + self.position_offset,
                     lengths=lengths,
                 )
                 replay.validate(lengths)
                 self._target_round.commit(lengths)
                 replay.commit(lengths)
             indices = mx.maximum(mx.array(lengths), 1)[:, None, None] - 1
+            active = mx.array(lengths)[:, None] > 0
             self.seed = DraftState(
-                mx.argmax(logits, axis=-1),
-                mx.take_along_axis(hidden, indices, axis=1),
+                mx.where(active, mx.argmax(logits, axis=-1), self.seed.token),
+                mx.where(
+                    active[..., None],
+                    mx.take_along_axis(hidden, indices, axis=1),
+                    self.seed.hidden,
+                ),
             )
             self.bonus = mx.where(
-                mx.array(lengths)[:, None] > 0,
+                active,
                 mx.take_along_axis(inputs, indices.squeeze(-1), axis=1),
                 self.bonus,
             )
             self.position = self.position + mx.array(lengths)
+            if self.tokens is not None:
+                for context, emitted in zip(self.tokens, tokens):
+                    context.extend(emitted)
         finally:
             self.abort()
 
