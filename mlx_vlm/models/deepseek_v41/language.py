@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import LanguageModelOutput
 from ..deepseek_v4.hyper_connection import _hc_split_sinkhorn_ops, hc_expand
 from ..deepseek_v4.language import (
     DeepseekV4RoPE,
@@ -14,7 +15,7 @@ from ..deepseek_v4.language import (
 from ..mla import MultiLinear
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
-from .engram import Engram
+from .engram import Engram, EngramLayout, NgramHashState
 
 
 class SharedIndexState:
@@ -811,3 +812,104 @@ class DeepseekV41Block(nn.Module):
         x = self.ffn(x, image_mask)
         x = hc_expand(x, residual, ffn_post, ffn_comb)
         return x, ffn_pre
+
+
+class ParallelHead(nn.Module):
+    """Vocabulary projection kept in fp32 so logits come out fp32 directly."""
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.weight = mx.zeros(
+            (config.vocab_size, config.hidden_size), dtype=mx.float32
+        )
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return x.astype(mx.float32) @ self.weight.T
+
+
+class DeepseekV41Cache:
+    """Generation state: shared cross-layer handoff plus the token offset.
+
+    Layer caches live inside the modules (growing underscore attributes, like the
+    reference buffers); this object only carries what must cross call boundaries.
+    A zero offset marks a fresh generation and resets module state on entry.
+    """
+
+    def __init__(self):
+        self.shared = SharedIndexState()
+        self.offset = 0
+
+
+class LanguageModel(nn.Module):
+    """Embed, expand to hc copies, run the blocks, collapse, project to logits."""
+
+    def __init__(self, config: ModelConfig, tokenizer=None):
+        super().__init__()
+        self.config = config
+        self.model_type = config.model_type
+        self.layout = EngramLayout.from_config(config)
+        self.engram_hash = None
+        if self.layout is not None and tokenizer is not None:
+            self.engram_hash = NgramHashState(config, self.layout, tokenizer)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = [
+            DeepseekV41Block(config, i, self.layout)
+            for i in range(config.num_hidden_layers)
+        ]
+        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.head = ParallelHead(config)
+        self.target_layer_ids = list(config.dspark_target_layer_ids)
+
+    def make_cache(self):
+        return [DeepseekV41Cache()]
+
+    def _reset_caches(self):
+        for layer in self.layers:
+            layer.attn._window_cache = None
+            layer.attn._compress_cache = None
+            layer.attn._cache_len = 0
+            if layer.attn.indexer is not None:
+                layer.attn.indexer._k_cache = None
+            if layer.attn.compressor is not None:
+                layer.attn.compressor._kv_state = None
+                layer.attn.compressor._score_state = None
+
+    def __call__(
+        self,
+        input_ids: Optional[mx.array] = None,
+        inputs_embeds: Optional[mx.array] = None,
+        cache=None,
+        image_mask: Optional[mx.array] = None,
+        engram_hashes: Optional[mx.array] = None,
+    ) -> LanguageModelOutput:
+        entry = cache[0] if cache else DeepseekV41Cache()
+        start_pos = entry.offset
+        if start_pos == 0:
+            self._reset_caches()
+        if inputs_embeds is None:
+            h = self.embed_tokens(input_ids)
+        else:
+            h = inputs_embeds
+        batch, seqlen = h.shape[0], h.shape[1]
+        h = mx.broadcast_to(
+            h[..., None, :],
+            (batch, seqlen, self.config.hc_mult, self.config.hidden_size),
+        )
+        main_hiddens = []
+        pre_mix = make_identity_pre_mix(batch, seqlen, self.config.hc_mult)
+        shared = entry.shared
+        for i, layer in enumerate(self.layers):
+            if layer.engram is not None and engram_hashes is not None:
+                h = layer.engram(
+                    h,
+                    engram_hashes[:, :, layer.engram.layer_hash_index, :],
+                    None if image_mask is None else ~image_mask,
+                )
+            if i in self.target_layer_ids:
+                main_hiddens.append(h.mean(axis=2))
+            h, pre_mix = layer(h, start_pos, pre_mix, image_mask, shared)
+        h = DeepseekV41Block.hc_pre(h, pre_mix)
+        logits = self.head(self.norm(h))
+        entry.offset = start_pos + seqlen
+        hidden = [mx.concatenate(main_hiddens, axis=-1)] if main_hiddens else None
+        return LanguageModelOutput(logits=logits, hidden_states=hidden)

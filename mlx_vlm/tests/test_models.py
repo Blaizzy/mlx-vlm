@@ -20199,3 +20199,91 @@ class TestDeepseekV41Block(unittest.TestCase):
         mx.eval(hd)
         self.assertEqual(hd.shape, (1, 1, 2, 16))
         self.assertTrue(bool(mx.all(mx.isfinite(hd))))
+
+
+class TestDeepseekV41EndToEnd(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            num_hidden_layers=2,
+            compress_ratios=[2, 1],
+            hidden_size=16,
+            vocab_size=64,
+            num_attention_heads=2,
+            head_dim=8,
+            qk_rope_head_dim=4,
+            q_lora_rank=8,
+            o_lora_rank=4,
+            o_groups=1,
+            sliding_window=4,
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=4,
+            kv_source_layer_ids=[0],
+            index_source_layer_ids=[0, 1],
+            candidate_source_layer_id=1,
+            candidate_topk_blocks=2,
+            candidate_block_size=2,
+            moe_intermediate_size=8,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            engram_layer_ids=[1],
+            engram_num_embeddings=[256],
+            engram_max_ngram_size=3,
+            engram_vocab_size=512,
+            engram_n_heads=2,
+            engram_head_dim=8,
+            dspark_target_layer_ids=[1],
+            dspark_block_size=2,
+        )
+
+    def test_deepseek_v41_full_forward(self):
+        from mlx_vlm.models import deepseek_v41
+
+        model = deepseek_v41.Model(self._tiny_config())
+        mx.eval(model.parameters())
+
+        cache = model.make_cache()
+        ids = mx.array([[1, 2, 3]])
+        out = model.language_model(ids, cache=cache)
+        mx.eval(out.logits)
+        self.assertEqual(out.logits.shape, (1, 3, 64))
+        self.assertTrue(bool(mx.all(mx.isfinite(out.logits))))
+        self.assertIsNotNone(out.hidden_states)
+        self.assertEqual(out.hidden_states[0].shape, (1, 3, 16))
+
+        step = model.language_model(mx.array([[4]]), cache=cache)
+        mx.eval(step.logits)
+        self.assertEqual(step.logits.shape, (1, 1, 64))
+
+        fresh = model.make_cache()
+        again = model.language_model(ids, cache=fresh)
+        mx.eval(again.logits)
+        self.assertTrue(bool(mx.allclose(out.logits, again.logits)))
+
+    def test_deepseek_v41_model_wrapper(self):
+        from mlx_vlm.models import deepseek_v41
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        model = deepseek_v41.Model(self._tiny_config())
+        mx.eval(model.parameters())
+        self.assertEqual(len(model.layers), 2)
+
+        result = model.get_input_embeddings(mx.array([[1, 2, 3]]))
+        self.assertIsInstance(result, InputEmbeddingsFeatures)
+        self.assertEqual(result.inputs_embeds.shape, (1, 3, 16))
+
+        sanitized = model.sanitize(
+            {
+                "model.embed_tokens.weight": mx.zeros((4, 4)),
+                "lm_head.weight": mx.zeros((4, 4)),
+                "other.weight": mx.zeros((4, 4)),
+            }
+        )
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        self.assertIn("language_model.lm_head.weight", sanitized)
+        self.assertIn("other.weight", sanitized)
