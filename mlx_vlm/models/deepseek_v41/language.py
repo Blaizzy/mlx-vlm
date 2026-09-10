@@ -344,3 +344,115 @@ class DeepseekV41MoE(nn.Module):
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None].astype(y.dtype)).sum(-2)
         return y + self.shared_w2(self.shared_act(self.shared_w3(x), self.shared_w1(x)))
+
+
+class Compressor(nn.Module):
+    """Pools `compress_ratio` consecutive tokens into one KV latent with a learned softmax gate.
+
+    Returns the latent before RoPE, or None while a group is still filling up -- so during
+    decode it only yields every `compress_ratio` steps, holding the partial group in state.
+    Pre-RoPE is deliberate: the indexer needs the unrotated form, so attention rotates
+    afterwards. Ratio 1 is a plain projection with no gate and no fp32 promotion.
+    """
+
+    def __init__(self, config: ModelConfig, layer_idx: int):
+        super().__init__()
+        compress_ratio = config.compress_ratios[layer_idx]
+        assert compress_ratio >= 1
+        self.compress_ratio = compress_ratio
+        self.head_dim = config.head_dim
+        self.norm = nn.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
+        self.wkv = nn.Linear(config.hidden_size, config.head_dim)
+        if compress_ratio > 1:
+            self.wgate = nn.Linear(config.hidden_size, config.head_dim)
+        self._kv_state = None
+        self._score_state = None
+
+    def _grow_state(self, batch: int):
+        if self._kv_state is None:
+            self._kv_state = mx.zeros(
+                (batch, self.compress_ratio, self.head_dim), dtype=mx.float32
+            )
+            self._score_state = mx.full(
+                (batch, self.compress_ratio, self.head_dim), -mx.inf
+            )
+        elif self._kv_state.shape[0] < batch:
+            extra = batch - self._kv_state.shape[0]
+            self._kv_state = mx.concatenate(
+                [
+                    self._kv_state,
+                    mx.zeros(
+                        (extra, self.compress_ratio, self.head_dim), dtype=mx.float32
+                    ),
+                ],
+                axis=0,
+            )
+            self._score_state = mx.concatenate(
+                [
+                    self._score_state,
+                    mx.full((extra, self.compress_ratio, self.head_dim), -mx.inf),
+                ],
+                axis=0,
+            )
+
+    def _stow_remainder(self, state: mx.array, batch: int, vals: mx.array):
+        remainder = vals.shape[1]
+        head = mx.concatenate([vals, state[:batch, remainder:]], axis=1)
+        if state.shape[0] > batch:
+            return mx.concatenate([head, state[batch:]], axis=0)
+        return head
+
+    def _write_slot(self, state: mx.array, batch: int, slot: int, vals: mx.array):
+        parts = []
+        if slot > 0:
+            parts.append(state[:batch, :slot])
+        parts.append(vals)
+        if slot + 1 < self.compress_ratio:
+            parts.append(state[:batch, slot + 1 :])
+        head = mx.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
+        if state.shape[0] > batch:
+            return mx.concatenate([head, state[batch:]], axis=0)
+        return head
+
+    def __call__(self, x: mx.array, start_pos: int):
+        ratio = self.compress_ratio
+        if ratio == 1:
+            return self.norm(self.wkv(x))
+
+        batch, seqlen = x.shape[0], x.shape[1]
+        dtype = x.dtype
+        xf = x.astype(mx.float32)
+        kv, score = self.wkv(xf), self.wgate(xf)
+        if start_pos == 0:
+            should_compress = seqlen >= ratio
+            remainder = seqlen % ratio
+            cutoff = seqlen - remainder
+            if remainder:
+                self._grow_state(batch)
+                self._kv_state = self._stow_remainder(
+                    self._kv_state, batch, kv[:, cutoff:]
+                )
+                self._score_state = self._stow_remainder(
+                    self._score_state, batch, score[:, cutoff:]
+                )
+            kv = kv[:, :cutoff].reshape(batch, -1, ratio, self.head_dim)
+            score = score[:, :cutoff].reshape(batch, -1, ratio, self.head_dim)
+            kv = (kv * mx.softmax(score, axis=2)).sum(axis=2)
+        else:
+            slot = start_pos % ratio
+            self._grow_state(batch)
+            self._kv_state = self._write_slot(
+                self._kv_state, batch, slot, kv[:, 0:1, :]
+            )
+            self._score_state = self._write_slot(
+                self._score_state, batch, slot, score[:, 0:1, :]
+            )
+            should_compress = (start_pos + 1) % ratio == 0
+            if should_compress:
+                kv = (
+                    self._kv_state[:batch]
+                    * mx.softmax(self._score_state[:batch], axis=1)
+                ).sum(axis=1, keepdims=True)
+        if not should_compress:
+            return None
+        return self.norm(kv.astype(dtype))

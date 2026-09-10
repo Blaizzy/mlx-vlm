@@ -19995,3 +19995,55 @@ class TestDeepseekV41SharedPrimitives(unittest.TestCase):
         y = rope(x, offset=1)
         y_inv = rope(y, offset=1, inverse=True)
         self.assertTrue(mx.allclose(y_inv, x, rtol=1e-5, atol=1e-5))
+
+
+class TestDeepseekV41Compressor(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            num_hidden_layers=2,
+            compress_ratios=[2, 1],
+            hidden_size=16,
+            head_dim=8,
+        )
+
+    def test_deepseek_v41_compressor_prefill_decode(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        comp = deepseek_v41.Compressor(config, 0)
+        mx.eval(comp.parameters())
+
+        latent = comp(mx.random.normal((1, 5, 16)), 0)
+        mx.eval(latent)
+        self.assertEqual(latent.shape, (1, 2, 8))
+
+        step = comp(mx.random.normal((1, 1, 16)), 5)
+        mx.eval(step)
+        self.assertEqual(step.shape, (1, 1, 8))
+
+    def test_deepseek_v41_compressor_holds_partial_group(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        comp = deepseek_v41.Compressor(config, 0)
+        mx.eval(comp.parameters())
+
+        self.assertIsNone(comp(mx.random.normal((1, 1, 16)), 2))
+        step = comp(mx.random.normal((1, 1, 16)), 3)
+        mx.eval(step)
+        self.assertEqual(step.shape, (1, 1, 8))
+
+    def test_deepseek_v41_compressor_ratio_one(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        comp = deepseek_v41.Compressor(config, 1)
+        mx.eval(comp.parameters())
+        self.assertFalse(hasattr(comp, "wgate"))
+
+        out = comp(mx.random.normal((1, 4, 16)), 0)
+        mx.eval(out)
+        self.assertEqual(out.shape, (1, 4, 8))
