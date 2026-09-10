@@ -24,7 +24,7 @@ class DSparkMarkovHead(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.embed = nn.Embedding(config.vocab_size, config.dspark_markov_rank)
-        self.head = nn.Linear(config.dspark_markov_rank, config.vocab_size)
+        self.head = nn.Linear(config.dspark_markov_rank, config.vocab_size, bias=False)
 
     def __call__(self, token_ids: mx.array):
         embed = self.embed(token_ids)
@@ -39,7 +39,9 @@ class DSparkConfidenceHead(nn.Module):
 
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.proj = nn.Linear(config.hidden_size + config.dspark_markov_rank, 1)
+        self.proj = nn.Linear(
+            config.hidden_size + config.dspark_markov_rank, 1, bias=False
+        )
 
     def __call__(self, hidden: mx.array, markov_embed: mx.array) -> mx.array:
         out = self.proj(
