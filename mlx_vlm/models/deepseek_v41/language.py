@@ -1,9 +1,12 @@
 import math
 from functools import lru_cache
+from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..deepseek_v4.language import LimitedSwiGLU
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 
 
@@ -265,3 +268,79 @@ class Indexer(nn.Module):
             mx.int32
         )
         return mx.where(idxs < compress_lens, idxs + offset, -1).astype(mx.int32)
+
+
+class DeepseekV41MoEGate(nn.Module):
+    """MoE gating with a separate correction bias for image-span tokens.
+
+    The bias steers expert selection only; routing weights come from the unbiased
+    scores. Selection matches the shared noaux_tc top-k; only the bias source is
+    V4.1-specific, everything else reuses the proven mechanism.
+    """
+
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        if config.scoring_func != "sqrtsoftplus":
+            raise ValueError(
+                f"Unsupported DeepSeek-V4.1 scoring function: {config.scoring_func}"
+            )
+        self.top_k = config.num_experts_per_tok
+        self.num_experts = config.n_routed_experts
+        self.norm_topk_prob = config.norm_topk_prob
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.weight = mx.zeros((self.num_experts, config.hidden_size))
+        self.bias = mx.zeros((self.num_experts,), dtype=mx.float32)
+        self.bias_vl = mx.zeros((self.num_experts,), dtype=mx.float32)
+
+    def __call__(
+        self, x: mx.array, image_mask: Optional[mx.array] = None
+    ) -> Tuple[mx.array, mx.array]:
+        scores = mx.sqrt(nn.softplus(x.astype(mx.float32) @ self.weight.T))
+        bias = self.bias
+        if image_mask is not None:
+            bias = mx.where(image_mask[..., None], self.bias_vl, self.bias)
+        inds = mx.argpartition(-(scores + bias), kth=self.top_k - 1, axis=-1)[
+            ..., : self.top_k
+        ].astype(mx.int32)
+        weights = mx.take_along_axis(scores, inds, axis=-1)
+        if self.norm_topk_prob and self.top_k > 1:
+            weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+        return inds, weights * self.routed_scaling_factor
+
+
+class DeepseekV41MoE(nn.Module):
+    """Top-k routed experts plus one shared expert every token goes through."""
+
+    def __init__(
+        self,
+        config: ModelConfig,
+        moe_intermediate_size: Optional[int] = None,
+        n_routed_experts: Optional[int] = None,
+        num_experts_per_tok: Optional[int] = None,
+    ):
+        super().__init__()
+        self.gate = DeepseekV41MoEGate(config)
+        if n_routed_experts is not None:
+            self.gate.num_experts = n_routed_experts
+            self.gate.top_k = num_experts_per_tok or self.gate.top_k
+            self.gate.weight = mx.zeros((n_routed_experts, config.hidden_size))
+            self.gate.bias = mx.zeros((n_routed_experts,), dtype=mx.float32)
+            self.gate.bias_vl = mx.zeros((n_routed_experts,), dtype=mx.float32)
+        inter = moe_intermediate_size or config.moe_intermediate_size
+        routed = n_routed_experts or config.n_routed_experts
+        self.switch_mlp = SwitchGLU(
+            config.hidden_size,
+            inter,
+            routed,
+            activation=LimitedSwiGLU(config.swiglu_limit),
+        )
+        self.shared_w1 = nn.Linear(config.hidden_size, inter, bias=False)
+        self.shared_w3 = nn.Linear(config.hidden_size, inter, bias=False)
+        self.shared_w2 = nn.Linear(inter, config.hidden_size, bias=False)
+        self.shared_act = LimitedSwiGLU(config.swiglu_limit)
+
+    def __call__(self, x: mx.array, image_mask: Optional[mx.array] = None) -> mx.array:
+        inds, scores = self.gate(x, image_mask)
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None].astype(y.dtype)).sum(-2)
+        return y + self.shared_w2(self.shared_act(self.shared_w3(x), self.shared_w1(x)))

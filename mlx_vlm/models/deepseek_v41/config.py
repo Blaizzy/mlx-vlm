@@ -83,9 +83,13 @@ class ModelConfig(BaseModelConfig):
         if not self.compress_ratios:
             self.compress_ratios = [0, 0] + [2] * 18 + [1] * 20 + [0, 0, 0]
         n = self.num_hidden_layers
-        self.compress_ratios = list(self.compress_ratios[:n])
-        if len(self.compress_ratios) != n:
+        if len(self.compress_ratios) == n:
+            self.compress_ratios = list(self.compress_ratios) + [0] * (
+                self.num_nextn_predict_layers
+            )
+        if len(self.compress_ratios) != n + self.num_nextn_predict_layers:
             raise ValueError(
-                "`compress_ratios` must have one entry per hidden layer, "
-                f"got {len(self.compress_ratios)} for {n} layers."
+                "`compress_ratios` must cover the backbone plus the MTP stages, "
+                f"got {len(self.compress_ratios)} for {n} + "
+                f"{self.num_nextn_predict_layers} layers."
             )

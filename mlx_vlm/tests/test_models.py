@@ -19781,9 +19781,13 @@ class TestDeepseekV41Basics(unittest.TestCase):
 
         config = deepseek_v41.ModelConfig()
         self.assertEqual(config.model_type, "deepseek_v41")
-        self.assertEqual(len(config.compress_ratios), config.num_hidden_layers)
+        self.assertEqual(
+            len(config.compress_ratios),
+            config.num_hidden_layers + config.num_nextn_predict_layers,
+        )
         self.assertEqual(config.compress_ratios[2], 2)
         self.assertEqual(config.compress_ratios[20], 1)
+        self.assertEqual(config.compress_ratios[40:], [0, 0, 0])
         self.assertEqual(
             config.kv_source_layer_ids,
             [2, 8, 14, 20],
@@ -19925,3 +19929,69 @@ class TestDeepseekV41Indexer(unittest.TestCase):
         idxs = consumer(x, qr, None, 0, 0, shared)
         mx.eval(idxs)
         self.assertEqual(idxs.shape, (1, 4, 2))
+
+
+class TestDeepseekV41SharedPrimitives(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            hidden_size=16,
+            moe_intermediate_size=8,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+        )
+
+    def test_deepseek_v41_moe_gate_vl_bias(self):
+        from mlx_vlm.models import deepseek_v41
+
+        gate = deepseek_v41.DeepseekV41MoEGate(self._tiny_config())
+        mx.eval(gate.parameters())
+        gate.weight = mx.broadcast_to(mx.arange(4, dtype=mx.float32)[:, None], (4, 16))
+        gate.bias_vl = mx.array([0.0, 0.0, 0.0, 1e6], dtype=mx.float32)
+
+        x = mx.random.normal((1, 3, 16))
+        mask = mx.array([[False, True, False]])
+        inds, weights = gate(x, mask)
+        mx.eval(inds, weights)
+        self.assertEqual(inds.shape, (1, 3, 2))
+        self.assertEqual(weights.shape, (1, 3, 2))
+        self.assertIn(3, inds[0, 1].tolist())
+        self.assertTrue(
+            bool(mx.allclose(weights.sum(-1), mx.full((1, 3), 1.5), atol=1e-5))
+        )
+
+    def test_deepseek_v41_moe_forward(self):
+        from mlx_vlm.models import deepseek_v41
+
+        moe = deepseek_v41.DeepseekV41MoE(self._tiny_config())
+        mx.eval(moe.parameters())
+        x = mx.random.normal((1, 3, 16))
+        y = moe(x)
+        mx.eval(y)
+        self.assertEqual(y.shape, (1, 3, 16))
+        self.assertTrue(bool(mx.all(mx.isfinite(y))))
+        y_masked = moe(x, mx.array([[True, False, True]]))
+        mx.eval(y_masked)
+        self.assertEqual(y_masked.shape, (1, 3, 16))
+
+    def test_deepseek_v41_rope_yarn_dict(self):
+        from mlx_vlm.models.deepseek_v4.language import DeepseekV4RoPE
+
+        rope = DeepseekV4RoPE(
+            64,
+            10000.0,
+            {
+                "rope_type": "yarn",
+                "factor": 16,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "original_max_position_embeddings": 65536,
+            },
+        )
+        x = mx.random.uniform(shape=(1, 2, 3, 64))
+        y = rope(x, offset=1)
+        y_inv = rope(y, offset=1, inverse=True)
+        self.assertTrue(mx.allclose(y_inv, x, rtol=1e-5, atol=1e-5))
