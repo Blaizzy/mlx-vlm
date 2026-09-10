@@ -3,8 +3,8 @@ import json
 import pytest
 
 from mlx_vlm.models.muse_glimmer import ModelConfig
-from mlx_vlm.server.responses_state import process_tool_calls
-from mlx_vlm.tool_parsers import _infer_tool_parser, atem, load_tool_module
+from mlx_vlm.tools import _infer_tool_parser, load_tool_module, process_tool_calls
+from mlx_vlm.tools.parsers import atem
 
 ATEM_TEMPLATE = """
 <atem:function_calls>
@@ -83,9 +83,9 @@ def test_process_tool_calls_converts_atem_to_openai_shape():
         tools=None,
     )
 
-    assert result["remaining_text"] == ""
-    assert len(result["calls"]) == 1
-    call = result["calls"][0]
+    assert result.remaining_text == ""
+    assert len(result.calls) == 1
+    call = result.calls[0]
     assert call["type"] == "function"
     assert call["function"]["name"] == "weather.get_weather"
     assert json.loads(call["function"]["arguments"]) == {"city": "Warsaw"}
