@@ -50,3 +50,21 @@ def test_string_arguments_keep_their_declared_type():
     assert len(parsed.calls) == 1
     arguments = json.loads(parsed.calls[0]["function"]["arguments"])
     assert arguments == {"zip": "10001", "days": 3}
+
+
+# Poolside Laguna emits the same GLM shape inline (name and args on one line).
+# glm47 handles it once the name is stripped, so no dedicated Laguna parser is
+# needed; verified on real poolside/Laguna-XS-2.1 weights.
+LAGUNA_OUTPUT = (
+    "<tool_call>get_weather"
+    "<arg_key>zip</arg_key><arg_value>10001</arg_value>"
+    "<arg_key>days</arg_key><arg_value>3</arg_value></tool_call>"
+)
+
+
+def test_glm47_parses_laguna_inline_format():
+    parsed = process_tool_calls(LAGUNA_OUTPUT, glm47, TOOLS)
+
+    assert len(parsed.calls) == 1
+    arguments = json.loads(parsed.calls[0]["function"]["arguments"])
+    assert arguments == {"zip": "10001", "days": 3}
