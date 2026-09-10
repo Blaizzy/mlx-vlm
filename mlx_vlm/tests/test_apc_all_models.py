@@ -39,6 +39,7 @@ from mlx_vlm.models.cache import (
 from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
 from mlx_vlm.models.qwen4_exp.language import QSAKVCache
 from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
+from mlx_vlm.models.z1t.language import Z1TCache
 
 
 def _model_source_root() -> Path:
@@ -89,6 +90,7 @@ def _cache_samples():
         "RotatingKVCache": RotatingKVCache(max_size=16),
         "SimpleKVCache": SimpleKVCache(),
         "StaticPrefixKVCache": StaticPrefixKVCache(max_size=16),
+        "Z1TCache": Z1TCache(),
     }
 
 
@@ -138,9 +140,10 @@ def _model_cache_contract(model_cls: type) -> tuple[str, ...]:
     return tuple(sorted(visit(model_cls) or {"KVCache"}))
 
 
-def _all_generative_model_contracts() -> list[tuple[str, tuple[str, ...]]]:
+def _all_generative_model_contracts(
+    local_factories: dict[str, set[str]],
+) -> list[tuple[str, tuple[str, ...]]]:
     contracts = []
-    local_factories = _cache_factories_by_package()
     for info in pkgutil.iter_modules(model_packages.__path__):
         if not info.ispkg or info.name.startswith("_"):
             continue
@@ -235,10 +238,22 @@ def _populated_cache(name: str, token_count: int):
             _populated_cache("KVCache", token_count),
             _populated_cache("ArraysCache", token_count),
         )
+    if name == "Z1TCache":
+        cache = Z1TCache()
+        cache.offset = token_count
+        cache.cum_eKV = mx.ones((1, 4))
+        cache.cum_eK = mx.ones((1, 4)) * 2
+        cache.win_eKV = mx.ones((1, 3, 4)) * 3
+        cache.win_eK = mx.ones((1, 3, 4)) * 4
+        return cache
     raise AssertionError(f"No populated APC sample for {name}")
 
 
-MODEL_CACHE_CONTRACTS = _all_generative_model_contracts()
+MODEL_CACHE_FACTORIES = _cache_factories_by_package()
+MODEL_CACHE_CONTRACTS = _all_generative_model_contracts(MODEL_CACHE_FACTORIES)
+# Synthetic cache hits depend only on the cache types, not the model name.
+# Keep discovery for every model, but exercise each distinct layout once.
+CACHE_CONTRACTS = sorted({names for _, names in MODEL_CACHE_CONTRACTS})
 
 
 def test_all_generative_model_packages_discovered_without_weights():
@@ -252,7 +267,7 @@ def test_all_generative_model_packages_discovered_without_weights():
 
 def test_every_model_cache_factory_has_a_restorable_apc_adapter():
     """All cache types referenced by all model factories are APC-compatible."""
-    by_package = _cache_factories_by_package()
+    by_package = MODEL_CACHE_FACTORIES
     discovered = set().union(*by_package.values())
     samples = _cache_samples()
     unknown = discovered - samples.keys()
@@ -290,19 +305,19 @@ def test_every_model_cache_factory_has_a_restorable_apc_adapter():
 
 
 @pytest.mark.parametrize(
-    ("model_name", "cache_names"),
-    MODEL_CACHE_CONTRACTS,
-    ids=[name for name, _ in MODEL_CACHE_CONTRACTS],
+    "cache_names",
+    CACHE_CONTRACTS,
+    ids=["+".join(names) for names in CACHE_CONTRACTS],
 )
-def test_cache_hit_for_every_model(model_name, cache_names, monkeypatch):
-    """A synthetic second request hits APC for every model cache contract."""
+def test_cache_hit_for_each_model_cache_contract(cache_names, monkeypatch):
+    """A synthetic second request hits APC for every distinct cache layout."""
     monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "2")
     block_size = 8
     token_count = 2 * block_size
     token_ids = list(range(token_count))
     caches = [_populated_cache(name, token_count) for name in cache_names]
     plan = build_prefix_cache_plan_from_caches(caches)
-    assert plan.restorable, f"{model_name}: {plan.describe()}"
+    assert plan.restorable, f"{cache_names}: {plan.describe()}"
 
     manager = APCManager(num_blocks=8, block_size=block_size)
 
@@ -311,7 +326,7 @@ def test_cache_hit_for_every_model(model_name, cache_names, monkeypatch):
             return caches
 
     coordinator = manager.coordinator(SyntheticModel())
-    assert coordinator.strategy == plan.strategy, model_name
+    assert coordinator.strategy == plan.strategy, cache_names
     try:
         if plan.strategy == "block":
             stored = manager.store_kv_blocks(
@@ -321,7 +336,7 @@ def test_cache_hit_for_every_model(model_name, cache_names, monkeypatch):
             )
             manager.release(stored)
         else:
-            assert manager.store_exact_cache(token_ids, caches), model_name
+            assert manager.store_exact_cache(token_ids, caches), cache_names
 
         hit = coordinator.lookup(
             token_ids + [999],
@@ -330,14 +345,14 @@ def test_cache_hit_for_every_model(model_name, cache_names, monkeypatch):
             suffix_is_text_only=lambda _prefix_len: True,
             prefix_has_media=lambda _prefix_len: False,
         )
-        assert hit is not None, model_name
-        assert hit["prefix_len"] == token_count, model_name
+        assert hit is not None, cache_names
+        assert hit["prefix_len"] == token_count, cache_names
         stats = manager.stats_snapshot()
         if plan.strategy == "block":
-            assert stats["lookups_hit"] == 1, model_name
+            assert stats["lookups_hit"] == 1, cache_names
         else:
-            assert hit["warm_cache"] is not None, model_name
-            assert stats["exact_hits"] == 1, model_name
+            assert hit["warm_cache"] is not None, cache_names
+            assert stats["exact_hits"] == 1, cache_names
         coordinator.release_hit(hit)
     finally:
         manager.close()

@@ -28,6 +28,9 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         self.shared_expert = Qwen3_5MoeMLP(dim, shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
 
+    def _shared_expert_scale(self, x: mx.array) -> mx.array:
+        return mx.sigmoid(self.shared_expert_gate(x))
+
     def __call__(self, x: mx.array) -> mx.array:
         gates = self.gate(x)
         gates = mx.softmax(gates, axis=-1, precise=True)
@@ -41,7 +44,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         y = (y * scores[..., None]).sum(axis=-2)
 
         shared_y = self.shared_expert(x)
-        shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
+        shared_y = self._shared_expert_scale(x) * shared_y
 
         return y + shared_y
 

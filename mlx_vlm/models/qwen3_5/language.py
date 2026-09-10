@@ -4,6 +4,9 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ...speculative.cache_state import (
+    rollback_speculative_cache as rollback_cache_transaction,
+)
 from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
@@ -14,11 +17,7 @@ from ..cache import ArraysCache, KVCache
 from ..rope_utils import MRoPERotaryEmbedding
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
 from .config import ModelConfig, TextConfig
-from .gated_delta import (
-    gated_delta_accept_states,
-    gated_delta_state_update,
-    gated_delta_update,
-)
+from .gated_delta import gated_delta_update
 from .speculative_verifier import Qwen3_5ExactSpeculativeVerifier
 
 _EXACT_SPECULATIVE_VERIFIER = Qwen3_5ExactSpeculativeVerifier()
@@ -72,59 +71,6 @@ def _precise_swiglu(h, gate, x):
 def _qwen3_5_decode_depthwise_conv(conv_input: mx.array, weight: mx.array):
     out = mx.sum(conv_input.astype(mx.float32) * weight[None, :, :], axis=1)
     return out.astype(conv_input.dtype)[:, None, :]
-
-
-def _decode_quantized_linears_fused(linears, x: mx.array):
-    if (
-        x.ndim != 3
-        or x.shape[1] != 1
-        or len(linears) != 4
-        or not all(isinstance(linear, nn.QuantizedLinear) for linear in linears)
-    ):
-        return None
-
-    first = linears[0]
-    if not all(
-        linear.bits == first.bits
-        and linear.group_size == first.group_size
-        and linear.mode == first.mode
-        and linear.biases is not None
-        and linear.scales.dtype == x.dtype
-        and linear.biases.dtype == x.dtype
-        and "bias" not in linear
-        for linear in linears
-    ):
-        return None
-
-    cache_key = tuple(
-        (id(linear.weight), id(linear.scales), id(linear.biases)) for linear in linears
-    )
-    cached = getattr(first, "_qwen3_5_fused_decode_linears", None)
-    if cached is None or cached[0] != cache_key:
-        weights = mx.concatenate([linear.weight for linear in linears], axis=0)
-        scales = mx.concatenate([linear.scales for linear in linears], axis=0)
-        biases = mx.concatenate([linear.biases for linear in linears], axis=0)
-        split_indices = []
-        offset = 0
-        for linear in linears[:-1]:
-            offset += linear.weight.shape[0]
-            split_indices.append(offset)
-        mx.eval(weights, scales, biases)
-        cached = (cache_key, weights, scales, biases, split_indices)
-        first._qwen3_5_fused_decode_linears = cached
-
-    _, weights, scales, biases, split_indices = cached
-    output = mx.quantized_matmul(
-        x,
-        weights,
-        scales=scales,
-        biases=biases,
-        transpose=True,
-        group_size=first.group_size,
-        bits=first.bits,
-        mode=first.mode,
-    )
-    return tuple(mx.split(output, split_indices, axis=-1))
 
 
 def _extract_row_cache(cache_entry, row: int):
@@ -189,7 +135,22 @@ def _restore_batch_padding_metadata(cache_entry, offsets, steps: int):
     return cache_entry
 
 
+def _qwen3_5_refresh_metadata(cache):
+    revision = getattr(cache, "metadata_revision", 0)
+    if getattr(cache, "_qwen3_5_metadata_revision", None) != revision:
+        for name in (
+            "_qwen3_5_left_padding_info",
+            "_qwen3_5_lengths_info",
+            "_qwen3_5_ssm_no_mask_batch_size",
+        ):
+            if hasattr(cache, name):
+                delattr(cache, name)
+        cache._qwen3_5_metadata_revision = revision
+
+
 def _qwen3_5_left_padding_info(cache):
+    if cache is not None:
+        _qwen3_5_refresh_metadata(cache)
     left_padding = getattr(cache, "left_padding", None)
     if not (
         isinstance(left_padding, mx.array)
@@ -207,6 +168,8 @@ def _qwen3_5_left_padding_info(cache):
 
 
 def _qwen3_5_set_left_padding_info(cache, pads):
+    if cache is not None:
+        _qwen3_5_refresh_metadata(cache)
     left_padding = getattr(cache, "left_padding", None)
     if not isinstance(left_padding, mx.array):
         return
@@ -227,6 +190,8 @@ def _qwen3_5_advance_left_padding_info(cache, steps: int):
 
 
 def _qwen3_5_lengths_info(cache):
+    if cache is not None:
+        _qwen3_5_refresh_metadata(cache)
     lengths = getattr(cache, "lengths", None)
     if not (isinstance(lengths, mx.array) and lengths.ndim > 0 and lengths.size > 0):
         return None
@@ -248,6 +213,8 @@ def _qwen3_5_advance_lengths_info(cache, steps: int):
 
 
 def _create_qwen3_5_ssm_mask(h: mx.array, cache):
+    if cache is not None:
+        _qwen3_5_refresh_metadata(cache)
     if not (cache and hasattr(cache, "make_mask")):
         return None
 
@@ -1106,6 +1073,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
         return q, k
 
+    def _project_gates(self, inputs: mx.array):
+        return self.in_proj_b(inputs), self.in_proj_a(inputs)
+
     def __call__(
         self,
         inputs: mx.array,
@@ -1113,12 +1083,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
-        mixed_qkv, z, b, a = (
-            self.in_proj_qkv(inputs),
-            self.in_proj_z(inputs),
-            self.in_proj_b(inputs),
-            self.in_proj_a(inputs),
-        )
+        mixed_qkv = self.in_proj_qkv(inputs)
+        z = self.in_proj_z(inputs)
+        b, a = self._project_gates(inputs)
 
         z = z.reshape(B, S, -1, self.head_v_dim)
 
@@ -1142,13 +1109,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
         if cache is not None:
-            n_keep = self.conv_kernel_size - 1
-            if getattr(cache, "lengths", None) is not None:
-                ends = mx.clip(cache.lengths, 0, S)
-                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
-                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
-            else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
+            cache.update_window(
+                0, conv_input, self.conv_kernel_size - 1, lengths=cache.lengths
+            )
         if (
             S == 1
             and conv_input.shape[1] == self.conv_kernel_size
@@ -1167,12 +1130,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         ]
 
-        state = cache[1] if cache else None
-        if state is not None and state.shape[0] != B:
-            state = None
         q, k = self._normalize_qk(q, k)
 
-        out, state = gated_delta_update(
+        out, _ = gated_delta_update(
             q,
             k,
             v,
@@ -1180,13 +1140,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             b,
             self.A_log,
             self.dt_bias,
-            state,
-            mask,
+            mask=mask,
             use_kernel=not self.training,
+            cache=cache,
         )
 
         if cache is not None:
-            cache[1] = state
             if hasattr(cache, "advance"):
                 cache.advance(S)
                 _qwen3_5_advance_left_padding_info(cache, S)
@@ -1448,286 +1407,16 @@ class LanguageModel(nn.Module):
     def rollback_speculative_cache(
         self,
         caches: List[Any],
-        gdn_states: List,
+        rollback_state,
         accepted,
         block_size: int,
     ) -> int:
-        if isinstance(accepted, int):
-            accepted_list = [int(accepted)]
-        elif isinstance(accepted, mx.array):
-            accepted_list = [int(x) for x in accepted.reshape(-1).tolist()]
-        else:
-            accepted_list = [int(x) for x in accepted]
-
-        max_a = max(accepted_list)
-        n = max_a + 1
-        trim = block_size - n
-        is_batch = len(accepted_list) > 1
-        valid_ends_list = [a + 1 for a in accepted_list]
-        accepted_mx = None
-        valid_ends_mx = None
-
-        def accepted_array():
-            nonlocal accepted_mx
-            if accepted_mx is None:
-                accepted_mx = mx.array(accepted_list, dtype=mx.int32)
-            return accepted_mx
-
-        def valid_ends_array():
-            nonlocal valid_ends_mx
-            if valid_ends_mx is None:
-                valid_ends_mx = mx.array(valid_ends_list, dtype=mx.int32)
-            return valid_ends_mx
-
-        def _is_ssm_cache(c):
-            return not c.is_trimmable() and not hasattr(c, "zero_row_tail")
-
-        ssm_caches = []
-        for c in caches:
-            if c is None:
-                continue
-            if _is_ssm_cache(c):
-                ssm_caches.append(c)
-                continue
-            if c.is_trimmable() and trim > 0:
-                c.trim(trim)
-            right_trimmed = False
-            if is_batch and max_a > 0:
-                extra_trim_list = [max_a - a for a in accepted_list]
-                if any(extra_trim_list):
-                    prepare = getattr(c, "prepare", None)
-                    finalize = getattr(c, "finalize", None)
-                    if c.keys is not None and callable(prepare) and callable(finalize):
-                        prepare(right_padding=extra_trim_list)
-                        finalize()
-                        right_trimmed = True
-            if (
-                is_batch
-                and not right_trimmed
-                and hasattr(c, "_idx")
-                and c.keys is not None
-                and max_a > 0
-            ):
-                kv_len = c._idx
-                verify_start = kv_len - n
-                if any(verify_start + ve < kv_len for ve in valid_ends_list):
-                    raise RuntimeError(
-                        "Qwen3.5 batched speculative rollback requires uniform "
-                        f"per-row acceptance; got ragged accepts {accepted_list}. "
-                        "Zeroing a rejected row's KV tail leaves phantom keys "
-                        "attended (issue #1962); set "
-                        "requires_uniform_batch_acceptance on the drafter or target "
-                        "so accepts are clamped before rollback."
-                    )
-
-        if not ssm_caches:
-            return max_a
-
-        if all(len(s) > 11 and s[11] is not None for s in gdn_states):
-            a0 = accepted_list[0] if not is_batch else None
-            if is_batch:
-                intermediate_parts = []
-                conv_input_parts = []
-                live_state_parts = []
-                live_conv_parts = []
-                layer_batch_sizes = []
-                kernel_sizes = []
-
-                for j, c in enumerate(ssm_caches):
-                    (
-                        _q,
-                        _k,
-                        _v,
-                        _a,
-                        _b,
-                        _A_log,
-                        _dt_bias,
-                        _init_state,
-                        _mask,
-                        conv_input,
-                        K,
-                        intermediate_states,
-                        *_,
-                    ) = gdn_states[j]
-                    rows = intermediate_states.shape[0]
-                    layer_batch_sizes.append(rows)
-                    kernel_sizes.append(int(K))
-                    intermediate_parts.append(intermediate_states)
-                    conv_input_parts.append(conv_input)
-
-                    live_state = c[1]
-                    if live_state is None:
-                        live_state = mx.zeros(
-                            (
-                                rows,
-                                intermediate_states.shape[2],
-                                intermediate_states.shape[3],
-                                intermediate_states.shape[4],
-                            ),
-                            dtype=intermediate_states.dtype,
-                        )
-                    live_state_parts.append(live_state)
-
-                    live_conv = c[0]
-                    if live_conv is None:
-                        live_conv = mx.zeros(
-                            (rows, int(K) - 1, conv_input.shape[-1]),
-                            dtype=conv_input.dtype,
-                        )
-                    live_conv_parts.append(live_conv)
-
-                if len(set(kernel_sizes)) != 1:
-                    raise ValueError("Qwen GDN layers must share conv kernel size.")
-
-                accepted_mx = accepted_array()
-                accepted_bat = mx.concatenate([accepted_mx for _ in ssm_caches], axis=0)
-                state_bat, conv_bat = gated_delta_accept_states(
-                    mx.concatenate(intermediate_parts, axis=0),
-                    mx.concatenate(conv_input_parts, axis=0),
-                    mx.concatenate(live_state_parts, axis=0),
-                    mx.concatenate(live_conv_parts, axis=0),
-                    accepted_bat,
-                    kernel_sizes[0],
-                    use_kernel=True,
-                )
-
-                offset = 0
-                for c, rows in zip(ssm_caches, layer_batch_sizes):
-                    c[1] = state_bat[offset : offset + rows]
-                    c[0] = conv_bat[offset : offset + rows]
-                    offset += rows
-            else:
-                for j, c in enumerate(ssm_caches):
-                    (
-                        _q,
-                        _k,
-                        _v,
-                        _a,
-                        _b,
-                        _A_log,
-                        _dt_bias,
-                        _init_state,
-                        _mask,
-                        conv_input,
-                        K,
-                        intermediate_states,
-                        *_,
-                    ) = gdn_states[j]
-                    if a0 < intermediate_states.shape[1]:
-                        c[1] = intermediate_states[:, a0]
-                        c[0] = conv_input[:, a0 + 1 : a0 + K]
-            return max_a
-
-        # Batch all SSM rollbacks into a single state-only gated delta kernel.
-        # Rollback does not need the layer output, so this avoids the verifier
-        # replay's q projection and y materialization.
-        N = len(ssm_caches)
-
-        k_list, v_list, a_list, b_list = [], [], [], []
-        A_log_list, dt_bias_list, state_list = [], [], []
-        steps_list = []
-        mask_parts = []
-        layer_batch_sizes = []
-        conv_data = []
-        for j in range(N):
-            (
-                _q,
-                k,
-                v,
-                a,
-                b,
-                A_log,
-                dt_bias,
-                init_state,
-                mask,
-                conv_input,
-                K,
-                *_,
-            ) = gdn_states[j]
-            k = k[:, :n]
-            v = v[:, :n]
-            a = a[:, :n]
-            b = b[:, :n]
-            batch_rows = k.shape[0]
-            k_list.append(k)
-            v_list.append(v)
-            a_list.append(a)
-            b_list.append(b)
-            if is_batch:
-                steps_list.append(valid_ends_array())
-            else:
-                steps_list.append(mx.full((batch_rows,), n, dtype=mx.int32))
-            A_log_list.append(
-                mx.broadcast_to(A_log[None, None, :], (batch_rows, 1, A_log.shape[0]))
-            )
-            dt_bias_list.append(
-                mx.broadcast_to(
-                    dt_bias[None, None, :], (batch_rows, 1, dt_bias.shape[0])
-                )
-            )
-            if init_state is None:
-                init_state = mx.zeros(
-                    (batch_rows, v.shape[-2], v.shape[-1], k.shape[-1]),
-                    dtype=mx.float32,
-                )
-            state_list.append(init_state)
-            layer_batch_sizes.append(batch_rows)
-            conv_data.append((conv_input, K))
-            mask_parts.append(None if mask is None else mask[:, :n])
-
-        # Stack along batch dim: (N, n, H, D) — one kernel launch for all layers.
-        k_bat = mx.concatenate(k_list, axis=0)
-        v_bat = mx.concatenate(v_list, axis=0)
-        a_bat = mx.concatenate(a_list, axis=0)
-        b_bat = mx.concatenate(b_list, axis=0)
-        A_log_bat = mx.concatenate(A_log_list, axis=0)  # (N, 1, Hv)
-        dt_bias_bat = mx.concatenate(dt_bias_list, axis=0)  # (N, 1, Hv)
-        state_bat = mx.concatenate(state_list, axis=0)  # (N, Hv, Dv, Dk)
-        steps_bat = mx.concatenate(steps_list, axis=0)
-
-        replay_mask = None
-        if any(mask is not None for mask in mask_parts):
-            replay_mask = mx.concatenate(
-                [
-                    (mask if mask is not None else mx.ones((rows, n), dtype=mx.bool_))
-                    for mask, rows in zip(mask_parts, layer_batch_sizes)
-                ],
-                axis=0,
-            )
-
-        states_out = gated_delta_state_update(
-            k_bat,
-            v_bat,
-            a_bat,
-            b_bat,
-            A_log_bat,
-            dt_bias_bat,
-            state_bat,
-            steps_bat,
-            replay_mask,
-            use_kernel=True,
+        return rollback_cache_transaction(
+            caches,
+            rollback_state,
+            accepted,
+            block_size,
         )
-
-        # Scatter results back to individual caches.
-        a0 = accepted_list[0] if not is_batch else None
-        state_offset = 0
-        for j, c in enumerate(ssm_caches):
-            batch_rows = layer_batch_sizes[j]
-            c[1] = states_out[state_offset : state_offset + batch_rows]
-            state_offset += batch_rows
-            conv_input, K = conv_data[j]
-            if is_batch:
-                slices = [
-                    conv_input[
-                        bi : bi + 1,
-                        accepted_list[bi] + 1 : accepted_list[bi] + K,
-                    ]
-                    for bi in range(len(accepted_list))
-                ]
-                c[0] = mx.concatenate(slices, axis=0)
-            else:
-                c[0] = conv_input[:, a0 + 1 : a0 + K]
-        return max_a
 
     def get_rope_index(
         self,
@@ -1744,6 +1433,14 @@ class LanguageModel(nn.Module):
         video_token_id = self.config.video_token_id
         vision_start_token_id = self.config.vision_start_token_id
         mrope_position_deltas = []
+        # The processor emits one vision block per temporal patch group, so
+        # expand each video grid (t, h, w) into t rows of (1, h, w) — the same
+        # split the reference implementation performs before indexing.
+        if video_grid_thw is not None:
+            rows = []
+            for thw in video_grid_thw.tolist():
+                rows.extend([[1, thw[1], thw[2]]] * int(thw[0]))
+            video_grid_thw = mx.array(rows, dtype=mx.int32)
         if input_ids is not None and (
             image_grid_thw is not None or video_grid_thw is not None
         ):
@@ -2056,7 +1753,7 @@ class LanguageModel(nn.Module):
                     )
 
         if speculative_verify:
-            return _EXACT_SPECULATIVE_VERIFIER(
+            return _EXACT_SPECULATIVE_VERIFIER.verify(
                 self,
                 inputs,
                 cache=cache,
@@ -2065,6 +1762,28 @@ class LanguageModel(nn.Module):
                 capture_layer_ids=capture_layer_ids,
                 return_hidden=return_hidden,
                 return_shared_kv=return_shared_kv,
+                skip_logits=skip_logits,
+            )
+
+        batch_invariant_decode = getattr(self, "_batch_invariant_decode", None)
+        supports_batch_invariant_decode = getattr(
+            self, "_supports_batch_invariant_decode", None
+        )
+        if (
+            cache is not None
+            and inputs.ndim == 2
+            and inputs.shape[1] == 1
+            and callable(batch_invariant_decode)
+            and (
+                supports_batch_invariant_decode is None
+                or supports_batch_invariant_decode()
+            )
+        ):
+            return batch_invariant_decode(
+                inputs,
+                cache=cache,
+                inputs_embeds=inputs_embeds,
+                position_ids=position_ids,
                 skip_logits=skip_logits,
             )
 
@@ -2185,12 +1904,16 @@ class LanguageModel(nn.Module):
             return_hidden=True,
             return_shared_kv=True,
         )
-        return (
-            out.hidden_states[-1],
-            out.shared_kv_states,
-            out.gdn_states,
-            sampler(out.logits),
-        )
+        try:
+            return (
+                out.hidden_states[-1],
+                out.shared_kv_states,
+                out.gdn_states,
+                sampler(out.logits),
+            )
+        except BaseException:
+            out.gdn_states.abort()
+            raise
 
     def speculative_verify_hidden(self, inputs: mx.array, cache):
         out = self(

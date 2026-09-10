@@ -7,9 +7,9 @@ import mlx.nn as nn
 
 from ....models.base import create_attention_mask
 from ....models.cache import BatchKVCache, KVCache
-from ....models.qwen3_5.fp8 import convert_qwen_fp8_weights
 from ....models.qwen3_5.language import Qwen3_5DecoderLayer
 from ....models.qwen3_5_moe.language import Qwen3_5MoeDecoderLayer
+from ...common import _prepare_ragged_mtp_replay
 from .config import Qwen3_5MTPConfig
 
 
@@ -51,6 +51,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         self._input_embed = None
         self._input_embed_scale: float = 1.0
         self._lm_head_fn = None
+        self._greedy_argmax_fn = None
         self._cache: List[KVCache] = []
         self._seed_token: Optional[mx.array] = None
         self._seed_hidden: Optional[mx.array] = None
@@ -91,6 +92,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
             or getattr(lm, "lm_head", None)
             or self._input_embed.as_linear
         )
+        self._greedy_argmax_fn = getattr(lm, "speculative_argmax_from_hidden", None)
         return self
 
     def make_cache(self, left_padding: Optional[List[int]] = None) -> List[KVCache]:
@@ -202,9 +204,18 @@ class Qwen3_5MTPDraftModel(nn.Module):
     ) -> mx.array:
         return self._forward_tokens(tok, hidden, token_dtype)
 
+    def _greedy_token(self, hidden: mx.array) -> mx.array:
+        if self._greedy_argmax_fn is not None:
+            token = self._greedy_argmax_fn(hidden)
+            if token is not None:
+                return token
+        return mx.argmax(self._lm_head_fn(hidden), axis=-1)
+
     def _set_seed_from_hidden(self, hidden: mx.array, sampler, greedy: bool) -> None:
-        logits = self._lm_head_fn(hidden)
-        self._seed_token = mx.argmax(logits, axis=-1) if greedy else sampler(logits)
+        if greedy:
+            self._seed_token = self._greedy_token(hidden)
+        else:
+            self._seed_token = sampler(self._lm_head_fn(hidden))
         self._seed_hidden = hidden
 
     def prefill_from_target_hidden(
@@ -326,59 +337,15 @@ class Qwen3_5MTPDraftModel(nn.Module):
                     "Qwen MTP ragged batch acceptance requires a batch-aware cache."
                 )
 
-        draft_rows = draft_tokens.tolist()
-        row_tokens = []
-        row_hiddens = []
-        for row, accepted_i in enumerate(accepted):
-            tokens_i = []
-            hiddens_i = []
-            for draft_idx in range(keep_appended[row], accepted_i):
-                tokens_i.append(int(draft_rows[row][draft_idx]))
-                hiddens_i.append(
-                    verify_hidden[row : row + 1, draft_idx : draft_idx + 1, :]
-                )
-            if new_tokens[row]:
-                tokens_i.append(int(new_tokens[row][-1]))
-                hiddens_i.append(
-                    verify_hidden[row : row + 1, accepted_i : accepted_i + 1, :]
-                )
-            row_tokens.append(tokens_i)
-            row_hiddens.append(hiddens_i)
-
-        lengths = [len(tokens_i) for tokens_i in row_tokens]
-        max_len = max(lengths) if lengths else 0
-        if max_len > 0:
-            token_data = []
-            hidden_rows = []
-            for tokens_i, hiddens_i in zip(row_tokens, row_hiddens):
-                token_data.extend(tokens_i)
-                pad = max_len - len(tokens_i)
-                if pad:
-                    token_data.extend([0] * pad)
-                if hiddens_i:
-                    hidden_row = mx.concatenate(hiddens_i, axis=1)
-                else:
-                    hidden_row = mx.zeros(
-                        (1, 0, verify_hidden.shape[-1]), dtype=verify_hidden.dtype
-                    )
-                if pad:
-                    hidden_row = mx.concatenate(
-                        [
-                            hidden_row,
-                            mx.zeros(
-                                (1, pad, verify_hidden.shape[-1]),
-                                dtype=verify_hidden.dtype,
-                            ),
-                        ],
-                        axis=1,
-                    )
-                hidden_rows.append(hidden_row)
-
-            tokens = mx.array(token_data, dtype=token_dtype).reshape(
-                len(row_tokens), max_len
-            )
-            hiddens = mx.concatenate(hidden_rows, axis=0)
-            right_padding = [max_len - length for length in lengths]
+        tokens, hiddens, lengths, right_padding = _prepare_ragged_mtp_replay(
+            verify_hidden,
+            draft_tokens,
+            accepted,
+            new_tokens,
+            keep_appended,
+            token_dtype,
+        )
+        if tokens is not None:
             if any(right_padding):
                 for cache in self._cache:
                     prepare = getattr(cache, "prepare", None)
@@ -461,8 +428,10 @@ class Qwen3_5MTPDraftModel(nn.Module):
         while len(tokens) < block_size - 1:
             h_prev = self._forward_token(tok, h_prev, token_dtype)
             self._round_appended += 1
-            logits = self._lm_head_fn(h_prev)
-            tok = mx.argmax(logits, axis=-1) if greedy else sampler(logits)
+            if greedy:
+                tok = self._greedy_token(h_prev)
+            else:
+                tok = sampler(self._lm_head_fn(h_prev))
             tokens.append(tok)
 
         self._draft_round += 1
@@ -487,8 +456,6 @@ class Qwen3_5MTPDraftModel(nn.Module):
                 if value.ndim == 1 and mx.issubdtype(value.dtype, mx.floating):
                     value = value + 1.0
             out[key] = value
-        out = convert_qwen_fp8_weights(out)
-
         expert_prefixes = [
             key[: -len(".experts.gate_up_proj")]
             for key in out

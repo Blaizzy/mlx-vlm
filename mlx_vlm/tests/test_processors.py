@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 from PIL import Image
 
 # ── Shared mocks ──────────────────────────────────────────────────────────────
@@ -85,6 +86,49 @@ def _mock_ip(**extra):
             ),
         },
     )()
+
+
+class TestUnlimitedOCRProcessor(unittest.TestCase):
+    def test_default_chat_template_omits_trailing_space(self):
+        Template = pytest.importorskip("jinja2").Template
+
+        from mlx_vlm.models.unlimited_ocr.processing_unlimitedocr import (
+            UnlimitedOCRProcessor,
+        )
+
+        processor = object.__new__(UnlimitedOCRProcessor)
+        rendered = Template(processor.default_chat_template).render(
+            messages=[
+                {"role": "user", "content": "<image>document parsing."},
+                {"role": "assistant", "content": "partial"},
+                {"role": "user", "content": "continue"},
+            ],
+            add_generation_prompt=True,
+        )
+
+        self.assertEqual(rendered, "<image>document parsing. partial continue")
+
+
+class TestOutputControlTokens(unittest.TestCase):
+    def test_glm46v_strips_box_markers(self):
+        from mlx_vlm.models.glm4v.processing import _strip_box_markers
+
+        self.assertEqual(
+            _strip_box_markers("<|begin_of_box|>answer<|end_of_box|>"), "answer"
+        )
+
+    def test_kimi_vl_stops_on_assistant_marker(self):
+        from mlx_vlm.models.kimi_vl.processing_kimi_vl import KimiVLProcessor
+
+        processor = object.__new__(KimiVLProcessor)
+        processor.tokenizer = SimpleNamespace(
+            unk_token_id=0,
+            convert_tokens_to_ids=lambda token: (
+                163586 if token == "<|im_assistant|>" else 0
+            ),
+        )
+
+        self.assertEqual(processor.additional_eos_token_ids, [163586])
 
 
 class TestGemma4UnifiedProcessor(unittest.TestCase):
@@ -2949,7 +2993,7 @@ class TestNemotronHNanoOmniProcessor(unittest.TestCase):
         self.assertGreater(int(result["num_tokens"][0].item()), 0)
 
 
-class TestLagunaProcessor(unittest.TestCase):
+class TestLagunaSpecialTokens(unittest.TestCase):
     def test_chat_template_owns_laguna_special_tokens(self):
         from mlx_vlm.utils import should_add_special_tokens
 
@@ -3561,6 +3605,43 @@ class TestQwen4ExpPatch(unittest.TestCase):
         )
 
 
+class TestQwen3VLEmbeddingPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
+            "qwen3_vl_embedding",
+            "mlx_vlm.models.qwen3_vl_embedding",
+            "Qwen3VLProcessor",
+        )
+
+    def test_does_not_fall_through_to_torch_gated_hf_processor(self):
+        # Regression test: embedding checkpoints ship with model_type
+        # "qwen3_vl_embedding", distinct from "qwen3_vl". Before this class
+        # registered its own patch, AutoProcessor fell through to
+        # transformers' real Qwen3VLProcessor, which hard-requires
+        # torch/torchvision to build its video sub-processor even though the
+        # embedding server never uses one.
+        import importlib
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        importlib.import_module("mlx_vlm.models.qwen3_vl_embedding")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps({"model_type": "qwen3_vl_embedding"})
+            )
+            try:
+                AutoProcessor.from_pretrained(tmpdir)
+            except Exception as e:
+                err = str(e).lower()
+                self.assertNotIn("requires the pytorch library", err)
+                self.assertNotIn("requires the torchvision library", err)
+
+
 class TestQwen3OmniMoePatch(unittest.TestCase):
     def test_patch_intercepts_without_hf_video_processor(self):
         import json
@@ -4056,3 +4137,123 @@ class TestVideoFrameCaps(unittest.TestCase):
             processor.video_sampling_defaults(),
             {"max_frames": processor.max_num_frames},
         )
+
+
+class TestMuseGlimmerCleanOutput(unittest.TestCase):
+    def _clean(self, text):
+        from mlx_vlm.models.muse_glimmer.processing_muse_glimmer import (
+            _extract_final_channel,
+        )
+
+        return _extract_final_channel(text)
+
+    def test_returns_only_final_user_channel(self):
+        raw = (
+            " to=self<|message|>Describe this image in one sentence.\n"
+            "Probably: two cats.\nLet's produce.<|eom|>"
+            "<|start|>assistant to=user<|message|>Two tabby cats sleep on a pink couch."
+        )
+        cleaned = self._clean(raw)
+        self.assertEqual(cleaned, "Two tabby cats sleep on a pink couch.")
+        self.assertNotIn("to=self", cleaned)
+        self.assertNotIn("<|message|>", cleaned)
+
+    def test_strips_trailing_channel_end_marker(self):
+        raw = "to=user<|message|>Final answer.<|return|>"
+        self.assertEqual(self._clean(raw), "Final answer.")
+
+    def test_noop_without_channels(self):
+        plain = "Two tabby cats sleep on a pink couch."
+        self.assertEqual(self._clean(plain), plain)
+
+
+class Qwen3VLVideoTimestampTests(unittest.TestCase):
+    """The processor renders one timestamped vision block per temporal group."""
+
+    class _Tokenizer:
+        video_token = "<|video_pad|>"
+        video_token_id = 102
+        pad_token = "<pad>"
+        pad_token_id = 0
+
+        def __init__(self):
+            self.last_text = None
+
+        def __call__(self, text, **kwargs):
+            self.last_text = text
+            texts = [text] if isinstance(text, str) else text
+            ids = []
+            for item in texts:
+                row = []
+                remaining = item
+                while remaining:
+                    if remaining.startswith(self.video_token):
+                        row.append(self.video_token_id)
+                        remaining = remaining[len(self.video_token) :]
+                    else:
+                        row.append(1)
+                        remaining = remaining[1:]
+                ids.append(row)
+            return {"input_ids": ids, "attention_mask": [[1] * len(r) for r in ids]}
+
+    def _make_processor(self, grid_thw):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+
+        tokenizer = self._Tokenizer()
+        video_processor = SimpleNamespace(
+            merge_size=2,
+            temporal_patch_size=2,
+            fps=2.0,
+            __call__=None,
+        )
+        video_processor = type(
+            "StubVideoProcessor",
+            (),
+            {
+                "merge_size": 2,
+                "temporal_patch_size": 2,
+                "fps": 2.0,
+                "__call__": lambda self, videos=None, **kw: {
+                    "pixel_values_videos": np.zeros((1, 4), dtype=np.float32),
+                    "video_grid_thw": np.array([grid_thw], dtype=np.int64),
+                },
+            },
+        )()
+        processor = Qwen3VLProcessor.__new__(Qwen3VLProcessor)
+        processor.tokenizer = tokenizer
+        processor.image_processor = None
+        processor.video_processor = video_processor
+        processor.image_token = "<|image_pad|>"
+        processor.image_token_id = 100
+        processor.video_token = tokenizer.video_token
+        processor.video_token_id = tokenizer.video_token_id
+        processor.vision_start_token = "<|vision_start|>"
+        processor.vision_end_token = "<|vision_end|>"
+        processor.vision_start_token_id = 58
+        processor.vision_end_token_id = 59
+        return processor, tokenizer
+
+    def test_video_prompt_gets_one_timestamped_block_per_temporal_group(self):
+        processor, tokenizer = self._make_processor(grid_thw=[4, 2, 2])
+        prompt = "<|vision_start|><|video_pad|><|vision_end|>Describe the clip."
+
+        out = processor(text=[prompt], videos=["clip.mp4"], fps=[2.0])
+
+        rendered = tokenizer.last_text[0]
+        self.assertEqual(rendered.count(" seconds>"), 4)
+        self.assertIn("<0.2 seconds><|vision_start|>", rendered)
+        self.assertIn("<3.2 seconds><|vision_start|>", rendered)
+        self.assertEqual(rendered.count("<|vision_start|>"), 4)
+        ids = np.array(out["input_ids"])[0].tolist()
+        self.assertEqual(ids.count(tokenizer.video_token_id), 4)  # 4 groups x 1 token
+
+    def test_video_prompt_falls_back_to_processor_fps(self):
+        processor, tokenizer = self._make_processor(grid_thw=[2, 2, 2])
+        prompt = "<|vision_start|><|video_pad|><|vision_end|>Describe the clip."
+
+        processor(text=[prompt], videos=["clip.mp4"])
+
+        rendered = tokenizer.last_text[0]
+        self.assertEqual(rendered.count(" seconds>"), 2)
+        self.assertIn("<0.2 seconds>", rendered)
+        self.assertIn("<1.2 seconds>", rendered)

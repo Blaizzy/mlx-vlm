@@ -48,15 +48,16 @@ class TrackerMaskDecoderConfig(BaseModelConfig):
     num_attention_heads: int = 8
     attention_downsample_rate: int = 2
     num_multimask_outputs: int = 3
-    iou_head_depth: int = 3
-    iou_head_hidden_dim: int = 256
     mlp_dim: int = 2048
-    hidden_act: str = "gelu"
     dynamic_multimask_via_stability: bool = True
     dynamic_multimask_stability_delta: float = 0.05
     dynamic_multimask_stability_thresh: float = 0.98
     # SAM 3.1 multiplex
     multiplex_count: int = 16
+    # Propagation decoder has no single-mask token (multimask tokens only)
+    multimask_outputs_only: bool = False
+    # Use multimask tokens (not the single-mask token) for object pointers
+    use_multimask_token_for_obj_ptr: bool = True
 
 
 @dataclass
@@ -73,59 +74,76 @@ class TrackerConfig(BaseModelConfig):
     multiplex_count: int = 16
 
     # Memory attention (decoupled)
-    memory_attention_hidden_size: int = 256
-    memory_attention_num_layers: int = 4
-    memory_attention_num_attention_heads: int = 8
     memory_attention_feed_forward_hidden_size: int = 2048
-    memory_attention_feed_forward_hidden_act: str = "relu"
-    memory_attention_dropout: float = 0.1
-    memory_attention_rope_dropout: float = 0.1
-    memory_attention_rope_theta: float = 10000.0
+    memory_attention_hidden_size: int = 256
+    memory_attention_num_attention_heads: int = 8
+    memory_attention_num_layers: int = 4
     memory_attention_rope_feat_sizes: List[int] = field(
         default_factory=lambda: [72, 72]
     )
-    memory_attention_downsample_rate: int = 1
+    memory_attention_rope_theta: float = 10000.0
 
-    # Memory encoder
-    memory_encoder_hidden_size: int = 256
-    memory_encoder_output_channels: int = 256  # SAM 3.1: 256 (was 64 in SAM 3)
-
-    # Mask downsampler — first channels from checkpoint: 16
+    # Memory encoder — mask downsampler (SAM 3.1: dim = out_dim = 256)
     mask_downsampler_embed_dim: int = 256
-    mask_downsampler_kernel_size: int = 3
-    mask_downsampler_stride: int = 2
-    mask_downsampler_padding: int = 1
-    mask_downsampler_total_stride: int = 16
-    mask_downsampler_hidden_act: str = "gelu"
     mask_downsampler_first_channels: int = 16  # actual from checkpoint
+    mask_downsampler_input_size: int = 1152  # resize masks to this pre-convs
+    mask_downsampler_kernel_size: int = 3
+    mask_downsampler_padding: int = 1
+    mask_downsampler_stride: int = 2
+    memory_encoder_hidden_size: int = 256
 
     # Memory fuser (CXBlock)
     memory_fuser_embed_dim: int = 256
-    memory_fuser_kernel_size: int = 7
-    memory_fuser_padding: int = 3
-    memory_fuser_num_layers: int = 2
     memory_fuser_intermediate_dim: int = 1024
+    memory_fuser_kernel_size: int = 7
     memory_fuser_layer_scale_init_value: float = 1e-6
-    memory_fuser_hidden_act: str = "gelu"
+    memory_fuser_num_layers: int = 2
+    memory_fuser_padding: int = 3
 
-    # Tracker settings
-    num_maskmem: int = 7
+    # Memory retrieval over past frames
     max_cond_frame_num: int = 4
     max_object_pointers_in_encoder: int = 16
-    multimask_output_in_sam: bool = True
-    multimask_output_for_tracking: bool = True
-    multimask_min_pt_num: int = 0
+    memory_temporal_stride_for_eval: int = 1
+    num_maskmem: int = 7
+    save_image_features: bool = True
+    use_maskmem_tpos_v2: bool = True
+
+    # Memory encoding: mask -> memory (SAM 3.1: sigmoid(logits) * 2.0 - 1.0)
+    apply_sigmoid_to_mask_logits_for_mem_enc: bool = True
+    sigmoid_bias_for_mem_enc: float = -1.0
+    sigmoid_scale_for_mem_enc: float = 2.0
+    # Extra per-object channel marking conditioning objects
+    condition_as_mask_input: bool = True
+    condition_as_mask_input_bg: float = 0.0
+    condition_as_mask_input_fg: float = 1.0
+
+    # SAM head behavior (multimask, mask-as-output)
+    directly_add_no_mem_embed: bool = True
     multimask_max_pt_num: int = 1
+    multimask_min_pt_num: int = 0
+    multimask_output_for_tracking: bool = True
+    multimask_output_in_sam: bool = True
+    num_multimask_outputs: int = 3
+    use_mask_input_as_output_without_sam: bool = True
 
-    # Memory encoding params
-    sigmoid_bias_for_mem_enc: float = -10.0
-    sigmoid_scale_for_mem_enc: float = 20.0
-
-    # Occlusion / temporal
-    enable_occlusion_spatial_embedding: bool = True
-    enable_temporal_pos_encoding_for_object_pointers: bool = True
+    # Object presence scores and pointers
+    add_output_suppression_embeddings: bool = True
+    fixed_no_obj_ptr: bool = True
+    object_score_logit_threshold: float = 0.0
+    pred_obj_scores: bool = True
+    use_linear_no_obj_ptr: bool = True
+    use_no_obj_ptr: bool = True
+    use_obj_ptrs_in_encoder: bool = True
 
     def __post_init__(self):
+        # The facebook/sam3.1 HF config carries a stale SAM 3 (non-multiplex)
+        # tracker_config. Re-pin the SAM 3.1 multiplex architectural constants
+        # (see build_sam3_multiplex_video_model in the SAM 3 repo).
+        if self.model_type == "sam3_tracker_video":
+            self.memory_attention_num_attention_heads = 8
+            self.sigmoid_scale_for_mem_enc = 2.0
+            self.sigmoid_bias_for_mem_enc = -1.0
+
         if isinstance(self.vision_config, dict):
             self.vision_config = VisionEncoderConfig.from_dict(self.vision_config)
         elif self.vision_config is None:
@@ -135,8 +153,12 @@ class TrackerConfig(BaseModelConfig):
             self.mask_decoder_config = TrackerMaskDecoderConfig.from_dict(
                 self.mask_decoder_config
             )
+            # Propagation decoder: multimask tokens only (no single-mask token)
+            self.mask_decoder_config.multimask_outputs_only = True
         elif self.mask_decoder_config is None:
-            self.mask_decoder_config = TrackerMaskDecoderConfig()
+            self.mask_decoder_config = TrackerMaskDecoderConfig(
+                multimask_outputs_only=True
+            )
 
         if isinstance(self.prompt_encoder_config, dict):
             self.prompt_encoder_config = PromptEncoderConfig.from_dict(

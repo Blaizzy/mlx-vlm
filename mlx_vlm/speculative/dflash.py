@@ -3,6 +3,7 @@ from typing import Any, Callable, Generator, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .cache_state import abort_speculative_round, commit_speculative_round
 from .common import (
     _dflash_block_total,
     _record_speculative_round,
@@ -11,6 +12,7 @@ from .common import (
     _speculative_walk_batch,
     _SpeculativeSamplerRNG,
     generation_stream,
+    verify_forward,
 )
 
 
@@ -78,6 +80,64 @@ def _dflash_committed_hidden_segments(
         hidden_full[i : i + 1, : len(new_tokens), :]
         for i, new_tokens in enumerate(new_tokens_list)
     ]
+
+
+def _reserve_dflash_target_cache(prompt_cache: List[Any], block_size: int) -> None:
+    pending = []
+    for entry in prompt_cache:
+        reserve = getattr(entry, "prefix_cache_reserve", None)
+        offset = getattr(entry, "offset", None)
+        if not callable(reserve) or not isinstance(offset, int):
+            continue
+        pending.extend(reserve(offset + block_size))
+    if pending:
+        mx.async_eval(*pending)
+
+
+def _dflash_verify(lm, inputs, cache, capture_layer_ids):
+    # Older architectures still own their verifier entry point. Models using
+    # ordinary forward calls need only the shared cache transaction.
+    if callable(getattr(lm, "rollback_speculative_cache", None)):
+        output = lm(
+            inputs,
+            cache=cache,
+            capture_layer_ids=capture_layer_ids,
+            speculative_verify=True,
+        )
+        return output, output.gdn_states
+    return verify_forward(lm, inputs, cache, capture_layer_ids=capture_layer_ids)
+
+
+def _dflash_verify_greedy(
+    lm: nn.Module,
+    verify_input: mx.array,
+    prompt_cache: List[Any],
+    target_layer_ids: List[int],
+    sampler: Callable[[mx.array], mx.array],
+):
+    gdn_states = None
+    try:
+        verify_hidden = getattr(lm, "speculative_verify_dflash_hidden", None)
+        argmax_from_hidden = getattr(lm, "speculative_argmax_from_hidden", None)
+        if callable(verify_hidden) and callable(argmax_from_hidden):
+            captured, final_hidden, gdn_states = verify_hidden(
+                verify_input, prompt_cache, target_layer_ids
+            )
+            target_tokens = argmax_from_hidden(final_hidden)
+            if target_tokens is None:
+                raise RuntimeError(
+                    "speculative_argmax_from_hidden returned no greedy target tokens"
+                )
+            return captured, gdn_states, target_tokens
+
+        verify_out, gdn_states = _dflash_verify(
+            lm, verify_input, prompt_cache, target_layer_ids
+        )
+        return verify_out.hidden_states, gdn_states, sampler(verify_out.logits)
+
+    except BaseException:
+        abort_speculative_round(gdn_states)
+        raise
 
 
 def _supports_positioned_target_sampling(sampler: Callable) -> bool:
@@ -247,15 +307,21 @@ def _dflash_rounds(
     captured hidden states into ``hidden``.
     """
     lm = model.language_model if hasattr(model, "language_model") else model
-    if not hasattr(lm, "rollback_speculative_cache"):
-        raise RuntimeError(
-            f"{type(lm).__name__} does not implement rollback_speculative_cache. "
-            "This target does not currently support DFlash speculative decoding."
-        )
 
     target_layer_ids = list(draft_model.config.target_layer_ids)
     block_total = _dflash_block_total(draft_model, draft_block_size)
+    choose_block_ceiling = getattr(draft_model, "choose_block_ceiling", None)
+    if callable(choose_block_ceiling):
+        block_total = choose_block_ceiling(int(hidden.shape[1]), block_total)
+    initial_block_size = getattr(draft_model, "dflash_initial_block_size", None)
+    choose_initial_block_size = getattr(draft_model, "choose_initial_block_size", None)
+    if use_model_initial_block_size and callable(choose_initial_block_size):
+        initial_block_size = choose_initial_block_size(
+            int(hidden.shape[1]), block_total
+        )
     draft_cache = draft_model.reset(model)
+    with mx.stream(generation_stream):
+        _reserve_dflash_target_cache(prompt_cache, block_total)
     positioned_sampling = _supports_positioned_target_sampling(sampler)
     sampler_rng = _SpeculativeSamplerRNG(
         draft_model,
@@ -275,11 +341,7 @@ def _dflash_rounds(
             draft_model,
             block_total,
             max_tokens - emitted + 1,
-            (
-                getattr(draft_model, "dflash_initial_block_size", None)
-                if use_model_initial_block_size
-                else None
-            ),
+            (initial_block_size if use_model_initial_block_size else None),
         )
         if bs <= 1:
             break
@@ -294,8 +356,13 @@ def _dflash_rounds(
             if not greedy_sampling and positioned_sampling
             else sampler
         )
+        draft_fn = (
+            getattr(draft_model, "draft_block_greedy", draft_model.draft_block)
+            if greedy_sampling
+            else draft_model.draft_block
+        )
         draft_tokens = sampler_rng.draft_tokens(
-            draft_model.draft_block,
+            draft_fn,
             b,
             hidden,
             draft_cache,
@@ -306,52 +373,60 @@ def _dflash_rounds(
         )
         mx.async_eval(draft_tokens)
 
-        with mx.stream(generation_stream):
-            verify_input = mx.concatenate(
-                [mx.array([[b]], dtype=token_dtype), draft_tokens],
-                axis=1,
-            )
-            verify_out = lm(
-                verify_input,
-                cache=prompt_cache,
-                capture_layer_ids=target_layer_ids,
-                speculative_verify=True,
-            )
-            hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
-            if greedy_sampling:
-                target_tokens = sampler(verify_out.logits)
-        if greedy_sampling:
-            mx.async_eval(target_tokens, hidden)
-        else:
-            mx.async_eval(hidden)
-
-        if greedy_sampling:
-            accepted, new_tokens = _speculative_walk(
-                draft_tokens, target_tokens, max_tokens - emitted
-            )
-        else:
-            accepted_list, new_tokens_list = _sample_dflash_target_walk(
-                verify_out.logits,
-                draft_tokens,
-                sampler,
-                [max_tokens - emitted],
-                row_ids=[0],
-                base_positions=[emitted],
-            )
-            accepted = accepted_list[0]
-            new_tokens = new_tokens_list[0]
-            sampler_rng.target_sampled(sync_draft=not positioned_sampling)
-        _record_speculative_round(draft_model, accepted, bs - 1)
-
-        if accepted < bs - 1:
-            hidden = hidden[:, : accepted + 1, :]
-        b = new_tokens[-1] if new_tokens else b
-
-        if accepted < bs - 1:
+        gdn_states = None
+        try:
             with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(
-                    prompt_cache, verify_out.gdn_states, accepted, bs
+                verify_input = mx.concatenate(
+                    [mx.array([[b]], dtype=token_dtype), draft_tokens],
+                    axis=1,
                 )
+                if greedy_sampling:
+                    captured, gdn_states, target_tokens = _dflash_verify_greedy(
+                        lm,
+                        verify_input,
+                        prompt_cache,
+                        target_layer_ids,
+                        sampler,
+                    )
+                    hidden = mx.concatenate(captured, axis=-1)
+                else:
+                    verify_out, gdn_states = _dflash_verify(
+                        lm, verify_input, prompt_cache, target_layer_ids
+                    )
+                    hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
+            if greedy_sampling:
+                mx.async_eval(target_tokens, hidden)
+            else:
+                mx.async_eval(hidden)
+
+            if greedy_sampling:
+                accepted, new_tokens = _speculative_walk(
+                    draft_tokens, target_tokens, max_tokens - emitted
+                )
+            else:
+                accepted_list, new_tokens_list = _sample_dflash_target_walk(
+                    verify_out.logits,
+                    draft_tokens,
+                    sampler,
+                    [max_tokens - emitted],
+                    row_ids=[0],
+                    base_positions=[emitted],
+                )
+                accepted = accepted_list[0]
+                new_tokens = new_tokens_list[0]
+                sampler_rng.target_sampled(sync_draft=not positioned_sampling)
+            _record_speculative_round(draft_model, accepted, bs - 1)
+
+            if accepted < bs - 1:
+                hidden = hidden[:, : accepted + 1, :]
+            b = new_tokens[-1] if new_tokens else b
+
+            with mx.stream(generation_stream):
+                commit_speculative_round(lm, prompt_cache, gdn_states, accepted, bs)
+
+        except BaseException:
+            abort_speculative_round(gdn_states)
+            raise
 
         if hidden_is_prepared and emitted + len(new_tokens) < max_tokens:
             hidden = prepare_target_hidden(hidden)
@@ -397,16 +472,23 @@ def _dflash_rounds_batch(
     to emit this step).
     """
     lm = model.language_model if hasattr(model, "language_model") else model
-    if not hasattr(lm, "rollback_speculative_cache"):
-        raise RuntimeError(
-            f"{type(lm).__name__} does not implement " "rollback_speculative_cache."
-        )
 
     B = first_bonus.shape[0]
     row_ids = list(range(B)) if row_ids is None else list(row_ids)
     target_layer_ids = list(draft_model.config.target_layer_ids)
     block_total = _dflash_block_total(draft_model, draft_block_size)
+    choose_block_ceiling = getattr(draft_model, "choose_block_ceiling", None)
+    if callable(choose_block_ceiling):
+        block_total = choose_block_ceiling(int(hidden.shape[1]), block_total)
+    initial_block_size = getattr(draft_model, "dflash_initial_block_size", None)
+    choose_initial_block_size = getattr(draft_model, "choose_initial_block_size", None)
+    if callable(choose_initial_block_size):
+        initial_block_size = choose_initial_block_size(
+            int(hidden.shape[1]), block_total
+        )
     draft_model.reset(model)
+    with mx.stream(generation_stream):
+        _reserve_dflash_target_cache(prompt_cache, block_total)
     positioned_sampling = _supports_positioned_target_sampling(sampler)
     sampler_rng = _SpeculativeSamplerRNG(
         draft_model,
@@ -429,7 +511,12 @@ def _dflash_rounds_batch(
             max(1, max_tokens - emitted[active_idx[j]] + 1)
             for j in range(len(active_idx))
         ]
-        bs = _dflash_next_block_size(draft_model, block_total, min(remaining))
+        bs = _dflash_next_block_size(
+            draft_model,
+            block_total,
+            min(remaining),
+            initial_block_size,
+        )
         if bs <= 1:
             break
 
@@ -443,7 +530,15 @@ def _dflash_rounds_batch(
         def draft_active_rows():
             return mx.concatenate(
                 [
-                    draft_model.draft_block(
+                    (
+                        getattr(
+                            draft_model,
+                            "draft_block_greedy",
+                            draft_model.draft_block,
+                        )
+                        if greedy_sampling
+                        else draft_model.draft_block
+                    )(
                         int(b_active[j]),
                         hidden_by_orig[active_idx[j]],
                         draft_caches[active_idx[j]],
@@ -468,60 +563,73 @@ def _dflash_rounds_batch(
             draft_active_rows,
         )
 
-        with mx.stream(generation_stream):
-            verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
-            verify_out = lm(
-                verify_input,
-                cache=prompt_cache,
-                capture_layer_ids=target_layer_ids,
-                speculative_verify=True,
-            )
-            hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
+        gdn_states = None
+        try:
+            with mx.stream(generation_stream):
+                verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
+                if greedy_sampling:
+                    captured, gdn_states, target_tokens = _dflash_verify_greedy(
+                        lm,
+                        verify_input,
+                        prompt_cache,
+                        target_layer_ids,
+                        sampler,
+                    )
+                    hidden_full = mx.concatenate(captured, axis=-1)
+                else:
+                    verify_out, gdn_states = _dflash_verify(
+                        lm, verify_input, prompt_cache, target_layer_ids
+                    )
+                    hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
             if greedy_sampling:
-                target_tokens = sampler(verify_out.logits)
-        if greedy_sampling:
-            mx.async_eval(target_tokens, hidden_full)
-        else:
-            mx.async_eval(hidden_full)
+                mx.async_eval(target_tokens, hidden_full)
+            else:
+                mx.async_eval(hidden_full)
 
-        budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
-        if greedy_sampling:
-            accepted_list, new_tokens_list = _speculative_walk_batch(
-                draft_tokens, target_tokens, budgets
+            budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
+            if greedy_sampling:
+                accepted_list, new_tokens_list = _speculative_walk_batch(
+                    draft_tokens, target_tokens, budgets
+                )
+            else:
+                accepted_list, new_tokens_list = _sample_dflash_target_walk(
+                    verify_out.logits,
+                    draft_tokens,
+                    sampler,
+                    budgets,
+                    row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
+                    base_positions=[emitted[active_idx[j]] for j in range(n_active)],
+                )
+                sampler_rng.target_sampled(sync_draft=not positioned_sampling)
+
+            if (
+                n_active > 1
+                and _requires_uniform_batch_acceptance(draft_model, lm)
+                and len(set(accepted_list)) > 1
+            ):
+                uniform = min(len(nt) - 1 for nt in new_tokens_list)
+                new_tokens_list = [nt[: uniform + 1] for nt in new_tokens_list]
+                accepted_list = [uniform] * n_active
+
+            hidden_segments = _dflash_committed_hidden_segments(
+                hidden_full, new_tokens_list
             )
-        else:
-            accepted_list, new_tokens_list = _sample_dflash_target_walk(
-                verify_out.logits,
-                draft_tokens,
-                sampler,
-                budgets,
-                row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
-                base_positions=[emitted[active_idx[j]] for j in range(n_active)],
-            )
-            sampler_rng.target_sampled(sync_draft=not positioned_sampling)
+            for j in range(n_active):
+                orig = active_idx[j]
+                if hidden_segments[j].shape[1] > 0:
+                    hidden_by_orig[orig] = hidden_segments[j]
 
-        if (
-            n_active > 1
-            and _requires_uniform_batch_acceptance(draft_model, lm)
-            and len(set(accepted_list)) > 1
-        ):
-            uniform = min(len(nt) - 1 for nt in new_tokens_list)
-            new_tokens_list = [nt[: uniform + 1] for nt in new_tokens_list]
-            accepted_list = [uniform] * n_active
+            for a in accepted_list:
+                _record_speculative_round(draft_model, a, bs - 1)
 
-        min_accepted = min(accepted_list)
-        accepted_arr = mx.array(accepted_list)
+            with mx.stream(generation_stream):
+                commit_speculative_round(
+                    lm, prompt_cache, gdn_states, mx.array(accepted_list), bs
+                )
 
-        hidden_segments = _dflash_committed_hidden_segments(
-            hidden_full, new_tokens_list
-        )
-        for j in range(n_active):
-            orig = active_idx[j]
-            if hidden_segments[j].shape[1] > 0:
-                hidden_by_orig[orig] = hidden_segments[j]
-
-        for a in accepted_list:
-            _record_speculative_round(draft_model, a, bs - 1)
+        except BaseException:
+            abort_speculative_round(gdn_states)
+            raise
 
         # Emit (map active slots back to original indices)
         max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
@@ -544,12 +652,6 @@ def _dflash_rounds_batch(
             orig = active_idx[j]
             if new_tokens_list[j]:
                 b[orig] = new_tokens_list[j][-1]
-
-        if min_accepted < bs - 1:
-            with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(
-                    prompt_cache, verify_out.gdn_states, accepted_arr, bs
-                )
 
         # --- Continuous batching: filter out finished sequences ---
         keep_slots = [j for j in range(n_active) if not finished[active_idx[j]]]

@@ -57,6 +57,7 @@ MODEL_CONFIG = {
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "glm5_next": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "dots_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
@@ -113,7 +114,7 @@ MODEL_CONFIG = {
     "paligemma": MessageFormat.PROMPT_WITH_IMAGE_TOKEN,
     "laguna": MessageFormat.TEXT_ONLY,
     "nemotron_labs_diffusion": MessageFormat.TEXT_ONLY,
-    "deepseek_v4": MessageFormat.TEXT_ONLY,
+    "deepseek_v4": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "hrm_text": MessageFormat.TEXT_ONLY,
     "minimax_m3": MessageFormat.TEXT_ONLY,
 }
@@ -294,6 +295,7 @@ class MessageFormatter:
             "qwen2_vl",
             "qwen2_5_vl",
             "qwen3_vl",
+            "mage_vl",
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
@@ -305,6 +307,7 @@ class MessageFormatter:
             "minicpmv4_6",
             "minimax_m3_vl",
             "llava_onevision",
+            "glm5_next",
         ] and kwargs.get("video"):
             return self._format_video_message(
                 prompt,
@@ -550,6 +553,8 @@ class MessageFormatter:
             MessageBuilder.video_message(v, max_pixels, f)
             for v, f in zip(videos, fps_list)
         ]
+        if role == "user" and not skip_image_token:
+            content = [MessageBuilder.image_message()] * num_images + content
         if role == "user" and not skip_audio_token and num_audios > 0:
             content.extend([MessageBuilder.audio_message()] * num_audios)
         content.append(MessageBuilder.text_message(prompt))
@@ -888,6 +893,16 @@ def apply_chat_template(
     # Build messages from prompts
     messages = []
 
+    def _deepseek_message_with_images(message, image_count):
+        message = dict(message)
+        content = message.get("content", "")
+        if not isinstance(content, list):
+            return None
+        explicit = _content_media_count(content, ("image", "image_url", "input_image"))
+        missing = max(image_count - explicit, 0)
+        message["content"] = [MessageBuilder.image_message()] * missing + list(content)
+        return message
+
     if isinstance(prompt, str):
         # Single string prompt
         messages.append(
@@ -904,6 +919,12 @@ def apply_chat_template(
         role = prompt.get("role", "user")
         if "tool_calls" in prompt or "tool_call_id" in prompt or role == "tool":
             messages.append(_normalize_tool_message(prompt))
+        elif (
+            model_type == "deepseek_v4"
+            and (message := _deepseek_message_with_images(prompt, num_images))
+            is not None
+        ):
+            messages.append(message)
         else:
             content = extract_text_from_content(prompt["content"])
             messages.append(
@@ -971,6 +992,12 @@ def apply_chat_template(
                 )
                 if has_tool_metadata:
                     messages.append(_normalize_tool_message(p))
+                elif (
+                    model_type == "deepseek_v4"
+                    and (message := _deepseek_message_with_images(p, image_counts[i]))
+                    is not None
+                ):
+                    messages.append(message)
                 else:
                     # Handle multimodal content: extract only text, skip image/audio URLs
                     content = extract_text_from_content(content)

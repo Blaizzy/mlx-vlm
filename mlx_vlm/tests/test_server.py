@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
 from threading import Event, Lock, Thread
@@ -35,6 +36,7 @@ from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
+from mlx_vlm.tool_parsers import _infer_tool_parser, minicpm5
 
 
 def test_response_generator_prefill_step_override_wins_over_environment(monkeypatch):
@@ -531,53 +533,33 @@ def test_speculative_server_hidden_state_concatenates_for_dflash():
     assert result.shape == (1, 1, 8)
 
 
-@pytest.mark.parametrize("draft_kind", ["mtp", "dflash", "eagle3"])
-def test_speculative_prompt_cache_uses_unbatched_cache_for_singleton(
-    monkeypatch, draft_kind
+@pytest.mark.parametrize(
+    "draft_kind,batch_size,left_padding",
+    [
+        ("mtp", 1, [0]),
+        ("mtp", 2, [0, 1]),
+        ("dflash", 1, [0]),
+        ("dflash", 2, [0, 1]),
+        ("eagle3", 1, [0]),
+        (None, 1, [0]),
+    ],
+)
+def test_speculative_prompt_cache_always_uses_supplied_make_cache(
+    draft_kind, batch_size, left_padding
 ):
-    lm = object()
-    unbatched_cache = object()
-    batched_cache = object()
-
-    monkeypatch.setattr(
-        speculative_utils.cache, "make_prompt_cache", lambda target: unbatched_cache
-    )
-
-    result = speculative_utils.make_speculative_prompt_cache(
-        lm,
-        draft_kind=draft_kind,
-        batch_size=1,
-        left_padding=[0],
-        make_cache=lambda *args, **kwargs: batched_cache,
-    )
-
-    assert result is unbatched_cache
-
-
-def test_speculative_prompt_cache_uses_batched_cache_for_batch(monkeypatch):
+    # `make_cache` is what applies --kv-bits. Single-row speculation used to
+    # bypass it for `cache.make_prompt_cache`, which left the KV unquantized
+    # however the server was configured.  That shortcut covered every drafter
+    # routed through here, so each one is checked for the single-row case.
     lm = object()
     batched_cache = object()
-
-    monkeypatch.setattr(
-        speculative_utils.cache, "make_prompt_cache", lambda target: pytest.fail()
-    )
 
     assert (
         speculative_utils.make_speculative_prompt_cache(
             lm,
-            draft_kind="mtp",
-            batch_size=2,
-            left_padding=[0, 1],
-            make_cache=lambda *args, **kwargs: batched_cache,
-        )
-        is batched_cache
-    )
-    assert (
-        speculative_utils.make_speculative_prompt_cache(
-            lm,
-            draft_kind="dflash",
-            batch_size=2,
-            left_padding=[0, 1],
+            draft_kind=draft_kind,
+            batch_size=batch_size,
+            left_padding=left_padding,
             make_cache=lambda *args, **kwargs: batched_cache,
         )
         is batched_cache
@@ -5553,7 +5535,7 @@ class TestResponseGenerator:
         gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
         gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
         gen.top_logprobs_k = 0
-        apc_manager = object()
+        apc_manager = SimpleNamespace(prepare_prefill=MagicMock(), close=MagicMock())
         gen.apc_manager = apc_manager
         gen.prefill_step_size = 3072
         gen.tokenizer = SimpleNamespace()
@@ -5615,6 +5597,9 @@ class TestResponseGenerator:
         assert kwargs["compute_logprobs"] is False
         assert kwargs["prefill_step_size"] == 3072
         assert kwargs["apc_manager"] is apc_manager
+        assert apc_manager.prepare_prefill.call_count == 2
+        apc_manager.prepare_prefill.assert_called_with(1)
+        apc_manager.close.assert_called_once_with()
         assert batch_state["instance"].next_active_sizes == [2]
 
     @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])
@@ -6844,6 +6829,10 @@ class TestSplitThinking:
         assert reasoning == "Thinking text"
         assert content == "Answer."
 
+    @pytest.mark.parametrize("prefix", ["", "thought\n"])
+    def test_channel_close_only(self, prefix):
+        assert server._split_thinking(f"{prefix}got it<channel|>42") == ("got it", "42")
+
     def test_no_thinking(self):
         text = "Just plain text."
         reasoning, content = server._split_thinking(text)
@@ -7221,6 +7210,69 @@ class TestProcessToolCalls:
         assert json.loads(result["calls"][1]["function"]["arguments"]) == {
             "path": "file.py"
         }
+
+    minicpm5_call = (
+        '<function name="write_file"><param name="content">'
+        "<![CDATA[  <html>\nA & B\n</html>  ]]></param>"
+        '<param name="version">123</param><param name="count">3</param>'
+        '<param name="enabled">True</param></function>'
+    )
+
+    def test_detects_minicpm5_chat_template(self):
+        template = """{{ '<function name="' ~ tool_call.name ~ '">' }}
+    {{ '<param name="' ~ param_name ~ '">' }}"""
+        assert server.load_tool_module(_infer_tool_parser(template)) is minicpm5
+
+    def test_minicpm5_cdata_and_argument_types(self):
+        tools = [
+            {
+                "function": {
+                    "name": "write_file",
+                    "parameters": {"properties": {"version": {"type": "string"}}},
+                }
+            }
+        ]
+        result = minicpm5.parse_tool_call(self.minicpm5_call, tools)
+
+        assert result == {
+            "name": "write_file",
+            "arguments": {
+                "content": "  <html>\nA & B\n</html>  ",
+                "version": "123",
+                "count": 3,
+                "enabled": True,
+            },
+        }
+
+    def test_minicpm5_multiple_calls_and_streamed_markup(self):
+        text = f'Before{self.minicpm5_call}Between<function name="get_time"></function>After'
+        result = server.process_tool_calls(text, minicpm5, tools=None)
+
+        assert result["remaining_text"] == "Before Between After"
+        assert [call["function"]["name"] for call in result["calls"]] == [
+            "write_file",
+            "get_time",
+        ]
+        assert json.loads(result["calls"][1]["function"]["arguments"]) == {}
+
+        state = server.ToolCallStreamState(
+            minicpm5.tool_call_start, minicpm5.tool_call_end
+        )
+        visible = "".join(state.feed(char) or "" for char in text)
+        visible += state.feed("", last=True) or ""
+        assert visible == "BeforeBetweenAfter"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '<function name="lookup"><param name="value">unfinished',
+            '<function name=""></function>',
+            '<function name="lookup"><param>3</param></function>',
+        ],
+    )
+    def test_minicpm5_rejects_malformed_calls(self, text):
+        with pytest.raises(ValueError):
+            minicpm5.parse_tool_call(text)
 
 
 class TestCountThinkingTagTokens:
@@ -7982,3 +8034,153 @@ class TestReranking:
         loaded = server.get_cached_model("reranker", None, model_kind="reranker")
 
         assert loaded == (model, processor, model.config)
+
+
+@dataclass
+class _FakeAlignedToken:
+    id: int
+    text: str
+    start: float
+    duration: float
+    end: float = 0.0
+
+    def __post_init__(self):
+        self.end = self.start + self.duration
+
+
+@dataclass
+class _FakeAlignedSentence:
+    text: str
+    tokens: list
+    start: float = 0.0
+    end: float = 0.0
+
+    def __post_init__(self):
+        self.start = self.tokens[0].start
+        self.end = self.tokens[-1].end
+
+
+@dataclass
+class _FakeAlignedResult:
+    text: str
+    sentences: list
+
+
+@dataclass
+class _FakeSTTOutput:
+    text: str
+    segments: list = None
+    language: str = None
+
+
+@dataclass
+class _FakeStreamingResult:
+    text: str
+    tokens: list
+    is_final: bool
+    start_time: float
+    end_time: float
+
+
+def _fake_parakeet_result():
+    first = _FakeAlignedSentence(
+        "Hello world.",
+        [
+            _FakeAlignedToken(1, "Hello", 0.0, 0.4),
+            _FakeAlignedToken(2, " world.", 0.4, 0.5),
+        ],
+    )
+    second = _FakeAlignedSentence("Bye.", [_FakeAlignedToken(3, "Bye.", 1.0, 0.3)])
+    return _FakeAlignedResult("Hello world. Bye.", [first, second])
+
+
+class TestSTTSegmentSerialization:
+    """Serialization of STT results into OpenAI-style transcription payloads.
+
+    Regression coverage for NeMo-alignment models (Parakeet/Canary) whose
+    ``AlignedResult`` exposes ``sentences`` rather than ``segments`` (issue 2183).
+    """
+
+    def test_derives_segments_from_nemo_sentences(self):
+        from mlx_vlm.server.audio import _stt_item_to_dict
+
+        data = _stt_item_to_dict(_fake_parakeet_result())
+
+        assert "segments" in data
+        segments = data["segments"]
+        assert [s["text"] for s in segments] == ["Hello world.", "Bye."]
+        assert segments[0]["start"] == 0.0
+        assert abs(segments[0]["end"] - 0.9) < 1e-6
+        assert segments[1]["start"] == 1.0
+        assert abs(segments[1]["end"] - 1.3) < 1e-6
+
+    def test_pipeline_preserves_nemo_segments(self):
+        from mlx_vlm.server.audio import (
+            _iter_stt_items,
+            _sanitize_for_json,
+            _stt_item_to_dict,
+            _transcription_result_from_chunks,
+        )
+
+        chunks = [
+            json.dumps(_sanitize_for_json(_stt_item_to_dict(item))) + "\n"
+            for item in _iter_stt_items(_fake_parakeet_result())
+        ]
+        result = _transcription_result_from_chunks(chunks)
+
+        assert result["text"].startswith("Hello world.")
+        assert len(result.get("segments") or []) == 2
+
+    def test_whisper_segments_unchanged(self):
+        from mlx_vlm.server.audio import _stt_item_to_dict
+
+        whisper = _FakeSTTOutput(
+            "hi", segments=[{"start": 0.0, "end": 1.0, "text": "hi"}], language="en"
+        )
+        data = _stt_item_to_dict(whisper)
+
+        assert data["segments"] == [{"start": 0.0, "end": 1.0, "text": "hi"}]
+        assert data["language"] == "en"
+        assert "sentences" not in data
+
+    def test_plain_text_item_unchanged(self):
+        from mlx_vlm.server.audio import _stt_item_to_dict
+
+        assert _stt_item_to_dict("just text") == {"text": "just text"}
+
+    def test_streaming_result_gets_no_segments(self):
+        from mlx_vlm.server.audio import _stt_item_to_dict
+
+        data = _stt_item_to_dict(
+            _FakeStreamingResult("partial", [1, 2], False, 0.0, 0.5)
+        )
+
+        assert "segments" not in data
+        assert data["is_final"] is False
+
+    def test_real_aligned_result_if_available(self):
+        pytest.importorskip("mlx_audio.stt.models.nemo.alignment")
+        from mlx_audio.stt.models.nemo.alignment import (
+            AlignedSentence,
+            AlignedToken,
+            sentences_to_result,
+        )
+
+        from mlx_vlm.server.audio import _stt_item_to_dict
+
+        result = sentences_to_result(
+            [
+                AlignedSentence(
+                    "hello",
+                    [
+                        AlignedToken(id=1, text="hel", start=0.0, duration=0.2),
+                        AlignedToken(id=2, text="lo", start=0.2, duration=0.3),
+                    ],
+                )
+            ]
+        )
+        data = _stt_item_to_dict(result)
+
+        assert data["segments"] == [
+            {"id": 0, "start": 0.0, "end": 0.5, "text": "hello"}
+        ]

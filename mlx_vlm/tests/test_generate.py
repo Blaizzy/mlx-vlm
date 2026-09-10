@@ -210,49 +210,9 @@ class TestGenerationResult:
         assert result.generation_tps == 0.0
         assert result.peak_memory == 0.0
 
-    def test_with_values(self):
-        result = GenerationResult(
-            text="Hello world",
-            token=42,
-            logprobs=[0.1, 0.2, 0.3],
-            prompt_tokens=10,
-            generation_tokens=5,
-            total_tokens=15,
-            prompt_tps=100.0,
-            generation_tps=50.0,
-            peak_memory=2.5,
-        )
-        assert result.text == "Hello world"
-        assert result.token == 42
-        assert result.logprobs == [0.1, 0.2, 0.3]
-        assert result.prompt_tokens == 10
-        assert result.generation_tokens == 5
-        assert result.total_tokens == 15
-        assert result.prompt_tps == 100.0
-        assert result.generation_tps == 50.0
-        assert result.peak_memory == 2.5
-
 
 class TestBatchGenerationResult:
     """Tests for BatchGenerationResult dataclass."""
-
-    def test_creation(self):
-        result = BatchGenerationResult(
-            texts=["Hello", "World"],
-            tokens=[1, 2],
-            logprobs=[[0.1], [0.2]],
-            prompt_tokens=[10, 12],
-            generation_tokens=[5, 6],
-            total_tokens=[15, 18],
-            prompt_tps=[100.0, 110.0],
-            generation_tps=[50.0, 55.0],
-            peak_memory=3.0,
-            image_sizes=[(224, 224), (336, 336)],
-        )
-        assert result.texts == ["Hello", "World"]
-        assert result.tokens == [1, 2]
-        assert result.peak_memory == 3.0
-        assert result.image_sizes == [(224, 224), (336, 336)]
 
     def test_optional_image_sizes(self):
         result = BatchGenerationResult(
@@ -281,34 +241,9 @@ class TestBatchStats:
         assert stats.generation_time == 0
         assert stats.peak_memory == 0
 
-    def test_with_values(self):
-        stats = BatchStats(
-            prompt_tokens=100,
-            prompt_tps=500.0,
-            prompt_time=0.2,
-            generation_tokens=50,
-            generation_tps=250.0,
-            generation_time=0.2,
-            peak_memory=4.0,
-        )
-        assert stats.prompt_tokens == 100
-        assert stats.prompt_tps == 500.0
-        assert stats.generation_tokens == 50
-
 
 class TestBatchResponse:
     """Tests for BatchResponse dataclass."""
-
-    def test_creation(self):
-        stats = BatchStats(prompt_tokens=100)
-        response = BatchResponse(
-            texts=["Hello", "World"],
-            stats=stats,
-            image_sizes=[(224, 224), (336, 336)],
-        )
-        assert response.texts == ["Hello", "World"]
-        assert response.stats.prompt_tokens == 100
-        assert response.image_sizes == [(224, 224), (336, 336)]
 
     def test_optional_image_sizes(self):
         stats = BatchStats()
@@ -765,15 +700,6 @@ class TestBatchGenerator:
         eval_mock.assert_not_called()
         batch._store_apc_exact_checkpoints.assert_called_once_with()
 
-    def test_response_dataclass(self):
-        response = GenerationBatch.Response(
-            uid=0, token=42, token_logprob=-0.5, finish_reason="stop"
-        )
-
-        assert response.uid == 0
-        assert response.token == 42
-        assert response.finish_reason == "stop"
-
     def test_generation_batch_applies_per_sequence_logits_processors(self):
         class FixedLogitModel:
             def __call__(self, input_ids, cache=None, **kwargs):
@@ -1163,6 +1089,26 @@ class TestBatchGenerator:
         gen.insert([[1, 2, 3]])
         assert gen.remove(9999) is False
 
+    def test_remove_cancels_image_prefill_and_releases_cache(
+        self, mock_model, mock_processor
+    ):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+        )
+        prompt_batch = SimpleNamespace(
+            uids=[7],
+            prompt_cache=[MagicMock()],
+            input_ids=mx.array([[1, mock_model.config.image_token_index, 2]]),
+        )
+        gen._prompt_batch = prompt_batch
+
+        assert gen.remove(7) is True
+        assert prompt_batch.uids == []
+        assert prompt_batch.prompt_cache == []
+        assert gen._prompt_batch is None
+
 
 # ============================================================================
 # Tests for batch_generate function
@@ -1195,10 +1141,10 @@ class TestBatchGenerate:
         assert response.texts == ["Response 1", "Response 2"]
         mock_generate_batch.assert_called_once()
 
-    def test_generate_batch_splits_batched_prompt_kwargs_per_row(
+    def test_generate_batch_passes_mask_and_split_prompt_kwargs_to_generator(
         self, mock_model, mock_processor
     ):
-        """Regression test for Gemma 4-style batched ``inputs_embeds``."""
+        """BatchGenerator receives the dense rows and their padding metadata."""
 
         class _EmbeddingOutput:
             def __init__(self, inputs_embeds, position_ids):
@@ -1219,12 +1165,17 @@ class TestBatchGenerate:
         hidden_size = 7
         input_ids = mx.array(
             [
-                [11, 12, 13, 14, 15],
+                [0, 0, 11, 12, 13],
                 [21, 22, 23, 24, 25],
-                [31, 32, 33, 34, 35],
+                [0, 31, 32, 33, 34],
             ],
             dtype=mx.int32,
         )
+        attention_mask = mx.array(
+            [[0, 0, 1, 1, 1], [1, 1, 1, 1, 1], [0, 1, 1, 1, 1]],
+            dtype=mx.int32,
+        )
+        prepared_attention_mask = attention_mask
         inputs_embeds = mx.arange(
             batch_size * seq_len * hidden_size, dtype=mx.float32
         ).reshape(batch_size, seq_len, hidden_size)
@@ -1234,9 +1185,15 @@ class TestBatchGenerate:
         embedding_output = _EmbeddingOutput(inputs_embeds, position_ids)
 
         def fake_insert(
-            self, prompts, max_tokens, prompt_kwargs=None, logits_processors=None
+            self,
+            prompts,
+            max_tokens,
+            prompt_kwargs=None,
+            logits_processors=None,
+            attention_mask=None,
         ):
-            assert len(prompts) == batch_size
+            assert mx.array_equal(prompts, input_ids)
+            assert mx.array_equal(attention_mask, prepared_attention_mask)
             assert len(prompt_kwargs) == batch_size
             for i, kw in enumerate(prompt_kwargs):
                 assert kw["inputs_embeds"].shape == (1, seq_len, hidden_size)
@@ -1256,7 +1213,7 @@ class TestBatchGenerate:
                 "prepare_inputs",
                 return_value={
                     "input_ids": input_ids,
-                    "attention_mask": mx.ones((batch_size, seq_len), dtype=mx.int32),
+                    "attention_mask": attention_mask,
                 },
             ),
             patch.object(
@@ -1359,9 +1316,22 @@ class TestBatchGenerate:
         mock_generate_batch.side_effect = [
             (
                 ["Response 1", "Response 3"],
-                BatchStats(prompt_tokens=20, generation_tokens=10),
+                BatchStats(
+                    prompt_tokens=20,
+                    prompt_time=0.1,
+                    generation_tokens=10,
+                    generation_time=0.2,
+                ),
             ),
-            (["Response 2"], BatchStats(prompt_tokens=10, generation_tokens=5)),
+            (
+                ["Response 2"],
+                BatchStats(
+                    prompt_tokens=10,
+                    prompt_time=0.15,
+                    generation_tokens=5,
+                    generation_time=0.3,
+                ),
+            ),
         ]
 
         prompts = ["Prompt 1", "Prompt 2", "Prompt 3"]
@@ -1379,6 +1349,13 @@ class TestBatchGenerate:
         assert mock_generate_batch.call_count == 2
         # All 3 responses should be present
         assert len(response.texts) == 3
+        # Check aggregation through batch_generate itself, across both groups.
+        assert response.stats.prompt_tokens == 30
+        assert response.stats.prompt_time == pytest.approx(0.25)
+        assert response.stats.generation_tokens == 15
+        assert response.stats.generation_time == pytest.approx(0.5)
+        assert response.stats.prompt_tps == pytest.approx(120.0)
+        assert response.stats.generation_tps == pytest.approx(30.0)
 
     @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
@@ -1571,57 +1548,6 @@ class TestBatchGenerate:
 
 
 # ============================================================================
-# Tests for stats aggregation
-# ============================================================================
-
-
-class TestBatchStatsAggregation:
-    """Tests for stats aggregation in batch generation."""
-
-    def test_stats_accumulation(self):
-        """Test that stats are properly accumulated across batches."""
-        total_stats = BatchStats()
-
-        # Simulate processing multiple batches
-        batch_stats = [
-            BatchStats(
-                prompt_tokens=100,
-                prompt_time=0.1,
-                generation_tokens=50,
-                generation_time=0.2,
-            ),
-            BatchStats(
-                prompt_tokens=150,
-                prompt_time=0.15,
-                generation_tokens=75,
-                generation_time=0.3,
-            ),
-        ]
-
-        for stats in batch_stats:
-            total_stats.prompt_tokens += stats.prompt_tokens
-            total_stats.prompt_time += stats.prompt_time
-            total_stats.generation_tokens += stats.generation_tokens
-            total_stats.generation_time += stats.generation_time
-
-        assert total_stats.prompt_tokens == 250
-        assert total_stats.prompt_time == pytest.approx(0.25)
-        assert total_stats.generation_tokens == 125
-        assert total_stats.generation_time == pytest.approx(0.5)
-
-        # Calculate TPS
-        if total_stats.prompt_time > 0:
-            total_stats.prompt_tps = total_stats.prompt_tokens / total_stats.prompt_time
-        if total_stats.generation_time > 0:
-            total_stats.generation_tps = (
-                total_stats.generation_tokens / total_stats.generation_time
-            )
-
-        assert total_stats.prompt_tps == pytest.approx(1000.0)
-        assert total_stats.generation_tps == pytest.approx(250.0)
-
-
-# ============================================================================
 # Edge Cases
 # ============================================================================
 
@@ -1659,14 +1585,6 @@ class TestEdgeCases:
         # First prompt should have 998 padding tokens
         assert padded[0, 0].item() == 0
         assert padded[0, -1].item() == 2
-
-    def test_batch_response_with_empty_texts(self):
-        """Test BatchResponse with empty texts."""
-        stats = BatchStats()
-        response = BatchResponse(texts=[], stats=stats)
-
-        assert response.texts == []
-        assert response.image_sizes is None
 
 
 # ============================================================================
@@ -2201,7 +2119,8 @@ def test_stream_generate_forwards_verbose_to_generate_step():
     assert captured["verbose"] is True
 
 
-def test_stream_generate_stores_checkpoint_only_before_decode():
+@pytest.mark.parametrize("reused_prefix", [0, 1, 2])
+def test_stream_generate_stores_checkpoint_only_before_decode(reused_prefix):
     class FakeStoppingCriteria:
         def __call__(self, token):
             return False
@@ -2221,13 +2140,17 @@ def test_stream_generate_stores_checkpoint_only_before_decode():
     coordinator = MagicMock()
     coordinator.enabled = True
     coordinator.is_checkpoint = True
-    coordinator.lookup.return_value = None
-    coordinator.checkpoint_len.return_value = 3
+    coordinator.lookup.return_value = (
+        {"prefix_len": reused_prefix, "warm_cache": []} if reused_prefix else None
+    )
+    coordinator.materialize_single.return_value = []
+    coordinator.checkpoint_lengths.return_value = [2, 3]
 
     def fake_generate_step(*args, **kwargs):
-        kwargs["prompt_cache_checkpoint"](
-            kwargs["prompt_cache_checkpoint_len"], kwargs["prompt_cache"]
-        )
+        coordinator.prepare_prefill.assert_called_once_with(4)
+        assert args[0].shape[1] == 4 - reused_prefix
+        for n in kwargs["prompt_cache_checkpoint_lengths"]:
+            kwargs["prompt_cache_checkpoint"](n, kwargs["prompt_cache"])
         yield 7, mx.zeros((4,))
 
     processor = SimpleNamespace(
@@ -2262,9 +2185,12 @@ def test_stream_generate_stores_checkpoint_only_before_decode():
             )
         )
 
-    coordinator.store_checkpoint.assert_called_once_with(
-        [1, 2, 3], prompt_cache, extra_hash=0
-    )
+    calls = coordinator.store_checkpoint.call_args_list
+    assert [call.args[0] for call in calls] == [
+        [1, 2, 3, 4][:n] for n in [2, 3] if n > reused_prefix
+    ]
+    assert all(call.args[1] == prompt_cache for call in calls)
+    assert all(call.kwargs == {"extra_hash": 0} for call in calls)
 
 
 def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
@@ -3348,20 +3274,19 @@ class TestBatchTurboQuantizedKVStart:
         assert "BatchTurboQuantKVCache" in kinds
 
 
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+class TestTokenizerPaddedBatchRows:
+    """BatchGenerator canonicalizes masked dense rows before queueing them."""
 
+    def _generator(self):
+        gen = object.__new__(BatchGenerator)
+        gen.max_tokens = 4
+        gen.logits_processors = []
+        gen._unprocessed_sequences = []
+        gen.uid_count = 0
+        gen._wire_stack = None
+        return gen
 
-class TestPrePaddedBatchRows:
-    """Rows that arrive already padded must still declare that padding.
-
-    The tokenizer squares a batch off with left padding and reports it in the
-    attention mask. If that never reaches the caches, every row looks the same
-    length: a causal mask does not exclude padding that comes first, and a
-    recurrent layer walks it like any other column.
-    """
-
-    def _batch(self, rows, existing_left_padding):
+    def _batch(self, rows):
         import mlx.nn as nn
 
         from mlx_vlm.generate.ar import PromptProcessingBatch
@@ -3379,29 +3304,70 @@ class TestPrePaddedBatchRows:
             max_tokens=[4] * len(rows),
             inputs_embeds=None,
             prompt_kwargs={},
-            existing_left_padding=existing_left_padding,
         )
 
-    def test_declared_padding_reaches_the_caches(self):
-        rows = [list(range(8)), list(range(8))]
+    def test_unpads_tokens_and_sequence_aligned_prompt_tensors(self):
+        input_ids = mx.array([[0, 0, 4, 5], [6, 7, 8, 9], [10, 11, 0, 0]])
+        attention_mask = mx.array([[0, 0, 1, 1], [1, 1, 1, 1], [1, 1, 0, 0]])
+        inputs_embeds = mx.arange(3 * 4 * 3).reshape(3, 4, 3)
+        position_ids = mx.arange(3 * 3 * 4).reshape(3, 3, 4)
+        prompt_kwargs = ar_module._split_prompt_kwargs_per_row(
+            {
+                "inputs_embeds": inputs_embeds,
+                "position_ids": position_ids,
+                "rope_deltas": mx.array([[2], [3], [4]]),
+            },
+            batch_size=3,
+        )
 
-        batch = self._batch(rows, existing_left_padding=[5, 0])
+        gen = self._generator()
+        assert gen.insert(
+            input_ids,
+            prompt_kwargs=prompt_kwargs,
+            attention_mask=attention_mask,
+        ) == [0, 1, 2]
+        queued = {sequence[0]: sequence for sequence in gen._unprocessed_sequences}
 
-        assert batch._left_padding_per_row == [5, 0]
+        assert queued[0][1] == [4, 5]
+        assert queued[1][1] == [6, 7, 8, 9]
+        assert queued[2][1] == [10, 11]
+        assert queued[0][3]["inputs_embeds"].shape == (1, 2, 3)
+        assert queued[1][3]["inputs_embeds"].shape == (1, 4, 3)
+        assert queued[2][3]["inputs_embeds"].shape == (1, 2, 3)
+        assert queued[0][3]["position_ids"].shape == (3, 1, 2)
+        assert queued[1][3]["position_ids"].shape == (3, 1, 4)
+        assert queued[2][3]["position_ids"].shape == (3, 1, 2)
+        assert queued[0][3]["rope_deltas"].tolist() == [[2]]
+        assert queued[2][3]["rope_deltas"].tolist() == [[4]]
 
-    def test_uniform_rows_without_a_declaration_record_none(self):
-        rows = [list(range(8)), list(range(8))]
+    def test_rejects_noncontiguous_padding_mask(self):
+        gen = self._generator()
+        with pytest.raises(ValueError, match="one contiguous prompt span"):
+            gen.insert(
+                mx.array([[0, 4, 0, 5]]),
+                prompt_kwargs=[{"inputs_embeds": mx.ones((1, 4, 3))}],
+                attention_mask=mx.array([[0, 1, 0, 1]]),
+            )
+        assert gen._unprocessed_sequences == []
 
-        batch = self._batch(rows, existing_left_padding=None)
+    def test_accepts_mask_with_existing_python_prompt_rows(self):
+        gen = self._generator()
 
-        assert batch._left_padding_per_row == [0, 0]
+        gen.insert(
+            [[0, 4, 5], [6, 7, 8]],
+            attention_mask=mx.array([[0, 1, 1], [1, 1, 1]]),
+        )
 
-    def test_a_declaration_adds_to_the_generator_s_own_padding(self):
-        rows = [list(range(4)), list(range(8))]
+        queued = {sequence[0]: sequence[1] for sequence in gen._unprocessed_sequences}
+        assert queued == {0: [4, 5], 1: [6, 7, 8]}
 
-        batch = self._batch(rows, existing_left_padding=[2, 1])
+    def test_ragged_rows_initialize_both_cache_types(self):
+        batch = self._batch([[4, 5], [6, 7, 8, 9]])
 
-        assert batch._left_padding_per_row == [6, 1]
+        assert batch._left_padding_per_row == [2, 0]
+        assert batch.total_prompt_tokens == 6
+        assert batch.prompt_cache[0].offset.tolist() == [-2, 0]
+        assert batch.prompt_cache[1].left_padding.tolist() == [2, 0]
 
     def test_arrays_cache_masks_the_declared_padding(self):
         import mlx.core as mx
@@ -3409,10 +3375,78 @@ class TestPrePaddedBatchRows:
         from mlx_vlm.models.cache import ArraysCache
 
         entry = ArraysCache(1)
-        entry.left_padding = mx.array([5, 0])
+        entry.left_padding = mx.array([2, 0])
 
-        mask = entry.make_mask(8)
+        mask = entry.make_mask(4)
 
-        assert mask.shape == (2, 8)
-        assert mask[0].tolist() == [False] * 5 + [True] * 3
-        assert mask[1].tolist() == [True] * 8
+        assert mask.shape == (2, 4)
+        assert mask[0].tolist() == [False, False, True, True]
+        assert mask[1].tolist() == [True] * 4
+
+
+def test_prompt_shorter_than_prefill_step_size_is_still_chunked():
+    """Short prompts must not skip chunking: the unchunked path feeds the whole
+    prompt to _step, which reads logits[:, -1, :] and materializes [1, N, vocab]."""
+    model = MagicMock()
+    model.chunked_prefill_policy = MagicMock(return_value=True)
+    output = SimpleNamespace(
+        logits=mx.zeros((1, 1, 8)),
+        hidden_states=[mx.zeros((1, 1, 4))],
+        shared_kv_states={},
+        cross_attention_states=None,
+        encoder_outputs=None,
+    )
+    model.language_model.return_value = output
+
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 5, 4))
+    embedding_output.to_dict.return_value = {}
+    model.get_input_embeddings.return_value = embedding_output
+
+    with (
+        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+    ):
+        # 5 prompt tokens, prefill_step_size 2048: previously unchunked.
+        list(
+            generate_module.generate_step(
+                input_ids=mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
+                model=model,
+                pixel_values=None,
+                mask=None,
+                max_tokens=1,
+                prefill_step_size=2048,
+            )
+        )
+
+    n_processed = [
+        c.kwargs["n_to_process"]
+        for c in model.language_model.call_args_list
+        if "n_to_process" in c.kwargs
+    ]
+    assert n_processed == [4], f"expected one 4-token prefill chunk, got {n_processed}"
+
+
+def test_paligemma_opts_out_of_chunked_prefill_when_bidirectional():
+    from mlx_vlm.models.paligemma.paligemma import Model as PaliGemmaModel
+
+    bidirectional = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(use_bidirectional_attention=True)
+        )
+    )
+    causal = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(use_bidirectional_attention=False)
+        )
+    )
+    policy = PaliGemmaModel.chunked_prefill_policy
+    assert policy(bidirectional) is False
+    assert policy(causal) is True
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

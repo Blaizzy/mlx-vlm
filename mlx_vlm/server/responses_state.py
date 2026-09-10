@@ -374,8 +374,8 @@ def process_tool_calls(model_output: str, tool_module, tools):
                                 },
                             },
                         )
-                except Exception:
-                    logger.warning("Invalid tool call: %s", call)
+                except Exception as exc:
+                    logger.warning("Invalid tool call %r: %s", call, exc)
     return dict(calls=called_tools, remaining_text=remaining)
 
 
@@ -402,7 +402,7 @@ def _sse_event(event_type: str, payload: Dict[str, Any]) -> str:
 def _clean_reasoning(reasoning: str, start_marker: str) -> str:
     reasoning = reasoning.replace(start_marker, "")
     if start_marker == "<|channel>thought":
-        reasoning = reasoning.lstrip("thought")
+        reasoning = reasoning.removeprefix("thought")
     return reasoning.strip()
 
 

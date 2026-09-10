@@ -328,6 +328,76 @@ class QuantizedKVCache(_BaseCache):
             self.keys, self.values, self.offset, self.group_size, self.bits
         )
 
+    def prefix_cache_snapshot(self):
+        """Capture the packed cache state without a float round-trip."""
+        state = (None, None) if self.keys is None else self.state
+        return {"state": state, "meta_state": self.meta_state}
+
+    def prefix_cache_restore(self, snapshot):
+        """Restore a native packed snapshot into a fresh cache."""
+        self.__init__()
+        self.state = snapshot["state"]
+        self.meta_state = snapshot["meta_state"]
+
+    def prefix_cache_reserve(self, min_capacity_tokens):
+        """Reserve packed capacity for the first post-restore update."""
+        if self.keys is None or self.values is None:
+            return ()
+        needed = int(min_capacity_tokens)
+        capacity = int(self.keys[0].shape[2])
+        if needed <= capacity:
+            return self.keys, self.values
+        capacity = ((needed + self.step - 1) // self.step) * self.step
+        pad_tokens = capacity - int(self.keys[0].shape[2])
+        pad = [(0, 0), (0, 0), (0, pad_tokens), (0, 0)]
+        self.keys = tuple(mx.pad(part, pad) for part in self.keys)
+        self.values = tuple(mx.pad(part, pad) for part in self.values)
+        return self.keys, self.values
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        """Merge packed rows directly into ``BatchQuantizedKVCache``.
+
+        Empty float ``KVCache`` rows are accepted because continuous batching
+        represents cold rows with the model's fresh, unquantized cache layout.
+        """
+        if not rows or len(rows) != len(prefix_lens):
+            return None
+
+        def is_cold_empty(row):
+            return type(row) is KVCache and row.keys is None and row.values is None
+
+        for row in rows:
+            if isinstance(row, QuantizedKVCache):
+                if row.group_size != self.group_size or row.bits != self.bits:
+                    return None
+            elif not is_cold_empty(row):
+                return None
+
+        prefix_lens = [int(length) for length in prefix_lens]
+        if any(
+            int(row.offset) != length
+            for row, length in zip(rows, prefix_lens)
+            if isinstance(row, QuantizedKVCache)
+        ):
+            return None
+
+        batch_rows = []
+        for row in rows:
+            batch = BatchQuantizedKVCache(
+                [0], group_size=self.group_size, bits=self.bits
+            )
+            if isinstance(row, QuantizedKVCache) and row.keys is not None:
+                batch.keys = row.keys
+                batch.values = row.values
+                batch._idx = int(row.offset)
+                batch.offset = mx.array([row.offset])
+            batch_rows.append(batch)
+
+        out = batch_rows[0]
+        for batch in batch_rows[1:]:
+            out.extend(batch)
+        return out
+
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 
@@ -666,6 +736,9 @@ class ArraysCache(_BaseCache):
         instance._left_padding_advance = 0
         instance._lengths = None
         instance._lengths_advance = 0
+        instance._speculation = None
+        instance._speculation_generation = 0
+        instance.metadata_revision = 0
         return instance
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
@@ -718,6 +791,290 @@ class ArraysCache(_BaseCache):
         return self.cache[idx]
 
     @property
+    def is_speculating(self):
+        """Whether this cache is recording a bounded speculative timeline."""
+        return self._speculation is not None
+
+    @property
+    def history_capacity(self):
+        """Maximum post-token states retained per slot in the current window."""
+        return 0 if self._speculation is None else self._speculation["length"]
+
+    def _recorded_length(self, index):
+        record = self._speculation["records"].get(index)
+        if record is None:
+            return 0
+        if record[0] == "window":
+            return record[1].shape[1] - record[2]
+        return 1 if record[1] is None else record[1].shape[1] + 1
+
+    def update_recurrent(self, index, length, update):
+        """Run a state transition and retain only the requested temporal history.
+
+        ``update(state, state_steps)`` returns output, final state, and optional
+        intermediate states. The operator knows how to produce states; this
+        cache owns whether and how many to retain. Both one block update and
+        several smaller updates can fill the same bounded window.
+        """
+        if length < 1:
+            raise ValueError("Recurrent updates must contain at least one token.")
+        if self.history_capacity:
+            if self._recorded_length(index) + length > self.history_capacity:
+                raise ValueError("Recurrent update exceeds the cache history capacity.")
+            state_steps = length - 1 if length > 1 else None
+        else:
+            state_steps = None
+        result = update(self.cache[index], state_steps)
+        output, state = result[:2]
+        if self.history_capacity:
+            intermediate = result[2] if len(result) > 2 else None
+            if (0 if intermediate is None else intermediate.shape[1]) != length - 1:
+                raise ValueError(
+                    "Recurrent update did not return the requested history."
+                )
+            self.record_speculative_states(index, intermediate, state)
+        self.cache[index] = state
+        return output, state
+
+    def update_window(self, index, source, width, *, lengths=None):
+        """Store the trailing causal window and retain its temporal views."""
+        width = int(width)
+        length = source.shape[1] - width
+        if width < 0 or length < 0:
+            raise ValueError("Invalid causal cache window width.")
+        if self.history_capacity:
+            self.record_speculative_window(index, source, width)
+        if lengths is None:
+            state = mx.contiguous(source[:, length : length + width])
+        else:
+            positions = mx.clip(lengths, 0, length)[:, None] + mx.arange(width)
+            positions = positions.reshape(*positions.shape, *([1] * (source.ndim - 2)))
+            state = mx.take_along_axis(source, positions, axis=1)
+        self.cache[index] = state
+        return state
+
+    def start_speculation(self, length: int) -> int:
+        """Start recording state transitions for a speculative block.
+
+        Cache-aware operators use ``update_recurrent`` or ``update_window``;
+        the cache retains recurrent states or views into causal-window inputs.
+        The records exist only for the active block and are discarded when the
+        next block starts or the transaction is committed.
+        """
+        length = int(length)
+        if length < 1:
+            raise ValueError("Speculative cache length must be positive.")
+        self._speculation_generation += 1
+        self._speculation = {
+            "generation": self._speculation_generation,
+            "length": length,
+            "initial_state": list(self.cache),
+            "initial_metadata": (
+                self._left_padding,
+                self._left_padding_advance,
+                self._lengths,
+                self._lengths_advance,
+            ),
+            "records": {},
+        }
+        return self._speculation_generation
+
+    def record_speculative_states(
+        self,
+        index: int,
+        intermediate_states: Optional[mx.array],
+        final_state: mx.array,
+    ) -> None:
+        """Record post-token recurrent states for one cache slot.
+
+        ``intermediate_states[:, i]`` is the state after token ``i`` of this
+        update. Keeping ``final_state`` separately avoids a concatenation and
+        duplicate full-state allocation for a single block update.
+        """
+        transaction = self._speculation
+        if transaction is None:
+            return
+        index = int(index)
+        length = 1 if intermediate_states is None else intermediate_states.shape[1] + 1
+        previous = transaction["records"].get(index)
+        if self._recorded_length(index) + length > self.history_capacity:
+            raise ValueError("Recurrent update exceeds the cache history capacity.")
+        if previous is not None:
+            if previous[0] != "states":
+                raise ValueError("A cache slot cannot change its temporal state kind.")
+            parts = [previous[1], previous[2][:, None], intermediate_states]
+            intermediate_states = mx.concatenate(
+                [part for part in parts if part is not None], axis=1
+            )
+        transaction["records"][index] = (
+            "states",
+            intermediate_states,
+            final_state,
+        )
+
+    def record_speculative_window(
+        self,
+        index: int,
+        source: mx.array,
+        width: int,
+    ) -> None:
+        """Record fixed-width temporal states as views into ``source``.
+
+        ``source[:, t:t + width]`` is the cache state after retaining ``t``
+        tokens from the active block. This covers short convolutions, token
+        histories, and similar causal windows without materializing a stack.
+        """
+        transaction = self._speculation
+        if transaction is None:
+            return
+        width = int(width)
+        if width < 0:
+            raise ValueError("Speculative cache window width cannot be negative.")
+        index = int(index)
+        length = source.shape[1] - width
+        if length < 0 or self._recorded_length(index) + length > self.history_capacity:
+            raise ValueError("Window update exceeds the cache history capacity.")
+        previous = transaction["records"].get(index)
+        if previous is not None:
+            if previous[0] != "window" or previous[2] != width:
+                raise ValueError("A cache slot cannot change its temporal window.")
+            source = mx.concatenate([previous[1], source[:, width:]], axis=1)
+        transaction["records"][index] = ("window", source, width)
+
+    @staticmethod
+    def _select_speculative_states(record, initial, lengths, total):
+        _, intermediate, final = record
+        if len(set(lengths)) == 1:
+            keep = lengths[0]
+            if keep == 0:
+                return initial
+            if keep == total:
+                return final
+            return intermediate[:, keep - 1]
+
+        keep = mx.array(lengths, dtype=mx.int32)
+        batch = len(lengths)
+        if intermediate is None:
+            selected = final
+        else:
+            indices = mx.clip(keep - 1, 0, intermediate.shape[1] - 1)
+            indices = indices.reshape(batch, 1, *([1] * (intermediate.ndim - 2)))
+            selected = mx.take_along_axis(intermediate, indices, axis=1).squeeze(1)
+            final_rows = (keep == total).reshape(batch, *([1] * (final.ndim - 1)))
+            selected = mx.where(final_rows, final, selected)
+
+        if any(length == 0 for length in lengths):
+            if initial is None:
+                initial = mx.zeros_like(final)
+            initial_rows = (keep == 0).reshape(batch, *([1] * (final.ndim - 1)))
+            selected = mx.where(initial_rows, initial, selected)
+        return selected
+
+    @staticmethod
+    def _select_speculative_window(record, lengths):
+        _, source, width = record
+        if len(set(lengths)) == 1:
+            keep = lengths[0]
+            return mx.contiguous(source[:, keep : keep + width])
+        positions = mx.array(lengths, dtype=mx.int32)[:, None] + mx.arange(width)
+        positions = positions.reshape(*positions.shape, *([1] * (source.ndim - 2)))
+        return mx.take_along_axis(source, positions, axis=1)
+
+    def _invalidate_derived_metadata(self):
+        self.metadata_revision += 1
+
+    def _restore_speculative_metadata(self, lengths, initial_metadata):
+        left_padding, left_advance, valid_lengths, lengths_advance = initial_metadata
+        if len(set(lengths)) == 1:
+            keep = lengths[0]
+            self._left_padding = left_padding
+            self._left_padding_advance = left_advance + (
+                keep if left_padding is not None else 0
+            )
+            self._lengths = valid_lengths
+            self._lengths_advance = lengths_advance + (
+                keep if valid_lengths is not None else 0
+            )
+        else:
+            keep = mx.array(lengths, dtype=mx.int32)
+            self._left_padding = (
+                None if left_padding is None else left_padding - left_advance - keep
+            )
+            self._left_padding_advance = 0
+            self._lengths = (
+                None
+                if valid_lengths is None
+                else valid_lengths - lengths_advance - keep
+            )
+            self._lengths_advance = 0
+
+        self._invalidate_derived_metadata()
+
+    def validate_speculation(self, lengths, generation: Optional[int] = None):
+        transaction = self._speculation
+        if transaction is None:
+            raise RuntimeError("No speculative cache transaction is active.")
+        if generation is not None and generation != transaction["generation"]:
+            raise RuntimeError("Attempted to commit a stale cache transaction.")
+
+        total = transaction["length"]
+        lengths = _speculative_lengths(lengths, self.batch_size, total)
+        records = transaction["records"]
+        initial_state = transaction["initial_state"]
+        missing = [
+            index
+            for index, (initial, current) in enumerate(zip(initial_state, self.cache))
+            if initial is not current and index not in records
+        ]
+        if missing:
+            raise RuntimeError(
+                "Speculative cache state changed without temporal records for "
+                f"slots {missing}."
+            )
+        if any(self._recorded_length(index) != total for index in records):
+            raise RuntimeError("Temporal cache history does not cover the full window.")
+        return transaction, lengths
+
+    def commit_speculation(self, lengths, generation: Optional[int] = None) -> None:
+        """Keep a per-row prefix of the active speculative block."""
+        transaction, lengths = self.validate_speculation(lengths, generation)
+        total = transaction["length"]
+
+        initial_state = transaction["initial_state"]
+        for index, record in transaction["records"].items():
+            if record[0] == "states":
+                self.cache[index] = self._select_speculative_states(
+                    record,
+                    initial_state[index],
+                    lengths,
+                    total,
+                )
+            else:
+                self.cache[index] = self._select_speculative_window(record, lengths)
+        self._restore_speculative_metadata(
+            lengths,
+            transaction["initial_metadata"],
+        )
+        self._speculation = None
+
+    def abort_speculation(self, generation: Optional[int] = None) -> None:
+        """Restore the state that preceded the active speculative block."""
+        transaction = self._speculation
+        if transaction is None:
+            return
+        if generation is not None and generation != transaction["generation"]:
+            raise RuntimeError("Attempted to abort a stale cache transaction.")
+        self.cache = transaction["initial_state"]
+        (
+            self._left_padding,
+            self._left_padding_advance,
+            self._lengths,
+            self._lengths_advance,
+        ) = transaction["initial_metadata"]
+        self._invalidate_derived_metadata()
+        self._speculation = None
+
+    @property
     def state(self):
         return self.cache
 
@@ -767,7 +1124,7 @@ class ArraysCache(_BaseCache):
         self.lengths = cat(self.lengths, other.lengths)
 
     def extract(self, idx):
-        cache = ArraysCache(len(self.cache))
+        cache = type(self)(len(self.cache))
         cache.cache = [c[idx : idx + 1] for c in self.cache]
         return cache
 
@@ -821,7 +1178,16 @@ class ArraysCache(_BaseCache):
 
     @property
     def nbytes(self):
-        return sum(c.nbytes for c in self.cache if c is not None)
+        arrays = {id(c): c for c in self.cache if isinstance(c, mx.array)}
+        if self._speculation is not None:
+            for value in self._speculation["initial_state"]:
+                if isinstance(value, mx.array):
+                    arrays[id(value)] = value
+            for record in self._speculation["records"].values():
+                for value in record[1:]:
+                    if isinstance(value, mx.array):
+                        arrays[id(value)] = value
+        return sum(array.nbytes for array in arrays.values())
 
 
 class ChunkedKVCache(_BaseCache):
@@ -1085,6 +1451,12 @@ class BatchKVCache(_BaseCache):
 
     def finalize(self):
         if self._right_padding is not None:
+            if self.keys is None:
+                # Some sparse-attention side caches are prepared with the
+                # layer cache list but are not updated on single-token decode.
+                # There is no appended padding to roll back in that case.
+                self._right_padding = None
+                return
             padding = self._right_padding
             self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
             self.values = dynamic_roll(self.values, padding[:, None], axis=2)
@@ -2061,6 +2433,83 @@ class BatchQuantizedKVCache(_BaseCache):
         )
 
 
+def _select_pooling_remainder(
+    initial: Optional[mx.array],
+    values: mx.array,
+    remainders: List[int],
+    starts: List[int],
+    valid_lengths: List[int],
+    ratio: int,
+) -> mx.array:
+    """Select per-row remainder windows without replaying the compressor."""
+    batch = values.shape[0]
+    if initial is None:
+        initial = mx.zeros((batch, ratio, values.shape[-1]), dtype=values.dtype)
+
+    slots = mx.arange(ratio, dtype=mx.int32)[None]
+    remainder = mx.array(remainders, dtype=mx.int32)[:, None]
+    start = mx.array(starts, dtype=mx.int32)[:, None]
+    valid = mx.array(valid_lengths, dtype=mx.int32)[:, None]
+    total = remainder + valid
+    new_remainder = total % ratio
+    logical = total - new_remainder + slots
+
+    initial_index = mx.clip(logical, 0, ratio - 1)[..., None]
+    value_index = mx.clip(start + logical - remainder, 0, values.shape[1] - 1)[
+        ..., None
+    ]
+    from_initial = mx.take_along_axis(initial, initial_index, axis=1)
+    from_values = mx.take_along_axis(values, value_index, axis=1)
+    selected = mx.where((logical < remainder)[..., None], from_initial, from_values)
+    return mx.where((slots < new_remainder)[..., None], selected, 0)
+
+
+def _speculative_lengths(lengths, batch_size: int, total: int) -> List[int]:
+    if isinstance(lengths, int):
+        values = [int(lengths)] * batch_size
+    elif isinstance(lengths, mx.array):
+        values = [int(value) for value in lengths.reshape(-1).tolist()]
+    else:
+        values = [int(value) for value in lengths]
+    if len(values) != batch_size:
+        raise ValueError(
+            f"Speculative cache has batch {batch_size}, got "
+            f"{len(values)} commit lengths."
+        )
+    if any(value < 0 or value > total for value in values):
+        raise ValueError(f"Speculative commit lengths must be between 0 and {total}.")
+    return values
+
+
+def _record_pooling_speculative_inputs(transaction, kv, gate) -> None:
+    """Retain verifier inputs without joining tokenwise updates eagerly."""
+    if transaction is None or not transaction["needs_history"]:
+        return
+    next_length = transaction["input_length"] + kv.shape[1]
+    if next_length > transaction["length"]:
+        raise ValueError(
+            f"Speculative pooling inputs exceed length {transaction['length']}."
+        )
+    transaction["inputs"].append((kv, gate))
+    transaction["input_length"] = next_length
+
+
+def _pooling_speculative_inputs(transaction):
+    inputs = transaction["inputs"]
+    if len(inputs) == 1:
+        return inputs[0]
+    return tuple(
+        mx.concatenate([segment[index] for segment in inputs], axis=1)
+        for index in range(2)
+    )
+
+
+def _pooling_speculative_nbytes(transaction, arrays) -> None:
+    for kv, gate in transaction["inputs"]:
+        arrays[id(kv)] = kv
+        arrays[id(gate)] = gate
+
+
 class PoolingCache(_BaseCache):
     """Cache for pooled (compressed) KV tokens with a remainder buffer.
 
@@ -2077,6 +2526,118 @@ class PoolingCache(_BaseCache):
         self.remainder = 0
 
         self.pooled = None
+        self._speculation = None
+        self._speculation_generation = 0
+
+    @property
+    def batch_size(self):
+        for value in (self.buf_kv, self.pooled):
+            if value is not None:
+                return value.shape[0]
+        return 1
+
+    @property
+    def is_speculating(self):
+        return self._speculation is not None
+
+    def start_speculation(self, length: int) -> int:
+        length = int(length)
+        if length < 1:
+            raise ValueError("Speculative cache length must be positive.")
+        needs_history = self.remainder + length >= self.ratio
+        self._speculation_generation += 1
+        self._speculation = {
+            "generation": self._speculation_generation,
+            "length": length,
+            "remainder": int(self.remainder),
+            "buf_kv": (
+                mx.array(self.buf_kv)
+                if needs_history and self.buf_kv is not None
+                else None
+            ),
+            "buf_gate": (
+                mx.array(self.buf_gate)
+                if needs_history and self.buf_gate is not None
+                else None
+            ),
+            "pooled": self.pooled,
+            "pooled_length": self.offset,
+            "needs_history": needs_history,
+            "inputs": [],
+            "input_length": 0,
+        }
+        return self._speculation_generation
+
+    def _record_speculative_inputs(self, kv, gate):
+        _record_pooling_speculative_inputs(self._speculation, kv, gate)
+
+    def validate_speculation(self, lengths, generation: Optional[int] = None):
+        transaction = self._speculation
+        if transaction is None:
+            raise RuntimeError("No speculative cache transaction is active.")
+        if generation is not None and generation != transaction["generation"]:
+            raise RuntimeError("Attempted to commit a stale cache transaction.")
+        lengths = _speculative_lengths(lengths, self.batch_size, transaction["length"])
+        if len(set(lengths)) != 1:
+            raise ValueError("PoolingCache requires uniform batch commit lengths.")
+        if (
+            transaction["needs_history"]
+            and transaction["input_length"] != transaction["length"]
+        ):
+            raise RuntimeError(
+                "Speculative pooling inputs cover "
+                f"{transaction['input_length']} of {transaction['length']} tokens."
+            )
+        return transaction, lengths
+
+    def commit_speculation(self, lengths, generation: Optional[int] = None) -> None:
+        transaction, lengths = self.validate_speculation(lengths, generation)
+        keep = lengths[0]
+        initial_remainder = transaction["remainder"]
+        if transaction["needs_history"]:
+            kv, gate = _pooling_speculative_inputs(transaction)
+            remainders = [initial_remainder] * self.batch_size
+            starts = [0] * self.batch_size
+            valid_lengths = [keep] * self.batch_size
+            self.buf_kv = _select_pooling_remainder(
+                transaction["buf_kv"],
+                kv,
+                remainders,
+                starts,
+                valid_lengths,
+                self.ratio,
+            )
+            self.buf_gate = _select_pooling_remainder(
+                transaction["buf_gate"],
+                gate,
+                remainders,
+                starts,
+                valid_lengths,
+                self.ratio,
+            )
+
+        self.remainder = (initial_remainder + keep) % self.ratio
+        pooled_length = transaction["pooled_length"] + (
+            (initial_remainder + keep) // self.ratio
+        )
+        if pooled_length == 0:
+            self.pooled = None
+        elif self.pooled is not None:
+            self.pooled = mx.contiguous(self.pooled[:, :pooled_length])
+        self._speculation = None
+
+    def abort_speculation(self, generation: Optional[int] = None) -> None:
+        transaction = self._speculation
+        if transaction is None:
+            return
+        if generation is not None and generation != transaction["generation"]:
+            raise RuntimeError("Attempted to abort a stale cache transaction.")
+        self.remainder = transaction["remainder"]
+        if transaction["needs_history"]:
+            self.buf_kv = transaction["buf_kv"]
+            self.buf_gate = transaction["buf_gate"]
+        self.pooled = transaction["pooled"]
+        self._speculation = None
 
     @property
     def offset(self):
@@ -2085,6 +2646,7 @@ class PoolingCache(_BaseCache):
     def accumulate_windows(self, kv: mx.array, gate: mx.array, offset):
         B, L, D1 = kv.shape
         _, _, D2 = gate.shape
+        self._record_speculative_inputs(kv, gate)
 
         if self.buf_kv is None:
             self.buf_kv = mx.zeros((B, self.ratio, D1), dtype=kv.dtype)
@@ -2219,12 +2781,18 @@ class PoolingCache(_BaseCache):
 
     @property
     def nbytes(self):
-        total = 0
-        if self.buf_kv is not None:
-            total += self.buf_kv.nbytes + self.buf_gate.nbytes
-        if self.pooled is not None:
-            total += self.pooled.nbytes
-        return total
+        arrays = {
+            id(value): value
+            for value in (self.buf_kv, self.buf_gate, self.pooled)
+            if isinstance(value, mx.array)
+        }
+        if self._speculation is not None:
+            for key in ("buf_kv", "buf_gate", "pooled"):
+                value = self._speculation[key]
+                if isinstance(value, mx.array):
+                    arrays[id(value)] = value
+            _pooling_speculative_nbytes(self._speculation, arrays)
+        return sum(value.nbytes for value in arrays.values())
 
     @classmethod
     def merge(cls, caches, prefix_lens=None):
@@ -2233,6 +2801,12 @@ class PoolingCache(_BaseCache):
 
 class BatchPoolingCache(_BaseCache):
     """Batched pooling cache with per-element variable-length tracking."""
+
+    def __new__(cls, *args, **kwargs):
+        instance = super().__new__(cls)
+        instance._speculation = None
+        instance._speculation_generation = 0
+        return instance
 
     def __init__(self, ratio: int, left_padding: List[int]):
         self.ratio = ratio
@@ -2252,6 +2826,157 @@ class BatchPoolingCache(_BaseCache):
 
         self._lengths = [2**31] * batch_size
         self._processed = [0] * batch_size
+        self._speculation = None
+        self._speculation_generation = 0
+
+    @property
+    def batch_size(self):
+        return len(self.remainder)
+
+    @property
+    def is_speculating(self):
+        return self._speculation is not None
+
+    def _speculative_valid_lengths(self, physical_lengths):
+        starts = [
+            min(padding, physical)
+            for padding, physical in zip(self.left_padding, physical_lengths)
+        ]
+        valid = [
+            max(0, min(limit - processed, physical - start))
+            for limit, processed, physical, start in zip(
+                self._lengths,
+                self._processed,
+                physical_lengths,
+                starts,
+            )
+        ]
+        return starts, valid
+
+    def start_speculation(self, length: int) -> int:
+        length = int(length)
+        if length < 1:
+            raise ValueError("Speculative cache length must be positive.")
+        _, valid = self._speculative_valid_lengths([length] * self.batch_size)
+        needs_history = any(
+            remainder + count >= self.ratio
+            for remainder, count in zip(self.remainder, valid)
+        )
+        self._speculation_generation += 1
+        self._speculation = {
+            "generation": self._speculation_generation,
+            "length": length,
+            "remainder": list(self.remainder),
+            "pool_lengths": list(self._pool_lengths),
+            "lengths": list(self._lengths),
+            "processed": list(self._processed),
+            "left_padding": list(self.left_padding),
+            "buf_kv": (
+                mx.array(self.buf_kv)
+                if needs_history and self.buf_kv is not None
+                else None
+            ),
+            "buf_gate": (
+                mx.array(self.buf_gate)
+                if needs_history and self.buf_gate is not None
+                else None
+            ),
+            "pooled": self.pooled,
+            "needs_history": needs_history,
+            "inputs": [],
+            "input_length": 0,
+        }
+        return self._speculation_generation
+
+    def _record_speculative_inputs(self, kv, gate):
+        _record_pooling_speculative_inputs(self._speculation, kv, gate)
+
+    def validate_speculation(self, lengths, generation: Optional[int] = None):
+        transaction = self._speculation
+        if transaction is None:
+            raise RuntimeError("No speculative cache transaction is active.")
+        if generation is not None and generation != transaction["generation"]:
+            raise RuntimeError("Attempted to commit a stale cache transaction.")
+        lengths = _speculative_lengths(lengths, self.batch_size, transaction["length"])
+        if (
+            transaction["needs_history"]
+            and transaction["input_length"] != transaction["length"]
+        ):
+            raise RuntimeError(
+                "Speculative pooling inputs cover "
+                f"{transaction['input_length']} of {transaction['length']} tokens."
+            )
+        return transaction, lengths
+
+    def commit_speculation(self, lengths, generation: Optional[int] = None) -> None:
+        transaction, lengths = self.validate_speculation(lengths, generation)
+        self.remainder = list(transaction["remainder"])
+        self._pool_lengths = list(transaction["pool_lengths"])
+        self._lengths = list(transaction["lengths"])
+        self._processed = list(transaction["processed"])
+        self.left_padding = list(transaction["left_padding"])
+        starts, valid = self._speculative_valid_lengths(lengths)
+
+        if transaction["needs_history"]:
+            kv, gate = _pooling_speculative_inputs(transaction)
+            self.buf_kv = _select_pooling_remainder(
+                transaction["buf_kv"],
+                kv,
+                self.remainder,
+                starts,
+                valid,
+                self.ratio,
+            )
+            self.buf_gate = _select_pooling_remainder(
+                transaction["buf_gate"],
+                gate,
+                self.remainder,
+                starts,
+                valid,
+                self.ratio,
+            )
+
+        new_counts = [
+            (remainder + count) // self.ratio
+            for remainder, count in zip(self.remainder, valid)
+        ]
+        self.remainder = [
+            (remainder + count) % self.ratio
+            for remainder, count in zip(self.remainder, valid)
+        ]
+        self._pool_lengths = [
+            pooled + count for pooled, count in zip(self._pool_lengths, new_counts)
+        ]
+        self._processed = [
+            processed + count for processed, count in zip(self._processed, valid)
+        ]
+        self.left_padding = [
+            padding - start for padding, start in zip(self.left_padding, starts)
+        ]
+
+        pooled_length = max(self._pool_lengths, default=0)
+        if pooled_length == 0:
+            self.pooled = None
+        elif self.pooled is not None:
+            self.pooled = mx.contiguous(self.pooled[:, :pooled_length])
+        self._speculation = None
+
+    def abort_speculation(self, generation: Optional[int] = None) -> None:
+        transaction = self._speculation
+        if transaction is None:
+            return
+        if generation is not None and generation != transaction["generation"]:
+            raise RuntimeError("Attempted to abort a stale cache transaction.")
+        self.remainder = transaction["remainder"]
+        self._pool_lengths = transaction["pool_lengths"]
+        self._lengths = transaction["lengths"]
+        self._processed = transaction["processed"]
+        self.left_padding = transaction["left_padding"]
+        if transaction["needs_history"]:
+            self.buf_kv = transaction["buf_kv"]
+            self.buf_gate = transaction["buf_gate"]
+        self.pooled = transaction["pooled"]
+        self._speculation = None
 
     @property
     def offset(self):
@@ -2288,6 +3013,7 @@ class BatchPoolingCache(_BaseCache):
         B, L, D1 = kv.shape
         _, _, D2 = gate.shape
         ratio = self.ratio
+        self._record_speculative_inputs(kv, gate)
 
         if not (
             len(self.left_padding) == len(self._lengths) == len(self._processed) == B
@@ -2502,12 +3228,18 @@ class BatchPoolingCache(_BaseCache):
 
     @property
     def nbytes(self):
-        total = 0
-        if self.buf_kv is not None:
-            total += self.buf_kv.nbytes + self.buf_gate.nbytes
-        if self.pooled is not None:
-            total += self.pooled.nbytes
-        return total
+        arrays = {
+            id(value): value
+            for value in (self.buf_kv, self.buf_gate, self.pooled)
+            if isinstance(value, mx.array)
+        }
+        if self._speculation is not None:
+            for key in ("buf_kv", "buf_gate", "pooled"):
+                value = self._speculation[key]
+                if isinstance(value, mx.array):
+                    arrays[id(value)] = value
+            _pooling_speculative_nbytes(self._speculation, arrays)
+        return sum(value.nbytes for value in arrays.values())
 
     def filter(self, batch_indices):
         if isinstance(batch_indices, mx.array):
