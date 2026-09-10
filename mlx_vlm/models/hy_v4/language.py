@@ -2,25 +2,24 @@ from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn.layers.distributed import sum_gradients
 
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import CacheList, KVCache
+from ..cache import CacheList
 from ..deepseek_v32.language import (
     DeepseekV32Attention,
     DeepseekV32DecoderLayer,
     DeepseekV32Model,
-    DeepseekV32MoE,
 )
+from .cache import HyV4KVCache
 from .config import ModelConfig
 from .fused_switch_glu import FusedSwitchGLU
 from .hyper_connection import IdentityHyperConnection, IdentityHyperHead, hc_expand
 from .indexer import HyV4Indexer
-from .moe import weighted_expert_sum
+from .moe import HyV4MoE
 
 
 def make_quantization_config(model):
@@ -146,21 +145,6 @@ class HyV4Attention(DeepseekV32Attention):
         return self.o_proj(output), topk_indices
 
 
-class HyV4MoE(DeepseekV32MoE):
-    def __call__(self, x):
-        if self.sharding_group is not None:
-            x = sum_gradients(self.sharding_group)(x)
-
-        indices, scores = self.gate(x)
-        y = weighted_expert_sum(self.switch_mlp(x, indices), scores)
-        if self.config.n_shared_experts is not None:
-            y = y + self.shared_experts(x)
-
-        if self.sharding_group is not None:
-            y = mx.distributed.all_sum(y, group=self.sharding_group)
-        return y
-
-
 class HyV4DecoderLayer(DeepseekV32DecoderLayer):
     def __init__(self, config: ModelConfig, layer_idx: int):
         super().__init__(config, layer_idx)
@@ -256,10 +240,79 @@ class LanguageModel(nn.Module):
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
-        logits = self.lm_head(
-            self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+        return_hidden = kwargs.pop("return_hidden", False)
+        return_shared_kv = kwargs.pop("return_shared_kv", False)
+        skip_logits = kwargs.pop("skip_logits", False)
+        hidden = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+        logits = None if skip_logits else self.lm_head(hidden)
+        return LanguageModelOutput(
+            logits=logits,
+            hidden_states=[hidden] if return_hidden else None,
+            shared_kv_states={} if return_shared_kv else None,
         )
-        return LanguageModelOutput(logits=logits)
+
+    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        return self.lm_head(hidden)
+
+    def _speculative_verify_hidden(self, inputs: mx.array, cache) -> mx.array:
+        # Quantized Hy4 does not preserve greedy-token equivalence between a
+        # multi-token prefill and ordinary one-token decode. Verify each draft
+        # position through the target's decode path so speculative generation
+        # cannot alter the target sequence.
+        return mx.concatenate(
+            [
+                self.model(inputs[:, index : index + 1], cache=cache)
+                for index in range(inputs.shape[1])
+            ],
+            axis=1,
+        )
+
+    def speculative_verify_hidden(self, inputs: mx.array, cache):
+        hidden = self._speculative_verify_hidden(inputs, cache)
+        return hidden, {}
+
+    def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
+        hidden = self._speculative_verify_hidden(inputs, cache)
+        logits = self.lm_head(hidden)
+        return hidden, {}, None, sampler(logits)
+
+    def rollback_speculative_cache(
+        self, caches, gdn_states, accepted, block_size: int
+    ) -> int:
+        del gdn_states
+        if isinstance(accepted, int):
+            accepted = [accepted]
+        elif isinstance(accepted, mx.array):
+            accepted = [int(value) for value in accepted.reshape(-1).tolist()]
+        else:
+            accepted = [int(value) for value in accepted]
+        max_accepted = max(accepted)
+        trim = block_size - (max_accepted + 1)
+        if trim > 0:
+            for cache in caches:
+                if cache is not None and cache.is_trimmable():
+                    cache.trim(trim)
+        return max_accepted
+
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del input_ids, inputs_embeds, prompt_cache
+        prefill_kwargs = prefill_kwargs or {}
+        if draft_model is None:
+            return True
+        if draft_kind == "mtp":
+            return bool(prefill_kwargs.get("return_hidden", False)) and bool(
+                prefill_kwargs.get("return_shared_kv", False)
+            )
+        return draft_kind is None
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         return Model.sanitize(self, weights)
@@ -276,9 +329,9 @@ class LanguageModel(nn.Module):
         caches = []
         for layer in self.layers:
             if layer.self_attn.skip_topk:
-                caches.append(CacheList(KVCache()))
+                caches.append(CacheList(HyV4KVCache()))
             else:
-                caches.append(CacheList(KVCache(), KVCache()))
+                caches.append(CacheList(HyV4KVCache(), HyV4KVCache()))
         return caches
 
 
