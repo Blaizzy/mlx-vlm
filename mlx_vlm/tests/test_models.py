@@ -19825,3 +19825,34 @@ class TestDeepseekV41Basics(unittest.TestCase):
         y = eng(x, hash_ids)
         mx.eval(y)
         self.assertEqual(y.shape, x.shape)
+
+    def test_deepseek_v41_dspark_heads(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = deepseek_v41.ModelConfig(
+            hidden_size=32, vocab_size=64, dspark_markov_rank=8
+        )
+        markov = deepseek_v41.DSparkMarkovHead(config)
+        mx.eval(markov.parameters())
+        token_ids = mx.array([[1, 2, 3]])
+        logits, embed = markov(token_ids)
+        mx.eval(logits, embed)
+        self.assertEqual(logits.shape, (1, 3, 64))
+        self.assertEqual(embed.shape, (1, 3, 8))
+
+        confidence = deepseek_v41.DSparkConfidenceHead(config)
+        mx.eval(confidence.parameters())
+        scores = confidence(mx.random.normal((1, 3, 32)), mx.random.normal((1, 3, 8)))
+        mx.eval(scores)
+        self.assertEqual(scores.shape, (1, 3))
+        self.assertEqual(scores.dtype, mx.float32)
+
+    def test_deepseek_v41_dspark_topk_idxs(self):
+        from mlx_vlm.models import deepseek_v41
+
+        idxs = deepseek_v41.get_dspark_topk_idxs(128, 2, 5, 10)
+        mx.eval(idxs)
+        self.assertEqual(idxs.shape, (2, 5, 11 + 5))
+        self.assertTrue(bool(mx.all(idxs[0, 0, :11] == mx.arange(11))))
+        with self.assertRaises(AssertionError):
+            deepseek_v41.get_dspark_topk_idxs(128, 2, 5, 0)
