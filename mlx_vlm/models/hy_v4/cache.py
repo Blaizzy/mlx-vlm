@@ -28,6 +28,17 @@ class HyV4KVCache(KVCache):
         self.values[..., previous : self.offset, :] = values
         return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
 
+    @property
+    def state(self):
+        if self.keys is None:
+            return None, None
+        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+
+    @state.setter
+    def state(self, value):
+        self.keys, self.values = value
+        self.offset = 0 if self.keys is None else self.keys.shape[2]
+
     def extract(self, idx):
         cache = HyV4KVCache()
         if self.keys is None:
