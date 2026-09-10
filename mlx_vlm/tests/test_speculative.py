@@ -5372,6 +5372,82 @@ def test_split_glm4_moe_lite_mtp_flattens_nextn_layer(tmp_path):
     assert not any(k.endswith("rotary_emb.inv_freq") for k in out)
 
 
+class TestDeepseekV41DsparkSplit:
+    def test_deepseek_v41_dspark_rename(self):
+        from mlx_vlm.speculative.drafters.deepseek_v41_dspark.split import (
+            sanitize_dspark_weights,
+        )
+
+        weights = {
+            "mtp.0.attn.wq_a.weight": mx.zeros((4, 4)),
+            "mtp.2.markov_head.embed.weight": mx.zeros((8, 2)),
+            "model.embed_tokens.weight": mx.zeros((4, 4)),
+        }
+        out = sanitize_dspark_weights(weights)
+        assert "stages.0.attn.wq_a.weight" in out
+        assert "stages.2.markov_head.embed.weight" in out
+        assert "model.embed_tokens.weight" not in out
+        assert "mtp.0.attn.wq_a.weight" not in out
+
+    def test_deepseek_v41_dspark_config(self):
+        from mlx_vlm.speculative.drafters.deepseek_v41_dspark.config import (
+            DeepseekV41DsparkConfig,
+        )
+
+        config = DeepseekV41DsparkConfig.from_dict(
+            {
+                "model_type": "deepseek_v41_dspark",
+                "text_config": {
+                    "model_type": "deepseek_v41",
+                    "dspark_block_size": 5,
+                    "dspark_noise_token_id": 7,
+                    "dspark_target_layer_ids": [37, 38, 39],
+                    "dspark_markov_rank": 256,
+                },
+            }
+        )
+        assert config.n_mtp_layers == 3
+        assert config.block_size == 6
+        assert config.dspark_target_layer_ids == [37, 38, 39]
+        assert config.dspark_noise_token_id == 7
+
+    def test_deepseek_v41_dspark_quantization(self):
+        from mlx_vlm.speculative.drafters.deepseek_v41_dspark.split import (
+            DeepseekV41DsparkSplitter,
+        )
+
+        splitter = DeepseekV41DsparkSplitter()
+        weights = {
+            "stages.0.ffn.experts.0.w1.weight": mx.zeros((4, 4)),
+            "stages.0.ffn.experts.0.w1.scales": mx.zeros((4, 1)),
+            "stages.0.attn_norm.weight": mx.zeros((4,)),
+        }
+        quantization = splitter.quantization_from_source(
+            weights,
+            {"quantization_config": {"group_size": 64, "bits": 2, "mode": "affine"}},
+        )
+        assert quantization["stages.0.ffn.experts.0.w1"] == {
+            "group_size": 64,
+            "bits": 2,
+            "mode": "affine",
+        }
+        assert "stages.0.attn_norm" not in quantization
+
+    def test_deepseek_v41_dspark_registered(self):
+        from mlx_vlm.speculative.drafters import DRAFTER_KIND_BY_MODEL_TYPE
+        from mlx_vlm.speculative.drafters.mtp_split import (
+            MTP_SPLITTERS,
+            get_mtp_splitter,
+        )
+
+        assert DRAFTER_KIND_BY_MODEL_TYPE["deepseek_v41_dspark"] == "dflash"
+        assert "deepseek_v41" in MTP_SPLITTERS
+        splitter = get_mtp_splitter("deepseek_v41")
+        assert splitter.output_model_type == "deepseek_v41_dspark"
+        assert splitter.select_keys("mtp.0.attn.wq_a.weight", {})
+        assert not splitter.select_keys("model.embed_tokens.weight", {})
+
+
 def _laguna_language_model(num_hidden_layers=4):
     from mlx_vlm.models.laguna.config import ModelConfig
 
