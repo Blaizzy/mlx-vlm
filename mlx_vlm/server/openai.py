@@ -180,10 +180,20 @@ def _with_tool_choice_instruction(messages, instruction: str):
         messages[0]["content"] = f"{content}\n\n{instruction}".strip()
     user_instruction_added = False
     for message in reversed(messages):
-        if message.get("role") == "user" and isinstance(message.get("content"), str):
-            message["content"] = f"{message['content']}\n\n{instruction}".strip()
-            user_instruction_added = True
-            break
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = f"{content}\n\n{instruction}".strip()
+        elif isinstance(content, list):
+            message["content"] = [
+                *content,
+                {"type": "text", "text": f"\n\n{instruction}"},
+            ]
+        else:
+            continue
+        user_instruction_added = True
+        break
     if not user_instruction_added and not (
         messages and messages[0].get("role") == "system"
     ):
@@ -1642,22 +1652,39 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             if isinstance(message.content, str):
                 msg["content"] = message.content
             elif isinstance(message.content, list):
+                content_parts = []
+                has_images = False
                 if message.role == "user":
                     for item in message.content:
                         if not isinstance(item, dict):
                             continue
                         item_type = item.get("type")
-                        if item_type == "input_image":
+                        if item_type in ("text", "input_text"):
+                            text = item.get("text", "") or item.get("content", "")
+                            if text:
+                                content_parts.append({"type": "text", "text": text})
+                        elif item_type == "input_image":
                             images.append(item["image_url"])
+                            content_parts.append({"type": "image"})
+                            has_images = True
                         elif item_type == "image_url":
                             images.append(item["image_url"]["url"])
+                            content_parts.append({"type": "image"})
+                            has_images = True
                         elif item_type == "input_audio":
                             audio.append(_decode_input_audio_data(item["input_audio"]))
                         elif item_type in ("input_video", "video_url", "video"):
                             video = _extract_video_reference(item)
                             if video:
                                 videos.append(video)
-                msg["content"] = extract_text_from_content(message.content)
+                # Keep payload-free markers with the text that supplied them,
+                # as in Responses normalization. The shared prompt formatter
+                # assigns them to turns; image payloads stay in processor order.
+                msg["content"] = (
+                    content_parts
+                    if has_images
+                    else extract_text_from_content(message.content)
+                )
             else:
                 msg["content"] = message.content
 

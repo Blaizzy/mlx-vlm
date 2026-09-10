@@ -130,6 +130,8 @@ SINGLE_IMAGE_ONLY_MODELS = {
     "falcon_ocr",
 }
 
+LAST_MESSAGE_ONLY_MODELS = {"paligemma", "florence2", "falcon_ocr"}
+
 
 def extract_text_from_content(content: Any) -> str:
     """
@@ -509,7 +511,10 @@ class MessageFormatter:
             prefix_parts = []
             if not skip_image_token and num_images > 0:
                 prefix_parts.append(
-                    "".join([f"<|image_{i+1}|>" for i in range(num_images)])
+                    "".join(
+                        f"<|image_{kwargs.get('image_offset', 0) + i + 1}|>"
+                        for i in range(num_images)
+                    )
                 )
             if not skip_audio_token and num_audios > 0:
                 prefix_parts.append(
@@ -864,6 +869,13 @@ def apply_chat_template(
     config = config if isinstance(config, dict) else config.__dict__
     model_type = config["model_type"]
 
+    # Per-turn allocation must not bypass a model's request-wide image limit.
+    if num_images > 1 and model_type.lower() in SINGLE_IMAGE_ONLY_MODELS:
+        raise ValueError(
+            f"Model {model_type} does not support multi-image chat. "
+            f"Please only use 1 image."
+        )
+
     # Use standard formatting for text-only models.
     if model_type.lower() not in MODEL_CONFIG:
         if isinstance(prompt, str):
@@ -965,11 +977,15 @@ def apply_chat_template(
                 allocated[last_user_idx] += remaining
             return allocated
 
+        # Models that discard history still need the image on the retained turn.
+        if model_type in LAST_MESSAGE_ONLY_MODELS:
+            explicit_image_counts = [0] * len(prompt)
         image_counts = _allocate_media_counts(explicit_image_counts, num_images)
         audio_counts = [0] * len(prompt)
         if last_user_idx >= 0:
             audio_counts[last_user_idx] = num_audios
 
+        image_offset = 0
         for i, p in enumerate(prompt):
             if isinstance(p, str):
                 messages.append(
@@ -979,6 +995,7 @@ def apply_chat_template(
                         skip_image_token=image_counts[i] == 0,
                         skip_audio_token=audio_counts[i] == 0,
                         num_images=image_counts[i],
+                        image_offset=image_offset,
                         num_audios=audio_counts[i],
                         **kwargs,
                     )
@@ -1011,16 +1028,18 @@ def apply_chat_template(
                             skip_audio_token=audio_counts[i] == 0
                             or role in ["system", "assistant"],
                             num_images=image_counts[i],
+                            image_offset=image_offset,
                             num_audios=audio_counts[i],
                             **kwargs,
                         )
                     )
+            image_offset += image_counts[i]
 
     if return_messages:
         return messages
 
     # Some models only need the last message
-    if model_type in ["paligemma", "florence2", "falcon_ocr"]:
+    if model_type in LAST_MESSAGE_ONLY_MODELS:
         return messages[-1]
 
     return get_chat_template(processor, messages, add_generation_prompt, **kwargs)
