@@ -877,6 +877,85 @@ def test_apply_chat_template_keeps_enable_thinking_only_for_other_templates():
 class TestModelSpecificPromptContracts:
     """Guard model-specific multimodal message formats from regressions."""
 
+    @pytest.mark.parametrize("model_type", ["phi3_v", "phi4mm"])
+    @pytest.mark.parametrize(
+        ("first_count", "first_markers", "second_marker"),
+        [
+            (1, "<|image_1|>", "<|image_2|>"),
+            (2, "<|image_1|><|image_2|>", "<|image_3|>"),
+        ],
+    )
+    def test_numbered_images_keep_conversation_wide_indices(
+        self, model_type, first_count, first_markers, second_marker
+    ):
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "image"} for _ in range(first_count)]
+                + [{"type": "text", "text": "First."}],
+            },
+            {"role": "assistant", "content": "Ready."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "Second."},
+                ],
+            },
+            "Compare.",
+        ]
+
+        result = apply_chat_template(
+            None,
+            {"model_type": model_type},
+            messages,
+            return_messages=True,
+            num_images=first_count + 1,
+        )
+
+        assert result == [
+            {"role": "user", "content": first_markers + "First."},
+            {"role": "assistant", "content": "Ready."},
+            {"role": "user", "content": second_marker + "Second."},
+            {"role": "user", "content": "Compare."},
+        ]
+
+    @pytest.mark.parametrize("model_type", ["llava_next", "paligemma"])
+    def test_single_image_models_reject_images_across_separate_turns(self, model_type):
+        messages = [
+            {"role": "user", "content": [{"type": "image"}]},
+            {"role": "assistant", "content": "Ready."},
+            {"role": "user", "content": [{"type": "image"}]},
+        ]
+
+        with pytest.raises(ValueError, match="does not support multi-image chat"):
+            apply_chat_template(
+                None,
+                {"model_type": model_type},
+                messages,
+                return_messages=True,
+                num_images=2,
+            )
+
+    def test_unmarked_images_still_belong_to_last_user_turn(self):
+        result = apply_chat_template(
+            None,
+            {"model_type": "phi3_v"},
+            [
+                {"role": "user", "content": "First."},
+                {"role": "assistant", "content": "Ready."},
+                "Compare.",
+            ],
+            return_messages=True,
+            num_images=2,
+        )
+
+        assert result == [
+            {"role": "user", "content": "First."},
+            {"role": "assistant", "content": "Ready."},
+            {"role": "user", "content": "<|image_1|><|image_2|>Compare."},
+        ]
+
     def test_ernie4_5_vl_uses_image_url_before_text(self):
         from mlx_vlm.prompt_utils import apply_chat_template
 

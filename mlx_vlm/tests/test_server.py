@@ -7,7 +7,9 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from queue import Queue
 from threading import Event, Lock, Thread
@@ -20,6 +22,7 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 from transformers.utils.chat_parsing import ResponseParser, parse_response
+from transformers.utils.chat_template_utils import render_jinja_template
 
 import mlx_vlm.reranker_loader as reranker_loader
 import mlx_vlm.server as server
@@ -37,6 +40,373 @@ from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 from mlx_vlm.tool_parsers import _infer_tool_parser, minicpm5
+from mlx_vlm.utils import prepare_inputs
+
+
+class _ImageAssociationProcessor:
+    # Synthetic template: observe the real request/normalizer output without
+    # downloading a tokenizer or a model. Text and media remain distinguishable.
+    chat_template = """{%- for message in messages -%}
+{{ '<' + message.role + '>' }}
+{%- if message.content is string -%}{{ message.content }}
+{%- else -%}{%- for part in message.content -%}
+{%- if part.type == 'text' -%}{{ part.text }}
+{%- else -%}{{ '<' + part.type + '>' }}{%- endif -%}
+{%- endfor -%}{%- endif -%}
+{{ '</' + message.role + '>' }}
+{%- endfor -%}"""
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.messages = deepcopy(messages)
+        self.template_kwargs = kwargs
+        rendered, _ = render_jinja_template(
+            [messages], chat_template=self.chat_template, **kwargs
+        )
+        return rendered[0]
+
+    def __call__(self, text, images, **kwargs):
+        self.image_colors = [image.getpixel((0, 0)) for image in images]
+        return {"input_ids": [[1]], "attention_mask": [[1]]}
+
+
+def _association_image(color, kind="image_url"):
+    buffer = BytesIO()
+    Image.new("RGB", (2, 2), color).save(buffer, format="PNG")
+    url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    return {"type": kind, "image_url": {"url": url} if kind == "image_url" else url}
+
+
+@pytest.fixture
+def image_chat(monkeypatch):
+    processor = _ImageAssociationProcessor()
+    config = {"model_type": "qwen3_5"}
+    calls = []
+
+    def generate(**kwargs):
+        calls.append(kwargs)
+        # Exercise real image decoding and processor input ordering, stopping
+        # before any model computation. Mixed-media tests inspect side channels.
+        if kwargs["image"] and not kwargs["audio"] and not kwargs["video"]:
+            prepare_inputs(processor, images=kwargs["image"], prompts=kwargs["prompt"])
+        return GenerationResult(text="ACK", prompt_tokens=1, generation_tokens=1)
+
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    monkeypatch.setattr(
+        server, "get_cached_model", lambda *args: (object(), processor, config)
+    )
+    monkeypatch.setattr(server, "generate", generate)
+    # No lifespan/model preload and no listening socket.
+    client = TestClient(server.app)
+    return SimpleNamespace(
+        client=client, processor=processor, config=config, calls=calls
+    )
+
+
+@pytest.mark.parametrize(
+    "model_type", ["qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_5", "qwen3_5_moe"]
+)
+@pytest.mark.parametrize("kind", ["image_url", "input_image"])
+def test_chat_image_association_resubmitted_history(image_chat, model_type, kind):
+    image_chat.config["model_type"] = model_type
+    a, b = _association_image("red", kind), _association_image("blue", kind)
+    messages = [{"role": "user", "content": [{"type": "text", "text": "FIRST"}, a]}]
+    # A client resubmits the entire history on each follow-up, then adds B.
+    for followup, expected_turns, colors, images in [
+        (None, [1], [(255, 0, 0)], [a]),
+        ("FOLLOWUP", [1, 0], [(255, 0, 0)], [a]),
+        (
+            [{"type": "input_text", "text": "SECOND"}, b],
+            [1, 0, 1],
+            [(255, 0, 0), (0, 0, 255)],
+            [a, b],
+        ),
+    ]:
+        if followup is not None:
+            messages.extend(
+                [
+                    {"role": "assistant", "content": "ACK"},
+                    {"role": "user", "content": followup},
+                ]
+            )
+        payload = {"model": "synthetic", "messages": messages}
+        original = deepcopy(payload)
+        response = image_chat.client.post("/v1/chat/completions", json=payload)
+        assert response.status_code == 200, response.text
+        prompt = image_chat.calls[-1]["prompt"]
+        turns = [part.split("</user>")[0] for part in prompt.split("<user>")[1:]]
+        assert [turn.count("<image>") for turn in turns] == expected_turns
+        assert "FIRST" in turns[0]
+        if followup is not None:
+            assert "FOLLOWUP" in turns[1]
+        if len(turns) == 3:
+            assert "SECOND" in turns[2]
+        assert prompt.count("<image>") == len(images)
+        assert image_chat.calls[-1]["image"] == [
+            part["image_url"]["url"] if kind == "image_url" else part["image_url"]
+            for part in images
+        ]
+        assert image_chat.processor.image_colors == colors
+        assert "data:image" not in prompt
+        assert payload == original
+
+
+def test_chat_image_association_multiple_images_and_caller_unchanged(image_chat):
+    a, b = _association_image("red"), _association_image("blue", "input_image")
+    request = server.ChatRequest(
+        model="synthetic",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "BEFORE"},
+                    a,
+                    {"type": "input_text", "text": "BETWEEN"},
+                    b,
+                    {"type": "text", "text": "AFTER"},
+                ],
+            },
+            {"role": "assistant", "content": "ACK"},
+            {"role": "user", "content": "FOLLOWUP"},
+        ],
+    )
+    original = request.model_dump()
+    asyncio.run(server.chat_completions_endpoint(request, SimpleNamespace(headers={})))
+    assert image_chat.calls[-1]["prompt"] == (
+        "<user><image><image>BEFORE BETWEEN AFTER</user>"
+        "<assistant>ACK</assistant><user>FOLLOWUP</user>"
+    )
+    assert image_chat.calls[-1]["image"] == [a["image_url"]["url"], b["image_url"]]
+    assert image_chat.processor.image_colors == [(255, 0, 0), (0, 0, 255)]
+    assert request.model_dump() == original
+
+
+@pytest.mark.parametrize(
+    "choice", ["required", {"type": "function", "function": {"name": "inspect"}}]
+)
+@pytest.mark.parametrize("system", [False, True])
+def test_chat_image_association_tool_choice_and_reasoning(image_chat, choice, system):
+    messages = [{"role": "system", "content": "SYSTEM"}] if system else []
+    messages += [
+        {"role": "user", "content": "FIRST"},
+        {
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": "NOTE",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "inspect", "arguments": '{"value": 1}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "RESULT"},
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "SECOND"}, _association_image("red")],
+        },
+    ]
+    request = server.ChatRequest(
+        model="synthetic",
+        messages=messages,
+        tools=[
+            {
+                "type": "function",
+                "function": {"name": "inspect", "parameters": {"type": "object"}},
+            }
+        ],
+        tool_choice=choice,
+    )
+    original = request.model_dump()
+    asyncio.run(server.chat_completions_endpoint(request, SimpleNamespace(headers={})))
+    prompt = image_chat.calls[-1]["prompt"]
+    assert "<user>FIRST</user>" in prompt
+    assert "<user><image>SECOND" in prompt
+    assert "You must call" in prompt.split("<user>")[-1]
+    formatted = image_chat.processor.messages
+    assistant = formatted[2 if system else 1]
+    assert assistant["reasoning_content"] == "NOTE"
+    assert assistant["tool_calls"][0]["function"]["arguments"] == {"value": 1}
+    assert formatted[3 if system else 2]["tool_call_id"] == "call_1"
+    assert image_chat.processor.template_kwargs["tool_choice"] == choice
+    assert prompt.count("<image>") == 1
+    assert request.model_dump() == original
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "TEXT",
+        [{"type": "text", "text": "TEXT"}],
+        [{"type": "input_text", "text": "TEXT"}],
+    ],
+)
+@pytest.mark.parametrize("model_type", ["qwen3_5", "laguna", "unknown_text_model"])
+def test_chat_image_association_text_controls(image_chat, content, model_type):
+    image_chat.config["model_type"] = model_type
+    response = image_chat.client.post(
+        "/v1/chat/completions",
+        json={"model": "synthetic", "messages": [{"role": "user", "content": content}]},
+    )
+    assert response.status_code == 200
+    assert image_chat.calls[-1]["prompt"] == "<user>TEXT</user>"
+    assert image_chat.calls[-1]["image"] == []
+
+
+@pytest.mark.parametrize(
+    "part", [{"type": "image", "image": "x"}, {"type": "image_url", "image_url": "x"}]
+)
+def test_chat_image_association_rejects_unsupported_schema_forms(image_chat, part):
+    response = image_chat.client.post(
+        "/v1/chat/completions",
+        json={"model": "synthetic", "messages": [{"role": "user", "content": [part]}]},
+    )
+    assert response.status_code == 422
+    assert image_chat.calls == []
+
+
+@pytest.mark.parametrize(
+    "model_type, expected",
+    [
+        ("deepseek_v4", "BEFORE<image>AFTER"),
+        ("gemma3", "BEFORE AFTER<start_of_image>"),
+        ("laguna", "BEFORE AFTER"),
+    ],
+)
+def test_chat_image_association_other_formats(image_chat, model_type, expected):
+    image_chat.config["model_type"] = model_type
+    response = image_chat.client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "synthetic",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "BEFORE"},
+                        _association_image("red"),
+                        {"type": "text", "text": "AFTER"},
+                    ],
+                },
+                {"role": "user", "content": "FOLLOWUP"},
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert (
+        image_chat.calls[-1]["prompt"]
+        == f"<user>{expected}</user><user>FOLLOWUP</user>"
+    )
+    assert image_chat.processor.image_colors == [(255, 0, 0)]
+
+
+@pytest.mark.parametrize(
+    "model_type, expected",
+    [
+        ("paligemma", "<image>FOLLOWUP"),
+        ("florence2", "FOLLOWUP"),
+        ("falcon_ocr", "FOLLOWUP"),
+    ],
+)
+def test_chat_image_association_last_message_controls(image_chat, model_type, expected):
+    image_chat.config["model_type"] = model_type
+    response = image_chat.client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "synthetic",
+            "messages": [
+                {"role": "user", "content": [_association_image("red")]},
+                {"role": "user", "content": "FOLLOWUP"},
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert image_chat.calls[-1]["prompt"] == expected
+    assert image_chat.processor.image_colors == [(255, 0, 0)]
+
+
+@pytest.mark.parametrize("with_image", [False, True])
+def test_chat_image_association_audio_side_channel(image_chat, with_image):
+    content = [
+        {"type": "text", "text": "FIRST"},
+        {
+            "type": "input_audio",
+            "input_audio": {
+                "data": base64.b64encode(b"synthetic-audio").decode(),
+                "format": "wav",
+            },
+        },
+    ]
+    if with_image:
+        content.append(_association_image("red"))
+    response = image_chat.client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "synthetic",
+            "messages": [
+                {"role": "user", "content": content},
+                {"role": "user", "content": "FOLLOWUP"},
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+    call = image_chat.calls[-1]
+    assert call["prompt"] == (
+        f"<user>{'<image>' if with_image else ''}FIRST</user>"
+        "<user>FOLLOWUP<audio></user>"
+    )
+    assert len(call["image"]) == int(with_image)
+    assert len(call["audio"]) == 1
+    assert call["audio"][0].getvalue() == b"synthetic-audio"
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_chat_image_association_video_side_channel(image_chat, monkeypatch, native):
+    from mlx_vlm.generate import video as video_utils
+
+    frame = Image.new("RGB", (2, 2), "blue")
+    if native:
+        image_chat.processor.video_processor = object()
+        image_chat.processor.process = lambda text, images, videos: None
+    else:
+        monkeypatch.setattr(
+            video_utils, "sample_video_frames", lambda *a, **k: ([frame], 2.0)
+        )
+    a = _association_image("red")
+    response = image_chat.client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "synthetic",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "FIRST"},
+                        a,
+                        {"type": "video", "video": "synthetic.mp4"},
+                    ],
+                },
+                {"role": "user", "content": "FOLLOWUP"},
+            ],
+        },
+    )
+    assert response.status_code == 200, response.text
+    call = image_chat.calls[-1]
+    assert call["image"][0] == a["image_url"]["url"]
+    if native:
+        # Existing native video formatting repeats videos on each message.
+        # This image fix does not establish video turn association.
+        assert (
+            call["prompt"]
+            == "<user><image><video>FIRST</user><user><video>FOLLOWUP</user>"
+        )
+        assert call["video"] == ["synthetic.mp4"]
+        assert len(call["image"]) == 1
+    else:
+        assert call["prompt"] == "<user><image>FIRST</user><user><image>FOLLOWUP</user>"
+        assert call["image"][1] is frame
+        assert call["video"] == []
+        assert image_chat.processor.image_colors == [(255, 0, 0), (0, 0, 255)]
 
 
 def test_response_generator_prefill_step_override_wins_over_environment(monkeypatch):
