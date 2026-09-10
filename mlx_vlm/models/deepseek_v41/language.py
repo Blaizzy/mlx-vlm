@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..deepseek_v4.hyper_connection import _hc_split_sinkhorn_ops, hc_expand
 from ..deepseek_v4.language import (
     DeepseekV4RoPE,
     LimitedSwiGLU,
@@ -13,6 +14,7 @@ from ..deepseek_v4.language import (
 from ..mla import MultiLinear
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
+from .engram import Engram
 
 
 class SharedIndexState:
@@ -718,3 +720,94 @@ class Compressor(nn.Module):
         if not should_compress:
             return None
         return self.norm(kv.astype(dtype))
+
+
+def make_identity_pre_mix(batch: int, seqlen: int, hc_mult: int) -> mx.array:
+    """Initial one-hot mix: the first copy passes through untouched."""
+    pre_mix = mx.zeros((batch, seqlen, hc_mult), dtype=mx.float32)
+    return mx.concatenate(
+        [mx.ones((batch, seqlen, 1), dtype=mx.float32), pre_mix[:, :, 1:]], axis=-1
+    )
+
+
+class DeepseekV41Block(nn.Module):
+    """A block whose residual stream is `hc_mult` parallel copies (Hyper-Connections).
+
+    Attention and FFN each sit between `hc_pre` (collapse the copies into one sublayer
+    input) and `hc_post` (expand back out, mixing the residual in through `comb`).
+    The coefficients a sublayer computes are used by the *next* one (single-pass mHC):
+    attention consumes the incoming mix and produces `attn_pre` for the FFN, which
+    produces `ffn_pre` for the next block. Coefficient math reuses the proven
+    sinkhorn path; only the flat V4.1 key layout and the shifted consumption are new.
+    """
+
+    def __init__(self, config: ModelConfig, layer_idx: int, engram_layout=None):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.hc_mult = config.hc_mult
+        self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
+        self.hc_eps = config.hc_eps
+        self.norm_eps = config.rms_norm_eps
+        self.attn = DeepseekV41Attention(config, layer_idx)
+        self.ffn = DeepseekV41MoE(config)
+        self.engram = None
+        if engram_layout is not None and layer_idx in engram_layout.layer_ids:
+            self.engram = Engram(config, layer_idx, engram_layout)
+        self.attn_norm = nn.RMSNorm(config.hidden_size, eps=self.norm_eps)
+        self.ffn_norm = nn.RMSNorm(config.hidden_size, eps=self.norm_eps)
+        mix_hc = (2 + self.hc_mult) * self.hc_mult
+        hc_dim = self.hc_mult * config.hidden_size
+        self.hc_attn_fn = mx.zeros((mix_hc, hc_dim), dtype=mx.float32)
+        self.hc_ffn_fn = mx.zeros((mix_hc, hc_dim), dtype=mx.float32)
+        self.hc_attn_base = mx.zeros((mix_hc,), dtype=mx.float32)
+        self.hc_ffn_base = mx.zeros((mix_hc,), dtype=mx.float32)
+        self.hc_attn_scale = mx.ones((3,), dtype=mx.float32)
+        self.hc_ffn_scale = mx.ones((3,), dtype=mx.float32)
+
+    def hc_mixes(
+        self, x: mx.array, hc_fn: mx.array, hc_scale: mx.array, hc_base: mx.array
+    ):
+        """Collapse coefficients for the next sublayer: pre / post / comb."""
+        mixes = (
+            mx.fast.rms_norm(x.flatten(-2).astype(mx.float32), None, self.norm_eps)
+            @ hc_fn.T
+        )
+        return _hc_split_sinkhorn_ops(
+            mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps
+        )
+
+    @staticmethod
+    def hc_pre(x: mx.array, pre_mix: mx.array) -> mx.array:
+        """Collapse the hc copies into one, weighted by pre_mix."""
+        return (
+            (pre_mix[..., None].astype(mx.float32) * x.astype(mx.float32))
+            .sum(axis=2)
+            .astype(x.dtype)
+        )
+
+    def __call__(
+        self,
+        h: mx.array,
+        start_pos: int,
+        pre_mix: mx.array,
+        image_mask: Optional[mx.array],
+        shared: SharedIndexState,
+    ):
+        residual = h
+        attn_pre, attn_post, attn_comb = self.hc_mixes(
+            h, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        )
+        x = self.hc_pre(h, pre_mix)
+        x = self.attn_norm(x)
+        x = self.attn(x, start_pos, shared)
+        x = hc_expand(x, residual, attn_post, attn_comb)
+
+        residual = x
+        ffn_pre, ffn_post, ffn_comb = self.hc_mixes(
+            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        )
+        x = self.hc_pre(x, attn_pre)
+        x = self.ffn_norm(x)
+        x = self.ffn(x, image_mask)
+        x = hc_expand(x, residual, ffn_post, ffn_comb)
+        return x, ffn_pre

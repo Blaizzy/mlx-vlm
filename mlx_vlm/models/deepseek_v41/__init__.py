@@ -4,10 +4,12 @@ from .engram import Engram, EngramEmbedding, EngramLayout, NgramHashState
 from .language import (
     Compressor,
     DeepseekV41Attention,
+    DeepseekV41Block,
     DeepseekV41MoE,
     DeepseekV41MoEGate,
     Indexer,
     SharedIndexState,
+    make_identity_pre_mix,
     select_candidate_blocks,
 )
 from .vision import Aligner, ViT
@@ -19,6 +21,7 @@ __all__ = [
     "get_dspark_topk_idxs",
     "Compressor",
     "DeepseekV41Attention",
+    "DeepseekV41Block",
     "DeepseekV41MoE",
     "DeepseekV41MoEGate",
     "Engram",
@@ -27,6 +30,7 @@ __all__ = [
     "NgramHashState",
     "Indexer",
     "SharedIndexState",
+    "make_identity_pre_mix",
     "select_candidate_blocks",
     "Aligner",
     "ViT",

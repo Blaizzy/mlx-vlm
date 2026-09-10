@@ -20119,3 +20119,83 @@ class TestDeepseekV41Attention(unittest.TestCase):
             mx.eval(x1)
             self.assertEqual(x1.shape, (1, 1, 16))
         self.assertTrue(bool(mx.all(mx.isfinite(x1))))
+
+
+class TestDeepseekV41Block(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            num_hidden_layers=4,
+            compress_ratios=[2, 2, 1, 0],
+            hidden_size=16,
+            num_attention_heads=2,
+            head_dim=8,
+            qk_rope_head_dim=4,
+            q_lora_rank=8,
+            o_lora_rank=4,
+            o_groups=1,
+            sliding_window=4,
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=4,
+            kv_source_layer_ids=[0],
+            index_source_layer_ids=[0, 1],
+            candidate_source_layer_id=1,
+            candidate_topk_blocks=2,
+            candidate_block_size=2,
+            moe_intermediate_size=8,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            engram_layer_ids=[1],
+            engram_num_embeddings=[256],
+            engram_max_ngram_size=3,
+            engram_vocab_size=512,
+            engram_n_heads=2,
+            engram_head_dim=8,
+        )
+
+    def test_deepseek_v41_block_prefill_decode(self):
+        from mlx_vlm.models import deepseek_v41
+
+        config = self._tiny_config()
+        layout = deepseek_v41.EngramLayout.from_config(config)
+        block0 = deepseek_v41.DeepseekV41Block(config, 0, layout)
+        block1 = deepseek_v41.DeepseekV41Block(config, 1, layout)
+        self.assertIsNone(block0.engram)
+        self.assertIsNotNone(block1.engram)
+        for block in (block0, block1):
+            mx.eval(block.parameters())
+        shared = deepseek_v41.SharedIndexState()
+
+        pre_mix = deepseek_v41.make_identity_pre_mix(1, 3, 2)
+        self.assertEqual(pre_mix.shape, (1, 3, 2))
+        self.assertTrue(bool(mx.all(pre_mix[..., 0] == 1)))
+
+        h = mx.random.normal((1, 3, 2, 16))
+        h, pre_mix = block0(h, 0, pre_mix, None, shared)
+        mx.eval(h, pre_mix)
+        self.assertEqual(h.shape, (1, 3, 2, 16))
+        self.assertEqual(pre_mix.shape, (1, 3, 2))
+
+        hashes = mx.zeros((1, 3, 4), dtype=mx.int32)
+        h = block1.engram(h, hashes, None)
+        mx.eval(h)
+        h, pre_mix = block1(h, 0, pre_mix, None, shared)
+        mx.eval(h, pre_mix)
+        self.assertEqual(h.shape, (1, 3, 2, 16))
+        self.assertTrue(bool(mx.all(mx.isfinite(h))))
+
+        hd = mx.random.normal((1, 1, 2, 16))
+        pre_d = deepseek_v41.make_identity_pre_mix(1, 1, 2)
+        hd, pre_d = block0(hd, 3, pre_d, None, shared)
+        mx.eval(hd, pre_d)
+        hashes_d = mx.zeros((1, 1, 4), dtype=mx.int32)
+        hd = block1.engram(hd, hashes_d, None)
+        hd, _ = block1(hd, 3, pre_d, None, shared)
+        mx.eval(hd)
+        self.assertEqual(hd.shape, (1, 1, 2, 16))
+        self.assertTrue(bool(mx.all(mx.isfinite(hd))))
