@@ -11,12 +11,15 @@ import logging
 import re
 import uuid
 
+from .base import ToolParser
 from .types import ParseResult
 
 logger = logging.getLogger("mlx_vlm.server")
 
 
-def process_tool_calls(model_output: str, tool_module, tools) -> ParseResult:
+def process_tool_calls(
+    model_output: str, tool_module: ToolParser, tools
+) -> ParseResult:
     """Parse tool calls from model output using the given tool parser module."""
     called_tools = []
     remaining = model_output
