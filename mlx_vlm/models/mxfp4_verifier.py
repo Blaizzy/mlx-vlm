@@ -347,7 +347,7 @@ def optimized_mxfp4_linear(linear, x: mx.array) -> Optional[mx.array]:
 def optimized_mxfp4_argmax(
     linear, x: mx.array, token_mask: Optional[mx.array] = None
 ) -> Optional[mx.array]:
-    if not _can_optimized_mxfp4(linear, x):
+    if not _can_optimized_mxfp4(linear, x) or "bias" in linear:
         return None
 
     B, T, K = x.shape

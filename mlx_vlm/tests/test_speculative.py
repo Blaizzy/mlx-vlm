@@ -4430,6 +4430,25 @@ def test_optimized_mxfp4_verifier_matches_singleton_decode(dtype, verify_length)
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal kernels")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("masked", [False, True])
+def test_mxfp4_argmax_preserves_linear_bias(dtype, masked):
+    linear = nn.QuantizedLinear.from_linear(
+        nn.Linear(512, 16, bias=False), group_size=32, bits=4, mode="mxfp4"
+    )
+    linear.bias = mx.array([0.0] * 14 + [5.0, 10.0], dtype=dtype)
+    inputs = mx.zeros((2, 3, 512), dtype=dtype)
+    token_mask = mx.full((6, 1), 0x7FFF, dtype=mx.int32) if masked else None
+    expected = mx.full((2, 3), 14 if masked else 15, dtype=mx.int32)
+
+    actual = verifier_linear._target_verify_quantized_argmax(
+        linear, inputs, token_mask=token_mask
+    )
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal kernels")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("group_size", [32, 64])
 def test_optimized_affine_q3_verifier_matches_singleton_decode(dtype, group_size):
     from mlx_vlm.models.quantized_verifier import (
