@@ -50,7 +50,6 @@ SPECS: Tuple[ParserSpec, ...] = (
     ParserSpec("cohere2_moe", (("<|START_ACTION|>",),)),
     ParserSpec("minimax_m3", (("]<]minimax[>[<tool_call>",), ("<mm:think>",))),
     ParserSpec("minimax_m2", (("<minimax:tool_call>",),)),
-    ParserSpec("function_gemma", (("<start_function_call>",),)),
     ParserSpec("minicpm5", (("<function name=", "<param name="),)),
     ParserSpec("longcat", (("<longcat_tool_call>",),)),
     ParserSpec("glm47", (("<arg_key>",),)),
