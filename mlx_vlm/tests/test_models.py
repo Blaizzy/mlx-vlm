@@ -20455,3 +20455,62 @@ class TestDeepseekV41Processing(unittest.TestCase):
             "<｜Assistant｜></think>",
         ):
             self.assertIn(marker, template)
+
+
+class TestDeepseekV41Generate(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            num_hidden_layers=2,
+            compress_ratios=[2, 1],
+            hidden_size=16,
+            vocab_size=64,
+            num_attention_heads=2,
+            head_dim=8,
+            qk_rope_head_dim=4,
+            q_lora_rank=8,
+            o_lora_rank=4,
+            o_groups=1,
+            sliding_window=4,
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=4,
+            kv_source_layer_ids=[0],
+            index_source_layer_ids=[0, 1],
+            candidate_source_layer_id=1,
+            candidate_topk_blocks=2,
+            candidate_block_size=2,
+            moe_intermediate_size=8,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            engram_layer_ids=[],
+            dspark_target_layer_ids=[1],
+            dspark_block_size=2,
+        )
+
+    def test_deepseek_v41_generate_step(self):
+        from mlx_vlm.generate.ar import generate_step
+        from mlx_vlm.models import deepseek_v41
+
+        model = deepseek_v41.Model(self._tiny_config())
+        mx.eval(model.parameters())
+        gen = generate_step(
+            mx.array([[1, 2, 3]]),
+            model,
+            None,
+            None,
+            max_tokens=2,
+            temperature=0,
+        )
+        out = list(gen)
+        self.assertEqual(len(out), 2)
+        for token, logprobs in out:
+            mx.eval(logprobs)
+            self.assertIsInstance(token, int)
+            self.assertGreaterEqual(token, 0)
+            self.assertLess(token, 64)
+            self.assertEqual(logprobs.shape, (64,))

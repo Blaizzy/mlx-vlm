@@ -15,6 +15,7 @@ from .language import (
     LanguageModel,
     ParallelHead,
     SharedIndexState,
+    hc_mix_coeffs,
     make_identity_pre_mix,
     select_candidate_blocks,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "LanguageModel",
     "ParallelHead",
     "SharedIndexState",
+    "hc_mix_coeffs",
     "make_identity_pre_mix",
     "select_candidate_blocks",
     "Aligner",

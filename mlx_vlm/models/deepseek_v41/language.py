@@ -731,6 +731,23 @@ def make_identity_pre_mix(batch: int, seqlen: int, hc_mult: int) -> mx.array:
     )
 
 
+def hc_mix_coeffs(
+    x: mx.array,
+    hc_fn: mx.array,
+    hc_scale: mx.array,
+    hc_base: mx.array,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    hc_eps: float,
+    norm_eps: float,
+):
+    """Collapse coefficients for the next sublayer: pre / post / comb."""
+    mixes = mx.fast.rms_norm(x.flatten(-2).astype(mx.float32), None, norm_eps) @ hc_fn.T
+    return _hc_split_sinkhorn_ops(
+        mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps
+    )
+
+
 class DeepseekV41Block(nn.Module):
     """A block whose residual stream is `hc_mult` parallel copies (Hyper-Connections).
 
@@ -769,12 +786,15 @@ class DeepseekV41Block(nn.Module):
         self, x: mx.array, hc_fn: mx.array, hc_scale: mx.array, hc_base: mx.array
     ):
         """Collapse coefficients for the next sublayer: pre / post / comb."""
-        mixes = (
-            mx.fast.rms_norm(x.flatten(-2).astype(mx.float32), None, self.norm_eps)
-            @ hc_fn.T
-        )
-        return _hc_split_sinkhorn_ops(
-            mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps
+        return hc_mix_coeffs(
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            self.hc_mult,
+            self.hc_sinkhorn_iters,
+            self.hc_eps,
+            self.norm_eps,
         )
 
     @staticmethod
@@ -843,6 +863,8 @@ class DeepseekV41Cache:
 class LanguageModel(nn.Module):
     """Embed, expand to hc copies, run the blocks, collapse, project to logits."""
 
+    no_chunked_prefill = True
+
     def __init__(self, config: ModelConfig, tokenizer=None):
         super().__init__()
         self.config = config
@@ -881,7 +903,15 @@ class LanguageModel(nn.Module):
         cache=None,
         image_mask: Optional[mx.array] = None,
         engram_hashes: Optional[mx.array] = None,
+        inputs: Optional[mx.array] = None,
+        n_to_process: Optional[int] = None,
     ) -> LanguageModelOutput:
+        """Extra `inputs`/`n_to_process` are generate-protocol passengers.
+
+        Chunked prefill slices `inputs_embeds` per call and advances the cache
+        offset; the raw `inputs` ids carry nothing this architecture needs
+        (no hash routing), so they are accepted and ignored.
+        """
         entry = cache[0] if cache else DeepseekV41Cache()
         start_pos = entry.offset
         if start_pos == 0:
