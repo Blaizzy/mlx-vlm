@@ -11,7 +11,7 @@ from .dequant import (
     unpack_fp4,
 )
 from .dspark import DSparkConfidenceHead, DSparkMarkovHead, get_dspark_topk_idxs
-from .engram import Engram, EngramEmbedding, EngramLayout, NgramHashState
+from .engram import Engram, EngramLayout, NgramHashState
 from .language import (
     Compressor,
     DeepseekV41Attention,
@@ -48,7 +48,6 @@ __all__ = [
     "DeepseekV41MoE",
     "DeepseekV41MoEGate",
     "Engram",
-    "EngramEmbedding",
     "EngramLayout",
     "NgramHashState",
     "Indexer",

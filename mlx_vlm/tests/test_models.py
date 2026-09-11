@@ -20634,3 +20634,50 @@ class TestDeepseekV41Repackage(unittest.TestCase):
                 self.assertIn("mtp.0.attn.wq_a.weight", index["weight_map"])
                 loaded = dict(mx.load(str(out / "model-00001-of-00001.safetensors")))
                 self.assertIn("language_model.embed_tokens.weight", loaded)
+
+
+class TestDeepseekV41Sanitize(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            num_hidden_layers=1,
+            compress_ratios=[0],
+            hidden_size=8,
+            n_routed_experts=4,
+            o_groups=2,
+            o_lora_rank=4,
+        )
+
+    def test_deepseek_v41_sanitize_stacks_experts(self):
+        from mlx_vlm.models import deepseek_v41
+
+        model = deepseek_v41.Model(self._tiny_config())
+        weights = {}
+        for e in range(4):
+            for src in ("w1", "w2", "w3"):
+                for suffix in ("weight", "scales", "biases"):
+                    weights[f"layers.0.ffn.experts.{e}.{src}.{suffix}"] = mx.zeros(
+                        (2, 2)
+                    )
+        weights["layers.0.ffn.shared_experts.w1.weight"] = mx.zeros((2, 2))
+        weights["layers.0.attn.wo_a.weight"] = mx.zeros((16, 8))
+        weights["layers.0.attn.q_norm.weight"] = mx.zeros((8,))
+        out = model.sanitize(weights)
+        mx.eval(out)
+        self.assertEqual(
+            out["language_model.layers.0.ffn.switch_mlp.gate_proj.weight"].shape,
+            (4, 2, 2),
+        )
+        self.assertEqual(
+            out["language_model.layers.0.ffn.switch_mlp.down_proj.scales"].shape,
+            (4, 2, 2),
+        )
+        self.assertIn(
+            "language_model.layers.0.ffn.shared_experts.gate_proj.weight", out
+        )
+        self.assertEqual(
+            out["language_model.layers.0.attn.wo_a.weight"].shape, (2, 4, 16)
+        )
+        self.assertFalse(any(".experts.0." in k for k in out))

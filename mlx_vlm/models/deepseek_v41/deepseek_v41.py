@@ -92,9 +92,47 @@ class Model(nn.Module):
                 return f"language_model.{key}"
             return key
 
-        return {
+        weights = {
             transform_key(k): v for k, v in weights.items() if not k.startswith("mtp.")
         }
+
+        w_remap = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+        remapped = {}
+        for k, v in weights.items():
+            for old, new in w_remap.items():
+                k = k.replace(f".shared_experts.{old}.", f".shared_experts.{new}.")
+            remapped[k] = v
+        weights = remapped
+
+        n_layers = self.config.num_hidden_layers
+        n_routed = self.config.n_routed_experts
+        for layer_idx in range(n_layers):
+            prefix = f"language_model.layers.{layer_idx}.ffn.experts"
+            for src, dst in (
+                ("w1", "gate_proj"),
+                ("w2", "down_proj"),
+                ("w3", "up_proj"),
+            ):
+                for suffix in ("weight", "scales", "biases"):
+                    key0 = f"{prefix}.0.{src}.{suffix}"
+                    if key0 in weights:
+                        stacked = [
+                            weights.pop(f"{prefix}.{e}.{src}.{suffix}")
+                            for e in range(n_routed)
+                        ]
+                        weights[
+                            f"language_model.layers.{layer_idx}.ffn.switch_mlp.{dst}.{suffix}"
+                        ] = mx.stack(stacked)
+
+        for layer_idx in range(n_layers):
+            prefix = f"language_model.layers.{layer_idx}.attn.wo_a"
+            for key in (f"{prefix}.weight", f"{prefix}.scales", f"{prefix}.biases"):
+                if key in weights and weights[key].ndim == 2:
+                    weights[key] = weights[key].reshape(
+                        self.config.o_groups, self.config.o_lora_rank, -1
+                    )
+
+        return weights
 
     @property
     def layers(self):

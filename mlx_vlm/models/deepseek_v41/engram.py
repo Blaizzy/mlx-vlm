@@ -232,19 +232,6 @@ class NgramHashState(nn.Module):
         return mx.concatenate(hashes, axis=-1) + self._offsets
 
 
-class EngramEmbedding(nn.Module):
-    """The n-gram hash table. Table quantization on lookup lands with the converter."""
-
-    def __init__(self, num_embeddings: int, head_dim: int):
-        super().__init__()
-        self.num_embeddings = num_embeddings
-        self.head_dim = head_dim
-        self.embed = nn.Embedding(num_embeddings, head_dim)
-
-    def __call__(self, indices: mx.array) -> mx.array:
-        return self.embed(indices)
-
-
 class Engram(nn.Module):
     """Writes an n-gram lookup into the residual stream, gated by how well it matches that stream.
 
@@ -258,15 +245,18 @@ class Engram(nn.Module):
         self.layer_hash_index = layout.layer_ids.index(layer_id)
         self.dim = config.hidden_size
         self.hc_mult = config.hc_mult
+        self.head_dim = layout.head_dim
         self.clamp_value = 1e-6
         self.eps = config.rms_norm_eps
 
-        self.embed = EngramEmbedding(
+        self.embed = nn.Embedding(
             layout.num_embeddings[self.layer_hash_index], layout.head_dim
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = nn.Linear(
-            n_hash_cols * layout.head_dim, config.hidden_size * (config.hc_mult + 1)
+            n_hash_cols * layout.head_dim,
+            config.hidden_size * (config.hc_mult + 1),
+            bias=False,
         )
         self.q_weight = mx.ones((config.hc_mult, config.hidden_size))
         self.k_weight = mx.ones((config.hc_mult, config.hidden_size))
@@ -277,9 +267,7 @@ class Engram(nn.Module):
         dtype = x.dtype
         n_cols = hash_ids.shape[-1]
         kv = self.wkv(
-            self.embed(hash_ids).reshape(
-                *hash_ids.shape[:-1], n_cols * self.embed.head_dim
-            )
+            self.embed(hash_ids).reshape(*hash_ids.shape[:-1], n_cols * self.head_dim)
         )
         key, value = mx.split(kv, [self.hc_mult * self.dim], axis=-1)
         key = key.astype(mx.float32).reshape(*key.shape[:-1], self.hc_mult, self.dim)

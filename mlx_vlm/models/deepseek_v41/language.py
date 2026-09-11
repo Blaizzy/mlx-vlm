@@ -8,6 +8,7 @@ import mlx.nn as nn
 from ..base import LanguageModelOutput
 from ..deepseek_v4.hyper_connection import _hc_split_sinkhorn_ops, hc_expand
 from ..deepseek_v4.language import (
+    DeepseekV4MLP,
     DeepseekV4RoPE,
     LimitedSwiGLU,
     _sparse_pooled_attention,
@@ -350,16 +351,17 @@ class DeepseekV41MoE(nn.Module):
             routed,
             activation=LimitedSwiGLU(config.swiglu_limit),
         )
-        self.shared_w1 = nn.Linear(config.hidden_size, inter, bias=False)
-        self.shared_w3 = nn.Linear(config.hidden_size, inter, bias=False)
-        self.shared_w2 = nn.Linear(inter, config.hidden_size, bias=False)
-        self.shared_act = LimitedSwiGLU(config.swiglu_limit)
+        self.shared_experts = DeepseekV4MLP(
+            config,
+            intermediate_size=inter,
+            swiglu_limit=config.swiglu_limit,
+        )
 
     def __call__(self, x: mx.array, image_mask: Optional[mx.array] = None) -> mx.array:
         inds, scores = self.gate(x, image_mask)
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None].astype(y.dtype)).sum(-2)
-        return y + self.shared_w2(self.shared_act(self.shared_w3(x), self.shared_w1(x)))
+        return y + self.shared_experts(x)
 
 
 def _apply_rope_at_positions(
