@@ -277,6 +277,7 @@ def stream_convert(
         )
         converted = convert_shard(Path(local), PROFILES[profile_name])
         Path(local).unlink()
+        print(f"{filename}: {len(converted)} tensors", flush=True)
         for key, value in converted.items():
             pending[key] = value
             pending_bytes += value.nbytes
