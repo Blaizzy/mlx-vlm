@@ -3,13 +3,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from mlx_vlm.server.responses_state import process_tool_calls
-from mlx_vlm.tool_parsers import (
+from mlx_vlm.tools import (
     _infer_tool_parser,
     _infer_tool_parser_from_processor,
     load_tool_module,
+    process_tool_calls,
 )
-from mlx_vlm.tool_parsers.pythonic import parse_tool_call
+from mlx_vlm.tools.parsers.pythonic import parse_tool_call
 
 LFM_TOOL_TEMPLATE = """
 {{ '<|tool_call_start|>[' + tool_calls + ']<|tool_call_end|>' }}
@@ -36,10 +36,10 @@ def test_lfm_tool_call_output_parses_for_server_response():
         tools=[{"type": "function", "function": {"name": "get_weather"}}],
     )
 
-    assert result["remaining_text"] == ""
-    assert len(result["calls"]) == 1
-    assert result["calls"][0]["function"]["name"] == "get_weather"
-    assert json.loads(result["calls"][0]["function"]["arguments"]) == {
+    assert result.remaining_text == ""
+    assert len(result.calls) == 1
+    assert result.calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(result.calls[0]["function"]["arguments"]) == {
         "location": "Warsaw",
         "unit": "celsius",
     }
@@ -65,12 +65,12 @@ def test_multiple_tool_calls_parse_for_server_response():
         tools=[{"type": "function", "function": {"name": "read_file"}}],
     )
 
-    assert result["remaining_text"] == ""
-    assert [call["function"]["name"] for call in result["calls"]] == [
+    assert result.remaining_text == ""
+    assert [call["function"]["name"] for call in result.calls] == [
         "read_file",
         "read_file",
     ]
-    assert [json.loads(call["function"]["arguments"]) for call in result["calls"]] == [
+    assert [json.loads(call["function"]["arguments"]) for call in result.calls] == [
         {"path": "brick.html"},
         {"path": "game.html"},
     ]
@@ -155,10 +155,10 @@ def test_multiline_write_file_output_parses_for_server_response():
         tools=[{"type": "function", "function": {"name": "write_file"}}],
     )
 
-    assert result["remaining_text"] == ""
-    assert len(result["calls"]) == 1
-    assert result["calls"][0]["function"]["name"] == "write_file"
-    assert json.loads(result["calls"][0]["function"]["arguments"]) == {
+    assert result.remaining_text == ""
+    assert len(result.calls) == 1
+    assert result.calls[0]["function"]["name"] == "write_file"
+    assert json.loads(result.calls[0]["function"]["arguments"]) == {
         "path": "game.html",
         "content": "<!doctype html>\n<script>const label = 'Score';</script>",
     }

@@ -3,9 +3,9 @@
 import json
 import unittest
 
-import mlx_vlm.tool_parsers.gemma4 as gemma4
-from mlx_vlm.server.responses_state import process_tool_calls
-from mlx_vlm.tool_parsers.gemma4 import parse_tool_call
+import mlx_vlm.tools.parsers.gemma4 as gemma4
+from mlx_vlm.tools import process_tool_calls
+from mlx_vlm.tools.parsers.gemma4 import parse_tool_call
 
 # Wire-format helpers
 TC_START = "<|tool_call>"
@@ -124,17 +124,17 @@ class TestGemma4ToolParser(unittest.TestCase):
             tools=None,
         )
 
-        self.assertEqual(len(result["calls"]), 1)
-        self.assertEqual(result["calls"][0]["function"]["name"], "get_weather")
-        args = json.loads(result["calls"][0]["function"]["arguments"])
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0]["function"]["name"], "get_weather")
+        args = json.loads(result.calls[0]["function"]["arguments"])
         self.assertEqual(args, {"city": "Austin"})
-        self.assertEqual(result["remaining_text"], "")
+        self.assertEqual(result.remaining_text, "")
 
     def test_process_tool_calls_ignores_non_call_prose(self):
         result = process_tool_calls("Like call: prince", gemma4, tools=None)
 
-        self.assertEqual(result["calls"], [])
-        self.assertEqual(result["remaining_text"], "Like call: prince")
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.remaining_text, "Like call: prince")
 
     # ── error path ────────────────────────────────────────────────────────
 

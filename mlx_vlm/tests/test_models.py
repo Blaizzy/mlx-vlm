@@ -14,6 +14,274 @@ from mlx_vlm.tests.cache_invariants import assert_cached_forward_matches_full
 from mlx_vlm.tests.sanitize_invariants import assert_sanitize_idempotent
 
 
+class TestHyV4(unittest.TestCase):
+    def _config(self):
+        from mlx_vlm.models.hy_v4 import ModelConfig
+
+        return ModelConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            moe_intermediate_size=16,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            routed_scaling_factor=1.0,
+            kv_lora_rank=8,
+            q_lora_rank=8,
+            qk_rope_head_dim=4,
+            qk_nope_head_dim=4,
+            v_head_dim=8,
+            index_head_dim=4,
+            index_n_heads=2,
+            index_topk=2,
+            indexer_types=["full", "shared", "full"],
+            num_experts_per_tok=1,
+            first_k_dense_replace=1,
+            max_position_embeddings=32,
+            hc_mult=2,
+        )
+
+    def test_cached_forward_exercises_identity_hc_and_shared_index_cache(self):
+        from mlx_vlm.models.hy_v4 import Model
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = Model(config)
+        cache = model.make_cache()
+        logits, _ = assert_cached_forward_matches_full(
+            model, tokens=(1, 2, 3, 4), splits=(1, 3), cache=cache
+        )
+        decode = model(mx.array([[5]]), cache=cache).logits
+        mx.eval(decode)
+
+        self.assertEqual(logits.shape, (1, 4, config.vocab_size))
+        self.assertEqual(decode.shape, (1, 1, config.vocab_size))
+        self.assertEqual(len(cache[1].caches), 1)
+        self.assertEqual(len(cache[2].caches), 2)
+        self.assertTrue(mx.isfinite(decode).all().item())
+
+        model_module, model_type = get_model_and_args(config.to_dict())
+        self.assertEqual(model_module.__name__, "mlx_vlm.models.hy_v4")
+        self.assertEqual(model_type, "hy_v4")
+
+    def test_sanitize_repackages_modelopt_mxfp8_weights(self):
+        from mlx_vlm.models.hy_v4 import Model, ModelConfig
+
+        config = ModelConfig(
+            vocab_size=64,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            kv_lora_rank=32,
+            q_lora_rank=16,
+            qk_rope_head_dim=4,
+            qk_nope_head_dim=32,
+            v_head_dim=32,
+            index_head_dim=4,
+            index_n_heads=2,
+            index_topk=2,
+            indexer_types=["full", "shared"],
+            num_experts_per_tok=1,
+            first_k_dense_replace=1,
+            max_position_embeddings=32,
+        )
+
+        def mxfp8(shape):
+            packed, scales = mx.quantize(
+                mx.random.normal(shape), group_size=32, bits=8, mode="mxfp8"
+            )
+            return packed.view(mx.uint8), scales
+
+        gate_up, gate_up_scale = mxfp8((2, 64, 64))
+        down, down_scale = mxfp8((2, 64, 32))
+        kv_b, kv_b_scale = mxfp8((128, 32))
+        q_a, q_a_scale = mxfp8((16, 64))
+        sanitized = Model(config).sanitize(
+            {
+                "model.layers.1.mlp.experts.gate_up_proj": gate_up,
+                "model.layers.1.mlp.experts.gate_up_proj_scale": gate_up_scale,
+                "model.layers.1.mlp.experts.down_proj": down,
+                "model.layers.1.mlp.experts.down_proj_scale": down_scale,
+                "model.layers.1.self_attn.kv_b_proj.weight": kv_b,
+                "model.layers.1.self_attn.kv_b_proj.weight_scale": kv_b_scale,
+                "model.layers.1.self_attn.q_a_proj.weight": q_a,
+                "model.layers.1.self_attn.q_a_proj.weight_scale": q_a_scale,
+                "model.auxiliary.weight": mx.zeros((64, 64)),
+            }
+        )
+
+        prefix = "language_model.model.layers.1"
+        self.assertEqual(
+            sanitized[f"{prefix}.mlp.switch_mlp.gate_up_proj.weight"].shape,
+            (2, 64, 16),
+        )
+        self.assertEqual(
+            sanitized[f"{prefix}.mlp.switch_mlp.down_proj.scales"].shape,
+            (2, 64, 1),
+        )
+        self.assertEqual(
+            sanitized[f"{prefix}.self_attn.embed_q.weight"].shape, (2, 32, 8)
+        )
+        self.assertEqual(
+            sanitized[f"{prefix}.self_attn.unembed_out.weight"].shape, (2, 32, 8)
+        )
+        self.assertEqual(
+            sanitized[f"{prefix}.self_attn.q_a_proj.scales"].shape, (16, 2)
+        )
+        self.assertFalse(any("auxiliary" in key for key in sanitized))
+
+    def test_loader_recognizes_modelopt_mxfp8(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.hy_v4 import ModelConfig
+        from mlx_vlm.models.switch_layers import QuantizedSwitchLinear
+        from mlx_vlm.utils import load_model
+
+        config = ModelConfig(
+            model_type="hy_v4",
+            vocab_size=64,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            kv_lora_rank=32,
+            q_lora_rank=16,
+            qk_rope_head_dim=4,
+            qk_nope_head_dim=32,
+            v_head_dim=32,
+            index_head_dim=4,
+            index_n_heads=2,
+            index_topk=2,
+            indexer_types=["full", "shared"],
+            num_experts_per_tok=1,
+            first_k_dense_replace=1,
+            max_position_embeddings=32,
+        )
+
+        def mxfp8(shape):
+            packed, scales = mx.quantize(
+                mx.random.normal(shape), group_size=32, bits=8, mode="mxfp8"
+            )
+            return packed.view(mx.uint8), scales
+
+        gate_up, gate_up_scale = mxfp8((2, 64, 64))
+        down, down_scale = mxfp8((2, 64, 32))
+        kv_b, kv_b_scale = mxfp8((128, 32))
+        q_a, q_a_scale = mxfp8((16, 64))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            source_config = config.to_dict()
+            source_config["quantization_config"] = {
+                "quant_method": "modelopt",
+                "quant_algo": "MXFP8",
+            }
+            (path / "config.json").write_text(json.dumps(source_config))
+            mx.save_safetensors(
+                str(path / "model.safetensors"),
+                {
+                    "model.layers.1.mlp.experts.gate_up_proj": gate_up,
+                    "model.layers.1.mlp.experts.gate_up_proj_scale": gate_up_scale,
+                    "model.layers.1.mlp.experts.down_proj": down,
+                    "model.layers.1.mlp.experts.down_proj_scale": down_scale,
+                    "model.layers.1.self_attn.kv_b_proj.weight": kv_b,
+                    "model.layers.1.self_attn.kv_b_proj.weight_scale": kv_b_scale,
+                    "model.layers.1.self_attn.q_a_proj.weight": q_a,
+                    "model.layers.1.self_attn.q_a_proj.weight_scale": q_a_scale,
+                },
+            )
+            model = load_model(path, lazy=True, strict=False)
+
+        layer = model.language_model.model.layers[1]
+        self.assertIsInstance(layer.mlp.switch_mlp.gate_up_proj, QuantizedSwitchLinear)
+        self.assertIsInstance(layer.self_attn.q_a_proj, nn.QuantizedLinear)
+
+    def test_fused_switch_glu_matches_split_quantized_projections(self):
+        from mlx_vlm.models.hy_v4.fused_switch_glu import FusedSwitchGLU
+        from mlx_vlm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
+
+        input_dims, hidden_dims, num_experts = 32, 64, 4
+        gate = mx.random.normal((num_experts, hidden_dims, input_dims))
+        up = mx.random.normal((num_experts, hidden_dims, input_dims))
+        down = mx.random.normal((num_experts, input_dims, hidden_dims))
+
+        def quantized(weight):
+            packed, scales, biases = mx.quantize(weight, group_size=32, bits=4)
+            linear = QuantizedSwitchLinear(
+                weight.shape[-1],
+                weight.shape[-2],
+                weight.shape[0],
+                bias=False,
+                group_size=32,
+                bits=4,
+            )
+            linear.weight = packed
+            linear.scales = scales
+            linear.biases = biases
+            return linear
+
+        split = SwitchGLU(input_dims, hidden_dims, num_experts)
+        split.gate_proj = quantized(gate)
+        split.up_proj = quantized(up)
+        split.down_proj = quantized(down)
+
+        fused = FusedSwitchGLU(input_dims, hidden_dims, num_experts)
+        fused.gate_up_proj = quantized(mx.concatenate([gate, up], axis=1))
+        fused.down_proj = quantized(down)
+
+        for tokens in (1, 13):
+            x = mx.random.normal((1, tokens, input_dims))
+            indices = mx.random.randint(0, num_experts, (1, tokens, 2))
+            expected = split(x, indices)
+            actual = fused(x, indices)
+            mx.eval(expected, actual)
+            self.assertTrue(mx.array_equal(expected, actual).item())
+
+    def test_compiled_weighted_expert_sum_matches_eager(self):
+        from mlx_vlm.models.hy_v4.moe import weighted_expert_sum
+
+        outputs = mx.random.normal((1, 13, 8, 32)).astype(mx.bfloat16)
+        scores = mx.random.uniform(shape=(1, 13, 8)).astype(mx.float32)
+        expected = (outputs * scores[..., None]).sum(axis=-2).astype(outputs.dtype)
+        actual = weighted_expert_sum(outputs, scores)
+        mx.eval(expected, actual)
+        self.assertTrue(mx.array_equal(expected, actual).item())
+
+    def test_compiled_indexer_matches_deepseek_indexer(self):
+        from mlx_vlm.models.deepseek_v32.language import Indexer
+        from mlx_vlm.models.hy_v4.indexer import HyV4Indexer
+
+        config = self._config()
+        config.index_topk = 2
+        eager = Indexer(config)
+        compiled = HyV4Indexer(config)
+        compiled.load_weights(list(tree_flatten(eager.parameters())))
+
+        for sequence_length, mask in (
+            (3, None),
+            (13, mx.tri(13, 13, dtype=mx.bool_)[None, None]),
+        ):
+            x = mx.random.normal((1, sequence_length, config.hidden_size))
+            qr = mx.random.normal((1, sequence_length, config.q_lora_rank))
+            expected = eager(x, qr, mask)
+            actual = compiled(x, qr, mask)
+            mx.eval(expected, actual)
+            self.assertTrue(mx.array_equal(expected, actual).item())
+
+
 class TestNanochatModel(unittest.TestCase):
     def test_native_loader_and_cached_forward(self):
         from mlx_vlm.models import nanochat
