@@ -4,6 +4,12 @@
 `deepseek-ai/DeepSeek-V4.1-Flash`: 3 DSpark stages (`mtp.0..2.*`) drafting
 `dspark_block_size` (5) tokens per step against target layers [37, 38, 39].
 
+It conforms to the shared `dflash` round loop (same contract as
+`deepseek_v4_dspark`): cross-attention over the projected target hidden,
+`VanillaMarkov` block sampling, `reset` / `_hidden` / `_logits` /
+`draft_block`. Only the draft layers are V4.1-native (MLA cross-attention,
+MoE, single-pass Hyper-Connections threaded internally from identity).
+
 ## Tensor layout (verified against Vontra's converted checkpoint)
 
 - **Every stage**: MLA attention (`attn.wq_a/wq_b/wkv/wo_a/wo_b` + norms + sink),
@@ -11,11 +17,11 @@
   (`ffn.gate.weight/bias/bias_vl`), Hyper-Connection tensors
   (`hc_attn/ffn_{fn,scale,base}`).
 - **Stage 0 only**: `main_proj` + `main_norm` (target-hidden mixer).
-- **Stage 2 only**: final `norm`, `markov_head` (embed + head) and
-  `confidence_head.proj`.
-- **Open question**: no `hc_head` tensors exist in the converted checkpoint
-  while the reference `forward_head` applies one. The stage class must resolve
-  whether the converter folded it (e.g. mean-collapse) before wiring the head.
+- **Stage 2 only**: final `norm`, `markov_head` (embed + head, renamed onto
+  `VanillaMarkov` as `markov_w1/markov_w2`) and `confidence_head.proj`
+  (dropped: unused by the `dflash` loop).
+- No `hc_head` exists: the reference collapses via `hc_pre` directly, which is
+  what the port does.
 
 ## Building a drafter
 
@@ -30,12 +36,6 @@ split_deepseek_v41_dspark(
 )
 ```
 
-The written config carries `n_mtp_layers`, `dspark_block_size`,
-`dspark_target_layer_ids`, `dspark_noise_token_id` and `dspark_markov_rank`.
-
-## Status
-
-Config, `mtp.*` → `stages.*` split, and quantization profiles are implemented.
-The `DSparkStage`/`DSparkAttention` draft loop (reusing the `markov_head` and
-`confidence_head` classes from `mlx_vlm.models.deepseek_v41.dspark`, whose
-`embed/head/proj` names already match this layout) is the remaining step.
+The written config carries `n_mtp_layers`, `target_layer_ids`,
+`mask_token_id`, `markov_rank` and `block_size`, so `load_drafter` resolves it
+to `draft_kind="dflash"`.

@@ -1,29 +1,30 @@
 """DeepSeek-V4.1 DSpark speculative drafter.
 
-DSpark is DeepSeek-V4.1-Flash's native multi-token-prediction head: a stack of
-``n_mtp_layers`` (3) transformer stages drafting ``dspark_block_size`` (5)
-tokens per step, conditioned on the concatenated hidden states of the target's
-``dspark_target_layer_ids`` (the ``main_hidden`` window).
+A DeepSeek-V4.1-backbone variant of the model-agnostic DSpark drafter: it reuses
+the shared DSpark proposal machinery (``VanillaMarkov`` block sampling and the
+``dflash`` round loop with its target-hidden tap) and only swaps the Qwen-style
+draft layers for DeepSeek-V4.1 MLA cross-attention, MoE, and single-pass
+Hyper-Connections, mirroring the native DSpark head.
 
-Structure mirrors the reference ``inference/model.py`` ``DSparkBlock``: stage 0
-owns ``main_proj``/``main_norm`` over the target hidden, every stage is an MLA
-attention (KV from the projected target hidden plus the block's own tokens) +
-MoE block under single-pass mHC, and only the last stage owns the final norm
-plus ``markov_head`` (low-rank bigram bias) and ``confidence_head``. The
-attention here is a dense mirror of the reference sparse windowed kernel; the
-markov/confidence heads are imported from the model path, whose
-``embed/head/proj`` names already match this checkpoint layout.
+Like the base DSpark drafter, it conforms to the DFlash drafter contract
+(``reset`` / ``_hidden`` / ``_logits`` / ``draft_block``): the projected target
+hidden (``main_proj`` over the concatenated ``target_layer_ids`` hiddens) is the
+accumulating attention context, and the drafted block — seeded with
+``mask_token_id`` — supplies the queries. Pre-mix coefficients thread through
+the stages single-pass style, carried internally from an identity start.
 """
 
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ....models.base import scaled_dot_product_attention
-from ....models.deepseek_v4.hyper_connection import hc_expand
+from ....models.cache import RotatingKVCache
 from ....models.deepseek_v4.language import DeepseekV4RoPE
-from ....models.deepseek_v41.dspark import DSparkConfidenceHead, DSparkMarkovHead
+from ....models.deepseek_v41.dspark import (  # noqa: F401 (documents the unused native head)
+    DSparkConfidenceHead,
+)
 from ....models.deepseek_v41.language import (
     DeepseekV41Block,
     DeepseekV41MoE,
@@ -31,15 +32,16 @@ from ....models.deepseek_v41.language import (
     make_identity_pre_mix,
 )
 from ....models.mla import MultiLinear
+from ..dspark.dspark import VanillaMarkov
 from .config import DeepseekV41DsparkConfig
 
 
-class DeepseekV41DsparkAttention(nn.Module):
-    """MLA attention whose KV context is the projected target hidden ``main_x``.
+class DSparkMLACrossAttention(nn.Module):
+    """DeepSeek-V4.1 MLA attention in the DFlash cross-attention layout.
 
-    Queries come from the drafted block; keys/values are the concatenation of
-    the target context (``main_x``) and the block's own tokens, with a causal
-    in-block mask. Dense mirror of the reference sparse kernel.
+    The accumulating KV context is the projected target hidden ``x_ctx``
+    (cached); the drafted block supplies the queries and a transient block KV.
+    Block self-attention is non-causal (the whole block is denoised at once).
     """
 
     def __init__(self, config):
@@ -69,31 +71,30 @@ class DeepseekV41DsparkAttention(nn.Module):
         self.attn_sink = mx.zeros((self.n_heads,), dtype=mx.float32)
         self.rope = DeepseekV4RoPE(
             config.qk_rope_head_dim,
-            config.compress_rope_theta,
-            config.rope_scaling,
+            config.rope_theta,
+            None,
             config.max_position_embeddings,
         )
 
     def __call__(
-        self, x: mx.array, main_x: mx.array, block_offset: int = 0
+        self, x: mx.array, x_ctx: mx.array, cache: RotatingKVCache
     ) -> mx.array:
-        batch, block = x.shape[0], x.shape[1]
-        ctx = main_x.shape[1]
+        B, L, _ = x.shape
+        S = x_ctx.shape[1]
+        offset = cache.offset
 
         q = self.wq_b(self.q_norm(self.wq_a(x)))
-        q = q.reshape(batch, block, self.n_heads, self.head_dim)
+        q = q.reshape(B, L, self.n_heads, self.head_dim)
         q = q.transpose(0, 2, 1, 3)
-        q = self.rope(q, block_offset)
+        q = self.rope(q, offset + S)
 
-        main_kv = self.kv_norm(self.wkv(main_x)).reshape(batch, 1, ctx, self.head_dim)
-        main_kv = self.rope(main_kv, 0)
-        block_kv = self.kv_norm(self.wkv(x)).reshape(batch, 1, block, self.head_dim)
-        block_kv = self.rope(block_kv, block_offset)
-        kv = mx.concatenate([main_kv, block_kv], axis=2)
+        ctx_kv = self.kv_norm(self.wkv(x_ctx)).reshape(B, 1, S, self.head_dim)
+        ctx_kv = self.rope(ctx_kv, offset)
+        block_kv = self.kv_norm(self.wkv(x)).reshape(B, 1, L, self.head_dim)
+        block_kv = self.rope(block_kv, offset + S)
 
-        cols = mx.arange(ctx + block)[None, None, :]
-        rows = mx.arange(block)[None, :, None]
-        mask = (cols < ctx) | ((cols - ctx) <= rows)
+        kv, _ = cache.update_and_fetch(ctx_kv, mx.zeros((B, 1, S, 0)))
+        kv = mx.concatenate([kv, block_kv], axis=2)
 
         out = scaled_dot_product_attention(
             q,
@@ -101,12 +102,12 @@ class DeepseekV41DsparkAttention(nn.Module):
             kv,
             cache=None,
             scale=self.scale,
-            mask=mask,
+            mask=None,
             sinks=self.attn_sink.astype(q.dtype),
         )
-        out = self.rope(out, block_offset, inverse=True)
+        out = self.rope(out, offset + S, inverse=True)
 
-        out = out.reshape(batch, self.o_groups, -1, block, self.head_dim)
+        out = out.reshape(B, self.o_groups, -1, L, self.head_dim)
         out = out.transpose(0, 1, 3, 2, 4).flatten(-2)
         out = self.wo_a(out)
         out = out.transpose(0, 2, 1, 3).flatten(-2)
@@ -114,12 +115,10 @@ class DeepseekV41DsparkAttention(nn.Module):
 
 
 class DeepseekV41DsparkStage(nn.Module):
-    """One DSpark transformer stage under single-pass mHC.
-
-    Structurally a backbone block (same parameter names, so the checkpoint maps
-    straight in) apart from the cross-attention and the stage-specific
-    input/output modules.
-    """
+    """One DSpark transformer stage: a DeepSeek-V4.1 HC block whose attention reads
+    the projected target hidden. Same parameter names as the backbone block (minus
+    compressor/indexer, plus the stage input/output modules) so the checkpoint maps
+    straight in."""
 
     def __init__(self, config: DeepseekV41DsparkConfig, stage_id: int):
         super().__init__()
@@ -132,7 +131,7 @@ class DeepseekV41DsparkStage(nn.Module):
         self.hc_eps = text_config.hc_eps
         self.norm_eps = text_config.rms_norm_eps
 
-        self.attn = DeepseekV41DsparkAttention(text_config)
+        self.attn = DSparkMLACrossAttention(text_config)
         self.ffn = DeepseekV41MoE(
             text_config,
             moe_intermediate_size=text_config.moe_intermediate_size,
@@ -155,7 +154,7 @@ class DeepseekV41DsparkStage(nn.Module):
         self.hc_ffn_scale = mx.ones((3,), dtype=mx.float32)
 
         if self.is_first:
-            n_targets = max(len(config.dspark_target_layer_ids), 1)
+            n_targets = max(len(config.target_layer_ids), 1)
             self.main_proj = nn.Linear(
                 text_config.hidden_size * n_targets,
                 text_config.hidden_size,
@@ -168,11 +167,13 @@ class DeepseekV41DsparkStage(nn.Module):
             self.norm = nn.RMSNorm(
                 text_config.hidden_size, eps=text_config.rms_norm_eps
             )
-            self.markov_head = DSparkMarkovHead(text_config)
-            self.confidence_head = DSparkConfidenceHead(text_config)
 
     def __call__(
-        self, h: mx.array, main_x: mx.array, pre_mix: mx.array, block_offset: int = 0
+        self,
+        h: mx.array,
+        main_x: mx.array,
+        pre_mix: mx.array,
+        cache: RotatingKVCache,
     ):
         residual = h
         attn_pre, attn_post, attn_comb = hc_mix_coeffs(
@@ -187,12 +188,12 @@ class DeepseekV41DsparkStage(nn.Module):
         )
         x = DeepseekV41Block.hc_pre(h, pre_mix)
         x = self.attn_norm(x)
-        x = self.attn(x, main_x, block_offset)
-        x = hc_expand(x, residual, attn_post, attn_comb)
+        x = self.attn(x, main_x, cache)
+        h = hc_post(x, residual, attn_post, attn_comb)
 
-        residual = x
+        residual = h
         ffn_pre, ffn_post, ffn_comb = hc_mix_coeffs(
-            x,
+            h,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,
@@ -204,8 +205,17 @@ class DeepseekV41DsparkStage(nn.Module):
         x = DeepseekV41Block.hc_pre(x, attn_pre)
         x = self.ffn_norm(x)
         x = self.ffn(x)
-        x = hc_expand(x, residual, ffn_post, ffn_comb)
-        return x, ffn_pre
+        h = hc_post(x, residual, ffn_post, ffn_comb)
+        return h, ffn_pre
+
+
+def hc_post(x, residual, post, comb):
+    """Expand the sublayer output back to hc copies through `comb`."""
+    y = post[..., None].astype(mx.float32) * x[:, :, None, :].astype(mx.float32)
+    y = y + mx.matmul(
+        comb.swapaxes(-1, -2).astype(mx.float32), residual.astype(mx.float32)
+    )
+    return y.astype(x.dtype)
 
 
 class DeepseekV41DsparkDraftModel(nn.Module):
@@ -219,13 +229,12 @@ class DeepseekV41DsparkDraftModel(nn.Module):
             raise ValueError("DeepseekV41DsparkConfig.text_config must be set")
         self.args = text_config
         self.hc_mult = text_config.hc_mult
-        self.block_size = config.dspark_block_size
-        self.noise_token_id = config.dspark_noise_token_id
 
         self.stages = [
             DeepseekV41DsparkStage(config, stage_id)
             for stage_id in range(config.n_mtp_layers)
         ]
+        self.markov_head = VanillaMarkov(config.vocab_size, config.markov_rank)
 
         self._input_embed = None
         self._lm_head_fn = None
@@ -264,98 +273,101 @@ class DeepseekV41DsparkDraftModel(nn.Module):
         )
         return self
 
-    def reset(self, target_model) -> None:
+    def make_cache(self) -> List[RotatingKVCache]:
+        from ....models.cache import RotatingKVCache as _RotCache
+
+        return [_RotCache(max_size=512) for _ in self.stages]
+
+    def reset(self, target_model) -> List[RotatingKVCache]:
         self.bind(target_model)
         self.accept_lens = []
         self.draft_lens = []
+        return self.make_cache()
 
-    def _forward_embed(
-        self, main_hidden: mx.array, bonus_token: mx.array, token_dtype: mx.Dtype
-    ) -> Tuple[mx.array, mx.array]:
-        first = self.stages[0]
-        main_x = first.main_norm(first.main_proj(main_hidden))
-
-        batch = main_hidden.shape[0]
-        draft_ids = mx.full(
-            (batch, self.block_size), self.noise_token_id, dtype=token_dtype
-        )
-        draft_ids[:, 0] = bonus_token.astype(token_dtype)
-        x = self._input_embed(draft_ids)
-        x = mx.broadcast_to(
-            x[:, :, None, :], (batch, self.block_size, self.hc_mult, x.shape[-1])
-        )
-        return mx.contiguous(x), main_x
-
-    def _forward_head(
+    def _hidden(
         self,
-        x: mx.array,
-        pre_mix: mx.array,
-        bonus_token: mx.array,
-        sampler: Optional[Callable[[mx.array], mx.array]],
-        token_dtype: mx.Dtype,
-    ) -> Tuple[mx.array, mx.array, mx.array]:
-        last = self.stages[-1]
-        hidden = DeepseekV41Block.hc_pre(x, pre_mix)
-        base_logits = self._lm_head_fn(last.norm(hidden))
+        inputs: mx.array,
+        target_hidden: mx.array,
+        cache: List[RotatingKVCache],
+    ) -> mx.array:
+        first = self.stages[0]
+        main_x = first.main_norm(first.main_proj(target_hidden))
 
-        output_ids = [bonus_token.astype(token_dtype)]
-        markov_embeds = []
-        logits_out = []
-        for i in range(self.block_size):
-            bias, embed = last.markov_head(output_ids[i])
-            logits_i = base_logits[:, i, :] + bias
-            markov_embeds.append(embed)
-            logits_out.append(logits_i)
-            token = (
-                mx.argmax(logits_i, axis=-1) if sampler is None else sampler(logits_i)
-            )
-            output_ids.append(token.astype(token_dtype))
-
-        confidence = last.confidence_head(hidden, mx.stack(markov_embeds, axis=1))
-        return (
-            mx.stack(output_ids, axis=1),
-            mx.stack(logits_out, axis=1),
-            confidence,
+        h = self._input_embed(inputs)
+        h = mx.broadcast_to(
+            h[:, :, None, :], (h.shape[0], h.shape[1], self.hc_mult, h.shape[-1])
         )
+        h = mx.contiguous(h)
+        pre_mix = make_identity_pre_mix(h.shape[0], h.shape[1], self.hc_mult)
+        for stage, stage_cache in zip(self.stages, cache):
+            h, pre_mix = stage(h, main_x, pre_mix, stage_cache)
+
+        last = self.stages[-1]
+        return last.norm(DeepseekV41Block.hc_pre(h, pre_mix))
+
+    def _logits(self, hidden: mx.array) -> mx.array:
+        return self._lm_head_fn(hidden)
 
     def draft_block(
         self,
-        main_hidden: mx.array,
-        bonus_token: mx.array,
-        sampler: Optional[Callable[[mx.array], mx.array]] = None,
-        block_offset: int = 0,
+        last_bonus,
+        hidden: mx.array,
+        cache: List[RotatingKVCache],
+        block_size: int,
+        sampler: Callable[[mx.array], mx.array],
         token_dtype: mx.Dtype = mx.int32,
-    ) -> Tuple[mx.array, mx.array, mx.array]:
-        """Draft one block.
-
-        ``main_hidden``: [B, ctx, hidden_size * len(target_layer_ids)] target
-        context. ``bonus_token``: [B] accepted token. Returns
-        ``(output_ids [B, block_size + 1], logits [B, block_size, vocab],
-        confidence [B, block_size])``.
-        """
+    ) -> mx.array:
         if self._input_embed is None or self._lm_head_fn is None:
             raise RuntimeError(
                 "bind(target_model) must be called before draft_block()."
             )
 
-        x, main_x = self._forward_embed(main_hidden, bonus_token, token_dtype)
-        pre_mix = make_identity_pre_mix(
-            main_hidden.shape[0], self.block_size, self.hc_mult
+        proposal_length = int(block_size) - 1
+        if proposal_length <= 0:
+            batch = 1 if isinstance(last_bonus, int) else int(last_bonus.shape[0])
+            return mx.zeros((batch, 0), dtype=token_dtype)
+
+        anchor = (
+            mx.array([last_bonus], dtype=token_dtype)
+            if isinstance(last_bonus, int)
+            else last_bonus.reshape(-1).astype(token_dtype)
         )
-        for stage in self.stages:
-            x, pre_mix = stage(x, main_x, pre_mix, block_offset)
-        return self._forward_head(x, pre_mix, bonus_token, sampler, token_dtype)
+        masks = mx.full(
+            (anchor.shape[0], proposal_length - 1),
+            int(self.config.mask_token_id),
+            dtype=token_dtype,
+        )
+        draft_inputs = mx.concatenate([anchor[:, None], masks], axis=1)
+        base_logits = self._logits(self._hidden(draft_inputs, hidden, cache))
+        return self.markov_head.sample_block(
+            base_logits,
+            first_prev_tokens=anchor,
+            sampler=sampler,
+        ).astype(token_dtype)
 
     def sanitize(self, weights: dict) -> dict:
-        """Map the ``mtp.<stage>.*`` checkpoint layout onto ``stages.<i>.*``,
-        stacking per-expert tensors for SwitchGLU like the backbone."""
+        """Map the ``mtp.<stage>.*`` checkpoint layout onto the drafter.
+
+        Reuses the proven per-stage mapping, then renames the model-level
+        native markov head onto ``VanillaMarkov``. The native confidence head
+        is unused by the ``dflash`` loop and is dropped.
+        """
         import re
 
         from ....models.deepseek_v41.language import sanitize_moe_weights
         from .split import sanitize_dspark_weights
 
         weights = sanitize_dspark_weights(weights)
-        text_config = self.config.text_config
+        for key in [k for k in weights if re.match(r"markov_head\.(embed|head)\.", k)]:
+            renamed = (
+                key.replace("markov_head.embed.", "markov_head.markov_w1.")
+                if ".embed." in key
+                else key.replace("markov_head.head.", "markov_head.markov_w2.")
+            )
+            weights[renamed] = weights.pop(key)
+        weights = {
+            k: v for k, v in weights.items() if not k.startswith("confidence_head.")
+        }
         stages = {
             int(m.group(1))
             for k in weights
@@ -376,6 +388,8 @@ class DeepseekV41DsparkDraftModel(nn.Module):
                 + 1
             )
             weights = sanitize_moe_weights(weights, prefix, n_routed)
+        text_config = self.config.text_config
+        for stage in sorted(stages):
             wo_prefix = f"stages.{stage}.attn.wo_a"
             for key in (
                 f"{wo_prefix}.weight",

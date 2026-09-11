@@ -5399,17 +5399,18 @@ class TestDeepseekV41DsparkSplit:
                 "model_type": "deepseek_v41_dspark",
                 "text_config": {
                     "model_type": "deepseek_v41",
-                    "dspark_block_size": 5,
-                    "dspark_noise_token_id": 7,
-                    "dspark_target_layer_ids": [37, 38, 39],
-                    "dspark_markov_rank": 256,
                 },
+                "target_layer_ids": [37, 38, 39],
+                "mask_token_id": 7,
+                "markov_rank": 256,
+                "block_size": 6,
             }
         )
         assert config.n_mtp_layers == 3
         assert config.block_size == 6
-        assert config.dspark_target_layer_ids == [37, 38, 39]
-        assert config.dspark_noise_token_id == 7
+        assert config.target_layer_ids == [37, 38, 39]
+        assert config.mask_token_id == 7
+        assert config.markov_rank == 256
 
     def test_deepseek_v41_dspark_quantization(self):
         from mlx_vlm.speculative.drafters.deepseek_v41_dspark.split import (
@@ -5618,10 +5619,10 @@ def _tiny_v41_dspark_config(text_config=None):
     return DeepseekV41DsparkConfig(
         text_config=text_config or _tiny_v41_text_config(),
         n_mtp_layers=2,
-        dspark_block_size=2,
-        dspark_noise_token_id=5,
-        dspark_target_layer_ids=[0],
-        dspark_markov_rank=4,
+        target_layer_ids=[0],
+        mask_token_id=5,
+        markov_rank=4,
+        block_size=3,
     )
 
 
@@ -5637,18 +5638,22 @@ def test_deepseek_v41_dspark_draft_block():
 
     drafter = DeepseekV41DsparkDraftModel(_tiny_v41_dspark_config(text_config))
     mx.eval(drafter.parameters())
-    drafter.bind(target)
+    cache = drafter.reset(target)
 
     main_hidden = mx.random.normal((1, 4, 16))
     bonus = mx.array([3])
-    output_ids, logits, confidence = drafter.draft_block(main_hidden, bonus)
-    mx.eval(output_ids, logits, confidence)
-    assert output_ids.shape == (1, 3)
+    sampler = lambda logits: mx.argmax(logits, axis=-1)
+    hidden = drafter._hidden(mx.array([[3, 5]]), main_hidden, cache)
+    mx.eval(hidden)
+    assert hidden.shape == (1, 2, 16)
+    logits = drafter._logits(hidden)
+    mx.eval(logits)
     assert logits.shape == (1, 2, 64)
-    assert confidence.shape == (1, 2)
-    assert output_ids[0, 0].item() == 3
-    assert bool(mx.all(mx.isfinite(logits)))
-    assert bool(mx.all(mx.isfinite(confidence)))
+    output_ids = drafter.draft_block(bonus, main_hidden, cache, 3, sampler)
+    mx.eval(output_ids)
+    assert output_ids.shape == (1, 2)
+    assert bool(mx.all(output_ids >= 0))
+    assert bool(mx.all(output_ids < 64))
 
 
 def test_deepseek_v41_drafter_sanitize_stacks_experts():
@@ -5667,3 +5672,20 @@ def test_deepseek_v41_drafter_sanitize_stacks_experts():
     assert "stages.0.attn.wq_a.weight" in out
     assert out["stages.0.attn.wo_a.weight"].shape == (1, 4, 4)
     assert not any(".experts.0." in k for k in out)
+
+
+def test_deepseek_v41_drafter_sanitize_markov():
+    from mlx_vlm.speculative.drafters.deepseek_v41_dspark.deepseek_v41_dspark import (
+        DeepseekV41DsparkDraftModel,
+    )
+
+    drafter = DeepseekV41DsparkDraftModel(_tiny_v41_dspark_config())
+    weights = {
+        "markov_head.embed.weight": mx.zeros((8, 2)),
+        "markov_head.head.weight": mx.zeros((4, 8)),
+        "confidence_head.proj.weight": mx.zeros((1, 12)),
+    }
+    out = drafter.sanitize(weights)
+    assert "markov_head.markov_w1.weight" in out
+    assert "markov_head.markov_w2.weight" in out
+    assert not any(k.startswith("confidence_head.") for k in out)

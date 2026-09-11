@@ -83,18 +83,18 @@ class DeepseekV41DsparkSplitter(MTPSplitter):
 
     def extra_config(self, text_config: dict) -> dict:
         dspark_block = int(text_config.get("dspark_block_size", 0) or 0)
+        targets = list(text_config.get("dspark_target_layer_ids", []) or [])
+        noise = int(text_config.get("dspark_noise_token_id", 0) or 0)
+        rank = int(text_config.get("dspark_markov_rank", 256) or 256)
         return {
             "n_mtp_layers": self._n_mtp_layers,
             "dspark_block_size": dspark_block,
-            "dspark_noise_token_id": int(
-                text_config.get("dspark_noise_token_id", 0) or 0
-            ),
-            "dspark_target_layer_ids": list(
-                text_config.get("dspark_target_layer_ids", []) or []
-            ),
-            "dspark_markov_rank": int(
-                text_config.get("dspark_markov_rank", 256) or 256
-            ),
+            "dspark_noise_token_id": noise,
+            "dspark_target_layer_ids": targets,
+            "dspark_markov_rank": rank,
+            "target_layer_ids": targets,
+            "mask_token_id": noise,
+            "markov_rank": rank,
             "block_size": (dspark_block + 1) if dspark_block else 0,
         }
 
