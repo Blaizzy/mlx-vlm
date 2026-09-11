@@ -20020,3 +20020,265 @@ class TestSpark2_5Model(unittest.TestCase):
         weights = {"model.embedding.weight": mx.zeros((128, 64))}
         sanitized = model.sanitize(weights)
         self.assertIn("language_model.model.embedding.weight", sanitized)
+
+
+class TestServerRequestPreparation(unittest.TestCase):
+    def test_chat_preserves_source_and_tool_reasoning_metadata(self):
+        import copy
+
+        from mlx_vlm.server.request_preparation import normalize_chat_input
+        from mlx_vlm.server.schemas import ChatRequest
+
+        request = ChatRequest(
+            model="test",
+            messages=[
+                {"role": "system", "content": "Keep exact paths."},
+                {"role": "user", "content": "Excerpt: café /src/app.py:42"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "Inspect the file first.",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read",
+                                "arguments": '{"path":"/src/app.py"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "name": "read",
+                    "content": "exact result",
+                },
+            ],
+        )
+        before = copy.deepcopy(request.model_dump())
+        source = normalize_chat_input(request)
+        self.assertEqual(request.model_dump(), before)
+        self.assertEqual(
+            [m["role"] for m in source.messages],
+            ["system", "user", "assistant", "tool"],
+        )
+        self.assertEqual(source.messages[1]["content"], "Excerpt: café /src/app.py:42")
+        self.assertEqual(
+            source.messages[2]["reasoning_content"], "Inspect the file first."
+        )
+        self.assertEqual(source.messages[2]["reasoning"], "Inspect the file first.")
+        self.assertEqual(
+            source.messages[2]["tool_calls"][0]["function"]["arguments"],
+            {"path": "/src/app.py"},
+        )
+        self.assertEqual(
+            source.messages[3],
+            {
+                "role": "tool",
+                "content": "exact result",
+                "tool_call_id": "call_1",
+                "name": "read",
+            },
+        )
+
+    def test_media_order_and_resize_survive_preparation(self):
+        import base64
+        from unittest.mock import MagicMock
+
+        from mlx_vlm.server.generation import GenerationArguments
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            prepare_prompt,
+        )
+        from mlx_vlm.server.schemas import ChatRequest
+
+        request = ChatRequest(
+            model="test",
+            resize_shape=[224],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Compare."},
+                        {"type": "image_url", "image_url": {"url": "first.png"}},
+                        {"type": "input_image", "image_url": "second.png"},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": base64.b64encode(b"audio bytes").decode(),
+                                "format": "wav",
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+        source = normalize_chat_input(request)
+        render = MagicMock(return_value="rendered")
+        prepared = prepare_prompt(
+            source,
+            SimpleNamespace(),
+            SimpleNamespace(),
+            GenerationArguments(),
+            render=render,
+        )
+        self.assertEqual(prepared.images, ["first.png", "second.png"])
+        self.assertEqual(prepared.audio[0].getvalue(), b"audio bytes")
+        self.assertEqual(prepared.generation_kwargs, {"resize_shape": (224, 224)})
+        self.assertEqual(render.call_args.kwargs["num_images"], 2)
+        self.assertEqual(render.call_args.kwargs["num_audios"], 1)
+        self.assertEqual(prepared.prompt, "rendered")
+
+    def test_video_fallback_does_not_mutate_source(self):
+        from unittest.mock import MagicMock, patch
+
+        from mlx_vlm.server.generation import GenerationArguments
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            prepare_prompt,
+        )
+        from mlx_vlm.server.schemas import ChatRequest
+
+        source = normalize_chat_input(
+            ChatRequest(
+                model="test",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe."},
+                            {"type": "input_video", "video_url": "clip.mp4"},
+                        ],
+                    }
+                ],
+            )
+        )
+        render = MagicMock(return_value="rendered")
+        resolution = SimpleNamespace(
+            images=["frame1", "frame2"],
+            videos=[],
+            used_fallback=True,
+            selected_count=2,
+            sampled_count=2,
+        )
+        with patch(
+            "mlx_vlm.server.request_preparation.resolve_video_inputs",
+            return_value=resolution,
+        ) as resolve:
+            prepared = prepare_prompt(
+                source,
+                SimpleNamespace(),
+                SimpleNamespace(),
+                GenerationArguments(),
+                render=render,
+            )
+        self.assertEqual(source.videos, ["clip.mp4"])
+        self.assertEqual(source.images, [])
+        self.assertEqual(prepared.images, ["frame1", "frame2"])
+        self.assertEqual(prepared.videos, [])
+        self.assertEqual(render.call_args.kwargs["num_images"], 2)
+        self.assertIsNone(render.call_args.kwargs["video"])
+        self.assertEqual(resolve.call_args.kwargs["fps"], 2.0)
+        self.assertEqual(resolve.call_args.kwargs["max_frames"], 16)
+
+    def test_responses_preserves_existing_instruction_and_tool_item_semantics(self):
+        import copy
+
+        from mlx_vlm.server.request_preparation import normalize_responses_input
+        from mlx_vlm.server.responses_state import _normalize_response_input
+        from mlx_vlm.server.schemas import OpenAIRequest
+
+        request = OpenAIRequest(
+            model="test",
+            instructions="Primary.",
+            input=[
+                {"role": "system", "content": "Secondary."},
+                {"role": "user", "content": "Read."},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read",
+                    "arguments": '{"path":"a"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "file contents",
+                },
+            ],
+            tools=[
+                {"type": "function", "name": "read", "parameters": {"type": "object"}}
+            ],
+        )
+        items = _normalize_response_input(request.input)
+        before = copy.deepcopy(items)
+        source, instructions, registry = normalize_responses_input(request, items)
+        self.assertEqual(items, before)
+        self.assertEqual(instructions, "Primary.\n\nSecondary.")
+        self.assertEqual(
+            source.messages[0], {"role": "system", "content": instructions}
+        )
+        self.assertEqual(source.messages[2]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(
+            source.messages[3],
+            {"role": "tool", "tool_call_id": "call_1", "content": "file contents"},
+        )
+        self.assertEqual(source.tools[0]["function"]["name"], "read")
+        self.assertEqual(registry, {"read": "function"})
+
+    def test_equivalent_text_inputs_share_rendered_prompt_and_append_prefix(self):
+        from mlx_vlm.server.request_normalization import _build_gen_args
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            normalize_responses_input,
+            prepare_prompt,
+        )
+        from mlx_vlm.server.responses_state import _normalize_response_input
+        from mlx_vlm.server.schemas import ChatRequest, OpenAIRequest
+
+        class Processor:
+            chat_template = "test"
+
+            def apply_chat_template(self, messages, **kwargs):
+                return (
+                    "".join(
+                        f"<{m['role']}>{m['content']}</{m['role']}>" for m in messages
+                    )
+                    + "<assistant>"
+                )
+
+        processor = Processor()
+        config = SimpleNamespace(model_type="test")
+        messages = [
+            {"role": "system", "content": "Instructions."},
+            {"role": "user", "content": "Exact document excerpt."},
+            {"role": "assistant", "content": "Done."},
+        ]
+        chat = ChatRequest(model="test", messages=messages, enable_thinking=False)
+        response = OpenAIRequest(
+            model="test",
+            instructions="Instructions.",
+            input=messages[1:],
+            enable_thinking=False,
+        )
+        chat_source = normalize_chat_input(chat)
+        response_source, _, _ = normalize_responses_input(
+            response, _normalize_response_input(response.input)
+        )
+        chat_args = _build_gen_args(chat, processor)
+        response_args = _build_gen_args(response, processor)
+        expected = "<system>Instructions.</system><user>Exact document excerpt.</user><assistant>Done.</assistant><assistant>"
+        before = prepare_prompt(chat_source, processor, config, chat_args)
+        self.assertEqual(before.prompt, expected)
+        self.assertEqual(
+            prepare_prompt(response_source, processor, config, response_args).prompt,
+            expected,
+        )
+        chat_source.messages.append(
+            {"role": "user", "content": "Summarize the preceding conversation."}
+        )
+        after = prepare_prompt(chat_source, processor, config, chat_args)
+        self.assertTrue(after.prompt.startswith(expected.removesuffix("<assistant>")))
+        self.assertEqual(chat.messages[-1].content, "Done.")
