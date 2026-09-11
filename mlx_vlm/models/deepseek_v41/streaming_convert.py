@@ -94,16 +94,17 @@ def convert_shard(source_file: Path, profile: dict):
     out = {}
     with safe_open(str(source_file), framework="mlx") as f:
         keys = list(f.keys())
-        try:
-            probe = mx.array(f.get_tensor(keys[0]))
-            del probe
-            load = lambda key: mx.array(f.get_tensor(key))
-            close = lambda: None
-        except (AttributeError, RuntimeError, TypeError):
-            store = dict(mx.load(str(source_file)))
-            keys = list(store.keys())
-            load = store.get
-            close = store.clear
+        store = None
+
+        def load(key):
+            nonlocal store
+            try:
+                return mx.array(f.get_tensor(key))
+            except (AttributeError, RuntimeError, TypeError):
+                if store is None:
+                    store = dict(mx.load(str(source_file)))
+                return store.get(key)
+
         for key in keys:
             if key.endswith(".scale"):
                 continue
@@ -138,7 +139,8 @@ def convert_shard(source_file: Path, profile: dict):
                 raise ValueError(f"Unroutable tensor {key} dtype {tensor.dtype}.")
             del tensor
             mx.clear_cache()
-        close()
+        if store is not None:
+            store.clear()
     gc.collect()
     return out
 
