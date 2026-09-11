@@ -286,6 +286,7 @@ class DeepseekV41Processor(ProcessorMixin):
         self.tokenizer.chat_template = value
 
     def apply_chat_template(self, *args, **kwargs):
+        kwargs.setdefault("tokenize", False)
         return self.tokenizer.apply_chat_template(*args, **kwargs)
 
     def encode(self, *args, **kwargs):

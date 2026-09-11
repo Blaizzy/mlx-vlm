@@ -20457,6 +20457,24 @@ class TestDeepseekV41Processing(unittest.TestCase):
         ):
             self.assertIn(marker, template)
 
+    def test_deepseek_v41_processor_template_returns_str(self):
+        from mlx_vlm.models.deepseek_v41 import processing_deepseek_v41 as proc
+
+        seen = {}
+
+        class StubTokenizer:
+            chat_template = None
+
+            def apply_chat_template(self, *args, **kwargs):
+                seen.update(kwargs)
+                return "rendered"
+
+        processor = proc.DeepseekV41Processor.__new__(proc.DeepseekV41Processor)
+        processor.tokenizer = StubTokenizer()
+        out = processor.apply_chat_template([], add_generation_prompt=True)
+        self.assertEqual(out, "rendered")
+        self.assertFalse(seen.get("tokenize", True))
+
 
 class TestDeepseekV41Generate(unittest.TestCase):
     @staticmethod
