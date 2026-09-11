@@ -20699,3 +20699,61 @@ class TestDeepseekV41Sanitize(unittest.TestCase):
         self.assertEqual(set(out), {"language_model.head.weight"})
         self.assertEqual(out["language_model.head.weight"].dtype, mx.float32)
         self.assertEqual(out["language_model.head.weight"].shape, (64, 128))
+
+
+class TestDeepseekV41StreamingConvert(unittest.TestCase):
+    @staticmethod
+    def _synthetic_shard(path):
+        pass
+
+        weights = {
+            "layers.0.attn.wq_a.weight": mx.full((64, 64), 0x38, dtype=mx.uint8),
+            "layers.0.attn.wq_a.scale": mx.full((2, 2), 127, dtype=mx.uint8),
+            "layers.0.ffn.experts.0.w1.weight": mx.full((8, 32), 0x22, dtype=mx.uint8),
+            "layers.0.ffn.experts.0.w1.scale": mx.full((8, 2), 128, dtype=mx.uint8),
+            "layers.1.engram.embed.weight": mx.full((4, 64), 0x38, dtype=mx.uint8),
+            "layers.1.engram.embed.scale": mx.full((4, 2), 127, dtype=mx.uint8),
+            "layers.0.attn_norm.weight": mx.ones((64,)),
+        }
+        mx.save_safetensors(path, weights)
+
+    def test_deepseek_v41_convert_profiles(self):
+        from mlx_vlm.models.deepseek_v41 import streaming_convert as sc
+
+        self.assertEqual(set(sc.PROFILES), {"4bit", "nvfp4", "engram6"})
+        self.assertEqual(sc.PROFILES["4bit"]["expert"], (4, "affine", 64))
+        self.assertEqual(sc.PROFILES["nvfp4"]["expert"], (4, "nvfp4", 16))
+        self.assertEqual(sc.PROFILES["engram6"]["engram"], (6, "affine", 64))
+        recipe = sc.quantization_recipe("4bit")
+        self.assertEqual(recipe, {"group_size": 64, "bits": 4, "mode": "affine"})
+
+    def test_deepseek_v41_convert_shard(self):
+        import tempfile
+
+        from mlx_vlm.models.deepseek_v41 import streaming_convert as sc
+
+        with tempfile.TemporaryDirectory() as tmp:
+            shard = f"{tmp}/shard.safetensors"
+            self._synthetic_shard(shard)
+            out = sc.convert_shard(shard, sc.PROFILES["4bit"])
+            mx.eval(out)
+            self.assertIn("layers.0.attn.wq_a.weight", out)
+            self.assertIn("layers.0.attn.wq_a.scales", out)
+            self.assertIn("layers.0.ffn.experts.0.w1.weight", out)
+            self.assertIn("layers.1.engram.embed.weight", out)
+            self.assertIn("layers.0.attn_norm.weight", out)
+            self.assertTrue(
+                bool(
+                    mx.allclose(
+                        mx.dequantize(
+                            out["layers.0.attn.wq_a.weight"],
+                            out["layers.0.attn.wq_a.scales"],
+                            out["layers.0.attn.wq_a.biases"],
+                            group_size=64,
+                            bits=8,
+                        ),
+                        mx.ones((64, 64)),
+                        atol=0.2,
+                    )
+                )
+            )
