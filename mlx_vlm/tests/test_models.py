@@ -1,6 +1,7 @@
 import importlib
 import inspect
 import math
+import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
@@ -20583,3 +20584,53 @@ class TestDeepseekV41Dequant(unittest.TestCase):
             deepseek_v41.is_fp4_expert("layers.0.ffn.shared_experts.w1.weight")
         )
         self.assertFalse(deepseek_v41.is_fp4_expert("layers.0.attn.wq_a.weight"))
+
+
+class TestDeepseekV41Repackage(unittest.TestCase):
+    def test_deepseek_v41_output_config(self):
+        from mlx_vlm.models.deepseek_v41 import repackage_vontra
+
+        config = repackage_vontra.output_config()
+        self.assertEqual(config["model_type"], "deepseek_v41")
+        self.assertEqual(
+            config["quantization"], {"group_size": 64, "bits": 2, "mode": "affine"}
+        )
+        self.assertEqual(config["hidden_size"], 5120)
+        self.assertEqual(config["n_routed_experts"], 384)
+
+    def test_deepseek_v41_repackage_roundtrip(self):
+        import json
+
+        from mlx_vlm.models.deepseek_v41 import repackage_vontra
+
+        with tempfile.TemporaryDirectory() as source:
+            weights = {
+                "layers.0.attn.wq_a.weight": mx.zeros((8, 8)),
+                "layers.0.attn_norm.weight": mx.zeros((8,)),
+                "embed.weight": mx.zeros((16, 8)),
+                "mtp.0.attn.wq_a.weight": mx.zeros((8, 8)),
+            }
+            mx.save_safetensors(f"{source}/model-00001-of-00001.safetensors", weights)
+            with open(f"{source}/model.safetensors.index.json", "w") as f:
+                json.dump(
+                    {
+                        "metadata": {"total_size": 0},
+                        "weight_map": {
+                            k: "model-00001-of-00001.safetensors" for k in weights
+                        },
+                    },
+                    f,
+                )
+            with tempfile.TemporaryDirectory() as output:
+                out = repackage_vontra.repackage_vontra(source, f"{output}/out")
+                self.assertTrue((out / "config.json").is_file())
+                self.assertTrue((out / "model.safetensors.index.json").is_file())
+                with open(out / "model.safetensors.index.json") as f:
+                    index = json.load(f)
+                self.assertIn(
+                    "language_model.layers.0.attn.wq_a.weight",
+                    index["weight_map"],
+                )
+                self.assertIn("mtp.0.attn.wq_a.weight", index["weight_map"])
+                loaded = dict(mx.load(str(out / "model-00001-of-00001.safetensors")))
+                self.assertIn("language_model.embed_tokens.weight", loaded)
