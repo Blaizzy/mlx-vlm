@@ -20514,3 +20514,72 @@ class TestDeepseekV41Generate(unittest.TestCase):
             self.assertGreaterEqual(token, 0)
             self.assertLess(token, 64)
             self.assertEqual(logprobs.shape, (64,))
+
+
+class TestDeepseekV41Dequant(unittest.TestCase):
+    def test_deepseek_v41_e8m0(self):
+        from mlx_vlm.models import deepseek_v41
+
+        out = deepseek_v41.e8m0_to_float(mx.array([126, 127, 128], dtype=mx.uint8))
+        mx.eval(out)
+        self.assertTrue(bool(mx.allclose(out, mx.array([0.5, 1.0, 2.0]))))
+
+    def test_deepseek_v41_dequant_fp8(self):
+        from mlx_vlm.models import deepseek_v41
+
+        w = mx.full((32, 32), 0x38, dtype=mx.uint8)
+        s = mx.full((1, 1), 127, dtype=mx.uint8)
+        out = deepseek_v41.dequant_fp8(w, s, dtype=mx.float32)
+        mx.eval(out)
+        self.assertTrue(bool(mx.allclose(out, mx.ones((32, 32)))))
+
+        s2 = mx.full((1, 1), 128, dtype=mx.uint8)
+        out2 = deepseek_v41.dequant_fp8(w, s2, dtype=mx.float32)
+        mx.eval(out2)
+        self.assertTrue(bool(mx.allclose(out2, mx.full((32, 32), 2.0))))
+
+    def test_deepseek_v41_dequant_fp8_crops_overhang(self):
+        from mlx_vlm.models import deepseek_v41
+
+        w = mx.full((40, 48), 0x40, dtype=mx.uint8)
+        s = mx.full((2, 2), 127, dtype=mx.uint8)
+        out = deepseek_v41.dequant_fp8(w, s, dtype=mx.float32)
+        mx.eval(out)
+        self.assertEqual(out.shape, (40, 48))
+        self.assertTrue(bool(mx.allclose(out, mx.full((40, 48), 2.0))))
+
+    def test_deepseek_v41_unpack_fp4(self):
+        from mlx_vlm.models import deepseek_v41
+
+        out = deepseek_v41.unpack_fp4(mx.array([[0x21, 0x08]], dtype=mx.uint8))
+        mx.eval(out)
+        self.assertTrue(bool(mx.allclose(out, mx.array([[0.5, 1.0, 0.0, 0.0]]))))
+
+    def test_deepseek_v41_dequant_fp4(self):
+        from mlx_vlm.models import deepseek_v41
+
+        packed = mx.full((2, 32), 0x22, dtype=mx.uint8)
+        scales = mx.full((2, 2), 128, dtype=mx.uint8)
+        out = deepseek_v41.dequant_fp4(packed, scales, dtype=mx.float32)
+        mx.eval(out)
+        self.assertEqual(out.shape, (2, 64))
+        self.assertTrue(bool(mx.allclose(out, mx.full((2, 64), 2.0))))
+
+    def test_deepseek_v41_dequant_fp8_rows(self):
+        from mlx_vlm.models import deepseek_v41
+
+        w = mx.full((2, 64), 0x38, dtype=mx.uint8)
+        s = mx.full((2, 2), 127, dtype=mx.uint8)
+        out = deepseek_v41.dequant_fp8_rows(w, s)
+        mx.eval(out)
+        self.assertEqual(out.shape, (2, 64))
+        self.assertTrue(bool(mx.allclose(out, mx.ones((2, 64)))))
+
+    def test_deepseek_v41_is_fp4_expert(self):
+        from mlx_vlm.models import deepseek_v41
+
+        self.assertTrue(deepseek_v41.is_fp4_expert("layers.0.ffn.experts.3.w1.weight"))
+        self.assertFalse(
+            deepseek_v41.is_fp4_expert("layers.0.ffn.shared_experts.w1.weight")
+        )
+        self.assertFalse(deepseek_v41.is_fp4_expert("layers.0.attn.wq_a.weight"))
