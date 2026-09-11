@@ -134,6 +134,18 @@ class Model(nn.Module):
                         self.config.o_groups, self.config.o_lora_rank, -1
                     )
 
+        head_w = "language_model.head.weight"
+        head_s = "language_model.head.scales"
+        head_b = "language_model.head.biases"
+        if head_s in weights and head_b in weights and head_w in weights:
+            in_dim = weights[head_s].shape[-1] * 64
+            bits = 32 * weights[head_w].shape[-1] // in_dim
+            weights[head_w] = mx.dequantize(
+                weights[head_w], weights[head_s], weights[head_b], 64, bits
+            ).astype(mx.float32)
+            del weights[head_s]
+            del weights[head_b]
+
         return weights
 
     @property

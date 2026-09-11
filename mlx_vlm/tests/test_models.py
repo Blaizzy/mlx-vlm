@@ -20681,3 +20681,21 @@ class TestDeepseekV41Sanitize(unittest.TestCase):
             out["language_model.layers.0.attn.wo_a.weight"].shape, (2, 4, 16)
         )
         self.assertFalse(any(".experts.0." in k for k in out))
+
+    def test_deepseek_v41_sanitize_dequantizes_head(self):
+        from mlx_vlm.models import deepseek_v41
+
+        model = deepseek_v41.Model(self._tiny_config())
+        wq, scales, biases = mx.quantize(
+            mx.random.normal((64, 128)), group_size=64, bits=4, mode="affine"
+        )
+        out = model.sanitize(
+            {
+                "head.weight": wq,
+                "head.scales": scales,
+                "head.biases": biases,
+            }
+        )
+        self.assertEqual(set(out), {"language_model.head.weight"})
+        self.assertEqual(out["language_model.head.weight"].dtype, mx.float32)
+        self.assertEqual(out["language_model.head.weight"].shape, (64, 128))
