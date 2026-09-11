@@ -5587,3 +5587,65 @@ def test_laguna_dflash_config_derives_sliding_windows_when_absent():
     config = DFlashConfig.from_dict(params)
 
     assert config.sliding_windows == [512, 512]
+
+
+def _tiny_v41_text_config():
+    from mlx_vlm.models import deepseek_v41
+
+    return deepseek_v41.ModelConfig(
+        hidden_size=16,
+        vocab_size=64,
+        num_attention_heads=2,
+        head_dim=8,
+        qk_rope_head_dim=4,
+        q_lora_rank=8,
+        o_lora_rank=4,
+        o_groups=1,
+        moe_intermediate_size=8,
+        dspark_n_routed_experts=4,
+        dspark_num_experts_per_tok=2,
+        hc_mult=2,
+        hc_sinkhorn_iters=2,
+        engram_layer_ids=[],
+    )
+
+
+def _tiny_v41_dspark_config(text_config=None):
+    from mlx_vlm.speculative.drafters.deepseek_v41_dspark.config import (
+        DeepseekV41DsparkConfig,
+    )
+
+    return DeepseekV41DsparkConfig(
+        text_config=text_config or _tiny_v41_text_config(),
+        n_mtp_layers=2,
+        dspark_block_size=2,
+        dspark_noise_token_id=5,
+        dspark_target_layer_ids=[0],
+        dspark_markov_rank=4,
+    )
+
+
+def test_deepseek_v41_dspark_draft_block():
+    from mlx_vlm.models import deepseek_v41
+    from mlx_vlm.speculative.drafters.deepseek_v41_dspark.deepseek_v41_dspark import (
+        DeepseekV41DsparkDraftModel,
+    )
+
+    text_config = _tiny_v41_text_config()
+    target = deepseek_v41.Model(text_config)
+    mx.eval(target.parameters())
+
+    drafter = DeepseekV41DsparkDraftModel(_tiny_v41_dspark_config(text_config))
+    mx.eval(drafter.parameters())
+    drafter.bind(target)
+
+    main_hidden = mx.random.normal((1, 4, 16))
+    bonus = mx.array([3])
+    output_ids, logits, confidence = drafter.draft_block(main_hidden, bonus)
+    mx.eval(output_ids, logits, confidence)
+    assert output_ids.shape == (1, 3)
+    assert logits.shape == (1, 2, 64)
+    assert confidence.shape == (1, 2)
+    assert output_ids[0, 0].item() == 3
+    assert bool(mx.all(mx.isfinite(logits)))
+    assert bool(mx.all(mx.isfinite(confidence)))
