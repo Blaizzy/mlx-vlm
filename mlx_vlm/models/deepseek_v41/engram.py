@@ -235,9 +235,10 @@ class NgramHashState(nn.Module):
             mx.arange(start_pos, start_pos + seqlen), (batch, seqlen)
         )
         tokens, blocked = [], mx.zeros_like(positions, dtype=mx.bool_)
+        rows = mx.arange(batch)[:, None]
         for shift in range(self.layout.max_ngram_size):
             idx = mx.clip(positions - shift, 0, cur.shape[1] - 1)
-            source = mx.take(cur, idx, axis=1)
+            source = cur[rows, idx]
             blocked = blocked | (positions < shift) | (source == self.DEAD)
             tokens.append(mx.where(blocked, self.pad_id, source))
         tokens = mx.stack(tokens, axis=-1)

@@ -20840,3 +20840,42 @@ class TestDeepseekV41TokenMap(unittest.TestCase):
         lookup_wrapped, _ = engram_module.build_compressed_token_map(Wrapper(raw))
         lookup_raw, _ = engram_module.build_compressed_token_map(raw)
         self.assertEqual(lookup_wrapped, lookup_raw)
+
+    def test_deepseek_v41_hash_state_shapes(self):
+        from mlx_vlm.models import deepseek_v41
+        from mlx_vlm.models.deepseek_v41 import engram as engram_module
+
+        config = deepseek_v41.ModelConfig(
+            engram_layer_ids=[0],
+            engram_num_embeddings=[1024],
+            engram_max_ngram_size=3,
+            engram_vocab_size=64,
+            engram_n_heads=2,
+            engram_head_dim=8,
+            engram_compressed_vocab_size=7,
+        )
+        layout = engram_module.EngramLayout.from_config(config)
+        state = engram_module.NgramHashState.__new__(engram_module.NgramHashState)
+        state.layout = layout
+        state._primes = mx.array(layout.primes, dtype=mx.int64)
+        flat = [
+            [p for per_ngram in layer for p in per_ngram] for layer in layout.primes
+        ]
+        import numpy as np
+
+        state._offsets = mx.array(
+            np.array([np.cumsum([0, *sizes[:-1]]) for sizes in flat]), dtype=mx.int64
+        )
+        state._multipliers = engram_module.compute_hash_multipliers(
+            layout.layer_ids, layout.max_ngram_size, 7
+        )
+        state._token_map = mx.arange(64, dtype=mx.int64) % 7
+        state.pad_id = 0
+        state._cache = None
+
+        prefill = state(mx.array([[1, 2, 3, 4]]), 0, None)
+        mx.eval(prefill)
+        self.assertEqual(prefill.shape, (1, 4, 1, 4))
+        step = state(mx.array([[5]]), 4, None)
+        mx.eval(step)
+        self.assertEqual(step.shape, (1, 1, 1, 4))
