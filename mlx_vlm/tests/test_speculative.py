@@ -5656,11 +5656,14 @@ def test_deepseek_v41_drafter_sanitize_stacks_experts():
         DeepseekV41DsparkDraftModel,
     )
 
+    drafter = DeepseekV41DsparkDraftModel(_tiny_v41_dspark_config())
     weights = {f"mtp.0.ffn.experts.{e}.w1.weight": mx.zeros((2, 2)) for e in range(4)}
     weights["mtp.0.ffn.shared_experts.w1.weight"] = mx.zeros((2, 2))
     weights["mtp.0.attn.wq_a.weight"] = mx.zeros((2, 2))
-    out = DeepseekV41DsparkDraftModel.sanitize(weights)
+    weights["mtp.0.attn.wo_a.weight"] = mx.zeros((2, 8))
+    out = drafter.sanitize(weights)
     assert out["stages.0.ffn.switch_mlp.gate_proj.weight"].shape == (4, 2, 2)
     assert "stages.0.ffn.shared_experts.gate_proj.weight" in out
     assert "stages.0.attn.wq_a.weight" in out
+    assert out["stages.0.attn.wo_a.weight"].shape == (1, 4, 4)
     assert not any(".experts.0." in k for k in out)

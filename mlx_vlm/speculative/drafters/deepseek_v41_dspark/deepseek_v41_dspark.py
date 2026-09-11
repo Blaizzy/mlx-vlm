@@ -346,8 +346,7 @@ class DeepseekV41DsparkDraftModel(nn.Module):
             x, pre_mix = stage(x, main_x, pre_mix, block_offset)
         return self._forward_head(x, pre_mix, bonus_token, sampler, token_dtype)
 
-    @staticmethod
-    def sanitize(weights: dict) -> dict:
+    def sanitize(self, weights: dict) -> dict:
         """Map the ``mtp.<stage>.*`` checkpoint layout onto ``stages.<i>.*``,
         stacking per-expert tensors for SwitchGLU like the backbone."""
         import re
@@ -356,6 +355,7 @@ class DeepseekV41DsparkDraftModel(nn.Module):
         from .split import sanitize_dspark_weights
 
         weights = sanitize_dspark_weights(weights)
+        text_config = self.config.text_config
         stages = {
             int(m.group(1))
             for k in weights
@@ -376,6 +376,16 @@ class DeepseekV41DsparkDraftModel(nn.Module):
                 + 1
             )
             weights = sanitize_moe_weights(weights, prefix, n_routed)
+            wo_prefix = f"stages.{stage}.attn.wo_a"
+            for key in (
+                f"{wo_prefix}.weight",
+                f"{wo_prefix}.scales",
+                f"{wo_prefix}.biases",
+            ):
+                if key in weights and weights[key].ndim == 2:
+                    weights[key] = weights[key].reshape(
+                        text_config.o_groups, text_config.o_lora_rank, -1
+                    )
         return weights
 
 
