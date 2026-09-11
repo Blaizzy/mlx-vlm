@@ -20775,3 +20775,34 @@ class TestDeepseekV41StreamingConvert(unittest.TestCase):
                     )
                 )
             )
+
+
+class TestDeepseekV41ScanOutput(unittest.TestCase):
+    def test_deepseek_v41_scan_output_rebuilds_index(self):
+        import tempfile
+
+        from mlx_vlm.models.deepseek_v41 import streaming_convert as sc
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = f"{tmp}/out"
+            import os
+
+            os.mkdir(out)
+            mx.save_safetensors(
+                f"{out}/model-00001-of-00048.safetensors",
+                {"layers.0.attn_norm.weight": mx.ones((8,))},
+            )
+            mx.save_safetensors(
+                f"{out}/model-00002-of-00048.safetensors",
+                {"layers.1.attn_norm.weight": mx.zeros((8,))},
+            )
+            weight_map, total_size, output_index = sc.scan_output(out)
+            self.assertEqual(
+                weight_map,
+                {
+                    "layers.0.attn_norm.weight": "model-00001-of-00048.safetensors",
+                    "layers.1.attn_norm.weight": "model-00002-of-00048.safetensors",
+                },
+            )
+            self.assertEqual(total_size, 2 * 8 * 4)
+            self.assertEqual(output_index, 2)

@@ -19,6 +19,8 @@ head/embed stay bf16. Giant engram tables process in row chunks.
 import argparse
 import gc
 import json
+import re
+import struct
 from pathlib import Path
 
 import mlx.core as mx
@@ -27,6 +29,55 @@ from safetensors import safe_open
 
 from .config import ModelConfig
 from .dequant import dequant_fp4, dequant_fp8, dequant_fp8_rows, is_fp4_expert
+
+_DTYPE_BYTES = {
+    "BF16": 2,
+    "F16": 2,
+    "F32": 4,
+    "F64": 8,
+    "U8": 1,
+    "I8": 1,
+    "U32": 4,
+    "I32": 4,
+    "U64": 8,
+    "I64": 8,
+    "BOOL": 1,
+}
+
+
+def _read_header(path: Path):
+    with open(path, "rb") as f:
+        (hlen,) = struct.unpack("<Q", f.read(8))
+        return json.loads(f.read(hlen))
+
+
+def scan_output(output_path: Path):
+    """Rebuild (weight_map, total_size, output_index) from existing shards.
+
+    Makes resume complete: already-converted shards are never reprocessed, but
+    their keys still land in the final index.
+    """
+    output_path = Path(output_path)
+    weight_map, total_size, output_index = {}, 0, 0
+    for shard in sorted(output_path.glob("model-*.safetensors")):
+        match = re.match(r"model-(\d+)-of-\d+\.safetensors", shard.name)
+        if match:
+            output_index = max(output_index, int(match.group(1)))
+        try:
+            header = _read_header(shard)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        for key, meta in header.items():
+            if key == "__metadata__":
+                continue
+            shape = meta["shape"]
+            nbytes = _DTYPE_BYTES.get(meta.get("dtype", ""), 0)
+            for dim in shape:
+                nbytes *= dim
+            weight_map[key] = shard.name
+            total_size += nbytes
+    return weight_map, total_size, output_index
+
 
 SOURCE_REPO = "deepseek-ai/DeepSeek-V4.1-Flash"
 SHARD_SIZE_BYTES = 5 * 1024**3
@@ -199,6 +250,7 @@ def stream_convert(
     output_index = 0
     weight_map: dict[str, str] = {}
     total_size = 0
+    weight_map, total_size, output_index = scan_output(output_path)
 
     def flush():
         nonlocal output_index, total_size, pending, pending_bytes
