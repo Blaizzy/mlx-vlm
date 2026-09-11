@@ -29,6 +29,20 @@ def find_next_prime(start: int, seen_primes: set) -> int:
     return candidate
 
 
+def _raw_backend(tokenizer):
+    """Unwrap to the raw `tokenizers` backend.
+
+    HF wrappers (including transformers 5.x `TokenizersBackend`) report
+    different lengths and decode paths than the raw backend the reference
+    builds the map with; hashing must use the raw object to match.
+    """
+    for attr in ("backend_tokenizer", "_tokenizer"):
+        backend = getattr(tokenizer, attr, None)
+        if backend is not None and hasattr(backend, "decode"):
+            return backend
+    return tokenizer
+
+
 def build_compressed_token_map(tokenizer):
     """Map every token id onto a smaller id space where tokens that normalize alike collapse together.
 
@@ -38,7 +52,7 @@ def build_compressed_token_map(tokenizer):
     """
     from tokenizers import Regex, normalizers
 
-    sentinel = ""
+    sentinel = ""
     normalizer = normalizers.Sequence(
         [
             normalizers.NFKC(),
@@ -52,10 +66,14 @@ def build_compressed_token_map(tokenizer):
         ]
     )
 
-    backend = tokenizer.backend_tokenizer
+    backend = getattr(tokenizer, "backend_tokenizer", None) or _raw_backend(tokenizer)
+    try:
+        n_tokens = len(tokenizer)
+    except TypeError:
+        n_tokens = backend.get_vocab_size()
     key_to_new = {}
-    lookup = [0] * len(tokenizer)
-    for token_id in range(len(tokenizer)):
+    lookup = [0] * n_tokens
+    for token_id in range(n_tokens):
         text = backend.decode([token_id], skip_special_tokens=False)
         if "�" in text:
             key = backend.id_to_token(token_id)

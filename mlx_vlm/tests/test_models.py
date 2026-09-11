@@ -20806,3 +20806,37 @@ class TestDeepseekV41ScanOutput(unittest.TestCase):
             )
             self.assertEqual(total_size, 2 * 8 * 4)
             self.assertEqual(output_index, 2)
+
+
+class TestDeepseekV41TokenMap(unittest.TestCase):
+    @staticmethod
+    def _wordlevel_tokenizer():
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import Whitespace
+
+        vocab = {"[UNK]": 0, "Hello": 1, "hello": 2, " THE": 3, "the": 4, "world": 5}
+        tokenizer = Tokenizer(WordLevel(vocab=vocab, unk_token="[UNK]"))
+        tokenizer.pre_tokenizer = Whitespace()
+        return tokenizer
+
+    def test_deepseek_v41_token_map_collapses_case(self):
+        from mlx_vlm.models.deepseek_v41 import engram as engram_module
+
+        tokenizer = self._wordlevel_tokenizer()
+        lookup, size = engram_module.build_compressed_token_map(tokenizer)
+        self.assertEqual(len(lookup), tokenizer.get_vocab_size())
+        self.assertEqual(lookup[1], lookup[2])
+        self.assertLessEqual(size, tokenizer.get_vocab_size())
+
+    def test_deepseek_v41_token_map_unwraps_wrapper(self):
+        from mlx_vlm.models.deepseek_v41 import engram as engram_module
+
+        class Wrapper:
+            def __init__(self, backend):
+                self._tokenizer = backend
+
+        raw = self._wordlevel_tokenizer()
+        lookup_wrapped, _ = engram_module.build_compressed_token_map(Wrapper(raw))
+        lookup_raw, _ = engram_module.build_compressed_token_map(raw)
+        self.assertEqual(lookup_wrapped, lookup_raw)
