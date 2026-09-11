@@ -1,6 +1,6 @@
 import math
 from functools import lru_cache
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -952,6 +952,7 @@ class LanguageModel(nn.Module):
         engram_hashes: Optional[mx.array] = None,
         inputs: Optional[mx.array] = None,
         n_to_process: Optional[int] = None,
+        capture_layer_ids: Optional[List[int]] = None,
     ) -> LanguageModelOutput:
         """Extra `inputs`/`n_to_process` are generate-protocol passengers.
 
@@ -973,6 +974,9 @@ class LanguageModel(nn.Module):
             (batch, seqlen, self.config.hc_mult, self.config.hidden_size),
         )
         main_hiddens = []
+        capture_ids = (
+            self.target_layer_ids if capture_layer_ids is None else capture_layer_ids
+        )
         pre_mix = make_identity_pre_mix(batch, seqlen, self.config.hc_mult)
         shared = entry.shared
         for i, layer in enumerate(self.layers):
@@ -982,7 +986,7 @@ class LanguageModel(nn.Module):
                     engram_hashes[:, :, layer.engram.layer_hash_index, :],
                     None if image_mask is None else ~image_mask,
                 )
-            if i in self.target_layer_ids:
+            if i in capture_ids:
                 main_hiddens.append(h.mean(axis=2))
             h, pre_mix = layer(h, start_pos, pre_mix, image_mask, shared)
         h = DeepseekV41Block.hc_pre(h, pre_mix)
