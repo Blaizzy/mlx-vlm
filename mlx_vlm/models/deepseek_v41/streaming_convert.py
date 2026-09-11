@@ -112,7 +112,7 @@ def convert_shard(source_file: Path, profile: dict):
             if tensor is None:
                 continue
             if "engram.embed" in key and tensor.shape[0] > ROW_CHUNK:
-                scale_all = load(f"{key}.scale")
+                scale_all = load(f"{key[:-len('.weight')]}.scale")
                 merged = {}
                 for start in range(0, tensor.shape[0], ROW_CHUNK):
                     end = min(start + ROW_CHUNK, tensor.shape[0])
