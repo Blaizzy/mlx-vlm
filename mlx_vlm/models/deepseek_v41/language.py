@@ -573,6 +573,9 @@ class DeepseekV41Attention(nn.Module):
                 self._compress_cache = cache
                 shared.compress_kv = cache
         compress_len = (start_pos + seqlen) // ratio
+        if compress_len == 0:
+            pool = mx.zeros((batch, 0, self.head_dim), dtype=x.dtype)
+            return pool, mx.zeros((batch, seqlen, 0), dtype=mx.int32)
         pool = shared.compress_kv[:batch, :compress_len]
         if self.is_index_source:
             idxs = self.indexer(x, qr, latent, start_pos, 0, shared)
