@@ -4,6 +4,8 @@ from enum import Enum
 from functools import partial
 from typing import Any, Dict, List, Union
 
+from jinja2.exceptions import TemplateError
+
 
 class MessageFormat(Enum):
     """Enum for different message format types."""
@@ -108,10 +110,11 @@ MODEL_CONFIG = {
     "florence2": MessageFormat.PROMPT_ONLY,
     "plamo2vl": MessageFormat.PROMPT_ONLY,
     "molmo": MessageFormat.TEXT_ONLY,
+    "moondream1": MessageFormat.TEXT_ONLY,
     "moondream2": MessageFormat.PROMPT_ONLY,
-    "moondream3": MessageFormat.PROMPT_ONLY,
+    "moondream3": MessageFormat.TEXT_ONLY,
     "falcon_ocr": MessageFormat.PROMPT_ONLY,
-    "paligemma": MessageFormat.PROMPT_WITH_IMAGE_TOKEN,
+    "paligemma": MessageFormat.IMAGE_TOKEN,
     "laguna": MessageFormat.TEXT_ONLY,
     "nemotron_labs_diffusion": MessageFormat.TEXT_ONLY,
     "deepseek_v4": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -121,10 +124,7 @@ MODEL_CONFIG = {
 
 # Models that don't support multi-image
 SINGLE_IMAGE_ONLY_MODELS = {
-    "llava_next",
-    "llava-qwen2",
     "bunny-llama",
-    "paligemma",
     "multi_modality",
     "mllama",
     "falcon_ocr",
@@ -600,6 +600,76 @@ def get_message_json(
     )
 
 
+def _coalesce_leading_system_text(messages):
+    end = 0
+    texts = []
+    for message in messages:
+        if (
+            not isinstance(message, dict)
+            or set(message) != {"role", "content"}
+            or message["role"] != "system"
+        ):
+            break
+        content = message["content"]
+        if isinstance(content, list):
+            if not all(
+                isinstance(part, dict)
+                and (
+                    set(part) == {"type", "text"}
+                    or (
+                        set(part) == {"type", "text", "content"}
+                        and part["content"] == part["text"]
+                    )
+                )
+                and part["type"] == "text"
+                and isinstance(part["text"], str)
+                for part in content
+            ):
+                break
+            content = " ".join(part["text"] for part in content)
+        if not isinstance(content, str):
+            break
+        texts.append(content)
+        end += 1
+    if end < 2:
+        return messages
+    return [{"role": "system", "content": "\n\n".join(texts)}, *messages[end:]]
+
+
+def _string_content_messages(messages, image_token):
+    result = []
+    changed = False
+    for message in messages:
+        if not isinstance(message, dict):
+            return messages
+        content = message.get("content")
+        if not isinstance(content, list):
+            result.append(message)
+            continue
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part == {"type": "image"}:
+                parts.append(image_token)
+            elif (
+                isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+                and (
+                    set(part) == {"type", "text"}
+                    or (
+                        set(part) == {"type", "text", "content"}
+                        and part["content"] == part["text"]
+                    )
+                )
+            ):
+                parts.append(part["text"])
+            else:
+                return messages
+        result.append({**message, "content": "\n".join(parts)})
+        changed = True
+    return result if changed else messages
+
+
 def get_chat_template(
     processor,
     messages: List[Dict[str, Any]],
@@ -705,6 +775,7 @@ def get_chat_template(
             if isinstance(message, dict):
                 normalized.append(
                     {
+                        **message,
                         "role": message.get("role", "user"),
                         "content": _flatten_content(
                             message.get("content", ""), image_token, video_token
@@ -718,10 +789,19 @@ def get_chat_template(
         if not normalized:
             return ""
 
-        if len(normalized) == 1 and normalized[0]["role"] == "user":
+        if (
+            len(normalized) == 1
+            and normalized[0]["role"] == "user"
+            and len(normalized[0]) == 2
+            and not kwargs.get("tools")
+        ):
             return normalized[0]["content"]
 
         lines = []
+        if kwargs.get("tools"):
+            lines.append(
+                f"Available tools: {json.dumps(kwargs['tools'], ensure_ascii=False)}"
+            )
         for message in normalized:
             role = message.get("role", "user")
             content = message.get("content", "")
@@ -730,6 +810,15 @@ def get_chat_template(
                 lines.append(f"{prefix}: {content}" if content else f"{prefix}:")
             else:
                 lines.append(content if content else "")
+            metadata = {
+                key: value
+                for key, value in message.items()
+                if key not in ("role", "content")
+            }
+            if metadata:
+                lines.append(
+                    f"{role.capitalize()} metadata: {json.dumps(metadata, ensure_ascii=False)}"
+                )
 
         if add_generation_prompt:
             lines.append("Assistant:")
@@ -827,6 +916,32 @@ def get_chat_template(
                 add_generation_prompt=add_generation_prompt,
                 **template_kwargs,
             )
+        except TypeError as error:
+            normalized = _string_content_messages(messages, _get_image_token())
+            if normalized is messages:
+                raise
+            try:
+                return template_processor.apply_chat_template(
+                    normalized,
+                    tokenize=tokenize,
+                    add_generation_prompt=add_generation_prompt,
+                    **template_kwargs,
+                )
+            except (TemplateError, TypeError, ValueError):
+                raise error
+        except TemplateError as error:
+            normalized = _coalesce_leading_system_text(messages)
+            if normalized is messages:
+                raise
+            try:
+                return template_processor.apply_chat_template(
+                    normalized,
+                    tokenize=tokenize,
+                    add_generation_prompt=add_generation_prompt,
+                    **template_kwargs,
+                )
+            except (TemplateError, TypeError, ValueError):
+                raise error
         except ValueError as e:
             if chat_template_override is None and _missing_template_error(e):
                 return _messages_to_plain_prompt()
@@ -1015,12 +1130,20 @@ def apply_chat_template(
                             **kwargs,
                         )
                     )
+                    if isinstance(p, dict) and isinstance(messages[-1], dict):
+                        messages[-1].update(
+                            {
+                                key: value
+                                for key, value in p.items()
+                                if key not in ("role", "content")
+                            }
+                        )
 
     if return_messages:
         return messages
 
     # Some models only need the last message
-    if model_type in ["paligemma", "florence2", "falcon_ocr"]:
+    if model_type in ["florence2", "falcon_ocr"]:
         return messages[-1]
 
     return get_chat_template(processor, messages, add_generation_prompt, **kwargs)

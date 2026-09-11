@@ -132,8 +132,9 @@ class JinaVLMProcessor(ProcessorMixin):
                 if image_input_idx_list is not None and current_image_idx < len(
                     image_input_idx_list
                 ):
-                    offset_idx = image_input_idx_list[current_image_idx] + len(
-                        input_ids
+                    indices = image_input_idx_list[current_image_idx]
+                    offset_idx = np.where(
+                        indices >= 0, indices + len(input_ids), indices
                     )
                     updated_image_input_idx.append(offset_idx)
                 input_ids.extend(img_tokens.tolist())
@@ -251,16 +252,25 @@ class JinaVLMProcessor(ProcessorMixin):
         all_pixel_values = []
         all_image_input_idx = []
         all_image_masks = []
+        all_image_batch_indices = []
 
-        for r in batch_results:
+        for batch_index, r in enumerate(batch_results):
             if "pixel_values" in r:
                 all_pixel_values.append(r["pixel_values"])
-                all_image_input_idx.append(r["image_input_idx"])
+                indices = r["image_input_idx"]
+                pad_len = max_len - r["input_ids"].shape[1]
+                all_image_input_idx.append(
+                    mx.where(indices >= 0, indices + pad_len, indices)
+                )
                 all_image_masks.append(r["image_masks"])
+                all_image_batch_indices.append(
+                    mx.full((indices.shape[0],), batch_index, dtype=mx.int32)
+                )
 
         if all_pixel_values:
             result["pixel_values"] = mx.concatenate(all_pixel_values, axis=0)
             result["image_input_idx"] = mx.concatenate(all_image_input_idx, axis=0)
             result["image_masks"] = mx.concatenate(all_image_masks, axis=0)
+            result["image_batch_indices"] = mx.concatenate(all_image_batch_indices)
 
         return result

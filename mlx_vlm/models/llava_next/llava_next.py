@@ -3,10 +3,12 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from transformers.image_processing_utils import select_best_resolution
 
 from ..base import InputEmbeddingsFeatures
 from . import processing_llava_next  # noqa: F401
 from .config import ModelConfig
+from .image_features import pack_image_features
 from .language import LanguageModel
 from .vision import VisionModel
 
@@ -62,9 +64,32 @@ class Model(nn.Module):
         if cached is not None:
             image_features = cached.astype(inputs_embeds.dtype)
         else:
-            # Get the ouptut hidden states from the vision model
+            image_sizes = kwargs.get("image_sizes")
+            if image_sizes is None:
+                raise ValueError(
+                    "LLaVA-NeXT requires original image_sizes for spatial packing"
+                )
+            image_sizes = np.asarray(image_sizes).tolist()
+            patch_counts = []
+            for size in image_sizes:
+                height, width = select_best_resolution(
+                    size, self.config.image_grid_pinpoints
+                )
+                tile_size = self.config.vision_config.image_size
+                patch_counts.append(1 + (height // tile_size) * (width // tile_size))
+            if pixel_values.ndim == 5:
+                if pixel_values.shape[0] != len(patch_counts):
+                    raise ValueError("Image sizes and pixel batch do not match")
+                pixel_values = mx.concatenate(
+                    [
+                        pixels[:count]
+                        for pixels, count in zip(pixel_values, patch_counts)
+                    ]
+                )
+            if pixel_values.ndim != 4 or pixel_values.shape[0] != sum(patch_counts):
+                raise ValueError("Image crop count does not match original image sizes")
             *_, hidden_states = self.vision_tower(
-                pixel_values[0].transpose(0, 2, 3, 1), output_hidden_states=True
+                pixel_values.transpose(0, 2, 3, 1), output_hidden_states=True
             )
 
             # Select the hidden states from the desired layer
@@ -83,15 +108,19 @@ class Model(nn.Module):
             # Pass image features through the multi-modal projector
             image_features = self.multi_modal_projector(selected_image_feature)
 
-            # Add a newline token to the image features
-            if self.image_newline is not None:
-                newline = np.array(self.image_newline)[None, None, :]
-                newline = np.broadcast_to(newline, image_features.shape)
-                image_features = mx.concatenate(
-                    [image_features, mx.array(newline)], axis=0
-                )
-
-            image_features = image_features.astype(inputs_embeds.dtype)
+            boundaries = np.cumsum(patch_counts)[:-1].tolist()
+            features = mx.split(image_features, boundaries, axis=0)
+            image_features = mx.concatenate(
+                pack_image_features(
+                    features,
+                    image_sizes,
+                    self.config.vision_config.image_size,
+                    self.config.vision_config.patch_size,
+                    self.config.image_grid_pinpoints,
+                    self.image_newline,
+                ),
+                axis=0,
+            ).astype(inputs_embeds.dtype)
 
         # Insert special image tokens in the input_ids
         final_inputs_embeds = self._merge_input_ids_with_image_features(
@@ -102,25 +131,16 @@ class Model(nn.Module):
     def _merge_input_ids_with_image_features(
         self, image_features, inputs_embeds, input_ids
     ):
-        image_token_index = self.config.image_token_index
-        num_images, num_image_patches, embed_dim = image_features.shape
-
-        image_positions = np.where(input_ids == image_token_index)[1].tolist()
-
-        text_segments = []
-        start_idx = 0
-
-        for position in image_positions:
-            text_segments.append(inputs_embeds[:, start_idx:position])
-            start_idx = position + 1
-
-        image_embeddings = mx.split(image_features, image_features.shape[0])
-        final_embeddings = [v for p in zip(text_segments, image_embeddings) for v in p]
-        final_embeddings += [inputs_embeds[:, start_idx:]]
-
-        # Create a final embedding of shape
-        # (1, num_image_patches*num_images + sequence_len, embed_dim)
-        return mx.concatenate(final_embeddings, axis=1)
+        positions = np.where(np.asarray(input_ids) == self.config.image_token_index)
+        image_features = image_features.reshape(-1, inputs_embeds.shape[-1])
+        if len(positions[0]) != image_features.shape[0]:
+            raise ValueError(
+                f"Image features and image tokens do not match: "
+                f"{image_features.shape[0]} features, {len(positions[0])} tokens"
+            )
+        result = mx.array(inputs_embeds)
+        result[mx.array(positions[0]), mx.array(positions[1])] = image_features
+        return result
 
     @property
     def layers(self):
@@ -135,7 +155,9 @@ class Model(nn.Module):
         **kwargs,
     ):
 
-        input_embeddings_features = self.get_input_embeddings(input_ids, pixel_values)
+        input_embeddings_features = self.get_input_embeddings(
+            input_ids, pixel_values, **kwargs
+        )
         logits = self.language_model(
             input_ids,
             cache=cache,

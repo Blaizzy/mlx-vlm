@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import logging
+import math
 import os
 import sys
 import time
@@ -953,7 +954,7 @@ def _make_cache(
         elif isinstance(c, cache.ChunkedKVCache):
             if kv_bits is not None and quantize:
                 return _make_quant_cache(left_padding)
-            return cache.BatchKVCache(left_padding)
+            return cache.BatchChunkedKVCache(c.chunk_size, left_padding)
         elif isinstance(c, cache.SimpleKVCache):
             if kv_bits is not None and quantize:
                 return _make_quant_cache(left_padding)
@@ -2597,13 +2598,28 @@ class BatchGenerator:
             ),
         }
         if coordinator is not None:
-            return coordinator.lookup(ids_list, **lookup_kwargs)
-        return _apc.apc_lookup_plan(
-            self.apc_manager,
-            ids_list,
-            apc_mode=getattr(self, "apc_mode", "block"),
-            **lookup_kwargs,
-        )
+            pick = coordinator.lookup(ids_list, **lookup_kwargs)
+        else:
+            pick = _apc.apc_lookup_plan(
+                self.apc_manager,
+                ids_list,
+                apc_mode=getattr(self, "apc_mode", "block"),
+                **lookup_kwargs,
+            )
+        prefill_step = getattr(self, "prefill_step_size", None)
+        if pick and pick.get("matched_blocks") and prefill_step and prefill_step > 0:
+            block_size = self.apc_manager.block_size
+            alignment = math.lcm(block_size, prefill_step)
+            prefix_len = pick["prefix_len"] // alignment * alignment
+            keep = prefix_len // block_size
+            # Preserve cold prefill chunk boundaries: changing the suffix shape
+            # can change rounded logits and greedy output even with identical KV.
+            self.apc_manager.release(pick["matched_blocks"][keep:])
+            if not prefix_len:
+                return None
+            pick["matched_blocks"] = pick["matched_blocks"][:keep]
+            pick["prefix_len"] = prefix_len
+        return pick
 
     def _build_mixed_prompt_batch(
         self, sequences: List[tuple]

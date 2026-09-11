@@ -181,6 +181,9 @@ class LanguageModel(nn.Module):
             out = self.lm_head(out)
         return LanguageModelOutput(logits=out)
 
+    def make_cache(self):
+        return [KVCache() for _ in self.model.layers]
+
     @staticmethod
     def sanitize(weights):
         # Remove unused precomputed rotary freqs
