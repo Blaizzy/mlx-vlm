@@ -255,9 +255,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main():
-    args = build_parser().parse_args()
-    output = stream_convert(**vars(args))
-    print(f"Wrote {args.profile} build to {output}")
+    args = vars(build_parser().parse_args())
+    args["profile_name"] = args.pop("profile")
+    output = stream_convert(**args)
+    print(f"Wrote build to {output}")
 
 
 if __name__ == "__main__":
