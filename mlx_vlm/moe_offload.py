@@ -395,6 +395,17 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
 
     import shutil
 
+    if not written_layers:
+        raise ValueError(
+            f"moe_offload.repack: {build!r} produced no MoE expert tensors "
+            "(written_layers is empty). This means plan() didn't recognize "
+            "any expert tensor names for this checkpoint -- writing "
+            "offload_index.json here would silently claim 0 MoE layers and "
+            "only surface as a failure later, at patch_model() load time. "
+            "Check STACKED_RE/STACKED_FUSED_RE against this model's actual "
+            "expert tensor naming."
+        )
+
     for fn in os.listdir(build):  # passthrough config/tokenizer/processor/code
         src = os.path.join(build, fn)
         if (
