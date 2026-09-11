@@ -5386,7 +5386,7 @@ class TestDeepseekV41DsparkSplit:
         out = sanitize_dspark_weights(weights)
         assert "stages.0.attn.wq_a.weight" in out
         assert "stages.2.markov_head.embed.weight" in out
-        assert "model.embed_tokens.weight" not in out
+        assert "model.embed_tokens.weight" in out
         assert "mtp.0.attn.wq_a.weight" not in out
 
     def test_deepseek_v41_dspark_config(self):

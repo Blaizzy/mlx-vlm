@@ -24,6 +24,7 @@ def sanitize_dspark_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array]
     for key, value in weights.items():
         match = re.match(r"mtp\.(\d+)\.(.*)", key)
         if not match:
+            out[key] = value
             continue
         out[f"stages.{match.group(1)}.{match.group(2)}"] = value
     return out
