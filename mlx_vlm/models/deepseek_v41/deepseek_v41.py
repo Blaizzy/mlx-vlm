@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -6,6 +6,8 @@ import mlx.nn as nn
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput
 from .config import ModelConfig
 from .language import LanguageModel
+from .processing_deepseek_v41 import IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_START
+from .vision import Aligner, ViT
 
 
 class Model(nn.Module):
@@ -14,16 +16,57 @@ class Model(nn.Module):
         self.config = config
         self.model_type = config.model_type
         self.language_model = LanguageModel(config)
+        self.vision = ViT(config)
+        self.aligner = Aligner(config)
+        self.image_start = mx.zeros((config.hidden_size,))
+        self.image_end = mx.zeros((config.hidden_size,))
+        self.image_newline = mx.zeros((config.hidden_size,))
+
+    def encode_image(self, patches: mx.array, n_vit_h: int, n_vit_w: int) -> mx.array:
+        return self.aligner(self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w)
+
+    def merge_image_embeddings(self, images, h: mx.array) -> mx.array:
+        """Overwrite each image's token span with ViT features and span markers.
+
+        `images` is a per-batch list of records with `start`, `patches`,
+        `n_vit_h`, `n_vit_w`, and `types` (IMAGE_START/IMAGE/NEWLINE/END codes).
+        IMAGE slots take aligner rows in reading order; delimiters take the
+        learned span embeddings.
+        """
+        dtype = h.dtype
+        marks = {
+            IMAGE_START: self.image_start,
+            IMAGE_END: self.image_end,
+            IMAGE_NEW_LINE: self.image_newline,
+        }
+        rows = []
+        for b, sample in enumerate(images):
+            row = h[b]
+            for img in sample or []:
+                codes = mx.array(img.types)
+                end = img.start + len(img.types)
+                span = row[img.start : end]
+                is_image = codes == IMAGE
+                order = mx.cumsum(is_image.astype(mx.int32), axis=0) - 1
+                embeds = self.encode_image(img.patches, img.n_vit_h, img.n_vit_w)
+                gathered = embeds[mx.clip(order, 0, embeds.shape[0] - 1)]
+                span = mx.where(is_image[:, None], gathered.astype(dtype), span)
+                for code, mark in marks.items():
+                    span = mx.where((codes == code)[:, None], mark.astype(dtype), span)
+                row = mx.concatenate([row[: img.start], span, row[end:]], axis=0)
+            rows.append(row)
+        return mx.stack(rows, axis=0).astype(dtype)
 
     def get_input_embeddings(
         self,
         input_ids: Optional[mx.array] = None,
-        pixel_values: Optional[mx.array] = None,
+        pixel_values: Optional[List] = None,
         **kwargs,
     ) -> InputEmbeddingsFeatures:
-        return InputEmbeddingsFeatures(
-            inputs_embeds=self.language_model.embed_tokens(input_ids)
-        )
+        inputs_embeds = self.language_model.embed_tokens(input_ids)
+        if pixel_values is not None and input_ids.shape[1] != 1:
+            inputs_embeds = self.merge_image_embeddings(pixel_values, inputs_embeds)
+        return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
     def __call__(
         self,
@@ -41,9 +84,17 @@ class Model(nn.Module):
                 return key
             if key.startswith("model.") or key.startswith("lm_head."):
                 return f"language_model.{key}"
+            if key.startswith("embed."):
+                return f"language_model.embed_tokens.{key[len('embed.'):]}"
+            if key.startswith("head."):
+                return f"language_model.head.{key[len('head.'):]}"
+            if key.startswith("layers."):
+                return f"language_model.{key}"
             return key
 
-        return {transform_key(k): v for k, v in weights.items()}
+        return {
+            transform_key(k): v for k, v in weights.items() if not k.startswith("mtp.")
+        }
 
     @property
     def layers(self):

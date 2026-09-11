@@ -20288,6 +20288,97 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
         self.assertIn("language_model.lm_head.weight", sanitized)
         self.assertIn("other.weight", sanitized)
 
+    def test_deepseek_v41_sanitize_checkpoint_keys(self):
+        from mlx_vlm.models import deepseek_v41
+
+        model = deepseek_v41.Model(self._tiny_config())
+        sanitized = model.sanitize(
+            {
+                "embed.weight": mx.zeros((4, 4)),
+                "head.weight": mx.zeros((4, 4)),
+                "layers.0.attn.wq_a.weight": mx.zeros((4, 4)),
+                "vision.blocks.0.attn.wqkv.weight": mx.zeros((4, 4)),
+                "aligner.w1.weight": mx.zeros((4, 4)),
+                "image_start": mx.zeros((4,)),
+                "mtp.0.attn.wq_a.weight": mx.zeros((4, 4)),
+            }
+        )
+        self.assertIn("language_model.embed_tokens.weight", sanitized)
+        self.assertIn("language_model.head.weight", sanitized)
+        self.assertIn("language_model.layers.0.attn.wq_a.weight", sanitized)
+        self.assertIn("vision.blocks.0.attn.wqkv.weight", sanitized)
+        self.assertIn("aligner.w1.weight", sanitized)
+        self.assertIn("image_start", sanitized)
+        self.assertFalse(any(k.startswith("mtp.") for k in sanitized))
+
+
+class TestDeepseekV41VisionSplice(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            hidden_size=16,
+            vocab_size=64,
+            num_hidden_layers=1,
+            compress_ratios=[0],
+            engram_layer_ids=[],
+            vision_hidden_size=16,
+            vision_num_heads=2,
+            vision_num_layers=1,
+            vision_intermediate_size=32,
+            vision_patch_size=2,
+            vision_downsample_ratio=3,
+        )
+
+    @staticmethod
+    def _image_record():
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            start=1,
+            patches=mx.random.normal((36, 3, 2, 2)),
+            n_vit_h=6,
+            n_vit_w=6,
+            types=[0, 1, 1, 2, 1, 1, 2, 3],
+        )
+
+    def test_deepseek_v41_vision_splice(self):
+        from mlx_vlm.models import deepseek_v41
+
+        model = deepseek_v41.Model(self._tiny_config())
+        mx.eval(model.parameters())
+        model.image_start = mx.ones((16,))
+        model.image_end = mx.ones((16,)) * 2
+        model.image_newline = mx.ones((16,)) * 3
+
+        ids = mx.array([[5, 9, 9, 9, 9, 9, 9, 9, 9, 6]])
+        result = model.get_input_embeddings(ids, pixel_values=[[self._image_record()]])
+        mx.eval(result.inputs_embeds)
+        embeds = result.inputs_embeds
+        self.assertEqual(embeds.shape, (1, 10, 16))
+        self.assertTrue(
+            bool(mx.all(embeds[0, 0] == model.language_model.embed_tokens(ids)[0, 0]))
+        )
+        self.assertTrue(bool(mx.all(embeds[0, 1] == 1)))
+        self.assertTrue(bool(mx.all(embeds[0, 4] == 3)))
+        self.assertTrue(bool(mx.all(embeds[0, 8] == 2)))
+        self.assertTrue(
+            bool(mx.all(embeds[0, 9] == model.language_model.embed_tokens(ids)[0, 9]))
+        )
+
+    def test_deepseek_v41_decode_skips_vision(self):
+        from mlx_vlm.models import deepseek_v41
+
+        model = deepseek_v41.Model(self._tiny_config())
+        mx.eval(model.parameters())
+        ids = mx.array([[5]])
+        result = model.get_input_embeddings(ids, pixel_values=[[self._image_record()]])
+        mx.eval(result.inputs_embeds)
+        self.assertTrue(
+            bool(mx.all(result.inputs_embeds == model.language_model.embed_tokens(ids)))
+        )
+
 
 class TestDeepseekV41Processing(unittest.TestCase):
     @staticmethod
