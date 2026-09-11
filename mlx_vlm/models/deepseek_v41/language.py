@@ -595,16 +595,17 @@ class DeepseekV41Attention(nn.Module):
         out = None
         if self.compress_ratio:
             pool, idxs = self._compress_part(x, qr, start_pos, shared)
-            out = _sparse_pooled_attention(
-                q,
-                window_kv[:, None],
-                pool,
-                idxs,
-                window_mask,
-                (idxs != -1)[:, None],
-                self.scale,
-                self.attn_sink.astype(q.dtype),
-            )
+            if pool.shape[1]:
+                out = _sparse_pooled_attention(
+                    q,
+                    window_kv[:, None],
+                    pool,
+                    idxs,
+                    window_mask,
+                    (idxs != -1)[:, None],
+                    self.scale,
+                    self.attn_sink.astype(q.dtype),
+                )
         if out is None:
             mask = window_mask
             kv = window_kv[:, None]
