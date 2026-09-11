@@ -94,12 +94,24 @@ def convert_shard(source_file: Path, profile: dict):
     out = {}
     with safe_open(str(source_file), framework="mlx") as f:
         keys = list(f.keys())
+        try:
+            probe = mx.array(f.get_tensor(keys[0]))
+            del probe
+            load = lambda key: mx.array(f.get_tensor(key))
+            close = lambda: None
+        except (AttributeError, RuntimeError, TypeError):
+            store = dict(mx.load(str(source_file)))
+            keys = list(store.keys())
+            load = store.get
+            close = store.clear
         for key in keys:
             if key.endswith(".scale"):
                 continue
-            tensor = mx.array(f.get_tensor(key))
+            tensor = load(key)
+            if tensor is None:
+                continue
             if "engram.embed" in key and tensor.shape[0] > ROW_CHUNK:
-                scale_all = mx.array(f.get_tensor(f"{key}.scale"))
+                scale_all = load(f"{key}.scale")
                 merged = {}
                 for start in range(0, tensor.shape[0], ROW_CHUNK):
                     end = min(start + ROW_CHUNK, tensor.shape[0])
@@ -111,10 +123,13 @@ def convert_shard(source_file: Path, profile: dict):
                     mx.clear_cache()
                 for k, v in merged.items():
                     out[k] = mx.concatenate(v, axis=0) if len(v) > 1 else v[0]
-                del merged
-            elif key.endswith(".weight") and f"{key[:-len('.weight')]}.scale" in keys:
-                stem = key[: -len(".weight")]
-                scale = mx.array(f.get_tensor(f"{stem}.scale"))
+                del merged, scale_all
+            elif (
+                f"{key[:-len('.weight')]}.scale" in keys
+                if key.endswith(".weight")
+                else False
+            ):
+                scale = load(f"{key[:-len('.weight')]}.scale")
                 out.update(convert_tensor(key, tensor, scale, profile))
                 del scale
             elif tensor.dtype in (mx.bfloat16, mx.float32):
@@ -123,6 +138,7 @@ def convert_shard(source_file: Path, profile: dict):
                 raise ValueError(f"Unroutable tensor {key} dtype {tensor.dtype}.")
             del tensor
             mx.clear_cache()
+        close()
     gc.collect()
     return out
 
