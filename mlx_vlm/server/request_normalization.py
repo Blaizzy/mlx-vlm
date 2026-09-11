@@ -17,6 +17,7 @@ from .generation import (
     get_server_thinking_start_token,
 )
 from .runtime import runtime
+from .schemas import ChatRequest
 
 _DISABLED_REASONING_EFFORTS = {"none", "off", "disabled", "false", "0"}
 
@@ -230,6 +231,9 @@ def _build_gen_args(
         enable_thinking=enable_thinking,
         reasoning=template_reasoning,
         reasoning_effort=reasoning_effort,
+        preserve_thinking=(
+            request.preserve_thinking if isinstance(request, ChatRequest) else None
+        ),
         thinking_budget=_request_field_or_default(
             request, "thinking_budget", get_server_thinking_budget()
         ),

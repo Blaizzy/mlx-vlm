@@ -641,6 +641,7 @@ class GenerationArguments:
     enable_thinking: bool = DEFAULT_ENABLE_THINKING
     reasoning: Optional[bool] = None
     reasoning_effort: Optional[str] = None
+    preserve_thinking: Optional[bool] = None
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
     thinking_end_token: Optional[str] = None
@@ -725,6 +726,8 @@ class GenerationArguments:
             kw["reasoning_effort"] = self.reasoning_effort
             # Muse Glimmer's chat template reads the reasoning_strength alias.
             kw["reasoning_strength"] = self.reasoning_effort
+        if self.preserve_thinking is not None:
+            kw["preserve_thinking"] = self.preserve_thinking
         if self.thinking_budget is not None:
             kw["thinking_budget"] = self.thinking_budget
         if self.thinking_start_token is not None:

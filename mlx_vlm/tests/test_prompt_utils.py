@@ -915,3 +915,23 @@ class TestModelSpecificPromptContracts:
             "text",
         ]
         assert result[0]["content"][-1]["text"] == "OCR:"
+
+
+def test_preserve_thinking_ignored_by_processor_without_option():
+    class Processor:
+        chat_template = "synthetic"
+
+        def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+            return messages
+
+    expected = apply_chat_template(Processor(), {"model_type": "qwen3_5"}, "Hello")
+    for policy in (True, False):
+        assert (
+            apply_chat_template(
+                Processor(),
+                {"model_type": "qwen3_5"},
+                "Hello",
+                preserve_thinking=policy,
+            )
+            == expected
+        )

@@ -809,6 +809,8 @@ def get_chat_template(
             return _messages_to_plain_prompt()
 
         template_kwargs = dict(kwargs)
+        if not _supports_template_kw(template_processor, "preserve_thinking"):
+            template_kwargs.pop("preserve_thinking", None)
         if "enable_thinking" not in template_kwargs and _supports_template_kw(
             template_processor, "enable_thinking"
         ):
