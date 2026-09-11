@@ -629,9 +629,9 @@ class Compressor(nn.Module):
         self.compress_ratio = compress_ratio
         self.head_dim = config.head_dim
         self.norm = nn.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
-        self.wkv = nn.Linear(config.hidden_size, config.head_dim)
+        self.wkv = nn.Linear(config.hidden_size, config.head_dim, bias=False)
         if compress_ratio > 1:
-            self.wgate = nn.Linear(config.hidden_size, config.head_dim)
+            self.wgate = nn.Linear(config.hidden_size, config.head_dim, bias=False)
         self._kv_state = None
         self._score_state = None
 

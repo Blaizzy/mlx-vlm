@@ -88,6 +88,8 @@ class Model(nn.Module):
                 return f"language_model.embed_tokens.{key[len('embed.'):]}"
             if key.startswith("head."):
                 return f"language_model.head.{key[len('head.'):]}"
+            if key.startswith("norm."):
+                return f"language_model.norm.{key[len('norm.'):]}"
             if key.startswith("layers."):
                 return f"language_model.{key}"
             return key
