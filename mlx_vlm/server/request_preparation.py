@@ -15,7 +15,7 @@ from ..prompt_utils import apply_chat_template, extract_text_from_content
 from ..tools import _prepare_chat_tool_choice
 from .generation import GenerationArguments
 from .responses_state import _response_items_to_chat, _response_tool_registry
-from .schemas import InputAudio
+from .schemas import ChatRequest, InputAudio
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -274,7 +274,55 @@ def normalize_chat_input(request) -> PromptInput:
 
 
 def normalize_responses_input(request, prompt_items):
-    """Retain Responses instruction merging and response-item conversion semantics."""
+    """Replay Chat-shaped history through Chat normalization; adapt native items."""
+    if any(item.get("type") is None and "role" in item for item in prompt_items):
+        messages = []
+        if request.instructions:
+            messages.append({"role": "system", "content": request.instructions})
+        for item in prompt_items:
+            if item.get("type") is None and "role" in item:
+                messages.append(item)
+                continue
+            converted, images = _response_items_to_chat([item])
+            image_sources = iter(images)
+            for message in converted:
+                content = message.get("content")
+                if isinstance(content, list):
+                    message["content"] = [
+                        (
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": next(image_sources)},
+                            }
+                            if part.get("type") == "image"
+                            else part
+                        )
+                        for part in content
+                    ]
+            messages.extend(converted)
+        tools, registry = _response_tool_registry(request.tools)
+        tool_choice = request.tool_choice
+        if (
+            isinstance(tool_choice, dict)
+            and tool_choice.get("type") == "function"
+            and "function" not in tool_choice
+            and "name" in tool_choice
+        ):
+            tool_choice = {
+                "type": "function",
+                "function": {"name": tool_choice["name"]},
+            }
+        source = normalize_chat_input(
+            ChatRequest(
+                model=request.model,
+                messages=messages,
+                tools=tools if request.tools is not None else None,
+                tool_choice=tool_choice,
+                resize_shape=getattr(request, "resize_shape", None),
+            )
+        )
+        return source, request.instructions, registry
+
     messages, images = _response_items_to_chat(prompt_items)
     instructions = _normalize_response_instruction_messages(
         messages, request.instructions

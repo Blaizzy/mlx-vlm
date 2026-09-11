@@ -20194,8 +20194,8 @@ class TestServerRequestPreparation(unittest.TestCase):
             model="test",
             instructions="Primary.",
             input=[
-                {"role": "system", "content": "Secondary."},
-                {"role": "user", "content": "Read."},
+                {"type": "message", "role": "system", "content": "Secondary."},
+                {"type": "message", "role": "user", "content": "Read."},
                 {
                     "type": "function_call",
                     "call_id": "call_1",
@@ -20282,3 +20282,281 @@ class TestServerRequestPreparation(unittest.TestCase):
         after = prepare_prompt(chat_source, processor, config, chat_args)
         self.assertTrue(after.prompt.startswith(expected.removesuffix("<assistant>")))
         self.assertEqual(chat.messages[-1].content, "Done.")
+
+
+class TestChatHistoryReplay(unittest.TestCase):
+    def test_responses_replays_chat_history_without_changing_prepared_input(self):
+        import copy
+
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            normalize_responses_input,
+        )
+        from mlx_vlm.server.responses_state import _normalize_response_input
+        from mlx_vlm.server.schemas import ChatRequest, OpenAIRequest
+
+        messages = [
+            {"role": "system", "content": "First instruction."},
+            {"role": "system", "content": "Second instruction."},
+            {"role": "user", "content": "Read /src/app.py:42 — café."},
+            {
+                "role": "assistant",
+                "content": "Checking both files.",
+                "reasoning_content": "Keep the exact source history.",
+                "tool_calls": [
+                    {
+                        "id": f"call_{i}",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": arguments},
+                    }
+                    for i, arguments in enumerate(
+                        ['{"path":"/src/app.py"}', {"path": "/src/db.py"}]
+                    )
+                ],
+            },
+            {
+                "role": "tool",
+                "name": "read",
+                "tool_call_id": "call_0",
+                "content": "Uses SQLite.",
+            },
+            {
+                "role": "tool",
+                "name": "read",
+                "tool_call_id": "call_1",
+                "content": "No migrations yet.",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Inspect these as well."},
+                    {"type": "image_url", "image_url": {"url": "first.png"}},
+                    {"type": "input_image", "image_url": "second.png"},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": "recording.wav", "format": "wav"},
+                    },
+                    {"type": "input_video", "video_url": "clip.mp4"},
+                ],
+            },
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "read", "parameters": {"type": "object"}},
+            }
+        ]
+        for choice in (
+            None,
+            "auto",
+            "none",
+            "required",
+            {"type": "function", "function": {"name": "read"}},
+        ):
+            with self.subTest(tool_choice=choice):
+                chat = ChatRequest(
+                    model="test",
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=choice,
+                    resize_shape=[224],
+                )
+                response = OpenAIRequest(
+                    model="test",
+                    input=messages,
+                    tools=tools,
+                    tool_choice=choice,
+                    resize_shape=[224],
+                )
+                before = copy.deepcopy(response.model_dump())
+                expected = normalize_chat_input(chat)
+                actual, _, _ = normalize_responses_input(
+                    response, _normalize_response_input(response.input)
+                )
+                self.assertEqual(actual, expected)
+                self.assertEqual(response.model_dump(), before)
+
+    def test_stored_chain_retains_original_chat_prefix(self):
+        import copy
+        import uuid
+
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            normalize_responses_input,
+        )
+        from mlx_vlm.server.responses_state import (
+            StoredResponse,
+            _normalize_response_input,
+            _response_chain_items,
+            response_store,
+            response_store_lock,
+        )
+        from mlx_vlm.server.schemas import ChatRequest, OpenAIRequest
+
+        history = [
+            {"role": "system", "content": "Keep exact paths."},
+            {"role": "system", "content": "Preserve separate instructions."},
+            {"role": "user", "content": "Inspect /src/app.py."},
+            {
+                "role": "assistant",
+                "content": "The file uses SQLite.",
+                "reasoning_content": "Verified by reading the source.",
+            },
+        ]
+        original = copy.deepcopy(history)
+        response_id = f"test_{uuid.uuid4().hex}"
+        with response_store_lock:
+            response_store[response_id] = StoredResponse(
+                response={},
+                input_items=_normalize_response_input(history),
+                output_items=[
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Done."}],
+                    }
+                ],
+            )
+        try:
+            request = OpenAIRequest(
+                model="test",
+                previous_response_id=response_id,
+                input=[{"role": "user", "content": "Continue."}],
+            )
+            source, _, _ = normalize_responses_input(
+                request,
+                _response_chain_items(response_id)
+                + _normalize_response_input(request.input),
+            )
+            expected = normalize_chat_input(ChatRequest(model="test", messages=history))
+            self.assertEqual(source.messages[: len(history)], expected.messages)
+            self.assertEqual(
+                source.messages[-2:],
+                [
+                    {"role": "assistant", "content": "Done."},
+                    {"role": "user", "content": "Continue."},
+                ],
+            )
+            self.assertEqual(history, original)
+        finally:
+            with response_store_lock:
+                response_store.pop(response_id, None)
+
+    def test_responses_forwards_media_to_counting_and_both_generation_modes(self):
+        from unittest.mock import MagicMock, patch
+
+        from fastapi.testclient import TestClient
+
+        import mlx_vlm.server as server
+
+        def generate(*args, **kwargs):
+            def tokens():
+                yield server.StreamingToken(
+                    text="Done.", token=1, logprobs=0.0, finish_reason="stop"
+                )
+
+            return SimpleNamespace(prompt_tokens=3), tokens()
+
+        worker = SimpleNamespace(
+            generate=MagicMock(side_effect=generate),
+            validate_context_budget=MagicMock(),
+            _cpu_preprocess=MagicMock(
+                return_value={"input_ids": mx.array([[1, 2, 3]])}
+            ),
+        )
+        payload = {
+            "model": "test",
+            "store": False,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe the recording."},
+                        {"type": "image_url", "image_url": {"url": "image.png"}},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": "audio.wav", "format": "wav"},
+                        },
+                        {"type": "input_video", "video_url": "video.mp4"},
+                    ],
+                }
+            ],
+        }
+        resolution = SimpleNamespace(
+            images=["image.png"], videos=["video.mp4"], used_fallback=False
+        )
+        with (
+            TestClient(server.app) as client,
+            patch.object(server.runtime, "response_generator", worker),
+            patch.object(
+                server,
+                "get_cached_model",
+                return_value=(
+                    SimpleNamespace(),
+                    SimpleNamespace(),
+                    SimpleNamespace(model_type="test"),
+                ),
+            ),
+            patch.object(server, "apply_chat_template", return_value="prompt"),
+            patch(
+                "mlx_vlm.server.request_preparation.resolve_video_inputs",
+                return_value=resolution,
+            ),
+        ):
+            counted = client.post("/v1/responses/input_tokens", json=payload)
+            self.assertEqual(counted.status_code, 200, counted.text)
+            self.assertEqual(counted.json(), {"input_tokens": 3})
+            self.assertEqual(
+                worker._cpu_preprocess.call_args.args,
+                ("prompt", ["image.png"], ["audio.wav"]),
+            )
+            self.assertEqual(
+                worker._cpu_preprocess.call_args.kwargs["videos"], ["video.mp4"]
+            )
+            for stream in (False, True):
+                with self.subTest(stream=stream):
+                    response = client.post(
+                        "/v1/responses", json={**payload, "stream": stream}
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    call = worker.generate.call_args
+                    if stream:
+                        self.assertIn("response.completed", response.text)
+                        self.assertEqual(
+                            call.args[:3], ("prompt", ["image.png"], ["audio.wav"])
+                        )
+                        self.assertEqual(
+                            worker.validate_context_budget.call_args.kwargs["videos"],
+                            ["video.mp4"],
+                        )
+                    else:
+                        self.assertEqual(call.kwargs["audio"], ["audio.wav"])
+                        self.assertEqual(call.kwargs["images"], ["image.png"])
+                    self.assertEqual(call.kwargs["videos"], ["video.mp4"])
+
+    def test_native_named_tool_choice_with_original_chat_history(self):
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            normalize_responses_input,
+        )
+        from mlx_vlm.server.responses_state import _normalize_response_input
+        from mlx_vlm.server.schemas import ChatRequest, OpenAIRequest
+
+        messages = [{"role": "user", "content": "Read the source."}]
+        function = {"name": "read", "parameters": {"type": "object"}}
+        chat = ChatRequest(
+            model="test",
+            messages=messages,
+            tools=[{"type": "function", "function": function}],
+            tool_choice={"type": "function", "function": {"name": "read"}},
+        )
+        response = OpenAIRequest(
+            model="test",
+            input=messages,
+            tools=[{"type": "function", "function": function}],
+            tool_choice={"type": "function", "name": "read"},
+        )
+        actual, _, _ = normalize_responses_input(
+            response, _normalize_response_input(response.input)
+        )
+        self.assertEqual(actual, normalize_chat_input(chat))

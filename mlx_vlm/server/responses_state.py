@@ -493,9 +493,7 @@ def _normalize_response_input(input_value: Any) -> List[Dict[str, Any]]:
         item = _as_plain_dict(item)
         if not isinstance(item, dict):
             raise HTTPException(status_code=400, detail="Invalid input format.")
-        item_type = item.get("type")
-        if item_type is None and item.get("role") is not None:
-            item = {**item, "type": "message"}
+        # An absent type identifies original Chat messages during prompt replay.
         items.append(item)
     return items
 
@@ -587,7 +585,7 @@ def _append_response_item_to_prompt(
     chat_messages: List[Dict[str, Any]],
     images: List[Any],
 ):
-    item_type = item.get("type")
+    item_type = item.get("type") or ("message" if "role" in item else None)
     if item_type == "message":
         role = item.get("role") or "user"
         content = item.get("content")

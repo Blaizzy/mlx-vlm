@@ -579,19 +579,24 @@ async def responses_input_tokens_endpoint(request: Request):
             source, processor, config, gen_args, render=apply_chat_template
         )
         formatted_prompt, images = prepared.prompt, prepared.images
+        audio, videos = prepared.audio, prepared.videos
         if runtime.response_generator is not None:
             raw_inputs = await asyncio.to_thread(
                 runtime.response_generator._cpu_preprocess,
                 formatted_prompt,
                 images if images else None,
-                None,
+                audio if audio else None,
+                **({"videos": videos} if videos else {}),
             )
         else:
             image_token_index = getattr(config, "image_token_index", None)
             raw_inputs = prepare_inputs(
                 processor,
                 images=images if images else None,
+                audio=audio if audio else None,
+                videos=videos if videos else None,
                 prompts=formatted_prompt,
+                **prepared.generation_kwargs,
                 image_token_index=image_token_index,
             )
         return {"input_tokens": _count_prompt_tokens(raw_inputs)}
@@ -737,6 +742,7 @@ async def responses_endpoint(request: Request):
             source, processor, config, gen_args, render=apply_chat_template
         )
         formatted_prompt, images = prepared.prompt, prepared.images
+        audio, videos = prepared.audio, prepared.videos
         kwargs = prepared.generation_kwargs
 
         logger.debug(
@@ -764,7 +770,8 @@ async def responses_endpoint(request: Request):
                 model=openai_request.model,
                 prompt=formatted_prompt,
                 images=images if images else None,
-                audio=None,
+                audio=audio if audio else None,
+                videos=videos if videos else None,
                 args=gen_args,
             )
 
@@ -854,8 +861,9 @@ async def responses_endpoint(request: Request):
                             runtime.response_generator.generate,
                             formatted_prompt,
                             images if images else None,
-                            None,  # audio
+                            audio if audio else None,
                             gen_args,
+                            **({"videos": videos} if videos else {}),
                         )
                         usage_stats["input_tokens"] = ctx.prompt_tokens
 
@@ -915,6 +923,8 @@ async def responses_endpoint(request: Request):
                             processor=processor,
                             prompt=formatted_prompt,
                             image=images,
+                            audio=audio,
+                            video=videos,
                             vision_cache=runtime.model_cache.get("vision_cache"),
                             apc_manager=runtime.apc_manager,
                             **gen_args.to_generate_kwargs(),
@@ -1173,7 +1183,9 @@ async def responses_endpoint(request: Request):
                         ctx_, ti = runtime.response_generator.generate(
                             prompt=formatted_prompt,
                             images=images if images else None,
+                            audio=audio if audio else None,
                             args=gen_args,
+                            **({"videos": videos} if videos else {}),
                         )
                         text = ""
                         ot = 0
@@ -1204,6 +1216,8 @@ async def responses_endpoint(request: Request):
                         processor=processor,
                         prompt=formatted_prompt,
                         image=images,
+                        audio=audio,
+                        video=videos,
                         verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=runtime.model_cache.get("vision_cache"),
                         apc_manager=runtime.apc_manager,
