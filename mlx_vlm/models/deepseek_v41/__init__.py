@@ -26,6 +26,7 @@ from .language import (
     SharedIndexState,
     hc_mix_coeffs,
     make_identity_pre_mix,
+    sanitize_moe_weights,
     select_candidate_blocks,
 )
 from .vision import Aligner, ViT
@@ -60,6 +61,7 @@ __all__ = [
     "SharedIndexState",
     "hc_mix_coeffs",
     "make_identity_pre_mix",
+    "sanitize_moe_weights",
     "select_candidate_blocks",
     "Aligner",
     "ViT",

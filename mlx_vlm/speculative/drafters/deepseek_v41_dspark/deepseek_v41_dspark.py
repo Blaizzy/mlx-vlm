@@ -348,10 +348,35 @@ class DeepseekV41DsparkDraftModel(nn.Module):
 
     @staticmethod
     def sanitize(weights: dict) -> dict:
-        """Map the ``mtp.<stage>.*`` checkpoint layout onto ``stages.<i>.*``."""
+        """Map the ``mtp.<stage>.*`` checkpoint layout onto ``stages.<i>.*``,
+        stacking per-expert tensors for SwitchGLU like the backbone."""
+        import re
+
+        from ....models.deepseek_v41.language import sanitize_moe_weights
         from .split import sanitize_dspark_weights
 
-        return sanitize_dspark_weights(weights)
+        weights = sanitize_dspark_weights(weights)
+        stages = {
+            int(m.group(1))
+            for k in weights
+            if (m := re.match(r"stages\.(\d+)\.ffn\.experts\.0\.w1\.weight", k))
+        }
+        for stage in sorted(stages):
+            prefix = f"stages.{stage}.ffn"
+            n_routed = (
+                max(
+                    int(m.group(1))
+                    for k in weights
+                    if (
+                        m := re.match(
+                            rf"{re.escape(prefix)}\.experts\.(\d+)\.w1\.weight", k
+                        )
+                    )
+                )
+                + 1
+            )
+            weights = sanitize_moe_weights(weights, prefix, n_routed)
+        return weights
 
 
 Model = DeepseekV41DsparkDraftModel

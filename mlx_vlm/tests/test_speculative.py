@@ -5649,3 +5649,18 @@ def test_deepseek_v41_dspark_draft_block():
     assert output_ids[0, 0].item() == 3
     assert bool(mx.all(mx.isfinite(logits)))
     assert bool(mx.all(mx.isfinite(confidence)))
+
+
+def test_deepseek_v41_drafter_sanitize_stacks_experts():
+    from mlx_vlm.speculative.drafters.deepseek_v41_dspark.deepseek_v41_dspark import (
+        DeepseekV41DsparkDraftModel,
+    )
+
+    weights = {f"mtp.0.ffn.experts.{e}.w1.weight": mx.zeros((2, 2)) for e in range(4)}
+    weights["mtp.0.ffn.shared_experts.w1.weight"] = mx.zeros((2, 2))
+    weights["mtp.0.attn.wq_a.weight"] = mx.zeros((2, 2))
+    out = DeepseekV41DsparkDraftModel.sanitize(weights)
+    assert out["stages.0.ffn.switch_mlp.gate_proj.weight"].shape == (4, 2, 2)
+    assert "stages.0.ffn.shared_experts.gate_proj.weight" in out
+    assert "stages.0.attn.wq_a.weight" in out
+    assert not any(".experts.0." in k for k in out)
