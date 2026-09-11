@@ -19875,8 +19875,8 @@ class TestDeepseekV41Indexer(unittest.TestCase):
             head_dim=16,
             q_lora_rank=8,
             index_n_heads=2,
-            index_head_dim=8,
-            qk_rope_head_dim=4,
+            index_head_dim=32,
+            qk_rope_head_dim=8,
             index_topk=4,
             kv_source_layer_ids=[0],
             candidate_source_layer_id=1,
@@ -20060,14 +20060,14 @@ class TestDeepseekV41Attention(unittest.TestCase):
             compress_ratios=[2, 2, 1, 0],
             hidden_size=16,
             num_attention_heads=2,
-            head_dim=8,
-            qk_rope_head_dim=4,
+            head_dim=32,
+            qk_rope_head_dim=8,
             q_lora_rank=8,
             o_lora_rank=4,
             o_groups=1,
             sliding_window=4,
             index_n_heads=2,
-            index_head_dim=8,
+            index_head_dim=32,
             index_topk=4,
             kv_source_layer_ids=[0],
             index_source_layer_ids=[0, 1, 2],
@@ -20132,14 +20132,14 @@ class TestDeepseekV41Block(unittest.TestCase):
             compress_ratios=[2, 2, 1, 0],
             hidden_size=16,
             num_attention_heads=2,
-            head_dim=8,
-            qk_rope_head_dim=4,
+            head_dim=32,
+            qk_rope_head_dim=8,
             q_lora_rank=8,
             o_lora_rank=4,
             o_groups=1,
             sliding_window=4,
             index_n_heads=2,
-            index_head_dim=8,
+            index_head_dim=32,
             index_topk=4,
             kv_source_layer_ids=[0],
             index_source_layer_ids=[0, 1],
@@ -20213,14 +20213,14 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
             hidden_size=16,
             vocab_size=64,
             num_attention_heads=2,
-            head_dim=8,
-            qk_rope_head_dim=4,
+            head_dim=32,
+            qk_rope_head_dim=8,
             q_lora_rank=8,
             o_lora_rank=4,
             o_groups=1,
             sliding_window=4,
             index_n_heads=2,
-            index_head_dim=8,
+            index_head_dim=32,
             index_topk=4,
             kv_source_layer_ids=[0],
             index_source_layer_ids=[0, 1],
@@ -20487,14 +20487,14 @@ class TestDeepseekV41Generate(unittest.TestCase):
             hidden_size=16,
             vocab_size=64,
             num_attention_heads=2,
-            head_dim=8,
-            qk_rope_head_dim=4,
+            head_dim=32,
+            qk_rope_head_dim=8,
             q_lora_rank=8,
             o_lora_rank=4,
             o_groups=1,
             sliding_window=4,
             index_n_heads=2,
-            index_head_dim=8,
+            index_head_dim=32,
             index_topk=4,
             kv_source_layer_ids=[0],
             index_source_layer_ids=[0, 1],
@@ -20879,3 +20879,53 @@ class TestDeepseekV41TokenMap(unittest.TestCase):
         step = state(mx.array([[5]]), 4, None)
         mx.eval(step)
         self.assertEqual(step.shape, (1, 1, 1, 4))
+
+
+class TestDeepseekV41FakeQuant(unittest.TestCase):
+    def test_deepseek_v41_fp8_zeros_stable(self):
+        from mlx_vlm.models import deepseek_v41
+
+        x = mx.zeros((2, 64), dtype=mx.float32)
+        out = deepseek_v41.fake_quant_fp8_ue8m0(x)
+        mx.eval(out)
+        self.assertEqual(out.shape, x.shape)
+        self.assertTrue(bool(mx.all(out == 0)))
+
+    def test_deepseek_v41_fakequant_disable(self):
+        from mlx_vlm.models.deepseek_v41 import fakequant as fq
+
+        x = mx.random.normal((2, 64))
+        mx.eval(x)
+        old = fq.DISABLE
+        fq.DISABLE = True
+        try:
+            self.assertTrue(bool(mx.all(fq.fake_quant_fp8_ue8m0(x) == x)))
+            self.assertTrue(bool(mx.all(fq.fake_quant_fp4_ue8m0(x) == x)))
+            self.assertTrue(bool(mx.all(fq.fake_quant_fp4_e4m3(x) == x)))
+        finally:
+            fq.DISABLE = old
+
+    def test_deepseek_v41_fp4_ties_to_even(self):
+        from mlx_vlm.models import deepseek_v41
+
+        x = mx.array(
+            [[0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 0.1] * 4], dtype=mx.float32
+        )
+        out = deepseek_v41.fake_quant_fp4_ue8m0(x)
+        mx.eval(out)
+        self.assertEqual(out.shape, x.shape)
+        flat = out.reshape(-1).tolist()
+        self.assertAlmostEqual(flat[0], 0.0)
+        self.assertAlmostEqual(flat[1], 1.0)
+        self.assertAlmostEqual(flat[2], 1.0)
+        self.assertAlmostEqual(flat[3], 2.0)
+
+    def test_deepseek_v41_fp4_e4m3_bounded(self):
+        from mlx_vlm.models import deepseek_v41
+
+        x = (mx.arange(64, dtype=mx.float32) / 63.0 * 4.0 - 2.0).reshape(1, -1)
+        x = mx.concatenate([x] * 2, axis=0)
+        out = deepseek_v41.fake_quant_fp4_e4m3(x)
+        mx.eval(out)
+        self.assertEqual(out.shape, x.shape)
+        self.assertTrue(bool(mx.all(mx.abs(out) <= 6.0 + 1e-3)))

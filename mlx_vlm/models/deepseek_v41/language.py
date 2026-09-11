@@ -17,6 +17,7 @@ from ..mla import MultiLinear
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 from .engram import Engram, EngramLayout, NgramHashState
+from .fakequant import fake_quant_fp4_e4m3, fake_quant_fp4_ue8m0, fake_quant_fp8_ue8m0
 
 
 class SharedIndexState:
@@ -125,8 +126,8 @@ class Indexer(nn.Module):
     A small side attention: query heads against one shared key per compressed position,
     scores rectified then combined by `weights_proj`. With a candidate source this is the
     second of two levels; `select_candidate_blocks` is the first. Only compression-source
-    layers publish index keys; every other indexer reads them from shared state. The fp4
-    QAT quantization of queries and keys lands with the quantization work.
+    layers publish index keys; every other indexer reads them from shared state. Queries
+    and keys pass through the QAT fake-quant before scoring.
     """
 
     def __init__(self, config: ModelConfig, layer_idx: int):
@@ -173,6 +174,7 @@ class Indexer(nn.Module):
             sin[positions][None, :, :],
             self.rope_head_dim,
         )
+        k = fake_quant_fp4_ue8m0(k)
         base = start_pos // ratio
         cache = self._k_cache
         if cache is None:
@@ -254,6 +256,7 @@ class Indexer(nn.Module):
             sin[positions][None, :, None, :],
             self.rope_head_dim,
         )
+        q = fake_quant_fp4_ue8m0(q)
 
         index_k = shared.index_k[:batch, : end_pos // ratio].astype(mx.float32)
         weights = self.weights_proj(x).astype(mx.float32) * (
@@ -385,8 +388,7 @@ class DeepseekV41Attention(nn.Module):
     Deliberate deviations from the reference: an ordered shift ring replaces the
     indexed ring buffer (same visible sets, mask-addressed); window and compressed
     KV stay in separate gathers so no concatenation offset is needed; the extra
-    query rms-norm in the V4 port is omitted (the reference has none); fp4/fp8
-    activation quantization of KV lands with the quantization work.
+    query rms-norm in the V4 port is omitted (the reference has none).
     """
 
     def __init__(self, config: ModelConfig, layer_idx: int):
@@ -494,6 +496,7 @@ class DeepseekV41Attention(nn.Module):
         win = self.window_size
         kv = self.kv_norm(self.wkv(x)).reshape(batch, 1, seqlen, self.head_dim)
         kv = self.rope(kv, start_pos).reshape(batch, seqlen, self.head_dim)
+        kv = fake_quant_fp8_ue8m0(kv.astype(mx.float32)).astype(kv.dtype)
         self._window_cache = self._grow_cache(
             self._window_cache, batch, win, self.head_dim
         )
@@ -551,6 +554,7 @@ class DeepseekV41Attention(nn.Module):
                     self._latent_theta,
                     self._latent_yarn,
                 )
+                latent = fake_quant_fp4_e4m3(latent)
                 base = start_pos // ratio
                 cache = self._grow_cache(
                     self._compress_cache, batch, base + n_latent, self.head_dim

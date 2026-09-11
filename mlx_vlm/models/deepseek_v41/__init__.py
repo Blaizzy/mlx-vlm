@@ -12,6 +12,7 @@ from .dequant import (
 )
 from .dspark import DSparkConfidenceHead, DSparkMarkovHead, get_dspark_topk_idxs
 from .engram import Engram, EngramLayout, NgramHashState
+from .fakequant import fake_quant_fp4_e4m3, fake_quant_fp4_ue8m0, fake_quant_fp8_ue8m0
 from .language import (
     Compressor,
     DeepseekV41Attention,
@@ -50,6 +51,9 @@ __all__ = [
     "Engram",
     "EngramLayout",
     "NgramHashState",
+    "fake_quant_fp4_e4m3",
+    "fake_quant_fp4_ue8m0",
+    "fake_quant_fp8_ue8m0",
     "Indexer",
     "LanguageModel",
     "ParallelHead",
