@@ -602,7 +602,12 @@ class DeepseekV41Attention(nn.Module):
             mask = window_mask
             kv = window_kv[:, None]
             out = mx.fast.scaled_dot_product_attention(
-                q, kv, kv, scale=self.scale, mask=mask, sinks=self.attn_sink
+                q,
+                kv,
+                kv,
+                scale=self.scale,
+                mask=mask,
+                sinks=self.attn_sink.astype(q.dtype),
             )
         out = self.rope(out, start_pos, inverse=True)
 
