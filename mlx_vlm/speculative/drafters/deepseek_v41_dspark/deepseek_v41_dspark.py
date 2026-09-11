@@ -349,8 +349,10 @@ class DeepseekV41DsparkDraftModel(nn.Module):
         """Map the ``mtp.<stage>.*`` checkpoint layout onto the drafter.
 
         Reuses the proven per-stage mapping, then renames the model-level
-        native markov head onto ``VanillaMarkov``. The native confidence head
-        is unused by the ``dflash`` loop and is dropped.
+        native markov head onto ``VanillaMarkov``. That head is stored inside
+        the last stage in released checkpoints and at the top level in split
+        ones, so both spellings are accepted. The native confidence head is
+        unused by the ``dflash`` loop and is dropped.
         """
         import re
 
@@ -358,16 +360,13 @@ class DeepseekV41DsparkDraftModel(nn.Module):
         from .split import sanitize_dspark_weights
 
         weights = sanitize_dspark_weights(weights)
-        for key in [k for k in weights if re.match(r"markov_head\.(embed|head)\.", k)]:
-            renamed = (
-                key.replace("markov_head.embed.", "markov_head.markov_w1.")
-                if ".embed." in key
-                else key.replace("markov_head.head.", "markov_head.markov_w2.")
-            )
-            weights[renamed] = weights.pop(key)
-        weights = {
-            k: v for k, v in weights.items() if not k.startswith("confidence_head.")
-        }
+        markov_re = re.compile(r"^(?:stages\.\d+\.)?markov_head\.(embed|head)\.(.+)$")
+        for key in [k for k in weights if markov_re.match(k)]:
+            m = markov_re.match(key)
+            slot = "markov_w1" if m.group(1) == "embed" else "markov_w2"
+            weights[f"markov_head.{slot}.{m.group(2)}"] = weights.pop(key)
+        confidence_re = re.compile(r"^(?:stages\.\d+\.)?confidence_head\.")
+        weights = {k: v for k, v in weights.items() if not confidence_re.match(k)}
         stages = {
             int(m.group(1))
             for k in weights
