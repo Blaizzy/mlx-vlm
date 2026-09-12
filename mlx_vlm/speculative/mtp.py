@@ -7,7 +7,6 @@ import mlx.core as mx
 from ..models.cache import BatchKVCache, BatchQuantizedKVCache
 from .cache_state import SpeculativeCache, iter_leaf_caches
 from .sampling import accept_greedy, accept_sampled
-from .stats import record_round
 
 
 def mtp_rounds(
@@ -30,6 +29,7 @@ def mtp_rounds(
     logits_processors=None,
     token_context=None,
     state=None,
+    compute_logprobs=False,
 ):
     """Yield one token per live row. ``max_tokens`` includes ``first_bonus``.
 
@@ -113,9 +113,11 @@ def mtp_rounds(
             if phase_observer:
                 phase_observer("verify", [output.logits, output.hidden_states[-1]])
             if greedy_sampling and not (logits_processors and any(logits_processors)):
-                rows = accept_greedy(proposals, output.logits, budgets)
+                accepted = accept_greedy(
+                    proposals, output.logits, budgets, compute_logprobs=compute_logprobs
+                )
             else:
-                rows = accept_sampled(
+                accepted = accept_sampled(
                     proposals,
                     output.logits,
                     budgets,
@@ -125,7 +127,9 @@ def mtp_rounds(
                     processors=logits_processors,
                     contexts=state.tokens,
                     greedy=greedy_sampling,
+                    compute_logprobs=compute_logprobs,
                 )
+            rows = accepted.tokens
             if phase_observer:
                 phase_observer("accept", [])
             for row, values in enumerate(rows):
@@ -152,12 +156,25 @@ def mtp_rounds(
                             phase_observer(
                                 "commit", [state.seed.token, state.seed.hidden]
                             )
-                        record_round(draft_model, proposals, emitted)
                         committed = True
-                    yield tokens, {"round_pos": pos, "round_len": width}
+                    yield tokens, {
+                        "round_pos": pos,
+                        "round_len": width,
+                        "logprobs": (
+                            [
+                                (
+                                    accepted.logprobs[row][pos]
+                                    if token is not None
+                                    else None
+                                )
+                                for row, token in enumerate(tokens)
+                            ]
+                            if accepted.logprobs is not None
+                            else None
+                        ),
+                    }
             finally:
                 if not committed:
                     state.commit(emitted, forward)
-                    record_round(draft_model, proposals, emitted)
     finally:
         state.abort()

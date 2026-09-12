@@ -59,7 +59,19 @@ per-request generated-token positions.
 
 ## Shared operations
 
-No new model-specific Metal kernels are introduced. Acceptance is a small
+Positioned samplers draw a complete verification block in one batch when there
+are no history-dependent processors. This preserves each row/position RNG key
+and transfers one prefix decision to the host. History-dependent sampling
+continues along accepted prefixes only.
+
+The shared short-block projection helper uses the existing dense GEMV kernel
+for singleton BF16/FP16 rows, including tied embedding output heads. MXFP8 MoE
+gate/up projections fuse into one dispatch and reuse selected expert weights
+across adjacent tokens. The dispatch is based on tensor shape and quantization
+format, with native fallbacks for other shapes and formats; it has no model-name
+or speculative-engine flags. Expert addresses use wide byte offsets.
+
+No model-specific Metal kernels are introduced. Acceptance is a small
 compiled MLX operation. Attention, gated-delta history, hyperconnections, and
 quantized projections use shared operators in `models/`. Shared operators
 are available to ordinary decoding and future model adapters. The Qwen batch
@@ -100,9 +112,27 @@ logits processors use this path. Processors see the full prompt plus only
 committed output tokens, including after prefix reuse. Processors requiring
 external updates after each token (such as structured output) yield one target
 token at a time; they preserve correctness but do not gain speculative speedup.
-Server thinking budgets and rotating/TurboQuant caches remain unsupported.
+Thinking budgets mask the target distribution at each sampled position, forcing
+the configured closing sequence once the reasoning budget is exhausted. Zero
+budgets, multi-token delimiters, natural termination, and boundaries inside a
+speculative block use the same policy as ordinary AR. Only committed history
+and the candidate accepted prefix determine the mask; rejected tokens cannot
+advance a reasoning counter. Rotating/TurboQuant caches remain unsupported.
 Native KV, batch KV, native quantized KV, recurrent arrays, and pooling caches
 participate in transactions. Model weights may be FP8 independently of KV format.
+
+Request metrics also belong to the cache, with separate accepted/drafted/round
+counters for every row. A prefix hit starts new counters. Completion responses
+report that row's counters, so overlapping requests never share metrics through
+the draft model.
+
+Pass `logprobs=True` to generation or request `logprobs` from the server to
+return verified target probabilities, including the first token, rejected-draft
+corrections, and bonus tokens. Server top logprobs are available within its
+configured cap. Values use processed target logits before temperature/top-P,
+matching ordinary AR. Forced reasoning tokens have probability one under the
+constrained distribution. Speculative calls without this option return no
+probability payload.
 
 ## Prefix reuse
 
@@ -134,6 +164,41 @@ No new Metal kernel is introduced for the second adapter.
 
 ## Validation and performance
 
+The latest [controlled optimization comparison](benchmarks/glm53-mtp-fp8-optimized.json)
+uses an M3 Ultra with 512 GB RAM and MLX 0.32.2. It measures 256 output tokens
+per row, one draft plus bonus, and two alternating before/after repetitions
+with the same loaded FP8 target and MTP weights. Every output matches AR:
+
+| Batch | Temperature | AR tok/s | Previous MTP tok/s | Optimized MTP tok/s | MTP improvement | Speedup over AR |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0 | 18.25 | 25.03 | 30.60 | 22.3% | 1.68× |
+| 1 | 0.8 | 17.99 | 23.01 | 28.29 | 22.9% | 1.57× |
+| 2 | 0 | 27.66 | 34.10 | 34.80 | 2.1% | 1.26× |
+| 2 | 0.8 | 27.55 | 29.99 | 31.18 | 4.0% | 1.13× |
+
+Rates for batch two are aggregate. The comparison substitutes the projection
+and acceptance functions from `378349e9` into the current cache-owned request
+loop, then enables the optimized functions. Target and MTP prefill are measured
+separately; decode rates count the remaining 255 tokens per row. These runs use
+raw encoded prompts without a chat template: a Fibonacci coding prompt for batch
+one, plus a sky explanation for batch two. Settings, exact prompts, tokens, and
+per-run timings are in the artifact. This short-context comparison does not
+establish the same speedup for long contexts or constrained sampling.
+
+The [FP8 reporting checks](benchmarks/glm53-mtp-fp8-reporting.json) compare 64
+sampled output tokens and their full target logprob vectors against AR, with no
+thinking limit and with budgets of 0 and 8. All three token sequences and every
+logprob match exactly. Forced closing tokens have a reported logprob of zero.
+The checks use the model's chat template with thinking enabled.
+
+The latest [Qwen3.5-0.8B matrix](benchmarks/qwen35-mtp-optimized.json) also passes
+all 12 token comparisons. One draft reaches 144.1–230.3 tok/s versus
+127.0–137.3 tok/s for AR at batch one. At batch two it reaches 205.7–217.2
+aggregate tok/s versus 305.4–334.2 for AR. Batch-two MTP remains slower for this
+small model despite the shared optimizations.
+
+Earlier measurements below establish longer-output, prefix-cache, and
+multi-context coverage before these projection and sampling optimizations.
 The primary measurements use GLM-5.3-Flash FP8 target weights and an MXFP8
 native MTP head on MLX 0.32.2. All recorded comparisons match every ordinary
 AR token:
@@ -190,3 +255,9 @@ it does not copy CUDA scheduling or paged allocation.
 See also [vLLM MTP](https://docs.vllm.ai/en/latest/features/speculative_decoding/mtp/),
 [SGLang speculative decoding](https://docs.sglang.io/docs/advanced_features/speculative_decoding),
 and the [official FP8 checkpoint](https://huggingface.co/zai-org/GLM-5.3-Flash).
+
+Thinking-budget behavior follows sampling-time constraints in
+[vLLM's thinking-budget state](https://github.com/vllm-project/vllm/blob/9d3e991ece7f54c173c0cc9261ab5969b1dbeb4c/vllm/v1/sample/thinking_budget_state.py)
+and [SGLang's reasoning grammar](https://github.com/sgl-project/sglang/blob/ae1acf822dd357641d885f30c58d2ad547ec9220/python/sglang/srt/constrained/reasoner_grammar_backend.py).
+The MLX policy reads the cache-owned token prefix directly instead of maintaining
+a second speculative reasoning cursor that needs rollback.

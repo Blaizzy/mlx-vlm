@@ -269,8 +269,8 @@ def generate_step(
           MTP loop. VLM prefill with image/audio
           is supported via the same ``get_input_embeddings`` path the normal
           decoder uses; decode itself is text-only. ``temperature`` and
-          ``sampler`` are respected; continuation ``logprobs`` are unavailable
-          on the speculative path.
+          ``sampler`` are respected. Pass ``logprobs=True`` to return target
+          log probabilities for every speculative output token.
         draft_block_size (int, optional): Override the drafter's configured
           block size.
 
@@ -341,6 +341,12 @@ def generate_step(
     target_sample_position = 0
 
     thinking_budget_criteria = kwargs.pop("thinking_budget_criteria", None)
+    compute_logprobs = kwargs.pop("logprobs", kwargs.pop("compute_logprobs", False))
+    if hasattr(thinking_budget_criteria, "make_logits_processor"):
+        policy = thinking_budget_criteria.make_logits_processor(full_prompt_tokens.size)
+        if policy is not None:
+            processors.append(policy)
+        thinking_budget_criteria = None
 
     # Create the KV cache for generation
     if speculative_state is not None:
@@ -571,6 +577,7 @@ def generate_step(
             logits_processors=processors,
             token_context=full_prompt_tokens.tolist(),
             state=speculative_prefill.state,
+            compute_logprobs=compute_logprobs,
         )
         return
 
@@ -1109,9 +1116,10 @@ class GenerationBatch:
     class Response:
         uid: int
         token: int
-        token_logprob: float
+        token_logprob: Optional[float]
         finish_reason: Optional[str]
         top_logprobs: Optional[List[Tuple[int, float]]] = None
+        speculative_stats: Optional[tuple] = None
 
     def __init__(
         self,
@@ -1587,6 +1595,9 @@ class SpeculativeGenerationBatch:
         token_context=None,
         state=None,
         checkpoint=None,
+        compute_logprobs=False,
+        top_logprobs_k=0,
+        first_logprobs=None,
     ):
         self.model = model
         self.draft_model = draft_model
@@ -1607,6 +1618,9 @@ class SpeculativeGenerationBatch:
         self.token_context = token_context
         self.state = state
         self.checkpoint = checkpoint
+        self.compute_logprobs = compute_logprobs
+        self.top_logprobs_k = top_logprobs_k
+        self.first_logprobs = first_logprobs
         if state is not None:
             state.tokens = [list(ctx) for ctx in (token_context or [[] for _ in uids])]
         self._checkpointed = set()
@@ -1617,6 +1631,14 @@ class SpeculativeGenerationBatch:
 
     def __len__(self):
         return sum(not done for done in self._finished)
+
+    def _attach_stats(self, responses):
+        if self.state is not None:
+            for response in responses:
+                if response.finish_reason is not None:
+                    row = self._all_uids.index(response.uid)
+                    response.speculative_stats = self.state.stats[row].snapshot()
+        return responses
 
     def _refresh_uids(self):
         self.uids = [
@@ -1658,7 +1680,11 @@ class SpeculativeGenerationBatch:
         self,
         responses: List[GenerationBatch.Response],
         tok_list: List[Optional[int]],
+        metadata=None,
     ) -> None:
+        from ..speculative.sampling import token_logprobs
+
+        distributions = metadata.get("logprobs") if metadata else None
         for row, token in enumerate(tok_list):
             if token is None or self._finished[row]:
                 continue
@@ -1667,11 +1693,17 @@ class SpeculativeGenerationBatch:
             finish_reason = self._finish_reason(row, token)
             if finish_reason is not None:
                 self._finished[row] = True
+            lp, top_lp = token_logprobs(
+                distributions[row] if distributions is not None else None,
+                token,
+                self.top_logprobs_k,
+            )
             responses.append(
                 self.Response(
                     uid=self._all_uids[row],
                     token=token,
-                    token_logprob=0.0,
+                    token_logprob=lp,
+                    top_logprobs=top_lp,
                     finish_reason=finish_reason,
                 )
             )
@@ -1706,6 +1738,7 @@ class SpeculativeGenerationBatch:
             logits_processors=self.logits_processors,
             token_context=self.token_context,
             state=self.state,
+            compute_logprobs=self.compute_logprobs,
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -1716,6 +1749,8 @@ class SpeculativeGenerationBatch:
         if not self._sent_first:
             self._sent_first = True
             mx.eval(self.first_tokens)
+            from ..speculative.sampling import token_logprobs
+
             for row, token in enumerate(self.first_tokens.tolist()):
                 if self._finished[row]:
                     continue
@@ -1726,16 +1761,26 @@ class SpeculativeGenerationBatch:
                 finish_reason = self._finish_reason(row, token)
                 if finish_reason is not None:
                     self._finished[row] = True
+                lp, top_lp = token_logprobs(
+                    (
+                        self.first_logprobs[row]
+                        if self.compute_logprobs and self.first_logprobs is not None
+                        else None
+                    ),
+                    token,
+                    self.top_logprobs_k,
+                )
                 responses.append(
                     self.Response(
                         uid=self._all_uids[row],
                         token=token,
-                        token_logprob=0.0,
+                        token_logprob=lp,
+                        top_logprobs=top_lp,
                         finish_reason=finish_reason,
                     )
                 )
             self._refresh_uids()
-            return responses
+            return self._attach_stats(responses)
 
         self._start_rounds()
         try:
@@ -1753,9 +1798,9 @@ class SpeculativeGenerationBatch:
                         )
                     )
             self._refresh_uids()
-            return responses
+            return self._attach_stats(responses)
 
-        self._append_token_responses(responses, tok_list)
+        self._append_token_responses(responses, tok_list, round_meta)
         while isinstance(round_meta, dict) and int(
             round_meta.get("round_pos", 0)
         ) + 1 < int(round_meta.get("round_len", 1)):
@@ -1763,10 +1808,10 @@ class SpeculativeGenerationBatch:
                 tok_list, round_meta = next(self._rounds_iter)
             except StopIteration:
                 break
-            self._append_token_responses(responses, tok_list)
+            self._append_token_responses(responses, tok_list, round_meta)
 
         self._refresh_uids()
-        return responses
+        return self._attach_stats(responses)
 
 
 class SpeculativePromptBatch:
@@ -1829,6 +1874,13 @@ class SpeculativePromptBatch:
             ],
             token_context=contexts,
             state=state,
+            compute_logprobs=first.compute_logprobs,
+            top_logprobs_k=first.top_logprobs_k,
+            first_logprobs=(
+                mx.concatenate([b.first_logprobs for b in batches])
+                if first.compute_logprobs
+                else None
+            ),
             checkpoint=lambda state, row, tokens: batches[row].checkpoint(
                 state, row, tokens
             ),
@@ -1929,6 +1981,7 @@ class PromptProcessingBatch:
         self._token_context = (
             [list(ids) for ids in (full_token_context or input_ids)]
             if draft_model is not None
+            or any(self.thinking_budget_criteria)
             or (self.logits_processors and any(self.logits_processors))
             else []
         )
@@ -2307,6 +2360,17 @@ class PromptProcessingBatch:
             self._finished_prompt_logits.clear()
         else:
             logits = logits[:, -1, :]
+        for row, criteria in enumerate(self.thinking_budget_criteria):
+            if hasattr(criteria, "make_logits_processor"):
+                policy = criteria.make_logits_processor(len(self._token_context[row]))
+                if policy is not None:
+                    if not self.logits_processors:
+                        self.logits_processors = [[] for _ in self.uids]
+                    self.logits_processors[row] = list(
+                        self.logits_processors[row] or []
+                    ) + [policy]
+                self.thinking_budget_criteria[row] = None
+
         if self.logits_processors and any(self.logits_processors):
             processed_logits = []
             for i in range(logits.shape[0]):
@@ -2376,8 +2440,10 @@ class PromptProcessingBatch:
                 token_context=self._token_context or None,
                 state=self._speculative_prefill.state,
                 checkpoint=self._speculative_decode_checkpoint,
+                compute_logprobs=compute_logprobs,
+                top_logprobs_k=top_logprobs_k,
+                first_logprobs=logprobs if compute_logprobs else None,
             )
-            compute_logprobs = False
         else:
             gen_batch = GenerationBatch(
                 model=self.model,
@@ -2612,10 +2678,6 @@ class BatchGenerator:
                 self.speculative_prefix = SpeculativePrefixCache(
                     apc_manager, model, draft_model
                 )
-            compute_logprobs = False
-            top_logprobs_k = 0
-            self.compute_logprobs = False
-            self.top_logprobs_k = 0
         self.apc = (
             _apc.APCCoordinator(apc_manager, model)
             if apc_manager is not None and draft_model is None
@@ -2949,6 +3011,7 @@ class BatchGenerator:
             right_pad_per_row=right_pad_per_row,
             suffix_lens=suffix_lens,
             apc_mode=apc_mode,
+            full_token_context=full_ids,
             draft_model=getattr(self, "draft_model", None),
             draft_kind=getattr(self, "draft_kind", None),
             draft_block_size=getattr(self, "draft_block_size", None),

@@ -1,34 +1,31 @@
-"""Lifetime counters used by CLI and server request reporting."""
+"""Per-request speculative counters, owned by the request cache."""
+
+from dataclasses import dataclass
 
 
-def speculative_stats_snapshot(draft_model):
-    return getattr(draft_model, "speculative_stats", (0, 0, 0))
+@dataclass
+class SpeculativeStats:
+    rounds: int = 0
+    accepted: int = 0
+    drafted: int = 0
 
-
-def record_round(draft_model, proposals, emitted):
-    rounds, accepted, drafted = speculative_stats_snapshot(draft_model)
-    drafts = proposals.tolist()
-    for proposal, output in zip(drafts, emitted):
-        if not output:
-            continue
-        drafted += len(proposal)
-        for expected, actual in zip(proposal, output):
+    def record(self, proposals, emitted):
+        if not emitted or not proposals:
+            return
+        self.rounds += 1
+        self.drafted += len(proposals)
+        for expected, actual in zip(proposals, emitted):
             if expected != actual:
                 break
-            accepted += 1
-    draft_model.speculative_stats = (rounds + 1, accepted, drafted)
+            self.accepted += 1
+
+    def snapshot(self):
+        return self.rounds, self.accepted, self.drafted
 
 
-def speculative_stats_since(draft_model, snapshot):
-    values = tuple(
-        a - b for a, b in zip(speculative_stats_snapshot(draft_model), snapshot)
-    )
-    return values if values[0] else (None, None, None)
-
-
-def format_speculative_stats(draft_model):
-    rounds, accepted, drafted = speculative_stats_snapshot(draft_model)
-    if not rounds:
+def format_speculative_stats(stats):
+    if stats is None or not stats[0]:
         return None
+    rounds, accepted, drafted = stats
     rate = 100 * accepted / drafted if drafted else 0
     return f"MTP: {accepted}/{drafted} drafts accepted ({rate:.1f}%) in {rounds} rounds"

@@ -17,7 +17,6 @@ from mlx_vlm.generate.common import wired_limit
 from mlx_vlm.speculative.cache_state import SpeculativePrefill
 from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
 from mlx_vlm.speculative.mtp import mtp_rounds
-from mlx_vlm.speculative.stats import speculative_stats_snapshot
 from mlx_vlm.utils import load
 
 
@@ -137,6 +136,13 @@ def run(
             "tokens_per_second": sum(len(row) - 1 for row in result) / elapsed,
             "peak_memory_gb": mx.get_peak_memory() / 1e9,
         }
+        if draft is not None:
+            counters = prefill_state.state.stats
+            report["stats"] = [
+                max(s.rounds for s in counters),
+                sum(s.accepted for s in counters),
+                sum(s.drafted for s in counters),
+            ]
         if profiler:
             report["phases"] = profiler.report()
         return report
@@ -227,7 +233,6 @@ def main():
                         flush=True,
                     )
                     for block_size in args.block_sizes:
-                        before = speculative_stats_snapshot(draft)
                         actual = run(
                             target,
                             draft,
@@ -239,10 +244,7 @@ def main():
                             args.profile,
                             args.prefill_step_size,
                         )
-                        stats = [
-                            a - b
-                            for a, b in zip(speculative_stats_snapshot(draft), before)
-                        ]
+                        stats = actual["stats"]
                         parity = actual["tokens"] == baseline["tokens"]
                         report["runs"].append(
                             {

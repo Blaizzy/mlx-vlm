@@ -395,20 +395,17 @@ def test_native_quantized_kv_transaction_retains_each_row_prefix(bits):
             assert mx.array_equal(actual[row : row + 1, :, start:], reference).item()
 
 
-def test_mtp_statistics_count_partial_rounds_and_snapshots():
-    from mlx_vlm.speculative.stats import (
-        record_round,
-        speculative_stats_since,
-        speculative_stats_snapshot,
-    )
+def test_mtp_statistics_are_per_request_and_count_partial_rounds():
+    from mlx_vlm.speculative.stats import SpeculativeStats
 
-    draft = SimpleNamespace()
-    snapshot = speculative_stats_snapshot(draft)
-    record_round(draft, mx.array([[1, 2, 3], [4, 5, 6]]), [[1, 9], []])
-    assert speculative_stats_since(draft, snapshot) == (1, 1, 3)
-    snapshot = speculative_stats_snapshot(draft)
-    record_round(draft, mx.array([[1, 2]]), [[1, 2, 3]])
-    assert speculative_stats_since(draft, snapshot) == (1, 2, 2)
+    first, second = SpeculativeStats(), SpeculativeStats()
+    first.record([1, 2, 3], [1, 9])
+    second.record([4, 5, 6], [])
+    assert first.snapshot() == (1, 1, 3)
+    assert second.snapshot() == (0, 0, 0)
+    second.record([1, 2], [1, 2, 3])
+    assert second.snapshot() == (1, 2, 2)
+    assert first.snapshot() == (1, 1, 3)
 
 
 def _tiny_glm5_next_text_config():

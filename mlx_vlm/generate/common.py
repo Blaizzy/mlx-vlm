@@ -270,6 +270,7 @@ class GenerationResult:
     diffusion_canvas_index: int = 0
     diffusion_block_complete: bool = False
     token_ids: Optional[List[int]] = None
+    speculative_stats: Optional[tuple] = None
 
 
 class PromptCacheState:

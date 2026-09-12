@@ -421,6 +421,154 @@ def singleton_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
     return output
 
 
+_FP_SWITCH_GATE_UP_SOURCE = r"""
+constexpr int RESULTS = 4;
+constexpr int SIMDS = 2;
+constexpr int ROWS = RESULTS * SIMDS;
+constexpr int W_ROW_BYTES = K_SIZE * BITS / 8;
+constexpr int GROUPS = K_SIZE / GROUP_SIZE;
+uint lane = thread_index_in_simdgroup;
+uint simd = simdgroup_index_in_threadgroup;
+int route = int(threadgroup_position_in_grid.z);
+int token = route / TOP_K;
+int time = token % LENGTH;
+int expert = int(indices[route]);
+int paired = -1;
+if ((time & 1) == 0 && time + 1 < LENGTH) {
+  for (int other = 0; other < TOP_K; ++other) {
+    int next = (token + 1) * TOP_K + other;
+    if (int(indices[next]) == expert) { paired = next; break; }
+  }
+} else if ((time & 1) != 0) {
+  for (int other = 0; other < TOP_K; ++other) {
+    if (int(indices[(token - 1) * TOP_K + other]) == expert) { return; }
+  }
+}
+int pairs = paired >= 0 ? 2 : 1;
+int out_row = int(threadgroup_position_in_grid.y) * ROWS + int(simd) * RESULTS;
+size_t weight_offset = (size_t(expert) * N_SIZE + out_row) * W_ROW_BYTES +
+                    int(lane) * PACKS_PER_THREAD * BYTES_PER_PACK;
+size_t scale_offset = (size_t(expert) * N_SIZE + out_row) * GROUPS +
+                   int(lane) / SCALE_STEP_PER_THREAD;
+const device uint8_t* uw = (const device uint8_t*)up_w + weight_offset;
+const device uint8_t* gw = (const device uint8_t*)gate_w + weight_offset;
+const device uint8_t* us = up_scales + scale_offset;
+const device uint8_t* gs = gate_scales + scale_offset;
+const device T* xp[2] = {
+    x + token * K_SIZE + int(lane) * VALUES_PER_THREAD,
+    x + (paired >= 0 ? paired / TOP_K : token) * K_SIZE + int(lane) * VALUES_PER_THREAD
+};
+float up_acc[2][RESULTS] = {0.0f};
+float gate_acc[2][RESULTS] = {0.0f};
+float xv[2][VALUES_PER_THREAD];
+for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
+  for (int pair = 0; pair < pairs; ++pair) {
+    load_quantized_vector<T>(xp[pair], xv[pair]);
+  }
+  for (int row = 0; row < RESULTS; ++row) {
+    float up_scale = quantized_scale(us[row * GROUPS]);
+    float gate_scale = quantized_scale(gs[row * GROUPS]);
+    for (int pair = 0; pair < pairs; ++pair) {
+      up_acc[pair][row] += quantized_dot(uw + row * W_ROW_BYTES, xv[pair], up_scale, 0.0f, 0.0f);
+      gate_acc[pair][row] += quantized_dot(gw + row * W_ROW_BYTES, xv[pair], gate_scale, 0.0f, 0.0f);
+    }
+  }
+  uw += BLOCK_SIZE * BITS / 8;
+  gw += BLOCK_SIZE * BITS / 8;
+  us += BLOCK_SIZE / GROUP_SIZE;
+  gs += BLOCK_SIZE / GROUP_SIZE;
+  xp[0] += BLOCK_SIZE;
+  xp[1] += BLOCK_SIZE;
+}
+for (int pair = 0; pair < pairs; ++pair) {
+  int output_route = pair == 0 ? route : paired;
+  for (int row = 0; row < RESULTS; ++row) {
+    float up_value = simd_sum(up_acc[pair][row]);
+    float gate_value = simd_sum(gate_acc[pair][row]);
+    if (lane == 0) {
+      up_y[output_route * N_SIZE + out_row + row] = T(up_value);
+      gate_y[output_route * N_SIZE + out_row + row] = T(gate_value);
+    }
+  }
+}
+"""
+
+
+@lru_cache(maxsize=None)
+def _fp_switch_gate_up_kernel(bits, group_size):
+    return mx.fast.metal_kernel(
+        name=f"quantized_switch_gate_up_fp{bits}_g{group_size}",
+        input_names=["x", "indices", "up_w", "up_scales", "gate_w", "gate_scales"],
+        output_names=["up_y", "gate_y"],
+        header=_FP_MOE_HC_HEADER.replace("BITS", str(bits)).replace(
+            "GROUP_SIZE", str(group_size)
+        ),
+        source=_FP_SWITCH_GATE_UP_SOURCE,
+    )
+
+
+def exact_quantized_switch_gate_up(switch, x, indices):
+    """Fuse two selected-expert projections, reusing weights at adjacent tokens.
+
+    Shared by every SwitchGLU model using MXFP8 weights. Each
+    projection keeps the singleton gather-QMV accumulation and output rounding.
+    """
+    up, gate = switch.up_proj, switch.gate_proj
+    if getattr(up, "mode", None) == "affine":
+        from .fast_ops import exact_affine_switch_gate_up
+
+        return exact_affine_switch_gate_up(switch, x, indices)
+    if (
+        not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
+        or x.ndim != 3
+        or x.shape[1] != 2
+        or x.dtype not in (mx.bfloat16, mx.float16)
+        or getattr(up, "mode", None) != "mxfp8"
+        or indices.ndim != 3
+        or indices.shape[:2] != x.shape[:2]
+        or not all(
+            isinstance(layer, QuantizedSwitchLinear)
+            and supports_quantization(layer)
+            and "bias" not in layer
+            and layer.mode == up.mode
+            and layer.group_size == up.group_size
+            and layer.scales.dtype == mx.uint8
+            for layer in (up, gate)
+        )
+        or gate.weight.shape != up.weight.shape
+        or x.shape[-1] != up.input_dims
+        or x.shape[-1] % 512
+        or up.output_dims % 8
+    ):
+        return None
+    batch, length, width = x.shape
+    outputs = (batch, length, indices.shape[-1], up.output_dims)
+    return _fp_switch_gate_up_kernel(up.bits, up.group_size)(
+        inputs=[
+            mx.contiguous(x),
+            mx.contiguous(indices.astype(mx.int32)),
+            up.weight,
+            up.scales,
+            gate.weight,
+            gate.scales,
+        ],
+        template=[
+            ("T", x.dtype),
+            ("BITS", up.bits),
+            ("GROUP_SIZE", up.group_size),
+            ("LENGTH", length),
+            ("K_SIZE", width),
+            ("N_SIZE", up.output_dims),
+            ("TOP_K", indices.shape[-1]),
+        ],
+        grid=(32, 2 * (up.output_dims // 8), batch * length * indices.shape[-1]),
+        threadgroup=(32, 2, 1),
+        output_shapes=[outputs, outputs],
+        output_dtypes=[x.dtype, x.dtype],
+    )
+
+
 def exact_quantized_switch_linear(
     linear,
     x: mx.array,

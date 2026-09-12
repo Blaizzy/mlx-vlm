@@ -285,3 +285,66 @@ def test_general_quantized_argmax_supports_packed_mask(mode, bits, group_size):
 
     assert actual is not None
     assert mx.array_equal(actual, allowed).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("batch", [1, 2, 4])
+@pytest.mark.parametrize("shared_routes", [False, True])
+def test_fused_fp8_gate_up_matches_native_selected_projections(
+    dtype, batch, shared_routes
+):
+    from mlx_vlm.models.quantized_verifier import exact_quantized_switch_gate_up
+
+    mx.random.seed(53)
+    switch = SwitchGLU(512, 256, 6)
+    switch.up_proj = switch.up_proj.to_quantized(32, 8, "mxfp8")
+    switch.gate_proj = switch.gate_proj.to_quantized(32, 8, "mxfp8")
+    # A strided input exercises the shared dispatch's layout normalization.
+    x = mx.random.normal((batch, 4, 512)).astype(dtype)[:, ::2]
+    routes = [[0, 1, 2], [2, 3, 0] if shared_routes else [3, 4, 5]]
+    indices = mx.broadcast_to(mx.array(routes)[None], (batch, 2, 3))
+    actual = exact_quantized_switch_gate_up(switch, x, indices)
+    expected = tuple(
+        exact_quantized_switch_linear(l, x, indices)
+        for l in (switch.up_proj, switch.gate_proj)
+    )
+    mx.eval(actual, expected)
+    assert actual is not None
+    assert all(mx.array_equal(a, b).item() for a, b in zip(actual, expected))
+
+
+def test_fp8_gate_up_preserves_fallbacks_for_other_shapes_and_formats():
+    from mlx_vlm.models.quantized_verifier import exact_quantized_switch_gate_up
+
+    switch = SwitchGLU(512, 256, 4)
+    switch.up_proj = switch.up_proj.to_quantized(32, 8, "mxfp8")
+    switch.gate_proj = switch.gate_proj.to_quantized(32, 8, "mxfp8")
+    for length in (1, 3):
+        x = mx.zeros((1, length, 512), mx.bfloat16)
+        indices = mx.zeros((1, length, 1), mx.int32)
+        assert exact_quantized_switch_gate_up(switch, x, indices) is None
+    switch.gate_proj = QuantizedSwitchLinear(512, 256, 4, False, 32, 4, "mxfp4")
+    assert (
+        exact_quantized_switch_gate_up(
+            switch, mx.zeros((1, 2, 512), mx.bfloat16), mx.zeros((1, 2, 1), mx.int32)
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("embedding", [False, True])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_short_dense_projection_matches_singleton_decode(embedding, dtype):
+    from mlx_vlm.models.linear import linear
+
+    mx.random.seed(14)
+    module = nn.Embedding(512, 1024) if embedding else nn.Linear(1024, 512, bias=False)
+    module.weight = module.weight.astype(dtype)
+    module.eval()
+    operation = module.as_linear if embedding else module
+    x = mx.random.normal((1, 3, 1024)).astype(dtype)
+    expected = mx.concatenate([operation(x[:, i : i + 1]) for i in range(3)], axis=1)
+    observed = linear(operation, x)
+    mx.eval(expected, observed)
+    assert mx.array_equal(observed, expected).item()

@@ -201,7 +201,9 @@ cache commit path. FP8 source weights use the shared MXFP8 loader.
 
 This rebuild retires the former DFlash, EAGLE, and other MTP adapters. Atomic
 prefix reuse restores target and draft state together. Logits processors use
-full committed-token histories, including after prefix reuse.
+full committed-token histories, including after prefix reuse. Thinking budgets
+constrain target sampling within speculative blocks. Requests with `logprobs=true`
+receive target probabilities; acceptance metrics are isolated per request.
 See [the implementation guide](docs/speculative-decoding.md) for the cache
 contract and a reproducible FP8 parity benchmark.
 

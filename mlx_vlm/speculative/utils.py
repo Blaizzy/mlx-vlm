@@ -3,11 +3,7 @@
 from .cache_state import SpeculativePrefill
 from .drafters import validate_drafter_compatibility
 from .mtp import mtp_rounds
-from .stats import (
-    format_speculative_stats,
-    speculative_stats_since,
-    speculative_stats_snapshot,
-)
+from .stats import format_speculative_stats
 
 __all__ = [
     "SpeculativePrefill",
@@ -17,8 +13,6 @@ __all__ = [
     "run_speculative_server_rounds",
     "speculative_hidden_state",
     "speculative_prefill_kwargs",
-    "speculative_stats_since",
-    "speculative_stats_snapshot",
 ]
 
 
@@ -68,6 +62,7 @@ def run_speculative_rounds(
     logits_processors=None,
     token_context=None,
     state=None,
+    compute_logprobs=False,
 ):
     if max_tokens <= 0:
         return
@@ -75,7 +70,7 @@ def run_speculative_rounds(
     batch = input_ids.shape[0]
     first_token = first_token.reshape(-1)
     values = first_token.tolist()
-    yield values[0] if batch == 1 else values, logprobs
+    yield values[0] if batch == 1 else values, logprobs if compute_logprobs else None
     target = getattr(model, "language_model", model)
     eos = getattr(target.config, "eos_token_id", None)
     eos = {eos} if isinstance(eos, int) else set(eos or [])
@@ -95,9 +90,15 @@ def run_speculative_rounds(
         logits_processors=[logits_processors or []] * batch,
         token_context=token_context,
         state=state,
+        compute_logprobs=compute_logprobs,
     )
     try:
-        for tokens, _ in rounds:
-            yield tokens[0] if batch == 1 else tokens, None
+        for tokens, metadata in rounds:
+            distributions = metadata["logprobs"]
+            yield (tokens[0] if batch == 1 else tokens), (
+                distributions[0]
+                if batch == 1 and distributions is not None
+                else distributions
+            )
     finally:
         rounds.close()

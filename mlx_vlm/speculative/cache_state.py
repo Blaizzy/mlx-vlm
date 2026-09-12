@@ -19,6 +19,7 @@ from ..models.cache import (
     PoolingCache,
     QuantizedKVCache,
 )
+from .stats import SpeculativeStats
 
 
 def iter_leaf_caches(caches):
@@ -207,9 +208,11 @@ class SpeculativeCache:
         self.bonus = bonus.reshape(-1, 1)
         self.seed = None
         self.tokens = None
+        self.stats = [SpeculativeStats() for _ in range(self.position.size)]
         self._target_round = None
         self._draft_round = None
         self._verified_hidden = None
+        self._proposals = None
 
     @classmethod
     def create(cls, target_cache, drafter, batch):
@@ -280,6 +283,7 @@ class SpeculativeCache:
             mx.concatenate([s.seed.hidden for s in states]),
         )
         state.position_offset = mx.concatenate([s.position_offset for s in states])
+        state.stats = [stats for s in states for stats in s.stats]
         return state
 
     def positions(self, length):
@@ -305,7 +309,8 @@ class SpeculativeCache:
         self._target_round = CacheTransaction(self.target, count + 1)
         try:
             if count == 0:
-                return self.bonus[:, :0]
+                self._proposals = self.bonus[:, :0]
+                return self._proposals
             token, hidden = self.seed.token, self.seed.hidden
             proposals = [token]
             if count > 1:
@@ -319,7 +324,8 @@ class SpeculativeCache:
                 )
                 token = mx.argmax(logits, axis=-1)
                 proposals.append(token)
-            return mx.concatenate(proposals, axis=1).astype(self.bonus.dtype)
+            self._proposals = mx.concatenate(proposals, axis=1).astype(self.bonus.dtype)
+            return self._proposals
         except BaseException:
             self.abort()
             raise
@@ -379,6 +385,10 @@ class SpeculativeCache:
             if self.tokens is not None:
                 for context, emitted in zip(self.tokens, tokens):
                     context.extend(emitted)
+            for stats, draft, output in zip(
+                self.stats, self._proposals.tolist(), tokens
+            ):
+                stats.record(draft, output)
         finally:
             self.abort()
 
@@ -388,4 +398,4 @@ class SpeculativeCache:
         if self._draft_round is not None:
             self._draft_round.abort()
         self._target_round = self._draft_round = None
-        self._verified_hidden = None
+        self._verified_hidden = self._proposals = None

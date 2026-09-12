@@ -962,6 +962,10 @@ def stream_generate(
         )
 
     speculative_holder = {}
+    if kwargs.get("draft_model") is not None:
+        kwargs["speculative_cache_callback"] = lambda state: speculative_holder.update(
+            state=state
+        )
     if speculative_prefix is not None:
         state, prefix_len = speculative_prefix.lookup(
             full_input_ids_list, extra_hash=apc_extra_hash
@@ -986,9 +990,6 @@ def stream_generate(
             )
 
         kwargs["speculative_checkpoint"] = speculative_checkpoint
-        kwargs["speculative_cache_callback"] = lambda state: speculative_holder.update(
-            state=state
-        )
 
     if (
         kwargs.get("draft_model") is None
@@ -1136,7 +1137,9 @@ def stream_generate(
                 generated_tokens.append(token)
 
                 # Check thinking budget and force token if needed
-                if thinking_criteria is not None:
+                if thinking_criteria is not None and not hasattr(
+                    thinking_criteria, "make_logits_processor"
+                ):
                     thinking_criteria(token)
 
                 # Stop generation if the token is in the eos_token_ids
@@ -1207,6 +1210,11 @@ def stream_generate(
             peak_memory=mx.get_peak_memory() / 1e9,
             cached_tokens=reused_prefix_len,
             finish_reason=finish_reason,
+            speculative_stats=(
+                speculative_holder["state"].stats[0].snapshot()
+                if "state" in speculative_holder
+                else None
+            ),
             token_ids=[
                 int(t.item()) if hasattr(t, "item") else int(t)
                 for t in generated_tokens
@@ -1362,6 +1370,7 @@ def generate(
         generation_tps=last_response.generation_tps,
         peak_memory=last_response.peak_memory,
         cached_tokens=last_response.cached_tokens,
+        speculative_stats=last_response.speculative_stats,
         finish_reason=last_response.finish_reason,
         diffusion_canvas_tokens=last_response.diffusion_canvas_tokens,
         diffusion_denoising_steps=last_response.diffusion_denoising_steps,
@@ -1712,7 +1721,7 @@ def main():
             print(f"Audio written to {result.path}")
 
         if draft_model is not None:
-            stats = format_speculative_stats(draft_model)
+            stats = format_speculative_stats(result.speculative_stats)
             if stats is not None:
                 print(stats)
 

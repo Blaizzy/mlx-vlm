@@ -5431,8 +5431,9 @@ class TestResponseGenerator:
             ]
 
     @pytest.mark.parametrize("draft_kind", ["mtp"])
+    @pytest.mark.parametrize("second_logprobs", [False, True])
     def test_run_routes_speculative_decode_through_batch_generator(
-        self, monkeypatch, draft_kind
+        self, monkeypatch, draft_kind, second_logprobs
     ):
         batch_state = {}
         draft_model = object()
@@ -5454,6 +5455,8 @@ class TestResponseGenerator:
             def __init__(self, *args, **kwargs):
                 del args
                 batch_state["kwargs"] = kwargs
+                self.compute_logprobs = kwargs["compute_logprobs"]
+                self.top_logprobs_k = kwargs["top_logprobs_k"]
                 self._next_uid = 1
                 self._active = {}
                 self.next_active_sizes = []
@@ -5486,6 +5489,7 @@ class TestResponseGenerator:
                         token=uid + 100,
                         token_logprob=0.0,
                         finish_reason="length",
+                        speculative_stats=(uid, uid * 2, uid * 3),
                     )
                     for uid in sorted(self._active)
                 ]
@@ -5518,7 +5522,7 @@ class TestResponseGenerator:
         gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
         gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
         gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
-        gen.top_logprobs_k = 0
+        gen.top_logprobs_k = 7
         apc_manager = SimpleNamespace(prepare_prefill=MagicMock(), close=MagicMock())
         gen.apc_manager = apc_manager
         gen.prefill_step_size = 3072
@@ -5554,7 +5558,11 @@ class TestResponseGenerator:
                     rqueue=rqueue,
                     raw_inputs={"request_id": request_id},
                     prompt_tokens=1,
-                    args=server.GenerationArguments(max_tokens=1, temperature=0),
+                    args=server.GenerationArguments(
+                        max_tokens=1,
+                        temperature=0,
+                        logprobs=second_logprobs and request_id == 1,
+                    ),
                 )
             )
 
@@ -5567,6 +5575,11 @@ class TestResponseGenerator:
                 assert isinstance(ctx, server.GenerationContext)
                 item = rqueue.get(timeout=1)
                 assert item.finish_reason == "length"
+                assert (item.draft_rounds, item.draft_n_accepted, item.draft_n) == (
+                    ctx.uid,
+                    ctx.uid * 2,
+                    ctx.uid * 3,
+                )
                 assert rqueue.get(timeout=1) is None
         finally:
             gen._stop = True
@@ -5579,6 +5592,8 @@ class TestResponseGenerator:
         assert kwargs["draft_block_size"] == 6
         assert kwargs["greedy_sampling"] is True
         assert kwargs["compute_logprobs"] is False
+        assert batch_state["instance"].compute_logprobs is second_logprobs
+        assert batch_state["instance"].top_logprobs_k == (7 if second_logprobs else 0)
         assert kwargs["prefill_step_size"] == 3072
         assert kwargs["apc_manager"] is apc_manager
         assert apc_manager.prepare_prefill.call_count == 2

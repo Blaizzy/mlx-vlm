@@ -2682,6 +2682,9 @@ class ThinkingBudgetCriteria:
         self.enable_thinking = enable_thinking
         self.prompt_preopens_thinking = prompt_preopens_thinking
 
+        self.thinking_start_token = thinking_start_token
+        self.thinking_end_token = thinking_end_token
+
         # Resolve token IDs from strings
         self.thinking_end_token_id = tokenizer.encode(
             thinking_end_token, add_special_tokens=False
@@ -2702,6 +2705,19 @@ class ThinkingBudgetCriteria:
         self.thinking_token_count = 0
         self.budget_exceeded = False
         self.forced_token_id = None
+
+    def make_logits_processor(self, prompt_length):
+        from .thinking import ThinkingBudgetLogitsProcessor
+
+        if not self.enable_thinking:
+            return None
+        return ThinkingBudgetLogitsProcessor(
+            self.thinking_budget,
+            self.tokenizer.encode(self.thinking_start_token, add_special_tokens=False),
+            self.tokenizer.encode(self.thinking_end_token, add_special_tokens=False),
+            prompt_length=prompt_length,
+            preopened=self.prompt_preopens_thinking,
+        )
 
     def reset_thinking_state(self):
         """Reset thinking state between generations."""
