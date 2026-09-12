@@ -30,6 +30,34 @@ def sanitize_dspark_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array]
     return out
 
 
+def _dequantize_release(tensors: Dict[str, mx.array]) -> Dict[str, mx.array]:
+    """Fold the release's native quantization to float.
+
+    DeepSeek-V4.1 ships fp8 weights beside ue8m0 ``.scale`` companions and packs
+    the routed experts as fp4. Neither is an MLX layout, so convert here rather
+    than leave uint8 for a quantizer that only accepts floats. Checkpoints
+    already in an MLX layout carry no ``.scale`` and pass through untouched.
+    """
+    from ....models.deepseek_v41.dequant import dequant_fp4, dequant_fp8, is_fp4_expert
+
+    out = {}
+    for key, value in tensors.items():
+        if key.endswith(".scale"):
+            continue
+        scale = (
+            tensors.get(f"{key[: -len('.weight')]}.scale")
+            if key.endswith(".weight")
+            else None
+        )
+        if scale is None:
+            out[key] = value
+        elif is_fp4_expert(key):
+            out[key] = dequant_fp4(value, scale)
+        else:
+            out[key] = dequant_fp8(value, scale)
+    return out
+
+
 class DeepseekV41DsparkSplitter(MTPSplitter):
     """Extract DeepSeek-V4.1's native DSpark head (``mtp.<stage>.*``, stages 0..2)
     into a standalone ``deepseek_v41_dspark`` drafter."""
@@ -66,7 +94,11 @@ class DeepseekV41DsparkSplitter(MTPSplitter):
     def rename(
         self, tensors: Dict[str, mx.array], text_config: dict
     ) -> Dict[str, mx.array]:
-        return sanitize_dspark_weights(tensors)
+        return sanitize_dspark_weights(_dequantize_release(tensors))
+
+    def should_quantize_key(self, key: str) -> bool:
+        """The router gate stays full precision; this family names it ``ffn.gate``."""
+        return super().should_quantize_key(key) and not key.endswith("ffn.gate.weight")
 
     def quantization_from_source(self, tensors, source_config):
         recipe = source_config.get("quantization_config") or {}
