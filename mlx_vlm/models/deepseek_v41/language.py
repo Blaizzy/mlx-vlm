@@ -962,6 +962,36 @@ class DeepseekV41Cache:
         self.offset = 0
         self._model = None
 
+    @property
+    def state(self):
+        """Arrays the generator materializes between prefill chunks.
+
+        Layer state lives inside the modules, so surface it here; evaluating it
+        per chunk is what keeps a long prefill from becoming one command buffer.
+        """
+        model = self._model
+        if model is None:
+            return []
+        arrays = []
+        for layer in model.layers:
+            attn = layer.attn
+            for array in (attn._window_cache, attn._compress_cache):
+                if array is not None:
+                    arrays.append(array)
+            if attn.indexer is not None and attn.indexer._k_cache is not None:
+                arrays.append(attn.indexer._k_cache)
+            if attn.compressor is not None:
+                for array in (
+                    attn.compressor._kv_state,
+                    attn.compressor._score_state,
+                ):
+                    if array is not None:
+                        arrays.append(array)
+        engram = model.engram_hash
+        if engram is not None and engram._cache is not None:
+            arrays.append(engram._cache)
+        return arrays
+
     def trim(self, n: int) -> int:
         """Drop the last `n` appended tokens so a speculative block rolls back.
 
@@ -982,7 +1012,6 @@ class DeepseekV41Cache:
 class LanguageModel(nn.Module):
     """Embed, expand to hc copies, run the blocks, collapse, project to logits."""
 
-    no_chunked_prefill = True
     requires_uniform_batch_acceptance = True
 
     def __init__(self, config: ModelConfig, tokenizer=None):
