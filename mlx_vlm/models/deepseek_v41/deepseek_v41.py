@@ -78,6 +78,18 @@ class Model(nn.Module):
     ) -> LanguageModelOutput:
         return self.language_model(input_ids, cache=cache, **kwargs)
 
+    @property
+    def model_path(self):
+        return getattr(self, "_model_path", None)
+
+    @model_path.setter
+    def model_path(self, value):
+        """The engram hash tables are built from files in the checkpoint dir."""
+        self._model_path = value
+        language_model = getattr(self, "language_model", None)
+        if language_model is not None:
+            language_model._engram_source = value
+
     def quantization_path_aliases(self, path: str):
         """Routed experts load as ``switch_mlp`` but converters key them ``experts``."""
         if path.startswith("language_model."):

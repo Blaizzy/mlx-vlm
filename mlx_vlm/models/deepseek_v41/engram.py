@@ -166,10 +166,21 @@ class NgramHashState(nn.Module):
 
     DEAD = -1
 
-    def __init__(self, config: ModelConfig, layout: EngramLayout, tokenizer):
+    def __init__(
+        self, config: ModelConfig, layout: EngramLayout, tokenizer=None, token_map=None
+    ):
+        """``token_map`` is the released ``engram_token_map.json`` when present.
+
+        Deriving it instead decodes and normalizes the whole vocabulary, so the
+        shipped map is both faster and guaranteed to match the release.
+        """
         super().__init__()
         self.layout = layout
-        token_map, vocab_size = build_compressed_token_map(tokenizer)
+        if token_map is None:
+            token_map, vocab_size = build_compressed_token_map(tokenizer)
+        else:
+            token_map = list(token_map)
+            vocab_size = max(token_map) + 1
         if vocab_size != config.engram_compressed_vocab_size:
             raise ValueError((vocab_size, config.engram_compressed_vocab_size))
         self.pad_id = token_map[config.engram_pad_token_id]

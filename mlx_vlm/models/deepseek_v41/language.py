@@ -991,6 +991,7 @@ class LanguageModel(nn.Module):
         self.model_type = config.model_type
         self.layout = EngramLayout.from_config(config)
         self.engram_hash = None
+        self._engram_source = None
         if self.layout is not None and tokenizer is not None:
             self.engram_hash = NgramHashState(config, self.layout, tokenizer)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -1001,6 +1002,38 @@ class LanguageModel(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.head = ParallelHead(config)
         self.target_layer_ids = list(config.dspark_target_layer_ids)
+
+    def _ensure_engram_hash(self):
+        """Build the n-gram hash state on first use from the checkpoint directory.
+
+        The loader only learns the model path after construction, so this cannot
+        happen in ``__init__``.
+        """
+        if self.engram_hash is not None or self.layout is None:
+            return
+        source = self._engram_source
+        if source is None:
+            return
+        import json
+        import os
+
+        token_map = None
+        cached = os.path.join(str(source), "engram_token_map.json")
+        if os.path.exists(cached):
+            with open(cached) as handle:
+                token_map = json.load(handle)
+        tokenizer = None
+        if token_map is None:
+            tok_file = os.path.join(str(source), "tokenizer.json")
+            if not os.path.exists(tok_file):
+                self._engram_source = None
+                return
+            from transformers import PreTrainedTokenizerFast
+
+            tokenizer = PreTrainedTokenizerFast(tokenizer_file=tok_file)
+        self.engram_hash = NgramHashState(
+            self.config, self.layout, tokenizer=tokenizer, token_map=token_map
+        )
 
     def make_cache(self):
         cache = DeepseekV41Cache()
@@ -1069,6 +1102,10 @@ class LanguageModel(nn.Module):
             h[..., None, :],
             (batch, seqlen, self.config.hc_mult, self.config.hidden_size),
         )
+        if engram_hashes is None and input_ids is not None:
+            self._ensure_engram_hash()
+            if self.engram_hash is not None:
+                engram_hashes = self.engram_hash(input_ids, start_pos)
         main_hiddens = []
         capture_ids = (
             self.target_layer_ids if capture_layer_ids is None else capture_layer_ids

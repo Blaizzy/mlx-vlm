@@ -1114,7 +1114,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             if hasattr(m, "weight") and m.weight.size % 64 != 0:
                 return False
             # Handle legacy models which may not have everything quantized
-            return f"{p}.scales" in weights
+            if f"{p}.scales" not in weights:
+                return False
+            # Carry the resolved width; returning True would silently fall back
+            # to the global bits and mis-pack component-wide overrides.
+            return module_quantization
 
         nn.quantize(
             quantized_model,
