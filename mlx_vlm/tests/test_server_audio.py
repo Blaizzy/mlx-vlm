@@ -169,6 +169,60 @@ def test_audio_transcriptions_default_json(client, monkeypatch):
     assert cache_calls == [("fake-stt", {"model_kind": "audio_stt"})]
 
 
+class FakeHotwordSTTModel:
+    model_type = "fake_hotword_stt"
+
+    def __init__(self):
+        self.calls = []
+
+    def generate(self, path, hotwords=None, **kwargs):
+        self.calls.append({"path": path, "hotwords": hotwords, **kwargs})
+        assert Path(path).exists()
+        return {"text": "MLX transcription"}
+
+
+def test_audio_transcriptions_accepts_repeated_hotwords(client, monkeypatch):
+    fake_model = FakeHotwordSTTModel()
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda model, **kwargs: (fake_model, None, SimpleNamespace(model_type="audio")),
+    )
+    monkeypatch.setattr(
+        server_audio,
+        "audio_read",
+        lambda buffer, always_2d=False: (np.zeros(160, dtype=np.float32), 16000),
+    )
+    monkeypatch.setattr(server_audio, "audio_write", _fake_audio_write)
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("test.wav", b"audio-bytes", "audio/wav")},
+        data={"model": "fake-stt", "hotwords": ["MLX", "Apple Silicon"]},
+    )
+
+    assert response.status_code == 200
+    assert fake_model.calls[0]["hotwords"] == ["MLX", "Apple Silicon"]
+
+
+def test_stt_forwards_context_and_hotwords_when_backend_accepts_both():
+    def generate(path, *, hotwords=None, context=None, **kwargs):
+        pass
+
+    kwargs = server_audio._build_stt_generate_kwargs(
+        SimpleNamespace(generate=generate),
+        server_audio.AudioTranscriptionRequest(
+            model="fake-stt",
+            context="Product names",
+            hotwords=["Nativ"],
+        ),
+        translate=False,
+    )
+
+    assert kwargs["context"] == "Product names"
+    assert kwargs["hotwords"] == ["Nativ"]
+
+
 def test_audio_transcriptions_text_response_format(client, monkeypatch):
     fake_model = FakeSTTModel({"text": "Plain text transcript."})
     monkeypatch.setattr(
