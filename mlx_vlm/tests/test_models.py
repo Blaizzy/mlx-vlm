@@ -20990,8 +20990,10 @@ class TestLlavaProcessorCompatibility(unittest.TestCase):
                         return_value=tokenizer,
                     ),
                     patch(
-                        "transformers.AutoImageProcessor.from_pretrained",
-                        return_value=image_processor,
+                        "transformers.AutoImageProcessor",
+                        SimpleNamespace(
+                            from_pretrained=lambda *args, **kwargs: image_processor
+                        ),
                     ),
                 ):
                     processor = LlavaProcessor.from_pretrained(path)
@@ -22652,3 +22654,148 @@ class TestPaliGemmaAttentionPolicy(unittest.TestCase):
                 self.assertGreater(error, 1e-3)
             else:
                 self.assertLess(error, 1e-5)
+
+
+class TestLegacyGemmaHistory(unittest.TestCase):
+    TEMPLATE = """{{ bos_token }}{% for message in messages %}{% if (message.role == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate') }}{% endif %}{{ '<start_of_turn>' + ('model' if message.role == 'assistant' else message.role) + '\n' }}{% if message.content is string %}{{ message.content | trim }}{% else %}{% for part in message.content %}{% if part.type == 'text' %}{{ part.text }}{% elif part.type == 'image' %}{{ '<start_of_image>' }}{% elif part.type == 'audio' %}{{ '<audio_soft_token>' }}{% endif %}{% endfor %}{% endif %}{{ '<end_of_turn>\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<start_of_turn>model\n' }}{% endif %}"""
+
+    def _tokenizer(self, template=None):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        return PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+            unk_token="[UNK]",
+            chat_template=template or self.TEMPLATE,
+        )
+
+    def test_tool_history_retains_metadata_and_does_not_mutate(self):
+        import copy
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        messages = [
+            {"role": "user", "content": "USER"},
+            {
+                "role": "assistant",
+                "content": "ANSWER",
+                "reasoning_content": "REASON",
+                "tool_calls": [
+                    {
+                        "id": "CALL_ID",
+                        "function": {
+                            "name": "FUNCTION",
+                            "arguments": '{"path":"ARGUMENT"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "CALL_ID", "content": "RESULT"},
+            {"role": "user", "content": "NEXT"},
+        ]
+        original = copy.deepcopy(messages)
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "FUNCTION", "description": "SCHEMA"},
+            }
+        ]
+        rendered = get_chat_template(self._tokenizer(), messages, True, tools=tools)
+        for marker in [
+            "USER",
+            "ANSWER",
+            "REASON",
+            "CALL_ID",
+            "FUNCTION",
+            "ARGUMENT",
+            "RESULT",
+            "NEXT",
+            "SCHEMA",
+            '"role": "tool"',
+        ]:
+            self.assertIn(marker, rendered)
+        self.assertEqual(messages, original)
+        self.assertEqual(rendered.count("<start_of_turn>"), 4)
+
+    def test_ordinary_and_explicit_templates_are_unchanged(self):
+        from jinja2.exceptions import TemplateError
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        tokenizer = self._tokenizer()
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "next"},
+        ]
+        for tokenize in [False, True]:
+            self.assertEqual(
+                get_chat_template(tokenizer, messages, True, tokenize),
+                tokenizer.apply_chat_template(
+                    messages, tokenize=tokenize, add_generation_prompt=True
+                ),
+            )
+        rich = messages[:2] + [{"role": "tool", "content": "result"}]
+        with self.assertRaises(TemplateError):
+            get_chat_template(tokenizer, rich, True, chat_template=self.TEMPLATE)
+
+    def test_tool_aware_template_keeps_native_messages(self):
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        template = (
+            "<start_of_turn>{{ messages | tojson }}{{ tools | tojson }}<end_of_turn>"
+        )
+        tokenizer = self._tokenizer(template)
+        messages = [{"role": "tool", "content": "RESULT", "tool_call_id": "CALL"}]
+        tools = [{"type": "function", "function": {"name": "FUNCTION"}}]
+        self.assertEqual(
+            get_chat_template(tokenizer, messages, True, tools=tools),
+            tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, tools=tools
+            ),
+        )
+
+    def test_media_order_and_system_role_survive(self):
+        import copy
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        template = (
+            "{% if messages[0].role == 'system' %}{{ raise_exception('System role not supported') }}{% endif %}"
+            + self.TEMPLATE
+        )
+        messages = [
+            {"role": "system", "content": "SYSTEM"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "BEFORE"},
+                    {"type": "image"},
+                    {"type": "text", "text": "AFTER"},
+                    {"type": "audio"},
+                ],
+            },
+            {"role": "assistant", "content": "ANSWER"},
+            {"role": "tool", "content": "RESULT"},
+            {
+                "role": "user",
+                "content": [{"type": "image"}, {"type": "text", "text": "LAST"}],
+            },
+        ]
+        original = copy.deepcopy(messages)
+        rendered = get_chat_template(self._tokenizer(template), messages, True)
+        position = 0
+        for marker in [
+            "SYSTEM",
+            "BEFORE",
+            "<start_of_image>",
+            "AFTER",
+            "<audio_soft_token>",
+            "ANSWER",
+            "RESULT",
+            "<start_of_image>",
+            "LAST",
+        ]:
+            position = rendered.index(marker, position) + len(marker)
+        self.assertEqual(messages, original)

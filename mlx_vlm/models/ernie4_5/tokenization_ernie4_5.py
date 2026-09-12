@@ -18,10 +18,9 @@ from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 import sentencepiece as spm
-import torch
 from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.tokenization_utils_base import PaddingStrategy
-from transformers.utils import logging
+from transformers.utils import is_torch_tensor, logging
 
 logger = logging.get_logger(__name__)
 
@@ -190,7 +189,7 @@ class Ernie45Tokenizer(PreTrainedTokenizer):
                 and encoded_inputs["attention_mask"] is not None
             ):
                 attention_mask = encoded_inputs.pop("attention_mask")
-                if isinstance(attention_mask, torch.Tensor):
+                if is_torch_tensor(attention_mask):
                     attention_mask = attention_mask.numpy()
                 elif isinstance(attention_mask, list):
                     attention_mask = np.array(attention_mask)

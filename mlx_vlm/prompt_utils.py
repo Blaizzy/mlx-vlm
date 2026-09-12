@@ -1,5 +1,6 @@
 import inspect
 import json
+from copy import deepcopy
 from enum import Enum
 from functools import partial
 from typing import Any, Dict, List, Union
@@ -670,6 +671,68 @@ def _string_content_messages(messages, image_token):
     return result if changed else messages
 
 
+def _legacy_gemma_history(messages, template, tools=None):
+    if not isinstance(template, str) or not all(
+        marker in template
+        for marker in (
+            "<start_of_turn>",
+            "<end_of_turn>",
+            "Conversation roles must alternate",
+        )
+    ):
+        return messages
+    if any(field in template for field in ("tools", "tool_calls", "reasoning")):
+        return messages
+
+    ordinary = _coalesce_leading_system_text(messages)
+    if (
+        ordinary
+        and ordinary[0].get("role") == "system"
+        and "System role not supported" not in template
+    ):
+        ordinary = ordinary[1:]
+    rich = tools or any(set(message) - {"role", "content"} for message in messages)
+    rich = rich or any(
+        message.get("role") != ("user" if index % 2 == 0 else "assistant")
+        for index, message in enumerate(ordinary)
+    )
+    if not rich:
+        return messages
+
+    # Legacy Gemma only accepts alternating user/model turns. Keep the original
+    # roles and metadata explicit inside those turns, including tool results.
+    result = []
+    for message in messages:
+        role = "assistant" if message.get("role") == "assistant" else "user"
+        metadata = {key: value for key, value in message.items() if key != "content"}
+        content = deepcopy(message.get("content") or [])
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        content = [
+            {"type": "text", "text": json.dumps(metadata, ensure_ascii=False) + "\n"}
+        ] + content
+        if result and result[-1]["role"] == role:
+            result[-1]["content"] += [{"type": "text", "text": "\n"}] + content
+        else:
+            result.append({"role": role, "content": content})
+    if not result or result[0]["role"] != "user":
+        result.insert(0, {"role": "user", "content": []})
+    if tools:
+        result[0]["content"].insert(
+            0,
+            {
+                "type": "text",
+                "text": "Available tools: "
+                + json.dumps(tools, ensure_ascii=False)
+                + "\n",
+            },
+        )
+    for message in result:
+        if all(part.get("type") == "text" for part in message["content"]):
+            message["content"] = "".join(part["text"] for part in message["content"])
+    return result
+
+
 def get_chat_template(
     processor,
     messages: List[Dict[str, Any]],
@@ -897,6 +960,12 @@ def get_chat_template(
         if template_processor is None:
             return _messages_to_plain_prompt()
 
+        if chat_template_override is None:
+            messages = _legacy_gemma_history(
+                messages,
+                getattr(template_processor, "chat_template", None),
+                kwargs.get("tools"),
+            )
         template_kwargs = dict(kwargs)
         if "enable_thinking" not in template_kwargs and _supports_template_kw(
             template_processor, "enable_thinking"
