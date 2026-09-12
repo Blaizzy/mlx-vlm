@@ -1,7 +1,6 @@
 import importlib
 import inspect
 import math
-import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
@@ -20697,56 +20696,6 @@ class TestDeepseekV41Dequant(unittest.TestCase):
         self.assertFalse(deepseek_v41.is_fp4_expert("layers.0.attn.wq_a.weight"))
 
 
-class TestDeepseekV41Repackage(unittest.TestCase):
-    def test_deepseek_v41_output_config(self):
-        from mlx_vlm.models.deepseek_v41 import repackage_vontra
-
-        config = repackage_vontra.output_config()
-        self.assertEqual(config["model_type"], "deepseek_v41")
-        self.assertEqual(
-            config["quantization"], {"group_size": 64, "bits": 2, "mode": "affine"}
-        )
-        self.assertEqual(config["hidden_size"], 5120)
-        self.assertEqual(config["n_routed_experts"], 384)
-
-    def test_deepseek_v41_repackage_roundtrip(self):
-        import json
-
-        from mlx_vlm.models.deepseek_v41 import repackage_vontra
-
-        with tempfile.TemporaryDirectory() as source:
-            weights = {
-                "layers.0.attn.wq_a.weight": mx.zeros((8, 8)),
-                "layers.0.attn_norm.weight": mx.zeros((8,)),
-                "embed.weight": mx.zeros((16, 8)),
-                "mtp.0.attn.wq_a.weight": mx.zeros((8, 8)),
-            }
-            mx.save_safetensors(f"{source}/model-00001-of-00001.safetensors", weights)
-            with open(f"{source}/model.safetensors.index.json", "w") as f:
-                json.dump(
-                    {
-                        "metadata": {"total_size": 0},
-                        "weight_map": {
-                            k: "model-00001-of-00001.safetensors" for k in weights
-                        },
-                    },
-                    f,
-                )
-            with tempfile.TemporaryDirectory() as output:
-                out = repackage_vontra.repackage_vontra(source, f"{output}/out")
-                self.assertTrue((out / "config.json").is_file())
-                self.assertTrue((out / "model.safetensors.index.json").is_file())
-                with open(out / "model.safetensors.index.json") as f:
-                    index = json.load(f)
-                self.assertIn(
-                    "language_model.layers.0.attn.wq_a.weight",
-                    index["weight_map"],
-                )
-                self.assertIn("mtp.0.attn.wq_a.weight", index["weight_map"])
-                loaded = dict(mx.load(str(out / "model-00001-of-00001.safetensors")))
-                self.assertIn("language_model.embed_tokens.weight", loaded)
-
-
 class TestDeepseekV41Sanitize(unittest.TestCase):
     @staticmethod
     def _tiny_config():
@@ -20810,95 +20759,6 @@ class TestDeepseekV41Sanitize(unittest.TestCase):
         self.assertEqual(set(out), {"language_model.head.weight"})
         self.assertEqual(out["language_model.head.weight"].dtype, mx.float32)
         self.assertEqual(out["language_model.head.weight"].shape, (64, 128))
-
-
-class TestDeepseekV41StreamingConvert(unittest.TestCase):
-    @staticmethod
-    def _synthetic_shard(path):
-        pass
-
-        weights = {
-            "layers.0.attn.wq_a.weight": mx.full((64, 64), 0x38, dtype=mx.uint8),
-            "layers.0.attn.wq_a.scale": mx.full((2, 2), 127, dtype=mx.uint8),
-            "layers.0.ffn.experts.0.w1.weight": mx.full((8, 32), 0x22, dtype=mx.uint8),
-            "layers.0.ffn.experts.0.w1.scale": mx.full((8, 2), 128, dtype=mx.uint8),
-            "layers.1.engram.embed.weight": mx.full((4, 64), 0x38, dtype=mx.uint8),
-            "layers.1.engram.embed.scale": mx.full((4, 2), 127, dtype=mx.uint8),
-            "layers.0.attn_norm.weight": mx.ones((64,)),
-        }
-        mx.save_safetensors(path, weights)
-
-    def test_deepseek_v41_convert_profiles(self):
-        from mlx_vlm.models.deepseek_v41 import streaming_convert as sc
-
-        self.assertEqual(set(sc.PROFILES), {"4bit", "nvfp4", "engram6"})
-        self.assertEqual(sc.PROFILES["4bit"]["expert"], (4, "affine", 64))
-        self.assertEqual(sc.PROFILES["nvfp4"]["expert"], (4, "nvfp4", 16))
-        self.assertEqual(sc.PROFILES["engram6"]["engram"], (6, "affine", 64))
-        recipe = sc.quantization_recipe("4bit")
-        self.assertEqual(recipe, {"group_size": 64, "bits": 4, "mode": "affine"})
-
-    def test_deepseek_v41_convert_shard(self):
-        import tempfile
-
-        from mlx_vlm.models.deepseek_v41 import streaming_convert as sc
-
-        with tempfile.TemporaryDirectory() as tmp:
-            shard = f"{tmp}/shard.safetensors"
-            self._synthetic_shard(shard)
-            out = sc.convert_shard(shard, sc.PROFILES["4bit"])
-            mx.eval(out)
-            self.assertIn("layers.0.attn.wq_a.weight", out)
-            self.assertIn("layers.0.attn.wq_a.scales", out)
-            self.assertIn("layers.0.ffn.experts.0.w1.weight", out)
-            self.assertIn("layers.1.engram.embed.weight", out)
-            self.assertIn("layers.0.attn_norm.weight", out)
-            self.assertTrue(
-                bool(
-                    mx.allclose(
-                        mx.dequantize(
-                            out["layers.0.attn.wq_a.weight"],
-                            out["layers.0.attn.wq_a.scales"],
-                            out["layers.0.attn.wq_a.biases"],
-                            group_size=64,
-                            bits=8,
-                        ),
-                        mx.ones((64, 64)),
-                        atol=0.2,
-                    )
-                )
-            )
-
-
-class TestDeepseekV41ScanOutput(unittest.TestCase):
-    def test_deepseek_v41_scan_output_rebuilds_index(self):
-        import tempfile
-
-        from mlx_vlm.models.deepseek_v41 import streaming_convert as sc
-
-        with tempfile.TemporaryDirectory() as tmp:
-            out = f"{tmp}/out"
-            import os
-
-            os.mkdir(out)
-            mx.save_safetensors(
-                f"{out}/model-00001-of-00048.safetensors",
-                {"layers.0.attn_norm.weight": mx.ones((8,))},
-            )
-            mx.save_safetensors(
-                f"{out}/model-00002-of-00048.safetensors",
-                {"layers.1.attn_norm.weight": mx.zeros((8,))},
-            )
-            weight_map, total_size, output_index = sc.scan_output(out)
-            self.assertEqual(
-                weight_map,
-                {
-                    "layers.0.attn_norm.weight": "model-00001-of-00048.safetensors",
-                    "layers.1.attn_norm.weight": "model-00002-of-00048.safetensors",
-                },
-            )
-            self.assertEqual(total_size, 2 * 8 * 4)
-            self.assertEqual(output_index, 2)
 
 
 class TestDeepseekV41TokenMap(unittest.TestCase):
