@@ -737,7 +737,10 @@ def _explicit_content(message):
     if isinstance(content, str):
         content = [{"type": "text", "text": content}]
     return [
-        {"type": "text", "text": json.dumps(metadata, ensure_ascii=False) + "\n"}
+        {
+            "type": "text",
+            "text": json.dumps(metadata, ensure_ascii=False, sort_keys=True) + "\n",
+        }
     ] + content
 
 
