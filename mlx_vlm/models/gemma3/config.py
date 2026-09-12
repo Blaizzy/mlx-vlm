@@ -25,6 +25,16 @@ class TextConfig(BaseModelConfig):
     sliding_window_pattern: int = 6
     max_position_embeddings: int = 4096
 
+    @classmethod
+    def from_dict(cls, params):
+        params = dict(params or {})
+        if "rope_theta" in params:
+            theta = params.pop("rope_theta")
+            if params.get("rope_global_base_freq", theta) != theta:
+                raise ValueError("rope_theta and rope_global_base_freq must agree")
+            params["rope_global_base_freq"] = theta
+        return super().from_dict(params)
+
 
 @dataclass
 class VisionConfig(BaseModelConfig):

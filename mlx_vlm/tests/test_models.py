@@ -3,6 +3,8 @@ import inspect
 import math
 import threading
 import unittest
+import warnings
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -17052,6 +17054,177 @@ class TestQwen3Embedding(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestUnusedConfigKeys(unittest.TestCase):
+    def config_type(self):
+        from mlx_vlm.models.base import BaseModelConfig
+
+        @dataclass
+        class Config(BaseModelConfig):
+            hidden_size: int = 32
+
+        return Config
+
+    def test_dropped_keys_are_reported_without_values_or_input_mutation(self):
+        from mlx_vlm.models.base import UnusedConfigKeysWarning
+
+        config_type = self.config_type()
+        params = {"hidden_size": 64, "hidden_szie": 128, "extra": "private-value"}
+        original = dict(params)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", UnusedConfigKeysWarning)
+            config = config_type.from_dict(params)
+        self.assertEqual(len(caught), 1)
+        self.assertIs(caught[0].category, UnusedConfigKeysWarning)
+        self.assertEqual(config.hidden_size, 64)
+        self.assertEqual(params, original)
+        self.assertEqual(
+            str(caught[0].message),
+            f"{config_type.__module__}.Config does not use configuration keys: "
+            "extra, hidden_szie",
+        )
+        self.assertEqual(caught[0].filename, __file__)
+
+    def test_known_and_empty_configs_are_quiet(self):
+        config_type = self.config_type()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            for params in (None, {}, {"hidden_size": 32}):
+                self.assertEqual(config_type.from_dict(params).hidden_size, 32)
+        self.assertEqual(caught, [])
+
+    def test_metadata_remains_loadable_and_warnings_are_deduplicated(self):
+        from mlx_vlm.models.base import UnusedConfigKeysWarning
+
+        config_type = self.config_type()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("default", UnusedConfigKeysWarning)
+            for _ in range(3):
+                config = config_type.from_dict({"architectures": ["ExampleModel"]})
+        self.assertEqual(config.hidden_size, 32)
+        self.assertEqual(len(caught), 1)
+        self.assertIn("architectures", str(caught[0].message))
+
+    def test_warning_can_be_promoted_to_an_error(self):
+        from mlx_vlm.models.base import UnusedConfigKeysWarning
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UnusedConfigKeysWarning)
+            with self.assertRaisesRegex(UnusedConfigKeysWarning, "hidden_szie"):
+                self.config_type().from_dict({"hidden_szie": 64})
+
+
+class TestGemma3RopeConfig(unittest.TestCase):
+    def config_values(self):
+        return dict(
+            model_type="gemma3_text",
+            hidden_size=32,
+            num_hidden_layers=6,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            vocab_size=64,
+        )
+
+    def test_checkpoint_rope_theta_reaches_global_attention(self):
+        from mlx_vlm.models.gemma3.config import TextConfig
+        from mlx_vlm.models.gemma3.language import Attention
+        from mlx_vlm.models.gemma3_text.config import ModelConfig
+
+        for config_type in (TextConfig, ModelConfig):
+            params = dict(self.config_values(), rope_theta=12345.0)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                config = config_type.from_dict(params)
+            self.assertEqual(caught, [])
+            self.assertEqual(Attention(config, 5).rope.base, 12345.0)
+            self.assertEqual(Attention(config, 0).rope.base, 10000.0)
+            self.assertEqual(params["rope_theta"], 12345.0)
+            self.assertNotIn("rope_global_base_freq", params)
+            self.assertEqual(config_type.from_dict(config.to_dict()), config)
+
+    def test_default_and_legacy_config_keep_their_behavior(self):
+        from mlx_vlm.models.gemma3.config import TextConfig
+
+        for params, expected in (
+            ({}, 1000000.0),
+            ({"rope_global_base_freq": 23456.0}, 23456.0),
+            ({"rope_theta": 23456.0, "rope_global_base_freq": 23456.0}, 23456.0),
+        ):
+            with self.subTest(params=params):
+                config = TextConfig.from_dict(dict(self.config_values(), **params))
+                self.assertEqual(config.rope_global_base_freq, expected)
+
+    def test_conflicting_rope_aliases_fail_clearly(self):
+        from mlx_vlm.models.gemma3.config import TextConfig
+
+        with self.assertRaisesRegex(ValueError, "rope_theta.*rope_global_base_freq"):
+            TextConfig.from_dict(
+                dict(
+                    self.config_values(),
+                    rope_theta=12345.0,
+                    rope_global_base_freq=54321.0,
+                )
+            )
+
+    def test_checkpoint_loader_reports_nested_unused_keys(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models import gemma3
+        from mlx_vlm.models.base import UnusedConfigKeysWarning
+        from mlx_vlm.utils import load_model
+
+        text = gemma3.TextConfig(**self.config_values(), mm_tokens_per_image=4)
+        vision = gemma3.VisionConfig(
+            model_type="siglip_vision_model",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            patch_size=8,
+            image_size=16,
+        )
+        model = gemma3.Model(gemma3.ModelConfig(text, vision, "gemma3", hidden_size=32))
+        params = dict(
+            model_type="gemma3",
+            hidden_size=32,
+            text_config=dict(
+                self.config_values(),
+                mm_tokens_per_image=4,
+                rope_theta=12345.0,
+                hidden_szie=64,
+            ),
+            vision_config=vision.to_dict(),
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)
+            (path / "config.json").write_text(json.dumps(params))
+            mx.save_safetensors(
+                str(path / "model.safetensors"), dict(tree_flatten(model.parameters()))
+            )
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", UnusedConfigKeysWarning)
+                restored = load_model(path)
+        messages = [
+            str(w.message) for w in caught if w.category is UnusedConfigKeysWarning
+        ]
+        self.assertIn(
+            "mlx_vlm.models.gemma3.config.TextConfig does not use configuration keys: "
+            "hidden_szie",
+            messages,
+        )
+        self.assertFalse(any("rope_theta" in message for message in messages))
+        self.assertEqual(restored.config.text_config.hidden_size, 32)
+        self.assertEqual(
+            restored.language_model.model.layers[5].self_attn.rope.base, 12345.0
+        )
+        logits = restored.language_model(mx.array([[1, 2, 3]])).logits
+        mx.eval(logits)
+        self.assertEqual(logits.shape, (1, 3, 64))
 
 
 class TestGemma3Embedding(unittest.TestCase):
