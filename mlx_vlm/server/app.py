@@ -22,7 +22,7 @@ from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
 from ..reranker import RerankerKind, reranker_kind
 from ..structured import build_json_schema_logits_processor
-from ..tool_parsers import _infer_tool_parser_from_processor
+from ..tools import _infer_tool_parser_from_processor
 from ..version import __version__
 from ..vision_cache import VisionFeatureCache
 from . import request_normalization as _request_normalization
@@ -868,13 +868,7 @@ def get_cached_model(
             kv_quant_scheme=kv_quant_scheme,
             quantized_kv_start=quantized_kv_start,
         ),
-        overrides={
-            "enabled": cfg.apc_enabled,
-            "disk_path": cfg.apc_disk_path,
-            "block_size": cfg.apc_block_size,
-            "num_blocks": cfg.apc_num_blocks,
-            "disk_max_gb": cfg.apc_disk_max_gb,
-        },
+        overrides=cfg.apc_overrides(),
     )
 
     response_generator = ResponseGenerator(
@@ -1153,14 +1147,17 @@ async def update_runtime_settings(request: Request):
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
     op, values = _settings_operation(payload)
+    before = runtime.config.current()
     applied, rejected = runtime.config.apply_changes(values, op=op)
+    current = runtime.config.current()
+    changed = {name: value for name, value in current.items() if before[name] != value}
     return {
         "op": op,
         "applied": applied,
         "rejected": rejected,
-        "reload_kinds": sorted(runtime.config.reload_kinds(applied)),
+        "reload_kinds": sorted(runtime.config.reload_kinds(changed)),
         "fingerprint": runtime.config.fingerprint(),
-        "current": runtime.config.current(),
+        "current": current,
     }
 
 

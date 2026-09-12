@@ -2,6 +2,7 @@ from typing import Dict
 
 import mlx.core as mx
 
+from ....fp8 import make_quantization_config
 from ....models.qwen4_exp.fp8 import convert_qwen4_exp_fp8_weights
 from ..mtp_split import MTPSplitter
 from .qwen4_exp_mtp import Qwen4ExpMTPDraftModel
@@ -28,6 +29,14 @@ class Qwen4ExpMTPSplitter(MTPSplitter):
     ) -> Dict[str, mx.array]:
         del text_config
         return convert_qwen4_exp_fp8_weights(tensors)
+
+    def quantization_from_source(self, tensors, source_config):
+        if not any(key.endswith(".scales") for key in tensors):
+            return None
+        quantization = source_config.get("quantization")
+        if quantization is None:
+            quantization = make_quantization_config(source_config)
+        return quantization
 
 
 def split_qwen4_exp_mtp(source: str, output: str, **kwargs):

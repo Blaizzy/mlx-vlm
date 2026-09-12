@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Optional
 
 import mlx.core as mx
@@ -9,6 +10,7 @@ from ..qwen3_vl.language import LanguageModel
 from .audio import AudioModel, AudioProjector, check_conv1d_weight_shape
 from .config import ModelConfig
 from .processing_minicpmo import MiniCPMOProcessor  # noqa: F401
+from .tts import MiniCPMTTS, TTSSamplingParams, sanitize_tts_weights
 from .vision import VisionModel, check_array_shape
 
 
@@ -234,10 +236,18 @@ class Model(nn.Module):
         else:
             self.audio_tower = None
             self.audio_projection_layer = None
+        if config.init_tts and config.tts_config is not None:
+            self.tts = MiniCPMTTS(config.tts_config)
+        else:
+            self.tts = None
 
     @property
     def layers(self):
         return self.language_model.model.layers
+
+    @property
+    def supports_audio_generation(self):
+        return self.tts is not None
 
     def _set_position_state(self, input_ids: mx.array):
         batch_size, seq_len = input_ids.shape
@@ -501,13 +511,287 @@ class Model(nn.Module):
             cache=cache,
         )
 
+    def get_hidden_states(
+        self,
+        input_ids: mx.array,
+        pixel_values: Optional[list] = None,
+        mask: Optional[mx.array] = None,
+        **kwargs,
+    ):
+        """Recompute final hidden states without a vocabulary projection.
+
+        The normal text loop remains cache-compatible and does not retain
+        intermediate activations for every layer and every generated token.
+        """
+        input_embeddings_features = self.get_input_embeddings(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            **kwargs,
+        )
+        attention_mask = None
+        if mask is not None:
+            if mask.shape != input_ids.shape:
+                raise ValueError(
+                    "Speech conditioning requires a 2D attention mask matching input_ids"
+                )
+            if not mx.all(mask).item():
+                causal = mx.tril(
+                    mx.ones((input_ids.shape[1], input_ids.shape[1]), dtype=mx.bool_)
+                )
+                attention_mask = causal[None, None] & mask[:, None, None, :].astype(
+                    mx.bool_
+                )
+        return self.language_model.model(
+            input_ids,
+            inputs_embeds=input_embeddings_features.inputs_embeds,
+            mask=attention_mask,
+            cache=None,
+            position_ids=self.language_model._position_ids,
+        )
+
+    def find_tts_bound(
+        self,
+        input_ids: mx.array,
+        tts_start_id: int,
+        tts_end_id: int,
+    ) -> tuple[int, int]:
+        ids = _to_numpy(input_ids).reshape(-1)
+        start_positions = np.where(ids == tts_start_id)[0]
+        end_positions = np.where(ids == tts_end_id)[0]
+        if len(start_positions) == 0:
+            raise ValueError(
+                "Could not find <|tts_bos|> in the generated "
+                "sequence. Make sure the prompt was built with use_tts_template=True."
+            )
+
+        start = start_positions[-1]
+        valid_ends = end_positions[end_positions > start]
+        if len(valid_ends) == 0:
+            raise ValueError(
+                "The spoken response is incomplete; increase max_tokens to generate <|tts_eos|>."
+            )
+        end = valid_ends[0]
+        if end == start + 1:
+            raise ValueError("The model generated an empty spoken response.")
+        return int(start + 1), int(end)
+
+    def build_tts_input_embeddings(
+        self,
+        full_input_ids: mx.array,
+        hidden_states: mx.array,
+        tts_bound: tuple[int, int],
+    ) -> mx.array:
+        if self.tts is None:
+            raise ValueError("MiniCPM-o TTS module is not initialized.")
+        if self.tts.condition_type != "hidden_text_merge":
+            raise NotImplementedError(
+                f"Unsupported MiniCPM-o TTS condition type: {self.tts.condition_type}"
+            )
+
+        start, end = tts_bound
+        llm_tokens = full_input_ids[:, start:end]
+        llm_embeds = self.tts.emb_text(llm_tokens)
+        hidden_embeds = self.tts.projector_semantic(hidden_states[:, start:end, :])
+        if self.tts.config.normalize_projected_hidden:
+            normalized = hidden_embeds.astype(mx.float32)
+            denom = mx.linalg.norm(normalized, ord=2, axis=-1, keepdims=True)
+            hidden_embeds = (normalized / mx.maximum(denom, 1e-12)).astype(
+                hidden_embeds.dtype
+            )
+
+        tts_embeds = llm_embeds + hidden_embeds
+        text_eos = mx.array([[self.tts.config.text_eos_token_id]], dtype=mx.int32)
+        audio_bos = mx.array([[self.tts.audio_bos_token_id]], dtype=mx.int32)
+        text_eos_embed = self.tts.emb_text(text_eos).astype(tts_embeds.dtype)
+        audio_bos_embed = self.tts.emb_text(audio_bos).astype(tts_embeds.dtype)
+        return mx.concatenate([tts_embeds, text_eos_embed, audio_bos_embed], axis=1)
+
+    def generate_speech_tokens(
+        self,
+        full_input_ids: mx.array,
+        pixel_values: Optional[list] = None,
+        mask: Optional[mx.array] = None,
+        tts_start_id: Optional[int] = None,
+        tts_end_id: Optional[int] = None,
+        tts_bound: Optional[tuple[int, int]] = None,
+        tts_sampling_params: Optional[TTSSamplingParams] = None,
+        tts_max_new_token: int = 2048,
+        **kwargs,
+    ) -> mx.array:
+        if self.tts is None:
+            raise ValueError("MiniCPM-o TTS module is not initialized.")
+        if full_input_ids.shape[0] != 1:
+            raise ValueError(
+                "MiniCPM-o audio generation currently supports batch size 1"
+            )
+
+        if tts_bound is None:
+            if tts_start_id is None or tts_end_id is None:
+                raise ValueError("tts_start_id and tts_end_id are required.")
+            tts_bound = self.find_tts_bound(full_input_ids, tts_start_id, tts_end_id)
+
+        hidden_states = self.get_hidden_states(
+            full_input_ids,
+            pixel_values=pixel_values,
+            mask=mask,
+            **kwargs,
+        )
+        inputs_embeds = self.build_tts_input_embeddings(
+            full_input_ids,
+            hidden_states,
+            tts_bound,
+        )
+        outputs = self.tts.generate(
+            inputs_embeds=inputs_embeds,
+            eos_token=self.tts.config.num_audio_tokens - 1,
+            # Suppress early EOS, while respecting a smaller generation budget.
+            min_new_token=min(50, tts_max_new_token),
+            max_new_token=tts_max_new_token,
+            sampling_params=tts_sampling_params,
+        )
+        return outputs.new_ids
+
+    @staticmethod
+    def _token_id(tokenizer, attr: str, token: str) -> int:
+        token_id = getattr(tokenizer, attr, None)
+        if token_id is None:
+            token_id = tokenizer.convert_tokens_to_ids(token)
+        if token_id is None or token_id < 0:
+            raise ValueError(f"Could not resolve MiniCPM-o speech token {token!r}.")
+        return int(token_id)
+
+    @staticmethod
+    def _ref_audio_path(audio, ref_audio_path: Optional[str]) -> Optional[str]:
+        if ref_audio_path is not None:
+            return ref_audio_path
+        if isinstance(audio, list) and len(audio) > 0 and isinstance(audio[0], str):
+            return audio[0]
+        if isinstance(audio, str):
+            return audio
+        return None
+
+    def validate_audio_generation(self, *, audio=None, ref_audio_path=None):
+        if not self.supports_audio_generation:
+            raise ValueError(
+                "This MiniCPM-o checkpoint has no TTS weights. Convert openbmb/MiniCPM-o-4_5 with the current converter."
+            )
+        reference = self._ref_audio_path(audio, ref_audio_path)
+        if reference is None:
+            raise ValueError(
+                "MiniCPM-o speech requires ref_audio_path (--ref-audio), or an audio input, for the reference voice."
+            )
+        if not Path(reference).is_file():
+            raise FileNotFoundError(f"Reference audio does not exist: {reference}")
+
+    def generate_audio(
+        self,
+        *,
+        input_ids: mx.array,
+        generated_tokens: list[int],
+        tokenizer,
+        pixel_values: Optional[list] = None,
+        mask: Optional[mx.array] = None,
+        audio=None,
+        ref_audio_path: Optional[str] = None,
+        **kwargs,
+    ):
+        from ...generate.audio import AudioGenerationResult
+        from .vocoder import StepAudio2Vocoder
+
+        self.validate_audio_generation(audio=audio, ref_audio_path=ref_audio_path)
+        if input_ids.shape[0] != 1:
+            raise ValueError(
+                "MiniCPM-o audio generation currently supports batch size 1"
+            )
+
+        if mask is not None:
+            if mask.shape != input_ids.shape:
+                raise ValueError(
+                    "Speech conditioning requires a 2D attention mask matching input_ids"
+                )
+            mask = mx.concatenate(
+                [mask, mx.ones((1, len(generated_tokens)), dtype=mask.dtype)], axis=1
+            )
+
+        if len(generated_tokens) == 0:
+            full_input_ids = input_ids
+        else:
+            full_input_ids = mx.concatenate(
+                [
+                    input_ids,
+                    mx.array(generated_tokens, dtype=input_ids.dtype)[None, :],
+                ],
+                axis=1,
+            )
+
+        tts_max_tokens = kwargs.pop("tts_max_tokens", 2048)
+        sampling_params = TTSSamplingParams(
+            top_p=kwargs.pop("tts_top_p", self.tts.config.top_p),
+            top_k=kwargs.pop("tts_top_k", self.tts.config.top_k),
+            repetition_penalty=kwargs.pop(
+                "tts_repetition_penalty", self.tts.config.repetition_penalty
+            ),
+            temperature=kwargs.pop("tts_temperature", self.tts.config.temperature),
+        )
+        tts_bound = self.find_tts_bound(
+            full_input_ids,
+            self._token_id(tokenizer, "tts_start_id", "<|tts_bos|>"),
+            self._token_id(tokenizer, "tts_end_id", "<|tts_eos|>"),
+        )
+        if tts_bound[0] < input_ids.shape[1]:
+            raise ValueError(
+                "The new response has no TTS start marker. Format the prompt "
+                "with use_tts_template=True."
+            )
+        audio_tokens = self.generate_speech_tokens(
+            full_input_ids,
+            pixel_values=pixel_values,
+            mask=mask,
+            tts_bound=tts_bound,
+            tts_sampling_params=sampling_params,
+            tts_max_new_token=tts_max_tokens,
+            **kwargs,
+        )
+
+        # Keep the codec outside nn.Module's parameter tree: it is a separate
+        # pretrained component, not part of MiniCPM-o conversion/quantization.
+        vocoder = getattr(self, "_speech_vocoder", None)
+        if vocoder is None:
+            vocoder = StepAudio2Vocoder()
+            object.__setattr__(self, "_speech_vocoder", vocoder)
+        waveform = vocoder.decode(
+            audio_tokens,
+            prompt_wav_path=self._ref_audio_path(audio, ref_audio_path),
+        )
+        return AudioGenerationResult(
+            text=tokenizer.decode(
+                full_input_ids[0, tts_bound[0] : tts_bound[1]].tolist(),
+                skip_special_tokens=True,
+            ),
+            audio_tokens=audio_tokens,
+            audio=waveform,
+            sample_rate=vocoder.sample_rate,
+        )
+
     def sanitize(self, weights):
         sanitized_weights = {}
         in_proj_weight = None
         in_proj_bias = None
+        tts_weights = {}
+
+        # Older conversions retained tts_config but discarded all speech
+        # tensors. Keep text inference working without random speech weights.
+        if self.tts is not None and not any(key.startswith("tts.") for key in weights):
+            self.tts = None
+            self.config.init_tts = False
 
         for key, value in weights.items():
-            if key.startswith(("tts.", "audio_avg_pooler.")):
+            if key.startswith("audio_avg_pooler."):
+                continue
+
+            if key.startswith("tts."):
+                if self.tts is not None:
+                    tts_weights[key] = value
                 continue
 
             if key.startswith("llm."):
@@ -520,7 +804,12 @@ class Model(nn.Module):
                 pass
             elif key.startswith("resampler."):
                 pass
+            elif key.startswith(("language_model.", "vision_tower.", "audio_tower.")):
+                pass
             else:
+                continue
+
+            if "rotary_emb.inv_freq" in key:
                 continue
 
             if key == "resampler.attn.in_proj_weight":
@@ -558,6 +847,8 @@ class Model(nn.Module):
             sanitized_weights["resampler.attn.q_proj.bias"] = q_b
             sanitized_weights["resampler.attn.k_proj.bias"] = k_b
             sanitized_weights["resampler.attn.v_proj.bias"] = v_b
+
+        sanitized_weights.update(sanitize_tts_weights(tts_weights))
 
         if self.config.text_config.tie_word_embeddings:
             sanitized_weights.pop("language_model.lm_head.weight", None)

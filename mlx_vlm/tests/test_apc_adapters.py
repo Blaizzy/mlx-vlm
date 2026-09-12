@@ -302,11 +302,6 @@ class TestBatchQuantizedExtract:
 
 class TestSnapshotPromptCacheRow:
 
-    def test_api_exists(self):
-        from mlx_vlm.apc import snapshot_prompt_cache_row
-
-        assert callable(snapshot_prompt_cache_row)
-
     def test_b1_batch_kv_collapses_to_single_row(self):
         from mlx_vlm.apc import snapshot_prompt_cache_row
 

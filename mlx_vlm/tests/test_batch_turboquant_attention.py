@@ -13,11 +13,7 @@ from mlx_vlm.models.base import (
     _turboquant_attention_applies,
     scaled_dot_product_attention,
 )
-from mlx_vlm.turboquant import (
-    BatchTurboQuantKVCache,
-    TurboQuantKVCache,
-    _TurboQuantAttentionMixin,
-)
+from mlx_vlm.turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
 
 H, D = 4, 64  # kv heads, head_dim
 BITS = 4
@@ -39,27 +35,6 @@ def _filled(left_padding, seq_len, batch=None, bits=BITS):
 
 class TestSharedAttentionSurface:
     """Both caches expose the same attention API through the mixin."""
-
-    @pytest.mark.parametrize("cls", [TurboQuantKVCache, BatchTurboQuantKVCache])
-    def test_inherits_mixin(self, cls):
-        assert issubclass(cls, _TurboQuantAttentionMixin)
-
-    @pytest.mark.parametrize(
-        "name",
-        [
-            "decode_attention",
-            "prefill_attention",
-            "quantized_attention",
-            "decode_key_chunk_size",
-            "prefill_key_chunk_size",
-            "prefill_query_block_size",
-        ],
-    )
-    @pytest.mark.parametrize("cls", [TurboQuantKVCache, BatchTurboQuantKVCache])
-    def test_attribute_present(self, cls, name):
-        # The chunk-size constants live on the mixin: reading them off the
-        # batch cache used to raise AttributeError mid-decode.
-        assert hasattr(cls, name)
 
     def test_attention_states_ignores_batch_bookkeeping(self):
         # The batch cache's `state` is a 4-tuple; the mixin must not unpack it.

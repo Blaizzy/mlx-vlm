@@ -54,6 +54,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Gemma 4 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
 | MiniMax M3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
 | Falcon-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
+| PP-DocLayoutV3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/pp_doclayout_v3/README.md) |
 | Granite Vision 3.2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
 | Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
 | MiniCPM-V 4.6 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minicpmv4_6/README.md) |
@@ -61,6 +62,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | LLaVA-OneVision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/llava_onevision/README.md) |
 | K2-Horizon | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/k2_horizon/README.md) |
 | Z1T-0 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/z1t/README.md) |
+| Spark-X2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/spark2_5/README.md) |
 
 ## Installation
 
@@ -129,11 +131,14 @@ mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 10
 # Image generation
 mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --temperature 0.0 --image http://images.cocodataset.org/val2017/000000039769.jpg
 
-# Audio generation (New)
+# Audio understanding
 mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --prompt "Describe what you hear" --audio /path/to/audio.wav
 
-# Multi-modal generation (Image + Audio)
+# Multi-modal understanding (Image + Audio)
 mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --prompt "Describe what you see and hear" --image /path/to/image.jpg --audio /path/to/audio.wav
+
+# Speech generation
+mlx_vlm.generate --model openbmb/MiniCPM-o-4_5 --output-modality audio --prompt "Say hello." --ref-audio /path/to/voice.wav --output speech.wav --max-tokens 256
 ```
 
 #### Thinking Budget
@@ -875,7 +880,9 @@ APC_NUM_BLOCKS=4096 \
 mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --kv-bits 8 --port 8080
 ```
 
-Enable the persistent disk tier:
+APC persists caches to disk by default when enabled, under
+`$MLX_VLM_CACHE_HOME/apc` (or `~/.cache/mlx-vlm/apc`), with a 20 GiB cap per
+model namespace. Customize the location and cap:
 
 ```sh
 APC_ENABLED=1 \
@@ -911,6 +918,44 @@ curl http://localhost:8080/v1/cache/stats
 curl -X POST http://localhost:8080/v1/cache/reset
 ```
 
+Configure APC on a running server with `PATCH /v1/settings`. Use
+`GET /v1/settings` to discover supported settings and read their current values:
+
+```sh
+curl http://localhost:8080/v1/settings
+
+curl -X PATCH http://localhost:8080/v1/settings \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "apc_enabled": true,
+    "apc_disk_enabled": true,
+    "apc_memory_max_gb": 2,
+    "apc_disk_max_gb": 20,
+    "apc_checkpoint_interval_tokens": 1024
+  }'
+```
+
+The endpoint also accepts `apc_memory_reserve_gb`, `apc_disk_queue_max_gb`,
+`apc_disk_path`, `apc_disk_shard_max_blocks`, `apc_block_size`, `apc_num_blocks`,
+`apc_checkpoint_entries`, and `apc_checkpoint_guard_tokens`. When
+`MLX_VLM_SERVER_API_KEY` is configured, include `Authorization: Bearer <key>`.
+
+Settings apply on the next text-generation request through the existing model
+reload path; the server process stays running. Reloading clears resident caches
+and retires the previous disk writer after its generation worker finishes.
+Existing disk files remain available. Updating APC options while APC is disabled
+stages them for the next enable. The response reports `applied`, `rejected`,
+`reload_kinds`, and the resulting settings; invalid sizes are rejected without
+changing those values. Unchanged settings do not trigger a reload.
+
+Use `null` for automatic memory budgets or the default disk path/cap. Zero has
+specific meanings: `apc_memory_max_gb: 0` retains caches only on disk,
+`apc_disk_max_gb: 0` removes the disk cap, and `apc_disk_queue_max_gb: 0` writes
+synchronously. An empty `apc_disk_path` or `apc_disk_enabled: false` disables
+persistence. PATCH merges with current settings; the optional
+`{"op": "replace", "values": {...}}` form first restores startup environment
+defaults. `/v1/cache/stats` shows the active manager after the next request.
+
 Common APC environment variables:
 
 | Variable | Default | Description |
@@ -918,10 +963,16 @@ Common APC environment variables:
 | `APC_ENABLED` | `0` | Set to `1` to enable APC |
 | `APC_NUM_BLOCKS` | `2048` | Number of in-memory APC blocks |
 | `APC_BLOCK_SIZE` | `16` | Tokens per APC block |
-| `APC_CHECKPOINT_ENTRIES` | `2` | In-memory checkpoint entries for hybrid/stateful cache layouts |
+| `APC_CHECKPOINT_ENTRIES` | `2` | In-memory checkpoint entries; also bounds snapshots captured per hybrid prompt (disk-only mode captures two) |
 | `APC_CHECKPOINT_GUARD_TOKENS` | `1` | Tokens retained after a reusable hybrid checkpoint boundary; the default preserves the normal final-token prefill boundary |
-| `APC_DISK_PATH` | unset | Directory for persistent disk shards |
-| `APC_DISK_MAX_GB` | `0` | Disk cap in GB; `0` means uncapped |
+| `APC_CHECKPOINT_INTERVAL_TOKENS` | `2048` | Spacing of intermediate hybrid checkpoints, rounded up to a multiple of `APC_BLOCK_SIZE`; `0` keeps only the final checkpoint |
+| `APC_MEMORY_MAX_GB` | auto | Resident block and checkpoint budget in GiB: 10% of Metal's recommended working set, capped at 8 GiB; `0` retains caches only on disk |
+| `APC_MEMORY_RESERVE_GB` | auto | Additional memory headroom in GiB: 10% of Metal's recommended working set, at least 1 GiB |
+| `APC_DISK_ENABLED` | `1` | Set to `0` to disable disk persistence |
+| `MLX_VLM_CACHE_HOME` | `~/.cache/mlx-vlm` | Base cache directory; APC uses its `apc` subdirectory unless `APC_DISK_PATH` is set |
+| `APC_DISK_PATH` | cache directory above | Directory for persistent disk shards; an empty value disables persistence |
+| `APC_DISK_MAX_GB` | `20` | Disk cap per model namespace in GiB; `0` means uncapped |
+| `APC_DISK_QUEUE_MAX_GB` | `1` | Maximum tensor bytes held by queued disk writes in GiB; larger writes run synchronously; `0` makes all writes synchronous |
 | `APC_DISK_SHARD_MAX_BLOCKS` | `256` | Max blocks per disk segment shard |
 | `APC_MAX_POOL_TENSORS` | `450000` | Stops adding memory blocks before the Metal resource limit; disk writes continue |
 | `APC_LAYER_MAJOR_MEMORY_MIN_TOKENS` | `50000` | Store long warm-memory prefixes as compact layer-major snapshots instead of per-block tensors |
@@ -930,6 +981,44 @@ Common APC environment variables:
 
 Custom cache layouts can opt in without APC model-name checks by implementing `prefix_cache_snapshot()` and `prefix_cache_restore(snapshot)`. In-tree dense, sliding-window, recurrent, composite, VLM, and Omni cache layouts are detected automatically. APC works with `--kv-bits` (including TurboQuant): the live KV cache stays quantized; pageable APC K/V blocks are stored as dequantized float K/V, so block-pool size does not shrink with quant.
 When APC is enabled on the server, a non-fatal layout self-check runs at model load.
+
+Requests with a shared document and different questions can reuse their common
+prefix. Dense K/V caches, including compact layer-major memory snapshots, match
+complete blocks before the first differing token. Hybrid, recurrent and sliding
+window caches must restore a state captured before that divergence: their final
+state cannot be rolled back by slicing K/V tensors.
+
+Hybrid prefill now captures intermediate checkpoints as well as the final guard
+checkpoint, in streaming, continuous batching and DiffusionGemma generation.
+With the defaults, each prompt stores its latest 2,048-token boundary before the
+final checkpoint and the final checkpoint itself. For example, a 30,000-token
+document followed by 20 instruction tokens can reuse 28,672 tokens when the
+instructions change. The same checkpoints persist across server restarts when
+the disk tier is enabled.
+
+Captures are bounded by `APC_CHECKPOINT_ENTRIES` to avoid copying the growing
+hybrid cache at every prefill chunk. More entries retain more earlier boundaries;
+a smaller interval gives finer reuse near the end. Reuse still requires a
+retained boundary before the divergence. Short prompts below the interval,
+divergence before the earliest retained checkpoint, and evicted checkpoints can
+miss. Media checkpoints include all media tokens so the remaining suffix is text.
+Changing checkpoint boundaries can change floating-point execution shapes, as
+with other chunked or cached prefill paths.
+
+The resident byte budget includes exact snapshots as well as pageable blocks.
+Before embeddings and prefill, APC drains pending disk writes and evicts idle
+checkpoints and blocks in LRU order within each tier. Admission uses current
+Metal allocations, available system RAM, and the incoming prompt's estimated
+cache growth, based on observed bytes per token. Leased blocks remain valid for
+active requests. Snapshots that exceed the budget are written directly to disk
+without making another resident copy, and disk restores stay out of the memory
+LRU when promotion would exceed the budget. Disk pressure may therefore trade
+latency for lower memory use.
+
+These controls limit APC's memory overhead; model weights and an individual
+request must still fit in memory. Tune the reserve for models with larger
+prefill or vision temporaries. `/v1/cache/stats` reports resident bytes,
+the memory budget, prefill reserve, memory evictions, and pending disk bytes.
 
 #### KV Cache Quantization
 
@@ -1441,6 +1530,7 @@ The following models support video chat:
 4. LLaVA
 5. MiniMax M3
 6. LLaVA-OneVision
+7. Mage-VL
 
 With more coming soon.
 

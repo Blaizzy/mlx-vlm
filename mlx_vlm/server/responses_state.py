@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
 
+from ..tools import process_tool_calls
+
 logger = logging.getLogger("mlx_vlm.server")
 
 RESPONSE_STORE_LIMIT = int(os.environ.get("MLX_VLM_RESPONSE_STORE_LIMIT", "1024"))
@@ -329,56 +331,6 @@ class ToolCallStreamState:
         return text, ""
 
 
-def process_tool_calls(model_output: str, tool_module, tools):
-    """Parse tool calls from model output using the appropriate tool parser."""
-    called_tools = []
-    remaining = model_output
-
-    if tool_module.tool_call_start in model_output:
-        if tool_module.tool_call_end == "":
-            pattern = re.compile(
-                f"{re.escape(tool_module.tool_call_start)}.*?(?:\n|$)", re.DOTALL
-            )
-        else:
-            pattern = re.compile(
-                f"{re.escape(tool_module.tool_call_start)}.*?{re.escape(tool_module.tool_call_end)}",
-                re.DOTALL,
-            )
-
-        matches = re.findall(pattern, model_output)
-        if matches:
-            remaining = re.sub(pattern, " ", model_output).strip()
-            for match in matches:
-                call = (
-                    match.strip()
-                    .removeprefix(tool_module.tool_call_start)
-                    .removesuffix(tool_module.tool_call_end)
-                )
-                try:
-                    parsed = tool_module.parse_tool_call(call, tools)
-                    parsed_calls = parsed if isinstance(parsed, list) else [parsed]
-                    for tool_call in parsed_calls:
-                        args = tool_call["arguments"]
-                        called_tools.append(
-                            {
-                                "type": "function",
-                                "index": len(called_tools),
-                                "id": str(uuid.uuid4()),
-                                "function": {
-                                    "name": tool_call["name"].strip(),
-                                    "arguments": (
-                                        args
-                                        if isinstance(args, str)
-                                        else json.dumps(args, ensure_ascii=False)
-                                    ),
-                                },
-                            },
-                        )
-                except Exception as exc:
-                    logger.warning("Invalid tool call %r: %s", call, exc)
-    return dict(calls=called_tools, remaining_text=remaining)
-
-
 def _as_plain_dict(value):
     if value is None:
         return None
@@ -402,7 +354,7 @@ def _sse_event(event_type: str, payload: Dict[str, Any]) -> str:
 def _clean_reasoning(reasoning: str, start_marker: str) -> str:
     reasoning = reasoning.replace(start_marker, "")
     if start_marker == "<|channel>thought":
-        reasoning = reasoning.lstrip("thought")
+        reasoning = reasoning.removeprefix("thought")
     return reasoning.strip()
 
 
@@ -486,12 +438,12 @@ def _response_output_items_from_text(
     reasoning_items = _reasoning_output_items(reasoning, reasoning_item_id)
     if tool_module is not None and chat_tools:
         tc = process_tool_calls(full_text, tool_module, chat_tools)
-        if tc["calls"]:
+        if tc.calls:
             items = [
-                _tool_call_to_response_item(call, tool_registry) for call in tc["calls"]
+                _tool_call_to_response_item(call, tool_registry) for call in tc.calls
             ]
             _, remaining = _split_thinking(
-                tc.get("remaining_text") or "",
+                tc.remaining_text or "",
                 thinking_start_token,
                 thinking_end_token,
             )
