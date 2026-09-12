@@ -182,7 +182,10 @@ def _get_role_content(item: Any) -> Union[tuple[str, Any], None]:
 def _preserve_message_metadata(
     original: Any, formatted: Union[str, Dict[str, Any]]
 ) -> Union[str, Dict[str, Any]]:
-    """Preserve dictionary fields while letting formatter-owned fields win."""
+    """Shallow-copy dictionary fields, with formatter-owned fields taking priority.
+
+    Other input/output shapes retain their existing formatter behavior.
+    """
     if isinstance(original, dict) and isinstance(formatted, dict):
         return {**original, **formatted}
     return formatted
@@ -856,6 +859,10 @@ def apply_chat_template(
 ) -> Union[List[Dict[str, Any]], str, Any]:
     """
     Apply chat template to prompts.
+
+    Ordinary dictionary messages retain fields not replaced by their dictionary
+    formatter. Values are not coerced; rendering and reasoning-history policy
+    belong to the template. Retained metadata can affect prompts and validation.
 
     Args:
         processor: The processor with chat template functionality

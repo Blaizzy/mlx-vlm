@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
@@ -3699,6 +3700,63 @@ def test_chat_completions_endpoint_preserves_assistant_reasoning_content(client)
         "reasoning_content": "Prior thought",
         "reasoning": "Prior thought",
     }
+
+
+def test_chat_completions_renders_assistant_metadata(template_processor, monkeypatch):
+    @asynccontextmanager
+    async def no_lifespan(app):
+        yield
+
+    processor = template_processor("qwen3_5")
+    monkeypatch.setattr(server.app.router, "lifespan_context", no_lifespan)
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    monkeypatch.setattr(server.runtime, "apc_manager", None)
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "synthetic-key")
+    result = GenerationResult(text="done", prompt_tokens=1, generation_tokens=1)
+    with (
+        patch.object(
+            server,
+            "get_cached_model",
+            return_value=(
+                SimpleNamespace(),
+                processor,
+                SimpleNamespace(model_type="qwen3_5"),
+            ),
+        ),
+        patch.object(server, "generate", return_value=result) as generate,
+        patch.object(
+            processor, "apply_chat_template", wraps=processor.apply_chat_template
+        ) as render,
+        patch.object(mx, "clear_cache"),
+        TestClient(server.app) as test_client,
+    ):
+        response = test_client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer synthetic-key"},
+            json={
+                "model": "synthetic",
+                "stream": False,
+                "max_tokens": 1,
+                "enable_thinking": False,
+                "messages": [
+                    {"role": "user", "content": "question"},
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "name": "speaker",
+                        "reasoning_content": "structured",
+                    },
+                ],
+            },
+        )
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "done"
+    normalized = render.call_args.args[0][1]
+    assert normalized["name"] == "speaker"
+    assert normalized["reasoning_content"] == "structured"
+    assert (
+        "<think>\nstructured\n</think>\n\nanswer" in generate.call_args.kwargs["prompt"]
+    )
 
 
 def test_anthropic_messages_endpoint_maps_text_and_images(client, monkeypatch):

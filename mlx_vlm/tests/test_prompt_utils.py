@@ -151,6 +151,132 @@ class TestMessageMetadata:
         )
 
 
+class TestMessageTemplateMetadata:
+    def test_metadata_does_not_move_history_images(self):
+        messages = [
+            {"role": "system", "content": "rules", "name": "system_name"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "synthetic.png"}},
+                    {"type": "text", "text": "question"},
+                ],
+            },
+            {"role": "assistant", "content": "answer", "reasoning_content": "reason"},
+            {"role": "user", "content": "follow up"},
+        ]
+        before = deepcopy(messages)
+        normalized = apply_chat_template(
+            None,
+            {"model_type": "qwen3_5"},
+            messages,
+            num_images=1,
+            return_messages=True,
+        )
+        assert messages == before
+        assert normalized[0]["name"] == "system_name"
+        assert normalized[2]["reasoning_content"] == "reason"
+        assert [
+            sum(part["type"] == "image" for part in message["content"])
+            for message in normalized
+        ] == [0, 1, 0, 0]
+
+    @pytest.mark.parametrize("name", ["qwen3_5", "qwen3_8"])
+    @pytest.mark.parametrize("reasoning", [None, "", "structured"])
+    def test_qwen_reasoning_precedence_history_and_continuation(
+        self, template_processor, name, reasoning
+    ):
+        processor = template_processor(name)
+        messages = [
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "content": "<think>inline</think>answer",
+                "reasoning_content": reasoning,
+            },
+        ]
+        kwargs = {"add_generation_prompt": False, "enable_thinking": True}
+        rendered = apply_chat_template(
+            processor, {"model_type": "qwen3_5"}, messages, **kwargs
+        )
+        assert rendered == processor.apply_chat_template(messages, **kwargs)
+        inline_fallback = name == "qwen3_5" and reasoning is None
+        thought = "inline" if inline_fallback else reasoning or ""
+        answer = "answer" if inline_fallback else messages[-1]["content"]
+        assert rendered.endswith(
+            f"<|im_start|>assistant\n<think>\n{thought}\n</think>\n\n{answer}<|im_end|>\n"
+        )
+
+        history = messages + [{"role": "user", "content": "next"}]
+        historical = apply_chat_template(
+            processor, {"model_type": "qwen3_5"}, history, **kwargs
+        )
+        assert historical == processor.apply_chat_template(history, **kwargs)
+        assert ("structured" in historical) == (name == "qwen3_8" and bool(reasoning))
+
+        continuation = [messages[0], {**messages[1], "content": "answer"}]
+        continued = apply_chat_template(
+            processor,
+            {"model_type": "qwen3_5"},
+            continuation,
+            continue_final_message=True,
+            **kwargs,
+        )
+        assert continued == processor.apply_chat_template(
+            continuation, continue_final_message=True, **kwargs
+        )
+        assert continued.endswith(f"<think>\n{reasoning or ''}\n</think>\n\nanswer")
+
+    @pytest.mark.parametrize(
+        "metadata,thought",
+        [
+            ({"reasoning_content": None}, ""),
+            ({"reasoning_content": ""}, ""),
+            ({"reasoning_content": "structured"}, "structured"),
+            ({"reasoning": "preferred", "reasoning_content": "secondary"}, "preferred"),
+        ],
+    )
+    def test_gemma_reasoning_remains_template_owned(
+        self, template_processor, metadata, thought
+    ):
+        processor = template_processor("gemma4")
+        messages = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer", **metadata},
+        ]
+        kwargs = {"add_generation_prompt": False, "enable_thinking": True}
+        rendered = apply_chat_template(
+            processor, {"model_type": "gemma4"}, messages, **kwargs
+        )
+        channel = f"<|channel>thought\n{thought}\n<channel|>" if thought else ""
+        assert rendered == (
+            "<bos><|turn>system\n<|think|>\n<turn|>\n"
+            "<|turn>user\nquestion<turn|>\n"
+            f"<|turn>model\n{channel}answer<turn|>\n"
+        )
+        history = messages + [{"role": "user", "content": "next"}]
+        assert apply_chat_template(
+            processor, {"model_type": "gemma4"}, history, **kwargs
+        ) == processor.apply_chat_template(history, **kwargs)
+        assert "<|channel>thought" not in processor.apply_chat_template(
+            history, **kwargs
+        )
+
+    def test_unaffected_qwen2_5_rendering(self, template_processor):
+        processor = template_processor("qwen2_5_vl")
+        messages = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer", "reasoning_content": "unused"},
+        ]
+        assert apply_chat_template(
+            processor, {"model_type": "qwen2_5_vl"}, messages
+        ) == (
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            "<|im_start|>user\nquestion<|im_end|>\n"
+            "<|im_start|>assistant\nanswer<|im_end|>\n<|im_start|>assistant\n"
+        )
+
+
 class TestExtractTextFromContent:
     """Tests for the extract_text_from_content function."""
 
