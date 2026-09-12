@@ -179,6 +179,15 @@ def _get_role_content(item: Any) -> Union[tuple[str, Any], None]:
     return None
 
 
+def _preserve_message_metadata(
+    original: Any, formatted: Union[str, Dict[str, Any]]
+) -> Union[str, Dict[str, Any]]:
+    """Preserve dictionary fields while letting formatter-owned fields win."""
+    if isinstance(original, dict) and isinstance(formatted, dict):
+        return {**original, **formatted}
+    return formatted
+
+
 def _content_media_count(content: Any, media_types: tuple[str, ...]) -> int:
     if not isinstance(content, list):
         return 0
@@ -928,13 +937,16 @@ def apply_chat_template(
         else:
             content = extract_text_from_content(prompt["content"])
             messages.append(
-                get_message_json(
-                    model_type,
-                    content,
-                    role,
-                    num_images=num_images,
-                    num_audios=num_audios,
-                    **kwargs,
+                _preserve_message_metadata(
+                    prompt,
+                    get_message_json(
+                        model_type,
+                        content,
+                        role,
+                        num_images=num_images,
+                        num_audios=num_audios,
+                        **kwargs,
+                    ),
                 )
             )
     elif isinstance(prompt, list):
@@ -1002,17 +1014,20 @@ def apply_chat_template(
                     # Handle multimodal content: extract only text, skip image/audio URLs
                     content = extract_text_from_content(content)
                     messages.append(
-                        get_message_json(
-                            model_type,
-                            content,
-                            role,
-                            skip_image_token=image_counts[i] == 0
-                            or role in ["system", "assistant"],
-                            skip_audio_token=audio_counts[i] == 0
-                            or role in ["system", "assistant"],
-                            num_images=image_counts[i],
-                            num_audios=audio_counts[i],
-                            **kwargs,
+                        _preserve_message_metadata(
+                            p,
+                            get_message_json(
+                                model_type,
+                                content,
+                                role,
+                                skip_image_token=image_counts[i] == 0
+                                or role in ["system", "assistant"],
+                                skip_audio_token=audio_counts[i] == 0
+                                or role in ["system", "assistant"],
+                                num_images=image_counts[i],
+                                num_audios=audio_counts[i],
+                                **kwargs,
+                            ),
                         )
                     )
 

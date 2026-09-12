@@ -1,5 +1,8 @@
 """Tests for prompt_utils module, specifically multimodal content handling."""
 
+from copy import deepcopy
+from types import SimpleNamespace
+
 import pytest
 
 from mlx_vlm.prompt_utils import apply_chat_template, extract_text_from_content
@@ -17,6 +20,135 @@ def _assistant_tool_call(content):
             }
         ],
     }
+
+
+class TestMessageMetadata:
+    @pytest.mark.parametrize("as_list", [False, True])
+    def test_formatter_fields_take_precedence(self, monkeypatch, as_list):
+        original = {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}],
+            "name": "speaker",
+            "custom": {"nested": [1, None]},
+            "owned": "original",
+        }
+        before = deepcopy(original)
+        formatted = {"role": "assistant", "content": "formatted", "owned": "new"}
+        monkeypatch.setattr(
+            "mlx_vlm.prompt_utils.get_message_json", lambda *a, **kw: formatted
+        )
+        result = apply_chat_template(
+            None,
+            {"model_type": "qwen3_5"},
+            [original] if as_list else original,
+            return_messages=True,
+        )
+        assert result == [{**original, **formatted}]
+        assert original == before
+        assert formatted == {
+            "role": "assistant",
+            "content": "formatted",
+            "owned": "new",
+        }
+
+    @pytest.mark.parametrize(
+        "metadata,content,text",
+        [
+            ({}, "answer", "answer"),
+            ({"reasoning_content": None}, None, ""),
+            ({"reasoning_content": ""}, [], ""),
+            (
+                {"reasoning_content": "reason"},
+                [
+                    {"type": "input_text", "text": "answer"},
+                    {"type": "image_url", "image_url": {"url": "synthetic.png"}},
+                ],
+                "answer",
+            ),
+        ],
+    )
+    def test_reasoning_values_and_content_normalization(self, metadata, content, text):
+        original = {"role": "assistant", "content": content, **metadata}
+        before = deepcopy(original)
+        result = apply_chat_template(
+            None, {"model_type": "qwen3_5"}, [original], return_messages=True
+        )
+        assert result == [
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text, "content": text}],
+                **metadata,
+            }
+        ]
+        assert original == before
+
+    @pytest.mark.parametrize(
+        "model,original,expected",
+        [
+            (
+                "paligemma",
+                {"role": "user", "content": "hello", "name": "speaker"},
+                "hello",
+            ),
+            (
+                "qwen3_5",
+                SimpleNamespace(role="assistant", content="hello", name="speaker"),
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hello", "content": "hello"}],
+                },
+            ),
+        ],
+    )
+    def test_non_dictionary_shapes_keep_formatter_behavior(
+        self, model, original, expected
+    ):
+        assert apply_chat_template(
+            None, {"model_type": model}, [original], return_messages=True
+        ) == [expected]
+
+    @pytest.mark.parametrize(
+        "tool_calls", [None, [], _assistant_tool_call(None)["tool_calls"]]
+    )
+    def test_tool_path_preserves_key_states_and_inputs(self, tool_calls):
+        original = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": deepcopy(tool_calls),
+            "reasoning_content": "reason",
+            "custom": {"nested": []},
+        }
+        if tool_calls:
+            original["tool_calls"][0]["function"]["arguments"] = '{"city":"Paris"}'
+        before = deepcopy(original)
+        result = apply_chat_template(
+            None, {"model_type": "qwen3_5"}, [original], return_messages=True
+        )[0]
+        assert original == before
+        assert result["reasoning_content"] == "reason"
+        assert result["custom"] == original["custom"]
+        assert result["content"] == ("" if tool_calls else None)
+        if tool_calls:
+            assert result["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}
+        else:
+            assert result["tool_calls"] == tool_calls
+
+    @pytest.mark.parametrize("model", ["qwen3_5", "qwen3_5_moe"])
+    def test_dense_and_moe_routes_preserve_metadata(self, model):
+        from mlx_vlm.prompt_utils import MODEL_CONFIG, MessageFormat
+
+        assert MODEL_CONFIG[model] == MessageFormat.LIST_WITH_IMAGE_FIRST
+        message = {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_content": "reason",
+        }
+        assert (
+            apply_chat_template(
+                None, {"model_type": model}, message, return_messages=True
+            )[0]["reasoning_content"]
+            == "reason"
+        )
 
 
 class TestExtractTextFromContent:
