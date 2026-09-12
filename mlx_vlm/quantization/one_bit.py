@@ -473,6 +473,17 @@ def _quantization_for_path(quantization: dict, path: str) -> dict:
             entry = modules.get(key)
         return entry
 
+    # Converters also express component-wide widths as ``<component>_bits``
+    # (``expert_bits``, ``engram_bits``) alongside the base ``bits``. An
+    # explicit per-module entry still wins over these.
+    for key, value in quantization.items():
+        if not key.endswith("_bits") or not isinstance(value, int):
+            continue
+        component = key[: -len("_bits")]
+        if f".{component}." in path or f".{component}s." in path:
+            base["bits"] = value
+            break
+
     per_layer = lookup(path)
     if per_layer is None and path.startswith("language_model."):
         # Config keys from the underlying text checkpoint omit the mlx-vlm
