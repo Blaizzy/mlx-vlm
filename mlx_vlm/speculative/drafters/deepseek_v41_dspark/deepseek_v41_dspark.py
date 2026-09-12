@@ -202,7 +202,7 @@ class DeepseekV41DsparkStage(nn.Module):
             self.hc_eps,
             self.norm_eps,
         )
-        x = DeepseekV41Block.hc_pre(x, attn_pre)
+        x = DeepseekV41Block.hc_pre(h, attn_pre)
         x = self.ffn_norm(x)
         x = self.ffn(x)
         h = hc_post(x, residual, ffn_post, ffn_comb)
