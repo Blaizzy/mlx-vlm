@@ -549,7 +549,7 @@ def generate_step(
         if n == max_tokens:
             break
 
-        yield y.item(), logprobs
+        yield (y.item() if y.size == 1 else y.tolist()), logprobs
         if n % 256 == 0:
             mx.clear_cache()
 
