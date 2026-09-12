@@ -26,13 +26,20 @@ from ..tools import (
     process_tool_calls,
 )
 from ..utils import prepare_inputs
+from .compaction import (
+    append_summarization_instruction,
+    compaction_response,
+    replacement_fits,
+)
 from .generation import (
     GenerationMetrics,
     PromptTooLongError,
     _build_metrics_envelope,
     _count_prompt_tokens,
+    get_configured_context_limit,
 )
 from .request_preparation import (
+    _ensure_effective_input,
     normalize_chat_input,
     normalize_responses_input,
     prepare_prompt,
@@ -194,6 +201,8 @@ def register_routes(app, deps):
     )
     app.post("/responses")(responses_endpoint)
     app.post("/v1/responses", include_in_schema=False)(responses_endpoint)
+    app.post("/responses/compact")(compact_endpoint)
+    app.post("/v1/responses/compact", include_in_schema=False)(compact_endpoint)
     app.post("/chat/completions", response_model=None)(chat_completions_endpoint)
     app.post("/v1/chat/completions", response_model=None, include_in_schema=False)(
         chat_completions_endpoint
@@ -1341,6 +1350,109 @@ async def responses_endpoint(request: Request):
         raise http_exc
     except Exception as e:
         logger.exception("Unexpected error in /responses endpoint: %s", e)
+        mx.clear_cache()
+        gc.collect()
+        raise HTTPException(
+            status_code=500, detail=f"An unexpected error occurred: {e}"
+        )
+
+
+async def compact_endpoint(request: Request):
+    """Summarize an active conversation into a replacement for its own history.
+
+    The caller's ordered context is left untouched and the summarization
+    instruction is appended as a final turn, so the rendered prefix still
+    matches the request this one follows and its cache can be reused.
+    """
+    body = await request.json()
+    openai_request = OpenAIRequest(**body)
+
+    try:
+        if openai_request.input is None:
+            raise HTTPException(status_code=400, detail="Missing input.")
+
+        conversation = _response_chain_items(
+            openai_request.previous_response_id
+        ) + _normalize_response_input(openai_request.input)
+        _ensure_effective_input(conversation)
+        source, _, _ = normalize_responses_input(
+            openai_request, append_summarization_instruction(conversation)
+        )
+        model, processor, config = get_cached_model(
+            openai_request.model, _adapter_path_or_inherit(openai_request)
+        )
+        try:
+            gen_args = _build_gen_args(
+                openai_request, processor, tenant_id=_read_tenant_id(request)
+            )
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        gen_args.stream = False
+
+        prepared = prepare_prompt(
+            source, processor, config, gen_args, render=apply_chat_template
+        )
+        images, audio, videos = prepared.images, prepared.audio, prepared.videos
+
+        runtime.metrics.begin_request(
+            endpoint="/responses/compact",
+            model=openai_request.model,
+            stream=False,
+        )
+        metrics = GenerationMetrics()
+        result = generate(
+            model=model,
+            processor=processor,
+            prompt=prepared.prompt,
+            image=images,
+            audio=audio,
+            video=videos,
+            verbose=logger.isEnabledFor(logging.DEBUG),
+            vision_cache=runtime.model_cache.get("vision_cache"),
+            apc_manager=runtime.apc_manager,
+            **gen_args.to_generate_kwargs(),
+            **prepared.generation_kwargs,
+        )
+        metrics.record_result(result)
+        mx.clear_cache()
+        gc.collect()
+
+        summary = (result.text or "").strip()
+        if not summary:
+            raise HTTPException(
+                status_code=502,
+                detail="Compaction produced no summary.",
+            )
+        if not replacement_fits(
+            result.generation_tokens,
+            get_configured_context_limit(),
+            gen_args.max_tokens,
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="Summary does not fit as the replacement conversation.",
+            )
+
+        usage = OpenAIUsage.from_metrics(
+            metrics, result.prompt_tokens, result.generation_tokens
+        ).model_dump()
+        return compaction_response(
+            response_id=f"resp_compact_{uuid.uuid4().hex}",
+            item_id=f"cmp_{uuid.uuid4().hex}",
+            created_at=int(datetime.now().timestamp()),
+            summary=summary,
+            usage=usage,
+        )
+    except HTTPException:
+        mx.clear_cache()
+        gc.collect()
+        raise
+    except PromptTooLongError as e:
+        mx.clear_cache()
+        gc.collect()
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Unexpected error in /responses/compact endpoint: %s", e)
         mx.clear_cache()
         gc.collect()
         raise HTTPException(
