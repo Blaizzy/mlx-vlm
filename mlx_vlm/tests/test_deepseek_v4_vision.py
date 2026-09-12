@@ -20,10 +20,6 @@ from mlx_vlm.models.deepseek_v4.processing_deepseek_v4 import (
     preprocess_image,
 )
 from mlx_vlm.models.deepseek_v4.vision import Aligner, ViT
-from mlx_vlm.speculative.drafters.deepseek_v4_dspark import DeepseekV4DsparkDraftModel
-from mlx_vlm.speculative.drafters.deepseek_v4_dspark.config import (
-    DeepseekV4DsparkConfig,
-)
 from mlx_vlm.vision_cache import VisionFeatureCache
 
 
@@ -433,47 +429,6 @@ class TestDeepseekV4VisionLanguage(unittest.TestCase):
             mx.eval(output.logits)
 
         self.assertEqual(output.logits.shape, (1, 1, model.config.vocab_size))
-
-    def test_image_prefill_hidden_feeds_text_only_dspark(self):
-        processor = TestDeepseekV4ImageProcessor().make_processor(vocab_size=16)
-        processed = processor(
-            f"before{IMAGE_PLACEHOLDER}after",
-            images=[Image.new("RGB", (8, 4), (20, 40, 60))],
-            return_tensors="mlx",
-        )
-        image_kwargs = {
-            key: value for key, value in processed.items() if key.startswith("image_")
-        }
-        target = Model(tiny_vision_config())
-        outputs = target(
-            processed["input_ids"],
-            pixel_values=processed["pixel_values"],
-            capture_layer_ids=[0],
-            **image_kwargs,
-        )
-        hidden = mx.concatenate(outputs.hidden_states, axis=-1)
-        drafter = DeepseekV4DsparkDraftModel(
-            DeepseekV4DsparkConfig(
-                text_config=target.config,
-                n_mtp_layers=1,
-                target_layer_ids=[0],
-                mask_token_id=1,
-                markov_rank=4,
-                block_size=3,
-            )
-        )
-        draft_cache = drafter.reset(target)
-        drafts = drafter.draft_block(
-            2,
-            hidden,
-            draft_cache,
-            block_size=3,
-            sampler=lambda logits: mx.argmax(logits, axis=-1),
-        )
-        mx.eval(drafts)
-
-        self.assertFalse(drafter.stages[0].ffn.gate.vision)
-        self.assertEqual(drafts.shape, (1, 2))
 
 
 class ProcessorTokenizer:

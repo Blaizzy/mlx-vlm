@@ -231,24 +231,20 @@ def main():
         "--draft-model",
         type=str,
         default=None,
-        help=(
-            "Speculative drafter path or HF id "
-            "(e.g. z-lab/Qwen3.5-4B-DFlash, google/gemma-4-31B-it-assistant)."
-        ),
+        help="Native MTP checkpoint path or HF id (GLM-5.3-Flash or Qwen3.5).",
     )
     parser.add_argument(
         "--draft-kind",
         type=str,
         default=None,
-        choices=["dflash", "eagle3", "mtp"],
-        help="Drafter family -- 'dflash', 'eagle3', or 'mtp' (Gemma 4). "
-        "Default: auto-detected from the drafter's HF model_type.",
+        choices=["mtp"],
+        help="Speculative method (native MTP).",
     )
     parser.add_argument(
         "--draft-block-size",
         type=int,
         default=None,
-        help="Override the drafter's configured block size.",
+        help="Verification block size: number of draft tokens plus one (default: 2).",
     )
     parser.add_argument(
         "--max-num-seqs",

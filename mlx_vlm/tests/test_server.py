@@ -469,13 +469,6 @@ def test_chat_completions_rejects_invalid_tool_choice(
     mock_get_cached_model.assert_not_called()
 
 
-def test_speculative_server_dispatches_mtp_batch_loop():
-    assert (
-        speculative_utils.get_speculative_rounds_batch("mtp")
-        is speculative_utils._mtp_rounds_batch
-    )
-
-
 def test_positioned_target_sampler_is_batch_grouping_invariant():
     sampler = server_generation._PositionedTargetSampler(
         temperature=0.7, top_p=1.0, seed=42
@@ -541,35 +534,14 @@ def test_server_passes_top_k_to_positioned_sampler():
     assert sampler.top_k == 7
 
 
-def test_speculative_server_dispatches_eagle3_batch_loop():
-    assert (
-        speculative_utils.get_speculative_rounds_batch("eagle3")
-        is speculative_utils._eagle3_rounds_batch
-    )
-
-
-def test_speculative_server_keeps_dflash_default_batch_loop():
-    assert (
-        speculative_utils.get_speculative_rounds_batch("dflash")
-        is speculative_utils._dflash_rounds_batch
-    )
-
-
-def test_speculative_server_rejects_unknown_draft_kind():
-    with pytest.raises(ValueError):
-        speculative_utils.get_speculative_rounds_batch("nope")
-
-
 def test_speculative_server_prefill_kwargs_are_drafter_specific():
     drafter = SimpleNamespace(config=SimpleNamespace(target_layer_ids=[1, 2, 3]))
 
     assert speculative_utils.speculative_prefill_kwargs("mtp", drafter) == {
         "return_hidden": True,
-        "return_shared_kv": True,
     }
-    assert speculative_utils.speculative_prefill_kwargs("dflash", drafter) == {
-        "capture_layer_ids": [1, 2, 3],
-    }
+    with pytest.raises(ValueError, match="Only native MTP"):
+        speculative_utils.speculative_prefill_kwargs("dflash", drafter)
 
 
 def test_speculative_server_hidden_state_picks_last_layer_for_mtp():
@@ -579,22 +551,11 @@ def test_speculative_server_hidden_state_picks_last_layer_for_mtp():
     assert speculative_utils.speculative_hidden_state("mtp", out) is h[-1]
 
 
-def test_speculative_server_hidden_state_concatenates_for_dflash():
-    h = [mx.zeros((1, 1, 4)), mx.ones((1, 1, 4))]
-    out = SimpleNamespace(hidden_states=h)
-
-    result = speculative_utils.speculative_hidden_state("dflash", out)
-    assert result.shape == (1, 1, 8)
-
-
 @pytest.mark.parametrize(
     "draft_kind,batch_size,left_padding",
     [
         ("mtp", 1, [0]),
         ("mtp", 2, [0, 1]),
-        ("dflash", 1, [0]),
-        ("dflash", 2, [0, 1]),
-        ("eagle3", 1, [0]),
         (None, 1, [0]),
     ],
 )
@@ -3249,48 +3210,17 @@ def test_generation_metrics_record_speculative_stats():
         SimpleNamespace(
             generation_tokens=6,
             emitted_at=10.5,
-            draft_kind="dflash",
+            draft_kind="mtp",
             draft_rounds=3,
             draft_n_accepted=4,
             draft_n=9,
         )
     )
 
-    assert metrics.draft_kind == "dflash"
+    assert metrics.draft_kind == "mtp"
     assert metrics.draft_rounds == 3
     assert metrics.draft_n_accepted == 4
     assert metrics.draft_n == 9
-
-
-def test_speculative_lifetime_counters_survive_reset():
-    from mlx_vlm.speculative.common import (
-        _record_speculative_round,
-        speculative_stats_since,
-        speculative_stats_snapshot,
-    )
-
-    drafter = SimpleNamespace(accept_lens=[], draft_lens=[])
-
-    assert speculative_stats_since(drafter, speculative_stats_snapshot(drafter)) == (
-        None,
-        None,
-        None,
-    )
-
-    snapshot = speculative_stats_snapshot(drafter)
-    _record_speculative_round(drafter, 3, 7)
-    _record_speculative_round(drafter, 2.5, 7)
-    drafter.accept_lens = []
-    drafter.draft_lens = []
-    _record_speculative_round(drafter, 1.5, 7)
-
-    rounds, accepted, drafted = speculative_stats_since(drafter, snapshot)
-    assert (rounds, accepted, drafted) == (3, 7, 21)
-
-    later_snapshot = speculative_stats_snapshot(drafter)
-    _record_speculative_round(drafter, 2, 7)
-    rounds, accepted, drafted = speculative_stats_since(drafter, later_snapshot)
-    assert (rounds, accepted, drafted) == (1, 2, 7)
 
 
 def test_chat_completions_returns_timings(client, monkeypatch):
@@ -5500,9 +5430,10 @@ class TestResponseGenerator:
                 (str(uid * 10 + 1), "length"),
             ]
 
-    @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])
+    @pytest.mark.parametrize("draft_kind", ["mtp"])
+    @pytest.mark.parametrize("second_logprobs", [False, True])
     def test_run_routes_speculative_decode_through_batch_generator(
-        self, monkeypatch, draft_kind
+        self, monkeypatch, draft_kind, second_logprobs
     ):
         batch_state = {}
         draft_model = object()
@@ -5524,6 +5455,8 @@ class TestResponseGenerator:
             def __init__(self, *args, **kwargs):
                 del args
                 batch_state["kwargs"] = kwargs
+                self.compute_logprobs = kwargs["compute_logprobs"]
+                self.top_logprobs_k = kwargs["top_logprobs_k"]
                 self._next_uid = 1
                 self._active = {}
                 self.next_active_sizes = []
@@ -5556,6 +5489,7 @@ class TestResponseGenerator:
                         token=uid + 100,
                         token_logprob=0.0,
                         finish_reason="length",
+                        speculative_stats=(uid, uid * 2, uid * 3),
                     )
                     for uid in sorted(self._active)
                 ]
@@ -5588,7 +5522,7 @@ class TestResponseGenerator:
         gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
         gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
         gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
-        gen.top_logprobs_k = 0
+        gen.top_logprobs_k = 7
         apc_manager = SimpleNamespace(prepare_prefill=MagicMock(), close=MagicMock())
         gen.apc_manager = apc_manager
         gen.prefill_step_size = 3072
@@ -5624,7 +5558,11 @@ class TestResponseGenerator:
                     rqueue=rqueue,
                     raw_inputs={"request_id": request_id},
                     prompt_tokens=1,
-                    args=server.GenerationArguments(max_tokens=1, temperature=0),
+                    args=server.GenerationArguments(
+                        max_tokens=1,
+                        temperature=0,
+                        logprobs=second_logprobs and request_id == 1,
+                    ),
                 )
             )
 
@@ -5637,6 +5575,11 @@ class TestResponseGenerator:
                 assert isinstance(ctx, server.GenerationContext)
                 item = rqueue.get(timeout=1)
                 assert item.finish_reason == "length"
+                assert (item.draft_rounds, item.draft_n_accepted, item.draft_n) == (
+                    ctx.uid,
+                    ctx.uid * 2,
+                    ctx.uid * 3,
+                )
                 assert rqueue.get(timeout=1) is None
         finally:
             gen._stop = True
@@ -5649,6 +5592,8 @@ class TestResponseGenerator:
         assert kwargs["draft_block_size"] == 6
         assert kwargs["greedy_sampling"] is True
         assert kwargs["compute_logprobs"] is False
+        assert batch_state["instance"].compute_logprobs is second_logprobs
+        assert batch_state["instance"].top_logprobs_k == (7 if second_logprobs else 0)
         assert kwargs["prefill_step_size"] == 3072
         assert kwargs["apc_manager"] is apc_manager
         assert apc_manager.prepare_prefill.call_count == 2
@@ -5656,7 +5601,7 @@ class TestResponseGenerator:
         apc_manager.close.assert_called_once_with()
         assert batch_state["instance"].next_active_sizes == [2]
 
-    @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])
+    @pytest.mark.parametrize("draft_kind", ["mtp"])
     def test_run_coalesces_idle_speculative_batch_generator(
         self, monkeypatch, draft_kind
     ):

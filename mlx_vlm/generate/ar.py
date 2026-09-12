@@ -213,7 +213,7 @@ def generate_step(
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
     draft_model: Optional[nn.Module] = None,
-    draft_kind: str = "dflash",
+    draft_kind: str = "mtp",
     draft_block_size: Optional[int] = None,
     prompt_cache_checkpoint: Optional[Callable[[int, List[Any]], None]] = None,
     prompt_cache_checkpoint_len: Optional[int] = None,
@@ -266,11 +266,11 @@ def generate_step(
           memory usage.
         draft_model (nn.Module, optional): A drafter for speculative decoding.
           When set, the decode loop is replaced by the drafter's speculative
-          loop (e.g. DFlash block-diffusion). VLM prefill with image/audio
+          MTP loop. VLM prefill with image/audio
           is supported via the same ``get_input_embeddings`` path the normal
           decoder uses; decode itself is text-only. ``temperature`` and
-          ``sampler`` are respected; ``logprobs`` is always ``None`` on the
-          speculative path.
+          ``sampler`` are respected. Pass ``logprobs=True`` to return target
+          log probabilities for every speculative output token.
         draft_block_size (int, optional): Override the drafter's configured
           block size.
 
@@ -332,13 +332,26 @@ def generate_step(
     if logits_processors is not None:
         processors.extend(logits_processors)
 
+    full_prompt_tokens = kwargs.pop("full_prompt_tokens", input_ids)
+    speculative_state = kwargs.pop("speculative_cache", None)
+    speculative_state_callback = kwargs.pop("speculative_cache_callback", None)
+    speculative_checkpoint = kwargs.pop("speculative_checkpoint", None)
     y = input_ids
     tokens = mx.array([], dtype=input_ids.dtype)
     target_sample_position = 0
 
     thinking_budget_criteria = kwargs.pop("thinking_budget_criteria", None)
+    compute_logprobs = kwargs.pop("logprobs", kwargs.pop("compute_logprobs", False))
+    if hasattr(thinking_budget_criteria, "make_logits_processor"):
+        policy = thinking_budget_criteria.make_logits_processor(full_prompt_tokens.size)
+        if policy is not None:
+            processors.append(policy)
+        thinking_budget_criteria = None
 
     # Create the KV cache for generation
+    if speculative_state is not None:
+        prompt_cache = speculative_state.target
+        kwargs.setdefault("rope_deltas", speculative_state.position_offset[:, None])
     if prompt_cache is None:
         prompt_cache = cache.make_prompt_cache(
             model.language_model,
@@ -347,20 +360,35 @@ def generate_step(
 
     # Speculative decoding setup
     last_outputs = None
-    speculative_prefill = SpeculativePrefill(draft_kind, draft_model)
+    speculative_prefill = SpeculativePrefill(draft_kind, draft_model, input_ids)
     speculative_prefill_capture_kwargs = {}
     if draft_model is not None:
+        from ..speculative.cache_state import CacheTransaction
         from ..speculative.drafters import validate_drafter_compatibility
 
         validate_drafter_compatibility(model, draft_model, draft_kind)
+        CacheTransaction.check_types(prompt_cache)
+        if speculative_state is None and any(
+            not entry.empty() for entry in prompt_cache
+        ):
+            raise ValueError(
+                "MTP requires a fresh prompt cache; target-only prefix reuse is not supported."
+            )
         speculative_prefill_capture_kwargs = speculative_prefill_kwargs(
             draft_kind, draft_model
         )
+        speculative_prefill.start(
+            model,
+            prompt_cache,
+            draft_model,
+            state=speculative_state,
+            checkpoint=speculative_checkpoint,
+        )
         # Reset stale mRoPE state from any previous generation.
         lm = model.language_model if hasattr(model, "language_model") else model
-        if hasattr(lm, "_position_ids"):
+        if speculative_state is None and hasattr(lm, "_position_ids"):
             lm._position_ids = None
-        if hasattr(lm, "_rope_deltas"):
+        if speculative_state is None and hasattr(lm, "_rope_deltas"):
             lm._rope_deltas = None
 
     def _step(y, inputs_embeds=None):
@@ -390,7 +418,11 @@ def generate_step(
             logits = outputs.logits[:, -1, :]
 
             if len(processors) > 0 and len(y) > 0:
-                tokens = mx.concat([tokens, y.flatten()])
+                tokens = (
+                    full_prompt_tokens.flatten()
+                    if target_sample_position == 0
+                    else mx.concat([tokens, y.flatten()])
+                )
 
                 for processor in processors:
                     logits = processor(tokens, logits)
@@ -445,6 +477,10 @@ def generate_step(
             }
         )
         kwargs.update(explicit_prompt_metadata)
+        if draft_model is not None and kwargs.get("rope_deltas") is not None:
+            speculative_prefill.state.position_offset = kwargs["rope_deltas"].reshape(
+                -1
+            )
         policy_kwargs = kwargs
         if speculative_prefill_capture_kwargs:
             policy_kwargs = {**kwargs, **speculative_prefill_capture_kwargs}
@@ -522,12 +558,14 @@ def generate_step(
 
     # Speculative decoding
     if draft_model is not None:
-        last_outputs = speculative_prefill.finish(last_outputs)
+        last_outputs = speculative_prefill.finish(last_outputs, y)
+        if speculative_state_callback is not None:
+            speculative_state_callback(speculative_prefill.state)
         yield from run_speculative_rounds(
             model,
             draft_model,
             prompt_cache,
-            input_ids,
+            speculative_prefill.tokens,
             y,
             logprobs,
             last_outputs,
@@ -536,6 +574,10 @@ def generate_step(
             sampler=sampler,
             draft_block_size=draft_block_size,
             sampler_is_greedy=sampler_is_greedy,
+            logits_processors=processors,
+            token_context=full_prompt_tokens.tolist(),
+            state=speculative_prefill.state,
+            compute_logprobs=compute_logprobs,
         )
         return
 
@@ -1074,9 +1116,10 @@ class GenerationBatch:
     class Response:
         uid: int
         token: int
-        token_logprob: float
+        token_logprob: Optional[float]
         finish_reason: Optional[str]
         top_logprobs: Optional[List[Tuple[int, float]]] = None
+        speculative_stats: Optional[tuple] = None
 
     def __init__(
         self,
@@ -1543,12 +1586,18 @@ class SpeculativeGenerationBatch:
         stop_criteria,
         max_tokens: List[int],
         hidden: mx.array,
-        shared_kv_states: Optional[dict],
         prompt_tokens: mx.array,
         *,
         draft_block_size: Optional[int] = None,
         token_dtype: mx.Dtype = mx.int32,
         greedy_sampling: bool = False,
+        logits_processors=None,
+        token_context=None,
+        state=None,
+        checkpoint=None,
+        compute_logprobs=False,
+        top_logprobs_k=0,
+        first_logprobs=None,
     ):
         self.model = model
         self.draft_model = draft_model
@@ -1561,11 +1610,20 @@ class SpeculativeGenerationBatch:
         self.stop_criteria = stop_criteria
         self.max_tokens = list(max_tokens)
         self.hidden = hidden
-        self.shared_kv_states = shared_kv_states
         self.prompt_tokens = prompt_tokens
         self.draft_block_size = draft_block_size
         self.token_dtype = token_dtype
         self.greedy_sampling = greedy_sampling
+        self.logits_processors = logits_processors
+        self.token_context = token_context
+        self.state = state
+        self.checkpoint = checkpoint
+        self.compute_logprobs = compute_logprobs
+        self.top_logprobs_k = top_logprobs_k
+        self.first_logprobs = first_logprobs
+        if state is not None:
+            state.tokens = [list(ctx) for ctx in (token_context or [[] for _ in uids])]
+        self._checkpointed = set()
         self._num_tokens = [0] * len(uids)
         self._finished = [False] * len(uids)
         self._sent_first = False
@@ -1574,10 +1632,26 @@ class SpeculativeGenerationBatch:
     def __len__(self):
         return sum(not done for done in self._finished)
 
+    def _attach_stats(self, responses):
+        if self.state is not None:
+            for response in responses:
+                if response.finish_reason is not None:
+                    row = self._all_uids.index(response.uid)
+                    response.speculative_stats = self.state.stats[row].snapshot()
+        return responses
+
     def _refresh_uids(self):
         self.uids = [
             uid for uid, done in zip(self._all_uids, self._finished) if not done
         ]
+        if not self.uids and self._rounds_iter is not None:
+            self._rounds_iter.close()
+            self._rounds_iter = None
+        if self.checkpoint is not None and self.state is not None:
+            for row, done in enumerate(self._finished):
+                if done and row not in self._checkpointed:
+                    self.checkpoint(self.state, row, self.state.tokens[row])
+                    self._checkpointed.add(row)
 
     def extend(self, other: "SpeculativeGenerationBatch"):
         if len(self) == 0:
@@ -1606,7 +1680,11 @@ class SpeculativeGenerationBatch:
         self,
         responses: List[GenerationBatch.Response],
         tok_list: List[Optional[int]],
+        metadata=None,
     ) -> None:
+        from ..speculative.sampling import token_logprobs
+
+        distributions = metadata.get("logprobs") if metadata else None
         for row, token in enumerate(tok_list):
             if token is None or self._finished[row]:
                 continue
@@ -1615,11 +1693,17 @@ class SpeculativeGenerationBatch:
             finish_reason = self._finish_reason(row, token)
             if finish_reason is not None:
                 self._finished[row] = True
+            lp, top_lp = token_logprobs(
+                distributions[row] if distributions is not None else None,
+                token,
+                self.top_logprobs_k,
+            )
             responses.append(
                 self.Response(
                     uid=self._all_uids[row],
                     token=token,
-                    token_logprob=0.0,
+                    token_logprob=lp,
+                    top_logprobs=top_lp,
                     finish_reason=finish_reason,
                 )
             )
@@ -1642,16 +1726,19 @@ class SpeculativeGenerationBatch:
             self.hidden,
             draft_kind=self.draft_kind,
             first_bonus=self.first_tokens,
-            max_tokens=max(self.max_tokens) if self.max_tokens else 0,
+            max_tokens=self.max_tokens,
             sampler=self.sampler,
             draft_block_size=self.draft_block_size,
             token_dtype=self.token_dtype,
             stop_check=stop_check,
             greedy_sampling=self.greedy_sampling,
-            shared_kv_states=self.shared_kv_states,
             eos_token_ids=None,
             prompt_tokens=self.prompt_tokens,
             row_ids=[0] * len(self._all_uids),
+            logits_processors=self.logits_processors,
+            token_context=self.token_context,
+            state=self.state,
+            compute_logprobs=self.compute_logprobs,
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -1662,24 +1749,38 @@ class SpeculativeGenerationBatch:
         if not self._sent_first:
             self._sent_first = True
             mx.eval(self.first_tokens)
+            from ..speculative.sampling import token_logprobs
+
             for row, token in enumerate(self.first_tokens.tolist()):
                 if self._finished[row]:
                     continue
                 token = int(token)
+                if self.state is not None:
+                    self.state.tokens[row].append(token)
                 self._num_tokens[row] += 1
                 finish_reason = self._finish_reason(row, token)
                 if finish_reason is not None:
                     self._finished[row] = True
+                lp, top_lp = token_logprobs(
+                    (
+                        self.first_logprobs[row]
+                        if self.compute_logprobs and self.first_logprobs is not None
+                        else None
+                    ),
+                    token,
+                    self.top_logprobs_k,
+                )
                 responses.append(
                     self.Response(
                         uid=self._all_uids[row],
                         token=token,
-                        token_logprob=0.0,
+                        token_logprob=lp,
+                        top_logprobs=top_lp,
                         finish_reason=finish_reason,
                     )
                 )
             self._refresh_uids()
-            return responses
+            return self._attach_stats(responses)
 
         self._start_rounds()
         try:
@@ -1697,9 +1798,9 @@ class SpeculativeGenerationBatch:
                         )
                     )
             self._refresh_uids()
-            return responses
+            return self._attach_stats(responses)
 
-        self._append_token_responses(responses, tok_list)
+        self._append_token_responses(responses, tok_list, round_meta)
         while isinstance(round_meta, dict) and int(
             round_meta.get("round_pos", 0)
         ) + 1 < int(round_meta.get("round_len", 1)):
@@ -1707,10 +1808,83 @@ class SpeculativeGenerationBatch:
                 tok_list, round_meta = next(self._rounds_iter)
             except StopIteration:
                 break
-            self._append_token_responses(responses, tok_list)
+            self._append_token_responses(responses, tok_list, round_meta)
 
         self._refresh_uids()
-        return responses
+        return self._attach_stats(responses)
+
+
+class SpeculativePromptBatch:
+    """Prefill restored rows independently, then join their caches for decode.
+
+    Exact recurrent checkpoints can have different prefix lengths. Completing
+    each suffix before merging avoids replaying target tokens or right-padding
+    the shifted MTP inputs.
+    """
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.uids = [uid for row in rows for uid in row.uids]
+
+    @property
+    def total_prompt_tokens(self):
+        return sum(row.total_prompt_tokens for row in self.rows)
+
+    def needs_processing(self):
+        return any(row.needs_processing() for row in self.rows)
+
+    def prompt_step(self):
+        return next(row for row in self.rows if row.needs_processing()).prompt_step()
+
+    def record_prompt_time(self, elapsed_s):
+        for row in self.rows:
+            row.record_prompt_time(elapsed_s)
+
+    def prompt_progress(self):
+        return [progress for row in self.rows for progress in row.prompt_progress()]
+
+    def generate(self, sampler, stop_criteria, **kwargs):
+        from ..speculative.cache_state import SpeculativeCache
+
+        batches = [row.generate(sampler, stop_criteria, **kwargs) for row in self.rows]
+        if len(batches) == 1:
+            return batches[0]
+        state = SpeculativeCache.merge([batch.state for batch in batches])
+        first = batches[0]
+        contexts = [ctx for batch in batches for ctx in batch.token_context]
+        return SpeculativeGenerationBatch(
+            first.model,
+            first.draft_model,
+            first.draft_kind,
+            self.uids,
+            mx.concatenate([batch.first_tokens for batch in batches]),
+            state.target,
+            sampler,
+            stop_criteria,
+            [limit for batch in batches for limit in batch.max_tokens],
+            None,
+            _left_pad_prompts(contexts),
+            draft_block_size=first.draft_block_size,
+            token_dtype=first.token_dtype,
+            greedy_sampling=first.greedy_sampling,
+            logits_processors=[
+                processors
+                for batch in batches
+                for processors in batch.logits_processors
+            ],
+            token_context=contexts,
+            state=state,
+            compute_logprobs=first.compute_logprobs,
+            top_logprobs_k=first.top_logprobs_k,
+            first_logprobs=(
+                mx.concatenate([b.first_logprobs for b in batches])
+                if first.compute_logprobs
+                else None
+            ),
+            checkpoint=lambda state, row, tokens: batches[row].checkpoint(
+                state, row, tokens
+            ),
+        )
 
 
 class PromptProcessingBatch:
@@ -1754,6 +1928,10 @@ class PromptProcessingBatch:
         draft_kind: Optional[str] = None,
         draft_block_size: Optional[int] = None,
         greedy_sampling: bool = False,
+        speculative_state=None,
+        speculative_checkpoint=None,
+        speculative_decode_checkpoint=None,
+        full_token_context=None,
     ):
         self.model = model
         self.uids = uids
@@ -1761,10 +1939,16 @@ class PromptProcessingBatch:
         self.max_tokens = max_tokens
         self.prefill_step_size = prefill_step_size
         self._speculative_prefill = SpeculativePrefill(draft_kind, draft_model)
+        if draft_model is not None:
+            if warm_cache is not None and speculative_state is None:
+                raise ValueError("MTP requires a fresh prompt cache.")
+            if right_pad_per_row is not None and any(right_pad_per_row):
+                raise ValueError("MTP prefill requires left-padded prompts.")
         self.draft_model = draft_model
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling
+        self._speculative_decode_checkpoint = speculative_decode_checkpoint
 
         lengths = [len(ids) for ids in input_ids]
         max_length = max(lengths)
@@ -1786,6 +1970,8 @@ class PromptProcessingBatch:
             left_padding = [max_length - l for l in lengths]
             self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
         self._left_padding_per_row = list(left_padding)
+        if draft_model is not None:
+            self._speculative_prefill.tokens = self._input_ids
         self._total_prompt_tokens = sum(lengths)
         self._processed_prompt_columns = 0
         self._finished_prompt_logits: dict[int, mx.array] = {}
@@ -1793,12 +1979,18 @@ class PromptProcessingBatch:
         self.logits_processors = logits_processors or []
         self.thinking_budget_criteria = thinking_budget_criteria or []
         self._token_context = (
-            [list(ids) for ids in input_ids]
-            if self.logits_processors and any(self.logits_processors)
+            [list(ids) for ids in (full_token_context or input_ids)]
+            if draft_model is not None
+            or any(self.thinking_budget_criteria)
+            or (self.logits_processors and any(self.logits_processors))
             else []
         )
         self._inputs_embeds = inputs_embeds
         self._prompt_kwargs = prompt_kwargs or {}
+        if speculative_state is not None:
+            self._prompt_kwargs.setdefault(
+                "rope_deltas", speculative_state.position_offset[:, None]
+            )
         self._prompt_length_aware_keys: List[str] = []
         if self._prompt_kwargs and self._inputs_embeds is not None:
             prompt_batch = self._inputs_embeds.shape[0]
@@ -1873,6 +2065,19 @@ class PromptProcessingBatch:
                 kv_quant_scheme=kv_quant_scheme,
                 quantized_kv_start=quantized_kv_start,
                 prefill_length=max_length,
+            )
+
+        if draft_model is not None:
+            from ..speculative.cache_state import CacheTransaction
+
+            CacheTransaction.check_types(self.prompt_cache)
+            self._speculative_prefill.start(
+                model,
+                self.prompt_cache,
+                draft_model,
+                state=speculative_state,
+                checkpoint=speculative_checkpoint,
+                position_offset=self._prompt_kwargs.get("rope_deltas"),
             )
 
         # Declare per-row right-padding on each cache so finalize() can roll
@@ -2138,7 +2343,6 @@ class PromptProcessingBatch:
             inputs_embeds=self._inputs_embeds,
             **call_kwargs,
         )
-        output = self._speculative_prefill.finish(output)
         logits = output.logits if hasattr(output, "logits") else output
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
             # Short rows may have finished in an earlier prefill chunk. Their
@@ -2156,6 +2360,17 @@ class PromptProcessingBatch:
             self._finished_prompt_logits.clear()
         else:
             logits = logits[:, -1, :]
+        for row, criteria in enumerate(self.thinking_budget_criteria):
+            if hasattr(criteria, "make_logits_processor"):
+                policy = criteria.make_logits_processor(len(self._token_context[row]))
+                if policy is not None:
+                    if not self.logits_processors:
+                        self.logits_processors = [[] for _ in self.uids]
+                    self.logits_processors[row] = list(
+                        self.logits_processors[row] or []
+                    ) + [policy]
+                self.thinking_budget_criteria[row] = None
+
         if self.logits_processors and any(self.logits_processors):
             processed_logits = []
             for i in range(logits.shape[0]):
@@ -2177,6 +2392,7 @@ class PromptProcessingBatch:
         )
 
         mx.async_eval(first_tokens)
+        output = self._speculative_prefill.finish(output, first_tokens)
 
         # Roll any right-padding into left-padding so the cache decoded by
         # GenerationBatch sees a canonical layout.
@@ -2216,15 +2432,18 @@ class PromptProcessingBatch:
                 stop_criteria=stop_criteria,
                 max_tokens=list(self.max_tokens),
                 hidden=speculative_hidden_state(self.draft_kind, output),
-                shared_kv_states=(
-                    output.shared_kv_states if self.draft_kind == "mtp" else None
-                ),
-                prompt_tokens=self._input_ids,
+                prompt_tokens=self._speculative_prefill.tokens,
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
                 greedy_sampling=self.greedy_sampling,
+                logits_processors=self.logits_processors,
+                token_context=self._token_context or None,
+                state=self._speculative_prefill.state,
+                checkpoint=self._speculative_decode_checkpoint,
+                compute_logprobs=compute_logprobs,
+                top_logprobs_k=top_logprobs_k,
+                first_logprobs=logprobs if compute_logprobs else None,
             )
-            compute_logprobs = False
         else:
             gen_batch = GenerationBatch(
                 model=self.model,
@@ -2451,13 +2670,18 @@ class BatchGenerator:
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling or sampler is None
+        self.speculative_prefix = None
         if self.draft_model is not None:
-            compute_logprobs = False
-            top_logprobs_k = 0
-            self.compute_logprobs = False
-            self.top_logprobs_k = 0
+            if apc_manager is not None:
+                from ..speculative.prefix_cache import SpeculativePrefixCache
+
+                self.speculative_prefix = SpeculativePrefixCache(
+                    apc_manager, model, draft_model
+                )
         self.apc = (
-            _apc.APCCoordinator(apc_manager, model) if apc_manager is not None else None
+            _apc.APCCoordinator(apc_manager, model)
+            if apc_manager is not None and draft_model is None
+            else None
         )
         if self.apc is not None and not self.apc.enabled:
             self.apc = None
@@ -2582,6 +2806,7 @@ class BatchGenerator:
         """
         if self.apc_manager is None:
             return None
+
         uid, ids_list, max_toks, prompt_kwargs, lps, criteria = sequence
         if not ids_list or len(ids_list) < 2:
             return None
@@ -2620,6 +2845,9 @@ class BatchGenerator:
         """
         if self.apc_manager is None:
             return None
+
+        if getattr(self, "speculative_prefix", None) is not None:
+            return self._build_speculative_prompt_batch(sequences)
 
         picks: List[Optional[dict]] = [self._apc_pick_for(s) for s in sequences]
         any_warm = any(p is not None for p in picks)
@@ -2783,11 +3011,84 @@ class BatchGenerator:
             right_pad_per_row=right_pad_per_row,
             suffix_lens=suffix_lens,
             apc_mode=apc_mode,
+            full_token_context=full_ids,
             draft_model=getattr(self, "draft_model", None),
             draft_kind=getattr(self, "draft_kind", None),
             draft_block_size=getattr(self, "draft_block_size", None),
             greedy_sampling=getattr(self, "greedy_sampling", False),
         )
+
+    def _speculative_checkpoints(self, input_ids, prompt_kwargs):
+        prefix = self.speculative_prefix
+        hashes = [self._apc_extra_hash(kw or {}) for kw in prompt_kwargs]
+
+        def prefill(state):
+            for row, tokens in enumerate(input_ids):
+                prefix.store(tokens, state, row=row, extra_hash=hashes[row])
+
+        def decode(state, row, tokens):
+            # A single-row prefill may be merged into a larger decode batch.
+            key = hashes[0] if len(hashes) == 1 else hashes[row]
+            prefix.store(tokens, state, row=row, extra_hash=key)
+
+        return prefill, decode
+
+    def _build_speculative_prompt_batch(self, sequences):
+        picks = []
+        for _, ids, _, kw, _, _ in sequences:
+            state, position = self.speculative_prefix.lookup(
+                ids, extra_hash=self._apc_extra_hash(kw)
+            )
+            if state is not None and not self._apc_suffix_is_text_only(ids, position):
+                state, position = None, 0
+            picks.append((state, position))
+        if not any(state is not None for state, _ in picks):
+            return None
+
+        rows = []
+        for sequence, (state, position) in zip(sequences, picks):
+            uid, ids, limit, kw, processors, criteria = sequence
+            embeddings, prompt_kwargs = _merge_prefill_prompt_kwargs([kw], [ids])
+            if embeddings is not None:
+                embeddings = embeddings[:, position:]
+            for key, value in prompt_kwargs.items():
+                if _is_sequence_aligned_prompt_kwarg(key, value, len(ids)):
+                    prompt_kwargs[key] = _slice_sequence_aligned_prompt_kwarg(
+                        key, value, start=position
+                    )
+            prefill, decode = self._speculative_checkpoints([ids], [kw])
+            rows.append(
+                PromptProcessingBatch(
+                    self.model,
+                    [uid],
+                    [ids[position:]],
+                    [limit],
+                    embeddings,
+                    prompt_kwargs,
+                    logits_processors=[processors],
+                    thinking_budget_criteria=[criteria],
+                    prefill_step_size=self.prefill_step_size,
+                    kv_bits=self.kv_bits,
+                    kv_key_bits=self.kv_key_bits,
+                    kv_value_bits=self.kv_value_bits,
+                    kv_key_scheme=self.kv_key_scheme,
+                    kv_value_scheme=self.kv_value_scheme,
+                    kv_group_size=self.kv_group_size,
+                    kv_quant_scheme=self.kv_quant_scheme,
+                    quantized_kv_start=self.quantized_kv_start,
+                    warm_cache=state.target if state is not None else None,
+                    apc_meta=[{"full_input_ids": ids, "prefix_len": position}],
+                    draft_model=self.draft_model,
+                    draft_kind=self.draft_kind,
+                    draft_block_size=self.draft_block_size,
+                    greedy_sampling=self.greedy_sampling,
+                    speculative_state=state,
+                    speculative_checkpoint=prefill,
+                    speculative_decode_checkpoint=decode,
+                    full_token_context=[ids],
+                )
+            )
+        return SpeculativePromptBatch(rows)
 
     def _build_apc_meta_for_cold(
         self,
@@ -2797,7 +3098,10 @@ class BatchGenerator:
         """Build per-row harvest metadata for a cold-prefill batch so the
         produced K/V are added to APC after prefill.
         """
-        if self.apc_manager is None:
+        if (
+            self.apc_manager is None
+            or getattr(self, "speculative_prefix", None) is not None
+        ):
             return None
         meta: List[Optional[dict]] = []
         for ids_list, kw in zip(input_ids_list, prompt_kwargs_list):
@@ -3085,6 +3389,15 @@ class BatchGenerator:
             prompt_batch_cls = _generate_module_override(
                 "PromptProcessingBatch", PromptProcessingBatch
             )
+            speculative_kwargs = {}
+            if getattr(self, "speculative_prefix", None) is not None:
+                prefill, decode = self._speculative_checkpoints(
+                    input_ids, prompt_kwargs_list
+                )
+                speculative_kwargs = {
+                    "speculative_checkpoint": prefill,
+                    "speculative_decode_checkpoint": decode,
+                }
             self._prompt_batch = prompt_batch_cls(
                 model=self.model,
                 uids=uids,
@@ -3113,6 +3426,7 @@ class BatchGenerator:
                 draft_kind=getattr(self, "draft_kind", None),
                 draft_block_size=getattr(self, "draft_block_size", None),
                 greedy_sampling=getattr(self, "greedy_sampling", False),
+                **speculative_kwargs,
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 

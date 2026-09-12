@@ -40,7 +40,6 @@ from ..sample_utils import (
     make_sampler,
     top_p_sampling,
 )
-from ..speculative.utils import speculative_stats_since, speculative_stats_snapshot
 from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs, resolve_eos_token_ids
@@ -845,7 +844,7 @@ class StreamingToken:
 
     text: str
     token: int
-    logprobs: float
+    logprobs: Optional[float]
     finish_reason: Optional[str]
     peak_memory: float = 0.0
     prompt_tps: Optional[float] = None
@@ -1150,14 +1149,6 @@ class ResponseGenerator:
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
-        if self.draft_model is not None and args.logits_processors is not None:
-            raise ValueError(
-                "Structured response_format is not supported with speculative decoding."
-            )
-        if self.draft_model is not None and args.thinking_budget is not None:
-            raise ValueError(
-                "thinking_budget is not supported with speculative decoding in the server."
-            )
         rqueue: Queue = Queue()
         request_started_at = time.perf_counter()
 
@@ -1775,6 +1766,12 @@ class ResponseGenerator:
                             prefill_step_size=self._effective_prefill_step_size(),
                         )
 
+                    # Newly admitted requests may request probabilities even when
+                    # the first request in this scheduler did not.
+                    if args.logprobs:
+                        batch_gen.compute_logprobs = True
+                        batch_gen.top_logprobs_k = self.top_logprobs_k
+
                     # Vision encoder runs on the GPU thread; text tokenization
                     # already happened on the caller thread.
                     if self.apc_manager is not None:
@@ -1827,11 +1824,6 @@ class ResponseGenerator:
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                         "prompt_tps": None,
                         "cached_tokens": 0,
-                        "spec_snapshot": (
-                            speculative_stats_snapshot(self.draft_model)
-                            if self.draft_model is not None
-                            else None
-                        ),
                         **log_state,
                     }
 
@@ -2047,12 +2039,10 @@ class ResponseGenerator:
 
             draft_rounds = draft_accepted = draft_total = None
             request_draft_kind = None
-            if r.finish_reason is not None and info.get("spec_snapshot") is not None:
-                draft_rounds, draft_accepted, draft_total = speculative_stats_since(
-                    self.draft_model, info["spec_snapshot"]
-                )
-                if draft_rounds is not None:
-                    request_draft_kind = self.draft_kind
+            stats = getattr(r, "speculative_stats", None)
+            if r.finish_reason is not None and stats is not None:
+                draft_rounds, draft_accepted, draft_total = stats
+                request_draft_kind = self.draft_kind
 
             rqueue.put(
                 StreamingToken(

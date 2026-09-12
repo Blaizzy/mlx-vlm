@@ -3,7 +3,7 @@
 MiniMax M3 is supported as a native multimodal model in mlx-vlm. The
 implementation covers text, image, and video prompts, MiniMax Sparse Attention
 (MSA), MiniMax thinking tags, MiniMax XML-style tool calls, MXFP8 config loading,
-and EAGLE-3 speculative decoding with the released drafter.
+and ordinary autoregressive decoding.
 
 ## Convert
 
@@ -75,26 +75,6 @@ mlx_vlm.generate \
 
 `--enable-thinking` is accepted as a shortcut for `--thinking-mode enabled`.
 
-## EAGLE-3
-
-The released EAGLE-3 drafter is auto-detected from its architecture, but passing
-`--draft-kind eagle3` is explicit and stable:
-
-```sh
-mlx_vlm.convert \
-  --hf-path Inferact/MiniMax-M3-EAGLE3 \
-  --mlx-path ~/MiniMax-M3-EAGLE3
-
-mlx_vlm.generate \
-  --model ~/MiniMax-M3-4bit \
-  --draft-model ~/MiniMax-M3-EAGLE3 \
-  --draft-kind eagle3 \
-  --draft-block-size 3 \
-  --prompt "Explain MiniMax Sparse Attention in one paragraph." \
-  --temperature 0 \
-  --max-tokens 256
-```
-
 ## Notes
 
 - Unlike the current experimental GGUF path, this implementation loads the
@@ -111,8 +91,7 @@ mlx_vlm.generate \
   the cache by default.
 - The public MiniMax M3 BF16 checkpoint config advertises MTP metadata, but its
   weight index does not publish `mtp` or `nextn` weights. This branch does not
-  include MiniMax M3 native MTP support; use the released EAGLE-3 drafter for
-  speculative decoding.
+  include MiniMax M3 speculative decoding support.
 - Long prompts may need `--prefill-step-size 512` or lower to reduce peak memory.
 - On MLX CUDA, use `--quantize-activations` for MXFP8/NVFP4 checkpoints. On
   Apple Silicon, activation quantization is not required for the MiniMax M3

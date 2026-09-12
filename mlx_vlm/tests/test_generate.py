@@ -900,7 +900,6 @@ class TestBatchGenerator:
             stop_criteria=lambda token: False,
             max_tokens=[10, 10],
             hidden=mx.zeros((2, 1, 1)),
-            shared_kv_states=None,
             prompt_tokens=mx.array([[0], [9]], dtype=mx.int32),
         )
 
@@ -2009,52 +2008,16 @@ def test_generate_step_prefill_tqdm_respects_verbose(verbose, disabled):
 
 
 def test_generate_step_chunks_prefill_when_model_policy_allows_speculation():
-    model = MagicMock()
-    model.no_chunked_prefill = False
-    model.chunked_prefill_policy.return_value = True
+    from mlx_vlm.tests.test_speculative_serving import generate, glm_models
 
-    output = SimpleNamespace(
-        logits=mx.zeros((1, 1, 4)),
-        hidden_states=[mx.zeros((1, 1, 4))],
-        shared_kv_states={},
-        cross_attention_states=None,
-        encoder_outputs=None,
-    )
-    model.language_model.return_value = output
-
-    embedding_output = MagicMock()
-    embedding_output.inputs_embeds = mx.zeros((1, 5, 4))
-    embedding_output.to_dict.return_value = {}
-    model.get_input_embeddings.return_value = embedding_output
-
-    draft_model = SimpleNamespace(
-        config=SimpleNamespace(target_layer_ids=[]),
-    )
-
-    with (
-        patch("mlx_vlm.speculative.drafters.validate_drafter_compatibility"),
-        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
-        patch.object(generate_module, "make_logits_processors", return_value=[]),
-        patch.object(
-            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
-        ),
-        patch.object(ar_module, "run_speculative_rounds", return_value=iter(())),
-    ):
-        gen = generate_module.generate_step(
-            input_ids=mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
-            model=model,
-            pixel_values=None,
-            mask=None,
-            max_tokens=1,
-            prefill_step_size=2,
-            draft_model=draft_model,
-            draft_kind="mtp",
+    target, draft = glm_models()
+    with patch.object(target, "chunked_prefill_policy", return_value=True) as policy:
+        tokens, state = generate(
+            target, draft, [1, 2, 3, 4, 5], max_tokens=1, prefill_step_size=2
         )
-        list(gen)
-
-    assert model.language_model.call_args_list[0].kwargs["n_to_process"] == 2
-    assert model.language_model.call_args_list[1].kwargs["n_to_process"] == 2
-    model.chunked_prefill_policy.assert_called_once()
+    assert len(tokens) == 1
+    assert state.position.item() == 5
+    policy.assert_called_once()
 
 
 def test_chunked_prefill_policy_defaults_conservative_for_speculation():
@@ -2376,7 +2339,7 @@ def test_generate_cli_smoke(capsys):
         thinking_start_token="<think>",
         thinking_end_token="</think>",
         draft_model=None,
-        draft_kind="dflash",
+        draft_kind="mtp",
         draft_block_size=None,
     )
     model = SimpleNamespace(config=SimpleNamespace(model_type="demo"))

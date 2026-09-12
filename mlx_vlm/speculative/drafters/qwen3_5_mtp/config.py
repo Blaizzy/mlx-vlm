@@ -20,7 +20,7 @@ class TextConfig:
 class Qwen3_5MTPConfig(BaseModelConfig):
     model_type: str = "qwen3_5_mtp"
     text_config: Optional[TextConfig] = None
-    block_size: int = 3
+    block_size: int = 2
     tie_word_embeddings: bool = True
 
     def __post_init__(self):
@@ -38,7 +38,7 @@ class Qwen3_5MTPConfig(BaseModelConfig):
         flat = dict(params)
         text_config = flat.get("text_config") or {}
         mtp_depth = text_config.get("mtp_num_hidden_layers", 1)
-        flat.setdefault("block_size", int(mtp_depth) + 2)
+        flat.setdefault("block_size", int(mtp_depth) + 1)
         sig = inspect.signature(cls).parameters
         return cls(**{k: v for k, v in flat.items() if k in sig})
 

@@ -2,7 +2,7 @@
 
 DeepSeek-V4 Flash Vision support covers the checkpoint's processor, vision
 tower and aligner, image-span attention, vision-aware MoE routing, mixed
-FP8/FP4 conversion, and its checkpoint-local DSpark drafter.
+FP8/FP4 conversion.
 
 Convert the base checkpoint without materializing every source shard at once:
 
@@ -12,14 +12,12 @@ python -m mlx_vlm.models.deepseek_v4.convert \
   --mlx-path DeepSeek-V4-Flash-Vision-Exp-MLX
 ```
 
-Add `--mtp` to extract the three native DSpark stages beside the converted
-target. The drafter must come from the same vision checkpoint; do not combine
-it with the older DeepSeek-V4 Flash target or drafter.
+Speculative decoding is currently limited to GLM-5.3-Flash MTP.
 
 The normal test suite uses small deterministic models to cover exact processor
 layouts, all three compression ratios, text regression, portrait/landscape
 images, multiple images, mixed text/image batches, repeated decode, feature
-cache reuse, DSpark, and continuous-batching primitives.
+cache reuse and continuous-batching primitives.
 
 Before advertising a converted checkpoint as supported, run the heavyweight
 official-reference gates as well:

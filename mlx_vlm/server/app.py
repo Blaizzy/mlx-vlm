@@ -1,6 +1,7 @@
 import asyncio
 import gc
 import logging
+import math
 import os
 import secrets
 import sys
@@ -346,6 +347,10 @@ def _make_logprob_content(
     top_list: List[TopLogprob] = []
     if top_k > 0 and top_logprobs:
         for tid, lp in top_logprobs[:top_k]:
+            # Constrained sampling can leave fewer than K possible tokens.
+            # Zero-probability (-inf) alternatives are not JSON numbers.
+            if not math.isfinite(lp):
+                continue
             t_text, t_bytes = _decode_token(tokenizer, tid)
             top_list.append(TopLogprob(token=t_text, logprob=float(lp), bytes=t_bytes))
     return ChatLogprobContent(

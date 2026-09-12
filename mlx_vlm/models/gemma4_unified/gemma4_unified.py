@@ -150,11 +150,7 @@ class Model(nn.Module):
             return False
 
         if draft_model is not None:
-            return (
-                draft_kind == "mtp"
-                and bool(prefill_kwargs.get("return_hidden", False))
-                and bool(prefill_kwargs.get("return_shared_kv", False))
-            )
+            return False
 
         return True
 
