@@ -20761,6 +20761,104 @@ class TestDeepseekV41Sanitize(unittest.TestCase):
         self.assertEqual(out["language_model.head.weight"].shape, (64, 128))
 
 
+class TestDeepseekV41Engram(unittest.TestCase):
+    """Engram layers must actually run.
+
+    They were wired up but unreachable: the language model was built without a
+    tokenizer, so the hash state stayed None and the call site's guard was never
+    true. Nothing failed - the weights loaded and the layers were skipped.
+    """
+
+    @staticmethod
+    def _config():
+        from mlx_vlm.models import deepseek_v41
+
+        return deepseek_v41.ModelConfig(
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=5,
+            num_nextn_predict_layers=0,
+            num_attention_heads=2,
+            head_dim=32,
+            q_lora_rank=8,
+            o_lora_rank=8,
+            o_groups=2,
+            qk_rope_head_dim=4,
+            max_position_embeddings=64,
+            sliding_window=8,
+            compress_ratios=[0, 2, 2, 1, 0],
+            kv_source_layer_ids=[1, 3],
+            index_source_layer_ids=[1, 2],
+            candidate_source_layer_id=1,
+            candidate_topk_blocks=4,
+            candidate_block_size=2,
+            index_n_heads=2,
+            index_head_dim=32,
+            index_topk=4,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=16,
+            hc_mult=2,
+            dspark_target_layer_ids=[3],
+            engram_layer_ids=[1],
+            engram_num_embeddings=[1024],
+            engram_max_ngram_size=3,
+            engram_vocab_size=512,
+            engram_n_heads=2,
+            engram_head_dim=8,
+            engram_compressed_vocab_size=7,
+        )
+
+    def test_deepseek_v41_engram_layers_are_invoked(self):
+        from mlx_vlm.models.deepseek_v41 import engram as engram_mod
+        from mlx_vlm.models.deepseek_v41.language import LanguageModel
+
+        config = self._config()
+        model = LanguageModel(config)
+        layout = engram_mod.EngramLayout.from_config(config)
+        token_map = [i % 7 for i in range(config.vocab_size)]
+        token_map[0] = 6
+        model.engram_hash = engram_mod.NgramHashState(
+            config, layout, token_map=token_map
+        )
+
+        calls = []
+        original = engram_mod.Engram.__call__
+
+        def counting(self, x, hash_ids, token_mask=None):
+            calls.append(hash_ids.shape)
+            return original(self, x, hash_ids, token_mask)
+
+        engram_mod.Engram.__call__ = counting
+        try:
+            out = model(mx.array([[3, 7, 11, 15, 19, 23]]), cache=model.make_cache())
+            mx.eval(out.logits)
+        finally:
+            engram_mod.Engram.__call__ = original
+
+        self.assertEqual(len(calls), len(config.engram_layer_ids))
+
+    def test_deepseek_v41_engram_hash_is_built_from_checkpoint_map(self):
+        import json
+        import tempfile
+
+        from mlx_vlm.models.deepseek_v41.language import LanguageModel
+
+        config = self._config()
+        model = LanguageModel(config)
+        self.assertIsNone(model.engram_hash)
+
+        token_map = [i % 7 for i in range(config.vocab_size)]
+        token_map[0] = 6
+        with tempfile.TemporaryDirectory() as directory:
+            with open(f"{directory}/engram_token_map.json", "w") as handle:
+                json.dump(token_map, handle)
+            model._engram_source = directory
+            model._ensure_engram_hash()
+
+        self.assertIsNotNone(model.engram_hash)
+
+
 class TestDeepseekV41TokenMap(unittest.TestCase):
     @staticmethod
     def _wordlevel_tokenizer():

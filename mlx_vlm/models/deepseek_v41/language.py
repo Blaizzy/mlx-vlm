@@ -319,11 +319,24 @@ def sanitize_moe_weights(weights: dict, ffn_prefix: str, n_routed: int) -> dict:
     ):
         for suffix in ("weight", "scales", "biases"):
             key0 = f"{prefix}.0.{src}.{suffix}"
-            if key0 in weights:
-                stacked = [
-                    weights.pop(f"{prefix}.{e}.{src}.{suffix}") for e in range(n_routed)
-                ]
-                weights[f"{ffn_prefix}.switch_mlp.{dst}.{suffix}"] = mx.stack(stacked)
+            if key0 not in weights:
+                continue
+            absent = [
+                e
+                for e in range(n_routed)
+                if f"{prefix}.{e}.{src}.{suffix}" not in weights
+            ]
+            if absent:
+                shown = ", ".join(str(e) for e in absent[:8])
+                more = f" (+{len(absent) - 8} more)" if len(absent) > 8 else ""
+                raise ValueError(
+                    f"{prefix}.{{expert}}.{src}.{suffix}: checkpoint provides "
+                    f"{n_routed - len(absent)} of {n_routed} experts; missing {shown}{more}"
+                )
+            stacked = [
+                weights.pop(f"{prefix}.{e}.{src}.{suffix}") for e in range(n_routed)
+            ]
+            weights[f"{ffn_prefix}.switch_mlp.{dst}.{suffix}"] = mx.stack(stacked)
     return weights
 
 
