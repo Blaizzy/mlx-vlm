@@ -22656,7 +22656,7 @@ class TestPaliGemmaAttentionPolicy(unittest.TestCase):
                 self.assertLess(error, 1e-5)
 
 
-class TestLegacyGemmaHistory(unittest.TestCase):
+class TestAlternatingRoleHistory(unittest.TestCase):
     TEMPLATE = """{{ bos_token }}{% for message in messages %}{% if (message.role == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate') }}{% endif %}{{ '<start_of_turn>' + ('model' if message.role == 'assistant' else message.role) + '\n' }}{% if message.content is string %}{{ message.content | trim }}{% else %}{% for part in message.content %}{% if part.type == 'text' %}{{ part.text }}{% elif part.type == 'image' %}{{ '<start_of_image>' }}{% elif part.type == 'audio' %}{{ '<audio_soft_token>' }}{% endif %}{% endfor %}{% endif %}{{ '<end_of_turn>\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<start_of_turn>model\n' }}{% endif %}"""
 
     def _tokenizer(self, template=None):
@@ -22799,3 +22799,209 @@ class TestLegacyGemmaHistory(unittest.TestCase):
         ]:
             position = rendered.index(marker, position) + len(marker)
         self.assertEqual(messages, original)
+
+    def test_alternating_template_without_system_support_keeps_system_text(self):
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        template = (
+            "{{ bos_token }}{% for message in messages %}"
+            "{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}"
+            "{{ raise_exception('Conversation roles must alternate') }}{% endif %}"
+            "{% if message['role'] == 'user' %}{{ '[INST] ' + message['content'] + ' [/INST]' }}"
+            "{% elif message['role'] == 'assistant' %}{{ message['content'] }}"
+            "{% else %}{{ raise_exception('Only user and assistant roles are supported!') }}"
+            "{% endif %}{% endfor %}"
+        )
+        messages = [
+            {"role": "system", "content": "BE_CONCISE"},
+            {"role": "system", "content": "KEEP_PATHS"},
+            {"role": "user", "content": "QUESTION"},
+        ]
+        rendered = get_chat_template(self._tokenizer(template), messages, True)
+        for marker in ["BE_CONCISE", "KEEP_PATHS", "QUESTION", '"role": "system"']:
+            self.assertIn(marker, rendered)
+
+    def test_processor_owning_its_rendering_is_skipped(self):
+        from mlx_vlm.prompt_utils import _alternating_role_history
+
+        class OwnRenderer:
+            chat_template = "{{ raise_exception('Conversation roles must alternate') }}"
+
+            def apply_chat_template(self, messages, **kwargs):
+                return ""
+
+        messages = [{"role": "tool", "content": "RESULT", "tool_call_id": "CALL"}]
+        self.assertIs(
+            _alternating_role_history(messages, OwnRenderer(), tools=[{"a": 1}]),
+            messages,
+        )
+
+
+class TestTemplateToolHistory(unittest.TestCase):
+    TEMPLATE = """{% for message in messages %}{% if message.tool_calls is defined and message.tool_calls is not none %}{% for call in message.tool_calls %}{% if not call.id is defined or call.id|length != 9 %}{{ raise_exception('Tool call IDs should be alphanumeric strings with length 9!') }}{% endif %}{{ '[TOOL_CALLS] ' + call.function|tojson + ' id=' + call.id }}{% endfor %}{% elif message.role == 'tool' %}{% if not message.tool_call_id is defined or message.tool_call_id|length != 9 %}{{ raise_exception('Tool call IDs should be alphanumeric strings with length 9!') }}{% endif %}{{ '[TOOL_RESULTS] ' + message.content + ' call_id=' + message.tool_call_id }}{% elif message.role == 'user' %}{{ '[INST]' + message.content + '[/INST]' }}{% else %}{{ ' ' + message.content }}{% endif %}{% endfor %}"""
+
+    HISTORY = [
+        {"role": "user", "content": "QUESTION"},
+        {
+            "role": "assistant",
+            "content": "SPOKEN",
+            "tool_calls": [
+                {
+                    "id": "call_saved",
+                    "type": "function",
+                    "function": {"name": "FUNCTION", "arguments": '{"path":"ARG"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_saved", "content": "RESULT"},
+    ]
+
+    def _tokenizer(self):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        return PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+            unk_token="[UNK]",
+            chat_template=self.TEMPLATE,
+        )
+
+    def test_call_ids_are_remapped_and_stay_paired(self):
+        from mlx_vlm.prompt_utils import _template_tool_history
+
+        normalized = _template_tool_history(self.HISTORY, self.TEMPLATE)
+        call = next(m for m in normalized if m.get("tool_calls"))["tool_calls"][0]
+        result = next(m for m in normalized if m.get("role") == "tool")
+        self.assertEqual(len(call["id"]), 9)
+        self.assertTrue(call["id"].isalnum())
+        self.assertEqual(call["id"], result["tool_call_id"])
+        repeated = _template_tool_history(self.HISTORY, self.TEMPLATE)
+        repeated_call = next(m for m in repeated if m.get("tool_calls"))["tool_calls"][
+            0
+        ]
+        self.assertEqual(call["id"], repeated_call["id"])
+
+    def test_spoken_content_survives_the_tool_call_turn(self):
+        from mlx_vlm.prompt_utils import _template_tool_history
+
+        normalized = _template_tool_history(self.HISTORY, self.TEMPLATE)
+        spoken = [m for m in normalized if m.get("content") == "SPOKEN"]
+        self.assertEqual(len(spoken), 1)
+        self.assertNotIn("tool_calls", spoken[0])
+        self.assertNotIn("content", next(m for m in normalized if m.get("tool_calls")))
+
+    def test_history_renders_and_caller_is_unchanged(self):
+        import copy
+
+        from jinja2.exceptions import TemplateError
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        tokenizer = self._tokenizer()
+        messages = copy.deepcopy(self.HISTORY)
+        original = copy.deepcopy(messages)
+        with self.assertRaises(TemplateError):
+            tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        rendered = get_chat_template(tokenizer, messages, True)
+        for marker in ["QUESTION", "SPOKEN", "FUNCTION", "ARG", "RESULT"]:
+            self.assertIn(marker, rendered)
+        self.assertEqual(messages, original)
+
+    def test_template_without_the_contract_is_untouched(self):
+        from mlx_vlm.prompt_utils import _template_tool_history
+
+        self.assertIs(
+            _template_tool_history(self.HISTORY, "{{ messages | tojson }}"),
+            self.HISTORY,
+        )
+        self.assertIs(_template_tool_history(self.HISTORY, None), self.HISTORY)
+
+
+class TestSupportedRoleMessages(unittest.TestCase):
+    TEMPLATE = """{% for message in messages %}{% if message['role'] == 'user' %}{{ '[INST]' + message['content'] + '[/INST]' }}{% elif message['role'] == 'system' %}{{ '[SYSTEM_PROMPT]' + message['content'] + '[/SYSTEM_PROMPT]' }}{% elif message['role'] == 'assistant' %}{{ message['content'] }}{% else %}{{ raise_exception('Only user, system and assistant roles are supported!') }}{% endif %}{% endfor %}"""
+
+    def _tokenizer(self):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        return PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+            unk_token="[UNK]",
+            chat_template=self.TEMPLATE,
+        )
+
+    def test_rejected_roles_and_unread_fields_are_kept(self):
+        import copy
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        messages = [
+            {"role": "system", "content": "SYSTEM"},
+            {"role": "user", "content": "QUESTION"},
+            {
+                "role": "assistant",
+                "content": "SPOKEN",
+                "reasoning_content": "REASON",
+                "tool_calls": [
+                    {
+                        "id": "CALL_ID",
+                        "function": {"name": "FUNCTION", "arguments": '{"p":"ARG"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "CALL_ID", "content": "RESULT"},
+            {"role": "user", "content": "FOLLOW_UP"},
+        ]
+        original = copy.deepcopy(messages)
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "FUNCTION", "description": "SCHEMA"},
+            }
+        ]
+        rendered = get_chat_template(self._tokenizer(), messages, True, tools=tools)
+        for marker in [
+            "SYSTEM",
+            "QUESTION",
+            "SPOKEN",
+            "REASON",
+            "CALL_ID",
+            "FUNCTION",
+            "ARG",
+            "RESULT",
+            "FOLLOW_UP",
+            "SCHEMA",
+            '"role": "tool"',
+        ]:
+            self.assertIn(marker, rendered)
+        self.assertIn("[SYSTEM_PROMPT]SYSTEM[/SYSTEM_PROMPT]", rendered)
+        self.assertEqual(messages, original)
+
+    def test_ordinary_history_takes_the_native_path(self):
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        tokenizer = self._tokenizer()
+        messages = [
+            {"role": "system", "content": "SYSTEM"},
+            {"role": "user", "content": "QUESTION"},
+            {"role": "assistant", "content": "ANSWER"},
+        ]
+        self.assertEqual(
+            get_chat_template(tokenizer, messages, True),
+            tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            ),
+        )
+
+    def test_unrelated_errors_do_not_fold_roles(self):
+        from mlx_vlm.prompt_utils import _supported_role_messages
+
+        messages = [{"role": "tool", "content": "RESULT"}]
+        self.assertIs(
+            _supported_role_messages(messages, "Conversation roles must alternate"),
+            messages,
+        )

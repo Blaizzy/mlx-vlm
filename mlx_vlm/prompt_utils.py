@@ -1,5 +1,7 @@
+import hashlib
 import inspect
 import json
+import re
 from copy import deepcopy
 from enum import Enum
 from functools import partial
@@ -671,15 +673,154 @@ def _string_content_messages(messages, image_token):
     return result if changed else messages
 
 
-def _legacy_gemma_history(messages, template, tools=None):
-    if not isinstance(template, str) or not all(
-        marker in template
-        for marker in (
-            "<start_of_turn>",
-            "<end_of_turn>",
-            "Conversation roles must alternate",
+_CALL_ID_LENGTH = re.compile(r"\.(?:id|tool_call_id)\s*\|\s*length\s*!=\s*(\d+)")
+
+
+def _fixed_length_call_id(value, length):
+    return hashlib.sha256(str(value).encode()).hexdigest()[:length]
+
+
+def _template_tool_history(messages, template):
+    """Fit a tool history to templates with a stricter tool protocol.
+
+    Mistral-style templates reject call IDs that are not a fixed number of
+    alphanumeric characters, and render an assistant turn's tool calls instead
+    of its content. Remap the IDs to the required width, keeping each call
+    paired with its result, and carry the content in its own turn.
+    """
+    if not isinstance(template, str):
+        return messages
+    match = _CALL_ID_LENGTH.search(template)
+    length = int(match.group(1)) if match else None
+    split = "message.tool_calls" in template
+    if length is None and not split:
+        return messages
+
+    result = []
+    changed = False
+    for message in messages:
+        message = dict(message)
+        calls = message.get("tool_calls")
+        if length is not None and message.get("tool_call_id") is not None:
+            message["tool_call_id"] = _fixed_length_call_id(
+                message["tool_call_id"], length
+            )
+            changed = True
+        if calls and length is not None:
+            message["tool_calls"] = [
+                (
+                    {**call, "id": _fixed_length_call_id(call["id"], length)}
+                    if call.get("id") is not None
+                    else call
+                )
+                for call in calls
+            ]
+            changed = True
+        if calls and split and message.get("content"):
+            spoken = {
+                key: value for key, value in message.items() if key != "tool_calls"
+            }
+            message = {key: value for key, value in message.items() if key != "content"}
+            result.append(spoken)
+            changed = True
+        result.append(message)
+    return result if changed else messages
+
+
+_SUPPORTED_ROLES = re.compile(
+    r"only (?P<roles>[\w,\s]+?) roles? (?:are|is) supported", re.IGNORECASE
+)
+
+
+def _explicit_content(message):
+    """Content parts for a message whose role the template cannot express."""
+    metadata = {key: value for key, value in message.items() if key != "content"}
+    content = deepcopy(message.get("content") or [])
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    return [
+        {"type": "text", "text": json.dumps(metadata, ensure_ascii=False) + "\n"}
+    ] + content
+
+
+def _collapse_text_content(messages):
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list) and all(
+            part.get("type") == "text" for part in content
+        ):
+            message["content"] = "".join(part["text"] for part in content)
+    return messages
+
+
+def _supported_role_messages(messages, error_message, template=None, tools=None):
+    """Fold turns a template rejects into the roles it names as supported.
+
+    Templates that raise "Only <roles> roles are supported" state their own
+    contract. Turns outside it, and turns carrying fields the template never
+    reads, keep their original role and metadata as explicit text inside a role
+    the template does render, rather than being dropped on the way through.
+    """
+    rendered = template if isinstance(template, str) else ""
+    match = _SUPPORTED_ROLES.search(f"{error_message}\n{rendered}")
+    if not match:
+        return messages
+    roles = {
+        word
+        for word in re.split(r"[,\s]+", match.group("roles").replace(" and ", " "))
+        if word
+    }
+    if not roles:
+        return messages
+
+    fallback = "user" if "user" in roles else sorted(roles)[0]
+    result = []
+    changed = False
+    for message in messages:
+        role = message.get("role")
+        if role in roles and all(
+            field in rendered for field in set(message) - {"role", "content"}
+        ):
+            result.append(message)
+            continue
+        result.append(
+            {
+                "role": role if role in roles else fallback,
+                "content": _explicit_content(message),
+            }
         )
-    ):
+        changed = True
+    if tools and "tools" not in rendered:
+        index = next(
+            (i for i, message in enumerate(result) if message["role"] == fallback), None
+        )
+        if index is not None:
+            preamble = {
+                "type": "text",
+                "text": "Available tools: "
+                + json.dumps(tools, ensure_ascii=False)
+                + "\n",
+            }
+            content = result[index].get("content")
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+            elif not isinstance(content, list):
+                content = []
+            else:
+                content = list(content)
+            result[index] = {**result[index], "content": [preamble] + content}
+            changed = True
+    return _collapse_text_content(result) if changed else messages
+
+
+def _alternating_role_history(messages, template_processor, tools=None):
+    if "apply_chat_template" in type(template_processor).__dict__:
+        return messages
+    template = getattr(template_processor, "chat_template", None)
+    if not isinstance(template, str):
+        return messages
+    lowered = template.lower()
+    if "roles must alternate" not in lowered:
         return messages
     if any(field in template for field in ("tools", "tool_calls", "reasoning")):
         return messages
@@ -688,7 +829,8 @@ def _legacy_gemma_history(messages, template, tools=None):
     if (
         ordinary
         and ordinary[0].get("role") == "system"
-        and "System role not supported" not in template
+        and "system" in lowered
+        and "system role not supported" not in lowered
     ):
         ordinary = ordinary[1:]
     rich = tools or any(set(message) - {"role", "content"} for message in messages)
@@ -699,18 +841,10 @@ def _legacy_gemma_history(messages, template, tools=None):
     if not rich:
         return messages
 
-    # Legacy Gemma only accepts alternating user/model turns. Keep the original
-    # roles and metadata explicit inside those turns, including tool results.
     result = []
     for message in messages:
         role = "assistant" if message.get("role") == "assistant" else "user"
-        metadata = {key: value for key, value in message.items() if key != "content"}
-        content = deepcopy(message.get("content") or [])
-        if isinstance(content, str):
-            content = [{"type": "text", "text": content}]
-        content = [
-            {"type": "text", "text": json.dumps(metadata, ensure_ascii=False) + "\n"}
-        ] + content
+        content = _explicit_content(message)
         if result and result[-1]["role"] == role:
             result[-1]["content"] += [{"type": "text", "text": "\n"}] + content
         else:
@@ -727,10 +861,7 @@ def _legacy_gemma_history(messages, template, tools=None):
                 + "\n",
             },
         )
-    for message in result:
-        if all(part.get("type") == "text" for part in message["content"]):
-            message["content"] = "".join(part["text"] for part in message["content"])
-    return result
+    return _collapse_text_content(result)
 
 
 def get_chat_template(
@@ -961,9 +1092,9 @@ def get_chat_template(
             return _messages_to_plain_prompt()
 
         if chat_template_override is None:
-            messages = _legacy_gemma_history(
+            messages = _alternating_role_history(
                 messages,
-                getattr(template_processor, "chat_template", None),
+                template_processor,
                 kwargs.get("tools"),
             )
         template_kwargs = dict(kwargs)
@@ -985,32 +1116,34 @@ def get_chat_template(
                 add_generation_prompt=add_generation_prompt,
                 **template_kwargs,
             )
-        except TypeError as error:
-            normalized = _string_content_messages(messages, _get_image_token())
-            if normalized is messages:
-                raise
-            try:
-                return template_processor.apply_chat_template(
-                    normalized,
-                    tokenize=tokenize,
-                    add_generation_prompt=add_generation_prompt,
-                    **template_kwargs,
-                )
-            except (TemplateError, TypeError, ValueError):
-                raise error
-        except TemplateError as error:
-            normalized = _coalesce_leading_system_text(messages)
-            if normalized is messages:
-                raise
-            try:
-                return template_processor.apply_chat_template(
-                    normalized,
-                    tokenize=tokenize,
-                    add_generation_prompt=add_generation_prompt,
-                    **template_kwargs,
-                )
-            except (TemplateError, TypeError, ValueError):
-                raise error
+        except (TypeError, TemplateError) as error:
+            template = getattr(template_processor, "chat_template", None)
+            normalized = messages
+            for normalize in (
+                _coalesce_leading_system_text,
+                partial(_template_tool_history, template=template),
+                partial(
+                    _supported_role_messages,
+                    error_message=error,
+                    template=template,
+                    tools=kwargs.get("tools"),
+                ),
+                partial(_string_content_messages, image_token=_get_image_token()),
+            ):
+                candidate = normalize(normalized)
+                if candidate is normalized:
+                    continue
+                normalized = candidate
+                try:
+                    return template_processor.apply_chat_template(
+                        normalized,
+                        tokenize=tokenize,
+                        add_generation_prompt=add_generation_prompt,
+                        **template_kwargs,
+                    )
+                except (TemplateError, TypeError, ValueError):
+                    continue
+            raise error
         except ValueError as e:
             if chat_template_override is None and _missing_template_error(e):
                 return _messages_to_plain_prompt()
