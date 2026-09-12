@@ -4376,6 +4376,127 @@ def test_general_quantized_verifier_matches_decode(
     assert mx.array_equal(tokens, mx.argmax(expected, axis=-1)).item()
 
 
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal kernels")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("verify_length", [2, 4])
+def test_optimized_mxfp4_verifier_matches_singleton_decode(dtype, verify_length):
+    mx.random.seed(810 + verify_length)
+    linears = tuple(
+        nn.QuantizedLinear.from_linear(
+            nn.Linear(512, output_dims, bias=False),
+            group_size=32,
+            bits=4,
+            mode="mxfp4",
+        )
+        for output_dims in (16, 24, 32)
+    )
+    inputs = mx.random.normal((2, verify_length, 512)).astype(dtype)
+    mx.eval(*(linear.parameters() for linear in linears), inputs)
+    expected = tuple(
+        verifier_linear._target_verify_singletons(linear, inputs) for linear in linears
+    )
+
+    token_mask = mx.full((2 * verify_length, 1), 0x5555, dtype=mx.int32)
+    with (
+        patch.object(
+            verifier_linear,
+            "_target_verify_singleton_quantized_linear",
+            side_effect=AssertionError("MXFP4 must use its optimized projection"),
+        ),
+        patch.object(
+            verifier_linear,
+            "_target_verify_singleton_quantized_argmax",
+            side_effect=AssertionError("MXFP4 must use its optimized argmax"),
+        ),
+    ):
+        actual = verifier_linear._target_verify_quantized_linear(linears[0], inputs)
+        fused = verifier_linear._target_verify_linears(linears, inputs)
+        tokens = verifier_linear._target_verify_quantized_argmax(linears[0], inputs)
+        masked_tokens = verifier_linear._target_verify_quantized_argmax(
+            linears[0], inputs, token_mask=token_mask
+        )
+    masked_expected = mx.argmax(
+        mx.where(mx.arange(16) % 2 == 0, expected[0], -mx.inf), axis=-1
+    )
+    mx.eval(*expected, actual, *fused, tokens, masked_tokens, masked_expected)
+
+    assert actual is not None
+    assert fused is not None
+    assert mx.array_equal(actual, expected[0]).item()
+    assert all(mx.array_equal(a, e).item() for a, e in zip(fused, expected))
+    assert mx.array_equal(tokens, mx.argmax(expected[0], axis=-1)).item()
+    assert mx.array_equal(masked_tokens, masked_expected).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal kernels")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("masked", [False, True])
+def test_mxfp4_argmax_preserves_linear_bias(dtype, masked):
+    linear = nn.QuantizedLinear.from_linear(
+        nn.Linear(512, 16, bias=False), group_size=32, bits=4, mode="mxfp4"
+    )
+    linear.bias = mx.array([0.0] * 14 + [5.0, 10.0], dtype=dtype)
+    inputs = mx.zeros((2, 3, 512), dtype=dtype)
+    token_mask = mx.full((6, 1), 0x7FFF, dtype=mx.int32) if masked else None
+    expected = mx.full((2, 3), 14 if masked else 15, dtype=mx.int32)
+
+    actual = verifier_linear._target_verify_quantized_argmax(
+        linear, inputs, token_mask=token_mask
+    )
+    mx.eval(actual, expected)
+    assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal kernels")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("group_size", [32, 64])
+@pytest.mark.parametrize("batch,verify_length", [(1, 3), (2, 4), (4, 3), (4, 4)])
+def test_optimized_affine_q3_verifier_matches_singleton_decode(
+    dtype, group_size, batch, verify_length
+):
+    from mlx_vlm.models.quantized_verifier import (
+        optimized_affine_argmax,
+        optimized_affine_linear,
+        optimized_affine_linears,
+    )
+
+    mx.random.seed(820 + group_size)
+    linears = tuple(
+        nn.QuantizedLinear.from_linear(
+            nn.Linear(512, output_dims, bias=False),
+            group_size=group_size,
+            bits=3,
+            mode="affine",
+        )
+        for output_dims in (16, 24, 32)
+    )
+    for linear in linears:
+        linear.scales = linear.scales.astype(dtype)
+        linear.biases = linear.biases.astype(dtype)
+    inputs = mx.random.normal((batch, verify_length, 512)).astype(dtype)
+    mx.eval(*(linear.parameters() for linear in linears), inputs)
+    expected = tuple(
+        verifier_linear._target_verify_singletons(linear, inputs) for linear in linears
+    )
+
+    actual = optimized_affine_linear(linears[0], inputs)
+    fused = optimized_affine_linears(linears, inputs)
+    tokens = optimized_affine_argmax(linears[0], inputs)
+    token_mask = mx.full((inputs.shape[0] * inputs.shape[1], 1), 0x5555, dtype=mx.int32)
+    masked_tokens = optimized_affine_argmax(linears[0], inputs, token_mask=token_mask)
+    masked_expected = mx.argmax(
+        mx.where(mx.arange(16) % 2 == 0, expected[0], -mx.inf), axis=-1
+    )
+    mx.eval(*expected, actual, *fused, tokens, masked_tokens, masked_expected)
+
+    assert actual is not None
+    assert fused is not None
+    assert mx.array_equal(actual, expected[0]).item()
+    assert all(mx.array_equal(a, e).item() for a, e in zip(fused, expected))
+    assert mx.array_equal(tokens, mx.argmax(expected[0], axis=-1)).item()
+    assert mx.array_equal(masked_tokens, masked_expected).item()
+
+
 @pytest.mark.parametrize("input_dims", [64, 128])
 @pytest.mark.parametrize("bits", [2, 4, 8])
 def test_general_quantized_verifier_matches_narrow_qmv_quad(input_dims, bits):

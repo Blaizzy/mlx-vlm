@@ -758,8 +758,16 @@ def _stable_nvfp4_argmax(
 
 
 def _target_verify_qlinear_header(
-    bits: int, group_size: int, results_per_simdgroup: int = 4
+    bits: int,
+    group_size: int,
+    results_per_simdgroup: int = 4,
+    *,
+    q3_shifted_fields: bool = False,
 ) -> str:
+    # Shifted Q3 extraction is faster but changes floating-point operation
+    # order. Use it only for argmax kernels, where exact token IDs are
+    # verified; projection kernels retain the unshifted form for byte-identical
+    # singleton outputs.
     return (
         r"""
     using namespace metal;
@@ -767,8 +775,11 @@ def _target_verify_qlinear_header(
     constant constexpr int SIMD_SIZE = 32;
     constant constexpr int BITS = __BITS__;
     constant constexpr int GS = __GS__;
-    constant constexpr int PACK_FACTOR = (BITS == 5 ? 8 : 32 / BITS);
-    constant constexpr int BYTES_PER_PACK = (BITS == 5 ? 5 : 32 / 8);
+    constant constexpr bool Q3_SHIFTED = __Q3_SHIFTED__;
+    constant constexpr int PACK_FACTOR =
+        ((BITS == 3 || BITS == 5) ? 8 : 32 / BITS);
+    constant constexpr int BYTES_PER_PACK =
+        ((BITS == 3 || BITS == 5) ? (BITS == 3 ? 3 : 5) : 32 / 8);
     constant constexpr int PACKS_PER_THREAD = 2;
     constant constexpr int VALUES_PER_THREAD = PACK_FACTOR * PACKS_PER_THREAD;
     constant constexpr int BLOCK_SIZE = VALUES_PER_THREAD * SIMD_SIZE;
@@ -780,7 +791,20 @@ def _target_verify_qlinear_header(
     template <typename T>
     inline float load_vector_exact(const device T* x, thread float* x_thread) {
       float sum = 0.0f;
-      if (BITS == 4) {
+      if (BITS == 3) {
+        for (int i = 0; i < VALUES_PER_THREAD; i += 8) {
+          sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] +
+              x[i + 5] + x[i + 6] + x[i + 7];
+          x_thread[i] = x[i];
+          x_thread[i + 1] = Q3_SHIFTED ? x[i + 1] : x[i + 1] / 8.0f;
+          x_thread[i + 2] = Q3_SHIFTED ? x[i + 2] : x[i + 2] / 64.0f;
+          x_thread[i + 3] = Q3_SHIFTED ? x[i + 3] : x[i + 3] / 2.0f;
+          x_thread[i + 4] = Q3_SHIFTED ? x[i + 4] : x[i + 4] / 16.0f;
+          x_thread[i + 5] = Q3_SHIFTED ? x[i + 5] : x[i + 5] / 128.0f;
+          x_thread[i + 6] = Q3_SHIFTED ? x[i + 6] : x[i + 6] / 4.0f;
+          x_thread[i + 7] = Q3_SHIFTED ? x[i + 7] : x[i + 7] / 32.0f;
+        }
+      } else if (BITS == 4) {
         for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
           sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
           x_thread[i] = x[i];
@@ -817,7 +841,31 @@ def _target_verify_qlinear_header(
         float bias,
         float sum) {
       float accum = 0.0f;
-      if (BITS == 4) {
+      if (BITS == 3) {
+        for (int i = 0; i < (VALUES_PER_THREAD / 8); i++) {
+          const thread float* xt = x_thread + 8 * i;
+          const device uint8_t* wb = w + 3 * i;
+          accum += (wb[0] & 0x07) * xt[0];
+          accum +=
+              (Q3_SHIFTED ? ((wb[0] >> 3) & 0x07) : (wb[0] & 0x38)) * xt[1];
+          accum +=
+              (Q3_SHIFTED ? (wb[0] >> 6) : (wb[0] & 0xc0)) * xt[2];
+          accum +=
+              (wb[1] & 0x01) * (xt[2] * (Q3_SHIFTED ? 4.0f : 256.0f));
+          accum +=
+              (Q3_SHIFTED ? ((wb[1] >> 1) & 0x07) : (wb[1] & 0x0e)) * xt[3];
+          accum +=
+              (Q3_SHIFTED ? ((wb[1] >> 4) & 0x07) : (wb[1] & 0x70)) * xt[4];
+          accum +=
+              (Q3_SHIFTED ? (wb[1] >> 7) : (wb[1] & 0x80)) * xt[5];
+          accum +=
+              (wb[2] & 0x03) * (xt[5] * (Q3_SHIFTED ? 2.0f : 256.0f));
+          accum +=
+              (Q3_SHIFTED ? ((wb[2] >> 2) & 0x07) : (wb[2] & 0x1c)) * xt[6];
+          accum +=
+              (Q3_SHIFTED ? (wb[2] >> 5) : (wb[2] & 0xe0)) * xt[7];
+        }
+      } else if (BITS == 4) {
         const device uint16_t* ws = (const device uint16_t*)w;
         for (int i = 0; i < (VALUES_PER_THREAD / 4); i++) {
           uint packed = ws[i];
@@ -860,7 +908,36 @@ def _target_verify_qlinear_header(
         float bias,
         float sum) {
       float accum = 0.0f;
-      if (BITS == 4) {
+      if (BITS == 3) {
+        const thread uint8_t* wb = (const thread uint8_t*)ws;
+        for (int i = 0; i < (VALUES_PER_THREAD / 8); i++) {
+          const thread float* xt = x_thread + 8 * i;
+          const thread uint8_t* packed = wb + 3 * i;
+          accum += (packed[0] & 0x07) * xt[0];
+          accum +=
+              (Q3_SHIFTED ? ((packed[0] >> 3) & 0x07) : (packed[0] & 0x38)) *
+              xt[1];
+          accum +=
+              (Q3_SHIFTED ? (packed[0] >> 6) : (packed[0] & 0xc0)) * xt[2];
+          accum +=
+              (packed[1] & 0x01) * (xt[2] * (Q3_SHIFTED ? 4.0f : 256.0f));
+          accum +=
+              (Q3_SHIFTED ? ((packed[1] >> 1) & 0x07) : (packed[1] & 0x0e)) *
+              xt[3];
+          accum +=
+              (Q3_SHIFTED ? ((packed[1] >> 4) & 0x07) : (packed[1] & 0x70)) *
+              xt[4];
+          accum +=
+              (Q3_SHIFTED ? (packed[1] >> 7) : (packed[1] & 0x80)) * xt[5];
+          accum +=
+              (packed[2] & 0x03) * (xt[5] * (Q3_SHIFTED ? 2.0f : 256.0f));
+          accum +=
+              (Q3_SHIFTED ? ((packed[2] >> 2) & 0x07) : (packed[2] & 0x1c)) *
+              xt[6];
+          accum +=
+              (Q3_SHIFTED ? (packed[2] >> 5) : (packed[2] & 0xe0)) * xt[7];
+        }
+      } else if (BITS == 4) {
         for (int i = 0; i < (VALUES_PER_THREAD / 4); i++) {
           uint packed = ws[i];
           accum +=
@@ -876,6 +953,7 @@ def _target_verify_qlinear_header(
 """.replace("__BITS__", str(bits))
         .replace("__GS__", str(group_size))
         .replace("__RESULTS_PER_SIMDGROUP__", str(results_per_simdgroup))
+        .replace("__Q3_SHIFTED__", "true" if q3_shifted_fields else "false")
     )
 
 
@@ -1451,6 +1529,12 @@ def _target_verify_fused_qmv_source(source: str, n_sizes) -> str:
     )
 
 
+def _projection_results_per_simdgroup(bits, verify_t):
+    # Q3's unshifted projection arithmetic benefits from a smaller output
+    # tile at T=3/4. Keep the singleton reduction order within each output.
+    return 2 if bits == 3 and verify_t in (3, 4) else 4
+
+
 @lru_cache(maxsize=None)
 def _target_verify_qmv_kernel(bits, group_size, dtype, verify_t, k_size, n_size):
     dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
@@ -1461,7 +1545,9 @@ def _target_verify_qmv_kernel(bits, group_size, dtype, verify_t, k_size, n_size)
         ),
         input_names=["x", "w", "scales", "biases"],
         output_names=["y"],
-        header=_target_verify_qlinear_header(bits, group_size),
+        header=_target_verify_qlinear_header(
+            bits, group_size, _projection_results_per_simdgroup(bits, verify_t)
+        ),
         source=_TARGET_VERIFY_QMV_SOURCE,
     )
 
@@ -1476,7 +1562,9 @@ def _target_verify_qargmax_kernel(bits, group_size, dtype, verify_t, k_size, n_s
         ),
         input_names=["x", "w", "scales", "biases"],
         output_names=["tile_values", "tile_indices"],
-        header=_target_verify_qlinear_header(bits, group_size),
+        header=_target_verify_qlinear_header(
+            bits, group_size, q3_shifted_fields=bits == 3
+        ),
         source=_TARGET_VERIFY_QARGMAX_SOURCE,
     )
 
@@ -1493,7 +1581,9 @@ def _target_verify_masked_qargmax_kernel(
         ),
         input_names=["x", "w", "scales", "biases", "mask"],
         output_names=["tile_values", "tile_indices"],
-        header=_target_verify_qlinear_header(bits, group_size),
+        header=_target_verify_qlinear_header(
+            bits, group_size, q3_shifted_fields=bits == 3
+        ),
         source=_TARGET_VERIFY_MASKED_QARGMAX_SOURCE,
     )
 
@@ -1614,7 +1704,9 @@ def _target_verify_fused_qmv_kernel(bits, group_size, dtype, verify_t, k_size, n
         ),
         input_names=input_names,
         output_names=["y"],
-        header=_target_verify_qlinear_header(bits, group_size),
+        header=_target_verify_qlinear_header(
+            bits, group_size, _projection_results_per_simdgroup(bits, verify_t)
+        ),
         source=_target_verify_fused_qmv_source(_TARGET_VERIFY_QMV_SOURCE, n_sizes),
     )
 
@@ -1646,7 +1738,7 @@ def supports_optimized_affine_head(linear) -> bool:
     """Return whether the exact affine verifier kernel supports ``linear``."""
     if (
         not isinstance(linear, nn.QuantizedLinear)
-        or linear.bits not in (4, 5, 8)
+        or linear.bits not in (3, 4, 5, 8)
         or linear.mode != "affine"
         or linear.biases is None
         or linear.scales.dtype not in (mx.bfloat16, mx.float16)
@@ -1685,7 +1777,9 @@ def optimized_affine_linear(linear, x: mx.array) -> Optional[mx.array]:
     x = mx.contiguous(x)
     streamed = linear.bits == 4 and 6 <= T <= 8
     token_tiled = linear.bits == 4 and T >= 6 and not streamed
-    results_per_simdgroup = 1 if streamed else 4
+    results_per_simdgroup = (
+        1 if streamed else _projection_results_per_simdgroup(linear.bits, T)
+    )
     if streamed:
         kernel_factory = _target_verify_qmv_streamed_kernel
     elif token_tiled:
@@ -1793,7 +1887,7 @@ def optimized_affine_linears(linears, x: mx.array):
         not 2 <= len(linears) <= 4
         or x.ndim != 3
         or not 1 < x.shape[1] <= 8
-        or bits not in (4, 5, 8)
+        or bits not in (3, 4, 5, 8)
         or not all(
             isinstance(linear, nn.QuantizedLinear)
             and linear.bits == bits
@@ -1820,6 +1914,9 @@ def optimized_affine_linears(linears, x: mx.array):
     inputs = [x]
     for linear in linears:
         inputs.extend([linear.weight, linear.scales, linear.biases])
+    rows_per_threadgroup = (
+        2 if streamed else 2 * _projection_results_per_simdgroup(bits, T)
+    )
     out = kernel(
         inputs=inputs,
         template=[
@@ -1828,7 +1925,7 @@ def optimized_affine_linears(linears, x: mx.array):
             ("K_SIZE", int(K)),
             ("N_SIZE", int(total_n)),
         ],
-        grid=(32, 2 * (total_n // (2 if streamed else 8)), B),
+        grid=(32, 2 * (total_n // rows_per_threadgroup), B),
         threadgroup=(32, 2, 1),
         output_shapes=[(B, T, total_n)],
         output_dtypes=[x.dtype],
