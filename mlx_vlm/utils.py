@@ -793,8 +793,12 @@ def _quantization_path_aliases(
 def _quantization_for_module_path(
     quantization: dict, path: str, model: Optional[nn.Module] = None
 ) -> Optional[dict]:
+    modules = quantization.get("modules")
+    modules = modules if isinstance(modules, dict) else {}
     for alias in _quantization_path_aliases(path, model):
         value = quantization.get(alias)
+        if value is None:
+            value = modules.get(alias)
         if isinstance(value, dict):
             return value
         if value is False:
@@ -1099,11 +1103,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             if module_quantization.get("bits") == 1:
                 return False
             # Handle custom per-layer quantization, including aliases supplied
-            # by the model.
-            if per_module_quantization is not None:
-                return per_module_quantization
+            # by the model. A config entry cannot force quantization onto a
+            # module that does not support it (e.g. a head deliberately kept in
+            # fp32 and dequantized during sanitize).
             if not hasattr(m, "to_quantized"):
                 return False
+            if per_module_quantization is not None:
+                return per_module_quantization
             # Skip layers not divisible by 64
             if hasattr(m, "weight") and m.weight.size % 64 != 0:
                 return False

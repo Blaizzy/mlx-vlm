@@ -462,11 +462,22 @@ def _quantization_for_path(quantization: dict, path: str) -> dict:
         for key in ("group_size", "bits", "mode")
         if key in quantization
     }
-    per_layer = quantization.get(path)
+    # Converters disagree on where per-module overrides live: some write them
+    # as top-level keys, others nest them under ``modules``.
+    modules = quantization.get("modules")
+    modules = modules if isinstance(modules, dict) else {}
+
+    def lookup(key):
+        entry = quantization.get(key)
+        if entry is None:
+            entry = modules.get(key)
+        return entry
+
+    per_layer = lookup(path)
     if per_layer is None and path.startswith("language_model."):
         # Config keys from the underlying text checkpoint omit the mlx-vlm
         # ``language_model.`` wrapper prefix that loaded module paths carry.
-        per_layer = quantization.get(path[len("language_model.") :])
+        per_layer = lookup(path[len("language_model.") :])
     if isinstance(per_layer, dict):
         base.update(per_layer)
     return base

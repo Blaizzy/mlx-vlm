@@ -78,6 +78,14 @@ class Model(nn.Module):
     ) -> LanguageModelOutput:
         return self.language_model(input_ids, cache=cache, **kwargs)
 
+    def quantization_path_aliases(self, path: str):
+        """Routed experts load as ``switch_mlp`` but converters key them ``experts``."""
+        if path.startswith("language_model."):
+            path = path[len("language_model.") :]
+        if ".switch_mlp." in path:
+            return [path.replace(".switch_mlp.", ".experts.")]
+        return []
+
     def sanitize(self, weights):
         def transform_key(key):
             if key.startswith("language_model."):
