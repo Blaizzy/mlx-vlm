@@ -519,44 +519,61 @@ class DeepseekV41Attention(nn.Module):
         return cache
 
     def _window_part(self, x: mx.array, start_pos: int):
-        """Rotated window KV for this step plus its validity mask.
+        """Window KV slice for this step plus its validity mask.
 
-        Prefill attends over the current chunk; later steps attend the ordered
-        ring of the last `window_size` tokens.
+        Prefill attends over the current chunk; later steps attend the last
+        `window_size` tokens. The buffer keeps every token in order (not a
+        fixed ring) so speculative rollback can truncate it.
         """
         batch, seqlen = x.shape[0], x.shape[1]
         win = self.window_size
         kv = self.kv_norm(self.wkv(x)).reshape(batch, 1, seqlen, self.head_dim)
         kv = self.rope(kv, start_pos).reshape(batch, seqlen, self.head_dim)
         kv = fake_quant_fp8_ue8m0(kv.astype(mx.float32)).astype(kv.dtype)
-        self._window_cache = self._grow_cache(
-            self._window_cache, batch, win, self.head_dim
-        )
-        hist_len = min(self._cache_len, win) if start_pos else 0
-        hist = self._window_cache[:batch, win - hist_len :] if hist_len else None
+        need_len = start_pos + seqlen
+        cache = self._window_cache
+        if cache is None:
+            cache = mx.zeros((batch, 0, self.head_dim), dtype=mx.float32)
+        if cache.shape[0] < batch:
+            cache = mx.concatenate(
+                [
+                    cache,
+                    mx.zeros(
+                        (batch - cache.shape[0], cache.shape[1], self.head_dim),
+                        dtype=mx.float32,
+                    ),
+                ],
+                axis=0,
+            )
+        if cache.shape[1] < need_len:
+            cache = mx.concatenate(
+                [
+                    cache,
+                    mx.zeros(
+                        (cache.shape[0], need_len - cache.shape[1], self.head_dim),
+                        dtype=mx.float32,
+                    ),
+                ],
+                axis=1,
+            )
+        parts = []
+        if start_pos > 0:
+            parts.append(cache[:batch, :start_pos])
+        parts.append(kv)
+        if cache.shape[1] > need_len:
+            parts.append(cache[:batch, need_len:])
+        head = mx.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
+        if cache.shape[0] > batch:
+            cache = mx.concatenate([head, cache[batch:]], axis=0)
+        else:
+            cache = head
+        self._window_cache = cache
+        self._cache_len = need_len
         if start_pos == 0:
-            part, base = kv, 0
-            tail = kv[:, -win:]
+            part, base = cache[:batch, :need_len], 0
         else:
-            full = kv if hist is None else mx.concatenate([hist, kv], axis=1)
-            tail = full[:, -win:]
-            part, base = tail, max(0, start_pos + seqlen - tail.shape[1])
-        keep = (
-            tail
-            if tail.shape[1] == win
-            else mx.concatenate(
-                [mx.zeros((batch, win - tail.shape[1], self.head_dim)), tail], axis=1
-            )
-        )
-        ring = self._window_cache
-        if ring.shape[0] >= batch:
-            ring = mx.concatenate(
-                [keep] + ([ring[batch:]] if ring.shape[0] > batch else []), axis=0
-            )
-        else:
-            ring = keep
-        self._window_cache = ring
-        self._cache_len = start_pos + seqlen
+            base = max(0, start_pos - win + 1)
+            part = cache[:batch, base:need_len]
         positions = mx.arange(base, base + part.shape[1])
         queries = mx.arange(start_pos, start_pos + seqlen)
         valid = (
@@ -575,10 +592,7 @@ class DeepseekV41Attention(nn.Module):
             latent = self.compressor(x, start_pos)
             if latent is not None:
                 n_latent = latent.shape[1]
-                if start_pos == 0:
-                    positions = mx.arange(n_latent) * ratio
-                else:
-                    positions = mx.array([start_pos + 1 - ratio])
+                positions = (start_pos // ratio + mx.arange(n_latent)) * ratio
                 latent = _apply_rope_at_positions(
                     latent.astype(mx.float32),
                     positions,
@@ -679,6 +693,33 @@ class Compressor(nn.Module):
             self.wgate = nn.Linear(config.hidden_size, config.head_dim, bias=False)
         self._kv_state = None
         self._score_state = None
+        self._undo = []
+
+    def _push_undo(self, batch: int, slot: int):
+        """Record a slot's prior contents so a rejected position can be undone.
+
+        Slots are position-addressed (``pos % ratio``), so a speculative block
+        that crosses a compression boundary overwrites slots belonging to
+        already-committed positions. Those are not recoverable by replay.
+        """
+        kv = None if self._kv_state is None else self._kv_state[:batch, slot : slot + 1]
+        sc = (
+            None
+            if self._score_state is None
+            else self._score_state[:batch, slot : slot + 1]
+        )
+        self._undo.append((slot, batch, kv, sc))
+        if len(self._undo) > 64:
+            del self._undo[:-64]
+
+    def undo(self, n: int):
+        """Restore slot state for the last ``n`` written positions."""
+        for _ in range(min(int(n), len(self._undo))):
+            slot, batch, kv, sc = self._undo.pop()
+            if kv is not None:
+                self._kv_state = self._write_slot(self._kv_state, batch, slot, kv)
+            if sc is not None:
+                self._score_state = self._write_slot(self._score_state, batch, slot, sc)
 
     def _grow_state(self, batch: int):
         if self._kv_state is None:
@@ -737,6 +778,7 @@ class Compressor(nn.Module):
         kv, score = self.wkv(xf), self.wgate(xf)
         if start_pos == 0:
             should_compress = seqlen >= ratio
+            self._undo.clear()
             remainder = seqlen % ratio
             cutoff = seqlen - remainder
             if remainder:
@@ -751,20 +793,28 @@ class Compressor(nn.Module):
             score = score[:, :cutoff].reshape(batch, -1, ratio, self.head_dim)
             kv = (kv * mx.softmax(score, axis=2)).sum(axis=2)
         else:
-            slot = start_pos % ratio
             self._grow_state(batch)
-            self._kv_state = self._write_slot(
-                self._kv_state, batch, slot, kv[:, 0:1, :]
-            )
-            self._score_state = self._write_slot(
-                self._score_state, batch, slot, score[:, 0:1, :]
-            )
-            should_compress = (start_pos + 1) % ratio == 0
+            pooled = []
+            for i in range(seqlen):
+                pos = start_pos + i
+                slot = pos % ratio
+                self._push_undo(batch, slot)
+                self._kv_state = self._write_slot(
+                    self._kv_state, batch, slot, kv[:, i : i + 1, :]
+                )
+                self._score_state = self._write_slot(
+                    self._score_state, batch, slot, score[:, i : i + 1, :]
+                )
+                if (pos + 1) % ratio == 0:
+                    pooled.append(
+                        (
+                            self._kv_state[:batch]
+                            * mx.softmax(self._score_state[:batch], axis=1)
+                        ).sum(axis=1, keepdims=True)
+                    )
+            should_compress = bool(pooled)
             if should_compress:
-                kv = (
-                    self._kv_state[:batch]
-                    * mx.softmax(self._score_state[:batch], axis=1)
-                ).sum(axis=1, keepdims=True)
+                kv = mx.concatenate(pooled, axis=1) if len(pooled) > 1 else pooled[0]
         if not should_compress:
             return None
         return self.norm(kv.astype(dtype))
@@ -905,12 +955,30 @@ class DeepseekV41Cache:
     def __init__(self):
         self.shared = SharedIndexState()
         self.offset = 0
+        self._model = None
+
+    def trim(self, n: int) -> int:
+        """Drop the last `n` appended tokens so a speculative block rolls back.
+
+        The framework calls this with the rejected-token count on commit and
+        the whole-block advance on abort. Prefix-addressed buffers truncate;
+        the compressor's slot state is position-addressed and rewrites itself
+        on resume, so it needs no trim.
+        """
+        n = min(self.offset, int(n))
+        if n <= 0:
+            return 0
+        self.offset -= n
+        if self._model is not None:
+            self._model._trim_caches(self.offset, n)
+        return n
 
 
 class LanguageModel(nn.Module):
     """Embed, expand to hc copies, run the blocks, collapse, project to logits."""
 
     no_chunked_prefill = True
+    requires_uniform_batch_acceptance = True
 
     def __init__(self, config: ModelConfig, tokenizer=None):
         super().__init__()
@@ -930,7 +998,29 @@ class LanguageModel(nn.Module):
         self.target_layer_ids = list(config.dspark_target_layer_ids)
 
     def make_cache(self):
-        return [DeepseekV41Cache()]
+        cache = DeepseekV41Cache()
+        cache._model = self
+        return [cache]
+
+    def _trim_caches(self, offset: int, n: int = 0):
+        for layer in self.layers:
+            attn = layer.attn
+            attn._cache_len = min(attn._cache_len, offset)
+            if n and attn.compressor is not None:
+                attn.compressor.undo(n)
+            if attn._window_cache is not None:
+                attn._window_cache = attn._window_cache[:, :offset]
+            if attn.compress_ratio and attn._compress_cache is not None:
+                attn._compress_cache = attn._compress_cache[
+                    :, : offset // attn.compress_ratio
+                ]
+            indexer = attn.indexer
+            if indexer is not None and indexer._k_cache is not None:
+                indexer._k_cache = indexer._k_cache[
+                    :, : offset // indexer.compress_ratio
+                ]
+        if self.engram_hash is not None and self.engram_hash._cache is not None:
+            self.engram_hash._cache = self.engram_hash._cache[:, :offset]
 
     def _reset_caches(self):
         for layer in self.layers:
@@ -942,6 +1032,7 @@ class LanguageModel(nn.Module):
             if layer.attn.compressor is not None:
                 layer.attn.compressor._kv_state = None
                 layer.attn.compressor._score_state = None
+                layer.attn.compressor._undo.clear()
 
     def __call__(
         self,

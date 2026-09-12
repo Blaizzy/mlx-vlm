@@ -19862,6 +19862,99 @@ class TestDeepseekV41Basics(unittest.TestCase):
         with self.assertRaises(AssertionError):
             deepseek_v41.get_dspark_topk_idxs(128, 2, 5, 0)
 
+    def test_deepseek_v41_cache_trim_rollback(self):
+        from mlx_vlm.models import deepseek_v41
+        from mlx_vlm.models.deepseek_v41.language import LanguageModel
+
+        config = deepseek_v41.ModelConfig(
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=5,
+            num_nextn_predict_layers=0,
+            num_attention_heads=2,
+            head_dim=32,
+            q_lora_rank=8,
+            o_lora_rank=8,
+            o_groups=2,
+            qk_rope_head_dim=4,
+            max_position_embeddings=64,
+            sliding_window=8,
+            compress_ratios=[0, 2, 2, 1, 0],
+            kv_source_layer_ids=[1, 3],
+            index_source_layer_ids=[1, 2],
+            candidate_source_layer_id=1,
+            candidate_topk_blocks=4,
+            candidate_block_size=2,
+            index_n_heads=2,
+            index_head_dim=32,
+            index_topk=4,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=16,
+            hc_mult=2,
+            dspark_target_layer_ids=[3],
+            engram_layer_ids=[1],
+            engram_num_embeddings=[1024],
+            engram_max_ngram_size=3,
+            engram_vocab_size=512,
+            engram_n_heads=2,
+            engram_head_dim=8,
+            engram_compressed_vocab_size=7,
+        )
+        model = LanguageModel(config)
+        mx.eval(model.parameters())
+
+        def maxdiff(a, b):
+            d = mx.abs(a.astype(mx.float32) - b.astype(mx.float32))
+            mx.eval(d)
+            return float(mx.max(d).item())
+
+        prompt = mx.array([[3, 7, 11, 15, 19, 23, 27, 31, 35, 39]])
+        toks = [3, 7, 11, 15, 19, 23, 27, 31, 35, 39]
+
+        cache_a = model.make_cache()
+        out_a = model(prompt, cache=cache_a)
+        mx.eval(out_a.logits)
+        logits_a = [out_a.logits[:, i] for i in range(10)]
+        for _ in range(9):
+            nxt = int(mx.argmax(logits_a[-1]).item())
+            toks.append(nxt)
+            out = model(mx.array([[nxt]]), cache=cache_a)
+            mx.eval(out.logits)
+            logits_a.append(out.logits[:, 0])
+
+        cache_b = model.make_cache()
+        out_b = model(prompt, cache=cache_b)
+        mx.eval(out_b.logits)
+        self.assertLess(maxdiff(out_b.logits, out_a.logits), 1e-4)
+        for j in range(1, 4):
+            out = model(mx.array([[toks[9 + j]]]), cache=cache_b)
+            mx.eval(out.logits)
+            self.assertLess(maxdiff(out.logits[:, 0], logits_a[10 + j]), 1e-4)
+        blk = model(mx.array([toks[13:18]]), cache=cache_b)
+        mx.eval(blk.logits)
+        for r in range(2):
+            self.assertLess(maxdiff(blk.logits[:, r], logits_a[14 + r]), 1e-4)
+        self.assertEqual(cache_b[0].trim(3), 3)
+        self.assertEqual(cache_b[0].offset, 15)
+        for j in range(6, 9):
+            out = model(mx.array([[toks[9 + j]]]), cache=cache_b)
+            mx.eval(out.logits)
+            self.assertLess(maxdiff(out.logits[:, 0], logits_a[10 + j]), 1e-4)
+
+        cache_c = model.make_cache()
+        model(prompt, cache=cache_c)
+        first = model(mx.array([[toks[10]]]), cache=cache_c)
+        mx.eval(first.logits)
+        blk = model(mx.array([toks[11:15]]), cache=cache_c)
+        mx.eval(blk.logits)
+        self.assertEqual(cache_c[0].offset, 15)
+        self.assertEqual(cache_c[0].trim(4), 4)
+        self.assertEqual(cache_c[0].offset, 11)
+        again = model(mx.array([[toks[11]]]), cache=cache_c)
+        mx.eval(again.logits)
+        self.assertLess(maxdiff(again.logits[:, 0], logits_a[12]), 1e-4)
+
 
 class TestDeepseekV41Indexer(unittest.TestCase):
     @staticmethod
