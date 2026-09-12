@@ -85,7 +85,7 @@ def _extract_row_cache(cache_entry, row: int):
             row_cache.lengths = lengths[row : row + 1]
         return row_cache
 
-    if hasattr(cache_entry, "extract") and not cache_entry.empty():
+    if hasattr(cache_entry, "extract"):
         return cache_entry.extract(row)
 
     if hasattr(cache_entry, "left_padding"):
@@ -249,6 +249,9 @@ def _create_qwen3_5_attention_mask(h: mx.array, cache):
 
     if hasattr(cache, "_qwen3_5_decode_left_padding"):
         delattr(cache, "_qwen3_5_decode_left_padding")
+
+    if getattr(cache, "max_size", None) is not None:
+        return create_attention_mask(h, cache)
 
     left_padding = getattr(cache, "left_padding", None)
     if h.shape[1] == 1 and isinstance(left_padding, mx.array) and left_padding.ndim > 0:
@@ -984,7 +987,7 @@ class Qwen3_5Attention(nn.Module):
             cos, sin = position_embeddings
             queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
-        if mask is not None and isinstance(mask, mx.array):
+        if isinstance(mask, mx.array) and getattr(cache, "max_size", None) is None:
             if (
                 cache is not None
                 and hasattr(cache, "_idx")
@@ -1647,6 +1650,12 @@ class LanguageModel(nn.Module):
                 and c0.offset.size > 1
             ):
                 cache_offsets = mx.maximum(c0.offset, 0)
+            elif getattr(c0, "max_size", None) is not None:
+                cache_offset = (
+                    int(c0.offset.item())
+                    if isinstance(c0.offset, mx.array)
+                    else c0.offset
+                )
 
         if position_ids is not None and cache_offsets is None:
             seq_length = inputs.shape[-1]

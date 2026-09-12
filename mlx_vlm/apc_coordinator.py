@@ -10,7 +10,11 @@ from __future__ import annotations
 
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
-from .apc_adapters import PrefixCachePlan, build_prefix_cache_plan
+from .apc_adapters import (
+    PrefixCachePlan,
+    build_prefix_cache_plan,
+    build_prefix_cache_plan_from_caches,
+)
 
 
 class APCCoordinator:
@@ -21,10 +25,24 @@ class APCCoordinator:
     boundary.  The distinction is deliberately private to this class.
     """
 
-    def __init__(self, manager: Any, model: Any):
+    def __init__(self, manager: Any, model: Any, *, max_kv_size: Optional[int] = None):
         self.manager = manager
         self.model = model
-        self.plan: PrefixCachePlan = build_prefix_cache_plan(model)
+        self.max_kv_size = max_kv_size
+        self.plan: PrefixCachePlan = (
+            build_prefix_cache_plan(model)
+            if max_kv_size is None
+            else build_prefix_cache_plan_from_caches(self.fresh_cache())
+        )
+
+    def scope_hash(self, extra_hash: int) -> int:
+        if self.max_kv_size is None:
+            return extra_hash
+        from .apc import semantic_extra_hash
+
+        return semantic_extra_hash(
+            image_hash=extra_hash, media={"max_kv_size": self.max_kv_size}
+        )
 
     def prepare_prefill(self, token_count: int) -> None:
         if self.enabled:
@@ -48,6 +66,10 @@ class APCCoordinator:
 
     def fresh_cache(self) -> List[Any]:
         language_model = getattr(self.model, "language_model", self.model)
+        if self.max_kv_size is not None:
+            from .models.cache import make_prompt_cache
+
+            return list(make_prompt_cache(language_model, max_kv_size=self.max_kv_size))
         make_cache = getattr(language_model, "make_cache", None) or getattr(
             self.model, "make_cache", None
         )

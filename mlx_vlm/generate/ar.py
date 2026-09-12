@@ -885,6 +885,7 @@ def _make_cache(
     kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
     quantized_kv_start=0,
     prefill_length=0,
+    max_kv_size=None,
 ):
     """
     Convert a list of regular caches into their corresponding
@@ -965,7 +966,7 @@ def _make_cache(
             return cache.BatchPoolingCache(c.ratio, left_padding)
         elif isinstance(c, cache.RotatingKVCache):
             if c.keep > 0:
-                raise ValueError("RotatingKVCache with keep tokens is not supported.")
+                return cache.BatchPrefixKVCache(c.max_size, left_padding, c.keep)
             return cache.BatchRotatingKVCache(c.max_size, left_padding)
         elif isinstance(c, cache.CacheList):
             return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
@@ -974,25 +975,18 @@ def _make_cache(
         else:
             raise ValueError(f"{type(c)} does not yet support batching")
 
-    if hasattr(model, "make_cache"):
-        model_cache = model.make_cache()
-        n = len(model_cache)
-        return [
-            to_batch_cache(c, quantize=cache.should_quantize_kv_layer(i, n))
-            for i, c in enumerate(model_cache)
-        ]
-    else:
-        if kv_bits is not None:
-            n = len(model.layers)
-            return [
-                (
-                    _make_quant_cache(left_padding)
-                    if cache.should_quantize_kv_layer(i, n)
-                    else cache.BatchKVCache(left_padding)
-                )
-                for i in range(n)
-            ]
-        return [cache.BatchKVCache(left_padding) for _ in model.layers]
+    if max_kv_size is not None and any(
+        bits is not None for bits in (kv_bits, kv_key_bits, kv_value_bits)
+    ):
+        raise NotImplementedError(
+            "max_kv_size with quantized batching is not supported"
+        )
+    model_cache = cache.make_prompt_cache(model, max_kv_size=max_kv_size)
+    n = len(model_cache)
+    return [
+        to_batch_cache(c, quantize=cache.should_quantize_kv_layer(i, n))
+        for i, c in enumerate(model_cache)
+    ]
 
 
 @dataclass
@@ -1754,6 +1748,7 @@ class PromptProcessingBatch:
         draft_kind: Optional[str] = None,
         draft_block_size: Optional[int] = None,
         greedy_sampling: bool = False,
+        max_kv_size: Optional[int] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1851,6 +1846,7 @@ class PromptProcessingBatch:
                     kv_quant_scheme=kv_quant_scheme,
                     quantized_kv_start=quantized_kv_start,
                     prefill_length=max_length,
+                    max_kv_size=max_kv_size,
                 ),
             )
         elif (
@@ -1859,7 +1855,7 @@ class PromptProcessingBatch:
             and kv_bits is None
             and hasattr(model, "make_cache")
         ):
-            self.prompt_cache = cache.make_prompt_cache(model)
+            self.prompt_cache = cache.make_prompt_cache(model, max_kv_size=max_kv_size)
         else:
             self.prompt_cache = _make_cache(
                 model,
@@ -1873,6 +1869,7 @@ class PromptProcessingBatch:
                 kv_quant_scheme=kv_quant_scheme,
                 quantized_kv_start=quantized_kv_start,
                 prefill_length=max_length,
+                max_kv_size=max_kv_size,
             )
 
         # Declare per-row right-padding on each cache so finalize() can roll
@@ -2432,8 +2429,17 @@ class BatchGenerator:
         draft_kind: Optional[str] = None,
         draft_block_size: Optional[int] = None,
         greedy_sampling: bool = False,
+        max_kv_size: Optional[int] = None,
     ):
         self.model = model
+        self._wire_stack = contextlib.ExitStack()
+        if max_kv_size is not None and any(
+            bits is not None for bits in (kv_bits, kv_key_bits, kv_value_bits)
+        ):
+            raise NotImplementedError(
+                "max_kv_size with quantized batching is not supported"
+            )
+        self.max_kv_size = max_kv_size
         self.max_tokens = max_tokens
         self.processor = processor
         self.kv_bits = kv_bits
@@ -2457,7 +2463,9 @@ class BatchGenerator:
             self.compute_logprobs = False
             self.top_logprobs_k = 0
         self.apc = (
-            _apc.APCCoordinator(apc_manager, model) if apc_manager is not None else None
+            _apc.APCCoordinator(apc_manager, model, max_kv_size=max_kv_size)
+            if apc_manager is not None
+            else None
         )
         if self.apc is not None and not self.apc.enabled:
             self.apc = None
@@ -2495,7 +2503,6 @@ class BatchGenerator:
         self._steps_counter = 0
         self._cache_eval_interval = _get_batch_cache_eval_interval()
 
-        self._wire_stack = contextlib.ExitStack()
         self._wire_stack.enter_context(wired_limit(model, [self._stream]))
 
     # ---------------- APC integration helpers ----------------
@@ -2511,13 +2518,18 @@ class BatchGenerator:
             prompt_kwargs = {}
         precomputed = prompt_kwargs.get("_apc_semantic_hash")
         if precomputed is not None:
-            return int(precomputed)
+            coordinator = getattr(self, "apc", None)
+            return (
+                coordinator.scope_hash(int(precomputed))
+                if coordinator
+                else int(precomputed)
+            )
         img = prompt_kwargs.get("_apc_image_hash")
         if img is None:
             pixel_values = prompt_kwargs.get("pixel_values")
             img = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=None)
         tenant = prompt_kwargs.get("_apc_tenant")
-        return _apc.semantic_extra_hash(
+        extra_hash = _apc.semantic_extra_hash(
             tenant=tenant,
             image_hash=img,
             media={
@@ -2529,6 +2541,8 @@ class BatchGenerator:
             model=getattr(self, "model", None),
             processor=getattr(self, "processor", None),
         )
+        coordinator = getattr(self, "apc", None)
+        return coordinator.scope_hash(extra_hash) if coordinator else extra_hash
 
     def _apc_media_token_ids(self) -> set[int]:
         config = getattr(self.model, "config", None)
@@ -2766,6 +2780,7 @@ class BatchGenerator:
             logits_processors=logits_processors,
             thinking_budget_criteria=thinking_budget_criteria,
             prefill_step_size=self.prefill_step_size,
+            max_kv_size=self.max_kv_size,
             kv_bits=self.kv_bits,
             kv_key_bits=getattr(self, "kv_key_bits", None),
             kv_value_bits=getattr(self, "kv_value_bits", None),
@@ -3095,6 +3110,7 @@ class BatchGenerator:
                 logits_processors=logits_processors,
                 thinking_budget_criteria=thinking_budget_criteria,
                 prefill_step_size=self.prefill_step_size,
+                max_kv_size=self.max_kv_size,
                 kv_bits=self.kv_bits,
                 kv_key_bits=getattr(self, "kv_key_bits", None),
                 kv_value_bits=getattr(self, "kv_value_bits", None),

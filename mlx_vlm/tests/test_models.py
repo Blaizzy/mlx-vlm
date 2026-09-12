@@ -15364,6 +15364,507 @@ class TestDeepseekV4HISA(unittest.TestCase):
         self.assertTrue(bool(mx.array_equal(mx.sort(out, -1), mx.sort(ftk, -1))))
 
 
+class TestCacheCapacity(unittest.TestCase):
+    def test_quantized_limit_is_rejected_before_warm_cache_lookup(self):
+        from mlx_vlm.generate.ar import BatchGenerator, _make_cache
+
+        for kwargs in ({"kv_bits": 4}, {"kv_key_bits": 4, "kv_value_bits": 4}):
+            with self.assertRaisesRegex(NotImplementedError, "quantized batching"):
+                BatchGenerator(None, None, max_kv_size=8, **kwargs)
+            with self.assertRaisesRegex(NotImplementedError, "quantized batching"):
+                _make_cache(None, [0, 0], max_kv_size=8, **kwargs)
+
+    def test_conversation_cache_is_not_reused_after_limit_changes(self):
+        import contextlib
+        from unittest.mock import patch
+
+        from mlx_vlm.generate import dispatch
+        from mlx_vlm.generate.common import PromptCacheState
+        from mlx_vlm.models.cache import KVCache, RotatingKVCache
+        from mlx_vlm.tests.test_generate import MockProcessor
+
+        model = SimpleNamespace(
+            config=SimpleNamespace(model_type="test", eos_token_id=[]),
+            language_model=SimpleNamespace(layers=[None]),
+        )
+        state = PromptCacheState()
+        state.update([1, 2], [KVCache()])
+
+        def generate(*args, **kwargs):
+            self.assertEqual(args[0].tolist(), [[1, 2, 3]])
+            self.assertIsInstance(kwargs["prompt_cache"][0], RotatingKVCache)
+            self.assertEqual(kwargs["prompt_cache"][0].max_size, 8)
+            yield 7, mx.zeros(8)
+
+        with (
+            patch.object(
+                dispatch, "wired_limit", return_value=contextlib.nullcontext()
+            ),
+            patch.object(dispatch, "generate_step", side_effect=generate),
+            patch.object(
+                state, "find_prefix_length", side_effect=AssertionError("stale policy")
+            ),
+        ):
+            list(
+                dispatch.stream_generate(
+                    model,
+                    MockProcessor(),
+                    "",
+                    input_ids=mx.array([[1, 2, 3]]),
+                    prompt_cache_state=state,
+                    max_kv_size=8,
+                    max_tokens=1,
+                )
+            )
+        self.assertEqual(state.max_kv_size, 8)
+
+    def test_cache_owners_apply_limit_without_losing_layout(self):
+        from mlx_vlm.models.cache import (
+            ArraysCache,
+            CacheList,
+            KVCache,
+            RotatingKVCache,
+            make_prompt_cache,
+        )
+
+        recurrent = ArraysCache(size=2)
+        model = SimpleNamespace(
+            make_cache=lambda: [CacheList(KVCache(), recurrent), RotatingKVCache(5)]
+        )
+        caches = make_prompt_cache(model, max_kv_size=8)
+        self.assertEqual(caches[0][0].max_size, 8)
+        self.assertEqual(caches[0][0].keep, 4)
+        self.assertIs(caches[0][1], recurrent)
+        self.assertEqual(caches[1].max_size, 5)
+        self.assertEqual(
+            make_prompt_cache(SimpleNamespace(layers=[None]), max_kv_size=1)[0].keep, 0
+        )
+
+    def test_limit_cannot_partially_succeed(self):
+        from mlx_vlm.models.cache import KVCache, PoolingCache, make_prompt_cache
+
+        class AuxiliaryCache(KVCache):
+            pass
+
+        for unsupported in (PoolingCache(4), AuxiliaryCache()):
+            ordinary = KVCache()
+            model = SimpleNamespace(make_cache=lambda: [ordinary, unsupported])
+            with self.assertRaisesRegex(
+                NotImplementedError, type(unsupported).__name__
+            ):
+                make_prompt_cache(model, max_kv_size=8)
+            self.assertIsNone(ordinary.keys)
+
+    def test_invalid_limit_fails_before_cache_construction(self):
+        from mlx_vlm.models.cache import make_prompt_cache
+
+        for limit in (0, -1, True, 1.5):
+            with (
+                self.subTest(limit=limit),
+                self.assertRaisesRegex(ValueError, "positive integer"),
+            ):
+                make_prompt_cache(object(), max_kv_size=limit)
+
+    def assert_visible_tokens(
+        self, cache, chunks, positions=None, window_size=None, lengths=None
+    ):
+        if positions is None:
+            positions = np.array(cache.offset).reshape(-1)
+        keep = getattr(cache, "keep", 0)
+        for length in chunks:
+            p = positions[:, None] + np.arange(length)
+            data = mx.array(p[:, None, :, None], dtype=mx.float32)
+            mask = cache.make_mask(length, window_size=window_size, return_array=True)
+            keys, values = cache.update_and_fetch(data, data)
+            mx.eval(mask, keys, values)
+            keys = np.array(keys)
+            masks = (
+                np.ones((length, keys.shape[2]), dtype=bool)
+                if mask is None
+                else np.array(mask)
+            )
+            masks = np.broadcast_to(masks, (len(positions), 1, length, keys.shape[2]))
+            for row in range(len(positions)):
+                for col in range(length):
+                    position = int(p[row, col])
+                    if position < 0:
+                        continue
+                    if lengths is not None and position >= lengths[row]:
+                        continue
+                    expected = set(range(min(position + 1, keep)))
+                    expected.update(
+                        range(
+                            max(
+                                keep,
+                                position
+                                - min(
+                                    window_size or cache.max_size,
+                                    cache.max_size - keep,
+                                )
+                                + 1,
+                            ),
+                            position + 1,
+                        )
+                    )
+                    visible = keys[row, 0, :, 0][masks[row, 0, col]]
+                    self.assertEqual(len(visible), len(expected))
+                    self.assertEqual(set(visible), expected)
+            positions += length
+        return positions
+
+    def test_batched_prefix_survives_chunking_and_cache_lifecycle(self):
+        from mlx_vlm.models.cache import BatchPrefixKVCache
+
+        for padding in ([0, 0], [0, 3], [0, 9]):
+            for chunks in ([1] * 25, [5, 3, 2, 15], [20, 1, 4]):
+                with self.subTest(padding=padding, chunks=chunks):
+                    cache = BatchPrefixKVCache(8, padding, keep=2)
+                    positions = self.assert_visible_tokens(cache, chunks)
+                    snapshot = tree_map(
+                        lambda x: (
+                            mx.array(np.array(x)) if isinstance(x, mx.array) else x
+                        ),
+                        cache.state,
+                    )
+                    restored = BatchPrefixKVCache.from_state(snapshot, cache.meta_state)
+                    self.assert_visible_tokens(restored, [1, 3], positions.copy())
+                    merged = BatchPrefixKVCache.merge(
+                        [cache.extract(i) for i in range(2)]
+                    )
+                    self.assert_visible_tokens(merged, [1, 3], positions.copy())
+                    cache.filter([1, 0])
+                    self.assert_visible_tokens(cache, [1, 3], positions[::-1].copy())
+
+    def test_explicit_attention_window_keeps_the_fixed_prefix(self):
+        from mlx_vlm.models.cache import BatchPrefixKVCache, RotatingKVCache
+
+        for chunks in ([1] * 25, [3, 5, 17]):
+            for cache in (
+                RotatingKVCache(8, keep=4),
+                BatchPrefixKVCache(8, [0], keep=4),
+            ):
+                self.assert_visible_tokens(cache, chunks, window_size=2)
+
+    def test_attention_window_cannot_exceed_retained_history(self):
+        from mlx_vlm.models.cache import (
+            BatchPrefixKVCache,
+            BatchRotatingKVCache,
+            RotatingKVCache,
+        )
+
+        for capacity, keep in ((2, 0), (2, 1), (8, 0), (8, 4)):
+            for chunks in ([1] * 25, [4, 7, 14]):
+                for window in (1, capacity, capacity * 2):
+                    with self.subTest(
+                        capacity=capacity, keep=keep, chunks=chunks, window=window
+                    ):
+                        batched = (
+                            BatchPrefixKVCache(capacity, [0], keep)
+                            if keep
+                            else BatchRotatingKVCache(capacity, [0])
+                        )
+                        for cache in (RotatingKVCache(capacity, keep), batched):
+                            self.assert_visible_tokens(
+                                cache, chunks, window_size=window
+                            )
+
+    def test_padded_prefill_mask_matches_concat_layout(self):
+        from mlx_vlm.models.cache import BatchPrefixKVCache, BatchRotatingKVCache
+
+        for keep in (0, 2, 4):
+            for window in (None, 2, 16):
+                for warm_chunks in ([], [11, 1]):
+                    for chunks in ([1] * 20, [5, 7, 7, 1]):
+                        with self.subTest(
+                            keep=keep, window=window, warm=warm_chunks, chunks=chunks
+                        ):
+                            cache = (
+                                BatchPrefixKVCache(8, [0, 0], keep)
+                                if keep
+                                else BatchRotatingKVCache(8, [0, 0])
+                            )
+                            positions = self.assert_visible_tokens(
+                                cache, warm_chunks, window_size=window
+                            )
+                            lengths = positions + np.array([5, 20])
+                            cache.prepare(lengths=[5, 20], right_padding=[15, 0])
+                            self.assert_visible_tokens(
+                                cache,
+                                chunks,
+                                positions.copy(),
+                                window_size=window,
+                                lengths=lengths,
+                            )
+                            cache.finalize()
+                            np.testing.assert_array_equal(
+                                np.array(cache.offset), lengths
+                            )
+                            self.assert_visible_tokens(
+                                cache, [1, 3], lengths.copy(), window_size=window
+                            )
+
+    def test_batch_generation_receives_the_requested_limit(self):
+        from mlx_vlm.generate.ar import BatchGenerator
+        from mlx_vlm.models.gemma3.config import TextConfig
+        from mlx_vlm.models.gemma3.language import LanguageModel
+        from mlx_vlm.tests.test_generate import MockTokenizer
+
+        class RecordingModel(LanguageModel):
+            def __call__(self, *args, cache=None, **kwargs):
+                self.seen_cache = cache
+                return super().__call__(*args, cache=cache, **kwargs)
+
+        config = TextConfig(
+            model_type="gemma3_text",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            vocab_size=64,
+            sliding_window_pattern=1,
+        )
+        model = RecordingModel(config)
+        model.eval()
+        for batch_size in (1, 2):
+            with self.subTest(batch_size=batch_size):
+                generator = BatchGenerator(
+                    model,
+                    MockTokenizer(),
+                    max_kv_size=8,
+                    prefill_batch_size=batch_size,
+                    completion_batch_size=batch_size,
+                    prefill_step_size=5,
+                )
+                try:
+                    prompts = [list(range(3, 23 - i)) for i in range(batch_size)]
+                    prompt_kwargs = [
+                        {"inputs_embeds": model.model.embed_tokens(mx.array([ids]))}
+                        for ids in prompts
+                    ]
+                    generator.insert(prompts, max_tokens=3, prompt_kwargs=prompt_kwargs)
+                    while generator.has_work:
+                        generator.next()
+                    for cache in model.seen_cache:
+                        self.assertEqual(cache.max_size, 8)
+                        self.assertEqual(cache.keep, 4)
+                        self.assertLessEqual(cache.size(), 8)
+                finally:
+                    generator.close()
+
+    def test_right_padding_and_new_rows_preserve_prefix_tokens(self):
+        from mlx_vlm.models.cache import BatchPrefixKVCache
+
+        for chunks in ([12], [4, 4, 4], [5, 3, 3, 1]):
+            cache = BatchPrefixKVCache(8, [0, 0], keep=2)
+            cache.prepare(lengths=[4, 12], right_padding=[8, 0])
+            processed = 0
+            for length in chunks:
+                data = np.broadcast_to(
+                    np.arange(processed, processed + length)[None], (2, length)
+                ).copy()
+                data[0, data[0] >= 4] = -100
+                values = mx.array(data[:, None, :, None], dtype=mx.float32)
+                mx.eval(cache.update_and_fetch(values, values))
+                processed += length
+            cache.finalize()
+            self.assert_visible_tokens(cache, [1, 3], np.array([4, 12]))
+        first = BatchPrefixKVCache(8, [0], keep=2)
+        second = BatchPrefixKVCache(8, [0], keep=2)
+        a = self.assert_visible_tokens(first, [12])
+        b = self.assert_visible_tokens(second, [3])
+        first.extend(second)
+        self.assert_visible_tokens(first, [1, 3], np.concatenate([a, b]))
+
+    def test_single_and_batched_bounded_attention_agree(self):
+        from mlx_vlm.generate.ar import _make_cache
+        from mlx_vlm.models.cache import make_prompt_cache
+        from mlx_vlm.models.gemma3.config import TextConfig
+        from mlx_vlm.models.gemma3.language import LanguageModel
+
+        mx.random.seed(42)
+        config = TextConfig(
+            model_type="gemma3_text",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            vocab_size=64,
+            sliding_window=16,
+            sliding_window_pattern=2,
+        )
+        model = LanguageModel(config)
+        model.eval()
+        ids = mx.array([list(range(3, 28)), list(range(5, 30))])
+        refs = []
+        for row in range(2):
+            cache = make_prompt_cache(model, max_kv_size=8)
+            refs.append(
+                mx.concatenate(
+                    [
+                        model(ids[row : row + 1, t : t + 1], cache=cache).logits
+                        for t in range(25)
+                    ],
+                    axis=1,
+                )
+            )
+        expected = mx.concatenate(refs, axis=0)
+        mx.eval(expected)
+        for chunks in ([25], [5, 7, 13], [1] * 25):
+            with self.subTest(chunks=chunks):
+                cache = _make_cache(model, [0, 0], max_kv_size=8)
+                actual = []
+                offset = 0
+                for length in chunks:
+                    actual.append(
+                        model(ids[:, offset : offset + length], cache=cache).logits
+                    )
+                    offset += length
+                actual = mx.concatenate(actual, axis=1)
+                mx.eval(actual)
+                np.testing.assert_allclose(
+                    np.array(actual), np.array(expected), atol=2e-3, rtol=2e-3
+                )
+
+    def test_apc_uses_bounded_layout_and_separates_limit_policies(self):
+        from mlx_vlm.apc import APCManager, snapshot_prompt_cache_row
+        from mlx_vlm.apc_coordinator import APCCoordinator
+        from mlx_vlm.models.cache import BatchPrefixKVCache, KVCache
+
+        model = SimpleNamespace(make_cache=lambda: [KVCache()])
+        manager = APCManager(num_blocks=8, block_size=4)
+        bounded = APCCoordinator(manager, model, max_kv_size=8)
+        other = APCCoordinator(manager, model, max_kv_size=16)
+        default = APCCoordinator(manager, model)
+        self.assertTrue(bounded.is_checkpoint)
+        self.assertEqual(bounded.fresh_cache()[0].max_size, 8)
+        self.assertEqual(default.scope_hash(7), 7)
+        self.assertNotEqual(bounded.scope_hash(7), other.scope_hash(7))
+        cache = BatchPrefixKVCache(8, [0, 0], keep=4)
+        positions = self.assert_visible_tokens(cache, [20, 1])
+        rows = [snapshot_prompt_cache_row([cache], batch_idx=i) for i in range(2)]
+        self.assertTrue(all(row is not None for row in rows))
+        merged, _ = bounded.merge_rows([{"warm_cache": row} for row in rows], [21, 21])
+        self.assertIsInstance(merged[0], BatchPrefixKVCache)
+        self.assert_visible_tokens(merged[0], [1, 3], positions)
+
+    def test_prefix_cache_restores_empty_partial_and_rotated_states(self):
+        from mlx_vlm.models.cache import BatchPrefixKVCache, BatchRotatingKVCache
+
+        for length in (0, 1, 3, 7, 8, 9):
+            with self.subTest(length=length):
+                cache = BatchPrefixKVCache(8, [0, 2], keep=4)
+                positions = self.assert_visible_tokens(cache, [1] * length)
+                restored = BatchPrefixKVCache.from_state(cache.state, cache.meta_state)
+                self.assertEqual(restored.tail.rotated, cache.tail.rotated)
+                self.assert_visible_tokens(restored, [1, 4], positions.copy())
+        cache = BatchPrefixKVCache(8, [0, 0], keep=4)
+        positions = self.assert_visible_tokens(cache, [3])
+        merged = BatchRotatingKVCache.merge([cache.extract(i) for i in range(2)])
+        self.assertIsInstance(merged, BatchPrefixKVCache)
+        self.assert_visible_tokens(merged, [1, 8], positions)
+
+    def test_qwen35_ragged_prefill_respects_bounded_mask_and_cache_type(self):
+        from unittest.mock import patch
+
+        from mlx_vlm.generate.ar import _make_cache
+        from mlx_vlm.models.cache import BatchPrefixKVCache, make_prompt_cache
+        from mlx_vlm.models.qwen3_5.config import TextConfig
+        from mlx_vlm.models.qwen3_5.language import LanguageModel
+
+        mx.random.seed(7)
+        model = LanguageModel(
+            TextConfig(
+                model_type="qwen3_5_text",
+                hidden_size=32,
+                intermediate_size=64,
+                linear_num_value_heads=2,
+                linear_num_key_heads=2,
+                linear_key_head_dim=32,
+                linear_value_head_dim=32,
+                linear_conv_kernel_dim=4,
+                num_hidden_layers=4,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                head_dim=32,
+                rms_norm_eps=1e-5,
+                vocab_size=64,
+                max_position_embeddings=256,
+                rope_parameters={
+                    "type": "default",
+                    "mrope_section": [1, 1, 2],
+                    "rope_theta": 100000,
+                    "partial_rotary_factor": 0.25,
+                },
+            )
+        )
+        model.eval()
+        for padding in (3, 11):
+            ids = mx.array([list(range(3, 35)), list(range(4, 36))])
+            cache = _make_cache(model, [padding, 0], max_kv_size=8)
+            for start in range(0, 32, 8):
+                actual = model.model(ids[:, start : start + 8], cache=cache)
+                mx.eval(actual)
+            references = []
+            for row, pad in enumerate((padding, 0)):
+                row_cache = make_prompt_cache(model, max_kv_size=8)
+                for start in range(pad, 32):
+                    expected = model.model(
+                        ids[row : row + 1, start : start + 1], cache=row_cache
+                    )
+                    mx.eval(expected)
+                references.append(expected)
+            np.testing.assert_allclose(
+                np.array(actual[:, -1:]),
+                np.array(mx.concatenate(references)),
+                atol=2e-3,
+                rtol=2e-3,
+            )
+            self.assertIsInstance(cache[3], BatchPrefixKVCache)
+            self.assertEqual(cache[3].offset.tolist(), [32 - padding, 32])
+            model._rope_deltas = mx.zeros((1, 1), dtype=mx.int32)
+            with patch.object(
+                type(model.model), "__call__", return_value=mx.zeros((1, 1, 32))
+            ) as forward:
+                model(ids[:1, :1], cache=row_cache)
+            np.testing.assert_array_equal(
+                np.array(forward.call_args.kwargs["position_ids"]), [[32]]
+            )
+
+    def test_apc_checkpoint_reuse_preserves_the_requested_history(self):
+        from mlx_vlm.apc import APCManager
+        from mlx_vlm.apc_coordinator import APCCoordinator
+        from mlx_vlm.models.cache import KVCache
+
+        model = SimpleNamespace(make_cache=lambda: [KVCache()])
+        manager = APCManager(num_blocks=8, block_size=4)
+        coordinator = APCCoordinator(manager, model, max_kv_size=8)
+        cache = coordinator.fresh_cache()
+        positions = self.assert_visible_tokens(cache[0], [20], np.array([0]))
+        scope = coordinator.scope_hash(0)
+        self.assertTrue(
+            coordinator.store_checkpoint(list(range(20)), cache, extra_hash=scope)
+        )
+        lookup_kwargs = dict(
+            safe_lookup_min=0,
+            suffix_is_text_only=lambda _: True,
+            prefix_has_media=lambda _: False,
+        )
+        hit = coordinator.lookup(list(range(23)), extra_hash=scope, **lookup_kwargs)
+        self.assertIsNotNone(hit)
+        restored = coordinator.materialize_single(hit, min_capacity_tokens=24)
+        self.assert_visible_tokens(restored[0], [1, 3], positions)
+        other = APCCoordinator(manager, model, max_kv_size=16)
+        self.assertIsNone(
+            other.lookup(
+                list(range(23)), extra_hash=other.scope_hash(0), **lookup_kwargs
+            )
+        )
+
+
 class TestQuantizedKVCacheMask(unittest.TestCase):
     """Mask-length checks must handle quantized KV caches, whose
     ``update_and_fetch`` returns packed tuples instead of arrays (#1481)."""

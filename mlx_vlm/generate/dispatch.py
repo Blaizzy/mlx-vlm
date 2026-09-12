@@ -922,7 +922,9 @@ def stream_generate(
         )
 
     if apc_manager is not None:
-        apc_coordinator = _apc.APCCoordinator(apc_manager, model.language_model)
+        apc_coordinator = _apc.APCCoordinator(
+            apc_manager, model.language_model, max_kv_size=kwargs.get("max_kv_size")
+        )
         if not apc_coordinator.enabled:
             apc_coordinator = None
             apc_manager = None
@@ -946,7 +948,13 @@ def stream_generate(
             processor=processor,
         )
 
-    if prompt_cache_state is not None and prompt_cache_state.cache is not None:
+        apc_extra_hash = apc_coordinator.scope_hash(apc_extra_hash)
+
+    if (
+        prompt_cache_state is not None
+        and prompt_cache_state.cache is not None
+        and prompt_cache_state.max_kv_size == kwargs.get("max_kv_size")
+    ):
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
         kv_cache = prompt_cache_state.cache
         # None => a cache can't be trimmed back to the shared prefix (wrapped
@@ -1158,7 +1166,9 @@ def stream_generate(
             all_ids = full_input_ids_list + [
                 t.item() if hasattr(t, "item") else t for t in generated_tokens
             ]
-            prompt_cache_state.update(all_ids, tracked_cache)
+            prompt_cache_state.update(
+                all_ids, tracked_cache, max_kv_size=kwargs.get("max_kv_size")
+            )
 
         # APC: harvest new blocks from the post-generation KV state.
         if apc_coordinator is not None and not apc_coordinator.is_checkpoint:
