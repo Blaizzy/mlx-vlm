@@ -58,6 +58,8 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
+        if isinstance(mask, mx.array) and mask.dtype != mx.bool_:
+            mask = mask.astype(queries.dtype)
         output = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
         )
@@ -121,6 +123,14 @@ class LanguageModel(nn.Module):
         self.model = TextModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=True)
 
+    def chunked_prefill_policy(
+        self, *, prefill_kwargs=None, draft_model=None, **kwargs
+    ):
+        # Image-prefix tokens attend to future tokens within the same prefix.
+        return (prefill_kwargs or {}).get(
+            "attention_mask_4d"
+        ) is None and draft_model is None
+
     def __call__(
         self,
         inputs: mx.array,
@@ -129,8 +139,20 @@ class LanguageModel(nn.Module):
         cache=None,
         **kwargs,
     ):
+        full_mask = kwargs.get("attention_mask_4d")
+        if mask is None and full_mask is not None:
+            c = cache[0] if cache else None
+            offset = getattr(c, "_idx", getattr(c, "offset", 0))
+            length = (
+                inputs_embeds.shape[1] if inputs_embeds is not None else inputs.shape[1]
+            )
+            if offset < full_mask.shape[-2]:
+                mask = full_mask[..., offset : offset + length, : offset + length]
         out = self.model(inputs, inputs_embeds=inputs_embeds, mask=mask, cache=cache)
         return LanguageModelOutput(logits=self.lm_head(out))
+
+    def make_cache(self):
+        return [KVCache() for _ in self.model.layers]
 
     @property
     def layers(self):

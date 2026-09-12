@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 
 import mlx.core as mx
@@ -132,12 +133,12 @@ class VisionModel(nn.Module):
 
         pooled = mx.zeros((grid_size, grid_size, D), dtype=full_grid.dtype)
         for i in range(grid_size):
-            h_start = int(round(i * pool_h))
-            h_end = int(round((i + 1) * pool_h))
+            h_start = math.floor(i * pool_h)
+            h_end = math.ceil((i + 1) * pool_h)
             h_end = max(h_end, h_start + 1)
             for j in range(grid_size):
-                w_start = int(round(j * pool_w))
-                w_end = int(round((j + 1) * pool_w))
+                w_start = math.floor(j * pool_w)
+                w_end = math.ceil((j + 1) * pool_w)
                 w_end = max(w_end, w_start + 1)
                 pooled[i, j] = full_grid[h_start:h_end, w_start:w_end].mean(axis=(0, 1))
 

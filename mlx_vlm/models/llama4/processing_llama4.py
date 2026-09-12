@@ -169,10 +169,10 @@ class Llama4Processor(ProcessorMixin):
         import json
         from pathlib import Path
 
-        from transformers import AutoTokenizer
+        from transformers import PreTrainedTokenizerFast
 
         kwargs.pop("use_fast", None)
-        tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)

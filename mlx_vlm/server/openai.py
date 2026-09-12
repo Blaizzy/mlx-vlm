@@ -1,6 +1,4 @@
 import asyncio
-import base64
-import binascii
 import gc
 import json
 import logging
@@ -9,9 +7,8 @@ import re
 import time
 import uuid
 from datetime import datetime
-from io import BytesIO
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import HTTPException, Request
@@ -22,11 +19,9 @@ from ..generate.edit_image import ImageEditRequest as CoreImageEditRequest
 from ..generate.edit_image import edit_image
 from ..generate.image import ImageGenerationRequest as CoreImageGenerationRequest
 from ..generate.image import generate_image, parse_size
-from ..generate.video import resolve_video_inputs
-from ..prompt_utils import apply_chat_template, extract_text_from_content
+from ..prompt_utils import apply_chat_template
 from ..tools import (
     _infer_tool_parser_from_processor,
-    _prepare_chat_tool_choice,
     load_tool_module,
     process_tool_calls,
 )
@@ -37,13 +32,16 @@ from .generation import (
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
+from .request_preparation import (
+    normalize_chat_input,
+    normalize_responses_input,
+    prepare_prompt,
+)
 from .responses_state import (
     ToolCallStreamState,
     _normalize_response_input,
     _response_chain_items,
-    _response_items_to_chat,
     _response_output_items_from_text,
-    _response_tool_registry,
 )
 from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
@@ -70,7 +68,6 @@ from .schemas import (
     ImageGenerationRequest,
     ImageGenerationResponse,
     ImageGenerationResponseData,
-    InputAudio,
     MessageItem,
     OpenAIRequest,
     OpenAIResponse,
@@ -98,69 +95,6 @@ _preflight_stream_context_budget = None
 _split_thinking = None
 _count_thinking_tag_tokens = None
 _make_logprob_content = None
-_AUDIO_REFERENCE_PREFIXES = ("http://", "https://", "file://", "/", "./", "../")
-_AUDIO_REFERENCE_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".webm")
-_MISSING_INPUT_DETAIL = (
-    "Request must include at least one non-empty message content or media input."
-)
-
-
-def _has_non_empty_text(value: Any) -> bool:
-    return isinstance(value, str) and bool(value.strip())
-
-
-def _content_has_effective_input(content: Any) -> bool:
-    if _has_non_empty_text(content):
-        return True
-    if content is None:
-        return False
-    if isinstance(content, list):
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            item_type = item.get("type")
-            if item_type in ("text", "input_text", "output_text"):
-                if _has_non_empty_text(item.get("text")) or _has_non_empty_text(
-                    item.get("content")
-                ):
-                    return True
-            elif item_type in ("image_url", "input_image"):
-                image = item.get("image_url") or item.get("file_id")
-                if isinstance(image, dict):
-                    image = image.get("url")
-                if image:
-                    return True
-            elif item_type == "input_audio":
-                input_audio = item.get("input_audio")
-                if isinstance(input_audio, dict) and input_audio.get("data"):
-                    return True
-            elif _content_has_effective_input(item.get("content")):
-                return True
-        return False
-    if isinstance(content, dict):
-        return _content_has_effective_input([content])
-    return bool(str(content).strip())
-
-
-def _message_has_effective_input(message: Any) -> bool:
-    if hasattr(message, "model_dump"):
-        message = message.model_dump(exclude_none=True)
-    if not isinstance(message, dict):
-        return False
-    return (
-        _content_has_effective_input(message.get("content"))
-        or bool(message.get("tool_calls"))
-        or _has_non_empty_text(message.get("reasoning_content"))
-        or _has_non_empty_text(message.get("reasoning"))
-    )
-
-
-def _ensure_effective_input(messages, *, images=None, audio=None):
-    if any(image for image in (images or [])) or any(item for item in (audio or [])):
-        return
-    if any(_message_has_effective_input(message) for message in messages or []):
-        return
-    raise HTTPException(status_code=400, detail=_MISSING_INPUT_DETAIL)
 
 
 def _runtime_cache_get(key, default=None, *, kind=None):
@@ -171,87 +105,12 @@ def _runtime_cache_get(key, default=None, *, kind=None):
         return cache.get(key, default)
 
 
-def _looks_like_audio_reference(value: str) -> bool:
-    return value.startswith(_AUDIO_REFERENCE_PREFIXES) or value.lower().endswith(
-        _AUDIO_REFERENCE_SUFFIXES
-    )
-
-
 def _adapter_path_or_inherit(request):
     return (
         request.adapter_path
         if "adapter_path" in request.model_fields_set
         else _INHERIT_ADAPTER
     )
-
-
-def _normalize_response_instruction_messages(
-    chat_messages: List[dict],
-    instructions: Optional[str],
-) -> Optional[str]:
-    instruction_parts = [instructions] if instructions else []
-    conversation = []
-
-    for message in chat_messages:
-        if message.get("role") in ("system", "developer"):
-            content = message.get("content")
-            if content:
-                instruction_parts.append(str(content))
-        else:
-            conversation.append(message)
-
-    normalized_instructions = "\n\n".join(instruction_parts) or None
-    if normalized_instructions:
-        conversation.insert(
-            0,
-            {"role": "system", "content": normalized_instructions},
-        )
-    chat_messages[:] = conversation
-    return normalized_instructions
-
-
-def _decode_input_audio_data(input_audio: InputAudio):
-    data = input_audio["data"]
-    if not isinstance(data, str):
-        return data
-
-    stripped = data.strip()
-    if stripped.startswith("data:"):
-        prefix, separator, encoded = stripped.partition(",")
-        if (
-            separator == ","
-            and ";base64" in prefix
-            and prefix.startswith("data:audio/")
-        ):
-            try:
-                return BytesIO(base64.b64decode(encoded, validate=True))
-            except (binascii.Error, ValueError) as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail="input_audio data URI is not valid base64 audio",
-                ) from exc
-        return data
-
-    if _looks_like_audio_reference(stripped):
-        return data
-
-    try:
-        return BytesIO(base64.b64decode(stripped, validate=True))
-    except (binascii.Error, ValueError):
-        return data
-
-
-def _extract_video_reference(item):
-    item_type = item.get("type")
-    if item_type == "video":
-        return item.get("video")
-    if item_type == "input_video":
-        video = item.get("video") or item.get("video_url")
-    elif item_type == "video_url":
-        video = item.get("video_url")
-    else:
-        return None
-    return video.get("url") if isinstance(video, dict) else video
 
 
 def _final_chat_chunk(
@@ -708,45 +567,36 @@ async def responses_input_tokens_endpoint(request: Request):
             _response_chain_items(openai_request.previous_response_id)
             + current_input_items
         )
-        chat_messages, images = _response_items_to_chat(prompt_items)
-        _normalize_response_instruction_messages(
-            chat_messages,
-            openai_request.instructions,
-        )
-        _ensure_effective_input(chat_messages, images=images)
-
+        source, _, _ = normalize_responses_input(openai_request, prompt_items)
         model, processor, config = get_cached_model(
             openai_request.model, _adapter_path_or_inherit(openai_request)
         )
         del model
-        chat_tools, _ = _response_tool_registry(openai_request.tools)
         gen_args = _build_gen_args(
             openai_request, processor, tenant_id=_read_tenant_id(request)
         )
-        template_kwargs = gen_args.to_template_kwargs()
-        if openai_request.tool_choice is not None:
-            template_kwargs["tool_choice"] = openai_request.tool_choice
-        formatted_prompt = apply_chat_template(
-            processor,
-            config,
-            chat_messages,
-            num_images=len(images),
-            tools=chat_tools or None,
-            **template_kwargs,
+        prepared = prepare_prompt(
+            source, processor, config, gen_args, render=apply_chat_template
         )
+        formatted_prompt, images = prepared.prompt, prepared.images
+        audio, videos = prepared.audio, prepared.videos
         if runtime.response_generator is not None:
             raw_inputs = await asyncio.to_thread(
                 runtime.response_generator._cpu_preprocess,
                 formatted_prompt,
                 images if images else None,
-                None,
+                audio if audio else None,
+                **({"videos": videos} if videos else {}),
             )
         else:
             image_token_index = getattr(config, "image_token_index", None)
             raw_inputs = prepare_inputs(
                 processor,
                 images=images if images else None,
+                audio=audio if audio else None,
+                videos=videos if videos else None,
                 prompts=formatted_prompt,
+                **prepared.generation_kwargs,
                 image_token_index=image_token_index,
             )
         return {"input_tokens": _count_prompt_tokens(raw_inputs)}
@@ -858,8 +708,6 @@ async def responses_endpoint(request: Request):
     openai_request = OpenAIRequest(**body)
 
     try:
-        kwargs = {}
-
         if openai_request.input is None:
             logger.warning("Responses request is missing input.")
             raise HTTPException(status_code=400, detail="Missing input.")
@@ -869,19 +717,13 @@ async def responses_endpoint(request: Request):
             _response_chain_items(openai_request.previous_response_id)
             + current_input_items
         )
-        chat_messages, images = _response_items_to_chat(prompt_items)
-        instructions = _normalize_response_instruction_messages(
-            chat_messages,
-            openai_request.instructions,
+        source, instructions, tool_registry = normalize_responses_input(
+            openai_request, prompt_items
         )
-        _ensure_effective_input(chat_messages, images=images)
-
-        # Get model, processor, config - loading if necessary
         model, processor, config = get_cached_model(
             openai_request.model, _adapter_path_or_inherit(openai_request)
         )
-
-        chat_tools, tool_registry = _response_tool_registry(openai_request.tools)
+        chat_tools = source.tools
         tool_parser_type = _infer_tool_parser_from_processor(
             processor, override=openai_request.tool_parser
         )
@@ -896,18 +738,12 @@ async def responses_endpoint(request: Request):
         if chat_tools and tool_module is not None:
             gen_args.skip_special_tokens = False
 
-        template_kwargs = gen_args.to_template_kwargs()
-        if openai_request.tool_choice is not None:
-            template_kwargs["tool_choice"] = openai_request.tool_choice
-
-        formatted_prompt = apply_chat_template(
-            processor,
-            config,
-            chat_messages,
-            num_images=len(images),
-            tools=chat_tools or None,
-            **template_kwargs,
+        prepared = prepare_prompt(
+            source, processor, config, gen_args, render=apply_chat_template
         )
+        formatted_prompt, images = prepared.prompt, prepared.images
+        audio, videos = prepared.audio, prepared.videos
+        kwargs = prepared.generation_kwargs
 
         logger.debug(
             "responses request: model=%s images=%d max_tokens=%s temp=%s stream=%s",
@@ -934,7 +770,8 @@ async def responses_endpoint(request: Request):
                 model=openai_request.model,
                 prompt=formatted_prompt,
                 images=images if images else None,
-                audio=None,
+                audio=audio if audio else None,
+                videos=videos if videos else None,
                 args=gen_args,
             )
 
@@ -1024,8 +861,9 @@ async def responses_endpoint(request: Request):
                             runtime.response_generator.generate,
                             formatted_prompt,
                             images if images else None,
-                            None,  # audio
+                            audio if audio else None,
                             gen_args,
+                            **({"videos": videos} if videos else {}),
                         )
                         usage_stats["input_tokens"] = ctx.prompt_tokens
 
@@ -1085,6 +923,8 @@ async def responses_endpoint(request: Request):
                             processor=processor,
                             prompt=formatted_prompt,
                             image=images,
+                            audio=audio,
+                            video=videos,
                             vision_cache=runtime.model_cache.get("vision_cache"),
                             apc_manager=runtime.apc_manager,
                             **gen_args.to_generate_kwargs(),
@@ -1343,7 +1183,9 @@ async def responses_endpoint(request: Request):
                         ctx_, ti = runtime.response_generator.generate(
                             prompt=formatted_prompt,
                             images=images if images else None,
+                            audio=audio if audio else None,
                             args=gen_args,
+                            **({"videos": videos} if videos else {}),
                         )
                         text = ""
                         ot = 0
@@ -1374,6 +1216,8 @@ async def responses_endpoint(request: Request):
                         processor=processor,
                         prompt=formatted_prompt,
                         image=images,
+                        audio=audio,
+                        video=videos,
                         verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=runtime.model_cache.get("vision_cache"),
                         apc_manager=runtime.apc_manager,
@@ -1514,109 +1358,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
     request_start = time.perf_counter()
     try:
-        adapter_path = (
-            request.adapter_path
-            if "adapter_path" in request.model_fields_set
-            else _INHERIT_ADAPTER
+        source = normalize_chat_input(request)
+        model, processor, config = get_cached_model(
+            request.model, _adapter_path_or_inherit(request)
         )
-
-        kwargs = {}
-
-        if request.resize_shape is not None:
-            if len(request.resize_shape) not in [1, 2]:
-                raise HTTPException(
-                    status_code=400,
-                    detail="resize_shape must contain exactly two integers (height, width)",
-                )
-            kwargs["resize_shape"] = (
-                (request.resize_shape[0],) * 2
-                if len(request.resize_shape) == 1
-                else tuple(request.resize_shape)
-            )
-
-        images = []
-        audio = []
-        videos = []
-        processed_messages = []
-        for message in request.messages:
-            msg = {"role": message.role}
-
-            if isinstance(message.content, str):
-                msg["content"] = message.content
-            elif isinstance(message.content, list):
-                if message.role == "user":
-                    for item in message.content:
-                        if not isinstance(item, dict):
-                            continue
-                        item_type = item.get("type")
-                        if item_type == "input_image":
-                            images.append(item["image_url"])
-                        elif item_type == "image_url":
-                            images.append(item["image_url"]["url"])
-                        elif item_type == "input_audio":
-                            audio.append(_decode_input_audio_data(item["input_audio"]))
-                        elif item_type in ("input_video", "video_url", "video"):
-                            video = _extract_video_reference(item)
-                            if video:
-                                videos.append(video)
-                msg["content"] = extract_text_from_content(message.content)
-            else:
-                msg["content"] = message.content
-
-            # Preserve tool-calling metadata.
-            # Ensure arguments are dicts (not JSON strings) for Jinja templates
-            # that iterate them with |items (e.g. Qwen3.5).
-            if message.tool_calls is not None:
-                normalized_calls = []
-                for tc in message.tool_calls:
-                    tc = dict(tc) if isinstance(tc, dict) else tc
-                    if isinstance(tc, dict) and "function" in tc:
-                        fn = dict(tc["function"])
-                        args = fn.get("arguments", {})
-                        if isinstance(args, str):
-                            try:
-                                fn["arguments"] = json.loads(args)
-                            except (json.JSONDecodeError, TypeError):
-                                fn["arguments"] = {}
-                        tc["function"] = fn
-                    normalized_calls.append(tc)
-                msg["tool_calls"] = normalized_calls
-            if message.tool_call_id is not None:
-                msg["tool_call_id"] = message.tool_call_id
-            if message.name is not None:
-                msg["name"] = message.name
-            if message.reasoning_content is not None:
-                msg["reasoning_content"] = message.reasoning_content
-                msg["reasoning"] = message.reasoning_content
-
-            processed_messages.append(msg)
-
-        _ensure_effective_input(processed_messages, images=images, audio=audio)
-
-        processed_messages, tools, tool_choice = _prepare_chat_tool_choice(
-            processed_messages,
-            request.tools,
-            request.tool_choice,
-        )
-
-        model, processor, config = get_cached_model(request.model, adapter_path)
-
-        video_resolution = resolve_video_inputs(
-            processor,
-            videos,
-            images=images,
-            fps=2.0,
-            max_frames=16,
-        )
-        images, videos = video_resolution.images, video_resolution.videos
-        if video_resolution.used_fallback:
-            logger.info(
-                "Processor %s has no native video support; sending %d of %d "
-                "sampled frames as ordered images.",
-                processor.__class__.__name__,
-                video_resolution.selected_count,
-                video_resolution.sampled_count,
-            )
+        tools = source.tools
 
         # Detect tool parser from chat template
         tool_parser_type = _infer_tool_parser_from_processor(
@@ -1635,20 +1381,12 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
         if tools and tool_module is not None:
             gen_args.skip_special_tokens = False
 
-        template_kwargs = gen_args.to_template_kwargs()
-        if tool_choice is not None:
-            template_kwargs["tool_choice"] = tool_choice
-
-        formatted_prompt = apply_chat_template(
-            processor,
-            config,
-            processed_messages,
-            num_images=len(images),
-            num_audios=len(audio),
-            video=videos or None,
-            tools=tools,
-            **template_kwargs,
+        prepared = prepare_prompt(
+            source, processor, config, gen_args, render=apply_chat_template
         )
+        formatted_prompt = prepared.prompt
+        images, audio, videos = prepared.images, prepared.audio, prepared.videos
+        kwargs = prepared.generation_kwargs
 
         logger.debug(
             "chat/completions request: model=%s images=%d audio=%d videos=%d "

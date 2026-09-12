@@ -2,6 +2,7 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from ..base import InputEmbeddingsFeatures
 from . import processing_paligemma  # noqa: F401
@@ -76,7 +77,7 @@ class Model(nn.Module):
                 output_hidden_states=True,
             )
 
-            image_features = hidden_state[None, :].astype(pixel_values.dtype)
+            image_features = hidden_state.astype(pixel_values.dtype)
             image_features = self.multi_modal_projector(image_features)
 
         final_inputs_embeds, final_attention_mask_4d = (
@@ -91,50 +92,26 @@ class Model(nn.Module):
     def _prepare_inputs_for_multimodal(
         self, image_features, inputs_embeds, input_ids, attention_mask
     ):
-        _, _, embed_dim = image_features.shape
-
+        embed_dim = image_features.shape[-1]
         batch_size, sequence_length = input_ids.shape
         scaled_image_features = image_features / (self.config.hidden_size**0.5)
         final_embedding = mx.zeros((batch_size, sequence_length, embed_dim))
-
-        text_mask = (input_ids != self.config.image_token_index) & (
+        valid = (
             input_ids != self.config.pad_token_id
+            if attention_mask is None
+            else attention_mask.astype(mx.bool_)
         )
-        image_mask = input_ids == self.config.image_token_index
-        pad_mask = input_ids == self.config.pad_token_id
-
-        # expand masks to match embedding dimension
-        text_mask_expanded = mx.expand_dims(text_mask, -1)
-        text_mask_expanded = mx.repeat(text_mask_expanded, embed_dim, axis=-1)
-        pad_mask_expanded = mx.expand_dims(pad_mask, -1)
-        pad_mask_expanded = mx.repeat(pad_mask_expanded, embed_dim, axis=-1)
-
-        # insert padding and text token embeddings
-        final_embedding = mx.where(text_mask_expanded, inputs_embeds, final_embedding)
-        final_embedding = mx.where(
-            pad_mask_expanded, mx.zeros_like(final_embedding), final_embedding
+        final_embedding = mx.where(valid[..., None], inputs_embeds, final_embedding)
+        rows, columns = np.where(np.asarray(input_ids) == self.config.image_token_index)
+        features = scaled_image_features.reshape(-1, embed_dim)
+        if len(rows) != features.shape[0]:
+            raise ValueError("Image features do not match image placeholders")
+        final_embedding[mx.array(rows), mx.array(columns)] = features
+        allowed = valid[:, :, None] & valid[:, None, :]
+        allowed = mx.where(
+            valid[:, :, None], allowed, mx.eye(sequence_length, dtype=mx.bool_)[None]
         )
-        pad_size = final_embedding.shape[1] - scaled_image_features.shape[1]
-        scaled_image_features = mx.pad(
-            scaled_image_features, ((0, 0), (0, pad_size), (0, 0))
-        )
-        # insert image embeddings - the image mask is always less or equal to the sentence in length
-        image_mask_expanded = mx.expand_dims(image_mask, -1)
-        image_mask_expanded = mx.repeat(image_mask_expanded, embed_dim, axis=-1)
-        final_embedding = mx.where(
-            image_mask_expanded, scaled_image_features, final_embedding
-        )
-
-        final_embedding = mx.where(
-            pad_mask_expanded, mx.zeros_like(final_embedding), final_embedding
-        )
-
-        attention_mask_expanded_1 = mx.expand_dims(attention_mask, 1)
-        attention_mask_expanded_2 = mx.expand_dims(attention_mask, 2)
-        final_attention_mask_4d = attention_mask_expanded_1 * attention_mask_expanded_2
-        final_attention_mask_4d = final_attention_mask_4d
-        final_attention_mask_4d = mx.expand_dims(final_attention_mask_4d, 1)
-        final_embedding = mx.array(final_embedding)
+        final_attention_mask_4d = allowed[:, None]
         return final_embedding, final_attention_mask_4d
 
     @property

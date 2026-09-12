@@ -82,11 +82,11 @@ class Attention(nn.Module):
             offset = int(cache._idx)
             offsets_per_seq = (
                 raw_offset
-                if isinstance(raw_offset, mx.array) and raw_offset.size > 1
+                if isinstance(raw_offset, mx.array) and raw_offset.ndim > 0
                 else None
             )
         elif isinstance(raw_offset, mx.array):
-            if raw_offset.size > 1:
+            if raw_offset.ndim > 0:
                 # Per-sequence offsets from BatchKVCache -- shape (B,).
                 offsets_per_seq = raw_offset
                 offset = int(raw_offset.max().item())
@@ -99,7 +99,7 @@ class Attention(nn.Module):
 
         if offsets_per_seq is not None:
             # Build per-sequence positions: (B, L) = offsets[:, None] + arange(L)
-            positions = offsets_per_seq[:, None] + mx.arange(L)
+            positions = mx.maximum(offsets_per_seq[:, None] + mx.arange(L), 0)
         else:
             positions = mx.arange(offset, offset + L)
         tau_q, tau_v = self.tau(qkv_out, positions)
@@ -120,7 +120,7 @@ class Attention(nn.Module):
         values = values * tau_v
 
         if cache is not None:
-            if offsets_per_seq is not None and B > 1:
+            if offsets_per_seq is not None:
                 # Per-row RoPE offsets for a batched cache. mx.fast.rope only
                 # accepts scalar offsets, so apply it one row at a time and
                 # stitch back.

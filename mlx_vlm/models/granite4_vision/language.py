@@ -159,7 +159,23 @@ class Granite(nn.Module):
                 h, cache[0] if cache and cache[0] is not None else cache
             )
 
-        prefill_offset = cache[0].offset if cache and cache[0] is not None else 0
+        if deepstack_visual_embeds is not None and visual_pos_masks is not None:
+            if not isinstance(deepstack_visual_embeds, mx.array):
+                deepstack_visual_embeds = mx.stack(deepstack_visual_embeds)
+            if deepstack_visual_embeds.ndim == 3:
+                deepstack_visual_embeds = deepstack_visual_embeds.transpose(1, 0, 2)[
+                    None
+                ]
+            if visual_pos_masks.shape[1] != h.shape[1]:
+                offset = cache[0].offset if cache and cache[0] is not None else 0
+                offsets = mx.array(offset).reshape(-1, 1)
+                positions = offsets + mx.arange(h.shape[1])[None]
+                visual_pos_masks = mx.take_along_axis(
+                    visual_pos_masks, positions, axis=1
+                )
+                deepstack_visual_embeds = mx.take_along_axis(
+                    deepstack_visual_embeds, positions[..., None, None], axis=1
+                )
 
         for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
             if (
@@ -169,14 +185,8 @@ class Granite(nn.Module):
             ):
                 for feat_idx, target_layer in enumerate(deepstack_target_layers):
                     if layer_idx == target_layer:
-                        seq_len = h.shape[1]
-                        pos_mask = visual_pos_masks[
-                            ..., prefill_offset : prefill_offset + seq_len
-                        ]
-                        features = deepstack_visual_embeds[feat_idx][
-                            prefill_offset : prefill_offset + seq_len
-                        ]
-                        h = mx.where(pos_mask[..., None], h + features, h)
+                        features = deepstack_visual_embeds[:, :, feat_idx, :]
+                        h = mx.where(visual_pos_masks[..., None], h + features, h)
 
             h = layer(h, mask, c)
 

@@ -1,8 +1,13 @@
+import hashlib
 import inspect
 import json
+import re
+from copy import deepcopy
 from enum import Enum
 from functools import partial
 from typing import Any, Dict, List, Union
+
+from jinja2.exceptions import TemplateError
 
 
 class MessageFormat(Enum):
@@ -108,10 +113,11 @@ MODEL_CONFIG = {
     "florence2": MessageFormat.PROMPT_ONLY,
     "plamo2vl": MessageFormat.PROMPT_ONLY,
     "molmo": MessageFormat.TEXT_ONLY,
+    "moondream1": MessageFormat.TEXT_ONLY,
     "moondream2": MessageFormat.PROMPT_ONLY,
-    "moondream3": MessageFormat.PROMPT_ONLY,
+    "moondream3": MessageFormat.TEXT_ONLY,
     "falcon_ocr": MessageFormat.PROMPT_ONLY,
-    "paligemma": MessageFormat.PROMPT_WITH_IMAGE_TOKEN,
+    "paligemma": MessageFormat.IMAGE_TOKEN,
     "laguna": MessageFormat.TEXT_ONLY,
     "nemotron_labs_diffusion": MessageFormat.TEXT_ONLY,
     "deepseek_v4": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -121,10 +127,7 @@ MODEL_CONFIG = {
 
 # Models that don't support multi-image
 SINGLE_IMAGE_ONLY_MODELS = {
-    "llava_next",
-    "llava-qwen2",
     "bunny-llama",
-    "paligemma",
     "multi_modality",
     "mllama",
     "falcon_ocr",
@@ -600,6 +603,258 @@ def get_message_json(
     )
 
 
+def _coalesce_leading_system_text(messages):
+    end = 0
+    texts = []
+    for message in messages:
+        if (
+            not isinstance(message, dict)
+            or set(message) != {"role", "content"}
+            or message["role"] != "system"
+        ):
+            break
+        content = message["content"]
+        if isinstance(content, list):
+            if not all(
+                isinstance(part, dict)
+                and (
+                    set(part) == {"type", "text"}
+                    or (
+                        set(part) == {"type", "text", "content"}
+                        and part["content"] == part["text"]
+                    )
+                )
+                and part["type"] == "text"
+                and isinstance(part["text"], str)
+                for part in content
+            ):
+                break
+            content = " ".join(part["text"] for part in content)
+        if not isinstance(content, str):
+            break
+        texts.append(content)
+        end += 1
+    if end < 2:
+        return messages
+    return [{"role": "system", "content": "\n\n".join(texts)}, *messages[end:]]
+
+
+def _string_content_messages(messages, image_token):
+    result = []
+    changed = False
+    for message in messages:
+        if not isinstance(message, dict):
+            return messages
+        content = message.get("content")
+        if not isinstance(content, list):
+            result.append(message)
+            continue
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part == {"type": "image"}:
+                parts.append(image_token)
+            elif (
+                isinstance(part, dict)
+                and part.get("type") == "text"
+                and isinstance(part.get("text"), str)
+                and (
+                    set(part) == {"type", "text"}
+                    or (
+                        set(part) == {"type", "text", "content"}
+                        and part["content"] == part["text"]
+                    )
+                )
+            ):
+                parts.append(part["text"])
+            else:
+                return messages
+        result.append({**message, "content": "\n".join(parts)})
+        changed = True
+    return result if changed else messages
+
+
+_CALL_ID_LENGTH = re.compile(r"\.(?:id|tool_call_id)\s*\|\s*length\s*!=\s*(\d+)")
+
+
+def _fixed_length_call_id(value, length):
+    return hashlib.sha256(str(value).encode()).hexdigest()[:length]
+
+
+def _template_tool_history(messages, template):
+    """Fit a tool history to templates with a stricter tool protocol.
+
+    Mistral-style templates reject call IDs that are not a fixed number of
+    alphanumeric characters, and render an assistant turn's tool calls instead
+    of its content. Remap the IDs to the required width, keeping each call
+    paired with its result, and carry the content in its own turn.
+    """
+    if not isinstance(template, str):
+        return messages
+    match = _CALL_ID_LENGTH.search(template)
+    length = int(match.group(1)) if match else None
+    split = "message.tool_calls" in template
+    if length is None and not split:
+        return messages
+
+    result = []
+    changed = False
+    for message in messages:
+        message = dict(message)
+        calls = message.get("tool_calls")
+        if length is not None:
+            if message.get("tool_call_id") is not None:
+                message["tool_call_id"] = _fixed_length_call_id(
+                    message["tool_call_id"], length
+                )
+                changed = True
+            if calls:
+                message["tool_calls"] = [
+                    (
+                        {**call, "id": _fixed_length_call_id(call["id"], length)}
+                        if call.get("id") is not None
+                        else call
+                    )
+                    for call in calls
+                ]
+                changed = True
+        if calls and split and message.get("content"):
+            result.append({k: v for k, v in message.items() if k != "tool_calls"})
+            message.pop("content")
+            changed = True
+        result.append(message)
+    return result if changed else messages
+
+
+_SUPPORTED_ROLES = re.compile(
+    r"only (?P<roles>[\w,\s]+?) roles? (?:are|is) supported", re.IGNORECASE
+)
+
+
+def _explicit_content(message):
+    """Content parts for a message whose role the template cannot express."""
+    metadata = {key: value for key, value in message.items() if key != "content"}
+    content = deepcopy(message.get("content") or [])
+    if isinstance(content, str):
+        content = [{"type": "text", "text": content}]
+    return [
+        {"type": "text", "text": json.dumps(metadata, ensure_ascii=False) + "\n"}
+    ] + content
+
+
+def _collapse_text_content(messages):
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list) and all(
+            part.get("type") == "text" for part in content
+        ):
+            message["content"] = "".join(part["text"] for part in content)
+    return messages
+
+
+def _supported_role_messages(messages, error_message, template=None, tools=None):
+    """Fold turns a template rejects into the roles it names as supported.
+
+    Templates that raise "Only <roles> roles are supported" state their own
+    contract. Turns outside it, and turns carrying fields the template never
+    reads, keep their original role and metadata as explicit text inside a role
+    the template does render, rather than being dropped on the way through.
+    """
+    rendered = template if isinstance(template, str) else ""
+    match = _SUPPORTED_ROLES.search(f"{error_message}\n{rendered}")
+    if not match:
+        return messages
+    roles = {
+        word
+        for word in re.split(r"[,\s]+", match.group("roles").replace(" and ", " "))
+        if word
+    }
+    if not roles:
+        return messages
+
+    fallback = "user" if "user" in roles else sorted(roles)[0]
+    result = []
+    changed = False
+    for message in messages:
+        role = message.get("role")
+        if role in roles and all(
+            field in rendered for field in set(message) - {"role", "content"}
+        ):
+            result.append(message)
+            continue
+        result.append(
+            {
+                "role": role if role in roles else fallback,
+                "content": _explicit_content(message),
+            }
+        )
+        changed = True
+    for index, message in enumerate(result):
+        if not tools or "tools" in rendered or message["role"] != fallback:
+            continue
+        content = message.get("content") or []
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        preamble = {
+            "type": "text",
+            "text": "Available tools: " + json.dumps(tools, ensure_ascii=False) + "\n",
+        }
+        result[index] = {**message, "content": [preamble] + list(content)}
+        changed = True
+        break
+    return _collapse_text_content(result) if changed else messages
+
+
+def _alternating_role_history(messages, template_processor, tools=None):
+    if "apply_chat_template" in type(template_processor).__dict__:
+        return messages
+    template = getattr(template_processor, "chat_template", None)
+    if not isinstance(template, str):
+        return messages
+    lowered = template.lower()
+    if "roles must alternate" not in lowered:
+        return messages
+    if any(field in template for field in ("tools", "tool_calls", "reasoning")):
+        return messages
+
+    ordinary = _coalesce_leading_system_text(messages)
+    if (
+        ordinary
+        and ordinary[0].get("role") == "system"
+        and "system" in lowered
+        and "system role not supported" not in lowered
+    ):
+        ordinary = ordinary[1:]
+    rich = tools or any(set(message) - {"role", "content"} for message in messages)
+    rich = rich or any(
+        message.get("role") != ("user" if index % 2 == 0 else "assistant")
+        for index, message in enumerate(ordinary)
+    )
+    if not rich:
+        return messages
+
+    result = []
+    for message in messages:
+        role = "assistant" if message.get("role") == "assistant" else "user"
+        content = _explicit_content(message)
+        if result and result[-1]["role"] == role:
+            result[-1]["content"] += [{"type": "text", "text": "\n"}] + content
+        else:
+            result.append({"role": role, "content": content})
+    if not result or result[0]["role"] != "user":
+        result.insert(0, {"role": "user", "content": []})
+    if tools:
+        result[0]["content"].insert(
+            0,
+            {
+                "type": "text",
+                "text": "Available tools: "
+                + json.dumps(tools, ensure_ascii=False)
+                + "\n",
+            },
+        )
+    return _collapse_text_content(result)
+
+
 def get_chat_template(
     processor,
     messages: List[Dict[str, Any]],
@@ -705,6 +960,7 @@ def get_chat_template(
             if isinstance(message, dict):
                 normalized.append(
                     {
+                        **message,
                         "role": message.get("role", "user"),
                         "content": _flatten_content(
                             message.get("content", ""), image_token, video_token
@@ -718,10 +974,19 @@ def get_chat_template(
         if not normalized:
             return ""
 
-        if len(normalized) == 1 and normalized[0]["role"] == "user":
+        if (
+            len(normalized) == 1
+            and normalized[0]["role"] == "user"
+            and len(normalized[0]) == 2
+            and not kwargs.get("tools")
+        ):
             return normalized[0]["content"]
 
         lines = []
+        if kwargs.get("tools"):
+            lines.append(
+                f"Available tools: {json.dumps(kwargs['tools'], ensure_ascii=False)}"
+            )
         for message in normalized:
             role = message.get("role", "user")
             content = message.get("content", "")
@@ -730,6 +995,15 @@ def get_chat_template(
                 lines.append(f"{prefix}: {content}" if content else f"{prefix}:")
             else:
                 lines.append(content if content else "")
+            metadata = {
+                key: value
+                for key, value in message.items()
+                if key not in ("role", "content")
+            }
+            if metadata:
+                lines.append(
+                    f"{role.capitalize()} metadata: {json.dumps(metadata, ensure_ascii=False)}"
+                )
 
         if add_generation_prompt:
             lines.append("Assistant:")
@@ -808,6 +1082,12 @@ def get_chat_template(
         if template_processor is None:
             return _messages_to_plain_prompt()
 
+        if chat_template_override is None:
+            messages = _alternating_role_history(
+                messages,
+                template_processor,
+                kwargs.get("tools"),
+            )
         template_kwargs = dict(kwargs)
         if "enable_thinking" not in template_kwargs and _supports_template_kw(
             template_processor, "enable_thinking"
@@ -827,6 +1107,34 @@ def get_chat_template(
                 add_generation_prompt=add_generation_prompt,
                 **template_kwargs,
             )
+        except (TypeError, TemplateError) as error:
+            template = getattr(template_processor, "chat_template", None)
+            normalized = messages
+            for normalize in (
+                _coalesce_leading_system_text,
+                partial(_template_tool_history, template=template),
+                partial(
+                    _supported_role_messages,
+                    error_message=error,
+                    template=template,
+                    tools=kwargs.get("tools"),
+                ),
+                partial(_string_content_messages, image_token=_get_image_token()),
+            ):
+                candidate = normalize(normalized)
+                if candidate is normalized:
+                    continue
+                normalized = candidate
+                try:
+                    return template_processor.apply_chat_template(
+                        normalized,
+                        tokenize=tokenize,
+                        add_generation_prompt=add_generation_prompt,
+                        **template_kwargs,
+                    )
+                except (TemplateError, TypeError, ValueError):
+                    continue
+            raise error
         except ValueError as e:
             if chat_template_override is None and _missing_template_error(e):
                 return _messages_to_plain_prompt()
@@ -1015,12 +1323,20 @@ def apply_chat_template(
                             **kwargs,
                         )
                     )
+                    if isinstance(p, dict) and isinstance(messages[-1], dict):
+                        messages[-1].update(
+                            {
+                                key: value
+                                for key, value in p.items()
+                                if key not in ("role", "content")
+                            }
+                        )
 
     if return_messages:
         return messages
 
     # Some models only need the last message
-    if model_type in ["paligemma", "florence2", "falcon_ocr"]:
+    if model_type in ["florence2", "falcon_ocr"]:
         return messages[-1]
 
     return get_chat_template(processor, messages, add_generation_prompt, **kwargs)

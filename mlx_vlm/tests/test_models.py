@@ -20039,3 +20039,2988 @@ class TestSpark2_5Model(unittest.TestCase):
         weights = {"model.embedding.weight": mx.zeros((128, 64))}
         sanitized = model.sanitize(weights)
         self.assertIn("language_model.model.embedding.weight", sanitized)
+
+
+class TestServerRequestPreparation(unittest.TestCase):
+    def test_chat_preserves_source_and_tool_reasoning_metadata(self):
+        import copy
+
+        from mlx_vlm.server.request_preparation import normalize_chat_input
+        from mlx_vlm.server.schemas import ChatRequest
+
+        request = ChatRequest(
+            model="test",
+            messages=[
+                {"role": "system", "content": "Keep exact paths."},
+                {"role": "user", "content": "Excerpt: café /src/app.py:42"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "Inspect the file first.",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read",
+                                "arguments": '{"path":"/src/app.py"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "name": "read",
+                    "content": "exact result",
+                },
+            ],
+        )
+        before = copy.deepcopy(request.model_dump())
+        source = normalize_chat_input(request)
+        self.assertEqual(request.model_dump(), before)
+        self.assertEqual(
+            [m["role"] for m in source.messages],
+            ["system", "user", "assistant", "tool"],
+        )
+        self.assertEqual(source.messages[1]["content"], "Excerpt: café /src/app.py:42")
+        self.assertEqual(
+            source.messages[2]["reasoning_content"], "Inspect the file first."
+        )
+        self.assertEqual(source.messages[2]["reasoning"], "Inspect the file first.")
+        self.assertEqual(
+            source.messages[2]["tool_calls"][0]["function"]["arguments"],
+            {"path": "/src/app.py"},
+        )
+        self.assertEqual(
+            source.messages[3],
+            {
+                "role": "tool",
+                "content": "exact result",
+                "tool_call_id": "call_1",
+                "name": "read",
+            },
+        )
+
+    def test_media_order_and_resize_survive_preparation(self):
+        import base64
+        from unittest.mock import MagicMock
+
+        from mlx_vlm.server.generation import GenerationArguments
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            prepare_prompt,
+        )
+        from mlx_vlm.server.schemas import ChatRequest
+
+        request = ChatRequest(
+            model="test",
+            resize_shape=[224],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Compare."},
+                        {"type": "image_url", "image_url": {"url": "first.png"}},
+                        {"type": "input_image", "image_url": "second.png"},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": base64.b64encode(b"audio bytes").decode(),
+                                "format": "wav",
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+        source = normalize_chat_input(request)
+        render = MagicMock(return_value="rendered")
+        prepared = prepare_prompt(
+            source,
+            SimpleNamespace(),
+            SimpleNamespace(),
+            GenerationArguments(),
+            render=render,
+        )
+        self.assertEqual(prepared.images, ["first.png", "second.png"])
+        self.assertEqual(prepared.audio[0].getvalue(), b"audio bytes")
+        self.assertEqual(prepared.generation_kwargs, {"resize_shape": (224, 224)})
+        self.assertEqual(render.call_args.kwargs["num_images"], 2)
+        self.assertEqual(render.call_args.kwargs["num_audios"], 1)
+        self.assertEqual(prepared.prompt, "rendered")
+
+    def test_video_fallback_does_not_mutate_source(self):
+        from unittest.mock import MagicMock, patch
+
+        from mlx_vlm.server.generation import GenerationArguments
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            prepare_prompt,
+        )
+        from mlx_vlm.server.schemas import ChatRequest
+
+        source = normalize_chat_input(
+            ChatRequest(
+                model="test",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe."},
+                            {"type": "input_video", "video_url": "clip.mp4"},
+                        ],
+                    }
+                ],
+            )
+        )
+        render = MagicMock(return_value="rendered")
+        resolution = SimpleNamespace(
+            images=["frame1", "frame2"],
+            videos=[],
+            used_fallback=True,
+            selected_count=2,
+            sampled_count=2,
+        )
+        with patch(
+            "mlx_vlm.server.request_preparation.resolve_video_inputs",
+            return_value=resolution,
+        ) as resolve:
+            prepared = prepare_prompt(
+                source,
+                SimpleNamespace(),
+                SimpleNamespace(),
+                GenerationArguments(),
+                render=render,
+            )
+        self.assertEqual(source.videos, ["clip.mp4"])
+        self.assertEqual(source.images, [])
+        self.assertEqual(prepared.images, ["frame1", "frame2"])
+        self.assertEqual(prepared.videos, [])
+        self.assertEqual(render.call_args.kwargs["num_images"], 2)
+        self.assertIsNone(render.call_args.kwargs["video"])
+        self.assertEqual(resolve.call_args.kwargs["fps"], 2.0)
+        self.assertEqual(resolve.call_args.kwargs["max_frames"], 16)
+
+    def test_responses_preserves_existing_instruction_and_tool_item_semantics(self):
+        import copy
+
+        from mlx_vlm.server.request_preparation import normalize_responses_input
+        from mlx_vlm.server.responses_state import _normalize_response_input
+        from mlx_vlm.server.schemas import OpenAIRequest
+
+        request = OpenAIRequest(
+            model="test",
+            instructions="Primary.",
+            input=[
+                {"type": "message", "role": "system", "content": "Secondary."},
+                {"type": "message", "role": "user", "content": "Read."},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read",
+                    "arguments": '{"path":"a"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "file contents",
+                },
+            ],
+            tools=[
+                {"type": "function", "name": "read", "parameters": {"type": "object"}}
+            ],
+        )
+        items = _normalize_response_input(request.input)
+        before = copy.deepcopy(items)
+        source, instructions, registry = normalize_responses_input(request, items)
+        self.assertEqual(items, before)
+        self.assertEqual(instructions, "Primary.\n\nSecondary.")
+        self.assertEqual(
+            source.messages[0], {"role": "system", "content": instructions}
+        )
+        self.assertEqual(source.messages[2]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(
+            source.messages[3],
+            {"role": "tool", "tool_call_id": "call_1", "content": "file contents"},
+        )
+        self.assertEqual(source.tools[0]["function"]["name"], "read")
+        self.assertEqual(registry, {"read": "function"})
+
+    def test_equivalent_text_inputs_share_rendered_prompt_and_append_prefix(self):
+        from mlx_vlm.server.request_normalization import _build_gen_args
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            normalize_responses_input,
+            prepare_prompt,
+        )
+        from mlx_vlm.server.responses_state import _normalize_response_input
+        from mlx_vlm.server.schemas import ChatRequest, OpenAIRequest
+
+        class Processor:
+            chat_template = "test"
+
+            def apply_chat_template(self, messages, **kwargs):
+                return (
+                    "".join(
+                        f"<{m['role']}>{m['content']}</{m['role']}>" for m in messages
+                    )
+                    + "<assistant>"
+                )
+
+        processor = Processor()
+        config = SimpleNamespace(model_type="test")
+        messages = [
+            {"role": "system", "content": "Instructions."},
+            {"role": "user", "content": "Exact document excerpt."},
+            {"role": "assistant", "content": "Done."},
+        ]
+        chat = ChatRequest(model="test", messages=messages, enable_thinking=False)
+        response = OpenAIRequest(
+            model="test",
+            instructions="Instructions.",
+            input=messages[1:],
+            enable_thinking=False,
+        )
+        chat_source = normalize_chat_input(chat)
+        response_source, _, _ = normalize_responses_input(
+            response, _normalize_response_input(response.input)
+        )
+        chat_args = _build_gen_args(chat, processor)
+        response_args = _build_gen_args(response, processor)
+        expected = "<system>Instructions.</system><user>Exact document excerpt.</user><assistant>Done.</assistant><assistant>"
+        before = prepare_prompt(chat_source, processor, config, chat_args)
+        self.assertEqual(before.prompt, expected)
+        self.assertEqual(
+            prepare_prompt(response_source, processor, config, response_args).prompt,
+            expected,
+        )
+        chat_source.messages.append(
+            {"role": "user", "content": "Summarize the preceding conversation."}
+        )
+        after = prepare_prompt(chat_source, processor, config, chat_args)
+        self.assertTrue(after.prompt.startswith(expected.removesuffix("<assistant>")))
+        self.assertEqual(chat.messages[-1].content, "Done.")
+
+
+class TestChatHistoryReplay(unittest.TestCase):
+    def test_responses_replays_chat_history_without_changing_prepared_input(self):
+        import copy
+
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            normalize_responses_input,
+        )
+        from mlx_vlm.server.responses_state import _normalize_response_input
+        from mlx_vlm.server.schemas import ChatRequest, OpenAIRequest
+
+        messages = [
+            {"role": "system", "content": "First instruction."},
+            {"role": "system", "content": "Second instruction."},
+            {"role": "user", "content": "Read /src/app.py:42 — café."},
+            {
+                "role": "assistant",
+                "content": "Checking both files.",
+                "reasoning_content": "Keep the exact source history.",
+                "tool_calls": [
+                    {
+                        "id": f"call_{i}",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": arguments},
+                    }
+                    for i, arguments in enumerate(
+                        ['{"path":"/src/app.py"}', {"path": "/src/db.py"}]
+                    )
+                ],
+            },
+            {
+                "role": "tool",
+                "name": "read",
+                "tool_call_id": "call_0",
+                "content": "Uses SQLite.",
+            },
+            {
+                "role": "tool",
+                "name": "read",
+                "tool_call_id": "call_1",
+                "content": "No migrations yet.",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Inspect these as well."},
+                    {"type": "image_url", "image_url": {"url": "first.png"}},
+                    {"type": "input_image", "image_url": "second.png"},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": "recording.wav", "format": "wav"},
+                    },
+                    {"type": "input_video", "video_url": "clip.mp4"},
+                ],
+            },
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "read", "parameters": {"type": "object"}},
+            }
+        ]
+        for choice in (
+            None,
+            "auto",
+            "none",
+            "required",
+            {"type": "function", "function": {"name": "read"}},
+        ):
+            with self.subTest(tool_choice=choice):
+                chat = ChatRequest(
+                    model="test",
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=choice,
+                    resize_shape=[224],
+                )
+                response = OpenAIRequest(
+                    model="test",
+                    input=messages,
+                    tools=tools,
+                    tool_choice=choice,
+                    resize_shape=[224],
+                )
+                before = copy.deepcopy(response.model_dump())
+                expected = normalize_chat_input(chat)
+                actual, _, _ = normalize_responses_input(
+                    response, _normalize_response_input(response.input)
+                )
+                self.assertEqual(actual, expected)
+                self.assertEqual(response.model_dump(), before)
+
+    def test_stored_chain_retains_original_chat_prefix(self):
+        import copy
+        import uuid
+
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            normalize_responses_input,
+        )
+        from mlx_vlm.server.responses_state import (
+            StoredResponse,
+            _normalize_response_input,
+            _response_chain_items,
+            response_store,
+            response_store_lock,
+        )
+        from mlx_vlm.server.schemas import ChatRequest, OpenAIRequest
+
+        history = [
+            {"role": "system", "content": "Keep exact paths."},
+            {"role": "system", "content": "Preserve separate instructions."},
+            {"role": "user", "content": "Inspect /src/app.py."},
+            {
+                "role": "assistant",
+                "content": "The file uses SQLite.",
+                "reasoning_content": "Verified by reading the source.",
+            },
+        ]
+        original = copy.deepcopy(history)
+        response_id = f"test_{uuid.uuid4().hex}"
+        with response_store_lock:
+            response_store[response_id] = StoredResponse(
+                response={},
+                input_items=_normalize_response_input(history),
+                output_items=[
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Done."}],
+                    }
+                ],
+            )
+        try:
+            request = OpenAIRequest(
+                model="test",
+                previous_response_id=response_id,
+                input=[{"role": "user", "content": "Continue."}],
+            )
+            source, _, _ = normalize_responses_input(
+                request,
+                _response_chain_items(response_id)
+                + _normalize_response_input(request.input),
+            )
+            expected = normalize_chat_input(ChatRequest(model="test", messages=history))
+            self.assertEqual(source.messages[: len(history)], expected.messages)
+            self.assertEqual(
+                source.messages[-2:],
+                [
+                    {"role": "assistant", "content": "Done."},
+                    {"role": "user", "content": "Continue."},
+                ],
+            )
+            self.assertEqual(history, original)
+        finally:
+            with response_store_lock:
+                response_store.pop(response_id, None)
+
+    def test_responses_forwards_media_to_counting_and_both_generation_modes(self):
+        from unittest.mock import MagicMock, patch
+
+        from fastapi.testclient import TestClient
+
+        import mlx_vlm.server as server
+
+        def generate(*args, **kwargs):
+            def tokens():
+                yield server.StreamingToken(
+                    text="Done.", token=1, logprobs=0.0, finish_reason="stop"
+                )
+
+            return SimpleNamespace(prompt_tokens=3), tokens()
+
+        worker = SimpleNamespace(
+            generate=MagicMock(side_effect=generate),
+            validate_context_budget=MagicMock(),
+            _cpu_preprocess=MagicMock(
+                return_value={"input_ids": mx.array([[1, 2, 3]])}
+            ),
+        )
+        payload = {
+            "model": "test",
+            "store": False,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe the recording."},
+                        {"type": "image_url", "image_url": {"url": "image.png"}},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": "audio.wav", "format": "wav"},
+                        },
+                        {"type": "input_video", "video_url": "video.mp4"},
+                    ],
+                }
+            ],
+        }
+        resolution = SimpleNamespace(
+            images=["image.png"], videos=["video.mp4"], used_fallback=False
+        )
+        with (
+            TestClient(server.app) as client,
+            patch.object(server.runtime, "response_generator", worker),
+            patch.object(
+                server,
+                "get_cached_model",
+                return_value=(
+                    SimpleNamespace(),
+                    SimpleNamespace(),
+                    SimpleNamespace(model_type="test"),
+                ),
+            ),
+            patch.object(server, "apply_chat_template", return_value="prompt"),
+            patch(
+                "mlx_vlm.server.request_preparation.resolve_video_inputs",
+                return_value=resolution,
+            ),
+        ):
+            counted = client.post("/v1/responses/input_tokens", json=payload)
+            self.assertEqual(counted.status_code, 200, counted.text)
+            self.assertEqual(counted.json(), {"input_tokens": 3})
+            self.assertEqual(
+                worker._cpu_preprocess.call_args.args,
+                ("prompt", ["image.png"], ["audio.wav"]),
+            )
+            self.assertEqual(
+                worker._cpu_preprocess.call_args.kwargs["videos"], ["video.mp4"]
+            )
+            for stream in (False, True):
+                with self.subTest(stream=stream):
+                    response = client.post(
+                        "/v1/responses", json={**payload, "stream": stream}
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    call = worker.generate.call_args
+                    if stream:
+                        self.assertIn("response.completed", response.text)
+                        self.assertEqual(
+                            call.args[:3], ("prompt", ["image.png"], ["audio.wav"])
+                        )
+                        self.assertEqual(
+                            worker.validate_context_budget.call_args.kwargs["videos"],
+                            ["video.mp4"],
+                        )
+                    else:
+                        self.assertEqual(call.kwargs["audio"], ["audio.wav"])
+                        self.assertEqual(call.kwargs["images"], ["image.png"])
+                    self.assertEqual(call.kwargs["videos"], ["video.mp4"])
+
+    def test_native_named_tool_choice_with_original_chat_history(self):
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            normalize_responses_input,
+        )
+        from mlx_vlm.server.responses_state import _normalize_response_input
+        from mlx_vlm.server.schemas import ChatRequest, OpenAIRequest
+
+        messages = [{"role": "user", "content": "Read the source."}]
+        function = {"name": "read", "parameters": {"type": "object"}}
+        chat = ChatRequest(
+            model="test",
+            messages=messages,
+            tools=[{"type": "function", "function": function}],
+            tool_choice={"type": "function", "function": {"name": "read"}},
+        )
+        response = OpenAIRequest(
+            model="test",
+            input=messages,
+            tools=[{"type": "function", "function": function}],
+            tool_choice={"type": "function", "name": "read"},
+        )
+        actual, _, _ = normalize_responses_input(
+            response, _normalize_response_input(response.input)
+        )
+        self.assertEqual(actual, normalize_chat_input(chat))
+
+
+class TestReplayProcessorLoading(unittest.TestCase):
+    def _tokenizer(self, path):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import Whitespace
+        from transformers import PreTrainedTokenizerFast
+
+        backend = Tokenizer(
+            WordLevel({"[UNK]": 0, "Hello": 1, "world": 2}, unk_token="[UNK]")
+        )
+        backend.pre_tokenizer = Whitespace()
+        tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+        tokenizer.save_pretrained(path)
+        return tokenizer
+
+    def test_tokenizer_loading_does_not_validate_mlx_model_config(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from mlx_vlm.utils import load_processor
+
+        for model_type, config in (
+            ("exaone4", {"sliding_window": None, "sliding_window_pattern": None}),
+            ("llama4", {"text_config": {"attn_temperature_tuning": 4}}),
+        ):
+            with (
+                self.subTest(model_type=model_type),
+                tempfile.TemporaryDirectory() as folder,
+            ):
+                path = Path(folder)
+                expected = self._tokenizer(path)
+                model_config = {"model_type": model_type, **config}
+                (path / "config.json").write_text(json.dumps(model_config))
+                importlib.import_module(f"mlx_vlm.models.{model_type}")
+                with patch(
+                    "transformers.AutoConfig.from_pretrained",
+                    side_effect=AssertionError("model config should not be loaded"),
+                ):
+                    processor = load_processor(
+                        path, add_detokenizer=False, local_files_only=True
+                    )
+                tokenizer = getattr(processor, "tokenizer", processor)
+                self.assertEqual(
+                    tokenizer.encode("Hello world"), expected.encode("Hello world")
+                )
+                self.assertEqual(
+                    json.loads((path / "config.json").read_text()), model_config
+                )
+
+    def test_moondream_fallback_loads_standalone_tokenizer(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from mlx_vlm.models.moondream3 import processing_moondream3
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)
+            tokenizer_path = path / "tokenizer"
+            expected = self._tokenizer(tokenizer_path)
+            model_path = path / "model"
+            model_path.mkdir()
+            with (
+                patch.object(
+                    processing_moondream3, "TOKENIZER_REPO", str(tokenizer_path)
+                ),
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    side_effect=ValueError("no bundled tokenizer"),
+                ),
+            ):
+                processor = processing_moondream3.Moondream3Processor.from_pretrained(
+                    str(model_path)
+                )
+            self.assertEqual(
+                processor.tokenizer.encode("Hello world"),
+                expected.encode("Hello world"),
+            )
+
+
+class TestMixedMediaFeatureOrdering(unittest.TestCase):
+    def _model(self, omni=False):
+        from types import MethodType
+
+        from mlx_vlm.models.qwen3_5.qwen3_5 import Model
+        from mlx_vlm.models.qwen3_omni_moe.thinker import Thinker
+
+        class Vision:
+            patch_embed = SimpleNamespace(proj=SimpleNamespace(weight=mx.zeros((1,))))
+
+            def __call__(self, pixels, grid):
+                return pixels, [pixels * 10, pixels * 100]
+
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                image_token_index=2,
+                video_token_index=3,
+                image_token_id=2,
+                video_token_id=3,
+                audio_token_id=4,
+            ),
+            vision_tower=Vision(),
+            language_model=SimpleNamespace(
+                model=SimpleNamespace(
+                    embed_tokens=lambda ids: mx.zeros((*ids.shape, 2))
+                ),
+                get_rope_index=lambda ids, *args, **kwargs: (mx.zeros_like(ids), None),
+            ),
+            merge_input_ids_with_image_features=Model.merge_input_ids_with_image_features,
+        )
+        if omni:
+            model.get_placeholder_mask = MethodType(Thinker.get_placeholder_mask, model)
+        model.get_input_embeddings = MethodType(
+            Thinker.get_input_embeddings if omni else Model.get_input_embeddings, model
+        )
+        return model
+
+    def test_interleaved_image_video_features_keep_token_order(self):
+        for omni in (False, True):
+            for tokens in ([3, 0, 2, 3, 2], [2, 3, 2, 0, 3]):
+                with self.subTest(omni=omni, tokens=tokens):
+                    model = self._model(omni)
+                    images = mx.array([[1.0, 2.0], [3.0, 4.0]])
+                    videos = mx.array([[5.0, 6.0], [7.0, 8.0]])
+                    result = model.get_input_embeddings(
+                        mx.array([tokens]), images, pixel_values_videos=videos
+                    )
+                    image_rows, video_rows = iter(images.tolist()), iter(
+                        videos.tolist()
+                    )
+                    expected = [
+                        (
+                            next(image_rows)
+                            if token == 2
+                            else next(video_rows) if token == 3 else [0.0, 0.0]
+                        )
+                        for token in tokens
+                    ]
+                    self.assertEqual(result.inputs_embeds.tolist(), [expected])
+                    if omni:
+                        visual_rows = [
+                            row
+                            for token, row in zip(tokens, expected)
+                            if token in (2, 3)
+                        ]
+                        for layer, scale in zip(
+                            result.deepstack_visual_embeds, (10, 100)
+                        ):
+                            self.assertEqual(
+                                layer.tolist(),
+                                [
+                                    [value * scale for value in row]
+                                    for row in visual_rows
+                                ],
+                            )
+
+    def test_single_modality_features_remain_unchanged(self):
+        for omni in (False, True):
+            for token in (2, 3):
+                with self.subTest(omni=omni, token=token):
+                    model = self._model(omni)
+                    pixels = mx.array([[1.0, 2.0], [3.0, 4.0]])
+                    kwargs = (
+                        {"pixel_values": pixels}
+                        if token == 2
+                        else {"pixel_values_videos": pixels}
+                    )
+                    result = model.get_input_embeddings(
+                        mx.array([[token, 0, token]]), **kwargs
+                    )
+                    self.assertEqual(
+                        result.inputs_embeds.tolist(),
+                        [[[1.0, 2.0], [0.0, 0.0], [3.0, 4.0]]],
+                    )
+
+
+class TestGraniteVisualPrefillWindows(unittest.TestCase):
+    def test_batched_offsets_and_chunk_local_features_inject_same_values(self):
+        from mlx_vlm.models.granite4_vision.language import Granite
+
+        model = SimpleNamespace(
+            embedding_multiplier=1,
+            layers=[lambda h, mask, cache: h, lambda h, mask, cache: h],
+            norm=lambda h: h,
+            _deepstack_target_layers=[0, 1],
+        )
+        full_features = mx.arange(2 * 6 * 2 * 3, dtype=mx.float32).reshape(2, 6, 2, 3)
+        full_mask = mx.array(
+            [
+                [False, True, True, False, True, False],
+                [True, True, False, True, True, False],
+            ]
+        )
+        offsets = [2, 1]
+        expected_features = mx.stack(
+            [full_features[b, offset : offset + 3] for b, offset in enumerate(offsets)]
+        )
+        expected_mask = mx.stack(
+            [full_mask[b, offset : offset + 3] for b, offset in enumerate(offsets)]
+        )
+        expected = mx.where(expected_mask[..., None], expected_features.sum(axis=2), 0)
+        for chunk_local in (False, True):
+            with self.subTest(chunk_local=chunk_local):
+                actual = Granite.__call__(
+                    model,
+                    mx.zeros((2, 3), dtype=mx.int32),
+                    inputs_embeds=mx.zeros((2, 3, 3)),
+                    mask=mx.zeros((2, 1, 3, 3)),
+                    cache=[SimpleNamespace(offset=mx.array(offsets))] * 2,
+                    visual_pos_masks=expected_mask if chunk_local else full_mask,
+                    deepstack_visual_embeds=(
+                        expected_features if chunk_local else full_features
+                    ),
+                )
+                self.assertEqual(actual.tolist(), expected.tolist())
+
+
+class TestEmptyBatchCacheReplay(unittest.TestCase):
+    def test_empty_state_round_trip_preserves_offsets_and_can_append(self):
+        from mlx_vlm.models.cache import BatchKVCache
+
+        original = BatchKVCache([1, 0])
+        restored = BatchKVCache([0, 0])
+        restored.state = original.state
+        self.assertIsNone(restored.keys)
+        self.assertEqual(restored.offset.tolist(), [-1, 0])
+        self.assertEqual(restored.left_padding.tolist(), [1, 0])
+        keys = mx.arange(8, dtype=mx.float32).reshape(2, 1, 2, 2)
+        actual_keys, actual_values = restored.update_and_fetch(keys, keys + 10)
+        self.assertEqual(actual_keys.tolist(), keys.tolist())
+        self.assertEqual(actual_values.tolist(), (keys + 10).tolist())
+        self.assertEqual(restored.offset.tolist(), [1, 2])
+
+    def test_exact_replay_keeps_unused_layer_cache_empty(self):
+        from mlx_vlm.apc import make_warm_batch_exact_cache_multi
+        from mlx_vlm.models.cache import KVCache
+
+        used = KVCache()
+        keys = mx.ones((1, 1, 3, 2))
+        used.update_and_fetch(keys, keys)
+        merged, prefix = make_warm_batch_exact_cache_multi([[used, KVCache()]], [3])
+        self.assertEqual(prefix, 3)
+        self.assertEqual(merged[0].keys.tolist(), keys.tolist())
+        self.assertTrue(merged[1].empty())
+        self.assertEqual(merged[1].state[2].tolist(), [0])
+
+
+class TestSavedAssistantTurnReplay(unittest.TestCase):
+    def test_reasoning_text_and_parallel_calls_keep_one_turn(self):
+        from copy import deepcopy
+
+        from mlx_vlm.server.responses_state import _stored_output_to_chat
+
+        output = [
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "Think α\n"}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "reasoning": "Think α\n",
+                "content": [{"type": "output_text", "text": "Check both.\n"}],
+            },
+            {
+                "type": "function_call",
+                "call_id": "a",
+                "name": "lookup",
+                "arguments": '{"city":"東京"}',
+            },
+            {
+                "type": "function_call",
+                "call_id": "b",
+                "name": "lookup",
+                "arguments": '{"city":"Paris"}',
+            },
+        ]
+        original = deepcopy(output)
+        self.assertEqual(
+            _stored_output_to_chat(output),
+            [
+                {
+                    "role": "assistant",
+                    "content": "Check both.\n",
+                    "reasoning_content": "Think α\n",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "id": "a",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": '{"city":"東京"}',
+                            },
+                        },
+                        {
+                            "type": "function",
+                            "id": "b",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": '{"city":"Paris"}',
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(output, original)
+
+    def test_unknown_output_and_nontext_content_are_retained(self):
+        from mlx_vlm.server.responses_state import _stored_output_to_chat
+
+        for output in (
+            [{"type": "future_item", "payload": "keep"}],
+            [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_audio", "data": "keep"}],
+                }
+            ],
+        ):
+            with self.subTest(output=output):
+                self.assertEqual(_stored_output_to_chat(output), output)
+
+
+class TestHarmonyResponseChannels(unittest.TestCase):
+    def test_every_stream_boundary_matches_expected_channels(self):
+        from mlx_vlm.server.responses_state import HarmonyStreamState
+
+        cases = [
+            (
+                False,
+                "<|channel|>analysis<|message|> Think α\n<|end|><|start|>assistant<|channel|>final<|message|> Answer β\n<|return|>",
+                " Think α\n",
+                " Answer β\n",
+            ),
+            (False, "<|channel|>final<|message|>42<|return|>", "", "42"),
+            (False, "<|channel|>analysis<|message|>unfinished", "unfinished", ""),
+            (False, "<|channel|>anal", "", ""),
+            (
+                True,
+                "continued<|end|><|start|>assistant<|channel|>final<|message|>done",
+                "continued",
+                "done",
+            ),
+        ]
+        for opened, text, reasoning, content in cases:
+            for split in range(len(text) + 1):
+                with self.subTest(opened=opened, text=text, split=split):
+                    state = HarmonyStreamState(opened)
+                    deltas = [
+                        state.feed(text[:split]),
+                        state.feed(text[split:], last=True),
+                    ]
+                    self.assertEqual(
+                        "".join(d.reasoning or "" for d in deltas), reasoning
+                    )
+                    self.assertEqual("".join(d.content or "" for d in deltas), content)
+            state = HarmonyStreamState(opened)
+            deltas = [state.feed(char) for char in text] + [state.feed("", last=True)]
+            self.assertEqual("".join(d.reasoning or "" for d in deltas), reasoning)
+            self.assertEqual("".join(d.content or "" for d in deltas), content)
+
+    def test_stream_and_nonstream_use_same_template_detection(self):
+        from mlx_vlm.server.responses_state import (
+            _split_thinking,
+            make_response_stream_state,
+        )
+
+        for template in (
+            "<|channel|>analysis<|message|>",
+            {"default": "<|channel|>analysis<|message|>"},
+        ):
+            processor = SimpleNamespace(
+                tokenizer=SimpleNamespace(chat_template=template)
+            )
+            text = "<|channel|>analysis<|message|>reason<|end|><|start|>assistant<|message|>answer"
+            delta = make_response_stream_state(processor).feed(text, last=True)
+            self.assertEqual((delta.reasoning, delta.content), ("reason", "answer"))
+            self.assertEqual(
+                _split_thinking(text, processor=processor), ("reason", "answer")
+            )
+
+
+class TestLlavaProcessorCompatibility(unittest.TestCase):
+    def test_model_metadata_fallback_and_separate_modality_kwargs(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from PIL import Image
+        from transformers import CLIPImageProcessor
+
+        from mlx_vlm.models.llava.processing_llava import LlavaProcessor
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            tokenizer = TestReplayProcessorLoading()._tokenizer(path)
+            tokenizer.add_special_tokens(
+                {"additional_special_tokens": ["<image>"], "pad_token": "[UNK]"}
+            )
+            (path / "config.json").write_text(
+                json.dumps(
+                    {
+                        "vision_config": {
+                            "model_type": "clip_vision_model",
+                            "patch_size": 14,
+                        }
+                    }
+                )
+            )
+            image_processor = CLIPImageProcessor(do_resize=False, do_center_crop=False)
+            for explicit in (False, True):
+                config = {
+                    "patch_size": 7 if explicit else None,
+                    "vision_feature_select_strategy": "full" if explicit else None,
+                }
+                if explicit:
+                    config["num_additional_image_tokens"] = 0
+                (path / "processor_config.json").write_text(json.dumps(config))
+                with (
+                    patch(
+                        "transformers.AutoTokenizer.from_pretrained",
+                        return_value=tokenizer,
+                    ),
+                    patch(
+                        "transformers.AutoImageProcessor",
+                        SimpleNamespace(
+                            from_pretrained=lambda *args, **kwargs: image_processor
+                        ),
+                    ),
+                ):
+                    processor = LlavaProcessor.from_pretrained(path)
+                self.assertEqual(processor.patch_size, 7 if explicit else 14)
+                self.assertEqual(
+                    processor.num_additional_image_tokens, 0 if explicit else 1
+                )
+                result = processor(
+                    images=[Image.new("RGB", (28, 28))] * 2,
+                    text=["<image> Hello", "<image> Hello world"],
+                    padding=True,
+                    do_rescale=False,
+                )
+                rows = result["input_ids"].tolist()
+                self.assertEqual(len(rows[0]), len(rows[1]))
+                self.assertEqual(
+                    [row.count(processor.image_token_id) for row in rows],
+                    [16, 16] if explicit else [4, 4],
+                )
+
+
+class TestMoondreamWeightLayout(unittest.TestCase):
+    def test_original_and_converted_weights_sanitize_identically(self):
+        from mlx_vlm.models.moondream3.moondream3 import Model
+
+        original = {
+            "model.text.wte": mx.zeros((2, 3)),
+            "model.text.blocks.0.attn.qkv.weight": mx.ones((3, 3)),
+            "model.text.lm_head.weight": mx.ones((2, 3)),
+            "model.vision.blocks.0.attn.qkv.weight": mx.ones((3, 3)),
+            "model.vision.proj_mlp.fc1.weight": mx.ones((3, 3)),
+        }
+        expected_keys = {
+            "text.model.wte.weight",
+            "text.model.blocks.0.attn.qkv.weight",
+            "text.lm_head.weight",
+            "vision.encoder.blocks.0.attn.qkv.weight",
+            "vision.proj_mlp.fc1.weight",
+        }
+        converted = Model.sanitize(None, original)
+        self.assertEqual(set(converted), expected_keys)
+        again = Model.sanitize(None, converted)
+        self.assertEqual(set(again), expected_keys)
+        for key in expected_keys:
+            self.assertIs(again[key], converted[key])
+
+
+class TestJinaMultiImagePlacement(unittest.TestCase):
+    def test_all_images_keep_hidden_width_and_token_positions(self):
+        from mlx_vlm.models.jina_vlm.jina_vlm import Model
+
+        for batch, images in ((1, 1), (1, 2), (1, 5), (2, 1), (2, 2)):
+            with self.subTest(batch=batch, images=images):
+                features = mx.arange(
+                    batch * images * 2 * 3 * 4, dtype=mx.float32
+                ).reshape(batch * images, 2, 3, 4)
+                positions = mx.arange(images * 6).reshape(1, images, 2, 3) + 1
+                positions = mx.broadcast_to(positions, (batch, images, 2, 3)).reshape(
+                    batch * images, 2, 3
+                )
+                model = SimpleNamespace(
+                    language_model=SimpleNamespace(
+                        embedding=lambda ids: mx.ones((*ids.shape, 4))
+                    ),
+                    get_image_features=lambda pixels, masks: features,
+                )
+                result = Model.get_input_embeddings(
+                    model,
+                    mx.zeros((batch, images * 6 + 2), dtype=mx.int32),
+                    mx.zeros((batch * images, 2, 3, 4)),
+                    image_input_idx=positions,
+                )
+                expected = mx.ones((batch, images * 6 + 2, 4))
+                expected[:, 1:-1, :] = features.reshape(batch, images * 6, 4) + 1
+                self.assertEqual(result.inputs_embeds.tolist(), expected.tolist())
+
+
+class TestJinaBatchedImageOwnership(unittest.TestCase):
+    def test_uneven_images_text_only_rows_and_left_padding(self):
+        from mlx_vlm.models.jina_vlm.jina_vlm import Model
+        from mlx_vlm.models.jina_vlm.processing_jinavlm import JinaVLMProcessor
+
+        rows = []
+        for length, values, positions in (
+            (5, [10.0, 20.0], [[1, -1], [3, 4]]),
+            (8, [], []),
+            (6, [30.0], [[2, 5]]),
+        ):
+            row = {
+                "input_ids": mx.zeros((1, length), dtype=mx.int32),
+                "attention_mask": mx.ones((1, length)),
+            }
+            if values:
+                row.update(
+                    pixel_values=mx.array(values).reshape(-1, 1, 1, 1),
+                    image_masks=mx.ones((len(values), 1, 1)),
+                    image_input_idx=mx.array(positions).reshape(-1, 1, 2),
+                )
+            rows.append(row)
+        batch = JinaVLMProcessor._collate_batch(SimpleNamespace(pad_token_id=0), rows)
+        features = mx.array(
+            [
+                [[[10.0, 11.0], [12.0, 13.0]]],
+                [[[20.0, 21.0], [22.0, 23.0]]],
+                [[[30.0, 31.0], [32.0, 33.0]]],
+            ]
+        )
+        model = SimpleNamespace(
+            language_model=SimpleNamespace(
+                embedding=lambda ids: mx.ones((*ids.shape, 2))
+            ),
+            get_image_features=lambda pixels, masks: features,
+        )
+        actual = Model.get_input_embeddings(model, **batch).inputs_embeds
+        expected = mx.ones((3, 8, 2))
+        expected[0, 4] += features[0, 0, 0]
+        expected[0, 6] += features[1, 0, 0]
+        expected[0, 7] += features[1, 0, 1]
+        expected[2, 4] += features[2, 0, 0]
+        expected[2, 7] += features[2, 0, 1]
+        self.assertEqual(actual.tolist(), expected.tolist())
+        self.assertEqual(rows[0]["image_input_idx"].tolist(), [[[1, -1]], [[3, 4]]])
+
+
+class TestJinaUnusedImageSlots(unittest.TestCase):
+    def test_long_text_offset_does_not_turn_unused_slots_into_valid_positions(self):
+        import numpy as np
+
+        from mlx_vlm.models.jina_vlm.processing_jinavlm import JinaVLMProcessor
+
+        outputs = {
+            "pixel_values": [np.zeros((1, 2, 3))],
+            "image_masks": [np.ones((1, 2))],
+            "image_tokens": [np.array([4, 5])],
+            "image_input_idx": [np.array([[0, -10000]])],
+        }
+        processor = SimpleNamespace(
+            image_token="<|image|>",
+            _image_proc=SimpleNamespace(preprocess=lambda images: outputs),
+            encode=lambda text, **kwargs: [1] * 10001,
+        )
+        result = JinaVLMProcessor.process_one(
+            processor, "long prefix<|image|>", [object()]
+        )
+        self.assertEqual(result["image_input_idx"].tolist(), [[[10001, -10000]]])
+
+
+class TestMolmoSharedPromptImages(unittest.TestCase):
+    def test_images_share_one_prompt_and_indices_follow_all_prefixes(self):
+        import numpy as np
+        from PIL import Image
+
+        from mlx_vlm.models.molmo.processing_molmo import MolmoProcessor
+
+        tokenizer = SimpleNamespace(
+            convert_tokens_to_ids=lambda token: 1,
+            encode=lambda text: [90, 91],
+            pad_token_id=0,
+        )
+
+        def preprocess(image, *args):
+            return (
+                np.zeros((1, 2, 3)),
+                np.array([10, 11, 12]),
+                np.array([[1, -100]]),
+                np.ones((1, 2)),
+            )
+
+        processor = SimpleNamespace(
+            tokenizer=tokenizer,
+            image_processor=SimpleNamespace(preprocess=preprocess),
+            image_patch_token="patch",
+            image_col_token="col",
+            image_start_token="start",
+            image_end_token="end",
+        )
+        for count in (1, 2, 5):
+            with self.subTest(count=count):
+                result = MolmoProcessor.__call__(
+                    processor,
+                    images=[Image.new("RGB", (2, 2))] * count,
+                    text="One question",
+                )
+                self.assertEqual(
+                    result["input_ids"].tolist(), [[10, 11, 12] * count + [90, 91]]
+                )
+                self.assertEqual(
+                    result["image_input_idx"].tolist(),
+                    [[1 + 3 * i, -100] for i in range(count)],
+                )
+
+
+class TestPlainPromptHistoryFields(unittest.TestCase):
+    def test_fallback_keeps_reasoning_calls_and_result_identity(self):
+        import json
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        extra = {
+            "reasoning_content": "Keep α\nexact",
+            "tool_calls": [
+                {
+                    "id": "call_a",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"city": "東京"}'},
+                }
+            ],
+        }
+        messages = [
+            {"role": "user", "content": "Check."},
+            {"role": "assistant", "content": "Looking.", **extra},
+            {
+                "role": "tool",
+                "name": "lookup",
+                "tool_call_id": "call_a",
+                "content": "Result.",
+            },
+        ]
+        prompt = get_chat_template(None, messages, True)
+        metadata = [
+            json.loads(line.split(": ", 1)[1])
+            for line in prompt.splitlines()
+            if " metadata: " in line
+        ]
+        self.assertEqual(
+            metadata, [extra, {"name": "lookup", "tool_call_id": "call_a"}]
+        )
+        self.assertTrue(prompt.endswith("Assistant:"))
+
+    def test_plain_text_fallback_stays_identical(self):
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        self.assertEqual(
+            get_chat_template(None, [{"role": "user", "content": "Hello"}], True),
+            "Hello",
+        )
+        self.assertEqual(
+            get_chat_template(
+                None,
+                [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi"},
+                ],
+                True,
+            ),
+            "User: Hello\nAssistant: Hi\nAssistant:",
+        )
+
+
+class TestMoondreamHistoryRoles(unittest.TestCase):
+    def test_assistant_role_and_reasoning_survive_message_formatting(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        messages = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Answer", "reasoning_content": "Reason"},
+            {"role": "user", "content": "Continue"},
+        ]
+        prompt = apply_chat_template(None, {"model_type": "moondream3"}, messages)
+        self.assertEqual(
+            prompt,
+            'User: Hi\nAssistant: Answer\nAssistant metadata: {"reasoning_content": "Reason"}\nUser: Continue\nAssistant:',
+        )
+
+
+class TestMoondreamPaddedPositions(unittest.TestCase):
+    def test_single_padded_sequence_matches_unpadded_prefill_and_decode(self):
+        from mlx_vlm.models.base import create_attention_mask
+        from mlx_vlm.models.cache import BatchKVCache, KVCache
+        from mlx_vlm.models.moondream3.config import TextConfig
+        from mlx_vlm.models.moondream3.language import Attention
+
+        mx.random.seed(72)
+        attention = Attention(
+            TextConfig(
+                hidden_size=8,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                head_dim=4,
+                rope_dim=4,
+            )
+        )
+        attention.tau.alpha = mx.array([0.7, -0.4])
+        x = mx.random.normal((1, 4, 8))
+        plain, padded = KVCache(), BatchKVCache([2])
+        expected = attention(x, mask=create_attention_mask(x, plain), cache=plain)
+        padded_x = mx.concatenate([mx.zeros((1, 2, 8)), x], axis=1)
+        actual = attention(
+            padded_x, mask=create_attention_mask(padded_x, padded), cache=padded
+        )
+        self.assertTrue(mx.allclose(actual[:, 2:], expected, atol=1e-5).item())
+        token = mx.random.normal((1, 1, 8))
+        expected = attention(
+            token, mask=create_attention_mask(token, plain), cache=plain
+        )
+        actual = attention(
+            token, mask=create_attention_mask(token, padded), cache=padded
+        )
+        self.assertTrue(mx.allclose(actual, expected, atol=1e-5).item())
+
+
+class TestDenseAPCPrefillBoundaries(unittest.TestCase):
+    def test_reuse_retains_chunk_boundaries_and_releases_unused_blocks(self):
+        from unittest.mock import Mock
+
+        from mlx_vlm.generate.ar import BatchGenerator
+
+        for block_size, step, prefix, expected in (
+            (16, 128, 1008, 896),
+            (48, 128, 1008, 768),
+            (16, 128, 64, 0),
+            (16, 128, 1024, 1024),
+        ):
+            with self.subTest(block_size=block_size, step=step, prefix=prefix):
+                blocks = [object() for _ in range(prefix // block_size)]
+                ids = list(range(1100))
+                plan = {
+                    "matched_blocks": list(blocks),
+                    "prefix_len": prefix,
+                    "full_input_ids": ids,
+                    "extra_hash": 0,
+                }
+                manager = SimpleNamespace(block_size=block_size, release=Mock())
+                model = SimpleNamespace(
+                    apc_manager=manager,
+                    apc=SimpleNamespace(lookup=lambda *args, **kwargs: plan),
+                    prefill_step_size=step,
+                    _apc_extra_hash=lambda kwargs: 0,
+                    _apc_safe_prefix_lookup_min=lambda ids: 0,
+                    _apc_suffix_is_text_only=lambda ids, prefix: True,
+                    _apc_prefix_has_media_tokens=lambda ids, prefix: False,
+                )
+                result = BatchGenerator._apc_pick_for(
+                    model, (0, ids, 10, {}, None, None)
+                )
+                manager.release.assert_called_once_with(
+                    blocks[expected // block_size :]
+                )
+                if expected:
+                    self.assertEqual(result["prefix_len"], expected)
+                    self.assertEqual(
+                        result["matched_blocks"], blocks[: expected // block_size]
+                    )
+                    self.assertIs(result["full_input_ids"], ids)
+                else:
+                    self.assertIsNone(result)
+
+
+class TestDenseAPCReferenceLifecycle(unittest.TestCase):
+    def test_repeated_aligned_hits_and_rejected_hits_release_every_reference(self):
+        from mlx_vlm.apc import APCManager
+        from mlx_vlm.generate.ar import BatchGenerator
+
+        manager = APCManager(num_blocks=32, block_size=16)
+        ids = list(range(257))
+        keys = mx.zeros((1, 1, len(ids), 2))
+        stored = manager.store_kv_blocks(ids, [keys], [keys])
+        manager.release(stored)
+
+        def lookup(tokens, **kwargs):
+            blocks, length = manager.lookup_prefix(tokens)
+            return {
+                "matched_blocks": blocks,
+                "prefix_len": length,
+                "full_input_ids": tokens,
+            }
+
+        model = SimpleNamespace(
+            apc_manager=manager,
+            apc=SimpleNamespace(lookup=lookup),
+            prefill_step_size=128,
+            _apc_extra_hash=lambda kwargs: 0,
+            _apc_safe_prefix_lookup_min=lambda ids: 0,
+            _apc_suffix_is_text_only=lambda ids, prefix: True,
+            _apc_prefix_has_media_tokens=lambda ids, prefix: False,
+        )
+        try:
+            for _ in range(100):
+                for length, expected in ((65, 0), (209, 128), (257, 256)):
+                    pick = BatchGenerator._apc_pick_for(
+                        model, (0, ids[:length], 1, {}, None, None)
+                    )
+                    self.assertEqual(
+                        sum(b.ref_cnt for b in manager.pool), expected // 16
+                    )
+                    if pick:
+                        manager.release(pick["matched_blocks"])
+                    self.assertTrue(all(b.ref_cnt == 0 for b in manager.pool))
+            manager.clear()
+            self.assertEqual(manager.stats_snapshot()["pool_used"], 0)
+            self.assertFalse(manager.hash_table)
+        finally:
+            manager.close()
+
+
+class TestFlorenceIndependentLayerCaches(unittest.TestCase):
+    def test_default_forward_matches_explicit_per_layer_caches(self):
+        from mlx_vlm.models.florence2.config import TextConfig
+        from mlx_vlm.models.florence2.language import LanguageModel
+
+        mx.random.seed(81)
+        model = LanguageModel(
+            TextConfig(
+                d_model=8,
+                encoder_layers=2,
+                decoder_layers=2,
+                encoder_attention_heads=2,
+                decoder_attention_heads=2,
+                encoder_ffn_dim=16,
+                decoder_ffn_dim=16,
+                vocab_size=32,
+                max_position_embeddings=32,
+            )
+        )
+        inputs = mx.array([[3, 4, 5]])
+        decoder = mx.array([[2, 6]])
+        expected = model(
+            inputs, decoder_input_ids=decoder, cache=model.make_cache()
+        ).logits
+        actual = model(inputs, decoder_input_ids=decoder).logits
+        self.assertTrue(mx.allclose(actual, expected, atol=1e-6).item())
+
+
+class TestExactAPCSingleRowRestore(unittest.TestCase):
+    def test_single_row_preserves_chunked_window_on_continuation(self):
+        from mlx_vlm.apc_coordinator import APCCoordinator
+        from mlx_vlm.models.cache import ChunkedKVCache
+
+        cache = ChunkedKVCache(chunk_size=4)
+        values = mx.arange(8, dtype=mx.float32).reshape(1, 1, 8, 1)
+        cache.update_and_fetch(values, values)
+        cache.maybe_trim_front()
+        coordinator = SimpleNamespace(is_checkpoint=True)
+        restored, prefix = APCCoordinator.merge_rows(
+            coordinator, [{"warm_cache": [cache]}], [8]
+        )
+        next_value = mx.array([[[[8.0]]]])
+        keys, values = restored[0].update_and_fetch(next_value, next_value)
+        self.assertEqual(prefix, 8)
+        self.assertEqual(keys.flatten().tolist(), [4.0, 5.0, 6.0, 7.0, 8.0])
+        self.assertEqual(values.flatten().tolist(), keys.flatten().tolist())
+        self.assertEqual(restored[0].offset, 9)
+        self.assertEqual(restored[0].start_position, 4)
+
+
+class TestChunkedCacheStateRoundTrip(unittest.TestCase):
+    def test_empty_state_round_trip(self):
+        from mlx_vlm.models.cache import ChunkedKVCache
+
+        cache = ChunkedKVCache(4)
+        restored = ChunkedKVCache.from_state(cache.state, cache.meta_state)
+        self.assertTrue(restored.empty())
+        self.assertEqual(restored.offset, 0)
+
+    def test_trimmed_state_excludes_padding_and_preserves_position(self):
+        from mlx_vlm.models.cache import ChunkedKVCache
+
+        cache = ChunkedKVCache(4)
+        values = mx.arange(8, dtype=mx.float32).reshape(1, 1, 8, 1)
+        cache.update_and_fetch(values, values)
+        cache.maybe_trim_front()
+        cache.update_and_fetch(mx.array([[[[8.0]]]]), mx.array([[[[8.0]]]]))
+        state = cache.state
+        self.assertEqual(state[0].flatten().tolist(), [4.0, 5.0, 6.0, 7.0, 8.0])
+        restored = ChunkedKVCache.from_state(state, cache.meta_state)
+        self.assertEqual(restored.offset, cache.offset)
+        self.assertEqual(restored.start_position, cache.start_position)
+        for c in (cache, restored):
+            c.maybe_trim_front()
+        next_value = mx.array([[[[9.0]]]])
+        expected = cache.update_and_fetch(next_value, next_value)
+        actual = restored.update_and_fetch(next_value, next_value)
+        self.assertEqual(actual[0].flatten().tolist(), expected[0].flatten().tolist())
+
+    def test_llama4_logits_survive_state_round_trip_after_window_advances(self):
+        from mlx_vlm.models.llama4.config import TextConfig
+        from mlx_vlm.models.llama4.language import LanguageModel
+
+        mx.random.seed(82)
+        model = LanguageModel(
+            TextConfig(
+                model_type="llama4_text",
+                hidden_size=16,
+                intermediate_size=32,
+                intermediate_size_mlp=32,
+                num_hidden_layers=4,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=8,
+                rms_norm_eps=1e-5,
+                vocab_size=32,
+                num_local_experts=2,
+                attention_chunk_size=4,
+            )
+        )
+        model.eval()
+        cache = model.make_cache()
+        for token in range(9):
+            mx.eval(model(mx.array([[token]]), cache=cache).logits)
+        restored = [type(c).from_state(c.state, c.meta_state) for c in cache]
+        self.assertGreater(cache[0].start_position, 0)
+        for token in range(9, 13):
+            expected = model(mx.array([[token]]), cache=cache).logits
+            actual = model(mx.array([[token]]), cache=restored).logits
+            self.assertTrue(mx.allclose(actual, expected, atol=1e-6).item())
+
+
+class TestBatchChunkedCache(unittest.TestCase):
+    @staticmethod
+    def row(length):
+        from mlx_vlm.models.cache import ChunkedKVCache
+
+        cache = ChunkedKVCache(4)
+        for token in range(length):
+            cache.maybe_trim_front()
+            value = mx.array([[[[float(token)]]]])
+            cache.update_and_fetch(value, value)
+        return cache
+
+    def test_merge_trim_extract_filter_and_extend_preserve_rows(self):
+        from mlx_vlm.models.cache import BatchChunkedKVCache
+
+        rows = [self.row(n) for n in (3, 7, 9)]
+        batch = BatchChunkedKVCache.merge(rows[:2])
+        batch.extend(BatchChunkedKVCache.merge(rows[2:]))
+        batch.maybe_trim_front()
+        for row in rows:
+            row.maybe_trim_front()
+        batch.filter(mx.array([2, 0]))
+        for index, original in enumerate((rows[2], rows[0])):
+            restored = batch.extract(index)
+            self.assertEqual(restored.offset, original.offset)
+            self.assertEqual(restored.start_position, original.start_position)
+            self.assertEqual(restored.state[0].tolist(), original.state[0].tolist())
+        restored_batch = BatchChunkedKVCache.from_state(batch.state, batch.meta_state)
+        value = mx.array([[[[12.0]]], [[[13.0]]]])
+        actual = restored_batch.update_and_fetch(value, value)[0]
+        expected = batch.update_and_fetch(value, value)[0]
+        self.assertTrue(mx.array_equal(actual, expected).item())
+        self.assertEqual(restored_batch.chunk_size, 4)
+
+    def test_mask_uses_each_rows_absolute_position(self):
+        from mlx_vlm.models.cache import BatchChunkedKVCache
+
+        batch = BatchChunkedKVCache.merge([self.row(3), self.row(7)])
+        batch.maybe_trim_front()
+        mask = batch.make_chunk_mask(2).tolist()
+        width = batch._idx
+        for row, offset in enumerate((3, 7)):
+            padding = int(batch.left_padding[row].item())
+            for query in range(2):
+                expected = []
+                for column in range(width + 2):
+                    key = offset - width + column
+                    expected.append(
+                        column >= padding
+                        and key <= offset + query
+                        and key // 4 == (offset + query) // 4
+                    )
+                self.assertEqual(mask[row][0][query], expected)
+
+    def test_right_padded_prefill_restores_each_rows_real_offset(self):
+        from mlx_vlm.models.cache import BatchChunkedKVCache
+
+        rows = [self.row(3), self.row(7)]
+        batch = BatchChunkedKVCache.merge(rows)
+        batch.prepare(lengths=[2, 3], right_padding=[1, 0])
+        values = mx.array([[[[12.0], [13.0], [0.0]]], [[[14.0], [15.0], [16.0]]]])
+        batch.update_and_fetch(values, values)
+        batch.finalize()
+        for index, suffix in enumerate(([12.0, 13.0], [14.0, 15.0, 16.0])):
+            values = mx.array(suffix).reshape(1, 1, -1, 1)
+            rows[index].update_and_fetch(values, values)
+            actual = batch.extract(index)
+            self.assertEqual(actual.offset, rows[index].offset)
+            self.assertEqual(actual.start_position, rows[index].start_position)
+            self.assertEqual(actual.state[0].tolist(), rows[index].state[0].tolist())
+
+
+class TestSystemTemplateRetry(unittest.TestCase):
+    def test_rejected_leading_system_text_is_preserved(self):
+        from copy import deepcopy
+
+        from transformers.utils.chat_template_utils import render_jinja_template
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        class Processor:
+            chat_template = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('Only first system supported') }}{% endif %}{{ m.content }}{% endfor %}"
+
+            def apply_chat_template(self, messages, **kwargs):
+                result, _ = render_jinja_template(
+                    [messages], chat_template=self.chat_template, **kwargs
+                )
+                return result[0]
+
+        for content in (
+            "Second.",
+            [{"type": "text", "text": "Second.", "content": "Second."}],
+        ):
+            with self.subTest(content=content):
+                messages = [
+                    {"role": "system", "content": "First."},
+                    {"role": "system", "content": content},
+                    {"role": "user", "content": "Question."},
+                ]
+                original = deepcopy(messages)
+                self.assertEqual(
+                    get_chat_template(Processor(), messages, True),
+                    "First.\n\nSecond.Question.",
+                )
+                self.assertEqual(messages, original)
+
+    def test_successful_template_receives_original_messages_once(self):
+        from unittest.mock import Mock
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        messages = [
+            {"role": "system", "content": "First."},
+            {"role": "system", "content": "Second."},
+        ]
+        processor = SimpleNamespace(
+            chat_template="template",
+            apply_chat_template=Mock(return_value="original render"),
+        )
+        self.assertEqual(
+            get_chat_template(processor, messages, True), "original render"
+        )
+        processor.apply_chat_template.assert_called_once()
+        self.assertIs(processor.apply_chat_template.call_args.args[0], messages)
+
+    def test_metadata_and_later_system_messages_are_not_rewritten(self):
+        from unittest.mock import Mock
+
+        from jinja2.exceptions import TemplateError
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        for messages in (
+            [
+                {"role": "system", "content": "First.", "name": "policy"},
+                {"role": "system", "content": "Second."},
+            ],
+            [
+                {"role": "system", "content": "First."},
+                {"role": "user", "content": "Question."},
+                {"role": "system", "content": "Second."},
+            ],
+            [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "First.", "content": "Different."}
+                    ],
+                },
+                {"role": "system", "content": "Second."},
+            ],
+        ):
+            with self.subTest(messages=messages):
+                error = TemplateError("original rejection")
+                processor = SimpleNamespace(
+                    chat_template="template",
+                    apply_chat_template=Mock(side_effect=error),
+                )
+                with self.assertRaises(TemplateError) as caught:
+                    get_chat_template(processor, messages, True)
+                self.assertIs(caught.exception, error)
+                processor.apply_chat_template.assert_called_once()
+
+
+class TestLegacyStringTemplateRetry(unittest.TestCase):
+    def test_string_template_preserves_text_image_order_and_metadata(self):
+        from copy import deepcopy
+
+        from transformers.utils.chat_template_utils import render_jinja_template
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        class Processor:
+            chat_template = "{% for m in messages %}{{ '[INST]' + m.content + '[/INST]' }}{{ m.name }}{% endfor %}"
+
+            def __init__(self, marker):
+                self.image_token = marker
+
+            def apply_chat_template(self, messages, **kwargs):
+                result, _ = render_jinja_template(
+                    [messages], chat_template=self.chat_template, **kwargs
+                )
+                return result[0]
+
+        for marker in ("<image>", "[IMG]"):
+            with self.subTest(marker=marker):
+                messages = [
+                    {
+                        "role": "user",
+                        "name": "caller",
+                        "content": [
+                            {"type": "text", "text": "Before.", "content": "Before."},
+                            {"type": "image"},
+                            {"type": "text", "text": "After."},
+                        ],
+                    }
+                ]
+                original = deepcopy(messages)
+                text = get_chat_template(Processor(marker), messages, True)
+                self.assertEqual(
+                    text, "[INST]Before.\n" + marker + "\nAfter.[/INST]caller"
+                )
+                self.assertEqual(messages, original)
+
+    def test_unknown_parts_do_not_trigger_lossy_retry(self):
+        from unittest.mock import Mock
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        for part in (
+            {"type": "input_audio", "data": "abc"},
+            {"type": "image", "url": "payload"},
+            {"type": "text", "text": "A", "content": "B"},
+        ):
+            with self.subTest(part=part):
+                processor = SimpleNamespace(
+                    chat_template="template",
+                    apply_chat_template=Mock(
+                        side_effect=TypeError("original rejection")
+                    ),
+                )
+                with self.assertRaisesRegex(TypeError, "original rejection"):
+                    get_chat_template(
+                        processor, [{"role": "user", "content": [part]}], True
+                    )
+                processor.apply_chat_template.assert_called_once()
+
+
+class TestLlavaNextImagePacking(unittest.TestCase):
+    def test_merge_preserves_text_between_images_and_batch_rows(self):
+        from mlx_vlm.models.llava_next.llava_next import Model
+
+        ids = mx.array([[11, 99, 99, 12, 99, 99, 13], [21, 22, 23, 24, 25, 26, 27]])
+        text = mx.arange(28).reshape(2, 7, 2).astype(mx.float32)
+        features = mx.arange(8).reshape(2, 2, 2).astype(mx.float32) + 100
+        fake = SimpleNamespace(config=SimpleNamespace(image_token_index=99))
+        actual = Model._merge_input_ids_with_image_features(fake, features, text, ids)
+        expected = np.array(text)
+        expected[0, [1, 2, 4, 5]] = np.array(features).reshape(4, 2)
+        np.testing.assert_array_equal(np.array(actual), expected)
+        np.testing.assert_array_equal(np.array(text), np.arange(28).reshape(2, 7, 2))
+
+    def test_merge_rejects_missing_features(self):
+        from mlx_vlm.models.llava_next.llava_next import Model
+
+        fake = SimpleNamespace(config=SimpleNamespace(image_token_index=99))
+        with self.assertRaisesRegex(ValueError, "features.*tokens"):
+            Model._merge_input_ids_with_image_features(
+                fake, mx.zeros((1, 2)), mx.zeros((1, 3, 2)), mx.array([[99, 99, 1]])
+            )
+
+    def test_spatial_packing_orders_rows_and_newlines(self):
+        from mlx_vlm.models.llava_next.image_features import pack_image_features
+
+        features = mx.arange(12).reshape(3, 4, 1)
+        actual = pack_image_features(
+            [features], [(2, 4)], 2, 1, [[2, 4]], mx.array([-1])
+        )[0]
+        expected = [0, 1, 2, 3, 4, 5, 8, 9, -1, 6, 7, 10, 11, -1]
+        np.testing.assert_array_equal(np.array(actual).ravel(), expected)
+
+
+class TestLlavaNextProcessorPadding(unittest.TestCase):
+    def test_padding_and_special_tokens(self):
+        from tokenizers import Tokenizer, models, pre_tokenizers, processors
+        from transformers import PreTrainedTokenizerFast
+
+        from mlx_vlm.models.llava_next.processing_llava_next import LlavaNextProcessor
+
+        backend = Tokenizer(
+            models.WordLevel(
+                {"<pad>": 0, "<s>": 1, "a": 2, "b": 3, "<unk>": 4}, unk_token="<unk>"
+            )
+        )
+        backend.pre_tokenizer = pre_tokenizers.Whitespace()
+        backend.post_processor = processors.TemplateProcessing(
+            single="<s> $A", special_tokens=[("<s>", 1)]
+        )
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            pad_token="<pad>",
+            bos_token="<s>",
+            unk_token="<unk>",
+        )
+        processor = object.__new__(LlavaNextProcessor)
+        processor.tokenizer = tokenizer
+        inputs = processor(
+            text=["a b", "a"],
+            padding=True,
+            add_special_tokens=False,
+            padding_side="left",
+        )
+        np.testing.assert_array_equal(np.array(inputs["input_ids"]), [[2, 3], [0, 2]])
+        np.testing.assert_array_equal(
+            np.array(inputs["attention_mask"]), [[1, 1], [0, 1]]
+        )
+        inputs = processor(
+            text=["a b", "a"],
+            padding=True,
+            add_special_tokens=True,
+            padding_side="right",
+        )
+        np.testing.assert_array_equal(
+            np.array(inputs["input_ids"]), [[1, 2, 3], [1, 2, 0]]
+        )
+
+
+class TestLLMjpVLCacheAndImages(unittest.TestCase):
+    def test_cache_layout_and_continuation(self):
+        from mlx_vlm.apc import self_check_model_apc
+        from mlx_vlm.models.llmjpvl import TextConfig
+        from mlx_vlm.models.llmjpvl.language import LanguageModel
+
+        model = LanguageModel(
+            TextConfig(
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                vocab_size=32,
+            )
+        )
+        self.assertTrue(self_check_model_apc(model, log=False).ok)
+        cache = model.make_cache()
+        self.assertIsNot(cache[0], cache[1])
+        tokens = mx.array([[1, 2, 3, 4]])
+        expected = model(tokens).logits[:, -1:]
+        model(tokens[:, :3], cache=cache)
+        actual = model(tokens[:, 3:], cache=cache).logits
+        np.testing.assert_allclose(
+            np.array(actual), np.array(expected), atol=1e-5, rtol=1e-5
+        )
+        self.assertEqual([c.offset for c in cache], [4, 4])
+
+    def test_image_scatter_preserves_other_rows(self):
+        from mlx_vlm.models.llmjpvl.llmjpvl import Model
+
+        ids = mx.array([[14, 1, 2, 3], [4, 5, 6, 7], [8, 14, 9, 14]])
+        embeddings = mx.arange(24).reshape(3, 4, 2).astype(mx.float32)
+        features = mx.array([[100, 101], [200, 201], [300, 301]], dtype=mx.float32)
+        fake = SimpleNamespace(config=SimpleNamespace(image_token_index=14))
+        actual = Model._merge_input_ids_with_image_features(
+            fake, features, embeddings, ids
+        )
+        expected = np.arange(24).reshape(3, 4, 2).astype(np.float32)
+        expected[0, 0] = [100, 101]
+        expected[2, 1] = [200, 201]
+        expected[2, 3] = [300, 301]
+        np.testing.assert_array_equal(np.array(actual), expected)
+        np.testing.assert_array_equal(
+            np.array(embeddings), np.arange(24).reshape(3, 4, 2)
+        )
+
+
+class TestErnie45LocalTokenizer(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import tempfile
+        from pathlib import Path
+
+        import sentencepiece as spm
+
+        from mlx_vlm.models.ernie4_5.tokenization_ernie4_5 import Ernie45Tokenizer
+
+        cls.directory = tempfile.TemporaryDirectory()
+        prefix = str(Path(cls.directory.name) / "tokenizer")
+        spm.SentencePieceTrainer.train(
+            sentence_iterator=iter(["hello world", "hello again", "test tokens"] * 10),
+            model_prefix=prefix,
+            vocab_size=32,
+            hard_vocab_limit=False,
+            user_defined_symbols=["<cls>", "<sep>", "<mask:0>", "<mask:1>", "<mask:7>"],
+            minloglevel=2,
+        )
+        cls.tokenizer = Ernie45Tokenizer(prefix + ".model", pad_token="<unk>")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.directory.cleanup()
+
+    def test_special_token_boundaries_and_pair(self):
+        tokenizer = self.tokenizer
+        ids = tokenizer.encode("hello", add_special_tokens=False)
+        self.assertEqual(
+            tokenizer.build_inputs_with_special_tokens(ids),
+            [
+                tokenizer.bos_token_id,
+                tokenizer.cls_token_id,
+                *ids,
+                tokenizer.sep_token_id,
+            ],
+        )
+        marked = [tokenizer.cls_token_id, *ids]
+        self.assertEqual(
+            tokenizer.build_inputs_with_special_tokens(marked, ids),
+            [tokenizer.bos_token_id, *marked, *ids, tokenizer.sep_token_id],
+        )
+
+    def test_padding_preserves_causal_mask(self):
+        tokenizer = self.tokenizer
+        for side in ("left", "right"):
+            tokenizer.padding_side = side
+            data = tokenizer(
+                ["hello", "hello world again"], padding=True, add_special_tokens=False
+            )
+            for row, text in enumerate(["hello", "hello world again"]):
+                ids = tokenizer.encode(text, add_special_tokens=False)
+                start = len(data["input_ids"][row]) - len(ids) if side == "left" else 0
+                self.assertEqual(data["input_ids"][row][start : start + len(ids)], ids)
+                mask = np.array(data["attention_mask"][row])[0]
+                expected = np.zeros_like(mask)
+                expected[start : start + len(ids), start : start + len(ids)] = np.tril(
+                    np.ones((len(ids), len(ids)))
+                )
+                np.testing.assert_array_equal(mask, expected)
+
+
+class TestMoondreamPackedCheckpoint(unittest.TestCase):
+    def test_unpack_nibble_order_groups_and_idempotence(self):
+        from mlx_vlm.models.moondream2.moondream2 import Model
+
+        weights = {
+            "model.text.blocks.0.attn.proj.weight.packed": mx.array(
+                [[0x12, 0x34]], dtype=mx.uint8
+            ),
+            "model.text.blocks.0.attn.proj.weight.scale": mx.array([[2.0], [3.0]]),
+            "model.text.blocks.0.attn.proj.weight.zero_point": mx.array([[1.0], [2.0]]),
+            "model.text.blocks.0.attn.proj.bias": mx.array([0.0, 1.0]),
+            "model.region.unused": mx.array([1]),
+        }
+        result = Model.sanitize(None, weights)
+        self.assertEqual(
+            set(result),
+            {
+                "text.model.layers.0.attn.proj.weight",
+                "text.model.layers.0.attn.proj.bias",
+            },
+        )
+        np.testing.assert_array_equal(
+            np.array(result["text.model.layers.0.attn.proj.weight"].astype(mx.float32)),
+            [[0, 4], [0, 6]],
+        )
+        again = Model.sanitize(None, result)
+        self.assertEqual(set(result), set(again))
+        for key in result:
+            self.assertTrue(mx.array_equal(result[key], again[key]).item())
+        self.assertIn("model.text.blocks.0.attn.proj.weight.packed", weights)
+
+    def test_legacy_checkpoint_stop_tokens(self):
+        from mlx_vlm.models.moondream2 import ModelConfig
+
+        self.assertEqual(
+            ModelConfig.from_dict({"model_type": "moondream1"}).eos_token_id, 50256
+        )
+        self.assertEqual(
+            ModelConfig.from_dict(
+                {"model_type": "moondream1", "eos_token_id": 7}
+            ).eos_token_id,
+            7,
+        )
+        self.assertEqual(
+            ModelConfig.from_dict({"model_type": "moondream2"}).eos_token_id, 0
+        )
+
+
+class TestMoondreamCropFidelity(unittest.TestCase):
+    def test_reference_crop_grid_and_pixel_rounding(self):
+        from PIL import Image
+
+        from mlx_vlm.models.moondream2.image_crops import create_crops
+
+        crops, layout = create_crops(
+            Image.new("RGB", (600, 400), (128, 128, 128)), 378, 12, 4
+        )
+        self.assertEqual(layout, (2, 4))
+        self.assertEqual(len(crops), 9)
+        np.testing.assert_array_equal(
+            np.stack(crops), np.full((9, 378, 378, 3), 0.0078125)
+        )
+
+    def test_reconstruction_uses_overlapping_adaptive_pool_bins(self):
+        from mlx_vlm.models.moondream2.vision import VisionModel
+
+        fake = SimpleNamespace(
+            config=SimpleNamespace(crop_size=4, patch_size=1, overlap_margin=1)
+        )
+        features = [
+            mx.arange(16).reshape(16, 1).astype(mx.float32) + 100 * i for i in range(6)
+        ]
+        actual = VisionModel._reconstruct_local_features(fake, features, (2, 3))
+        rows = []
+        for r in range(2):
+            parts = []
+            for c in range(3):
+                tile = np.array(features[r * 3 + c]).reshape(4, 4)
+                parts.append(
+                    tile[
+                        0 if r == 0 else 1 : 4 if r == 1 else 3,
+                        0 if c == 0 else 1 : 4 if c == 2 else 3,
+                    ]
+                )
+            rows.append(np.concatenate(parts, axis=1))
+        grid = np.concatenate(rows, axis=0)
+        expected = np.array(
+            [
+                [
+                    grid[
+                        math.floor(i * grid.shape[0] / 4) : math.ceil(
+                            (i + 1) * grid.shape[0] / 4
+                        ),
+                        math.floor(j * grid.shape[1] / 4) : math.ceil(
+                            (j + 1) * grid.shape[1] / 4
+                        ),
+                    ].mean()
+                    for j in range(4)
+                ]
+                for i in range(4)
+            ]
+        )
+        np.testing.assert_array_equal(np.array(actual).reshape(4, 4), expected)
+
+
+class TestMoondream3VideoPrefix(unittest.TestCase):
+    def test_all_frame_features_and_question_survive(self):
+        from mlx_vlm.models.moondream3.moondream3 import Model
+
+        ids = mx.array([[7, 0, 0, 0, 0, 41, 42]])
+        features = mx.array(
+            [[[100.0, 101.0], [102.0, 103.0]], [[200.0, 201.0], [202.0, 203.0]]]
+        )
+        fake = SimpleNamespace(
+            text=SimpleNamespace(
+                model=SimpleNamespace(
+                    wte=lambda x: mx.stack([x, x], axis=-1).astype(mx.float32)
+                )
+            ),
+            _create_prefix_attention_mask=lambda *args, **kwargs: None,
+        )
+        result = Model.get_input_embeddings(
+            fake,
+            ids,
+            pixel_values=mx.zeros((2, 1, 1, 3)),
+            cached_image_features=features,
+        )
+        expected = mx.concatenate(
+            [
+                mx.array([[[7.0, 7.0]]]),
+                features.reshape(1, 4, 2),
+                mx.array([[[41.0, 41.0], [42.0, 42.0]]]),
+            ],
+            axis=1,
+        )
+        np.testing.assert_array_equal(
+            np.array(result.inputs_embeds), np.array(expected)
+        )
+
+    def test_processor_reserves_space_for_every_frame(self):
+        from unittest.mock import patch
+
+        from mlx_vlm.models.moondream3.processing_moondream3 import (
+            ANSWER_ID,
+            NUM_VISION_TOKENS,
+            Moondream3Processor,
+        )
+
+        tokenizer = SimpleNamespace(
+            bos_token_id=7,
+            pad_token_id=0,
+            bos_token="<s>",
+            eos_token="</s>",
+            pad_token="<pad>",
+            encode=lambda text, **kwargs: [41, 42],
+            chat_template=None,
+        )
+        processor = Moondream3Processor(tokenizer)
+        with patch(
+            "mlx_vlm.models.moondream3.processing_moondream3.create_crops",
+            return_value=([np.zeros((1, 1, 3))], (1, 1)),
+        ):
+            inputs = processor(text="Keep this question.", images=[object(), object()])
+        ids = inputs["input_ids"][0].tolist()
+        self.assertEqual(ids, [7] + [0] * (2 * NUM_VISION_TOKENS) + [41, 42, ANSWER_ID])
+
+
+class TestMoondream2PrefixAttention(unittest.TestCase):
+    def test_generation_mask_matches_explicit_mask_and_cached_continuation(self):
+        from mlx_vlm.generate.common import _chunked_prefill_enabled
+        from mlx_vlm.models.cache import KVCache
+        from mlx_vlm.models.moondream2.config import TextConfig
+        from mlx_vlm.models.moondream2.language import LanguageModel
+
+        mx.random.seed(7)
+        model = LanguageModel(
+            TextConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                vocab_size=64,
+                num_attention_heads=4,
+                num_key_value_heads=4,
+            )
+        )
+        ids = mx.array([[1, 2, 3, 4, 5]])
+        mask = mx.triu(mx.full((5, 5), -mx.inf), k=1)
+        mask[:4, :4] = 0
+        mask = mask[None, None]
+        expected = model(ids, mask=mask).logits
+        caches = [KVCache() for _ in model.layers]
+        actual = model(ids, attention_mask_4d=mask, cache=caches).logits
+        np.testing.assert_allclose(np.array(actual), np.array(expected), atol=1e-6)
+        self.assertFalse(
+            _chunked_prefill_enabled(model, prefill_kwargs={"attention_mask_4d": mask})
+        )
+        self.assertTrue(_chunked_prefill_enabled(model))
+        continuation = model(
+            mx.array([[6]]), attention_mask_4d=mask, cache=caches
+        ).logits
+        full_mask = mx.triu(mx.full((6, 6), -mx.inf), k=1)
+        full_mask[:4, :4] = 0
+        full = model(mx.array([[1, 2, 3, 4, 5, 6]]), mask=full_mask[None, None]).logits
+        np.testing.assert_allclose(
+            np.array(continuation[:, -1]),
+            np.array(full[:, -1]),
+            atol=2e-6,
+        )
+
+    def test_float_mask_is_valid_for_bfloat16_attention(self):
+        from mlx_vlm.models.moondream2.config import TextConfig
+        from mlx_vlm.models.moondream2.language import Attention
+
+        model = Attention(
+            TextConfig(hidden_size=32, num_attention_heads=4, num_key_value_heads=4)
+        )
+        model.set_dtype(mx.bfloat16)
+        inputs = mx.ones((1, 4, 32), dtype=mx.bfloat16)
+        mask = mx.triu(mx.full((4, 4), -mx.inf), k=1)
+        actual = model(inputs, mask=mask)
+        expected = model(inputs, mask=mask.astype(mx.bfloat16))
+        np.testing.assert_array_equal(
+            np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+        )
+
+
+class TestMoondream2PaddedImages(unittest.TestCase):
+    def test_padded_rows_match_independent_embeddings_and_masks(self):
+        from mlx_vlm.models.moondream2.moondream2 import Model
+
+        features = mx.array(
+            [[[100.0, 101.0], [102.0, 103.0]], [[200.0, 201.0], [202.0, 203.0]]]
+        )
+        fake = SimpleNamespace(
+            text=SimpleNamespace(
+                model=SimpleNamespace(
+                    embed_tokens=lambda x: mx.stack([x, x], axis=-1).astype(mx.float32)
+                )
+            ),
+            vision=lambda *args, **kwargs: features,
+            _create_prefix_attention_mask=lambda n, p: Model._create_prefix_attention_mask(
+                None, n, p
+            ),
+        )
+        ids = mx.array([[0, 0, 7, 0, 0, 41, 42], [7, 0, 0, 51, 52, 53, 54]])
+        valid = mx.array([[0, 0, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1]])
+        result = Model.get_input_embeddings(
+            fake, ids, mx.zeros((2, 1, 1, 3)), mask=valid
+        )
+        for row, start in enumerate((2, 0)):
+            single = SimpleNamespace(**vars(fake))
+            single.vision = lambda *args, row=row, **kwargs: features[row : row + 1]
+            expected = Model.get_input_embeddings(
+                single, ids[row : row + 1, start:], mx.zeros((1, 1, 1, 3))
+            )
+            np.testing.assert_array_equal(
+                np.array(result.inputs_embeds[row : row + 1, start:]),
+                np.array(expected.inputs_embeds),
+            )
+            np.testing.assert_array_equal(
+                np.array(result.attention_mask_4d[row : row + 1, :, start:, start:]),
+                np.array(expected.attention_mask_4d),
+            )
+        self.assertTrue(
+            bool(mx.all(mx.isneginf(result.attention_mask_4d[0, :, 2:, :2])))
+        )
+
+
+class TestMoondream2NativeCache(unittest.TestCase):
+    def test_factory_preserves_cached_continuation(self):
+        from mlx_vlm.models.cache import KVCache
+        from mlx_vlm.models.moondream2.config import TextConfig
+        from mlx_vlm.models.moondream2.language import LanguageModel
+
+        mx.random.seed(11)
+        model = LanguageModel(
+            TextConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                vocab_size=64,
+                num_attention_heads=4,
+                num_key_value_heads=4,
+            )
+        )
+        cache = model.make_cache()
+        self.assertEqual(len(cache), 2)
+        self.assertTrue(all(isinstance(c, KVCache) for c in cache))
+        self.assertIsNot(cache[0], cache[1])
+        self.assertIsNot(cache[0], model.make_cache()[0])
+        model(mx.array([[1, 2, 3, 4]]), cache=cache)
+        actual = model(mx.array([[5]]), cache=cache).logits
+        expected = model(mx.array([[1, 2, 3, 4, 5]])).logits[:, -1:]
+        np.testing.assert_allclose(np.array(actual), np.array(expected), atol=2e-6)
+
+
+class TestMolmoHistoryRendering(unittest.TestCase):
+    def test_rich_history_preserves_roles_and_call_metadata(self):
+        import copy
+
+        from mlx_vlm.models.molmo.processing_molmo import MolmoProcessor
+
+        processor = SimpleNamespace(
+            chat_template="{% for message in messages %}{{ message['content'] }}{% endfor %}",
+            tokenizer=SimpleNamespace(encode=lambda x: list(x.encode())),
+        )
+        messages = [
+            {"role": "system", "content": "SYSTEM_MARKER"},
+            {"role": "user", "content": "USER_MARKER"},
+            {
+                "role": "assistant",
+                "content": "ASSISTANT_MARKER",
+                "reasoning_content": "REASONING_MARKER",
+                "tool_calls": [
+                    {
+                        "id": "CALL_MARKER",
+                        "type": "function",
+                        "function": {
+                            "name": "FUNCTION_MARKER",
+                            "arguments": '{"path":"ARGUMENT_MARKER"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "CALL_MARKER", "content": "RESULT_MARKER"},
+            {"role": "user", "content": "FOLLOWUP_MARKER"},
+        ]
+        original = copy.deepcopy(messages)
+        rendered = MolmoProcessor.apply_chat_template(
+            processor, messages, add_generation_prompt=True
+        )
+        for marker in (
+            "SYSTEM_MARKER",
+            "USER_MARKER",
+            "ASSISTANT_MARKER",
+            "REASONING_MARKER",
+            "CALL_MARKER",
+            "FUNCTION_MARKER",
+            "ARGUMENT_MARKER",
+            "RESULT_MARKER",
+            "FOLLOWUP_MARKER",
+        ):
+            self.assertIn(marker, rendered)
+        self.assertIn("System:", rendered)
+        self.assertIn("Tool:", rendered)
+        self.assertTrue(rendered.endswith("Assistant:"))
+        self.assertEqual(messages, original)
+        self.assertEqual(
+            MolmoProcessor.apply_chat_template(
+                processor, messages, add_generation_prompt=True, tokenize=True
+            ),
+            list(rendered.encode()),
+        )
+
+    def test_explicit_template_and_tokenization_keep_existing_contract(self):
+        from mlx_vlm.models.molmo.processing_molmo import MolmoProcessor
+
+        calls = []
+
+        def render(messages, **kwargs):
+            calls.append((messages, kwargs))
+            return "CUSTOM_TEXT"
+
+        processor = SimpleNamespace(
+            chat_template="DEFAULT_TEMPLATE",
+            tokenizer=SimpleNamespace(
+                apply_chat_template=render, encode=lambda text: [99, len(text)]
+            ),
+        )
+        messages = [{"role": "system", "content": "Keep this instruction"}]
+        actual = MolmoProcessor.apply_chat_template(
+            processor, messages, chat_template="EXPLICIT_TEMPLATE", tokenize=True
+        )
+        self.assertEqual(actual, [99, len("CUSTOM_TEXT")])
+        self.assertEqual(calls[0][0], messages)
+        self.assertEqual(calls[0][1]["chat_template"], "EXPLICIT_TEMPLATE")
+        self.assertFalse(calls[0][1]["tokenize"])
+
+    def test_available_tools_survive_without_prior_tool_calls(self):
+        import json
+
+        from mlx_vlm.models.molmo.processing_molmo import MolmoProcessor
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read café_λ",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            }
+        ]
+        processor = SimpleNamespace(
+            chat_template="unused",
+            tokenizer=SimpleNamespace(
+                apply_chat_template=lambda *args, **kwargs: "User: Read the file."
+            ),
+        )
+        rendered = MolmoProcessor.apply_chat_template(
+            processor,
+            [{"role": "user", "content": "Read the file."}],
+            tools=tools,
+            add_generation_prompt=True,
+        )
+        first, rest = rendered.split("\n", 1)
+        self.assertEqual(json.loads(first.removeprefix("Available tools: ")), tools)
+        self.assertEqual(rest, "User: Read the file.\nAssistant:")
+
+
+class TestLLMjpVLHistoryRendering(unittest.TestCase):
+    def _processor(self):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast, SiglipImageProcessor
+
+        from mlx_vlm.models.llmjpvl.processing_llmjpvl import LLMjpVLProcessor
+
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+            unk_token="[UNK]",
+        )
+        tokenizer.chat_template = (
+            "{% for m in messages %}{{ m['role'] }}:{{ m['content'] }};{% endfor %}"
+        )
+        return LLMjpVLProcessor(SiglipImageProcessor(), tokenizer)
+
+    def test_all_roles_metadata_and_tool_definitions_are_preserved(self):
+        processor = self._processor()
+        messages = [
+            {"role": "system", "content": "FIRST_SYSTEM"},
+            {"role": "system", "content": "SECOND_SYSTEM"},
+            {
+                "role": "assistant",
+                "content": "ANSWER",
+                "reasoning_content": "REASONING",
+                "tool_calls": [
+                    {
+                        "id": "CALL_ID",
+                        "type": "function",
+                        "function": {
+                            "name": "FUNCTION_NAME",
+                            "arguments": '{"key":"ARGUMENT_VALUE"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "content": "TOOL_RESULT", "tool_call_id": "CALL_ID"},
+            {"role": "user", "content": "FOLLOWUP"},
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "AVAILABLE_TOOL",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"PARAMETER_NAME": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        result = processor.apply_chat_template(
+            messages, tools=tools, tokenize=False, add_generation_prompt=True
+        )
+        for marker in (
+            "FIRST_SYSTEM",
+            "SECOND_SYSTEM",
+            "ANSWER",
+            "REASONING",
+            "CALL_ID",
+            "FUNCTION_NAME",
+            "ARGUMENT_VALUE",
+            "TOOL_RESULT",
+            "FOLLOWUP",
+            "AVAILABLE_TOOL",
+            "PARAMETER_NAME",
+        ):
+            self.assertIn(marker, result)
+        self.assertLess(result.index("FIRST_SYSTEM"), result.index("SECOND_SYSTEM"))
+        self.assertIn("<|start|>tool<|message|>TOOL_RESULT", result)
+        self.assertTrue(
+            result.endswith("<|start|>assistant<|channel|>final<|message|>")
+        )
+
+    def test_ordinary_history_and_explicit_override_remain_native(self):
+        processor = self._processor()
+        messages = [{"role": "user", "content": "hello"}]
+        self.assertEqual(
+            processor.apply_chat_template(messages, tokenize=False), "user:hello;"
+        )
+        rich = [{"role": "tool", "content": "result"}]
+        self.assertEqual(
+            processor.apply_chat_template(
+                rich, chat_template="EXPLICIT", tokenize=False
+            ),
+            "EXPLICIT",
+        )
+
+    def test_batched_history_keeps_each_conversation(self):
+        processor = self._processor()
+        ordinary = [{"role": "user", "content": "hello"}]
+        self.assertEqual(
+            processor.apply_chat_template([ordinary, ordinary], tokenize=False),
+            ["user:hello;", "user:hello;"],
+        )
+        rich = [{"role": "tool", "content": "TOOL_RESULT", "tool_call_id": "CALL_ID"}]
+        rendered = processor.apply_chat_template([rich, rich], tokenize=False)
+        self.assertEqual(len(rendered), 2)
+        self.assertEqual(rendered[0], rendered[1])
+        self.assertIn("TOOL_RESULT", rendered[0])
+        self.assertIn("CALL_ID", rendered[0])
+
+
+class TestAPCFullPromptBoundary(unittest.TestCase):
+    def test_full_match_keeps_usable_blocks_and_releases_tail(self):
+        from mlx_vlm.apc import apc_lookup_plan
+
+        for length in (16, 48):
+            with self.subTest(length=length):
+                blocks = list(range(length // 16))
+                released = []
+                manager = SimpleNamespace(
+                    block_size=16,
+                    lookup_prefix=lambda *args, **kwargs: (blocks.copy(), length),
+                    lookup_exact_cache=lambda *args, **kwargs: (None, 0),
+                    lookup_prefix_disk_cache=lambda *args, **kwargs: (None, 0),
+                    release=lambda values: released.extend(values),
+                )
+                result = apc_lookup_plan(
+                    manager,
+                    list(range(length)),
+                    extra_hash=0,
+                    apc_mode="block",
+                    safe_lookup_min=0,
+                    suffix_is_text_only=lambda n: True,
+                    prefix_has_media=lambda n: False,
+                )
+                if length == 16:
+                    self.assertIsNone(result)
+                    self.assertEqual(released, blocks)
+                else:
+                    self.assertIsNotNone(result)
+                    self.assertEqual(result["prefix_len"], length - 16)
+                    self.assertEqual(result["matched_blocks"], blocks[:-1])
+                    self.assertEqual(released, blocks[-1:])
+
+
+class TestBunnyMultipleImages(unittest.TestCase):
+    def test_preparation_keeps_all_chunks_and_expands_image_slots(self):
+        from PIL import Image
+
+        from mlx_vlm.models.base import BaseImageProcessor
+        from mlx_vlm.utils import prepare_inputs
+
+        class ImageProcessor(BaseImageProcessor):
+            image_seq_length = 2
+
+            def preprocess(self, images):
+                return [np.zeros((3, 2, 2)) for _ in images]
+
+        class Tokenizer:
+            pad_token = "pad"
+            pad_token_id = 0
+            eos_token = "eos"
+            image_processor = ImageProcessor()
+
+            def __call__(self, text, **kwargs):
+                return SimpleNamespace(input_ids=[ord(c) for c in text])
+
+        result = prepare_inputs(
+            Tokenizer(),
+            images=[Image.new("RGB", (2, 2))] * 2,
+            prompts="A<image>B<image>C",
+            image_token_index=-200,
+        )
+        self.assertEqual(
+            result["input_ids"].tolist(), [[65, -200, -200, 66, -200, -200, 67]]
+        )
+        self.assertEqual(result["attention_mask"].tolist(), [[1] * 7])
+
+    def test_expanded_image_slots_keep_intervening_text_and_rows(self):
+        from mlx_vlm.models.llava_bunny.llava_bunny import Model
+
+        fake = SimpleNamespace(config=SimpleNamespace(image_token_index=-200))
+        ids = mx.array(
+            [[7, -200, -200, 8, -200, -200, 9], [10, 11, 12, 13, 14, 15, 16]]
+        )
+        embeddings = mx.stack([ids, ids], axis=-1).astype(mx.float32)
+        features = mx.array(
+            [[[100.0, 101.0], [102.0, 103.0]], [[200.0, 201.0], [202.0, 203.0]]]
+        )
+        actual = Model._prepare_inputs_for_multimodal(fake, features, embeddings, ids)
+        expected = np.array(embeddings)
+        expected[0, 1:3] = np.array(features[0])
+        expected[0, 4:6] = np.array(features[1])
+        np.testing.assert_array_equal(np.array(actual), expected)
+        np.testing.assert_array_equal(
+            np.array(embeddings), np.array(mx.stack([ids, ids], axis=-1))
+        )
+
+
+class TestPaliGemmaMultipleImages(unittest.TestCase):
+    def test_vision_encoder_preserves_every_image(self):
+        from mlx_vlm.models.paligemma.vision import Encoder
+
+        fake = SimpleNamespace(layers=[lambda x, mask: x + 1])
+        images = mx.arange(24).reshape(2, 3, 4).astype(mx.float32)
+        encoded, states = Encoder.__call__(fake, images, output_hidden_states=True)
+        np.testing.assert_array_equal(np.array(encoded), np.array(images + 1))
+        self.assertEqual(states[-1].shape, (2, 3, 4))
+
+    def test_image_features_follow_slots_across_rows(self):
+        from mlx_vlm.models.paligemma.paligemma import Model
+
+        fake = SimpleNamespace(
+            config=SimpleNamespace(hidden_size=4, image_token_index=19, pad_token_id=0)
+        )
+        ids = mx.array([[19, 19, 1, 19, 19, 2], [0, 0, 0, 3, 4, 5]])
+        embeddings = mx.stack([ids] * 4, axis=-1).astype(mx.float32)
+        features = mx.arange(16).reshape(2, 2, 4).astype(mx.float32) + 100
+        valid = ids != 0
+        actual, mask = Model._prepare_inputs_for_multimodal(
+            fake, features, embeddings, ids, valid
+        )
+        expected = np.array(embeddings)
+        expected[0, :2] = np.array(features[0] / 2)
+        expected[0, 3:5] = np.array(features[1] / 2)
+        np.testing.assert_array_equal(np.array(actual), expected)
+        self.assertEqual(mask.shape, (2, 1, 6, 6))
+        self.assertFalse(bool(mx.any(mask[1, :, 3:, :3])))
+
+
+class TestPaliGemmaHistoryRendering(unittest.TestCase):
+    def test_history_and_tools_are_not_reduced_to_last_message(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        processor = SimpleNamespace(chat_template=None)
+        config = SimpleNamespace(model_type="paligemma")
+        messages = [
+            {"role": "system", "content": "SYSTEM_MARKER"},
+            {"role": "user", "content": "FIRST_MARKER"},
+            {
+                "role": "assistant",
+                "content": "ANSWER_MARKER",
+                "tool_calls": [
+                    {
+                        "id": "CALL_MARKER",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "CALL_MARKER", "content": "RESULT_MARKER"},
+            {"role": "user", "content": "LAST_MARKER"},
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "SCHEMA_MARKER", "parameters": {"type": "object"}},
+            }
+        ]
+        rendered = apply_chat_template(processor, config, messages, tools=tools)
+        for marker in (
+            "SYSTEM_MARKER",
+            "FIRST_MARKER",
+            "ANSWER_MARKER",
+            "CALL_MARKER",
+            "RESULT_MARKER",
+            "LAST_MARKER",
+            "SCHEMA_MARKER",
+        ):
+            self.assertIn(marker, rendered)
+
+
+class TestPaliGemmaAttentionPolicy(unittest.TestCase):
+    def _model(self, bidirectional=True):
+        from mlx_vlm.models.paligemma.config import TextConfig
+        from mlx_vlm.models.paligemma.language import LanguageModel
+
+        mx.random.seed(3)
+        return LanguageModel(
+            TextConfig(
+                hidden_size=32,
+                num_hidden_layers=2,
+                intermediate_size=64,
+                num_attention_heads=4,
+                num_key_value_heads=1,
+                vocab_size=64,
+                use_bidirectional_attention=bidirectional,
+            )
+        )
+
+    def test_bidirectional_attention_rejects_chunking_and_prefix_reuse(self):
+        from mlx_vlm.apc import APCManager
+        from mlx_vlm.apc_coordinator import APCCoordinator
+        from mlx_vlm.generate.common import _chunked_prefill_enabled
+
+        for bidirectional in (True, False):
+            model = self._model(bidirectional)
+            self.assertEqual(_chunked_prefill_enabled(model), not bidirectional)
+            coordinator = APCCoordinator(APCManager(num_blocks=8, block_size=16), model)
+            self.assertEqual(coordinator.enabled, not bidirectional)
+
+    def test_generation_mask_matches_explicit_padding_mask(self):
+        model = self._model()
+        ids = mx.array([[0, 0, 1, 2, 3]])
+        valid = ids != 0
+        mask = mx.where(
+            valid[:, :, None], valid[:, None, :], mx.eye(5, dtype=mx.bool_)[None]
+        )[:, None]
+        expected = model(ids, mask=mask).logits
+        actual = model(ids, attention_mask_4d=mask).logits
+        np.testing.assert_allclose(np.array(actual), np.array(expected), atol=1e-6)
+
+    def test_only_causal_prefix_is_independent_of_later_tokens(self):
+        from mlx_vlm.models.cache import KVCache
+
+        for bidirectional in (True, False):
+            model = self._model(bidirectional)
+            caches = [KVCache() for _ in model.layers]
+            model(mx.array([[1, 2, 3, 4, 5, 6]]), cache=caches)
+            for cache in caches:
+                cache.trim(3)
+            reused = model(mx.array([[4, 5, 9]]), cache=caches).logits[:, -1]
+            expected = model(mx.array([[1, 2, 3, 4, 5, 9]])).logits[:, -1]
+            error = float(mx.max(mx.abs(reused - expected)).item())
+            if bidirectional:
+                self.assertGreater(error, 1e-3)
+            else:
+                self.assertLess(error, 1e-5)
+
+
+class TestAlternatingRoleHistory(unittest.TestCase):
+    TEMPLATE = """{{ bos_token }}{% for message in messages %}{% if (message.role == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate') }}{% endif %}{{ '<start_of_turn>' + ('model' if message.role == 'assistant' else message.role) + '\n' }}{% if message.content is string %}{{ message.content | trim }}{% else %}{% for part in message.content %}{% if part.type == 'text' %}{{ part.text }}{% elif part.type == 'image' %}{{ '<start_of_image>' }}{% elif part.type == 'audio' %}{{ '<audio_soft_token>' }}{% endif %}{% endfor %}{% endif %}{{ '<end_of_turn>\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<start_of_turn>model\n' }}{% endif %}"""
+
+    def _tokenizer(self, template=None):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        return PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+            unk_token="[UNK]",
+            chat_template=template or self.TEMPLATE,
+        )
+
+    def test_tool_history_retains_metadata_and_does_not_mutate(self):
+        import copy
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        messages = [
+            {"role": "user", "content": "USER"},
+            {
+                "role": "assistant",
+                "content": "ANSWER",
+                "reasoning_content": "REASON",
+                "tool_calls": [
+                    {
+                        "id": "CALL_ID",
+                        "function": {
+                            "name": "FUNCTION",
+                            "arguments": '{"path":"ARGUMENT"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "CALL_ID", "content": "RESULT"},
+            {"role": "user", "content": "NEXT"},
+        ]
+        original = copy.deepcopy(messages)
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "FUNCTION", "description": "SCHEMA"},
+            }
+        ]
+        rendered = get_chat_template(self._tokenizer(), messages, True, tools=tools)
+        for marker in [
+            "USER",
+            "ANSWER",
+            "REASON",
+            "CALL_ID",
+            "FUNCTION",
+            "ARGUMENT",
+            "RESULT",
+            "NEXT",
+            "SCHEMA",
+            '"role": "tool"',
+        ]:
+            self.assertIn(marker, rendered)
+        self.assertEqual(messages, original)
+        self.assertEqual(rendered.count("<start_of_turn>"), 4)
+
+    def test_ordinary_and_explicit_templates_are_unchanged(self):
+        from jinja2.exceptions import TemplateError
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        tokenizer = self._tokenizer()
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "next"},
+        ]
+        for tokenize in [False, True]:
+            self.assertEqual(
+                get_chat_template(tokenizer, messages, True, tokenize),
+                tokenizer.apply_chat_template(
+                    messages, tokenize=tokenize, add_generation_prompt=True
+                ),
+            )
+        rich = messages[:2] + [{"role": "tool", "content": "result"}]
+        with self.assertRaises(TemplateError):
+            get_chat_template(tokenizer, rich, True, chat_template=self.TEMPLATE)
+
+    def test_tool_aware_template_keeps_native_messages(self):
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        template = (
+            "<start_of_turn>{{ messages | tojson }}{{ tools | tojson }}<end_of_turn>"
+        )
+        tokenizer = self._tokenizer(template)
+        messages = [{"role": "tool", "content": "RESULT", "tool_call_id": "CALL"}]
+        tools = [{"type": "function", "function": {"name": "FUNCTION"}}]
+        self.assertEqual(
+            get_chat_template(tokenizer, messages, True, tools=tools),
+            tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, tools=tools
+            ),
+        )
+
+    def test_media_order_and_system_role_survive(self):
+        import copy
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        template = (
+            "{% if messages[0].role == 'system' %}{{ raise_exception('System role not supported') }}{% endif %}"
+            + self.TEMPLATE
+        )
+        messages = [
+            {"role": "system", "content": "SYSTEM"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "BEFORE"},
+                    {"type": "image"},
+                    {"type": "text", "text": "AFTER"},
+                    {"type": "audio"},
+                ],
+            },
+            {"role": "assistant", "content": "ANSWER"},
+            {"role": "tool", "content": "RESULT"},
+            {
+                "role": "user",
+                "content": [{"type": "image"}, {"type": "text", "text": "LAST"}],
+            },
+        ]
+        original = copy.deepcopy(messages)
+        rendered = get_chat_template(self._tokenizer(template), messages, True)
+        position = 0
+        for marker in [
+            "SYSTEM",
+            "BEFORE",
+            "<start_of_image>",
+            "AFTER",
+            "<audio_soft_token>",
+            "ANSWER",
+            "RESULT",
+            "<start_of_image>",
+            "LAST",
+        ]:
+            position = rendered.index(marker, position) + len(marker)
+        self.assertEqual(messages, original)
+
+    def test_alternating_template_without_system_support_keeps_system_text(self):
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        template = (
+            "{{ bos_token }}{% for message in messages %}"
+            "{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}"
+            "{{ raise_exception('Conversation roles must alternate') }}{% endif %}"
+            "{% if message['role'] == 'user' %}{{ '[INST] ' + message['content'] + ' [/INST]' }}"
+            "{% elif message['role'] == 'assistant' %}{{ message['content'] }}"
+            "{% else %}{{ raise_exception('Only user and assistant roles are supported!') }}"
+            "{% endif %}{% endfor %}"
+        )
+        messages = [
+            {"role": "system", "content": "BE_CONCISE"},
+            {"role": "system", "content": "KEEP_PATHS"},
+            {"role": "user", "content": "QUESTION"},
+        ]
+        rendered = get_chat_template(self._tokenizer(template), messages, True)
+        for marker in ["BE_CONCISE", "KEEP_PATHS", "QUESTION", '"role": "system"']:
+            self.assertIn(marker, rendered)
+
+    def test_processor_owning_its_rendering_is_skipped(self):
+        from mlx_vlm.prompt_utils import _alternating_role_history
+
+        class OwnRenderer:
+            chat_template = "{{ raise_exception('Conversation roles must alternate') }}"
+
+            def apply_chat_template(self, messages, **kwargs):
+                return ""
+
+        messages = [{"role": "tool", "content": "RESULT", "tool_call_id": "CALL"}]
+        self.assertIs(
+            _alternating_role_history(messages, OwnRenderer(), tools=[{"a": 1}]),
+            messages,
+        )
+
+
+class TestTemplateToolHistory(unittest.TestCase):
+    TEMPLATE = """{% for message in messages %}{% if message.tool_calls is defined and message.tool_calls is not none %}{% for call in message.tool_calls %}{% if not call.id is defined or call.id|length != 9 %}{{ raise_exception('Tool call IDs should be alphanumeric strings with length 9!') }}{% endif %}{{ '[TOOL_CALLS] ' + call.function|tojson + ' id=' + call.id }}{% endfor %}{% elif message.role == 'tool' %}{% if not message.tool_call_id is defined or message.tool_call_id|length != 9 %}{{ raise_exception('Tool call IDs should be alphanumeric strings with length 9!') }}{% endif %}{{ '[TOOL_RESULTS] ' + message.content + ' call_id=' + message.tool_call_id }}{% elif message.role == 'user' %}{{ '[INST]' + message.content + '[/INST]' }}{% else %}{{ ' ' + message.content }}{% endif %}{% endfor %}"""
+
+    HISTORY = [
+        {"role": "user", "content": "QUESTION"},
+        {
+            "role": "assistant",
+            "content": "SPOKEN",
+            "tool_calls": [
+                {
+                    "id": "call_saved",
+                    "type": "function",
+                    "function": {"name": "FUNCTION", "arguments": '{"path":"ARG"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_saved", "content": "RESULT"},
+    ]
+
+    def _tokenizer(self):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        return PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+            unk_token="[UNK]",
+            chat_template=self.TEMPLATE,
+        )
+
+    def test_call_ids_are_remapped_and_stay_paired(self):
+        from mlx_vlm.prompt_utils import _template_tool_history
+
+        normalized = _template_tool_history(self.HISTORY, self.TEMPLATE)
+        call = next(m for m in normalized if m.get("tool_calls"))["tool_calls"][0]
+        result = next(m for m in normalized if m.get("role") == "tool")
+        self.assertEqual(len(call["id"]), 9)
+        self.assertTrue(call["id"].isalnum())
+        self.assertEqual(call["id"], result["tool_call_id"])
+        repeated = _template_tool_history(self.HISTORY, self.TEMPLATE)
+        repeated_call = next(m for m in repeated if m.get("tool_calls"))["tool_calls"][
+            0
+        ]
+        self.assertEqual(call["id"], repeated_call["id"])
+
+    def test_spoken_content_survives_the_tool_call_turn(self):
+        from mlx_vlm.prompt_utils import _template_tool_history
+
+        normalized = _template_tool_history(self.HISTORY, self.TEMPLATE)
+        spoken = [m for m in normalized if m.get("content") == "SPOKEN"]
+        self.assertEqual(len(spoken), 1)
+        self.assertNotIn("tool_calls", spoken[0])
+        self.assertNotIn("content", next(m for m in normalized if m.get("tool_calls")))
+
+    def test_history_renders_and_caller_is_unchanged(self):
+        import copy
+
+        from jinja2.exceptions import TemplateError
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        tokenizer = self._tokenizer()
+        messages = copy.deepcopy(self.HISTORY)
+        original = copy.deepcopy(messages)
+        with self.assertRaises(TemplateError):
+            tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        rendered = get_chat_template(tokenizer, messages, True)
+        for marker in ["QUESTION", "SPOKEN", "FUNCTION", "ARG", "RESULT"]:
+            self.assertIn(marker, rendered)
+        self.assertEqual(messages, original)
+
+    def test_template_without_the_contract_is_untouched(self):
+        from mlx_vlm.prompt_utils import _template_tool_history
+
+        self.assertIs(
+            _template_tool_history(self.HISTORY, "{{ messages | tojson }}"),
+            self.HISTORY,
+        )
+        self.assertIs(_template_tool_history(self.HISTORY, None), self.HISTORY)
+
+
+class TestSupportedRoleMessages(unittest.TestCase):
+    TEMPLATE = """{% for message in messages %}{% if message['role'] == 'user' %}{{ '[INST]' + message['content'] + '[/INST]' }}{% elif message['role'] == 'system' %}{{ '[SYSTEM_PROMPT]' + message['content'] + '[/SYSTEM_PROMPT]' }}{% elif message['role'] == 'assistant' %}{{ message['content'] }}{% else %}{{ raise_exception('Only user, system and assistant roles are supported!') }}{% endif %}{% endfor %}"""
+
+    def _tokenizer(self):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        return PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+            unk_token="[UNK]",
+            chat_template=self.TEMPLATE,
+        )
+
+    def test_rejected_roles_and_unread_fields_are_kept(self):
+        import copy
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        messages = [
+            {"role": "system", "content": "SYSTEM"},
+            {"role": "user", "content": "QUESTION"},
+            {
+                "role": "assistant",
+                "content": "SPOKEN",
+                "reasoning_content": "REASON",
+                "tool_calls": [
+                    {
+                        "id": "CALL_ID",
+                        "function": {"name": "FUNCTION", "arguments": '{"p":"ARG"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "CALL_ID", "content": "RESULT"},
+            {"role": "user", "content": "FOLLOW_UP"},
+        ]
+        original = copy.deepcopy(messages)
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "FUNCTION", "description": "SCHEMA"},
+            }
+        ]
+        rendered = get_chat_template(self._tokenizer(), messages, True, tools=tools)
+        for marker in [
+            "SYSTEM",
+            "QUESTION",
+            "SPOKEN",
+            "REASON",
+            "CALL_ID",
+            "FUNCTION",
+            "ARG",
+            "RESULT",
+            "FOLLOW_UP",
+            "SCHEMA",
+            '"role": "tool"',
+        ]:
+            self.assertIn(marker, rendered)
+        self.assertIn("[SYSTEM_PROMPT]SYSTEM[/SYSTEM_PROMPT]", rendered)
+        self.assertEqual(messages, original)
+
+    def test_ordinary_history_takes_the_native_path(self):
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        tokenizer = self._tokenizer()
+        messages = [
+            {"role": "system", "content": "SYSTEM"},
+            {"role": "user", "content": "QUESTION"},
+            {"role": "assistant", "content": "ANSWER"},
+        ]
+        self.assertEqual(
+            get_chat_template(tokenizer, messages, True),
+            tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            ),
+        )
+
+    def test_unrelated_errors_do_not_fold_roles(self):
+        from mlx_vlm.prompt_utils import _supported_role_messages
+
+        messages = [{"role": "tool", "content": "RESULT"}]
+        self.assertIs(
+            _supported_role_messages(messages, "Conversation roles must alternate"),
+            messages,
+        )

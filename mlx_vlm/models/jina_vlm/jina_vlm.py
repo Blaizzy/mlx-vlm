@@ -232,16 +232,19 @@ class Model(nn.Module):
             else:
                 image_features = self.get_image_features(pixel_values, image_masks)
 
-            num_image, num_patch = image_features.shape[1:3]
-
+            image_batch_indices = kwargs.get("image_batch_indices")
+            if image_batch_indices is None:
+                image_batch_indices = mx.arange(batch_size)
+            num_groups = image_batch_indices.size
             image_features = image_features.reshape(
-                batch_size, num_image * num_patch, -1
+                num_groups, -1, inputs_embeds.shape[-1]
             )
-            image_input_idx = image_input_idx.reshape(batch_size, num_image * num_patch)
+            image_input_idx = image_input_idx.reshape(num_groups, -1)
 
-            for b in range(batch_size):
-                idx = image_input_idx[b]
-                features = image_features[b]
+            for group in range(num_groups):
+                b = int(image_batch_indices[group].item())
+                idx = image_input_idx[group]
+                features = image_features[group]
 
                 for i in range(idx.shape[0]):
                     pos = int(idx[i].item())

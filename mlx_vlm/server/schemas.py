@@ -331,7 +331,11 @@ class OpenAIRequest(FlexibleBaseModel):
     """
 
     input: Union[str, List[Any]] = Field(
-        ..., description="Input text or list of chat messages."
+        ...,
+        description=(
+            "Input text, native Responses items, or original Chat messages without "
+            "a type field. Chat messages retain their order, metadata, and media."
+        ),
     )
     model: str = Field(..., description="The model to use for generation.")
     adapter_path: Optional[str] = Field(

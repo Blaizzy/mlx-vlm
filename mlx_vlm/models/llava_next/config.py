@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 from ..base import BaseModelConfig
@@ -52,6 +52,15 @@ class ModelConfig(BaseModelConfig):
     text_config: TextConfig
     vision_config: VisionConfig
     model_type: str
+    image_grid_pinpoints: List[List[int]] = field(
+        default_factory=lambda: [
+            [336, 672],
+            [672, 336],
+            [672, 672],
+            [1008, 336],
+            [336, 1008],
+        ]
+    )
     ignore_index: int = -100
     image_token_index: int = 32000
     vision_feature_select_strategy: str = "default"
