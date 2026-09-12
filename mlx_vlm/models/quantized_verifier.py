@@ -1529,6 +1529,12 @@ def _target_verify_fused_qmv_source(source: str, n_sizes) -> str:
     )
 
 
+def _projection_results_per_simdgroup(bits, verify_t):
+    # Q3's unshifted projection arithmetic benefits from a smaller output
+    # tile at T=3/4. Keep the singleton reduction order within each output.
+    return 2 if bits == 3 and verify_t in (3, 4) else 4
+
+
 @lru_cache(maxsize=None)
 def _target_verify_qmv_kernel(bits, group_size, dtype, verify_t, k_size, n_size):
     dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
@@ -1539,7 +1545,9 @@ def _target_verify_qmv_kernel(bits, group_size, dtype, verify_t, k_size, n_size)
         ),
         input_names=["x", "w", "scales", "biases"],
         output_names=["y"],
-        header=_target_verify_qlinear_header(bits, group_size),
+        header=_target_verify_qlinear_header(
+            bits, group_size, _projection_results_per_simdgroup(bits, verify_t)
+        ),
         source=_TARGET_VERIFY_QMV_SOURCE,
     )
 
@@ -1696,7 +1704,9 @@ def _target_verify_fused_qmv_kernel(bits, group_size, dtype, verify_t, k_size, n
         ),
         input_names=input_names,
         output_names=["y"],
-        header=_target_verify_qlinear_header(bits, group_size),
+        header=_target_verify_qlinear_header(
+            bits, group_size, _projection_results_per_simdgroup(bits, verify_t)
+        ),
         source=_target_verify_fused_qmv_source(_TARGET_VERIFY_QMV_SOURCE, n_sizes),
     )
 
@@ -1767,7 +1777,9 @@ def optimized_affine_linear(linear, x: mx.array) -> Optional[mx.array]:
     x = mx.contiguous(x)
     streamed = linear.bits == 4 and 6 <= T <= 8
     token_tiled = linear.bits == 4 and T >= 6 and not streamed
-    results_per_simdgroup = 1 if streamed else 4
+    results_per_simdgroup = (
+        1 if streamed else _projection_results_per_simdgroup(linear.bits, T)
+    )
     if streamed:
         kernel_factory = _target_verify_qmv_streamed_kernel
     elif token_tiled:
@@ -1902,6 +1914,9 @@ def optimized_affine_linears(linears, x: mx.array):
     inputs = [x]
     for linear in linears:
         inputs.extend([linear.weight, linear.scales, linear.biases])
+    rows_per_threadgroup = (
+        2 if streamed else 2 * _projection_results_per_simdgroup(bits, T)
+    )
     out = kernel(
         inputs=inputs,
         template=[
@@ -1910,7 +1925,7 @@ def optimized_affine_linears(linears, x: mx.array):
             ("K_SIZE", int(K)),
             ("N_SIZE", int(total_n)),
         ],
-        grid=(32, 2 * (total_n // (2 if streamed else 8)), B),
+        grid=(32, 2 * (total_n // rows_per_threadgroup), B),
         threadgroup=(32, 2, 1),
         output_shapes=[(B, T, total_n)],
         output_dtypes=[x.dtype],

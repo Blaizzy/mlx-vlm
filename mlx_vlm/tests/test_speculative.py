@@ -4450,7 +4450,10 @@ def test_mxfp4_argmax_preserves_linear_bias(dtype, masked):
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal kernels")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("group_size", [32, 64])
-def test_optimized_affine_q3_verifier_matches_singleton_decode(dtype, group_size):
+@pytest.mark.parametrize("batch,verify_length", [(1, 3), (2, 4), (4, 3), (4, 4)])
+def test_optimized_affine_q3_verifier_matches_singleton_decode(
+    dtype, group_size, batch, verify_length
+):
     from mlx_vlm.models.quantized_verifier import (
         optimized_affine_argmax,
         optimized_affine_linear,
@@ -4470,7 +4473,7 @@ def test_optimized_affine_q3_verifier_matches_singleton_decode(dtype, group_size
     for linear in linears:
         linear.scales = linear.scales.astype(dtype)
         linear.biases = linear.biases.astype(dtype)
-    inputs = mx.random.normal((2, 4, 512)).astype(dtype)
+    inputs = mx.random.normal((batch, verify_length, 512)).astype(dtype)
     mx.eval(*(linear.parameters() for linear in linears), inputs)
     expected = tuple(
         verifier_linear._target_verify_singletons(linear, inputs) for linear in linears
