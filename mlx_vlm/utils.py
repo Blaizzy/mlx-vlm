@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import math
+import os
 import struct
 import warnings
 from dataclasses import dataclass, fields
@@ -806,7 +807,32 @@ def _quantization_for_module_path(
     return None
 
 
-def _materialize_parameters(model, budget_bytes: int = 8 << 30) -> None:
+def _prewarm_page_cache(model_path) -> None:
+    """Read the shards sequentially so later faults hit the page cache.
+
+    Cold-disk faults taken inside a GPU command buffer can outrun Metal's
+    watchdog; sequential reads are fast and leave clean, evictable pages.
+    """
+    import glob as _glob
+
+    shards = sorted(_glob.glob(str(Path(model_path) / "*.safetensors")))
+    if not shards:
+        return
+    total = sum(os.path.getsize(shard) for shard in shards)
+    try:
+        physical = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError):
+        return
+    if total < 0.25 * physical:
+        return
+    buf = bytearray(1 << 28)
+    for shard in shards:
+        with open(shard, "rb", buffering=0) as handle:
+            while handle.readinto(buf):
+                pass
+
+
+def _materialize_parameters(model, budget_bytes: int = 2 << 30) -> None:
     """Evaluate parameters in bounded groups.
 
     Evaluating a whole multi-hundred-GB model in one call builds a single
@@ -1197,6 +1223,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         lazy = requested_lazy
 
     if not lazy:
+        _prewarm_page_cache(model_path)
         _materialize_parameters(model)
 
     model.model_path = model_path
