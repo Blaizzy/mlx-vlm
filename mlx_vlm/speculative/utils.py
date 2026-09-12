@@ -367,7 +367,7 @@ def run_speculative_rounds(
             )
         else:
             mx.eval(first_token)
-            first_bonus = first_token.squeeze(-1)
+            first_bonus = first_token.reshape(-1)
             yield first_bonus.tolist(), logprobs
             eos = getattr(model.config, "eos_token_id", None)
             if isinstance(eos, int):
@@ -416,7 +416,7 @@ def run_speculative_rounds(
         )
     else:
         mx.eval(first_token)
-        first_bonus = first_token.squeeze(-1)
+        first_bonus = first_token.reshape(-1)
         yield first_bonus.tolist(), logprobs
         yield from _dflash_rounds_batch(
             model,
