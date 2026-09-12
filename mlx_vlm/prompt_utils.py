@@ -701,27 +701,25 @@ def _template_tool_history(messages, template):
     for message in messages:
         message = dict(message)
         calls = message.get("tool_calls")
-        if length is not None and message.get("tool_call_id") is not None:
-            message["tool_call_id"] = _fixed_length_call_id(
-                message["tool_call_id"], length
-            )
-            changed = True
-        if calls and length is not None:
-            message["tool_calls"] = [
-                (
-                    {**call, "id": _fixed_length_call_id(call["id"], length)}
-                    if call.get("id") is not None
-                    else call
+        if length is not None:
+            if message.get("tool_call_id") is not None:
+                message["tool_call_id"] = _fixed_length_call_id(
+                    message["tool_call_id"], length
                 )
-                for call in calls
-            ]
-            changed = True
+                changed = True
+            if calls:
+                message["tool_calls"] = [
+                    (
+                        {**call, "id": _fixed_length_call_id(call["id"], length)}
+                        if call.get("id") is not None
+                        else call
+                    )
+                    for call in calls
+                ]
+                changed = True
         if calls and split and message.get("content"):
-            spoken = {
-                key: value for key, value in message.items() if key != "tool_calls"
-            }
-            message = {key: value for key, value in message.items() if key != "content"}
-            result.append(spoken)
+            result.append({k: v for k, v in message.items() if k != "tool_calls"})
+            message.pop("content")
             changed = True
         result.append(message)
     return result if changed else messages
@@ -790,26 +788,19 @@ def _supported_role_messages(messages, error_message, template=None, tools=None)
             }
         )
         changed = True
-    if tools and "tools" not in rendered:
-        index = next(
-            (i for i, message in enumerate(result) if message["role"] == fallback), None
-        )
-        if index is not None:
-            preamble = {
-                "type": "text",
-                "text": "Available tools: "
-                + json.dumps(tools, ensure_ascii=False)
-                + "\n",
-            }
-            content = result[index].get("content")
-            if isinstance(content, str):
-                content = [{"type": "text", "text": content}]
-            elif not isinstance(content, list):
-                content = []
-            else:
-                content = list(content)
-            result[index] = {**result[index], "content": [preamble] + content}
-            changed = True
+    for index, message in enumerate(result):
+        if not tools or "tools" in rendered or message["role"] != fallback:
+            continue
+        content = message.get("content") or []
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        preamble = {
+            "type": "text",
+            "text": "Available tools: " + json.dumps(tools, ensure_ascii=False) + "\n",
+        }
+        result[index] = {**message, "content": [preamble] + list(content)}
+        changed = True
+        break
     return _collapse_text_content(result) if changed else messages
 
 
