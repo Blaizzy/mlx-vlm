@@ -157,12 +157,10 @@ class Indexer(nn.Module):
     def _publish_keys(self, latent: mx.array, start_pos: int, batch: int):
         ratio = self.compress_ratio
         n_latent = latent.shape[1]
-        if start_pos == 0:
-            positions = mx.arange(n_latent) * ratio
-        else:
-            positions = mx.array([start_pos + 1 - ratio])
+        base = start_pos // ratio
+        positions = (base + mx.arange(n_latent)) * ratio
         cos, sin = _index_cos_sin(
-            start_pos + latent.shape[1] + 1 if start_pos == 0 else start_pos + 2,
+            max((base + n_latent - 1) * ratio + 1, start_pos + n_latent + 1),
             self.rope_head_dim,
             self.rope_theta,
             self.yarn,
@@ -175,7 +173,6 @@ class Indexer(nn.Module):
             self.rope_head_dim,
         )
         k = fake_quant_fp4_ue8m0(k)
-        base = start_pos // ratio
         cache = self._k_cache
         if cache is None:
             cache = mx.zeros(
@@ -266,12 +263,9 @@ class Indexer(nn.Module):
         scores = mx.maximum(scores, 0) * weights[..., None]
         scores = scores.sum(axis=2)
 
-        if start_pos == 0:
-            compress_lens = (mx.arange(1, seqlen + 1) // ratio)[:, None]
-            visible = mx.arange(index_k.shape[1])[None, :] < compress_lens
-            scores = mx.where(visible, scores, -mx.inf)
-        else:
-            compress_lens = end_pos // ratio
+        compress_lens = (mx.arange(start_pos + 1, end_pos + 1) // ratio)[:, None]
+        visible = mx.arange(index_k.shape[1])[None, :] < compress_lens
+        scores = mx.where(visible, scores, -mx.inf)
 
         if self.is_candidate_source:
             shared.candidates = select_candidate_blocks(
@@ -297,6 +291,10 @@ def sanitize_moe_weights(weights: dict, ffn_prefix: str, n_routed: int) -> dict:
     ``experts.{e}.w1/w2/w3`` stack over experts into
     ``switch_mlp.{gate,down,up}_proj``. Shared by the backbone and the
     DSpark stages, which use identical MoE layouts.
+
+    Checkpoints converted by the reference PipeNetwork port already store the
+    routed experts stacked under ``experts.{gate,down,up}_proj``; those only
+    need the move onto ``switch_mlp``.
     """
     w_remap = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
     remapped = {}
@@ -307,6 +305,13 @@ def sanitize_moe_weights(weights: dict, ffn_prefix: str, n_routed: int) -> dict:
         remapped[k] = v
     weights = remapped
     prefix = f"{ffn_prefix}.experts"
+    for dst in ("gate_proj", "down_proj", "up_proj"):
+        for suffix in ("weight", "scales", "biases"):
+            stacked_key = f"{prefix}.{dst}.{suffix}"
+            if stacked_key in weights:
+                weights[f"{ffn_prefix}.switch_mlp.{dst}.{suffix}"] = weights.pop(
+                    stacked_key
+                )
     for src, dst in (
         ("w1", "gate_proj"),
         ("w2", "down_proj"),
