@@ -90,6 +90,30 @@ class Model(nn.Module):
         if language_model is not None:
             language_model._engram_source = value
 
+    def _install_engram_embeddings(self, weights):
+        """Swap in the row-wise engram table when the checkpoint is quantized.
+
+        Done before ``nn.quantize`` so the generic path never claims these
+        modules; the replacement exposes no ``to_quantized``.
+        """
+        from .engram import QuantizedEngramEmbedding
+
+        for idx, layer in enumerate(self.language_model.layers):
+            engram = getattr(layer, "engram", None)
+            if engram is None:
+                continue
+            prefix = f"language_model.layers.{idx}.engram.embed"
+            packed = weights.get(f"{prefix}.weight")
+            scales = weights.get(f"{prefix}.scales")
+            if packed is None or scales is None:
+                continue
+            dims = engram.embed.weight.shape[1]
+            bits = 32 * packed.shape[1] // dims
+            group_size = dims // scales.shape[1]
+            engram.embed = QuantizedEngramEmbedding(
+                packed.shape[0], dims, group_size, bits, scale_dtype=scales.dtype
+            )
+
     def quantization_path_aliases(self, path: str):
         """Routed experts load as ``switch_mlp`` but converters key them ``experts``."""
         if path.startswith("language_model."):
@@ -117,6 +141,8 @@ class Model(nn.Module):
         weights = {
             transform_key(k): v for k, v in weights.items() if not k.startswith("mtp.")
         }
+
+        self._install_engram_embeddings(weights)
 
         from .language import sanitize_moe_weights
 

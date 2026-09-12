@@ -262,6 +262,39 @@ class NgramHashState(nn.Module):
         return mx.concatenate(hashes, axis=-1) + self._offsets
 
 
+class QuantizedEngramEmbedding(nn.Module):
+    """Affine-quantized hash table whose rows are dequantized on lookup.
+
+    The tables are ~384M rows; a generic quantized embedding is too costly to
+    read from lazily-mapped storage, so gather the handful of rows a step needs
+    and dequantize only those.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        dims: int,
+        group_size: int = 64,
+        bits: int = 4,
+        scale_dtype=mx.bfloat16,
+    ):
+        super().__init__()
+        self.group_size = group_size
+        self.bits = bits
+        self.weight = mx.zeros((num_embeddings, dims * bits // 32), dtype=mx.uint32)
+        self.scales = mx.zeros((num_embeddings, dims // group_size), dtype=scale_dtype)
+        self.biases = mx.zeros((num_embeddings, dims // group_size), dtype=scale_dtype)
+
+    def __call__(self, indices: mx.array) -> mx.array:
+        return mx.dequantize(
+            self.weight[indices],
+            scales=self.scales[indices],
+            biases=self.biases[indices],
+            group_size=self.group_size,
+            bits=self.bits,
+        ).astype(mx.float32)
+
+
 class Engram(nn.Module):
     """Writes an n-gram lookup into the residual stream, gated by how well it matches that stream.
 
