@@ -806,6 +806,27 @@ def _quantization_for_module_path(
     return None
 
 
+def _materialize_parameters(model, budget_bytes: int = 8 << 30) -> None:
+    """Evaluate parameters in bounded groups.
+
+    Evaluating a whole multi-hundred-GB model in one call builds a single
+    command buffer; on Apple silicon the cold page-ins inside it can outrun
+    Metal's watchdog, which surfaces as a GPU timeout or takes the machine
+    down. Materializing in slices keeps each buffer short.
+    """
+    group, used = [], 0
+    for _, value in tree_flatten(model.parameters()):
+        if not isinstance(value, mx.array):
+            continue
+        group.append(value)
+        used += value.nbytes
+        if used >= budget_bytes:
+            mx.eval(group)
+            group, used = [], 0
+    if group:
+        mx.eval(group)
+
+
 def _drop_modules_without_weights(
     model: nn.Module, weights: dict, declared_keys: Optional[set] = None
 ) -> None:
@@ -1176,7 +1197,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         lazy = requested_lazy
 
     if not lazy:
-        mx.eval(model.parameters())
+        _materialize_parameters(model)
 
     model.model_path = model_path
     model.eval()
