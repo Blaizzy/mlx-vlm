@@ -905,7 +905,13 @@ class DeepseekV41Cache:
         self.reset_handoff()
 
     def reset_handoff(self):
-        """Clear the per-forward handoff so a step cannot read last step's values."""
+        """Clear the cross-layer handoff.
+
+        This is initialization, not per-step bookkeeping. ``compress_kv`` and
+        ``index_k`` mirror buffers that only change when a compression group
+        completes, so on a step that completes none the consumers are meant to
+        go on reading what the source last published.
+        """
         self.index_k = None
         self.candidates = None
         self.compress_kv = None
@@ -1005,7 +1011,6 @@ class DeepseekV41Cache:
             if ratio and self.compress[layer] is not None:
                 self.compress[layer] = self.compress[layer][:, : self.offset // ratio]
             self._restore_slots(layer, n)
-        self.reset_handoff()
         return n
 
 
@@ -1126,7 +1131,6 @@ class LanguageModel(nn.Module):
                 len(self.layers), [l.attn.compress_ratio for l in self.layers]
             )
         )
-        entry.reset_handoff()
         start_pos = entry.offset
         if input_ids is None:
             input_ids = inputs
