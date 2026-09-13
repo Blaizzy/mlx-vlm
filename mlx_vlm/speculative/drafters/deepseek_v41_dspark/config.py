@@ -45,7 +45,7 @@ class DeepseekV41DsparkConfig(BaseModelConfig):
     block_size_policy: str = "fixed"
     dflash_initial_block_size: Optional[int] = None
     draft_window_size: Optional[int] = None
-    confidence_threshold: Optional[float] = 0.7
+    confidence_threshold: Optional[float] = 0.3
     tie_word_embeddings: bool = False
 
     def __post_init__(self):
