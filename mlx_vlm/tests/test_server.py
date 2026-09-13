@@ -8238,3 +8238,133 @@ class TestSTTSegmentSerialization:
         assert data["segments"] == [
             {"id": 0, "start": 0.0, "end": 0.5, "text": "hello"}
         ]
+
+
+class _HarmonyProcessor:
+    """Minimal stand-in for a processor whose template speaks Harmony."""
+
+    class tokenizer:
+        chat_template = "<|start|>{role}<|channel|>final<|message|>{content}<|end|>"
+
+
+def test_prompt_open_channel_detects_a_completed_header():
+    from mlx_vlm.server.responses_state import prompt_open_channel
+
+    assert (
+        prompt_open_channel("<|start|>assistant<|channel|>final<|message|>") == "final"
+    )
+    assert (
+        prompt_open_channel("<|start|>assistant<|channel|>analysis<|message|>")
+        == "analysis"
+    )
+    # header still open: generation starts by naming its channel
+    assert prompt_open_channel("<|start|>assistant") is None
+    assert prompt_open_channel("plain text prompt") is None
+    assert prompt_open_channel(None) is None
+
+
+def test_answer_survives_when_the_prompt_already_closed_the_header():
+    """llm-jp-VL's rich-history template ends the prompt mid-message."""
+    from mlx_vlm.server.responses_state import HarmonyStreamState
+
+    state = HarmonyStreamState(open_channel="final")
+    parsed = state.feed("Hello world<|return|>", last=True)
+
+    assert parsed.content == "Hello world"
+    assert parsed.reasoning is None
+
+
+def test_nonstreaming_split_honors_a_prompt_opened_channel():
+    from mlx_vlm.server.responses_state import _split_thinking
+
+    reasoning, content = _split_thinking(
+        "Hello world<|return|>",
+        processor=_HarmonyProcessor(),
+        open_channel="final",
+    )
+    assert content == "Hello world"
+    assert reasoning is None
+
+
+def test_streamed_answer_survives_a_prompt_opened_channel():
+    from mlx_vlm.server.responses_state import make_response_stream_state
+
+    state = make_response_stream_state(_HarmonyProcessor(), open_channel="final")
+    seen = "".join(
+        (state.feed(chunk).content or "") for chunk in ["Hel", "lo ", "world"]
+    )
+    seen += state.feed("<|return|>", last=True).content or ""
+    assert seen == "Hello world"
+
+
+def test_header_mode_is_unchanged_when_the_prompt_leaves_it_open():
+    from mlx_vlm.server.responses_state import HarmonyStreamState
+
+    state = HarmonyStreamState()
+    parsed = state.feed("<|channel|>final<|message|>Hello world<|return|>", last=True)
+    assert parsed.content == "Hello world"
+
+
+def test_replayed_apply_patch_call_keeps_its_patch_body():
+    """The stored call carries a raw diff, which is not JSON."""
+    from mlx_vlm.server.request_preparation import normalize_chat_input
+    from mlx_vlm.server.responses_state import _response_call_to_chat_tool_call
+
+    patch_body = "*** Begin Patch\n*** Update File: a.py\n-old\n+new\n*** End Patch"
+    stored = {"type": "apply_patch_call", "call_id": "call_1", "patch": patch_body}
+    chat_call = _response_call_to_chat_tool_call(stored)
+    assert chat_call["function"]["arguments"] == patch_body
+
+    request = server.ChatRequest(
+        model="demo",
+        messages=[
+            {"role": "user", "content": "edit it"},
+            {"role": "assistant", "content": None, "tool_calls": [chat_call]},
+        ],
+    )
+    source = normalize_chat_input(request)
+    rendered = json.dumps(source.messages)
+    assert "Begin Patch" in rendered
+    assert "Update File: a.py" in rendered
+
+
+def test_stored_assistant_turn_does_not_move_earlier_images_forward():
+    """A stored turn must not relocate the image that belongs to an earlier turn."""
+    from mlx_vlm.server.request_preparation import normalize_responses_input
+
+    image = "data:image/png;base64,iVBORw0KGgo="
+    items = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "DESCRIBE_THIS"},
+                {"type": "input_image", "image_url": image},
+            ],
+        },
+        # what a replayed stored turn looks like: untyped, chat-shaped
+        {"role": "assistant", "content": "A_RED_SHAPE"},
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "WHAT_COLOR"}],
+        },
+    ]
+    request = server.OpenAIRequest(model="demo", input=items)
+    source, _, _ = normalize_responses_input(request, items)
+
+    described = next(
+        m for m in source.messages if "DESCRIBE_THIS" in json.dumps(m.get("content"))
+    )
+    asked = next(
+        m for m in source.messages if "WHAT_COLOR" in json.dumps(m.get("content"))
+    )
+
+    def image_parts(message):
+        content = message.get("content")
+        if not isinstance(content, list):
+            return []
+        return [p for p in content if str(p.get("type", "")).startswith("image")]
+
+    assert image_parts(described), "image left the turn it was sent with"
+    assert not image_parts(asked), "image moved onto the later question"

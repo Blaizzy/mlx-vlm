@@ -35,6 +35,7 @@ ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
 
 # Constants
 MODEL_REMAPPING = {
+    "moondream1": "moondream2",
     "llava_qwen2": "fastvlm",  # Apple's FastVLM, note it's different to the one below
     "llava-qwen2": "llava_bunny",
     "bunny-llama": "llava_bunny",
@@ -2473,28 +2474,47 @@ def prepare_inputs(
         if processor.pad_token is None:
             processor.pad_token = processor.eos_token
         text_chunks = [
-            [processor(chunk).input_ids for chunk in prompt.split("<image>")]
+            [
+                processor(
+                    chunk, add_special_tokens=add_special_tokens if i == 0 else False
+                ).input_ids
+                for i, chunk in enumerate(prompt.split("<image>"))
+            ]
             for prompt in prompts
         ]
+        if sum(len(chunks) - 1 for chunks in text_chunks) != len(images):
+            raise ValueError("Image count does not match image placeholders")
+        image_seq_length = getattr(processor.image_processor, "image_seq_length", 1)
 
         # Find the maximum length for padding
         max_length = max(
-            sum(len(chunk) for chunk in chunks) + 1 for chunks in text_chunks
+            sum(len(chunk) for chunk in chunks) + image_seq_length * (len(chunks) - 1)
+            for chunks in text_chunks
         )
 
         # Pad and create input_ids
         input_ids = []
+        attention_masks = []
         for chunks in text_chunks:
-            ids = chunks[0] + [image_token_index] + chunks[1]
-            padding = [processor.pad_token_id] * (max_length - len(ids))
-            input_ids.append(mx.array(ids + padding))
+            ids = list(chunks[0])
+            for chunk in chunks[1:]:
+                ids.extend([image_token_index] * image_seq_length)
+                ids.extend(chunk)
+            pad = [processor.pad_token_id] * (max_length - len(ids) if padding else 0)
+            mask = [1] * len(ids)
+            if padding_side == "left":
+                ids, mask = pad + ids, [0] * len(pad) + mask
+            elif padding_side == "right":
+                ids, mask = ids + pad, mask + [0] * len(pad)
+            else:
+                raise ValueError("padding_side must be left or right")
+            input_ids.append(ids)
+            attention_masks.append(mask)
 
         model_inputs["input_ids"] = mx.array(input_ids)
         pixel_values = processor.image_processor.preprocess(images=images)
         model_inputs["pixel_values"] = mx.array(np.stack(pixel_values))
-        model_inputs["attention_mask"] = mx.array(
-            [(ids != processor.pad_token_id) for ids in input_ids]
-        ).astype(mx.int32)
+        model_inputs["attention_mask"] = mx.array(attention_masks, dtype=mx.int32)
 
     else:
         if hasattr(processor, "tokenizer") and processor.tokenizer.pad_token is None:

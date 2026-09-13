@@ -30,6 +30,7 @@ from .responses_state import (
     ToolCallStreamState,
     make_response_stream_state,
     prompt_has_open_thinking,
+    prompt_open_channel,
 )
 from .runtime import runtime
 from .schemas import AnthropicMessageResponse, AnthropicRequest, AnthropicUsage
@@ -565,6 +566,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                     ),
                     gen_args.thinking_start_token,
                     gen_args.thinking_end_token,
+                    open_channel=prompt_open_channel(formatted_prompt),
                 )
                 tc_start = tool_module.tool_call_start if tool_module else None
                 tc_end = tool_module.tool_call_end if tool_module else None
@@ -967,6 +969,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                 gen_args.thinking_start_token,
                 gen_args.thinking_end_token,
                 processor=processor,
+                open_channel=prompt_open_channel(formatted_prompt),
             )
             parsed_tool_calls = None
             if tool_module is not None and tools:

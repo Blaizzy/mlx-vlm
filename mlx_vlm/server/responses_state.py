@@ -173,6 +173,89 @@ class ThinkingStreamState:
         return text
 
 
+class HarmonyStreamState:
+    """Separate Harmony message headers and channels from generated text."""
+
+    _MARKERS = (
+        "<|start|>",
+        "<|channel|>",
+        "<|message|>",
+        "<|end|>",
+        "<|return|>",
+        "<|call|>",
+        "<|im_end|>",
+        "<|fim_suffix|>",
+        "<|ghissue|>",
+    )
+
+    def __init__(self, starts_in_thinking=False, open_channel=None):
+        self.buffer = ""
+        self.header = ""
+        if open_channel:
+            # The prompt already named a channel and opened its message, so
+            # generation starts inside the body rather than in a header.
+            self.in_header = False
+            self.channel = open_channel
+        else:
+            self.in_header = not starts_in_thinking
+            self.channel = "analysis" if starts_in_thinking else None
+        self.reading_channel = False
+
+    def feed(self, text, last=False):
+        self.buffer += text or ""
+        reasoning, content = [], []
+        thinking_closed = False
+
+        def emit(value):
+            if self.in_header:
+                self.header += value
+            elif value:
+                (reasoning if self.channel == "analysis" else content).append(value)
+
+        while self.buffer:
+            index, marker = ThinkingStreamState._find_first(self.buffer, self._MARKERS)
+            if index < 0:
+                value, self.buffer = ThinkingStreamState._split_partial(
+                    self.buffer, self._MARKERS
+                )
+                emit(value)
+                break
+            emit(self.buffer[:index])
+            self.buffer = self.buffer[index + len(marker) :]
+            if marker == "<|message|>":
+                self.channel = (
+                    self.header.split()[0]
+                    if self.reading_channel and self.header.split()
+                    else "final"
+                )
+                self.in_header = False
+                self.reading_channel = False
+            else:
+                if not self.in_header and self.channel == "analysis":
+                    thinking_closed = True
+                self.in_header = True
+                self.header = ""
+                self.reading_channel = marker == "<|channel|>"
+        if last:
+            emit(self.buffer)
+            self.buffer = ""
+        return ThinkingStreamDelta(
+            reasoning="".join(reasoning) or None,
+            content="".join(content) or None,
+            thinking_closed=thinking_closed,
+        )
+
+
+def _uses_harmony_template(processor):
+    tokenizer = getattr(processor, "tokenizer", processor)
+    template = getattr(tokenizer, "chat_template", None)
+    templates = template.values() if isinstance(template, dict) else [template]
+    return any(
+        isinstance(value, str) and "<|channel|>" in value and "<|message|>" in value
+        for value in templates
+    )
+
+
 class ResponseTemplateStreamState:
     """Adapt a Transformers response-template parser to server stream deltas."""
 
@@ -226,7 +309,10 @@ def make_response_stream_state(
     enable_thinking: bool = False,
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
+    open_channel: Optional[str] = None,
 ):
+    if _uses_harmony_template(processor):
+        return HarmonyStreamState(enable_thinking, open_channel)
     tokenizer = _response_template_tokenizer(processor)
     if tokenizer is not None and hasattr(tokenizer, "get_response_parser"):
         try:
@@ -242,6 +328,27 @@ def make_response_stream_state(
     )
 
 
+_OPEN_CHANNEL = re.compile(r"<\|channel\|>(\w+)<\|message\|>\s*$")
+
+
+def prompt_open_channel(prompt: Any) -> Optional[str]:
+    """The Harmony channel a prompt leaves open for generation to continue.
+
+    A template that completes its own header ends the prompt inside a message
+    body, so a parser that assumes header mode would read the answer as header
+    text and discard it.
+    """
+    if not isinstance(prompt, str):
+        return None
+    stripped = prompt.rstrip()
+    match = _OPEN_CHANNEL.search(stripped)
+    if match:
+        return match.group(1)
+    if stripped.endswith("<|message|>"):
+        return "final"
+    return None
+
+
 def prompt_has_open_thinking(
     prompt: Any,
     enable_thinking: bool = False,
@@ -253,6 +360,8 @@ def prompt_has_open_thinking(
         return False
 
     stripped_prompt = prompt.rstrip()
+    if stripped_prompt.endswith("<|channel|>analysis<|message|>"):
+        return True
     for start_marker, _ in ThinkingStreamState._build_open_close_markers(
         thinking_start_token, thinking_end_token
     ):
@@ -364,9 +473,16 @@ def _split_thinking(
     thinking_end_token: Optional[str] = None,
     starts_in_thinking: bool = False,
     processor=None,
+    open_channel: Optional[str] = None,
 ) -> Tuple[Optional[str], str]:
     if not text:
         return None, text
+
+    if _uses_harmony_template(processor):
+        parsed = HarmonyStreamState(starts_in_thinking, open_channel).feed(
+            text, last=True
+        )
+        return parsed.reasoning, parsed.content or ""
 
     tokenizer = _response_template_tokenizer(processor)
     if tokenizer is not None and hasattr(tokenizer, "parse_response"):
@@ -428,12 +544,14 @@ def _response_output_items_from_text(
     thinking_end_token: Optional[str] = None,
     reasoning_item_id: Optional[str] = None,
     processor=None,
+    open_channel: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
         full_text,
         thinking_start_token,
         thinking_end_token,
         processor=processor,
+        open_channel=open_channel,
     )
     reasoning_items = _reasoning_output_items(reasoning, reasoning_item_id)
     if tool_module is not None and chat_tools:
@@ -493,9 +611,7 @@ def _normalize_response_input(input_value: Any) -> List[Dict[str, Any]]:
         item = _as_plain_dict(item)
         if not isinstance(item, dict):
             raise HTTPException(status_code=400, detail="Invalid input format.")
-        item_type = item.get("type")
-        if item_type is None and item.get("role") is not None:
-            item = {**item, "type": "message"}
+        # An absent type identifies original Chat messages during prompt replay.
         items.append(item)
     return items
 
@@ -587,7 +703,7 @@ def _append_response_item_to_prompt(
     chat_messages: List[Dict[str, Any]],
     images: List[Any],
 ):
-    item_type = item.get("type")
+    item_type = item.get("type") or ("message" if "role" in item else None)
     if item_type == "message":
         role = item.get("role") or "user"
         content = item.get("content")
@@ -678,8 +794,47 @@ def _response_chain_items(previous_response_id: Optional[str]) -> List[Dict[str,
     items: List[Dict[str, Any]] = []
     for stored in reversed(chain):
         items.extend(stored.input_items)
-        items.extend(stored.output_items)
+        items.extend(_stored_output_to_chat(stored.output_items))
     return items
+
+
+def _stored_output_to_chat(output_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Reassemble the assistant turn whose boundary is known by the response store."""
+    if not output_items:
+        return []
+    supported = {
+        "message",
+        "reasoning",
+        "function_call",
+        "shell_call",
+        "apply_patch_call",
+    }
+    if any(item.get("type") not in supported for item in output_items):
+        return output_items
+    text, reasoning, calls = [], [], []
+    message_reasoning = []
+    for item in output_items:
+        item_type = item["type"]
+        if item_type == "reasoning":
+            reasoning.extend(part.get("text", "") for part in item.get("summary", []))
+        elif item_type == "message":
+            content = item.get("content") or []
+            if not isinstance(content, list) or any(
+                part.get("type") not in ("output_text", "text") for part in content
+            ):
+                return output_items
+            text.extend(part.get("text", "") for part in content)
+            message_reasoning.append(
+                item.get("reasoning_content") or item.get("reasoning") or ""
+            )
+        else:
+            calls.append(_response_call_to_chat_tool_call(item))
+    message = {"role": "assistant", "content": "".join(text)}
+    if reasoning or any(message_reasoning):
+        message["reasoning_content"] = "".join(reasoning or message_reasoning)
+    if calls:
+        message["tool_calls"] = calls
+    return [message]
 
 
 def _response_items_to_chat(

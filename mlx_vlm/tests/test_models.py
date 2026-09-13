@@ -21150,3 +21150,1505 @@ class TestPaliGemmaMultipleImages(unittest.TestCase):
         np.testing.assert_array_equal(np.array(actual), expected)
         self.assertEqual(mask.shape, (2, 1, 6, 6))
         self.assertFalse(bool(mx.any(mask[1, :, 3:, :3])))
+
+
+class TestServerRequestPreparation(unittest.TestCase):
+    def test_chat_preserves_source_and_tool_reasoning_metadata(self):
+        import copy
+
+        from mlx_vlm.server.request_preparation import normalize_chat_input
+        from mlx_vlm.server.schemas import ChatRequest
+
+        request = ChatRequest(
+            model="test",
+            messages=[
+                {"role": "system", "content": "Keep exact paths."},
+                {"role": "user", "content": "Excerpt: café /src/app.py:42"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "Inspect the file first.",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "read",
+                                "arguments": '{"path":"/src/app.py"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "name": "read",
+                    "content": "exact result",
+                },
+            ],
+        )
+        before = copy.deepcopy(request.model_dump())
+        source = normalize_chat_input(request)
+        self.assertEqual(request.model_dump(), before)
+        self.assertEqual(
+            [m["role"] for m in source.messages],
+            ["system", "user", "assistant", "tool"],
+        )
+        self.assertEqual(source.messages[1]["content"], "Excerpt: café /src/app.py:42")
+        self.assertEqual(
+            source.messages[2]["reasoning_content"], "Inspect the file first."
+        )
+        self.assertEqual(source.messages[2]["reasoning"], "Inspect the file first.")
+        self.assertEqual(
+            source.messages[2]["tool_calls"][0]["function"]["arguments"],
+            {"path": "/src/app.py"},
+        )
+        self.assertEqual(
+            source.messages[3],
+            {
+                "role": "tool",
+                "content": "exact result",
+                "tool_call_id": "call_1",
+                "name": "read",
+            },
+        )
+
+    def test_media_order_and_resize_survive_preparation(self):
+        import base64
+        from unittest.mock import MagicMock
+
+        from mlx_vlm.server.generation import GenerationArguments
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            prepare_prompt,
+        )
+        from mlx_vlm.server.schemas import ChatRequest
+
+        request = ChatRequest(
+            model="test",
+            resize_shape=[224],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Compare."},
+                        {"type": "image_url", "image_url": {"url": "first.png"}},
+                        {"type": "input_image", "image_url": "second.png"},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": base64.b64encode(b"audio bytes").decode(),
+                                "format": "wav",
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+        source = normalize_chat_input(request)
+        render = MagicMock(return_value="rendered")
+        prepared = prepare_prompt(
+            source,
+            SimpleNamespace(),
+            SimpleNamespace(),
+            GenerationArguments(),
+            render=render,
+        )
+        self.assertEqual(prepared.images, ["first.png", "second.png"])
+        self.assertEqual(prepared.audio[0].getvalue(), b"audio bytes")
+        self.assertEqual(prepared.generation_kwargs, {"resize_shape": (224, 224)})
+        self.assertEqual(render.call_args.kwargs["num_images"], 2)
+        self.assertEqual(render.call_args.kwargs["num_audios"], 1)
+        self.assertEqual(prepared.prompt, "rendered")
+
+    def test_video_fallback_does_not_mutate_source(self):
+        from unittest.mock import MagicMock, patch
+
+        from mlx_vlm.server.generation import GenerationArguments
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            prepare_prompt,
+        )
+        from mlx_vlm.server.schemas import ChatRequest
+
+        source = normalize_chat_input(
+            ChatRequest(
+                model="test",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe."},
+                            {"type": "input_video", "video_url": "clip.mp4"},
+                        ],
+                    }
+                ],
+            )
+        )
+        render = MagicMock(return_value="rendered")
+        resolution = SimpleNamespace(
+            images=["frame1", "frame2"],
+            videos=[],
+            used_fallback=True,
+            selected_count=2,
+            sampled_count=2,
+        )
+        with patch(
+            "mlx_vlm.server.request_preparation.resolve_video_inputs",
+            return_value=resolution,
+        ) as resolve:
+            prepared = prepare_prompt(
+                source,
+                SimpleNamespace(),
+                SimpleNamespace(),
+                GenerationArguments(),
+                render=render,
+            )
+        self.assertEqual(source.videos, ["clip.mp4"])
+        self.assertEqual(source.images, [])
+        self.assertEqual(prepared.images, ["frame1", "frame2"])
+        self.assertEqual(prepared.videos, [])
+        self.assertEqual(render.call_args.kwargs["num_images"], 2)
+        self.assertIsNone(render.call_args.kwargs["video"])
+        self.assertEqual(resolve.call_args.kwargs["fps"], 2.0)
+        self.assertEqual(resolve.call_args.kwargs["max_frames"], 16)
+
+    def test_responses_preserves_existing_instruction_and_tool_item_semantics(self):
+        import copy
+
+        from mlx_vlm.server.request_preparation import normalize_responses_input
+        from mlx_vlm.server.responses_state import _normalize_response_input
+        from mlx_vlm.server.schemas import OpenAIRequest
+
+        request = OpenAIRequest(
+            model="test",
+            instructions="Primary.",
+            input=[
+                {"type": "message", "role": "system", "content": "Secondary."},
+                {"type": "message", "role": "user", "content": "Read."},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read",
+                    "arguments": '{"path":"a"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "file contents",
+                },
+            ],
+            tools=[
+                {"type": "function", "name": "read", "parameters": {"type": "object"}}
+            ],
+        )
+        items = _normalize_response_input(request.input)
+        before = copy.deepcopy(items)
+        source, instructions, registry = normalize_responses_input(request, items)
+        self.assertEqual(items, before)
+        self.assertEqual(instructions, "Primary.\n\nSecondary.")
+        self.assertEqual(
+            source.messages[0], {"role": "system", "content": instructions}
+        )
+        self.assertEqual(source.messages[2]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(
+            source.messages[3],
+            {"role": "tool", "tool_call_id": "call_1", "content": "file contents"},
+        )
+        self.assertEqual(source.tools[0]["function"]["name"], "read")
+        self.assertEqual(registry, {"read": "function"})
+
+    def test_equivalent_text_inputs_share_rendered_prompt_and_append_prefix(self):
+        from mlx_vlm.server.request_normalization import _build_gen_args
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            normalize_responses_input,
+            prepare_prompt,
+        )
+        from mlx_vlm.server.responses_state import _normalize_response_input
+        from mlx_vlm.server.schemas import ChatRequest, OpenAIRequest
+
+        class Processor:
+            chat_template = "test"
+
+            def apply_chat_template(self, messages, **kwargs):
+                return (
+                    "".join(
+                        f"<{m['role']}>{m['content']}</{m['role']}>" for m in messages
+                    )
+                    + "<assistant>"
+                )
+
+        processor = Processor()
+        config = SimpleNamespace(model_type="test")
+        messages = [
+            {"role": "system", "content": "Instructions."},
+            {"role": "user", "content": "Exact document excerpt."},
+            {"role": "assistant", "content": "Done."},
+        ]
+        chat = ChatRequest(model="test", messages=messages, enable_thinking=False)
+        response = OpenAIRequest(
+            model="test",
+            instructions="Instructions.",
+            input=messages[1:],
+            enable_thinking=False,
+        )
+        chat_source = normalize_chat_input(chat)
+        response_source, _, _ = normalize_responses_input(
+            response, _normalize_response_input(response.input)
+        )
+        chat_args = _build_gen_args(chat, processor)
+        response_args = _build_gen_args(response, processor)
+        expected = "<system>Instructions.</system><user>Exact document excerpt.</user><assistant>Done.</assistant><assistant>"
+        before = prepare_prompt(chat_source, processor, config, chat_args)
+        self.assertEqual(before.prompt, expected)
+        self.assertEqual(
+            prepare_prompt(response_source, processor, config, response_args).prompt,
+            expected,
+        )
+        chat_source.messages.append(
+            {"role": "user", "content": "Summarize the preceding conversation."}
+        )
+        after = prepare_prompt(chat_source, processor, config, chat_args)
+        self.assertTrue(after.prompt.startswith(expected.removesuffix("<assistant>")))
+        self.assertEqual(chat.messages[-1].content, "Done.")
+
+
+class TestChatHistoryReplay(unittest.TestCase):
+    def test_responses_replays_chat_history_without_changing_prepared_input(self):
+        import copy
+
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            normalize_responses_input,
+        )
+        from mlx_vlm.server.responses_state import _normalize_response_input
+        from mlx_vlm.server.schemas import ChatRequest, OpenAIRequest
+
+        messages = [
+            {"role": "system", "content": "First instruction."},
+            {"role": "system", "content": "Second instruction."},
+            {"role": "user", "content": "Read /src/app.py:42 — café."},
+            {
+                "role": "assistant",
+                "content": "Checking both files.",
+                "reasoning_content": "Keep the exact source history.",
+                "tool_calls": [
+                    {
+                        "id": f"call_{i}",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": arguments},
+                    }
+                    for i, arguments in enumerate(
+                        ['{"path":"/src/app.py"}', {"path": "/src/db.py"}]
+                    )
+                ],
+            },
+            {
+                "role": "tool",
+                "name": "read",
+                "tool_call_id": "call_0",
+                "content": "Uses SQLite.",
+            },
+            {
+                "role": "tool",
+                "name": "read",
+                "tool_call_id": "call_1",
+                "content": "No migrations yet.",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Inspect these as well."},
+                    {"type": "image_url", "image_url": {"url": "first.png"}},
+                    {"type": "input_image", "image_url": "second.png"},
+                    {
+                        "type": "input_audio",
+                        "input_audio": {"data": "recording.wav", "format": "wav"},
+                    },
+                    {"type": "input_video", "video_url": "clip.mp4"},
+                ],
+            },
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "read", "parameters": {"type": "object"}},
+            }
+        ]
+        for choice in (
+            None,
+            "auto",
+            "none",
+            "required",
+            {"type": "function", "function": {"name": "read"}},
+        ):
+            with self.subTest(tool_choice=choice):
+                chat = ChatRequest(
+                    model="test",
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=choice,
+                    resize_shape=[224],
+                )
+                response = OpenAIRequest(
+                    model="test",
+                    input=messages,
+                    tools=tools,
+                    tool_choice=choice,
+                    resize_shape=[224],
+                )
+                before = copy.deepcopy(response.model_dump())
+                expected = normalize_chat_input(chat)
+                actual, _, _ = normalize_responses_input(
+                    response, _normalize_response_input(response.input)
+                )
+                self.assertEqual(actual, expected)
+                self.assertEqual(response.model_dump(), before)
+
+    def test_stored_chain_retains_original_chat_prefix(self):
+        import copy
+        import uuid
+
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            normalize_responses_input,
+        )
+        from mlx_vlm.server.responses_state import (
+            StoredResponse,
+            _normalize_response_input,
+            _response_chain_items,
+            response_store,
+            response_store_lock,
+        )
+        from mlx_vlm.server.schemas import ChatRequest, OpenAIRequest
+
+        history = [
+            {"role": "system", "content": "Keep exact paths."},
+            {"role": "system", "content": "Preserve separate instructions."},
+            {"role": "user", "content": "Inspect /src/app.py."},
+            {
+                "role": "assistant",
+                "content": "The file uses SQLite.",
+                "reasoning_content": "Verified by reading the source.",
+            },
+        ]
+        original = copy.deepcopy(history)
+        response_id = f"test_{uuid.uuid4().hex}"
+        with response_store_lock:
+            response_store[response_id] = StoredResponse(
+                response={},
+                input_items=_normalize_response_input(history),
+                output_items=[
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Done."}],
+                    }
+                ],
+            )
+        try:
+            request = OpenAIRequest(
+                model="test",
+                previous_response_id=response_id,
+                input=[{"role": "user", "content": "Continue."}],
+            )
+            source, _, _ = normalize_responses_input(
+                request,
+                _response_chain_items(response_id)
+                + _normalize_response_input(request.input),
+            )
+            expected = normalize_chat_input(ChatRequest(model="test", messages=history))
+            self.assertEqual(source.messages[: len(history)], expected.messages)
+            self.assertEqual(
+                source.messages[-2:],
+                [
+                    {"role": "assistant", "content": "Done."},
+                    {"role": "user", "content": "Continue."},
+                ],
+            )
+            self.assertEqual(history, original)
+        finally:
+            with response_store_lock:
+                response_store.pop(response_id, None)
+
+    def test_responses_forwards_media_to_counting_and_both_generation_modes(self):
+        from unittest.mock import MagicMock, patch
+
+        from fastapi.testclient import TestClient
+
+        import mlx_vlm.server as server
+
+        def generate(*args, **kwargs):
+            def tokens():
+                yield server.StreamingToken(
+                    text="Done.", token=1, logprobs=0.0, finish_reason="stop"
+                )
+
+            return SimpleNamespace(prompt_tokens=3), tokens()
+
+        worker = SimpleNamespace(
+            generate=MagicMock(side_effect=generate),
+            validate_context_budget=MagicMock(),
+            _cpu_preprocess=MagicMock(
+                return_value={"input_ids": mx.array([[1, 2, 3]])}
+            ),
+        )
+        payload = {
+            "model": "test",
+            "store": False,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe the recording."},
+                        {"type": "image_url", "image_url": {"url": "image.png"}},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": "audio.wav", "format": "wav"},
+                        },
+                        {"type": "input_video", "video_url": "video.mp4"},
+                    ],
+                }
+            ],
+        }
+        resolution = SimpleNamespace(
+            images=["image.png"], videos=["video.mp4"], used_fallback=False
+        )
+        with (
+            TestClient(server.app) as client,
+            patch.object(server.runtime, "response_generator", worker),
+            patch.object(
+                server,
+                "get_cached_model",
+                return_value=(
+                    SimpleNamespace(),
+                    SimpleNamespace(),
+                    SimpleNamespace(model_type="test"),
+                ),
+            ),
+            patch.object(server, "apply_chat_template", return_value="prompt"),
+            patch(
+                "mlx_vlm.server.request_preparation.resolve_video_inputs",
+                return_value=resolution,
+            ),
+        ):
+            counted = client.post("/v1/responses/input_tokens", json=payload)
+            self.assertEqual(counted.status_code, 200, counted.text)
+            self.assertEqual(counted.json(), {"input_tokens": 3})
+            self.assertEqual(
+                worker._cpu_preprocess.call_args.args,
+                ("prompt", ["image.png"], ["audio.wav"]),
+            )
+            self.assertEqual(
+                worker._cpu_preprocess.call_args.kwargs["videos"], ["video.mp4"]
+            )
+            for stream in (False, True):
+                with self.subTest(stream=stream):
+                    response = client.post(
+                        "/v1/responses", json={**payload, "stream": stream}
+                    )
+                    self.assertEqual(response.status_code, 200, response.text)
+                    call = worker.generate.call_args
+                    if stream:
+                        self.assertIn("response.completed", response.text)
+                        self.assertEqual(
+                            call.args[:3], ("prompt", ["image.png"], ["audio.wav"])
+                        )
+                        self.assertEqual(
+                            worker.validate_context_budget.call_args.kwargs["videos"],
+                            ["video.mp4"],
+                        )
+                    else:
+                        self.assertEqual(call.kwargs["audio"], ["audio.wav"])
+                        self.assertEqual(call.kwargs["images"], ["image.png"])
+                    self.assertEqual(call.kwargs["videos"], ["video.mp4"])
+
+    def test_native_named_tool_choice_with_original_chat_history(self):
+        from mlx_vlm.server.request_preparation import (
+            normalize_chat_input,
+            normalize_responses_input,
+        )
+        from mlx_vlm.server.responses_state import _normalize_response_input
+        from mlx_vlm.server.schemas import ChatRequest, OpenAIRequest
+
+        messages = [{"role": "user", "content": "Read the source."}]
+        function = {"name": "read", "parameters": {"type": "object"}}
+        chat = ChatRequest(
+            model="test",
+            messages=messages,
+            tools=[{"type": "function", "function": function}],
+            tool_choice={"type": "function", "function": {"name": "read"}},
+        )
+        response = OpenAIRequest(
+            model="test",
+            input=messages,
+            tools=[{"type": "function", "function": function}],
+            tool_choice={"type": "function", "name": "read"},
+        )
+        actual, _, _ = normalize_responses_input(
+            response, _normalize_response_input(response.input)
+        )
+        self.assertEqual(actual, normalize_chat_input(chat))
+
+
+class TestReplayProcessorLoading(unittest.TestCase):
+    def _tokenizer(self, path):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import Whitespace
+        from transformers import PreTrainedTokenizerFast
+
+        backend = Tokenizer(
+            WordLevel({"[UNK]": 0, "Hello": 1, "world": 2}, unk_token="[UNK]")
+        )
+        backend.pre_tokenizer = Whitespace()
+        tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="[UNK]")
+        tokenizer.save_pretrained(path)
+        return tokenizer
+
+    def test_tokenizer_loading_does_not_validate_mlx_model_config(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from mlx_vlm.utils import load_processor
+
+        for model_type, config in (
+            ("exaone4", {"sliding_window": None, "sliding_window_pattern": None}),
+            ("llama4", {"text_config": {"attn_temperature_tuning": 4}}),
+        ):
+            with (
+                self.subTest(model_type=model_type),
+                tempfile.TemporaryDirectory() as folder,
+            ):
+                path = Path(folder)
+                expected = self._tokenizer(path)
+                model_config = {"model_type": model_type, **config}
+                (path / "config.json").write_text(json.dumps(model_config))
+                importlib.import_module(f"mlx_vlm.models.{model_type}")
+                with patch(
+                    "transformers.AutoConfig.from_pretrained",
+                    side_effect=AssertionError("model config should not be loaded"),
+                ):
+                    processor = load_processor(
+                        path, add_detokenizer=False, local_files_only=True
+                    )
+                tokenizer = getattr(processor, "tokenizer", processor)
+                self.assertEqual(
+                    tokenizer.encode("Hello world"), expected.encode("Hello world")
+                )
+                self.assertEqual(
+                    json.loads((path / "config.json").read_text()), model_config
+                )
+
+    def test_moondream_fallback_loads_standalone_tokenizer(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from mlx_vlm.models.moondream3 import processing_moondream3
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)
+            tokenizer_path = path / "tokenizer"
+            expected = self._tokenizer(tokenizer_path)
+            model_path = path / "model"
+            model_path.mkdir()
+            with (
+                patch.object(
+                    processing_moondream3, "TOKENIZER_REPO", str(tokenizer_path)
+                ),
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    side_effect=ValueError("no bundled tokenizer"),
+                ),
+            ):
+                processor = processing_moondream3.Moondream3Processor.from_pretrained(
+                    str(model_path)
+                )
+            self.assertEqual(
+                processor.tokenizer.encode("Hello world"),
+                expected.encode("Hello world"),
+            )
+
+
+class TestSavedAssistantTurnReplay(unittest.TestCase):
+    def test_reasoning_text_and_parallel_calls_keep_one_turn(self):
+        from copy import deepcopy
+
+        from mlx_vlm.server.responses_state import _stored_output_to_chat
+
+        output = [
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "Think α\n"}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "reasoning": "Think α\n",
+                "content": [{"type": "output_text", "text": "Check both.\n"}],
+            },
+            {
+                "type": "function_call",
+                "call_id": "a",
+                "name": "lookup",
+                "arguments": '{"city":"東京"}',
+            },
+            {
+                "type": "function_call",
+                "call_id": "b",
+                "name": "lookup",
+                "arguments": '{"city":"Paris"}',
+            },
+        ]
+        original = deepcopy(output)
+        self.assertEqual(
+            _stored_output_to_chat(output),
+            [
+                {
+                    "role": "assistant",
+                    "content": "Check both.\n",
+                    "reasoning_content": "Think α\n",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "id": "a",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": '{"city":"東京"}',
+                            },
+                        },
+                        {
+                            "type": "function",
+                            "id": "b",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": '{"city":"Paris"}',
+                            },
+                        },
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(output, original)
+
+    def test_unknown_output_and_nontext_content_are_retained(self):
+        from mlx_vlm.server.responses_state import _stored_output_to_chat
+
+        for output in (
+            [{"type": "future_item", "payload": "keep"}],
+            [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_audio", "data": "keep"}],
+                }
+            ],
+        ):
+            with self.subTest(output=output):
+                self.assertEqual(_stored_output_to_chat(output), output)
+
+
+class TestHarmonyResponseChannels(unittest.TestCase):
+    def test_every_stream_boundary_matches_expected_channels(self):
+        from mlx_vlm.server.responses_state import HarmonyStreamState
+
+        cases = [
+            (
+                False,
+                "<|channel|>analysis<|message|> Think α\n<|end|><|start|>assistant<|channel|>final<|message|> Answer β\n<|return|>",
+                " Think α\n",
+                " Answer β\n",
+            ),
+            (False, "<|channel|>final<|message|>42<|return|>", "", "42"),
+            (False, "<|channel|>analysis<|message|>unfinished", "unfinished", ""),
+            (False, "<|channel|>anal", "", ""),
+            (
+                True,
+                "continued<|end|><|start|>assistant<|channel|>final<|message|>done",
+                "continued",
+                "done",
+            ),
+        ]
+        for opened, text, reasoning, content in cases:
+            for split in range(len(text) + 1):
+                with self.subTest(opened=opened, text=text, split=split):
+                    state = HarmonyStreamState(opened)
+                    deltas = [
+                        state.feed(text[:split]),
+                        state.feed(text[split:], last=True),
+                    ]
+                    self.assertEqual(
+                        "".join(d.reasoning or "" for d in deltas), reasoning
+                    )
+                    self.assertEqual("".join(d.content or "" for d in deltas), content)
+            state = HarmonyStreamState(opened)
+            deltas = [state.feed(char) for char in text] + [state.feed("", last=True)]
+            self.assertEqual("".join(d.reasoning or "" for d in deltas), reasoning)
+            self.assertEqual("".join(d.content or "" for d in deltas), content)
+
+    def test_stream_and_nonstream_use_same_template_detection(self):
+        from mlx_vlm.server.responses_state import (
+            _split_thinking,
+            make_response_stream_state,
+        )
+
+        for template in (
+            "<|channel|>analysis<|message|>",
+            {"default": "<|channel|>analysis<|message|>"},
+        ):
+            processor = SimpleNamespace(
+                tokenizer=SimpleNamespace(chat_template=template)
+            )
+            text = "<|channel|>analysis<|message|>reason<|end|><|start|>assistant<|message|>answer"
+            delta = make_response_stream_state(processor).feed(text, last=True)
+            self.assertEqual((delta.reasoning, delta.content), ("reason", "answer"))
+            self.assertEqual(
+                _split_thinking(text, processor=processor), ("reason", "answer")
+            )
+
+
+class TestLlavaProcessorCompatibility(unittest.TestCase):
+    def test_model_metadata_fallback_and_separate_modality_kwargs(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from PIL import Image
+        from transformers import CLIPImageProcessor
+
+        from mlx_vlm.models.llava.processing_llava import LlavaProcessor
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            tokenizer = TestReplayProcessorLoading()._tokenizer(path)
+            tokenizer.add_special_tokens(
+                {"additional_special_tokens": ["<image>"], "pad_token": "[UNK]"}
+            )
+            (path / "config.json").write_text(
+                json.dumps(
+                    {
+                        "vision_config": {
+                            "model_type": "clip_vision_model",
+                            "patch_size": 14,
+                        }
+                    }
+                )
+            )
+            image_processor = CLIPImageProcessor(do_resize=False, do_center_crop=False)
+            for explicit in (False, True):
+                config = {
+                    "patch_size": 7 if explicit else None,
+                    "vision_feature_select_strategy": "full" if explicit else None,
+                }
+                if explicit:
+                    config["num_additional_image_tokens"] = 0
+                (path / "processor_config.json").write_text(json.dumps(config))
+                with (
+                    patch(
+                        "transformers.AutoTokenizer.from_pretrained",
+                        return_value=tokenizer,
+                    ),
+                    patch(
+                        "transformers.AutoImageProcessor",
+                        SimpleNamespace(
+                            from_pretrained=lambda *args, **kwargs: image_processor
+                        ),
+                    ),
+                ):
+                    processor = LlavaProcessor.from_pretrained(path)
+                self.assertEqual(processor.patch_size, 7 if explicit else 14)
+                self.assertEqual(
+                    processor.num_additional_image_tokens, 0 if explicit else 1
+                )
+                result = processor(
+                    images=[Image.new("RGB", (28, 28))] * 2,
+                    text=["<image> Hello", "<image> Hello world"],
+                    padding=True,
+                    do_rescale=False,
+                )
+                rows = result["input_ids"].tolist()
+                self.assertEqual(len(rows[0]), len(rows[1]))
+                self.assertEqual(
+                    [row.count(processor.image_token_id) for row in rows],
+                    [16, 16] if explicit else [4, 4],
+                )
+
+
+class TestPlainPromptHistoryFields(unittest.TestCase):
+    def test_fallback_keeps_reasoning_calls_and_result_identity(self):
+        import json
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        extra = {
+            "reasoning_content": "Keep α\nexact",
+            "tool_calls": [
+                {
+                    "id": "call_a",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"city": "東京"}'},
+                }
+            ],
+        }
+        messages = [
+            {"role": "user", "content": "Check."},
+            {"role": "assistant", "content": "Looking.", **extra},
+            {
+                "role": "tool",
+                "name": "lookup",
+                "tool_call_id": "call_a",
+                "content": "Result.",
+            },
+        ]
+        prompt = get_chat_template(None, messages, True)
+        metadata = [
+            json.loads(line.split(": ", 1)[1])
+            for line in prompt.splitlines()
+            if " metadata: " in line
+        ]
+        self.assertEqual(
+            metadata, [extra, {"name": "lookup", "tool_call_id": "call_a"}]
+        )
+        self.assertTrue(prompt.endswith("Assistant:"))
+
+    def test_plain_text_fallback_stays_identical(self):
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        self.assertEqual(
+            get_chat_template(None, [{"role": "user", "content": "Hello"}], True),
+            "Hello",
+        )
+        self.assertEqual(
+            get_chat_template(
+                None,
+                [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi"},
+                ],
+                True,
+            ),
+            "User: Hello\nAssistant: Hi\nAssistant:",
+        )
+
+
+class TestMoondreamHistoryRoles(unittest.TestCase):
+    def test_assistant_role_and_reasoning_survive_message_formatting(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        messages = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Answer", "reasoning_content": "Reason"},
+            {"role": "user", "content": "Continue"},
+        ]
+        prompt = apply_chat_template(None, {"model_type": "moondream3"}, messages)
+        self.assertEqual(
+            prompt,
+            'User: Hi\nAssistant: Answer\nAssistant metadata: {"reasoning_content": "Reason"}\nUser: Continue\nAssistant:',
+        )
+
+
+class TestSystemTemplateRetry(unittest.TestCase):
+    def test_rejected_leading_system_text_is_preserved(self):
+        from copy import deepcopy
+
+        from transformers.utils.chat_template_utils import render_jinja_template
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        class Processor:
+            chat_template = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('Only first system supported') }}{% endif %}{{ m.content }}{% endfor %}"
+
+            def apply_chat_template(self, messages, **kwargs):
+                result, _ = render_jinja_template(
+                    [messages], chat_template=self.chat_template, **kwargs
+                )
+                return result[0]
+
+        for content in (
+            "Second.",
+            [{"type": "text", "text": "Second.", "content": "Second."}],
+        ):
+            with self.subTest(content=content):
+                messages = [
+                    {"role": "system", "content": "First."},
+                    {"role": "system", "content": content},
+                    {"role": "user", "content": "Question."},
+                ]
+                original = deepcopy(messages)
+                self.assertEqual(
+                    get_chat_template(Processor(), messages, True),
+                    "First.\n\nSecond.Question.",
+                )
+                self.assertEqual(messages, original)
+
+    def test_successful_template_receives_original_messages_once(self):
+        from unittest.mock import Mock
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        messages = [
+            {"role": "system", "content": "First."},
+            {"role": "system", "content": "Second."},
+        ]
+        processor = SimpleNamespace(
+            chat_template="template",
+            apply_chat_template=Mock(return_value="original render"),
+        )
+        self.assertEqual(
+            get_chat_template(processor, messages, True), "original render"
+        )
+        processor.apply_chat_template.assert_called_once()
+        self.assertIs(processor.apply_chat_template.call_args.args[0], messages)
+
+    def test_metadata_and_later_system_messages_are_not_rewritten(self):
+        from unittest.mock import Mock
+
+        from jinja2.exceptions import TemplateError
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        for messages in (
+            [
+                {"role": "system", "content": "First.", "name": "policy"},
+                {"role": "system", "content": "Second."},
+            ],
+            [
+                {"role": "system", "content": "First."},
+                {"role": "user", "content": "Question."},
+                {"role": "system", "content": "Second."},
+            ],
+            [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "First.", "content": "Different."}
+                    ],
+                },
+                {"role": "system", "content": "Second."},
+            ],
+        ):
+            with self.subTest(messages=messages):
+                error = TemplateError("original rejection")
+                processor = SimpleNamespace(
+                    chat_template="template",
+                    apply_chat_template=Mock(side_effect=error),
+                )
+                with self.assertRaises(TemplateError) as caught:
+                    get_chat_template(processor, messages, True)
+                self.assertIs(caught.exception, error)
+                processor.apply_chat_template.assert_called_once()
+
+
+class TestLegacyStringTemplateRetry(unittest.TestCase):
+    def test_string_template_preserves_text_image_order_and_metadata(self):
+        from copy import deepcopy
+
+        from transformers.utils.chat_template_utils import render_jinja_template
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        class Processor:
+            chat_template = "{% for m in messages %}{{ '[INST]' + m.content + '[/INST]' }}{{ m.name }}{% endfor %}"
+
+            def __init__(self, marker):
+                self.image_token = marker
+
+            def apply_chat_template(self, messages, **kwargs):
+                result, _ = render_jinja_template(
+                    [messages], chat_template=self.chat_template, **kwargs
+                )
+                return result[0]
+
+        for marker in ("<image>", "[IMG]"):
+            with self.subTest(marker=marker):
+                messages = [
+                    {
+                        "role": "user",
+                        "name": "caller",
+                        "content": [
+                            {"type": "text", "text": "Before.", "content": "Before."},
+                            {"type": "image"},
+                            {"type": "text", "text": "After."},
+                        ],
+                    }
+                ]
+                original = deepcopy(messages)
+                text = get_chat_template(Processor(marker), messages, True)
+                self.assertEqual(
+                    text, "[INST]Before.\n" + marker + "\nAfter.[/INST]caller"
+                )
+                self.assertEqual(messages, original)
+
+    def test_unknown_parts_do_not_trigger_lossy_retry(self):
+        from unittest.mock import Mock
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        for part in (
+            {"type": "input_audio", "data": "abc"},
+            {"type": "image", "url": "payload"},
+            {"type": "text", "text": "A", "content": "B"},
+        ):
+            with self.subTest(part=part):
+                processor = SimpleNamespace(
+                    chat_template="template",
+                    apply_chat_template=Mock(
+                        side_effect=TypeError("original rejection")
+                    ),
+                )
+                with self.assertRaisesRegex(TypeError, "original rejection"):
+                    get_chat_template(
+                        processor, [{"role": "user", "content": [part]}], True
+                    )
+                processor.apply_chat_template.assert_called_once()
+
+
+class TestBunnyMultipleImages(unittest.TestCase):
+    def test_preparation_keeps_all_chunks_and_expands_image_slots(self):
+        from PIL import Image
+
+        from mlx_vlm.models.base import BaseImageProcessor
+        from mlx_vlm.utils import prepare_inputs
+
+        class ImageProcessor(BaseImageProcessor):
+            image_seq_length = 2
+
+            def preprocess(self, images):
+                return [np.zeros((3, 2, 2)) for _ in images]
+
+        class Tokenizer:
+            pad_token = "pad"
+            pad_token_id = 0
+            eos_token = "eos"
+            image_processor = ImageProcessor()
+
+            def __call__(self, text, **kwargs):
+                return SimpleNamespace(input_ids=[ord(c) for c in text])
+
+        result = prepare_inputs(
+            Tokenizer(),
+            images=[Image.new("RGB", (2, 2))] * 2,
+            prompts="A<image>B<image>C",
+            image_token_index=-200,
+        )
+        self.assertEqual(
+            result["input_ids"].tolist(), [[65, -200, -200, 66, -200, -200, 67]]
+        )
+        self.assertEqual(result["attention_mask"].tolist(), [[1] * 7])
+
+    def test_expanded_image_slots_keep_intervening_text_and_rows(self):
+        from mlx_vlm.models.llava_bunny.llava_bunny import Model
+
+        fake = SimpleNamespace(config=SimpleNamespace(image_token_index=-200))
+        ids = mx.array(
+            [[7, -200, -200, 8, -200, -200, 9], [10, 11, 12, 13, 14, 15, 16]]
+        )
+        embeddings = mx.stack([ids, ids], axis=-1).astype(mx.float32)
+        features = mx.array(
+            [[[100.0, 101.0], [102.0, 103.0]], [[200.0, 201.0], [202.0, 203.0]]]
+        )
+        actual = Model._prepare_inputs_for_multimodal(fake, features, embeddings, ids)
+        expected = np.array(embeddings)
+        expected[0, 1:3] = np.array(features[0])
+        expected[0, 4:6] = np.array(features[1])
+        np.testing.assert_array_equal(np.array(actual), expected)
+        np.testing.assert_array_equal(
+            np.array(embeddings), np.array(mx.stack([ids, ids], axis=-1))
+        )
+
+
+class TestPaliGemmaHistoryRendering(unittest.TestCase):
+    def test_history_and_tools_are_not_reduced_to_last_message(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        processor = SimpleNamespace(chat_template=None)
+        config = SimpleNamespace(model_type="paligemma")
+        messages = [
+            {"role": "system", "content": "SYSTEM_MARKER"},
+            {"role": "user", "content": "FIRST_MARKER"},
+            {
+                "role": "assistant",
+                "content": "ANSWER_MARKER",
+                "tool_calls": [
+                    {
+                        "id": "CALL_MARKER",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "CALL_MARKER", "content": "RESULT_MARKER"},
+            {"role": "user", "content": "LAST_MARKER"},
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "SCHEMA_MARKER", "parameters": {"type": "object"}},
+            }
+        ]
+        rendered = apply_chat_template(processor, config, messages, tools=tools)
+        for marker in (
+            "SYSTEM_MARKER",
+            "FIRST_MARKER",
+            "ANSWER_MARKER",
+            "CALL_MARKER",
+            "RESULT_MARKER",
+            "LAST_MARKER",
+            "SCHEMA_MARKER",
+        ):
+            self.assertIn(marker, rendered)
+
+
+class TestAlternatingRoleHistory(unittest.TestCase):
+    TEMPLATE = """{{ bos_token }}{% for message in messages %}{% if (message.role == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate') }}{% endif %}{{ '<start_of_turn>' + ('model' if message.role == 'assistant' else message.role) + '\n' }}{% if message.content is string %}{{ message.content | trim }}{% else %}{% for part in message.content %}{% if part.type == 'text' %}{{ part.text }}{% elif part.type == 'image' %}{{ '<start_of_image>' }}{% elif part.type == 'audio' %}{{ '<audio_soft_token>' }}{% endif %}{% endfor %}{% endif %}{{ '<end_of_turn>\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<start_of_turn>model\n' }}{% endif %}"""
+
+    def _tokenizer(self, template=None):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        return PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+            unk_token="[UNK]",
+            chat_template=template or self.TEMPLATE,
+        )
+
+    def test_tool_history_retains_metadata_and_does_not_mutate(self):
+        import copy
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        messages = [
+            {"role": "user", "content": "USER"},
+            {
+                "role": "assistant",
+                "content": "ANSWER",
+                "reasoning_content": "REASON",
+                "tool_calls": [
+                    {
+                        "id": "CALL_ID",
+                        "function": {
+                            "name": "FUNCTION",
+                            "arguments": '{"path":"ARGUMENT"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "CALL_ID", "content": "RESULT"},
+            {"role": "user", "content": "NEXT"},
+        ]
+        original = copy.deepcopy(messages)
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "FUNCTION", "description": "SCHEMA"},
+            }
+        ]
+        rendered = get_chat_template(self._tokenizer(), messages, True, tools=tools)
+        for marker in [
+            "USER",
+            "ANSWER",
+            "REASON",
+            "CALL_ID",
+            "FUNCTION",
+            "ARGUMENT",
+            "RESULT",
+            "NEXT",
+            "SCHEMA",
+            '"role": "tool"',
+        ]:
+            self.assertIn(marker, rendered)
+        self.assertEqual(messages, original)
+        self.assertEqual(rendered.count("<start_of_turn>"), 4)
+
+    def test_ordinary_and_explicit_templates_are_unchanged(self):
+        from jinja2.exceptions import TemplateError
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        tokenizer = self._tokenizer()
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "next"},
+        ]
+        for tokenize in [False, True]:
+            self.assertEqual(
+                get_chat_template(tokenizer, messages, True, tokenize),
+                tokenizer.apply_chat_template(
+                    messages, tokenize=tokenize, add_generation_prompt=True
+                ),
+            )
+        rich = messages[:2] + [{"role": "tool", "content": "result"}]
+        with self.assertRaises(TemplateError):
+            get_chat_template(tokenizer, rich, True, chat_template=self.TEMPLATE)
+
+    def test_tool_aware_template_keeps_native_messages(self):
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        template = (
+            "<start_of_turn>{{ messages | tojson }}{{ tools | tojson }}<end_of_turn>"
+        )
+        tokenizer = self._tokenizer(template)
+        messages = [{"role": "tool", "content": "RESULT", "tool_call_id": "CALL"}]
+        tools = [{"type": "function", "function": {"name": "FUNCTION"}}]
+        self.assertEqual(
+            get_chat_template(tokenizer, messages, True, tools=tools),
+            tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, tools=tools
+            ),
+        )
+
+    def test_media_order_and_system_role_survive(self):
+        import copy
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        template = (
+            "{% if messages[0].role == 'system' %}{{ raise_exception('System role not supported') }}{% endif %}"
+            + self.TEMPLATE
+        )
+        messages = [
+            {"role": "system", "content": "SYSTEM"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "BEFORE"},
+                    {"type": "image"},
+                    {"type": "text", "text": "AFTER"},
+                    {"type": "audio"},
+                ],
+            },
+            {"role": "assistant", "content": "ANSWER"},
+            {"role": "tool", "content": "RESULT"},
+            {
+                "role": "user",
+                "content": [{"type": "image"}, {"type": "text", "text": "LAST"}],
+            },
+        ]
+        original = copy.deepcopy(messages)
+        rendered = get_chat_template(self._tokenizer(template), messages, True)
+        position = 0
+        for marker in [
+            "SYSTEM",
+            "BEFORE",
+            "<start_of_image>",
+            "AFTER",
+            "<audio_soft_token>",
+            "ANSWER",
+            "RESULT",
+            "<start_of_image>",
+            "LAST",
+        ]:
+            position = rendered.index(marker, position) + len(marker)
+        self.assertEqual(messages, original)
+
+    def test_alternating_template_without_system_support_keeps_system_text(self):
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        template = (
+            "{{ bos_token }}{% for message in messages %}"
+            "{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}"
+            "{{ raise_exception('Conversation roles must alternate') }}{% endif %}"
+            "{% if message['role'] == 'user' %}{{ '[INST] ' + message['content'] + ' [/INST]' }}"
+            "{% elif message['role'] == 'assistant' %}{{ message['content'] }}"
+            "{% else %}{{ raise_exception('Only user and assistant roles are supported!') }}"
+            "{% endif %}{% endfor %}"
+        )
+        messages = [
+            {"role": "system", "content": "BE_CONCISE"},
+            {"role": "system", "content": "KEEP_PATHS"},
+            {"role": "user", "content": "QUESTION"},
+        ]
+        rendered = get_chat_template(self._tokenizer(template), messages, True)
+        for marker in ["BE_CONCISE", "KEEP_PATHS", "QUESTION", '"role": "system"']:
+            self.assertIn(marker, rendered)
+
+    def test_processor_owning_its_rendering_is_skipped(self):
+        from mlx_vlm.prompt_utils import _alternating_role_history
+
+        class OwnRenderer:
+            chat_template = "{{ raise_exception('Conversation roles must alternate') }}"
+
+            def apply_chat_template(self, messages, **kwargs):
+                return ""
+
+        messages = [{"role": "tool", "content": "RESULT", "tool_call_id": "CALL"}]
+        self.assertIs(
+            _alternating_role_history(messages, OwnRenderer(), tools=[{"a": 1}]),
+            messages,
+        )
+
+
+class TestTemplateToolHistory(unittest.TestCase):
+    TEMPLATE = """{% for message in messages %}{% if message.tool_calls is defined and message.tool_calls is not none %}{% for call in message.tool_calls %}{% if not call.id is defined or call.id|length != 9 %}{{ raise_exception('Tool call IDs should be alphanumeric strings with length 9!') }}{% endif %}{{ '[TOOL_CALLS] ' + call.function|tojson + ' id=' + call.id }}{% endfor %}{% elif message.role == 'tool' %}{% if not message.tool_call_id is defined or message.tool_call_id|length != 9 %}{{ raise_exception('Tool call IDs should be alphanumeric strings with length 9!') }}{% endif %}{{ '[TOOL_RESULTS] ' + message.content + ' call_id=' + message.tool_call_id }}{% elif message.role == 'user' %}{{ '[INST]' + message.content + '[/INST]' }}{% else %}{{ ' ' + message.content }}{% endif %}{% endfor %}"""
+
+    HISTORY = [
+        {"role": "user", "content": "QUESTION"},
+        {
+            "role": "assistant",
+            "content": "SPOKEN",
+            "tool_calls": [
+                {
+                    "id": "call_saved",
+                    "type": "function",
+                    "function": {"name": "FUNCTION", "arguments": '{"path":"ARG"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_saved", "content": "RESULT"},
+    ]
+
+    def _tokenizer(self):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        return PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+            unk_token="[UNK]",
+            chat_template=self.TEMPLATE,
+        )
+
+    def test_call_ids_are_remapped_and_stay_paired(self):
+        from mlx_vlm.prompt_utils import _template_tool_history
+
+        normalized = _template_tool_history(self.HISTORY, self.TEMPLATE)
+        call = next(m for m in normalized if m.get("tool_calls"))["tool_calls"][0]
+        result = next(m for m in normalized if m.get("role") == "tool")
+        self.assertEqual(len(call["id"]), 9)
+        self.assertTrue(call["id"].isalnum())
+        self.assertEqual(call["id"], result["tool_call_id"])
+        repeated = _template_tool_history(self.HISTORY, self.TEMPLATE)
+        repeated_call = next(m for m in repeated if m.get("tool_calls"))["tool_calls"][
+            0
+        ]
+        self.assertEqual(call["id"], repeated_call["id"])
+
+    def test_spoken_content_survives_the_tool_call_turn(self):
+        from mlx_vlm.prompt_utils import _template_tool_history
+
+        normalized = _template_tool_history(self.HISTORY, self.TEMPLATE)
+        spoken = [m for m in normalized if m.get("content") == "SPOKEN"]
+        self.assertEqual(len(spoken), 1)
+        self.assertNotIn("tool_calls", spoken[0])
+        self.assertNotIn("content", next(m for m in normalized if m.get("tool_calls")))
+
+    def test_history_renders_and_caller_is_unchanged(self):
+        import copy
+
+        from jinja2.exceptions import TemplateError
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        tokenizer = self._tokenizer()
+        messages = copy.deepcopy(self.HISTORY)
+        original = copy.deepcopy(messages)
+        with self.assertRaises(TemplateError):
+            tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        rendered = get_chat_template(tokenizer, messages, True)
+        for marker in ["QUESTION", "SPOKEN", "FUNCTION", "ARG", "RESULT"]:
+            self.assertIn(marker, rendered)
+        self.assertEqual(messages, original)
+
+    def test_template_without_the_contract_is_untouched(self):
+        from mlx_vlm.prompt_utils import _template_tool_history
+
+        self.assertIs(
+            _template_tool_history(self.HISTORY, "{{ messages | tojson }}"),
+            self.HISTORY,
+        )
+        self.assertIs(_template_tool_history(self.HISTORY, None), self.HISTORY)
+
+
+class TestSupportedRoleMessages(unittest.TestCase):
+    TEMPLATE = """{% for message in messages %}{% if message['role'] == 'user' %}{{ '[INST]' + message['content'] + '[/INST]' }}{% elif message['role'] == 'system' %}{{ '[SYSTEM_PROMPT]' + message['content'] + '[/SYSTEM_PROMPT]' }}{% elif message['role'] == 'assistant' %}{{ message['content'] }}{% else %}{{ raise_exception('Only user, system and assistant roles are supported!') }}{% endif %}{% endfor %}"""
+
+    def _tokenizer(self):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        return PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+            unk_token="[UNK]",
+            chat_template=self.TEMPLATE,
+        )
+
+    def test_rejected_roles_and_unread_fields_are_kept(self):
+        import copy
+
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        messages = [
+            {"role": "system", "content": "SYSTEM"},
+            {"role": "user", "content": "QUESTION"},
+            {
+                "role": "assistant",
+                "content": "SPOKEN",
+                "reasoning_content": "REASON",
+                "tool_calls": [
+                    {
+                        "id": "CALL_ID",
+                        "function": {"name": "FUNCTION", "arguments": '{"p":"ARG"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "CALL_ID", "content": "RESULT"},
+            {"role": "user", "content": "FOLLOW_UP"},
+        ]
+        original = copy.deepcopy(messages)
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "FUNCTION", "description": "SCHEMA"},
+            }
+        ]
+        rendered = get_chat_template(self._tokenizer(), messages, True, tools=tools)
+        for marker in [
+            "SYSTEM",
+            "QUESTION",
+            "SPOKEN",
+            "REASON",
+            "CALL_ID",
+            "FUNCTION",
+            "ARG",
+            "RESULT",
+            "FOLLOW_UP",
+            "SCHEMA",
+            '"role": "tool"',
+        ]:
+            self.assertIn(marker, rendered)
+        self.assertIn("[SYSTEM_PROMPT]SYSTEM[/SYSTEM_PROMPT]", rendered)
+        self.assertEqual(messages, original)
+
+    def test_ordinary_history_takes_the_native_path(self):
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        tokenizer = self._tokenizer()
+        messages = [
+            {"role": "system", "content": "SYSTEM"},
+            {"role": "user", "content": "QUESTION"},
+            {"role": "assistant", "content": "ANSWER"},
+        ]
+        self.assertEqual(
+            get_chat_template(tokenizer, messages, True),
+            tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            ),
+        )
+
+    def test_unrelated_errors_do_not_fold_roles(self):
+        from mlx_vlm.prompt_utils import _supported_role_messages
+
+        messages = [{"role": "tool", "content": "RESULT"}]
+        self.assertIs(
+            _supported_role_messages(messages, "Conversation roles must alternate"),
+            messages,
+        )
