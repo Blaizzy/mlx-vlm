@@ -117,6 +117,14 @@ class TestOutputControlTokens(unittest.TestCase):
             _strip_box_markers("<|begin_of_box|>answer<|end_of_box|>"), "answer"
         )
 
+    def test_glm46v_moe_strips_box_markers(self):
+        from mlx_vlm.models.glm4v_moe.processing import Glm46VMoEProcessor
+
+        processor = object.__new__(Glm46VMoEProcessor)
+        self.assertEqual(
+            processor.clean_output("<|begin_of_box|>answer<|end_of_box|>"), "answer"
+        )
+
     def test_kimi_vl_stops_on_assistant_marker(self):
         from mlx_vlm.models.kimi_vl.processing_kimi_vl import KimiVLProcessor
 
