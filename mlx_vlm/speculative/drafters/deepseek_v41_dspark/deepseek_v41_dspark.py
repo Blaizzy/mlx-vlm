@@ -266,12 +266,28 @@ class DeepseekV41DsparkDraftModel(nn.Module):
             )
         self._input_embed = inner.embed_tokens
         lm = getattr(target_model, "language_model", target_model)
-        self._lm_head_fn = (
-            getattr(target_model, "lm_head", None)
-            or getattr(lm, "lm_head", None)
-            or self._input_embed.as_linear
-        )
+        self._lm_head_fn = self._resolve_head(target_model, lm)
         return self
+
+    def _resolve_head(self, target_model, lm) -> Callable[[mx.array], mx.array]:
+        """The target's output projection, which the drafter decodes through.
+
+        DeepSeek-V4.1 names it ``head`` and does not tie it to the embedding, so
+        a chain that only looks for ``lm_head`` falls through to
+        ``embed_tokens.as_linear`` -- a different linear map that still returns
+        plausible-looking logits. That silently cost every proposal: the target's
+        own next token ranked 42527 of 129280 through the embedding and 0
+        through the real head.
+        """
+        for owner, name in (
+            (target_model, "lm_head"),
+            (lm, "lm_head"),
+            (lm, "head"),
+        ):
+            candidate = getattr(owner, name, None)
+            if candidate is not None and callable(candidate):
+                return candidate
+        return self._input_embed.as_linear
 
     def make_cache(self) -> List[RotatingKVCache]:
         """Window KV rings sized as the release does.
