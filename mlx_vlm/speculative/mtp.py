@@ -152,6 +152,16 @@ def mtp_rounds(
                             produced[row] += 1
                     if pos + 1 == width:
                         state.commit(emitted, forward)
+                        # Replay updates only seed the next round.  Launch the
+                        # device work before yielding the block's final token
+                        # so it overlaps caller-side detokenization, stop
+                        # checks, and stream framing instead of leaving the GPU
+                        # idle until the generator is resumed.
+                        mx.async_eval(
+                            state.seed.token,
+                            state.seed.hidden,
+                            state.bonus,
+                        )
                         if phase_observer:
                             phase_observer(
                                 "commit", [state.seed.token, state.seed.hidden]

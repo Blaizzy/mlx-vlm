@@ -98,6 +98,39 @@ def test_mtp_generation_matches_ar(depth, batch, all_accepted):
     assert not hasattr(draft, "_seed_hidden")
 
 
+def test_mtp_launches_replay_before_reporting_commit(monkeypatch):
+    target, draft = models()
+    prompt = mx.array([[1, 2, 3]])
+    caches = target.make_cache()
+    output = target(prompt, cache=caches, return_hidden=True)
+    first = mx.argmax(output.logits[:, -1], axis=-1)
+    events = []
+    original_async_eval = mx.async_eval
+
+    def record_launch(*arrays):
+        events.append("async_replay")
+        return original_async_eval(*arrays)
+
+    monkeypatch.setattr(mx, "async_eval", record_launch)
+    list(
+        mtp_rounds(
+            target,
+            draft,
+            caches,
+            output.hidden_states[-1],
+            prompt_tokens=prompt,
+            first_bonus=first,
+            max_tokens=6,
+            sampler=None,
+            greedy_sampling=True,
+            draft_block_size=3,
+            phase_observer=lambda phase, _: events.append(phase),
+        )
+    )
+    assert "async_replay" in events
+    assert events.index("async_replay") < events.index("commit")
+
+
 def test_cancel_commits_only_delivered_prefix():
     target, draft = models()
     target.lm_head.weight = mx.zeros_like(target.lm_head.weight)
