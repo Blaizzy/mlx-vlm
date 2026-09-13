@@ -7,6 +7,7 @@ import pytest
 import mlx_vlm.models.fast_ops as fast_ops
 from mlx_vlm.models import quantized_ops as verifier_linear
 from mlx_vlm.models.linear import native_batch_linear
+from mlx_vlm.models.mla import MultiLinear
 from mlx_vlm.models.quantized_verifier import (
     decode_quantized_argmax,
     decode_quantized_linear,
@@ -22,6 +23,48 @@ def _bf16_quantization_parameters(linear):
     if linear.biases is not None:
         linear.biases = linear.biases.astype(mx.bfloat16)
     return linear
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal kernels")
+@pytest.mark.parametrize("batch", [1, 4])
+def test_row_parallel_affine4_linear_matches_singleton(batch):
+    mx.random.seed(904 + batch)
+    dense = nn.Linear(512, 32, bias=False)
+    dense.weight = dense.weight.astype(mx.bfloat16)
+    linear = _bf16_quantization_parameters(
+        nn.QuantizedLinear.from_linear(dense, group_size=64, bits=4)
+    )
+    inputs = mx.random.normal((batch, 1, 512)).astype(mx.bfloat16)
+    expected_rows = [
+        linear(mx.contiguous(inputs[row : row + 1])) for row in range(batch)
+    ]
+    mx.eval(*expected_rows)
+    expected = mx.concatenate(expected_rows)
+    actual = fast_ops.exact_affine_linear(linear, inputs)
+    assert actual is not None
+    mx.eval(expected, actual)
+    assert mx.array_equal(actual, expected).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal kernels")
+@pytest.mark.parametrize("batch", [1, 4])
+def test_row_parallel_affine4_multilinear_matches_singleton(batch):
+    mx.random.seed(914 + batch)
+    linear = _bf16_quantization_parameters(MultiLinear(256, 128, 4).to_quantized(64, 4))
+    inputs = mx.random.normal((batch, 4, 1, 256)).astype(mx.bfloat16)
+    expected_rows = [
+        fast_ops.exact_affine_multilinear(linear, mx.contiguous(inputs[row : row + 1]))
+        for row in range(batch)
+    ]
+    assert all(row is not None for row in expected_rows)
+    mx.eval(*expected_rows)
+    expected = mx.concatenate(expected_rows)
+    native = linear(inputs)
+    actual = fast_ops.exact_affine_multilinear(linear, inputs)
+    assert actual is not None
+    mx.eval(expected, native, actual)
+    assert mx.array_equal(actual, expected).item()
+    assert float(mx.max(mx.abs(actual.astype(mx.float32) - native))) < 1e-5
 
 
 @pytest.mark.parametrize(
@@ -306,8 +349,8 @@ def test_fused_fp8_gate_up_matches_native_selected_projections(
     indices = mx.broadcast_to(mx.array(routes)[None], (batch, 2, 3))
     actual = exact_quantized_switch_gate_up(switch, x, indices)
     expected = tuple(
-        exact_quantized_switch_linear(l, x, indices)
-        for l in (switch.up_proj, switch.gate_proj)
+        exact_quantized_switch_linear(layer, x, indices)
+        for layer in (switch.up_proj, switch.gate_proj)
     )
     mx.eval(actual, expected)
     assert actual is not None

@@ -236,9 +236,8 @@ class HyperConnection(nn.Module):
     def apply_branch(self, x, norm, branch, *args, **kwargs):
         """Collapse, normalize, evaluate a branch, and expand its residual."""
         fused = None
-        if 1 < x.shape[1] <= DECODE_BLOCK_SIZE and not self.training:
-            if x.shape[0] == 1:
-                fused = exact_hc_normalized_norm(self, norm, x)
+        if x.shape[1] <= DECODE_BLOCK_SIZE and not self.training:
+            fused = exact_hc_normalized_norm(self, norm, x)
             if fused is None and _hc_kernel is not None:
                 y = x.astype(mx.float32)
                 z = mx.fast.rms_norm(y.flatten(-2), None, self.norm_eps)

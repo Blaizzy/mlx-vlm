@@ -618,6 +618,106 @@ for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
 """
 
 
+_AFFINE_LINEAR_SOURCE = r"""
+uint n_tile = threadgroup_position_in_grid.y;
+uint token = threadgroup_position_in_grid.z;
+uint simd_gid = simdgroup_index_in_threadgroup;
+uint lane = thread_index_in_simdgroup;
+
+int out_row = int(n_tile) * ROWS_PER_TG +
+    int(simd_gid) * RESULTS_PER_SIMDGROUP;
+constexpr int W_ROW_BYTES = K_SIZE * 4 / 8;
+constexpr int GROUPS = K_SIZE / GROUP_SIZE;
+
+const device uint8_t* ws = (const device uint8_t*)w +
+    out_row * W_ROW_BYTES + int(lane) * PACKS_PER_THREAD * BYTES_PER_PACK;
+const device T* sc = scales +
+    out_row * GROUPS + int(lane) / SCALE_STEP_PER_THREAD;
+const device T* bs = biases +
+    out_row * GROUPS + int(lane) / SCALE_STEP_PER_THREAD;
+const device T* xk = x +
+    int(token) * K_SIZE + int(lane) * VALUES_PER_THREAD;
+
+float result[RESULTS_PER_SIMDGROUP] = {0.0f};
+float x_thread[VALUES_PER_THREAD];
+for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
+  bool active = k + int(lane) * VALUES_PER_THREAD < K_SIZE;
+  if (active) {
+    float sum = load_affine4_vector_exact<T>(xk, x_thread);
+    for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+      const device uint8_t* wr = ws + row * W_ROW_BYTES;
+      const device T* sr = sc + row * GROUPS;
+      const device T* br = bs + row * GROUPS;
+      result[row] += affine4_qdot_exact(
+          wr, x_thread, float(sr[0]), float(br[0]), sum);
+    }
+  }
+  ws += BLOCK_SIZE * 4 / 8;
+  sc += BLOCK_SIZE / GROUP_SIZE;
+  bs += BLOCK_SIZE / GROUP_SIZE;
+  xk += BLOCK_SIZE;
+}
+
+for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+  float value = simd_sum(result[row]);
+  if (lane == 0) {
+    y[int(token) * N_SIZE + out_row + row] = T(value);
+  }
+}
+"""
+
+
+_AFFINE_MULTILINEAR_SOURCE = r"""
+uint n_tile = threadgroup_position_in_grid.y;
+uint token = threadgroup_position_in_grid.z;
+uint simd_gid = simdgroup_index_in_threadgroup;
+uint lane = thread_index_in_simdgroup;
+
+int out_row = int(n_tile) * ROWS_PER_TG +
+    int(simd_gid) * RESULTS_PER_SIMDGROUP;
+int head = int((token / LENGTH) % HEADS);
+constexpr int W_ROW_BYTES = K_SIZE * 4 / 8;
+constexpr int GROUPS = K_SIZE / GROUP_SIZE;
+
+const device uint8_t* ws = (const device uint8_t*)w +
+    head * N_SIZE * W_ROW_BYTES + out_row * W_ROW_BYTES +
+    int(lane) * PACKS_PER_THREAD * BYTES_PER_PACK;
+const device T* sc = scales + head * N_SIZE * GROUPS +
+    out_row * GROUPS + int(lane) / SCALE_STEP_PER_THREAD;
+const device T* bs = biases + head * N_SIZE * GROUPS +
+    out_row * GROUPS + int(lane) / SCALE_STEP_PER_THREAD;
+const device T* xk = x +
+    int(token) * K_SIZE + int(lane) * VALUES_PER_THREAD;
+
+float result[RESULTS_PER_SIMDGROUP] = {0.0f};
+float x_thread[VALUES_PER_THREAD];
+for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
+  bool active = k + int(lane) * VALUES_PER_THREAD < K_SIZE;
+  if (active) {
+    float sum = load_affine4_vector_exact<T>(xk, x_thread);
+    for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+      const device uint8_t* wr = ws + row * W_ROW_BYTES;
+      const device T* sr = sc + row * GROUPS;
+      const device T* br = bs + row * GROUPS;
+      result[row] += affine4_qdot_exact(
+          wr, x_thread, float(sr[0]), float(br[0]), sum);
+    }
+  }
+  ws += BLOCK_SIZE * 4 / 8;
+  sc += BLOCK_SIZE / GROUP_SIZE;
+  bs += BLOCK_SIZE / GROUP_SIZE;
+  xk += BLOCK_SIZE;
+}
+
+for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+  float value = simd_sum(result[row]);
+  if (lane == 0) {
+    y[int(token) * N_SIZE + out_row + row] = T(value);
+  }
+}
+"""
+
+
 _AFFINE5_MOE_DOWN_SOURCE = r"""
 uint n_tile = threadgroup_position_in_grid.y;
 uint token = threadgroup_position_in_grid.z;
@@ -700,6 +800,152 @@ def _affine_exact_header(
         .replace("__NUM_SIMDGROUPS__", str(num_simdgroups))
         .replace("__PACKS_PER_THREAD__", str(packs_per_thread))
     )
+
+
+@lru_cache(maxsize=None)
+def _affine_linear_kernel(dtype, k_size, n_size, group_size):
+    return mx.fast.metal_kernel(
+        name=(
+            f"row_parallel_affine4_linear_{_dtype_name(dtype)}_"
+            f"k{k_size}_n{n_size}_g{group_size}"
+        ),
+        input_names=["x", "w", "scales", "biases"],
+        output_names=["y"],
+        header=_affine_exact_header(4, group_size, 4, 2),
+        source=_AFFINE_LINEAR_SOURCE,
+    )
+
+
+def exact_affine_linear(linear, x: mx.array):
+    """Project independent short-block rows in parallel with QMV arithmetic."""
+    weight = getattr(linear, "weight", None)
+    scales = getattr(linear, "scales", None)
+    biases = getattr(linear, "biases", None)
+    if (
+        not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
+        or x.ndim != 3
+        or x.dtype not in (mx.bfloat16, mx.float16)
+        or getattr(linear, "mode", None) != "affine"
+        or getattr(linear, "bits", None) != 4
+        or getattr(linear, "group_size", None) not in (64, 128)
+        or not isinstance(weight, mx.array)
+        or not isinstance(scales, mx.array)
+        or not isinstance(biases, mx.array)
+        or weight.ndim != 2
+        or scales.ndim != 2
+        or biases.shape != scales.shape
+        or scales.dtype != x.dtype
+        or biases.dtype != x.dtype
+    ):
+        return None
+    batch, length, k_size = x.shape
+    n_size = weight.shape[0]
+    if (
+        scales.shape != (n_size, k_size // linear.group_size)
+        or weight.shape != (n_size, k_size // 8)
+        or k_size % 16
+        or n_size % 8
+    ):
+        return None
+    rows = batch * length
+    output = _affine_linear_kernel(x.dtype, k_size, n_size, linear.group_size)(
+        inputs=[
+            mx.contiguous(x),
+            weight,
+            scales,
+            biases,
+        ],
+        template=[
+            ("T", x.dtype),
+            ("K_SIZE", k_size),
+            ("N_SIZE", n_size),
+            ("GROUP_SIZE", linear.group_size),
+        ],
+        grid=(32, 2 * (n_size // 8), rows),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(batch, length, n_size)],
+        output_dtypes=[x.dtype],
+    )[0]
+    if "bias" in linear:
+        output = output + linear["bias"]
+    return output
+
+
+@lru_cache(maxsize=None)
+def _affine_multilinear_kernel(dtype, heads, length, k_size, n_size, group_size):
+    return mx.fast.metal_kernel(
+        name=(
+            f"row_parallel_affine4_multilinear_{_dtype_name(dtype)}_"
+            f"h{heads}_t{length}_k{k_size}_n{n_size}_g{group_size}"
+        ),
+        input_names=["x", "w", "scales", "biases"],
+        output_names=["y"],
+        header=_affine_exact_header(4, group_size, 4, 2),
+        source=_AFFINE_MULTILINEAR_SOURCE,
+    )
+
+
+def exact_affine_multilinear(linear, x: mx.array, transpose=True):
+    """Apply independent per-head Q4 projections with fixed row reductions."""
+    weight = getattr(linear, "weight", None)
+    scales = getattr(linear, "scales", None)
+    biases = getattr(linear, "biases", None)
+    if (
+        not transpose
+        or not mx.metal.is_available()
+        or mx.default_device() != mx.gpu
+        or x.ndim != 4
+        or x.dtype not in (mx.bfloat16, mx.float16)
+        or getattr(linear, "mode", None) != "affine"
+        or getattr(linear, "bits", None) != 4
+        or getattr(linear, "group_size", None) not in (64, 128)
+        or not isinstance(weight, mx.array)
+        or not isinstance(scales, mx.array)
+        or not isinstance(biases, mx.array)
+        or weight.ndim != 3
+        or scales.ndim != 3
+        or biases.shape != scales.shape
+        or scales.dtype != x.dtype
+        or biases.dtype != x.dtype
+    ):
+        return None
+    batch, heads, length, k_size = x.shape
+    if weight.shape[0] != heads:
+        return None
+    n_size = weight.shape[1]
+    if (
+        scales.shape != (heads, n_size, k_size // linear.group_size)
+        or weight.shape != (heads, n_size, k_size // 8)
+        or k_size % 16
+        or n_size % 8
+    ):
+        return None
+    rows = batch * heads * length
+    return _affine_multilinear_kernel(
+        x.dtype, heads, length, k_size, n_size, linear.group_size
+    )(
+        inputs=[
+            mx.contiguous(x),
+            weight,
+            scales,
+            biases,
+        ],
+        template=[
+            ("T", x.dtype),
+            ("HEADS", heads),
+            ("LENGTH", length),
+            ("K_SIZE", k_size),
+            ("N_SIZE", n_size),
+            ("GROUP_SIZE", linear.group_size),
+        ],
+        grid=(32, 2 * (n_size // 8), rows),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(batch, heads, length, n_size)],
+        output_dtypes=[x.dtype],
+    )[
+        0
+    ]
 
 
 @lru_cache(maxsize=None)

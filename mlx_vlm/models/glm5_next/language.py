@@ -7,11 +7,42 @@ from ..base import LanguageModelOutput, create_ssm_mask, scaled_dot_product_atte
 from ..cache import ArraysCache, CacheList, KVCache, PoolingCache
 from ..deepseek_v4.hyper_connection import HyperConnection
 from ..gated_delta import gated_delta_update
-from ..linear import DECODE_BLOCK_SIZE, linear, tiled_linear
+from ..linear import DECODE_BLOCK_SIZE
+from ..linear import linear as base_linear
+from ..linear import tiled_linear
 from ..mla import MultiLinear
 from ..sparse_attention import indexed_sparse_attention
 from ..switch_layers import MoE, SwitchGLU
 from .config import TextConfig
+
+
+def linear(module, value):
+    """Use GLM's fixed-row projection kernels during short decode."""
+    if value.ndim == 3 and value.shape[1] <= DECODE_BLOCK_SIZE:
+        from ..exact_speculative_verify import exact_speculative_verify_weight
+        from ..fast_ops import exact_affine_linear
+
+        output = exact_affine_linear(module, value)
+        if output is not None:
+            return output
+        weight = getattr(module, "weight", None)
+        if weight is not None:
+            output = exact_speculative_verify_weight(weight, value)
+            if output is not None:
+                if "bias" in module:
+                    output = output + module["bias"]
+                return output
+    return base_linear(module, value)
+
+
+def _multilinear(module, value, transpose=True):
+    if value.ndim == 4 and value.shape[-2] <= DECODE_BLOCK_SIZE:
+        from ..fast_ops import exact_affine_multilinear
+
+        output = exact_affine_multilinear(module, value, transpose)
+        if output is not None:
+            return output
+    return module(value, transpose)
 
 
 @mx.compile
@@ -688,19 +719,35 @@ class Glm5NextAttention(nn.Module):
             start = length - 1 if last_only else 0
             for index in range(start, length):
                 selected_indices = topk[:, index : index + 1]
-                valid = (selected_indices >= 0) & (selected_indices < latent.shape[2])
-                safe = mx.clip(selected_indices, 0, max(latent.shape[2] - 1, 0))
-                selected = mx.take_along_axis(latent, safe[:, None, 0, :, None], axis=2)
-                query = self.embed_q(q[:, :, index : index + 1])
-                output = scaled_dot_product_attention(
+                query = _multilinear(self.embed_q, q[:, :, index : index + 1])
+                attention_latent = getattr(kv_cache, "keys", None)
+                if not isinstance(attention_latent, mx.array):
+                    attention_latent = latent
+                output = indexed_sparse_attention(
                     query,
-                    selected,
-                    selected,
-                    cache=kv_cache,
-                    scale=self.scale,
-                    mask=valid[:, None],
+                    attention_latent,
+                    attention_latent,
+                    selected_indices,
+                    self.scale,
+                    key_length=latent.shape[2],
                 )
-                output = self.unembed_out(output)
+                if output is None:
+                    valid = (selected_indices >= 0) & (
+                        selected_indices < latent.shape[2]
+                    )
+                    safe = mx.clip(selected_indices, 0, max(latent.shape[2] - 1, 0))
+                    selected = mx.take_along_axis(
+                        latent, safe[:, None, 0, :, None], axis=2
+                    )
+                    output = scaled_dot_product_attention(
+                        query,
+                        selected,
+                        selected,
+                        cache=kv_cache,
+                        scale=self.scale,
+                        mask=valid[:, None],
+                    )
+                output = _multilinear(self.unembed_out, output)
                 if length > 1:
                     mx.async_eval(output)
                 outputs.append(output)
@@ -715,12 +762,12 @@ class Glm5NextAttention(nn.Module):
                 and latent.shape[2] <= _MAX_PROJECTED_PREFILL_TOKENS
             )
             if cache_matches:
-                new_keys = self.embed_q(new_latent, transpose=False)
-                new_values = self.unembed_out(new_latent)
+                new_keys = _multilinear(self.embed_q, new_latent, transpose=False)
+                new_values = _multilinear(self.unembed_out, new_latent)
                 keys, values = projected_cache.update_and_fetch(new_keys, new_values)
             else:
-                keys = self.embed_q(latent, transpose=False)
-                values = self.unembed_out(latent)
+                keys = _multilinear(self.embed_q, latent, transpose=False)
+                values = _multilinear(self.unembed_out, latent)
             if last_only:
                 q = q[:, :, -1:]
                 topk = topk[:, -1:]

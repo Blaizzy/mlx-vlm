@@ -55,7 +55,7 @@ _INDEXED_SPARSE_ATTENTION_SOURCE = r"""
         U score = -3.4028234663852886e38f;
         if (valid) {
             const device T* kptr =
-                keys + (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
+                keys + (((batch_idx * NUM_KV_HEADS + kv_head_idx) * PHYSICAL_LENGTH +
                          key_pos) *
                         QK_DIM) +
                 int(simd_lid) * qk_per_thread;
@@ -75,7 +75,7 @@ _INDEXED_SPARSE_ATTENTION_SOURCE = r"""
 
         if (valid) {
             const device T* vptr =
-                values + (((batch_idx * NUM_KV_HEADS + kv_head_idx) * key_length +
+                values + (((batch_idx * NUM_KV_HEADS + kv_head_idx) * PHYSICAL_LENGTH +
                            key_pos) *
                           V_DIM) +
                 int(simd_lid) * v_per_thread;
@@ -166,6 +166,7 @@ def indexed_sparse_attention(
     scale: float,
     *,
     min_sparse_ratio: int = 0,
+    key_length: Optional[int] = None,
 ) -> Optional[mx.array]:
     """Fused indexed attention for Metal, or ``None`` when unsupported.
 
@@ -189,20 +190,23 @@ def indexed_sparse_attention(
         return None
 
     batch, q_heads, query_length, qk_dim = queries.shape
-    key_batch, kv_heads, key_length, key_dim = keys.shape
+    key_batch, kv_heads, physical_length, key_dim = keys.shape
     value_batch, value_heads, value_length, v_dim = values.shape
+    key_length = physical_length if key_length is None else int(key_length)
     topk = indices.shape[-1]
     if (
         batch != key_batch
         or batch != value_batch
         or indices.shape[:2] != (batch, query_length)
         or value_heads != kv_heads
-        or value_length != key_length
+        or value_length != physical_length
         or key_dim != qk_dim
         or q_heads % kv_heads != 0
         or qk_dim % 32 != 0
         or v_dim % 32 != 0
         or topk == 0
+        or key_length < 0
+        or key_length > physical_length
         or key_length < topk * min_sparse_ratio
     ):
         return None
@@ -242,6 +246,7 @@ def indexed_sparse_attention(
             ("NUM_Q_HEADS", int(q_heads)),
             ("NUM_KV_HEADS", int(kv_heads)),
             ("GQA_FACTOR", int(q_heads // kv_heads)),
+            ("PHYSICAL_LENGTH", int(physical_length)),
         ],
         grid=(1024, batch * q_heads * query_length, 1),
         threadgroup=(1024, 1, 1),
