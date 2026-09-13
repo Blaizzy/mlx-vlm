@@ -509,9 +509,42 @@ class DeepseekV41Attention(nn.Module):
         kv = self.rope(kv, start_pos).reshape(batch, seqlen, self.head_dim)
         kv = fake_quant_fp8_ue8m0(kv.astype(mx.float32)).astype(kv.dtype)
         need_len = start_pos + seqlen
-        buffer = _write_span(
-            cache.window[self.layer_idx], kv, batch, start_pos, dtype=mx.float32
-        )
+        buffer = cache.window[self.layer_idx]
+        if buffer is None:
+            buffer = mx.zeros((batch, 0, self.head_dim), dtype=mx.float32)
+        if buffer.shape[0] < batch:
+            buffer = mx.concatenate(
+                [
+                    buffer,
+                    mx.zeros(
+                        (batch - buffer.shape[0], buffer.shape[1], self.head_dim),
+                        dtype=mx.float32,
+                    ),
+                ],
+                axis=0,
+            )
+        if buffer.shape[1] < need_len:
+            buffer = mx.concatenate(
+                [
+                    buffer,
+                    mx.zeros(
+                        (buffer.shape[0], need_len - buffer.shape[1], self.head_dim),
+                        dtype=mx.float32,
+                    ),
+                ],
+                axis=1,
+            )
+        parts = []
+        if start_pos > 0:
+            parts.append(buffer[:batch, :start_pos])
+        parts.append(kv)
+        if buffer.shape[1] > need_len:
+            parts.append(buffer[:batch, need_len:])
+        head = mx.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
+        if buffer.shape[0] > batch:
+            buffer = mx.concatenate([head, buffer[batch:]], axis=0)
+        else:
+            buffer = head
         cache.window[self.layer_idx] = buffer
         if start_pos == 0:
             part, base = buffer[:batch, :need_len], 0
