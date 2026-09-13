@@ -1765,6 +1765,54 @@ def test_speculative_walk_batch_deferred_greedy_matches_batch_walk():
     assert fake_head.calls == 3
 
 
+def test_speculative_walk_singleton_positioned_sampler_projects_block_once():
+    class FakeEmbed:
+        def __init__(self):
+            self.calls = 0
+
+        def as_linear(self, hidden):
+            self.calls += 1
+            return hidden
+
+    class PositionedLogitsSampler:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, logprobs):
+            raise AssertionError("positioned target sampler was not used")
+
+        def sample_target(self, logprobs, *, row_ids, positions):
+            raise AssertionError("raw-logits sampler was not used")
+
+        def sample_target_logits(self, logits, *, row_ids, positions):
+            self.calls.append((list(row_ids), list(positions)))
+            return mx.argmax(logits, axis=-1)
+
+    fake_head = FakeEmbed()
+    sampler = PositionedLogitsSampler()
+    lm = SimpleNamespace(speculative_logits_from_hidden=fake_head.as_linear)
+    target_hidden = mx.array(
+        [[[0, 0, 9, 0], [0, 9, 0, 0], [0, 0, 0, 9]]],
+        dtype=mx.float32,
+    )
+    draft_tokens = mx.array([[2, 3]], dtype=mx.int32)
+
+    accepted, new_tokens = _speculative_walk_batch_deferred_greedy(
+        lm,
+        target_hidden,
+        draft_tokens,
+        sampler,
+        budgets=[3],
+        row_ids=[10],
+        base_positions=[7],
+    )
+
+    assert accepted == [1]
+    assert new_tokens == [[2, 1]]
+    assert fake_head.calls == 1
+    assert sampler.calls == [([10, 10, 10], [7, 8, 9])]
+
+
 @pytest.mark.parametrize("uniform", [False, True])
 def test_speculative_walk_batch_deferred_uses_positioned_sampler(uniform):
     class FakeEmbed:

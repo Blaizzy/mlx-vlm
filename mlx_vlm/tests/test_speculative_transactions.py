@@ -8,7 +8,13 @@ import mlx.nn as nn
 import pytest
 from mlx.utils import tree_map_with_path
 
-from mlx_vlm.generate.ar import PromptProcessingBatch, _make_cache
+from mlx_vlm.generate.ar import (
+    GenerationBatch,
+    PromptProcessingBatch,
+    SpeculativeGenerationBatch,
+    _make_cache,
+    _SpeculativeThinkingBudgetSampler,
+)
 from mlx_vlm.models.base import LanguageModelOutput
 from mlx_vlm.models.cache import (
     ArraysCache,
@@ -34,11 +40,32 @@ from mlx_vlm.speculative.drafters.glm5_next_mtp import (
 )
 from mlx_vlm.speculative.eagle3 import _eagle3_rounds, _eagle3_rounds_batch
 from mlx_vlm.speculative.mtp import _mtp_rounds, _mtp_rounds_batch, _mtp_verify_target
+from mlx_vlm.speculative.utils import speculative_hidden_state
 from mlx_vlm.tests.test_qwen4_mtp import _outer_config, _tiny_text_config
 from mlx_vlm.tests.test_speculative import (
     _tiny_deepseek_v4_config,
     _tiny_glm5_next_text_config,
 )
+from mlx_vlm.utils import ThinkingBudgetCriteria
+
+
+class _FixedBudgetTokenizer:
+    _tokens = {"<think>": [29], "</think>": [30], "\n": [31]}
+
+    def encode(self, text, add_special_tokens=False):
+        del add_special_tokens
+        return self._tokens.get(text, [0])
+
+
+def _tiny_thinking_budget():
+    return ThinkingBudgetCriteria(
+        _FixedBudgetTokenizer(),
+        thinking_budget=6,
+        thinking_end_token="</think>",
+        thinking_start_token="<think>",
+        enable_thinking=True,
+        prompt_preopens_thinking=True,
+    )
 
 
 @pytest.mark.parametrize("batch", [2, 4])
@@ -516,6 +543,85 @@ def test_glm_sampler_failure_restores_temporal_and_append_caches():
     assert not caches[0].is_speculating
     assert all(a is b for a, b in zip(initial, caches[0].state))
     assert caches[1][0].offset == 2
+
+
+def test_glm_positioned_budget_matches_ar_through_forced_close():
+    mx.random.seed(7)
+    config = _tiny_glm5_next_text_config()
+    model = GlmLanguageModel(config)
+    model.eval()
+    drafter = Glm5NextMTPDraftModel(ModelConfig(text_config=config, block_size=2))
+    drafter.eval()
+    prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+
+    def sampler(logprobs):
+        return mx.argmax(logprobs, axis=-1)
+
+    def stop_criteria(token):
+        return token == 30
+
+    def prefill():
+        prompt_cache = _make_cache(model, left_padding=[0])
+        output = model(
+            prompt,
+            cache=prompt_cache,
+            return_hidden=True,
+            return_shared_kv=True,
+        )
+        logits = output.logits[:, -1, :]
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        return prompt_cache, output, logprobs
+
+    ar_cache, _, ar_logprobs = prefill()
+    ar_first = sampler(ar_logprobs)
+    ar_batch = GenerationBatch(
+        model,
+        [1],
+        ar_first,
+        ar_cache,
+        sampler,
+        stop_criteria,
+        [20],
+        greedy_sampling=True,
+        thinking_budget_criteria=[_tiny_thinking_budget()],
+    )
+    ar_batch.compute_logprobs = False
+
+    spec_cache, spec_output, spec_logprobs = prefill()
+    budget_sampler = _SpeculativeThinkingBudgetSampler(sampler, _tiny_thinking_budget())
+    spec_first = budget_sampler.sample_first(spec_logprobs)
+    spec_batch = SpeculativeGenerationBatch(
+        model,
+        drafter,
+        "mtp",
+        [1],
+        spec_first,
+        spec_cache,
+        budget_sampler,
+        stop_criteria,
+        [20],
+        speculative_hidden_state("mtp", spec_output),
+        spec_output.shared_kv_states,
+        prompt,
+        draft_block_size=2,
+        greedy_sampling=True,
+    )
+    spec_batch.compute_logprobs = False
+
+    def collect(batch):
+        tokens = []
+        while len(batch):
+            responses = batch.next()
+            assert responses
+            tokens.extend(response.token for response in responses)
+        return tokens
+
+    ar_tokens = collect(ar_batch)
+    spec_tokens = collect(spec_batch)
+
+    assert ar_tokens == [0, 23, 15, 21, 16, 24, 21, 31, 30]
+    assert spec_tokens == ar_tokens
+    assert drafter.speculative_total_rounds > 0
 
 
 def test_glm_verification_uses_original_modules_and_preserves_weights():

@@ -2719,6 +2719,7 @@ class ThinkingBudgetCriteria:
         self.thinking_token_count = 0
         self.budget_exceeded = False
         self._forced_index = 0
+        self.forced_token_id = None
 
     def __call__(self, token_id: int) -> Optional[int]:
         """Process a token and return a forced token ID if budget exceeded, else None."""
@@ -2754,6 +2755,24 @@ class ThinkingBudgetCriteria:
         forced_token_id = self.forced_token_id
         self.forced_token_id = None
         return forced_token_id
+
+    def snapshot_state(self) -> dict:
+        """Capture mutable state for speculative verify rollback."""
+        return {
+            "in_thinking": self.in_thinking,
+            "thinking_token_count": self.thinking_token_count,
+            "budget_exceeded": self.budget_exceeded,
+            "forced_index": self._forced_index,
+            "forced_token_id": self.forced_token_id,
+        }
+
+    def restore_state(self, state: dict) -> None:
+        """Restore a checkpoint produced by :meth:`snapshot_state`."""
+        self.in_thinking = bool(state["in_thinking"])
+        self.thinking_token_count = int(state["thinking_token_count"])
+        self.budget_exceeded = bool(state["budget_exceeded"])
+        self._forced_index = int(state["forced_index"])
+        self.forced_token_id = state["forced_token_id"]
 
 
 def print_array_report(t: mx.array, label: Optional[str]) -> dict:

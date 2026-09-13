@@ -649,6 +649,47 @@ class TestBatchGenerator:
         assert batch.draft_kind is None
         assert batch.thinking_budget_criteria == [criteria]
 
+    def test_prompt_batch_keeps_greedy_singleton_budget_on_mtp(self):
+        draft_model = object()
+        criteria = object()
+        batch = PromptProcessingBatch(
+            model=SimpleNamespace(),
+            uids=[1],
+            input_ids=[[4, 5]],
+            max_tokens=[8],
+            inputs_embeds=mx.ones((1, 2, 4)),
+            prompt_kwargs={},
+            thinking_budget_criteria=[criteria],
+            warm_cache=[],
+            draft_model=draft_model,
+            draft_kind="mtp",
+            greedy_sampling=True,
+        )
+
+        assert batch.draft_model is draft_model
+        assert batch.draft_kind == "mtp"
+
+    def test_prompt_batch_falls_back_for_multirow_greedy_budgets(self):
+        draft_model = object()
+        criteria = [object(), object()]
+        batch = PromptProcessingBatch(
+            model=SimpleNamespace(),
+            uids=[1, 2],
+            input_ids=[[4, 5], [6, 7]],
+            max_tokens=[8, 8],
+            inputs_embeds=mx.ones((2, 2, 4)),
+            prompt_kwargs={},
+            thinking_budget_criteria=criteria,
+            warm_cache=[],
+            draft_model=draft_model,
+            draft_kind="mtp",
+            greedy_sampling=True,
+        )
+
+        assert batch.draft_model is None
+        assert batch.draft_kind is None
+        assert batch.thinking_budget_criteria == criteria
+
     def test_prompt_batch_keeps_speculation_without_thinking_budget(self):
         draft_model = object()
         batch = PromptProcessingBatch(
@@ -1776,6 +1817,43 @@ class TestThinkingBudgetCriteria:
         assert criteria(60) == 100  # </think>
         assert criteria.pop_forced_token_id() == 100
         assert criteria.budget_exceeded is True
+
+    def test_snapshot_restores_pending_force_and_count(self):
+        criteria = ThinkingBudgetCriteria(
+            tokenizer=FakeTokenizer(),
+            thinking_budget=1,
+            thinking_end_token="</think>",
+            thinking_start_token="<think>",
+            enable_thinking=True,
+            prompt_preopens_thinking=True,
+        )
+        criteria(50)
+        snapshot = criteria.snapshot_state()
+
+        assert criteria(51) == 10
+        assert criteria.pop_forced_token_id() == 10
+        criteria.restore_state(snapshot)
+
+        assert criteria.thinking_token_count == 1
+        assert criteria.forced_token_id is None
+        assert criteria(52) == 10
+
+    def test_reset_clears_pending_forced_token(self):
+        criteria = ThinkingBudgetCriteria(
+            tokenizer=FakeTokenizer(),
+            thinking_budget=0,
+            thinking_end_token="</think>",
+            thinking_start_token="<think>",
+            enable_thinking=True,
+            prompt_preopens_thinking=True,
+        )
+        criteria(50)
+        assert criteria.forced_token_id == 10
+
+        criteria.reset_thinking_state()
+
+        assert criteria.forced_token_id is None
+        assert criteria.pop_forced_token_id() is None
 
     def _make_criteria(self, enable_thinking=True, prompt_preopens_thinking=True):
         return ThinkingBudgetCriteria(

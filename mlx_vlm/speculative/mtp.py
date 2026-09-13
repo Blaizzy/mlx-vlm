@@ -304,13 +304,21 @@ def _positioned_target_tokens(
             if logits.shape[0] != 1:
                 return None
             logits = logits[0]
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        positions = [int(base_position) + pos for pos in range(logprobs.shape[0])]
-        target_tokens = sample_target(
-            logprobs,
-            row_ids=[int(row_id)] * len(positions),
-            positions=positions,
-        )
+        positions = [int(base_position) + pos for pos in range(logits.shape[0])]
+        sample_target_logits = getattr(sampler, "sample_target_logits", None)
+        if callable(sample_target_logits):
+            target_tokens = sample_target_logits(
+                logits,
+                row_ids=[int(row_id)] * len(positions),
+                positions=positions,
+            )
+        else:
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            target_tokens = sample_target(
+                logprobs,
+                row_ids=[int(row_id)] * len(positions),
+                positions=positions,
+            )
     return target_tokens[None, :]
 
 
@@ -342,6 +350,23 @@ def _speculative_walk_batch_deferred_greedy(
     n_draft = draft_tokens.shape[1]
     draft_lists = [[int(token) for token in row] for row in draft_tokens.tolist()]
     budgets = [int(budget) for budget in budgets]
+    if (
+        B == 1
+        and row_ids is not None
+        and base_positions is not None
+        and _sampler_supports_positioned_target(sampler)
+    ):
+        target_tokens = _positioned_target_tokens(
+            lm,
+            target_hidden,
+            sampler,
+            row_id=row_ids[0],
+            base_position=base_positions[0],
+        )
+        if target_tokens is not None:
+            mx.async_eval(target_tokens, target_hidden)
+            return _speculative_walk_batch(draft_tokens, target_tokens, budgets)
+
     accepted = [0] * B
     new_tokens: List[List[int]] = [[] for _ in range(B)]
     done = [False] * B

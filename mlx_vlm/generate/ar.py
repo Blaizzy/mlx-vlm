@@ -1061,6 +1061,78 @@ def _sample_with_positions(
     return sampler(logprobs)
 
 
+class _SpeculativeThinkingBudgetSampler:
+    """Apply a singleton thinking budget at positioned MTP verify slots.
+
+    Target slots beyond the first rejected draft are sampled again in a later
+    round.  Checkpointing the criteria by absolute output position makes that
+    replay deterministic and lets a forced thinking terminator participate in
+    the normal target verification/rollback transaction.
+    """
+
+    def __init__(self, sampler, criteria):
+        self._sampler = sampler
+        self._criteria = criteria
+        self._snapshots = {0: criteria.snapshot_state()}
+        self.requires_positioned_target = True
+
+    def __call__(self, logprobs):
+        return self._sampler(logprobs)
+
+    def _sample_one(self, logprobs):
+        forced = self._criteria.pop_forced_token_id()
+        if forced is None:
+            sampled = self._sampler(logprobs)
+            token = int(sampled.reshape(-1)[0].item())
+        else:
+            token = int(forced)
+        self._criteria(token)
+        return token
+
+    def sample_first(self, logprobs):
+        token = self._sample_one(logprobs)
+        self._snapshots[1] = self._criteria.snapshot_state()
+        return mx.array([token], dtype=mx.int32)
+
+    def sample_target(self, logprobs, *, row_ids=None, positions=None):
+        return self._sample_positioned(logprobs, positions)
+
+    def sample_target_logits(self, logits, *, row_ids=None, positions=None):
+        return self._sample_positioned(logits, positions)
+
+    def _sample_positioned(self, scores, positions):
+        if positions is None or not positions:
+            raise RuntimeError(
+                "thinking-budget MTP requires positioned target sampling"
+            )
+        if scores.ndim == 1:
+            scores = scores[None, :]
+        if scores.shape[0] != len(positions):
+            raise RuntimeError(
+                "thinking-budget MTP target positions do not match logits"
+            )
+
+        base_position = int(positions[0])
+        snapshot = self._snapshots.get(base_position)
+        if snapshot is None:
+            raise RuntimeError(
+                f"thinking-budget MTP has no checkpoint at position {base_position}"
+            )
+        self._criteria.restore_state(snapshot)
+        for position in tuple(self._snapshots):
+            if position > base_position:
+                del self._snapshots[position]
+
+        tokens = []
+        for offset, position in enumerate(positions):
+            if int(position) != base_position + offset:
+                raise RuntimeError("thinking-budget MTP positions must be contiguous")
+            token = self._sample_one(scores[offset : offset + 1])
+            tokens.append(token)
+            self._snapshots[int(position) + 1] = self._criteria.snapshot_state()
+        return mx.array(tokens, dtype=mx.int32)
+
+
 class GenerationBatch:
     """
     Batched token generator with double-buffered pipelining.
@@ -1647,7 +1719,13 @@ class SpeculativeGenerationBatch:
             draft_block_size=self.draft_block_size,
             token_dtype=self.token_dtype,
             stop_check=stop_check,
-            greedy_sampling=self.greedy_sampling,
+            # The ordinary greedy verifier may use a fused argmax that never
+            # calls ``sample_target``. A budget wrapper must take the deferred
+            # positioned path; it still makes draft-side sampling greedy.
+            greedy_sampling=(
+                self.greedy_sampling
+                and not getattr(self.sampler, "requires_positioned_target", False)
+            ),
             shared_kv_states=self.shared_kv_states,
             eos_token_ids=None,
             prompt_tokens=self.prompt_tokens,
@@ -1760,17 +1838,20 @@ class PromptProcessingBatch:
         self._prompt_uids = list(uids)
         self.max_tokens = max_tokens
         self.prefill_step_size = prefill_step_size
-        # ThinkingBudgetCriteria forces future tokens after observing a
-        # delivered token.  A speculative round may already have verified and
-        # committed several tokens past that boundary, so it cannot honour the
-        # force without a target + drafter rollback transaction.  Until that
-        # transaction exists, fall back for the complete coalesced cohort.
-        # BatchGenerator keeps budgeted and unbudgeted cohorts separate, so an
-        # unrelated request retains speculative decoding.
+        # Greedy singleton MTP can apply a thinking budget inside positioned
+        # target verification. Sampled requests and multi-row cohorts keep the
+        # conservative AR fallback because they also require RNG/row-state
+        # rollback, not just criteria rollback.
+        has_thinking_budget = any(
+            item is not None for item in (thinking_budget_criteria or [])
+        )
         use_speculative = (
             draft_model is not None
             and draft_kind is not None
-            and not any(item is not None for item in (thinking_budget_criteria or []))
+            and (
+                not has_thinking_budget
+                or (len(uids) == 1 and draft_kind == "mtp" and greedy_sampling)
+            )
         )
         self.draft_model = draft_model if use_speculative else None
         self.draft_kind = draft_kind if use_speculative else None
@@ -2186,12 +2267,19 @@ class PromptProcessingBatch:
             logits = mx.concatenate(processed_logits, axis=0)
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        first_tokens = _sample_with_positions(
-            sampler,
-            logprobs,
-            row_ids=[0] * len(self.uids),
-            positions=[0] * len(self.uids),
-        )
+        generation_sampler = sampler
+        if self.draft_model is not None and any(self.thinking_budget_criteria):
+            generation_sampler = _SpeculativeThinkingBudgetSampler(
+                sampler, self.thinking_budget_criteria[0]
+            )
+            first_tokens = generation_sampler.sample_first(logprobs)
+        else:
+            first_tokens = _sample_with_positions(
+                sampler,
+                logprobs,
+                row_ids=[0] * len(self.uids),
+                positions=[0] * len(self.uids),
+            )
 
         mx.async_eval(first_tokens)
 
@@ -2229,7 +2317,7 @@ class PromptProcessingBatch:
                 uids=list(self.uids),
                 first_tokens=first_tokens,
                 prompt_cache=self.prompt_cache,
-                sampler=sampler,
+                sampler=generation_sampler,
                 stop_criteria=stop_criteria,
                 max_tokens=list(self.max_tokens),
                 hidden=speculative_hidden_state(self.draft_kind, output),
