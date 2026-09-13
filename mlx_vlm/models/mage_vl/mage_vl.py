@@ -118,7 +118,6 @@ class Model(nn.Module):
             elif k.startswith("lm_head."):
                 k = "language_model.lm_head." + k[len("lm_head.") :]
             elif k.startswith("model."):
-                # Flattened OptiQ conversions drop the language_model. segment.
                 k = "language_model." + k
             out[k] = v
 
