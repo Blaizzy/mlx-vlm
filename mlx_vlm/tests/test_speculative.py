@@ -5718,3 +5718,69 @@ def test_deepseek_v41_drafter_sanitize_markov():
     assert "markov_head.markov_w1.weight" in out
     assert "markov_head.markov_w2.weight" in out
     assert "confidence_head.proj.weight" in out
+
+
+def test_dflash_rounds_batch_tolerates_ragged_draft_widths():
+    """A drafter may propose fewer tokens for one row than another.
+
+    DSpark's confidence head truncates each row independently, so the per-row
+    proposals are not the same width and cannot be stacked as they come.
+    """
+    from mlx_vlm.models.cache import KVCache
+    from mlx_vlm.speculative.dflash import _dflash_rounds_batch
+
+    vocab, dim = 16, 4
+    widths = [1, 2]
+
+    class Drafter:
+        def __init__(self):
+            self.config = SimpleNamespace(target_layer_ids=[0], block_size=4)
+            self.accept_lens = []
+            self.draft_lens = []
+
+        def reset(self, model):
+            pass
+
+        def make_cache(self):
+            return [KVCache()]
+
+        def draft_block(self, last_bonus, hidden, cache, block_size, sampler, dtype):
+            width = min(widths.pop(0) if widths else 1, max(block_size - 1, 1))
+            return mx.full((1, width), 5, dtype=dtype)
+
+    class LM:
+        def __call__(self, inputs, cache=None, capture_layer_ids=None):
+            n = inputs.shape[1]
+            batch = inputs.shape[0]
+            cache[0].update_and_fetch(
+                mx.zeros((batch, 1, n, dim)), mx.zeros((batch, 1, n, dim))
+            )
+            return SimpleNamespace(
+                logits=mx.zeros((batch, n, vocab)),
+                hidden_states=[mx.zeros((batch, n, dim))],
+                cross_attention_states=None,
+                encoder_outputs=None,
+            )
+
+    lm = LM()
+    cache = [KVCache()]
+    cache[0].update_and_fetch(mx.zeros((2, 1, 3, dim)), mx.zeros((2, 1, 3, dim)))
+
+    emitted = list(
+        _dflash_rounds_batch(
+            SimpleNamespace(language_model=lm),
+            Drafter(),
+            cache,
+            mx.zeros((2, 1, dim)),
+            first_bonus=mx.array([1, 2], dtype=mx.int32),
+            max_tokens=4,
+            sampler=lambda logits: mx.argmax(logits, axis=-1),
+            draft_block_size=3,
+            token_dtype=mx.int32,
+            greedy_sampling=True,
+        )
+    )
+
+    assert emitted
+    for tokens, _ in emitted:
+        assert len(tokens) == 2

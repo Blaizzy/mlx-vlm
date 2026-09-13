@@ -528,36 +528,35 @@ def _dflash_rounds_batch(
         # proven unsafe as a single batched cache on MLX/Metal. Target verify
         # remains batched below.
         def draft_active_rows():
-            return mx.concatenate(
-                [
-                    (
-                        getattr(
-                            draft_model,
-                            "draft_block_greedy",
-                            draft_model.draft_block,
-                        )
-                        if greedy_sampling
-                        else draft_model.draft_block
-                    )(
-                        int(b_active[j]),
-                        hidden_by_orig[active_idx[j]],
-                        draft_caches[active_idx[j]],
-                        bs,
-                        (
-                            _PositionedDraftSampler(
-                                sampler,
-                                row_ids=[row_ids[active_idx[j]]],
-                                positions=[emitted[active_idx[j]]],
-                            )
-                            if not greedy_sampling and positioned_sampling
-                            else sampler
-                        ),
-                        token_dtype,
+            rows = [
+                (
+                    getattr(
+                        draft_model,
+                        "draft_block_greedy",
+                        draft_model.draft_block,
                     )
-                    for j in range(n_active)
-                ],
-                axis=0,
-            )
+                    if greedy_sampling
+                    else draft_model.draft_block
+                )(
+                    int(b_active[j]),
+                    hidden_by_orig[active_idx[j]],
+                    draft_caches[active_idx[j]],
+                    bs,
+                    (
+                        _PositionedDraftSampler(
+                            sampler,
+                            row_ids=[row_ids[active_idx[j]]],
+                            positions=[emitted[active_idx[j]]],
+                        )
+                        if not greedy_sampling and positioned_sampling
+                        else sampler
+                    ),
+                    token_dtype,
+                )
+                for j in range(n_active)
+            ]
+            width = min(int(row.shape[1]) for row in rows)
+            return mx.concatenate([row[:, :width] for row in rows], axis=0)
 
         draft_tokens = sampler_rng.draft_tokens(
             draft_active_rows,
