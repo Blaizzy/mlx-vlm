@@ -991,6 +991,7 @@ def _mtp_rounds_batch(
     emitted = [1] * B
     finished = [False] * B
     active_idx = list(range(B))
+    has_token_controls = token_observer is not None or forced_token_provider is not None
 
     while len(active_idx) > 0:
         remaining = [
@@ -1041,14 +1042,15 @@ def _mtp_rounds_batch(
 
             # Walk per-row
             budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
-            forced_tokens = [
-                (
-                    forced_token_provider(active_idx[row])
-                    if forced_token_provider is not None
-                    else None
-                )
-                for row in range(n_active)
-            ]
+            if has_token_controls:
+                forced_tokens = [
+                    (
+                        forced_token_provider(active_idx[row])
+                        if forced_token_provider is not None
+                        else None
+                    )
+                    for row in range(n_active)
+                ]
             if verify.target_tokens is not None:
                 sampler_rng.target_eval(verify.target_tokens, hidden_full)
                 accepted_list, new_tokens_list = _speculative_walk_batch(
@@ -1093,13 +1095,14 @@ def _mtp_rounds_batch(
                 sampler_rng.target_sampled(
                     sync_draft=not _sampler_supports_positioned_target(sampler)
                 )
-            _apply_mtp_token_controls(
-                accepted_list,
-                new_tokens_list,
-                active_idx,
-                forced_tokens,
-                token_observer,
-            )
+            if has_token_controls:
+                _apply_mtp_token_controls(
+                    accepted_list,
+                    new_tokens_list,
+                    active_idx,
+                    forced_tokens,
+                    token_observer,
+                )
             # Keep the adaptive block-size history on a per-round basis so
             # batched MTP reacts like the singleton loop instead of letting
             # batch size change the controller signal.
