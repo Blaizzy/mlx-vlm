@@ -108,7 +108,8 @@ def test_mtp_launches_replay_before_reporting_commit(monkeypatch):
     original_async_eval = mx.async_eval
 
     def record_launch(*arrays):
-        events.append("async_replay")
+        if len(arrays) == 3:
+            events.append("async_replay")
         return original_async_eval(*arrays)
 
     monkeypatch.setattr(mx, "async_eval", record_launch)
@@ -129,6 +130,38 @@ def test_mtp_launches_replay_before_reporting_commit(monkeypatch):
     )
     assert "async_replay" in events
     assert events.index("async_replay") < events.index("commit")
+
+
+def test_mtp_does_not_launch_unused_terminal_replay(monkeypatch):
+    target, draft = models()
+    prompt = mx.array([[1, 2, 3]])
+    caches = target.make_cache()
+    output = target(prompt, cache=caches, return_hidden=True)
+    first = mx.argmax(output.logits[:, -1], axis=-1)
+    launches = []
+    original_async_eval = mx.async_eval
+
+    def record_launch(*arrays):
+        if len(arrays) == 3:
+            launches.append(arrays)
+        return original_async_eval(*arrays)
+
+    monkeypatch.setattr(mx, "async_eval", record_launch)
+    list(
+        mtp_rounds(
+            target,
+            draft,
+            caches,
+            output.hidden_states[-1],
+            prompt_tokens=prompt,
+            first_bonus=first,
+            max_tokens=2,
+            sampler=None,
+            greedy_sampling=True,
+            draft_block_size=3,
+        )
+    )
+    assert launches == []
 
 
 def test_cancel_commits_only_delivered_prefix():
