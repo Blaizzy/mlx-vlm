@@ -1136,6 +1136,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # Stock MLX rejects bits=1; route those layers to our Metal kernel.
         replace_one_bit_modules(quantized_model, quantization, weights)
 
+        default_quantization = _quantization_for_path(config["quantization"], "")
+
         def get_class_predicate(p, m):
             per_module_quantization = _quantization_for_module_path(
                 config["quantization"], p, model
@@ -1168,6 +1170,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             # Handle legacy models which may not have everything quantized
             if f"{p}.scales" not in weights:
                 return False
+            if module_quantization == default_quantization:
+                return True
             return module_quantization
 
         nn.quantize(
