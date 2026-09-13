@@ -1157,9 +1157,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             if module_quantization.get("bits") == 1:
                 return False
             # Handle custom per-layer quantization, including aliases supplied
-            # by the model. A config entry cannot force quantization onto a
-            # module that does not support it (e.g. a head deliberately kept in
-            # fp32 and dequantized during sanitize).
+            # by the model.
             if not hasattr(m, "to_quantized"):
                 return False
             if per_module_quantization is not None:
@@ -1170,8 +1168,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             # Handle legacy models which may not have everything quantized
             if f"{p}.scales" not in weights:
                 return False
-            # Carry the resolved width; returning True would silently fall back
-            # to the global bits and mis-pack component-wide overrides.
             return module_quantization
 
         nn.quantize(

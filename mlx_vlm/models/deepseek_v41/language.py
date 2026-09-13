@@ -6,7 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import LanguageModelOutput
-from ..deepseek_v4.hyper_connection import hc_expand, hc_split_sinkhorn
+from ..deepseek_v4.hyper_connection import _hc_split_sinkhorn_ops, hc_expand
 from ..deepseek_v4.language import (
     DeepseekV4MLP,
     DeepseekV4RoPE,
@@ -864,7 +864,9 @@ def hc_mix_coeffs(
 ):
     """Collapse coefficients for the next sublayer: pre / post / comb."""
     mixes = mx.fast.rms_norm(x.flatten(-2).astype(mx.float32), None, norm_eps) @ hc_fn.T
-    return hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps)
+    return _hc_split_sinkhorn_ops(
+        mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps
+    )
 
 
 class DeepseekV41Block(nn.Module):

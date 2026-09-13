@@ -457,13 +457,19 @@ class OneBitEmbedding(nn.Module):
 
 
 def _quantization_for_path(quantization: dict, path: str) -> dict:
+    """Resolve the quantization settings a module path should be packed with.
+
+    Converters disagree on the layout. Per-module overrides appear either as
+    top-level keys or nested under ``modules``, and component-wide widths are
+    written as ``<component>_bits`` (``expert_bits``, ``engram_bits``) beside
+    the base ``bits``. An explicit per-module entry wins over a component-wide
+    one.
+    """
     base = {
         key: quantization[key]
         for key in ("group_size", "bits", "mode")
         if key in quantization
     }
-    # Converters disagree on where per-module overrides live: some write them
-    # as top-level keys, others nest them under ``modules``.
     modules = quantization.get("modules")
     modules = modules if isinstance(modules, dict) else {}
 
@@ -473,9 +479,6 @@ def _quantization_for_path(quantization: dict, path: str) -> dict:
             entry = modules.get(key)
         return entry
 
-    # Converters also express component-wide widths as ``<component>_bits``
-    # (``expert_bits``, ``engram_bits``) alongside the base ``bits``. An
-    # explicit per-module entry still wins over these.
     for key, value in quantization.items():
         if not key.endswith("_bits") or not isinstance(value, int):
             continue
