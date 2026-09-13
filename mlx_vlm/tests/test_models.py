@@ -3476,6 +3476,28 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(fused[:, :64] == 0).item())
         self.assertTrue(mx.all(fused[:, 64:] == 1).item())
 
+        raw_experts = {}
+        for expert in range(text.n_routed_experts):
+            expert_prefix = f"model.language_model.layers.1.mlp.experts.{expert}"
+            raw_experts[f"{expert_prefix}.gate_proj.weight"] = mx.full(
+                (64, 128), expert
+            )
+            raw_experts[f"{expert_prefix}.up_proj.weight"] = mx.full(
+                (64, 128), expert + 10
+            )
+            raw_experts[f"{expert_prefix}.down_proj.weight"] = mx.full(
+                (128, 64), expert + 20
+            )
+        raw = model.sanitize(raw_experts)
+        fused = raw["language_model.model.layers.1.mlp.switch_mlp.gate_up_proj.weight"]
+        down = raw["language_model.model.layers.1.mlp.switch_mlp.down_proj.weight"]
+        self.assertEqual(fused.shape, (8, 128, 128))
+        self.assertEqual(down.shape, (8, 128, 64))
+        for expert in range(text.n_routed_experts):
+            self.assertTrue(mx.all(fused[expert, :64] == expert).item())
+            self.assertTrue(mx.all(fused[expert, 64:] == expert + 10).item())
+            self.assertTrue(mx.all(down[expert] == expert + 20).item())
+
         prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
         logits = model(prompt, cache=cache).logits
         self.assertEqual(logits.shape, (1, 8, config.text_config.vocab_size))
