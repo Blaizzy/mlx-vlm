@@ -19,19 +19,34 @@ IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(4)
 
 IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
 
+_RENDER_CONTENT = (
+    "{%- if content is string -%}"
+    "{{- content -}}"
+    "{%- else -%}"
+    "{%- for part in content -%}"
+    "{%- if part['type'] in ('image', 'image_url', 'input_image') -%}"
+    "{{- '" + IMAGE_PLACEHOLDER + "' -}}"
+    "{%- elif part['type'] == 'text' -%}"
+    "{{- part['text'] -}}"
+    "{%- endif -%}"
+    "{%- endfor -%}"
+    "{%- endif -%}"
+)
+
 DEFAULT_CHAT_TEMPLATE = (
     "{{- '<｜begin▁of▁sentence｜>' -}}"
     "{%- if messages[0]['role'] == 'system' -%}"
-    "{{- messages[0]['content'] -}}"
+    "{%- set content = messages[0]['content'] -%}" + _RENDER_CONTENT + ""
     "{%- set start = 1 -%}"
     "{%- else -%}"
     "{%- set start = 0 -%}"
     "{%- endif -%}"
     "{%- for m in messages[start:] -%}"
+    "{%- set content = m['content'] -%}"
     "{%- if m['role'] == 'user' -%}"
-    "{{- '<｜User｜>' + m['content'] -}}"
+    "{{- '<｜User｜>' -}}" + _RENDER_CONTENT + ""
     "{%- elif m['role'] == 'assistant' -%}"
-    "{{- '<｜Assistant｜>' + m['content'] + '<｜end▁of▁sentence｜>' -}}"
+    "{{- '<｜Assistant｜>' -}}" + _RENDER_CONTENT + "{{- '<｜end▁of▁sentence｜>' -}}"
     "{%- endif -%}"
     "{%- endfor -%}"
     "{%- if add_generation_prompt -%}"

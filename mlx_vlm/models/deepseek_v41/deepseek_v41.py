@@ -86,7 +86,14 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ) -> LanguageModelOutput:
-        return self.language_model(input_ids, cache=cache, **kwargs)
+        inputs_embeds = kwargs.pop("inputs_embeds", None)
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings(
+                input_ids, pixel_values
+            ).inputs_embeds
+        return self.language_model(
+            input_ids, inputs_embeds=inputs_embeds, cache=cache, **kwargs
+        )
 
     @property
     def model_path(self):
