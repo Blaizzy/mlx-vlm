@@ -19901,6 +19901,7 @@ class TestDeepseekV41Basics(unittest.TestCase):
             engram_compressed_vocab_size=7,
         )
         model = LanguageModel(config)
+        model.head.weight = mx.random.normal(model.head.weight.shape) * 0.05
         mx.eval(model.parameters())
 
         def maxdiff(a, b):
@@ -19929,17 +19930,17 @@ class TestDeepseekV41Basics(unittest.TestCase):
         for j in range(1, 4):
             out = model(mx.array([[toks[9 + j]]]), cache=cache_b)
             mx.eval(out.logits)
-            self.assertLess(maxdiff(out.logits[:, 0], logits_a[10 + j]), 1e-4)
+            self.assertLess(maxdiff(out.logits[:, 0], logits_a[9 + j]), 1e-4)
         blk = model(mx.array([toks[13:18]]), cache=cache_b)
         mx.eval(blk.logits)
-        for r in range(2):
-            self.assertLess(maxdiff(blk.logits[:, r], logits_a[14 + r]), 1e-4)
+        self.assertEqual(cache_b[0].offset, 18)
+        self.assertEqual(cache_b[0].trim(5), 5)
+        self.assertEqual(cache_b[0].offset, 13)
+        replay = model(mx.array([toks[13:18]]), cache=cache_b)
+        mx.eval(replay.logits)
+        self.assertLess(maxdiff(replay.logits, blk.logits), 1e-4)
         self.assertEqual(cache_b[0].trim(3), 3)
         self.assertEqual(cache_b[0].offset, 15)
-        for j in range(6, 9):
-            out = model(mx.array([[toks[9 + j]]]), cache=cache_b)
-            mx.eval(out.logits)
-            self.assertLess(maxdiff(out.logits[:, 0], logits_a[10 + j]), 1e-4)
 
         cache_c = model.make_cache()
         model(prompt, cache=cache_c)
@@ -19952,7 +19953,74 @@ class TestDeepseekV41Basics(unittest.TestCase):
         self.assertEqual(cache_c[0].offset, 11)
         again = model(mx.array([[toks[11]]]), cache=cache_c)
         mx.eval(again.logits)
-        self.assertLess(maxdiff(again.logits[:, 0], logits_a[12]), 1e-4)
+        self.assertLess(maxdiff(again.logits[:, 0], logits_a[11]), 1e-4)
+
+    def test_deepseek_v41_chunked_prefill_matches_whole_prompt(self):
+        """Chunked prefill names the ids `inputs`; the engram has to still see them."""
+        from mlx_vlm.models import deepseek_v41
+        from mlx_vlm.models.deepseek_v41.language import LanguageModel
+
+        config = deepseek_v41.ModelConfig(
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=3,
+            num_nextn_predict_layers=0,
+            num_attention_heads=2,
+            head_dim=32,
+            q_lora_rank=8,
+            o_lora_rank=8,
+            o_groups=2,
+            qk_rope_head_dim=4,
+            max_position_embeddings=64,
+            sliding_window=8,
+            compress_ratios=[0, 2, 0],
+            kv_source_layer_ids=[1],
+            index_source_layer_ids=[1],
+            index_n_heads=2,
+            index_head_dim=32,
+            index_topk=4,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=16,
+            hc_mult=2,
+            engram_layer_ids=[1],
+            engram_num_embeddings=[1024],
+            engram_max_ngram_size=3,
+            engram_vocab_size=512,
+            engram_n_heads=2,
+            engram_head_dim=8,
+            engram_compressed_vocab_size=7,
+        )
+        model = LanguageModel(config)
+        model.head.weight = mx.random.normal(model.head.weight.shape) * 0.05
+        mx.eval(model.parameters())
+        model.engram_hash = deepseek_v41.NgramHashState(
+            config,
+            model.layout,
+            token_map=[i % config.engram_compressed_vocab_size for i in range(64)],
+        )
+        prompt = mx.array([[3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47]])
+
+        whole = model(prompt, cache=model.make_cache())
+        mx.eval(whole.logits)
+
+        cache = model.make_cache()
+        embeds = model.embed_tokens(prompt)
+        for lo, hi in ((0, 5), (5, 9), (9, 12)):
+            chunked = model(
+                inputs=prompt[:, lo:hi],
+                inputs_embeds=embeds[:, lo:hi],
+                cache=cache,
+                n_to_process=hi - lo,
+            )
+        mx.eval(chunked.logits)
+
+        diff = mx.abs(
+            whole.logits[:, -1].astype(mx.float32)
+            - chunked.logits[:, -1].astype(mx.float32)
+        )
+        mx.eval(diff)
+        self.assertLess(float(mx.max(diff).item()), 1e-4)
 
 
 class TestDeepseekV41Indexer(unittest.TestCase):

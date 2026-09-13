@@ -1140,14 +1140,18 @@ class LanguageModel(nn.Module):
     ) -> LanguageModelOutput:
         """Extra `inputs`/`n_to_process` are generate-protocol passengers.
 
-        Chunked prefill slices `inputs_embeds` per call and advances the cache
-        offset; the raw `inputs` ids carry nothing this architecture needs
-        (no hash routing), so they are accepted and ignored.
+        Chunked prefill slices `inputs_embeds` per call and names the matching
+        token ids `inputs`. The engram routes on those ids, so they are read
+        here rather than ignored; without them the tables contribute nothing
+        and a chunked prompt encodes differently from an unchunked one.
+        `n_to_process` is implied by the slice and is not needed.
         """
         entry = cache[0] if cache else DeepseekV41Cache()
         start_pos = entry.offset
         if start_pos == 0:
             self._reset_caches()
+        if input_ids is None:
+            input_ids = inputs
         if inputs_embeds is None:
             h = self.embed_tokens(input_ids)
         else:
