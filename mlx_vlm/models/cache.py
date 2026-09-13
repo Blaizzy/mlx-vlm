@@ -1244,18 +1244,16 @@ class ChunkedKVCache(_BaseCache):
 
     @property
     def state(self):
-        if self.offset == self.keys.shape[2]:
-            return self.keys, self.values
-        else:
-            return (
-                self.keys[..., : self.offset, :],
-                self.values[..., : self.offset, :],
-            )
+        if self.keys is None:
+            return None, None
+        length = self.offset - self.start_position
+        return self.keys[..., :length, :], self.values[..., :length, :]
 
     @state.setter
     def state(self, v):
         self.keys, self.values = v
-        self.offset = self.keys.shape[2]
+        self.start_position = 0
+        self.offset = 0 if self.keys is None else self.keys.shape[2]
 
     def is_trimmable(self):
         return True
@@ -1271,7 +1269,9 @@ class ChunkedKVCache(_BaseCache):
 
     @meta_state.setter
     def meta_state(self, v):
+        length = self.offset - self.start_position
         self.chunk_size, self.start_position = map(int, v)
+        self.offset = self.start_position + length
 
     def empty(self):
         return self.keys is None
@@ -1467,7 +1467,7 @@ class BatchKVCache(_BaseCache):
     @property
     def state(self):
         k, v = self.keys, self.values
-        if self._idx < k.shape[2]:
+        if k is not None and self._idx < k.shape[2]:
             k = k[..., : self._idx, :]
             v = v[..., : self._idx, :]
         return k, v, self.offset, self.left_padding
@@ -1475,7 +1475,7 @@ class BatchKVCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.keys, self.values, self.offset, self.left_padding = v
-        self._idx = self.keys.shape[2]
+        self._idx = self.keys.shape[2] if self.keys is not None else 0
 
     def is_trimmable(self):
         return True
@@ -1617,6 +1617,87 @@ class BatchKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+
+class BatchChunkedKVCache(BatchKVCache):
+    def __init__(self, chunk_size, left_padding):
+        super().__init__(left_padding)
+        self.chunk_size = chunk_size
+
+    def maybe_trim_front(self):
+        trim = max(0, self._idx - self.chunk_size)
+        if trim and self.keys is not None:
+            self.keys = self.keys[..., trim : self._idx, :]
+            self.values = self.values[..., trim : self._idx, :]
+            self.left_padding = mx.maximum(self.left_padding - trim, 0)
+            self._idx -= trim
+
+    def make_chunk_mask(self, length):
+        query_positions = self.offset[:, None, None] + mx.arange(length)[None, :, None]
+        key_columns = mx.arange(self._idx + length)[None, None, :]
+        key_positions = self.offset[:, None, None] - self._idx + key_columns
+        mask = (key_positions <= query_positions) & (
+            key_positions // self.chunk_size == query_positions // self.chunk_size
+        )
+        mask &= key_columns >= self.left_padding[:, None, None]
+        return mask[:, None]
+
+    @property
+    def meta_state(self):
+        return str(self.chunk_size)
+
+    @meta_state.setter
+    def meta_state(self, value):
+        self.chunk_size = int(value)
+
+    def extract(self, idx):
+        cache = ChunkedKVCache(self.chunk_size)
+        padding = int(self.left_padding[idx].item())
+        cache.offset = int(self.offset[idx].item())
+        length = max(0, self._idx - padding)
+        cache.start_position = cache.offset - length
+        if self.keys is not None:
+            cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
+            cache.values = mx.contiguous(
+                self.values[idx : idx + 1, :, padding : self._idx]
+            )
+        return cache
+
+    def extend(self, other):
+        if (
+            not isinstance(other, BatchChunkedKVCache)
+            or other.chunk_size != self.chunk_size
+        ):
+            raise ValueError("Chunked caches must have the same window size")
+        super().extend(other)
+
+    @classmethod
+    def merge(cls, caches):
+        if any(c.chunk_size != caches[0].chunk_size for c in caches):
+            raise ValueError("Chunked caches must have the same window size")
+        lengths = [
+            c.offset - c.start_position if c.keys is not None else 0 for c in caches
+        ]
+        width = max(lengths)
+        padding = [width - length for length in lengths]
+        result = cls(caches[0].chunk_size, padding)
+        result.offset = mx.array([c.offset for c in caches])
+        result._idx = width
+        if width:
+            source = next(c for c in caches if c.keys is not None)
+            result.keys = mx.zeros(
+                (len(caches), source.keys.shape[1], width, source.keys.shape[3]),
+                source.keys.dtype,
+            )
+            result.values = mx.zeros(
+                (len(caches), source.values.shape[1], width, source.values.shape[3]),
+                source.values.dtype,
+            )
+            for i, (cache, length, pad) in enumerate(zip(caches, lengths, padding)):
+                if length:
+                    result.keys[i : i + 1, :, pad:] = cache.keys[..., :length, :]
+                    result.values[i : i + 1, :, pad:] = cache.values[..., :length, :]
+        return result
 
 
 class BatchRotatingKVCache(_BaseCache):

@@ -22652,3 +22652,375 @@ class TestSupportedRoleMessages(unittest.TestCase):
             _supported_role_messages(messages, "Conversation roles must alternate"),
             messages,
         )
+
+
+class TestEmptyBatchCacheReplay(unittest.TestCase):
+    def test_empty_state_round_trip_preserves_offsets_and_can_append(self):
+        from mlx_vlm.models.cache import BatchKVCache
+
+        original = BatchKVCache([1, 0])
+        restored = BatchKVCache([0, 0])
+        restored.state = original.state
+        self.assertIsNone(restored.keys)
+        self.assertEqual(restored.offset.tolist(), [-1, 0])
+        self.assertEqual(restored.left_padding.tolist(), [1, 0])
+        keys = mx.arange(8, dtype=mx.float32).reshape(2, 1, 2, 2)
+        actual_keys, actual_values = restored.update_and_fetch(keys, keys + 10)
+        self.assertEqual(actual_keys.tolist(), keys.tolist())
+        self.assertEqual(actual_values.tolist(), (keys + 10).tolist())
+        self.assertEqual(restored.offset.tolist(), [1, 2])
+
+    def test_exact_replay_keeps_unused_layer_cache_empty(self):
+        from mlx_vlm.apc import make_warm_batch_exact_cache_multi
+        from mlx_vlm.models.cache import KVCache
+
+        used = KVCache()
+        keys = mx.ones((1, 1, 3, 2))
+        used.update_and_fetch(keys, keys)
+        merged, prefix = make_warm_batch_exact_cache_multi([[used, KVCache()]], [3])
+        self.assertEqual(prefix, 3)
+        self.assertEqual(merged[0].keys.tolist(), keys.tolist())
+        self.assertTrue(merged[1].empty())
+        self.assertEqual(merged[1].state[2].tolist(), [0])
+
+
+class TestDenseAPCPrefillBoundaries(unittest.TestCase):
+    def test_reuse_retains_chunk_boundaries_and_releases_unused_blocks(self):
+        from unittest.mock import Mock
+
+        from mlx_vlm.generate.ar import BatchGenerator
+
+        for block_size, step, prefix, expected in (
+            (16, 128, 1008, 896),
+            (48, 128, 1008, 768),
+            (16, 128, 64, 0),
+            (16, 128, 1024, 1024),
+        ):
+            with self.subTest(block_size=block_size, step=step, prefix=prefix):
+                blocks = [object() for _ in range(prefix // block_size)]
+                ids = list(range(1100))
+                plan = {
+                    "matched_blocks": list(blocks),
+                    "prefix_len": prefix,
+                    "full_input_ids": ids,
+                    "extra_hash": 0,
+                }
+                manager = SimpleNamespace(block_size=block_size, release=Mock())
+                model = SimpleNamespace(
+                    apc_manager=manager,
+                    apc=SimpleNamespace(lookup=lambda *args, **kwargs: plan),
+                    prefill_step_size=step,
+                    _apc_extra_hash=lambda kwargs: 0,
+                    _apc_safe_prefix_lookup_min=lambda ids: 0,
+                    _apc_suffix_is_text_only=lambda ids, prefix: True,
+                    _apc_prefix_has_media_tokens=lambda ids, prefix: False,
+                )
+                result = BatchGenerator._apc_pick_for(
+                    model, (0, ids, 10, {}, None, None)
+                )
+                manager.release.assert_called_once_with(
+                    blocks[expected // block_size :]
+                )
+                if expected:
+                    self.assertEqual(result["prefix_len"], expected)
+                    self.assertEqual(
+                        result["matched_blocks"], blocks[: expected // block_size]
+                    )
+                    self.assertIs(result["full_input_ids"], ids)
+                else:
+                    self.assertIsNone(result)
+
+
+class TestDenseAPCReferenceLifecycle(unittest.TestCase):
+    def test_repeated_aligned_hits_and_rejected_hits_release_every_reference(self):
+        from mlx_vlm.apc import APCManager
+        from mlx_vlm.generate.ar import BatchGenerator
+
+        manager = APCManager(num_blocks=32, block_size=16)
+        ids = list(range(257))
+        keys = mx.zeros((1, 1, len(ids), 2))
+        stored = manager.store_kv_blocks(ids, [keys], [keys])
+        manager.release(stored)
+
+        def lookup(tokens, **kwargs):
+            blocks, length = manager.lookup_prefix(tokens)
+            return {
+                "matched_blocks": blocks,
+                "prefix_len": length,
+                "full_input_ids": tokens,
+            }
+
+        model = SimpleNamespace(
+            apc_manager=manager,
+            apc=SimpleNamespace(lookup=lookup),
+            prefill_step_size=128,
+            _apc_extra_hash=lambda kwargs: 0,
+            _apc_safe_prefix_lookup_min=lambda ids: 0,
+            _apc_suffix_is_text_only=lambda ids, prefix: True,
+            _apc_prefix_has_media_tokens=lambda ids, prefix: False,
+        )
+        try:
+            for _ in range(100):
+                for length, expected in ((65, 0), (209, 128), (257, 256)):
+                    pick = BatchGenerator._apc_pick_for(
+                        model, (0, ids[:length], 1, {}, None, None)
+                    )
+                    self.assertEqual(
+                        sum(b.ref_cnt for b in manager.pool), expected // 16
+                    )
+                    if pick:
+                        manager.release(pick["matched_blocks"])
+                    self.assertTrue(all(b.ref_cnt == 0 for b in manager.pool))
+            manager.clear()
+            self.assertEqual(manager.stats_snapshot()["pool_used"], 0)
+            self.assertFalse(manager.hash_table)
+        finally:
+            manager.close()
+
+
+class TestExactAPCSingleRowRestore(unittest.TestCase):
+    def test_single_row_preserves_chunked_window_on_continuation(self):
+        from mlx_vlm.apc_coordinator import APCCoordinator
+        from mlx_vlm.models.cache import ChunkedKVCache
+
+        cache = ChunkedKVCache(chunk_size=4)
+        values = mx.arange(8, dtype=mx.float32).reshape(1, 1, 8, 1)
+        cache.update_and_fetch(values, values)
+        cache.maybe_trim_front()
+        coordinator = SimpleNamespace(is_checkpoint=True)
+        restored, prefix = APCCoordinator.merge_rows(
+            coordinator, [{"warm_cache": [cache]}], [8]
+        )
+        next_value = mx.array([[[[8.0]]]])
+        keys, values = restored[0].update_and_fetch(next_value, next_value)
+        self.assertEqual(prefix, 8)
+        self.assertEqual(keys.flatten().tolist(), [4.0, 5.0, 6.0, 7.0, 8.0])
+        self.assertEqual(values.flatten().tolist(), keys.flatten().tolist())
+        self.assertEqual(restored[0].offset, 9)
+        self.assertEqual(restored[0].start_position, 4)
+
+
+class TestChunkedCacheStateRoundTrip(unittest.TestCase):
+    def test_empty_state_round_trip(self):
+        from mlx_vlm.models.cache import ChunkedKVCache
+
+        cache = ChunkedKVCache(4)
+        restored = ChunkedKVCache.from_state(cache.state, cache.meta_state)
+        self.assertTrue(restored.empty())
+        self.assertEqual(restored.offset, 0)
+
+    def test_trimmed_state_excludes_padding_and_preserves_position(self):
+        from mlx_vlm.models.cache import ChunkedKVCache
+
+        cache = ChunkedKVCache(4)
+        values = mx.arange(8, dtype=mx.float32).reshape(1, 1, 8, 1)
+        cache.update_and_fetch(values, values)
+        cache.maybe_trim_front()
+        cache.update_and_fetch(mx.array([[[[8.0]]]]), mx.array([[[[8.0]]]]))
+        state = cache.state
+        self.assertEqual(state[0].flatten().tolist(), [4.0, 5.0, 6.0, 7.0, 8.0])
+        restored = ChunkedKVCache.from_state(state, cache.meta_state)
+        self.assertEqual(restored.offset, cache.offset)
+        self.assertEqual(restored.start_position, cache.start_position)
+        for c in (cache, restored):
+            c.maybe_trim_front()
+        next_value = mx.array([[[[9.0]]]])
+        expected = cache.update_and_fetch(next_value, next_value)
+        actual = restored.update_and_fetch(next_value, next_value)
+        self.assertEqual(actual[0].flatten().tolist(), expected[0].flatten().tolist())
+
+    def test_llama4_logits_survive_state_round_trip_after_window_advances(self):
+        from mlx_vlm.models.llama4.config import TextConfig
+        from mlx_vlm.models.llama4.language import LanguageModel
+
+        mx.random.seed(82)
+        model = LanguageModel(
+            TextConfig(
+                model_type="llama4_text",
+                hidden_size=16,
+                intermediate_size=32,
+                intermediate_size_mlp=32,
+                num_hidden_layers=4,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=8,
+                rms_norm_eps=1e-5,
+                vocab_size=32,
+                num_local_experts=2,
+                attention_chunk_size=4,
+            )
+        )
+        model.eval()
+        cache = model.make_cache()
+        for token in range(9):
+            mx.eval(model(mx.array([[token]]), cache=cache).logits)
+        restored = [type(c).from_state(c.state, c.meta_state) for c in cache]
+        self.assertGreater(cache[0].start_position, 0)
+        for token in range(9, 13):
+            expected = model(mx.array([[token]]), cache=cache).logits
+            actual = model(mx.array([[token]]), cache=restored).logits
+            self.assertTrue(mx.allclose(actual, expected, atol=1e-6).item())
+
+
+class TestBatchChunkedCache(unittest.TestCase):
+    @staticmethod
+    def row(length):
+        from mlx_vlm.models.cache import ChunkedKVCache
+
+        cache = ChunkedKVCache(4)
+        for token in range(length):
+            cache.maybe_trim_front()
+            value = mx.array([[[[float(token)]]]])
+            cache.update_and_fetch(value, value)
+        return cache
+
+    def test_merge_trim_extract_filter_and_extend_preserve_rows(self):
+        from mlx_vlm.models.cache import BatchChunkedKVCache
+
+        rows = [self.row(n) for n in (3, 7, 9)]
+        batch = BatchChunkedKVCache.merge(rows[:2])
+        batch.extend(BatchChunkedKVCache.merge(rows[2:]))
+        batch.maybe_trim_front()
+        for row in rows:
+            row.maybe_trim_front()
+        batch.filter(mx.array([2, 0]))
+        for index, original in enumerate((rows[2], rows[0])):
+            restored = batch.extract(index)
+            self.assertEqual(restored.offset, original.offset)
+            self.assertEqual(restored.start_position, original.start_position)
+            self.assertEqual(restored.state[0].tolist(), original.state[0].tolist())
+        restored_batch = BatchChunkedKVCache.from_state(batch.state, batch.meta_state)
+        value = mx.array([[[[12.0]]], [[[13.0]]]])
+        actual = restored_batch.update_and_fetch(value, value)[0]
+        expected = batch.update_and_fetch(value, value)[0]
+        self.assertTrue(mx.array_equal(actual, expected).item())
+        self.assertEqual(restored_batch.chunk_size, 4)
+
+    def test_mask_uses_each_rows_absolute_position(self):
+        from mlx_vlm.models.cache import BatchChunkedKVCache
+
+        batch = BatchChunkedKVCache.merge([self.row(3), self.row(7)])
+        batch.maybe_trim_front()
+        mask = batch.make_chunk_mask(2).tolist()
+        width = batch._idx
+        for row, offset in enumerate((3, 7)):
+            padding = int(batch.left_padding[row].item())
+            for query in range(2):
+                expected = []
+                for column in range(width + 2):
+                    key = offset - width + column
+                    expected.append(
+                        column >= padding
+                        and key <= offset + query
+                        and key // 4 == (offset + query) // 4
+                    )
+                self.assertEqual(mask[row][0][query], expected)
+
+    def test_right_padded_prefill_restores_each_rows_real_offset(self):
+        from mlx_vlm.models.cache import BatchChunkedKVCache
+
+        rows = [self.row(3), self.row(7)]
+        batch = BatchChunkedKVCache.merge(rows)
+        batch.prepare(lengths=[2, 3], right_padding=[1, 0])
+        values = mx.array([[[[12.0], [13.0], [0.0]]], [[[14.0], [15.0], [16.0]]]])
+        batch.update_and_fetch(values, values)
+        batch.finalize()
+        for index, suffix in enumerate(([12.0, 13.0], [14.0, 15.0, 16.0])):
+            values = mx.array(suffix).reshape(1, 1, -1, 1)
+            rows[index].update_and_fetch(values, values)
+            actual = batch.extract(index)
+            self.assertEqual(actual.offset, rows[index].offset)
+            self.assertEqual(actual.start_position, rows[index].start_position)
+            self.assertEqual(actual.state[0].tolist(), rows[index].state[0].tolist())
+
+
+class TestAPCFullPromptBoundary(unittest.TestCase):
+    def test_full_match_keeps_usable_blocks_and_releases_tail(self):
+        from mlx_vlm.apc import apc_lookup_plan
+
+        for length in (16, 48):
+            with self.subTest(length=length):
+                blocks = list(range(length // 16))
+                released = []
+                manager = SimpleNamespace(
+                    block_size=16,
+                    lookup_prefix=lambda *args, **kwargs: (blocks.copy(), length),
+                    lookup_exact_cache=lambda *args, **kwargs: (None, 0),
+                    lookup_prefix_disk_cache=lambda *args, **kwargs: (None, 0),
+                    release=lambda values: released.extend(values),
+                )
+                result = apc_lookup_plan(
+                    manager,
+                    list(range(length)),
+                    extra_hash=0,
+                    apc_mode="block",
+                    safe_lookup_min=0,
+                    suffix_is_text_only=lambda n: True,
+                    prefix_has_media=lambda n: False,
+                )
+                if length == 16:
+                    self.assertIsNone(result)
+                    self.assertEqual(released, blocks)
+                else:
+                    self.assertIsNotNone(result)
+                    self.assertEqual(result["prefix_len"], length - 16)
+                    self.assertEqual(result["matched_blocks"], blocks[:-1])
+                    self.assertEqual(released, blocks[-1:])
+
+
+class TestPaliGemmaAttentionPolicy(unittest.TestCase):
+    def _model(self, bidirectional=True):
+        from mlx_vlm.models.paligemma.config import TextConfig
+        from mlx_vlm.models.paligemma.language import LanguageModel
+
+        mx.random.seed(3)
+        return LanguageModel(
+            TextConfig(
+                hidden_size=32,
+                num_hidden_layers=2,
+                intermediate_size=64,
+                num_attention_heads=4,
+                num_key_value_heads=1,
+                vocab_size=64,
+                use_bidirectional_attention=bidirectional,
+            )
+        )
+
+    def test_bidirectional_attention_rejects_chunking_and_prefix_reuse(self):
+        from mlx_vlm.apc import APCManager
+        from mlx_vlm.apc_coordinator import APCCoordinator
+        from mlx_vlm.generate.common import _chunked_prefill_enabled
+
+        for bidirectional in (True, False):
+            model = self._model(bidirectional)
+            self.assertEqual(_chunked_prefill_enabled(model), not bidirectional)
+            coordinator = APCCoordinator(APCManager(num_blocks=8, block_size=16), model)
+            self.assertEqual(coordinator.enabled, not bidirectional)
+
+    def test_generation_mask_matches_explicit_padding_mask(self):
+        model = self._model()
+        ids = mx.array([[0, 0, 1, 2, 3]])
+        valid = ids != 0
+        mask = mx.where(
+            valid[:, :, None], valid[:, None, :], mx.eye(5, dtype=mx.bool_)[None]
+        )[:, None]
+        expected = model(ids, mask=mask).logits
+        actual = model(ids, attention_mask_4d=mask).logits
+        np.testing.assert_allclose(np.array(actual), np.array(expected), atol=1e-6)
+
+    def test_only_causal_prefix_is_independent_of_later_tokens(self):
+        from mlx_vlm.models.cache import KVCache
+
+        for bidirectional in (True, False):
+            model = self._model(bidirectional)
+            caches = [KVCache() for _ in model.layers]
+            model(mx.array([[1, 2, 3, 4, 5, 6]]), cache=caches)
+            for cache in caches:
+                cache.trim(3)
+            reused = model(mx.array([[4, 5, 9]]), cache=caches).logits[:, -1]
+            expected = model(mx.array([[1, 2, 3, 4, 5, 9]])).logits[:, -1]
+            error = float(mx.max(mx.abs(reused - expected)).item())
+            if bidirectional:
+                self.assertGreater(error, 1e-3)
+            else:
+                self.assertLess(error, 1e-5)

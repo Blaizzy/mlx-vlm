@@ -4672,6 +4672,11 @@ def apc_lookup_plan(
         return None
 
     matched, prefix_len = manager.lookup_prefix(ids_list, extra_hash=extra_hash)
+    if prefix_len == n:
+        # Recompute the final block to obtain logits for the first output token.
+        manager.release(matched[-1:])
+        matched = matched[:-1]
+        prefix_len -= manager.block_size
     if prefix_len > 0 and prefix_has_media(prefix_len):
         manager.release(matched)
         matched = []

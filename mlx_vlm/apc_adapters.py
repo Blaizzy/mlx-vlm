@@ -222,7 +222,12 @@ def register_default_capabilities() -> None:
         c.SimpleKVCache,
     ):
         register_capability(cls, Capability.PAGEABLE)
-    for cls in (c.RotatingKVCache, c.BatchRotatingKVCache, c.ChunkedKVCache):
+    for cls in (
+        c.RotatingKVCache,
+        c.BatchRotatingKVCache,
+        c.ChunkedKVCache,
+        c.BatchChunkedKVCache,
+    ):
         register_capability(cls, Capability.WINDOWED)
     for cls in (
         c.ArraysCache,
@@ -427,7 +432,7 @@ class ChunkedKVCacheCloneAdapter:
     def merge_rows(self, caches, prefix_lens):
         from .models import cache as lm
 
-        return lm.BatchKVCache.merge(caches)
+        return lm.BatchChunkedKVCache.merge(caches)
 
 
 class ArraysCacheCloneAdapter:
@@ -575,6 +580,8 @@ def clone_cache_entry(c, *, min_capacity_tokens, eval_targets):
         if not c.is_single_row():
             return None
         if c.empty():
+            if isinstance(c, lm.BatchChunkedKVCache):
+                return c.extract(0)
             if isinstance(c, lm.BatchRotatingKVCache):
                 return lm.RotatingKVCache(max_size=int(c.max_size))
             return lm.KVCache()

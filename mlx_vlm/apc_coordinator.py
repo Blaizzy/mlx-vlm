@@ -32,7 +32,12 @@ class APCCoordinator:
 
     @property
     def enabled(self) -> bool:
-        return self.manager is not None and self.plan.restorable
+        language_model = getattr(self.model, "language_model", self.model)
+        return (
+            self.manager is not None
+            and self.plan.restorable
+            and getattr(language_model, "supports_prefix_cache", True)
+        )
 
     @property
     def strategy(self) -> Optional[str]:
@@ -148,6 +153,9 @@ class APCCoordinator:
                 pick["warm_cache"] if pick is not None else self.fresh_cache()
                 for pick in picks
             ]
+            if len(row_caches) == 1 and kv_quant_config is None:
+                # Keep native window/state semantics for an unpadded single row.
+                return row_caches[0], prefix_lens[0]
             return make_warm_batch_exact_cache_multi(
                 row_caches,
                 prefix_lens,
