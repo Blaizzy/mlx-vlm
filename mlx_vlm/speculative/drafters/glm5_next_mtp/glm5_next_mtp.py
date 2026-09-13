@@ -352,9 +352,10 @@ class Glm5NextMTPDraftModel(AutoregressiveMTPDraftModel):
                 for projection in ("gate_proj", "up_proj")
             ]
             if all(key in weights for key in source_keys):
-                weights[f"{switch_prefix}.gate_up_proj.{suffix}"] = mx.concatenate(
-                    [weights.pop(key) for key in source_keys], axis=1
-                )
+                gate, up = [weights.pop(key) for key in source_keys]
+                weights[f"{switch_prefix}.gate_up_proj.{suffix}"] = mx.stack(
+                    (gate, up), axis=1
+                ).reshape(gate.shape[0], gate.shape[1] + up.shape[1], *gate.shape[2:])
 
         for projection in ("gate_up_proj", "down_proj"):
             for suffix in ("weight", "scales", "biases"):
@@ -367,18 +368,16 @@ class Glm5NextMTPDraftModel(AutoregressiveMTPDraftModel):
                 if key0 not in weights:
                     continue
                 values = [
-                    mx.concatenate(
-                        [
-                            weights.pop(
-                                f"mtp_block.mlp.experts.{expert}.{source}.{suffix}"
-                            )
-                            for source in sources
-                        ],
-                        axis=0,
-                    )
+                    weights.pop(f"mtp_block.mlp.experts.{expert}.{source}.{suffix}")
                     for expert in range(self.args.n_routed_experts)
+                    for source in sources
                 ]
-                weights[f"{switch_prefix}.{projection}.{suffix}"] = mx.stack(values)
+                stacked = mx.stack(values)
+                weights[f"{switch_prefix}.{projection}.{suffix}"] = stacked.reshape(
+                    self.args.n_routed_experts,
+                    len(sources) * stacked.shape[1],
+                    *stacked.shape[2:],
+                )
 
         attn_prefix = "mtp_block.self_attn"
         for suffix in ("weight", "scales", "biases", "bias"):

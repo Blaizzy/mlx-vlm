@@ -1034,10 +1034,11 @@ class LanguageModel(nn.Module):
                         for projection in ("gate_proj", "up_proj")
                     ]
                     if all(key in weights for key in source_keys):
-                        weights[f"{switch_prefix}.gate_up_proj.{suffix}"] = (
-                            mx.concatenate(
-                                [weights.pop(key) for key in source_keys], axis=1
-                            )
+                        gate, up = [weights.pop(key) for key in source_keys]
+                        weights[f"{switch_prefix}.gate_up_proj.{suffix}"] = mx.stack(
+                            (gate, up), axis=1
+                        ).reshape(
+                            gate.shape[0], gate.shape[1] + up.shape[1], *gate.shape[2:]
                         )
                 for name in ("gate_up_proj", "down_proj"):
                     for suffix in ("weight", "scales", "biases"):
@@ -1049,19 +1050,19 @@ class LanguageModel(nn.Module):
                         key0 = f"{prefix}.mlp.experts.0.{projections[0]}.{suffix}"
                         if key0 in weights:
                             values = [
-                                mx.concatenate(
-                                    [
-                                        weights.pop(
-                                            f"{prefix}.mlp.experts.{expert}.{projection}.{suffix}"
-                                        )
-                                        for projection in projections
-                                    ],
-                                    axis=0,
+                                weights.pop(
+                                    f"{prefix}.mlp.experts.{expert}.{projection}.{suffix}"
                                 )
                                 for expert in range(self.args.n_routed_experts)
+                                for projection in projections
                             ]
-                            weights[f"{switch_prefix}.{name}.{suffix}"] = mx.stack(
-                                values
+                            stacked = mx.stack(values)
+                            weights[f"{switch_prefix}.{name}.{suffix}"] = (
+                                stacked.reshape(
+                                    self.args.n_routed_experts,
+                                    len(projections) * stacked.shape[1],
+                                    *stacked.shape[2:],
+                                )
                             )
 
             attn_prefix = f"{prefix}.self_attn"
