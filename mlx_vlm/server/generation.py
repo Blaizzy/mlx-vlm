@@ -1154,10 +1154,6 @@ class ResponseGenerator:
             raise ValueError(
                 "Structured response_format is not supported with speculative decoding."
             )
-        if self.draft_model is not None and args.thinking_budget is not None:
-            raise ValueError(
-                "thinking_budget is not supported with speculative decoding in the server."
-            )
         rqueue: Queue = Queue()
         request_started_at = time.perf_counter()
 
@@ -1827,9 +1823,13 @@ class ResponseGenerator:
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                         "prompt_tps": None,
                         "cached_tokens": 0,
+                        # A request with a thinking budget is served by the
+                        # autoregressive fallback in BatchGenerator.  Do not
+                        # attribute the process-wide drafter counters to it.
                         "spec_snapshot": (
                             speculative_stats_snapshot(self.draft_model)
                             if self.draft_model is not None
+                            and thinking_budget_criteria is None
                             else None
                         ),
                         **log_state,

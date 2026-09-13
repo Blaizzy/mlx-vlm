@@ -629,6 +629,92 @@ class TestBatchGenerator:
 
         assert gen.stats().prompt_tokens == prompt_tokens
 
+    def test_prompt_batch_falls_back_from_speculation_for_thinking_budget(self):
+        draft_model = object()
+        criteria = object()
+        batch = PromptProcessingBatch(
+            model=SimpleNamespace(),
+            uids=[1],
+            input_ids=[[4, 5]],
+            max_tokens=[8],
+            inputs_embeds=mx.ones((1, 2, 4)),
+            prompt_kwargs={},
+            thinking_budget_criteria=[criteria],
+            warm_cache=[],
+            draft_model=draft_model,
+            draft_kind="mtp",
+        )
+
+        assert batch.draft_model is None
+        assert batch.draft_kind is None
+        assert batch.thinking_budget_criteria == [criteria]
+
+    def test_prompt_batch_keeps_speculation_without_thinking_budget(self):
+        draft_model = object()
+        batch = PromptProcessingBatch(
+            model=SimpleNamespace(),
+            uids=[1],
+            input_ids=[[4, 5]],
+            max_tokens=[8],
+            inputs_embeds=mx.ones((1, 2, 4)),
+            prompt_kwargs={},
+            thinking_budget_criteria=[None],
+            warm_cache=[],
+            draft_model=draft_model,
+            draft_kind="mtp",
+        )
+
+        assert batch.draft_model is draft_model
+        assert batch.draft_kind == "mtp"
+
+    def test_drafter_batches_budgeted_and_unbudgeted_rows_separately(
+        self, mock_model, mock_processor
+    ):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            draft_model=object(),
+            draft_kind="mtp",
+        )
+        budget_a = object()
+        budget_b = object()
+        gen.insert(
+            [[1], [2], [3], [4]],
+            thinking_budget_criteria=[None, budget_a, None, budget_b],
+        )
+
+        speculative = gen._take_compatible_sequences(4)
+        fallback = gen._take_compatible_sequences(4)
+
+        assert [sequence[1] for sequence in speculative] == [[1], [3]]
+        assert [sequence[1] for sequence in fallback] == [[2], [4]]
+        assert [sequence[5] for sequence in fallback] == [budget_a, budget_b]
+        assert gen._unprocessed_sequences == []
+
+    def test_drafter_drains_active_fallback_before_switching_cohorts(self):
+        class ActiveFallback:
+            logits_processors = []
+
+            def __len__(self):
+                return 1
+
+            def next(self):
+                return []
+
+        gen = object.__new__(BatchGenerator)
+        gen.draft_model = object()
+        gen._generation_batch = ActiveFallback()
+        gen._prompt_batch = None
+        gen._unprocessed_sequences = [(1, [7], 4, {}, [], None)]
+        gen._gen_tokens_counter = 0
+        gen._steps_counter = 0
+        gen._cache_eval_interval = 0
+        gen._wire_stack = None
+
+        assert gen._next() == ([], [])
+        assert gen._prompt_batch is None
+        assert gen._unprocessed_sequences == [(1, [7], 4, {}, [], None)]
+
     def test_prompt_progress_reports_apc_cached_tokens(self):
         batch = PromptProcessingBatch(
             model=SimpleNamespace(),

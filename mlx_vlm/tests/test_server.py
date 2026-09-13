@@ -4728,6 +4728,37 @@ class TestResponseGenerator:
         assert len(queued) == 4
         assert all(request.thinking_budget_criteria is not None for request in queued)
 
+    def test_speculative_server_queues_thinking_budget_for_ar_fallback(self):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.wait_until_ready = lambda: None
+        gen.draft_model = object()
+        gen._tokenizer_lock = Lock()
+        gen._cancel = lambda uid: None
+        gen.apc_manager = None
+        gen.apc_mode = None
+        gen._preprocess_request = lambda *args, **kwargs: {
+            "input_ids": mx.array([[1, 2, 3]], dtype=mx.int32)
+        }
+        criteria = object()
+        gen._make_thinking_budget_criteria = lambda args, input_ids: criteria
+        queued = []
+
+        class Requests:
+            def put(self, request):
+                queued.append(request)
+                request.rqueue.put(server.GenerationContext(uid=7, prompt_tokens=3))
+
+        gen.requests = Requests()
+
+        _, token_iter = gen.generate(
+            "prompt",
+            args=server.GenerationArguments(max_tokens=8, thinking_budget=4),
+        )
+        token_iter.close()
+
+        assert len(queued) == 1
+        assert queued[0].thinking_budget_criteria is criteria
+
     def test_generate_precomputes_semantic_hash_from_processed_image_content(self):
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
         gen.wait_until_ready = lambda: None

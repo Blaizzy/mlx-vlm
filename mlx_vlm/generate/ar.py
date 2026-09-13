@@ -1760,9 +1760,23 @@ class PromptProcessingBatch:
         self._prompt_uids = list(uids)
         self.max_tokens = max_tokens
         self.prefill_step_size = prefill_step_size
-        self._speculative_prefill = SpeculativePrefill(draft_kind, draft_model)
-        self.draft_model = draft_model
-        self.draft_kind = draft_kind
+        # ThinkingBudgetCriteria forces future tokens after observing a
+        # delivered token.  A speculative round may already have verified and
+        # committed several tokens past that boundary, so it cannot honour the
+        # force without a target + drafter rollback transaction.  Until that
+        # transaction exists, fall back for the complete coalesced cohort.
+        # BatchGenerator keeps budgeted and unbudgeted cohorts separate, so an
+        # unrelated request retains speculative decoding.
+        use_speculative = (
+            draft_model is not None
+            and draft_kind is not None
+            and not any(item is not None for item in (thinking_budget_criteria or []))
+        )
+        self.draft_model = draft_model if use_speculative else None
+        self.draft_kind = draft_kind if use_speculative else None
+        self._speculative_prefill = SpeculativePrefill(
+            self.draft_kind, self.draft_model
+        )
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling
 
@@ -1833,10 +1847,10 @@ class PromptProcessingBatch:
 
         if warm_cache is not None:
             self.prompt_cache = warm_cache
-        elif draft_model is not None and draft_kind is not None:
+        elif self.draft_model is not None and self.draft_kind is not None:
             self.prompt_cache = make_speculative_prompt_cache(
                 model,
-                draft_kind=draft_kind,
+                draft_kind=self.draft_kind,
                 batch_size=len(input_ids),
                 left_padding=left_padding,
                 make_cache=lambda lm, lp: _make_cache(
@@ -1889,7 +1903,10 @@ class PromptProcessingBatch:
                 prepare(right_padding=right_pad_per_row, lengths=self._suffix_lens)
 
         self.prefill_step_size = _default_prefill_step_size_for_offload(
-            self.model, self.prefill_step_size, draft_model, DEFAULT_PREFILL_STEP_SIZE
+            self.model,
+            self.prefill_step_size,
+            self.draft_model,
+            DEFAULT_PREFILL_STEP_SIZE,
         )
         if self.prefill_step_size is not None:
             policy_kwargs = dict(self._prompt_kwargs)
@@ -2926,6 +2943,33 @@ class BatchGenerator:
             or len(self._unprocessed_sequences) > 0
         )
 
+    def _take_compatible_sequences(self, limit: int):
+        """Pop one AR-or-speculative cohort without mixing batch semantics.
+
+        A configured drafter normally makes every prompt speculative.  Rows
+        carrying ``ThinkingBudgetCriteria`` must instead use GenerationBatch,
+        whose next-token force is transactionally safe.  Preserve FIFO within
+        each cohort and leave the other cohort queued for the next batch.
+        """
+        if limit <= 0 or not self._unprocessed_sequences:
+            return []
+        if getattr(self, "draft_model", None) is None:
+            selected = self._unprocessed_sequences[:limit]
+            self._unprocessed_sequences = self._unprocessed_sequences[limit:]
+            return selected
+
+        wants_fallback = self._unprocessed_sequences[0][5] is not None
+        selected = []
+        remaining = []
+        for sequence in self._unprocessed_sequences:
+            same_cohort = (sequence[5] is not None) == wants_fallback
+            if same_cohort and len(selected) < limit:
+                selected.append(sequence)
+            else:
+                remaining.append(sequence)
+        self._unprocessed_sequences = remaining
+        return selected
+
     def stats(self):
         """Return accumulated batch statistics."""
         stats = BatchStats()
@@ -2986,8 +3030,13 @@ class BatchGenerator:
             if yield_after_decode:
                 return prompt_responses, generation_responses
 
+        # A drafter-backed BatchGenerator can alternate between speculative
+        # cohorts and request-scoped AR fallback cohorts.  Neither batch type
+        # can be extended with the other, so drain the active cohort before
+        # admitting the next one.  Speculative batches already required this;
+        # the same rule now protects the fallback lane.
         if (
-            getattr(self._generation_batch, "is_speculative", False)
+            getattr(self, "draft_model", None) is not None
             and len(self._generation_batch) > 0
         ):
             return prompt_responses, generation_responses
@@ -3028,7 +3077,8 @@ class BatchGenerator:
             # warm/cold PromptProcessingBatch with right-padded suffixes so
             # warm and cold rows prefill in a single forward pass.
             n = min(self.prefill_batch_size, len(self._unprocessed_sequences))
-            sequences = self._unprocessed_sequences[:n]
+            sequences = self._take_compatible_sequences(n)
+            n = len(sequences)
             coordinator = getattr(self, "apc", None)
             if coordinator is not None:
                 coordinator.prepare_prefill(sum(len(s[1]) for s in sequences))
@@ -3040,7 +3090,6 @@ class BatchGenerator:
                 )
             mixed = self._build_mixed_prompt_batch(sequences)
             if mixed is not None:
-                self._unprocessed_sequences = self._unprocessed_sequences[n:]
                 self._prompt_batch = mixed
                 self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
                 if self._prompt_batch.needs_processing():
@@ -3065,8 +3114,6 @@ class BatchGenerator:
                     self._prompt_batch = None
                     mx.clear_cache()
                 return prompt_responses, generation_responses
-
-            self._unprocessed_sequences = self._unprocessed_sequences[n:]
 
             uids = [s[0] for s in sequences]
             input_ids = [s[1] for s in sequences]
