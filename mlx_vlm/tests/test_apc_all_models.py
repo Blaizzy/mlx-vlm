@@ -36,6 +36,7 @@ from mlx_vlm.models.cache import (
     SimpleKVCache,
     StaticPrefixKVCache,
 )
+from mlx_vlm.models.hy_v4.cache import HyV4KVCache
 from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
 from mlx_vlm.models.qwen4_exp.language import QSAKVCache
 from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
@@ -82,6 +83,7 @@ def _cache_samples():
         "ArraysCache": ArraysCache(2),
         "CacheList": CacheList(KVCache(), ArraysCache(1)),
         "ChunkedKVCache": ChunkedKVCache(chunk_size=16),
+        "HyV4KVCache": HyV4KVCache(),
         "KVCache": KVCache(),
         "MiniMaxM3KVCache": MiniMaxM3KVCache(),
         "PoolingCache": PoolingCache(ratio=2),
@@ -171,6 +173,12 @@ def _all_generative_model_contracts(
 
 def _populated_cache(name: str, token_count: int):
     shape = (1, 1, token_count, 4)
+    if name == "HyV4KVCache":
+        cache = HyV4KVCache()
+        cache.keys = mx.ones(shape)
+        cache.values = mx.ones(shape) * 2
+        cache.offset = token_count
+        return cache
     if name == "KVCache":
         cache = KVCache()
         cache.keys = mx.ones(shape)

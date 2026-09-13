@@ -7,6 +7,15 @@ from ...models.exact_speculative_verify import exact_speculative_verify_dense_av
 from ...models.exact_speculative_verify import (
     exact_speculative_verify_weight as _target_verify_weight,
 )
+from ...models.mxfp4_verifier import (
+    optimized_mxfp4_argmax as _target_verify_optimized_mxfp4_argmax,
+)
+from ...models.mxfp4_verifier import (
+    optimized_mxfp4_linear as _target_verify_optimized_mxfp4_linear,
+)
+from ...models.mxfp4_verifier import (
+    optimized_mxfp4_linears as _target_verify_optimized_mxfp4_linears,
+)
 from ...models.quantized_verifier import (
     optimized_affine_argmax as _target_verify_optimized_affine_argmax,
 )
@@ -14,7 +23,7 @@ from ...models.quantized_verifier import (
     optimized_affine_linear as _target_verify_optimized_affine_linear,
 )
 from ...models.quantized_verifier import (
-    optimized_affine_linears as _target_verify_quantized_linears,
+    optimized_affine_linears as _target_verify_optimized_affine_linears,
 )
 from ...models.quantized_verifier import (
     optimized_nvfp4_argmax as _target_verify_optimized_nvfp4_argmax,
@@ -38,6 +47,9 @@ def _use_target_verify_dense(linear, x: mx.array) -> bool:
 
 
 def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
+    output = _target_verify_optimized_mxfp4_linear(linear, x)
+    if output is not None:
+        return output
     output = _target_verify_optimized_affine_linear(linear, x)
     if output is not None:
         return output
@@ -47,6 +59,9 @@ def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
 def _target_verify_quantized_argmax(
     linear, x: mx.array, token_mask: Optional[mx.array] = None
 ) -> Optional[mx.array]:
+    output = _target_verify_optimized_mxfp4_argmax(linear, x, token_mask=token_mask)
+    if output is not None:
+        return output
     output = _target_verify_optimized_affine_argmax(linear, x, token_mask=token_mask)
     if output is not None:
         return output
@@ -111,7 +126,10 @@ def _target_verify_linears(linears, x: mx.array):
             return out
         return tuple(linear(x) for linear in linears)
 
-    out = _target_verify_quantized_linears(linears, x)
+    out = _target_verify_optimized_mxfp4_linears(linears, x)
+    if out is not None:
+        return out
+    out = _target_verify_optimized_affine_linears(linears, x)
     if out is not None:
         return out
     return tuple(_target_verify_linear(linear, x) for linear in linears)
