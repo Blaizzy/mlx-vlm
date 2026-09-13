@@ -390,7 +390,7 @@ class Florence2LanguageModel(nn.Module):
             inputs_embeds = inputs_embeds * self.embed_scale
 
         if cache is None:
-            cache = [(SimpleKVCache(), SimpleKVCache())] * len(self.decoder.layers)
+            cache = [(SimpleKVCache(), SimpleKVCache()) for _ in self.decoder.layers]
 
         if encoder_outputs is None:
             encoder_outputs = self.encoder(

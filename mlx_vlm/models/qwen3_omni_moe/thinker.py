@@ -230,47 +230,20 @@ class Thinker(nn.Module):
                     if video_mask.ndim == 3
                     else (video_mask | image_mask)
                 )
-                visual_mask_flat = mx.reshape(visual_pos_masks, (-1,))
-                image_mask_flat = mx.reshape(
-                    image_mask[..., 0] if image_mask.ndim == 3 else image_mask, (-1,)
+                image_positions = np.flatnonzero(np.array(image_mask[..., 0]))
+                video_positions = np.flatnonzero(np.array(video_mask[..., 0]))
+                visual_order = mx.array(
+                    np.argsort(np.concatenate((image_positions, video_positions))),
+                    mx.int32,
                 )
-                video_mask_flat = mx.reshape(
-                    video_mask[..., 0] if video_mask.ndim == 3 else video_mask, (-1,)
-                )
-                visual_indices_flat = mx.where(visual_mask_flat)[0]
-                image_mask_on_visual = mx.take(
-                    image_mask_flat, visual_indices_flat, axis=0
-                )
-                video_mask_on_visual = mx.take(
-                    video_mask_flat, visual_indices_flat, axis=0
-                )
-                image_indices = mx.where(image_mask_on_visual)[0]
-                video_indices = mx.where(video_mask_on_visual)[0]
-
-                visual_embeds_multiscale_joint = []
-                for img_embed, vid_embed in zip(
-                    visual_embeds_multiscale, video_embeds_multiscale
-                ):
-                    embed_joint = mx.zeros(
-                        (len(visual_indices_flat), img_embed.shape[-1]),
-                        dtype=img_embed.dtype,
+                visual_embeds_multiscale = tuple(
+                    mx.concatenate((image_features, video_features), axis=0)[
+                        visual_order
+                    ]
+                    for image_features, video_features in zip(
+                        visual_embeds_multiscale, video_embeds_multiscale
                     )
-                    if len(image_indices) > 0:
-                        embed_joint = mx.scatter(
-                            embed_joint,
-                            image_indices,
-                            mx.take(img_embed, image_indices, axis=0),
-                            axis=0,
-                        )
-                    if len(video_indices) > 0:
-                        embed_joint = mx.scatter(
-                            embed_joint,
-                            video_indices,
-                            mx.take(vid_embed, video_indices, axis=0),
-                            axis=0,
-                        )
-                    visual_embeds_multiscale_joint.append(embed_joint)
-                visual_embeds_multiscale = tuple(visual_embeds_multiscale_joint)
+                )
 
         mask = kwargs.get("mask", None)
         position_ids, rope_deltas = self.language_model.get_rope_index(

@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from PIL import Image
 from transformers.image_transforms import (
     convert_to_rgb,
@@ -22,6 +23,8 @@ from .vision import VisionModel
 
 
 class ImageProcessor(BaseImageProcessor):
+    image_seq_length = 729
+
     def preprocess(self, images):
         if isinstance(images, Image.Image):
             images = [images]
@@ -106,7 +109,9 @@ class Model(nn.Module):
                 inputs_embeds=self.language_model.model.embed_tokens(input_ids)
             )
 
-        inputs_embeds = self.language_model.model.embed_tokens(input_ids)
+        inputs_embeds = self.language_model.model.embed_tokens(
+            mx.where(input_ids == self.config.image_token_index, 0, input_ids)
+        )
 
         cached = kwargs.get("cached_image_features", None)
         if cached is not None:
@@ -129,28 +134,30 @@ class Model(nn.Module):
     def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
         image_token_index = self.config.image_token_index
         num_images, num_image_patches, embed_dim = image_features.shape
+        rows, columns = np.where(np.asarray(input_ids) == image_token_index)
+        image_features = image_features.astype(inputs_embeds.dtype)
+        if len(rows) == num_images * num_image_patches:
+            result = mx.array(inputs_embeds)
+            result[mx.array(rows), mx.array(columns)] = image_features.reshape(
+                -1, embed_dim
+            )
+            return result
+        if len(rows) != num_images:
+            raise ValueError("Image features do not match image placeholders")
 
-        batch_size, seq_length, embed_dim = inputs_embeds.shape
-        num_images, num_image_patches, _ = image_features.shape
-
-        # Positions of <image> tokens in input_ids for each batch
-        image_positions = mx.argmax(input_ids == image_token_index, axis=1)
-
+        # Preserve direct callers that provide one unexpanded placeholder per image.
         final_embeddings = []
-        for b in range(batch_size):
+        image_index = 0
+        for b in range(inputs_embeds.shape[0]):
             text_segments = []
             start_idx = 0
-            position = int(image_positions[b].item())
-
-            text_segments.append(inputs_embeds[b : b + 1, start_idx:position])
-            text_segments.append(image_features[b : b + 1])
-            text_segments.append(inputs_embeds[b : b + 1, position + 1 :])
-
-            batch_embeddings = mx.concatenate(text_segments, axis=1)
-            final_embeddings.append(batch_embeddings)
-
-        # Create a final embedding of shape
-        # (batch_size, num_image_patches + sequence_len, embed_dim)
+            for position in columns[rows == b]:
+                text_segments.append(inputs_embeds[b : b + 1, start_idx:position])
+                text_segments.append(image_features[image_index : image_index + 1])
+                image_index += 1
+                start_idx = position + 1
+            text_segments.append(inputs_embeds[b : b + 1, start_idx:])
+            final_embeddings.append(mx.concatenate(text_segments, axis=1))
         return mx.concatenate(final_embeddings, axis=0)
 
     @property

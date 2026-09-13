@@ -108,6 +108,8 @@ class LlavaNextProcessor(ProcessorMixin):
         text: (
             TextInput | PreTokenizedInput | list[TextInput] | list[PreTokenizedInput]
         ) = None,
+        add_special_tokens=False,
+        padding_side="left",
         **kwargs,
     ) -> BatchFeature:
         """
@@ -131,7 +133,7 @@ class LlavaNextProcessor(ProcessorMixin):
 
         # Pop common kwargs that shouldn't be forwarded to sub-processors
         return_tensors = kwargs.pop("return_tensors", None)
-        kwargs.pop("padding", None)
+        padding = kwargs.pop("padding", False)
         do_pad = kwargs.pop("do_pad", True)
 
         if images is not None:
@@ -176,7 +178,13 @@ class LlavaNextProcessor(ProcessorMixin):
                 for sample in prompt_strings
             ]
 
-        text_inputs = self.tokenizer(prompt_strings, **kwargs)
+        text_inputs = self.tokenizer(
+            prompt_strings,
+            padding=padding,
+            padding_side=padding_side,
+            add_special_tokens=add_special_tokens,
+            **kwargs,
+        )
 
         return BatchFeature(data=to_mlx({**text_inputs, **image_inputs}))
 

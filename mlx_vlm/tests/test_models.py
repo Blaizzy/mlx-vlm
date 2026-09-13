@@ -20039,3 +20039,1114 @@ class TestSpark2_5Model(unittest.TestCase):
         weights = {"model.embedding.weight": mx.zeros((128, 64))}
         sanitized = model.sanitize(weights)
         self.assertIn("language_model.model.embedding.weight", sanitized)
+
+
+class TestMixedMediaFeatureOrdering(unittest.TestCase):
+    def _model(self, omni=False):
+        from types import MethodType
+
+        from mlx_vlm.models.qwen3_5.qwen3_5 import Model
+        from mlx_vlm.models.qwen3_omni_moe.thinker import Thinker
+
+        class Vision:
+            patch_embed = SimpleNamespace(proj=SimpleNamespace(weight=mx.zeros((1,))))
+
+            def __call__(self, pixels, grid):
+                return pixels, [pixels * 10, pixels * 100]
+
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                image_token_index=2,
+                video_token_index=3,
+                image_token_id=2,
+                video_token_id=3,
+                audio_token_id=4,
+            ),
+            vision_tower=Vision(),
+            language_model=SimpleNamespace(
+                model=SimpleNamespace(
+                    embed_tokens=lambda ids: mx.zeros((*ids.shape, 2))
+                ),
+                get_rope_index=lambda ids, *args, **kwargs: (mx.zeros_like(ids), None),
+            ),
+            merge_input_ids_with_image_features=Model.merge_input_ids_with_image_features,
+        )
+        if omni:
+            model.get_placeholder_mask = MethodType(Thinker.get_placeholder_mask, model)
+        model.get_input_embeddings = MethodType(
+            Thinker.get_input_embeddings if omni else Model.get_input_embeddings, model
+        )
+        return model
+
+    def test_interleaved_image_video_features_keep_token_order(self):
+        for omni in (False, True):
+            for tokens in ([3, 0, 2, 3, 2], [2, 3, 2, 0, 3]):
+                with self.subTest(omni=omni, tokens=tokens):
+                    model = self._model(omni)
+                    images = mx.array([[1.0, 2.0], [3.0, 4.0]])
+                    videos = mx.array([[5.0, 6.0], [7.0, 8.0]])
+                    result = model.get_input_embeddings(
+                        mx.array([tokens]), images, pixel_values_videos=videos
+                    )
+                    image_rows, video_rows = iter(images.tolist()), iter(
+                        videos.tolist()
+                    )
+                    expected = [
+                        (
+                            next(image_rows)
+                            if token == 2
+                            else next(video_rows) if token == 3 else [0.0, 0.0]
+                        )
+                        for token in tokens
+                    ]
+                    self.assertEqual(result.inputs_embeds.tolist(), [expected])
+                    if omni:
+                        visual_rows = [
+                            row
+                            for token, row in zip(tokens, expected)
+                            if token in (2, 3)
+                        ]
+                        for layer, scale in zip(
+                            result.deepstack_visual_embeds, (10, 100)
+                        ):
+                            self.assertEqual(
+                                layer.tolist(),
+                                [
+                                    [value * scale for value in row]
+                                    for row in visual_rows
+                                ],
+                            )
+
+    def test_single_modality_features_remain_unchanged(self):
+        for omni in (False, True):
+            for token in (2, 3):
+                with self.subTest(omni=omni, token=token):
+                    model = self._model(omni)
+                    pixels = mx.array([[1.0, 2.0], [3.0, 4.0]])
+                    kwargs = (
+                        {"pixel_values": pixels}
+                        if token == 2
+                        else {"pixel_values_videos": pixels}
+                    )
+                    result = model.get_input_embeddings(
+                        mx.array([[token, 0, token]]), **kwargs
+                    )
+                    self.assertEqual(
+                        result.inputs_embeds.tolist(),
+                        [[[1.0, 2.0], [0.0, 0.0], [3.0, 4.0]]],
+                    )
+
+
+class TestGraniteVisualPrefillWindows(unittest.TestCase):
+    def test_batched_offsets_and_chunk_local_features_inject_same_values(self):
+        from mlx_vlm.models.granite4_vision.language import Granite
+
+        model = SimpleNamespace(
+            embedding_multiplier=1,
+            layers=[lambda h, mask, cache: h, lambda h, mask, cache: h],
+            norm=lambda h: h,
+            _deepstack_target_layers=[0, 1],
+        )
+        full_features = mx.arange(2 * 6 * 2 * 3, dtype=mx.float32).reshape(2, 6, 2, 3)
+        full_mask = mx.array(
+            [
+                [False, True, True, False, True, False],
+                [True, True, False, True, True, False],
+            ]
+        )
+        offsets = [2, 1]
+        expected_features = mx.stack(
+            [full_features[b, offset : offset + 3] for b, offset in enumerate(offsets)]
+        )
+        expected_mask = mx.stack(
+            [full_mask[b, offset : offset + 3] for b, offset in enumerate(offsets)]
+        )
+        expected = mx.where(expected_mask[..., None], expected_features.sum(axis=2), 0)
+        for chunk_local in (False, True):
+            with self.subTest(chunk_local=chunk_local):
+                actual = Granite.__call__(
+                    model,
+                    mx.zeros((2, 3), dtype=mx.int32),
+                    inputs_embeds=mx.zeros((2, 3, 3)),
+                    mask=mx.zeros((2, 1, 3, 3)),
+                    cache=[SimpleNamespace(offset=mx.array(offsets))] * 2,
+                    visual_pos_masks=expected_mask if chunk_local else full_mask,
+                    deepstack_visual_embeds=(
+                        expected_features if chunk_local else full_features
+                    ),
+                )
+                self.assertEqual(actual.tolist(), expected.tolist())
+
+
+class TestMoondreamWeightLayout(unittest.TestCase):
+    def test_original_and_converted_weights_sanitize_identically(self):
+        from mlx_vlm.models.moondream3.moondream3 import Model
+
+        original = {
+            "model.text.wte": mx.zeros((2, 3)),
+            "model.text.blocks.0.attn.qkv.weight": mx.ones((3, 3)),
+            "model.text.lm_head.weight": mx.ones((2, 3)),
+            "model.vision.blocks.0.attn.qkv.weight": mx.ones((3, 3)),
+            "model.vision.proj_mlp.fc1.weight": mx.ones((3, 3)),
+        }
+        expected_keys = {
+            "text.model.wte.weight",
+            "text.model.blocks.0.attn.qkv.weight",
+            "text.lm_head.weight",
+            "vision.encoder.blocks.0.attn.qkv.weight",
+            "vision.proj_mlp.fc1.weight",
+        }
+        converted = Model.sanitize(None, original)
+        self.assertEqual(set(converted), expected_keys)
+        again = Model.sanitize(None, converted)
+        self.assertEqual(set(again), expected_keys)
+        for key in expected_keys:
+            self.assertIs(again[key], converted[key])
+
+
+class TestJinaMultiImagePlacement(unittest.TestCase):
+    def test_all_images_keep_hidden_width_and_token_positions(self):
+        from mlx_vlm.models.jina_vlm.jina_vlm import Model
+
+        for batch, images in ((1, 1), (1, 2), (1, 5), (2, 1), (2, 2)):
+            with self.subTest(batch=batch, images=images):
+                features = mx.arange(
+                    batch * images * 2 * 3 * 4, dtype=mx.float32
+                ).reshape(batch * images, 2, 3, 4)
+                positions = mx.arange(images * 6).reshape(1, images, 2, 3) + 1
+                positions = mx.broadcast_to(positions, (batch, images, 2, 3)).reshape(
+                    batch * images, 2, 3
+                )
+                model = SimpleNamespace(
+                    language_model=SimpleNamespace(
+                        embedding=lambda ids: mx.ones((*ids.shape, 4))
+                    ),
+                    get_image_features=lambda pixels, masks: features,
+                )
+                result = Model.get_input_embeddings(
+                    model,
+                    mx.zeros((batch, images * 6 + 2), dtype=mx.int32),
+                    mx.zeros((batch * images, 2, 3, 4)),
+                    image_input_idx=positions,
+                )
+                expected = mx.ones((batch, images * 6 + 2, 4))
+                expected[:, 1:-1, :] = features.reshape(batch, images * 6, 4) + 1
+                self.assertEqual(result.inputs_embeds.tolist(), expected.tolist())
+
+
+class TestJinaBatchedImageOwnership(unittest.TestCase):
+    def test_uneven_images_text_only_rows_and_left_padding(self):
+        from mlx_vlm.models.jina_vlm.jina_vlm import Model
+        from mlx_vlm.models.jina_vlm.processing_jinavlm import JinaVLMProcessor
+
+        rows = []
+        for length, values, positions in (
+            (5, [10.0, 20.0], [[1, -1], [3, 4]]),
+            (8, [], []),
+            (6, [30.0], [[2, 5]]),
+        ):
+            row = {
+                "input_ids": mx.zeros((1, length), dtype=mx.int32),
+                "attention_mask": mx.ones((1, length)),
+            }
+            if values:
+                row.update(
+                    pixel_values=mx.array(values).reshape(-1, 1, 1, 1),
+                    image_masks=mx.ones((len(values), 1, 1)),
+                    image_input_idx=mx.array(positions).reshape(-1, 1, 2),
+                )
+            rows.append(row)
+        batch = JinaVLMProcessor._collate_batch(SimpleNamespace(pad_token_id=0), rows)
+        features = mx.array(
+            [
+                [[[10.0, 11.0], [12.0, 13.0]]],
+                [[[20.0, 21.0], [22.0, 23.0]]],
+                [[[30.0, 31.0], [32.0, 33.0]]],
+            ]
+        )
+        model = SimpleNamespace(
+            language_model=SimpleNamespace(
+                embedding=lambda ids: mx.ones((*ids.shape, 2))
+            ),
+            get_image_features=lambda pixels, masks: features,
+        )
+        actual = Model.get_input_embeddings(model, **batch).inputs_embeds
+        expected = mx.ones((3, 8, 2))
+        expected[0, 4] += features[0, 0, 0]
+        expected[0, 6] += features[1, 0, 0]
+        expected[0, 7] += features[1, 0, 1]
+        expected[2, 4] += features[2, 0, 0]
+        expected[2, 7] += features[2, 0, 1]
+        self.assertEqual(actual.tolist(), expected.tolist())
+        self.assertEqual(rows[0]["image_input_idx"].tolist(), [[[1, -1]], [[3, 4]]])
+
+
+class TestJinaUnusedImageSlots(unittest.TestCase):
+    def test_long_text_offset_does_not_turn_unused_slots_into_valid_positions(self):
+        import numpy as np
+
+        from mlx_vlm.models.jina_vlm.processing_jinavlm import JinaVLMProcessor
+
+        outputs = {
+            "pixel_values": [np.zeros((1, 2, 3))],
+            "image_masks": [np.ones((1, 2))],
+            "image_tokens": [np.array([4, 5])],
+            "image_input_idx": [np.array([[0, -10000]])],
+        }
+        processor = SimpleNamespace(
+            image_token="<|image|>",
+            _image_proc=SimpleNamespace(preprocess=lambda images: outputs),
+            encode=lambda text, **kwargs: [1] * 10001,
+        )
+        result = JinaVLMProcessor.process_one(
+            processor, "long prefix<|image|>", [object()]
+        )
+        self.assertEqual(result["image_input_idx"].tolist(), [[[10001, -10000]]])
+
+
+class TestMolmoSharedPromptImages(unittest.TestCase):
+    def test_images_share_one_prompt_and_indices_follow_all_prefixes(self):
+        import numpy as np
+        from PIL import Image
+
+        from mlx_vlm.models.molmo.processing_molmo import MolmoProcessor
+
+        tokenizer = SimpleNamespace(
+            convert_tokens_to_ids=lambda token: 1,
+            encode=lambda text: [90, 91],
+            pad_token_id=0,
+        )
+
+        def preprocess(image, *args):
+            return (
+                np.zeros((1, 2, 3)),
+                np.array([10, 11, 12]),
+                np.array([[1, -100]]),
+                np.ones((1, 2)),
+            )
+
+        processor = SimpleNamespace(
+            tokenizer=tokenizer,
+            image_processor=SimpleNamespace(preprocess=preprocess),
+            image_patch_token="patch",
+            image_col_token="col",
+            image_start_token="start",
+            image_end_token="end",
+        )
+        for count in (1, 2, 5):
+            with self.subTest(count=count):
+                result = MolmoProcessor.__call__(
+                    processor,
+                    images=[Image.new("RGB", (2, 2))] * count,
+                    text="One question",
+                )
+                self.assertEqual(
+                    result["input_ids"].tolist(), [[10, 11, 12] * count + [90, 91]]
+                )
+                self.assertEqual(
+                    result["image_input_idx"].tolist(),
+                    [[1 + 3 * i, -100] for i in range(count)],
+                )
+
+
+class TestMoondreamPaddedPositions(unittest.TestCase):
+    def test_single_padded_sequence_matches_unpadded_prefill_and_decode(self):
+        from mlx_vlm.models.base import create_attention_mask
+        from mlx_vlm.models.cache import BatchKVCache, KVCache
+        from mlx_vlm.models.moondream3.config import TextConfig
+        from mlx_vlm.models.moondream3.language import Attention
+
+        mx.random.seed(72)
+        attention = Attention(
+            TextConfig(
+                hidden_size=8,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                head_dim=4,
+                rope_dim=4,
+            )
+        )
+        attention.tau.alpha = mx.array([0.7, -0.4])
+        x = mx.random.normal((1, 4, 8))
+        plain, padded = KVCache(), BatchKVCache([2])
+        expected = attention(x, mask=create_attention_mask(x, plain), cache=plain)
+        padded_x = mx.concatenate([mx.zeros((1, 2, 8)), x], axis=1)
+        actual = attention(
+            padded_x, mask=create_attention_mask(padded_x, padded), cache=padded
+        )
+        self.assertTrue(mx.allclose(actual[:, 2:], expected, atol=1e-5).item())
+        token = mx.random.normal((1, 1, 8))
+        expected = attention(
+            token, mask=create_attention_mask(token, plain), cache=plain
+        )
+        actual = attention(
+            token, mask=create_attention_mask(token, padded), cache=padded
+        )
+        self.assertTrue(mx.allclose(actual, expected, atol=1e-5).item())
+
+
+class TestFlorenceIndependentLayerCaches(unittest.TestCase):
+    def test_default_forward_matches_explicit_per_layer_caches(self):
+        from mlx_vlm.models.florence2.config import TextConfig
+        from mlx_vlm.models.florence2.language import LanguageModel
+
+        mx.random.seed(81)
+        model = LanguageModel(
+            TextConfig(
+                d_model=8,
+                encoder_layers=2,
+                decoder_layers=2,
+                encoder_attention_heads=2,
+                decoder_attention_heads=2,
+                encoder_ffn_dim=16,
+                decoder_ffn_dim=16,
+                vocab_size=32,
+                max_position_embeddings=32,
+            )
+        )
+        inputs = mx.array([[3, 4, 5]])
+        decoder = mx.array([[2, 6]])
+        expected = model(
+            inputs, decoder_input_ids=decoder, cache=model.make_cache()
+        ).logits
+        actual = model(inputs, decoder_input_ids=decoder).logits
+        self.assertTrue(mx.allclose(actual, expected, atol=1e-6).item())
+
+
+class TestLlavaNextImagePacking(unittest.TestCase):
+    def test_merge_preserves_text_between_images_and_batch_rows(self):
+        from mlx_vlm.models.llava_next.llava_next import Model
+
+        ids = mx.array([[11, 99, 99, 12, 99, 99, 13], [21, 22, 23, 24, 25, 26, 27]])
+        text = mx.arange(28).reshape(2, 7, 2).astype(mx.float32)
+        features = mx.arange(8).reshape(2, 2, 2).astype(mx.float32) + 100
+        fake = SimpleNamespace(config=SimpleNamespace(image_token_index=99))
+        actual = Model._merge_input_ids_with_image_features(fake, features, text, ids)
+        expected = np.array(text)
+        expected[0, [1, 2, 4, 5]] = np.array(features).reshape(4, 2)
+        np.testing.assert_array_equal(np.array(actual), expected)
+        np.testing.assert_array_equal(np.array(text), np.arange(28).reshape(2, 7, 2))
+
+    def test_merge_rejects_missing_features(self):
+        from mlx_vlm.models.llava_next.llava_next import Model
+
+        fake = SimpleNamespace(config=SimpleNamespace(image_token_index=99))
+        with self.assertRaisesRegex(ValueError, "features.*tokens"):
+            Model._merge_input_ids_with_image_features(
+                fake, mx.zeros((1, 2)), mx.zeros((1, 3, 2)), mx.array([[99, 99, 1]])
+            )
+
+    def test_spatial_packing_orders_rows_and_newlines(self):
+        from mlx_vlm.models.llava_next.image_features import pack_image_features
+
+        features = mx.arange(12).reshape(3, 4, 1)
+        actual = pack_image_features(
+            [features], [(2, 4)], 2, 1, [[2, 4]], mx.array([-1])
+        )[0]
+        expected = [0, 1, 2, 3, 4, 5, 8, 9, -1, 6, 7, 10, 11, -1]
+        np.testing.assert_array_equal(np.array(actual).ravel(), expected)
+
+
+class TestLlavaNextProcessorPadding(unittest.TestCase):
+    def test_padding_and_special_tokens(self):
+        from tokenizers import Tokenizer, models, pre_tokenizers, processors
+        from transformers import PreTrainedTokenizerFast
+
+        from mlx_vlm.models.llava_next.processing_llava_next import LlavaNextProcessor
+
+        backend = Tokenizer(
+            models.WordLevel(
+                {"<pad>": 0, "<s>": 1, "a": 2, "b": 3, "<unk>": 4}, unk_token="<unk>"
+            )
+        )
+        backend.pre_tokenizer = pre_tokenizers.Whitespace()
+        backend.post_processor = processors.TemplateProcessing(
+            single="<s> $A", special_tokens=[("<s>", 1)]
+        )
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            pad_token="<pad>",
+            bos_token="<s>",
+            unk_token="<unk>",
+        )
+        processor = object.__new__(LlavaNextProcessor)
+        processor.tokenizer = tokenizer
+        inputs = processor(
+            text=["a b", "a"],
+            padding=True,
+            add_special_tokens=False,
+            padding_side="left",
+        )
+        np.testing.assert_array_equal(np.array(inputs["input_ids"]), [[2, 3], [0, 2]])
+        np.testing.assert_array_equal(
+            np.array(inputs["attention_mask"]), [[1, 1], [0, 1]]
+        )
+        inputs = processor(
+            text=["a b", "a"],
+            padding=True,
+            add_special_tokens=True,
+            padding_side="right",
+        )
+        np.testing.assert_array_equal(
+            np.array(inputs["input_ids"]), [[1, 2, 3], [1, 2, 0]]
+        )
+
+
+class TestLLMjpVLCacheAndImages(unittest.TestCase):
+    def test_cache_layout_and_continuation(self):
+        from mlx_vlm.apc import self_check_model_apc
+        from mlx_vlm.models.llmjpvl import TextConfig
+        from mlx_vlm.models.llmjpvl.language import LanguageModel
+
+        model = LanguageModel(
+            TextConfig(
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                vocab_size=32,
+            )
+        )
+        self.assertTrue(self_check_model_apc(model, log=False).ok)
+        cache = model.make_cache()
+        self.assertIsNot(cache[0], cache[1])
+        tokens = mx.array([[1, 2, 3, 4]])
+        expected = model(tokens).logits[:, -1:]
+        model(tokens[:, :3], cache=cache)
+        actual = model(tokens[:, 3:], cache=cache).logits
+        np.testing.assert_allclose(
+            np.array(actual), np.array(expected), atol=1e-5, rtol=1e-5
+        )
+        self.assertEqual([c.offset for c in cache], [4, 4])
+
+    def test_image_scatter_preserves_other_rows(self):
+        from mlx_vlm.models.llmjpvl.llmjpvl import Model
+
+        ids = mx.array([[14, 1, 2, 3], [4, 5, 6, 7], [8, 14, 9, 14]])
+        embeddings = mx.arange(24).reshape(3, 4, 2).astype(mx.float32)
+        features = mx.array([[100, 101], [200, 201], [300, 301]], dtype=mx.float32)
+        fake = SimpleNamespace(config=SimpleNamespace(image_token_index=14))
+        actual = Model._merge_input_ids_with_image_features(
+            fake, features, embeddings, ids
+        )
+        expected = np.arange(24).reshape(3, 4, 2).astype(np.float32)
+        expected[0, 0] = [100, 101]
+        expected[2, 1] = [200, 201]
+        expected[2, 3] = [300, 301]
+        np.testing.assert_array_equal(np.array(actual), expected)
+        np.testing.assert_array_equal(
+            np.array(embeddings), np.arange(24).reshape(3, 4, 2)
+        )
+
+
+class TestErnie45LocalTokenizer(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import tempfile
+        from pathlib import Path
+
+        import sentencepiece as spm
+
+        from mlx_vlm.models.ernie4_5.tokenization_ernie4_5 import Ernie45Tokenizer
+
+        cls.directory = tempfile.TemporaryDirectory()
+        prefix = str(Path(cls.directory.name) / "tokenizer")
+        spm.SentencePieceTrainer.train(
+            sentence_iterator=iter(["hello world", "hello again", "test tokens"] * 10),
+            model_prefix=prefix,
+            vocab_size=32,
+            hard_vocab_limit=False,
+            user_defined_symbols=["<cls>", "<sep>", "<mask:0>", "<mask:1>", "<mask:7>"],
+            minloglevel=2,
+        )
+        cls.tokenizer = Ernie45Tokenizer(prefix + ".model", pad_token="<unk>")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.directory.cleanup()
+
+    def test_special_token_boundaries_and_pair(self):
+        tokenizer = self.tokenizer
+        ids = tokenizer.encode("hello", add_special_tokens=False)
+        self.assertEqual(
+            tokenizer.build_inputs_with_special_tokens(ids),
+            [
+                tokenizer.bos_token_id,
+                tokenizer.cls_token_id,
+                *ids,
+                tokenizer.sep_token_id,
+            ],
+        )
+        marked = [tokenizer.cls_token_id, *ids]
+        self.assertEqual(
+            tokenizer.build_inputs_with_special_tokens(marked, ids),
+            [tokenizer.bos_token_id, *marked, *ids, tokenizer.sep_token_id],
+        )
+
+    def test_padding_preserves_causal_mask(self):
+        tokenizer = self.tokenizer
+        for side in ("left", "right"):
+            tokenizer.padding_side = side
+            data = tokenizer(
+                ["hello", "hello world again"], padding=True, add_special_tokens=False
+            )
+            for row, text in enumerate(["hello", "hello world again"]):
+                ids = tokenizer.encode(text, add_special_tokens=False)
+                start = len(data["input_ids"][row]) - len(ids) if side == "left" else 0
+                self.assertEqual(data["input_ids"][row][start : start + len(ids)], ids)
+                mask = np.array(data["attention_mask"][row])[0]
+                expected = np.zeros_like(mask)
+                expected[start : start + len(ids), start : start + len(ids)] = np.tril(
+                    np.ones((len(ids), len(ids)))
+                )
+                np.testing.assert_array_equal(mask, expected)
+
+
+class TestMoondreamPackedCheckpoint(unittest.TestCase):
+    def test_unpack_nibble_order_groups_and_idempotence(self):
+        from mlx_vlm.models.moondream2.moondream2 import Model
+
+        weights = {
+            "model.text.blocks.0.attn.proj.weight.packed": mx.array(
+                [[0x12, 0x34]], dtype=mx.uint8
+            ),
+            "model.text.blocks.0.attn.proj.weight.scale": mx.array([[2.0], [3.0]]),
+            "model.text.blocks.0.attn.proj.weight.zero_point": mx.array([[1.0], [2.0]]),
+            "model.text.blocks.0.attn.proj.bias": mx.array([0.0, 1.0]),
+            "model.region.unused": mx.array([1]),
+        }
+        result = Model.sanitize(None, weights)
+        self.assertEqual(
+            set(result),
+            {
+                "text.model.layers.0.attn.proj.weight",
+                "text.model.layers.0.attn.proj.bias",
+            },
+        )
+        np.testing.assert_array_equal(
+            np.array(result["text.model.layers.0.attn.proj.weight"].astype(mx.float32)),
+            [[0, 4], [0, 6]],
+        )
+        again = Model.sanitize(None, result)
+        self.assertEqual(set(result), set(again))
+        for key in result:
+            self.assertTrue(mx.array_equal(result[key], again[key]).item())
+        self.assertIn("model.text.blocks.0.attn.proj.weight.packed", weights)
+
+    def test_legacy_checkpoint_stop_tokens(self):
+        from mlx_vlm.models.moondream2 import ModelConfig
+
+        self.assertEqual(
+            ModelConfig.from_dict({"model_type": "moondream1"}).eos_token_id, 50256
+        )
+        self.assertEqual(
+            ModelConfig.from_dict(
+                {"model_type": "moondream1", "eos_token_id": 7}
+            ).eos_token_id,
+            7,
+        )
+        self.assertEqual(
+            ModelConfig.from_dict({"model_type": "moondream2"}).eos_token_id, 0
+        )
+
+
+class TestMoondreamCropFidelity(unittest.TestCase):
+    def test_reference_crop_grid_and_pixel_rounding(self):
+        from PIL import Image
+
+        from mlx_vlm.models.moondream2.image_crops import create_crops
+
+        crops, layout = create_crops(
+            Image.new("RGB", (600, 400), (128, 128, 128)), 378, 12, 4
+        )
+        self.assertEqual(layout, (2, 4))
+        self.assertEqual(len(crops), 9)
+        np.testing.assert_array_equal(
+            np.stack(crops), np.full((9, 378, 378, 3), 0.0078125)
+        )
+
+    def test_reconstruction_uses_overlapping_adaptive_pool_bins(self):
+        from mlx_vlm.models.moondream2.vision import VisionModel
+
+        fake = SimpleNamespace(
+            config=SimpleNamespace(crop_size=4, patch_size=1, overlap_margin=1)
+        )
+        features = [
+            mx.arange(16).reshape(16, 1).astype(mx.float32) + 100 * i for i in range(6)
+        ]
+        actual = VisionModel._reconstruct_local_features(fake, features, (2, 3))
+        rows = []
+        for r in range(2):
+            parts = []
+            for c in range(3):
+                tile = np.array(features[r * 3 + c]).reshape(4, 4)
+                parts.append(
+                    tile[
+                        0 if r == 0 else 1 : 4 if r == 1 else 3,
+                        0 if c == 0 else 1 : 4 if c == 2 else 3,
+                    ]
+                )
+            rows.append(np.concatenate(parts, axis=1))
+        grid = np.concatenate(rows, axis=0)
+        expected = np.array(
+            [
+                [
+                    grid[
+                        math.floor(i * grid.shape[0] / 4) : math.ceil(
+                            (i + 1) * grid.shape[0] / 4
+                        ),
+                        math.floor(j * grid.shape[1] / 4) : math.ceil(
+                            (j + 1) * grid.shape[1] / 4
+                        ),
+                    ].mean()
+                    for j in range(4)
+                ]
+                for i in range(4)
+            ]
+        )
+        np.testing.assert_array_equal(np.array(actual).reshape(4, 4), expected)
+
+
+class TestMoondream3VideoPrefix(unittest.TestCase):
+    def test_all_frame_features_and_question_survive(self):
+        from mlx_vlm.models.moondream3.moondream3 import Model
+
+        ids = mx.array([[7, 0, 0, 0, 0, 41, 42]])
+        features = mx.array(
+            [[[100.0, 101.0], [102.0, 103.0]], [[200.0, 201.0], [202.0, 203.0]]]
+        )
+        fake = SimpleNamespace(
+            text=SimpleNamespace(
+                model=SimpleNamespace(
+                    wte=lambda x: mx.stack([x, x], axis=-1).astype(mx.float32)
+                )
+            ),
+            _create_prefix_attention_mask=lambda *args, **kwargs: None,
+        )
+        result = Model.get_input_embeddings(
+            fake,
+            ids,
+            pixel_values=mx.zeros((2, 1, 1, 3)),
+            cached_image_features=features,
+        )
+        expected = mx.concatenate(
+            [
+                mx.array([[[7.0, 7.0]]]),
+                features.reshape(1, 4, 2),
+                mx.array([[[41.0, 41.0], [42.0, 42.0]]]),
+            ],
+            axis=1,
+        )
+        np.testing.assert_array_equal(
+            np.array(result.inputs_embeds), np.array(expected)
+        )
+
+    def test_processor_reserves_space_for_every_frame(self):
+        from unittest.mock import patch
+
+        from mlx_vlm.models.moondream3.processing_moondream3 import (
+            ANSWER_ID,
+            NUM_VISION_TOKENS,
+            Moondream3Processor,
+        )
+
+        tokenizer = SimpleNamespace(
+            bos_token_id=7,
+            pad_token_id=0,
+            bos_token="<s>",
+            eos_token="</s>",
+            pad_token="<pad>",
+            encode=lambda text, **kwargs: [41, 42],
+            chat_template=None,
+        )
+        processor = Moondream3Processor(tokenizer)
+        with patch(
+            "mlx_vlm.models.moondream3.processing_moondream3.create_crops",
+            return_value=([np.zeros((1, 1, 3))], (1, 1)),
+        ):
+            inputs = processor(text="Keep this question.", images=[object(), object()])
+        ids = inputs["input_ids"][0].tolist()
+        self.assertEqual(ids, [7] + [0] * (2 * NUM_VISION_TOKENS) + [41, 42, ANSWER_ID])
+
+
+class TestMoondream2PrefixAttention(unittest.TestCase):
+    def test_generation_mask_matches_explicit_mask_and_cached_continuation(self):
+        from mlx_vlm.generate.common import _chunked_prefill_enabled
+        from mlx_vlm.models.cache import KVCache
+        from mlx_vlm.models.moondream2.config import TextConfig
+        from mlx_vlm.models.moondream2.language import LanguageModel
+
+        mx.random.seed(7)
+        model = LanguageModel(
+            TextConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                vocab_size=64,
+                num_attention_heads=4,
+                num_key_value_heads=4,
+            )
+        )
+        ids = mx.array([[1, 2, 3, 4, 5]])
+        mask = mx.triu(mx.full((5, 5), -mx.inf), k=1)
+        mask[:4, :4] = 0
+        mask = mask[None, None]
+        expected = model(ids, mask=mask).logits
+        caches = [KVCache() for _ in model.layers]
+        actual = model(ids, attention_mask_4d=mask, cache=caches).logits
+        np.testing.assert_allclose(np.array(actual), np.array(expected), atol=1e-6)
+        self.assertFalse(
+            _chunked_prefill_enabled(model, prefill_kwargs={"attention_mask_4d": mask})
+        )
+        self.assertTrue(_chunked_prefill_enabled(model))
+        continuation = model(
+            mx.array([[6]]), attention_mask_4d=mask, cache=caches
+        ).logits
+        full_mask = mx.triu(mx.full((6, 6), -mx.inf), k=1)
+        full_mask[:4, :4] = 0
+        full = model(mx.array([[1, 2, 3, 4, 5, 6]]), mask=full_mask[None, None]).logits
+        np.testing.assert_allclose(
+            np.array(continuation[:, -1]),
+            np.array(full[:, -1]),
+            atol=2e-6,
+        )
+
+    def test_float_mask_is_valid_for_bfloat16_attention(self):
+        from mlx_vlm.models.moondream2.config import TextConfig
+        from mlx_vlm.models.moondream2.language import Attention
+
+        model = Attention(
+            TextConfig(hidden_size=32, num_attention_heads=4, num_key_value_heads=4)
+        )
+        model.set_dtype(mx.bfloat16)
+        inputs = mx.ones((1, 4, 32), dtype=mx.bfloat16)
+        mask = mx.triu(mx.full((4, 4), -mx.inf), k=1)
+        actual = model(inputs, mask=mask)
+        expected = model(inputs, mask=mask.astype(mx.bfloat16))
+        np.testing.assert_array_equal(
+            np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+        )
+
+
+class TestMoondream2PaddedImages(unittest.TestCase):
+    def test_padded_rows_match_independent_embeddings_and_masks(self):
+        from mlx_vlm.models.moondream2.moondream2 import Model
+
+        features = mx.array(
+            [[[100.0, 101.0], [102.0, 103.0]], [[200.0, 201.0], [202.0, 203.0]]]
+        )
+        fake = SimpleNamespace(
+            text=SimpleNamespace(
+                model=SimpleNamespace(
+                    embed_tokens=lambda x: mx.stack([x, x], axis=-1).astype(mx.float32)
+                )
+            ),
+            vision=lambda *args, **kwargs: features,
+            _create_prefix_attention_mask=lambda n, p: Model._create_prefix_attention_mask(
+                None, n, p
+            ),
+        )
+        ids = mx.array([[0, 0, 7, 0, 0, 41, 42], [7, 0, 0, 51, 52, 53, 54]])
+        valid = mx.array([[0, 0, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1]])
+        result = Model.get_input_embeddings(
+            fake, ids, mx.zeros((2, 1, 1, 3)), mask=valid
+        )
+        for row, start in enumerate((2, 0)):
+            single = SimpleNamespace(**vars(fake))
+            single.vision = lambda *args, row=row, **kwargs: features[row : row + 1]
+            expected = Model.get_input_embeddings(
+                single, ids[row : row + 1, start:], mx.zeros((1, 1, 1, 3))
+            )
+            np.testing.assert_array_equal(
+                np.array(result.inputs_embeds[row : row + 1, start:]),
+                np.array(expected.inputs_embeds),
+            )
+            np.testing.assert_array_equal(
+                np.array(result.attention_mask_4d[row : row + 1, :, start:, start:]),
+                np.array(expected.attention_mask_4d),
+            )
+        self.assertTrue(
+            bool(mx.all(mx.isneginf(result.attention_mask_4d[0, :, 2:, :2])))
+        )
+
+
+class TestMoondream2NativeCache(unittest.TestCase):
+    def test_factory_preserves_cached_continuation(self):
+        from mlx_vlm.models.cache import KVCache
+        from mlx_vlm.models.moondream2.config import TextConfig
+        from mlx_vlm.models.moondream2.language import LanguageModel
+
+        mx.random.seed(11)
+        model = LanguageModel(
+            TextConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                vocab_size=64,
+                num_attention_heads=4,
+                num_key_value_heads=4,
+            )
+        )
+        cache = model.make_cache()
+        self.assertEqual(len(cache), 2)
+        self.assertTrue(all(isinstance(c, KVCache) for c in cache))
+        self.assertIsNot(cache[0], cache[1])
+        self.assertIsNot(cache[0], model.make_cache()[0])
+        model(mx.array([[1, 2, 3, 4]]), cache=cache)
+        actual = model(mx.array([[5]]), cache=cache).logits
+        expected = model(mx.array([[1, 2, 3, 4, 5]])).logits[:, -1:]
+        np.testing.assert_allclose(np.array(actual), np.array(expected), atol=2e-6)
+
+
+class TestMolmoHistoryRendering(unittest.TestCase):
+    def test_rich_history_preserves_roles_and_call_metadata(self):
+        import copy
+
+        from mlx_vlm.models.molmo.processing_molmo import MolmoProcessor
+
+        processor = SimpleNamespace(
+            chat_template="{% for message in messages %}{{ message['content'] }}{% endfor %}",
+            tokenizer=SimpleNamespace(encode=lambda x: list(x.encode())),
+        )
+        messages = [
+            {"role": "system", "content": "SYSTEM_MARKER"},
+            {"role": "user", "content": "USER_MARKER"},
+            {
+                "role": "assistant",
+                "content": "ASSISTANT_MARKER",
+                "reasoning_content": "REASONING_MARKER",
+                "tool_calls": [
+                    {
+                        "id": "CALL_MARKER",
+                        "type": "function",
+                        "function": {
+                            "name": "FUNCTION_MARKER",
+                            "arguments": '{"path":"ARGUMENT_MARKER"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "CALL_MARKER", "content": "RESULT_MARKER"},
+            {"role": "user", "content": "FOLLOWUP_MARKER"},
+        ]
+        original = copy.deepcopy(messages)
+        rendered = MolmoProcessor.apply_chat_template(
+            processor, messages, add_generation_prompt=True
+        )
+        for marker in (
+            "SYSTEM_MARKER",
+            "USER_MARKER",
+            "ASSISTANT_MARKER",
+            "REASONING_MARKER",
+            "CALL_MARKER",
+            "FUNCTION_MARKER",
+            "ARGUMENT_MARKER",
+            "RESULT_MARKER",
+            "FOLLOWUP_MARKER",
+        ):
+            self.assertIn(marker, rendered)
+        self.assertIn("System:", rendered)
+        self.assertIn("Tool:", rendered)
+        self.assertTrue(rendered.endswith("Assistant:"))
+        self.assertEqual(messages, original)
+        self.assertEqual(
+            MolmoProcessor.apply_chat_template(
+                processor, messages, add_generation_prompt=True, tokenize=True
+            ),
+            list(rendered.encode()),
+        )
+
+    def test_explicit_template_and_tokenization_keep_existing_contract(self):
+        from mlx_vlm.models.molmo.processing_molmo import MolmoProcessor
+
+        calls = []
+
+        def render(messages, **kwargs):
+            calls.append((messages, kwargs))
+            return "CUSTOM_TEXT"
+
+        processor = SimpleNamespace(
+            chat_template="DEFAULT_TEMPLATE",
+            tokenizer=SimpleNamespace(
+                apply_chat_template=render, encode=lambda text: [99, len(text)]
+            ),
+        )
+        messages = [{"role": "system", "content": "Keep this instruction"}]
+        actual = MolmoProcessor.apply_chat_template(
+            processor, messages, chat_template="EXPLICIT_TEMPLATE", tokenize=True
+        )
+        self.assertEqual(actual, [99, len("CUSTOM_TEXT")])
+        self.assertEqual(calls[0][0], messages)
+        self.assertEqual(calls[0][1]["chat_template"], "EXPLICIT_TEMPLATE")
+        self.assertFalse(calls[0][1]["tokenize"])
+
+    def test_available_tools_survive_without_prior_tool_calls(self):
+        import json
+
+        from mlx_vlm.models.molmo.processing_molmo import MolmoProcessor
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read café_λ",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            }
+        ]
+        processor = SimpleNamespace(
+            chat_template="unused",
+            tokenizer=SimpleNamespace(
+                apply_chat_template=lambda *args, **kwargs: "User: Read the file."
+            ),
+        )
+        rendered = MolmoProcessor.apply_chat_template(
+            processor,
+            [{"role": "user", "content": "Read the file."}],
+            tools=tools,
+            add_generation_prompt=True,
+        )
+        first, rest = rendered.split("\n", 1)
+        self.assertEqual(json.loads(first.removeprefix("Available tools: ")), tools)
+        self.assertEqual(rest, "User: Read the file.\nAssistant:")
+
+
+class TestLLMjpVLHistoryRendering(unittest.TestCase):
+    def _processor(self):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast, SiglipImageProcessor
+
+        from mlx_vlm.models.llmjpvl.processing_llmjpvl import LLMjpVLProcessor
+
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+            unk_token="[UNK]",
+        )
+        tokenizer.chat_template = (
+            "{% for m in messages %}{{ m['role'] }}:{{ m['content'] }};{% endfor %}"
+        )
+        return LLMjpVLProcessor(SiglipImageProcessor(), tokenizer)
+
+    def test_all_roles_metadata_and_tool_definitions_are_preserved(self):
+        processor = self._processor()
+        messages = [
+            {"role": "system", "content": "FIRST_SYSTEM"},
+            {"role": "system", "content": "SECOND_SYSTEM"},
+            {
+                "role": "assistant",
+                "content": "ANSWER",
+                "reasoning_content": "REASONING",
+                "tool_calls": [
+                    {
+                        "id": "CALL_ID",
+                        "type": "function",
+                        "function": {
+                            "name": "FUNCTION_NAME",
+                            "arguments": '{"key":"ARGUMENT_VALUE"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "content": "TOOL_RESULT", "tool_call_id": "CALL_ID"},
+            {"role": "user", "content": "FOLLOWUP"},
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "AVAILABLE_TOOL",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"PARAMETER_NAME": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        result = processor.apply_chat_template(
+            messages, tools=tools, tokenize=False, add_generation_prompt=True
+        )
+        for marker in (
+            "FIRST_SYSTEM",
+            "SECOND_SYSTEM",
+            "ANSWER",
+            "REASONING",
+            "CALL_ID",
+            "FUNCTION_NAME",
+            "ARGUMENT_VALUE",
+            "TOOL_RESULT",
+            "FOLLOWUP",
+            "AVAILABLE_TOOL",
+            "PARAMETER_NAME",
+        ):
+            self.assertIn(marker, result)
+        self.assertLess(result.index("FIRST_SYSTEM"), result.index("SECOND_SYSTEM"))
+        self.assertIn("<|start|>tool<|message|>TOOL_RESULT", result)
+        self.assertTrue(
+            result.endswith("<|start|>assistant<|channel|>final<|message|>")
+        )
+
+    def test_ordinary_history_and_explicit_override_remain_native(self):
+        processor = self._processor()
+        messages = [{"role": "user", "content": "hello"}]
+        self.assertEqual(
+            processor.apply_chat_template(messages, tokenize=False), "user:hello;"
+        )
+        rich = [{"role": "tool", "content": "result"}]
+        self.assertEqual(
+            processor.apply_chat_template(
+                rich, chat_template="EXPLICIT", tokenize=False
+            ),
+            "EXPLICIT",
+        )
+
+    def test_batched_history_keeps_each_conversation(self):
+        processor = self._processor()
+        ordinary = [{"role": "user", "content": "hello"}]
+        self.assertEqual(
+            processor.apply_chat_template([ordinary, ordinary], tokenize=False),
+            ["user:hello;", "user:hello;"],
+        )
+        rich = [{"role": "tool", "content": "TOOL_RESULT", "tool_call_id": "CALL_ID"}]
+        rendered = processor.apply_chat_template([rich, rich], tokenize=False)
+        self.assertEqual(len(rendered), 2)
+        self.assertEqual(rendered[0], rendered[1])
+        self.assertIn("TOOL_RESULT", rendered[0])
+        self.assertIn("CALL_ID", rendered[0])
+
+
+class TestPaliGemmaMultipleImages(unittest.TestCase):
+    def test_vision_encoder_preserves_every_image(self):
+        from mlx_vlm.models.paligemma.vision import Encoder
+
+        fake = SimpleNamespace(layers=[lambda x, mask: x + 1])
+        images = mx.arange(24).reshape(2, 3, 4).astype(mx.float32)
+        encoded, states = Encoder.__call__(fake, images, output_hidden_states=True)
+        np.testing.assert_array_equal(np.array(encoded), np.array(images + 1))
+        self.assertEqual(states[-1].shape, (2, 3, 4))
+
+    def test_image_features_follow_slots_across_rows(self):
+        from mlx_vlm.models.paligemma.paligemma import Model
+
+        fake = SimpleNamespace(
+            config=SimpleNamespace(hidden_size=4, image_token_index=19, pad_token_id=0)
+        )
+        ids = mx.array([[19, 19, 1, 19, 19, 2], [0, 0, 0, 3, 4, 5]])
+        embeddings = mx.stack([ids] * 4, axis=-1).astype(mx.float32)
+        features = mx.arange(16).reshape(2, 2, 4).astype(mx.float32) + 100
+        valid = ids != 0
+        actual, mask = Model._prepare_inputs_for_multimodal(
+            fake, features, embeddings, ids, valid
+        )
+        expected = np.array(embeddings)
+        expected[0, :2] = np.array(features[0] / 2)
+        expected[0, 3:5] = np.array(features[1] / 2)
+        np.testing.assert_array_equal(np.array(actual), expected)
+        self.assertEqual(mask.shape, (2, 1, 6, 6))
+        self.assertFalse(bool(mx.any(mask[1, :, 3:, :3])))

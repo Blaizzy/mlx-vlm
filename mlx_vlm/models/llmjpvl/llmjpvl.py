@@ -5,6 +5,7 @@ import mlx.nn as nn
 import numpy as np
 
 from ..base import InputEmbeddingsFeatures, pixel_shuffle
+from . import processing_llmjpvl  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel, check_array_shape
@@ -85,7 +86,6 @@ class Model(nn.Module):
     def _merge_input_ids_with_image_features(
         self, image_features, inputs_embeds, input_ids, image_token_index=None
     ):
-        B, N, C = inputs_embeds.shape
         if image_token_index is None:
             image_token_index = self.config.image_token_index
 
@@ -98,9 +98,10 @@ class Model(nn.Module):
                 f"({image_features.shape[0]})"
             )
 
-        image_indices = np.where(image_positions)[1].tolist()
-        inputs_embeds[:, image_indices, :] = image_features
-        return inputs_embeds.reshape(B, N, C)
+        rows, columns = np.where(np.asarray(image_positions))
+        result = mx.array(inputs_embeds)
+        result[mx.array(rows), mx.array(columns)] = image_features
+        return result
 
     @property
     def layers(self):

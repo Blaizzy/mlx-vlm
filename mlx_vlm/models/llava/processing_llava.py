@@ -4,7 +4,7 @@ Processor class for Llava.
 
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput, get_image_size, to_numpy_array
-from transformers.processing_utils import ProcessorMixin
+from transformers.processing_utils import ProcessingKwargs, ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from ..base import load_chat_template, to_mlx
@@ -85,9 +85,16 @@ class LlavaProcessor(ProcessorMixin):
 
         # Pop common kwargs
         return_tensors = kwargs.pop("return_tensors", None)
+        output_kwargs = self._merge_kwargs(
+            ProcessingKwargs,
+            tokenizer_init_kwargs=self.tokenizer.init_kwargs,
+            **kwargs,
+        )
 
         if images is not None:
-            image_inputs = self.image_processor(images, **kwargs)
+            image_inputs = self.image_processor(
+                images, **output_kwargs["images_kwargs"]
+            )
         else:
             image_inputs = {}
 
@@ -117,7 +124,9 @@ class LlavaProcessor(ProcessorMixin):
                 )
                 prompt_strings.append(sample)
 
-        text_inputs = self.tokenizer(prompt_strings, **kwargs, return_tensors=None)
+        text_inputs = self.tokenizer(
+            prompt_strings, **output_kwargs["text_kwargs"], return_tensors=None
+        )
 
         return BatchFeature(data=to_mlx({**text_inputs, **image_inputs}))
 
@@ -167,6 +176,20 @@ class LlavaProcessor(ProcessorMixin):
                 ip_overrides["patch_size"] = ip_cfg["patch_size"]
             if "size" in ip_cfg:
                 ip_overrides["size"] = ip_cfg["size"]
+
+        model_cfg_path = Path(pretrained_model_name_or_path) / "config.json"
+        if model_cfg_path.exists():
+            with open(model_cfg_path) as f:
+                model_cfg = json.load(f)
+            vision_cfg = model_cfg.get("vision_config", {})
+            if proc_kwargs.get("patch_size") is None:
+                proc_kwargs["patch_size"] = vision_cfg.get("patch_size")
+            if proc_kwargs.get("vision_feature_select_strategy") is None:
+                proc_kwargs["vision_feature_select_strategy"] = model_cfg.get(
+                    "vision_feature_select_strategy", "default"
+                )
+            if vision_cfg.get("model_type") == "clip_vision_model":
+                proc_kwargs.setdefault("num_additional_image_tokens", 1)
 
         try:
             image_processor = AutoImageProcessor.from_pretrained(

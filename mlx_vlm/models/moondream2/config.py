@@ -46,6 +46,14 @@ class ModelConfig(BaseModelConfig):
     eos_token_id: int = 0
     bos_token_id: int = 0
 
+    @classmethod
+    def from_dict(cls, params):
+        params = dict(params)
+        if params.get("model_type") == "moondream1":
+            params.setdefault("bos_token_id", 50256)
+            params.setdefault("eos_token_id", 50256)
+        return super().from_dict(params)
+
     def __post_init__(self):
         if isinstance(self.text_config, dict):
             self.text_config = TextConfig(

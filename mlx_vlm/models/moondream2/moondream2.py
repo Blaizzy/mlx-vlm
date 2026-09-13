@@ -6,6 +6,7 @@ import mlx.nn as nn
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel
+from .packed_weights import unpack_checkpoint_weights
 from .vision import VisionModel
 
 
@@ -38,11 +39,11 @@ class Model(nn.Module):
 
     def get_input_embeddings(
         self,
-        inputs: mx.array,
+        input_ids: mx.array,
         pixel_values: Optional[mx.array] = None,
         **kwargs,
     ):
-        inputs_embeds = self.text.model.embed_tokens(inputs)
+        inputs_embeds = self.text.model.embed_tokens(input_ids)
 
         if pixel_values is None:
             return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
@@ -59,21 +60,35 @@ class Model(nn.Module):
             crop_layouts=crop_layouts,
         )
 
-        bos_embed = inputs_embeds[:, :1, :]
+        if input_ids.shape[0] == 1:
+            image_features = image_features.reshape(1, -1, image_features.shape[-1])
+        elif image_features.shape[0] != input_ids.shape[0]:
+            raise ValueError("Image features do not match the prompt batch")
         num_vision_tokens = image_features.shape[1]
-        text_start = 1 + num_vision_tokens
-
-        if inputs_embeds.shape[1] > text_start:
-            text_embeds = inputs_embeds[:, text_start:, :]
-            final_embeds = mx.concatenate(
-                [bos_embed, image_features, text_embeds], axis=1
-            )
+        batch_size, seq_len = input_ids.shape
+        valid = kwargs.get("mask")
+        if valid is None:
+            valid = mx.ones(input_ids.shape, dtype=mx.bool_)
         else:
-            final_embeds = mx.concatenate([bos_embed, image_features], axis=1)
-
+            valid = valid.astype(mx.bool_)
+        starts = mx.argmax(valid, axis=1)
+        columns = starts[:, None] + 1 + mx.arange(num_vision_tokens)[None, :]
+        final_embeds = mx.array(inputs_embeds)
+        final_embeds[mx.arange(batch_size)[:, None], columns] = image_features
         prefix_len = 1 + num_vision_tokens
-        seq_len = final_embeds.shape[1]
-        attention_mask_4d = self._create_prefix_attention_mask(seq_len, prefix_len)
+        positions = mx.arange(seq_len)
+        prefix = (positions[None, :] >= starts[:, None]) & (
+            positions[None, :] < starts[:, None] + prefix_len
+        )
+        allowed = (positions[:, None] >= positions[None, :])[None] | (
+            prefix[:, :, None] & prefix[:, None, :]
+        )
+        allowed &= valid[:, None, :]
+        # Padding queries attend only to themselves to avoid fully masked rows.
+        allowed = mx.where(
+            valid[:, :, None], allowed, mx.eye(seq_len, dtype=mx.bool_)[None]
+        )
+        attention_mask_4d = mx.where(allowed[:, None], 0.0, -mx.inf)
 
         return InputEmbeddingsFeatures(
             inputs_embeds=final_embeds,
@@ -88,6 +103,8 @@ class Model(nn.Module):
         return causal.reshape(1, 1, seq_len, seq_len)
 
     def sanitize(self, weights):
+        if any(key.startswith("model.text.") for key in weights):
+            weights = unpack_checkpoint_weights(weights)
         sanitized = {}
 
         for k, v in weights.items():
@@ -137,6 +154,10 @@ class Model(nn.Module):
             sanitized[new_key] = v
 
         return sanitized
+
+    @property
+    def language_model(self):
+        return self.text
 
     @property
     def layers(self):

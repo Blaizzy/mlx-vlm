@@ -260,6 +260,14 @@ class LanguageModel(nn.Module):
                 f"Model type {self.model_type} not supported. Currently only 'gemma' is supported"
             )
 
+    @property
+    def supports_prefix_cache(self):
+        # Bidirectional prefix states depend on tokens beyond the matched prefix.
+        return not bool(self.config.use_bidirectional_attention)
+
+    def chunked_prefill_policy(self, *, draft_model=None, **kwargs):
+        return self.supports_prefix_cache and draft_model is None
+
     def __call__(
         self,
         inputs: mx.array,
@@ -268,6 +276,15 @@ class LanguageModel(nn.Module):
         cache=None,
         **kwargs,
     ):
+        full_mask = kwargs.get("attention_mask_4d")
+        if mask is None and full_mask is not None:
+            c = cache[0] if cache else None
+            offset = getattr(c, "_idx", getattr(c, "offset", 0))
+            length = (
+                inputs_embeds.shape[1] if inputs_embeds is not None else inputs.shape[1]
+            )
+            if offset < full_mask.shape[-2]:
+                mask = full_mask[..., offset : offset + length, : offset + length]
         out = self.model(inputs, mask=mask, cache=cache, inputs_embeds=inputs_embeds)
         out = self.model.embed_tokens.as_linear(out)
 

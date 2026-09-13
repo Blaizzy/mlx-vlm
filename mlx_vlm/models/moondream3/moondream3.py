@@ -65,6 +65,10 @@ class Model(nn.Module):
             )
 
         B = inputs.shape[0]
+        if B == 1:
+            image_features = image_features.reshape(1, -1, image_features.shape[-1])
+        elif image_features.shape[0] != B:
+            raise ValueError("Image features do not match the prompt batch")
         bos_embed = inputs_embeds[:, :1, :]
 
         num_vision_tokens = image_features.shape[1]
@@ -136,13 +140,13 @@ class Model(nn.Module):
 
             if new_key == "text.wte":
                 new_key = "text.model.wte.weight"
-            elif new_key.startswith("text.lm_head"):
+            elif new_key.startswith(("text.lm_head", "text.model.")):
                 pass
             elif new_key.startswith("text."):
                 new_key = "text.model." + new_key[len("text.") :]
 
             if new_key.startswith("vision.") and not new_key.startswith(
-                "vision.proj_mlp"
+                ("vision.proj_mlp", "vision.encoder.")
             ):
                 new_key = "vision.encoder." + new_key[len("vision.") :]
 

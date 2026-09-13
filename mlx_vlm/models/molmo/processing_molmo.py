@@ -511,6 +511,8 @@ class MolmoProcessor(ProcessorMixin):
             all_image_idx = []
             all_masks = []
             all_input_ids = []
+            shared_prompt = len(tokens_list) == 1
+            image_token_offset = 0
 
             for i, (img, tokens) in enumerate(
                 zip(
@@ -533,13 +535,25 @@ class MolmoProcessor(ProcessorMixin):
                 )
 
                 # Combine image tokens with text tokens
-                combined_tokens = np.concatenate([image_tokens, np.array(tokens)])
+                if shared_prompt:
+                    combined_tokens = image_tokens
+                    patch_idx = np.where(
+                        patch_idx >= 0, patch_idx + image_token_offset, patch_idx
+                    )
+                    image_token_offset += len(image_tokens)
+                else:
+                    combined_tokens = np.concatenate([image_tokens, np.array(tokens)])
 
                 # Adjust patch_idx for the position in combined tokens
                 all_crops.append(crops)
                 all_image_idx.append(patch_idx)
                 all_masks.append(img_mask)
                 all_input_ids.append(combined_tokens)
+
+            if shared_prompt:
+                all_input_ids = [
+                    np.concatenate([*all_input_ids, np.array(tokens_list[0])])
+                ]
 
             # Stack results
             pixel_values = mx.array(
@@ -604,6 +618,39 @@ class MolmoProcessor(ProcessorMixin):
         **kwargs,
     ):
         """Apply chat template."""
+        tools = kwargs.get("tools")
+        rich_history = bool(tools) or any(
+            set(message) != {"role", "content"}
+            or message["role"] != ("user" if i % 2 == 0 else "assistant")
+            for i, message in enumerate(conversation)
+        )
+        if chat_template is None and rich_history:
+            # Molmo's ordinary template accepts only alternating text turns.
+            # Keep richer history explicit in its role-labelled text format.
+            lines = []
+            if tools:
+                lines.append(
+                    f"Available tools: {json.dumps(tools, ensure_ascii=False)}"
+                )
+            for message in conversation:
+                role = message["role"].capitalize()
+                content = message.get("content")
+                if not isinstance(content, str):
+                    content = json.dumps(content, ensure_ascii=False)
+                lines.append(f"{role}: {content}")
+                metadata = {
+                    key: value
+                    for key, value in message.items()
+                    if key not in ("role", "content")
+                }
+                if metadata:
+                    lines.append(
+                        f"{role} metadata: {json.dumps(metadata, ensure_ascii=False)}"
+                    )
+            if add_generation_prompt:
+                lines.append("Assistant:")
+            rendered = "\n".join(lines)
+            return self.tokenizer.encode(rendered) if tokenize else rendered
         if chat_template is None:
             chat_template = self.chat_template
         if chat_template is None:
@@ -621,20 +668,14 @@ class MolmoProcessor(ProcessorMixin):
                 "{% if add_generation_prompt %}Assistant: {% endif %}"
             )
 
-        from jinja2 import Environment
-
-        # Use Environment with loopcontrols extension to support {% continue %} and {% break %}
-        env = Environment(extensions=["jinja2.ext.loopcontrols"])
-        template = env.from_string(chat_template)
-        rendered = template.render(
-            messages=conversation,
+        rendered = self.tokenizer.apply_chat_template(
+            conversation,
+            chat_template=chat_template,
             add_generation_prompt=add_generation_prompt,
+            tokenize=False,
             **kwargs,
         )
-
-        if tokenize:
-            return self.tokenizer.encode(rendered)
-        return rendered
+        return self.tokenizer.encode(rendered) if tokenize else rendered
 
     @property
     def model_input_names(self):

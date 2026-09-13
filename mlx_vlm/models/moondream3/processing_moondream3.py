@@ -44,7 +44,7 @@ class Moondream3Processor:
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        from transformers import AutoTokenizer
+        from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
         # Filter out kwargs that aren't relevant to tokenizer loading
         tokenizer_kwargs = {}
@@ -60,7 +60,7 @@ class Moondream3Processor:
                 **tokenizer_kwargs,
             )
         except Exception:
-            tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer = PreTrainedTokenizerFast.from_pretrained(
                 TOKENIZER_REPO,
                 **tokenizer_kwargs,
             )
@@ -147,6 +147,9 @@ class Moondream3Processor:
             if isinstance(text, str):
                 text = [text]
 
+            if has_images and len(text) != 1 and len(images) != len(text):
+                raise ValueError("Multiple prompts require one image per prompt")
+            images_per_prompt = len(images) if has_images and len(text) == 1 else 1
             # Build input sequences: [BOS] [image_placeholders] [text_tokens]
             all_input_ids = []
             bos_id = self.tokenizer.bos_token_id or 0
@@ -159,7 +162,10 @@ class Moondream3Processor:
                         formatted, add_special_tokens=False
                     )
                     input_ids = (
-                        [bos_id] + [0] * NUM_VISION_TOKENS + text_tokens + [ANSWER_ID]
+                        [bos_id]
+                        + [0] * (NUM_VISION_TOKENS * images_per_prompt)
+                        + text_tokens
+                        + [ANSWER_ID]
                     )
                 else:
                     text_tokens = self.tokenizer.encode(t, add_special_tokens=False)

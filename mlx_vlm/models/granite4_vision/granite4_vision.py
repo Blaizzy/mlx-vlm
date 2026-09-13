@@ -265,7 +265,7 @@ class Model(nn.Module):
                 )
                 deepstack_list.append(full_feat)
 
-            deepstack_visual_embeds = mx.concatenate(deepstack_list, axis=0)
+            deepstack_visual_embeds = mx.stack(deepstack_list, axis=2)
         else:
             deepstack_visual_embeds = None
             target_layers = None

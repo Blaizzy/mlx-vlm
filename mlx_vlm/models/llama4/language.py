@@ -80,22 +80,18 @@ class Attention(nn.Module):
             keys = mx.fast.rms_norm(keys, weight=None, eps=1e-6)
 
         if self.attn_temperature_tuning and not self.use_rope:
-            # arange needs scalar offset
-            offset_scalar = offset
-            if isinstance(offset_scalar, mx.array):
-                offset_scalar = offset_scalar.max().item()
+            positions = mx.arange(1, L + 1)
+            if isinstance(offset, mx.array):
+                positions = positions[None, :] + offset[:, None]
+                positions = positions[:, None, :, None]
+            else:
+                positions = positions + offset
+                positions = positions[:, None]
             attn_scales = (
-                mx.log(
-                    mx.floor(
-                        mx.arange(offset_scalar + 1, offset_scalar + L + 1)
-                        / self.floor_scale
-                    )
-                    + 1.0
-                )
+                mx.log(mx.floor(mx.maximum(positions, 0) / self.floor_scale) + 1.0)
                 * self.attn_scale
                 + 1.0
             )
-            attn_scales = attn_scales[:, None]
             queries = (queries * attn_scales).astype(queries.dtype)
 
         if cache is not None:
@@ -242,7 +238,9 @@ class LlamaModel(nn.Module):
             h = input_embeds
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
+            mask = create_attention_mask(
+                h, cache[3] if cache is not None and len(cache) > 3 else None
+            )
 
         if cache is not None:
             for idx, c in enumerate(cache):
@@ -258,9 +256,12 @@ class LlamaModel(nn.Module):
             offset = 0
 
         # Create a mask for the chunked attention
-        chunk_mask = self.create_chunked_attention_mask(
-            h.shape[1], self.config.attention_chunk_size, start, offset
-        )
+        if cache is not None and hasattr(cache[0], "make_chunk_mask"):
+            chunk_mask = cache[0].make_chunk_mask(h.shape[1])
+        else:
+            chunk_mask = self.create_chunked_attention_mask(
+                h.shape[1], self.config.attention_chunk_size, start, offset
+            )
 
         if cache is None:
             cache = [None] * len(self.layers)
