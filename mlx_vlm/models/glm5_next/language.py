@@ -10,7 +10,7 @@ from ..gated_delta import gated_delta_update
 from ..linear import DECODE_BLOCK_SIZE, linear, tiled_linear
 from ..mla import MultiLinear
 from ..sparse_attention import indexed_sparse_attention
-from ..switch_layers import MoE, SwitchGLU
+from ..switch_layers import FusedSwitchGLU, MoE
 from .config import TextConfig
 
 
@@ -115,7 +115,7 @@ class Glm5NextMoE(MoE):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.gate = MoEGate(config)
-        self.switch_mlp = SwitchGLU(
+        self.switch_mlp = FusedSwitchGLU(
             config.hidden_size,
             config.moe_intermediate_size,
             config.n_routed_experts,
@@ -1027,18 +1027,41 @@ class LanguageModel(nn.Module):
                         )
 
             if isinstance(layer.mlp, Glm5NextMoE):
-                for name in ("gate_proj", "up_proj", "down_proj"):
+                switch_prefix = f"{prefix}.mlp.switch_mlp"
+                for suffix in ("weight", "scales", "biases"):
+                    source_keys = [
+                        f"{switch_prefix}.{projection}.{suffix}"
+                        for projection in ("gate_proj", "up_proj")
+                    ]
+                    if all(key in weights for key in source_keys):
+                        weights[f"{switch_prefix}.gate_up_proj.{suffix}"] = (
+                            mx.concatenate(
+                                [weights.pop(key) for key in source_keys], axis=1
+                            )
+                        )
+                for name in ("gate_up_proj", "down_proj"):
                     for suffix in ("weight", "scales", "biases"):
-                        key0 = f"{prefix}.mlp.experts.0.{name}.{suffix}"
+                        projections = (
+                            ("gate_proj", "up_proj")
+                            if name == "gate_up_proj"
+                            else (name,)
+                        )
+                        key0 = f"{prefix}.mlp.experts.0.{projections[0]}.{suffix}"
                         if key0 in weights:
                             values = [
-                                weights.pop(
-                                    f"{prefix}.mlp.experts.{expert}.{name}.{suffix}"
+                                mx.concatenate(
+                                    [
+                                        weights.pop(
+                                            f"{prefix}.mlp.experts.{expert}.{projection}.{suffix}"
+                                        )
+                                        for projection in projections
+                                    ],
+                                    axis=0,
                                 )
                                 for expert in range(self.args.n_routed_experts)
                             ]
-                            weights[f"{prefix}.mlp.switch_mlp.{name}.{suffix}"] = (
-                                mx.stack(values)
+                            weights[f"{switch_prefix}.{name}.{suffix}"] = mx.stack(
+                                values
                             )
 
             attn_prefix = f"{prefix}.self_attn"

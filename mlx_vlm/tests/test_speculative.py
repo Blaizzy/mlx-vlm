@@ -3455,9 +3455,9 @@ def test_qwen3_5_moe_mtp_builds_moe_layer_and_sanitizes_both_expert_layouts():
             key = f"layers.0.mlp.switch_mlp.{proj}.weight"
             assert key in out, f"[{label}] missing {key}"
             assert out[key].shape[0] == num_experts, f"[{label}] {key} not stacked"
-        assert not any(
-            ".experts." in k and "switch_mlp" not in k for k in out
-        ), f"[{label}] raw expert keys leaked"
+        assert not any(".experts." in k and "switch_mlp" not in k for k in out), (
+            f"[{label}] raw expert keys leaked"
+        )
 
 
 def test_qwen3_5_mtp_draft_block_smoke():
@@ -4905,10 +4905,32 @@ def test_glm5_next_mtp_sanitize_fuses_native_layer_weights():
         16,
         16,
     )
-    assert out["mtp_block.mlp.switch_mlp.gate_proj.weight"].shape == (2, 8, 16)
+    assert out["mtp_block.mlp.switch_mlp.gate_up_proj.weight"].shape == (2, 16, 16)
     assert out["mtp_block.self_attn.qkv_a_proj.weight"].shape == (12, 16)
     assert out["mtp_block.self_attn.embed_q.weight"].shape == (2, 4, 4)
     assert out["mtp_block.self_attn.unembed_out.weight"].shape == (2, 4, 4)
+
+
+def test_glm5_next_mtp_sanitize_migrates_stacked_gate_up_weights():
+    config = _tiny_glm5_next_text_config()
+    context = SimpleNamespace(args=config)
+    gate = mx.zeros((config.n_routed_experts, 8, 16))
+    up = mx.ones((config.n_routed_experts, 8, 16))
+
+    out = Glm5NextMTPDraftModel.sanitize(
+        context,
+        {
+            "mtp_block.mlp.switch_mlp.gate_proj.weight": gate,
+            "mtp_block.mlp.switch_mlp.up_proj.weight": up,
+        },
+    )
+
+    fused = out["mtp_block.mlp.switch_mlp.gate_up_proj.weight"]
+    assert fused.shape == (config.n_routed_experts, 16, 16)
+    assert mx.array_equal(fused[:, :8], gate).item()
+    assert mx.array_equal(fused[:, 8:], up).item()
+    assert "mtp_block.mlp.switch_mlp.gate_proj.weight" not in out
+    assert "mtp_block.mlp.switch_mlp.up_proj.weight" not in out
 
 
 def test_split_glm5_next_mtp_extracts_layer_after_target_stack(tmp_path):

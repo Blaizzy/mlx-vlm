@@ -242,11 +242,13 @@ class TestHyV4(unittest.TestCase):
         fused.gate_up_proj = quantized(mx.concatenate([gate, up], axis=1))
         fused.down_proj = quantized(down)
 
-        for tokens in (1, 13):
+        for tokens in (1, 2, 8, 13):
             x = mx.random.normal((1, tokens, input_dims))
             indices = mx.random.randint(0, num_experts, (1, tokens, 2))
-            expected = split(x, indices)
-            actual = fused(x, indices)
+            weights = mx.softmax(mx.random.normal((1, tokens, 2)), axis=-1)
+            shared = mx.random.normal((1, tokens, input_dims))
+            expected = split(x, indices, weights, shared)
+            actual = fused(x, indices, weights, shared)
             mx.eval(expected, actual)
             self.assertTrue(mx.array_equal(expected, actual).item())
 
@@ -3456,6 +3458,23 @@ class TestModels(unittest.TestCase):
             san["language_model.model.layers.0.self_attn.qkv_conv.conv.weight"].shape,
             (384, 2, 1),
         )
+
+        stacked = model.sanitize(
+            {
+                "model.language_model.layers.1.mlp.switch_mlp.gate_proj.weight": mx.zeros(
+                    (8, 64, 128)
+                ),
+                "model.language_model.layers.1.mlp.switch_mlp.up_proj.weight": mx.ones(
+                    (8, 64, 128)
+                ),
+            }
+        )
+        fused = stacked[
+            "language_model.model.layers.1.mlp.switch_mlp.gate_up_proj.weight"
+        ]
+        self.assertEqual(fused.shape, (8, 128, 128))
+        self.assertTrue(mx.all(fused[:, :64] == 0).item())
+        self.assertTrue(mx.all(fused[:, 64:] == 1).item())
 
         prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
         logits = model(prompt, cache=cache).logits
@@ -16441,7 +16460,9 @@ class TestMixedPrecisionCompressedTensors(unittest.TestCase):
             rng.integers(0, 256, (out, inp // 2), dtype=np.uint8)
         )
         weights["model.layer.mlp.gate_proj.weight_scale"] = mx.full(
-            (out, inp // 16), 0x38, dtype=mx.uint8  # E4M3 1.0
+            (out, inp // 16),
+            0x38,
+            dtype=mx.uint8,  # E4M3 1.0
         )
         weights["model.layer.mlp.gate_proj.weight_global_scale"] = mx.array(
             [1.0], dtype=mx.float32
@@ -17580,8 +17601,9 @@ class TestMoEOffload(unittest.TestCase):
             model,
             group_size=group_size,
             bits=bits,
-            class_predicate=lambda p, m: "switch_mlp" in p
-            and hasattr(m, "to_quantized"),
+            class_predicate=lambda p, m: (
+                "switch_mlp" in p and hasattr(m, "to_quantized")
+            ),
         )
         mx.eval(model.parameters())
 
