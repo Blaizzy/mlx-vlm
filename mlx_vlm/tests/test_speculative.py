@@ -2162,6 +2162,48 @@ def test_mtp_token_controls_replace_next_target_with_forced_token():
     assert new_tokens == [[99]]
 
 
+def test_mtp_token_controls_keep_uniform_acceptance_at_budget_boundary():
+    accepted = [3, 3]
+    new_tokens = [[10, 11, 12, 13], [20, 21, 22, 23]]
+    observed = []
+
+    def observe(row, token):
+        observed.append((row, token))
+        return row == 7 and token == 11
+
+    mtp_utils._apply_mtp_token_controls(
+        accepted,
+        new_tokens,
+        active_idx=[7, 9],
+        forced_tokens=[None, None],
+        token_observer=observe,
+        uniform_acceptance=True,
+    )
+
+    assert observed == [(7, 10), (9, 20), (7, 11), (9, 21)]
+    assert accepted == [1, 1]
+    assert new_tokens == [[10, 11], [20, 21]]
+
+
+def test_mtp_token_controls_keep_uniform_acceptance_for_forced_target():
+    accepted = [2, 2]
+    new_tokens = [[10, 11, 12], [20, 21, 22]]
+    observed = []
+
+    mtp_utils._apply_mtp_token_controls(
+        accepted,
+        new_tokens,
+        active_idx=[7, 9],
+        forced_tokens=[99, None],
+        token_observer=lambda row, token: observed.append((row, token)) or False,
+        uniform_acceptance=True,
+    )
+
+    assert observed == [(7, 99), (9, 20)]
+    assert accepted == [0, 0]
+    assert new_tokens == [[99], [20]]
+
+
 def test_mtp_rounds_skips_rollback_after_full_accept_with_gdn_states():
     class Draft:
         def __init__(self):
