@@ -1106,6 +1106,35 @@ class LanguageModel(nn.Module):
         if self.engram_hash is not None and self.engram_hash._cache is not None:
             self.engram_hash._cache = self.engram_hash._cache[:, :offset]
 
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        """Chunking is safe here with a drafter attached, not just without one.
+
+        The engram reads the ids chunked prefill passes as ``inputs`` and its
+        hash state is position-indexed, so a chunk boundary changes nothing. A
+        dflash drafter additionally needs the per-layer hidden states, which are
+        captured per chunk and concatenated, so it needs only that the capture
+        was requested. Without this the speculative path prefills the whole
+        prompt in one dispatch and runs out of memory well before the
+        autoregressive path does.
+        """
+        del input_ids, inputs_embeds, prompt_cache
+        if getattr(self, "no_chunked_prefill", False):
+            return False
+        if draft_model is None:
+            return True
+        return draft_kind == "dflash" and bool(
+            (prefill_kwargs or {}).get("capture_layer_ids")
+        )
+
     def _reset_caches(self):
         """Drop every per-generation buffer that lives on a module.
 

@@ -19955,6 +19955,32 @@ class TestDeepseekV41Basics(unittest.TestCase):
         mx.eval(again.logits)
         self.assertLess(maxdiff(again.logits[:, 0], logits_a[11]), 1e-4)
 
+    def test_deepseek_v41_chunks_prefill_with_a_dflash_drafter(self):
+        """Without this the speculative path prefills in one dispatch and OOMs."""
+        from mlx_vlm.generate.common import _chunked_prefill_enabled
+        from mlx_vlm.models.deepseek_v41.language import LanguageModel
+
+        model = LanguageModel(self._tiny_config())
+        drafter = object()
+        capture = {"capture_layer_ids": [0]}
+
+        self.assertTrue(_chunked_prefill_enabled(model))
+        self.assertTrue(
+            _chunked_prefill_enabled(
+                model,
+                draft_model=drafter,
+                draft_kind="dflash",
+                prefill_kwargs=capture,
+            )
+        )
+        self.assertFalse(
+            _chunked_prefill_enabled(
+                model, draft_model=drafter, draft_kind="dflash", prefill_kwargs={}
+            )
+        )
+        model.no_chunked_prefill = True
+        self.assertFalse(_chunked_prefill_enabled(model))
+
     def test_deepseek_v41_chunked_prefill_matches_whole_prompt(self):
         """Chunked prefill names the ids `inputs`; the engram has to still see them."""
         from mlx_vlm.models import deepseek_v41
