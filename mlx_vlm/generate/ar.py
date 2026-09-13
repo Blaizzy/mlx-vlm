@@ -345,6 +345,12 @@ def generate_step(
             max_kv_size=max_kv_size,
         )
 
+    # A block of one leaves the drafter zero tokens to propose, which is
+    # ordinary autoregressive decoding. Speculating on it stalls: the round
+    # loops treat a block size of one as an exhausted budget and stop.
+    if draft_block_size is not None and int(draft_block_size) <= 1:
+        draft_model = None
+
     # Speculative decoding setup
     last_outputs = None
     speculative_prefill = SpeculativePrefill(draft_kind, draft_model)
