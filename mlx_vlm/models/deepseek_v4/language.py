@@ -413,13 +413,54 @@ def _overlap_compress_kv(kv, gate, ape, head_dim):
     return (kv * weights).sum(axis=-2)
 
 
-@partial(mx.compile, shapeless=True)
-def _split_softmax(log_normalizer, logits_a, logits_b, sinks=None):
+def _gather_pooled(pooled: mx.array, topk: mx.array) -> mx.array:
+    """``pooled[b, topk[b, l, j]]`` as whole-row copies, shaped (B, L, k, D).
+
+    Broadcasting the index to the value width makes MLX compute one index per
+    element instead of one per row, which dominates the call.
+    """
+    B, Np, D = pooled.shape
+    _, L, k = topk.shape
+    if B == 1:
+        return mx.take(pooled, topk.reshape(-1), axis=1).reshape(B, L, k, D)
+    idx = topk.reshape(B, -1) + (mx.arange(B, dtype=topk.dtype) * Np)[:, None]
+    return mx.take(pooled.reshape(B * Np, D), idx.reshape(-1), axis=0).reshape(
+        B, L, k, D
+    )
+
+
+@mx.compile
+def _decode_attention(q_scaled, local_kv, pooled_g, local_mask, pooled_mask, sinks):
+    local_scores = _apply_score_mask(q_scaled @ local_kv.swapaxes(-1, -2), local_mask)
+    pooled_scores = _apply_score_mask(q_scaled @ pooled_g.swapaxes(-1, -2), pooled_mask)
+    normalizer = mx.logaddexp(
+        mx.logsumexp(local_scores, -1, keepdims=True),
+        mx.logsumexp(pooled_scores, -1, keepdims=True),
+    )
     if sinks is not None:
-        log_normalizer = mx.logaddexp(log_normalizer, sinks)
-    weights_a = mx.exp(logits_a - log_normalizer)
-    weights_b = mx.exp(logits_b - log_normalizer)
-    return weights_a, weights_b
+        normalizer = mx.logaddexp(normalizer, sinks[None, :, None, None])
+    return (
+        mx.exp(local_scores - normalizer) @ local_kv
+        + mx.exp(pooled_scores - normalizer) @ pooled_g
+    )
+
+
+def _flat_attention(q_scaled, local_kv, pooled_g, local_mask, pooled_mask, sinks):
+    local_scores = _apply_score_mask(q_scaled @ local_kv.swapaxes(-1, -2), local_mask)
+    pooled_scores = q_scaled.transpose(0, 2, 1, 3) @ pooled_g.swapaxes(-1, -2)
+    if pooled_mask is not None:
+        pooled_scores = _apply_score_mask(
+            pooled_scores, pooled_mask.transpose(0, 2, 1, 3)
+        )
+    normalizer = mx.logaddexp(
+        mx.logsumexp(local_scores, -1, keepdims=True),
+        mx.logsumexp(pooled_scores, -1, keepdims=True).transpose(0, 2, 1, 3),
+    )
+    if sinks is not None:
+        normalizer = mx.logaddexp(normalizer, sinks[None, :, None, None])
+    out = mx.exp(local_scores - normalizer) @ local_kv
+    pw = mx.exp(pooled_scores - normalizer.transpose(0, 2, 1, 3))
+    return out + (pw @ pooled_g).transpose(0, 2, 1, 3)
 
 
 def _sparse_pooled_attention(
@@ -432,39 +473,28 @@ def _sparse_pooled_attention(
     scale: float,
     sinks: Optional[mx.array],
 ) -> mx.array:
-    B, H, L, D = q.shape
-    idx = topk[:, None, :, :, None]
-    pooled = mx.take_along_axis(
-        mx.broadcast_to(pooled[:, None, None], (B, 1, L, pooled.shape[1], D)),
-        mx.broadcast_to(idx, idx.shape[:-1] + (D,)),
-        axis=3,
-    )
+    """Attention over a sliding window and a gathered set of pooled positions.
 
+    Both branches share one softmax normalizer. Single-token decode runs the
+    compiled variant; wider queries keep the pooled scores in (B, L, H, k)
+    layout, matching the gathered rows so no transpose is needed per score.
+    """
     q_scaled = q * scale
-    local_scores = q_scaled @ local_kv.swapaxes(-1, -2)
-    local_scores = _apply_score_mask(local_scores, local_mask)
-    normalizer = mx.logsumexp(local_scores, -1, keepdims=True)
+    pooled_g = _gather_pooled(pooled, topk)
 
-    pooled_sq = pooled.squeeze(1)
-    q_bl = q_scaled.transpose(0, 2, 1, 3)
-    pooled_scores = q_bl @ pooled_sq.swapaxes(-1, -2)
-    pooled_scores = pooled_scores.transpose(0, 2, 1, 3)
-    pooled_scores = _apply_score_mask(pooled_scores, pooled_mask)
-    normalizer = mx.logaddexp(
-        normalizer, mx.logsumexp(pooled_scores, -1, keepdims=True)
-    )
+    if q.shape[2] == 1:
+        return _decode_attention(
+            q_scaled,
+            local_kv,
+            pooled_g[:, 0][:, None],
+            local_mask,
+            pooled_mask,
+            sinks,
+        ).astype(q.dtype)
 
-    local_weights, pooled_weights = _split_softmax(
-        normalizer,
-        local_scores,
-        pooled_scores,
-        sinks[None, :, None, None] if sinks is not None else None,
-    )
-
-    out = local_weights @ local_kv
-    pw_bl = pooled_weights.transpose(0, 2, 1, 3)
-    out = out + (pw_bl @ pooled_sq).transpose(0, 2, 1, 3)
-    return out.astype(q.dtype)
+    return _flat_attention(
+        q_scaled, local_kv, pooled_g, local_mask, pooled_mask, sinks
+    ).astype(q.dtype)
 
 
 class MoEGate(nn.Module):
