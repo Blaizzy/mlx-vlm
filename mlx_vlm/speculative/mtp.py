@@ -42,6 +42,31 @@ class _MTPVerifyResult:
         )
 
 
+def _apply_mtp_token_controls(
+    accepted_list: List[int],
+    new_tokens_list: List[List[int]],
+    active_idx: List[int],
+    forced_tokens: List[Optional[int]],
+    token_observer: Optional[Callable[[int, int], bool]],
+) -> None:
+    """Inject forced targets and truncate accepted blocks at control boundaries."""
+    for row, forced_token in enumerate(forced_tokens):
+        if forced_token is not None:
+            accepted_list[row] = 0
+            new_tokens_list[row] = [int(forced_token)]
+
+    if token_observer is None:
+        return
+    for row, new_tokens in enumerate(new_tokens_list):
+        original_row = active_idx[row]
+        for position, token in enumerate(new_tokens):
+            if token_observer(original_row, int(token)):
+                kept = position + 1
+                new_tokens_list[row] = new_tokens[:kept]
+                accepted_list[row] = kept - 1
+                break
+
+
 def _mtp_shared_kv_from_prompt_cache(
     lm: nn.Module,
     prompt_cache: List[Any],
@@ -885,6 +910,8 @@ def _mtp_rounds_batch(
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
     row_ids: Optional[List[int]] = None,
+    token_observer: Optional[Callable[[int, int], bool]] = None,
+    forced_token_provider: Optional[Callable[[int], Optional[int]]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B >= 1).
 
@@ -1014,6 +1041,14 @@ def _mtp_rounds_batch(
 
             # Walk per-row
             budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
+            forced_tokens = [
+                (
+                    forced_token_provider(active_idx[row])
+                    if forced_token_provider is not None
+                    else None
+                )
+                for row in range(n_active)
+            ]
             if verify.target_tokens is not None:
                 sampler_rng.target_eval(verify.target_tokens, hidden_full)
                 accepted_list, new_tokens_list = _speculative_walk_batch(
@@ -1058,6 +1093,13 @@ def _mtp_rounds_batch(
                 sampler_rng.target_sampled(
                     sync_draft=not _sampler_supports_positioned_target(sampler)
                 )
+            _apply_mtp_token_controls(
+                accepted_list,
+                new_tokens_list,
+                active_idx,
+                forced_tokens,
+                token_observer,
+            )
             # Keep the adaptive block-size history on a per-round basis so
             # batched MTP reacts like the singleton loop instead of letting
             # batch size change the controller signal.
