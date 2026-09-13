@@ -3455,9 +3455,9 @@ def test_qwen3_5_moe_mtp_builds_moe_layer_and_sanitizes_both_expert_layouts():
             key = f"layers.0.mlp.switch_mlp.{proj}.weight"
             assert key in out, f"[{label}] missing {key}"
             assert out[key].shape[0] == num_experts, f"[{label}] {key} not stacked"
-        assert not any(".experts." in k and "switch_mlp" not in k for k in out), (
-            f"[{label}] raw expert keys leaked"
-        )
+        assert not any(
+            ".experts." in k and "switch_mlp" not in k for k in out
+        ), f"[{label}] raw expert keys leaked"
 
 
 def test_qwen3_5_mtp_draft_block_smoke():

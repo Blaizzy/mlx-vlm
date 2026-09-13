@@ -11,13 +11,13 @@ from pathlib import Path
 
 import mlx.core as mx
 
+from mlx_vlm.models.fast_ops import exact_affine_switch_gate_up
 from mlx_vlm.models.switch_layers import (
     FusedSwitchGLU,
     QuantizedSwitchLinear,
     SwitchGLU,
     _gather_sort,
 )
-from mlx_vlm.models.fast_ops import exact_affine_switch_gate_up
 
 
 def quantized(input_dims, output_dims, experts):
