@@ -649,6 +649,13 @@ class DeepseekV41Attention(nn.Module):
         return pool, idxs
 
     def __call__(self, x: mx.array, start_pos: int, shared: SharedIndexState):
+        """Sparse attention over the pooled compressor cache, or the sliding window alone.
+
+        The window cache is float32 and the queries are the model dtype; the cast
+        below keeps them equal, because a dtype mismatch drops the call off the
+        fused attention path. It is lossless: the cache holds fake-quantized fp8
+        values, whose mantissa and exponent both fit the narrower type.
+        """
         batch, seqlen = x.shape[0], x.shape[1]
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).reshape(batch, seqlen, self.n_heads, self.head_dim)
@@ -671,19 +678,13 @@ class DeepseekV41Attention(nn.Module):
                     self.attn_sink.astype(q.dtype),
                 )
         if out is None:
-            mask = window_mask
-            # The window cache is float32 while queries are the model dtype, and
-            # mixed dtypes drop this call off the fused attention path: measured
-            # 79 ms against 0.1 ms for one decode step's call. The cast is
-            # lossless because the cache holds fake-quantized fp8 values, whose
-            # mantissa and exponent both fit the narrower type.
             kv = window_kv[:, None].astype(q.dtype)
             out = mx.fast.scaled_dot_product_attention(
                 q,
                 kv,
                 kv,
                 scale=self.scale,
-                mask=mask,
+                mask=window_mask,
                 sinks=self.attn_sink.astype(q.dtype),
             )
         out = self.rope(out, start_pos, inverse=True)
