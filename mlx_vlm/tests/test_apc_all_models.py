@@ -77,11 +77,18 @@ def _cache_factories_by_package() -> dict[str, set[str]]:
     return found
 
 
+def _deepseek_v41_cache():
+    from mlx_vlm.models.deepseek_v41.language import DeepseekV41Cache
+
+    return DeepseekV41Cache(1, [2])
+
+
 def _cache_samples():
     """One unpopulated instance of every cache family used by model sources."""
     return {
         "ArraysCache": ArraysCache(2),
         "CacheList": CacheList(KVCache(), ArraysCache(1)),
+        "DeepseekV41Cache": _deepseek_v41_cache(),
         "ChunkedKVCache": ChunkedKVCache(chunk_size=16),
         "HyV4KVCache": HyV4KVCache(),
         "KVCache": KVCache(),
@@ -246,6 +253,18 @@ def _populated_cache(name: str, token_count: int):
             _populated_cache("KVCache", token_count),
             _populated_cache("ArraysCache", token_count),
         )
+    if name == "DeepseekV41Cache":
+        from mlx_vlm.models.deepseek_v41.language import DeepseekV41Cache
+
+        cache = DeepseekV41Cache(1, [2])
+        cache.offset = token_count
+        cache.window[0] = mx.ones((1, token_count, 4))
+        cache.compress[0] = mx.ones((1, token_count // 2, 4)) * 2
+        cache.keys[0] = mx.ones((1, token_count // 2, 4)) * 3
+        cache.kv_state[0] = mx.ones((1, 2, 4)) * 4
+        cache.score_state[0] = mx.ones((1, 2, 4)) * 5
+        cache.engram = mx.zeros((1, token_count), dtype=mx.int64)
+        return cache
     if name == "Z1TCache":
         cache = Z1TCache()
         cache.offset = token_count

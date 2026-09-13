@@ -194,17 +194,19 @@ class NgramHashState(nn.Module):
             layout.layer_ids, layout.max_ngram_size, vocab_size
         )
         self._token_map = mx.array(token_map, dtype=mx.int64)
-        self._cache = None
 
-    def __call__(self, input_ids: mx.array, start_pos: int, token_mask=None):
+    def __call__(self, input_ids: mx.array, start_pos: int, state, token_mask=None):
         """token_mask: [B, L], False for tokens that take no part in an n-gram (image spans).
-        Returns the hash ids, shaped [B, L, n_engram_layers, n_hash_cols]."""
+        Returns the hash ids, shaped [B, L, n_engram_layers, n_hash_cols].
+
+        The token history lives on ``state`` (the generation's cache) rather than
+        on this module, so two generations do not share it."""
         batch, seqlen = input_ids.shape
         compressed = self._token_map[input_ids]
         if token_mask is not None:
             compressed = mx.where(token_mask, compressed, self.DEAD)
         need_len = start_pos + seqlen
-        cache = self._cache
+        cache = state.engram
         if cache is None:
             cache = mx.zeros((batch, need_len), dtype=mx.int64)
         else:
@@ -239,7 +241,7 @@ class NgramHashState(nn.Module):
             cache = mx.concatenate([head, cache[batch:]], axis=0)
         else:
             cache = head
-        self._cache = cache
+        state.engram = cache
         cur = cache[:batch]
 
         positions = mx.broadcast_to(

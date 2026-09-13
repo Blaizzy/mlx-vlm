@@ -20364,7 +20364,7 @@ class TestDeepseekV41Indexer(unittest.TestCase):
         indexer = deepseek_v41.Indexer(config, 0)
         self.assertTrue(indexer.owns_k)
         mx.eval(indexer.parameters())
-        shared = deepseek_v41.SharedIndexState()
+        shared = deepseek_v41.DeepseekV41Cache(8, [2] * 8)
 
         x = mx.random.normal((1, 4, 16))
         qr = mx.random.normal((1, 4, 8))
@@ -20391,7 +20391,7 @@ class TestDeepseekV41Indexer(unittest.TestCase):
         consumer = deepseek_v41.Indexer(config, 2)
         self.assertTrue(consumer.uses_candidates)
         mx.eval(source.parameters(), consumer.parameters())
-        shared = deepseek_v41.SharedIndexState()
+        shared = deepseek_v41.DeepseekV41Cache(8, [2] * 8)
 
         seed = deepseek_v41.Indexer(config, 0)
         mx.eval(seed.parameters())
@@ -20489,12 +20489,13 @@ class TestDeepseekV41Compressor(unittest.TestCase):
         config = self._tiny_config()
         comp = deepseek_v41.Compressor(config, 0)
         mx.eval(comp.parameters())
+        cache = deepseek_v41.DeepseekV41Cache(2, [2, 1])
 
-        latent = comp(mx.random.normal((1, 5, 16)), 0)
+        latent = comp(mx.random.normal((1, 5, 16)), 0, cache)
         mx.eval(latent)
         self.assertEqual(latent.shape, (1, 2, 8))
 
-        step = comp(mx.random.normal((1, 1, 16)), 5)
+        step = comp(mx.random.normal((1, 1, 16)), 5, cache)
         mx.eval(step)
         self.assertEqual(step.shape, (1, 1, 8))
 
@@ -20504,9 +20505,10 @@ class TestDeepseekV41Compressor(unittest.TestCase):
         config = self._tiny_config()
         comp = deepseek_v41.Compressor(config, 0)
         mx.eval(comp.parameters())
+        cache = deepseek_v41.DeepseekV41Cache(2, [2, 1])
 
-        self.assertIsNone(comp(mx.random.normal((1, 1, 16)), 2))
-        step = comp(mx.random.normal((1, 1, 16)), 3)
+        self.assertIsNone(comp(mx.random.normal((1, 1, 16)), 2, cache))
+        step = comp(mx.random.normal((1, 1, 16)), 3, cache)
         mx.eval(step)
         self.assertEqual(step.shape, (1, 1, 8))
 
@@ -20518,7 +20520,9 @@ class TestDeepseekV41Compressor(unittest.TestCase):
         mx.eval(comp.parameters())
         self.assertFalse(hasattr(comp, "wgate"))
 
-        out = comp(mx.random.normal((1, 4, 16)), 0)
+        out = comp(
+            mx.random.normal((1, 4, 16)), 0, deepseek_v41.DeepseekV41Cache(2, [2, 1])
+        )
         mx.eval(out)
         self.assertEqual(out.shape, (1, 4, 8))
 
@@ -20575,7 +20579,7 @@ class TestDeepseekV41Attention(unittest.TestCase):
         layers = [deepseek_v41.DeepseekV41Attention(config, i) for i in range(4)]
         for layer in layers:
             mx.eval(layer.parameters())
-        shared = deepseek_v41.SharedIndexState()
+        shared = deepseek_v41.DeepseekV41Cache(8, [2] * 8)
 
         x = mx.random.normal((1, 5, 16))
         for layer in layers:
@@ -20643,7 +20647,7 @@ class TestDeepseekV41Block(unittest.TestCase):
         self.assertIsNotNone(block1.engram)
         for block in (block0, block1):
             mx.eval(block.parameters())
-        shared = deepseek_v41.SharedIndexState()
+        shared = deepseek_v41.DeepseekV41Cache(8, [2] * 8)
 
         pre_mix = deepseek_v41.make_identity_pre_mix(1, 3, 2)
         self.assertEqual(pre_mix.shape, (1, 3, 2))
@@ -21204,20 +21208,35 @@ class TestDeepseekV41Engram(unittest.TestCase):
         )
         return model
 
-    def test_reset_caches_clears_the_engram_hash_state(self):
-        """A generation must not inherit the previous one's token history.
+    def test_two_caches_on_one_model_do_not_interfere(self):
+        """Generation state belongs to the cache, not the model.
 
-        The hash state keeps a token history across the prefill/decode split,
-        and at start_pos 0 it preserves any tail longer than the new prompt.
-        Leaving it behind made a generation depend on the one before it.
+        While it lived on the modules, a second cache overwrote the first one's
+        buffers, so a generation depended on whatever ran beside it.
         """
         import mlx.core as mx
 
         model = self._model_with_engram()
-        model.engram_hash(mx.array([[1, 2, 3, 4, 5, 6]]), 0)
-        self.assertIsNotNone(model.engram_hash._cache)
-        model._reset_caches()
-        self.assertIsNone(model.engram_hash._cache)
+        a = mx.array([[1, 2, 3, 4, 5, 6]])
+        b = mx.array([[6, 5, 4, 3, 2, 1]])
+
+        cache_a = model.make_cache()
+        model(a, cache=cache_a)
+        solo = model(mx.array([[2]]), cache=cache_a)
+        mx.eval(solo.logits)
+
+        cache_a = model.make_cache()
+        model(a, cache=cache_a)
+        cache_b = model.make_cache()
+        model(b, cache=cache_b)
+        interleaved = model(mx.array([[2]]), cache=cache_a)
+        mx.eval(interleaved.logits)
+
+        diff = mx.abs(
+            solo.logits.astype(mx.float32) - interleaved.logits.astype(mx.float32)
+        )
+        mx.eval(diff)
+        self.assertLess(float(mx.max(diff).item()), 1e-4)
 
     def test_deepseek_v41_engram_layers_are_invoked(self):
         from mlx_vlm.models.deepseek_v41 import engram as engram_mod
@@ -21332,12 +21351,14 @@ class TestDeepseekV41TokenMap(unittest.TestCase):
         )
         state._token_map = mx.arange(64, dtype=mx.int64) % 7
         state.pad_id = 0
-        state._cache = None
 
-        prefill = state(mx.array([[1, 2, 3, 4]]), 0, None)
+        from mlx_vlm.models.deepseek_v41.language import DeepseekV41Cache
+
+        cache = DeepseekV41Cache(1, [1])
+        prefill = state(mx.array([[1, 2, 3, 4]]), 0, cache)
         mx.eval(prefill)
         self.assertEqual(prefill.shape, (1, 4, 1, 4))
-        step = state(mx.array([[5]]), 4, None)
+        step = state(mx.array([[5]]), 4, cache)
         mx.eval(step)
         self.assertEqual(step.shape, (1, 1, 1, 4))
 

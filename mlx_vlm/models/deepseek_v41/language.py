@@ -20,18 +20,54 @@ from .engram import Engram, EngramLayout, NgramHashState
 from .fakequant import fake_quant_fp4_e4m3, fake_quant_fp4_ue8m0, fake_quant_fp8_ue8m0
 
 
-class SharedIndexState:
-    """Per-forward handoff between index layers, replacing the reference global.
+def _write_span(buffer, values, batch: int, start: int, fill=0, dtype=None):
+    """Write ``values`` into ``buffer`` at ``start``, growing it to fit.
 
-    Layers run in order and every source writes before its consumers read. The
-    candidate source must run on every step before deeper indexers consume its mask.
+    Every per-generation buffer here is position-addressed: a step rewrites the
+    span it owns and leaves the rest alone, which is what lets a rejected
+    speculative block be dropped by moving the offset back. Rows past ``batch``
+    are preserved so a filtered batch can grow again.
     """
-
-    def __init__(self):
-        self.index_k = None
-        self.candidates = None
-        self.compress_kv = None
-        self.topk_idxs = None
+    length, tail = values.shape[1], values.shape[2:]
+    need = start + length
+    if buffer is None:
+        buffer = mx.full(
+            (batch, need, *tail), fill, dtype=values.dtype if dtype is None else dtype
+        )
+    if buffer.shape[0] < batch:
+        buffer = mx.concatenate(
+            [
+                buffer,
+                mx.full(
+                    (batch - buffer.shape[0], buffer.shape[1], *tail),
+                    fill,
+                    dtype=buffer.dtype,
+                ),
+            ],
+            axis=0,
+        )
+    if buffer.shape[1] < need:
+        buffer = mx.concatenate(
+            [
+                buffer,
+                mx.full(
+                    (buffer.shape[0], need - buffer.shape[1], *tail),
+                    fill,
+                    dtype=buffer.dtype,
+                ),
+            ],
+            axis=1,
+        )
+    parts = []
+    if start > 0:
+        parts.append(buffer[:batch, :start])
+    parts.append(values.astype(buffer.dtype))
+    if buffer.shape[1] > need:
+        parts.append(buffer[:batch, need:])
+    head = mx.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
+    if buffer.shape[0] > batch:
+        return mx.concatenate([head, buffer[batch:]], axis=0)
+    return head
 
 
 @lru_cache(64)
@@ -152,9 +188,9 @@ class Indexer(nn.Module):
         if self.owns_k:
             self.wk = nn.Linear(config.head_dim, self.index_head_dim, bias=False)
             self.k_norm = nn.RMSNorm(self.index_head_dim, eps=config.rms_norm_eps)
-        self._k_cache = None
+        self.layer_idx = layer_idx
 
-    def _publish_keys(self, latent: mx.array, start_pos: int, batch: int):
+    def _publish_keys(self, latent: mx.array, start_pos: int, batch: int, cache):
         ratio = self.compress_ratio
         n_latent = latent.shape[1]
         base = start_pos // ratio
@@ -173,55 +209,9 @@ class Indexer(nn.Module):
             self.rope_head_dim,
         )
         k = fake_quant_fp4_ue8m0(k)
-        cache = self._k_cache
-        if cache is None:
-            cache = mx.zeros(
-                (batch, base + n_latent, self.index_head_dim), dtype=mx.float32
-            )
-        else:
-            if cache.shape[0] < batch:
-                cache = mx.concatenate(
-                    [
-                        cache,
-                        mx.zeros(
-                            (
-                                batch - cache.shape[0],
-                                cache.shape[1],
-                                self.index_head_dim,
-                            ),
-                            dtype=mx.float32,
-                        ),
-                    ],
-                    axis=0,
-                )
-            if cache.shape[1] < base + n_latent:
-                cache = mx.concatenate(
-                    [
-                        cache,
-                        mx.zeros(
-                            (
-                                cache.shape[0],
-                                base + n_latent - cache.shape[1],
-                                self.index_head_dim,
-                            ),
-                            dtype=mx.float32,
-                        ),
-                    ],
-                    axis=1,
-                )
-        parts = []
-        if base > 0:
-            parts.append(cache[:batch, :base])
-        parts.append(k)
-        if cache.shape[1] > base + n_latent:
-            parts.append(cache[:batch, base + n_latent :])
-        head = mx.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
-        if cache.shape[0] > batch:
-            cache = mx.concatenate([head, cache[batch:]], axis=0)
-        else:
-            cache = head
-        self._k_cache = cache
-        return cache
+        keys = _write_span(cache.keys[self.layer_idx], k, batch, base, dtype=mx.float32)
+        cache.keys[self.layer_idx] = keys
+        return keys
 
     def __call__(
         self,
@@ -230,7 +220,7 @@ class Indexer(nn.Module):
         latent,
         start_pos: int,
         offset: int,
-        shared: SharedIndexState,
+        cache: "DeepseekV41Cache",
     ) -> mx.array:
         """`latent` is this layer's RoPE-free compressed latent, None when this layer does not
         compress or when its current group is still incomplete. An index-key owner turns it
@@ -240,7 +230,7 @@ class Indexer(nn.Module):
         ratio, end_pos = self.compress_ratio, start_pos + seqlen
 
         if self.owns_k and latent is not None:
-            shared.index_k = self._publish_keys(latent, start_pos, batch)
+            cache.index_k = self._publish_keys(latent, start_pos, batch, cache)
 
         cos, sin = _index_cos_sin(
             end_pos, self.rope_head_dim, self.rope_theta, self.yarn
@@ -255,7 +245,7 @@ class Indexer(nn.Module):
         )
         q = fake_quant_fp4_ue8m0(q)
 
-        index_k = shared.index_k[:batch, : end_pos // ratio].astype(mx.float32)
+        index_k = cache.index_k[:batch, : end_pos // ratio].astype(mx.float32)
         weights = self.weights_proj(x).astype(mx.float32) * (
             self.scale * self.n_heads**-0.5
         )
@@ -268,14 +258,14 @@ class Indexer(nn.Module):
         scores = mx.where(visible, scores, -mx.inf)
 
         if self.is_candidate_source:
-            shared.candidates = select_candidate_blocks(
+            cache.candidates = select_candidate_blocks(
                 scores,
                 compress_lens,
                 self.candidate_topk_blocks,
                 self.candidate_block_size,
             )
         elif self.uses_candidates:
-            scores = mx.where(shared.candidates, scores, -mx.inf)
+            scores = mx.where(cache.candidates, scores, -mx.inf)
 
         topk = min(self.index_topk, end_pos // ratio)
         idxs = mx.sort(mx.argsort(-scores, axis=-1)[..., :topk], axis=-1).astype(
@@ -505,38 +495,8 @@ class DeepseekV41Attention(nn.Module):
             scaling.get("beta_slow", 1),
             scaling.get("original_max_position_embeddings", 65536),
         )
-        self._window_cache = None
-        self._compress_cache = None
-        self._cache_len = 0
 
-    def _grow_cache(self, cache, batch: int, length: int, dim: int):
-        if cache is None:
-            return mx.zeros((batch, length, dim), dtype=mx.float32)
-        if cache.shape[0] < batch:
-            cache = mx.concatenate(
-                [
-                    cache,
-                    mx.zeros(
-                        (batch - cache.shape[0], cache.shape[1], dim),
-                        dtype=mx.float32,
-                    ),
-                ],
-                axis=0,
-            )
-        if cache.shape[1] < length:
-            cache = mx.concatenate(
-                [
-                    cache,
-                    mx.zeros(
-                        (cache.shape[0], length - cache.shape[1], dim),
-                        dtype=mx.float32,
-                    ),
-                ],
-                axis=1,
-            )
-        return cache
-
-    def _window_part(self, x: mx.array, start_pos: int):
+    def _window_part(self, x: mx.array, start_pos: int, cache):
         """Window KV slice for this step plus its validity mask.
 
         Prefill attends over the current chunk; later steps attend the last
@@ -549,49 +509,15 @@ class DeepseekV41Attention(nn.Module):
         kv = self.rope(kv, start_pos).reshape(batch, seqlen, self.head_dim)
         kv = fake_quant_fp8_ue8m0(kv.astype(mx.float32)).astype(kv.dtype)
         need_len = start_pos + seqlen
-        cache = self._window_cache
-        if cache is None:
-            cache = mx.zeros((batch, 0, self.head_dim), dtype=mx.float32)
-        if cache.shape[0] < batch:
-            cache = mx.concatenate(
-                [
-                    cache,
-                    mx.zeros(
-                        (batch - cache.shape[0], cache.shape[1], self.head_dim),
-                        dtype=mx.float32,
-                    ),
-                ],
-                axis=0,
-            )
-        if cache.shape[1] < need_len:
-            cache = mx.concatenate(
-                [
-                    cache,
-                    mx.zeros(
-                        (cache.shape[0], need_len - cache.shape[1], self.head_dim),
-                        dtype=mx.float32,
-                    ),
-                ],
-                axis=1,
-            )
-        parts = []
-        if start_pos > 0:
-            parts.append(cache[:batch, :start_pos])
-        parts.append(kv)
-        if cache.shape[1] > need_len:
-            parts.append(cache[:batch, need_len:])
-        head = mx.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
-        if cache.shape[0] > batch:
-            cache = mx.concatenate([head, cache[batch:]], axis=0)
-        else:
-            cache = head
-        self._window_cache = cache
-        self._cache_len = need_len
+        buffer = _write_span(
+            cache.window[self.layer_idx], kv, batch, start_pos, dtype=mx.float32
+        )
+        cache.window[self.layer_idx] = buffer
         if start_pos == 0:
-            part, base = cache[:batch, :need_len], 0
+            part, base = buffer[:batch, :need_len], 0
         else:
             base = max(0, start_pos - win + 1)
-            part = cache[:batch, base:need_len]
+            part = buffer[:batch, base:need_len]
         positions = mx.arange(base, base + part.shape[1])
         queries = mx.arange(start_pos, start_pos + seqlen)
         valid = (
@@ -601,13 +527,13 @@ class DeepseekV41Attention(nn.Module):
         )
         return part, valid[None, None]
 
-    def _compress_part(self, x: mx.array, qr: mx.array, start_pos: int, shared):
+    def _compress_part(self, x: mx.array, qr: mx.array, start_pos: int, cache):
         """Shared compressed KV slice plus this layer's Top-K indices."""
         batch, seqlen = x.shape[0], x.shape[1]
         ratio = self.compress_ratio
         latent = None
         if self.is_kv_source:
-            latent = self.compressor(x, start_pos)
+            latent = self.compressor(x, start_pos, cache)
             if latent is not None:
                 n_latent = latent.shape[1]
                 positions = (start_pos // ratio + mx.arange(n_latent)) * ratio
@@ -619,36 +545,32 @@ class DeepseekV41Attention(nn.Module):
                     self._latent_yarn,
                 )
                 latent = fake_quant_fp4_e4m3(latent)
-                base = start_pos // ratio
-                cache = self._grow_cache(
-                    self._compress_cache, batch, base + n_latent, self.head_dim
+                pool_kv = _write_span(
+                    cache.compress[self.layer_idx],
+                    latent,
+                    batch,
+                    start_pos // ratio,
+                    dtype=mx.float32,
                 )
-                parts = []
-                if base > 0:
-                    parts.append(cache[:batch, :base])
-                parts.append(latent)
-                if cache.shape[1] > base + n_latent:
-                    parts.append(cache[:batch, base + n_latent :])
-                head = mx.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
-                if cache.shape[0] > batch:
-                    cache = mx.concatenate([head, cache[batch:]], axis=0)
-                else:
-                    cache = head
-                self._compress_cache = cache
-                shared.compress_kv = cache
+                cache.compress[self.layer_idx] = pool_kv
+                cache.compress_kv = pool_kv
         compress_len = (start_pos + seqlen) // ratio
-        if compress_len == 0:
+        if compress_len == 0 or cache.compress_kv is None:
             pool = mx.zeros((batch, 0, self.head_dim), dtype=x.dtype)
             return pool, mx.zeros((batch, seqlen, 0), dtype=mx.int32)
-        pool = shared.compress_kv[:batch, :compress_len]
+        pool = cache.compress_kv[:batch, :compress_len]
         if self.is_index_source:
-            idxs = self.indexer(x, qr, latent, start_pos, 0, shared)
-            shared.topk_idxs = idxs
+            idxs = self.indexer(x, qr, latent, start_pos, 0, cache)
+            cache.topk_idxs = idxs
         else:
-            idxs = shared.topk_idxs
+            idxs = cache.topk_idxs
+        if idxs is None:
+            return mx.zeros((batch, 0, self.head_dim), dtype=x.dtype), mx.zeros(
+                (batch, seqlen, 0), dtype=mx.int32
+            )
         return pool, idxs
 
-    def __call__(self, x: mx.array, start_pos: int, shared: SharedIndexState):
+    def __call__(self, x: mx.array, start_pos: int, cache: "DeepseekV41Cache"):
         """Sparse attention over the pooled compressor cache, or the sliding window alone.
 
         The window cache is float32 and the queries are the model dtype; the cast
@@ -662,10 +584,10 @@ class DeepseekV41Attention(nn.Module):
         q = q.transpose(0, 2, 1, 3)
         q = self.rope(q, start_pos)
 
-        window_kv, window_mask = self._window_part(x, start_pos)
+        window_kv, window_mask = self._window_part(x, start_pos, cache)
         out = None
         if self.compress_ratio:
-            pool, idxs = self._compress_part(x, qr, start_pos, shared)
+            pool, idxs = self._compress_part(x, qr, start_pos, cache)
             if pool.shape[1]:
                 out = _sparse_pooled_attention(
                     q,
@@ -715,58 +637,47 @@ class Compressor(nn.Module):
         self.wkv = nn.Linear(config.hidden_size, config.head_dim, bias=False)
         if compress_ratio > 1:
             self.wgate = nn.Linear(config.hidden_size, config.head_dim, bias=False)
-        self._kv_state = None
-        self._score_state = None
-        self._undo = []
+        self.layer_idx = layer_idx
 
-    def _push_undo(self, batch: int, slot: int):
+    def _push_undo(self, batch: int, slot: int, cache):
         """Record a slot's prior contents so a rejected position can be undone.
 
         Slots are position-addressed (``pos % ratio``), so a speculative block
         that crosses a compression boundary overwrites slots belonging to
         already-committed positions. Those are not recoverable by replay.
         """
-        kv = None if self._kv_state is None else self._kv_state[:batch, slot : slot + 1]
-        sc = (
-            None
-            if self._score_state is None
-            else self._score_state[:batch, slot : slot + 1]
-        )
-        self._undo.append((slot, batch, kv, sc))
-        if len(self._undo) > 64:
-            del self._undo[:-64]
+        i = self.layer_idx
+        kv_state, score_state = cache.kv_state[i], cache.score_state[i]
+        kv = None if kv_state is None else kv_state[:batch, slot : slot + 1]
+        sc = None if score_state is None else score_state[:batch, slot : slot + 1]
+        undo = cache.undo[i]
+        undo.append((slot, batch, kv, sc))
+        if len(undo) > 64:
+            del undo[:-64]
 
-    def undo(self, n: int):
-        """Restore slot state for the last ``n`` written positions."""
-        for _ in range(min(int(n), len(self._undo))):
-            slot, batch, kv, sc = self._undo.pop()
-            if kv is not None:
-                self._kv_state = self._write_slot(self._kv_state, batch, slot, kv)
-            if sc is not None:
-                self._score_state = self._write_slot(self._score_state, batch, slot, sc)
-
-    def _grow_state(self, batch: int):
-        if self._kv_state is None:
-            self._kv_state = mx.zeros(
+    def _grow_state(self, batch: int, cache):
+        i = self.layer_idx
+        if cache.kv_state[i] is None:
+            cache.kv_state[i] = mx.zeros(
                 (batch, self.compress_ratio, self.head_dim), dtype=mx.float32
             )
-            self._score_state = mx.full(
+            cache.score_state[i] = mx.full(
                 (batch, self.compress_ratio, self.head_dim), -mx.inf
             )
-        elif self._kv_state.shape[0] < batch:
-            extra = batch - self._kv_state.shape[0]
-            self._kv_state = mx.concatenate(
+        elif cache.kv_state[i].shape[0] < batch:
+            extra = batch - cache.kv_state[i].shape[0]
+            cache.kv_state[i] = mx.concatenate(
                 [
-                    self._kv_state,
+                    cache.kv_state[i],
                     mx.zeros(
                         (extra, self.compress_ratio, self.head_dim), dtype=mx.float32
                     ),
                 ],
                 axis=0,
             )
-            self._score_state = mx.concatenate(
+            cache.score_state[i] = mx.concatenate(
                 [
-                    self._score_state,
+                    cache.score_state[i],
                     mx.full((extra, self.compress_ratio, self.head_dim), -mx.inf),
                 ],
                 axis=0,
@@ -791,49 +702,50 @@ class Compressor(nn.Module):
             return mx.concatenate([head, state[batch:]], axis=0)
         return head
 
-    def __call__(self, x: mx.array, start_pos: int):
+    def __call__(self, x: mx.array, start_pos: int, cache):
         ratio = self.compress_ratio
         if ratio == 1:
             return self.norm(self.wkv(x))
 
+        i = self.layer_idx
         batch, seqlen = x.shape[0], x.shape[1]
         dtype = x.dtype
         xf = x.astype(mx.float32)
         kv, score = self.wkv(xf), self.wgate(xf)
         if start_pos == 0:
             should_compress = seqlen >= ratio
-            self._undo.clear()
+            cache.undo[i].clear()
             remainder = seqlen % ratio
             cutoff = seqlen - remainder
             if remainder:
-                self._grow_state(batch)
-                self._kv_state = self._stow_remainder(
-                    self._kv_state, batch, kv[:, cutoff:]
+                self._grow_state(batch, cache)
+                cache.kv_state[i] = self._stow_remainder(
+                    cache.kv_state[i], batch, kv[:, cutoff:]
                 )
-                self._score_state = self._stow_remainder(
-                    self._score_state, batch, score[:, cutoff:]
+                cache.score_state[i] = self._stow_remainder(
+                    cache.score_state[i], batch, score[:, cutoff:]
                 )
             kv = kv[:, :cutoff].reshape(batch, -1, ratio, self.head_dim)
             score = score[:, :cutoff].reshape(batch, -1, ratio, self.head_dim)
             kv = (kv * mx.softmax(score, axis=2)).sum(axis=2)
         else:
-            self._grow_state(batch)
+            self._grow_state(batch, cache)
             pooled = []
-            for i in range(seqlen):
-                pos = start_pos + i
+            for n in range(seqlen):
+                pos = start_pos + n
                 slot = pos % ratio
-                self._push_undo(batch, slot)
-                self._kv_state = self._write_slot(
-                    self._kv_state, batch, slot, kv[:, i : i + 1, :]
+                self._push_undo(batch, slot, cache)
+                cache.kv_state[i] = self._write_slot(
+                    cache.kv_state[i], batch, slot, kv[:, n : n + 1, :]
                 )
-                self._score_state = self._write_slot(
-                    self._score_state, batch, slot, score[:, i : i + 1, :]
+                cache.score_state[i] = self._write_slot(
+                    cache.score_state[i], batch, slot, score[:, n : n + 1, :]
                 )
                 if (pos + 1) % ratio == 0:
                     pooled.append(
                         (
-                            self._kv_state[:batch]
-                            * mx.softmax(self._score_state[:batch], axis=1)
+                            cache.kv_state[i][:batch]
+                            * mx.softmax(cache.score_state[i][:batch], axis=1)
                         ).sum(axis=1, keepdims=True)
                     )
             should_compress = bool(pooled)
@@ -933,7 +845,7 @@ class DeepseekV41Block(nn.Module):
         start_pos: int,
         pre_mix: mx.array,
         image_mask: Optional[mx.array],
-        shared: SharedIndexState,
+        cache: "DeepseekV41Cache",
     ):
         residual = h
         attn_pre, attn_post, attn_comb = self.hc_mixes(
@@ -941,7 +853,7 @@ class DeepseekV41Block(nn.Module):
         )
         x = self.hc_pre(h, pre_mix)
         x = self.attn_norm(x)
-        x = self.attn(x, start_pos, shared)
+        x = self.attn(x, start_pos, cache)
         x = hc_expand(x, residual, attn_post, attn_comb)
 
         residual = x
@@ -969,62 +881,131 @@ class ParallelHead(nn.Module):
 
 
 class DeepseekV41Cache:
-    """Generation state: shared cross-layer handoff plus the token offset.
+    """Everything one generation owns: per-layer buffers and the cross-layer handoff.
 
-    Layer caches live inside the modules (growing underscore attributes, like the
-    reference buffers); this object only carries what must cross call boundaries.
-    A zero offset marks a fresh generation and resets module state on entry.
+    Layer state lives here rather than on the modules so that two generations can
+    run against one model without overwriting each other, and so the whole thing
+    can be snapshotted and restored. Layers run in order and every index source
+    writes its handoff before its consumers read it.
     """
 
-    def __init__(self):
-        self.shared = SharedIndexState()
+    N_SLOTS = 5
+
+    def __init__(self, n_layers: int = 0, ratios=()):
         self.offset = 0
-        self._model = None
+        self.n_layers = n_layers
+        self.ratios = list(ratios)
+        self.undo = [[] for _ in range(n_layers)]
+        self.window = [None] * n_layers
+        self.compress = [None] * n_layers
+        self.keys = [None] * n_layers
+        self.kv_state = [None] * n_layers
+        self.score_state = [None] * n_layers
+        self.engram = None
+        self.reset_handoff()
+
+    def reset_handoff(self):
+        """Clear the per-forward handoff so a step cannot read last step's values."""
+        self.index_k = None
+        self.candidates = None
+        self.compress_kv = None
+        self.topk_idxs = None
+
+    @property
+    def _slots(self):
+        return (self.window, self.compress, self.keys, self.kv_state, self.score_state)
 
     @property
     def state(self):
-        """Arrays the generator materializes between prefill chunks.
+        """Every buffer, in a fixed order, with empties standing in for unset slots.
 
-        Layer state lives inside the modules, so surface it here; evaluating it
-        per chunk is what keeps a long prefill from becoming one command buffer.
+        The generator evaluates this between prefill chunks to keep a long prompt
+        from becoming one command buffer, so it cannot contain ``None``.
         """
-        model = self._model
-        if model is None:
-            return []
-        arrays = []
-        for layer in model.layers:
-            attn = layer.attn
-            for array in (attn._window_cache, attn._compress_cache):
-                if array is not None:
-                    arrays.append(array)
-            if attn.indexer is not None and attn.indexer._k_cache is not None:
-                arrays.append(attn.indexer._k_cache)
-            if attn.compressor is not None:
-                for array in (
-                    attn.compressor._kv_state,
-                    attn.compressor._score_state,
-                ):
-                    if array is not None:
-                        arrays.append(array)
-        engram = model.engram_hash
-        if engram is not None and engram._cache is not None:
-            arrays.append(engram._cache)
-        return arrays
+        flat = [array for slot in self._slots for array in slot] + [self.engram]
+        return [mx.zeros((0,)) if array is None else array for array in flat]
+
+    @state.setter
+    def state(self, value):
+        value = list(value)
+        n = (len(value) - 1) // self.N_SLOTS
+        self.n_layers = n
+        restored = [
+            [None if array.size == 0 else array for array in value[i * n : (i + 1) * n]]
+            for i in range(self.N_SLOTS)
+        ]
+        (
+            self.window,
+            self.compress,
+            self.keys,
+            self.kv_state,
+            self.score_state,
+        ) = restored
+        self.engram = None if value[-1].size == 0 else value[-1]
+        self.undo = [[] for _ in range(n)]
+        self.reset_handoff()
+
+    @property
+    def meta_state(self):
+        return (str(self.offset), ",".join(str(r) for r in self.ratios))
+
+    @meta_state.setter
+    def meta_state(self, value):
+        self.offset = int(value[0])
+        self.ratios = [int(r) for r in value[1].split(",") if r]
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        cache = cls.__new__(cls)
+        cache.state = state
+        cache.meta_state = meta_state
+        return cache
+
+    def is_trimmable(self) -> bool:
+        return True
+
+    def _restore_slots(self, layer: int, n: int):
+        """Put back the compressor slots the last ``n`` positions overwrote."""
+        undo = self.undo[layer]
+        for _ in range(min(int(n), len(undo))):
+            slot, batch, kv, score = undo.pop()
+            for buffers, value in ((self.kv_state, kv), (self.score_state, score)):
+                state = buffers[layer]
+                if value is None or state is None:
+                    continue
+                parts = []
+                if slot > 0:
+                    parts.append(state[:batch, :slot])
+                parts.append(value)
+                if slot + 1 < state.shape[1]:
+                    parts.append(state[:batch, slot + 1 :])
+                head = mx.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
+                buffers[layer] = (
+                    mx.concatenate([head, state[batch:]], axis=0)
+                    if state.shape[0] > batch
+                    else head
+                )
 
     def trim(self, n: int) -> int:
         """Drop the last `n` appended tokens so a speculative block rolls back.
 
-        The framework calls this with the rejected-token count on commit and
-        the whole-block advance on abort. Prefix-addressed buffers truncate;
-        the compressor's slot state is position-addressed and rewrites itself
-        on resume, so it needs no trim.
+        The framework calls this with the rejected-token count on commit and the
+        whole-block advance on abort. Prefix-addressed buffers truncate; the
+        compressor's slots are position-addressed, so a block that crossed a
+        compression boundary has to put back what it overwrote.
         """
         n = min(self.offset, int(n))
         if n <= 0:
             return 0
         self.offset -= n
-        if self._model is not None:
-            self._model._trim_caches(self.offset, n)
+        for layer in range(len(self.window)):
+            if self.window[layer] is not None:
+                self.window[layer] = self.window[layer][:, : self.offset]
+            ratio = self.ratios[layer] if layer < len(self.ratios) else 0
+            if ratio and self.compress[layer] is not None:
+                self.compress[layer] = self.compress[layer][:, : self.offset // ratio]
+            self._restore_slots(layer, n)
+        self.reset_handoff()
         return n
 
 
@@ -1084,29 +1065,11 @@ class LanguageModel(nn.Module):
         )
 
     def make_cache(self):
-        cache = DeepseekV41Cache()
-        cache._model = self
-        return [cache]
-
-    def _trim_caches(self, offset: int, n: int = 0):
-        for layer in self.layers:
-            attn = layer.attn
-            attn._cache_len = min(attn._cache_len, offset)
-            if n and attn.compressor is not None:
-                attn.compressor.undo(n)
-            if attn._window_cache is not None:
-                attn._window_cache = attn._window_cache[:, :offset]
-            if attn.compress_ratio and attn._compress_cache is not None:
-                attn._compress_cache = attn._compress_cache[
-                    :, : offset // attn.compress_ratio
-                ]
-            indexer = attn.indexer
-            if indexer is not None and indexer._k_cache is not None:
-                indexer._k_cache = indexer._k_cache[
-                    :, : offset // indexer.compress_ratio
-                ]
-        if self.engram_hash is not None and self.engram_hash._cache is not None:
-            self.engram_hash._cache = self.engram_hash._cache[:, :offset]
+        return [
+            DeepseekV41Cache(
+                len(self.layers), [l.attn.compress_ratio for l in self.layers]
+            )
+        ]
 
     def chunked_prefill_policy(
         self,
@@ -1137,27 +1100,6 @@ class LanguageModel(nn.Module):
             (prefill_kwargs or {}).get("capture_layer_ids")
         )
 
-    def _reset_caches(self):
-        """Drop every per-generation buffer that lives on a module.
-
-        The engram hash state is one of them: it keeps a token history across
-        the prefill/decode split, and at ``start_pos == 0`` it preserves any
-        tail longer than the new prompt. Leaving it in place makes a generation
-        depend on the one before it.
-        """
-        if self.engram_hash is not None:
-            self.engram_hash._cache = None
-        for layer in self.layers:
-            layer.attn._window_cache = None
-            layer.attn._compress_cache = None
-            layer.attn._cache_len = 0
-            if layer.attn.indexer is not None:
-                layer.attn.indexer._k_cache = None
-            if layer.attn.compressor is not None:
-                layer.attn.compressor._kv_state = None
-                layer.attn.compressor._score_state = None
-                layer.attn.compressor._undo.clear()
-
     def __call__(
         self,
         input_ids: Optional[mx.array] = None,
@@ -1177,10 +1119,15 @@ class LanguageModel(nn.Module):
         and a chunked prompt encodes differently from an unchunked one.
         `n_to_process` is implied by the slice and is not needed.
         """
-        entry = cache[0] if cache else DeepseekV41Cache()
+        entry = (
+            cache[0]
+            if cache
+            else DeepseekV41Cache(
+                len(self.layers), [l.attn.compress_ratio for l in self.layers]
+            )
+        )
+        entry.reset_handoff()
         start_pos = entry.offset
-        if start_pos == 0:
-            self._reset_caches()
         if input_ids is None:
             input_ids = inputs
         if inputs_embeds is None:
@@ -1195,13 +1142,12 @@ class LanguageModel(nn.Module):
         if engram_hashes is None and input_ids is not None:
             self._ensure_engram_hash()
             if self.engram_hash is not None:
-                engram_hashes = self.engram_hash(input_ids, start_pos)
+                engram_hashes = self.engram_hash(input_ids, start_pos, entry)
         main_hiddens = []
         capture_ids = (
             self.target_layer_ids if capture_layer_ids is None else capture_layer_ids
         )
         pre_mix = make_identity_pre_mix(batch, seqlen, self.config.hc_mult)
-        shared = entry.shared
         for i, layer in enumerate(self.layers):
             if layer.engram is not None and engram_hashes is not None:
                 h = layer.engram(
@@ -1211,7 +1157,7 @@ class LanguageModel(nn.Module):
                 )
             if i in capture_ids:
                 main_hiddens.append(h.mean(axis=2))
-            h, pre_mix = layer(h, start_pos, pre_mix, image_mask, shared)
+            h, pre_mix = layer(h, start_pos, pre_mix, image_mask, entry)
         h = DeepseekV41Block.hc_pre(h, pre_mix)
         logits = self.head(self.norm(h))
         entry.offset = start_pos + seqlen
