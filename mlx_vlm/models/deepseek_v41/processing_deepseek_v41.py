@@ -1,7 +1,8 @@
 import base64
 import io
+import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional, Tuple
 from urllib.request import urlopen
@@ -73,7 +74,12 @@ def num_image_tokens(n_llm_h: int, n_llm_w: int) -> int:
 def llm_grid(
     best_height: int, best_width: int, patch_size: int, downsample_ratio: int
 ) -> Tuple[int, int]:
-    """Token grid the aligner produces from a patch grid of this pixel size."""
+    """Token grid the aligner produces from a patch grid of this pixel size.
+
+    Callers size images to a multiple of ``patch_size * downsample_ratio`` so
+    this divides exactly; the aligner truncates, and a grid it rounds down would
+    leave span slots with no feature behind them.
+    """
     return math.ceil((best_height // patch_size) / downsample_ratio), math.ceil(
         (best_width // patch_size) / downsample_ratio
     )
@@ -100,8 +106,8 @@ def solve_resize_ratio(
         math.floor(max_h_float) * cell / height,
     )
     return (
-        math.floor(height * beta / patch_size) * patch_size,
-        math.floor(width * beta / patch_size) * patch_size,
+        math.floor(height * beta / cell) * cell,
+        math.floor(width * beta / cell) * cell,
     )
 
 
@@ -141,8 +147,9 @@ def plan_image_grid(
         ratio = (config.vision_min_pixels / (width * height)) ** 0.5
         width = int(width * ratio)
         height = int(height * ratio)
-    best_width = math.ceil(width / p) * p
-    best_height = math.ceil(height / p) * p
+    cell = p * config.vision_downsample_ratio
+    best_width = math.ceil(width / cell) * cell
+    best_height = math.ceil(height / cell) * cell
     return safe_resize(
         height,
         width,
@@ -186,10 +193,17 @@ def load_image_bytes(record) -> bytes:
 
 
 def load_image(record, config: ModelConfig) -> Tuple[mx.array, int, int, int, int]:
-    """Load and transform one image record into ViT patches."""
+    """Load and transform one image into ViT patches.
+
+    Accepts an already-decoded PIL image or a record naming bytes, base64 or a
+    URL; callers upstream of the processor hand over the former.
+    """
     p = config.vision_patch_size
-    with Image.open(io.BytesIO(load_image_bytes(record))) as source:
-        image = source.convert("RGB")
+    if isinstance(record, Image.Image):
+        image = record.convert("RGB")
+    else:
+        with Image.open(io.BytesIO(load_image_bytes(record))) as source:
+            image = source.convert("RGB")
     n_llm_h, n_llm_w, best_height, best_width = plan_image_grid(
         image.width, image.height, config
     )
@@ -252,6 +266,23 @@ def prepare_vl_inputs(
     return tokens, token_types, image_inputs
 
 
+def load_deepseek_v41_config(model_path) -> Optional[ModelConfig]:
+    """The model config, which the processor needs to lay out image spans."""
+    local_path = Path(model_path)
+    if local_path.exists():
+        source = local_path / "config.json"
+        if not source.exists():
+            return None
+        return ModelConfig.from_dict(json.loads(source.read_text(encoding="utf-8")))
+    try:
+        from huggingface_hub import hf_hub_download
+
+        source = hf_hub_download(repo_id=str(model_path), filename="config.json")
+    except Exception:
+        return None
+    return ModelConfig.from_dict(json.loads(Path(source).read_text(encoding="utf-8")))
+
+
 def load_deepseek_v41_chat_template(model_path, **kwargs) -> Optional[str]:
     local_path = Path(model_path)
     if local_path.exists():
@@ -282,8 +313,15 @@ class DeepseekV41Processor(ProcessorMixin):
     attributes = ["tokenizer"]
     tokenizer_class = "AutoTokenizer"
 
-    def __init__(self, tokenizer, chat_template: Optional[str] = None, **kwargs):
+    def __init__(
+        self,
+        tokenizer,
+        chat_template: Optional[str] = None,
+        config: Optional[ModelConfig] = None,
+        **kwargs,
+    ):
         self.tokenizer = tokenizer
+        self.config = config
         chat_template = (
             chat_template
             or getattr(tokenizer, "chat_template", None)
@@ -313,8 +351,51 @@ class DeepseekV41Processor(ProcessorMixin):
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)
 
-    def __call__(self, *args, **kwargs):
-        return self.tokenizer(*args, **kwargs)
+    def __call__(self, text=None, images=None, **kwargs):
+        """Tokenize, and expand each image placeholder into its image span.
+
+        ``pixel_values`` comes back as one list of ``ImageInput`` per row, which
+        is what the model's image merge walks. Rows are left-padded to a common
+        length, so every span offset moves with its row.
+        """
+        if images is None or (hasattr(images, "__len__") and len(images) == 0):
+            return self.tokenizer(text, **kwargs)
+        if self.config is None:
+            raise ValueError(
+                "DeepseekV41Processor needs the model config to place images; "
+                "build it with from_pretrained()."
+            )
+
+        prompts = [text] if isinstance(text, str) else list(text)
+        records = images if isinstance(images, list) else [images]
+        pending = iter(records)
+
+        rows, spans = [], []
+        for prompt in prompts:
+            ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+            wanted = sum(token == self.config.image_token_id for token in ids)
+            tokens, _, image_inputs = prepare_vl_inputs(
+                ids, [next(pending) for _ in range(wanted)], self.config
+            )
+            rows.append(tokens)
+            spans.append(image_inputs)
+
+        width = max(len(row) for row in rows)
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id or 0
+        padded, masks, shifted = [], [], []
+        for row, image_inputs in zip(rows, spans):
+            left = width - len(row)
+            padded.append([pad_id] * left + row)
+            masks.append([0] * left + [1] * len(row))
+            shifted.append(
+                [replace(img, start=img.start + left) for img in image_inputs]
+            )
+
+        return {
+            "input_ids": mx.array(padded),
+            "attention_mask": mx.array(masks),
+            "pixel_values": shifted,
+        }
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
@@ -334,7 +415,11 @@ class DeepseekV41Processor(ProcessorMixin):
                 pretrained_model_name_or_path,
                 **kwargs,
             )
-        return cls(tokenizer=tokenizer, chat_template=chat_template)
+        return cls(
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            config=load_deepseek_v41_config(pretrained_model_name_or_path),
+        )
 
 
 install_auto_processor_patch("deepseek_v41", DeepseekV41Processor)
@@ -346,6 +431,7 @@ __all__ = [
     "ImageInput",
     "image_token_types",
     "load_deepseek_v41_chat_template",
+    "load_deepseek_v41_config",
     "load_image",
     "num_image_tokens",
     "plan_image_grid",
