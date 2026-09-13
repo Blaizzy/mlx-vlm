@@ -5651,9 +5651,38 @@ def test_deepseek_v41_dspark_draft_block():
     assert logits.shape == (1, 2, 64)
     output_ids = drafter.draft_block(bonus, main_hidden, cache, 3, sampler)
     mx.eval(output_ids)
-    assert output_ids.shape == (1, 2)
+    assert output_ids.shape[0] == 1
+    assert 1 <= output_ids.shape[1] <= 2
     assert bool(mx.all(output_ids >= 0))
     assert bool(mx.all(output_ids < 64))
+
+
+def test_deepseek_v41_dspark_confidence_truncates_the_block():
+    """A threshold the head cannot meet must shorten the proposal, never empty it."""
+    from mlx_vlm.models import deepseek_v41
+    from mlx_vlm.speculative.drafters.deepseek_v41_dspark.deepseek_v41_dspark import (
+        DeepseekV41DsparkDraftModel,
+    )
+
+    text_config = _tiny_v41_text_config()
+    target = deepseek_v41.Model(text_config)
+    mx.eval(target.parameters())
+    config = _tiny_v41_dspark_config(text_config)
+    sampler = lambda logits: mx.argmax(logits, axis=-1)
+    main_hidden = mx.random.normal((1, 4, 16))
+
+    widths = {}
+    for threshold in (None, 1.01):
+        config.confidence_threshold = threshold
+        drafter = DeepseekV41DsparkDraftModel(config)
+        mx.eval(drafter.parameters())
+        cache = drafter.reset(target)
+        out = drafter.draft_block(mx.array([3]), main_hidden, cache, 3, sampler)
+        mx.eval(out)
+        widths[threshold] = out.shape[1]
+
+    assert widths[None] == 2
+    assert widths[1.01] == 1
 
 
 def test_deepseek_v41_drafter_sanitize_stacks_experts():
@@ -5688,4 +5717,4 @@ def test_deepseek_v41_drafter_sanitize_markov():
     out = drafter.sanitize(weights)
     assert "markov_head.markov_w1.weight" in out
     assert "markov_head.markov_w2.weight" in out
-    assert not any(k.startswith("confidence_head.") for k in out)
+    assert "confidence_head.proj.weight" in out

@@ -14,6 +14,7 @@ accumulating attention context, and the drafted block — seeded with
 the stages single-pass style, carried internally from an identity start.
 """
 
+from dataclasses import replace
 from typing import Callable, List
 
 import mlx.core as mx
@@ -22,9 +23,7 @@ import mlx.nn as nn
 from ....models.base import scaled_dot_product_attention
 from ....models.cache import RotatingKVCache
 from ....models.deepseek_v4.language import DeepseekV4RoPE
-from ....models.deepseek_v41.dspark import (  # noqa: F401 (documents the unused native head)
-    DSparkConfidenceHead,
-)
+from ....models.deepseek_v41.dspark import DSparkConfidenceHead
 from ....models.deepseek_v41.language import (
     DeepseekV41Block,
     DeepseekV41MoE,
@@ -235,6 +234,9 @@ class DeepseekV41DsparkDraftModel(nn.Module):
             for stage_id in range(config.n_mtp_layers)
         ]
         self.markov_head = VanillaMarkov(config.vocab_size, config.markov_rank)
+        self.confidence_head = DSparkConfidenceHead(
+            replace(text_config, dspark_markov_rank=config.markov_rank)
+        )
 
         self._input_embed = None
         self._lm_head_fn = None
@@ -313,7 +315,17 @@ class DeepseekV41DsparkDraftModel(nn.Module):
         target_hidden: mx.array,
         cache: List[RotatingKVCache],
     ) -> mx.array:
+        """Run the draft stack over `inputs`, conditioned on the target hidden.
+
+        The context is clipped to ``draft_window_size`` rows. The release seeds
+        its ring with only the last `window_size`, while a rotating cache keeps
+        its whole first push and trims only later, which would otherwise leave
+        the opening round attending to the entire prompt.
+        """
         first = self.stages[0]
+        window = int(self.config.draft_window_size or 0)
+        if window and target_hidden.shape[1] > window:
+            target_hidden = target_hidden[:, -window:, :]
         main_x = first.main_norm(first.main_proj(target_hidden))
 
         h = self._input_embed(inputs)
@@ -361,12 +373,45 @@ class DeepseekV41DsparkDraftModel(nn.Module):
             dtype=token_dtype,
         )
         draft_inputs = mx.concatenate([anchor[:, None], masks], axis=1)
-        base_logits = self._logits(self._hidden(draft_inputs, hidden, cache))
-        return self.markov_head.sample_block(
-            base_logits,
+        draft_hidden = self._hidden(draft_inputs, hidden, cache)
+        proposal = self.markov_head.sample_block(
+            self._logits(draft_hidden),
             first_prev_tokens=anchor,
             sampler=sampler,
         ).astype(token_dtype)
+        return proposal[:, : self._confident_width(draft_hidden, anchor, proposal)]
+
+    def _confident_width(
+        self, draft_hidden: mx.array, anchor: mx.array, proposal: mx.array
+    ) -> int:
+        """How many leading proposals the confidence head vouches for.
+
+        A wide block costs its full verification whether or not the tail is
+        usable, so the release scores each position and stops at the first one
+        below threshold. At least one token is always proposed: a single
+        proposal is cheaper than the round already spent drafting it. Batched
+        rows take the shortest run, since the loop verifies one width.
+        """
+        threshold = self.config.confidence_threshold
+        width = int(proposal.shape[1])
+        if threshold is None or width <= 1:
+            return width
+        previous = mx.concatenate([anchor[:, None], proposal[:, :-1]], axis=1)
+        scores = mx.sigmoid(
+            self.confidence_head(
+                draft_hidden, self.markov_head.get_prev_embeddings(previous)
+            )
+        )
+        mx.eval(scores)
+        keep = width
+        for row in scores.tolist():
+            run = 0
+            for value in row:
+                if value < threshold:
+                    break
+                run += 1
+            keep = min(keep, run)
+        return max(1, keep)
 
     def sanitize(self, weights: dict) -> dict:
         """Map the ``mtp.<stage>.*`` checkpoint layout onto the drafter.
@@ -388,8 +433,11 @@ class DeepseekV41DsparkDraftModel(nn.Module):
             m = markov_re.match(key)
             slot = "markov_w1" if m.group(1) == "embed" else "markov_w2"
             weights[f"markov_head.{slot}.{m.group(2)}"] = weights.pop(key)
-        confidence_re = re.compile(r"^(?:stages\.\d+\.)?confidence_head\.")
-        weights = {k: v for k, v in weights.items() if not confidence_re.match(k)}
+        confidence_re = re.compile(r"^(?:stages\.\d+\.)?confidence_head\.(.+)$")
+        for key in [k for k in weights if confidence_re.match(k)]:
+            weights[f"confidence_head.{confidence_re.match(key).group(1)}"] = (
+                weights.pop(key)
+            )
         stages = {
             int(m.group(1))
             for k in weights

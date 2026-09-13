@@ -26,6 +26,11 @@ class DeepseekV41DsparkConfig(BaseModelConfig):
     ``runtime_block_size`` defaults to a single proposal: exact verification
     pays for each retained attention window, and a wider default spends most of
     that work on rejected tails. An explicit width still takes precedence.
+
+    ``confidence_threshold`` truncates a proposal at the first position the
+    native confidence head scores below it, which is how the release keeps a
+    wide draft block from costing more than it returns. Set it to ``None`` to
+    propose the full block.
     """
 
     model_type: str = "deepseek_v41_dspark"
@@ -40,6 +45,7 @@ class DeepseekV41DsparkConfig(BaseModelConfig):
     block_size_policy: str = "fixed"
     dflash_initial_block_size: Optional[int] = None
     draft_window_size: Optional[int] = None
+    confidence_threshold: Optional[float] = 0.7
     tie_word_embeddings: bool = False
 
     def __post_init__(self):
