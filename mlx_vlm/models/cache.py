@@ -446,7 +446,8 @@ class KVCache(_BaseCache):
 
     @property
     def state(self):
-        if self.offset == self.keys.shape[2]:
+        # Cross-attention layers may leave their cache empty during prefill.
+        if self.keys is None or self.offset == self.keys.shape[2]:
             return self.keys, self.values
         else:
             return (
@@ -1467,7 +1468,7 @@ class BatchKVCache(_BaseCache):
     @property
     def state(self):
         k, v = self.keys, self.values
-        if self._idx < k.shape[2]:
+        if k is not None and self._idx < k.shape[2]:
             k = k[..., : self._idx, :]
             v = v[..., : self._idx, :]
         return k, v, self.offset, self.left_padding

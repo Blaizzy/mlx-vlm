@@ -481,6 +481,13 @@ def generate_step(
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
             processed_tokens = 0
+            # Cross-attention masks index text queries on axis 2. Keep those
+            # rows aligned with each chunk, including the final token in _step.
+            cross_attention_keys = [
+                k
+                for k in _CROSS_ATTENTION_PROMPT_KWARGS
+                if isinstance(kwargs.get(k), mx.array)
+            ]
             with tqdm(
                 total=total_tokens, desc="Prefill", unit="tok", disable=not verbose
             ) as pbar:
@@ -492,6 +499,10 @@ def generate_step(
                     ):
                         n_to_process = checkpoint_lengths[0] - processed_tokens
                     chunk_kwargs = {**kwargs, **speculative_prefill.kwargs}
+                    for key in cross_attention_keys:
+                        chunk_kwargs[key] = _slice_sequence_aligned_prompt_kwarg(
+                            key, kwargs[key], stop=n_to_process
+                        )
                     if getattr(model.language_model, "supports_logits_to_keep", False):
                         chunk_kwargs = {**chunk_kwargs, "logits_to_keep": 1}
                     chunk_output = model.language_model(
@@ -511,6 +522,10 @@ def generate_step(
                         checkpoint_lengths.pop(0)
                     inputs_embeds = inputs_embeds[:, n_to_process:]
                     input_ids = input_ids[:, n_to_process:]
+                    for key in cross_attention_keys:
+                        kwargs[key] = _slice_sequence_aligned_prompt_kwarg(
+                            key, kwargs[key], start=n_to_process
+                        )
                     mx.clear_cache()
                     pbar.update(n_to_process)
 
@@ -605,13 +620,17 @@ def _right_pad_prompts(prompts, max_length=None):
     return mx.array([list(p) + [0] * (max_length - len(p)) for p in prompts])
 
 
-_SEQUENCE_ALIGNED_PROMPT_KWARGS = {
+_CROSS_ATTENTION_PROMPT_KWARGS = {
+    "cross_attention_mask",
+    "full_text_row_masked_out_mask",
+}
+
+_SEQUENCE_ALIGNED_PROMPT_KWARGS = _CROSS_ATTENTION_PROMPT_KWARGS | {
     "attention_mask",
     "decoder_inputs_embeds",
     "deepstack_visual_embeds",
     "visual_pos_masks",
     "per_layer_inputs",
-    "full_text_row_masked_out_mask",
     "position_ids",
     "pos_hw",
     "mm_token_type_ids",
@@ -747,20 +766,27 @@ def _unpad_batch_prompts(
     return unpadded_prompts, prompt_kwargs
 
 
+def _prompt_kwarg_sequence_axis(key: str, v: mx.array) -> int:
+    if _is_mrope_position_ids_prompt_kwarg(key, v) or (
+        key in _CROSS_ATTENTION_PROMPT_KWARGS and v.ndim == 4
+    ):
+        return 2
+    return 1
+
+
 def _is_sequence_aligned_prompt_kwarg(
     key: str, v: mx.array, sequence_length: int
 ) -> bool:
     if key not in _SEQUENCE_ALIGNED_PROMPT_KWARGS:
         return False
-    if _is_mrope_position_ids_prompt_kwarg(key, v):
-        return v.shape[2] == sequence_length
-    return v.ndim >= 2 and v.shape[1] == sequence_length
+    axis = _prompt_kwarg_sequence_axis(key, v)
+    return v.ndim > axis and v.shape[axis] == sequence_length
 
 
 def _pad_sequence_aligned_prompt_kwarg(
     key: str, v: mx.array, target_length: int, *, left: bool
 ) -> mx.array:
-    sequence_axis = 2 if _is_mrope_position_ids_prompt_kwarg(key, v) else 1
+    sequence_axis = _prompt_kwarg_sequence_axis(key, v)
     pad = target_length - v.shape[sequence_axis]
     if pad <= 0:
         return v
@@ -775,7 +801,7 @@ def _pad_sequence_aligned_prompt_kwarg(
 def _slice_sequence_aligned_prompt_kwarg(
     key: str, v: mx.array, start: Optional[int] = None, stop: Optional[int] = None
 ) -> mx.array:
-    sequence_axis = 2 if _is_mrope_position_ids_prompt_kwarg(key, v) else 1
+    sequence_axis = _prompt_kwarg_sequence_axis(key, v)
     slices = [slice(None)] * v.ndim
     slices[sequence_axis] = slice(start, stop)
     return v[tuple(slices)]

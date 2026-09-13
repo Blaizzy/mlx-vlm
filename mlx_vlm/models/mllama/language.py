@@ -314,7 +314,7 @@ class MllamaTextModel(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None:
-            mask = create_attention_mask(hidden_states, cache)
+            mask = create_attention_mask(hidden_states, cache[0])
 
         for idx, (decoder_layer, c) in enumerate(zip(self.layers, cache)):
             if idx in self.config.cross_attention_layers:
