@@ -589,23 +589,20 @@ def parse_arguments():
         "--draft-model",
         type=str,
         default=None,
-        help="Speculative drafter path or HF id (e.g. z-lab/Qwen3.5-4B-DFlash).",
+        help="Native MTP checkpoint path or HF id (GLM-5.3-Flash or Qwen3.5).",
     )
     parser.add_argument(
         "--draft-kind",
         type=str,
         default=None,
-        choices=["dflash", "eagle3", "mtp"],
-        help="Drafter family. Supported: 'dflash' (Qwen3.5 DFlash), "
-        "'eagle3' (Speculators/SGLang EAGLE-3), "
-        "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model). "
-        "Default: auto-detected from the drafter's HF model_type.",
+        choices=["mtp"],
+        help="Speculative method (native MTP).",
     )
     parser.add_argument(
         "--draft-block-size",
         type=int,
         default=None,
-        help="Override the drafter's configured block size.",
+        help="Verification block size: number of draft tokens plus one (default: 2).",
     )
     parser.add_argument(
         "--enable-thinking",
@@ -785,7 +782,14 @@ def _prefix_cache_trim_amount(kv_cache: List[Any], prefix_len: int) -> Optional[
     evicted part of the prefix, or holds untrimmable state (e.g. the ``ArraysCache``
     of hybrid/linear-attention layers), and the caller must cold-prefill instead.
     """
-    cached_len = max((int(getattr(c, "offset", 0) or 0) for c in kv_cache), default=0)
+
+    def cache_length(entry):
+        children = getattr(entry, "caches", None)
+        if children is not None:
+            return max((cache_length(c) for c in children), default=0)
+        return int(getattr(entry, "offset", 0) or 0)
+
+    cached_len = max((cache_length(c) for c in kv_cache), default=0)
     n_drop = max(0, cached_len - prefix_len)
     if n_drop and not all(
         c.is_trimmable() and _cache_fully_retained(c) for c in kv_cache
@@ -896,6 +900,8 @@ def stream_generate(
     # Prompt cache reuse: skip common prefix from previous turn
     reused_prefix_len = 0
     full_input_ids_list = input_ids.flatten().tolist()
+    if kwargs.get("draft_model") is not None:
+        kwargs["full_prompt_tokens"] = input_ids
     apc_blocks_in_use: List[_apc.APCBlock] = []
     apc_extra_hash = 0
     apc_coordinator: Optional[_apc.APCCoordinator] = None
@@ -946,6 +952,11 @@ def stream_generate(
             processor=processor,
         )
 
+    speculative_holder = {}
+    if kwargs.get("draft_model") is not None:
+        kwargs["speculative_cache_callback"] = lambda state: speculative_holder.update(
+            state=state
+        )
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
         kv_cache = prompt_cache_state.cache
@@ -1059,7 +1070,7 @@ def stream_generate(
             def exact_checkpoint(prefix_len: int, prompt_cache: List[Any]) -> None:
                 apc_coordinator.store_checkpoint(
                     full_input_ids_list[: reused_prefix_len + prefix_len],
-                    prompt_cache,
+                    list(prompt_cache),
                     extra_hash=apc_extra_hash,
                 )
 
@@ -1078,41 +1089,75 @@ def stream_generate(
 
         generated_tokens = []
         finish_reason: Optional[str] = None
-        for n, (token, logprobs) in enumerate(gen):
-            if n == 0:
-                prompt_time = time.perf_counter() - tic
-                prompt_tps = total_prompt_tokens / prompt_time
-                tic = time.perf_counter()
+        try:
+            for n, (token, logprobs) in enumerate(gen):
+                if n == 0:
+                    prompt_time = time.perf_counter() - tic
+                    prompt_tps = total_prompt_tokens / prompt_time
+                    tic = time.perf_counter()
 
-            generated_tokens.append(token)
+                generated_tokens.append(token)
 
-            # Check thinking budget and force token if needed
-            if thinking_criteria is not None:
-                thinking_criteria(token)
+                # Check thinking budget and force token if needed
+                if thinking_criteria is not None and not hasattr(
+                    thinking_criteria, "make_logits_processor"
+                ):
+                    thinking_criteria(token)
 
-            # Stop generation if the token is in the eos_token_ids
-            if tokenizer.stopping_criteria(token):
-                finish_reason = "stop"
-                break
+                # Stop generation if the token is in the eos_token_ids
+                if tokenizer.stopping_criteria(token):
+                    finish_reason = "stop"
+                    break
 
-            detokenizer.add_token(token, skip_special_token_ids=skip_special_token_ids)
+                detokenizer.add_token(
+                    token, skip_special_token_ids=skip_special_token_ids
+                )
 
-            # Yield the last segment if streaming
-            yield GenerationResult(
-                text=detokenizer.last_segment,
-                token=token,
-                logprobs=logprobs,
-                prompt_tokens=total_prompt_tokens,
-                generation_tokens=n + 1,
-                total_tokens=total_prompt_tokens + n + 1,
-                prompt_tps=prompt_tps,
-                generation_tps=(n + 1) / (time.perf_counter() - tic),
-                peak_memory=mx.get_peak_memory() / 1e9,
-                cached_tokens=reused_prefix_len,
+                # Yield the last segment if streaming
+                yield GenerationResult(
+                    text=detokenizer.last_segment,
+                    token=token,
+                    logprobs=logprobs,
+                    prompt_tokens=total_prompt_tokens,
+                    generation_tokens=n + 1,
+                    total_tokens=total_prompt_tokens + n + 1,
+                    prompt_tps=prompt_tps,
+                    generation_tps=(n + 1) / (time.perf_counter() - tic),
+                    peak_memory=mx.get_peak_memory() / 1e9,
+                    cached_tokens=reused_prefix_len,
+                )
+            else:
+                # generate_step exhausted its budget without stopping_criteria firing.
+                finish_reason = "length"
+        finally:
+            close = getattr(gen, "close", None)
+            if close is not None:
+                close()
+            completed_cache = (
+                speculative_holder["state"].target
+                if "state" in speculative_holder
+                else tracked_cache
             )
-        else:
-            # generate_step exhausted its budget without stopping_criteria firing.
-            finish_reason = "length"
+            all_ids = full_input_ids_list + generated_tokens
+            cache_ids = (
+                all_ids[: int(speculative_holder["state"].position.item())]
+                if "state" in speculative_holder
+                else all_ids
+            )
+            if prompt_cache_state is not None and (
+                generated_tokens or "state" in speculative_holder
+            ):
+                prompt_cache_state.update(
+                    cache_ids,
+                    completed_cache,
+                )
+            if apc_coordinator is not None and "state" in speculative_holder:
+                apc_coordinator.commit(
+                    completed_cache,
+                    cache_ids,
+                    extra_hash=apc_extra_hash,
+                    blocks_in_use=apc_blocks_in_use,
+                )
 
         if not generated_tokens:
             prompt_time = time.perf_counter() - tic
@@ -1146,22 +1191,23 @@ def stream_generate(
             peak_memory=mx.get_peak_memory() / 1e9,
             cached_tokens=reused_prefix_len,
             finish_reason=finish_reason,
+            speculative_stats=(
+                speculative_holder["state"].stats[0].snapshot()
+                if "state" in speculative_holder
+                else None
+            ),
             token_ids=[
                 int(t.item()) if hasattr(t, "item") else int(t)
                 for t in generated_tokens
             ],
         )
 
-        # Save cache state for potential reuse on next turn
-        all_ids: Optional[List[int]] = None
-        if prompt_cache_state is not None:
-            all_ids = full_input_ids_list + [
-                t.item() if hasattr(t, "item") else t for t in generated_tokens
-            ]
-            prompt_cache_state.update(all_ids, tracked_cache)
-
         # APC: harvest new blocks from the post-generation KV state.
-        if apc_coordinator is not None and not apc_coordinator.is_checkpoint:
+        if (
+            apc_coordinator is not None
+            and not apc_coordinator.is_checkpoint
+            and "state" not in speculative_holder
+        ):
             try:
                 if all_ids is None:
                     all_ids = full_input_ids_list + [
@@ -1301,6 +1347,7 @@ def generate(
         generation_tps=last_response.generation_tps,
         peak_memory=last_response.peak_memory,
         cached_tokens=last_response.cached_tokens,
+        speculative_stats=last_response.speculative_stats,
         finish_reason=last_response.finish_reason,
         diffusion_canvas_tokens=last_response.diffusion_canvas_tokens,
         diffusion_denoising_steps=last_response.diffusion_denoising_steps,
@@ -1651,7 +1698,7 @@ def main():
             print(f"Audio written to {result.path}")
 
         if draft_model is not None:
-            stats = format_speculative_stats(draft_model)
+            stats = format_speculative_stats(result.speculative_stats)
             if stats is not None:
                 print(stats)
 

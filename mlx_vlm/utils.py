@@ -745,7 +745,7 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
         spec.loader.exec_module(arch)
         return arch, "custom"
 
-    raw_model_type = config.get("model_type") or config.get("speculators_model_type")
+    raw_model_type = config.get("model_type")
     if raw_model_type is None:
         raise KeyError("model_type")
     model_type = raw_model_type.lower()
@@ -753,20 +753,8 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
     architectures = set(config.get("architectures") or ())
-    dflash_config = config.get("dflash_config")
     if "BoundaryExtractor" in architectures:
         model_type = "gliner2_5"
-    elif "DFlash2DraftModel" in architectures:
-        model_type = "dflash2"
-    elif "Gemma4DSparkModel" in architectures:
-        model_type = "gemma4_dspark"
-    elif dflash_config is not None:
-        is_dspark = (
-            dflash_config.get("projector_type") == "dspark"
-            or int(config.get("markov_rank") or dflash_config.get("markov_rank") or 0)
-            > 0
-        )
-        model_type = "dspark" if is_dspark else f"{model_type}_dflash"
 
     last_err: Optional[ImportError] = None
     for pkg in ("mlx_vlm.models", "mlx_vlm.speculative.drafters"):
@@ -1185,6 +1173,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         mx.eval(model.parameters())
 
     model.model_path = model_path
+    if hasattr(model, "language_model"):
+        model.language_model.model_path = model_path
     model.eval()
     return model
 
@@ -2692,6 +2682,9 @@ class ThinkingBudgetCriteria:
         self.enable_thinking = enable_thinking
         self.prompt_preopens_thinking = prompt_preopens_thinking
 
+        self.thinking_start_token = thinking_start_token
+        self.thinking_end_token = thinking_end_token
+
         # Resolve token IDs from strings
         self.thinking_end_token_id = tokenizer.encode(
             thinking_end_token, add_special_tokens=False
@@ -2712,6 +2705,19 @@ class ThinkingBudgetCriteria:
         self.thinking_token_count = 0
         self.budget_exceeded = False
         self.forced_token_id = None
+
+    def make_logits_processor(self, prompt_length):
+        from .thinking import ThinkingBudgetLogitsProcessor
+
+        if not self.enable_thinking:
+            return None
+        return ThinkingBudgetLogitsProcessor(
+            self.thinking_budget,
+            self.tokenizer.encode(self.thinking_start_token, add_special_tokens=False),
+            self.tokenizer.encode(self.thinking_end_token, add_special_tokens=False),
+            prompt_length=prompt_length,
+            preopened=self.prompt_preopens_thinking,
+        )
 
     def reset_thinking_state(self):
         """Reset thinking state between generations."""

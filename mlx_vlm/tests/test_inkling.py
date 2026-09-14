@@ -2,16 +2,8 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_vlm.generate.ar import _make_cache
-from mlx_vlm.models.cache import ArraysCache, BatchKVCache, CacheList
 from mlx_vlm.models.inkling.config import TextConfig
-from mlx_vlm.models.inkling.language import (
-    LanguageModel,
-    _restore_cache_state,
-    _snapshot_cache_state,
-    banded_additive_mask,
-)
-from mlx_vlm.speculative.drafters.inkling_mtp import InklingMTPDraftModel
-from mlx_vlm.speculative.drafters.inkling_mtp.config import InklingMTPConfig
+from mlx_vlm.models.inkling.language import LanguageModel, banded_additive_mask
 
 
 def _tiny_text_config(num_hidden_layers=2):
@@ -136,38 +128,6 @@ def test_server_right_padded_prefill_preserves_conv_state():
 
     assert mx.allclose(batch_logits[0, 0], long_logits[0, 0], atol=3e-3).item()
     assert mx.allclose(batch_logits[1, 0], short_logits[0, 0], atol=3e-3).item()
-
-
-def test_empty_batch_cache_snapshot_restores_metadata():
-    cache = CacheList(BatchKVCache([0, 2]), ArraysCache(4, left_padding=[0, 2]))
-    snapshot = _snapshot_cache_state([cache])
-
-    keys = mx.ones((2, 1, 1, 4))
-    cache[0].update_and_fetch(keys, keys)
-    cache[1][0] = mx.ones((2, 3, 4))
-    cache[1].advance(1)
-    _restore_cache_state([cache], snapshot)
-
-    assert cache[0].keys is None
-    assert cache[0].offset.tolist() == [0, -2]
-    assert cache[0].left_padding.tolist() == [0, 2]
-    assert cache[0]._idx == 0
-    assert cache[1].cache == [None] * 4
-    assert cache[1].left_padding.tolist() == [0, 2]
-
-
-def test_mtp_eval_state_skips_empty_kv_caches():
-    config = InklingMTPConfig(
-        text_config=_tiny_text_config(1),
-        num_mtp_layers=2,
-        mtp_local_layer_ids=[0],
-    )
-    drafter = InklingMTPDraftModel(config)
-    drafter._cache = drafter.make_cache()
-
-    state = drafter.draft_eval_state()
-
-    assert len(state) == 4
 
 
 def test_audio_features_match_numpy_stft():

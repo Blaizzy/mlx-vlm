@@ -196,7 +196,7 @@ class Model(nn.Module):
             **kwargs,
         )
 
-        # Forward speculative-decoding hooks straight through to the LM.
+        # Forward optional hidden-state and shared-KV output requests.
         lm_kwargs = {
             k: kwargs[k]
             for k in (

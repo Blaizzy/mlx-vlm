@@ -400,6 +400,14 @@ class Glm5NextIndexer(nn.Module):
                 mx.zeros((batch, 1, q_length, 0), dtype=mx.bool_),
             )
             key_valid = valid_state[:, 0, :, 0].astype(mx.bool_)
+            # Padding slots can contain old flags after cache compaction.
+            # Interpret validity in the cache's logical layout, just as dense
+            # attention masks out its physical left-padding slots.
+            left_padding = getattr(cache, "left_padding", None)
+            if left_padding is not None:
+                key_valid = key_valid & (
+                    mx.arange(key_valid.shape[1])[None] >= left_padding[:, None]
+                )
 
             ready_k, ready_gate, _ = pool_cache.accumulate_windows(
                 k, gate.astype(k.dtype), offset
@@ -854,9 +862,7 @@ class LanguageModel(nn.Module):
         if draft_model is None:
             return True
         if draft_kind == "mtp":
-            return bool(prefill_kwargs.get("return_hidden", False)) and bool(
-                prefill_kwargs.get("return_shared_kv", False)
-            )
+            return bool(prefill_kwargs.get("return_hidden", False))
         return draft_kind is None
 
     def __call__(

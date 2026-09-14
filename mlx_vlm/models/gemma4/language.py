@@ -14,9 +14,6 @@ from ..base import (
 from ..cache import KVCache, RotatingKVCache
 from ..rope_utils import initialize_rope
 from .config import TextConfig
-from .speculative_verifier import Gemma4ExactSpeculativeVerifier
-
-_EXACT_SPECULATIVE_VERIFIER = Gemma4ExactSpeculativeVerifier()
 
 
 @partial(mx.compile, shapeless=True)
@@ -638,9 +635,7 @@ class Gemma4TextModel(nn.Module):
 
         # Match HF's `_can_record_outputs={"hidden_states": Gemma4TextDecoderLayer}`
         # — the recorded value is the LAST decoder layer's output, captured
-        # BEFORE the final RMSNorm. Speculative verification can reuse this
-        # hidden for deferred logits; MTP drafters normalize it via
-        # LanguageModel.speculative_draft_hidden before consuming it.
+        # BEFORE the final RMSNorm.
         if hidden_sink is not None and not capture_set:
             hidden_sink.append(h)
 
@@ -654,7 +649,6 @@ class Gemma4TextModel(nn.Module):
 
 class LanguageModel(nn.Module):
     supports_logits_to_keep = True
-    requires_uniform_batch_acceptance = True
 
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -668,12 +662,6 @@ class LanguageModel(nn.Module):
         if self.final_logit_softcapping is not None:
             logits = logit_softcap(self.final_logit_softcapping, logits)
         return logits
-
-    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
-        return self.logits_from_hidden(self.model.norm(hidden))
-
-    def speculative_draft_hidden(self, hidden: mx.array) -> mx.array:
-        return self.model.norm(hidden)
 
     def chunked_prefill_policy(
         self,
@@ -703,11 +691,7 @@ class LanguageModel(nn.Module):
                 return False
 
         if draft_model is not None:
-            return (
-                draft_kind == "mtp"
-                and bool(prefill_kwargs.get("return_hidden", False))
-                and bool(prefill_kwargs.get("return_shared_kv", False))
-            )
+            return False
 
         return True
 
@@ -721,16 +705,6 @@ class LanguageModel(nn.Module):
         capture_layer_ids: Optional[List[int]] = None,
         **kwargs,
     ):
-        if kwargs.pop("speculative_verify", False) and getattr(
-            self.config, "exact_speculative_verify", False
-        ):
-            return _EXACT_SPECULATIVE_VERIFIER(
-                self,
-                inputs,
-                cache=cache,
-                input_embeddings=inputs_embeds,
-                capture_layer_ids=capture_layer_ids,
-            )
 
         hidden_sink: Optional[list] = (
             []
@@ -764,55 +738,6 @@ class LanguageModel(nn.Module):
             hidden_states=hidden_sink,
             shared_kv_states=shared_kv_sink,
         )
-
-    def rollback_speculative_cache(
-        self,
-        caches: List[Any],
-        gdn_states: Any,
-        accepted: Any,
-        block_size: int,
-    ) -> int:
-        """Rewind target KV caches after a speculative-decoding round.
-
-        Gemma 4 has only KV/RotatingKV caches (no SSM/GDN), so this is a
-        simple trim + per-row tail-zero. ``gdn_states`` is accepted (and
-        ignored) for API parity with qwen3_5's hook.
-        """
-        del gdn_states  # API-parity placeholder; Gemma 4 has no SSM/GDN state.
-        if isinstance(accepted, int):
-            accepted = mx.array([accepted])
-        if isinstance(accepted, (list, tuple)):
-            accepted = mx.array(accepted, dtype=mx.int32)
-
-        max_a = int(accepted.max().item())
-        n = max_a + 1
-        trim = block_size - n
-        is_batch = accepted.size > 1
-        valid_ends = accepted + 1
-
-        for c in caches:
-            if c is None:
-                continue
-
-            if trim > 0 and hasattr(c, "trim"):
-                c.trim(trim)
-            if is_batch and hasattr(c, "_idx") and c.keys is not None and max_a > 0:
-                kv_len = c._idx
-                ve = valid_ends.tolist()
-                verify_start = kv_len - n
-                if any(
-                    verify_start + int(ve[bi]) < kv_len
-                    for bi in range(accepted.shape[0])
-                ):
-                    raise RuntimeError(
-                        "Gemma 4 batched speculative rollback requires uniform "
-                        f"per-row acceptance; got ragged accepts {accepted.tolist()}. "
-                        "Zeroing a rejected row's KV tail leaves phantom keys "
-                        "attended (issue #1962); set "
-                        "requires_uniform_batch_acceptance on the drafter or target "
-                        "so accepts are clamped before rollback."
-                    )
-        return max_a
 
     def sanitize(self, weights):
         sanitized = {}

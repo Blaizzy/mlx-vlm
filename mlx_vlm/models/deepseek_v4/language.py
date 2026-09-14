@@ -1140,7 +1140,7 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         ):
             h = layer(h, mask, layer_cache, inputs, causal=not has_image_tokens)
             if capture_set is not None and (self.start_idx + local_idx) in capture_set:
-                # DSpark taps the mean over the hyper-connection copies.
+                # Expose the mean over the hyperconnection copies.
                 capture_sink.append(h.mean(axis=2))
 
         if pipeline_rank != 0:
@@ -1164,7 +1164,6 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
 
 
 class LanguageModel(nn.Module):
-    requires_uniform_batch_acceptance = True
 
     def __init__(self, config: ModelConfig):
         super().__init__()

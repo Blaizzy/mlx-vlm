@@ -2,7 +2,6 @@ import math
 
 import mlx.core as mx
 import numpy as np
-import pytest
 
 import mlx_vlm.models.minimax_m3_vl.language as minimax_language
 from mlx_vlm.models.minimax_m3_vl.config import ModelConfig, TextConfig, VisionConfig
@@ -1312,40 +1311,6 @@ def test_minimax_m3_to_batch_preserves_warm_kv_and_index_cache():
     assert extracted.kv_cache.state[0].tolist() == keys.tolist()
     assert extracted.kv_cache.state[1].tolist() == values.tolist()
     assert extracted.index_keys.tolist() == index_keys.tolist()
-
-
-def test_minimax_m3_rollback_speculative_cache_trims_index_cache():
-    lm = LanguageModel(_tiny_minimax_text_config(num_hidden_layers=1))
-    cache = MiniMaxM3KVCache()
-    keys = mx.ones((1, 1, 5, 4), dtype=mx.float32)
-    values = mx.ones((1, 1, 5, 4), dtype=mx.float32)
-    index_keys = mx.ones((1, 1, 5, 4), dtype=mx.float32)
-
-    cache.update_and_fetch(keys, values)
-    cache.update_index_and_fetch(index_keys)
-    accepted = lm.rollback_speculative_cache([cache], None, accepted=1, block_size=4)
-
-    assert accepted == 1
-    assert cache.offset == 3
-    assert cache.index_offset == 3
-
-
-def test_minimax_m3_batch_rollback_raises_on_ragged_accepts():
-    # Ragged accepts on a rectangular batch cache would zero the shorter row's
-    # KV and indexer tails, leaving phantom keys attended (issue #1962). The
-    # rollback must fail loud so callers clamp to uniform acceptance instead.
-    lm = LanguageModel(_tiny_minimax_text_config(num_hidden_layers=1))
-    cache = MiniMaxM3BatchKVCache([0, 0])
-    keys = mx.ones((2, 1, 5, 4), dtype=mx.float32)
-    values = mx.ones((2, 1, 5, 4), dtype=mx.float32)
-    index_keys = mx.ones((2, 1, 5, 4), dtype=mx.float32)
-
-    cache.update_and_fetch(keys, values)
-    cache.update_index_and_fetch(index_keys)
-    with pytest.raises(RuntimeError, match="uniform"):
-        lm.rollback_speculative_cache(
-            [cache], None, accepted=mx.array([2, 0], dtype=mx.int32), block_size=4
-        )
 
 
 def test_minimax_m3_batch_index_cache_filter_extend_extract():

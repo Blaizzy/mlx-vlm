@@ -17,7 +17,6 @@ class Glm5NextMTPConfig(BaseModelConfig):
     model_type: str = "glm5_next_mtp"
     text_config: Optional[TextConfig] = None
     block_size: int = 2
-    runtime_block_size: Optional[int] = None
     tie_word_embeddings: bool = False
 
     def __post_init__(self):

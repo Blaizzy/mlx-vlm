@@ -215,31 +215,12 @@ def convert(
     output_path: str | Path,
     *,
     revision: str | None = None,
-    mtp: bool = False,
-    mtp_output: str | Path | None = None,
     upload_repo: str | None = None,
 ) -> Path:
     """Resolve and convert a DeepSeek-V4 Flash Vision checkpoint."""
     model_path = get_model_path(model, revision=revision)
     print("[INFO] Streaming DeepSeek-V4 mixed FP8/FP4 conversion")
     destination = convert_deepseek_v4_vision(model_path, output_path)
-
-    if mtp:
-        try:
-            from ...speculative.drafters.mtp_split import detect_mtp_splitter
-
-            splitter = detect_mtp_splitter(model_path)
-            if splitter is None:
-                print("[INFO] --mtp: no native DSpark tensors found; skipping")
-            else:
-                drafter_path = mtp_output or f"{destination}-mtp"
-                print(f"[INFO] Extracting DSpark drafter -> {drafter_path}")
-                splitter.split(str(model_path), str(drafter_path))
-        except Exception as exc:
-            print(
-                f"[WARNING] --mtp: failed to extract DSpark drafter "
-                f"({type(exc).__name__}: {exc}); base conversion is unaffected"
-            )
 
     source_id = None if Path(model).expanduser().exists() else model
     create_model_card(destination, source_id)
@@ -269,16 +250,6 @@ def configure_parser() -> argparse.ArgumentParser:
         "--revision",
         default=None,
         help="Hugging Face revision to download.",
-    )
-    parser.add_argument(
-        "--mtp",
-        action="store_true",
-        help="Also extract the checkpoint's native DSpark drafter.",
-    )
-    parser.add_argument(
-        "--mtp-output",
-        default=None,
-        help="Output path for the DSpark drafter (default: <mlx-path>-mtp).",
     )
     parser.add_argument(
         "--upload-repo",

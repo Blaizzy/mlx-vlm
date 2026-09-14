@@ -116,13 +116,3 @@ class Model(nn.Module):
     @property
     def cast_predicate(self):
         return self.language_model.cast_predicate
-
-    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
-        return self.language_model.speculative_logits_from_hidden(hidden)
-
-    def rollback_speculative_cache(
-        self, caches, gdn_states, accepted, block_size
-    ) -> int:
-        return self.language_model.rollback_speculative_cache(
-            caches, gdn_states, accepted, block_size
-        )

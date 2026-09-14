@@ -11,7 +11,7 @@ changes.
 
 | Model | Repository | Variant | Notes |
 |---|---|---|---|
-| Qwen3.6 35B-A3B | `Qwen/Qwen3.6-35B-A3B` | MoE (`qwen3_5_moe`) | Same architecture and MTP head |
+| Qwen3.6 35B-A3B | `Qwen/Qwen3.6-35B-A3B` | MoE (`qwen3_5_moe`) | Same architecture |
 | Ornith 1.5 9B | `ornith-ai/Ornith-1.5-9B` | dense (`qwen3_5`) | Vision-language, image and video |
 | Ornith 1.5 35B-A3B | `ornith-ai/Ornith-1.5-35B-A3B` | MoE (`qwen3_5_moe`) | 256 experts, 8 active (~3B active) |
 
@@ -23,7 +23,6 @@ changes.
 | **Architecture** | Hybrid Qwen3.5 text (gated-delta + full attention) + Qwen3-VL vision tower |
 | **Modalities** | Text, image, video |
 | **Vocabulary** | 248320 |
-| **Speculative decoding** | Single-layer MTP head (`mtp` drafter), dense and MoE |
 | **Official Cards** | [Ornith 1.5 9B](https://huggingface.co/ornith-ai/Ornith-1.5-9B), [Ornith 1.5 35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) |
 
 ## CLI Usage
@@ -65,26 +64,6 @@ result = generate(
     temperature=0.0,
 )
 print(result.text)
-```
-
-## Speculative Decoding
-
-These checkpoints ship a single-layer MTP head. Extract it into a standalone
-drafter and run speculative decoding with the `qwen3_5_mtp` drafter, which
-supports both the dense and mixture-of-experts variants:
-
-```bash
-python -m mlx_vlm.speculative.drafters.qwen3_5_mtp.split \
-    --model ornith-ai/Ornith-1.5-9B \
-    --output ornith-1.5-9b-mtp
-
-python -m mlx_vlm.generate \
-    --model ornith-ai/Ornith-1.5-9B \
-    --draft-model ornith-1.5-9b-mtp \
-    --image path/to/image.jpg \
-    --prompt "Describe this image." \
-    --max-tokens 200 \
-    --temperature 0.0
 ```
 
 ## Architecture

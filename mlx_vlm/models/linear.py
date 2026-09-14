@@ -1,6 +1,7 @@
 """Projection helpers shared by model families."""
 
 import mlx.core as mx
+import mlx.nn as nn
 
 DECODE_BLOCK_SIZE = 8
 
@@ -25,6 +26,26 @@ def native_batch_linear(module, x):
     """Match independent B×1 calls, including dense and mixed-dtype fallbacks."""
     if x.ndim != 3 or x.shape[1] <= 1:
         return module(x)
+    # One GEMV dispatch preserves the reduction used by singleton decode.
+    # Batched AR may use different reduction geometry, so keep its native path.
+    dense = (
+        getattr(module, "__self__", module)
+        if getattr(module, "__name__", None) == "as_linear"
+        else module
+    )
+    if (
+        x.shape[0] == 1
+        and x.dtype in (mx.bfloat16, mx.float16)
+        and mx.default_device() == mx.gpu
+        and isinstance(dense, (nn.Linear, nn.Embedding))
+        and not dense.training
+        and "bias" not in dense
+    ):
+        from .exact_speculative_verify import exact_speculative_verify_weight
+
+        result = exact_speculative_verify_weight(dense.weight, x)
+        if result is not None:
+            return result
     from .quantized_verifier import exact_quantized_linear, singleton_quantized_linear
 
     # Narrow and FP32 projections can use a different native QMV reduction.

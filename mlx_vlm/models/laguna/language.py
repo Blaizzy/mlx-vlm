@@ -327,7 +327,6 @@ class LanguageModel(nn.Module):
             inputs = kwargs.get("input_ids")
         if inputs_embeds is None:
             inputs_embeds = input_embeddings
-        kwargs.pop("speculative_verify", None)
         hidden_sink: Optional[list] = [] if capture_layer_ids is not None else None
         out = self.model(
             inputs,
@@ -567,41 +566,6 @@ class LanguageModel(nn.Module):
     @property
     def n_kv_heads(self):
         return self.args.num_key_value_heads
-
-    def rollback_speculative_cache(
-        self,
-        caches: List[Any],
-        gdn_states: Any,
-        accepted: Any,
-        block_size: int,
-    ) -> int:
-        """Commit the accepted speculative prefix and drop rejected entries.
-
-        Laguna holds only KV and RotatingKV caches, so committing is a trim.
-        ``gdn_states`` is accepted and ignored, for parity with the targets
-        that carry recurrent state.
-        """
-        del gdn_states
-        if isinstance(accepted, int):
-            accepted = mx.array([accepted], dtype=mx.int32)
-        elif not isinstance(accepted, mx.array):
-            accepted = mx.array(accepted, dtype=mx.int32)
-
-        max_accepted = int(accepted.max().item())
-        if accepted.size > 1 and int(accepted.min().item()) != max_accepted:
-            raise RuntimeError(
-                "Laguna batched speculative rollback requires uniform per-row "
-                f"acceptance; got ragged accepts {accepted.tolist()}. Set "
-                "requires_uniform_batch_acceptance on the drafter or target so "
-                "accepts are clamped before rollback."
-            )
-
-        trim = block_size - max_accepted - 1
-        if trim > 0:
-            for cache in caches:
-                if cache is not None and hasattr(cache, "trim"):
-                    cache.trim(trim)
-        return max_accepted
 
     def make_cache(self):
         return [

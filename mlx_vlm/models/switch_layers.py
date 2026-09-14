@@ -176,18 +176,19 @@ class SwitchGLU(nn.Module):
         self, x, indices, weights=None, shared=None, residual=None
     ) -> mx.array:
         if not self.training and x.ndim == 3 and 1 < x.shape[1] <= DECODE_BLOCK_SIZE:
-            from .fast_ops import exact_affine_moe_down, exact_affine_switch_gate_up
+            from .fast_ops import exact_affine_moe_down
             from .linear import tokenwise
             from .quantized_verifier import (
                 exact_quantized_moe_hc_expand,
                 exact_quantized_selected_linear,
+                exact_quantized_switch_gate_up,
                 exact_quantized_switch_linear,
             )
 
             routed = None
             # The route count per position determines decode's sorting policy.
             if x.shape[0] * indices.shape[-1] < 64:
-                gate_up = exact_affine_switch_gate_up(self, x, indices)
+                gate_up = exact_quantized_switch_gate_up(self, x, indices)
                 if gate_up is None:
                     up = exact_quantized_switch_linear(self.up_proj, x, indices)
                     gate = exact_quantized_switch_linear(self.gate_proj, x, indices)

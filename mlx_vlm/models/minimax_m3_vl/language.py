@@ -1,5 +1,5 @@
 from functools import lru_cache, partial
-from typing import Any, List, Optional
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -1899,7 +1899,6 @@ class MiniMaxM3Model(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    requires_uniform_batch_acceptance = True
 
     def __init__(self, args: TextConfig, config: Optional[ModelConfig] = None):
         super().__init__()
@@ -2116,7 +2115,6 @@ class LanguageModel(nn.Module):
         return LanguageModelOutput(
             logits=logits,
             hidden_states=hidden_sink,
-            gdn_states=None,
             shared_kv_states={} if return_shared_kv else None,
         )
 
@@ -2124,60 +2122,6 @@ class LanguageModel(nn.Module):
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(hidden)
         return self.lm_head(hidden)
-
-    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
-        return self.logits_from_hidden(self.model.norm(hidden))
-
-    def speculative_argmax_from_hidden(self, hidden: mx.array) -> mx.array:
-        return mx.argmax(self.speculative_logits_from_hidden(hidden), axis=-1)
-
-    def rollback_speculative_cache(
-        self,
-        caches: List[Any],
-        gdn_states: Any,
-        accepted: Any,
-        block_size: int,
-    ) -> int:
-        del gdn_states
-        if isinstance(accepted, int):
-            accepted = mx.array([accepted])
-        elif not isinstance(accepted, mx.array):
-            accepted = mx.array(accepted)
-        if accepted.ndim == 0:
-            accepted = accepted.reshape(1)
-
-        max_a = int(accepted.max().item())
-        n = max_a + 1
-        trim = int(block_size) - n
-        is_batch = accepted.size > 1
-        valid_ends = accepted + 1
-
-        for cache in caches:
-            if cache is None:
-                continue
-
-            if trim > 0 and hasattr(cache, "trim"):
-                cache.trim(trim)
-
-            if not is_batch or not hasattr(cache, "_idx"):
-                continue
-
-            kv_len = int(cache._idx)
-            verify_start = kv_len - n
-            if verify_start < 0:
-                continue
-            valid_ends_list = [int(v) for v in valid_ends.tolist()]
-
-            if any(verify_start + valid_end < kv_len for valid_end in valid_ends_list):
-                raise RuntimeError(
-                    "MiniMax-M3 batched speculative rollback requires uniform "
-                    f"per-row acceptance; got ragged accepts {accepted.tolist()}. "
-                    "Zeroing a rejected row's KV (or indexer) tail leaves phantom "
-                    "keys attended (issue #1962); set "
-                    "requires_uniform_batch_acceptance on the drafter or target so "
-                    "accepts are clamped before rollback."
-                )
-        return max_a
 
     @property
     def layers(self):

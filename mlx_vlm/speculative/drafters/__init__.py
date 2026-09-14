@@ -1,226 +1,49 @@
+"""Supported speculative checkpoint loading and architecture validation."""
+
 import json
-import logging
-from typing import Any, Optional, Tuple
 
-from .dflash2 import DFlash2DraftModel
-from .dspark import DSparkDraftModel
-from .laguna_dflash import LagunaDFlashDraftModel
-from .muse_glimmer_assistant import MuseGlimmerAssistantDraftModel
-from .qwen3_dflash import DFlashDraftModel
-
-KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
-
-# Drafter HF ``model_type`` → required round-loop kind. Anything not listed
-# here falls back to ``DEFAULT_DRAFTER_KIND`` when the caller didn't pass one.
-DRAFTER_KIND_BY_MODEL_TYPE = {
-    "deepseek_v4_mtp": "mtp",
-    "deepseek_v4_dspark": "dflash",
-    "dspark": "dflash",
-    "gemma4_dspark": "dflash",
-    "eagle3": "eagle3",
-    "gemma4_assistant": "mtp",
-    "gemma4_unified_assistant": "mtp",
-    "glm4_moe_lite_mtp": "mtp",
-    "glm5_next_mtp": "mtp",
-    "glm_moe_dsa_mtp": "mtp",
-    "hy_v4_mtp": "mtp",
-    "inkling_mtp": "mtp",
-    "qwen3_5_mtp": "mtp",
-    "qwen4_exp_mtp": "mtp",
-    "laguna": "dflash",
-    "muse_glimmer_assistant": "dflash",
-    "qwen3_dspark": "dflash",
+KNOWN_DRAFTER_KINDS = {"mtp"}
+DEFAULT_DRAFTER_KIND = "mtp"
+DRAFTER_TARGETS = {
+    "glm5_next_mtp": ("glm5_next", "glm5_next_text"),
+    "qwen3_5_mtp": ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"),
 }
-
-DEFAULT_DRAFTER_KIND = "dflash"
-
-logger = logging.getLogger(__name__)
+DRAFTER_KIND_BY_MODEL_TYPE = {name: "mtp" for name in DRAFTER_TARGETS}
 
 
-def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
-    if isinstance(config, dict):
-        return config.get(key, default)
-    return getattr(config, key, default)
-
-
-def _hidden_size(config: Any) -> Any:
-    return _cfg_get(_cfg_get(config, "text_config", config), "hidden_size")
-
-
-def _noop_target_compatibility(target_model: Any) -> None:
-    del target_model
-
-
-def _validate_model_specific_compatibility(target_model: Any, draft_model: Any) -> None:
-    validator = getattr(
-        draft_model,
-        "validate_target_compatibility",
-        _noop_target_compatibility,
-    )
-    validator(target_model)
-
-
-def validate_drafter_compatibility(
-    target_model: Any,
-    draft_model: Any,
-    draft_kind: Optional[str],
-) -> None:
-    """Validate that a loaded drafter can safely pair with a target model.
-
-    This intentionally uses architecture/config fields instead of repository
-    names, so quantized MLX conversions and local checkpoints remain accepted.
-    """
-    draft_cfg = getattr(draft_model, "config", None)
-    if draft_cfg is None:
-        return
-
-    model_type = _cfg_get(draft_cfg, "model_type")
-    expected_kind = _expected_drafter_kind(model_type, draft_cfg)
-    if expected_kind is not None and draft_kind != expected_kind:
+def resolve_drafter_kind(model_path, kind=None):
+    config = json.loads((model_path / "config.json").read_text())
+    if kind not in (None, "mtp") or config.get("model_type") not in DRAFTER_TARGETS:
         raise ValueError(
-            f"Drafter model_type={model_type!r} requires draft_kind={expected_kind!r}. "
-            f"Got draft_kind={draft_kind!r}."
+            "Supported native MTP heads are GLM-5.3-Flash and Qwen3.5. Extract with mlx_vlm.split_mtp."
         )
+    return "mtp"
 
-    _validate_model_specific_compatibility(target_model, draft_model)
 
-    if draft_kind != "mtp":
-        return
-
-    draft_hidden_size = (
-        _cfg_get(draft_cfg, "backbone_hidden_size")
-        or _cfg_get(draft_cfg, "target_hidden_size")
-        or _hidden_size(draft_cfg)
-    )
+def validate_drafter_compatibility(target_model, draft_model, draft_kind):
     target = getattr(target_model, "language_model", target_model)
-    target_hidden_size = _hidden_size(getattr(target, "config", None))
-
-    if (
-        draft_hidden_size is not None
-        and target_hidden_size is not None
-        and draft_hidden_size != target_hidden_size
+    target_config = getattr(target, "args", None) or target.config
+    draft_config = draft_model.config
+    if draft_kind != "mtp" or target_config.model_type not in DRAFTER_TARGETS.get(
+        draft_config.model_type, ()
     ):
-        raise ValueError(
-            "Drafter is incompatible with the target model. "
-            "Use the drafter checkpoint for the same target family and size. "
-            f"Drafter target hidden_size={draft_hidden_size!r}, "
-            f"target hidden_size={target_hidden_size!r}."
-        )
-
-
-def _read_drafter_config(model_path) -> dict:
-    """Read the drafter's HF ``config.json`` without loading weights. Returns an
-    empty dict when the config can't be read."""
-    try:
-        with open(model_path / "config.json") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
-
-
-def _peek_drafter_model_type(model_path) -> Optional[str]:
-    config = _read_drafter_config(model_path)
-    return config.get("model_type") or config.get("speculators_model_type")
-
-
-def _declares_mtp_layers(config: Any) -> bool:
-    """True when the config declares next-token-prediction layers, the marker of
-    a native checkpoint that carries an embedded ``mtp.*`` head."""
-    for cfg in (config, _cfg_get(config, "text_config")):
-        if cfg is None:
+        raise ValueError("Pair GLM-5.3-Flash or Qwen3.5 with its own native MTP head.")
+    for field in (
+        "hidden_size",
+        "vocab_size",
+        "num_hidden_layers",
+        "n_routed_experts",
+        "num_experts",
+    ):
+        if not hasattr(target_config, field):
             continue
-        count = _cfg_get(cfg, "num_nextn_predict_layers")
-        if isinstance(count, int) and count > 0:
-            return True
-    return False
+        if getattr(target_config, field) != getattr(draft_config.text_config, field):
+            raise ValueError(f"MTP checkpoint does not match target {field}.")
 
 
-def _expected_drafter_kind(model_type: Any, config: Any = None) -> Optional[str]:
-    """Round-loop kind a drafter requires, or ``None`` when it can't be inferred:
-    an explicit ``model_type`` mapping first, then an ``mtp`` model_type name,
-    then a config that declares next-token-prediction layers."""
-    expected = DRAFTER_KIND_BY_MODEL_TYPE.get(model_type)
-    if expected is not None:
-        return expected
-    if "mtp" in str(model_type).lower():
-        return "mtp"
-    if config is not None and _declares_mtp_layers(config):
-        return "mtp"
-    return None
-
-
-def resolve_drafter_kind(model_path, kind: Optional[str] = None) -> str:
-    """Reconcile the caller's ``kind`` with the drafter's actual model type.
-
-    When ``kind`` is None, auto-detect from the drafter's HF ``model_type`` or,
-    for a native checkpoint that declares next-token-prediction layers, ``mtp``;
-    if neither applies, fall back to :data:`DEFAULT_DRAFTER_KIND`.
-
-    When the caller passes a ``kind`` that disagrees with the drafter's
-    ``model_type``, we override (and warn). This avoids the trap where a
-    user points ``--draft-model`` at e.g. a ``gemma4_assistant`` checkpoint
-    but forgets ``--draft-kind mtp``: rather than crashing deep inside
-    ``draft_block`` with an opaque error, we pick the right kind for them.
-    """
-    config = _read_drafter_config(model_path)
-    model_type = config.get("model_type") or config.get("speculators_model_type")
-    expected = _expected_drafter_kind(model_type, config)
-
-    if kind is None:
-        resolved = expected or DEFAULT_DRAFTER_KIND
-        logger.info(
-            "Auto-detected --draft-kind=%r for drafter %r (model_type=%r).",
-            resolved,
-            str(model_path),
-            model_type,
-        )
-        return resolved
-
-    if expected is not None and expected != kind:
-        logger.warning(
-            "Drafter %r has model_type=%r which requires --draft-kind=%r; "
-            "got --draft-kind=%r. Overriding to %r.",
-            str(model_path),
-            model_type,
-            expected,
-            kind,
-            expected,
-        )
-        return expected
-    return kind
-
-
-def load_drafter(
-    path_or_repo: str, kind: Optional[str] = None, **kwargs
-) -> Tuple[object, str]:
-    """Load a speculative drafter and return ``(model, resolved_kind)``.
-
-    ``kind`` defaults to ``None``, which triggers auto-detection from the
-    drafter's HF ``model_type`` (see :func:`resolve_drafter_kind`). Callers
-    should use ``resolved_kind`` for downstream dispatch instead of trusting
-    their original ``kind`` arg.
-    """
-    if kind is not None and kind not in KNOWN_DRAFTER_KINDS:
-        raise ValueError(
-            f"Unknown drafter kind {kind!r}. Known: {sorted(KNOWN_DRAFTER_KINDS)}"
-        )
+def load_drafter(path_or_repo, kind=None, **kwargs):
     from ...utils import get_model_path, load_model
 
     path = get_model_path(path_or_repo)
     resolved = resolve_drafter_kind(path, kind)
     return load_model(path, **kwargs), resolved
-
-
-__all__ = [
-    "DEFAULT_DRAFTER_KIND",
-    "DRAFTER_KIND_BY_MODEL_TYPE",
-    "KNOWN_DRAFTER_KINDS",
-    "DFlashDraftModel",
-    "DFlash2DraftModel",
-    "DSparkDraftModel",
-    "LagunaDFlashDraftModel",
-    "MuseGlimmerAssistantDraftModel",
-    "load_drafter",
-    "resolve_drafter_kind",
-    "validate_drafter_compatibility",
-]

@@ -251,69 +251,6 @@ class LanguageModel(nn.Module):
             shared_kv_states={} if return_shared_kv else None,
         )
 
-    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
-        return self.lm_head(hidden)
-
-    def _speculative_verify_hidden(self, inputs: mx.array, cache) -> mx.array:
-        # Quantized Hy4 does not preserve greedy-token equivalence between a
-        # multi-token prefill and ordinary one-token decode. Verify each draft
-        # position through the target's decode path so speculative generation
-        # cannot alter the target sequence.
-        return mx.concatenate(
-            [
-                self.model(inputs[:, index : index + 1], cache=cache)
-                for index in range(inputs.shape[1])
-            ],
-            axis=1,
-        )
-
-    def speculative_verify_hidden(self, inputs: mx.array, cache):
-        hidden = self._speculative_verify_hidden(inputs, cache)
-        return hidden, {}
-
-    def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
-        hidden = self._speculative_verify_hidden(inputs, cache)
-        logits = self.lm_head(hidden)
-        return hidden, {}, None, sampler(logits)
-
-    def rollback_speculative_cache(
-        self, caches, gdn_states, accepted, block_size: int
-    ) -> int:
-        del gdn_states
-        if isinstance(accepted, int):
-            accepted = [accepted]
-        elif isinstance(accepted, mx.array):
-            accepted = [int(value) for value in accepted.reshape(-1).tolist()]
-        else:
-            accepted = [int(value) for value in accepted]
-        max_accepted = max(accepted)
-        trim = block_size - (max_accepted + 1)
-        if trim > 0:
-            for cache in caches:
-                if cache is not None and cache.is_trimmable():
-                    cache.trim(trim)
-        return max_accepted
-
-    def chunked_prefill_policy(
-        self,
-        *,
-        input_ids=None,
-        inputs_embeds=None,
-        prompt_cache=None,
-        draft_model=None,
-        draft_kind=None,
-        prefill_kwargs=None,
-    ) -> bool:
-        del input_ids, inputs_embeds, prompt_cache
-        prefill_kwargs = prefill_kwargs or {}
-        if draft_model is None:
-            return True
-        if draft_kind == "mtp":
-            return bool(prefill_kwargs.get("return_hidden", False)) and bool(
-                prefill_kwargs.get("return_shared_kv", False)
-            )
-        return draft_kind is None
-
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         return Model.sanitize(self, weights)
 
