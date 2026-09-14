@@ -1836,7 +1836,7 @@ class _LazyPathModel(nn.Module):
 
 
 def _materialized_paths(model):
-    """Paths whose arrays reach mx.eval during materialization."""
+    """Paths whose arrays are handed to mx.eval during materialization."""
     from mlx.utils import tree_flatten
 
     from mlx_vlm import utils as utils_module
@@ -1844,16 +1844,11 @@ def _materialized_paths(model):
     by_id = {
         id(v): p for p, v in tree_flatten(model.parameters()) if isinstance(v, mx.array)
     }
-    seen = []
-
-    def record(group):
-        for array in group if isinstance(group, list) else [group]:
-            if id(array) in by_id:
-                seen.append(by_id[id(array)])
-
-    with patch.object(utils_module.mx, "eval", side_effect=record):
-        utils_module._materialize_parameters(model, budget_bytes=1)
-    return seen
+    return [
+        by_id[id(array)]
+        for array in utils_module._eager_parameters(model)
+        if id(array) in by_id
+    ]
 
 
 def test_materialize_parameters_skips_declared_lazy_paths():

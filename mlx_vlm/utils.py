@@ -5,7 +5,6 @@ import inspect
 import json
 import logging
 import math
-import os
 import struct
 import warnings
 from dataclasses import dataclass, fields
@@ -816,57 +815,18 @@ def _quantization_for_module_path(
     return None
 
 
-def _prewarm_page_cache(model_path) -> None:
-    """Read the shards sequentially so later faults hit the page cache.
+def _eager_parameters(model) -> list:
+    """Parameters to materialize, minus any the model asks to leave mapped.
 
-    Cold-disk faults taken inside a GPU command buffer can outrun Metal's
-    watchdog; sequential reads are fast and leave clean, evictable pages.
+    ``lazy_parameter_paths`` names tables a step gathers a handful of rows
+    from; making those resident costs their full size and buys nothing.
     """
-    import glob as _glob
-
-    shards = sorted(_glob.glob(str(Path(model_path) / "*.safetensors")))
-    if not shards:
-        return
-    total = sum(os.path.getsize(shard) for shard in shards)
-    try:
-        physical = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    except (ValueError, OSError):
-        return
-    if total < 0.25 * physical:
-        return
-    buf = bytearray(1 << 28)
-    for shard in shards:
-        with open(shard, "rb", buffering=0) as handle:
-            while handle.readinto(buf):
-                pass
-
-
-def _materialize_parameters(model, budget_bytes: int = 2 << 30) -> None:
-    """Evaluate parameters in bounded groups.
-
-    Evaluating a whole multi-hundred-GB model in one call builds a single
-    command buffer; on Apple silicon the cold page-ins inside it can outrun
-    Metal's watchdog, which surfaces as a GPU timeout or takes the machine
-    down. Materializing in slices keeps each buffer short.
-
-    Paths matching the model's ``lazy_parameter_paths`` are skipped and left
-    mapped. Those are tables a step gathers a handful of rows from, so making
-    them resident buys nothing and costs their full size in memory.
-    """
-    lazy_markers = tuple(getattr(model, "lazy_parameter_paths", ()) or ())
-    group, used = [], 0
-    for path, value in tree_flatten(model.parameters()):
-        if not isinstance(value, mx.array):
-            continue
-        if any(marker in path for marker in lazy_markers):
-            continue
-        group.append(value)
-        used += value.nbytes
-        if used >= budget_bytes:
-            mx.eval(group)
-            group, used = [], 0
-    if group:
-        mx.eval(group)
+    markers = tuple(getattr(model, "lazy_parameter_paths", ()) or ())
+    return [
+        value
+        for path, value in tree_flatten(model.parameters())
+        if isinstance(value, mx.array) and not any(marker in path for marker in markers)
+    ]
 
 
 def _drop_modules_without_weights(
@@ -1246,8 +1206,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         lazy = requested_lazy
 
     if not lazy:
-        _prewarm_page_cache(model_path)
-        _materialize_parameters(model)
+        mx.eval(_eager_parameters(model))
 
     model.model_path = model_path
     model.eval()
