@@ -3706,5 +3706,90 @@ def test_paligemma_opts_out_of_chunked_prefill_when_bidirectional():
     assert policy(causal) is True
 
 
+@pytest.fixture
+def mllama_prefill():
+    from mlx_vlm.models.mllama import LanguageModel, TextConfig
+
+    mx.random.seed(0)
+    model = LanguageModel(
+        TextConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            cross_attention_layers=[0, 2],
+        )
+    )
+    for idx in model.config.cross_attention_layers:
+        model.layers[idx].cross_attn_attn_gate = mx.ones((1,))
+        model.layers[idx].cross_attn_mlp_gate = mx.ones((1,))
+    # Vary visible vision keys and fully masked rows across chunk boundaries.
+    mask = mx.tile(mx.array([[0.0, -1e9], [-1e9, 0.0], [0.0, 0.0]]), (6, 1))
+    row_mask = mx.broadcast_to(
+        (mx.arange(18) % 4 != 0)[None, None, :, None], (2, 1, 18, 1)
+    )
+    return model, {
+        "inputs_embeds": model.model.embed_tokens(mx.arange(36).reshape(2, 18) % 32),
+        "cross_attention_states": mx.random.normal((2, 2, 16)),
+        "cross_attention_mask": mask[None, None] * row_mask,
+        "full_text_row_masked_out_mask": row_mask,
+    }
+
+
+@pytest.mark.parametrize("prefill_step_size", [4, 2048])
+def test_mllama_generation_matches_unchunked(mllama_prefill, prefill_step_size):
+    from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+    language_model, kwargs = mllama_prefill
+    features = InputEmbeddingsFeatures(
+        **{key: value[:1] for key, value in kwargs.items()}
+    )
+    model = SimpleNamespace(
+        language_model=language_model,
+        get_input_embeddings=lambda *args, **kwargs: features,
+    )
+
+    def generate(step_size):
+        return list(
+            generate_module.generate_step(
+                mx.arange(18)[None],
+                model,
+                None,
+                None,
+                prefill_step_size=step_size,
+                max_tokens=3,
+                temperature=0,
+                verbose=False,
+            )
+        )
+
+    expected, actual = generate(None), generate(prefill_step_size)
+    assert len(actual) == 3
+    assert [token for token, _ in actual] == [token for token, _ in expected]
+    assert mx.allclose(
+        mx.stack([lp for _, lp in actual]),
+        mx.stack([lp for _, lp in expected]),
+        atol=1e-6,
+    ).item()
+
+
+@pytest.mark.parametrize("slice_masks", [False, True])
+def test_mllama_batched_prefill_matches_full_prompt(mllama_prefill, slice_masks):
+    model, kwargs = mllama_prefill
+    expected = model(**kwargs).logits
+    # All rows have padding, so max(offset) differs from the shared column count.
+    cache = [BatchKVCache([3, 1]) for _ in model.layers]
+    outputs = []
+    for start, end in [(0, 4), (4, 8), (8, 17), (17, 18)]:
+        chunk = {**kwargs, "inputs_embeds": kwargs["inputs_embeds"][:, start:end]}
+        if slice_masks:
+            for key in ("cross_attention_mask", "full_text_row_masked_out_mask"):
+                chunk[key] = kwargs[key][:, :, start:end]
+        outputs.append(model(cache=cache, **chunk).logits)
+    assert mx.allclose(mx.concatenate(outputs, axis=1), expected, atol=1e-5).item()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

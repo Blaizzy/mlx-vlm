@@ -446,7 +446,7 @@ class KVCache(_BaseCache):
 
     @property
     def state(self):
-        if self.offset == self.keys.shape[2]:
+        if self.keys is None or self.offset == self.keys.shape[2]:
             return self.keys, self.values
         else:
             return (
@@ -457,7 +457,7 @@ class KVCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.keys, self.values = v
-        self.offset = self.keys.shape[2]
+        self.offset = 0 if self.keys is None else self.keys.shape[2]
 
     def prefix_cache_reserve(self, min_capacity_tokens):
         if self.keys is None or self.values is None:
@@ -657,7 +657,7 @@ class RotatingKVCache(_BaseCache):
 
     @property
     def state(self):
-        if self.offset < self.keys.shape[2]:
+        if self.keys is not None and self.offset < self.keys.shape[2]:
             return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
         else:
             return self.keys, self.values
@@ -1467,7 +1467,7 @@ class BatchKVCache(_BaseCache):
     @property
     def state(self):
         k, v = self.keys, self.values
-        if self._idx < k.shape[2]:
+        if k is not None and self._idx < k.shape[2]:
             k = k[..., : self._idx, :]
             v = v[..., : self._idx, :]
         return k, v, self.offset, self.left_padding
@@ -1475,7 +1475,7 @@ class BatchKVCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.keys, self.values, self.offset, self.left_padding = v
-        self._idx = self.keys.shape[2]
+        self._idx = 0 if self.keys is None else self.keys.shape[2]
 
     def is_trimmable(self):
         return True
