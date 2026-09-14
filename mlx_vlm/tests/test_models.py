@@ -6158,6 +6158,70 @@ class TestModels(unittest.TestCase):
         )
         self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, 64))
 
+    def test_mage_vl_sanitize_weight_layouts(self):
+        from mlx_vlm.models import mage_vl
+
+        config = mage_vl.ModelConfig(
+            text_config=mage_vl.TextConfig(
+                model_type="qwen3",
+                hidden_size=64,
+                num_hidden_layers=2,
+                intermediate_size=128,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=32,
+                rms_norm_eps=1e-6,
+                vocab_size=128,
+                rope_theta=1000.0,
+                max_position_embeddings=1000,
+                tie_word_embeddings=False,
+            ),
+            vision_config=mage_vl.VisionConfig(
+                model_type="mage_vl_vision",
+                hidden_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                intermediate_size=128,
+                patch_size=16,
+                num_channels=3,
+                spatial_merge_size=2,
+                out_hidden_size=64,
+                frame_windows_size=4,
+                use_head=False,
+            ),
+            model_type="mage_vl",
+            image_token_id=151655,
+            video_token_id=151656,
+        )
+        model = mage_vl.Model(config)
+
+        # The hub nests the language stack under ``model.language_model.``.
+        # Flattened OptiQ conversions drop that segment and ship a bare
+        # ``model.`` with the vision stack already at top level; both layouts
+        # must land on the same target module paths.
+        hub = {
+            "model.language_model.embed_tokens.weight": mx.zeros((128, 64)),
+            "model.visual.blocks.0.norm1.weight": mx.zeros((64,)),
+            "lm_head.weight": mx.zeros((128, 64)),
+        }
+        optiq = {
+            "model.embed_tokens.weight": mx.zeros((128, 64)),
+            "model.layers.0.self_attn.q_proj.weight": mx.zeros((128, 64)),
+            "model.norm.weight": mx.zeros((64,)),
+            "lm_head.weight": mx.zeros((128, 64)),
+            "vision_tower.blocks.0.norm1.weight": mx.zeros((64,)),
+        }
+
+        for name, weights in (("hub", hub), ("optiq", optiq)):
+            keys = set(model.sanitize(weights))
+            self.assertFalse(
+                any(k.startswith(("model.", "lm_head.")) for k in keys),
+                f"{name}: unmapped top-level keys survived sanitize: {keys}",
+            )
+            self.assertIn("language_model.model.embed_tokens.weight", keys)
+            self.assertIn("language_model.lm_head.weight", keys)
+            self.assertIn("vision_tower.blocks.0.norm1.weight", keys)
+
     def test_mage_vl(self):
         from mlx_vlm.models import mage_vl
 
