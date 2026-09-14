@@ -15,7 +15,6 @@ KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
 DRAFTER_KIND_BY_MODEL_TYPE = {
     "deepseek_v4_mtp": "mtp",
     "deepseek_v4_dspark": "dflash",
-    "deepseek_v41_dspark": "dflash",
     "dspark": "dflash",
     "gemma4_dspark": "dflash",
     "eagle3": "eagle3",
