@@ -140,9 +140,10 @@ An MTP checkpoint contains target caches, draft caches, logical position, the pe
 target token, and positional offsets. The next MTP prediction and hidden-state seed
 belong to the live request and are regenerated during suffix prefill before decode.
 Checkpoints use the existing APC budget, LRU, cloning, and disk serialization with
-native cache types. Older checkpoints remain readable; their saved seeds are ignored.
-Keys are separated by target/draft checkpoint identity, schema, and the existing
-request/tenant/media salt. A target-only checkpoint cannot satisfy an MTP lookup.
+native cache types and the shared APC schema from main. Restore also accepts the
+previous metadata layout, ignoring its saved seeds. Keys are separated by
+target/draft checkpoint identity and the existing request/tenant/media salt, with
+no separate MTP schema version. A target-only checkpoint cannot satisfy an MTP lookup.
 
 If the target has processed N inputs, the MTP cache has already consumed the
 shifted token at N. The prefix key must therefore include N+1 tokens. A hit

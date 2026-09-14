@@ -286,7 +286,6 @@ class SpeculativeCache:
 
         state = cls.create(target_cache, drafter, 1)
         state.prefix_cache_identity = {
-            "mtp_schema": 3,
             "target": identity(getattr(model, "language_model", model)),
             "draft": identity(drafter),
             "draft_dependencies": semantic_extra_hash(model=drafter),
