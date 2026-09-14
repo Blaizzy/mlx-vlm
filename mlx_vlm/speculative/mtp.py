@@ -42,6 +42,57 @@ class _MTPVerifyResult:
         )
 
 
+def _apply_mtp_token_controls(
+    accepted_list: List[int],
+    new_tokens_list: List[List[int]],
+    active_idx: List[int],
+    forced_tokens: List[Optional[int]],
+    token_observer: Optional[Callable[[int, int], bool]],
+    uniform_acceptance: bool = False,
+) -> None:
+    """Inject forced targets and truncate accepted blocks at control boundaries."""
+    for row, forced_token in enumerate(forced_tokens):
+        if forced_token is not None:
+            accepted_list[row] = 0
+            new_tokens_list[row] = [int(forced_token)]
+
+    if uniform_acceptance and accepted_list:
+        accepted = min(accepted_list)
+        for row in range(len(accepted_list)):
+            accepted_list[row] = accepted
+            new_tokens_list[row] = new_tokens_list[row][: accepted + 1]
+
+    if token_observer is None:
+        return
+
+    if uniform_acceptance:
+        max_new = max((len(tokens) for tokens in new_tokens_list), default=0)
+        for position in range(max_new):
+            boundary_reached = False
+            for row, new_tokens in enumerate(new_tokens_list):
+                if position >= len(new_tokens):
+                    continue
+                boundary_reached = (
+                    token_observer(active_idx[row], int(new_tokens[position]))
+                    or boundary_reached
+                )
+            if boundary_reached:
+                for row in range(len(accepted_list)):
+                    accepted_list[row] = min(accepted_list[row], position)
+                    new_tokens_list[row] = new_tokens_list[row][: position + 1]
+                break
+        return
+
+    for row, new_tokens in enumerate(new_tokens_list):
+        original_row = active_idx[row]
+        for position, token in enumerate(new_tokens):
+            if token_observer(original_row, int(token)):
+                kept = position + 1
+                new_tokens_list[row] = new_tokens[:kept]
+                accepted_list[row] = kept - 1
+                break
+
+
 def _mtp_shared_kv_from_prompt_cache(
     lm: nn.Module,
     prompt_cache: List[Any],
@@ -885,6 +936,8 @@ def _mtp_rounds_batch(
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
     row_ids: Optional[List[int]] = None,
+    token_observer: Optional[Callable[[int, int], bool]] = None,
+    forced_token_provider: Optional[Callable[[int], Optional[int]]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B >= 1).
 
@@ -964,6 +1017,7 @@ def _mtp_rounds_batch(
     emitted = [1] * B
     finished = [False] * B
     active_idx = list(range(B))
+    has_token_controls = token_observer is not None or forced_token_provider is not None
 
     while len(active_idx) > 0:
         remaining = [
@@ -1014,17 +1068,25 @@ def _mtp_rounds_batch(
 
             # Walk per-row
             budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
+            uniform_acceptance = n_active > 1 and _requires_uniform_batch_acceptance(
+                draft_model, lm
+            )
+            if has_token_controls:
+                forced_tokens = [
+                    (
+                        forced_token_provider(active_idx[row])
+                        if forced_token_provider is not None
+                        else None
+                    )
+                    for row in range(n_active)
+                ]
             if verify.target_tokens is not None:
                 sampler_rng.target_eval(verify.target_tokens, hidden_full)
                 accepted_list, new_tokens_list = _speculative_walk_batch(
                     draft_tokens, verify.target_tokens, budgets
                 )
                 sampler_rng.sync_draft_to_target()
-                if (
-                    n_active > 1
-                    and _requires_uniform_batch_acceptance(draft_model, lm)
-                    and len(set(accepted_list)) > 1
-                ):
+                if uniform_acceptance and len(set(accepted_list)) > 1:
                     accepted_list, new_tokens_list = (
                         _speculative_walk_batch_uniform_acceptance(
                             draft_tokens,
@@ -1057,6 +1119,15 @@ def _mtp_rounds_batch(
                 )
                 sampler_rng.target_sampled(
                     sync_draft=not _sampler_supports_positioned_target(sampler)
+                )
+            if has_token_controls:
+                _apply_mtp_token_controls(
+                    accepted_list,
+                    new_tokens_list,
+                    active_idx,
+                    forced_tokens,
+                    token_observer,
+                    uniform_acceptance=uniform_acceptance,
                 )
             # Keep the adaptive block-size history on a per-round basis so
             # batched MTP reacts like the singleton loop instead of letting
