@@ -345,9 +345,6 @@ def generate_step(
             max_kv_size=max_kv_size,
         )
 
-    if draft_block_size is not None and int(draft_block_size) <= 1:
-        draft_model = None
-
     # Speculative decoding setup
     last_outputs = None
     speculative_prefill = SpeculativePrefill(draft_kind, draft_model)
@@ -552,7 +549,7 @@ def generate_step(
         if n == max_tokens:
             break
 
-        yield (y.item() if y.size == 1 else y.tolist()), logprobs
+        yield y.item(), logprobs
         if n % 256 == 0:
             mx.clear_cache()
 
