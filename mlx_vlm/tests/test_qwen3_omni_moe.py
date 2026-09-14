@@ -307,6 +307,55 @@ class Qwen3OmniMoeTest(unittest.TestCase):
                 pre[:, prefix_len + i], step, prefix_len + i
             )
 
+    def test_chunked_prefill_windows_deepstack_inputs(self):
+        # generate() passes the full-prompt visual_pos_masks and deepstack embeds
+        # to every prefill chunk. Each chunk must scatter only its own visual
+        # tokens; otherwise the indices run past the chunk's hidden states and
+        # long video prompts hit a Metal GPU address fault (#2099).
+        from mlx_vlm.models.cache import make_prompt_cache
+
+        model = _tiny_vision_model()
+        lm = model.thinker.language_model
+        input_ids, pixel_values, grid = _image_inputs()
+        features = model.thinker.get_input_embeddings(
+            input_ids, pixel_values=pixel_values, image_grid_thw=grid
+        )
+        kwargs = {
+            "visual_pos_masks": features.visual_pos_masks,
+            "deepstack_visual_embeds": features.deepstack_visual_embeds,
+            "position_ids": features.position_ids,
+            "rope_deltas": features.rope_deltas,
+        }
+        embeds = features.inputs_embeds
+
+        full = lm(
+            input_ids, inputs_embeds=embeds, cache=make_prompt_cache(lm.model), **kwargs
+        ).logits
+
+        # Split inside the image span (visual tokens at positions 3..6).
+        split = 5
+        cache = make_prompt_cache(lm.model)
+        first = lm(
+            input_ids[:, :split],
+            inputs_embeds=embeds[:, :split],
+            cache=cache,
+            **kwargs,
+        ).logits
+        rest = lm(
+            input_ids[:, split:],
+            inputs_embeds=embeds[:, split:],
+            cache=cache,
+            **kwargs,
+        ).logits
+        mx.eval(full, first, rest)
+
+        self.assertTrue(
+            bool(mx.allclose(full[:, :split], first, rtol=1e-4, atol=1e-4).item())
+        )
+        self.assertTrue(
+            bool(mx.allclose(full[:, split:], rest, rtol=1e-4, atol=1e-4).item())
+        )
+
     def test_quant_predicate_forwarded_to_top_level_model(self):
         model = _tiny_model()
         predicate = model.quant_predicate

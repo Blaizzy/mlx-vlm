@@ -565,6 +565,22 @@ class LanguageModel(nn.Module):
                     ..., cache_offset : cache_offset + seq_length
                 ]
 
+        # Chunked prefill also passes the full-prompt deepstack inputs to every
+        # chunk. Window them the same way, or _deepstack_process scatters at
+        # full-prompt positions past the end of this chunk's hidden states.
+        if visual_pos_masks is not None and deepstack_visual_embeds is not None:
+            visual_pos_masks, deepstack_visual_embeds = self._window_deepstack(
+                visual_pos_masks,
+                deepstack_visual_embeds,
+                cache_offset,
+                cache_offsets,
+                (
+                    inputs_embeds.shape[1]
+                    if inputs_embeds is not None
+                    else inputs.shape[-1]
+                ),
+            )
+
         rope_mask = mask
         if mask is not None and mask.shape[-1] != inputs.shape[-1]:
             rope_mask = None
@@ -676,6 +692,51 @@ class LanguageModel(nn.Module):
                 else None
             ),
         )
+
+    @staticmethod
+    def _window_deepstack(
+        visual_pos_masks, deepstack_visual_embeds, cache_offset, cache_offsets, window
+    ):
+        """Slice full-prompt deepstack inputs to tokens [offset, offset + window).
+
+        ``deepstack_visual_embeds`` rows are the visual tokens of every batch row
+        in order, which is how ``_deepstack_process`` consumes them.
+        """
+        masks = (
+            visual_pos_masks[..., 0] if visual_pos_masks.ndim == 3 else visual_pos_masks
+        )
+        if masks.shape[-1] == window:
+            return visual_pos_masks, deepstack_visual_embeds
+
+        batch_size = masks.shape[0]
+        if cache_offsets is not None:
+            starts = [int(o) for o in cache_offsets[:batch_size].tolist()]
+        else:
+            start = (
+                int(cache_offset.item())
+                if isinstance(cache_offset, mx.array)
+                else int(cache_offset)
+            )
+            starts = [start] * batch_size
+
+        rows, spans, base = [], [], 0
+        for b, start in enumerate(starts):
+            row = masks[b, start : start + window]
+            if row.shape[0] < window:
+                row = mx.pad(row, (0, window - row.shape[0]), constant_values=False)
+            n_before = int(masks[b, :start].sum().item())
+            n_window = int(row.sum().item())
+            rows.append(row)
+            spans.append((base + n_before, n_window))
+            base += int(masks[b].sum().item())
+
+        if not any(n for _, n in spans):
+            return None, None
+        embeds = [
+            mx.concatenate([e[s : s + n] for s, n in spans if n], axis=0)
+            for e in deepstack_visual_embeds
+        ]
+        return mx.stack(rows, axis=0), embeds
 
     def sanitize(self, weights):
         for l in range(self.args.num_hidden_layers):
