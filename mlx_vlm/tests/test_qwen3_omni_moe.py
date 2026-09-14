@@ -155,6 +155,28 @@ def _image_inputs():
     return input_ids, pixel_values, mx.array([[1, 4, 4]])
 
 
+VIDEO_TOKEN = 61
+
+
+def _image_video_inputs():
+    # One image and one video, each a 1x4x4 patch grid -> 4 visual tokens.
+    mx.random.seed(11)
+    pixel_values = mx.random.normal((16, 24))
+    pixel_values_videos = mx.random.normal((16, 24))
+    input_ids = mx.array(
+        [
+            [1, 2, VISION_START]
+            + [IMAGE_TOKEN] * 4
+            + [VISION_END, VISION_START]
+            + [VIDEO_TOKEN] * 4
+            + [VISION_END, 3]
+        ],
+        dtype=mx.int32,
+    )
+    grid = mx.array([[1, 4, 4]])
+    return input_ids, pixel_values, pixel_values_videos, grid
+
+
 class Qwen3OmniMoeTest(unittest.TestCase):
     def test_thinker_generation_keeps_hidden_states_aligned(self):
         model = _tiny_model()
@@ -306,6 +328,39 @@ class Qwen3OmniMoeTest(unittest.TestCase):
             self._assert_prefill_decode_match(
                 pre[:, prefix_len + i], step, prefix_len + i
             )
+
+    def test_image_and_video_deepstack_embeds_are_joined_by_position(self):
+        # With an image and a video in one prompt, each modality's deepstack
+        # rows must land at its own token positions. This path used the
+        # one-argument mx.where and mx.scatter, which mlx does not provide.
+        model = _tiny_vision_model()
+        input_ids, pixel_values, pixel_values_videos, grid = _image_video_inputs()
+        thinker = model.thinker
+
+        joint = thinker.get_input_embeddings(
+            input_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=grid,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=grid,
+        ).deepstack_visual_embeds
+        _, image_only = thinker.vision_tower(
+            pixel_values.astype(thinker.vision_tower.patch_embed.proj.weight.dtype),
+            grid,
+        )
+        _, video_only = thinker.vision_tower(
+            pixel_values_videos.astype(
+                thinker.vision_tower.patch_embed.proj.weight.dtype
+            ),
+            grid,
+        )
+        mx.eval(joint, image_only, video_only)
+
+        self.assertEqual(len(joint), 2)
+        for j, img, vid in zip(joint, image_only, video_only):
+            self.assertEqual(tuple(j.shape), (8, 16))
+            self.assertTrue(bool(mx.allclose(j[:4], img, atol=1e-6).item()))
+            self.assertTrue(bool(mx.allclose(j[4:], vid, atol=1e-6).item()))
 
     def test_quant_predicate_forwarded_to_top_level_model(self):
         model = _tiny_model()
