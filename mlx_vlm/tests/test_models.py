@@ -3689,8 +3689,8 @@ class TestModels(unittest.TestCase):
             self.assertEqual(float(mx.max(mx.abs(ref - fused))), 0.0)
 
     def test_glm5_next_compiled_kda_decode_matches_eager(self):
-        # The compiled cached decode step must carry the same conv window and
-        # recurrent state as eager decode, and produce the same outputs, for
+        # The compiled cached decode step must be bit-identical to eager decode
+        # (outputs, conv window and recurrent state) for
         # single streams, left-padded batches and ragged continuous batches.
         import mlx.nn as nn
         from mlx.utils import tree_map_with_path
@@ -3775,7 +3775,7 @@ class TestModels(unittest.TestCase):
             for B, variant in ((1, "none"), (3, "left_padding"), (3, "lengths")):
                 eager, eager_cache = decode(False, B, variant)
                 compiled, compiled_cache = decode(True, B, variant)
-                self.assertTrue(mx.allclose(eager, compiled, atol=1e-5).item())
+                self.assertTrue(mx.array_equal(eager, compiled).item())
                 for e, c in zip(eager_cache.cache, compiled_cache.cache):
                     self.assertTrue(mx.array_equal(e, c).item())
             self.assertEqual(len(kda._compiled_steps), 3)

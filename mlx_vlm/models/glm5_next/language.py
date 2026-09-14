@@ -20,6 +20,18 @@ from .config import TextConfig
 COMPILED_KDA_DECODE = os.environ.get("MLX_VLM_GLM5_COMPILED_KDA_DECODE", "0") == "1"
 
 
+def _sigmoid_exact(x):
+    """mx.sigmoid, bit-identical to the prebuilt kernel inside mx.compile.
+
+    The JIT lowers mx.sigmoid's exp to the fast approximation, so a compiled
+    sigmoid differs from the eager one in the last bit. mx.exp stays precise
+    under compilation, so spelling out the prebuilt kernel's formula keeps the
+    compiled step bit-exact with the eager path.
+    """
+    y = 1 / (1 + mx.exp(mx.abs(x)))
+    return mx.where(x < 0, y, 1 - y)
+
+
 @mx.compile
 def _limited_swiglu(gate: mx.array, up: mx.array, limit: float) -> mx.array:
     gate = mx.minimum(gate, limit)
@@ -235,9 +247,10 @@ class Glm5NextLinearAttention(nn.Module):
             mask=mask,
             use_kernel=True,
             lower_bound=self.lower_bound,
+            beta=_sigmoid_exact(b),
         )[:2]
         gate = linear(self.g_b_proj, g_a).reshape(shape)
-        output = (self.o_norm(output) * mx.sigmoid(gate)).reshape(batch, length, -1)
+        output = (self.o_norm(output) * _sigmoid_exact(gate)).reshape(batch, length, -1)
         return linear(self.o_proj, output), new_conv_state, new_state
 
     def _compiled_decode(self, x, mask, cache):
