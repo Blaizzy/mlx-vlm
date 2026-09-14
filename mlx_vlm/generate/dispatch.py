@@ -850,22 +850,10 @@ def stream_generate(
     vision_cache = kwargs.pop("vision_cache", None)
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
     apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
-    speculative_prefix = None
-    if (
-        kwargs.get("draft_model") is not None
-        and apc_manager is None
-        and prompt_cache_state is not None
-    ):
-        if prompt_cache_state.speculative_manager is None:
-            prompt_cache_state.speculative_manager = _apc.APCManager(num_blocks=1)
-        apc_manager = prompt_cache_state.speculative_manager
-    if kwargs.get("draft_model") is not None and apc_manager is not None:
-        from ..speculative.prefix_cache import SpeculativePrefixCache
-
-        speculative_prefix = SpeculativePrefixCache(
-            apc_manager, model, kwargs["draft_model"]
-        )
-        apc_manager = None
+    if apc_manager is None and prompt_cache_state is not None:
+        if prompt_cache_state.apc_manager is None:
+            prompt_cache_state.apc_manager = _apc.APCManager(num_blocks=1)
+        apc_manager = prompt_cache_state.apc_manager
     apc_tenant: Optional[str] = kwargs.pop("apc_tenant", None)
     image = image or None
     audio = audio or None
@@ -937,14 +925,25 @@ def stream_generate(
         )
 
     if apc_manager is not None:
-        apc_coordinator = _apc.APCCoordinator(apc_manager, model.language_model)
+        cache_factory = None
+        if kwargs.get("draft_model") is not None:
+            from functools import partial
+
+            from ..speculative.cache_state import SpeculativeCache
+
+            cache_factory = partial(
+                SpeculativeCache.for_model, model.language_model, kwargs["draft_model"]
+            )
+        apc_coordinator = _apc.APCCoordinator(
+            apc_manager, model.language_model, cache_factory=cache_factory
+        )
         if not apc_coordinator.enabled:
             apc_coordinator = None
             apc_manager = None
         else:
             apc_coordinator.prepare_prefill(len(full_input_ids_list))
 
-    if apc_manager is not None or speculative_prefix is not None:
+    if apc_manager is not None:
         image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)
         audio_features = kwargs.get("input_features")
         video_features = kwargs.get("pixel_values_videos")
@@ -966,35 +965,11 @@ def stream_generate(
         kwargs["speculative_cache_callback"] = lambda state: speculative_holder.update(
             state=state
         )
-    if speculative_prefix is not None:
-        state, prefix_len = speculative_prefix.lookup(
-            full_input_ids_list, extra_hash=apc_extra_hash
-        )
-        if (
-            state is not None
-            and _apc_suffix_is_text_only(prefix_len)
-            and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
-        ):
-            reused_prefix_len = prefix_len
-            input_ids = input_ids[:, prefix_len:]
-            pixel_values = None
-            kwargs.pop("cached_image_features", None)
-            kwargs["prompt_cache"] = state.target
-            kwargs["speculative_cache"] = state
-
-        def speculative_checkpoint(state):
-            # An exact prompt checkpoint includes the pending input token.
-            # Longer prompts also retain chunk boundaries in the bounded APC LRU.
-            speculative_prefix.store(
-                full_input_ids_list, state, extra_hash=apc_extra_hash
-            )
-
-        kwargs["speculative_checkpoint"] = speculative_checkpoint
-
     if (
         kwargs.get("draft_model") is None
         and prompt_cache_state is not None
         and prompt_cache_state.cache is not None
+        and not hasattr(prompt_cache_state.cache, "checkpoint")
     ):
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
         kv_cache = prompt_cache_state.cache
@@ -1107,8 +1082,9 @@ def stream_generate(
 
             def exact_checkpoint(prefix_len: int, prompt_cache: List[Any]) -> None:
                 apc_coordinator.store_checkpoint(
-                    full_input_ids_list[: reused_prefix_len + prefix_len],
+                    full_input_ids_list,
                     prompt_cache,
+                    prefix_len=reused_prefix_len + prefix_len,
                     extra_hash=apc_extra_hash,
                 )
 
@@ -1171,10 +1147,11 @@ def stream_generate(
             close = getattr(gen, "close", None)
             if close is not None:
                 close()
-            if speculative_prefix is not None and "state" in speculative_holder:
-                speculative_prefix.store(
+            completed_cache = speculative_holder.get("state", tracked_cache)
+            if apc_coordinator is not None and hasattr(completed_cache, "checkpoint"):
+                apc_coordinator.commit(
+                    completed_cache,
                     full_input_ids_list + generated_tokens,
-                    speculative_holder["state"],
                     extra_hash=apc_extra_hash,
                 )
 
@@ -1227,7 +1204,7 @@ def stream_generate(
             all_ids = full_input_ids_list + [
                 t.item() if hasattr(t, "item") else t for t in generated_tokens
             ]
-            prompt_cache_state.update(all_ids, tracked_cache)
+            prompt_cache_state.update(all_ids, completed_cache)
 
         # APC: harvest new blocks from the post-generation KV state.
         if apc_coordinator is not None and not apc_coordinator.is_checkpoint:

@@ -19,7 +19,7 @@ its native dense and MoE MTP weights; real-model validation uses Qwen3.5-0.8B.
 | `speculative/mtp.py` | Propose, run the target, accept, emit |
 | `speculative/sampling.py` | Model-independent prefix acceptance and target sampling |
 | `speculative/drafters/` | Checkpoint extraction and stateless GLM/Qwen MTP forwards |
-| `speculative/prefix_cache.py` | Atomic target/draft/seed checkpoints in the bounded APC store |
+| `apc_coordinator.py` | Normal prefix lookup, checkpoint scheduling, restore, and mixed-row cache assembly |
 | `speculative/utils.py` | CLI and server generation entry points |
 
 The MTP model owns weights. It has no request cache, hidden-state seed,
@@ -130,7 +130,13 @@ probability payload.
 
 ## Prefix reuse
 
-A checkpoint contains target caches, draft caches, logical position, the pending
+Prefix reuse belongs to ordinary prefill. Both AR and MTP use `APCCoordinator`
+and `PromptProcessingBatch`; there is no separate speculative prefix manager
+or warm-prefill scheduler. The coordinator accepts a request-cache factory,
+and the cache defines its components, checkpoint identity, and restore/merge
+operations. The coordinator does not import an MTP implementation.
+
+An MTP checkpoint contains target caches, draft caches, logical position, the pending
 target token, positional offsets, and the next MTP prediction/hidden state. It is stored through the
 existing APC budget, LRU, cloning, and disk serialization using native cache types.
 Keys are separated by target/draft checkpoint identity, schema, and the existing
@@ -145,20 +151,38 @@ extensions. Changing that pending token prevents reuse of that checkpoint.
 Prompt chunk boundaries and completed generations can be checkpointed. Closing
 a stream first commits only delivered tokens, then stores that committed state.
 `PromptCacheState` uses the same bounded checkpoint mechanism across turns.
-The server prefills restored suffixes independently when prefix lengths differ,
-then merges their target/draft caches for one batched decode. Cold-only requests
-retain batched prefill. This avoids target replay, with an added prefill scheduling
-cost for mixed warm/cold admissions.
+The server merges warm and empty request caches before prefill, then processes
+their suffixes together through the normal right-padded prompt batch. Each
+target chunk also initializes or extends the MTP cache. When a shorter row
+finishes, the cache retains its final target feature until its first output is
+sampled. Native cache padding controls which positions are retained. Speculative
+proposal and verification begin only after prefill finishes; neither prefix
+lookup nor prompt processing runs a speculative decoding round.
 
 Qwen's ordinary forward uses the existing shared short-block projection helpers
 and its existing convolution/attention operations with single-token reductions.
 Active cache transactions preserve cache object identity. Batch cache padding
 changes replace their metadata arrays, invalidating cached attention metadata.
+Prepared right-padded caches also keep their identity through prefill so row
+extraction cannot discard the metadata needed to preserve completed rows.
+GLM's sparse indexer uses the cache's logical padding metadata when reading
+stored validity flags, so stale bits in compacted padding never become real keys.
 No new Metal kernel is introduced for the second adapter.
 
 ## Validation and performance
 
-The latest controlled optimization comparison
+The unified-prefill check uses the real GLM-5.3-Flash FP8 target and native
+MXFP8 MTP head with 64 outputs per row. Ten comparisons cover a cold single
+request and mixed warm/cold batches in both row orders, at temperatures 0 and
+0.8. The cached prompt has 143 tokens and reuses 142; cold prompts have 10 and
+187 tokens. AR and MTP use matching prefix/batch layouts. All output tokens and
+selected target logprobs match exactly. Settings are chunk size 32, one draft
+plus bonus, top-P 0.9, seed 123, repetition penalty 1.1, and presence/frequency
+penalties 0.1 with the default 20-token penalty context. Eight APC entries keep
+the prompt checkpoint resident across cases. This is a correctness check,
+not a new throughput measurement.
+
+The earlier controlled optimization comparison
 uses an M3 Ultra with 512 GB RAM and MLX 0.32.2. It measures 256 output tokens
 per row, one draft plus bonus, and two alternating before/after repetitions
 with the same loaded FP8 target and MTP weights. Every output matches AR:
@@ -240,6 +264,22 @@ cache objects during an active transaction. These tests supplement the original
 short FP8 runs.
 
 ## Upstream references
+
+Prefix caching follows the normal prefill ownership used by both upstreams:
+
+- [vLLM's KV cache manager](https://github.com/vllm-project/vllm/blob/dc36fcce902a63eab06c1b93a5c4a5ee178a0c56/vllm/v1/core/kv_cache_manager.py#L265)
+  finds reusable prefixes through its regular cache coordinator. Its
+  [cache-group lookup](https://github.com/vllm-project/vllm/blob/dc36fcce902a63eab06c1b93a5c4a5ee178a0c56/vllm/v1/core/single_type_kv_cache_manager.py#L608)
+  reserves a matched tail block for EAGLE/MTP hidden-state recomputation.
+- [SGLang's request preparation](https://github.com/sgl-project/sglang/blob/2f5cc8e33e9717f8284ed48ffc7f012e7b4a4197/python/sglang/srt/managers/schedule_batch.py#L1530)
+  performs normal radix-cache prefix matching. Its
+  [speculative worker](https://github.com/sgl-project/sglang/blob/2f5cc8e33e9717f8284ed48ffc7f012e7b4a4197/python/sglang/srt/speculative/eagle_worker_v2.py#L1263)
+  runs target prefill and extends the draft with those target features before decode.
+
+Here, MLX stores an atomic request checkpoint and reprocesses one pending target
+token rather than reserving a paged KV block. The cache declares that one-token
+boundary to normal APC lookup. This preserves shifted MTP alignment without
+introducing another prefix-cache subsystem.
 
 The organization follows the proposal/verification/acceptance split visible
 in [vLLM's proposer](https://github.com/vllm-project/vllm/blob/main/vllm/v1/spec_decode/llm_base_proposer.py)

@@ -186,19 +186,17 @@ def test_chunked_prefill_keeps_only_draft_seed():
     cache = target.make_cache()
     prefill = SpeculativePrefill("mtp", draft, tokens)
     positions = []
-    prefill.start(
-        target,
-        cache,
-        draft,
-        checkpoint=lambda state: positions.append(state.position.item()),
-    )
+    prefill.start(target, cache, draft)
     for chunk in (tokens[:, :2], tokens[:, 2:4]):
         prefill.append(target(chunk, cache=cache, return_hidden=True))
+        positions.append(prefill.state.position.item())
     output = target(tokens[:, 4:], cache=cache, return_hidden=True)
     prefill.finish(output, mx.argmax(output.logits[:, -1], axis=-1))
     assert positions == [2, 4]
     assert prefill.state.position.item() == 5
     assert prefill.state.seed.hidden.shape[1] == 1
+    assert prefill.tail_hidden is None
+    assert not hasattr(prefill, "checkpoint")
     assert not hasattr(prefill, "chunks")
 
 
@@ -516,6 +514,34 @@ def test_glm5_next_cached_indexer_block_matches_stepwise(batch):
                     cache_index,
                     mx.max(mx.abs(step_value - block_value)).item(),
                 )
+
+
+def test_glm5_next_indexer_excludes_compacted_padding_flags():
+    config = _tiny_glm5_next_text_config()
+    config.index_kpool = 4
+    target = glm5_next_language.LanguageModel(config)
+    target.eval()
+    indexer = target.model.layers[1].self_attn.indexer
+    caches = _make_cache(target, [0, 0])[1]
+    # A large right-padding region wraps stored validity bits into physical
+    # left padding when the cache finalizes its prefill layout.
+    caches.prepare(lengths=[1, 187], right_padding=[186, 0])
+    indexer(
+        mx.ones((2, 187, config.hidden_size)),
+        mx.ones((2, 187, config.q_lora_rank)),
+        cache=caches[1],
+        pool_cache=caches[2],
+        offset=0,
+    )
+    caches.finalize()
+    topk = indexer(
+        mx.ones((2, 1, config.hidden_size)),
+        mx.ones((2, 1, config.q_lora_rank)),
+        cache=caches[1],
+        pool_cache=caches[2],
+        offset=caches[1].offset,
+    )
+    assert [i for i in topk[0, 0].tolist() if i >= 0] == [186, 187]
 
 
 @pytest.mark.parametrize("batch", [1, 8])

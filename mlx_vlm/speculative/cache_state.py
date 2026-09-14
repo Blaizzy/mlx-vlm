@@ -6,6 +6,7 @@ unaccepted inputs, and aligns the MTP tokens with verified target features.
 
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 
 import mlx.core as mx
 
@@ -131,7 +132,8 @@ class SpeculativePrefill:
         self.tokens = tokens
         self.state = None
         self.consumed = 0
-        self.checkpoint = None
+        self.lengths = None
+        self.tail_hidden = None
 
     def start(
         self,
@@ -140,49 +142,78 @@ class SpeculativePrefill:
         drafter,
         *,
         state=None,
-        checkpoint=None,
+        lengths=None,
         position_offset=None,
     ):
         """Stream target features into MTP, keeping only the next draft seed."""
         self.forward = partial(
             drafter, target_model=getattr(model, "language_model", model)
         )
-        self.state = state or SpeculativeCache.create(
-            target_cache, drafter, self.tokens.shape[0]
+        self.state = state or (
+            target_cache
+            if isinstance(target_cache, SpeculativeCache)
+            else SpeculativeCache.create(target_cache, drafter, self.tokens.shape[0])
         )
-        self.checkpoint = checkpoint
+        self.lengths = lengths or [self.tokens.shape[1]] * self.tokens.shape[0]
         if position_offset is not None:
             self.state.position_offset = position_offset.reshape(-1)
 
     def append(self, output):
-        if self.kwargs:
-            hidden = output.hidden_states[-1]
-            if self.state is not None:
-                end = self.consumed + hidden.shape[1]
-                self.state.bonus = self.tokens[:, end : end + 1]
-                self.state.prefill(
-                    self.tokens[:, self.consumed : end], hidden, self.forward
-                )
-                mx.async_eval(
+        if not self.kwargs:
+            return
+        if self.state is None:
+            raise RuntimeError("Initialize the speculative cache before prefill.")
+        hidden = output.hidden_states[-1]
+        width = hidden.shape[1]
+        end = self.consumed + width
+        lengths = [min(width, max(0, n - 1 - self.consumed)) for n in self.lengths]
+        eval_targets = []
+        # A right-padded row can finish before the rest of the batch. Retain
+        # its last target feature until the first output token has been sampled.
+        if any(self.consumed < n <= end for n in self.lengths):
+            indices = mx.array(self.lengths) - self.consumed - 1
+            last = mx.take_along_axis(
+                hidden, mx.clip(indices, 0, width - 1)[:, None, None], axis=1
+            )
+            if self.tail_hidden is None:
+                self.tail_hidden = mx.zeros_like(last)
+            self.tail_hidden = mx.where(
+                ((indices >= 0) & (indices < width))[:, None, None],
+                last,
+                self.tail_hidden,
+            )
+            # Materialize the retained vector so it cannot keep old chunks'
+            # full hidden-state graphs alive while longer rows finish.
+            eval_targets.append(self.tail_hidden)
+        if any(lengths):
+            next_token = self.tokens[:, end : end + 1]
+            self.state.bonus = (
+                next_token if next_token.size else mx.zeros_like(self.state.bonus)
+            )
+            self.state.prefill(
+                self.tokens[:, self.consumed : end],
+                hidden,
+                self.forward,
+                lengths=lengths,
+            )
+            eval_targets.extend(
+                [
                     [entry.state for entry in self.state.draft],
                     self.state.seed.token,
                     self.state.seed.hidden,
-                )
-                self.consumed = end
-                if self.checkpoint:
-                    self.checkpoint(self.state)
-                return
-            raise RuntimeError("Initialize the speculative cache before prefill.")
+                ]
+            )
+        if eval_targets:
+            mx.async_eval(eval_targets)
+        self.consumed = end
 
     def finish(self, output, first_bonus=None):
-        if self.state is not None:
-            self.state.bonus = first_bonus.reshape(-1, 1)
-            self.state.prefill(
-                self.tokens[:, self.consumed :], output.hidden_states[-1], self.forward
-            )
+        if not self.kwargs:
             return output
-        if self.kwargs:
-            raise RuntimeError("Initialize the speculative cache before prefill.")
+        self.append(output)
+        self.state.bonus = first_bonus.reshape(-1, 1)
+        self.state.prefill(self.state.bonus, self.tail_hidden, self.forward)
+        self.tail_hidden = None
         return output
 
 
@@ -213,6 +244,70 @@ class SpeculativeCache:
         self._draft_round = None
         self._verified_hidden = None
         self._proposals = None
+
+    # Expose the target's ordinary layer-cache sequence to model forwards.
+    def __len__(self):
+        return len(self.target)
+
+    def __iter__(self):
+        return iter(self.target)
+
+    def __getitem__(self, index):
+        return self.target[index]
+
+    def __setitem__(self, index, value):
+        self.target[index] = value
+
+    prefix_replay_tokens = 1
+
+    @property
+    def prefix_cache_components(self):
+        return [CacheList(*self.target), CacheList(*self.draft), ArraysCache(5)]
+
+    @classmethod
+    def for_model(cls, model, drafter, target_cache):
+        """Cache factory consumed by the normal APC coordinator."""
+        from ..apc import semantic_extra_hash
+
+        def identity(weights):
+            path = getattr(weights, "model_path", None)
+            if path is None:
+                return id(weights)
+            path = Path(path).resolve()
+            files = sorted([*path.glob("*.safetensors"), path / "config.json"])
+            return [
+                str(path),
+                [
+                    (p.name, p.stat().st_size, p.stat().st_mtime_ns)
+                    for p in files
+                    if p.exists()
+                ],
+            ]
+
+        state = cls.create(target_cache, drafter, 1)
+        state.prefix_cache_identity = {
+            "mtp_schema": 3,
+            "target": identity(getattr(model, "language_model", model)),
+            "draft": identity(drafter),
+            "draft_dependencies": semantic_extra_hash(model=drafter),
+        }
+        return state
+
+    def prefix_cache_key(self, tokens, row=0):
+        """MTP has already consumed the pending target token at this boundary."""
+        position = int(self.position[row].item())
+        if position < 1 or position >= len(tokens):
+            return None
+        if self.bonus[row].item() != tokens[position]:
+            raise ValueError("Prefix checkpoint must include its pending target token.")
+        return list(tokens[: position + 1])
+
+    def validate_prefix(self, tokens, position):
+        if (
+            int(self.position.item()) != position
+            or self.bonus.item() != tokens[position]
+        ):
+            raise ValueError("Request cache is not aligned with its prefix key.")
 
     @classmethod
     def create(cls, target_cache, drafter, batch):
@@ -263,25 +358,36 @@ class SpeculativeCache:
         return state
 
     @classmethod
-    def merge(cls, states):
-        """Join independently prefilled rows without replaying either model."""
+    def merge(cls, states, *, kv_quant_config=None):
+        """Merge warm and empty rows before ordinary batched prefill."""
         from ..apc import make_warm_batch_exact_cache_multi
 
-        checkpoints = [state.checkpoint() for state in states]
         positions = [int(state.position.item()) for state in states]
         target, _ = make_warm_batch_exact_cache_multi(
-            [c[0].caches for c in checkpoints], positions
+            [s.target for s in states], positions, kv_quant_config=kv_quant_config
         )
         draft, _ = make_warm_batch_exact_cache_multi(
-            [c[1].caches for c in checkpoints], positions
+            [s.draft for s in states], positions
         )
         if target is None or draft is None:
-            raise ValueError("Cache types cannot merge speculative request rows.")
+            raise ValueError("Cache types cannot merge request rows.")
         state = cls(target, draft, positions, mx.concatenate([s.bonus for s in states]))
-        state.seed = DraftState(
-            mx.concatenate([s.seed.token for s in states]),
-            mx.concatenate([s.seed.hidden for s in states]),
-        )
+        seed = next((s.seed for s in states if s.seed is not None), None)
+        if seed is not None:
+            state.seed = DraftState(
+                mx.concatenate(
+                    [
+                        s.seed.token if s.seed else mx.zeros_like(seed.token)
+                        for s in states
+                    ]
+                ),
+                mx.concatenate(
+                    [
+                        s.seed.hidden if s.seed else mx.zeros_like(seed.hidden)
+                        for s in states
+                    ]
+                ),
+            )
         state.position_offset = mx.concatenate([s.position_offset for s in states])
         state.stats = [stats for s in states for stats in s.stats]
         return state
@@ -289,17 +395,51 @@ class SpeculativeCache:
     def positions(self, length):
         return (self.position + self.position_offset)[:, None] + mx.arange(length)[None]
 
-    def prefill(self, tokens, hidden, forward):
+    def prefill(self, tokens, hidden, forward, *, lengths=None):
         if tokens.shape[:2] != hidden.shape[:2] or tokens.shape[1] == 0:
             raise ValueError(
                 "MTP requires target hidden states for every prompt token."
             )
+        width = tokens.shape[1]
+        lengths = lengths or [width] * tokens.shape[0]
         shifted = mx.concatenate([tokens[:, 1:], self.bonus], axis=1)
+        width = max(lengths)
+        shifted, hidden = shifted[:, :width], hidden[:, :width]
+        # Reuse native prefill padding support. Each chunk ends with canonical
+        # caches, even when some rows finished and receive only padding.
+        padding = [width - n for n in lengths]
+        if any(padding):
+            for entry in self.draft:
+                entry.prepare(lengths=lengths, right_padding=padding)
         logits, draft_hidden = forward(
-            shifted, hidden, self.draft, self.position + self.position_offset
+            shifted,
+            hidden,
+            self.draft,
+            self.position + self.position_offset,
+            lengths=lengths,
         )
-        self.position = self.position + tokens.shape[1]
-        self.seed = DraftState(mx.argmax(logits, axis=-1), draft_hidden[:, -1:])
+        if any(padding):
+            for entry in self.draft:
+                entry.finalize()
+        self.position = self.position + mx.array(lengths)
+        last = mx.take_along_axis(
+            draft_hidden, mx.maximum(mx.array(lengths), 1)[:, None, None] - 1, axis=1
+        )
+        token = mx.argmax(logits, axis=-1)
+        active = mx.array(lengths)[:, None] > 0
+        previous = self.seed or DraftState(mx.zeros_like(token), mx.zeros_like(last))
+        self.seed = DraftState(
+            mx.where(active, token, previous.token),
+            mx.where(active[..., None], last, previous.hidden),
+        )
+        # The shift at the last retained position, not a padded batch column.
+        self.bonus = mx.where(
+            active,
+            mx.take_along_axis(
+                shifted, mx.maximum(mx.array(lengths), 1)[:, None] - 1, axis=1
+            ),
+            self.bonus,
+        )
 
     def propose(self, count, forward):
         if self._target_round is not None:

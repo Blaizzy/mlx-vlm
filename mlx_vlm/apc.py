@@ -1539,7 +1539,7 @@ class DiskBlockStore:
         token_tuple = tuple(int(t) for t in token_ids)
         max_len = len(token_tuple) - 1
         if max_prefix_tokens is not None and max_prefix_tokens > 0:
-            max_len = min(max_len, int(max_prefix_tokens))
+            max_len = min(len(token_tuple), int(max_prefix_tokens))
         if max_len <= min_prefix_tokens:
             return None
 
@@ -3358,6 +3358,8 @@ class APCManager:
         addition to attention KV. That state is not block-concatenable, so the
         safe reuse unit is an exact prompt-cache snapshot at a prefix boundary.
         Plain dense K/V snapshots can also be sliced to the last matching block.
+        By default a final input remains for prefill. An explicit maximum may
+        match the full key when the request cache itself reserves a replay tail.
         """
         disk = self.disk
         if self._exact_cache_max <= 0 and disk is None:
@@ -3369,7 +3371,7 @@ class APCManager:
         prompt_capacity_tokens = len(token_tuple)
         max_len = len(token_tuple) - 1
         if max_prefix_tokens is not None and max_prefix_tokens > 0:
-            max_len = min(max_len, int(max_prefix_tokens))
+            max_len = min(len(token_tuple), int(max_prefix_tokens))
         if max_len <= min_prefix_tokens:
             return None, 0
 
@@ -3420,7 +3422,7 @@ class APCManager:
             disk_match = disk.find_exact_prefix(
                 token_tuple,
                 extra_hash=extra_hash,
-                max_prefix_tokens=max_prefix_tokens,
+                max_prefix_tokens=max_len,
                 min_prefix_tokens=max(min_prefix_tokens, prefix_len),
                 block_size=self.block_size,
             )
@@ -4649,6 +4651,7 @@ def apc_lookup_plan(
     safe_lookup_min: int,
     suffix_is_text_only,
     prefix_has_media,
+    prefix_replay_tokens: int = 0,
 ) -> Optional[dict]:
     """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply."""
     n = len(ids_list)
@@ -4657,8 +4660,12 @@ def apc_lookup_plan(
 
     if apc_mode == "exact":
         exact_cache, exact_prefix_len = manager.lookup_exact_cache(
-            ids_list, extra_hash=extra_hash, min_prefix_tokens=safe_lookup_min
+            ids_list,
+            extra_hash=extra_hash,
+            max_prefix_tokens=n - 1 + prefix_replay_tokens,
+            min_prefix_tokens=safe_lookup_min + prefix_replay_tokens,
         )
+        exact_prefix_len -= prefix_replay_tokens
         if exact_cache is not None and 0 < exact_prefix_len < n:
             if not suffix_is_text_only(exact_prefix_len):
                 return None

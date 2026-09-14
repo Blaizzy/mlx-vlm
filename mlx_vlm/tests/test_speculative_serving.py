@@ -6,11 +6,31 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
-from mlx_vlm.apc import APCManager, DiskBlockStore
+from mlx_vlm.apc import APCCoordinator, APCManager, DiskBlockStore
 from mlx_vlm.generate.ar import BatchGenerator, generate_step
 from mlx_vlm.models.base import InputEmbeddingsFeatures
-from mlx_vlm.speculative.prefix_cache import SpeculativePrefixCache
+from mlx_vlm.models.cache import KVCache
+from mlx_vlm.speculative.cache_state import SpeculativeCache
 from mlx_vlm.tests.test_speculative import models as glm_models
+
+
+def coordinator(manager, target, draft):
+    return APCCoordinator(
+        manager,
+        target,
+        cache_factory=partial(SpeculativeCache.for_model, target, draft),
+    )
+
+
+def lookup(prefix, tokens, extra_hash=0):
+    hit = prefix.lookup(
+        tokens,
+        extra_hash=extra_hash,
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda _: True,
+        prefix_has_media=lambda _: False,
+    )
+    return (hit["warm_cache"], hit["prefix_len"]) if hit is not None else (None, 0)
 
 
 @pytest.fixture(autouse=True)
@@ -116,10 +136,19 @@ def generate(target, draft, prompt, *, state=None, prefix=None, **kwargs):
             None,
             draft_model=draft,
             full_prompt_tokens=full,
-            speculative_cache=state,
+            prompt_cache=state,
             speculative_cache_callback=holder.append,
-            speculative_checkpoint=(
-                (lambda state: prefix.store(prompt, state)) if prefix else None
+            prompt_cache_checkpoint=(
+                (
+                    lambda length, caches: prefix.store_checkpoint(
+                        prompt, caches, prefix_len=length
+                    )
+                )
+                if prefix
+                else None
+            ),
+            prompt_cache_checkpoint_lengths=(
+                prefix.checkpoint_lengths(prompt, set()) if prefix else None
             ),
             **kwargs,
         )
@@ -164,11 +193,11 @@ def test_processors_see_full_committed_history(pair, temperature, chunk):
 def test_prefix_reuse_restores_both_caches_and_seed(pair, temperature):
     target, draft = pair
     manager = APCManager(num_blocks=1, block_size=4)
-    prefix = SpeculativePrefixCache(manager, target, draft)
+    prefix = coordinator(manager, target, draft)
     prompt = [1, 2, 3, 4, 5, 6]
     kwargs = dict(temperature=temperature, seed=17, repetition_penalty=1.2)
     original, state = generate(target, draft, prompt, prefix=prefix, **kwargs)
-    warm, position = prefix.lookup(prompt)
+    warm, position = lookup(prefix, prompt)
     assert position == len(prompt) - 1
     assert warm.position.item() == position
     assert warm.bonus.item() == prompt[-1]
@@ -176,8 +205,8 @@ def test_prefix_reuse_restores_both_caches_and_seed(pair, temperature):
         target._rope_deltas = mx.array([[99]])
     assert generate(target, draft, prompt, state=warm, **kwargs)[0] == original
     history = prompt + original
-    assert prefix.store(history, state)
-    warm, position = prefix.lookup(history + [7, 8, 9])
+    assert prefix.store_checkpoint(history, state)
+    warm, position = lookup(prefix, history + [7, 8, 9])
     assert position == len(history) - 1
     expected, _ = generate(target, None, history + [7, 8, 9], **kwargs)
     actual, _ = generate(target, draft, history + [7, 8, 9], state=warm, **kwargs)
@@ -188,15 +217,18 @@ def test_prefix_reuse_restores_both_caches_and_seed(pair, temperature):
 def test_checkpoint_key_includes_pending_token_and_draft_identity(pair):
     target, draft = pair
     manager = APCManager(num_blocks=1)
-    prefix = SpeculativePrefixCache(manager, target, draft)
+    prefix = coordinator(manager, target, draft)
     prompt = [1, 2, 3]
     generated, state = generate(target, draft, prompt, max_tokens=1)
     key = prompt + generated
-    assert prefix.store(key, state)
-    assert prefix.lookup(key)[1] == len(prompt)
-    assert prefix.lookup(key[:-1] + [(key[-1] + 1) % 32]) == (None, 0)
-    assert prefix.lookup(key, extra_hash=99) == (None, 0)
-    assert SpeculativePrefixCache(manager, target, object()).lookup(key) == (None, 0)
+    assert prefix.store_checkpoint(key, state)
+    assert lookup(prefix, key)[1] == len(prompt)
+    assert lookup(prefix, key[:-1] + [(key[-1] + 1) % 32]) == (None, 0)
+    assert lookup(prefix, key, extra_hash=99) == (None, 0)
+    assert lookup(APCCoordinator(manager, target), key) == (None, 0)
+    assert lookup(
+        coordinator(manager, target, SimpleNamespace(make_cache=draft.make_cache)), key
+    ) == (None, 0)
     manager.close()
 
 
@@ -208,13 +240,14 @@ def test_speculative_checkpoint_disk_roundtrip(pair, tmp_path, monkeypatch):
     history = prompt + generated
     disk = DiskBlockStore(tmp_path, namespace="mtp")
     manager = APCManager(num_blocks=1, disk=disk)
-    prefix = SpeculativePrefixCache(manager, target, draft)
-    assert prefix.store(history, state)
+    prefix = coordinator(manager, target, draft)
+    assert prefix.store_checkpoint(history, state)
     disk._q.join()
     manager.close()
     manager = APCManager(num_blocks=1, disk=DiskBlockStore(tmp_path, namespace="mtp"))
-    prefix = SpeculativePrefixCache(manager, target, draft)
-    warm, position = prefix.lookup(history + [5, 6])
+    prefix = coordinator(manager, target, draft)
+    assert lookup(prefix, history)[1] == len(history) - 1
+    warm, position = lookup(prefix, history + [5, 6])
     assert position == len(history) - 1
     assert mx.array_equal(warm.seed.hidden, state.seed.hidden).item()
     assert (
@@ -233,8 +266,12 @@ class NeverStop:
 
 
 @pytest.mark.parametrize("temperature", [0, 0.8])
-def test_server_mixed_warm_cold_rows_share_decode(pair, temperature):
-    from mlx_vlm.generate.ar import SpeculativePromptBatch, _PositionedTargetSampler
+@pytest.mark.parametrize("cold_tokens", [[8], [8, 9, 10], [8, 9, 10, 11, 12, 13]])
+@pytest.mark.parametrize("chunk", [1, 2, 32])
+def test_server_mixed_warm_cold_rows_share_prefill_and_decode(
+    pair, temperature, cold_tokens, chunk
+):
+    from mlx_vlm.generate.ar import PromptProcessingBatch, _PositionedTargetSampler
     from mlx_vlm.sample_utils import make_logits_processors
 
     target, draft = pair
@@ -243,10 +280,10 @@ def test_server_mixed_warm_cold_rows_share_decode(pair, temperature):
     prompt = [1, 2, 3, 4, 5]
     _, state = generate(target, draft, prompt, max_tokens=1, **kwargs)
     # Use a prompt checkpoint whose shifted draft cache depends on the next input.
-    prefix = SpeculativePrefixCache(manager, target, draft)
+    prefix = coordinator(manager, target, draft)
     key = prompt + [int(state.bonus.item())]
-    assert prefix.store(key, state)
-    prompts = [[8, 9, 10], key + [6, 7]]
+    assert prefix.store_checkpoint(key, state)
+    prompts = [cold_tokens, key + [6, 7]]
     sampler = (
         None
         if temperature == 0
@@ -261,7 +298,7 @@ def test_server_mixed_warm_cold_rows_share_decode(pair, temperature):
         apc_manager=manager,
         prefill_batch_size=2,
         completion_batch_size=2,
-        prefill_step_size=2,
+        prefill_step_size=chunk,
         sampler=sampler,
     )
     processor = make_logits_processors(repetition_penalty=1.2)
@@ -283,7 +320,10 @@ def test_server_mixed_warm_cold_rows_share_decode(pair, temperature):
     saw_restored = False
     while generator.has_work:
         progress, responses = generator.next()
-        saw_restored |= isinstance(generator._prompt_batch, SpeculativePromptBatch)
+        if isinstance(generator._prompt_batch, PromptProcessingBatch):
+            assert generator._prompt_batch.uids == ids
+            assert isinstance(generator._prompt_batch.prompt_cache, SpeculativeCache)
+            saw_restored = True
         for row in progress:
             cached[row.uid] = row.cached_tokens
         for response in responses:
@@ -297,9 +337,14 @@ def test_server_mixed_warm_cold_rows_share_decode(pair, temperature):
     assert cached[ids[1]] == len(key) - 1
     for uid, prompt in zip(ids, prompts):
         history = prompt + actual[uid]
-        warm, position = prefix.lookup(history)
+        warm, position = lookup(prefix, history)
         assert position == len(history) - 1
         assert warm.bonus.item() == history[-1]
+        # The logical cursor must agree with dense target/draft storage;
+        # dropped padding metadata can otherwise leave unnoticed extra inputs.
+        for entry in [*warm.target, *warm.draft]:
+            if isinstance(entry, KVCache):
+                assert entry.offset == position
     generator.close()
     manager.close()
 
@@ -332,10 +377,10 @@ def test_stream_cancel_saves_only_delivered_prefix(pair):
     )
     delivered = [next(stream).token, next(stream).token]
     stream.close()
-    prefix = SpeculativePrefixCache(request_cache.speculative_manager, model, draft)
+    prefix = coordinator(request_cache.apc_manager, model, draft)
     # Request hashes also include processor/media semantics; the mock has none.
     history = prompt + delivered
-    warm, position = prefix.lookup(history)
+    warm, position = lookup(prefix, history)
     assert position == len(history) - 1
     assert warm.bonus.item() == delivered[-1]
     assert not any(getattr(c, "is_speculating", False) for c in warm.target)
@@ -356,7 +401,7 @@ def test_stream_cancel_saves_only_delivered_prefix(pair):
     )
     assert results[-1].cached_tokens == position
     assert results[-1].token_ids == [0] * 5
-    request_cache.speculative_manager.close()
+    request_cache.apc_manager.close()
 
 
 def test_processor_requiring_external_updates_yields_each_token(pair):

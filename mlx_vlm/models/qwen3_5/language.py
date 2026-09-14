@@ -1257,9 +1257,13 @@ class Qwen3_5Model(nn.Module):
         # Row extraction replaces cache objects. Preserve their identity while
         # the native caches are recording a bounded temporal history.
         recording = any(getattr(entry, "is_speculating", False) for entry in cache)
+        # Row extraction discards the prepared right-padding metadata. Keep
+        # these caches in place until the normal prefill path finalizes them.
+        padded_prefill = getattr(cache[self.ssm_idx], "lengths", None) is not None
         if (
             h.shape[0] == 1
             and not recording
+            and not padded_prefill
             and hidden_sink is None
             and fa_cache is not None
             and _is_single_row_batch_cache(fa_cache)
@@ -1289,6 +1293,7 @@ class Qwen3_5Model(nn.Module):
         if (
             h.shape[0] > 1
             and not recording
+            and not padded_prefill
             and h.shape[1] > 1
             and hidden_sink is None
             and fa_cache is not None
