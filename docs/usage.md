@@ -16,6 +16,36 @@ Launch the chat interface:
 python -m mlx_vlm.chat_ui --model mlx-community/Qwen2-VL-2B-Instruct-4bit
 ```
 
+## OpenAI Responses terminal bridge
+
+The bridge lets a local MLX-LM/MLX-VLM chat workflow ask an OpenAI model a
+question without putting credentials in code or command arguments:
+
+```bash
+export OPENAI_API_KEY='...'
+printf '%s\n' 'Summarize the local model output.' | python -m mlx_vlm openai_bridge
+python -m mlx_vlm openai_bridge --prompt 'Explain this error briefly.'
+```
+
+Configuration uses `OPENAI_API_KEY`, optional `OPENAI_MODEL` (default
+`gpt-4.1-mini`), optional `OPENAI_BASE_URL` (default
+`https://api.openai.com/v1`), and optional `OPENAI_TIMEOUT` in seconds.
+`--json` prints the complete Responses API object.
+
+SSH is not needed when the bridge and MLX chat process run on the same
+machine: both can call the public API directly. If the command must reach an
+OpenAI-compatible proxy listening on a remote host's loopback interface, keep
+the SSH tunnel private and bind it to loopback only, for example:
+
+```bash
+ssh -N -L 127.0.0.1:18080:127.0.0.1:8080 user@remote-host
+OPENAI_BASE_URL=http://127.0.0.1:18080/v1 python -m mlx_vlm openai_bridge \
+    --prompt 'Use the remote proxy.'
+```
+
+Do not expose that forwarded port publicly. For the public OpenAI API, leave
+`OPENAI_BASE_URL` at its HTTPS default.
+
 ## Python Script
 
 ```python

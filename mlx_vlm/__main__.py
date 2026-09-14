@@ -14,6 +14,7 @@ if __name__ == "__main__":
         "chat",
         "chat_ui",
         "server",
+        "openai_bridge",
         "moe_offload",
     }
 

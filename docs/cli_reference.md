@@ -19,6 +19,7 @@ python -m mlx_vlm generate --help
 - `mlx_vlm.generate` – run inference on images, audio, or video.
 - `mlx_vlm.chat_ui` – start an interactive Gradio UI.
 - `mlx_vlm.server` – run the FastAPI server.
+- `mlx_vlm.openai_bridge` – call the OpenAI Responses API from a terminal.
 - `mlx_vlm.moe_offload` – repack a MoE checkpoint for expert offloading.
 
 Each command accepts `--help` for full usage information.
