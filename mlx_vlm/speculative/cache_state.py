@@ -262,7 +262,7 @@ class SpeculativeCache:
 
     @property
     def prefix_cache_components(self):
-        return [CacheList(*self.target), CacheList(*self.draft), ArraysCache(5)]
+        return [CacheList(*self.target), CacheList(*self.draft), ArraysCache(3)]
 
     @classmethod
     def for_model(cls, model, drafter, target_cache):
@@ -329,32 +329,34 @@ class SpeculativeCache:
         )
 
     def checkpoint(self, row=0):
-        """Return an atomic target/draft/seed checkpoint using native APC types."""
+        """Snapshot committed caches and alignment; suffix prefill rebuilds the seed."""
         from ..apc import snapshot_prompt_cache_row
 
-        if self._target_round is not None or self.seed is None:
+        if self._target_round is not None:
             raise RuntimeError("Only committed speculative state can be checkpointed.")
         target = snapshot_prompt_cache_row(self.target, row, clone=False)
         draft = snapshot_prompt_cache_row(self.draft, row, clone=False)
         if target is None or draft is None:
             raise ValueError("Cache cannot extract a prefix checkpoint row.")
-        metadata = ArraysCache(5)
+        metadata = ArraysCache(3)
         metadata.cache = [
             self.position[row : row + 1, None],
             self.bonus[row : row + 1],
-            self.seed.token[row : row + 1],
-            self.seed.hidden[row : row + 1],
             self.position_offset[row : row + 1, None],
         ]
         return [CacheList(*target), CacheList(*draft), metadata]
 
     @classmethod
     def restore(cls, checkpoint):
+        """Restore prefix state without a decode seed, including older checkpoints."""
         target, draft, metadata = checkpoint
-        position, bonus, token, hidden, position_offset = metadata.cache
+        values = metadata.cache
+        if len(values) == 5:
+            # Older entries also saved a prediction and hidden state; ignore them.
+            values = [values[0], values[1], values[4]]
+        position, bonus, position_offset = values
         state = cls(target.caches, draft.caches, position, bonus)
         state.position_offset = position_offset.reshape(-1)
-        state.seed = DraftState(token, hidden)
         return state
 
     @classmethod
@@ -372,22 +374,6 @@ class SpeculativeCache:
         if target is None or draft is None:
             raise ValueError("Cache types cannot merge request rows.")
         state = cls(target, draft, positions, mx.concatenate([s.bonus for s in states]))
-        seed = next((s.seed for s in states if s.seed is not None), None)
-        if seed is not None:
-            state.seed = DraftState(
-                mx.concatenate(
-                    [
-                        s.seed.token if s.seed else mx.zeros_like(seed.token)
-                        for s in states
-                    ]
-                ),
-                mx.concatenate(
-                    [
-                        s.seed.hidden if s.seed else mx.zeros_like(seed.hidden)
-                        for s in states
-                    ]
-                ),
-            )
         state.position_offset = mx.concatenate([s.position_offset for s in states])
         state.stats = [stats for s in states for stats in s.stats]
         return state

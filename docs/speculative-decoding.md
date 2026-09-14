@@ -137,8 +137,10 @@ and the cache defines its components, checkpoint identity, and restore/merge
 operations. The coordinator does not import an MTP implementation.
 
 An MTP checkpoint contains target caches, draft caches, logical position, the pending
-target token, positional offsets, and the next MTP prediction/hidden state. It is stored through the
-existing APC budget, LRU, cloning, and disk serialization using native cache types.
+target token, and positional offsets. The next MTP prediction and hidden-state seed
+belong to the live request and are regenerated during suffix prefill before decode.
+Checkpoints use the existing APC budget, LRU, cloning, and disk serialization with
+native cache types. Older checkpoints remain readable; their saved seeds are ignored.
 Keys are separated by target/draft checkpoint identity, schema, and the existing
 request/tenant/media salt. A target-only checkpoint cannot satisfy an MTP lookup.
 
@@ -179,7 +181,9 @@ request and mixed warm/cold batches in both row orders, at temperatures 0 and
 selected target logprobs match exactly. Settings are chunk size 32, one draft
 plus bonus, top-P 0.9, seed 123, repetition penalty 1.1, and presence/frequency
 penalties 0.1 with the default 20-token penalty context. Eight APC entries keep
-the prompt checkpoint resident across cases. This is a correctness check,
+the prompt checkpoint resident across cases. The check also passes with seeds
+omitted from APC and regenerated from the warm row's one-token suffix.
+This is a correctness check,
 not a new throughput measurement.
 
 The earlier controlled optimization comparison

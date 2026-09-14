@@ -190,7 +190,7 @@ def test_processors_see_full_committed_history(pair, temperature, chunk):
 
 
 @pytest.mark.parametrize("temperature", [0, 0.8])
-def test_prefix_reuse_restores_both_caches_and_seed(pair, temperature):
+def test_prefix_reuse_restores_both_caches_and_rebuilds_seed(pair, temperature):
     target, draft = pair
     manager = APCManager(num_blocks=1, block_size=4)
     prefix = coordinator(manager, target, draft)
@@ -201,17 +201,45 @@ def test_prefix_reuse_restores_both_caches_and_seed(pair, temperature):
     assert position == len(prompt) - 1
     assert warm.position.item() == position
     assert warm.bonus.item() == prompt[-1]
+    assert warm.seed is None
     if hasattr(target, "_rope_deltas"):
         target._rope_deltas = mx.array([[99]])
-    assert generate(target, draft, prompt, state=warm, **kwargs)[0] == original
+    actual, resumed = generate(target, draft, prompt, state=warm, **kwargs)
+    assert actual == original
+    assert resumed.seed is not None
     history = prompt + original
     assert prefix.store_checkpoint(history, state)
     warm, position = lookup(prefix, history + [7, 8, 9])
     assert position == len(history) - 1
+    assert warm.seed is None
     expected, _ = generate(target, None, history + [7, 8, 9], **kwargs)
     actual, _ = generate(target, draft, history + [7, 8, 9], state=warm, **kwargs)
     assert actual == expected
     manager.close()
+
+
+def test_checkpoint_omits_decode_seed_and_rejects_active_round(pair):
+    target, draft = pair
+    _, state = generate(target, draft, [1, 2, 3], max_tokens=1)
+    state.position_offset = mx.array([17], dtype=mx.int32)
+    checkpoint = state.checkpoint()
+    metadata = checkpoint[-1].cache
+    assert len(metadata) == 3
+    assert [value.shape for value in metadata] == [(1, 1)] * 3
+    restored = SpeculativeCache.restore(checkpoint)
+    assert restored.seed is None
+    assert restored.position.item() == state.position.item()
+    assert restored.bonus.item() == state.bonus.item()
+    assert restored.position_offset.item() == 17
+    assert len(restored.checkpoint()[-1].cache) == 3
+    with pytest.raises(ValueError, match="Prefill the MTP cache"):
+        restored.propose(0, None)
+    state.propose(0, None)
+    try:
+        with pytest.raises(RuntimeError, match="Only committed speculative state"):
+            state.checkpoint()
+    finally:
+        state.abort()
 
 
 def test_checkpoint_key_includes_pending_token_and_draft_identity(pair):
@@ -232,11 +260,19 @@ def test_checkpoint_key_includes_pending_token_and_draft_identity(pair):
     manager.close()
 
 
-def test_speculative_checkpoint_disk_roundtrip(pair, tmp_path, monkeypatch):
+@pytest.mark.parametrize("legacy_seed", [False, True])
+def test_speculative_checkpoint_disk_roundtrip(
+    pair, tmp_path, monkeypatch, legacy_seed
+):
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
     target, draft = pair
     prompt = [1, 2, 3]
     generated, state = generate(target, draft, prompt, max_tokens=5)
+    if legacy_seed:
+        # Existing disk entries use the same identity, with two extra seed arrays.
+        checkpoint = state.checkpoint()
+        checkpoint[-1].cache[2:2] = [state.seed.token, state.seed.hidden]
+        monkeypatch.setattr(state, "checkpoint", lambda row=0: checkpoint)
     history = prompt + generated
     disk = DiskBlockStore(tmp_path, namespace="mtp")
     manager = APCManager(num_blocks=1, disk=disk)
@@ -249,7 +285,8 @@ def test_speculative_checkpoint_disk_roundtrip(pair, tmp_path, monkeypatch):
     assert lookup(prefix, history)[1] == len(history) - 1
     warm, position = lookup(prefix, history + [5, 6])
     assert position == len(history) - 1
-    assert mx.array_equal(warm.seed.hidden, state.seed.hidden).item()
+    assert warm.seed is None
+    assert len(warm.checkpoint()[-1].cache) == 3
     assert (
         generate(target, draft, history + [5, 6], state=warm)[0]
         == generate(target, None, history + [5, 6])[0]
@@ -340,6 +377,7 @@ def test_server_mixed_warm_cold_rows_share_prefill_and_decode(
         warm, position = lookup(prefix, history)
         assert position == len(history) - 1
         assert warm.bonus.item() == history[-1]
+        assert warm.seed is None
         # The logical cursor must agree with dense target/draft storage;
         # dropped padding metadata can otherwise leave unnoticed extra inputs.
         for entry in [*warm.target, *warm.draft]:
