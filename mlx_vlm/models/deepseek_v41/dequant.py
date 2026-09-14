@@ -80,16 +80,6 @@ def dequant_fp4(packed: mx.array, scale_u8: mx.array, dtype=mx.bfloat16) -> mx.a
     return (w * s).astype(dtype)
 
 
-def dequant_fp8_rows(
-    weight_u8: mx.array, scale_u8: mx.array, block: int = 32
-) -> mx.array:
-    """Engram-table layout: e4m3 [..., d] + ue8m0 [..., d//block] -> float32."""
-    w = mx.from_fp8(weight_u8, mx.float32)
-    s = e8m0_to_float(scale_u8)
-    wv = w.reshape(*w.shape[:-1], w.shape[-1] // block, block)
-    return (wv * s[..., None]).reshape(w.shape)
-
-
 def is_fp4_expert(name: str) -> bool:
     """Routed-expert matmuls are the FP4 ones; shared experts are FP8."""
     return ".experts." in name and ".shared_experts." not in name

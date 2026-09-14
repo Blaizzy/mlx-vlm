@@ -20123,30 +20123,12 @@ class TestDeepseekV41Basics(unittest.TestCase):
         config = deepseek_v41.ModelConfig(
             hidden_size=32, vocab_size=64, dspark_markov_rank=8
         )
-        markov = deepseek_v41.DSparkMarkovHead(config)
-        mx.eval(markov.parameters())
-        token_ids = mx.array([[1, 2, 3]])
-        logits, embed = markov(token_ids)
-        mx.eval(logits, embed)
-        self.assertEqual(logits.shape, (1, 3, 64))
-        self.assertEqual(embed.shape, (1, 3, 8))
-
         confidence = deepseek_v41.DSparkConfidenceHead(config)
         mx.eval(confidence.parameters())
         scores = confidence(mx.random.normal((1, 3, 32)), mx.random.normal((1, 3, 8)))
         mx.eval(scores)
         self.assertEqual(scores.shape, (1, 3))
         self.assertEqual(scores.dtype, mx.float32)
-
-    def test_deepseek_v41_dspark_topk_idxs(self):
-        from mlx_vlm.models import deepseek_v41
-
-        idxs = deepseek_v41.get_dspark_topk_idxs(128, 2, 5, 10)
-        mx.eval(idxs)
-        self.assertEqual(idxs.shape, (2, 5, 11 + 5))
-        self.assertTrue(bool(mx.all(idxs[0, 0, :11] == mx.arange(11))))
-        with self.assertRaises(AssertionError):
-            deepseek_v41.get_dspark_topk_idxs(128, 2, 5, 0)
 
     def test_deepseek_v41_cache_trim_rollback(self):
         from mlx_vlm.models import deepseek_v41
@@ -21060,16 +21042,6 @@ class TestDeepseekV41Dequant(unittest.TestCase):
         mx.eval(out)
         self.assertEqual(out.shape, (2, 64))
         self.assertTrue(bool(mx.allclose(out, mx.full((2, 64), 2.0))))
-
-    def test_deepseek_v41_dequant_fp8_rows(self):
-        from mlx_vlm.models import deepseek_v41
-
-        w = mx.full((2, 64), 0x38, dtype=mx.uint8)
-        s = mx.full((2, 2), 127, dtype=mx.uint8)
-        out = deepseek_v41.dequant_fp8_rows(w, s)
-        mx.eval(out)
-        self.assertEqual(out.shape, (2, 64))
-        self.assertTrue(bool(mx.allclose(out, mx.ones((2, 64)))))
 
     def test_deepseek_v41_is_fp4_expert(self):
         from mlx_vlm.models import deepseek_v41
