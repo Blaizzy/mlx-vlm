@@ -1,5 +1,8 @@
 """Tests for prompt_utils module, specifically multimodal content handling."""
 
+from copy import deepcopy
+from types import SimpleNamespace
+
 import pytest
 
 from mlx_vlm.prompt_utils import apply_chat_template, extract_text_from_content
@@ -17,6 +20,261 @@ def _assistant_tool_call(content):
             }
         ],
     }
+
+
+class TestMessageMetadata:
+    @pytest.mark.parametrize("as_list", [False, True])
+    def test_formatter_fields_take_precedence(self, monkeypatch, as_list):
+        original = {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}],
+            "name": "speaker",
+            "custom": {"nested": [1, None]},
+            "owned": "original",
+        }
+        before = deepcopy(original)
+        formatted = {"role": "assistant", "content": "formatted", "owned": "new"}
+        monkeypatch.setattr(
+            "mlx_vlm.prompt_utils.get_message_json", lambda *a, **kw: formatted
+        )
+        result = apply_chat_template(
+            None,
+            {"model_type": "qwen3_5"},
+            [original] if as_list else original,
+            return_messages=True,
+        )
+        assert result == [{**original, **formatted}]
+        assert original == before
+        assert formatted == {
+            "role": "assistant",
+            "content": "formatted",
+            "owned": "new",
+        }
+
+    @pytest.mark.parametrize(
+        "metadata,content,text",
+        [
+            ({}, "answer", "answer"),
+            ({"reasoning_content": None}, None, ""),
+            ({"reasoning_content": ""}, [], ""),
+            (
+                {"reasoning_content": "reason"},
+                [
+                    {"type": "input_text", "text": "answer"},
+                    {"type": "image_url", "image_url": {"url": "synthetic.png"}},
+                ],
+                "answer",
+            ),
+        ],
+    )
+    def test_reasoning_values_and_content_normalization(self, metadata, content, text):
+        original = {"role": "assistant", "content": content, **metadata}
+        before = deepcopy(original)
+        result = apply_chat_template(
+            None, {"model_type": "qwen3_5"}, [original], return_messages=True
+        )
+        assert result == [
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text, "content": text}],
+                **metadata,
+            }
+        ]
+        assert original == before
+
+    @pytest.mark.parametrize(
+        "model,original,expected",
+        [
+            (
+                "paligemma",
+                {"role": "user", "content": "hello", "name": "speaker"},
+                "hello",
+            ),
+            (
+                "qwen3_5",
+                SimpleNamespace(role="assistant", content="hello", name="speaker"),
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "hello", "content": "hello"}],
+                },
+            ),
+        ],
+    )
+    def test_non_dictionary_shapes_keep_formatter_behavior(
+        self, model, original, expected
+    ):
+        assert apply_chat_template(
+            None, {"model_type": model}, [original], return_messages=True
+        ) == [expected]
+
+    @pytest.mark.parametrize(
+        "tool_calls", [None, [], _assistant_tool_call(None)["tool_calls"]]
+    )
+    def test_tool_path_preserves_key_states_and_inputs(self, tool_calls):
+        original = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": deepcopy(tool_calls),
+            "reasoning_content": "reason",
+            "custom": {"nested": []},
+        }
+        if tool_calls:
+            original["tool_calls"][0]["function"]["arguments"] = '{"city":"Paris"}'
+        before = deepcopy(original)
+        result = apply_chat_template(
+            None, {"model_type": "qwen3_5"}, [original], return_messages=True
+        )[0]
+        assert original == before
+        assert result["reasoning_content"] == "reason"
+        assert result["custom"] == original["custom"]
+        assert result["content"] == ("" if tool_calls else None)
+        if tool_calls:
+            assert result["tool_calls"][0]["function"]["arguments"] == {"city": "Paris"}
+        else:
+            assert result["tool_calls"] == tool_calls
+
+    @pytest.mark.parametrize("model", ["qwen3_5", "qwen3_5_moe"])
+    def test_dense_and_moe_routes_preserve_metadata(self, model):
+        from mlx_vlm.prompt_utils import MODEL_CONFIG, MessageFormat
+
+        assert MODEL_CONFIG[model] == MessageFormat.LIST_WITH_IMAGE_FIRST
+        message = {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_content": "reason",
+        }
+        assert (
+            apply_chat_template(
+                None, {"model_type": model}, message, return_messages=True
+            )[0]["reasoning_content"]
+            == "reason"
+        )
+
+
+class TestMessageTemplateMetadata:
+    def test_metadata_does_not_move_history_images(self):
+        messages = [
+            {"role": "system", "content": "rules", "name": "system_name"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "synthetic.png"}},
+                    {"type": "text", "text": "question"},
+                ],
+            },
+            {"role": "assistant", "content": "answer", "reasoning_content": "reason"},
+            {"role": "user", "content": "follow up"},
+        ]
+        before = deepcopy(messages)
+        normalized = apply_chat_template(
+            None,
+            {"model_type": "qwen3_5"},
+            messages,
+            num_images=1,
+            return_messages=True,
+        )
+        assert messages == before
+        assert normalized[0]["name"] == "system_name"
+        assert normalized[2]["reasoning_content"] == "reason"
+        assert [
+            sum(part["type"] == "image" for part in message["content"])
+            for message in normalized
+        ] == [0, 1, 0, 0]
+
+    @pytest.mark.parametrize("name", ["qwen3_5", "qwen3_8"])
+    @pytest.mark.parametrize("reasoning", [None, "", "structured"])
+    def test_qwen_reasoning_precedence_history_and_continuation(
+        self, template_processor, name, reasoning
+    ):
+        processor = template_processor(name)
+        messages = [
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "content": "<think>inline</think>answer",
+                "reasoning_content": reasoning,
+            },
+        ]
+        kwargs = {"add_generation_prompt": False, "enable_thinking": True}
+        rendered = apply_chat_template(
+            processor, {"model_type": "qwen3_5"}, messages, **kwargs
+        )
+        assert rendered == processor.apply_chat_template(messages, **kwargs)
+        inline_fallback = name == "qwen3_5" and reasoning is None
+        thought = "inline" if inline_fallback else reasoning or ""
+        answer = "answer" if inline_fallback else messages[-1]["content"]
+        assert rendered.endswith(
+            f"<|im_start|>assistant\n<think>\n{thought}\n</think>\n\n{answer}<|im_end|>\n"
+        )
+
+        history = messages + [{"role": "user", "content": "next"}]
+        historical = apply_chat_template(
+            processor, {"model_type": "qwen3_5"}, history, **kwargs
+        )
+        assert historical == processor.apply_chat_template(history, **kwargs)
+        assert ("structured" in historical) == (name == "qwen3_8" and bool(reasoning))
+
+        continuation = [messages[0], {**messages[1], "content": "answer"}]
+        continued = apply_chat_template(
+            processor,
+            {"model_type": "qwen3_5"},
+            continuation,
+            continue_final_message=True,
+            **kwargs,
+        )
+        assert continued == processor.apply_chat_template(
+            continuation, continue_final_message=True, **kwargs
+        )
+        assert continued.endswith(f"<think>\n{reasoning or ''}\n</think>\n\nanswer")
+
+    @pytest.mark.parametrize(
+        "metadata,thought",
+        [
+            ({"reasoning_content": None}, ""),
+            ({"reasoning_content": ""}, ""),
+            ({"reasoning_content": "structured"}, "structured"),
+            ({"reasoning": "preferred", "reasoning_content": "secondary"}, "preferred"),
+        ],
+    )
+    def test_gemma_reasoning_remains_template_owned(
+        self, template_processor, metadata, thought
+    ):
+        processor = template_processor("gemma4")
+        messages = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer", **metadata},
+        ]
+        kwargs = {"add_generation_prompt": False, "enable_thinking": True}
+        rendered = apply_chat_template(
+            processor, {"model_type": "gemma4"}, messages, **kwargs
+        )
+        channel = f"<|channel>thought\n{thought}\n<channel|>" if thought else ""
+        assert rendered == (
+            "<bos><|turn>system\n<|think|>\n<turn|>\n"
+            "<|turn>user\nquestion<turn|>\n"
+            f"<|turn>model\n{channel}answer<turn|>\n"
+        )
+        history = messages + [{"role": "user", "content": "next"}]
+        assert apply_chat_template(
+            processor, {"model_type": "gemma4"}, history, **kwargs
+        ) == processor.apply_chat_template(history, **kwargs)
+        assert "<|channel>thought" not in processor.apply_chat_template(
+            history, **kwargs
+        )
+
+    def test_unaffected_qwen2_5_rendering(self, template_processor):
+        processor = template_processor("qwen2_5_vl")
+        messages = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer", "reasoning_content": "unused"},
+        ]
+        assert apply_chat_template(
+            processor, {"model_type": "qwen2_5_vl"}, messages
+        ) == (
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+            "<|im_start|>user\nquestion<|im_end|>\n"
+            "<|im_start|>assistant\nanswer<|im_end|>\n<|im_start|>assistant\n"
+        )
 
 
 class TestExtractTextFromContent:
