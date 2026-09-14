@@ -2,6 +2,7 @@ import unittest
 
 import mlx.core as mx
 
+from mlx_vlm.models.qwen3_omni_moe.audio import _get_feat_extract_output_lengths
 from mlx_vlm.models.qwen3_omni_moe.config import (
     AudioConfig,
     Code2WavConfig,
@@ -13,6 +14,37 @@ from mlx_vlm.models.qwen3_omni_moe.config import (
     VisionConfig,
 )
 from mlx_vlm.models.qwen3_omni_moe.qwen3_omni_moe import Model
+
+
+class Qwen3OmniAudioLengthTest(unittest.TestCase):
+    # Pinned against the reference processor that sets the audio placeholder
+    # count. Literal values rather than a re-implementation of the formula, so
+    # the test still fails if the formula itself drifts.
+    EXPECTED = (
+        (0, 0),
+        (100, 13),
+        (320, 42),
+        (500, 65),
+        (999, 130),
+        (1000, 130),
+        (2800, 364),
+        (2900, 377),
+        (2999, 390),
+        (3000, 390),  # the 30s clamp -- MLX truncation returned 391 here
+        (3100, 403),
+        (6000, 780),
+    )
+
+    def test_matches_reference_output_lengths(self):
+        for length, expected in self.EXPECTED:
+            got = int(_get_feat_extract_output_lengths(mx.array([length]))[0])
+            self.assertEqual(got, expected, msg=f"length={length}")
+
+    def test_batched_lengths_match_scalar(self):
+        lengths = [length for length, _ in self.EXPECTED]
+        got = _get_feat_extract_output_lengths(mx.array(lengths)).tolist()
+        self.assertEqual(got, [expected for _, expected in self.EXPECTED])
+
 
 IMAGE_TOKEN = 60
 VISION_START = 63
