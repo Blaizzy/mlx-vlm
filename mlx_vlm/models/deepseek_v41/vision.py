@@ -136,14 +136,22 @@ class Aligner(nn.Module):
         self.act = nn.GELU(approx="precise")
 
     def __call__(self, x: mx.array, n_h: int, n_w: int) -> mx.array:
+        """Group each r x r block of ViT tokens into one language-dim embedding.
+
+        A partial trailing block is zero-filled rather than dropped, so the grid
+        rounds up and matches the span the prompt reserved. Each output vector
+        runs channel-major, all r*r neighbours of one channel before the next.
+        """
         r = self.downsample_ratio
-        h2 = n_h - n_h % r
-        w2 = n_w - n_w % r
-        x = x.reshape(n_h, n_w, -1).transpose(2, 0, 1)[:, :h2, :w2]
-        d = x.shape[0]
+        d = x.shape[-1]
+        h_out, w_out = -(-n_h // r), -(-n_w // r)
+        x = x.reshape(n_h, n_w, d)
+        pad_h, pad_w = h_out * r - n_h, w_out * r - n_w
+        if pad_h or pad_w:
+            x = mx.pad(x, ((0, pad_h), (0, pad_w), (0, 0)))
         x = (
-            x.reshape(d, h2 // r, r, w2 // r, r)
-            .transpose(1, 3, 2, 4, 0)
-            .reshape(-1, d * r * r)
+            x.reshape(h_out, r, w_out, r, d)
+            .transpose(0, 2, 4, 1, 3)
+            .reshape(h_out * w_out, d * r * r)
         )
         return self.w2(self.act(self.w1(x)))

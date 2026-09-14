@@ -76,9 +76,8 @@ def llm_grid(
 ) -> Tuple[int, int]:
     """Token grid the aligner produces from a patch grid of this pixel size.
 
-    Callers size images to a multiple of ``patch_size * downsample_ratio`` so
-    this divides exactly; the aligner truncates, and a grid it rounds down would
-    leave span slots with no feature behind them.
+    Rounds up: the aligner zero-pads a partial trailing block rather than
+    dropping it.
     """
     return math.ceil((best_height // patch_size) / downsample_ratio), math.ceil(
         (best_width // patch_size) / downsample_ratio
@@ -106,8 +105,8 @@ def solve_resize_ratio(
         math.floor(max_h_float) * cell / height,
     )
     return (
-        math.floor(height * beta / cell) * cell,
-        math.floor(width * beta / cell) * cell,
+        math.floor(height * beta / patch_size) * patch_size,
+        math.floor(width * beta / patch_size) * patch_size,
     )
 
 
@@ -147,9 +146,8 @@ def plan_image_grid(
         ratio = (config.vision_min_pixels / (width * height)) ** 0.5
         width = int(width * ratio)
         height = int(height * ratio)
-    cell = p * config.vision_downsample_ratio
-    best_width = math.ceil(width / cell) * cell
-    best_height = math.ceil(height / cell) * cell
+    best_width = math.ceil(width / p) * p
+    best_height = math.ceil(height / p) * p
     return safe_resize(
         height,
         width,
