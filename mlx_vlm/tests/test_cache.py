@@ -423,6 +423,74 @@ def test_batch_rotating_merge_skips_zero_length_backing_storage():
     assert mx.all(merged.values[0] == 0).item()
 
 
+@pytest.mark.parametrize("window", [4, 8, 16])
+@pytest.mark.parametrize("prefix_length", [0, 3, 8, 20])
+@pytest.mark.parametrize("parts", [(3, 1), (1, 1, 1, 1)])
+@pytest.mark.parametrize("right_padded", [False, True])
+def test_batch_rotating_masks_match_prefill_and_decode_layouts(
+    window, prefix_length, parts, right_padded
+):
+    head_dim = 64
+
+    def values(rows):
+        array = mx.array(rows, dtype=mx.float32)[:, None, :, None]
+        return mx.broadcast_to(array, (*array.shape[:-1], head_dim))
+
+    history = [list(range(10, 10 + prefix_length)), []]
+    warm = RotatingKVCache(max_size=window)
+    if prefix_length:
+        warm.update_and_fetch(
+            mx.zeros((1, 1, prefix_length, head_dim)), values([history[0]])
+        )
+    batch = BatchRotatingKVCache.merge([warm, RotatingKVCache(max_size=window)])
+    lengths = [3 if right_padded else 4, 4]
+    if right_padded:
+        batch.prepare(right_padding=[1, 0], lengths=lengths)
+
+    suffixes = [[11, 12, 13, 0], [1, 2, 3, 4]]
+    start = 0
+    for size in parts:
+        mask = batch.make_mask(size)
+        keys, vals = batch.update_and_fetch(
+            mx.zeros((2, 1, size, head_dim)),
+            values([row[start : start + size] for row in suffixes]),
+        )
+        output = mx.fast.scaled_dot_product_attention(
+            mx.zeros((2, 1, size, head_dim)), keys, vals, scale=1.0, mask=mask
+        )
+        actual = output[:, 0, :, 0].tolist()
+        for row in range(2):
+            for column in range(size):
+                position = start + column
+                if position < lengths[row]:
+                    history[row].append(suffixes[row][position])
+                    expected = history[row][-window:]
+                    assert actual[row][column] == pytest.approx(
+                        sum(expected) / len(expected), abs=1e-5
+                    )
+        start += size
+
+    batch.finalize()
+    assert batch._lengths is None
+    assert batch.offset.tolist() == [len(row) for row in history]
+
+    # After finalize(), normal one-token decoding must still rotate its mask.
+    for step in range(window + 2):
+        mask = batch.make_mask(1)
+        new_values = [[100 + step], [200 + step]]
+        keys, vals = batch.update_and_fetch(
+            mx.zeros((2, 1, 1, head_dim)), values(new_values)
+        )
+        output = mx.fast.scaled_dot_product_attention(
+            mx.zeros((2, 1, 1, head_dim)), keys, vals, scale=1.0, mask=mask
+        )
+        actual = output[:, 0, 0, 0].tolist()
+        for row in range(2):
+            history[row].extend(new_values[row])
+            expected = history[row][-window:]
+            assert actual[row] == pytest.approx(sum(expected) / len(expected), abs=1e-5)
+
+
 def test_chunked_kv_cache_trims_on_valid_length_not_buffer_width():
     # Regression test for maybe_trim_front: update_and_fetch pads the backing
     # buffer up to a multiple of ``step``, so trimming on ``keys.shape[2]``

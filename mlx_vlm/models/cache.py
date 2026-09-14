@@ -1832,10 +1832,11 @@ class BatchRotatingKVCache(_BaseCache):
         rinds = rinds[None]
         mask = linds >= rinds
         mask &= linds < rinds + window_size
-        if (trim_size := self._idx - self.max_size + int(N > 1)) > 0:
+        in_place = N == 1 and self._lengths is None
+        if (trim_size := self._idx - self.max_size + int(not in_place)) > 0:
             left_padding = left_padding - trim_size
 
-        rotated = N == 1 and (self.rotated or self._idx >= self.max_size)
+        rotated = in_place and (self.rotated or self._idx >= self.max_size)
         if rotated:
             left_padding = left_padding - 1
 

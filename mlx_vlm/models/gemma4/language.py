@@ -613,13 +613,6 @@ class Gemma4TextModel(nn.Module):
             per_layer_inputs = [None] * len(self.layers)
 
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
-        # KV-shared layers only compute queries and token-wise transformations;
-        # their keys and values were produced by the non-shared prefix. Once all
-        # full-width hidden-state captures are complete, positions that will not
-        # be returned can therefore be dropped before entering the remaining
-        # shared layers. This is especially important for short prefills, which
-        # otherwise run the expensive shared tail over the complete prompt just
-        # to return the final row of logits.
         keep = int(logits_to_keep) if logits_to_keep else 0
         trim_before_layer = self.first_kv_shared_layer_idx
         if hidden_sink is not None:
