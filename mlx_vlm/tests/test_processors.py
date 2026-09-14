@@ -125,6 +125,29 @@ class TestOutputControlTokens(unittest.TestCase):
             processor.clean_output("<|begin_of_box|>answer<|end_of_box|>"), "answer"
         )
 
+    def test_aya_vision_strips_response_markers(self):
+        from mlx_vlm.models.aya_vision.processing_aya_vision import AyaVisionProcessor
+
+        processor = object.__new__(AyaVisionProcessor)
+        self.assertEqual(
+            processor.clean_output("<|START_RESPONSE|>answer<|END_RESPONSE|>"), "answer"
+        )
+
+    def test_aya_vision_registered_processor_strips_response_markers(self):
+        from transformers.models.aya_vision.processing_aya_vision import (
+            AyaVisionProcessor as Native,
+        )
+
+        from mlx_vlm.models.aya_vision.processing_aya_vision import (
+            AyaVisionOutputProcessor,
+        )
+
+        self.assertTrue(issubclass(AyaVisionOutputProcessor, Native))
+        processor = object.__new__(AyaVisionOutputProcessor)
+        self.assertEqual(
+            processor.clean_output("<|START_RESPONSE|>answer<|END_RESPONSE|>"), "answer"
+        )
+
     def test_kimi_vl_stops_on_assistant_marker(self):
         from mlx_vlm.models.kimi_vl.processing_kimi_vl import KimiVLProcessor
 
