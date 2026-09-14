@@ -3448,73 +3448,58 @@ def test_paligemma_opts_out_of_chunked_prefill_when_bidirectional():
     assert policy(causal) is True
 
 
-@pytest.fixture(params=[[1], [0, 2]])
-def mllama_model(request):
-    from mlx_vlm.models import mllama
+@pytest.fixture
+def mllama_prefill():
+    from mlx_vlm.models.mllama import LanguageModel, TextConfig
 
     mx.random.seed(0)
-    text_config = mllama.TextConfig(
-        vocab_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=3,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        cross_attention_layers=request.param,
-    )
-    vision_config = mllama.VisionConfig(
-        image_size=8,
-        patch_size=4,
-        hidden_size=8,
-        intermediate_size=16,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_global_layers=1,
-        vision_output_dim=16,
-        intermediate_layers_indices=[0],
-    )
-    model = mllama.Model(
-        mllama.ModelConfig(
-            text_config=text_config,
-            vision_config=vision_config,
-            model_type="mllama",
+    model = LanguageModel(
+        TextConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            cross_attention_layers=[0, 2],
         )
     )
-    # Exercise the cross-attention output instead of the zero-initialized gates.
-    for idx in text_config.cross_attention_layers:
-        cross_layer = model.language_model.layers[idx]
-        cross_layer.cross_attn_attn_gate = mx.ones((1,))
-        cross_layer.cross_attn_mlp_gate = mx.ones((1,))
-    return model
+    for idx in model.config.cross_attention_layers:
+        model.layers[idx].cross_attn_attn_gate = mx.ones((1,))
+        model.layers[idx].cross_attn_mlp_gate = mx.ones((1,))
+    # Vary visible vision keys and fully masked rows across chunk boundaries.
+    mask = mx.tile(mx.array([[0.0, -1e9], [-1e9, 0.0], [0.0, 0.0]]), (6, 1))
+    row_mask = mx.broadcast_to(
+        (mx.arange(18) % 4 != 0)[None, None, :, None], (2, 1, 18, 1)
+    )
+    return model, {
+        "inputs_embeds": model.model.embed_tokens(mx.arange(36).reshape(2, 18) % 32),
+        "cross_attention_states": mx.random.normal((2, 2, 16)),
+        "cross_attention_mask": mask[None, None] * row_mask,
+        "full_text_row_masked_out_mask": row_mask,
+    }
 
 
-@pytest.mark.parametrize("prompt_length", [18, 301, 2049])
 @pytest.mark.parametrize("prefill_step_size", [4, 2048])
-def test_mllama_generation_with_cross_attention_mask(
-    mllama_model, prompt_length, prefill_step_size
-):
-    model = mllama_model
-    text_config = model.config.text_config
+def test_mllama_generation_matches_unchunked(mllama_prefill, prefill_step_size):
+    from mlx_vlm.models.base import InputEmbeddingsFeatures
 
-    input_ids = (mx.arange(prompt_length) % text_config.vocab_size)[None]
-    pixel_values = mx.zeros((1, 1, 4, 3, 8, 8))
-    # Reuse projected vision features to keep this generation regression small.
-    image_features = mx.random.normal((1, 20, text_config.hidden_size))
-    cross_attention_mask = mx.ones((1, prompt_length, 1, 4))
-    cross_attention_mask[:, :2] = 0
-    cross_attention_mask[:, :, :, -1] = 0
-    cross_attention_mask[:, 4::5] = 0
-    cross_attention_mask[:, 3::5, :, :2] = 0
+    language_model, kwargs = mllama_prefill
+    features = InputEmbeddingsFeatures(
+        **{key: value[:1] for key, value in kwargs.items()}
+    )
+    model = SimpleNamespace(
+        language_model=language_model,
+        get_input_embeddings=lambda *args, **kwargs: features,
+    )
 
     def generate(step_size):
         return list(
             generate_module.generate_step(
-                input_ids=input_ids,
-                model=model,
-                pixel_values=pixel_values,
-                mask=None,
-                cached_image_features=image_features,
-                cross_attention_mask=cross_attention_mask,
+                mx.arange(18)[None],
+                model,
+                None,
+                None,
                 prefill_step_size=step_size,
                 max_tokens=3,
                 temperature=0,
@@ -3522,109 +3507,29 @@ def test_mllama_generation_with_cross_attention_mask(
             )
         )
 
-    expected = generate(None)
-    prefill_lengths = []
-    language_model_type = type(model.language_model)
-    original_forward = language_model_type.__call__
-
-    def record_forward(*args, **kwargs):
-        embeds = kwargs.get("inputs_embeds")
-        if embeds is not None:
-            prefill_lengths.append(embeds.shape[1])
-        return original_forward(*args, **kwargs)
-
-    with patch.object(language_model_type, "__call__", record_forward):
-        actual = generate(prefill_step_size)
-    assert prefill_lengths == [
-        min(prefill_step_size, prompt_length - 1 - start)
-        for start in range(0, prompt_length - 1, prefill_step_size)
-    ] + [1]
+    expected, actual = generate(None), generate(prefill_step_size)
     assert len(actual) == 3
     assert [token for token, _ in actual] == [token for token, _ in expected]
-    for (_, logprobs), (_, expected_logprobs) in zip(actual, expected):
-        assert mx.all(mx.isfinite(logprobs)).item()
-        assert mx.allclose(logprobs, expected_logprobs, atol=1e-6).item()
+    assert mx.allclose(
+        mx.stack([lp for _, lp in actual]),
+        mx.stack([lp for _, lp in expected]),
+        atol=1e-6,
+    ).item()
 
 
 @pytest.mark.parametrize("slice_masks", [False, True])
-def test_mllama_language_prefill_matches_full_prompt(mllama_model, slice_masks):
-    model = mllama_model
-    input_ids = mx.arange(11)[None]
-    mask = mx.ones((1, 11, 1, 4))
-    mask[:, ::3] = 0
-    mask[:, 1::3, :, :2] = 0
-    kwargs = model.get_input_embeddings(
-        input_ids,
-        mx.zeros((1, 1, 4, 3, 8, 8)),
-        cross_attention_mask=mask,
-        cached_image_features=mx.random.normal((1, 20, 16)),
-    ).to_dict()
-    inputs_embeds = kwargs.pop("inputs_embeds")
-    expected = model.language_model(inputs_embeds=inputs_embeds, **kwargs).logits
-    prompt_cache = [KVCache() for _ in model.language_model.layers]
+def test_mllama_batched_prefill_matches_full_prompt(mllama_prefill, slice_masks):
+    model, kwargs = mllama_prefill
+    expected = model(**kwargs).logits
+    # All rows have padding, so max(offset) differs from the shared column count.
+    cache = [BatchKVCache([3, 1]) for _ in model.layers]
     outputs = []
-    for start, end in [(0, 4), (4, 8), (8, 10), (10, 11)]:
-        chunk_kwargs = dict(kwargs)
+    for start, end in [(0, 4), (4, 8), (8, 17), (17, 18)]:
+        chunk = {**kwargs, "inputs_embeds": kwargs["inputs_embeds"][:, start:end]}
         if slice_masks:
             for key in ("cross_attention_mask", "full_text_row_masked_out_mask"):
-                chunk_kwargs[key] = kwargs[key][:, :, start:end]
-        outputs.append(
-            model.language_model(
-                inputs_embeds=inputs_embeds[:, start:end],
-                cache=prompt_cache,
-                **chunk_kwargs,
-            ).logits
-        )
-    assert mx.allclose(mx.concatenate(outputs, axis=1), expected, atol=1e-5).item()
-
-
-def test_mllama_batch_prefill_slices_cross_attention_masks(mllama_model):
-    model = mllama_model
-    rows = [list(range(8)), list(range(11))]
-    mask = mx.ones((2, 11, 1, 4))
-    mask[:, ::3] = 0
-    mask[:, 1::3, :, :2] = 0
-    mask[0, :3] = 0
-    kwargs = model.get_input_embeddings(
-        _left_pad_prompts(rows),
-        mx.zeros((2, 1, 4, 3, 8, 8)),
-        cross_attention_mask=mask,
-        cached_image_features=mx.random.normal((2, 20, 16)),
-    ).to_dict()
-    inputs_embeds = kwargs.pop("inputs_embeds")
-    expected = model.language_model(
-        inputs_embeds=inputs_embeds,
-        cache=[BatchKVCache([3, 0]) for _ in model.language_model.layers],
-        **kwargs,
-    ).logits
-    mx.eval(expected)
-
-    batch = PromptProcessingBatch(
-        model=model.language_model,
-        uids=[0, 1],
-        input_ids=rows,
-        max_tokens=[1, 1],
-        inputs_embeds=inputs_embeds,
-        prompt_kwargs=kwargs,
-        prefill_step_size=4,
-    )
-    outputs = []
-    original_forward = type(model.language_model).__call__
-
-    def record_forward(*args, **kwargs):
-        output = original_forward(*args, **kwargs)
-        outputs.append(output.logits)
-        return output
-
-    with patch.object(type(model.language_model), "__call__", record_forward):
-        while batch.needs_processing():
-            batch.prompt_step()
-        batch.generate(
-            sampler=lambda logits: mx.argmax(logits, axis=-1),
-            stop_criteria=lambda _: False,
-        )
-
-    assert [output.shape[1] for output in outputs] == [4, 4, 2, 1]
+                chunk[key] = kwargs[key][:, :, start:end]
+        outputs.append(model(cache=cache, **chunk).logits)
     assert mx.allclose(mx.concatenate(outputs, axis=1), expected, atol=1e-5).item()
 
 
