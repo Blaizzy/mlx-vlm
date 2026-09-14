@@ -3688,6 +3688,100 @@ class TestModels(unittest.TestCase):
             fused = kda(x, None, c2)
             self.assertEqual(float(mx.max(mx.abs(ref - fused))), 0.0)
 
+    def test_glm5_next_compiled_kda_decode_matches_eager(self):
+        # The compiled cached decode step must carry the same conv window and
+        # recurrent state as eager decode, and produce the same outputs, for
+        # single streams, left-padded batches and ragged continuous batches.
+        import mlx.nn as nn
+        from mlx.utils import tree_map_with_path
+
+        import mlx_vlm.models.glm5_next.language as glm5_language
+        from mlx_vlm.models import glm5_next
+        from mlx_vlm.models.cache import ArraysCache
+
+        cfg = glm5_next.TextConfig(
+            model_type="glm5_next_text",
+            vocab_size=128,
+            hidden_size=256,
+            intermediate_size=128,
+            moe_intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=64,
+            q_lora_rank=128,
+            qk_rope_head_dim=0,
+            v_head_dim=64,
+            qk_nope_head_dim=64,
+            qk_head_dim=64,
+            num_experts_per_tok=4,
+            first_k_dense_replace=1,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-5,
+            index_topk=6,
+            index_head_dim=64,
+            index_n_heads=2,
+            index_kpool=3,
+            layer_types=["linear_attention"],
+            mlp_layer_types=["dense"],
+            linear_attn_config={
+                "num_heads": 4,
+                "head_dim": 64,
+                "short_conv_kernel_size": 4,
+                "gate_lower_bound": -5.0,
+            },
+            hc_mult=4,
+            num_nextn_predict_layers=0,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        mx.random.seed(0)
+        kda = glm5_language.Glm5NextLinearAttention(cfg)
+        kda.update(
+            tree_map_with_path(
+                lambda k, v: 0.2 * mx.random.normal(v.shape), kda.parameters()
+            )
+        )
+        nn.quantize(kda, class_predicate=lambda p, m: isinstance(m, nn.Linear))
+        kda.eval()
+
+        def decode(compiled, B, variant):
+            glm5_language.COMPILED_KDA_DECODE = compiled
+            mx.random.seed(1)
+            cache = ArraysCache(size=2)
+            mask = None
+            if variant == "left_padding":
+                cache.left_padding = mx.array([0, 2, 5][:B])
+                mask = cache.make_mask(6)
+            elif variant == "lengths":
+                cache.lengths = mx.array([6, 4, 2][:B])
+                mask = cache.make_mask(6)
+            kda(4 * mx.random.normal((B, 6, cfg.hidden_size)), mask, cache)
+            outputs = []
+            for step in range(8):
+                if variant == "lengths":
+                    cache.lengths = mx.array([1, step % 2, 1][:B])
+                step_mask = None if variant == "none" else cache.make_mask(1)
+                x = 4 * mx.random.normal((B, 1, cfg.hidden_size))
+                outputs.append(kda(x, step_mask, cache))
+                mx.eval(outputs[-1], cache.cache)
+            return mx.concatenate(outputs, axis=1), cache
+
+        previous = glm5_language.COMPILED_KDA_DECODE
+        try:
+            for B, variant in ((1, "none"), (3, "left_padding"), (3, "lengths")):
+                eager, eager_cache = decode(False, B, variant)
+                compiled, compiled_cache = decode(True, B, variant)
+                self.assertTrue(mx.allclose(eager, compiled, atol=1e-5).item())
+                for e, c in zip(eager_cache.cache, compiled_cache.cache):
+                    self.assertTrue(mx.array_equal(e, c).item())
+            self.assertEqual(len(kda._compiled_steps), 3)
+        finally:
+            glm5_language.COMPILED_KDA_DECODE = previous
+
     def test_glm5_next_short_indexer_matches_cached_attention(self):
         # When the whole sequence fits within index_topk, cached and uncached
         # checkpoint-native sparse attention must select the same complete pool.

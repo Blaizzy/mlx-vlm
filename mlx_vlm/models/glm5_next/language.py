@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
@@ -12,6 +13,11 @@ from ..mla import MultiLinear
 from ..sparse_attention import indexed_sparse_attention
 from ..switch_layers import MoE, SwitchGLU
 from .config import TextConfig
+
+# Compile the whole cached KDA decode step (~30 small kernels per layer) into
+# fused graphs. Opt-in: fused elementwise kernels round differently from the
+# eager ones, so greedy outputs can differ at near-tied tokens.
+COMPILED_KDA_DECODE = os.environ.get("MLX_VLM_GLM5_COMPILED_KDA_DECODE", "0") == "1"
 
 
 @mx.compile
@@ -182,8 +188,94 @@ class Glm5NextLinearAttention(nn.Module):
         self.o_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.o_proj = nn.Linear(self.projection_dim, config.hidden_size, bias=False)
 
+    def _decode_step(self, x, conv_state, state, mask=None, lengths=None):
+        """One cached S=1 step as a pure function of its inputs and states.
+
+        Mirrors ``__call__`` + ``ShortConv1d`` + ``ArraysCache.update_window`` /
+        ``update_recurrent`` op for op, but returns the new states instead of
+        writing them, so the whole chain can go through ``mx.compile``.
+        """
+        batch, length, _ = x.shape
+        if mask is not None and mask.dtype == mx.bool_:
+            x = mx.where(mask[..., None], x, 0)
+        qkv = linear(self.qkv_proj, x)
+        if mask is not None:
+            qkv = mx.where(mask[..., None], qkv, 0)
+        conv_input = mx.concatenate([conv_state, qkv], axis=1)
+        qkv = nn.silu(self.qkv_conv.conv(conv_input))
+        keep = self.conv_kernel - 1
+        if lengths is None:
+            new_conv_state = mx.contiguous(conv_input[:, length : length + keep])
+        else:
+            positions = mx.clip(lengths, 0, length)[:, None] + mx.arange(keep)
+            new_conv_state = mx.take_along_axis(
+                conv_input, positions[..., None], axis=1
+            )
+        shape = (batch, length, self.num_heads, self.head_dim)
+        q, k, v = (value.reshape(shape) for value in mx.split(qkv, 3, axis=-1))
+        eps = 1e-6 / self.head_dim
+        q = self.scale**2 * mx.fast.rms_norm(q, None, eps)
+        k = self.scale * mx.fast.rms_norm(k, None, eps)
+        f_a, b, g_a = mx.split(
+            linear(self.fbg_a_proj, x),
+            (self.head_dim, self.head_dim + self.num_heads),
+            axis=-1,
+        )
+        a = linear(self.f_b_proj, f_a).reshape(shape)
+        b = b.reshape(batch, length, self.num_heads)
+        output, new_state = gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b,
+            self.A_log.reshape(self.num_heads, 1),
+            self.dt_bias.reshape(self.num_heads, self.head_dim),
+            state=state,
+            mask=mask,
+            use_kernel=True,
+            lower_bound=self.lower_bound,
+        )[:2]
+        gate = linear(self.g_b_proj, g_a).reshape(shape)
+        output = (self.o_norm(output) * mx.sigmoid(gate)).reshape(batch, length, -1)
+        return linear(self.o_proj, output), new_conv_state, new_state
+
+    def _compiled_decode(self, x, mask, cache):
+        # One compiled graph per (mask, lengths) variant; mx.compile then keeps
+        # one trace per input shape, so a batch size is traced once, not per step.
+        key = (mask is None, cache.lengths is None)
+        steps = self.__dict__.setdefault("_compiled_steps", {})
+        if key not in steps:
+            if key == (True, True):
+                fn = lambda x, c, s: self._decode_step(x, c, s)
+            elif key == (False, True):
+                fn = lambda x, m, c, s: self._decode_step(x, c, s, mask=m)
+            elif key == (True, False):
+                fn = lambda x, l, c, s: self._decode_step(x, c, s, lengths=l)
+            else:
+                fn = lambda x, m, l, c, s: self._decode_step(x, c, s, m, l)
+            steps[key] = mx.compile(fn)
+        args = [x]
+        if mask is not None:
+            args.append(mask)
+        if cache.lengths is not None:
+            args.append(cache.lengths)
+        output, cache.cache[0], cache.cache[1] = steps[key](*args, cache[0], cache[1])
+        cache.advance(1)
+        return output
+
     def __call__(self, x, mask=None, cache=None):
         batch, length, _ = x.shape
+        if (
+            COMPILED_KDA_DECODE
+            and length == 1
+            and cache is not None
+            and not self.training
+            and cache[0] is not None
+            and cache[1] is not None
+            and not cache.history_capacity
+        ):
+            return self._compiled_decode(x, mask, cache)
         if mask is not None and mask.dtype == mx.bool_:
             x = mx.where(mask[..., None], x, 0)
         qkv = self.qkv_conv(linear(self.qkv_proj, x), mask=mask, cache=cache)
