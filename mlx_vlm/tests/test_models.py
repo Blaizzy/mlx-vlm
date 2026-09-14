@@ -21468,3 +21468,63 @@ class TestDeepseekV41Vision(unittest.TestCase):
             self.assertEqual(types.count(IMAGE), rows, f"{size}")
             self.assertEqual(len(spans), 1)
             self.assertEqual(spans[0].patches.shape[0], n_vit_h * n_vit_w)
+
+
+class TestDeepseekV4PooledGather(unittest.TestCase):
+    """The pooled gather must match indexing the broadcast value exactly."""
+
+    @staticmethod
+    def _reference(pooled, topk):
+        B, n_pooled, D = pooled.shape
+        _, L, _ = topk.shape
+        idx = topk[:, None, :, :, None]
+        return mx.take_along_axis(
+            mx.broadcast_to(pooled[:, None, None], (B, 1, L, n_pooled, D)),
+            mx.broadcast_to(idx, idx.shape[:-1] + (D,)),
+            axis=3,
+        ).squeeze(1)
+
+    def test_deepseek_v4_pooled_gather_matches_take_along_axis(self):
+        from mlx_vlm.models.deepseek_v4.language import _gather_pooled
+
+        for batch, length, topk_width, n_pooled, dim in (
+            (1, 7, 3, 11, 8),
+            (1, 64, 16, 128, 32),
+            (2, 5, 4, 9, 8),
+            (4, 16, 8, 32, 16),
+            (8, 3, 5, 11, 8),
+        ):
+            mx.random.seed(batch * 100 + length)
+            pooled = mx.random.normal((batch, n_pooled, dim))
+            topk = (
+                mx.random.uniform(shape=(batch, length, topk_width)) * n_pooled
+            ).astype(mx.int32)
+            got = _gather_pooled(pooled, topk)
+            want = self._reference(pooled, topk)
+            mx.eval(got, want)
+            self.assertEqual(got.shape, want.shape)
+            self.assertTrue(mx.array_equal(got, want), (batch, length))
+
+    def test_deepseek_v4_pooled_gather_wraps_the_padding_sentinel(self):
+        """V4.1 pads short rows with -1; it must wrap inside its own row."""
+        from mlx_vlm.models.deepseek_v4.language import _gather_pooled
+
+        pooled = mx.arange(2 * 6 * 4, dtype=mx.float32).reshape(2, 6, 4)
+        topk = mx.array([[[0, -1, 2]], [[1, -1, 3]]], dtype=mx.int32)
+        got = _gather_pooled(pooled, topk)
+        want = self._reference(pooled, topk)
+        mx.eval(got, want)
+        self.assertTrue(mx.array_equal(got, want))
+        self.assertTrue(mx.array_equal(got[1, 0, 1], pooled[1, -1]))
+
+        for batch in (1, 2, 4):
+            mx.random.seed(batch)
+            pooled = mx.random.normal((batch, 32, 16))
+            topk = (mx.random.uniform(shape=(batch, 9, 6)) * 32).astype(mx.int32)
+            topk = mx.where(mx.random.uniform(shape=topk.shape) < 0.3, -1, topk).astype(
+                mx.int32
+            )
+            got = _gather_pooled(pooled, topk)
+            want = self._reference(pooled, topk)
+            mx.eval(got, want)
+            self.assertTrue(mx.array_equal(got, want), batch)
