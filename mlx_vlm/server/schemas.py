@@ -1,7 +1,14 @@
 import os
 from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    field_validator,
+    model_validator,
+)
 from typing_extensions import Required, TypeAlias, TypedDict
 
 if TYPE_CHECKING:
@@ -859,6 +866,13 @@ class StreamOptions(BaseModel):
 
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
+    preserve_thinking: Optional[StrictBool] = Field(
+        None,
+        description=(
+            "Preserve historical assistant reasoning when supported by the chat "
+            "template. Omitted or null uses the template default."
+        ),
+    )
     stream_options: Optional[StreamOptions] = None
     tools: Optional[List[Any]] = Field(None, description="Tools the model may call.")
     tool_choice: Optional[Any] = Field(

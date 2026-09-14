@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from queue import Queue
@@ -8238,3 +8239,180 @@ class TestSTTSegmentSerialization:
         assert data["segments"] == [
             {"id": 0, "start": 0.0, "end": 0.5, "text": "hello"}
         ]
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"preserve_thinking": None},
+        {"preserve_thinking": True},
+        {"preserve_thinking": False},
+    ],
+)
+def test_chat_preserve_thinking_request_normalization(options):
+    request = server.ChatRequest(
+        model="demo", messages=[{"role": "user", "content": "Hello"}], **options
+    )
+    original = deepcopy(request.model_dump())
+    args = server._build_gen_args(request)
+    template_kwargs = args.to_template_kwargs()
+    expected = options.get("preserve_thinking")
+    if expected is None:
+        assert "preserve_thinking" not in template_kwargs
+    else:
+        assert template_kwargs["preserve_thinking"] is expected
+    assert "preserve_thinking" not in args.to_generate_kwargs()
+    assert request.model_dump() == original
+
+
+def test_preserve_thinking_is_a_chat_request_option():
+    request = server.OpenAIRequest(model="demo", input="Hello", preserve_thinking=False)
+    assert (
+        "preserve_thinking" not in server._build_gen_args(request).to_template_kwargs()
+    )
+
+
+@pytest.mark.parametrize("value", [0, 1, 0.0, "true", "false", "yes", [], {}])
+def test_chat_preserve_thinking_rejects_invalid_values(client, value):
+    with patch.object(server, "get_cached_model") as load_model:
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "preserve_thinking": value,
+            },
+        )
+    assert response.status_code == 422
+    assert any(
+        error["loc"] == ["body", "preserve_thinking"]
+        for error in response.json()["detail"]
+    )
+    load_model.assert_not_called()
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe", "qwen3_vl"])
+@pytest.mark.parametrize("supports_policy", [False, True])
+def test_chat_preserve_thinking_reaches_rendering(
+    client, monkeypatch, model_type, supports_policy
+):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    # Synthetic policy template: completed user turns can omit reasoning, while
+    # the active tool continuation retains it. No model or remote tokenizer needed.
+    template = """
+        {% set ns = namespace(last_user=-1) %}
+        {% for message in messages %}
+            {% if message.role == 'user' %}{% set ns.last_user = loop.index0 %}{% endif %}
+        {% endfor %}
+        {% for message in messages %}
+            {{ message.role }}
+            {% if message.role == 'assistant' and
+                  (preserve_thinking is undefined or preserve_thinking is true
+                   or loop.index0 > ns.last_user) %}
+                {{ message.reasoning_content | default('', true) }}
+            {% endif %}
+            {% if message.content is string %}{{ message.content }}
+            {% else %}{% for item in message.content or [] %}{{ item.text }} {% endfor %}{% endif %}
+            {% for call in message.tool_calls or [] %}{{ call.function.name }}{% endfor %}
+        {% endfor %}
+    """
+    if not supports_policy:
+        template = template.replace(
+            "preserve_thinking is undefined or preserve_thinking is true", "true"
+        )
+    backend = Tokenizer(
+        WordLevel(
+            {
+                "[UNK]": 0,
+                "OLD_NOTE": 1,
+                "ACTIVE_NOTE": 2,
+                "VISIBLE": 3,
+                "RESULT": 4,
+                "check": 5,
+            },
+            unk_token="[UNK]",
+        )
+    )
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, chat_template=template
+    )
+    calls = [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "check", "arguments": "{}"},
+        }
+    ]
+    messages = [
+        {"role": "user", "content": "Earlier query"},
+        {
+            "role": "assistant",
+            "content": "VISIBLE",
+            "reasoning_content": "OLD_NOTE",
+            "tool_calls": calls,
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "RESULT"},
+        {"role": "user", "content": "Current query"},
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "VISIBLE"}],
+            "reasoning_content": "ACTIVE_NOTE",
+            "tool_calls": calls,
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "RESULT"},
+    ]
+    original = deepcopy(messages)
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    renders, tokens = [], []
+    for options in (
+        {},
+        {"preserve_thinking": None},
+        {"preserve_thinking": True},
+        {"preserve_thinking": False},
+    ):
+        with (
+            patch.object(
+                server,
+                "get_cached_model",
+                return_value=(
+                    SimpleNamespace(),
+                    tokenizer,
+                    SimpleNamespace(model_type=model_type),
+                ),
+            ),
+            patch.object(
+                server,
+                "generate",
+                return_value=GenerationResult(
+                    text="done", prompt_tokens=8, generation_tokens=1
+                ),
+            ) as generate,
+        ):
+            response = client.post(
+                "/chat/completions",
+                json={"model": "demo", "messages": messages, **options},
+            )
+        assert response.status_code == 200, response.text
+        prompt = generate.call_args.kwargs["prompt"]
+        renders.append(prompt)
+        tokens.append(tokenizer.encode(prompt, add_special_tokens=False))
+        assert "preserve_thinking" not in generate.call_args.kwargs
+        assert all(
+            marker in prompt for marker in ("ACTIVE_NOTE", "VISIBLE", "RESULT", "check")
+        )
+    assert renders[0] == renders[1] == renders[2]
+    assert tokens[0] == tokens[1] == tokens[2]
+    assert 1 in tokens[0] and 2 in tokens[3]
+    if supports_policy:
+        assert "OLD_NOTE" not in renders[3]
+        assert tokens[3] == [token for token in tokens[0] if token != 1]
+    else:
+        assert renders[0] == renders[3]
+        assert tokens[0] == tokens[3]
+    assert messages == original
