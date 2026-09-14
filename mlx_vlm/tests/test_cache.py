@@ -22,6 +22,24 @@ def _make_kv_cache(batch_size=1, length=3):
     return cache, keys, values
 
 
+@pytest.mark.parametrize(
+    "factory", [KVCache, lambda: BatchKVCache([0]), lambda: RotatingKVCache(8)]
+)
+def test_empty_kv_cache_state_can_be_evaluated_and_restored(factory):
+    cache = factory()
+    # Cross-attention layers can leave their cache empty during chunked prefill.
+    mx.eval(cache.state)
+    restored = factory()
+    restored.state = cache.state
+    restored.meta_state = cache.meta_state
+    assert restored.empty()
+    keys = mx.ones((1, 2, 3, 4))
+    values = keys * 2
+    actual_keys, actual_values = restored.update_and_fetch(keys, values)
+    assert mx.array_equal(actual_keys, keys).item()
+    assert mx.array_equal(actual_values, values).item()
+
+
 def test_kv_cache_extracts_one_active_row():
     cache, keys, values = _make_kv_cache(batch_size=2)
 
