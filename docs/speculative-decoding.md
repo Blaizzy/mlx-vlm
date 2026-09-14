@@ -44,8 +44,9 @@ can use the same model with independent `SpeculativeCache` objects.
    output tokens paired with the verified *target* features, then retain only
    the last prediction and hidden state for the next round.
 
-Both target and draft caches end a round at the same logical position. The
-last emitted token remains pending for the target's next forward, matching
+The request tracks the target's absolute position. Draft caches contain the
+current request's prefill suffix and committed decode context; they can be shorter
+than the target caches after prefix reuse. The last emitted token remains pending for the target's next forward, matching
 ordinary autoregressive generation. Ragged batches commit per-row lengths;
 finished rows retain no further input positions. The last output of a round
 is yielded only after commit. Closing a generator partway through a round
@@ -130,37 +131,37 @@ probability payload.
 
 ## Prefix reuse
 
-Prefix reuse belongs to ordinary prefill. Both AR and MTP use `APCCoordinator`
-and `PromptProcessingBatch`; there is no separate speculative prefix manager
-or warm-prefill scheduler. The coordinator accepts a request-cache factory,
-and the cache defines its components, checkpoint identity, and restore/merge
-operations. The coordinator does not import an MTP implementation.
+Prefix reuse belongs to ordinary prefill. AR and MTP use the same
+`APCCoordinator`, prefix keys, cache plan, storage budget, LRU, and disk format.
+APC stores only ordinary target caches. It has no MTP cache, seed, hidden features,
+rollback state, drafter identity, or separate schema. A prefix produced by AR can
+be reused by MTP, and a target prefix produced with MTP can be reused by AR or
+another drafter. Existing tenant/media isolation still applies.
 
-An MTP checkpoint contains target caches, draft caches, logical position, the pending
-target token, and positional offsets. The next MTP prediction and hidden-state seed
-belong to the live request and are regenerated during suffix prefill before decode.
-Checkpoints use the existing APC budget, LRU, cloning, and disk serialization with
-native cache types and the shared APC schema from main. Restore also accepts the
-previous metadata layout, ignoring its saved seeds. Keys are separated by
-target/draft checkpoint identity and the existing request/tenant/media salt, with
-no separate MTP schema version. A target-only checkpoint cannot satisfy an MTP lookup.
+A prefix hit restores the target cache and leaves the normal uncached suffix for
+prefill. The live request creates an empty MTP cache and streams only the suffix's
+target features into it. The last suffix token's feature and the first sampled
+target token produce the seed for drafting. Even a one-token suffix is enough;
+no cached prefix is replayed and no MTP state is reconstructed from APC.
 
-If the target has processed N inputs, the MTP cache has already consumed the
-shifted token at N. The prefix key must therefore include N+1 tokens. A hit
-restores both caches and processes the last key token as the first target suffix
-input. This preserves MTP alignment on identical prompts and conversation
-extensions. Changing that pending token prevents reuse of that checkpoint.
+The fresh drafter has less attention history than a drafter prefilled on the full
+prompt. This can change its proposals and acceptance rate. Output correctness
+still comes from target verification and sampling against the complete target
+context. Prefix reuse therefore saves target prefill work without requiring
+persistent draft state. Draft caches grow with committed tokens during decode.
 
-Prompt chunk boundaries and completed generations can be checkpointed. Closing
-a stream first commits only delivered tokens, then stores that committed state.
-`PromptCacheState` uses the same bounded checkpoint mechanism across turns.
-The server merges warm and empty request caches before prefill, then processes
-their suffixes together through the normal right-padded prompt batch. Each
-target chunk also initializes or extends the MTP cache. When a shorter row
-finishes, the cache retains its final target feature until its first output is
-sampled. Native cache padding controls which positions are retained. Speculative
-proposal and verification begin only after prefill finishes; neither prefix
-lookup nor prompt processing runs a speculative decoding round.
+The server processes mixed warm/cold rows through the normal prompt batch,
+including unequal suffix lengths and chunk boundaries. Target positions include
+each row's cached prefix; draft padding describes only the new suffix. When a
+shorter row finishes, the request retains its final target feature until the first
+output is sampled. Proposal and verification begin after prefill finishes.
+
+Prompt boundaries and completed generations can save target checkpoints. Closing
+a stream first commits only delivered tokens, then saves the target prefix up to
+its actual cursor; the last emitted token is still pending for the target.
+`PromptCacheState` also retains only target caches and does not create an APC
+manager implicitly. Changing the next input token does not invalidate an otherwise
+matching target prefix.
 
 Qwen's ordinary forward uses the existing shared short-block projection helpers
 and its existing convolution/attention operations with single-token reductions.
@@ -182,10 +183,12 @@ request and mixed warm/cold batches in both row orders, at temperatures 0 and
 selected target logprobs match exactly. Settings are chunk size 32, one draft
 plus bonus, top-P 0.9, seed 123, repetition penalty 1.1, and presence/frequency
 penalties 0.1 with the default 20-token penalty context. Eight APC entries keep
-the prompt checkpoint resident across cases. The check also passes with seeds
-omitted from APC and regenerated from the warm row's one-token suffix.
-This is a correctness check,
-not a new throughput measurement.
+the prompt checkpoint resident across cases. The warm row starts a fresh MTP
+cache from its one-token suffix; APC contains only target state. This is a
+correctness check, not a new throughput measurement.
+Two additional comparisons reuse AR-created prefixes with MTP through the same
+APC manager, at temperatures 0 and 0.8. All 64 tokens and selected logprobs match
+in both cases, for twelve comparisons in total.
 
 The earlier controlled optimization comparison
 uses an M3 Ultra with 512 GB RAM and MLX 0.32.2. It measures 256 output tokens
@@ -262,7 +265,8 @@ is slower with MTP (151.1–200.1 versus 294.0–320.9 aggregate tok/s). This ad
 validates the shared cache contract; it is not a recommendation to enable MTP
 for every Qwen workload. Dense and MoE variants also share the serving unit tests.
 
-Tests cover warm/cold batches, disk checkpoint restore, changed pending tokens,
+Tests cover AR/MTP prefix interoperability, warm/cold batches, target-only disk
+checkpoint restore, changed continuation tokens,
 processor histories, external per-token processor updates, cancellation, and
 per-request positional state. Native caches reject model forwards that replace
 cache objects during an active transaction. These tests supplement the original
@@ -281,10 +285,10 @@ Prefix caching follows the normal prefill ownership used by both upstreams:
   [speculative worker](https://github.com/sgl-project/sglang/blob/2f5cc8e33e9717f8284ed48ffc7f012e7b4a4197/python/sglang/srt/speculative/eagle_worker_v2.py#L1263)
   runs target prefill and extends the draft with those target features before decode.
 
-Here, MLX stores an atomic request checkpoint and reprocesses one pending target
-token rather than reserving a paged KV block. The cache declares that one-token
-boundary to normal APC lookup. This preserves shifted MTP alignment without
-introducing another prefix-cache subsystem.
+Here, MLX uses target-only APC and initializes a fresh draft cache from the
+uncached suffix. This shares the normal lookup/prefill lifecycle, but does not
+reuse upstream-style draft cache groups. Reduced draft context may affect
+acceptance rates; target verification still governs every emitted token.
 
 The organization follows the proposal/verification/acceptance split visible
 in [vLLM's proposer](https://github.com/vllm-project/vllm/blob/main/vllm/v1/spec_decode/llm_base_proposer.py)

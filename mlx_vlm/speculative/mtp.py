@@ -68,7 +68,9 @@ def mtp_rounds(
     if phase_observer:
         phase_observer("start", [])
     if state is None:
-        state = SpeculativeCache.create(prompt_cache, draft_model, batch)
+        state = SpeculativeCache.create(
+            prompt_cache, draft_model, batch, prefix_lengths=[0] * batch
+        )
         state.bonus = first_bonus.astype(token_dtype).reshape(-1, 1)
         state.prefill(prompt_tokens, hidden, forward)
     contexts = (

@@ -10,11 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
-from .apc_adapters import (
-    PrefixCachePlan,
-    build_prefix_cache_plan,
-    build_prefix_cache_plan_from_caches,
-)
+from .apc_adapters import PrefixCachePlan, build_prefix_cache_plan
 
 
 class APCCoordinator:
@@ -23,41 +19,12 @@ class APCCoordinator:
     Native dense K/V layouts use the block pool.  Windowed, recurrent,
     composite and custom layouts use restorable checkpoints at the same token
     boundary.  The distinction is deliberately private to this class.
-
-    An optional factory wraps native layer caches in an aggregate request cache.
-    That cache exposes its checkpoint components, identity, replay tail, and
-    checkpoint/restore/merge operations while remaining a layer-cache sequence
-    for ordinary model forwards.
     """
 
-    def __init__(self, manager: Any, model: Any, *, cache_factory=None):
+    def __init__(self, manager: Any, model: Any):
         self.manager = manager
         self.model = model
-        self.cache_factory = cache_factory
-        self.cache_template = self.fresh_cache() if cache_factory is not None else None
-        self.plan: PrefixCachePlan = (
-            build_prefix_cache_plan_from_caches(
-                self.cache_template.prefix_cache_components
-            )
-            if self.cache_template is not None
-            else build_prefix_cache_plan(model)
-        )
-
-    @property
-    def prefix_replay_tokens(self):
-        return getattr(self.cache_template, "prefix_replay_tokens", 0)
-
-    def _key(self, extra_hash):
-        if self.cache_template is None:
-            return extra_hash
-        from .apc import semantic_extra_hash
-
-        return semantic_extra_hash(
-            media={
-                "cache": self.cache_template.prefix_cache_identity,
-                "request": extra_hash,
-            }
-        )
+        self.plan: PrefixCachePlan = build_prefix_cache_plan(model)
 
     def prepare_prefill(self, token_count: int) -> None:
         if self.enabled:
@@ -85,12 +52,10 @@ class APCCoordinator:
             self.model, "make_cache", None
         )
         if callable(make_cache):
-            caches = list(make_cache())
-        else:
-            from .models.cache import make_prompt_cache
+            return list(make_cache())
+        from .models.cache import make_prompt_cache
 
-            caches = list(make_prompt_cache(language_model))
-        return self.cache_factory(caches) if self.cache_factory is not None else caches
+        return list(make_prompt_cache(language_model))
 
     def lookup(
         self,
@@ -108,19 +73,13 @@ class APCCoordinator:
         hit = apc_lookup_plan(
             self.manager,
             token_ids,
-            extra_hash=self._key(extra_hash),
+            extra_hash=extra_hash,
             apc_mode=self.legacy_mode,
-            prefix_replay_tokens=self.prefix_replay_tokens,
             safe_lookup_min=safe_lookup_min,
             suffix_is_text_only=suffix_is_text_only,
             prefix_has_media=prefix_has_media,
         )
         if hit is not None:
-            hit["extra_hash"] = extra_hash
-            if self.cache_template is not None:
-                state = self.cache_template.restore(hit["warm_cache"])
-                state.validate_prefix(token_ids, hit["prefix_len"])
-                hit["warm_cache"] = state
             hit["cache_plan"] = self.plan
         return hit
 
@@ -189,10 +148,6 @@ class APCCoordinator:
                 pick["warm_cache"] if pick is not None else self.fresh_cache()
                 for pick in picks
             ]
-            if self.cache_template is not None:
-                return self.cache_template.merge(
-                    row_caches, kv_quant_config=kv_quant_config
-                ), max(prefix_lens, default=0)
             return make_warm_batch_exact_cache_multi(
                 row_caches,
                 prefix_lens,
@@ -229,7 +184,6 @@ class APCCoordinator:
         *,
         extra_hash: int = 0,
         batch_idx: Optional[int] = None,
-        prefix_len: Optional[int] = None,
     ) -> bool:
         if not self.enabled or not self.is_checkpoint:
             return False
@@ -239,31 +193,20 @@ class APCCoordinator:
             snapshot_prompt_cache_row,
         )
 
-        if prefix_len is not None:
-            token_ids = token_ids[: prefix_len + self.prefix_replay_tokens]
-        checkpoint = getattr(prompt_cache, "checkpoint", None)
-        if callable(checkpoint):
-            token_ids = prompt_cache.prefix_cache_key(token_ids, batch_idx or 0)
-            if token_ids is None:
-                return False
-        components = getattr(prompt_cache, "prefix_cache_components", prompt_cache)
-        # Budget the entire request before extracting any target or auxiliary row.
-        if _prompt_cache_is_batch_shaped(components):
+        # Batch extraction can itself allocate a full row before store_exact_cache
+        # decides whether it can afford another retained snapshot.
+        if _prompt_cache_is_batch_shaped(prompt_cache):
             if self.manager.disk is not None:
                 self.manager.disk.flush()
-            if not self.manager._make_room(_cache_nbytes(components)):
+            if not self.manager._make_room(_cache_nbytes(prompt_cache)):
                 with self.manager.lock:
                     self.manager.stats.memory_skips += 1
                 return False
-        snapshot = (
-            checkpoint(batch_idx or 0)
-            if callable(checkpoint)
-            else snapshot_prompt_cache_row(prompt_cache, batch_idx or 0, clone=False)
-        )
+        snapshot = snapshot_prompt_cache_row(prompt_cache, batch_idx or 0, clone=False)
         if snapshot is None:
             return False
         return self.manager.store_exact_cache(
-            token_ids, snapshot, extra_hash=self._key(extra_hash)
+            token_ids, snapshot, extra_hash=extra_hash
         )
 
     def commit(

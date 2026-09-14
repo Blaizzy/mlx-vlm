@@ -279,7 +279,6 @@ class PromptCacheState:
     def __init__(self):
         self.cache: Optional[List[Any]] = None
         self.token_ids: Optional[List[int]] = None
-        self.apc_manager = None
 
     def find_prefix_length(self, new_ids: list) -> int:
         """Return the number of leading tokens that match the cached ids."""

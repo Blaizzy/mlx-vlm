@@ -6,7 +6,6 @@ unaccepted inputs, and aligns the MTP tokens with verified target features.
 
 from dataclasses import dataclass
 from functools import partial
-from pathlib import Path
 
 import mlx.core as mx
 
@@ -144,6 +143,8 @@ class SpeculativePrefill:
         state=None,
         lengths=None,
         position_offset=None,
+        prefix_lengths=None,
+        left_padding=None,
     ):
         """Stream target features into MTP, keeping only the next draft seed."""
         self.forward = partial(
@@ -152,7 +153,13 @@ class SpeculativePrefill:
         self.state = state or (
             target_cache
             if isinstance(target_cache, SpeculativeCache)
-            else SpeculativeCache.create(target_cache, drafter, self.tokens.shape[0])
+            else SpeculativeCache.create(
+                target_cache,
+                drafter,
+                self.tokens.shape[0],
+                prefix_lengths=prefix_lengths,
+                left_padding=left_padding,
+            )
         )
         self.lengths = lengths or [self.tokens.shape[1]] * self.tokens.shape[0]
         if position_offset is not None:
@@ -226,8 +233,9 @@ class DraftState:
 class SpeculativeCache:
     """One request's target cache, MTP cache, positions, and hidden states.
 
-    Both caches end each round at the same logical position. Draft expansions
-    are temporary: after verification, MTP extends only with accepted tokens
+    The target cursor is absolute; draft caches contain only this request's
+    suffix and decode context. Draft expansions are temporary: after
+    verification, MTP extends only with accepted tokens
     and *target* hidden states. No model holds a seed or a rollback snapshot.
     """
 
@@ -258,58 +266,10 @@ class SpeculativeCache:
     def __setitem__(self, index, value):
         self.target[index] = value
 
-    prefix_replay_tokens = 1
-
-    @property
-    def prefix_cache_components(self):
-        return [CacheList(*self.target), CacheList(*self.draft), ArraysCache(3)]
-
     @classmethod
-    def for_model(cls, model, drafter, target_cache):
-        """Cache factory consumed by the normal APC coordinator."""
-        from ..apc import semantic_extra_hash
-
-        def identity(weights):
-            path = getattr(weights, "model_path", None)
-            if path is None:
-                return id(weights)
-            path = Path(path).resolve()
-            files = sorted([*path.glob("*.safetensors"), path / "config.json"])
-            return [
-                str(path),
-                [
-                    (p.name, p.stat().st_size, p.stat().st_mtime_ns)
-                    for p in files
-                    if p.exists()
-                ],
-            ]
-
-        state = cls.create(target_cache, drafter, 1)
-        state.prefix_cache_identity = {
-            "target": identity(getattr(model, "language_model", model)),
-            "draft": identity(drafter),
-            "draft_dependencies": semantic_extra_hash(model=drafter),
-        }
-        return state
-
-    def prefix_cache_key(self, tokens, row=0):
-        """MTP has already consumed the pending target token at this boundary."""
-        position = int(self.position[row].item())
-        if position < 1 or position >= len(tokens):
-            return None
-        if self.bonus[row].item() != tokens[position]:
-            raise ValueError("Prefix checkpoint must include its pending target token.")
-        return list(tokens[: position + 1])
-
-    def validate_prefix(self, tokens, position):
-        if (
-            int(self.position.item()) != position
-            or self.bonus.item() != tokens[position]
-        ):
-            raise ValueError("Request cache is not aligned with its prefix key.")
-
-    @classmethod
-    def create(cls, target_cache, drafter, batch):
+    def create(
+        cls, target_cache, drafter, batch, *, prefix_lengths=None, left_padding=None
+    ):
         padding = next(
             (
                 c.left_padding.tolist()
@@ -320,62 +280,26 @@ class SpeculativeCache:
         )
         if batch > 1 and padding is None:
             raise ValueError("Batched MTP requires batch prompt caches.")
+        if left_padding is not None:
+            padding = list(left_padding) if padding is not None else None
+        position = (
+            next(
+                (
+                    c.offset
+                    for c in iter_leaf_caches(target_cache)
+                    if isinstance(c, CacheTransaction.append_types)
+                ),
+                [0] * batch,
+            )
+            if prefix_lengths is None
+            else [p - pad for p, pad in zip(prefix_lengths, padding or [0] * batch)]
+        )
         return cls(
             target_cache,
             drafter.make_cache(padding),
-            [0] * batch if padding is None else [-p for p in padding],
+            position,
             mx.zeros((batch, 1), dtype=mx.int32),
         )
-
-    def checkpoint(self, row=0):
-        """Snapshot committed caches and alignment; suffix prefill rebuilds the seed."""
-        from ..apc import snapshot_prompt_cache_row
-
-        if self._target_round is not None:
-            raise RuntimeError("Only committed speculative state can be checkpointed.")
-        target = snapshot_prompt_cache_row(self.target, row, clone=False)
-        draft = snapshot_prompt_cache_row(self.draft, row, clone=False)
-        if target is None or draft is None:
-            raise ValueError("Cache cannot extract a prefix checkpoint row.")
-        metadata = ArraysCache(3)
-        metadata.cache = [
-            self.position[row : row + 1, None],
-            self.bonus[row : row + 1],
-            self.position_offset[row : row + 1, None],
-        ]
-        return [CacheList(*target), CacheList(*draft), metadata]
-
-    @classmethod
-    def restore(cls, checkpoint):
-        """Restore prefix state without a decode seed, including older checkpoints."""
-        target, draft, metadata = checkpoint
-        values = metadata.cache
-        if len(values) == 5:
-            # Older entries also saved a prediction and hidden state; ignore them.
-            values = [values[0], values[1], values[4]]
-        position, bonus, position_offset = values
-        state = cls(target.caches, draft.caches, position, bonus)
-        state.position_offset = position_offset.reshape(-1)
-        return state
-
-    @classmethod
-    def merge(cls, states, *, kv_quant_config=None):
-        """Merge warm and empty rows before ordinary batched prefill."""
-        from ..apc import make_warm_batch_exact_cache_multi
-
-        positions = [int(state.position.item()) for state in states]
-        target, _ = make_warm_batch_exact_cache_multi(
-            [s.target for s in states], positions, kv_quant_config=kv_quant_config
-        )
-        draft, _ = make_warm_batch_exact_cache_multi(
-            [s.draft for s in states], positions
-        )
-        if target is None or draft is None:
-            raise ValueError("Cache types cannot merge request rows.")
-        state = cls(target, draft, positions, mx.concatenate([s.bonus for s in states]))
-        state.position_offset = mx.concatenate([s.position_offset for s in states])
-        state.stats = [stats for s in states for stats in s.stats]
-        return state
 
     def positions(self, length):
         return (self.position + self.position_offset)[:, None] + mx.arange(length)[None]

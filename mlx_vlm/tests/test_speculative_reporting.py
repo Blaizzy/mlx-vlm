@@ -224,11 +224,17 @@ def test_server_thinking_budget_uses_same_sampling_policy(pair, draft_enabled):
     assert rows[ids[1]] == [5] * 3 + [29, 30] + [5] * 3
 
 
-def test_prefix_restore_starts_new_request_counters(pair):
+def test_fresh_mtp_cache_starts_new_request_counters(pair):
     target, draft = pair
     _, first = collect(target, draft, [1, 2, 3])
     assert first.stats[0].rounds > 0
-    restored = first.restore(first.checkpoint())
+    from mlx_vlm.speculative.cache_state import SpeculativeCache
+
+    restored = SpeculativeCache.create(
+        first.target, draft, 1, prefix_lengths=[int(first.position.item())]
+    )
+    assert restored.seed is None
+    assert all(c.empty() for c in restored.draft)
     assert restored.stats[0].snapshot() == (0, 0, 0)
     assert first.stats[0].rounds > 0
 

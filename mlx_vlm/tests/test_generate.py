@@ -2150,11 +2150,9 @@ def test_stream_generate_stores_checkpoint_only_before_decode(reused_prefix):
 
     calls = coordinator.store_checkpoint.call_args_list
     lengths = [n for n in [2, 3] if n > reused_prefix]
-    assert [call.args[0] for call in calls] == [[1, 2, 3, 4]] * len(lengths)
+    assert [call.args[0] for call in calls] == [[1, 2, 3, 4][:n] for n in lengths]
     assert all(call.args[1] == prompt_cache for call in calls)
-    assert [call.kwargs for call in calls] == [
-        {"prefix_len": n, "extra_hash": 0} for n in lengths
-    ]
+    assert [call.kwargs for call in calls] == [{"extra_hash": 0} for n in lengths]
 
 
 def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
@@ -2779,6 +2777,13 @@ class TestPrefixCacheReuseTrim:
     def test_full_prefix_needs_no_trim(self):
         c = self._fill(KVCache(), 12)
         assert dispatch_module._prefix_cache_trim_amount([c], 12) == 0
+
+    def test_nested_stateful_cache_cannot_rewind_to_divergence(self):
+        from mlx_vlm.models.cache import ArraysCache, CacheList
+
+        c = CacheList(self._fill(KVCache(), 12), ArraysCache(1))
+        assert dispatch_module._prefix_cache_trim_amount([c], 12) == 0
+        assert dispatch_module._prefix_cache_trim_amount([c], 8) is None
 
     def test_empty_cache_is_reusable(self):
         assert dispatch_module._prefix_cache_trim_amount([], 0) == 0

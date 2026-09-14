@@ -10,16 +10,8 @@ from mlx_vlm.apc import APCCoordinator, APCManager, DiskBlockStore
 from mlx_vlm.generate.ar import BatchGenerator, generate_step
 from mlx_vlm.models.base import InputEmbeddingsFeatures
 from mlx_vlm.models.cache import KVCache
-from mlx_vlm.speculative.cache_state import SpeculativeCache
+from mlx_vlm.speculative.cache_state import SpeculativeCache, iter_leaf_caches
 from mlx_vlm.tests.test_speculative import models as glm_models
-
-
-def coordinator(manager, target, draft):
-    return APCCoordinator(
-        manager,
-        target,
-        cache_factory=partial(SpeculativeCache.for_model, target, draft),
-    )
 
 
 def lookup(prefix, tokens, extra_hash=0):
@@ -120,9 +112,9 @@ def wrapper(target):
     )
 
 
-def generate(target, draft, prompt, *, state=None, prefix=None, **kwargs):
+def generate(target, draft, prompt, *, state=None, prefix_len=0, prefix=None, **kwargs):
     full = mx.array([prompt])
-    suffix = full if state is None else full[:, int(state.position.item()) :]
+    suffix = full[:, prefix_len:]
     holder = []
     kwargs.setdefault("max_tokens", 12)
     kwargs.setdefault("draft_block_size", 4)
@@ -141,14 +133,20 @@ def generate(target, draft, prompt, *, state=None, prefix=None, **kwargs):
             prompt_cache_checkpoint=(
                 (
                     lambda length, caches: prefix.store_checkpoint(
-                        prompt, caches, prefix_len=length
+                        prompt[: prefix_len + length], list(caches)
                     )
                 )
                 if prefix
                 else None
             ),
             prompt_cache_checkpoint_lengths=(
-                prefix.checkpoint_lengths(prompt, set()) if prefix else None
+                [
+                    n - prefix_len
+                    for n in prefix.checkpoint_lengths(prompt, set())
+                    if n > prefix_len
+                ]
+                if prefix
+                else None
             ),
             **kwargs,
         )
@@ -190,107 +188,94 @@ def test_processors_see_full_committed_history(pair, temperature, chunk):
 
 
 @pytest.mark.parametrize("temperature", [0, 0.8])
-def test_prefix_reuse_restores_both_caches_and_rebuilds_seed(pair, temperature):
+def test_ar_prefix_reuse_initializes_mtp_from_suffix_only(
+    pair, temperature, monkeypatch
+):
     target, draft = pair
     manager = APCManager(num_blocks=1, block_size=4)
-    prefix = coordinator(manager, target, draft)
+    prefix = APCCoordinator(manager, target)
     prompt = [1, 2, 3, 4, 5, 6]
     kwargs = dict(temperature=temperature, seed=17, repetition_penalty=1.2)
-    original, state = generate(target, draft, prompt, prefix=prefix, **kwargs)
+    expected, _ = generate(target, None, prompt, prefix=prefix, **kwargs)
     warm, position = lookup(prefix, prompt)
     assert position == len(prompt) - 1
-    assert warm.position.item() == position
-    assert warm.bonus.item() == prompt[-1]
-    assert warm.seed is None
+    assert isinstance(warm, list)
+    assert [type(c) for c in warm] == [type(c) for c in target.make_cache()]
+    calls = []
+    original = type(target).__call__
+
+    def forward(self, *args, **kwargs):
+        calls.append((args[0] if args else kwargs["inputs"]).tolist())
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(target), "__call__", forward)
+    first, resumed = generate(
+        target, draft, prompt, state=warm, prefix_len=position, max_tokens=1, **kwargs
+    )
+    assert first == expected[:1]
+    assert calls == [[[prompt[-1]]]]
+    assert resumed.seed is not None
+    assert resumed.position.item() == len(prompt)
+    for entry in iter_leaf_caches(resumed.draft):
+        if isinstance(entry, KVCache):
+            assert entry.offset in (0, 1)  # Optional indexer caches can be unused.
+    assert any(
+        isinstance(c, KVCache) and c.offset == 1
+        for c in iter_leaf_caches(resumed.draft)
+    )
+    warm, position = lookup(prefix, prompt)
     if hasattr(target, "_rope_deltas"):
         target._rope_deltas = mx.array([[99]])
-    actual, resumed = generate(target, draft, prompt, state=warm, **kwargs)
-    assert actual == original
-    assert resumed.seed is not None
-    history = prompt + original
-    assert prefix.store_checkpoint(history, state)
-    warm, position = lookup(prefix, history + [7, 8, 9])
-    assert position == len(history) - 1
-    assert warm.seed is None
-    expected, _ = generate(target, None, history + [7, 8, 9], **kwargs)
-    actual, _ = generate(target, draft, history + [7, 8, 9], state=warm, **kwargs)
+    actual, _ = generate(
+        target, draft, prompt, state=warm, prefix_len=position, **kwargs
+    )
     assert actual == expected
     manager.close()
 
 
-def test_checkpoint_omits_decode_seed_and_rejects_active_round(pair):
-    target, draft = pair
-    _, state = generate(target, draft, [1, 2, 3], max_tokens=1)
-    state.position_offset = mx.array([17], dtype=mx.int32)
-    checkpoint = state.checkpoint()
-    metadata = checkpoint[-1].cache
-    assert len(metadata) == 3
-    assert [value.shape for value in metadata] == [(1, 1)] * 3
-    restored = SpeculativeCache.restore(checkpoint)
-    assert restored.seed is None
-    assert restored.position.item() == state.position.item()
-    assert restored.bonus.item() == state.bonus.item()
-    assert restored.position_offset.item() == 17
-    assert len(restored.checkpoint()[-1].cache) == 3
-    with pytest.raises(ValueError, match="Prefill the MTP cache"):
-        restored.propose(0, None)
-    state.propose(0, None)
-    try:
-        with pytest.raises(RuntimeError, match="Only committed speculative state"):
-            state.checkpoint()
-    finally:
-        state.abort()
-
-
-def test_checkpoint_key_includes_pending_token_and_draft_identity(pair):
+def test_target_checkpoint_does_not_depend_on_drafter_or_pending_token(pair):
     target, draft = pair
     manager = APCManager(num_blocks=1)
-    prefix = coordinator(manager, target, draft)
+    prefix = APCCoordinator(manager, target)
     prompt = [1, 2, 3]
     generated, state = generate(target, draft, prompt, max_tokens=1)
-    key = prompt + generated
-    assert prefix.store_checkpoint(key, state)
-    assert lookup(prefix, key)[1] == len(prompt)
-    assert lookup(prefix, key[:-1] + [(key[-1] + 1) % 32]) == (None, 0)
-    assert lookup(prefix, key, extra_hash=99) == (None, 0)
-    assert lookup(APCCoordinator(manager, target), key) == (None, 0)
-    assert lookup(
-        coordinator(manager, target, SimpleNamespace(make_cache=draft.make_cache)), key
-    ) == (None, 0)
+    assert prefix.store_checkpoint(prompt, state.target)
+    changed = prompt + [(generated[0] + 1) % 32]
+    warm, position = lookup(APCCoordinator(manager, target), changed)
+    assert position == len(prompt)
+    assert lookup(prefix, changed, extra_hash=99) == (None, 0)
+    other_draft = type(draft)(draft.config)
+    actual, _ = generate(target, other_draft, changed, state=warm, prefix_len=position)
+    expected, _ = generate(target, None, changed)
+    assert actual == expected
     manager.close()
 
 
-@pytest.mark.parametrize("legacy_seed", [False, True])
-def test_speculative_checkpoint_disk_roundtrip(
-    pair, tmp_path, monkeypatch, legacy_seed
-):
+def test_target_checkpoint_disk_roundtrip_for_mtp(pair, tmp_path, monkeypatch):
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
     target, draft = pair
     prompt = [1, 2, 3]
     generated, state = generate(target, draft, prompt, max_tokens=5)
-    if legacy_seed:
-        # Existing disk entries use the same identity, with two extra seed arrays.
-        checkpoint = state.checkpoint()
-        checkpoint[-1].cache[2:2] = [state.seed.token, state.seed.hidden]
-        monkeypatch.setattr(state, "checkpoint", lambda row=0: checkpoint)
     history = prompt + generated
-    disk = DiskBlockStore(tmp_path, namespace="mtp")
+    disk = DiskBlockStore(tmp_path, namespace="target")
     manager = APCManager(num_blocks=1, disk=disk)
-    prefix = coordinator(manager, target, draft)
-    assert prefix.store_checkpoint(history, state)
+    prefix = APCCoordinator(manager, target)
+    assert prefix.store_checkpoint(history[:-1], state.target)
     disk._q.join()
     manager.close()
-    manager = APCManager(num_blocks=1, disk=DiskBlockStore(tmp_path, namespace="mtp"))
-    prefix = coordinator(manager, target, draft)
-    assert lookup(prefix, history)[1] == len(history) - 1
+    manager = APCManager(
+        num_blocks=1, disk=DiskBlockStore(tmp_path, namespace="target")
+    )
+    prefix = APCCoordinator(manager, target)
     warm, position = lookup(prefix, history + [5, 6])
     assert position == len(history) - 1
-    assert warm.seed is None
-    assert len(warm.checkpoint()[-1].cache) == 3
-    assert (
-        generate(target, draft, history + [5, 6], state=warm)[0]
-        == generate(target, None, history + [5, 6])[0]
+    assert isinstance(warm, list)
+    assert [type(c) for c in warm] == [type(c) for c in target.make_cache()]
+    actual, _ = generate(
+        target, draft, history + [5, 6], state=warm, prefix_len=position
     )
+    expected, _ = generate(target, None, history + [5, 6])
+    assert actual == expected
     manager.close()
 
 
@@ -316,10 +301,10 @@ def test_server_mixed_warm_cold_rows_share_prefill_and_decode(
     kwargs = dict(seed=23, temperature=temperature, repetition_penalty=1.2)
     prompt = [1, 2, 3, 4, 5]
     _, state = generate(target, draft, prompt, max_tokens=1, **kwargs)
-    # Use a prompt checkpoint whose shifted draft cache depends on the next input.
-    prefix = coordinator(manager, target, draft)
+    # Store only target state; the warm row starts with an empty draft cache.
+    prefix = APCCoordinator(manager, target)
     key = prompt + [int(state.bonus.item())]
-    assert prefix.store_checkpoint(key, state)
+    assert prefix.store_checkpoint(prompt, state.target)
     prompts = [cold_tokens, key + [6, 7]]
     sampler = (
         None
@@ -376,18 +361,18 @@ def test_server_mixed_warm_cold_rows_share_prefill_and_decode(
         history = prompt + actual[uid]
         warm, position = lookup(prefix, history)
         assert position == len(history) - 1
-        assert warm.bonus.item() == history[-1]
-        assert warm.seed is None
+        assert isinstance(warm, list)
         # The logical cursor must agree with dense target/draft storage;
         # dropped padding metadata can otherwise leave unnoticed extra inputs.
-        for entry in [*warm.target, *warm.draft]:
-            if isinstance(entry, KVCache):
+        for entry in iter_leaf_caches(warm):
+            if isinstance(entry, KVCache) and not entry.empty():
                 assert entry.offset == position
     generator.close()
     manager.close()
 
 
-def test_stream_cancel_saves_only_delivered_prefix(pair):
+@pytest.mark.parametrize("use_apc", [False, True])
+def test_stream_cancel_saves_only_delivered_target_prefix(pair, use_apc):
     from mlx_vlm.generate.common import PromptCacheState
     from mlx_vlm.generate.dispatch import stream_generate
     from mlx_vlm.tests.test_generate import MockDetokenizer, MockTokenizer
@@ -399,6 +384,7 @@ def test_stream_cancel_saves_only_delivered_prefix(pair):
     tokenizer.stopping_criteria = NeverStop()
     processor = SimpleNamespace(tokenizer=tokenizer, detokenizer=MockDetokenizer())
     request_cache = PromptCacheState()
+    manager = APCManager(num_blocks=1) if use_apc else None
     prompt = [1, 2, 3, 4, 5]
     stream = stream_generate(
         model,
@@ -411,17 +397,22 @@ def test_stream_cancel_saves_only_delivered_prefix(pair):
         draft_block_size=4,
         prefill_step_size=2,
         prompt_cache_state=request_cache,
+        apc_manager=manager,
         max_tokens=20,
     )
     delivered = [next(stream).token, next(stream).token]
     stream.close()
-    prefix = coordinator(request_cache.apc_manager, model, draft)
     # Request hashes also include processor/media semantics; the mock has none.
     history = prompt + delivered
-    warm, position = lookup(prefix, history)
-    assert position == len(history) - 1
-    assert warm.bonus.item() == delivered[-1]
-    assert not any(getattr(c, "is_speculating", False) for c in warm.target)
+    position = len(history) - 1
+    assert request_cache.token_ids == history[:-1]
+    if use_apc:
+        warm, cached = lookup(APCCoordinator(manager, target), history)
+        assert cached == position
+        assert isinstance(warm, list)
+    assert isinstance(request_cache.cache, list)
+    assert not hasattr(request_cache, "apc_manager")
+    assert not any(getattr(c, "is_speculating", False) for c in request_cache.cache)
     results = list(
         stream_generate(
             model,
@@ -434,12 +425,14 @@ def test_stream_cancel_saves_only_delivered_prefix(pair):
             draft_block_size=4,
             prefill_step_size=2,
             prompt_cache_state=request_cache,
+            apc_manager=manager,
             max_tokens=5,
         )
     )
     assert results[-1].cached_tokens == position
     assert results[-1].token_ids == [0] * 5
-    request_cache.apc_manager.close()
+    if manager is not None:
+        manager.close()
 
 
 def test_processor_requiring_external_updates_yields_each_token(pair):

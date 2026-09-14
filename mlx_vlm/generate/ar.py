@@ -371,12 +371,7 @@ def generate_step(
 
         validate_drafter_compatibility(model, draft_model, draft_kind)
         CacheTransaction.check_types(prompt_cache)
-        if speculative_state is None and any(
-            not entry.empty() for entry in prompt_cache
-        ):
-            raise ValueError(
-                "MTP requires a fresh prompt cache; target-only prefix reuse is not supported."
-            )
+        warm_target = any(not entry.empty() for entry in prompt_cache)
         speculative_prefill_capture_kwargs = speculative_prefill_kwargs(
             draft_kind, draft_model
         )
@@ -385,14 +380,18 @@ def generate_step(
             prompt_cache,
             draft_model,
             state=speculative_state,
+            left_padding=[0] * input_ids.shape[0] if warm_target else None,
         )
         prompt_cache = speculative_prefill.state
+        if warm_target:
+            kwargs.setdefault("rope_deltas", prompt_cache.position_offset[:, None])
         # Reset stale mRoPE state from any previous generation.
         lm = model.language_model if hasattr(model, "language_model") else model
-        if speculative_state is None and hasattr(lm, "_position_ids"):
-            lm._position_ids = None
-        if speculative_state is None and hasattr(lm, "_rope_deltas"):
-            lm._rope_deltas = None
+        if speculative_state is None and not warm_target:
+            if hasattr(lm, "_position_ids"):
+                lm._position_ids = None
+            if hasattr(lm, "_rope_deltas"):
+                lm._rope_deltas = None
 
     def _step(y, inputs_embeds=None):
         nonlocal tokens, kwargs, last_outputs, target_sample_position
@@ -1871,12 +1870,6 @@ class PromptProcessingBatch:
         speculative_state = (
             warm_cache if isinstance(warm_cache, SpeculativeCache) else None
         )
-        if (
-            draft_model is not None
-            and warm_cache is not None
-            and speculative_state is None
-        ):
-            raise ValueError("MTP requires its request cache when restoring a prefix.")
         self.draft_model = draft_model
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
@@ -2010,6 +2003,8 @@ class PromptProcessingBatch:
                 state=speculative_state,
                 lengths=self._suffix_lens if right_pad_per_row is not None else None,
                 position_offset=self._prompt_kwargs.get("rope_deltas"),
+                prefix_lengths=self._cached_tokens_per_row,
+                left_padding=left_padding,
             )
 
             self.prompt_cache = self._speculative_prefill.state
@@ -2155,9 +2150,8 @@ class PromptProcessingBatch:
             coordinator = getattr(self, "_apc_coordinator", None)
             if coordinator is not None:
                 stored = coordinator.store_checkpoint(
-                    meta["full_input_ids"],
-                    self.prompt_cache,
-                    prefix_len=checkpoint_len,
+                    meta["full_input_ids"][:checkpoint_len],
+                    list(self.prompt_cache),
                     batch_idx=batch_idx,
                     extra_hash=meta.get("extra_hash", 0),
                 )
@@ -2186,7 +2180,7 @@ class PromptProcessingBatch:
 
         def checkpoint(prompt_cache, row, tokens):
             coordinator.commit(
-                prompt_cache, tokens, batch_idx=row, extra_hash=hashes[row]
+                prompt_cache.target, tokens[:-1], batch_idx=row, extra_hash=hashes[row]
             )
 
         return checkpoint
@@ -2473,7 +2467,7 @@ class PromptProcessingBatch:
                     coordinator = getattr(self, "_apc_coordinator", None)
                     if coordinator is not None:
                         coordinator.commit(
-                            self.prompt_cache,
+                            list(self.prompt_cache),
                             meta["full_input_ids"],
                             batch_idx=batch_idx,
                             extra_hash=meta.get("extra_hash", 0),
@@ -2618,17 +2612,8 @@ class BatchGenerator:
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling or sampler is None
-        cache_factory = None
-        if draft_model is not None:
-            from ..speculative.cache_state import SpeculativeCache
-
-            cache_factory = functools.partial(
-                SpeculativeCache.for_model, model, draft_model
-            )
         self.apc = (
-            _apc.APCCoordinator(apc_manager, model, cache_factory=cache_factory)
-            if apc_manager is not None
-            else None
+            _apc.APCCoordinator(apc_manager, model) if apc_manager is not None else None
         )
         if self.apc is not None and not self.apc.enabled:
             self.apc = None

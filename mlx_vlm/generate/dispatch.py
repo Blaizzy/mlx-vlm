@@ -782,7 +782,14 @@ def _prefix_cache_trim_amount(kv_cache: List[Any], prefix_len: int) -> Optional[
     evicted part of the prefix, or holds untrimmable state (e.g. the ``ArraysCache``
     of hybrid/linear-attention layers), and the caller must cold-prefill instead.
     """
-    cached_len = max((int(getattr(c, "offset", 0) or 0) for c in kv_cache), default=0)
+
+    def cache_length(entry):
+        children = getattr(entry, "caches", None)
+        if children is not None:
+            return max((cache_length(c) for c in children), default=0)
+        return int(getattr(entry, "offset", 0) or 0)
+
+    cached_len = max((cache_length(c) for c in kv_cache), default=0)
     n_drop = max(0, cached_len - prefix_len)
     if n_drop and not all(
         c.is_trimmable() and _cache_fully_retained(c) for c in kv_cache
@@ -850,10 +857,6 @@ def stream_generate(
     vision_cache = kwargs.pop("vision_cache", None)
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
     apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
-    if apc_manager is None and prompt_cache_state is not None:
-        if prompt_cache_state.apc_manager is None:
-            prompt_cache_state.apc_manager = _apc.APCManager(num_blocks=1)
-        apc_manager = prompt_cache_state.apc_manager
     apc_tenant: Optional[str] = kwargs.pop("apc_tenant", None)
     image = image or None
     audio = audio or None
@@ -925,18 +928,7 @@ def stream_generate(
         )
 
     if apc_manager is not None:
-        cache_factory = None
-        if kwargs.get("draft_model") is not None:
-            from functools import partial
-
-            from ..speculative.cache_state import SpeculativeCache
-
-            cache_factory = partial(
-                SpeculativeCache.for_model, model.language_model, kwargs["draft_model"]
-            )
-        apc_coordinator = _apc.APCCoordinator(
-            apc_manager, model.language_model, cache_factory=cache_factory
-        )
+        apc_coordinator = _apc.APCCoordinator(apc_manager, model.language_model)
         if not apc_coordinator.enabled:
             apc_coordinator = None
             apc_manager = None
@@ -965,12 +957,7 @@ def stream_generate(
         kwargs["speculative_cache_callback"] = lambda state: speculative_holder.update(
             state=state
         )
-    if (
-        kwargs.get("draft_model") is None
-        and prompt_cache_state is not None
-        and prompt_cache_state.cache is not None
-        and not hasattr(prompt_cache_state.cache, "checkpoint")
-    ):
+    if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
         kv_cache = prompt_cache_state.cache
         # None => a cache can't be trimmed back to the shared prefix (wrapped
@@ -1082,9 +1069,8 @@ def stream_generate(
 
             def exact_checkpoint(prefix_len: int, prompt_cache: List[Any]) -> None:
                 apc_coordinator.store_checkpoint(
-                    full_input_ids_list,
-                    prompt_cache,
-                    prefix_len=reused_prefix_len + prefix_len,
+                    full_input_ids_list[: reused_prefix_len + prefix_len],
+                    list(prompt_cache),
                     extra_hash=apc_extra_hash,
                 )
 
@@ -1147,12 +1133,30 @@ def stream_generate(
             close = getattr(gen, "close", None)
             if close is not None:
                 close()
-            completed_cache = speculative_holder.get("state", tracked_cache)
-            if apc_coordinator is not None and hasattr(completed_cache, "checkpoint"):
+            completed_cache = (
+                speculative_holder["state"].target
+                if "state" in speculative_holder
+                else tracked_cache
+            )
+            all_ids = full_input_ids_list + generated_tokens
+            cache_ids = (
+                all_ids[: int(speculative_holder["state"].position.item())]
+                if "state" in speculative_holder
+                else all_ids
+            )
+            if prompt_cache_state is not None and (
+                generated_tokens or "state" in speculative_holder
+            ):
+                prompt_cache_state.update(
+                    cache_ids,
+                    completed_cache,
+                )
+            if apc_coordinator is not None and "state" in speculative_holder:
                 apc_coordinator.commit(
                     completed_cache,
-                    full_input_ids_list + generated_tokens,
+                    cache_ids,
                     extra_hash=apc_extra_hash,
+                    blocks_in_use=apc_blocks_in_use,
                 )
 
         if not generated_tokens:
@@ -1198,16 +1202,12 @@ def stream_generate(
             ],
         )
 
-        # Save cache state for potential reuse on next turn
-        all_ids: Optional[List[int]] = None
-        if prompt_cache_state is not None:
-            all_ids = full_input_ids_list + [
-                t.item() if hasattr(t, "item") else t for t in generated_tokens
-            ]
-            prompt_cache_state.update(all_ids, completed_cache)
-
         # APC: harvest new blocks from the post-generation KV state.
-        if apc_coordinator is not None and not apc_coordinator.is_checkpoint:
+        if (
+            apc_coordinator is not None
+            and not apc_coordinator.is_checkpoint
+            and "state" not in speculative_holder
+        ):
             try:
                 if all_ids is None:
                     all_ids = full_input_ids_list + [
