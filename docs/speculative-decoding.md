@@ -164,7 +164,7 @@ No new Metal kernel is introduced for the second adapter.
 
 ## Validation and performance
 
-The latest [controlled optimization comparison](benchmarks/glm53-mtp-fp8-optimized.json)
+The latest controlled optimization comparison
 uses an M3 Ultra with 512 GB RAM and MLX 0.32.2. It measures 256 output tokens
 per row, one draft plus bonus, and two alternating before/after repetitions
 with the same loaded FP8 target and MTP weights. Every output matches AR:
@@ -180,18 +180,19 @@ Rates for batch two are aggregate. The comparison substitutes the projection
 and acceptance functions from `378349e9` into the current cache-owned request
 loop, then enables the optimized functions. Target and MTP prefill are measured
 separately; decode rates count the remaining 255 tokens per row. These runs use
-raw encoded prompts without a chat template: a Fibonacci coding prompt for batch
-one, plus a sky explanation for batch two. Settings, exact prompts, tokens, and
-per-run timings are in the artifact. This short-context comparison does not
-establish the same speedup for long contexts or constrained sampling.
+raw encoded prompts without a chat template: "Write a Python function that
+returns the first n Fibonacci numbers. Include examples." for batch one, plus
+"Explain why the sky is blue in three sentences." for batch two. Sampling uses
+top-P 0.9 and seed 123, with a prefill chunk size of 512. This short-context
+comparison does not establish the same speedup for long contexts or constrained sampling.
 
-The [FP8 reporting checks](benchmarks/glm53-mtp-fp8-reporting.json) compare 64
+The FP8 reporting checks compare 64
 sampled output tokens and their full target logprob vectors against AR, with no
 thinking limit and with budgets of 0 and 8. All three token sequences and every
 logprob match exactly. Forced closing tokens have a reported logprob of zero.
 The checks use the model's chat template with thinking enabled.
 
-The latest [Qwen3.5-0.8B matrix](benchmarks/qwen35-mtp-optimized.json) also passes
+The latest Qwen3.5-0.8B matrix also passes
 all 12 token comparisons. One draft reaches 144.1–230.3 tok/s versus
 127.0–137.3 tok/s for AR at batch one. At batch two it reaches 205.7–217.2
 aggregate tok/s versus 305.4–334.2 for AR. Batch-two MTP remains slower for this
@@ -210,15 +211,15 @@ AR token:
 | 1,024 outputs, 4,123-token prompt, T=0 | 17.55 tok/s | 22.53 tok/s | 1.28× |
 | 1,024 outputs, 4,123-token prompt, T=0.8 | 17.22 tok/s | 21.70 tok/s | 1.26× |
 
-The [256-token matrix](benchmarks/glm53-mtp-fp8-256.json) has 24 comparisons
+The 256-token matrix has 24 comparisons
 across two prompts, batch sizes 1/2, temperatures 0/0.8, and blocks 2/3.
-The [longer runs](benchmarks/glm53-mtp-fp8-1024.json) reach about 343.2 GB peak
+The longer runs reach about 343.2 GB peak
 MLX memory. The 256-token matrix includes initial MTP alignment in decode time;
 the later harness accounts for both target and MTP prefill in `prefill_seconds`.
 All throughput runs use a fixed output budget and continue past EOS, to keep
 workload lengths comparable. Larger blocks sometimes lose throughput.
 
-The [phase profile](benchmarks/glm53-mtp-fp8-profile.json), on a 256-token coding
+The phase profile, on a 256-token coding
 prompt, attributes roughly 91–92% of round time to target verification. With one
 draft, target verification averages 74.3 ms, acceptance 0.8 ms, and commit/MTP
 alignment 5.6 ms. With two drafts, target verification averages 102.6 ms and
@@ -226,12 +227,12 @@ alignment 6.2 ms. Phase boundaries explicitly synchronize MLX, so these timings
 are diagnostic and should not be used as normal throughput measurements. Use
 `--profile` to reproduce them; normal decoding has no phase synchronization.
 
-The [FP8 serving check](benchmarks/glm53-mtp-fp8-serving.json) compares AR, cold
+The FP8 serving check compares AR, cold
 MTP, and warm MTP with temperature 0.8 and repetition/presence/frequency penalties.
 All 128 outputs match; the warm request reuses 148 of 149 prompt tokens. Its
 measured prompt-processing time falls from about 1.40 s cold to 0.057 s warm.
 
-[Qwen3.5-0.8B results](benchmarks/qwen35-mtp.json) cover 12 comparisons of 128
+Earlier Qwen3.5-0.8B results cover 12 comparisons of 128
 outputs, batch sizes 1/2, temperatures 0/0.8, and blocks 2/3. Every token matches.
 One draft reaches 106.5–158.0 tok/s versus 103.6–106.4 for batch one. Batch two
 is slower with MTP (151.1–200.1 versus 294.0–320.9 aggregate tok/s). This adapter
@@ -242,7 +243,7 @@ Tests cover warm/cold batches, disk checkpoint restore, changed pending tokens,
 processor histories, external per-token processor updates, cancellation, and
 per-request positional state. Native caches reject model forwards that replace
 cache objects during an active transaction. These tests supplement the original
-[short FP8 runs](benchmarks/glm53-mtp-fp8.json).
+short FP8 runs.
 
 ## Upstream references
 
