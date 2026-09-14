@@ -366,11 +366,11 @@ def generate_step(
     def _step(y, inputs_embeds=None):
         nonlocal tokens, kwargs, last_outputs, target_sample_position
 
-        step_kwargs = kwargs
-        if speculative_prefill_capture_kwargs:
-            step_kwargs = {**kwargs, **speculative_prefill_capture_kwargs}
-        if getattr(model.language_model, "supports_logits_to_keep", False):
-            step_kwargs = {**step_kwargs, "logits_to_keep": 1}
+        step_kwargs = {
+            **kwargs,
+            **speculative_prefill_capture_kwargs,
+            "logits_to_keep": 1,
+        }
 
         with mx.stream(generation_stream):
             if "decoder_input_ids" in step_kwargs:
@@ -491,9 +491,11 @@ def generate_step(
                         and processed_tokens + n_to_process > checkpoint_lengths[0]
                     ):
                         n_to_process = checkpoint_lengths[0] - processed_tokens
-                    chunk_kwargs = {**kwargs, **speculative_prefill.kwargs}
-                    if getattr(model.language_model, "supports_logits_to_keep", False):
-                        chunk_kwargs = {**chunk_kwargs, "logits_to_keep": 1}
+                    chunk_kwargs = {
+                        **kwargs,
+                        **speculative_prefill.kwargs,
+                        "logits_to_keep": 1,
+                    }
                     chunk_output = model.language_model(
                         inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
@@ -2132,16 +2134,14 @@ class PromptProcessingBatch:
                 speculative_prefill_kwargs(self.draft_kind, self.draft_model)
             )
 
-        language_model = getattr(self.model, "language_model", self.model)
-        if getattr(language_model, "supports_logits_to_keep", False):
-            call_kwargs["logits_to_keep"] = 1 + max(
-                (
-                    padding
-                    for i, padding in enumerate(self._right_pad_per_row or [])
-                    if i not in self._finished_prompt_logits
-                ),
-                default=0,
-            )
+        call_kwargs["logits_to_keep"] = 1 + max(
+            (
+                padding
+                for i, padding in enumerate(self._right_pad_per_row or [])
+                if i not in self._finished_prompt_logits
+            ),
+            default=0,
+        )
 
         output = self.model(
             self._input_ids,
@@ -2267,6 +2267,7 @@ class PromptProcessingBatch:
             gen_batch._next_top_idx = top_idx
             gen_batch._next_top_lp = top_lp
 
+        language_model = getattr(self.model, "language_model", self.model)
         rope_deltas = self._capture_rope_deltas_from_prompt_kwargs(
             call_kwargs, language_model, len(gen_batch.uids)
         )

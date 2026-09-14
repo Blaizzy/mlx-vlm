@@ -511,8 +511,6 @@ class Gemma4TextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    supports_logits_to_keep = True
-
     def __init__(self, args: ModelConfig):
         super().__init__()
         self.args = args

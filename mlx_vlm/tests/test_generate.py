@@ -1922,7 +1922,6 @@ def test_generate_step_schedules_final_prefill_async():
 
 def test_generate_step_preserves_explicit_prompt_position_metadata():
     model = MagicMock()
-    model.language_model.supports_logits_to_keep = False
     model.language_model.return_value = MagicMock(
         logits=mx.zeros((1, 1, 4)),
         cross_attention_states=None,
@@ -2894,17 +2893,15 @@ class TestGemma4LogitsToKeep:
         return LanguageModel, lm
 
     def test_gemma4_slices_before_lm_head(self):
-        cls, lm = self._gemma4_lm(hidden=8)
+        _, lm = self._gemma4_lm(hidden=8)
         ids = mx.zeros((1, 6), dtype=mx.int32)
-        assert cls.supports_logits_to_keep is True
         assert lm(ids).logits.shape == (1, 6, 8)
         assert lm(ids, logits_to_keep=1).logits.shape == (1, 1, 8)
         assert lm(ids, logits_to_keep=3).logits.shape == (1, 3, 8)
 
     def test_gemma4_text_slices_before_lm_head(self):
-        cls, lm = self._gemma4_text_lm(hidden=8)
+        _, lm = self._gemma4_text_lm(hidden=8)
         ids = mx.zeros((1, 6), dtype=mx.int32)
-        assert cls.supports_logits_to_keep is True
         assert lm(ids).logits.shape == (1, 6, 8)
         assert lm(ids, logits_to_keep=1).logits.shape == (1, 1, 8)
 
@@ -3029,6 +3026,63 @@ class TestGemma4LogitsToKeep:
             assert model.language_model.call_args.kwargs["logits_to_keep"] == 1
 
 
+@pytest.mark.parametrize("prefill_step_size", [None, 2])
+def test_generate_step_passes_optional_logits_hint_to_gemma3(prefill_step_size):
+    from mlx_vlm.models.base import InputEmbeddingsFeatures
+    from mlx_vlm.models.gemma3.config import TextConfig
+    from mlx_vlm.models.gemma3.language import LanguageModel
+
+    lm = LanguageModel(
+        TextConfig(
+            model_type="gemma3",
+            hidden_size=16,
+            num_hidden_layers=2,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            vocab_size=32,
+            sliding_window_pattern=2,
+        )
+    )
+    ids = mx.array([[1, 2, 3, 4, 5]])
+    expected = mx.argmax(lm(ids).logits[:, -1], axis=-1)
+    mx.eval(expected)
+    model = SimpleNamespace(
+        language_model=lm,
+        get_input_embeddings=lambda inputs, *args, **kwargs: InputEmbeddingsFeatures(
+            lm.model.embed_tokens(inputs)
+        ),
+    )
+    calls = []
+    original_call = LanguageModel.__call__
+
+    def traced_call(language_model, inputs, *args, **kwargs):
+        calls.append(kwargs)
+        output = original_call(language_model, inputs, *args, **kwargs)
+        assert output.logits.shape[1] == inputs.shape[1]
+        return output
+
+    with patch.object(LanguageModel, "__call__", traced_call):
+        token, _ = next(
+            generate_module.generate_step(
+                input_ids=ids,
+                model=model,
+                pixel_values=None,
+                mask=None,
+                max_tokens=1,
+                prefill_step_size=prefill_step_size,
+            )
+        )
+
+    assert token == expected.item()
+    assert all(kwargs["logits_to_keep"] == 1 for kwargs in calls)
+    assert any("n_to_process" in kwargs for kwargs in calls) == (
+        prefill_step_size is not None
+    )
+
+
+@pytest.mark.parametrize("honors_hint", [False, True])
 @pytest.mark.parametrize(
     (
         "right_padding",
@@ -3053,16 +3107,13 @@ def test_prompt_processing_requests_only_required_trailing_logits(
     chunks,
     expected_input_width,
     expected_logits_to_keep,
+    honors_hint,
 ):
     import mlx.nn as nn
 
     calls = []
 
     class Model(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.language_model = SimpleNamespace(supports_logits_to_keep=True)
-
         def make_cache(self):
             return [KVCache()]
 
@@ -3073,7 +3124,12 @@ def test_prompt_processing_requests_only_required_trailing_logits(
             default_keep = (
                 1 if kwargs.get("n_to_process") is not None else input_ids.shape[1]
             )
-            length = min(kwargs.get("logits_to_keep", default_keep), input_ids.shape[1])
+            keep = (
+                kwargs.get("logits_to_keep", default_keep)
+                if honors_hint
+                else default_keep
+            )
+            length = min(keep, input_ids.shape[1])
             logits = (input_ids[..., None] == mx.arange(16)).astype(mx.float32)
             return SimpleNamespace(logits=logits[:, -length:])
 

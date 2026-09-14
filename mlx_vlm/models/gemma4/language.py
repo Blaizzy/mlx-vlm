@@ -680,7 +680,6 @@ class Gemma4TextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    supports_logits_to_keep = True
     requires_uniform_batch_acceptance = True
 
     def __init__(self, config: TextConfig):
