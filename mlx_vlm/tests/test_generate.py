@@ -210,49 +210,9 @@ class TestGenerationResult:
         assert result.generation_tps == 0.0
         assert result.peak_memory == 0.0
 
-    def test_with_values(self):
-        result = GenerationResult(
-            text="Hello world",
-            token=42,
-            logprobs=[0.1, 0.2, 0.3],
-            prompt_tokens=10,
-            generation_tokens=5,
-            total_tokens=15,
-            prompt_tps=100.0,
-            generation_tps=50.0,
-            peak_memory=2.5,
-        )
-        assert result.text == "Hello world"
-        assert result.token == 42
-        assert result.logprobs == [0.1, 0.2, 0.3]
-        assert result.prompt_tokens == 10
-        assert result.generation_tokens == 5
-        assert result.total_tokens == 15
-        assert result.prompt_tps == 100.0
-        assert result.generation_tps == 50.0
-        assert result.peak_memory == 2.5
-
 
 class TestBatchGenerationResult:
     """Tests for BatchGenerationResult dataclass."""
-
-    def test_creation(self):
-        result = BatchGenerationResult(
-            texts=["Hello", "World"],
-            tokens=[1, 2],
-            logprobs=[[0.1], [0.2]],
-            prompt_tokens=[10, 12],
-            generation_tokens=[5, 6],
-            total_tokens=[15, 18],
-            prompt_tps=[100.0, 110.0],
-            generation_tps=[50.0, 55.0],
-            peak_memory=3.0,
-            image_sizes=[(224, 224), (336, 336)],
-        )
-        assert result.texts == ["Hello", "World"]
-        assert result.tokens == [1, 2]
-        assert result.peak_memory == 3.0
-        assert result.image_sizes == [(224, 224), (336, 336)]
 
     def test_optional_image_sizes(self):
         result = BatchGenerationResult(
@@ -281,34 +241,9 @@ class TestBatchStats:
         assert stats.generation_time == 0
         assert stats.peak_memory == 0
 
-    def test_with_values(self):
-        stats = BatchStats(
-            prompt_tokens=100,
-            prompt_tps=500.0,
-            prompt_time=0.2,
-            generation_tokens=50,
-            generation_tps=250.0,
-            generation_time=0.2,
-            peak_memory=4.0,
-        )
-        assert stats.prompt_tokens == 100
-        assert stats.prompt_tps == 500.0
-        assert stats.generation_tokens == 50
-
 
 class TestBatchResponse:
     """Tests for BatchResponse dataclass."""
-
-    def test_creation(self):
-        stats = BatchStats(prompt_tokens=100)
-        response = BatchResponse(
-            texts=["Hello", "World"],
-            stats=stats,
-            image_sizes=[(224, 224), (336, 336)],
-        )
-        assert response.texts == ["Hello", "World"]
-        assert response.stats.prompt_tokens == 100
-        assert response.image_sizes == [(224, 224), (336, 336)]
 
     def test_optional_image_sizes(self):
         stats = BatchStats()
@@ -764,15 +699,6 @@ class TestBatchGenerator:
         async_eval_mock.assert_called_once_with([cache_state])
         eval_mock.assert_not_called()
         batch._store_apc_exact_checkpoints.assert_called_once_with()
-
-    def test_response_dataclass(self):
-        response = GenerationBatch.Response(
-            uid=0, token=42, token_logprob=-0.5, finish_reason="stop"
-        )
-
-        assert response.uid == 0
-        assert response.token == 42
-        assert response.finish_reason == "stop"
 
     def test_generation_batch_applies_per_sequence_logits_processors(self):
         class FixedLogitModel:
@@ -1390,9 +1316,22 @@ class TestBatchGenerate:
         mock_generate_batch.side_effect = [
             (
                 ["Response 1", "Response 3"],
-                BatchStats(prompt_tokens=20, generation_tokens=10),
+                BatchStats(
+                    prompt_tokens=20,
+                    prompt_time=0.1,
+                    generation_tokens=10,
+                    generation_time=0.2,
+                ),
             ),
-            (["Response 2"], BatchStats(prompt_tokens=10, generation_tokens=5)),
+            (
+                ["Response 2"],
+                BatchStats(
+                    prompt_tokens=10,
+                    prompt_time=0.15,
+                    generation_tokens=5,
+                    generation_time=0.3,
+                ),
+            ),
         ]
 
         prompts = ["Prompt 1", "Prompt 2", "Prompt 3"]
@@ -1410,6 +1349,13 @@ class TestBatchGenerate:
         assert mock_generate_batch.call_count == 2
         # All 3 responses should be present
         assert len(response.texts) == 3
+        # Check aggregation through batch_generate itself, across both groups.
+        assert response.stats.prompt_tokens == 30
+        assert response.stats.prompt_time == pytest.approx(0.25)
+        assert response.stats.generation_tokens == 15
+        assert response.stats.generation_time == pytest.approx(0.5)
+        assert response.stats.prompt_tps == pytest.approx(120.0)
+        assert response.stats.generation_tps == pytest.approx(30.0)
 
     @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
@@ -1602,57 +1548,6 @@ class TestBatchGenerate:
 
 
 # ============================================================================
-# Tests for stats aggregation
-# ============================================================================
-
-
-class TestBatchStatsAggregation:
-    """Tests for stats aggregation in batch generation."""
-
-    def test_stats_accumulation(self):
-        """Test that stats are properly accumulated across batches."""
-        total_stats = BatchStats()
-
-        # Simulate processing multiple batches
-        batch_stats = [
-            BatchStats(
-                prompt_tokens=100,
-                prompt_time=0.1,
-                generation_tokens=50,
-                generation_time=0.2,
-            ),
-            BatchStats(
-                prompt_tokens=150,
-                prompt_time=0.15,
-                generation_tokens=75,
-                generation_time=0.3,
-            ),
-        ]
-
-        for stats in batch_stats:
-            total_stats.prompt_tokens += stats.prompt_tokens
-            total_stats.prompt_time += stats.prompt_time
-            total_stats.generation_tokens += stats.generation_tokens
-            total_stats.generation_time += stats.generation_time
-
-        assert total_stats.prompt_tokens == 250
-        assert total_stats.prompt_time == pytest.approx(0.25)
-        assert total_stats.generation_tokens == 125
-        assert total_stats.generation_time == pytest.approx(0.5)
-
-        # Calculate TPS
-        if total_stats.prompt_time > 0:
-            total_stats.prompt_tps = total_stats.prompt_tokens / total_stats.prompt_time
-        if total_stats.generation_time > 0:
-            total_stats.generation_tps = (
-                total_stats.generation_tokens / total_stats.generation_time
-            )
-
-        assert total_stats.prompt_tps == pytest.approx(1000.0)
-        assert total_stats.generation_tps == pytest.approx(250.0)
-
-
-# ============================================================================
 # Edge Cases
 # ============================================================================
 
@@ -1690,14 +1585,6 @@ class TestEdgeCases:
         # First prompt should have 998 padding tokens
         assert padded[0, 0].item() == 0
         assert padded[0, -1].item() == 2
-
-    def test_batch_response_with_empty_texts(self):
-        """Test BatchResponse with empty texts."""
-        stats = BatchStats()
-        response = BatchResponse(texts=[], stats=stats)
-
-        assert response.texts == []
-        assert response.image_sizes is None
 
 
 # ============================================================================
@@ -2232,7 +2119,8 @@ def test_stream_generate_forwards_verbose_to_generate_step():
     assert captured["verbose"] is True
 
 
-def test_stream_generate_stores_checkpoint_only_before_decode():
+@pytest.mark.parametrize("reused_prefix", [0, 1, 2])
+def test_stream_generate_stores_checkpoint_only_before_decode(reused_prefix):
     class FakeStoppingCriteria:
         def __call__(self, token):
             return False
@@ -2252,13 +2140,17 @@ def test_stream_generate_stores_checkpoint_only_before_decode():
     coordinator = MagicMock()
     coordinator.enabled = True
     coordinator.is_checkpoint = True
-    coordinator.lookup.return_value = None
-    coordinator.checkpoint_len.return_value = 3
+    coordinator.lookup.return_value = (
+        {"prefix_len": reused_prefix, "warm_cache": []} if reused_prefix else None
+    )
+    coordinator.materialize_single.return_value = []
+    coordinator.checkpoint_lengths.return_value = [2, 3]
 
     def fake_generate_step(*args, **kwargs):
-        kwargs["prompt_cache_checkpoint"](
-            kwargs["prompt_cache_checkpoint_len"], kwargs["prompt_cache"]
-        )
+        coordinator.prepare_prefill.assert_called_once_with(4)
+        assert args[0].shape[1] == 4 - reused_prefix
+        for n in kwargs["prompt_cache_checkpoint_lengths"]:
+            kwargs["prompt_cache_checkpoint"](n, kwargs["prompt_cache"])
         yield 7, mx.zeros((4,))
 
     processor = SimpleNamespace(
@@ -2293,9 +2185,12 @@ def test_stream_generate_stores_checkpoint_only_before_decode():
             )
         )
 
-    coordinator.store_checkpoint.assert_called_once_with(
-        [1, 2, 3], prompt_cache, extra_hash=0
-    )
+    calls = coordinator.store_checkpoint.call_args_list
+    assert [call.args[0] for call in calls] == [
+        [1, 2, 3, 4][:n] for n in [2, 3] if n > reused_prefix
+    ]
+    assert all(call.args[1] == prompt_cache for call in calls)
+    assert all(call.kwargs == {"extra_hash": 0} for call in calls)
 
 
 def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
@@ -3135,65 +3030,85 @@ class TestGemma4LogitsToKeep:
 
 
 @pytest.mark.parametrize(
-    ("right_padding", "input_ids", "expected_logits_to_keep"),
+    (
+        "right_padding",
+        "input_ids",
+        "prefill_step_size",
+        "chunks",
+        "expected_input_width",
+        "expected_logits_to_keep",
+    ),
     [
-        (None, [[1, 2, 3, 4, 5]], 1),
-        ([0, 2], [[1, 2, 3, 4, 5], [6, 7, 8, 0, 0]], 3),
+        (None, [[1, 2, 3, 4, 5]], 2, None, 1, 1),
+        (None, [[1, 2, 3, 4, 5], [6, 7, 8]], 2, None, 1, 1),
+        ([0, 2], [[1, 2, 3, 4, 5], [6, 7, 8]], 2, None, 1, 1),
+        ([0, 2], [[1, 2, 3, 4, 5], [6, 7, 8]], None, 0, 5, 3),
+        ([0, 2], [[1, 2, 3, 4, 5], [6, 7, 8]], 2, 1, 3, 3),
     ],
 )
 def test_prompt_processing_requests_only_required_trailing_logits(
-    right_padding, input_ids, expected_logits_to_keep
+    right_padding,
+    input_ids,
+    prefill_step_size,
+    chunks,
+    expected_input_width,
+    expected_logits_to_keep,
 ):
+    import mlx.nn as nn
+
     calls = []
 
-    class Model:
-        language_model = SimpleNamespace(supports_logits_to_keep=True)
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = SimpleNamespace(supports_logits_to_keep=True)
 
-        def __call__(self, input_ids, **kwargs):
+        def make_cache(self):
+            return [KVCache()]
+
+        def __call__(self, input_ids, cache=None, **kwargs):
             calls.append((input_ids.shape[1], kwargs))
-            length = min(
-                kwargs.get("logits_to_keep", input_ids.shape[1]), input_ids.shape[1]
+            kv = mx.zeros((input_ids.shape[0], 1, input_ids.shape[1], 4))
+            cache[0].update_and_fetch(kv, kv)
+            default_keep = (
+                1 if kwargs.get("n_to_process") is not None else input_ids.shape[1]
             )
-            return SimpleNamespace(logits=mx.zeros((input_ids.shape[0], length, 4)))
+            length = min(kwargs.get("logits_to_keep", default_keep), input_ids.shape[1])
+            logits = (input_ids[..., None] == mx.arange(16)).astype(mx.float32)
+            return SimpleNamespace(logits=logits[:, -length:])
 
-    batch = object.__new__(PromptProcessingBatch)
-    batch.model = Model()
-    batch._prompt_kwargs = {}
-    batch._prompt_length_aware_keys = []
-    batch._processed_prompt_columns = 0
-    batch.draft_model = None
-    batch.draft_kind = None
-    batch._right_pad_per_row = right_padding
-    batch.prefill_step_size = 2
-    batch._input_ids = mx.array(input_ids, dtype=mx.int32)
-    batch._inputs_embeds = mx.zeros((*batch._input_ids.shape, 4))
-    batch.prompt_cache = []
-    batch.logits_processors = []
-    batch._token_context = []
-    batch.uids = list(range(batch._input_ids.shape[0]))
-    batch.max_tokens = [1] * len(batch.uids)
-    batch.greedy_sampling = True
-    batch.thinking_budget_criteria = []
-    batch._apc_manager = None
-    batch._apc_meta = []
-    batch._apc_harvest_enabled = False
-    batch._next_apc_checkpoint_column = lambda: None
-    batch._store_apc_exact_checkpoints = lambda: None
+    batch_size = len(input_ids)
+    batch = PromptProcessingBatch(
+        model=Model(),
+        uids=list(range(batch_size)),
+        input_ids=input_ids,
+        max_tokens=[1] * batch_size,
+        inputs_embeds=mx.zeros((batch_size, max(map(len, input_ids)), 4)),
+        prompt_kwargs={},
+        prefill_step_size=prefill_step_size,
+        right_pad_per_row=right_padding,
+        greedy_sampling=True,
+    )
 
-    while batch.needs_processing():
-        assert batch.prompt_step() > 0
+    if chunks is None:
+        while batch.needs_processing():
+            assert batch.prompt_step() > 0
+    else:
+        for _ in range(chunks):
+            assert batch.prompt_step() > 0
 
-    assert batch._input_ids.shape[1] == expected_logits_to_keep
+    assert batch._input_ids.shape[1] == expected_input_width
 
-    batch.generate(
+    gen_batch = batch.generate(
         sampler=lambda logits: mx.argmax(logits, axis=-1),
-        stop_criteria=[MagicMock()] * len(batch.uids),
+        stop_criteria=[lambda _: False] * batch_size,
         compute_logprobs=False,
     )
 
     final_input_width, final_kwargs = calls[-1]
-    assert final_input_width == expected_logits_to_keep
+    assert final_input_width == expected_input_width
     assert final_kwargs["logits_to_keep"] == expected_logits_to_keep
+    assert gen_batch._next_tokens.tolist() == [row[-1] for row in input_ids]
 
 
 def test_batch_apc_extra_hash_uses_precomputed_image_hash():

@@ -57,6 +57,7 @@ MODEL_CONFIG = {
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "glm5_next": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "dots_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
@@ -294,6 +295,7 @@ class MessageFormatter:
             "qwen2_vl",
             "qwen2_5_vl",
             "qwen3_vl",
+            "mage_vl",
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
@@ -305,6 +307,7 @@ class MessageFormatter:
             "minicpmv4_6",
             "minimax_m3_vl",
             "llava_onevision",
+            "glm5_next",
         ] and kwargs.get("video"):
             return self._format_video_message(
                 prompt,
@@ -550,6 +553,8 @@ class MessageFormatter:
             MessageBuilder.video_message(v, max_pixels, f)
             for v, f in zip(videos, fps_list)
         ]
+        if role == "user" and not skip_image_token:
+            content = [MessageBuilder.image_message()] * num_images + content
         if role == "user" and not skip_audio_token and num_audios > 0:
             content.extend([MessageBuilder.audio_message()] * num_audios)
         content.append(MessageBuilder.text_message(prompt))

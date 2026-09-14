@@ -80,10 +80,45 @@ class AudioConfig(BaseModelConfig):
 
 
 @dataclass
+class MiniCPMTTSConfig(BaseModelConfig):
+    model_type: str = "minicpmtts"
+    llm_dim: int = 4096
+    llm_hidden_size: Optional[int] = None
+    llm_intermediate_size: int = 768
+    projector_type: str = "mlp"
+    hidden_size: int = 768
+    intermediate_size: int = 3072
+    num_attention_heads: int = 12
+    num_hidden_layers: int = 20
+    num_key_value_heads: int = 12
+    max_position_embeddings: int = 4096
+    num_audio_tokens: int = 6562
+    num_text_tokens: int = 152064
+    num_vq: int = 1
+    audio_bos_token_id: int = 151687
+    text_eos_token_id: int = 151692
+    condition_type: str = "hidden_text_merge"
+    backbone_model: str = "llama"
+    backbone_vocab_size: int = 32000
+    normalize_projected_hidden: bool = False
+    top_p: float = 0.85
+    top_k: int = 25
+    repetition_penalty: float = 1.05
+    temperature: float = 0.8
+    rms_norm_eps: float = 1e-6
+    rope_theta: float = 10000.0
+
+    def __post_init__(self):
+        if self.llm_hidden_size is None:
+            self.llm_hidden_size = self.llm_dim
+
+
+@dataclass
 class ModelConfig(BaseModelConfig):
     text_config: TextConfig
     vision_config: VisionConfig
     audio_config: Optional[AudioConfig] = None
+    tts_config: Optional[MiniCPMTTSConfig] = None
     model_type: str = "minicpmo"
     query_num: int = 64
     image_size: int = 448
@@ -145,6 +180,13 @@ class ModelConfig(BaseModelConfig):
             AudioConfig.from_dict(audio_params) if len(audio_params) > 0 else None
         )
 
+        tts_params = dict(params.pop("tts_config", {}))
+        if source_params is not None:
+            source_params["tts_config"] = dict(tts_params)
+        tts_config = (
+            MiniCPMTTSConfig.from_dict(tts_params) if len(tts_params) > 0 else None
+        )
+
         slice_params = params.pop("slice_config", None)
         slice_config = (
             SliceConfig.from_dict(slice_params)
@@ -156,6 +198,7 @@ class ModelConfig(BaseModelConfig):
             text_config=text_config,
             vision_config=vision_config,
             audio_config=audio_config,
+            tts_config=tts_config,
             slice_config=slice_config,
             **{
                 k: v

@@ -615,6 +615,36 @@ def _iter_stt_items(result):
 
 
 def _stt_item_to_dict(item) -> Dict[str, Any]:
+    data = _stt_item_base_dict(item)
+    # NeMo-alignment STT models (Parakeet, Canary) report timing as ``sentences``
+    # rather than ``segments``; map it across so it survives the ``segments``-keyed
+    # reassembly in ``_transcription_result_from_chunks``.
+    if isinstance(data, dict) and not data.get("segments") and data.get("sentences"):
+        data["segments"] = _sentences_to_segments(data["sentences"])
+    return data
+
+
+def _sentences_to_segments(sentences: Any) -> List[Dict[str, Any]]:
+    segments: List[Dict[str, Any]] = []
+    for index, sentence in enumerate(sentences):
+        if not isinstance(sentence, dict):
+            continue
+        start, end = sentence.get("start"), sentence.get("end")
+        if start is None or end is None:
+            continue
+        text = sentence.get("text")
+        segments.append(
+            {
+                "id": index,
+                "start": start,
+                "end": end,
+                "text": text.strip() if isinstance(text, str) else text,
+            }
+        )
+    return segments
+
+
+def _stt_item_base_dict(item) -> Dict[str, Any]:
     if isinstance(item, bytes):
         return {"text": item.decode("utf-8", errors="replace")}
     if isinstance(item, str):

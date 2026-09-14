@@ -26,6 +26,10 @@ class APCCoordinator:
         self.model = model
         self.plan: PrefixCachePlan = build_prefix_cache_plan(model)
 
+    def prepare_prefill(self, token_count: int) -> None:
+        if self.enabled:
+            self.manager.prepare_prefill(token_count)
+
     @property
     def enabled(self) -> bool:
         return self.manager is not None and self.plan.restorable
@@ -94,6 +98,38 @@ class APCCoordinator:
             max_prefix_tokens=len(token_ids) - 1,
         )
 
+    def checkpoint_lengths(
+        self, token_ids: Sequence[int], media_token_ids: set[int]
+    ) -> List[int]:
+        """Bounded intermediate states plus the final conversation checkpoint.
+
+        Stateful caches cannot roll back the final snapshot to a divergence.
+        Capture earlier states while prefilling, aligned across requests. Limit
+        captures to the resident entry budget (two for a disk-only manager),
+        rather than copying an ever-growing cache at every prefill chunk.
+        """
+        final = self.checkpoint_len(token_ids, media_token_ids)
+        if final <= 0:
+            return []
+        interval = self.manager.checkpoint_interval_tokens
+        budget = self.manager._exact_cache_max or (2 if self.manager.disk else 1)
+        if interval <= 0 or budget <= 1:
+            return [final]
+        from .apc import adjust_prefix_to_text_suffix_boundary
+
+        block_size = self.manager.block_size
+        interval = ((interval + block_size - 1) // block_size) * block_size
+        last = ((final - 1) // interval) * interval
+        first = max(interval, last - (budget - 2) * interval)
+        lengths = {final}
+        for boundary in range(first, last + 1, interval):
+            boundary = adjust_prefix_to_text_suffix_boundary(
+                token_ids, boundary, media_token_ids, max_prefix_tokens=final
+            )
+            if self.manager.exact_cache_min_tokens <= boundary < final:
+                lengths.add(boundary)
+        return sorted(lengths)
+
     def merge_rows(
         self,
         picks: Sequence[Optional[dict]],
@@ -151,9 +187,22 @@ class APCCoordinator:
     ) -> bool:
         if not self.enabled or not self.is_checkpoint:
             return False
-        from .apc import snapshot_prompt_cache_row
+        from .apc import (
+            _cache_nbytes,
+            _prompt_cache_is_batch_shaped,
+            snapshot_prompt_cache_row,
+        )
 
-        snapshot = snapshot_prompt_cache_row(prompt_cache, batch_idx or 0)
+        # Batch extraction can itself allocate a full row before store_exact_cache
+        # decides whether it can afford another retained snapshot.
+        if _prompt_cache_is_batch_shaped(prompt_cache):
+            if self.manager.disk is not None:
+                self.manager.disk.flush()
+            if not self.manager._make_room(_cache_nbytes(prompt_cache)):
+                with self.manager.lock:
+                    self.manager.stats.memory_skips += 1
+                return False
+        snapshot = snapshot_prompt_cache_row(prompt_cache, batch_idx or 0, clone=False)
         if snapshot is None:
             return False
         return self.manager.store_exact_cache(

@@ -17,6 +17,7 @@ from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.utils import (
     DEFAULT_VIDEO_SAMPLING,
     StoppingCriteria,
+    VideoMetadata,
     VideoSampling,
     _drop_modules_without_weights,
     _load_safetensors,
@@ -1244,7 +1245,7 @@ def test_load_model_matches_deepseek_v4_quantization_aliases():
     assert head_spec == {}
 
 
-def test_load_model_uses_qwen_fine_grained_fp8_quantization_config():
+def test_load_model_transforms_fine_grained_fp8_by_format():
     class FakeConfig:
         @classmethod
         def from_dict(cls, config):
@@ -1262,7 +1263,7 @@ def test_load_model_uses_qwen_fine_grained_fp8_quantization_config():
 
     fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeQwenModel)
     source_config = {
-        "model_type": "qwen3_5",
+        "model_type": "future_compatible_model",
         "quantization_config": {
             "quant_method": "fp8",
             "fmt": "e4m3",
@@ -1279,22 +1280,26 @@ def test_load_model_uses_qwen_fine_grained_fp8_quantization_config():
         patch(
             "mlx_vlm.utils._load_safetensors",
             return_value={
-                "proj.weight": mx.zeros((128, 32), dtype=mx.uint32),
-                "proj.scales": mx.zeros((128, 4), dtype=mx.uint8),
+                "proj.weight": mx.zeros((128, 128), dtype=mx.uint8),
+                "proj.weight_scale_inv": mx.ones((1, 1), dtype=mx.bfloat16),
             },
         ),
         patch(
             "mlx_vlm.utils.get_model_and_args",
-            return_value=(fake_model_class, "qwen3_5"),
+            return_value=(fake_model_class, "future_compatible_model"),
         ),
         patch("mlx_vlm.utils.nn.quantize") as quantize,
     ):
-        load_model(Path("/tmp/model"), lazy=True)
+        model = load_model(Path("/tmp/model"), lazy=True)
 
     quantize.assert_called_once()
     assert quantize.call_args.kwargs["group_size"] == 32
     assert quantize.call_args.kwargs["bits"] == 8
     assert quantize.call_args.kwargs["mode"] == "mxfp8"
+    loaded = dict(model.loaded_weights)
+    assert loaded["proj.weight"].dtype == mx.uint32
+    assert loaded["proj.scales"].dtype == mx.uint8
+    assert "proj.weight_scale_inv" not in loaded
 
 
 def test_load_model_quantizes_projector_with_scales_when_skip_vision():
@@ -1759,3 +1764,48 @@ class TestResolveVideoSampling:
         }
         resolve_video_sampling(SimpleNamespace(), kwargs)
         assert kwargs == {"temperature": 0.7}
+
+
+class TestVideoMetadataForwarding:
+    def test_metadata_is_only_forwarded_to_declaring_processors(self):
+        class Processor:
+            tokenizer = SimpleNamespace(pad_token="<pad>")
+
+            def __call__(self, text, images=None, videos=None, fps=None, **kwargs):
+                self.kwargs = kwargs
+                self.fps = fps
+                return {"input_ids": np.array([[1]]), "attention_mask": np.array([[1]])}
+
+        processor = Processor()
+        metadata = VideoMetadata(total_num_frames=30, fps=30, frames_indices=[0, 29])
+        video = np.zeros((2, 3, 32, 32), dtype=np.uint8)
+        with patch("mlx_vlm.utils.load_video", return_value=(video, metadata)):
+            prepare_inputs(processor, videos=["clip.mp4"], prompts="Describe this.")
+        assert "video_metadata" not in processor.kwargs
+        assert processor.fps == [metadata.sampled_fps]
+
+    def test_each_clip_keeps_its_metadata(self):
+        class Processor:
+            tokenizer = SimpleNamespace(pad_token="<pad>")
+
+            def __call__(
+                self, text, images=None, videos=None, video_metadata=None, **kwargs
+            ):
+                self.metadata = video_metadata
+                return {"input_ids": np.array([[1]]), "attention_mask": np.array([[1]])}
+
+        processor = Processor()
+        metadata = [
+            VideoMetadata(total_num_frames=60, fps=30, frames_indices=[0, 59]),
+            VideoMetadata(total_num_frames=240, fps=24, frames_indices=[10, 120, 239]),
+        ]
+        videos = [
+            np.zeros((len(m.frames_indices), 3, 32, 32), dtype=np.uint8)
+            for m in metadata
+        ]
+        with patch("mlx_vlm.utils.load_video", side_effect=list(zip(videos, metadata))):
+            prepare_inputs(
+                processor, videos=["first.mp4", "second.mp4"], prompts="Compare."
+            )
+        assert processor.metadata == metadata
+        assert processor.metadata[1].timestamps[-1] == 239 / 24

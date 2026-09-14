@@ -21,6 +21,21 @@ def get_server_max_tokens():
     return int(os.environ.get("MLX_VLM_MAX_TOKENS", DEFAULT_MAX_TOKENS))
 
 
+_TOOL_PARSER_DESC = (
+    "Force a specific tool-call parser by name, bypassing chat-template inference."
+)
+
+
+def _check_tool_parser(cls, value: Optional[str]) -> Optional[str]:
+    """Reject an unknown ``tool_parser`` override, naming the known parsers."""
+    from ..tools import SPECS
+
+    if value is not None and value not in {spec.name for spec in SPECS}:
+        known = ", ".join(sorted(spec.name for spec in SPECS))
+        raise ValueError(f"unknown tool_parser {value!r}; known parsers: {known}")
+    return value
+
+
 class FlexibleBaseModel(BaseModel):
     """Base model that ignores/accepts any unknown OpenAI SDK fields."""
 
@@ -394,6 +409,8 @@ class OpenAIRequest(FlexibleBaseModel):
         None, description="Responses API tool definitions."
     )
     tool_choice: Optional[Any] = Field(None, description="Tool choice policy.")
+    tool_parser: Optional[str] = Field(None, description=_TOOL_PARSER_DESC)
+    _validate_tool_parser = field_validator("tool_parser")(_check_tool_parser)
     store: Optional[bool] = Field(
         True, description="Whether to store this response for later retrieval."
     )
@@ -850,6 +867,8 @@ class ChatRequest(GenerationRequest):
             "Controls tool use: none, auto, required, or a specific function."
         ),
     )
+    tool_parser: Optional[str] = Field(None, description=_TOOL_PARSER_DESC)
+    _validate_tool_parser = field_validator("tool_parser")(_check_tool_parser)
 
 
 class TopLogprob(BaseModel):
@@ -928,6 +947,8 @@ class AnthropicRequest(FlexibleBaseModel):
     stop_sequences: Optional[List[str]] = None
     tools: Optional[List[Any]] = None
     tool_choice: Optional[Any] = None
+    tool_parser: Optional[str] = Field(None, description=_TOOL_PARSER_DESC)
+    _validate_tool_parser = field_validator("tool_parser")(_check_tool_parser)
     metadata: Optional[Any] = None
     thinking: Optional[Any] = None
     output_config: Optional[Any] = None

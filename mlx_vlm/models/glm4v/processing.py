@@ -4,6 +4,14 @@ import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.processing_utils import ProcessorMixin
 
+_BOX_TOKENS = ("<|begin_of_box|>", "<|end_of_box|>")
+
+
+def _strip_box_markers(text: str) -> str:
+    for token in _BOX_TOKENS:
+        text = text.replace(token, "")
+    return text
+
 
 class Glm46VProcessor(ProcessorMixin):
     """
@@ -34,6 +42,7 @@ class Glm46VProcessor(ProcessorMixin):
         self.video_token = "<|video|>"
 
         if tokenizer is not None:
+            tokenizer.add_special_tokens({"additional_special_tokens": _BOX_TOKENS})
             self.image_token = getattr(tokenizer, "image_token", "<|image|>")
             self.video_token = getattr(tokenizer, "video_token", "<|video|>")
 
@@ -50,6 +59,9 @@ class Glm46VProcessor(ProcessorMixin):
             self.video_token_id = None
 
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
+
+    def clean_output(self, text: str) -> str:
+        return _strip_box_markers(text)
 
     def __call__(
         self,

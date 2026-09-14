@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 
+from mlx_vlm.fp8 import transform_fp8_weights
 from mlx_vlm.models.qwen3_5_moe.qwen3_5_moe import Model
 from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.qwen3_5_mtp import Qwen3_5MTPDraftModel
@@ -77,12 +78,23 @@ def test_apodex_fp8_mtp_expert_sidecars_are_converted_and_stacked():
                 (1, 1), dtype=mx.bfloat16
             )
 
+    weights, quantization = transform_fp8_weights(
+        weights,
+        {
+            "quantization_config": {
+                "quant_method": "fp8",
+                "fmt": "e4m3",
+                "weight_block_size": [128, 128],
+            }
+        },
+    )
     out = Qwen3_5MTPDraftModel.sanitize(None, weights)
 
     prefix = "layers.0.mlp.switch_mlp"
     for projection in ("up_proj", "down_proj", "gate_proj"):
         assert out[f"{prefix}.{projection}.weight"].shape == (2, 128, 32)
         assert out[f"{prefix}.{projection}.scales"].shape == (2, 128, 4)
+    assert quantization == {"group_size": 32, "bits": 8, "mode": "mxfp8"}
     assert not any("scale_inv" in key or ".experts." in key for key in out)
 
 

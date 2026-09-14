@@ -6,6 +6,7 @@ import mlx.nn as nn
 import numpy as np
 
 from .activations import swiglu
+from .linear import DECODE_BLOCK_SIZE
 
 
 def _gather_sort(x, indices):
@@ -171,7 +172,53 @@ class SwitchGLU(nn.Module):
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
 
-    def __call__(self, x, indices) -> mx.array:
+    def __call__(
+        self, x, indices, weights=None, shared=None, residual=None
+    ) -> mx.array:
+        if not self.training and x.ndim == 3 and 1 < x.shape[1] <= DECODE_BLOCK_SIZE:
+            from .fast_ops import exact_affine_moe_down, exact_affine_switch_gate_up
+            from .linear import tokenwise
+            from .quantized_verifier import (
+                exact_quantized_moe_hc_expand,
+                exact_quantized_selected_linear,
+                exact_quantized_switch_linear,
+            )
+
+            routed = None
+            # The route count per position determines decode's sorting policy.
+            if x.shape[0] * indices.shape[-1] < 64:
+                gate_up = exact_affine_switch_gate_up(self, x, indices)
+                if gate_up is None:
+                    up = exact_quantized_switch_linear(self.up_proj, x, indices)
+                    gate = exact_quantized_switch_linear(self.gate_proj, x, indices)
+                else:
+                    up, gate = gate_up
+                if up is not None and gate is not None:
+                    activated = self.activation(up, gate)
+                    if residual is not None:
+                        output = exact_quantized_moe_hc_expand(
+                            self.down_proj,
+                            activated,
+                            indices,
+                            weights,
+                            shared,
+                            *residual,
+                        )
+                        if output is not None:
+                            return output
+                    if weights is not None and shared is not None:
+                        output = exact_affine_moe_down(
+                            self.down_proj, activated, indices, weights, shared
+                        )
+                        if output is not None:
+                            return self._combine(output, None, None, residual)
+                    routed = exact_quantized_selected_linear(
+                        self.down_proj, activated, indices
+                    )
+            if routed is None:
+                routed = tokenwise(self, x, indices)
+            return self._combine(routed, weights, shared, residual)
+
         x = mx.expand_dims(x, (-2, -3))
 
         do_sort = indices.size >= 64
@@ -192,7 +239,44 @@ class SwitchGLU(nn.Module):
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)
 
-        return x.squeeze(-2)
+        return self._combine(x.squeeze(-2), weights, shared, residual)
+
+    @staticmethod
+    def _combine(routed, weights, shared, residual=None):
+        if weights is not None:
+            routed = (routed * weights[..., None].astype(routed.dtype)).sum(axis=-2)
+        output = routed if shared is None else routed + shared
+        if residual is not None:
+            from .deepseek_v4.hyper_connection import hc_expand
+
+            output = hc_expand(output, *residual)
+        return output
+
+
+class MoE(nn.Module):
+    """Weighted routed experts plus shared experts, with optional residual fusion."""
+
+    def __call__(self, x, *args, residual=None, **kwargs):
+        group = getattr(self, "sharding_group", None)
+        if group is not None:
+            from mlx.nn.layers.distributed import sum_gradients
+
+            x = sum_gradients(group)(x)
+        indices, weights = self.gate(x, *args, **kwargs)
+        shared = self.shared_experts(x)
+        fused_residual = residual if group is None else None
+        if isinstance(self.switch_mlp, SwitchGLU):
+            output = self.switch_mlp(
+                x, indices, weights, shared, residual=fused_residual
+            )
+        else:
+            output = SwitchGLU._combine(
+                self.switch_mlp(x, indices), weights, shared, fused_residual
+            )
+        if group is not None:
+            output = mx.distributed.all_sum(output, group=group)
+            output = SwitchGLU._combine(output, None, None, residual)
+        return output
 
 
 class OffloadedSwitchGLU(nn.Module):

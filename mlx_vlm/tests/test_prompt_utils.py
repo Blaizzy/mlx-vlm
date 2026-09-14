@@ -1,5 +1,7 @@
 """Tests for prompt_utils module, specifically multimodal content handling."""
 
+import pytest
+
 from mlx_vlm.prompt_utils import apply_chat_template, extract_text_from_content
 
 
@@ -230,6 +232,70 @@ class TestApplyChatTemplateIntegration:
                 ],
             }
         ]
+
+    @pytest.mark.parametrize(
+        "model_type",
+        [
+            "qwen2_vl",
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "mage_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+            "qwen4_exp",
+            "qwen3_omni_moe",
+            "gemma4",
+            "gemma4_unified",
+            "diffusion_gemma",
+            "minicpmv4_6",
+            "minimax_m3_vl",
+            "llava_onevision",
+        ],
+    )
+    def test_video_models_keep_still_images_in_mixed_prompts(self, model_type):
+        result = apply_chat_template(
+            None,
+            {"model_type": model_type},
+            "Compare the images and videos.",
+            return_messages=True,
+            num_images=2,
+            video=["first.mp4", "second.mp4"],
+            fps=[1, 2],
+        )
+
+        content = result[0]["content"]
+        assert [part["type"] for part in content] == [
+            "image",
+            "image",
+            "video",
+            "video",
+            "text",
+        ]
+        assert [part["video"] for part in content[2:4]] == ["first.mp4", "second.mp4"]
+        assert [part["fps"] for part in content[2:4]] == [1, 2]
+        assert content[-1]["text"] == "Compare the images and videos."
+
+    @pytest.mark.parametrize(
+        "role,skip_image_token",
+        [("user", True), ("assistant", False), ("system", False)],
+    )
+    def test_video_formatter_does_not_insert_unrequested_image_tokens(
+        self, role, skip_image_token
+    ):
+        from mlx_vlm.prompt_utils import get_message_json
+
+        result = get_message_json(
+            "qwen3_vl",
+            "Describe the video.",
+            role=role,
+            skip_image_token=skip_image_token,
+            num_images=2,
+            video=["clip.mp4"],
+        )
+
+        assert result["role"] == role
+        assert [part["type"] for part in result["content"]] == ["video", "text"]
 
     def test_gemma4_unified_formats_video_messages(self):
         """Gemma 4 Unified should use typed video content for HF templates."""

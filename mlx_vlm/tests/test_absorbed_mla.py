@@ -123,7 +123,6 @@ class TestGatePairing(unittest.TestCase):
         "longcat_flash_sparse",
         "glm4_moe_lite",
         "glm_moe_dsa",
-        "glm5_next",
         "youtu_vl",
     ]
 
@@ -154,7 +153,6 @@ class TestIndexerGateUnchanged(unittest.TestCase):
     SPARSE = [
         "deepseek_v32",
         "longcat_flash_sparse",
-        "glm5_next",
         "glm_moe_dsa",
     ]
 

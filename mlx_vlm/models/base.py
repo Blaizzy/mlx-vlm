@@ -2,7 +2,7 @@ import inspect
 import math
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -57,7 +57,7 @@ class LanguageModelOutput:
     hidden_states: Optional[List[mx.array]] = None
     cross_attention_states: Optional[List[mx.array]] = None
     encoder_outputs: Optional[List[mx.array]] = None
-    gdn_states: Optional[List] = None
+    gdn_states: Optional[Any] = None
     shared_kv_states: Optional[Dict[str, tuple]] = None
 
 

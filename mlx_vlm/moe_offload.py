@@ -32,10 +32,11 @@ PEREXPERT_RE = re.compile(
     r"^.*\.layers\.(?P<layer>\d+)\..*?experts\.(?P<j>\d+)\." + _PROJ
 )
 STACKED_RE = re.compile(
-    r"^.*\.layers\.(?P<layer>\d+)\..*?(?:experts|switch_mlp)\." + _PROJ
+    r"^.*\.layers\.(?P<layer>\d+)\..*?(?:experts|switch_mlp)(?:\.switch_glu)?\." + _PROJ
 )
 STACKED_FUSED_RE = re.compile(
-    r"^.*\.layers\.(?P<layer>\d+)\..*?(?:experts|switch_mlp)\." + _FUSED_PROJ
+    r"^.*\.layers\.(?P<layer>\d+)\..*?(?:experts|switch_mlp)(?:\.switch_glu)?\."
+    + _FUSED_PROJ
 )
 
 
@@ -393,6 +394,13 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
         )
 
     import shutil
+
+    if not written_layers:
+        raise ValueError(
+            f"moe_offload.repack: {build!r} produced no MoE expert tensors "
+            "(written_layers is empty). Check STACKED_RE/STACKED_FUSED_RE "
+            "against this model's actual expert tensor naming."
+        )
 
     for fn in os.listdir(build):  # passthrough config/tokenizer/processor/code
         src = os.path.join(build, fn)
