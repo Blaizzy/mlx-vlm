@@ -21389,3 +21389,89 @@ class TestDeepseekV41FakeQuant(unittest.TestCase):
         mx.eval(out)
         self.assertEqual(out.shape, x.shape)
         self.assertTrue(bool(mx.all(mx.abs(out) <= 6.0 + 1e-3)))
+
+
+class TestDeepseekV41Vision(unittest.TestCase):
+    @staticmethod
+    def _config(**over):
+        from mlx_vlm.models.deepseek_v41.config import ModelConfig
+
+        base = dict(
+            hidden_size=16,
+            vision_hidden_size=8,
+            vision_num_layers=1,
+            vision_num_heads=2,
+            vision_intermediate_size=16,
+            vision_patch_size=14,
+            vision_downsample_ratio=3,
+            vision_min_pixels=1,
+            vision_max_image_tokens=1024,
+        )
+        base.update(over)
+        return ModelConfig(**base)
+
+    def test_deepseek_v41_aligner_reorders_channel_major_and_pads(self):
+        """The reference groups each channel's r*r neighbours together.
+
+        Its kernel reads `channel = d / 9`, `within = d % 9`, and contributes
+        zero where a neighbour falls outside the grid. Laying the vector out
+        position-major instead is a permutation of the same values, so nothing
+        fails and the features stay plausible while the model cannot read them.
+        """
+        from mlx_vlm.models.deepseek_v41.vision import Aligner
+
+        config = self._config()
+        aligner = Aligner(config)
+        mx.eval(aligner.parameters())
+
+        r = config.vision_downsample_ratio
+        d = config.vision_hidden_size
+        for n_h, n_w in ((3, 3), (4, 5), (7, 2)):
+            x = mx.random.normal((n_h * n_w, d))
+            source = x.reshape(n_h, n_w, d)
+            h_out, w_out = -(-n_h // r), -(-n_w // r)
+            want = mx.zeros((h_out * w_out, d * r * r)).tolist()
+            for row in range(h_out * w_out):
+                by, bx = divmod(row, w_out)
+                for col in range(d * r * r):
+                    channel, within = divmod(col, r * r)
+                    sy, sx = by * r + within // r, bx * r + within % r
+                    want[row][col] = (
+                        float(source[sy, sx, channel].item())
+                        if sy < n_h and sx < n_w
+                        else 0.0
+                    )
+            expected = aligner.w2(aligner.act(aligner.w1(mx.array(want))))
+            got = aligner(x, n_h, n_w)
+            mx.eval(expected, got)
+            self.assertEqual(got.shape, (h_out * w_out, config.hidden_size))
+            diff = mx.abs(got.astype(mx.float32) - expected.astype(mx.float32))
+            mx.eval(diff)
+            self.assertLess(float(mx.max(diff).item()), 1e-4, f"{n_h}x{n_w}")
+
+    def test_deepseek_v41_image_span_matches_the_aligner_row_count(self):
+        """Every reserved IMAGE slot must have an aligner row behind it.
+
+        The gather clamps out-of-range indices, so a span wider than the
+        feature grid silently repeats the last feature instead of failing.
+        """
+        from PIL import Image
+
+        from mlx_vlm.models.deepseek_v41.processing_deepseek_v41 import (
+            IMAGE,
+            load_image,
+            prepare_vl_inputs,
+        )
+
+        config = self._config()
+        r = config.vision_downsample_ratio
+        for size in ((896, 896), (640, 480), (128, 900), (42, 42)):
+            image = Image.new("RGB", size, (10, 120, 200))
+            _, n_vit_h, n_vit_w, _, _ = load_image(image, config)
+            _, types, spans = prepare_vl_inputs(
+                [1, config.image_token_id, 2], [image], config
+            )
+            rows = (-(-n_vit_h // r)) * (-(-n_vit_w // r))
+            self.assertEqual(types.count(IMAGE), rows, f"{size}")
+            self.assertEqual(len(spans), 1)
+            self.assertEqual(spans[0].patches.shape[0], n_vit_h * n_vit_w)

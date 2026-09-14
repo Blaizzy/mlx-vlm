@@ -5905,3 +5905,25 @@ def test_dflash_rounds_batch_tolerates_ragged_draft_widths():
     assert emitted
     for tokens, _ in emitted:
         assert len(tokens) == 2
+
+
+def test_speculative_walk_only_ever_emits_target_tokens():
+    """Speculation may not emit a token the target did not itself produce.
+
+    This is what makes a drafter unable to change the output: acceptance stops
+    at the first disagreement, and the tokens handed back are the verifier's,
+    never the draft's. A walk that returned draft tokens past a mismatch would
+    let the drafter speak for the target.
+    """
+    from mlx_vlm.speculative.common import _speculative_walk_batch
+
+    draft = mx.array([[5, 6, 7], [1, 2, 3], [8, 9, 10]])
+    target = mx.array([[5, 9, 7, 8], [4, 2, 3, 0], [8, 9, 10, 11]])
+    budgets = [4, 4, 4]
+
+    accepted, emitted = _speculative_walk_batch(draft, target, budgets)
+
+    assert accepted == [1, 0, 3]
+    for row, tokens in enumerate(emitted):
+        assert tokens == target[row, : len(tokens)].tolist()
+        assert len(tokens) == min(accepted[row] + 1, budgets[row])
