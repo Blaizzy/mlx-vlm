@@ -4442,6 +4442,11 @@ class TestModels(unittest.TestCase):
         for layer in model.layers:
             self.assertEqual(layer.self_attn.rope.scale, 1.0)
 
+        inputs = mx.array([[1, 2, 3]])
+        full = model(inputs).logits
+        hinted = model(inputs, logits_to_keep=1).logits
+        self.assertTrue(mx.array_equal(hinted, full).item())
+
     def test_gemma3n_rope_scaling_applies_only_to_global_attention(self):
         from mlx_vlm.models import gemma3n
         from mlx_vlm.models.gemma3n.language import Gemma3nAttention

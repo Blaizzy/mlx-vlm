@@ -1922,7 +1922,6 @@ def test_generate_step_schedules_final_prefill_async():
 
 def test_generate_step_preserves_explicit_prompt_position_metadata():
     model = MagicMock()
-    model.language_model.supports_logits_to_keep = False
     model.language_model.return_value = MagicMock(
         logits=mx.zeros((1, 1, 4)),
         cross_attention_states=None,
@@ -1960,6 +1959,7 @@ def test_generate_step_preserves_explicit_prompt_position_metadata():
     # The generator prepares the following decode step before yielding the
     # current token, so inspect the first (prompt/suffix) forward call.
     call_kwargs = model.language_model.call_args_list[0].kwargs
+    assert call_kwargs["logits_to_keep"] == 1
     assert bool(mx.array_equal(call_kwargs["position_ids"], full_position_ids))
     assert bool(mx.array_equal(call_kwargs["rope_deltas"], full_rope_deltas))
 
@@ -2006,6 +2006,10 @@ def test_generate_step_prefill_tqdm_respects_verbose(verbose, disabled):
     mock_tqdm.assert_called_once()
     assert mock_tqdm.call_args.kwargs["disable"] is disabled
     assert pbar.update.call_count > 0
+    assert all(
+        call.kwargs["logits_to_keep"] == 1
+        for call in model.language_model.call_args_list
+    )
 
 
 def test_generate_step_chunks_prefill_when_model_policy_allows_speculation():
@@ -2894,19 +2898,172 @@ class TestGemma4LogitsToKeep:
         return LanguageModel, lm
 
     def test_gemma4_slices_before_lm_head(self):
-        cls, lm = self._gemma4_lm(hidden=8)
+        _, lm = self._gemma4_lm(hidden=8)
         ids = mx.zeros((1, 6), dtype=mx.int32)
-        assert cls.supports_logits_to_keep is True
         assert lm(ids).logits.shape == (1, 6, 8)
         assert lm(ids, logits_to_keep=1).logits.shape == (1, 1, 8)
         assert lm(ids, logits_to_keep=3).logits.shape == (1, 3, 8)
 
     def test_gemma4_text_slices_before_lm_head(self):
-        cls, lm = self._gemma4_text_lm(hidden=8)
+        _, lm = self._gemma4_text_lm(hidden=8)
         ids = mx.zeros((1, 6), dtype=mx.int32)
-        assert cls.supports_logits_to_keep is True
         assert lm(ids).logits.shape == (1, 6, 8)
         assert lm(ids, logits_to_keep=1).logits.shape == (1, 1, 8)
+
+    @staticmethod
+    def _shared_config(config_cls, **kwargs):
+        return config_cls(
+            hidden_size=16,
+            num_hidden_layers=4,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            global_head_dim=8,
+            vocab_size=32,
+            vocab_size_per_layer_input=32,
+            hidden_size_per_layer_input=8,
+            num_kv_shared_layers=2,
+            sliding_window=32,
+            sliding_window_pattern=2,
+            **kwargs,
+        )
+
+    @pytest.mark.parametrize("keep", [1, 3])
+    @pytest.mark.parametrize(
+        "model_name,bidirectional,capture_ids",
+        [
+            ("gemma4", False, None),
+            ("gemma4", True, None),
+            ("gemma4", False, [0, 2]),
+            ("gemma4", False, []),
+            ("gemma4_text", False, None),
+        ],
+    )
+    def test_shared_tail_trimming(self, model_name, bidirectional, capture_ids, keep):
+        from mlx_vlm.models.gemma4 import language as gemma4
+        from mlx_vlm.models.gemma4_text import language as gemma4_text
+
+        language = gemma4 if model_name == "gemma4" else gemma4_text
+        config_cls = (
+            gemma4.TextConfig if model_name == "gemma4" else gemma4_text.ModelConfig
+        )
+        config_kwargs = (
+            {"use_bidirectional_attention": "vision"} if bidirectional else {}
+        )
+        lm = language.LanguageModel(self._shared_config(config_cls, **config_kwargs))
+        ids = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        kwargs = (
+            {"mm_token_type_ids": mx.array([[0, 1, 1, 0, 0]])} if bidirectional else {}
+        )
+        if capture_ids is not None:
+            kwargs["capture_layer_ids"] = capture_ids
+        full = lm(ids, **kwargs)
+        mx.eval(full.logits, full.hidden_states or [])
+        lengths = []
+        original_call = language.DecoderLayer.__call__
+
+        def traced_call(layer, hidden, *args, **call_kwargs):
+            lengths.append(hidden.shape[1])
+            return original_call(layer, hidden, *args, **call_kwargs)
+
+        with patch.object(language.DecoderLayer, "__call__", traced_call):
+            output = lm(ids, logits_to_keep=keep, **kwargs)
+            mx.eval(output.logits, output.hidden_states or [])
+
+        trim_at = 2 if capture_ids is None else max(capture_ids, default=3) + 1
+        assert lengths == [5] * trim_at + [keep] * (4 - trim_at)
+        assert output.logits.shape == (1, keep, 32)
+        assert mx.allclose(
+            output.logits, full.logits[:, -keep:], rtol=1e-3, atol=2e-3
+        ).item()
+        assert [h.shape for h in output.hidden_states or []] == [
+            h.shape for h in full.hidden_states or []
+        ]
+        assert all(
+            mx.array_equal(actual, expected).item()
+            for actual, expected in zip(
+                output.hidden_states or [], full.hidden_states or []
+            )
+        )
+
+    def test_gemma4_wrappers_forward_logits_to_keep(self):
+        from mlx_vlm.models import gemma4, gemma4_unified
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        ids = mx.array([[1, 2, 3]], dtype=mx.int32)
+        features = InputEmbeddingsFeatures(mx.zeros((1, 3, 4)))
+        for model_cls in (gemma4.Model, gemma4_unified.Model):
+            model = model_cls.__new__(model_cls)
+            model.get_input_embeddings = MagicMock(return_value=features)
+            model.language_model = MagicMock(return_value=object())
+
+            model_cls.__call__(model, ids, logits_to_keep=1)
+
+            assert model.language_model.call_args.kwargs["logits_to_keep"] == 1
+
+
+@pytest.mark.parametrize("honors_hint", [False, True])
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("right_padded", [False, True])
+@pytest.mark.parametrize(
+    "prefill_step_size,chunks", [(None, 0), (2, 0), (2, 1), (2, None)]
+)
+def test_prompt_processing_requests_only_required_trailing_logits(
+    right_padded, batch_size, prefill_step_size, chunks, honors_hint
+):
+    import mlx.nn as nn
+
+    calls = []
+
+    class Model(nn.Module):
+        def make_cache(self):
+            return [KVCache()]
+
+        def __call__(self, input_ids, cache=None, **kwargs):
+            calls.append((input_ids.shape[1], kwargs))
+            kv = mx.zeros((input_ids.shape[0], 1, input_ids.shape[1], 4))
+            cache[0].update_and_fetch(kv, kv)
+            logits = (input_ids[..., None] == mx.arange(16)).astype(mx.float32)
+            if honors_hint:
+                logits = logits[:, -kwargs.get("logits_to_keep", input_ids.shape[1]) :]
+            return SimpleNamespace(logits=logits)
+
+    input_ids = [[1, 2, 3, 4, 5], [6, 7, 8]][:batch_size]
+    right_padding = [0, 2][:batch_size] if right_padded else None
+    batch = PromptProcessingBatch(
+        model=Model(),
+        uids=list(range(batch_size)),
+        input_ids=input_ids,
+        max_tokens=[1] * batch_size,
+        inputs_embeds=mx.zeros((batch_size, 5, 4)),
+        prompt_kwargs={},
+        prefill_step_size=prefill_step_size,
+        right_pad_per_row=right_padding,
+        greedy_sampling=True,
+    )
+
+    if chunks is None:
+        while batch.needs_processing():
+            assert batch.prompt_step() > 0
+    else:
+        for _ in range(chunks):
+            assert batch.prompt_step() > 0
+
+    expected_input_width = 1 if chunks is None else 5 - 2 * chunks
+    assert batch._input_ids.shape[1] == expected_input_width
+
+    gen_batch = batch.generate(
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        stop_criteria=[lambda _: False] * batch_size,
+        compute_logprobs=False,
+    )
+
+    final_input_width, final_kwargs = calls[-1]
+    assert final_input_width == expected_input_width
+    expected_keep = 1 if not right_padded or batch_size == 1 or chunks is None else 3
+    assert final_kwargs["logits_to_keep"] == expected_keep
+    assert gen_batch._next_tokens.tolist() == [row[-1] for row in input_ids]
 
 
 def test_batch_apc_extra_hash_uses_precomputed_image_hash():
