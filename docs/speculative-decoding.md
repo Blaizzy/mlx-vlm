@@ -92,12 +92,6 @@ mlx_vlm.generate --model zai-org/GLM-5.3-Flash \
   --draft-model GLM-5.3-Flash-MTP-FP8 --draft-kind mtp \
   --draft-block-size 2 --temperature 0 --prompt "Explain why the sky is blue."
 
-PYTHONPATH=. python examples/benchmark_glm53_mtp.py \
-  --model /path/to/GLM-5.3-Flash-FP8 \
-  --draft-model /path/to/GLM-5.3-Flash-MTP-FP8 \
-  --batch-size 1 2 --context-tokens 0 1024 --temperatures 0 0.8 \
-  --max-tokens 256 --block-sizes 2 3 --output results.json
-
 python -m pytest mlx_vlm/tests/test_speculative.py \
   mlx_vlm/tests/test_speculative_transactions.py \
   mlx_vlm/tests/test_speculative_serving.py mlx_vlm/tests/test_cache.py
@@ -224,8 +218,8 @@ prompt, attributes roughly 91–92% of round time to target verification. With o
 draft, target verification averages 74.3 ms, acceptance 0.8 ms, and commit/MTP
 alignment 5.6 ms. With two drafts, target verification averages 102.6 ms and
 alignment 6.2 ms. Phase boundaries explicitly synchronize MLX, so these timings
-are diagnostic and should not be used as normal throughput measurements. Use
-`--profile` to reproduce them; normal decoding has no phase synchronization.
+are diagnostic and should not be used as normal throughput measurements.
+Normal decoding has no phase synchronization.
 
 The FP8 serving check compares AR, cold
 MTP, and warm MTP with temperature 0.8 and repetition/presence/frequency penalties.

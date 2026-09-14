@@ -205,7 +205,7 @@ full committed-token histories, including after prefix reuse. Thinking budgets
 constrain target sampling within speculative blocks. Requests with `logprobs=true`
 receive target probabilities; acceptance metrics are isolated per request.
 See [the implementation guide](docs/speculative-decoding.md) for the cache
-contract and a reproducible FP8 parity benchmark.
+contract and FP8 parity measurements.
 
 ### Chat UI with Gradio
 
