@@ -802,13 +802,31 @@ def _quantization_path_aliases(
 def _quantization_for_module_path(
     quantization: dict, path: str, model: Optional[nn.Module] = None
 ) -> Optional[dict]:
+    modules = quantization.get("modules")
+    modules = modules if isinstance(modules, dict) else {}
     for alias in _quantization_path_aliases(path, model):
         value = quantization.get(alias)
+        if value is None:
+            value = modules.get(alias)
         if isinstance(value, dict):
             return value
         if value is False:
             return {}
     return None
+
+
+def _eager_parameters(model) -> list:
+    """Parameters to materialize, minus any the model asks to leave mapped.
+
+    ``lazy_parameter_paths`` names tables a step gathers a handful of rows
+    from; making those resident costs their full size and buys nothing.
+    """
+    markers = tuple(getattr(model, "lazy_parameter_paths", ()) or ())
+    return [
+        value
+        for path, value in tree_flatten(model.parameters())
+        if isinstance(value, mx.array) and not any(marker in path for marker in markers)
+    ]
 
 
 def _drop_modules_without_weights(
@@ -1094,6 +1112,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # Stock MLX rejects bits=1; route those layers to our Metal kernel.
         replace_one_bit_modules(quantized_model, quantization, weights)
 
+        default_quantization = _quantization_for_path(config["quantization"], "")
+
         def get_class_predicate(p, m):
             per_module_quantization = _quantization_for_module_path(
                 config["quantization"], p, model
@@ -1116,15 +1136,19 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 return False
             # Handle custom per-layer quantization, including aliases supplied
             # by the model.
-            if per_module_quantization is not None:
-                return per_module_quantization
             if not hasattr(m, "to_quantized"):
                 return False
+            if per_module_quantization is not None:
+                return per_module_quantization
             # Skip layers not divisible by 64
             if hasattr(m, "weight") and m.weight.size % 64 != 0:
                 return False
             # Handle legacy models which may not have everything quantized
-            return f"{p}.scales" in weights
+            if f"{p}.scales" not in weights:
+                return False
+            if module_quantization == default_quantization:
+                return True
+            return module_quantization
 
         nn.quantize(
             quantized_model,
@@ -1182,7 +1206,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         lazy = requested_lazy
 
     if not lazy:
-        mx.eval(model.parameters())
+        mx.eval(_eager_parameters(model))
 
     model.model_path = model_path
     model.eval()

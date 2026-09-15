@@ -1809,3 +1809,75 @@ class TestVideoMetadataForwarding:
             )
         assert processor.metadata == metadata
         assert processor.metadata[1].timestamps[-1] == 239 / 24
+
+
+class _LazyPathLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.engram = nn.Module()
+        self.engram.embed = nn.Embedding(8, 4)
+        self.dense = nn.Linear(4, 4, bias=False)
+
+
+class _LazyPathModel(nn.Module):
+    """Two tables, one declared sparsely-gathered.
+
+    Nested under ``layers`` so the flattened paths carry the leading dot the
+    real markers rely on (``language_model.layers.N.engram.embed.weight``); a
+    flat module would make the marker match nothing and the skip assertion
+    pass vacuously.
+    """
+
+    lazy_parameter_paths = (".engram.embed.",)
+
+    def __init__(self):
+        super().__init__()
+        self.layers = [_LazyPathLayer()]
+
+
+def _materialized_paths(model):
+    """Paths whose arrays are handed to mx.eval during materialization."""
+    from mlx.utils import tree_flatten
+
+    from mlx_vlm import utils as utils_module
+
+    by_id = {
+        id(v): p for p, v in tree_flatten(model.parameters()) if isinstance(v, mx.array)
+    }
+    return [
+        by_id[id(array)]
+        for array in utils_module._eager_parameters(model)
+        if id(array) in by_id
+    ]
+
+
+def test_materialize_parameters_skips_declared_lazy_paths():
+    """Declared paths are skipped; the undeclared table still materializes.
+
+    The second assertion is the control: without it this would pass even if
+    nothing were materialized at all.
+    """
+    seen = _materialized_paths(_LazyPathModel())
+    assert not any(".engram.embed." in p for p in seen)
+    assert any("dense." in p for p in seen)
+
+
+def test_materialize_parameters_materializes_everything_without_a_declaration():
+    """Control for the opt-out: no declaration means no skipping.
+
+    Declared via a subclass rather than instance assignment: ``nn.Module`` is a
+    dict subclass, so assigning the attribute on an instance writes into the
+    dict while normal attribute lookup still finds the class attribute.
+    """
+
+    class _Undeclared(_LazyPathModel):
+        lazy_parameter_paths = ()
+
+    seen = _materialized_paths(_Undeclared())
+    assert any(".engram.embed." in p for p in seen)
+
+
+def test_deepseek_v41_declares_its_engram_tables_lazy():
+    from mlx_vlm.models import deepseek_v41
+
+    assert ".engram.embed." in deepseek_v41.Model.lazy_parameter_paths
