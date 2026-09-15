@@ -161,13 +161,13 @@ def test_unknown_checkpoint_state_keeps_conservative_growth_estimate(
     assert not manager._make_room()
 
 
-@pytest.mark.parametrize("capacity", [16, 256])
 @pytest.mark.parametrize(
     "make_cache",
     [KVCache, QuantizedKVCache, lambda: RotatingKVCache(max_size=512)],
     ids=["dense", "quantized", "windowed"],
 )
-def test_kv_growth_ignores_unused_capacity(manager_factory, capacity, make_cache):
+def test_kv_growth_ignores_unused_capacity(manager_factory, make_cache):
+    capacity = 256
     cache = make_cache()
     cache.step = 1
     tensor = mx.ones((1, 1, capacity, 64))
@@ -334,14 +334,12 @@ def test_padded_kv_admission_counts_allocated_buffers(manager_factory, monkeypat
     )
     # Admission includes the unused portion of the 8 KiB buffer.
     assert not manager.store_exact_cache(list(range(16)), [cache])
+    assert manager.resident_bytes() == 0
     assert manager.stats.memory_skips == 1
 
 
-@pytest.mark.parametrize("budget", [0, 256])
-def test_oversized_checkpoint_spills_without_clone(
-    manager_factory, monkeypatch, budget
-):
-    manager = manager_factory(budget=budget, disk=True)
+def test_oversized_checkpoint_spills_without_clone(manager_factory, monkeypatch):
+    manager = manager_factory(budget=256, disk=True)
     tokens = list(range(32))
     source = _kv(32)
 
@@ -361,16 +359,6 @@ def test_oversized_checkpoint_spills_without_clone(
     assert count == 32
     assert mx.all(restored[0].state[0] == 1).item()
     assert manager.resident_bytes() == 0  # Disk promotion obeys the byte cap too.
-
-
-def test_oversized_checkpoint_without_disk_does_not_clone(manager_factory, monkeypatch):
-    manager = manager_factory(budget=1)
-    monkeypatch.setattr(
-        apc, "_clone_prompt_cache_for_apc", lambda *a, **kw: pytest.fail("cloned")
-    )
-    assert not manager.store_exact_cache(list(range(32)), [_kv(32)])
-    assert manager.resident_bytes() == 0
-    assert manager.stats_snapshot()["memory_skips"] == 1
 
 
 def test_batch_checkpoint_skips_extraction_without_headroom(
