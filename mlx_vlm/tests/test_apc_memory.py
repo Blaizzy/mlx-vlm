@@ -1,6 +1,7 @@
 """APC memory admission, eviction, and bounded disk persistence."""
 
 import threading
+import weakref
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -237,6 +238,46 @@ def test_disk_expansion_is_admitted_before_reserving_capacity(
         KVCache, "prefix_cache_reserve", lambda *a: pytest.fail("expanded")
     )
     assert reader.lookup_exact_cache(tokens + [99] * 6000) == (None, 0)
+    assert reader.stats.memory_skips == 1
+
+
+def test_rejected_disk_expansion_falls_back_to_memory(manager_factory, monkeypatch):
+    tokens = list(range(1024))
+    writer = manager_factory(budget=1 << 20, disk=True)
+    assert writer.store_exact_cache(tokens[:32], [_kv(32)])
+    writer.disk.flush()
+
+    reader = manager_factory(budget=1 << 20, disk=True)
+    assert reader.store_exact_cache(tokens[:16], [_kv(16)])
+    coordinator = _coordinator(reader, [KVCache()])
+    coordinator.prepare_prefill(len(tokens))
+    reserve = reader.stats_snapshot()["prefill_reserve_bytes"]
+    disk_caches = []
+    load = reader.disk.load_exact_cache
+
+    def track_load(*args, **kwargs):
+        loaded = load(*args, **kwargs)
+        assert loaded is not None and len(loaded[0]) == 32
+        disk_caches.append(weakref.ref(loaded[2][0]))
+        return loaded
+
+    # Loading the 1 KiB checkpoint leaves too little for disk expansion's
+    # two-buffer budget. Dropping it leaves room to clone the memory hit.
+    monkeypatch.setattr(reader.disk, "load_exact_cache", track_load)
+    monkeypatch.setattr(
+        reader,
+        "_memory_headroom",
+        lambda: reserve + 1000 - sum(_cache_nbytes(ref()) for ref in disk_caches),
+    )
+    restored, matched = reader.lookup_exact_cache(tokens)
+
+    assert restored is not None and matched == 16
+    assert mx.all(restored[0].state[0] == 1).item()
+    assert restored[0].keys.shape[2] >= len(tokens)
+    assert len(disk_caches) == 1 and disk_caches[0]() is None
+    assert reader.stats_snapshot()["prefill_reserve_bytes"] == reserve
+    assert reader.stats.exact_hits == 1
+    assert reader.stats.disk_hits == 0
     assert reader.stats.memory_skips == 1
 
 
