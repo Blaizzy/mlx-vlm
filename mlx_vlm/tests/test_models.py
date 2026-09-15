@@ -1,6 +1,8 @@
 import importlib
 import inspect
 import math
+import pathlib
+import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
@@ -20108,3 +20110,145 @@ class TestSpark2_5Model(unittest.TestCase):
         weights = {"model.embedding.weight": mx.zeros((128, 64))}
         sanitized = model.sanitize(weights)
         self.assertIn("language_model.model.embedding.weight", sanitized)
+
+
+import pathlib
+import tempfile
+from unittest.mock import patch
+
+
+class TestAPCOffloadPrefix(unittest.TestCase):
+    """Offload must persist before it frees, and never drop live state."""
+
+    def _manager(self, root):
+        from mlx_vlm.apc import APCManager, DiskBlockStore
+
+        return APCManager(
+            num_blocks=64,
+            block_size=16,
+            disk=DiskBlockStore(pathlib.Path(root), "offload-test"),
+        )
+
+    def _store(self, manager, ids):
+        keys = mx.random.normal((1, 1, len(ids), 4))
+        values = mx.random.normal((1, 1, len(ids), 4))
+        blocks = manager.store_kv_blocks(ids, [keys], [values])
+        manager.release(blocks)
+        return blocks
+
+    def test_offload_frees_memory_and_leaves_the_prefix_on_disk(self):
+        with tempfile.TemporaryDirectory() as root:
+            manager = self._manager(root)
+            ids = list(range(256))
+            self._store(manager, ids)
+
+            before = manager.stats_snapshot()["pool_used"]
+            self.assertGreater(before, 0)
+            self.assertGreater(manager.resident_bytes(), 0)
+
+            result = manager.offload_prefix(ids)
+
+            self.assertEqual(result["matched_blocks"], 16)
+            self.assertEqual(result["released_blocks"], 16)
+            self.assertEqual(result["released_tokens"], 256)
+            self.assertEqual(result["retained_in_use"], 0)
+            self.assertEqual(result["retained_unpersisted"], 0)
+            self.assertGreater(result["freed_bytes"], 0)
+            self.assertEqual(manager.stats_snapshot()["pool_used"], 0)
+
+            # the prefix survives on disk for a later matching request
+            self.assertTrue(all(manager.disk.has(h) for h in manager.disk._index))
+            self.assertEqual(manager.lookup_prefix(ids)[1], 0)
+            self.assertGreater(manager.lookup_prefix_disk_cache(ids)[1], 0)
+            manager.close()
+
+    def test_offload_keeps_blocks_another_request_still_holds(self):
+        with tempfile.TemporaryDirectory() as root:
+            manager = self._manager(root)
+            ids = list(range(256))
+            self._store(manager, ids)
+
+            held, _ = manager.lookup_prefix(ids)
+            self.assertGreater(len(held), 0)
+
+            result = manager.offload_prefix(ids)
+            self.assertEqual(result["released_blocks"], 0)
+            self.assertEqual(result["retained_in_use"], len(held))
+            self.assertEqual(manager.stats_snapshot()["pool_used"], len(held))
+
+            manager.release(held)
+            after = manager.offload_prefix(ids)
+            self.assertEqual(after["released_blocks"], len(held))
+            self.assertEqual(manager.stats_snapshot()["pool_used"], 0)
+            manager.close()
+
+    def test_offload_retains_blocks_that_never_reached_disk(self):
+        with tempfile.TemporaryDirectory() as root:
+            manager = self._manager(root)
+            ids = list(range(256))
+            self._store(manager, ids)
+
+            with patch.object(manager.disk, "has", return_value=False):
+                result = manager.offload_prefix(ids)
+
+            self.assertEqual(result["released_blocks"], 0)
+            self.assertEqual(result["retained_unpersisted"], 16)
+            self.assertEqual(manager.stats_snapshot()["pool_used"], 16)
+            self.assertGreater(manager.lookup_prefix(ids)[1], 0)
+            manager.close()
+
+    def test_offload_is_a_no_op_for_a_prefix_that_was_never_cached(self):
+        with tempfile.TemporaryDirectory() as root:
+            manager = self._manager(root)
+            self._store(manager, list(range(256)))
+
+            result = manager.offload_prefix(list(range(1000, 1256)))
+
+            self.assertEqual(result["matched_blocks"], 0)
+            self.assertEqual(result["released_blocks"], 0)
+            self.assertEqual(manager.stats_snapshot()["pool_used"], 16)
+            manager.close()
+
+    def test_offloaded_blocks_return_to_the_pool_without_leaking(self):
+        with tempfile.TemporaryDirectory() as root:
+            manager = self._manager(root)
+            for start in range(0, 5):
+                ids = list(range(start * 1000, start * 1000 + 256))
+                self._store(manager, ids)
+                manager.offload_prefix(ids)
+
+            self.assertEqual(manager.stats_snapshot()["pool_used"], 0)
+            self.assertEqual(sum(b.ref_cnt for b in manager.pool), 0)
+            free = 0
+            node = manager._free_head
+            while node is not None:
+                free += 1
+                node = node.next
+            self.assertEqual(free, manager.num_blocks)
+            manager.close()
+
+
+class TestAPCOffloadSaltDiscovery(unittest.TestCase):
+    """The salt folds in model and processor, so offload cannot assume zero."""
+
+    def test_offload_finds_a_prefix_stored_under_a_model_specific_salt(self):
+        from mlx_vlm.apc import APCManager, DiskBlockStore
+
+        with tempfile.TemporaryDirectory() as root:
+            manager = APCManager(
+                num_blocks=64,
+                block_size=16,
+                disk=DiskBlockStore(pathlib.Path(root), "salt-test"),
+            )
+            ids = list(range(256))
+            keys = mx.random.normal((1, 1, len(ids), 4))
+            manager.release(
+                manager.store_kv_blocks(ids, [keys], [keys], extra_hash=987654321)
+            )
+
+            result = manager.offload_prefix(ids)
+
+            self.assertEqual(result["matched_blocks"], 16)
+            self.assertEqual(result["released_blocks"], 16)
+            self.assertEqual(manager.stats_snapshot()["pool_used"], 0)
+            manager.close()
