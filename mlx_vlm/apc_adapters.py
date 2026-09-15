@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
+from math import ceil
 from typing import Any, Dict, List, Optional, Sequence
 
 import mlx.core as mx
@@ -76,6 +77,27 @@ class CacheGroupSpec:
     layer_indices: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class CacheMemory:
+    """One row's allocation policy, measured without copying cache tensors."""
+
+    source_bytes: int = 0
+    fixed_bytes: int = 0
+    bytes_per_token: float = 0
+    step: int = 1
+    window_size: Optional[int] = None
+    fallback: bool = False
+
+    def footprint(self, tokens: int, chunk_size: Optional[int] = None) -> int:
+        if tokens <= 0:
+            return 0
+        if self.window_size is not None and chunk_size is not None:
+            tokens = min(tokens, self.window_size - 1 + chunk_size)
+        step = max(1, self.step)
+        capacity = ((tokens + step - 1) // step) * step
+        return self.fixed_bytes + ceil(capacity * self.bytes_per_token)
+
+
 def _copy_array(x: mx.array) -> mx.array:
     """Materialize ``x`` into a fresh MLX-owned contiguous buffer (detach)."""
     return mx.contiguous(mx.array(x, dtype=x.dtype))
@@ -136,6 +158,16 @@ class CheckpointAdapter:
 
     capability = Capability.CHECKPOINT
 
+    def memory(self, cache: Any, token_count: int) -> CacheMemory:
+        from .apc import _cache_nbytes
+
+        size = _cache_nbytes(cache)
+        return CacheMemory(
+            source_bytes=size,
+            bytes_per_token=size / max(1, token_count),
+            fallback=True,
+        )
+
     def capture(self, cache: Any, prefix_len: int) -> Optional[StateFragment]:
         if not _is_snapshotable(cache):
             return None
@@ -183,6 +215,15 @@ def reserve_checkpoint_capacity(
 ) -> None:
     """Apply an optional cache-defined capacity reservation after restoration."""
     if min_capacity_tokens is None:
+        return
+    if resolve_capability(cache) == Capability.COMPOSITE:
+        children = cache if isinstance(cache, tuple) else cache.caches
+        for child in children:
+            reserve_checkpoint_capacity(
+                child,
+                min_capacity_tokens=min_capacity_tokens,
+                eval_targets=eval_targets,
+            )
         return
     reserve = getattr(cache, "prefix_cache_reserve", None)
     if not callable(reserve):
@@ -364,8 +405,22 @@ def _apc_array_helpers():
     return _copy_mlx_array, _pad_kv_for_capacity
 
 
-class KVCacheCloneAdapter:
+class KVCacheCloneAdapter(CheckpointAdapter):
     capability = Capability.PAGEABLE
+
+    def memory(self, c, token_count):
+        from .apc import _cache_nbytes
+
+        if c.keys is None:
+            return CacheMemory()
+        keys = c.keys[0] if isinstance(c.keys, tuple) else c.keys
+        capacity = keys.shape[2]
+        size = _cache_nbytes(c.keys) + _cache_nbytes(c.values)
+        return CacheMemory(
+            source_bytes=size,
+            bytes_per_token=size / capacity if capacity else 0,
+            step=c.step,
+        )
 
     def clone(self, c, *, min_capacity_tokens, eval_targets):
         copy, pad = _apc_array_helpers()
@@ -392,8 +447,17 @@ class KVCacheCloneAdapter:
         return lm.BatchKVCache.merge(caches)
 
 
-class RotatingKVCacheCloneAdapter:
+class RotatingKVCacheCloneAdapter(KVCacheCloneAdapter):
     capability = Capability.WINDOWED
+
+    def memory(self, c, token_count):
+        profile = super().memory(c, token_count)
+        return CacheMemory(
+            source_bytes=profile.source_bytes,
+            bytes_per_token=profile.bytes_per_token,
+            step=profile.step,
+            window_size=c.max_size,
+        )
 
     def clone(self, c, *, min_capacity_tokens, eval_targets):
         copy, _ = _apc_array_helpers()
@@ -411,7 +475,7 @@ class RotatingKVCacheCloneAdapter:
         return lm.BatchRotatingKVCache.merge(caches)
 
 
-class ChunkedKVCacheCloneAdapter:
+class ChunkedKVCacheCloneAdapter(CheckpointAdapter):
     capability = Capability.WINDOWED
 
     def clone(self, c, *, min_capacity_tokens, eval_targets):
@@ -430,8 +494,20 @@ class ChunkedKVCacheCloneAdapter:
         return lm.BatchKVCache.merge(caches)
 
 
-class ArraysCacheCloneAdapter:
+class ArraysCacheCloneAdapter(CheckpointAdapter):
     capability = Capability.CHECKPOINT
+
+    def memory(self, c, token_count):
+        from .apc import _cache_nbytes
+
+        size = _cache_nbytes(c)
+        fixed = _cache_nbytes(c.state)
+        return CacheMemory(
+            source_bytes=size,
+            fixed_bytes=fixed,
+            # Speculative rollback records, if present, are additional buffers.
+            bytes_per_token=max(0, size - fixed) / max(1, token_count),
+        )
 
     def clone(self, c, *, min_capacity_tokens, eval_targets):
         from .models import cache as lm
@@ -479,7 +555,7 @@ class ArraysCacheCloneAdapter:
         return out
 
 
-class PoolingCacheCloneAdapter:
+class PoolingCacheCloneAdapter(CheckpointAdapter):
     capability = Capability.CHECKPOINT
 
     def clone(self, c, *, min_capacity_tokens, eval_targets):
@@ -514,6 +590,44 @@ def _clone_rules():
             (lm.PoolingCache, PoolingCacheCloneAdapter()),
         ]
     return _CLONE_RULES
+
+
+def cache_memory_components(caches, token_count, *, batch_size=1):
+    """Resolve composite layouts; unknown subclasses use opaque estimates."""
+    from .models import cache as lm
+
+    adapters = dict(_clone_rules())
+    # Shared memory layouts have separate clone protocols.
+    for typ in (lm.QuantizedKVCache, lm.BatchKVCache, lm.BatchQuantizedKVCache):
+        adapters[typ] = adapters[lm.KVCache]
+    adapters[lm.BatchRotatingKVCache] = adapters[lm.RotatingKVCache]
+    fallback = CheckpointAdapter()
+    profiles = []
+    seen = set()
+
+    def visit(c):
+        if c is None or id(c) in seen:
+            return
+        seen.add(id(c))
+        if isinstance(c, (list, tuple)):
+            for child in c:
+                visit(child)
+        elif resolve_capability(c) == Capability.COMPOSITE:
+            visit(c.caches)
+        else:
+            adapter = adapters.get(type(c), fallback)
+            profile = adapter.memory(c, token_count)
+            profiles.append(
+                replace(
+                    profile,
+                    source_bytes=ceil(profile.source_bytes / batch_size),
+                    fixed_bytes=ceil(profile.fixed_bytes / batch_size),
+                    bytes_per_token=profile.bytes_per_token / batch_size,
+                )
+            )
+
+    visit(caches)
+    return profiles
 
 
 def _custom_state_contract(c) -> bool:

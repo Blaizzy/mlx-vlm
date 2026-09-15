@@ -1777,8 +1777,12 @@ class ResponseGenerator:
 
                     # Vision encoder runs on the GPU thread; text tokenization
                     # already happened on the caller thread.
-                    if self.apc_manager is not None:
-                        self.apc_manager.prepare_prefill(prompt_tokens)
+                    coordinator = getattr(batch_gen, "apc", None)
+                    if coordinator is not None:
+                        coordinator.prepare_prefill(
+                            prompt_tokens,
+                            prefill_step_size=self._effective_prefill_step_size(),
+                        )
                     input_ids, gen_kwargs = self._gpu_embed(
                         raw_inputs,
                         images,
