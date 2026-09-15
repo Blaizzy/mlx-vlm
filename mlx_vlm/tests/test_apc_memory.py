@@ -22,7 +22,7 @@ from mlx_vlm.models.cache import (
 
 def _kv(length, value=1):
     cache = KVCache()
-    cache.step = 1  # These synthetic caches allocate exactly the requested length.
+    cache.step = 1  # Allocate exactly the requested length.
     cache.keys = mx.full((1, 1, length, 4), value, dtype=mx.float32)
     cache.values = mx.full((1, 1, length, 4), value + 1, dtype=mx.float32)
     cache.offset = length
@@ -140,7 +140,7 @@ def test_unknown_checkpoint_state_keeps_conservative_growth_estimate(
         meta_state = ()
 
     manager = manager_factory(budget=4 << 20)
-    # An opaque cache is not necessarily fixed just because it is checkpointed.
+    # Opaque checkpoints may grow with tokens.
     monkeypatch.setattr(apc, "_clone_prompt_cache_for_apc", lambda cache: cache)
     cache = GrowingCache()
     coordinator = _coordinator(manager, [cache])
@@ -200,7 +200,7 @@ def test_short_hybrid_checkpoint_extends_with_bounded_memory(
     manager_factory, monkeypatch, disk, composite
 ):
     state = ArraysCache(1)
-    state[0] = mx.ones((1, 256, 1024))  # Fixed 1 MiB, independent of prompt length.
+    state[0] = mx.ones((1, 256, 1024))  # 1 MiB fixed state.
     entries = [state, _kv(18)]
     if composite:
         entries = [CacheList(*entries)]
@@ -261,8 +261,8 @@ def test_rejected_disk_expansion_falls_back_to_memory(manager_factory, monkeypat
         disk_caches.append(weakref.ref(loaded[2][0]))
         return loaded
 
-    # Loading the 1 KiB checkpoint leaves too little for disk expansion's
-    # two-buffer budget. Dropping it leaves room to clone the memory hit.
+    # Disk expansion needs two buffers. Freeing the loaded 1 KiB lets
+    # the memory hit fit with one clone.
     monkeypatch.setattr(reader.disk, "load_exact_cache", track_load)
     monkeypatch.setattr(
         reader,
@@ -327,7 +327,7 @@ def test_windowed_memory_budget_is_independent_of_checkpoint_order(
         assert manager.store_exact_cache([length] * length, [cache])
     coordinator = _coordinator(manager, [cache])
     coordinator.prepare_prefill(6001, prefill_step_size=2048)
-    # At most the retained window plus one prefill chunk, rounded to 256 slots.
+    # Window plus one chunk, rounded to 256 slots.
     assert manager.stats_snapshot()["prefill_reserve_bytes"] == 2 * 2560 * 32
 
 
@@ -338,7 +338,7 @@ def test_padded_kv_admission_counts_allocated_buffers(manager_factory, monkeypat
     monkeypatch.setattr(
         apc, "_clone_prompt_cache_for_apc", lambda *a, **kw: pytest.fail("cloned")
     )
-    # The populated 512 bytes fit, but the allocated 8 KiB must still be admitted.
+    # Admission includes the unused portion of the 8 KiB buffer.
     assert not manager.store_exact_cache(list(range(16)), [cache])
     assert manager.stats.memory_skips == 1
 

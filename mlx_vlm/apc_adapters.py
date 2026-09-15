@@ -593,15 +593,11 @@ def _clone_rules():
 
 
 def cache_memory_components(caches, token_count, *, batch_size=1):
-    """Resolve memory through the existing adapters, including composite entries.
-
-    Specialized subclasses keep opaque accounting until their allocation policy
-    is supported; inheriting a KV layout does not guarantee its growth rules.
-    """
+    """Resolve composite layouts; unknown subclasses use opaque estimates."""
     from .models import cache as lm
 
     adapters = dict(_clone_rules())
-    # These layouts share memory accounting, but keep their own clone protocols.
+    # Shared memory layouts have separate clone protocols.
     for typ in (lm.QuantizedKVCache, lm.BatchKVCache, lm.BatchQuantizedKVCache):
         adapters[typ] = adapters[lm.KVCache]
     adapters[lm.BatchRotatingKVCache] = adapters[lm.RotatingKVCache]

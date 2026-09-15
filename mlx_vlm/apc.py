@@ -3410,8 +3410,7 @@ class APCManager:
             )
             if disk_match is not None:
                 cache_hash, disk_prefix_len = disk_match
-                # Admit the stored buffers first. Once loaded, the adapters can
-                # budget expansion from their actual layouts, even after restart.
+                # Admit stored buffers before estimating expansion from their layout.
                 restore_bytes = disk.exact_cache_bytes(cache_hash)
                 if not self._make_room(2 * restore_bytes):
                     with self.lock:
@@ -3440,8 +3439,7 @@ class APCManager:
                         if not self._make_room(2 * expanded_bytes):
                             with self.lock:
                                 self.stats.memory_skips += 1
-                            # Release the rejected disk copy before trying the
-                            # memory hit, and remove its live-buffer credit.
+                            # Drop disk buffers and credit before memory fallback.
                             loaded = prompt_cache = None
                             self._prefill_reserve_bytes = (
                                 self.memory_plan.reserve_bytes()
@@ -3460,16 +3458,9 @@ class APCManager:
                             self._prefill_reserve_bytes = (
                                 self.memory_plan.reserve_bytes(size)
                             )
-                            # Promote the disk-restored entry to the in-memory LRU
-                            # so subsequent identical requests get the fast clone
-                            # path instead of paying disk-restore latency again.
-                            # We clone before storing because the caller's copy will
-                            # be mutated in-place by generate_step as it appends
-                            # generated tokens; the stored copy must stay pristine.
-                            # Disk reads and warm-cache construction intentionally
-                            # happen outside the manager lock. If clear()/reset_stats()
-                            # races here, the restored tensors are still valid; only
-                            # the hit counter lands in the new stats window.
+                            # Retain a copy; generation mutates the returned cache.
+                            # Reads run unlocked. Resets leave tensors valid but move
+                            # hit counts to the new stats window.
                             if (
                                 self._exact_cache_max > 0
                                 and size <= self.memory_max_bytes

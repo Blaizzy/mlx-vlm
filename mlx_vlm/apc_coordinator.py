@@ -20,11 +20,9 @@ from .apc_adapters import (
 
 
 class PrefillMemoryPlan:
-    """Request memory planning shared by coordinators bound to one manager.
+    """Per-manager budgets from cache layouts or conservative opaque bounds.
 
-    Known components use tensor dimensions and adapter allocation policies.
-    Only opaque components retain a conservative observed bytes/token bound.
-    Before any dimensions are available, admission uses the device reserve.
+    Empty caches use the device reserve until dimensions are known.
     """
 
     def __init__(self):
@@ -46,8 +44,7 @@ class PrefillMemoryPlan:
     def reserve_bytes(self, live_bytes: int = 0) -> int:
         if not self.lengths or not max(self.lengths):
             return 0
-        # Warm rows align their prefixes and suffixes separately. Cold batches
-        # are the special case where every prefix has length zero.
+        # Prefixes and suffixes are padded separately; cold prefixes are zero.
         capacity = max(self.prefix_lengths) + max(
             n - p for n, p in zip(self.lengths, self.prefix_lengths)
         )
@@ -71,7 +68,7 @@ class PrefillMemoryPlan:
     def observe_cache(
         self, prompt_cache, token_count, *, batch_size=1, live_bytes=None
     ) -> int:
-        """Update cache dimensions and return the reserve beyond live allocations."""
+        """Update dimensions and return the reserve beyond live buffers."""
         from .apc import _cache_nbytes
 
         if live_bytes is None:
@@ -82,8 +79,7 @@ class PrefillMemoryPlan:
         )
 
     def observe_kv(self, keys, values, *, live_bytes: int) -> int:
-        # The block API receives populated, unquantized slabs without a cache
-        # wrapper. Their token axis describes growth directly.
+        # Raw float KV slabs expose growth through their token axis.
         return self.observe(
             (
                 CacheMemory(
