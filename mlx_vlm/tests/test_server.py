@@ -8238,3 +8238,82 @@ class TestSTTSegmentSerialization:
         assert data["segments"] == [
             {"id": 0, "start": 0.0, "end": 0.5, "text": "hello"}
         ]
+
+
+def _offload_patches(prefix_ids, offload_result=None, recorder=None):
+    from types import SimpleNamespace
+
+    manager = SimpleNamespace(
+        offload_prefix=lambda ids, *a, **k: (
+            recorder.append(list(ids)) if recorder is not None else None,
+            offload_result or {"released_blocks": 0},
+        )[1]
+    )
+    return [
+        patch.object(
+            server_openai,
+            "get_cached_model",
+            return_value=(object(), SimpleNamespace(), SimpleNamespace()),
+        ),
+        patch.object(
+            server_openai,
+            "_build_gen_args",
+            return_value=SimpleNamespace(to_template_kwargs=lambda: {}),
+        ),
+        patch.object(server_openai, "apply_chat_template", return_value="rendered"),
+        patch.object(
+            server_openai, "_conversation_prefix_ids", return_value=prefix_ids
+        ),
+        patch.object(server_openai.runtime, "apc_manager", manager),
+    ]
+
+
+def test_cache_offload_requires_input(client):
+    response = client.post("/v1/cache/offload", json={"model": "demo", "input": ""})
+    assert response.status_code == 400
+
+
+def test_cache_offload_reports_disabled_prompt_cache(client):
+    with patch.object(server_openai.runtime, "apc_manager", None):
+        response = client.post(
+            "/v1/cache/offload",
+            json={"model": "demo", "input": [{"role": "user", "content": "hi"}]},
+        )
+    assert response.status_code == 409
+
+
+def test_cache_offload_refuses_an_unresolvable_prefix(client):
+    import contextlib
+
+    with contextlib.ExitStack() as stack:
+        for p in _offload_patches([]):
+            stack.enter_context(p)
+        response = client.post(
+            "/v1/cache/offload",
+            json={"model": "demo", "input": [{"role": "user", "content": "hi"}]},
+        )
+    assert response.status_code == 422
+
+
+def test_cache_offload_releases_the_conversation_prefix(client):
+    import contextlib
+
+    seen = []
+    counts = {
+        "released_blocks": 3,
+        "released_tokens": 48,
+        "retained_in_use": 1,
+        "retained_unpersisted": 0,
+        "freed_bytes": 4096,
+    }
+    with contextlib.ExitStack() as stack:
+        for p in _offload_patches([7, 8, 9], counts, recorder=seen):
+            stack.enter_context(p)
+        response = client.post(
+            "/v1/cache/offload",
+            json={"model": "demo", "input": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == counts
+    assert seen == [[7, 8, 9]]
