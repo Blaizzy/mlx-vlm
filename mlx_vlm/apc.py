@@ -118,6 +118,31 @@ def _cache_nbytes(value: Any, seen: Optional[set[int]] = None) -> int:
     )
 
 
+def _cache_fixed_nbytes(value: Any, seen: Optional[set[int]] = None) -> int:
+    """Count known recurrent state without treating opaque checkpoints as fixed.
+
+    ArraysCache holds bounded convolution/recurrent state. Only its live state
+    is fixed: speculative rollback records, if present, are additional buffers.
+    Other checkpoint types may grow with tokens, so retain the linear estimate
+    for those, including windowed and custom caches.
+    """
+    from .models.cache import ArraysCache, CacheList
+
+    if value is None:
+        return 0
+    seen = set() if seen is None else seen
+    if id(value) in seen:
+        return 0
+    seen.add(id(value))
+    if isinstance(value, (list, tuple)):
+        return sum(_cache_fixed_nbytes(v, seen) for v in value)
+    if isinstance(value, CacheList):
+        return _cache_fixed_nbytes(value.caches, seen)
+    if isinstance(value, ArraysCache):
+        return _cache_nbytes(value.state, seen)
+    return 0
+
+
 def _metal_working_set_bytes() -> Optional[int]:
     try:
         return int(mx.device_info()["max_recommended_working_set_size"])
@@ -3185,9 +3210,11 @@ class APCManager:
                 * (1 << 30)
             ),
         )
+        self._fixed_cache_bytes = 0
         self._bytes_per_token = 0.0
         self._prefill_reserve_bytes = 0
         self._prefill_tokens = 0
+        self._prefill_sequences = 1
 
     def _record_disk_writes(self, count: int) -> None:
         with self.lock:
@@ -3320,16 +3347,31 @@ class APCManager:
             and self._memory_headroom() >= required
         )
 
-    def _observe_cache_size(self, size: int, token_count: int) -> None:
+    def _estimated_prefill_bytes(self) -> int:
+        if self._prefill_tokens <= 0:
+            return 0
+        return 2 * int(
+            self._prefill_sequences * self._fixed_cache_bytes
+            + self._prefill_tokens * self._bytes_per_token
+        )
+
+    def _observe_cache_size(
+        self, size: int, token_count: int, *, fixed_bytes: int = 0
+    ) -> None:
         if token_count > 0:
             with self.lock:
-                self._bytes_per_token = max(self._bytes_per_token, size / token_count)
-                self._prefill_reserve_bytes = int(
-                    max(0, 2 * self._prefill_tokens - token_count)
-                    * self._bytes_per_token
+                fixed_bytes = min(size, max(0, fixed_bytes))
+                self._fixed_cache_bytes = max(self._fixed_cache_bytes, fixed_bytes)
+                self._bytes_per_token = max(
+                    self._bytes_per_token, (size - fixed_bytes) / token_count
+                )
+                # The observed live cache already consumes device headroom.
+                # Reserve only the remaining growth/restore footprint.
+                self._prefill_reserve_bytes = max(
+                    0, self._estimated_prefill_bytes() - size
                 )
 
-    def prepare_prefill(self, token_count: int) -> None:
+    def prepare_prefill(self, token_count: int, *, num_sequences: int = 1) -> None:
         """Make room for the incoming request before lookup, embeddings or prefill.
 
         Reserve two cache footprints for growth/restore temporaries in addition
@@ -3339,9 +3381,8 @@ class APCManager:
         if self.disk is not None:
             self.disk.flush()
         self._prefill_tokens = max(0, token_count)
-        self._prefill_reserve_bytes = int(
-            2 * self._prefill_tokens * self._bytes_per_token
-        )
+        self._prefill_sequences = max(1, num_sequences)
+        self._prefill_reserve_bytes = self._estimated_prefill_bytes()
         self._make_room()
 
     # ---------- Public API ----------
@@ -3451,7 +3492,11 @@ class APCManager:
                         and token_tuple[:disk_prefix_len] == stored_tokens
                     ):
                         size = _cache_nbytes(prompt_cache)
-                        self._observe_cache_size(size, disk_prefix_len)
+                        self._observe_cache_size(
+                            size,
+                            disk_prefix_len,
+                            fixed_bytes=_cache_fixed_nbytes(prompt_cache),
+                        )
                         # Promote the disk-restored entry to the in-memory LRU
                         # so subsequent identical requests get the fast clone
                         # path instead of paying disk-restore latency again.
@@ -3534,7 +3579,9 @@ class APCManager:
             return False
         token_tuple = tuple(int(t) for t in token_ids)
         size = _cache_nbytes(prompt_cache)
-        self._observe_cache_size(size, len(token_tuple))
+        self._observe_cache_size(
+            size, len(token_tuple), fixed_bytes=_cache_fixed_nbytes(prompt_cache)
+        )
         if self.disk is not None:
             self.disk.flush()
         retain = (

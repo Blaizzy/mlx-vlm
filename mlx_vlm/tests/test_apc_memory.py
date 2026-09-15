@@ -8,7 +8,7 @@ import pytest
 
 from mlx_vlm import apc
 from mlx_vlm.apc import APCManager, DiskBlockStore, _cache_nbytes, from_env
-from mlx_vlm.models.cache import ArraysCache, KVCache
+from mlx_vlm.models.cache import ArraysCache, BatchKVCache, CacheList, KVCache
 
 
 def _kv(length, value=1):
@@ -72,6 +72,67 @@ def test_custom_state_accounting_without_snapshot_or_evaluation():
     cache = CustomCache()
     assert _cache_nbytes([cache]) == 48
     assert _cache_nbytes([cache, cache]) == 48
+
+
+@pytest.mark.parametrize("composite", [False, True])
+def test_short_hybrid_checkpoint_does_not_block_long_batch_reuse(
+    manager_factory, monkeypatch, composite
+):
+    def make_cache(length=0):
+        state = ArraysCache(1)
+        state[0] = mx.ones((1, 256, 1024), dtype=mx.float32)  # 1 MiB fixed state.
+        kv = BatchKVCache.merge([_kv(length)])
+        return [CacheList(state, kv)] if composite else [state, kv]
+
+    manager = manager_factory(budget=4 << 20, disk=True)
+    monkeypatch.setattr(
+        manager, "_memory_headroom", lambda: (8 << 20) - manager.resident_bytes()
+    )
+    coordinator = manager.coordinator(SimpleNamespace(make_cache=make_cache))
+    manager.prepare_prefill(19)
+    assert coordinator.store_checkpoint(list(range(18)), make_cache(18))
+    tokens = [42] * 6000
+    manager.prepare_prefill(6001)
+    assert coordinator.store_checkpoint(tokens, make_cache(6000))
+    manager.prepare_prefill(6001)
+    restored, count = manager.lookup_exact_cache(tokens + [9])
+    assert restored is not None and count == 6000
+    assert manager.stats.exact_stores == 2
+    assert manager.stats.memory_skips == 0
+
+
+def test_disk_fixed_state_reserve_counts_every_prefill_sequence(manager_factory):
+    state = ArraysCache(1)
+    state[0] = mx.ones((1, 256, 1024), dtype=mx.float32)
+    tokens = list(range(18))
+    writer = manager_factory(budget=4 << 20, disk=True)
+    assert writer.store_exact_cache(tokens, [state])
+    writer.disk.flush()
+
+    manager = manager_factory(budget=4 << 20, disk=True)
+    assert manager.lookup_exact_cache(tokens + [99])[1] == len(tokens)
+    coordinator = manager.coordinator(SimpleNamespace(make_cache=lambda: [state]))
+    coordinator.prepare_prefill(6000, num_sequences=3)
+    assert manager.stats_snapshot()["prefill_reserve_bytes"] == 6 << 20
+    coordinator.prepare_prefill(0)
+    assert manager.stats_snapshot()["prefill_reserve_bytes"] == 0
+
+
+def test_unknown_checkpoint_state_keeps_conservative_growth_estimate(
+    manager_factory, monkeypatch
+):
+    class GrowingCache:
+        state = mx.ones((1, 256, 1024))
+        meta_state = ()
+
+    manager = manager_factory(budget=4 << 20)
+    # An opaque cache is not necessarily fixed just because it is checkpointed.
+    monkeypatch.setattr(apc, "_clone_prompt_cache_for_apc", lambda cache: cache)
+    assert manager.store_exact_cache(list(range(18)), [GrowingCache()])
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: 8 << 20)
+    manager.prepare_prefill(6001)
+    assert manager.resident_bytes() == 0
+    assert not manager._make_room()
 
 
 @pytest.mark.parametrize("budget", [0, 256])

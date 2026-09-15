@@ -26,9 +26,9 @@ class APCCoordinator:
         self.model = model
         self.plan: PrefixCachePlan = build_prefix_cache_plan(model)
 
-    def prepare_prefill(self, token_count: int) -> None:
+    def prepare_prefill(self, token_count: int, *, num_sequences: int = 1) -> None:
         if self.enabled:
-            self.manager.prepare_prefill(token_count)
+            self.manager.prepare_prefill(token_count, num_sequences=num_sequences)
 
     @property
     def enabled(self) -> bool:

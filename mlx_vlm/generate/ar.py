@@ -3042,7 +3042,9 @@ class BatchGenerator:
             sequences = self._unprocessed_sequences[:n]
             coordinator = getattr(self, "apc", None)
             if coordinator is not None:
-                coordinator.prepare_prefill(sum(len(s[1]) for s in sequences))
+                coordinator.prepare_prefill(
+                    sum(len(s[1]) for s in sequences), num_sequences=len(sequences)
+                )
             if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
                 logger.warning(
                     "APC admit n=%d (pending=%d)",
