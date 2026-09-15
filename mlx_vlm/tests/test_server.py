@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import json
 import logging
 import math
@@ -1776,6 +1777,110 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     assert mock_generate.call_args.kwargs["thinking_budget"] == 24
     assert mock_generate.call_args.kwargs["thinking_start_token"] == "<think>"
     assert mock_generate.call_args.kwargs["thinking_end_token"] == "</think>"
+
+
+def _assert_chat_and_responses_messages(client, messages, expected, **extra):
+    config = SimpleNamespace(model_type="qwen3_5")
+    result = GenerationResult(text="done", prompt_tokens=8, generation_tokens=1)
+    with (
+        patch.object(server, "get_cached_model", return_value=(None, None, config)),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        for route, field in [
+            ("/v1/chat/completions", "messages"),
+            ("/v1/responses", "input"),
+        ]:
+            mock_template.reset_mock()
+            response = client.post(
+                route, json={"model": "demo", field: messages, **extra}
+            )
+            assert response.status_code == 200, response.text
+            mock_template.assert_called_once()
+            assert mock_template.call_args.args[2] == expected, route
+            assert mock_template.call_args.kwargs["tools"] == extra.get("tools"), route
+
+
+@pytest.mark.parametrize("omitted_reasoning", ["reasoning_content", "reasoning"])
+@pytest.mark.parametrize(
+    "content", ["Inspecting.", [{"type": "output_text", "text": "Inspecting."}]]
+)
+def test_chat_and_responses_preserve_same_tool_history(
+    client, omitted_reasoning, content
+):
+    expected = [
+        {"role": "user", "content": "Where is the entry point?"},
+        {
+            "role": "assistant",
+            "content": "Inspecting.",
+            "reasoning_content": "Check the entry point first.",
+            "reasoning": "Check the entry point first.",
+            "tool_calls": [
+                {
+                    "id": "call_saved",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": {"path": "/src/app.py"},
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_saved",
+            "name": "read_file",
+            "content": "It initializes SQLite.",
+        },
+        {"role": "user", "content": "Summarize what you learned."},
+    ]
+    messages = copy.deepcopy(expected)
+    assistant = messages[1]
+    assistant["content"] = content
+    del assistant[omitted_reasoning]
+    function = assistant["tool_calls"][0]["function"]
+    function["arguments"] = json.dumps(function["arguments"])
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    _assert_chat_and_responses_messages(
+        client,
+        messages,
+        expected,
+        tools=tools,
+        tool_choice="auto",
+    )
+
+
+@pytest.mark.parametrize(
+    "roles", [("system", "system"), ("system", "developer"), ("developer", "system")]
+)
+def test_chat_and_responses_merge_instruction_messages_identically(client, roles):
+    messages = [
+        {"role": roles[0], "content": "Be concise."},
+        {"role": roles[1], "content": "Preserve exact paths."},
+        {"role": "user", "content": "Say hello."},
+    ]
+    _assert_chat_and_responses_messages(
+        client,
+        messages,
+        [
+            {"role": "system", "content": "Be concise.\n\nPreserve exact paths."},
+            messages[2],
+        ],
+    )
 
 
 def test_responses_endpoint_merges_developer_message_with_instructions(client):

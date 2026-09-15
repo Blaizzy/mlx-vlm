@@ -1,3 +1,4 @@
+import copy
 import json
 
 import pytest
@@ -137,6 +138,57 @@ def test_message_image_stays_on_its_original_user_turn():
     assert normalized[-1]["content"] == [
         {"type": "text", "text": "Second turn", "content": "Second turn"}
     ]
+
+
+def test_message_metadata_survives_image_extraction_without_mutating_input():
+    image_url = "https://example.com/result.png"
+    items = [
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Inspecting."}],
+            "reasoning_content": "Use the saved path.",
+            "reasoning": "Outdated alias.",
+            "tool_calls": [
+                {
+                    "id": "call_saved",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"/src/app.py"}',
+                    },
+                }
+            ],
+        },
+        {
+            "type": "message",
+            "role": "tool",
+            "tool_call_id": "call_saved",
+            "name": "read_file",
+            "content": [
+                {"type": "input_text", "text": "File preview"},
+                {"type": "input_image", "image_url": image_url},
+            ],
+        },
+    ]
+    original = copy.deepcopy(items)
+
+    messages, images = _response_items_to_chat(items)
+
+    assert images == [image_url]
+    assert messages[0]["reasoning_content"] == "Use the saved path."
+    assert messages[0]["reasoning"] == "Use the saved path."
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == {
+        "path": "/src/app.py"
+    }
+    assert messages[1] == {
+        "role": "tool",
+        "tool_call_id": "call_saved",
+        "name": "read_file",
+        "content": "File preview",
+    }
+    assert messages[2] == {"role": "user", "content": [{"type": "image"}]}
+    assert items == original
 
 
 @pytest.mark.parametrize(
