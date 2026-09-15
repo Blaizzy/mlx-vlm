@@ -8,7 +8,7 @@ from mlx_vlm.models.qwen3_omni_moe.audio import AudioModel
 
 from ..base import InputEmbeddingsFeatures
 from .config import ThinkerConfig
-from .language import LanguageModel
+from .language import LanguageModel, expand_deepstack_visual_embeds
 from .vision import VisionModel
 
 
@@ -278,6 +278,24 @@ class Thinker(nn.Module):
         )
         if image_grid_thw is None and video_grid_thw is None and position_ids.ndim == 3:
             position_ids = position_ids[0]
+
+        # Align residuals with token positions for batching and prefill slicing.
+        # Text-only requests use zeros with the same layer and hidden dimensions.
+        if visual_embeds_multiscale:
+            visual_embeds_multiscale = expand_deepstack_visual_embeds(
+                visual_pos_masks, visual_embeds_multiscale, inputs_embeds.dtype
+            )
+        elif self.vision_tower.deepstack_merger_list:
+            visual_embeds_multiscale = mx.broadcast_to(
+                mx.zeros((), dtype=inputs_embeds.dtype),
+                (
+                    *inputs_embeds.shape[:2],
+                    len(self.vision_tower.deepstack_merger_list),
+                    inputs_embeds.shape[-1],
+                ),
+            )
+        else:
+            visual_embeds_multiscale = None
 
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds,

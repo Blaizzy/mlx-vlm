@@ -210,9 +210,11 @@ class Qwen3OmniMoeTest(unittest.TestCase):
         )
         embeds = features.deepstack_visual_embeds
         self.assertIsNotNone(embeds)
-        self.assertEqual(len(embeds), 2)
-        for e in embeds:
-            self.assertEqual(tuple(e.shape), (4, 16))
+        self.assertEqual(embeds.shape, (1, input_ids.shape[1], 2, 16))
+        self.assertEqual(embeds.dtype, features.inputs_embeds.dtype)
+        self.assertFalse(bool(mx.any(embeds[:, :3]).item()))
+        self.assertFalse(bool(mx.any(embeds[:, 7:]).item()))
+        self.assertTrue(bool(mx.any(embeds[:, 3:7]).item()))
 
         with_injection = model(input_ids, pixel_values, image_grid_thw=grid).logits
         model_cls = type(model.thinker.language_model.model)
