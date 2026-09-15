@@ -70,6 +70,38 @@ def test_arrays_cache_roundtrip():
         assert (a is None and b is None) or bool(mx.array_equal(a, b))
 
 
+def test_arrays_snapshot_preserves_batch_masks():
+    source = C.ArraysCache(1, left_padding=[2])
+    source[0] = mx.ones((1, 4))
+    source.lengths = mx.array([3])
+    adapter = A.CheckpointAdapter()
+    restored = C.ArraysCache(1)
+    adapter.restore(restored, adapter.capture(source, 3))
+    assert restored.left_padding.tolist() == [2]
+    assert restored.lengths.tolist() == [3]
+    assert bool(mx.array_equal(restored.make_mask(4), source.make_mask(4)))
+    source[0] = mx.zeros_like(source[0])
+    source.advance(1)
+    assert bool(mx.all(restored[0] == 1))
+    assert restored.left_padding.tolist() == [2]
+
+
+def test_chunked_snapshot_preserves_trimmed_offset():
+    source = C.ChunkedKVCache(chunk_size=4)
+    keys = mx.arange(48, dtype=mx.float32).reshape(1, 1, 6, 8)
+    source.update_and_fetch(keys, keys + 1)
+    source.maybe_trim_front()
+    adapter = A.CheckpointAdapter()
+    restored = C.ChunkedKVCache(chunk_size=4)
+    adapter.restore(restored, adapter.capture(source, 6))
+    assert (restored.offset, restored.start_position) == (6, 2)
+    for actual, expected in zip(
+        restored.update_and_fetch(keys[..., :1, :], keys[..., :1, :] + 1),
+        source.update_and_fetch(keys[..., :1, :], keys[..., :1, :] + 1),
+    ):
+        assert bool(mx.array_equal(actual, expected))
+
+
 def test_apc_mode_layouts():
     assert A.apc_mode([C.KVCache(), C.KVCache()]) == "block"
     assert A.apc_mode([C.KVCache(), C.ArraysCache(2), C.KVCache()]) == "exact"

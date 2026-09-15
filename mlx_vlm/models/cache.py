@@ -535,6 +535,11 @@ class KVCache(_BaseCache):
     def merge(_, caches):
         return BatchKVCache.merge(caches)
 
+    def prefix_cache_merge(self, rows, prefix_lens):
+        if all(type(c) is KVCache for c in rows):
+            return self.merge(rows)
+        return None
+
     def empty(self):
         return self.keys is None
 
@@ -676,6 +681,14 @@ class RotatingKVCache(_BaseCache):
             int,
             v,
         )
+
+    def prefix_cache_snapshot(self):
+        return {"state": (self.keys, self.values), "meta_state": self.meta_state}
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        if all(isinstance(c, RotatingKVCache) for c in rows):
+            return BatchRotatingKVCache.merge(rows)
+        return None
 
     def is_trimmable(self):
         return self.offset < self.max_size
@@ -1082,6 +1095,24 @@ class ArraysCache(_BaseCache):
     def state(self, v):
         self.cache = v
 
+    def prefix_cache_snapshot(self):
+        return {
+            "state": self.state,
+            "meta_state": self.meta_state,
+            "left_padding": self.left_padding,
+            "lengths": self.lengths,
+        }
+
+    def prefix_cache_restore(self, snapshot):
+        super().prefix_cache_restore(snapshot)
+        self.left_padding = snapshot.get("left_padding")
+        self.lengths = snapshot.get("lengths")
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        if all(isinstance(c, ArraysCache) for c in rows):
+            return self.merge(rows)
+        return None
+
     def filter(self, batch_indices):
         """
         In-place filter to keep just the given indices in the cache.
@@ -1272,6 +1303,23 @@ class ChunkedKVCache(_BaseCache):
     @meta_state.setter
     def meta_state(self, v):
         self.chunk_size, self.start_position = map(int, v)
+
+    def prefix_cache_snapshot(self):
+        return {
+            "state": (self.keys, self.values),
+            "meta_state": self.meta_state,
+            "offset": self.offset,
+        }
+
+    def prefix_cache_restore(self, snapshot):
+        self.keys, self.values = snapshot["state"]
+        self.meta_state = snapshot["meta_state"]
+        self.offset = snapshot["offset"]
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        if all(isinstance(c, ChunkedKVCache) for c in rows):
+            return BatchKVCache.merge(rows)
+        return None
 
     def empty(self):
         return self.keys is None
@@ -2765,6 +2813,23 @@ class PoolingCache(_BaseCache):
         obj = cls(meta_state)
         obj.state = state
         return obj
+
+    def prefix_cache_snapshot(self):
+        return {
+            "state": (self.buf_kv, self.buf_gate, self.pooled),
+            "meta_state": self.ratio,
+            "remainder": self.remainder,
+        }
+
+    def prefix_cache_restore(self, snapshot):
+        self.__init__(snapshot["meta_state"])
+        self.buf_kv, self.buf_gate, self.pooled = snapshot["state"]
+        self.remainder = snapshot["remainder"]
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        if all(isinstance(c, PoolingCache) for c in rows):
+            return self.merge(rows, prefix_lens)
+        return None
 
     def is_trimmable(self):
         return self.pooled is None
