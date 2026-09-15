@@ -179,6 +179,18 @@ def _get_role_content(item: Any) -> Union[tuple[str, Any], None]:
     return None
 
 
+def _preserve_message_metadata(
+    original: Any, formatted: Union[str, Dict[str, Any]]
+) -> Union[str, Dict[str, Any]]:
+    """Shallow-copy dictionary fields, with formatter-owned fields taking priority.
+
+    Other input/output shapes retain their existing formatter behavior.
+    """
+    if isinstance(original, dict) and isinstance(formatted, dict):
+        return {**original, **formatted}
+    return formatted
+
+
 def _content_media_count(content: Any, media_types: tuple[str, ...]) -> int:
     if not isinstance(content, list):
         return 0
@@ -848,6 +860,10 @@ def apply_chat_template(
     """
     Apply chat template to prompts.
 
+    Ordinary dictionary messages retain fields not replaced by their dictionary
+    formatter. Values are not coerced; rendering and reasoning-history policy
+    belong to the template. Retained metadata can affect prompts and validation.
+
     Args:
         processor: The processor with chat template functionality
         config: Model configuration
@@ -928,13 +944,16 @@ def apply_chat_template(
         else:
             content = extract_text_from_content(prompt["content"])
             messages.append(
-                get_message_json(
-                    model_type,
-                    content,
-                    role,
-                    num_images=num_images,
-                    num_audios=num_audios,
-                    **kwargs,
+                _preserve_message_metadata(
+                    prompt,
+                    get_message_json(
+                        model_type,
+                        content,
+                        role,
+                        num_images=num_images,
+                        num_audios=num_audios,
+                        **kwargs,
+                    ),
                 )
             )
     elif isinstance(prompt, list):
@@ -1002,17 +1021,20 @@ def apply_chat_template(
                     # Handle multimodal content: extract only text, skip image/audio URLs
                     content = extract_text_from_content(content)
                     messages.append(
-                        get_message_json(
-                            model_type,
-                            content,
-                            role,
-                            skip_image_token=image_counts[i] == 0
-                            or role in ["system", "assistant"],
-                            skip_audio_token=audio_counts[i] == 0
-                            or role in ["system", "assistant"],
-                            num_images=image_counts[i],
-                            num_audios=audio_counts[i],
-                            **kwargs,
+                        _preserve_message_metadata(
+                            p,
+                            get_message_json(
+                                model_type,
+                                content,
+                                role,
+                                skip_image_token=image_counts[i] == 0
+                                or role in ["system", "assistant"],
+                                skip_audio_token=audio_counts[i] == 0
+                                or role in ["system", "assistant"],
+                                num_images=image_counts[i],
+                                num_audios=audio_counts[i],
+                                **kwargs,
+                            ),
                         )
                     )
 
