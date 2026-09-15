@@ -8,11 +8,19 @@ import pytest
 
 from mlx_vlm import apc
 from mlx_vlm.apc import APCManager, DiskBlockStore, _cache_nbytes, from_env
-from mlx_vlm.models.cache import ArraysCache, BatchKVCache, CacheList, KVCache
+from mlx_vlm.models.cache import (
+    ArraysCache,
+    BatchKVCache,
+    CacheList,
+    KVCache,
+    QuantizedKVCache,
+    RotatingKVCache,
+)
 
 
 def _kv(length, value=1):
     cache = KVCache()
+    cache.step = 1  # These synthetic caches allocate exactly the requested length.
     cache.keys = mx.full((1, 1, length, 4), value, dtype=mx.float32)
     cache.values = mx.full((1, 1, length, 4), value + 1, dtype=mx.float32)
     cache.offset = length
@@ -133,6 +141,59 @@ def test_unknown_checkpoint_state_keeps_conservative_growth_estimate(
     manager.prepare_prefill(6001)
     assert manager.resident_bytes() == 0
     assert not manager._make_room()
+
+
+@pytest.mark.parametrize("capacity", [16, 256])
+@pytest.mark.parametrize(
+    "make_cache",
+    [KVCache, QuantizedKVCache, lambda: RotatingKVCache(max_size=512)],
+    ids=["dense", "quantized", "windowed"],
+)
+def test_kv_growth_ignores_unused_capacity(manager_factory, capacity, make_cache):
+    cache = make_cache()
+    cache.step = 1
+    tensor = mx.ones((1, 1, capacity, 64))
+    cache.update_and_fetch(tensor, tensor + 1)
+    cache.trim(capacity - 16)
+    cache.step = 256
+    allocated_bytes = _cache_nbytes(cache)
+    per_token = allocated_bytes // capacity
+    manager = manager_factory(budget=1 << 20)
+    assert manager.store_exact_cache(list(range(16)), [cache])
+
+    manager.prepare_prefill(6000, num_sequences=3)
+    assert manager.stats_snapshot()["prefill_reserve_bytes"] == (
+        2 * (6000 + 3 * 255) * per_token
+    )
+    assert _cache_nbytes(cache) == allocated_bytes
+    assert allocated_bytes == capacity * _cache_nbytes(cache.state) // 16
+
+
+def test_disk_restore_capacity_does_not_inflate_growth(manager_factory):
+    writer = manager_factory(budget=1 << 20, disk=True)
+    cache = _kv(16)
+    cache.step = 256
+    tokens = list(range(16))
+    assert writer.store_exact_cache(tokens, [CacheList(cache)])
+    writer.disk.flush()
+
+    reader = manager_factory(budget=1 << 20, disk=True)
+    restored, count = reader.lookup_exact_cache(tokens + [99] * 6000)
+    assert count == 16 and restored[0][0].keys.shape[2] >= 6016
+    reader.prepare_prefill(6016)
+    assert reader.stats_snapshot()["prefill_reserve_bytes"] == 2 * (6016 + 255) * 32
+
+
+def test_padded_kv_admission_counts_allocated_buffers(manager_factory, monkeypatch):
+    cache = _kv(256)
+    cache.offset = 16
+    manager = manager_factory(budget=1024)
+    monkeypatch.setattr(
+        apc, "_clone_prompt_cache_for_apc", lambda *a, **kw: pytest.fail("cloned")
+    )
+    # The populated 512 bytes fit, but the allocated 8 KiB must still be admitted.
+    assert not manager.store_exact_cache(list(range(16)), [cache])
+    assert manager.stats.memory_skips == 1
 
 
 @pytest.mark.parametrize("budget", [0, 256])

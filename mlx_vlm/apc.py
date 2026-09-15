@@ -118,29 +118,48 @@ def _cache_nbytes(value: Any, seen: Optional[set[int]] = None) -> int:
     )
 
 
-def _cache_fixed_nbytes(value: Any, seen: Optional[set[int]] = None) -> int:
-    """Count known recurrent state without treating opaque checkpoints as fixed.
+def _cache_size_estimate(
+    value: Any, seen: Optional[set[int]] = None
+) -> Tuple[int, int, int]:
+    """Return populated, recurrent, and allocation-padding bytes for prefill.
 
-    ArraysCache holds bounded convolution/recurrent state. Only its live state
-    is fixed: speculative rollback records, if present, are additional buffers.
-    Other checkpoint types may grow with tokens, so retain the linear estimate
-    for those, including windowed and custom caches.
+    Known row KV caches expose their populated offset and buffer capacity.
+    Reserve at most one allocation step of slack per cache, independent of
+    prompt length. Unknown types retain their full, conservative byte estimate.
+    This only reads metadata; physical admission still uses _cache_nbytes.
     """
-    from .models.cache import ArraysCache, CacheList
+    from .models.cache import (
+        ArraysCache,
+        CacheList,
+        KVCache,
+        QuantizedKVCache,
+        RotatingKVCache,
+    )
 
     if value is None:
-        return 0
+        return 0, 0, 0
     seen = set() if seen is None else seen
     if id(value) in seen:
-        return 0
+        return 0, 0, 0
     seen.add(id(value))
     if isinstance(value, (list, tuple)):
-        return sum(_cache_fixed_nbytes(v, seen) for v in value)
+        estimates = [_cache_size_estimate(v, seen) for v in value]
+        return tuple(sum(e[i] for e in estimates) for i in range(3))
     if isinstance(value, CacheList):
-        return _cache_fixed_nbytes(value.caches, seen)
+        return _cache_size_estimate(value.caches, seen)
+    size = _cache_nbytes(value)
     if isinstance(value, ArraysCache):
-        return _cache_nbytes(value.state, seen)
-    return 0
+        # Rollback records, if present, remain additional growing buffers.
+        return size, _cache_nbytes(value.state, seen), 0
+    if type(value) in (KVCache, QuantizedKVCache, RotatingKVCache) and size:
+        keys = value.keys[0] if isinstance(value.keys, tuple) else value.keys
+        capacity = keys.shape[2]
+        if capacity:
+            per_token = size // capacity
+            populated = min(capacity, max(0, value.offset))
+            padding = per_token * max(0, value.step - 1)
+            return per_token * populated, 0, padding
+    return size, 0, 0
 
 
 def _metal_working_set_bytes() -> Optional[int]:
@@ -3211,6 +3230,7 @@ class APCManager:
             ),
         )
         self._fixed_cache_bytes = 0
+        self._cache_padding_bytes = 0
         self._bytes_per_token = 0.0
         self._prefill_reserve_bytes = 0
         self._prefill_tokens = 0
@@ -3351,19 +3371,31 @@ class APCManager:
         if self._prefill_tokens <= 0:
             return 0
         return 2 * int(
-            self._prefill_sequences * self._fixed_cache_bytes
+            self._prefill_sequences
+            * (self._fixed_cache_bytes + self._cache_padding_bytes)
             + self._prefill_tokens * self._bytes_per_token
         )
 
     def _observe_cache_size(
-        self, size: int, token_count: int, *, fixed_bytes: int = 0
+        self,
+        size: int,
+        token_count: int,
+        *,
+        prompt_cache: Optional[Sequence[Any]] = None,
     ) -> None:
         if token_count > 0:
+            populated, fixed_bytes, padding = (
+                (size, 0, 0)
+                if prompt_cache is None
+                else _cache_size_estimate(prompt_cache)
+            )
             with self.lock:
-                fixed_bytes = min(size, max(0, fixed_bytes))
+                populated = min(size, max(0, populated))
+                fixed_bytes = min(populated, max(0, fixed_bytes))
                 self._fixed_cache_bytes = max(self._fixed_cache_bytes, fixed_bytes)
+                self._cache_padding_bytes = max(self._cache_padding_bytes, padding)
                 self._bytes_per_token = max(
-                    self._bytes_per_token, (size - fixed_bytes) / token_count
+                    self._bytes_per_token, (populated - fixed_bytes) / token_count
                 )
                 # The observed live cache already consumes device headroom.
                 # Reserve only the remaining growth/restore footprint.
@@ -3495,7 +3527,7 @@ class APCManager:
                         self._observe_cache_size(
                             size,
                             disk_prefix_len,
-                            fixed_bytes=_cache_fixed_nbytes(prompt_cache),
+                            prompt_cache=prompt_cache,
                         )
                         # Promote the disk-restored entry to the in-memory LRU
                         # so subsequent identical requests get the fast clone
@@ -3579,9 +3611,7 @@ class APCManager:
             return False
         token_tuple = tuple(int(t) for t in token_ids)
         size = _cache_nbytes(prompt_cache)
-        self._observe_cache_size(
-            size, len(token_tuple), fixed_bytes=_cache_fixed_nbytes(prompt_cache)
-        )
+        self._observe_cache_size(size, len(token_tuple), prompt_cache=prompt_cache)
         if self.disk is not None:
             self.disk.flush()
         retain = (
@@ -3739,7 +3769,9 @@ class APCManager:
                 return None, 0
 
         warm_cache = make_warm_kv_cache_from_layers(keys, values, matched_tokens)
-        self._observe_cache_size(_cache_nbytes(warm_cache), matched_tokens)
+        self._observe_cache_size(
+            _cache_nbytes(warm_cache), matched_tokens, prompt_cache=warm_cache
+        )
         # Disk reads and warm-cache construction intentionally happen outside
         # the manager lock. If clear()/reset_stats() races here, the restored
         # tensors are still valid; only the hit counter lands in the new stats
