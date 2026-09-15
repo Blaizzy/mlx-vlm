@@ -147,11 +147,6 @@ def _windowed_memory_profile(c, token_count):
 
 
 class _BaseCache:
-    def memory_profile(self, token_count: int) -> Optional[CacheMemory]:
-        """Only concrete classes declaring a layout opt into growth estimates."""
-        describe = type(self).__dict__.get("_memory_profile")
-        return describe(self, token_count) if describe is not None else None
-
     @property
     def state(self):
         return []
@@ -304,7 +299,7 @@ def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
 
 
 class QuantizedKVCache(_BaseCache):
-    _memory_profile = _kv_memory_profile
+    memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(self, group_size: int = 64, bits: int = 8):
@@ -479,7 +474,7 @@ class QuantizedKVCache(_BaseCache):
 
 
 class KVCache(_BaseCache):
-    _memory_profile = _kv_memory_profile
+    memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(self):
@@ -621,7 +616,7 @@ class KVCache(_BaseCache):
 
 
 class RotatingKVCache(_BaseCache):
-    _memory_profile = _windowed_memory_profile
+    memory_profile = _windowed_memory_profile
     step = 256
 
     def __init__(self, max_size, keep=0):
@@ -818,7 +813,7 @@ class RotatingKVCache(_BaseCache):
 
 
 class ArraysCache(_BaseCache):
-    def _memory_profile(self, token_count):
+    def memory_profile(self, token_count):
         size = cache_nbytes(self)
         fixed = cache_nbytes(self.state)
         return CacheMemory(
@@ -1516,7 +1511,7 @@ def dynamic_roll(x, shifts, axis):
 
 
 class BatchKVCache(_BaseCache):
-    _memory_profile = _kv_memory_profile
+    memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(self, left_padding: List[int]):
@@ -1755,7 +1750,7 @@ class BatchKVCache(_BaseCache):
 
 
 class BatchRotatingKVCache(_BaseCache):
-    _memory_profile = _windowed_memory_profile
+    memory_profile = _windowed_memory_profile
     step = 256
 
     def __init__(self, max_size, left_padding: List[int]):
@@ -2308,7 +2303,7 @@ class BatchQuantizedKVCache(_BaseCache):
     ``Batch.extend`` / ``Batch.filter`` work during continuous-batching.
     """
 
-    _memory_profile = _kv_memory_profile
+    memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(

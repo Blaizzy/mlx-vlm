@@ -140,8 +140,8 @@ class CheckpointAdapter:
     capability = Capability.CHECKPOINT
 
     def memory(self, cache: Any, token_count: int) -> CacheMemory:
-        describe = getattr(cache, "memory_profile", None)
-        profile = describe(token_count) if callable(describe) else None
+        describe = type(cache).__dict__.get("memory_profile")
+        profile = describe(cache, token_count) if callable(describe) else None
         if profile is not None:
             return profile
         size = cache_nbytes(cache)
