@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import json
 import logging
 import math
@@ -1802,39 +1803,27 @@ def _assert_chat_and_responses_messages(client, messages, expected, **extra):
             assert mock_template.call_args.kwargs["tools"] == extra.get("tools"), route
 
 
-@pytest.mark.parametrize("reasoning_field", ["reasoning_content", "reasoning"])
-@pytest.mark.parametrize("content_parts", [False, True])
+@pytest.mark.parametrize("omitted_reasoning", ["reasoning_content", "reasoning"])
+@pytest.mark.parametrize(
+    "content", ["Inspecting.", [{"type": "output_text", "text": "Inspecting."}]]
+)
 def test_chat_and_responses_preserve_same_tool_history(
-    client, reasoning_field, content_parts
+    client, omitted_reasoning, content
 ):
-    call = {
-        "id": "call_saved",
-        "type": "function",
-        "function": {"name": "read_file", "arguments": {"path": "/src/app.py"}},
-    }
-    assistant = {
-        "role": "assistant",
-        "content": "Inspecting.",
-        "reasoning_content": "Check the entry point first.",
-        "reasoning": "Check the entry point first.",
-        "tool_calls": [call],
-    }
-    messages = [
+    expected = [
         {"role": "user", "content": "Where is the entry point?"},
         {
             "role": "assistant",
-            "content": (
-                [{"type": "output_text", "text": "Inspecting."}]
-                if content_parts
-                else "Inspecting."
-            ),
-            reasoning_field: assistant["reasoning_content"],
+            "content": "Inspecting.",
+            "reasoning_content": "Check the entry point first.",
+            "reasoning": "Check the entry point first.",
             "tool_calls": [
                 {
-                    **call,
+                    "id": "call_saved",
+                    "type": "function",
                     "function": {
-                        **call["function"],
-                        "arguments": json.dumps(call["function"]["arguments"]),
+                        "name": "read_file",
+                        "arguments": {"path": "/src/app.py"},
                     },
                 }
             ],
@@ -1847,6 +1836,12 @@ def test_chat_and_responses_preserve_same_tool_history(
         },
         {"role": "user", "content": "Summarize what you learned."},
     ]
+    messages = copy.deepcopy(expected)
+    assistant = messages[1]
+    assistant["content"] = content
+    del assistant[omitted_reasoning]
+    function = assistant["tool_calls"][0]["function"]
+    function["arguments"] = json.dumps(function["arguments"])
     tools = [
         {
             "type": "function",
@@ -1863,7 +1858,7 @@ def test_chat_and_responses_preserve_same_tool_history(
     _assert_chat_and_responses_messages(
         client,
         messages,
-        [messages[0], assistant, messages[2], messages[3]],
+        expected,
         tools=tools,
         tool_choice="auto",
     )
