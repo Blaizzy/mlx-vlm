@@ -34,6 +34,12 @@ def _coordinator(manager, caches):
     return manager.coordinator(SimpleNamespace(make_cache=lambda: caches))
 
 
+def _hybrid(kv, composite=False):
+    state = ArraysCache(1)
+    state[0] = mx.ones((1, 256, 1024))  # 1 MiB fixed state.
+    return [CacheList(state, kv)] if composite else [state, kv]
+
+
 @pytest.fixture
 def manager_factory(monkeypatch, tmp_path):
     monkeypatch.setenv("APC_CHECKPOINT_ENTRIES", "16")
@@ -52,6 +58,19 @@ def manager_factory(monkeypatch, tmp_path):
     yield make
     for manager in managers:
         manager.close()
+
+
+@pytest.fixture
+def disk_reader(manager_factory):
+    """Seed a disk checkpoint and return a manager with no resident entries."""
+
+    def make(tokens, caches, *, budget=1 << 20):
+        writer = manager_factory(budget=budget, disk=True)
+        assert writer.store_exact_cache(tokens, caches)
+        writer.disk.flush()
+        return manager_factory(budget=budget, disk=True)
+
+    return make
 
 
 def test_exact_resident_bytes_and_byte_lru(manager_factory):
@@ -93,21 +112,16 @@ def test_short_hybrid_checkpoint_does_not_block_long_batch_reuse(
     manager_factory, monkeypatch, composite
 ):
     def make_cache(length=0):
-        state = ArraysCache(1)
-        state[0] = mx.ones((1, 256, 1024), dtype=mx.float32)  # 1 MiB fixed state.
-        kv = BatchKVCache.merge([_kv(length)])
-        return [CacheList(state, kv)] if composite else [state, kv]
+        return _hybrid(BatchKVCache.merge([_kv(length)]), composite)
 
-    manager = manager_factory(budget=4 << 20, disk=True)
+    manager = manager_factory(budget=4 << 20)
     monkeypatch.setattr(
         manager, "_memory_headroom", lambda: (8 << 20) - manager.resident_bytes()
     )
     coordinator = manager.coordinator(SimpleNamespace(make_cache=make_cache))
-    coordinator.prepare_prefill(19)
-    assert coordinator.store_checkpoint(list(range(18)), make_cache(18))
-    tokens = [42] * 6000
-    coordinator.prepare_prefill(6001)
-    assert coordinator.store_checkpoint(tokens, make_cache(6000))
+    for tokens in (list(range(18)), [42] * 6000):
+        coordinator.prepare_prefill(len(tokens) + 1)
+        assert coordinator.store_checkpoint(tokens, make_cache(len(tokens)))
     coordinator.prepare_prefill(6001)
     restored, count = manager.lookup_exact_cache(tokens + [9])
     assert restored is not None and count == 6000
@@ -115,15 +129,11 @@ def test_short_hybrid_checkpoint_does_not_block_long_batch_reuse(
     assert manager.stats.memory_skips == 0
 
 
-def test_disk_fixed_state_reserve_counts_every_prefill_sequence(manager_factory):
+def test_disk_fixed_state_reserve_counts_every_prefill_sequence(disk_reader):
     state = ArraysCache(1)
     state[0] = mx.ones((1, 256, 1024), dtype=mx.float32)
     tokens = list(range(18))
-    writer = manager_factory(budget=4 << 20, disk=True)
-    assert writer.store_exact_cache(tokens, [state])
-    writer.disk.flush()
-
-    manager = manager_factory(budget=4 << 20, disk=True)
+    manager = disk_reader(tokens, [state], budget=4 << 20)
     assert manager.lookup_exact_cache(tokens + [99])[1] == len(tokens)
     coordinator = _coordinator(manager, [state])
     coordinator.prepare_prefill([2000, 2000, 2000])
@@ -178,15 +188,11 @@ def test_kv_growth_ignores_unused_capacity(manager_factory, capacity, make_cache
     assert allocated_bytes == capacity * _cache_nbytes(cache.state) // 16
 
 
-def test_disk_restore_capacity_does_not_inflate_growth(manager_factory):
-    writer = manager_factory(budget=1 << 20, disk=True)
+def test_disk_restore_capacity_does_not_inflate_growth(disk_reader):
     cache = _kv(16)
     cache.step = 256
     tokens = list(range(16))
-    assert writer.store_exact_cache(tokens, [CacheList(cache)])
-    writer.disk.flush()
-
-    reader = manager_factory(budget=1 << 20, disk=True)
+    reader = disk_reader(tokens, [CacheList(cache)])
     restored, count = reader.lookup_exact_cache(tokens + [99] * 6000)
     assert count == 16 and restored[0][0].keys.shape[2] >= 6016
     coordinator = _coordinator(reader, restored)
@@ -197,19 +203,15 @@ def test_disk_restore_capacity_does_not_inflate_growth(manager_factory):
 @pytest.mark.parametrize("disk", [False, True])
 @pytest.mark.parametrize("composite", [False, True])
 def test_short_hybrid_checkpoint_extends_with_bounded_memory(
-    manager_factory, monkeypatch, disk, composite
+    manager_factory, disk_reader, monkeypatch, disk, composite
 ):
-    state = ArraysCache(1)
-    state[0] = mx.ones((1, 256, 1024))  # 1 MiB fixed state.
-    entries = [state, _kv(18)]
-    if composite:
-        entries = [CacheList(*entries)]
-    writer = manager_factory(budget=4 << 20, disk=disk)
+    entries = _hybrid(_kv(18), composite)
     tokens = list(range(18))
-    assert writer.store_exact_cache(tokens, entries)
     if disk:
-        writer.disk.flush()
-    reader = manager_factory(budget=4 << 20, disk=True) if disk else writer
+        reader = disk_reader(tokens, entries, budget=4 << 20)
+    else:
+        reader = manager_factory(budget=4 << 20)
+        assert reader.store_exact_cache(tokens, entries)
     coordinator = _coordinator(reader, entries)
     monkeypatch.setattr(reader, "_memory_headroom", lambda: 8 << 20)
     coordinator.prepare_prefill(6001)
@@ -218,21 +220,17 @@ def test_short_hybrid_checkpoint_extends_with_bounded_memory(
 
     assert matched == 18
     leaves = restored[0].caches if composite else restored
+    expected = entries[0].caches if composite else entries
     assert leaves[1].keys.shape[2] >= 6001
-    assert mx.array_equal(leaves[0][0], state[0]).item()
+    assert mx.array_equal(leaves[0][0], expected[0][0]).item()
     assert _cache_nbytes(restored) < 2 << 20
     assert reader.stats.memory_skips == 0
     assert reader.stats.disk_hits == int(disk)
 
 
-def test_disk_expansion_is_admitted_before_reserving_capacity(
-    manager_factory, monkeypatch
-):
-    writer = manager_factory(disk=True)
+def test_disk_expansion_is_admitted_before_reserving_capacity(disk_reader, monkeypatch):
     tokens = list(range(16))
-    assert writer.store_exact_cache(tokens, [_kv(16)])
-    writer.disk.flush()
-    reader = manager_factory(disk=True)
+    reader = disk_reader(tokens, [_kv(16)], budget=4096)
     monkeypatch.setattr(reader, "_memory_headroom", lambda: 4096)
     monkeypatch.setattr(
         KVCache, "prefix_cache_reserve", lambda *a: pytest.fail("expanded")
@@ -241,13 +239,9 @@ def test_disk_expansion_is_admitted_before_reserving_capacity(
     assert reader.stats.memory_skips == 1
 
 
-def test_rejected_disk_expansion_falls_back_to_memory(manager_factory, monkeypatch):
+def test_rejected_disk_expansion_falls_back_to_memory(disk_reader, monkeypatch):
     tokens = list(range(1024))
-    writer = manager_factory(budget=1 << 20, disk=True)
-    assert writer.store_exact_cache(tokens[:32], [_kv(32)])
-    writer.disk.flush()
-
-    reader = manager_factory(budget=1 << 20, disk=True)
+    reader = disk_reader(tokens[:32], [_kv(32)])
     assert reader.store_exact_cache(tokens[:16], [_kv(16)])
     coordinator = _coordinator(reader, [KVCache()])
     coordinator.prepare_prefill(len(tokens))
