@@ -218,6 +218,46 @@ def _clone(c):
     return out
 
 
+@pytest.mark.parametrize("length", [0, 4, 48])
+def test_buffered_rotating_snapshot_continuation(length):
+    source = C.BufferedRotatingKVCache(max_size=8, buffer_size=3)
+    for token in range(length):
+        keys = mx.full((1, 1, 1, 4), token, dtype=mx.float32)
+        source.update_and_fetch(keys, keys + 1)
+    restored = _clone(source)
+    assert restored.meta_state == source.meta_state
+
+    for count in (3, 12, 1):
+        assert mx.array_equal(
+            restored.make_mask(2, return_array=True),
+            source.make_mask(2, return_array=True),
+        ).item()
+        keys = mx.random.normal((1, 1, count, 4))
+        for actual, expected in zip(
+            restored.update_and_fetch(keys, keys + 1),
+            source.update_and_fetch(keys, keys + 1),
+        ):
+            assert mx.array_equal(actual, expected).item()
+        restored.trim(1)
+        source.trim(1)
+        assert restored.meta_state == source.meta_state
+
+
+@pytest.mark.parametrize("used_slot", [None, 0, 1])
+def test_arrays_merge_preserves_optional_state(used_slot):
+    rows = [C.ArraysCache(2) for _ in range(3)]
+    if used_slot is not None:
+        rows[0][used_slot] = mx.ones((1, 4))
+        rows[2][used_slot] = mx.full((1, 4), 2.0)
+    merged = A.merge_cache_entries(rows, [4, 0, 4])
+    if used_slot is None:
+        assert merged.cache == [None, None]
+        assert merged.left_padding.tolist() == [0, 0, 0]
+    else:
+        assert merged[1 - used_slot] is None
+        assert merged[used_slot].tolist() == [[1] * 4, [0] * 4, [2] * 4]
+
+
 def test_ring_sliding_clone_roundtrip():
     from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 

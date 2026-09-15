@@ -756,6 +756,10 @@ class RotatingKVCache(_BaseCache):
     def prefix_cache_snapshot(self):
         return {"state": (self.keys, self.values), "meta_state": self.meta_state}
 
+    def prefix_cache_restore(self, snapshot):
+        self.keys, self.values = snapshot["state"]
+        self.meta_state = snapshot["meta_state"]
+
     def prefix_cache_merge(self, rows, prefix_lens):
         if all(isinstance(c, RotatingKVCache) for c in rows):
             return BatchRotatingKVCache.merge(rows)
@@ -1269,12 +1273,14 @@ class ArraysCache(_BaseCache):
         cache = cls(n_state)
 
         # All caches are empty so return early
-        if all(c.empty() for c in caches):
+        if all(state is None for c in caches for state in c.cache):
             cache.left_padding = mx.array([0] * B)
             return cache
 
         for e in range(n_state):
-            c_init = next(iter(c[e] for c in caches if c[e] is not None))
+            c_init = next((c[e] for c in caches if c[e] is not None), None)
+            if c_init is None:
+                continue
             shape = list(c_init.shape)
             shape[0] = B
             cache[e] = mx.zeros(shape, c_init.dtype)
