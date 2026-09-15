@@ -250,6 +250,7 @@ def test_arrays_merge_preserves_optional_state(used_slot):
         rows[0][used_slot] = mx.ones((1, 4))
         rows[2][used_slot] = mx.full((1, 4), 2.0)
     merged = A.merge_cache_entries(rows, [4, 0, 4])
+    assert merged.empty() is (used_slot is None)
     if used_slot is None:
         assert merged.cache == [None, None]
         assert merged.left_padding.tolist() == [0, 0, 0]

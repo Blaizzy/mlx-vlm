@@ -1273,7 +1273,7 @@ class ArraysCache(_BaseCache):
         cache = cls(n_state)
 
         # All caches are empty so return early
-        if all(state is None for c in caches for state in c.cache):
+        if all(c.empty() for c in caches):
             cache.left_padding = mx.array([0] * B)
             return cache
 
@@ -1291,7 +1291,7 @@ class ArraysCache(_BaseCache):
         return cache
 
     def empty(self):
-        return self.cache[0] is None
+        return all(state is None for state in self.cache)
 
     @property
     def nbytes(self):
