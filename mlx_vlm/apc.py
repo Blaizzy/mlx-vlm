@@ -61,7 +61,8 @@ import mlx.core as mx
 import numpy as np
 
 from ._stream_cleanup import clear_mlx_streams
-from .apc_coordinator import APCCoordinator
+from .apc_adapters import reserve_checkpoint_capacity
+from .apc_coordinator import APCCoordinator, PrefillMemoryPlan
 from .apc_storage import APCNode, ComponentId, StateHandle
 from .kv_quant import from_config as kv_quant_from_config
 from .kv_quant import kv_quant_fingerprint
@@ -116,50 +117,6 @@ def _cache_nbytes(value: Any, seen: Optional[set[int]] = None) -> int:
     return _cache_nbytes(getattr(value, "state", None), seen) + _cache_nbytes(
         getattr(value, "meta_state", None), seen
     )
-
-
-def _cache_size_estimate(
-    value: Any, seen: Optional[set[int]] = None
-) -> Tuple[int, int, int]:
-    """Return populated, recurrent, and allocation-padding bytes for prefill.
-
-    Known row KV caches expose their populated offset and buffer capacity.
-    Reserve at most one allocation step of slack per cache, independent of
-    prompt length. Unknown types retain their full, conservative byte estimate.
-    This only reads metadata; physical admission still uses _cache_nbytes.
-    """
-    from .models.cache import (
-        ArraysCache,
-        CacheList,
-        KVCache,
-        QuantizedKVCache,
-        RotatingKVCache,
-    )
-
-    if value is None:
-        return 0, 0, 0
-    seen = set() if seen is None else seen
-    if id(value) in seen:
-        return 0, 0, 0
-    seen.add(id(value))
-    if isinstance(value, (list, tuple)):
-        estimates = [_cache_size_estimate(v, seen) for v in value]
-        return tuple(sum(e[i] for e in estimates) for i in range(3))
-    if isinstance(value, CacheList):
-        return _cache_size_estimate(value.caches, seen)
-    size = _cache_nbytes(value)
-    if isinstance(value, ArraysCache):
-        # Rollback records, if present, remain additional growing buffers.
-        return size, _cache_nbytes(value.state, seen), 0
-    if type(value) in (KVCache, QuantizedKVCache, RotatingKVCache) and size:
-        keys = value.keys[0] if isinstance(value.keys, tuple) else value.keys
-        capacity = keys.shape[2]
-        if capacity:
-            per_token = size // capacity
-            populated = min(capacity, max(0, value.offset))
-            padding = per_token * max(0, value.step - 1)
-            return per_token * populated, 0, padding
-    return size, 0, 0
 
 
 def _metal_working_set_bytes() -> Optional[int]:
@@ -1803,6 +1760,7 @@ class DiskBlockStore:
             c.keys = k
             c.values = v
             c.offset = off
+            c.step = step
             eval_targets.extend([k, v])
             return c
 
@@ -3229,12 +3187,8 @@ class APCManager:
                 * (1 << 30)
             ),
         )
-        self._fixed_cache_bytes = 0
-        self._cache_padding_bytes = 0
-        self._bytes_per_token = 0.0
+        self.memory_plan = PrefillMemoryPlan()
         self._prefill_reserve_bytes = 0
-        self._prefill_tokens = 0
-        self._prefill_sequences = 1
 
     def _record_disk_writes(self, count: int) -> None:
         with self.lock:
@@ -3367,54 +3321,11 @@ class APCManager:
             and self._memory_headroom() >= required
         )
 
-    def _estimated_prefill_bytes(self) -> int:
-        if self._prefill_tokens <= 0:
-            return 0
-        return 2 * int(
-            self._prefill_sequences
-            * (self._fixed_cache_bytes + self._cache_padding_bytes)
-            + self._prefill_tokens * self._bytes_per_token
-        )
-
-    def _observe_cache_size(
-        self,
-        size: int,
-        token_count: int,
-        *,
-        prompt_cache: Optional[Sequence[Any]] = None,
-    ) -> None:
-        if token_count > 0:
-            populated, fixed_bytes, padding = (
-                (size, 0, 0)
-                if prompt_cache is None
-                else _cache_size_estimate(prompt_cache)
-            )
-            with self.lock:
-                populated = min(size, max(0, populated))
-                fixed_bytes = min(populated, max(0, fixed_bytes))
-                self._fixed_cache_bytes = max(self._fixed_cache_bytes, fixed_bytes)
-                self._cache_padding_bytes = max(self._cache_padding_bytes, padding)
-                self._bytes_per_token = max(
-                    self._bytes_per_token, (populated - fixed_bytes) / token_count
-                )
-                # The observed live cache already consumes device headroom.
-                # Reserve only the remaining growth/restore footprint.
-                self._prefill_reserve_bytes = max(
-                    0, self._estimated_prefill_bytes() - size
-                )
-
-    def prepare_prefill(self, token_count: int, *, num_sequences: int = 1) -> None:
-        """Make room for the incoming request before lookup, embeddings or prefill.
-
-        Reserve two cache footprints for growth/restore temporaries in addition
-        to the device headroom. Keep this conservative reserve during snapshot
-        admission, so intermediate checkpoints cannot refill the space we freed.
-        """
+    def prepare_prefill(self, reserve_bytes: int) -> None:
+        """Enforce the coordinator's byte budget before new allocations."""
         if self.disk is not None:
             self.disk.flush()
-        self._prefill_tokens = max(0, token_count)
-        self._prefill_sequences = max(1, num_sequences)
-        self._prefill_reserve_bytes = self._estimated_prefill_bytes()
+        self._prefill_reserve_bytes = max(0, int(reserve_bytes))
         self._make_room()
 
     # ---------- Public API ----------
@@ -3499,12 +3410,9 @@ class APCManager:
             )
             if disk_match is not None:
                 cache_hash, disk_prefix_len = disk_match
-                # Include capacity for an extending prompt and temporary read /
-                # padding buffers, including the first restore after a restart.
-                restore_bytes = int(
-                    disk.exact_cache_bytes(cache_hash)
-                    * max(1, prompt_capacity_tokens / disk_prefix_len)
-                )
+                # Admit the stored buffers first. Once loaded, the adapters can
+                # budget expansion from their actual layouts, even after restart.
+                restore_bytes = disk.exact_cache_bytes(cache_hash)
                 if not self._make_room(2 * restore_bytes):
                     with self.lock:
                         self.stats.memory_skips += 1
@@ -3513,7 +3421,6 @@ class APCManager:
                 cache_hash, disk_prefix_len = disk_match
                 loaded = disk.load_exact_cache(
                     cache_hash,
-                    min_capacity_tokens=prompt_capacity_tokens,
                     prefix_len=disk_prefix_len,
                 )
                 if loaded is not None:
@@ -3524,10 +3431,29 @@ class APCManager:
                         and token_tuple[:disk_prefix_len] == stored_tokens
                     ):
                         size = _cache_nbytes(prompt_cache)
-                        self._observe_cache_size(
-                            size,
-                            disk_prefix_len,
-                            prompt_cache=prompt_cache,
+                        self.memory_plan.observe_cache(prompt_cache, disk_prefix_len)
+                        self._prefill_reserve_bytes = self.memory_plan.reserve_bytes(
+                            size
+                        )
+                        expanded_bytes = self.memory_plan.restore_bytes(
+                            prompt_cache, disk_prefix_len, prompt_capacity_tokens
+                        )
+                        if not self._make_room(2 * expanded_bytes):
+                            with self.lock:
+                                self.stats.memory_skips += 1
+                            return None, 0
+                        eval_targets = []
+                        for entry in prompt_cache:
+                            reserve_checkpoint_capacity(
+                                entry,
+                                min_capacity_tokens=prompt_capacity_tokens,
+                                eval_targets=eval_targets,
+                            )
+                        if eval_targets:
+                            mx.eval(eval_targets)
+                        size = _cache_nbytes(prompt_cache)
+                        self._prefill_reserve_bytes = self.memory_plan.reserve_bytes(
+                            size
                         )
                         # Promote the disk-restored entry to the in-memory LRU
                         # so subsequent identical requests get the fast clone
@@ -3578,8 +3504,8 @@ class APCManager:
 
         if source_cache is None:
             return None, 0
-        restore_bytes = int(
-            _cache_nbytes(source_cache) * max(1, prompt_capacity_tokens / prefix_len)
+        restore_bytes = self.memory_plan.restore_bytes(
+            source_cache, prefix_len, prompt_capacity_tokens
         )
         if not self._make_room(restore_bytes):
             with self.lock:
@@ -3611,7 +3537,8 @@ class APCManager:
             return False
         token_tuple = tuple(int(t) for t in token_ids)
         size = _cache_nbytes(prompt_cache)
-        self._observe_cache_size(size, len(token_tuple), prompt_cache=prompt_cache)
+        self.memory_plan.observe_cache(prompt_cache, len(token_tuple))
+        self._prefill_reserve_bytes = self.memory_plan.reserve_bytes(size)
         if self.disk is not None:
             self.disk.flush()
         retain = (
@@ -3769,8 +3696,9 @@ class APCManager:
                 return None, 0
 
         warm_cache = make_warm_kv_cache_from_layers(keys, values, matched_tokens)
-        self._observe_cache_size(
-            _cache_nbytes(warm_cache), matched_tokens, prompt_cache=warm_cache
+        self.memory_plan.observe_cache(warm_cache, matched_tokens)
+        self._prefill_reserve_bytes = self.memory_plan.reserve_bytes(
+            _cache_nbytes(warm_cache)
         )
         # Disk reads and warm-cache construction intentionally happen outside
         # the manager lock. If clear()/reset_stats() races here, the restored
@@ -3830,7 +3758,8 @@ class APCManager:
         Returns newly acquired blocks (caller must release).
         """
         size = _cache_nbytes(layer_keys + layer_values)
-        self._observe_cache_size(size, len(token_ids))
+        self.memory_plan.observe_kv(layer_keys, layer_values)
+        self._prefill_reserve_bytes = self.memory_plan.reserve_bytes(size)
         # Reserve no more than the pool can retain. Larger requests continue
         # directly to disk once the byte budget is exhausted.
         per_token_bytes = size / max(1, layer_keys[0].shape[2]) if layer_keys else 0
