@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import json
 import logging
 import math
@@ -8238,3 +8239,166 @@ class TestSTTSegmentSerialization:
         assert data["segments"] == [
             {"id": 0, "start": 0.0, "end": 0.5, "text": "hello"}
         ]
+
+
+import copy
+
+
+def test_compaction_instruction_is_appended_last_and_caller_is_untouched():
+    from mlx_vlm.server.compaction import (
+        SUMMARIZATION_INSTRUCTION,
+        append_summarization_instruction,
+    )
+
+    items = [
+        {"role": "user", "content": "FIRST"},
+        {"role": "assistant", "content": "SECOND"},
+    ]
+    original = copy.deepcopy(items)
+    result = append_summarization_instruction(items)
+
+    assert len(result) == len(items) + 1
+    assert result[:2] == original
+    assert result[-1]["role"] == "user"
+    assert SUMMARIZATION_INSTRUCTION in result[-1]["content"][0]["text"]
+    assert items == original
+
+
+def test_compaction_instruction_is_overridable():
+    from mlx_vlm.server.compaction import append_summarization_instruction
+
+    result = append_summarization_instruction(
+        [{"role": "user", "content": "X"}], "CUSTOM"
+    )
+    assert result[-1]["content"][0]["text"] == "CUSTOM"
+
+
+def test_replacement_fit_check():
+    from mlx_vlm.server.compaction import replacement_fits
+
+    assert replacement_fits(100, 4096, 512)
+    assert not replacement_fits(4000, 4096, 512)
+    assert replacement_fits(10**9, None, 512)
+    assert replacement_fits(10**9, 0, 512)
+
+
+def test_compaction_envelope_shape():
+    from mlx_vlm.server.compaction import compaction_response
+
+    envelope = compaction_response(
+        "resp_1", "cmp_1", 1789084800, "SUMMARY", {"total_tokens": 4}
+    )
+
+    assert envelope["object"] == "response.compaction"
+    assert envelope["id"] == "resp_1"
+    assert envelope["created_at"] == 1789084800
+    assert len(envelope["output"]) == 1
+    assert envelope["output"][0]["type"] == "compaction"
+    assert envelope["output"][0]["content"] == "SUMMARY"
+    assert envelope["usage"] == {"total_tokens": 4}
+
+
+@pytest.mark.parametrize(
+    "input_value", ["", " \n\t ", [], [{"role": "user", "content": ""}]]
+)
+def test_compact_endpoint_rejects_empty_effective_input(client, input_value):
+    with patch.object(server_openai, "get_cached_model") as mock_get_cached_model:
+        response = client.post(
+            "/v1/responses/compact", json={"model": "demo", "input": input_value}
+        )
+
+    assert response.status_code == 400
+    mock_get_cached_model.assert_not_called()
+
+
+def test_compaction_prompt_extends_the_preceding_prompt():
+    """The summarization turn must not disturb the prefix the cache holds."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    from mlx_vlm.prompt_utils import get_chat_template
+    from mlx_vlm.server.compaction import SUMMARIZATION_INSTRUCTION
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]")),
+        unk_token="[UNK]",
+        chat_template=(
+            "{% for message in messages %}"
+            "{{ '<' + message['role'] + '>' + message['content'] + '</' + message['role'] + '>' }}"
+            "{% endfor %}"
+            "{% if add_generation_prompt %}{{ '<assistant>' }}{% endif %}"
+        ),
+    )
+    history = [
+        {"role": "system", "content": "SYSTEM"},
+        {"role": "user", "content": "QUESTION"},
+    ]
+    answered = history + [{"role": "assistant", "content": "ANSWER"}]
+
+    preceding = get_chat_template(tokenizer, history, True)
+    compaction = get_chat_template(
+        tokenizer,
+        answered + [{"role": "user", "content": SUMMARIZATION_INSTRUCTION}],
+        True,
+    )
+
+    assert compaction.startswith(preceding)
+
+
+def test_summarization_instruction_reaches_the_model_as_the_last_turn():
+    from mlx_vlm.server.compaction import (
+        SUMMARIZATION_INSTRUCTION,
+        append_summarization_instruction,
+    )
+    from mlx_vlm.server.responses_state import (
+        _normalize_response_input,
+        _response_items_to_chat,
+    )
+
+    items = _normalize_response_input(
+        [
+            {"role": "user", "content": "Port it."},
+            {"role": "assistant", "content": "Ok."},
+        ]
+    )
+    chat_messages, _ = _response_items_to_chat(append_summarization_instruction(items))
+
+    assert len(chat_messages) == len(items) + 1
+    assert SUMMARIZATION_INSTRUCTION[:40] in str(chat_messages[-1]["content"])
+
+
+def test_truncated_summary_is_refused(client):
+    from types import SimpleNamespace
+
+    result = SimpleNamespace(
+        text="half a summ",
+        prompt_tokens=100,
+        generation_tokens=8,
+        finish_reason="length",
+    )
+    with (
+        patch.object(
+            server_openai,
+            "get_cached_model",
+            return_value=(object(), SimpleNamespace(), SimpleNamespace()),
+        ),
+        patch.object(
+            server_openai,
+            "_build_gen_args",
+            return_value=SimpleNamespace(
+                max_tokens=8,
+                to_template_kwargs=lambda: {},
+                to_generate_kwargs=lambda: {},
+            ),
+        ),
+        patch.object(server_openai, "apply_chat_template", return_value="prompt"),
+        patch.object(server_openai, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/v1/responses/compact",
+            json={"model": "demo", "input": [{"role": "user", "content": "hello"}]},
+        )
+
+    assert response.status_code == 422
+    assert "max_output_tokens" in response.json()["detail"]
