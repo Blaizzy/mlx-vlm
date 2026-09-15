@@ -102,6 +102,20 @@ def test_chunked_snapshot_preserves_trimmed_offset():
         assert bool(mx.array_equal(actual, expected))
 
 
+def test_custom_kv_memory_includes_auxiliary_state():
+    class CustomKV(C.KVCache):
+        @property
+        def nbytes(self):
+            return super().nbytes + self.auxiliary.nbytes
+
+    source = CustomKV()
+    source.auxiliary = mx.ones((32,))
+    source.update_and_fetch(mx.ones((1, 1, 16, 4)), mx.ones((1, 1, 16, 4)))
+    profile = A.cache_memory_components([source], 16)[0]
+    assert profile.fallback
+    assert profile.bytes_per_token == source.nbytes / 16
+
+
 def test_apc_mode_layouts():
     assert A.apc_mode([C.KVCache(), C.KVCache()]) == "block"
     assert A.apc_mode([C.KVCache(), C.ArraysCache(2), C.KVCache()]) == "exact"

@@ -66,6 +66,7 @@ from .apc_coordinator import APCCoordinator, PrefillMemoryPlan
 from .apc_storage import APCNode, ComponentId, StateHandle
 from .kv_quant import from_config as kv_quant_from_config
 from .kv_quant import kv_quant_fingerprint
+from .models.cache import cache_nbytes as _cache_nbytes
 
 logger = logging.getLogger("mlx_vlm.apc")
 
@@ -94,29 +95,6 @@ def _setting(overrides: Optional[dict], key: str, env: str, default: Any) -> Any
         value = overrides[key]
         return default if value is None else value
     return os.environ.get(env, default)
-
-
-def _cache_nbytes(value: Any, seen: Optional[set[int]] = None) -> int:
-    """Account cache buffers without evaluating or cloning their contents."""
-    if value is None:
-        return 0
-    seen = set() if seen is None else seen
-    if id(value) in seen:
-        return 0
-    seen.add(id(value))
-    if isinstance(value, dict):
-        return sum(_cache_nbytes(v, seen) for v in value.values())
-    if isinstance(value, (list, tuple)):
-        return sum(_cache_nbytes(v, seen) for v in value)
-    try:
-        size = value.nbytes
-        if isinstance(size, int):
-            return size
-    except (AttributeError, NotImplementedError):
-        pass
-    return _cache_nbytes(getattr(value, "state", None), seen) + _cache_nbytes(
-        getattr(value, "meta_state", None), seen
-    )
 
 
 def _metal_working_set_bytes() -> Optional[int]:

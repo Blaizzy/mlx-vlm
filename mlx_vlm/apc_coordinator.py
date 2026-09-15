@@ -12,11 +12,11 @@ from dataclasses import replace
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 from .apc_adapters import (
-    CacheMemory,
     PrefixCachePlan,
     build_prefix_cache_plan,
     cache_memory_components,
 )
+from .models.cache import CacheMemory
 
 
 class PrefillMemoryPlan:

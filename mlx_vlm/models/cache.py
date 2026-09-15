@@ -1,8 +1,10 @@
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, replace
+from math import ceil
+from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
+from mlx.utils import tree_map, tree_reduce
 
 
 def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:
@@ -83,7 +85,73 @@ def create_attention_mask(
         return "causal"
 
 
+@dataclass(frozen=True)
+class CacheMemory:
+    """One row's allocation policy, measured without copying cache tensors."""
+
+    source_bytes: int = 0
+    fixed_bytes: int = 0
+    bytes_per_token: float = 0
+    step: int = 1
+    window_size: Optional[int] = None
+    fallback: bool = False
+
+    def footprint(self, tokens: int, chunk_size: Optional[int] = None) -> int:
+        if tokens <= 0:
+            return 0
+        if self.window_size is not None and chunk_size is not None:
+            tokens = min(tokens, self.window_size - 1 + chunk_size)
+        step = max(1, self.step)
+        capacity = ((tokens + step - 1) // step) * step
+        return self.fixed_bytes + ceil(capacity * self.bytes_per_token)
+
+
+def cache_nbytes(value: Any, seen: Optional[set[int]] = None) -> int:
+    """Account cache buffers without evaluating or cloning their contents."""
+    if value is None:
+        return 0
+    seen = set() if seen is None else seen
+    if id(value) in seen:
+        return 0
+    seen.add(id(value))
+    if isinstance(value, dict):
+        return sum(cache_nbytes(v, seen) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(cache_nbytes(v, seen) for v in value)
+    try:
+        size = value.nbytes
+        if isinstance(size, int):
+            return size
+    except (AttributeError, NotImplementedError):
+        pass
+    return cache_nbytes(getattr(value, "state", None), seen) + cache_nbytes(
+        getattr(value, "meta_state", None), seen
+    )
+
+
+def _kv_memory_profile(c, token_count):
+    if c.keys is None:
+        return CacheMemory()
+    keys = c.keys[0] if isinstance(c.keys, tuple) else c.keys
+    capacity = keys.shape[2]
+    size = cache_nbytes(c.keys) + cache_nbytes(c.values)
+    return CacheMemory(
+        source_bytes=size,
+        bytes_per_token=size / capacity if capacity else 0,
+        step=c.step,
+    )
+
+
+def _windowed_memory_profile(c, token_count):
+    return replace(_kv_memory_profile(c, token_count), window_size=c.max_size)
+
+
 class _BaseCache:
+    def memory_profile(self, token_count: int) -> Optional[CacheMemory]:
+        """Only concrete classes declaring a layout opt into growth estimates."""
+        describe = type(self).__dict__.get("_memory_profile")
+        return describe(self, token_count) if describe is not None else None
+
     @property
     def state(self):
         return []
@@ -236,6 +304,7 @@ def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
 
 
 class QuantizedKVCache(_BaseCache):
+    _memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(self, group_size: int = 64, bits: int = 8):
@@ -410,6 +479,7 @@ class QuantizedKVCache(_BaseCache):
 
 
 class KVCache(_BaseCache):
+    _memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(self):
@@ -551,6 +621,7 @@ class KVCache(_BaseCache):
 
 
 class RotatingKVCache(_BaseCache):
+    _memory_profile = _windowed_memory_profile
     step = 256
 
     def __init__(self, max_size, keep=0):
@@ -743,6 +814,15 @@ class RotatingKVCache(_BaseCache):
 
 
 class ArraysCache(_BaseCache):
+    def _memory_profile(self, token_count):
+        size = cache_nbytes(self)
+        fixed = cache_nbytes(self.state)
+        return CacheMemory(
+            source_bytes=size,
+            fixed_bytes=fixed,
+            bytes_per_token=max(0, size - fixed) / max(1, token_count),
+        )
+
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
         instance._left_padding = None
@@ -1430,6 +1510,7 @@ def dynamic_roll(x, shifts, axis):
 
 
 class BatchKVCache(_BaseCache):
+    _memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(self, left_padding: List[int]):
@@ -1668,6 +1749,7 @@ class BatchKVCache(_BaseCache):
 
 
 class BatchRotatingKVCache(_BaseCache):
+    _memory_profile = _windowed_memory_profile
     step = 256
 
     def __init__(self, max_size, left_padding: List[int]):
@@ -2220,6 +2302,7 @@ class BatchQuantizedKVCache(_BaseCache):
     ``Batch.extend`` / ``Batch.filter`` work during continuous-batching.
     """
 
+    _memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(
