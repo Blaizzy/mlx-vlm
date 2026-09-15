@@ -1778,6 +1778,149 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     assert mock_generate.call_args.kwargs["thinking_end_token"] == "</think>"
 
 
+@pytest.mark.parametrize("reasoning_field", ["reasoning_content", "reasoning"])
+@pytest.mark.parametrize("content_parts", [False, True])
+def test_chat_and_responses_preserve_same_tool_history(
+    client, reasoning_field, content_parts
+):
+    messages = [
+        {"role": "user", "content": "Where is the entry point?"},
+        {
+            "role": "assistant",
+            "content": (
+                [{"type": "output_text", "text": "Inspecting."}]
+                if content_parts
+                else "Inspecting."
+            ),
+            reasoning_field: "Check the entry point first.",
+            "tool_calls": [
+                {
+                    "id": "call_saved",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"/src/app.py"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_saved",
+            "name": "read_file",
+            "content": "It initializes SQLite.",
+        },
+        {"role": "user", "content": "Summarize what you learned."},
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                },
+            },
+        }
+    ]
+    result = GenerationResult(
+        text="done", prompt_tokens=8, generation_tokens=1, total_tokens=9
+    )
+    with (
+        patch.object(
+            server,
+            "get_cached_model",
+            return_value=(
+                SimpleNamespace(),
+                SimpleNamespace(),
+                SimpleNamespace(model_type="qwen3_5"),
+            ),
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        for route, field in [
+            ("/v1/chat/completions", "messages"),
+            ("/v1/responses", "input"),
+        ]:
+            response = client.post(
+                route,
+                json={
+                    "model": "demo",
+                    field: messages,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                },
+            )
+            assert response.status_code == 200, response.text
+
+    chat_call, responses_call = mock_template.call_args_list
+    assert chat_call.args[2] == responses_call.args[2]
+    assert chat_call.kwargs["tools"] == responses_call.kwargs["tools"] == tools
+    assert responses_call.args[2][1] == {
+        "role": "assistant",
+        "content": "Inspecting.",
+        "reasoning_content": "Check the entry point first.",
+        "reasoning": "Check the entry point first.",
+        "tool_calls": [
+            {
+                "id": "call_saved",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": {"path": "/src/app.py"},
+                },
+            }
+        ],
+    }
+    assert responses_call.args[2][2] == messages[2]
+
+
+@pytest.mark.parametrize(
+    "roles", [("system", "system"), ("system", "developer"), ("developer", "system")]
+)
+def test_chat_and_responses_merge_instruction_messages_identically(client, roles):
+    messages = [
+        {"role": roles[0], "content": "Be concise."},
+        {"role": roles[1], "content": "Preserve exact paths."},
+        {"role": "user", "content": "Say hello."},
+    ]
+    result = GenerationResult(
+        text="done", prompt_tokens=8, generation_tokens=1, total_tokens=9
+    )
+    with (
+        patch.object(
+            server,
+            "get_cached_model",
+            return_value=(
+                SimpleNamespace(),
+                SimpleNamespace(),
+                SimpleNamespace(model_type="qwen3_5"),
+            ),
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        for route, field in [
+            ("/v1/chat/completions", "messages"),
+            ("/v1/responses", "input"),
+        ]:
+            response = client.post(route, json={"model": "demo", field: messages})
+            assert response.status_code == 200, response.text
+
+    for call in mock_template.call_args_list:
+        assert call.args[2] == [
+            {"role": "system", "content": "Be concise.\n\nPreserve exact paths."},
+            {"role": "user", "content": "Say hello."},
+        ]
+
+
 def test_responses_endpoint_merges_developer_message_with_instructions(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
