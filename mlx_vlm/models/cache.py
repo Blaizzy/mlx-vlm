@@ -1,8 +1,10 @@
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, replace
+from math import ceil
+from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
+from mlx.utils import tree_map, tree_reduce
 
 
 def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:
@@ -83,7 +85,73 @@ def create_attention_mask(
         return "causal"
 
 
+@dataclass(frozen=True)
+class CacheMemory:
+    """One row's allocation policy, measured without copying cache tensors."""
+
+    source_bytes: int = 0
+    fixed_bytes: int = 0
+    bytes_per_token: float = 0
+    step: int = 1
+    window_size: Optional[int] = None
+    fallback: bool = False
+
+    def footprint(self, tokens: int, chunk_size: Optional[int] = None) -> int:
+        if tokens <= 0:
+            return 0
+        if self.window_size is not None and chunk_size is not None:
+            tokens = min(tokens, self.window_size - 1 + chunk_size)
+        step = max(1, self.step)
+        capacity = ((tokens + step - 1) // step) * step
+        return self.fixed_bytes + ceil(capacity * self.bytes_per_token)
+
+
+def cache_nbytes(value: Any, seen: Optional[set[int]] = None) -> int:
+    """Account cache buffers without evaluating or cloning their contents."""
+    if value is None:
+        return 0
+    seen = set() if seen is None else seen
+    if id(value) in seen:
+        return 0
+    seen.add(id(value))
+    if isinstance(value, dict):
+        return sum(cache_nbytes(v, seen) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(cache_nbytes(v, seen) for v in value)
+    try:
+        size = value.nbytes
+        if isinstance(size, int):
+            return size
+    except (AttributeError, NotImplementedError):
+        pass
+    return cache_nbytes(getattr(value, "state", None), seen) + cache_nbytes(
+        getattr(value, "meta_state", None), seen
+    )
+
+
+def _kv_memory_profile(c, token_count):
+    if c.keys is None:
+        return CacheMemory()
+    keys = c.keys[0] if isinstance(c.keys, tuple) else c.keys
+    capacity = keys.shape[2]
+    size = cache_nbytes(c.keys) + cache_nbytes(c.values)
+    return CacheMemory(
+        source_bytes=size,
+        bytes_per_token=size / capacity if capacity else 0,
+        step=c.step,
+    )
+
+
+def _windowed_memory_profile(c, token_count):
+    return replace(_kv_memory_profile(c, token_count), window_size=c.max_size)
+
+
 class _BaseCache:
+    def memory_profile(self, token_count: int) -> Optional[CacheMemory]:
+        """Only concrete classes declaring a layout opt into growth estimates."""
+        describe = type(self).__dict__.get("_memory_profile")
+        return describe(self, token_count) if describe is not None else None
+
     @property
     def state(self):
         return []
@@ -236,6 +304,7 @@ def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
 
 
 class QuantizedKVCache(_BaseCache):
+    _memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(self, group_size: int = 64, bits: int = 8):
@@ -410,6 +479,7 @@ class QuantizedKVCache(_BaseCache):
 
 
 class KVCache(_BaseCache):
+    _memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(self):
@@ -535,6 +605,11 @@ class KVCache(_BaseCache):
     def merge(_, caches):
         return BatchKVCache.merge(caches)
 
+    def prefix_cache_merge(self, rows, prefix_lens):
+        if all(type(c) is KVCache for c in rows):
+            return self.merge(rows)
+        return None
+
     def empty(self):
         return self.keys is None
 
@@ -546,6 +621,7 @@ class KVCache(_BaseCache):
 
 
 class RotatingKVCache(_BaseCache):
+    _memory_profile = _windowed_memory_profile
     step = 256
 
     def __init__(self, max_size, keep=0):
@@ -677,6 +753,18 @@ class RotatingKVCache(_BaseCache):
             v,
         )
 
+    def prefix_cache_snapshot(self):
+        return {"state": (self.keys, self.values), "meta_state": self.meta_state}
+
+    def prefix_cache_restore(self, snapshot):
+        self.keys, self.values = snapshot["state"]
+        self.meta_state = snapshot["meta_state"]
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        if all(isinstance(c, RotatingKVCache) for c in rows):
+            return BatchRotatingKVCache.merge(rows)
+        return None
+
     def is_trimmable(self):
         return self.offset < self.max_size
 
@@ -730,6 +818,15 @@ class RotatingKVCache(_BaseCache):
 
 
 class ArraysCache(_BaseCache):
+    def _memory_profile(self, token_count):
+        size = cache_nbytes(self)
+        fixed = cache_nbytes(self.state)
+        return CacheMemory(
+            source_bytes=size,
+            fixed_bytes=fixed,
+            bytes_per_token=max(0, size - fixed) / max(1, token_count),
+        )
+
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
         instance._left_padding = None
@@ -1082,6 +1179,24 @@ class ArraysCache(_BaseCache):
     def state(self, v):
         self.cache = v
 
+    def prefix_cache_snapshot(self):
+        return {
+            "state": self.state,
+            "meta_state": self.meta_state,
+            "left_padding": self.left_padding,
+            "lengths": self.lengths,
+        }
+
+    def prefix_cache_restore(self, snapshot):
+        super().prefix_cache_restore(snapshot)
+        self.left_padding = snapshot.get("left_padding")
+        self.lengths = snapshot.get("lengths")
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        if all(isinstance(c, ArraysCache) for c in rows):
+            return self.merge(rows)
+        return None
+
     def filter(self, batch_indices):
         """
         In-place filter to keep just the given indices in the cache.
@@ -1163,7 +1278,9 @@ class ArraysCache(_BaseCache):
             return cache
 
         for e in range(n_state):
-            c_init = next(iter(c[e] for c in caches if c[e] is not None))
+            c_init = next((c[e] for c in caches if c[e] is not None), None)
+            if c_init is None:
+                continue
             shape = list(c_init.shape)
             shape[0] = B
             cache[e] = mx.zeros(shape, c_init.dtype)
@@ -1174,7 +1291,7 @@ class ArraysCache(_BaseCache):
         return cache
 
     def empty(self):
-        return self.cache[0] is None
+        return all(state is None for state in self.cache)
 
     @property
     def nbytes(self):
@@ -1272,6 +1389,23 @@ class ChunkedKVCache(_BaseCache):
     @meta_state.setter
     def meta_state(self, v):
         self.chunk_size, self.start_position = map(int, v)
+
+    def prefix_cache_snapshot(self):
+        return {
+            "state": (self.keys, self.values),
+            "meta_state": self.meta_state,
+            "offset": self.offset,
+        }
+
+    def prefix_cache_restore(self, snapshot):
+        self.keys, self.values = snapshot["state"]
+        self.meta_state = snapshot["meta_state"]
+        self.offset = snapshot["offset"]
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        if all(isinstance(c, ChunkedKVCache) for c in rows):
+            return BatchKVCache.merge(rows)
+        return None
 
     def empty(self):
         return self.keys is None
@@ -1382,6 +1516,7 @@ def dynamic_roll(x, shifts, axis):
 
 
 class BatchKVCache(_BaseCache):
+    _memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(self, left_padding: List[int]):
@@ -1620,6 +1755,7 @@ class BatchKVCache(_BaseCache):
 
 
 class BatchRotatingKVCache(_BaseCache):
+    _memory_profile = _windowed_memory_profile
     step = 256
 
     def __init__(self, max_size, left_padding: List[int]):
@@ -2172,6 +2308,7 @@ class BatchQuantizedKVCache(_BaseCache):
     ``Batch.extend`` / ``Batch.filter`` work during continuous-batching.
     """
 
+    _memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(
@@ -2765,6 +2902,23 @@ class PoolingCache(_BaseCache):
         obj = cls(meta_state)
         obj.state = state
         return obj
+
+    def prefix_cache_snapshot(self):
+        return {
+            "state": (self.buf_kv, self.buf_gate, self.pooled),
+            "meta_state": self.ratio,
+            "remainder": self.remainder,
+        }
+
+    def prefix_cache_restore(self, snapshot):
+        self.__init__(snapshot["meta_state"])
+        self.buf_kv, self.buf_gate, self.pooled = snapshot["state"]
+        self.remainder = snapshot["remainder"]
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        if all(isinstance(c, PoolingCache) for c in rows):
+            return self.merge(rows, prefix_lens)
+        return None
 
     def is_trimmable(self):
         return self.pooled is None

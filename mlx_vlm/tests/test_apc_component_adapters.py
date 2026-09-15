@@ -70,6 +70,52 @@ def test_arrays_cache_roundtrip():
         assert (a is None and b is None) or bool(mx.array_equal(a, b))
 
 
+def test_arrays_snapshot_preserves_batch_masks():
+    source = C.ArraysCache(1, left_padding=[2])
+    source[0] = mx.ones((1, 4))
+    source.lengths = mx.array([3])
+    adapter = A.CheckpointAdapter()
+    restored = C.ArraysCache(1)
+    adapter.restore(restored, adapter.capture(source, 3))
+    assert restored.left_padding.tolist() == [2]
+    assert restored.lengths.tolist() == [3]
+    assert bool(mx.array_equal(restored.make_mask(4), source.make_mask(4)))
+    source[0] = mx.zeros_like(source[0])
+    source.advance(1)
+    assert bool(mx.all(restored[0] == 1))
+    assert restored.left_padding.tolist() == [2]
+
+
+def test_chunked_snapshot_preserves_trimmed_offset():
+    source = C.ChunkedKVCache(chunk_size=4)
+    keys = mx.arange(48, dtype=mx.float32).reshape(1, 1, 6, 8)
+    source.update_and_fetch(keys, keys + 1)
+    source.maybe_trim_front()
+    adapter = A.CheckpointAdapter()
+    restored = C.ChunkedKVCache(chunk_size=4)
+    adapter.restore(restored, adapter.capture(source, 6))
+    assert (restored.offset, restored.start_position) == (6, 2)
+    for actual, expected in zip(
+        restored.update_and_fetch(keys[..., :1, :], keys[..., :1, :] + 1),
+        source.update_and_fetch(keys[..., :1, :], keys[..., :1, :] + 1),
+    ):
+        assert bool(mx.array_equal(actual, expected))
+
+
+def test_custom_kv_memory_includes_auxiliary_state():
+    class CustomKV(C.KVCache):
+        @property
+        def nbytes(self):
+            return super().nbytes + self.auxiliary.nbytes
+
+    source = CustomKV()
+    source.auxiliary = mx.ones((32,))
+    source.update_and_fetch(mx.ones((1, 1, 16, 4)), mx.ones((1, 1, 16, 4)))
+    profile = A.cache_memory_components([source], 16)[0]
+    assert profile.fallback
+    assert profile.bytes_per_token == source.nbytes / 16
+
+
 def test_apc_mode_layouts():
     assert A.apc_mode([C.KVCache(), C.KVCache()]) == "block"
     assert A.apc_mode([C.KVCache(), C.ArraysCache(2), C.KVCache()]) == "exact"
@@ -170,6 +216,47 @@ def _clone(c):
     out = A.clone_cache_entry(c, min_capacity_tokens=None, eval_targets=et)
     mx.eval(et)
     return out
+
+
+@pytest.mark.parametrize("length", [0, 4, 48])
+def test_buffered_rotating_snapshot_continuation(length):
+    source = C.BufferedRotatingKVCache(max_size=8, buffer_size=3)
+    for token in range(length):
+        keys = mx.full((1, 1, 1, 4), token, dtype=mx.float32)
+        source.update_and_fetch(keys, keys + 1)
+    restored = _clone(source)
+    assert restored.meta_state == source.meta_state
+
+    for count in (3, 12, 1):
+        assert mx.array_equal(
+            restored.make_mask(2, return_array=True),
+            source.make_mask(2, return_array=True),
+        ).item()
+        keys = mx.random.normal((1, 1, count, 4))
+        for actual, expected in zip(
+            restored.update_and_fetch(keys, keys + 1),
+            source.update_and_fetch(keys, keys + 1),
+        ):
+            assert mx.array_equal(actual, expected).item()
+        restored.trim(1)
+        source.trim(1)
+        assert restored.meta_state == source.meta_state
+
+
+@pytest.mark.parametrize("used_slot", [None, 0, 1])
+def test_arrays_merge_preserves_optional_state(used_slot):
+    rows = [C.ArraysCache(2) for _ in range(3)]
+    if used_slot is not None:
+        rows[0][used_slot] = mx.ones((1, 4))
+        rows[2][used_slot] = mx.full((1, 4), 2.0)
+    merged = A.merge_cache_entries(rows, [4, 0, 4])
+    assert merged.empty() is (used_slot is None)
+    if used_slot is None:
+        assert merged.cache == [None, None]
+        assert merged.left_padding.tolist() == [0, 0, 0]
+    else:
+        assert merged[1 - used_slot] is None
+        assert merged[used_slot].tolist() == [[1] * 4, [0] * 4, [2] * 4]
 
 
 def test_ring_sliding_clone_roundtrip():
