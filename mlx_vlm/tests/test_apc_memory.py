@@ -29,9 +29,8 @@ def _kv(length, value=1):
     return cache
 
 
-def _prefill(manager, lengths, *, chunk_size=None):
-    coordinator = manager.coordinator(SimpleNamespace(make_cache=lambda: [KVCache()]))
-    coordinator.prepare_prefill(lengths, prefill_step_size=chunk_size)
+def _coordinator(manager, caches):
+    return manager.coordinator(SimpleNamespace(make_cache=lambda: caches))
 
 
 @pytest.fixture
@@ -103,12 +102,12 @@ def test_short_hybrid_checkpoint_does_not_block_long_batch_reuse(
         manager, "_memory_headroom", lambda: (8 << 20) - manager.resident_bytes()
     )
     coordinator = manager.coordinator(SimpleNamespace(make_cache=make_cache))
-    _prefill(manager, 19)
+    coordinator.prepare_prefill(19)
     assert coordinator.store_checkpoint(list(range(18)), make_cache(18))
     tokens = [42] * 6000
-    _prefill(manager, 6001)
+    coordinator.prepare_prefill(6001)
     assert coordinator.store_checkpoint(tokens, make_cache(6000))
-    _prefill(manager, 6001)
+    coordinator.prepare_prefill(6001)
     restored, count = manager.lookup_exact_cache(tokens + [9])
     assert restored is not None and count == 6000
     assert manager.stats.exact_stores == 2
@@ -125,7 +124,7 @@ def test_disk_fixed_state_reserve_counts_every_prefill_sequence(manager_factory)
 
     manager = manager_factory(budget=4 << 20, disk=True)
     assert manager.lookup_exact_cache(tokens + [99])[1] == len(tokens)
-    coordinator = manager.coordinator(SimpleNamespace(make_cache=lambda: [state]))
+    coordinator = _coordinator(manager, [state])
     coordinator.prepare_prefill([2000, 2000, 2000])
     assert manager.stats_snapshot()["prefill_reserve_bytes"] == 6 << 20
     coordinator.prepare_prefill(0)
@@ -142,9 +141,11 @@ def test_unknown_checkpoint_state_keeps_conservative_growth_estimate(
     manager = manager_factory(budget=4 << 20)
     # An opaque cache is not necessarily fixed just because it is checkpointed.
     monkeypatch.setattr(apc, "_clone_prompt_cache_for_apc", lambda cache: cache)
-    assert manager.store_exact_cache(list(range(18)), [GrowingCache()])
+    cache = GrowingCache()
+    coordinator = _coordinator(manager, [cache])
+    assert manager.store_exact_cache(list(range(18)), [cache])
     monkeypatch.setattr(manager, "_memory_headroom", lambda: 8 << 20)
-    _prefill(manager, 6001)
+    coordinator.prepare_prefill(6001)
     assert manager.resident_bytes() == 0
     assert not manager._make_room()
 
@@ -165,9 +166,10 @@ def test_kv_growth_ignores_unused_capacity(manager_factory, capacity, make_cache
     allocated_bytes = _cache_nbytes(cache)
     per_token = allocated_bytes // capacity
     manager = manager_factory(budget=1 << 20)
+    coordinator = _coordinator(manager, [cache])
     assert manager.store_exact_cache(list(range(16)), [cache])
 
-    _prefill(manager, [2000, 2000, 2000])
+    coordinator.prepare_prefill([2000, 2000, 2000])
     assert manager.stats_snapshot()["prefill_reserve_bytes"] == (
         2 * 3 * 2048 * per_token
     )
@@ -186,7 +188,8 @@ def test_disk_restore_capacity_does_not_inflate_growth(manager_factory):
     reader = manager_factory(budget=1 << 20, disk=True)
     restored, count = reader.lookup_exact_cache(tokens + [99] * 6000)
     assert count == 16 and restored[0][0].keys.shape[2] >= 6016
-    _prefill(reader, 6016)
+    coordinator = _coordinator(reader, restored)
+    coordinator.prepare_prefill(6016)
     assert reader.stats_snapshot()["prefill_reserve_bytes"] == 2 * 6144 * 32
 
 
@@ -206,8 +209,9 @@ def test_short_hybrid_checkpoint_extends_with_bounded_memory(
     if disk:
         writer.disk.flush()
     reader = manager_factory(budget=4 << 20, disk=True) if disk else writer
+    coordinator = _coordinator(reader, entries)
     monkeypatch.setattr(reader, "_memory_headroom", lambda: 8 << 20)
-    _prefill(reader, 6001)
+    coordinator.prepare_prefill(6001)
 
     restored, matched = reader.lookup_exact_cache(tokens + [99] * 5983)
 
@@ -241,8 +245,9 @@ def test_prefill_budget_covers_unequal_length_batch_padding(manager_factory):
     cache = _kv(16)
     cache.step = 256
     assert manager.store_exact_cache(list(range(16)), [cache])
+    coordinator = _coordinator(manager, [cache])
     lengths = [6000, 16, 16]
-    _prefill(manager, lengths)
+    coordinator.prepare_prefill(lengths)
     batch = BatchKVCache([max(lengths) - n for n in lengths])
     keys = mx.ones((len(lengths), 1, max(lengths), 4))
     batch.update_and_fetch(keys, keys + 1)
@@ -252,9 +257,9 @@ def test_prefill_budget_covers_unequal_length_batch_padding(manager_factory):
 @pytest.mark.parametrize("make_cache", [BatchKVCache, BatchQuantizedKVCache])
 def test_runtime_memory_is_learned_before_any_checkpoint(manager_factory, make_cache):
     manager = manager_factory(budget=4 << 20)
-    coordinator = manager.coordinator(SimpleNamespace(make_cache=lambda: [KVCache()]))
-    coordinator.prepare_prefill([6000, 16])
     cache = make_cache([0, 5984])
+    coordinator = _coordinator(manager, [cache])
+    coordinator.prepare_prefill([6000, 16])
     keys = mx.ones((2, 1, 16, 64))
     cache.update_and_fetch(keys, keys + 1)
     live_bytes = _cache_nbytes(cache)
@@ -279,7 +284,8 @@ def test_windowed_memory_budget_is_independent_of_checkpoint_order(
         keys = mx.ones((1, 1, length, 4))
         cache.update_and_fetch(keys, keys + 1)
         assert manager.store_exact_cache([length] * length, [cache])
-    _prefill(manager, 6001, chunk_size=2048)
+    coordinator = _coordinator(manager, [cache])
+    coordinator.prepare_prefill(6001, prefill_step_size=2048)
     # At most the retained window plus one prefill chunk, rounded to 256 slots.
     assert manager.stats_snapshot()["prefill_reserve_bytes"] == 2 * 2560 * 32
 
@@ -376,6 +382,7 @@ def test_disk_restore_checks_headroom_before_loading(
 
 def test_prefill_evicts_oldest_before_new_allocation(manager_factory, monkeypatch):
     manager = manager_factory()
+    coordinator = _coordinator(manager, [KVCache()])
     assert manager.store_exact_cache([1] * 16, [_kv(16)])
     assert manager.store_exact_cache([2] * 16, [_kv(16)])
     # 3 KiB available including APC. A 40-token prefill reserves 2.5 KiB,
@@ -383,7 +390,7 @@ def test_prefill_evicts_oldest_before_new_allocation(manager_factory, monkeypatc
     monkeypatch.setattr(
         manager, "_memory_headroom", lambda: 3072 - manager.resident_bytes()
     )
-    _prefill(manager, 40)
+    coordinator.prepare_prefill(40)
     assert manager.resident_bytes() == 512
     assert next(iter(manager._exact_cache.values())).token_ids == (2,) * 16
     assert manager.stats_snapshot()["prefill_reserve_bytes"] == 2560
@@ -412,6 +419,7 @@ def test_memory_restore_accounts_for_extended_prompt_capacity(
 
 def test_prefill_waits_for_writes_before_evicting(manager_factory, monkeypatch):
     manager = manager_factory(disk=True)
+    coordinator = _coordinator(manager, [KVCache()])
     manager.store_exact_cache([1] * 16, [_kv(16)])
     original_flush = manager.disk.flush
     flushed = []
@@ -423,7 +431,7 @@ def test_prefill_waits_for_writes_before_evicting(manager_factory, monkeypatch):
 
     monkeypatch.setattr(manager.disk, "flush", flush)
     manager.memory_max_bytes = 0
-    _prefill(manager, 100_000)
+    coordinator.prepare_prefill(100_000)
     assert flushed and manager.resident_bytes() == 0
     assert manager.disk.num_exact_indexed == 1
 
@@ -431,15 +439,16 @@ def test_prefill_waits_for_writes_before_evicting(manager_factory, monkeypatch):
 def test_byte_eviction_preserves_leased_blocks(manager_factory):
     manager = manager_factory(budget=1024)
     source = _kv(32)
+    coordinator = _coordinator(manager, [source])
     leased = manager.store_kv_blocks(list(range(32)), [source.keys], [source.values])
     assert len(leased) == 2
     manager.release(leased[:1])
     manager.memory_max_bytes = 0
-    _prefill(manager, 100_000)
+    coordinator.prepare_prefill(100_000)
     assert manager.resident_bytes() == 512
     assert leased[1].ref_cnt == 1 and leased[1].keys is not None
     manager.release(leased[1:])
-    _prefill(manager, 100_000)
+    coordinator.prepare_prefill(100_000)
     assert manager.resident_bytes() == 0
 
 
@@ -463,6 +472,7 @@ def test_sequential_long_prefixes_remain_bounded_and_replay_from_disk(
     manager_factory, monkeypatch
 ):
     manager = manager_factory(budget=2 << 20, disk=True)
+    coordinator = _coordinator(manager, [KVCache()])
     manager.disk.queue_max_bytes = 1 << 20
     live_bytes = [0]
     # Model weights and other allocations leave 7 MiB. These synthetic caches
@@ -473,7 +483,7 @@ def test_sequential_long_prefixes_remain_bounded_and_replay_from_disk(
         lambda: (7 << 20) - manager.resident_bytes() - live_bytes[0],
     )
     for i, length in enumerate([30_000, 30_000, 50_000, 50_000, 100_000]):
-        _prefill(manager, length)
+        coordinator.prepare_prefill(length)
         cache = _kv(length, i)
         live_bytes[0] = cache.nbytes
         assert manager.store_exact_cache([i] * length, [cache])
@@ -483,7 +493,7 @@ def test_sequential_long_prefixes_remain_bounded_and_replay_from_disk(
         live_bytes[0] = 0
         mx.clear_cache()
 
-    _prefill(manager, 100_001)
+    coordinator.prepare_prefill(100_001)
     # The oldest cached states are gone before the next 100k allocation.
     assert manager.resident_bytes() == 0
     restored, count = manager.lookup_exact_cache([4] * 100_000 + [99])

@@ -3431,9 +3431,8 @@ class APCManager:
                         and token_tuple[:disk_prefix_len] == stored_tokens
                     ):
                         size = _cache_nbytes(prompt_cache)
-                        self.memory_plan.observe_cache(prompt_cache, disk_prefix_len)
-                        self._prefill_reserve_bytes = self.memory_plan.reserve_bytes(
-                            size
+                        self._prefill_reserve_bytes = self.memory_plan.observe_cache(
+                            prompt_cache, disk_prefix_len, live_bytes=size
                         )
                         expanded_bytes = self.memory_plan.restore_bytes(
                             prompt_cache, disk_prefix_len, prompt_capacity_tokens
@@ -3537,8 +3536,9 @@ class APCManager:
             return False
         token_tuple = tuple(int(t) for t in token_ids)
         size = _cache_nbytes(prompt_cache)
-        self.memory_plan.observe_cache(prompt_cache, len(token_tuple))
-        self._prefill_reserve_bytes = self.memory_plan.reserve_bytes(size)
+        self._prefill_reserve_bytes = self.memory_plan.observe_cache(
+            prompt_cache, len(token_tuple), live_bytes=size
+        )
         if self.disk is not None:
             self.disk.flush()
         retain = (
@@ -3696,9 +3696,8 @@ class APCManager:
                 return None, 0
 
         warm_cache = make_warm_kv_cache_from_layers(keys, values, matched_tokens)
-        self.memory_plan.observe_cache(warm_cache, matched_tokens)
-        self._prefill_reserve_bytes = self.memory_plan.reserve_bytes(
-            _cache_nbytes(warm_cache)
+        self._prefill_reserve_bytes = self.memory_plan.observe_cache(
+            warm_cache, matched_tokens
         )
         # Disk reads and warm-cache construction intentionally happen outside
         # the manager lock. If clear()/reset_stats() races here, the restored
@@ -3758,8 +3757,9 @@ class APCManager:
         Returns newly acquired blocks (caller must release).
         """
         size = _cache_nbytes(layer_keys + layer_values)
-        self.memory_plan.observe_kv(layer_keys, layer_values)
-        self._prefill_reserve_bytes = self.memory_plan.reserve_bytes(size)
+        self._prefill_reserve_bytes = self.memory_plan.observe_kv(
+            layer_keys, layer_values, live_bytes=size
+        )
         # Reserve no more than the pool can retain. Larger requests continue
         # directly to disk once the byte budget is exhausted.
         per_token_bytes = size / max(1, layer_keys[0].shape[2]) if layer_keys else 0

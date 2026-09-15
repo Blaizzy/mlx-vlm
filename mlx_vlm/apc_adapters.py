@@ -447,15 +447,6 @@ class KVCacheCloneAdapter(CheckpointAdapter):
         return lm.BatchKVCache.merge(caches)
 
 
-class QuantizedKVCacheCloneAdapter(KVCacheCloneAdapter):
-    def clone(self, c, *, min_capacity_tokens, eval_targets):
-        return _snapshot_contract_clone(c, eval_targets, min_capacity_tokens)
-
-    def merge_rows(self, caches, prefix_lens):
-        # The packed cache's prefix_cache_merge contract runs before adapters.
-        return None
-
-
 class RotatingKVCacheCloneAdapter(KVCacheCloneAdapter):
     capability = Capability.WINDOWED
 
@@ -583,27 +574,22 @@ class PoolingCacheCloneAdapter(CheckpointAdapter):
         return type(caches[0]).merge(caches)
 
 
-_ADAPTER_RULES: Optional[list] = None
+_CLONE_RULES: Optional[list] = None
 
 
-def _adapter_rules():
-    global _ADAPTER_RULES
-    if _ADAPTER_RULES is None:
+def _clone_rules():
+    global _CLONE_RULES
+    if _CLONE_RULES is None:
         from .models import cache as lm
 
-        _ADAPTER_RULES = [
-            (lm.KVCache, KVCacheCloneAdapter(), True),
-            (lm.QuantizedKVCache, QuantizedKVCacheCloneAdapter(), True),
-            (lm.RotatingKVCache, RotatingKVCacheCloneAdapter(), True),
-            (lm.ChunkedKVCache, ChunkedKVCacheCloneAdapter(), True),
-            (lm.ArraysCache, ArraysCacheCloneAdapter(), True),
-            (lm.PoolingCache, PoolingCacheCloneAdapter(), True),
-            # Batch snapshots retain their existing row/protocol clone paths.
-            (lm.BatchKVCache, KVCacheCloneAdapter(), False),
-            (lm.BatchQuantizedKVCache, QuantizedKVCacheCloneAdapter(), False),
-            (lm.BatchRotatingKVCache, RotatingKVCacheCloneAdapter(), False),
+        _CLONE_RULES = [
+            (lm.KVCache, KVCacheCloneAdapter()),
+            (lm.RotatingKVCache, RotatingKVCacheCloneAdapter()),
+            (lm.ChunkedKVCache, ChunkedKVCacheCloneAdapter()),
+            (lm.ArraysCache, ArraysCacheCloneAdapter()),
+            (lm.PoolingCache, PoolingCacheCloneAdapter()),
         ]
-    return _ADAPTER_RULES
+    return _CLONE_RULES
 
 
 def cache_memory_components(caches, token_count, *, batch_size=1):
@@ -612,6 +598,14 @@ def cache_memory_components(caches, token_count, *, batch_size=1):
     Specialized subclasses keep opaque accounting until their allocation policy
     is supported; inheriting a KV layout does not guarantee its growth rules.
     """
+    from .models import cache as lm
+
+    adapters = dict(_clone_rules())
+    # These layouts share memory accounting, but keep their own clone protocols.
+    for typ in (lm.QuantizedKVCache, lm.BatchKVCache, lm.BatchQuantizedKVCache):
+        adapters[typ] = adapters[lm.KVCache]
+    adapters[lm.BatchRotatingKVCache] = adapters[lm.RotatingKVCache]
+    fallback = CheckpointAdapter()
     profiles = []
     seen = set()
 
@@ -625,10 +619,7 @@ def cache_memory_components(caches, token_count, *, batch_size=1):
         elif resolve_capability(c) == Capability.COMPOSITE:
             visit(c.caches)
         else:
-            adapter = next(
-                (adapter for typ, adapter, _ in _adapter_rules() if type(c) is typ),
-                CheckpointAdapter(),
-            )
+            adapter = adapters.get(type(c), fallback)
             profile = adapter.memory(c, token_count)
             profiles.append(
                 replace(
@@ -710,15 +701,9 @@ def clone_cache_entry(c, *, min_capacity_tokens, eval_targets):
             min_capacity_tokens=min_capacity_tokens,
             eval_targets=eval_targets,
         )
-    for typ, adapter, clone in _adapter_rules():
-        if not clone:
-            continue
+    for typ, adapter in _clone_rules():
 
-        matched = (
-            type(c) is typ
-            if typ in (lm.KVCache, lm.QuantizedKVCache)
-            else isinstance(c, typ)
-        )
+        matched = type(c) is typ if typ is lm.KVCache else isinstance(c, typ)
         if matched:
             return adapter.clone(
                 c, min_capacity_tokens=min_capacity_tokens, eval_targets=eval_targets
@@ -771,9 +756,7 @@ def merge_cache_entries(entries, prefix_lens):
         merged = merge(entries, prefix_lens)
         if merged is not None:
             return merged
-    for typ, adapter, clone in _adapter_rules():
-        if not clone:
-            continue
+    for typ, adapter in _clone_rules():
         if typ is lm.KVCache:
             ok = all(type(c) is typ for c in entries)
         else:

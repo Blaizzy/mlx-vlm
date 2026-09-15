@@ -33,9 +33,13 @@ class PrefillMemoryPlan:
         self.prefix_lengths: List[int] = []
         self.chunk_size: Optional[int] = None
 
-    def prepare(self, lengths, *, chunk_size=None) -> int:
+    def prepare(self, lengths, *, chunk_size=None, prefix_lengths=None) -> int:
         self.lengths = [max(0, int(n)) for n in lengths]
-        self.prefix_lengths = [0] * len(self.lengths)
+        self.prefix_lengths = (
+            list(prefix_lengths)
+            if prefix_lengths is not None
+            else [0] * len(self.lengths)
+        )
         self.chunk_size = chunk_size if chunk_size and chunk_size > 0 else None
         return self.reserve_bytes()
 
@@ -50,32 +54,46 @@ class PrefillMemoryPlan:
         row_bytes = sum(c.footprint(capacity, self.chunk_size) for c in self.components)
         return max(0, 2 * len(self.lengths) * row_bytes - live_bytes)
 
-    def observe(self, components) -> None:
+    def observe(self, components, *, live_bytes: int) -> int:
         previous = self.components
         self.components = list(components)
-        if len(previous) != len(self.components):
-            return
-        for i, (old, new) in enumerate(zip(previous, self.components)):
-            if not new.source_bytes:
-                self.components[i] = old
-            elif old.fallback and new.fallback:
-                self.components[i] = replace(
-                    new, bytes_per_token=max(old.bytes_per_token, new.bytes_per_token)
-                )
+        if len(previous) == len(self.components):
+            for i, (old, new) in enumerate(zip(previous, self.components)):
+                if not new.source_bytes:
+                    self.components[i] = old
+                elif old.fallback and new.fallback:
+                    self.components[i] = replace(
+                        new,
+                        bytes_per_token=max(old.bytes_per_token, new.bytes_per_token),
+                    )
+        return self.reserve_bytes(live_bytes)
 
-    def observe_cache(self, prompt_cache, token_count) -> None:
-        self.observe(cache_memory_components(prompt_cache, token_count))
+    def observe_cache(
+        self, prompt_cache, token_count, *, batch_size=1, live_bytes=None
+    ) -> int:
+        """Update cache dimensions and return the reserve beyond live allocations."""
+        from .apc import _cache_nbytes
 
-    def observe_kv(self, keys, values) -> None:
+        if live_bytes is None:
+            live_bytes = _cache_nbytes(prompt_cache)
+        return self.observe(
+            cache_memory_components(prompt_cache, token_count, batch_size=batch_size),
+            live_bytes=live_bytes,
+        )
+
+    def observe_kv(self, keys, values, *, live_bytes: int) -> int:
         # The block API receives populated, unquantized slabs without a cache
         # wrapper. Their token axis describes growth directly.
-        self.observe(
-            CacheMemory(
-                source_bytes=k.nbytes + v.nbytes,
-                bytes_per_token=(k.nbytes + v.nbytes) / k.shape[2],
-            )
-            for k, v in zip(keys, values)
-            if k.shape[2]
+        return self.observe(
+            (
+                CacheMemory(
+                    source_bytes=k.nbytes + v.nbytes,
+                    bytes_per_token=(k.nbytes + v.nbytes) / k.shape[2],
+                )
+                for k, v in zip(keys, values)
+                if k.shape[2]
+            ),
+            live_bytes=live_bytes,
         )
 
     def restore_bytes(self, prompt_cache, token_count, capacity) -> int:
@@ -107,22 +125,16 @@ class APCCoordinator:
                 [prompt_lengths] if isinstance(prompt_lengths, int) else prompt_lengths
             )
             reserve = self.manager.memory_plan.prepare(
-                lengths, chunk_size=prefill_step_size
+                lengths, chunk_size=prefill_step_size, prefix_lengths=prefix_lengths
             )
-            if prefix_lengths is not None:
-                self.manager.memory_plan.prefix_lengths = list(prefix_lengths)
-                reserve = self.manager.memory_plan.reserve_bytes()
             self.manager.prepare_prefill(reserve)
 
     def observe_cache(self, prompt_cache, token_count, *, batch_size=1) -> None:
         """Update runtime dimensions independently of snapshot persistence."""
-        from .apc import _cache_nbytes
-
-        memory = self.manager.memory_plan
-        memory.observe(
-            cache_memory_components(prompt_cache, token_count, batch_size=batch_size)
+        reserve = self.manager.memory_plan.observe_cache(
+            prompt_cache, token_count, batch_size=batch_size
         )
-        self.manager.prepare_prefill(memory.reserve_bytes(_cache_nbytes(prompt_cache)))
+        self.manager.prepare_prefill(reserve)
 
     @property
     def enabled(self) -> bool:
@@ -239,8 +251,11 @@ class APCCoordinator:
 
         memory = self.manager.memory_plan
         if len(prefix_lens) == len(memory.lengths):
-            memory.prefix_lengths = list(prefix_lens)
-            self.manager.prepare_prefill(memory.reserve_bytes())
+            self.prepare_prefill(
+                memory.lengths,
+                prefill_step_size=memory.chunk_size,
+                prefix_lengths=prefix_lens,
+            )
 
         if self.is_checkpoint:
             row_caches = [
