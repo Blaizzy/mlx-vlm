@@ -5,6 +5,7 @@ import importlib
 import inspect
 import json
 import unittest
+from operator import attrgetter
 from pathlib import Path
 
 import mlx.core as mx
@@ -317,65 +318,118 @@ CHECKS = {
     "request_positions": "_assert_qwen_request_owned_mrope_kwargs",
     "chunked_positions": "_assert_qwen_chunked_prefill_slices_mrope_position_ids",
 }
+CONFIG_TYPES = {
+    "text_config": "TextConfig",
+    "vision_config": "VisionConfig",
+    "projector_config": "ProjectorConfig",
+    "perceiver_config": "PerceiverConfig",
+    "audio_config": "AudioConfig",
+    "thinker_config": "ThinkerConfig",
+    "talker_config": "TalkerConfig",
+    "code_predictor_config": "CodePredictorConfig",
+    "code2wav_config": "Code2WavConfig",
+    "vit_config": "config.VitConfig",
+    "adapter_config": "config.AdapterConfig",
+}
 DATA = json.loads(
     Path(__file__).with_name("model_cases.json").read_text(encoding="utf-8")
 )
-if DATA["version"] != 1:
+if DATA["version"] != 2:
     raise ValueError(f"Unsupported model_cases.json version: {DATA['version']}")
 
 
-def resolve_path(objects, path):
-    name, *attributes = path.split(".")
-    result = objects[name]
-    for attribute in attributes:
-        result = getattr(result, attribute)
-    return result
+def build_config(module, values, config_type="ModelConfig"):
+    """Construct the model family's config classes from ordinary nested data."""
+    fields = copy.deepcopy(values)
+    for name, value in fields.items():
+        if name in CONFIG_TYPES and isinstance(value, dict):
+            fields[name] = build_config(module, value, CONFIG_TYPES[name])
+    return attrgetter(config_type)(module)(**fields)
 
 
-def decode(value, module, objects):
-    if isinstance(value, list):
-        return [decode(item, module, objects) for item in value]
-    if not isinstance(value, dict):
-        return value
-    if set(value) == {"ref"}:
-        return resolve_path(objects, value["ref"])
-    if set(value) == {"tuple"}:
-        return tuple(decode(item, module, objects) for item in value["tuple"])
-    if set(value) == {"config"}:
-        return construct(value["config"], module, objects)
-    if set(value) == {"dtype"}:
-        return getattr(mx, value["dtype"])
-    if "array" in value or "ones" in value:
-        kind = "array" if "array" in value else "ones"
-        dtype = {"dtype": getattr(mx, value["dtype"])} if "dtype" in value else {}
-        return getattr(mx, kind)(decode(value[kind], module, objects), **dtype)
-    return {key: decode(item, module, objects) for key, item in value.items()}
+def first_attribute(obj, *names):
+    for name in names:
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    raise AttributeError(f"{type(obj).__name__} has none of {names}")
 
 
-def construct(spec, module, objects):
-    constructor = module
-    for name in spec["type"].split("."):
-        constructor = getattr(constructor, name)
-    return constructor(
-        *decode(spec.get("args", []), module, objects),
-        **decode(spec.get("kwargs", {}), module, objects),
-    )
+def check_arguments(kind, case, model, config):
+    """Keep shared component selection and dimension wiring in Python."""
+    if kind == "input_embeddings":
+        return (model, case["module"]), {}
+    if kind in {"request_positions", "chunked_positions"}:
+        return (model,), {}
+    if kind in {"language", "mrope_cache_index", "mrope_deltas"}:
+        language_model = model if case.get("language_only") else model.language_model
+        text_config = config.text_config
+        # Phi3-V keeps its language dimensions on the top-level config.
+        if case["module"] == "phi3_v":
+            text_config = config
+        if kind == "language":
+            options = {}
+            if not hasattr(text_config, "num_hidden_layers"):
+                options["num_layers"] = text_config.n_layers
+            return (language_model, text_config), options
+        return (language_model, text_config.hidden_size), {}
+    if kind == "projector":
+        projector = attrgetter(case.get("projector_path", "multi_modal_projector"))(
+            model
+        )
+        return (
+            projector,
+            config.vision_config.hidden_size,
+            config.text_config.hidden_size,
+        ), {}
+    if kind == "vision":
+        vision = attrgetter(case.get("vision_path", "vision_tower"))(model)
+        vision_config = config.vision_config
+        options = case.get("vision", {})
+        image_size = options.get("input_shape")
+        if image_size is None:
+            image_size = (vision_config.image_size, vision_config.image_size)
+        hidden_size = first_attribute(
+            vision_config, "out_hidden_size", "hidden_size", "d_model", "width"
+        )
+        # Molmo's hidden_size is the projector intermediate width.
+        if case["module"] == "molmo":
+            hidden_size = vision_config.d_model
+        channels = first_attribute(vision_config, "num_channels", "in_channels")
+        kwargs = {}
+        if "feature_layer" in options:
+            kwargs["vision_feature_layer"] = options["feature_layer"]
+        if "channel_first" in options:
+            kwargs["channel_first"] = options["channel_first"]
+        if "grid_thw" in options:
+            kwargs["grid_thw"] = mx.array(
+                options["grid_thw"],
+                dtype=getattr(mx, options.get("grid_dtype", "int64")),
+            )
+        if vision_config.model_type == "llama4_vision_model":
+            kwargs["projector_output_dim"] = vision_config.projector_output_dim
+        return (
+            vision,
+            vision_config.model_type,
+            hidden_size,
+            channels,
+            tuple(image_size),
+        ), kwargs
+    raise ValueError(f"Unknown model check: {kind}")
 
 
 @pytest.mark.parametrize("case", DATA["cases"], ids=lambda case: case["id"])
 def test_model_contract(case):
     module = importlib.import_module("mlx_vlm.models." + case["module"])
-    objects = {}
-    for name, spec in case["configs"].items():
-        objects[name] = construct(spec, module, objects)
-    spec = case["model"]
-    objects[spec["name"]] = construct(spec, module, objects)
+    config = build_config(module, case["config"])
+    model = (
+        module.LanguageModel(config.text_config, config)
+        if case.get("language_only")
+        else module.Model(config)
+    )
     checks = ModelChecks()
-    for check in case["checks"]:
-        getattr(checks, CHECKS[check["kind"]])(
-            *decode(check.get("args", []), module, objects),
-            **decode(check.get("kwargs", {}), module, objects),
-        )
+    for kind in case["checks"]:
+        args, kwargs = check_arguments(kind, case, model, config)
+        getattr(checks, CHECKS[kind])(*args, **kwargs)
 
 
 @pytest.mark.parametrize("name", DATA["dense"])

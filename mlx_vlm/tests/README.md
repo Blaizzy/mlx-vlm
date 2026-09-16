@@ -56,14 +56,50 @@ model ID, so failures can be selected with `pytest -k`:
 python -m pytest -q mlx_vlm/tests/test_models.py -k llava_bunny
 ```
 
-For a contract case, `module` names the module under `mlx_vlm.models`. The runner
-constructs `configs` in declaration order, then `model`, and runs the listed
-`checks` in order. Constructor specs accept `type`, positional `args`, and
-keyword `kwargs`. Values support references such as `{"ref": "config.text_config"}`,
-nested `{"config": {"type": "TextConfig", "kwargs": {}}}` constructors, tuples,
-MLX dtypes, and `array`/`ones` inputs. Ordinary JSON values pass through. Each case
-gets fresh configuration objects and a fresh model; the JSON contains no Python
-expressions or executable code.
+For a contract case, `module` names the module under `mlx_vlm.models`, `config`
+contains ordinary nested model settings, and `checks` lists check names in order:
+
+```json
+{
+  "id": "tiny_mistral_language",
+  "module": "mistral3",
+  "config": {
+    "text_config": {
+      "model_type": "mistral",
+      "hidden_size": 16,
+      "intermediate_size": 32,
+      "num_hidden_layers": 1,
+      "num_attention_heads": 2,
+      "num_key_value_heads": 2,
+      "head_dim": 8,
+      "rms_norm_eps": 0.00001,
+      "rope_theta": 10000.0,
+      "vocab_size": 32
+    },
+    "vision_config": {
+      "hidden_size": 16,
+      "intermediate_size": 32,
+      "num_hidden_layers": 1,
+      "num_attention_heads": 2
+    },
+    "model_type": "mistral3"
+  },
+  "checks": ["language", "input_embeddings"]
+}
+```
+
+The runner constructs the family's `ModelConfig`, nested `TextConfig`/`VisionConfig`
+and other config classes, then calls `Model(config)`. Python selects check
+arguments and reads dimensions from the config. Every case gets fresh config
+objects and a fresh model; JSON contains no constructor calls or object references.
+
+Most cases need no wiring overrides. `vision_path` and `projector_path` select
+unusual component locations; defaults are `vision_tower` and
+`multi_modal_projector`. `language_only: true` constructs
+`LanguageModel(config.text_config, config)` for the isolated Qwen language check.
+The optional `vision` object holds input data and layout settings: `input_shape`,
+`feature_layer`, `channel_first`, and `grid_thw` (integer grid by default;
+`grid_dtype: "float32"` preserves the floating-grid scenario).
 
 The `dense` table retains the prototype's name and includes both dense and MoE
 families. Each entry checks a full forward pass and cached token decode.

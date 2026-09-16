@@ -1,1123 +1,528 @@
 {
-  "version": 1,
+  "version": 2,
   "cases": [
     {
       "id": "TestModels.llava_bunny",
       "module": "llava_bunny",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "model_type": "qwen2",
-            "hidden_size": 4096,
-            "num_hidden_layers": 32,
-            "intermediate_size": 11008,
-            "num_attention_heads": 32,
-            "rms_norm_eps": 1e-06,
-            "vocab_size": 32000,
-            "num_key_value_heads": 32,
-            "rope_theta": 10000.0
-          }
+          "model_type": "qwen2",
+          "hidden_size": 4096,
+          "num_hidden_layers": 32,
+          "intermediate_size": 11008,
+          "num_attention_heads": 32,
+          "rms_norm_eps": 1e-06,
+          "vocab_size": 32000,
+          "num_key_value_heads": 32,
+          "rope_theta": 10000.0
         },
-        "vision_config": {"type": "VisionConfig", "kwargs": {"model_type": "siglip_vision_model"}},
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "model_type": "llava-qwen2",
-            "auto_map": {
-              "AutoConfig": "configuration_llava_qwen2.LlavaQwen2Config",
-              "AutoModelForCausalLM": "modeling_llava_qwen2.LlavaQwen2ForCausalLM"
-            },
-            "hidden_size": 1024,
-            "mm_hidden_size": 1152
-          }
-        }
+        "vision_config": {"model_type": "siglip_vision_model"},
+        "model_type": "llava-qwen2",
+        "auto_map": {
+          "AutoConfig": "configuration_llava_qwen2.LlavaQwen2Config",
+          "AutoModelForCausalLM": "modeling_llava_qwen2.LlavaQwen2ForCausalLM"
+        },
+        "hidden_size": 1024,
+        "mm_hidden_size": 1152
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "projector",
-          "args": [
-            {"ref": "model.mm_projector"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.text_config.hidden_size"}
-          ]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_tower.vision_tower"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.vision_config.num_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ]
-        },
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "llava_bunny"]}
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "projector", "vision", "input_embeddings"],
+      "projector_path": "mm_projector",
+      "vision_path": "vision_tower.vision_tower"
     },
     {
       "id": "TestModels.llava_next",
       "module": "llava_next",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "model_type": "llama",
-            "intermediate_size": 11008,
-            "vocab_size": 32000,
-            "num_key_value_heads": 32,
-            "rope_theta": 10000.0
-          }
+          "model_type": "llama",
+          "intermediate_size": 11008,
+          "vocab_size": 32000,
+          "num_key_value_heads": 32,
+          "rope_theta": 10000.0
         },
-        "vision_config": {
-          "type": "VisionConfig",
-          "kwargs": {"model_type": "clip_vision_model", "num_hidden_layers": 23, "layer_norm_eps": 1e-06}
-        },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "model_type": "llava"
-          }
-        }
+        "vision_config": {"model_type": "clip_vision_model", "num_hidden_layers": 23, "layer_norm_eps": 1e-06},
+        "model_type": "llava"
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "projector",
-          "args": [
-            {"ref": "model.multi_modal_projector"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.text_config.hidden_size"}
-          ]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_tower"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.vision_config.num_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ]
-        },
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "llava_next"]}
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "projector", "vision", "input_embeddings"]
     },
     {
       "id": "TestModels.llava_onevision",
       "module": "llava_onevision",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "hidden_size": 64,
-            "num_hidden_layers": 2,
-            "intermediate_size": 128,
-            "num_attention_heads": 4,
-            "vocab_size": 200
-          }
+          "hidden_size": 64,
+          "num_hidden_layers": 2,
+          "intermediate_size": 128,
+          "num_attention_heads": 4,
+          "vocab_size": 200
         },
         "vision_config": {
-          "type": "VisionConfig",
-          "kwargs": {
-            "num_hidden_layers": 3,
-            "hidden_size": 48,
-            "intermediate_size": 96,
-            "num_attention_heads": 4,
-            "image_size": 56
-          }
+          "num_hidden_layers": 3,
+          "hidden_size": 48,
+          "intermediate_size": 96,
+          "num_attention_heads": 4,
+          "image_size": 56
         },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "image_token_index": 190,
-            "video_token_index": 191,
-            "image_grid_pinpoints": [[56, 56], [56, 112], [112, 56], [112, 112]],
-            "vocab_size": 200
-          }
-        }
+        "image_token_index": 190,
+        "video_token_index": 191,
+        "image_grid_pinpoints": [[56, 56], [56, 112], [112, 56], [112, 112]],
+        "vocab_size": 200
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "projector",
-          "args": [
-            {"ref": "model.multi_modal_projector"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.text_config.hidden_size"}
-          ]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_tower"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.vision_config.num_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ]
-        },
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "llava_onevision"]}
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "projector", "vision", "input_embeddings"]
     },
     {
       "id": "TestModels.llava",
       "module": "llava",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "model_type": "llama",
-            "rms_norm_eps": 1e-05,
-            "num_key_value_heads": 32,
-            "rope_theta": 10000.0
-          }
+          "model_type": "llama",
+          "rms_norm_eps": 1e-05,
+          "num_key_value_heads": 32,
+          "rope_theta": 10000.0
         },
-        "vision_config": {
-          "type": "VisionConfig",
-          "kwargs": {"model_type": "clip_vision_model", "num_hidden_layers": 23, "layer_norm_eps": 1e-06}
-        },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "model_type": "llava"
-          }
-        }
+        "vision_config": {"model_type": "clip_vision_model", "num_hidden_layers": 23, "layer_norm_eps": 1e-06},
+        "model_type": "llava"
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "projector",
-          "args": [
-            {"ref": "model.multi_modal_projector"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.text_config.hidden_size"}
-          ]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_tower"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.vision_config.num_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ]
-        },
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "llava"]}
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "projector", "vision", "input_embeddings"]
     },
     {
       "id": "TestModels.idefics2",
       "module": "idefics2",
-      "configs": {
-        "text_config": {
-          "type": "TextConfig",
-          "kwargs": {"model_type": "mistral", "vocab_size": 32000, "rope_theta": 10000.0}
-        },
+      "config": {
+        "text_config": {"model_type": "mistral", "vocab_size": 32000, "rope_theta": 10000.0},
         "vision_config": {
-          "type": "VisionConfig",
-          "kwargs": {
-            "model_type": "idefics2",
-            "num_hidden_layers": 27,
-            "hidden_size": 1152,
-            "intermediate_size": 4304,
-            "num_attention_heads": 16,
-            "image_size": 980,
-            "patch_size": 14
-          }
+          "model_type": "idefics2",
+          "num_hidden_layers": 27,
+          "hidden_size": 1152,
+          "intermediate_size": 4304,
+          "num_attention_heads": 16,
+          "image_size": 980,
+          "patch_size": 14
         },
-        "perceiver_config": {"type": "PerceiverConfig", "kwargs": {"model_type": "idefics2Perceiver"}},
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "perceiver_config": {"ref": "perceiver_config"},
-            "model_type": "idefics2",
-            "image_token_index": 32001
-          }
-        }
+        "perceiver_config": {"model_type": "idefics2Perceiver"},
+        "model_type": "idefics2",
+        "image_token_index": 32001
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_model"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.vision_config.num_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ]
-        },
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "idefics2"]}
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "vision", "input_embeddings"],
+      "vision_path": "vision_model"
     },
     {
       "id": "TestModels.internvl_chat",
       "module": "internvl_chat",
-      "configs": {
-        "test_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "model_type": "qwen2",
-            "hidden_size": 3584,
-            "num_hidden_layers": 5,
-            "intermediate_size": 18944,
-            "num_attention_heads": 28,
-            "rms_norm_eps": 1e-06,
-            "max_window_layers": 16,
-            "vocab_size": 151674,
-            "num_key_value_heads": 4,
-            "rope_scaling": {"factor": 2.0, "rope_type": "dynamic", "type": "dynamic"},
-            "max_position_embeddings": 32768
-          }
+      "config": {
+        "text_config": {
+          "model_type": "qwen2",
+          "hidden_size": 3584,
+          "num_hidden_layers": 5,
+          "intermediate_size": 18944,
+          "num_attention_heads": 28,
+          "rms_norm_eps": 1e-06,
+          "max_window_layers": 16,
+          "vocab_size": 151674,
+          "num_key_value_heads": 4,
+          "rope_scaling": {"factor": 2.0, "rope_type": "dynamic", "type": "dynamic"},
+          "max_position_embeddings": 32768
         },
         "vision_config": {
-          "type": "VisionConfig",
-          "kwargs": {
-            "model_type": "intern_vit_6b",
-            "num_hidden_layers": 5,
-            "hidden_size": 1152,
-            "intermediate_size": 4304,
-            "image_size": 384
-          }
+          "model_type": "intern_vit_6b",
+          "num_hidden_layers": 5,
+          "hidden_size": 1152,
+          "intermediate_size": 4304,
+          "image_size": 384
         },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "test_config"},
-            "vision_config": {"ref": "vision_config"},
-            "model_type": "internvl_chat"
-          }
-        }
+        "model_type": "internvl_chat"
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_model"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.vision_config.num_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ]
-        },
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "internvl_chat"]}
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "vision", "input_embeddings"],
+      "vision_path": "vision_model"
     },
     {
       "id": "TestModels.llmjpvl",
       "module": "llmjpvl",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "hidden_size": 64,
-            "num_hidden_layers": 4,
-            "intermediate_size": 128,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "vocab_size": 1024,
-            "max_position_embeddings": 4096
-          }
+          "hidden_size": 64,
+          "num_hidden_layers": 4,
+          "intermediate_size": 128,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "vocab_size": 1024,
+          "max_position_embeddings": 4096
         },
         "vision_config": {
-          "type": "VisionConfig",
-          "kwargs": {
-            "hidden_size": 64,
-            "num_hidden_layers": 3,
-            "intermediate_size": 128,
-            "num_attention_heads": 4,
-            "image_size": 64
-          }
-        },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {"text_config": {"ref": "text_config"}, "vision_config": {"ref": "vision_config"}}
+          "hidden_size": 64,
+          "num_hidden_layers": 3,
+          "intermediate_size": 128,
+          "num_attention_heads": 4,
+          "image_size": 64
         }
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_backbone"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.vision_config.num_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ]
-        }
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "vision"],
+      "vision_path": "vision_backbone"
     },
     {
       "id": "TestModels.paligemma",
       "module": "paligemma",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "intermediate_size": 16384,
-            "num_attention_heads": 8,
-            "vocab_size": 257216,
-            "num_key_value_heads": 1,
-            "rope_theta": 10000.0
-          }
+          "intermediate_size": 16384,
+          "num_attention_heads": 8,
+          "vocab_size": 257216,
+          "num_key_value_heads": 1,
+          "rope_theta": 10000.0
         },
-        "vision_config": {"type": "VisionConfig"},
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "vocab_size": 257216
-          }
-        }
+        "vision_config": {},
+        "vocab_size": 257216
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "projector",
-          "args": [
-            {"ref": "model.multi_modal_projector"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.text_config.hidden_size"}
-          ]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_tower"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.vision_config.num_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ]
-        },
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "paligemma"]}
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "projector", "vision", "input_embeddings"]
     },
     {
       "id": "TestModels.multi_modality",
       "module": "multi_modality",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "model_type": "llama",
-            "hidden_size": 2048,
-            "num_hidden_layers": 24,
-            "intermediate_size": 5632,
-            "num_attention_heads": 16,
-            "vocab_size": 32000,
-            "rope_theta": 10000.0
-          }
+          "model_type": "llama",
+          "hidden_size": 2048,
+          "num_hidden_layers": 24,
+          "intermediate_size": 5632,
+          "num_attention_heads": 16,
+          "vocab_size": 32000,
+          "rope_theta": 10000.0
         },
-        "vision_config": {"type": "VisionConfig", "kwargs": {"model_type": "vision", "patch_size": 14, "params": {}}},
+        "vision_config": {"model_type": "vision", "patch_size": 14, "params": {}},
         "projector_config": {
-          "type": "ProjectorConfig",
-          "kwargs": {
-            "cls": "MlpProjector",
-            "model_type": "projector",
-            "params": {"depth": 2, "input_dim": 1024, "n_embed": 2048, "projector_type": "mlp_gelu"}
-          }
+          "cls": "MlpProjector",
+          "model_type": "projector",
+          "params": {"depth": 2, "input_dim": 1024, "n_embed": 2048, "projector_type": "mlp_gelu"}
         },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "projector_config": {"ref": "projector_config"},
-            "model_type": "multi_modality"
-          }
-        }
+        "model_type": "multi_modality"
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "projector",
-          "args": [
-            {"ref": "model.aligner"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.text_config.hidden_size"}
-          ]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_model"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.vision_config.num_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ]
-        },
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "multi_modality"]}
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "projector", "vision", "input_embeddings"],
+      "projector_path": "aligner",
+      "vision_path": "vision_model"
     },
     {
       "id": "TestModels.phi3_v",
       "module": "phi3_v",
-      "configs": {
-        "text_config": {"type": "TextConfig"},
-        "vision_config": {"type": "VisionConfig", "kwargs": {"image_dim_out": 1024}},
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "hidden_size": 256,
-            "intermediate_size": 512,
-            "max_position_embeddings": 4096,
-            "model_type": "phi3_v",
-            "num_attention_heads": 4,
-            "num_hidden_layers": 2,
-            "num_key_value_heads": 4,
-            "original_max_position_embeddings": 4096,
-            "rms_norm_eps": 1e-05,
-            "rope_scaling": {
-              "long_factor": [
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0
-              ],
-              "short_factor": [
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0,
-                1.0
-              ],
-              "type": "su"
-            },
-            "rope_theta": 10000.0,
-            "vocab_size": 1000
-          }
-        }
+      "config": {
+        "text_config": {},
+        "vision_config": {"image_dim_out": 1024},
+        "hidden_size": 256,
+        "intermediate_size": 512,
+        "max_position_embeddings": 4096,
+        "model_type": "phi3_v",
+        "num_attention_heads": 4,
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 4,
+        "original_max_position_embeddings": 4096,
+        "rms_norm_eps": 1e-05,
+        "rope_scaling": {
+          "long_factor": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "short_factor": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "type": "su"
+        },
+        "rope_theta": 10000.0,
+        "vocab_size": 1000
       },
-      "checks": [
-        {"kind": "language", "args": [{"ref": "model.language_model"}, {"ref": "config"}]},
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_model"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.vision_config.num_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ]
-        }
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "vision"],
+      "vision_path": "vision_model"
     },
     {
       "id": "TestModels.ministral3",
       "module": "mistral3",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "head_dim": 128,
-            "hidden_size": 3072,
-            "intermediate_size": 9216,
-            "max_position_embeddings": 262144,
-            "model_type": "ministral3",
-            "num_attention_heads": 32,
-            "num_hidden_layers": 26,
-            "rms_norm_eps": 1e-05,
-            "rope_parameters": {
-              "beta_fast": 32.0,
-              "beta_slow": 1.0,
-              "factor": 16.0,
-              "llama_4_scaling_beta": 0.1,
-              "mscale": 1.0,
-              "mscale_all_dim": 1.0,
-              "original_max_position_embeddings": 16384,
-              "rope_theta": 1000000.0,
-              "rope_type": "yarn",
-              "type": "yarn"
-            },
-            "tie_word_embeddings": true,
-            "vocab_size": 131072
-          }
+          "head_dim": 128,
+          "hidden_size": 3072,
+          "intermediate_size": 9216,
+          "max_position_embeddings": 262144,
+          "model_type": "ministral3",
+          "num_attention_heads": 32,
+          "num_hidden_layers": 26,
+          "rms_norm_eps": 1e-05,
+          "rope_parameters": {
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+            "factor": 16.0,
+            "llama_4_scaling_beta": 0.1,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+            "original_max_position_embeddings": 16384,
+            "rope_theta": 1000000.0,
+            "rope_type": "yarn",
+            "type": "yarn"
+          },
+          "tie_word_embeddings": true,
+          "vocab_size": 131072
         },
-        "vision_config": {"type": "VisionConfig", "kwargs": {"image_size": 1540}},
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "model_type": "pixtral"
-          }
-        }
+        "vision_config": {"image_size": 1540},
+        "model_type": "pixtral"
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_tower"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.vision_config.num_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ]
-        }
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "vision"]
     },
     {
       "id": "TestModels.qwen2_vl",
       "module": "qwen2_vl",
-      "configs": {
+      "config": {
+        "model_type": "qwen2_vl",
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "model_type": "qwen2_vl",
-            "hidden_size": 32,
-            "num_hidden_layers": 4,
-            "intermediate_size": 37,
-            "num_attention_heads": 4,
-            "rms_norm_eps": 1e-06,
-            "vocab_size": 152064,
-            "num_key_value_heads": 4,
-            "max_position_embeddings": 512,
-            "rope_theta": 10000,
-            "rope_scaling": {"type": "mrope", "mrope_section": [2, 1, 1]}
-          }
+          "model_type": "qwen2_vl",
+          "hidden_size": 32,
+          "num_hidden_layers": 4,
+          "intermediate_size": 37,
+          "num_attention_heads": 4,
+          "rms_norm_eps": 1e-06,
+          "vocab_size": 152064,
+          "num_key_value_heads": 4,
+          "max_position_embeddings": 512,
+          "rope_theta": 10000,
+          "rope_scaling": {"type": "mrope", "mrope_section": [2, 1, 1]}
         },
         "vision_config": {
-          "type": "VisionConfig",
-          "kwargs": {
-            "depth": 2,
-            "embed_dim": 32,
-            "hidden_size": 32,
-            "image_size": 224,
-            "num_heads": 4,
-            "mlp_ratio": 4,
-            "spatial_merge_size": 1
-          }
-        },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "model_type": "qwen2_vl",
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"}
-          }
+          "depth": 2,
+          "embed_dim": 32,
+          "hidden_size": 32,
+          "image_size": 224,
+          "num_heads": 4,
+          "mlp_ratio": 4,
+          "spatial_merge_size": 1
         }
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_tower"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.vision_config.in_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ],
-          "kwargs": {"vision_feature_layer": -1, "grid_thw": {"ones": {"tuple": [1, 3]}}}
-        },
-        {
-          "kind": "mrope_cache_index",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config.hidden_size"}]
-        },
-        {
-          "kind": "mrope_deltas",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config.hidden_size"}]
-        }
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "vision", "mrope_cache_index", "mrope_deltas"],
+      "vision": {"feature_layer": -1, "grid_thw": [[1, 1, 1]], "grid_dtype": "float32"}
     },
     {
       "id": "TestModels.qwen2_5_vl",
       "module": "qwen2_5_vl",
-      "configs": {
+      "config": {
+        "model_type": "qwen2_5_vl",
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "model_type": "qwen2_5_vl",
-            "hidden_size": 1280,
-            "num_hidden_layers": 32,
-            "intermediate_size": 3420,
-            "num_attention_heads": 16,
-            "rms_norm_eps": 1e-06,
-            "vocab_size": 32000,
-            "num_key_value_heads": 16,
-            "rope_scaling": {"type": "mrope", "mrope_section": [2, 1, 1]}
-          }
+          "model_type": "qwen2_5_vl",
+          "hidden_size": 1280,
+          "num_hidden_layers": 32,
+          "intermediate_size": 3420,
+          "num_attention_heads": 16,
+          "rms_norm_eps": 1e-06,
+          "vocab_size": 32000,
+          "num_key_value_heads": 16,
+          "rope_scaling": {"type": "mrope", "mrope_section": [2, 1, 1]}
         },
-        "vision_config": {"type": "VisionConfig", "kwargs": {"fullatt_block_indexes": [7, 15, 23, 31]}},
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "model_type": "qwen2_5_vl",
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"}
-          }
-        }
+        "vision_config": {"fullatt_block_indexes": [7, 15, 23, 31]}
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_tower"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.out_hidden_size"},
-            {"ref": "config.vision_config.in_channels"},
-            {"tuple": [140, 1176]}
-          ],
-          "kwargs": {"vision_feature_layer": -1, "grid_thw": {"array": [[1, 10, 14]], "dtype": "int64"}}
-        },
-        {
-          "kind": "mrope_cache_index",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config.hidden_size"}]
-        },
-        {
-          "kind": "mrope_deltas",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config.hidden_size"}]
-        }
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "vision", "mrope_cache_index", "mrope_deltas"],
+      "vision": {"input_shape": [140, 1176], "feature_layer": -1, "grid_thw": [[1, 10, 14]]}
     },
     {
       "id": "TestModels.qwen3_5_decode_uses_rope_deltas_kwarg",
       "module": "qwen3_5",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "model_type": "qwen3_5",
-            "hidden_size": 16,
-            "intermediate_size": 32,
-            "linear_num_value_heads": 2,
-            "linear_num_key_heads": 2,
-            "linear_key_head_dim": 8,
-            "linear_value_head_dim": 8,
-            "linear_conv_kernel_dim": 3,
-            "num_hidden_layers": 1,
-            "num_attention_heads": 2,
-            "rms_norm_eps": 1e-05,
-            "vocab_size": 32,
-            "num_key_value_heads": 2,
-            "max_position_embeddings": 128,
-            "head_dim": 8
-          }
+          "model_type": "qwen3_5",
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "linear_num_value_heads": 2,
+          "linear_num_key_heads": 2,
+          "linear_key_head_dim": 8,
+          "linear_value_head_dim": 8,
+          "linear_conv_kernel_dim": 3,
+          "num_hidden_layers": 1,
+          "num_attention_heads": 2,
+          "rms_norm_eps": 1e-05,
+          "vocab_size": 32,
+          "num_key_value_heads": 2,
+          "max_position_embeddings": 128,
+          "head_dim": 8
         },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {
-              "config": {
-                "type": "VisionConfig",
-                "kwargs": {
-                  "depth": 1,
-                  "hidden_size": 16,
-                  "intermediate_size": 32,
-                  "out_hidden_size": 16,
-                  "num_heads": 2
-                }
-              }
-            },
-            "model_type": "qwen3_5"
-          }
-        }
+        "vision_config": {
+          "depth": 1,
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "out_hidden_size": 16,
+          "num_heads": 2
+        },
+        "model_type": "qwen3_5"
       },
-      "checks": [{"kind": "mrope_deltas", "args": [{"ref": "language_model"}, 16]}],
-      "model": {
-        "name": "language_model",
-        "type": "LanguageModel",
-        "args": [{"ref": "text_config"}, {"ref": "config"}]
-      }
+      "checks": ["mrope_deltas"],
+      "language_only": true
     },
     {
       "id": "TestModels.glm4v_moe",
       "module": "glm4v_moe",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "model_type": "glm4v_moe",
-            "vocab_size": 257152,
-            "hidden_size": 4096,
-            "intermediate_size": 10944,
-            "max_position_embeddings": 8192,
-            "moe_intermediate_size": 13696,
-            "norm_topk_prob": false,
-            "num_attention_heads": 32,
-            "n_group": 1,
-            "head_dim": 128,
-            "topk_group": 1,
-            "n_shared_experts": 2,
-            "n_routed_experts": 16,
-            "routed_scaling_factor": 1.0,
-            "num_experts_per_tok": 2,
-            "first_k_dense_replace": 1,
-            "num_hidden_layers": 5,
-            "num_key_value_heads": 2,
-            "rms_norm_eps": 1e-05,
-            "rope_theta": 5000000,
-            "use_qk_norm": true,
-            "attention_bias": false,
-            "partial_rotary_factor": 0.5,
-            "rope_scaling": {"rope_type": "default", "mrope_section": [8, 12, 12]},
-            "tie_word_embeddings": false
-          }
+          "model_type": "glm4v_moe",
+          "vocab_size": 257152,
+          "hidden_size": 4096,
+          "intermediate_size": 10944,
+          "max_position_embeddings": 8192,
+          "moe_intermediate_size": 13696,
+          "norm_topk_prob": false,
+          "num_attention_heads": 32,
+          "n_group": 1,
+          "head_dim": 128,
+          "topk_group": 1,
+          "n_shared_experts": 2,
+          "n_routed_experts": 16,
+          "routed_scaling_factor": 1.0,
+          "num_experts_per_tok": 2,
+          "first_k_dense_replace": 1,
+          "num_hidden_layers": 5,
+          "num_key_value_heads": 2,
+          "rms_norm_eps": 1e-05,
+          "rope_theta": 5000000,
+          "use_qk_norm": true,
+          "attention_bias": false,
+          "partial_rotary_factor": 0.5,
+          "rope_scaling": {"rope_type": "default", "mrope_section": [8, 12, 12]},
+          "tie_word_embeddings": false
         },
         "vision_config": {
-          "type": "VisionConfig",
-          "kwargs": {
-            "model_type": "glm4v_moe",
-            "depth": 32,
-            "hidden_size": 1280,
-            "intermediate_size": 3420,
-            "out_hidden_size": 1536,
-            "num_heads": 16,
-            "patch_size": 14
-          }
+          "model_type": "glm4v_moe",
+          "depth": 32,
+          "hidden_size": 1280,
+          "intermediate_size": 3420,
+          "out_hidden_size": 1536,
+          "num_heads": 16,
+          "patch_size": 14
         },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "model_type": "glm4v_moe"
-          }
-        }
+        "model_type": "glm4v_moe"
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_tower"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.out_hidden_size"},
-            {"ref": "config.vision_config.in_channels"},
-            {"tuple": [140, 1176]}
-          ],
-          "kwargs": {"vision_feature_layer": -1, "grid_thw": {"array": [[1, 10, 14]], "dtype": "int64"}}
-        },
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "glm4v_moe"]}
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "vision", "input_embeddings"],
+      "vision": {"input_shape": [140, 1176], "feature_layer": -1, "grid_thw": [[1, 10, 14]]}
     },
     {
       "id": "TestModels.glm4v",
       "module": "glm4v",
-      "configs": {
-        "text_config": {"type": "TextConfig", "kwargs": {"model_type": "glm4v"}},
+      "config": {
+        "text_config": {"model_type": "glm4v"},
         "vision_config": {
-          "type": "VisionConfig",
-          "kwargs": {
-            "model_type": "glm4v",
-            "depth": 32,
-            "hidden_size": 1280,
-            "intermediate_size": 3420,
-            "out_hidden_size": 1536,
-            "num_heads": 16,
-            "patch_size": 14
-          }
+          "model_type": "glm4v",
+          "depth": 32,
+          "hidden_size": 1280,
+          "intermediate_size": 3420,
+          "out_hidden_size": 1536,
+          "num_heads": 16,
+          "patch_size": 14
         },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "model_type": "glm4v"
-          }
-        }
+        "model_type": "glm4v"
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_tower"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.out_hidden_size"},
-            {"ref": "config.vision_config.in_channels"},
-            {"tuple": [140, 1176]}
-          ],
-          "kwargs": {"vision_feature_layer": -1, "grid_thw": {"array": [[1, 10, 14]], "dtype": "int64"}}
-        },
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "glm4v"]}
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "vision", "input_embeddings"],
+      "vision": {"input_shape": [140, 1176], "feature_layer": -1, "grid_thw": [[1, 10, 14]]}
     },
     {
       "id": "TestModels.lfm2_vl",
       "module": "lfm2_vl",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "layer_types": [
-              "conv",
-              "conv",
-              "full_attention",
-              "conv",
-              "conv",
-              "full_attention",
-              "conv",
-              "conv",
-              "full_attention",
-              "conv",
-              "full_attention",
-              "conv",
-              "full_attention",
-              "conv",
-              "full_attention",
-              "conv"
-            ]
-          }
+          "layer_types": [
+            "conv",
+            "conv",
+            "full_attention",
+            "conv",
+            "conv",
+            "full_attention",
+            "conv",
+            "conv",
+            "full_attention",
+            "conv",
+            "full_attention",
+            "conv",
+            "full_attention",
+            "conv",
+            "full_attention",
+            "conv"
+          ]
         },
-        "vision_config": {"type": "VisionConfig"},
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {"text_config": {"ref": "text_config"}, "vision_config": {"ref": "vision_config"}}
-        }
+        "vision_config": {}
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "lfm2_vl"]}
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "input_embeddings"]
     },
     {
       "id": "TestModels.molmo",
       "module": "molmo",
-      "configs": {
-        "text_config": {"type": "TextConfig"},
-        "vision_config": {"type": "VisionConfig"},
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {"text_config": {"ref": "text_config"}, "vision_config": {"ref": "vision_config"}}
-        }
-      },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}],
-          "kwargs": {"num_layers": {"ref": "config.text_config.n_layers"}}
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_tower"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.d_model"},
-            {"ref": "config.vision_config.num_channels"},
-            {"tuple": [576, 588]}
-          ]
-        }
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "config": {"text_config": {}, "vision_config": {}},
+      "checks": ["language", "vision"],
+      "vision": {"input_shape": [576, 588]}
     },
     {
       "id": "TestModels.molmo2",
       "module": "molmo2",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "hidden_size": 256,
-            "intermediate_size": 512,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 64
-          }
+          "hidden_size": 256,
+          "intermediate_size": 512,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "head_dim": 64
         },
-        "vit_config": {
-          "type": "config.VitConfig",
-          "kwargs": {
+        "vision_config": {
+          "vit_config": {
             "hidden_size": 128,
             "intermediate_size": 256,
             "num_hidden_layers": 2,
@@ -1125,11 +530,8 @@
             "num_key_value_heads": 2,
             "head_dim": 64,
             "image_default_input_size": [378, 378]
-          }
-        },
-        "adapter_config": {
-          "type": "config.AdapterConfig",
-          "kwargs": {
+          },
+          "adapter_config": {
             "hidden_size": 128,
             "intermediate_size": 256,
             "text_hidden_size": 256,
@@ -1138,1328 +540,690 @@
             "head_dim": 64,
             "vit_layers": [-1, -2]
           }
-        },
-        "vision_config": {
-          "type": "VisionConfig",
-          "kwargs": {"vit_config": {"ref": "vit_config"}, "adapter_config": {"ref": "adapter_config"}}
-        },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {"text_config": {"ref": "text_config"}, "vision_config": {"ref": "vision_config"}}
         }
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "molmo2"]}
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "input_embeddings"]
     },
     {
       "id": "TestModels.deepseek_vl_v2",
       "module": "deepseek_vl_v2",
-      "configs": {
-        "text_config": {"type": "TextConfig", "kwargs": {"model_type": "text"}},
-        "vision_config": {"type": "VisionConfig", "kwargs": {"model_type": "vision"}},
-        "projector_config": {"type": "ProjectorConfig"},
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "projector_config": {"ref": "projector_config"},
-            "model_type": "deepseek_v2"
-          }
-        }
+      "config": {
+        "text_config": {"model_type": "text"},
+        "vision_config": {"model_type": "vision"},
+        "projector_config": {},
+        "model_type": "deepseek_v2"
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.width"},
-            {"ref": "config.vision_config.num_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ]
-        }
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "vision"],
+      "vision_path": "vision"
     },
     {
       "id": "TestModels.aya_vision",
       "module": "aya_vision",
-      "configs": {
-        "text_config": {"type": "TextConfig", "kwargs": {"model_type": "aya_vision"}},
+      "config": {
+        "model_type": "aya_vision",
+        "text_config": {"model_type": "aya_vision"},
         "vision_config": {
-          "type": "VisionConfig",
-          "kwargs": {
-            "model_type": "siglip_vision_model",
-            "hidden_size": 1152,
-            "num_attention_heads": 16,
-            "patch_size": 14,
-            "num_hidden_layers": 27
-          }
-        },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "model_type": "aya_vision",
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"}
-          }
+          "model_type": "siglip_vision_model",
+          "hidden_size": 1152,
+          "num_attention_heads": 16,
+          "patch_size": 14,
+          "num_hidden_layers": 27
         }
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_tower"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.vision_config.num_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ]
-        },
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "aya_vision"]}
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "vision", "input_embeddings"]
     },
     {
       "id": "TestModels.llama4",
       "module": "llama4",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "model_type": "llama4_text",
-            "hidden_size": 5120,
-            "num_hidden_layers": 3,
-            "intermediate_size": 8192,
-            "num_attention_heads": 40,
-            "num_key_value_heads": 8,
-            "rms_norm_eps": 1e-05,
-            "vocab_size": 32000
-          }
+          "model_type": "llama4_text",
+          "hidden_size": 5120,
+          "num_hidden_layers": 3,
+          "intermediate_size": 8192,
+          "num_attention_heads": 40,
+          "num_key_value_heads": 8,
+          "rms_norm_eps": 1e-05,
+          "vocab_size": 32000
         },
         "vision_config": {
-          "type": "VisionConfig",
-          "kwargs": {
-            "model_type": "llama4_vision_model",
-            "image_size": 336,
-            "patch_size": 14,
-            "num_channels": 3,
-            "num_hidden_layers": 3,
-            "hidden_size": 1408,
-            "intermediate_size": 5632,
-            "num_attention_heads": 16,
-            "norm_eps": 1e-05,
-            "initializer_range": 0.02,
-            "pixel_shuffle_ratio": 0.5,
-            "projector_input_dim": 4096,
-            "projector_output_dim": 4096,
-            "projector_dropout": 0.0,
-            "vision_output_dim": 4096,
-            "rope_theta": 10000,
-            "vision_feature_layer": -1,
-            "vision_feature_select_strategy": "default"
-          }
+          "model_type": "llama4_vision_model",
+          "image_size": 336,
+          "patch_size": 14,
+          "num_channels": 3,
+          "num_hidden_layers": 3,
+          "hidden_size": 1408,
+          "intermediate_size": 5632,
+          "num_attention_heads": 16,
+          "norm_eps": 1e-05,
+          "initializer_range": 0.02,
+          "pixel_shuffle_ratio": 0.5,
+          "projector_input_dim": 4096,
+          "projector_output_dim": 4096,
+          "projector_dropout": 0.0,
+          "vision_output_dim": 4096,
+          "rope_theta": 10000,
+          "vision_feature_layer": -1,
+          "vision_feature_select_strategy": "default"
         },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "model_type": "llama4"
-          }
-        }
+        "model_type": "llama4"
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_model"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.vision_config.num_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ],
-          "kwargs": {
-            "channel_first": true,
-            "projector_output_dim": {"ref": "config.vision_config.projector_output_dim"}
-          }
-        }
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "vision"],
+      "vision_path": "vision_model",
+      "vision": {"channel_first": true}
     },
     {
       "id": "TestModels.gemma3",
       "module": "gemma3",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "model_type": "gemma3",
-            "hidden_size": 2048,
-            "num_hidden_layers": 18,
-            "intermediate_size": 16384,
-            "vocab_size": 257216
-          }
+          "model_type": "gemma3",
+          "hidden_size": 2048,
+          "num_hidden_layers": 18,
+          "intermediate_size": 16384,
+          "vocab_size": 257216
         },
         "vision_config": {
-          "type": "VisionConfig",
-          "kwargs": {
-            "model_type": "gemma3",
-            "patch_size": 14,
-            "num_hidden_layers": 18,
-            "hidden_size": 2048,
-            "intermediate_size": 16384,
-            "num_attention_heads": 8
-          }
+          "model_type": "gemma3",
+          "patch_size": 14,
+          "num_hidden_layers": 18,
+          "hidden_size": 2048,
+          "intermediate_size": 16384,
+          "num_attention_heads": 8
         },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "model_type": "gemma3"
-          }
-        }
+        "model_type": "gemma3"
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_tower"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.vision_config.num_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ]
-        },
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "gemma3"]}
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "vision", "input_embeddings"]
     },
     {
       "id": "TestModels.hunyuan_vl",
       "module": "hunyuan_vl",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "num_hidden_layers": 6,
-            "rope_scaling": {
-              "alpha": 1000.0,
-              "beta_fast": 32,
-              "beta_slow": 1,
-              "factor": 1.0,
-              "mscale": 1.0,
-              "mscale_all_dim": 1.0,
-              "type": "xdrope",
-              "xdrope_section": [16, 16, 16, 16]
-            }
+          "num_hidden_layers": 6,
+          "rope_scaling": {
+            "alpha": 1000.0,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "factor": 1.0,
+            "mscale": 1.0,
+            "mscale_all_dim": 1.0,
+            "type": "xdrope",
+            "xdrope_section": [16, 16, 16, 16]
           }
         },
-        "vision_config": {"type": "VisionConfig", "kwargs": {"num_hidden_layers": 5}},
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {"text_config": {"ref": "text_config"}, "vision_config": {"ref": "vision_config"}}
-        }
+        "vision_config": {"num_hidden_layers": 5}
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_tower"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.out_hidden_size"},
-            {"ref": "config.vision_config.num_channels"},
-            {"tuple": [1080, 768]}
-          ],
-          "kwargs": {"vision_feature_layer": -1, "grid_thw": {"array": [[1, 18, 60]], "dtype": "int64"}}
-        },
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "hunyuan_vl"]}
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "vision", "input_embeddings"],
+      "vision": {"input_shape": [1080, 768], "feature_layer": -1, "grid_thw": [[1, 18, 60]]}
     },
     {
       "id": "TestModels.ernie4_5_moe_vl",
       "module": "ernie4_5_moe_vl",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "hidden_size": 256,
-            "intermediate_size": 512,
-            "num_hidden_layers": 4,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "vocab_size": 1000,
-            "rope_theta": 500000,
-            "rope_scaling": {"type": "default", "mrope_section": [12, 12, 8]},
-            "tie_word_embeddings": true,
-            "moe_num_experts": [8, 8],
-            "moe_intermediate_size": [128, 64],
-            "moe_layer_start_index": [1, 1],
-            "moe_layer_end_index": [4, 3],
-            "moe_num_shared_experts": 1
-          }
+          "hidden_size": 256,
+          "intermediate_size": 512,
+          "num_hidden_layers": 4,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "vocab_size": 1000,
+          "rope_theta": 500000,
+          "rope_scaling": {"type": "default", "mrope_section": [12, 12, 8]},
+          "tie_word_embeddings": true,
+          "moe_num_experts": [8, 8],
+          "moe_intermediate_size": [128, 64],
+          "moe_layer_start_index": [1, 1],
+          "moe_layer_end_index": [4, 3],
+          "moe_num_shared_experts": 1
         },
-        "vision_config": {
-          "type": "VisionConfig",
-          "kwargs": {"depth": 4, "embed_dim": 128, "hidden_size": 128, "num_heads": 4}
-        },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "hidden_size": 256,
-            "pixel_hidden_size": 128,
-            "vocab_size": 1000
-          }
-        }
+        "vision_config": {"depth": 4, "embed_dim": 128, "hidden_size": 128, "num_heads": 4},
+        "hidden_size": 256,
+        "pixel_hidden_size": 128,
+        "vocab_size": 1000
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        }
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language"]
     },
     {
       "id": "TestModels.phi4_siglip",
       "module": "phi4_siglip",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "hidden_size": 32,
-            "intermediate_size": 64,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "vocab_size": 1000
-          }
+          "hidden_size": 32,
+          "intermediate_size": 64,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "vocab_size": 1000
         },
         "vision_config": {
-          "type": "VisionConfig",
-          "kwargs": {
-            "hidden_size": 16,
-            "intermediate_size": 32,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 2,
-            "patch_size": 14
-          }
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "patch_size": 14
         },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "mm_hidden_size": 16
-          }
-        }
+        "mm_hidden_size": 16
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        }
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language"]
     },
     {
       "id": "TestModels.mistral4",
       "module": "mistral3",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "model_type": "mistral4",
-            "hidden_size": 64,
-            "num_hidden_layers": 2,
-            "intermediate_size": 128,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 4,
-            "rms_norm_eps": 1e-05,
-            "vocab_size": 256,
-            "max_position_embeddings": 1024,
-            "rope_parameters": {
-              "rope_theta": 1000000.0,
-              "rope_type": "yarn",
-              "factor": 4.0,
-              "llama_4_scaling_beta": 0.1,
-              "original_max_position_embeddings": 512
-            },
-            "q_lora_rank": 32,
-            "kv_lora_rank": 16,
-            "qk_rope_head_dim": 8,
-            "qk_nope_head_dim": 8,
-            "v_head_dim": 16,
-            "n_routed_experts": 4,
-            "n_shared_experts": 1,
-            "num_experts_per_tok": 2,
-            "moe_intermediate_size": 64
-          }
+          "model_type": "mistral4",
+          "hidden_size": 64,
+          "num_hidden_layers": 2,
+          "intermediate_size": 128,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 4,
+          "rms_norm_eps": 1e-05,
+          "vocab_size": 256,
+          "max_position_embeddings": 1024,
+          "rope_parameters": {
+            "rope_theta": 1000000.0,
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "llama_4_scaling_beta": 0.1,
+            "original_max_position_embeddings": 512
+          },
+          "q_lora_rank": 32,
+          "kv_lora_rank": 16,
+          "qk_rope_head_dim": 8,
+          "qk_nope_head_dim": 8,
+          "v_head_dim": 16,
+          "n_routed_experts": 4,
+          "n_shared_experts": 1,
+          "num_experts_per_tok": 2,
+          "moe_intermediate_size": 64
         },
-        "vision_config": {"type": "VisionConfig", "kwargs": {"num_hidden_layers": 2}},
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "model_type": "mistral3"
-          }
-        }
+        "vision_config": {"num_hidden_layers": 2},
+        "model_type": "mistral3"
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_tower"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.vision_config.num_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ]
-        }
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "vision"]
     },
     {
       "id": "TestModels.falcon_ocr",
       "module": "falcon_ocr",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "hidden_size": 64,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 4,
-            "head_dim": 16,
-            "num_key_value_heads": 2,
-            "vocab_size": 256,
-            "intermediate_size": 128,
-            "max_position_embeddings": 512
-          }
+          "hidden_size": 64,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 4,
+          "head_dim": 16,
+          "num_key_value_heads": 2,
+          "vocab_size": 256,
+          "intermediate_size": 128,
+          "max_position_embeddings": 512
         },
-        "vision_config": {"type": "VisionConfig", "kwargs": {"spatial_patch_size": 4}},
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "vocab_size": 256
-          }
-        }
+        "vision_config": {"spatial_patch_size": 4},
+        "vocab_size": 256
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "falcon_ocr"]}
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "input_embeddings"]
     },
     {
       "id": "TestModels.falcon_perception",
       "module": "falcon_perception",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "hidden_size": 64,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 4,
-            "head_dim": 16,
-            "num_key_value_heads": 2,
-            "vocab_size": 256,
-            "intermediate_size": 128,
-            "max_position_embeddings": 512
-          }
+          "hidden_size": 64,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 4,
+          "head_dim": 16,
+          "num_key_value_heads": 2,
+          "vocab_size": 256,
+          "intermediate_size": 128,
+          "max_position_embeddings": 512
         },
-        "vision_config": {"type": "VisionConfig", "kwargs": {"spatial_patch_size": 4}},
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "vocab_size": 256,
-            "coord_enc_dim": 64,
-            "coord_dec_dim": 128,
-            "coord_out_dim": 256,
-            "size_enc_dim": 64,
-            "size_dec_dim": 128,
-            "size_out_dim": 256,
-            "do_segmentation": false,
-            "segm_out_dim": 64,
-            "num_segm_layers": 1
-          }
-        }
+        "vision_config": {"spatial_patch_size": 4},
+        "vocab_size": 256,
+        "coord_enc_dim": 64,
+        "coord_dec_dim": 128,
+        "coord_out_dim": 256,
+        "size_enc_dim": 64,
+        "size_dec_dim": 128,
+        "size_out_dim": 256,
+        "do_segmentation": false,
+        "segm_out_dim": 64,
+        "num_segm_layers": 1
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "falcon_perception"]}
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "input_embeddings"]
     },
     {
       "id": "TestModels.granite_vision",
       "module": "granite_vision",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "hidden_size": 32,
-            "intermediate_size": 64,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "vocab_size": 1000
-          }
+          "hidden_size": 32,
+          "intermediate_size": 64,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "vocab_size": 1000
         },
         "vision_config": {
-          "type": "VisionConfig",
-          "kwargs": {
-            "hidden_size": 16,
-            "intermediate_size": 32,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 2,
-            "image_size": 56
-          }
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 2,
+          "image_size": 56
         },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "vision_feature_layer": [-2, -1]
-          }
-        }
+        "vision_feature_layer": [-2, -1]
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        }
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language"]
     },
     {
       "id": "TestModels.granite4_1_vision",
       "module": "granite4_vision",
-      "configs": {
+      "config": {
         "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
-            "model_type": "granite",
-            "hidden_size": 64,
-            "intermediate_size": 128,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "vocab_size": 1000
-          }
+          "model_type": "granite",
+          "hidden_size": 64,
+          "intermediate_size": 128,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "vocab_size": 1000
         },
         "vision_config": {
-          "type": "VisionConfig",
-          "kwargs": {
-            "hidden_size": 64,
-            "intermediate_size": 128,
-            "num_hidden_layers": 2,
-            "num_attention_heads": 4,
-            "image_size": 48
-          }
+          "hidden_size": 64,
+          "intermediate_size": 128,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 4,
+          "image_size": 48
         },
-        "config": {
-          "type": "ModelConfig",
-          "kwargs": {
-            "text_config": {"ref": "text_config"},
-            "vision_config": {"ref": "vision_config"},
-            "deepstack_layer_map": [[-1, 0]],
-            "use_spatial_sampling": false,
-            "downsample_rate": "3/3",
-            "use_image_newline_parameter": false
-          }
-        }
+        "deepstack_layer_map": [[-1, 0]],
+        "use_spatial_sampling": false,
+        "downsample_rate": "3/3",
+        "use_image_newline_parameter": false
       },
-      "checks": [
-        {
-          "kind": "language",
-          "args": [{"ref": "model.language_model"}, {"ref": "config.text_config"}]
-        },
-        {
-          "kind": "vision",
-          "args": [
-            {"ref": "model.vision_tower"},
-            {"ref": "config.vision_config.model_type"},
-            {"ref": "config.vision_config.hidden_size"},
-            {"ref": "config.vision_config.num_channels"},
-            {
-              "tuple": [
-                {"ref": "config.vision_config.image_size"},
-                {"ref": "config.vision_config.image_size"}
-              ]
-            }
-          ],
-          "kwargs": {"vision_feature_layer": 0}
-        }
-      ],
-      "model": {"name": "model", "type": "Model", "args": [{"ref": "config"}]}
+      "checks": ["language", "vision"],
+      "vision": {"feature_layer": 0}
     },
     {
       "id": "TestGetInputEmbeddings.qwen2_vl_input_embeddings",
       "module": "qwen2_vl",
-      "configs": {},
-      "checks": [
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "qwen2_vl"]},
-        {"kind": "request_positions", "args": [{"ref": "model"}]},
-        {"kind": "chunked_positions", "args": [{"ref": "model"}]}
-      ],
-      "model": {
-        "name": "model",
-        "type": "Model",
-        "args": [
-          {
-            "config": {
-              "type": "ModelConfig",
-              "kwargs": {
-                "text_config": {
-                  "config": {
-                    "type": "TextConfig",
-                    "kwargs": {
-                      "model_type": "qwen2_vl",
-                      "hidden_size": 16,
-                      "num_hidden_layers": 1,
-                      "intermediate_size": 32,
-                      "num_attention_heads": 2,
-                      "vocab_size": 32,
-                      "num_key_value_heads": 2,
-                      "rms_norm_eps": 1e-06,
-                      "rope_scaling": {"type": "mrope", "mrope_section": [2, 1, 1]}
-                    }
-                  }
-                },
-                "vision_config": {
-                  "config": {
-                    "type": "VisionConfig",
-                    "kwargs": {
-                      "depth": 1,
-                      "embed_dim": 16,
-                      "hidden_size": 16,
-                      "num_heads": 2,
-                      "image_size": 28
-                    }
-                  }
-                },
-                "model_type": "qwen2_vl",
-                "image_token_id": 31,
-                "vocab_size": 32
-              }
-            }
-          }
-        ]
-      }
+      "config": {
+        "text_config": {
+          "model_type": "qwen2_vl",
+          "hidden_size": 16,
+          "num_hidden_layers": 1,
+          "intermediate_size": 32,
+          "num_attention_heads": 2,
+          "vocab_size": 32,
+          "num_key_value_heads": 2,
+          "rms_norm_eps": 1e-06,
+          "rope_scaling": {"type": "mrope", "mrope_section": [2, 1, 1]}
+        },
+        "vision_config": {"depth": 1, "embed_dim": 16, "hidden_size": 16, "num_heads": 2, "image_size": 28},
+        "model_type": "qwen2_vl",
+        "image_token_id": 31,
+        "vocab_size": 32
+      },
+      "checks": ["input_embeddings", "request_positions", "chunked_positions"]
     },
     {
       "id": "TestGetInputEmbeddings.qwen2_5_vl_input_embeddings",
       "module": "qwen2_5_vl",
-      "configs": {},
-      "checks": [
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "qwen2_5_vl"]},
-        {"kind": "request_positions", "args": [{"ref": "model"}]},
-        {"kind": "chunked_positions", "args": [{"ref": "model"}]}
-      ],
-      "model": {
-        "name": "model",
-        "type": "Model",
-        "args": [
-          {
-            "config": {
-              "type": "ModelConfig",
-              "kwargs": {
-                "text_config": {
-                  "config": {
-                    "type": "TextConfig",
-                    "kwargs": {
-                      "model_type": "qwen2_5_vl",
-                      "hidden_size": 16,
-                      "num_hidden_layers": 1,
-                      "intermediate_size": 32,
-                      "num_attention_heads": 2,
-                      "vocab_size": 32,
-                      "num_key_value_heads": 2,
-                      "rms_norm_eps": 1e-06,
-                      "rope_scaling": {"type": "mrope", "mrope_section": [2, 1, 1]}
-                    }
-                  }
-                },
-                "vision_config": {
-                  "config": {
-                    "type": "VisionConfig",
-                    "kwargs": {
-                      "depth": 1,
-                      "hidden_size": 16,
-                      "num_heads": 2,
-                      "out_hidden_size": 16,
-                      "image_size": 28,
-                      "fullatt_block_indexes": [0],
-                      "window_size": 14
-                    }
-                  }
-                },
-                "model_type": "qwen2_5_vl",
-                "image_token_id": 31,
-                "vocab_size": 32
-              }
-            }
-          }
-        ]
-      }
+      "config": {
+        "text_config": {
+          "model_type": "qwen2_5_vl",
+          "hidden_size": 16,
+          "num_hidden_layers": 1,
+          "intermediate_size": 32,
+          "num_attention_heads": 2,
+          "vocab_size": 32,
+          "num_key_value_heads": 2,
+          "rms_norm_eps": 1e-06,
+          "rope_scaling": {"type": "mrope", "mrope_section": [2, 1, 1]}
+        },
+        "vision_config": {
+          "depth": 1,
+          "hidden_size": 16,
+          "num_heads": 2,
+          "out_hidden_size": 16,
+          "image_size": 28,
+          "fullatt_block_indexes": [0],
+          "window_size": 14
+        },
+        "model_type": "qwen2_5_vl",
+        "image_token_id": 31,
+        "vocab_size": 32
+      },
+      "checks": ["input_embeddings", "request_positions", "chunked_positions"]
     },
     {
       "id": "TestGetInputEmbeddings.qwen3_vl_input_embeddings",
       "module": "qwen3_vl",
-      "configs": {},
-      "checks": [
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "qwen3_vl"]},
-        {"kind": "request_positions", "args": [{"ref": "model"}]},
-        {"kind": "chunked_positions", "args": [{"ref": "model"}]}
-      ],
-      "model": {
-        "name": "model",
-        "type": "Model",
-        "args": [
-          {
-            "config": {
-              "type": "ModelConfig",
-              "kwargs": {
-                "text_config": {
-                  "config": {
-                    "type": "TextConfig",
-                    "kwargs": {
-                      "model_type": "qwen3_vl_text",
-                      "hidden_size": 16,
-                      "num_hidden_layers": 1,
-                      "intermediate_size": 32,
-                      "num_attention_heads": 2,
-                      "vocab_size": 32,
-                      "num_key_value_heads": 2,
-                      "rms_norm_eps": 1e-05,
-                      "head_dim": 8,
-                      "rope_theta": 1000.0,
-                      "max_position_embeddings": 1000,
-                      "rope_scaling": {"rope_type": "mrope", "mrope_section": [2, 1, 1]}
-                    }
-                  }
-                },
-                "vision_config": {
-                  "config": {
-                    "type": "VisionConfig",
-                    "kwargs": {
-                      "depth": 1,
-                      "hidden_size": 16,
-                      "num_heads": 2,
-                      "out_hidden_size": 16,
-                      "num_position_embeddings": 4,
-                      "deepstack_visual_indexes": []
-                    }
-                  }
-                },
-                "model_type": "qwen3_vl",
-                "image_token_id": 31,
-                "vocab_size": 32
-              }
-            }
-          }
-        ]
-      }
+      "config": {
+        "text_config": {
+          "model_type": "qwen3_vl_text",
+          "hidden_size": 16,
+          "num_hidden_layers": 1,
+          "intermediate_size": 32,
+          "num_attention_heads": 2,
+          "vocab_size": 32,
+          "num_key_value_heads": 2,
+          "rms_norm_eps": 1e-05,
+          "head_dim": 8,
+          "rope_theta": 1000.0,
+          "max_position_embeddings": 1000,
+          "rope_scaling": {"rope_type": "mrope", "mrope_section": [2, 1, 1]}
+        },
+        "vision_config": {
+          "depth": 1,
+          "hidden_size": 16,
+          "num_heads": 2,
+          "out_hidden_size": 16,
+          "num_position_embeddings": 4,
+          "deepstack_visual_indexes": []
+        },
+        "model_type": "qwen3_vl",
+        "image_token_id": 31,
+        "vocab_size": 32
+      },
+      "checks": ["input_embeddings", "request_positions", "chunked_positions"]
     },
     {
       "id": "TestGetInputEmbeddings.mistral3_input_embeddings",
       "module": "mistral3",
-      "configs": {},
-      "checks": [{"kind": "input_embeddings", "args": [{"ref": "model"}, "mistral3"]}],
-      "model": {
-        "name": "model",
-        "type": "Model",
-        "args": [
-          {
-            "config": {
-              "type": "ModelConfig",
-              "kwargs": {
-                "text_config": {
-                  "config": {
-                    "type": "TextConfig",
-                    "kwargs": {
-                      "model_type": "mistral",
-                      "hidden_size": 16,
-                      "num_hidden_layers": 1,
-                      "intermediate_size": 32,
-                      "num_attention_heads": 2,
-                      "vocab_size": 32,
-                      "num_key_value_heads": 2,
-                      "rms_norm_eps": 1e-05,
-                      "head_dim": 8,
-                      "layer_types": ["full_attention"]
-                    }
-                  }
-                },
-                "vision_config": {
-                  "config": {
-                    "type": "VisionConfig",
-                    "kwargs": {
-                      "num_hidden_layers": 1,
-                      "hidden_size": 16,
-                      "intermediate_size": 32,
-                      "num_attention_heads": 2,
-                      "image_size": 28
-                    }
-                  }
-                },
-                "model_type": "mistral3"
-              }
-            }
-          }
-        ]
-      }
+      "config": {
+        "text_config": {
+          "model_type": "mistral",
+          "hidden_size": 16,
+          "num_hidden_layers": 1,
+          "intermediate_size": 32,
+          "num_attention_heads": 2,
+          "vocab_size": 32,
+          "num_key_value_heads": 2,
+          "rms_norm_eps": 1e-05,
+          "head_dim": 8,
+          "layer_types": ["full_attention"]
+        },
+        "vision_config": {
+          "num_hidden_layers": 1,
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_attention_heads": 2,
+          "image_size": 28
+        },
+        "model_type": "mistral3"
+      },
+      "checks": ["input_embeddings"]
     },
     {
       "id": "TestGetInputEmbeddings.deepseek_vl_v2_input_embeddings",
       "module": "deepseek_vl_v2",
-      "configs": {},
-      "checks": [{"kind": "input_embeddings", "args": [{"ref": "model"}, "deepseek_vl_v2"]}],
-      "model": {
-        "name": "model",
-        "type": "Model",
-        "args": [
-          {
-            "config": {
-              "type": "ModelConfig",
-              "kwargs": {
-                "text_config": {
-                  "config": {
-                    "type": "TextConfig",
-                    "kwargs": {
-                      "hidden_size": 16,
-                      "num_hidden_layers": 1,
-                      "intermediate_size": 32,
-                      "num_attention_heads": 2,
-                      "vocab_size": 32,
-                      "num_key_value_heads": 2,
-                      "kv_lora_rank": 8,
-                      "q_lora_rank": 16,
-                      "qk_rope_head_dim": 8,
-                      "v_head_dim": 8,
-                      "qk_nope_head_dim": 0,
-                      "moe_intermediate_size": 16,
-                      "n_shared_experts": 1,
-                      "n_routed_experts": 2,
-                      "num_experts_per_tok": 1
-                    }
-                  }
-                },
-                "vision_config": {
-                  "config": {
-                    "type": "VisionConfig",
-                    "kwargs": {
-                      "model_type": "vision",
-                      "layers": 1,
-                      "width": 16,
-                      "intermediate_size": 32,
-                      "num_attention_heads": 2
-                    }
-                  }
-                },
-                "projector_config": {"config": {"type": "ProjectorConfig", "kwargs": {"input_dim": 16, "n_embed": 16}}},
-                "model_type": "deepseek_vl_v2"
-              }
-            }
-          }
-        ]
-      }
+      "config": {
+        "text_config": {
+          "hidden_size": 16,
+          "num_hidden_layers": 1,
+          "intermediate_size": 32,
+          "num_attention_heads": 2,
+          "vocab_size": 32,
+          "num_key_value_heads": 2,
+          "kv_lora_rank": 8,
+          "q_lora_rank": 16,
+          "qk_rope_head_dim": 8,
+          "v_head_dim": 8,
+          "qk_nope_head_dim": 0,
+          "moe_intermediate_size": 16,
+          "n_shared_experts": 1,
+          "n_routed_experts": 2,
+          "num_experts_per_tok": 1
+        },
+        "vision_config": {
+          "model_type": "vision",
+          "layers": 1,
+          "width": 16,
+          "intermediate_size": 32,
+          "num_attention_heads": 2
+        },
+        "projector_config": {"input_dim": 16, "n_embed": 16},
+        "model_type": "deepseek_vl_v2"
+      },
+      "checks": ["input_embeddings"]
     },
     {
       "id": "TestGetInputEmbeddings.deepseekocr_input_embeddings",
       "module": "deepseekocr",
-      "configs": {},
-      "checks": [{"kind": "input_embeddings", "args": [{"ref": "model"}, "deepseekocr"]}],
-      "model": {
-        "name": "model",
-        "type": "Model",
-        "args": [
-          {
-            "config": {
-              "type": "ModelConfig",
-              "kwargs": {
-                "text_config": {
-                  "config": {
-                    "type": "TextConfig",
-                    "kwargs": {
-                      "hidden_size": 16,
-                      "num_hidden_layers": 1,
-                      "intermediate_size": 32,
-                      "num_attention_heads": 2,
-                      "vocab_size": 32,
-                      "num_key_value_heads": 2,
-                      "kv_lora_rank": 8,
-                      "q_lora_rank": 16,
-                      "v_head_dim": 8,
-                      "moe_intermediate_size": 16,
-                      "n_shared_experts": 1,
-                      "n_routed_experts": 2,
-                      "num_experts_per_tok": 1
-                    }
-                  }
-                },
-                "vision_config": {
-                  "config": {
-                    "type": "VisionConfig",
-                    "kwargs": {
-                      "model_type": "vision",
-                      "layers": 1,
-                      "width": 16,
-                      "hidden_size": 16,
-                      "intermediate_size": 32,
-                      "num_attention_heads": 2
-                    }
-                  }
-                },
-                "projector_config": {"config": {"type": "ProjectorConfig", "kwargs": {"input_dim": 16, "n_embed": 16}}},
-                "model_type": "deepseekocr"
-              }
-            }
-          }
-        ]
-      }
+      "config": {
+        "text_config": {
+          "hidden_size": 16,
+          "num_hidden_layers": 1,
+          "intermediate_size": 32,
+          "num_attention_heads": 2,
+          "vocab_size": 32,
+          "num_key_value_heads": 2,
+          "kv_lora_rank": 8,
+          "q_lora_rank": 16,
+          "v_head_dim": 8,
+          "moe_intermediate_size": 16,
+          "n_shared_experts": 1,
+          "n_routed_experts": 2,
+          "num_experts_per_tok": 1
+        },
+        "vision_config": {
+          "model_type": "vision",
+          "layers": 1,
+          "width": 16,
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_attention_heads": 2
+        },
+        "projector_config": {"input_dim": 16, "n_embed": 16},
+        "model_type": "deepseekocr"
+      },
+      "checks": ["input_embeddings"]
     },
     {
       "id": "TestGetInputEmbeddings.fastvlm_input_embeddings",
       "module": "fastvlm",
-      "configs": {},
-      "checks": [{"kind": "input_embeddings", "args": [{"ref": "model"}, "fastvlm"]}],
-      "model": {
-        "name": "model",
-        "type": "Model",
-        "args": [
-          {
-            "config": {
-              "type": "ModelConfig",
-              "kwargs": {
-                "text_config": {
-                  "config": {
-                    "type": "TextConfig",
-                    "kwargs": {
-                      "model_type": "fastvlm",
-                      "hidden_size": 16,
-                      "num_hidden_layers": 1,
-                      "intermediate_size": 32,
-                      "num_attention_heads": 2,
-                      "vocab_size": 32
-                    }
-                  }
-                },
-                "vision_config": {"config": {"type": "VisionConfig", "kwargs": {"hidden_size": 16}}},
-                "mm_hidden_size": 16
-              }
-            }
-          }
-        ]
-      }
+      "config": {
+        "text_config": {
+          "model_type": "fastvlm",
+          "hidden_size": 16,
+          "num_hidden_layers": 1,
+          "intermediate_size": 32,
+          "num_attention_heads": 2,
+          "vocab_size": 32
+        },
+        "vision_config": {"hidden_size": 16},
+        "mm_hidden_size": 16
+      },
+      "checks": ["input_embeddings"]
     },
     {
       "id": "TestGetInputEmbeddings.florence2_input_embeddings",
       "module": "florence2",
-      "configs": {},
-      "checks": [{"kind": "input_embeddings", "args": [{"ref": "model"}, "florence2"]}],
-      "model": {
-        "name": "model",
-        "type": "Model",
-        "args": [
-          {
-            "config": {
-              "type": "ModelConfig",
-              "kwargs": {
-                "vision_config": {
-                  "config": {
-                    "type": "VisionConfig",
-                    "kwargs": {
-                      "hidden_size": 16,
-                      "depths": [1],
-                      "dim_embed": [16],
-                      "num_heads": [2],
-                      "num_groups": [2],
-                      "patch_size": [7],
-                      "patch_stride": [4],
-                      "patch_padding": [3],
-                      "patch_prenorm": [false]
-                    }
-                  }
-                },
-                "text_config": {
-                  "config": {
-                    "type": "TextConfig",
-                    "kwargs": {
-                      "d_model": 16,
-                      "encoder_attention_heads": 2,
-                      "decoder_attention_heads": 2,
-                      "encoder_ffn_dim": 32,
-                      "decoder_ffn_dim": 32,
-                      "encoder_layers": 1,
-                      "decoder_layers": 1,
-                      "vocab_size": 32
-                    }
-                  }
-                },
-                "vocab_size": 32
-              }
-            }
-          }
-        ]
-      }
+      "config": {
+        "vision_config": {
+          "hidden_size": 16,
+          "depths": [1],
+          "dim_embed": [16],
+          "num_heads": [2],
+          "num_groups": [2],
+          "patch_size": [7],
+          "patch_stride": [4],
+          "patch_padding": [3],
+          "patch_prenorm": [false]
+        },
+        "text_config": {
+          "d_model": 16,
+          "encoder_attention_heads": 2,
+          "decoder_attention_heads": 2,
+          "encoder_ffn_dim": 32,
+          "decoder_ffn_dim": 32,
+          "encoder_layers": 1,
+          "decoder_layers": 1,
+          "vocab_size": 32
+        },
+        "vocab_size": 32
+      },
+      "checks": ["input_embeddings"]
     },
     {
       "id": "TestGetInputEmbeddings.gemma3n_input_embeddings",
       "module": "gemma3n",
-      "configs": {},
-      "checks": [{"kind": "input_embeddings", "args": [{"ref": "model"}, "gemma3n"]}],
-      "model": {
-        "name": "model",
-        "type": "Model",
-        "args": [
-          {
-            "config": {
-              "type": "ModelConfig",
-              "kwargs": {
-                "text_config": {
-                  "config": {
-                    "type": "TextConfig",
-                    "kwargs": {
-                      "model_type": "gemma3n",
-                      "hidden_size": 16,
-                      "num_hidden_layers": 2,
-                      "intermediate_size": [32, 32],
-                      "num_key_value_heads": 2,
-                      "head_dim": 8,
-                      "vocab_size": 32,
-                      "vocab_size_per_layer_input": 32,
-                      "hidden_size_per_layer_input": 16,
-                      "altup_num_inputs": 2,
-                      "laurel_rank": 8,
-                      "layer_types": ["sliding_attention", "full_attention"],
-                      "sliding_window_pattern": 1
-                    }
-                  }
-                },
-                "vision_config": {
-                  "config": {
-                    "type": "VisionConfig",
-                    "kwargs": {
-                      "hidden_size": 16,
-                      "num_hidden_layers": 1,
-                      "intermediate_size": 32,
-                      "num_attention_heads": 2,
-                      "vocab_size": 4,
-                      "vocab_offset": 32
-                    }
-                  }
-                },
-                "audio_config": {
-                  "config": {
-                    "type": "AudioConfig",
-                    "kwargs": {"vocab_size": 4, "vocab_offset": 36, "hidden_size": 16}
-                  }
-                },
-                "model_type": "gemma3n",
-                "hidden_size": 16,
-                "vocab_size": 40
-              }
-            }
-          }
-        ]
-      }
+      "config": {
+        "text_config": {
+          "model_type": "gemma3n",
+          "hidden_size": 16,
+          "num_hidden_layers": 2,
+          "intermediate_size": [32, 32],
+          "num_key_value_heads": 2,
+          "head_dim": 8,
+          "vocab_size": 32,
+          "vocab_size_per_layer_input": 32,
+          "hidden_size_per_layer_input": 16,
+          "altup_num_inputs": 2,
+          "laurel_rank": 8,
+          "layer_types": ["sliding_attention", "full_attention"],
+          "sliding_window_pattern": 1
+        },
+        "vision_config": {
+          "hidden_size": 16,
+          "num_hidden_layers": 1,
+          "intermediate_size": 32,
+          "num_attention_heads": 2,
+          "vocab_size": 4,
+          "vocab_offset": 32
+        },
+        "audio_config": {"vocab_size": 4, "vocab_offset": 36, "hidden_size": 16},
+        "model_type": "gemma3n",
+        "hidden_size": 16,
+        "vocab_size": 40
+      },
+      "checks": ["input_embeddings"]
     },
     {
       "id": "TestGetInputEmbeddings.paddleocr_vl_input_embeddings",
       "module": "paddleocr_vl",
-      "configs": {},
-      "checks": [{"kind": "input_embeddings", "args": [{"ref": "model"}, "paddleocr_vl"]}],
-      "model": {
-        "name": "model",
-        "type": "Model",
-        "args": [
-          {
-            "config": {
-              "type": "ModelConfig",
-              "kwargs": {
-                "text_config": {
-                  "config": {
-                    "type": "TextConfig",
-                    "kwargs": {
-                      "hidden_size": 16,
-                      "num_hidden_layers": 1,
-                      "intermediate_size": 32,
-                      "num_attention_heads": 2,
-                      "vocab_size": 32,
-                      "head_dim": 8
-                    }
-                  }
-                },
-                "vision_config": {
-                  "config": {
-                    "type": "VisionConfig",
-                    "kwargs": {
-                      "hidden_size": 16,
-                      "intermediate_size": 32,
-                      "num_hidden_layers": 1,
-                      "num_attention_heads": 2
-                    }
-                  }
-                }
-              }
-            }
-          }
-        ]
-      }
+      "config": {
+        "text_config": {
+          "hidden_size": 16,
+          "num_hidden_layers": 1,
+          "intermediate_size": 32,
+          "num_attention_heads": 2,
+          "vocab_size": 32,
+          "head_dim": 8
+        },
+        "vision_config": {
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_hidden_layers": 1,
+          "num_attention_heads": 2
+        }
+      },
+      "checks": ["input_embeddings"]
     },
     {
       "id": "TestGetInputEmbeddings.qwen3_vl_moe_input_embeddings",
       "module": "qwen3_vl_moe",
-      "configs": {},
-      "checks": [
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "qwen3_vl_moe"]},
-        {"kind": "request_positions", "args": [{"ref": "model"}]},
-        {"kind": "chunked_positions", "args": [{"ref": "model"}]}
-      ],
-      "model": {
-        "name": "model",
-        "type": "Model",
-        "args": [
-          {
-            "config": {
-              "type": "ModelConfig",
-              "kwargs": {
-                "text_config": {
-                  "config": {
-                    "type": "TextConfig",
-                    "kwargs": {
-                      "model_type": "qwen3_vl_moe",
-                      "num_hidden_layers": 1,
-                      "hidden_size": 16,
-                      "intermediate_size": 32,
-                      "num_attention_heads": 2,
-                      "num_experts": 2,
-                      "num_experts_per_tok": 1,
-                      "decoder_sparse_step": 1,
-                      "mlp_only_layers": [],
-                      "moe_intermediate_size": 16,
-                      "rms_norm_eps": 1e-05,
-                      "vocab_size": 32,
-                      "num_key_value_heads": 2,
-                      "head_dim": 8,
-                      "rope_theta": 10000.0,
-                      "max_position_embeddings": 128
-                    }
-                  }
-                },
-                "vision_config": {
-                  "config": {
-                    "type": "VisionConfig",
-                    "kwargs": {
-                      "depth": 1,
-                      "hidden_size": 16,
-                      "intermediate_size": 32,
-                      "out_hidden_size": 16,
-                      "num_heads": 2
-                    }
-                  }
-                },
-                "model_type": "qwen3_vl_moe"
-              }
-            }
-          }
-        ]
-      }
+      "config": {
+        "text_config": {
+          "model_type": "qwen3_vl_moe",
+          "num_hidden_layers": 1,
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "num_attention_heads": 2,
+          "num_experts": 2,
+          "num_experts_per_tok": 1,
+          "decoder_sparse_step": 1,
+          "mlp_only_layers": [],
+          "moe_intermediate_size": 16,
+          "rms_norm_eps": 1e-05,
+          "vocab_size": 32,
+          "num_key_value_heads": 2,
+          "head_dim": 8,
+          "rope_theta": 10000.0,
+          "max_position_embeddings": 128
+        },
+        "vision_config": {
+          "depth": 1,
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "out_hidden_size": 16,
+          "num_heads": 2
+        },
+        "model_type": "qwen3_vl_moe"
+      },
+      "checks": ["input_embeddings", "request_positions", "chunked_positions"]
     },
     {
       "id": "TestGetInputEmbeddings.qwen3_5_input_embeddings_owns_mrope_kwargs",
       "module": "qwen3_5",
-      "configs": {},
-      "checks": [
-        {"kind": "request_positions", "args": [{"ref": "model"}]},
-        {"kind": "chunked_positions", "args": [{"ref": "model"}]}
-      ],
-      "model": {
-        "name": "model",
-        "type": "Model",
-        "args": [
-          {
-            "config": {
-              "type": "ModelConfig",
-              "kwargs": {
-                "text_config": {
-                  "config": {
-                    "type": "TextConfig",
-                    "kwargs": {
-                      "model_type": "qwen3_5",
-                      "hidden_size": 16,
-                      "intermediate_size": 32,
-                      "linear_num_value_heads": 2,
-                      "linear_num_key_heads": 2,
-                      "linear_key_head_dim": 8,
-                      "linear_value_head_dim": 8,
-                      "linear_conv_kernel_dim": 3,
-                      "num_hidden_layers": 1,
-                      "num_attention_heads": 2,
-                      "rms_norm_eps": 1e-05,
-                      "vocab_size": 32,
-                      "num_key_value_heads": 2,
-                      "max_position_embeddings": 128,
-                      "head_dim": 8
-                    }
-                  }
-                },
-                "vision_config": {
-                  "config": {
-                    "type": "VisionConfig",
-                    "kwargs": {
-                      "depth": 1,
-                      "hidden_size": 16,
-                      "intermediate_size": 32,
-                      "out_hidden_size": 16,
-                      "num_heads": 2
-                    }
-                  }
-                },
-                "model_type": "qwen3_5"
-              }
-            }
-          }
-        ]
-      }
+      "config": {
+        "text_config": {
+          "model_type": "qwen3_5",
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "linear_num_value_heads": 2,
+          "linear_num_key_heads": 2,
+          "linear_key_head_dim": 8,
+          "linear_value_head_dim": 8,
+          "linear_conv_kernel_dim": 3,
+          "num_hidden_layers": 1,
+          "num_attention_heads": 2,
+          "rms_norm_eps": 1e-05,
+          "vocab_size": 32,
+          "num_key_value_heads": 2,
+          "max_position_embeddings": 128,
+          "head_dim": 8
+        },
+        "vision_config": {
+          "depth": 1,
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "out_hidden_size": 16,
+          "num_heads": 2
+        },
+        "model_type": "qwen3_5"
+      },
+      "checks": ["request_positions", "chunked_positions"]
     },
     {
       "id": "TestGetInputEmbeddings.qwen3_5_moe_chunked_prefill_slices_mrope_position_ids",
       "module": "qwen3_5_moe",
-      "configs": {},
-      "checks": [{"kind": "chunked_positions", "args": [{"ref": "model"}]}],
-      "model": {
-        "name": "model",
-        "type": "Model",
-        "args": [
-          {
-            "config": {
-              "type": "ModelConfig",
-              "kwargs": {
-                "text_config": {
-                  "config": {
-                    "type": "TextConfig",
-                    "kwargs": {
-                      "model_type": "qwen3_5_moe",
-                      "hidden_size": 16,
-                      "linear_num_value_heads": 2,
-                      "linear_num_key_heads": 2,
-                      "linear_key_head_dim": 8,
-                      "linear_value_head_dim": 8,
-                      "linear_conv_kernel_dim": 3,
-                      "num_hidden_layers": 1,
-                      "num_attention_heads": 2,
-                      "num_experts": 2,
-                      "num_experts_per_tok": 1,
-                      "shared_expert_intermediate_size": 32,
-                      "moe_intermediate_size": 16,
-                      "rms_norm_eps": 1e-05,
-                      "vocab_size": 32,
-                      "num_key_value_heads": 2,
-                      "max_position_embeddings": 128,
-                      "head_dim": 8
-                    }
-                  }
-                },
-                "vision_config": {
-                  "config": {
-                    "type": "VisionConfig",
-                    "kwargs": {
-                      "depth": 1,
-                      "hidden_size": 16,
-                      "intermediate_size": 32,
-                      "out_hidden_size": 16,
-                      "num_heads": 2
-                    }
-                  }
-                },
-                "model_type": "qwen3_5_moe"
-              }
-            }
-          }
-        ]
-      }
+      "config": {
+        "text_config": {
+          "model_type": "qwen3_5_moe",
+          "hidden_size": 16,
+          "linear_num_value_heads": 2,
+          "linear_num_key_heads": 2,
+          "linear_key_head_dim": 8,
+          "linear_value_head_dim": 8,
+          "linear_conv_kernel_dim": 3,
+          "num_hidden_layers": 1,
+          "num_attention_heads": 2,
+          "num_experts": 2,
+          "num_experts_per_tok": 1,
+          "shared_expert_intermediate_size": 32,
+          "moe_intermediate_size": 16,
+          "rms_norm_eps": 1e-05,
+          "vocab_size": 32,
+          "num_key_value_heads": 2,
+          "max_position_embeddings": 128,
+          "head_dim": 8
+        },
+        "vision_config": {
+          "depth": 1,
+          "hidden_size": 16,
+          "intermediate_size": 32,
+          "out_hidden_size": 16,
+          "num_heads": 2
+        },
+        "model_type": "qwen3_5_moe"
+      },
+      "checks": ["chunked_positions"]
     },
     {
       "id": "TestGetInputEmbeddings.qwen3_omni_moe_input_embeddings",
       "module": "qwen3_omni_moe",
-      "configs": {
-        "text_config": {
-          "type": "TextConfig",
-          "kwargs": {
+      "config": {
+        "thinker_config": {
+          "text_config": {
             "num_hidden_layers": 1,
             "hidden_size": 16,
             "intermediate_size": 32,
@@ -2475,84 +1239,55 @@
             "head_dim": 8,
             "rope_theta": 10000.0,
             "max_position_embeddings": 128
+          },
+          "vision_config": {
+            "depth": 1,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "out_hidden_size": 16,
+            "num_heads": 2
+          },
+          "audio_config": {
+            "d_model": 16,
+            "encoder_layers": 1,
+            "encoder_attention_heads": 2,
+            "encoder_ffn_dim": 32,
+            "num_hidden_layers": 1,
+            "output_dim": 16
           }
-        }
+        },
+        "talker_config": {
+          "text_config": {
+            "num_hidden_layers": 1,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_attention_heads": 2,
+            "num_experts": 2,
+            "num_experts_per_tok": 1,
+            "decoder_sparse_step": 1,
+            "mlp_only_layers": [],
+            "moe_intermediate_size": 16,
+            "rms_norm_eps": 1e-05,
+            "vocab_size": 32,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "rope_theta": 10000.0,
+            "max_position_embeddings": 128
+          },
+          "code_predictor_config": {
+            "num_hidden_layers": 1,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "head_dim": 8
+          },
+          "thinker_hidden_size": 16
+        },
+        "code2wav_config": {},
+        "enable_audio_output": false
       },
-      "checks": [
-        {"kind": "input_embeddings", "args": [{"ref": "model"}, "qwen3_omni_moe"]},
-        {"kind": "request_positions", "args": [{"ref": "model"}]},
-        {"kind": "chunked_positions", "args": [{"ref": "model"}]}
-      ],
-      "model": {
-        "name": "model",
-        "type": "Model",
-        "args": [
-          {
-            "config": {
-              "type": "ModelConfig",
-              "kwargs": {
-                "thinker_config": {
-                  "config": {
-                    "type": "ThinkerConfig",
-                    "kwargs": {
-                      "text_config": {"ref": "text_config"},
-                      "vision_config": {
-                        "config": {
-                          "type": "VisionConfig",
-                          "kwargs": {
-                            "depth": 1,
-                            "hidden_size": 16,
-                            "intermediate_size": 32,
-                            "out_hidden_size": 16,
-                            "num_heads": 2
-                          }
-                        }
-                      },
-                      "audio_config": {
-                        "config": {
-                          "type": "AudioConfig",
-                          "kwargs": {
-                            "d_model": 16,
-                            "encoder_layers": 1,
-                            "encoder_attention_heads": 2,
-                            "encoder_ffn_dim": 32,
-                            "num_hidden_layers": 1,
-                            "output_dim": 16
-                          }
-                        }
-                      }
-                    }
-                  }
-                },
-                "talker_config": {
-                  "config": {
-                    "type": "TalkerConfig",
-                    "kwargs": {
-                      "text_config": {"ref": "text_config"},
-                      "code_predictor_config": {
-                        "config": {
-                          "type": "CodePredictorConfig",
-                          "kwargs": {
-                            "num_hidden_layers": 1,
-                            "hidden_size": 16,
-                            "intermediate_size": 32,
-                            "num_attention_heads": 2,
-                            "num_key_value_heads": 2,
-                            "head_dim": 8
-                          }
-                        }
-                      },
-                      "thinker_hidden_size": 16
-                    }
-                  }
-                },
-                "code2wav_config": {"config": {"type": "Code2WavConfig"}},
-                "enable_audio_output": false
-              }
-            }
-          }
-        ]
-      }
+      "checks": ["input_embeddings", "request_positions", "chunked_positions"]
     }
   ],
   "dense": {
