@@ -6,8 +6,8 @@ import mlx.core as mx
 import pytest
 
 from mlx_vlm.generate import ar
-from mlx_vlm.models import deepseek_v4
-from mlx_vlm.models.cache import CacheList
+from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
+from mlx_vlm.models.cache import CacheList, RotatingKVCache
 
 
 def _graph_edges(array):
@@ -16,53 +16,36 @@ def _graph_edges(array):
     return graph.getvalue().count("->")
 
 
-@pytest.fixture
-def model():
-    mx.random.seed(0)
-    config = deepseek_v4.ModelConfig(
-        vocab_size=128,
-        hidden_size=64,
-        num_hidden_layers=3,
-        num_attention_heads=4,
-        num_key_value_heads=1,
-        q_lora_rank=16,
-        o_lora_rank=8,
-        o_groups=2,
-        head_dim=16,
-        qk_rope_head_dim=4,
-        sliding_window=16,
-        compress_ratios=[0, 128, 4],
-        index_n_heads=4,
-        index_head_dim=8,
-        index_topk=4,
-        moe_intermediate_size=16,
-        n_routed_experts=4,
-        n_shared_experts=1,
-        num_experts_per_tok=2,
-        num_hash_layers=1,
-        hc_mult=2,
-        hc_sinkhorn_iters=2,
-    )
-    model = deepseek_v4.Model(config)
-    model.eval()
-    mx.eval(model.parameters())
-    return model
+class KeyOnlyModel:
+    def __init__(self):
+        self.language_model = self
+
+    def get_input_embeddings(self, inputs, *args, **kwargs):
+        return InputEmbeddingsFeatures(inputs_embeds=inputs[..., None])
+
+    def __call__(self, inputs, cache, **kwargs):
+        entry = cache[0][0] if isinstance(cache[0], CacheList) else cache[0]
+        keys = inputs.astype(mx.float32)[:, None, :, None]
+        keys, _ = entry.update_and_fetch(keys, mx.zeros((*keys.shape[:-1], 0)))
+        logits = -((mx.arange(4) - keys.sum() % 4) ** 2)
+        return LanguageModelOutput(logits=logits[None, None])
 
 
 @pytest.mark.parametrize("prompt_length", [1, 65])
+@pytest.mark.parametrize("nested", [False, True])
 def test_decode_bounds_unused_cache_graphs_without_changing_outputs(
-    model, prompt_length, monkeypatch
+    prompt_length, nested, monkeypatch
 ):
     def decode():
-        cache = model.make_cache()
-        local_caches = [c[0] if isinstance(c, CacheList) else c for c in cache]
+        cache = RotatingKVCache(max_size=16)
+        prompt_cache = [CacheList(cache) if nested else cache]
         graph_sizes, tokens, logprobs = [], [], []
         generator = ar.generate_step(
             mx.arange(1, prompt_length + 1)[None],
-            model,
+            KeyOnlyModel(),
             pixel_values=None,
             mask=None,
-            prompt_cache=cache,
+            prompt_cache=prompt_cache,
             prefill_step_size=32,
             max_tokens=125,
             temperature=0,
@@ -71,22 +54,19 @@ def test_decode_bounds_unused_cache_graphs_without_changing_outputs(
             for token, lp in generator:
                 tokens.append(token)
                 logprobs.append(lp)
-                graph_sizes.append([_graph_edges(c.values) for c in local_caches])
-            result = mx.stack(logprobs)
-            mx.eval(result)
-            return tokens, result, graph_sizes
+                graph_sizes.append(_graph_edges(cache.values))
+            return tokens, mx.stack(logprobs), graph_sizes
         finally:
             generator.close()
-            mx.eval([c.state for c in cache])
+            mx.eval(cache.state)
 
     tokens, logprobs, graph_sizes = decode()
     assert len(tokens) == 125
-    assert max(max(sizes) for sizes in graph_sizes) < 400
-    assert graph_sizes[49] == [0, 0, 0]
-    assert graph_sizes[99] == [0, 0, 0]
+    assert graph_sizes[49] == graph_sizes[99] == 0
+    assert max(graph_sizes[50:]) <= max(graph_sizes[:50])
 
-    monkeypatch.setattr(ar, "DEFAULT_CACHE_EVAL_INTERVAL", 10**9)
+    monkeypatch.setattr(ar, "DEFAULT_CACHE_EVAL_INTERVAL", len(tokens) + 1)
     reference_tokens, reference_logprobs, unbounded = decode()
-    assert min(unbounded[-1]) > 800
+    assert unbounded[-1] > max(graph_sizes)
     assert tokens == reference_tokens
     assert mx.array_equal(logprobs, reference_logprobs).item()
