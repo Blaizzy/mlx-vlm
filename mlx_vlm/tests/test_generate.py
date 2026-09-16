@@ -1097,10 +1097,14 @@ class TestBatchGenerator:
             processor=mock_processor,
             max_tokens=50,
         )
-        prompt_batch = SimpleNamespace(
+        prompt_batch = PromptProcessingBatch(
+            model=mock_model.language_model,
             uids=[7],
-            prompt_cache=[MagicMock()],
-            input_ids=mx.array([[1, mock_model.config.image_token_index, 2]]),
+            max_tokens=[50],
+            input_ids=[[1, mock_model.config.image_token_index, 2]],
+            inputs_embeds=mx.zeros((1, 3, 4)),
+            prompt_kwargs={},
+            warm_cache=[BatchKVCache([0])],
         )
         gen._prompt_batch = prompt_batch
 

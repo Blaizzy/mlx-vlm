@@ -1634,7 +1634,8 @@ class BatchKVCache(_BaseCache):
             self._right_padding = self._right_padding[batch_indices]
 
         # Shift left to reduce padding
-        min_left_pad = self.left_padding.min().item()
+        # During chunked prefill, some left padding has not been processed yet.
+        min_left_pad = min(self.left_padding.min().item(), self._idx)
         if min_left_pad > 0:
             if self.keys is not None:
                 self.keys = self.keys[..., min_left_pad:, :]
@@ -2444,7 +2445,7 @@ class BatchQuantizedKVCache(_BaseCache):
         if self._right_padding is not None:
             self._right_padding = self._right_padding[batch_indices]
 
-        min_lp = self.left_padding.min().item()
+        min_lp = min(self.left_padding.min().item(), self._idx)
         if min_lp > 0:
             if self.keys is not None:
                 self.keys = tuple(k[..., min_lp:, :] for k in self.keys)
