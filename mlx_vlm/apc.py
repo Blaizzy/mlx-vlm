@@ -640,7 +640,7 @@ class APCStats:
     misses: int = 0
     matched_tokens: int = 0
     stored_tokens: int = 0
-    served_tokens: int = 0
+    restored_tokens: int = 0
     evictions: int = 0
     stores: int = 0
     pool_used: int = 0
@@ -672,7 +672,7 @@ class APCStats:
             "lookups_miss": self.misses,
             "matched_tokens": self.matched_tokens,
             "stored_tokens": self.stored_tokens,
-            "served_tokens": self.served_tokens,
+            "restored_tokens": self.restored_tokens,
             "token_hit_rate": hit_rate,
             "evictions": self.evictions,
             "stores": self.stores,

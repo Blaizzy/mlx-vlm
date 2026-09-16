@@ -35,7 +35,7 @@ BITS = 8
 @pytest.mark.parametrize("mode", ["block", "exact"])
 @pytest.mark.parametrize("tier", ["memory", "disk"])
 @pytest.mark.parametrize("restore", ["single", "batch", "failed-batch"])
-def test_served_tokens_count_successful_restores(
+def test_restored_tokens_count_successful_restores(
     mode, tier, restore, tmp_path, monkeypatch
 ):
     from mlx_vlm.tests.test_apc import _make_exact_row_cache
@@ -57,7 +57,7 @@ def test_served_tokens_count_successful_restores(
             blocks = manager.store_kv_blocks(tokens, [row[1].keys], [row[1].values])
             manager.release(blocks)
         stats = manager.stats_snapshot()
-        assert stats["served_tokens"] == 0
+        assert stats["restored_tokens"] == 0
         assert stats["stored_tokens"] == (32 if mode == "block" else 0)
         if tier == "disk":
             manager.close()
@@ -74,7 +74,7 @@ def test_served_tokens_count_successful_restores(
         assert hit is not None
         before = manager.stats_snapshot()
         assert before["matched_tokens"] > 0
-        assert before["served_tokens"] == 0
+        assert before["restored_tokens"] == 0
         if restore == "single":
             caches = coordinator.materialize_single(hit, min_capacity_tokens=33)
         else:
@@ -88,12 +88,12 @@ def test_served_tokens_count_successful_restores(
         coordinator.release_hit(hit)
         stats = manager.stats_snapshot()
         assert (caches is None) == (restore == "failed-batch")
-        assert stats["served_tokens"] == (0 if caches is None else hit["prefix_len"])
+        assert stats["restored_tokens"] == (0 if caches is None else hit["prefix_len"])
         assert stats["token_hit_rate"] == before["token_hit_rate"]
         if tier == "disk":
             assert stats["disk_hits"] > 0
         manager.reset_stats()
-        assert manager.stats_snapshot()["served_tokens"] == 0
+        assert manager.stats_snapshot()["restored_tokens"] == 0
         assert manager.stats_snapshot()["stored_tokens"] == 0
     finally:
         manager.close()

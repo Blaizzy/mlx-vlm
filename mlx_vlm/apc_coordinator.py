@@ -271,7 +271,7 @@ class APCCoordinator:
             )
         if caches is not None:
             with self.manager.lock:
-                self.manager.stats.served_tokens += sum(prefix_lens)
+                self.manager.stats.restored_tokens += sum(prefix_lens)
         return caches, max_prefix
 
     def materialize_single(
@@ -292,7 +292,7 @@ class APCCoordinator:
             )
         if warm_cache:
             with self.manager.lock:
-                self.manager.stats.served_tokens += hit["prefix_len"]
+                self.manager.stats.restored_tokens += hit["prefix_len"]
         return warm_cache
 
     def store_checkpoint(
