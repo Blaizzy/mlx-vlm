@@ -538,6 +538,21 @@ def test_glm_verification_uses_original_modules_and_preserves_weights():
     assert isinstance(original_projection, nn.Linear)
 
 
+def test_glm_mtp_chunked_prefill_requires_hidden_but_not_shared_kv():
+    model = GlmLanguageModel(_tiny_glm5_next_text_config())
+
+    assert model.chunked_prefill_policy(
+        draft_model=object(),
+        draft_kind="mtp",
+        prefill_kwargs={"return_hidden": True},
+    )
+    assert not model.chunked_prefill_policy(
+        draft_model=object(),
+        draft_kind="mtp",
+        prefill_kwargs={},
+    )
+
+
 @pytest.mark.parametrize("batch", [1, 4])
 def test_glm_block_verification_matches_stepwise_bfloat16(batch):
     mx.random.seed(2127)
