@@ -27,6 +27,7 @@ from mlx_vlm.speculative.dflash import (
     _dflash_rounds,
     _dflash_rounds_batch,
     _dflash_verify,
+    _dflash_verify_greedy,
 )
 from mlx_vlm.speculative.drafters.glm5_next_mtp import (
     Glm5NextMTPDraftModel,
@@ -536,6 +537,49 @@ def test_glm_verification_uses_original_modules_and_preserves_weights():
     assert mx.array_equal(before, after).item()
     assert model.model.layers[0].self_attn.qkv_proj is original_projection
     assert isinstance(original_projection, nn.Linear)
+
+
+def test_glm_dflash_verification_captures_layers_without_changing_mtp_hooks():
+    model = GlmLanguageModel(_tiny_glm5_next_text_config())
+    model.eval()
+    caches = model.make_cache()
+    mx.eval(model(mx.array([[1, 2]]), cache=caches).logits)
+
+    captured, final_hidden, transaction = model.speculative_verify_dflash_hidden(
+        mx.array([[3, 4]]), caches, [0, 1]
+    )
+    mx.eval(captured, final_hidden)
+
+    assert len(captured) == 2
+    assert all(hidden.shape[:2] == (1, 2) for hidden in captured)
+    assert final_hidden.shape[:2] == (1, 2)
+    assert not hasattr(model, "speculative_verify_hidden")
+    transaction.abort()
+    assert not caches[0].is_speculating
+
+
+def test_glm_dflash_greedy_uses_dedicated_argmax_hook_not_sampler():
+    model = GlmLanguageModel(_tiny_glm5_next_text_config())
+    model.eval()
+    caches = model.make_cache()
+    mx.eval(model(mx.array([[1, 2]]), cache=caches).logits)
+
+    def fail_sampler(_):
+        raise AssertionError("DFlash should use the GLM hidden-state argmax hook")
+
+    captured, transaction, target_tokens = _dflash_verify_greedy(
+        model,
+        mx.array([[3, 4]]),
+        caches,
+        [0, 1],
+        fail_sampler,
+    )
+    mx.eval(captured, target_tokens)
+
+    assert len(captured) == 2
+    assert target_tokens.shape == (1, 2)
+    transaction.abort()
+    assert not caches[0].is_speculating
 
 
 @pytest.mark.parametrize("batch", [1, 4])

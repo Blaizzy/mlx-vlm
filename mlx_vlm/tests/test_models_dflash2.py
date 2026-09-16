@@ -261,13 +261,32 @@ def test_dflash2_target_validation_is_structural():
                 vocab_size=32,
             ),
             model=SimpleNamespace(layers=[object(), object()]),
-            rollback_speculative_cache=lambda *args: None,
+            speculative_verify_dflash_hidden=lambda *args: None,
         )
     )
 
     validate_drafter_compatibility(
         target, DFlash2DraftModel(config), draft_kind="dflash"
     )
+
+
+def test_dflash2_target_validation_rejects_no_rollback_or_transaction():
+    config = _tiny_config()
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            config=SimpleNamespace(
+                hidden_size=16,
+                num_hidden_layers=2,
+                vocab_size=32,
+            ),
+            model=SimpleNamespace(layers=[object(), object()]),
+        )
+    )
+
+    with pytest.raises(ValueError, match="transactional DFlash verifier"):
+        validate_drafter_compatibility(
+            target, DFlash2DraftModel(config), draft_kind="dflash"
+        )
 
 
 @pytest.mark.parametrize(("temperature", "seed"), [(0, None), (1.0, 17)])

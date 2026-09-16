@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ...speculative.ops.linear import _target_verify_quantized_argmax
 from ..base import LanguageModelOutput, create_ssm_mask, scaled_dot_product_attention
 from ..cache import ArraysCache, CacheList, KVCache, PoolingCache
 from ..deepseek_v4.hyper_connection import HyperConnection
@@ -802,6 +803,8 @@ class Glm5NextTextModel(nn.Module):
         cache: Optional[List[Any]] = None,
         attention_mask: Optional[mx.array] = None,
         hidden_sink: Optional[List[mx.array]] = None,
+        capture_layer_ids: Optional[List[int]] = None,
+        capture_sink: Optional[List[mx.array]] = None,
     ):
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         if cache is None:
@@ -813,7 +816,8 @@ class Glm5NextTextModel(nn.Module):
 
         h = mx.repeat(h[:, :, None], self.config.hc_mult, axis=2)
         topk = None
-        for layer, layer_cache in zip(self.layers, cache):
+        capture_set = set(capture_layer_ids) if capture_layer_ids else None
+        for layer_idx, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             layer_mask = attention_mask
             if layer.block_type == "linear_attention" and layer_cache is not None:
                 layer_mask = create_ssm_mask(h[:, :, 0], layer_cache)
@@ -823,6 +827,10 @@ class Glm5NextTextModel(nn.Module):
                 layer_cache,
                 topk,
             )
+            if capture_set is not None and layer_idx in capture_set:
+                # DFlash2 is trained on the contracted mHC stream after each
+                # selected target layer, matching the target-side recipe.
+                capture_sink.append(h.mean(axis=2))
         h = self.norm(h.mean(axis=2))
         if hidden_sink is not None:
             hidden_sink.append(h)
@@ -870,8 +878,10 @@ class LanguageModel(nn.Module):
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         skip_logits = kwargs.pop("skip_logits", False)
         hidden_sink = kwargs.pop("hidden_sink", None)
+        capture_layer_ids = kwargs.pop("capture_layer_ids", None)
         if return_hidden and hidden_sink is None:
             hidden_sink = []
+        capture_sink = [] if capture_layer_ids else None
         if inputs is None:
             inputs = kwargs.get("input_ids")
         attention_mask = kwargs.get("attention_mask")
@@ -881,6 +891,8 @@ class LanguageModel(nn.Module):
             cache,
             attention_mask,
             hidden_sink=hidden_sink,
+            capture_layer_ids=capture_layer_ids,
+            capture_sink=capture_sink,
         )
         num_logits_to_keep = kwargs.get("num_logits_to_keep", 0)
         if num_logits_to_keep:
@@ -893,9 +905,39 @@ class LanguageModel(nn.Module):
             logits = linear(self.lm_head, hidden)
         return LanguageModelOutput(
             logits=logits,
-            hidden_states=hidden_sink,
+            hidden_states=(
+                capture_sink + hidden_sink
+                if capture_sink is not None and return_hidden
+                else capture_sink
+                if capture_sink is not None
+                else hidden_sink
+            ),
             shared_kv_states={} if return_shared_kv else None,
         )
+
+    def speculative_verify_dflash_hidden(self, inputs, cache, capture_layer_ids):
+        from ...speculative.common import verify_forward
+
+        output, transaction = verify_forward(
+            self,
+            inputs,
+            cache,
+            capture_layer_ids=capture_layer_ids,
+            return_hidden=True,
+            skip_logits=True,
+        )
+        return output.hidden_states[:-1], output.hidden_states[-1], transaction
+
+    def speculative_dflash_argmax_from_hidden(self, hidden: mx.array) -> mx.array:
+        if not self.args.tie_word_embeddings:
+            argmax = _target_verify_quantized_argmax(self.lm_head, hidden)
+            if argmax is not None:
+                return argmax
+        if self.args.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(hidden)
+        else:
+            logits = linear(self.lm_head, hidden)
+        return mx.argmax(logits, axis=-1)
 
     @property
     def layers(self):

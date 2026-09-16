@@ -118,7 +118,9 @@ def _dflash_verify_greedy(
     gdn_states = None
     try:
         verify_hidden = getattr(lm, "speculative_verify_dflash_hidden", None)
-        argmax_from_hidden = getattr(lm, "speculative_argmax_from_hidden", None)
+        argmax_from_hidden = getattr(lm, "speculative_dflash_argmax_from_hidden", None)
+        if not callable(argmax_from_hidden):
+            argmax_from_hidden = getattr(lm, "speculative_argmax_from_hidden", None)
         if callable(verify_hidden) and callable(argmax_from_hidden):
             captured, final_hidden, gdn_states = verify_hidden(
                 verify_input, prompt_cache, target_layer_ids
@@ -126,7 +128,7 @@ def _dflash_verify_greedy(
             target_tokens = argmax_from_hidden(final_hidden)
             if target_tokens is None:
                 raise RuntimeError(
-                    "speculative_argmax_from_hidden returned no greedy target tokens"
+                    "speculative_dflash_argmax_from_hidden returned no greedy target tokens"
                 )
             return captured, gdn_states, target_tokens
 
@@ -504,8 +506,6 @@ def _dflash_rounds_batch(
     active_idx = list(range(B))  # maps active-slot → original-index
     hidden_by_orig = [hidden[i : i + 1] for i in range(B)]
 
-    total_emitted = sum(emitted)
-
     while len(active_idx) > 0:
         remaining = [
             max(1, max_tokens - emitted[active_idx[j]] + 1)
@@ -667,4 +667,3 @@ def _dflash_rounds_batch(
             active_idx = [active_idx[j] for j in keep_slots]
 
         verify_out = None
-        total_emitted = sum(emitted)
