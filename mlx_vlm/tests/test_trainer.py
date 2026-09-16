@@ -10,6 +10,10 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
+from mlx_vlm.tests.speculative_fixtures import (
+    tiny_deepseek_config,
+    tiny_glm_text_config,
+)
 from mlx_vlm.trainer.datasets import VisionDataset
 from mlx_vlm.trainer.lora import LoRaLayer
 from mlx_vlm.trainer.lora_layers import LoRALinear
@@ -677,6 +681,39 @@ class TestMRoPETrainingVJP(unittest.TestCase):
 
                 self.assertTrue(bool(mx.allclose(dq, dq2, atol=1e-4, rtol=1e-4)))
                 self.assertTrue(bool(mx.allclose(dk, dk2, atol=1e-4, rtol=1e-4)))
+
+
+@pytest.mark.parametrize("family", ["glm", "deepseek"])
+def test_shared_moe_preserves_expert_gradients_and_unweighted_replacements(family):
+    from mlx_vlm.models.deepseek_v4.language import DeepseekV4MoE
+    from mlx_vlm.models.glm5_next.language import Glm5NextMoE
+    from mlx_vlm.models.switch_layers import SwitchGLU
+
+    if family == "glm":
+        config = tiny_glm_text_config()
+        module = Glm5NextMoE(config)
+        kwargs = {}
+    else:
+        config = tiny_deepseek_config()
+        module = DeepseekV4MoE(config, 0)
+        kwargs = dict(input_ids=mx.array([[1, 2, 3]]))
+    inputs = mx.random.normal((1, 3, config.hidden_size))
+    module.gate.freeze()
+    value, grad = nn.value_and_grad(module, lambda m: m(inputs, **kwargs).sum())(module)
+    mx.eval(value, grad)
+    assert mx.isfinite(value).item()
+    module.eval()
+    original = module.switch_mlp
+    expected = module(inputs, **kwargs)
+
+    class ExternalExperts(nn.Module):
+        def __call__(self, x, indices):
+            return original(x, indices)
+
+    module.switch_mlp = ExternalExperts()
+    actual = module(inputs, **kwargs)
+    assert mx.allclose(actual, expected, atol=1e-5).item()
+    assert not isinstance(module.switch_mlp, SwitchGLU)
 
 
 if __name__ == "__main__":

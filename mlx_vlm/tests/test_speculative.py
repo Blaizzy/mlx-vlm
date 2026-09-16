@@ -157,6 +157,18 @@ from mlx_vlm.speculative.utils import (
     speculative_prefill_kwargs,
 )
 from mlx_vlm.split_mtp import split_mtp
+from mlx_vlm.tests.speculative_fixtures import (
+    tiny_deepseek_config as _tiny_deepseek_v4_config,
+)
+from mlx_vlm.tests.speculative_fixtures import (
+    tiny_glm_text_config as _tiny_glm5_next_text_config,
+)
+from mlx_vlm.tests.speculative_fixtures import (
+    tiny_qwen_moe_text_config as _tiny_qwen3_5_moe_text_config,
+)
+from mlx_vlm.tests.speculative_fixtures import (
+    tiny_qwen_text_config as _tiny_qwen3_5_text_config,
+)
 from mlx_vlm.turboquant import BatchTurboQuantKVCache
 from mlx_vlm.utils import get_model_and_args
 
@@ -215,6 +227,63 @@ def test_speculative_sampler_rng_async_evals_greedy_draft_call_state(monkeypatch
     assert len(calls) == 1
     assert calls[0][0] is result_array
     assert calls[0][1] is state_array
+
+
+def _write_checkpoint(
+    path, config, weights, *, shard="model.safetensors", indexed=False
+):
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(path / shard), weights, metadata={})
+    if indexed:
+        (path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"model.foo": "model.safetensors"}})
+        )
+    return path
+
+
+def _read_checkpoint(path):
+    weights = {}
+    for shard in sorted(path.glob("model*.safetensors")):
+        weights.update(mx.load(str(shard)))
+    return json.loads((path / "config.json").read_text()), weights
+
+
+def _greedy(logits):
+    return mx.argmax(logits, axis=-1)
+
+
+def _make_mtp_drafter(family, *, left_padding=None):
+    config_factory, config_class, model_class, block_size = {
+        "qwen": (_tiny_qwen3_5_text_config, Qwen3_5MTPConfig, Qwen3_5MTPDraftModel, 3),
+        "glm": (
+            _tiny_glm5_next_text_config,
+            Glm5NextMTPConfig,
+            Glm5NextMTPDraftModel,
+            2,
+        ),
+        "deepseek": (
+            _tiny_deepseek_v4_config,
+            DeepseekV4MTPConfig,
+            DeepseekV4MTPDraftModel,
+            3,
+        ),
+    }[family]
+    text = config_factory()
+    if family == "qwen":
+        text.mtp_num_hidden_layers = 1
+    drafter = model_class(config_class(text_config=text, block_size=block_size))
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(
+                embed_tokens=nn.Embedding(text.vocab_size, text.hidden_size)
+            )
+        )
+    )
+    drafter.reset(
+        target, **({"left_padding": left_padding} if left_padding is not None else {})
+    )
+    return drafter
 
 
 def _make_drafter_dir(
@@ -390,8 +459,7 @@ def test_qwen_target_verify_4bit_linear_matches_singleton_path_exactly(
 ):
     mx.random.seed(31 + input_dims + verify_length)
     linear = nn.QuantizedLinear(input_dims, 16, bias=False, group_size=64, bits=4)
-    linear.scales = linear.scales.astype(mx.bfloat16)
-    linear.biases = linear.biases.astype(mx.bfloat16)
+    _bf16_quantization_parameters(linear)
     x = mx.random.normal((1, verify_length, input_dims)).astype(mx.bfloat16)
 
     ref = verifier_linear._target_verify_timewise(linear, x)
@@ -428,8 +496,7 @@ def test_qwen_target_verify_affine_linears_fuse_exactly(
 
 def test_qwen_fused_greedy_decode_support_matches_lm_head():
     linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=4)
-    linear.scales = linear.scales.astype(mx.bfloat16)
-    linear.biases = linear.biases.astype(mx.bfloat16)
+    _bf16_quantization_parameters(linear)
     model = SimpleNamespace(
         args=SimpleNamespace(tie_word_embeddings=False), lm_head=linear
     )
@@ -494,8 +561,7 @@ def test_qwen_fused_greedy_decode_uses_quantized_argmax():
 def test_qwen3_5_4bit_quantized_argmax_wide_blocks_match_singletons(verify_length):
     mx.random.seed(32 + verify_length)
     linear = nn.QuantizedLinear(512, 32, bias=False, group_size=64, bits=4)
-    linear.scales = linear.scales.astype(mx.bfloat16)
-    linear.biases = linear.biases.astype(mx.bfloat16)
+    _bf16_quantization_parameters(linear)
     x = mx.random.normal((1, verify_length, 512), dtype=mx.bfloat16)
 
     out = verifier_linear._target_verify_quantized_argmax(linear, x)
@@ -555,18 +621,6 @@ def test_qwen_exact_verifier_moe_matches_singleton_path():
     mx.eval(expected, actual)
 
     assert bool(mx.array_equal(expected, actual).item())
-
-
-def test_qwen_target_verify_norms_match_singleton_path():
-    mx.random.seed(12)
-    norm = nn.RMSNorm(16, eps=1e-6)
-    x = mx.random.normal((2, 4, 3, 16)).astype(mx.bfloat16)
-
-    ref = mx.concatenate([norm(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
-    out = norm(x)
-    mx.eval(ref, out)
-
-    assert bool(mx.array_equal(ref, out).item())
 
 
 def test_qwen3_5_single_row_batch_cache_matches_singleton_cache():
@@ -849,7 +903,7 @@ def test_speculative_walk_mtp_deferred_greedy_stops_after_first_mismatch():
         lm,
         target_hidden,
         draft_tokens,
-        lambda logits: mx.argmax(logits, axis=-1),
+        _greedy,
         budget=4,
     )
 
@@ -985,7 +1039,7 @@ def test_speculative_walk_batch_deferred_uniform_stops_at_batch_rejection():
         lm,
         target_hidden,
         draft_tokens,
-        lambda logits: mx.argmax(logits, axis=-1),
+        _greedy,
         budgets=[3, 3],
     )
 
@@ -1072,7 +1126,7 @@ def test_dflash_server_singleton_dispatches_single_rounds(monkeypatch):
 def test_mtp_uses_uniform_deferred_walk_for_batched_sampling():
     ragged_drafter = SimpleNamespace(requires_uniform_batch_acceptance=False)
     uniform_drafter = SimpleNamespace(requires_uniform_batch_acceptance=True)
-    normal_sampler = lambda logits: mx.argmax(logits, axis=-1)
+    normal_sampler = _greedy
     positioned_sampler = SimpleNamespace(sample_target=lambda *args, **kwargs: None)
 
     assert not mtp_utils._mtp_use_uniform_deferred_walk(
@@ -1113,7 +1167,7 @@ def test_mtp_verify_target_uses_model_logits_hook():
         lm,
         verify_input,
         prompt_cache=["cache"],
-        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        sampler=_greedy,
     )
 
     assert calls[0][0] is verify_input
@@ -1169,7 +1223,7 @@ def test_mtp_rounds_skips_rollback_after_full_accept_with_gdn_states():
                 {},
                 first_bonus=1,
                 max_tokens=5,
-                sampler=lambda logits: mx.argmax(logits, axis=-1),
+                sampler=_greedy,
                 draft_block_size=3,
                 token_dtype=mx.int32,
                 greedy_sampling=True,
@@ -1313,7 +1367,7 @@ def test_dflash_greedy_verify_prefers_hidden_argmax_hook():
         mx.array([[1, 2, 3]]),
         ["cache"],
         [1],
-        lambda logits: mx.argmax(logits, axis=-1),
+        _greedy,
     )
 
     assert actual_captured is captured
@@ -1580,95 +1634,6 @@ def test_model_loader_uses_gemma4_unified_assistant_drafter():
     assert config.text_config.num_kv_shared_layers == 4
 
 
-def _tiny_qwen3_5_text_config():
-    return qwen_language.TextConfig(
-        model_type="qwen3_5_text",
-        hidden_size=16,
-        intermediate_size=32,
-        linear_num_value_heads=2,
-        linear_num_key_heads=2,
-        linear_key_head_dim=4,
-        linear_value_head_dim=4,
-        linear_conv_kernel_dim=4,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        rms_norm_eps=1e-6,
-        vocab_size=32,
-        num_key_value_heads=1,
-        max_position_embeddings=128,
-        tie_word_embeddings=True,
-        head_dim=8,
-        full_attention_interval=1,
-        rope_parameters={
-            "type": "default",
-            "mrope_section": [1, 0, 0],
-            "rope_theta": 10000,
-            "partial_rotary_factor": 0.25,
-        },
-    )
-
-
-def _tiny_qwen3_5_moe_text_config(num_experts=4, moe_intermediate_size=8):
-    from mlx_vlm.models.qwen3_5_moe.config import TextConfig as MoeTextConfig
-
-    return MoeTextConfig(
-        model_type="qwen3_5_moe_text",
-        hidden_size=16,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        linear_num_value_heads=2,
-        linear_num_key_heads=2,
-        linear_key_head_dim=4,
-        linear_value_head_dim=4,
-        linear_conv_kernel_dim=4,
-        num_experts=num_experts,
-        num_experts_per_tok=2,
-        shared_expert_intermediate_size=moe_intermediate_size,
-        moe_intermediate_size=moe_intermediate_size,
-        rms_norm_eps=1e-6,
-        vocab_size=32,
-        num_key_value_heads=1,
-        max_position_embeddings=128,
-        head_dim=8,
-        full_attention_interval=1,
-        rope_parameters={
-            "type": "default",
-            "mrope_section": [1, 0, 0],
-            "rope_theta": 10000,
-            "partial_rotary_factor": 0.25,
-        },
-    )
-
-
-def _tiny_deepseek_v4_config():
-    return deepseek_language.ModelConfig(
-        vocab_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        moe_intermediate_size=4,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        n_shared_experts=1,
-        n_routed_experts=2,
-        num_experts_per_tok=1,
-        q_lora_rank=8,
-        qk_rope_head_dim=4,
-        head_dim=8,
-        o_groups=1,
-        o_lora_rank=8,
-        index_n_heads=1,
-        index_head_dim=8,
-        index_topk=1,
-        num_hash_layers=0,
-        hc_mult=2,
-        hc_sinkhorn_iters=2,
-        compress_ratios=[0],
-        sliding_window=16,
-        max_position_embeddings=128,
-    )
-
-
 def test_eagle3_config_uses_speculators_fields():
     cfg = Eagle3Config.from_dict(
         {
@@ -1911,7 +1876,7 @@ def test_eagle3_accept_replays_committed_tokens_with_verifier_hidden():
         draft_tokens,
         accepted=2,
         new_tokens=[10, 11, 99],
-        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        sampler=_greedy,
         token_dtype=mx.int32,
         greedy=True,
     )
@@ -1982,39 +1947,31 @@ def test_qwen3_5_moe_mtp_builds_moe_layer_and_sanitizes_both_expert_layouts():
         ), f"[{label}] raw expert keys leaked"
 
 
-def test_qwen3_5_mtp_draft_block_smoke():
-    text_config = _tiny_qwen3_5_text_config()
-    text_config.mtp_num_hidden_layers = 1
-    drafter = Qwen3_5MTPDraftModel(
-        Qwen3_5MTPConfig(text_config=text_config, block_size=3)
-    )
-    target = SimpleNamespace(
-        language_model=SimpleNamespace(
-            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
-        )
-    )
-    drafter.reset(target)
-    drafter.set_shared_kv({}, kv_offset=4, position=3, kv_valid_len=4)
-    hidden = mx.zeros((1, 1, 16), dtype=mx.float32)
+@pytest.mark.parametrize(
+    "family,position,block_size", [("qwen", 3, 3), ("glm", 4, 2)], ids=["qwen", "glm"]
+)
+def test_mtp_draft_block_smoke(family, position, block_size):
+    drafter = _make_mtp_drafter(family)
+    drafter.set_shared_kv({}, kv_offset=4, position=position, kv_valid_len=4)
     tokens = drafter.draft_block(
-        7, hidden, None, 3, lambda logits: mx.argmax(logits, axis=-1), mx.int32
+        7,
+        mx.zeros((1, 1, 16)),
+        None,
+        block_size,
+        _greedy,
+        mx.int32,
+        **({"greedy": True} if family == "glm" else {}),
     )
     mx.eval(tokens)
-    assert tokens.shape == (1, 2)
+    assert tokens.shape == (1, block_size - 1)
+    if family == "glm":
+        assert drafter.config.runtime_block_size is None
+        assert mtp_utils._dflash_block_total(drafter, None) == 3
+        assert not drafter.prefer_requested_block_size
 
 
 def test_qwen3_5_mtp_batch_accept_updates_ragged_cache():
-    text_config = _tiny_qwen3_5_text_config()
-    text_config.mtp_num_hidden_layers = 1
-    drafter = Qwen3_5MTPDraftModel(
-        Qwen3_5MTPConfig(text_config=text_config, block_size=3)
-    )
-    target = SimpleNamespace(
-        language_model=SimpleNamespace(
-            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
-        )
-    )
-    drafter.reset(target, left_padding=[0, 0])
+    drafter = _make_mtp_drafter("qwen", left_padding=[0, 0])
     drafter.set_shared_kv(
         {},
         kv_offset=4,
@@ -2027,7 +1984,7 @@ def test_qwen3_5_mtp_batch_accept_updates_ragged_cache():
         hidden,
         None,
         3,
-        lambda logits: mx.argmax(logits, axis=-1),
+        _greedy,
         mx.int32,
         greedy=True,
     )
@@ -2037,7 +1994,7 @@ def test_qwen3_5_mtp_batch_accept_updates_ragged_cache():
         draft_tokens,
         accepted=[1, 0],
         new_tokens=[[int(draft_tokens[0, 0].item()), 5], [6]],
-        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        sampler=_greedy,
         token_dtype=mx.int32,
         greedy=True,
     )
@@ -2107,17 +2064,7 @@ def test_uniform_batch_acceptance_flag_advertised_on_affected_models():
 
 
 def test_qwen3_5_mtp_filter_batch_keeps_drafter_state_aligned():
-    text_config = _tiny_qwen3_5_text_config()
-    text_config.mtp_num_hidden_layers = 1
-    drafter = Qwen3_5MTPDraftModel(
-        Qwen3_5MTPConfig(text_config=text_config, block_size=3)
-    )
-    target = SimpleNamespace(
-        language_model=SimpleNamespace(
-            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
-        )
-    )
-    drafter.reset(target)
+    drafter = _make_mtp_drafter("qwen")
     drafter.set_shared_kv(
         {},
         kv_offset=4,
@@ -2130,7 +2077,7 @@ def test_qwen3_5_mtp_filter_batch_keeps_drafter_state_aligned():
         hidden,
         None,
         3,
-        lambda logits: mx.argmax(logits, axis=-1),
+        _greedy,
         mx.int32,
         greedy=True,
     )
@@ -2140,7 +2087,7 @@ def test_qwen3_5_mtp_filter_batch_keeps_drafter_state_aligned():
         draft_tokens,
         accepted=[1, 1],
         new_tokens=[[3, 5], [4, 6]],
-        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        sampler=_greedy,
         token_dtype=mx.int32,
         greedy=True,
     )
@@ -2153,17 +2100,7 @@ def test_qwen3_5_mtp_filter_batch_keeps_drafter_state_aligned():
 
 
 def test_qwen3_5_mtp_filter_batch_keeps_batch_cache_padding_aligned():
-    text_config = _tiny_qwen3_5_text_config()
-    text_config.mtp_num_hidden_layers = 1
-    drafter = Qwen3_5MTPDraftModel(
-        Qwen3_5MTPConfig(text_config=text_config, block_size=3)
-    )
-    target = SimpleNamespace(
-        language_model=SimpleNamespace(
-            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
-        )
-    )
-    drafter.reset(target, left_padding=[0, 1, 2])
+    drafter = _make_mtp_drafter("qwen", left_padding=[0, 1, 2])
     drafter._cache[0].update_and_fetch(
         mx.zeros((3, 1, 2, 8), dtype=mx.float32),
         mx.zeros((3, 1, 2, 8), dtype=mx.float32),
@@ -2182,24 +2119,19 @@ def test_qwen3_5_mtp_filter_batch_keeps_batch_cache_padding_aligned():
 def test_split_qwen3_5_mtp_converts_fine_grained_fp8(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "mtp"
-    source.mkdir()
     text_config = _tiny_qwen3_5_text_config()
     text_config.mtp_num_hidden_layers = 1
-    (source / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "qwen3_5",
-                "text_config": text_config.to_dict(),
-                "quantization_config": {
-                    "quant_method": "fp8",
-                    "fmt": "e4m3",
-                    "weight_block_size": [128, 128],
-                },
-            }
-        )
-    )
-    mx.save_safetensors(
-        str(source / "mtp.safetensors"),
+    _write_checkpoint(
+        source,
+        {
+            "model_type": "qwen3_5",
+            "text_config": text_config.to_dict(),
+            "quantization_config": {
+                "quant_method": "fp8",
+                "fmt": "e4m3",
+                "weight_block_size": [128, 128],
+            },
+        },
         {
             "mtp.layers.0.mlp.down_proj.weight": mx.to_fp8(
                 mx.ones((128, 128), dtype=mx.bfloat16)
@@ -2209,14 +2141,12 @@ def test_split_qwen3_5_mtp_converts_fine_grained_fp8(tmp_path):
             ),
             "mtp.pre_fc_norm_hidden.weight": mx.zeros((16,)),
         },
-        metadata={},
+        shard="mtp.safetensors",
     )
 
     split_qwen3_5_mtp(str(source), str(output))
 
-    with open(output / "config.json") as f:
-        cfg = json.load(f)
-    weights = mx.load(str(output / "model.safetensors"))
+    cfg, weights = _read_checkpoint(output)
     expected = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
     assert cfg["quantization"] == expected
     assert cfg["quantization_config"] == expected
@@ -2264,70 +2194,6 @@ def test_deepseek_v4_local_mask_aligns_to_layer_cache_width():
     assert padded.tolist() == [[[[True, True, True, False, True]]]]
 
 
-def _tiny_glm5_next_text_config():
-    from mlx_vlm.models.glm5_next.config import TextConfig
-
-    return TextConfig(
-        vocab_size=32,
-        hidden_size=16,
-        intermediate_size=32,
-        moe_intermediate_size=8,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        n_shared_experts=1,
-        n_routed_experts=2,
-        num_experts_per_tok=1,
-        kv_lora_rank=4,
-        q_lora_rank=8,
-        qk_nope_head_dim=4,
-        v_head_dim=4,
-        mlp_layer_types=["dense", "sparse"],
-        layer_types=["linear_attention", "deepseek_sparse_attention"],
-        indexer_types=["full", "full"],
-        index_topk=4,
-        index_kpool=2,
-        index_head_dim=4,
-        index_n_heads=2,
-        linear_attn_config={
-            "num_heads": 2,
-            "head_dim": 4,
-            "short_conv_kernel_size": 2,
-            "gate_lower_bound": -5.0,
-        },
-        hc_mult=2,
-        max_position_embeddings=64,
-    )
-
-
-def test_glm5_next_mtp_draft_block_smoke():
-    text_config = _tiny_glm5_next_text_config()
-    drafter = Glm5NextMTPDraftModel(
-        Glm5NextMTPConfig(text_config=text_config, block_size=2)
-    )
-    target = SimpleNamespace(
-        language_model=SimpleNamespace(
-            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
-        )
-    )
-    drafter.reset(target)
-    drafter.set_shared_kv({}, kv_offset=4, position=4, kv_valid_len=4)
-    tokens = drafter.draft_block(
-        7,
-        mx.zeros((1, 1, 16)),
-        None,
-        2,
-        lambda logits: mx.argmax(logits, axis=-1),
-        mx.int32,
-        greedy=True,
-    )
-    mx.eval(tokens)
-    assert tokens.shape == (1, 1)
-    assert drafter.config.runtime_block_size is None
-    assert mtp_utils._dflash_block_total(drafter, None) == 3
-    assert not drafter.prefer_requested_block_size
-
-
 def test_glm5_next_mtp_owns_left_padded_prefill(monkeypatch):
     text_config = _tiny_glm5_next_text_config()
     drafter = Glm5NextMTPDraftModel(
@@ -2351,7 +2217,7 @@ def test_glm5_next_mtp_owns_left_padded_prefill(monkeypatch):
         mx.array([[0, 0, 1, 2], [1, 2, 3, 4]], dtype=mx.int32),
         mx.zeros((2, 4, text_config.hidden_size)),
         mx.array([3, 5], dtype=mx.int32),
-        lambda logits: mx.argmax(logits, axis=-1),
+        _greedy,
         left_padding=[2, 0],
     )
     mx.eval(captured["start"], drafter._next_position)
@@ -2415,19 +2281,37 @@ def test_glm5_next_dense_verifier_matches_batched_decode(batch, length):
     linear = nn.Linear(512, 32, bias=False)
     linear.weight = linear.weight.astype(mx.bfloat16)
     inputs = mx.random.normal((batch, length, 512)).astype(mx.bfloat16)
-    expected = mx.concatenate(
-        [
-            linear(mx.contiguous(inputs[:, position : position + 1]))
-            for position in range(inputs.shape[1])
-        ],
-        axis=1,
-    )
+    expected = _decode_reference(linear, inputs)
 
     actual = native_batch_linear(linear, inputs)
     mx.eval(expected, actual)
 
     assert actual is not None
     assert mx.array_equal(actual, expected).item()
+
+
+def _quantized_formats(group_sizes=(64,)):
+    return [
+        ("affine", bits, size) for size in group_sizes for bits in (2, 3, 4, 5, 6, 8)
+    ] + [("mxfp4", 4, 32), ("mxfp8", 8, 32), ("nvfp4", 4, 16)]
+
+
+def _quantize_bf16_linear(mode, bits, group_size):
+    dense = nn.Linear(512, 16, bias=False)
+    dense.weight = dense.weight.astype(mx.bfloat16)
+    return nn.QuantizedLinear.from_linear(
+        dense, group_size=group_size, bits=bits, mode=mode
+    )
+
+
+def _decode_reference(linear, inputs):
+    return mx.concatenate(
+        [
+            linear(mx.contiguous(inputs[:, position : position + 1]))
+            for position in range(inputs.shape[1])
+        ],
+        axis=1,
+    )
 
 
 def _bf16_quantization_parameters(linear):
@@ -2493,16 +2377,7 @@ def test_glm5_next_affine_moe_fusion_matches_batched_decode(bits, batch):
 
 @pytest.mark.parametrize(
     ("mode", "bits", "group_size"),
-    [
-        *[
-            ("affine", bits, group_size)
-            for group_size in (32, 64, 128)
-            for bits in (2, 3, 4, 5, 6, 8)
-        ],
-        ("mxfp4", 4, 32),
-        ("mxfp8", 8, 32),
-        ("nvfp4", 4, 16),
-    ],
+    _quantized_formats((32, 64, 128)),
 )
 @pytest.mark.parametrize("batch", [1, 4, 8, 64, 127])
 def test_general_quantized_moe_hc_matches_separate_kernels(
@@ -2540,37 +2415,19 @@ def test_general_quantized_moe_hc_matches_separate_kernels(
 
 @pytest.mark.parametrize(
     ("mode", "bits", "group_size"),
-    [
-        *[("affine", bits, 64) for bits in (2, 3, 4, 5, 6, 8)],
-        ("mxfp4", 4, 32),
-        ("mxfp8", 8, 32),
-        ("nvfp4", 4, 16),
-    ],
+    _quantized_formats(),
 )
 @pytest.mark.parametrize("batch", [1, 2, 4, 5, 8, 9, 16, 32, 64, 127])
 def test_general_quantized_verifier_matches_decode(mode, bits, group_size, batch):
     mx.random.seed(100 + bits + batch)
-    dense = nn.Linear(512, 16, bias=False)
-    dense.weight = dense.weight.astype(mx.bfloat16)
-    linear = nn.QuantizedLinear.from_linear(
-        dense, group_size=group_size, bits=bits, mode=mode
-    )
+    linear = _quantize_bf16_linear(mode, bits, group_size)
     inputs = mx.random.normal((batch, 3, 512)).astype(mx.bfloat16)
     if mode == "nvfp4":
         expected = verifier_linear._target_verify_singletons(linear, inputs)
     else:
-        expected = mx.concatenate(
-            [
-                linear(mx.contiguous(inputs[:, position : position + 1]))
-                for position in range(3)
-            ],
-            axis=1,
-        )
+        expected = _decode_reference(linear, inputs)
 
-    native_reference = mx.concatenate(
-        [linear(mx.contiguous(inputs[:, i : i + 1])) for i in range(inputs.shape[1])],
-        axis=1,
-    )
+    native_reference = _decode_reference(linear, inputs)
     assert mx.array_equal(native_batch_linear(linear, inputs), native_reference).item()
     actual = decode_quantized_linear(linear, inputs)
     tokens = decode_quantized_argmax(linear, inputs)
@@ -2583,20 +2440,11 @@ def test_general_quantized_verifier_matches_decode(mode, bits, group_size, batch
 
 @pytest.mark.parametrize(
     ("mode", "bits", "group_size"),
-    [
-        *[("affine", bits, 64) for bits in (2, 3, 4, 5, 6, 8)],
-        ("mxfp4", 4, 32),
-        ("mxfp8", 8, 32),
-        ("nvfp4", 4, 16),
-    ],
+    _quantized_formats(),
 )
 def test_general_quantized_argmax_supports_packed_mask(mode, bits, group_size):
     mx.random.seed(400 + bits)
-    dense = nn.Linear(512, 16, bias=False)
-    dense.weight = dense.weight.astype(mx.bfloat16)
-    linear = nn.QuantizedLinear.from_linear(
-        dense, group_size=group_size, bits=bits, mode=mode
-    )
+    linear = _quantize_bf16_linear(mode, bits, group_size)
     inputs = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
     allowed = mx.array([[1, 3, 5], [7, 9, 11]], dtype=mx.int32)
     token_mask = (mx.array(1, dtype=mx.int32) << allowed).reshape(-1, 1)
@@ -2609,16 +2457,7 @@ def test_general_quantized_argmax_supports_packed_mask(mode, bits, group_size):
 
 
 def test_glm5_next_mtp_sampler_state_tolerates_uninitialized_kv_cache():
-    text_config = _tiny_glm5_next_text_config()
-    drafter = Glm5NextMTPDraftModel(
-        Glm5NextMTPConfig(text_config=text_config, block_size=2)
-    )
-    target = SimpleNamespace(
-        language_model=SimpleNamespace(
-            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
-        )
-    )
-    drafter.reset(target)
+    drafter = _make_mtp_drafter("glm")
 
     sampler_rng = _SpeculativeSamplerRNG(drafter, enabled=False)
     assert sampler_rng.draft_call(lambda: None) is None
@@ -2651,14 +2490,11 @@ def test_glm5_next_mtp_sanitize_fuses_native_layer_weights():
 def test_split_glm5_next_mtp_extracts_layer_after_target_stack(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "mtp"
-    source.mkdir()
     text_config = _tiny_glm5_next_text_config()
-    (source / "config.json").write_text(
-        json.dumps({"model_type": "glm5_next", "text_config": text_config.to_dict()})
-    )
     prefix = f"model.language_model.layers.{text_config.num_hidden_layers}"
-    mx.save_safetensors(
-        str(source / "model.safetensors"),
+    _write_checkpoint(
+        source,
+        {"model_type": "glm5_next", "text_config": text_config.to_dict()},
         {
             f"{prefix}.enorm.weight": mx.ones((16,)),
             f"{prefix}.hnorm.weight": mx.ones((16,)),
@@ -2669,8 +2505,7 @@ def test_split_glm5_next_mtp_extracts_layer_after_target_stack(tmp_path):
 
     split_glm5_next_mtp(str(source), str(output))
 
-    config = json.loads((output / "config.json").read_text())
-    weights = mx.load(str(output / "model.safetensors"))
+    config, weights = _read_checkpoint(output)
     assert config["model_type"] == "glm5_next_mtp"
     assert config["block_size"] == 2
     assert set(weights) == {
@@ -2684,24 +2519,19 @@ def test_split_glm5_next_mtp_extracts_layer_after_target_stack(tmp_path):
 def test_split_glm5_next_mtp_honors_requested_quantization_for_fp8(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "mtp"
-    source.mkdir()
     text_config = _tiny_glm5_next_text_config()
-    (source / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "glm5_next",
-                "text_config": text_config.to_dict(),
-                "quantization_config": {
-                    "quant_method": "fp8",
-                    "fmt": "e4m3",
-                    "weight_block_size": [128, 128],
-                },
-            }
-        )
-    )
     prefix = f"model.language_model.layers.{text_config.num_hidden_layers}"
-    mx.save_safetensors(
-        str(source / "model.safetensors"),
+    _write_checkpoint(
+        source,
+        {
+            "model_type": "glm5_next",
+            "text_config": text_config.to_dict(),
+            "quantization_config": {
+                "quant_method": "fp8",
+                "fmt": "e4m3",
+                "weight_block_size": [128, 128],
+            },
+        },
         {
             f"{prefix}.eh_proj.weight": mx.to_fp8(
                 mx.ones((128, 128), dtype=mx.bfloat16)
@@ -2714,8 +2544,7 @@ def test_split_glm5_next_mtp_honors_requested_quantization_for_fp8(tmp_path):
 
     split_mtp(str(source), str(output), q_bits=4, q_group_size=64)
 
-    config = json.loads((output / "config.json").read_text())
-    weights = mx.load(str(output / "model.safetensors"))
+    config, weights = _read_checkpoint(output)
     expected = {"group_size": 64, "bits": 4, "mode": "affine"}
     assert config["quantization"] == expected
     assert config["quantization_config"] == expected
@@ -2728,21 +2557,17 @@ def test_split_glm5_next_mtp_honors_requested_quantization_for_fp8(tmp_path):
 def test_split_glm5_next_mtp_supports_independent_mxfp8_quantization(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "mtp"
-    source.mkdir()
     text_config = _tiny_glm5_next_text_config()
-    (source / "config.json").write_text(
-        json.dumps({"model_type": "glm5_next", "text_config": text_config.to_dict()})
-    )
     prefix = f"model.language_model.layers.{text_config.num_hidden_layers}"
-    mx.save_safetensors(
-        str(source / "model.safetensors"),
+    _write_checkpoint(
+        source,
+        {"model_type": "glm5_next", "text_config": text_config.to_dict()},
         {f"{prefix}.eh_proj.weight": mx.ones((128, 128), dtype=mx.bfloat16)},
     )
 
     split_mtp(str(source), str(output), q_mode="mxfp8")
 
-    config = json.loads((output / "config.json").read_text())
-    weights = mx.load(str(output / "model.safetensors"))
+    config, weights = _read_checkpoint(output)
     expected = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
     assert config["quantization"] == expected
     assert config["quantization_config"] == expected
@@ -2766,24 +2591,16 @@ def test_deepseek_v4_mtp_runtime_block_size_defaults_to_native_nextn_depth():
 
 
 def test_deepseek_v4_mtp_batch_accept_updates_uniform_cache():
-    text_config = _tiny_deepseek_v4_config()
-    drafter = DeepseekV4MTPDraftModel(
-        DeepseekV4MTPConfig(text_config=text_config, block_size=3)
-    )
-    target = SimpleNamespace(
-        language_model=SimpleNamespace(
-            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
-        )
-    )
-    drafter.reset(target)
+    drafter = _make_mtp_drafter("deepseek")
     drafter.set_shared_kv({}, kv_offset=4, position=3, kv_valid_len=4)
+    text_config = drafter.config.text_config
     hidden = mx.zeros((2, 1, text_config.hc_mult, 16), dtype=mx.float32)
     draft_tokens = drafter.draft_block(
         mx.array([7, 8], dtype=mx.int32),
         hidden,
         None,
         3,
-        lambda logits: mx.argmax(logits, axis=-1),
+        _greedy,
         mx.int32,
         greedy=True,
     )
@@ -2793,7 +2610,7 @@ def test_deepseek_v4_mtp_batch_accept_updates_uniform_cache():
         draft_tokens,
         accepted=[0, 0],
         new_tokens=[[3], [4]],
-        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        sampler=_greedy,
         token_dtype=mx.int32,
         greedy=True,
     )
@@ -2943,7 +2760,7 @@ def test_deepseek_v4_dspark_draft_block_emits_proposal_tokens():
         hidden,
         draft_cache,
         cfg.block_size,
-        lambda logits: mx.argmax(logits, axis=-1),
+        _greedy,
     )
     assert drafts.shape == (1, cfg.block_size - 1)
 
@@ -2955,23 +2772,20 @@ def test_split_deepseek_v4_dspark_writes_dspark_config(tmp_path):
     src_weights = _forge_dspark_source(model, cfg)
 
     source = tmp_path / "source"
-    source.mkdir()
     text = cfg.text_config
-    (source / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "deepseek_v4",
-                **text.to_dict(),
-                "dspark_block_size": cfg.block_size - 1,
-                "dspark_noise_token_id": cfg.mask_token_id,
-                "dspark_target_layer_ids": cfg.target_layer_ids,
-                "dspark_markov_rank": cfg.markov_rank,
-            }
-        )
-    )
-    mx.save_safetensors(str(source / "mtp.safetensors"), src_weights, metadata={})
-    (source / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"model.foo": "model.safetensors"}})
+    _write_checkpoint(
+        source,
+        {
+            "model_type": "deepseek_v4",
+            **text.to_dict(),
+            "dspark_block_size": cfg.block_size - 1,
+            "dspark_noise_token_id": cfg.mask_token_id,
+            "dspark_target_layer_ids": cfg.target_layer_ids,
+            "dspark_markov_rank": cfg.markov_rank,
+        },
+        src_weights,
+        shard="mtp.safetensors",
+        indexed=True,
     )
 
     output = tmp_path / "dspark"
@@ -2980,10 +2794,7 @@ def test_split_deepseek_v4_dspark_writes_dspark_config(tmp_path):
     assert type(detect_mtp_splitter(source)).__name__ == "DeepseekV4DsparkSplitter"
     split_deepseek_v4_dspark(str(source), str(output))
 
-    written_cfg = json.loads((output / "config.json").read_text())
-    weights = {}
-    for shard in sorted(output.glob("model-*.safetensors")):
-        weights.update(mx.load(str(shard)))
+    written_cfg, weights = _read_checkpoint(output)
     assert written_cfg["model_type"] == "deepseek_v4_dspark"
     assert written_cfg["n_mtp_layers"] == 3
     assert written_cfg["target_layer_ids"] == cfg.target_layer_ids
@@ -3044,7 +2855,7 @@ def test_deepseek_v4_dspark_uses_dflash_rounds_losslessly():
         hidden,
         first_bonus=first_bonus,
         max_tokens=n_new,
-        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        sampler=_greedy,
         greedy_sampling=True,
     ):
         spec.append(tok)
@@ -3056,13 +2867,10 @@ def test_deepseek_v4_dspark_uses_dflash_rounds_losslessly():
 def test_split_deepseek_v4_mtp_writes_sidecar_without_index_mtp_entries(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "mtp"
-    source.mkdir()
     text_config = _tiny_deepseek_v4_config()
-    (source / "config.json").write_text(
-        json.dumps({"model_type": "deepseek_v4", **text_config.to_dict()})
-    )
-    mx.save_safetensors(
-        str(source / "mtp.safetensors"),
+    _write_checkpoint(
+        source,
+        {"model_type": "deepseek_v4", **text_config.to_dict()},
         {
             "mtp.0.e_proj.weight": mx.zeros((4, 4), dtype=mx.uint8),
             "mtp.0.e_proj.scale": mx.ones((1, 1), dtype=mx.float32),
@@ -3070,17 +2878,13 @@ def test_split_deepseek_v4_mtp_writes_sidecar_without_index_mtp_entries(tmp_path
             "mtp.0.attn.wq_a.scale": mx.ones((1, 1), dtype=mx.float32),
             "mtp.0.enorm.weight": mx.zeros((text_config.hidden_size,)),
         },
-        metadata={},
-    )
-    (source / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"model.foo": "model.safetensors"}})
+        shard="mtp.safetensors",
+        indexed=True,
     )
 
     split_deepseek_v4_mtp(str(source), str(output))
 
-    with open(output / "config.json") as f:
-        cfg = json.load(f)
-    weights = mx.load(str(output / "model.safetensors"))
+    cfg, weights = _read_checkpoint(output)
     assert cfg["model_type"] == "deepseek_v4_mtp"
     assert cfg["block_size"] == 2
     assert cfg["quantization"]["e_proj"]["mode"] == "mxfp8"
@@ -3093,7 +2897,6 @@ def test_split_deepseek_v4_mtp_writes_sidecar_without_index_mtp_entries(tmp_path
 def test_split_glm4_moe_lite_mtp_flattens_nextn_layer(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "mtp"
-    source.mkdir()
     cfg = {
         "model_type": "glm4_moe_lite",
         "hidden_size": 8,
@@ -3108,7 +2911,6 @@ def test_split_glm4_moe_lite_mtp_flattens_nextn_layer(tmp_path):
         "num_nextn_predict_layers": 1,
         "tie_word_embeddings": False,
     }
-    (source / "config.json").write_text(json.dumps(cfg))
     p = "model.layers.2."
     weights = {
         f"{p}embed_tokens.weight": mx.zeros((16, 8)),
@@ -3134,16 +2936,11 @@ def test_split_glm4_moe_lite_mtp_flattens_nextn_layer(tmp_path):
         weights[f"{p}mlp.experts.{e}.gate_proj.weight"] = mx.zeros((4, 8))
         weights[f"{p}mlp.experts.{e}.up_proj.weight"] = mx.zeros((4, 8))
         weights[f"{p}mlp.experts.{e}.down_proj.weight"] = mx.zeros((8, 4))
-    mx.save_safetensors(str(source / "model.safetensors"), weights, metadata={})
-    (source / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"model.foo": "model.safetensors"}})
-    )
+    _write_checkpoint(source, cfg, weights, shard="model.safetensors", indexed=True)
 
     split_glm4_moe_lite_mtp(str(source), str(output))
 
-    with open(output / "config.json") as f:
-        out_cfg = json.load(f)
-    out = mx.load(str(output / "model.safetensors"))
+    out_cfg, out = _read_checkpoint(output)
     assert out_cfg["model_type"] == "glm4_moe_lite_mtp"
     assert out_cfg["block_size"] == 2
     assert out_cfg["text_config"]["model_type"] == "glm4_moe_lite"
@@ -3265,26 +3062,46 @@ def test_laguna_dflash_config_derives_sliding_windows_when_absent():
     assert config.sliding_windows == [512, 512]
 
 
-def _dflash2_published_config():
+def _published_drafter_config(**overrides):
     return {
-        "architectures": ["DFlash2DraftModel"],
-        "model_type": "qwen3",
-        "is_causal": False,
-        "hidden_size": 5120,
-        "intermediate_size": 17408,
         "num_hidden_layers": 5,
         "num_attention_heads": 32,
         "num_key_value_heads": 8,
         "head_dim": 128,
-        "hidden_act": "silu",
-        "rms_norm_eps": 1e-6,
-        "vocab_size": 248320,
-        "max_position_embeddings": 262144,
-        "num_target_layers": 64,
-        "layer_types": ["sliding_attention"] * 5,
-        "sliding_window": 2048,
-        "rope_parameters": {"rope_type": "default", "rope_theta": 10000000},
-        "dflash_config": {
+        "rms_norm_eps": 1e-06,
+        **overrides,
+    }
+
+
+def _tiny_draft_dimensions(**overrides):
+    return {
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 8,
+        "vocab_size": 32,
+        "max_position_embeddings": 128,
+        **overrides,
+    }
+
+
+def _dflash2_published_config():
+    return _published_drafter_config(
+        architectures=["DFlash2DraftModel"],
+        model_type="qwen3",
+        is_causal=False,
+        hidden_size=5120,
+        intermediate_size=17408,
+        hidden_act="silu",
+        vocab_size=248320,
+        max_position_embeddings=262144,
+        num_target_layers=64,
+        layer_types=["sliding_attention"] * 5,
+        sliding_window=2048,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000000},
+        dflash_config={
             "block_size": 8,
             "conv_group_size": 16,
             "conv_kernel_size": 2,
@@ -3293,24 +3110,18 @@ def _dflash2_published_config():
             "selector_top_k": 16,
             "target_layer_ids": [5, 19, 33, 47, 61],
         },
-    }
+    )
 
 
 def _dflash2_config():
     config = _dflash2_published_config()
     config.update(
-        hidden_size=16,
-        intermediate_size=32,
-        num_hidden_layers=1,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=8,
-        vocab_size=32,
-        max_position_embeddings=128,
-        num_target_layers=2,
-        layer_types=["full_attention"],
-        sliding_window=None,
-        rope_parameters={"rope_type": "default", "rope_theta": 10000},
+        _tiny_draft_dimensions(
+            num_target_layers=2,
+            layer_types=["full_attention"],
+            sliding_window=None,
+            rope_parameters={"rope_type": "default", "rope_theta": 10000},
+        )
     )
     config["dflash_config"] = {
         "block_size": 3,
@@ -3393,32 +3204,29 @@ def test_positioned_proposal_sampling_is_independent_of_target_filters():
 
 
 def _laguna_config_dict():
-    return {
-        "model_type": "laguna",
-        "hidden_size": 3072,
-        "intermediate_size": 12288,
-        "num_hidden_layers": 6,
-        "num_attention_heads": 72,
-        "num_key_value_heads": 8,
-        "head_dim": 128,
-        "rms_norm_eps": 1e-6,
-        "max_position_embeddings": 1048576,
-        "rope_theta": 500000.0,
-        "vocab_size": 100352,
-        "draft_vocab_size": 100352,
-        "layer_types": ["sliding_attention"] * 6,
-        "sliding_windows": [512] * 6,
-        "sliding_window": 512,
-        "gating": "per-head",
-        "eagle_aux_hidden_state_layer_ids": [2, 11, 20, 30, 39, 48],
-        "dflash_config": {
+    return _published_drafter_config(
+        model_type="laguna",
+        hidden_size=3072,
+        intermediate_size=12288,
+        num_hidden_layers=6,
+        num_attention_heads=72,
+        max_position_embeddings=1048576,
+        rope_theta=500000.0,
+        vocab_size=100352,
+        draft_vocab_size=100352,
+        layer_types=["sliding_attention"] * 6,
+        sliding_windows=[512] * 6,
+        sliding_window=512,
+        gating="per-head",
+        eagle_aux_hidden_state_layer_ids=[2, 11, 20, 30, 39, 48],
+        dflash_config={
             "block_size": 16,
             "mask_token_id": 12,
             "num_target_layers": 48,
             "target_layer_ids": [1, 10, 19, 29, 38, 47],
             "causal": True,
         },
-    }
+    )
 
 
 @pytest.mark.parametrize(
@@ -3525,23 +3333,19 @@ def test_target_without_rollback_support_is_rejected():
 
 
 def _glimmer_published_config():
-    return {
-        "model_type": "muse_glimmer_assistant",
-        "hidden_size": 6656,
-        "intermediate_size": 19968,
-        "num_hidden_layers": 5,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
-        "head_dim": 128,
-        "rms_norm_eps": 1e-5,
-        "max_position_embeddings": 131072,
-        "rope_parameters": {"rope_theta": 500000.0, "rope_type": "default"},
-        "layer_types": ["sliding_attention"] * 5,
-        "sliding_window": 2048,
-        "block_size": 16,
-        "mask_token_id": 201818,
-        "target_layer_ids": [1, 13, 25, 37, 49],
-    }
+    return _published_drafter_config(
+        model_type="muse_glimmer_assistant",
+        hidden_size=6656,
+        intermediate_size=19968,
+        rms_norm_eps=1e-05,
+        max_position_embeddings=131072,
+        rope_parameters={"rope_theta": 500000.0, "rope_type": "default"},
+        layer_types=["sliding_attention"] * 5,
+        sliding_window=2048,
+        block_size=16,
+        mask_token_id=201818,
+        target_layer_ids=[1, 13, 25, 37, 49],
+    )
 
 
 def _glimmer_config():
@@ -3661,56 +3465,49 @@ def test_binding_uses_raw_target_embedding_and_checks_target_family():
 
 
 def _dspark_published_config():
-    return {
-        "architectures": ["Lfm2DSparkDraftModel"],
-        "model_type": "qwen3",
-        "hidden_size": 2048,
-        "num_hidden_layers": 5,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
-        "head_dim": 64,
-        "intermediate_size": 6144,
-        "hidden_act": "silu",
-        "rms_norm_eps": 1e-5,
-        "vocab_size": 128000,
-        "rope_theta": 10000000.0,
-        "max_position_embeddings": 128000,
-        "layer_types": ["full_attention"] * 5,
-        "block_size": 9,
-        "dflash_config": {
+    return _published_drafter_config(
+        architectures=["Lfm2DSparkDraftModel"],
+        model_type="qwen3",
+        hidden_size=2048,
+        head_dim=64,
+        intermediate_size=6144,
+        hidden_act="silu",
+        rms_norm_eps=1e-05,
+        vocab_size=128000,
+        rope_theta=10000000.0,
+        max_position_embeddings=128000,
+        layer_types=["full_attention"] * 5,
+        block_size=9,
+        dflash_config={
             "mask_token_id": 125017,
             "target_layer_ids": [2, 9, 17, 21, 27],
             "num_target_layers": 30,
         },
-        "markov_rank": 256,
-        "rope_is_neox_style": False,
-        "enable_confidence_head": True,
-        "markov_head_type": "vanilla",
-    }
+        markov_rank=256,
+        rope_is_neox_style=False,
+        enable_confidence_head=True,
+        markov_head_type="vanilla",
+    )
 
 
 def _dspark_qwen_published_config():
-    return {
-        "architectures": ["DSparkDraftModel"],
-        "model_type": "qwen3",
-        "block_size": 7,
-        "confidence_head_with_markov": True,
-        "hidden_size": 5120,
-        "intermediate_size": 10240,
-        "num_hidden_layers": 5,
-        "num_attention_heads": 40,
-        "num_key_value_heads": 8,
-        "head_dim": 128,
-        "hidden_act": "silu",
-        "rms_norm_eps": 1e-6,
-        "vocab_size": 248320,
-        "max_position_embeddings": 262144,
-        "num_target_layers": 64,
-        "layer_types": ["full_attention"] * 5,
-        "markov_rank": 256,
-        "markov_head_type": "vanilla",
-        "enable_confidence_head": True,
-        "rope_parameters": {
+    return _published_drafter_config(
+        architectures=["DSparkDraftModel"],
+        model_type="qwen3",
+        block_size=7,
+        confidence_head_with_markov=True,
+        hidden_size=5120,
+        intermediate_size=10240,
+        num_attention_heads=40,
+        hidden_act="silu",
+        vocab_size=248320,
+        max_position_embeddings=262144,
+        num_target_layers=64,
+        layer_types=["full_attention"] * 5,
+        markov_rank=256,
+        markov_head_type="vanilla",
+        enable_confidence_head=True,
+        rope_parameters={
             "rope_type": "yarn",
             "rope_theta": 10000000,
             "factor": 32.0,
@@ -3718,7 +3515,7 @@ def _dspark_qwen_published_config():
             "beta_fast": 32.0,
             "beta_slow": 1.0,
         },
-        "dflash_config": {
+        dflash_config={
             "projector_type": "dspark",
             "mask_token_id": 248077,
             "target_layer_ids": [4, 16, 28, 40, 52],
@@ -3727,33 +3524,30 @@ def _dspark_qwen_published_config():
             "enable_confidence_head": True,
             "confidence_head_with_markov": True,
         },
-    }
+    )
 
 
 def _dspark_nemotron_published_config():
-    return {
-        "architectures": ["Qwen3DSparkModel"],
-        "model_type": "qwen3",
-        "hidden_size": 2688,
-        "intermediate_size": 6144,
-        "num_hidden_layers": 6,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 2,
-        "head_dim": 128,
-        "hidden_act": "silu",
-        "rms_norm_eps": 1e-6,
-        "vocab_size": 131072,
-        "max_position_embeddings": 1048576,
-        "rope_theta": 10000,
-        "layer_types": ["sliding_attention"] * 6,
-        "sliding_window": 1024,
-        "block_size": 8,
-        "dspark_bonus_anchor": True,
-        "dflash_query_causal": True,
-        "attention_sink_bias": True,
-        "markov_rank": 512,
-        "markov_head_type": "vanilla",
-        "dflash_config": {
+    return _published_drafter_config(
+        architectures=["Qwen3DSparkModel"],
+        model_type="qwen3",
+        hidden_size=2688,
+        intermediate_size=6144,
+        num_hidden_layers=6,
+        num_key_value_heads=2,
+        hidden_act="silu",
+        vocab_size=131072,
+        max_position_embeddings=1048576,
+        rope_theta=10000,
+        layer_types=["sliding_attention"] * 6,
+        sliding_window=1024,
+        block_size=8,
+        dspark_bonus_anchor=True,
+        dflash_query_causal=True,
+        attention_sink_bias=True,
+        markov_rank=512,
+        markov_head_type="vanilla",
+        dflash_config={
             "attention_sink_bias": True,
             "causal": True,
             "mask_token_id": 990,
@@ -3762,67 +3556,39 @@ def _dspark_nemotron_published_config():
             "use_swa": True,
             "sample_from_anchor": False,
         },
-    }
+    )
 
 
-def _dspark_config():
+def _dspark_config(qwen=False):
     return DSparkConfig.from_dict(
-        {
-            "architectures": ["Lfm2DSparkDraftModel"],
-            "model_type": "qwen3",
-            "hidden_size": 8,
-            "num_hidden_layers": 1,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 1,
-            "head_dim": 4,
-            "intermediate_size": 16,
-            "rms_norm_eps": 1e-5,
-            "vocab_size": 32,
-            "rope_theta": 10000.0,
-            "rope_is_neox_style": False,
-            "max_position_embeddings": 128,
-            "layer_types": ["full_attention"],
-            "block_size": 3,
-            "dflash_config": {
+        _tiny_draft_dimensions(
+            hidden_size=16 if qwen else 8,
+            intermediate_size=32 if qwen else 16,
+            head_dim=8 if qwen else 4,
+            architectures=["DSparkDraftModel" if qwen else "Lfm2DSparkDraftModel"],
+            model_type="qwen3",
+            rms_norm_eps=1e-6 if qwen else 1e-5,
+            rope_theta=10000.0,
+            layer_types=["full_attention"],
+            block_size=3,
+            markov_rank=4,
+            markov_head_type="vanilla",
+            enable_confidence_head=True,
+            **({"num_target_layers": 2} if qwen else {"rope_is_neox_style": False}),
+            dflash_config={
                 "mask_token_id": 31,
-                "target_layer_ids": [0, 2],
-                "num_target_layers": 3,
+                **(
+                    {"projector_type": "dspark", "target_layer_ids": [0]}
+                    if qwen
+                    else {"target_layer_ids": [0, 2], "num_target_layers": 3}
+                ),
             },
-            "markov_rank": 4,
-            "markov_head_type": "vanilla",
-            "enable_confidence_head": True,
-        }
+        )
     )
 
 
 def _dspark_qwen_config():
-    return DSparkConfig.from_dict(
-        {
-            "architectures": ["DSparkDraftModel"],
-            "model_type": "qwen3",
-            "hidden_size": 16,
-            "num_hidden_layers": 1,
-            "num_attention_heads": 2,
-            "num_key_value_heads": 1,
-            "head_dim": 8,
-            "intermediate_size": 32,
-            "rms_norm_eps": 1e-6,
-            "vocab_size": 32,
-            "rope_theta": 10000.0,
-            "max_position_embeddings": 128,
-            "layer_types": ["full_attention"],
-            "block_size": 3,
-            "num_target_layers": 2,
-            "dflash_config": {
-                "projector_type": "dspark",
-                "mask_token_id": 31,
-                "target_layer_ids": [0],
-            },
-            "markov_rank": 4,
-            "markov_head_type": "vanilla",
-            "enable_confidence_head": True,
-        }
-    )
+    return _dspark_config(qwen=True)
 
 
 def _lfm2_target():
@@ -4081,7 +3847,7 @@ def test_tiny_dspark_forward_uses_markov_head_and_published_block_semantics():
         hidden,
         draft_cache,
         block_size=drafter.config.block_size,
-        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        sampler=_greedy,
     )
     mx.eval(tokens)
 
@@ -4201,32 +3967,28 @@ def test_sampled_dspark_generation_matches_stateful_baseline():
 
 
 def _published_gemma4_dspark_config():
-    """Fields the published deepseek-ai/dspark_gemma4_12b_block7 config carries."""
-    return {
-        "architectures": ["Gemma4DSparkModel"],
-        "model_type": "gemma4_text",
-        "attention_k_eq_v": True,
-        "block_size": 7,
-        "confidence_head_with_markov": True,
-        "enable_confidence_head": True,
-        "final_logit_softcapping": 30.0,
-        "global_head_dim": 512,
-        "head_dim": 256,
-        "hidden_activation": "gelu_pytorch_tanh",
-        "hidden_size": 3840,
-        "intermediate_size": 15360,
-        "layer_types": ["full_attention"] * 5,
-        "markov_head_type": "vanilla",
-        "markov_rank": 256,
-        "mask_token_id": 4,
-        "max_position_embeddings": 262144,
-        "num_attention_heads": 16,
-        "num_global_key_value_heads": 1,
-        "num_hidden_layers": 5,
-        "num_key_value_heads": 8,
-        "num_target_layers": 48,
-        "rms_norm_eps": 1e-06,
-        "rope_parameters": {
+    return _published_drafter_config(
+        architectures=["Gemma4DSparkModel"],
+        model_type="gemma4_text",
+        attention_k_eq_v=True,
+        block_size=7,
+        confidence_head_with_markov=True,
+        enable_confidence_head=True,
+        final_logit_softcapping=30.0,
+        global_head_dim=512,
+        head_dim=256,
+        hidden_activation="gelu_pytorch_tanh",
+        hidden_size=3840,
+        intermediate_size=15360,
+        layer_types=["full_attention"] * 5,
+        markov_head_type="vanilla",
+        markov_rank=256,
+        mask_token_id=4,
+        max_position_embeddings=262144,
+        num_attention_heads=16,
+        num_global_key_value_heads=1,
+        num_target_layers=48,
+        rope_parameters={
             "full_attention": {
                 "partial_rotary_factor": 0.25,
                 "rope_theta": 1000000.0,
@@ -4234,11 +3996,11 @@ def _published_gemma4_dspark_config():
             },
             "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"},
         },
-        "sliding_window": 1024,
-        "target_layer_ids": [5, 17, 29, 41, 46],
-        "tie_word_embeddings": False,
-        "vocab_size": 262144,
-    }
+        sliding_window=1024,
+        target_layer_ids=[5, 17, 29, 41, 46],
+        tie_word_embeddings=False,
+        vocab_size=262144,
+    )
 
 
 def test_published_gemma4_dspark_config_reads_flat_contract():
@@ -4424,7 +4186,7 @@ def test_deepseek_chunked_prefill_keeps_all_dflash_features(batch):
     while processing.needs_processing():
         assert processing.prompt_step() <= 2
     generated = processing.generate(
-        lambda logits: mx.argmax(logits, axis=-1),
+        _greedy,
         lambda *args: False,
         compute_logprobs=False,
     )
@@ -4611,39 +4373,6 @@ def test_ordinary_verification_spans_multiple_short_blocks(family, batch):
     ).item()
 
 
-@pytest.mark.parametrize("family", ["glm", "deepseek"])
-def test_shared_moe_preserves_expert_gradients_and_unweighted_replacements(family):
-    from mlx_vlm.models.deepseek_v4.language import DeepseekV4MoE
-    from mlx_vlm.models.glm5_next.language import Glm5NextMoE
-    from mlx_vlm.models.switch_layers import SwitchGLU
-
-    if family == "glm":
-        config = _tiny_glm5_next_text_config()
-        module = Glm5NextMoE(config)
-        kwargs = {}
-    else:
-        config = _tiny_deepseek_v4_config()
-        module = DeepseekV4MoE(config, 0)
-        kwargs = dict(input_ids=mx.array([[1, 2, 3]]))
-    inputs = mx.random.normal((1, 3, config.hidden_size))
-    module.gate.freeze()
-    value, grad = nn.value_and_grad(module, lambda m: m(inputs, **kwargs).sum())(module)
-    mx.eval(value, grad)
-    assert mx.isfinite(value).item()
-    module.eval()
-    original = module.switch_mlp
-    expected = module(inputs, **kwargs)
-
-    class ExternalExperts(nn.Module):
-        def __call__(self, x, indices):
-            return original(x, indices)
-
-    module.switch_mlp = ExternalExperts()
-    actual = module(inputs, **kwargs)
-    assert mx.allclose(actual, expected, atol=1e-5).item()
-    assert not isinstance(module.switch_mlp, SwitchGLU)
-
-
 def test_ordinary_forward_failure_aborts_all_verification_parts():
     cache = ArraysCache(1)
     initial = mx.zeros((1, 1), dtype=mx.int32)
@@ -4741,7 +4470,7 @@ def test_glm_drafter_rejection_restores_pool_after_multiple_appends(batch):
     hidden = mx.random.normal((batch, 1, config.hidden_size))
     mx.eval(drafter._forward_tokens(mx.array([[1]] * batch), hidden, mx.int32))
     reference = deepcopy(drafter)
-    sampler = lambda logits: mx.argmax(logits, axis=-1)
+    sampler = _greedy
     tokens = drafter.draft_block(
         2 if batch == 1 else mx.full((batch,), 2), hidden, None, 4, sampler, greedy=True
     )

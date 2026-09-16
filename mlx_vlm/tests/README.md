@@ -39,14 +39,17 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_server_audio.py` | HTTP audio endpoints and realtime voice sessions |
 | `test_cli.py` | CLI arguments, diffusion display/visualizer behavior, detector display options, and CLI/library default parity |
 | `test_prompt_utils.py` | Prompt construction and reasoning-template arguments |
-| `test_trainer.py` | Training workflows, trainer utilities, and MRoPE/gated-delta gradient regressions |
+| `test_trainer.py` | Training workflows, trainer utilities, MRoPE/gated-delta gradients, and MoE gradient/expert-replacement checks |
 | `test_utils.py` | General loading/conversion utilities and local Python model files |
 
 Other architecture-specific modules remain focused on their own models. The
 larger `test_processors.py`, `test_generate.py`, and `test_server.py` contain
 their existing broad integration checks. Drafter and speculative-decoding tests
 belong in `test_speculative.py`: reuse its tiny target/config factories and
-parameterize shared contracts with descriptive family IDs. It also owns the
+parameterize shared contracts with descriptive family IDs. Checkpoint I/O, MTP
+setup, quantization format matrices, and repeated-decode references are shared
+within the suite. `speculative_fixtures.py` supplies fresh tiny language configs
+for speculative and training tests. `test_speculative.py` also owns the
 Apodex MTP splitter and MiniMax speculative rollback checks; unrelated model
 tests remain in their existing modules.
 
