@@ -723,8 +723,16 @@ def patch_model(
         "mode": quantization.get("mode", "affine"),
     }
 
+    # Routed experts can be quantised apart from the rest of the model, and a
+    # checkpoint says so with a single `expert_bits` rather than an entry per
+    # projection. Every path reaching here is an expert projection, so it
+    # applies unless that projection carries its own override.
+    expert_bits = quantization.get("expert_bits")
+
     def resolve_quant(path: str) -> Tuple[int, int, str]:
         merged = {**default_quant, **_quantization_for_path(quantization, path)}
+        if expert_bits is not None and path not in quantization:
+            merged["bits"] = expert_bits
         return merged["group_size"], merged["bits"], merged["mode"]
 
     expert_cache_bytes = (
