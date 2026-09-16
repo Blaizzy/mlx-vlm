@@ -159,6 +159,8 @@ class ModelChecks(unittest.TestCase):
 
             if model_type in [
                 "qwen2_5_vl",
+                "qwen3_5",
+                "qwen3_5_moe",
                 "glm4v_moe",
                 "glm4v",
                 "hunyuan_vl",

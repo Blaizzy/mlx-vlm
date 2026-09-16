@@ -94,10 +94,12 @@ arguments and reads dimensions from the config. Every case gets fresh config
 objects and a fresh model; JSON contains no constructor calls or object references.
 
 Combine regressions that use the same model configuration into one case's
-`checks` list. The `qwen3_5` case covers request-owned positions, chunked prefill,
-and decode-time RoPE deltas; `qwen3_5_moe` covers its chunked-prefill regression.
-Checks that replace inner modules with recording stubs run after checks that
-need the original model's input embeddings.
+`checks` list. Both `qwen3_5` and `qwen3_5_moe` check language and vision output
+shapes and dtypes in float32 and float16. Their tiny language configs include
+one linear-attention layer and one full-attention layer. The `qwen3_5` case also
+covers request-owned positions, chunked prefill, and decode-time RoPE deltas;
+`qwen3_5_moe` retains its chunked-prefill regression. Checks that replace inner
+modules with recording stubs run after checks that need the original model.
 
 Most cases need no wiring overrides. `vision_path` and `projector_path` select
 unusual component locations; defaults are `vision_tower` and
