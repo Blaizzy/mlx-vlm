@@ -361,7 +361,7 @@ def check_arguments(kind, case, model, config):
     if kind in {"request_positions", "chunked_positions"}:
         return (model,), {}
     if kind in {"language", "mrope_cache_index", "mrope_deltas"}:
-        language_model = model if case.get("language_only") else model.language_model
+        language_model = model.language_model
         text_config = config.text_config
         # Phi3-V keeps its language dimensions on the top-level config.
         if case["module"] == "phi3_v":
@@ -421,11 +421,7 @@ def check_arguments(kind, case, model, config):
 def test_model_contract(case):
     module = importlib.import_module("mlx_vlm.models." + case["module"])
     config = build_config(module, case["config"])
-    model = (
-        module.LanguageModel(config.text_config, config)
-        if case.get("language_only")
-        else module.Model(config)
-    )
+    model = module.Model(config)
     checks = ModelChecks()
     for kind in case["checks"]:
         args, kwargs = check_arguments(kind, case, model, config)

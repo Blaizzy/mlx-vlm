@@ -378,7 +378,7 @@
       "vision": {"input_shape": [140, 1176], "feature_layer": -1, "grid_thw": [[1, 10, 14]]}
     },
     {
-      "id": "TestModels.qwen3_5_decode_uses_rope_deltas_kwarg",
+      "id": "qwen3_5",
       "module": "qwen3_5",
       "config": {
         "text_config": {
@@ -407,8 +407,7 @@
         },
         "model_type": "qwen3_5"
       },
-      "checks": ["mrope_deltas"],
-      "language_only": true
+      "checks": ["request_positions", "chunked_positions", "mrope_deltas"]
     },
     {
       "id": "TestModels.glm4v_moe",
@@ -1152,39 +1151,7 @@
       "checks": ["input_embeddings", "request_positions", "chunked_positions"]
     },
     {
-      "id": "TestGetInputEmbeddings.qwen3_5_input_embeddings_owns_mrope_kwargs",
-      "module": "qwen3_5",
-      "config": {
-        "text_config": {
-          "model_type": "qwen3_5",
-          "hidden_size": 16,
-          "intermediate_size": 32,
-          "linear_num_value_heads": 2,
-          "linear_num_key_heads": 2,
-          "linear_key_head_dim": 8,
-          "linear_value_head_dim": 8,
-          "linear_conv_kernel_dim": 3,
-          "num_hidden_layers": 1,
-          "num_attention_heads": 2,
-          "rms_norm_eps": 1e-05,
-          "vocab_size": 32,
-          "num_key_value_heads": 2,
-          "max_position_embeddings": 128,
-          "head_dim": 8
-        },
-        "vision_config": {
-          "depth": 1,
-          "hidden_size": 16,
-          "intermediate_size": 32,
-          "out_hidden_size": 16,
-          "num_heads": 2
-        },
-        "model_type": "qwen3_5"
-      },
-      "checks": ["request_positions", "chunked_positions"]
-    },
-    {
-      "id": "TestGetInputEmbeddings.qwen3_5_moe_chunked_prefill_slices_mrope_position_ids",
+      "id": "qwen3_5_moe",
       "module": "qwen3_5_moe",
       "config": {
         "text_config": {

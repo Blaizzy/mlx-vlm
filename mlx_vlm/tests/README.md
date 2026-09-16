@@ -48,7 +48,7 @@ small files should not automatically be added to those large modules.
 
 ## JSON model cases
 
-`model_cases.json` contains 45 configurable contract cases and 17 native
+`model_cases.json` contains 44 configurable contract cases and 17 native
 forward/cache cases. `test_models.py` collects each case separately with a stable
 model ID, so failures can be selected with `pytest -k`:
 
@@ -93,12 +93,17 @@ and other config classes, then calls `Model(config)`. Python selects check
 arguments and reads dimensions from the config. Every case gets fresh config
 objects and a fresh model; JSON contains no constructor calls or object references.
 
+Combine regressions that use the same model configuration into one case's
+`checks` list. The `qwen3_5` case covers request-owned positions, chunked prefill,
+and decode-time RoPE deltas; `qwen3_5_moe` covers its chunked-prefill regression.
+Checks that replace inner modules with recording stubs run after checks that
+need the original model's input embeddings.
+
 Most cases need no wiring overrides. `vision_path` and `projector_path` select
 unusual component locations; defaults are `vision_tower` and
-`multi_modal_projector`. `language_only: true` constructs
-`LanguageModel(config.text_config, config)` for the isolated Qwen language check.
-The optional `vision` object holds input data and layout settings: `input_shape`,
-`feature_layer`, `channel_first`, and `grid_thw` (integer grid by default;
+`multi_modal_projector`. The optional `vision` object holds input data and layout
+settings: `input_shape`, `feature_layer`, `channel_first`, and `grid_thw` (integer
+grid by default;
 `grid_dtype: "float32"` preserves the floating-grid scenario).
 
 The `dense` table retains the prototype's name and includes both dense and MoE
