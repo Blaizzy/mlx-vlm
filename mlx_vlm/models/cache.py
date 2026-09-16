@@ -95,12 +95,14 @@ class CacheMemory:
     step: int = 1
     window_size: Optional[int] = None
     fallback: bool = False
+    min_capacity: int = 0
 
     def footprint(self, tokens: int, chunk_size: Optional[int] = None) -> int:
         if tokens <= 0:
             return 0
         if self.window_size is not None and chunk_size is not None:
             tokens = min(tokens, self.window_size - 1 + chunk_size)
+        tokens = max(tokens, self.min_capacity)
         step = max(1, self.step)
         capacity = ((tokens + step - 1) // step) * step
         return self.fixed_bytes + ceil(capacity * self.bytes_per_token)
@@ -138,7 +140,7 @@ def _kv_memory_profile(c, token_count):
     return CacheMemory(
         source_bytes=size,
         bytes_per_token=size / capacity if capacity else 0,
-        step=c.step,
+        step=getattr(c, "step", 1),
     )
 
 
@@ -146,7 +148,31 @@ def _windowed_memory_profile(c, token_count):
     return replace(_kv_memory_profile(c, token_count), window_size=c.max_size)
 
 
+def _pooling_memory_profile(c, token_count):
+    size = cache_nbytes(c)
+    pooled = c.pooled if c.pooled is not None else c.buf_kv
+    capacity = 0 if pooled is None else pooled.shape[1]
+    return CacheMemory(
+        source_bytes=size,
+        fixed_bytes=size - cache_nbytes(c.pooled),
+        bytes_per_token=(pooled.nbytes / capacity / c.ratio if capacity else 0),
+        step=c.ratio,
+    )
+
+
 class _BaseCache:
+    def memory_profile(self, token_count):
+        """Describe standard KV buffers; other layouts override this method."""
+        if not hasattr(self, "keys") or not hasattr(self, "values"):
+            return None
+        profile = _kv_memory_profile(self, token_count)
+        try:
+            if self.nbytes > profile.source_bytes:
+                return None  # Auxiliary state needs its own profile.
+        except (AttributeError, NotImplementedError):
+            pass
+        return profile
+
     @property
     def state(self):
         return []
@@ -299,7 +325,6 @@ def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
 
 
 class QuantizedKVCache(_BaseCache):
-    memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(self, group_size: int = 64, bits: int = 8):
@@ -474,7 +499,6 @@ class QuantizedKVCache(_BaseCache):
 
 
 class KVCache(_BaseCache):
-    memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(self):
@@ -1305,6 +1329,16 @@ class ArraysCache(_BaseCache):
 class ChunkedKVCache(_BaseCache):
     step = 256
 
+    def memory_profile(self, token_count):
+        profile = _kv_memory_profile(self, token_count)
+        # A trimmed prefix can be followed by a partially filled allocation block.
+        return replace(
+            profile,
+            fixed_bytes=ceil((self.step - 1) * profile.bytes_per_token),
+            step=1,
+            window_size=self.chunk_size + 1,
+        )
+
     def __init__(self, chunk_size):
         self.keys = None
         self.values = None
@@ -1511,7 +1545,6 @@ def dynamic_roll(x, shifts, axis):
 
 
 class BatchKVCache(_BaseCache):
-    memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(self, left_padding: List[int]):
@@ -2130,6 +2163,16 @@ class BatchRotatingKVCache(_BaseCache):
 class BufferedRotatingKVCache(RotatingKVCache):
     """Temporal sliding-window cache with rollback slack for speculative blocks."""
 
+    def memory_profile(self, token_count):
+        profile = _windowed_memory_profile(self, token_count)
+        if self.keep:
+            return profile
+        return replace(
+            profile,
+            min_capacity=self._target_size(),
+            window_size=self.max_size + 1,
+        )
+
     def __init__(self, max_size: int, keep: int = 0, buffer_size: int = 64):
         super().__init__(max_size=max_size, keep=keep)
         self.buffer_size = max(0, int(buffer_size))
@@ -2303,7 +2346,6 @@ class BatchQuantizedKVCache(_BaseCache):
     ``Batch.extend`` / ``Batch.filter`` work during continuous-batching.
     """
 
-    memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(
@@ -2651,6 +2693,8 @@ class PoolingCache(_BaseCache):
       2. A small remainder buffer of tokens not yet forming a full window.
     """
 
+    memory_profile = _pooling_memory_profile
+
     def __init__(self, ratio: int):
         self.ratio = ratio
 
@@ -2951,6 +2995,8 @@ class PoolingCache(_BaseCache):
 
 class BatchPoolingCache(_BaseCache):
     """Batched pooling cache with per-element variable-length tracking."""
+
+    memory_profile = _pooling_memory_profile
 
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
@@ -3553,7 +3599,7 @@ class BatchPoolingCache(_BaseCache):
         return batch_cache
 
 
-class SimpleKVCache:
+class SimpleKVCache(_BaseCache):
     """A simple key-value cache for transformer attention layers.
 
     Stores and concatenates key/value tensors along sequence dimension.
@@ -3655,6 +3701,13 @@ class StaticPrefixKVCache(_BaseCache):
     an attention mask that hides unpopulated entries.
     """
 
+    def memory_profile(self, token_count):
+        if self.read_only:
+            return CacheMemory(source_bytes=self.nbytes, fixed_bytes=self.nbytes)
+        return replace(
+            _kv_memory_profile(self, token_count), min_capacity=self.max_size
+        )
+
     def __init__(self, max_size: int, step: int = 256, read_only: bool = False):
         self.max_size = int(max_size)
         self.step = int(step)
@@ -3740,11 +3793,15 @@ class StaticPrefixKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.max_size, self.step, self.offset)))
+        return tuple(
+            map(str, (self.max_size, self.step, self.offset, int(self.read_only)))
+        )
 
     @meta_state.setter
     def meta_state(self, v):
-        self.max_size, self.step, self.offset = map(int, v)
+        values = list(map(int, v))
+        self.max_size, self.step, self.offset = values[:3]
+        self.read_only = bool(values[3]) if len(values) > 3 else False
 
     def is_trimmable(self):
         return True

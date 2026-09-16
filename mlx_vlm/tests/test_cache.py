@@ -12,10 +12,11 @@ from mlx_vlm.models.cache import (
     PoolingCache,
     RotatingKVCache,
 )
+from mlx_vlm.models.hy_v4.cache import HyV4KVCache
 
 
-def _make_kv_cache(batch_size=1, length=3):
-    cache = KVCache()
+def _make_kv_cache(batch_size=1, length=3, factory=KVCache):
+    cache = factory()
     keys = mx.arange(batch_size * 2 * length * 4).reshape(batch_size, 2, length, 4)
     values = keys + 100
     cache.update_and_fetch(keys, values)
@@ -23,7 +24,8 @@ def _make_kv_cache(batch_size=1, length=3):
 
 
 @pytest.mark.parametrize(
-    "factory", [KVCache, lambda: BatchKVCache([0]), lambda: RotatingKVCache(8)]
+    "factory",
+    [KVCache, HyV4KVCache, lambda: BatchKVCache([0]), lambda: RotatingKVCache(8)],
 )
 def test_empty_kv_cache_state_can_be_evaluated_and_restored(factory):
     cache = factory()
@@ -38,6 +40,20 @@ def test_empty_kv_cache_state_can_be_evaluated_and_restored(factory):
     actual_keys, actual_values = restored.update_and_fetch(keys, values)
     assert mx.array_equal(actual_keys, keys).item()
     assert mx.array_equal(actual_values, values).item()
+
+
+@pytest.mark.parametrize("factory", [KVCache, HyV4KVCache])
+def test_kv_cache_extracts_one_active_row(factory):
+    cache, keys, values = _make_kv_cache(batch_size=2, factory=factory)
+
+    extracted = cache.extract(1)
+
+    assert type(extracted) is factory
+    assert extracted.offset == 3
+    assert extracted.keys.shape == (1, 2, 3, 4)
+    assert extracted.values.shape == (1, 2, 3, 4)
+    assert mx.array_equal(extracted.keys, keys[1:2]).item()
+    assert mx.array_equal(extracted.values, values[1:2]).item()
 
 
 def test_cache_list_can_extract_an_already_extracted_kv_cache():
@@ -171,8 +187,9 @@ def test_temporal_cache_retention_is_bounded_and_abort_restores_state():
         assert cache.nbytes == initial.nbytes
 
 
-def test_kv_cache_extract_validates_row_index():
-    cache, _, _ = _make_kv_cache(batch_size=2)
+@pytest.mark.parametrize("factory", [KVCache, HyV4KVCache])
+def test_kv_cache_extract_validates_row_index(factory):
+    cache, _, _ = _make_kv_cache(batch_size=2, factory=factory)
 
     assert mx.array_equal(cache.extract(-1).keys, cache.extract(1).keys).item()
     with pytest.raises(IndexError):
@@ -251,11 +268,16 @@ def test_batch_pooling_cache_speculative_commit_matches_ragged_prefixes(incremen
             ).item()
 
 
-def test_empty_kv_cache_extracts_as_empty():
-    extracted = KVCache().extract(0)
-
-    assert extracted.empty()
-    assert extracted.offset == 0
+@pytest.mark.parametrize("factory", [KVCache, HyV4KVCache])
+def test_empty_kv_cache_extracts_as_empty(factory):
+    cache = factory()
+    for idx in (0, -1):
+        extracted = cache.extract(idx)
+        assert type(extracted) is factory
+        assert extracted.empty()
+        assert extracted.offset == 0
+    with pytest.raises(IndexError):
+        cache.extract(1)
 
 
 def test_empty_batch_kv_cache_ignores_unapplied_right_padding():

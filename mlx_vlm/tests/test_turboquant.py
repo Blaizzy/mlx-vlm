@@ -4,6 +4,7 @@ import mlx.core as mx
 import pytest
 
 import mlx_vlm.turboquant as tq
+from mlx_vlm.apc_adapters import cache_memory_components, clone_cache_entry
 from mlx_vlm.generate import maybe_quantize_kv_cache
 from mlx_vlm.models.base import (
     _turboquant_attention_applies,
@@ -616,3 +617,44 @@ def test_rht_weighted_sum_stats_matches_einsum(dim, bits, monkeypatch):
     assert mx.max(mx.abs(out_k - out_e)).item() < 1e-4
     assert mx.max(mx.abs(denom_k - denom_e)).item() < 1e-4
     assert mx.max(mx.abs(max_k - max_e)).item() < 1e-4
+
+
+@pytest.mark.parametrize("kind,batch_size", [("turbo", 1), ("batch", 2), ("hybrid", 1)])
+@pytest.mark.parametrize("bits", [3, 3.5])
+def test_packed_memory_profiles_include_spare_capacity(kind, batch_size, bits):
+    from mlx_vlm.kv_quant import from_legacy
+    from mlx_vlm.turboquant import HybridQuantKVCache, _state_nbytes
+
+    if kind == "hybrid":
+        cache = HybridQuantKVCache(
+            from_legacy(
+                8, "uniform", 64, kv_value_bits=bits, kv_value_scheme="turboquant"
+            )
+        )
+    elif kind == "batch":
+        cache = BatchTurboQuantKVCache([0, 3], bits)
+    else:
+        cache = TurboQuantKVCache(bits)
+
+    def advance(length):
+        cache.update_and_fetch(
+            mx.ones((batch_size, 1, length, 64)),
+            mx.ones((batch_size, 1, length, 128)),
+        )
+
+    empty = cache_memory_components([cache], 0)[0]
+    assert not empty.fallback and empty.footprint(6000) == 0
+    advance(1)
+    if kind == "turbo":
+        cache = clone_cache_entry(cache, min_capacity_tokens=None, eval_targets=[])
+    profile = cache_memory_components([cache], 1, batch_size=batch_size)[0]
+    assert not profile.fallback
+    for start in range(1, 6000, 257):
+        advance(min(257, 6000 - start))
+    allocated = _state_nbytes(cache.keys) + _state_nbytes(cache.values)
+    estimate = batch_size * profile.footprint(6000, 257)
+    assert allocated <= estimate < 1.1 * allocated
+    current = cache_memory_components([cache], 6000, batch_size=batch_size)[0]
+    assert current.source_bytes * batch_size == allocated
+    if kind != "hybrid":
+        assert allocated > cache.nbytes

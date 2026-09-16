@@ -1,4 +1,6 @@
+from dataclasses import replace
 from functools import lru_cache, partial
+from math import ceil
 from typing import Any, List, Optional
 
 import mlx.core as mx
@@ -550,7 +552,22 @@ class MiniMaxRMSNorm(nn.Module):
         return mx.fast.rms_norm(x, weight, self.eps)
 
 
+def _minimax_memory_profile(c, token_count):
+    profile = c.kv_cache.memory_profile(token_count)
+    capacity = 0 if c.index_keys is None else c.index_keys.shape[2]
+    index_bytes = c.index_keys.nbytes / capacity if capacity else 0
+    per_token = profile.bytes_per_token + index_bytes
+    return replace(
+        profile,
+        source_bytes=c.nbytes,
+        fixed_bytes=ceil((c.step - 1) * per_token),
+        bytes_per_token=per_token,
+        step=1,
+    )
+
+
 class MiniMaxM3KVCache:
+    memory_profile = _minimax_memory_profile
     step = KVCache.step
 
     def __init__(self):
@@ -678,6 +695,7 @@ class MiniMaxM3KVCache:
 
 
 class MiniMaxM3BatchKVCache:
+    memory_profile = _minimax_memory_profile
     step = BatchKVCache.step
 
     def __init__(self, left_padding):

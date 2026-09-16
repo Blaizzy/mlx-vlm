@@ -10,8 +10,30 @@ import pytest
 
 from mlx_vlm import apc
 from mlx_vlm.apc import APCManager, DiskBlockStore, _cache_nbytes, from_env
+from mlx_vlm.apc_adapters import cache_memory_components, clone_cache_entry
 from mlx_vlm.apc_storage import KVBlockHandle
-from mlx_vlm.models.cache import ArraysCache, KVCache, QuantizedKVCache, RotatingKVCache
+from mlx_vlm.models.cache import (
+    ArraysCache,
+    BatchPoolingCache,
+    BufferedRotatingKVCache,
+    ChunkedKVCache,
+    ConcatenateKVCache,
+    KVCache,
+    PoolingCache,
+    QuantizedKVCache,
+    RotatingKVCache,
+    SimpleKVCache,
+    StaticPrefixKVCache,
+    _BaseCache,
+)
+from mlx_vlm.models.hy_v4.cache import HyV4KVCache
+from mlx_vlm.models.minimax_m3_vl.language import (
+    MiniMaxM3BatchKVCache,
+    MiniMaxM3KVCache,
+)
+from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
+from mlx_vlm.models.z1t.config import ModelConfig as Z1TConfig
+from mlx_vlm.models.z1t.language import AFTConv, Z1TCache
 
 # Memory budgets and disk eviction
 
@@ -330,3 +352,163 @@ def _seed_block_storage():
 def test_kv_block_handle_empty():
     handle = KVBlockHandle()
     assert handle.resident_bytes() == 0
+
+
+@pytest.mark.parametrize("base", [object, _BaseCache])
+def test_unknown_checkpoint_state_keeps_conservative_growth_estimate(
+    manager_factory, monkeypatch, base
+):
+    class GrowingCache(base):
+        state = mx.ones((1, 256, 1024))
+        meta_state = ()
+
+    manager = manager_factory(budget=4 << 20)
+    # Opaque checkpoints may grow with tokens.
+    monkeypatch.setattr(apc, "_clone_prompt_cache_for_apc", lambda cache: cache)
+    cache = GrowingCache()
+    coordinator = _coordinator(manager, [cache])
+    assert manager.store_exact_cache(list(range(18)), [cache])
+    monkeypatch.setattr(manager, "_memory_headroom", lambda: 8 << 20)
+    coordinator.prepare_prefill(6001)
+    assert manager.resident_bytes() == 0
+    assert not manager._make_room()
+
+
+@pytest.mark.parametrize(
+    "make_cache",
+    [
+        ConcatenateKVCache,
+        SimpleKVCache,
+        lambda: ChunkedKVCache(65),
+        lambda: BufferedRotatingKVCache(65, buffer_size=300),
+        lambda: BufferedRotatingKVCache(65, keep=1),
+        lambda: StaticPrefixKVCache(513),
+    ],
+)
+@pytest.mark.parametrize("chunk_size", [37, 256])
+def test_builtin_kv_profiles_bound_prefill_allocations(make_cache, chunk_size):
+    cache = make_cache()
+    empty = cache_memory_components([cache], 0)[0]
+    assert not empty.fallback
+    assert empty.footprint(6000, chunk_size) == 0
+    cache.update_and_fetch(mx.ones((1, 1, 1, 4)), mx.ones((1, 1, 1, 8)))
+    profile = cache_memory_components([cache], 1)[0]
+    assert not profile.fallback
+    assert profile.source_bytes == cache.nbytes
+    estimate = profile.footprint(1, chunk_size)
+    assert cache.nbytes <= estimate < cache.nbytes + 2 * 256 * 48
+
+    peak = cache.nbytes
+    for start in range(1, 6000, chunk_size):
+        if isinstance(cache, ChunkedKVCache):
+            cache.maybe_trim_front()
+        size = min(chunk_size, 6000 - start)
+        cache.update_and_fetch(mx.ones((1, 1, size, 4)), mx.ones((1, 1, size, 8)))
+        peak = max(peak, cache.nbytes)
+    estimate = profile.footprint(6000, chunk_size)
+    assert peak <= estimate < peak + 2 * 256 * 48
+    assert profile.footprint(0, chunk_size) == 0
+
+
+@pytest.mark.parametrize("batch_size", [1, 3])
+@pytest.mark.parametrize("ratio", [4, 64])
+@pytest.mark.parametrize("seed_length", [1, 65])
+def test_pooling_profiles_separate_buffers_from_compressed_growth(
+    batch_size, ratio, seed_length
+):
+    cache = (
+        PoolingCache(ratio)
+        if batch_size == 1
+        else BatchPoolingCache(ratio, left_padding=[0, 3, 7])
+    )
+
+    def advance(length):
+        kv = mx.ones((batch_size, length, 8), dtype=mx.float16)
+        gate = mx.ones((batch_size, length, 4), dtype=mx.float32)
+        ready, _, _ = cache.accumulate_windows(kv, gate, 0)
+        cache.update_and_fetch(
+            mx.ones((batch_size, ready.shape[1] // ratio, 4), dtype=mx.float16)
+        )
+
+    empty = cache_memory_components([cache], 0)[0]
+    assert not empty.fallback and empty.footprint(6000) == 0
+    advance(seed_length)
+    profile = cache_memory_components([cache], seed_length, batch_size=batch_size)[0]
+    assert not profile.fallback
+    assert profile.fixed_bytes == ratio * 32
+
+    for start in range(seed_length, 6000, 37):
+        advance(min(37, 6000 - start))
+    estimate = batch_size * profile.footprint(6000)
+    assert cache.nbytes <= estimate <= 2 * cache.nbytes
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+def test_static_prefix_profile_survives_restore(read_only):
+    prefix = StaticPrefixKVCache(513)
+    prefix.update_and_fetch(mx.ones((1, 1, 16, 4)), mx.ones((1, 1, 16, 8)))
+    source = StaticPrefixKVCache.from_prefix(prefix) if read_only else prefix
+    cache = StaticPrefixKVCache.from_state(source.state, source.meta_state)
+    assert cache.read_only == read_only
+    profile = cache_memory_components([cache], 16)[0]
+    assert not profile.fallback
+    if read_only:
+        assert profile.footprint(1) == profile.footprint(6000) == cache.nbytes
+    cache.update_and_fetch(mx.ones((1, 1, 1, 4)), mx.ones((1, 1, 1, 8)))
+    assert cache.offset == (16 if read_only else 17)
+    legacy = StaticPrefixKVCache.from_state(source.state, source.meta_state[:3])
+    assert not legacy.read_only
+
+
+@pytest.mark.parametrize("make_cache", [HyV4KVCache, lambda: RingSlidingKVCache(16)])
+@pytest.mark.parametrize("chunk_size", [37, 256, 1024])
+def test_model_kv_profiles_bound_restored_prefill(make_cache, chunk_size):
+    cache = make_cache()
+    cache.update_and_fetch(mx.ones((1, 1, 16, 4)), mx.ones((1, 1, 16, 8)))
+    cache = clone_cache_entry(cache, min_capacity_tokens=None, eval_targets=[])
+    profile = cache_memory_components([cache], 16)[0]
+    assert not profile.fallback
+    assert profile.source_bytes == cache.nbytes
+    for start in range(16, 6000, chunk_size):
+        size = min(chunk_size, 6000 - start)
+        cache.update_and_fetch(mx.ones((1, 1, size, 4)), mx.ones((1, 1, size, 8)))
+    assert cache.nbytes <= profile.footprint(6000, chunk_size) <= 2 * cache.nbytes
+
+
+def test_z1t_prefill_memory_is_fixed():
+    layer = AFTConv(Z1TConfig(hidden_size=8, aft_heads=2, aft_ksize=4))
+    cache = Z1TCache()
+    layer(mx.ones((1, 1, 8)), cache)
+    cache = clone_cache_entry(cache, min_capacity_tokens=None, eval_targets=[])
+    profile = cache_memory_components([cache], 1)[0]
+    assert not profile.fallback
+    layer(mx.ones((1, 5999, 8)), cache)
+    assert profile.footprint(1) == profile.footprint(6000) == _cache_nbytes(cache)
+
+
+@pytest.mark.parametrize(
+    "make_cache,batch_size",
+    [(MiniMaxM3KVCache, 1), (lambda: MiniMaxM3BatchKVCache([0, 3]), 2)],
+)
+def test_minimax_profiles_include_indexer_allocations(make_cache, batch_size):
+    cache = make_cache()
+
+    def advance(length):
+        cache.update_and_fetch(
+            mx.ones((batch_size, 1, length, 4), dtype=mx.float16),
+            mx.ones((batch_size, 1, length, 8), dtype=mx.float16),
+        )
+        cache.update_index_and_fetch(mx.ones((batch_size, 1, length, 8)))
+
+    empty = cache_memory_components([cache], 0)[0]
+    assert not empty.fallback and empty.footprint(6000) == 0
+    advance(16)
+    if batch_size == 1:
+        cache = clone_cache_entry(cache, min_capacity_tokens=None, eval_targets=[])
+    profile = cache_memory_components([cache], 16, batch_size=batch_size)[0]
+    assert not profile.fallback
+    assert profile.source_bytes * batch_size == cache.nbytes
+    for start in range(16, 6000, 257):
+        advance(min(257, 6000 - start))
+    estimate = batch_size * profile.footprint(6000, 257)
+    assert cache.nbytes <= estimate < 1.1 * cache.nbytes

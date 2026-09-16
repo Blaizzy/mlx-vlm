@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
+import json
 import pkgutil
 import textwrap
 from pathlib import Path
@@ -22,9 +23,11 @@ from mlx_vlm.apc import (
 from mlx_vlm.apc_adapters import (
     build_prefix_cache_plan,
     build_prefix_cache_plan_from_caches,
+    cache_memory_components,
     clone_cache_entry,
 )
 from mlx_vlm.models import cache as C
+from mlx_vlm.models import qwen4_exp
 from mlx_vlm.models.cache import (
     ArraysCache,
     BatchKVCache,
@@ -42,7 +45,12 @@ from mlx_vlm.models.cache import (
 )
 from mlx_vlm.models.hy_v4.cache import HyV4KVCache
 from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
-from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+from mlx_vlm.models.qwen4_exp.language import (
+    BatchQSAKVCache,
+    QSAKVCache,
+    QSAQuantizedKVCache,
+    Qwen4ExpAttention,
+)
 from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 from mlx_vlm.models.z1t.language import Z1TCache
 
@@ -799,6 +807,7 @@ def test_every_model_cache_factory_has_a_restorable_apc_adapter():
             cache, min_capacity_tokens=None, eval_targets=eval_targets
         )
         assert clone is not None, f"{name} cannot be cloned for APC"
+        assert all(not c.fallback for c in A.cache_memory_components([clone], 0)), name
 
     # Also build one heterogeneous plan per model package. This catches a
     # future combination that is individually registered but cannot be
@@ -880,3 +889,107 @@ def test_dense_models_without_make_cache_use_generation_fallback():
     assert plan.strategy == "block"
     assert len(plan.components) == len(DenseLanguageModel.layers)
     assert len(plan.groups) == 1
+
+
+@pytest.mark.parametrize(
+    "base,kwargs",
+    [
+        (C.ConcatenateKVCache, {}),
+        (C.SimpleKVCache, {}),
+        (C.KVCache, {}),
+        (C.QuantizedKVCache, {}),
+        (C.BatchKVCache, {"left_padding": [0]}),
+        (C.BatchQuantizedKVCache, {"left_padding": [0]}),
+    ],
+)
+def test_kv_subclasses_inherit_default_memory_profile(base, kwargs):
+    class CustomKV(base):
+        pass
+
+    cache = CustomKV(**kwargs)
+    empty = A.cache_memory_components([cache], 0)[0]
+    assert not empty.fallback and empty.footprint(6000) == 0
+
+    keys = mx.ones((1, 1, 16, 64))
+    cache.update_and_fetch(keys, keys + 1)
+    profile = A.cache_memory_components([cache], 16)[0]
+    assert not profile.fallback
+    assert profile.source_bytes == C.cache_nbytes((cache.keys, cache.values))
+    future = CustomKV(**kwargs)
+    keys = mx.ones((1, 1, 6000, 64))
+    future.update_and_fetch(keys, keys + 1)
+    assert profile.footprint(6000) == C.cache_nbytes((future.keys, future.values))
+
+
+def test_subclasses_inherit_specialized_memory_profile():
+    class CustomState(C.ArraysCache):
+        pass
+
+    cache = CustomState(1)
+    cache[0] = mx.ones((1, 64))
+    profile = A.cache_memory_components([cache], 16)[0]
+    assert not profile.fallback
+    assert profile.footprint(6000) == cache.nbytes
+
+
+@pytest.mark.parametrize(
+    "make_cache,batch_size,mrope",
+    [
+        (QSAKVCache, 1, False),
+        (lambda: QSAQuantizedKVCache(32, 4), 1, True),
+        (lambda: BatchQSAKVCache([0, 0]), 2, True),
+        (lambda: BatchQSAKVCache([0, 3]), 2, False),
+    ],
+)
+@pytest.mark.parametrize("seed_length", [1, 16])
+def test_qsa_profiles_include_indexer_and_block_growth(
+    make_cache, batch_size, mrope, seed_length
+):
+    cases = json.loads(Path(__file__).with_name("model_cases.json").read_text())[
+        "cases"
+    ]
+    config = next(case for case in cases if case["id"] == "qwen4_exp")["config"][
+        "text_config"
+    ]
+    # Preserve the upstream indexer's dimensions while reusing the shared config.
+    config.update(
+        indexer_n_heads=2,
+        indexer_head_dim=8,
+        indexer_compress_ratio=2,
+        head_dim=8,
+        rope_parameters={
+            "rope_type": "default",
+            "mrope_section": [2, 1, 1],
+            "rope_theta": 10000,
+            "partial_rotary_factor": 1.0,
+        },
+    )
+    indexer = Qwen4ExpAttention(qwen4_exp.TextConfig(**config)).indexer
+    cache = make_cache()
+
+    def advance(start, length):
+        positions = mx.broadcast_to(
+            mx.arange(start, start + length), (batch_size, length)
+        )
+        if mrope:
+            positions = mx.broadcast_to(positions, (3, batch_size, length))
+        indexer.select_from_projected(
+            mx.ones((batch_size, length, 24)), cache, positions
+        )
+        cache.update_and_fetch(
+            mx.ones((batch_size, 1, length, 32), dtype=mx.float16),
+            mx.ones((batch_size, 1, length, 64), dtype=mx.float16),
+        )
+        mx.eval(cache.state)
+
+    empty = cache_memory_components([cache], 0)[0]
+    assert not empty.fallback and empty.footprint(6000) == 0
+    advance(0, seed_length)
+    cache = clone_cache_entry(cache, min_capacity_tokens=None, eval_targets=[])
+    profile = cache_memory_components([cache], seed_length, batch_size=batch_size)[0]
+    assert not profile.fallback
+    assert profile.source_bytes * batch_size == cache.nbytes
+    for start in range(seed_length, 6000, 257):
+        advance(start, min(257, 6000 - start))
+    estimate = batch_size * profile.footprint(6000, 257)
+    assert cache.nbytes <= estimate < 1.3 * cache.nbytes
