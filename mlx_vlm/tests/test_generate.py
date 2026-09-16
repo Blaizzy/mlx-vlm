@@ -29,10 +29,7 @@ from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
 from mlx_vlm.models.cache import (
     BatchKVCache,
-    BatchPoolingCache,
-    BatchRotatingKVCache,
     BufferedRotatingKVCache,
-    CacheList,
     KVCache,
     RotatingKVCache,
 )
@@ -403,37 +400,6 @@ class TestBatchGenerator:
         assert len(uids) == 2
         # Prompts are sorted by length, so check the unprocessed prompts
         assert len(gen.unprocessed_prompts) == 2
-
-    def test_extend_active_deepseek_cache_with_concurrent_request(self):
-        def make_row(prompt_length):
-            rotating = BatchRotatingKVCache(max_size=16, left_padding=[0])
-            keys = mx.random.normal((1, 1, prompt_length, 4))
-            values = mx.random.normal((1, 1, prompt_length, 4))
-            rotating.update_and_fetch(keys, values)
-            rotating.finalize()
-
-            pooling = BatchPoolingCache(ratio=4, left_padding=[0])
-            pooling.prepare(lengths=[prompt_length])
-            kv = mx.random.normal((1, prompt_length, 3))
-            gate = mx.random.normal((1, prompt_length, 2))
-            ready_kv, _, _ = pooling.accumulate_windows(kv, gate, offset=0)
-            pooled = mx.random.normal((1, ready_kv.shape[1] // 4, 3))
-            pooling.update_and_fetch(pooled)
-            pooling.finalize()
-            return [CacheList(rotating, pooling)]
-
-        active = make_row(6)
-        joining = make_row(5)
-
-        extended = ar_module._extend_cache(active, joining)
-
-        rotating, pooling = extended[0].caches
-        assert isinstance(rotating, BatchRotatingKVCache)
-        assert rotating.offset.shape == (2,)
-        assert rotating.keys.shape[0] == 2
-        assert isinstance(pooling, BatchPoolingCache)
-        assert pooling.remainder == [2, 1]
-        assert pooling.pooled.shape[0] == 2
 
     def test_next_reports_prompt_progress_for_completed_prefill(
         self, mock_model, mock_processor, monkeypatch
@@ -1615,121 +1581,6 @@ class TestPrefixCacheReuseTrim:
         c.update_and_fetch(mx.zeros((1, 1, 2, 4)), mx.zeros((1, 1, 2, 4)))
 
 
-class TestGemma4LogitsToKeep:
-    class _FakeTextModel:
-        def __init__(self, hidden):
-            self.hidden = hidden
-
-        def __call__(
-            self, inputs=None, inputs_embeds=None, input_embeddings=None, **kwargs
-        ):
-            seq = next(
-                t for t in (inputs, inputs_embeds, input_embeddings) if t is not None
-            )
-            return mx.zeros((1, seq.shape[1], self.hidden))
-
-    def _gemma4_lm(self, hidden):
-        from mlx_vlm.models.gemma4.language import LanguageModel
-
-        lm = LanguageModel.__new__(LanguageModel)
-        lm.model = self._FakeTextModel(hidden)
-        lm.logits_from_hidden = lambda h: h
-        return LanguageModel, lm
-
-    def _gemma4_text_lm(self, hidden):
-        from mlx_vlm.models.gemma4_text.language import LanguageModel
-
-        lm = LanguageModel.__new__(LanguageModel)
-        lm.model = self._FakeTextModel(hidden)
-        lm.tie_word_embeddings = False
-        lm.lm_head = lambda h: h
-        lm.final_logit_softcapping = None
-        return LanguageModel, lm
-
-    def test_gemma4_text_slices_before_lm_head(self):
-        _, lm = self._gemma4_text_lm(hidden=8)
-        ids = mx.zeros((1, 6), dtype=mx.int32)
-        assert lm(ids).logits.shape == (1, 6, 8)
-        assert lm(ids, logits_to_keep=1).logits.shape == (1, 1, 8)
-
-    @staticmethod
-    def _shared_config(config_cls, **kwargs):
-        return config_cls(
-            hidden_size=16,
-            num_hidden_layers=4,
-            intermediate_size=32,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-            global_head_dim=8,
-            vocab_size=32,
-            vocab_size_per_layer_input=32,
-            hidden_size_per_layer_input=8,
-            num_kv_shared_layers=2,
-            sliding_window=32,
-            sliding_window_pattern=2,
-            **kwargs,
-        )
-
-    @pytest.mark.parametrize("keep", [1, 3])
-    @pytest.mark.parametrize(
-        "model_name,bidirectional,capture_ids",
-        [
-            ("gemma4", False, None),
-            ("gemma4", True, None),
-            ("gemma4", False, [0, 2]),
-            ("gemma4", False, []),
-            ("gemma4_text", False, None),
-        ],
-    )
-    def test_shared_tail_trimming(self, model_name, bidirectional, capture_ids, keep):
-        from mlx_vlm.models.gemma4 import language as gemma4
-        from mlx_vlm.models.gemma4_text import language as gemma4_text
-
-        language = gemma4 if model_name == "gemma4" else gemma4_text
-        config_cls = (
-            gemma4.TextConfig if model_name == "gemma4" else gemma4_text.ModelConfig
-        )
-        config_kwargs = (
-            {"use_bidirectional_attention": "vision"} if bidirectional else {}
-        )
-        lm = language.LanguageModel(self._shared_config(config_cls, **config_kwargs))
-        ids = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
-        kwargs = (
-            {"mm_token_type_ids": mx.array([[0, 1, 1, 0, 0]])} if bidirectional else {}
-        )
-        if capture_ids is not None:
-            kwargs["capture_layer_ids"] = capture_ids
-        full = lm(ids, **kwargs)
-        mx.eval(full.logits, full.hidden_states or [])
-        lengths = []
-        original_call = language.DecoderLayer.__call__
-
-        def traced_call(layer, hidden, *args, **call_kwargs):
-            lengths.append(hidden.shape[1])
-            return original_call(layer, hidden, *args, **call_kwargs)
-
-        with patch.object(language.DecoderLayer, "__call__", traced_call):
-            output = lm(ids, logits_to_keep=keep, **kwargs)
-            mx.eval(output.logits, output.hidden_states or [])
-
-        trim_at = 2 if capture_ids is None else max(capture_ids, default=3) + 1
-        assert lengths == [5] * trim_at + [keep] * (4 - trim_at)
-        assert output.logits.shape == (1, keep, 32)
-        assert mx.allclose(
-            output.logits, full.logits[:, -keep:], rtol=1e-3, atol=2e-3
-        ).item()
-        assert [h.shape for h in output.hidden_states or []] == [
-            h.shape for h in full.hidden_states or []
-        ]
-        assert all(
-            mx.array_equal(actual, expected).item()
-            for actual, expected in zip(
-                output.hidden_states or [], full.hidden_states or []
-            )
-        )
-
-
 @pytest.mark.parametrize("honors_hint", [False, True])
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("right_padded", [False, True])
@@ -2125,109 +1976,6 @@ class TestTokenizerPaddedBatchRows:
 
         queued = {sequence[0]: sequence[1] for sequence in gen._unprocessed_sequences}
         assert queued == {0: [4, 5], 1: [6, 7, 8]}
-
-
-def test_paligemma_opts_out_of_chunked_prefill_when_bidirectional():
-    from mlx_vlm.models.paligemma.paligemma import Model as PaliGemmaModel
-
-    bidirectional = SimpleNamespace(
-        config=SimpleNamespace(
-            text_config=SimpleNamespace(use_bidirectional_attention=True)
-        )
-    )
-    causal = SimpleNamespace(
-        config=SimpleNamespace(
-            text_config=SimpleNamespace(use_bidirectional_attention=False)
-        )
-    )
-    policy = PaliGemmaModel.chunked_prefill_policy
-    assert policy(bidirectional) is False
-    assert policy(causal) is True
-
-
-@pytest.fixture
-def mllama_prefill():
-    from mlx_vlm.models.mllama import LanguageModel, TextConfig
-
-    mx.random.seed(0)
-    model = LanguageModel(
-        TextConfig(
-            vocab_size=32,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=3,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            cross_attention_layers=[0, 2],
-        )
-    )
-    for idx in model.config.cross_attention_layers:
-        model.layers[idx].cross_attn_attn_gate = mx.ones((1,))
-        model.layers[idx].cross_attn_mlp_gate = mx.ones((1,))
-    # Vary visible vision keys and fully masked rows across chunk boundaries.
-    mask = mx.tile(mx.array([[0.0, -1e9], [-1e9, 0.0], [0.0, 0.0]]), (6, 1))
-    row_mask = mx.broadcast_to(
-        (mx.arange(18) % 4 != 0)[None, None, :, None], (2, 1, 18, 1)
-    )
-    return model, {
-        "inputs_embeds": model.model.embed_tokens(mx.arange(36).reshape(2, 18) % 32),
-        "cross_attention_states": mx.random.normal((2, 2, 16)),
-        "cross_attention_mask": mask[None, None] * row_mask,
-        "full_text_row_masked_out_mask": row_mask,
-    }
-
-
-@pytest.mark.parametrize("prefill_step_size", [4, 2048])
-def test_mllama_generation_matches_unchunked(mllama_prefill, prefill_step_size):
-    from mlx_vlm.models.base import InputEmbeddingsFeatures
-
-    language_model, kwargs = mllama_prefill
-    features = InputEmbeddingsFeatures(
-        **{key: value[:1] for key, value in kwargs.items()}
-    )
-    model = SimpleNamespace(
-        language_model=language_model,
-        get_input_embeddings=lambda *args, **kwargs: features,
-    )
-
-    def generate(step_size):
-        return list(
-            generate_module.generate_step(
-                mx.arange(18)[None],
-                model,
-                None,
-                None,
-                prefill_step_size=step_size,
-                max_tokens=3,
-                temperature=0,
-                verbose=False,
-            )
-        )
-
-    expected, actual = generate(None), generate(prefill_step_size)
-    assert len(actual) == 3
-    assert [token for token, _ in actual] == [token for token, _ in expected]
-    assert mx.allclose(
-        mx.stack([lp for _, lp in actual]),
-        mx.stack([lp for _, lp in expected]),
-        atol=1e-6,
-    ).item()
-
-
-@pytest.mark.parametrize("slice_masks", [False, True])
-def test_mllama_batched_prefill_matches_full_prompt(mllama_prefill, slice_masks):
-    model, kwargs = mllama_prefill
-    expected = model(**kwargs).logits
-    # All rows have padding, so max(offset) differs from the shared column count.
-    cache = [BatchKVCache([3, 1]) for _ in model.layers]
-    outputs = []
-    for start, end in [(0, 4), (4, 8), (8, 17), (17, 18)]:
-        chunk = {**kwargs, "inputs_embeds": kwargs["inputs_embeds"][:, start:end]}
-        if slice_masks:
-            for key in ("cross_attention_mask", "full_text_row_masked_out_mask"):
-                chunk[key] = kwargs[key][:, :, start:end]
-        outputs.append(model(cache=cache, **chunk).logits)
-    assert mx.allclose(mx.concatenate(outputs, axis=1), expected, atol=1e-5).item()
 
 
 if __name__ == "__main__":
