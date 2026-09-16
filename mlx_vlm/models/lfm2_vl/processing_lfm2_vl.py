@@ -794,17 +794,21 @@ def _patched_call(self, images=None, text=None, **kwargs):
     images = self.image_processor.fetch_images(images)
     batched_images = make_nested_list_of_images(images)
 
-    if [len(sublist) for sublist in batched_images] != n_images_in_text:
-        # `make_nested_list_of_images` reads a flat image list as one sample, so
-        # a batch of prompts with one image each arrives as a single sample
-        # holding all of them. Re-split it along the prompts whenever the totals
-        # agree; the flat order is the prompt order either way.
-        flat = [image for sublist in batched_images for image in sublist]
-        if len(flat) == sum(n_images_in_text):
+    is_flat_image_list = isinstance(images, (list, tuple)) and all(
+        isinstance(image, Image.Image) or getattr(image, "ndim", None) == 3
+        for image in images
+    )
+    if (
+        is_flat_image_list
+        and [len(sublist) for sublist in batched_images] != n_images_in_text
+    ):
+        # Flat inputs from batch_generate follow prompt order; explicitly
+        # grouped inputs must retain their image-to-prompt assignments.
+        if len(images) == sum(n_images_in_text):
             batched_images = []
             offset = 0
             for count in n_images_in_text:
-                batched_images.append(flat[offset : offset + count])
+                batched_images.append(images[offset : offset + count])
                 offset += count
 
     n_images_in_images = [len(sublist) for sublist in batched_images]

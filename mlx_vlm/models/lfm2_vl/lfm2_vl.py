@@ -156,7 +156,6 @@ class Model(nn.Module):
         spatial_shapes = kwargs.get("spatial_shapes", None)
         pixel_attention_mask = kwargs.get("pixel_attention_mask", None)
 
-        # Get the output hidden states from the vision model
         *_, hidden_states = self.vision_tower(
             pixel_values,
             output_hidden_states=True,

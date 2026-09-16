@@ -2744,6 +2744,41 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
             self.assertEqual(text.count("<image>"), 252)
             self.assertTrue(text.endswith(suffix))
 
+    def test_patched_call_rejects_mismatched_nested_image_groups(self):
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import (
+            Lfm2VlNumpyImageProcessor,
+            _patched_call,
+        )
+
+        processor = SimpleNamespace(
+            image_processor=Lfm2VlNumpyImageProcessor(),
+            tokenizer=_mock_tokenizer(),
+            image_token="<image>",
+            image_start_token="<|image_start|>",
+            image_end_token="<|image_end|>",
+            image_thumbnail_token="<|img_thumbnail|>",
+            _merge_kwargs=lambda *args, **kwargs: {
+                "text_kwargs": {},
+                "images_kwargs": {},
+            },
+        )
+        images = [Image.new("RGB", (64, 64), (i * 60, 0, 0)) for i in range(4)]
+        groups = [images[:1], images[1:]]
+        for name, nested_images in (
+            ("lists", groups),
+            ("tuples", tuple(tuple(group) for group in groups)),
+            ("array batches", [np.stack(group) for group in groups]),
+        ):
+            with self.subTest(layout=name):
+                with self.assertRaisesRegex(
+                    ValueError, r"text \[2, 2\] and images \[1, 3\]"
+                ):
+                    _patched_call(
+                        processor,
+                        images=nested_images,
+                        text=["<image><image>Prompt A", "<image><image>Prompt B"],
+                    )
+
     def test_patched_call_expands_multi_tile_markers(self):
         from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import (
             Lfm2VlNumpyImageProcessor,
