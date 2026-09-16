@@ -3,7 +3,9 @@ from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
+import pytest
 
+from mlx_vlm.apc_adapters import cache_memory_components, clone_cache_entry
 from mlx_vlm.generate import maybe_quantize_kv_cache
 from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models import qwen4_exp
@@ -96,6 +98,51 @@ def tiny_config():
         vision_end_token_id=59,
         vocab_size=64,
     )
+
+
+@pytest.mark.parametrize(
+    "make_cache,batch_size,mrope",
+    [
+        (QSAKVCache, 1, False),
+        (lambda: QSAQuantizedKVCache(32, 4), 1, True),
+        (lambda: BatchQSAKVCache([0, 0]), 2, True),
+        (lambda: BatchQSAKVCache([0, 3]), 2, False),
+    ],
+)
+@pytest.mark.parametrize("seed_length", [1, 16])
+def test_qsa_profiles_include_indexer_and_block_growth(
+    make_cache, batch_size, mrope, seed_length
+):
+    model = qwen4_exp.Model(tiny_config())
+    indexer = model.language_model.model.layers[1].self_attn.indexer
+    cache = make_cache()
+
+    def advance(start, length):
+        positions = mx.broadcast_to(
+            mx.arange(start, start + length), (batch_size, length)
+        )
+        if mrope:
+            positions = mx.broadcast_to(positions, (3, batch_size, length))
+        indexer.select_from_projected(
+            mx.ones((batch_size, length, 24)), cache, positions
+        )
+        cache.update_and_fetch(
+            mx.ones((batch_size, 1, length, 32), dtype=mx.float16),
+            mx.ones((batch_size, 1, length, 64), dtype=mx.float16),
+        )
+        mx.eval(cache.state)
+
+    empty = cache_memory_components([cache], 0)[0]
+    assert not empty.fallback and empty.footprint(6000) == 0
+    advance(0, seed_length)
+    cache = clone_cache_entry(cache, min_capacity_tokens=None, eval_targets=[])
+    profile = cache_memory_components([cache], seed_length, batch_size=batch_size)[0]
+    assert not profile.fallback
+    assert profile.source_bytes * batch_size == cache.nbytes
+    for start in range(seed_length, 6000, 257):
+        advance(start, min(257, 6000 - start))
+    estimate = batch_size * profile.footprint(6000, 257)
+    assert cache.nbytes <= estimate < 1.3 * cache.nbytes
 
 
 class Qwen4ExpTests(unittest.TestCase):

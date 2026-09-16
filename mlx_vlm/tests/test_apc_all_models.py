@@ -24,6 +24,7 @@ from mlx_vlm.apc import APCManager
 from mlx_vlm.apc_adapters import (
     build_prefix_cache_plan,
     build_prefix_cache_plan_from_caches,
+    cache_memory_components,
     clone_cache_entry,
 )
 from mlx_vlm.models.cache import (
@@ -297,6 +298,7 @@ def test_every_model_cache_factory_has_a_restorable_apc_adapter():
             eval_targets=eval_targets,
         )
         assert clone is not None, f"{name} cannot be cloned for APC"
+        assert all(not c.fallback for c in cache_memory_components([clone], 0)), name
 
     # Also build one heterogeneous plan per model package. This catches a
     # future combination that is individually registered but cannot be
