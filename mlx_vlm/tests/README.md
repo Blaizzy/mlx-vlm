@@ -27,7 +27,7 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_turboquant.py` | TurboQuant cache integration, batched attention, and value kernels |
 | `test_weight_quantization.py` | FP8 and one-bit weight conversion and execution |
 | `test_moe_offload.py` | MoE checkpoint repacking, expert offload, output parity, and failure handling |
-| `test_qwen3_5.py` | Qwen3.5 patch layouts and ragged attention fallbacks |
+| `test_qwen3_5.py` | Qwen3.5 patch and quantized expert-weight layouts, including Apodex NVFP4, and ragged attention fallbacks |
 | `test_nemotron_voicechat.py` | VoiceChat runtime, streaming, and checkpoint conversion |
 | `test_mage_vl.py` | Mage VL video processing and position handling |
 | `test_speculative.py` | Drafter loading and compatibility, generation parity, verification, cache transactions, and quantized speculative state across model families |

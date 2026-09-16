@@ -1,11 +1,14 @@
 """Qwen3.5 weight sanitization and ragged attention fallbacks."""
 
+from types import SimpleNamespace
+
 import mlx.core as mx
 import pytest
 
 from mlx_vlm.models.qwen3_5 import language as lang
 from mlx_vlm.models.qwen3_5.config import ModelConfig, TextConfig, VisionConfig
 from mlx_vlm.models.qwen3_5.qwen3_5 import Model
+from mlx_vlm.models.qwen3_5_moe.qwen3_5_moe import Model as Qwen3_5MoeModel
 
 # Patch embedding layouts
 
@@ -69,6 +72,34 @@ def test_patch_embed_is_transposed_from_ncdhw_to_ndhwc():
     sanitized = model.sanitize({PATCH_EMBED_KEY: ncdhw})
 
     assert sanitized[SANITIZED_KEY].shape == expected
+
+
+def test_apodex_nvfp4_expert_sidecars_are_stacked():
+    context = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(
+                tie_word_embeddings=False, num_hidden_layers=1, num_experts=2
+            )
+        )
+    )
+    weights = {}
+    prefix = "model.language_model.layers.0.mlp.experts"
+    for expert in range(2):
+        for projection in ("up_proj", "down_proj", "gate_proj"):
+            weights[f"{prefix}.{expert}.{projection}.weight"] = mx.zeros(
+                (8, 2), dtype=mx.uint32
+            )
+            weights[f"{prefix}.{expert}.{projection}.scales"] = mx.ones(
+                (8, 2), dtype=mx.uint8
+            )
+
+    out = Qwen3_5MoeModel.sanitize(context, weights)
+
+    prefix = "language_model.model.layers.0.mlp.switch_mlp"
+    for projection in ("up_proj", "down_proj", "gate_proj"):
+        assert out[f"{prefix}.{projection}.weight"].shape == (2, 8, 2)
+        assert out[f"{prefix}.{projection}.scales"].shape == (2, 8, 2)
+    assert not any(".experts." in key for key in out)
 
 
 # Ragged decode launch fallbacks
