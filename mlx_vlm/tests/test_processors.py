@@ -2598,6 +2598,71 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
             result["pixel_attention_mask"].sum(axis=1).tolist(), [1024] * 8 + [1008]
         )
 
+    def test_resample_filter_follows_the_checkpoint(self):
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlNumpyImageProcessor
+
+        # LFM2-VL-450M/1.6B and LFM2.5-VL-3B ship 3 (bicubic);
+        # LFM2.5-VL-1.6B ships 2 (bilinear). Resizing with the wrong filter
+        # changes every patch the vision tower sees.
+        self.assertIs(
+            Lfm2VlNumpyImageProcessor(resample=3).resample, Image.Resampling.BICUBIC
+        )
+        self.assertIs(
+            Lfm2VlNumpyImageProcessor(resample=2).resample, Image.Resampling.BILINEAR
+        )
+        self.assertIs(
+            Lfm2VlNumpyImageProcessor(resample=Image.Resampling.LANCZOS).resample,
+            Image.Resampling.LANCZOS,
+        )
+        # Unusable values fall back rather than crashing at load time.
+        self.assertIs(Lfm2VlNumpyImageProcessor().resample, Image.Resampling.BICUBIC)
+        self.assertIs(
+            Lfm2VlNumpyImageProcessor(resample="nonsense").resample,
+            Image.Resampling.BICUBIC,
+        )
+
+        image = Image.fromarray(
+            np.random.randint(0, 255, (540, 960, 3), dtype=np.uint8)
+        )
+        bicubic = Lfm2VlNumpyImageProcessor(resample=3)([image], return_tensors="np")
+        bilinear = Lfm2VlNumpyImageProcessor(resample=2)([image], return_tensors="np")
+        self.assertFalse(np.allclose(bicubic["pixel_values"], bilinear["pixel_values"]))
+
+    def test_max_num_patches_is_derived_not_read(self):
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlNumpyImageProcessor
+
+        # The official processor always derives this from max_image_tokens and
+        # the tile size. mlx-community/LFM2.5-VL-450M-{6,8}bit ship the Siglip2
+        # default of 256, which truncates every image to a quarter of its
+        # patches while spatial_shapes still describes the full grid.
+        processor = Lfm2VlNumpyImageProcessor(max_num_patches=256)
+        self.assertEqual(processor.max_num_patches, 1024)
+
+        image = Image.fromarray(
+            np.random.randint(0, 255, (480, 640, 3), dtype=np.uint8)
+        )
+        result = processor([image], return_tensors="np")
+        rows, cols = result["spatial_shapes"][0].tolist()
+        self.assertEqual(result["pixel_values"].shape, (1, 1024, 768))
+        self.assertEqual(int(result["pixel_attention_mask"].sum()), rows * cols)
+
+    def test_resizing_is_forced_on_despite_checkpoint_config(self):
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlNumpyImageProcessor
+
+        # Every LFM2-VL preprocessor_config.json ships `do_resize: false`, but
+        # the official `_preprocess` hardcodes it on. Honoring the config would
+        # emit a patch grid that no longer matches the packed-patch budget.
+        processor = Lfm2VlNumpyImageProcessor(do_resize=False)
+        self.assertTrue(processor.do_resize)
+
+        image = Image.fromarray(
+            np.random.randint(0, 255, (1440, 2560, 3), dtype=np.uint8)
+        )
+        result = processor([image], return_tensors="np", do_resize=False)
+        # Tiled to a 4x2 grid plus a thumbnail, not left at its 90x160 grid.
+        self.assertEqual(result["pixel_values"].shape, (9, 1024, 768))
+        self.assertEqual(result["spatial_shapes"].tolist(), [[32, 32]] * 8 + [[24, 42]])
+
     def test_small_image_stays_single_view_with_tiling_enabled(self):
         from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlNumpyImageProcessor
 
@@ -2623,6 +2688,61 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertEqual(result["pixel_values"].shape, (1, 1024, 768))
         self.assertEqual(result["image_rows"].tolist(), [1])
         self.assertEqual(result["image_cols"].tolist(), [1])
+
+    def test_patched_call_splits_a_flat_image_list_across_prompts(self):
+        # batch_generate hands the processor N prompts and a flat list of N
+        # images. `make_nested_list_of_images` reads that as a single sample
+        # holding every image, so it has to be re-split along the prompts.
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import (
+            Lfm2VlNumpyImageProcessor,
+            _patched_call,
+        )
+
+        class RecordingTokenizer(type(_mock_tokenizer())):
+            def __init__(self):
+                self.texts = []
+
+            def __call__(self, text, **kwargs):
+                self.texts.append(text)
+                return super().__call__(text, **kwargs)
+
+        tokenizer = RecordingTokenizer()
+
+        class DummyProcessor:
+            pass
+
+        processor = DummyProcessor()
+        processor.image_processor = Lfm2VlNumpyImageProcessor()
+        processor.tokenizer = tokenizer
+        processor.image_token = "<image>"
+        processor.image_start_token = "<|image_start|>"
+        processor.image_end_token = "<|image_end|>"
+        processor.image_thumbnail_token = "<|img_thumbnail|>"
+        processor._merge_kwargs = lambda *args, **kwargs: {
+            "text_kwargs": {},
+            "images_kwargs": {},
+        }
+
+        # Same-shaped images are the case that used to fail: batch_generate
+        # groups them into a single processor call.
+        images = [
+            Image.fromarray(np.random.randint(0, 255, (540, 960, 3), dtype=np.uint8))
+            for _ in range(3)
+        ]
+        result = _patched_call(
+            processor,
+            images=images,
+            text=["<image>First", "<image>Second", "<image>Third"],
+        )
+
+        self.assertEqual(result["pixel_values"].shape, (3, 1024, 768))
+        expanded = tokenizer.texts[0]
+        self.assertEqual(len(expanded), 3)
+        for text, suffix in zip(expanded, ("First", "Second", "Third")):
+            # One image per prompt, each keeping its own trailing text.
+            self.assertEqual(text.count("<|image_start|>"), 1)
+            self.assertEqual(text.count("<image>"), 252)
+            self.assertTrue(text.endswith(suffix))
 
     def test_patched_call_expands_multi_tile_markers(self):
         from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import (
@@ -2924,6 +3044,66 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
 
         self.assertFalse(processor.image_processor.do_image_splitting)
         self.assertTrue(processor.image_processor.use_thumbnail)
+
+    def test_from_pretrained_merges_both_processor_config_files(self):
+        # The LiquidAI repos split the settings across two files: only
+        # `preprocessor_config.json` carries `resample` and the tiling budget,
+        # while `processor_config.json` carries the processor-level flags.
+        # Reading just one of them silently falls back to hardcoded defaults.
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlProcessor
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "preprocessor_config.json").write_text(
+                json.dumps(
+                    {
+                        "image_processor_type": "Lfm2VlImageProcessorFast",
+                        "resample": 3,
+                        "do_resize": False,
+                        "max_image_tokens": 128,
+                        "max_pixels_tolerance": 1.5,
+                        "image_mean": [0.4, 0.4, 0.4],
+                    }
+                )
+            )
+            (Path(tmpdir) / "processor_config.json").write_text(
+                json.dumps(
+                    {
+                        "processor_class": "Lfm2VlProcessor",
+                        "use_image_special_tokens": True,
+                    }
+                )
+            )
+
+            def _fake_init(
+                self, image_processor, tokenizer, chat_template=None, **kwargs
+            ):
+                self.image_processor = image_processor
+                self.tokenizer = tokenizer
+                self.chat_template = chat_template
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=_mock_tokenizer(),
+                ),
+                patch(
+                    "mlx_vlm.models.lfm2_vl.processing_lfm2_vl._original_init",
+                    _fake_init,
+                ),
+            ):
+                processor = Lfm2VlProcessor.from_pretrained(tmpdir)
+
+        image_processor = processor.image_processor
+        self.assertIs(image_processor.resample, Image.Resampling.BICUBIC)
+        self.assertEqual(image_processor.max_image_tokens, 128)
+        self.assertEqual(image_processor.max_pixels_tolerance, 1.5)
+        self.assertEqual(image_processor.image_mean, [0.4, 0.4, 0.4])
+        self.assertTrue(image_processor.do_resize)
 
 
 class TestMolmoPointProcessor(unittest.TestCase):

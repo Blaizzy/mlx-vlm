@@ -131,36 +131,57 @@ class Model(nn.Module):
         if cached is not None:
             image_features = cached
         else:
-            # Get the ouptut hidden states from the vision model
-            *_, hidden_states = self.vision_tower(
-                pixel_values, output_hidden_states=True, spatial_shapes=spatial_shapes
+            image_features = self.encode_images(
+                pixel_values,
+                spatial_shapes=spatial_shapes,
+                pixel_attention_mask=pixel_attention_mask,
             )
 
-            img_feature_lengths = pixel_attention_mask.sum(axis=1).tolist()
-            image_features = []
-
-            for img_idx in range(hidden_states.shape[0]):
-                feature = hidden_states[img_idx]
-
-                feature = feature[: img_feature_lengths[img_idx], :][None, ...]
-
-                feature_org_h, feature_org_w = (
-                    int(dim) for dim in spatial_shapes[img_idx]
-                )
-                feature = feature.reshape(1, feature_org_h, feature_org_w, -1)
-                feature = self.pixel_unshuffle(feature)
-
-                img_embedding = self.multi_modal_projector(feature)
-
-                img_embedding = img_embedding.reshape(-1, img_embedding.shape[-1])
-                image_features.append(img_embedding)
-
-            image_features = mx.concatenate(image_features, axis=0)
+        if not isinstance(image_features, mx.array):
+            image_features = mx.concatenate(list(image_features), axis=0)
 
         final_inputs_embeds = self.merge_input_ids_with_image_features(
             image_features, inputs_embeds, input_ids, self.config.image_token_index
         )
         return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
+
+    def encode_images(self, pixel_values: mx.array, **kwargs) -> list[mx.array]:
+        """Project the packed image patches into language-model space.
+
+        Returns one ``(tokens, hidden_size)`` array per vision-tower view (one
+        per tile, plus the thumbnail), in the order the views are laid out in
+        the prompt. This is the form the vision feature cache stores and hands
+        back as ``cached_image_features`` on later turns.
+        """
+        spatial_shapes = kwargs.get("spatial_shapes", None)
+        pixel_attention_mask = kwargs.get("pixel_attention_mask", None)
+
+        # Get the output hidden states from the vision model
+        *_, hidden_states = self.vision_tower(
+            pixel_values,
+            output_hidden_states=True,
+            spatial_shapes=spatial_shapes,
+            pixel_attention_mask=pixel_attention_mask,
+        )
+
+        img_feature_lengths = pixel_attention_mask.sum(axis=1).tolist()
+        image_features = []
+
+        for img_idx in range(hidden_states.shape[0]):
+            feature = hidden_states[img_idx]
+
+            feature = feature[: img_feature_lengths[img_idx], :][None, ...]
+
+            feature_org_h, feature_org_w = (int(dim) for dim in spatial_shapes[img_idx])
+            feature = feature.reshape(1, feature_org_h, feature_org_w, -1)
+            feature = self.pixel_unshuffle(feature)
+
+            img_embedding = self.multi_modal_projector(feature)
+
+            img_embedding = img_embedding.reshape(-1, img_embedding.shape[-1])
+            image_features.append(img_embedding)
+
+        return image_features
 
     @staticmethod
     def merge_input_ids_with_image_features(
@@ -203,6 +224,7 @@ class Model(nn.Module):
             pixel_values,
             spatial_shapes=spatial_shapes,
             pixel_attention_mask=pixel_attention_mask,
+            cached_image_features=kwargs.get("cached_image_features", None),
         )
 
         logits = self.language_model(
@@ -212,6 +234,9 @@ class Model(nn.Module):
             inputs_embeds=input_embeddings_features.inputs_embeds,
         )
         return logits
+
+    def make_cache(self):
+        return self.language_model.make_cache()
 
     def sanitize(self, weights):
         def transform_key(key):
@@ -231,7 +256,9 @@ class Model(nn.Module):
                     "model.multi_modal_projector", "multi_modal_projector"
                 )
 
-            if key.startswith("model."):
+            # `lm_head` sits at the top level in HF checkpoints and is only
+            # present when the embeddings are untied.
+            if key.startswith("model.") or key.startswith("lm_head."):
                 key = "language_model." + key
 
             return key

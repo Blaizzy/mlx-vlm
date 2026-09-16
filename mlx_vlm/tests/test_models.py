@@ -2972,6 +2972,190 @@ class TestModels(unittest.TestCase):
         )
         self.assertEqual(set(mlx_std), set(model.sanitize(mlx_std)))
 
+    @staticmethod
+    def _lfm2_vl_tiny_config(**overrides):
+        from mlx_vlm.models import lfm2_vl
+
+        kwargs = dict(
+            model_type="lfm2-vl",
+            text_config=lfm2_vl.TextConfig(
+                hidden_size=64,
+                num_hidden_layers=2,
+                intermediate_size=128,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                vocab_size=128,
+                block_dim=64,
+                conv_dim=64,
+                layer_types=["conv", "full_attention"],
+            ),
+            vision_config=lfm2_vl.VisionConfig(
+                hidden_size=64,
+                num_hidden_layers=2,
+                intermediate_size=128,
+                num_attention_heads=4,
+                num_patches=64,
+            ),
+            projector_hidden_size=64,
+        )
+        kwargs.update(overrides)
+        return lfm2_vl.ModelConfig(**kwargs)
+
+    def test_lfm2_vl_vision_tower_masks_padded_patches(self):
+        # Siglip2 turns pixel_attention_mask into a bidirectional attention
+        # mask, so the padded rows must not reach a valid patch's attention.
+        from mlx_vlm.models import lfm2_vl
+
+        config = self._lfm2_vl_tiny_config()
+        tower = lfm2_vl.VisionModel(config.vision_config)
+
+        patch_dim = 3 * config.vision_config.patch_size**2
+        valid = 6
+        total = 10
+        pixel_values = mx.random.normal((1, total, patch_dim))
+        pixel_values[:, valid:] = 0.0
+        pixel_attention_mask = mx.concatenate(
+            [mx.ones((1, valid), mx.int32), mx.zeros((1, total - valid), mx.int32)],
+            axis=1,
+        )
+        spatial_shapes = mx.array([[2, 3]])
+
+        def run(pv):
+            *_, out = tower(
+                pv,
+                output_hidden_states=True,
+                spatial_shapes=spatial_shapes,
+                pixel_attention_mask=pixel_attention_mask,
+            )
+            return out[:, :valid]
+
+        base = run(pixel_values)
+        # Perturbing only the padded rows must leave the valid patches alone.
+        perturbed = mx.array(pixel_values)
+        perturbed[:, valid:] = mx.random.normal((1, total - valid, patch_dim)) * 10
+        self.assertTrue(mx.allclose(base, run(perturbed), atol=1e-4))
+
+        # Without the mask the same perturbation does leak through, which is
+        # what this plumbing exists to prevent.
+        def run_unmasked(pv):
+            *_, out = tower(
+                pv, output_hidden_states=True, spatial_shapes=spatial_shapes
+            )
+            return out[:, :valid]
+
+        self.assertFalse(
+            mx.allclose(run_unmasked(pixel_values), run_unmasked(perturbed), atol=1e-4)
+        )
+
+    def test_lfm2_vl_vision_tower_without_hidden_states(self):
+        from mlx_vlm.models import lfm2_vl
+
+        config = self._lfm2_vl_tiny_config()
+        tower = lfm2_vl.VisionModel(config.vision_config)
+        pixel_values = mx.random.normal((1, 6, 3 * config.vision_config.patch_size**2))
+        *_, out = tower(
+            pixel_values,
+            output_hidden_states=False,
+            spatial_shapes=mx.array([[2, 3]]),
+            pixel_attention_mask=mx.ones((1, 6), mx.int32),
+        )
+        self.assertEqual(out.shape, (1, 6, config.vision_config.hidden_size))
+
+    def test_lfm2_vl_encode_images_matches_input_embeddings(self):
+        from mlx_vlm.models import lfm2_vl
+
+        config = self._lfm2_vl_tiny_config(image_token_id=7)
+        model = lfm2_vl.Model(config)
+
+        n_views, n_patches = 2, 24
+        pixel_values = mx.random.normal(
+            (n_views, n_patches, 3 * config.vision_config.patch_size**2)
+        )
+        pixel_attention_mask = mx.ones((n_views, n_patches), mx.int32)
+        spatial_shapes = mx.array([[4, 6], [4, 6]])
+
+        features = model.encode_images(
+            pixel_values,
+            spatial_shapes=spatial_shapes,
+            pixel_attention_mask=pixel_attention_mask,
+        )
+        # One entry per view, each downsampled by the pixel-unshuffle factor.
+        self.assertEqual(len(features), n_views)
+        tokens_per_view = (4 // config.downsample_factor) * (
+            6 // config.downsample_factor
+        )
+        for f in features:
+            self.assertEqual(f.shape, (tokens_per_view, config.text_config.hidden_size))
+
+        input_ids = mx.array([[7] * (tokens_per_view * n_views) + [1, 2]])
+        fresh = model.get_input_embeddings(
+            input_ids,
+            pixel_values,
+            spatial_shapes=spatial_shapes,
+            pixel_attention_mask=pixel_attention_mask,
+        ).inputs_embeds
+        # Replaying the cached features must reproduce the same embeddings.
+        cached = model.get_input_embeddings(
+            input_ids,
+            pixel_values,
+            spatial_shapes=spatial_shapes,
+            pixel_attention_mask=pixel_attention_mask,
+            cached_image_features=features,
+        ).inputs_embeds
+        self.assertTrue(mx.allclose(fresh, cached, atol=1e-5))
+
+    def test_lfm2_vl_make_cache_matches_layer_types(self):
+        from mlx_vlm.models import lfm2_vl
+        from mlx_vlm.models.cache import ArraysCache, KVCache, make_prompt_cache
+
+        model = lfm2_vl.Model(self._lfm2_vl_tiny_config())
+        # layer_types is ["conv", "full_attention"], so the top-level model must
+        # hand out a conv state cache and a KV cache in that order.
+        for caches in (model.make_cache(), make_prompt_cache(model)):
+            self.assertIsInstance(caches[0], ArraysCache)
+            self.assertIsInstance(caches[1], KVCache)
+
+    def test_lfm2_vl_reads_rope_theta_from_rope_parameters(self):
+        from mlx_vlm.models import lfm2_vl
+
+        config = lfm2_vl.TextConfig.from_dict(
+            {
+                "layer_types": ["full_attention"],
+                "rope_parameters": {"rope_theta": 500000.0, "rope_type": "default"},
+            }
+        )
+        self.assertEqual(config.rope_theta, 500000.0)
+
+    def test_lfm2_vl_untied_lm_head_is_routed_and_used(self):
+        from mlx_vlm.models import lfm2_vl
+
+        # LFM2-VL-3B and LFM2.5-VL-450M omit the flag; a serialized `null`
+        # must not be read as "untied" and grow an lm_head the checkpoint
+        # has no weights for.
+        for value in (None, True):
+            config = lfm2_vl.TextConfig.from_dict(
+                {"layer_types": ["full_attention"], "tie_word_embeddings": value}
+            )
+            self.assertTrue(config.tie_word_embeddings)
+
+        tied = lfm2_vl.Model(self._lfm2_vl_tiny_config())
+        self.assertNotIn("lm_head", tied.language_model.parameters())
+        self.assertNotIn(
+            "language_model.lm_head.weight",
+            tied.language_model.sanitize(
+                tied.sanitize({"lm_head.weight": mx.zeros((128, 64))})
+            ),
+        )
+
+        config = self._lfm2_vl_tiny_config()
+        config.text_config.tie_word_embeddings = False
+        untied = lfm2_vl.Model(config)
+        self.assertIn("lm_head", untied.language_model.parameters())
+        self.assertIn(
+            "language_model.lm_head.weight",
+            untied.sanitize({"lm_head.weight": mx.zeros((128, 64))}),
+        )
+
     def test_deepseek_v4_language_model(self):
         from mlx_vlm.models import deepseek_v4
         from mlx_vlm.models.deepseek_v4.hyper_connection import (
@@ -3295,7 +3479,9 @@ class TestModels(unittest.TestCase):
 
         from mlx_vlm.models.cache import CacheList, KVCache
         from mlx_vlm.models.glm_moe_dsa.language import GlmMoeDsaMTP
-        from mlx_vlm.speculative.drafters.glm_moe_dsa_mtp import GlmMoeDsaMTPDraftModel
+        from mlx_vlm.speculative.drafters.glm_moe_dsa_mtp import (
+            GlmMoeDsaMTPDraftModel,
+        )
         from mlx_vlm.speculative.drafters.glm_moe_dsa_mtp import (
             ModelConfig as GlmMoeDsaMTPConfig,
         )

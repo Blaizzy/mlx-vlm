@@ -7,7 +7,9 @@ When using the slow image processor (Siglip2ImageProcessor), this causes a valid
 
 This patch:
 1. Removes the unsupported `return_row_col_info` parameter from the defaults
-2. Enables `do_resize: True` to ensure images are properly resized for patch processing
+2. Resizes unconditionally, the way the official `_preprocess` does — every
+   LFM2-VL checkpoint ships `do_resize: false`, but honoring it would break the
+   packed-patch contract
 3. Patches the `__call__` method to handle the slow image processor case, computing
    `image_rows`, `image_cols`, `image_sizes` when missing and providing sensible
    defaults for tile-related parameters
@@ -17,6 +19,8 @@ This patch:
    large images are split into a grid of `tile_size` tiles (plus a downsampled
    thumbnail) and the text is expanded with the official per-tile
    `<|img_row_r_col_c|>` / `<|img_thumbnail|>` marker tokens
+7. Reads the checkpoint's `resample` filter instead of assuming one — the
+   LFM2-VL repos disagree (bicubic for most, bilinear for LFM2.5-VL-1.6B)
 """
 
 import json
@@ -82,6 +86,25 @@ def _normalize_image_layout_axis(values, num_images: int) -> list[int]:
         return [int(values)] * max(1, num_images)
 
     return [int(v) for v in values]
+
+
+# `resample` is stored in the checkpoints as a PIL filter id. LFM2-VL-450M,
+# LFM2-VL-1.6B and LFM2.5-VL-3B ship 3 (bicubic); LFM2.5-VL-1.6B ships 2
+# (bilinear). Resizing with the wrong filter changes every patch the encoder
+# sees, so honor the configured value instead of assuming one.
+_DEFAULT_RESAMPLE = Image.Resampling.BICUBIC
+
+
+def _resolve_resample(resample) -> "Image.Resampling":
+    """Map a checkpoint's ``resample`` value onto a PIL filter."""
+    if resample is None:
+        return _DEFAULT_RESAMPLE
+    if isinstance(resample, Image.Resampling):
+        return resample
+    try:
+        return Image.Resampling(int(resample))
+    except (TypeError, ValueError):
+        return _DEFAULT_RESAMPLE
 
 
 def _round_by_factor(number: float, factor: int) -> int:
@@ -259,8 +282,16 @@ class Lfm2VlNumpyImageProcessor(ImageProcessingMixin):
         self.rescale_factor = kwargs.get("rescale_factor", 1 / 255)
         self.do_rescale = kwargs.get("do_rescale", True)
         self.do_normalize = kwargs.get("do_normalize", True)
-        self.do_resize = kwargs.get("do_resize", True)
+        # The official processor resizes unconditionally -- its `_preprocess`
+        # hardcodes `do_resize = True` and ignores the configured value -- and
+        # the packed-patch contract depends on it: an unresized image produces a
+        # patch grid that no longer fits `max_num_patches` and no longer matches
+        # the expanded image-token count. Every LFM2-VL checkpoint nonetheless
+        # ships `do_resize: false` (a leftover of the fast-processor config), so
+        # pin it on rather than reading it back.
+        self.do_resize = True
         self.do_pad = kwargs.get("do_pad", True)
+        self.resample = _resolve_resample(kwargs.get("resample"))
         self.downsample_factor = kwargs.get("downsample_factor", 2)
         self.encoder_patch_size = kwargs.get(
             "encoder_patch_size", kwargs.get("patch_size", 16)
@@ -273,15 +304,18 @@ class Lfm2VlNumpyImageProcessor(ImageProcessingMixin):
         for key, value in _OFFICIAL_SPLITTING_DEFAULTS.items():
             setattr(self, key, kwargs.get(key, value))
         # Each vision-tower row holds one tile or the thumbnail; both must fit
-        # within the padded patch budget.
+        # within the padded patch budget. The official processor always derives
+        # this (`max_num_patches` is not even one of its kwargs), and a
+        # configured value cannot be trusted: the mlx-community LFM2.5-VL-450M
+        # repos ship the Siglip2 default of 256, which truncates every image
+        # down to a quarter of its patches and then fails to broadcast.
         tile_size_patches = (
             (self.tile_size // self.encoder_patch_size) ** 2
             if self.do_image_splitting
             else 0
         )
-        self.max_num_patches = kwargs.get(
-            "max_num_patches",
-            max(self.max_image_tokens * self.downsample_factor**2, tile_size_patches),
+        self.max_num_patches = max(
+            self.max_image_tokens * self.downsample_factor**2, tile_size_patches
         )
 
     def fetch_images(self, images):
@@ -349,9 +383,7 @@ class Lfm2VlNumpyImageProcessor(ImageProcessingMixin):
             grid_width, grid_height, target_width, target_height = _get_grid_layout(
                 height, width, min_tiles, max_tiles, self.tile_size
             )
-            resized = image.resize(
-                (target_width, target_height), Image.Resampling.BILINEAR
-            )
+            resized = image.resize((target_width, target_height), self.resample)
             tile = self.tile_size
             views = [
                 resized.crop(
@@ -362,16 +394,12 @@ class Lfm2VlNumpyImageProcessor(ImageProcessingMixin):
             ]
             if use_thumbnail and grid_width * grid_height > 1:
                 views.append(
-                    image.resize(
-                        (resized_width, resized_height), Image.Resampling.BILINEAR
-                    )
+                    image.resize((resized_width, resized_height), self.resample)
                 )
             return views, grid_height, grid_width, (resized_height, resized_width)
 
         if self.do_resize:
-            image = image.resize(
-                (resized_width, resized_height), Image.Resampling.BILINEAR
-            )
+            image = image.resize((resized_width, resized_height), self.resample)
             return [image], 1, 1, (resized_height, resized_width)
 
         return [image], 1, 1, (height, width)
@@ -472,14 +500,13 @@ except ImportError:
 
 # Remove return_row_col_info from the defaults since the slow image processor
 # (Siglip2ImageProcessor) doesn't support it - only the fast version does.
-# Also enable do_resize to ensure images are properly resized to be divisible by patch_size.
 if hasattr(Lfm2VlProcessorKwargs, "_defaults"):
     if "images_kwargs" in Lfm2VlProcessorKwargs._defaults:
         Lfm2VlProcessorKwargs._defaults["images_kwargs"].pop(
             "return_row_col_info", None
         )
-        # Enable resizing for the slow image processor (model config has do_resize: False
-        # which is intended for the fast processor that handles resizing differently)
+        # Kept for any processor that still reads it; the NumPy processor pins
+        # do_resize on in __init__ the way the official one does.
         Lfm2VlProcessorKwargs._defaults["images_kwargs"]["do_resize"] = True
 
 
@@ -567,29 +594,29 @@ def _patched_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
             cls, pretrained_model_name_or_path, **kwargs
         )
 
-    if is_local:
-        config_path = model_path / "processor_config.json"
-        if not config_path.exists():
-            config_path = model_path / "preprocessor_config.json"
-    else:
-        try:
-            config_path = Path(
-                hf_hub_download(pretrained_model_name_or_path, "processor_config.json")
-            )
-        except Exception:
-            config_path = Path(
-                hf_hub_download(
-                    pretrained_model_name_or_path, "preprocessor_config.json"
-                )
-            )
+    def _read_config(filename):
+        if is_local:
+            path = model_path / filename
+            if not path.exists():
+                return {}
+        else:
+            try:
+                path = Path(hf_hub_download(pretrained_model_name_or_path, filename))
+            except Exception:
+                return {}
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        # LFM2.5 repos nest the image-processor settings; older ones keep them
+        # at the top level of `preprocessor_config.json`.
+        return dict(loaded.get("image_processor", loaded))
 
-    image_processor_config = {}
-    if config_path.exists():
-        with open(config_path, "r", encoding="utf-8") as f:
-            image_processor_config = json.load(f)
-        image_processor_config = image_processor_config.get(
-            "image_processor", image_processor_config
-        )
+    # Both files carry image-processor settings and neither is a superset:
+    # LiquidAI's `processor_config.json` holds only `use_image_special_tokens`
+    # while `preprocessor_config.json` holds `resample`, `image_mean/std` and the
+    # tiling budget; the mlx-community repos put tiling flags in the former. Read
+    # both, with `processor_config.json` winning on conflicts.
+    image_processor_config = _read_config("preprocessor_config.json")
+    image_processor_config.update(_read_config("processor_config.json"))
 
     for key in (
         "image_processor_type",
@@ -602,10 +629,6 @@ def _patched_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         "input_data_format",
     ):
         image_processor_config.pop(key, None)
-
-    # The upstream config is tuned for the fast processor; the slow Siglip2 path
-    # needs resizing enabled.
-    image_processor_config["do_resize"] = True
 
     # Re-apply the official tiling defaults (see _OFFICIAL_SPLITTING_DEFAULTS):
     # the LiquidAI MLX repos ship `do_image_splitting: false` / `use_thumbnail:
@@ -771,17 +794,30 @@ def _patched_call(self, images=None, text=None, **kwargs):
     images = self.image_processor.fetch_images(images)
     batched_images = make_nested_list_of_images(images)
 
-    # Override return_tensors for image processing to avoid PyTorch dependency
-    images_kwargs = output_kwargs["images_kwargs"].copy()
-    images_kwargs["return_tensors"] = "np"  # Use numpy instead of pt
-
-    vision_inputs = self.image_processor(batched_images, **images_kwargs)
+    if [len(sublist) for sublist in batched_images] != n_images_in_text:
+        # `make_nested_list_of_images` reads a flat image list as one sample, so
+        # a batch of prompts with one image each arrives as a single sample
+        # holding all of them. Re-split it along the prompts whenever the totals
+        # agree; the flat order is the prompt order either way.
+        flat = [image for sublist in batched_images for image in sublist]
+        if len(flat) == sum(n_images_in_text):
+            batched_images = []
+            offset = 0
+            for count in n_images_in_text:
+                batched_images.append(flat[offset : offset + count])
+                offset += count
 
     n_images_in_images = [len(sublist) for sublist in batched_images]
     if n_images_in_images != n_images_in_text:
         raise ValueError(
             f"The number of images in the text {n_images_in_text} and images {n_images_in_images} should be the same."
         )
+
+    # Override return_tensors for image processing to avoid PyTorch dependency
+    images_kwargs = output_kwargs["images_kwargs"].copy()
+    images_kwargs["return_tensors"] = "np"  # Use numpy instead of pt
+
+    vision_inputs = self.image_processor(batched_images, **images_kwargs)
 
     # Check if image_rows/cols/sizes are present (numpy processor with tiling)
     if "image_rows" in vision_inputs:
