@@ -5030,3 +5030,40 @@ class TestSTTSegmentSerialization:
         from mlx_vlm.server.audio import _stt_item_to_dict
 
         assert _stt_item_to_dict("just text") == {"text": "just text"}
+
+
+@pytest.mark.parametrize(
+    "results,expected",
+    [
+        (
+            [
+                GenerationResult(text="Hello", token=5, diffusion_canvas_index=1),
+                GenerationResult(text=" world", token=6, diffusion_canvas_index=1),
+                GenerationResult(
+                    diffusion_block_complete=True, diffusion_canvas_index=1
+                ),
+                GenerationResult(text="!", token=7, diffusion_canvas_index=2),
+                GenerationResult(
+                    diffusion_block_complete=True, diffusion_canvas_index=2
+                ),
+                GenerationResult(text="", finish_reason="stop", token=7),
+            ],
+            [("Hello world", None), ("!", None), ("", "stop")],
+        ),
+        (
+            [
+                GenerationResult(is_draft=True, draft_text="[Mask]"),
+                GenerationResult(
+                    diffusion_block_complete=True, diffusion_canvas_index=1
+                ),
+                GenerationResult(text="Hi", token=4, diffusion_canvas_index=2),
+                GenerationResult(text=".", finish_reason="stop", token=5),
+            ],
+            [("Hi.", "stop")],
+        ),
+    ],
+    ids=["groups_by_block", "skips_drafts_and_empty_blocks"],
+)
+def test_diffusion_block_chunks(results, expected):
+    chunks = server_generation._diffusion_block_chunks(iter(results))
+    assert [(chunk.text, chunk.finish_reason) for chunk in chunks] == expected

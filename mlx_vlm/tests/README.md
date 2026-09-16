@@ -16,6 +16,8 @@ Use a module path or `-k` to select a smaller group while developing.
 | Test module | Scope |
 | --- | --- |
 | `test_models.py` + `model_cases.json` | Shared language, vision, audio, projector, embedding, position, and native forward/cache contracts |
+| `test_diffusion_models.py` | Shared diffusion generation, sampling, prefill, caches, and LLaDA/Nemotron model contracts |
+| `test_diffusion_gemma.py` | DiffusionGemma numerical parity, self-conditioning, vision masks/features, sanitization, and quantization policy |
 | `test_tool_parsers.py` | ATEM, Cohere, Gemma 4, GLM, Mistral, Pythonic parsing, and parser selection |
 | `test_apc.py` | Cache lookup, semantic keys, lifecycle, trace logging, and diagnostics |
 | `test_apc_adapters.py` | Cache adapters, component snapshots, and model cache-layout compatibility |
@@ -35,7 +37,7 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_rope.py` | Rotary embeddings, multimodal position IDs, and batched offsets |
 | `test_audio_generation.py` | Audio generation, loading, downmixing, and resampling |
 | `test_server_audio.py` | HTTP audio endpoints and realtime voice sessions |
-| `test_cli.py` | CLI arguments, detector display options, and CLI/library default parity |
+| `test_cli.py` | CLI arguments, diffusion display/visualizer behavior, detector display options, and CLI/library default parity |
 | `test_prompt_utils.py` | Prompt construction and reasoning-template arguments |
 | `test_trainer.py` | Training workflows, trainer utilities, and MRoPE/gated-delta gradient regressions |
 | `test_utils.py` | General loading/conversion utilities and local Python model files |
@@ -47,6 +49,13 @@ belong in `test_speculative.py`: reuse its tiny target/config factories and
 parameterize shared contracts with descriptive family IDs. It also owns the
 Apodex MTP splitter and MiniMax speculative rollback checks; unrelated model
 tests remain in their existing modules.
+
+DiffusionGemma generation and APC tests share `diffusion_fixtures.py` for tiny
+configs, model construction, tokenization, encoder recording, and stream calls.
+Processor checks live in `test_processors.py`, server block streaming in
+`test_server.py`, and generation-config loading in `test_utils.py`. Keep numerical
+and vision-specific assertions in `test_diffusion_gemma.py`; its optional
+Transformers reference check still requires the reference dependencies.
 
 ## JSON model cases
 

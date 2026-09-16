@@ -1,12 +1,21 @@
 import math
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
+import pytest
 from mlx.utils import tree_map
 
+from mlx_vlm.generate import diffusion
 from mlx_vlm.generate.common import GenerationResult
 from mlx_vlm.generate.dispatch import stream_generate
 from mlx_vlm.models.cache import StaticPrefixKVCache
+from mlx_vlm.tests.diffusion_fixtures import (
+    RecordingEncoder,
+    diffusion_responses,
+    make_diffusion_model,
+    tiny_config_dict,
+)
 
 
 def _llada_config(**overrides):
@@ -655,5 +664,149 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
         self.assertIsNone(diffusion_generation_family(model))
 
 
+class TestDiffusionGemmaGeneration:
+    def test_chunked_diffusion_prefill_matches_unchunked_tokens(self):
+        def tokens(step_size):
+            responses = diffusion_responses(
+                make_diffusion_model(seed=42),
+                (2, 3, 4, 5, 6),
+                max_tokens=3,
+                prefill_step_size=step_size,
+            )
+            return [r.token for r in responses if r.token is not None]
+
+        assert tokens(None) == tokens(2)
+
+    @pytest.mark.parametrize("visual", [False, True], ids=["padded", "visual"])
+    def test_diffusion_prefill_stays_unchunked(self, visual):
+        model = make_diffusion_model()
+        recorder = RecordingEncoder(model.model.encoder)
+        model.model.encoder = recorder
+        metadata = mx.array(
+            [[0, 1, 1, 0, 0]] if visual else [[1, 1, 1, 1, 0]],
+            dtype=mx.int32 if visual else mx.bool_,
+        )
+        kwargs = {"mm_token_type_ids" if visual else "mask": metadata}
+        responses = diffusion_responses(
+            model,
+            (2, 3, 4, 5, 6 if visual else 0),
+            max_tokens=1,
+            prefill_step_size=2,
+            **kwargs,
+        )
+        assert responses[-1].generation_tokens == 1
+        assert recorder.input_lengths == [5]
+        if visual:
+            assert recorder.mm_token_type_ids[0] is metadata
+        else:
+            assert recorder.attention_masks[0] is not None
+
+    def test_stream_generate_supports_static_diffusion_cache(self):
+        result = diffusion_responses(
+            make_diffusion_model(), max_tokens=4, diffusion_static_cache=True
+        )[-1]
+        assert result.generation_tokens == 4
+        assert result.diffusion_canvas_tokens >= 3
+
+    def test_default_confidence_threshold_sampler_can_exit_after_one_step(self):
+        result = diffusion_responses(
+            make_diffusion_model(), max_denoising_steps=4, diffusion_threshold=0.0
+        )[-1]
+        assert result.generation_tokens == 2
+        assert result.diffusion_denoising_steps == 1
+        assert result.diffusion_work_tokens == 3
+
+    def test_stream_generate_uses_checkpoint_denoising_steps(self):
+        config = tiny_config_dict()
+        config["generation_config"]["max_denoising_steps"] = 48
+        result = diffusion_responses(
+            make_diffusion_model(config), diffusion_sampler="entropy-bound"
+        )[-1]
+        assert result.diffusion_denoising_steps == 48
+        assert result.diffusion_work_tokens == 48 * 3
+
+    def test_diffusion_initial_canvas_pads_short_decoder_input_ids(self):
+        decoder_ids = diffusion._normalize_decoder_input_ids(
+            [[10, 11]], batch_size=1, dtype=mx.int32
+        )
+        with patch.object(
+            diffusion,
+            "_diffusion_initialize_canvas",
+            return_value=mx.array([[7, 8, 9]], dtype=mx.int32),
+        ):
+            canvas = diffusion._diffusion_initial_canvas(
+                decoder_ids,
+                start_index=0,
+                batch_size=1,
+                canvas_length=3,
+                vocab_size=64,
+                dtype=mx.int32,
+            )
+            mx.eval(canvas)
+        assert canvas.tolist() == [[10, 11, 9]]
+
+    @pytest.mark.parametrize(
+        "ids,error", [([10, 11], "2D array"), ([[10, 11], [12, 13]], "batch size")]
+    )
+    def test_diffusion_decoder_input_ids_validation(self, ids, error):
+        with pytest.raises(ValueError, match=error):
+            diffusion._normalize_decoder_input_ids(ids, batch_size=1, dtype=mx.int32)
+
+    def test_stream_generate_slices_decoder_input_ids_by_canvas(self):
+        model = make_diffusion_model()
+        seen = []
+
+        def logits(canvas, *args, **kwargs):
+            mx.eval(canvas)
+            seen.append(canvas.tolist())
+            return mx.zeros((*canvas.shape, model.config.text_config.vocab_size))
+
+        with patch.object(model, "diffusion_decoder_logits", side_effect=logits):
+            responses = diffusion_responses(
+                model,
+                max_tokens=4,
+                diffusion_max_canvas_length=2,
+                decoder_input_ids=mx.array([[10, 11, 12, 13]], dtype=mx.int32),
+            )
+        assert responses[-1].generation_tokens == 4
+        assert seen[:2] == [[[10, 11]], [[12, 13]]]
+
+    @pytest.mark.parametrize(
+        "temperature,expected",
+        [(0.0, [[1, 0]]), (0.7, [[2, 1]])],
+        ids=["argmax", "categorical"],
+    )
+    def test_diffusion_samples_canvas(self, temperature, expected):
+        logits = mx.array([[[0.0, 2.0, 1.0], [3.0, 1.0, 2.0]]])
+        with patch.object(
+            mx.random, "categorical", return_value=mx.array([[2, 1]])
+        ) as categorical:
+            sampled = diffusion._diffusion_sample_canvas(
+                logits, mx.int32, temperature=temperature
+            )
+            mx.eval(sampled)
+        assert categorical.call_count == (1 if temperature else 0)
+        assert sampled.tolist() == expected
+
+    def test_stream_generate_with_mxfp4_quantized_embeddings(self):
+        import mlx.nn as nn
+
+        config = tiny_config_dict()
+        config["text_config"]["hidden_size"] = 32
+        config["generation_config"]["max_denoising_steps"] = 3
+        model = make_diffusion_model(config)
+        nn.quantize(
+            model,
+            group_size=32,
+            bits=4,
+            mode="mxfp4",
+            class_predicate=lambda path, module: isinstance(module, nn.Embedding),
+        )
+        assert model.model.decoder.embed_tokens.mode == "mxfp4"
+        result = diffusion_responses(model)[-1]
+        assert result.generation_tokens == 2
+        assert result.diffusion_work_tokens > 0
+
+
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__]))

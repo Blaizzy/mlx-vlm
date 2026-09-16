@@ -1,12 +1,20 @@
 """Tests for custom processor implementations."""
 
+import importlib
+import json
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import mlx.core as mx
 import numpy as np
 import pytest
 from PIL import Image
+
+from mlx_vlm.utils import StoppingCriteria
 
 # ── Shared mocks ──────────────────────────────────────────────────────────────
 
@@ -3093,10 +3101,6 @@ class TestTrustRemoteCodePassthrough(unittest.TestCase):
         self.assertFalse(kwargs["trust_remote_code"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestVideoFrameCaps(unittest.TestCase):
     """Processors that re-subsample declare their cap so the decoder can stop
     reading frames that are about to be thrown away."""
@@ -3460,3 +3464,353 @@ class TestMageVLProcessor:
         from mlx_vlm.models.mage_vl.mage_vl import _as_grid_list
 
         assert _as_grid_list(raw) == [(1, 4, 4)]
+
+
+class TinyDiffusionGemma4Tokenizer:
+    image_token = "<image>"
+    image_token_id = 60
+    video_token = "<video>"
+    video_token_id = 61
+    boi_token = "<boi>"
+    eoi_token = "<eoi>"
+    pad_token = "<pad>"
+    pad_token_id = 0
+    eos_token = "<eos>"
+    eos_token_id = 1
+    unk_token_id = 2
+    model_input_names = ["input_ids", "attention_mask"]
+
+    def __init__(self):
+        self.additional_special_tokens = []
+        self.stc_token = None
+        self.etc_token = None
+        self.escape_token = None
+        self.soc_token = None
+        self.eoc_token = None
+        self.special_tokens = {
+            self.image_token: self.image_token_id,
+            self.video_token: self.video_token_id,
+            self.boi_token: 62,
+            self.eoi_token: 63,
+            self.pad_token: self.pad_token_id,
+            self.eos_token: self.eos_token_id,
+        }
+
+    @property
+    def all_special_ids(self):
+        additional_ids = [
+            self.convert_tokens_to_ids(token)
+            for token in self.additional_special_tokens
+        ]
+        attr_ids = [
+            self.convert_tokens_to_ids(token)
+            for token in (
+                self.stc_token,
+                self.etc_token,
+                self.escape_token,
+                self.soc_token,
+                self.eoc_token,
+            )
+            if token is not None
+        ]
+        return additional_ids + attr_ids
+
+    def convert_tokens_to_ids(self, token):
+        return self.special_tokens.get(token, self.unk_token_id)
+
+    def add_special_tokens(self, tokens):
+        for token in tokens.get("additional_special_tokens", []):
+            self.special_tokens[token] = self.video_token_id
+
+    def __call__(self, text=None, **kwargs):
+        del kwargs
+        if isinstance(text, str):
+            text = [text]
+        rows = [self._encode(prompt) for prompt in text]
+        max_len = max(len(row) for row in rows)
+        input_ids = [row + [self.pad_token_id] * (max_len - len(row)) for row in rows]
+        attention_mask = [[1] * len(row) + [0] * (max_len - len(row)) for row in rows]
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    def _encode(self, text):
+        ids = []
+        i = 0
+        specials = sorted(self.special_tokens, key=len, reverse=True)
+        while i < len(text):
+            for token in specials:
+                if text.startswith(token, i):
+                    ids.append(self.special_tokens[token])
+                    i += len(token)
+                    break
+            else:
+                if not text[i].isspace():
+                    ids.append(10)
+                i += 1
+        return ids
+
+
+class TinyVideoProcessor:
+    model_input_names = ["pixel_values_videos"]
+
+    def __call__(self, videos, fps=None):
+        del videos, fps
+        return {
+            "pixel_values_videos": np.zeros((2, 3, 4, 4), dtype=np.float32),
+            "num_frames_per_video": [2],
+            "num_soft_tokens_per_frame": [1],
+            "frame_timestamps": [[0.0, 1.0]],
+        }
+
+
+class TinyImageProcessor:
+    model_input_names = ["pixel_values"]
+
+    def fetch_images(self, images):
+        return images
+
+    def __call__(self, images):
+        if not isinstance(images, list):
+            images = [images]
+        return {"pixel_values": np.stack(images).astype(np.float32)}, [1] * len(images)
+
+
+def tiny_diffusion_gemma_processor(image_processor=None):
+    from mlx_vlm.models.diffusion_gemma import DiffusionGemma4Processor
+
+    tokenizer = TinyDiffusionGemma4Tokenizer()
+    processor = DiffusionGemma4Processor.__new__(DiffusionGemma4Processor)
+    processor.image_processor = image_processor
+    processor.tokenizer = tokenizer
+    processor.video_processor = TinyVideoProcessor()
+    processor.feature_extractor = None
+    processor.image_seq_length = 280
+    processor.audio_seq_length = 750
+    processor.audio_ms_per_token = 40
+    processor.image_token_id = tokenizer.image_token_id
+    processor.image_token = tokenizer.image_token
+    processor.video_token_id = tokenizer.video_token_id
+    processor.video_token = tokenizer.video_token
+    processor.boi_token = tokenizer.boi_token
+    processor.eoi_token = tokenizer.eoi_token
+    processor.audio_token_id = None
+    processor.audio_token = ""
+    processor.full_audio_sequence = None
+    processor.full_image_sequence = ""
+    return processor
+
+
+class TestDiffusionGemma4Processor(unittest.TestCase):
+    def test_auto_processor_loads_multimodal_processor(self):
+        from transformers import AutoProcessor
+
+        from mlx_vlm.models.diffusion_gemma import DiffusionGemma4Processor
+        from mlx_vlm.models.gemma4.processing_gemma4 import (
+            Gemma4ImageProcessor,
+            Gemma4VideoProcessor,
+        )
+
+        tokenizer = TinyDiffusionGemma4Tokenizer()
+        tokenizer.chat_template = None
+
+        with TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir)
+            (model_dir / "config.json").write_text(
+                json.dumps({"model_type": "diffusion_gemma"}), encoding="utf-8"
+            )
+            (model_dir / "processor_config.json").write_text(
+                json.dumps(
+                    {
+                        "audio_ms_per_token": 40,
+                        "audio_seq_length": 750,
+                        "image_processor": {
+                            "do_normalize": False,
+                            "image_processor_type": "Gemma4ImageProcessor",
+                            "max_soft_tokens": 140,
+                            "patch_size": 16,
+                            "pooling_kernel_size": 3,
+                        },
+                        "image_seq_length": 140,
+                        "processor_class": "DiffusionGemma4Processor",
+                        "video_processor": {
+                            "max_soft_tokens": 70,
+                            "num_frames": 8,
+                            "video_processor_type": "Gemma4VideoProcessor",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer
+                ),
+                patch(
+                    "transformers.processing_utils.ProcessorMixin."
+                    "check_argument_for_proper_class",
+                    return_value=None,
+                ),
+            ):
+                processor = AutoProcessor.from_pretrained(tmpdir)
+
+        self.assertIsInstance(processor, DiffusionGemma4Processor)
+        self.assertIsInstance(processor.image_processor, Gemma4ImageProcessor)
+        self.assertIsInstance(processor.video_processor, Gemma4VideoProcessor)
+        self.assertEqual(processor.image_processor.max_soft_tokens, 140)
+        self.assertEqual(processor.video_processor.num_frames, 8)
+        self.assertEqual(
+            DiffusionGemma4Processor.get_attributes(),
+            ["image_processor", "tokenizer", "video_processor"],
+        )
+
+    def test_processor_demotes_tool_parser_tokens_from_specials(self):
+        from mlx_vlm.models.diffusion_gemma import DiffusionGemma4Processor
+        from mlx_vlm.models.diffusion_gemma.processing_diffusion_gemma import (
+            _TOOL_PARSER_TOKENS,
+        )
+        from mlx_vlm.models.gemma4.processing_gemma4 import Gemma4Processor
+
+        tokenizer = TinyDiffusionGemma4Tokenizer()
+        tokenizer.special_tokens.update(
+            {token: 70 + i for i, token in enumerate(_TOOL_PARSER_TOKENS)}
+        )
+        tokenizer.special_tokens["<extra_special>"] = 90
+        tokenizer.stc_token = "<|tool_call>"
+        tokenizer.etc_token = "<tool_call|>"
+        tokenizer.escape_token = '<|"|>'
+        tokenizer.soc_token = "<|channel>"
+        tokenizer.eoc_token = "<channel|>"
+        tokenizer.additional_special_tokens = ["<extra_special>"]
+
+        with patch.object(
+            Gemma4Processor,
+            "from_pretrained",
+            return_value=SimpleNamespace(tokenizer=tokenizer),
+        ):
+            processor = DiffusionGemma4Processor.from_pretrained("demo")
+
+        self.assertIs(processor.tokenizer, tokenizer)
+        self.assertEqual(tokenizer.additional_special_tokens, ["<extra_special>"])
+        self.assertEqual(tokenizer.all_special_ids, [90])
+        self.assertIsNone(tokenizer.stc_token)
+        self.assertIsNone(tokenizer.etc_token)
+        self.assertIsNone(tokenizer.escape_token)
+        self.assertIsNone(tokenizer.soc_token)
+        self.assertIsNone(tokenizer.eoc_token)
+        for token in _TOOL_PARSER_TOKENS:
+            self.assertNotEqual(
+                tokenizer.convert_tokens_to_ids(token), tokenizer.unk_token_id
+            )
+
+    def test_strip_channel_scaffolding_is_noop_without_markers(self):
+        from mlx_vlm.models.diffusion_gemma.processing_diffusion_gemma import (
+            _strip_channel_scaffolding,
+        )
+
+        plain = "Title: A calm river cruise\nKeywords: boat, river"
+        self.assertEqual(_strip_channel_scaffolding(plain), plain)
+
+    def test_generate_strips_diffusion_channel_scaffolding(self):
+        dispatch_module = importlib.import_module("mlx_vlm.generate.dispatch")
+        from mlx_vlm.generate import GenerationResult, generate
+
+        class Config:
+            model_type = "diffusion_gemma"
+            eos_token_id = 999999
+
+        class Model:
+            config = Config()
+
+        processor = tiny_diffusion_gemma_processor()
+        processor.tokenizer.stopping_criteria = StoppingCriteria(
+            [999999], processor.tokenizer
+        )
+
+        chunks = [
+            GenerationResult(
+                text="<|channel>thought\n<channel|>Title: A calm river cruise",
+                token=1,
+                prompt_tokens=3,
+                generation_tokens=8,
+                total_tokens=11,
+                prompt_tps=10.0,
+                generation_tps=5.0,
+            )
+        ]
+
+        with patch.object(
+            dispatch_module, "stream_generate", return_value=iter(chunks)
+        ):
+            result = generate(Model(), processor, "")
+
+        self.assertEqual(result.text, "Title: A calm river cruise")
+
+    def test_processor_video_outputs_can_cross_thread_boundary(self):
+        def produce():
+            return tiny_diffusion_gemma_processor()(
+                text="<video> describe",
+                videos=[np.zeros((2, 3, 4, 4), dtype=np.uint8)],
+            )
+
+        def consume(result):
+            mx.eval(
+                *(
+                    result[key]
+                    for key in (
+                        "input_ids",
+                        "attention_mask",
+                        "mm_token_type_ids",
+                        "pixel_values",
+                    )
+                )
+            )
+            return result["pixel_values"].shape, int(
+                mx.sum(result["mm_token_type_ids"] == 2).item()
+            )
+
+        # Keep both workers alive so production and consumption use distinct threads.
+        with (
+            ThreadPoolExecutor(max_workers=1) as producer,
+            ThreadPoolExecutor(max_workers=1) as consumer,
+        ):
+            result = producer.submit(produce).result(timeout=5)
+            self.assertEqual(
+                consumer.submit(consume, result).result(timeout=5), ((2, 3, 4, 4), 2)
+            )
+
+    def test_apply_chat_template_includes_video_token_for_video_inputs(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        processor = tiny_diffusion_gemma_processor()
+        rendered = apply_chat_template(
+            processor,
+            SimpleNamespace(model_type="diffusion_gemma"),
+            "Describe this video.",
+            video=["clip.mp4"],
+        )
+
+        self.assertIn(processor.video_token, rendered)
+
+        result = processor(
+            text=rendered, videos=[np.zeros((2, 3, 4, 4), dtype=np.uint8)]
+        )
+        self.assertEqual(int(mx.sum(result["mm_token_type_ids"] == 2).item()), 2)
+
+    def test_processor_orders_mixed_images_and_videos_in_pixel_values(self):
+        processor = tiny_diffusion_gemma_processor(image_processor=TinyImageProcessor())
+
+        image = np.ones((3, 4, 4), dtype=np.float32)
+        result = processor(
+            text="<video> then <image>",
+            images=[image],
+            videos=[np.zeros((2, 3, 4, 4), dtype=np.uint8)],
+        )
+
+        self.assertNotIn("pixel_values_videos", result)
+        self.assertEqual(result["pixel_values"].shape, (3, 3, 4, 4))
+        self.assertTrue(bool(mx.all(result["pixel_values"][:2] == 0).item()))
+        self.assertTrue(bool(mx.all(result["pixel_values"][2] == 1).item()))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -2,14 +2,18 @@
 
 import argparse
 import ast
+import contextlib
 import inspect
+import io
 import os
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import mlx.core as mx
 import pytest
 
 from mlx_vlm.generate import ar, common, dispatch
@@ -17,6 +21,7 @@ from mlx_vlm.generate.ar import generate_step
 from mlx_vlm.generate.dispatch import parse_arguments
 from mlx_vlm.models.rfdetr.generate import _get_annotator, main
 from mlx_vlm.models.sam3 import generate as sam3_generate
+from mlx_vlm.tests.diffusion_fixtures import FakeProcessor, make_diffusion_model
 
 # CLI arguments
 
@@ -330,6 +335,216 @@ def test_shared_defaults_are_defined_once():
                     f"{module.__name__}.{name} is not the object defined in "
                     "mlx_vlm.generate.common"
                 )
+
+
+class TestDiffusionDisplay(unittest.TestCase):
+    def test_generate_verbose_omits_diffusion_work_stats(self):
+        from mlx_vlm.generate import generate
+
+        model = make_diffusion_model()
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            generate(
+                model,
+                FakeProcessor(),
+                "",
+                input_ids=mx.array([[2, 3]], dtype=mx.int32),
+                max_tokens=2,
+                max_denoising_steps=1,
+                verbose=True,
+            )
+
+        output = stdout.getvalue()
+        self.assertIn("Prompt:", output)
+        self.assertIn("Generation:", output)
+        self.assertIn("Peak memory:", output)
+        self.assertNotIn("Diffusion:", output)
+        self.assertNotIn("work tokens", output)
+        self.assertNotIn("work-tokens-per-sec", output)
+
+    def test_unmasking_display_has_no_prefix_and_preserves_newlines(self):
+        from mlx_vlm.generate import GenerationResult
+        from mlx_vlm.generate.diffusion import (
+            _format_diffusion_draft_line,
+            _format_diffusion_live_text,
+        )
+
+        draft = GenerationResult(
+            is_draft=True,
+            draft_text="[Mask]\nHello",
+            diffusion_canvas_index=1,
+            diffusion_step=1,
+            diffusion_total_steps=4,
+        )
+
+        self.assertEqual(_format_diffusion_draft_line(draft, 80), "[Mask]\nHello")
+        self.assertEqual(
+            _format_diffusion_live_text("hello\nworld", 80), "hello\nworld"
+        )
+        self.assertEqual(
+            _format_diffusion_live_text("hello\nworld", 80, preserve_newlines=False),
+            "hello\\nworld",
+        )
+
+    def test_unmasking_display_is_untrimmed_by_default(self):
+        from mlx_vlm.generate import GenerationResult
+        from mlx_vlm.generate.diffusion import (
+            _format_diffusion_draft_line,
+            _format_diffusion_live_text,
+        )
+
+        long_text = "A" * 200
+        draft = GenerationResult(is_draft=True, draft_text=long_text)
+
+        self.assertEqual(_format_diffusion_draft_line(draft), long_text)
+        self.assertEqual(_format_diffusion_live_text(long_text), long_text)
+        self.assertTrue(_format_diffusion_live_text(long_text, 20).endswith("..."))
+
+    def test_wrap_text_wraps_on_spaces(self):
+        from mlx_vlm.models.diffusion_gemma.visualizer import _wrap_text
+
+        wrapped = _wrap_text("alpha beta gamma delta", 11)
+        self.assertEqual(wrapped, "alpha beta\ngamma delta")
+        # Newlines in the input are preserved.
+        wrapped = _wrap_text("alpha\nbeta gamma", 20)
+        self.assertEqual(wrapped, "alpha\nbeta gamma")
+        # A single overlong word is hard-split.
+        self.assertEqual(_wrap_text("abcdef", 3), "abc\ndef")
+
+    def test_visualizer_composes_full_canvas(self):
+        from mlx_vlm.models.diffusion_gemma.visualizer import DiffusionGemma4Visualizer
+
+        visualizer = DiffusionGemma4Visualizer()
+        drawn = []
+
+        class FakeRedrawer:
+            def draw(self, text, wrap_width=None):
+                drawn.append(text)
+
+            def finish(self):
+                drawn.append("<finish>")
+
+        visualizer.redrawer = FakeRedrawer()
+
+        class FakeDraft:
+            draft_text = "[Mask]\nworld"
+
+        visualizer.handle_text("Hello.\n")
+        visualizer.handle_draft(FakeDraft())
+        self.assertEqual(drawn[-1], "Hello.\n[Mask]\nworld")
+
+        visualizer.handle_text(" Bye.")
+        self.assertEqual(drawn[-1], "Hello.\n Bye.")
+
+        visualizer.finish("Hello.\n Bye.")
+        self.assertIn("<finish>", drawn)
+
+    def test_output_handler_delegates_to_model_visualizer(self):
+        from unittest.mock import patch
+
+        from mlx_vlm.generate.diffusion import DiffusionOutputHandler
+        from mlx_vlm.models.diffusion_gemma.visualizer import make_unmasking_visualizer
+
+        # Importing the model package installs the handler patch.
+        self.assertTrue(getattr(DiffusionOutputHandler, "_model_visualizer_patched"))
+
+        model = SimpleNamespace(make_unmasking_visualizer=make_unmasking_visualizer)
+
+        with patch("sys.stdout.isatty", return_value=True):
+            kwargs = {}
+            handler = DiffusionOutputHandler(model, kwargs, verbose=True)
+
+        self.assertIsNotNone(handler._model_visualizer)
+        self.assertTrue(kwargs.get("diffusion_show_unmasking"))
+        self.assertIsNone(handler.redrawer)
+
+        events = []
+
+        class FakeVisualizer:
+            def handle_draft(self, response):
+                events.append(("draft", response.draft_text))
+
+            def handle_text(self, text):
+                events.append(("text", text))
+                return True
+
+            def finish(self, text):
+                events.append(("finish", text))
+
+        handler._model_visualizer = FakeVisualizer()
+
+        class FakeDraft:
+            draft_text = "[Mask]"
+
+        handler.handle_draft(FakeDraft())
+        self.assertTrue(handler.handle_text("hi"))
+        handler.finish("hi")
+        self.assertEqual(
+            events, [("draft", "[Mask]"), ("text", "hi"), ("finish", "hi")]
+        )
+
+    def test_diffusion_kwargs_omits_default_confidence_threshold_sampler(self):
+        from types import SimpleNamespace
+
+        from mlx_vlm.generate.diffusion import diffusion_kwargs_from_args
+
+        config = SimpleNamespace(canvas_length=3)
+        args = SimpleNamespace(
+            max_denoising_steps=None,
+            diffusion_full_canvas=False,
+            diffusion_min_canvas_length=None,
+            diffusion_max_canvas_length=None,
+            diffusion_sampler="confidence-threshold",
+            threshold=None,
+        )
+
+        self.assertEqual(diffusion_kwargs_from_args(args, config), {})
+
+        args.diffusion_sampler = "entropy-bound"
+        self.assertEqual(
+            diffusion_kwargs_from_args(args, config),
+            {"diffusion_sampler": "entropy-bound"},
+        )
+
+        args.threshold = 0.7
+        self.assertEqual(
+            diffusion_kwargs_from_args(args, config),
+            {
+                "diffusion_sampler": "entropy-bound",
+                "diffusion_threshold": 0.7,
+                "threshold": 0.7,
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "alternate", [False, True], ids=["in_place", "alternate_screen"]
+)
+def test_diffusion_redrawer(alternate):
+    from mlx_vlm.models.diffusion_visualizer import _CanvasRedrawer
+
+    redrawer = _CanvasRedrawer(min_interval=0.0)
+    buffer = io.StringIO()
+    terminal = SimpleNamespace(columns=40, lines=6 if alternate else 24)
+    with (
+        patch("shutil.get_terminal_size", return_value=terminal),
+        contextlib.redirect_stdout(buffer),
+    ):
+        redrawer.draw("word " * 60 if alternate else "one two three\nfour")
+        first = buffer.getvalue()
+        if not alternate:
+            redrawer.draw("one two three\nfour five")
+            second = buffer.getvalue()[len(first) :]
+        redrawer.finish()
+    if alternate:
+        for sequence in ("\033[?1049h", "\033[?25l", "\033[?1049l", "\033[?25h"):
+            assert sequence in buffer.getvalue()
+        assert not redrawer.alternate_screen
+    else:
+        assert "\033[2J" not in first + second
+        assert "\033[2K" in first
+        assert "\033[1A" in second
+        assert redrawer.rows == 0
 
 
 if __name__ == "__main__":

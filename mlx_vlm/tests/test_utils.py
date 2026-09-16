@@ -1139,3 +1139,22 @@ def test_missing_model_file_raises_clearly(tmp_path):
 
 def _load(path):
     return load_model(path)
+
+
+def test_diffusion_gemma_load_config_preserves_generation_config(tmp_path):
+    from mlx_vlm.models.diffusion_gemma import ModelConfig
+    from mlx_vlm.tests.diffusion_fixtures import tiny_config_dict
+
+    generation_config = {
+        "max_denoising_steps": 48,
+        "sampler_config": {
+            "_cls_name": "EntropyBoundSamplerConfig",
+            "entropy_bound": 0.1,
+        },
+    }
+    (tmp_path / "config.json").write_text(json.dumps(tiny_config_dict()))
+    (tmp_path / "generation_config.json").write_text(json.dumps(generation_config))
+    loaded = load_config(tmp_path)
+    assert loaded["model_type"] == "diffusion_gemma"
+    assert loaded["generation_config"] == generation_config
+    assert ModelConfig.from_dict(loaded).generation_config == generation_config
