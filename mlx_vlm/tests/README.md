@@ -49,9 +49,11 @@ belong in `test_speculative.py`: reuse its tiny target/config factories and
 parameterize shared contracts with descriptive family IDs. Checkpoint I/O, MTP
 setup, quantization format matrices, and repeated-decode references are shared
 within the suite. `speculative_fixtures.py` supplies fresh tiny language configs
-for speculative and training tests. `test_speculative.py` also owns the
-Apodex MTP splitter and MiniMax speculative rollback checks; unrelated model
-tests remain in their existing modules.
+for speculative and training tests. `test_speculative.py` also owns MiniMax
+speculative rollback checks; unrelated model tests remain in their existing
+modules. Cache/position, sampling-parity, and batched-mask checks run through
+shared contract runners. See [coverage measurements](speculative_coverage.md)
+for the retained coverage and remaining gaps from the compact rewrite.
 
 DiffusionGemma generation and APC tests share `diffusion_fixtures.py` for tiny
 configs, model construction, tokenization, encoder recording, and stream calls.
@@ -59,11 +61,6 @@ Processor checks live in `test_processors.py`, server block streaming in
 `test_server.py`, and generation-config loading in `test_utils.py`. Keep numerical
 and vision-specific assertions in `test_diffusion_gemma.py`; its optional
 Transformers reference check still requires the reference dependencies.
-
-An opt-in [1.5K speculative prototype](prototypes/README.md) explores shared
-behavior runners within a roughly 1,500-line budget. It is excluded from default
-collection; its report measures the coverage lost if it replaces the current
-suite. Run it by its explicit file path as documented in the report.
 
 ## JSON model cases
 
