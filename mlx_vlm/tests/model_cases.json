@@ -414,7 +414,14 @@
         },
         "model_type": "qwen3_5"
       },
-      "checks": ["language", "vision", "request_positions", "chunked_positions", "mrope_deltas"],
+      "checks": [
+        "language",
+        "vision",
+        "input_embeddings",
+        "request_positions",
+        "chunked_positions",
+        "mrope_deltas"
+      ],
       "vision": {"input_shape": [4, 1176], "feature_layer": 0, "grid_thw": [[1, 2, 2]]}
     },
     {
@@ -1198,7 +1205,7 @@
         },
         "model_type": "qwen3_5_moe"
       },
-      "checks": ["language", "vision", "chunked_positions"],
+      "checks": ["language", "vision", "input_embeddings", "chunked_positions"],
       "vision": {"input_shape": [4, 1176], "feature_layer": 0, "grid_thw": [[1, 2, 2]]}
     },
     {
