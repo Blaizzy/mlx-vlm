@@ -545,7 +545,8 @@ def check_arguments(kind, case, model, config):
             kwargs["projector_output_dim"] = vision_config.projector_output_dim
         return (
             vision,
-            vision_config.model_type,
+            # MiniMax's vision wrapper does not expose model_type.
+            None if case["module"] == "minimax_m3_vl" else vision_config.model_type,
             hidden_size,
             channels,
             tuple(image_size),

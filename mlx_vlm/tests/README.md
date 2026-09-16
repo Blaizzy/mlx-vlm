@@ -27,7 +27,7 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_turboquant.py` | TurboQuant cache integration, batched attention, and value kernels |
 | `test_weight_quantization.py` | FP8 and one-bit weight conversion and execution |
 | `test_moe_offload.py` | MoE checkpoint repacking, expert offload, output parity, and failure handling |
-| `test_qwen3_5.py` | Qwen3.5 patch and quantized expert-weight layouts, including Apodex NVFP4, and ragged attention fallbacks |
+| `test_qwen3_5.py` | Qwen3.5 patch layouts and ragged attention fallbacks |
 | `test_nemotron_voicechat.py` | VoiceChat runtime, streaming, and checkpoint conversion |
 | `test_mage_vl.py` | Mage VL video processing and position handling |
 | `test_speculative.py` | Drafter loading and compatibility, generation parity, verification, cache transactions, and quantized speculative state across model families |
@@ -50,7 +50,7 @@ tests remain in their existing modules.
 
 ## JSON model cases
 
-`model_cases.json` contains 49 configurable contract cases and 17 native
+`model_cases.json` contains 50 configurable contract cases and 17 native
 forward/cache cases. `test_models.py` collects each case separately with a stable
 model ID, so failures can be selected with `pytest -k`:
 
@@ -123,6 +123,12 @@ input-embedding, and `forward_cache` checks; DeepSeek also checks its aligner
 through `projector`. Their standalone regression modules are removed. The
 Qwen4 transaction tests read their tiny config from the same JSON case.
 `forward_cache` reuses the native full-forward and cached-decode shape checks.
+
+The `minimax_m3_vl` case replaces its standalone regression module with the
+existing language, vision, projector, text-only input-embedding, and
+`forward_cache` checks. Its tiny language config includes dense and MoE layers;
+vision uses four flattened patches with a 2×2 grid. The MiniMax speculative
+rollback checks remain in `test_speculative.py`.
 
 Most cases need no wiring overrides. `vision_path` and `projector_path` select
 unusual component locations; defaults are `vision_tower` and
