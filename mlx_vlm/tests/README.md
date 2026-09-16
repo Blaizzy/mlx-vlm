@@ -1,7 +1,8 @@
 # Test organization
 
-Add regressions to the module covering the same production behavior and reuse
-its fixtures. Prefer a new file when a test needs an independent dependency,
+Add regressions and reusable helpers to the module covering the same production
+behavior. Import shared helpers from that module instead of adding separate
+fixture files. Prefer a new file when a test needs an independent dependency,
 checkpoint, or collection boundary. Keep fixture setup and hardware skips scoped
 to the tests that need them.
 
@@ -47,15 +48,16 @@ their existing broad integration checks. Drafter and speculative-decoding tests
 belong in `test_speculative.py`: reuse its tiny target/config factories and
 parameterize shared contracts with descriptive family IDs. Checkpoint I/O, MTP
 setup, quantization format matrices, and repeated-decode references are shared
-within the suite. `speculative_fixtures.py` supplies fresh tiny language configs
-for speculative and training tests. `test_speculative.py` also owns MiniMax
+within the suite. `test_speculative.py` supplies fresh tiny language configs
+for speculative and training tests. It also owns MiniMax
 speculative rollback checks; unrelated model tests remain in their existing
 modules. Cache/position, sampling-parity, and batched-mask checks run through
 shared contract runners. See [coverage measurements](speculative_coverage.md)
 for the retained coverage and remaining gaps from the compact rewrite.
 
-DiffusionGemma generation and APC tests share `diffusion_fixtures.py` for tiny
-configs, model construction, tokenization, encoder recording, and stream calls.
+`test_diffusion_models.py` owns the shared DiffusionGemma helpers for tiny configs,
+model construction, tokenization, encoder recording, and stream calls. CLI, APC,
+and loading tests import the helpers they need from that module.
 Processor checks live in `test_processors.py`, server block streaming in
 `test_server.py`, and generation-config loading in `test_utils.py`. Keep numerical
 and vision-specific assertions in `test_diffusion_models.py`; its optional

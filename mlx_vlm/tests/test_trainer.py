@@ -10,10 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from mlx_vlm.tests.speculative_fixtures import (
-    tiny_deepseek_config,
-    tiny_glm_text_config,
-)
+from mlx_vlm.tests.test_speculative import tiny_deepseek_config, tiny_glm_text_config
 from mlx_vlm.trainer.datasets import VisionDataset
 from mlx_vlm.trainer.lora import LoRaLayer
 from mlx_vlm.trainer.lora_layers import LoRALinear

@@ -4,13 +4,17 @@
 519-case module; the opt-in experiment and its separate report have been removed.
 Production code is unchanged. These measurements compare the compact suite with
 the previous suite at `5c3e00dc`, which remained unchanged through `bf85e718`.
+The measurements below were recorded at `88324690`. Shared configuration helpers
+now live directly in `test_speculative.py` and are also imported by training tests;
+the helper move preserves the test scenarios and assertions. The size breakdown
+below describes the earlier layout, and full-suite counts predate later pruning.
 
 ## Size and validation
 
 | Measure | Previous suite | Final suite |
 | --- | ---: | ---: |
 | Main Python module, including blank lines | 4,956 | 1,883 |
-| Shared `speculative_fixtures.py`, counted in full | 116 | 116 |
+| Shared configuration helpers, then in a separate file | 116 | 116 |
 | Combined readable lines | **5,072** | **1,999** |
 | Including the common 17-line pytest setup | 5,089 | 2,016 |
 | Speculative cases | 519 | **408 passed** |

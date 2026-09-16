@@ -319,7 +319,7 @@ def test_lfm_mixed_prefill_keeps_logits_before_right_padding(
 def test_diffusion_prefills_only_divergent_suffix(manager_factory, tier):
     from mlx_vlm.generate import stream_generate
     from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-    from mlx_vlm.tests.diffusion_fixtures import (
+    from mlx_vlm.tests.test_diffusion_models import (
         FakeProcessor,
         RecordingEncoder,
         tiny_config_dict,

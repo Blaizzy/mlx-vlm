@@ -1143,7 +1143,7 @@ def _load(path):
 
 def test_diffusion_gemma_load_config_preserves_generation_config(tmp_path):
     from mlx_vlm.models.diffusion_gemma import ModelConfig
-    from mlx_vlm.tests.diffusion_fixtures import tiny_config_dict
+    from mlx_vlm.tests.test_diffusion_models import tiny_config_dict
 
     generation_config = {
         "max_denoising_steps": 48,

@@ -21,7 +21,7 @@ from mlx_vlm.generate.ar import generate_step
 from mlx_vlm.generate.dispatch import parse_arguments
 from mlx_vlm.models.rfdetr.generate import _get_annotator, main
 from mlx_vlm.models.sam3 import generate as sam3_generate
-from mlx_vlm.tests.diffusion_fixtures import FakeProcessor, make_diffusion_model
+from mlx_vlm.tests.test_diffusion_models import FakeProcessor, make_diffusion_model
 
 # CLI arguments
 
