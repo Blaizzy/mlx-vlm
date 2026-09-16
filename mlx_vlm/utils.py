@@ -2008,10 +2008,15 @@ def load_audio(
     else:
         audio, sample_rate = read_audio(file, dtype="float32")
 
+    # Downmix before resampling: read_audio returns (samples, channels), and
+    # resample_audio works on the last axis, so resampling stereo first would
+    # resample the channel axis and leave the samples at the source rate.
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
     if sample_rate != sr:
         audio = resample_audio(audio, sample_rate, sr)
-    audio = np.asarray(audio, dtype=np.float32)
-    return audio.mean(axis=1) if audio.ndim > 1 else audio
+    return np.asarray(audio, dtype=np.float32)
 
 
 @dataclass(frozen=True)
