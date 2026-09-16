@@ -66,8 +66,9 @@ Transformers reference check still requires the reference dependencies.
 `test_processors.py` uses `SMOKE_PROCESSORS` and `_make_processor` for shared
 image/text contracts across 20 processor families. Helpers for tokenization,
 image outputs, temporary checkpoint configs, and loader mocks stay in this file.
-Reuse them when adding cases; keep distinct media, batching, serialization, and
-threading assertions explicit. AutoProcessor routing checks assert the selected
+Reuse the parameterized output, EOS-token, tiled-image, and timestamp contracts
+when adding cases. Keep distinct media, batching, serialization, and threading
+assertions explicit; related integration scenarios may share their setup. AutoProcessor routing checks assert the selected
 loader and its returned object, and exercise real incomplete-checkpoint behavior.
 
 ## JSON model cases
