@@ -30,7 +30,8 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_qwen3_5.py` | Qwen3.5 patch layouts and ragged attention fallbacks |
 | `test_nemotron_voicechat.py` | VoiceChat runtime, streaming, and checkpoint conversion |
 | `test_mage_vl.py` | Mage VL video processing and position handling |
-| `test_dflash_drafters.py` | DFlash2, Laguna, and Muse Glimmer drafter contracts |
+| `test_speculative.py` | Drafter loading and compatibility, generation parity, verification, cache transactions, and quantized speculative state across model families |
+| `test_speculative_masks_static.py` | Gemma assistant mask offsets with fake dependencies, without importing MLX |
 | `test_rope.py` | Rotary embeddings, multimodal position IDs, and batched offsets |
 | `test_audio_generation.py` | Audio generation, loading, downmixing, and resampling |
 | `test_server_audio.py` | HTTP audio endpoints and realtime voice sessions |
@@ -40,9 +41,12 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_utils.py` | General loading/conversion utilities and local Python model files |
 
 Other architecture-specific modules remain focused on their own models. The
-larger `test_processors.py`, `test_generate.py`, `test_server.py`, and
-`test_speculative.py` contain their existing broad integration checks; related
-small files should not automatically be added to those large modules.
+larger `test_processors.py`, `test_generate.py`, and `test_server.py` contain
+their existing broad integration checks. Drafter and speculative-decoding tests
+belong in `test_speculative.py`: reuse its tiny target/config factories and
+parameterize shared contracts with descriptive family IDs. It also owns the
+Apodex MTP splitter and MiniMax speculative rollback checks; unrelated model
+tests remain in their existing modules.
 
 ## JSON model cases
 
@@ -144,7 +148,7 @@ These files retain separate execution boundaries:
   fixture and is the documented entry point for official-reference parity.
 - `test_nemotron_voicechat_dependency_floor.py` checks the dependency floor in a
   fresh interpreter and supports direct script execution.
-- `test_gemma4_assistant_masks_static.py` loads mask code with fake dependencies
+- `test_speculative_masks_static.py` loads mask code with fake dependencies
   without importing MLX in the test module.
 - `test_smoke.py` is the manual model-download runner and is excluded from CI's
   automated suite.
