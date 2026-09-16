@@ -3479,9 +3479,7 @@ class TestModels(unittest.TestCase):
 
         from mlx_vlm.models.cache import CacheList, KVCache
         from mlx_vlm.models.glm_moe_dsa.language import GlmMoeDsaMTP
-        from mlx_vlm.speculative.drafters.glm_moe_dsa_mtp import (
-            GlmMoeDsaMTPDraftModel,
-        )
+        from mlx_vlm.speculative.drafters.glm_moe_dsa_mtp import GlmMoeDsaMTPDraftModel
         from mlx_vlm.speculative.drafters.glm_moe_dsa_mtp import (
             ModelConfig as GlmMoeDsaMTPConfig,
         )
