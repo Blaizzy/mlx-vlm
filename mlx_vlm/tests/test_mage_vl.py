@@ -1,4 +1,4 @@
-"""Mage-VL frame sampling, prompt ordering, and image-path video regressions."""
+"""Mage VL video processing and position handling."""
 
 import json
 from unittest.mock import patch
@@ -13,7 +13,7 @@ from transformers import AutoProcessor, PreTrainedTokenizerFast
 
 from mlx_vlm.generate.video import processor_handles_video
 from mlx_vlm.models.mage_vl.config import ModelConfig, TextConfig, VisionConfig
-from mlx_vlm.models.mage_vl.mage_vl import Model
+from mlx_vlm.models.mage_vl.mage_vl import Model, _as_grid_list
 from mlx_vlm.models.mage_vl.processing_mage_vl import (
     IMAGE_PAD,
     VIDEO_PAD,
@@ -24,6 +24,8 @@ from mlx_vlm.models.mage_vl.processing_mage_vl import (
 from mlx_vlm.models.mage_vl.vision import build_cu_seqlens
 from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
 from mlx_vlm.utils import VideoMetadata, prepare_inputs, resolve_video_sampling
+
+# Video processing
 
 VIDEO_BLOCK = VISION_START + VIDEO_PAD + VISION_END
 IMAGE_BLOCK = VISION_START + IMAGE_PAD + VISION_END
@@ -211,3 +213,13 @@ def test_mixed_video_pixels_affect_only_their_visual_embeddings(processor):
         np.array(a)[0, visual_indices[1:]], np.array(b)[0, visual_indices[1:]]
     )
     assert mx.all(mx.isfinite(a)).item() and mx.all(mx.isfinite(b)).item()
+
+
+# Position embedding sanitization
+
+
+@pytest.mark.parametrize(
+    "raw", [np.array([[1, 4, 4]]), [[1, 4, 4]], np.array([1, 4, 4])]
+)
+def test_grid_coercion_accepts_processor_shapes(raw):
+    assert _as_grid_list(raw) == [(1, 4, 4)]

@@ -32,7 +32,7 @@ from mlx_vlm.speculative.drafters.glm5_next_mtp import (
 )
 from mlx_vlm.speculative.eagle3 import _eagle3_rounds, _eagle3_rounds_batch
 from mlx_vlm.speculative.mtp import _mtp_rounds, _mtp_rounds_batch, _mtp_verify_target
-from mlx_vlm.tests.test_qwen4_mtp import _tiny_text_config
+from mlx_vlm.tests.test_qwen4_exp import _tiny_text_config
 from mlx_vlm.tests.test_speculative import (
     _tiny_deepseek_v4_config,
     _tiny_glm5_next_text_config,

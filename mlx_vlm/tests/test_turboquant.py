@@ -1,15 +1,24 @@
+"""TurboQuant cache integration, batched attention, and value kernels."""
+
 import mlx.core as mx
 import pytest
 
+import mlx_vlm.turboquant as tq
 from mlx_vlm.generate import maybe_quantize_kv_cache
-from mlx_vlm.models.base import scaled_dot_product_attention
+from mlx_vlm.models.base import (
+    _turboquant_attention_applies,
+    scaled_dot_product_attention,
+)
 from mlx_vlm.models.cache import ArraysCache, KVCache
 from mlx_vlm.turboquant import (
     BatchTurboQuantKVCache,
     TurboQuantKVCache,
+    _TurboQuantMSECodec,
     _TurboQuantProdCodec,
     resolve_kv_bits,
 )
+
+# Cache codecs and integration
 
 
 def _sample_unit_vectors(count: int, dim: int) -> mx.array:
@@ -450,3 +459,160 @@ def test_hybrid_cache_trims_fractional_turboquant_tensor():
     deq_keys, deq_values = cache.dequantize()
     assert deq_keys.shape[-2] == 15
     assert deq_values.shape[-2] == 15
+
+
+# Batched attention
+
+H, D = 4, 64  # kv heads, head_dim
+BITS = 4
+SCALE = D**-0.5
+
+
+def _rand_kv(batch, seq_len, heads=H):
+    k = mx.random.normal((batch, heads, seq_len, D))
+    v = mx.random.normal((batch, heads, seq_len, D))
+    return k, v
+
+
+def _filled(left_padding, seq_len, batch=None, bits=BITS):
+    batch = len(left_padding) if batch is None else batch
+    cache = BatchTurboQuantKVCache(left_padding, bits=bits)
+    keys, values = cache.update_and_fetch(*_rand_kv(batch, seq_len))
+    return cache, keys, values
+
+
+class TestFusedPathGuard:
+    def test_cached_eligibility_tracks_batch_lifecycle(self):
+        cache = BatchTurboQuantKVCache([0], bits=BITS)
+        other = BatchTurboQuantKVCache([0], bits=BITS)
+        assert cache.fused_attention_eligible
+
+        cache.extend(other)
+        assert not cache.fused_attention_eligible
+        assert not _turboquant_attention_applies(cache)
+
+        cache.filter(mx.array([0]))
+        assert cache.fused_attention_eligible
+        assert _turboquant_attention_applies(cache)
+
+        cache.state = BatchTurboQuantKVCache([2], bits=BITS).state
+        assert not cache.fused_attention_eligible
+        assert not _turboquant_attention_applies(cache)
+
+
+class TestNumericalEquivalence:
+    """The fused path must agree with the dequantizing fallback."""
+
+    def _reference(self, cache, queries, keys, values, mask=None):
+        dq_k, dq_v = cache.dequantize(keys, values)
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            dq_k.astype(queries.dtype),
+            dq_v.astype(queries.dtype),
+            scale=SCALE,
+            mask=mask,
+        )
+
+    def test_multi_row_still_produces_correct_shape(self):
+        cache, keys, values = _filled([0, 0], 12)
+        queries = mx.random.normal((2, H, 1, D))
+        out = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=SCALE, mask=None
+        )
+        mx.eval(out)
+        assert out.shape == (2, H, 1, D)
+
+
+class TestDecodeMemoryIsFlat:
+    """Regression guard for the bug this change fixes.
+
+    The dequantizing fallback materialised the whole KV cache as float32 on
+    every step, so peak memory scaled with the context length. The fused path
+    reads the quantized state in place.
+    """
+
+    def _peak_delta_for(self, seq_len):
+        cache, keys, values = _filled([0], seq_len)
+        queries = mx.random.normal((1, H, 1, D))
+        mx.eval(cache.keys, cache.values, queries)
+        mx.clear_cache()
+
+        before = mx.get_peak_memory()
+        out = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=SCALE, mask=None
+        )
+        mx.eval(out)
+        return mx.get_peak_memory() - before
+
+    def test_peak_does_not_scale_with_context(self):
+        short = self._peak_delta_for(256)
+        long = self._peak_delta_for(4096)
+        # 16x the context. Dequantizing would grow the step's peak roughly in
+        # step with it; the fused kernels keep it bounded.
+        assert long <= max(short, 1 << 20) * 4
+
+
+# Rotated value kernels
+
+
+def _codec_and_state(dim: int, bits: int, n_heads: int, n_tokens: int, seed: int):
+    mx.random.seed(seed)
+    values = mx.random.normal((1, n_heads, n_tokens, dim))
+    codec = _TurboQuantMSECodec(dim, bits, seed=seed)
+    return codec, codec.quantize(values)
+
+
+def _dequant_weighted_sum(codec, state, weights):
+    """Math ground truth: weighted sum over the codec's own dequantized values."""
+    deq = codec.dequantize(state)  # (1, H, T, D)
+    return mx.einsum("bhmlt,bhtd->bhmld", weights, deq)
+
+
+@pytest.mark.parametrize("dim", [64, 128, 256])
+@pytest.mark.parametrize("bits", [2, 3, 4, 8])
+@pytest.mark.parametrize("n_repeats", [1, 4])
+def test_rht_weighted_sum_matches_einsum_and_dequant(dim, bits, n_repeats, monkeypatch):
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+
+    n_heads, n_tokens = 2, 24
+    codec, state = _codec_and_state(dim, bits, n_heads, n_tokens, seed=0)
+    # power-of-2 dim -> the RHT path that #1244 disabled for these kernels
+    assert codec.use_rht is True
+
+    weights = mx.softmax(
+        mx.random.normal((1, n_heads, n_repeats, 1, n_tokens)), axis=-1
+    )
+
+    kernel_out = codec.weighted_sum(weights, state)  # Metal -> RHT kernel fast path
+    truth = _dequant_weighted_sum(codec, state, weights)
+
+    # Force the einsum fallback by hiding Metal, then compare paths.
+    monkeypatch.setattr(tq, "_metal_available", lambda: False)
+    einsum_out = codec.weighted_sum(weights, state)
+
+    assert kernel_out.shape == einsum_out.shape == truth.shape
+    assert mx.max(mx.abs(kernel_out - einsum_out)).item() < 1e-4
+    assert mx.max(mx.abs(kernel_out - truth)).item() < 1e-3
+
+
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("bits", [3, 4])
+def test_rht_weighted_sum_stats_matches_einsum(dim, bits, monkeypatch):
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+
+    n_heads, n_repeats, n_tokens = 2, 4, 24
+    codec, state = _codec_and_state(dim, bits, n_heads, n_tokens, seed=1)
+    assert codec.use_rht is True
+
+    scores = mx.random.normal((1, n_heads, n_repeats, 1, n_tokens))
+
+    out_k, denom_k, max_k = codec.weighted_sum_stats_from_scores(scores, state)
+
+    monkeypatch.setattr(tq, "_metal_available", lambda: False)
+    out_e, denom_e, max_e = codec.weighted_sum_stats_from_scores(scores, state)
+
+    assert mx.max(mx.abs(out_k - out_e)).item() < 1e-4
+    assert mx.max(mx.abs(denom_k - denom_e)).item() < 1e-4
+    assert mx.max(mx.abs(max_k - max_e)).item() < 1e-4

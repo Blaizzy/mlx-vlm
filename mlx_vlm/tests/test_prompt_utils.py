@@ -1,6 +1,9 @@
-"""Tests for prompt_utils module, specifically multimodal content handling."""
+"""Prompt construction and reasoning-template arguments."""
 
 from mlx_vlm.prompt_utils import apply_chat_template, extract_text_from_content
+from mlx_vlm.server.generation import GenerationArguments
+
+# Prompt construction
 
 
 def _assistant_tool_call(content):
@@ -318,3 +321,13 @@ class TestModelSpecificPromptContracts:
         assert result[0]["role"] == "user"
         assert [item["type"] for item in result[0]["content"]] == ["image_url", "text"]
         assert result[0]["content"][1]["text"] == "Describe this image."
+
+
+# Reasoning-template arguments
+
+
+def test_no_reasoning_strength_when_effort_unset():
+    kw = GenerationArguments(enable_thinking=True, reasoning=True).to_template_kwargs()
+
+    assert "reasoning_strength" not in kw
+    assert "reasoning_effort" not in kw

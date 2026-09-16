@@ -1,20 +1,107 @@
-"""Ragged-decode fallbacks when a GPU rejects the kernels' 1024-thread launch.
+"""Qwen3.5 weight sanitization and ragged attention fallbacks."""
 
-``_qwen3_5_ragged_decode_attention`` dispatches the one-pass kernel and the
-second pass of the two-pass plan with a fixed 1024 threads. Metal caps threads
-per compiled *pipeline* rather than per device, so on some parts that launch is
-illegal (observed at ``D_SIZE == 256`` on applegpu_g14d, where the pass-2
-pipeline tops out at 896) and raises. Whether it happens is a property of the
-GPU, so these tests inject the rejection rather than depending on the hardware:
-they pin that a rejected launch degrades one step instead of propagating, that
-the verdict is only probed once, and that nothing changes where the launch is
-legal.
-"""
+from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
 
 from mlx_vlm.models.qwen3_5 import language as lang
+from mlx_vlm.models.qwen3_5.config import ModelConfig, TextConfig, VisionConfig
+from mlx_vlm.models.qwen3_5.qwen3_5 import Model
+from mlx_vlm.models.qwen3_5_moe.qwen3_5_moe import Model as MoEModel
+
+# Patch embedding layouts
+
+PATCH_EMBED_KEY = "model.visual.patch_embed.proj.weight"
+SANITIZED_KEY = "vision_tower.patch_embed.proj.weight"
+
+
+def _tiny_model(in_channels=3, temporal_patch_size=2, patch_size=4, hidden_size=8):
+    text_config = TextConfig(
+        model_type="qwen3_5_text",
+        hidden_size=32,
+        intermediate_size=64,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=4,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        rms_norm_eps=1e-6,
+        vocab_size=64,
+        num_key_value_heads=1,
+        max_position_embeddings=128,
+        full_attention_interval=2,
+        head_dim=16,
+    )
+    vision_config = VisionConfig(
+        model_type="qwen3_5",
+        depth=1,
+        hidden_size=hidden_size,
+        intermediate_size=16,
+        out_hidden_size=32,
+        num_heads=1,
+        in_channels=in_channels,
+        patch_size=patch_size,
+        temporal_patch_size=temporal_patch_size,
+        spatial_merge_size=1,
+        num_position_embeddings=4,
+    )
+    config = ModelConfig(
+        text_config=text_config, vision_config=vision_config, model_type="qwen3_5"
+    )
+    return Model(config), vision_config
+
+
+def test_patch_embed_is_transposed_from_ncdhw_to_ndhwc():
+    """Qwen3.8 stores the Conv3d patch embed as NCDHW; MLX expects NDHWC."""
+    model, vision_config = _tiny_model()
+    expected = model.vision_tower.patch_embed.proj.weight.shape
+
+    ncdhw = mx.zeros(
+        (
+            vision_config.hidden_size,
+            vision_config.in_channels,
+            vision_config.temporal_patch_size,
+            vision_config.patch_size,
+            vision_config.patch_size,
+        ),
+        dtype=mx.bfloat16,
+    )
+    sanitized = model.sanitize({PATCH_EMBED_KEY: ncdhw})
+
+    assert sanitized[SANITIZED_KEY].shape == expected
+
+
+# MTP shard sanitization
+
+
+def _model_for_sanitize(model_class):
+    model = model_class.__new__(model_class)
+    model.config = SimpleNamespace(
+        text_config=SimpleNamespace(tie_word_embeddings=False, num_hidden_layers=0)
+    )
+    return model
+
+
+def _weights_with_draft_shard():
+    return {
+        "language_model.model.layers.0.input_layernorm.weight": mx.array([2.0]),
+        "language_model.mtp.layers.0.input_layernorm.weight": mx.array([1.0]),
+    }
+
+
+def test_moe_qwen_mtp_shard_does_not_shift_base_norm_weights():
+    weights = _model_for_sanitize(MoEModel).sanitize(_weights_with_draft_shard())
+
+    assert weights["language_model.model.layers.0.input_layernorm.weight"].tolist() == [
+        2.0
+    ]
+    assert not any("mtp." in key for key in weights)
+
+
+# Ragged decode launch fallbacks
 
 # Qwen3.5-4B text config, whose head_dim=256 is what makes the pass-2 pipeline
 # expensive enough to lose threads on an affected GPU.
@@ -31,12 +118,12 @@ REJECTION = ValueError(
     "threadgroup (896)."
 )
 
-pytestmark = pytest.mark.skipif(
+_RAGGED_SDPA_ONLY = pytest.mark.skipif(
     not mx.metal.is_available(), reason="ragged decode is a Metal-only fast path"
 )
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def clear_launchability_cache():
     """The cache is process-global; keep verdicts from leaking between tests."""
     lang._QWEN3_5_SDPA_LAUNCHABLE.clear()
@@ -101,6 +188,8 @@ def reject(monkeypatch, factory_name, launches):
     monkeypatch.setattr(lang, factory_name, factory)
 
 
+@_RAGGED_SDPA_ONLY
+@pytest.mark.usefixtures("clear_launchability_cache")
 def test_rejected_two_pass_degrades_to_one_pass(monkeypatch):
     kv_len = two_pass_kv_len()
     if kv_len is None:
@@ -115,6 +204,8 @@ def test_rejected_two_pass_degrades_to_one_pass(monkeypatch):
     assert max_abs_diff(out, reference(queries, keys, values)) < TOLERANCE
 
 
+@_RAGGED_SDPA_ONLY
+@pytest.mark.usefixtures("clear_launchability_cache")
 def test_rejection_is_probed_once(monkeypatch):
     kv_len = two_pass_kv_len()
     if kv_len is None:
@@ -134,6 +225,8 @@ def test_rejection_is_probed_once(monkeypatch):
     ], "a rejected pipeline must be probed once and remembered, not retried per call"
 
 
+@_RAGGED_SDPA_ONLY
+@pytest.mark.usefixtures("clear_launchability_cache")
 @pytest.mark.parametrize("kv_len", [512, 2048])
 def test_launchable_pipelines_are_untouched(kv_len):
     queries, keys, values = inputs(kv_len)
