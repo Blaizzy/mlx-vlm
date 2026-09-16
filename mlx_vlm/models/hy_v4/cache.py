@@ -1,9 +1,15 @@
+from dataclasses import replace
+
 import mlx.core as mx
 
 from ..cache import KVCache
 
 
 class HyV4KVCache(KVCache):
+    def memory_profile(self, token_count):
+        profile = super().memory_profile(token_count)
+        return replace(profile, bytes_per_token=2 * profile.bytes_per_token)
+
     def update_and_fetch(self, keys, values):
         previous = self.offset
         required = previous + keys.shape[2]
