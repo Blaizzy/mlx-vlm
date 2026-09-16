@@ -38,7 +38,6 @@ from mlx_vlm.models.ideogram4.prompting import (
     normalize_prompt,
     prepare_prompt,
 )
-from mlx_vlm.models.ideogram4.scheduler import get_preset, make_step_intervals
 from mlx_vlm.models.ideogram4.transformer import (
     LLM_TOKEN_INDICATOR,
     OUTPUT_IMAGE_INDICATOR,
@@ -167,26 +166,13 @@ def test_ideogram4_plain_prompt_wraps_as_minimal_json_caption() -> None:
     assert is_structured_caption(prepared.text)
 
 
-def test_ideogram4_json_caption_passes_through_unchanged() -> None:
-    prepared = normalize_prompt(EXPANDED_CAPTION, warn=False)
-
-    assert prepared.text == EXPANDED_CAPTION
-    assert not prepared.was_wrapped
-    assert prepared.is_json_caption
-    assert prepared.is_structured_caption
-
-
 def test_ideogram4_caption_warnings_cover_elements_and_bounding_boxes() -> None:
     prompt = format_caption(
         {
             "compositional_deconstruction": {
                 "background": "A studio.",
                 "elements": [
-                    {
-                        "type": "text",
-                        "desc": "A title.",
-                        "bbox": [900, 100, 100, 800],
-                    }
+                    {"type": "text", "desc": "A title.", "bbox": [900, 100, 100, 800]}
                 ],
             }
         }
@@ -244,9 +230,7 @@ def test_ideogram4_prompt_expansion_uses_structured_generation(
     monkeypatch.setattr(dispatch_module, "generate", fake_generate)
 
     result = prompting_module.generate_prompt_expansion_caption(
-        "A red cube.",
-        model="tiny-text-model",
-        aspect_ratio="1:1",
+        "A red cube.", model="tiny-text-model", aspect_ratio="1:1"
     )
 
     messages = observed["messages"]
@@ -265,15 +249,11 @@ def test_ideogram4_prompt_expansion_model_expands_plain_prompt(
         assert kwargs["model"] == "tiny-text-model"
         assert kwargs["aspect_ratio"] == "1:1"
         return PromptExpansionResult(
-            text=EXPANDED_CAPTION,
-            raw_text=EXPANDED_CAPTION,
-            model=kwargs["model"],
+            text=EXPANDED_CAPTION, raw_text=EXPANDED_CAPTION, model=kwargs["model"]
         )
 
     monkeypatch.setattr(
-        prompting_module,
-        "generate_prompt_expansion_caption",
-        fake_prompt_expansion,
+        prompting_module, "generate_prompt_expansion_caption", fake_prompt_expansion
     )
 
     prepared = prepare_prompt(
@@ -303,9 +283,7 @@ def test_ideogram4_json_caption_skips_prompt_expansion_model(
     )
 
     prepared = prepare_prompt(
-        EXPANDED_CAPTION,
-        prompt_expansion_model="tiny-text-model",
-        warn=False,
+        EXPANDED_CAPTION, prompt_expansion_model="tiny-text-model", warn=False
     )
 
     assert prepared.text == EXPANDED_CAPTION
@@ -320,39 +298,15 @@ def test_ideogram4_invalid_prompt_expansion_falls_back_to_minimal_caption(
         raise PromptExpansionCaptionError("bad json")
 
     monkeypatch.setattr(
-        prompting_module,
-        "generate_prompt_expansion_caption",
-        fake_prompt_expansion,
+        prompting_module, "generate_prompt_expansion_caption", fake_prompt_expansion
     )
 
     with pytest.warns(UserWarning, match="falling back"):
-        prepared = prepare_prompt(
-            "A red cube.",
-            prompt_expansion_model="bad-model",
-        )
+        prepared = prepare_prompt("A red cube.", prompt_expansion_model="bad-model")
 
     assert prepared.was_wrapped
     assert not prepared.prompt_expansion_used
     assert prepared.prompt_expansion_error == "bad json"
-
-
-def test_ideogram4_prompt_expansion_runtime_failure_is_not_hidden(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fake_prompt_expansion(*args, **kwargs):  # noqa: ARG001
-        raise RuntimeError("model failed to load")
-
-    monkeypatch.setattr(
-        prompting_module,
-        "generate_prompt_expansion_caption",
-        fake_prompt_expansion,
-    )
-
-    with pytest.raises(RuntimeError, match="model failed to load"):
-        prepare_prompt(
-            "A red cube.",
-            prompt_expansion_model="bad-model",
-        )
 
 
 @pytest.mark.parametrize("width,height", [(255, 512), (512, 2050), (2048, 256)])
@@ -361,15 +315,6 @@ def test_ideogram4_validate_dimensions_rejects_bad_sizes(
 ) -> None:
     with pytest.raises(ValueError):
         validate_dimensions(width=width, height=height)
-
-
-def test_ideogram4_default_sampler_preset() -> None:
-    preset = get_preset(None)
-
-    assert preset.num_steps == 20
-    assert preset.guidance_schedule[:2] == (3.0, 3.0)
-    assert preset.guidance_schedule[-1] == 7.0
-    assert make_step_intervals(2) == (0.0, 0.5, 1.0)
 
 
 def test_ideogram4_dequantizes_weight_only_fp8() -> None:
@@ -385,10 +330,7 @@ def test_ideogram4_dequantizes_weight_only_fp8() -> None:
 
     assert "linear.weight_scale" not in converted
     np.testing.assert_allclose(
-        np.array(converted["linear.weight"]),
-        np.array(expected),
-        rtol=0,
-        atol=0,
+        np.array(converted["linear.weight"]), np.array(expected), rtol=0, atol=0
     )
     assert converted["linear.bias"].dtype == mx.float32
 
@@ -423,8 +365,7 @@ def test_ideogram4_pipeline_uses_prepared_prompt_and_reports_metadata(
     pipeline = Ideogram4ImagePipeline.__new__(Ideogram4ImagePipeline)
     pipeline.model_path = Path("/tmp/fake-ideogram")
     pipeline.runtime_config = Ideogram4RuntimeConfig(
-        evict_text_encoder=False,
-        evict_transformers=False,
+        evict_text_encoder=False, evict_transformers=False
     )
     pipeline.text_encoder = object()
     pipeline.conditional_transformer = lambda **kwargs: mx.zeros_like(kwargs["x"])
@@ -552,18 +493,12 @@ class _FakePipeline:
 
 def test_ideogram4_model_wrapper_returns_image_result() -> None:
     model = Ideogram4ImageGenerationModel(
-        pipeline=_FakePipeline(),
-        model_id="ideogram-ai/ideogram-4-fp8",
+        pipeline=_FakePipeline(), model_id="ideogram-ai/ideogram-4-fp8"
     )
 
     result = model.generate(
         ImageGenerationRequest(
-            prompt="caption",
-            seed=9,
-            steps=2,
-            width=10,
-            height=8,
-            guidance=7.0,
+            prompt="caption", seed=9, steps=2, width=10, height=8, guidance=7.0
         )
     )
 

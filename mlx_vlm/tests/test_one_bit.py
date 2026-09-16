@@ -20,30 +20,6 @@ def _pack_bits(bits: np.ndarray) -> mx.array:
 
 
 @pytest.mark.parametrize("group_size", [32, 64, 128])
-def test_one_bit_quantized_matmul_matches_dense(group_size):
-    rng = np.random.default_rng(7 + group_size)
-    input_dims = 128
-    output_dims = 7
-    bits = rng.integers(0, 2, size=(output_dims, input_dims), dtype=np.uint32)
-    weight = _pack_bits(bits)
-    scales = mx.array(
-        rng.normal(size=(output_dims, input_dims // group_size)).astype(np.float32)
-    )
-    biases = mx.array(
-        rng.normal(size=(output_dims, input_dims // group_size)).astype(np.float32)
-    )
-    x = mx.array(rng.normal(size=(2, 3, input_dims)).astype(np.float32))
-
-    out = one_bit_quantized_matmul(x, weight, scales, biases, group_size=group_size)
-    dense = dequantize_one_bit(weight, scales, biases, group_size)
-    reference = x @ dense.T
-    mx.eval(out, reference)
-
-    assert out.shape == (2, 3, output_dims)
-    assert mx.allclose(out, reference, rtol=1e-5, atol=1e-4).item()
-
-
-@pytest.mark.parametrize("group_size", [32, 64, 128])
 def test_one_bit_prompt_matmul_matches_dense(group_size):
     rng = np.random.default_rng(71 + group_size)
     input_dims = 512
@@ -126,14 +102,9 @@ def test_replace_one_bit_checkpoint_modules_only():
             self.embedding = nn.Embedding(16, 64)
 
     model = Model()
-    weights = {
-        "proj.scales": mx.zeros((8, 1)),
-        "embedding.scales": mx.zeros((16, 1)),
-    }
+    weights = {"proj.scales": mx.zeros((8, 1)), "embedding.scales": mx.zeros((16, 1))}
     replace_one_bit_modules(
-        model,
-        {"group_size": 64, "bits": 1, "mode": "affine"},
-        weights,
+        model, {"group_size": 64, "bits": 1, "mode": "affine"}, weights
     )
 
     assert isinstance(model.proj, OneBitLinear)

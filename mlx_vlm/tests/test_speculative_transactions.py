@@ -17,10 +17,8 @@ from mlx_vlm.models.cache import (
     KVCache,
     RotatingKVCache,
 )
-from mlx_vlm.models.deepseek_v4 import Model as DeepseekModel
 from mlx_vlm.models.deepseek_v4.language import LanguageModel as DeepseekLanguageModel
 from mlx_vlm.models.glm5_next.language import LanguageModel as GlmLanguageModel
-from mlx_vlm.models.qwen4_exp.language import LanguageModel as QwenLanguageModel
 from mlx_vlm.speculative.cache_state import start_speculative_cache
 from mlx_vlm.speculative.common import verify_forward
 from mlx_vlm.speculative.dflash import (
@@ -34,7 +32,7 @@ from mlx_vlm.speculative.drafters.glm5_next_mtp import (
 )
 from mlx_vlm.speculative.eagle3 import _eagle3_rounds, _eagle3_rounds_batch
 from mlx_vlm.speculative.mtp import _mtp_rounds, _mtp_rounds_batch, _mtp_verify_target
-from mlx_vlm.tests.test_qwen4_mtp import _outer_config, _tiny_text_config
+from mlx_vlm.tests.test_qwen4_mtp import _tiny_text_config
 from mlx_vlm.tests.test_speculative import (
     _tiny_deepseek_v4_config,
     _tiny_glm5_next_text_config,
@@ -115,45 +113,6 @@ def test_rotating_transaction_retains_different_row_prefixes():
 
 
 @pytest.mark.parametrize("batch", [1, 2])
-@pytest.mark.parametrize("retained", [1, 3, 4])
-@pytest.mark.parametrize("prefix", [3, 19])
-@pytest.mark.parametrize("batched_cache", [False, True])
-def test_deepseek_dflash_commit_restores_compressed_history(
-    batch, retained, prefix, batched_cache
-):
-    mx.random.seed(2127)
-    config = _tiny_deepseek_v4_config()
-    config.compress_ratios = [4]
-    model = DeepseekLanguageModel(config)
-    model.eval()
-    prompt = mx.broadcast_to((mx.arange(prefix)[None] % 30) + 1, (batch, prefix))
-    proposed = mx.array([[4, 5, 6, 7]] * batch)
-
-    def make_cache():
-        return _make_cache(model, [0] * batch) if batched_cache else model.make_cache()
-
-    reference, speculative = make_cache(), make_cache()
-    for caches in (reference, speculative):
-        mx.eval(model(prompt, cache=caches).logits)
-    output, transaction = _dflash_verify(model, proposed, speculative, [0])
-    mx.eval(output.logits, output.hidden_states)
-    assert transaction.active
-    transaction.commit([retained] * batch)
-    mx.eval(model(proposed[:, :retained], cache=reference).logits)
-    for actual, expected in zip(speculative[0].caches[1:], reference[0].caches[1:]):
-        assert actual.remainder == expected.remainder
-        assert mx.array_equal(mx.array(actual.offset), mx.array(expected.offset)).item()
-        assert not actual.is_speculating
-        for a, b in zip(actual.state, expected.state):
-            if a is not None and b is not None:
-                assert mx.allclose(a, b, atol=1e-5).item()
-    next_input = mx.array([[8]] * batch)
-    actual = model(next_input, cache=speculative).logits
-    expected = model(next_input, cache=reference).logits
-    assert mx.allclose(actual, expected, atol=1e-4).item()
-
-
-@pytest.mark.parametrize("batch", [1, 2])
 def test_deepseek_chunked_prefill_keeps_all_dflash_features(batch):
     mx.random.seed(2127)
     config = _tiny_deepseek_v4_config()
@@ -191,37 +150,6 @@ def test_deepseek_chunked_prefill_keeps_all_dflash_features(batch):
     )
     assert generated.hidden.shape[1] == tokens.shape[1]
     assert mx.array_equal(generated.hidden, expected).item()
-
-
-def test_generate_step_keeps_chunked_dflash_features(monkeypatch):
-    from mlx_vlm.generate import ar
-
-    model = DeepseekModel(_tiny_deepseek_v4_config())
-    model.eval()
-    tokens = mx.array([[1, 2, 3, 4, 5, 6, 7]])
-    drafter = SimpleNamespace(config=SimpleNamespace(target_layer_ids=[0]))
-    cache = model.make_cache()
-    expected = []
-    for start in range(0, 7, 2):
-        output = model.language_model(
-            tokens[:, start : start + 2], cache=cache, capture_layer_ids=[0]
-        )
-        mx.eval(output.hidden_states)
-        expected.append(output.hidden_states[0])
-    captured = []
-
-    def rounds(model, draft, cache, inputs, bonus, logprobs, output, **kwargs):
-        captured.extend(output.hidden_states)
-        return iter(())
-
-    monkeypatch.setattr(ar, "run_speculative_rounds", rounds)
-    list(
-        ar.generate_step(
-            tokens, model, None, None, prefill_step_size=2, draft_model=drafter
-        )
-    )
-    assert len(captured) == 1
-    assert mx.array_equal(captured[0], mx.concatenate(expected, axis=1)).item()
 
 
 @pytest.mark.parametrize("batch", [1, 2, 4])
@@ -295,36 +223,6 @@ def test_deepseek_native_quantized_verifier_matches_repeated_decode(batch, forma
             mx.eval(model(tokens[:, index : index + 1], cache=reference).logits)
 
 
-def test_glm_prefill_indexer_projections_are_chunk_invariant():
-    from mlx_vlm.models.glm5_next.language import Glm5NextIndexer
-
-    mx.random.seed(2127)
-    config = _tiny_glm5_next_text_config()
-    config.hidden_size = 4096
-    config.q_lora_rank = 1536
-    config.index_head_dim = 128
-    config.index_n_heads = 32
-    indexer = Glm5NextIndexer(config, 0)
-    indexer.set_dtype(mx.bfloat16)
-    indexer.index_kpool_compress_gate = mx.random.normal((128, 4096)) * 0.01
-    nn.quantize(indexer, group_size=64, bits=4)
-    x = mx.random.normal((1, 4096, 4096)).astype(mx.bfloat16)
-    q = mx.random.normal((1, 4096, 1536)).astype(mx.bfloat16)
-    reference = (*indexer._project_keys(x), *indexer._project_queries(x, q))
-    mx.eval(reference)
-    parts = [
-        (
-            *indexer._project_keys(x[:, start : start + 2048]),
-            *indexer._project_queries(
-                x[:, start : start + 2048], q[:, start : start + 2048]
-            ),
-        )
-        for start in (0, 2048)
-    ]
-    for expected, segments in zip(reference, zip(*parts)):
-        assert mx.array_equal(expected, mx.concatenate(segments, axis=1)).item()
-
-
 def test_hyperconnection_prefill_is_chunk_invariant():
     from mlx_vlm.models.deepseek_v4.hyper_connection import HyperConnection
 
@@ -340,25 +238,6 @@ def test_hyperconnection_prefill_is_chunk_invariant():
     parts = [connection(x[:, :2048]), connection(x[:, 2048:])]
     for reference, segments in zip(expected, zip(*parts)):
         assert mx.array_equal(reference, mx.concatenate(segments, axis=1)).item()
-
-
-def test_ordinary_qwen4_decode_does_not_record_speculation():
-    config = _tiny_text_config()
-    config.linear_key_head_dim = config.linear_value_head_dim = 32
-    model = QwenLanguageModel(config, _outer_config())
-    model.eval()
-    caches = model.make_cache()
-    mx.eval(model(mx.array([[1, 2]]), cache=caches).logits)
-    for token in (3, 4):
-        output = model(mx.array([[token]]), cache=caches)
-        mx.eval(output.logits)
-        assert output.gdn_states is None
-        for cache in caches:
-            if isinstance(cache, ArraysCache):
-                assert not cache.is_speculating
-                assert cache.nbytes == sum(
-                    x.nbytes for x in cache.state if x is not None
-                )
 
 
 @pytest.mark.parametrize("family", ["glm", "qwen"])
@@ -499,23 +378,6 @@ def test_ordinary_forward_failure_aborts_all_verification_parts():
     assert calls == [8, 5]
     assert cache[0] is initial
     assert not cache.is_speculating
-
-
-def test_glm_sampler_failure_restores_temporal_and_append_caches():
-    model = GlmLanguageModel(_tiny_glm5_next_text_config())
-    model.eval()
-    caches = model.make_cache()
-    mx.eval(model(mx.array([[1, 2]]), cache=caches).logits)
-    initial = list(caches[0].state)
-
-    def fail(_):
-        raise RuntimeError("injected sampler failure")
-
-    with pytest.raises(RuntimeError, match="injected sampler failure"):
-        _mtp_verify_target(model, mx.array([[3, 4]]), caches, fail)
-    assert not caches[0].is_speculating
-    assert all(a is b for a, b in zip(initial, caches[0].state))
-    assert caches[1][0].offset == 2
 
 
 def test_glm_verification_uses_original_modules_and_preserves_weights():

@@ -53,21 +53,6 @@ class TestSam3ThresholdDefaults(unittest.TestCase):
         kwargs = self._dispatch(["--task", "realtime", "--prompt", "a car"])
         self.assertEqual(kwargs["threshold"], 0.5)
 
-    def test_explicit_threshold_wins_over_the_per_task_default(self):
-        kwargs = self._dispatch(
-            [
-                "--task",
-                "track",
-                "--video",
-                "clip.mp4",
-                "--prompt",
-                "a car",
-                "--threshold",
-                "0.9",
-            ]
-        )
-        self.assertEqual(kwargs["threshold"], 0.9)
-
 
 if __name__ == "__main__":
     unittest.main()

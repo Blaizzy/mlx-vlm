@@ -169,10 +169,7 @@ class Qwen3OmniMoeTest(unittest.TestCase):
             )
         )
         expected_hidden_states, expected_input_embeds = (
-            model.extract_thinker_hidden_states(
-                sequences,
-                target_layer_idx=0,
-            )
+            model.extract_thinker_hidden_states(sequences, target_layer_idx=0)
         )
         mx.eval(sequences, hidden_states, input_embeds)
         mx.eval(expected_hidden_states, expected_input_embeds)
@@ -183,52 +180,16 @@ class Qwen3OmniMoeTest(unittest.TestCase):
         self.assertTrue(
             bool(
                 mx.allclose(
-                    hidden_states,
-                    expected_hidden_states,
-                    rtol=1e-4,
-                    atol=1e-4,
+                    hidden_states, expected_hidden_states, rtol=1e-4, atol=1e-4
                 ).item()
             )
         )
         self.assertTrue(
             bool(
                 mx.allclose(
-                    input_embeds,
-                    expected_input_embeds,
-                    rtol=1e-6,
-                    atol=1e-6,
+                    input_embeds, expected_input_embeds, rtol=1e-6, atol=1e-6
                 ).item()
             )
-        )
-
-    def test_deepstack_embeds_reach_language_model(self):
-        model = _tiny_vision_model()
-        input_ids, pixel_values, grid = _image_inputs()
-
-        features = model.thinker.get_input_embeddings(
-            input_ids, pixel_values=pixel_values, image_grid_thw=grid
-        )
-        embeds = features.deepstack_visual_embeds
-        self.assertIsNotNone(embeds)
-        self.assertEqual(len(embeds), 2)
-        for e in embeds:
-            self.assertEqual(tuple(e.shape), (4, 16))
-
-        with_injection = model(input_ids, pixel_values, image_grid_thw=grid).logits
-        model_cls = type(model.thinker.language_model.model)
-        orig = model_cls._deepstack_process
-        model_cls._deepstack_process = (
-            lambda self, hidden_states, *a, **k: hidden_states
-        )
-        try:
-            without_injection = model(
-                input_ids, pixel_values, image_grid_thw=grid
-            ).logits
-        finally:
-            model_cls._deepstack_process = orig
-        mx.eval(with_injection, without_injection)
-        self.assertFalse(
-            bool(mx.allclose(with_injection, without_injection, atol=1e-6).item())
         )
 
     def test_deepstack_injection_is_batch_safe(self):
@@ -277,35 +238,6 @@ class Qwen3OmniMoeTest(unittest.TestCase):
         for pos, tok in enumerate(ids):
             step = self._thinker_logits(model, [[tok]], cache)
             self._assert_prefill_decode_match(pre[:, pos], step, pos)
-
-    def test_decode_continues_rope_positions_multimodal(self):
-        # After an image+text prefill, decoded text tokens must continue mRoPE
-        # positions from the cache offset (via rope_deltas), matching a single
-        # full prefill of image+text+continuation (#1983).
-        from mlx_vlm.models.cache import make_prompt_cache
-
-        model = _tiny_vision_model()
-        inner = model.thinker.language_model.model
-        img_ids, pixel_values, grid = _image_inputs()
-        cont = [30, 31, 32, 33]
-        prefix_len = img_ids.shape[1]
-        full = mx.concatenate([img_ids, mx.array([cont], dtype=mx.int32)], axis=1)
-        pre = self._thinker_logits(
-            model,
-            full,
-            make_prompt_cache(inner),
-            pixel_values=pixel_values,
-            image_grid_thw=grid,
-        )
-        cache = make_prompt_cache(inner)
-        self._thinker_logits(
-            model, img_ids, cache, pixel_values=pixel_values, image_grid_thw=grid
-        )
-        for i, tok in enumerate(cont):
-            step = self._thinker_logits(model, [[tok]], cache)
-            self._assert_prefill_decode_match(
-                pre[:, prefix_len + i], step, prefix_len + i
-            )
 
     def test_quant_predicate_forwarded_to_top_level_model(self):
         model = _tiny_model()

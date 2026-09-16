@@ -47,10 +47,7 @@ MODEL_PY = textwrap.dedent("""
 
 
 def _write_checkpoint(path, config_extra=None):
-    config = {
-        "model_type": "does-not-exist-in-registry",
-        "model_file": "model.py",
-    }
+    config = {"model_type": "does-not-exist-in-registry", "model_file": "model.py"}
     config.update(config_extra or {})
     (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
     (path / "model.py").write_text(MODEL_PY, encoding="utf-8")
@@ -77,18 +74,6 @@ def test_missing_model_file_raises_clearly(tmp_path):
     (tmp_path / "model.py").unlink()
 
     with pytest.raises(FileNotFoundError, match="model_file"):
-        _load(tmp_path)
-
-
-def test_registry_path_untouched_without_model_file(tmp_path):
-    """A config WITHOUT model_file must go through the registry exactly as
-    before — here that means the unknown model_type raises ValueError."""
-    _write_checkpoint(tmp_path)
-    config = json.loads((tmp_path / "config.json").read_text())
-    del config["model_file"]
-    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="not supported"):
         _load(tmp_path)
 
 

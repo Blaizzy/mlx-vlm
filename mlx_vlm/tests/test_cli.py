@@ -95,9 +95,7 @@ def test_chat_verbose_flag_uses_boolean_optional_action():
 def test_generate_verbose_flag_semantics():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--verbose",
-        action=argparse.BooleanOptionalAction,
-        default=False,
+        "--verbose", action=argparse.BooleanOptionalAction, default=False
     )
 
     assert parser.parse_args([]).verbose is False

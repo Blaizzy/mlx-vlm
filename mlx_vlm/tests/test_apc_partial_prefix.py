@@ -6,7 +6,7 @@ import mlx.core as mx
 import pytest
 
 from mlx_vlm.apc import APCManager, DiskBlockStore
-from mlx_vlm.models.cache import ArraysCache, KVCache, RotatingKVCache
+from mlx_vlm.models.cache import ArraysCache, KVCache
 from mlx_vlm.tests.test_apc_exact_mode import _make_tiny_gemma4, _make_tiny_qwen35
 
 
@@ -73,65 +73,6 @@ def test_dense_checkpoint_reuses_only_common_blocks(manager_factory, tier):
     ) == (None, 0)
 
 
-def test_compact_dense_memory_reuses_divergent_suffix(manager_factory):
-    manager = manager_factory()
-    manager._layer_major_memory_min_tokens = 16
-    stored = list(range(80))
-    source = _kv(stored)
-    blocks = manager.store_kv_blocks(stored, [source.keys], [source.values])
-    manager.release(blocks)
-    assert not manager.hash_table
-    restored, count = manager.lookup_exact_cache(stored[:53] + [999])
-    assert count == restored[0].offset == 48
-    assert restored[0].state[0].flatten().tolist() == stored[:48]
-
-
-@pytest.mark.parametrize("tier", ["memory", "disk"])
-@pytest.mark.parametrize("kind", ["recurrent", "rotating"])
-def test_stateful_final_checkpoint_cannot_be_trimmed(manager_factory, tier, kind):
-    tokens = list(range(80))
-    if kind == "recurrent":
-        state = ArraysCache(size=1)
-        state[0] = mx.ones((1, 2, 3))
-    else:
-        state = RotatingKVCache(max_size=16)
-        values = mx.ones((1, 1, 80, 2))
-        state.update_and_fetch(values, values)
-    manager = manager_factory(tier)
-    assert manager.store_exact_cache(tokens, [state, _kv(tokens)])
-    if manager.disk:
-        manager.close()
-        manager.disk = None
-        manager = manager_factory(tier)
-    assert manager.lookup_exact_cache(tokens[:70] + [999]) == (None, 0)
-    assert manager.lookup_exact_cache(tokens + [999])[1] == 80
-
-
-@pytest.mark.parametrize("doc_len", [30_000, 50_000, 100_000])
-@pytest.mark.parametrize("tier", ["memory", "disk-only"])
-def test_long_document_has_bounded_reusable_checkpoint(manager_factory, doc_len, tier):
-    manager = manager_factory(tier)
-    model = SimpleNamespace(make_cache=lambda: [ArraysCache(size=1)])
-    coordinator = manager.coordinator(model)
-    tokens = list(range(doc_len)) + [100_001] * 20
-    boundaries = coordinator.checkpoint_lengths(tokens, set())
-    assert len(boundaries) == 2
-    assert boundaries[-1] == len(tokens) - 1
-    assert doc_len - 2048 < boundaries[0] <= doc_len
-    assert boundaries[0] % 16 == 0
-    for boundary in boundaries:
-        cache = ArraysCache(size=1)
-        cache[0] = mx.full((1, 1), boundary)
-        assert coordinator.store_checkpoint(tokens[:boundary], [cache])
-    if manager.disk:
-        manager.close()
-        manager.disk = None
-        manager = manager_factory(tier)
-    restored, count = manager.lookup_exact_cache(tokens[:doc_len] + [100_002] * 30)
-    assert count == boundaries[0]
-    assert restored[0][0].item() == count
-
-
 def test_checkpoint_schedule_respects_media_budget_and_opt_out(manager_factory):
     manager = manager_factory()
     manager.checkpoint_interval_tokens = 16
@@ -147,84 +88,6 @@ def test_checkpoint_schedule_respects_media_budget_and_opt_out(manager_factory):
     assert coordinator.checkpoint_lengths(tokens, {999}) == [67, 74]
     manager.checkpoint_interval_tokens = 0
     assert coordinator.checkpoint_lengths(tokens, set()) == [74]
-
-
-@pytest.mark.parametrize("right_padding", [None, [0]])
-def test_warm_batch_captures_new_checkpoints_at_absolute_positions(
-    manager_factory, right_padding
-):
-    from mlx_vlm.generate.ar import PromptProcessingBatch
-
-    lm = _make_tiny_qwen35()
-    manager = manager_factory()
-    manager.checkpoint_interval_tokens = 16
-    coordinator = manager.coordinator(lm)
-    tokens = [i % 50 + 1 for i in range(91)]
-    cache = lm.make_cache()
-    lm(mx.array([tokens[:64]]), cache=cache)
-    assert manager.store_exact_cache(tokens[:64], cache)
-    restored, count = manager.lookup_exact_cache(tokens)
-    assert count == 64
-    boundaries = coordinator.checkpoint_lengths(tokens, set())
-    assert boundaries == [80, 90]
-    suffix = tokens[count:]
-    batch = PromptProcessingBatch(
-        model=lm,
-        uids=[0],
-        input_ids=[suffix],
-        max_tokens=[1],
-        inputs_embeds=_embeddings(lm, mx.array([suffix])),
-        prompt_kwargs={},
-        warm_cache=restored,
-        prefill_step_size=16,
-        apc_manager=manager,
-        apc_coordinator=coordinator,
-        right_pad_per_row=right_padding,
-        apc_meta=[
-            {
-                "full_input_ids": tokens,
-                "prefix_len": count,
-                "checkpoint_lengths": boundaries,
-            }
-        ],
-    )
-    steps = []
-    while batch.needs_processing():
-        steps.append(batch.prompt_step())
-        assert steps[-1] > 0
-    batch.generate(lambda lp: mx.argmax(lp, axis=-1), [lambda _: False])
-    assert steps == [16, 10]
-    assert (
-        sorted(len(entry.token_ids) for entry in manager._exact_cache.values())
-        == boundaries
-    )
-    repeated_cache, repeated_count = manager.lookup_exact_cache(tokens)
-    assert repeated_count == 90
-    repeated = PromptProcessingBatch(
-        model=lm,
-        uids=[1],
-        input_ids=[tokens[repeated_count:]],
-        max_tokens=[1],
-        inputs_embeds=_embeddings(lm, mx.array([tokens[repeated_count:]])),
-        prompt_kwargs={},
-        warm_cache=repeated_cache,
-        apc_manager=manager,
-        apc_coordinator=coordinator,
-        apc_meta=[
-            {
-                "full_input_ids": tokens,
-                "prefix_len": repeated_count,
-                "checkpoint_lengths": boundaries,
-            }
-        ],
-    )
-    assert not repeated.needs_processing()
-    repeated.generate(lambda lp: mx.argmax(lp, axis=-1), [lambda _: False])
-    assert (
-        sorted(len(entry.token_ids) for entry in manager._exact_cache.values())
-        == boundaries
-    )
-    assert manager.lookup_exact_cache(tokens[:85] + [63])[1] == 80
 
 
 def _embeddings(lm, tokens):

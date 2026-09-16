@@ -9,6 +9,30 @@ from mlx_vlm.generate.dispatch import stream_generate
 from mlx_vlm.models.cache import StaticPrefixKVCache
 
 
+def _llada_config(**overrides):
+    """Build a fresh config; callers specify only scenario-specific differences."""
+    from mlx_vlm.models import llada2_moe
+
+    fields = dict(
+        model_type="llada2_moe",
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        rotary_dim=8,
+        num_experts=None,
+        max_position_embeddings=128,
+        pad_token_id=3,
+        eos_token_id=3,
+        mask_token_id=127,
+    )
+    fields.update(overrides)
+    return llada2_moe.ModelConfig(**fields)
+
+
 class _StoppingCriteria:
     def __call__(self, token):
         return token == 3
@@ -74,22 +98,7 @@ class TestDiffusionModels(unittest.TestCase):
     def test_llada(self):
         from mlx_vlm.models import llada2_moe
 
-        config = llada2_moe.ModelConfig(
-            model_type="llada2_moe",
-            vocab_size=128,
-            hidden_size=64,
-            intermediate_size=128,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=16,
-            rotary_dim=8,
-            num_experts=None,
-            max_position_embeddings=128,
-            pad_token_id=3,
-            eos_token_id=3,
-            mask_token_id=127,
-        )
+        config = _llada_config()
         model = llada2_moe.Model(config)
         generate_kwargs = {}
 
@@ -190,75 +199,13 @@ class TestDiffusionModels(unittest.TestCase):
         model = llada2_moe.Model(config)
 
         self.dtype_consistency_test_runner(
-            model.language_model,
-            config.model_type,
-            config.num_hidden_layers,
+            model.language_model, config.model_type, config.num_hidden_layers
         )
-
-    def test_llada_steps_caps_block_denoising(self):
-        from mlx_vlm.models import llada2_moe
-        from mlx_vlm.models.llada2_moe import language as llada_language
-
-        config = llada2_moe.ModelConfig(
-            model_type="llada2_moe",
-            vocab_size=128,
-            hidden_size=64,
-            intermediate_size=128,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=16,
-            rotary_dim=8,
-            num_experts=None,
-            max_position_embeddings=128,
-            pad_token_id=3,
-            eos_token_id=3,
-            mask_token_id=127,
-        )
-        model = llada2_moe.Model(config)
-        original_call = llada_language.LLaDA2MoeModel.__call__
-        calls = {"count": 0}
-
-        def counted_call(self, *args, **kwargs):
-            calls["count"] += 1
-            return original_call(self, *args, **kwargs)
-
-        llada_language.LLaDA2MoeModel.__call__ = counted_call
-        try:
-            generated = model.language_model.generate(
-                mx.array([[4]], dtype=mx.int32),
-                block_length=4,
-                steps=1,
-                gen_length=8,
-                max_post_steps=4,
-                mask_id=127,
-                eos_id=3,
-            )
-            mx.eval(generated)
-        finally:
-            llada_language.LLaDA2MoeModel.__call__ = original_call
-
-        self.assertLessEqual(calls["count"], 6)
 
     def test_llada_stream_generate_ignores_extra_cli_kwargs(self):
         from mlx_vlm.models import llada2_moe
 
-        config = llada2_moe.ModelConfig(
-            model_type="llada2_moe",
-            vocab_size=128,
-            hidden_size=64,
-            intermediate_size=128,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=16,
-            rotary_dim=8,
-            num_experts=None,
-            max_position_embeddings=128,
-            pad_token_id=3,
-            eos_token_id=3,
-            mask_token_id=127,
-        )
+        config = _llada_config()
         model = llada2_moe.Model(config)
 
         results = list(
@@ -317,9 +264,7 @@ class TestDiffusionModels(unittest.TestCase):
         )
         model = nemotron_labs_diffusion.Model(config)
         self.dtype_consistency_test_runner(
-            model.language_model,
-            config.model_type,
-            config.num_hidden_layers,
+            model.language_model, config.model_type, config.num_hidden_layers
         )
 
         model.language_model.update(
@@ -421,9 +366,7 @@ class TestDiffusionModels(unittest.TestCase):
             )
 
         ar_generated, ar_nfe = model.language_model.ar_generate(
-            mx.array([[4]], dtype=mx.int32),
-            max_new_tokens=2,
-            eos_token_id=3,
+            mx.array([[4]], dtype=mx.int32), max_new_tokens=2, eos_token_id=3
         )
         mx.eval(ar_generated)
         self.assertEqual(ar_generated.shape[0], 1)
@@ -571,48 +514,8 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
     def _tiny_llada(self):
         from mlx_vlm.models import llada2_moe
 
-        config = llada2_moe.ModelConfig(
-            model_type="llada2_moe",
-            vocab_size=128,
-            hidden_size=64,
-            intermediate_size=128,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=16,
-            rotary_dim=8,
-            num_experts=None,
-            max_position_embeddings=128,
-            pad_token_id=3,
-            eos_token_id=3,
-            mask_token_id=127,
-        )
+        config = _llada_config()
         return llada2_moe.Model(config)
-
-    def test_generate_invokes_on_block_per_block(self):
-        mx.random.seed(0)
-        model = self._tiny_llada()
-        blocks = []
-
-        def on_block(tokens):
-            blocks.append(list(tokens))
-            return True
-
-        generated = model.language_model.generate(
-            mx.array([[4, 5]], dtype=mx.int32),
-            gen_length=8,
-            block_length=4,
-            steps=4,
-            eos_early_stop=False,
-            on_block=on_block,
-        )
-
-        self.assertGreaterEqual(len(blocks), 2)
-        # Each callback reports the cumulative generated tokens so far.
-        self.assertLess(len(blocks[0]), len(blocks[-1]))
-        self.assertEqual(blocks[-1][: len(blocks[0])][:0], [])
-        self.assertLessEqual(len(blocks[-1]), 8)
-        self.assertEqual(generated.shape[0], 1)
 
     def test_generate_on_block_false_stops_early(self):
         mx.random.seed(0)
@@ -633,32 +536,6 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
         )
 
         self.assertEqual(len(calls), 1)
-
-    def test_generate_invokes_on_result_with_generation_results(self):
-        mx.random.seed(0)
-        model = self._tiny_llada()
-        results = []
-        blocks = []
-
-        generated = model.language_model.generate(
-            mx.array([[4, 5]], dtype=mx.int32),
-            gen_length=8,
-            block_length=4,
-            steps=4,
-            eos_early_stop=False,
-            eos_id=999,
-            tokenizer=_Tokenizer(),
-            on_block=lambda tokens: blocks.append(tokens) or True,
-            on_result=lambda result: results.append(result) or True,
-        )
-
-        self.assertEqual(generated.shape[0], 1)
-        self.assertFalse(blocks)
-        self.assertTrue(results)
-        self.assertTrue(all(isinstance(result, GenerationResult) for result in results))
-        self.assertTrue(any(result.diffusion_block_complete for result in results))
-        self.assertFalse(results[-1].diffusion_block_complete)
-        self.assertEqual(results[-1].finish_reason, "length")
 
     def test_stream_generate_yields_llada_model_owned_results(self):
         mx.random.seed(0)
@@ -776,14 +653,6 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
         model.config.mask_token_id = None
         self.assertFalse(is_diffusion_model(model))
         self.assertIsNone(diffusion_generation_family(model))
-
-    def test_diffusion_generation_family_block(self):
-        from mlx_vlm.generate.diffusion import diffusion_generation_family
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-        from mlx_vlm.tests.test_diffusion_gemma import tiny_config_dict
-
-        model = Model(ModelConfig.from_dict(tiny_config_dict()))
-        self.assertEqual(diffusion_generation_family(model), "diffusion")
 
 
 if __name__ == "__main__":

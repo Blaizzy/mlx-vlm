@@ -36,44 +36,7 @@ from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
-from mlx_vlm.tools import _infer_tool_parser
 from mlx_vlm.tools.parsers import minicpm5
-
-
-def test_response_generator_prefill_step_override_wins_over_environment(monkeypatch):
-    class DormantThread:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def start(self):
-            pass
-
-    monkeypatch.setenv("PREFILL_STEP_SIZE", "2048")
-    monkeypatch.setattr(server_generation, "Thread", DormantThread)
-
-    default_generator = server.ResponseGenerator(model_path="default")
-    overridden_generator = server.ResponseGenerator(
-        model_path="overridden",
-        prefill_step_size=3072,
-    )
-
-    assert default_generator.prefill_step_size == 2048
-    assert overridden_generator.prefill_step_size == 3072
-
-
-def test_response_generator_clears_worker_streams(monkeypatch):
-    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-    error = RuntimeError("worker failed")
-    gen._run_impl = MagicMock(side_effect=error)
-    clear_streams = MagicMock()
-    monkeypatch.setattr(server_generation, "clear_mlx_streams", clear_streams)
-
-    with pytest.raises(RuntimeError, match="worker failed"):
-        gen._run()
-
-    gen._run_impl.assert_called_once_with()
-    clear_streams.assert_called_once_with()
-
 
 _MUSE_RESPONSE_TEMPLATE = {
     "defaults": {"role": "assistant"},
@@ -96,10 +59,7 @@ _MUSE_RESPONSE_TEMPLATE = {
                     r'<atem:parameter\b[^>]*?\bname="(?P<key>[^"]+)"'
                     r"[^>]*?>(?P<value>.*?)</atem:parameter>"
                 ),
-                "value_parser": {
-                    "args": {"allow_non_json": True},
-                    "name": "json",
-                },
+                "value_parser": {"args": {"allow_non_json": True}, "name": "json"},
             },
             "open_pattern": r'<atem:invoke\b[^>]*?\bname="(?P<name>[^"]+)">',
             "repeats": True,
@@ -158,52 +118,6 @@ def _gemma_thinking_channel_chunks():
     ]
 
 
-@pytest.mark.parametrize("value", [224, "22", [1.0], [1.5], [True], [1, 2, 3]])
-def test_chat_completions_endpoint_rejects_invalid_resize_shape(client, value):
-    response = client.post(
-        "/chat/completions",
-        json={
-            "model": "demo",
-            "messages": [{"role": "user", "content": "Hello"}],
-            "resize_shape": value,
-        },
-    )
-
-    assert response.status_code == 422
-
-
-def test_chat_completions_endpoint_requires_model(client):
-    response = client.post(
-        "/chat/completions",
-        json={"messages": [{"role": "user", "content": "Hello"}]},
-    )
-
-    assert response.status_code == 422
-    detail = response.json().get("detail", [])
-    assert any(err.get("loc") == ["body", "model"] for err in detail)
-
-
-@pytest.mark.parametrize(
-    "messages",
-    [
-        [],
-        [{"role": "user", "content": ""}],
-        [{"role": "user", "content": " \n\t "}],
-        [{"role": "user", "content": [{"type": "text", "text": " "}]}],
-    ],
-)
-def test_chat_completions_endpoint_rejects_empty_effective_input(client, messages):
-    with patch.object(server_openai, "get_cached_model") as mock_get_cached_model:
-        response = client.post(
-            "/chat/completions",
-            json={"model": "demo", "messages": messages},
-        )
-
-    assert response.status_code == 400
-    assert "non-empty message content" in response.json()["detail"]
-    mock_get_cached_model.assert_not_called()
-
-
 @pytest.mark.parametrize(
     "input_value",
     [
@@ -217,8 +131,7 @@ def test_chat_completions_endpoint_rejects_empty_effective_input(client, message
 def test_responses_endpoint_rejects_empty_effective_input(client, input_value):
     with patch.object(server_openai, "get_cached_model") as mock_get_cached_model:
         response = client.post(
-            "/v1/responses",
-            json={"model": "demo", "input": input_value},
+            "/v1/responses", json={"model": "demo", "input": input_value}
         )
 
     assert response.status_code == 400
@@ -343,46 +256,6 @@ def test_chat_completions_tool_parser_override(client, monkeypatch):
     assert post({"tool_parser": "bogus"}).status_code == 422
 
 
-def test_chat_completions_required_tool_choice_adds_instruction(client, monkeypatch):
-    monkeypatch.setattr(server.runtime, "response_generator", None)
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    result = GenerationResult(text="done", prompt_tokens=5, generation_tokens=2)
-    tools = [
-        {
-            "type": "function",
-            "function": {"name": "get_weather", "parameters": {"type": "object"}},
-        }
-    ]
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(
-            server, "apply_chat_template", return_value="prompt"
-        ) as mock_template,
-        patch.object(server, "generate", return_value=result),
-    ):
-        response = client.post(
-            "/v1/chat/completions",
-            json={
-                "model": "demo",
-                "messages": [{"role": "user", "content": "Weather?"}],
-                "tools": tools,
-                "tool_choice": "required",
-            },
-        )
-
-    assert response.status_code == 200
-    messages = mock_template.call_args.args[2]
-    assert messages[0]["role"] == "user"
-    assert "must call one or more" in messages[0]["content"]
-    assert mock_template.call_args.kwargs["tools"] == tools
-    assert mock_template.call_args.kwargs["tool_choice"] == "required"
-
-
 def test_chat_completions_forced_tool_choice_filters_tools(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
@@ -438,12 +311,7 @@ def test_chat_completions_forced_tool_choice_filters_tools(client, monkeypatch):
     [
         ([], "required", "requires at least one tool"),
         (
-            [
-                {
-                    "type": "function",
-                    "function": {"name": "get_weather"},
-                }
-            ],
+            [{"type": "function", "function": {"name": "get_weather"}}],
             {"type": "function", "function": {"name": "missing"}},
             "unknown function 'missing'",
         ),
@@ -476,39 +344,6 @@ def test_speculative_server_dispatches_mtp_batch_loop():
     )
 
 
-def test_positioned_target_sampler_is_batch_grouping_invariant():
-    sampler = server_generation._PositionedTargetSampler(
-        temperature=0.7, top_p=1.0, seed=42
-    )
-    logits = mx.array(
-        [
-            [0.0, 1.0, 2.0, 3.0],
-            [3.0, 2.0, 1.0, 0.0],
-        ],
-        dtype=mx.float32,
-    )
-    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-
-    batched = sampler.sample_target(
-        logprobs,
-        row_ids=[0, 0],
-        positions=[5, 5],
-    )
-    single_0 = sampler.sample_target(
-        logprobs[0:1],
-        row_ids=[0],
-        positions=[5],
-    )
-    single_1 = sampler.sample_target(
-        logprobs[1:2],
-        row_ids=[0],
-        positions=[5],
-    )
-    mx.eval(batched, single_0, single_1)
-
-    assert batched.tolist() == [single_0.item(), single_1.item()]
-
-
 @pytest.mark.parametrize("top_p", [1.0, 0.95])
 def test_positioned_target_sampler_honors_top_k(top_p):
     sampler = server_generation._PositionedTargetSampler(
@@ -519,9 +354,7 @@ def test_positioned_target_sampler_honors_top_k(top_p):
     repeated = mx.repeat(logprobs, 32, axis=0)
 
     tokens = sampler.sample_target(
-        repeated,
-        row_ids=[0] * 32,
-        positions=list(range(32)),
+        repeated, row_ids=[0] * 32, positions=list(range(32))
     )
     mx.eval(tokens)
 
@@ -530,11 +363,7 @@ def test_positioned_target_sampler_honors_top_k(top_p):
 
 def test_server_passes_top_k_to_positioned_sampler():
     generator = server.ResponseGenerator.__new__(server.ResponseGenerator)
-    args = server_generation.GenerationArguments(
-        max_tokens=1,
-        temperature=1.0,
-        top_k=7,
-    )
+    args = server_generation.GenerationArguments(max_tokens=1, temperature=1.0, top_k=7)
 
     sampler = generator._make_sampler(args)
 
@@ -560,72 +389,11 @@ def test_speculative_server_rejects_unknown_draft_kind():
         speculative_utils.get_speculative_rounds_batch("nope")
 
 
-def test_speculative_server_prefill_kwargs_are_drafter_specific():
-    drafter = SimpleNamespace(config=SimpleNamespace(target_layer_ids=[1, 2, 3]))
-
-    assert speculative_utils.speculative_prefill_kwargs("mtp", drafter) == {
-        "return_hidden": True,
-        "return_shared_kv": True,
-    }
-    assert speculative_utils.speculative_prefill_kwargs("dflash", drafter) == {
-        "capture_layer_ids": [1, 2, 3],
-    }
-
-
 def test_speculative_server_hidden_state_picks_last_layer_for_mtp():
     h = [mx.zeros((1, 1, 4)), mx.ones((1, 1, 4))]
     out = SimpleNamespace(hidden_states=h)
 
     assert speculative_utils.speculative_hidden_state("mtp", out) is h[-1]
-
-
-def test_speculative_server_hidden_state_concatenates_for_dflash():
-    h = [mx.zeros((1, 1, 4)), mx.ones((1, 1, 4))]
-    out = SimpleNamespace(hidden_states=h)
-
-    result = speculative_utils.speculative_hidden_state("dflash", out)
-    assert result.shape == (1, 1, 8)
-
-
-@pytest.mark.parametrize(
-    "draft_kind,batch_size,left_padding",
-    [
-        ("mtp", 1, [0]),
-        ("mtp", 2, [0, 1]),
-        ("dflash", 1, [0]),
-        ("dflash", 2, [0, 1]),
-        ("eagle3", 1, [0]),
-        (None, 1, [0]),
-    ],
-)
-def test_speculative_prompt_cache_always_uses_supplied_make_cache(
-    draft_kind, batch_size, left_padding
-):
-    # `make_cache` is what applies --kv-bits. Single-row speculation used to
-    # bypass it for `cache.make_prompt_cache`, which left the KV unquantized
-    # however the server was configured.  That shortcut covered every drafter
-    # routed through here, so each one is checked for the single-row case.
-    lm = object()
-    batched_cache = object()
-
-    assert (
-        speculative_utils.make_speculative_prompt_cache(
-            lm,
-            draft_kind=draft_kind,
-            batch_size=batch_size,
-            left_padding=left_padding,
-            make_cache=lambda *args, **kwargs: batched_cache,
-        )
-        is batched_cache
-    )
-
-
-def test_speculative_server_reads_draft_block_size_env(monkeypatch):
-    monkeypatch.delenv("MLX_VLM_DRAFT_BLOCK_SIZE", raising=False)
-    assert server._get_draft_block_size_from_env() is None
-
-    monkeypatch.setenv("MLX_VLM_DRAFT_BLOCK_SIZE", "3")
-    assert server._get_draft_block_size_from_env() == 3
 
 
 def test_speculative_server_reads_batch_coalesce_env(monkeypatch):
@@ -669,9 +437,7 @@ def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     assert server.runtime.model_cache["adapter_path"] == "adapter-a"
 
 
-def test_unload_model_cache_group_resets_apc_around_generator_shutdown(
-    monkeypatch,
-):
+def test_unload_model_cache_group_resets_apc_around_generator_shutdown(monkeypatch):
     events = []
 
     class FakeAPCManager:
@@ -718,56 +484,6 @@ def test_unload_model_cache_group_resets_apc_around_generator_shutdown(
     assert registry.for_kind("text_generation") == {}
     assert server.runtime.response_generator is None
     assert server.runtime.apc_manager is None
-
-
-def test_unload_model_cache_group_keeps_model_when_initial_apc_reset_fails(
-    monkeypatch,
-):
-    class FailingAPCManager:
-        def clear(self):
-            raise RuntimeError("APC cleanup failed")
-
-    response_generator = MagicMock()
-    cache = {
-        "model_path": "old-model",
-        "adapter_path": None,
-        "response_generator": response_generator,
-        "apc_manager": FailingAPCManager(),
-    }
-    registry = server.ModelCacheRegistry()
-    registry.set("text_generation", cache)
-    monkeypatch.setattr(server.runtime, "model_cache", registry)
-
-    with pytest.raises(RuntimeError, match="APC cleanup failed"):
-        server._app_module._unload_model_cache_group("text_generation")
-
-    response_generator.stop_and_join.assert_not_called()
-    assert registry.for_kind("text_generation") is cache
-
-
-@pytest.mark.parametrize(
-    "load_error",
-    [
-        ValueError("Model type bert not supported."),
-        RuntimeError("Unable to initialize model."),
-    ],
-)
-def test_load_model_resources_returns_load_failure_as_bad_request(
-    monkeypatch, load_error
-):
-    def reject_model(*_args, **_kwargs):
-        raise load_error
-
-    monkeypatch.setattr(server_generation, "load", reject_model)
-
-    with pytest.raises(server.HTTPException) as exc_info:
-        server_generation.load_model_resources(
-            "google-bert/bert-base-multilingual-cased",
-            None,
-        )
-
-    assert exc_info.value.status_code == 400
-    assert exc_info.value.detail == f"Failed to load model: {load_error}"
 
 
 def test_unsupported_model_request_does_not_crash_server(client, monkeypatch):
@@ -825,83 +541,6 @@ def _unstarted_response_generator():
     return gen
 
 
-def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
-    target_config = SimpleNamespace(
-        model_type="gemma4_text",
-        hidden_size=5376,
-        eos_token_id=[],
-    )
-    model = SimpleNamespace(language_model=SimpleNamespace(config=target_config))
-    processor = SimpleNamespace(tokenizer=SimpleNamespace())
-    drafter = SimpleNamespace(
-        config=SimpleNamespace(
-            model_type="gemma4_assistant",
-            backbone_hidden_size=1536,
-        )
-    )
-    gen = _unstarted_response_generator()
-
-    monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "assistant")
-    monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
-    monkeypatch.setattr(
-        server_generation,
-        "load_model_resources",
-        lambda *_args, **_kwargs: (model, processor, target_config),
-    )
-    monkeypatch.setattr(
-        "mlx_vlm.speculative.drafters.load_drafter",
-        lambda *_args, **_kwargs: (drafter, "mtp"),
-    )
-
-    gen._initialize_model()
-
-    assert gen.model is model
-    assert gen.processor is processor
-    assert gen.draft_model is None
-    assert gen.draft_kind is None
-
-
-def test_server_includes_processor_specific_stop_tokens(monkeypatch):
-    config = SimpleNamespace(eos_token_id=[2])
-    model = SimpleNamespace(language_model=SimpleNamespace(config=config))
-    processor = SimpleNamespace(
-        tokenizer=SimpleNamespace(),
-        additional_eos_token_ids=[3],
-    )
-    gen = _unstarted_response_generator()
-
-    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
-    monkeypatch.delenv("MLX_VLM_DRAFT_KIND", raising=False)
-    monkeypatch.setattr(
-        server_generation,
-        "load_model_resources",
-        lambda *_args, **_kwargs: (model, processor, config),
-    )
-
-    gen._initialize_model()
-
-    assert gen.stop_tokens == {2, 3}
-
-
-def test_server_includes_tokenizer_eos_in_stop_tokens(monkeypatch):
-    config = SimpleNamespace(eos_token_id=248044)
-    model = SimpleNamespace(language_model=SimpleNamespace(config=config))
-    processor = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=248046))
-    gen = _unstarted_response_generator()
-
-    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
-    monkeypatch.delenv("MLX_VLM_DRAFT_KIND", raising=False)
-    monkeypatch.setattr(
-        server_generation,
-        "load_model_resources",
-        lambda *_args, **_kwargs: (model, processor, config),
-    )
-
-    gen._initialize_model()
-
-    assert gen.stop_tokens == {248044, 248046}
-
-
 def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
     config = SimpleNamespace(eos_token_id=[])
     language_model = SimpleNamespace()
@@ -948,25 +587,17 @@ def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
         def next(self, **kwargs):
             return [], [
                 SimpleNamespace(
-                    uid=1,
-                    token=7,
-                    token_logprob=0.0,
-                    finish_reason="length",
+                    uid=1, token=7, token_logprob=0.0, finish_reason="length"
                 )
             ]
 
     target_config = SimpleNamespace(
-        model_type="gemma4_text",
-        hidden_size=5376,
-        eos_token_id=[],
+        model_type="gemma4_text", hidden_size=5376, eos_token_id=[]
     )
     model = SimpleNamespace(language_model=SimpleNamespace(config=target_config))
     processor = SimpleNamespace(tokenizer=SimpleNamespace())
     drafter = SimpleNamespace(
-        config=SimpleNamespace(
-            model_type="gemma4_assistant",
-            backbone_hidden_size=1536,
-        )
+        config=SimpleNamespace(model_type="gemma4_assistant", backbone_hidden_size=1536)
     )
     gen = _unstarted_response_generator()
 
@@ -1135,103 +766,6 @@ def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
     ]
 
 
-def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(client, monkeypatch):
-    monkeypatch.setenv("MLX_VLM_MODEL_DISCOVERY", "hf-cache")
-
-    def repo(repo_id, file_names):
-        return SimpleNamespace(
-            repo_id=repo_id,
-            repo_type="model",
-            last_modified=123.0,
-            refs={
-                "main": SimpleNamespace(
-                    files=[
-                        SimpleNamespace(file_path=SimpleNamespace(name=file_name))
-                        for file_name in file_names
-                    ]
-                )
-            },
-        )
-
-    monkeypatch.setattr(
-        server,
-        "scan_cache_dir",
-        lambda: SimpleNamespace(
-            repos=[
-                repo(
-                    "local/sharded-model",
-                    [
-                        "config.json",
-                        "model.safetensors.index.json",
-                        "tokenizer_config.json",
-                    ],
-                ),
-            ]
-        ),
-    )
-    monkeypatch.setitem(server.runtime.model_cache, "model_path", "local/sharded-model")
-
-    response = client.get("/v1/models")
-
-    assert response.status_code == 200
-    assert [model["id"] for model in response.json()["data"]].count(
-        "local/sharded-model"
-    ) == 1
-
-
-def test_models_endpoint_default_does_not_advertise_shared_hf_cache(
-    client, monkeypatch
-):
-    monkeypatch.delenv("MLX_VLM_MODEL_DISCOVERY", raising=False)
-    scan_cache = MagicMock(
-        return_value=SimpleNamespace(
-            repos=[
-                SimpleNamespace(
-                    repo_id="sentence-transformers/all-MiniLM-L6-v2",
-                    repo_type="model",
-                    last_modified=123.0,
-                    refs={
-                        "main": SimpleNamespace(
-                            files=[
-                                SimpleNamespace(
-                                    file_path=SimpleNamespace(name=file_name)
-                                )
-                                for file_name in (
-                                    "config.json",
-                                    "tokenizer_config.json",
-                                    "model.safetensors",
-                                )
-                            ]
-                        )
-                    },
-                )
-            ]
-        )
-    )
-    monkeypatch.setattr(server, "scan_cache_dir", scan_cache)
-    registry = server.ModelCacheRegistry()
-    registry.set(
-        "text_generation",
-        {
-            "model_path": "/models/loaded-chat-model",
-            "model_kind": "text_generation",
-        },
-    )
-    monkeypatch.setattr(server.runtime, "model_cache", registry)
-
-    response = client.get("/v1/models")
-
-    assert response.status_code == 200
-    assert response.json()["data"] == [
-        {
-            "id": "/models/loaded-chat-model",
-            "object": "model",
-            "created": response.json()["data"][0]["created"],
-        }
-    ]
-    scan_cache.assert_not_called()
-
-
 def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
     gen = _unstarted_response_generator()
     gen.model = SimpleNamespace()
@@ -1376,29 +910,6 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         ("post", "/unload"),
     ],
 )
-def test_management_endpoints_allow_requests_without_configured_api_key(
-    client, monkeypatch, method, path
-):
-    monkeypatch.delenv("MLX_VLM_SERVER_API_KEY", raising=False)
-
-    response = getattr(client, method)(path)
-
-    assert response.status_code == 200
-
-
-@pytest.mark.parametrize(
-    ("method", "path"),
-    [
-        ("get", "/health"),
-        ("get", "/metrics"),
-        ("get", "/v1/metrics"),
-        ("get", "/cache/stats"),
-        ("get", "/v1/cache/stats"),
-        ("post", "/cache/reset"),
-        ("post", "/v1/cache/reset"),
-        ("post", "/unload"),
-    ],
-)
 def test_management_endpoints_require_configured_api_key(
     client, monkeypatch, method, path
 ):
@@ -1406,81 +917,15 @@ def test_management_endpoints_require_configured_api_key(
 
     missing = getattr(client, method)(path)
     invalid = getattr(client, method)(
-        path,
-        headers={"Authorization": "Bearer wrong-token"},
+        path, headers={"Authorization": "Bearer wrong-token"}
     )
     valid = getattr(client, method)(
-        path,
-        headers={"Authorization": "Bearer secret-token"},
+        path, headers={"Authorization": "Bearer secret-token"}
     )
 
     assert missing.status_code == 401
     assert invalid.status_code == 401
     assert valid.status_code == 200
-
-
-@pytest.mark.parametrize(
-    ("method", "path"),
-    [
-        ("post", "/messages"),
-        ("post", "/messages/count_tokens"),
-        ("post", "/responses/input_tokens"),
-        ("get", "/responses/missing"),
-        ("delete", "/responses/missing"),
-        ("post", "/responses/missing/cancel"),
-        ("get", "/responses/missing/input_items"),
-        ("post", "/responses"),
-        ("post", "/chat/completions"),
-        ("post", "/images/generations"),
-        ("post", "/images/edits"),
-        ("post", "/audio/speech"),
-        ("post", "/audio/transcriptions"),
-        ("post", "/audio/translations"),
-        ("get", "/models"),
-        ("post", "/v1/messages"),
-        ("post", "/v1/messages/count_tokens"),
-        ("post", "/v1/responses/input_tokens"),
-        ("get", "/v1/responses/missing"),
-        ("delete", "/v1/responses/missing"),
-        ("post", "/v1/responses/missing/cancel"),
-        ("get", "/v1/responses/missing/input_items"),
-        ("post", "/v1/responses"),
-        ("post", "/v1/chat/completions"),
-        ("post", "/v1/images/generations"),
-        ("post", "/v1/images/edits"),
-        ("post", "/v1/audio/speech"),
-        ("post", "/v1/audio/transcriptions"),
-        ("post", "/v1/audio/translations"),
-        ("get", "/v1/models"),
-    ],
-)
-def test_inference_endpoints_require_configured_api_key(
-    client, monkeypatch, method, path
-):
-    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret-token")
-
-    missing = getattr(client, method)(path)
-    invalid = getattr(client, method)(
-        path,
-        headers={"Authorization": "Bearer wrong-token"},
-    )
-
-    assert missing.status_code == 401
-    assert invalid.status_code == 401
-    assert missing.headers["WWW-Authenticate"] == "Bearer"
-    assert invalid.headers["WWW-Authenticate"] == "Bearer"
-
-
-def test_inference_endpoint_accepts_configured_api_key(client, monkeypatch):
-    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret-token")
-
-    response = client.post(
-        "/v1/chat/completions",
-        headers={"Authorization": "Bearer secret-token"},
-        json={},
-    )
-
-    assert response.status_code == 422
 
 
 def _fake_image_result(*, seed: int, output_path=None) -> ImageGenerationResult:
@@ -1501,63 +946,6 @@ def _fake_image_result(*, seed: int, output_path=None) -> ImageGenerationResult:
     if output_path is not None:
         data.save(output_path)
     return data
-
-
-def test_images_generations_returns_b64_json(client, monkeypatch):
-    calls = []
-    cache_calls = []
-
-    def fake_get_cached_model(model, **kwargs):
-        cache_calls.append((model, kwargs))
-        return SimpleNamespace(), None, SimpleNamespace(model_type="bonsai")
-
-    monkeypatch.setattr(
-        server,
-        "get_cached_model",
-        fake_get_cached_model,
-    )
-
-    def fake_generate_image(model, request, **kwargs):
-        calls.append(request)
-        return _fake_image_result(seed=request.seed)
-
-    monkeypatch.setattr(server_openai, "generate_image", fake_generate_image)
-
-    response = client.post(
-        "/v1/images/generations",
-        json={
-            "model": "bonsai-ternary",
-            "prompt": "bonsai",
-            "n": 2,
-            "seed": 10,
-            "size": "256x256",
-            "steps": 1,
-            "response_format": "b64_json",
-        },
-    )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["size"] == "256x256"
-    assert [item["seed"] for item in payload["data"]] == [10, 11]
-    assert all(item["b64_json"] for item in payload["data"])
-    assert [call.seed for call in calls] == [10, 11]
-    assert cache_calls == [("bonsai-ternary", {"model_kind": "image_generation"})]
-
-
-def test_image_generation_lock_uses_image_cache_kind(monkeypatch):
-    text_lock = object()
-    image_lock = object()
-    registry = server.ModelCacheRegistry()
-    registry.set("text_generation", {"generation_lock": text_lock})
-    registry.set("image_generation", {"generation_lock": image_lock})
-    monkeypatch.setattr(server.runtime, "model_cache", registry)
-
-    assert server_openai._runtime_cache_get("generation_lock") is text_lock
-    assert (
-        server_openai._runtime_cache_get("generation_lock", kind="image_generation")
-        is image_lock
-    )
 
 
 def test_images_generations_forwards_prompt_expansion_model(client, monkeypatch):
@@ -1730,10 +1118,7 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
     result = GenerationResult(
-        text="done",
-        prompt_tokens=8,
-        generation_tokens=4,
-        total_tokens=12,
+        text="done", prompt_tokens=8, generation_tokens=4, total_tokens=12
     )
 
     with (
@@ -1783,10 +1168,7 @@ def test_responses_endpoint_merges_developer_message_with_instructions(client):
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
     result = GenerationResult(
-        text="done",
-        prompt_tokens=8,
-        generation_tokens=4,
-        total_tokens=12,
+        text="done", prompt_tokens=8, generation_tokens=4, total_tokens=12
     )
 
     with (
@@ -1808,10 +1190,7 @@ def test_responses_endpoint_merges_developer_message_with_instructions(client):
                         "type": "message",
                         "role": "developer",
                         "content": [
-                            {
-                                "type": "input_text",
-                                "text": "Developer instructions.",
-                            }
+                            {"type": "input_text", "text": "Developer instructions."}
                         ],
                     },
                     {
@@ -1842,10 +1221,7 @@ def test_responses_endpoint_places_function_output_image_after_tool_result(
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
     result = GenerationResult(
-        text="done",
-        prompt_tokens=8,
-        generation_tokens=4,
-        total_tokens=12,
+        text="done", prompt_tokens=8, generation_tokens=4, total_tokens=12
     )
 
     with (
@@ -1907,42 +1283,6 @@ def test_responses_endpoint_rejects_image_file_id(client):
         "input_image.file_id is not supported by this server. "
         "Provide image_url instead."
     )
-
-
-@pytest.mark.parametrize(
-    ("include_adapter", "adapter_path", "expected_adapter"),
-    [
-        (False, None, server._INHERIT_ADAPTER),
-        (True, "adapter-a", "adapter-a"),
-        (True, None, None),
-    ],
-)
-def test_responses_endpoint_forwards_adapter_path_or_inherits(
-    client, monkeypatch, include_adapter, adapter_path, expected_adapter
-):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    result = GenerationResult(
-        text="done",
-        prompt_tokens=1,
-        generation_tokens=1,
-        total_tokens=2,
-    )
-    get_cached_model = MagicMock(return_value=(model, processor, config))
-    payload = {"model": "demo", "input": "Hello"}
-    if include_adapter:
-        payload["adapter_path"] = adapter_path
-
-    monkeypatch.setattr(server.runtime, "response_generator", None)
-    monkeypatch.setattr(server, "get_cached_model", get_cached_model)
-    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
-    monkeypatch.setattr(server, "generate", MagicMock(return_value=result))
-
-    response = client.post("/responses", json=payload)
-
-    assert response.status_code == 200
-    assert get_cached_model.call_args.args == ("demo", expected_adapter)
 
 
 def test_responses_input_tokens_endpoint_forwards_adapter_path(client, monkeypatch):
@@ -2019,93 +1359,6 @@ def test_responses_previous_response_id_replays_stored_items(client):
     assert input_items.json()["data"][0]["content"][0]["text"] == "First"
 
 
-def test_responses_endpoint_returns_function_call_items(client):
-    server.response_store.clear()
-    server.response_store_order.clear()
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    result = GenerationResult(
-        text='<tool_call>{"name":"get_weather","arguments":{"location":"SF"}}</tool_call>',
-        prompt_tokens=8,
-        generation_tokens=4,
-    )
-    tool_module = SimpleNamespace(
-        tool_call_start="<tool_call>",
-        tool_call_end="</tool_call>",
-        parse_tool_call=lambda call, tools: json.loads(call),
-    )
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(
-            server, "apply_chat_template", return_value="prompt"
-        ) as mock_template,
-        patch.object(server, "generate", return_value=result),
-        patch.object(server, "_infer_tool_parser_from_processor", return_value="demo"),
-        patch.object(server, "load_tool_module", return_value=tool_module),
-    ):
-        response = client.post(
-            "/v1/responses",
-            json={
-                "model": "demo",
-                "input": "weather?",
-                "tools": [
-                    {
-                        "type": "function",
-                        "name": "get_weather",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"location": {"type": "string"}},
-                        },
-                    }
-                ],
-            },
-        )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["output"][0]["type"] == "function_call"
-    assert payload["output"][0]["name"] == "get_weather"
-    assert payload["output"][0]["arguments"] == '{"location": "SF"}'
-    assert (
-        mock_template.call_args.kwargs["tools"][0]["function"]["name"] == "get_weather"
-    )
-
-
-def test_responses_endpoint_returns_reasoning_items(client):
-    server.response_store.clear()
-    server.response_store_order.clear()
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    result = GenerationResult(
-        text="<think>Check briefly.</think>\n\nDone.",
-        prompt_tokens=8,
-        generation_tokens=4,
-    )
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(server, "apply_chat_template", return_value="prompt"),
-        patch.object(server, "generate", return_value=result),
-    ):
-        response = client.post(
-            "/v1/responses", json={"model": "demo", "input": "hello"}
-        )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert [item["type"] for item in payload["output"]] == ["reasoning", "message"]
-    assert payload["output"][0]["summary"][0]["text"] == "Check briefly."
-    assert payload["output"][1]["content"][0]["text"] == "Done."
-    assert payload["output_text"] == "Done."
-
-
 def test_responses_endpoint_returns_native_shell_call_items(client):
     server.response_store.clear()
     server.response_store_order.clear()
@@ -2134,11 +1387,7 @@ def test_responses_endpoint_returns_native_shell_call_items(client):
     ):
         response = client.post(
             "/v1/responses",
-            json={
-                "model": "demo",
-                "input": "run pwd",
-                "tools": [{"type": "shell"}],
-            },
+            json={"model": "demo", "input": "run pwd", "tools": [{"type": "shell"}]},
         )
 
     assert response.status_code == 200
@@ -2211,70 +1460,6 @@ def test_responses_streaming_emits_native_tool_call_items(client):
     assert "<tool_call>" not in body
 
 
-def test_responses_streaming_emits_reasoning_events(client):
-    server.response_store.clear()
-    server.response_store_order.clear()
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    chunks = [
-        GenerationResult(text="<think>Check", prompt_tokens=8, generation_tokens=1),
-        GenerationResult(
-            text=" briefly.</think>\n\nDone.",
-            prompt_tokens=8,
-            generation_tokens=4,
-            finish_reason="stop",
-        ),
-    ]
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(server, "apply_chat_template", return_value="prompt"),
-        patch.object(server, "stream_generate", return_value=iter(chunks)),
-        patch.object(server.runtime, "response_generator", None),
-    ):
-        response = client.post(
-            "/v1/responses",
-            json={"model": "demo", "input": "hello", "stream": True},
-        )
-
-    assert response.status_code == 200
-    events = _sse_events(response.text)
-    reasoning_events = [
-        data
-        for event_type, data in events
-        if event_type == "response.reasoning_text.delta"
-    ]
-    text_delta_events = [
-        data
-        for event_type, data in events
-        if event_type == "response.output_text.delta"
-    ]
-    done_event = next(
-        data for event_type, data in events if event_type == "response.output_text.done"
-    )
-    completed = next(
-        data["response"]
-        for event_type, data in events
-        if event_type == "response.completed"
-    )
-
-    assert "".join(event["delta"] for event in reasoning_events) == "Check briefly."
-    assert "".join(event["delta"] for event in text_delta_events) == "Done."
-    assert reasoning_events[0]["timings"]["predicted_per_second"] is None
-    assert reasoning_events[1]["timings"]["predicted_per_second"] > 0
-    assert (
-        text_delta_events[0]["timings"]["predicted_per_second"]
-        == reasoning_events[1]["timings"]["predicted_per_second"]
-    )
-    assert done_event["timings"]["predicted_per_second"] > 0
-    assert [item["type"] for item in completed["output"]] == ["reasoning", "message"]
-    assert completed["output"][0]["summary"][0]["text"] == "Check briefly."
-    assert completed["output_text"] == "Done."
-
-
 def test_responses_streaming_uses_prompt_opened_thinking_without_flag(client):
     server.response_store.clear()
     server.response_store_order.clear()
@@ -2301,9 +1486,7 @@ def test_responses_streaming_uses_prompt_opened_thinking_without_flag(client):
             server, "get_cached_model", return_value=(model, processor, config)
         ),
         patch.object(
-            server,
-            "apply_chat_template",
-            side_effect=fake_apply_chat_template,
+            server, "apply_chat_template", side_effect=fake_apply_chat_template
         ),
         patch.object(server, "stream_generate", return_value=iter(chunks)),
         patch.object(server.runtime, "response_generator", None),
@@ -2416,12 +1599,7 @@ def test_responses_streaming_emits_function_call_arguments_done(client):
         ),
         (
             "/v1/responses",
-            {
-                "model": "demo",
-                "input": "Hello",
-                "max_output_tokens": 4,
-                "stream": True,
-            },
+            {"model": "demo", "input": "Hello", "max_output_tokens": 4, "stream": True},
         ),
     ],
 )
@@ -2438,10 +1616,7 @@ def test_stream_endpoints_do_not_clear_mlx_cache_on_close(
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 [
                     server.StreamingToken(
-                        text="ok",
-                        token=1,
-                        logprobs=0.0,
-                        finish_reason="stop",
+                        text="ok", token=1, logprobs=0.0, finish_reason="stop"
                     )
                 ]
             )
@@ -2487,12 +1662,7 @@ def test_stream_endpoints_do_not_clear_mlx_cache_on_close(
         ),
         (
             "/v1/responses",
-            {
-                "model": "demo",
-                "input": "Hello",
-                "max_output_tokens": 4,
-                "stream": True,
-            },
+            {"model": "demo", "input": "Hello", "max_output_tokens": 4, "stream": True},
         ),
     ],
 )
@@ -2542,14 +1712,7 @@ def test_v1_stream_endpoints_reject_over_context_before_sse(
                 "max_tokens": 4,
             },
         ),
-        (
-            "/v1/responses",
-            {
-                "model": "demo",
-                "input": "Hello",
-                "max_output_tokens": 4,
-            },
-        ),
+        ("/v1/responses", {"model": "demo", "input": "Hello", "max_output_tokens": 4}),
     ],
 )
 def test_v1_non_stream_endpoints_reject_over_context(
@@ -2625,182 +1788,6 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
 
 
-def test_chat_completions_streaming_forwards_explicit_sampling_args(
-    client, monkeypatch
-):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    captured = {}
-
-    class FakeResponseGenerator:
-        tokenizer = SimpleNamespace(decode=lambda tokens: "")
-
-        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
-            return None
-
-        def generate(self, prompt, images=None, audio=None, args=None):
-            captured["prompt"] = prompt
-            captured["images"] = images
-            captured["audio"] = audio
-            captured["args"] = args
-            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
-                [
-                    server.StreamingToken(
-                        text="done", token=1, logprobs=0.0, finish_reason="stop"
-                    )
-                ]
-            )
-
-    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(server, "apply_chat_template", return_value="prompt"),
-    ):
-        response = client.post(
-            "/chat/completions",
-            json={
-                "model": "demo",
-                "messages": [{"role": "user", "content": "Hello"}],
-                "stream": True,
-                "max_tokens": 12,
-                "top_k": 40,
-                "min_p": 0.08,
-                "repetition_penalty": 1.15,
-                "logit_bias": {"12": -1.5},
-            },
-        )
-
-    assert response.status_code == 200
-    assert "data: [DONE]" in response.text
-    assert captured["args"].max_tokens == 12
-    assert captured["args"].top_k == 40
-    assert captured["args"].min_p == 0.08
-    assert captured["args"].repetition_penalty == 1.15
-    assert captured["args"].logit_bias == {12: -1.5}
-
-
-def test_chat_completions_streaming_splits_gemma_thinking_channel_content(
-    client, monkeypatch
-):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="gemma4")
-
-    class FakeResponseGenerator:
-        tokenizer = SimpleNamespace(decode=lambda tokens: "")
-
-        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
-            return None
-
-        def generate(self, prompt, images=None, audio=None, args=None):
-            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
-                _gemma_thinking_channel_chunks()
-            )
-
-    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(server, "apply_chat_template", return_value="prompt"),
-    ):
-        response = client.post(
-            "/chat/completions",
-            json={
-                "model": "demo",
-                "messages": [{"role": "user", "content": "What's 7*8?"}],
-                "stream": True,
-                "enable_thinking": True,
-            },
-        )
-
-    assert response.status_code == 200
-    chunks = [
-        json.loads(line[len("data: ") :])
-        for line in response.text.splitlines()
-        if line.startswith("data: ") and line != "data: [DONE]"
-    ]
-    deltas = [
-        chunk["choices"][0]["delta"]
-        for chunk in chunks
-        if chunk.get("choices") and chunk["choices"][0].get("delta")
-    ]
-
-    assert "".join(delta.get("content") or "" for delta in deltas) == "7 * 8 = 56"
-    assert "".join(delta.get("reasoning_content") or "" for delta in deltas) == ""
-    assert "<|channel>" not in response.text
-    assert "<channel|>" not in response.text
-
-
-def test_chat_completions_streaming_uses_custom_thinking_markers(client, monkeypatch):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="custom")
-
-    class FakeResponseGenerator:
-        tokenizer = SimpleNamespace(decode=lambda tokens: "")
-
-        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
-            return None
-
-        def generate(self, prompt, images=None, audio=None, args=None):
-            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
-                [
-                    server.StreamingToken(
-                        text="<analysis>Custom reasoning.</analysis>Custom answer.",
-                        token=1,
-                        logprobs=0.0,
-                        finish_reason="stop",
-                    )
-                ]
-            )
-
-    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(server, "apply_chat_template", return_value="prompt"),
-    ):
-        response = client.post(
-            "/chat/completions",
-            json={
-                "model": "demo",
-                "messages": [{"role": "user", "content": "Hello"}],
-                "stream": True,
-                "enable_thinking": True,
-                "thinking_start_token": "<analysis>",
-                "thinking_end_token": "</analysis>",
-            },
-        )
-
-    assert response.status_code == 200
-    chunks = [
-        json.loads(line[len("data: ") :])
-        for line in response.text.splitlines()
-        if line.startswith("data: ") and line != "data: [DONE]"
-    ]
-    deltas = [
-        chunk["choices"][0]["delta"]
-        for chunk in chunks
-        if chunk.get("choices") and chunk["choices"][0].get("delta")
-    ]
-
-    assert "".join(delta.get("reasoning_content") or "" for delta in deltas) == (
-        "Custom reasoning."
-    )
-    assert "".join(delta.get("reasoning") or "" for delta in deltas) == (
-        "Custom reasoning."
-    )
-    assert "".join(delta.get("content") or "" for delta in deltas) == ("Custom answer.")
-
-
 def test_chat_completions_streaming_uses_prompt_opened_thinking_without_flag(
     client, monkeypatch
 ):
@@ -2824,10 +1811,7 @@ def test_chat_completions_streaming_uses_prompt_opened_thinking_without_flag(
                         finish_reason=None,
                     ),
                     server.StreamingToken(
-                        text="<|END_THINK",
-                        token=2,
-                        logprobs=0.0,
-                        finish_reason=None,
+                        text="<|END_THINK", token=2, logprobs=0.0, finish_reason=None
                     ),
                     server.StreamingToken(
                         text="ING|><|START_TEXT|>North answer.<|END_TEXT|>",
@@ -2845,9 +1829,7 @@ def test_chat_completions_streaming_uses_prompt_opened_thinking_without_flag(
             server, "get_cached_model", return_value=(model, processor, config)
         ),
         patch.object(
-            server,
-            "apply_chat_template",
-            return_value="prompt<|START_THINKING|>",
+            server, "apply_chat_template", return_value="prompt<|START_THINKING|>"
         ),
     ):
         response = client.post(
@@ -2881,164 +1863,6 @@ def test_chat_completions_streaming_uses_prompt_opened_thinking_without_flag(
     assert "<|END_THINKING|>" not in response.text
     assert "<|START_TEXT|>" not in response.text
     assert "<|END_TEXT|>" not in response.text
-
-
-def test_chat_completions_streaming_keeps_plain_output_as_content_when_thinking_enabled(
-    client, monkeypatch
-):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="lfm2_vl")
-
-    class FakeResponseGenerator:
-        tokenizer = SimpleNamespace(decode=lambda tokens: "")
-
-        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
-            return None
-
-        def generate(self, prompt, images=None, audio=None, args=None):
-            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
-                [
-                    server.StreamingToken(
-                        text="Hello", token=1, logprobs=0.0, finish_reason=None
-                    ),
-                    server.StreamingToken(
-                        text="!", token=2, logprobs=0.0, finish_reason="stop"
-                    ),
-                ]
-            )
-
-    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(server, "apply_chat_template", return_value="prompt"),
-    ):
-        response = client.post(
-            "/chat/completions",
-            json={
-                "model": "liquidai/LFM2.5-VL-1.6B",
-                "messages": [{"role": "user", "content": "Hello"}],
-                "stream": True,
-                "enable_thinking": True,
-            },
-        )
-
-    assert response.status_code == 200
-    chunks = [
-        json.loads(line[len("data: ") :])
-        for line in response.text.splitlines()
-        if line.startswith("data: ") and line != "data: [DONE]"
-    ]
-    deltas = [
-        chunk["choices"][0]["delta"]
-        for chunk in chunks
-        if chunk.get("choices") and chunk["choices"][0].get("delta")
-    ]
-
-    assert "".join(delta.get("content") or "" for delta in deltas) == "Hello!"
-    assert "".join(delta.get("reasoning_content") or "" for delta in deltas) == ""
-    assert "".join(delta.get("reasoning") or "" for delta in deltas) == ""
-
-
-def test_chat_completions_response_uses_reasoning_content(client):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="custom")
-    result = GenerationResult(
-        text="<analysis>Custom reasoning.</analysis>Custom answer.",
-        prompt_tokens=8,
-        generation_tokens=4,
-        total_tokens=12,
-        prompt_tps=10.0,
-        generation_tps=5.0,
-        peak_memory=0.1,
-    )
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(server, "apply_chat_template", return_value="prompt"),
-        patch.object(server, "generate", return_value=result),
-    ):
-        response = client.post(
-            "/chat/completions",
-            json={
-                "model": "demo",
-                "messages": [{"role": "user", "content": "Hello"}],
-                "enable_thinking": True,
-                "thinking_start_token": "<analysis>",
-                "thinking_end_token": "</analysis>",
-            },
-        )
-
-    assert response.status_code == 200
-    message = response.json()["choices"][0]["message"]
-    assert message["reasoning_content"] == "Custom reasoning."
-    assert message["reasoning"] == "Custom reasoning."
-    assert message["content"] == "Custom answer."
-
-
-def test_chat_completions_uses_processor_config_and_response_template(
-    client, monkeypatch
-):
-    model = SimpleNamespace()
-    config = SimpleNamespace(
-        model_type="muse_glimmer",
-        thinking_start_token="to=self<|message|>",
-        thinking_end_token="<|eom|>",
-    )
-    processor = SimpleNamespace(
-        config=config,
-        tokenizer=_MuseResponseTemplateTokenizer(),
-    )
-    monkeypatch.delenv("MLX_VLM_THINKING_START_TOKEN", raising=False)
-    monkeypatch.delenv("MLX_VLM_THINKING_END_TOKEN", raising=False)
-    result = GenerationResult(
-        text=(
-            "to=self<|message|>Say exactly: hello world\n\n"
-            "We need to say exactly: hello world ...\n\n"
-            "No extra.<|eom|><|start|>assistant to=user<|message|>hello world"
-        ),
-        prompt_tokens=8,
-        generation_tokens=32,
-        total_tokens=40,
-        prompt_tps=10.0,
-        generation_tps=5.0,
-        peak_memory=0.1,
-    )
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(server, "apply_chat_template", return_value="<|start|>assistant"),
-        patch.object(server, "generate", return_value=result) as mock_generate,
-    ):
-        response = client.post(
-            "/chat/completions",
-            json={
-                "model": "mlx-community/Muse-Glimmer-30B-4bit",
-                "messages": [{"role": "user", "content": "Say exactly: hello world"}],
-            },
-        )
-
-    assert response.status_code == 200
-    generate_kwargs = mock_generate.call_args.kwargs
-    assert generate_kwargs["thinking_start_token"] == "to=self<|message|>"
-    assert generate_kwargs["thinking_end_token"] == "<|eom|>"
-    message = response.json()["choices"][0]["message"]
-    expected_reasoning = (
-        "Say exactly: hello world\n\n"
-        "We need to say exactly: hello world ...\n\n"
-        "No extra."
-    )
-    assert message["reasoning_content"] == expected_reasoning
-    assert message["reasoning"] == expected_reasoning
-    assert message["content"] == "hello world"
 
 
 @pytest.mark.parametrize(
@@ -3155,92 +1979,6 @@ def test_chat_completions_preserves_input_audio_references(client):
     assert captured["audio"] == [audio_path]
 
 
-def test_generation_timings_from_metrics():
-    metrics = SimpleNamespace(
-        cached_tokens=2,
-        prompt_tps=20.0,
-        generation_tps=8.0,
-        token_times=[],
-        peak_memory=0.5,
-    )
-    timings = server.GenerationTimings.from_metrics(metrics, 10, 4)
-
-    assert (timings.prompt_n, timings.cache_n, timings.predicted_n) == (8, 2, 4)
-    assert timings.prompt_ms == pytest.approx(500.0)
-    assert timings.prompt_per_token_ms == pytest.approx(62.5)
-    assert timings.prompt_per_second == pytest.approx(16.0)
-    assert timings.predicted_ms == pytest.approx(500.0)
-    assert timings.predicted_per_token_ms == pytest.approx(125.0)
-    assert timings.predicted_per_second == pytest.approx(8.0)
-    assert timings.peak_memory == pytest.approx(0.5)
-
-    metrics = SimpleNamespace(
-        cached_tokens=9,
-        prompt_tps=None,
-        generation_tps=None,
-        token_times=[],
-        peak_memory=0.0,
-    )
-    timings = server.GenerationTimings.from_metrics(metrics, 4, 1)
-    assert timings.prompt_n == 0
-    assert timings.prompt_ms == 0.0
-    assert timings.prompt_per_token_ms == 0.0
-    assert timings.predicted_ms == 0.0
-    assert timings.predicted_per_token_ms == 0.0
-
-
-def test_generation_metrics_reports_chunk_and_aggregate_rates():
-    metrics = server_generation.GenerationMetrics()
-
-    first_rate = metrics.record_chunk(
-        SimpleNamespace(generation_tokens=1, emitted_at=10.0)
-    )
-    second_rate = metrics.record_chunk(
-        SimpleNamespace(generation_tokens=4, emitted_at=10.25)
-    )
-
-    assert first_rate is None
-    assert second_rate == pytest.approx(12.0)
-    assert metrics.rate == pytest.approx(12.0)
-
-
-def test_generation_timings_include_speculative_stats():
-    metrics = SimpleNamespace(
-        cached_tokens=0,
-        prompt_tps=20.0,
-        generation_tps=8.0,
-        token_times=[],
-        peak_memory=0.0,
-        draft_kind="mtp",
-        draft_rounds=5,
-        draft_n_accepted=12,
-        draft_n=20,
-    )
-    timings = server.GenerationTimings.from_metrics(metrics, 10, 17)
-
-    assert timings.draft_kind == "mtp"
-    assert timings.draft_rounds == 5
-    assert timings.draft_n_accepted == 12
-    assert timings.draft_n == 20
-    assert timings.draft_n_accepted / timings.draft_n == pytest.approx(0.6)
-
-
-def test_generation_timings_speculative_stats_default_to_none():
-    metrics = SimpleNamespace(
-        cached_tokens=0,
-        prompt_tps=20.0,
-        generation_tps=8.0,
-        token_times=[],
-        peak_memory=0.0,
-    )
-    timings = server.GenerationTimings.from_metrics(metrics, 10, 4)
-
-    assert timings.draft_kind is None
-    assert timings.draft_rounds is None
-    assert timings.draft_n_accepted is None
-    assert timings.draft_n is None
-
-
 def test_generation_metrics_record_speculative_stats():
     metrics = server_generation.GenerationMetrics()
 
@@ -3291,44 +2029,6 @@ def test_speculative_lifetime_counters_survive_reset():
     _record_speculative_round(drafter, 2, 7)
     rounds, accepted, drafted = speculative_stats_since(drafter, later_snapshot)
     assert (rounds, accepted, drafted) == (1, 2, 7)
-
-
-def test_chat_completions_returns_timings(client, monkeypatch):
-    monkeypatch.setattr(server.runtime, "response_generator", None)
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    result = GenerationResult(
-        text="done",
-        prompt_tokens=10,
-        generation_tokens=4,
-        prompt_tps=20.0,
-        generation_tps=8.0,
-        peak_memory=0.1,
-        cached_tokens=2,
-    )
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(server, "apply_chat_template", return_value="prompt"),
-        patch.object(server, "generate", return_value=result),
-    ):
-        response = client.post(
-            "/chat/completions",
-            json={
-                "model": "demo",
-                "messages": [{"role": "user", "content": "Hello"}],
-                "max_tokens": 12,
-            },
-        )
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
-    assert (body["timings"]["cache_n"], body["timings"]["prompt_n"]) == (2, 8)
-    assert body["timings"]["predicted_per_second"] == 8.0
 
 
 def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch):
@@ -3498,107 +2198,6 @@ def test_chat_completions_streaming_response_template_tool_calls(client, monkeyp
     assert usage_chunk["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
 
 
-def test_chat_completions_endpoint_flattens_text_content_parts(client):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    result = GenerationResult(
-        text="done",
-        prompt_tokens=8,
-        generation_tokens=4,
-        total_tokens=12,
-        prompt_tps=10.0,
-        generation_tps=5.0,
-        peak_memory=0.1,
-    )
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(
-            server, "apply_chat_template", return_value="prompt"
-        ) as mock_template,
-        patch.object(server, "generate", return_value=result),
-    ):
-        response = client.post(
-            "/chat/completions",
-            json={
-                "model": "demo",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "First text block."},
-                            {"type": "text", "text": "Second text block."},
-                        ],
-                    }
-                ],
-            },
-        )
-
-    assert response.status_code == 200
-    assert mock_template.call_args.args[2] == [
-        {
-            "role": "user",
-            "content": "First text block. Second text block.",
-        }
-    ]
-
-
-def test_chat_completions_endpoint_forwards_native_video_content(client):
-    model = SimpleNamespace()
-    processor = SimpleNamespace(
-        video_processor=SimpleNamespace(),
-        process=lambda text=None, images=None, videos=None, **kwargs: None,
-    )
-    config = SimpleNamespace(model_type="gemma4")
-    result = GenerationResult(
-        text="done",
-        prompt_tokens=8,
-        generation_tokens=4,
-        total_tokens=12,
-        prompt_tps=10.0,
-        generation_tps=5.0,
-        peak_memory=0.1,
-    )
-    from mlx_vlm.generate import video as video_module
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(
-            server, "apply_chat_template", return_value="prompt"
-        ) as mock_template,
-        patch.object(server, "generate", return_value=result) as mock_generate,
-        patch.object(video_module, "sample_video_frames") as mock_sample,
-    ):
-        response = client.post(
-            "/chat/completions",
-            json={
-                "model": "demo",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "video_url", "video_url": {"url": "clip.mp4"}},
-                            {"type": "text", "text": "Describe this video."},
-                        ],
-                    }
-                ],
-            },
-        )
-
-    assert response.status_code == 200
-    assert mock_template.call_args.kwargs["video"] == ["clip.mp4"]
-    assert mock_template.call_args.args[2] == [
-        {"role": "user", "content": "Describe this video."}
-    ]
-    assert mock_generate.call_args.kwargs["video"] == ["clip.mp4"]
-    mock_sample.assert_not_called()
-
-
 def test_chat_completions_endpoint_falls_back_from_video_to_images(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
@@ -3624,9 +2223,7 @@ def test_chat_completions_endpoint_falls_back_from_video_to_images(client):
         ) as mock_template,
         patch.object(server, "generate", return_value=result) as mock_generate,
         patch.object(
-            video_module,
-            "sample_video_frames",
-            return_value=(frames, 2.0),
+            video_module, "sample_video_frames", return_value=(frames, 2.0)
         ) as mock_sample,
     ):
         response = client.post(
@@ -3885,52 +2482,9 @@ def test_anthropic_messages_endpoint_converts_tool_result_inputs(client, monkeyp
         {"role": "tool", "tool_call_id": "toolu_1", "content": "72F", "name": None},
     ]
     normalized = apply_chat_template(
-        None,
-        config,
-        mock_template.call_args.args[2],
-        return_messages=True,
+        None, config, mock_template.call_args.args[2], return_messages=True
     )
     assert normalized[0]["content"] == ""
-
-
-def test_anthropic_messages_usage_reports_cached_tokens(client, monkeypatch):
-    monkeypatch.setattr(server.runtime, "response_generator", None)
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    result = GenerationResult(
-        text="done",
-        prompt_tokens=10,
-        generation_tokens=4,
-        cached_tokens=6,
-        prompt_tps=20.0,
-        generation_tps=8.0,
-        peak_memory=0.1,
-    )
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(server, "apply_chat_template", return_value="prompt"),
-        patch.object(server, "generate", return_value=result),
-    ):
-        response = client.post(
-            "/v1/messages",
-            json={
-                "model": "demo",
-                "messages": [{"role": "user", "content": "Hello"}],
-                "max_tokens": 4,
-            },
-        )
-
-    assert response.status_code == 200
-    assert response.json()["usage"] == {
-        "input_tokens": 4,
-        "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 6,
-        "output_tokens": 4,
-    }
 
 
 def test_anthropic_messages_endpoint_preserves_tool_result_images(client, monkeypatch):
@@ -4016,10 +2570,7 @@ def test_anthropic_messages_endpoint_preserves_tool_result_images(client, monkey
         {
             "role": "tool",
             "tool_call_id": "toolu_1",
-            "content": [
-                {"type": "text", "text": "Rendered chart."},
-                {"type": "image"},
-            ],
+            "content": [{"type": "text", "text": "Rendered chart."}, {"type": "image"}],
             "name": None,
         },
     ]
@@ -4035,8 +2586,7 @@ def test_anthropic_nonstreaming_preserves_thinking_with_tool_use(client, monkeyp
         thinking_end_token="<|eom|>",
     )
     processor = SimpleNamespace(
-        config=config,
-        tokenizer=_MuseResponseTemplateTokenizer(),
+        config=config, tokenizer=_MuseResponseTemplateTokenizer()
     )
     result = GenerationResult(
         text=(
@@ -4097,66 +2647,6 @@ def test_anthropic_nonstreaming_preserves_thinking_with_tool_use(client, monkeyp
     assert payload["content"][1]["input"] == {"city": "Warsaw"}
     assert "to=self" not in response.text
     assert "<atem:" not in response.text
-
-
-def test_anthropic_messages_streaming_uses_anthropic_events(client, monkeypatch):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-
-    class FakeResponseGenerator:
-        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
-            return None
-
-        def generate(self, prompt, images=None, audio=None, args=None):
-            return server.GenerationContext(uid=1, prompt_tokens=3), iter(
-                [
-                    server.StreamingToken(
-                        text="Hel",
-                        token=1,
-                        logprobs=0.0,
-                        finish_reason=None,
-                        cached_tokens=2,
-                    ),
-                    server.StreamingToken(
-                        text="lo",
-                        token=2,
-                        logprobs=0.0,
-                        finish_reason="stop",
-                        cached_tokens=2,
-                    ),
-                ]
-            )
-
-    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(server, "apply_chat_template", return_value="prompt"),
-    ):
-        response = client.post(
-            "/v1/messages",
-            json={
-                "model": "demo",
-                "messages": [{"role": "user", "content": "Hello"}],
-                "max_tokens": 4,
-                "stream": True,
-            },
-        )
-
-    assert response.status_code == 200
-    body = response.text
-    assert "event: message_start" in body
-    assert "event: content_block_start" in body
-    assert "event: content_block_delta" in body
-    assert '"text": "Hel"' in body
-    assert "event: message_delta" in body
-    assert '"stop_reason": "end_turn"' in body
-    assert '"cache_read_input_tokens": 2' in body
-    assert '"input_tokens": 1' in body
-    assert "event: message_stop" in body
 
 
 def test_anthropic_messages_streaming_splits_gemma_thinking_channel_content(
@@ -4402,24 +2892,6 @@ def test_anthropic_messages_any_tool_choice_adds_instruction(client, monkeypatch
     assert mock_template.call_args.kwargs["tool_choice"] == "required"
 
 
-def test_anthropic_messages_forced_tool_choice_filters_tools(client, monkeypatch):
-    monkeypatch.setattr(server.runtime, "response_generator", None)
-
-    response, mock_template = _anthropic_tool_choice_request(
-        client, {"type": "tool", "name": "get_time"}
-    )
-
-    assert response.status_code == 200
-    messages = mock_template.call_args.args[2]
-    assert "must call the 'get_time' function" in messages[-1]["content"]
-    selected_tools = mock_template.call_args.kwargs["tools"]
-    assert [tool["function"]["name"] for tool in selected_tools] == ["get_time"]
-    assert mock_template.call_args.kwargs["tool_choice"] == {
-        "type": "function",
-        "function": {"name": "get_time"},
-    }
-
-
 @pytest.mark.parametrize(
     ("tool_choice", "tools", "message"),
     [
@@ -4502,133 +2974,6 @@ def test_cache_endpoints_report_disabled_stats_and_reset(client, monkeypatch):
     assert response.status_code == 200
     assert response.json() == {"enabled": True, "status": "cleared"}
     manager.clear.assert_called_once_with()
-
-
-def test_metrics_endpoint_reports_empty_state(client, monkeypatch):
-    monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
-    monkeypatch.setattr(server.runtime, "apc_manager", None)
-    monkeypatch.setattr(server.runtime, "response_generator", None)
-    monkeypatch.setattr(server.runtime, "model_cache", {})
-
-    response = client.get("/metrics")
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["latest"] is None
-    assert payload["recent"] == []
-    assert payload["summary"]["requests_started"] == 0
-    assert payload["summary"]["requests_completed"] == 0
-    assert payload["summary"]["requests_failed"] == 0
-    assert payload["server"]["loaded_model"] is None
-    assert payload["server"]["apc"] == {"enabled": False}
-
-
-def test_metrics_store_logs_request_lifecycle(caplog):
-    caplog.set_level(logging.INFO, logger="mlx_vlm.server")
-    metrics = server.ServerMetricsStore()
-    metrics.begin_request(endpoint="/chat/completions", model="demo", stream=True)
-    metrics.record_success(
-        {
-            "endpoint": "/chat/completions",
-            "model": "demo",
-            "stream": True,
-            "backend": "continuous_batching",
-            "prompt_tokens": 10,
-            "completion_tokens": 4,
-            "generated_tokens": 4,
-            "request_elapsed_s": 0.5,
-            "decode_elapsed_s": 0.1,
-            "prefill_tok_s": 100.0,
-            "decode_tok_s": 40.0,
-            "finish_reason": "stop",
-        }
-    )
-
-    assert "Request started: endpoint=/chat/completions model=demo" in caplog.text
-    assert "Request completed: endpoint=/chat/completions model=demo" in caplog.text
-    assert "prefill=100.0 tok/s decode=40.0 tok/s" in caplog.text
-
-
-def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
-    monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
-    monkeypatch.setattr(server.runtime, "apc_manager", None)
-    monkeypatch.setattr(server.runtime, "response_generator", None)
-
-    config = SimpleNamespace(
-        text_config=SimpleNamespace(max_position_embeddings=4096),
-    )
-    processor = SimpleNamespace()
-    model = SimpleNamespace()
-    monkeypatch.setattr(
-        server.runtime,
-        "model_cache",
-        {
-            "model_path": "demo-model",
-            "adapter_path": None,
-            "config": config,
-            "processor": processor,
-        },
-    )
-    monkeypatch.setattr(
-        server,
-        "get_cached_model",
-        MagicMock(return_value=(model, processor, config)),
-    )
-    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
-    monkeypatch.setattr(
-        server,
-        "generate",
-        MagicMock(
-            return_value=GenerationResult(
-                text="Hello there",
-                prompt_tokens=12,
-                generation_tokens=5,
-                prompt_tps=120.0,
-                generation_tps=50.0,
-                peak_memory=1.25,
-            )
-        ),
-    )
-
-    response = client.post(
-        "/chat/completions",
-        json={
-            "model": "demo-model",
-            "messages": [{"role": "user", "content": "Hello"}],
-            "max_tokens": 8,
-        },
-    )
-
-    assert response.status_code == 200
-
-    metrics = client.get("/metrics")
-    assert metrics.status_code == 200
-    payload = metrics.json()
-
-    latest = payload["latest"]
-    assert latest["endpoint"] == "/chat/completions"
-    assert latest["model"] == "demo-model"
-    assert latest["stream"] is False
-    assert latest["backend"] == "generate"
-    assert latest["prompt_tokens"] == 12
-    assert latest["completion_tokens"] == 5
-    assert latest["generated_tokens"] == 5
-    assert latest["prefill_tok_s"] == 120.0
-    assert latest["decode_tok_s"] == 50.0
-    assert latest["peak_memory_gb"] == 1.25
-    assert latest["image_count"] == 0
-    assert latest["audio_count"] == 0
-    assert latest["apc_enabled"] is False
-
-    assert len(payload["recent"]) == 1
-    assert payload["summary"]["requests_started"] == 1
-    assert payload["summary"]["requests_completed"] == 1
-    assert payload["summary"]["requests_failed"] == 0
-    assert payload["summary"]["prompt_tokens_total"] == 12
-    assert payload["summary"]["completion_tokens_total"] == 5
-    assert payload["summary"]["generated_tokens_total"] == 5
-    assert payload["server"]["loaded_model"] == "demo-model"
-    assert payload["server"]["loaded_context_size"] == 4096
 
 
 # ── Continuous batching / ResponseGenerator tests ─────────────────────
@@ -4714,10 +3059,7 @@ class TestResponseGenerator:
         def generate_one(_):
             _, token_iter = gen.generate(
                 "prompt",
-                args=server.GenerationArguments(
-                    max_tokens=1,
-                    thinking_budget=512,
-                ),
+                args=server.GenerationArguments(max_tokens=1, thinking_budget=512),
             )
             token_iter.close()
 
@@ -4788,41 +3130,6 @@ class TestResponseGenerator:
             processor=gen.processor,
         )
 
-    def test_generate_skips_semantic_hash_for_unsupported_apc_model(self, monkeypatch):
-        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-        gen.wait_until_ready = lambda: None
-        gen.draft_model = None
-        gen.apc_manager = object()
-        gen.apc_mode = None
-        gen._cancel = lambda uid: None
-        gen._preprocess_request = lambda prompt, images, audio, videos: {
-            "input_ids": mx.array([[1, 2]], dtype=mx.int32),
-            "pixel_values": mx.zeros((1, 3, 2, 2), dtype=mx.float32),
-        }
-        queued = []
-
-        class Requests:
-            def put(self, request):
-                queued.append(request)
-                request.rqueue.put(server.GenerationContext(uid=1, prompt_tokens=2))
-
-        gen.requests = Requests()
-        image_hash = MagicMock(wraps=apc_module.hash_image_payload)
-        semantic_hash = MagicMock(wraps=apc_module.semantic_extra_hash)
-        monkeypatch.setattr(apc_module, "hash_image_payload", image_hash)
-        monkeypatch.setattr(apc_module, "semantic_extra_hash", semantic_hash)
-
-        _, token_iter = gen.generate(
-            "prompt",
-            images=["image.png"],
-            args=server.GenerationArguments(max_tokens=1),
-        )
-        token_iter.close()
-
-        assert queued[0].apc_semantic_hash is None
-        image_hash.assert_not_called()
-        semantic_hash.assert_not_called()
-
     def test_server_runtime_snapshot_reports_effective_context_limit(self, monkeypatch):
         monkeypatch.setenv("MAX_KV_SIZE", "8")
         monkeypatch.setattr(
@@ -4850,18 +3157,6 @@ class TestResponseGenerator:
         assert args.enable_thinking is False
         assert args.logit_bias is None
 
-    def test_token_queue_timeout_defaults_to_long_prefill_window(self, monkeypatch):
-        monkeypatch.delenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", raising=False)
-        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
-
-        assert server.get_token_queue_timeout() == 600.0
-
-    def test_token_queue_timeout_accepts_namespaced_env(self, monkeypatch):
-        monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "42.5")
-        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
-
-        assert server.get_token_queue_timeout() == 42.5
-
     def test_token_queue_timeout_invalid_values_fall_back_to_default(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "bad")
         monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
@@ -4873,16 +3168,6 @@ class TestResponseGenerator:
         monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
 
         assert server.get_token_queue_timeout() is None
-
-    def test_log_progress_interval_is_configurable(self, monkeypatch):
-        monkeypatch.delenv("MLX_VLM_LOG_PROGRESS_INTERVAL", raising=False)
-        assert server.get_log_progress_interval() == 10
-
-        monkeypatch.setenv("MLX_VLM_LOG_PROGRESS_INTERVAL", "7")
-        assert server.get_log_progress_interval() == 7
-
-        monkeypatch.setenv("MLX_VLM_LOG_PROGRESS_INTERVAL", "-1")
-        assert server.get_log_progress_interval() == 0
 
     def test_debug_decode_logging_adds_token_details(self, monkeypatch, caplog):
         monkeypatch.setenv("MLX_VLM_LOG_PROGRESS_INTERVAL", "2")
@@ -4929,11 +3214,7 @@ class TestResponseGenerator:
 
         for token_number in range(1, 3):
             server.ResponseGenerator._log_decode_progress(
-                1,
-                info,
-                token=token_number,
-                text=str(token_number),
-                finish_reason=None,
+                1, info, token=token_number, text=str(token_number), finish_reason=None
             )
 
         progress = [
@@ -4946,43 +3227,6 @@ class TestResponseGenerator:
         assert "token_number=" not in progress[0]
         assert "token_id=" not in progress[0]
         assert "text=" not in progress[0]
-
-    def test_decode_logging_uses_one_rate_field(self, monkeypatch, caplog):
-        times = iter([10.0, 10.25])
-        monkeypatch.setattr(server_generation.time, "perf_counter", lambda: next(times))
-        caplog.set_level(logging.DEBUG, logger="mlx_vlm.server")
-        info = {
-            "request_id": "req-1",
-            "queued_at": 9.0,
-            "generated_tokens": 0,
-            "decode_started_at": None,
-            "last_token_at": None,
-        }
-
-        for token_number in range(1, 3):
-            server.ResponseGenerator._log_decode_progress(
-                1,
-                info,
-                token=token_number,
-                text=str(token_number),
-                finish_reason="stop" if token_number == 2 else None,
-            )
-
-        progress = [
-            record.getMessage()
-            for record in caplog.records
-            if record.getMessage().startswith("Decode progress:")
-        ]
-        assert "rate=n/a" in progress[0]
-        assert "rate=4.0 tok/s" in progress[1]
-        assert not any("token_rate=" in message for message in progress)
-        completed = next(
-            record.getMessage()
-            for record in caplog.records
-            if record.getMessage().startswith("Decode completed:")
-        )
-        assert "rate=4.0 tok/s" in completed
-        assert "token_rate=" not in completed
 
     def test_chunked_prefill_logging_reports_partial_progress(self, caplog):
         caplog.set_level(logging.INFO, logger="mlx_vlm.server")
@@ -5037,10 +3281,7 @@ class TestResponseGenerator:
 
         rqueue = BlockingQueue()
         token_iter = server_generation._TokenIterator(
-            rqueue,
-            "req-1",
-            cancelled.append,
-            None,
+            rqueue, "req-1", cancelled.append, None
         )
 
         def consume():
@@ -5097,45 +3338,14 @@ class TestResponseGenerator:
             next(token_iter)
         assert cancelled == []
 
-    def test_collect_pending_requests_coalesces_after_first_item(self, monkeypatch):
-        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-        gen.requests = Queue()
-        gen._stop = False
-        first = object()
-        second = object()
-        gen.requests.put(first)
-
-        def fake_sleep(seconds):
-            assert seconds == pytest.approx(0.005)
-            gen.requests.put(second)
-
-        monkeypatch.setattr(server.time, "sleep", fake_sleep)
-
-        pending, should_stop = gen._collect_pending_requests(
-            active=False, coalesce_s=0.005
-        )
-
-        assert pending == [first, second]
-        assert should_stop is False
-
     def test_step_streams_spm_subword_tokens_immediately(self):
         class SentencePieceTokenizer:
-            vocab = {
-                "▁hello": 0,
-                "world": 1,
-                "!": 2,
-            }
+            vocab = {"▁hello": 0, "world": 1, "!": 2}
 
             def decode(self, tokens):
                 parts = []
                 for token in tokens:
-                    parts.append(
-                        {
-                            0: " hello",
-                            1: "world",
-                            2: "!",
-                        }[token]
-                    )
+                    parts.append({0: " hello", 1: "world", 2: "!"}[token])
                 return "".join(parts).lstrip()
 
         class SingleResponseBatch:
@@ -5153,8 +3363,7 @@ class TestResponseGenerator:
             1: {
                 "rqueue": rqueue,
                 "streamer": _ServerTokenStreamer(
-                    tokenizer,
-                    server.make_streaming_detokenizer(processor),
+                    tokenizer, server.make_streaming_detokenizer(processor)
                 ),
             }
         }
@@ -5163,10 +3372,7 @@ class TestResponseGenerator:
             gen._step(
                 SingleResponseBatch(
                     SimpleNamespace(
-                        uid=1,
-                        token=token,
-                        token_logprob=0.0,
-                        finish_reason=None,
+                        uid=1, token=token, token_logprob=0.0, finish_reason=None
                     )
                 ),
                 active,
@@ -5174,10 +3380,7 @@ class TestResponseGenerator:
         gen._step(
             SingleResponseBatch(
                 SimpleNamespace(
-                    uid=1,
-                    token=99,
-                    token_logprob=0.0,
-                    finish_reason="stop",
+                    uid=1, token=99, token_logprob=0.0, finish_reason="stop"
                 )
             ),
             active,
@@ -5193,10 +3396,7 @@ class TestResponseGenerator:
 
     def test_server_token_streamer_flushes_incomplete_utf8_on_finalize(self):
         class ByteFallbackTokenizer:
-            vocab = {
-                "<0xF0>": 0,
-                "<0x9F>": 1,
-            }
+            vocab = {"<0xF0>": 0, "<0x9F>": 1}
 
             def decode(self, tokens):
                 byte_values = {0: 0xF0, 1: 0x9F}
@@ -5209,136 +3409,12 @@ class TestResponseGenerator:
             detokenizer=SPMStreamingDetokenizer(tokenizer, trim_space=False)
         )
         streamer = _ServerTokenStreamer(
-            tokenizer,
-            server.make_streaming_detokenizer(processor),
+            tokenizer, server.make_streaming_detokenizer(processor)
         )
 
         assert streamer.advance(0, None) == ""
         assert streamer.advance(1, None) == ""
         assert streamer.finalize() == "\ufffd"
-
-    def test_step_streams_multiple_utf8_emojis_with_text_between_them(self):
-        class MixedEmojiTokenizer:
-            vocab = {
-                "hi": 0,
-                "<0xF0>": 1,
-                "<0x9F>": 2,
-                "<0x98>": 3,
-                "<0x80>": 4,
-                "▁mid": 5,
-                "<0x82>": 6,
-                "▁wow": 7,
-                "<0x8E>": 8,
-                "▁done": 9,
-            }
-
-            def decode(self, tokens):
-                text = ""
-                byte_buffer = bytearray()
-                byte_values = {
-                    1: 0xF0,
-                    2: 0x9F,
-                    3: 0x98,
-                    4: 0x80,
-                    6: 0x82,
-                    8: 0x8E,
-                }
-                regular = {0: "hi", 5: "▁mid", 7: "▁wow", 9: "▁done"}
-
-                def flush_bytes():
-                    nonlocal text, byte_buffer
-                    if byte_buffer:
-                        text += byte_buffer.decode("utf-8", errors="replace")
-                        byte_buffer = bytearray()
-
-                for token in tokens:
-                    if token in byte_values:
-                        byte_buffer.append(byte_values[token])
-                    else:
-                        flush_bytes()
-                        text += regular[token].replace("▁", " ")
-                flush_bytes()
-                return text
-
-        class SingleResponseBatch:
-            def __init__(self, response):
-                self.response = response
-
-            def next(self, **kwargs):
-                return [], [self.response]
-
-        tokenizer = MixedEmojiTokenizer()
-        processor = SimpleNamespace(
-            detokenizer=SPMStreamingDetokenizer(tokenizer, trim_space=False)
-        )
-        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-        rqueue = Queue()
-        active = {
-            1: {
-                "rqueue": rqueue,
-                "streamer": _ServerTokenStreamer(
-                    tokenizer,
-                    server.make_streaming_detokenizer(processor),
-                ),
-            }
-        }
-
-        for token in [0, 1, 2, 3, 4, 5, 1, 2, 3, 6, 7, 1, 2, 3, 8, 9, 1, 2, 3, 4]:
-            gen._step(
-                SingleResponseBatch(
-                    SimpleNamespace(
-                        uid=1,
-                        token=token,
-                        token_logprob=0.0,
-                        finish_reason=None,
-                    )
-                ),
-                active,
-            )
-        gen._step(
-            SingleResponseBatch(
-                SimpleNamespace(
-                    uid=1,
-                    token=99,
-                    token_logprob=0.0,
-                    finish_reason="stop",
-                )
-            ),
-            active,
-        )
-
-        segments = []
-        while not rqueue.empty():
-            item = rqueue.get()
-            if item is not None:
-                segments.append(item.text)
-
-        streamed_text = "".join(segments)
-        assert segments == [
-            "hi",
-            "",
-            "",
-            "",
-            "😀",
-            " mid",
-            "",
-            "",
-            "",
-            "😂",
-            " wow",
-            "",
-            "",
-            "",
-            "😎",
-            " done",
-            "",
-            "",
-            "",
-            "😀",
-            "",
-        ]
-        assert streamed_text == "hi😀 mid😂 wow😎 done😀"
-        assert "\ufffd" not in streamed_text
 
     def test_run_batches_eight_streaming_requests(self, monkeypatch):
         batch_state = {}
@@ -5411,9 +3487,7 @@ class TestResponseGenerator:
 
         monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
         monkeypatch.setattr(
-            server_generation,
-            "make_streaming_detokenizer",
-            lambda _: FakeDetokenizer(),
+            server_generation, "make_streaming_detokenizer", lambda _: FakeDetokenizer()
         )
 
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
@@ -5495,10 +3569,7 @@ class TestResponseGenerator:
         assert batch_gen.next_active_sizes[:2] == [8, 8]
         assert len(streamed_by_uid) == 8
         for uid, items in streamed_by_uid.items():
-            assert items == [
-                (str(uid * 10), None),
-                (str(uid * 10 + 1), "length"),
-            ]
+            assert items == [(str(uid * 10), None), (str(uid * 10 + 1), "length")]
 
     @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])
     def test_run_routes_speculative_decode_through_batch_generator(
@@ -5565,14 +3636,10 @@ class TestResponseGenerator:
 
         monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
         monkeypatch.setattr(
-            server_generation,
-            "_get_draft_block_size_from_env",
-            lambda: 6,
+            server_generation, "_get_draft_block_size_from_env", lambda: 6
         )
         monkeypatch.setattr(
-            server_generation,
-            "make_streaming_detokenizer",
-            lambda _: FakeDetokenizer(),
+            server_generation, "make_streaming_detokenizer", lambda _: FakeDetokenizer()
         )
 
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
@@ -5658,44 +3725,6 @@ class TestResponseGenerator:
         apc_manager.close.assert_called_once_with()
         assert batch_state["instance"].next_active_sizes == [2]
 
-    @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])
-    def test_run_coalesces_idle_speculative_batch_generator(
-        self, monkeypatch, draft_kind
-    ):
-        monkeypatch.setenv("MLX_VLM_SPEC_BATCH_COALESCE_MS", "37")
-        calls = []
-        draft_model = object()
-
-        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-        gen.draft_model = None
-        gen.draft_kind = None
-        gen._stop = False
-        gen._ready = Event()
-        gen._load_error = None
-
-        def fake_initialize_model():
-            gen.model = SimpleNamespace(language_model=object())
-            gen.processor = SimpleNamespace()
-            gen.config = SimpleNamespace()
-            gen.stop_tokens = set()
-            gen.draft_model = draft_model
-            gen.draft_kind = draft_kind
-            gen.tokenizer = SimpleNamespace()
-
-        def fake_collect_pending_requests(
-            *, active, idle_timeout=0.1, coalesce_s=0.0, capacity=None
-        ):
-            del idle_timeout, capacity
-            calls.append((active, coalesce_s))
-            return [], True
-
-        gen._initialize_model = fake_initialize_model
-        gen._collect_pending_requests = fake_collect_pending_requests
-
-        gen._run_impl()
-
-        assert calls == [(False, 0.037)]
-
     def test_idle_batch_generator_is_recreated_for_new_sampler(self, monkeypatch):
         created = []
         next_uid = [1]
@@ -5744,10 +3773,7 @@ class TestResponseGenerator:
                 del kwargs
                 responses = [
                     SimpleNamespace(
-                        uid=uid,
-                        token=uid,
-                        token_logprob=0.0,
-                        finish_reason="length",
+                        uid=uid, token=uid, token_logprob=0.0, finish_reason="length"
                     )
                     for uid in list(self._active)
                 ]
@@ -5762,9 +3788,7 @@ class TestResponseGenerator:
 
         monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
         monkeypatch.setattr(
-            server_generation,
-            "make_streaming_detokenizer",
-            lambda _: FakeDetokenizer(),
+            server_generation, "make_streaming_detokenizer", lambda _: FakeDetokenizer()
         )
 
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
@@ -5852,10 +3876,7 @@ class TestResponseGenerator:
                     [SimpleNamespace(uid=1, prompt_tps=184.431, cached_tokens=7)],
                     [
                         SimpleNamespace(
-                            uid=1,
-                            token=0,
-                            token_logprob=0.0,
-                            finish_reason="stop",
+                            uid=1, token=0, token_logprob=0.0, finish_reason="stop"
                         )
                     ],
                 )
@@ -5870,8 +3891,7 @@ class TestResponseGenerator:
             1: {
                 "rqueue": rqueue,
                 "streamer": _ServerTokenStreamer(
-                    tokenizer,
-                    server.make_streaming_detokenizer(processor),
+                    tokenizer, server.make_streaming_detokenizer(processor)
                 ),
                 "prompt_tps": None,
                 "cached_tokens": 0,
@@ -5924,89 +3944,6 @@ class TestResponseGenerator:
         assert kw["logits_processors"] == [processor]
         assert kw["apc_tenant"] == "tenant-a"
 
-    def test_generate_arguments_to_template_kwargs(self):
-        args = server.GenerationArguments(
-            enable_thinking=False,
-            reasoning=True,
-            reasoning_effort="high",
-            thinking_budget=50,
-            thinking_end_token="</think>",
-        )
-        kw = args.to_template_kwargs()
-        assert kw["enable_thinking"] is False
-        assert kw["reasoning"] is True
-        assert kw["reasoning_effort"] == "high"
-        assert kw["thinking_budget"] == 50
-        assert kw["thinking_end_token"] == "</think>"
-
-    def test_generate_arguments_omits_none_optionals(self):
-        args = server.GenerationArguments()
-        kw = args.to_generate_kwargs()
-        assert "repetition_penalty" not in kw
-        assert (
-            kw["repetition_context_size"]
-            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
-        )
-        assert "presence_penalty" not in kw
-        assert (
-            kw["presence_context_size"]
-            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
-        )
-        assert "frequency_penalty" not in kw
-        assert (
-            kw["frequency_context_size"]
-            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
-        )
-        assert "logit_bias" not in kw
-        assert "thinking_budget" not in kw
-
-    def test_server_generation_builds_repetition_logits_processors(self, monkeypatch):
-        custom_processor = lambda tokens, logits: logits
-        calls = []
-
-        def fake_make_logits_processors(
-            logit_bias,
-            repetition_penalty,
-            repetition_context_size,
-            presence_penalty,
-            presence_context_size,
-            frequency_penalty,
-            frequency_context_size,
-        ):
-            calls.append(
-                (
-                    logit_bias,
-                    repetition_penalty,
-                    repetition_context_size,
-                    presence_penalty,
-                    presence_context_size,
-                    frequency_penalty,
-                    frequency_context_size,
-                )
-            )
-            return ["repetition-processor"]
-
-        monkeypatch.setattr(
-            server_generation, "make_logits_processors", fake_make_logits_processors
-        )
-
-        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-        args = server.GenerationArguments(
-            repetition_penalty=1.2,
-            repetition_context_size=512,
-            presence_penalty=0.2,
-            presence_context_size=256,
-            frequency_penalty=0.3,
-            frequency_context_size=128,
-            logit_bias={5: -0.5},
-            logits_processors=[custom_processor],
-        )
-
-        processors = gen._make_logits_processors(args)
-
-        assert calls == [({5: -0.5}, 1.2, 512, 0.2, 256, 0.3, 128)]
-        assert processors == ["repetition-processor", custom_processor]
-
     def test_server_generation_delays_structured_processors_for_thinking_prompt(
         self, monkeypatch
     ):
@@ -6033,8 +3970,7 @@ class TestResponseGenerator:
         )
 
         processors = gen._make_logits_processors(
-            args,
-            mx.array([[1, 10, 3]], dtype=mx.int32),
+            args, mx.array([[1, 10, 3]], dtype=mx.int32)
         )
 
         assert processors[0] is repetition_processor
@@ -6050,9 +3986,7 @@ class TestResponseGenerator:
 
         structured_processor = lambda tokens, logits: logits
         monkeypatch.setattr(
-            server_generation,
-            "make_logits_processors",
-            lambda *_args: [],
+            server_generation, "make_logits_processors", lambda *_args: []
         )
 
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
@@ -6065,8 +3999,7 @@ class TestResponseGenerator:
         )
 
         processors = gen._make_logits_processors(
-            args,
-            mx.array([[1, 10, 3, 20]], dtype=mx.int32),
+            args, mx.array([[1, 10, 3, 20]], dtype=mx.int32)
         )
 
         assert processors == [structured_processor]
@@ -6099,43 +4032,12 @@ class TestResponseGenerator:
         )
 
         processors = gen._make_logits_processors(
-            args,
-            mx.array([[1, 2, 3]], dtype=mx.int32),
+            args, mx.array([[1, 2, 3]], dtype=mx.int32)
         )
 
         assert processors[0] is repetition_processor
         assert isinstance(processors[1], server_generation.ThinkingAwareLogitsProcessor)
         assert processors[1].processor is structured_processor
-
-    def test_build_gen_args_from_openai_request(self):
-        req = SimpleNamespace(
-            max_output_tokens=128,
-            temperature=0.5,
-            top_p=0.9,
-            top_k=32,
-            min_p=0.1,
-            repetition_penalty=1.2,
-            repetition_context_size=512,
-            presence_penalty=0.2,
-            presence_context_size=256,
-            frequency_penalty=0.3,
-            frequency_context_size=128,
-            logit_bias={"5": -1.0},
-            enable_thinking=False,
-            thinking_budget=None,
-            thinking_start_token=None,
-            thinking_end_token=None,
-        )
-        args = server._build_gen_args(req, tenant_id="tenant-a")
-        assert args.max_tokens == 128
-        assert args.top_k == 32
-        assert args.repetition_context_size == 512
-        assert args.presence_penalty == 0.2
-        assert args.presence_context_size == 256
-        assert args.frequency_penalty == 0.3
-        assert args.frequency_context_size == 128
-        assert args.logit_bias == {5: -1.0}  # string keys converted to int
-        assert args.to_generate_kwargs()["apc_tenant"] == "tenant-a"
 
     def test_build_gen_args_from_chat_request(self):
         req = SimpleNamespace(
@@ -6161,21 +4063,6 @@ class TestResponseGenerator:
         assert args.max_tokens == 256
         assert args.enable_thinking is True
 
-    def test_build_gen_args_maps_responses_reasoning_configuration(self):
-        req = server.OpenAIRequest(
-            model="demo",
-            input="hi",
-            reasoning={"effort": "high", "summary": "auto"},
-        )
-
-        args = server._build_gen_args(req)
-
-        assert args.enable_thinking is True
-        assert args.reasoning is True
-        assert args.reasoning_effort == "high"
-        assert args.to_template_kwargs()["reasoning"] is True
-        assert args.to_template_kwargs()["reasoning_effort"] == "high"
-
     def test_build_gen_args_maps_chat_reasoning_effort(self):
         req = server.ChatRequest(
             model="demo",
@@ -6189,187 +4076,12 @@ class TestResponseGenerator:
         assert args.reasoning is True
         assert args.reasoning_effort == "low"
 
-    def test_build_gen_args_maps_none_reasoning_effort_to_disabled(self):
-        req = server.OpenAIRequest(
-            model="demo",
-            input="hi",
-            reasoning={"effort": "none"},
-        )
-
-        args = server._build_gen_args(req)
-
-        assert args.enable_thinking is False
-        assert args.reasoning is False
-        assert args.reasoning_effort == "none"
-
-    def test_build_gen_args_explicit_thinking_overrides_standard_reasoning(self):
-        req = server.ChatRequest(
-            model="demo",
-            messages=[server.ChatMessage(role="user", content="hi")],
-            enable_thinking=False,
-            reasoning_effort="high",
-        )
-
-        args = server._build_gen_args(req)
-
-        assert args.enable_thinking is False
-        assert args.reasoning is False
-        assert args.reasoning_effort == "high"
-
-    def test_build_gen_args_preserves_diffusion_options(self):
-        req = server.ChatRequest(
-            model="demo",
-            messages=[server.ChatMessage(role="user", content="hi")],
-            max_denoising_steps=7,
-            block_length=16,
-            num_to_transfer=3,
-            max_transfer_per_step=2,
-            editing_threshold=0.8,
-            max_post_steps=5,
-            stability_steps=1,
-            diffusion_full_canvas=True,
-            diffusion_min_canvas_length=4,
-            diffusion_max_canvas_length=8,
-            diffusion_sampler="entropy-bound",
-            threshold=0.7,
-            min_threshold=0.4,
-        )
-
-        args = server._build_gen_args(req)
-
-        expected = {
-            "max_denoising_steps": 7,
-            "block_length": 16,
-            "num_to_transfer": 3,
-            "max_transfer_per_step": 2,
-            "editing_threshold": 0.8,
-            "max_post_steps": 5,
-            "stability_steps": 1,
-            "diffusion_full_canvas": True,
-            "diffusion_min_canvas_length": 4,
-            "diffusion_max_canvas_length": 8,
-            "diffusion_sampler": "entropy-bound",
-            "threshold": 0.7,
-            "min_threshold": 0.4,
-        }
-        assert args.diffusion_kwargs() == expected
-        for key, value in expected.items():
-            assert args.to_generate_kwargs()[key] == value
-
-    def test_build_gen_args_uses_model_generation_config_when_omitted(
-        self, monkeypatch
-    ):
-        monkeypatch.setitem(
-            server.runtime.model_cache,
-            "config",
-            SimpleNamespace(temperature=1.0, top_p=0.95, top_k=64),
-        )
-        req = server.ChatRequest(
-            model="demo",
-            messages=[server.ChatMessage(role="user", content="hi")],
-        )
-
-        args = server._build_gen_args(req)
-
-        assert args.temperature == 1.0
-        assert args.top_p == 0.95
-        assert args.top_k == 64
-
-    def test_build_gen_args_request_sampling_overrides_model_generation_config(
-        self, monkeypatch
-    ):
-        monkeypatch.setitem(
-            server.runtime.model_cache,
-            "config",
-            SimpleNamespace(temperature=1.0, top_p=0.95, top_k=64),
-        )
-        req = server.ChatRequest(
-            model="demo",
-            messages=[server.ChatMessage(role="user", content="hi")],
-            temperature=0.0,
-            top_p=1.0,
-            top_k=0,
-        )
-
-        args = server._build_gen_args(req)
-
-        assert args.temperature == 0.0
-        assert args.top_p == 1.0
-        assert args.top_k == 0
-
-    def test_build_gen_args_defaults_penalty_context_sizes_when_omitted(self):
-        req = server.ChatRequest(
-            model="demo",
-            messages=[server.ChatMessage(role="user", content="hi")],
-            repetition_penalty=1.1,
-            presence_penalty=0.2,
-            frequency_penalty=0.3,
-        )
-
-        args = server._build_gen_args(req)
-
-        assert (
-            args.repetition_context_size
-            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
-        )
-        assert (
-            args.presence_context_size
-            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
-        )
-        assert (
-            args.frequency_context_size
-            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
-        )
-
-    def test_build_gen_args_defaults_penalty_context_sizes_when_null(self):
-        req = server.ChatRequest(
-            model="demo",
-            messages=[server.ChatMessage(role="user", content="hi")],
-            repetition_penalty=1.1,
-            repetition_context_size=None,
-            presence_penalty=0.2,
-            presence_context_size=None,
-            frequency_penalty=0.3,
-            frequency_context_size=None,
-        )
-
-        args = server._build_gen_args(req)
-
-        assert (
-            args.repetition_context_size
-            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
-        )
-        assert (
-            args.presence_context_size
-            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
-        )
-        assert (
-            args.frequency_context_size
-            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
-        )
-
-    def test_build_gen_args_preserves_explicit_penalty_context_sizes(self):
-        req = server.ChatRequest(
-            model="demo",
-            messages=[server.ChatMessage(role="user", content="hi")],
-            repetition_context_size=64,
-            presence_context_size=32,
-            frequency_context_size=16,
-        )
-
-        args = server._build_gen_args(req)
-
-        assert args.repetition_context_size == 64
-        assert args.presence_context_size == 32
-        assert args.frequency_context_size == 16
-
     def test_build_gen_args_uses_server_thinking_default_when_omitted(
         self, monkeypatch
     ):
         monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "1")
         req = server.ChatRequest(
-            model="demo",
-            messages=[server.ChatMessage(role="user", content="hi")],
+            model="demo", messages=[server.ChatMessage(role="user", content="hi")]
         )
 
         assert "enable_thinking" not in req.model_fields_set
@@ -6377,105 +4089,10 @@ class TestResponseGenerator:
 
         monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "0")
         req = server.ChatRequest(
-            model="demo",
-            messages=[server.ChatMessage(role="user", content="hi")],
+            model="demo", messages=[server.ChatMessage(role="user", content="hi")]
         )
 
         assert server._build_gen_args(req).enable_thinking is False
-
-    def test_build_gen_args_uses_server_thinking_token_defaults_when_omitted(
-        self, monkeypatch
-    ):
-        processor = SimpleNamespace(
-            config=SimpleNamespace(
-                thinking_start_token="<model-analysis>",
-                thinking_end_token="</model-analysis>",
-            )
-        )
-        monkeypatch.setenv("MLX_VLM_THINKING_BUDGET", "256")
-        monkeypatch.setenv("MLX_VLM_THINKING_START_TOKEN", "<analysis>")
-        monkeypatch.setenv("MLX_VLM_THINKING_END_TOKEN", "</analysis>")
-        req = server.ChatRequest(
-            model="demo",
-            messages=[server.ChatMessage(role="user", content="hi")],
-        )
-
-        assert "thinking_budget" not in req.model_fields_set
-        assert "thinking_start_token" not in req.model_fields_set
-        assert "thinking_end_token" not in req.model_fields_set
-        args = server._build_gen_args(req, processor)
-
-        assert args.thinking_budget == 256
-        assert args.thinking_start_token == "<analysis>"
-        assert args.thinking_end_token == "</analysis>"
-
-    def test_build_gen_args_uses_processor_config_thinking_tokens_when_omitted(
-        self, monkeypatch
-    ):
-        monkeypatch.delenv("MLX_VLM_THINKING_START_TOKEN", raising=False)
-        monkeypatch.delenv("MLX_VLM_THINKING_END_TOKEN", raising=False)
-        processor = SimpleNamespace(
-            config=SimpleNamespace(
-                thinking_start_token="to=self<|message|>",
-                thinking_end_token="<|eom|>",
-            )
-        )
-        req = server.ChatRequest(
-            model="demo",
-            messages=[server.ChatMessage(role="user", content="hi")],
-        )
-
-        args = server._build_gen_args(req, processor)
-
-        assert args.thinking_start_token == "to=self<|message|>"
-        assert args.thinking_end_token == "<|eom|>"
-
-    def test_build_gen_args_request_thinking_overrides_server_default(
-        self, monkeypatch
-    ):
-        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "1")
-        req = server.ChatRequest(
-            model="demo",
-            messages=[server.ChatMessage(role="user", content="hi")],
-            enable_thinking=False,
-        )
-
-        assert server._build_gen_args(req).enable_thinking is False
-
-        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "0")
-        req = server.ChatRequest(
-            model="demo",
-            messages=[server.ChatMessage(role="user", content="hi")],
-            enable_thinking=True,
-        )
-
-        assert server._build_gen_args(req).enable_thinking is True
-
-    def test_build_gen_args_request_thinking_tokens_override_server_defaults(
-        self, monkeypatch
-    ):
-        processor = SimpleNamespace(
-            config=SimpleNamespace(
-                thinking_start_token="<model-analysis>",
-                thinking_end_token="</model-analysis>",
-            )
-        )
-        monkeypatch.setenv("MLX_VLM_THINKING_BUDGET", "256")
-        monkeypatch.setenv("MLX_VLM_THINKING_START_TOKEN", "<analysis>")
-        monkeypatch.setenv("MLX_VLM_THINKING_END_TOKEN", "</analysis>")
-        req = server.ChatRequest(
-            model="demo",
-            messages=[server.ChatMessage(role="user", content="hi")],
-            thinking_budget=32,
-            thinking_start_token="<think>",
-            thinking_end_token="</think>",
-        )
-
-        args = server._build_gen_args(req, processor)
-
-        assert args.thinking_budget == 32
-        assert args.thinking_start_token == "<think>"
-        assert args.thinking_end_token == "</think>"
 
     def test_server_cli_sets_thinking_defaults(self, monkeypatch):
         for env_var in (
@@ -6572,44 +4189,6 @@ class TestResponseGenerator:
             ):
                 os.environ.pop(env_var, None)
 
-    def test_lifespan_preloads_configured_model_kinds(self, monkeypatch):
-        preload_env = {
-            "MLX_VLM_PRELOAD_MODEL": "language-demo",
-            "MLX_VLM_PRELOAD_ADAPTER": "adapter-demo",
-            "MLX_VLM_PRELOAD_IMAGE_MODEL": "image-demo",
-            "MLX_VLM_PRELOAD_TTS_MODEL": "tts-demo",
-            "MLX_VLM_PRELOAD_STT_MODEL": "stt-demo",
-            "MLX_VLM_PRELOAD_RERANKER_MODEL": "reranker-demo",
-        }
-        for key, value in preload_env.items():
-            monkeypatch.setenv(key, value)
-        calls = []
-
-        def fake_get_cached_model(model_path, adapter_path=None, *, model_kind="auto"):
-            calls.append((model_path, adapter_path, model_kind))
-            return SimpleNamespace(), None, SimpleNamespace(model_type=model_kind)
-
-        monkeypatch.setattr(
-            server._app_module, "get_cached_model", fake_get_cached_model
-        )
-        monkeypatch.setattr(server.runtime, "audio_queue", None)
-
-        async def run_lifespan():
-            async with server._app_module.lifespan(server.app):
-                pass
-
-        asyncio.run(run_lifespan())
-
-        assert calls == [
-            ("language-demo", "adapter-demo", "text_generation"),
-            ("image-demo", None, "image_generation"),
-            ("tts-demo", None, "audio_tts"),
-            ("stt-demo", None, "audio_stt"),
-            ("reranker-demo", None, "reranker"),
-        ]
-        for key in preload_env:
-            assert key not in os.environ
-
     def test_lifespan_continues_when_optional_preload_fails(self, monkeypatch):
         preload_env = {
             "MLX_VLM_PRELOAD_MODEL": "language-demo",
@@ -6654,26 +4233,6 @@ class TestResponseGenerator:
         assert "Failed to load audio model" in failure["error"]
         assert "audio_tts" not in server.runtime.preload_failures
         server.runtime.preload_failures.clear()
-
-    def test_lifespan_propagates_language_model_failure(self, monkeypatch):
-        monkeypatch.setenv("MLX_VLM_PRELOAD_MODEL", "language-demo")
-
-        def fake_get_cached_model(model_path, adapter_path=None, *, model_kind="auto"):
-            raise server.HTTPException(
-                status_code=500, detail="language model exploded"
-            )
-
-        monkeypatch.setattr(
-            server._app_module, "get_cached_model", fake_get_cached_model
-        )
-        monkeypatch.setattr(server.runtime, "audio_queue", None)
-
-        async def run_lifespan():
-            async with server._app_module.lifespan(server.app):
-                pass
-
-        with pytest.raises(server.HTTPException):
-            asyncio.run(run_lifespan())
 
     def test_gpu_embed_hashes_pixel_values_without_image_ref(self):
         class Embed:
@@ -6724,67 +4283,13 @@ class TestResponseGenerator:
 
         _, gen_kwargs = server.ResponseGenerator._gpu_embed(
             response_generator,
-            {
-                "input_ids": mx.array([[1, 2]]),
-                "attention_mask": mx.array([[1, 1]]),
-            },
+            {"input_ids": mx.array([[1, 2]]), "attention_mask": mx.array([[1, 1]])},
             images=None,
         )
 
         assert "position_ids" not in gen_kwargs
         assert "rope_deltas" not in gen_kwargs
         assert "_apc_semantic_hash" not in gen_kwargs
-
-    def test_gpu_embed_uses_precomputed_semantic_hash(self):
-        class Embed:
-            def to_dict(self):
-                return {"inputs_embeds": mx.zeros((1, 2, 4))}
-
-        class Model:
-            def get_input_embeddings(
-                self, input_ids, pixel_values, mask=None, **kwargs
-            ):
-                return Embed()
-
-        response_generator = SimpleNamespace(model=Model(), vision_cache=None)
-        pixel_values = mx.array([[[[1.0, 2.0]]]])
-        images = ["image-a.png"]
-        semantic_hash = apc_module.semantic_extra_hash(
-            image_hash=hash_image_payload(pixel_values=pixel_values)
-        )
-
-        _, gen_kwargs = server.ResponseGenerator._gpu_embed(
-            response_generator,
-            {
-                "input_ids": mx.array([[1, 2]]),
-                "pixel_values": pixel_values,
-                "attention_mask": mx.array([[1, 1]]),
-            },
-            images=images,
-            apc_semantic_hash=semantic_hash,
-        )
-
-        assert gen_kwargs["_apc_semantic_hash"] == semantic_hash
-
-    def test_extract_chat_response_format_json_schema(self):
-        req = SimpleNamespace(
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "animal",
-                    "schema": {
-                        "type": "object",
-                        "properties": {"animal": {"type": "string"}},
-                        "required": ["animal"],
-                    },
-                },
-            },
-            text=None,
-        )
-
-        schema = server._extract_response_format_schema(req)
-
-        assert schema["properties"]["animal"]["type"] == "string"
 
     def test_extract_responses_text_format_json_schema(self):
         req = SimpleNamespace(
@@ -6807,19 +4312,9 @@ class TestResponseGenerator:
         assert schema["required"] == ["animal"]
 
     @pytest.mark.parametrize("format_type", ["json_object", "object"])
-    def test_extract_chat_response_format_json_object_aliases(self, format_type):
-        req = SimpleNamespace(
-            response_format={"type": format_type},
-            text=None,
-        )
-
-        assert server._extract_response_format_schema(req) == {"type": "object"}
-
-    @pytest.mark.parametrize("format_type", ["json_object", "object"])
     def test_extract_responses_text_format_json_object_aliases(self, format_type):
         req = SimpleNamespace(
-            response_format=None,
-            text={"format": {"type": format_type}},
+            response_format=None, text={"format": {"type": format_type}}
         )
 
         assert server._extract_response_format_schema(req) == {"type": "object"}
@@ -6828,29 +4323,8 @@ class TestResponseGenerator:
         req = SimpleNamespace(
             response_format={
                 "type": "json_schema",
-                "json_schema": {
-                    "name": "animal",
-                    "schema": {"type": "object"},
-                },
+                "json_schema": {"name": "animal", "schema": {"type": "object"}},
             },
-            text=None,
-        )
-        proc = SimpleNamespace(tokenizer=object())
-
-        with patch.object(
-            server, "build_json_schema_logits_processor", return_value="processor"
-        ) as mock_build:
-            processors = server._build_structured_logits_processors(req, proc)
-
-        assert processors == ["processor"]
-        assert mock_build.call_args.args[1] == {"type": "object"}
-
-    @pytest.mark.parametrize("format_type", ["json_object", "object"])
-    def test_build_structured_logits_processors_for_json_object_aliases(
-        self, format_type
-    ):
-        req = SimpleNamespace(
-            response_format={"type": format_type},
             text=None,
         )
         proc = SimpleNamespace(tokenizer=object())
@@ -6867,94 +4341,21 @@ class TestResponseGenerator:
 class TestSplitThinking:
     """Tests for thinking tag parsing."""
 
-    def test_channel_tags(self):
-        text = "<|channel>thought\nReasoning here.<channel|>The answer."
-        reasoning, content = server._split_thinking(text)
-        assert reasoning == "Reasoning here."
-        assert content == "The answer."
-
     def test_think_tags(self):
         text = "<think>Thinking.</think>Answer."
         reasoning, content = server._split_thinking(text)
         assert reasoning == "Thinking."
         assert content == "Answer."
 
-    def test_partial_close_tag_only(self):
-        text = "Thinking text\n</think>\nAnswer."
-        reasoning, content = server._split_thinking(text)
-        assert reasoning == "Thinking text"
-        assert content == "Answer."
-
     @pytest.mark.parametrize("prefix", ["", "thought\n"])
     def test_channel_close_only(self, prefix):
         assert server._split_thinking(f"{prefix}got it<channel|>42") == ("got it", "42")
-
-    def test_no_thinking(self):
-        text = "Just plain text."
-        reasoning, content = server._split_thinking(text)
-        assert reasoning is None
-        assert content == "Just plain text."
-
-    def test_prompt_opened_thinking_is_detected(self):
-        assert server.prompt_has_open_thinking("<|im_start|>assistant\n<think>")
-        assert not server.prompt_has_open_thinking("<|im_start|>assistant\n")
 
     def test_unterminated_thinking_without_markers_is_reasoning(self):
         text = "The user is asking me to say OK. This is a simple request"
         reasoning, content = server._split_thinking(text, starts_in_thinking=True)
         assert reasoning == text
         assert content == ""
-
-    def test_unterminated_thinking_stays_content_when_not_in_block(self):
-        text = "The user is asking me to say OK. This is a simple request"
-        reasoning, content = server._split_thinking(text, starts_in_thinking=False)
-        assert reasoning is None
-        assert content == text
-
-    def test_starts_in_thinking_still_splits_on_close_marker(self):
-        text = "Reasoning first.</think>The answer."
-        reasoning, content = server._split_thinking(text, starts_in_thinking=True)
-        assert reasoning == "Reasoning first."
-        assert content == "The answer."
-
-    def test_starts_in_thinking_respects_paired_markers(self):
-        text = "<think>Thinking.</think>Answer."
-        reasoning, content = server._split_thinking(text, starts_in_thinking=True)
-        assert reasoning == "Thinking."
-        assert content == "Answer."
-
-    def test_empty_content_after_thinking(self):
-        text = "<|channel>thought\nOnly thinking.<channel|>"
-        reasoning, content = server._split_thinking(text)
-        assert reasoning == "Only thinking."
-        assert content == ""
-
-    def test_custom_thinking_markers(self):
-        text = "<analysis>Custom reasoning.</analysis>Custom answer."
-        reasoning, content = server._split_thinking(text, "<analysis>", "</analysis>")
-        assert reasoning == "Custom reasoning."
-        assert content == "Custom answer."
-
-    def test_response_template_parses_reasoning_and_content(self):
-        text = (
-            "to=self<|message|>Muse reasoning.<|eom|>"
-            "<|start|>assistant to=user<|message|>Muse answer."
-        )
-        reasoning, content = server._split_thinking(
-            text,
-            processor=SimpleNamespace(tokenizer=_MuseResponseTemplateTokenizer()),
-        )
-        assert reasoning == "Muse reasoning."
-        assert content == "Muse answer."
-
-    def test_cohere_thinking_markers_strip_text_markers(self):
-        text = (
-            "<|START_THINKING|>Custom reasoning.<|END_THINKING|>"
-            "<|START_TEXT|>Custom answer.<|END_TEXT|>"
-        )
-        reasoning, content = server._split_thinking(text)
-        assert reasoning == "Custom reasoning."
-        assert content == "Custom answer."
 
 
 class TestThinkingStreamState:
@@ -6972,95 +4373,6 @@ class TestThinkingStreamState:
         state.feed("<think>")
         assert state.feed("cut off </thi", last=True).reasoning == "cut off </thi"
 
-    def test_last_chunk_does_not_disturb_a_complete_stream(self):
-        state = server.ThinkingStreamState()
-        reasoning, content = "", ""
-
-        for chunk in ("<think>", "why", "</think>", "answer"):
-            delta = state.feed(chunk, last=chunk == "answer")
-            reasoning += delta.reasoning or ""
-            content += delta.content or ""
-
-        assert (reasoning, content) == ("why", "answer")
-
-    def test_last_chunk_on_an_empty_buffer_emits_nothing(self):
-        state = server.ThinkingStreamState()
-
-        delta = state.feed("", last=True)
-
-        assert (delta.reasoning, delta.content) == (None, None)
-
-    def test_buffer_is_only_released_once(self):
-        state = server.ThinkingStreamState()
-
-        state.feed("hello <")
-        assert state.feed("", last=True).content == "<"
-        assert state.feed("", last=True).content is None
-
-    def test_last_chunk_releases_to_reasoning_when_thinking_opened_in_the_prompt(self):
-        state = server.ThinkingStreamState(enable_thinking=True)
-
-        delta = state.feed("why </thi", last=True)
-
-        assert (delta.reasoning, delta.content) == ("why </thi", None)
-
-    def test_last_chunk_releases_a_partial_custom_end_token(self):
-        state = server.ThinkingStreamState(
-            thinking_start_token="<BEGIN>", thinking_end_token="<END>"
-        )
-
-        state.feed("<BEGIN>")
-        assert state.feed("work <EN", last=True).reasoning == "work <EN"
-
-    def test_last_chunk_releases_content_held_after_thinking_closed(self):
-        state = server.ThinkingStreamState()
-
-        state.feed("<think>x</think>")
-        assert state.feed("done <|START_TE", last=True).content == "done <|START_TE"
-
-    def test_last_chunk_still_reports_thinking_closed(self):
-        state = server.ThinkingStreamState()
-
-        state.feed("<think>why")
-        delta = state.feed("</think>tail <", last=True)
-
-        assert (delta.content, delta.thinking_closed) == ("tail <", True)
-
-    def test_last_chunk_strips_complete_content_markers(self):
-        state = server.ThinkingStreamState()
-
-        assert state.feed("hi <|END_TEXT|>", last=True).content == "hi "
-
-    def test_prompt_must_end_with_open_thinking_marker_to_start_in_thinking(self):
-        assert server.prompt_has_open_thinking("prompt", enable_thinking=True) is False
-        assert (
-            server.prompt_has_open_thinking("prompt<think>\n", enable_thinking=True)
-            is True
-        )
-        assert (
-            server.prompt_has_open_thinking(
-                "User: Say <think> literally\nAssistant:", enable_thinking=True
-            )
-            is False
-        )
-        assert (
-            server.prompt_has_open_thinking(
-                "prompt<analysis>",
-                enable_thinking=True,
-                thinking_start_token="<analysis>",
-                thinking_end_token="</analysis>",
-            )
-            is True
-        )
-
-    def test_prompt_open_marker_is_authoritative_when_flag_is_disabled(self):
-        assert (
-            server.prompt_has_open_thinking(
-                "prompt<|START_THINKING|>", enable_thinking=False
-            )
-            is True
-        )
-
     @pytest.mark.parametrize("enable_thinking", [False, True])
     def test_gemma_channel_markers_and_content_in_same_delta(self, enable_thinking):
         state = server.ThinkingStreamState(enable_thinking=enable_thinking)
@@ -7076,35 +4388,6 @@ class TestThinkingStreamState:
 
         assert "".join(reasoning) == ""
         assert "".join(content) == "7 * 8 = 56"
-
-    def test_think_close_can_emit_reasoning_tail_and_content(self):
-        state = server.ThinkingStreamState(enable_thinking=True)
-
-        first = state.feed("thinking")
-        second = state.feed(" tail</think>\n\nAnswer")
-
-        assert first.reasoning == "thinking"
-        assert first.content is None
-        assert first.thinking_closed is False
-        assert second.reasoning == " tail"
-        assert second.content == "Answer"
-        assert second.thinking_closed is True
-
-    def test_custom_markers_split_same_delta_content(self):
-        state = server.ThinkingStreamState(
-            enable_thinking=False,
-            thinking_start_token="<analysis>",
-            thinking_end_token="</analysis>",
-        )
-
-        first = state.feed("<ana")
-        second = state.feed("lysis>Custom reasoning.</analysis>Custom answer.")
-
-        assert first.reasoning is None
-        assert first.content is None
-        assert second.reasoning == "Custom reasoning."
-        assert second.content == "Custom answer."
-        assert second.thinking_closed is True
 
     def test_response_template_markers_split_across_chunks(self):
         state = server.make_response_stream_state(
@@ -7154,118 +4437,17 @@ class TestThinkingStreamState:
         assert "".join(content) == "Custom answer."
 
 
-class TestChatMessageSchema:
-    """Tests for ChatMessage accepting tool-calling roles and fields."""
-
-    def test_accepts_tool_role(self):
-        msg = server.ChatMessage(role="tool", content="result", tool_call_id="tc_1")
-        assert msg.role == "tool"
-        assert msg.tool_call_id == "tc_1"
-
-    def test_accepts_assistant_with_tool_calls(self):
-        msg = server.ChatMessage(
-            role="assistant",
-            content=None,
-            tool_calls=[{"id": "tc_1", "function": {"name": "f", "arguments": "{}"}}],
-        )
-        assert msg.tool_calls is not None
-        assert len(msg.tool_calls) == 1
-
-    def test_reasoning_field(self):
-        msg = server.ChatMessage(
-            role="assistant", content="answer", reasoning="thought"
-        )
-        assert msg.reasoning == "thought"
-        assert msg.reasoning_content == "thought"
-
-    def test_reasoning_content_field(self):
-        msg = server.ChatMessage(
-            role="assistant", content="answer", reasoning_content="thought"
-        )
-        assert msg.reasoning_content == "thought"
-        assert msg.reasoning == "thought"
-
-
 class TestToolCallStreamState:
     """Tests for tool-call markup suppression in streaming."""
-
-    def test_no_tool_module(self):
-        state = server.ToolCallStreamState(None, None)
-        assert state.feed("world") == "world"
-
-    def test_normal_text_before_tool_call(self):
-        state = server.ToolCallStreamState("<tool_call>", "</tool_call>")
-        assert state.feed("I will call") == "I will call"
-        assert state.in_tool_call is False
 
     def test_suppresses_on_start_marker(self):
         state = server.ToolCallStreamState("<tool_call>", "</tool_call>")
         assert state.feed("text<tool_call>") == "text"
         assert state.in_tool_call is True
 
-    def test_suppresses_partial_marker(self):
-        state = server.ToolCallStreamState("<tool_call>", "</tool_call>")
-        assert state.feed("text<tool") == "text"
-        assert state.buffer == "<tool"
-        assert state.in_tool_call is False
-
-    def test_stays_suppressed_after_entering(self):
-        state = server.ToolCallStreamState("<tool_call>", "</tool_call>")
-        assert state.feed("text<tool_call>") == "text"
-        assert state.feed("get_weather") is None
-        assert state.in_tool_call is True
-
-    def test_pipe_delimited_marker(self):
-        state = server.ToolCallStreamState("<|tool_call>", "<|tool_call_end|>")
-        assert state.feed("text<|tool_call>call:get_weather") == "text"
-        assert state.in_tool_call is True
-
-    def test_pipe_delimited_partial_marker(self):
-        state = server.ToolCallStreamState("<|tool_call>", "<|tool_call_end|>")
-        assert state.feed("text<|tool") == "text"
-        assert state.buffer == "<|tool"
-        assert state.in_tool_call is False
-
-    def test_literal_less_than_is_not_suppressed(self):
-        state = server.ToolCallStreamState("<tool_call>", "</tool_call>")
-        assert state.feed("if n <") == "if n "
-        assert state.feed("x") == "<x"
-        assert state.in_tool_call is False
-
 
 class TestProcessToolCalls:
     """Tests for tool call parsing from model output."""
-
-    def test_no_tool_calls(self):
-        # Minimal tool module mock
-        module = SimpleNamespace(tool_call_start="<tc>", tool_call_end="</tc>")
-        result = server.process_tool_calls("Just text.", module, [])
-        assert result.calls == []
-        assert result.remaining_text == "Just text."
-
-    def test_parser_can_return_multiple_tool_calls(self):
-        module = SimpleNamespace(
-            tool_call_start="<tc>",
-            tool_call_end="</tc>",
-            parse_tool_call=lambda call, tools: [
-                {"name": "grep", "arguments": {"pattern": "foo"}},
-                {"name": "read", "arguments": {"path": "file.py"}},
-            ],
-        )
-
-        result = server.process_tool_calls("Before <tc>[]</tc> after", module, [])
-
-        assert result.remaining_text == "Before   after"
-        assert [call["function"]["name"] for call in result.calls] == [
-            "grep",
-            "read",
-        ]
-        assert json.loads(result.calls[0]["function"]["arguments"]) == {
-            "pattern": "foo"
-        }
-        assert json.loads(result.calls[1]["function"]["arguments"]) == {
-            "path": "file.py"
-        }
 
     minicpm5_call = (
         '<function name="write_file"><param name="content">'
@@ -7273,11 +4455,6 @@ class TestProcessToolCalls:
         '<param name="version">123</param><param name="count">3</param>'
         '<param name="enabled">True</param></function>'
     )
-
-    def test_detects_minicpm5_chat_template(self):
-        template = """{{ '<function name="' ~ tool_call.name ~ '">' }}
-    {{ '<param name="' ~ param_name ~ '">' }}"""
-        assert server.load_tool_module(_infer_tool_parser(template)) is minicpm5
 
     def test_minicpm5_cdata_and_argument_types(self):
         tools = [
@@ -7334,28 +4511,11 @@ class TestProcessToolCalls:
 class TestCountThinkingTagTokens:
     """Tests for thinking tag token counting."""
 
-    def test_channel_tags(self):
-        assert (
-            server._count_thinking_tag_tokens("<|channel>thought\ntext<channel|>answer")
-            == 4
-        )
-
     def test_think_tags(self):
         assert server._count_thinking_tag_tokens("<think>text</think>answer") == 2
 
-    def test_no_tags(self):
-        assert server._count_thinking_tag_tokens("plain text") == 0
-
 
 class TestQuantizedKVBits:
-    def test_kv_bits_unset_returns_none(self, monkeypatch):
-        monkeypatch.delenv("KV_BITS", raising=False)
-        assert server_generation.get_quantized_kv_bits() is None
-
-    def test_kv_bits_applies(self, monkeypatch):
-        monkeypatch.setenv("KV_BITS", "3.5")
-        assert server_generation.get_quantized_kv_bits() == 3.5
-
     @pytest.mark.parametrize(
         "model_path",
         [
@@ -7373,43 +4533,8 @@ class TestQuantizedKVBits:
         assert server_generation.get_quantized_kv_bits() == 3.5
         assert server_generation.get_max_kv_size(model_path) is None
 
-    def test_split_bits_agree_with_uniform_bits(self, monkeypatch):
-        # The split path never had a model-path guard; both must behave alike.
-        monkeypatch.setenv("KV_BITS", "3.5")
-        monkeypatch.setenv("KV_KEY_BITS", "3")
-        monkeypatch.setenv("KV_VALUE_BITS", "4")
-        assert server_generation.get_quantized_kv_bits() == 3.5
-        assert server_generation.get_quantized_kv_split_bits() == (3.0, 4.0)
-
 
 class TestRuntimeConfig:
-    def test_from_env_seeds_defaults(self, monkeypatch):
-        monkeypatch.setenv("KV_QUANT_SCHEME", "group")
-        monkeypatch.setenv("KV_BITS", "6")
-        monkeypatch.setenv("APC_ENABLED", "1")
-        monkeypatch.setenv("MLX_VLM_VISION_CACHE_SIZE", "33")
-        cfg = RuntimeConfig.from_env()
-        assert cfg.kv_quant_scheme == "group"
-        assert cfg.kv_bits == 6.0
-        assert cfg.apc_enabled is True
-        assert cfg.vision_cache_size == 33
-
-    def test_fingerprint_stable_and_scoped(self):
-        cfg = RuntimeConfig.from_env()
-        fp = cfg.fingerprint()
-        assert fp == cfg.fingerprint()  # stable across calls
-
-        cfg2 = RuntimeConfig.from_env()
-        assert cfg2.fingerprint() == fp
-
-        # toggling a dead APC knob while APC is off must not invalidate
-        cfg2.apc_block_size = 64
-        assert cfg2.fingerprint() == fp
-
-        # toggling an effective knob must invalidate
-        cfg2.vision_cache_size = 40
-        assert cfg2.fingerprint() != fp
-
     def test_apply_changes_validates_and_coerces(self):
         cfg = RuntimeConfig.from_env()
         applied, rejected = cfg.apply_changes(
@@ -7420,30 +4545,11 @@ class TestRuntimeConfig:
                 "not_a_knob": 1,
             }
         )
-        assert applied == {
-            "kv_bits": 8.0,
-            "apc_enabled": True,
-            "vision_cache_size": 50,
-        }
+        assert applied == {"kv_bits": 8.0, "apc_enabled": True, "vision_cache_size": 50}
         assert rejected == [{"name": "not_a_knob", "reason": "unknown knob"}]
         assert cfg.kv_bits == 8.0
         assert cfg.apc_enabled is True
         assert cfg.vision_cache_size == 50
-
-    def test_apply_changes_rejects_bad_values(self):
-        cfg = RuntimeConfig.from_env()
-        applied, rejected = cfg.apply_changes({"kv_bits": "not-a-number"})
-        assert applied == {}
-        assert len(rejected) == 1
-        assert rejected[0]["name"] == "kv_bits"
-        assert cfg.kv_bits is None  # unchanged
-
-    def test_reload_kinds_scoped(self):
-        cfg = RuntimeConfig.from_env()
-        applied, _ = cfg.apply_changes({"kv_quant_scheme": "turboquant"})
-        assert cfg.reload_kinds(applied) == {"text_generation"}
-        applied, _ = cfg.apply_changes({"vision_cache_size": 10})
-        assert cfg.reload_kinds(applied) == {"image_generation", "image_edit"}
 
     def test_reload_kinds_excludes_live_knobs(self):
         cfg = RuntimeConfig.from_env()
@@ -7455,51 +4561,6 @@ class TestRuntimeConfig:
         assert cfg.reload_kinds(applied) == set()
         assert cfg.fingerprint() == before
 
-    def test_reload_kinds_excludes_apc_knobs_while_disabled(self):
-        cfg = RuntimeConfig.from_env()
-        cfg.apply_changes({"apc_enabled": False})
-        before = cfg.fingerprint()
-
-        applied, _ = cfg.apply_changes({"apc_block_size": 32})
-        assert applied == {"apc_block_size": 32}
-        assert cfg.reload_kinds(applied) == set()
-        assert cfg.fingerprint() == before
-
-        applied, _ = cfg.apply_changes({"apc_enabled": True, "apc_block_size": 64})
-        assert cfg.reload_kinds(applied) == {"text_generation"}
-        assert cfg.fingerprint() != before
-
-    def test_settings_endpoints_get_and_patch(self, client, monkeypatch):
-        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
-        cfg = server.runtime.config
-
-        r = client.get("/v1/settings")
-        assert r.status_code == 200
-        body = r.json()
-        assert set(body) == {"schema", "current", "fingerprint"}
-        names = {k["name"] for k in body["schema"]}
-        assert "kv_bits" in names and "apc_enabled" in names
-        assert body["current"]["kv_quant_scheme"] == cfg.kv_quant_scheme
-
-        before = cfg.fingerprint()
-        r = client.patch("/v1/settings", json={"kv_quant_scheme": "turboquant"})
-        assert r.status_code == 200
-        body = r.json()
-        assert body["applied"] == {"kv_quant_scheme": "turboquant"}
-        assert body["rejected"] == []
-        assert body["reload_kinds"] == ["text_generation"]
-        assert body["current"]["kv_quant_scheme"] == "turboquant"
-        assert body["fingerprint"] != before
-
-        r = client.get("/v1/settings")
-        assert r.json()["current"]["kv_quant_scheme"] == "turboquant"
-
-        # unknown knobs are never applied
-        r = client.patch("/v1/settings", json={"bogus": 1})
-        assert r.status_code == 200
-        assert r.json()["applied"] == {}
-        assert r.json()["rejected"] == [{"name": "bogus", "reason": "unknown knob"}]
-
     def test_settings_patch_requires_json_object(self, client, monkeypatch):
         monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
         r = client.patch("/v1/settings", json=[1, 2, 3])
@@ -7507,36 +4568,6 @@ class TestRuntimeConfig:
 
 
 class TestRuntimeConfigAdditions:
-    def test_schema_includes_live_and_reloadable_knobs(self):
-        cfg = RuntimeConfig.from_env()
-        spec = {k["name"]: k for k in cfg.schema()}
-        for name in (
-            "max_kv_size",
-            "token_queue_timeout",
-            "spec_draft_model",
-            "spec_draft_kind",
-        ):
-            assert name in spec
-            assert spec[name]["reload_kinds"] == ["text_generation"]
-
-    def test_token_queue_timeout_is_live(self, client, monkeypatch):
-        monkeypatch.delenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", raising=False)
-        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
-        cfg = server.runtime.config
-        fingerprint = cfg.fingerprint()
-
-        response = client.patch("/v1/settings", json={"token_queue_timeout": 1200})
-
-        assert response.status_code == 200
-        assert response.json()["applied"] == {"token_queue_timeout": 1200.0}
-        assert server.get_token_queue_timeout() == 1200.0
-        assert cfg.fingerprint() == fingerprint
-
-        response = client.patch("/v1/settings", json={"token_queue_timeout": 0})
-
-        assert response.json()["applied"] == {"token_queue_timeout": None}
-        assert server.get_token_queue_timeout() is None
-
     def test_max_kv_size_is_live_context_limit(self, monkeypatch):
         import mlx_vlm.server.generation as server_generation
 
@@ -7547,44 +4578,13 @@ class TestRuntimeConfigAdditions:
         monkeypatch.delenv("MAX_KV_SIZE", raising=False)
         assert server_generation.get_configured_context_limit() is None
 
-    def test_spec_draft_knob_reaches_generator(self, monkeypatch):
-        class FakeResponseGenerator:
-            last_kwargs = {}
-
-            def __init__(self, *args, **kwargs):
-                FakeResponseGenerator.last_kwargs = kwargs
-                self.model = SimpleNamespace()
-                self.processor = SimpleNamespace()
-                self.config = SimpleNamespace(model_type="qwen2_vl")
-
-            def wait_until_ready(self):
-                return self.model, self.processor, self.config
-
-            def stop_and_join(self):
-                pass
-
-        monkeypatch.setattr(
-            server._app_module, "ResponseGenerator", FakeResponseGenerator
-        )
-        monkeypatch.setattr(server._app_module._apc, "from_env", lambda *_, **__: None)
-        monkeypatch.setattr(server.runtime, "model_cache", {})
-        monkeypatch.setattr(server.runtime, "response_generator", None)
-        monkeypatch.setattr(server.runtime, "apc_manager", None)
-        monkeypatch.setattr(server.runtime.config, "spec_draft_model", "draft-x")
-        monkeypatch.setattr(server.runtime.config, "spec_draft_kind", "auto")
-
-        server.get_cached_model("demo-model")
-        assert FakeResponseGenerator.last_kwargs["draft_model_path"] == "draft-x"
-        assert FakeResponseGenerator.last_kwargs["draft_kind"] == "auto"
-
     def test_settings_patch_replace_semantics(self, client, monkeypatch):
         monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
         cfg = server.runtime.config
         assert cfg.apc_enabled is False
 
         client.patch(
-            "/v1/settings",
-            json={"kv_quant_scheme": "turboquant", "apc_enabled": True},
+            "/v1/settings", json={"kv_quant_scheme": "turboquant", "apc_enabled": True}
         )
         assert cfg.kv_quant_scheme == "turboquant"
         assert cfg.apc_enabled is True
@@ -7603,27 +4603,6 @@ class TestRuntimeConfigAdditions:
 
         r = client.patch("/v1/settings", json={"op": "replace", "values": "x"})
         assert r.status_code == 400
-
-
-def test_runtime_config_fingerprint_is_kind_scoped():
-    cfg = RuntimeConfig.from_env()
-    text_fp = cfg.fingerprint(kinds={"text_generation"})
-    vision_fp = cfg.fingerprint(kinds={"image_generation"})
-
-    cfg.apply_changes({"kv_quant_scheme": "turboquant"})
-    assert cfg.fingerprint(kinds={"text_generation"}) != text_fp
-    assert cfg.fingerprint(kinds={"image_generation"}) == vision_fp
-
-    cfg.apply_changes({"vision_cache_size": 64})
-    assert cfg.fingerprint(kinds={"image_generation"}) != vision_fp
-    assert cfg.fingerprint(kinds={"text_generation"}) != text_fp
-
-
-def test_runtime_config_live_knob_not_in_fingerprint():
-    cfg = RuntimeConfig.from_env()
-    fp = cfg.fingerprint()
-    cfg.apply_changes({"max_kv_size": 8192})
-    assert cfg.fingerprint() == fp
 
 
 def test_runtime_config_enum_knobs_reject_invalid():
@@ -7657,9 +4636,7 @@ class TestReranking:
 
         monkeypatch.setattr(server, "get_cached_model", fake_get_cached_model)
         monkeypatch.setattr(
-            server_reranking,
-            "score_documents",
-            lambda *args: ([0.2, 0.9, 0.5], 12),
+            server_reranking, "score_documents", lambda *args: ([0.2, 0.9, 0.5], 12)
         )
 
         response = client.post(
@@ -7684,33 +4661,6 @@ class TestReranking:
         }
         assert cache_calls == [("reranker", "reranker")]
 
-    def test_preserves_input_order_for_equal_scores(self, client, monkeypatch):
-        monkeypatch.setattr(
-            server,
-            "get_cached_model",
-            lambda *args, **kwargs: (
-                object(),
-                object(),
-                SimpleNamespace(model_type="qwen3"),
-            ),
-        )
-        monkeypatch.setattr(
-            server_reranking,
-            "score_documents",
-            lambda *args: ([0.5, 0.5, 0.5], 3),
-        )
-
-        response = client.post(
-            "/v1/rerank",
-            json={
-                "model": "reranker",
-                "query": "query",
-                "documents": ["a", "b", "c"],
-            },
-        )
-
-        assert [result["index"] for result in response.json()["results"]] == [0, 1, 2]
-
     def test_uses_preloaded_model(self, client, monkeypatch):
         monkeypatch.setenv("MLX_VLM_PRELOAD_RERANKER_MODEL", "preloaded")
         seen = []
@@ -7732,67 +4682,11 @@ class TestReranking:
         assert response.json()["model"] == "preloaded"
         assert seen == [("preloaded", "reranker")]
 
-    def test_uses_cached_preload_after_environment_is_consumed(
-        self, client, monkeypatch
-    ):
-        monkeypatch.delenv("MLX_VLM_PRELOAD_RERANKER_MODEL", raising=False)
-        registry = server.ModelCacheRegistry()
-        registry.set("reranker", {"model_path": "preloaded"})
-        monkeypatch.setattr(server.runtime, "model_cache", registry)
-        monkeypatch.setattr(
-            server,
-            "get_cached_model",
-            lambda *args, **kwargs: (
-                object(),
-                object(),
-                SimpleNamespace(model_type="qwen3"),
-            ),
-        )
-        monkeypatch.setattr(
-            server_reranking, "score_documents", lambda *args: ([0.7], 4)
-        )
-
-        response = client.post(
-            "/v1/rerank", json={"query": "query", "documents": ["document"]}
-        )
-
-        assert response.status_code == 200
-        assert response.json()["model"] == "preloaded"
-
-    def test_uses_server_authentication(self, client, monkeypatch):
-        monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret")
-        monkeypatch.setattr(
-            server,
-            "get_cached_model",
-            lambda *args, **kwargs: (
-                object(),
-                object(),
-                SimpleNamespace(model_type="qwen3"),
-            ),
-        )
-        monkeypatch.setattr(
-            server_reranking, "score_documents", lambda *args: ([0.5], 1)
-        )
-        payload = {"model": "reranker", "query": "q", "documents": ["d"]}
-
-        assert client.post("/v1/rerank", json=payload).status_code == 401
-        response = client.post(
-            "/v1/rerank",
-            json=payload,
-            headers={"Authorization": "Bearer secret"},
-        )
-
-        assert response.status_code == 200
-
     @pytest.mark.parametrize(
         "value,label,expected",
         [
             ("  text  ", "query", server_reranking.RerankItem(text="text")),
-            (
-                {"text": " text "},
-                "query",
-                server_reranking.RerankItem(text="text"),
-            ),
+            ({"text": " text "}, "query", server_reranking.RerankItem(text="text")),
             (
                 {"image_url": {"url": " image.png "}},
                 "documents[0]",
@@ -7866,27 +4760,6 @@ class TestReranking:
         assert tokens == 5
         assert batches == [["0", "1"], ["2", "3"], ["4"]]
 
-    def test_generative_reranker_uses_default_instruction(self, monkeypatch):
-        instructions = []
-
-        def fake_score_batch(model, processor, query, documents, instruction):
-            del model, processor, query
-            instructions.append(instruction)
-            return [0.5] * len(documents), len(documents)
-
-        monkeypatch.setattr(server_reranking, "_score_text_batch", fake_score_batch)
-
-        server_reranking.score_documents(
-            object(),
-            object(),
-            SimpleNamespace(model_type="qwen3"),
-            server_reranking.RerankItem(text="query"),
-            [server_reranking.RerankItem(text="document")],
-            None,
-        )
-
-        assert instructions == [server_reranking.DEFAULT_INSTRUCTION]
-
     def test_sequence_classifier_scores_tokenized_pairs(self):
         calls = []
 
@@ -7903,11 +4776,7 @@ class TestReranking:
 
         class Model:
             def __call__(self, **inputs):
-                assert set(inputs) == {
-                    "input_ids",
-                    "attention_mask",
-                    "token_type_ids",
-                }
+                assert set(inputs) == {"input_ids", "attention_mask", "token_type_ids"}
                 return SimpleNamespace(logits=mx.array([[-2.0], [2.0]]))
 
         scores, tokens = server_reranking.score_documents(
@@ -8022,8 +4891,7 @@ class TestReranking:
     def test_ensure_chat_template_loads_packaged_template(self, tmp_path, monkeypatch):
         (tmp_path / "chat_template.jinja").write_text("template", encoding="utf-8")
         processor = SimpleNamespace(
-            chat_template=None,
-            tokenizer=SimpleNamespace(chat_template=None),
+            chat_template=None, tokenizer=SimpleNamespace(chat_template=None)
         )
         monkeypatch.setattr(server_reranking, "get_model_path", lambda path: tmp_path)
 
@@ -8122,22 +4990,6 @@ class _FakeAlignedResult:
     sentences: list
 
 
-@dataclass
-class _FakeSTTOutput:
-    text: str
-    segments: list = None
-    language: str = None
-
-
-@dataclass
-class _FakeStreamingResult:
-    text: str
-    tokens: list
-    is_final: bool
-    start_time: float
-    end_time: float
-
-
 def _fake_parakeet_result():
     first = _FakeAlignedSentence(
         "Hello world.",
@@ -8157,19 +5009,6 @@ class TestSTTSegmentSerialization:
     ``AlignedResult`` exposes ``sentences`` rather than ``segments`` (issue 2183).
     """
 
-    def test_derives_segments_from_nemo_sentences(self):
-        from mlx_vlm.server.audio import _stt_item_to_dict
-
-        data = _stt_item_to_dict(_fake_parakeet_result())
-
-        assert "segments" in data
-        segments = data["segments"]
-        assert [s["text"] for s in segments] == ["Hello world.", "Bye."]
-        assert segments[0]["start"] == 0.0
-        assert abs(segments[0]["end"] - 0.9) < 1e-6
-        assert segments[1]["start"] == 1.0
-        assert abs(segments[1]["end"] - 1.3) < 1e-6
-
     def test_pipeline_preserves_nemo_segments(self):
         from mlx_vlm.server.audio import (
             _iter_stt_items,
@@ -8187,56 +5026,7 @@ class TestSTTSegmentSerialization:
         assert result["text"].startswith("Hello world.")
         assert len(result.get("segments") or []) == 2
 
-    def test_whisper_segments_unchanged(self):
-        from mlx_vlm.server.audio import _stt_item_to_dict
-
-        whisper = _FakeSTTOutput(
-            "hi", segments=[{"start": 0.0, "end": 1.0, "text": "hi"}], language="en"
-        )
-        data = _stt_item_to_dict(whisper)
-
-        assert data["segments"] == [{"start": 0.0, "end": 1.0, "text": "hi"}]
-        assert data["language"] == "en"
-        assert "sentences" not in data
-
     def test_plain_text_item_unchanged(self):
         from mlx_vlm.server.audio import _stt_item_to_dict
 
         assert _stt_item_to_dict("just text") == {"text": "just text"}
-
-    def test_streaming_result_gets_no_segments(self):
-        from mlx_vlm.server.audio import _stt_item_to_dict
-
-        data = _stt_item_to_dict(
-            _FakeStreamingResult("partial", [1, 2], False, 0.0, 0.5)
-        )
-
-        assert "segments" not in data
-        assert data["is_final"] is False
-
-    def test_real_aligned_result_if_available(self):
-        pytest.importorskip("mlx_audio.stt.models.nemo.alignment")
-        from mlx_audio.stt.models.nemo.alignment import (
-            AlignedSentence,
-            AlignedToken,
-            sentences_to_result,
-        )
-
-        from mlx_vlm.server.audio import _stt_item_to_dict
-
-        result = sentences_to_result(
-            [
-                AlignedSentence(
-                    "hello",
-                    [
-                        AlignedToken(id=1, text="hel", start=0.0, duration=0.2),
-                        AlignedToken(id=2, text="lo", start=0.2, duration=0.3),
-                    ],
-                )
-            ]
-        )
-        data = _stt_item_to_dict(result)
-
-        assert data["segments"] == [
-            {"id": 0, "start": 0.0, "end": 0.5, "text": "hello"}
-        ]

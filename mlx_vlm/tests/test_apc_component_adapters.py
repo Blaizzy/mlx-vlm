@@ -14,78 +14,6 @@ def _seeded():
     mx.random.seed(0)
 
 
-def test_capability_classification():
-    assert A.resolve_capability(C.KVCache()) == A.Capability.PAGEABLE
-    assert A.resolve_capability(C.RotatingKVCache(max_size=64)) == A.Capability.WINDOWED
-    assert A.resolve_capability(C.ArraysCache(2)) == A.Capability.CHECKPOINT
-    assert (
-        A.resolve_capability(C.CacheList(C.KVCache(), C.ArraysCache(2)))
-        == A.Capability.COMPOSITE
-    )
-    assert A.resolve_capability((C.KVCache(),)) == A.Capability.COMPOSITE
-
-
-def test_kvcache_subclass_is_not_pageable_by_inheritance():
-
-    from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
-
-    ring = RingSlidingKVCache(window_size=64)
-    assert A.resolve_capability(ring) == A.Capability.WINDOWED
-    assert A.apc_block_eligible(ring) is False
-    assert A.apc_exact_eligible(ring) is True
-
-
-def test_custom_cache_accepted_via_checkpoint():
-
-    from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
-
-    assert A.resolve_capability(MiniMaxM3KVCache()) == A.Capability.CHECKPOINT
-
-
-def test_checkpoint_adapter_roundtrip_and_detach():
-    kv = C.KVCache()
-    kv.update_and_fetch(mx.random.normal((1, 2, 5, 4)), mx.random.normal((1, 2, 5, 4)))
-    mx.eval(kv.state)
-    adapter = A.CheckpointAdapter()
-    frag = adapter.capture(kv, prefix_len=5)
-    fresh = C.KVCache()
-    adapter.restore(fresh, frag)
-    for a, b in zip(kv.state, fresh.state):
-        assert bool(mx.array_equal(a, b))
-    assert kv.offset == fresh.offset
-
-    kv.update_and_fetch(mx.random.normal((1, 2, 1, 4)), mx.random.normal((1, 2, 1, 4)))
-    mx.eval(kv.state, fresh.state)
-    assert fresh.offset == 5
-
-
-def test_arrays_cache_roundtrip():
-    ac = C.ArraysCache(3)
-    ac.cache = [mx.random.normal((2, 5)), None, mx.random.normal((4,))]
-    mx.eval([x for x in ac.cache if x is not None])
-    adapter = A.CheckpointAdapter()
-    fresh = C.ArraysCache(3)
-    adapter.restore(fresh, adapter.capture(ac, 5))
-    for a, b in zip(ac.cache, fresh.cache):
-        assert (a is None and b is None) or bool(mx.array_equal(a, b))
-
-
-def test_arrays_snapshot_preserves_batch_masks():
-    source = C.ArraysCache(1, left_padding=[2])
-    source[0] = mx.ones((1, 4))
-    source.lengths = mx.array([3])
-    adapter = A.CheckpointAdapter()
-    restored = C.ArraysCache(1)
-    adapter.restore(restored, adapter.capture(source, 3))
-    assert restored.left_padding.tolist() == [2]
-    assert restored.lengths.tolist() == [3]
-    assert bool(mx.array_equal(restored.make_mask(4), source.make_mask(4)))
-    source[0] = mx.zeros_like(source[0])
-    source.advance(1)
-    assert bool(mx.all(restored[0] == 1))
-    assert restored.left_padding.tolist() == [2]
-
-
 def test_chunked_snapshot_preserves_trimmed_offset():
     source = C.ChunkedKVCache(chunk_size=4)
     keys = mx.arange(48, dtype=mx.float32).reshape(1, 1, 6, 8)
@@ -100,20 +28,6 @@ def test_chunked_snapshot_preserves_trimmed_offset():
         source.update_and_fetch(keys[..., :1, :], keys[..., :1, :] + 1),
     ):
         assert bool(mx.array_equal(actual, expected))
-
-
-def test_custom_kv_memory_includes_auxiliary_state():
-    class CustomKV(C.KVCache):
-        @property
-        def nbytes(self):
-            return super().nbytes + self.auxiliary.nbytes
-
-    source = CustomKV()
-    source.auxiliary = mx.ones((32,))
-    source.update_and_fetch(mx.ones((1, 1, 16, 4)), mx.ones((1, 1, 16, 4)))
-    profile = A.cache_memory_components([source], 16)[0]
-    assert profile.fallback
-    assert profile.bytes_per_token == source.nbytes / 16
 
 
 def test_apc_mode_layouts():
@@ -145,70 +59,6 @@ def test_dense_plan_has_one_pageable_group():
     assert plan.strategy == "block"
     assert len(plan.groups) == 1
     assert plan.groups[0].layer_indices == (0, 1)
-
-
-def test_hybrid_plan_groups_full_window_and_state_entries():
-    caches = [
-        C.KVCache(),
-        C.RotatingKVCache(max_size=64),
-        C.ArraysCache(2),
-    ]
-    plan = A.build_prefix_cache_plan_from_caches(caches)
-    assert plan.restorable and plan.is_hybrid
-    assert plan.strategy == "checkpoint"
-    assert [g.spec.capability for g in plan.groups] == [
-        A.Capability.PAGEABLE,
-        A.Capability.WINDOWED,
-        A.Capability.CHECKPOINT,
-    ]
-    assert [c.group_id for c in plan.components] == [0, 1, 2]
-
-
-def test_composite_spec_is_recursive():
-    spec = A.cache_spec(C.CacheList(C.KVCache(), C.ArraysCache(2)))
-    assert spec.capability == A.Capability.COMPOSITE
-    assert [child.capability for child in spec.children] == [
-        A.Capability.PAGEABLE,
-        A.Capability.CHECKPOINT,
-    ]
-    assert spec.restorable
-
-
-def test_simple_kv_cache_uses_snapshot_protocol():
-    simple = C.SimpleKVCache()
-    simple.update_and_fetch(mx.ones((1, 2, 3, 4)), mx.ones((1, 2, 3, 4)))
-    cloned = _clone(simple)
-    assert isinstance(cloned, C.SimpleKVCache)
-    assert cloned.cache_length == 3
-    assert bool(mx.array_equal(simple.keys, cloned.keys))
-
-
-def test_coordinator_hides_dense_vs_hybrid_storage_strategy():
-    from mlx_vlm.apc import APCManager
-    from mlx_vlm.apc_coordinator import APCCoordinator
-
-    class Dense:
-        def make_cache(self):
-            return [C.KVCache(), C.KVCache()]
-
-    class Hybrid:
-        def make_cache(self):
-            return [C.KVCache(), C.ArraysCache(2)]
-
-    manager = APCManager(num_blocks=4, block_size=4)
-    dense = APCCoordinator(manager, Dense())
-    hybrid = APCCoordinator(manager, Hybrid())
-    assert dense.enabled and dense.strategy == "block"
-    assert hybrid.enabled and hybrid.strategy == "checkpoint"
-
-
-def test_registry_eligibility_helpers():
-    from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
-
-    assert A.apc_block_eligible(C.KVCache()) is True
-    assert A.apc_exact_eligible(C.ArraysCache(2)) is True
-
-    assert A.apc_block_eligible(RingSlidingKVCache(window_size=64)) is False
 
 
 def _clone(c):

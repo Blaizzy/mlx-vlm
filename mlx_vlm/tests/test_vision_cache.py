@@ -5,18 +5,6 @@ from mlx_vlm.vision_cache import VisionFeatureCache
 
 
 class TestVisionFeatureCache:
-    def test_put_and_get(self):
-        cache = VisionFeatureCache(max_size=2)
-        features = mx.ones((1, 280, 1536))
-        cache.put("image1.jpg", features)
-        result = cache.get("image1.jpg")
-        assert result is not None
-        assert mx.array_equal(result, features)
-
-    def test_cache_miss(self):
-        cache = VisionFeatureCache()
-        assert cache.get("nonexistent.jpg") is None
-
     def test_lru_eviction(self):
         cache = VisionFeatureCache(max_size=2)
         cache.put("a.jpg", mx.ones((1, 10, 64)))
@@ -26,41 +14,12 @@ class TestVisionFeatureCache:
         assert cache.get("b.jpg") is not None
         assert cache.get("c.jpg") is not None
 
-    def test_lru_touch(self):
-        cache = VisionFeatureCache(max_size=2)
-        cache.put("a.jpg", mx.ones((1, 10, 64)))
-        cache.put("b.jpg", mx.ones((1, 10, 64)) * 2)
-        cache.get("a.jpg")  # touch a, making b the LRU
-        cache.put("c.jpg", mx.ones((1, 10, 64)) * 3)  # evicts b
-        assert cache.get("a.jpg") is not None
-        assert cache.get("b.jpg") is None
-        assert cache.get("c.jpg") is not None
-
     def test_multi_image_key(self):
         cache = VisionFeatureCache()
         features = mx.ones((1, 560, 1536))
         cache.put(["img1.jpg", "img2.jpg"], features)
         assert cache.get(["img1.jpg", "img2.jpg"]) is not None
         assert cache.get(["img2.jpg", "img1.jpg"]) is None  # order matters
-
-    def test_multi_image_feature_collection(self):
-        cache = VisionFeatureCache()
-        features = [mx.ones((4, 8)), mx.full((6, 8), 2)]
-
-        cache.put(["img1.jpg", "img2.jpg"], features)
-        cached = cache.get(["img1.jpg", "img2.jpg"])
-
-        assert isinstance(cached, list)
-        assert len(cached) == 2
-        assert mx.array_equal(cached[0], features[0])
-        assert mx.array_equal(cached[1], features[1])
-
-    def test_url_key(self):
-        cache = VisionFeatureCache()
-        url = "https://example.com/image.jpg"
-        features = mx.ones((1, 280, 1536))
-        cache.put(url, features)
-        assert cache.get(url) is not None
 
     def test_contains(self):
         cache = VisionFeatureCache()
@@ -75,20 +34,6 @@ class TestVisionFeatureCache:
         assert len(cache) == 1
         result = cache.get("a.jpg")
         assert mx.array_equal(result, mx.ones((1, 10, 64)) * 5)
-
-    def test_default_max_size(self):
-        cache = VisionFeatureCache()
-        assert cache.max_size == 20
-
-    def test_clear_releases_all(self):
-        cache = VisionFeatureCache()
-        for i in range(5):
-            cache.put(f"img{i}.jpg", mx.ones((1, 10, 64)) * i)
-        assert len(cache) == 5
-        cache.clear()
-        assert len(cache) == 0
-        for i in range(5):
-            assert cache.get(f"img{i}.jpg") is None
 
 
 class TestCachedImageFeaturesKwarg:

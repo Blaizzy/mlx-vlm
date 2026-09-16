@@ -292,9 +292,7 @@ def test_every_model_cache_factory_has_a_restorable_apc_adapter():
         assert plan.restorable, f"{name}: {plan.describe()}"
         eval_targets: list[mx.array] = []
         clone = clone_cache_entry(
-            cache,
-            min_capacity_tokens=None,
-            eval_targets=eval_targets,
+            cache, min_capacity_tokens=None, eval_targets=eval_targets
         )
         assert clone is not None, f"{name} cannot be cloned for APC"
 
@@ -313,9 +311,7 @@ def test_every_model_cache_factory_has_a_restorable_apc_adapter():
 
 
 @pytest.mark.parametrize(
-    "cache_names",
-    CACHE_CONTRACTS,
-    ids=["+".join(names) for names in CACHE_CONTRACTS],
+    "cache_names", CACHE_CONTRACTS, ids=["+".join(names) for names in CACHE_CONTRACTS]
 )
 def test_cache_hit_for_each_model_cache_contract(cache_names, monkeypatch):
     """A synthetic second request hits APC for every distinct cache layout."""

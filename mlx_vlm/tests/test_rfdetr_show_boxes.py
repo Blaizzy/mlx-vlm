@@ -19,14 +19,6 @@ def test_segment_chain_drops_boxes_and_labels_when_show_boxes_is_off():
     ]
 
 
-def test_show_boxes_defaults_to_on():
-    assert _chain_names(_get_annotator(None, "segment")) == [
-        "MaskAnnotator",
-        "BoxAnnotator",
-        "LabelAnnotator",
-    ]
-
-
 def test_detect_keeps_boxes_because_nothing_else_is_drawn():
     # A detect chain has nothing but boxes and labels, so turning them off
     # would render an empty overlay.

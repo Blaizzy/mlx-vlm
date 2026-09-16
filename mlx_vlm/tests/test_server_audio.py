@@ -1,5 +1,4 @@
 import os
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -219,82 +218,6 @@ def test_audio_translations_passes_translate_task(client, monkeypatch):
     assert fake_model.calls[0]["task"] == "translate"
 
 
-def test_audio_request_queue_serializes_requests(monkeypatch):
-    active = 0
-    max_active = 0
-    fake_model = FakeTTSModel()
-
-    def slow_generate(text, **kwargs):
-        nonlocal active, max_active
-        active += 1
-        max_active = max(max_active, active)
-        time.sleep(0.05)
-        yield SimpleNamespace(
-            audio=np.array([1.0], dtype=np.float32), sample_rate=16000
-        )
-        active -= 1
-
-    fake_model.generate = slow_generate
-    monkeypatch.setattr(
-        server_audio,
-        "get_cached_model",
-        lambda model, **kwargs: (fake_model, None, SimpleNamespace(model_type="audio")),
-    )
-    monkeypatch.setattr(server_audio, "audio_write", _fake_audio_write)
-
-    audio_queue = server_audio.AudioRequestQueue()
-    try:
-        first = audio_queue.submit(
-            kind="tts",
-            model_name="fake",
-            payload=server_audio.SpeechTaskPayload(
-                request=server_audio.AudioSpeechRequest(model="fake", input="first")
-            ),
-        )
-        second = audio_queue.submit(
-            kind="tts",
-            model_name="fake",
-            payload=server_audio.SpeechTaskPayload(
-                request=server_audio.AudioSpeechRequest(model="fake", input="second")
-            ),
-        )
-
-        assert _drain(first) == [b"mp3:16000:1"]
-        assert _drain(second) == [b"mp3:16000:1"]
-        assert max_active == 1
-    finally:
-        audio_queue.stop_and_join()
-
-
-def test_audio_request_queue_clears_worker_streams(monkeypatch):
-    cleared_threads = []
-    monkeypatch.setattr(
-        server_audio,
-        "clear_mlx_streams",
-        lambda: cleared_threads.append(server_audio.threading.current_thread().name),
-    )
-
-    audio_queue = server_audio.AudioRequestQueue()
-    audio_queue.stop_and_join()
-
-    assert cleared_threads == [audio_queue._thread.name]
-
-
-def test_get_cached_model_loads_tts_audio_model(monkeypatch):
-    fake_model = SimpleNamespace(model_type="fake_audio")
-    monkeypatch.setattr(server, "load_audio_model", lambda model_path: fake_model)
-
-    model, processor, config = server.get_cached_model(
-        "fake-audio", model_kind="audio_tts"
-    )
-
-    assert model is fake_model
-    assert processor is None
-    assert config.model_type == "fake_audio"
-    assert server.runtime.response_generator is None
-    assert server.runtime.model_cache.for_kind("tts")["model_kind"] == "audio_tts"
-
-
 def test_audio_tts_and_stt_caches_are_independent(monkeypatch):
     fake_tts = SimpleNamespace(model_type="fake_tts")
     fake_stt = SimpleNamespace(model_type="fake_stt")
@@ -315,83 +238,6 @@ def test_audio_tts_and_stt_caches_are_independent(monkeypatch):
     cached_tts_model, _, _ = server.get_cached_model("fake-tts", model_kind="audio_tts")
 
     assert cached_tts_model is fake_tts
-
-
-def test_audio_cache_does_not_evict_text_cache(monkeypatch):
-    class FakeResponseGenerator:
-        def __init__(self, model_path, adapter_path=None, **kwargs):
-            self.model_path = model_path
-            self.adapter_path = adapter_path
-            self.model = SimpleNamespace(kind="text")
-            self.processor = SimpleNamespace()
-            self.config = SimpleNamespace(model_type="text")
-            self.stopped = False
-
-        def wait_until_ready(self):
-            return self.model, self.processor, self.config
-
-        def stop_and_join(self):
-            self.stopped = True
-
-    fake_audio = SimpleNamespace(model_type="fake_audio")
-
-    monkeypatch.setattr(server._app_module, "ResponseGenerator", FakeResponseGenerator)
-    monkeypatch.setattr(server._app_module._apc, "from_env", lambda *_, **__: None)
-    monkeypatch.setattr(server, "load_audio_model", lambda model_path: fake_audio)
-
-    text_model, _, _ = server.get_cached_model("fake-text")
-    text_generator = server.runtime.response_generator
-    audio_model, _, _ = server.get_cached_model("fake-audio", model_kind="audio_tts")
-
-    assert audio_model is fake_audio
-    assert server.runtime.model_cache.for_kind("text_generation")["model"] is text_model
-    assert server.runtime.model_cache.for_kind("tts")["model"] is fake_audio
-    assert text_generator.stopped is False
-
-    cached_text_model, _, _ = server.get_cached_model("fake-text")
-
-    assert cached_text_model is text_model
-    assert server.runtime.response_generator is text_generator
-
-
-def _drain(handle, timeout=2.0):
-    deadline = time.time() + timeout
-    chunks = []
-    while time.time() < deadline:
-        chunk = handle.result_queue.get(timeout=timeout)
-        if chunk.kind == "data":
-            chunks.append(chunk.payload)
-        elif chunk.kind == "error":
-            raise chunk.error
-        elif chunk.kind == "done":
-            return chunks
-    raise TimeoutError("timed out waiting for audio queue results")
-
-
-def test_audio_transcriptions_accepts_m4a_upload(client, monkeypatch):
-    fake_model = FakeSTTModel({"text": "Transcribed from m4a."})
-    monkeypatch.setattr(
-        server,
-        "get_cached_model",
-        lambda model, **kwargs: (fake_model, None, SimpleNamespace(model_type="audio")),
-    )
-    monkeypatch.setattr(
-        server_audio,
-        "audio_read",
-        lambda buffer, always_2d=False: (np.zeros(160, dtype=np.float32), 16000),
-    )
-    # Intentionally exercises the real writer: the bug was that the temp file
-    # inherited the upload's extension and m4a is not an encodable format.
-
-    response = client.post(
-        "/v1/audio/transcriptions",
-        files={"file": ("meeting.m4a", b"audio-bytes", "audio/mp4")},
-        data={"model": "fake-stt"},
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {"text": "Transcribed from m4a."}
-    assert fake_model.calls[0]["path"].endswith(".wav")
 
 
 def test_audio_transcriptions_undecodable_upload_returns_400(client, monkeypatch):

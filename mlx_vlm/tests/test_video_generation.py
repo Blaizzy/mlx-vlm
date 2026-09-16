@@ -69,9 +69,7 @@ def test_h3_video_adapter_maps_ordered_references_and_outputs():
             )
 
     model = MiniMaxH3VideoGenerationModel(
-        pipeline=FakePipeline(),
-        model_id="synthetic-h3",
-        workflow="ref2va",
+        pipeline=FakePipeline(), model_id="synthetic-h3", workflow="ref2va"
     )
     result = model.generate(
         VideoGenerationRequest(
@@ -107,11 +105,7 @@ def test_video_generation_cli_preserves_reference_order(tmp_path, capsys):
         prompt=["A", "short", "film"],
         image=None,
         last_image=None,
-        reference=[
-            "image=character.png",
-            "video=motion.mp4",
-            "audio=voice.wav",
-        ],
+        reference=["image=character.png", "video=motion.mp4", "audio=voice.wav"],
         audio=None,
         video=None,
         workflow=None,
@@ -162,11 +156,7 @@ def test_video_generation_cli_preserves_reference_order(tmp_path, capsys):
 
 @pytest.mark.parametrize(
     ("image", "last_image", "expected_workflow"),
-    [
-        (None, None, "t2va"),
-        (["first.png"], None, "fl2va"),
-        (None, "last.png", "fl2va"),
-    ],
+    [(None, None, "t2va"), (["first.png"], None, "fl2va"), (None, "last.png", "fl2va")],
 )
 def test_video_generation_cli_infers_keyframe_workflow(
     tmp_path, image, last_image, expected_workflow

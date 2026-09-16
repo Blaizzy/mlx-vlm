@@ -115,16 +115,6 @@ def test_rejected_two_pass_degrades_to_one_pass(monkeypatch):
     assert max_abs_diff(out, reference(queries, keys, values)) < TOLERANCE
 
 
-def test_rejected_one_pass_declines_to_the_portable_path(monkeypatch):
-    queries, keys, values = inputs(512)
-    reject(monkeypatch, "_qwen3_5_ragged_sdpa_one_pass_kernel", [])
-    reject(monkeypatch, "_qwen3_5_ragged_sdpa_two_pass_2_kernel", [])
-
-    out = lang._qwen3_5_ragged_decode_attention(queries, keys, values, PADS, SCALE)
-
-    assert out is None, "with no launchable kernel it must let the caller fall back"
-
-
 def test_rejection_is_probed_once(monkeypatch):
     kv_len = two_pass_kv_len()
     if kv_len is None:

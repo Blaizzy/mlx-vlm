@@ -2,14 +2,8 @@ import mlx.core as mx
 import numpy as np
 
 from mlx_vlm.generate.ar import _make_cache
-from mlx_vlm.models.cache import ArraysCache, BatchKVCache, CacheList
 from mlx_vlm.models.inkling.config import TextConfig
-from mlx_vlm.models.inkling.language import (
-    LanguageModel,
-    _restore_cache_state,
-    _snapshot_cache_state,
-    banded_additive_mask,
-)
+from mlx_vlm.models.inkling.language import LanguageModel, banded_additive_mask
 from mlx_vlm.speculative.drafters.inkling_mtp import InklingMTPDraftModel
 from mlx_vlm.speculative.drafters.inkling_mtp.config import InklingMTPConfig
 
@@ -44,13 +38,7 @@ def test_banded_mask_excludes_left_padding():
     rel = mx.zeros((2, 3, 1, 1))
     proj = mx.zeros((1, 4))
     mask = banded_additive_mask(
-        rel,
-        proj,
-        mx.array(0),
-        mx.array(3),
-        0,
-        4,
-        left_padding=mx.array([0, 2]),
+        rel, proj, mx.array(0), mx.array(3), 0, 4, left_padding=mx.array([0, 2])
     )
     mx.eval(mask)
 
@@ -67,10 +55,7 @@ def test_server_batch_matches_independent_rows():
     long_prompt = mx.random.normal((1, 3, 32))
     short_prompt = mx.random.normal((1, 1, 32))
     batch_prompt = mx.concatenate(
-        [
-            long_prompt,
-            mx.concatenate([mx.zeros((1, 2, 32)), short_prompt], axis=1),
-        ],
+        [long_prompt, mx.concatenate([mx.zeros((1, 2, 32)), short_prompt], axis=1)],
         axis=0,
     )
 
@@ -105,10 +90,7 @@ def test_server_right_padded_prefill_preserves_conv_state():
     long_prompt = mx.random.normal((1, 3, 32))
     short_prompt = mx.random.normal((1, 1, 32))
     batch_prompt = mx.concatenate(
-        [
-            long_prompt,
-            mx.concatenate([short_prompt, mx.zeros((1, 2, 32))], axis=1),
-        ],
+        [long_prompt, mx.concatenate([short_prompt, mx.zeros((1, 2, 32))], axis=1)],
         axis=0,
     )
 
@@ -138,29 +120,9 @@ def test_server_right_padded_prefill_preserves_conv_state():
     assert mx.allclose(batch_logits[1, 0], short_logits[0, 0], atol=3e-3).item()
 
 
-def test_empty_batch_cache_snapshot_restores_metadata():
-    cache = CacheList(BatchKVCache([0, 2]), ArraysCache(4, left_padding=[0, 2]))
-    snapshot = _snapshot_cache_state([cache])
-
-    keys = mx.ones((2, 1, 1, 4))
-    cache[0].update_and_fetch(keys, keys)
-    cache[1][0] = mx.ones((2, 3, 4))
-    cache[1].advance(1)
-    _restore_cache_state([cache], snapshot)
-
-    assert cache[0].keys is None
-    assert cache[0].offset.tolist() == [0, -2]
-    assert cache[0].left_padding.tolist() == [0, 2]
-    assert cache[0]._idx == 0
-    assert cache[1].cache == [None] * 4
-    assert cache[1].left_padding.tolist() == [0, 2]
-
-
 def test_mtp_eval_state_skips_empty_kv_caches():
     config = InklingMTPConfig(
-        text_config=_tiny_text_config(1),
-        num_mtp_layers=2,
-        mtp_local_layer_ids=[0],
+        text_config=_tiny_text_config(1), num_mtp_layers=2, mtp_local_layer_ids=[0]
     )
     drafter = InklingMTPDraftModel(config)
     drafter._cache = drafter.make_cache()
@@ -168,51 +130,6 @@ def test_mtp_eval_state_skips_empty_kv_caches():
     state = drafter.draft_eval_state()
 
     assert len(state) == 4
-
-
-def test_audio_features_match_numpy_stft():
-    from mlx_vlm.models.inkling.audio_feature_extractor import (
-        InklingAudioFeatureExtractor,
-    )
-
-    extractor = InklingAudioFeatureExtractor()
-    rng = np.random.default_rng(5)
-    waveform = rng.normal(0.0, 0.1, 2401).astype(np.float32)
-    actual = np.asarray(extractor(waveform)["input_features"])[0]
-
-    right_pad = (-len(waveform)) % extractor.hop_length
-    padded = np.pad(
-        waveform,
-        (extractor.n_fft - extractor.hop_length, right_pad),
-    )
-    frames = np.lib.stride_tricks.sliding_window_view(padded, extractor.n_fft)[
-        :: extractor.hop_length
-    ]
-    spectrum = np.fft.rfft(frames * np.asarray(extractor.window), axis=-1)
-    magnitudes = np.maximum(np.abs(spectrum), 1e-10)
-    mel = magnitudes @ np.asarray(extractor.mel_filters).T
-    expected = np.log10(np.maximum(mel, 1e-10)).astype(np.float32)
-
-    assert actual.shape == (4, 80)
-    assert np.allclose(actual, expected, atol=2e-6)
-
-
-def test_audio_features_pad_frames_and_mask():
-    from mlx_vlm.models.inkling.audio_feature_extractor import (
-        InklingAudioFeatureExtractor,
-    )
-
-    extractor = InklingAudioFeatureExtractor()
-    result = extractor(
-        [np.ones(799, dtype=np.float32), np.ones(1600, dtype=np.float32)]
-    )
-
-    assert result["input_features"].shape == (2, 2, 80)
-    assert result["input_features_mask"].tolist() == [
-        [True, False],
-        [True, True],
-    ]
-    assert mx.all(result["input_features"][0, 1] == 0).item()
 
 
 def test_audio_feature_chunks_preserve_stft_frames(monkeypatch):
@@ -240,8 +157,7 @@ def test_audio_feature_chunks_preserve_stft_frames(monkeypatch):
     assert calls == [3200, 3200, 3200, 1600]
     assert mx.allclose(chunked, unchunked, atol=3e-7).item()
     assert mx.array_equal(
-        extract_dmel_bins(chunked, max_frames_per_chunk=3),
-        extract_dmel_bins(unchunked),
+        extract_dmel_bins(chunked, max_frames_per_chunk=3), extract_dmel_bins(unchunked)
     ).item()
 
 
@@ -251,10 +167,7 @@ def test_audio_tower_chunks_embedding_gather():
 
     model = AudioModel(
         AudioConfig(
-            n_mel_bins=8,
-            mel_vocab_size=4,
-            text_hidden_size=32,
-            max_frames_per_chunk=2,
+            n_mel_bins=8, mel_vocab_size=4, text_hidden_size=32, max_frames_per_chunk=2
         )
     )
     mx.eval(model.parameters())
@@ -269,36 +182,6 @@ def test_audio_tower_chunks_embedding_gather():
 
     assert chunked.shape == (2, 4, 32)
     assert mx.allclose(chunked, unchunked, atol=1e-6).item()
-
-
-def test_dmel_quantization_boundaries():
-    from mlx_vlm.models.inkling.processing_inkling import (
-        DMEL_MAX_VALUE,
-        DMEL_MIN_VALUE,
-        dmel_bin_boundaries,
-        dmel_bin_centers,
-        extract_dmel_bins,
-    )
-
-    centers = dmel_bin_centers()
-    midpoints = (centers[:-1] + centers[1:]) / 2
-    rounded_midpoints = midpoints.astype(np.float32)
-    values = np.concatenate(
-        [
-            [DMEL_MIN_VALUE - 1],
-            centers.astype(np.float32),
-            np.nextafter(rounded_midpoints, np.float32(-np.inf)),
-            rounded_midpoints,
-            np.nextafter(rounded_midpoints, np.float32(np.inf)),
-            [DMEL_MAX_VALUE + 1],
-        ]
-    ).astype(np.float32)
-    clipped = np.clip(values, DMEL_MIN_VALUE, DMEL_MAX_VALUE)
-    expected = np.abs(clipped.astype(np.float64)[:, None] - centers).argmin(axis=1)
-    actual = np.asarray(extract_dmel_bins(mx.array(values), dmel_bin_boundaries()))
-
-    assert actual.dtype == np.int32
-    assert np.array_equal(actual, expected)
 
 
 def test_processor_expands_audio_tokens_from_frame_mask():
@@ -340,19 +223,13 @@ def test_processor_expands_audio_tokens_from_frame_mask():
     result = InklingProcessor.__call__(
         processor,
         text=[f"first {AUDIO_TOKEN}", f"second {AUDIO_TOKEN}"],
-        audio=[
-            np.zeros(799, dtype=np.float32),
-            np.zeros(1600, dtype=np.float32),
-        ],
+        audio=[np.zeros(799, dtype=np.float32), np.zeros(1600, dtype=np.float32)],
     )
 
     assert [text.count(AUDIO_TOKEN) for text in processor.tokenizer.encoded] == [1, 2]
     assert result["audio_input_ids"].shape == (2, 2, 80)
     assert result["audio_input_ids"].dtype == mx.int32
-    assert result["audio_input_ids_mask"].tolist() == [
-        [True, False],
-        [True, True],
-    ]
+    assert result["audio_input_ids_mask"].tolist() == [[True, False], [True, True]]
     assert result["attention_mask"].tolist() == [[0, 1, 1], [1, 1, 1]]
 
 

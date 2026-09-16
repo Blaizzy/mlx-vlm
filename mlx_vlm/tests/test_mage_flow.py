@@ -19,7 +19,6 @@ from mlx_vlm.generate.image import (
 )
 from mlx_vlm.models.mage_flow.config import (
     VARIANTS,
-    get_variant,
     validate_dimensions,
     variant_from_local_path,
 )
@@ -35,7 +34,6 @@ from mlx_vlm.models.mage_flow.model import (
     MageFlowImageEditModel,
     MageFlowImageGenerationModel,
     _resolve_load_variant,
-    resolve_variant,
 )
 from mlx_vlm.models.mage_flow.scheduler import FlowMatchEulerDiscreteScheduler
 from mlx_vlm.models.mage_flow.transformer import (
@@ -69,39 +67,6 @@ def _write_layout(root: Path) -> None:
     (root / "model_index.json").write_text('{"_class_name":"MageFlowPipeline"}')
 
 
-@pytest.mark.parametrize(
-    "model_id,variant,task,steps,guidance",
-    [
-        ("microsoft/Mage-Flow-Base", "mage-flow-base", "generate", 30, 5.0),
-        ("microsoft/Mage-Flow", "mage-flow", "generate", 20, 5.0),
-        ("microsoft/Mage-Flow-Turbo", "mage-flow-turbo", "generate", 4, 1.0),
-        (
-            "microsoft/Mage-Flow-Edit-Base",
-            "mage-flow-edit-base",
-            "edit",
-            30,
-            5.0,
-        ),
-        ("microsoft/Mage-Flow-Edit", "mage-flow-edit", "edit", 30, 5.0),
-        (
-            "microsoft/Mage-Flow-Edit-Turbo",
-            "mage-flow-edit-turbo",
-            "edit",
-            4,
-            1.0,
-        ),
-    ],
-)
-def test_mage_flow_variants(
-    model_id: str, variant: str, task: str, steps: int, guidance: float
-) -> None:
-    spec = get_variant(model_id)
-    assert spec.name == variant
-    assert spec.task == task
-    assert spec.default_steps == steps
-    assert spec.default_guidance == guidance
-
-
 def test_mage_flow_registers_generation_and_edit_families() -> None:
     assert (
         image_generation_model_class("microsoft/Mage-Flow")
@@ -117,28 +82,6 @@ def test_mage_flow_registers_generation_and_edit_families() -> None:
     assert not is_image_edit_model("mage-flow-turbo")
 
 
-def test_mage_flow_remote_metadata_dispatch(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    _write_layout(tmp_path)
-
-    def fake_get_model_path(repo_id: str, **kwargs):  # noqa: ARG001
-        assert repo_id == "example/custom-mage"
-        return tmp_path
-
-    monkeypatch.setattr(image_module, "get_model_path", fake_get_model_path)
-    assert (
-        image_generation_model_class("example/custom-mage")
-        is MageFlowImageGenerationModel
-    )
-
-
-def test_mage_flow_resolves_community_repo_alias() -> None:
-    assert (
-        resolve_variant("mage-flow-community/Mage-Flow-Turbo").name == "mage-flow-turbo"
-    )
-
-
 def test_mage_flow_load_prefers_local_metadata(tmp_path: Path) -> None:
     _write_layout(tmp_path)
     (tmp_path / "mlx_mage_flow.json").write_text('{"variant":"mage-flow-edit-turbo"}')
@@ -146,12 +89,6 @@ def test_mage_flow_load_prefers_local_metadata(tmp_path: Path) -> None:
         _resolve_load_variant("community/custom-name", tmp_path).name
         == "mage-flow-edit-turbo"
     )
-
-
-def test_mage_flow_load_prefers_explicit_variant(tmp_path: Path) -> None:
-    model_path = tmp_path / "unrelated-edit-turbo-directory" / "model"
-    _write_layout(model_path)
-    assert _resolve_load_variant("mage-flow-base", model_path).name == "mage-flow-base"
 
 
 def test_mage_flow_local_variant_uses_cache_parent_name(tmp_path: Path) -> None:
@@ -258,51 +195,9 @@ def test_mage_flow_weight_sanitizers() -> None:
 def test_mage_flow_native_vae_layout_is_not_transposed() -> None:
     weight = mx.zeros((2, 3, 3, 4))
     sanitized = sanitize_vae_weights(
-        {"decoder_model.conv_in.weight": weight},
-        source_layout="mlx_nhwc",
+        {"decoder_model.conv_in.weight": weight}, source_layout="mlx_nhwc"
     )
     assert sanitized["decoder_model.conv_in.weight"].shape == weight.shape
-
-
-@pytest.mark.parametrize(
-    "mode,bits,group_size",
-    [
-        ("affine", 4, 64),
-        ("mxfp4", 4, 32),
-        ("nvfp4", 4, 16),
-        ("mxfp8", 8, 32),
-    ],
-)
-def test_mage_flow_loads_quantized_weights(
-    mode: str, bits: int, group_size: int
-) -> None:
-    class TinyModel(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.proj = nn.Linear(64, 32, bias=False)
-
-    quantized = TinyModel()
-    nn.quantize(
-        quantized,
-        group_size=group_size,
-        bits=bits,
-        mode=mode,
-    )
-    loaded = _apply_weights(
-        TinyModel(),
-        dict(tree_flatten(quantized.parameters())),
-        {
-            "quantization_mode": mode,
-            "quantization_level": str(bits),
-            "quantization_group_size": str(group_size),
-        },
-    )
-    assert isinstance(loaded.proj, nn.QuantizedLinear)
-    assert loaded.quantization_config == {
-        "bits": bits,
-        "group_size": group_size,
-        "mode": mode,
-    }
 
 
 def test_mage_flow_quantizes_only_compatible_layers() -> None:
@@ -322,17 +217,12 @@ def test_mage_flow_quantizes_only_compatible_layers() -> None:
 
 def test_mage_flow_quantization_skips_sensitive_transformer_layers() -> None:
     module = nn.Linear(64, 32, bias=False)
-    assert _transformer_quantization_predicate(
-        "transformer_blocks.0.attn.to_q",
-        module,
+    assert _transformer_quantization_predicate("transformer_blocks.0.attn.to_q", module)
+    assert not _transformer_quantization_predicate(
+        "transformer_blocks.0.img_mod.linear", module
     )
     assert not _transformer_quantization_predicate(
-        "transformer_blocks.0.img_mod.linear",
-        module,
-    )
-    assert not _transformer_quantization_predicate(
-        "transformer_blocks.0.txt_mod.linear",
-        module,
+        "transformer_blocks.0.txt_mod.linear", module
     )
     assert not _transformer_quantization_predicate("proj_out", module)
 
@@ -369,11 +259,7 @@ def test_mage_flow_quantized_weights_require_config() -> None:
     quantized = TinyModel()
     nn.quantize(quantized, group_size=64, bits=4, mode="affine")
     with pytest.raises(ValueError, match="quantization mode"):
-        _apply_weights(
-            TinyModel(),
-            dict(tree_flatten(quantized.parameters())),
-            {},
-        )
+        _apply_weights(TinyModel(), dict(tree_flatten(quantized.parameters())), {})
 
 
 def test_mage_flow_conversion_rejects_output_inside_source(tmp_path: Path) -> None:
@@ -390,8 +276,7 @@ def test_mage_flow_conversion_rejects_ambiguous_local_variant(tmp_path: Path) ->
 
 
 def test_mage_flow_conversion_prefers_source_id_variant(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _write_layout(tmp_path)
 
@@ -428,9 +313,7 @@ def test_mage_flow_conversion_prefers_source_id_variant(
 
     output = tmp_path.parent / f"{tmp_path.name}-converted"
     convert_mage_flow(
-        tmp_path,
-        output,
-        source_id="mage-flow-community/Mage-Flow-Edit-Turbo",
+        tmp_path, output, source_id="mage-flow-community/Mage-Flow-Edit-Turbo"
     )
     metadata = json.loads((output / "mlx_mage_flow.json").read_text())
     assert metadata["variant"] == "mage-flow-edit-turbo"

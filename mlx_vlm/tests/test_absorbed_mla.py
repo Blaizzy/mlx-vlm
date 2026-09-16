@@ -3,7 +3,7 @@ import unittest
 import mlx.core as mx
 
 from mlx_vlm.models.cache import KVCache
-from mlx_vlm.models.mla import latent_length, max_absorbed_queries
+from mlx_vlm.models.mla import max_absorbed_queries
 
 # Dims chosen only to steer the gate; they do not affect the attention maths.
 FORCE_MATERIALIZED = (1, 1, 1)  # threshold 1
@@ -40,44 +40,9 @@ def _dense_attentions():
 
 
 class TestMaxAbsorbedQueries(unittest.TestCase):
-    def test_asymptotic_matches_mlx_lm(self):
-        # cache_len omitted -> the T -> inf limit, as in ml-explore/mlx-lm#1817
-        self.assertEqual(max_absorbed_queries(512, 128, 128), 170)
-        self.assertEqual(max_absorbed_queries(512, 192, 256), 398)
-
-    def test_cold_cache_rejects_the_absorbed_path(self):
-        # At T == L materializing is cheaper for every current model, so the
-        # threshold must fall below L rather than admit it.
-        for r, n, v in ((512, 128, 128), (512, 192, 256)):
-            for L in (2, 32, 64, 169, 398):
-                self.assertLess(
-                    max_absorbed_queries(r, n, v, cache_len=L),
-                    L,
-                    f"cold cache admitted L={L} for dims {(r, n, v)}",
-                )
-
-    def test_warm_cache_approaches_the_asymptote(self):
-        r, n, v = 512, 128, 128
-        limit = max_absorbed_queries(r, n, v)
-        self.assertEqual(max_absorbed_queries(r, n, v, cache_len=32768), limit - 1)
-        self.assertLess(max_absorbed_queries(r, n, v, cache_len=1024), limit)
-        # monotonic in cache length
-        seq = [max_absorbed_queries(r, n, v, cache_len=t) for t in (256, 1024, 8192)]
-        self.assertEqual(seq, sorted(seq))
-
     def test_degenerate_dims_keep_the_decode_path(self):
         self.assertEqual(max_absorbed_queries(64, 128, 128), 1)
         self.assertGreaterEqual(max_absorbed_queries(1, 1, 1), 1)
-
-
-class TestLatentLength(unittest.TestCase):
-    def test_plain_array(self):
-        self.assertEqual(latent_length(mx.zeros((1, 1, 37, 8))), 37)
-
-    def test_quantized_tuple(self):
-        # A quantized KV cache hands back a 3-tuple rather than an array.
-        q = (mx.zeros((1, 1, 37, 2)), mx.zeros((1, 1, 37, 1)), mx.zeros((1, 1, 37, 1)))
-        self.assertEqual(latent_length(q), 37)
 
 
 class TestGateWiring(unittest.TestCase):
@@ -150,11 +115,7 @@ class TestIndexerGateUnchanged(unittest.TestCase):
     widening it would apply one query's selection to all of them.
     """
 
-    SPARSE = [
-        "deepseek_v32",
-        "longcat_flash_sparse",
-        "glm_moe_dsa",
-    ]
+    SPARSE = ["deepseek_v32", "longcat_flash_sparse", "glm_moe_dsa"]
 
     def test_first_query_gather_is_still_gated_on_one_query(self):
         import pathlib

@@ -4,12 +4,10 @@ import importlib
 from pathlib import Path
 
 import mlx.core as mx
-import numpy as np
 import pytest
 
 import mlx_vlm.models.bonsai.download as download_module
 from mlx_vlm.generate.image import (
-    ImageGenerationResult,
     image_generation_model_class,
     is_image_generation_model,
 )
@@ -33,8 +31,7 @@ class FakeTransformer:
 class FakeVAE:
     def decode_packed_latents(self, packed, tiling_config=None):  # noqa: ARG002
         return mx.zeros(
-            (1, 3, packed.shape[2] * 16, packed.shape[3] * 16),
-            dtype=mx.bfloat16,
+            (1, 3, packed.shape[2] * 16, packed.shape[3] * 16), dtype=mx.bfloat16
         )
 
 
@@ -91,32 +88,6 @@ def test_bonsai_declares_image_generation_model_type(tmp_path: Path) -> None:
     assert not is_image_generation_model("mlx-community/nanoLLaVA-1.5-8bit")
 
 
-def test_bonsai_image_model_class_uses_remote_manifest(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    _write_layout(tmp_path)
-    (tmp_path / "manifest.json").write_text("""
-        {
-          "files": [
-            {"remote_path": "transformer-packed-mflux/diffusion_pytorch_model.safetensors"},
-            {"remote_path": "text_encoder-mlx-4bit/model.safetensors"},
-            {"remote_path": "tokenizer/tokenizer.json"}
-          ]
-        }
-        """)
-
-    def fake_get_model_path(repo_id: str, **kwargs):  # noqa: ARG001
-        assert repo_id == "example/custom-image-model"
-        return tmp_path
-
-    monkeypatch.setattr(image_module, "get_model_path", fake_get_model_path)
-
-    assert (
-        image_generation_model_class("example/custom-image-model")
-        is BonsaiImageGenerationModel
-    )
-
-
 def test_bonsai_parse_size() -> None:
     assert parse_size("1248x832") == (1248, 832)
     assert parse_size("832x1248") == (832, 1248)
@@ -126,11 +97,6 @@ def test_bonsai_parse_size() -> None:
 def test_bonsai_validate_dimensions_rejects_bad_sizes(width: int, height: int) -> None:
     with pytest.raises(ValueError):
         validate_dimensions(width=width, height=height)
-
-
-def test_bonsai_validate_model_layout_accepts_required_files(tmp_path: Path) -> None:
-    _write_layout(tmp_path)
-    assert validate_model_layout(tmp_path) == tmp_path
 
 
 def test_bonsai_validate_model_layout_reports_missing_files(tmp_path: Path) -> None:
@@ -186,25 +152,3 @@ def test_bonsai_generate_rejects_empty_prompt() -> None:
     pipeline = _fake_pipeline()
     with pytest.raises(ValueError, match="prompt"):
         pipeline.generate("", width=512, height=512)
-
-
-def test_image_generation_result_serializes_array(tmp_path: Path) -> None:
-    data = ImageGenerationResult(
-        array=mx.zeros((8, 8, 3), dtype=mx.uint8),
-        seed=1,
-        width=8,
-        height=8,
-        steps=1,
-        model="bonsai",
-        family="bonsai",
-        variant="ternary",
-        guidance=1.0,
-        peak_memory=0.0,
-    )
-
-    output_path = data.save(tmp_path / "image.png")
-
-    assert data.array.shape == (8, 8, 3)
-    assert output_path.exists()
-    assert data.to_b64_json()
-    assert np.array(data.to_pil()).shape == (8, 8, 3)

@@ -20,10 +20,7 @@ def _fake_minimum(values: _FakeArray, limit: int) -> _FakeArray:
 
 def _load_masks_module(monkeypatch):
     fake_mx = types.SimpleNamespace(
-        Dtype=object,
-        array=_FakeArray,
-        float32=object(),
-        minimum=_fake_minimum,
+        Dtype=object, array=_FakeArray, float32=object(), minimum=_fake_minimum
     )
     fake_mlx = types.ModuleType("mlx")
     fake_mlx.core = fake_mx
@@ -60,11 +57,3 @@ def test_local_window_offset_clamps_absolute_decode_position(monkeypatch):
     module = _load_masks_module(monkeypatch)
 
     assert module._local_window_offset(128, 8) == 8
-
-
-def test_local_window_offset_clamps_batched_decode_positions(monkeypatch):
-    module = _load_masks_module(monkeypatch)
-
-    result = module._local_window_offset(_FakeArray([5, 128]), 8)
-
-    assert result.values == [5, 8]

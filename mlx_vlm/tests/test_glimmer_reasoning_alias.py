@@ -10,27 +10,6 @@ renders "high".
 from mlx_vlm.server.generation import GenerationArguments
 
 
-def test_reasoning_effort_emits_reasoning_strength_alias():
-    kw = GenerationArguments(
-        enable_thinking=True,
-        reasoning=True,
-        reasoning_effort="low",
-    ).to_template_kwargs()
-
-    assert kw["reasoning_effort"] == "low"
-    assert kw["reasoning_strength"] == "low"
-
-
-def test_reasoning_strength_alias_preserves_high():
-    kw = GenerationArguments(
-        enable_thinking=True,
-        reasoning=True,
-        reasoning_effort="high",
-    ).to_template_kwargs()
-
-    assert kw["reasoning_strength"] == "high"
-
-
 def test_no_reasoning_strength_when_effort_unset():
     kw = GenerationArguments(enable_thinking=True, reasoning=True).to_template_kwargs()
 

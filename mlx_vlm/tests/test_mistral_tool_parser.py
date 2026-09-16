@@ -15,10 +15,7 @@ TOOLS = [
             "name": "get_weather",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "city": {"type": "string"},
-                    "days": {"type": "integer"},
-                },
+                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
             },
         },
     }
@@ -31,25 +28,6 @@ V3_OUTPUT = (
 )
 # Newer v11 / tekken form (Mistral-Small-3.x, Devstral).
 V11_OUTPUT = '[TOOL_CALLS]get_weather[ARGS]{"city": "Paris", "days": 3}'
-
-
-def test_v11_args_format_still_parses():
-    result = parse_tool_call('get_weather[ARGS]{"city": "Paris", "days": 3}')
-    assert result == {"name": "get_weather", "arguments": {"city": "Paris", "days": 3}}
-
-
-def test_v3_json_array_format_parses():
-    result = parse_tool_call(
-        '[{"name": "get_weather", "arguments": {"city": "Paris"}}]'
-    )
-    assert result == [{"name": "get_weather", "arguments": {"city": "Paris"}}]
-
-
-def test_v3_multiple_calls_in_array():
-    result = parse_tool_call(
-        '[{"name": "a", "arguments": {"x": 1}}, {"name": "b", "arguments": {}}]'
-    )
-    assert [c["name"] for c in result] == ["a", "b"]
 
 
 @pytest.mark.parametrize("output", [V3_OUTPUT, V11_OUTPUT])

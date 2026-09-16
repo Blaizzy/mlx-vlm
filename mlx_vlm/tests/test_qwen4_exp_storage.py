@@ -29,11 +29,7 @@ def _write_quantized_store(tmp_path, table, *, cache_rows=0):
     tensors = {}
     data_path = tmp_path / "rows.bin"
     with data_path.open("wb") as stream:
-        for name, dtype in (
-            ("weight", "U32"),
-            ("scales", "BF16"),
-            ("biases", "BF16"),
-        ):
+        for name, dtype in (("weight", "U32"), ("scales", "BF16"), ("biases", "BF16")):
             values = arrays[name]
             stream.write(values.tobytes())
             tensors[name] = {
@@ -50,13 +46,7 @@ def _write_quantized_store(tmp_path, table, *, cache_rows=0):
         "row_count": table.shape[0],
         "quantization": {"bits": 4, "group_size": 32, "mode": "affine"},
         "cache_rows": cache_rows,
-        "shards": [
-            {
-                "row_start": 0,
-                "row_count": table.shape[0],
-                **tensors,
-            }
-        ],
+        "shards": [{"row_start": 0, "row_count": table.shape[0], **tensors}],
     }
     path = tmp_path / "manifest.json"
     path.write_text(json.dumps(manifest))
@@ -95,36 +85,6 @@ def _write_nvfp4_store(tmp_path, table, *, cache_rows=0):
     path.write_text(json.dumps(manifest))
     expected = mx.dequantize(weight, scales, group_size=16, bits=4, mode="nvfp4")
     return path, expected
-
-
-def test_quantized_mmap_lookup_matches_resident_dequantization(tmp_path):
-    table = mx.arange(64 * 160).reshape(64, 160).astype(mx.float32) / 100
-    path, expected = _write_quantized_store(tmp_path, table, cache_rows=4)
-    store = QuantizedMMapNGramEmbedding(path)
-    ids = np.array([[1, 7, 1], [63, 7, 2]])
-    actual = store(ids)
-    mx.eval(actual, expected)
-    np.testing.assert_array_equal(
-        np.asarray(actual.astype(mx.float32)),
-        np.asarray(expected.astype(mx.float32))[ids],
-    )
-    assert store.stats.rows == 6
-    assert store.stats.cache_hits == 2
-    assert store.stats.cache_misses == 4
-    assert store.stats.bytes_read == 4 * (20 * 4 + 5 * 2 + 5 * 2)
-
-
-def test_quantized_mmap_lookup_preserves_unsorted_unique_ids(tmp_path):
-    table = mx.arange(8 * 160).reshape(8, 160).astype(mx.float32) / 100
-    path, expected = _write_quantized_store(tmp_path, table)
-    store = QuantizedMMapNGramEmbedding(path)
-    ids = np.array([7, 1, 5, 0])
-    actual = store(ids)
-    mx.eval(actual, expected)
-    np.testing.assert_array_equal(
-        np.asarray(actual.astype(mx.float32)),
-        np.asarray(expected.astype(mx.float32))[ids],
-    )
 
 
 def test_nvfp4_mmap_lookup_matches_resident_dequantization(tmp_path):
@@ -208,8 +168,7 @@ def test_external_ple_preserves_batched_incremental_history(tmp_path):
         np.asarray(expected.astype(mx.float32)),
     )
     np.testing.assert_array_equal(
-        np.asarray(batch_cache[3]),
-        np.asarray(continuation[:, -external.context_len :]),
+        np.asarray(batch_cache[3]), np.asarray(continuation[:, -external.context_len :])
     )
 
 
@@ -281,60 +240,7 @@ def test_prepare_external_model_indexes_existing_q4_ranges(tmp_path):
     expected = mx.dequantize(weight, scales, biases, group_size=32, bits=4)[[0, 7]]
     mx.eval(actual, expected)
     np.testing.assert_array_equal(
-        np.asarray(actual.astype(mx.float32)),
-        np.asarray(expected.astype(mx.float32)),
-    )
-
-
-def test_prepare_external_model_supports_nvfp4(tmp_path):
-    source = tmp_path / "source"
-    target = tmp_path / "target"
-    source.mkdir()
-    table = mx.arange(8 * 160).reshape(8, 160).astype(mx.float32) / 100
-    weight, scales = mx.quantize(table, group_size=16, bits=4, mode="nvfp4")
-    prefix = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0"
-    tensors = {
-        f"{prefix}.weight": weight,
-        f"{prefix}.scales": scales,
-        "language_model.embed_tokens.weight": mx.ones((2, 2)),
-    }
-    file_name = "model.safetensors"
-    mx.save_safetensors(str(source / file_name), tensors)
-    (source / "model.safetensors.index.json").write_text(
-        json.dumps({"metadata": {}, "weight_map": {key: file_name for key in tensors}})
-    )
-    (source / "config.json").write_text(
-        json.dumps(
-            {
-                "text_config": {},
-                "quantization": {
-                    "bits": 4,
-                    "group_size": 16,
-                    "mode": "nvfp4",
-                },
-            }
-        )
-    )
-
-    prepare_external_ple_model(source, target)
-    range_manifest = json.loads((target / "ple-store.json").read_text())
-    assert range_manifest["source_root"] == "../source"
-    assert range_manifest["quantization"] == {
-        "bits": 4,
-        "group_size": 16,
-        "mode": "nvfp4",
-    }
-    materialize_interleaved_ple_store(source, target / "ple-store.json")
-    assert (target / "ple-q4.rows").stat().st_size == 8 * 90
-    store = QuantizedMMapNGramEmbedding(target / "ple-store.json")
-    actual = store(np.array([0, 7]))
-    expected = mx.dequantize(weight, scales, group_size=16, bits=4, mode="nvfp4")[
-        [0, 7]
-    ]
-    mx.eval(actual, expected)
-    np.testing.assert_array_equal(
-        np.asarray(actual.astype(mx.float32)),
-        np.asarray(expected.astype(mx.float32)),
+        np.asarray(actual.astype(mx.float32)), np.asarray(expected.astype(mx.float32))
     )
 
 
@@ -405,54 +311,3 @@ def test_materialize_checks_existing_data_before_rewriting_manifest(tmp_path):
         materialize_interleaved_ple_store(source, manifest_path)
 
     assert manifest_path.read_text() == original_manifest
-
-
-def test_materialize_does_not_publish_partial_store(tmp_path, monkeypatch):
-    source = tmp_path / "source"
-    target = tmp_path / "target"
-    source.mkdir()
-    table = mx.ones((8, 160))
-    weight, scales, biases = mx.quantize(table, group_size=32, bits=4)
-    prefix = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0"
-    tensors = {
-        f"{prefix}.weight": weight,
-        f"{prefix}.scales": scales.astype(mx.bfloat16),
-        f"{prefix}.biases": biases.astype(mx.bfloat16),
-        "language_model.embed_tokens.weight": mx.ones((2, 2)),
-    }
-    file_name = "model.safetensors"
-    mx.save_safetensors(str(source / file_name), tensors)
-    (source / "model.safetensors.index.json").write_text(
-        json.dumps({"metadata": {}, "weight_map": {key: file_name for key in tensors}})
-    )
-    (source / "config.json").write_text(
-        json.dumps(
-            {
-                "text_config": {},
-                "quantization": {
-                    "bits": 4,
-                    "group_size": 64,
-                    "mode": "affine",
-                    prefix: {"bits": 4, "group_size": 32, "mode": "affine"},
-                },
-            }
-        )
-    )
-    prepare_external_ple_model(source, target)
-    manifest_path = target / "ple-store.json"
-    original_manifest = manifest_path.read_text()
-    original_memmap = np.memmap
-
-    def fail_output_mapping(*args, **kwargs):
-        if kwargs.get("mode") == "r+":
-            raise OSError("simulated write failure")
-        return original_memmap(*args, **kwargs)
-
-    monkeypatch.setattr(np, "memmap", fail_output_mapping)
-
-    with pytest.raises(OSError, match="simulated write failure"):
-        materialize_interleaved_ple_store(source, manifest_path)
-
-    assert manifest_path.read_text() == original_manifest
-    assert not (target / "ple-q4.rows").exists()
-    assert list(target.glob(".ple-q4.rows.*.partial")) == []

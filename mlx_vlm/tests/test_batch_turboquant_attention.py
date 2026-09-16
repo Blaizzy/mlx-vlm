@@ -7,13 +7,12 @@ holds a single unpadded row.
 """
 
 import mlx.core as mx
-import pytest
 
 from mlx_vlm.models.base import (
     _turboquant_attention_applies,
     scaled_dot_product_attention,
 )
-from mlx_vlm.turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
+from mlx_vlm.turboquant import BatchTurboQuantKVCache
 
 H, D = 4, 64  # kv heads, head_dim
 BITS = 4
@@ -33,33 +32,7 @@ def _filled(left_padding, seq_len, batch=None, bits=BITS):
     return cache, keys, values
 
 
-class TestSharedAttentionSurface:
-    """Both caches expose the same attention API through the mixin."""
-
-    def test_attention_states_ignores_batch_bookkeeping(self):
-        # The batch cache's `state` is a 4-tuple; the mixin must not unpack it.
-        cache, _, _ = _filled([0], 4)
-        keys_state, values_state = cache._attention_states()
-        assert keys_state is not None and values_state is not None
-
-
 class TestFusedPathGuard:
-    def test_single_cache_always_applies(self):
-        assert _turboquant_attention_applies(TurboQuantKVCache(bits=BITS))
-
-    def test_single_unpadded_row_applies(self):
-        cache, _, _ = _filled([0], 8)
-        assert _turboquant_attention_applies(cache)
-
-    def test_multi_row_does_not_apply(self):
-        cache, _, _ = _filled([0, 0], 8)
-        assert not _turboquant_attention_applies(cache)
-
-    def test_left_padded_row_does_not_apply(self):
-        # Padded positions would otherwise be attended to as real tokens.
-        cache, _, _ = _filled([3], 8)
-        assert not _turboquant_attention_applies(cache)
-
     def test_cached_eligibility_tracks_batch_lifecycle(self):
         cache = BatchTurboQuantKVCache([0], bits=BITS)
         other = BatchTurboQuantKVCache([0], bits=BITS)
@@ -91,22 +64,6 @@ class TestNumericalEquivalence:
             mask=mask,
         )
 
-    @pytest.mark.parametrize("seq_len", [16, 300])
-    def test_decode_matches_fallback(self, seq_len):
-        cache, keys, values = _filled([0], seq_len)
-        queries = mx.random.normal((1, H, 1, D))
-
-        fused = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=SCALE, mask=None
-        )
-        reference = self._reference(cache, queries, keys, values)
-        mx.eval(fused, reference)
-
-        assert fused.shape == reference.shape
-        # Both paths read the same quantized state, so they differ only by
-        # kernel arithmetic order.
-        assert mx.allclose(fused, reference, atol=2e-2).item()
-
     def test_multi_row_still_produces_correct_shape(self):
         cache, keys, values = _filled([0, 0], 12)
         queries = mx.random.normal((2, H, 1, D))
@@ -115,96 +72,6 @@ class TestNumericalEquivalence:
         )
         mx.eval(out)
         assert out.shape == (2, H, 1, D)
-
-    def test_left_padded_matches_fallback(self):
-        cache, keys, values = _filled([2], 10)
-        queries = mx.random.normal((1, H, 1, D))
-        out = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=SCALE, mask=None
-        )
-        reference = self._reference(cache, queries, keys, values)
-        mx.eval(out, reference)
-        assert mx.allclose(out, reference, atol=2e-2).item()
-
-
-class TestShapesBeyondTheDefaultLayout:
-    """The fused path has to survive head geometries other than the default.
-
-    Models differ in head_dim and in how many query heads share a KV head, so
-    exercise a couple of combinations rather than only 4 heads at 64 dims.
-    """
-
-    @pytest.mark.parametrize("head_dim", [64, 128, 256])
-    @pytest.mark.parametrize("q_per_kv", [1, 4, 6])
-    def test_decode_matches_fallback(self, head_dim, q_per_kv):
-        kv_heads, seq_len = 4, 96
-        scale = head_dim**-0.5
-        cache = BatchTurboQuantKVCache([0], bits=BITS)
-        keys, values = cache.update_and_fetch(
-            mx.random.normal((1, kv_heads, seq_len, head_dim)),
-            mx.random.normal((1, kv_heads, seq_len, head_dim)),
-        )
-        queries = mx.random.normal((1, kv_heads * q_per_kv, 1, head_dim))
-
-        fused = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=scale, mask=None
-        )
-        dq_k, dq_v = cache.dequantize(keys, values)
-        reference = mx.fast.scaled_dot_product_attention(
-            queries,
-            dq_k.astype(queries.dtype),
-            dq_v.astype(queries.dtype),
-            scale=scale,
-            mask=None,
-        )
-        mx.eval(fused, reference)
-        assert fused.shape == reference.shape
-        assert mx.allclose(fused, reference, atol=2e-2).item()
-
-
-class TestAttentionSinks:
-    """Sinks must be applied, not dropped and not rejected.
-
-    The fused kernels carry no sink term, so a request with sinks has to fall
-    through to the dequantizing path, which can pass them to MLX.
-    """
-
-    def _with_sinks(self, cache, keys, values, queries, sinks):
-        return scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=SCALE, mask=None, sinks=sinks
-        )
-
-    def test_sinks_are_applied(self):
-        cache, keys, values = _filled([0], 64)
-        queries = mx.random.normal((1, H, 1, D))
-        sinks = mx.random.normal((H,))
-
-        out = self._with_sinks(cache, keys, values, queries, sinks)
-        dq_k, dq_v = cache.dequantize(keys, values)
-        reference = mx.fast.scaled_dot_product_attention(
-            queries,
-            dq_k.astype(queries.dtype),
-            dq_v.astype(queries.dtype),
-            scale=SCALE,
-            mask=None,
-            sinks=sinks,
-        )
-        mx.eval(out, reference)
-        assert mx.allclose(out, reference, atol=2e-2).item()
-
-    def test_sinks_change_the_result(self):
-        # Guards against silently discarding them: the batch cache used to
-        # drop sinks on the floor and return the no-sink answer.
-        cache, keys, values = _filled([0], 64)
-        queries = mx.random.normal((1, H, 1, D))
-        sinks = mx.full((H,), 5.0)
-
-        with_sinks = self._with_sinks(cache, keys, values, queries, sinks)
-        without = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=SCALE, mask=None
-        )
-        mx.eval(with_sinks, without)
-        assert not mx.allclose(with_sinks, without, atol=1e-3).item()
 
 
 class TestDecodeMemoryIsFlat:

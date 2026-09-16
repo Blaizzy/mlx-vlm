@@ -9,10 +9,7 @@ from mlx_vlm.structured import ThinkingAwareLogitsProcessor
 
 class TinyThinkingTokenizer:
     def encode(self, text, add_special_tokens=False):
-        return {
-            "<think>": [10],
-            "</think>": [20],
-        }[text]
+        return {"<think>": [10], "</think>": [20]}[text]
 
 
 class RecordingProcessor:
@@ -36,9 +33,7 @@ class RecordingProcessor:
 def test_thinking_aware_processor_passes_logits_until_thinking_ends():
     inner = RecordingProcessor()
     processor = ThinkingAwareLogitsProcessor(
-        inner,
-        TinyThinkingTokenizer(),
-        enable_thinking=True,
+        inner, TinyThinkingTokenizer(), enable_thinking=True
     )
     logits = mx.zeros((1, 3), dtype=mx.float32)
 
@@ -61,9 +56,7 @@ def test_thinking_aware_processor_passes_logits_until_thinking_ends():
 def test_thinking_aware_processor_delegates_immediately_without_thinking():
     inner = RecordingProcessor()
     processor = ThinkingAwareLogitsProcessor(
-        inner,
-        TinyThinkingTokenizer(),
-        enable_thinking=False,
+        inner, TinyThinkingTokenizer(), enable_thinking=False
     )
     logits = mx.zeros((1, 3), dtype=mx.float32)
 
@@ -77,9 +70,7 @@ def test_thinking_aware_processor_delegates_immediately_without_thinking():
 def test_thinking_aware_processor_clone_resets_phase_state():
     inner = RecordingProcessor()
     processor = ThinkingAwareLogitsProcessor(
-        inner,
-        TinyThinkingTokenizer(),
-        enable_thinking=True,
+        inner, TinyThinkingTokenizer(), enable_thinking=True
     )
     processor.process_last_token(20, mx.zeros((1, 3), dtype=mx.float32))
 
@@ -116,8 +107,7 @@ def test_json_schema_processor_uses_compact_whitespace_pattern(monkeypatch):
     structured._llg_tokenizer_cache.clear()
 
     processor = structured.build_json_schema_logits_processor(
-        object(),
-        {"type": "object"},
+        object(), {"type": "object"}
     )
 
     assert processor.grammar == "compiled grammar"

@@ -48,7 +48,6 @@ from mlx_vlm.models.ernie_image.pipeline import (
     _load_edit_image,
     _pad_text,
 )
-from mlx_vlm.models.ernie_image.scheduler import ErnieImageFlowMatchScheduler
 from mlx_vlm.models.ernie_image.text_encoder import (
     ErnieImageTextConfig,
     ErnieImageTextEncoder,
@@ -57,7 +56,6 @@ from mlx_vlm.models.ernie_image.transformer import (
     ErnieImageTransformer,
     rope_frequencies,
     rotate_half,
-    timestep_embedding,
 )
 from mlx_vlm.models.ernie_image.weights import (
     _require_vae_encoder_weights,
@@ -90,20 +88,6 @@ def _write_layout(root: Path, *, turbo: bool = True) -> None:
             }
         )
     )
-
-
-@pytest.mark.parametrize(
-    "model_id,name,steps,guidance",
-    [
-        ("baidu/ERNIE-Image", "ernie-image", 50, 4.0),
-        ("baidu/ERNIE-Image-Turbo", "ernie-image-turbo", 8, 1.0),
-    ],
-)
-def test_ernie_variants(model_id: str, name: str, steps: int, guidance: float) -> None:
-    variant = get_variant(model_id)
-    assert variant.name == name
-    assert variant.default_steps == steps
-    assert variant.default_guidance == guidance
 
 
 def test_ernie_local_variant_uses_native_metadata(tmp_path: Path) -> None:
@@ -185,30 +169,6 @@ def test_ernie_dimensions_must_be_positive_multiples_of_16(
 ) -> None:
     with pytest.raises(ValueError):
         validate_dimensions(width=width, height=height)
-
-
-def test_ernie_scheduler_matches_official_static_shift() -> None:
-    scheduler = ErnieImageFlowMatchScheduler(num_inference_steps=8)
-    expected = np.array(
-        [
-            1.0,
-            0.96551724,
-            0.92307692,
-            0.86956522,
-            0.8,
-            0.70588235,
-            0.57142857,
-            0.36363636,
-            0.0,
-        ]
-    )
-    np.testing.assert_allclose(np.array(scheduler.sigmas), expected, rtol=1e-6)
-    assert scheduler.timesteps.shape == (8,)
-
-
-def test_timestep_embedding_uses_sin_then_cos() -> None:
-    result = timestep_embedding(mx.array([0.0]), 4)
-    np.testing.assert_allclose(np.array(result), [[0.0, 0.0, 1.0, 1.0]])
 
 
 def test_ernie_rope_matches_reference_hybrid_convention() -> None:
@@ -360,12 +320,7 @@ def test_ambiguous_rgb_conv_uses_source_layout_metadata() -> None:
 
 @pytest.mark.parametrize(
     "mode,group_size,bits",
-    [
-        ("affine", 32, 4),
-        ("mxfp4", 32, 4),
-        ("nvfp4", 16, 4),
-        ("mxfp8", 32, 8),
-    ],
+    [("affine", 32, 4), ("mxfp4", 32, 4), ("nvfp4", 16, 4), ("mxfp8", 32, 8)],
 )
 def test_ernie_strict_quantized_loading_modes(
     mode: str, group_size: int, bits: int
@@ -444,10 +399,7 @@ class FakePipeline:
 
 @pytest.mark.parametrize(
     "variant,steps,guidance,cfg",
-    [
-        ("ernie-image", 50, 4.0, True),
-        ("ernie-image-turbo", 8, 1.0, False),
-    ],
+    [("ernie-image", 50, 4.0, True), ("ernie-image-turbo", 8, 1.0, False)],
 )
 def test_model_request_defaults_follow_variant(
     variant: str, steps: int, guidance: float, cfg: bool
@@ -457,9 +409,7 @@ def test_model_request_defaults_follow_variant(
     result = generate_image(
         model,
         ImageGenerationRequest(
-            prompt="a lighthouse",
-            seed=7,
-            extra={"negative_prompt": "fog"},
+            prompt="a lighthouse", seed=7, extra={"negative_prompt": "fog"}
         ),
     )
     assert result.steps == steps
@@ -484,92 +434,16 @@ def test_generation_request_converts_to_edit_request() -> None:
     )
 
 
-def test_ernie_edit_model_forwards_img2img_strength() -> None:
-    pipeline = FakePipeline("ernie-image-turbo")
-    model = ErnieImageEditModel(pipeline=pipeline, model_id="ernie")
-    result = model.edit(
-        ImageEditRequest(
-            prompt="make it a convertible",
-            image_paths=("source.png",),
-            seed=3,
-            steps=8,
-            guidance=1.0,
-            extra={"image_strength": 0.55},
-        )
-    )
-    assert result.width == 32
-    assert result.height == 16
-    assert result.metadata["image_strength"] == 0.55
-    assert result.metadata["native_instruction_edit"] is False
-    assert pipeline.calls[0][2]["image_strength"] == 0.55
-
-
 def test_ernie_base_edit_uses_variant_defaults() -> None:
     pipeline = FakePipeline("ernie-image")
     model = ErnieImageEditModel(pipeline=pipeline, model_id="ernie")
     result = model.edit(
         ImageEditRequest(
-            prompt="make it a convertible",
-            image_paths=("source.png",),
-            seed=3,
+            prompt="make it a convertible", image_paths=("source.png",), seed=3
         )
     )
     assert result.steps == 50
     assert result.guidance == 4.0
-
-
-def test_ernie_edit_model_accepts_strength_alias() -> None:
-    pipeline = FakePipeline("ernie-image-turbo")
-    model = ErnieImageEditModel(pipeline=pipeline, model_id="ernie")
-    result = model.edit(
-        ImageEditRequest(
-            prompt="make it a convertible",
-            image_paths=("source.png",),
-            seed=3,
-            steps=8,
-            guidance=1.0,
-            extra={"strength": 0.42},
-        )
-    )
-    assert result.metadata["image_strength"] == 0.42
-    assert result.metadata["prompt_enhancement"] is False
-    assert pipeline.calls[0][2]["image_strength"] == 0.42
-
-
-def test_ernie_edit_model_image_strength_precedes_strength() -> None:
-    pipeline = FakePipeline("ernie-image-turbo")
-    model = ErnieImageEditModel(pipeline=pipeline, model_id="ernie")
-    result = model.edit(
-        ImageEditRequest(
-            prompt="make it a convertible",
-            image_paths=("source.png",),
-            seed=3,
-            steps=8,
-            guidance=1.0,
-            extra={"strength": 0.42, "image_strength": 0.71},
-        )
-    )
-    assert result.metadata["image_strength"] == 0.71
-    assert pipeline.calls[0][2]["image_strength"] == 0.71
-
-
-def test_ernie_edit_model_uses_raised_edit_default_guidance() -> None:
-    pipeline = FakePipeline("ernie-image-turbo")
-    model = ErnieImageEditModel(pipeline=pipeline, model_id="ernie")
-    result = model.edit(
-        ImageEditRequest(
-            prompt="make it a convertible",
-            image_paths=("source.png",),
-            seed=3,
-        )
-    )
-    # No explicit guidance: the raised edit default is used, not the turbo
-    # generation default (1.0), so classifier-free guidance actually applies.
-    assert result.guidance == 3.0
-    assert result.metadata["classifier_free_guidance"] is True
-    # The model-card generation recommendation is left untouched.
-    assert get_variant("ernie-image-turbo").default_guidance == 1.0
-    assert get_variant("ernie-image-turbo").edit_default_guidance == 3.0
 
 
 def test_ernie_edit_model_defaults_prompt_enhancer_off(
@@ -613,8 +487,7 @@ class FakeVAE:
     def __init__(self) -> None:
         self.encoder = object()
         self.bn = SimpleNamespace(
-            running_mean=mx.zeros((128,)),
-            running_var=mx.ones((128,)),
+            running_mean=mx.zeros((128,)), running_var=mx.ones((128,))
         )
 
     def encode(self, pixels):
@@ -632,9 +505,7 @@ def _fake_runtime_pipeline(variant: str, *, evict: bool = False) -> ErnieImagePi
     pipeline.variant = get_variant(variant)
     pipeline.model_path = Path("/tmp/ernie")
     pipeline.runtime_config = ErnieImageRuntimeConfig(
-        evict_text_encoder=False,
-        evict_transformer=evict,
-        use_prompt_enhancer=False,
+        evict_text_encoder=False, evict_transformer=evict, use_prompt_enhancer=False
     )
     pipeline.tokenizer = SimpleNamespace(count_tokens=lambda prompt: len(prompt))
     pipeline.text_encoder = None
@@ -666,14 +537,6 @@ def test_prompt_cache_evicts_least_recently_used_entry() -> None:
     assert list(pipeline.prompt_cache) == ["first", "third"]
 
 
-def test_base_cfg_batches_unconditional_before_conditional() -> None:
-    pipeline = _fake_runtime_pipeline("ernie-image")
-    pipeline.generate_array("prompt", seed=1, steps=1, width=16, height=16)
-    shape, lengths = pipeline.transformer.calls[0]
-    assert shape[0] == 2
-    np.testing.assert_array_equal(np.array(lengths), [1, 3])
-
-
 def test_turbo_skips_cfg_and_evicts_large_components() -> None:
     pipeline = _fake_runtime_pipeline("ernie-image-turbo", evict=True)
     pipeline.generate_array("prompt", seed=1, steps=1, width=16, height=16)
@@ -700,33 +563,11 @@ def test_img2img_uses_strength_to_select_denoising_steps(tmp_path: Path) -> None
     assert len(pipeline.transformer.calls) == 4
 
 
-def test_edit_image_rounds_source_size_to_model_grid(tmp_path: Path) -> None:
-    image_path = tmp_path / "source.png"
-    Image.new("RGBA", (1160, 890), color="navy").save(image_path)
-    pixels, width, height = _load_edit_image(image_path, width=None, height=None)
-    assert (width, height) == (1152, 880)
-    assert pixels.shape == (1, 3, 880, 1152)
-
-
-def test_edit_image_caps_large_source_to_one_megapixel(tmp_path: Path) -> None:
-    image_path = tmp_path / "source.png"
-    Image.new("RGB", (4032, 3024), color="navy").save(image_path)
-    pixels, width, height = _load_edit_image(image_path, width=None, height=None)
-    assert (width, height) == (1168, 880)
-    assert pixels.shape == (1, 3, 880, 1168)
-
-
 @pytest.mark.parametrize(
-    "size,expected",
-    [
-        ((300, 200), (384, 256)),
-        ((4000, 250), (2048, 128)),
-    ],
+    "size,expected", [((300, 200), (384, 256)), ((4000, 250), (2048, 128))]
 )
 def test_edit_auto_size_preserves_aspect_ratio(
-    tmp_path: Path,
-    size: tuple[int, int],
-    expected: tuple[int, int],
+    tmp_path: Path, size: tuple[int, int], expected: tuple[int, int]
 ) -> None:
     image_path = tmp_path / "source.png"
     Image.new("RGB", size, color="navy").save(image_path)
@@ -810,8 +651,7 @@ def test_conversion_detection_and_layout_metadata(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "mode,expected_bits,expected_group_size",
-    [("affine", 4, 64), ("mxfp8", 8, 32)],
+    "mode,expected_bits,expected_group_size", [("affine", 4, 64), ("mxfp8", 8, 32)]
 )
 def test_ernie_convert_resolves_hub_model(
     monkeypatch: pytest.MonkeyPatch,

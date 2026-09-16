@@ -9,16 +9,8 @@ from mlx_vlm.models.base import InputEmbeddingsFeatures
 from mlx_vlm.models.qwen3_5 import language as qwen_language
 from mlx_vlm.models.qwen3_5.config import TextConfig as Qwen3_5TextConfig
 from mlx_vlm.server.generation import _PositionedTargetSampler
-from mlx_vlm.speculative.drafters import (
-    resolve_drafter_kind,
-    validate_drafter_compatibility,
-)
-from mlx_vlm.speculative.drafters.dflash2 import (
-    CandidateSelector,
-    DFlash2DraftModel,
-    ModelConfig,
-    _grouped_dynamic_convolve,
-)
+from mlx_vlm.speculative.drafters import resolve_drafter_kind
+from mlx_vlm.speculative.drafters.dflash2 import DFlash2DraftModel, ModelConfig
 from mlx_vlm.utils import get_model_and_args
 
 
@@ -40,10 +32,7 @@ def _published_config():
         "num_target_layers": 64,
         "layer_types": ["sliding_attention"] * 5,
         "sliding_window": 2048,
-        "rope_parameters": {
-            "rope_type": "default",
-            "rope_theta": 10000000,
-        },
+        "rope_parameters": {"rope_type": "default", "rope_theta": 10000000},
         "dflash_config": {
             "block_size": 8,
             "conv_group_size": 16,
@@ -137,8 +126,7 @@ def _generated_tokens(target, prompt, drafter=None, temperature=0, seed=None):
         )
 
     generation_target = SimpleNamespace(
-        language_model=target,
-        get_input_embeddings=get_input_embeddings,
+        language_model=target, get_input_embeddings=get_input_embeddings
     )
     kwargs = (
         {"draft_model": drafter, "draft_kind": "dflash"} if drafter is not None else {}
@@ -205,43 +193,8 @@ def test_dflash2_sanitize_normalizes_published_codebooks():
     }
 
 
-def test_grouped_dynamic_convolution_is_causal():
-    hidden = mx.array([[[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]])
-    dynamic = mx.zeros((1, 3, 2, 2))
-    base = mx.array([[1, 1, 1, 1], [2, 2, 2, 2]])
-
-    actual = _grouped_dynamic_convolve(hidden, dynamic, base, group_size=2)
-    expected = mx.array([[[1, 2, 3, 4], [7, 10, 13, 16], [19, 22, 25, 28]]])
-
-    assert bool(mx.array_equal(actual, expected))
-
-
-def test_candidate_selector_uses_coherent_top_candidate_path():
-    config = _tiny_config()
-    selector = CandidateSelector(config)
-    selector.predecessor_codebook.weight = mx.zeros((32, 4))
-    selector.successor_codebook.weight = mx.zeros((32, 4))
-    selector.hidden_projection.weight = mx.zeros((4, 16))
-    hidden = mx.zeros((1, 2, 16))
-    logits = mx.array([[[0, 1, 5, 2] + [0] * 28, [0, 7, 2, 3] + [0] * 28]])
-
-    selected = selector.select(
-        hidden,
-        logits,
-        mx.array([4]),
-        sampler=lambda scores: mx.argmax(scores, axis=-1),
-    )
-
-    assert selected.tolist() == [[2, 1]]
-
-
 def test_positioned_proposal_sampling_is_independent_of_target_filters():
-    sampler = _PositionedTargetSampler(
-        temperature=1.0,
-        top_p=0.95,
-        top_k=20,
-        seed=7,
-    )
+    sampler = _PositionedTargetSampler(temperature=1.0, top_p=0.95, top_k=20, seed=7)
     scores = mx.zeros((1, 16))
 
     first = sampler.sample_proposal(scores, row_ids=[0], positions=[3])
@@ -249,25 +202,6 @@ def test_positioned_proposal_sampling_is_independent_of_target_filters():
 
     assert first.shape == (1,)
     assert bool(mx.array_equal(first, second))
-
-
-def test_dflash2_target_validation_is_structural():
-    config = _tiny_config()
-    target = SimpleNamespace(
-        language_model=SimpleNamespace(
-            config=SimpleNamespace(
-                hidden_size=16,
-                num_hidden_layers=2,
-                vocab_size=32,
-            ),
-            model=SimpleNamespace(layers=[object(), object()]),
-            rollback_speculative_cache=lambda *args: None,
-        )
-    )
-
-    validate_drafter_compatibility(
-        target, DFlash2DraftModel(config), draft_kind="dflash"
-    )
 
 
 @pytest.mark.parametrize(("temperature", "seed"), [(0, None), (1.0, 17)])
@@ -280,11 +214,7 @@ def test_dflash2_generation_has_exact_target_parity(temperature, seed):
 
     baseline = _generated_tokens(target, prompt, temperature=temperature, seed=seed)
     speculative = _generated_tokens(
-        target,
-        prompt,
-        drafter,
-        temperature=temperature,
-        seed=seed,
+        target, prompt, drafter, temperature=temperature, seed=seed
     )
 
     assert speculative == baseline

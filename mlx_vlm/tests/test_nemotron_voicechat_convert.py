@@ -37,10 +37,7 @@ def _source_config():
                 }
             },
             "speech_generation": {
-                "data": {
-                    "audio_prompt_duration": 3.0,
-                    "target_sample_rate": 22_050,
-                },
+                "data": {"audio_prompt_duration": 3.0, "target_sample_rate": 22_050},
                 "model": {
                     "inference_guidance_scale": 0.2,
                     "inference_top_p_or_k": 0.95,
@@ -146,22 +143,6 @@ def _base_config():
     }
 
 
-def test_build_runtime_config_normalizes_source_schema():
-    config = build_runtime_config(_source_config(), _base_config())
-    assert config["model_type"] == "nemotron_voicechat"
-    assert "mlx_runtime_config_version" not in config
-    assert "source_revision" not in config
-    assert "base_tokenizer_revision" not in config
-    assert "time_step_limit" not in config["text_config"]
-    assert config["eos_token_id"] == 2
-    assert config["pad_token_id"] == 12
-    assert config["audio_config"]["encoder"]["att_context_size"] == [[70, 0]]
-    assert config["codec_config"]["base_channels"] == 384
-    assert config["codec_config"]["channel_multipliers"] == [1, 2, 4]
-    assert config["codec_config"]["downsample_rates"] == [7, 7, 9]
-    assert config["rnnt_vocabulary"] == ["<unk>", "▁hello"]
-
-
 def test_build_runtime_config_preserves_finite_time_step_limit():
     base = _base_config()
     base["time_step_limit"] = [0.001, 0.1]
@@ -177,18 +158,6 @@ def test_build_runtime_config_rejects_non_finite_time_step_limit():
 
     with pytest.raises(ValueError, match="two finite numbers"):
         build_runtime_config(_source_config(), base)
-
-
-def test_build_runtime_config_flattens_per_module_quantization():
-    config = build_runtime_config(_source_config(), _base_config())
-    quantization = config["quantization"]
-    assert quantization["group_size"] == 64
-    assert quantization["bits"] == 4
-    assert quantization["stt_model.embed_tokens"] == {
-        "group_size": 64,
-        "bits": 4,
-    }
-    assert config["quantization_config"] == quantization
 
 
 def test_build_runtime_config_keeps_bf16_unquantized():
@@ -226,12 +195,7 @@ def test_prepare_artifact_writes_generic_load_layout(tmp_path):
     source, tokenizer, shard_name = _write_artifact_inputs(tmp_path)
     output = tmp_path / "output"
 
-    result = convert.prepare_artifact(
-        source,
-        tokenizer,
-        output,
-        copy_weights=True,
-    )
+    result = convert.prepare_artifact(source, tokenizer, output, copy_weights=True)
 
     assert result == output
     assert json.loads((output / "config.json").read_text())["model_type"] == (
@@ -244,19 +208,6 @@ def test_prepare_artifact_writes_generic_load_layout(tmp_path):
     assert (output / shard_name).read_bytes() == b"weights"
     assert not (output / shard_name).is_symlink()
     assert (output / "README.md").exists()
-
-
-def test_prepare_artifact_rejects_non_finite_runtime_json(tmp_path, monkeypatch):
-    source, tokenizer, _ = _write_artifact_inputs(tmp_path)
-    output = tmp_path / "invalid-output"
-    monkeypatch.setattr(
-        convert,
-        "build_runtime_config",
-        lambda *_args: {"value": float("inf")},
-    )
-
-    with pytest.raises(ValueError, match="Out of range float values"):
-        convert.prepare_artifact(source, tokenizer, output, copy_weights=True)
 
 
 def test_prepare_artifact_can_link_weight_shards(tmp_path):

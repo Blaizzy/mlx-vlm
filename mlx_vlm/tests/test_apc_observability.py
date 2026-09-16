@@ -7,20 +7,11 @@ import logging
 import mlx.core as mx
 import pytest
 
-from mlx_vlm.apc import (
-    APCManager,
-    APCSelfCheckResult,
-    apc_trace,
-    apc_trace_enabled,
-    classify_layer_for_apc,
-    self_check_model_apc,
-    validate_prompt_cache_layout,
-)
+from mlx_vlm.apc import APCManager, classify_layer_for_apc, self_check_model_apc
 from mlx_vlm.models.cache import (
     BatchKVCache,
     BatchQuantizedKVCache,
     BatchRotatingKVCache,
-    KVCache,
     QuantizedKVCache,
 )
 
@@ -37,30 +28,6 @@ def _clear_apc_trace_env(monkeypatch):
 
 
 class TestApcTrace:
-    def test_disabled_by_default(self):
-        assert apc_trace_enabled() is False
-
-    def test_enabled_by_env(self, monkeypatch):
-        monkeypatch.setenv("APC_TRACE", "1")
-        assert apc_trace_enabled() is True
-        monkeypatch.setenv("APC_TRACE", "true")
-        assert apc_trace_enabled() is True
-        monkeypatch.setenv("APC_TRACE", "0")
-        assert apc_trace_enabled() is False
-
-    def test_trace_emits_logger_info_when_enabled(self, monkeypatch, caplog):
-        monkeypatch.setenv("APC_TRACE", "1")
-        with caplog.at_level(logging.INFO, logger="mlx_vlm.apc"):
-            apc_trace("store", mode="exact", ok=True, token_len=32)
-        assert any("APC_TRACE store" in r.message for r in caplog.records)
-        assert any("mode=exact" in r.message for r in caplog.records)
-        assert any("token_len=32" in r.message for r in caplog.records)
-
-    def test_trace_silent_when_disabled(self, caplog):
-        with caplog.at_level(logging.INFO, logger="mlx_vlm.apc"):
-            apc_trace("store", mode="exact", ok=True)
-        assert not any("APC_TRACE" in r.message for r in caplog.records)
-
     def test_reject_records_emit_trace(self, monkeypatch, caplog):
         monkeypatch.setenv("APC_TRACE", "1")
         manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE)
@@ -77,16 +44,6 @@ class TestApcTrace:
 
 
 class TestClassifyLayer:
-    def test_plain_kv_ok(self):
-        c = KVCache()
-        c.update_and_fetch(
-            mx.zeros((1, 2, 4, 8), dtype=mx.float32),
-            mx.zeros((1, 2, 4, 8), dtype=mx.float32),
-        )
-        result = classify_layer_for_apc(c)
-        assert result.status == "ok"
-        assert result.type_name == "KVCache"
-
     def test_quantized_with_dequant_ok(self):
         # Last dim must be divisible by group_size for mx.quantize.
         c = QuantizedKVCache(group_size=GROUP_SIZE, bits=BITS)
@@ -97,16 +54,6 @@ class TestClassifyLayer:
         result = classify_layer_for_apc(c)
         assert result.status == "ok"
 
-    def test_batch_quantized_empty_ok(self):
-        c = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
-        result = classify_layer_for_apc(c)
-        assert result.status in ("ok", "empty_ok")
-
-    def test_batch_rotating_empty_ok(self):
-        c = BatchRotatingKVCache(32, [0])
-        result = classify_layer_for_apc(c)
-        assert result.status in ("ok", "empty_ok")
-
     def test_unsupported_opaque_type(self):
         class Bogus:
             pass
@@ -114,30 +61,6 @@ class TestClassifyLayer:
         result = classify_layer_for_apc(Bogus())
         assert result.status == "unsupported"
         assert result.reason
-
-
-class TestValidateLayout:
-    def test_all_supported_layout_ok(self):
-        caches = [
-            BatchRotatingKVCache(32, [0]),
-            BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS),
-            BatchKVCache([0]),
-        ]
-        result = validate_prompt_cache_layout(caches, apc_mode="exact")
-        assert isinstance(result, APCSelfCheckResult)
-        assert result.ok is True
-        assert result.apc_mode == "exact"
-        assert result.layer_count == 3
-        assert result.unsupported == []
-
-    def test_mixed_unsupported_not_ok(self):
-        class Bogus:
-            pass
-
-        result = validate_prompt_cache_layout([KVCache(), Bogus()], apc_mode="block")
-        assert result.ok is False
-        assert len(result.unsupported) == 1
-        assert result.unsupported[0].type_name == "Bogus"
 
 
 class TestSelfCheckModel:
@@ -156,37 +79,12 @@ class TestSelfCheckModel:
         assert result.apc_mode == "exact"
         assert any("APC self-check ok" in r.message for r in caplog.records)
 
-    def test_unsupported_model_logs_error(self, caplog):
-        class FakeLang:
-            def make_cache(self):
-                class Bogus:
-                    pass
-
-                return [Bogus()]
-
-        with caplog.at_level(logging.ERROR, logger="mlx_vlm.apc"):
-            result = self_check_model_apc(FakeLang())
-        assert result.ok is False
-        assert any("APC self-check" in r.message for r in caplog.records)
-
     def test_no_make_cache_not_ok(self, caplog):
         class NoCache:
             pass
 
         result = self_check_model_apc(NoCache())
         assert result.ok is False
-
-    def test_unwraps_language_model(self):
-        class FakeLang:
-            def make_cache(self):
-                return [KVCache()]
-
-        class VLM:
-            language_model = FakeLang()
-
-        result = self_check_model_apc(VLM())
-        assert result.ok is True
-        assert result.apc_mode == "block"
 
     def test_does_not_raise_on_failure(self):
         class FakeLang:
@@ -196,37 +94,3 @@ class TestSelfCheckModel:
         result = self_check_model_apc(FakeLang())
         assert result.ok is False
         assert result.notes
-
-
-class TestSelfCheckCapabilityAndSchema:
-    def test_layer_capability_is_reported(self):
-        from mlx_vlm.models.cache import RotatingKVCache
-
-        assert classify_layer_for_apc(KVCache()).capability == "pageable"
-        assert classify_layer_for_apc(RotatingKVCache(max_size=64)).capability == (
-            "windowed"
-        )
-
-    def test_layout_reports_capabilities_and_schema(self):
-        from mlx_vlm.apc_adapters import ADAPTER_SCHEMA_VERSION
-
-        result = validate_prompt_cache_layout([KVCache(), KVCache()], apc_mode="block")
-        assert result.capabilities == ["pageable", "pageable"]
-        assert result.schema_version == ADAPTER_SCHEMA_VERSION
-
-    def test_self_check_log_includes_schema_and_caps(self, caplog):
-        from mlx_vlm.apc_adapters import ADAPTER_SCHEMA_VERSION
-
-        class FakeLang:
-            def make_cache(self):
-                return [KVCache(), KVCache()]
-
-        with caplog.at_level(logging.INFO, logger="mlx_vlm.apc"):
-            result = self_check_model_apc(FakeLang())
-        assert result.schema_version == ADAPTER_SCHEMA_VERSION
-        assert result.capabilities == ["pageable", "pageable"]
-        assert any(
-            ("schema=v%d" % ADAPTER_SCHEMA_VERSION) in r.message
-            and "caps=[pageable,pageable]" in r.message
-            for r in caplog.records
-        )

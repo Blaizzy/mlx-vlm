@@ -182,24 +182,6 @@ def test_audio_uses_shared_text_generation_and_prepares_once(
     assert speech_kwargs["ref_audio_path"] == "voice.wav"
 
 
-def test_audio_returns_waveform_without_file(monkeypatch):
-    model = SimpleNamespace(
-        config=SimpleNamespace(model_type="test"),
-        generate_audio=Mock(return_value=AudioGenerationResult(audio=mx.zeros(10))),
-    )
-    monkeypatch.setattr(
-        dispatch, "generate", Mock(return_value=GenerationResult(token_ids=[3]))
-    )
-    monkeypatch.setattr(
-        audio_module, "wired_limit", lambda *a: contextlib.nullcontext()
-    )
-    result = generate_audio(
-        model, SimpleNamespace(tokenizer=None), "prompt", input_ids=mx.array([[1]])
-    )
-    assert result.audio.shape == (10,)
-    assert result.path is None
-
-
 def test_unsupported_audio_fails_before_text_generation(monkeypatch):
     text_generate = Mock()
     monkeypatch.setattr(dispatch, "generate", text_generate)

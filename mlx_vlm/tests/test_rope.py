@@ -32,26 +32,12 @@ def test_mrope_rope_index_handles_fully_masked_rows(module_name):
     lm = module.LanguageModel.__new__(module.LanguageModel)
     lm.config = _mrope_config()
 
-    input_ids = mx.array(
-        [
-            [0, 0, 0, 0],
-            [10, 100, 101, 11],
-        ],
-        dtype=mx.int32,
-    )
-    attention_mask = mx.array(
-        [
-            [0, 0, 0, 0],
-            [1, 1, 1, 1],
-        ],
-        dtype=mx.int32,
-    )
+    input_ids = mx.array([[0, 0, 0, 0], [10, 100, 101, 11]], dtype=mx.int32)
+    attention_mask = mx.array([[0, 0, 0, 0], [1, 1, 1, 1]], dtype=mx.int32)
     image_grid_thw = mx.array([[1, 2, 2]], dtype=mx.int32)
 
     position_ids, rope_deltas = lm.get_rope_index(
-        input_ids,
-        image_grid_thw=image_grid_thw,
-        attention_mask=attention_mask,
+        input_ids, image_grid_thw=image_grid_thw, attention_mask=attention_mask
     )
     mx.eval(position_ids, rope_deltas)
 
@@ -69,26 +55,12 @@ def test_glm_ocr_rope_index_handles_fully_masked_rows():
         video_token_id=102,
     )
 
-    input_ids = mx.array(
-        [
-            [0, 0, 0, 0],
-            [10, 101, 11, 12],
-        ],
-        dtype=mx.int32,
-    )
-    attention_mask = mx.array(
-        [
-            [0, 0, 0, 0],
-            [1, 1, 1, 1],
-        ],
-        dtype=mx.int32,
-    )
+    input_ids = mx.array([[0, 0, 0, 0], [10, 101, 11, 12]], dtype=mx.int32)
+    attention_mask = mx.array([[0, 0, 0, 0], [1, 1, 1, 1]], dtype=mx.int32)
     image_grid_thw = mx.array([[1, 2, 2]], dtype=mx.int32)
 
     position_ids, rope_deltas = lm.get_rope_index(
-        input_ids,
-        image_grid_thw=image_grid_thw,
-        attention_mask=attention_mask,
+        input_ids, image_grid_thw=image_grid_thw, attention_mask=attention_mask
     )
     mx.eval(position_ids, rope_deltas)
 
@@ -106,8 +78,7 @@ def test_ernie_mrope_rope_index_handles_empty_rows():
     image_grid_thw = mx.zeros((0, 3), dtype=mx.int32)
 
     position_ids, rope_deltas = lm.get_rope_index(
-        input_ids,
-        image_grid_thw=image_grid_thw,
+        input_ids, image_grid_thw=image_grid_thw
     )
     mx.eval(position_ids, rope_deltas)
 

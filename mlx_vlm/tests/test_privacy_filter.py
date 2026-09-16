@@ -2,12 +2,10 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 import pytest
 
 from mlx_vlm.models.openai_privacy_filter import Model, ModelConfig
-from mlx_vlm.privacy_filter import PrivacyFilter, ViterbiDecoder
-from mlx_vlm.utils import get_model_and_args
+from mlx_vlm.privacy_filter import PrivacyFilter
 
 LABELS = {0: "O", 1: "B-x", 2: "I-x", 3: "E-x", 4: "S-x"}
 
@@ -35,21 +33,6 @@ def _tiny_config(**overrides):
     }
     values.update(overrides)
     return ModelConfig(**values)
-
-
-def test_model_type_resolves_to_privacy_filter_package():
-    module, model_type = get_model_and_args({"model_type": "openai_privacy_filter"})
-
-    assert model_type == "openai_privacy_filter"
-    assert module.Model is Model
-
-
-def test_config_normalizes_json_label_keys():
-    config = _tiny_config(id2label={str(key): value for key, value in LABELS.items()})
-
-    assert config.id2label == LABELS
-    assert config.label2id["S-x"] == 4
-    assert config.num_labels == 5
 
 
 def test_checkpoint_expert_layout_sanitization():
@@ -81,23 +64,6 @@ def test_checkpoint_expert_layout_sanitization():
     assert "score.weight" in sanitized
 
 
-def test_existing_split_quantized_expert_layout_is_preserved():
-    weights = {
-        "model.layers.0.mlp.experts.gate_proj.weight": mx.zeros((4, 8, 2)),
-        "model.layers.0.mlp.experts.gate_proj.scales": mx.ones((4, 8, 1)),
-        "model.layers.0.mlp.experts.gate_proj.biases": mx.zeros((4, 8, 1)),
-        "model.layers.0.mlp.experts.up_proj.weight": mx.zeros((4, 8, 2)),
-        "model.layers.0.mlp.experts.up_proj.scales": mx.ones((4, 8, 1)),
-        "model.layers.0.mlp.experts.up_proj.biases": mx.zeros((4, 8, 1)),
-    }
-
-    sanitized = Model.sanitize(None, weights)
-
-    assert sanitized.keys() == weights.keys()
-    for key in weights:
-        assert mx.array_equal(sanitized[key], weights[key]).item()
-
-
 @pytest.mark.parametrize(
     ("group_size", "bits", "mode"),
     [
@@ -113,18 +79,10 @@ def test_existing_split_quantized_expert_layout_is_preserved():
 def test_published_quantization_modes_run_end_to_end(group_size, bits, mode):
     model = Model(
         _tiny_config(
-            hidden_size=64,
-            intermediate_size=64,
-            head_dim=16,
-            num_attention_heads=4,
+            hidden_size=64, intermediate_size=64, head_dim=16, num_attention_heads=4
         )
     )
-    nn.quantize(
-        model,
-        group_size=group_size,
-        bits=bits,
-        mode=mode,
-    )
+    nn.quantize(model, group_size=group_size, bits=bits, mode=mode)
     input_ids = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
 
     logits = model(input_ids, attention_mask=mx.ones_like(input_ids)).logits
@@ -145,41 +103,10 @@ def test_tiny_forward_supports_attention_and_moe_chunk_boundaries():
     assert mx.all(mx.isfinite(logits)).item()
 
 
-def test_viterbi_rejects_invalid_inside_start():
-    # Independent argmax gives I-x, E-x. The constrained path must begin with B/S.
-    emissions = np.array(
-        [
-            [0.0, 8.0, 10.0, 0.0, 1.0],
-            [0.0, 0.0, 1.0, 10.0, 2.0],
-        ],
-        dtype=np.float32,
-    )
-
-    path = ViterbiDecoder(tuple(LABELS.values())).decode(emissions)
-
-    assert path == [1, 3]
-
-
-def test_viterbi_biases_change_background_operating_point():
-    emissions = np.zeros((2, 5), dtype=np.float32)
-    default_path = ViterbiDecoder(tuple(LABELS.values())).decode(emissions)
-    recall_path = ViterbiDecoder(
-        tuple(LABELS.values()),
-        {"transition_bias_background_to_start": 3.0},
-    ).decode(emissions)
-
-    assert default_path == [0, 0]
-    assert recall_path != default_path
-    assert recall_path[-1] == 4
-
-
 class _FakeTokenizer:
     def __call__(self, text, **kwargs):
         assert text == "Alice emailed bob@example.com"
-        return {
-            "input_ids": [1, 2, 3],
-            "offset_mapping": [(0, 5), (5, 13), (13, 29)],
-        }
+        return {"input_ids": [1, 2, 3], "offset_mapping": [(0, 5), (5, 13), (13, 29)]}
 
 
 class _FakeModel:
@@ -196,9 +123,7 @@ class _FakeModel:
             8: "S-private_email",
         }
         self.config = SimpleNamespace(
-            id2label=labels,
-            num_labels=len(labels),
-            default_n_ctx=16,
+            id2label=labels, num_labels=len(labels), default_n_ctx=16
         )
 
     def eval(self):

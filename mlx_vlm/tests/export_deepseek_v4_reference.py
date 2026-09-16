@@ -69,10 +69,7 @@ def export_fixture(args: argparse.Namespace) -> Path:
     model_args.max_batch_size = 1
     tokenizer = AutoTokenizer.from_pretrained(checkpoint)
     input_ids, image_inputs = prepare_vl_inputs(
-        prompt,
-        [{"url": str(image_path)}],
-        tokenizer,
-        model_args,
+        prompt, [{"url": str(image_path)}], tokenizer, model_args
     )
     if image_inputs is None or len(image_inputs) != 1:
         raise ValueError("The reference exporter requires exactly one image")
@@ -98,9 +95,7 @@ def export_fixture(args: argparse.Namespace) -> Path:
     tokens = torch.tensor([input_ids], dtype=torch.long, device=device)
     with torch.inference_mode():
         aligned = model.encode_image(
-            image_input.patches.to(device),
-            image_input.n_vit_h,
-            image_input.n_vit_w,
+            image_input.patches.to(device), image_input.n_vit_h, image_input.n_vit_w
         )[image_input.perm.to(device)]
         _, logits, _ = model(tokens, start_pos=0, images=[image_inputs])
     if logits.ndim == 3:
@@ -173,8 +168,7 @@ def configure_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=33377335)
     parser.add_argument(
-        "--reference-revision",
-        default="6821d6ad3681a4b137b066b76094fa82ebd0a380",
+        "--reference-revision", default="6821d6ad3681a4b137b066b76094fa82ebd0a380"
     )
     parser.add_argument("--vision-atol", type=float, default=2e-2)
     parser.add_argument("--vision-rtol", type=float, default=2e-2)

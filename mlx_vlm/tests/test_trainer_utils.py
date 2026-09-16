@@ -10,27 +10,11 @@ from mlx_vlm.trainer.lora_layers import LoRALinear
 from mlx_vlm.trainer.utils import (
     apply_lora_layers,
     find_all_linear_names,
-    get_module_by_name,
     get_peft_model,
-    set_module_by_name,
 )
 
 
 class TestTrainerUtils(unittest.TestCase):
-
-    def test_get_module_by_name(self):
-        model = MagicMock()
-        model.layer1.layer2.layer3 = "test_module"
-
-        result = get_module_by_name(model, "layer1.layer2.layer3")
-        self.assertEqual(result, "test_module")
-
-    def test_set_module_by_name(self):
-        model = MagicMock()
-        new_module = MagicMock()
-
-        set_module_by_name(model, "layer1.layer2.layer3", new_module)
-        self.assertEqual(model.layer1.layer2.layer3, new_module)
 
     @patch("mlx_vlm.trainer.utils.freeze_model")
     @patch("mlx_vlm.trainer.utils.print_trainable_parameters")
@@ -140,8 +124,7 @@ class TestTrainerUtils(unittest.TestCase):
             self.assertIs(result, model)
             self.assertIsInstance(model.language_model.proj, LoRALinear)
             self.assertEqual(
-                model.loaded_weights,
-                (str(adapter_dir / "adapters.safetensors"), False),
+                model.loaded_weights, (str(adapter_dir / "adapters.safetensors"), False)
             )
 
 

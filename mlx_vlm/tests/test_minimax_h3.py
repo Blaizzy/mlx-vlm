@@ -324,10 +324,7 @@ def test_fl2va_packing_matches_diffusers_golden():
 def test_ref2va_mixed_packing_matches_diffusers_golden():
     references = [
         MiniMaxH3PreparedReference(
-            kind="image",
-            num_latent_frames=1,
-            latent_height=4,
-            latent_width=6,
+            kind="image", num_latent_frames=1, latent_height=4, latent_width=6
         ),
         MiniMaxH3PreparedReference(
             kind="video",
@@ -337,11 +334,7 @@ def test_ref2va_mixed_packing_matches_diffusers_golden():
             latent_width=4,
             num_audio_latents=2,
         ),
-        MiniMaxH3PreparedReference(
-            kind="audio",
-            has_audio=True,
-            num_audio_latents=3,
-        ),
+        MiniMaxH3PreparedReference(kind="audio", has_audio=True, num_audio_latents=3),
     ]
     layout = build_ref2va_packed_sequence(
         mx.array([1, 0, 1, 1, 0]),
@@ -360,10 +353,7 @@ def test_ref2va_mixed_packing_matches_diffusers_golden():
         *range(15, 27),
         *range(41, 65),
     ]
-    assert layout.audio_indices.tolist() == [
-        *range(11, 15),
-        *range(27, 41),
-    ]
+    assert layout.audio_indices.tolist() == [*range(11, 15), *range(27, 41)]
     positions = layout.position_ids.tolist()
     assert positions[5][0] == 5.0
     assert positions[11][0] == 6.0
@@ -394,44 +384,23 @@ def test_scheduler_matches_diffusers_golden():
     output = scheduler.step(velocity, scheduler.timesteps[0], sample)
     np.testing.assert_allclose(
         np.array(output),
-        np.array(
-            [[0.11351351, -0.1837838], [0.2810811, 0.42162162]],
-            dtype=np.float32,
-        ),
+        np.array([[0.11351351, -0.1837838], [0.2810811, 0.42162162]], dtype=np.float32),
         rtol=0.0,
         atol=1e-8,
     )
 
 
 def test_mlx_lanczos_matches_pillow_reference():
-    pixels = np.random.default_rng(7).integers(
-        0,
-        256,
-        size=(13, 15, 3),
-        dtype=np.uint8,
-    )
+    pixels = np.random.default_rng(7).integers(0, 256, size=(13, 15, 3), dtype=np.uint8)
     for height, width in ((7, 9), (21, 26), (13, 23)):
         expected = np.asarray(
-            Image.fromarray(pixels).resize(
-                (width, height),
-                Image.Resampling.LANCZOS,
-            )
+            Image.fromarray(pixels).resize((width, height), Image.Resampling.LANCZOS)
         )
         actual = resize_lanczos(mx.array(pixels), height, width)
         np.testing.assert_array_equal(np.array(actual), expected)
 
-    stretched = prepare_keyframe_image(
-        mx.array(pixels),
-        8,
-        10,
-        stretch=True,
-    )
-    covered = prepare_keyframe_image(
-        mx.array(pixels),
-        8,
-        10,
-        stretch=False,
-    )
+    stretched = prepare_keyframe_image(mx.array(pixels), 8, 10, stretch=True)
+    covered = prepare_keyframe_image(mx.array(pixels), 8, 10, stretch=False)
     assert stretched.shape == (8, 10, 3)
     assert covered.shape == (8, 10, 3)
 
@@ -518,9 +487,7 @@ def test_video_soundtrack_decode_moves_pcm_directly_into_mlx(monkeypatch):
             )()
         assert command[0].endswith("ffmpeg")
         return type(
-            "Decode",
-            (),
-            {"returncode": 0, "stdout": pcm.tobytes(), "stderr": b""},
+            "Decode", (), {"returncode": 0, "stdout": pcm.tobytes(), "stderr": b""}
         )()
 
     monkeypatch.setattr(
@@ -606,9 +573,7 @@ def test_prompt_presentations_match_diffusers_ordering():
     references = [
         MiniMaxH3PreparedReference(kind="image"),
         MiniMaxH3PreparedReference(
-            kind="video",
-            has_audio=True,
-            block_timestamps=[0.25, 1.25],
+            kind="video", has_audio=True, block_timestamps=[0.25, 1.25]
         ),
         MiniMaxH3PreparedReference(kind="audio", has_audio=True),
     ]
@@ -626,52 +591,6 @@ def test_prompt_presentations_match_diffusers_ordering():
     assert tags.count(0) == 3 + 4 + 4
     assert trim_reference_num_frames(5) == 22
     assert trim_reference_num_frames(39) == 39
-
-
-def test_qwen_conditioner_layer_stop_is_pre_final_norm():
-    config = Qwen3VLTextConfig(
-        model_type="qwen3_vl",
-        num_hidden_layers=3,
-        hidden_size=12,
-        intermediate_size=16,
-        num_attention_heads=2,
-        rms_norm_eps=1e-6,
-        vocab_size=32,
-        num_key_value_heads=2,
-        head_dim=6,
-        rope_theta=10000.0,
-        max_position_embeddings=32,
-        rope_scaling={"type": "default", "mrope_section": [1, 1, 1]},
-    )
-    model = Qwen3VLModel(config)
-    input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
-    with mx.stream(mx.cpu):
-        layer_two = model(
-            input_ids,
-            stop_after_layer=2,
-            apply_final_norm=False,
-        )
-        layer_two_normalized = model(
-            input_ids,
-            stop_after_layer=2,
-            apply_final_norm=True,
-        )
-        full_pre_norm = model(input_ids, apply_final_norm=False)
-        full = model(input_ids)
-        mx.eval(layer_two, layer_two_normalized, full_pre_norm, full)
-    np.testing.assert_allclose(
-        np.array(layer_two_normalized),
-        np.array(model.norm(layer_two)),
-        rtol=1e-6,
-        atol=1e-6,
-    )
-    np.testing.assert_allclose(
-        np.array(full),
-        np.array(model.norm(full_pre_norm)),
-        rtol=1e-6,
-        atol=1e-6,
-    )
-    assert not np.allclose(np.array(layer_two), np.array(full_pre_norm))
 
 
 def test_qwen_layer_two_matches_transformers_synthetic_golden():
@@ -772,13 +691,10 @@ def test_qwen_mixed_image_video_deepstack_keeps_token_order():
     image_layers = [mx.array([[1.0, 1.5], [2.0, 2.5]])]
     video_layers = [mx.array([[3.0, 3.5]])]
     merged = model._merge_deepstack_features(
-        mx.array([[29, 30, 29]], dtype=mx.int32),
-        image_layers,
-        video_layers,
+        mx.array([[29, 30, 29]], dtype=mx.int32), image_layers, video_layers
     )
     np.testing.assert_array_equal(
-        np.array(merged),
-        np.array([[[1.0, 1.5], [3.0, 3.5], [2.0, 2.5]]]),
+        np.array(merged), np.array([[[1.0, 1.5], [3.0, 3.5], [2.0, 2.5]]])
     )
 
 
@@ -823,29 +739,16 @@ def test_tiny_transformer_matches_diffusers_synthetic_golden():
         mx.eval(output.sample, output.audio_sample)
 
     expected_video = np.array(
-        [[[0.35690272], [0.35708505], [0.35721874], [0.35731968]]],
-        dtype=np.float32,
+        [[[0.35690272], [0.35708505], [0.35721874], [0.35731968]]], dtype=np.float32
     )
     expected_audio = np.array(
-        [
-            [
-                [0.3702623, 0.048529133],
-                [0.37101823, 0.056271546],
-            ]
-        ],
-        dtype=np.float32,
+        [[[0.3702623, 0.048529133], [0.37101823, 0.056271546]]], dtype=np.float32
     )
     np.testing.assert_allclose(
-        np.array(output.sample),
-        expected_video,
-        rtol=1e-6,
-        atol=1e-7,
+        np.array(output.sample), expected_video, rtol=1e-6, atol=1e-7
     )
     np.testing.assert_allclose(
-        np.array(output.audio_sample),
-        expected_audio,
-        rtol=1e-6,
-        atol=1e-7,
+        np.array(output.audio_sample), expected_audio, rtol=1e-6, atol=1e-7
     )
 
 
@@ -1020,16 +923,10 @@ def test_tiny_audio_vae_matches_diffusers_synthetic_golden():
         np.array(latents.flatten()[:8]), expected_mean, rtol=1e-6, atol=3e-8
     )
     np.testing.assert_allclose(
-        np.array(posterior.logs.flatten()[:8]),
-        expected_logs,
-        rtol=1e-6,
-        atol=3e-8,
+        np.array(posterior.logs.flatten()[:8]), expected_logs, rtol=1e-6, atol=3e-8
     )
     np.testing.assert_allclose(
-        np.array(decoded.flatten()[:8]),
-        expected_waveform,
-        rtol=2e-6,
-        atol=2e-8,
+        np.array(decoded.flatten()[:8]), expected_waveform, rtol=2e-6, atol=2e-8
     )
 
 
@@ -1086,9 +983,7 @@ def test_video_path_automatically_contributes_its_soundtrack(monkeypatch):
     frames = mx.zeros((5, 8, 8, 3), mx.uint8)
     soundtrack = mx.zeros((2, 100), mx.float32)
     monkeypatch.setattr(
-        h3_pipeline_module,
-        "decode_video_soundtrack",
-        lambda path: (soundtrack, 20),
+        h3_pipeline_module, "decode_video_soundtrack", lambda path: (soundtrack, 20)
     )
     monkeypatch.setattr(h3_pipeline_module, "decode_video", lambda path: (frames, 24.0))
     monkeypatch.setattr(
@@ -1293,10 +1188,7 @@ def _tiny_qwen_source():
             "head_dim": 6,
             "rope_theta": 10000.0,
             "max_position_embeddings": 32,
-            "rope_scaling": {
-                "rope_type": "default",
-                "mrope_section": [1, 1, 1],
-            },
+            "rope_scaling": {"rope_type": "default", "mrope_section": [1, 1, 1]},
         },
         "vision_config": {
             "depth": 1,
@@ -1420,10 +1312,7 @@ def test_official_layout_conversion_and_strict_reload(tmp_path, monkeypatch):
 
     monkeypatch.setattr(h3_download_module, "snapshot_download", fake_snapshot_download)
     remote_pipeline = load_pipeline(
-        "test-org/minimax-h3",
-        workflow="t2va",
-        text_only=True,
-        revision="test-revision",
+        "test-org/minimax-h3", workflow="t2va", text_only=True, revision="test-revision"
     )
     assert remote_pipeline.partition == "fl2va"
     assert download_calls[0]["revision"] == "test-revision"
@@ -1431,9 +1320,7 @@ def test_official_layout_conversion_and_strict_reload(tmp_path, monkeypatch):
     assert "transformer_ref/**" not in download_calls[0]["allow_patterns"]
 
     ref_download = h3_download_module.download_model(
-        workflow="ref2va",
-        repo_id="test-org/minimax-h3",
-        revision="test-revision",
+        workflow="ref2va", repo_id="test-org/minimax-h3", revision="test-revision"
     )
     assert ref_download == source
     assert "transformer_ref/**" in download_calls[1]["allow_patterns"]
@@ -1442,19 +1329,11 @@ def test_official_layout_conversion_and_strict_reload(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="uses the 'fl2va' partition"):
         load_pipeline(source, workflow="t2va", partition="ref2va")
 
-    official_pipeline = load_pipeline(
-        source,
-        partition="fl2va",
-        text_only=True,
-    )
+    official_pipeline = load_pipeline(source, partition="fl2va", text_only=True)
     assert official_pipeline.partition == "fl2va"
 
     dry_run = convert_minimax_h3(
-        source,
-        tmp_path / "unused",
-        partition="fl2va",
-        text_only=True,
-        dry_run=True,
+        source, tmp_path / "unused", partition="fl2va", text_only=True, dry_run=True
     )
     assert dry_run.dry_run
     assert dry_run.source_bytes > 0
@@ -1463,12 +1342,7 @@ def test_official_layout_conversion_and_strict_reload(tmp_path, monkeypatch):
     assert not dry_run.destination.exists()
 
     fl_path = tmp_path / "fl"
-    fl_report = convert_minimax_h3(
-        source,
-        fl_path,
-        partition="fl2va",
-        text_only=True,
-    )
+    fl_report = convert_minimax_h3(source, fl_path, partition="fl2va", text_only=True)
     assert not (fl_path / "transformer_ref").exists()
     fl_manifest = json.loads((fl_path / "h3_manifest.json").read_text())
     assert fl_manifest["partition"] == "fl2va"
@@ -1483,12 +1357,7 @@ def test_official_layout_conversion_and_strict_reload(tmp_path, monkeypatch):
     assert not fl_pipeline.conditioner.has_vision
 
     fl_copy = tmp_path / "fl-copy"
-    convert_minimax_h3(
-        source,
-        fl_copy,
-        partition="fl2va",
-        text_only=True,
-    )
+    convert_minimax_h3(source, fl_copy, partition="fl2va", text_only=True)
     fl_copy_manifest = json.loads((fl_copy / "h3_manifest.json").read_text())
     assert fl_manifest["sha256"] == fl_copy_manifest["sha256"]
     assert fl_report.tensor_counts == fl_copy_manifest["tensor_counts"]

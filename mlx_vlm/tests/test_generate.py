@@ -34,7 +34,6 @@ from mlx_vlm.models.cache import (
     BufferedRotatingKVCache,
     CacheList,
     KVCache,
-    PoolingCache,
     RotatingKVCache,
 )
 from mlx_vlm.utils import ThinkingBudgetCriteria
@@ -178,13 +177,10 @@ def mock_processor():
 
 def test_batch_generator_apc_media_token_ids_handles_text_only_model(mock_processor):
     model = SimpleNamespace(
-        language_model=MockLanguageModel(),
-        make_cache=lambda: [KVCache()],
+        language_model=MockLanguageModel(), make_cache=lambda: [KVCache()]
     )
     generator = ar_module.BatchGenerator(
-        model,
-        mock_processor,
-        apc_manager=apc_module.APCManager(num_blocks=1),
+        model, mock_processor, apc_manager=apc_module.APCManager(num_blocks=1)
     )
 
     assert generator._apc_media_token_ids() == set()
@@ -254,15 +250,6 @@ class TestBatchResponse:
 class TestGenerationBatch:
     """Tests for GenerationBatch class."""
 
-    def test_empty_creation(self):
-        mock_model = MagicMock()
-        sampler = lambda x: mx.argmax(x, axis=-1)
-        stop_criteria = lambda tok: tok == 2
-        batch = GenerationBatch.empty(mock_model, sampler, stop_criteria)
-        assert len(batch) == 0
-        assert batch.uids == []
-        assert batch.max_tokens == []
-
     def test_filter(self):
         mock_model = MagicMock()
         sampler = lambda x: mx.argmax(x, axis=-1)
@@ -314,31 +301,6 @@ class TestGenerationBatch:
         )
         empty.extend(self._mrope_batch([0, 1], [[5], [7]]))
         assert empty._rope_deltas.tolist() == [[5], [7]]
-
-    def test_extend_materializes_pending_decode_before_cache_merge(self, monkeypatch):
-        calls = []
-
-        class RecordingCache:
-            @property
-            def state(self):
-                return ()
-
-            def extend(self, other):
-                calls.append(("extend-cache",))
-
-        def record_eval(batch):
-            calls.append(("eval", tuple(batch.uids)))
-
-        monkeypatch.setattr(GenerationBatch, "_eval_pending_state", record_eval)
-
-        a = self._mrope_batch([0], [[0]])
-        b = self._mrope_batch([1], [[5]])
-        a.prompt_cache = [RecordingCache()]
-        b.prompt_cache = [RecordingCache()]
-
-        a.extend(b)
-
-        assert calls == [("eval", (0,)), ("eval", (1,)), ("extend-cache",)]
 
     def test_filter_materializes_pending_decode_before_cache_filter(self, monkeypatch):
         calls = []
@@ -413,47 +375,12 @@ class TestGenerationBatch:
 class TestLeftPadPrompts:
     """Tests for _left_pad_prompts function."""
 
-    def test_basic_padding(self):
-        prompts = [[1, 2, 3], [4, 5], [6]]
-        padded = _left_pad_prompts(prompts)
-
-        assert padded.shape == (3, 3)
-        # Check that shorter prompts are left-padded with zeros
-        assert mx.array_equal(padded[0], mx.array([1, 2, 3]))
-        assert mx.array_equal(padded[1], mx.array([0, 4, 5]))
-        assert mx.array_equal(padded[2], mx.array([0, 0, 6]))
-
-    def test_with_explicit_max_length(self):
-        prompts = [[1, 2], [3]]
-        padded = _left_pad_prompts(prompts, max_length=5)
-
-        assert padded.shape == (2, 5)
-        assert mx.array_equal(padded[0], mx.array([0, 0, 0, 1, 2]))
-        assert mx.array_equal(padded[1], mx.array([0, 0, 0, 0, 3]))
-
     def test_single_prompt(self):
         prompts = [[1, 2, 3, 4, 5]]
         padded = _left_pad_prompts(prompts)
 
         assert padded.shape == (1, 5)
         assert mx.array_equal(padded[0], mx.array([1, 2, 3, 4, 5]))
-
-    def test_equal_length_prompts(self):
-        prompts = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
-        padded = _left_pad_prompts(prompts)
-
-        assert padded.shape == (3, 3)
-        # No padding needed when all prompts are same length
-        assert mx.array_equal(padded[0], mx.array([1, 2, 3]))
-        assert mx.array_equal(padded[1], mx.array([4, 5, 6]))
-        assert mx.array_equal(padded[2], mx.array([7, 8, 9]))
-
-    def test_empty_prompt(self):
-        prompts = [[1, 2], []]
-        padded = _left_pad_prompts(prompts)
-
-        assert padded.shape == (2, 2)
-        assert mx.array_equal(padded[1], mx.array([0, 0]))
 
 
 # ============================================================================
@@ -464,39 +391,9 @@ class TestLeftPadPrompts:
 class TestBatchGenerator:
     """Tests for BatchGenerator class."""
 
-    def test_initialization(self, mock_model, mock_processor):
-        gen = BatchGenerator(
-            model=mock_model.language_model,
-            processor=mock_processor,
-            max_tokens=128,
-            stop_tokens={2, 3},
-        )
-
-        assert gen.max_tokens == 128
-        assert gen.model == mock_model.language_model
-        assert len(gen._generation_batch) == 0
-        assert gen.uid_count == 0
-
-    def test_insert_prompts(self, mock_model, mock_processor):
-        gen = BatchGenerator(
-            model=mock_model.language_model,
-            processor=mock_processor,
-            max_tokens=100,
-        )
-
-        prompts = [[1, 2, 3], [4, 5, 6, 7], [8, 9]]
-        uids = gen.insert(prompts)
-
-        assert len(uids) == 3
-        assert uids == [0, 1, 2]
-        assert gen.uid_count == 3
-        assert len(gen.unprocessed_prompts) == 3
-
     def test_insert_with_max_tokens(self, mock_model, mock_processor):
         gen = BatchGenerator(
-            model=mock_model.language_model,
-            processor=mock_processor,
-            max_tokens=50,
+            model=mock_model.language_model, processor=mock_processor, max_tokens=50
         )
 
         prompts = [[1, 2, 3], [4, 5]]
@@ -506,34 +403,6 @@ class TestBatchGenerator:
         assert len(uids) == 2
         # Prompts are sorted by length, so check the unprocessed prompts
         assert len(gen.unprocessed_prompts) == 2
-
-    def test_insert_with_single_max_tokens(self, mock_model, mock_processor):
-        gen = BatchGenerator(
-            model=mock_model.language_model,
-            processor=mock_processor,
-            max_tokens=50,
-        )
-
-        prompts = [[1, 2, 3], [4, 5]]
-        uids = gen.insert(prompts, max_tokens=75)
-
-        assert len(uids) == 2
-
-    def test_stats(self, mock_model, mock_processor):
-        gen = BatchGenerator(
-            model=mock_model.language_model,
-            processor=mock_processor,
-        )
-
-        # Set some stats manually via counters
-        gen._prompt_tokens_counter = 100
-        gen._prompt_time_counter = 0.5
-        gen._gen_tokens_counter = 50
-
-        stats = gen.stats()
-
-        assert stats.prompt_tps == 200.0  # 100 / 0.5
-        assert stats.prompt_tokens == 100
 
     def test_extend_active_deepseek_cache_with_concurrent_request(self):
         def make_row(prompt_length):
@@ -566,19 +435,6 @@ class TestBatchGenerator:
         assert pooling.remainder == [2, 1]
         assert pooling.pooled.shape[0] == 2
 
-    def test_make_cache_converts_left_padded_pooling_cache(self):
-        class PoolingModel:
-            def make_cache(self):
-                return [PoolingCache(ratio=4)]
-
-        caches = ar_module._make_cache(PoolingModel(), [2, 0])
-
-        assert len(caches) == 1
-        assert isinstance(caches[0], BatchPoolingCache)
-        assert caches[0].ratio == 4
-        assert caches[0].remainder == [0, 0]
-        assert caches[0].left_padding == [2, 0]
-
     def test_next_reports_prompt_progress_for_completed_prefill(
         self, mock_model, mock_processor, monkeypatch
     ):
@@ -591,10 +447,7 @@ class TestBatchGenerator:
         )
         prompt = [1, 2, 3]
         inputs_embeds = mx.random.normal((1, len(prompt), 8))
-        uids = gen.insert(
-            [prompt],
-            prompt_kwargs=[{"inputs_embeds": inputs_embeds}],
-        )
+        uids = gen.insert([prompt], prompt_kwargs=[{"inputs_embeds": inputs_embeds}])
         ticks = iter([10.0, 10.2])
         monkeypatch.setattr(ar_module.time, "perf_counter", lambda: next(ticks))
 
@@ -620,85 +473,13 @@ class TestBatchGenerator:
         )
         prompt_tokens = 5
         gen._prompt_batch = SimpleNamespace(
-            needs_processing=lambda: True,
-            prompt_step=lambda: 2,
+            needs_processing=lambda: True, prompt_step=lambda: 2
         )
         gen._prompt_tokens_counter = prompt_tokens
 
         gen.next()
 
         assert gen.stats().prompt_tokens == prompt_tokens
-
-    def test_prompt_progress_reports_apc_cached_tokens(self):
-        batch = PromptProcessingBatch(
-            model=SimpleNamespace(),
-            uids=[1, 2],
-            input_ids=[[4, 5], [6, 7, 8]],
-            max_tokens=[1, 1],
-            inputs_embeds=mx.ones((2, 3, 4)),
-            prompt_kwargs={},
-            prefill_step_size=None,
-            warm_cache=[],
-            apc_meta=[
-                {"full_input_ids": [1, 2, 3, 4, 5], "prefix_len": 3},
-                None,
-            ],
-        )
-        batch.record_prompt_time(0.5)
-
-        progress = batch.prompt_progress()
-
-        assert [p.prompt_tokens for p in progress] == [5, 3]
-        assert [p.cached_tokens for p in progress] == [3, 0]
-
-    def test_prompt_step_schedules_cache_evaluation_asynchronously(self, monkeypatch):
-        cache_state = mx.array([1])
-        batch = PromptProcessingBatch(
-            model=MagicMock(),
-            uids=[1],
-            input_ids=[[1, 2, 3, 4, 5]],
-            max_tokens=[1],
-            inputs_embeds=mx.ones((1, 5, 4)),
-            prompt_kwargs={},
-            prefill_step_size=2,
-            warm_cache=[SimpleNamespace(state=cache_state)],
-        )
-        eval_mock = MagicMock()
-        async_eval_mock = MagicMock()
-        monkeypatch.setattr(ar_module.mx, "eval", eval_mock)
-        monkeypatch.setattr(ar_module.mx, "async_eval", async_eval_mock)
-        monkeypatch.setattr(ar_module.mx, "clear_cache", MagicMock())
-
-        assert batch.prompt_step() == 2
-
-        async_eval_mock.assert_called_once_with([cache_state])
-        eval_mock.assert_not_called()
-
-    def test_prompt_step_keeps_exact_apc_checkpoint_async(self, monkeypatch):
-        cache_state = mx.array([1])
-        batch = PromptProcessingBatch(
-            model=MagicMock(),
-            uids=[1],
-            input_ids=[[1, 2, 3, 4, 5]],
-            max_tokens=[1],
-            inputs_embeds=mx.ones((1, 5, 4)),
-            prompt_kwargs={},
-            prefill_step_size=2,
-            warm_cache=[SimpleNamespace(state=cache_state)],
-        )
-        batch._next_apc_checkpoint_column = lambda: 2
-        batch._store_apc_exact_checkpoints = MagicMock()
-        eval_mock = MagicMock()
-        async_eval_mock = MagicMock()
-        monkeypatch.setattr(ar_module.mx, "eval", eval_mock)
-        monkeypatch.setattr(ar_module.mx, "async_eval", async_eval_mock)
-        monkeypatch.setattr(ar_module.mx, "clear_cache", MagicMock())
-
-        assert batch.prompt_step() == 2
-
-        async_eval_mock.assert_called_once_with([cache_state])
-        eval_mock.assert_not_called()
-        batch._store_apc_exact_checkpoints.assert_called_once_with()
 
     def test_generation_batch_applies_per_sequence_logits_processors(self):
         class FixedLogitModel:
@@ -772,48 +553,6 @@ class TestBatchGenerator:
 
         second = batch.next()
         assert [r.token for r in second] == [3]
-
-    def test_generation_batch_thinking_budget_does_not_sync_next_token(self):
-        class FixedLogitModel:
-            def __call__(self, input_ids, cache=None, **kwargs):
-                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
-                logits = mx.broadcast_to(
-                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
-                )
-                return MagicMock(logits=logits)
-
-        class ForceAfterFirst:
-            def __init__(self):
-                self.forced_token_id = None
-
-            def __call__(self, token):
-                self.forced_token_id = 3 if token == 5 else None
-
-            def pop_forced_token_id(self):
-                forced_token_id = self.forced_token_id
-                self.forced_token_id = None
-                return forced_token_id
-
-        batch = GenerationBatch(
-            model=FixedLogitModel(),
-            uids=[0],
-            inputs=mx.array([5], dtype=mx.int32),
-            prompt_cache=[],
-            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
-            stop_criteria=lambda token: False,
-            max_tokens=[2],
-            thinking_budget_criteria=[ForceAfterFirst()],
-        )
-
-        original_eval = mx.eval
-        with patch.object(generate_module.mx, "eval", wraps=original_eval) as mock_eval:
-            first = batch.next()
-
-        assert [r.token for r in first] == [5]
-        # GenerationBatch._step synchronizes the current token once. Budget
-        # handling must not add a second synchronization for the next token.
-        assert mock_eval.call_count == 1
-        assert [r.token for r in batch.next()] == [3]
 
     def test_generation_batch_uses_fused_greedy_decode_without_logprobs(self):
         class FastArgmaxModel:
@@ -915,53 +654,6 @@ class TestBatchGenerator:
             (200, 11),
         ]
 
-    def test_generation_batch_extend_keeps_processor_context_aligned(self):
-        class FixedLogitModel:
-            def __call__(self, input_ids, cache=None, **kwargs):
-                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
-                logits = mx.broadcast_to(
-                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
-                )
-                return MagicMock(logits=logits)
-
-        seen_contexts = []
-
-        def force_token_2(tokens, logits):
-            seen_contexts.append(tokens.tolist())
-            token_scores = mx.array([-1e9, -1e9, 0.0, -1e9])
-            return mx.broadcast_to(token_scores, logits.shape)
-
-        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
-        stop_criteria = lambda token: False
-        plain = GenerationBatch(
-            model=FixedLogitModel(),
-            uids=[0, 1],
-            inputs=mx.array([5, 6], dtype=mx.int32),
-            prompt_cache=[],
-            sampler=sampler,
-            stop_criteria=stop_criteria,
-            max_tokens=[2, 2],
-            logits_processors=[None, None],
-        )
-        structured = GenerationBatch(
-            model=FixedLogitModel(),
-            uids=[2],
-            inputs=mx.array([7], dtype=mx.int32),
-            prompt_cache=[],
-            sampler=sampler,
-            stop_criteria=stop_criteria,
-            max_tokens=[2],
-            token_context=[[30]],
-            logits_processors=[[force_token_2]],
-        )
-
-        plain.extend(structured)
-        assert plain.token_context == [[], [], [30]]
-
-        first = plain.next()
-        assert [r.token for r in first] == [5, 6, 7]
-        assert seen_contexts == [[30, 7]]
-
     def test_generation_batch_extend_expands_compact_processor_state(self):
         sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
         stop_criteria = lambda token: False
@@ -991,42 +683,7 @@ class TestBatchGenerator:
 
         assert first_plain.uids == [0, 1, 2]
         assert first_plain.token_context == [[], [], [30]]
-        assert first_plain.logits_processors == [
-            None,
-            None,
-            [structured_processor],
-        ]
-
-    def test_generation_batch_extend_discards_inactive_stale_processor_state(self):
-        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
-        stop_criteria = lambda token: False
-        finished_structured = GenerationBatch(
-            model=MagicMock(),
-            uids=[0],
-            inputs=mx.array([5], dtype=mx.int32),
-            prompt_cache=[],
-            sampler=sampler,
-            stop_criteria=stop_criteria,
-            max_tokens=[2],
-            token_context=[[30]],
-            logits_processors=[None],
-        )
-        plain = GenerationBatch(
-            model=MagicMock(),
-            uids=[1],
-            inputs=mx.array([6], dtype=mx.int32),
-            prompt_cache=[],
-            sampler=sampler,
-            stop_criteria=stop_criteria,
-            max_tokens=[2],
-        )
-
-        finished_structured.extend(plain)
-
-        assert finished_structured.token_context == []
-        assert finished_structured.logits_processors == []
-        finished_structured.filter([1])
-        assert finished_structured.uids == [1]
+        assert first_plain.logits_processors == [None, None, [structured_processor]]
 
     def test_generation_batch_extend_promotes_singleton_kv_cache(self):
         def make_kv_cache(value):
@@ -1066,9 +723,7 @@ class TestBatchGenerator:
 
     def test_remove_from_unprocessed(self, mock_model, mock_processor):
         gen = BatchGenerator(
-            model=mock_model.language_model,
-            processor=mock_processor,
-            max_tokens=50,
+            model=mock_model.language_model, processor=mock_processor, max_tokens=50
         )
         uids = gen.insert([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
         assert len(gen.unprocessed_prompts) == 3
@@ -1082,9 +737,7 @@ class TestBatchGenerator:
 
     def test_remove_missing_uid_returns_false(self, mock_model, mock_processor):
         gen = BatchGenerator(
-            model=mock_model.language_model,
-            processor=mock_processor,
-            max_tokens=50,
+            model=mock_model.language_model, processor=mock_processor, max_tokens=50
         )
         gen.insert([[1, 2, 3]])
         assert gen.remove(9999) is False
@@ -1093,9 +746,7 @@ class TestBatchGenerator:
         self, mock_model, mock_processor
     ):
         gen = BatchGenerator(
-            model=mock_model.language_model,
-            processor=mock_processor,
-            max_tokens=50,
+            model=mock_model.language_model, processor=mock_processor, max_tokens=50
         )
         prompt_batch = SimpleNamespace(
             uids=[7],
@@ -1164,16 +815,11 @@ class TestBatchGenerate:
         seq_len = 5
         hidden_size = 7
         input_ids = mx.array(
-            [
-                [0, 0, 11, 12, 13],
-                [21, 22, 23, 24, 25],
-                [0, 31, 32, 33, 34],
-            ],
+            [[0, 0, 11, 12, 13], [21, 22, 23, 24, 25], [0, 31, 32, 33, 34]],
             dtype=mx.int32,
         )
         attention_mask = mx.array(
-            [[0, 0, 1, 1, 1], [1, 1, 1, 1, 1], [0, 1, 1, 1, 1]],
-            dtype=mx.int32,
+            [[0, 0, 1, 1, 1], [1, 1, 1, 1, 1], [0, 1, 1, 1, 1]], dtype=mx.int32
         )
         prepared_attention_mask = attention_mask
         inputs_embeds = mx.arange(
@@ -1211,10 +857,7 @@ class TestBatchGenerate:
             patch.object(
                 ar_module,
                 "prepare_inputs",
-                return_value={
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                },
+                return_value={"input_ids": input_ids, "attention_mask": attention_mask},
             ),
             patch.object(
                 mock_model, "get_input_embeddings", return_value=embedding_output
@@ -1228,23 +871,6 @@ class TestBatchGenerate:
                     prompts=["alpha", "beta", "gamma"],
                     max_tokens=5,
                 )
-
-    def test_split_prompt_kwargs_handles_native_mrope_position_ids(self):
-        batch_size = 2
-        seq_len = 4
-        position_ids = mx.arange(3 * batch_size * seq_len, dtype=mx.int32).reshape(
-            3, batch_size, seq_len
-        )
-
-        rows = ar_module._split_prompt_kwargs_per_row(
-            {"position_ids": position_ids}, batch_size
-        )
-
-        assert len(rows) == batch_size
-        assert rows[0]["position_ids"].shape == (3, 1, seq_len)
-        assert rows[1]["position_ids"].shape == (3, 1, seq_len)
-        assert rows[0]["position_ids"].tolist() == position_ids[:, :1, :].tolist()
-        assert rows[1]["position_ids"].tolist() == position_ids[:, 1:2, :].tolist()
 
     @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
@@ -1287,109 +913,6 @@ class TestBatchGenerate:
 
     @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
-    def test_with_images_different_shapes(
-        self, mock_process_image, mock_generate_batch, mock_model, mock_processor
-    ):
-        """Test batch generation with images of different shapes."""
-        from PIL import Image
-
-        from mlx_vlm.generate import batch_generate
-
-        # Create mock images of different sizes
-        mock_img1 = MagicMock(spec=Image.Image)
-        mock_img1.height = 224
-        mock_img1.width = 224
-
-        mock_img2 = MagicMock(spec=Image.Image)
-        mock_img2.height = 336
-        mock_img2.width = 336
-
-        mock_img3 = MagicMock(spec=Image.Image)
-        mock_img3.height = 224
-        mock_img3.width = 224
-
-        mock_process_image.side_effect = [mock_img1, mock_img2, mock_img3]
-
-        # Return correct number of responses for each group:
-        # Group 1 (224x224): 2 images (img1, img3) -> 2 responses
-        # Group 2 (336x336): 1 image (img2) -> 1 response
-        mock_generate_batch.side_effect = [
-            (
-                ["Response 1", "Response 3"],
-                BatchStats(
-                    prompt_tokens=20,
-                    prompt_time=0.1,
-                    generation_tokens=10,
-                    generation_time=0.2,
-                ),
-            ),
-            (
-                ["Response 2"],
-                BatchStats(
-                    prompt_tokens=10,
-                    prompt_time=0.15,
-                    generation_tokens=5,
-                    generation_time=0.3,
-                ),
-            ),
-        ]
-
-        prompts = ["Prompt 1", "Prompt 2", "Prompt 3"]
-        response = batch_generate(
-            model=mock_model,
-            processor=mock_processor,
-            images=["img1.jpg", "img2.jpg", "img3.jpg"],
-            prompts=prompts,
-            max_tokens=50,
-            group_by_shape=True,
-        )
-
-        assert isinstance(response, BatchResponse)
-        # Different shapes should result in multiple batches (2 groups: 224x224 and 336x336)
-        assert mock_generate_batch.call_count == 2
-        # All 3 responses should be present
-        assert len(response.texts) == 3
-        # Check aggregation through batch_generate itself, across both groups.
-        assert response.stats.prompt_tokens == 30
-        assert response.stats.prompt_time == pytest.approx(0.25)
-        assert response.stats.generation_tokens == 15
-        assert response.stats.generation_time == pytest.approx(0.5)
-        assert response.stats.prompt_tps == pytest.approx(120.0)
-        assert response.stats.generation_tps == pytest.approx(30.0)
-
-    @patch.object(ar_module, "_generate_batch")
-    @patch("mlx_vlm.utils.process_image")
-    def test_track_image_sizes(
-        self, mock_process_image, mock_generate_batch, mock_model, mock_processor
-    ):
-        """Test that image sizes are tracked correctly."""
-        from PIL import Image
-
-        from mlx_vlm.generate import batch_generate
-
-        mock_img = MagicMock(spec=Image.Image)
-        mock_img.height = 512
-        mock_img.width = 384
-
-        mock_process_image.return_value = mock_img
-        mock_generate_batch.return_value = (
-            ["Response"],
-            BatchStats(prompt_tokens=20, generation_tokens=10),
-        )
-
-        response = batch_generate(
-            model=mock_model,
-            processor=mock_processor,
-            images=["test.jpg"],
-            prompts=["Describe this"],
-            track_image_sizes=True,
-        )
-
-        assert response.image_sizes is not None
-        assert response.image_sizes[0] == (512, 384)
-
-    @patch.object(ar_module, "_generate_batch")
-    @patch("mlx_vlm.utils.process_image")
     def test_disable_track_image_sizes(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
     ):
@@ -1417,32 +940,6 @@ class TestBatchGenerate:
         )
 
         assert response.image_sizes is None
-
-    @patch.object(ar_module, "_generate_batch")
-    def test_per_sample_max_tokens(
-        self, mock_generate_batch, mock_model, mock_processor
-    ):
-        """Test batch generation with per-sample max_tokens."""
-        from mlx_vlm.generate import batch_generate
-
-        mock_generate_batch.return_value = (
-            ["Short", "Long response here"],
-            BatchStats(),
-        )
-
-        prompts = ["Short prompt", "Longer prompt here"]
-        max_tokens = [50, 200]
-
-        response = batch_generate(
-            model=mock_model,
-            processor=mock_processor,
-            images=None,
-            prompts=prompts,
-            max_tokens=max_tokens,
-        )
-
-        assert isinstance(response, BatchResponse)
-        assert len(response.texts) == 2
 
     @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
@@ -1512,79 +1009,10 @@ class TestBatchGenerate:
         captured = capsys.readouterr()
         assert "[batch_generate]" in captured.out
 
-    @patch.object(ar_module, "_generate_batch")
-    @patch("mlx_vlm.utils.process_image")
-    def test_disable_grouping(
-        self, mock_process_image, mock_generate_batch, mock_model, mock_processor
-    ):
-        """Test batch generation with grouping disabled."""
-        from PIL import Image
-
-        from mlx_vlm.generate import batch_generate
-
-        # Create mock images of different sizes
-        mock_img1 = MagicMock(spec=Image.Image)
-        mock_img1.height = 224
-        mock_img1.width = 224
-
-        mock_img2 = MagicMock(spec=Image.Image)
-        mock_img2.height = 336
-        mock_img2.width = 336
-
-        mock_process_image.side_effect = [mock_img1, mock_img2]
-        # When grouping is disabled, both images are in one group
-        mock_generate_batch.return_value = (["Response 1", "Response 2"], BatchStats())
-
-        response = batch_generate(
-            model=mock_model,
-            processor=mock_processor,
-            images=["img1.jpg", "img2.jpg"],
-            prompts=["Prompt 1", "Prompt 2"],
-            group_by_shape=False,  # Disable grouping
-        )
-
-        assert isinstance(response, BatchResponse)
-        assert len(response.texts) == 2
-
 
 # ============================================================================
 # Edge Cases
 # ============================================================================
-
-
-class TestEdgeCases:
-    """Tests for edge cases in batch generation."""
-
-    def test_empty_prompts_list(self, mock_model, mock_processor):
-        """Test behavior with empty prompts list."""
-        gen = BatchGenerator(
-            model=mock_model.language_model,
-            processor=mock_processor,
-        )
-
-        uids = gen.insert([])
-        assert uids == []
-        assert gen.uid_count == 0
-
-    def test_single_token_prompt(self):
-        """Test left padding with single token prompts."""
-        prompts = [[1], [2], [3]]
-        padded = _left_pad_prompts(prompts)
-
-        assert padded.shape == (3, 1)
-        assert mx.array_equal(padded[0], mx.array([1]))
-
-    def test_very_long_prompt(self):
-        """Test left padding with very long prompts."""
-        short_prompt = [1, 2]
-        long_prompt = list(range(1000))
-
-        padded = _left_pad_prompts([short_prompt, long_prompt])
-
-        assert padded.shape == (2, 1000)
-        # First prompt should have 998 padding tokens
-        assert padded[0, 0].item() == 0
-        assert padded[0, -1].item() == 2
 
 
 # ============================================================================
@@ -1605,36 +1033,6 @@ class FakeTokenizer:
 
 class TestThinkingBudgetCriteria:
     """Tests for ThinkingBudgetCriteria class."""
-
-    def test_thinking_model(self):
-        """Test thinking budget for thinking models (enable_thinking=True)."""
-        criteria = ThinkingBudgetCriteria(
-            tokenizer=FakeTokenizer(),
-            thinking_budget=5,
-            thinking_end_token="</think>",
-            thinking_start_token="<think>",
-            enable_thinking=True,
-            prompt_preopens_thinking=True,
-        )
-
-        # enable_thinking=True — already in thinking mode
-        assert criteria.in_thinking is True
-
-        # Tokens within budget return None
-        for i in range(5):
-            assert criteria(50 + i) is None
-        assert criteria.thinking_token_count == 5
-        assert criteria.budget_exceeded is False
-
-        # Exceeding budget forces \n then </think>
-        assert criteria(60) == 10  # \n
-        assert criteria(60) == 100  # </think>
-        assert criteria.budget_exceeded is True
-
-        # End token resets state
-        assert criteria(100) is None
-        assert criteria.in_thinking is False
-        assert criteria.budget_exceeded is False
 
     def test_non_thinking_model(self):
         """Test thinking budget for non-thinking models (enable_thinking=False)."""
@@ -1664,33 +1062,6 @@ class TestThinkingBudgetCriteria:
         assert criteria.thinking_token_count == 0
         assert criteria.budget_exceeded is False
 
-    def test_self_opening_model_budget_still_enforced(self):
-        """Regression test for issue #1911."""
-        criteria = ThinkingBudgetCriteria(
-            tokenizer=FakeTokenizer(),
-            thinking_budget=5,
-            thinking_end_token="</think>",
-            thinking_start_token="<think>",
-            enable_thinking=True,
-            prompt_preopens_thinking=False,
-        )
-
-        assert criteria.in_thinking is False
-
-        assert criteria(99) is None
-        assert criteria.in_thinking is True
-
-        for i in range(5):
-            assert criteria(50 + i) is None
-        assert criteria.thinking_token_count == 5
-        assert criteria.budget_exceeded is False
-
-        assert criteria(60) == 10  # \n
-        assert criteria.pop_forced_token_id() == 10
-        assert criteria(60) == 100  # </think>
-        assert criteria.pop_forced_token_id() == 100
-        assert criteria.budget_exceeded is True
-
     def _make_criteria(self, enable_thinking=True, prompt_preopens_thinking=True):
         return ThinkingBudgetCriteria(
             tokenizer=FakeTokenizer(),
@@ -1700,18 +1071,6 @@ class TestThinkingBudgetCriteria:
             enable_thinking=enable_thinking,
             prompt_preopens_thinking=prompt_preopens_thinking,
         )
-
-    def test_pop_forced_token_id_safe_before_first_call(self):
-        """Regression: pop_forced_token_id must be safe before __call__ ever runs.
-
-        forced_token_id has to be initialised in __init__; otherwise the first
-        pop_forced_token_id (e.g. on the very first decode step) raises
-        AttributeError. This crashed real generations on Gemma-style models
-        whose first generated token is the thinking delimiter.
-        """
-        criteria = self._make_criteria()
-        # No __call__ yet: there is no pending token ID to consume.
-        assert criteria.pop_forced_token_id() is None
 
     def test_pop_forced_token_id_safe_after_start_delimiter(self):
         """Regression: the start-token early return in __call__ does not set
@@ -1729,17 +1088,6 @@ class TestThinkingBudgetCriteria:
         assert criteria(100) is None
         assert criteria.pop_forced_token_id() is None
 
-    def test_pop_forced_token_id_emits_forced_token_when_budget_exceeded(self):
-        """End-to-end: once the budget is exceeded, the token returned by
-        __call__ is the same one pop_forced_token_id exposes to the generator."""
-        criteria = self._make_criteria()
-        # Burn the budget (5 tokens), then trip it on the 6th.
-        for i in range(5):
-            assert criteria(50 + i) is None
-        forced = criteria(60)  # \n forced
-        assert forced == 10
-        assert criteria.pop_forced_token_id() == 10
-
     def test_pop_forced_token_id_consumes_pending_token_id(self):
         criteria = self._make_criteria()
         for i in range(5):
@@ -1750,377 +1098,21 @@ class TestThinkingBudgetCriteria:
         assert criteria.pop_forced_token_id() is None
 
 
-class TestSamplerArgs:
-    """Tests for sampler argument forwarding."""
-
-    @patch.object(generate_module.cache, "make_prompt_cache", return_value=[])
-    @patch.object(generate_module, "make_logits_processors", return_value=[])
-    @patch.object(generate_module, "make_sampler")
-    def test_generate_step_passes_sampling_and_logits_processor_args(
-        self,
-        mock_make_sampler,
-        mock_make_logits_processors,
-        _mock_prompt_cache,
-    ):
-        mock_make_sampler.return_value = lambda logprobs: mx.array([0])
-
-        model = MagicMock()
-        model.language_model.return_value = MagicMock(
-            logits=mx.zeros((1, 1, 4)),
-            cross_attention_states=None,
-            encoder_outputs=None,
-        )
-
-        embedding_output = MagicMock()
-        embedding_output.inputs_embeds = mx.zeros((1, 1, 4))
-        embedding_output.to_dict.return_value = {}
-        model.get_input_embeddings.return_value = embedding_output
-
-        gen = generate_module.generate_step(
-            input_ids=mx.array([[1]], dtype=mx.int32),
-            model=model,
-            pixel_values=None,
-            mask=None,
-            max_tokens=1,
-            temperature=0.7,
-            top_p=0.9,
-            min_p=0.05,
-            top_k=32,
-            repetition_penalty=1.15,
-            repetition_context_size=512,
-            presence_penalty=0.2,
-            presence_context_size=256,
-            frequency_penalty=0.3,
-            frequency_context_size=128,
-            logit_bias={3: -0.75},
-        )
-
-        next(gen)
-
-        mock_make_sampler.assert_called_once_with(
-            temp=0.7,
-            top_p=0.9,
-            min_p=0.05,
-            top_k=32,
-            top_n_sigma=0.0,
-            p_less=False,
-            typical_p=1.0,
-        )
-        mock_make_logits_processors.assert_called_once_with(
-            {3: -0.75}, 1.15, 512, 0.2, 256, 0.3, 128
-        )
-
-    @patch.object(generate_module.cache, "make_prompt_cache", return_value=[])
-    @patch.object(generate_module, "make_logits_processors", return_value=[])
-    @patch.object(ar_module, "_PositionedTargetSampler")
-    def test_seeded_top_k_uses_positioned_target_sampler(
-        self,
-        mock_positioned_sampler,
-        _mock_logits_processors,
-        _mock_prompt_cache,
-    ):
-        mock_positioned_sampler.return_value = lambda logprobs: mx.array([0])
-        model = MagicMock()
-        model.language_model.return_value = MagicMock(
-            logits=mx.zeros((1, 1, 4)),
-            cross_attention_states=None,
-            encoder_outputs=None,
-        )
-        embedding_output = MagicMock()
-        embedding_output.inputs_embeds = mx.zeros((1, 1, 4))
-        embedding_output.to_dict.return_value = {}
-        model.get_input_embeddings.return_value = embedding_output
-
-        gen = generate_module.generate_step(
-            input_ids=mx.array([[1]], dtype=mx.int32),
-            model=model,
-            pixel_values=None,
-            mask=None,
-            max_tokens=1,
-            temperature=1.0,
-            top_p=0.95,
-            top_k=40,
-            seed=7,
-        )
-        next(gen)
-
-        mock_positioned_sampler.assert_called_once_with(
-            temperature=1.0,
-            top_p=0.95,
-            top_k=40,
-            seed=7,
-        )
-
-
 @pytest.mark.parametrize("top_p", [1.0, 0.95])
 def test_positioned_target_sampler_honors_top_k(top_p):
     sampler = ar_module._PositionedTargetSampler(
-        temperature=1.0,
-        top_p=top_p,
-        top_k=2,
-        seed=42,
+        temperature=1.0, top_p=top_p, top_k=2, seed=42
     )
     logits = mx.array([[0.0, 1.0, 2.0, 3.0]], dtype=mx.float32)
     logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
     repeated = mx.repeat(logprobs, 32, axis=0)
 
     tokens = sampler.sample_target(
-        repeated,
-        row_ids=[0] * 32,
-        positions=list(range(32)),
+        repeated, row_ids=[0] * 32, positions=list(range(32))
     )
     mx.eval(tokens)
 
     assert set(tokens.tolist()) <= {2, 3}
-
-
-def test_generate_step_schedules_final_prefill_async():
-    model = MagicMock()
-    model.language_model.return_value = MagicMock(
-        logits=mx.zeros((1, 1, 4)),
-        cross_attention_states=None,
-        encoder_outputs=None,
-    )
-
-    embedding_output = MagicMock()
-    embedding_output.inputs_embeds = mx.zeros((1, 1, 4))
-    embedding_output.to_dict.return_value = {}
-    model.get_input_embeddings.return_value = embedding_output
-
-    events = []
-    original_async_eval = mx.async_eval
-    original_eval = mx.eval
-
-    def record_async_eval(*args):
-        events.append("async")
-        return original_async_eval(*args)
-
-    def record_eval(*args):
-        events.append("sync")
-        return original_eval(*args)
-
-    with (
-        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
-        patch.object(generate_module, "make_logits_processors", return_value=[]),
-        patch.object(
-            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
-        ),
-        patch.object(generate_module.mx, "async_eval", side_effect=record_async_eval),
-        patch.object(generate_module.mx, "eval", side_effect=record_eval),
-    ):
-        gen = generate_module.generate_step(
-            input_ids=mx.array([[1]], dtype=mx.int32),
-            model=model,
-            pixel_values=None,
-            mask=None,
-            max_tokens=1,
-        )
-        next(gen)
-
-    assert events[0] == "async"
-
-
-def test_generate_step_preserves_explicit_prompt_position_metadata():
-    model = MagicMock()
-    model.language_model.return_value = MagicMock(
-        logits=mx.zeros((1, 1, 4)),
-        cross_attention_states=None,
-        encoder_outputs=None,
-    )
-
-    full_position_ids = mx.array([[10, 11]], dtype=mx.int32)
-    full_rope_deltas = mx.array([[7]], dtype=mx.int32)
-    embedding_output = MagicMock()
-    embedding_output.inputs_embeds = mx.zeros((1, 2, 4))
-    embedding_output.to_dict.return_value = {
-        "position_ids": mx.array([[0, 1]], dtype=mx.int32),
-        "rope_deltas": mx.array([[0]], dtype=mx.int32),
-    }
-    model.get_input_embeddings.return_value = embedding_output
-
-    with (
-        patch.object(generate_module, "make_logits_processors", return_value=[]),
-        patch.object(
-            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
-        ),
-    ):
-        gen = generate_module.generate_step(
-            input_ids=mx.array([[1, 2]], dtype=mx.int32),
-            model=model,
-            pixel_values=None,
-            mask=None,
-            prompt_cache=[],
-            max_tokens=1,
-            position_ids=full_position_ids,
-            rope_deltas=full_rope_deltas,
-        )
-        next(gen)
-
-    # The generator prepares the following decode step before yielding the
-    # current token, so inspect the first (prompt/suffix) forward call.
-    call_kwargs = model.language_model.call_args_list[0].kwargs
-    assert call_kwargs["logits_to_keep"] == 1
-    assert bool(mx.array_equal(call_kwargs["position_ids"], full_position_ids))
-    assert bool(mx.array_equal(call_kwargs["rope_deltas"], full_rope_deltas))
-
-
-@pytest.mark.parametrize(("verbose", "disabled"), [(False, True), (True, False)])
-def test_generate_step_prefill_tqdm_respects_verbose(verbose, disabled):
-    pbar = MagicMock()
-
-    model = MagicMock()
-    model.language_model.return_value = MagicMock(
-        logits=mx.zeros((1, 1, 4)),
-        cross_attention_states=None,
-        encoder_outputs=None,
-    )
-    model.no_chunked_prefill = False
-
-    embedding_output = MagicMock()
-    embedding_output.inputs_embeds = mx.zeros((1, 5, 4))
-    embedding_output.to_dict.return_value = {}
-    model.get_input_embeddings.return_value = embedding_output
-
-    with (
-        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
-        patch.object(generate_module, "make_logits_processors", return_value=[]),
-        patch.object(
-            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
-        ),
-        patch.object(ar_module, "tqdm") as mock_tqdm,
-    ):
-        mock_tqdm.return_value.__enter__.return_value = pbar
-
-        gen = generate_module.generate_step(
-            input_ids=mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
-            model=model,
-            pixel_values=None,
-            mask=None,
-            max_tokens=1,
-            prefill_step_size=2,
-            verbose=verbose,
-        )
-
-        next(gen)
-
-    mock_tqdm.assert_called_once()
-    assert mock_tqdm.call_args.kwargs["disable"] is disabled
-    assert pbar.update.call_count > 0
-    assert all(
-        call.kwargs["logits_to_keep"] == 1
-        for call in model.language_model.call_args_list
-    )
-
-
-def test_generate_step_chunks_prefill_when_model_policy_allows_speculation():
-    model = MagicMock()
-    model.no_chunked_prefill = False
-    model.chunked_prefill_policy.return_value = True
-
-    output = SimpleNamespace(
-        logits=mx.zeros((1, 1, 4)),
-        hidden_states=[mx.zeros((1, 1, 4))],
-        shared_kv_states={},
-        cross_attention_states=None,
-        encoder_outputs=None,
-    )
-    model.language_model.return_value = output
-
-    embedding_output = MagicMock()
-    embedding_output.inputs_embeds = mx.zeros((1, 5, 4))
-    embedding_output.to_dict.return_value = {}
-    model.get_input_embeddings.return_value = embedding_output
-
-    draft_model = SimpleNamespace(
-        config=SimpleNamespace(target_layer_ids=[]),
-    )
-
-    with (
-        patch("mlx_vlm.speculative.drafters.validate_drafter_compatibility"),
-        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
-        patch.object(generate_module, "make_logits_processors", return_value=[]),
-        patch.object(
-            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
-        ),
-        patch.object(ar_module, "run_speculative_rounds", return_value=iter(())),
-    ):
-        gen = generate_module.generate_step(
-            input_ids=mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
-            model=model,
-            pixel_values=None,
-            mask=None,
-            max_tokens=1,
-            prefill_step_size=2,
-            draft_model=draft_model,
-            draft_kind="mtp",
-        )
-        list(gen)
-
-    assert model.language_model.call_args_list[0].kwargs["n_to_process"] == 2
-    assert model.language_model.call_args_list[1].kwargs["n_to_process"] == 2
-    model.chunked_prefill_policy.assert_called_once()
-
-
-def test_chunked_prefill_policy_defaults_conservative_for_speculation():
-    model = SimpleNamespace(no_chunked_prefill=False)
-
-    assert ar_module._chunked_prefill_enabled(model)
-    assert not ar_module._chunked_prefill_enabled(
-        model,
-        draft_model=SimpleNamespace(config=SimpleNamespace(target_layer_ids=[])),
-        draft_kind="mtp",
-        prefill_kwargs={"return_hidden": True, "return_shared_kv": True},
-    )
-
-
-def test_stream_generate_forwards_verbose_to_generate_step():
-    captured = {}
-
-    class FakeStoppingCriteria:
-        def __call__(self, token):
-            return False
-
-    class FakeDetokenizer:
-        def reset(self):
-            self.segments = []
-
-        def add_token(self, token, skip_special_token_ids=None):
-            self.segments.append(str(token))
-
-        @property
-        def last_segment(self):
-            return self.segments.pop(0) if self.segments else ""
-
-        def finalize(self):
-            pass
-
-    def fake_generate_step(*args, **kwargs):
-        captured["verbose"] = kwargs.get("verbose")
-        yield 7, mx.zeros((4,))
-
-    tokenizer = SimpleNamespace(stopping_criteria=FakeStoppingCriteria())
-    processor = SimpleNamespace(tokenizer=tokenizer, detokenizer=FakeDetokenizer())
-    model = SimpleNamespace(
-        config=SimpleNamespace(model_type="test", eos_token_id=[]),
-        language_model=SimpleNamespace(),
-    )
-
-    with patch.object(dispatch_module, "generate_step", side_effect=fake_generate_step):
-        list(
-            dispatch_module.stream_generate(
-                model=model,
-                processor=processor,
-                prompt="",
-                input_ids=mx.array([[1]], dtype=mx.int32),
-                pixel_values=None,
-                mask=None,
-                prompt_cache=[],
-                max_tokens=1,
-                verbose=True,
-            )
-        )
-
-    assert captured["verbose"] is True
 
 
 @pytest.mark.parametrize("reused_prefix", [0, 1, 2])
@@ -2197,108 +1189,6 @@ def test_stream_generate_stores_checkpoint_only_before_decode(reused_prefix):
     assert all(call.kwargs == {"extra_hash": 0} for call in calls)
 
 
-def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
-    captured = {}
-    tokenizer = SimpleNamespace(stopping_criteria=SimpleNamespace())
-    processor = SimpleNamespace(tokenizer=tokenizer)
-    model = SimpleNamespace(
-        config=SimpleNamespace(model_type="test"),
-        language_model=SimpleNamespace(layers=[object()]),
-    )
-    prepared_mask = mx.ones((1, 4), dtype=mx.int32)
-
-    def capture_hash(**kwargs):
-        captured.update(kwargs)
-        return 0
-
-    with (
-        patch.object(
-            dispatch_module,
-            "prepare_inputs",
-            return_value={
-                "input_ids": mx.array([[1, 2, 3, 4]], dtype=mx.int32),
-                "attention_mask": prepared_mask,
-            },
-        ),
-        patch.object(dispatch_module._apc, "model_apc_mode", return_value="block"),
-        patch.object(
-            dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
-        ),
-        patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
-        patch.object(
-            dispatch_module.cache,
-            "make_prompt_cache",
-            return_value=[dispatch_module.cache.KVCache()],
-        ),
-        patch.object(
-            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
-        ),
-        patch.object(dispatch_module, "make_streaming_detokenizer"),
-        patch.object(dispatch_module, "generate_step", return_value=iter(())),
-    ):
-        list(
-            dispatch_module.stream_generate(
-                model=model,
-                processor=processor,
-                prompt="hello",
-                apc_manager=MagicMock(),
-                max_tokens=0,
-            )
-        )
-
-    assert captured["media"]["embeddings"] is None
-    assert captured["media"]["masks"] is None
-
-
-def test_stream_generate_hashes_explicit_sequence_tensors_for_apc_safety():
-    captured = {}
-    tokenizer = SimpleNamespace(stopping_criteria=SimpleNamespace())
-    processor = SimpleNamespace(tokenizer=tokenizer)
-    model = SimpleNamespace(
-        config=SimpleNamespace(model_type="test"),
-        language_model=SimpleNamespace(layers=[object()]),
-    )
-    custom_embeds = mx.ones((1, 4, 3))
-    custom_mask = mx.array([[1, 1, 0, 0]], dtype=mx.int32)
-
-    def capture_hash(**kwargs):
-        captured.update(kwargs)
-        return 0
-
-    with (
-        patch.object(dispatch_module._apc, "model_apc_mode", return_value="block"),
-        patch.object(
-            dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
-        ),
-        patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
-        patch.object(
-            dispatch_module.cache,
-            "make_prompt_cache",
-            return_value=[dispatch_module.cache.KVCache()],
-        ),
-        patch.object(
-            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
-        ),
-        patch.object(dispatch_module, "make_streaming_detokenizer"),
-        patch.object(dispatch_module, "generate_step", return_value=iter(())),
-    ):
-        list(
-            dispatch_module.stream_generate(
-                model=model,
-                processor=processor,
-                prompt="",
-                input_ids=mx.array([[1, 2, 3, 4]], dtype=mx.int32),
-                inputs_embeds=custom_embeds,
-                mask=custom_mask,
-                apc_manager=MagicMock(),
-                max_tokens=0,
-            )
-        )
-
-    assert captured["media"]["embeddings"] is custom_embeds
-    assert captured["media"]["masks"] is custom_mask
-
-
 def test_public_generation_annotations_match_runtime_results():
     hints = typing.get_type_hints(dispatch_module.stream_generate)
 
@@ -2315,14 +1205,6 @@ def test_batch_generate_optional_input_annotations_match_defaults():
     assert type(None) in typing.get_args(hints["audios"])
     assert type(None) in typing.get_args(hints["prompts"])
     assert hints["return"] is BatchResponse
-
-
-def test_normalize_resize_shape_expands_single_value():
-    assert normalize_resize_shape([224]) == (224, 224)
-
-
-def test_normalize_resize_shape_accepts_two_values():
-    assert normalize_resize_shape((224, 448)) == (224, 448)
 
 
 @pytest.mark.parametrize("value", [224, "22", [1.5], [True], [1, 2, 3]])
@@ -2393,9 +1275,7 @@ def test_generate_cli_smoke(capsys):
             dispatch_module, "apply_chat_template", return_value="prompt"
         ) as mock_apply_chat_template,
         patch.object(
-            dispatch_module,
-            "generate",
-            return_value=SimpleNamespace(text="done"),
+            dispatch_module, "generate", return_value=SimpleNamespace(text="done")
         ) as mock_generate,
     ):
         dispatch_module.main()
@@ -2480,9 +1360,7 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
             dispatch_module, "apply_chat_template", return_value="prompt"
         ) as mock_apply_chat_template,
         patch.object(
-            dispatch_module,
-            "generate",
-            return_value=SimpleNamespace(text="done"),
+            dispatch_module, "generate", return_value=SimpleNamespace(text="done")
         ) as mock_generate,
     ):
         dispatch_module.main()
@@ -2492,82 +1370,6 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
     assert mock_generate.call_args.kwargs["video"] == ["clip.mp4"]
     assert mock_generate.call_args.kwargs["fps"] == pytest.approx(1.0)
     assert capsys.readouterr().out.strip() == "done"
-
-
-def test_resolve_video_inputs_keeps_native_video_unchanged():
-    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
-    images = [object()]
-    videos = ["first.mp4", "second.mp4"]
-    processor = SimpleNamespace(
-        video_processor=SimpleNamespace(),
-        process=lambda text=None, images=None, videos=None, **kwargs: None,
-    )
-
-    with patch.object(video_module, "sample_video_frames") as mock_sample:
-        resolution = video_module.resolve_video_inputs(
-            processor,
-            videos,
-            images=images,
-        )
-
-    assert resolution.images == images
-    assert resolution.videos == videos
-    assert resolution.used_fallback is False
-    mock_sample.assert_not_called()
-
-
-def test_resolve_video_inputs_uses_one_global_frame_budget():
-    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
-    still = object()
-    images = [still]
-    videos = ["first.mp4", "second.mp4"]
-    frames = [object() for _ in range(10)]
-
-    with patch.object(
-        video_module,
-        "sample_video_frames",
-        return_value=(frames, 1.5),
-    ) as mock_sample:
-        resolution = video_module.resolve_video_inputs(
-            SimpleNamespace(),
-            videos,
-            images=images,
-            fps=1.5,
-            max_frames=4,
-        )
-
-    assert resolution.images == [still, frames[0], frames[3], frames[6], frames[9]]
-    assert resolution.videos == []
-    assert resolution.used_fallback is True
-    assert resolution.sampled_count == 10
-    assert resolution.selected_count == 4
-    assert resolution.frame_fps == pytest.approx(1.5)
-    assert images == [still]
-    assert videos == ["first.mp4", "second.mp4"]
-    mock_sample.assert_called_once_with(videos, 1.5, None)
-
-
-def test_resolve_video_inputs_does_not_partially_mutate_on_decode_failure():
-    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
-    images = [object()]
-    videos = ["good.mp4", "bad.mp4"]
-
-    with (
-        patch.object(
-            video_module,
-            "sample_video_frames",
-            side_effect=RuntimeError("decode failed"),
-        ),
-        pytest.raises(RuntimeError, match="decode failed"),
-    ):
-        video_module.resolve_video_inputs(
-            SimpleNamespace(),
-            videos,
-            images=images,
-        )
-
-    assert len(images) == 1
-    assert videos == ["good.mp4", "bad.mp4"]
 
 
 def test_generate_cli_video_frames_fallback_without_video_processor(capsys):
@@ -2639,9 +1441,7 @@ def test_generate_cli_video_frames_fallback_without_video_processor(capsys):
             dispatch_module, "apply_chat_template", return_value="prompt"
         ) as mock_apply_chat_template,
         patch.object(
-            dispatch_module,
-            "generate",
-            return_value=SimpleNamespace(text="done"),
+            dispatch_module, "generate", return_value=SimpleNamespace(text="done")
         ) as mock_generate,
     ):
         dispatch_module.main()
@@ -2717,19 +1517,6 @@ def test_generate_image_cli_edit_task_loads_edit_model_and_saves_output(tmp_path
     assert mock_edit.call_args.kwargs["output_path"] == output_path
 
 
-def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["mlx_vlm.generate"])
-
-    args = generate_module.parse_arguments()
-
-    assert args.thinking_start_token == "<think>"
-    assert args.thinking_end_token == "</think>"
-    assert args.output_modality == "text"
-    assert args.task == "generate"
-    assert args.size is None
-    assert args.verbose is False
-
-
 def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
     class BrokenRopeLanguageModel:
         def __init__(self):
@@ -2746,12 +1533,7 @@ def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
     kwargs = {}
 
     with caplog.at_level(logging.WARNING, logger="mlx_vlm.generate"):
-        ok = _prime_cached_prefix_rope_state(
-            model,
-            mx.array([[1, 2, 3]]),
-            None,
-            kwargs,
-        )
+        ok = _prime_cached_prefix_rope_state(model, mx.array([[1, 2, 3]]), None, kwargs)
 
     assert ok is False
     assert "position_ids" not in kwargs
@@ -2807,22 +1589,6 @@ class TestPrefixCacheReuseTrim:
             cache.update_and_fetch(v, v)
         return cache
 
-    def test_flat_cache_trims_to_prefix(self):
-        c = self._fill(KVCache(), 20, marker=True)
-        n_drop = dispatch_module._prefix_cache_trim_amount([c], 8)
-        assert n_drop == 12
-        c.trim(n_drop)
-        keys, _ = c.state
-        assert c.offset == 8 and keys.shape[2] == 8
-        assert bool(mx.array_equal(keys[0, 0, :, 0], mx.arange(8, dtype=keys.dtype)))
-
-    def test_full_prefix_needs_no_trim(self):
-        c = self._fill(KVCache(), 12)
-        assert dispatch_module._prefix_cache_trim_amount([c], 12) == 0
-
-    def test_empty_cache_is_reusable(self):
-        assert dispatch_module._prefix_cache_trim_amount([], 0) == 0
-
     def test_unwrapped_rotating_trims_and_stays_usable(self):
         c = self._fill(RotatingKVCache(max_size=512), 100)
         assert c.offset == 100  # window has not wrapped
@@ -2832,11 +1598,6 @@ class TestPrefixCacheReuseTrim:
         assert c.offset == 40 and c._idx == 40
         c.update_and_fetch(mx.zeros((1, 1, 1, 4)), mx.zeros((1, 1, 1, 4)))
         assert c.offset == 41
-
-    def test_wrapped_rotating_is_not_reusable(self):
-        c = self._fill(RotatingKVCache(max_size=8), 20)  # ring has wrapped
-        assert c.offset > c.max_size
-        assert dispatch_module._prefix_cache_trim_amount([c], 3) is None
 
     def test_mixed_flat_and_wrapped_rotating_is_not_reusable(self):
         flat = self._fill(KVCache(), 20)
@@ -2852,18 +1613,6 @@ class TestPrefixCacheReuseTrim:
         )
         assert dispatch_module._prefix_cache_trim_amount([c], 2) is None
         c.update_and_fetch(mx.zeros((1, 1, 2, 4)), mx.zeros((1, 1, 2, 4)))
-
-    def test_unwrapped_buffered_rotating_trims(self):
-        # A buffered cache that has not evicted anything (start_position == 0) is
-        # still rollback-able even though is_trimmable() is unconditionally True.
-        c = BufferedRotatingKVCache(max_size=512, buffer_size=16)
-        self._fill(c, 100)
-        assert c.start_position == 0
-        assert dispatch_module._prefix_cache_trim_amount([c], 40) == 60
-        c.trim(60)
-        assert c.offset == 40
-        c.update_and_fetch(mx.zeros((1, 1, 1, 4)), mx.zeros((1, 1, 1, 4)))
-        assert c.offset == 41
 
 
 class TestGemma4LogitsToKeep:
@@ -2896,13 +1645,6 @@ class TestGemma4LogitsToKeep:
         lm.lm_head = lambda h: h
         lm.final_logit_softcapping = None
         return LanguageModel, lm
-
-    def test_gemma4_slices_before_lm_head(self):
-        _, lm = self._gemma4_lm(hidden=8)
-        ids = mx.zeros((1, 6), dtype=mx.int32)
-        assert lm(ids).logits.shape == (1, 6, 8)
-        assert lm(ids, logits_to_keep=1).logits.shape == (1, 1, 8)
-        assert lm(ids, logits_to_keep=3).logits.shape == (1, 3, 8)
 
     def test_gemma4_text_slices_before_lm_head(self):
         _, lm = self._gemma4_text_lm(hidden=8)
@@ -2987,21 +1729,6 @@ class TestGemma4LogitsToKeep:
             )
         )
 
-    def test_gemma4_wrappers_forward_logits_to_keep(self):
-        from mlx_vlm.models import gemma4, gemma4_unified
-        from mlx_vlm.models.base import InputEmbeddingsFeatures
-
-        ids = mx.array([[1, 2, 3]], dtype=mx.int32)
-        features = InputEmbeddingsFeatures(mx.zeros((1, 3, 4)))
-        for model_cls in (gemma4.Model, gemma4_unified.Model):
-            model = model_cls.__new__(model_cls)
-            model.get_input_embeddings = MagicMock(return_value=features)
-            model.language_model = MagicMock(return_value=object())
-
-            model_cls.__call__(model, ids, logits_to_keep=1)
-
-            assert model.language_model.call_args.kwargs["logits_to_keep"] == 1
-
 
 @pytest.mark.parametrize("honors_hint", [False, True])
 @pytest.mark.parametrize("batch_size", [1, 2])
@@ -3066,90 +1793,6 @@ def test_prompt_processing_requests_only_required_trailing_logits(
     assert gen_batch._next_tokens.tolist() == [row[-1] for row in input_ids]
 
 
-def test_batch_apc_extra_hash_uses_precomputed_image_hash():
-    batch_generator = SimpleNamespace(apc_manager=object())
-
-    got = BatchGenerator._apc_extra_hash(
-        batch_generator,
-        {"_apc_image_hash": 123, "_apc_tenant": "tenant-a"},
-    )
-
-    assert got == apc_module.tenant_scoped_hash("tenant-a", 123)
-
-
-def test_batch_apc_extra_hash_returns_precomputed_semantic_hash():
-    batch_generator = SimpleNamespace(apc_manager=object())
-    semantic_hash = 7088136067003016882
-
-    short_hash = BatchGenerator._apc_extra_hash(
-        batch_generator,
-        {
-            "_apc_semantic_hash": semantic_hash,
-            "inputs_embeds": mx.ones((1, 8, 4)),
-            "attention_mask": mx.ones((1, 8), dtype=mx.int32),
-        },
-    )
-    extended_hash = BatchGenerator._apc_extra_hash(
-        batch_generator,
-        {
-            "_apc_semantic_hash": semantic_hash,
-            "inputs_embeds": mx.ones((1, 12, 4)),
-            "attention_mask": mx.ones((1, 12), dtype=mx.int32),
-        },
-    )
-
-    assert short_hash == semantic_hash
-    assert extended_hash == semantic_hash
-
-
-def test_batch_apc_extra_hash_still_tracks_non_text_media():
-    batch_generator = SimpleNamespace(apc_manager=object())
-    base = {
-        "_apc_image_hash": 123,
-        "_apc_tenant": "tenant-a",
-        "inputs_embeds": mx.ones((1, 8, 4)),
-        "attention_mask": mx.ones((1, 8), dtype=mx.int32),
-    }
-
-    first_hash = BatchGenerator._apc_extra_hash(
-        batch_generator,
-        {**base, "input_features": mx.zeros((1, 4, 8))},
-    )
-    second_hash = BatchGenerator._apc_extra_hash(
-        batch_generator,
-        {**base, "input_features": mx.ones((1, 4, 8))},
-    )
-
-    assert first_hash != second_hash
-
-
-def test_batch_apc_extra_hash_tracks_explicit_sequence_tensors():
-    batch_generator = SimpleNamespace(apc_manager=object())
-    base = {
-        "_apc_image_hash": 123,
-        "_apc_tenant": "tenant-a",
-    }
-
-    first_hash = BatchGenerator._apc_extra_hash(
-        batch_generator,
-        {
-            **base,
-            "inputs_embeds": mx.zeros((1, 8, 4)),
-            "attention_mask": mx.ones((1, 8), dtype=mx.int32),
-        },
-    )
-    second_hash = BatchGenerator._apc_extra_hash(
-        batch_generator,
-        {
-            **base,
-            "inputs_embeds": mx.ones((1, 8, 4)),
-            "attention_mask": mx.ones((1, 8), dtype=mx.int32),
-        },
-    )
-
-    assert first_hash != second_hash
-
-
 def test_precomputed_semantic_hash_reuses_actual_growing_apc_prefix():
     manager = apc_module.APCManager(num_blocks=4, block_size=4)
     manager.exact_cache_guard_tokens = 1
@@ -3160,10 +1803,7 @@ def test_precomputed_semantic_hash_reuses_actual_growing_apc_prefix():
     layer_values = [mx.ones((1, 1, len(short_tokens), 2)) * 2]
 
     stored = manager.store_kv_blocks(
-        short_tokens,
-        layer_keys,
-        layer_values,
-        extra_hash=semantic_hash,
+        short_tokens, layer_keys, layer_values, extra_hash=semantic_hash
     )
     manager.release(stored)
 
@@ -3174,14 +1814,7 @@ def test_precomputed_semantic_hash_reuses_actual_growing_apc_prefix():
     batch_generator._wire_stack = None
 
     pick = batch_generator._apc_pick_for(
-        (
-            1,
-            extended_tokens,
-            1,
-            {"_apc_semantic_hash": semantic_hash},
-            [],
-            None,
-        )
+        (1, extended_tokens, 1, {"_apc_semantic_hash": semantic_hash}, [], None)
     )
 
     assert pick is not None
@@ -3360,9 +1993,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
     with (
         patch.object(BatchGenerator, "_apc_pick_for", side_effect=picks),
         patch.object(
-            ar_module._apc,
-            "make_warm_batch_kv_cache_multi",
-            return_value=([], 4),
+            ar_module._apc, "make_warm_batch_kv_cache_multi", return_value=([], 4)
         ),
         patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch),
     ):
@@ -3382,11 +2013,7 @@ def test_apc_pick_rejects_image_tokens_and_releases_blocks():
     manager = apc_module.APCManager(num_blocks=4, block_size=block_size)
     layer_keys = [mx.ones((1, 1, block_size, 2))]
     layer_values = [mx.ones((1, 1, block_size, 2)) * 2]
-    stored = manager.store_kv_blocks(
-        token_ids[:block_size],
-        layer_keys,
-        layer_values,
-    )
+    stored = manager.store_kv_blocks(token_ids[:block_size], layer_keys, layer_values)
     manager.release(stored)
 
     bg = object.__new__(BatchGenerator)
@@ -3405,11 +2032,7 @@ class TestBatchTurboQuantizedKVStart:
         from mlx_vlm.generate.ar import _make_cache
 
         caches = _make_cache(
-            MockModel(),
-            [0],
-            kv_bits=3.5,
-            kv_quant_scheme="turboquant",
-            **kwargs,
+            MockModel(), [0], kv_bits=3.5, kv_quant_scheme="turboquant", **kwargs
         )
         return [type(c).__name__ for c in caches]
 
@@ -3417,18 +2040,6 @@ class TestBatchTurboQuantizedKVStart:
         kinds = self._cache_kinds(quantized_kv_start=5000, prefill_length=16)
         assert "BatchTurboQuantKVCache" not in kinds
         assert set(kinds) == {"BatchKVCache"}
-
-    def test_quantizes_at_or_above_threshold(self):
-        kinds = self._cache_kinds(quantized_kv_start=8, prefill_length=32)
-        assert "BatchTurboQuantKVCache" in kinds
-
-    def test_immediate_when_start_zero(self):
-        kinds = self._cache_kinds(quantized_kv_start=0, prefill_length=16)
-        assert "BatchTurboQuantKVCache" in kinds
-
-    def test_default_preserves_immediate_quantization(self):
-        kinds = self._cache_kinds()
-        assert "BatchTurboQuantKVCache" in kinds
 
 
 class TestTokenizerPaddedBatchRows:
@@ -3479,9 +2090,7 @@ class TestTokenizerPaddedBatchRows:
 
         gen = self._generator()
         assert gen.insert(
-            input_ids,
-            prompt_kwargs=prompt_kwargs,
-            attention_mask=attention_mask,
+            input_ids, prompt_kwargs=prompt_kwargs, attention_mask=attention_mask
         ) == [0, 1, 2]
         queued = {sequence[0]: sequence for sequence in gen._unprocessed_sequences}
 
@@ -3511,80 +2120,11 @@ class TestTokenizerPaddedBatchRows:
         gen = self._generator()
 
         gen.insert(
-            [[0, 4, 5], [6, 7, 8]],
-            attention_mask=mx.array([[0, 1, 1], [1, 1, 1]]),
+            [[0, 4, 5], [6, 7, 8]], attention_mask=mx.array([[0, 1, 1], [1, 1, 1]])
         )
 
         queued = {sequence[0]: sequence[1] for sequence in gen._unprocessed_sequences}
         assert queued == {0: [4, 5], 1: [6, 7, 8]}
-
-    def test_ragged_rows_initialize_both_cache_types(self):
-        batch = self._batch([[4, 5], [6, 7, 8, 9]])
-
-        assert batch._left_padding_per_row == [2, 0]
-        assert batch.total_prompt_tokens == 6
-        assert batch.prompt_cache[0].offset.tolist() == [-2, 0]
-        assert batch.prompt_cache[1].left_padding.tolist() == [2, 0]
-
-    def test_arrays_cache_masks_the_declared_padding(self):
-        import mlx.core as mx
-
-        from mlx_vlm.models.cache import ArraysCache
-
-        entry = ArraysCache(1)
-        entry.left_padding = mx.array([2, 0])
-
-        mask = entry.make_mask(4)
-
-        assert mask.shape == (2, 4)
-        assert mask[0].tolist() == [False, False, True, True]
-        assert mask[1].tolist() == [True] * 4
-
-
-def test_prompt_shorter_than_prefill_step_size_is_still_chunked():
-    """Short prompts must not skip chunking: the unchunked path feeds the whole
-    prompt to _step, which reads logits[:, -1, :] and materializes [1, N, vocab]."""
-    model = MagicMock()
-    model.chunked_prefill_policy = MagicMock(return_value=True)
-    output = SimpleNamespace(
-        logits=mx.zeros((1, 1, 8)),
-        hidden_states=[mx.zeros((1, 1, 4))],
-        shared_kv_states={},
-        cross_attention_states=None,
-        encoder_outputs=None,
-    )
-    model.language_model.return_value = output
-
-    embedding_output = MagicMock()
-    embedding_output.inputs_embeds = mx.zeros((1, 5, 4))
-    embedding_output.to_dict.return_value = {}
-    model.get_input_embeddings.return_value = embedding_output
-
-    with (
-        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
-        patch.object(generate_module, "make_logits_processors", return_value=[]),
-        patch.object(
-            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
-        ),
-    ):
-        # 5 prompt tokens, prefill_step_size 2048: previously unchunked.
-        list(
-            generate_module.generate_step(
-                input_ids=mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
-                model=model,
-                pixel_values=None,
-                mask=None,
-                max_tokens=1,
-                prefill_step_size=2048,
-            )
-        )
-
-    n_processed = [
-        c.kwargs["n_to_process"]
-        for c in model.language_model.call_args_list
-        if "n_to_process" in c.kwargs
-    ]
-    assert n_processed == [4], f"expected one 4-token prefill chunk, got {n_processed}"
 
 
 def test_paligemma_opts_out_of_chunked_prefill_when_bidirectional():

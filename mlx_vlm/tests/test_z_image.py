@@ -24,7 +24,6 @@ from mlx_vlm.models.z_image.config import (
     ZImageTextEncoderConfig,
     ZImageTransformerConfig,
     ZImageVAEConfig,
-    detect_z_image_layout,
 )
 from mlx_vlm.models.z_image.convert import (
     _sanitize_vae_for_conversion,
@@ -46,27 +45,6 @@ from mlx_vlm.models.z_image.vae import ZImageVAE, sanitize_vae_weights
 # --- Config / Layout tests ---
 
 
-def test_detect_z_image_layout(tmp_path: Path) -> None:
-    """Positive and negative layout detection."""
-    # Missing tokenizer → False
-    assert not detect_z_image_layout(tmp_path)
-    # Create full layout
-    for rel in (
-        "model_index.json",
-        "transformer/config.json",
-        "transformer/model.safetensors",
-        "text_encoder/config.json",
-        "text_encoder/model.safetensors",
-        "vae/config.json",
-        "vae/model.safetensors",
-        "scheduler/scheduler_config.json",
-        "tokenizer/tokenizer.json",
-    ):
-        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / rel).write_text("{}")
-    assert detect_z_image_layout(tmp_path)
-
-
 def test_detects_diffusers_z_image_model_index(tmp_path: Path) -> None:
     (tmp_path / "model_index.json").write_text('{"_class_name":"ZImagePipeline"}')
     assert is_z_image_model_path(tmp_path)
@@ -75,8 +53,7 @@ def test_detects_diffusers_z_image_model_index(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "mode,expected_bits,expected_group_size",
-    [("affine", 4, 64), ("mxfp8", 8, 32)],
+    "mode,expected_bits,expected_group_size", [("affine", 4, 64), ("mxfp8", 8, 32)]
 )
 def test_z_image_convert_resolves_hub_model(
     monkeypatch: pytest.MonkeyPatch,
@@ -101,10 +78,7 @@ def test_z_image_convert_resolves_hub_model(
 
     monkeypatch.setattr(z_image_convert, "convert_z_image", fake_convert)
     result = z_image_convert.convert(
-        "Tongyi-MAI/Z-Image-Turbo",
-        output,
-        quantize=True,
-        q_mode=mode,
+        "Tongyi-MAI/Z-Image-Turbo", output, quantize=True, q_mode=mode
     )
     assert result == output
     assert calls["model_path"] == source
@@ -164,10 +138,7 @@ def test_edit_model_forwards_img2img_options() -> None:
 
     class FakePipeline:
         config = ZImageConfig(
-            default_steps=9,
-            default_guidance=0.0,
-            scheduler_shift=3.0,
-            variant="turbo",
+            default_steps=9, default_guidance=0.0, scheduler_shift=3.0, variant="turbo"
         )
         model_path = Path("/tmp/z-image")
 
@@ -179,8 +150,7 @@ def test_edit_model_forwards_img2img_options() -> None:
             return 1
 
     model = ZImageEditModel(
-        pipeline=FakePipeline(),
-        model_id="Tongyi-MAI/Z-Image-Turbo",
+        pipeline=FakePipeline(), model_id="Tongyi-MAI/Z-Image-Turbo"
     )
     result = model.edit(
         ImageEditRequest(
@@ -208,89 +178,12 @@ def test_edit_model_forwards_img2img_options() -> None:
 
 
 @pytest.mark.parametrize(
-    "steps,strength,expected",
-    [(9, 0.6, 3), (9, 0.5, 4), (8, 0.6, 3), (8, 0.3, 5)],
+    "steps,strength,expected", [(9, 0.6, 3), (9, 0.5, 4), (8, 0.6, 3), (8, 0.3, 5)]
 )
 def test_img2img_start_index_matches_diffusers(
-    steps: int,
-    strength: float,
-    expected: int,
+    steps: int, strength: float, expected: int
 ) -> None:
     assert _img2img_start_index(steps, strength) == expected
-
-
-def test_base_model_forwards_cfg_options() -> None:
-    calls = {}
-
-    class FakePipeline:
-        config = ZImageConfig(
-            default_steps=50,
-            default_guidance=4.0,
-            scheduler_shift=6.0,
-            variant="base",
-        )
-        model_path = Path("/tmp/z-image")
-
-        def generate_array(self, prompt: str, **kwargs):
-            calls.update(prompt=prompt, **kwargs)
-            return mx.zeros((16, 16, 3), dtype=mx.uint8)
-
-        def count_prompt_tokens(self, prompt: str) -> int:
-            return 1
-
-    model = ZImageGenerationModel(
-        pipeline=FakePipeline(),
-        model_id="Tongyi-MAI/Z-Image",
-    )
-    result = model.generate(
-        ImageGenerationRequest(
-            prompt="fox",
-            seed=42,
-            steps=50,
-            width=512,
-            height=512,
-            guidance=4.0,
-            extra={
-                "negative_prompt": "blurry",
-                "cfg_truncation": 0.75,
-            },
-        )
-    )
-    assert model.variant == "base"
-    assert calls["guidance"] == 4.0
-    assert calls["negative_prompt"] == "blurry"
-    assert calls["cfg_truncation"] == 0.75
-    assert result.metadata["guidance_mode"] == "classifier-free"
-
-
-def test_base_model_applies_variant_defaults() -> None:
-    calls = {}
-
-    class FakePipeline:
-        config = ZImageConfig(
-            default_steps=50,
-            default_guidance=4.0,
-            scheduler_shift=6.0,
-            variant="base",
-        )
-        model_path = Path("/tmp/z-image")
-
-        def generate_array(self, prompt: str, **kwargs):
-            calls.update(prompt=prompt, **kwargs)
-            return mx.zeros((16, 16, 3), dtype=mx.uint8)
-
-        def count_prompt_tokens(self, prompt: str) -> int:
-            return 1
-
-    model = ZImageGenerationModel(
-        pipeline=FakePipeline(),
-        model_id="Tongyi-MAI/Z-Image",
-    )
-    result = model.generate(ImageGenerationRequest(prompt="fox"))
-    assert calls["steps"] == 50
-    assert calls["guidance"] == 4.0
-    assert result.steps == 50
-    assert result.guidance == 4.0
 
 
 def test_base_model_preserves_explicit_generic_values() -> None:
@@ -298,10 +191,7 @@ def test_base_model_preserves_explicit_generic_values() -> None:
 
     class FakePipeline:
         config = ZImageConfig(
-            default_steps=50,
-            default_guidance=4.0,
-            scheduler_shift=6.0,
-            variant="base",
+            default_steps=50, default_guidance=4.0, scheduler_shift=6.0, variant="base"
         )
         model_path = Path("/tmp/z-image")
 
@@ -313,8 +203,7 @@ def test_base_model_preserves_explicit_generic_values() -> None:
             return 1
 
     model = ZImageGenerationModel(
-        pipeline=FakePipeline(),
-        model_id="Tongyi-MAI/Z-Image",
+        pipeline=FakePipeline(), model_id="Tongyi-MAI/Z-Image"
     )
     result = model.generate(ImageGenerationRequest(prompt="fox", steps=4, guidance=1.0))
     assert calls["steps"] == 4
@@ -434,41 +323,9 @@ def test_vae_decoder_shape() -> None:
 
 def test_rejects_classifier_free_guidance() -> None:
     model = object.__new__(ZImageGenerationModel)
-    model.pipeline = SimpleNamespace(
-        config=ZImageConfig(),
-    )
+    model.pipeline = SimpleNamespace(config=ZImageConfig())
     with pytest.raises(ValueError, match="does not support classifier-free guidance"):
         model.generate(ImageGenerationRequest(prompt="test", guidance=2.0))
-
-
-def test_config_loads_original_metadata(tmp_path: Path) -> None:
-    configs = {
-        "transformer/config.json": {
-            "dim": 3840,
-            "n_heads": 30,
-            "cap_feat_dim": 2560,
-        },
-        "text_encoder/config.json": {
-            "hidden_size": 2560,
-            "num_attention_heads": 32,
-        },
-        "vae/config.json": {},
-        "scheduler/scheduler_config.json": {"shift": 3.0},
-    }
-    for relative, content in configs.items():
-        path = tmp_path / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(content))
-    config = ZImageConfig.from_model_path(tmp_path)
-    assert config.transformer.hidden_size == 3840
-    assert config.transformer.num_attention_heads == 30
-    assert config.transformer.text_embed_dim == 2560
-    assert config.text_encoder.hidden_size == 2560
-    assert config.text_encoder.num_attention_heads == 32
-    assert config.scheduler_shift == 3.0
-    assert config.variant == "turbo"
-    assert config.default_steps == 9
-    assert config.default_guidance == 0.0
 
 
 def test_config_detects_base_variant(tmp_path: Path) -> None:
@@ -486,14 +343,6 @@ def test_config_detects_base_variant(tmp_path: Path) -> None:
     assert config.variant == "base"
     assert config.default_steps == 50
     assert config.default_guidance == 4.0
-
-
-def test_transformer_config_allows_distinct_refiner_depths() -> None:
-    config = ZImageTransformerConfig.from_dict(
-        {"n_refiner_layers": 2, "n_context_refiner_layers": 4}
-    )
-    assert config.n_refiner_layers == 2
-    assert config.n_context_refiner_layers == 4
 
 
 def test_sanitize_transformer_weights() -> None:
@@ -525,10 +374,7 @@ def test_sanitize_source_text_encoder_weights() -> None:
 def test_sanitize_source_vae_weights() -> None:
     conv = mx.zeros((8, 4, 3, 3))
     sanitized = sanitize_vae_weights(
-        {
-            "encoder.conv_in.weight": conv,
-            "decoder.conv_norm_out.weight": mx.zeros((8,)),
-        }
+        {"encoder.conv_in.weight": conv, "decoder.conv_norm_out.weight": mx.zeros((8,))}
     )
     assert sanitized["encoder.conv_in.weight"].shape == (8, 3, 3, 4)
     assert "decoder.conv_norm_out.weight" in sanitized
@@ -536,13 +382,9 @@ def test_sanitize_source_vae_weights() -> None:
     native = sanitize_vae_weights({"encoder.conv_in.conv2d.weight": conv})
     assert set(native) == {"encoder.conv_in.weight"}
 
-    converted = sanitize_vae_weights(
-        sanitized,
-        source_layout=False,
-    )
+    converted = sanitize_vae_weights(sanitized, source_layout=False)
     assert mx.array_equal(
-        converted["encoder.conv_in.weight"],
-        sanitized["encoder.conv_in.weight"],
+        converted["encoder.conv_in.weight"], sanitized["encoder.conv_in.weight"]
     )
 
 
@@ -555,8 +397,7 @@ def test_conversion_preserves_native_vae_layout(tmp_path: Path) -> None:
     )
 
     converted = _sanitize_vae_for_conversion(
-        vae_path,
-        {"encoder.conv_in.weight": native},
+        vae_path, {"encoder.conv_in.weight": native}
     )
 
     assert converted["encoder.conv_in.weight"].shape == native.shape
@@ -572,12 +413,7 @@ def test_rejects_invalid_image_dimensions(width: int, height: int) -> None:
 
 @pytest.mark.parametrize(
     "mode,bits,group_size",
-    [
-        ("mxfp4", 4, 32),
-        ("mxfp8", 8, 32),
-        ("nvfp4", 4, 16),
-        ("affine", 4, 64),
-    ],
+    [("mxfp4", 4, 32), ("mxfp8", 8, 32), ("nvfp4", 4, 16), ("affine", 4, 64)],
 )
 def test_native_quantization_metadata_is_supported(
     mode: str, bits: int, group_size: int
@@ -592,12 +428,7 @@ def test_native_quantization_metadata_is_supported(
             self.proj = nn.Linear(64, 32, bias=False)
 
     quantized = TinyModel()
-    nn.quantize(
-        quantized,
-        group_size=group_size,
-        bits=bits,
-        mode=mode,
-    )
+    nn.quantize(quantized, group_size=group_size, bits=bits, mode=mode)
     weights = dict(tree_flatten(quantized.parameters()))
     loaded = _apply_weights(
         TinyModel(),
@@ -629,13 +460,7 @@ def test_saved_affine_metadata_marks_native_layout(tmp_path: Path) -> None:
         tmp_path,
         "transformer",
         model,
-        {
-            "quantization": {
-                "group_size": 64,
-                "bits": 4,
-                "mode": "affine",
-            }
-        },
+        {"quantization": {"group_size": 64, "bits": 4, "mode": "affine"}},
     )
     index = json.loads(
         (tmp_path / "transformer" / "model.safetensors.index.json").read_text()

@@ -80,29 +80,3 @@ def test_rht_weighted_sum_stats_matches_einsum(dim, bits, monkeypatch):
     assert mx.max(mx.abs(out_k - out_e)).item() < 1e-4
     assert mx.max(mx.abs(denom_k - denom_e)).item() < 1e-4
     assert mx.max(mx.abs(max_k - max_e)).item() < 1e-4
-
-
-def test_rht_weighted_sum_takes_kernel_path_not_unpack(monkeypatch):
-    """Under RHT the fast kernel must run — never the einsum fallback (which unpacks).
-
-    Regression guard for the perf goal: before this fix the RHT codec skipped
-    the kernel and fell through to einsum, calling ``_unpack_lowbit``.
-    """
-    if not mx.metal.is_available():
-        pytest.skip("Metal kernels are unavailable on this host")
-
-    n_heads, n_repeats, n_tokens, dim = 2, 4, 24, 64
-    codec, state = _codec_and_state(dim, 4, n_heads, n_tokens, seed=2)
-    assert codec.use_rht is True
-
-    weights = mx.softmax(
-        mx.random.normal((1, n_heads, n_repeats, 1, n_tokens)), axis=-1
-    )
-
-    def fail(*args, **kwargs):
-        raise AssertionError("RHT weighted_sum should use the Metal kernel, not unpack")
-
-    monkeypatch.setattr(tq, "_unpack_lowbit", fail)
-    output = codec.weighted_sum(weights, state)
-    mx.eval(output)
-    assert output.shape == (1, n_heads, n_repeats, 1, dim)

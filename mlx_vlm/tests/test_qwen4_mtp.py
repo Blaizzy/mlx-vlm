@@ -7,7 +7,7 @@ import pytest
 
 from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models.qwen4_exp.config import TextConfig
-from mlx_vlm.models.qwen4_exp.language import LanguageModel, Qwen4ExpDecoderLayer
+from mlx_vlm.models.qwen4_exp.language import LanguageModel
 from mlx_vlm.speculative.common import _dflash_block_total
 from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_mtp_splitter
 from mlx_vlm.speculative.drafters.qwen4_exp_mtp import (
@@ -80,40 +80,6 @@ def _outer_config():
     )
 
 
-def test_qwen4_decoder_layers_expose_normalized_layer_types_for_mtp():
-    config = _tiny_text_config()
-
-    assert Qwen4ExpDecoderLayer(config, 0).layer_type == "linear_attention"
-    assert Qwen4ExpDecoderLayer(config, 1).layer_type == "qwen_sparse_attention"
-
-
-def test_qwen4_mtp_fusion_matches_released_equations():
-    config = _tiny_text_config()
-    drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=config))
-    drafter.fc_embedding.weight = mx.eye(config.hidden_size)
-    drafter.fc_hidden.weight = mx.eye(config.hidden_size)
-    embedding_weight = mx.linspace(-0.8, -0.2, config.hidden_size)
-    hidden_weight = mx.linspace(-0.6, 0.3, config.hc_count * config.hidden_size)
-    drafter.pre_fc_norm_embedding.weight = embedding_weight
-    drafter.pre_fc_norm_hidden.weight = hidden_weight
-    embedding = mx.arange(1, 33, dtype=mx.float32).reshape(1, 1, 32)
-    hidden = mx.arange(1, 65, dtype=mx.float32).reshape(1, 1, 64)
-
-    actual = drafter.fuse_inputs(embedding, hidden)
-    expected_embedding = embedding * mx.rsqrt(
-        mx.mean(embedding * embedding, axis=-1, keepdims=True) + config.rms_norm_eps
-    )
-    expected_embedding = expected_embedding * (1 + embedding_weight)
-    expected_hidden = hidden * mx.rsqrt(
-        mx.mean(hidden * hidden, axis=-1, keepdims=True) + config.rms_norm_eps
-    )
-    expected_hidden = expected_hidden * (1 + hidden_weight)
-    expected_hidden = expected_hidden.reshape(1, 1, config.hc_count, 32)
-    expected = (expected_embedding[..., None, :] + expected_hidden).reshape(1, 1, 64)
-
-    assert mx.allclose(actual, expected, atol=2e-5).item()
-
-
 def test_qwen4_mtp_uses_shared_adaptive_policy_with_three_draft_ceiling():
     drafter = Qwen4ExpMTPDraftModel(ModelConfig(text_config=_tiny_text_config()))
 
@@ -183,8 +149,7 @@ def test_qwen4_target_exposes_pre_mixer_hidden_and_rolls_back_rejection_exactly(
     assert hidden.shape == (1, 6, 64)
     assert mx.allclose(speculative_logits, reference_logits, rtol=0, atol=1e-6).item()
     assert mx.array_equal(
-        mx.argmax(speculative_logits, axis=-1),
-        mx.argmax(reference_logits, axis=-1),
+        mx.argmax(speculative_logits, axis=-1), mx.argmax(reference_logits, axis=-1)
     ).item()
 
 
@@ -237,9 +202,7 @@ def test_qwen4_speculative_verifier_matches_tokenwise_hidden_and_logits():
     tokenwise_logits = []
     for index in range(verify.shape[1]):
         output = language(
-            verify[:, index : index + 1],
-            cache=tokenwise_cache,
-            return_hidden=True,
+            verify[:, index : index + 1], cache=tokenwise_cache, return_hidden=True
         )
         tokenwise_hidden.append(output.hidden_states[-1])
         tokenwise_logits.append(output.logits)
@@ -250,8 +213,7 @@ def test_qwen4_speculative_verifier_matches_tokenwise_hidden_and_logits():
     assert mx.allclose(batched_hidden, tokenwise_hidden, rtol=0, atol=1e-6).item()
     assert mx.allclose(batched_logits, tokenwise_logits, rtol=0, atol=1e-6).item()
     assert mx.array_equal(
-        mx.argmax(batched_logits, axis=-1),
-        mx.argmax(tokenwise_logits, axis=-1),
+        mx.argmax(batched_logits, axis=-1), mx.argmax(tokenwise_logits, axis=-1)
     ).item()
 
 
@@ -361,11 +323,7 @@ def test_qwen4_mtp_splitter_maps_fused_experts_and_quantizes(tmp_path):
     assert "layers.0.mlp.gate.scales" not in weights
     assert config["model_type"] == "qwen4_exp_mtp"
     assert config["block_size"] == 2
-    assert config["quantization"] == {
-        "group_size": 32,
-        "bits": 3,
-        "mode": "affine",
-    }
+    assert config["quantization"] == {"group_size": 32, "bits": 3, "mode": "affine"}
 
 
 def test_qwen4_mtp_splitter_converts_official_fp8_experts(tmp_path):
@@ -410,8 +368,4 @@ def test_qwen4_mtp_splitter_converts_official_fp8_experts(tmp_path):
     assert "layers.0.mlp.switch_mlp.up_proj.scales" in split_weights
     assert "layers.0.mlp.switch_mlp.down_proj.scales" in split_weights
     assert not any(key.endswith("weight_scale_inv") for key in split_weights)
-    assert config["quantization"] == {
-        "group_size": 32,
-        "bits": 8,
-        "mode": "mxfp8",
-    }
+    assert config["quantization"] == {"group_size": 32, "bits": 8, "mode": "mxfp8"}

@@ -11,14 +11,7 @@ def test_load_audio_uses_mlx_audio_io_and_returns_mono_float32(monkeypatch):
     def fake_read(file, dtype="float64"):
         calls.append((file, dtype))
         return (
-            np.array(
-                [
-                    [0.0, 1.0],
-                    [0.5, -0.5],
-                    [1.0, 0.0],
-                ],
-                dtype=np.float32,
-            ),
+            np.array([[0.0, 1.0], [0.5, -0.5], [1.0, 0.0]], dtype=np.float32),
             16000,
         )
 

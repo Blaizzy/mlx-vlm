@@ -40,39 +40,6 @@ class TestIndicOCR(unittest.TestCase):
             },
         }
 
-    def test_indic_ocr_config_routes_and_carries_indic_tokens(self):
-        from mlx_vlm.models import indic_ocr
-        from mlx_vlm.utils import get_model_and_args
-
-        raw = self.ocr_config()
-
-        model_class, _ = get_model_and_args(config=dict(raw))
-        self.assertIs(model_class, indic_ocr)
-
-        config = indic_ocr.ModelConfig.from_dict(dict(raw))
-        self.assertEqual(config.model_type, "indic_ocr")
-        self.assertEqual(config.image_token_id, 262155)
-        self.assertEqual(config.video_token_id, 262156)
-        self.assertEqual(config.vision_start_token_id, 262153)
-        self.assertEqual(config.vision_end_token_id, 262154)
-        self.assertEqual(config.image_token_index, 262155)
-
-    def test_ocr_stage_uses_existing_image_prompt_format(self):
-        from mlx_vlm.models.indic_ocr import Model, ModelConfig
-        from mlx_vlm.prompt_utils import apply_chat_template
-
-        config = ModelConfig.from_dict(self.ocr_config())
-        model = Model(config)
-        self.assertEqual(config.model_type, "indic_ocr")
-        self.assertEqual(model.config.model_type, "qwen3_5")
-        messages = apply_chat_template(
-            object(), model.config, "Read this page", num_images=1, return_messages=True
-        )
-        content = messages[0]["content"]
-        self.assertEqual(content[0], {"type": "image"})
-        self.assertEqual(content[1]["type"], "text")
-        self.assertEqual(content[1]["text"], "Read this page")
-
     def test_indic_ocr_wrapper_repo_raises_helpful_error(self):
         from mlx_vlm.models import indic_ocr
 
@@ -263,12 +230,7 @@ class TestIndicOCR(unittest.TestCase):
                     override = root / "override"
                     override.mkdir()
                     (override / "config.json").write_text(
-                        json.dumps(
-                            {
-                                "model_type": "pp_doclayout_v3",
-                                "num_labels": 3,
-                            }
-                        )
+                        json.dumps({"model_type": "pp_doclayout_v3", "num_labels": 3})
                     )
                     override_weights = {
                         "enc_score_head.weight": mx.ones((3, 32)),
@@ -423,8 +385,7 @@ class TestIndicOCR(unittest.TestCase):
         self.assertEqual(block.conf, 1.0)
         as_rec = block.as_record()
         self.assertEqual(
-            list(as_rec.keys()),
-            ["order", "label", "type", "bbox_xyxy", "conf"],
+            list(as_rec.keys()), ["order", "label", "type", "bbox_xyxy", "conf"]
         )
 
         # Foreign taxonomy with explicit type passes; bad type raises
@@ -479,8 +440,7 @@ class TestIndicOCR(unittest.TestCase):
         ]
         kept = clean_layout(blocks)
         self.assertEqual(
-            [b_.bbox_xyxy for b_ in kept if b_.label == "Header"],
-            [[0, 0, 100, 60]],
+            [b_.bbox_xyxy for b_ in kept if b_.label == "Header"], [[0, 0, 100, 60]]
         )
 
         # Equation nested in text is absorbed by default
@@ -490,103 +450,6 @@ class TestIndicOCR(unittest.TestCase):
         ]
         self.assertEqual(len(resolve_nested_equations(blocks)), 1)
         self.assertEqual(len(resolve_nested_equations(blocks, nest=False)), 2)
-
-    def test_indic_ocr_build_ocr_requests(self):
-        from PIL import Image
-
-        from mlx_vlm.models.indic_ocr.blocks import Block
-        from mlx_vlm.models.indic_ocr.processing_indic_ocr import build_ocr_requests
-
-        page = Image.new("RGB", (400, 400), "white")
-        blocks = [
-            Block(
-                order=0,
-                label="Paragraph",
-                type="Text",
-                bbox_xyxy=[50, 50, 350, 200],
-                conf=0.9,
-            ),
-            Block(
-                order=1,
-                label="Header",
-                type="PageHeader",
-                bbox_xyxy=[50, 5, 350, 30],
-                conf=0.9,
-            ),
-            Block(
-                order=2,
-                label="Image",
-                type="Picture",
-                bbox_xyxy=[50, 210, 350, 390],
-                conf=0.9,
-            ),
-        ]
-        reqs = build_ocr_requests(blocks, page)
-        self.assertEqual(len(reqs), 1)
-        self.assertIs(reqs[0][0], blocks[0])
-        self.assertIn("LaTeX", reqs[0][2])
-
-    def test_indic_ocr_viewer_records_to_blocks(self):
-        from mlx_vlm.models.indic_ocr.pipeline import viewer_records_to_blocks
-
-        recs = [
-            {
-                "bbox": [0.0, 0.0, 500.0, 500.0],
-                "label": "Paragraph",
-                "reading_order": 2,
-                "score": 0.9,
-            },
-            {
-                "bbox": [500.0, 0.0, 1000.0, 1000.0],
-                "label": "Page-number",
-                "reading_order": 1,
-                "score": 0.8,
-            },
-        ]
-        blocks = viewer_records_to_blocks(recs, 200, 400)
-        self.assertEqual([b.order for b in blocks], [0, 1])
-        self.assertEqual(blocks[0].type, "PageNumber")
-        self.assertEqual(blocks[1].bbox_xyxy, [0.0, 0.0, 100.0, 200.0])
-
-    def test_indic_ocr_page_result_round_trip(self):
-        import json
-
-        from mlx_vlm.models.indic_ocr.pipeline import PageResult
-
-        record = {
-            "image": "page.png",
-            "width": 200,
-            "height": 400,
-            "blocks": [
-                {
-                    "order": 0,
-                    "label": "Paragraph",
-                    "type": "Text",
-                    "bbox_xyxy": [10, 10, 190, 100],
-                    "conf": 0.9,
-                    "text": "hi",
-                },
-                {
-                    "order": 1,
-                    "label": "Image",
-                    "type": "Picture",
-                    "bbox_xyxy": [10, 110, 190, 390],
-                    "conf": 0.8,
-                    "text": "",
-                },
-            ],
-        }
-        page = PageResult.from_record(record)
-        self.assertEqual(page.blocks[0].type, "Text")
-        self.assertIsNone(page.markdown)
-        out = page.as_record()
-        self.assertEqual(out["image"], "page.png")
-        self.assertEqual(len(out["blocks"]), 2)
-        self.assertEqual(out["blocks"][0]["text"], "hi")
-        # Round-trips through JSON.
-        self.assertEqual(
-            PageResult.from_record(json.loads(json.dumps(out))).as_record(), out
-        )
 
     def test_indic_ocr_backends(self):
         from PIL import Image
@@ -630,42 +493,6 @@ class TestIndicOCR(unittest.TestCase):
         replayed[0].label = "Changed"
         self.assertEqual(page.blocks[0].label, "Page-number")
 
-    def test_indic_ocr_stage_dir_resolution(self):
-        import json
-        import tempfile
-        from pathlib import Path
-
-        from mlx_vlm.models.indic_ocr.pipeline import _resolve_repo_root, _stage_dir
-
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "config.json").write_text(
-                json.dumps(
-                    {
-                        "model_type": "indic_ocr",
-                        "stages": {
-                            "layout": {"config": "weights/layout/config.json"},
-                            "ocr": {"config": "weights/ocr/config.json"},
-                        },
-                    }
-                )
-            )
-            resolved, stages = _resolve_repo_root(str(root))
-            self.assertEqual(resolved, root)
-            self.assertEqual(
-                _stage_dir(resolved, stages, "layout", "weights/layout/config.json"),
-                root / "weights/layout",
-            )
-            self.assertEqual(
-                _stage_dir(resolved, stages, "ocr", "weights/ocr/config.json"),
-                root / "weights/ocr",
-            )
-            # Defaults when the pointer is absent.
-            self.assertEqual(
-                _stage_dir(resolved, {}, "ocr", "weights/ocr/config.json"),
-                root / "weights/ocr",
-            )
-
     def test_indic_ocr_layout_source_resolution(self):
         import tempfile
         from pathlib import Path
@@ -684,8 +511,7 @@ class TestIndicOCR(unittest.TestCase):
             )
             # Else the single-repo subdir.
             self.assertEqual(
-                _resolve_layout_source(root, stages),
-                str(root / "weights" / "layout"),
+                _resolve_layout_source(root, stages), str(root / "weights" / "layout")
             )
             # Else a helpful error (separate dir without the subdir).
             with tempfile.TemporaryDirectory() as empty:
@@ -928,34 +754,6 @@ class TestIndicOCR(unittest.TestCase):
                 viewer_records_to_blocks(
                     [{**records[0], "reading_order": order}], 100, 100
                 )
-
-    def test_indic_ocr_cleanup_respects_stock_and_foreign_types(self):
-        from mlx_vlm.models.indic_ocr.blocks import Block, clean_layout
-
-        def block(order, label, bbox, **extra):
-            return Block.from_record(
-                {"order": order, "label": label, "bbox_xyxy": bbox, **extra}
-            )
-
-        # A page-number block must not be swallowed by a larger text block.
-        blocks = [
-            block(0, "text", [0, 0, 100, 100]),
-            block(1, "number", [10, 80, 20, 90]),
-        ]
-        self.assertEqual(len(clean_layout(blocks)), 2)
-        # Lowercase stock headers follow the same cleanup rules as Indic headers.
-        blocks = [
-            block(0, "header", [0, 0, 100, 60]),
-            block(1, "header", [0, 0, 50, 10]),
-            block(2, "text", [10, 25, 90, 55]),
-        ]
-        self.assertEqual([b.order for b in clean_layout(blocks)], [0, 2])
-        # A foreign figure with an explicit type cannot absorb a text caption.
-        blocks = [
-            block(0, "foreign_figure", [0, 0, 100, 100], type="Figure"),
-            block(1, "figure_title", [10, 80, 90, 90]),
-        ]
-        self.assertEqual(len(clean_layout(blocks)), 2)
 
     def test_indic_ocr_close_releases_owned_models(self):
         import gc

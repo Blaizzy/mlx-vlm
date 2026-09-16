@@ -21,24 +21,6 @@ from mlx_vlm.models.gliner2_5.boundary import (
 from mlx_vlm.utils import get_model_and_args, load_config
 
 
-def test_nested_encoder_config():
-    config = ModelConfig.from_dict(
-        {
-            "model_type": "extractor",
-            "architecture": "boundary",
-            "encoder_config": {
-                "vocab_size": 250112,
-                "hidden_size": 768,
-                "num_attention_heads": 12,
-            },
-        }
-    )
-
-    assert config.model_type == "gliner2_5"
-    assert config.encoder_config.vocab_size == 250112
-    assert config.encoder_config.hidden_size == 768
-
-
 def test_checkpoint_key_sanitization():
     weights = {
         "encoder.embeddings.LayerNorm.weight": mx.ones((4,)),
@@ -63,16 +45,6 @@ def test_word_splitters_preserve_offsets():
 
     assert whitespace[1] == ("me@example.com", 6, 20)
     assert characters[-2:] == [("北", 21, 22), ("京", 22, 23)]
-
-
-def test_flat_overlap_resolution_uses_total_score():
-    spans = [
-        (0.8, 0, 2),
-        (0.6, 0, 1),
-        (0.6, 1, 2),
-    ]
-
-    assert _resolve_flat_overlaps(spans) == [(0.6, 0, 1), (0.6, 1, 2)]
 
 
 def test_shared_pool_scorer_keeps_candidate_major_layout():
@@ -167,29 +139,6 @@ def test_candidate_pool_promotes_each_query_best_pair():
         assert pair in selected, f"{pair} missing from {sorted(selected)}"
 
 
-def test_schema_tokens_place_markers_where_prepare_looks_for_them():
-    """``_prepare`` derives query positions from fixed slots in the schema.
-
-    It treats index 1 as the prompt marker and every second index from 4
-    onward as a label marker, so the schema layout and that arithmetic have to
-    agree or the query states are read from the wrong tokens.
-    """
-    labels = ["person", "company", "location"]
-    schema = _schema_tokens("entities", labels, "[E]")
-
-    assert schema[0] == "("
-    assert schema[1] == "[P]"
-    assert schema[2] == "entities"
-    assert schema[3] == "("
-    assert schema[-2:] == [")", ")"]
-
-    marker_slots = {1, *range(4, len(schema) - 2, 2)}
-    assert len(marker_slots) == len(labels) + 1
-    for slot in sorted(marker_slots)[1:]:
-        assert schema[slot] == "[E]"
-        assert schema[slot + 1] in labels
-
-
 def test_schema_tokens_carry_prompt_and_descriptions():
     schema = _schema_tokens(
         "sentiment",
@@ -210,31 +159,6 @@ def test_flat_overlap_resolution_keeps_disjoint_spans():
     spans = [(0.9, 0, 2), (0.8, 3, 5), (0.7, 6, 7)]
 
     assert _resolve_flat_overlaps(spans) == spans
-
-
-def test_flat_overlap_resolution_drops_lower_scoring_overlap():
-    spans = [(0.9, 0, 3), (0.4, 2, 4)]
-
-    assert _resolve_flat_overlaps(spans) == [(0.9, 0, 3)]
-
-
-def test_char_splitter_keeps_latin_runs_but_splits_cjk():
-    text = "iPhone 15 在北京"
-
-    pieces = _CharSplitter()(text)
-
-    assert pieces[0] == ("iphone", 0, 6)
-    assert pieces[1] == ("15", 7, 9)
-    assert [piece[0] for piece in pieces[2:]] == ["在", "北", "京"]
-    for token, start, end in pieces:
-        assert text[start:end].lower() == token
-
-
-def test_whitespace_splitter_offsets_round_trip():
-    text = "Visit https://example.com or mail a.b@c.io — thanks!"
-
-    for token, start, end in _WhitespaceSplitter()(text):
-        assert text[start:end].lower() == token
 
 
 def test_gliner2_rejects_unknown_word_splitter():

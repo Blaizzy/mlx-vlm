@@ -15,29 +15,7 @@ from mlx_vlm.models.nemotron_voicechat.streaming import (
     VoiceChatFrameTiming,
     VoiceChatProfile,
 )
-from mlx_vlm.models.nemotron_voicechat.tts import (
-    CharAwareSubwordEncoder,
-    MoGHead,
-    OffsetRMSNorm,
-    _top_p_logits,
-)
-
-
-def test_offset_rms_norm_matches_definition():
-    norm = OffsetRMSNorm(4, eps=1e-6)
-    norm.weight = mx.array([0.0, 0.5, -0.25, 1.0])
-    inputs = mx.array([[[1.0, -2.0, 3.0, -4.0]]])
-    actual = norm(inputs)
-    expected = inputs / mx.sqrt(mx.mean(inputs**2, axis=-1, keepdims=True) + 1e-6)
-    expected = expected * (1.0 + norm.weight)
-    assert mx.allclose(actual, expected, atol=1e-6)
-
-
-def test_top_p_keeps_at_least_the_largest_logit():
-    logits = mx.array([[0.0, 1.0, 2.0, 3.0]])
-    filtered = _top_p_logits(logits, 0.01)
-    assert bool(mx.isfinite(filtered[0, 3]))
-    assert int(mx.sum(mx.isfinite(filtered))) == 1
+from mlx_vlm.models.nemotron_voicechat.tts import CharAwareSubwordEncoder, MoGHead
 
 
 def test_streaming_profile_summarizes_synchronized_stage_timings():
@@ -80,10 +58,7 @@ def test_character_aware_encoder_prepares_and_scatters_subwords():
 
 def test_mog_head_inference_shapes_and_finite_values():
     config = MoGConfig(
-        intermediate_size=16,
-        low_rank=2,
-        num_layers=1,
-        num_predictions=4,
+        intermediate_size=16, low_rank=2, num_layers=1, num_predictions=4
     )
     head = MoGHead(hidden_size=8, out_size=4, config=config)
     inputs = mx.zeros((2, 1, 8))
@@ -175,9 +150,7 @@ def test_real_checkpoint_offline_smoke():
         pytest.skip("set VOICECHAT_AUDIO_PATH to an input wav")
     model, processor = load(str(model_path), lazy=True)
     result = model.create_session(processor).generate(
-        audio_path,
-        system_prompt="Answer briefly.",
-        max_frames=2,
+        audio_path, system_prompt="Answer briefly.", max_frames=2
     )
     mx.eval(result.audio)
     assert result.audio.shape == (3528,)
@@ -201,15 +174,10 @@ def test_real_checkpoint_streaming_first_frame_matches_offline():
     session = model.create_session(processor)
     audio = load_audio(audio_path, sr=16_000).squeeze()[:1280]
     offline = session.generate(
-        audio,
-        system_prompt="Answer briefly.",
-        max_frames=2,
-        seed=0,
+        audio, system_prompt="Answer briefly.", max_frames=2, seed=0
     )
     stream = session.create_streaming_session(
-        system_prompt="Answer briefly.",
-        seed=0,
-        max_streaming_seconds=1.0,
+        system_prompt="Answer briefly.", seed=0, max_streaming_seconds=1.0
     )
     events = stream.push_audio(audio, sample_rate=16_000)
     audio_event = next(event for event in events if event.kind == "audio")

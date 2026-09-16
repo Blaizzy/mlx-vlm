@@ -68,12 +68,7 @@ def _make_source(tmp_path):
     for shard_name, weights in zip(shard_names, (shard1, shard2, mtp)):
         weight_map.update({key: shard_name for key in weights})
     (source / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "metadata": {"total_size": 123456},
-                "weight_map": weight_map,
-            }
-        )
+        json.dumps({"metadata": {"total_size": 123456}, "weight_map": weight_map})
     )
     return source
 
@@ -182,10 +177,7 @@ def test_dedicated_converter_resolves_source_and_extracts_dspark(tmp_path, monke
     assert calls["output_path"] == output
     assert calls["dspark_source"] == str(source)
     assert calls["dspark_output"] == str(drafter)
-    assert calls["card"] == (
-        output,
-        "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp",
-    )
+    assert calls["card"] == (output, "deepseek-ai/DeepSeek-V4-Flash-Vision-Exp")
     assert calls["upload"] == (output, "mlx-community/test-model")
 
 

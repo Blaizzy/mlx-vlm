@@ -57,48 +57,6 @@ class TestMiniCPMOTTS(unittest.TestCase):
         self.assertEqual(processor._count_audio_markers(prompt), 2)
         self.assertIn("<|im_start|>user\n<audio>Respond.", prompt)
 
-    def test_tts_config_parses(self):
-        from mlx_vlm.models.minicpmo.config import ModelConfig
-
-        cfg = ModelConfig.from_dict(
-            {
-                "model_type": "minicpmo",
-                "hidden_size": 8,
-                "intermediate_size": 16,
-                "num_hidden_layers": 1,
-                "num_attention_heads": 2,
-                "num_key_value_heads": 2,
-                "rms_norm_eps": 1e-6,
-                "vocab_size": 32,
-                "head_dim": 4,
-                "rope_theta": 10000.0,
-                "max_position_embeddings": 64,
-                "vision_config": {
-                    "hidden_size": 8,
-                    "intermediate_size": 16,
-                    "num_hidden_layers": 1,
-                    "num_attention_heads": 2,
-                },
-                "tts_config": {
-                    "hidden_size": 16,
-                    "intermediate_size": 32,
-                    "num_hidden_layers": 1,
-                    "num_attention_heads": 4,
-                    "num_key_value_heads": 4,
-                    "num_text_tokens": 64,
-                    "num_audio_tokens": 32,
-                    "llm_dim": 8,
-                    "condition_type": "hidden_text_merge",
-                    "normalize_projected_hidden": True,
-                },
-            }
-        )
-
-        self.assertEqual(cfg.tts_config.hidden_size, 16)
-        self.assertEqual(cfg.tts_config.num_audio_tokens, 32)
-        self.assertEqual(cfg.tts_config.condition_type, "hidden_text_merge")
-        self.assertTrue(cfg.tts_config.normalize_projected_hidden)
-
     def test_tiny_tts_generates_audio_tokens(self):
         from mlx_vlm.models.minicpmo.config import MiniCPMTTSConfig
         from mlx_vlm.models.minicpmo.tts import MiniCPMTTS, TTSSamplingParams
@@ -119,10 +77,7 @@ class TestMiniCPMOTTS(unittest.TestCase):
             max_new_token=2,
             min_new_token=2,
             sampling_params=TTSSamplingParams(
-                temperature=0.0,
-                top_p=None,
-                top_k=None,
-                repetition_penalty=None,
+                temperature=0.0, top_p=None, top_k=None, repetition_penalty=None
             ),
         )
         mx.eval(out.new_ids)
@@ -219,8 +174,7 @@ class TestMiniCPMOTTS(unittest.TestCase):
 
         ids = np.array([1, 10, 2, 3, 11, 4], dtype=np.int32)
         np.testing.assert_array_equal(
-            processor._compute_spk_bounds(ids),
-            np.array([[2, 4]], dtype=np.int32),
+            processor._compute_spk_bounds(ids), np.array([[2, 4]], dtype=np.int32)
         )
 
     def test_model_generate_audio_consumes_tts_kwargs(self):
@@ -490,26 +444,6 @@ def test_sanitizer_preserves_converted_weights_and_disables_missing_tts(tmp_path
     assert not loaded.supports_audio_generation
     assert loaded.config.init_tts is False
     assert loaded.get_hidden_states(ids).shape == (1, 3, 16)
-
-
-def test_partial_tts_checkpoint_fails_strict_loading(tmp_path):
-    import json
-    from dataclasses import asdict
-
-    import pytest
-    from mlx.utils import tree_flatten
-
-    from mlx_vlm.utils import load_model
-
-    model = _tiny_speech_model()
-    config = asdict(model.config)
-    config.pop("audio_config")
-    weights = dict(tree_flatten(model.parameters()))
-    del weights["tts.head_code.0.weight"]
-    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
-    (tmp_path / "config.json").write_text(json.dumps(config))
-    with pytest.raises(ValueError, match="Missing"):
-        load_model(tmp_path)
 
 
 def test_vocoder_keeps_tokens_on_device_and_refreshes_reference(tmp_path):

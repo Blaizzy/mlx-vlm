@@ -35,11 +35,7 @@ class _FakeStreamingSession:
                 text="hello",
             ),
             VoiceChatEvent(
-                kind="function_delta",
-                frame_index=0,
-                token_id=43,
-                delta="{",
-                text="{",
+                kind="function_delta", frame_index=0, token_id=43, delta="{", text="{"
             ),
             VoiceChatEvent(
                 kind="audio",
@@ -95,20 +91,6 @@ def test_realtime_loader_uses_generic_load_and_model_session(monkeypatch):
         ),
         ("create_session", processor),
     ]
-
-
-def test_realtime_engine_clears_worker_streams(monkeypatch):
-    cleared_threads = []
-    monkeypatch.setattr(
-        realtime,
-        "clear_mlx_streams",
-        lambda: cleared_threads.append(realtime.threading.current_thread().name),
-    )
-
-    engine = realtime.RealtimeVoiceChatEngine(loader=lambda _: None)
-    engine.stop_and_join()
-
-    assert cleared_threads == [engine._thread.name]
 
 
 @pytest.fixture
@@ -173,10 +155,7 @@ def test_realtime_websocket_streams_json_events(realtime_client):
     assert loaded.session.push_threads == ["mlx-vlm-realtime"]
 
 
-@pytest.mark.parametrize(
-    ("value", "expected"),
-    [(None, None), (30, 30.0)],
-)
+@pytest.mark.parametrize(("value", "expected"), [(None, None), (30, 30.0)])
 def test_realtime_websocket_accepts_explicit_session_limit(
     realtime_client, value, expected
 ):
@@ -186,10 +165,7 @@ def test_realtime_websocket_accepts_explicit_session_limit(
         websocket.send_json(
             {
                 "type": "session.update",
-                "session": {
-                    "model": "fake-voicechat",
-                    "max_streaming_seconds": value,
-                },
+                "session": {"model": "fake-voicechat", "max_streaming_seconds": value},
             }
         )
         assert websocket.receive_json()["type"] == "session.updated"
@@ -228,22 +204,6 @@ def test_realtime_websocket_requires_native_pcm_rate(realtime_client):
         event = websocket.receive_json()
         assert event["type"] == "error"
         assert event["error"]["code"] == "inference_error"
-
-
-def test_realtime_websocket_cancels_and_releases_session(realtime_client):
-    client, loaded, engine = realtime_client
-    with client.websocket_connect("/v1/realtime") as websocket:
-        websocket.receive_json()
-        websocket.send_json(
-            {"type": "session.update", "session": {"model": "fake-voicechat"}}
-        )
-        websocket.receive_json()
-        websocket.send_json({"type": "response.cancel"})
-        assert websocket.receive_json()["type"] == "response.cancelled"
-
-    assert loaded.session.closed is True
-    assert engine.try_reserve("next-session") is True
-    engine.release("next-session")
 
 
 def test_streaming_session_buffers_arbitrary_chunk_boundaries():

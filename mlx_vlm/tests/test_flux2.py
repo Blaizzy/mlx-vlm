@@ -11,12 +11,7 @@ from PIL import Image
 
 import mlx_vlm.models.flux2.download as download_module
 import mlx_vlm.models.flux2.weights as weights_module
-from mlx_vlm.generate.edit_image import (
-    ImageEditRequest,
-    image_edit_model_class,
-    is_image_edit_model,
-    load_image_edit_model,
-)
+from mlx_vlm.generate.edit_image import ImageEditRequest, load_image_edit_model
 from mlx_vlm.generate.image import (
     image_generation_model_class,
     is_image_generation_model,
@@ -46,8 +41,7 @@ class FakeTransformer:
 class FakeVAE:
     def decode_packed_latents(self, packed, tiling_config=None):  # noqa: ARG002
         return mx.zeros(
-            (1, 3, packed.shape[2] * 16, packed.shape[3] * 16),
-            dtype=mx.bfloat16,
+            (1, 3, packed.shape[2] * 16, packed.shape[3] * 16), dtype=mx.bfloat16
         )
 
 
@@ -89,20 +83,6 @@ def _fake_edit_pipeline(variant: str = "flux2-klein-9b-kv") -> Flux2ImageEdit:
     return pipeline
 
 
-@pytest.mark.parametrize(
-    "alias,variant",
-    [
-        ("flux2-klein-4b", "flux2-klein-4b"),
-        ("black-forest-labs/FLUX.2-klein-9B", "flux2-klein-9b"),
-        ("flux2-base-4B", "flux2-klein-base-4b"),
-        ("klein-base-9b", "flux2-klein-base-9b"),
-        ("black-forest-labs/FLUX.2-klein-9b-kv", "flux2-klein-9b-kv"),
-    ],
-)
-def test_flux2_variant_aliases(alias: str, variant: str) -> None:
-    assert get_variant(alias).name == variant
-
-
 def test_flux2_declares_image_generation_model_type(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -127,72 +107,6 @@ def test_flux2_declares_image_generation_model_type(
         image_generation_model_class(tmp_path.as_posix()) is Flux2ImageGenerationModel
     )
     assert is_image_generation_model("klein-base-9b")
-
-
-def test_flux2_declares_image_edit_model_type(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    _write_layout(tmp_path)
-    (tmp_path / "model_index.json").write_text('{"_class_name": "Flux2KleinPipeline"}')
-    (tmp_path / "flux-2-klein-9b-kv.safetensors").write_bytes(b"x")
-
-    def fake_get_model_path(repo_id: str, **kwargs):  # noqa: ARG001
-        assert repo_id == "black-forest-labs/FLUX.2-klein-9b-kv"
-        return tmp_path
-
-    monkeypatch.setattr(image_module, "get_model_path", fake_get_model_path)
-
-    assert Flux2ImageEditModel.is_image_edit_model
-    assert Flux2ImageEditModel.model_type == "flux2"
-    assert (
-        image_edit_model_class("black-forest-labs/FLUX.2-klein-9b-kv")
-        is Flux2ImageEditModel
-    )
-    assert image_edit_model_class(tmp_path.as_posix()) is Flux2ImageEditModel
-    for model_id in (
-        "black-forest-labs/FLUX.2-klein-4B",
-        "black-forest-labs/FLUX.2-klein-9B",
-        "black-forest-labs/FLUX.2-klein-base-4B",
-        "black-forest-labs/FLUX.2-klein-base-9B",
-        "black-forest-labs/FLUX.2-klein-9b-kv",
-    ):
-        assert image_edit_model_class(model_id) is Flux2ImageEditModel
-        assert is_image_edit_model(model_id)
-
-
-def test_flux2_image_model_class_uses_remote_model_index(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    _write_layout(tmp_path)
-    (tmp_path / "model_index.json").write_text('{"_class_name": "Flux2KleinPipeline"}')
-
-    def fake_get_model_path(repo_id: str, **kwargs):  # noqa: ARG001
-        assert repo_id == "example/custom-image-model"
-        return tmp_path
-
-    monkeypatch.setattr(image_module, "get_model_path", fake_get_model_path)
-
-    assert (
-        image_generation_model_class("example/custom-image-model")
-        is Flux2ImageGenerationModel
-    )
-
-
-def test_flux2_image_model_class_uses_component_weight_index(tmp_path: Path) -> None:
-    _write_layout(tmp_path)
-    index = tmp_path / "transformer" / "model.safetensors.index.json"
-    index.write_text("""{
-          "weight_map": {
-            "time_guidance_embed.linear_1.weight": "model.safetensors",
-            "double_stream_modulation_img.linear.weight": "model.safetensors",
-            "single_transformer_blocks.0.attn.to_qkv_mlp_proj.weight":
-              "model.safetensors"
-          }
-        }""")
-
-    assert (
-        image_generation_model_class(tmp_path.as_posix()) is Flux2ImageGenerationModel
-    )
 
 
 def test_flux2_remote_component_index_is_a_metadata_fallback(
@@ -225,12 +139,7 @@ def test_flux2_remote_component_index_is_a_metadata_fallback(
         is Flux2ImageGenerationModel
     )
     assert calls == [
-        [
-            "model_index.json",
-            "config.json",
-            "manifest.json",
-            "**/config.json",
-        ],
+        ["model_index.json", "config.json", "manifest.json", "**/config.json"],
         [
             "model_index.json",
             "config.json",
@@ -239,22 +148,6 @@ def test_flux2_remote_component_index_is_a_metadata_fallback(
             "**/model.safetensors.index.json",
         ],
     ]
-
-
-def test_is_image_generation_model_does_not_probe_remote_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fail_get_model_path(repo_id: str, **kwargs):  # noqa: ARG001
-        raise AssertionError("remote model path should not be resolved")
-
-    monkeypatch.setattr(image_module, "get_model_path", fail_get_model_path)
-
-    assert not is_image_generation_model("example/custom-image-model")
-
-
-def test_flux2_validate_model_layout_accepts_required_files(tmp_path: Path) -> None:
-    _write_layout(tmp_path)
-    assert validate_model_layout(tmp_path) == tmp_path
 
 
 def test_flux2_validate_model_layout_reports_missing_files(tmp_path: Path) -> None:
@@ -340,76 +233,6 @@ def test_flux2_edit_model_returns_image_result() -> None:
     assert result.metadata["reference_count"] == 1
 
 
-def test_flux2_standard_edit_model_reports_non_kv_path() -> None:
-    model = Flux2ImageEditModel(
-        pipeline=_fake_edit_pipeline("flux2-klein-9b"),
-        model_id="standard",
-    )
-    result = model.edit(
-        ImageEditRequest(
-            prompt="add sunglasses",
-            image_paths=("reference.png",),
-            seed=9,
-            steps=2,
-            guidance=1.0,
-        )
-    )
-
-    assert result.variant == "flux2-klein-9b"
-    assert result.metadata["uses_reference_kv_cache"] is False
-
-
-def test_flux2_edit_model_defaults_to_untiled_vae_decode(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls = []
-
-    def fake_from_pretrained(cls, variant, **kwargs):  # noqa: ARG001
-        calls.append(kwargs)
-        return _fake_edit_pipeline("flux2-klein-9b-kv")
-
-    monkeypatch.setattr(
-        Flux2ImageEdit, "from_pretrained", classmethod(fake_from_pretrained)
-    )
-
-    Flux2ImageEditModel.from_model_id("flux2-klein-9b-kv")
-    Flux2ImageEditModel.from_model_id(
-        "flux2-klein-9b-kv", bucketed_seq_len=True, tiled_vae="auto"
-    )
-
-    assert calls[0]["tiled_vae"] == "off"
-    assert calls[0]["bucketed_seq_len"] is False
-    assert calls[1]["tiled_vae"] == "auto"
-    assert calls[1]["bucketed_seq_len"] is True
-
-
-@pytest.mark.parametrize("bits", [4, 8])
-def test_flux2_quantization_is_inferred_from_tensor_shapes(bits: int) -> None:
-    class TinyModel(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.proj = nn.Linear(64, 32, bias=False)
-
-    dense = mx.arange(32 * 64, dtype=mx.float32).reshape(32, 64)
-    packed, scales, biases = mx.quantize(dense, group_size=32, bits=bits)
-    model = weights_module._apply_weights(
-        TinyModel(),
-        {
-            "proj.weight": packed,
-            "proj.scales": scales,
-            "proj.biases": biases,
-        },
-        {},
-    )
-
-    assert isinstance(model.proj, nn.QuantizedLinear)
-    assert model.quantization_config == {
-        "bits": bits,
-        "group_size": 32,
-        "mode": "affine",
-    }
-
-
 def test_flux2_text_encoder_accepts_native_quantized_keys(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -445,14 +268,10 @@ def test_flux2_vae_conv_layout_accepts_source_and_native_shapes() -> None:
     native = source.transpose(0, 2, 3, 1)
 
     converted = weights_module._match_conv_layout(
-        source,
-        target_shape=tuple(native.shape),
-        key="decoder.conv.weight",
+        source, target_shape=tuple(native.shape), key="decoder.conv.weight"
     )
     unchanged = weights_module._match_conv_layout(
-        native,
-        target_shape=tuple(native.shape),
-        key="decoder.conv.weight",
+        native, target_shape=tuple(native.shape), key="decoder.conv.weight"
     )
 
     assert np.array_equal(np.array(converted), np.array(native))

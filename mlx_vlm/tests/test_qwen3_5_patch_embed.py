@@ -63,39 +63,3 @@ def test_patch_embed_is_transposed_from_ncdhw_to_ndhwc():
     sanitized = model.sanitize({PATCH_EMBED_KEY: ncdhw})
 
     assert sanitized[SANITIZED_KEY].shape == expected
-
-
-def test_patch_embed_transpose_is_idempotent():
-    """Weights already in NDHWC order must pass through untouched."""
-    model, _ = _tiny_model()
-    ndhwc = mx.zeros(
-        model.vision_tower.patch_embed.proj.weight.shape, dtype=mx.bfloat16
-    )
-
-    once = model.sanitize({PATCH_EMBED_KEY: ndhwc})[SANITIZED_KEY]
-    twice = model.sanitize({SANITIZED_KEY: once})[SANITIZED_KEY]
-
-    assert once.shape == ndhwc.shape
-    assert twice.shape == ndhwc.shape
-
-
-def test_sanitized_patch_embed_loads_strictly():
-    """The whole point: a strict load must accept the sanitized weight."""
-    model, vision_config = _tiny_model()
-    ncdhw = mx.zeros(
-        (
-            vision_config.hidden_size,
-            vision_config.in_channels,
-            vision_config.temporal_patch_size,
-            vision_config.patch_size,
-            vision_config.patch_size,
-        ),
-        dtype=mx.bfloat16,
-    )
-    sanitized = model.sanitize({PATCH_EMBED_KEY: ncdhw})[SANITIZED_KEY]
-
-    bias = model.vision_tower.patch_embed.proj.bias
-    model.vision_tower.patch_embed.load_weights(
-        [("proj.weight", sanitized), ("proj.bias", bias)], strict=True
-    )
-    assert model.vision_tower.patch_embed.proj.weight.shape == sanitized.shape

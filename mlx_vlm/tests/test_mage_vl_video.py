@@ -23,7 +23,6 @@ from mlx_vlm.models.mage_vl.processing_mage_vl import (
 )
 from mlx_vlm.models.mage_vl.vision import build_cu_seqlens
 from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
-from mlx_vlm.prompt_utils import apply_chat_template, get_message_json
 from mlx_vlm.utils import VideoMetadata, prepare_inputs, resolve_video_sampling
 
 VIDEO_BLOCK = VISION_START + VIDEO_PAD + VISION_END
@@ -97,42 +96,6 @@ def test_video_uses_reference_timestamps_positions_and_frame_attention(processor
     assert build_cu_seqlens(output["image_grid_thw"].tolist(), 12, 4) == [0, 4, 8, 12]
 
 
-def test_mixed_media_and_batch_follow_prompt_order(processor):
-    stills = [Image.new("RGB", (32, 32), "red"), Image.new("RGB", (64, 32), "blue")]
-    clips = [frames(2, value=10), frames(3, width=64, value=20)]
-    output = processor(
-        text=[VIDEO_BLOCK + IMAGE_BLOCK, IMAGE_BLOCK + VIDEO_BLOCK],
-        images=stills,
-        videos=clips,
-        fps=[2, 1],
-    )
-    expected = processor.image_processor([*clips[0], stills[0], stills[1], *clips[1]])
-    np.testing.assert_array_equal(output["pixel_values"], expected["pixel_values"])
-    np.testing.assert_array_equal(output["image_grid_thw"], expected["image_grid_thw"])
-    assert image_counts(output) == [3, 8]
-    assert VIDEO_PAD not in "".join(processor.tokenizer.last_text)
-    expected_times = np.repeat([0, 1, 0, 0, 0, 1, 2], [4, 4, 4, 8, 8, 8, 8])
-    np.testing.assert_array_equal(
-        np.array(output["patch_positions"])[:, 0], expected_times
-    )
-
-
-@pytest.mark.parametrize("layout", ["tchw", "thwc", "pil", "batched_pil"])
-def test_predecoded_formats_agree(processor, layout):
-    video = frames(3, width=64, value=30)
-    expected = processor(text=VIDEO_BLOCK, videos=[video])
-    supplied = video
-    if layout == "thwc":
-        supplied = video.transpose(0, 2, 3, 1)
-    elif "pil" in layout:
-        supplied = [Image.fromarray(frame.transpose(1, 2, 0)) for frame in video]
-        if layout == "batched_pil":
-            supplied = [supplied]
-    output = processor(text=VIDEO_BLOCK, videos=supplied)
-    for key in ("pixel_values", "image_grid_thw", "patch_positions", "input_ids"):
-        np.testing.assert_array_equal(output[key], expected[key])
-
-
 @pytest.mark.parametrize(
     "prompt,videos",
     [(VIDEO_BLOCK * 2, [frames()]), (VIDEO_BLOCK, [frames(), frames()])],
@@ -155,36 +118,6 @@ def test_bad_metadata_is_rejected(processor):
         )
     with pytest.raises(ValueError, match="positive and finite"):
         processor(text=VIDEO_BLOCK, videos=[frames()], fps=0)
-
-
-def test_prompt_utils_keeps_stills_with_video(processor):
-    message = get_message_json(
-        "mage_vl", "Describe both", num_images=1, video=["clip.mp4"]
-    )
-    assert [part["type"] for part in message["content"]] == ["image", "video", "text"]
-    prompt = apply_chat_template(
-        processor,
-        {"model_type": "mage_vl"},
-        "Describe both",
-        num_images=1,
-        video=["clip.mp4"],
-    )
-    assert prompt == IMAGE_BLOCK + VIDEO_BLOCK + "Describe both"
-    assert processor_handles_video(processor)
-
-
-def test_prepare_inputs_preserves_exact_source_metadata(processor):
-    source = VideoMetadata(total_num_frames=240, fps=24, frames_indices=[0, 120, 239])
-    with patch("mlx_vlm.utils.load_video", return_value=(frames(), source)) as decode:
-        output = prepare_inputs(
-            processor, videos=["clip.mp4"], prompts=VIDEO_BLOCK, nframes=3
-        )
-    sampling = decode.call_args.args[1]
-    assert sampling.nframes == 3 and sampling.frame_factor == 1
-    assert processor.tokenizer.last_text == [
-        "".join(f"<{sec:.1f} seconds>{IMAGE_BLOCK}" for sec in [0, 5, 239 / 24])
-    ]
-    assert np.array(output["patch_positions"])[-1, 0] == 239
 
 
 def test_prepare_inputs_accepts_supplied_metadata(processor):

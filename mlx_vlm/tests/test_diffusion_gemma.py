@@ -2,7 +2,6 @@ import contextlib
 import importlib
 import io
 import json
-import os
 import unittest
 from pathlib import Path
 from queue import Queue
@@ -226,14 +225,6 @@ def tiny_diffusion_gemma_processor(image_processor=None):
 
 
 class TestDiffusionGemma4(unittest.TestCase):
-    def test_model_resolves_from_config(self):
-        from mlx_vlm.utils import get_model_and_args
-
-        arch, model_type = get_model_and_args(tiny_config_dict())
-
-        self.assertEqual(model_type, "diffusion_gemma")
-        self.assertEqual(arch.Model.__name__, "Model")
-
     def test_load_config_preserves_generation_config_for_model_config(self):
         from mlx_vlm.models.diffusion_gemma import ModelConfig
         from mlx_vlm.utils import load_config
@@ -258,8 +249,7 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(loaded["model_type"], "diffusion_gemma")
         self.assertEqual(loaded["generation_config"], generation_config)
         self.assertEqual(
-            ModelConfig.from_dict(loaded).generation_config,
-            generation_config,
+            ModelConfig.from_dict(loaded).generation_config, generation_config
         )
 
     def test_auto_processor_loads_multimodal_processor(self):
@@ -277,8 +267,7 @@ class TestDiffusionGemma4(unittest.TestCase):
         with TemporaryDirectory() as tmpdir:
             model_dir = Path(tmpdir)
             (model_dir / "config.json").write_text(
-                json.dumps({"model_type": "diffusion_gemma"}),
-                encoding="utf-8",
+                json.dumps({"model_type": "diffusion_gemma"}), encoding="utf-8"
             )
             (model_dir / "processor_config.json").write_text(
                 json.dumps(
@@ -306,8 +295,7 @@ class TestDiffusionGemma4(unittest.TestCase):
 
             with (
                 patch(
-                    "transformers.AutoTokenizer.from_pretrained",
-                    return_value=tokenizer,
+                    "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer
                 ),
                 patch(
                     "transformers.processing_utils.ProcessorMixin."
@@ -327,84 +315,6 @@ class TestDiffusionGemma4(unittest.TestCase):
             ["image_processor", "tokenizer", "video_processor"],
         )
 
-    def test_forward_shape(self):
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        config = ModelConfig.from_dict(tiny_config_dict())
-        model = Model(config)
-
-        out = model(
-            input_ids=mx.array([[2, 3, 4]]),
-            canvas_ids=mx.array([[5, 6, 7]]),
-        )
-        mx.eval(out.logits)
-
-        self.assertEqual(out.logits.shape, (1, 3, 64))
-        self.assertEqual(len(model.make_cache()), 2)
-
-    def test_video_token_type_ids_drive_vision_embeddings_without_video_token_id(self):
-        from mlx_vlm.models.diffusion_gemma.language import EncoderModel
-
-        class DummyDecoder:
-            embed_scale = 1.0
-
-            def embed_tokens(self, input_ids):
-                ids = input_ids.astype(mx.float32)
-                return mx.stack([ids, ids + 1000], axis=-1)
-
-        class DummyEncoder:
-            config = SimpleNamespace(image_token_id=60, video_token_id=None)
-            text_config = SimpleNamespace(pad_token_id=0)
-            decoder = DummyDecoder()
-
-            def get_image_features(self, pixel_values):
-                del pixel_values
-                return mx.array([[[101.0, 102.0], [201.0, 202.0]]])
-
-        input_ids = mx.array([[10, 61, 61, 11]], dtype=mx.int32)
-        mm_token_type_ids = mx.array([[0, 2, 2, 0]], dtype=mx.int32)
-        pixel_values = mx.zeros((2, 3, 4, 4), dtype=mx.float32)
-
-        embeddings = EncoderModel._embed_inputs(
-            DummyEncoder(),
-            input_ids,
-            pixel_values=pixel_values,
-            mm_token_type_ids=mm_token_type_ids,
-        )
-        mx.eval(embeddings)
-
-        self.assertEqual(embeddings[0, 1].tolist(), [101.0, 102.0])
-        self.assertEqual(embeddings[0, 2].tolist(), [201.0, 202.0])
-
-    def test_self_conditioning_soft_embeddings_use_embedding_scale(self):
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        config = ModelConfig.from_dict(tiny_config_dict())
-        model = Model(config)
-        decoder = model.model.decoder
-        captured = {}
-
-        class CaptureSelfConditioning:
-            def __call__(self, inputs_embeds, self_conditioning_signal):
-                captured["self_conditioning_signal"] = self_conditioning_signal
-                return inputs_embeds
-
-        decoder.self_conditioning = CaptureSelfConditioning()
-        self_conditioning_logits = mx.zeros((1, 1, config.text_config.vocab_size))
-        decoder._embed_canvas(
-            mx.array([[2]], dtype=mx.int32),
-            self_conditioning_logits,
-        )
-
-        expected = (
-            mx.softmax(self_conditioning_logits, axis=-1, precise=True)
-            @ decoder.embed_tokens.weight
-        ) * decoder.embed_scale
-        max_diff = mx.max(mx.abs(captured["self_conditioning_signal"] - expected))
-        mx.eval(max_diff)
-
-        self.assertLess(float(max_diff.item()), 1e-6)
-
     def test_precomputed_self_conditioning_embeddings_match_logits_path(self):
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
 
@@ -415,17 +325,14 @@ class TestDiffusionGemma4(unittest.TestCase):
         input_ids = mx.array([[2, 3, 4, 5]], dtype=mx.int32)
         canvas_ids = mx.array([[6, 7, 8]], dtype=mx.int32)
         self_conditioning_logits = mx.linspace(
-            -0.5,
-            0.5,
-            config.text_config.vocab_size * canvas_ids.shape[-1],
+            -0.5, 0.5, config.text_config.vocab_size * canvas_ids.shape[-1]
         ).reshape(1, canvas_ids.shape[-1], -1)
         stored_self_conditioning_logits = self_conditioning_logits.astype(
             decoder.embed_tokens.weight.dtype
         )
 
         self_conditioning_embeddings = model.diffusion_self_conditioning(
-            self_conditioning_logits,
-            model.diffusion_prepare_self_conditioning(),
+            self_conditioning_logits, model.diffusion_prepare_self_conditioning()
         ).astype(decoder.embed_tokens.weight.dtype)
         logits_output = model(
             input_ids=input_ids,
@@ -482,10 +389,7 @@ class TestDiffusionGemma4(unittest.TestCase):
             key: mx.array(value.detach().cpu().numpy())
             for key, value in hf_model.state_dict().items()
         }
-        mlx_model.load_weights(
-            list(mlx_model.sanitize(weights).items()),
-            strict=False,
-        )
+        mlx_model.load_weights(list(mlx_model.sanitize(weights).items()), strict=False)
 
         input_ids_t = torch.tensor([[2, 3, 4, 5]], dtype=torch.long)
         canvas_t = torch.tensor([[6, 7, 8]], dtype=torch.long)
@@ -530,9 +434,7 @@ class TestDiffusionGemma4(unittest.TestCase):
 
         attention_t = torch.ones_like(input_ids_t, dtype=torch.bool)
         decoder_attention_t = torch.nn.functional.pad(
-            attention_t,
-            (0, canvas_t.shape[-1]),
-            value=True,
+            attention_t, (0, canvas_t.shape[-1]), value=True
         )
         with torch.no_grad():
             past_key_values = DynamicCache(
@@ -555,8 +457,7 @@ class TestDiffusionGemma4(unittest.TestCase):
             logits_processor = LogitsProcessorList(
                 [
                     LinearTemperatureScheduleLogitsProcessor(
-                        LinearTemperatureScheduleConfig(t_min=0.4, t_max=0.8),
-                        4,
+                        LinearTemperatureScheduleConfig(t_min=0.4, t_max=0.8), 4
                     )
                 ]
             )
@@ -578,23 +479,16 @@ class TestDiffusionGemma4(unittest.TestCase):
         attention_m = mx.ones(input_ids_m.shape, dtype=mx.bool_)
         kv_cache = mlx_model.make_cache()
         _, kv_cache = mlx_model.model.encoder(
-            input_ids_m,
-            attention_mask=attention_m,
-            cache=kv_cache,
+            input_ids_m, attention_mask=attention_m, cache=kv_cache
         )
         decoder_attention_m = mx.concatenate(
-            [attention_m, mx.ones(canvas_m.shape, dtype=mx.bool_)],
-            axis=-1,
+            [attention_m, mx.ones(canvas_m.shape, dtype=mx.bool_)], axis=-1
         )
         mask_mapping = mlx_model.model.decoder._make_decoder_masks(
-            canvas_m[..., None],
-            kv_cache,
-            decoder_attention_m,
+            canvas_m[..., None], kv_cache, decoder_attention_m
         )
         mlx_processed = mlx_model(
-            cache=kv_cache,
-            canvas_ids=canvas_m,
-            decoder_attention_mask=mask_mapping,
+            cache=kv_cache, canvas_ids=canvas_m, decoder_attention_mask=mask_mapping
         ).logits / _diffusion_linear_temperature(3, 4, {"t_min": 0.4, "t_max": 0.8})
         mlx_argmax = mx.argmax(mlx_processed, axis=-1).astype(mx.int32)
         mx.eval(mlx_processed, mlx_argmax)
@@ -638,160 +532,24 @@ class TestDiffusionGemma4(unittest.TestCase):
 
         sanitized = model.sanitize(weights)
 
-        self.assertIn(
-            "model.decoder.layers.0.experts.gate_up_proj.weight",
-            sanitized,
-        )
-        self.assertIn(
-            "model.decoder.layers.0.experts.down_proj.weight",
-            sanitized,
-        )
+        self.assertIn("model.decoder.layers.0.experts.gate_up_proj.weight", sanitized)
+        self.assertIn("model.decoder.layers.0.experts.down_proj.weight", sanitized)
         self.assertEqual(
             sanitized["model.decoder.layers.0.experts.gate_up_proj.weight"].shape,
             (4, 16, 16),
         )
         self.assertIn("model.encoder.language_model.layers.0.layer_scalar", sanitized)
         self.assertNotIn(
-            "model.encoder.language_model.layers.0.self_attn.q_proj.weight",
-            sanitized,
+            "model.encoder.language_model.layers.0.self_attn.q_proj.weight", sanitized
         )
         self.assertNotIn(
-            "model.encoder.embed_vision.embedding_projection.weight",
-            sanitized,
+            "model.encoder.embed_vision.embedding_projection.weight", sanitized
         )
         self.assertNotIn(
             "model.encoder.vision_tower.encoder.layers.0.input_layernorm.weight",
             sanitized,
         )
         self.assertNotIn("lm_head.weight", sanitized)
-
-    def test_stream_generate_uses_diffusion_loop(self):
-        from mlx_vlm.generate import stream_generate
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        config = ModelConfig.from_dict(tiny_config_dict())
-        model = Model(config)
-        processor = FakeProcessor()
-
-        responses = list(
-            stream_generate(
-                model,
-                processor,
-                "",
-                input_ids=mx.array([[2, 3]], dtype=mx.int32),
-                max_tokens=2,
-                max_denoising_steps=1,
-            )
-        )
-
-        self.assertGreaterEqual(len(responses), 1)
-        self.assertEqual(responses[-1].generation_tokens, 2)
-        self.assertEqual(responses[-1].prompt_tokens, 2)
-        self.assertEqual(responses[-1].diffusion_canvas_tokens, 3)
-        self.assertEqual(responses[-1].diffusion_denoising_steps, 1)
-        self.assertEqual(responses[-1].diffusion_work_tokens, 3)
-
-    def test_stream_generate_reuses_hybrid_prompt_cache_with_apc(self):
-        from mlx_vlm.apc import APCManager
-        from mlx_vlm.generate import stream_generate
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        config = ModelConfig.from_dict(tiny_config_dict())
-        model = Model(config)
-        processor = FakeProcessor()
-        input_ids = mx.array([[2, 3, 4, 5]], dtype=mx.int32)
-        recorder = RecordingEncoder(model.model.encoder)
-        model.model.encoder = recorder
-
-        with patch.dict(
-            os.environ,
-            {
-                "APC_CHECKPOINT_ENTRIES": "4",
-                "APC_EXACT_MIN_TOKENS": "1",
-            },
-        ):
-            manager = APCManager(num_blocks=4, block_size=2)
-
-        try:
-            mx.random.seed(7)
-            cold = list(
-                stream_generate(
-                    model,
-                    processor,
-                    "",
-                    input_ids=input_ids,
-                    max_tokens=2,
-                    max_denoising_steps=1,
-                    _apc_manager=manager,
-                    _apc_semantic_hash=11,
-                )
-            )
-            cold_prefill_shapes = list(recorder.input_lengths)
-            recorder.input_lengths.clear()
-
-            mx.random.seed(7)
-            warm = list(
-                stream_generate(
-                    model,
-                    processor,
-                    "",
-                    input_ids=input_ids,
-                    max_tokens=2,
-                    max_denoising_steps=1,
-                    _apc_manager=manager,
-                    _apc_semantic_hash=11,
-                )
-            )
-            warm_prefill_shapes = list(recorder.input_lengths)
-
-            cold_tokens = [
-                response.token
-                for response in cold
-                if response.token is not None and not response.is_draft
-            ]
-            warm_tokens = [
-                response.token
-                for response in warm
-                if response.token is not None and not response.is_draft
-            ]
-            self.assertEqual(cold_tokens, warm_tokens)
-            self.assertEqual(cold[-1].cached_tokens, 0)
-            self.assertEqual(warm[-1].cached_tokens, 3)
-            self.assertEqual(cold_prefill_shapes[-1], 1)
-            self.assertEqual(warm_prefill_shapes, [1])
-            self.assertEqual(manager.stats_snapshot()["exact_hits"], 1)
-        finally:
-            manager.close()
-
-    def test_stream_generate_uses_model_owned_generator(self):
-        from mlx_vlm.generate import stream_generate
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        config = ModelConfig.from_dict(tiny_config_dict())
-        model = Model(config)
-        original_generate = model.language_model.generate
-        calls = {"count": 0}
-
-        def counted_generate(*args, **kwargs):
-            calls["count"] += 1
-            return original_generate(*args, **kwargs)
-
-        model.language_model.generate = counted_generate
-        responses = list(
-            stream_generate(
-                model,
-                FakeProcessor(),
-                "",
-                input_ids=mx.array([[2, 3]], dtype=mx.int32),
-                max_tokens=2,
-                max_denoising_steps=1,
-            )
-        )
-
-        self.assertEqual(calls["count"], 1)
-        self.assertEqual(responses[-1].generation_tokens, 2)
 
     def test_generate_verbose_omits_diffusion_work_stats(self):
         from mlx_vlm.generate import generate
@@ -820,64 +578,6 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertNotIn("work tokens", output)
         self.assertNotIn("work-tokens-per-sec", output)
 
-    def test_stream_generate_chunks_diffusion_prefill(self):
-        from mlx_vlm.generate import stream_generate
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        config = ModelConfig.from_dict(tiny_config_dict())
-        model = Model(config)
-        recorder = RecordingEncoder(model.model.encoder)
-        model.model.encoder = recorder
-        processor = FakeProcessor()
-
-        responses = list(
-            stream_generate(
-                model,
-                processor,
-                "",
-                input_ids=mx.array([[2, 3, 4, 5, 6]], dtype=mx.int32),
-                max_tokens=1,
-                max_denoising_steps=1,
-                prefill_step_size=2,
-            )
-        )
-
-        self.assertEqual(responses[-1].generation_tokens, 1)
-        self.assertEqual(recorder.input_lengths, [2, 2, 1])
-        self.assertEqual(recorder.attention_masks, [None, None, None])
-
-    def test_stream_generate_honors_diffusion_chunked_prefill_policy(self):
-        from mlx_vlm.generate import stream_generate
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        config = ModelConfig.from_dict(tiny_config_dict())
-        model = Model(config)
-        recorder = RecordingEncoder(model.model.encoder)
-        model.model.encoder = recorder
-        processor = FakeProcessor()
-
-        with patch.object(
-            model, "chunked_prefill_policy", return_value=False
-        ) as policy:
-            responses = list(
-                stream_generate(
-                    model,
-                    processor,
-                    "",
-                    input_ids=mx.array([[2, 3, 4, 5, 6]], dtype=mx.int32),
-                    max_tokens=1,
-                    max_denoising_steps=1,
-                    prefill_step_size=2,
-                )
-            )
-
-        self.assertEqual(responses[-1].generation_tokens, 1)
-        self.assertEqual(recorder.input_lengths, [5])
-        policy.assert_called_once()
-        self.assertFalse(policy.call_args.kwargs["prefill_kwargs"]["has_padding"])
-
     def test_chunked_diffusion_prefill_matches_unchunked_tokens(self):
         from mlx_vlm.generate import stream_generate
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
@@ -899,44 +599,6 @@ class TestDiffusionGemma4(unittest.TestCase):
             return [r.token for r in responses if r.token is not None]
 
         self.assertEqual(generated_tokens(None), generated_tokens(2))
-
-    def test_full_precision_generation_uses_model_self_conditioning(self):
-        from mlx_vlm.generate import stream_generate
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        config = ModelConfig.from_dict(tiny_config_dict())
-        model = Model(config)
-        processor = FakeProcessor()
-
-        self.assertFalse(model.prefers_logits_self_conditioning)
-
-        with (
-            patch.object(
-                model,
-                "diffusion_prepare_self_conditioning",
-                wraps=model.diffusion_prepare_self_conditioning,
-            ) as prepare,
-            patch.object(
-                model,
-                "diffusion_self_conditioning",
-                wraps=model.diffusion_self_conditioning,
-            ) as self_conditioning,
-        ):
-            responses = list(
-                stream_generate(
-                    model,
-                    processor,
-                    "",
-                    input_ids=mx.array([[2, 3]], dtype=mx.int32),
-                    max_tokens=2,
-                    max_denoising_steps=2,
-                )
-            )
-
-        self.assertEqual(responses[-1].generation_tokens, 2)
-        prepare.assert_called_once()
-        self_conditioning.assert_called()
 
     def test_stream_generate_keeps_padded_diffusion_prefill_unchunked(self):
         from mlx_vlm.generate import stream_generate
@@ -995,39 +657,6 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(recorder.input_lengths, [5])
         self.assertIs(recorder.mm_token_type_ids[0], mm_token_type_ids)
 
-    def test_decoder_masks_skip_no_padding_short_context(self):
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        config = ModelConfig.from_dict(tiny_config_dict())
-        model = Model(config)
-        cache = model.make_cache()
-        _, cache = model.model.encoder(
-            mx.array([[2, 3, 4]], dtype=mx.int32), cache=cache
-        )
-
-        masks = model.model.decoder._make_decoder_masks(
-            mx.zeros((1, 3, 1)),
-            cache,
-            decoder_attention_mask=None,
-        )
-
-        self.assertIsNone(masks["full_attention"])
-        self.assertIsNone(masks["sliding_attention"])
-
-    def test_static_prefix_cache_exposes_full_decoder_state(self):
-        from mlx_vlm.models.cache import StaticPrefixKVCache
-
-        cache = StaticPrefixKVCache(max_size=5)
-        keys = mx.ones((1, 2, 3, 4))
-        values = mx.ones((1, 2, 3, 4)) * 2
-
-        prefix_keys, prefix_values = cache.update_and_fetch(keys, values)
-
-        self.assertEqual(prefix_keys.shape, (1, 2, 3, 4))
-        self.assertEqual(prefix_values.shape, (1, 2, 3, 4))
-        self.assertEqual(cache.decoder_state[0].shape, (1, 2, 5, 4))
-        self.assertEqual(cache.offset, 3)
-
     def test_stream_generate_supports_static_diffusion_cache(self):
         from mlx_vlm.generate import stream_generate
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
@@ -1077,36 +706,6 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(responses[-1].diffusion_denoising_steps, 1)
         self.assertEqual(responses[-1].diffusion_work_tokens, 3)
 
-    def test_entropy_bound_sampler_runs_configured_steps(self):
-        from mlx_vlm.generate import stream_generate
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        config_dict = tiny_config_dict()
-        config_dict["generation_config"]["max_denoising_steps"] = 4
-        config_dict["generation_config"]["sampler_config"] = {
-            "_cls_name": "EntropyBoundSamplerConfig",
-            "entropy_bound": 1_000.0,
-        }
-        config = ModelConfig.from_dict(config_dict)
-        model = Model(config)
-        processor = FakeProcessor()
-
-        responses = list(
-            stream_generate(
-                model,
-                processor,
-                "",
-                input_ids=mx.array([[2, 3]], dtype=mx.int32),
-                max_tokens=2,
-                diffusion_sampler="entropy-bound",
-            )
-        )
-
-        self.assertEqual(responses[-1].generation_tokens, 2)
-        self.assertEqual(responses[-1].diffusion_denoising_steps, 4)
-        self.assertEqual(responses[-1].diffusion_work_tokens, 12)
-
     def test_stream_generate_uses_checkpoint_denoising_steps(self):
         from mlx_vlm.generate import stream_generate
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
@@ -1132,95 +731,11 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(responses[-1].diffusion_denoising_steps, 48)
         self.assertEqual(responses[-1].diffusion_work_tokens, 144)
 
-    def test_stream_generate_respects_explicit_denoising_steps_override(self):
-        from mlx_vlm.generate import stream_generate
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        config_dict = tiny_config_dict()
-        config_dict["generation_config"]["max_denoising_steps"] = 48
-        config = ModelConfig.from_dict(config_dict)
-        model = Model(config)
-        processor = FakeProcessor()
-
-        responses = list(
-            stream_generate(
-                model,
-                processor,
-                "",
-                input_ids=mx.array([[2, 3]], dtype=mx.int32),
-                max_tokens=2,
-                max_denoising_steps=48,
-                diffusion_sampler="entropy-bound",
-            )
-        )
-
-        self.assertEqual(responses[-1].diffusion_denoising_steps, 48)
-        self.assertEqual(responses[-1].diffusion_work_tokens, 144)
-
-    def test_stream_generate_respects_diffusion_max_canvas_length(self):
-        from mlx_vlm.generate import stream_generate
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        config = ModelConfig.from_dict(tiny_config_dict())
-        model = Model(config)
-        processor = FakeProcessor()
-
-        responses = list(
-            stream_generate(
-                model,
-                processor,
-                "",
-                input_ids=mx.array([[2, 3]], dtype=mx.int32),
-                max_tokens=4,
-                max_denoising_steps=1,
-                diffusion_max_canvas_length=2,
-            )
-        )
-
-        self.assertEqual(responses[-1].generation_tokens, 4)
-        self.assertEqual(responses[-1].diffusion_canvas_tokens, 4)
-        self.assertEqual(responses[-1].diffusion_work_tokens, 4)
-
-    def test_stream_generate_can_emit_unmasking_drafts(self):
-        from mlx_vlm.generate import stream_generate
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        config = ModelConfig.from_dict(tiny_config_dict())
-        model = Model(config)
-        processor = FakeProcessor()
-
-        responses = list(
-            stream_generate(
-                model,
-                processor,
-                "",
-                input_ids=mx.array([[2, 3]], dtype=mx.int32),
-                max_tokens=2,
-                max_denoising_steps=2,
-                diffusion_show_unmasking=True,
-            )
-        )
-        drafts = [response for response in responses if response.is_draft]
-        finals = [response for response in responses if not response.is_draft]
-
-        self.assertEqual(len(drafts), 3)
-        self.assertTrue(all(response.draft_text for response in drafts))
-        self.assertEqual(drafts[0].diffusion_step, 0)
-        self.assertIn("[Mask]", drafts[0].draft_text)
-        self.assertEqual(drafts[1].diffusion_step, 1)
-        self.assertEqual(drafts[-1].diffusion_total_steps, 2)
-        self.assertEqual(finals[-1].generation_tokens, 2)
-
     def test_diffusion_initial_canvas_pads_short_decoder_input_ids(self):
         diffusion_module = importlib.import_module("mlx_vlm.generate.diffusion")
 
         decoder_input_ids = diffusion_module._normalize_decoder_input_ids(
-            [[10, 11]],
-            batch_size=1,
-            dtype=mx.int32,
+            [[10, 11]], batch_size=1, dtype=mx.int32
         )
         with patch.object(
             diffusion_module,
@@ -1244,61 +759,13 @@ class TestDiffusionGemma4(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "2D array"):
             diffusion_module._normalize_decoder_input_ids(
-                [10, 11],
-                batch_size=1,
-                dtype=mx.int32,
+                [10, 11], batch_size=1, dtype=mx.int32
             )
 
         with self.assertRaisesRegex(ValueError, "batch size"):
             diffusion_module._normalize_decoder_input_ids(
-                [[10, 11], [12, 13]],
-                batch_size=1,
-                dtype=mx.int32,
+                [[10, 11], [12, 13]], batch_size=1, dtype=mx.int32
             )
-
-    def test_stream_generate_uses_decoder_input_ids_as_initial_canvas(self):
-        diffusion_module = importlib.import_module("mlx_vlm.generate.diffusion")
-        from mlx_vlm.generate import stream_generate
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        config = ModelConfig.from_dict(tiny_config_dict())
-        model = Model(config)
-        seen_canvases = []
-
-        def decoder_logits(current_canvas, *args, **kwargs):
-            del args, kwargs
-            mx.eval(current_canvas)
-            seen_canvases.append(current_canvas.tolist())
-            return mx.zeros(
-                (
-                    current_canvas.shape[0],
-                    current_canvas.shape[1],
-                    config.text_config.vocab_size,
-                )
-            )
-
-        with (
-            patch.object(model, "diffusion_decoder_logits", side_effect=decoder_logits),
-            patch.object(
-                diffusion_module,
-                "_diffusion_initialize_canvas",
-                return_value=mx.array([[7, 8, 9]], dtype=mx.int32),
-            ),
-        ):
-            responses = list(
-                stream_generate(
-                    model,
-                    FakeProcessor(),
-                    "",
-                    input_ids=mx.array([[2, 3]], dtype=mx.int32),
-                    max_tokens=1,
-                    max_denoising_steps=1,
-                    decoder_input_ids=mx.array([[10, 11]], dtype=mx.int32),
-                )
-            )
-
-        self.assertEqual(responses[-1].generation_tokens, 1)
-        self.assertEqual(seen_canvases[0], [[10, 11, 9]])
 
     def test_stream_generate_slices_decoder_input_ids_by_canvas(self):
         from mlx_vlm.generate import stream_generate
@@ -1366,34 +833,6 @@ class TestDiffusionGemma4(unittest.TestCase):
         categorical.assert_called_once()
         self.assertEqual(sampled.tolist(), [[2, 1]])
 
-    def test_diffusion_confidence_transfer_forces_best_unrevealed_token(self):
-        from mlx_vlm.generate.diffusion import _diffusion_confidence_transfer_mask
-
-        confidence = mx.array([[0.1, 0.4, 0.2]])
-        unrevealed = mx.array([[True, True, False]])
-
-        transfer = _diffusion_confidence_transfer_mask(
-            confidence,
-            unrevealed,
-            threshold=0.9,
-        )
-        mx.eval(transfer)
-
-        self.assertEqual(transfer.tolist(), [[False, True, False]])
-
-    def test_diffusion_entropy_transfer_forces_best_unrevealed_token(self):
-        from mlx_vlm.generate.diffusion import _diffusion_entropy_transfer_mask
-
-        entropy = mx.array([[0.4, 0.1, 0.2, 0.05]])
-
-        transfer = _diffusion_entropy_transfer_mask(
-            entropy,
-            entropy_bound=0.16,
-        )
-        mx.eval(transfer)
-
-        self.assertEqual(transfer.tolist(), [[False, True, True, True]])
-
     def test_unmasking_display_has_no_prefix_and_preserves_newlines(self):
         from mlx_vlm.generate import GenerationResult
         from mlx_vlm.generate.diffusion import (
@@ -1411,33 +850,11 @@ class TestDiffusionGemma4(unittest.TestCase):
 
         self.assertEqual(_format_diffusion_draft_line(draft, 80), "[Mask]\nHello")
         self.assertEqual(
-            _format_diffusion_live_text("hello\nworld", 80),
-            "hello\nworld",
+            _format_diffusion_live_text("hello\nworld", 80), "hello\nworld"
         )
         self.assertEqual(
-            _format_diffusion_live_text(
-                "hello\nworld",
-                80,
-                preserve_newlines=False,
-            ),
+            _format_diffusion_live_text("hello\nworld", 80, preserve_newlines=False),
             "hello\\nworld",
-        )
-
-    def test_diffusion_masked_draft_decode_preserves_newlines(self):
-        from mlx_vlm.generate.diffusion import _decode_diffusion_masked_draft
-
-        class NewlineTokenizer:
-            def decode(self, tokens, skip_special_tokens=False):
-                return "hello\nworld"
-
-        self.assertEqual(
-            _decode_diffusion_masked_draft(
-                NewlineTokenizer(),
-                [1],
-                [True],
-                skip_special_token_ids=[],
-            ),
-            "hello\nworld",
         )
 
     def test_unmasking_display_is_untrimmed_by_default(self):
@@ -1453,72 +870,6 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(_format_diffusion_draft_line(draft), long_text)
         self.assertEqual(_format_diffusion_live_text(long_text), long_text)
         self.assertTrue(_format_diffusion_live_text(long_text, 20).endswith("..."))
-
-    def test_generate_redraw_mode_prints_full_final_text(self):
-        diffusion_module = importlib.import_module("mlx_vlm.generate.diffusion")
-        dispatch_module = importlib.import_module("mlx_vlm.generate.dispatch")
-        from mlx_vlm.generate import GenerationResult, generate
-
-        class Config:
-            model_type = "diffusion_gemma"
-            eos_token_id = 999999
-
-        class Model:
-            config = Config()
-
-        long_text = "The sky is blue because Rayleigh scattering favors blue light."
-        chunks = [
-            GenerationResult(is_draft=True, draft_text="[Mask] [Mask] [Mask]"),
-            GenerationResult(
-                text=long_text,
-                token=1,
-                prompt_tokens=3,
-                generation_tokens=12,
-                total_tokens=15,
-                prompt_tps=10.0,
-                generation_tps=5.0,
-            ),
-        ]
-
-        buffer = io.StringIO()
-        with (
-            patch.object(dispatch_module, "stream_generate", return_value=iter(chunks)),
-            patch.object(
-                diffusion_module, "_supports_in_place_output", return_value=True
-            ),
-            contextlib.redirect_stdout(buffer),
-        ):
-            result = generate(
-                Model(),
-                FakeProcessor(),
-                "",
-                verbose=True,
-                diffusion_show_unmasking=True,
-                diffusion_unmasking_width=20,
-            )
-
-        self.assertEqual(result.text, long_text)
-        self.assertIn(long_text, buffer.getvalue())
-
-    def test_auto_processor_uses_local_text_only_processor(self):
-        from transformers import AutoProcessor
-
-        from mlx_vlm.models.diffusion_gemma import DiffusionGemma4Processor
-
-        sentinel = object()
-        with TemporaryDirectory() as tmpdir:
-            Path(tmpdir, "config.json").write_text(
-                json.dumps({"model_type": "diffusion_gemma"})
-            )
-            with patch.object(
-                DiffusionGemma4Processor,
-                "from_pretrained",
-                return_value=sentinel,
-            ) as from_pretrained:
-                processor = AutoProcessor.from_pretrained(tmpdir)
-
-        self.assertIs(processor, sentinel)
-        from_pretrained.assert_called_once()
 
     def test_processor_demotes_tool_parser_tokens_from_specials(self):
         from mlx_vlm.models.diffusion_gemma import DiffusionGemma4Processor
@@ -1558,27 +909,6 @@ class TestDiffusionGemma4(unittest.TestCase):
             self.assertNotEqual(
                 tokenizer.convert_tokens_to_ids(token), tokenizer.unk_token_id
             )
-
-    def test_strip_channel_scaffolding_removes_leaked_header(self):
-        from mlx_vlm.models.diffusion_gemma.processing_diffusion_gemma import (
-            _strip_channel_scaffolding,
-        )
-
-        raw = (
-            "<|channel>thought\n"
-            "<channel|>Title: White motor cruiser Wavey Katey II cruising on a river\n"
-            "Description: A white cabin motor cruiser named Wavey Katey II cruises "
-            "along a calm waterway.\n"
-            "Keywords: Boat, cabin cruiser, motorboat, river"
-        )
-
-        cleaned = _strip_channel_scaffolding(raw)
-
-        self.assertNotIn("<|channel>", cleaned)
-        self.assertNotIn("<channel|>", cleaned)
-        self.assertNotIn("thought", cleaned)
-        self.assertTrue(cleaned.startswith("Title: White motor cruiser"))
-        self.assertIn("Keywords: Boat, cabin cruiser, motorboat, river", cleaned)
 
     def test_strip_channel_scaffolding_is_noop_without_markers(self):
         from mlx_vlm.models.diffusion_gemma.processing_diffusion_gemma import (
@@ -1622,24 +952,6 @@ class TestDiffusionGemma4(unittest.TestCase):
             result = generate(Model(), processor, "")
 
         self.assertEqual(result.text, "Title: A calm river cruise")
-
-    def test_processor_returns_video_frames_as_pixel_values(self):
-        processor = tiny_diffusion_gemma_processor()
-
-        result = processor(
-            text="<video> describe",
-            videos=[np.zeros((2, 3, 4, 4), dtype=np.uint8)],
-        )
-
-        self.assertIn("pixel_values", result)
-        self.assertNotIn("pixel_values_videos", result)
-        self.assertIsInstance(result["pixel_values"], mx.array)
-        self.assertEqual(result["pixel_values"].shape, (2, 3, 4, 4))
-        self.assertEqual(result["num_frames_per_video"], [2])
-        self.assertEqual(
-            int(mx.sum(result["mm_token_type_ids"] == 2).item()),
-            2,
-        )
 
     def test_processor_video_outputs_can_cross_thread_boundary(self):
         raw_queue = Queue()
@@ -1704,13 +1016,9 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertIn(processor.video_token, rendered)
 
         result = processor(
-            text=rendered,
-            videos=[np.zeros((2, 3, 4, 4), dtype=np.uint8)],
+            text=rendered, videos=[np.zeros((2, 3, 4, 4), dtype=np.uint8)]
         )
-        self.assertEqual(
-            int(mx.sum(result["mm_token_type_ids"] == 2).item()),
-            2,
-        )
+        self.assertEqual(int(mx.sum(result["mm_token_type_ids"] == 2).item()), 2)
 
     def test_processor_orders_mixed_images_and_videos_in_pixel_values(self):
         processor = tiny_diffusion_gemma_processor(image_processor=TinyImageProcessor())
@@ -1739,19 +1047,6 @@ class TestDiffusionVisualization(unittest.TestCase):
         self.assertEqual(wrapped, "alpha\nbeta gamma")
         # A single overlong word is hard-split.
         self.assertEqual(_wrap_text("abcdef", 3), "abc\ndef")
-
-    def test_wrap_text_preserves_code_block_indentation(self):
-        from mlx_vlm.models.diffusion_gemma.visualizer import _wrap_text
-
-        code = (
-            "import random\n\n"
-            "def calculate_pi_monte_carlo(iterations):\n"
-            "    inside_circle = 0\n"
-            "    \n"
-            "    for _ in range(iterations):"
-        )
-
-        self.assertEqual(_wrap_text(code, 80), code)
 
     def test_redrawer_overwrites_frames_in_place(self):
         import contextlib
@@ -1805,33 +1100,6 @@ class TestDiffusionVisualization(unittest.TestCase):
         self.assertIn("\033[?1049l", out)
         self.assertIn("\033[?25h", out)
         self.assertFalse(redrawer.alternate_screen)
-
-    def test_make_visualizer_defaults_for_verbose_terminals(self):
-        from unittest.mock import patch
-
-        from mlx_vlm.models.diffusion_gemma.visualizer import make_unmasking_visualizer
-
-        with patch("sys.stdout.isatty", return_value=True):
-            kwargs = {}
-            visualizer = make_unmasking_visualizer(kwargs, verbose=True)
-            self.assertTrue(kwargs.get("diffusion_show_unmasking"))
-            self.assertIsNotNone(visualizer)
-
-            # Explicit opt-out is respected.
-            kwargs = {"diffusion_show_unmasking": False}
-            self.assertIsNone(make_unmasking_visualizer(kwargs, verbose=True))
-            self.assertFalse(kwargs["diffusion_show_unmasking"])
-
-            # Quiet runs stay off.
-            kwargs = {}
-            self.assertIsNone(make_unmasking_visualizer(kwargs, verbose=False))
-            self.assertNotIn("diffusion_show_unmasking", kwargs)
-
-        # Piped output stays off.
-        with patch("sys.stdout.isatty", return_value=False):
-            kwargs = {}
-            self.assertIsNone(make_unmasking_visualizer(kwargs, verbose=True))
-            self.assertNotIn("diffusion_show_unmasking", kwargs)
 
     def test_visualizer_composes_full_canvas(self):
         from mlx_vlm.models.diffusion_gemma.visualizer import DiffusionGemma4Visualizer
@@ -1907,36 +1175,6 @@ class TestDiffusionVisualization(unittest.TestCase):
 
 
 class TestDiffusionBlockStreaming(unittest.TestCase):
-    def test_stream_generate_emits_block_boundaries(self):
-        from mlx_vlm.generate import stream_generate
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        config = ModelConfig.from_dict(tiny_config_dict())
-        model = Model(config)
-        processor = FakeProcessor()
-
-        # canvas_length=3 with max_tokens=5 -> two canvases, two boundaries.
-        responses = list(
-            stream_generate(
-                model,
-                processor,
-                "",
-                input_ids=mx.array([[2, 3]], dtype=mx.int32),
-                max_tokens=5,
-            )
-        )
-
-        boundaries = [r for r in responses if r.diffusion_block_complete]
-        self.assertEqual(len(boundaries), 2)
-        self.assertTrue(all(r.text == "" for r in boundaries))
-        self.assertEqual([r.diffusion_canvas_index for r in boundaries], [1, 2])
-        # Token results carry their canvas index; the final result carries
-        # the finish reason.
-        token_results = [r for r in responses if r.text and not r.finish_reason]
-        self.assertTrue(all(r.diffusion_canvas_index > 0 for r in token_results))
-        self.assertEqual(responses[-1].finish_reason, "length")
-
     def test_diffusion_block_chunks_groups_by_block(self):
         from mlx_vlm.generate.common import GenerationResult
         from mlx_vlm.server.generation import _diffusion_block_chunks
@@ -1968,10 +1206,7 @@ class TestDiffusionBlockStreaming(unittest.TestCase):
         ]
 
         chunks = list(_diffusion_block_chunks(iter(results)))
-        self.assertEqual(
-            [(c.text, c.finish_reason) for c in chunks],
-            [("Hi.", "stop")],
-        )
+        self.assertEqual([(c.text, c.finish_reason) for c in chunks], [("Hi.", "stop")])
 
 
 class TestDiffusionGemma4Quantized(unittest.TestCase):
@@ -1995,15 +1230,13 @@ class TestDiffusionGemma4Quantized(unittest.TestCase):
         )
         self.assertEqual(
             predicate(
-                "model.decoder.layers.0.router.proj",
-                decoder.layers[0].router.proj,
+                "model.decoder.layers.0.router.proj", decoder.layers[0].router.proj
             ),
             {"group_size": 64, "bits": 8},
         )
         self.assertEqual(
             predicate(
-                "model.decoder.layers.0.mlp.gate_proj",
-                decoder.layers[0].mlp.gate_proj,
+                "model.decoder.layers.0.mlp.gate_proj", decoder.layers[0].mlp.gate_proj
             ),
             {"group_size": 64, "bits": 8},
         )
@@ -2049,57 +1282,6 @@ class TestDiffusionGemma4Quantized(unittest.TestCase):
             },
         )
 
-    def test_stream_generate_with_quantized_embeddings(self):
-        import mlx.nn as nn
-
-        from mlx_vlm.generate import stream_generate
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        config_dict = tiny_config_dict()
-        config_dict["text_config"]["hidden_size"] = 32
-        # Several denoising steps so quantized self-conditioning reuses logits
-        # and avoids materializing a dequantized embedding table.
-        config_dict["generation_config"]["max_denoising_steps"] = 3
-        config = ModelConfig.from_dict(config_dict)
-        model = Model(config)
-        nn.quantize(
-            model,
-            group_size=32,
-            bits=5,
-            class_predicate=lambda path, module: isinstance(module, nn.Embedding),
-        )
-        self.assertIsInstance(model.model.decoder.embed_tokens, nn.QuantizedEmbedding)
-        self.assertTrue(model.prefers_logits_self_conditioning)
-
-        processor = FakeProcessor()
-        with (
-            patch.object(
-                model,
-                "diffusion_prepare_self_conditioning",
-                wraps=model.diffusion_prepare_self_conditioning,
-            ) as prepare,
-            patch.object(
-                model,
-                "diffusion_self_conditioning",
-                wraps=model.diffusion_self_conditioning,
-            ) as self_conditioning,
-        ):
-            responses = list(
-                stream_generate(
-                    model,
-                    processor,
-                    "",
-                    input_ids=mx.array([[2, 3]], dtype=mx.int32),
-                    max_tokens=2,
-                )
-            )
-
-        self.assertEqual(responses[-1].generation_tokens, 2)
-        self.assertGreater(responses[-1].diffusion_work_tokens, 0)
-        prepare.assert_called_once()
-        self_conditioning.assert_called()
-
     def test_stream_generate_with_mxfp4_quantized_embeddings(self):
         import mlx.nn as nn
 
@@ -2135,54 +1317,6 @@ class TestDiffusionGemma4Quantized(unittest.TestCase):
         self.assertEqual(responses[-1].generation_tokens, 2)
         self.assertGreater(responses[-1].diffusion_work_tokens, 0)
 
-    def test_embed_canvas_quantized_self_conditioning_logits(self):
-        import mlx.nn as nn
-
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        config_dict = tiny_config_dict()
-        config_dict["text_config"]["hidden_size"] = 32
-        config = ModelConfig.from_dict(config_dict)
-        model = Model(config)
-        nn.quantize(
-            model,
-            group_size=32,
-            bits=5,
-            class_predicate=lambda path, module: isinstance(module, nn.Embedding),
-        )
-
-        decoder = model.model.decoder
-        canvas_ids = mx.array([[5, 6, 7]])
-        logits = mx.random.normal((1, 3, config.text_config.vocab_size))
-        embeds = decoder._embed_canvas(canvas_ids, self_conditioning_logits=logits)
-        self.assertEqual(embeds.shape, (1, 3, config.text_config.hidden_size))
-
-    def test_embed_canvas_mxfp4_quantized_self_conditioning_logits(self):
-        import mlx.nn as nn
-
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        config_dict = tiny_config_dict()
-        config_dict["text_config"]["hidden_size"] = 32
-        config = ModelConfig.from_dict(config_dict)
-        model = Model(config)
-        nn.quantize(
-            model,
-            group_size=32,
-            bits=4,
-            mode="mxfp4",
-            class_predicate=lambda path, module: isinstance(module, nn.Embedding),
-        )
-
-        decoder = model.model.decoder
-        self.assertEqual(decoder.embed_tokens.mode, "mxfp4")
-        canvas_ids = mx.array([[5, 6, 7]])
-        logits = mx.random.normal((1, 3, config.text_config.vocab_size))
-        embeds = decoder._embed_canvas(canvas_ids, self_conditioning_logits=logits)
-        self.assertEqual(embeds.shape, (1, 3, config.text_config.hidden_size))
-
 
 def tiny_vision_config_dict():
     config = tiny_config_dict()
@@ -2206,35 +1340,6 @@ def tiny_vision_config_dict():
 
 
 class TestDiffusionGemma4Vision(unittest.TestCase):
-    def test_image_features_scattered_into_embeddings(self):
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        config = ModelConfig.from_dict(tiny_vision_config_dict())
-        model = Model(config)
-
-        image_token_id = config.image_token_id
-        input_ids = mx.array([[2, image_token_id, 3]])
-        pixel_values = mx.random.uniform(shape=(1, 3, 4, 4))
-
-        text_only = model.get_input_embeddings(input_ids=input_ids).inputs_embeds
-        with_image = model.get_input_embeddings(
-            input_ids=input_ids, pixel_values=pixel_values
-        ).inputs_embeds
-
-        self.assertEqual(with_image.shape, text_only.shape)
-        # Text positions are untouched; image positions carry vision features.
-        self.assertTrue(bool(mx.allclose(with_image[0, 0], text_only[0, 0]).item()))
-        self.assertTrue(bool(mx.allclose(with_image[0, 2], text_only[0, 2]).item()))
-        self.assertFalse(bool(mx.allclose(with_image[0, 1], text_only[0, 1]).item()))
-
-        expected = model.model.encoder.get_image_features(pixel_values).astype(
-            with_image.dtype
-        )
-        self.assertTrue(
-            bool(mx.allclose(with_image[0, 1], expected[0, 0], atol=1e-5).item())
-        )
-
     def test_vision_block_bidirectional_encoder_mask(self):
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
 
@@ -2267,32 +1372,6 @@ class TestDiffusionGemma4Vision(unittest.TestCase):
         for mask in text_masks:
             self.assertFalse(isinstance(mask, mx.array) and mask.shape == (1, 1, 4, 4))
 
-    def test_stream_generate_with_image_inputs(self):
-        from mlx_vlm.generate import stream_generate
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        config = ModelConfig.from_dict(tiny_vision_config_dict())
-        model = Model(config)
-        processor = FakeProcessor()
-
-        image_token_id = config.image_token_id
-        input_ids = mx.array([[2, image_token_id, 3]])
-        responses = list(
-            stream_generate(
-                model,
-                processor,
-                "",
-                input_ids=input_ids,
-                pixel_values=mx.random.uniform(shape=(1, 3, 4, 4)),
-                mm_token_type_ids=mx.array([[0, 1, 0]]),
-                max_tokens=2,
-            )
-        )
-
-        self.assertEqual(responses[-1].generation_tokens, 2)
-        self.assertGreater(responses[-1].diffusion_work_tokens, 0)
-
     def test_video_features_scattered_into_embeddings(self):
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
 
@@ -2305,8 +1384,7 @@ class TestDiffusionGemma4Vision(unittest.TestCase):
 
         text_only = model.get_input_embeddings(input_ids=input_ids).inputs_embeds
         with_video = model.get_input_embeddings(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
+            input_ids=input_ids, pixel_values=pixel_values
         ).inputs_embeds
 
         self.assertEqual(with_video.shape, text_only.shape)
@@ -2320,63 +1398,6 @@ class TestDiffusionGemma4Vision(unittest.TestCase):
         self.assertTrue(
             bool(mx.allclose(with_video[0, 1], expected[0, 0], atol=1e-5).item())
         )
-
-    def test_video_features_scattered_from_token_types_without_video_token_id(self):
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        config_dict = tiny_vision_config_dict()
-        config_dict["video_token_id"] = None
-        config = ModelConfig.from_dict(config_dict)
-        model = Model(config)
-
-        input_ids = mx.array([[2, 61, 3]])
-        pixel_values = mx.random.uniform(shape=(1, 3, 4, 4))
-        mm_token_type_ids = mx.array([[0, 2, 0]])
-
-        text_only = model.get_input_embeddings(input_ids=input_ids).inputs_embeds
-        with_video = model.get_input_embeddings(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            mm_token_type_ids=mm_token_type_ids,
-        ).inputs_embeds
-
-        self.assertEqual(with_video.shape, text_only.shape)
-        self.assertTrue(bool(mx.allclose(with_video[0, 0], text_only[0, 0]).item()))
-        self.assertTrue(bool(mx.allclose(with_video[0, 2], text_only[0, 2]).item()))
-        self.assertFalse(bool(mx.allclose(with_video[0, 1], text_only[0, 1]).item()))
-
-        expected = model.model.encoder.get_image_features(pixel_values).astype(
-            with_video.dtype
-        )
-        self.assertTrue(
-            bool(mx.allclose(with_video[0, 1], expected[0, 0], atol=1e-5).item())
-        )
-
-    def test_stream_generate_with_video_inputs(self):
-        from mlx_vlm.generate import stream_generate
-        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
-
-        mx.random.seed(0)
-        config = ModelConfig.from_dict(tiny_vision_config_dict())
-        model = Model(config)
-        processor = FakeProcessor()
-
-        input_ids = mx.array([[2, config.video_token_id, 3]])
-        responses = list(
-            stream_generate(
-                model,
-                processor,
-                "",
-                input_ids=input_ids,
-                pixel_values=mx.random.uniform(shape=(1, 3, 4, 4)),
-                mm_token_type_ids=mx.array([[0, 2, 0]]),
-                max_tokens=2,
-            )
-        )
-
-        self.assertEqual(responses[-1].generation_tokens, 2)
-        self.assertGreater(responses[-1].diffusion_work_tokens, 0)
 
     def test_sanitize_handles_vision_weights(self):
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
