@@ -52,6 +52,19 @@ def test_kv_cache_extracts_one_active_row():
     assert mx.array_equal(extracted.values, values[1:2]).item()
 
 
+@pytest.mark.parametrize("processed", [0, 3, 12])
+def test_batch_filter_only_trims_processed_padding(processed):
+    cache = BatchKVCache([9, 0])
+    if processed:
+        keys = mx.ones((2, 1, processed, 4))
+        cache.update_and_fetch(keys, keys)
+    cache.filter(mx.array([0]))
+
+    assert cache._idx == max(0, processed - 9)
+    assert cache.left_padding.tolist() == [max(0, 9 - processed)]
+    assert cache.offset.tolist() == [processed - 9]
+
+
 def test_cache_list_can_extract_an_already_extracted_kv_cache():
     first, _, _ = _make_kv_cache()
     second, _, _ = _make_kv_cache()

@@ -64,17 +64,16 @@ class TestFilter:
         assert cache.keys[0].shape[0] == 2
         assert cache.offset.shape[0] == 2
 
-    def test_filter_removes_common_left_padding(self):
-        cache = BatchQuantizedKVCache([3, 1], group_size=GROUP_SIZE, bits=BITS)
+    @pytest.mark.parametrize("padding", [1, 9])
+    def test_filter_removes_common_left_padding(self, padding):
+        cache = BatchQuantizedKVCache([0, padding], group_size=GROUP_SIZE, bits=BITS)
         k, v = _rand_kv(B, 6)
         cache.update_and_fetch(k, v)
         mx.eval(cache.keys)
 
-        # Keep only second sequence (left_padding=1)
         cache.filter(mx.array([1], mx.int32))
-        # min left_padding=1, so it should shift left by 1
-        assert cache.left_padding.tolist() == [0]
-        assert cache._idx == 5  # 6 - 1
+        assert cache.left_padding.tolist() == [max(0, padding - 6)]
+        assert cache._idx == max(0, 6 - padding)
 
     def test_filter_single_sequence(self):
         cache = BatchQuantizedKVCache([0, 0, 0], group_size=GROUP_SIZE, bits=BITS)
