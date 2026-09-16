@@ -9,14 +9,22 @@ import pytest
 
 from mlx_vlm import apc
 from mlx_vlm.apc import APCManager, DiskBlockStore, _cache_nbytes, from_env
+from mlx_vlm.apc_adapters import cache_memory_components
 from mlx_vlm.models.cache import (
     ArraysCache,
     BatchKVCache,
+    BatchPoolingCache,
     BatchQuantizedKVCache,
+    BufferedRotatingKVCache,
     CacheList,
+    ChunkedKVCache,
+    ConcatenateKVCache,
     KVCache,
+    PoolingCache,
     QuantizedKVCache,
     RotatingKVCache,
+    SimpleKVCache,
+    StaticPrefixKVCache,
 )
 
 
@@ -323,6 +331,95 @@ def test_windowed_memory_budget_is_independent_of_checkpoint_order(
     coordinator.prepare_prefill(6001, prefill_step_size=2048)
     # Window plus one chunk, rounded to 256 slots.
     assert manager.stats_snapshot()["prefill_reserve_bytes"] == 2 * 2560 * 32
+
+
+@pytest.mark.parametrize(
+    "make_cache",
+    [
+        ConcatenateKVCache,
+        SimpleKVCache,
+        lambda: ChunkedKVCache(65),
+        lambda: BufferedRotatingKVCache(65, buffer_size=300),
+        lambda: BufferedRotatingKVCache(65, keep=1),
+        lambda: StaticPrefixKVCache(513),
+    ],
+)
+@pytest.mark.parametrize("chunk_size", [37, 256])
+@pytest.mark.parametrize("length", [1, 6000])
+def test_builtin_kv_profiles_bound_prefill_allocations(make_cache, chunk_size, length):
+    cache = make_cache()
+    empty = cache_memory_components([cache], 0)[0]
+    assert not empty.fallback
+    assert empty.footprint(length, chunk_size) == 0
+    cache.update_and_fetch(mx.ones((1, 1, 1, 4)), mx.ones((1, 1, 1, 8)))
+    profile = cache_memory_components([cache], 1)[0]
+    assert not profile.fallback
+    assert profile.source_bytes == cache.nbytes
+
+    future = make_cache()
+    peak = 0
+    for start in range(0, length, chunk_size):
+        if isinstance(future, ChunkedKVCache):
+            future.maybe_trim_front()
+        size = min(chunk_size, length - start)
+        future.update_and_fetch(mx.ones((1, 1, size, 4)), mx.ones((1, 1, size, 8)))
+        peak = max(peak, future.nbytes)
+    estimate = profile.footprint(length, chunk_size)
+    assert peak <= estimate < peak + 2 * 256 * 48
+    assert profile.footprint(0, chunk_size) == 0
+
+
+@pytest.mark.parametrize("batch_size", [1, 3])
+@pytest.mark.parametrize("ratio", [4, 64])
+@pytest.mark.parametrize("seed_length", [1, 65])
+def test_pooling_profiles_separate_buffers_from_compressed_growth(
+    batch_size, ratio, seed_length
+):
+    def make_cache():
+        if batch_size == 1:
+            return PoolingCache(ratio)
+        return BatchPoolingCache(ratio, left_padding=[0, 3, 7])
+
+    def advance(cache, length):
+        kv = mx.ones((batch_size, length, 8), dtype=mx.float16)
+        gate = mx.ones((batch_size, length, 4), dtype=mx.float32)
+        ready, _, _ = cache.accumulate_windows(kv, gate, 0)
+        cache.update_and_fetch(
+            mx.ones((batch_size, ready.shape[1] // ratio, 4), dtype=mx.float16)
+        )
+
+    cache = make_cache()
+    empty = cache_memory_components([cache], 0)[0]
+    assert not empty.fallback and empty.footprint(6000) == 0
+    advance(cache, seed_length)
+    profile = cache_memory_components([cache], seed_length, batch_size=batch_size)[0]
+    assert not profile.fallback
+    assert profile.fixed_bytes == ratio * 32
+
+    future = make_cache()
+    for start in range(0, 6000, 37):
+        advance(future, min(37, 6000 - start))
+    estimate = batch_size * profile.footprint(6000)
+    assert future.nbytes <= estimate <= 2 * future.nbytes
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+def test_static_prefix_profile_survives_restore(read_only):
+    prefix = StaticPrefixKVCache(513)
+    prefix.update_and_fetch(mx.ones((1, 1, 16, 4)), mx.ones((1, 1, 16, 8)))
+    source = StaticPrefixKVCache.from_prefix(prefix) if read_only else prefix
+    cache = StaticPrefixKVCache.from_state(source.state, source.meta_state)
+    assert cache.read_only == read_only
+    profile = cache_memory_components([cache], 16)[0]
+    assert not profile.fallback
+    if read_only:
+        assert profile.footprint(1) == profile.footprint(6000) == cache.nbytes
+    else:
+        assert profile.footprint(6000) >= 6000 * 48
+    cache.update_and_fetch(mx.ones((1, 1, 1, 4)), mx.ones((1, 1, 1, 8)))
+    assert cache.offset == (16 if read_only else 17)
+    legacy = StaticPrefixKVCache.from_state(source.state, source.meta_state[:3])
+    assert not legacy.read_only
 
 
 def test_padded_kv_admission_counts_allocated_buffers(manager_factory, monkeypatch):
