@@ -639,6 +639,7 @@ class APCStats:
     hits: int = 0
     misses: int = 0
     matched_tokens: int = 0
+    stored_tokens: int = 0
     served_tokens: int = 0
     evictions: int = 0
     stores: int = 0
@@ -661,7 +662,7 @@ class APCStats:
         apc_trace("reject", reason=reason, **details)
 
     def snapshot(self, num_blocks: int, block_size: int) -> dict:
-        denom = self.matched_tokens + self.served_tokens
+        denom = self.matched_tokens + self.stored_tokens
         hit_rate = self.matched_tokens / denom if denom > 0 else 0.0
         return {
             "block_size": block_size,
@@ -670,6 +671,7 @@ class APCStats:
             "lookups_hit": self.hits,
             "lookups_miss": self.misses,
             "matched_tokens": self.matched_tokens,
+            "stored_tokens": self.stored_tokens,
             "served_tokens": self.served_tokens,
             "token_hit_rate": hit_rate,
             "evictions": self.evictions,
@@ -3883,7 +3885,7 @@ class APCManager:
                 memory_slots -= 1
                 new_blocks.append(b)
                 self.stats.stores += 1
-                self.stats.served_tokens += self.block_size
+                self.stats.stored_tokens += self.block_size
                 parent = h
             if self.disk is not None and disk_blocks:
                 try:

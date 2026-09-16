@@ -919,6 +919,12 @@ curl http://localhost:8080/v1/cache/stats
 curl -X POST http://localhost:8080/v1/cache/reset
 ```
 
+`served_tokens` counts prefix tokens successfully materialized for generation, across
+block and exact caches, in memory or on disk. A lookup alone does not increase
+it, nor does a failed batch restore. It counts restores, not completed requests.
+The previous block-storage count is now `stored_tokens`; `token_hit_rate` retains
+its existing calculation, `matched_tokens / (matched_tokens + stored_tokens)`.
+
 Configure APC on a running server with `PATCH /v1/settings`. Use
 `GET /v1/settings` to discover supported settings and read their current values:
 

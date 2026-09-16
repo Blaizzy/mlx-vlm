@@ -361,6 +361,18 @@ def test_cache_hit_for_each_model_cache_contract(cache_names, monkeypatch):
         else:
             assert hit["warm_cache"] is not None, cache_names
             assert stats["exact_hits"] == 1, cache_names
+        assert stats["served_tokens"] == 0, cache_names
+        restored = coordinator.materialize_single(
+            hit, min_capacity_tokens=token_count + 1
+        )
+        assert restored is not None, cache_names
+        assert manager.stats_snapshot()["served_tokens"] == token_count, cache_names
+
+        manager.reset_stats()
+        merged, _ = coordinator.merge_rows([hit], [token_count])
+        # Layouts without batch-merge support fall back to cold prefill.
+        expected = token_count if merged is not None else 0
+        assert manager.stats_snapshot()["served_tokens"] == expected, cache_names
         coordinator.release_hit(hit)
     finally:
         manager.close()
