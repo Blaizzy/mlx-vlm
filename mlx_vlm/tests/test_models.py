@@ -4,6 +4,7 @@ import copy
 import importlib
 import inspect
 import json
+import math
 import unittest
 from operator import attrgetter
 from pathlib import Path
@@ -205,6 +206,86 @@ class ModelChecks(unittest.TestCase):
 
             self.assertEqual(hidden_states.dtype, t)
 
+    def _assert_audio_features(self, features, shape, dtype):
+        mx.eval(features)
+        self.assertEqual(features.shape, shape)
+        self.assertEqual(features.dtype, dtype)
+        self.assertTrue(mx.all(mx.isfinite(features)).item())
+
+    def audio_test_runner(self, model, config, model_name, *, frames=32, lengths=None):
+        if model_name not in {"inkling", "gemma3n", "gemma4", "gemma4_unified"}:
+            raise ValueError(f"Unsupported audio model: {model_name}")
+        audio_config = config.audio_config
+        text_width = config.text_config.hidden_size
+        lengths = [frames, frames // 2] if lengths is None else lengths
+        self.assertTrue(lengths and all(0 <= n <= frames for n in lengths))
+        batch = len(lengths)
+        valid_mask = mx.arange(frames)[None, :] < mx.array(lengths)[:, None]
+        components = [
+            getattr(model, name, None) for name in ("audio_tower", "embed_audio")
+        ]
+        for dtype in (mx.float32, mx.float16):
+            for component in components:
+                if component is not None:
+                    component.eval()
+                    component.update(
+                        tree_map(lambda p: p.astype(dtype), component.parameters())
+                    )
+
+            if model_name == "inkling":
+                bins = audio_config.n_mel_bins
+                inputs = mx.arange(batch * frames * bins, dtype=mx.int32)
+                inputs = (
+                    inputs.reshape(batch, frames, bins) % audio_config.mel_vocab_size
+                )
+                features = model.audio_tower(inputs)
+                shape, output_dtype = (batch, frames, text_width), dtype
+            elif model_name == "gemma4_unified":
+                inputs = mx.random.normal(
+                    (batch, frames, audio_config.output_proj_dims)
+                ).astype(dtype)
+                projected = model.get_audio_features(inputs)
+                self._assert_audio_features(
+                    projected, (batch * frames, text_width), dtype
+                )
+                features = model.get_audio_features(inputs, valid_mask)
+                shape, output_dtype = (sum(lengths), text_width), dtype
+            else:
+                is_gemma3n = model_name == "gemma3n"
+                # Gemma 4's subsampling projection requires 128 input mel bins.
+                bins = audio_config.input_feat_size if is_gemma3n else 128
+                inputs = mx.random.normal((batch, frames, bins)).astype(dtype)
+                encoded, mask = model.audio_tower(inputs, ~valid_mask)
+                stride = (
+                    math.prod(s[0] for s in audio_config.sscp_conv_stride_size)
+                    * max(1, audio_config.conf_reduction_factor)
+                    if is_gemma3n
+                    else 4
+                )
+                steps = (frames + stride - 1) // stride
+                width = (
+                    getattr(audio_config, "output_proj_dims", None)
+                    or audio_config.hidden_size
+                )
+                # Both Gemma encoders currently promote float16 inputs to float32.
+                output_dtype = mx.float32
+                self._assert_audio_features(
+                    encoded, (batch, steps, width), output_dtype
+                )
+                self.assertEqual(mask.shape, (batch, steps))
+                self.assertEqual(mask.dtype, mx.bool_)
+                self.assertTrue(mx.array_equal(mask, ~valid_mask[:, ::stride]).item())
+                self.assertTrue(
+                    mx.all(mx.where(mask[..., None], encoded == 0, True)).item()
+                )
+                features = (
+                    model.embed_audio(inputs_embeds=encoded)
+                    if is_gemma3n
+                    else model.embed_audio(encoded)
+                )
+                shape = (batch, steps, text_width)
+            self._assert_audio_features(features, shape, output_dtype)
+
     def _assert_mrope_decode_uses_cache_idx(self, language_model, hidden_size):
         """Shared assertion: MRoPE decode-step reads RoPE position from
         ``cache[0]._idx`` (Python int) rather than ``cache[0].offset.item()``
@@ -317,6 +398,7 @@ CHECKS = {
     "language": "language_test_runner",
     "projector": "mm_projector_test_runner",
     "vision": "vision_test_runner",
+    "audio": "audio_test_runner",
     "input_embeddings": "_check_returns_input_embeddings_features",
     "mrope_cache_index": "_assert_mrope_decode_uses_cache_idx",
     "mrope_deltas": "_assert_mrope_decode_uses_rope_deltas_kwarg",
@@ -363,6 +445,8 @@ def check_arguments(kind, case, model, config):
     """Keep shared component selection and dimension wiring in Python."""
     if kind == "input_embeddings":
         return (model, case["module"]), {}
+    if kind == "audio":
+        return (model, config, case["module"]), case.get("audio", {})
     if kind in {"request_positions", "chunked_positions"}:
         return (model,), {}
     if kind in {"language", "mrope_cache_index", "mrope_deltas"}:

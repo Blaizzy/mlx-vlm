@@ -15,7 +15,7 @@ Use a module path or `-k` to select a smaller group while developing.
 
 | Test module | Scope |
 | --- | --- |
-| `test_models.py` + `model_cases.json` | Shared language, vision, projector, embedding, position, and native forward/cache contracts |
+| `test_models.py` + `model_cases.json` | Shared language, vision, audio, projector, embedding, position, and native forward/cache contracts |
 | `test_tool_parsers.py` | ATEM, Cohere, Gemma 4, GLM, Mistral, Pythonic parsing, and parser selection |
 | `test_apc.py` | Cache lookup, semantic keys, lifecycle, trace logging, and diagnostics |
 | `test_apc_adapters.py` | Cache adapters, component snapshots, and model cache-layout compatibility |
@@ -48,7 +48,7 @@ small files should not automatically be added to those large modules.
 
 ## JSON model cases
 
-`model_cases.json` contains 45 configurable contract cases and 17 native
+`model_cases.json` contains 47 configurable contract cases and 17 native
 forward/cache cases. `test_models.py` collects each case separately with a stable
 model ID, so failures can be selected with `pytest -k`:
 
@@ -102,9 +102,19 @@ full-attention layer. The `qwen3_5` case also covers request-owned positions,
 chunked prefill, and decode-time RoPE deltas;
 `qwen3_5_moe` retains its chunked-prefill regression. Checks that replace inner
 modules with recording stubs run after checks that need the original model.
-The `inkling` case uses only the existing language, vision, and text-only
-input-embedding checks. Audio towers are constructed from `audio_config`, but
-there is no shared audio forward check.
+The `inkling` case checks language, vision, audio, and text-only input embeddings.
+
+The `audio` check supports Inkling, Gemma 3n, Gemma 4, and Gemma 4 Unified.
+Use a tiny `audio_config`; optional `audio: {"frames": 33, "lengths": [33, 13]}`
+sets the input frame count and valid prefix lengths. Defaults are 32 frames
+and two rows with lengths 32 and 16. Lengths control Gemma masks; Inkling's
+tower accepts unmasked integer dMel IDs. Input construction and tower/projector
+selection stay in Python. The check evaluates outputs with float32 and float16
+weights, verifies finite values, shapes, and projection into text dimensions,
+and checks Gemma encoder masks and zeroed padding or Unified's compacted token
+count. Gemma 3n/4 currently return float32 with float16 inputs; this is asserted
+explicitly. `input_embeddings` remains text-only and does not test audio-token
+insertion.
 
 Most cases need no wiring overrides. `vision_path` and `projector_path` select
 unusual component locations; defaults are `vision_tower` and
