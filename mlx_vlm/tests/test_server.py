@@ -5527,6 +5527,7 @@ class TestResponseGenerator:
                 self._next_uid = 1
                 self._active = {}
                 self.next_active_sizes = []
+                self.apc = SimpleNamespace(prepare_prefill=MagicMock())
                 batch_state["instance"] = self
 
             def insert(self, *args, **kwargs):
@@ -5589,7 +5590,7 @@ class TestResponseGenerator:
         gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
         gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
         gen.top_logprobs_k = 0
-        apc_manager = SimpleNamespace(prepare_prefill=MagicMock(), close=MagicMock())
+        apc_manager = SimpleNamespace(close=MagicMock())
         gen.apc_manager = apc_manager
         gen.prefill_step_size = 3072
         gen.tokenizer = SimpleNamespace()
@@ -5651,8 +5652,9 @@ class TestResponseGenerator:
         assert kwargs["compute_logprobs"] is False
         assert kwargs["prefill_step_size"] == 3072
         assert kwargs["apc_manager"] is apc_manager
-        assert apc_manager.prepare_prefill.call_count == 2
-        apc_manager.prepare_prefill.assert_called_with(1)
+        coordinator = batch_state["instance"].apc
+        assert coordinator.prepare_prefill.call_count == 2
+        coordinator.prepare_prefill.assert_called_with(1, prefill_step_size=3072)
         apc_manager.close.assert_called_once_with()
         assert batch_state["instance"].next_active_sizes == [2]
 
