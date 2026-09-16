@@ -48,7 +48,7 @@ small files should not automatically be added to those large modules.
 
 ## JSON model cases
 
-`model_cases.json` contains 44 configurable contract cases and 17 native
+`model_cases.json` contains 45 configurable contract cases and 17 native
 forward/cache cases. `test_models.py` collects each case separately with a stable
 model ID, so failures can be selected with `pytest -k`:
 
@@ -102,13 +102,19 @@ full-attention layer. The `qwen3_5` case also covers request-owned positions,
 chunked prefill, and decode-time RoPE deltas;
 `qwen3_5_moe` retains its chunked-prefill regression. Checks that replace inner
 modules with recording stubs run after checks that need the original model.
+The `inkling` case uses only the existing language, vision, and text-only
+input-embedding checks. Audio towers are constructed from `audio_config`, but
+there is no shared audio forward check.
 
 Most cases need no wiring overrides. `vision_path` and `projector_path` select
 unusual component locations; defaults are `vision_tower` and
 `multi_modal_projector`. The optional `vision` object holds input data and layout
 settings: `input_shape`, `feature_layer`, `channel_first`, and `grid_thw` (integer
 grid by default;
-`grid_dtype: "float32"` preserves the floating-grid scenario).
+`grid_dtype: "float32"` preserves the floating-grid scenario). An `input_shape`
+with more than two dimensions specifies the complete tensor shape, such as
+Inkling's `[patches, time, height, width, channels]`. Set `feature_layer: null`
+when the vision tower returns its feature tensor directly.
 
 The `dense` table retains the prototype's name and includes both dense and MoE
 families. Each entry checks a full forward pass and cached token decode.

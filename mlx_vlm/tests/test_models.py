@@ -157,7 +157,9 @@ class ModelChecks(unittest.TestCase):
             )
             self.assertEqual(vision_tower.model_type, model_type)
 
-            if model_type in [
+            if len(image_size) > 2:
+                input_tensor = mx.random.uniform(shape=image_size)
+            elif model_type in [
                 "qwen2_5_vl",
                 "qwen3_5",
                 "qwen3_5_moe",
@@ -192,7 +194,8 @@ class ModelChecks(unittest.TestCase):
             else:
                 hidden_states = vision_tower(input_tensor, **kwargs)
 
-            hidden_states = hidden_states[vision_feature_layer]
+            if vision_feature_layer is not None:
+                hidden_states = hidden_states[vision_feature_layer]
 
             # Check vision hidden feature layer's shape matches the expected hidden size
             if channel_first:
@@ -391,7 +394,12 @@ def check_arguments(kind, case, model, config):
         if image_size is None:
             image_size = (vision_config.image_size, vision_config.image_size)
         hidden_size = first_attribute(
-            vision_config, "out_hidden_size", "hidden_size", "d_model", "width"
+            vision_config,
+            "out_hidden_size",
+            "hidden_size",
+            "d_model",
+            "width",
+            "text_hidden_size",
         )
         # Molmo's hidden_size is the projector intermediate width.
         if case["module"] == "molmo":
