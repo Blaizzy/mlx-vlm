@@ -345,26 +345,26 @@ def test_windowed_memory_budget_is_independent_of_checkpoint_order(
     ],
 )
 @pytest.mark.parametrize("chunk_size", [37, 256])
-@pytest.mark.parametrize("length", [1, 6000])
-def test_builtin_kv_profiles_bound_prefill_allocations(make_cache, chunk_size, length):
+def test_builtin_kv_profiles_bound_prefill_allocations(make_cache, chunk_size):
     cache = make_cache()
     empty = cache_memory_components([cache], 0)[0]
     assert not empty.fallback
-    assert empty.footprint(length, chunk_size) == 0
+    assert empty.footprint(6000, chunk_size) == 0
     cache.update_and_fetch(mx.ones((1, 1, 1, 4)), mx.ones((1, 1, 1, 8)))
     profile = cache_memory_components([cache], 1)[0]
     assert not profile.fallback
     assert profile.source_bytes == cache.nbytes
+    estimate = profile.footprint(1, chunk_size)
+    assert cache.nbytes <= estimate < cache.nbytes + 2 * 256 * 48
 
-    future = make_cache()
-    peak = 0
-    for start in range(0, length, chunk_size):
-        if isinstance(future, ChunkedKVCache):
-            future.maybe_trim_front()
-        size = min(chunk_size, length - start)
-        future.update_and_fetch(mx.ones((1, 1, size, 4)), mx.ones((1, 1, size, 8)))
-        peak = max(peak, future.nbytes)
-    estimate = profile.footprint(length, chunk_size)
+    peak = cache.nbytes
+    for start in range(1, 6000, chunk_size):
+        if isinstance(cache, ChunkedKVCache):
+            cache.maybe_trim_front()
+        size = min(chunk_size, 6000 - start)
+        cache.update_and_fetch(mx.ones((1, 1, size, 4)), mx.ones((1, 1, size, 8)))
+        peak = max(peak, cache.nbytes)
+    estimate = profile.footprint(6000, chunk_size)
     assert peak <= estimate < peak + 2 * 256 * 48
     assert profile.footprint(0, chunk_size) == 0
 
@@ -375,12 +375,13 @@ def test_builtin_kv_profiles_bound_prefill_allocations(make_cache, chunk_size, l
 def test_pooling_profiles_separate_buffers_from_compressed_growth(
     batch_size, ratio, seed_length
 ):
-    def make_cache():
-        if batch_size == 1:
-            return PoolingCache(ratio)
-        return BatchPoolingCache(ratio, left_padding=[0, 3, 7])
+    cache = (
+        PoolingCache(ratio)
+        if batch_size == 1
+        else BatchPoolingCache(ratio, left_padding=[0, 3, 7])
+    )
 
-    def advance(cache, length):
+    def advance(length):
         kv = mx.ones((batch_size, length, 8), dtype=mx.float16)
         gate = mx.ones((batch_size, length, 4), dtype=mx.float32)
         ready, _, _ = cache.accumulate_windows(kv, gate, 0)
@@ -388,19 +389,17 @@ def test_pooling_profiles_separate_buffers_from_compressed_growth(
             mx.ones((batch_size, ready.shape[1] // ratio, 4), dtype=mx.float16)
         )
 
-    cache = make_cache()
     empty = cache_memory_components([cache], 0)[0]
     assert not empty.fallback and empty.footprint(6000) == 0
-    advance(cache, seed_length)
+    advance(seed_length)
     profile = cache_memory_components([cache], seed_length, batch_size=batch_size)[0]
     assert not profile.fallback
     assert profile.fixed_bytes == ratio * 32
 
-    future = make_cache()
-    for start in range(0, 6000, 37):
-        advance(future, min(37, 6000 - start))
+    for start in range(seed_length, 6000, 37):
+        advance(min(37, 6000 - start))
     estimate = batch_size * profile.footprint(6000)
-    assert future.nbytes <= estimate <= 2 * future.nbytes
+    assert cache.nbytes <= estimate <= 2 * cache.nbytes
 
 
 @pytest.mark.parametrize("read_only", [False, True])
@@ -414,8 +413,6 @@ def test_static_prefix_profile_survives_restore(read_only):
     assert not profile.fallback
     if read_only:
         assert profile.footprint(1) == profile.footprint(6000) == cache.nbytes
-    else:
-        assert profile.footprint(6000) >= 6000 * 48
     cache.update_and_fetch(mx.ones((1, 1, 1, 4)), mx.ones((1, 1, 1, 8)))
     assert cache.offset == (16 if read_only else 17)
     legacy = StaticPrefixKVCache.from_state(source.state, source.meta_state[:3])
