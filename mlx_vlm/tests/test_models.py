@@ -17,6 +17,15 @@ from mlx.utils import tree_map
 class ModelChecks(unittest.TestCase):
     """Reusable assertions; each JSON case constructs fresh configs and models."""
 
+    def forward_cache_test_runner(self, model, vocab_size):
+        model.eval()
+        mx.eval(model.parameters())
+        ids = mx.array([[1, 5, 9, 13, 2, 7, 11, 3]])
+        assert model(ids).logits.shape == (1, 8, vocab_size)
+        cache = model.language_model.make_cache()
+        model(ids[:, :-1], cache=cache)
+        assert model(ids[:, -1:], cache=cache).logits.shape == (1, 1, vocab_size)
+
     def _check_returns_input_embeddings_features(self, model, model_name):
         """Helper to test get_input_embeddings returns InputEmbeddingsFeatures."""
         from mlx_vlm.models.base import InputEmbeddingsFeatures
@@ -118,10 +127,21 @@ class ModelChecks(unittest.TestCase):
             self.assertEqual(logits.dtype, t)
 
     def mm_projector_test_runner(
-        self, mm_projector, vision_hidden_size, text_hidden_size
+        self,
+        mm_projector,
+        vision_hidden_size,
+        text_hidden_size,
+        *,
+        grid_hw=None,
+        downsample_ratio=1,
     ):
-
-        batch_size = 1
+        batch_size = math.prod(grid_hw) if grid_hw else 1
+        output_tokens = (
+            math.prod(math.ceil(n / downsample_ratio) for n in grid_hw)
+            if grid_hw
+            else 1
+        )
+        kwargs = dict(zip(("n_h", "n_w"), grid_hw)) if grid_hw else {}
 
         for t in [mx.float32, mx.float16]:
             mm_projector.update(
@@ -133,8 +153,8 @@ class ModelChecks(unittest.TestCase):
             )
             input_tensor = mx.array(vision_features)
 
-            outputs = mm_projector(input_tensor)
-            self.assertEqual(outputs.shape, (batch_size, text_hidden_size))
+            outputs = mm_projector(input_tensor, **kwargs)
+            self.assertEqual(outputs.shape, (output_tokens, text_hidden_size))
             self.assertEqual(outputs.dtype, t)
 
     def vision_test_runner(
@@ -156,7 +176,8 @@ class ModelChecks(unittest.TestCase):
             vision_tower.update(
                 tree_map(lambda p: p.astype(t), vision_tower.parameters())
             )
-            self.assertEqual(vision_tower.model_type, model_type)
+            if model_type is not None:
+                self.assertEqual(vision_tower.model_type, model_type)
 
             if len(image_size) > 2:
                 input_tensor = mx.random.uniform(shape=image_size)
@@ -164,6 +185,7 @@ class ModelChecks(unittest.TestCase):
                 "qwen2_5_vl",
                 "qwen3_5",
                 "qwen3_5_moe",
+                "qwen4_exp",
                 "glm4v_moe",
                 "glm4v",
                 "hunyuan_vl",
@@ -395,6 +417,7 @@ class ModelChecks(unittest.TestCase):
 
 
 CHECKS = {
+    "forward_cache": "forward_cache_test_runner",
     "language": "language_test_runner",
     "projector": "mm_projector_test_runner",
     "vision": "vision_test_runner",
@@ -443,6 +466,8 @@ def first_attribute(obj, *names):
 
 def check_arguments(kind, case, model, config):
     """Keep shared component selection and dimension wiring in Python."""
+    if kind == "forward_cache":
+        return (model, getattr(config, "text_config", config).vocab_size), {}
     if kind == "input_embeddings":
         return (model, case["module"]), {}
     if kind == "audio":
@@ -451,7 +476,7 @@ def check_arguments(kind, case, model, config):
         return (model,), {}
     if kind in {"language", "mrope_cache_index", "mrope_deltas"}:
         language_model = model.language_model
-        text_config = config.text_config
+        text_config = getattr(config, "text_config", config)
         # Phi3-V keeps its language dimensions on the top-level config.
         if case["module"] == "phi3_v":
             text_config = config
@@ -465,6 +490,11 @@ def check_arguments(kind, case, model, config):
         projector = attrgetter(case.get("projector_path", "multi_modal_projector"))(
             model
         )
+        if case["module"] == "deepseek_v4":
+            return (projector, config.vision_dim, config.hidden_size), {
+                "grid_hw": case["vision"]["grid_hw"],
+                "downsample_ratio": config.vision_downsample_ratio,
+            }
         return (
             projector,
             config.vision_config.hidden_size,
@@ -472,8 +502,20 @@ def check_arguments(kind, case, model, config):
         ), {}
     if kind == "vision":
         vision = attrgetter(case.get("vision_path", "vision_tower"))(model)
-        vision_config = config.vision_config
         options = case.get("vision", {})
+        if case["module"] == "deepseek_v4":
+            return (
+                vision,
+                None,
+                config.vision_dim,
+                3,
+                tuple(options["input_shape"]),
+            ), {
+                "vision_feature_layer": options["feature_layer"],
+                "n_h": options["grid_hw"][0],
+                "n_w": options["grid_hw"][1],
+            }
+        vision_config = config.vision_config
         image_size = options.get("input_shape")
         if image_size is None:
             image_size = (vision_config.image_size, vision_config.image_size)
@@ -527,10 +569,4 @@ def test_dense_model(name):
     module = importlib.import_module("mlx_vlm.models." + name)
     config = DATA["dense"][name]
     model = module.Model(module.ModelConfig.from_dict(copy.deepcopy(config)))
-    model.eval()
-    mx.eval(model.parameters())
-    ids = mx.array([[1, 5, 9, 13, 2, 7, 11, 3]])
-    assert model(ids).logits.shape == (1, 8, config["vocab_size"])
-    cache = model.language_model.make_cache()
-    model(ids[:, :-1], cache=cache)
-    assert model(ids[:, -1:], cache=cache).logits.shape == (1, 1, config["vocab_size"])
+    ModelChecks().forward_cache_test_runner(model, config["vocab_size"])

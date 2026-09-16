@@ -28,8 +28,6 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_weight_quantization.py` | FP8 and one-bit weight conversion and execution |
 | `test_moe_offload.py` | MoE checkpoint repacking, expert offload, output parity, and failure handling |
 | `test_qwen3_5.py` | Qwen3.5 patch layouts, MTP sanitization, and ragged attention fallbacks |
-| `test_qwen4_exp.py` | Qwen4 model behavior, external PLE storage, and MTP drafting |
-| `test_deepseek_v4_vision.py` | DeepSeek V4 vision behavior and checkpoint conversion |
 | `test_nemotron_voicechat.py` | VoiceChat runtime, streaming, and checkpoint conversion |
 | `test_mage_vl.py` | Mage VL video processing and position handling |
 | `test_dflash_drafters.py` | DFlash2, Laguna, and Muse Glimmer drafter contracts |
@@ -48,7 +46,7 @@ small files should not automatically be added to those large modules.
 
 ## JSON model cases
 
-`model_cases.json` contains 47 configurable contract cases and 17 native
+`model_cases.json` contains 49 configurable contract cases and 17 native
 forward/cache cases. `test_models.py` collects each case separately with a stable
 model ID, so failures can be selected with `pytest -k`:
 
@@ -116,15 +114,22 @@ count. Gemma 3n/4 currently return float32 with float16 inputs; this is asserted
 explicitly. `input_embeddings` remains text-only and does not test audio-token
 insertion.
 
+The `deepseek_v4` and `qwen4_exp` cases use shared language, vision, text-only
+input-embedding, and `forward_cache` checks; DeepSeek also checks its aligner
+through `projector`. Their standalone regression modules are removed. The
+Qwen4 transaction tests read their tiny config from the same JSON case.
+`forward_cache` reuses the native full-forward and cached-decode shape checks.
+
 Most cases need no wiring overrides. `vision_path` and `projector_path` select
 unusual component locations; defaults are `vision_tower` and
 `multi_modal_projector`. The optional `vision` object holds input data and layout
-settings: `input_shape`, `feature_layer`, `channel_first`, and `grid_thw` (integer
-grid by default;
+settings: `input_shape`, `feature_layer`, `channel_first`, `grid_hw`, and
+`grid_thw` (integer grid by default;
 `grid_dtype: "float32"` preserves the floating-grid scenario). An `input_shape`
 with more than two dimensions specifies the complete tensor shape, such as
 Inkling's `[patches, time, height, width, channels]`. Set `feature_layer: null`
-when the vision tower returns its feature tensor directly.
+when the vision tower returns its feature tensor directly. DeepSeek's `grid_hw`
+gives the patch-grid height and width to its vision tower and aligner.
 
 The `dense` table retains the prototype's name and includes both dense and MoE
 families. Each entry checks a full forward pass and cached token decode.

@@ -1,6 +1,8 @@
 """Cache lifetimes at target, drafter, and generator boundaries."""
 
+import json
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -19,6 +21,7 @@ from mlx_vlm.models.cache import (
 )
 from mlx_vlm.models.deepseek_v4.language import LanguageModel as DeepseekLanguageModel
 from mlx_vlm.models.glm5_next.language import LanguageModel as GlmLanguageModel
+from mlx_vlm.models.qwen4_exp.config import TextConfig as Qwen4TextConfig
 from mlx_vlm.speculative.cache_state import start_speculative_cache
 from mlx_vlm.speculative.common import verify_forward
 from mlx_vlm.speculative.dflash import (
@@ -32,7 +35,6 @@ from mlx_vlm.speculative.drafters.glm5_next_mtp import (
 )
 from mlx_vlm.speculative.eagle3 import _eagle3_rounds, _eagle3_rounds_batch
 from mlx_vlm.speculative.mtp import _mtp_rounds, _mtp_rounds_batch, _mtp_verify_target
-from mlx_vlm.tests.test_qwen4_exp import _tiny_text_config
 from mlx_vlm.tests.test_speculative import (
     _tiny_deepseek_v4_config,
     _tiny_glm5_next_text_config,
@@ -252,7 +254,13 @@ def test_ordinary_linear_attention_uses_temporal_cache_without_adapter(family, s
         config.linear_head_dim = 32
         layer = Glm5NextLinearAttention(config)
     else:
-        config = _tiny_text_config()
+        cases = json.loads(Path(__file__).with_name("model_cases.json").read_text())[
+            "cases"
+        ]
+        values = next(case for case in cases if case["id"] == "qwen4_exp")["config"][
+            "text_config"
+        ]
+        config = Qwen4TextConfig.from_dict(values)
         config.linear_key_head_dim = config.linear_value_head_dim = 32
         layer = Qwen3_5GatedDeltaNet(config)
     layer.eval()
