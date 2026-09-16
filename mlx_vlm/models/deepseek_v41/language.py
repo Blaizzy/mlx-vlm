@@ -27,6 +27,10 @@ def _write_span(buffer, values, batch: int, start: int, fill=0, dtype=None):
     span it owns and leaves the rest alone, which is what lets a rejected
     speculative block be dropped by moving the offset back. Rows past ``batch``
     are preserved so a filtered batch can grow again.
+
+    The buffer ends exactly ``start + length`` wide. Readers slice it with a
+    length derived from their own compression ratio, which can run past what
+    the writing layer covered, so the width is what keeps those slices honest.
     """
     length, tail = values.shape[1], values.shape[2:]
     need = start + length
@@ -70,6 +74,75 @@ def _write_span(buffer, values, batch: int, start: int, fill=0, dtype=None):
     return head
 
 
+WINDOW_INPLACE_MAX_SPAN = 64
+WINDOW_SLACK_ROWS = 512
+
+
+def _write_window(buffer, values, batch: int, start: int):
+    """Append this step's window KV.
+
+    The window is only read back as ``[:start + length]`` by the layer that
+    wrote it, so capacity past that is invisible and a short span can go in
+    place. That is what decode needs: rebuilding the buffer to add one row
+    copies the whole context, per layer, per token.
+
+    A prefill-sized span keeps the original rebuild. It is already
+    proportional to the span, happens once per chunk rather than once per
+    token, and at ``start == 0`` it hands back ``values`` untouched -- which is
+    also what fixes the buffer's dtype to the model's, so the span write must
+    never widen it.
+    """
+    length, dim = values.shape[1], values.shape[2]
+    need = start + length
+    if (
+        length <= WINDOW_INPLACE_MAX_SPAN
+        and buffer is not None
+        and buffer.shape[0] >= batch
+    ):
+        if buffer.shape[1] < need:
+            grown = mx.zeros(
+                (buffer.shape[0], need + WINDOW_SLACK_ROWS, dim), dtype=buffer.dtype
+            )
+            if buffer.shape[1]:
+                grown[:, : buffer.shape[1]] = buffer
+            buffer = grown
+        buffer[:batch, start:need] = values.astype(buffer.dtype)
+        return buffer
+
+    if buffer is None:
+        buffer = mx.zeros((batch, 0, dim), dtype=values.dtype)
+    if buffer.shape[0] < batch:
+        buffer = mx.concatenate(
+            [
+                buffer,
+                mx.zeros(
+                    (batch - buffer.shape[0], buffer.shape[1], dim), dtype=buffer.dtype
+                ),
+            ],
+            axis=0,
+        )
+    if buffer.shape[1] < need:
+        buffer = mx.concatenate(
+            [
+                buffer,
+                mx.zeros(
+                    (buffer.shape[0], need - buffer.shape[1], dim), dtype=buffer.dtype
+                ),
+            ],
+            axis=1,
+        )
+    parts = []
+    if start > 0:
+        parts.append(buffer[:batch, :start])
+    parts.append(values)
+    if buffer.shape[1] > need:
+        parts.append(buffer[:batch, need:])
+    head = mx.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
+    if buffer.shape[0] > batch:
+        return mx.concatenate([head, buffer[batch:]], axis=0)
+    return head
+
+
 @lru_cache(64)
 def _index_cos_sin(length: int, rope_dim: int, theta: float, yarn: tuple):
     """RoPE tables with DeepSeek-YaRN interpolation, one row per position."""
@@ -94,6 +167,62 @@ def _index_cos_sin(length: int, rope_dim: int, theta: float, yarn: tuple):
 
     freqs = mx.arange(length, dtype=mx.float32)[:, None] * inv_freq[None, :]
     return mx.cos(freqs), mx.sin(freqs)
+
+
+INDEX_SCORE_TILE = 4096
+INDEX_SCORE_TILE_MIN_ELEMS = 1 << 26
+
+
+def _index_scores(
+    q: mx.array,
+    index_k: mx.array,
+    weights: mx.array,
+    compress_lens=None,
+    candidates=None,
+) -> mx.array:
+    """Head-weighted rectified scores of every query against every index key.
+
+    The per-head scores are summed away immediately, so they are computed a
+    tile of keys at a time: materialising them for the whole key axis at once
+    costs `queries * heads * keys` floats, which at prefill widths is tens of
+    gigabytes per layer.
+
+    No reduction crosses a tile. Tiles are kept even in width because a tile
+    one key wide selects a different matmul kernel and moves the scores by
+    about 1e-4 relative, enough to reorder positions that close together; with
+    even tiles the result matched the untiled form bit for bit at every shape
+    tested, including the prefill widths this exists for.
+
+    Tiling only pays once the scores are big enough to be worth not holding.
+    One query's worth is a few megabytes and splitting that just buys kernel
+    launches, which costs decode about 6% at long context; splitting a short
+    key axis costs a wide batch about 1.5% of its prefill for nothing.
+    """
+    n_keys = index_k.shape[1]
+    width = n_keys
+    held = q.shape[1] * q.shape[2] * n_keys
+    if n_keys > INDEX_SCORE_TILE and held > INDEX_SCORE_TILE_MIN_ELEMS:
+        width = -(-n_keys // -(-n_keys // INDEX_SCORE_TILE))
+
+    whole = width >= n_keys
+
+    def one(start, stop):
+        keys = index_k if whole else index_k[:, start:stop]
+        tile = mx.einsum("bsnd,btd->bsnt", q, keys)
+        tile = (mx.maximum(tile, 0) * weights[..., None]).sum(axis=2)
+        if compress_lens is not None:
+            positions = mx.arange(stop) if whole else mx.arange(start, stop)
+            tile = mx.where(positions[None, :] < compress_lens, tile, -mx.inf)
+        if candidates is not None:
+            cand = candidates if whole else candidates[..., start:stop]
+            tile = mx.where(cand, tile, -mx.inf)
+        return tile
+
+    if width >= n_keys:
+        return one(0, n_keys)
+    return mx.concatenate(
+        [one(s, min(s + width, n_keys)) for s in range(0, n_keys, width)], axis=-1
+    )
 
 
 def _yarn_params(config: ModelConfig):
@@ -249,13 +378,14 @@ class Indexer(nn.Module):
         weights = self.weights_proj(x).astype(mx.float32) * (
             self.scale * self.n_heads**-0.5
         )
-        scores = mx.einsum("bsnd,btd->bsnt", q, index_k)
-        scores = mx.maximum(scores, 0) * weights[..., None]
-        scores = scores.sum(axis=2)
-
         compress_lens = (mx.arange(start_pos + 1, end_pos + 1) // ratio)[:, None]
-        visible = mx.arange(index_k.shape[1])[None, :] < compress_lens
-        scores = mx.where(visible, scores, -mx.inf)
+        scores = _index_scores(
+            q,
+            index_k,
+            weights,
+            compress_lens,
+            cache.candidates if self.uses_candidates else None,
+        )
 
         if self.is_candidate_source:
             cache.candidates = select_candidate_blocks(
@@ -264,8 +394,6 @@ class Indexer(nn.Module):
                 self.candidate_topk_blocks,
                 self.candidate_block_size,
             )
-        elif self.uses_candidates:
-            scores = mx.where(cache.candidates, scores, -mx.inf)
 
         topk = min(self.index_topk, end_pos // ratio)
         idxs = mx.sort(mx.argsort(-scores, axis=-1)[..., :topk], axis=-1).astype(
@@ -509,42 +637,7 @@ class DeepseekV41Attention(nn.Module):
         kv = self.rope(kv, start_pos).reshape(batch, seqlen, self.head_dim)
         kv = fake_quant_fp8_ue8m0(kv.astype(mx.float32)).astype(kv.dtype)
         need_len = start_pos + seqlen
-        buffer = cache.window[self.layer_idx]
-        if buffer is None:
-            buffer = mx.zeros((batch, 0, self.head_dim), dtype=mx.float32)
-        if buffer.shape[0] < batch:
-            buffer = mx.concatenate(
-                [
-                    buffer,
-                    mx.zeros(
-                        (batch - buffer.shape[0], buffer.shape[1], self.head_dim),
-                        dtype=mx.float32,
-                    ),
-                ],
-                axis=0,
-            )
-        if buffer.shape[1] < need_len:
-            buffer = mx.concatenate(
-                [
-                    buffer,
-                    mx.zeros(
-                        (buffer.shape[0], need_len - buffer.shape[1], self.head_dim),
-                        dtype=mx.float32,
-                    ),
-                ],
-                axis=1,
-            )
-        parts = []
-        if start_pos > 0:
-            parts.append(buffer[:batch, :start_pos])
-        parts.append(kv)
-        if buffer.shape[1] > need_len:
-            parts.append(buffer[:batch, need_len:])
-        head = mx.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
-        if buffer.shape[0] > batch:
-            buffer = mx.concatenate([head, buffer[batch:]], axis=0)
-        else:
-            buffer = head
+        buffer = _write_window(cache.window[self.layer_idx], kv, batch, start_pos)
         cache.window[self.layer_idx] = buffer
         if start_pos == 0:
             part, base = buffer[:batch, :need_len], 0
