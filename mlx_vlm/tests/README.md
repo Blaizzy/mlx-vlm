@@ -15,6 +15,7 @@ Use a module path or `-k` to select a smaller group while developing.
 
 | Test module | Scope |
 | --- | --- |
+| `test_models.py` + `model_cases.json` | Shared language, vision, projector, embedding, position, and native forward/cache contracts |
 | `test_tool_parsers.py` | ATEM, Cohere, Gemma 4, GLM, Mistral, Pythonic parsing, and parser selection |
 | `test_apc.py` | Cache lookup, semantic keys, lifecycle, trace logging, and diagnostics |
 | `test_apc_adapters.py` | Cache adapters, component snapshots, and model cache-layout compatibility |
@@ -41,9 +42,35 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_utils.py` | General loading/conversion utilities and local Python model files |
 
 Other architecture-specific modules remain focused on their own models. The
-larger `test_models.py`, `test_processors.py`, `test_generate.py`, `test_server.py`,
-and `test_speculative.py` contain their existing broad integration checks; related
+larger `test_processors.py`, `test_generate.py`, `test_server.py`, and
+`test_speculative.py` contain their existing broad integration checks; related
 small files should not automatically be added to those large modules.
+
+## JSON model cases
+
+`model_cases.json` contains 45 configurable contract cases and 17 native
+forward/cache cases. `test_models.py` collects each case separately with a stable
+model ID, so failures can be selected with `pytest -k`:
+
+```sh
+python -m pytest -q mlx_vlm/tests/test_models.py -k llava_bunny
+```
+
+For a contract case, `module` names the module under `mlx_vlm.models`. The runner
+constructs `configs` in declaration order, then `model`, and runs the listed
+`checks` in order. Constructor specs accept `type`, positional `args`, and
+keyword `kwargs`. Values support references such as `{"ref": "config.text_config"}`,
+nested `{"config": {"type": "TextConfig", "kwargs": {}}}` constructors, tuples,
+MLX dtypes, and `array`/`ones` inputs. Ordinary JSON values pass through. Each case
+gets fresh configuration objects and a fresh model; the JSON contains no Python
+expressions or executable code.
+
+The `dense` table retains the prototype's name and includes both dense and MoE
+families. Each entry checks a full forward pass and cached token decode.
+Model-specific regression scenarios need explicit assertions in the relevant
+domain test module. The shared contracts do not replace numerical-reference,
+checkpoint-conversion, or stateful integration assertions; MoE offload remains in
+`test_moe_offload.py`, and training gradients remain in `test_trainer.py`.
 
 These files retain separate execution boundaries:
 

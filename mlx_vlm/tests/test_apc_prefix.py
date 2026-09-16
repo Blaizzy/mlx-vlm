@@ -20,8 +20,7 @@ from mlx_vlm.models.cache import ArraysCache, KVCache
 def _make_tiny_gemma4():
     """Create a tiny Gemma 4 language model with mixed cache types.
 
-    Config adapted from test_models.py::TestModels::test_gemma4 with
-    num_hidden_layers bumped to 6 for full sliding_window_pattern coverage.
+    Six hidden layers provide full sliding_window_pattern coverage.
 
     sliding_window_pattern=3 → pattern: [sliding, sliding, full] repeated
     With 6 layers: 4 RotatingKVCache + 2 KVCache → triggers exact mode.
@@ -75,8 +74,7 @@ def _make_tiny_gemma4():
 def _make_tiny_qwen35():
     """Create a tiny Qwen 3.5 language model with mixed cache types.
 
-    Config adapted from test_models.py::TestModels::test_qwen3_5_decode_uses_rope_deltas_kwarg
-    with num_hidden_layers bumped to 4 for full_attention_interval coverage.
+    Four hidden layers provide full_attention_interval coverage.
 
     full_attention_interval=4 → 3 out of 4 layers use ArraysCache (linear/SSM),
     1 out of 4 uses KVCache (full attention) → triggers exact mode.
