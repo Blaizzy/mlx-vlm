@@ -50,7 +50,7 @@ tests remain in their existing modules.
 
 ## JSON model cases
 
-`model_cases.json` contains 50 configurable contract cases and 17 native
+`model_cases.json` contains 51 configurable contract cases and 17 native
 forward/cache cases. `test_models.py` collects each case separately with a stable
 model ID, so failures can be selected with `pytest -k`:
 
@@ -129,6 +129,12 @@ existing language, vision, projector, text-only input-embedding, and
 `forward_cache` checks. Its tiny language config includes dense and MoE layers;
 vision uses four flattened patches with a 2×2 grid. The MiniMax speculative
 rollback checks remain in `test_speculative.py`.
+
+The `indic_ocr` case checks its Qwen3.5-based recognizer with the existing
+language, vision, text-only input-embedding, and `forward_cache` checks. Its
+tiny config includes linear and full-attention layers and four vision patches.
+The standalone OCR pipeline tests are removed; shared model contracts do not
+cover combined checkpoint loading, layout cleanup, cropping, or reconstruction.
 
 Most cases need no wiring overrides. `vision_path` and `projector_path` select
 unusual component locations; defaults are `vision_tower` and
