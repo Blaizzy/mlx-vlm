@@ -56,6 +56,47 @@ def test_kv_cache_extracts_one_active_row(factory):
     assert mx.array_equal(extracted.values, values[1:2]).item()
 
 
+@pytest.mark.parametrize(
+    "factory,capacities",
+    [
+        (KVCache, [256, 528, 528, 822, 1078]),
+        (HyV4KVCache, [256, 768, 768, 1536, 1536]),
+    ],
+)
+def test_kv_allocation_preserves_existing_growth(factory, capacities):
+    cache = factory()
+    chunks = []
+    for length, capacity in zip([16, 257, 37, 512, 1], capacities):
+        keys = mx.full((1, 1, length, 4), len(chunks), dtype=mx.float32)
+        chunks.append(keys)
+        actual_keys, actual_values = cache.update_and_fetch(keys, keys + 10)
+        expected = mx.concatenate(chunks, axis=2)
+        assert cache.keys.shape[2] == capacity
+        assert mx.array_equal(actual_keys, expected).item()
+        assert mx.array_equal(actual_values, expected + 10).item()
+
+
+@pytest.mark.parametrize("factory", [KVCache, HyV4KVCache])
+@pytest.mark.parametrize("prefix_length", [0, 16])
+@pytest.mark.parametrize("chunk_size", [37, 256, 1024])
+def test_kv_capacity_forecast_matches_actual_allocation(
+    factory, prefix_length, chunk_size
+):
+    cache = factory()
+    if prefix_length:
+        keys = mx.ones((1, 1, prefix_length, 4))
+        cache.update_and_fetch(keys, keys)
+        cache = factory.from_state(cache.state, cache.meta_state)
+    capacity = 0 if cache.keys is None else cache.keys.shape[2]
+    predicted = cache.allocation_policy.prefill_capacity(
+        6000, chunk_size, step=cache.step, capacity=capacity, used=cache.offset
+    )
+    for start in range(prefix_length, 6000, chunk_size):
+        keys = mx.ones((1, 1, min(chunk_size, 6000 - start), 4))
+        cache.update_and_fetch(keys, keys)
+    assert cache.keys.shape[2] == predicted
+
+
 def test_cache_list_can_extract_an_already_extracted_kv_cache():
     first, _, _ = _make_kv_cache()
     second, _, _ = _make_kv_cache()

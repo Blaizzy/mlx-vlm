@@ -48,7 +48,15 @@ class PrefillMemoryPlan:
         capacity = max(self.prefix_lengths) + max(
             n - p for n, p in zip(self.lengths, self.prefix_lengths)
         )
-        row_bytes = sum(c.footprint(capacity, self.chunk_size) for c in self.components)
+        row_bytes = sum(
+            c.footprint(
+                capacity,
+                self.chunk_size,
+                prefix_tokens=max(self.prefix_lengths),
+                use_current=bool(live_bytes),
+            )
+            for c in self.components
+        )
         return max(0, 2 * len(self.lengths) * row_bytes - live_bytes)
 
     def observe(self, components, *, live_bytes: int) -> int:
@@ -57,7 +65,7 @@ class PrefillMemoryPlan:
         if len(previous) == len(self.components):
             for i, (old, new) in enumerate(zip(previous, self.components)):
                 if not new.source_bytes:
-                    self.components[i] = old
+                    self.components[i] = replace(old, allocated_tokens=0, used_tokens=0)
                 elif old.fallback and new.fallback:
                     self.components[i] = replace(
                         new,
@@ -95,7 +103,10 @@ class PrefillMemoryPlan:
     def restore_bytes(self, prompt_cache, token_count, capacity) -> int:
         components = cache_memory_components(prompt_cache, token_count)
         return sum(
-            max(c.source_bytes, c.footprint(capacity, self.chunk_size))
+            max(
+                c.source_bytes,
+                c.footprint(capacity, self.chunk_size, prefix_tokens=token_count),
+            )
             for c in components
         )
 

@@ -560,6 +560,7 @@ def _minimax_memory_profile(c, token_count):
     return replace(
         profile,
         source_bytes=c.nbytes,
+        allocation=None,
         fixed_bytes=ceil((c.step - 1) * per_token),
         bytes_per_token=per_token,
         step=1,

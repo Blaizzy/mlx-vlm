@@ -1,27 +1,23 @@
-from dataclasses import replace
-
 import mlx.core as mx
 
-from ..cache import KVCache
+from ..cache import KVCache, KVCacheAllocation
 
 
 class HyV4KVCache(KVCache):
-    def memory_profile(self, token_count):
-        profile = super().memory_profile(token_count)
-        return replace(profile, bytes_per_token=2 * profile.bytes_per_token)
+    allocation_policy = KVCacheAllocation(growth_factor=2)
+    memory_profile = KVCache.memory_profile
 
     def update_and_fetch(self, keys, values):
         previous = self.offset
         required = previous + keys.shape[2]
         capacity = 0 if self.keys is None else self.keys.shape[2]
-        if required > capacity:
+        new_capacity = self.allocation_policy.capacity_for_update(
+            capacity, previous, keys.shape[2], step=self.step
+        )
+        if new_capacity > capacity:
             B, n_kv_heads, _, k_head_dim = keys.shape
             v_head_dim = values.shape[3]
-            if keys.shape[2] < self.step:
-                capacity = required
-            else:
-                capacity = max(required, 2 * max(capacity, keys.shape[2]))
-            capacity = ((capacity + self.step - 1) // self.step) * self.step
+            capacity = new_capacity
             new_k = mx.zeros((B, n_kv_heads, capacity, k_head_dim), keys.dtype)
             new_v = mx.zeros((B, n_kv_heads, capacity, v_head_dim), values.dtype)
             if self.keys is not None:

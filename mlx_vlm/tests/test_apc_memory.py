@@ -10,6 +10,7 @@ import pytest
 from mlx_vlm import apc
 from mlx_vlm.apc import APCManager, DiskBlockStore, _cache_nbytes, from_env
 from mlx_vlm.apc_adapters import cache_memory_components, clone_cache_entry
+from mlx_vlm.apc_coordinator import PrefillMemoryPlan
 from mlx_vlm.models.cache import (
     ArraysCache,
     BatchKVCache,
@@ -740,7 +741,9 @@ def test_automatic_budget_and_overrides(monkeypatch):
     assert manager.memory_reserve_bytes == 2 << 30
 
 
-@pytest.mark.parametrize("make_cache", [HyV4KVCache, lambda: RingSlidingKVCache(16)])
+@pytest.mark.parametrize(
+    "make_cache", [KVCache, HyV4KVCache, lambda: RingSlidingKVCache(16)]
+)
 @pytest.mark.parametrize("chunk_size", [37, 256, 1024])
 def test_model_kv_profiles_bound_restored_prefill(make_cache, chunk_size):
     cache = make_cache()
@@ -752,7 +755,11 @@ def test_model_kv_profiles_bound_restored_prefill(make_cache, chunk_size):
     for start in range(16, 6000, chunk_size):
         size = min(chunk_size, 6000 - start)
         cache.update_and_fetch(mx.ones((1, 1, size, 4)), mx.ones((1, 1, size, 8)))
-    assert cache.nbytes <= profile.footprint(6000, chunk_size) <= 2 * cache.nbytes
+    assert (
+        cache.nbytes
+        <= profile.footprint(6000, chunk_size, prefix_tokens=16)
+        <= 2 * cache.nbytes
+    )
 
 
 def test_z1t_prefill_memory_is_fixed():
@@ -792,3 +799,38 @@ def test_minimax_profiles_include_indexer_allocations(make_cache, batch_size):
         advance(min(257, 6000 - start))
     estimate = batch_size * profile.footprint(6000, 257)
     assert cache.nbytes <= estimate < 1.1 * cache.nbytes
+
+
+@pytest.mark.parametrize("factory", [KVCache, HyV4KVCache])
+def test_allocation_forecast_releases_cache_and_resets_between_requests(factory):
+    cache = factory()
+    keys = mx.ones((1, 1, 6000, 4))
+    cache.update_and_fetch(keys, keys)
+    state = ArraysCache(1)
+    state[0] = mx.ones((1, 4))
+    plan = PrefillMemoryPlan()
+    plan.observe_cache([cache, state], 6000)
+    reference = weakref.ref(cache)
+    del cache
+    assert reference() is None
+
+    small = factory()
+    keys = keys[..., :16, :]
+    small.update_and_fetch(keys, keys)
+    expected = 2 * (small.nbytes + state.nbytes)
+    assert plan.prepare([16], chunk_size=37) == expected
+    assert plan.observe_cache([factory(), state], 0) == expected - state.nbytes
+
+
+@pytest.mark.parametrize("factory", [KVCache, HyV4KVCache])
+def test_allocation_forecast_uses_live_capacity_after_trim(factory):
+    cache = factory()
+    keys = mx.ones((1, 1, 512, 4))
+    cache.update_and_fetch(keys, keys)
+    cache.trim(256)
+    plan = PrefillMemoryPlan()
+    plan.prepare([768], chunk_size=512)
+    previous_bytes = cache.nbytes
+    reserve = plan.observe_cache([cache], 256)
+    cache.update_and_fetch(keys, keys)
+    assert reserve == 2 * cache.nbytes - previous_bytes
