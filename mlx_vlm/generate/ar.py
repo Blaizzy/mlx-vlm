@@ -551,8 +551,6 @@ def generate_step(
         if n == max_tokens:
             break
 
-        # Some models leave cache fields outside the logits graph (for example,
-        # DeepSeek-V4's zero-width values). Bound their unevaluated update chains.
         if (n + 1) % DEFAULT_CACHE_EVAL_INTERVAL == 0:
             mx.eval([c.state for c in prompt_cache])
 

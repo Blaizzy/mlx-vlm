@@ -81,14 +81,10 @@ def test_decode_bounds_unused_cache_graphs_without_changing_outputs(
 
     tokens, logprobs, graph_sizes = decode()
     assert len(tokens) == 125
-    # The bound is independent of total generation length, including nested
-    # rotating caches used by compressed and sparse-compressed attention.
     assert max(max(sizes) for sizes in graph_sizes) < 400
     assert graph_sizes[49] == [0, 0, 0]
     assert graph_sizes[99] == [0, 0, 0]
 
-    # The same model and inputs without periodic evaluation reproduce the leak
-    # and provide an output-parity reference across both evaluation boundaries.
     monkeypatch.setattr(ar, "DEFAULT_CACHE_EVAL_INTERVAL", 10**9)
     reference_tokens, reference_logprobs, unbounded = decode()
     assert min(unbounded[-1]) > 800
