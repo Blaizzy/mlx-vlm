@@ -25,6 +25,7 @@ from mlx_vlm.models.cache import (
     RotatingKVCache,
     SimpleKVCache,
     StaticPrefixKVCache,
+    _BaseCache,
 )
 from mlx_vlm.models.hy_v4.cache import HyV4KVCache
 from mlx_vlm.models.minimax_m3_vl.language import (
@@ -158,10 +159,11 @@ def test_disk_fixed_state_reserve_counts_every_prefill_sequence(disk_reader):
     assert manager.stats_snapshot()["prefill_reserve_bytes"] == 0
 
 
+@pytest.mark.parametrize("base", [object, _BaseCache])
 def test_unknown_checkpoint_state_keeps_conservative_growth_estimate(
-    manager_factory, monkeypatch
+    manager_factory, monkeypatch, base
 ):
-    class GrowingCache:
+    class GrowingCache(base):
         state = mx.ones((1, 256, 1024))
         meta_state = ()
 

@@ -161,6 +161,18 @@ def _pooling_memory_profile(c, token_count):
 
 
 class _BaseCache:
+    def memory_profile(self, token_count):
+        """Describe standard KV buffers; other layouts override this method."""
+        if not hasattr(self, "keys") or not hasattr(self, "values"):
+            return None
+        profile = _kv_memory_profile(self, token_count)
+        try:
+            if self.nbytes > profile.source_bytes:
+                return None  # Auxiliary state needs its own profile.
+        except (AttributeError, NotImplementedError):
+            pass
+        return profile
+
     @property
     def state(self):
         return []
@@ -239,8 +251,6 @@ class _BaseCache:
 
 
 class ConcatenateKVCache(_BaseCache):
-    memory_profile = _kv_memory_profile
-
     def __init__(self):
         self.keys = None
         self.values = None
@@ -315,7 +325,6 @@ def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
 
 
 class QuantizedKVCache(_BaseCache):
-    memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(self, group_size: int = 64, bits: int = 8):
@@ -490,7 +499,6 @@ class QuantizedKVCache(_BaseCache):
 
 
 class KVCache(_BaseCache):
-    memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(self):
@@ -1537,7 +1545,6 @@ def dynamic_roll(x, shifts, axis):
 
 
 class BatchKVCache(_BaseCache):
-    memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(self, left_padding: List[int]):
@@ -2339,7 +2346,6 @@ class BatchQuantizedKVCache(_BaseCache):
     ``Batch.extend`` / ``Batch.filter`` work during continuous-batching.
     """
 
-    memory_profile = _kv_memory_profile
     step = 256
 
     def __init__(
@@ -3593,13 +3599,11 @@ class BatchPoolingCache(_BaseCache):
         return batch_cache
 
 
-class SimpleKVCache:
+class SimpleKVCache(_BaseCache):
     """A simple key-value cache for transformer attention layers.
 
     Stores and concatenates key/value tensors along sequence dimension.
     """
-
-    memory_profile = _kv_memory_profile
 
     def __init__(self):
         self.keys = None
