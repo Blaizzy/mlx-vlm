@@ -88,7 +88,7 @@ def test_kv_capacity_forecast_matches_actual_allocation(
         cache.update_and_fetch(keys, keys)
         cache = factory.from_state(cache.state, cache.meta_state)
     capacity = 0 if cache.keys is None else cache.keys.shape[2]
-    predicted = cache.allocation_policy.prefill_capacity(
+    predicted = cache.capacity_forecast.prefill_capacity(
         6000, chunk_size, step=cache.step, capacity=capacity, used=cache.offset
     )
     for start in range(prefix_length, 6000, chunk_size):

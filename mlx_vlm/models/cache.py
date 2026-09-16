@@ -86,12 +86,12 @@ def create_attention_mask(
 
 
 @dataclass(frozen=True)
-class KVCacheAllocation:
-    """Capacity arithmetic shared by cache updates and memory forecasts."""
+class KVCacheForecast:
+    """Predict cache capacity without changing buffer allocation."""
 
     growth_factor: int = 1
 
-    def capacity_for_update(self, capacity, used, incoming, *, step) -> int:
+    def _capacity_after_update(self, capacity, used, incoming, *, step) -> int:
         required = used + incoming
         if required <= capacity:
             return capacity
@@ -111,7 +111,7 @@ class KVCacheAllocation:
         )
         while used < tokens:
             incoming = min(chunk_size, tokens - used)
-            capacity = self.capacity_for_update(capacity, used, incoming, step=step)
+            capacity = self._capacity_after_update(capacity, used, incoming, step=step)
             used += incoming
             # Skip whole chunks that fit without reallocating.
             used += min(capacity - used, tokens - used) // chunk_size * chunk_size
@@ -129,7 +129,7 @@ class CacheMemory:
     window_size: Optional[int] = None
     fallback: bool = False
     min_capacity: int = 0
-    allocation: Optional[KVCacheAllocation] = None
+    forecast: Optional[KVCacheForecast] = None
     allocated_tokens: int = 0
     used_tokens: int = 0
 
@@ -148,8 +148,8 @@ class CacheMemory:
         tokens = max(tokens, self.min_capacity)
         step = max(1, self.step)
         capacity = ((tokens + step - 1) // step) * step
-        if self.allocation is not None:
-            predicted = self.allocation.prefill_capacity(
+        if self.forecast is not None:
+            predicted = self.forecast.prefill_capacity(
                 tokens,
                 chunk_size,
                 step=step,
@@ -191,16 +191,14 @@ def _kv_memory_profile(c, token_count):
     capacity = keys.shape[2]
     size = cache_nbytes(c.keys) + cache_nbytes(c.values)
     # Specialized layouts opt in explicitly, like their memory profiles.
-    allocation = (
-        c.allocation_policy if "allocation_policy" in type(c).__dict__ else None
-    )
+    forecast = c.capacity_forecast if "capacity_forecast" in type(c).__dict__ else None
     return CacheMemory(
         source_bytes=size,
         bytes_per_token=size / capacity if capacity else 0,
         step=getattr(c, "step", 1),
-        allocation=allocation,
-        allocated_tokens=capacity if allocation is not None else 0,
-        used_tokens=c.offset if allocation is not None else 0,
+        forecast=forecast,
+        allocated_tokens=capacity if forecast is not None else 0,
+        used_tokens=c.offset if forecast is not None else 0,
     )
 
 
@@ -550,7 +548,7 @@ class QuantizedKVCache(_BaseCache):
 
 
 class KVCache(_BaseCache):
-    allocation_policy = KVCacheAllocation()
+    capacity_forecast = KVCacheForecast()
     memory_profile = _kv_memory_profile
     step = 256
 
@@ -561,16 +559,12 @@ class KVCache(_BaseCache):
 
     def update_and_fetch(self, keys, values):
         prev = self.offset
-        capacity = 0 if self.keys is None else self.keys.shape[2]
-        new_capacity = self.allocation_policy.capacity_for_update(
-            capacity, prev, keys.shape[2], step=self.step
-        )
-        if self.keys is None or new_capacity > capacity:
+        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
             B, n_kv_heads, _, k_head_dim = keys.shape
             v_head_dim = values.shape[3]
-            retained = prev if prev % self.step else capacity
-            k_shape = (B, n_kv_heads, new_capacity - retained, k_head_dim)
-            v_shape = (B, n_kv_heads, new_capacity - retained, v_head_dim)
+            n_steps = (self.step + keys.shape[2] - 1) // self.step
+            k_shape = (B, n_kv_heads, n_steps * self.step, k_head_dim)
+            v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
             new_k = mx.zeros(k_shape, keys.dtype)
             new_v = mx.zeros(v_shape, values.dtype)
             if self.keys is not None:
