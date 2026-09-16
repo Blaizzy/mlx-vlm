@@ -1,4 +1,4 @@
-# Speculative 1K prototype
+# Speculative prototype: 1K plus 500 lines
 
 `speculative_1k.py` is an opt-in experiment, not a replacement for
 `../test_speculative.py`. The normal suite still collects the original 519
@@ -9,17 +9,19 @@ configuration factories; it does not import, execute, or load the legacy tests.
 
 | Source | Readable lines, including imports and blank lines |
 | --- | ---: |
-| `speculative_1k.py` | 875 |
+| `speculative_1k.py` | 1,372 |
 | `../speculative_fixtures.py` (counted in full) | 116 |
-| Prototype and configuration fixtures | **991** |
+| Prototype and configuration fixtures | **1,488** |
 | Common pytest setup, `../conftest.py` | 17 |
-| Total including common pytest setup | **1,008** |
+| Total including common pytest setup | **1,505** |
 
 All case data lives in Python parameter tables; there is no additional JSON or
 hidden test runner. The original suite plus configuration fixtures is 5,072 lines.
-The prototype reduces that comparison by 80.5%, while dropping substantial checks.
+The prototype reduces that comparison by 70.7%, while dropping some checks.
+This revision adds **497 lines** to the initial 991-line prototype, within the
+additional 500-line budget. All original prototype checks remain unchanged.
 
-The 314 collected cases use shared runners for:
+The 361 collected cases use shared runners for:
 
 - DFlash2, Muse Glimmer, and DSpark generation parity, seeded sampling, and request reset.
 - Qwen3.5, GLM-5-Next, and DeepSeek V4 MTP generation and verifier/cache-commit parity.
@@ -28,6 +30,11 @@ The 314 collected cases use shared runners for:
 - Acceptance budgets, sampler RNG isolation, and rotating drafter masks.
 - Routing/compatibility, FP8 conversion, DeepSeek DSpark split/load/draft, Laguna
   checkpoint validation, and Eagle3 replay/draft-vocabulary mapping.
+- Padded Qwen prefill, batched MTP commit/filter, rotating and quantized cache rollback.
+- Gemma DSpark configuration/layers, positioned deferred sampling, Eagle EOS verification,
+  and adaptive block sizing.
+- Native GLM/DeepSeek checkpoint layouts, GLM weight fusion, wide quantized verification,
+  shared-KV padding, and sparse logits.
 
 The generic Qwen verifier cases use 32-dimensional recurrent heads so the inference
 Metal kernel can execute. Float32 Qwen recurrent outputs use `atol=rtol=1e-6`;
@@ -45,10 +52,10 @@ measures Python statements and branch outcomes, not Metal/C++ execution.
 | Run | Result |
 | --- | --- |
 | Original speculative suite alone | 519 passed |
-| Prototype alone | **314 passed** |
-| Full suite with prototype replacing original speculative tests | **1,779 passed, 6 skipped, 51 subtests passed** |
+| Prototype alone | **361 passed** |
+| Full suite with prototype replacing original speculative tests | **1,826 passed, 6 skipped, 51 subtests passed** |
 
-Replacement collection was checked explicitly: 1,785 cases, including all 314
+Replacement collection was checked explicitly: 1,832 cases, including all 361
 prototype cases and zero cases from `test_speculative.py`. Default collection
 remains 1,990 cases and does not collect the prototype.
 
@@ -57,37 +64,45 @@ newly exercised paths do not offset lost paths.
 
 | Scope | Original statements retained | Original branches retained |
 | --- | ---: | ---: |
-| Speculative package, isolated suite comparison | 3,491 / 4,568 (**76.4%**) | 771 / 1,168 (**66.0%**) |
-| All production reached by the isolated speculative suite | 11,541 / 16,698 (69.1%) | 1,751 / 2,672 (65.5%) |
-| Coverage contributed by the original speculative suite beyond all other tests | 4,002 / 5,496 (**72.8%**) | 1,111 / 1,698 (**65.4%**) |
-| Full production suite after substitution | 79,613 / 81,107 (98.2%) | 12,333 / 12,920 (95.5%) |
+| Speculative package, isolated suite comparison | 4,108 / 4,568 (**89.9%**) | 959 / 1,168 (**82.1%**) |
+| All production reached by the isolated speculative suite | 12,510 / 16,698 (74.9%) | 2,057 / 2,672 (77.0%) |
+| Coverage contributed by the original speculative suite beyond all other tests | 4,740 / 5,496 (**86.2%**) | 1,353 / 1,698 (**79.7%**) |
+| Full production suite after substitution | 80,350 / 81,107 (99.1%) | 12,574 / 12,920 (97.3%) |
 
-Replacing the original would lose **1,494 previously covered production statements
-and 587 branch outcomes**, while adding 204 statements and 76 branch outcomes.
-Whole-suite statement coverage would fall from 53.0555% to 52.2117%; branch
-coverage would fall from 32.1409% to 30.8697%. The high whole-suite retention
-includes the many unrelated tests that remain, so it overstates the similarity
-of the two speculative suites.
+The extra 497 lines recover **617 previously covered statements and 188 branch
+outcomes inside the speculative package**. That raises retention from 76.4% to
+89.9% for statements and from 66.0% to 82.1% for branches.
+
+For coverage uniquely contributed by the original suite across production, the
+remaining gap is **756 statements and 345 branch outcomes**, down from 1,494 and
+587. This recovers 738 statements and 242 branches that other tests do not cover.
+
+The raw whole-suite comparison loses 757 statements and 346 branch outcomes,
+while adding 230 statements and 92 branch outcomes. One additional statement and
+branch difference occurs in the unrelated realtime server close/cancel path,
+which was exercised by the other-tests-only run. Whole-suite statement coverage
+would fall from 53.0555% to 52.7108%; branch coverage from 32.1409% to 31.5090%.
+The high whole-suite retention includes unrelated tests and overstates the
+similarity of the two speculative suites.
 
 Largest losses after substitution (these paths are not recovered by other tests):
 
 | Production module under `mlx_vlm/` | Lost statements | Lost branch outcomes |
 | --- | ---: | ---: |
-| `speculative/mtp.py` | 156 | 70 |
-| `speculative/eagle3.py` | 95 | 32 |
-| `speculative/drafters/glm4_moe_lite_mtp/split.py` | 79 | 20 |
-| `speculative/drafters/qwen3_5_mtp/qwen3_5_mtp.py` | 69 | 47 |
-| `speculative/drafters/gemma4_dspark/gemma4_dspark.py` | 64 | 2 |
-| `models/quantized_verifier.py` | 62 | 17 |
-| `models/qwen3_5/language.py` | 62 | 38 |
-| `speculative/drafters/gemma4_dspark/config.py` | 58 | 14 |
-| `speculative/drafters/deepseek_v4_mtp/split.py` | 47 | 7 |
-| `speculative/drafters/gemma4_assistant/masks.py` | 44 | 20 |
+| `speculative/mtp.py` | 99 | 47 |
+| `speculative/drafters/laguna_dflash/dflash.py` | 43 | 0 |
+| `models/fast_ops.py` | 40 | 12 |
+| `models/deepseek_v4/language.py` | 39 | 17 |
+| `models/cache.py` | 32 | 17 |
+| `models/glm5_next/language.py` | 32 | 7 |
+| `models/minimax_m3_vl/language.py` | 30 | 12 |
+| `speculative/common.py` | 27 | 11 |
+| `models/laguna/language.py` | 24 | 17 |
+| `speculative/drafters/qwen3_dflash/config.py` | 23 | 14 |
 
-The prototype therefore demonstrates the 1K structure, but does not establish
-similar coverage for the speculative subsystem. Adoption would require accepting
-these losses or restoring targeted cases with a larger line budget. The existing
-suite remains intact for that decision.
+The expanded prototype improves coverage within the additional 500-line budget,
+but does not restore 100% of the previous coverage. The existing suite remains
+the default; adopting this prototype would accept the measured gaps above.
 
 ## Run it
 

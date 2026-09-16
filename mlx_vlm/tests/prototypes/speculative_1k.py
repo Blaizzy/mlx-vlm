@@ -1,11 +1,12 @@
 """Opt-in speculative-suite prototype; run this file explicitly with pytest.
 
-The 1,000-line budget includes speculative_fixtures.py. No legacy tests are imported.
+The 1,500-line budget includes speculative_fixtures.py. No legacy tests are imported.
 """
 
 import importlib
 import json
 from copy import deepcopy
+from math import prod
 from types import SimpleNamespace as NS
 
 import mlx.core as mx
@@ -873,3 +874,499 @@ def test_laguna_checkpoint_contract():
     weights["unexpected.weight"] = NS(shape=(1,))
     with pytest.raises(ValueError, match="weight keys"):
         arch.validate_laguna_dflash_weights(weights, config)
+
+
+@pytest.mark.parametrize("padding", [[5, 0], [5, 5]])
+def test_padded_prefill_chunks(padding):
+    lm, cfg = language("qwen")
+    recurrent = ArraysCache(2)
+    recurrent.left_padding = mx.array(padding)
+    caches = [recurrent, BatchKVCache(padding)]
+    for step in range(2):
+        ids = [[0, 0, 0 if step == 0 else 4], [1, 2, 3]]
+        if padding[1] == 5:
+            ids[1] = ids[0]
+        hidden = lm.model(mx.array(ids), cache=caches)
+        mx.eval(hidden, caches[1].state)
+        assert hidden.shape == (2, 3, cfg.hidden_size)
+        assert mx.isfinite(hidden).all().item()
+        assert caches[1].offset.tolist() == [3 * (step + 1) - p for p in padding]
+        expected_padding = (
+            padding if padding[1] == 0 else [max(5 - 3 * (step + 1), 0)] * 2
+        )
+        assert caches[1].left_padding.tolist() == expected_padding
+
+
+@pytest.mark.parametrize(
+    "family,accepted", [("qwen", [1, 0]), ("qwen", [1, 1]), ("deepseek", [0, 0])]
+)
+def test_batched_drafter_commit_and_filter(family, accepted):
+    cfg = TEXT[family][1]()
+    drafter = mtp_drafter(family, cfg)
+    target = NS(model=NS(embed_tokens=nn.Embedding(cfg.vocab_size, cfg.hidden_size)))
+    qwen = family == "qwen"
+    drafter.reset(
+        NS(language_model=target), **({"left_padding": [0, 0]} if qwen else {})
+    )
+    position = mx.array([4, 4]) if qwen else 3
+    valid = mx.full((2,), 4) if qwen else 4
+    drafter.set_shared_kv({}, kv_offset=4, position=position, kv_valid_len=valid)
+    shape = (cfg.hc_mult, 16) if family == "deepseek" else (16,)
+    tokens = drafter.draft_block(
+        mx.array([7, 8]),
+        mx.zeros((2, 1, *shape)),
+        None,
+        3,
+        greedy,
+        mx.int32,
+        greedy=True,
+    )
+    kept = [tokens[i, :n].tolist() + [5 + i] for i, n in enumerate(accepted)]
+    drafter.accept_verified_tokens_batch(
+        mx.zeros((2, 3, *shape)),
+        tokens,
+        accepted=accepted,
+        new_tokens=kept,
+        sampler=greedy,
+        token_dtype=mx.int32,
+        greedy=True,
+    )
+    mx.eval(drafter._seed_token, drafter._cache[0].state)
+    assert drafter._round_appended == 0
+    assert drafter._seed_token.shape == (2, 1)
+    assert drafter._seed_hidden.shape == (2, 1, *shape)
+    if qwen:
+        assert drafter._cache[0].offset.tolist() == [n + 1 for n in accepted]
+        assert drafter._cache[0].left_padding.tolist() == (
+            [1, 2] if accepted == [1, 0] else [0, 0]
+        )
+        drafter.filter_batch(mx.array([1]))
+        assert drafter._cache[0].keys.shape[0] == 1
+        assert drafter._cache[0].left_padding.tolist() == [0]
+        assert drafter._cache[0].offset.tolist() == [1 + accepted[1]]
+        assert drafter._next_position.tolist() == [5 + accepted[1]]
+        assert drafter._seed_token.shape == (1, 1)
+    else:
+        assert drafter._cache[0].offset == 1
+        assert drafter._next_position == 5
+
+
+@pytest.mark.parametrize("layout", ["full_attention", "sliding_attention"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_gemma_dspark_contract_and_attention(layout, nested):
+    arch = module("speculative.drafters.gemma4_dspark.gemma4_dspark")
+    values = dimensions(
+        model_type="gemma4_text",
+        architectures=["Gemma4DSparkModel"],
+        global_head_dim=8,
+        num_global_key_value_heads=1,
+        attention_k_eq_v=True,
+        layer_types=[layout],
+        sliding_window=8,
+        final_logit_softcapping=30.0,
+        rope_parameters={layout: dict(rope_theta=10000.0, rope_type="default")},
+    )
+    draft = dict(
+        block_size=3,
+        mask_token_id=31,
+        target_layer_ids=[0],
+        num_target_layers=2,
+        markov_rank=4,
+        enable_confidence_head=True,
+    )
+    values.update({"dflash_config": draft} if nested else draft)
+    cfg = arch.ModelConfig.from_dict(values)
+    assert (cfg.model_type, cfg.backbone_model_type) == ("gemma4_dspark", "gemma4_text")
+    assert (cfg.proposal_length, cfg.block_size, cfg.target_layer_ids) == (3, 4, [0])
+    drafter = arch.Model(cfg)
+    layer = drafter.layers[0]
+    result = layer(mx.zeros((1, 2, 16)), mx.zeros((1, 3, 16)), drafter.rope, KVCache())
+    mx.eval(result)
+    assert result.shape == (1, 2, 16) and mx.isfinite(result).all().item()
+    assert hasattr(layer.self_attn, "v_proj") == (layout == "sliding_attention")
+    assert cfg.final_logit_softcapping == 30.0
+    for key, value in [
+        ("mask_token_id", 32),
+        ("target_layer_ids", [2]),
+        ("markov_rank", 0),
+    ]:
+        malformed = deepcopy(values)
+        malformed.get("dflash_config", malformed)[key] = value
+        with pytest.raises(ValueError):
+            arch.ModelConfig.from_dict(malformed)
+
+
+@pytest.mark.parametrize("uniform", [False, True])
+@pytest.mark.parametrize("positioned", [False, True])
+@pytest.mark.parametrize("reject_first", [False, True])
+def test_deferred_acceptance(uniform, positioned, reject_first):
+    mtp = module("speculative.mtp")
+    head_calls, sample_calls = [], []
+
+    def logits(hidden):
+        head_calls.append(hidden.shape)
+        return hidden
+
+    def sample(logits, *, row_ids, positions):
+        sample_calls.append((list(row_ids), list(positions)))
+        return greedy(logits)
+
+    rows = [[2, 1, 3], [1, 2, 1] if reject_first else [0, 2, 1]]
+    hidden = mx.eye(4)[mx.array(rows)] * 9
+    sampler = NS(sample_target=sample) if positioned else greedy
+    walk = (
+        mtp._speculative_walk_batch_deferred_uniform
+        if uniform
+        else mtp._speculative_walk_batch_deferred_greedy
+    )
+    accepted, tokens = walk(
+        NS(speculative_logits_from_hidden=logits),
+        hidden,
+        mx.array([[2, 3], [0, 2]]),
+        sampler,
+        budgets=[3, 2],
+        row_ids=[10, 11],
+        base_positions=[7, 12],
+    )
+    expected = (
+        [0, 0]
+        if reject_first and uniform
+        else [1, 0] if reject_first else [1, 1] if uniform else [1, 2]
+    )
+    assert accepted == expected
+    assert tokens == (
+        [[2], [1]]
+        if reject_first and uniform
+        else [[2, 1], [1]] if reject_first else [[2, 1], [0, 2]]
+    )
+    calls = 1 if reject_first and uniform else 2 if uniform or reject_first else 3
+    assert len(head_calls) == calls
+    if positioned:
+        assert sample_calls == [([10, 11], [7 + i, 12 + i]) for i in range(calls)]
+
+
+@pytest.mark.parametrize("family", ["glm4_moe_lite", "deepseek_v4"])
+def test_native_checkpoint_layouts(tmp_path, family):
+    deepseek = family == "deepseek_v4"
+    cfg = (
+        tiny_deepseek_config().to_dict()
+        if deepseek
+        else dict(
+            hidden_size=8,
+            vocab_size=16,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            qk_nope_head_dim=4,
+            v_head_dim=6,
+            kv_lora_rank=4,
+            moe_intermediate_size=4,
+            n_routed_experts=2,
+            num_nextn_predict_layers=1,
+            tie_word_embeddings=False,
+        )
+    )
+    cfg["model_type"] = family
+    if deepseek:
+        weights = {
+            f"mtp.0.{key}.weight": mx.zeros((4, 4), dtype=mx.uint8)
+            for key in ("e_proj", "attn.wq_a")
+        }
+        weights.update(
+            {key.replace(".weight", ".scale"): mx.ones((1, 1)) for key in list(weights)}
+        )
+        weights["mtp.0.enorm.weight"] = mx.ones((cfg["hidden_size"],))
+        for expert in range(cfg["n_routed_experts"]):
+            for proj in ("w1", "w2", "w3"):
+                key = f"mtp.0.ffn.experts.{expert}.{proj}"
+                weights[key + ".weight"] = mx.full((4, 16), expert, dtype=mx.uint8)
+                weights[key + ".scale"] = mx.ones((4, 1), dtype=mx.uint8)
+        weights["mtp.0.ffn.gate.bias"] = mx.zeros((cfg["n_routed_experts"],))
+        weights["mtp.0.hc_attn_fn"] = mx.ones((2, 2))
+        weights["mtp.0.hc_head_scale"] = mx.ones((1,))
+    else:
+        shapes = {
+            "embed_tokens": (16, 8),
+            "enorm": (8,),
+            "hnorm": (8,),
+            "eh_proj": (8, 16),
+            "input_layernorm": (8,),
+            "post_attention_layernorm": (8,),
+            "self_attn.kv_b_proj": (20, 4),
+            "self_attn.o_proj": (8, 12),
+            "mlp.gate": (2, 8),
+            "shared_head.norm": (8,),
+            "shared_head.head": (16, 8),
+        }
+        for expert in ["shared_experts", "experts.0", "experts.1"]:
+            for proj in ("gate", "up", "down"):
+                shapes[f"mlp.{expert}.{proj}_proj"] = (
+                    (8, 4) if proj == "down" else (4, 8)
+                )
+        weights = {
+            f"model.layers.2.{key}.weight": mx.zeros(shape)
+            for key, shape in shapes.items()
+        }
+        weights["model.layers.2.mlp.gate.e_score_correction_bias"] = mx.ones((2,))
+        weights["model.layers.2.self_attn.rotary_emb.inv_freq"] = mx.ones((2,))
+    (tmp_path / "config.json").write_text(json.dumps(cfg))
+    shard = "mtp.safetensors" if deepseek else "model.safetensors"
+    mx.save_safetensors(str(tmp_path / shard), weights)
+    index = (
+        {"model.foo": "model.safetensors"}
+        if deepseek
+        else {key: shard for key in weights}
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": index})
+    )
+    output = tmp_path / "draft"
+    split_mtp(str(tmp_path), str(output))
+    config = json.loads((output / "config.json").read_text())
+    out = mx.load(str(output / "model.safetensors"))
+    assert config["model_type"] == family + "_mtp" and config["block_size"] == 2
+    if deepseek:
+        for key in ("e_proj", "decoder.attn.wq_a"):
+            assert config["quantization"][key]["mode"] == "mxfp8"
+            assert out[key + ".weight"].dtype == mx.uint32
+            assert key + ".scales" in out
+        assert "enorm.weight" in out
+        assert (
+            out["decoder.ffn.switch_mlp.gate_proj.weight"].shape[0]
+            == cfg["n_routed_experts"]
+        )
+        assert {
+            "decoder.ffn.gate.e_score_correction_bias",
+            "decoder.attn_hc.fn",
+            "hc_head.scale",
+        } <= out.keys()
+    else:
+        prefix = "model.mtp_block."
+        assert "model.embed_tokens.weight" in out and "lm_head.weight" in out
+        for key, shape in [
+            ("self_attn.embed_q", (2, 4, 4)),
+            ("self_attn.unembed_out", (2, 6, 4)),
+            ("mlp.switch_mlp.gate_proj", (2, 4, 8)),
+        ]:
+            assert out[prefix + key + ".weight"].shape == shape
+        assert out[prefix + "mlp.gate.e_score_correction_bias"].dtype == mx.float32
+        assert not any(
+            ".experts.0." in key or "rotary_emb" in key or "kv_b_proj" in key
+            for key in out
+        )
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+@pytest.mark.parametrize("step", [1, 4])
+def test_rotating_cache_commit_abort(batch, step):
+    arch = module("models.cache")
+    cache = (
+        arch.BatchRotatingKVCache(8, [0] * batch)
+        if batch > 1
+        else arch.RotatingKVCache(8)
+    )
+    prefix = mx.broadcast_to(mx.arange(13)[None, None, :, None], (batch, 1, 13, 1))
+    cache.update_and_fetch(prefix, prefix)
+    reference = deepcopy(cache)
+    for i, retained in enumerate((3, 1, 4, 0, None, 2)):
+        incoming = mx.broadcast_to(
+            (mx.arange(4) + 100 + i * 10)[None, None, :, None], (batch, 1, 4, 1)
+        )
+        transaction = start_speculative_cache([cache], 4)
+        for start in range(0, 4, step):
+            part = incoming[:, :, start : start + step]
+            cache.update_and_fetch(part, part)
+        if retained is None:
+            transaction.abort()
+        else:
+            transaction.commit([retained] * batch)
+            for start in range(0, retained, step):
+                part = incoming[:, :, start : min(start + step, retained)]
+                reference.update_and_fetch(part, part)
+        assert "update_and_fetch" not in cache.__dict__
+        assert all(
+            mx.array_equal(a, b).item() for a, b in zip(cache.state, reference.state)
+        )
+        assert cache.meta_state == reference.meta_state
+
+
+@pytest.mark.parametrize("family", ["qwen3_5", "gemma4", "deepseek_v4"])
+@pytest.mark.parametrize("accepted", [[2, 2], [0, 2]])
+def test_quantized_cache_rollback(family, accepted):
+    cache = module("turboquant").BatchTurboQuantKVCache([0, 0], bits=3.5)
+    keys = mx.arange(112, dtype=mx.float32).reshape(2, 1, 7, 8)
+    cache.update_and_fetch(keys, keys + 100)
+    generic = family == "deepseek_v4"
+    rollback = (
+        module("speculative.cache_state").rollback_speculative_cache
+        if generic
+        else module(
+            f"models.{family}.language"
+        ).LanguageModel.rollback_speculative_cache
+    )
+    args = ([cache], None) if generic else (None, [cache], None)
+    if accepted[0] != accepted[1]:
+        with pytest.raises(RuntimeError, match="uniform"):
+            rollback(*args, mx.array(accepted), block_size=5)
+    else:
+        assert rollback(*args, mx.array(accepted), block_size=5) == 2
+        assert cache._idx == 5
+
+
+def test_shared_kv_padding():
+    masks = module("speculative.drafters.gemma4_assistant.masks")
+    keys = mx.array([0, 0, 0, 10, 11, 12, 13, 14, *range(20, 28)]).reshape(2, 1, 8, 1)
+    states = masks.normalize_batched_shared_kv_states(
+        {"full_attention": (keys, keys + 100)},
+        kv_valid_len=mx.array([5, 8]),
+        left_padding=mx.array([3, 0]),
+    )
+    for offset, tensor in zip((0, 100), states["full_attention"]):
+        assert tensor[:, 0, :, 0].tolist() == [
+            list(range(10 + offset, 15 + offset)) + [0] * 3,
+            list(range(20 + offset, 28 + offset)),
+        ]
+
+
+def test_sparse_logits():
+    arch = module("speculative.drafters.gemma4_assistant.masked_embedder")
+    embedder = arch.MaskedEmbedder(
+        NS(
+            text_config=NS(hidden_size=2, vocab_size=8),
+            num_centroids=2,
+            centroid_intermediate_top_k=1,
+        )
+    )
+    embedder.centroids.weight = mx.eye(2)
+    embedder.token_ordering = mx.array([0, 2, 4, 6, 1, 3, 5, 7])
+    weights = (mx.eye(2)[None] * mx.arange(1, 5)[:, None, None]).reshape(8, 2)
+    hidden = mx.array([[[2.0, 0.5], [0.5, 2.0]]])
+    assert (
+        embedder.argmax(hidden, weights).tolist()
+        == greedy(embedder(hidden, weights)).tolist()
+        == [[6, 7]]
+    )
+    embedder.unfreeze()
+    assert "token_ordering" not in dict(tree_flatten(embedder.trainable_parameters()))
+
+
+def test_eagle_hot_verifier_includes_eos():
+    class Backbone:
+        embed_tokens = NS(
+            weight=mx.array(
+                [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 2.0], [3.5, -0.5]]
+            )
+        )
+
+        def __call__(self, inputs, cache, capture_layer_ids, hidden_sink):
+            hidden = mx.stack([inputs, inputs + 1], axis=-1).astype(mx.float32)
+            hidden_sink.append(hidden)
+            return hidden
+
+    class Target:
+        __module__ = "mlx_vlm.models.gemma4.language"
+        config, model, final_logit_softcapping = NS(eos_token_id=4), Backbone(), None
+
+        def logits_from_hidden(self, hidden):
+            return self.model.embed_tokens.weight[None, : hidden.shape[1], :]
+
+    result = module("speculative.eagle3")._eagle3_verify_target_hot(
+        Target(),
+        NS(d2t=mx.array([1, 1])),
+        mx.array([[0, 1]]),
+        prompt_cache=[],
+        sampler=lambda logits: mx.array([[4]]),
+        target_layer_ids=[1],
+    )
+    hidden, tokens, transaction = result
+    assert hidden.tolist() == [[[0.0, 1.0], [1.0, 2.0]]]
+    assert tokens.tolist() == [[1, 4]] and transaction is None
+
+
+@pytest.mark.parametrize("family", ["eagle3", "dflash"])
+def test_adaptive_block_policy(family):
+    if family == "eagle3":
+        arch = module("speculative.eagle3")
+        cfg = module("speculative.drafters.eagle3").ModelConfig(block_size=5)
+        drafter = NS(config=cfg, accept_lens=[], draft_lens=[])
+        assert arch._eagle3_block_settings(drafter, None) == (5, 5, False)
+        cfg.adaptive_max_block_size = 12
+        assert arch._eagle3_block_settings(drafter, None) == (12, 5, True)
+        cases = [
+            ([], [], 5, 5),
+            ([0, 0, 1, 1, 0, 1], [4] * 6, 5, 12),
+            ([4, 0, 4, 0, 4, 0, 4], [4] * 7, 5, 8),
+            ([0, 0, 0, 1, 1, 1], [11] * 6, 12, 8),
+        ]
+        choose = lambda: arch._eagle3_next_block_size(
+            drafter, 12, 5, 128, adaptive=True
+        )
+    else:
+        drafter = NS()
+        cases = [
+            ([], [], 16, 16),
+            ([1, 2], [15, 7], 16, 4),
+            ([3, 2, 1, 3], [3] * 4, 4, 4),
+        ]
+        choose = lambda: module("speculative.utils")._dflash_next_block_size(
+            drafter, 16, 20
+        )
+    for accepted, drafted, previous, expected in cases:
+        drafter.accept_lens, drafter.draft_lens = accepted, drafted
+        drafter._adaptive_block_size = previous
+        assert choose() == expected
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("length", [3, 7, 8])
+@pytest.mark.parametrize("bits", [4, 5])
+def test_wide_quantized_verifier(batch, length, bits):
+    mx.random.seed(43)
+    linear = bf16_parameters(
+        nn.QuantizedLinear(6144, 32, bias=False, group_size=64, bits=bits)
+    )
+    inputs = mx.random.normal((batch, length, 6144)).astype(mx.bfloat16)
+    # This verifier reproduces native GEMV separately for every token and row.
+    expected = verifier_linear._target_verify_singletons(linear, inputs)
+    actual = verifier_linear._target_verify_linear(linear, inputs)
+    assert mx.array_equal(actual, expected).item()
+    assert mx.array_equal(
+        verifier_linear._target_verify_quantized_argmax(linear, inputs),
+        greedy(expected),
+    ).item()
+
+
+def test_glm_mtp_native_weight_fusion():
+    cfg = tiny_glm_text_config()
+    arch = module("speculative.drafters.glm5_next_mtp")
+    shapes = {
+        "mlp.shared_experts.gate_proj": (8, 16),
+        "mlp.shared_experts.up_proj": (8, 16),
+        "self_attn.q_a_proj": (8, 16),
+        "self_attn.kv_a_proj_with_mqa": (4, 16),
+        "self_attn.kv_b_proj": (16, 4),
+    }
+    for expert in range(cfg.n_routed_experts):
+        for proj in ("gate", "up", "down"):
+            shapes[f"mlp.experts.{expert}.{proj}_proj"] = (
+                (16, 8) if proj == "down" else (8, 16)
+            )
+    weights = {
+        f"mtp_block.{key}.weight": mx.arange(prod(shape))
+        .reshape(shape)
+        .astype(mx.float32)
+        for key, shape in shapes.items()
+    }
+    out = arch.Model.sanitize(NS(args=cfg), weights.copy())
+    expected = {
+        "mlp.shared_experts.gate_up_proj": (16, 16),
+        "mlp.switch_mlp.gate_proj": (2, 8, 16),
+        "self_attn.qkv_a_proj": (12, 16),
+        "self_attn.embed_q": (2, 4, 4),
+        "self_attn.unembed_out": (2, 4, 4),
+    }
+    for key, shape in expected.items():
+        assert out[f"mtp_block.{key}.weight"].shape == shape
+    assert mx.array_equal(
+        out["mtp_block.mlp.switch_mlp.gate_proj.weight"][1],
+        weights["mtp_block.mlp.experts.1.gate_proj.weight"],
+    ).item()

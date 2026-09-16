@@ -60,8 +60,8 @@ Processor checks live in `test_processors.py`, server block streaming in
 and vision-specific assertions in `test_diffusion_gemma.py`; its optional
 Transformers reference check still requires the reference dependencies.
 
-An opt-in [1K speculative prototype](prototypes/README.md) explores shared
-behavior runners within a roughly 1,000-line budget. It is excluded from default
+An opt-in [1.5K speculative prototype](prototypes/README.md) explores shared
+behavior runners within a roughly 1,500-line budget. It is excluded from default
 collection; its report measures the coverage lost if it replaces the current
 suite. Run it by its explicit file path as documented in the report.
 
