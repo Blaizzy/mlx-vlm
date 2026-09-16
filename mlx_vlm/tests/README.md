@@ -29,7 +29,7 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_moe_offload.py` | MoE checkpoint repacking, expert offload, output parity, and failure handling |
 | `test_qwen3_5.py` | Qwen3.5 patch layouts and ragged attention fallbacks |
 | `test_nemotron_voicechat.py` | VoiceChat runtime, streaming, and checkpoint conversion |
-| `test_mage_vl.py` | Mage VL video processing and position handling |
+| `test_processors.py` | Image/video/audio processors, including Mage VL timestamps, patch positions, and visual-embedding integration |
 | `test_speculative.py` | Drafter loading and compatibility, generation parity, verification, cache transactions, and quantized speculative state across model families |
 | `test_speculative_masks_static.py` | Gemma assistant mask offsets with fake dependencies, without importing MLX |
 | `test_rope.py` | Rotary embeddings, multimodal position IDs, and batched offsets |

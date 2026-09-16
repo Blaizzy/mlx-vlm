@@ -3211,3 +3211,252 @@ class Qwen3VLVideoTimestampTests(unittest.TestCase):
         self.assertEqual(rendered.count(" seconds>"), 2)
         self.assertIn("<0.2 seconds>", rendered)
         self.assertIn("<1.2 seconds>", rendered)
+
+
+class TestMageVLProcessor:
+    """Mage VL image/video processing and processor-to-model compatibility."""
+
+    VIDEO_BLOCK = "<|vision_start|><|video_pad|><|vision_end|>"
+    IMAGE_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"
+    CHAT_TEMPLATE = (
+        "{% for message in messages %}{% for item in message['content'] %}"
+        "{% if item['type'] == 'image' %}<|vision_start|><|image_pad|><|vision_end|>"
+        "{% elif item['type'] == 'video' %}<|vision_start|><|video_pad|><|vision_end|>"
+        "{% else %}{{ item['text'] }}{% endif %}{% endfor %}{% endfor %}"
+    )
+
+    @pytest.fixture
+    def processor(self):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from transformers import PreTrainedTokenizerFast
+
+        from mlx_vlm.models.mage_vl.processing_mage_vl import (
+            IMAGE_PAD,
+            VIDEO_PAD,
+            VISION_END,
+            VISION_START,
+            MageVLProcessor,
+        )
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+        class RecordingTokenizer(PreTrainedTokenizerFast):
+            def __call__(self, text, **kwargs):
+                self.last_text = text
+                return super().__call__(text, **kwargs)
+
+        tokens = ["[UNK]", "[PAD]", IMAGE_PAD, VIDEO_PAD, VISION_START, VISION_END]
+        tokenizer = RecordingTokenizer(
+            tokenizer_object=Tokenizer(
+                WordLevel(
+                    {token: i for i, token in enumerate(tokens)}, unk_token="[UNK]"
+                )
+            ),
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+            additional_special_tokens=tokens[2:],
+            chat_template=self.CHAT_TEMPLATE,
+        )
+        image_processor = Qwen3VLImageProcessor(
+            patch_size=16,
+            temporal_patch_size=1,
+            merge_size=2,
+            min_pixels=1024,
+            max_pixels=8192,
+        )
+        return MageVLProcessor(image_processor=image_processor, tokenizer=tokenizer)
+
+    @staticmethod
+    def frames(count=3, width=32, value=0):
+        return np.full((count, 3, 32, width), value, dtype=np.uint8)
+
+    @staticmethod
+    def image_counts(output):
+        return (np.array(output["input_ids"]) == 2).sum(axis=1).tolist()
+
+    def test_image_batch_keeps_distinct_counts(self, processor):
+        images = [Image.new("RGB", (32, 32)), Image.new("RGB", (64, 32))]
+        output = processor(text=[self.IMAGE_BLOCK, self.IMAGE_BLOCK], images=images)
+        assert self.image_counts(output) == [1, 2]
+        assert "patch_positions" not in output
+        expected = processor.image_processor(images)
+        np.testing.assert_array_equal(output["pixel_values"], expected["pixel_values"])
+
+    def test_video_uses_reference_timestamps_positions_and_frame_attention(
+        self, processor
+    ):
+        from mlx_vlm.models.mage_vl.vision import build_cu_seqlens
+        from mlx_vlm.utils import VideoMetadata
+
+        metadata = VideoMetadata(
+            total_num_frames=61, fps=30, frames_indices=[0, 15, 60]
+        )
+        output = processor(
+            text=self.VIDEO_BLOCK, videos=[self.frames()], video_metadata=[metadata]
+        )
+        assert processor.tokenizer.last_text == [
+            "".join(f"<{sec:.1f} seconds>{self.IMAGE_BLOCK}" for sec in [0, 0.5, 2])
+        ]
+        assert self.image_counts(output) == [3]
+        assert "pixel_values_videos" not in output
+        assert "video_grid_thw" not in output
+        assert output["image_grid_thw"].tolist() == [[1, 2, 2]] * 3
+        positions = np.array(output["patch_positions"]).reshape(3, 4, 3)
+        np.testing.assert_array_equal(positions[:, :, 0], [[0] * 4, [15] * 4, [60] * 4])
+        np.testing.assert_array_equal(
+            positions[1, :, 1:], [[0, 0], [0, 1], [1, 0], [1, 1]]
+        )
+        assert build_cu_seqlens(output["image_grid_thw"].tolist(), 12, 4) == [
+            0,
+            4,
+            8,
+            12,
+        ]
+
+    @pytest.mark.parametrize(
+        "prompt,videos",
+        [(VIDEO_BLOCK * 2, [frames()]), (VIDEO_BLOCK, [frames(), frames()])],
+    )
+    def test_video_placeholder_mismatch_is_rejected(self, processor, prompt, videos):
+        with pytest.raises(ValueError, match="placeholder"):
+            processor(text=prompt, videos=videos)
+
+    def test_bad_metadata_is_rejected(self, processor):
+        from mlx_vlm.utils import VideoMetadata
+
+        with pytest.raises(ValueError, match="one video_metadata"):
+            processor(text=self.VIDEO_BLOCK, videos=[self.frames()], video_metadata=[])
+        with pytest.raises(ValueError, match="frame count"):
+            processor(
+                text=self.VIDEO_BLOCK,
+                videos=[self.frames()],
+                video_metadata=[
+                    VideoMetadata(total_num_frames=10, fps=30, frames_indices=[0, 9])
+                ],
+            )
+        with pytest.raises(ValueError, match="positive and finite"):
+            processor(text=self.VIDEO_BLOCK, videos=[self.frames()], fps=0)
+
+    def test_prepare_inputs_accepts_supplied_metadata(self, processor):
+        from mlx_vlm.utils import prepare_inputs
+
+        metadata = {"total_num_frames": 60, "fps": 10, "frames_indices": [0, 20, 59]}
+        output = prepare_inputs(
+            processor,
+            videos=[self.frames()],
+            prompts=self.VIDEO_BLOCK,
+            video_metadata=[metadata],
+        )
+        assert "<5.9 seconds>" in processor.tokenizer.last_text[0]
+        assert np.array(output["patch_positions"])[-1, 0] == 59
+
+    def test_shared_decoder_supports_odd_frame_counts(self, processor, tmp_path):
+        from mlx_vlm.utils import prepare_inputs
+
+        cv2 = pytest.importorskip("cv2")
+        path = tmp_path / "clip.mp4"
+        writer = cv2.VideoWriter(
+            str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30, (32, 32)
+        )
+        if not writer.isOpened():
+            pytest.skip("mp4v encoder unavailable")
+        for value in (0, 100, 200):
+            writer.write(np.full((32, 32, 3), value, dtype=np.uint8))
+        writer.release()
+        output = prepare_inputs(
+            processor, videos=[path], prompts=self.VIDEO_BLOCK, nframes=3
+        )
+        assert output["image_grid_thw"].shape == (3, 3)
+        assert np.array(output["patch_positions"])[-1, 0] == 2
+
+    def test_numpy_processor_loads_through_auto_processor(self, processor, tmp_path):
+        import json
+
+        from transformers import AutoProcessor
+
+        from mlx_vlm.generate.video import processor_handles_video
+        from mlx_vlm.models.mage_vl.processing_mage_vl import MageVLProcessor
+        from mlx_vlm.utils import resolve_video_sampling
+
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": "mage_vl"}))
+        (tmp_path / "preprocessor_config.json").write_text(
+            json.dumps(
+                {
+                    "patch_size": 16,
+                    "temporal_patch_size": 1,
+                    "merge_size": 2,
+                    "min_pixels": 1024,
+                    "max_pixels": 8192,
+                }
+            )
+        )
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained",
+            return_value=processor.tokenizer,
+        ):
+            loaded = AutoProcessor.from_pretrained(tmp_path)
+        assert isinstance(loaded, MageVLProcessor)
+        assert processor_handles_video(loaded)
+        sampling = resolve_video_sampling(loaded, {})
+        assert (sampling.min_frames, sampling.frame_factor, sampling.max_frames) == (
+            1,
+            1,
+            32,
+        )
+        assert self.image_counts(
+            loaded(text=self.VIDEO_BLOCK, videos=[self.frames()])
+        ) == [3]
+
+    def test_mixed_video_pixels_affect_only_their_visual_embeddings(self, processor):
+        import mlx.core as mx
+
+        from mlx_vlm.models.mage_vl.config import ModelConfig, TextConfig, VisionConfig
+        from mlx_vlm.models.mage_vl.mage_vl import Model
+
+        config = ModelConfig(
+            text_config=TextConfig(
+                hidden_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=32,
+                intermediate_size=128,
+                vocab_size=32,
+            ),
+            vision_config=VisionConfig(
+                hidden_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                intermediate_size=128,
+                out_hidden_size=64,
+                text_hidden_size=64,
+            ),
+            image_token_id=2,
+            video_token_id=3,
+        )
+        model = Model(config)
+        kwargs = {
+            "text": self.IMAGE_BLOCK + self.VIDEO_BLOCK,
+            "images": [Image.new("RGB", (32, 32), "red")],
+        }
+        first = processor(**kwargs, videos=[self.frames(2, value=0)])
+        second = processor(**kwargs, videos=[self.frames(2, value=255)])
+        a = model.get_input_embeddings(**first).inputs_embeds
+        b = model.get_input_embeddings(**second).inputs_embeds
+        mx.eval(a, b)
+        visual_indices = np.flatnonzero(np.array(first["input_ids"])[0] == 2)
+        np.testing.assert_array_equal(
+            np.array(a)[0, visual_indices[0]], np.array(b)[0, visual_indices[0]]
+        )
+        assert not np.allclose(
+            np.array(a)[0, visual_indices[1:]], np.array(b)[0, visual_indices[1:]]
+        )
+        assert mx.all(mx.isfinite(a)).item() and mx.all(mx.isfinite(b)).item()
+
+    @pytest.mark.parametrize(
+        "raw", [np.array([[1, 4, 4]]), [[1, 4, 4]], np.array([1, 4, 4])]
+    )
+    def test_grid_coercion_accepts_processor_shapes(self, raw):
+        from mlx_vlm.models.mage_vl.mage_vl import _as_grid_list
+
+        assert _as_grid_list(raw) == [(1, 4, 4)]
