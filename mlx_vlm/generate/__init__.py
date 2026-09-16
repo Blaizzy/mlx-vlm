@@ -7,6 +7,7 @@ from .ar import (
     PromptProcessingBatch,
     batch_generate,
     generate_step,
+    make_batch_cache,
 )
 from .audio import (
     AudioGenerationResult,
@@ -104,6 +105,7 @@ __all__ = [
     "load_image_model",
     "load_video_generation_model",
     "main",
+    "make_batch_cache",
     "maybe_quantize_kv_cache",
     "parse_arguments",
     "save_audio",
