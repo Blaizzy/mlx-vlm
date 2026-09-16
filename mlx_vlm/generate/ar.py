@@ -366,11 +366,11 @@ def generate_step(
     def _step(y, inputs_embeds=None):
         nonlocal tokens, kwargs, last_outputs, target_sample_position
 
-        step_kwargs = kwargs
-        if speculative_prefill_capture_kwargs:
-            step_kwargs = {**kwargs, **speculative_prefill_capture_kwargs}
-        if getattr(model.language_model, "supports_logits_to_keep", False):
-            step_kwargs = {**step_kwargs, "logits_to_keep": 1}
+        step_kwargs = {
+            **kwargs,
+            **speculative_prefill_capture_kwargs,
+            "logits_to_keep": 1,
+        }
 
         with mx.stream(generation_stream):
             if "decoder_input_ids" in step_kwargs:
@@ -491,9 +491,11 @@ def generate_step(
                         and processed_tokens + n_to_process > checkpoint_lengths[0]
                     ):
                         n_to_process = checkpoint_lengths[0] - processed_tokens
-                    chunk_kwargs = {**kwargs, **speculative_prefill.kwargs}
-                    if getattr(model.language_model, "supports_logits_to_keep", False):
-                        chunk_kwargs = {**chunk_kwargs, "logits_to_keep": 1}
+                    chunk_kwargs = {
+                        **kwargs,
+                        **speculative_prefill.kwargs,
+                        "logits_to_keep": 1,
+                    }
                     chunk_output = model.language_model(
                         inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
@@ -1908,6 +1910,13 @@ class PromptProcessingBatch:
             ):
                 self.prefill_step_size = None
 
+        if self._apc_coordinator is not None:
+            self._apc_coordinator.prepare_prefill(
+                self._prompt_tokens_per_row,
+                prefix_lengths=self._cached_tokens_per_row,
+                prefill_step_size=self.prefill_step_size,
+            )
+
     def __len__(self):
         return len(self.uids)
 
@@ -2091,6 +2100,12 @@ class PromptProcessingBatch:
         eval_targets.extend(self._finished_prompt_logits[i] for i in finished_rows)
         mx.async_eval(eval_targets)
         self._processed_prompt_columns += n
+        if self._apc_coordinator is not None:
+            self._apc_coordinator.observe_cache(
+                self.prompt_cache,
+                max(self._cached_tokens_per_row) + self._processed_prompt_columns,
+                batch_size=len(self.uids),
+            )
         self._store_apc_exact_checkpoints()
         self._inputs_embeds = self._inputs_embeds[:, n:]
         self._input_ids = self._input_ids[:, n:]
@@ -2131,6 +2146,15 @@ class PromptProcessingBatch:
             call_kwargs.update(
                 speculative_prefill_kwargs(self.draft_kind, self.draft_model)
             )
+
+        call_kwargs["logits_to_keep"] = 1 + max(
+            (
+                padding
+                for i, padding in enumerate(self._right_pad_per_row or [])
+                if i not in self._finished_prompt_logits
+            ),
+            default=0,
+        )
 
         output = self.model(
             self._input_ids,
@@ -3031,7 +3055,10 @@ class BatchGenerator:
             sequences = self._unprocessed_sequences[:n]
             coordinator = getattr(self, "apc", None)
             if coordinator is not None:
-                coordinator.prepare_prefill(sum(len(s[1]) for s in sequences))
+                coordinator.prepare_prefill(
+                    [len(s[1]) for s in sequences],
+                    prefill_step_size=self.prefill_step_size,
+                )
             if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
                 logger.warning(
                     "APC admit n=%d (pending=%d)",

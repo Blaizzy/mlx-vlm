@@ -8,9 +8,96 @@ coordinator, adapted to MLX's contiguous runtime cache objects.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Callable, List, Optional, Sequence, Tuple
 
-from .apc_adapters import PrefixCachePlan, build_prefix_cache_plan
+from .apc_adapters import (
+    PrefixCachePlan,
+    build_prefix_cache_plan,
+    cache_memory_components,
+)
+from .models.cache import CacheMemory
+
+
+class PrefillMemoryPlan:
+    """Per-manager budgets from cache layouts or conservative opaque bounds.
+
+    Empty caches use the device reserve until dimensions are known.
+    """
+
+    def __init__(self):
+        self.components: List[CacheMemory] = []
+        self.lengths: List[int] = []
+        self.prefix_lengths: List[int] = []
+        self.chunk_size: Optional[int] = None
+
+    def prepare(self, lengths, *, chunk_size=None, prefix_lengths=None) -> int:
+        self.lengths = [max(0, int(n)) for n in lengths]
+        self.prefix_lengths = (
+            list(prefix_lengths)
+            if prefix_lengths is not None
+            else [0] * len(self.lengths)
+        )
+        self.chunk_size = chunk_size if chunk_size and chunk_size > 0 else None
+        return self.reserve_bytes()
+
+    def reserve_bytes(self, live_bytes: int = 0) -> int:
+        if not self.lengths or not max(self.lengths):
+            return 0
+        # Prefixes and suffixes are padded separately; cold prefixes are zero.
+        capacity = max(self.prefix_lengths) + max(
+            n - p for n, p in zip(self.lengths, self.prefix_lengths)
+        )
+        row_bytes = sum(c.footprint(capacity, self.chunk_size) for c in self.components)
+        return max(0, 2 * len(self.lengths) * row_bytes - live_bytes)
+
+    def observe(self, components, *, live_bytes: int) -> int:
+        previous = self.components
+        self.components = list(components)
+        if len(previous) == len(self.components):
+            for i, (old, new) in enumerate(zip(previous, self.components)):
+                if not new.source_bytes:
+                    self.components[i] = old
+                elif old.fallback and new.fallback:
+                    self.components[i] = replace(
+                        new,
+                        bytes_per_token=max(old.bytes_per_token, new.bytes_per_token),
+                    )
+        return self.reserve_bytes(live_bytes)
+
+    def observe_cache(
+        self, prompt_cache, token_count, *, batch_size=1, live_bytes=None
+    ) -> int:
+        """Update dimensions and return the reserve beyond live buffers."""
+        from .apc import _cache_nbytes
+
+        if live_bytes is None:
+            live_bytes = _cache_nbytes(prompt_cache)
+        return self.observe(
+            cache_memory_components(prompt_cache, token_count, batch_size=batch_size),
+            live_bytes=live_bytes,
+        )
+
+    def observe_kv(self, keys, values, *, live_bytes: int) -> int:
+        # Raw float KV slabs expose growth through their token axis.
+        return self.observe(
+            (
+                CacheMemory(
+                    source_bytes=k.nbytes + v.nbytes,
+                    bytes_per_token=(k.nbytes + v.nbytes) / k.shape[2],
+                )
+                for k, v in zip(keys, values)
+                if k.shape[2]
+            ),
+            live_bytes=live_bytes,
+        )
+
+    def restore_bytes(self, prompt_cache, token_count, capacity) -> int:
+        components = cache_memory_components(prompt_cache, token_count)
+        return sum(
+            max(c.source_bytes, c.footprint(capacity, self.chunk_size))
+            for c in components
+        )
 
 
 class APCCoordinator:
@@ -26,9 +113,24 @@ class APCCoordinator:
         self.model = model
         self.plan: PrefixCachePlan = build_prefix_cache_plan(model)
 
-    def prepare_prefill(self, token_count: int) -> None:
+    def prepare_prefill(
+        self, prompt_lengths, *, prefill_step_size=None, prefix_lengths=None
+    ) -> None:
         if self.enabled:
-            self.manager.prepare_prefill(token_count)
+            lengths = (
+                [prompt_lengths] if isinstance(prompt_lengths, int) else prompt_lengths
+            )
+            reserve = self.manager.memory_plan.prepare(
+                lengths, chunk_size=prefill_step_size, prefix_lengths=prefix_lengths
+            )
+            self.manager.prepare_prefill(reserve)
+
+    def observe_cache(self, prompt_cache, token_count, *, batch_size=1) -> None:
+        """Update runtime dimensions independently of snapshot persistence."""
+        reserve = self.manager.memory_plan.observe_cache(
+            prompt_cache, token_count, batch_size=batch_size
+        )
+        self.manager.prepare_prefill(reserve)
 
     @property
     def enabled(self) -> bool:
@@ -142,6 +244,14 @@ class APCCoordinator:
             make_warm_batch_exact_cache_multi,
             make_warm_batch_kv_cache_multi,
         )
+
+        memory = self.manager.memory_plan
+        if len(prefix_lens) == len(memory.lengths):
+            self.prepare_prefill(
+                memory.lengths,
+                prefill_step_size=memory.chunk_size,
+                prefix_lengths=prefix_lens,
+            )
 
         if self.is_checkpoint:
             row_caches = [

@@ -15,6 +15,8 @@ class LanguageModel(nn.Module):
         self.config = config
         self.model_type = config.model_type
         self.model = Lfm2Model(config)
+        if not config.tie_word_embeddings:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(
         self,
@@ -25,10 +27,16 @@ class LanguageModel(nn.Module):
         **kwargs,
     ):
         out = self.model(inputs, cache, inputs_embeds)
-        out = self.model.embed_tokens.as_linear(out)
+        if self.config.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(out)
+        else:
+            out = self.lm_head(out)
         return LanguageModelOutput(out)
 
     def sanitize(self, weights):
+        if self.config.tie_word_embeddings:
+            weights.pop("language_model.lm_head.weight", None)
+
         sanitized_weights = {}
         for name, param in weights.items():
             if "conv.weight" in name:
