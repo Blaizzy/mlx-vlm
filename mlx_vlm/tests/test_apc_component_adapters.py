@@ -102,6 +102,47 @@ def test_chunked_snapshot_preserves_trimmed_offset():
         assert bool(mx.array_equal(actual, expected))
 
 
+@pytest.mark.parametrize(
+    "base,kwargs",
+    [
+        (C.ConcatenateKVCache, {}),
+        (C.SimpleKVCache, {}),
+        (C.KVCache, {}),
+        (C.QuantizedKVCache, {}),
+        (C.BatchKVCache, {"left_padding": [0]}),
+        (C.BatchQuantizedKVCache, {"left_padding": [0]}),
+    ],
+)
+def test_kv_subclasses_inherit_default_memory_profile(base, kwargs):
+    class CustomKV(base):
+        pass
+
+    cache = CustomKV(**kwargs)
+    empty = A.cache_memory_components([cache], 0)[0]
+    assert not empty.fallback and empty.footprint(6000) == 0
+
+    keys = mx.ones((1, 1, 16, 64))
+    cache.update_and_fetch(keys, keys + 1)
+    profile = A.cache_memory_components([cache], 16)[0]
+    assert not profile.fallback
+    assert profile.source_bytes == C.cache_nbytes((cache.keys, cache.values))
+    future = CustomKV(**kwargs)
+    keys = mx.ones((1, 1, 6000, 64))
+    future.update_and_fetch(keys, keys + 1)
+    assert profile.footprint(6000) == C.cache_nbytes((future.keys, future.values))
+
+
+def test_subclasses_inherit_specialized_memory_profile():
+    class CustomState(C.ArraysCache):
+        pass
+
+    cache = CustomState(1)
+    cache[0] = mx.ones((1, 64))
+    profile = A.cache_memory_components([cache], 16)[0]
+    assert not profile.fallback
+    assert profile.footprint(6000) == cache.nbytes
+
+
 def test_custom_kv_memory_includes_auxiliary_state():
     class CustomKV(C.KVCache):
         @property
