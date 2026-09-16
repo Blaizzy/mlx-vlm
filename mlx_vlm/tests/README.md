@@ -156,8 +156,6 @@ checkpoint-conversion, or stateful integration assertions; MoE offload remains i
 
 These files retain separate execution boundaries:
 
-- `test_deepseek_v4_reference.py` requires an external checkpoint and reference
-  fixture and is the documented entry point for official-reference parity.
 - `test_nemotron_voicechat_dependency_floor.py` checks the dependency floor in a
   fresh interpreter and supports direct script execution.
 - `test_speculative_masks_static.py` loads mask code with fake dependencies
