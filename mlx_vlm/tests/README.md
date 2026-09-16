@@ -25,6 +25,7 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_kv_cache_quantization.py` | Quantized cache lifecycle, batching, and attention masks |
 | `test_turboquant.py` | TurboQuant cache integration, batched attention, and value kernels |
 | `test_weight_quantization.py` | FP8 and one-bit weight conversion and execution |
+| `test_moe_offload.py` | MoE checkpoint repacking, expert offload, output parity, and failure handling |
 | `test_qwen3_5.py` | Qwen3.5 patch layouts, MTP sanitization, and ragged attention fallbacks |
 | `test_qwen4_exp.py` | Qwen4 model behavior, external PLE storage, and MTP drafting |
 | `test_deepseek_v4_vision.py` | DeepSeek V4 vision behavior and checkpoint conversion |
@@ -36,7 +37,7 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_server_audio.py` | HTTP audio endpoints and realtime voice sessions |
 | `test_cli.py` | CLI arguments, detector display options, and CLI/library default parity |
 | `test_prompt_utils.py` | Prompt construction and reasoning-template arguments |
-| `test_trainer.py` | Training workflows and trainer utilities |
+| `test_trainer.py` | Training workflows, trainer utilities, and MRoPE/gated-delta gradient regressions |
 | `test_utils.py` | General loading/conversion utilities and local Python model files |
 
 Other architecture-specific modules remain focused on their own models. The
