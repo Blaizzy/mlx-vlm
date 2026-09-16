@@ -1239,6 +1239,7 @@ class LanguageModel(nn.Module):
         inputs: Optional[mx.array] = None,
         n_to_process: Optional[int] = None,
         capture_layer_ids: Optional[List[int]] = None,
+        **kwargs,
     ) -> LanguageModelOutput:
         """Extra `inputs`/`n_to_process` are generate-protocol passengers.
 
