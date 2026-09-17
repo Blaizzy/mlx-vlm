@@ -1,249 +1,406 @@
 {
-  "models": [
-    {
-      "id": "ideogram4-transformer",
-      "module": "ideogram4.transformer",
-      "model_class": "Ideogram4Transformer",
-      "config_class": "Ideogram4TransformerConfig",
-      "config": {
-        "emb_dim": 12,
-        "num_layers": 1,
-        "num_heads": 3,
-        "intermediate_size": 16,
-        "adanln_dim": 4,
-        "in_channels": 4,
-        "llm_features_dim": 8,
-        "mrope_section": [1, 1, 0]
-      },
-      "checks": ["transformer"]
+  "families": {
+    "bonsai": {
+      "prefix": "Bonsai",
+      "aliases": ["bonsai-ternary"],
+      "invalid_dimensions": [[255, 512], [512, 2050], [513, 512]],
+      "probe": "bonsai-ternary",
+      "pipeline_class": "BonsaiImage",
+      "packed_variant": "ternary"
     },
-    {
-      "id": "z_image-transformer",
-      "module": "z_image.transformer",
-      "model_class": "ZImageTransformer",
-      "config_class": "ZImageTransformerConfig",
-      "config": {
-        "hidden_size": 64,
-        "num_attention_heads": 4,
-        "num_key_value_heads": 4,
-        "intermediate_size": 128,
-        "in_channels": 16,
-        "text_embed_dim": 32,
-        "num_hidden_layers": 2,
-        "n_refiner_layers": 1,
-        "n_context_refiner_layers": 1,
-        "adaln_embed_dim": 256,
-        "rope_sections": [4, 6, 6]
-      },
-      "checks": ["transformer"]
+    "flux2": {
+      "prefix": "Flux2",
+      "aliases": ["flux2-klein-4b", "black-forest-labs/FLUX.2-klein-9B"],
+      "invalid_dimensions": [[255, 512], [512, 2050], [513, 512]],
+      "probe": "klein-base-9b",
+      "pipeline_class": "Flux2Image",
+      "packed_variant": "flux2-klein-4b"
     },
-    {
-      "id": "z_image-text_encoder",
-      "module": "z_image.text_encoder",
-      "model_class": "ZImageTextEncoder",
-      "config_class": "ZImageTextEncoderConfig",
-      "config": {
-        "vocab_size": 256,
-        "hidden_size": 64,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 4,
-        "num_key_value_heads": 2,
-        "intermediate_size": 128,
-        "head_dim": 16
-      },
-      "checks": ["text_encoder"]
+    "ideogram4": {
+      "prefix": "Ideogram4",
+      "aliases": ["ideogram-ai/ideogram-4-fp8"],
+      "invalid_dimensions": [[255, 512], [512, 2050], [2048, 256]],
+      "index_class": "Ideogram4Pipeline",
+      "pipeline_class": "Ideogram4ImagePipeline"
     },
-    {
-      "id": "z_image-vae_decode",
-      "module": "z_image.vae",
-      "model_class": "ZImageVAE",
-      "config_class": "ZImageVAEConfig",
-      "config": {
-        "in_channels": 3,
-        "out_channels": 3,
-        "latent_channels": 4,
-        "block_out_channels": [32, 64],
-        "layers_per_block": 1
-      },
-      "checks": ["vae_decode"]
+    "z_image": {
+      "prefix": "ZImage",
+      "aliases": ["Tongyi-MAI/Z-Image"],
+      "invalid_dimensions": [[0, 512], [513, 512], [512, 513]],
+      "index_class": "ZImagePipeline",
+      "edit": {},
+      "pipeline_class": "ZImagePipeline"
     },
-    {
-      "id": "ernie_image-transformer",
-      "module": "ernie_image.transformer",
-      "model_class": "ErnieImageTransformer",
-      "config_class": "ErnieImageTransformerConfig",
-      "config": {
-        "hidden_size": 32,
-        "ffn_hidden_size": 64,
-        "in_channels": 8,
-        "out_channels": 8,
-        "num_layers": 2,
-        "num_attention_heads": 4,
-        "rope_axes_dim": [2, 2, 4],
-        "text_in_dim": 16
-      },
-      "checks": ["transformer"]
+    "ernie_image": {
+      "prefix": "ErnieImage",
+      "aliases": ["baidu/ERNIE-Image-Turbo"],
+      "invalid_dimensions": [[15, 16], [1025, 1024], [1024, 1000]],
+      "probe": "ernie-image",
+      "index_class": "ErnieImagePipeline",
+      "edit": {"probe": "baidu/ERNIE-Image-Turbo"},
+      "pipeline_class": "ErnieImagePipeline"
     },
-    {
-      "id": "mage_flow-transformer",
-      "module": "mage_flow.transformer",
-      "model_class": "MageFlowTransformer",
-      "config_class": null,
-      "config": {
-        "in_channels": 8,
-        "out_channels": 8,
-        "context_in_dim": 16,
-        "hidden_size": 32,
-        "num_heads": 4,
-        "depth": 2,
-        "axes_dim": [2, 2, 4]
-      },
-      "checks": ["transformer"]
+    "mage_flow": {
+      "prefix": "MageFlow",
+      "aliases": ["microsoft/Mage-Flow"],
+      "invalid_dimensions": [[511, 512], [512, 2049], [513, 512], [512, 496]],
+      "probe": "mage-flow-base",
+      "index_class": "MageFlowPipeline",
+      "edit": {"alias": "microsoft/Mage-Flow-Edit-Turbo", "probe": "mage-flow-edit-base"},
+      "pipeline_class": "MageFlowPipeline"
     }
-  ],
-  "wrappers": [
-    {
-      "id": "flux-kv-edit",
-      "family": "flux2",
-      "variant": "flux2-klein-9b-kv",
-      "task": "edit",
-      "request": {"prompt": "add sunglasses", "image_paths": ["reference.png"], "seed": 9, "steps": 2, "guidance": 1.0},
-      "expected": {"width": 24, "height": 20},
-      "metadata": {"uses_reference_kv_cache": true, "reference_count": 1}
-    },
-    {
-      "id": "ideogram-generate",
-      "family": "ideogram4",
-      "variant": "ideogram-4-fp8",
-      "task": "generate",
-      "request": {"prompt": "caption", "seed": 9, "steps": 2, "width": 10, "height": 8, "guidance": 7.0},
-      "expected": {"width": 10, "height": 8, "prompt_tokens": 3, "variant": "ideogram-4-fp8"}
-    },
-    {
-      "id": "z-edit-defaults",
-      "family": "z_image",
-      "variant": "turbo",
-      "task": "edit",
-      "request": {"prompt": "replace the cart", "image_paths": ["source.png"], "extra": {"strength": 0.55}},
-      "expected": {"width": 32, "height": 16},
-      "forwarded": {"steps": 8, "guidance": 0.0, "strength": 0.55}
-    },
-    {
-      "id": "z-edit-explicit",
-      "family": "z_image",
-      "variant": "turbo",
-      "task": "edit",
-      "request": {"prompt": "replace the cart", "image_paths": ["source.png"], "steps": 4, "guidance": 1.0},
-      "forwarded": {"steps": 4, "guidance": 1.0}
-    },
-    {
-      "id": "z-base-explicit",
-      "family": "z_image",
-      "variant": "base",
-      "task": "generate",
-      "request": {"prompt": "fox", "steps": 4, "guidance": 1.0},
-      "forwarded": {"steps": 4, "guidance": 1.0},
-      "metadata": {"guidance_mode": "disabled"}
-    },
-    {
-      "id": "ernie-base",
-      "family": "ernie_image",
-      "variant": "ernie-image",
-      "task": "generate",
-      "request": {"prompt": "a lighthouse", "seed": 7, "extra": {"negative_prompt": "fog"}},
-      "expected": {"steps": 50, "guidance": 4.0, "width": 512, "height": 512},
-      "forwarded": {"negative_prompt": "fog"},
-      "metadata": {"classifier_free_guidance": true}
-    },
-    {
-      "id": "ernie-turbo",
-      "family": "ernie_image",
-      "variant": "ernie-image-turbo",
-      "task": "generate",
-      "request": {"prompt": "a lighthouse", "seed": 7, "extra": {"negative_prompt": "fog"}},
-      "expected": {"steps": 8, "guidance": 1.0, "width": 512, "height": 512},
-      "forwarded": {"negative_prompt": "fog"},
-      "metadata": {"classifier_free_guidance": false}
-    },
-    {
-      "id": "ernie-base-edit",
-      "family": "ernie_image",
-      "variant": "ernie-image",
-      "task": "edit",
-      "request": {"prompt": "make it a convertible", "image_paths": ["source.png"], "seed": 3},
-      "expected": {"steps": 50, "guidance": 4.0}
-    }
-  ],
-  "sanitizers": [
-    {
-      "id": "z-transformer",
-      "family": "z_image",
-      "component": "transformer",
-      "keys": {
-        "all_final_layer.2-1.linear.weight": {"target": "final_layer.linear.weight", "shape": [3]},
-        "all_final_layer.2-1.adaLN_modulation.1.weight": {"target": "final_layer.adaLN_modulation.0.weight", "shape": [3]},
-        "all_x_embedder.2-1.weight": {"target": "x_embedder.weight", "shape": [3]},
-        "layers.0.attention.to_q.weight": {"target": "layers.0.attention.to_q.weight", "shape": [3]},
-        "t_embedder.mlp.0.weight": {"target": "t_embedder.linear1.weight", "shape": [3]}
+  },
+  "checks": {
+    "forward": [
+      {
+        "id": "ideogram4-transformer",
+        "module": "ideogram4.transformer",
+        "config": {
+          "emb_dim": 12,
+          "num_layers": 1,
+          "num_heads": 3,
+          "intermediate_size": 16,
+          "adanln_dim": 4,
+          "in_channels": 4,
+          "llm_features_dim": 8,
+          "mrope_section": [1, 1, 0]
+        },
+        "adapter": "ideogram4",
+        "input": {"features": [1, 3, 8], "image": [1, 3, 4], "positions": [1, 3, 3], "segments": [1, 3]},
+        "expected_shape": [1, 3, 4]
+      },
+      {
+        "id": "z_image-transformer",
+        "module": "z_image.transformer",
+        "config": {
+          "hidden_size": 64,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 4,
+          "intermediate_size": 128,
+          "in_channels": 16,
+          "text_embed_dim": 32,
+          "num_hidden_layers": 2,
+          "n_refiner_layers": 1,
+          "n_context_refiner_layers": 1,
+          "adaln_embed_dim": 256,
+          "rope_sections": [4, 6, 6]
+        },
+        "adapter": "z_image",
+        "input": {"image": [1, 16, 1, 4, 4], "context": [1, 8, 32], "padded_lengths": [32, 32, 64]},
+        "expected_shape": [1, 16, 1, 4, 4]
+      },
+      {
+        "id": "z_image-text_encoder",
+        "module": "z_image.text_encoder",
+        "config": {
+          "vocab_size": 256,
+          "hidden_size": 64,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "intermediate_size": 128,
+          "head_dim": 16
+        },
+        "adapter": "text_encoder",
+        "input": {"tokens": [[1, 2, 3, 4, 5]]},
+        "expected_shape": [1, 5, 64]
+      },
+      {
+        "id": "z_image-vae_decode",
+        "module": "z_image.vae",
+        "config": {
+          "in_channels": 3,
+          "out_channels": 3,
+          "latent_channels": 4,
+          "block_out_channels": [32, 64],
+          "layers_per_block": 1
+        },
+        "adapter": "vae_decode",
+        "input": {"latents": [1, 4, 4, 4]},
+        "expected_shape": [1, 8, 8, 3]
+      },
+      {
+        "id": "ernie_image-transformer",
+        "module": "ernie_image.transformer",
+        "config": {
+          "hidden_size": 32,
+          "ffn_hidden_size": 64,
+          "in_channels": 8,
+          "out_channels": 8,
+          "num_layers": 2,
+          "num_attention_heads": 4,
+          "rope_axes_dim": [2, 2, 4],
+          "text_in_dim": 16
+        },
+        "adapter": "ernie_image",
+        "input": {"image": [2, 8, 2, 2], "text": [2, 3, 16], "timesteps": [1000.0, 500.0], "text_lengths": [1, 3]},
+        "expected_shape": [2, 8, 2, 2]
+      },
+      {
+        "id": "mage_flow-transformer",
+        "module": "mage_flow.transformer",
+        "config_class": null,
+        "config": {
+          "in_channels": 8,
+          "out_channels": 8,
+          "context_in_dim": 16,
+          "hidden_size": 32,
+          "num_heads": 4,
+          "depth": 2,
+          "axes_dim": [2, 2, 4]
+        },
+        "adapter": "mage_flow",
+        "input": {"image": [1, 4, 8], "text": [1, 3, 16], "image_shapes": [[1, 2, 2]]},
+        "expected_shape": [1, 4, 8]
       }
-    },
-    {
-      "id": "z-text",
-      "family": "z_image",
-      "component": "text_encoder",
-      "keys": {
-        "model.embed_tokens.weight": {"target": "embed_tokens.weight", "shape": [2, 2]},
-        "model.rotary_emb.inv_freq": {"target": null, "shape": [2]}
+    ],
+    "wrapper": [
+      {
+        "id": "flux-kv-edit",
+        "family": "flux2",
+        "variant": "flux2-klein-9b-kv",
+        "task": "edit",
+        "request": {"prompt": "add sunglasses", "image_paths": ["reference.png"], "seed": 9, "steps": 2, "guidance": 1.0},
+        "expected": {"width": 24, "height": 20},
+        "metadata": {"uses_reference_kv_cache": true, "reference_count": 1}
+      },
+      {
+        "id": "ideogram-generate",
+        "family": "ideogram4",
+        "variant": "ideogram-4-fp8",
+        "task": "generate",
+        "request": {"prompt": "caption", "seed": 9, "steps": 2, "width": 10, "height": 8, "guidance": 7.0},
+        "expected": {"width": 10, "height": 8, "prompt_tokens": 3, "variant": "ideogram-4-fp8"}
+      },
+      {
+        "id": "z-edit-defaults",
+        "family": "z_image",
+        "variant": "turbo",
+        "task": "edit",
+        "request": {
+          "prompt": "replace the cart",
+          "image_paths": ["source.png"],
+          "extra": {"strength": 0.55}
+        },
+        "expected": {"width": 32, "height": 16},
+        "forwarded": {"steps": 8, "guidance": 0.0, "strength": 0.55}
+      },
+      {
+        "id": "z-edit-explicit",
+        "family": "z_image",
+        "variant": "turbo",
+        "task": "edit",
+        "request": {"prompt": "replace the cart", "image_paths": ["source.png"], "steps": 4, "guidance": 1.0},
+        "forwarded": {"steps": 4, "guidance": 1.0}
+      },
+      {
+        "id": "z-base-explicit",
+        "family": "z_image",
+        "variant": "base",
+        "task": "generate",
+        "request": {"prompt": "fox", "steps": 4, "guidance": 1.0},
+        "forwarded": {"steps": 4, "guidance": 1.0},
+        "metadata": {"guidance_mode": "disabled"}
+      },
+      {
+        "id": "ernie-base",
+        "family": "ernie_image",
+        "variant": "ernie-image",
+        "task": "generate",
+        "request": {
+          "prompt": "a lighthouse",
+          "seed": 7,
+          "extra": {"negative_prompt": "fog"}
+        },
+        "expected": {"steps": 50, "guidance": 4.0, "width": 512, "height": 512},
+        "forwarded": {"negative_prompt": "fog"},
+        "metadata": {"classifier_free_guidance": true}
+      },
+      {
+        "id": "ernie-turbo",
+        "family": "ernie_image",
+        "variant": "ernie-image-turbo",
+        "task": "generate",
+        "request": {
+          "prompt": "a lighthouse",
+          "seed": 7,
+          "extra": {"negative_prompt": "fog"}
+        },
+        "expected": {"steps": 8, "guidance": 1.0, "width": 512, "height": 512},
+        "forwarded": {"negative_prompt": "fog"},
+        "metadata": {"classifier_free_guidance": false}
+      },
+      {
+        "id": "ernie-base-edit",
+        "family": "ernie_image",
+        "variant": "ernie-image",
+        "task": "edit",
+        "request": {"prompt": "make it a convertible", "image_paths": ["source.png"], "seed": 3},
+        "expected": {"steps": 50, "guidance": 4.0}
       }
-    },
-    {
-      "id": "ernie-text",
-      "family": "ernie_image",
-      "component": "text_encoder",
-      "keys": {
-        "language_model.model.embed_tokens.weight": {"target": "embed_tokens.weight", "shape": [4, 2]},
-        "language_model.model.rotary_emb.inv_freq": {"target": null, "shape": [1]},
-        "vision_tower.weight": {"target": null, "shape": [1]}
+    ],
+    "sanitize": [
+      {
+        "id": "z-transformer",
+        "family": "z_image",
+        "component": "transformer",
+        "keys": {
+          "all_final_layer.2-1.linear.weight": {"target": "final_layer.linear.weight", "shape": [3]},
+          "all_final_layer.2-1.adaLN_modulation.1.weight": {"target": "final_layer.adaLN_modulation.0.weight", "shape": [3]},
+          "all_x_embedder.2-1.weight": {"target": "x_embedder.weight", "shape": [3]},
+          "layers.0.attention.to_q.weight": {"shape": [3]},
+          "t_embedder.mlp.0.weight": {"target": "t_embedder.linear1.weight", "shape": [3]}
+        }
+      },
+      {
+        "id": "z-text",
+        "family": "z_image",
+        "component": "text_encoder",
+        "keys": {
+          "model.embed_tokens.weight": {"target": "embed_tokens.weight", "shape": [2, 2]},
+          "model.rotary_emb.inv_freq": {"target": null, "shape": [2]}
+        }
+      },
+      {
+        "id": "ernie-text",
+        "family": "ernie_image",
+        "component": "text_encoder",
+        "keys": {
+          "language_model.model.embed_tokens.weight": {"target": "embed_tokens.weight", "shape": [4, 2]},
+          "language_model.model.rotary_emb.inv_freq": {"target": null, "shape": [1]},
+          "vision_tower.weight": {"target": null, "shape": [1]}
+        }
+      },
+      {
+        "id": "mage-transformer",
+        "family": "mage_flow",
+        "component": "transformer",
+        "keys": {
+          "transformer_blocks.0.img_mod.1.weight": {"target": "transformer_blocks.0.img_mod.linear.weight", "shape": [6, 1]},
+          "transformer_blocks.0.attn.to_out.0.bias": {"target": "transformer_blocks.0.attn.to_out.bias", "shape": [1]},
+          "transformer_blocks.0.txt_mlp.net.0.proj.weight": {"target": "transformer_blocks.0.txt_mlp.linear_in.weight", "shape": [4, 1]}
+        }
+      },
+      {
+        "id": "z-vae-source",
+        "family": "z_image",
+        "component": "vae",
+        "module": "vae",
+        "keys": {
+          "encoder.conv_in.weight": {"shape": [8, 4, 3, 3], "axes": [0, 2, 3, 1]},
+          "decoder.conv_norm_out.weight": {"shape": [8]}
+        },
+        "roundtrip_options": {"source_layout": false}
+      },
+      {
+        "id": "z-vae-native-key",
+        "family": "z_image",
+        "component": "vae",
+        "module": "vae",
+        "keys": {
+          "encoder.conv_in.conv2d.weight": {"target": "encoder.conv_in.weight", "shape": [8, 4, 3, 3]}
+        }
+      },
+      {
+        "id": "ernie-transformer",
+        "family": "ernie_image",
+        "component": "transformer",
+        "keys": {
+          "adaLN_modulation.1.weight": {"target": "adaln_modulation.weight", "shape": [6, 4]},
+          "layers.0.self_attention.to_out.0.weight": {"target": "layers.0.self_attention.to_out.weight", "shape": [4, 4]},
+          "x_embedder.proj.weight": {"shape": [8, 4, 1, 1], "axes": [0, 2, 3, 1]}
+        },
+        "target_shapes": true
+      },
+      {
+        "id": "mage-vae-source",
+        "family": "mage_flow",
+        "component": "vae",
+        "keys": {
+          "student.dconv_encoder.blocks.0.ca.1.weight": {"target": "dconv_encoder.blocks.0.ca_conv.weight", "shape": [2, 2, 1, 1], "axes": [0, 2, 3, 1]},
+          "pipeline.dec_net.res_blocks.0.mlp.2.weight": {"target": "decoder_model.dec_net.res_blocks.0.linear_2.weight", "shape": [2, 2]},
+          "pipeline.y_embedder.encoder.encoder.conv_in.weight": {"target": null, "shape": [2, 2, 3, 3]}
+        }
+      },
+      {
+        "id": "mage-vae-native",
+        "family": "mage_flow",
+        "component": "vae",
+        "options": {"source_layout": "mlx_nhwc"},
+        "keys": {
+          "decoder_model.conv_in.weight": {"shape": [2, 3, 3, 4]}
+        }
       }
-    },
-    {
-      "id": "mage-transformer",
-      "family": "mage_flow",
-      "component": "transformer",
-      "keys": {
-        "transformer_blocks.0.img_mod.1.weight": {"target": "transformer_blocks.0.img_mod.linear.weight", "shape": [6, 1]},
-        "transformer_blocks.0.attn.to_out.0.bias": {"target": "transformer_blocks.0.attn.to_out.bias", "shape": [1]},
-        "transformer_blocks.0.txt_mlp.net.0.proj.weight": {"target": "transformer_blocks.0.txt_mlp.linear_in.weight", "shape": [4, 1]}
+    ],
+    "download": [
+      {
+        "id": "bonsai-local",
+        "module": "bonsai.download",
+        "config": {"variant": "ternary", "max_workers": 3},
+        "repo_id": "prism-ml/bonsai-image-ternary-4B-mlx-2bit",
+        "directory_option": "models_dir",
+        "directory_name": "bonsai-image-4B-ternary-mlx"
+      },
+      {
+        "id": "bonsai-cache",
+        "module": "bonsai.download",
+        "config": {"variant": "ternary", "max_workers": 2},
+        "repo_id": "prism-ml/bonsai-image-ternary-4B-mlx-2bit"
+      },
+      {
+        "id": "flux2-cache",
+        "module": "flux2.download",
+        "config": {"variant": "flux2-klein-9b", "max_workers": 2},
+        "repo_id": "black-forest-labs/FLUX.2-klein-9B",
+        "required_patterns": ["model_index.json"]
+      },
+      {
+        "id": "mage-flow-cache",
+        "module": "mage_flow.download",
+        "config": {"variant": "mage-flow-turbo", "max_workers": 2},
+        "repo_id": "mage-flow-community/Mage-Flow-Turbo"
       }
-    }
-  ],
-  "downloads": [
-    {
-      "id": "bonsai-local",
-      "module": "bonsai.download",
-      "config": {"variant": "ternary", "max_workers": 3},
-      "repo_id": "prism-ml/bonsai-image-ternary-4B-mlx-2bit",
-      "directory_option": "models_dir",
-      "directory_name": "bonsai-image-4B-ternary-mlx"
-    },
-    {
-      "id": "bonsai-cache",
-      "module": "bonsai.download",
-      "config": {"variant": "ternary", "max_workers": 2},
-      "repo_id": "prism-ml/bonsai-image-ternary-4B-mlx-2bit"
-    },
-    {
-      "id": "flux2-cache",
-      "module": "flux2.download",
-      "config": {"variant": "flux2-klein-9b", "max_workers": 2},
-      "repo_id": "black-forest-labs/FLUX.2-klein-9B",
-      "required_patterns": ["model_index.json"]
-    },
-    {
-      "id": "mage-flow-cache",
-      "module": "mage_flow.download",
-      "config": {"variant": "mage-flow-turbo", "max_workers": 2},
-      "repo_id": "mage-flow-community/Mage-Flow-Turbo"
-    }
-  ]
+    ],
+    "layout": [
+      {"id": "bonsai", "family": "bonsai", "missing": "transformer-packed-mflux"},
+      {"id": "flux2", "family": "flux2", "missing": "transformer"},
+      {"id": "ideogram4", "family": "ideogram4", "missing": "transformer"},
+      {"id": "mage_flow", "family": "mage_flow", "missing": "transformer"},
+      {"id": "ernie-mflux", "family": "ernie_image", "valid": true},
+      {
+        "id": "ernie-incomplete-enhancer",
+        "family": "ernie_image",
+        "missing": "pe_tokenizer",
+        "files": ["pe/model.safetensors"]
+      }
+    ],
+    "quantized_load": [
+      {"id": "ernie_image-mxfp4", "family": "ernie_image", "mode": "mxfp4", "bits": 4, "group_size": 32},
+      {"id": "ernie_image-mxfp8", "family": "ernie_image", "mode": "mxfp8", "bits": 8, "group_size": 32},
+      {"id": "ernie_image-nvfp4", "family": "ernie_image", "mode": "nvfp4", "bits": 4, "group_size": 16},
+      {"id": "ernie_image-affine", "family": "ernie_image", "mode": "affine", "bits": 4, "group_size": 32},
+      {"id": "z_image-mxfp4", "family": "z_image", "mode": "mxfp4", "bits": 4, "group_size": 32},
+      {"id": "z_image-mxfp8", "family": "z_image", "mode": "mxfp8", "bits": 8, "group_size": 32},
+      {"id": "z_image-nvfp4", "family": "z_image", "mode": "nvfp4", "bits": 4, "group_size": 16},
+      {"id": "z_image-affine", "family": "z_image", "mode": "affine", "bits": 4, "group_size": 64}
+    ],
+    "save_reload": [
+      {
+        "id": "z-affine",
+        "family": "z_image",
+        "metadata": {
+          "mlx_vlm_format": "z_image",
+          "quantization_group_size": "64",
+          "quantization_level": "4",
+          "quantization_mode": "affine"
+        }
+      },
+      {
+        "id": "mage-affine",
+        "family": "mage_flow",
+        "metadata": {"mlx_vlm_format": "mage_flow", "tensor_layout": "mlx_nhwc"},
+        "reload": true
+      }
+    ]
+  }
 }

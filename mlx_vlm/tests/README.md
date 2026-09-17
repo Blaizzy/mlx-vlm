@@ -44,6 +44,38 @@ construction is shared through `test_models.py`.
 
 ## Current validation
 
+The image-contract refactor against `31218fb1` keeps all existing scenarios and
+uses seven named runners for **43 JSON cases**: forward (6), wrapper (8), sanitize
+(9), download (4), layout (6), quantized load (8), and save/reload (2). Dispatch
+and invalid-dimension checks use the same six-family registry. Numerical and
+stateful pipeline checks remain in Python, alongside shared checkpoint builders.
+
+| Image test source | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Python | 1,780 | 1,611 | -169 |
+| Readable JSON | 249 | 406 | +157 |
+| Combined | 2,029 | 2,017 | -12 |
+
+The current suite totals **21,396 Python lines and 3,256 JSON lines: 24,652
+combined**, with the same 16 Python files. Generalization saves considerably less
+combined source than Python alone; configuration moved to JSON is counted above.
+Sanitizer checks now compare nonzero tensor values as well as keys and shapes.
+
+The image suite passes **140 cases** (previously 139: source/native Z-Image VAE
+sanitization now collects separately). Its exact production execution sets remain
+**8,034 lines and 682 branch outcomes**. The full suite passes **1,720 tests,
+four existing skips, and 31 subtests**: 1,724 collected cases. Full-suite coverage
+remains **80,981 executed lines and 12,824 branch outcomes**, with **zero lost or
+added paths** against `31218fb1`. This preserves the immediate baseline; it does
+not restore coverage intentionally pruned earlier in this branch.
+
+Black, isort with the Black profile, autoflake, pyflakes, Python 3.10 syntax parsing,
+JSON parsing, and whitespace checks pass. This pass changes tests and documentation
+only. Use the coverage command below and compare against `31218fb1` to reproduce
+the image-contract measurements.
+
+## Previous compression and intentional pruning
+
 Compared with `e48acdc6`, shared setup and runners reduce Python source
 **22,331 → 21,565 lines**, saving **766 formatted lines**. JSON is unchanged at
 **3,099 lines**; the combined total is **24,664 lines**, with the same 16 Python
@@ -470,27 +502,35 @@ remain 80,919 lines and 12,819 branch outcomes, with no lost or added paths;
 
 `test_image_generation_models.py` owns the six image-generation families and
 keeps checkpoint writers, pipeline doubles, and tiny quantization models in the
-same file. `image_generation_cases.json` supplies ordinary data for six component
-checks across four model families, eight generation/edit wrapper cases, and four
-weight-key sanitizer cases. Each entry in `models` names its import `module`
-relative to `mlx_vlm.models`, `model_class`, `config_class`, ordinary constructor
-`config`, and `checks`. The runner imports the module dynamically and constructs
-the named classes; `config_class: null` passes config fields directly to the model
-constructor (Mage Flow). The case `id` only labels the collected test. For example,
-Z-Image's transformer imports `z_image.transformer` and constructs
-`ZImageTransformer(ZImageTransformerConfig(**config))`.
+same file. `image_generation_cases.json` has a `families` registry for class
+prefixes, pipeline classes, dispatch aliases, and invalid dimensions, plus a
+`checks` object with seven groups: `forward`, `wrapper`, `sanitize`, `download`,
+`layout`, `quantized_load`, and `save_reload`. `test_image_contract` dispatches
+each entry to the corresponding `ImageChecks` method. IDs include both the
+contract and case, for example `sanitize-z-vae-source`.
 
-Requests, expected result fields, forwarded arguments, and metadata belong in
-`wrappers`. Sanitizer keys specify their source shape and expected destination
-(`null` means drop). Python constructs models, supplies tensor layouts and calling
-conventions, and checks the results. No references or executable expressions are
-needed in JSON.
+Each `forward` case names its import `module` relative to `mlx_vlm.models`, tiny
+constructor `config`, input adapter, tensor shapes or token values, and expected
+output shape. Class names follow the family prefix and component, with the config
+class defaulting to the model class plus `Config`. For example, the
+`z_image.transformer` entry constructs
+`ZImageTransformer(ZImageTransformerConfig(**config))`. `config_class: null`
+passes config fields directly to the model constructor (Mage Flow).
+
+Wrapper cases supply requests, expected result fields, forwarded arguments, and
+metadata. Sanitizer keys specify source shape, expected destination (omitted
+means unchanged; `null` means drop), and optional transpose axes. The shared
+runner compares all output keys and tensor values, including native-layout
+roundtrips. Layout cases describe valid checkpoints or expected missing files;
+quantization cases supply mode, bits, group size, and expected saved metadata.
+Python constructs models and tensors, handles calling conventions, and asserts
+results. JSON contains no references or executable expressions.
 
 Behavioral checks use `_ModelFamily` for dynamic submodule access, such as
 `ernie.config` or `flux.weights`. These resolve to real imported modules, so
 patches still apply to production objects without a static model import block.
 
-The four `downloads` cases use one model-independent runner. Each supplies an
+The four `download` cases use one model-independent runner. Each supplies an
 import module, download `config`, expected `repo_id`, and optional destination
 or required-pattern expectations. The runner mocks Hub access and validation,
 checks argument forwarding, destination creation, and validation calls, and
