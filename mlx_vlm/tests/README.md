@@ -31,7 +31,6 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_video_generation.py` | Video model discovery, request/result adapters, progress, and audio/video muxing |
 | `test_processors.py` | Image/video/audio processors, including Mage VL timestamps, patch positions, and visual-embedding integration |
 | `test_speculative.py` | Drafter loading and compatibility, generation parity, verification, cache transactions, and quantized speculative state across model families |
-| `test_speculative_masks_static.py` | Gemma assistant mask offsets with fake dependencies, without importing MLX |
 | `test_rope.py` | Rotary embeddings, multimodal position IDs, and batched offsets |
 | `test_audio_generation.py` | Audio generation, loading, downmixing, and resampling |
 | `test_server.py` | Chat/Responses/Anthropic APIs, image endpoints, batching/cancellation, runtime settings, reranking, Responses normalization, tool stream state, HTTP audio, and realtime voice sessions |
@@ -46,7 +45,7 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_tokenizer_utils.py` | Streaming detokenizers, decoder detection, and tokenizer wrappers |
 | `test_smoke.py` | Manual model-download runner, excluded from automated collection |
 
-The suite has 29 test modules. Attention checks share `test_attention.py`;
+The suite has 28 test modules. Attention checks share `test_attention.py`;
 Qwen3.5 patch-weight sanitization lives with loading checks in `test_utils.py`.
 Responses normalization and tool-stream finalization share `test_server.py`;
 structured-output processors share `test_generate.py`. Vision LRU checks live in
@@ -59,8 +58,13 @@ against `f7de22df`, retaining both JSON files. Its full-suite execution sets wer
 80,634 production lines and 12,715 branch outcomes, with no lost or added paths.
 That validation reported 1,852 passed, five skipped, and 41 passing subtests.
 These are measured execution sets, not complete production coverage. The earlier
-pruning tradeoffs still apply. The suite now contains 26,622 Python lines plus
-2,142 readable JSON lines, or 28,764 combined.
+pruning tradeoffs still apply. The suite now contains 26,563 Python lines plus
+2,142 readable JSON lines, or 28,705 combined.
+
+After removing the unused cache helper and redundant standalone mask test, the
+full suite reports 1,875 passed, five skipped, and 41 passing subtests. Coverage
+against `66f67781` retains exactly 80,919 production lines and 12,819 branch
+outcomes, with no lost or added paths.
 
 `test_tool_parsers.py` discovers modules under `mlx_vlm.tools.parsers` and imports
 them through `load_tool_module`. Add a literal native-format example to
@@ -293,9 +297,9 @@ domain test module. The shared contracts do not replace numerical-reference,
 checkpoint-conversion, or stateful integration assertions; MoE offload remains in
 `test_moe_offload.py`, and training gradients remain in `test_trainer.py`.
 
-These files retain separate execution boundaries:
+Gemma assistant mask checks share `test_drafter_masks` in `test_speculative.py`.
+Its eight cases cover local rotating-cache offsets with real MLX masks, including
+the former standalone assertion that position 128 clamps to a cache length of 8.
 
-- `test_speculative_masks_static.py` loads mask code with fake dependencies
-  without importing MLX in the test module.
-- `test_smoke.py` is the manual model-download runner and is excluded from CI's
-  automated suite.
+`test_smoke.py` is the manual model-download runner and is excluded from CI's
+automated suite.
