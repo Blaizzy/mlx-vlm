@@ -1,6 +1,10 @@
 """Prompt construction and reasoning-template arguments."""
 
-from mlx_vlm.prompt_utils import apply_chat_template, extract_text_from_content
+from mlx_vlm.prompt_utils import (
+    apply_chat_template,
+    extract_text_from_content,
+    get_chat_template,
+)
 from mlx_vlm.server.generation import GenerationArguments
 
 # Prompt construction
@@ -35,6 +39,30 @@ class TestApplyChatTemplateIntegration:
     These tests verify the actual bug fix works end-to-end, not just the helper.
     Uses return_messages=True to inspect intermediate messages without mocking.
     """
+
+    def test_image_stays_on_its_original_user_turn(self):
+        messages = [
+            dict(
+                role="user",
+                content=[dict(type="text", text="First turn"), dict(type="image")],
+            ),
+            dict(role="assistant", content="I see it."),
+            dict(role="user", content="Second turn"),
+        ]
+        normalized = apply_chat_template(
+            None,
+            {"model_type": "qwen2_vl"},
+            messages,
+            num_images=1,
+            return_messages=True,
+        )
+        assert any(part["type"] == "image" for part in normalized[0]["content"])
+        assert normalized[-1]["content"] == [
+            dict(type="text", text="Second turn", content="Second turn")
+        ]
+        prompt = get_chat_template(None, normalized, add_generation_prompt=True)
+        assert prompt.count("<image>") == 1
+        assert prompt.index("<image>") < prompt.index("Second turn")
 
     def test_nemotron_omni_formats_image_and_audio_messages(self):
         """Nemotron Omni should use typed multimodal content for HF templates."""

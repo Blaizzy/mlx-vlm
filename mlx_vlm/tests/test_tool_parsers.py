@@ -270,6 +270,9 @@ MINICPM_CDATA_CALL = (
     '<param name="version">123</param><param name="count">3</param>'
     '<param name="enabled">True</param></function>'
 )
+MINICPM_MULTICALL = (
+    f'Before{MINICPM_CDATA_CALL}Between<function name="get_time"></function>After'
+)
 
 
 def test_minicpm5_cdata_and_argument_types():
@@ -288,3 +291,10 @@ def test_minicpm5_cdata_and_argument_types():
         count=3,
         enabled=True,
     )
+    result = process_tool_calls(MINICPM_MULTICALL, load_tool_module("minicpm5"), None)
+    assert result.remaining_text == "Before Between After"
+    assert [call["function"]["name"] for call in result.calls] == [
+        "write_file",
+        "get_time",
+    ]
+    assert json.loads(result.calls[1]["function"]["arguments"]) == {}

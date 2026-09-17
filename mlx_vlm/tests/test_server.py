@@ -41,15 +41,15 @@ from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.models.cache import KVCache
-from mlx_vlm.models.nemotron_voicechat.streaming import VoiceChatEvent
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server import GenerationArguments as Args
 from mlx_vlm.server import ResponseGenerator as Generator
 from mlx_vlm.server import realtime
 from mlx_vlm.server.responses_state import ToolCallStreamState, _response_items_to_chat
 from mlx_vlm.server.runtime_config import RuntimeConfig
+from mlx_vlm.tests.test_tool_parsers import MINICPM_MULTICALL
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
-from mlx_vlm.tools.parsers import minicpm5
+from mlx_vlm.tools import load_tool_module
 
 _MUSE_RESPONSE_TEMPLATE = {
     "defaults": {"role": "assistant"},
@@ -325,6 +325,32 @@ def _gemma_thinking_channel_chunks():
         _token(text, token, "stop" if i == len(chunks) - 1 else None)
         for i, (token, text) in enumerate(chunks)
     ]
+
+
+_THINKING_CASES = {
+    "gemma4": (_gemma_thinking_channel_chunks(), {}, ("", "7 * 8 = 56")),
+    "cohere2_moe": (
+        [
+            _token("North reasoning."),
+            _token("<|END_THINK"),
+            _token("ING|><|START_"),
+            _token("TEXT|>North answer.<|END_"),
+            _token("TEXT|>", finish_reason="stop"),
+        ],
+        {},
+        ("North reasoning.", "North answer."),
+    ),
+    "custom": (
+        [
+            _token(
+                "<analysis>Custom reasoning.</analysis>Custom answer.",
+                finish_reason="stop",
+            )
+        ],
+        dict(thinking_start_token="<analysis>", thinking_end_token="</analysis>"),
+        ("Custom reasoning.", "Custom answer."),
+    ),
+}
 
 
 def _reset_runtime(monkeypatch, **overrides):
@@ -1212,37 +1238,34 @@ def test_responses_native_tool_calls(client, kind, stream):
         assert json.loads(done["arguments"]) == args
 
 
-@pytest.mark.parametrize("api", ["responses", "chat"])
-def test_responses_streaming_uses_prompt_opened_thinking_without_flag(client, api):
-    texts = [
-        "North reasoning.",
-        "<|END_THINK",
-        "ING|><|START_TEXT|>North answer.<|END_TEXT|>",
-    ]
-    tokens = [_token(t, i, "stop" if i == 2 else None) for i, t in enumerate(texts)]
-    chunks = [
-        _result(texts[0], generation_tokens=1),
-        _result("".join(texts[1:]), finish_reason="stop"),
-    ]
-    extra = (
-        dict(reasoning={"effort": "high", "summary": "auto"})
-        if api == "responses"
-        else {}
-    )
+@pytest.mark.parametrize(
+    "api,family",
+    [
+        ("responses", "cohere2_moe"),
+        ("chat", "cohere2_moe"),
+        ("messages", "gemma4"),
+        ("messages", "custom"),
+    ],
+)
+def test_endpoint_thinking_markers(client, api, family):
+    tokens, options, expected = _THINKING_CASES[family]
+    preopened = family == "cohere2_moe"
+    payload = dict(options, max_tokens=16)
+    if api == "responses":
+        payload["reasoning"] = {"effort": "high", "summary": "auto"}
+    elif not preopened:
+        payload["enable_thinking"] = True
     with _endpoint(
-        model_type="cohere2_moe",
-        template="prompt<|START_THINKING|>",
-        chunks=chunks,
-        generator=_streaming(tokens, 8) if api == "chat" else None,
+        model_type=family,
+        template="prompt<|START_THINKING|>" if preopened else "prompt",
+        chunks=[
+            _result(tokens[0].text, generation_tokens=1),
+            _result("".join(t.text for t in tokens[1:]), finish_reason="stop"),
+        ],
+        generator=None if api == "responses" else _streaming(tokens, 8),
     ) as fake:
-        response = _post(
-            client,
-            api,
-            model="CohereLabs/North-Mini-Code-1.0-w4a16",
-            stream=True,
-            **extra,
-        )
-    reasoning, content = _thinking_text(response, api)
+        response = _post(client, api, stream=True, **payload)
+    assert _thinking_text(response, api) == expected
     if api == "responses":
         _assert_fields(
             fake.template.call_args.kwargs,
@@ -1250,12 +1273,18 @@ def test_responses_streaming_uses_prompt_opened_thinking_without_flag(client, ap
             reasoning=True,
             reasoning_effort="high",
         )
-    else:
-        assert _joined(_deltas(response), "reasoning") == reasoning
-    assert (reasoning, content) == ("North reasoning.", "North answer.")
+    elif api == "chat":
+        assert _joined(_deltas(response), "reasoning") == expected[0]
     assert all(
-        t not in response.text
-        for t in ("<|END_THINKING|>", "<|START_TEXT|>", "<|END_TEXT|>")
+        marker not in response.text
+        for marker in (
+            "<|channel>",
+            "<channel|>",
+            "<|END_THINKING|>",
+            "<|START_TEXT|>",
+            "<|END_TEXT|>",
+            *options.values(),
+        )
     )
 
 
@@ -1362,33 +1391,52 @@ def test_chat_completions_streaming_emits_timings_on_finish(client):
     )
 
 
-def test_chat_completions_streaming_response_template_tool_calls(client):
-    from mlx_vlm.tools.parsers import atem
-
+@pytest.mark.parametrize("api", ["chat", "messages"])
+def test_response_template_tool_calls(client, api):
+    config = NS(model_type="muse_glimmer")
+    tool = _tool(api=api)
+    if api == "messages":
+        config.thinking_start_token = "to=self<|message|>"
+        config.thinking_end_token = "<|eom|>"
+        tool["input_schema"].update(
+            properties={"city": {"type": "string"}}, required=["city"]
+        )
+    payload = (
+        dict(stream=True, stream_options={"include_usage": True})
+        if api == "chat"
+        else dict(thinking=dict(type="enabled", budget_tokens=4), max_tokens=8)
+    )
     token = _token(_MUSE_CALL, finish_reason="stop", prompt_tps=20, cached_tokens=2)
-    response = _stream_response(
-        client,
-        [token],
-        prompt_tokens=10,
-        endpoint=dict(
-            model_type="muse_glimmer",
-            processor=NS(tokenizer=_MuseResponseTemplateTokenizer()),
-            parser=atem,
-        ),
-        tools=[_tool()],
-        stream_options={"include_usage": True},
-    )
-    choices, usage, tool = _chat_events(response, "tool_calls")
-    deltas = [c["choices"][0]["delta"] for c in choices]
-    call = tool["choices"][0]["delta"]["tool_calls"][0]["function"]
-    assert tool.get("usage") is None and call["name"] == "get_weather"
-    assert json.loads(call["arguments"]) == {"city": "Warsaw"}
-    assert _joined(deltas, "reasoning_content") == "I need the weather tool."
-    assert _joined(deltas, "content") == ""
-    assert (
-        usage["choices"] == []
-        and usage["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
-    )
+    with _endpoint(
+        config=config,
+        processor=NS(config=config, tokenizer=_MuseResponseTemplateTokenizer()),
+        result=_result(_MUSE_CALL, prompt_tokens=7, generation_tokens=6),
+        generator=_streaming([token], 10) if api == "chat" else None,
+        parser=load_tool_module("atem"),
+    ):
+        response = _post(client, api, tools=[tool], **payload)
+    assert response.status_code == 200
+    if api == "chat":
+        choices, usage, tool_event = _chat_events(response, "tool_calls")
+        deltas = [c["choices"][0]["delta"] for c in choices]
+        call = tool_event["choices"][0]["delta"]["tool_calls"][0]["function"]
+        assert tool_event.get("usage") is None
+        assert _joined(deltas, "reasoning_content") == "I need the weather tool."
+        assert _joined(deltas, "content") == ""
+        assert usage["choices"] == []
+        assert usage["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
+        arguments = json.loads(call["arguments"])
+    else:
+        body = response.json()
+        assert body["stop_reason"] == "tool_use"
+        assert body["content"][0] == dict(
+            type="thinking", thinking="I need the weather tool.", signature=""
+        )
+        call = body["content"][1]
+        assert call["type"] == "tool_use"
+        arguments = call["input"]
+    assert call["name"] == "get_weather" and arguments == {"city": "Warsaw"}
+    assert "to=self" not in response.text and "<atem:" not in response.text
 
 
 def test_chat_completions_endpoint_falls_back_from_video_to_images(client):
@@ -1417,86 +1465,6 @@ def test_chat_completions_endpoint_falls_back_from_video_to_images(client):
     _assert_fields(fake.template.call_args.kwargs, num_images=2, video=None)
     _assert_fields(fake.generate.call_args.kwargs, image=frames, video=[])
     sample.assert_called_once_with(["clip.mp4"], 2.0, None)
-
-
-def test_anthropic_nonstreaming_preserves_thinking_with_tool_use(client):
-    from mlx_vlm.tools.parsers import atem
-
-    config = NS(
-        model_type="muse_glimmer",
-        thinking_start_token="to=self<|message|>",
-        thinking_end_token="<|eom|>",
-    )
-    with _endpoint(
-        config=config,
-        processor=NS(config=config, tokenizer=_MuseResponseTemplateTokenizer()),
-        result=_result(_MUSE_CALL, prompt_tokens=7, generation_tokens=6),
-        parser=atem,
-    ):
-        response = _post(
-            client,
-            "messages",
-            tools=[
-                dict(
-                    name="get_weather",
-                    description="Get weather",
-                    input_schema=dict(
-                        type="object",
-                        properties={"city": {"type": "string"}},
-                        required=["city"],
-                    ),
-                )
-            ],
-            thinking=dict(type="enabled", budget_tokens=4),
-            max_tokens=8,
-        )
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["stop_reason"] == "tool_use"
-    assert payload["content"][0] == dict(
-        type="thinking", thinking="I need the weather tool.", signature=""
-    )
-    _assert_fields(
-        payload["content"][1],
-        type="tool_use",
-        name="get_weather",
-        input={"city": "Warsaw"},
-    )
-    assert "to=self" not in response.text and "<atem:" not in response.text
-
-
-@pytest.mark.parametrize(
-    "custom", [False, True], ids=["gemma-channel", "custom-markers"]
-)
-def test_anthropic_thinking_markers(client, custom):
-    tokens = (
-        [
-            _token(
-                "<analysis>Custom reasoning.</analysis>Custom answer.",
-                finish_reason="stop",
-            )
-        ]
-        if custom
-        else _gemma_thinking_channel_chunks()
-    )
-    options = (
-        dict(thinking_start_token="<analysis>", thinking_end_token="</analysis>")
-        if custom
-        else {}
-    )
-    response = _stream_response(
-        client,
-        tokens,
-        "messages",
-        endpoint=dict(model_type="custom" if custom else "gemma4"),
-        max_tokens=16,
-        enable_thinking=True,
-        **options,
-    )
-    assert _thinking_text(response, "messages") == (
-        ("Custom reasoning.", "Custom answer.") if custom else ("", "7 * 8 = 56")
-    )
-    assert "<|channel>" not in response.text and "<channel|>" not in response.text
 
 
 def test_anthropic_messages_streaming_emits_tool_use_events(client):
@@ -2339,29 +2307,13 @@ def test_incomplete_thinking_markers(chunks, field, expected):
 
 
 @pytest.mark.parametrize(
-    "enabled,chunks,expected",
-    [
-        (False, [t.text for t in _gemma_thinking_channel_chunks()], ("", "7 * 8 = 56")),
-        (True, [t.text for t in _gemma_thinking_channel_chunks()], ("", "7 * 8 = 56")),
-        (
-            True,
-            [
-                "Custom reasoning.",
-                "<|END_THINKING|><|START_",
-                "TEXT|>Custom answer.<|END_",
-                "TEXT|>",
-            ],
-            ("Custom reasoning.", "Custom answer."),
-        ),
-    ],
+    "family,enabled",
+    [("gemma4", False), ("gemma4", True), ("cohere2_moe", True), ("custom", True)],
 )
-def test_thinking_stream_markers(enabled, chunks, expected):
-    assert (
-        _thoughts(
-            _feed_thinking(server.ThinkingStreamState(enable_thinking=enabled), chunks)
-        )
-        == expected
-    )
+def test_thinking_stream_markers(family, enabled):
+    tokens, options, expected = _THINKING_CASES[family]
+    state = server.ThinkingStreamState(enable_thinking=enabled, **options)
+    assert _thoughts(_feed_thinking(state, [t.text for t in tokens])) == expected
 
 
 def test_response_template_thinking_stream():
@@ -2381,27 +2333,6 @@ def test_response_template_thinking_stream():
     )
     assert _thoughts(deltas) == ("Muse reasoning.", "Muse answer.")
     assert any(delta.thinking_closed for delta in deltas)
-
-
-def test_minicpm5_multiple_calls_and_streamed_markup():
-    from mlx_vlm.tests.test_tool_parsers import MINICPM_CDATA_CALL
-
-    text = (
-        f'Before{MINICPM_CDATA_CALL}Between<function name="get_time"></function>After'
-    )
-    result = server.process_tool_calls(text, minicpm5, tools=None)
-    assert result.remaining_text == "Before Between After"
-    assert [call["function"]["name"] for call in result.calls] == [
-        "write_file",
-        "get_time",
-    ]
-    assert json.loads(result.calls[1]["function"]["arguments"]) == {}
-    state = ToolCallStreamState(minicpm5.tool_call_start, minicpm5.tool_call_end)
-    assert (
-        "".join(state.feed(char) or "" for char in text)
-        + (state.feed("", last=True) or "")
-        == "BeforeBetweenAfter"
-    )
 
 
 def test_kv_bits_independent_of_model_path(monkeypatch):
@@ -2708,32 +2639,46 @@ class _FakeAlignedResult:
     sentences: list
 
 
-def test_pipeline_preserves_nemo_segments():
-    from mlx_vlm.server.audio import (
-        _iter_stt_items,
-        _sanitize_for_json,
-        _stt_item_to_dict,
-        _transcription_result_from_chunks,
-    )
-
-    token = dict(id=1, text="Hello", start=0.0, duration=0.4, end=0.4)
-    aligned = _FakeAlignedResult(
-        "Hello world. Bye.",
-        [
-            dict(text="Hello world.", start=0.0, end=0.9, tokens=[token]),
-            dict(text="Bye.", start=1.0, end=1.3),
-        ],
-    )
+@pytest.mark.parametrize(
+    "item,expected",
+    [
+        ("just text", {"text": "just text"}),
+        (
+            _FakeAlignedResult(
+                "Hello world. Bye.",
+                [
+                    dict(
+                        text="Hello world.",
+                        start=0.0,
+                        end=0.9,
+                        tokens=[
+                            dict(id=1, text="Hello", start=0.0, duration=0.4, end=0.4)
+                        ],
+                    ),
+                    dict(text="Bye.", start=1.0, end=1.3),
+                ],
+            ),
+            dict(
+                text="Hello world. Bye.",
+                segments=[
+                    dict(id=0, text="Hello world.", start=0.0, end=0.9),
+                    dict(id=1, text="Bye.", start=1.0, end=1.3),
+                ],
+            ),
+        ),
+    ],
+    ids=["plain-text", "aligned-sentences"],
+)
+def test_audio_result_serialization(item, expected):
     chunks = [
-        json.dumps(_sanitize_for_json(_stt_item_to_dict(item))) + "\n"
-        for item in _iter_stt_items(aligned)
+        json.dumps(
+            server_audio._sanitize_for_json(server_audio._stt_item_to_dict(part))
+        )
+        + "\n"
+        for part in server_audio._iter_stt_items(item)
     ]
-    result = _transcription_result_from_chunks(chunks)
-    assert (
-        result["text"].startswith("Hello world.")
-        and len(result.get("segments") or []) == 2
-    )
-    assert _stt_item_to_dict("just text") == {"text": "just text"}
+    result = server_audio._transcription_result_from_chunks(chunks)
+    _assert_fields(result, **expected)
 
 
 @pytest.mark.parametrize(
@@ -3031,12 +2976,6 @@ def test_function_output_preserves_visual_input(mixed_text):
         _msg([{"type": "image"}], role="user"),
     ]
     assert (messages if mixed_text else messages[-2:]) == expected
-    if not mixed_text:
-        prompt = apply_chat_template(
-            None, {"model_type": "qwen2_vl"}, messages, num_images=len(images)
-        )
-        assert prompt.index("Tool:") < prompt.index("<image>")
-        assert image_url not in prompt
 
 
 def test_message_image_stays_on_its_original_user_turn():
@@ -3054,22 +2993,15 @@ def test_message_image_stays_on_its_original_user_turn():
             role="assistant",
             type="message",
         ),
-        _msg([{"type": "input_text", "text": "Second turn"}], type="message"),
+        _input_message("Second turn"),
     ]
 
     messages, images = _response_items_to_chat(items)
-    normalized = apply_chat_template(
-        None,
-        {"model_type": "qwen2_vl"},
-        messages,
-        num_images=len(images),
-        return_messages=True,
-    )
-
     assert images == [image_url]
-    assert any(part["type"] == "image" for part in normalized[0]["content"])
-    assert normalized[-1]["content"] == [
-        {"type": "text", "text": "Second turn", "content": "Second turn"}
+    assert messages == [
+        _msg([dict(type="text", text="First turn"), dict(type="image")]),
+        _msg("I see it.", "assistant"),
+        _msg("Second turn"),
     ]
 
 
@@ -3084,16 +3016,34 @@ def test_unknown_function_output_blocks_remain_text():
 
 
 @pytest.mark.parametrize(
-    "chunks,end_marker,expected,inside",
+    "chunks,start_marker,end_marker,expected,inside",
     [
-        (["text<tool_call>"], "</tool_call>", "text", True),
-        (["Before ", "<tool_call>", '{"name": "a"}', " trailing"], "", "Before ", True),
-        (["A literal <tool"], "</tool_call>", "A literal <tool", False),
+        (["text<tool_call>"], "<tool_call>", "</tool_call>", "text", True),
+        (
+            ["Before ", "<tool_call>", '{"name": "a"}', " trailing"],
+            "<tool_call>",
+            "",
+            "Before ",
+            True,
+        ),
+        (["A literal <tool"], "<tool_call>", "</tool_call>", "A literal <tool", False),
+        (
+            [*MINICPM_MULTICALL, ""],
+            "<function",
+            "</function>",
+            "BeforeBetweenAfter",
+            False,
+        ),
     ],
-    ids=["start-marker", "missing-end-marker", "unfinished-start-marker"],
+    ids=[
+        "start-marker",
+        "missing-end-marker",
+        "unfinished-start-marker",
+        "minicpm-character-chunks",
+    ],
 )
-def test_tool_stream_finalization(chunks, end_marker, expected, inside):
-    state = ToolCallStreamState("<tool_call>", end_marker)
+def test_tool_stream_finalization(chunks, start_marker, end_marker, expected, inside):
+    state = ToolCallStreamState(start_marker, end_marker)
     visible = [
         state.feed(chunk, last=i == len(chunks) - 1) for i, chunk in enumerate(chunks)
     ]
@@ -3308,17 +3258,15 @@ class _FakeStreamingSession:
         assert sample_rate == 16000
         assert samples.shape == (1280,)
         return [
-            VoiceChatEvent(
+            NS(
                 kind="assistant_text_delta",
                 frame_index=0,
                 token_id=42,
                 delta="hello",
                 text="hello",
             ),
-            VoiceChatEvent(
-                kind="function_delta", frame_index=0, token_id=43, delta="{", text="{"
-            ),
-            VoiceChatEvent(
+            NS(kind="function_delta", frame_index=0, token_id=43, delta="{", text="{"),
+            NS(
                 kind="audio",
                 frame_index=0,
                 samples=mx.zeros((1764,)),
@@ -3329,11 +3277,11 @@ class _FakeStreamingSession:
 
     def flush(self, pad_partial=True):
         self.closed = True
-        return [VoiceChatEvent(kind="done", frame_index=1)]
+        return [NS(kind="done", frame_index=1)]
 
     def cancel(self):
         self.closed = True
-        return [VoiceChatEvent(kind="cancelled", frame_index=0)]
+        return [NS(kind="cancelled", frame_index=0)]
 
 
 class _FakeLoadedModel:

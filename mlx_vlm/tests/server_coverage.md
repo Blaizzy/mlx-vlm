@@ -1,9 +1,9 @@
 # Server test consolidation
 
 Compared with `82d728b34434d919189c310db7d831d0b531299e`,
-`test_server.py` decreases from **3,749 to 3,470 formatted lines**.
-Including checks moved to the existing parser, speculative, and audio model
-suites, the net reduction is **194 Python lines**. No production code changes.
+`test_server.py` decreases from **3,749 to 3,418 formatted lines**.
+Including checks moved to the existing parser, prompt, speculative, and audio
+model suites, the net reduction is **208 Python lines**. No production code changes.
 
 - Share protocol tool-choice validation, stream decoding, message normalization,
   runtime setup, worker setup, audio backends, and WebSocket session setup.
@@ -22,6 +22,24 @@ pass, and the full suite retains exactly the same 80,947 production lines and
 12,834 branch outcomes as that commit. Four standalone tests are combined into
 existing cases. Concurrency and shutdown-order checks remain intact.
 
+The third pass removes **52 server lines and 14 net Python lines** relative to
+`a343762e`. It shares thinking-format data between endpoint and stream-state
+checks and combines Muse response-template tool checks across Chat streaming and
+Anthropic non-streaming responses. Audio serialization uses plain-text and aligned
+dataclass cases, with explicit segment expectations. Realtime tests use generic
+event objects instead of importing the Nemotron event class.
+
+MiniCPM mixed-call parsing belongs to the existing parser suite; its
+character-by-character filtering joins the shared server stream checks. Responses
+conversion stays in the server suite, while image-turn formatting and rendering
+without a processor belong to the prompt suite. The latter retains two distinct
+fallback paths identified by the coverage comparison. Repeated prompt-order
+assertions are removed from the conversion test; the endpoint still checks them.
+There are **199 server cases**, **264 cases across the three changed suites**, and
+**1,793 passing tests** in the full suite. The additional cases separate existing
+plain-text serialization, exercise custom markers directly, and isolate prompt
+formatting. Full-suite execution sets are identical to `a343762e`.
+
 ## Validation
 
 Both full-suite runs use the same isolated macOS arm64/Metal environment:
@@ -33,7 +51,7 @@ are compared; additions do not cancel losses.
 | --- | ---: | ---: | ---: | ---: |
 | Executed production lines | 80,943 | 80,947 | 0 | 4 |
 | Executed branch outcomes | 12,831 | 12,834 | 0 | 3 |
-| Passing tests | 1,791 | 1,790 | | |
+| Passing tests | 1,791 | 1,793 | | |
 
 Both runs have four skips and 39 passing subtests. The skips are two optional
 VoiceChat checkpoint tests and two tests requiring PyTorch. Black, isort,

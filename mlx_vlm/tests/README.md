@@ -158,6 +158,13 @@ same file. Reuse `_endpoint` and the request/result builders for API checks;
 a recording batch implementation. Parameterize protocol and model variants while
 keeping response assertions, cancellation, tokenizer locking, and cache lifecycle
 checks explicit. No separate server fixture module is needed.
+Thinking formats share `_THINKING_CASES` between endpoint and stream-state tests;
+response-template tool checks retain both Chat streaming and Anthropic responses.
+Keep parser extraction in `test_tool_parsers.py` and prompt-only image placement
+in `test_prompt_utils.py`; Responses conversion and stream filtering stay here.
+Realtime doubles expose the event fields consumed by the server without importing
+a model-specific event class. See [server coverage measurements](server_coverage.md)
+for the current line counts and exact coverage comparison.
 The audio HTTP and realtime checks also live here. `audio_client` depends on
 `reset_audio_runtime` to isolate model caches, metrics, and audio-queue shutdown;
 `realtime_client` owns the voice engine lifecycle. These fixtures are scoped to
