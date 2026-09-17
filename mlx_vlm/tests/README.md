@@ -1,48 +1,210 @@
 # Test organization
 
-Add regressions and reusable helpers to the module covering the same production
+The suite has **15 test modules plus `conftest.py`: 16 Python files**.
+`test_extraction_models.py` remains independent. The manual `test_smoke.py`
+download runner has been deleted.
+
+Add tests and reusable helpers to the module covering the same production
 behavior. Import shared helpers from that module instead of adding separate
-fixture files. Prefer a new file when a test needs an independent dependency,
-checkpoint, or collection boundary. Keep fixture setup and hardware skips scoped
-to the tests that need them.
+fixture files. Keep dependency, hardware, and checkpoint skips scoped to the
+tests that need them.
 
 Run the automated suite from the repository root:
 
 ```sh
-python -m pytest -q mlx_vlm/tests --ignore=mlx_vlm/tests/test_smoke.py
+python -m pytest -q mlx_vlm/tests
 ```
 
 Use a module path or `-k` to select a smaller group while developing.
 
 | Test module | Scope |
 | --- | --- |
-| `test_models.py` + `model_cases.json` | Shared language, vision, audio, projector, embedding, position, native forward/cache contracts, and cached-image source checks |
-| `test_image_generation_models.py` | Bonsai, Flux2, Ideogram4, Z-Image, ERNIE Image, and Mage Flow generation/editing, components, loading, and conversion |
-| `test_diffusion_models.py` | LLaDA, Nemotron, and DiffusionGemma model/generation contracts, including sampling, prefill, caches, numerical parity, self-conditioning, vision, sanitization, and quantization policy |
-| `test_tool_parsers.py` | Automatic discovery of all 13 parser modules, shared parsing/extraction/selection contracts, and format-specific edge cases |
-| `test_apc.py` | Cache lookup, semantic keys, adapters, model compatibility, exact/partial prefix reuse, quantized checkpoints, memory budgets, disk persistence, trace logging, and diagnostics |
-| `test_cache.py` | Cache lifecycle, recurrence, quantization, batching, attention masks, and vision-feature LRU behavior |
-| `test_turboquant.py` | TurboQuant cache integration, batched attention, and value kernels |
-| `test_weight_quantization.py` | FP8 and one-bit weight conversion and execution |
-| `test_moe_offload.py` | MoE checkpoint repacking, expert offload, output parity, and failure handling |
-| `test_attention.py` | Absorbed MLA gates and numerical parity, Qwen3.5 ragged decode fallbacks, and PaddleOCR vision fast paths |
-| `test_audio_models.py` | MiniCPMO TTS, Qwen3 Omni, Nemotron Omni, and VoiceChat components, speech generation, streaming, and checkpoint conversion |
-| `test_video_generation_models.py` | MiniMax H3 packing, components, conditioning workflows, cached trajectories, numerical references, and conversion |
-| `test_video_generation.py` | Video model discovery, request/result adapters, progress, and audio/video muxing |
-| `test_processors.py` + `processor_cases.json` | Shared processor construction, checkpoint loading, image/video/audio contracts, timestamps, patch positions, and visual-embedding integration |
-| `test_speculative.py` | Drafter loading and compatibility, generation parity, verification, cache transactions, and quantized speculative state across model families |
-| `test_rope.py` | Rotary embeddings, multimodal position IDs, and batched offsets |
-| `test_audio_generation.py` | Audio generation, loading, downmixing, and resampling |
-| `test_server.py` | Chat/Responses/Anthropic APIs, image endpoints, batching/cancellation, runtime settings, reranking, Responses normalization, tool stream state, HTTP audio, and realtime voice sessions |
-| `test_cli.py` | Text/image/audio/video CLI routing, arguments, diffusion display/visualizer behavior, detector display options, and CLI/library default parity |
-| `test_prompt_utils.py` | Prompt construction and reasoning-template arguments |
-| `test_trainer.py` | Training workflows, trainer utilities, MRoPE/gated-delta gradients, and MoE gradient/expert-replacement checks |
-| `test_utils.py` | General loading/conversion utilities, local Python model files, and Qwen3.5 patch-weight layouts |
-| `test_generate.py` | Generation, sampling distributions, AR/server positioned samplers, stopping criteria, structured logits, and thinking-phase state |
+| `test_models.py` + `model_cases.json` | Shared language, vision, audio, projector, embedding, position and native forward/cache contracts; cached-image declarations; checkpoint loading, sanitization, and document layout |
+| `test_model_ops.py` | Attention kernels and numerical parity, rotary embeddings, weight quantization, and format conversion |
+| `test_cache.py` | Cache lifecycle, APC lookup and prefix reuse, adapters, memory budgets, disk persistence, TurboQuant, batched masks/attention, and vision-feature LRU behavior |
+| `test_processors.py` + `processor_cases.json` | Tokenizers and detokenizers, processor loading and media contracts, image/video utilities, prompt construction, and dynamically discovered tool parsers |
+| `test_audio_models.py` | Audio/omni model components, speech generation, streaming, checkpoint conversion, audio loading, downmixing, and resampling |
+| `test_video_generation_models.py` | Video model components, conditioning workflows, cached trajectories, numerical references, conversion, discovery, request/result adapters, and audio/video muxing |
 | `test_extraction_models.py` | GLiNER candidate pools, span/schema handling, checkpoint loading, and privacy tagging/quantized inference |
-| `test_pp_doclayout_v3.py` | Document-layout detection configs, sanitization, forward outputs, and postprocessing |
-| `test_tokenizer_utils.py` | Streaming detokenizers, wrappers, shared tokenizer doubles, loader flags, Kimi conversion/serialization, and parser-token demotion |
-| `test_smoke.py` | Manual model-download runner, excluded from automated collection |
+| `test_image_generation_models.py` + `image_generation_cases.json` | Bonsai, Flux2, Ideogram4, Z-Image, ERNIE Image, and Mage Flow generation/editing, components, loading, and conversion |
+| `test_diffusion_models.py` | LLaDA, Nemotron, and DiffusionGemma models/generation, numerical parity, caches, vision, sanitization, and generation-config loading |
+| `test_speculative.py` | Drafter loading and compatibility, generation parity, verification, cache transactions, and quantized speculative state |
+| `test_generate.py` | Generation, sampling, stopping criteria, EOS reset behavior, structured logits, and thinking-phase state |
+| `test_server.py` | Chat/Responses/Anthropic APIs, image endpoints, batching/cancellation, runtime settings, reranking, tool stream state, HTTP audio, and realtime voice sessions |
+| `test_cli.py` | Text/image/audio/video CLI routing, arguments, diffusion display/visualizers, detector display options, and CLI/library default parity |
+| `test_trainer.py` | Training workflows, adapter loading, MRoPE/gated-delta gradients, and MoE gradient/expert-replacement checks |
+| `test_moe_offload.py` | MoE checkpoint repacking, expert offload, output parity, and failure handling |
+
+The former `test_utils.py` cases follow ownership: model/checkpoint loading in
+`test_models.py`, media handling in `test_processors.py`, weight conversion in
+`test_model_ops.py`, EOS handling in `test_generate.py`, adapter delegation in
+`test_trainer.py`, and diffusion configuration in `test_diffusion_models.py`.
+Speculative setup stays in `test_speculative.py`; only general JSON config
+construction is shared through `test_models.py`.
+
+## Consolidation validation
+
+Compared with `acd30322`, Python files decrease **28 → 16** (test modules
+**27 → 15**). Python source decreases **22,608 → 22,331 lines**, saving **277**:
+263 from deleting the manual smoke runner and 14 net from consolidating imports
+and module boilerplate. JSON is unchanged at **3,099 lines**; the combined total
+is **25,430 lines**. Individual destination modules grow as related suites join.
+
+All **1,771 collected cases** remain, including all 53 former utility cases.
+Before and after: **1,767 passed, four existing skips, and 31 passing subtests**.
+An AST audit preserves all **805 test/helper definitions**, including assertions
+and parametrization, after normalizing TurboQuant helper renames and the removed
+same-module import. Production coverage sets are identical: **80,999 executed
+lines and 12,836 branch outcomes**, with **zero lost or added paths**.
+This preserves the immediately preceding suite; earlier intentional pruning
+documented below is unchanged.
+
+Black, isort, autoflake, pyflakes, Python 3.10 syntax parsing and whitespace checks
+pass. Environment: macOS arm64/Metal, Python 3.12.14, MLX 0.32.2,
+Transformers 5.17.0, pytest 9.1.1 and coverage 7.16.1. Reproduce full-suite coverage:
+
+```sh
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+TOKENIZERS_PARALLELISM=false \
+python -m coverage run --branch --source=mlx_vlm --omit='mlx_vlm/tests/*' \
+  -m pytest -q mlx_vlm/tests \
+  -p pytest_timeout --timeout=90 --timeout-method=signal -ra
+python -m coverage json -o current-coverage.json
+```
+
+Compare exact `(file, line)` and `(file, branch-start, branch-end)` sets; additions
+do not cancel losses. These measurements exclude tests, native kernels, child
+process execution and optional skipped checks. To reproduce the earlier baseline,
+add `--ignore=mlx_vlm/tests/test_smoke.py` at that revision.
+
+## JSON model cases
+
+`model_cases.json` contains 51 configurable contract cases and 17 native
+forward/cache cases, plus five APC configuration profiles. `test_models.py`
+collects each contract case separately with a stable model ID, so failures can
+be selected with `pytest -k`:
+
+```sh
+python -m pytest -q mlx_vlm/tests/test_models.py -k llava_bunny
+```
+
+The `apc` section supplies ordinary settings to `test_cache.py`. Gemma4, Qwen3.5,
+and Qwen4 Exp profiles name an existing `case` and override its nested `config`;
+LFM2 and Z1T profiles provide a `module` and their complete input `config`.
+`apc_config` deep-copies and recursively merges these settings before calling
+the shared `build_config` helper, so derived layer layouts reflect the APC
+settings and neither the base case nor the profile is mutated. The module is
+imported dynamically under `mlx_vlm.models`. Model/component construction and
+APC assertions remain in Python; these profiles do not add model-contract cases.
+
+APC tests and their helpers now share `test_cache.py` with the cache lifecycle
+and TurboQuant checks. See [APC coverage](apc_coverage.md) for the earlier
+compaction measurements, pruned checks, and retained tolerances.
+
+For a contract case, `module` names the module under `mlx_vlm.models`, `config`
+contains ordinary nested model settings, and `checks` lists check names in order:
+
+```json
+{
+  "id": "tiny_mistral_language",
+  "module": "mistral3",
+  "config": {
+    "text_config": {
+      "model_type": "mistral",
+      "hidden_size": 16,
+      "intermediate_size": 32,
+      "num_hidden_layers": 1,
+      "num_attention_heads": 2,
+      "num_key_value_heads": 2,
+      "head_dim": 8,
+      "rms_norm_eps": 0.00001,
+      "rope_theta": 10000.0,
+      "vocab_size": 32
+    },
+    "vision_config": {
+      "hidden_size": 16,
+      "intermediate_size": 32,
+      "num_hidden_layers": 1,
+      "num_attention_heads": 2
+    },
+    "model_type": "mistral3"
+  },
+  "checks": ["language", "input_embeddings"]
+}
+```
+
+The runner constructs the family's `ModelConfig`, nested `TextConfig`/`VisionConfig`
+and other config classes, then calls `Model(config)`. Python selects check
+arguments and reads dimensions from the config. Every case gets fresh config
+objects and a fresh model; JSON contains no constructor calls or object references.
+
+Combine regressions that use the same model configuration into one case's
+`checks` list. Both `qwen3_5` and `qwen3_5_moe` check language and vision output
+shapes and dtypes in float32 and float16, plus the text-only `input_embeddings`
+contract (an `InputEmbeddingsFeatures` result with populated `inputs_embeds`).
+Their tiny language configs include one linear-attention layer and one
+full-attention layer. The `qwen3_5` case also covers request-owned positions,
+chunked prefill, and decode-time RoPE deltas;
+`qwen3_5_moe` retains its chunked-prefill regression. Checks that replace inner
+modules with recording stubs run after checks that need the original model.
+The `inkling` case checks language, vision, audio, and text-only input embeddings.
+
+The `audio` check supports Inkling, Gemma 3n, Gemma 4, and Gemma 4 Unified.
+Use a tiny `audio_config`; optional `audio: {"frames": 33, "lengths": [33, 13]}`
+sets the input frame count and valid prefix lengths. Defaults are 32 frames
+and two rows with lengths 32 and 16. Lengths control Gemma masks; Inkling's
+tower accepts unmasked integer dMel IDs. Input construction and tower/projector
+selection stay in Python. The check evaluates outputs with float32 and float16
+weights, verifies finite values, shapes, and projection into text dimensions,
+and checks Gemma encoder masks and zeroed padding or Unified's compacted token
+count. Gemma 3n/4 currently return float32 with float16 inputs; this is asserted
+explicitly. `input_embeddings` remains text-only and does not test audio-token
+insertion.
+
+The `deepseek_v4` and `qwen4_exp` cases use shared language, vision, text-only
+input-embedding, and `forward_cache` checks; DeepSeek also checks its aligner
+through `projector`. Their standalone regression modules are removed. The
+Qwen4 transaction tests read their tiny config from the same JSON case.
+`forward_cache` reuses the native full-forward and cached-decode shape checks.
+
+The `minimax_m3_vl` case replaces its standalone regression module with the
+existing language, vision, projector, text-only input-embedding, and
+`forward_cache` checks. Its tiny language config includes dense and MoE layers;
+vision uses four flattened patches with a 2×2 grid. The MiniMax speculative
+rollback checks remain in `test_speculative.py`.
+
+The `indic_ocr` case checks its Qwen3.5-based recognizer with the existing
+language, vision, text-only input-embedding, and `forward_cache` checks. Its
+tiny config includes linear and full-attention layers and four vision patches.
+The standalone OCR pipeline tests are removed; shared model contracts do not
+cover combined checkpoint loading, layout cleanup, cropping, or reconstruction.
+
+Most cases need no wiring overrides. `vision_path` and `projector_path` select
+unusual component locations; defaults are `vision_tower` and
+`multi_modal_projector`. The optional `vision` object holds input data and layout
+settings: `input_shape`, `feature_layer`, `channel_first`, `grid_hw`, and
+`grid_thw` (integer grid by default;
+`grid_dtype: "float32"` preserves the floating-grid scenario). An `input_shape`
+with more than two dimensions specifies the complete tensor shape, such as
+Inkling's `[patches, time, height, width, channels]`. Set `feature_layer: null`
+when the vision tower returns its feature tensor directly. DeepSeek's `grid_hw`
+gives the patch-grid height and width to its vision tower and aligner.
+
+The `dense` table retains the prototype's name and includes both dense and MoE
+families. Each entry checks a full forward pass and cached token decode.
+Model-specific regression scenarios need explicit assertions in the relevant
+domain test module. The shared contracts do not replace numerical-reference,
+checkpoint-conversion, or stateful integration assertions; MoE offload remains in
+`test_moe_offload.py`, and training gradients remain in `test_trainer.py`.
+
+Gemma assistant mask checks share `test_drafter_masks` in `test_speculative.py`.
+Its eight cases cover local rotating-cache offsets with real MLX masks, including
+the former standalone assertion that position 128 clamps to a cache length of 8.
+
+## Earlier refactor notes
+
+The following notes retain their historical module names, line counts, and
+validation totals. Use the ownership table above for the current layout.
 
 `test_processors.py` contains **997 formatted lines**, down from 1,898 at
 `bfa15bb9`. An explicit JSON registry imports processors dynamically, shared family
@@ -310,144 +472,3 @@ forwarding for every output modality live in `test_cli.py`; image HTTP endpoints
 stay in `test_server.py`. Audio transcription formats and translation share a
 request runner in `test_server.py`. Loading tests share checkpoint patches
 and model doubles in `test_utils.py`, with parameterized quantization policies.
-
-## JSON model cases
-
-`model_cases.json` contains 51 configurable contract cases and 17 native
-forward/cache cases, plus five APC configuration profiles. `test_models.py`
-collects each contract case separately with a stable model ID, so failures can
-be selected with `pytest -k`:
-
-```sh
-python -m pytest -q mlx_vlm/tests/test_models.py -k llava_bunny
-```
-
-The `apc` section supplies ordinary settings to `test_apc.py`. Gemma4, Qwen3.5,
-and Qwen4 Exp profiles name an existing `case` and override its nested `config`;
-LFM2 and Z1T profiles provide a `module` and their complete input `config`.
-`apc_config` deep-copies and recursively merges these settings before calling
-the shared `build_config` helper, so derived layer layouts reflect the APC
-settings and neither the base case nor the profile is mutated. The module is
-imported dynamically under `mlx_vlm.models`. Model/component construction and
-APC assertions remain in Python; these profiles do not add model-contract cases.
-
-The five effective configs, including derived fields, match their previous
-Python definitions exactly. The configuration migration removed 104 Python lines
-and added 87 JSON lines, saving 17 combined lines.
-
-The compact APC suite replaces the validated prototype in `test_apc.py` and runs
-under default collection. It contains **1,499 lines instead of 3,187** and
-**97 cases across 35 shared test functions**, with all helpers inline. Shared
-runners cover 19 cache layouts, disk restoration, memory-growth matrices, prefix
-generation, and packed quantization. Prototype files are removed. Coverage-based
-pruning also removes the optional live checkpoint-backed smoke, whose skipped
-coverage was not measured.
-
-The full default suite reports **1,791 passed, four skipped, and 39 passing
-subtests**. Against `eda5edef`, all 80,919 previously covered production statements
-and 12,819 branch outcomes remain covered, with seven statements and three
-branch outcomes added. See [APC coverage](apc_coverage.md) for exact measurements,
-pruned checks, retained tolerances, and reproduction commands.
-
-For a contract case, `module` names the module under `mlx_vlm.models`, `config`
-contains ordinary nested model settings, and `checks` lists check names in order:
-
-```json
-{
-  "id": "tiny_mistral_language",
-  "module": "mistral3",
-  "config": {
-    "text_config": {
-      "model_type": "mistral",
-      "hidden_size": 16,
-      "intermediate_size": 32,
-      "num_hidden_layers": 1,
-      "num_attention_heads": 2,
-      "num_key_value_heads": 2,
-      "head_dim": 8,
-      "rms_norm_eps": 0.00001,
-      "rope_theta": 10000.0,
-      "vocab_size": 32
-    },
-    "vision_config": {
-      "hidden_size": 16,
-      "intermediate_size": 32,
-      "num_hidden_layers": 1,
-      "num_attention_heads": 2
-    },
-    "model_type": "mistral3"
-  },
-  "checks": ["language", "input_embeddings"]
-}
-```
-
-The runner constructs the family's `ModelConfig`, nested `TextConfig`/`VisionConfig`
-and other config classes, then calls `Model(config)`. Python selects check
-arguments and reads dimensions from the config. Every case gets fresh config
-objects and a fresh model; JSON contains no constructor calls or object references.
-
-Combine regressions that use the same model configuration into one case's
-`checks` list. Both `qwen3_5` and `qwen3_5_moe` check language and vision output
-shapes and dtypes in float32 and float16, plus the text-only `input_embeddings`
-contract (an `InputEmbeddingsFeatures` result with populated `inputs_embeds`).
-Their tiny language configs include one linear-attention layer and one
-full-attention layer. The `qwen3_5` case also covers request-owned positions,
-chunked prefill, and decode-time RoPE deltas;
-`qwen3_5_moe` retains its chunked-prefill regression. Checks that replace inner
-modules with recording stubs run after checks that need the original model.
-The `inkling` case checks language, vision, audio, and text-only input embeddings.
-
-The `audio` check supports Inkling, Gemma 3n, Gemma 4, and Gemma 4 Unified.
-Use a tiny `audio_config`; optional `audio: {"frames": 33, "lengths": [33, 13]}`
-sets the input frame count and valid prefix lengths. Defaults are 32 frames
-and two rows with lengths 32 and 16. Lengths control Gemma masks; Inkling's
-tower accepts unmasked integer dMel IDs. Input construction and tower/projector
-selection stay in Python. The check evaluates outputs with float32 and float16
-weights, verifies finite values, shapes, and projection into text dimensions,
-and checks Gemma encoder masks and zeroed padding or Unified's compacted token
-count. Gemma 3n/4 currently return float32 with float16 inputs; this is asserted
-explicitly. `input_embeddings` remains text-only and does not test audio-token
-insertion.
-
-The `deepseek_v4` and `qwen4_exp` cases use shared language, vision, text-only
-input-embedding, and `forward_cache` checks; DeepSeek also checks its aligner
-through `projector`. Their standalone regression modules are removed. The
-Qwen4 transaction tests read their tiny config from the same JSON case.
-`forward_cache` reuses the native full-forward and cached-decode shape checks.
-
-The `minimax_m3_vl` case replaces its standalone regression module with the
-existing language, vision, projector, text-only input-embedding, and
-`forward_cache` checks. Its tiny language config includes dense and MoE layers;
-vision uses four flattened patches with a 2×2 grid. The MiniMax speculative
-rollback checks remain in `test_speculative.py`.
-
-The `indic_ocr` case checks its Qwen3.5-based recognizer with the existing
-language, vision, text-only input-embedding, and `forward_cache` checks. Its
-tiny config includes linear and full-attention layers and four vision patches.
-The standalone OCR pipeline tests are removed; shared model contracts do not
-cover combined checkpoint loading, layout cleanup, cropping, or reconstruction.
-
-Most cases need no wiring overrides. `vision_path` and `projector_path` select
-unusual component locations; defaults are `vision_tower` and
-`multi_modal_projector`. The optional `vision` object holds input data and layout
-settings: `input_shape`, `feature_layer`, `channel_first`, `grid_hw`, and
-`grid_thw` (integer grid by default;
-`grid_dtype: "float32"` preserves the floating-grid scenario). An `input_shape`
-with more than two dimensions specifies the complete tensor shape, such as
-Inkling's `[patches, time, height, width, channels]`. Set `feature_layer: null`
-when the vision tower returns its feature tensor directly. DeepSeek's `grid_hw`
-gives the patch-grid height and width to its vision tower and aligner.
-
-The `dense` table retains the prototype's name and includes both dense and MoE
-families. Each entry checks a full forward pass and cached token decode.
-Model-specific regression scenarios need explicit assertions in the relevant
-domain test module. The shared contracts do not replace numerical-reference,
-checkpoint-conversion, or stateful integration assertions; MoE offload remains in
-`test_moe_offload.py`, and training gradients remain in `test_trainer.py`.
-
-Gemma assistant mask checks share `test_drafter_masks` in `test_speculative.py`.
-Its eight cases cover local rotating-cache offsets with real MLX masks, including
-the former standalone assertion that position 128 clamps to a cache length of 8.
-
-`test_smoke.py` is the manual model-download runner and is excluded from CI's
-automated suite.

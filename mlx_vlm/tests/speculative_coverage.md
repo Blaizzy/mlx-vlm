@@ -1,5 +1,11 @@
 # Speculative suite coverage
 
+The current layout contains 15 test modules plus `conftest.py`; the manual smoke
+runner has been removed. Historical measurements below keep their original scope
+and filenames. See [test organization](README.md) for current ownership and the
+latest full-suite coverage comparison. When reproducing an older revision, add
+`--ignore=mlx_vlm/tests/test_smoke.py` to its full-suite command.
+
 The later model/training compaction is documented in [README.md](README.md).
 It saves another 503 Python lines, leaves this speculative suite unchanged, and
 retains the same full-suite production execution sets shown below.
@@ -231,7 +237,7 @@ python -m pytest -q mlx_vlm/tests/test_speculative.py
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 TOKENIZERS_PARALLELISM=false COVERAGE_FILE=/tmp/speculative-full.coverage \
 python -m coverage run --branch --source=mlx_vlm --omit='mlx_vlm/tests/*' \
-  -m pytest -q mlx_vlm/tests --ignore=mlx_vlm/tests/test_smoke.py \
+  -m pytest -q mlx_vlm/tests \
   -p pytest_timeout --timeout=90 --timeout-method=signal -ra
 COVERAGE_FILE=/tmp/speculative-full.coverage \
 python -m coverage json -o /tmp/speculative-full.json

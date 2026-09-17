@@ -1,5 +1,10 @@
 # APC suite coverage
 
+APC tests and helpers now live in `test_cache.py` alongside cache lifecycle and
+TurboQuant checks. The measurements below describe the earlier APC compaction,
+before that file consolidation. See [test organization](README.md) for current
+ownership and the latest full-suite coverage comparison.
+
 `test_apc.py` is the default APC suite: **1,499 formatted Python lines versus
 3,187**, a reduction of **1,688 lines (53.0%)**. Its 35 test functions collect
 97 cases; shared loops additionally exercise cache families, memory-growth
@@ -69,19 +74,21 @@ scenarios, and does not establish equivalence of every original assertion.
 
 ## Reproduction
 
-Run the APC suite:
+Run the current combined cache suite (including APC and TurboQuant):
 
 ```sh
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 TOKENIZERS_PARALLELISM=false \
 python -m coverage run --branch --source=mlx_vlm --omit='mlx_vlm/tests/*' \
-  -m pytest -q mlx_vlm/tests/test_apc.py \
+  -m pytest -q mlx_vlm/tests/test_cache.py \
   -p pytest_timeout --timeout=90 --timeout-method=signal -ra
 python -m coverage json -o apc-coverage.json
 ```
 
-For the full suite, replace `mlx_vlm/tests/test_apc.py` above with
-`mlx_vlm/tests --ignore=mlx_vlm/tests/test_smoke.py`. Compare with the same command
-at the baseline commit, using the exact `(file, line)` and
+For the full suite, replace `mlx_vlm/tests/test_cache.py` above with
+`mlx_vlm/tests`. At the historical baseline, use `test_apc.py` for APC-only
+measurements and add `--ignore=mlx_vlm/tests/test_smoke.py` to full-suite runs.
+The combined cache command exercises more than the historical APC-only suite.
+Compare matching scopes using the exact `(file, line)` and
 `(file, branch-start, branch-end)` sets in the JSON reports. Additions do not
 cancel losses.

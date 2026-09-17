@@ -40,7 +40,13 @@ from mlx_vlm.models.cache import (
     RotatingKVCache,
 )
 from mlx_vlm.structured import ThinkingAwareLogitsProcessor
-from mlx_vlm.utils import ThinkingBudgetCriteria
+from mlx_vlm.utils import (
+    StoppingCriteria,
+    ThinkingBudgetCriteria,
+    load_processor,
+)
+
+# Generation, sampling, stopping criteria, structured logits, and thinking state.
 
 generate_module = sys.modules["mlx_vlm.generate"]
 image_module = __import__("mlx_vlm.generate.image", fromlist=[""])
@@ -1875,3 +1881,48 @@ def test_positioned_target_sampler_honors_top_k(module_name, top_p):
     )
     mx.eval(tokens)
     assert set(tokens.tolist()) <= {2, 3}
+
+
+# Loading and utility contracts
+
+
+def test_stopping_criteria_reset():
+    class MockProcessor:
+        def __init__(self):
+            self.tokenizer = type(
+                "DummyTokenizer", (), {"pad_token": None, "eos_token": "[EOS]"}
+            )()
+
+        def encode(self, text, add_special_tokens=False):
+            if "[EOS]" in text:
+                return [32008]
+            return [1]
+
+    processor = MockProcessor()
+    stopping_criteria = StoppingCriteria([2], processor)
+    stopping_criteria.add_eos_token_ids("[EOS]")
+
+    stopping_criteria.reset([5, 7])
+    assert stopping_criteria.eos_token_ids == [5, 7]
+    assert stopping_criteria(7) is True
+
+
+def test_load_processor_preserves_additional_eos_tokens_on_reset():
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(eos_token_ids=[2]), additional_eos_token_ids=[3]
+    )
+
+    class Detokenizer:
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+
+    with (
+        patch("mlx_vlm.utils.AutoProcessor.from_pretrained", return_value=processor),
+        patch("mlx_vlm.utils.load_tokenizer", return_value=Detokenizer),
+    ):
+        loaded = load_processor("unused-model-path")
+
+    criteria = loaded.tokenizer.stopping_criteria
+    assert criteria.eos_token_ids == [2, 3]
+    criteria.reset([5])
+    assert criteria.eos_token_ids == [5, 2, 3]

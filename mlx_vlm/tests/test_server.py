@@ -47,7 +47,7 @@ from mlx_vlm.server import ResponseGenerator as Generator
 from mlx_vlm.server import realtime
 from mlx_vlm.server.responses_state import ToolCallStreamState, _response_items_to_chat
 from mlx_vlm.server.runtime_config import RuntimeConfig
-from mlx_vlm.tests.test_tool_parsers import MINICPM_MULTICALL
+from mlx_vlm.tests.test_processors import MINICPM_MULTICALL
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 from mlx_vlm.tools import load_tool_module
 

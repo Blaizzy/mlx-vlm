@@ -1,4 +1,4 @@
-"""JSON-driven model contracts and cached-image support declarations."""
+"""JSON model contracts, checkpoint loading, sanitization, and document layout."""
 
 from __future__ import annotations
 
@@ -6,16 +6,39 @@ import copy
 import importlib
 import inspect
 import json
+import logging
 import math
+import struct
+import textwrap
+import unittest
+from contextlib import contextmanager
 from operator import attrgetter
 from pathlib import Path
+from types import SimpleNamespace
 from types import SimpleNamespace as NS
+from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 from mlx.utils import tree_map
 
 from mlx_vlm.models.base import InputEmbeddingsFeatures
+from mlx_vlm.models.qwen3_5.config import ModelConfig as QwenModelConfig
+from mlx_vlm.models.qwen3_5.config import TextConfig as QwenTextConfig
+from mlx_vlm.models.qwen3_5.config import VisionConfig as QwenVisionConfig
+from mlx_vlm.models.qwen3_5.qwen3_5 import Model as QwenModel
+from mlx_vlm.utils import (
+    _drop_modules_without_weights,
+    _load_safetensors,
+    get_model_and_args,
+    get_model_path,
+    load,
+    load_config,
+    load_model,
+)
+
+# Shared model contracts
 
 
 def capture_positions(
@@ -450,3 +473,599 @@ def tiny_config(family, profile=None, **overrides):
     fields = TINY_DEFAULTS | case["config"] | case.get("profiles", {}).get(profile, {})
     module = importlib.import_module("mlx_vlm.models." + case["module"])
     return build_config(module, fields | overrides, case["config_type"])
+
+
+# Document layout
+
+
+class TestPPDocLayoutV3(unittest.TestCase):
+    def test_pp_doclayout_v3_config_routes(self):
+        from mlx_vlm.models import pp_doclayout_v3
+        from mlx_vlm.utils import get_model_and_args
+
+        model_class, model_type = get_model_and_args(
+            config={"model_type": "pp_doclayout_v3"}
+        )
+        self.assertIs(model_class, pp_doclayout_v3)
+        self.assertEqual(model_type, "pp_doclayout_v3")
+        self.assertEqual(pp_doclayout_v3.ModelConfig().num_labels, 25)
+
+        cfg = pp_doclayout_v3.ModelConfig.from_dict(
+            {
+                "model_type": "pp_doclayout_v3",
+                "num_labels": 37,
+                "id2label": {"0": "Question", "1": "Paragraph"},
+                "backbone_config": {"model_type": "hgnet_v2"},
+            }
+        )
+        self.assertEqual(cfg.id2label, {0: "Question", 1: "Paragraph"})
+        self.assertEqual(cfg.num_queries, 300)
+        self.assertEqual(cfg.decoder_layers, 6)
+
+    def test_pp_doclayout_v3_decode_order(self):
+        import mlx.core as mx
+
+        from mlx_vlm.models.pp_doclayout_v3.decoder import decode_order
+
+        # Chain 0 -> 1 -> 2 with strong pairwise scores.
+        scores = mx.array([[-1e4, 5.0, 5.0], [-1e4, -1e4, 5.0], [-1e4, -1e4, -1e4]])
+        self.assertEqual(decode_order(scores).tolist(), [0, 1, 2])
+        # Reference formula cross-check on random input.
+        rng_scores = mx.random.normal((7, 7))
+        mx.eval(rng_scores)
+        got = decode_order(rng_scores).tolist()
+        import numpy as np
+
+        arr = np.array(rng_scores.tolist())
+        s = 1.0 / (1.0 + np.exp(-arr))
+        votes = np.triu(s, 1).sum(0) + np.tril(1.0 - s.T, -1).sum(0)
+        self.assertEqual(got, np.argsort(votes).tolist())
+
+    def test_pp_doclayout_v3_mask_to_box(self):
+        import mlx.core as mx
+
+        from mlx_vlm.models.pp_doclayout_v3.decoder import mask_to_box_coordinate
+
+        mask = mx.zeros((1, 2, 8, 10))
+        mask[0, 0, 2:5, 3:7] = 1.0
+        mx.eval(mask)
+        boxes = mask_to_box_coordinate(mask)
+        mx.eval(boxes)
+        # x in [3,7), y in [2,5) over W=10,H=8 -> cxcywh
+        self.assertAlmostEqual(float(boxes[0, 0, 0]), 0.5, places=5)
+        self.assertAlmostEqual(float(boxes[0, 0, 1]), 0.4375, places=5)
+        self.assertAlmostEqual(float(boxes[0, 0, 2]), 0.4, places=5)
+        self.assertAlmostEqual(float(boxes[0, 0, 3]), 0.375, places=5)
+        # Empty mask -> zeros.
+        self.assertEqual(float(boxes[0, 1].sum()), 0.0)
+
+    def test_pp_doclayout_v3_bilinear_upsample(self):
+        import mlx.core as mx
+
+        from mlx_vlm.models.pp_doclayout_v3.encoder import upsample_bilinear2x
+
+        x = mx.array([[[[0.0], [1.0]], [[2.0], [3.0]]]])
+        mx.eval(x)
+        y = upsample_bilinear2x(x)
+        mx.eval(y)
+        # align_corners=False exact values: edges replicate, interior lerps.
+        self.assertEqual(tuple(y.shape), (1, 4, 4, 1))
+        self.assertAlmostEqual(float(y[0, 0, 0, 0]), 0.0, places=5)
+        self.assertAlmostEqual(float(y[0, 0, 1, 0]), 0.25, places=5)
+        self.assertAlmostEqual(float(y[0, 1, 0, 0]), 0.5, places=5)
+        self.assertAlmostEqual(float(y[0, 1, 1, 0]), 0.75, places=5)
+        self.assertAlmostEqual(float(y[0, 3, 3, 0]), 3.0, places=5)
+
+    def test_pp_doclayout_conversion_without_torch(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import mlx.core as mx
+
+        from mlx_vlm.models.pp_doclayout_v3.convert import convert
+
+        for dtype in (mx.float32, mx.bfloat16):
+            with self.subTest(dtype=dtype), tempfile.TemporaryDirectory() as tmp:
+                src = Path(tmp) / "source"
+                src.mkdir()
+                config = {"model_type": "pp_doclayout_v3"}
+                (src / "config.json").write_text(json.dumps(config))
+                weight = mx.arange(48).reshape(2, 3, 2, 4).astype(dtype)
+                mx.save_safetensors(
+                    str(src / "model.safetensors"),
+                    {
+                        "model.backbone.model.embedder.stem1.convolution.weight": weight,
+                        "model.denoising_class_embed.weight": mx.ones((2, 2)),
+                        "model.backbone.model.embedder.stem1.normalization.num_batches_tracked": mx.array(
+                            0
+                        ),
+                    },
+                )
+                with (
+                    patch.dict(
+                        "sys.modules", {"torch": None, "safetensors.torch": None}
+                    ),
+                    patch("mlx_vlm.models.pp_doclayout_v3.convert._verify") as verify,
+                ):
+                    out = convert(str(src), str(Path(tmp) / "converted"))
+                    again = convert(
+                        str(out), str(Path(tmp) / "reconverted"), "bfloat16"
+                    )
+                self.assertEqual(verify.call_count, 2)
+                key = "backbone.embedder.stem1.conv.weight"
+                expected = weight.transpose(0, 2, 3, 1)
+                converted = mx.load(str(out / "model.safetensors"))
+                reconverted = mx.load(str(again / "model.safetensors"))
+                self.assertEqual(set(converted), {key})
+                self.assertEqual(set(reconverted), {key})
+                self.assertEqual(converted[key].dtype, mx.float32)
+                self.assertEqual(reconverted[key].dtype, mx.bfloat16)
+                self.assertEqual(converted[key].tolist(), expected.tolist())
+                self.assertEqual(reconverted[key].tolist(), expected.tolist())
+                self.assertEqual(json.loads((out / "config.json").read_text()), config)
+
+
+# Loading and utility contracts
+
+
+def test_load_config_applies_generation_config_sampling_defaults(tmp_path):
+    generation_config = {
+        "eos_token_id": [2, 3],
+        "do_sample": True,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 64,
+        "max_new_tokens": 4096,
+    }
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "demo", "eos_token_id": 1}), encoding="utf-8"
+    )
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps(generation_config), encoding="utf-8"
+    )
+
+    config = load_config(tmp_path)
+
+    assert config["generation_config"] == generation_config
+    assert config["eos_token_id"] == [2, 3]
+    assert config["do_sample"] is True
+    assert config["temperature"] == 1.0
+    assert config["top_p"] == 0.95
+    assert config["top_k"] == 64
+    assert "max_new_tokens" not in config
+
+
+def test_get_model_path_downloads_jsonl_tokenizers(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_snapshot_download(**kwargs):
+        captured.update(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr("mlx_vlm.utils.snapshot_download", fake_snapshot_download)
+
+    assert get_model_path("org/model") == tmp_path
+    assert "*.jsonl" in captured["allow_patterns"]
+
+
+def test_load_passes_revision():
+    model_mock = MagicMock()
+    model_mock.config = MagicMock(eos_token_id=None)
+    processor_mock = MagicMock()
+
+    with (
+        patch("mlx_vlm.utils.get_model_path") as mock_get_model_path,
+        patch("mlx_vlm.utils.load_model", return_value=model_mock),
+        patch("mlx_vlm.utils.load_processor", return_value=processor_mock),
+        patch("mlx_vlm.utils.load_image_processor", return_value=None),
+    ):
+        mock_get_model_path.return_value = Path("/tmp/model")
+
+        model, processor = load("repo", revision="abc")
+
+        assert model is model_mock
+        assert processor is processor_mock
+        mock_get_model_path.assert_called_with(
+            "repo", revision="abc", force_download=False
+        )
+
+
+def test_get_model_and_args_rejects_unknown_text_configs():
+    with pytest.raises(ValueError):
+        get_model_and_args({"model_type": "unknown_text_arch"})
+
+
+class TestDropModulesWithoutWeights:
+    class ParameterlessHelper(nn.Module):
+        pass
+
+    class FakeModel(nn.Module):
+        def __init__(self, config=None):
+            super().__init__()
+            self.config = config
+            self.language_model = nn.Linear(2, 2, bias=False)
+            self.vision_tower = nn.Linear(2, 2, bias=True)
+            self.parameterless_helper = (
+                TestDropModulesWithoutWeights.ParameterlessHelper()
+            )
+
+    def test_keeps_module_declared_in_manifest_but_not_loaded(self):
+        # Manifest declares vision weights but none loaded -> keep, strict fails (#1963).
+        model = self.FakeModel()
+        weights = {"language_model.weight": mx.zeros((2, 2))}
+        declared = {"language_model.weight", "vision_tower.weight", "vision_tower.bias"}
+
+        _drop_modules_without_weights(model, weights, declared)
+
+        assert model.vision_tower is not None
+        with pytest.raises(ValueError, match="Missing"):
+            model.load_weights(list(weights.items()), strict=True)
+
+    def test_drops_module_absent_from_manifest(self, caplog):
+        # The manifest also omits vision -> an intentional text-only conversion.
+        model = self.FakeModel()
+        weights = {"language_model.weight": mx.zeros((2, 2))}
+        declared = {"language_model.weight"}
+
+        with caplog.at_level(logging.WARNING):
+            _drop_modules_without_weights(model, weights, declared)
+
+        assert model.vision_tower is None
+        assert "vision_tower" in caplog.text
+
+
+def test_load_safetensors_reinterprets_f8_e8m0_header(tmp_path):
+    path = tmp_path / "model.safetensors"
+    header = {"weight": {"dtype": "F8_E8M0", "shape": [1], "data_offsets": [0, 1]}}
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + b"\x00")
+
+    loaded = {"weight": mx.array([1], dtype=mx.uint8)}
+
+    def fake_mx_load(file_path):
+        current = json.loads(path.read_bytes()[8 : 8 + len(header_bytes)])
+        if current["weight"]["dtype"] == "F8_E8M0":
+            raise RuntimeError("unsupported dtype F8_E8M0")
+        assert current["weight"]["dtype"] == "U8"
+        return loaded
+
+    with patch("mlx_vlm.utils.mx.load", side_effect=fake_mx_load):
+        assert _load_safetensors(str(path)) is loaded
+
+    restored = json.loads(path.read_bytes()[8 : 8 + len(header_bytes)])
+    assert restored["weight"]["dtype"] == "F8_E8M0"
+
+
+class _CheckpointConfig:
+    @classmethod
+    def from_dict(cls, config):
+        return cls()
+
+
+class _CheckpointModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+    def load_weights(self, weights, strict=True):
+        self.loaded_weights, self.loaded_strict = weights, strict
+
+
+@contextmanager
+def _checkpoint_loading(config, model_class, weights, *, side_effect=None):
+    with (
+        patch("mlx_vlm.utils.load_config", return_value=config),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(
+                SimpleNamespace(ModelConfig=_CheckpointConfig, Model=model_class),
+                config["model_type"],
+            ),
+        ),
+        patch("mlx_vlm.utils.nn.quantize", side_effect=side_effect) as quantize,
+    ):
+        yield quantize
+
+
+def test_load_model_uses_deepseek_v4_fp8_quantization_config():
+
+    class FakeDeepseekV4Model(_CheckpointModel):
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.language_model = nn.Linear(2, 2, bias=False)
+
+    quantization = {
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine",
+        "language_model.weight": {"group_size": 64, "bits": 8, "mode": "affine"},
+    }
+    with (
+        patch(
+            "mlx_vlm.models.deepseek_v4.language.make_quantization_config",
+            return_value=quantization,
+        ) as make_quantization_config,
+        _checkpoint_loading(
+            {
+                "model_type": "deepseek_v4",
+                "quantization_config": {"quant_method": "fp8"},
+            },
+            FakeDeepseekV4Model,
+            {},
+        ) as quantize,
+    ):
+        model = load_model(Path("/tmp/model"), lazy=True)
+    make_quantization_config.assert_called_once_with(model)
+    quantize.assert_called_once()
+    assert quantize.call_args.kwargs["group_size"] == 64
+    assert quantize.call_args.kwargs["bits"] == 8
+    assert quantize.call_args.kwargs["mode"] == "affine"
+
+
+def test_load_model_matches_deepseek_v4_quantization_aliases():
+    from mlx_vlm.models import deepseek_v4
+
+    class FakeDeepseekV4Model(_CheckpointModel):
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.language_model = nn.Module()
+            self.language_model.model = nn.Module()
+            self.language_model.model.layers = [nn.Module()]
+            self.language_model.model.layers[0].ffn = nn.Module()
+            self.language_model.model.layers[0].ffn.shared_experts = nn.Module()
+            self.language_model.model.layers[0].ffn.shared_experts.gate_proj = (
+                nn.Linear(64, 64, bias=False)
+            )
+            self.language_model.lm_head = nn.Linear(64, 64, bias=False)
+
+        @staticmethod
+        def quantization_path_aliases(path):
+            return deepseek_v4.Model.quantization_path_aliases(path)
+
+    mxfp8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    quantization = {
+        "group_size": 32,
+        "bits": 4,
+        "mode": "mxfp4",
+        "layers.0.ffn.shared_experts.w1": mxfp8,
+        "head": False,
+    }
+    with _checkpoint_loading(
+        {"model_type": "deepseek_v4", "quantization": quantization},
+        FakeDeepseekV4Model,
+        {},
+    ) as quantize:
+        load_model(Path("/tmp/model"), lazy=True)
+    predicate = quantize.call_args.kwargs["class_predicate"]
+    fake_model = FakeDeepseekV4Model(_CheckpointConfig())
+    shared_expert_spec = predicate(
+        "language_model.model.layers.0.ffn.shared_experts.gate_proj",
+        fake_model.language_model.model.layers[0].ffn.shared_experts.gate_proj,
+    )
+    head_spec = predicate("language_model.lm_head", fake_model.language_model.lm_head)
+    assert shared_expert_spec == mxfp8
+    assert head_spec == {}
+
+
+def test_load_model_transforms_fine_grained_fp8_by_format():
+
+    class FakeQwenModel(_CheckpointModel):
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.proj = nn.Linear(128, 128, bias=False)
+
+    source_config = {
+        "model_type": "future_compatible_model",
+        "quantization_config": {
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "weight_block_size": [128, 128],
+        },
+    }
+    with _checkpoint_loading(
+        source_config,
+        FakeQwenModel,
+        {
+            "proj.weight": mx.zeros((128, 128), dtype=mx.uint8),
+            "proj.weight_scale_inv": mx.ones((1, 1), dtype=mx.bfloat16),
+        },
+    ) as quantize:
+        model = load_model(Path("/tmp/model"), lazy=True)
+    quantize.assert_called_once()
+    assert quantize.call_args.kwargs["group_size"] == 32
+    assert quantize.call_args.kwargs["bits"] == 8
+    assert quantize.call_args.kwargs["mode"] == "mxfp8"
+    loaded = dict(model.loaded_weights)
+    assert loaded["proj.weight"].dtype == mx.uint32
+    assert loaded["proj.scales"].dtype == mx.uint8
+    assert "proj.weight_scale_inv" not in loaded
+
+
+def test_load_model_quantizes_projector_with_scales_when_skip_vision():
+
+    class FakeProjector(nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.linear_1 = nn.Linear(64, 64, bias=False)
+
+    class FakeModel(_CheckpointModel):
+
+        def __init__(self, config):
+            super().__init__(config)
+            self.vision_tower = nn.Linear(64, 64, bias=False)
+            self.multi_modal_projector = FakeProjector()
+            self.language_model = nn.Linear(64, 64, bias=False)
+
+    weights = {
+        "language_model.weight": mx.zeros((64, 16), dtype=mx.uint32),
+        "language_model.scales": mx.zeros((64, 1), dtype=mx.float16),
+        "multi_modal_projector.linear_1.weight": mx.zeros((64, 16), dtype=mx.uint32),
+        "multi_modal_projector.linear_1.scales": mx.zeros((64, 1), dtype=mx.float16),
+        "vision_tower.weight": mx.zeros((64, 64), dtype=mx.float16),
+    }
+    selected = {}
+
+    def fake_quantize(model, *args, **kwargs):
+        predicate = kwargs["class_predicate"]
+        selected["language"] = predicate("language_model", model.language_model)
+        selected["projector"] = predicate(
+            "multi_modal_projector.linear_1", model.multi_modal_projector.linear_1
+        )
+        selected["vision"] = predicate("vision_tower", model.vision_tower)
+
+    with _checkpoint_loading(
+        {
+            "model_type": "kimi_vl",
+            "quantization": {"group_size": 64, "bits": 8},
+            "vision_config": {"skip_vision": True},
+        },
+        FakeModel,
+        weights,
+        side_effect=fake_quantize,
+    ):
+        load_model(Path("/tmp/model"), lazy=True)
+    assert selected == {"language": True, "projector": True, "vision": False}
+
+
+# Local Python model files
+
+MODEL_PY = textwrap.dedent("""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+
+    class ModelConfig:
+        # Deliberately minimal: exposing text_config/vision_config attributes
+        # opts in to update_module_configs, which then requires TextConfig /
+        # VisionConfig classes in this module. A model_file module controls
+        # both sides of that contract.
+        def __init__(self, model_type="custom"):
+            self.model_type = model_type
+
+        @classmethod
+        def from_dict(cls, params):
+            return cls(model_type=params.get("model_type", "custom"))
+
+
+    class Model(nn.Module):
+        loaded_via_model_file = True
+
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.proj = nn.Linear(4, 4, bias=False)
+
+        def __call__(self, x):
+            return self.proj(x)
+    """)
+
+
+def _write_checkpoint(path, config_extra=None):
+    config = {"model_type": "does-not-exist-in-registry", "model_file": "model.py"}
+    config.update(config_extra or {})
+    (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (path / "model.py").write_text(MODEL_PY, encoding="utf-8")
+    mx.save_safetensors(
+        str(path / "model.safetensors"),
+        {"proj.weight": mx.zeros((4, 4))},
+        metadata={"format": "mlx"},
+    )
+
+
+def test_load_model_uses_checkpoint_model_file(tmp_path):
+    _write_checkpoint(tmp_path)
+
+    model = _load(tmp_path)
+
+    # the class must come from the checkpoint's model.py, not the registry
+    # (the registry would have raised: model_type does not exist there)
+    assert getattr(model, "loaded_via_model_file", False) is True
+    assert model.proj.weight.shape == (4, 4)
+
+
+def test_missing_model_file_raises_clearly(tmp_path):
+    _write_checkpoint(tmp_path)
+    (tmp_path / "model.py").unlink()
+
+    with pytest.raises(FileNotFoundError, match="model_file"):
+        _load(tmp_path)
+
+
+def _load(path):
+    return load_model(path)
+
+
+# Patch embedding layouts
+
+QWEN_PATCH_EMBED_KEY = "model.visual.patch_embed.proj.weight"
+
+
+QWEN_SANITIZED_KEY = "vision_tower.patch_embed.proj.weight"
+
+
+def _qwen_patch_model(
+    in_channels=3, temporal_patch_size=2, patch_size=4, hidden_size=8
+):
+    text_config = QwenTextConfig(
+        model_type="qwen3_5_text",
+        hidden_size=32,
+        intermediate_size=64,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=4,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        rms_norm_eps=1e-6,
+        vocab_size=64,
+        num_key_value_heads=1,
+        max_position_embeddings=128,
+        full_attention_interval=2,
+        head_dim=16,
+    )
+    vision_config = QwenVisionConfig(
+        model_type="qwen3_5",
+        depth=1,
+        hidden_size=hidden_size,
+        intermediate_size=16,
+        out_hidden_size=32,
+        num_heads=1,
+        in_channels=in_channels,
+        patch_size=patch_size,
+        temporal_patch_size=temporal_patch_size,
+        spatial_merge_size=1,
+        num_position_embeddings=4,
+    )
+    config = QwenModelConfig(
+        text_config=text_config, vision_config=vision_config, model_type="qwen3_5"
+    )
+    return QwenModel(config), vision_config
+
+
+def test_patch_embed_is_transposed_from_ncdhw_to_ndhwc():
+    """Qwen3.5 stores the Conv3d patch embed as NCDHW; MLX expects NDHWC."""
+    model, vision_config = _qwen_patch_model()
+    expected = model.vision_tower.patch_embed.proj.weight.shape
+
+    ncdhw = mx.zeros(
+        (
+            vision_config.hidden_size,
+            vision_config.in_channels,
+            vision_config.temporal_patch_size,
+            vision_config.patch_size,
+            vision_config.patch_size,
+        ),
+        dtype=mx.bfloat16,
+    )
+    sanitized = model.sanitize({QWEN_PATCH_EMBED_KEY: ncdhw})
+
+    assert sanitized[QWEN_SANITIZED_KEY].shape == expected

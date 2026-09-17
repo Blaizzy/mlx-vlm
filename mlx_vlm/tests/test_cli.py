@@ -24,7 +24,7 @@ from mlx_vlm.models.diffusion_visualizer import _CanvasRedrawer
 from mlx_vlm.models.rfdetr import generate as rfdetr
 from mlx_vlm.models.sam3 import generate as sam3
 from mlx_vlm.tests.test_diffusion_models import FakeProcessor, make_diffusion_model
-from mlx_vlm.tests.test_video_generation import _result as _video_result
+from mlx_vlm.tests.test_video_generation_models import _result as _video_result
 
 image_generation = importlib.import_module("mlx_vlm.generate.image")
 video_generation = importlib.import_module("mlx_vlm.generate.video_generation")

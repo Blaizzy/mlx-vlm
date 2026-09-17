@@ -1,5 +1,11 @@
 # Server test consolidation
 
+The current layout contains 15 test modules plus `conftest.py`; the manual smoke
+runner has been removed. Historical measurements below keep their original scope
+and filenames. See [test organization](README.md) for current ownership and the
+latest full-suite coverage comparison. When reproducing an older revision, add
+`--ignore=mlx_vlm/tests/test_smoke.py` to its full-suite command.
+
 Compared with `82d728b34434d919189c310db7d831d0b531299e`,
 `test_server.py` decreases from **3,749 to 3,418 formatted lines**.
 Including checks moved to the existing parser, prompt, speculative, and audio
@@ -72,7 +78,7 @@ kernels, and skipped scenarios; it does not establish assertion equivalence.
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 TOKENIZERS_PARALLELISM=false \
 python -m coverage run --branch --source=mlx_vlm --omit='mlx_vlm/tests/*' \
-  -m pytest -q mlx_vlm/tests --ignore=mlx_vlm/tests/test_smoke.py \
+  -m pytest -q mlx_vlm/tests \
   -p pytest_timeout --timeout=90 --timeout-method=signal -ra
 python -m coverage json -o server-suite-coverage.json
 ```

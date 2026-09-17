@@ -1,9 +1,12 @@
 """Training workflows, adapter loading and numerical gradient contracts."""
 
+from __future__ import annotations
+
 import inspect
 import json
+from pathlib import Path
 from types import SimpleNamespace as NS
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -24,6 +27,11 @@ from mlx_vlm.trainer.utils import (
     find_all_linear_names,
     get_peft_model,
 )
+from mlx_vlm.utils import (
+    load,
+)
+
+# Training workflows, adapter loading and numerical gradient contracts.
 
 
 @pytest.fixture
@@ -419,5 +427,24 @@ def test_shared_moe_preserves_expert_gradients_and_unweighted_replacements(famil
     assert not isinstance(module.switch_mlp, SwitchGLU)
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
+# Loading and utility contracts
+
+
+def test_load_delegates_adapter_loading_to_trainer_entrypoint():
+    model = MagicMock()
+    adapted_model = MagicMock()
+    processor = MagicMock()
+
+    with (
+        patch("mlx_vlm.utils.get_model_path", return_value=Path("/tmp/model")),
+        patch("mlx_vlm.utils.load_model", return_value=model),
+        patch("mlx_vlm.utils.apply_lora_layers", return_value=adapted_model) as apply,
+        patch("mlx_vlm.utils.load_image_processor", return_value=None),
+        patch("mlx_vlm.utils.load_processor", return_value=processor),
+    ):
+        result_model, result_processor = load("model-id", adapter_path="adapter-dir")
+
+    apply.assert_called_once_with(model, "adapter-dir")
+    adapted_model.eval.assert_called_once()
+    assert result_model is adapted_model
+    assert result_processor is processor

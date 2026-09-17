@@ -1,5 +1,8 @@
 """Text diffusion model, generation, numerical parity, and vision contracts."""
 
+from __future__ import annotations
+
+import json
 import math
 import unittest
 from unittest.mock import patch
@@ -13,7 +16,12 @@ from mlx_vlm.generate.common import GenerationResult
 from mlx_vlm.generate.dispatch import stream_generate
 from mlx_vlm.models.cache import StaticPrefixKVCache
 from mlx_vlm.tokenizer_utils import NaiveStreamingDetokenizer
-from mlx_vlm.utils import StoppingCriteria
+from mlx_vlm.utils import (
+    StoppingCriteria,
+    load_config,
+)
+
+# Text diffusion model, generation, numerical parity, and vision contracts.
 
 
 def tiny_config_dict():
@@ -1258,5 +1266,22 @@ class TestDiffusionGemma:
         assert sanitized == {}
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
+# Loading and utility contracts
+
+
+def test_diffusion_gemma_load_config_preserves_generation_config(tmp_path):
+    from mlx_vlm.models.diffusion_gemma import ModelConfig
+
+    generation_config = {
+        "max_denoising_steps": 48,
+        "sampler_config": {
+            "_cls_name": "EntropyBoundSamplerConfig",
+            "entropy_bound": 0.1,
+        },
+    }
+    (tmp_path / "config.json").write_text(json.dumps(tiny_config_dict()))
+    (tmp_path / "generation_config.json").write_text(json.dumps(generation_config))
+    loaded = load_config(tmp_path)
+    assert loaded["model_type"] == "diffusion_gemma"
+    assert loaded["generation_config"] == generation_config
+    assert ModelConfig.from_dict(loaded).generation_config == generation_config

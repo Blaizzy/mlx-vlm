@@ -1,40 +1,573 @@
-"""Shared processor contracts, loader routing, and multimodal integration tests."""
+"""Tokenizers, processors, media loading, prompts, and tool parser contracts."""
 
+from __future__ import annotations
+
+import base64
 import importlib
 import json
+import pkgutil
+import re
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from copy import deepcopy
+from io import BytesIO
 from operator import attrgetter
 from pathlib import Path
+from threading import Thread
+from types import SimpleNamespace
 from types import SimpleNamespace as NS
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import mlx.core as mx
 import numpy as np
 import pytest
 from PIL import Image
-from transformers import AutoProcessor
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
+from transformers import AutoProcessor, PreTrainedTokenizerBase, PreTrainedTokenizerFast
 
 from mlx_vlm.generate import GenerationResult, generate
 from mlx_vlm.generate.video import processor_handles_video
-from mlx_vlm.prompt_utils import apply_chat_template
-from mlx_vlm.tests.test_tokenizer_utils import (
-    GemmaTokenizer,
-    KimiTokenizer,
-    ProcessorTokenizer,
-    RecordingTokenizer,
-    TinyDiffusionGemma4Tokenizer,
-    fast_tokenizer,
+from mlx_vlm.prompt_utils import (
+    apply_chat_template,
+    extract_text_from_content,
+    get_chat_template,
+)
+from mlx_vlm.server.generation import GenerationArguments
+from mlx_vlm.tokenizer_utils import (
+    REPLACEMENT_CHAR,
+    BPEStreamingDetokenizer,
+    NaiveStreamingDetokenizer,
+    SPMStreamingDetokenizer,
+    StreamingDetokenizer,
+    TokenizerWrapper,
+    _is_bpe_decoder,
+    _is_spm_decoder,
+    _is_spm_decoder_no_space,
+    _match,
+)
+from mlx_vlm.tools import (
+    SPECS,
+    _infer_tool_parser,
+    _infer_tool_parser_from_processor,
+    load_tool_module,
+    parsers,
+    process_tool_calls,
 )
 from mlx_vlm.utils import (
+    DEFAULT_VIDEO_SAMPLING,
     StoppingCriteria,
     VideoMetadata,
+    VideoSampling,
+    estimate_num_image_tokens,
+    load_image,
     load_image_processor,
     load_processor,
+    load_video,
     prepare_inputs,
+    process_image,
     resolve_video_sampling,
+    should_add_special_tokens,
 )
+
+# Tokenizers and streaming detokenizers
+
+
+class MockTokenizer:
+    """Mock tokenizer for testing detokenizers."""
+
+    def __init__(self, vocab=None):
+        self.vocab = vocab or {
+            "hello": 0,
+            "world": 1,
+            "▁hello": 2,
+            "▁world": 3,
+            "<0xE5>": 4,
+            "<0xA4>": 5,
+            "<0xA2>": 6,
+            "<0xE7>": 7,
+            "<0xA1>": 8,
+            "<0xAF>": 9,
+            "test": 10,
+            "▁test": 11,
+        }
+
+    def decode(self, tokens):
+        """Simple decode for testing."""
+        inv_vocab = {v: k for k, v in self.vocab.items()}
+        return "".join(inv_vocab.get(t, "") for t in tokens)
+
+
+class MockBPETokenizer:
+    """Mock tokenizer with BPE-style vocabulary."""
+
+    def __init__(self):
+        # BPE uses special unicode characters for bytes
+        # See: https://github.com/openai/gpt-2/blob/master/src/encoder.py
+        self.vocab = {
+            "Ġhello": 0,  # Ġ represents space in GPT-2 BPE
+            "Ġworld": 1,
+            "hello": 2,
+            "world": 3,
+            "test": 4,
+        }
+
+    def decode(self, tokens):
+        inv_vocab = {v: k for k, v in self.vocab.items()}
+        text = "".join(inv_vocab.get(t, "") for t in tokens)
+        return text.replace("Ġ", " ")
+
+
+def test_match_different_types():
+    assert _match(1, "1") is False
+    assert _match([], {}) is False
+
+
+def test_invalid_spm_decoder():
+    decoder = {"type": "ByteLevel"}
+    assert _is_spm_decoder(decoder) is False
+
+
+def test_valid_spm_decoder_no_space():
+    decoder = {
+        "type": "Sequence",
+        "decoders": [
+            {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+            {"type": "ByteFallback"},
+            {"type": "Fuse"},
+        ],
+    }
+    assert _is_spm_decoder_no_space(decoder) is True
+
+
+def test_valid_bpe_decoder():
+    decoder = {"type": "ByteLevel"}
+    assert _is_bpe_decoder(decoder) is True
+
+
+@pytest.mark.parametrize(
+    "factory, tokens",
+    [(NaiveStreamingDetokenizer, [0, 1]), (SPMStreamingDetokenizer, [2, 3])],
+)
+def test_skip_special_tokens(factory, tokens):
+    detokenizer = factory(MockTokenizer())
+    detokenizer.add_token(tokens[0])
+    detokenizer.add_token(tokens[1], skip_special_token_ids=[tokens[1]])
+    detokenizer.finalize()
+    assert "hello" in detokenizer.text
+    assert "world" not in detokenizer.text
+
+
+@pytest.mark.parametrize(
+    "vocab, trim, expected",
+    [
+        (["▁caf", "<0xC3>", "<0xA9>", "▁is", "▁great"], True, "café is great"),
+        (["test", "<0xFF>", "<0xFE>"], False, None),
+    ],
+    ids=["utf8", "invalid-utf8"],
+)
+def test_spm_byte_tokens(vocab, trim, expected):
+    tokenizer = MockTokenizer(dict(zip(vocab, range(len(vocab)))))
+    detokenizer = SPMStreamingDetokenizer(tokenizer, trim_space=trim)
+    for token in range(len(vocab)):
+        detokenizer.add_token(token)
+    detokenizer.finalize()
+    if expected is not None:
+        assert detokenizer.text == expected
+    else:
+        assert "test" in detokenizer.text
+        assert REPLACEMENT_CHAR in detokenizer.text
+
+
+def test_last_segment_basic():
+    vocab = {"▁hello": 0, "▁world": 1}
+    tokenizer = MockTokenizer(vocab)
+    detokenizer = SPMStreamingDetokenizer(tokenizer, trim_space=True)
+
+    detokenizer.add_token(0)  # ▁hello
+    # First access to last_segment
+    segment1 = detokenizer.last_segment
+
+    detokenizer.add_token(1)  # ▁world
+    detokenizer.finalize()
+    segment2 = detokenizer.last_segment
+
+    # Segments should be different parts of the text
+    assert "hello" in segment1 or "hello" in segment2
+    assert "world" in segment2 or "world" in detokenizer.text
+
+
+def test_initialization():
+    tokenizer = MockBPETokenizer()
+    detokenizer = BPEStreamingDetokenizer(tokenizer)
+
+    assert detokenizer._byte_decoder is not None
+    assert detokenizer.text == ""
+
+
+@pytest.mark.parametrize("factory", [None, SPMStreamingDetokenizer])
+def test_tokenizer_wrapper(factory):
+    tokenizer = MockTokenizer()
+    wrapper = (
+        TokenizerWrapper(tokenizer, factory) if factory else TokenizerWrapper(tokenizer)
+    )
+    assert wrapper.vocab == tokenizer.vocab
+    if factory:
+        assert isinstance(wrapper.detokenizer, factory)
+
+
+def test_not_implemented_methods():
+    class TestDetokenizer(StreamingDetokenizer):
+        pass
+
+    detokenizer = TestDetokenizer()
+
+    with pytest.raises(NotImplementedError):
+        detokenizer.reset()
+
+    with pytest.raises(NotImplementedError):
+        detokenizer.add_token(0)
+
+    with pytest.raises(NotImplementedError):
+        detokenizer.finalize()
+
+
+TOKENIZER_PROCESSORS = {
+    "step3p7": ("step3p7.processing_step3p7", "Step3VLProcessor"),
+    "laguna": ("laguna.processing_laguna", "LagunaProcessor"),
+    "molmo_point": ("molmo_point.processing_molmo_point", "MolmoPointProcessor"),
+    "kimi_k3": ("kimi_k3.processing_kimi_k3", "KimiK3Processor"),
+}
+
+
+def _processor_module(name):
+    return importlib.import_module("mlx_vlm.models." + TOKENIZER_PROCESSORS[name][0])
+
+
+class RecordingTokenizer(PreTrainedTokenizerFast):
+    def __call__(self, text, **kwargs):
+        self.last_text = text
+        return super().__call__(text, **kwargs)
+
+
+class KimiTokenizer(PreTrainedTokenizerBase):
+    model_input_names = ["input_ids", "attention_mask"]
+
+    def __init__(self):
+        super().__init__()
+        self.encode_calls = []
+
+    def convert_tokens_to_ids(self, token):
+        return 0
+
+    def encode(self, text, **kwargs):
+        self.encode_calls.append((text, kwargs))
+        return [1, 2, 3]
+
+    def apply_chat_template(
+        self, conversation, tokenize=False, add_generation_prompt=True
+    ):
+        return "rendered"
+
+
+def fast_tokenizer(
+    tokens=("[UNK]", "[PAD]", "hello"),
+    *,
+    tokenizer_class=PreTrainedTokenizerFast,
+    split=True,
+    **kwargs,
+):
+    backend = Tokenizer(
+        WordLevel({t: i for i, t in enumerate(tokens)}, unk_token=tokens[0])
+    )
+    if split:
+        backend.pre_tokenizer = Whitespace()
+    return tokenizer_class(
+        tokenizer_object=backend, unk_token=tokens[0], pad_token=tokens[1], **kwargs
+    )
+
+
+class ProcessorTokenizer:
+    model_input_names = ["input_ids", "attention_mask"]
+    bos_token, eos_token, pad_token = "<bos>", "<eos>", "<pad>"
+    pad_token_id = unk_token_id = 0
+    image_token, image_token_id = "<image>", 100
+    audio_token, audio_token_id = "<audio>", 101
+    video_token, video_token_id = "<video>", 102
+    boi_token, eoi_token = "<boi>", "<eoi>"
+    boa_token, eoa_token = "<boa>", "<eoa>"
+
+    def __init__(self, tokens=None, skip_spaces=False, pad=True, **attrs):
+        self.init_kwargs = {}
+        self.__dict__.update(attrs)
+        self.special_tokens = None if tokens is None else dict(tokens)
+        self.skip_spaces = skip_spaces
+        self.pad = pad
+
+    def convert_tokens_to_ids(self, token):
+        if isinstance(token, list):
+            return [self.convert_tokens_to_ids(t) for t in token]
+        return (self.special_tokens or {}).get(token, self.unk_token_id)
+
+    def encode(self, text, **kwargs):
+        if self.special_tokens is None:
+            return list(range(10))
+        pattern = "|".join(
+            re.escape(t) for t in sorted(self.special_tokens, key=len, reverse=True)
+        )
+        chunks = re.findall((pattern + "|" if pattern else "") + r"[\s\S]", text)
+        return [
+            self.special_tokens.get(t, 1)
+            for t in chunks
+            if t in self.special_tokens or not self.skip_spaces or not t.isspace()
+        ]
+
+    def __call__(self, text, text_pair=None, return_token_type_ids=False, **kwargs):
+        self.last_text, self.last_kwargs = (text, kwargs)
+        rows = [self.encode(t) for t in ([text] if isinstance(text, str) else text)]
+        width = max(map(len, rows)) if self.pad else 0
+        result = {
+            "input_ids": [
+                row + [self.pad_token_id] * (width - len(row)) for row in rows
+            ],
+            "attention_mask": [
+                [1] * len(row) + [0] * (width - len(row)) for row in rows
+            ],
+        }
+        if return_token_type_ids:
+            result["token_type_ids"] = [[0] * width for row in rows]
+        return result
+
+    def add_special_tokens(self, tokens):
+        pass
+
+    def build_inputs_with_special_tokens(self, ids):
+        return ids
+
+
+class GemmaTokenizer(ProcessorTokenizer):
+    def __init__(self):
+        super().__init__(
+            {"<|image|>": 100, "<|audio|>": 101, "<|video|>": 102},
+            image_token="<|image|>",
+            audio_token="<|audio|>",
+            video_token="<|video|>",
+            chat_template="mock",
+        )
+
+    def apply_chat_template(
+        self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+    ):
+        parts = ["<bos>"]
+        for message in messages:
+            for item in message["content"]:
+                parts.append(
+                    item["text"]
+                    if item["type"] == "text"
+                    else getattr(self, item["type"] + "_token")
+                )
+        if add_generation_prompt:
+            parts.append("<assistant>")
+        rendered = "".join(parts)
+        return self(rendered) if tokenize else rendered
+
+
+class TinyDiffusionGemma4Tokenizer(ProcessorTokenizer):
+    TOOL_ATTRS = ("stc_token", "etc_token", "escape_token", "soc_token", "eoc_token")
+
+    def __init__(self, profile):
+        super().__init__(**profile)
+        self.additional_special_tokens = []
+        for key in self.TOOL_ATTRS:
+            setattr(self, key, None)
+
+    @property
+    def all_special_ids(self):
+        tokens = self.additional_special_tokens + [
+            getattr(self, key)
+            for key in self.TOOL_ATTRS
+            if getattr(self, key) is not None
+        ]
+        return [self.convert_tokens_to_ids(token) for token in tokens]
+
+    def add_special_tokens(self, tokens):
+        for token in tokens.get("additional_special_tokens", []):
+            self.special_tokens[token] = self.video_token_id
+
+
+@pytest.mark.parametrize("name", ["step3p7", "laguna", "molmo_point"])
+def test_tokenizer_loader_options(name):
+    module = _processor_module(name)
+    cls = getattr(module, TOKENIZER_PROCESSORS[name][1])
+    tok = ProcessorTokenizer(
+        chat_template="template",
+        vocab={"Got": 0, "Ġit": 1},
+        backend_tokenizer=NS(decoder="bad"),
+    )
+    target = "transformers.AutoTokenizer.from_pretrained"
+    kwargs = {"trust_remote_code": name != "molmo_point"}
+    if name == "laguna":
+        target = "transformers.PreTrainedTokenizerFast.from_pretrained"
+        tok = fast_tokenizer(
+            ("<unk>", "<pad>", "<eos>", "prompt"),
+            eos_token="<eos>",
+            chat_template="template",
+        )
+        kwargs.update(
+            processor_kwargs={"local_files_only": True}, quantize_activations=True
+        )
+    with (
+        patch(target, return_value=tok) as loader,
+        (
+            patch.object(module, "load_chat_template")
+            if name == "molmo_point"
+            else nullcontext()
+        ),
+        patch.object(
+            cls, "check_argument_for_proper_class", return_value=None, create=True
+        ),
+    ):
+        p = cls.from_pretrained("/tmp/model", **kwargs)
+    assert p.tokenizer is tok
+    expected = {"trust_remote_code": name != "molmo_point"}
+    if name != "molmo_point":
+        expected["fix_mistral_regex"] = True
+    if name == "laguna":
+        expected["local_files_only"] = True
+    if name == "molmo_point":
+        expected["padding_side"] = "left"
+    loader.assert_called_once_with("/tmp/model", **expected)
+    if name == "step3p7":
+        assert p.detokenizer_class is BPEStreamingDetokenizer
+        assert "ByteLevel" in repr(tok.backend_tokenizer.decoder)
+        p.detokenizer = object()
+        for token in (0, 1):
+            p.detokenizer.add_token(token)
+        p.detokenizer.finalize()
+        assert p.detokenizer.text == "Got it"
+    if name == "laguna":
+        assert not should_add_special_tokens("laguna", p)
+        assert should_add_special_tokens("llama", p)
+
+
+class TestKimiTokenizer:
+    @pytest.fixture
+    def module(self):
+        return _processor_module("kimi_k3")
+
+    def test_fast_tokenizer_round_trip(self, module, tmp_path):
+        module.KimiK3Processor(tokenizer=fast_tokenizer()).save_pretrained(tmp_path)
+        assert (tmp_path / "tokenizer.json").is_file()
+        with patch.object(module, "_convert_kimi_k3_tiktoken") as convert:
+            loaded = module.KimiK3Processor.from_pretrained(tmp_path)
+        convert.assert_not_called()
+        assert loaded.tokenizer.encode("hello", add_special_tokens=False) == [2]
+
+    @pytest.mark.parametrize(
+        "remote", [False, True], ids=["local-tiktoken", "remote-fast"]
+    )
+    def test_tokenizer_loading(self, module, tmp_path, remote):
+        tokenizer = KimiTokenizer()
+        configs = dict(
+            tokenizer={},
+            tokenizer_config={"added_tokens_decoder": {}},
+            preprocessor_config=(
+                {"media_proc_cfg": {"patch_size": 18}} if remote else {}
+            ),
+        )
+        for name, config in configs.items():
+            (tmp_path / f"{name}.json").write_text(json.dumps(config))
+        vocab = tmp_path / "tiktoken.model"
+        vocab.write_text("tiktoken ranks")
+        if not remote:
+            (tmp_path / "tokenizer.json").unlink()
+
+        def download(repo_id, filename, **kwargs):
+            assert repo_id == "moonshotai/Kimi-K3"
+            assert kwargs["revision"] == "model-revision"
+            assert filename in ("tokenizer.json", "preprocessor_config.json")
+            return tmp_path / filename
+
+        with (
+            patch("huggingface_hub.hf_hub_download", side_effect=download),
+            patch.object(
+                PreTrainedTokenizerFast, "from_pretrained", return_value=tokenizer
+            ) as fast,
+            patch.object(
+                module,
+                "_convert_kimi_k3_tiktoken",
+                return_value=tokenizer,
+            ) as convert,
+        ):
+            source = "moonshotai/Kimi-K3" if remote else tmp_path
+            kwargs = {"revision": "model-revision"} if remote else {}
+            loaded = module.KimiK3Processor.from_pretrained(source, **kwargs)
+        assert isinstance(loaded, module.KimiK3Processor)
+        if remote:
+            assert fast.call_args.args[0] == "moonshotai/Kimi-K3"
+            assert fast.call_args.kwargs["revision"] == "model-revision"
+            assert not fast.call_args.kwargs["trust_remote_code"]
+            assert loaded.image_processor.patch_size == 18
+            convert.assert_not_called()
+        else:
+            convert.assert_called_once_with(vocab, tmp_path / "tokenizer_config.json")
+            fast.assert_not_called()
+
+    def test_conversion_requires_tiktoken(self, module):
+        with (
+            patch("importlib.util.find_spec", return_value=None),
+            pytest.raises(ImportError, match="Install `tiktoken`.*tokenizer.json"),
+        ):
+            module._convert_kimi_k3_tiktoken("tiktoken.model", "tokenizer_config.json")
+
+    def test_restores_all_control_slots(self, module):
+        supplied = {100: "[BOS]", 103: "<|open|>", 355: "[PAD]"}
+        config = {
+            "added_tokens_decoder": {
+                str(i): {"content": t} for i, t in supplied.items()
+            }
+        }
+        tokens = module._kimi_k3_control_tokens(config, base_vocab_size=100)
+        assert len(tokens) == 256 and tokens[1] == "<|reserved_token_101|>"
+        assert {i: tokens[i - 100] for i in supplied} == supplied
+
+
+def test_demotes_tool_parser_tokens():
+    from pathlib import Path
+
+    profiles = json.loads(Path(__file__).with_name("processor_cases.json").read_text())[
+        "profiles"
+    ]
+    module = importlib.import_module(
+        "mlx_vlm.models.diffusion_gemma.processing_diffusion_gemma"
+    )
+    base = importlib.import_module("mlx_vlm.models.gemma4.processing_gemma4")
+    tok = TinyDiffusionGemma4Tokenizer(profiles["diffusion_tokenizer"])
+    tok.special_tokens.update(
+        {t: 70 + i for i, t in enumerate(module._TOOL_PARSER_TOKENS)}
+    )
+    tok.special_tokens["<extra_special>"] = 90
+    tokens = ("<|tool_call>", "<tool_call|>", '<|"|>', "<|channel>", "<channel|>")
+    for attr, token in zip(tok.TOOL_ATTRS, tokens):
+        setattr(tok, attr, token)
+    tok.additional_special_tokens = ["<extra_special>"]
+    with patch.object(
+        base.Gemma4Processor, "from_pretrained", return_value=NS(tokenizer=tok)
+    ):
+        p = module.DiffusionGemma4Processor.from_pretrained("demo")
+    assert p.tokenizer is tok
+    assert tok.additional_special_tokens == [
+        "<extra_special>"
+    ] and tok.all_special_ids == [90]
+    assert all(getattr(tok, attr) is None for attr in tok.TOOL_ATTRS)
+    assert all(
+        tok.convert_tokens_to_ids(t) != tok.unk_token_id
+        for t in module._TOOL_PARSER_TOKENS
+    )
+
+
+# Processor contracts
 
 equal = np.testing.assert_array_equal
 DATA = json.loads(Path(__file__).with_name("processor_cases.json").read_text())
@@ -995,3 +1528,979 @@ def test_checkpoint_loading(tmp_path, name):
         assert TestMageVLProcessor.image_counts(
             p(text=m.mage.VIDEO_PAD, videos=[TestMageVLProcessor.frames()])
         ) == [3]
+
+
+# Prompt construction
+
+# Prompt construction
+
+
+def _assistant_tool_call(content):
+    return {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": {}},
+            }
+        ],
+    }
+
+
+class TestExtractTextFromContent:
+    """Tests for the extract_text_from_content function."""
+
+    def test_none_content(self):
+        """None should return empty string."""
+        result = extract_text_from_content(None)
+        assert result == ""
+
+
+class TestApplyChatTemplateIntegration:
+    """Integration tests for apply_chat_template with multimodal content.
+
+    These tests verify the actual bug fix works end-to-end, not just the helper.
+    Uses return_messages=True to inspect intermediate messages without mocking.
+    """
+
+    def test_image_stays_on_its_original_user_turn(self):
+        messages = [
+            dict(
+                role="user",
+                content=[dict(type="text", text="First turn"), dict(type="image")],
+            ),
+            dict(role="assistant", content="I see it."),
+            dict(role="user", content="Second turn"),
+        ]
+        normalized = apply_chat_template(
+            None,
+            {"model_type": "qwen2_vl"},
+            messages,
+            num_images=1,
+            return_messages=True,
+        )
+        assert any(part["type"] == "image" for part in normalized[0]["content"])
+        assert normalized[-1]["content"] == [
+            dict(type="text", text="Second turn", content="Second turn")
+        ]
+        prompt = get_chat_template(None, normalized, add_generation_prompt=True)
+        assert prompt.count("<image>") == 1
+        assert prompt.index("<image>") < prompt.index("Second turn")
+
+    def test_nemotron_omni_formats_image_and_audio_messages(self):
+        """Nemotron Omni should use typed multimodal content for HF templates."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        for model_type in ("nemotron_h_nano_omni", "nemotronh_nano_omni_reasoning_v3"):
+            result = apply_chat_template(
+                None,
+                {"model_type": model_type},
+                "Describe the inputs.",
+                return_messages=True,
+                num_images=1,
+                num_audios=1,
+            )
+
+            assert result == [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {
+                            "type": "text",
+                            "text": "Describe the inputs.",
+                            "content": "Describe the inputs.",
+                        },
+                        {"type": "audio"},
+                    ],
+                }
+            ]
+
+    def test_gemma4_unified_formats_video_and_audio_messages(self):
+        """Video prompts should retain audio placeholders when audio is present."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "gemma4_unified"},
+            "Describe the video and audio.",
+            return_messages=True,
+            video=["clip.mp4"],
+            fps=1,
+            num_audios=1,
+        )
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video",
+                        "video": "clip.mp4",
+                        "max_pixels": 224 * 224,
+                        "fps": 1,
+                    },
+                    {"type": "audio"},
+                    {
+                        "type": "text",
+                        "text": "Describe the video and audio.",
+                        "content": "Describe the video and audio.",
+                    },
+                ],
+            }
+        ]
+
+    def test_step3p7_formats_image_patch_token(self):
+        """Step-3.7 prompts should include the placeholder its processor expands."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "step3p7"},
+            "What do you see?",
+            return_messages=True,
+            num_images=1,
+        )
+
+        assert result == [{"role": "user", "content": "<im_patch>What do you see?"}]
+
+    def test_assistant_tool_call_content_is_preserved(self):
+        """Existing text and structured content should remain unchanged."""
+        for content in ["I will check.", [{"type": "text", "text": "I will check."}]]:
+            result = apply_chat_template(
+                None,
+                {"model_type": "qwen3_vl"},
+                _assistant_tool_call(content),
+                return_messages=True,
+            )
+
+            assert result[0]["content"] == content
+
+    def test_pydantic_basemodel_content_extraction(self):
+        """Test that BaseModel message objects are handled correctly."""
+        from pydantic import BaseModel
+
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        class ChatMessage(BaseModel):
+            role: str
+            content: list
+
+        config = {"model_type": "qwen2_vl"}
+
+        # BaseModel with multimodal content
+        message = ChatMessage(
+            role="user",
+            content=[
+                {"type": "text", "text": "What is in this image?"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,ABC123XYZ"},
+                },
+            ],
+        )
+
+        result = apply_chat_template(
+            None, config, [message], return_messages=True, num_images=1
+        )
+
+        # Should extract text, not include base64
+        assert isinstance(result, list)
+        for msg in result:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                assert "ABC123" not in content, "Base64 leaked from BaseModel content!"
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        text = item.get("text", "") or item.get("content", "")
+                        assert "ABC123" not in str(
+                            text
+                        ), "Base64 leaked from BaseModel content!"
+
+    def test_single_dict_prompt_multimodal(self):
+        """Single dict prompt with multimodal content should not include base64.
+
+        This tests the isinstance(prompt, dict) code path, which is different
+        from isinstance(prompt, list) where we pass a list of message dicts.
+        """
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        config = {"model_type": "qwen2_vl"}
+
+        # Single dict prompt (NOT a list of dicts)
+        single_prompt = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Analyze this single prompt image."},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,SINGLEBASE64DATA"},
+                },
+            ],
+        }
+
+        result = apply_chat_template(
+            None,
+            config,
+            single_prompt,  # Note: dict, not [dict]
+            return_messages=True,
+            num_images=1,
+        )
+
+        assert isinstance(result, list)
+        for msg in result:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                assert (
+                    "SINGLEBASE64" not in content
+                ), "Base64 leaked from single dict prompt!"
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        text = item.get("text", "") or item.get("content", "")
+                        assert "SINGLEBASE64" not in str(text), "Base64 leaked!"
+
+
+class TestExtractTextFromContentEdgeCases:
+    """Edge case tests for extract_text_from_content."""
+
+    def test_content_with_non_dict_items(self):
+        """Non-dict items in list should be skipped."""
+        content = ["just a string", {"type": "text", "text": "Valid item"}, 123, None]
+        result = extract_text_from_content(content)
+        assert result == "Valid item"
+
+    def test_text_item_with_empty_text(self):
+        """Text items with empty text should not add extra spaces."""
+        content = [
+            {"type": "text", "text": ""},
+            {"type": "text", "text": "Actual content"},
+            {"type": "text", "text": ""},
+        ]
+        result = extract_text_from_content(content)
+        assert result == "Actual content"
+
+
+def test_apply_chat_template_uses_generic_text_model_fallback():
+    class TextProcessor:
+        chat_template = "{{ messages }}"
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True
+        ):
+            assert add_generation_prompt is True
+            assert messages == [{"role": "user", "content": "Hello"}]
+            return "templated"
+
+    result = apply_chat_template(TextProcessor(), {"model_type": "llama"}, "Hello")
+
+    assert result == "templated"
+
+
+def test_apply_chat_template_preserves_explicit_thinking_enabled():
+    class ThinkingProcessor:
+        chat_template = "{{ messages }}"
+
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+        ):
+            self.kwargs = kwargs
+            if kwargs.get("enable_thinking") is False:
+                return "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            return "<|im_start|>assistant\n<think>\n"
+
+    processor = ThinkingProcessor()
+    result = apply_chat_template(
+        processor,
+        {"model_type": "qwen3_5_moe"},
+        "Describe this image.",
+        num_images=1,
+        enable_thinking=True,
+    )
+
+    assert processor.kwargs["enable_thinking"] is True
+    assert result.endswith("<think>\n")
+
+
+def test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates():
+    class ThinkingModeProcessor:
+        chat_template = "{% if thinking_mode == 'enabled' %}<mm:think>{% endif %}"
+
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+        ):
+            del messages, tokenize, add_generation_prompt
+            self.kwargs = kwargs
+            return "prompt"
+
+    processor = ThinkingModeProcessor()
+    result = apply_chat_template(
+        processor,
+        {"model_type": "minimax_m3_vl"},
+        "Describe this image.",
+        num_images=1,
+        enable_thinking=True,
+    )
+
+    assert result == "prompt"
+    assert processor.kwargs["enable_thinking"] is True
+    assert processor.kwargs["thinking_mode"] == "enabled"
+
+
+class TestModelSpecificPromptContracts:
+    """Guard model-specific multimodal message formats from regressions."""
+
+    def test_ernie4_5_vl_uses_image_url_before_text(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "ernie4_5_moe_vl"},
+            "Describe this image.",
+            return_messages=True,
+            num_images=1,
+        )
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert [item["type"] for item in result[0]["content"]] == ["image_url", "text"]
+        assert result[0]["content"][1]["text"] == "Describe this image."
+
+
+# Reasoning-template arguments
+
+
+def test_no_reasoning_strength_when_effort_unset():
+    kw = GenerationArguments(enable_thinking=True, reasoning=True).to_template_kwargs()
+
+    assert "reasoning_strength" not in kw
+    assert "reasoning_effort" not in kw
+
+
+# Tool parsing
+
+PARSER_NAMES = sorted(
+    module.name
+    for module in pkgutil.iter_modules(parsers.__path__)
+    if not module.ispkg and not module.name.startswith("_")
+)
+WEATHER_ARGS = {"city": "Paris", "days": 3}
+
+
+def _weather_tools(**fields):
+    properties = {name: dict(type=kind) for name, kind in fields.items()}
+    return [
+        dict(
+            type="function",
+            function=dict(
+                name="get_weather",
+                parameters=dict(type="object", properties=properties),
+            ),
+        )
+    ]
+
+
+WEATHER_TOOLS = _weather_tools(city="string", days="integer")
+# Literal wire examples are independent of the parser's marker constants.
+WIRE_CALLS = {
+    "atem": 'to=self<|message|><atem:function_calls><atem:invoke name="get_weather">'
+    '<atem:parameter name="city">Paris</atem:parameter>'
+    '<atem:parameter name="days">3</atem:parameter></atem:invoke></atem:function_calls>',
+    "cohere2_moe": '<|START_ACTION|>{"tool_name":"get_weather",'
+    '"parameters":{"city":"Paris","days":3}}<|END_ACTION|>',
+    "gemma4": '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>,days:3}<tool_call|>',
+    "glm47": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>"
+    "<arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+    "json_tools": '<tool_call>{"name":"get_weather",'
+    '"arguments":{"city":"Paris","days":3}}</tool_call>',
+    "kimi_k2": "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0"
+    '<|tool_call_argument_begin|>{"city":"Paris","days":3}'
+    "<|tool_call_end|><|tool_calls_section_end|>",
+    "longcat": "<longcat_tool_call>get_weather<longcat_arg_key>city</longcat_arg_key>"
+    "<longcat_arg_value>Paris</longcat_arg_value><longcat_arg_key>days</longcat_arg_key>"
+    "<longcat_arg_value>3</longcat_arg_value></longcat_tool_call>",
+    "minicpm5": '<function name="get_weather"><param name="city">Paris</param>'
+    '<param name="days">3</param></function>',
+    "minimax_m2": '<minimax:tool_call><invoke name="get_weather">'
+    '<parameter name="city">Paris</parameter><parameter name="days">3</parameter>'
+    "</invoke></minimax:tool_call>",
+    "minimax_m3": ']<]minimax[>[<tool_call>]<]minimax[>[<invoke name="get_weather">'
+    "]<]minimax[>[<city>Paris]<]minimax[>[</city>]<]minimax[>[<days>3"
+    "]<]minimax[>[</days>]<]minimax[>[</invoke>]<]minimax[>[</tool_call>",
+    "mistral": '[TOOL_CALLS]get_weather[ARGS]{"city": "Paris", "days": 3}',
+    "pythonic": '<|tool_call_start|>[get_weather(city="Paris", days=3)]<|tool_call_end|>',
+    "qwen3_coder": "<tool_call>\n<function=get_weather><parameter=city>Paris</parameter>"
+    "<parameter=days>3</parameter></function></tool_call>",
+}
+
+
+WIRE_VARIANTS = {
+    "mistral": [
+        '[TOOL_CALLS] [{"name": "get_weather", "arguments": {"city": "Paris", "days": 3}}]'
+    ],
+}
+
+
+def _parse(name, text, tools=None):
+    return load_tool_module(name).parse_tool_call(text, tools)
+
+
+def _call(name, **arguments):
+    return dict(name=name, arguments=arguments)
+
+
+def _arguments(call):
+    value = call["arguments"]
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def test_every_parser_has_registration_and_wire_example():
+    assert set(PARSER_NAMES) == {spec.name for spec in SPECS} == set(WIRE_CALLS)
+    assert set(WIRE_VARIANTS) <= set(PARSER_NAMES)
+
+
+@pytest.mark.parametrize("name", PARSER_NAMES)
+def test_parser_contract(name):
+    parser = load_tool_module(name)
+    for wire in [WIRE_CALLS[name], *WIRE_VARIANTS.get(name, ())]:
+        body = wire.removeprefix(parser.tool_call_start).removesuffix(
+            parser.tool_call_end
+        )
+        parsed = parser.parse_tool_call(body, WEATHER_TOOLS)
+        calls = parsed if isinstance(parsed, list) else [parsed]
+        assert len(calls) == 1
+        assert calls[0]["name"] == "get_weather"
+        assert _arguments(calls[0]) == WEATHER_ARGS
+        for count, with_prose in [(1, False), (1, True), (2, True)]:
+            # A bare call exercises EOF; newlines delimit Mistral's repeated calls.
+            output = "\n".join([wire] * count)
+            if with_prose:
+                output = f"Before\n{output}\nAfter"
+            result = process_tool_calls(output, parser, WEATHER_TOOLS)
+            if with_prose:
+                assert result.remaining_text.split() == ["Before", "After"]
+            else:
+                assert result.remaining_text == ""
+            assert len(result.calls) == count
+            assert len({call["id"] for call in result.calls}) == count
+            for index, call in enumerate(result.calls):
+                assert call["id"]
+                assert call["type"] == "function"
+                assert call["index"] == index
+                assert call["function"]["name"] == "get_weather"
+                assert json.loads(call["function"]["arguments"]) == WEATHER_ARGS
+    for text in ("Ordinary assistant prose.", "Like call: prince"):
+        result = process_tool_calls(text, parser, tools=None)
+        assert result.calls == []
+        assert result.remaining_text == text
+
+
+@pytest.mark.parametrize("name", PARSER_NAMES)
+def test_parser_selection(name):
+    # Specific formats must outrank the generic JSON fallback.
+    generic = "<tool_call> tool_call.name"
+    template = WIRE_CALLS[name] + generic
+    for value in (
+        template,
+        {"default": generic, "tool_use": template},
+        [
+            {"name": "default", "template": generic},
+            {"name": "tool_use", "template": template},
+        ],
+    ):
+        assert _infer_tool_parser(value) == name
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=template))
+    assert _infer_tool_parser_from_processor(processor) == name
+    assert _infer_tool_parser("anything", override=name) == name
+
+
+@pytest.mark.parametrize(
+    "name,text,error",
+    [
+        ("atem", "not a tool call", "No ATEM function invocation"),
+        ("minicpm5", '<function name="lookup"><param name="value">unfinished', None),
+        ("minicpm5", '<function name=""></function>', None),
+        ("minicpm5", '<function name="lookup"><param>3</param></function>', None),
+        ("gemma4", "just a normal model response, no tool call here", None),
+        ("mistral", "not a tool call at all", None),
+        (
+            "pythonic",
+            "[write_file(content='const player = { x: 0, y: 1 };)]",
+            "Invalid Pythonic tool call",
+        ),
+        ("pythonic", "[write_file(content=get_content())]", "must be a literal value"),
+    ],
+)
+def test_invalid_calls(name, text, error):
+    with pytest.raises(ValueError, match=error):
+        _parse(name, text)
+
+
+@pytest.mark.parametrize(
+    "parser,argument_type,text,expected,tools",
+    [
+        (
+            "gemma4",
+            str,
+            '<|tool_call>call:edit-file{path:<|"|>test.txt<|"|>,edits:[{newText:<|"|>orange<|"|>,oldText:<|"|>apple<|"|>}]}<tool_call|>',
+            _call(
+                "edit-file",
+                path="test.txt",
+                edits=[{"newText": "orange", "oldText": "apple"}],
+            ),
+            None,
+        ),
+        (
+            "gemma4",
+            str,
+            "get_weather{city:Austin}",
+            _call("get_weather", city="Austin"),
+            None,
+        ),
+        (
+            "pythonic",
+            dict,
+            '[write_file(path="game.html", content="<canvas id="game">\n</canvas>")]',
+            _call(
+                "write_file", path="game.html", content='<canvas id="game">\n</canvas>'
+            ),
+            None,
+        ),
+        (
+            "pythonic",
+            dict,
+            "[configure(options={'position': [0, 1], 'enabled': True})]",
+            _call("configure", options={"position": [0, 1], "enabled": True}),
+            None,
+        ),
+        (
+            "cohere2_moe",
+            str,
+            '{"tool_call_id":"1","tool_name":"grep","parameters":{"pattern":"foo"}}',
+            _call("grep", pattern="foo"),
+            None,
+        ),
+        (
+            "cohere2_moe",
+            str,
+            r'[{"tool_call_id":"1","tool_name":"grep","parameters":{"pattern":"<\|channel>"}},'
+            '{"tool_call_id_id":"2","tool_name":"read","parameters":{"path":"file.py"}}]',
+            [_call("grep", pattern="<|channel>"), _call("read", path="file.py")],
+            None,
+        ),
+        (
+            "glm47",
+            dict,
+            "get_weather\n<arg_key>zip</arg_key>\n<arg_value>10001</arg_value>\n<arg_key>days</arg_key>\n<arg_value>3</arg_value>\n",
+            _call("get_weather", zip="10001", days=3),
+            _weather_tools(zip="string", days="integer"),
+        ),
+    ],
+    ids=[
+        "gemma-nested",
+        "gemma-bare",
+        "pythonic-html",
+        "pythonic-nested",
+        "cohere-object",
+        "cohere-array-escape",
+        "glm-newline",
+    ],
+)
+def test_parser_syntax(parser, argument_type, text, expected, tools):
+    result = _parse(parser, text, tools)
+    assert isinstance(result, type(expected))
+    calls = result if isinstance(result, list) else [result]
+    expected_calls = expected if isinstance(expected, list) else [expected]
+    assert all(isinstance(call["arguments"], argument_type) for call in calls)
+    assert [dict(call, arguments=_arguments(call)) for call in calls] == expected_calls
+
+
+@pytest.mark.parametrize(
+    "template",
+    [None, {}, [], 123, {"tool_use": None}, {"default": "x", "tool_use": "y"}],
+)
+def test_non_routable_inputs_return_none(template):
+    assert _infer_tool_parser(template) is None
+
+
+def test_unknown_override_is_rejected():
+    with pytest.raises(ValueError):
+        _infer_tool_parser("anything", override="does_not_exist")
+
+
+MINICPM_CDATA_CALL = (
+    '<function name="write_file"><param name="content">'
+    "<![CDATA[  <html>\nA & B\n</html>  ]]></param>"
+    '<param name="version">123</param><param name="count">3</param>'
+    '<param name="enabled">True</param></function>'
+)
+MINICPM_MULTICALL = (
+    f'Before{MINICPM_CDATA_CALL}Between<function name="get_time"></function>After'
+)
+
+
+def test_minicpm5_cdata_and_argument_types():
+    tools = [
+        dict(
+            function=dict(
+                name="write_file",
+                parameters={"properties": {"version": {"type": "string"}}},
+            )
+        )
+    ]
+    assert _parse("minicpm5", MINICPM_CDATA_CALL, tools) == _call(
+        "write_file",
+        content="  <html>\nA & B\n</html>  ",
+        version="123",
+        count=3,
+        enabled=True,
+    )
+    result = process_tool_calls(MINICPM_MULTICALL, load_tool_module("minicpm5"), None)
+    assert result.remaining_text == "Before Between After"
+    assert [call["function"]["name"] for call in result.calls] == [
+        "write_file",
+        "get_time",
+    ]
+    assert json.loads(result.calls[1]["function"]["arguments"]) == {}
+
+
+# Loading and utility contracts
+
+
+class MockProcessor:
+    def __init__(self, tokenizer_return_value=None):
+        self.image_token = "<image>"
+        _return_value = tokenizer_return_value
+
+        class DummyTokenizer:
+            def __init__(self):
+                self.pad_token = None
+                self.eos_token = "[EOS]"
+
+            def __call__(
+                self,
+                text,
+                add_special_tokens=False,
+                padding=True,
+                padding_side="left",
+                return_tensors="mlx",
+            ):
+                del text, add_special_tokens, padding, padding_side
+                if return_tensors != "mlx":
+                    raise ValueError(f"Unsupported return_tensors: {return_tensors}")
+                if _return_value is not None:
+                    return _return_value
+                return SimpleNamespace(
+                    input_ids=mx.array([[1, 2, 3]]),
+                    attention_mask=mx.array([[7, 8, 9]]),
+                )
+
+        self.tokenizer = DummyTokenizer()
+
+    def __call__(
+        self, text=None, images=None, audio=None, padding=None, return_tensors="mlx"
+    ):
+        # Count image tokens in text
+        image_token_count = text.count("<image>") if text else 0
+
+        # Handle None images case
+        if images is None:
+            if image_token_count > 0:
+                raise ValueError(
+                    f"Number of image tokens in prompt_token_ids ({image_token_count}) "
+                    f"does not match number of images (0)"
+                )
+        else:
+            # Convert single image to list
+            if not isinstance(images, list):
+                images = [images]
+
+            images = [img for img in images if img is not None]
+
+            if image_token_count != len(images):
+                raise ValueError(
+                    f"Number of image tokens in prompt_token_ids ({image_token_count}) "
+                    f"does not match number of images ({len(images)})"
+                )
+
+        data = {"input_ids": [1, 2, 3], "attention_mask": [7, 8, 9]}
+
+        # Simulate MLX tensor output
+        if return_tensors == "mlx":
+            inputs = {k: mx.array(v) for k, v in data.items()}
+            inputs["pixel_values"] = mx.zeros((4, 5, 6)) if images else []
+            return inputs
+        else:
+            raise ValueError(f"Unsupported return_tensors: {return_tensors}")
+
+
+def test_prepare_inputs():
+    """Test prepare_inputs function."""
+
+    # Define tokenizer return values
+    tok_result = MagicMock()
+    tok_result.input_ids = [[1, 2, 3]]
+    tok_result.attention_mask = [7, 8, 9]
+    # Mock processor
+    processor = MockProcessor(tokenizer_return_value=tok_result)
+
+    # Test text-only input
+    inputs = prepare_inputs(
+        processor, prompts="test", images=None, image_token_index=None
+    )
+    assert "input_ids" in inputs
+    assert mx.array_equal(inputs["input_ids"], mx.array([[1, 2, 3]]))
+
+    # Test image-only input with image token
+    image = mx.zeros((3, 224, 224))
+    inputs = prepare_inputs(
+        processor, prompts="<image>", images=image, image_token_index=None
+    )
+    assert "input_ids" in inputs
+    assert mx.array_equal(inputs["input_ids"], mx.array([1, 2, 3]))
+
+    # Test both text and image
+    image = mx.zeros((3, 224, 224))
+    inputs = prepare_inputs(
+        processor, prompts="test <image>", images=image, image_token_index=None
+    )
+    assert "input_ids" in inputs
+    assert mx.array_equal(inputs["input_ids"], mx.array([1, 2, 3]))
+    assert mx.array_equal(inputs["pixel_values"], mx.zeros((4, 5, 6)))
+    assert mx.array_equal(inputs["attention_mask"], mx.array([7, 8, 9]))
+
+    # Test image present without image token
+    image = mx.zeros((3, 224, 224))
+    with pytest.raises(
+        ValueError,
+        match="Number of image tokens in prompt_token_ids.*does not match number of images",
+    ):
+        prepare_inputs(
+            processor,
+            images=image,
+            prompts="test without image token",
+            image_token_index=None,
+        )
+
+    # Text-only calls go straight through the tokenizer, so bare image tokens
+    # are not validated here unless actual image inputs are provided.
+    inputs = prepare_inputs(
+        processor,
+        images=None,
+        prompts="test with <image> token",
+        image_token_index=None,
+    )
+    assert "input_ids" in inputs
+    assert mx.array_equal(inputs["input_ids"], mx.array([[1, 2, 3]]))
+
+
+def test_prepare_inputs_preserves_mlx_attention_mask_for_thread_handoff():
+    attention_mask = mx.array([[1, 1]], dtype=mx.int32)
+
+    class Processor:
+        tokenizer = SimpleNamespace(pad_token="[PAD]", eos_token="[EOS]")
+
+        def __call__(self, text=None, images=None, padding=None, return_tensors="mlx"):
+            return {
+                "input_ids": mx.array([[1, 2]], dtype=mx.int32),
+                "attention_mask": attention_mask,
+                "pixel_values": mx.zeros((1, 2), dtype=mx.float32),
+            }
+
+    inputs = prepare_inputs(
+        Processor(), prompts="test <image>", images=mx.zeros((3, 8, 8))
+    )
+    consumed = []
+
+    def consume_attention_mask():
+        consumed.append(inputs["attention_mask"].tolist())
+
+    worker = Thread(target=consume_attention_mask)
+    worker.start()
+    worker.join(timeout=1)
+
+    assert inputs["attention_mask"] is attention_mask
+    assert consumed == [[[1, 1]]]
+
+
+def _make_test_image_bytes():
+    """Create a small valid PNG in memory."""
+    from PIL import Image as PILImage
+
+    img = PILImage.new("RGB", (4, 4), color="red")
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+class TestLoadImage:
+    def test_pil_image_input(self):
+        from PIL import Image as PILImage
+
+        source = PILImage.new("RGBA", (4, 4), color="red")
+        img = load_image(source)
+        assert img.mode == "RGB"
+        assert img.size == (4, 4)
+
+    def test_data_uri_input(self):
+        buf = _make_test_image_bytes()
+        encoded = base64.b64encode(buf.read()).decode("utf-8")
+        data_uri = f"data:image/png;base64,{encoded}"
+
+        img = load_image(data_uri)
+        assert img.mode == "RGB"
+        assert img.size == (4, 4)
+
+    def test_data_uri_missing_comma_raises(self):
+        with pytest.raises(ValueError, match="missing comma separator"):
+            load_image("data:image/png;base64NOCOMMA")
+
+    def test_http_url_input(self):
+        buf = _make_test_image_bytes()
+        mock_response = MagicMock()
+        mock_response.content = buf.getvalue()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.__enter__.return_value = mock_response
+        mock_response.__exit__.return_value = None
+
+        with patch("mlx_vlm.utils.requests.get", return_value=mock_response):
+            img = load_image("https://example.com/image.png")
+            assert img.mode == "RGB"
+
+    def test_nonexistent_path_object_raises(self):
+        with pytest.raises(ValueError, match="Failed to load image"):
+            load_image(Path("/nonexistent/path/image.png"))
+
+
+class TestProcessImage:
+    def _image(self, width=640, height=480):
+        from PIL import Image
+
+        return Image.new("RGB", (width, height), color=(120, 40, 200))
+
+    def test_resize_shape_applied_without_custom_processor(self):
+        img = process_image(self._image(), (320, 320), None)
+        assert max(img.size) <= 320
+
+    def test_resize_shape_ignored_with_custom_processor_warns(self):
+        from mlx_vlm.models.base import BaseImageProcessor
+
+        class DummyProcessor(BaseImageProcessor):
+            def preprocess(self, images):
+                return images
+
+        original = self._image()
+        with pytest.warns(UserWarning, match="resize_shape.*DummyProcessor"):
+            img = process_image(original, (320, 320), DummyProcessor())
+
+        assert img.size == original.size
+
+
+class TestEstimateNumImageTokens:
+    def _processor(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+        return Qwen3VLImageProcessor()
+
+    def _actual_tokens(self, processor, width, height, **kwargs):
+        import numpy as np
+        from PIL import Image
+
+        img = Image.new("RGB", (width, height), color=(9, 30, 51))
+        grid = processor([img], **kwargs)["image_grid_thw"][0]
+        return int(np.prod(grid)) // processor.merge_size**2
+
+    @pytest.mark.parametrize(
+        "width,height", [(64, 64), (640, 480), (1000, 1400), (2500, 1200), (333, 517)]
+    )
+    def test_estimate_matches_actual_processing(self, width, height):
+        processor = self._processor()
+        estimate = estimate_num_image_tokens(processor, height, width)
+        assert estimate == self._actual_tokens(processor, width, height)
+
+    def test_estimate_matches_actual_with_resized_dimensions(self):
+        processor = self._processor()
+        estimate = estimate_num_image_tokens(
+            processor, 1400, 1000, resized_height=448, resized_width=448
+        )
+        assert estimate == self._actual_tokens(
+            processor, 1000, 1400, resized_height=448, resized_width=448
+        )
+
+    def test_unsupported_processor_raises(self):
+        with pytest.raises(NotImplementedError, match="num_image_tokens"):
+            estimate_num_image_tokens(SimpleNamespace(), 480, 640)
+
+
+@pytest.fixture(scope="module")
+def synthetic_video(tmp_path_factory):
+    """A deterministic 600-frame 64x64 clip at 30 fps, i.e. 20 seconds."""
+    cv2 = pytest.importorskip("cv2")
+    path = tmp_path_factory.mktemp("video") / "clip.mp4"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (64, 64))
+    for i in range(600):
+        writer.write(np.full((64, 64, 3), i % 256, np.uint8))
+    writer.release()
+    return str(path)
+
+
+class _AttributeVideoProcessor:
+    """A video processor naming its knobs the way load_video does."""
+
+    fps = 1.0
+    min_frames = 8
+    max_frames = 100
+
+
+class TestVideoSampling:
+    def test_library_defaults_match_the_historical_load_video_signature(self):
+        assert DEFAULT_VIDEO_SAMPLING == VideoSampling(
+            fps=2.0, nframes=None, min_frames=4, max_frames=768, frame_factor=2
+        )
+
+
+class TestLoadVideo:
+    def test_unknown_keyword_is_rejected(self, synthetic_video):
+        with pytest.raises(TypeError, match="fpss"):
+            load_video(synthetic_video, fpss=1.0)
+
+    def test_timestamps_span_the_clip_at_the_source_frame_rate(self, synthetic_video):
+        _, metadata = load_video(synthetic_video, fps=1.0)
+        assert metadata.timestamps[0] == pytest.approx(0.0)
+        assert metadata.timestamps[-1] == pytest.approx(20.0, abs=0.05)
+
+
+class TestResolveVideoSampling:
+    def test_processor_beats_defaults(self):
+        processor = SimpleNamespace(video_processor=_AttributeVideoProcessor())
+        resolved = resolve_video_sampling(processor, {})
+        assert (resolved.fps, resolved.min_frames, resolved.max_frames) == (1.0, 8, 100)
+
+
+class TestVideoMetadataForwarding:
+    def test_metadata_is_only_forwarded_to_declaring_processors(self):
+        class Processor:
+            tokenizer = SimpleNamespace(pad_token="<pad>")
+
+            def __call__(self, text, images=None, videos=None, fps=None, **kwargs):
+                self.kwargs = kwargs
+                self.fps = fps
+                return {"input_ids": np.array([[1]]), "attention_mask": np.array([[1]])}
+
+        processor = Processor()
+        metadata = VideoMetadata(total_num_frames=30, fps=30, frames_indices=[0, 29])
+        video = np.zeros((2, 3, 32, 32), dtype=np.uint8)
+        with patch("mlx_vlm.utils.load_video", return_value=(video, metadata)):
+            prepare_inputs(processor, videos=["clip.mp4"], prompts="Describe this.")
+        assert "video_metadata" not in processor.kwargs
+        assert processor.fps == [metadata.sampled_fps]
