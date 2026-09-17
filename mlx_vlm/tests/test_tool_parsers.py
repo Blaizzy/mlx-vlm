@@ -174,20 +174,39 @@ def test_cohere_action_parses_to_openai_tool_calls(multiple):
 
 
 @pytest.mark.parametrize(
-    "text,name,args",
+    "parser,argument_type,text,name,args",
     [
         (
+            "gemma4",
+            str,
             '<|tool_call>call:edit-file{path:<|"|>test.txt<|"|>,edits:[{newText:<|"|>orange<|"|>,oldText:<|"|>apple<|"|>}]}<tool_call|>',
             "edit-file",
             {"path": "test.txt", "edits": [{"newText": "orange", "oldText": "apple"}]},
         ),
-        ("get_weather{city:Austin}", "get_weather", {"city": "Austin"}),
+        ("gemma4", str, "get_weather{city:Austin}", "get_weather", {"city": "Austin"}),
+        (
+            "pythonic",
+            dict,
+            '[write_file(path="game.html", content="<canvas id="game">\n</canvas>")]',
+            "write_file",
+            {"path": "game.html", "content": '<canvas id="game">\n</canvas>'},
+        ),
+        (
+            "pythonic",
+            dict,
+            "[configure(options={'position': [0, 1], 'enabled': True})]",
+            "configure",
+            {"options": {"position": [0, 1], "enabled": True}},
+        ),
     ],
+    ids=["gemma-nested", "gemma-bare", "pythonic-html", "pythonic-nested"],
 )
-def test_gemma_call_syntax(text, name, args):
-    result = _parse("gemma4", text)
-    assert result["name"] == name
-    assert json.loads(result["arguments"]) == args
+def test_parser_syntax(parser, argument_type, text, name, args):
+    result = _parse(parser, text)
+    assert isinstance(result["arguments"], argument_type)
+    assert {**result, "arguments": _arguments(result)} == dict(
+        name=name, arguments=args
+    )
 
 
 def test_gemma_ignores_non_call_prose():
@@ -236,25 +255,6 @@ def test_mistral_process_tool_calls(output):
     assert len(result.calls) == 1
     assert result.calls[0]["function"]["name"] == "get_weather"
     assert json.loads(result.calls[0]["function"]["arguments"]) == WEATHER_ARGS
-
-
-@pytest.mark.parametrize(
-    "text,name,args",
-    [
-        (
-            '[write_file(path="game.html", content="<canvas id="game">\n</canvas>")]',
-            "write_file",
-            {"path": "game.html", "content": '<canvas id="game">\n</canvas>'},
-        ),
-        (
-            "[configure(options={'position': [0, 1], 'enabled': True})]",
-            "configure",
-            {"options": {"position": [0, 1], "enabled": True}},
-        ),
-    ],
-)
-def test_pythonic_literal_arguments(text, name, args):
-    assert _parse("pythonic", text) == {"name": name, "arguments": args}
 
 
 @pytest.mark.parametrize(

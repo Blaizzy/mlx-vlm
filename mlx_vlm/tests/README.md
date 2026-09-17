@@ -68,8 +68,11 @@ them through `load_tool_module`. Add a literal native-format example to
 `WIRE_CALLS` for each new parser; the inventory check requires matching module,
 registry, and example names. Shared checks cover argument values/types, single and
 repeated extraction, unique IDs/indices, surrounding prose, template variants,
-processor inference, overrides, and priority over the JSON fallback. Keep special
-syntax and error cases in the same file. The 13 formats now run 49 cases in 270
+processor inference, overrides, and priority over the JSON fallback. Add syntax
+variants to `test_parser_syntax` with the parser name, expected argument type,
+input, function name, and arguments. Gemma and Pythonic share this runner while
+retaining their string/dict output contracts. Keep error cases in the same file.
+The 13 formats now run 49 cases in 270
 lines (previously 22 cases in 277 lines), with all prior measured paths retained.
 The full suite reports 1,879 passed, five skipped, and 41 passing subtests;
 80,919 production lines and 12,819 branch outcomes execute, adding 285 lines and
