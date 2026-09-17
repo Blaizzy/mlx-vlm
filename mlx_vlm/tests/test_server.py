@@ -2308,7 +2308,7 @@ def test_incomplete_thinking_markers(chunks, field, expected):
 
 @pytest.mark.parametrize(
     "family,enabled",
-    [("gemma4", False), ("gemma4", True), ("cohere2_moe", True), ("custom", True)],
+    [("gemma4", False), ("gemma4", True)],
 )
 def test_thinking_stream_markers(family, enabled):
     tokens, options, expected = _THINKING_CASES[family]

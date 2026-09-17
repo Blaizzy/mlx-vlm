@@ -35,10 +35,17 @@ conversion stays in the server suite, while image-turn formatting and rendering
 without a processor belong to the prompt suite. The latter retains two distinct
 fallback paths identified by the coverage comparison. Repeated prompt-order
 assertions are removed from the conversion test; the endpoint still checks them.
-There are **199 server cases**, **264 cases across the three changed suites**, and
-**1,793 passing tests** in the full suite. The additional cases separate existing
-plain-text serialization, exercise custom markers directly, and isolate prompt
-formatting. Full-suite execution sets are identical to `a343762e`.
+There are **197 server cases**, **262 cases across the three changed suites**, and
+**1,791 passing tests** in the full suite. Plain-text serialization and prompt
+formatting have independent cases. Full-suite execution sets are identical to
+`a343762e`.
+
+The follow-up removes the `cohere2_moe-True` and `custom-True` stream-marker rows,
+whose format/output assertions also run through the endpoint tests. A full run
+with exactly those two rows deselected passes 1,791 tests and retains all 80,947
+production lines and 12,834 branch outcomes from `73b15244`, with no additions or
+losses. After removing the rows, all 197 server cases pass. Both Gemma rows remain:
+removing the enabled row as well loses the opening-marker stripping path.
 
 ## Validation
 
@@ -51,7 +58,7 @@ are compared; additions do not cancel losses.
 | --- | ---: | ---: | ---: | ---: |
 | Executed production lines | 80,943 | 80,947 | 0 | 4 |
 | Executed branch outcomes | 12,831 | 12,834 | 0 | 3 |
-| Passing tests | 1,791 | 1,793 | | |
+| Passing tests | 1,791 | 1,791 | | |
 
 Both runs have four skips and 39 passing subtests. The skips are two optional
 VoiceChat checkpoint tests and two tests requiring PyTorch. Black, isort,
