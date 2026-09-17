@@ -50,6 +50,8 @@ MODEL_REMAPPING = {
     "rf-detr": "rfdetr",
     "dinov2_with_registers": "dinov2",
     "falcon-perception": "falcon_perception",
+    "sapiens2": "sapiens2",
+    "rtmdet": "rtmdet",
     "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
     "cohere2moe": "cohere2_moe",
     "unlimited-ocr": "unlimited_ocr",
