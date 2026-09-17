@@ -1,8 +1,9 @@
-"""Generation, stopping criteria, structured logits, and thinking state."""
+"""Generation, sampling, stopping criteria, structured logits, and thinking state."""
 
 from __future__ import annotations
 
 import contextlib
+import importlib
 import logging
 import sys
 import types
@@ -11,9 +12,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from mlx_vlm import apc as apc_module
+from mlx_vlm import sample_utils as sampling
 from mlx_vlm import structured
 from mlx_vlm.generate import (
     BatchGenerationResult,
@@ -1754,3 +1757,126 @@ def test_json_schema_processor_uses_compact_whitespace_pattern(monkeypatch):
         "whitespace_pattern": "",
     }
     assert observed["schema_text"] == '{"type": "object"}'
+
+
+def _np_p_less_keep(logits, temp):
+    z = np.asarray(logits, dtype=np.float64) / temp
+    z = z - z.max()
+    p = np.exp(z)
+    p = p / p.sum()
+    threshold = float((p * p).sum())
+    return p >= threshold, np.abs(p - threshold)
+
+
+def _np_typical_keep(logits, typical_p):
+    logp = np.asarray(logits, dtype=np.float64)
+    logp = logp - logp.max()
+    logp = logp - np.log(np.exp(logp).sum())
+    p = np.exp(logp)
+    ent = -(p * logp).sum()
+    order = np.argsort(np.abs(-logp - ent), kind="stable")
+    cum_before_sorted = np.cumsum(p[order]) - p[order]
+    cum_before = np.zeros(len(p))
+    cum_before[order] = cum_before_sorted
+    return cum_before < typical_p, np.abs(cum_before - typical_p)
+
+
+@pytest.mark.parametrize(
+    "name,values,reference,tolerance",
+    [
+        ("p_less", [0.5, 0.7, 1.0, 1.3, 2.0], _np_p_less_keep, 1e-5),
+        ("typical_p", [0.2, 0.5, 0.9, 0.95], _np_typical_keep, 1e-4),
+    ],
+    ids=["p_less", "typical_p"],
+)
+def test_sampling_filter_matches_numpy(name, values, reference, tolerance):
+    """Compare independent masks away from numerically ambiguous boundaries."""
+    rng = np.random.default_rng(0)
+    for _ in range(40):
+        vocab_size = int(rng.integers(8, 200))
+        parameter = float(rng.choice(values))
+        logits = rng.normal(0, 3, size=vocab_size).astype(np.float32)
+        expected, distance = reference(logits, parameter)
+        inputs = mx.array(logits)
+        if name == "typical_p":
+            inputs = inputs - mx.logsumexp(inputs, axis=-1, keepdims=True)
+        output = getattr(sampling, f"apply_{name}")(inputs, parameter)
+        mx.eval(output)
+        actual = np.isfinite(np.asarray(output.tolist(), dtype=np.float64))
+        far = distance > tolerance
+        assert np.array_equal(expected[far], actual[far])
+
+
+@pytest.mark.parametrize(
+    "shape,dtype,top_p",
+    [
+        ((100,), mx.float32, 0.9),
+        ((100,), mx.float32, 1.0),
+        ((50,), mx.bfloat16, 0.9),
+        ((3, 50), mx.bfloat16, 0.9),
+    ],
+)
+def test_top_p_sampling_shape(shape, dtype, top_p):
+    tokens = sampling.top_p_sampling(
+        mx.zeros(shape, dtype=dtype), top_p=top_p, temperature=1.0
+    )
+    assert tokens.shape == shape[:-1]
+
+
+@pytest.mark.parametrize(
+    "options,logits,draws,survivors",
+    [
+        ({"top_n_sigma": 1.0}, [0.0, 1.0, 2.0, 3.0, 4.0], 64, {3, 4}),
+        ({"p_less": True}, [10.0, 0.0, 0.0, 0.0, 0.0], 128, {0}),
+        ({"typical_p": 0.3}, [10.0, 0.0, 0.0, 0.0, 0.0], 64, {0}),
+    ],
+    ids=["top_n_sigma", "p_less", "typical_p"],
+)
+def test_sampler_selects_only_survivors(options, logits, draws, survivors):
+    tokens = sampling.make_sampler(temp=1.0, **options)(mx.array([logits] * draws))
+    mx.eval(tokens)
+    assert set(tokens.tolist()) <= survivors
+
+
+def test_p_less_peaked_keeps_top_only():
+    output = sampling.apply_p_less(mx.array([10.0, 0.0, 0.0, 0.0, 0.0]), 1.0)
+    mx.eval(output)
+    assert [i for i, value in enumerate(output.tolist()) if value != -mx.inf] == [0]
+
+
+@pytest.mark.parametrize(
+    "name,logits,bad",
+    [("top_n_sigma", [0.0, 1.0, 2.0, 3.0, 4.0], -1.0)]
+    + [("typical_p", [0.0, 1.0, 2.0], bad) for bad in (0.0, -0.1, 1.5)],
+)
+def test_sampling_filter_rejects_invalid_parameter(name, logits, bad):
+    with pytest.raises(ValueError):
+        mx.eval(getattr(sampling, f"apply_{name}")(mx.array(logits), bad))
+
+
+@pytest.mark.parametrize("name,bad,valid", [("min_p", -1.0, 0.1), ("top_k", -5, 3)])
+def test_sampling_validation_does_not_corrupt_compile(name, bad, valid):
+    """A parameter error must leave MLX tracing usable by subsequent sampling."""
+    logits = mx.array([[1.0, 2.0, 3.0, 4.0, 5.0]])
+    with pytest.raises(ValueError):
+        mx.eval(getattr(sampling, f"apply_{name}")(logits, bad))
+    tokens = sampling.make_sampler(temp=1.0, **{name: valid})(logits)
+    mx.eval(tokens)
+    assert tokens.shape == (1,)
+
+
+@pytest.mark.parametrize(
+    "module_name", ["mlx_vlm.generate.ar", "mlx_vlm.server.generation"]
+)
+@pytest.mark.parametrize("top_p", [1.0, 0.95])
+def test_positioned_target_sampler_honors_top_k(module_name, top_p):
+    sampler = importlib.import_module(module_name)._PositionedTargetSampler(
+        temperature=1.0, top_p=top_p, top_k=2, seed=42
+    )
+    logits = mx.array([[0.0, 1.0, 2.0, 3.0]], dtype=mx.float32)
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    tokens = sampler.sample_target(
+        mx.repeat(logprobs, 32, axis=0), row_ids=[0] * 32, positions=list(range(32))
+    )
+    mx.eval(tokens)
+    assert set(tokens.tolist()) <= {2, 3}

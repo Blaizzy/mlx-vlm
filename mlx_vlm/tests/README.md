@@ -35,17 +35,16 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_audio_generation.py` | Audio generation, loading, downmixing, and resampling |
 | `test_server.py` | Chat/Responses/Anthropic APIs, image endpoints, batching/cancellation, runtime settings, reranking, Responses normalization, tool stream state, HTTP audio, and realtime voice sessions |
 | `test_cli.py` | Text/image/audio/video CLI routing, arguments, diffusion display/visualizer behavior, detector display options, and CLI/library default parity |
-| `test_sample_utils.py` | Sampling distributions and shared contracts for AR/server positioned samplers |
 | `test_prompt_utils.py` | Prompt construction and reasoning-template arguments |
 | `test_trainer.py` | Training workflows, trainer utilities, MRoPE/gated-delta gradients, and MoE gradient/expert-replacement checks |
 | `test_utils.py` | General loading/conversion utilities, local Python model files, and Qwen3.5 patch-weight layouts |
-| `test_generate.py` | Generation, stopping criteria, structured logits, and thinking-phase state |
+| `test_generate.py` | Generation, sampling distributions, AR/server positioned samplers, stopping criteria, structured logits, and thinking-phase state |
 | `test_extraction_models.py` | GLiNER candidate pools, span/schema handling, checkpoint loading, and privacy tagging/quantized inference |
 | `test_pp_doclayout_v3.py` | Document-layout detection configs, sanitization, forward outputs, and postprocessing |
 | `test_tokenizer_utils.py` | Streaming detokenizers, decoder detection, and tokenizer wrappers |
 | `test_smoke.py` | Manual model-download runner, excluded from automated collection |
 
-The suite has 28 test modules. Attention checks share `test_attention.py`;
+The suite has 27 test modules. Attention checks share `test_attention.py`;
 Qwen3.5 patch-weight sanitization lives with loading checks in `test_utils.py`.
 Responses normalization and tool-stream finalization share `test_server.py`;
 structured-output processors share `test_generate.py`. Vision LRU checks live in
@@ -58,13 +57,26 @@ against `f7de22df`, retaining both JSON files. Its full-suite execution sets wer
 80,634 production lines and 12,715 branch outcomes, with no lost or added paths.
 That validation reported 1,852 passed, five skipped, and 41 passing subtests.
 These are measured execution sets, not complete production coverage. The earlier
-pruning tradeoffs still apply. The suite now contains 26,563 Python lines plus
-2,142 readable JSON lines, or 28,705 combined.
+pruning tradeoffs still apply. The suite now contains 26,492 Python lines plus
+2,142 readable JSON lines, or 28,634 combined.
 
 After removing the unused cache helper and redundant standalone mask test, the
 full suite reports 1,875 passed, five skipped, and 41 passing subtests. Coverage
 against `66f67781` retains exactly 80,919 production lines and 12,819 branch
 outcomes, with no lost or added paths.
+
+Sampling checks share `test_generate.py`, which contains 1,882 lines after a
+71-line reduction across generation and sampling tests. Parameterized runners
+retain top-p shape/dtype checks, sampler survivor sets, invalid parameters,
+post-error compiled sampling, and the shared AR/server positioned-sampler
+contract. Independent NumPy references retain all 40 trials per filter and the
+existing numerical boundary tolerances. Grouped assertions now collect as
+20 sampling cases instead of 16, with all 117 combined generation cases passing.
+Focused coverage against `7c803f24` retains exactly 6,908 production lines and
+717 branch outcomes, with no lost or added paths.
+The full suite reports 1,879 passed, five skipped, and 39 passing subtests;
+its execution sets remain 80,919 production lines and 12,819 branch outcomes,
+with no lost or added paths. Two former subtests now run as parameterized cases.
 
 `test_tool_parsers.py` discovers modules under `mlx_vlm.tools.parsers` and imports
 them through `load_tool_module`. Add a literal native-format example to
