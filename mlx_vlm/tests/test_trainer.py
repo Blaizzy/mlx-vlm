@@ -10,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
-from mlx_vlm.tests.test_models import tiny_deepseek_config, tiny_glm_text_config
+from mlx_vlm.tests.test_models import tiny_config
 from mlx_vlm.trainer.datasets import VisionDataset
 from mlx_vlm.trainer.lora import LoRaLayer
 from mlx_vlm.trainer.lora_layers import LoRALinear
@@ -686,12 +686,11 @@ def test_shared_moe_preserves_expert_gradients_and_unweighted_replacements(famil
     from mlx_vlm.models.glm5_next.language import Glm5NextMoE
     from mlx_vlm.models.switch_layers import SwitchGLU
 
+    config = tiny_config(family)
     if family == "glm":
-        config = tiny_glm_text_config()
         module = Glm5NextMoE(config)
         kwargs = {}
     else:
-        config = tiny_deepseek_config()
         module = DeepseekV4MoE(config, 0)
         kwargs = dict(input_ids=mx.array([[1, 2, 3]]))
     inputs = mx.random.normal((1, 3, config.hidden_size))

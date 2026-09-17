@@ -450,6 +450,9 @@ DATA = json.loads(
 if DATA["version"] != 2:
     raise ValueError(f"Unsupported model_cases.json version: {DATA['version']}")
 
+TINY_DEFAULTS = DATA["tiny_defaults"]
+TINY_MODELS = DATA["shared_configs"]
+
 
 def build_config(module, values, config_type="ModelConfig"):
     """Construct the model family's config classes from ordinary nested data."""
@@ -651,14 +654,9 @@ def test_cached_image_features_in_source(model_module):
     )
 
 
-# Tiny configurations shared by training and model-based integration tests.
-
-
-def tiny_deepseek_config():
-    module = importlib.import_module("mlx_vlm.models.deepseek_v4")
-    return build_config(module, DATA["shared_configs"]["deepseek"])
-
-
-def tiny_glm_text_config():
-    module = importlib.import_module("mlx_vlm.models.glm5_next")
-    return build_config(module, DATA["shared_configs"]["glm"], "TextConfig")
+def tiny_config(family, profile=None, **overrides):
+    """Build a fresh tiny config, optionally selecting a named test profile."""
+    case = TINY_MODELS[family]
+    fields = TINY_DEFAULTS | case["config"] | case.get("profiles", {}).get(profile, {})
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    return build_config(module, fields | overrides, case["config_type"])

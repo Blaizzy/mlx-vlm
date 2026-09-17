@@ -34,9 +34,10 @@ from mlx_vlm.speculative.ops import linear as verifier_linear
 from mlx_vlm.speculative.utils import _mtp_verify_target, _speculative_walk_batch
 from mlx_vlm.split_mtp import split_mtp
 from mlx_vlm.tests.test_models import (
+    TINY_DEFAULTS,
+    TINY_MODELS,
     build_config,
-    tiny_deepseek_config,
-    tiny_glm_text_config,
+    tiny_config,
 )
 from mlx_vlm.utils import get_model_and_args
 
@@ -50,30 +51,14 @@ def module(name):
     return importlib.import_module("mlx_vlm." + name)
 
 
-def values(name, **overrides):
-    return deepcopy(DATA["defaults"] | DATA[name] | overrides)
-
-
-def tiny_qwen_text_config():
-    return module("models.qwen3_5").TextConfig(**values("qwen"))
-
-
-TEXT = {
-    "qwen": ("qwen3_5", tiny_qwen_text_config),
-    "glm": ("glm5_next", tiny_glm_text_config),
-    "deepseek": ("deepseek_v4", tiny_deepseek_config),
-}
+def values(name=None, **overrides):
+    return deepcopy(TINY_DEFAULTS | (DATA[name] if name else {}) | overrides)
 
 
 def language(family, *, inference=False, **overrides):
-    name, factory = TEXT[family]
-    config = factory()
-    for key, value in overrides.items():
-        setattr(config, key, value)
+    name = TINY_MODELS[family]["module"]
+    config = tiny_config(family, "inference" if inference else "language", **overrides)
     if family == "qwen":
-        config.num_hidden_layers = config.full_attention_interval = 2
-        if inference:
-            config.linear_key_head_dim = config.linear_value_head_dim = 32
         outer = NS(
             model_type=name,
             text_config=config,
@@ -83,8 +68,6 @@ def language(family, *, inference=False, **overrides):
             vision_start_token_id=28,
         )
         return module(f"models.{name}.language").LanguageModel(config, outer), config
-    if family == "deepseek":
-        config.compress_ratios = [4]
     return module(f"models.{name}.language").LanguageModel(config), config
 
 
@@ -143,7 +126,7 @@ def dflash_drafter(family):
 
 
 def mtp_drafter(family, config):
-    arch = module(f"speculative.drafters.{TEXT[family][0]}_mtp")
+    arch = module(f"speculative.drafters.{TINY_MODELS[family]['module']}_mtp")
     config.mtp_num_hidden_layers = 1
     drafter = arch.Model(arch.ModelConfig(text_config=config, block_size=4))
     drafter.prefer_requested_block_size = True
@@ -153,7 +136,7 @@ def mtp_drafter(family, config):
 def native_speculative_checkpoint(family):
     deepseek = family == "deepseek_v4"
     cfg = (
-        tiny_deepseek_config().to_dict()
+        tiny_config("deepseek").to_dict()
         if deepseek
         else deepcopy(DATA["glm4_checkpoint"])
     )
@@ -358,7 +341,7 @@ def test_mtp_generation(family, failure, monkeypatch):
     assert drafter._round_appended == 0
 
 
-@parametrize("family", list(TEXT))
+@parametrize("family", list(TINY_MODELS))
 @parametrize("batch", [1, 2, 4])
 @parametrize("dtype", [mx.float32, mx.bfloat16])
 def test_verify_commit_matches_decode(family, batch, dtype):
@@ -596,8 +579,8 @@ def test_sampler_rng_isolation():
 
 @parametrize("family,quant", [("qwen", "mxfp8"), ("glm", "affine"), ("glm", "mxfp8")])
 def test_split_and_requantize_checkpoint(tmp_path, family, quant):
-    name, factory = TEXT[family]
-    text = factory()
+    name = TINY_MODELS[family]["module"]
+    text = tiny_config(family)
     text.mtp_num_hidden_layers = 1
     prefix = (
         "mtp.layers.0.mlp.down_proj"
@@ -678,7 +661,7 @@ def split_checkpoint(
 
 def test_deepseek_dspark_split_load_and_draft(tmp_path):
     arch = module("speculative.drafters.deepseek_v4_dspark")
-    text = tiny_deepseek_config()
+    text = tiny_config("deepseek")
     cfg = arch.ModelConfig(text_config=text, **DATA["deepseek_dspark"])
     # Build the native DSpark checkpoint layout from the tiny model.
     text_config = cfg.text_config
@@ -748,7 +731,7 @@ def test_deepseek_dspark_split_load_and_draft(tmp_path):
 def test_eagle3_draft_replay(accepted):
     arch = module("speculative.drafters.eagle3")
     cfg = arch.ModelConfig(
-        transformer_layer_config=values("defaults", intermediate_size=32, head_dim=8),
+        transformer_layer_config=values(intermediate_size=32, head_dim=8),
         **DATA["eagle3"],
     )
     drafter = arch.Model(cfg)
@@ -843,7 +826,7 @@ def test_padded_prefill_chunks(padding):
     "family,accepted", [("qwen", [1, 0]), ("qwen", [1, 1]), ("deepseek", [0, 0])]
 )
 def test_batched_drafter_commit_and_filter(family, accepted):
-    cfg = TEXT[family][1]()
+    cfg = tiny_config(family)
     drafter = mtp_drafter(family, cfg)
     target = NS(model=NS(embed_tokens=nn.Embedding(cfg.vocab_size, cfg.hidden_size)))
     qwen = family == "qwen"
@@ -1191,7 +1174,7 @@ def test_wide_quantized_verifier(batch, length, bits):
 
 
 def test_glm_mtp_native_weight_fusion():
-    cfg = tiny_glm_text_config()
+    cfg = tiny_config("glm")
     arch = module("speculative.drafters.glm5_next_mtp")
     shapes = deepcopy(DATA["glm_fusion_shapes"])
     for expert in range(cfg.n_routed_experts):
@@ -1527,9 +1510,9 @@ def test_lfm_ragged_rollback_matches_committed_prefixes():
 @parametrize("step", [1, 2, 5])
 def test_temporal_layers_commit_each_row_prefix(family, step):
     mx.random.seed(2127)
-    cfg = TEXT[family][1]()
+    cfg = tiny_config(family)
     cfg.linear_head_dim = cfg.linear_key_head_dim = cfg.linear_value_head_dim = 32
-    arch = module(f"models.{TEXT[family][0]}.language")
+    arch = module(f"models.{TINY_MODELS[family]['module']}.language")
     layer = (
         arch.Glm5NextLinearAttention(cfg)
         if family == "glm"
@@ -1614,7 +1597,7 @@ def test_local_mask_tracks_cache_width():
 
 
 def test_filter_batch_keeps_padding_and_positions():
-    drafter = mtp_drafter("qwen", tiny_qwen_text_config())
+    drafter = mtp_drafter("qwen", tiny_config("qwen"))
     drafter.reset(
         NS(model=NS(embed_tokens=nn.Embedding(32, 16))), left_padding=[0, 1, 2]
     )

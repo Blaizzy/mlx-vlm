@@ -68,28 +68,31 @@ Full suite: **1,762 passed, four skipped, 39 passing subtests**. Compared with
 remain covered, with two added lines (Laguna's real chat-template property and
 Muse's public cleanup method). Coverage excludes tests, native kernels, skipped
 optional checks and subprocess execution. Black, isort, autoflake, pyflakes and
-whitespace checks pass. Current suite size is **23,131 Python + 3,083 JSON =
-26,214 lines**, across 27 test modules.
+whitespace checks pass. Current suite size is **23,111 Python + 3,099 JSON =
+26,210 lines**, across 27 test modules.
 
-`test_speculative.py` contains **1,652 formatted lines**, including its own
+`test_speculative.py` contains **1,635 formatted lines**, including its own
 model/drafter construction, native checkpoint setup and transaction doubles.
-`test_models.py` is **664 lines** and exposes only its generic config builder and
-the DeepSeek/GLM config factories used by training and speculation. Their complete
-profiles live under `shared_configs` in `model_cases.json`; speculation reads its
-own profiles from the same JSON file. DSpark checkpoint naming and GLM weight
-fusion setup are inline in their single calling tests. No separate fixture files
-are introduced.
+`test_models.py` is **662 lines** and exposes `build_config` plus one shared
+`tiny_config(family, profile=None, **overrides)` factory. Qwen, GLM and DeepSeek
+module names, config classes and named language/inference profiles live under
+`shared_configs` in `model_cases.json`; `tiny_defaults` supplies common values.
+Each call constructs a fresh config, with explicit overrides applied last.
+Training and checkpoint tests use the base profile. The speculative `language`
+constructor retains Qwen's outer-config adapter. No separate fixture files or
+production changes are introduced.
 
-This corrects the previous 1,399-line speculative layout, which stored 265 lines
-of setup in `test_models.py`. Moving that setup back and inlining wrappers adds
-253 speculative lines and 11 JSON lines, for **one fewer combined line**. All
-**395 speculative cases across 48 test functions** retain their assertions and
-parametrization. Model/training/speculative validation passes **530 tests and
-eight subtests**. The full suite passes **1,762 tests, four skips and 39 subtests**.
-Against `e345fc08`, production execution sets are identical: **80,999 lines and
-12,836 branch outcomes**, with zero lost or added paths. See
-[speculative_coverage.md](speculative_coverage.md) for size accounting and the
-earlier intentional pruning.
+Against `c4f513c3`, this saves **20 Python lines**, offset by **16 additional JSON
+lines**, for **four fewer combined lines** (5,338 → 5,334 across the four affected
+source/config files). This is a small size reduction; the main benefit is removing
+three model-specific config factories and the Python factory lookup table.
+Config values, model parameter shapes, cache types, mutable-config isolation,
+test assertions and parametrization remain verified. All **395 speculative
+cases** pass; the full suite passes **1,762 tests, four skips and 39 subtests**.
+Both isolated and full-suite production execution sets are identical before and
+after: **15,723 / 80,999 lines** and **2,457 / 12,836 branch outcomes**, respectively,
+with zero lost or added paths. See [speculative_coverage.md](speculative_coverage.md)
+for size accounting and the earlier intentional pruning.
 
 `test_cli.py` contains **498 formatted lines**, down from 938 at `9383ef6c`
 (440 lines / 46.9% fewer), with **37 collected cases** before and after.
@@ -199,8 +202,8 @@ their existing broad integration checks. Drafter and speculative-decoding tests
 belong in `test_speculative.py`: reuse its tiny target/config factories and
 parameterize shared contracts with descriptive family IDs. Checkpoint I/O, MTP
 setup, quantization format matrices, and repeated-decode references are shared
-within the suite. `test_speculative.py` supplies fresh tiny language configs
-for speculative and training tests. It also owns MiniMax
+within the suite. `test_models.tiny_config` supplies fresh JSON-backed configs
+for speculative and training tests. `test_speculative.py` also owns MiniMax
 speculative rollback checks; unrelated model tests remain in their existing
 modules. Cache/position, sampling-parity, and batched-mask checks run through
 shared contract runners. See [coverage measurements](speculative_coverage.md)

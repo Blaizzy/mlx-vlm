@@ -1,5 +1,47 @@
 # Speculative suite coverage
 
+## Shared JSON config factory
+
+Against `c4f513c3`, replace the Qwen, GLM and DeepSeek config wrappers and Python
+factory lookup with `test_models.tiny_config`. Module/config-class metadata,
+base settings and language/inference profiles live in `model_cases.json`.
+Shared defaults are declared once. Each construction deep-copies the merged data;
+explicit overrides take precedence. Training and checkpoint tests retain their
+base settings, including DeepSeek's uncompressed cache configuration. Model,
+drafter, checkpoint and transaction setup stays in `test_speculative.py`.
+
+| File | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `test_speculative.py` | 1,652 | 1,635 | -17 |
+| `test_models.py` | 664 | 662 | -2 |
+| `test_trainer.py` | 717 | 716 | -1 |
+| `model_cases.json` | 2,305 | 2,321 | +16 |
+| **Combined** | **5,338** | **5,334** | **-4** |
+
+This removes **20 Python lines** and adds **16 JSON lines**, saving **four combined
+lines**. The main benefit is one reusable config factory, not a large LOC cut.
+All 395 speculative cases remain, with identical test names, assertions and
+parameterization. Captured base/language/inference/custom config values, model
+parameter shapes and cache classes match the original factories; nested mutable
+config values remain isolated between calls. Unrelated JSON settings are unchanged.
+
+The speculative suite passes **395 cases**. Both full-suite runs pass **1,762
+tests, four existing skips and 39 subtests**, with the same two dependency warnings.
+Exact Python production execution sets are unchanged:
+
+| Scope | Executed lines before/after | Branch outcomes before/after | Lost / added |
+| --- | ---: | ---: | ---: |
+| Speculative suite alone | 15,723 | 2,457 | 0 / 0 |
+| Full default suite | 80,999 | 12,836 | 0 / 0 |
+
+Full-suite statement coverage remains **52.9849%** and branch coverage **31.9319%**.
+These measurements retain the current suite's coverage, including the earlier
+intentional pruning documented below. They exclude test code, native kernels,
+subprocesses and skipped optional checks. Validation uses the offline commands
+below with a 90-second timeout, Python 3.12.14, MLX 0.32.2, Transformers 5.17.0,
+pytest 9.1.1 and coverage 7.16.1. Black, isort, autoflake, pyflakes, Python 3.10
+syntax parsing and whitespace checks pass.
+
 ## Speculative setup stays with its tests
 
 Against `e345fc08`, speculative-only constructors, native checkpoint setup and
