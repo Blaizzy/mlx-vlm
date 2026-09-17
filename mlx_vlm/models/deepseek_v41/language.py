@@ -538,12 +538,24 @@ class DeepseekV41MoE(nn.Module):
 def _apply_rope_at_positions(
     x: mx.array, positions: mx.array, rope_dim: int, theta: float, yarn: tuple
 ) -> mx.array:
-    """Rotate strided positions (compressor latents) with explicit tables."""
+    """Rotate strided positions (compressor latents) with explicit tables.
+
+    Paired as ``mx.fast.rope(traditional=True)`` pairs, to match the queries.
+    """
     table_len = int(mx.max(positions).item()) + 1 if positions.size else 1
     cos, sin = _index_cos_sin(table_len, rope_dim, theta, yarn)
     shape = (1,) * (x.ndim - positions.ndim - 1) + positions.shape + (cos.shape[-1],)
-    rows = cos[positions].reshape(shape)
-    return _apply_index_rotary(x, rows, sin[positions].reshape(shape), rope_dim)
+    cos_rows = cos[positions].reshape(shape)
+    sin_rows = sin[positions].reshape(shape)
+    dtype = x.dtype
+    x = x.astype(mx.float32)
+    passive, rot = x[..., :-rope_dim], x[..., -rope_dim:]
+    pairs = rot.reshape(*rot.shape[:-1], rope_dim // 2, 2)
+    even, odd = pairs[..., 0], pairs[..., 1]
+    rotated = mx.stack(
+        [even * cos_rows - odd * sin_rows, odd * cos_rows + even * sin_rows], axis=-1
+    ).reshape(rot.shape)
+    return mx.concatenate([passive, rotated], axis=-1).astype(dtype)
 
 
 class DeepseekV41Attention(nn.Module):
