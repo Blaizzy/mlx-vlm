@@ -1226,6 +1226,7 @@ Structured outputs are not currently supported with speculative decoding.
 - `/v1/realtime` - WebSocket-based realtime full-duplex speech. See the [Nemotron VoiceChat guide](mlx_vlm/models/nemotron_voicechat/README.md#realtime-websocket-api) for supported models and usage.
 - `/health` - Check server status
 - `/metrics` and `/v1/metrics` - Inspect rolling request metrics, throughput, and runtime counters
+- `/cache/offload` and `/v1/cache/offload` - Write a conversation's prefix cache to disk and free the memory it holds, keeping the prefix reusable
 - `/unload` - Unload all loaded model caches from memory
 
 #### Usage Examples

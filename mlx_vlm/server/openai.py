@@ -333,6 +333,8 @@ def register_routes(app, deps):
     app.get("/v1/responses/{response_id}/input_items", include_in_schema=False)(
         responses_input_items_endpoint
     )
+    app.post("/cache/offload")(cache_offload_endpoint)
+    app.post("/v1/cache/offload", include_in_schema=False)(cache_offload_endpoint)
     app.post("/responses")(responses_endpoint)
     app.post("/v1/responses", include_in_schema=False)(responses_endpoint)
     app.post("/chat/completions", response_model=None)(chat_completions_endpoint)
@@ -754,6 +756,93 @@ async def responses_input_tokens_endpoint(request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+def _conversation_prefix_ids(processor, config, prompt, images) -> list:
+    """The token ids generation ran over for this conversation.
+
+    Re-tokenizing the rendered prompt is not enough: a template that emits its
+    own BOS shifts every id by one and misses the cache entirely.
+    """
+    images = images or None
+    try:
+        if runtime.response_generator is not None:
+            raw_inputs = runtime.response_generator._cpu_preprocess(
+                prompt, images, None
+            )
+        else:
+            raw_inputs = prepare_inputs(
+                processor,
+                images=images,
+                prompts=prompt,
+                image_token_index=getattr(config, "image_token_index", None),
+            )
+        input_ids = raw_inputs["input_ids"]
+    except Exception as e:
+        logger.debug("Could not derive conversation prefix ids: %s", e)
+        return []
+    ids = input_ids[0] if getattr(input_ids, "ndim", 1) > 1 else input_ids
+    return [int(t) for t in ids]
+
+
+async def cache_offload_endpoint(request: Request):
+    """Write a conversation's prefix cache to disk and free the memory it holds.
+
+    The conversation is supplied the way a Responses request supplies it, so
+    the prefix released is the one generation actually ran over.
+    """
+    body = await request.json()
+    openai_request = OpenAIRequest(**body)
+
+    try:
+        if openai_request.input is None:
+            raise HTTPException(status_code=400, detail="Missing input.")
+
+        prompt_items = _response_chain_items(
+            openai_request.previous_response_id
+        ) + _normalize_response_input(openai_request.input)
+        chat_messages, images = _response_items_to_chat(prompt_items)
+        _normalize_response_instruction_messages(
+            chat_messages, openai_request.instructions
+        )
+        _ensure_effective_input(chat_messages, images=images)
+
+        if runtime.apc_manager is None:
+            raise HTTPException(status_code=409, detail="Prompt cache is disabled.")
+
+        model, processor, config = get_cached_model(
+            openai_request.model, _adapter_path_or_inherit(openai_request)
+        )
+        del model
+        gen_args = _build_gen_args(
+            openai_request, processor, tenant_id=_read_tenant_id(request)
+        )
+        formatted_prompt = apply_chat_template(
+            processor,
+            config,
+            chat_messages,
+            num_images=len(images),
+            **gen_args.to_template_kwargs(),
+        )
+        token_ids = _conversation_prefix_ids(
+            processor, config, formatted_prompt, images
+        )
+        if not token_ids:
+            raise HTTPException(
+                status_code=422, detail="Could not resolve the conversation prefix."
+            )
+
+        result = runtime.apc_manager.offload_prefix(token_ids)
+        mx.clear_cache()
+        gc.collect()
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unexpected error in /cache/offload endpoint: %s", e)
+        raise HTTPException(
+            status_code=500, detail=f"An unexpected error occurred: {e}"
+        )
 
 
 async def responses_retrieve_endpoint(response_id: str):

@@ -3069,6 +3069,7 @@ class APCManager:
             self._free_push(b)
         self.hash_table: dict[int, APCBlock] = {}
         self._exact_cache: "OrderedDict[int, APCExactCacheEntry]" = OrderedDict()
+        self._seen_extra_hashes: "OrderedDict[int, None]" = OrderedDict()
         self.stats = APCStats()
         self.lock = threading.RLock()
         self.disk = disk
@@ -3887,6 +3888,9 @@ class APCManager:
                 self.stats.stores += 1
                 self.stats.stored_tokens += self.block_size
                 parent = h
+            self._seen_extra_hashes[int(extra_hash)] = None
+            while len(self._seen_extra_hashes) > 16:
+                self._seen_extra_hashes.popitem(last=False)
             if self.disk is not None and disk_blocks:
                 try:
                     self.disk.save_layer_major_blocks(
@@ -3896,6 +3900,109 @@ class APCManager:
                     logger.warning("APC disk save scheduling failed: %s", e)
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
             return new_blocks
+
+    def _offload_candidate_salts(self, extra_hash: Optional[int]) -> List[int]:
+        salts = [] if extra_hash is None else [int(extra_hash)]
+        for salt in self._seen_extra_hashes:
+            if salt not in salts:
+                salts.append(salt)
+        return salts or [0]
+
+    def offload_prefix(
+        self, token_ids: Sequence[int], extra_hash: Optional[int] = None
+    ) -> dict:
+        """Persist a prefix's blocks to disk, then free the memory they hold.
+
+        Blocks another request still holds, and blocks that are not on disk,
+        stay resident: releasing either would drop state a caller still needs.
+        """
+        if self.disk is not None:
+            self.disk.flush()
+        with self.lock:
+            resident: List[Tuple[int, APCBlock]] = []
+            for salt in self._offload_candidate_salts(extra_hash):
+                walked: List[Tuple[int, APCBlock]] = []
+                parent = SEED_PARENT_HASH
+                for i in range(len(token_ids) // self.block_size):
+                    chunk = tuple(
+                        int(t)
+                        for t in token_ids[
+                            i * self.block_size : (i + 1) * self.block_size
+                        ]
+                    )
+                    h = _hash_tokens(parent, chunk, salt)
+                    block = self.hash_table.get(h)
+                    if block is None or block.token_ids != chunk:
+                        break
+                    walked.append((h, block))
+                    parent = h
+                if len(walked) > len(resident):
+                    resident = walked
+
+            released = in_use = unpersisted = freed_bytes = 0
+            for h, block in resident:
+                if block.ref_cnt > 0:
+                    in_use += 1
+                    continue
+                if self.disk is None or not self.disk.has(h):
+                    unpersisted += 1
+                    continue
+                freed_bytes += block.resident_bytes()
+                self._free_remove(block)
+                if self.hash_table.get(h) is block:
+                    del self.hash_table[h]
+                    self.stats.evictions += 1
+                block.block_hash = None
+                block.token_ids = ()
+                block.release_components()
+                self._free_push(block)
+                released += 1
+
+            self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
+
+        # Custom cache layouts are kept as whole-prefix snapshots rather than
+        # blocks, so they have to be spilled and dropped on their own terms.
+        prefix = tuple(int(t) for t in token_ids)
+        snapshots = released_snapshots = retained_snapshots = 0
+        for key, entry in list(self._exact_cache.items()):
+            if prefix[: len(entry.token_ids)] != entry.token_ids:
+                continue
+            snapshots += 1
+            persisted = self.disk is not None and (
+                self.disk.find_exact_prefix(
+                    entry.token_ids,
+                    extra_hash=entry.extra_hash,
+                    block_size=self.block_size,
+                )
+                is not None
+            )
+            if not persisted and self.disk is not None:
+                persisted = self.disk.save_exact_cache(
+                    key,
+                    entry.token_ids,
+                    entry.extra_hash,
+                    entry.prompt_cache,
+                    synchronous=True,
+                )
+            if not persisted:
+                retained_snapshots += 1
+                continue
+            with self.lock:
+                dropped = self._exact_cache.pop(key, None)
+            if dropped is not None:
+                freed_bytes += _cache_nbytes(dropped.prompt_cache)
+                released_snapshots += 1
+
+        return {
+            "matched_blocks": len(resident),
+            "released_blocks": released,
+            "released_tokens": released * self.block_size,
+            "retained_in_use": in_use,
+            "retained_unpersisted": unpersisted + retained_snapshots,
+            "matched_snapshots": snapshots,
+            "released_snapshots": released_snapshots,
+            "freed_bytes": freed_bytes,
+        }
 
     def stats_snapshot(self) -> dict:
         with self.lock:
