@@ -68,24 +68,28 @@ Full suite: **1,762 passed, four skipped, 39 passing subtests**. Compared with
 remain covered, with two added lines (Laguna's real chat-template property and
 Muse's public cleanup method). Coverage excludes tests, native kernels, skipped
 optional checks and subprocess execution. Black, isort, autoflake, pyflakes and
-whitespace checks pass. Current suite size is **23,143 Python + 3,072 JSON =
-26,215 lines**, across 27 test modules.
+whitespace checks pass. Current suite size is **23,131 Python + 3,083 JSON =
+26,214 lines**, across 27 test modules.
 
-`test_speculative.py` contains **1,399 formatted lines**, down from 2,027 at
-`a1bbdca6`. Reusable model constructors, checkpoint tensors, and transaction doubles
-share `test_models.py`, and plain config/shape profiles share `model_cases.json`.
-Together those files shrink by **35 lines**; the 628-line speculative-file
-reduction includes relocation. Training imports its two config helpers directly
-from `test_models.py`. There are no new fixture or test files.
+`test_speculative.py` contains **1,652 formatted lines**, including its own
+model/drafter construction, native checkpoint setup and transaction doubles.
+`test_models.py` is **664 lines** and exposes only its generic config builder and
+the DeepSeek/GLM config factories used by training and speculation. Their complete
+profiles live under `shared_configs` in `model_cases.json`; speculation reads its
+own profiles from the same JSON file. DSpark checkpoint naming and GLM weight
+fusion setup are inline in their single calling tests. No separate fixture files
+are introduced.
 
-All **395 speculative cases pass**, retaining the former 413 cases' scenarios:
-dispatch assertions share the round matrix, and acceptance/budget/error scenarios
-share one runner. Full suite: **1,773 passed, four skipped, 39 passing subtests**.
-Both isolated (15,723 lines / 2,457 branches) and full-suite (80,997 / 12,836)
-production execution sets are unchanged, with zero lost or added paths. See
-[speculative_coverage.md](speculative_coverage.md) for exact size accounting,
-validation scope, and the earlier intentional pruning. After that speculative refactor, suite size was
-**23,698 Python lines + 2,543 JSON lines = 26,241 combined**.
+This corrects the previous 1,399-line speculative layout, which stored 265 lines
+of setup in `test_models.py`. Moving that setup back and inlining wrappers adds
+253 speculative lines and 11 JSON lines, for **one fewer combined line**. All
+**395 speculative cases across 48 test functions** retain their assertions and
+parametrization. Model/training/speculative validation passes **530 tests and
+eight subtests**. The full suite passes **1,762 tests, four skips and 39 subtests**.
+Against `e345fc08`, production execution sets are identical: **80,999 lines and
+12,836 branch outcomes**, with zero lost or added paths. See
+[speculative_coverage.md](speculative_coverage.md) for size accounting and the
+earlier intentional pruning.
 
 `test_cli.py` contains **498 formatted lines**, down from 938 at `9383ef6c`
 (440 lines / 46.9% fewer), with **37 collected cases** before and after.

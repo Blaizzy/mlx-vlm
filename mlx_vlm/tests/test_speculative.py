@@ -1,9 +1,12 @@
 """Shared speculative generation, drafter, verification, and cache contracts."""
 
+import importlib
 import json
 from contextlib import nullcontext
 from copy import deepcopy
 from itertools import product
+from math import prod
+from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
@@ -17,7 +20,7 @@ import mlx_vlm.speculative.utils as speculative
 from mlx_vlm.generate.ar import _make_cache, generate_step
 from mlx_vlm.models import fast_ops
 from mlx_vlm.models import quantized_verifier as quantized
-from mlx_vlm.models.base import LanguageModelOutput
+from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
 from mlx_vlm.models.cache import ArraysCache, BatchKVCache, KVCache
 from mlx_vlm.models.linear import native_batch_linear
 from mlx_vlm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
@@ -30,10 +33,220 @@ from mlx_vlm.speculative.drafters import (
 from mlx_vlm.speculative.ops import linear as verifier_linear
 from mlx_vlm.speculative.utils import _mtp_verify_target, _speculative_walk_batch
 from mlx_vlm.split_mtp import split_mtp
-from mlx_vlm.tests import test_models as models
+from mlx_vlm.tests.test_models import (
+    build_config,
+    tiny_deepseek_config,
+    tiny_glm_text_config,
+)
+from mlx_vlm.utils import get_model_and_args
 
 parametrize = pytest.mark.parametrize
-module = models.module
+DATA = json.loads(Path(__file__).with_name("model_cases.json").read_text())[
+    "speculative"
+]
+
+
+def module(name):
+    return importlib.import_module("mlx_vlm." + name)
+
+
+def values(name, **overrides):
+    return deepcopy(DATA["defaults"] | DATA[name] | overrides)
+
+
+def tiny_qwen_text_config():
+    return module("models.qwen3_5").TextConfig(**values("qwen"))
+
+
+TEXT = {
+    "qwen": ("qwen3_5", tiny_qwen_text_config),
+    "glm": ("glm5_next", tiny_glm_text_config),
+    "deepseek": ("deepseek_v4", tiny_deepseek_config),
+}
+
+
+def language(family, *, inference=False, **overrides):
+    name, factory = TEXT[family]
+    config = factory()
+    for key, value in overrides.items():
+        setattr(config, key, value)
+    if family == "qwen":
+        config.num_hidden_layers = config.full_attention_interval = 2
+        if inference:
+            config.linear_key_head_dim = config.linear_value_head_dim = 32
+        outer = NS(
+            model_type=name,
+            text_config=config,
+            vision_config=NS(spatial_merge_size=2),
+            image_token_id=30,
+            video_token_id=29,
+            vision_start_token_id=28,
+        )
+        return module(f"models.{name}.language").LanguageModel(config, outer), config
+    if family == "deepseek":
+        config.compress_ratios = [4]
+    return module(f"models.{name}.language").LanguageModel(config), config
+
+
+def dflash_target(family):
+    if family in ("dflash2", "dspark-qwen"):
+        model, _ = language("qwen")
+        model.set_dtype(mx.bfloat16)
+
+        def embeddings(input_ids, pixel_values=None, mask=None, **kwargs):
+            positions, deltas = model.get_rope_index(input_ids, attention_mask=mask)
+            return InputEmbeddingsFeatures(
+                inputs_embeds=model.model.embed_tokens(input_ids),
+                position_ids=positions,
+                rope_deltas=deltas,
+            )
+
+        return NS(language_model=model, get_input_embeddings=embeddings)
+    if family.startswith("dspark-lfm"):
+        config = values(family.removeprefix("dspark-"))
+        arch = module("models." + config["model_type"])
+    else:
+        arch = module("models.muse_glimmer")
+        config = dict(
+            text_config=values(
+                "glimmer",
+                layer_types=["sliding_attention", "full_attention"],
+                layer_rope_theta=[10000.0, 0],
+            ),
+            vision_config=DATA["glimmer_vision"],
+            image_token_id=7,
+            video_token_id=6,
+            out_hidden_size=32,
+            projector_hidden_size=16,
+        )
+    return arch.Model(build_config(arch, config))
+
+
+def dflash_config(family):
+    config = values("glimmer" if family == "glimmer" else "dflash")
+    config.update(deepcopy(DATA["dflash_variants"][family]))
+    if family.startswith("dspark-lfm"):
+        del config["num_target_layers"]
+    return config
+
+
+def dflash_drafter(family):
+    config = dflash_config(family)
+    arch, name = get_model_and_args(config)
+    expected = (
+        "dflash2"
+        if family == "dflash2"
+        else "muse_glimmer_assistant" if family == "glimmer" else "dspark"
+    )
+    assert name == expected
+    return arch.Model(arch.ModelConfig.from_dict(config))
+
+
+def mtp_drafter(family, config):
+    arch = module(f"speculative.drafters.{TEXT[family][0]}_mtp")
+    config.mtp_num_hidden_layers = 1
+    drafter = arch.Model(arch.ModelConfig(text_config=config, block_size=4))
+    drafter.prefer_requested_block_size = True
+    return drafter
+
+
+def native_speculative_checkpoint(family):
+    deepseek = family == "deepseek_v4"
+    cfg = (
+        tiny_deepseek_config().to_dict()
+        if deepseek
+        else deepcopy(DATA["glm4_checkpoint"])
+    )
+    cfg["model_type"] = family
+    if deepseek:
+        weights = {
+            f"mtp.0.{key}.weight": mx.zeros((4, 4), dtype=mx.uint8)
+            for key in ("e_proj", "attn.wq_a")
+        }
+        weights.update(
+            {key.replace(".weight", ".scale"): mx.ones((1, 1)) for key in list(weights)}
+        )
+        weights["mtp.0.enorm.weight"] = mx.ones((cfg["hidden_size"],))
+        for expert in range(cfg["n_routed_experts"]):
+            for proj in ("w1", "w2", "w3"):
+                key = f"mtp.0.ffn.experts.{expert}.{proj}"
+                weights[key + ".weight"] = mx.full((4, 16), expert, dtype=mx.uint8)
+                weights[key + ".scale"] = mx.ones((4, 1), dtype=mx.uint8)
+        weights["mtp.0.ffn.gate.bias"] = mx.zeros((cfg["n_routed_experts"],))
+        weights["mtp.0.hc_attn_fn"] = mx.ones((2, 2))
+        weights["mtp.0.hc_head_scale"] = mx.ones((1,))
+    else:
+        shapes = deepcopy(DATA["glm4_checkpoint_shapes"])
+        for expert in ["shared_experts", "experts.0", "experts.1"]:
+            for proj in ("gate", "up", "down"):
+                shapes[f"mlp.{expert}.{proj}_proj"] = (
+                    (8, 4) if proj == "down" else (4, 8)
+                )
+        weights = {
+            f"model.layers.2.{key}.weight": mx.zeros(shape)
+            for key, shape in shapes.items()
+        }
+        weights["model.layers.2.mlp.gate.e_score_correction_bias"] = mx.ones((2,))
+        weights["model.layers.2.self_attn.rotary_emb.inv_freq"] = mx.ones((2,))
+    return cfg, weights
+
+
+class TransactionTarget:
+    def __init__(self, token):
+        self.token, self.transaction = token, None
+
+    def __call__(self, inputs, cache, **kwargs):
+        batch, length = inputs.shape
+        self.transaction = start_speculative_cache(cache, length)
+        states = cache[0][0][:, None] + mx.arange(1, length + 1)[None, :, None]
+        cache[0][0] = states[:, -1]
+        cache[0].record_speculative_states(0, states[:, :-1], states[:, -1])
+        kv = mx.zeros((batch, 1, length, 1))
+        cache[1].update_and_fetch(kv, kv)
+        return LanguageModelOutput(
+            logits=mx.broadcast_to(mx.eye(8)[self.token], (batch, length, 8)),
+            hidden_states=[mx.zeros((batch, length, 4))],
+            shared_kv_states={},
+            gdn_states=self.transaction,
+        )
+
+    def speculative_verify_logits(self, inputs, cache, sampler):
+        output = self(inputs, cache)
+        try:
+            return (
+                output.hidden_states[0],
+                {},
+                output.gdn_states,
+                sampler(output.logits),
+            )
+        except BaseException:
+            output.gdn_states.abort()
+            raise
+
+    def rollback_speculative_cache(self, *args):
+        raise AssertionError("transactions must own cache commit")
+
+
+class TransactionDrafter:
+    prefer_requested_block_size = True
+
+    def __init__(self):
+        self.config = NS(block_size=2, target_layer_ids=[0])
+        self.accept_lens, self.draft_lens = [], []
+
+    def reset(self, model, left_padding=None):
+        return []
+
+    def make_cache(self):
+        return []
+
+    def set_shared_kv(self, *args, **kwargs):
+        pass
+
+    def draft_block(
+        self, bonus, hidden, cache, block_size, sampler, token_dtype, **kwargs
+    ):
+        return mx.full((hidden.shape[0], block_size - 1), 4, dtype=token_dtype)
 
 
 def equal(actual, expected, **tolerance):
@@ -78,7 +291,7 @@ def generated(target, drafter=None, *, seed=41, temperature=0):
 @parametrize("temperature,seed", [(0, 41), (0.5, 41), (1.0, 41), (0.7, None)])
 def test_generation_and_request_reset(family, temperature, seed):
     mx.random.seed(37)
-    target, drafter = models.dflash_target(family), models.dflash_drafter(family)
+    target, drafter = dflash_target(family), dflash_drafter(family)
     mx.eval(target.language_model.parameters(), drafter.parameters())
     validate_drafter_compatibility(target, drafter, "dflash")
     expected = generated(target, temperature=temperature, seed=seed)
@@ -98,8 +311,8 @@ def test_generation_and_request_reset(family, temperature, seed):
 )
 def test_mtp_generation(family, failure, monkeypatch):
     mx.random.seed(2127)
-    model, config = models.language(family, inference=True)
-    drafter = models.mtp_drafter(family, config)
+    model, config = language(family, inference=True)
+    drafter = mtp_drafter(family, config)
     model.eval()
     drafter.eval()
     prompt = mx.array([[1, 2, 3]])
@@ -145,12 +358,12 @@ def test_mtp_generation(family, failure, monkeypatch):
     assert drafter._round_appended == 0
 
 
-@parametrize("family", list(models.TEXT))
+@parametrize("family", list(TEXT))
 @parametrize("batch", [1, 2, 4])
 @parametrize("dtype", [mx.float32, mx.bfloat16])
 def test_verify_commit_matches_decode(family, batch, dtype):
     mx.random.seed(2127)
-    model, _ = models.language(family, inference=True)
+    model, _ = language(family, inference=True)
     model.load_weights(
         [
             (key, value.astype(dtype) if model.cast_predicate(key) else value)
@@ -295,7 +508,7 @@ def test_fused_projection_parity(bits, widths, length):
 @parametrize("batch", [1, 2])
 @parametrize("token,failure", [(4, False), (7, False), (4, True)])
 def test_round_commit_close_and_abort(kind, batch, token, failure):
-    target = models.TransactionTarget(token)
+    target = TransactionTarget(token)
     caches = [ArraysCache(1), BatchKVCache([0] * batch) if batch > 1 else KVCache()]
     caches[0][0] = mx.zeros((batch, 1))
     initial = mx.zeros((batch, 1, 2, 1))
@@ -319,7 +532,7 @@ def test_round_commit_close_and_abort(kind, batch, token, failure):
     if kind == "mtp":
         options["shared_kv_states"] = {}
     generator = rounds(
-        target, models.TransactionDrafter(), caches, mx.zeros((batch, 1, 4)), **options
+        target, TransactionDrafter(), caches, mx.zeros((batch, 1, 4)), **options
     )
     error = pytest.raises(RuntimeError, match="injected sampler failure")
     with error if failure else nullcontext():
@@ -383,7 +596,7 @@ def test_sampler_rng_isolation():
 
 @parametrize("family,quant", [("qwen", "mxfp8"), ("glm", "affine"), ("glm", "mxfp8")])
 def test_split_and_requantize_checkpoint(tmp_path, family, quant):
-    name, factory = models.TEXT[family]
+    name, factory = TEXT[family]
     text = factory()
     text.mtp_num_hidden_layers = 1
     prefix = (
@@ -423,11 +636,11 @@ def test_split_and_requantize_checkpoint(tmp_path, family, quant):
 
 @parametrize("family", ["dflash2", "glimmer", "dspark-lfm2", "dspark-qwen"])
 def test_checkpoint_routing_and_validation(tmp_path, family):
-    settings = models.dflash_config(family)
+    settings = dflash_config(family)
     (tmp_path / "config.json").write_text(json.dumps(settings))
     assert resolve_drafter_kind(tmp_path) == "dflash"
-    drafter = models.dflash_drafter(family)
-    target = models.dflash_target(family)
+    drafter = dflash_drafter(family)
+    target = dflash_target(family)
     if family == "glimmer":
         target.language_model.config.model_type = "other"
     else:
@@ -465,11 +678,42 @@ def split_checkpoint(
 
 def test_deepseek_dspark_split_load_and_draft(tmp_path):
     arch = module("speculative.drafters.deepseek_v4_dspark")
-    text = models.tiny_deepseek_config()
-    cfg = arch.ModelConfig(
-        text_config=text, **models.DATA["speculative"]["deepseek_dspark"]
-    )
-    source = models.dspark_source(arch.Model(cfg), cfg)
+    text = tiny_deepseek_config()
+    cfg = arch.ModelConfig(text_config=text, **DATA["deepseek_dspark"])
+    # Build the native DSpark checkpoint layout from the tiny model.
+    text_config = cfg.text_config
+    proj_to_w = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
+    hc = {"attn_hc": "hc_attn", "ffn_hc": "hc_ffn"}
+    source = {}
+    for key, value in tree_flatten(arch.Model(cfg).parameters()):
+        if key.startswith("markov_head."):
+            # the model-level markov head lives under the last stage on disk
+            source[f"mtp.{cfg.n_mtp_layers - 1}.{key}"] = value
+            continue
+        _, stage, body = key.split(".", 2)
+        prefix = f"mtp.{stage}."
+        if body.startswith("ffn.switch_mlp."):
+            w = proj_to_w[body.split(".")[-2]]
+            for expert in range(text_config.n_routed_experts):
+                source[f"{prefix}ffn.experts.{expert}.{w}.weight"] = value[expert]
+        elif body.startswith("ffn.shared_experts."):
+            w = proj_to_w[body.split(".")[-2]]
+            source[f"{prefix}ffn.shared_experts.{w}.weight"] = value
+        elif body == "ffn.gate.e_score_correction_bias":
+            source[f"{prefix}ffn.gate.bias"] = value
+        elif body == "attn.wo_a.weight":
+            source[f"{prefix}attn.wo_a.weight"] = (
+                value.reshape(text_config.o_groups * text_config.o_lora_rank, -1)
+                if value.ndim == 3
+                else value
+            )
+        elif body.startswith("attn_hc.") or body.startswith("ffn_hc."):
+            component, param = body.split(".")
+            source[f"{prefix}{hc[component]}_{param}"] = value
+        elif body.startswith("hc_head."):
+            source[f"{prefix}hc_head_{body.split('.')[-1]}"] = value
+        else:
+            source[f"{prefix}{body}"] = value
     source["mtp.2.confidence_head.proj.weight"] = mx.zeros((1, 24))
     source["mtp.0.ffn.gate.bias_vl"] = mx.zeros((2,))
     settings = {**text.to_dict(), "model_type": "deepseek_v4"}
@@ -504,8 +748,8 @@ def test_deepseek_dspark_split_load_and_draft(tmp_path):
 def test_eagle3_draft_replay(accepted):
     arch = module("speculative.drafters.eagle3")
     cfg = arch.ModelConfig(
-        transformer_layer_config=models.dimensions(),
-        **models.DATA["speculative"]["eagle3"],
+        transformer_layer_config=values("defaults", intermediate_size=32, head_dim=8),
+        **DATA["eagle3"],
     )
     drafter = arch.Model(cfg)
     drafter.d2t = mx.arange(16, dtype=mx.int32)
@@ -556,7 +800,7 @@ def test_drafter_masks(offsets, length, query_len):
 
 def test_laguna_checkpoint_contract():
     arch = module("speculative.drafters.laguna_dflash.config")
-    settings = models.values("laguna_dflash")
+    settings = values("laguna_dflash")
     config = arch.DFlashConfig.from_dict(settings)
     expected = arch.expected_laguna_dflash_weight_shapes(config)
     weights = {key: NS(shape=shape) for key, shape in expected.items()}
@@ -576,7 +820,7 @@ def test_laguna_checkpoint_contract():
 
 @parametrize("padding", [[5, 0], [5, 5]])
 def test_padded_prefill_chunks(padding):
-    lm, cfg = models.language("qwen")
+    lm, cfg = language("qwen")
     recurrent = ArraysCache(2)
     recurrent.left_padding = mx.array(padding)
     caches = [recurrent, BatchKVCache(padding)]
@@ -599,8 +843,8 @@ def test_padded_prefill_chunks(padding):
     "family,accepted", [("qwen", [1, 0]), ("qwen", [1, 1]), ("deepseek", [0, 0])]
 )
 def test_batched_drafter_commit_and_filter(family, accepted):
-    cfg = models.TEXT[family][1]()
-    drafter = models.mtp_drafter(family, cfg)
+    cfg = TEXT[family][1]()
+    drafter = mtp_drafter(family, cfg)
     target = NS(model=NS(embed_tokens=nn.Embedding(cfg.vocab_size, cfg.hidden_size)))
     qwen = family == "qwen"
     drafter.reset(
@@ -653,12 +897,12 @@ def test_batched_drafter_commit_and_filter(family, accepted):
 @parametrize("nested", [False, True])
 def test_gemma_dspark_contract_and_attention(layout, nested):
     arch = module("speculative.drafters.gemma4_dspark.gemma4_dspark")
-    settings = models.values(
+    settings = values(
         "gemma_dspark",
         layer_types=[layout],
         rope_parameters={layout: dict(rope_theta=10000.0, rope_type="default")},
     )
-    draft = deepcopy(models.DATA["speculative"]["gemma_dspark_draft"])
+    draft = deepcopy(DATA["gemma_dspark_draft"])
     settings.update({"dflash_config": draft} if nested else draft)
     cfg = arch.ModelConfig.from_dict(settings)
     assert (cfg.model_type, cfg.backbone_model_type) == ("gemma4_dspark", "gemma4_text")
@@ -732,7 +976,7 @@ def test_deferred_acceptance(uniform, positioned, reject_first):
 @parametrize("family", ["glm4_moe_lite", "deepseek_v4"])
 def test_native_checkpoint_layouts(tmp_path, family):
     deepseek = family == "deepseek_v4"
-    cfg, weights = models.native_speculative_checkpoint(family)
+    cfg, weights = native_speculative_checkpoint(family)
     config, out, _ = split_checkpoint(
         tmp_path, cfg, weights, separate=deepseek, indexed=True
     )
@@ -947,11 +1191,22 @@ def test_wide_quantized_verifier(batch, length, bits):
 
 
 def test_glm_mtp_native_weight_fusion():
-    cfg = models.tiny_glm_text_config()
+    cfg = tiny_glm_text_config()
     arch = module("speculative.drafters.glm5_next_mtp")
-    weights = models.glm_mtp_checkpoint_weights(cfg)
+    shapes = deepcopy(DATA["glm_fusion_shapes"])
+    for expert in range(cfg.n_routed_experts):
+        for proj in ("gate", "up", "down"):
+            shapes[f"mlp.experts.{expert}.{proj}_proj"] = (
+                (16, 8) if proj == "down" else (8, 16)
+            )
+    weights = {
+        f"mtp_block.{key}.weight": mx.arange(prod(shape))
+        .reshape(shape)
+        .astype(mx.float32)
+        for key, shape in shapes.items()
+    }
     out = arch.Model.sanitize(NS(args=cfg), weights.copy())
-    expected = deepcopy(models.DATA["speculative"]["glm_fused_shapes"])
+    expected = deepcopy(DATA["glm_fused_shapes"])
     for key, shape in expected.items():
         assert out[f"mtp_block.{key}.weight"].shape == tuple(shape)
     equal(
@@ -1101,8 +1356,8 @@ def test_temporal_cache_boundaries_and_failed_transactions():
 @parametrize("batch", [1, 2])
 def test_glm_rejection_restores_draft_pool(batch):
     mx.random.seed(2127)
-    model, cfg = models.language("glm")
-    drafter = models.mtp_drafter("glm", cfg)
+    model, cfg = language("glm")
+    drafter = mtp_drafter("glm", cfg)
     drafter.eval()
     drafter.reset(model, left_padding=[0] * batch if batch > 1 else None)
     hidden = mx.random.normal((batch, 1, cfg.hidden_size))
@@ -1147,7 +1402,7 @@ def test_minimax_index_cache_rollback(ragged):
 
 @parametrize("batch", [1, 2])
 def test_chunked_prefill_retains_all_drafter_features(batch):
-    model, _ = models.language("deepseek")
+    model, _ = language("deepseek")
     model.eval()
     tokens = mx.array([[1, 2, 3, 4, 5, 6, 7]] * batch)
     drafter = NS(config=NS(target_layer_ids=[0]))
@@ -1220,9 +1475,7 @@ def test_chunked_verification_failure_restores_initial_cache():
 
 
 def test_qwen_quantized_cache_ragged_rollback():
-    model, cfg = models.language(
-        "qwen", hidden_size=64, intermediate_size=128, head_dim=32
-    )
+    model, cfg = language("qwen", hidden_size=64, intermediate_size=128, head_dim=32)
     recurrent = ArraysCache(2)
     recurrent.left_padding = mx.array([0, 0])
     kv = module("models.cache").BatchQuantizedKVCache([0, 0], group_size=32, bits=4)
@@ -1246,7 +1499,7 @@ def test_qwen_quantized_cache_ragged_rollback():
 
 def test_lfm_ragged_rollback_matches_committed_prefixes():
     mx.random.seed(5)
-    model = models.dflash_target("dspark-lfm2").language_model
+    model = dflash_target("dspark-lfm2").language_model
     prompt, verify = mx.array([[1, 2, 3, 4], [5, 6, 7, 8]]), mx.array(
         [[9, 10, 11, 12], [13, 14, 15, 16]]
     )
@@ -1274,9 +1527,9 @@ def test_lfm_ragged_rollback_matches_committed_prefixes():
 @parametrize("step", [1, 2, 5])
 def test_temporal_layers_commit_each_row_prefix(family, step):
     mx.random.seed(2127)
-    cfg = models.TEXT[family][1]()
+    cfg = TEXT[family][1]()
     cfg.linear_head_dim = cfg.linear_key_head_dim = cfg.linear_value_head_dim = 32
-    arch = module(f"models.{models.TEXT[family][0]}.language")
+    arch = module(f"models.{TEXT[family][0]}.language")
     layer = (
         arch.Glm5NextLinearAttention(cfg)
         if family == "glm"
@@ -1311,7 +1564,7 @@ def test_temporal_layers_commit_each_row_prefix(family, step):
 @parametrize("accepted", [1, 3, [0, 2]])
 def test_laguna_rollback_and_feature_capture(accepted):
     arch = module("models.laguna.language")
-    cfg = module("models.laguna.config").ModelConfig(**models.values("laguna"))
+    cfg = module("models.laguna.config").ModelConfig(**values("laguna"))
     model = arch.LanguageModel(cfg)
     caches = model.make_cache()
     out = model(
@@ -1334,7 +1587,7 @@ def test_laguna_rollback_and_feature_capture(accepted):
 
 @parametrize("from_anchor", [False, True])
 def test_dspark_samples_correct_proposal_positions(from_anchor):
-    drafter = models.dflash_drafter("dspark-qwen")
+    drafter = dflash_drafter("dspark-qwen")
     cfg = drafter.config
     cfg.sample_from_anchor = from_anchor
     drafter._hidden = Mock(
@@ -1361,7 +1614,7 @@ def test_local_mask_tracks_cache_width():
 
 
 def test_filter_batch_keeps_padding_and_positions():
-    drafter = models.mtp_drafter("qwen", models.tiny_qwen_text_config())
+    drafter = mtp_drafter("qwen", tiny_qwen_text_config())
     drafter.reset(
         NS(model=NS(embed_tokens=nn.Embedding(32, 16))), left_padding=[0, 1, 2]
     )

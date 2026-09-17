@@ -1,13 +1,47 @@
 # Speculative suite coverage
 
-## Refactor below 1,400 lines
+## Speculative setup stays with its tests
 
-The current refactor against `a1bbdca6` reduces `test_speculative.py` from
+Against `e345fc08`, speculative-only constructors, native checkpoint setup and
+transaction doubles move from `test_models.py` back into `test_speculative.py`.
+`dspark_source` and `glm_mtp_checkpoint_weights` are inline in their sole calling
+tests, as is the two-override `dimensions` wrapper. General model construction
+and the two DeepSeek/GLM config factories shared with training remain in
+`test_models.py`. The complete shared profiles move out of the speculative JSON
+section into `shared_configs`; their effective values are unchanged.
+
+This restores the file boundary rather than maintaining the earlier 1,400-line
+limit through relocation. No test, fixture or production module is added.
+
+| File | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `test_speculative.py` | 1,399 | 1,652 | +253 |
+| `test_models.py` | 929 | 664 | -265 |
+| `model_cases.json` | 2,294 | 2,305 | +11 |
+| **Combined** | **4,622** | **4,621** | **-1** |
+
+All **395 speculative cases across 48 test functions** remain. An AST comparison
+confirms unchanged assertions and parametrization after normalizing imported
+helper references. The targeted speculative/model/training run passes **530
+tests and eight subtests**. The full suite passes **1,762 tests, four skips and
+39 subtests**, with the same two dependency deprecation warnings as the baseline.
+
+Full-suite Python production coverage is **identical before and after: 80,999
+executed lines and 12,836 branch outcomes**, with no lost or added paths. Both
+runs use branch coverage over `mlx_vlm`, omit `mlx_vlm/tests/*`, exclude the manual
+`test_smoke.py` runner, disable downloads and apply a 90-second per-test timeout.
+These measurements exclude native kernels, subprocess execution and skipped
+optional checks. Black, isort, autoflake, pyflakes and whitespace checks pass.
+Earlier intentional test pruning remains documented below.
+
+## Earlier refactor below 1,400 lines
+
+The earlier refactor against `a1bbdca6` reduced `test_speculative.py` from
 **2,027 to 1,399 formatted lines**. Shared model construction, synthetic checkpoint
-tensors, and transaction doubles live in the existing `test_models.py`; training
-imports its two config factories directly from that module. Plain configuration
-and shape data use the existing `model_cases.json` under `speculative`. No new
-test or fixture files are added, and production code is unchanged.
+tensors, and transaction doubles were placed in `test_models.py`; training
+imported its two config factories from that module. Plain configuration and shape
+data used `model_cases.json` under `speculative`. The ownership correction above
+supersedes that layout. No production code changed.
 
 This is mainly a separation of reusable setup from assertions, not a 628-line
 reduction in the whole suite:
@@ -51,9 +85,9 @@ refactor.
 519-case module; the opt-in experiment and its separate report have been removed.
 Production code is unchanged. These measurements compare the compact suite with
 the previous suite at `5c3e00dc`, which remained unchanged through `bf85e718`.
-The measurements below were recorded at `88324690`. Shared configuration helpers
-now live directly in `test_speculative.py` and are also imported by training tests;
-the helper move preserves the test scenarios and assertions. The size breakdown
+The measurements below were recorded at `88324690`. At that stage, shared
+configuration helpers lived directly in `test_speculative.py` and were imported
+by training tests; the helper move preserved the test scenarios and assertions. The size breakdown
 below describes the earlier layout, and full-suite counts predate later pruning.
 
 ## Size and validation
