@@ -43,10 +43,14 @@ def validate_dflash_target(config, target_model, algorithm: str) -> None:
             f"{algorithm} target vocabulary mismatch: "
             f"draft={config.vocab_size}, target={vocab_size}."
         )
-    if not hasattr(language_model, "rollback_speculative_cache"):
+    has_rollback = callable(getattr(language_model, "rollback_speculative_cache", None))
+    has_transactional_verifier = callable(
+        getattr(language_model, "speculative_verify_dflash_hidden", None)
+    )
+    if not (has_rollback or has_transactional_verifier):
         raise ValueError(
-            f"{algorithm} target {type(language_model).__name__} does not expose "
-            "speculative cache rollback support."
+            f"{algorithm} target {type(language_model).__name__} exposes neither "
+            "architecture-specific rollback nor a transactional DFlash verifier."
         )
 
 
