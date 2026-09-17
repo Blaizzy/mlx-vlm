@@ -16,41 +16,6 @@ from mlx import nn
 from mlx.utils import tree_flatten
 from PIL import Image
 
-import mlx_vlm.models.bonsai.config as bonsai_config
-import mlx_vlm.models.bonsai.download as bonsai_download
-import mlx_vlm.models.bonsai.pipeline as bonsai_pipeline
-import mlx_vlm.models.ernie_image.config as ernie_config
-import mlx_vlm.models.ernie_image.convert as ernie_convert
-import mlx_vlm.models.ernie_image.download as ernie_download
-import mlx_vlm.models.ernie_image.model as ernie_model
-import mlx_vlm.models.ernie_image.pipeline as ernie_pipeline
-import mlx_vlm.models.ernie_image.text_encoder as ernie_text_encoder
-import mlx_vlm.models.ernie_image.transformer as ernie_transformer
-import mlx_vlm.models.ernie_image.weights as ernie_weights
-import mlx_vlm.models.flux2.config as flux_config
-import mlx_vlm.models.flux2.download as flux_download
-import mlx_vlm.models.flux2.model as flux_model
-import mlx_vlm.models.flux2.pipeline as flux_pipeline
-import mlx_vlm.models.flux2.vae as flux_vae
-import mlx_vlm.models.flux2.weights as flux_weights
-import mlx_vlm.models.ideogram4.config as ideogram_config
-import mlx_vlm.models.ideogram4.download as ideogram_download
-import mlx_vlm.models.ideogram4.pipeline as ideogram_pipeline
-import mlx_vlm.models.ideogram4.prompting as ideogram_prompting
-import mlx_vlm.models.ideogram4.transformer as ideogram_transformer
-import mlx_vlm.models.ideogram4.weights as ideogram_weights
-import mlx_vlm.models.mage_flow.config as mage_config
-import mlx_vlm.models.mage_flow.convert as mage_convert
-import mlx_vlm.models.mage_flow.download as mage_download
-import mlx_vlm.models.mage_flow.model as mage_model
-import mlx_vlm.models.mage_flow.scheduler as mage_scheduler
-import mlx_vlm.models.mage_flow.transformer as mage_transformer
-import mlx_vlm.models.mage_flow.weights as mage_weights
-import mlx_vlm.models.z_image.config as z_config
-import mlx_vlm.models.z_image.convert as z_convert
-import mlx_vlm.models.z_image.model as z_model
-import mlx_vlm.models.z_image.pipeline as z_pipeline
-import mlx_vlm.models.z_image.vae as z_vae
 from mlx_vlm.generate.edit_image import (
     ImageEditRequest,
     image_edit_model_class,
@@ -85,6 +50,24 @@ FAMILY_PREFIX = dict(
 
 def _family_module(family, component):
     return importlib.import_module(f"mlx_vlm.models.{family}.{component}")
+
+
+class _ModelFamily:
+    """Load a real model submodule when a behavioral check accesses it."""
+
+    def __init__(self, family):
+        self.family = family
+
+    def __getattr__(self, component):
+        return _family_module(self.family, component)
+
+
+bonsai = _ModelFamily("bonsai")
+flux = _ModelFamily("flux2")
+ideogram = _ModelFamily("ideogram4")
+z = _ModelFamily("z_image")
+ernie = _ModelFamily("ernie_image")
+mage = _ModelFamily("mage_flow")
 
 
 def _model_class(family, edit=False):
@@ -146,9 +129,9 @@ def _component_output(family, check, model):
             indicator=mx.array(
                 [
                     [
-                        ideogram_transformer.LLM_TOKEN_INDICATOR,
-                        ideogram_transformer.OUTPUT_IMAGE_INDICATOR,
-                        ideogram_transformer.OUTPUT_IMAGE_INDICATOR,
+                        ideogram.transformer.LLM_TOKEN_INDICATOR,
+                        ideogram.transformer.OUTPUT_IMAGE_INDICATOR,
+                        ideogram.transformer.OUTPUT_IMAGE_INDICATOR,
                     ]
                 ]
             ),
@@ -195,7 +178,7 @@ def test_image_model_contract(case):
         assert bool(mx.all(mx.isfinite(output)))
 
 
-EXPANDED_CAPTION = ideogram_prompting.format_caption(
+EXPANDED_CAPTION = ideogram.prompting.format_caption(
     {
         "high_level_description": "A detailed photo of a red cube.",
         "style_description": {
@@ -225,11 +208,11 @@ def _pipeline(family, **components):
 
 def _flux_edit_pipeline(
     variant: str = "flux2-klein-9b-kv",
-) -> flux_pipeline.Flux2ImageEdit:
-    pipeline = flux_pipeline.Flux2ImageEdit.__new__(flux_pipeline.Flux2ImageEdit)
-    pipeline.variant = flux_config.get_variant(variant)
+) -> flux.pipeline.Flux2ImageEdit:
+    pipeline = flux.pipeline.Flux2ImageEdit.__new__(flux.pipeline.Flux2ImageEdit)
+    pipeline.variant = flux.config.get_variant(variant)
     pipeline.model_path = None
-    pipeline.runtime_config = flux_pipeline.Flux2RuntimeConfig(tiled_vae="off")
+    pipeline.runtime_config = flux.pipeline.Flux2RuntimeConfig(tiled_vae="off")
     pipeline.tokenizer = type("Tokenizer", (), {"count_tokens": lambda self, text: 7})()
     pipeline.edit_array = lambda *args, **kwargs: mx.zeros((20, 24, 3), dtype=mx.uint8)
     return pipeline
@@ -269,15 +252,15 @@ class _RecordingPipeline:
             steps, guidance, shift = (
                 (50, 4.0, 6.0) if variant == "base" else (9, 0.0, 3.0)
             )
-            self.config = z_config.ZImageConfig(
+            self.config = z.config.ZImageConfig(
                 default_steps=steps,
                 default_guidance=guidance,
                 scheduler_shift=shift,
                 variant=variant,
             )
         elif family == "ernie_image":
-            self.variant = ernie_config.get_variant(variant)
-            self.runtime_config = ernie_pipeline.ErnieImageRuntimeConfig(
+            self.variant = ernie.config.get_variant(variant)
+            self.runtime_config = ernie.pipeline.ErnieImageRuntimeConfig(
                 use_prompt_enhancer=False
             )
         else:
@@ -370,11 +353,11 @@ class _ErnieVAE:
 
 def _ernie_runtime_pipeline(
     variant: str, *, evict: bool = False
-) -> ernie_pipeline.ErnieImagePipeline:
+) -> ernie.pipeline.ErnieImagePipeline:
     pipeline = _pipeline("ernie_image")
-    pipeline.variant = ernie_config.get_variant(variant)
+    pipeline.variant = ernie.config.get_variant(variant)
     pipeline.model_path = Path("/tmp/ernie")
-    pipeline.runtime_config = ernie_pipeline.ErnieImageRuntimeConfig(
+    pipeline.runtime_config = ernie.pipeline.ErnieImageRuntimeConfig(
         evict_text_encoder=False, evict_transformer=evict, use_prompt_enhancer=False
     )
     pipeline.tokenizer = SimpleNamespace(count_tokens=lambda prompt: len(prompt))
@@ -406,7 +389,7 @@ def _write_files(root, files=(), metadata=None):
 def _write_layout(root, family, *, turbo=True):
     components = ["transformer", "text_encoder", "vae"]
     if family == "bonsai":
-        files = list(bonsai_download.REQUIRED_FILES)
+        files = list(bonsai.download.REQUIRED_FILES)
     elif family == "ernie_image":
         files = [f"{c}/0.safetensors" for c in components] + [
             "tokenizer/tokenizer.json"
@@ -470,14 +453,14 @@ class _PackedVAE:
 def _packed_pipeline(family):
     cls, runtime, variant = {
         "bonsai": (
-            bonsai_pipeline.BonsaiImage,
-            bonsai_pipeline.BonsaiRuntimeConfig,
-            bonsai_config.get_variant("ternary"),
+            bonsai.pipeline.BonsaiImage,
+            bonsai.pipeline.BonsaiRuntimeConfig,
+            bonsai.config.get_variant("ternary"),
         ),
         "flux2": (
-            flux_pipeline.Flux2Image,
-            flux_pipeline.Flux2RuntimeConfig,
-            flux_config.get_variant("flux2-klein-4b"),
+            flux.pipeline.Flux2Image,
+            flux.pipeline.Flux2RuntimeConfig,
+            flux.config.get_variant("flux2-klein-4b"),
         ),
     }[family]
     pipeline = cls.__new__(cls)
@@ -554,11 +537,11 @@ def test_invalid_dimensions(family, width, height):
             pipeline.generate_array("prompt", width=width, height=height)
     else:
         config = dict(
-            bonsai=bonsai_config,
-            flux2=flux_config,
-            ideogram4=ideogram_config,
-            ernie_image=ernie_config,
-            mage_flow=mage_config,
+            bonsai=bonsai.config,
+            flux2=flux.config,
+            ideogram4=ideogram.config,
+            ernie_image=ernie.config,
+            mage_flow=mage.config,
         )[family]
         with pytest.raises(ValueError):
             config.validate_dimensions(width=width, height=height)
@@ -571,13 +554,13 @@ def test_invalid_dimensions(family, width, height):
 def test_model_download(monkeypatch, tmp_path, family, local):
     module, variant, repo = {
         "bonsai": (
-            bonsai_download,
+            bonsai.download,
             "ternary",
             "prism-ml/bonsai-image-ternary-4B-mlx-2bit",
         ),
-        "flux2": (flux_download, "flux2-klein-9b", "black-forest-labs/FLUX.2-klein-9B"),
+        "flux2": (flux.download, "flux2-klein-9b", "black-forest-labs/FLUX.2-klein-9B"),
         "mage_flow": (
-            mage_download,
+            mage.download,
             "mage-flow-turbo",
             "mage-flow-community/Mage-Flow-Turbo",
         ),
@@ -626,13 +609,13 @@ def test_quantized_weight_loading(family, mode, bits, group_size):
         dense = mx.arange(16 * 64, dtype=mx.float32).reshape(16, 64)
         arrays = mx.quantize(dense, **options)
         weights = dict(zip(["proj.weight", "proj.scales", "proj.biases"], arrays))
-        load = ernie_weights.apply_weights
+        load = ernie.weights.apply_weights
     else:
         model = _TinyLinear()
         quantized = _TinyLinear()
         nn.quantize(quantized, **options)
         weights = dict(tree_flatten(quantized.parameters()))
-        from mlx_vlm.models.z_image.weights import _apply_weights as load
+        load = z.weights._apply_weights
     loaded = load(model, weights, _quantization_metadata(mode, bits, group_size))
     assert loaded.quantization_config == options
     if family == "ernie_image":
@@ -642,7 +625,7 @@ def test_quantized_weight_loading(family, mode, bits, group_size):
 
 
 @pytest.mark.parametrize(
-    "convert", [ernie_convert, mage_convert], ids=["ernie_image", "mage_flow"]
+    "convert", [ernie.convert, mage.convert], ids=["ernie_image", "mage_flow"]
 )
 def test_incompatible_quantization_options(convert):
     with pytest.raises(ValueError, match="requires"):
@@ -719,10 +702,10 @@ def test_generation_model_dispatch(monkeypatch, tmp_path, family, aliases, probe
 @pytest.mark.parametrize(
     "family,module,missing",
     [
-        ("bonsai", bonsai_download, "transformer-packed-mflux"),
-        ("flux2", flux_download, "transformer"),
-        ("ideogram4", ideogram_download, "transformer"),
-        ("mage_flow", mage_download, "transformer"),
+        ("bonsai", bonsai.download, "transformer-packed-mflux"),
+        ("flux2", flux.download, "transformer"),
+        ("ideogram4", ideogram.download, "transformer"),
+        ("mage_flow", mage.download, "transformer"),
     ],
     ids=["bonsai", "flux2", "ideogram4", "mage_flow"],
 )
@@ -742,10 +725,10 @@ def test_missing_checkpoint_files(tmp_path, family, module, missing):
 @pytest.mark.parametrize(
     "family,module,method,repo",
     [
-        ("z_image", z_convert, "convert_z_image", "Tongyi-MAI/Z-Image-Turbo"),
+        ("z_image", z.convert, "convert_z_image", "Tongyi-MAI/Z-Image-Turbo"),
         (
             "ernie_image",
-            ernie_convert,
+            ernie.convert,
             "convert_ernie_image",
             "baidu/ERNIE-Image-Turbo",
         ),
@@ -814,19 +797,19 @@ def test_local_variant_precedence(tmp_path, family, override, expected):
 
 
 def test_bonsai_variant_aliases_are_ternary_only():
-    assert bonsai_config.get_variant("bonsai").precision == "2bit"
-    assert bonsai_config.get_variant("bonsai-ternary").name == "ternary"
+    assert bonsai.config.get_variant("bonsai").precision == "2bit"
+    assert bonsai.config.get_variant("bonsai-ternary").name == "ternary"
     assert (
-        bonsai_config.get_variant("prism-ml/bonsai-image-ternary-4B-mlx-2bit").name
+        bonsai.config.get_variant("prism-ml/bonsai-image-ternary-4B-mlx-2bit").name
         == "ternary"
     )
     with pytest.raises(ValueError, match="Unknown Bonsai variant"):
-        bonsai_config.get_variant("binary")
+        bonsai.config.get_variant("binary")
 
 
 def test_bonsai_parse_size():
-    assert bonsai_config.parse_size("1248x832") == (1248, 832)
-    assert bonsai_config.parse_size("832x1248") == (832, 1248)
+    assert bonsai.config.parse_size("1248x832") == (1248, 832)
+    assert bonsai.config.parse_size("832x1248") == (832, 1248)
 
 
 def test_flux2_remote_component_index_is_a_metadata_fallback(monkeypatch, tmp_path):
@@ -853,7 +836,7 @@ def test_flux2_remote_component_index_is_a_metadata_fallback(monkeypatch, tmp_pa
 
     assert (
         image_generation_model_class("example/custom-quantized-model")
-        is flux_model.Flux2ImageGenerationModel
+        is flux.model.Flux2ImageGenerationModel
     )
     assert calls == [
         ["model_index.json", "config.json", "manifest.json", "**/config.json"],
@@ -875,9 +858,9 @@ def test_flux2_text_encoder_accepts_native_quantized_keys(monkeypatch, tmp_path)
 
     dense = mx.arange(4 * 64, dtype=mx.float32).reshape(4, 64)
     packed, scales, biases = mx.quantize(dense, group_size=32, bits=8)
-    monkeypatch.setattr(flux_weights, "Qwen3TextEncoder", TinyTextEncoder)
+    monkeypatch.setattr(flux.weights, "Qwen3TextEncoder", TinyTextEncoder)
     monkeypatch.setattr(
-        flux_weights,
+        flux.weights,
         "_load_safetensors",
         lambda directory: (  # noqa: ARG005
             {
@@ -889,8 +872,8 @@ def test_flux2_text_encoder_accepts_native_quantized_keys(monkeypatch, tmp_path)
         ),
     )
 
-    model = flux_weights.load_text_encoder(
-        tmp_path, flux_config.get_variant("flux2-klein-4b")
+    model = flux.weights.load_text_encoder(
+        tmp_path, flux.config.get_variant("flux2-klein-4b")
     )
 
     assert isinstance(model.embed_tokens, nn.QuantizedEmbedding)
@@ -944,7 +927,7 @@ def test_flux2_quantized_repo_routes_through_resolved_layout(monkeypatch, tmp_pa
 
     monkeypatch.setattr(image_module, "get_model_path", fake_get_model_path)
     monkeypatch.setattr(
-        flux_pipeline.Flux2ImageEdit,
+        flux.pipeline.Flux2ImageEdit,
         "from_pretrained",
         classmethod(fake_from_pretrained),
     )
@@ -961,7 +944,7 @@ def test_flux2_quantized_repo_routes_through_resolved_layout(monkeypatch, tmp_pa
 
 def test_flux2_reference_image_array_keeps_float32_input():
     image = Image.new("RGB", (1, 1), color=(255, 127, 0))
-    array = flux_pipeline._reference_image_array(image)
+    array = flux.pipeline._reference_image_array(image)
 
     assert array.dtype == mx.float32
     assert np.array(array).shape == (1, 3, 1, 1)
@@ -969,17 +952,17 @@ def test_flux2_reference_image_array_keeps_float32_input():
 
 def test_ideogram4_variant_resolution_is_exact():
     assert (
-        ideogram_config.get_variant(ideogram_config.IDEOGRAM_4_FP8_REPO_ID).repo_id
-        == ideogram_config.IDEOGRAM_4_FP8_REPO_ID
+        ideogram.config.get_variant(ideogram.config.IDEOGRAM_4_FP8_REPO_ID).repo_id
+        == ideogram.config.IDEOGRAM_4_FP8_REPO_ID
     )
 
     for shorthand in ("ideogram4", "ideogram-4", "ideogram-4-fp8"):
         with pytest.raises(ValueError):
-            ideogram_config.get_variant(shorthand)
+            ideogram.config.get_variant(shorthand)
 
 
 def test_ideogram4_plain_prompt_wraps_as_minimal_json_caption():
-    prepared = ideogram_prompting.normalize_prompt(
+    prepared = ideogram.prompting.normalize_prompt(
         "A red cube on a marble plinth.", warn=False
     )
     caption = json.loads(prepared.text)
@@ -991,11 +974,11 @@ def test_ideogram4_plain_prompt_wraps_as_minimal_json_caption():
     assert caption["compositional_deconstruction"]["elements"] == [
         {"type": "obj", "desc": "A red cube on a marble plinth."}
     ]
-    assert ideogram_prompting.is_structured_caption(prepared.text)
+    assert ideogram.prompting.is_structured_caption(prepared.text)
 
 
 def test_ideogram4_caption_warnings_cover_elements_and_bounding_boxes():
-    prompt = ideogram_prompting.format_caption(
+    prompt = ideogram.prompting.format_caption(
         {
             "compositional_deconstruction": {
                 "background": "A studio.",
@@ -1007,7 +990,7 @@ def test_ideogram4_caption_warnings_cover_elements_and_bounding_boxes():
     )
 
     with pytest.warns(UserWarning) as records:
-        prepared = ideogram_prompting.normalize_prompt(prompt)
+        prepared = ideogram.prompting.normalize_prompt(prompt)
 
     messages = [str(record.message) for record in records]
     assert not prepared.is_structured_caption
@@ -1029,7 +1012,7 @@ def test_ideogram4_prompt_expansion_uses_structured_generation(monkeypatch):
         (dispatch_module, "generate", generate),
     ]:
         monkeypatch.setattr(module, name, replacement)
-    result = ideogram_prompting.generate_prompt_expansion_caption(
+    result = ideogram.prompting.generate_prompt_expansion_caption(
         "A red cube.", model="tiny-text-model", aspect_ratio="1:1"
     )
     load.assert_called_once_with("tiny-text-model")
@@ -1039,7 +1022,7 @@ def test_ideogram4_prompt_expansion_uses_structured_generation(monkeypatch):
     assert "visible wording" in messages[0]["content"]
     assert "do not add an aspect_ratio field" in messages[1]["content"]
     schema.assert_called_once_with(
-        tokenizer, ideogram_prompting.IDEOGRAM4_CAPTION_SCHEMA
+        tokenizer, ideogram.prompting.IDEOGRAM4_CAPTION_SCHEMA
     )
     assert generate.call_args.args == (model, processor, "formatted prompt")
     assert generate.call_args.kwargs["logits_processors"] == [logits_processor]
@@ -1055,7 +1038,7 @@ def test_ideogram4_dequantizes_weight_only_fp8():
         "linear.bias": mx.array([1.0, -1.0], dtype=mx.float32),
     }
 
-    converted = ideogram_weights.dequantize_fp8_weight_only(raw, precision=mx.float32)
+    converted = ideogram.weights.dequantize_fp8_weight_only(raw, precision=mx.float32)
 
     assert "linear.weight_scale" not in converted
     np.testing.assert_allclose(
@@ -1076,18 +1059,18 @@ def test_ideogram4_build_inputs_packs_text_and_image_tokens():
     assert inputs["position_ids"].shape == (1, 3 + 16 * 16, 3)
     assert (
         int(inputs["indicator"][0, 0].item())
-        == ideogram_transformer.LLM_TOKEN_INDICATOR
+        == ideogram.transformer.LLM_TOKEN_INDICATOR
     )
     assert (
         int(inputs["indicator"][0, -1].item())
-        == ideogram_transformer.OUTPUT_IMAGE_INDICATOR
+        == ideogram.transformer.OUTPUT_IMAGE_INDICATOR
     )
 
 
 def test_ideogram4_pipeline_uses_prepared_prompt_and_reports_metadata():
     pipeline = _pipeline("ideogram4")
     pipeline.model_path = Path("/tmp/fake-ideogram")
-    pipeline.runtime_config = ideogram_pipeline.Ideogram4RuntimeConfig(
+    pipeline.runtime_config = ideogram.pipeline.Ideogram4RuntimeConfig(
         evict_text_encoder=False, evict_transformers=False
     )
     pipeline.text_encoder = object()
@@ -1096,7 +1079,7 @@ def test_ideogram4_pipeline_uses_prepared_prompt_and_reports_metadata():
     pipeline.vae = object()
 
     pipeline.prepare_prompt = MagicMock(
-        return_value=ideogram_prompting.NormalizedPrompt(
+        return_value=ideogram.prompting.NormalizedPrompt(
             text=EXPANDED_CAPTION,
             is_json_caption=True,
             is_structured_caption=True,
@@ -1155,16 +1138,16 @@ def test_ideogram4_decode_uses_ideogram_latent_norm_path():
 
 def test_detects_diffusers_z_image_model_index(tmp_path):
     (tmp_path / "model_index.json").write_text('{"_class_name":"ZImagePipeline"}')
-    assert z_convert.is_z_image_model_path(tmp_path)
+    assert z.convert.is_z_image_model_path(tmp_path)
     (tmp_path / "model_index.json").write_text('{"_class_name":"FluxPipeline"}')
-    assert not z_convert.is_z_image_model_path(tmp_path)
+    assert not z.convert.is_z_image_model_path(tmp_path)
 
 
 @pytest.mark.parametrize(
     "steps,strength,expected", [(9, 0.6, 3), (9, 0.5, 4), (8, 0.6, 3), (8, 0.3, 5)]
 )
 def test_z_image_img2img_start_index_matches_diffusers(steps, strength, expected):
-    assert z_pipeline._img2img_start_index(steps, strength) == expected
+    assert z.pipeline._img2img_start_index(steps, strength) == expected
 
 
 def test_z_image_generation_evicts_components_before_reloading_encoder(
@@ -1196,8 +1179,8 @@ def test_z_image_generation_evicts_components_before_reloading_encoder(
 
 
 def test_z_image_rejects_classifier_free_guidance():
-    model = object.__new__(z_model.ZImageGenerationModel)
-    model.pipeline = SimpleNamespace(config=z_config.ZImageConfig())
+    model = object.__new__(z.model.ZImageGenerationModel)
+    model.pipeline = SimpleNamespace(config=z.config.ZImageConfig())
     with pytest.raises(ValueError, match="does not support classifier-free guidance"):
         model.generate(ImageGenerationRequest(prompt="test", guidance=2.0))
 
@@ -1210,7 +1193,7 @@ def test_z_image_config_detects_base_variant(tmp_path):
         "scheduler/scheduler_config.json": {"shift": 6.0},
     }
     _write_files(tmp_path, metadata=configs)
-    config = z_config.ZImageConfig.from_model_path(tmp_path)
+    config = z.config.ZImageConfig.from_model_path(tmp_path)
     assert config.variant == "base"
     assert config.default_steps == 50
     assert config.default_guidance == 4.0
@@ -1235,16 +1218,16 @@ def test_weight_key_sanitization(case):
 
 def test_z_image_sanitize_vae_weights():
     conv = mx.zeros((8, 4, 3, 3))
-    sanitized = z_vae.sanitize_vae_weights(
+    sanitized = z.vae.sanitize_vae_weights(
         {"encoder.conv_in.weight": conv, "decoder.conv_norm_out.weight": mx.zeros((8,))}
     )
     assert sanitized["encoder.conv_in.weight"].shape == (8, 3, 3, 4)
     assert "decoder.conv_norm_out.weight" in sanitized
 
-    native = z_vae.sanitize_vae_weights({"encoder.conv_in.conv2d.weight": conv})
+    native = z.vae.sanitize_vae_weights({"encoder.conv_in.conv2d.weight": conv})
     assert set(native) == {"encoder.conv_in.weight"}
 
-    converted = z_vae.sanitize_vae_weights(sanitized, source_layout=False)
+    converted = z.vae.sanitize_vae_weights(sanitized, source_layout=False)
     assert mx.array_equal(
         converted["encoder.conv_in.weight"], sanitized["encoder.conv_in.weight"]
     )
@@ -1258,7 +1241,7 @@ def test_z_image_conversion_preserves_native_vae_layout(tmp_path):
         json.dumps({"metadata": {"mlx_vlm_format": "z_image"}})
     )
 
-    converted = z_convert._sanitize_vae_for_conversion(
+    converted = z.convert._sanitize_vae_for_conversion(
         vae_path, {"encoder.conv_in.weight": native}
     )
 
@@ -1270,7 +1253,7 @@ def test_z_image_saved_affine_metadata_marks_native_layout(tmp_path):
 
     model = _TinyLinear()
     nn.quantize(model, group_size=64, bits=4, mode="affine")
-    z_convert._save_component(
+    z.convert._save_component(
         tmp_path,
         "transformer",
         model,
@@ -1301,13 +1284,13 @@ def test_ernie_dispatches_from_weight_index(tmp_path):
     )
     assert (
         image_generation_model_class(tmp_path.as_posix())
-        is ernie_model.ErnieImageGenerationModel
+        is ernie.model.ErnieImageGenerationModel
     )
 
 
 def test_ernie_layout_accepts_mflux_checkpoint_without_configs(tmp_path):
     _write_layout(tmp_path, "ernie_image")
-    assert ernie_download.validate_model_layout(tmp_path) == tmp_path
+    assert ernie.download.validate_model_layout(tmp_path) == tmp_path
 
 
 def test_ernie_layout_requires_complete_prompt_enhancer(tmp_path):
@@ -1315,11 +1298,11 @@ def test_ernie_layout_requires_complete_prompt_enhancer(tmp_path):
     (tmp_path / "pe" / "model.safetensors").parent.mkdir()
     (tmp_path / "pe" / "model.safetensors").write_bytes(b"x")
     with pytest.raises(FileNotFoundError, match="pe_tokenizer"):
-        ernie_download.validate_model_layout(tmp_path)
+        ernie.download.validate_model_layout(tmp_path)
 
 
 def test_ernie_image_transformer_config_parses_official_fields():
-    config = ernie_config.ErnieImageTransformerConfig.from_dict(
+    config = ernie.config.ErnieImageTransformerConfig.from_dict(
         {
             "_class_name": "ErnieImageTransformer2DModel",
             "hidden_size": 32,
@@ -1343,7 +1326,7 @@ def test_ernie_rope_matches_reference_hybrid_convention():
     angles = np.concatenate(angles, axis=-1)
     angles = np.stack([angles, angles], axis=-1).reshape(1, 2, 1, 8)
 
-    cos, sin = ernie_transformer.rope_frequencies(
+    cos, sin = ernie.transformer.rope_frequencies(
         mx.array(ids), axes_dim=axes, theta=256.0
     )
     np.testing.assert_allclose(
@@ -1358,7 +1341,7 @@ def test_ernie_rope_matches_reference_hybrid_convention():
         [-np.array(values)[..., 4:], np.array(values)[..., :4]], axis=-1
     )
     np.testing.assert_array_equal(
-        np.array(ernie_transformer.rotate_half(values)), expected_rotated
+        np.array(ernie.transformer.rotate_half(values)), expected_rotated
     )
 
 
@@ -1375,8 +1358,8 @@ def test_ernie_image_conditioning_skips_last_text_block_and_final_norm():
         def __call__(self, hidden_states):
             return hidden_states * 10
 
-    encoder = ernie_text_encoder.ErnieImageTextEncoder(
-        ernie_text_encoder.ErnieImageTextConfig(
+    encoder = ernie.text_encoder.ErnieImageTextEncoder(
+        ernie.text_encoder.ErnieImageTextConfig(
             vocab_size=4,
             hidden_size=2,
             intermediate_size=4,
@@ -1401,7 +1384,7 @@ def test_ernie_image_conditioning_skips_last_text_block_and_final_norm():
 def test_ernie_image_pad_text_preserves_cfg_order_and_lengths():
     negative = mx.ones((1, 1, 2))
     positive = mx.full((1, 3, 2), 2)
-    padded, lengths = ernie_pipeline._pad_text([negative, positive])
+    padded, lengths = ernie.pipeline._pad_text([negative, positive])
     assert tuple(padded.shape) == (2, 3, 2)
     np.testing.assert_array_equal(np.array(lengths), [1, 3])
     np.testing.assert_array_equal(np.array(padded[0, 1:]), np.zeros((2, 2)))
@@ -1410,7 +1393,7 @@ def test_ernie_image_pad_text_preserves_cfg_order_and_lengths():
 def test_ernie_weight_sanitizers_and_layouts():
     native = mx.zeros((8, 1, 1, 4))
     source = native.transpose(0, 3, 1, 2)
-    sanitized = ernie_weights.sanitize_transformer_weights(
+    sanitized = ernie.weights.sanitize_transformer_weights(
         {
             "adaLN_modulation.1.weight": mx.zeros((6, 4)),
             "layers.0.self_attention.to_out.0.weight": mx.zeros((4, 4)),
@@ -1426,7 +1409,7 @@ def test_ernie_weight_sanitizers_and_layouts():
     assert "layers.0.self_attention.to_out.weight" in sanitized
     assert sanitized["x_embedder.proj.weight"].shape == native.shape
     assert (
-        ernie_weights.match_conv_layout(
+        ernie.weights.match_conv_layout(
             native, target_shape=tuple(native.shape), key="conv.weight"
         ).shape
         == native.shape
@@ -1434,12 +1417,12 @@ def test_ernie_weight_sanitizers_and_layouts():
 
 
 def test_ernie_image_conversion_quantizes_compatible_vae_attention():
-    vae = flux_vae.Flux2VAE(
+    vae = flux.vae.Flux2VAE(
         decoder_block_out_channels=(32, 32),
         include_encoder=True,
         encoder_block_out_channels=(32, 32),
     )
-    ernie_convert._quantize_component(
+    ernie.convert._quantize_component(
         vae,
         {"mode": "mxfp8", "group_size": 32, "bits": 8},
         lambda path, module: hasattr(module, "to_quantized"),
@@ -1467,13 +1450,12 @@ def test_generation_request_converts_to_edit_request():
 def test_ernie_edit_model_defaults_prompt_enhancer_off(
     monkeypatch,
 ):
-    import mlx_vlm.models.ernie_image.model as ernie_model
 
     captured: dict[str, object] = {}
 
     class _StubPipeline:
         def __init__(self) -> None:
-            self.variant = ernie_config.get_variant("ernie-image-turbo")
+            self.variant = ernie.config.get_variant("ernie-image-turbo")
             self.model_path = Path("/tmp/ernie")
 
         @classmethod
@@ -1481,10 +1463,10 @@ def test_ernie_edit_model_defaults_prompt_enhancer_off(
             captured["use_prompt_enhancer"] = kwargs.get("use_prompt_enhancer")
             return cls()
 
-    monkeypatch.setattr(ernie_model, "ErnieImagePipeline", _StubPipeline)
-    ernie_model.ErnieImageEditModel.from_model_id("ernie-image-turbo")
+    monkeypatch.setattr(ernie.model, "ErnieImagePipeline", _StubPipeline)
+    ernie.model.ErnieImageEditModel.from_model_id("ernie-image-turbo")
     assert captured["use_prompt_enhancer"] is False
-    ernie_model.ErnieImageEditModel.from_model_id(
+    ernie.model.ErnieImageEditModel.from_model_id(
         "ernie-image-turbo", use_prompt_enhancer=True
     )
     assert captured["use_prompt_enhancer"] is True
@@ -1492,7 +1474,7 @@ def test_ernie_edit_model_defaults_prompt_enhancer_off(
 
 def test_ernie_image_prompt_cache_evicts_least_recently_used_entry():
     pipeline = _pipeline("ernie_image")
-    pipeline.runtime_config = ernie_pipeline.ErnieImageRuntimeConfig(
+    pipeline.runtime_config = ernie.pipeline.ErnieImageRuntimeConfig(
         prompt_cache_size=2
     )
     pipeline.prompt_cache = OrderedDict()
@@ -1541,7 +1523,7 @@ def test_ernie_image_img2img_uses_strength_to_select_denoising_steps(
 def test_ernie_image_edit_auto_size_preserves_aspect_ratio(tmp_path, size, expected):
     image_path = tmp_path / "source.png"
     Image.new("RGB", size, color="navy").save(image_path)
-    _, width, height = ernie_pipeline._load_edit_image(
+    _, width, height = ernie.pipeline._load_edit_image(
         image_path, width=None, height=None
     )
     assert (width, height) == expected
@@ -1549,7 +1531,7 @@ def test_ernie_image_edit_auto_size_preserves_aspect_ratio(tmp_path, size, expec
 
 def test_ernie_image_img2img_rejects_decoder_only_converted_vae():
     with pytest.raises(ValueError, match="VAE encoder weights"):
-        ernie_weights._require_vae_encoder_weights(
+        ernie.weights._require_vae_encoder_weights(
             {"decoder.conv_in.weight": mx.zeros((1,))},
             target_shapes={
                 "encoder.conv_in.weight": (2, 3, 3, 3),
@@ -1565,7 +1547,7 @@ def test_ernie_image_conversion_detects_decoder_only_vae_index(tmp_path):
         (["encoder.conv_in.weight", "quant_conv.weight"], True),
     ]:
         _weight_index(tmp_path / "vae", keys)
-        assert ernie_convert._vae_checkpoint_has_encoder(tmp_path) is expected
+        assert ernie.convert._vae_checkpoint_has_encoder(tmp_path) is expected
 
 
 def test_ernie_image_prompt_enhancement_auto_detects_optional_components(
@@ -1578,14 +1560,14 @@ def test_ernie_image_prompt_enhancement_auto_detects_optional_components(
     (tmp_path / "pe" / "model.safetensors").write_bytes(b"x")
     (tmp_path / "pe_tokenizer").mkdir()
     (tmp_path / "pe_tokenizer" / "tokenizer.json").write_text("{}")
-    pipeline.runtime_config = ernie_pipeline.ErnieImageRuntimeConfig(
+    pipeline.runtime_config = ernie.pipeline.ErnieImageRuntimeConfig(
         use_prompt_enhancer=None
     )
     assert pipeline._should_enhance_prompt()
     # Auto-detected enhancement applies to generation only: img2img needs the
     # source-aware prompt preserved unless callers explicitly opt in.
     assert not pipeline._should_enhance_prompt(for_edit=True)
-    pipeline.runtime_config = ernie_pipeline.ErnieImageRuntimeConfig(
+    pipeline.runtime_config = ernie.pipeline.ErnieImageRuntimeConfig(
         use_prompt_enhancer=True
     )
     assert pipeline._should_enhance_prompt(for_edit=True)
@@ -1593,12 +1575,12 @@ def test_ernie_image_prompt_enhancement_auto_detects_optional_components(
 
 def test_ernie_image_conversion_detection_and_layout_metadata(tmp_path):
     _write_layout(tmp_path, "ernie_image")
-    assert ernie_convert.is_ernie_image_checkpoint(tmp_path)
-    assert ernie_convert._source_layout(tmp_path) == "mlx_nhwc"
+    assert ernie.convert.is_ernie_image_checkpoint(tmp_path)
+    assert ernie.convert._source_layout(tmp_path) == "mlx_nhwc"
     output = tmp_path / "output"
     for component in ("transformer", "text_encoder", "vae"):
         (output / component).mkdir(parents=True, exist_ok=True)
-    ernie_convert._write_missing_configs(output)
+    ernie.convert._write_missing_configs(output)
     assert (
         json.loads((output / "transformer" / "config.json").read_text())["_class_name"]
         == "ErnieImageTransformer2DModel"
@@ -1613,7 +1595,7 @@ def test_mage_flow_load_prefers_local_metadata(tmp_path):
     _write_layout(tmp_path, "mage_flow")
     (tmp_path / "mlx_mage_flow.json").write_text('{"variant":"mage-flow-edit-turbo"}')
     assert (
-        mage_model._resolve_load_variant("community/custom-name", tmp_path).name
+        mage.model._resolve_load_variant("community/custom-name", tmp_path).name
         == "mage-flow-edit-turbo"
     )
 
@@ -1623,11 +1605,11 @@ def test_mage_flow_local_variant_uses_cache_parent_name(tmp_path):
         tmp_path / "models--microsoft--Mage-Flow-Edit-Turbo" / "snapshots" / "hash"
     )
     _write_layout(snapshot, "mage_flow")
-    assert mage_config.variant_from_local_path(snapshot).name == "mage-flow-edit-turbo"
+    assert mage.config.variant_from_local_path(snapshot).name == "mage-flow-edit-turbo"
 
 
 def test_mage_flow_scheduler_matches_static_shift():
-    scheduler = mage_scheduler.FlowMatchEulerDiscreteScheduler(
+    scheduler = mage.scheduler.FlowMatchEulerDiscreteScheduler(
         num_inference_steps=4, shift=6.0
     )
     expected = np.array([1.0, 4.5 / 4.75, 3.0 / 3.5, 1.5 / 2.25, 0.0])
@@ -1635,7 +1617,7 @@ def test_mage_flow_scheduler_matches_static_shift():
 
 
 def test_mage_flow_rope_covers_target_and_references():
-    cosine, sine = mage_transformer.image_rope_frequencies(
+    cosine, sine = mage.transformer.image_rope_frequencies(
         [(1, 2, 3), (1, 2, 3)], axes_dim=(2, 2, 4)
     )
     assert cosine.shape == (12, 4)
@@ -1645,7 +1627,7 @@ def test_mage_flow_rope_covers_target_and_references():
 
 
 def test_mage_flow_weight_sanitizers():
-    vae = mage_weights.sanitize_vae_weights(
+    vae = mage.weights.sanitize_vae_weights(
         {
             "student.dconv_encoder.blocks.0.ca.1.weight": mx.zeros((2, 2, 1, 1)),
             "pipeline.dec_net.res_blocks.0.mlp.2.weight": mx.zeros((2, 2)),
@@ -1661,7 +1643,7 @@ def test_mage_flow_weight_sanitizers():
 
 def test_mage_flow_native_vae_layout_is_not_transposed():
     weight = mx.zeros((2, 3, 3, 4))
-    sanitized = mage_weights.sanitize_vae_weights(
+    sanitized = mage.weights.sanitize_vae_weights(
         {"decoder_model.conv_in.weight": weight}, source_layout="mlx_nhwc"
     )
     assert sanitized["decoder_model.conv_in.weight"].shape == weight.shape
@@ -1675,8 +1657,8 @@ def test_mage_flow_quantizes_only_compatible_layers():
             self.incompatible = nn.Linear(63, 32, bias=False)
 
     model = TinyModel()
-    config = mage_convert._quantization_parameters("affine", 64, 4)
-    mage_convert._quantize_component(model, config)
+    config = mage.convert._quantization_parameters("affine", 64, 4)
+    mage.convert._quantize_component(model, config)
     assert isinstance(model.compatible, nn.QuantizedLinear)
     assert isinstance(model.incompatible, nn.Linear)
     assert model.quantization_config == config
@@ -1684,24 +1666,24 @@ def test_mage_flow_quantizes_only_compatible_layers():
 
 def test_mage_flow_quantization_skips_sensitive_transformer_layers():
     module = nn.Linear(64, 32, bias=False)
-    assert mage_convert._transformer_quantization_predicate(
+    assert mage.convert._transformer_quantization_predicate(
         "transformer_blocks.0.attn.to_q", module
     )
-    assert not mage_convert._transformer_quantization_predicate(
+    assert not mage.convert._transformer_quantization_predicate(
         "transformer_blocks.0.img_mod.linear", module
     )
-    assert not mage_convert._transformer_quantization_predicate(
+    assert not mage.convert._transformer_quantization_predicate(
         "transformer_blocks.0.txt_mod.linear", module
     )
-    assert not mage_convert._transformer_quantization_predicate("proj_out", module)
+    assert not mage.convert._transformer_quantization_predicate("proj_out", module)
 
 
 def test_mage_flow_saved_quantization_metadata(tmp_path):
 
     model = _TinyLinear()
-    config = mage_convert._quantization_parameters("affine", 64, 4)
-    mage_convert._quantize_component(model, config)
-    mage_convert._save_component(tmp_path, model, config)
+    config = mage.convert._quantization_parameters("affine", 64, 4)
+    mage.convert._quantize_component(model, config)
+    mage.convert._save_component(tmp_path, model, config)
 
     index = json.loads((tmp_path / "model.safetensors.index.json").read_text())
     assert index["metadata"]["mlx_vlm_format"] == "mage_flow"
@@ -1709,8 +1691,8 @@ def test_mage_flow_saved_quantization_metadata(tmp_path):
     component_config = json.loads((tmp_path / "config.json").read_text())
     assert component_config["quantization"] == config
     assert component_config["quantization_config"] == config
-    weights, metadata = mage_weights._load_safetensors(tmp_path)
-    loaded = mage_weights._apply_weights(
+    weights, metadata = mage.weights._load_safetensors(tmp_path)
+    loaded = mage.weights._apply_weights(
         _TinyLinear(), weights, {**component_config, **metadata}
     )
     assert isinstance(loaded.proj, nn.QuantizedLinear)
@@ -1722,7 +1704,7 @@ def test_mage_flow_quantized_weights_require_config():
     quantized = _TinyLinear()
     nn.quantize(quantized, group_size=64, bits=4, mode="affine")
     with pytest.raises(ValueError, match="quantization mode"):
-        mage_weights._apply_weights(
+        mage.weights._apply_weights(
             _TinyLinear(), dict(tree_flatten(quantized.parameters())), {}
         )
 
@@ -1730,14 +1712,14 @@ def test_mage_flow_quantized_weights_require_config():
 def test_mage_flow_conversion_rejects_output_inside_source(tmp_path):
     _write_layout(tmp_path, "mage_flow")
     with pytest.raises(ValueError, match="inside its source"):
-        mage_convert.convert_mage_flow(tmp_path, tmp_path / "converted")
+        mage.convert.convert_mage_flow(tmp_path, tmp_path / "converted")
 
 
 def test_mage_flow_conversion_rejects_ambiguous_local_variant(tmp_path):
     _write_layout(tmp_path, "mage_flow")
     output = tmp_path.parent / f"{tmp_path.name}-converted"
     with pytest.raises(ValueError, match="--variant"):
-        mage_convert.convert_mage_flow(tmp_path, output)
+        mage.convert.convert_mage_flow(tmp_path, output)
 
 
 def test_mage_flow_conversion_prefers_source_id_variant(monkeypatch, tmp_path):
@@ -1753,11 +1735,11 @@ def test_mage_flow_conversion_prefers_source_id_variant(monkeypatch, tmp_path):
         ("vae", component),
     ]:
         monkeypatch.setattr(
-            mage_convert, "load_" + name, MagicMock(return_value=result)
+            mage.convert, "load_" + name, MagicMock(return_value=result)
         )
-    monkeypatch.setattr(mage_convert, "_cast_component", lambda model, dtype: None)
+    monkeypatch.setattr(mage.convert, "_cast_component", lambda model, dtype: None)
     monkeypatch.setattr(
-        mage_convert,
+        mage.convert,
         "_save_component",
         lambda directory, model, quantization: directory.mkdir(
             parents=True, exist_ok=True
@@ -1765,7 +1747,7 @@ def test_mage_flow_conversion_prefers_source_id_variant(monkeypatch, tmp_path):
     )
 
     output = tmp_path.parent / f"{tmp_path.name}-converted"
-    mage_convert.convert_mage_flow(
+    mage.convert.convert_mage_flow(
         tmp_path, output, source_id="mage-flow-community/Mage-Flow-Edit-Turbo"
     )
     metadata = json.loads((output / "mlx_mage_flow.json").read_text())
@@ -1774,24 +1756,24 @@ def test_mage_flow_conversion_prefers_source_id_variant(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("case", ["expand", "structured", "invalid"])
 def test_ideogram_prompt_expansion_policy(monkeypatch, case):
-    failure = ideogram_prompting.PromptExpansionCaptionError("bad json")
+    failure = ideogram.prompting.PromptExpansionCaptionError("bad json")
     expand = MagicMock(
-        return_value=ideogram_prompting.PromptExpansionResult(
+        return_value=ideogram.prompting.PromptExpansionResult(
             text=EXPANDED_CAPTION, raw_text=EXPANDED_CAPTION, model="tiny-text-model"
         ),
         side_effect=failure if case == "invalid" else None,
     )
-    monkeypatch.setattr(ideogram_prompting, "generate_prompt_expansion_caption", expand)
+    monkeypatch.setattr(ideogram.prompting, "generate_prompt_expansion_caption", expand)
     if case == "invalid":
         with pytest.warns(UserWarning, match="falling back"):
-            result = ideogram_prompting.prepare_prompt(
+            result = ideogram.prompting.prepare_prompt(
                 "A red cube.", prompt_expansion_model="bad-model"
             )
         assert result.was_wrapped and not result.prompt_expansion_used
         assert result.prompt_expansion_error == "bad json"
     else:
         prompt = EXPANDED_CAPTION if case == "structured" else "A red cube."
-        result = ideogram_prompting.prepare_prompt(
+        result = ideogram.prompting.prepare_prompt(
             prompt,
             prompt_expansion_model="tiny-text-model",
             width=1024,

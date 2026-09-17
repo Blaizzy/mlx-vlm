@@ -98,6 +98,10 @@ Requests, expected result fields, forwarded arguments, and metadata belong in
 conventions, and checks the results. No references or executable expressions are
 needed in JSON.
 
+Behavioral checks use `_ModelFamily` for dynamic submodule access, such as
+`ernie.config` or `flux.weights`. These resolve to real imported modules, so
+patches still apply to production objects without a static model import block.
+
 Reuse the parameterized discovery, dimension, download, conversion, and
 weight-loading checks with descriptive family IDs. Retain family-specific prompt,
 guidance, position, VAE, and numerical assertions next to the shared contracts,
