@@ -1,84 +1,102 @@
 {
   "models": [
     {
-      "id": "ideogram4",
+      "id": "ideogram4-transformer",
+      "module": "ideogram4.transformer",
+      "model_class": "Ideogram4Transformer",
+      "config_class": "Ideogram4TransformerConfig",
       "config": {
-        "transformer": {
-          "emb_dim": 12,
-          "num_layers": 1,
-          "num_heads": 3,
-          "intermediate_size": 16,
-          "adanln_dim": 4,
-          "in_channels": 4,
-          "llm_features_dim": 8,
-          "mrope_section": [1, 1, 0]
-        }
+        "emb_dim": 12,
+        "num_layers": 1,
+        "num_heads": 3,
+        "intermediate_size": 16,
+        "adanln_dim": 4,
+        "in_channels": 4,
+        "llm_features_dim": 8,
+        "mrope_section": [1, 1, 0]
       },
       "checks": ["transformer"]
     },
     {
-      "id": "z_image",
+      "id": "z_image-transformer",
+      "module": "z_image.transformer",
+      "model_class": "ZImageTransformer",
+      "config_class": "ZImageTransformerConfig",
       "config": {
-        "transformer": {
-          "hidden_size": 64,
-          "num_attention_heads": 4,
-          "num_key_value_heads": 4,
-          "intermediate_size": 128,
-          "in_channels": 16,
-          "text_embed_dim": 32,
-          "num_hidden_layers": 2,
-          "n_refiner_layers": 1,
-          "n_context_refiner_layers": 1,
-          "adaln_embed_dim": 256,
-          "rope_sections": [4, 6, 6]
-        },
-        "text_encoder": {
-          "vocab_size": 256,
-          "hidden_size": 64,
-          "num_hidden_layers": 2,
-          "num_attention_heads": 4,
-          "num_key_value_heads": 2,
-          "intermediate_size": 128,
-          "head_dim": 16
-        },
-        "vae_decode": {
-          "in_channels": 3,
-          "out_channels": 3,
-          "latent_channels": 4,
-          "block_out_channels": [32, 64],
-          "layers_per_block": 1
-        }
-      },
-      "checks": ["transformer", "text_encoder", "vae_decode"]
-    },
-    {
-      "id": "ernie_image",
-      "config": {
-        "transformer": {
-          "hidden_size": 32,
-          "ffn_hidden_size": 64,
-          "in_channels": 8,
-          "out_channels": 8,
-          "num_layers": 2,
-          "num_attention_heads": 4,
-          "rope_axes_dim": [2, 2, 4],
-          "text_in_dim": 16
-        }
+        "hidden_size": 64,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 4,
+        "intermediate_size": 128,
+        "in_channels": 16,
+        "text_embed_dim": 32,
+        "num_hidden_layers": 2,
+        "n_refiner_layers": 1,
+        "n_context_refiner_layers": 1,
+        "adaln_embed_dim": 256,
+        "rope_sections": [4, 6, 6]
       },
       "checks": ["transformer"]
     },
     {
-      "id": "mage_flow",
+      "id": "z_image-text_encoder",
+      "module": "z_image.text_encoder",
+      "model_class": "ZImageTextEncoder",
+      "config_class": "ZImageTextEncoderConfig",
       "config": {
-        "transformer": {
-          "in_channels": 8,
-          "out_channels": 8,
-          "context_in_dim": 16,
-          "hidden_size": 32,
-          "num_heads": 4,
-          "depth": 2,
-          "axes_dim": [2, 2, 4]
-        }
+        "vocab_size": 256,
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "intermediate_size": 128,
+        "head_dim": 16
+      },
+      "checks": ["text_encoder"]
+    },
+    {
+      "id": "z_image-vae_decode",
+      "module": "z_image.vae",
+      "model_class": "ZImageVAE",
+      "config_class": "ZImageVAEConfig",
+      "config": {
+        "in_channels": 3,
+        "out_channels": 3,
+        "latent_channels": 4,
+        "block_out_channels": [32, 64],
+        "layers_per_block": 1
+      },
+      "checks": ["vae_decode"]
+    },
+    {
+      "id": "ernie_image-transformer",
+      "module": "ernie_image.transformer",
+      "model_class": "ErnieImageTransformer",
+      "config_class": "ErnieImageTransformerConfig",
+      "config": {
+        "hidden_size": 32,
+        "ffn_hidden_size": 64,
+        "in_channels": 8,
+        "out_channels": 8,
+        "num_layers": 2,
+        "num_attention_heads": 4,
+        "rope_axes_dim": [2, 2, 4],
+        "text_in_dim": 16
+      },
+      "checks": ["transformer"]
+    },
+    {
+      "id": "mage_flow-transformer",
+      "module": "mage_flow.transformer",
+      "model_class": "MageFlowTransformer",
+      "config_class": null,
+      "config": {
+        "in_channels": 8,
+        "out_channels": 8,
+        "context_in_dim": 16,
+        "hidden_size": 32,
+        "num_heads": 4,
+        "depth": 2,
+        "axes_dim": [2, 2, 4]
       },
       "checks": ["transformer"]
     }

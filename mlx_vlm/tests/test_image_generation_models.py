@@ -116,18 +116,13 @@ def test_edit_model_dispatch(tmp_path, family, alias, probe):
         assert not is_image_edit_model("mage-flow-turbo")
 
 
-def _component(family, check, config):
-    component, suffix = {
-        "transformer": ("transformer", "Transformer"),
-        "text_encoder": ("text_encoder", "TextEncoder"),
-        "vae_decode": ("vae", "VAE"),
-    }[check]
-    name = FAMILY_PREFIX[family] + suffix
-    cls = getattr(_family_module(family, component), name)
-    if family == "mage_flow":
-        return cls(**config)
-    config_cls = getattr(_family_module(family, "config"), name + "Config")
-    return cls(config_cls(**config))
+def _component(case):
+    module = importlib.import_module(f"mlx_vlm.models.{case['module']}")
+    model_cls = getattr(module, case["model_class"])
+    if case["config_class"] is None:
+        return model_cls(**case["config"])
+    config_cls = getattr(module, case["config_class"])
+    return model_cls(config_cls(**case["config"]))
 
 
 class _CaptureLength(nn.Module):
@@ -189,20 +184,15 @@ def _component_output(family, check, model):
     return output, (1, 16, 1, 4, 4)
 
 
-@pytest.mark.parametrize(
-    "case,check",
-    [
-        pytest.param(case, check, id=f"{case['id']}-{check}")
-        for case in IMAGE_CASES["models"]
-        for check in case["checks"]
-    ],
-)
-def test_image_model_contract(case, check):
-    model = _component(case["id"], check, case["config"][check])
-    output, shape = _component_output(case["id"], check, model)
-    mx.eval(output)
-    assert output.shape == shape
-    assert bool(mx.all(mx.isfinite(output)))
+@pytest.mark.parametrize("case", IMAGE_CASES["models"], ids=lambda case: case["id"])
+def test_image_model_contract(case):
+    model = _component(case)
+    family = case["module"].split(".")[0]
+    for check in case["checks"]:
+        output, shape = _component_output(family, check, model)
+        mx.eval(output)
+        assert output.shape == shape
+        assert bool(mx.all(mx.isfinite(output)))
 
 
 EXPANDED_CAPTION = ideogram_prompting.format_caption(

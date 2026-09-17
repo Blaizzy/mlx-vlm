@@ -84,8 +84,15 @@ checks explicit. No separate server fixture module is needed.
 keeps checkpoint writers, pipeline doubles, and tiny quantization models in the
 same file. `image_generation_cases.json` supplies ordinary data for six component
 checks across four model families, eight generation/edit wrapper cases, and four
-weight-key sanitizer cases. Component configs and check names belong in `models`;
-requests, expected result fields, forwarded arguments, and metadata belong in
+weight-key sanitizer cases. Each entry in `models` names its import `module`
+relative to `mlx_vlm.models`, `model_class`, `config_class`, ordinary constructor
+`config`, and `checks`. The runner imports the module dynamically and constructs
+the named classes; `config_class: null` passes config fields directly to the model
+constructor (Mage Flow). The case `id` only labels the collected test. For example,
+Z-Image's transformer imports `z_image.transformer` and constructs
+`ZImageTransformer(ZImageTransformerConfig(**config))`.
+
+Requests, expected result fields, forwarded arguments, and metadata belong in
 `wrappers`. Sanitizer keys specify their source shape and expected destination
 (`null` means drop). Python constructs models, supplies tensor layouts and calling
 conventions, and checks the results. No references or executable expressions are
