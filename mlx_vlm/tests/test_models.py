@@ -3607,6 +3607,31 @@ class TestModels(unittest.TestCase):
 
         model = glm5_next.Model(config)
 
+        nn.quantize(
+            model,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda path, _: path.endswith("language_model.lm_head"),
+        )
+        checkpoint = dict(tree_flatten(model.parameters()))
+        quantized_head = {
+            f"lm_head.{suffix}": checkpoint.pop(f"language_model.lm_head.{suffix}")
+            for suffix in ("weight", "scales", "biases")
+        }
+        sanitized_head = assert_sanitize_idempotent(model, quantized_head)
+        self.assertEqual(
+            set(sanitized_head),
+            {
+                "language_model.lm_head.weight",
+                "language_model.lm_head.scales",
+                "language_model.lm_head.biases",
+            },
+        )
+
+        checkpoint.update(quantized_head)
+        sanitized = model.sanitize(checkpoint)
+        model.load_weights(list(sanitized.items()), strict=True)
+
         # hybrid per-layer schedule: layer 0 linear-attn, layer 1 sparse (DSA)
         is_linear = [layer.is_linear for layer in model.language_model.model.layers]
         self.assertEqual(is_linear, [True, False])
