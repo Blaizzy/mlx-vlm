@@ -19,7 +19,7 @@ Use a module path or `-k` to select a smaller group while developing.
 
 | Test module | Scope |
 | --- | --- |
-| `test_models.py` + `model_cases.json` | Shared language, vision, audio, projector, embedding, position and native forward/cache contracts; cached-image declarations; checkpoint loading, sanitization, and document layout |
+| `test_models.py` + `model_cases.json` | Shared language, vision, audio, projector, embedding, position and native forward/cache contracts; checkpoint loading, sanitization, and document layout |
 | `test_model_ops.py` | Attention kernels and numerical parity, rotary embeddings, weight quantization, and format conversion |
 | `test_cache.py` | Cache lifecycle, APC lookup and prefix reuse, adapters, memory budgets, disk persistence, TurboQuant, batched masks/attention, and vision-feature LRU behavior |
 | `test_processors.py` + `processor_cases.json` | Tokenizers and detokenizers, processor loading and media contracts, image/video utilities, prompt construction, and dynamically discovered tool parsers |
@@ -42,22 +42,48 @@ The former `test_utils.py` cases follow ownership: model/checkpoint loading in
 Speculative setup stays in `test_speculative.py`; only general JSON config
 construction is shared through `test_models.py`.
 
-## Consolidation validation
+## Current validation
 
-Compared with `acd30322`, Python files decrease **28 → 16** (test modules
-**27 → 15**). Python source decreases **22,608 → 22,331 lines**, saving **277**:
-263 from deleting the manual smoke runner and 14 net from consolidating imports
-and module boilerplate. JSON is unchanged at **3,099 lines**; the combined total
-is **25,430 lines**. Individual destination modules grow as related suites join.
+Compared with `e48acdc6`, shared setup and runners reduce Python source
+**22,331 → 21,614 lines**, saving **717 formatted lines**. JSON is unchanged at
+**3,099 lines**; the combined total is **24,713 lines**, with the same 16 Python
+files. All changes in this pass are tests or their documentation.
 
-All **1,771 collected cases** remain, including all 53 former utility cases.
-Before and after: **1,767 passed, four existing skips, and 31 passing subtests**.
-An AST audit preserves all **805 test/helper definitions**, including assertions
-and parametrization, after normalizing TurboQuant helper renames and the removed
-same-module import. Production coverage sets are identical: **80,999 executed
-lines and 12,836 branch outcomes**, with **zero lost or added paths**.
-This preserves the immediately preceding suite; earlier intentional pruning
-documented below is unchanged.
+| Module | Before | After | Saved |
+| --- | ---: | ---: | ---: |
+| `test_generate.py` | 1,928 | 1,716 | 212 |
+| `test_processors.py` | 2,506 | 2,317 | 189 |
+| `test_diffusion_models.py` | 1,287 | 1,131 | 156 |
+| `test_models.py` | 1,071 | 1,014 | 57 |
+| `test_audio_models.py` | 1,613 | 1,573 | 40 |
+| `test_video_generation_models.py` | 1,544 | 1,522 | 22 |
+| `test_model_ops.py` | 1,021 | 1,002 | 19 |
+| `test_cache.py` | 2,844 | 2,826 | 18 |
+| `test_image_generation_models.py` | 1,784 | 1,780 | 4 |
+
+Batch generation, prompt/media handling, diffusion dispatch, quantized cache
+policies, and one-bit prompt/decode comparisons share setup. Synthetic checkpoint
+weights and tiny configurations share builders; numeric references, seeds,
+tolerances, masks, stateful cache checks, gradients, and concurrency checks remain.
+Processor cases explicitly retain both fresh and initialized tokenizer padding
+states when splitting the former sequential test into independent cases.
+
+Remove **52 selected cases**: 45 cached-image source-substring checks, four
+standalone dataclass default checks, two public annotation checks, and one
+historical video-default equality check. These declaration/default/signature
+guards are intentionally removed. Parameterization exposes five previously
+in-function scenarios as separate collected cases: **1,771 → 1,724 collected**.
+The full suite passes **1,720 tests, four existing skips, and 31 subtests**.
+
+Exact production coverage sets match `e48acdc6`: **80,999 executed lines and
+12,836 branch outcomes**, with **zero lost or added paths**. This preserves
+measured Python execution at the immediate baseline; it does not restore the
+earlier intentional pruning documented below.
+
+The preceding file consolidation against `acd30322` reduced **28 → 16 Python
+files** and **22,608 → 22,331 Python lines**. Its 277-line saving comprised 263
+lines from deleting the manual smoke runner and 14 from imports/module boilerplate.
+That step preserved all 1,771 collected cases and the same coverage sets.
 
 Black, isort, autoflake, pyflakes, Python 3.10 syntax parsing and whitespace checks
 pass. Environment: macOS arm64/Metal, Python 3.12.14, MLX 0.32.2,
@@ -74,8 +100,8 @@ python -m coverage json -o current-coverage.json
 
 Compare exact `(file, line)` and `(file, branch-start, branch-end)` sets; additions
 do not cancel losses. These measurements exclude tests, native kernels, child
-process execution and optional skipped checks. To reproduce the earlier baseline,
-add `--ignore=mlx_vlm/tests/test_smoke.py` at that revision.
+process execution and optional skipped checks. The immediate baseline is `e48acdc6`. For the older `acd30322` baseline,
+add `--ignore=mlx_vlm/tests/test_smoke.py`.
 
 ## JSON model cases
 
@@ -230,7 +256,7 @@ Full suite: **1,762 passed, four skipped, 39 passing subtests**. Compared with
 remain covered, with two added lines (Laguna's real chat-template property and
 Muse's public cleanup method). Coverage excludes tests, native kernels, skipped
 optional checks and subprocess execution. Black, isort, autoflake, pyflakes and
-whitespace checks pass. Current suite size is **22,608 Python + 3,099 JSON =
+whitespace checks pass. At that revision, suite size was **22,608 Python + 3,099 JSON =
 25,707 lines**, across 27 test modules.
 
 The model/training Python refactor against `9d469e0f` saves **503 formatted lines**
@@ -246,8 +272,8 @@ Model checks use plain pytest assertions and methods named after the JSON checks
 removing the duplicate method-name mapping. One position recorder handles chunked
 prefill, cache-index lookup and request-owned RoPE deltas. Shared component setup
 retains the same language/vision dtypes, projector dimensions, audio masks and
-shape assertions. All 45 cached-image model paths remain in the same order;
-repeated package/file names are derived from the explicit model inventory.
+shape assertions. That revision retained all 45 cached-image source checks in the same order;
+the current compression removes these declaration checks as described above.
 
 Training shares dataset setup, batch collation, optimizer/save cases, adapter
 construction and native/legacy adapter-loading contracts. Constructor assertions

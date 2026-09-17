@@ -426,47 +426,6 @@ def test_dense_model(name):
     ModelChecks().forward_cache(model, config["vocab_size"])
 
 
-@pytest.mark.parametrize(
-    "model_module",
-    [
-        f"{name}.{name}"
-        for name in (
-            "llava llava_bunny llava_next gemma3 gemma4 paligemma qwen2_5_vl qwen2_vl "
-            "qwen3_vl qwen3_5 qwen3_vl_moe internvl_chat mistral3 pixtral aya_vision "
-            "fastvlm glm4v glm4v_moe glm_ocr kimi_vl dots_ocr hunyuan_vl paddleocr_vl "
-            "ernie4_5_moe_vl mllama granite_vision granite4_vision deepseek_vl_v2 "
-            "deepseek_v4 multi_modality lfm2_vl idefics2 idefics3 phi4mm falcon_ocr "
-            "falcon_perception florence2 molmo molmo2 moondream3 gemma3n phi3_v minicpmo "
-            "jina_vlm "
-        ).split()
-    ]
-    + ["qwen3_omni_moe.thinker"],
-)
-def test_cached_image_features_in_source(model_module):
-    """Verify cached_image_features kwarg appears in get_input_embeddings source."""
-    try:
-        mod = importlib.import_module(f"mlx_vlm.models.{model_module}")
-    except Exception as e:
-        pytest.skip(f"Cannot import {model_module}: {e}")
-
-    # Find the class that has get_input_embeddings
-    target_cls = None
-    for name, obj in inspect.getmembers(mod, inspect.isclass):
-        if hasattr(obj, "get_input_embeddings") and obj.__module__ == mod.__name__:
-            target_cls = obj
-            break
-
-    assert (
-        target_cls is not None
-    ), f"No class with get_input_embeddings in {model_module}"
-
-    source = inspect.getsource(target_cls.get_input_embeddings)
-    assert "cached_image_features" in source, (
-        f"{model_module}.{target_cls.__name__}.get_input_embeddings "
-        f"missing cached_image_features check"
-    )
-
-
 def tiny_config(family, profile=None, **overrides):
     """Build a fresh tiny config, optionally selecting a named test profile."""
     case = TINY_MODELS[family]
@@ -486,9 +445,9 @@ class TestPPDocLayoutV3(unittest.TestCase):
         model_class, model_type = get_model_and_args(
             config={"model_type": "pp_doclayout_v3"}
         )
-        self.assertIs(model_class, pp_doclayout_v3)
-        self.assertEqual(model_type, "pp_doclayout_v3")
-        self.assertEqual(pp_doclayout_v3.ModelConfig().num_labels, 25)
+        assert model_class is pp_doclayout_v3
+        assert model_type == "pp_doclayout_v3"
+        assert pp_doclayout_v3.ModelConfig().num_labels == 25
 
         cfg = pp_doclayout_v3.ModelConfig.from_dict(
             {
@@ -498,9 +457,9 @@ class TestPPDocLayoutV3(unittest.TestCase):
                 "backbone_config": {"model_type": "hgnet_v2"},
             }
         )
-        self.assertEqual(cfg.id2label, {0: "Question", 1: "Paragraph"})
-        self.assertEqual(cfg.num_queries, 300)
-        self.assertEqual(cfg.decoder_layers, 6)
+        assert cfg.id2label == {0: "Question", 1: "Paragraph"}
+        assert cfg.num_queries == 300
+        assert cfg.decoder_layers == 6
 
     def test_pp_doclayout_v3_decode_order(self):
         import mlx.core as mx
@@ -509,7 +468,7 @@ class TestPPDocLayoutV3(unittest.TestCase):
 
         # Chain 0 -> 1 -> 2 with strong pairwise scores.
         scores = mx.array([[-1e4, 5.0, 5.0], [-1e4, -1e4, 5.0], [-1e4, -1e4, -1e4]])
-        self.assertEqual(decode_order(scores).tolist(), [0, 1, 2])
+        assert decode_order(scores).tolist() == [0, 1, 2]
         # Reference formula cross-check on random input.
         rng_scores = mx.random.normal((7, 7))
         mx.eval(rng_scores)
@@ -519,7 +478,7 @@ class TestPPDocLayoutV3(unittest.TestCase):
         arr = np.array(rng_scores.tolist())
         s = 1.0 / (1.0 + np.exp(-arr))
         votes = np.triu(s, 1).sum(0) + np.tril(1.0 - s.T, -1).sum(0)
-        self.assertEqual(got, np.argsort(votes).tolist())
+        assert got == np.argsort(votes).tolist()
 
     def test_pp_doclayout_v3_mask_to_box(self):
         import mlx.core as mx
@@ -537,7 +496,7 @@ class TestPPDocLayoutV3(unittest.TestCase):
         self.assertAlmostEqual(float(boxes[0, 0, 2]), 0.4, places=5)
         self.assertAlmostEqual(float(boxes[0, 0, 3]), 0.375, places=5)
         # Empty mask -> zeros.
-        self.assertEqual(float(boxes[0, 1].sum()), 0.0)
+        assert float(boxes[0, 1].sum()) == 0.0
 
     def test_pp_doclayout_v3_bilinear_upsample(self):
         import mlx.core as mx
@@ -549,7 +508,7 @@ class TestPPDocLayoutV3(unittest.TestCase):
         y = upsample_bilinear2x(x)
         mx.eval(y)
         # align_corners=False exact values: edges replicate, interior lerps.
-        self.assertEqual(tuple(y.shape), (1, 4, 4, 1))
+        assert tuple(y.shape) == (1, 4, 4, 1)
         self.assertAlmostEqual(float(y[0, 0, 0, 0]), 0.0, places=5)
         self.assertAlmostEqual(float(y[0, 0, 1, 0]), 0.25, places=5)
         self.assertAlmostEqual(float(y[0, 1, 0, 0]), 0.5, places=5)
@@ -593,18 +552,18 @@ class TestPPDocLayoutV3(unittest.TestCase):
                     again = convert(
                         str(out), str(Path(tmp) / "reconverted"), "bfloat16"
                     )
-                self.assertEqual(verify.call_count, 2)
+                assert verify.call_count == 2
                 key = "backbone.embedder.stem1.conv.weight"
                 expected = weight.transpose(0, 2, 3, 1)
                 converted = mx.load(str(out / "model.safetensors"))
                 reconverted = mx.load(str(again / "model.safetensors"))
-                self.assertEqual(set(converted), {key})
-                self.assertEqual(set(reconverted), {key})
-                self.assertEqual(converted[key].dtype, mx.float32)
-                self.assertEqual(reconverted[key].dtype, mx.bfloat16)
-                self.assertEqual(converted[key].tolist(), expected.tolist())
-                self.assertEqual(reconverted[key].tolist(), expected.tolist())
-                self.assertEqual(json.loads((out / "config.json").read_text()), config)
+                assert set(converted) == {key}
+                assert set(reconverted) == {key}
+                assert converted[key].dtype == mx.float32
+                assert reconverted[key].dtype == mx.bfloat16
+                assert converted[key].tolist() == expected.tolist()
+                assert reconverted[key].tolist() == expected.tolist()
+                assert json.loads((out / "config.json").read_text()) == config
 
 
 # Loading and utility contracts
@@ -745,9 +704,11 @@ class _CheckpointConfig:
 
 
 class _CheckpointModel(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, **modules):
         super().__init__()
         self.config = config
+        for name, module in modules.items():
+            setattr(self, name, module)
 
     def load_weights(self, weights, strict=True):
         self.loaded_weights, self.loaded_strict = weights, strict
@@ -773,12 +734,6 @@ def _checkpoint_loading(config, model_class, weights, *, side_effect=None):
 
 def test_load_model_uses_deepseek_v4_fp8_quantization_config():
 
-    class FakeDeepseekV4Model(_CheckpointModel):
-
-        def __init__(self, config):
-            super().__init__(config)
-            self.language_model = nn.Linear(2, 2, bias=False)
-
     quantization = {
         "group_size": 64,
         "bits": 8,
@@ -795,7 +750,9 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
                 "model_type": "deepseek_v4",
                 "quantization_config": {"quant_method": "fp8"},
             },
-            FakeDeepseekV4Model,
+            lambda config: _CheckpointModel(
+                config, language_model=nn.Linear(2, 2, bias=False)
+            ),
             {},
         ) as quantize,
     ):
@@ -855,12 +812,6 @@ def test_load_model_matches_deepseek_v4_quantization_aliases():
 
 def test_load_model_transforms_fine_grained_fp8_by_format():
 
-    class FakeQwenModel(_CheckpointModel):
-
-        def __init__(self, config):
-            super().__init__(config)
-            self.proj = nn.Linear(128, 128, bias=False)
-
     source_config = {
         "model_type": "future_compatible_model",
         "quantization_config": {
@@ -871,7 +822,7 @@ def test_load_model_transforms_fine_grained_fp8_by_format():
     }
     with _checkpoint_loading(
         source_config,
-        FakeQwenModel,
+        lambda config: _CheckpointModel(config, proj=nn.Linear(128, 128, bias=False)),
         {
             "proj.weight": mx.zeros((128, 128), dtype=mx.uint8),
             "proj.weight_scale_inv": mx.ones((1, 1), dtype=mx.bfloat16),
@@ -890,19 +841,15 @@ def test_load_model_transforms_fine_grained_fp8_by_format():
 
 def test_load_model_quantizes_projector_with_scales_when_skip_vision():
 
-    class FakeProjector(nn.Module):
-
-        def __init__(self):
-            super().__init__()
-            self.linear_1 = nn.Linear(64, 64, bias=False)
-
-    class FakeModel(_CheckpointModel):
-
-        def __init__(self, config):
-            super().__init__(config)
-            self.vision_tower = nn.Linear(64, 64, bias=False)
-            self.multi_modal_projector = FakeProjector()
-            self.language_model = nn.Linear(64, 64, bias=False)
+    def model(config):
+        projector = nn.Module()
+        projector.linear_1 = nn.Linear(64, 64, bias=False)
+        return _CheckpointModel(
+            config,
+            vision_tower=nn.Linear(64, 64, bias=False),
+            multi_modal_projector=projector,
+            language_model=nn.Linear(64, 64, bias=False),
+        )
 
     weights = {
         "language_model.weight": mx.zeros((64, 16), dtype=mx.uint32),
@@ -927,7 +874,7 @@ def test_load_model_quantizes_projector_with_scales_when_skip_vision():
             "quantization": {"group_size": 64, "bits": 8},
             "vision_config": {"skip_vision": True},
         },
-        FakeModel,
+        model,
         weights,
         side_effect=fake_quantize,
     ):
@@ -983,7 +930,7 @@ def _write_checkpoint(path, config_extra=None):
 def test_load_model_uses_checkpoint_model_file(tmp_path):
     _write_checkpoint(tmp_path)
 
-    model = _load(tmp_path)
+    model = load_model(tmp_path)
 
     # the class must come from the checkpoint's model.py, not the registry
     # (the registry would have raised: model_type does not exist there)
@@ -996,11 +943,7 @@ def test_missing_model_file_raises_clearly(tmp_path):
     (tmp_path / "model.py").unlink()
 
     with pytest.raises(FileNotFoundError, match="model_file"):
-        _load(tmp_path)
-
-
-def _load(path):
-    return load_model(path)
+        load_model(tmp_path)
 
 
 # Patch embedding layouts

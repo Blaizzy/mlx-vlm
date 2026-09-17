@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -27,19 +28,10 @@ from mlx_vlm.generate.common import GenerationResult
 from mlx_vlm.models.gemma3.config import TextConfig as Gemma3TextConfig
 from mlx_vlm.models.gemma3.language import Gemma3Model
 from mlx_vlm.models.nemotron_h.language import NemotronHModel
+from mlx_vlm.models.nemotron_h_nano_omni import config as nemotron_config
 from mlx_vlm.models.nemotron_h_nano_omni.audio import (
     SoundFeatureExtractor,
     sanitize_audio_weights,
-)
-from mlx_vlm.models.nemotron_h_nano_omni.config import (
-    AudioConfig as NemotronAudioConfig,
-)
-from mlx_vlm.models.nemotron_h_nano_omni.config import (
-    ModelConfig as NemotronModelConfig,
-)
-from mlx_vlm.models.nemotron_h_nano_omni.config import TextConfig as NemotronTextConfig
-from mlx_vlm.models.nemotron_h_nano_omni.config import (
-    VisionConfig as NemotronVisionConfig,
 )
 from mlx_vlm.models.nemotron_h_nano_omni.nemotron_h_nano_omni import (
     Model as NemotronModel,
@@ -54,16 +46,7 @@ from mlx_vlm.models.nemotron_voicechat.streaming import (
     VoiceChatProfile,
 )
 from mlx_vlm.models.nemotron_voicechat.tts import CharAwareSubwordEncoder, MoGHead
-from mlx_vlm.models.qwen3_omni_moe.config import AudioConfig as QwenAudioConfig
-from mlx_vlm.models.qwen3_omni_moe.config import Code2WavConfig as QwenCode2WavConfig
-from mlx_vlm.models.qwen3_omni_moe.config import (
-    CodePredictorConfig as QwenCodePredictorConfig,
-)
-from mlx_vlm.models.qwen3_omni_moe.config import ModelConfig as QwenModelConfig
-from mlx_vlm.models.qwen3_omni_moe.config import TalkerConfig as QwenTalkerConfig
-from mlx_vlm.models.qwen3_omni_moe.config import TextConfig as QwenTextConfig
-from mlx_vlm.models.qwen3_omni_moe.config import ThinkerConfig as QwenThinkerConfig
-from mlx_vlm.models.qwen3_omni_moe.config import VisionConfig as QwenVisionConfig
+from mlx_vlm.models.qwen3_omni_moe import config as qwen_config
 from mlx_vlm.models.qwen3_omni_moe.qwen3_omni_moe import Model as QwenModel
 from mlx_vlm.tests.test_generate import MockDetokenizer, MockModel, MockProcessor
 from mlx_vlm.utils import load_audio
@@ -100,27 +83,25 @@ class TestMiniCPMOTTS(unittest.TestCase):
                     prompt, paths = processor.prepare_audio_generation(
                         system + user, audio=input_audio, ref_audio_path="voice.wav"
                     )
-                    self.assertTrue(
-                        prompt.startswith("<|im_start|>system\nClone the voice")
-                    )
-                    self.assertTrue(prompt.endswith("<|tts_bos|>"))
-                    self.assertEqual(prompt.count("<|im_start|>system"), 1)
-                    self.assertEqual(processor._count_audio_markers(prompt), len(paths))
+                    assert prompt.startswith("<|im_start|>system\nClone the voice")
+                    assert prompt.endswith("<|tts_bos|>")
+                    assert prompt.count("<|im_start|>system") == 1
+                    assert processor._count_audio_markers(prompt) == len(paths)
                     if system:
-                        self.assertIn("Be concise.<|im_end|>", prompt)
+                        assert "Be concise.<|im_end|>" in prompt
                     if input_audio:
-                        self.assertEqual(paths, ["voice.wav", "input.wav"])
-                        self.assertIn("<|im_start|>user\n<audio>Say hello.", prompt)
+                        assert paths == ["voice.wav", "input.wav"]
+                        assert "<|im_start|>user\n<audio>Say hello." in prompt
                     else:
-                        self.assertEqual(paths, ["voice.wav"])
-                        self.assertTrue(prompt.endswith(user))
+                        assert paths == ["voice.wav"]
+                        assert prompt.endswith(user)
                     if isinstance(input_audio, list):
-                        self.assertEqual(input_audio, ["input.wav"])
+                        assert input_audio == ["input.wav"]
                     # A caller-supplied system reference must not be duplicated.
                     again = processor.prepare_audio_generation(
                         prompt, audio=paths, ref_audio_path="./voice.wav"
                     )
-                    self.assertEqual(again, (prompt, paths))
+                    assert again == (prompt, paths)
 
     def test_audio_input_can_also_supply_reference_voice(self):
         from mlx_vlm.models.minicpmo.processing_minicpmo import MiniCPMOProcessor
@@ -130,9 +111,9 @@ class TestMiniCPMOTTS(unittest.TestCase):
             "<|im_start|>user\n<audio>./</audio>Respond.<|im_end|>\n",
             audio=["input.wav"],
         )
-        self.assertEqual(paths, ["input.wav", "input.wav"])
-        self.assertEqual(processor._count_audio_markers(prompt), 2)
-        self.assertIn("<|im_start|>user\n<audio>Respond.", prompt)
+        assert paths == ["input.wav", "input.wav"]
+        assert processor._count_audio_markers(prompt) == 2
+        assert "<|im_start|>user\n<audio>Respond." in prompt
 
     def test_tiny_tts_generates_audio_tokens(self):
         from mlx_vlm.models.minicpmo.config import MiniCPMTTSConfig
@@ -156,7 +137,7 @@ class TestMiniCPMOTTS(unittest.TestCase):
             ),
         )
         mx.eval(out.new_ids)
-        self.assertEqual(out.new_ids.shape, (1, 2, 1))
+        assert out.new_ids.shape == (1, 2, 1)
 
     def test_sanitize_materializes_tts_weight_norm(self):
         from mlx_vlm.models.minicpmo.config import (
@@ -167,12 +148,11 @@ class TestMiniCPMOTTS(unittest.TestCase):
         )
         from mlx_vlm.models.minicpmo.minicpmo import Model
 
-        text = TextConfig(
+        text = _small_config(
+            TextConfig,
             model_type="qwen3",
             hidden_size=8,
             intermediate_size=16,
-            num_hidden_layers=1,
-            num_attention_heads=2,
             rms_norm_eps=1e-6,
             vocab_size=20,
             num_key_value_heads=2,
@@ -180,18 +160,16 @@ class TestMiniCPMOTTS(unittest.TestCase):
             rope_theta=10000,
             max_position_embeddings=64,
         )
-        vision = VisionConfig(
+        vision = _small_config(
+            VisionConfig,
             hidden_size=8,
             intermediate_size=16,
-            num_hidden_layers=1,
-            num_attention_heads=2,
         )
-        tts = MiniCPMTTSConfig(
+        tts = _small_config(
+            MiniCPMTTSConfig,
             hidden_size=8,
             intermediate_size=16,
-            num_attention_heads=2,
             num_key_value_heads=2,
-            num_hidden_layers=1,
             num_text_tokens=20,
             num_audio_tokens=12,
             llm_dim=8,
@@ -211,8 +189,8 @@ class TestMiniCPMOTTS(unittest.TestCase):
         }
         sanitized = model.sanitize(weights)
 
-        self.assertIn("tts.head_code.0.weight", sanitized)
-        self.assertEqual(sanitized["tts.head_code.0.weight"].shape, (12, 8))
+        assert "tts.head_code.0.weight" in sanitized
+        assert sanitized["tts.head_code.0.weight"].shape == (12, 8)
 
     def test_processor_exposes_tts_and_spk_tokens(self):
         from mlx_vlm.models.minicpmo.processing_minicpmo import MiniCPMOProcessor
@@ -244,8 +222,8 @@ class TestMiniCPMOTTS(unittest.TestCase):
         processor.tokenizer = Tokenizer()
         processor._ensure_tokenizer_attrs()
 
-        self.assertEqual(processor.tokenizer.tts_start_id, 12)
-        self.assertEqual(processor.tokenizer.tts_end_id, 13)
+        assert processor.tokenizer.tts_start_id == 12
+        assert processor.tokenizer.tts_end_id == 13
 
         ids = np.array([1, 10, 2, 3, 11, 4], dtype=np.int32)
         np.testing.assert_array_equal(
@@ -304,16 +282,16 @@ class TestMiniCPMOTTS(unittest.TestCase):
         )
 
         mx.eval(output.audio_tokens)
-        self.assertEqual(output.audio_tokens.shape, (1, 1, 1))
-        self.assertEqual(captured["tts_max_new_token"], 5)
-        self.assertEqual(captured["tts_bound"], (2, 3))
-        self.assertEqual(captured["mask"].shape, (1, 3))
-        self.assertEqual(captured["max_tokens"], 99)
+        assert output.audio_tokens.shape == (1, 1, 1)
+        assert captured["tts_max_new_token"] == 5
+        assert captured["tts_bound"] == (2, 3)
+        assert captured["mask"].shape == (1, 3)
+        assert captured["max_tokens"] == 99
         params = captured["tts_sampling_params"]
-        self.assertEqual(params.temperature, 0.2)
-        self.assertEqual(params.top_p, 0.3)
-        self.assertEqual(params.top_k, 6)
-        self.assertEqual(params.repetition_penalty, 1.2)
+        assert params.temperature == 0.2
+        assert params.top_p == 0.3
+        assert params.top_k == 6
+        assert params.repetition_penalty == 1.2
 
     def test_stepaudio2_vocoder_uses_codec_default_repo(self):
         from mlx_vlm.models.minicpmo.vocoder import StepAudio2Vocoder
@@ -340,7 +318,7 @@ class TestMiniCPMOTTS(unittest.TestCase):
         ):
             StepAudio2Vocoder()
 
-        self.assertEqual(calls, [((), {})])
+        assert calls == [((), {})]
 
 
 def _tiny_speech_model():
@@ -573,7 +551,7 @@ VISION_END = 59
 
 def _tiny_text_config(model_type="qwen3_omni_moe_text_encoder"):
     return _small_config(
-        QwenTextConfig,
+        qwen_config.TextConfig,
         model_type=model_type,
         num_hidden_layers=2,
         num_key_value_heads=2,
@@ -591,7 +569,7 @@ def _tiny_text_config(model_type="qwen3_omni_moe_text_encoder"):
 
 
 def _qwen_vision_config(**overrides):
-    return QwenVisionConfig(
+    return qwen_config.VisionConfig(
         **(
             dict(
                 depth=0,
@@ -615,10 +593,10 @@ def _qwen_vision_config(**overrides):
 
 def _tiny_model(vision_config=None, **thinker_kwargs):
     text_config = _tiny_text_config()
-    thinker_config = QwenThinkerConfig(
+    thinker_config = qwen_config.ThinkerConfig(
         text_config=text_config,
         vision_config=vision_config or _qwen_vision_config(),
-        audio_config=QwenAudioConfig(
+        audio_config=qwen_config.AudioConfig(
             d_model=16,
             encoder_layers=0,
             encoder_attention_heads=2,
@@ -633,10 +611,10 @@ def _tiny_model(vision_config=None, **thinker_kwargs):
         audio_token_id=62,
         **thinker_kwargs,
     )
-    talker_config = QwenTalkerConfig(
+    talker_config = qwen_config.TalkerConfig(
         text_config=_tiny_text_config("qwen3_omni_moe_talker_text"),
         code_predictor_config=_small_config(
-            QwenCodePredictorConfig,
+            qwen_config.CodePredictorConfig,
             num_key_value_heads=2,
             head_dim=8,
             vocab_size=32,
@@ -646,7 +624,7 @@ def _tiny_model(vision_config=None, **thinker_kwargs):
         thinker_hidden_size=16,
     )
     code2wav_config = _small_config(
-        QwenCode2WavConfig,
+        qwen_config.Code2WavConfig,
         num_key_value_heads=2,
         decoder_dim=16,
         codebook_dim=8,
@@ -657,7 +635,7 @@ def _tiny_model(vision_config=None, **thinker_kwargs):
         vector_quantization_hidden_dimension=8,
     )
     return QwenModel(
-        QwenModelConfig(
+        qwen_config.ModelConfig(
             thinker_config=thinker_config,
             talker_config=talker_config,
             code2wav_config=code2wav_config,
@@ -714,22 +692,18 @@ class Qwen3OmniMoeTest(unittest.TestCase):
         mx.eval(sequences, hidden_states, input_embeds)
         mx.eval(expected_hidden_states, expected_input_embeds)
 
-        self.assertEqual(sequences.shape[1], input_ids.shape[1] + 3)
-        self.assertEqual(hidden_states.shape, expected_hidden_states.shape)
-        self.assertEqual(input_embeds.shape, expected_input_embeds.shape)
-        self.assertTrue(
-            bool(
-                mx.allclose(
-                    hidden_states, expected_hidden_states, rtol=1e-4, atol=1e-4
-                ).item()
-            )
+        assert sequences.shape[1] == input_ids.shape[1] + 3
+        assert hidden_states.shape == expected_hidden_states.shape
+        assert input_embeds.shape == expected_input_embeds.shape
+        assert bool(
+            mx.allclose(
+                hidden_states, expected_hidden_states, rtol=0.0001, atol=0.0001
+            ).item()
         )
-        self.assertTrue(
-            bool(
-                mx.allclose(
-                    input_embeds, expected_input_embeds, rtol=1e-6, atol=1e-6
-                ).item()
-            )
+        assert bool(
+            mx.allclose(
+                input_embeds, expected_input_embeds, rtol=1e-06, atol=1e-06
+            ).item()
         )
 
     def test_deepstack_injection_is_batch_safe(self):
@@ -746,12 +720,8 @@ class Qwen3OmniMoeTest(unittest.TestCase):
         ).logits
         mx.eval(solo_image, solo_text, batch)
 
-        self.assertTrue(
-            bool(mx.allclose(batch[0:1], solo_image, rtol=1e-4, atol=1e-5).item())
-        )
-        self.assertTrue(
-            bool(mx.allclose(batch[1:2], solo_text, rtol=1e-4, atol=1e-5).item())
-        )
+        assert bool(mx.allclose(batch[0:1], solo_image, rtol=0.0001, atol=1e-05).item())
+        assert bool(mx.allclose(batch[1:2], solo_text, rtol=0.0001, atol=1e-05).item())
 
     def _thinker_logits(self, model, ids, cache, **kw):
         x = ids if isinstance(ids, mx.array) else mx.array(ids, dtype=mx.int32)
@@ -761,7 +731,7 @@ class Qwen3OmniMoeTest(unittest.TestCase):
     def _assert_prefill_decode_match(self, pre, step, pos):
         a, b = pre.reshape(-1), step[:, -1].reshape(-1)
         cosine = float((a * b).sum() / (mx.linalg.norm(a) * mx.linalg.norm(b) + 1e-9))
-        self.assertGreater(cosine, 0.999, f"decode diverges from prefill at pos {pos}")
+        assert cosine > 0.999, f"decode diverges from prefill at pos {pos}"
 
     def test_decode_continues_rope_positions_from_cache_offset(self):
         # Prefill and step-by-step decode of the same text tokens must agree.
@@ -782,18 +752,16 @@ class Qwen3OmniMoeTest(unittest.TestCase):
     def test_quant_predicate_forwarded_to_top_level_model(self):
         model = _tiny_model()
         predicate = model.quant_predicate
-        self.assertIsNotNone(predicate)
-        self.assertEqual(
-            predicate("thinker.language_model.model.layers.0.mlp.gate", None),
-            {"group_size": 64, "bits": 8},
-        )
-        self.assertTrue(
-            predicate("thinker.language_model.model.layers.0.self_attn.q_proj", None)
-        )
+        assert predicate is not None
+        assert predicate("thinker.language_model.model.layers.0.mlp.gate", None) == {
+            "group_size": 64,
+            "bits": 8,
+        }
+        assert predicate("thinker.language_model.model.layers.0.self_attn.q_proj", None)
 
 
 def tiny_text_config(hidden_size=24):
-    return NemotronTextConfig(
+    return nemotron_config.TextConfig(
         model_type="nemotron_h",
         vocab_size=128,
         hidden_size=hidden_size,
@@ -831,7 +799,7 @@ def test_nemotron_h_embeddingless_backbone_requires_inputs_embeds():
 
 def tiny_vision_config():
     return _small_config(
-        NemotronVisionConfig,
+        nemotron_config.VisionConfig,
         num_attention_heads=4,
         image_size=32,
         patch_size=16,
@@ -841,7 +809,7 @@ def tiny_vision_config():
 
 
 def tiny_sound_config(hidden_size=16):
-    return NemotronAudioConfig(
+    return nemotron_config.AudioConfig(
         hidden_size=hidden_size,
         num_attention_heads=4,
         num_hidden_layers=1,
@@ -856,7 +824,7 @@ def tiny_sound_config(hidden_size=16):
 
 def test_sound_feature_extractor_shapes_and_masks():
     pytest.importorskip("mlx_audio")
-    config = NemotronAudioConfig()
+    config = nemotron_config.AudioConfig()
     extractor = SoundFeatureExtractor(config)
     waveform = np.linspace(-0.5, 0.5, 1600, dtype=np.float32)
 
@@ -885,7 +853,7 @@ def test_audio_path_handles_nvfp4_uint8_lm_head_scales():
     path completes without dtype error.
     """
     model = NemotronModel(
-        NemotronModelConfig(
+        nemotron_config.ModelConfig(
             text_config=tiny_text_config(),
             vision_config=tiny_vision_config(),
             sound_config=tiny_sound_config(),
@@ -915,7 +883,7 @@ def test_audio_path_handles_nvfp4_uint8_lm_head_scales():
 
 def test_model_rejects_sound_token_feature_count_mismatch():
     model = NemotronModel(
-        NemotronModelConfig(
+        nemotron_config.ModelConfig(
             text_config=tiny_text_config(),
             vision_config=tiny_vision_config(),
             sound_config=tiny_sound_config(),
@@ -962,7 +930,7 @@ def test_sanitize_audio_and_projection_weights():
     ].shape == (4, 3, 3, 1)
 
     model = NemotronModel(
-        NemotronModelConfig(
+        nemotron_config.ModelConfig(
             text_config=tiny_text_config(),
             vision_config=tiny_vision_config(),
             sound_config=None,
@@ -1284,21 +1252,21 @@ def _base_config():
     }
 
 
-def test_build_runtime_config_preserves_finite_time_step_limit():
-    base = _base_config()
-    base["time_step_limit"] = [0.001, 0.1]
-
-    config = build_runtime_config(_source_config(), base)
-
-    assert config["text_config"]["time_step_limit"] == [0.001, 0.1]
-
-
-def test_build_runtime_config_rejects_non_finite_time_step_limit():
-    base = _base_config()
-    base["time_step_limit"] = [0.0, float("inf")]
-
-    with pytest.raises(ValueError, match="two finite numbers"):
-        build_runtime_config(_source_config(), base)
+@pytest.mark.parametrize(
+    "limit", [[0.001, 0.1], [0.0, float("inf")]], ids=["finite", "non-finite"]
+)
+def test_build_runtime_config_time_step_limit(limit):
+    base = _base_config() | {"time_step_limit": limit}
+    if not math.isfinite(limit[1]):
+        with pytest.raises(ValueError, match="two finite numbers"):
+            build_runtime_config(_source_config(), base)
+    else:
+        assert (
+            build_runtime_config(_source_config(), base)["text_config"][
+                "time_step_limit"
+            ]
+            == limit
+        )
 
 
 def test_build_runtime_config_keeps_bf16_unquantized():
@@ -1332,33 +1300,25 @@ def _write_artifact_inputs(tmp_path):
     return source, tokenizer, shard_name
 
 
-def test_prepare_artifact_writes_generic_load_layout(tmp_path):
-    source, tokenizer, shard_name = _write_artifact_inputs(tmp_path)
-    output = tmp_path / "output"
-
-    result = convert.prepare_artifact(source, tokenizer, output, copy_weights=True)
-
-    assert result == output
-    assert json.loads((output / "config.json").read_text())["model_type"] == (
-        "nemotron_voicechat"
+@pytest.mark.parametrize("copy_weights", [False, True], ids=["link", "copy"])
+def test_prepare_artifact_layout(tmp_path, copy_weights):
+    source, tokenizer, shard = _write_artifact_inputs(tmp_path)
+    output = tmp_path / ("output" if copy_weights else "linked-output")
+    result = convert.prepare_artifact(
+        source, tokenizer, output, copy_weights=copy_weights
     )
+    assert result == output
+    assert (output / shard).is_symlink() == (not copy_weights)
+    assert (output / "model.safetensors.index.json").exists()
+    if not copy_weights:
+        assert (output / "model.safetensors.index.json").is_symlink()
+    config = json.loads((output / "config.json").read_text())
     tokenizer_config = json.loads((output / "tokenizer_config.json").read_text())
+    assert config["model_type"] == "nemotron_voicechat"
     assert tokenizer_config["fix_mistral_regex"] is True
     assert (output / "tokenizer.json").exists()
-    assert (output / "model.safetensors.index.json").exists()
-    assert (output / shard_name).read_bytes() == b"weights"
-    assert not (output / shard_name).is_symlink()
+    assert (output / shard).read_bytes() == b"weights"
     assert (output / "README.md").exists()
-
-
-def test_prepare_artifact_can_link_weight_shards(tmp_path):
-    source, tokenizer, shard_name = _write_artifact_inputs(tmp_path)
-    output = tmp_path / "linked-output"
-
-    convert.prepare_artifact(source, tokenizer, output)
-
-    assert (output / "model.safetensors.index.json").is_symlink()
-    assert (output / shard_name).is_symlink()
 
 
 def test_streaming_session_buffers_arbitrary_chunk_boundaries():

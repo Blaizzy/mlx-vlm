@@ -681,13 +681,7 @@ def test_generation_model_dispatch(monkeypatch, tmp_path, family, aliases, probe
         assert all(c.args == (aliases[-1],) for c in lookup.call_args_list)
         if family == "ideogram4":
             assert all(
-                c.kwargs["allow_patterns"]
-                == [
-                    "model_index.json",
-                    "config.json",
-                    "manifest.json",
-                    "**/config.json",
-                ]
+                c.kwargs["allow_patterns"] == DISCOVERY_PATTERNS
                 for c in lookup.call_args_list
             )
 
@@ -805,6 +799,14 @@ def test_bonsai_parse_size():
     assert bonsai.config.parse_size("832x1248") == (832, 1248)
 
 
+DISCOVERY_PATTERNS = [
+    "model_index.json",
+    "config.json",
+    "manifest.json",
+    "**/config.json",
+]
+
+
 def test_flux2_remote_component_index_is_a_metadata_fallback(monkeypatch, tmp_path):
     metadata_path = tmp_path / "metadata"
     metadata_path.mkdir()
@@ -832,14 +834,8 @@ def test_flux2_remote_component_index_is_a_metadata_fallback(monkeypatch, tmp_pa
         is flux.model.Flux2ImageGenerationModel
     )
     assert calls == [
-        ["model_index.json", "config.json", "manifest.json", "**/config.json"],
-        [
-            "model_index.json",
-            "config.json",
-            "manifest.json",
-            "**/config.json",
-            "**/model.safetensors.index.json",
-        ],
+        DISCOVERY_PATTERNS,
+        DISCOVERY_PATTERNS + ["**/model.safetensors.index.json"],
     ]
 
 

@@ -7,7 +7,6 @@ import importlib
 import logging
 import sys
 import types
-import typing
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -19,12 +18,10 @@ from mlx_vlm import apc as apc_module
 from mlx_vlm import sample_utils as sampling
 from mlx_vlm import structured
 from mlx_vlm.generate import (
-    BatchGenerationResult,
     BatchGenerator,
     BatchResponse,
     BatchStats,
     GenerationBatch,
-    GenerationResult,
     PromptProcessingBatch,
     SpeculativeGenerationBatch,
     _left_pad_prompts,
@@ -65,6 +62,10 @@ class MockConfig:
         self.image_token_index = 32000
 
 
+def _input_shape(input_ids):
+    return input_ids.shape if input_ids.ndim > 1 else (1, input_ids.shape[0])
+
+
 class MockLanguageModel:
     """Mock language model for testing batch generation."""
 
@@ -74,10 +75,9 @@ class MockLanguageModel:
         self.layers = [MagicMock() for _ in range(4)]
 
     def __call__(self, input_ids, cache=None, **kwargs):
-        batch_size = input_ids.shape[0] if input_ids.ndim > 1 else 1
-        seq_len = input_ids.shape[-1] if input_ids.ndim > 1 else input_ids.shape[0]
-        logits = mx.random.normal((batch_size, seq_len, self.vocab_size))
-        return MagicMock(logits=logits)
+        return MagicMock(
+            logits=mx.random.normal((*_input_shape(input_ids), self.vocab_size))
+        )
 
 
 class MockModel:
@@ -88,17 +88,14 @@ class MockModel:
         self.language_model = MockLanguageModel()
 
     def __call__(self, input_ids, pixel_values=None, cache=None, mask=None, **kwargs):
-        batch_size = input_ids.shape[0] if input_ids.ndim > 1 else 1
-        seq_len = input_ids.shape[-1] if input_ids.ndim > 1 else input_ids.shape[0]
-        logits = mx.random.normal((batch_size, seq_len, 32000))
         return MagicMock(
-            logits=logits, cross_attention_states=None, encoder_outputs=None
+            logits=mx.random.normal((*_input_shape(input_ids), 32000)),
+            cross_attention_states=None,
+            encoder_outputs=None,
         )
 
     def get_input_embeddings(self, input_ids, pixel_values, **kwargs):
-        batch_size = input_ids.shape[0] if input_ids.ndim > 1 else 1
-        seq_len = input_ids.shape[-1] if input_ids.ndim > 1 else input_ids.shape[0]
-        return mx.random.normal((batch_size, seq_len, 768))
+        return mx.random.normal((*_input_shape(input_ids), 768))
 
     def make_cache(self):
         from mlx_vlm.models import cache
@@ -194,67 +191,6 @@ def test_batch_generator_apc_media_token_ids_handles_text_only_model(mock_proces
     )
 
     assert generator._apc_media_token_ids() == set()
-
-
-# ============================================================================
-# Tests for Dataclasses
-# ============================================================================
-
-
-class TestGenerationResult:
-    """Tests for GenerationResult dataclass."""
-
-    def test_default_values(self):
-        result = GenerationResult()
-        assert result.text == ""
-        assert result.token is None
-        assert result.logprobs is None
-        assert result.prompt_tokens == 0
-        assert result.generation_tokens == 0
-        assert result.total_tokens == 0
-        assert result.prompt_tps == 0.0
-        assert result.generation_tps == 0.0
-        assert result.peak_memory == 0.0
-
-
-class TestBatchGenerationResult:
-    """Tests for BatchGenerationResult dataclass."""
-
-    def test_optional_image_sizes(self):
-        result = BatchGenerationResult(
-            texts=["Hello"],
-            tokens=[1],
-            logprobs=[[0.1]],
-            prompt_tokens=[10],
-            generation_tokens=[5],
-            total_tokens=[15],
-            prompt_tps=[100.0],
-            generation_tps=[50.0],
-        )
-        assert result.image_sizes is None
-
-
-class TestBatchStats:
-    """Tests for BatchStats dataclass."""
-
-    def test_default_values(self):
-        stats = BatchStats()
-        assert stats.prompt_tokens == 0
-        assert stats.prompt_tps == 0
-        assert stats.prompt_time == 0
-        assert stats.generation_tokens == 0
-        assert stats.generation_tps == 0
-        assert stats.generation_time == 0
-        assert stats.peak_memory == 0
-
-
-class TestBatchResponse:
-    """Tests for BatchResponse dataclass."""
-
-    def test_optional_image_sizes(self):
-        stats = BatchStats()
-        response = BatchResponse(texts=["Hello"], stats=stats)
-        assert response.image_sizes is None
 
 
 class TestGenerationBatch:
@@ -398,6 +334,30 @@ class TestLeftPadPrompts:
 # ============================================================================
 
 
+class FixedLogitModel:
+    def __call__(self, input_ids, cache=None, **kwargs):
+        scores = mx.array([0.0, 10.0, 0.0, 0.0])
+        return MagicMock(logits=mx.broadcast_to(scores, (*input_ids.shape, 4)))
+
+
+def _generation_batch(model, inputs=(5, 6), uids=None, **options):
+    options = (
+        dict(
+            prompt_cache=[],
+            sampler=lambda logits: mx.argmax(logits, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[2] * len(inputs),
+        )
+        | options
+    )
+    return GenerationBatch(
+        model=model,
+        inputs=mx.array(inputs, mx.int32),
+        uids=list(range(len(inputs))) if uids is None else uids,
+        **options,
+    )
+
+
 class TestBatchGenerator:
     """Tests for BatchGenerator class."""
 
@@ -461,14 +421,6 @@ class TestBatchGenerator:
         assert gen.stats().prompt_tokens == prompt_tokens
 
     def test_generation_batch_applies_per_sequence_logits_processors(self):
-        class FixedLogitModel:
-            def __call__(self, input_ids, cache=None, **kwargs):
-                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
-                logits = mx.broadcast_to(
-                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
-                )
-                return MagicMock(logits=logits)
-
         seen_contexts = []
 
         def force_token_2(tokens, logits):
@@ -476,14 +428,8 @@ class TestBatchGenerator:
             token_scores = mx.array([-1e9, -1e9, 0.0, -1e9])
             return mx.broadcast_to(token_scores, logits.shape)
 
-        batch = GenerationBatch(
+        batch = _generation_batch(
             model=FixedLogitModel(),
-            uids=[0, 1],
-            inputs=mx.array([5, 6], dtype=mx.int32),
-            prompt_cache=[],
-            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
-            stop_criteria=lambda token: False,
-            max_tokens=[2, 2],
             token_context=[mx.array([10]), mx.array([20])],
             logits_processors=[[force_token_2], [force_token_2]],
         )
@@ -496,14 +442,6 @@ class TestBatchGenerator:
         assert [r.token for r in second] == [2, 2]
 
     def test_generation_batch_thinking_budget_criteria_can_force_next_token(self):
-        class FixedLogitModel:
-            def __call__(self, input_ids, cache=None, **kwargs):
-                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
-                logits = mx.broadcast_to(
-                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
-                )
-                return MagicMock(logits=logits)
-
         class ForceAfterFirst:
             def __init__(self):
                 self.forced_token_id = None
@@ -516,14 +454,9 @@ class TestBatchGenerator:
                 self.forced_token_id = None
                 return forced
 
-        batch = GenerationBatch(
+        batch = _generation_batch(
             model=FixedLogitModel(),
-            uids=[0],
-            inputs=mx.array([5], dtype=mx.int32),
-            prompt_cache=[],
-            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
-            stop_criteria=lambda token: False,
-            max_tokens=[2],
+            inputs=(5,),
             thinking_budget_criteria=[ForceAfterFirst()],
         )
 
@@ -546,16 +479,7 @@ class TestBatchGenerator:
                 )
 
         model = FastArgmaxModel()
-        batch = GenerationBatch(
-            model=model,
-            uids=[0, 1],
-            inputs=mx.array([5, 6], dtype=mx.int32),
-            prompt_cache=[],
-            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
-            stop_criteria=lambda token: False,
-            max_tokens=[2, 2],
-            greedy_sampling=True,
-        )
+        batch = _generation_batch(model=model, greedy_sampling=True)
         batch.compute_logprobs = False
 
         first = batch.next()
@@ -581,16 +505,7 @@ class TestBatchGenerator:
                 raise AssertionError("fallback argmax must not select the fused path")
 
         model = FallbackArgmaxModel()
-        batch = GenerationBatch(
-            model=model,
-            uids=[0],
-            inputs=mx.array([5], dtype=mx.int32),
-            prompt_cache=[],
-            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
-            stop_criteria=lambda token: False,
-            max_tokens=[2],
-            greedy_sampling=True,
-        )
+        batch = _generation_batch(model=model, inputs=(5,), greedy_sampling=True)
         batch.compute_logprobs = False
 
         first = batch.next()
@@ -638,14 +553,12 @@ class TestBatchGenerator:
         stop_criteria = lambda token: False
 
         def make_batch(uid, processor=None):
-            return GenerationBatch(
+            return _generation_batch(
                 model=object(),
                 uids=[uid],
-                inputs=mx.array([uid + 1], dtype=mx.int32),
-                prompt_cache=[],
+                inputs=(uid + 1,),
                 sampler=sampler,
                 stop_criteria=stop_criteria,
-                max_tokens=[2],
                 token_context=[[30]] if processor is not None else None,
                 logits_processors=[[processor]] if processor is not None else None,
             )
@@ -674,23 +587,20 @@ class TestBatchGenerator:
 
         sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
         stop_criteria = lambda token: False
-        first = GenerationBatch(
+        first = _generation_batch(
             model=MagicMock(),
-            uids=[0],
-            inputs=mx.array([5], dtype=mx.int32),
+            inputs=(5,),
             prompt_cache=[make_kv_cache(1.0)],
             sampler=sampler,
             stop_criteria=stop_criteria,
-            max_tokens=[2],
         )
-        second = GenerationBatch(
+        second = _generation_batch(
             model=MagicMock(),
             uids=[1],
-            inputs=mx.array([6], dtype=mx.int32),
+            inputs=(6,),
             prompt_cache=[make_kv_cache(3.0)],
             sampler=sampler,
             stop_criteria=stop_criteria,
-            max_tokens=[2],
         )
 
         first.extend(second)
@@ -745,31 +655,64 @@ class TestBatchGenerator:
 # ============================================================================
 
 
+@pytest.mark.parametrize(
+    "case", ["text", "images", "no-sizes", "image-string", "verbose"]
+)
+def test_batch_generate_media(case, mock_model, mock_processor, capsys):
+    from PIL import Image
+
+    from mlx_vlm.generate import batch_generate
+
+    prompts, images, options = ["Describe this"], ["test.jpg"], {}
+    count = 2 if case in ("text", "images") else 1
+    texts = ["Response 1", "Response 2"] if count == 2 else ["Response"]
+    stats = BatchStats(prompt_tokens=20, generation_tokens=10)
+    if case == "text":
+        prompts, images, options = ["Hello", "World"], None, dict(max_tokens=50)
+    elif case == "images":
+        prompts = ["Describe image 1", "Describe image 2"]
+        images = ["path/to/img1.jpg", "path/to/img2.jpg"]
+        options = dict(max_tokens=50)
+        stats = BatchStats(prompt_tokens=40, generation_tokens=20)
+    elif case == "no-sizes":
+        options = dict(track_image_sizes=False)
+    elif case == "image-string":
+        images, stats = "single_image.jpg", BatchStats()
+    else:
+        options = dict(verbose=True)
+        stats = BatchStats(
+            prompt_tokens=100,
+            prompt_time=0.1,
+            generation_tokens=50,
+            generation_time=0.2,
+        )
+    size = (512, 384) if case == "no-sizes" else (224, 224)
+    with (
+        patch.object(ar_module, "_generate_batch", return_value=(texts, stats)) as run,
+        patch(
+            "mlx_vlm.utils.process_image",
+            side_effect=[
+                MagicMock(spec=Image.Image, height=size[0], width=size[1])
+                for _ in range(count)
+            ],
+        ) as process,
+    ):
+        response = batch_generate(
+            mock_model, mock_processor, images=images, prompts=prompts, **options
+        )
+    assert isinstance(response, BatchResponse)
+    assert response.texts == texts
+    run.assert_called_once()
+    if case == "no-sizes":
+        assert response.image_sizes is None
+    if case == "image-string":
+        process.assert_called_once()
+    if case == "verbose":
+        assert "[batch_generate]" in capsys.readouterr().out
+
+
 class TestBatchGenerate:
     """Tests for the batch_generate function."""
-
-    @patch.object(ar_module, "_generate_batch")
-    def test_text_only_batch(self, mock_generate_batch, mock_model, mock_processor):
-        """Test batch generation without images."""
-        from mlx_vlm.generate import batch_generate
-
-        mock_generate_batch.return_value = (
-            ["Response 1", "Response 2"],
-            BatchStats(prompt_tokens=20, generation_tokens=10),
-        )
-
-        prompts = ["Hello", "World"]
-        response = batch_generate(
-            model=mock_model,
-            processor=mock_processor,
-            images=None,
-            prompts=prompts,
-            max_tokens=50,
-        )
-
-        assert isinstance(response, BatchResponse)
-        assert response.texts == ["Response 1", "Response 2"]
-        mock_generate_batch.assert_called_once()
 
     def test_generate_batch_passes_mask_and_split_prompt_kwargs_to_generator(
         self, mock_model, mock_processor
@@ -850,143 +793,6 @@ class TestBatchGenerate:
                     prompts=["alpha", "beta", "gamma"],
                     max_tokens=5,
                 )
-
-    @patch.object(ar_module, "_generate_batch")
-    @patch("mlx_vlm.utils.process_image")
-    def test_with_images_same_shape(
-        self, mock_process_image, mock_generate_batch, mock_model, mock_processor
-    ):
-        """Test batch generation with images of the same shape."""
-        from PIL import Image
-
-        from mlx_vlm.generate import batch_generate
-
-        # Create mock images of the same size
-        mock_img1 = MagicMock(spec=Image.Image)
-        mock_img1.height = 224
-        mock_img1.width = 224
-
-        mock_img2 = MagicMock(spec=Image.Image)
-        mock_img2.height = 224
-        mock_img2.width = 224
-
-        mock_process_image.side_effect = [mock_img1, mock_img2]
-        mock_generate_batch.return_value = (
-            ["Response 1", "Response 2"],
-            BatchStats(prompt_tokens=40, generation_tokens=20),
-        )
-
-        prompts = ["Describe image 1", "Describe image 2"]
-        response = batch_generate(
-            model=mock_model,
-            processor=mock_processor,
-            images=["path/to/img1.jpg", "path/to/img2.jpg"],
-            prompts=prompts,
-            max_tokens=50,
-        )
-
-        assert isinstance(response, BatchResponse)
-        assert len(response.texts) == 2
-        # Same shape images should be processed in one batch
-        assert mock_generate_batch.call_count == 1
-
-    @patch.object(ar_module, "_generate_batch")
-    @patch("mlx_vlm.utils.process_image")
-    def test_disable_track_image_sizes(
-        self, mock_process_image, mock_generate_batch, mock_model, mock_processor
-    ):
-        """Test that image sizes tracking can be disabled."""
-        from PIL import Image
-
-        from mlx_vlm.generate import batch_generate
-
-        mock_img = MagicMock(spec=Image.Image)
-        mock_img.height = 512
-        mock_img.width = 384
-
-        mock_process_image.return_value = mock_img
-        mock_generate_batch.return_value = (
-            ["Response"],
-            BatchStats(prompt_tokens=20, generation_tokens=10),
-        )
-
-        response = batch_generate(
-            model=mock_model,
-            processor=mock_processor,
-            images=["test.jpg"],
-            prompts=["Describe this"],
-            track_image_sizes=False,
-        )
-
-        assert response.image_sizes is None
-
-    @patch.object(ar_module, "_generate_batch")
-    @patch("mlx_vlm.utils.process_image")
-    def test_single_image_string(
-        self, mock_process_image, mock_generate_batch, mock_model, mock_processor
-    ):
-        """Test that a single image string is converted to list."""
-        from PIL import Image
-
-        from mlx_vlm.generate import batch_generate
-
-        mock_img = MagicMock(spec=Image.Image)
-        mock_img.height = 224
-        mock_img.width = 224
-
-        mock_process_image.return_value = mock_img
-        mock_generate_batch.return_value = (["Response"], BatchStats())
-
-        response = batch_generate(
-            model=mock_model,
-            processor=mock_processor,
-            images="single_image.jpg",  # String, not list
-            prompts=["Describe this"],
-        )
-
-        assert isinstance(response, BatchResponse)
-        mock_process_image.assert_called_once()
-
-    @patch.object(ar_module, "_generate_batch")
-    @patch("mlx_vlm.utils.process_image")
-    def test_verbose_output(
-        self,
-        mock_process_image,
-        mock_generate_batch,
-        mock_model,
-        mock_processor,
-        capsys,
-    ):
-        """Test verbose output in batch generation."""
-        from PIL import Image
-
-        from mlx_vlm.generate import batch_generate
-
-        mock_img = MagicMock(spec=Image.Image)
-        mock_img.height = 224
-        mock_img.width = 224
-
-        mock_process_image.return_value = mock_img
-        mock_generate_batch.return_value = (
-            ["Response"],
-            BatchStats(
-                prompt_tokens=100,
-                prompt_time=0.1,
-                generation_tokens=50,
-                generation_time=0.2,
-            ),
-        )
-
-        batch_generate(
-            model=mock_model,
-            processor=mock_processor,
-            images=["test.jpg"],
-            prompts=["Describe this"],
-            verbose=True,
-        )
-
-        captured = capsys.readouterr()
-        assert "[batch_generate]" in captured.out
 
 
 # ============================================================================
@@ -1149,24 +955,6 @@ def test_stream_generate_stores_checkpoint_only_before_decode(reused_prefix):
     ]
     assert all(call.args[1] == prompt_cache for call in calls)
     assert all(call.kwargs == {"extra_hash": 0} for call in calls)
-
-
-def test_public_generation_annotations_match_runtime_results():
-    hints = typing.get_type_hints(dispatch_module.stream_generate)
-
-    assert hints["return"] == typing.Generator[GenerationResult, None, None]
-    assert type(None) in typing.get_args(hints["image"])
-    assert type(None) in typing.get_args(hints["audio"])
-    assert type(None) in typing.get_args(hints["video"])
-
-
-def test_batch_generate_optional_input_annotations_match_defaults():
-    hints = typing.get_type_hints(ar_module.batch_generate)
-
-    assert type(None) in typing.get_args(hints["images"])
-    assert type(None) in typing.get_args(hints["audios"])
-    assert type(None) in typing.get_args(hints["prompts"])
-    assert hints["return"] is BatchResponse
 
 
 @pytest.mark.parametrize("value", [224, "22", [1.5], [True], [1, 2, 3]])

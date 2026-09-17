@@ -560,10 +560,10 @@ GROUP_SIZE = 32
 BITS = 8
 
 
-def _rand_kv(batch, seq_len):
+def _rand_kv(batch, seq_len, heads=H):
     """Return random (keys, values) tensors."""
-    k = mx.random.normal((batch, H, seq_len, D))
-    v = mx.random.normal((batch, H, seq_len, D))
+    k = mx.random.normal((batch, heads, seq_len, D))
+    v = mx.random.normal((batch, heads, seq_len, D))
     return k, v
 
 
@@ -2400,19 +2400,38 @@ def test_asymmetric_attention_matches_dequantized_reference():
     assert error < 0.02
 
 
-def test_maybe_quantize_kv_cache_defaults_unchanged():
-    prompt_cache = [KVCache(), KVCache(), KVCache()]
-    maybe_quantize_kv_cache(
-        prompt_cache,
-        quantized_kv_start=0,
-        kv_group_size=64,
-        kv_bits=3.5,
-        kv_quant_scheme="turboquant",
+@pytest.mark.parametrize(
+    "mixed", [False, True], ids=["turboquant-defaults", "mixed-schemes"]
+)
+def test_maybe_quantize_kv_cache_policy(mixed):
+    from mlx_vlm.turboquant import HybridQuantKVCache
+
+    options = (
+        dict(
+            kv_bits=8,
+            kv_quant_scheme="uniform",
+            kv_value_bits=3,
+            kv_value_scheme="turboquant",
+        )
+        if mixed
+        else dict(kv_bits=3.5, kv_quant_scheme="turboquant")
     )
-    converted = [c for c in prompt_cache if isinstance(c, TurboQuantKVCache)]
+    prompt_cache = [KVCache() for _ in range(3)]
+    maybe_quantize_kv_cache(
+        prompt_cache, quantized_kv_start=0, kv_group_size=64, **options
+    )
+    kind = HybridQuantKVCache if mixed else TurboQuantKVCache
+    converted = [entry for entry in prompt_cache if isinstance(entry, kind)]
     assert converted
     for entry in converted:
-        assert (entry.key_bits, entry.value_bits) == (3.0, 4.0)
+        if mixed:
+            assert (entry.policy.key.scheme, entry.policy.key.bits) == ("uniform", 8.0)
+            assert (entry.policy.value.scheme, entry.policy.value.bits) == (
+                "turboquant",
+                3.0,
+            )
+        else:
+            assert (entry.key_bits, entry.value_bits) == (3.0, 4.0)
 
 
 def _turbo_quant_config(**overrides):
@@ -2421,19 +2440,37 @@ def _turbo_quant_config(**overrides):
     return config
 
 
-def test_apc_stream_warm_cache_honors_key_value_bits():
+@pytest.mark.parametrize(
+    "mixed", [False, True], ids=["turboquant-bits", "mixed-schemes"]
+)
+def test_apc_stream_warm_cache_policy(mixed):
     from mlx_vlm.apc import _fill_stream_layer_cache
+    from mlx_vlm.turboquant import HybridQuantKVCache
 
-    keys = mx.random.normal((1, 4, 8, 256)).astype(mx.bfloat16)
-    values = mx.random.normal((1, 4, 8, 256)).astype(mx.bfloat16)
+    config = (
+        dict(
+            bits=8,
+            group_size=64,
+            scheme="uniform",
+            value_bits=3,
+            value_scheme="turboquant",
+        )
+        if mixed
+        else _turbo_quant_config(key_bits=8, value_bits=3)
+    )
     built = _fill_stream_layer_cache(
-        keys,
-        values,
+        *[mx.random.normal((1, 4, 8, 256)).astype(mx.bfloat16) for _ in range(2)],
         prefix_len=8,
         quantize=True,
-        kv_quant_config=_turbo_quant_config(key_bits=8, value_bits=3),
+        kv_quant_config=config,
     )
-    assert (built.key_bits, built.value_bits) == (8.0, 3.0)
+    if mixed:
+        assert isinstance(built, HybridQuantKVCache)
+        assert built.policy.key.scheme == "uniform"
+        assert built.policy.value.scheme == "turboquant"
+        assert built.offset == 8
+    else:
+        assert (built.key_bits, built.value_bits) == (8.0, 3.0)
 
 
 def test_apc_warm_cache_defaults_match_live_split():
@@ -2472,18 +2509,19 @@ def test_kv_quant_policy_scheme_property_rejects_heterogeneous():
         policy.scheme
 
 
-def test_kv_quant_policy_rejects_unknown_scheme():
+@pytest.mark.parametrize(
+    "bits,scheme,overrides",
+    [
+        (8, "uniform", dict(kv_key_scheme="turbo3")),
+        (3.5, "turboquant", dict(kv_key_bits=3.5, kv_key_scheme="uniform")),
+    ],
+    ids=["unknown-scheme", "fractional-uniform"],
+)
+def test_invalid_kv_quant_policy(bits, scheme, overrides):
     from mlx_vlm.kv_quant import from_legacy
 
     with pytest.raises(ValueError):
-        from_legacy(8, "uniform", 64, kv_key_scheme="turbo3")
-
-
-def test_kv_quant_policy_rejects_fractional_uniform_bits():
-    from mlx_vlm.kv_quant import from_legacy
-
-    with pytest.raises(ValueError):
-        from_legacy(3.5, "turboquant", 64, kv_key_bits=3.5, kv_key_scheme="uniform")
+        from_legacy(bits, scheme, 64, **overrides)
 
 
 def test_kv_quant_heterogeneous_round_trips_and_fingerprints_distinctly():
@@ -2537,28 +2575,6 @@ def test_hybrid_cache_meta_state_round_trips_policy():
     assert restored.seed == cache.seed
 
 
-def test_maybe_quantize_kv_cache_builds_hybrid_for_mixed_schemes():
-    from mlx_vlm.turboquant import HybridQuantKVCache
-
-    prompt_cache = [KVCache(), KVCache(), KVCache()]
-    maybe_quantize_kv_cache(
-        prompt_cache,
-        quantized_kv_start=0,
-        kv_group_size=64,
-        kv_bits=8,
-        kv_quant_scheme="uniform",
-        kv_value_bits=3,
-        kv_value_scheme="turboquant",
-    )
-    built = [c for c in prompt_cache if isinstance(c, HybridQuantKVCache)]
-    assert built
-    for entry in built:
-        assert entry.policy.key.scheme == "uniform"
-        assert entry.policy.key.bits == 8.0
-        assert entry.policy.value.scheme == "turboquant"
-        assert entry.policy.value.bits == 3.0
-
-
 def test_batch_generator_accepts_scheme_overrides():
     import inspect
 
@@ -2570,61 +2586,33 @@ def test_batch_generator_accepts_scheme_overrides():
         assert "kv_value_scheme" in params
 
 
-def test_make_cache_rejects_mixed_schemes():
-    from mlx_vlm.generate.ar import _make_cache
-
-    class _FakeModel:
-        def make_cache(self):
-            return [KVCache()]
-
-    with pytest.raises(NotImplementedError, match="batch path"):
-        _make_cache(
-            _FakeModel(),
-            [0],
-            kv_bits=8,
-            kv_quant_scheme="uniform",
-            kv_value_bits=3,
-            kv_value_scheme="turboquant",
-        )
-
-
-def test_apc_batch_builders_reject_mixed_schemes():
+@pytest.mark.parametrize(
+    "builder,message", [("live", "batch path"), ("prefix", "batch prefix caches")]
+)
+def test_batch_cache_rejects_mixed_schemes(builder, message):
     from mlx_vlm.apc import _empty_quant_batch_cache
 
-    with pytest.raises(NotImplementedError, match="batch prefix caches"):
-        _empty_quant_batch_cache(
-            [0],
-            {
-                "bits": 8,
-                "group_size": 64,
-                "scheme": "uniform",
-                "value_bits": 3,
-                "value_scheme": "turboquant",
-            },
-        )
-
-
-def test_apc_stream_builder_supports_mixed_schemes():
-    from mlx_vlm.apc import _fill_stream_layer_cache
-    from mlx_vlm.turboquant import HybridQuantKVCache
-
-    built = _fill_stream_layer_cache(
-        mx.random.normal((1, 4, 8, 256)).astype(mx.bfloat16),
-        mx.random.normal((1, 4, 8, 256)).astype(mx.bfloat16),
-        prefix_len=8,
-        quantize=True,
-        kv_quant_config={
-            "bits": 8,
-            "group_size": 64,
-            "scheme": "uniform",
-            "value_bits": 3,
-            "value_scheme": "turboquant",
-        },
-    )
-    assert isinstance(built, HybridQuantKVCache)
-    assert built.policy.key.scheme == "uniform"
-    assert built.policy.value.scheme == "turboquant"
-    assert built.offset == 8
+    with pytest.raises(NotImplementedError, match=message):
+        if builder == "live":
+            _make_cache(
+                NS(make_cache=lambda: [KVCache()]),
+                [0],
+                kv_bits=8,
+                kv_quant_scheme="uniform",
+                kv_value_bits=3,
+                kv_value_scheme="turboquant",
+            )
+        else:
+            _empty_quant_batch_cache(
+                [0],
+                dict(
+                    bits=8,
+                    group_size=64,
+                    scheme="uniform",
+                    value_bits=3,
+                    value_scheme="turboquant",
+                ),
+            )
 
 
 def test_hybrid_cache_trims_fractional_turboquant_tensor():
@@ -2653,16 +2641,10 @@ TURBO_BITS = 4
 TURBO_SCALE = TURBO_DIM**-0.5
 
 
-def _turbo_rand_kv(batch, seq_len, heads=TURBO_HEADS):
-    k = mx.random.normal((batch, heads, seq_len, TURBO_DIM))
-    v = mx.random.normal((batch, heads, seq_len, TURBO_DIM))
-    return k, v
-
-
 def _filled(left_padding, seq_len, batch=None, bits=TURBO_BITS):
     batch = len(left_padding) if batch is None else batch
     cache = BatchTurboQuantKVCache(left_padding, bits=bits)
-    keys, values = cache.update_and_fetch(*_turbo_rand_kv(batch, seq_len))
+    keys, values = cache.update_and_fetch(*_rand_kv(batch, seq_len))
     return cache, keys, values
 
 

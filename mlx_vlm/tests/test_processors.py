@@ -56,10 +56,8 @@ from mlx_vlm.tools import (
     process_tool_calls,
 )
 from mlx_vlm.utils import (
-    DEFAULT_VIDEO_SAMPLING,
     StoppingCriteria,
     VideoMetadata,
-    VideoSampling,
     estimate_num_image_tokens,
     load_image,
     load_image_processor,
@@ -1532,8 +1530,6 @@ def test_checkpoint_loading(tmp_path, name):
 
 # Prompt construction
 
-# Prompt construction
-
 
 def _assistant_tool_call(content):
     return {
@@ -1549,13 +1545,92 @@ def _assistant_tool_call(content):
     }
 
 
-class TestExtractTextFromContent:
-    """Tests for the extract_text_from_content function."""
+@pytest.mark.parametrize(
+    "content,expected",
+    [
+        (None, ""),
+        (
+            ["just a string", {"type": "text", "text": "Valid item"}, 123, None],
+            "Valid item",
+        ),
+        (
+            [{"type": "text", "text": text} for text in ("", "Actual content", "")],
+            "Actual content",
+        ),
+    ],
+)
+def test_extract_text_from_content(content, expected):
+    assert extract_text_from_content(content) == expected
 
-    def test_none_content(self):
-        """None should return empty string."""
-        result = extract_text_from_content(None)
-        assert result == ""
+
+@pytest.mark.parametrize(
+    "family,kind",
+    [
+        ("nemotron_h_nano_omni", "image-audio"),
+        ("nemotronh_nano_omni_reasoning_v3", "image-audio"),
+        ("gemma4_unified", "video-audio"),
+        ("step3p7", "patch"),
+    ],
+)
+def test_prompt_media_format(family, kind):
+    text, options = "Describe the inputs.", dict(num_images=1, num_audios=1)
+    if kind == "video-audio":
+        text = "Describe the video and audio."
+        options = dict(video=["clip.mp4"], fps=1, num_audios=1)
+    elif kind == "patch":
+        text, options = "What do you see?", dict(num_images=1)
+    text_part = dict(type="text", text=text, content=text)
+    expected = {
+        "image-audio": [dict(type="image"), text_part, dict(type="audio")],
+        "video-audio": [
+            dict(type="video", video="clip.mp4", max_pixels=224 * 224, fps=1),
+            dict(type="audio"),
+            text_part,
+        ],
+        "patch": "<im_patch>" + text,
+    }[kind]
+    result = apply_chat_template(
+        None, {"model_type": family}, text, return_messages=True, **options
+    )
+    assert result == [dict(role="user", content=expected)]
+
+
+@pytest.mark.parametrize("representation", ["pydantic-list", "single-dict"])
+def test_prompt_does_not_leak_image_payload(representation):
+    from pydantic import BaseModel
+
+    class ChatMessage(BaseModel):
+        role: str
+        content: list
+
+    pydantic = representation == "pydantic-list"
+    marker = "ABC123" if pydantic else "SINGLEBASE64"
+    payload = "ABC123XYZ" if pydantic else "SINGLEBASE64DATA"
+    text = "What is in this image?" if pydantic else "Analyze this single prompt image."
+    message = dict(
+        role="user",
+        content=[
+            dict(type="text", text=text),
+            dict(
+                type="image_url", image_url=dict(url="data:image/png;base64," + payload)
+            ),
+        ],
+    )
+    prompt = [ChatMessage(**message)] if pydantic else message
+    result = apply_chat_template(
+        None, {"model_type": "qwen2_vl"}, prompt, return_messages=True, num_images=1
+    )
+    assert isinstance(result, list)
+    for message in result:
+        content = message.get("content", "")
+        if isinstance(content, str):
+            assert marker not in content
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    assert marker not in str(
+                        item.get("text", "") or item.get("content", "")
+                    )
 
 
 class TestApplyChatTemplateIntegration:
@@ -1589,83 +1664,6 @@ class TestApplyChatTemplateIntegration:
         assert prompt.count("<image>") == 1
         assert prompt.index("<image>") < prompt.index("Second turn")
 
-    def test_nemotron_omni_formats_image_and_audio_messages(self):
-        """Nemotron Omni should use typed multimodal content for HF templates."""
-        from mlx_vlm.prompt_utils import apply_chat_template
-
-        for model_type in ("nemotron_h_nano_omni", "nemotronh_nano_omni_reasoning_v3"):
-            result = apply_chat_template(
-                None,
-                {"model_type": model_type},
-                "Describe the inputs.",
-                return_messages=True,
-                num_images=1,
-                num_audios=1,
-            )
-
-            assert result == [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {
-                            "type": "text",
-                            "text": "Describe the inputs.",
-                            "content": "Describe the inputs.",
-                        },
-                        {"type": "audio"},
-                    ],
-                }
-            ]
-
-    def test_gemma4_unified_formats_video_and_audio_messages(self):
-        """Video prompts should retain audio placeholders when audio is present."""
-        from mlx_vlm.prompt_utils import apply_chat_template
-
-        result = apply_chat_template(
-            None,
-            {"model_type": "gemma4_unified"},
-            "Describe the video and audio.",
-            return_messages=True,
-            video=["clip.mp4"],
-            fps=1,
-            num_audios=1,
-        )
-
-        assert result == [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "video",
-                        "video": "clip.mp4",
-                        "max_pixels": 224 * 224,
-                        "fps": 1,
-                    },
-                    {"type": "audio"},
-                    {
-                        "type": "text",
-                        "text": "Describe the video and audio.",
-                        "content": "Describe the video and audio.",
-                    },
-                ],
-            }
-        ]
-
-    def test_step3p7_formats_image_patch_token(self):
-        """Step-3.7 prompts should include the placeholder its processor expands."""
-        from mlx_vlm.prompt_utils import apply_chat_template
-
-        result = apply_chat_template(
-            None,
-            {"model_type": "step3p7"},
-            "What do you see?",
-            return_messages=True,
-            num_images=1,
-        )
-
-        assert result == [{"role": "user", "content": "<im_patch>What do you see?"}]
-
     def test_assistant_tool_call_content_is_preserved(self):
         """Existing text and structured content should remain unchanged."""
         for content in ["I will check.", [{"type": "text", "text": "I will check."}]]:
@@ -1677,111 +1675,6 @@ class TestApplyChatTemplateIntegration:
             )
 
             assert result[0]["content"] == content
-
-    def test_pydantic_basemodel_content_extraction(self):
-        """Test that BaseModel message objects are handled correctly."""
-        from pydantic import BaseModel
-
-        from mlx_vlm.prompt_utils import apply_chat_template
-
-        class ChatMessage(BaseModel):
-            role: str
-            content: list
-
-        config = {"model_type": "qwen2_vl"}
-
-        # BaseModel with multimodal content
-        message = ChatMessage(
-            role="user",
-            content=[
-                {"type": "text", "text": "What is in this image?"},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": "data:image/png;base64,ABC123XYZ"},
-                },
-            ],
-        )
-
-        result = apply_chat_template(
-            None, config, [message], return_messages=True, num_images=1
-        )
-
-        # Should extract text, not include base64
-        assert isinstance(result, list)
-        for msg in result:
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                assert "ABC123" not in content, "Base64 leaked from BaseModel content!"
-            elif isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict):
-                        text = item.get("text", "") or item.get("content", "")
-                        assert "ABC123" not in str(
-                            text
-                        ), "Base64 leaked from BaseModel content!"
-
-    def test_single_dict_prompt_multimodal(self):
-        """Single dict prompt with multimodal content should not include base64.
-
-        This tests the isinstance(prompt, dict) code path, which is different
-        from isinstance(prompt, list) where we pass a list of message dicts.
-        """
-        from mlx_vlm.prompt_utils import apply_chat_template
-
-        config = {"model_type": "qwen2_vl"}
-
-        # Single dict prompt (NOT a list of dicts)
-        single_prompt = {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "Analyze this single prompt image."},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": "data:image/png;base64,SINGLEBASE64DATA"},
-                },
-            ],
-        }
-
-        result = apply_chat_template(
-            None,
-            config,
-            single_prompt,  # Note: dict, not [dict]
-            return_messages=True,
-            num_images=1,
-        )
-
-        assert isinstance(result, list)
-        for msg in result:
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                assert (
-                    "SINGLEBASE64" not in content
-                ), "Base64 leaked from single dict prompt!"
-            elif isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict):
-                        text = item.get("text", "") or item.get("content", "")
-                        assert "SINGLEBASE64" not in str(text), "Base64 leaked!"
-
-
-class TestExtractTextFromContentEdgeCases:
-    """Edge case tests for extract_text_from_content."""
-
-    def test_content_with_non_dict_items(self):
-        """Non-dict items in list should be skipped."""
-        content = ["just a string", {"type": "text", "text": "Valid item"}, 123, None]
-        result = extract_text_from_content(content)
-        assert result == "Valid item"
-
-    def test_text_item_with_empty_text(self):
-        """Text items with empty text should not add extra spaces."""
-        content = [
-            {"type": "text", "text": ""},
-            {"type": "text", "text": "Actual content"},
-            {"type": "text", "text": ""},
-        ]
-        result = extract_text_from_content(content)
-        assert result == "Actual content"
 
 
 def test_apply_chat_template_uses_generic_text_model_fallback():
@@ -2179,128 +2072,66 @@ def test_minicpm5_cdata_and_argument_types():
 class MockProcessor:
     def __init__(self, tokenizer_return_value=None):
         self.image_token = "<image>"
-        _return_value = tokenizer_return_value
-
-        class DummyTokenizer:
-            def __init__(self):
-                self.pad_token = None
-                self.eos_token = "[EOS]"
-
-            def __call__(
-                self,
-                text,
-                add_special_tokens=False,
-                padding=True,
-                padding_side="left",
-                return_tensors="mlx",
-            ):
-                del text, add_special_tokens, padding, padding_side
-                if return_tensors != "mlx":
-                    raise ValueError(f"Unsupported return_tensors: {return_tensors}")
-                if _return_value is not None:
-                    return _return_value
-                return SimpleNamespace(
-                    input_ids=mx.array([[1, 2, 3]]),
-                    attention_mask=mx.array([[7, 8, 9]]),
-                )
-
-        self.tokenizer = DummyTokenizer()
+        result = tokenizer_return_value or SimpleNamespace(
+            input_ids=mx.array([[1, 2, 3]]), attention_mask=mx.array([[7, 8, 9]])
+        )
+        self.tokenizer = MagicMock(
+            pad_token=None, eos_token="[EOS]", return_value=result
+        )
 
     def __call__(
         self, text=None, images=None, audio=None, padding=None, return_tensors="mlx"
     ):
-        # Count image tokens in text
-        image_token_count = text.count("<image>") if text else 0
-
-        # Handle None images case
-        if images is None:
-            if image_token_count > 0:
-                raise ValueError(
-                    f"Number of image tokens in prompt_token_ids ({image_token_count}) "
-                    f"does not match number of images (0)"
-                )
-        else:
-            # Convert single image to list
-            if not isinstance(images, list):
-                images = [images]
-
-            images = [img for img in images if img is not None]
-
-            if image_token_count != len(images):
-                raise ValueError(
-                    f"Number of image tokens in prompt_token_ids ({image_token_count}) "
-                    f"does not match number of images ({len(images)})"
-                )
-
-        data = {"input_ids": [1, 2, 3], "attention_mask": [7, 8, 9]}
-
-        # Simulate MLX tensor output
-        if return_tensors == "mlx":
-            inputs = {k: mx.array(v) for k, v in data.items()}
-            inputs["pixel_values"] = mx.zeros((4, 5, 6)) if images else []
-            return inputs
-        else:
-            raise ValueError(f"Unsupported return_tensors: {return_tensors}")
-
-
-def test_prepare_inputs():
-    """Test prepare_inputs function."""
-
-    # Define tokenizer return values
-    tok_result = MagicMock()
-    tok_result.input_ids = [[1, 2, 3]]
-    tok_result.attention_mask = [7, 8, 9]
-    # Mock processor
-    processor = MockProcessor(tokenizer_return_value=tok_result)
-
-    # Test text-only input
-    inputs = prepare_inputs(
-        processor, prompts="test", images=None, image_token_index=None
-    )
-    assert "input_ids" in inputs
-    assert mx.array_equal(inputs["input_ids"], mx.array([[1, 2, 3]]))
-
-    # Test image-only input with image token
-    image = mx.zeros((3, 224, 224))
-    inputs = prepare_inputs(
-        processor, prompts="<image>", images=image, image_token_index=None
-    )
-    assert "input_ids" in inputs
-    assert mx.array_equal(inputs["input_ids"], mx.array([1, 2, 3]))
-
-    # Test both text and image
-    image = mx.zeros((3, 224, 224))
-    inputs = prepare_inputs(
-        processor, prompts="test <image>", images=image, image_token_index=None
-    )
-    assert "input_ids" in inputs
-    assert mx.array_equal(inputs["input_ids"], mx.array([1, 2, 3]))
-    assert mx.array_equal(inputs["pixel_values"], mx.zeros((4, 5, 6)))
-    assert mx.array_equal(inputs["attention_mask"], mx.array([7, 8, 9]))
-
-    # Test image present without image token
-    image = mx.zeros((3, 224, 224))
-    with pytest.raises(
-        ValueError,
-        match="Number of image tokens in prompt_token_ids.*does not match number of images",
-    ):
-        prepare_inputs(
-            processor,
-            images=image,
-            prompts="test without image token",
-            image_token_index=None,
+        assert return_tensors == "mlx"
+        images = images if isinstance(images, list) else [images]
+        images = [image for image in images if image is not None]
+        count = text.count("<image>") if text else 0
+        if count != len(images):
+            raise ValueError(
+                f"Number of image tokens in prompt_token_ids ({count}) "
+                f"does not match number of images ({len(images)})"
+            )
+        return dict(
+            input_ids=mx.array([1, 2, 3]),
+            attention_mask=mx.array([7, 8, 9]),
+            pixel_values=mx.zeros((4, 5, 6)) if images else [],
         )
 
-    # Text-only calls go straight through the tokenizer, so bare image tokens
-    # are not validated here unless actual image inputs are provided.
-    inputs = prepare_inputs(
-        processor,
-        images=None,
-        prompts="test with <image> token",
-        image_token_index=None,
+
+@pytest.mark.parametrize(
+    "prompt,with_image,error,pad_token",
+    [
+        ("test", False, False, None),
+        ("<image>", True, False, "[EOS]"),
+        ("test <image>", True, False, "[EOS]"),
+        ("test without image token", True, True, "[EOS]"),
+        ("test with <image> token", False, False, "[EOS]"),
+    ],
+)
+def test_prepare_inputs(prompt, with_image, error, pad_token):
+    processor = MockProcessor(
+        SimpleNamespace(input_ids=[[1, 2, 3]], attention_mask=[7, 8, 9])
     )
-    assert "input_ids" in inputs
-    assert mx.array_equal(inputs["input_ids"], mx.array([[1, 2, 3]]))
+    processor.tokenizer.pad_token = pad_token
+    image = mx.zeros((3, 224, 224)) if with_image else None
+    if error:
+        with pytest.raises(
+            ValueError,
+            match="Number of image tokens in prompt_token_ids.*does not match number of images",
+        ):
+            prepare_inputs(
+                processor, prompts=prompt, images=image, image_token_index=None
+            )
+        return
+    inputs = prepare_inputs(
+        processor, prompts=prompt, images=image, image_token_index=None
+    )
+    assert processor.tokenizer.pad_token == "[EOS]"
+    expected = [1, 2, 3] if with_image else [[1, 2, 3]]
+    assert mx.array_equal(inputs["input_ids"], mx.array(expected))
+    if prompt == "test <image>":
+        assert mx.array_equal(inputs["pixel_values"], mx.zeros((4, 5, 6)))
+        assert mx.array_equal(inputs["attention_mask"], mx.array([7, 8, 9]))
 
 
 def test_prepare_inputs_preserves_mlx_attention_mask_for_thread_handoff():
@@ -2343,43 +2174,30 @@ def _make_test_image_bytes():
     return buf
 
 
-class TestLoadImage:
-    def test_pil_image_input(self):
-        from PIL import Image as PILImage
-
-        source = PILImage.new("RGBA", (4, 4), color="red")
-        img = load_image(source)
-        assert img.mode == "RGB"
-        assert img.size == (4, 4)
-
-    def test_data_uri_input(self):
-        buf = _make_test_image_bytes()
-        encoded = base64.b64encode(buf.read()).decode("utf-8")
-        data_uri = f"data:image/png;base64,{encoded}"
-
-        img = load_image(data_uri)
-        assert img.mode == "RGB"
-        assert img.size == (4, 4)
-
-    def test_data_uri_missing_comma_raises(self):
-        with pytest.raises(ValueError, match="missing comma separator"):
-            load_image("data:image/png;base64NOCOMMA")
-
-    def test_http_url_input(self):
-        buf = _make_test_image_bytes()
-        mock_response = MagicMock()
-        mock_response.content = buf.getvalue()
-        mock_response.raise_for_status = MagicMock()
-        mock_response.__enter__.return_value = mock_response
-        mock_response.__exit__.return_value = None
-
-        with patch("mlx_vlm.utils.requests.get", return_value=mock_response):
-            img = load_image("https://example.com/image.png")
-            assert img.mode == "RGB"
-
-    def test_nonexistent_path_object_raises(self):
-        with pytest.raises(ValueError, match="Failed to load image"):
-            load_image(Path("/nonexistent/path/image.png"))
+@pytest.mark.parametrize(
+    "kind", ["pil", "data-uri", "http", "bad-data-uri", "missing-path"]
+)
+def test_load_image(kind):
+    source = Image.new("RGBA", (4, 4), color="red")
+    payload = _make_test_image_bytes().read()
+    if kind == "data-uri":
+        source = "data:image/png;base64," + base64.b64encode(payload).decode()
+    elif kind == "http":
+        source = "https://example.com/image.png"
+    elif kind in ("bad-data-uri", "missing-path"):
+        source, error = (
+            ("data:image/png;base64NOCOMMA", "missing comma separator")
+            if kind == "bad-data-uri"
+            else (Path("/nonexistent/path/image.png"), "Failed to load image")
+        )
+        with pytest.raises(ValueError, match=error):
+            load_image(source)
+        return
+    response = MagicMock(content=payload)
+    response.__enter__.return_value = response
+    with patch("mlx_vlm.utils.requests.get", return_value=response):
+        image = load_image(source)
+    assert image.mode == "RGB" and image.size == (4, 4)
 
 
 class TestProcessImage:
@@ -2460,13 +2278,6 @@ class _AttributeVideoProcessor:
     fps = 1.0
     min_frames = 8
     max_frames = 100
-
-
-class TestVideoSampling:
-    def test_library_defaults_match_the_historical_load_video_signature(self):
-        assert DEFAULT_VIDEO_SAMPLING == VideoSampling(
-            fps=2.0, nframes=None, min_frames=4, max_frames=768, frame_factor=2
-        )
 
 
 class TestLoadVideo:

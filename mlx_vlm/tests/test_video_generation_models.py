@@ -73,6 +73,7 @@ from mlx_vlm.models.qwen3_vl.config import ModelConfig as Qwen3VLModelConfig
 from mlx_vlm.models.qwen3_vl.config import TextConfig as Qwen3VLTextConfig
 from mlx_vlm.models.qwen3_vl.language import Qwen3VLModel
 from mlx_vlm.models.qwen3_vl.qwen3_vl import Model as Qwen3VLForConditionalGeneration
+from mlx_vlm.tests.test_image_generation_models import _write_files
 
 # Video model components
 
@@ -148,7 +149,7 @@ def _tiny_transformer_config() -> MiniMaxH3TransformerConfig:
     )
 
 
-def _load_canonical_synthetic_weights(model, *, video=False):
+def _load_canonical_synthetic_weights(model, *, video=False, text=False):
     weights = []
     for offset, (key, parameter) in enumerate(sorted(tree_flatten(model.parameters()))):
         shape = parameter.shape
@@ -162,7 +163,7 @@ def _load_canonical_synthetic_weights(model, *, video=False):
         if (
             ("norm" in key and key.endswith("weight"))
             if video
-            else key.endswith("norm.weight")
+            else key.endswith("norm.weight") or (text and "layernorm.weight" in key)
         ):
             values = 1.0 + values * 0.1
         if video and parameter.ndim == 5:
@@ -599,10 +600,10 @@ def test_prompt_presentations_match_diffusers_ordering():
     assert trim_reference_num_frames(39) == 39
 
 
-def test_qwen_layer_two_matches_transformers_synthetic_golden():
-    config = Qwen3VLTextConfig(
+def _qwen_text_fields(layers, rope_key):
+    return dict(
         model_type="qwen3_vl",
-        num_hidden_layers=3,
+        num_hidden_layers=layers,
         hidden_size=12,
         intermediate_size=16,
         num_attention_heads=2,
@@ -612,20 +613,14 @@ def test_qwen_layer_two_matches_transformers_synthetic_golden():
         head_dim=6,
         rope_theta=10000.0,
         max_position_embeddings=32,
-        rope_scaling={"type": "default", "mrope_section": [1, 1, 1]},
+        rope_scaling={rope_key: "default", "mrope_section": [1, 1, 1]},
     )
+
+
+def test_qwen_layer_two_matches_transformers_synthetic_golden():
+    config = Qwen3VLTextConfig(**_qwen_text_fields(3, "type"))
     model = Qwen3VLModel(config)
-    weights = []
-    for offset, (key, parameter) in enumerate(sorted(tree_flatten(model.parameters()))):
-        values = (
-            (mx.arange(math.prod(parameter.shape)) % 29).astype(mx.float32) - 14.0
-        ) * 0.005
-        values = values + ((offset % 7) - 3) * 0.001
-        values = values.reshape(parameter.shape)
-        if key.endswith("norm.weight") or "layernorm.weight" in key:
-            values = 1.0 + values * 0.1
-        weights.append((key, values))
-    model.load_weights(weights, strict=True)
+    _load_canonical_synthetic_weights(model, text=True)
 
     with mx.stream(mx.cpu):
         hidden_states = model(
@@ -1131,17 +1126,13 @@ def _canonical_parameter_weights(model) -> dict[str, mx.array]:
 
 
 def _write_official_component(path, config, weights):
-    path.mkdir(parents=True)
-    (path / "config.json").write_text(json.dumps(config))
     name = "diffusion_pytorch_model.safetensors"
-    mx.save_safetensors(str(path / name), dict(sorted(weights.items())))
-    index = {
-        "metadata": {"total_size": sum(value.nbytes for value in weights.values())},
-        "weight_map": {key: name for key in sorted(weights)},
-    }
-    (path / "diffusion_pytorch_model.safetensors.index.json").write_text(
-        json.dumps(index)
+    index = dict(
+        metadata=dict(total_size=sum(value.nbytes for value in weights.values())),
+        weight_map={key: name for key in sorted(weights)},
     )
+    _write_files(path, metadata={"config.json": config, name + ".index.json": index})
+    mx.save_safetensors(str(path / name), dict(sorted(weights.items())))
 
 
 def _tiny_qwen_source():
@@ -1151,20 +1142,7 @@ def _tiny_qwen_source():
         "video_token_id": 30,
         "vision_start_token_id": 28,
         "vision_end_token_id": 27,
-        "text_config": {
-            "model_type": "qwen3_vl",
-            "num_hidden_layers": 51,
-            "hidden_size": 12,
-            "intermediate_size": 16,
-            "num_attention_heads": 2,
-            "rms_norm_eps": 1e-6,
-            "vocab_size": 32,
-            "num_key_value_heads": 2,
-            "head_dim": 6,
-            "rope_theta": 10000.0,
-            "max_position_embeddings": 32,
-            "rope_scaling": {"rope_type": "default", "mrope_section": [1, 1, 1]},
-        },
+        "text_config": _qwen_text_fields(51, "rope_type"),
         "vision_config": {
             "depth": 1,
             "hidden_size": 8,

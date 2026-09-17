@@ -206,10 +206,50 @@ class _Processor:
     detokenizer = _Detokenizer()
 
 
+def _native_stream(model, **options):
+    options = (
+        dict(
+            prompt="ignored",
+            input_ids=mx.array([[4]], mx.int32),
+            max_tokens=2,
+            temperature=0.0,
+        )
+        | options
+    )
+    return stream_generate(model, _Processor(), **options)
+
+
+def _native_generate(model, **options):
+    options = dict(block_length=2, gen_length=2, mask_id=127, eos_id=999) | options
+    return model.language_model.generate(mx.array([[4]], mx.int32), **options)
+
+
+def _record_generation(model, tokens):
+    calls = {}
+
+    def generate(input_ids, **kwargs):
+        calls.update(kwargs)
+        kwargs["stats"]["prompt_time"] = 1.0
+        kwargs["on_result"](
+            GenerationResult(
+                text="decoded",
+                token=3,
+                prompt_tokens=input_ids.size,
+                generation_tokens=len(tokens),
+                total_tokens=input_ids.size + len(tokens),
+                finish_reason="stop",
+            )
+        )
+        return mx.array([tokens], mx.int32)
+
+    model.language_model.generate = generate
+    return calls
+
+
 class TestDiffusionModels(unittest.TestCase):
     def dtype_consistency_test_runner(self, language_model, model_type, num_layers):
-        self.assertEqual(language_model.model_type, model_type)
-        self.assertEqual(len(language_model.layers), num_layers)
+        assert language_model.model_type == model_type
+        assert len(language_model.layers) == num_layers
         inputs = mx.array([[1, 2, 3]], dtype=mx.int32)
 
         for dtype in [mx.float32, mx.float16]:
@@ -219,7 +259,7 @@ class TestDiffusionModels(unittest.TestCase):
                 )
 
                 outputs = language_model(inputs)
-                self.assertEqual(outputs.logits.dtype, dtype)
+                assert outputs.logits.dtype == dtype
 
                 prefix_cache = [
                     StaticPrefixKVCache(max_size=8) for _ in language_model.layers
@@ -227,111 +267,52 @@ class TestDiffusionModels(unittest.TestCase):
                 mx.eval(language_model.model(inputs[:, :2], cache=prefix_cache))
                 block_cache = [StaticPrefixKVCache.from_prefix(c) for c in prefix_cache]
                 cached_outputs = language_model(inputs[:, 2:], cache=block_cache)
-                self.assertEqual(cached_outputs.logits.dtype, dtype)
+                assert cached_outputs.logits.dtype == dtype
 
     def test_llada(self):
         from mlx_vlm.models import llada2_moe
 
         config = _llada_config()
         model = llada2_moe.Model(config)
-        generate_kwargs = {}
-
-        def generate(input_ids, **kwargs):
-            generate_kwargs.update(kwargs)
-            kwargs["stats"]["prompt_time"] = 1.0
-            kwargs["on_result"](
-                GenerationResult(
-                    text="decoded",
-                    token=3,
-                    prompt_tokens=input_ids.size,
-                    generation_tokens=3,
-                    total_tokens=input_ids.size + 3,
-                    finish_reason="stop",
+        captured = _record_generation(model, [1, 2, 3])
+        tuned = dict(
+            max_denoising_steps=7,
+            block_length=16,
+            num_to_transfer=3,
+            max_transfer_per_step=2,
+            threshold=0.8,
+            min_threshold=0.6,
+            editing_threshold=0.7,
+            max_post_steps=2,
+            stability_steps=1,
+        )
+        for options in ({}, tuned, dict(num_to_transfer=2)):
+            captured.clear()
+            result = next(
+                _native_stream(
+                    model,
+                    input_ids=mx.array([[4, 5]], mx.int32),
+                    max_tokens=8,
+                    **options,
                 )
             )
-            return mx.array([[1, 2, 3]], dtype=mx.int32)
-
-        model.language_model.generate = generate
-        input_ids = mx.array([[4, 5]], dtype=mx.int32)
-
-        result = next(
-            stream_generate(
-                model,
-                _Processor(),
-                prompt="ignored",
-                input_ids=input_ids,
-                max_tokens=8,
-                temperature=0.0,
-            )
-        )
-
-        # Without explicit overrides the model generate()'s own reference
-        # defaults apply; the dispatcher must not force shared tuned values.
-        for key in (
-            "threshold",
-            "min_threshold",
-            "editing_threshold",
-            "max_post_steps",
-            "num_to_transfer",
-            "max_transfer_per_step",
-            "stability_steps",
-        ):
-            self.assertNotIn(key, generate_kwargs)
-        self.assertEqual(generate_kwargs["block_length"], 32)
-        self.assertEqual(generate_kwargs["steps"], 32)
-        self.assertEqual(result.text, "decoded")
-        self.assertEqual(result.generation_tokens, 3)
-
-        generate_kwargs.clear()
-        next(
-            stream_generate(
-                model,
-                _Processor(),
-                prompt="ignored",
-                input_ids=input_ids,
-                max_tokens=8,
-                max_denoising_steps=7,
-                block_length=16,
-                num_to_transfer=3,
-                max_transfer_per_step=2,
-                threshold=0.8,
-                min_threshold=0.6,
-                editing_threshold=0.7,
-                max_post_steps=2,
-                stability_steps=1,
-                temperature=0.0,
-            )
-        )
-
-        self.assertEqual(generate_kwargs["steps"], 7)
-        self.assertEqual(generate_kwargs["block_length"], 16)
-        self.assertEqual(generate_kwargs["num_to_transfer"], 3)
-        self.assertEqual(generate_kwargs["max_transfer_per_step"], 2)
-        self.assertEqual(generate_kwargs["threshold"], 0.8)
-        self.assertEqual(generate_kwargs["min_threshold"], 0.6)
-        self.assertEqual(generate_kwargs["editing_threshold"], 0.7)
-        self.assertEqual(generate_kwargs["max_post_steps"], 2)
-        self.assertEqual(generate_kwargs["stability_steps"], 1)
-
-        generate_kwargs.clear()
-        next(
-            stream_generate(
-                model,
-                _Processor(),
-                prompt="ignored",
-                input_ids=input_ids,
-                max_tokens=8,
-                num_to_transfer=2,
-                temperature=0.0,
-            )
-        )
-
-        self.assertNotIn("threshold", generate_kwargs)
-        self.assertNotIn("editing_threshold", generate_kwargs)
-        self.assertEqual(generate_kwargs["num_to_transfer"], 2)
-
+            assert result.text == "decoded" and result.generation_tokens == 3
+            expected = {
+                ("steps" if key == "max_denoising_steps" else key): value
+                for key, value in options.items()
+            }
+            if not options:
+                expected = dict(block_length=32, steps=32)
+                assert (
+                    not (set(tuned) - {"max_denoising_steps", "block_length"})
+                    & captured.keys()
+                )
+            elif options != tuned:
+                assert (
+                    "threshold" not in captured and "editing_threshold" not in captured
+                )
+            assert {key: captured[key] for key in expected} == expected
         model = llada2_moe.Model(config)
-
         self.dtype_consistency_test_runner(
             model.language_model, config.model_type, config.num_hidden_layers
         )
@@ -342,32 +323,14 @@ class TestDiffusionModels(unittest.TestCase):
         config = _llada_config()
         model = llada2_moe.Model(config)
 
-        results = list(
-            stream_generate(
-                model,
-                _Processor(),
-                prompt="ignored",
-                input_ids=mx.array([[4]], dtype=mx.int32),
-                max_tokens=2,
-                steps=1,
-                fps=2.0,
-                temperature=0.0,
-            )
-        )
+        results = list(_native_stream(model, steps=1, fps=2.0))
 
-        self.assertEqual(results[-1].generation_tokens, 2)
+        assert results[-1].generation_tokens == 2
 
         with self.assertRaisesRegex(ValueError, "does not support linear_speculative"):
             list(
-                stream_generate(
-                    model,
-                    _Processor(),
-                    prompt="ignored",
-                    input_ids=mx.array([[4]], dtype=mx.int32),
-                    max_tokens=2,
-                    generation_mode="diffusion",
-                    linear_speculative=True,
-                    temperature=0.0,
+                _native_stream(
+                    model, generation_mode="diffusion", linear_speculative=True
                 )
             )
 
@@ -408,13 +371,13 @@ class TestDiffusionModels(unittest.TestCase):
             mx.array([[1, 2, 3]], dtype=mx.int32),
             attention_mask=mx.array([[1, 1, 0]], dtype=mx.int32),
         )
-        self.assertEqual(bf16_outputs.logits.dtype, mx.bfloat16)
+        assert bf16_outputs.logits.dtype == mx.bfloat16
         bf16_filtered = model.language_model._top_k_logits(bf16_outputs.logits, 2)
-        self.assertEqual(bf16_filtered.dtype, mx.bfloat16)
+        assert bf16_filtered.dtype == mx.bfloat16
         _, bf16_probs = model.language_model._sample_with_temperature_topk_topp(
             bf16_outputs.logits
         )
-        self.assertEqual(bf16_probs.dtype, mx.bfloat16)
+        assert bf16_probs.dtype == mx.bfloat16
 
         score_hidden = mx.random.normal((1, 3, 16)).astype(mx.float32)
         score_weight = mx.random.normal((4096, 16)).astype(mx.float32)
@@ -427,27 +390,25 @@ class TestDiffusionModels(unittest.TestCase):
             ..., 0
         ]
         ref_probs = mx.exp(ref_logits - mx.logsumexp(score_logits, axis=-1))
-        self.assertEqual(score_tokens.tolist(), ref_tokens.tolist())
-        self.assertTrue(bool(mx.allclose(score_probs, ref_probs).item()))
+        assert score_tokens.tolist() == ref_tokens.tolist()
+        assert bool(mx.allclose(score_probs, ref_probs).item())
 
         diffusion_stats = {}
-        generated = model.language_model.generate(
-            mx.array([[4]], dtype=mx.int32),
+        generated = _native_generate(
+            model,
             block_length=4,
             steps=1,
             gen_length=8,
             max_post_steps=4,
-            mask_id=127,
-            eos_id=999,
             stats=diffusion_stats,
         )
-        self.assertEqual(generated.shape, (1, 8))
-        self.assertEqual(diffusion_stats["diffusion_sampler"], "native")
-        self.assertTrue(math.isnan(diffusion_stats["diffusion_min_threshold"]))
-        self.assertEqual(diffusion_stats["diffusion_transformers_parity"], 1.0)
-        self.assertGreaterEqual(diffusion_stats["diffusion_denoise_nfe"], 1)
-        self.assertGreaterEqual(diffusion_stats["diffusion_accepted_tokens"], 1)
-        self.assertIn("diffusion_tokens_per_denoise_forward", diffusion_stats)
+        assert generated.shape == (1, 8)
+        assert diffusion_stats["diffusion_sampler"] == "native"
+        assert math.isnan(diffusion_stats["diffusion_min_threshold"])
+        assert diffusion_stats["diffusion_transformers_parity"] == 1.0
+        assert diffusion_stats["diffusion_denoise_nfe"] >= 1
+        assert diffusion_stats["diffusion_accepted_tokens"] >= 1
+        assert "diffusion_tokens_per_denoise_forward" in diffusion_stats
 
         for sampler in (
             "native",
@@ -457,191 +418,74 @@ class TestDiffusionModels(unittest.TestCase):
             "cumulative_error",
         ):
             with self.subTest(sampler=sampler):
-                sampled = model.language_model.generate(
-                    mx.array([[4]], dtype=mx.int32),
-                    block_length=2,
-                    steps=2,
-                    gen_length=2,
-                    mask_id=127,
-                    eos_id=999,
-                    sampler=sampler,
-                    threshold=0.5,
+                sampled = _native_generate(
+                    model, steps=2, sampler=sampler, threshold=0.5
                 )
-                self.assertEqual(sampled.shape, (1, 2))
+                assert sampled.shape == (1, 2)
 
         with self.assertRaises(ValueError):
-            model.language_model.generate(
-                mx.array([[4]], dtype=mx.int32),
-                block_length=2,
-                gen_length=2,
-                mask_id=127,
-                eos_id=999,
-                sampler="bogus",
-            )
+            _native_generate(model, sampler="bogus")
 
-        mixed = model.language_model.generate(
-            mx.array([[4]], dtype=mx.int32),
-            block_length=2,
-            gen_length=2,
-            mask_id=127,
-            eos_id=999,
-            ar_weight=0.5,
-        )
-        self.assertEqual(mixed.shape, (1, 2))
+        mixed = _native_generate(model, ar_weight=0.5)
+        assert mixed.shape == (1, 2)
 
         with self.assertRaises(ValueError):
-            model.language_model.generate(
-                mx.array([[4]], dtype=mx.int32),
-                block_length=2,
-                gen_length=2,
-                mask_id=127,
-                eos_id=999,
-                ar_weight=1.5,
+            _native_generate(model, ar_weight=1.5)
+
+        for method, options in [
+            (model.language_model.ar_generate, {}),
+            (
+                model.language_model.linear_spec_generate,
+                dict(block_length=2, mask_token_id=127, threshold=0.5),
+            ),
+        ]:
+            tokens, nfe = method(
+                mx.array([[4]], mx.int32), max_new_tokens=2, eos_token_id=3, **options
             )
-
-        ar_generated, ar_nfe = model.language_model.ar_generate(
-            mx.array([[4]], dtype=mx.int32), max_new_tokens=2, eos_token_id=3
-        )
-        mx.eval(ar_generated)
-        self.assertEqual(ar_generated.shape[0], 1)
-        self.assertLessEqual(ar_generated.shape[1], 3)
-        self.assertGreaterEqual(ar_nfe, 1)
-
-        spec_generated, spec_nfe = model.language_model.linear_spec_generate(
-            mx.array([[4]], dtype=mx.int32),
-            max_new_tokens=2,
-            block_length=2,
-            eos_token_id=3,
-            mask_token_id=127,
-            threshold=0.5,
-        )
-        mx.eval(spec_generated)
-        self.assertEqual(spec_generated.shape[0], 1)
-        self.assertLessEqual(spec_generated.shape[1], 3)
-        self.assertGreaterEqual(spec_nfe, 1)
+            mx.eval(tokens)
+            assert tokens.shape[0] == 1 and tokens.shape[1] <= 3 and nfe >= 1
 
         spec_results = list(
-            stream_generate(
-                model,
-                _Processor(),
-                prompt="ignored",
-                input_ids=mx.array([[4]], dtype=mx.int32),
-                max_tokens=2,
-                generation_mode="linear_speculative",
-                linear_speculative=True,
-                temperature=0.0,
+            _native_stream(
+                model, generation_mode="linear_speculative", linear_speculative=True
             )
         )
-        self.assertGreaterEqual(len(spec_results), 1)
-        self.assertEqual(spec_results[-1].generation_tokens, 2)
+        assert len(spec_results) >= 1
+        assert spec_results[-1].generation_tokens == 2
 
         def unexpected_diffusion_generate(*args, **kwargs):
             raise AssertionError("Default Nemotron generation should use AR")
 
         model.language_model.generate = unexpected_diffusion_generate
-        default_results = list(
-            stream_generate(
-                model,
-                _Processor(),
-                prompt="ignored",
-                input_ids=mx.array([[4]], dtype=mx.int32),
-                max_tokens=1,
-                temperature=0.0,
-            )
-        )
-        self.assertEqual(default_results[-1].generation_tokens, 1)
+        default_results = list(_native_stream(model, max_tokens=1))
+        assert default_results[-1].generation_tokens == 1
 
-        diffusion_calls = {}
-
-        def diffusion_generate(input_ids, **kwargs):
-            diffusion_calls["kwargs"] = kwargs
-            kwargs["stats"]["prompt_time"] = 1.0
-            kwargs["on_result"](
-                GenerationResult(
-                    text="decoded",
-                    token=3,
-                    prompt_tokens=input_ids.size,
-                    generation_tokens=2,
-                    total_tokens=input_ids.size + 2,
-                    finish_reason="stop",
-                )
-            )
-            return mx.array([[5, 3]], dtype=mx.int32)
-
-        model.language_model.generate = diffusion_generate
-        diffusion_results = list(
-            stream_generate(
-                model,
-                _Processor(),
-                prompt="ignored",
-                input_ids=mx.array([[4]], dtype=mx.int32),
-                max_tokens=2,
-                generation_mode="diffusion",
-                sampler="native",
-                sampling_scaling_factor=2.0,
-                head_scoring="chunked",
-                temperature=0.0,
-            )
-        )
-        self.assertTrue(diffusion_calls["kwargs"])
-        self.assertNotIn("linear_speculative", diffusion_calls["kwargs"])
-        self.assertEqual(diffusion_calls["kwargs"]["steps"], 32)
-        self.assertEqual(diffusion_calls["kwargs"]["threshold"], 0.9)
-        self.assertEqual(diffusion_calls["kwargs"]["sampler"], "native")
-        self.assertEqual(diffusion_calls["kwargs"]["sampling_scaling_factor"], 2.0)
-        self.assertEqual(diffusion_calls["kwargs"]["head_scoring"], "chunked")
-        self.assertEqual(diffusion_results[-1].generation_tokens, 2)
-
-        diffusion_calls.clear()
-        list(
-            stream_generate(
-                model,
-                _Processor(),
-                prompt="ignored",
-                input_ids=mx.array([[4]], dtype=mx.int32),
-                max_tokens=2,
-                generation_mode="dlm",
-                temperature=0.0,
-            )
-        )
-        self.assertTrue(diffusion_calls["kwargs"])
-        self.assertNotIn("linear_speculative", diffusion_calls["kwargs"])
-
-        linear_calls = {}
-
-        def generate(input_ids, **kwargs):
-            linear_calls["kwargs"] = kwargs
-            kwargs["stats"]["prompt_time"] = 1.0
-            kwargs["on_result"](
-                GenerationResult(
-                    text="decoded",
-                    token=3,
-                    prompt_tokens=input_ids.size,
-                    generation_tokens=2,
-                    total_tokens=input_ids.size + 2,
-                    finish_reason="stop",
-                )
-            )
-            return mx.array([[5, 3]], dtype=mx.int32)
-
-        model.language_model.generate = generate
-        results = list(
-            stream_generate(
-                model,
-                _Processor(),
-                prompt="ignored",
-                input_ids=mx.array([[4]], dtype=mx.int32),
-                max_tokens=2,
-                generation_mode="linear_speculative",
-                linear_speculative=True,
-                temperature=0.0,
-            )
-        )
-        self.assertTrue(linear_calls["kwargs"])
-        self.assertTrue(linear_calls["kwargs"]["linear_speculative"])
-        self.assertGreaterEqual(len(results), 1)
-        self.assertEqual(results[-1].generation_tokens, 2)
-        self.assertEqual(results[-1].finish_reason, "stop")
+        captured = _record_generation(model, [5, 3])
+        for mode, options in [
+            (
+                "diffusion",
+                dict(
+                    sampler="native",
+                    sampling_scaling_factor=2.0,
+                    head_scoring="chunked",
+                ),
+            ),
+            ("dlm", {}),
+            ("linear_speculative", dict(linear_speculative=True)),
+        ]:
+            captured.clear()
+            results = list(_native_stream(model, generation_mode=mode, **options))
+            assert captured
+            if mode == "linear_speculative":
+                assert captured["linear_speculative"]
+                assert len(results) >= 1 and results[-1].finish_reason == "stop"
+            else:
+                assert "linear_speculative" not in captured
+            if mode == "diffusion":
+                expected = dict(steps=32, threshold=0.9, **options)
+                assert {key: captured[key] for key in expected} == expected
+            if mode != "dlm":
+                assert results[-1].generation_tokens == 2
 
 
 class TestMaskedDiffusionServerLane(unittest.TestCase):
@@ -669,7 +513,7 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
             on_block=on_block,
         )
 
-        self.assertEqual(len(calls), 1)
+        assert len(calls) == 1
 
     def test_stream_generate_yields_llada_model_owned_results(self):
         mx.random.seed(0)
@@ -688,9 +532,9 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
             )
         )
 
-        self.assertTrue(any(result.diffusion_block_complete for result in responses))
-        self.assertFalse(responses[-1].diffusion_block_complete)
-        self.assertIsNotNone(responses[-1].finish_reason)
+        assert any((result.diffusion_block_complete for result in responses))
+        assert not responses[-1].diffusion_block_complete
+        assert responses[-1].finish_reason is not None
 
     def test_llada_unmasking_visualizes_current_block(self):
         from mlx_vlm.models.llada2_moe import language as llada_language
@@ -726,8 +570,8 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
             llada_language.DiffusionUnmaskingVisualizer = original_visualizer
 
         force_lengths = [length for length, force in calls if force]
-        self.assertEqual(force_lengths, [4, 8])
-        self.assertEqual(calls[0], (4, True))
+        assert force_lengths == [4, 8]
+        assert calls[0] == (4, True)
 
     def test_unmasking_visualizer_preserves_decoded_newlines(self):
         from mlx_vlm.models.diffusion_visualizer import DiffusionUnmaskingVisualizer
@@ -761,7 +605,7 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
         visualizer.redrawer = FakeRedrawer()
         visualizer.visualize(mx.array([[4, 5, 6]], dtype=mx.int32), force=True)
 
-        self.assertEqual(drawn[-1], "4\n6")
+        assert drawn[-1] == "4\n6"
 
     def test_diffusion_generation_family_routing(self):
         from mlx_vlm.generate.diffusion import (
@@ -770,23 +614,23 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
         )
 
         model = self._tiny_llada()
-        self.assertTrue(is_diffusion_model(model))
-        self.assertEqual(diffusion_generation_family(model), "diffusion")
+        assert is_diffusion_model(model)
+        assert diffusion_generation_family(model) == "diffusion"
 
         # Mask-token models that default to AR stay on the batch generator.
         model.config.default_generation_mode = "ar"
-        self.assertFalse(is_diffusion_model(model))
-        self.assertIsNone(diffusion_generation_family(model))
-        self.assertTrue(is_diffusion_model(model, {"generation_mode": "diffusion"}))
-        self.assertEqual(
-            diffusion_generation_family(model, {"generation_mode": "diffusion"}),
-            "diffusion",
+        assert not is_diffusion_model(model)
+        assert diffusion_generation_family(model) is None
+        assert is_diffusion_model(model, {"generation_mode": "diffusion"})
+        assert (
+            diffusion_generation_family(model, {"generation_mode": "diffusion"})
+            == "diffusion"
         )
         model.config.default_generation_mode = None
 
         model.config.mask_token_id = None
-        self.assertFalse(is_diffusion_model(model))
-        self.assertIsNone(diffusion_generation_family(model))
+        assert not is_diffusion_model(model)
+        assert diffusion_generation_family(model) is None
 
 
 class TestDiffusionGemma:

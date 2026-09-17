@@ -82,8 +82,8 @@ def _dense_attentions():
 
 class TestMaxAbsorbedQueries(unittest.TestCase):
     def test_degenerate_dims_keep_the_decode_path(self):
-        self.assertEqual(max_absorbed_queries(64, 128, 128), 1)
-        self.assertGreaterEqual(max_absorbed_queries(1, 1, 1), 1)
+        assert max_absorbed_queries(64, 128, 128) == 1
+        assert max_absorbed_queries(1, 1, 1) >= 1
 
 
 class TestGateWiring(unittest.TestCase):
@@ -111,10 +111,9 @@ class TestGateWiring(unittest.TestCase):
             mx.eval(attn.parameters())
             with self.subTest(model=name):
                 materialized, absorbed = self._both_branches(attn, L=4, cache_len=8)
-                self.assertTrue(
-                    mx.allclose(materialized, absorbed, atol=1e-4, rtol=1e-4),
-                    f"{name}: absorbed and materialized disagree through __call__",
-                )
+                assert mx.allclose(
+                    materialized, absorbed, atol=0.0001, rtol=0.0001
+                ), f"{name}: absorbed and materialized disagree through __call__"
 
 
 class TestGatePairing(unittest.TestCase):
@@ -139,14 +138,12 @@ class TestGatePairing(unittest.TestCase):
         for m in self.MODELS:
             src = (root / m / "language.py").read_text()
             with self.subTest(model=m):
-                self.assertEqual(
-                    src.count("absorbed = L == 1 or L <= max_absorbed_queries("),
-                    1,
-                    f"{m}: expected exactly one gate decision",
-                )
-                self.assertEqual(
-                    src.count("if absorbed:"), 2, f"{m}: expected both gates to use it"
-                )
+                assert (
+                    src.count("absorbed = L == 1 or L <= max_absorbed_queries(") == 1
+                ), f"{m}: expected exactly one gate decision"
+                assert (
+                    src.count("if absorbed:") == 2
+                ), f"{m}: expected both gates to use it"
 
 
 class TestIndexerGateUnchanged(unittest.TestCase):
@@ -715,45 +712,28 @@ def _pack_bits(bits: np.ndarray) -> mx.array:
     return mx.array(packed)
 
 
-@pytest.mark.parametrize("group_size", [32, 64, 128])
-def test_one_bit_prompt_matmul_matches_dense(group_size):
-    rng = np.random.default_rng(71 + group_size)
-    input_dims = 512
-    output_dims = 7
-    bits = rng.integers(0, 2, size=(output_dims, input_dims), dtype=np.uint32)
-    weight = _pack_bits(bits)
-    scales = mx.array(
-        rng.normal(size=(output_dims, input_dims // group_size)).astype(np.float32)
+@pytest.mark.parametrize(
+    "group,input_dims,output_dims,shape,seed",
+    [
+        *[(group, 512, 7, (2, 9, 512), 71 + group) for group in (32, 64, 128)],
+        (64, 128, 128, (1, 128), 117),
+    ],
+    ids=["prompt-32", "prompt-64", "prompt-128", "wide-decode"],
+)
+def test_one_bit_matmul_matches_dense(group, input_dims, output_dims, shape, seed):
+    rng = np.random.default_rng(seed)
+    weight = _pack_bits(
+        rng.integers(0, 2, size=(output_dims, input_dims), dtype=np.uint32)
     )
-    biases = mx.array(
-        rng.normal(size=(output_dims, input_dims // group_size)).astype(np.float32)
-    )
-    x = mx.array(rng.normal(size=(2, 9, input_dims)).astype(np.float32))
-
-    out = one_bit_quantized_matmul(x, weight, scales, biases, group_size=group_size)
-    dense = dequantize_one_bit(weight, scales, biases, group_size)
-    reference = x @ dense.T
+    scales, biases = [
+        mx.array(rng.normal(size=(output_dims, input_dims // group)).astype(np.float32))
+        for _ in range(2)
+    ]
+    x = mx.array(rng.normal(size=shape).astype(np.float32))
+    out = one_bit_quantized_matmul(x, weight, scales, biases, group_size=group)
+    reference = x @ dequantize_one_bit(weight, scales, biases, group).T
     mx.eval(out, reference)
-
-    assert out.shape == (2, 9, output_dims)
-    assert mx.allclose(out, reference, rtol=1e-5, atol=1e-4).item()
-
-
-def test_one_bit_wide_decode_matmul_matches_dense():
-    rng = np.random.default_rng(117)
-    input_dims = 128
-    output_dims = 128
-    bits = rng.integers(0, 2, size=(output_dims, input_dims), dtype=np.uint32)
-    weight = _pack_bits(bits)
-    scales = mx.array(rng.normal(size=(output_dims, 2)).astype(np.float32))
-    biases = mx.array(rng.normal(size=(output_dims, 2)).astype(np.float32))
-    x = mx.array(rng.normal(size=(1, input_dims)).astype(np.float32))
-
-    out = one_bit_quantized_matmul(x, weight, scales, biases, group_size=64)
-    dense = dequantize_one_bit(weight, scales, biases, 64)
-    reference = x @ dense.T
-    mx.eval(out, reference)
-
+    assert out.shape == (*shape[:-1], output_dims)
     assert mx.allclose(out, reference, rtol=1e-5, atol=1e-4).item()
 
 
@@ -818,14 +798,7 @@ def test_replace_one_bit_checkpoint_modules_only():
     [("modelopt", "NVFP4"), ("modelopt", "W4A16_NVFP4"), ("modelopt_mixed", "NVFP4")],
 )
 def test_transform_modelopt_nvfp4_weights(quant_method, quant_algo):
-    packed = mx.arange(32, dtype=mx.uint8).reshape(2, 16)
-    weights = {
-        "layer.weight": packed,
-        "layer.weight_scale": mx.array([[56, 64], [72, 80]], dtype=mx.uint8),
-        "layer.weight_scale_2": mx.array(0.5, dtype=mx.float32),
-        "layer.input_scale": mx.array(0.25, dtype=mx.float32),
-        "layer.bias": mx.ones((2,)),
-    }
+    weights = _nvfp4_weights() | {"layer.bias": mx.ones((2,))}
 
     transformed, quantization = _transform_modelopt_nvfp4_weights(
         weights, {"quant_method": quant_method, "quant_algo": quant_algo}
@@ -839,6 +812,15 @@ def test_transform_modelopt_nvfp4_weights(quant_method, quant_algo):
     assert "layer.weight_scale_2" not in transformed
     assert "layer.input_scale" not in transformed
     assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
+def _nvfp4_weights():
+    return {
+        "layer.weight": mx.arange(32, dtype=mx.uint8).reshape(2, 16),
+        "layer.weight_scale": mx.array([[56, 64], [72, 80]], dtype=mx.uint8),
+        "layer.weight_scale_2": mx.array(0.5, dtype=mx.float32),
+        "layer.input_scale": mx.array(0.25, dtype=mx.float32),
+    }
 
 
 def test_transform_modelopt_mixed_nvfp4_fp8_weights():
@@ -1002,12 +984,11 @@ def test_modelopt_mixed_drops_fp8_kv_cache_scales():
     every full-attention layer. MLX quantizes its KV cache at runtime, so these
     must be dropped or ``load_weights(strict=True)`` rejects the checkpoint.
     """
-    weights = {
-        "layer.weight": mx.arange(32, dtype=mx.uint8).reshape(2, 16),
-        "layer.weight_scale": mx.array([[56, 64], [72, 80]], dtype=mx.uint8),
-        "layer.weight_scale_2": mx.array(0.5, dtype=mx.float32),
-        "self_attn.k_proj.k_scale": mx.array(0.125, dtype=mx.float32),
-        "self_attn.v_proj.v_scale": mx.array(0.25, dtype=mx.float32),
+    weights = _nvfp4_weights() | {
+        f"self_attn.{projection}_proj.{projection}_scale": mx.array(
+            scale, dtype=mx.float32
+        )
+        for projection, scale in [("k", 0.125), ("v", 0.25)]
     }
 
     transformed, quantization = _transform_modelopt_nvfp4_weights(
