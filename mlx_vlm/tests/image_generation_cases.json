@@ -1,0 +1,202 @@
+{
+  "models": [
+    {
+      "id": "ideogram4",
+      "config": {
+        "transformer": {
+          "emb_dim": 12,
+          "num_layers": 1,
+          "num_heads": 3,
+          "intermediate_size": 16,
+          "adanln_dim": 4,
+          "in_channels": 4,
+          "llm_features_dim": 8,
+          "mrope_section": [1, 1, 0]
+        }
+      },
+      "checks": ["transformer"]
+    },
+    {
+      "id": "z_image",
+      "config": {
+        "transformer": {
+          "hidden_size": 64,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 4,
+          "intermediate_size": 128,
+          "in_channels": 16,
+          "text_embed_dim": 32,
+          "num_hidden_layers": 2,
+          "n_refiner_layers": 1,
+          "n_context_refiner_layers": 1,
+          "adaln_embed_dim": 256,
+          "rope_sections": [4, 6, 6]
+        },
+        "text_encoder": {
+          "vocab_size": 256,
+          "hidden_size": 64,
+          "num_hidden_layers": 2,
+          "num_attention_heads": 4,
+          "num_key_value_heads": 2,
+          "intermediate_size": 128,
+          "head_dim": 16
+        },
+        "vae_decode": {
+          "in_channels": 3,
+          "out_channels": 3,
+          "latent_channels": 4,
+          "block_out_channels": [32, 64],
+          "layers_per_block": 1
+        }
+      },
+      "checks": ["transformer", "text_encoder", "vae_decode"]
+    },
+    {
+      "id": "ernie_image",
+      "config": {
+        "transformer": {
+          "hidden_size": 32,
+          "ffn_hidden_size": 64,
+          "in_channels": 8,
+          "out_channels": 8,
+          "num_layers": 2,
+          "num_attention_heads": 4,
+          "rope_axes_dim": [2, 2, 4],
+          "text_in_dim": 16
+        }
+      },
+      "checks": ["transformer"]
+    },
+    {
+      "id": "mage_flow",
+      "config": {
+        "transformer": {
+          "in_channels": 8,
+          "out_channels": 8,
+          "context_in_dim": 16,
+          "hidden_size": 32,
+          "num_heads": 4,
+          "depth": 2,
+          "axes_dim": [2, 2, 4]
+        }
+      },
+      "checks": ["transformer"]
+    }
+  ],
+  "wrappers": [
+    {
+      "id": "flux-kv-edit",
+      "family": "flux2",
+      "variant": "flux2-klein-9b-kv",
+      "task": "edit",
+      "request": {"prompt": "add sunglasses", "image_paths": ["reference.png"], "seed": 9, "steps": 2, "guidance": 1.0},
+      "expected": {"width": 24, "height": 20},
+      "metadata": {"uses_reference_kv_cache": true, "reference_count": 1}
+    },
+    {
+      "id": "ideogram-generate",
+      "family": "ideogram4",
+      "variant": "ideogram-4-fp8",
+      "task": "generate",
+      "request": {"prompt": "caption", "seed": 9, "steps": 2, "width": 10, "height": 8, "guidance": 7.0},
+      "expected": {"width": 10, "height": 8, "prompt_tokens": 3, "variant": "ideogram-4-fp8"}
+    },
+    {
+      "id": "z-edit-defaults",
+      "family": "z_image",
+      "variant": "turbo",
+      "task": "edit",
+      "request": {"prompt": "replace the cart", "image_paths": ["source.png"], "extra": {"strength": 0.55}},
+      "expected": {"width": 32, "height": 16},
+      "forwarded": {"steps": 8, "guidance": 0.0, "strength": 0.55}
+    },
+    {
+      "id": "z-edit-explicit",
+      "family": "z_image",
+      "variant": "turbo",
+      "task": "edit",
+      "request": {"prompt": "replace the cart", "image_paths": ["source.png"], "steps": 4, "guidance": 1.0},
+      "forwarded": {"steps": 4, "guidance": 1.0}
+    },
+    {
+      "id": "z-base-explicit",
+      "family": "z_image",
+      "variant": "base",
+      "task": "generate",
+      "request": {"prompt": "fox", "steps": 4, "guidance": 1.0},
+      "forwarded": {"steps": 4, "guidance": 1.0},
+      "metadata": {"guidance_mode": "disabled"}
+    },
+    {
+      "id": "ernie-base",
+      "family": "ernie_image",
+      "variant": "ernie-image",
+      "task": "generate",
+      "request": {"prompt": "a lighthouse", "seed": 7, "extra": {"negative_prompt": "fog"}},
+      "expected": {"steps": 50, "guidance": 4.0, "width": 512, "height": 512},
+      "forwarded": {"negative_prompt": "fog"},
+      "metadata": {"classifier_free_guidance": true}
+    },
+    {
+      "id": "ernie-turbo",
+      "family": "ernie_image",
+      "variant": "ernie-image-turbo",
+      "task": "generate",
+      "request": {"prompt": "a lighthouse", "seed": 7, "extra": {"negative_prompt": "fog"}},
+      "expected": {"steps": 8, "guidance": 1.0, "width": 512, "height": 512},
+      "forwarded": {"negative_prompt": "fog"},
+      "metadata": {"classifier_free_guidance": false}
+    },
+    {
+      "id": "ernie-base-edit",
+      "family": "ernie_image",
+      "variant": "ernie-image",
+      "task": "edit",
+      "request": {"prompt": "make it a convertible", "image_paths": ["source.png"], "seed": 3},
+      "expected": {"steps": 50, "guidance": 4.0}
+    }
+  ],
+  "sanitizers": [
+    {
+      "id": "z-transformer",
+      "family": "z_image",
+      "component": "transformer",
+      "keys": {
+        "all_final_layer.2-1.linear.weight": {"target": "final_layer.linear.weight", "shape": [3]},
+        "all_final_layer.2-1.adaLN_modulation.1.weight": {"target": "final_layer.adaLN_modulation.0.weight", "shape": [3]},
+        "all_x_embedder.2-1.weight": {"target": "x_embedder.weight", "shape": [3]},
+        "layers.0.attention.to_q.weight": {"target": "layers.0.attention.to_q.weight", "shape": [3]},
+        "t_embedder.mlp.0.weight": {"target": "t_embedder.linear1.weight", "shape": [3]}
+      }
+    },
+    {
+      "id": "z-text",
+      "family": "z_image",
+      "component": "text_encoder",
+      "keys": {
+        "model.embed_tokens.weight": {"target": "embed_tokens.weight", "shape": [2, 2]},
+        "model.rotary_emb.inv_freq": {"target": null, "shape": [2]}
+      }
+    },
+    {
+      "id": "ernie-text",
+      "family": "ernie_image",
+      "component": "text_encoder",
+      "keys": {
+        "language_model.model.embed_tokens.weight": {"target": "embed_tokens.weight", "shape": [4, 2]},
+        "language_model.model.rotary_emb.inv_freq": {"target": null, "shape": [1]},
+        "vision_tower.weight": {"target": null, "shape": [1]}
+      }
+    },
+    {
+      "id": "mage-transformer",
+      "family": "mage_flow",
+      "component": "transformer",
+      "keys": {
+        "transformer_blocks.0.img_mod.1.weight": {"target": "transformer_blocks.0.img_mod.linear.weight", "shape": [6, 1]},
+        "transformer_blocks.0.attn.to_out.0.bias": {"target": "transformer_blocks.0.attn.to_out.bias", "shape": [1]},
+        "transformer_blocks.0.txt_mlp.net.0.proj.weight": {"target": "transformer_blocks.0.txt_mlp.linear_in.weight", "shape": [4, 1]}
+      }
+    }
+  ]
+}

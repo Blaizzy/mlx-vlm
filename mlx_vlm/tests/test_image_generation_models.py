@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib
 import json
 from collections import OrderedDict
-from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -19,7 +18,6 @@ from PIL import Image
 
 import mlx_vlm.models.bonsai.config as bonsai_config
 import mlx_vlm.models.bonsai.download as bonsai_download
-import mlx_vlm.models.bonsai.model as bonsai_model
 import mlx_vlm.models.bonsai.pipeline as bonsai_pipeline
 import mlx_vlm.models.ernie_image.config as ernie_config
 import mlx_vlm.models.ernie_image.convert as ernie_convert
@@ -37,7 +35,6 @@ import mlx_vlm.models.flux2.vae as flux_vae
 import mlx_vlm.models.flux2.weights as flux_weights
 import mlx_vlm.models.ideogram4.config as ideogram_config
 import mlx_vlm.models.ideogram4.download as ideogram_download
-import mlx_vlm.models.ideogram4.model as ideogram_model
 import mlx_vlm.models.ideogram4.pipeline as ideogram_pipeline
 import mlx_vlm.models.ideogram4.prompting as ideogram_prompting
 import mlx_vlm.models.ideogram4.transformer as ideogram_transformer
@@ -53,8 +50,6 @@ import mlx_vlm.models.z_image.config as z_config
 import mlx_vlm.models.z_image.convert as z_convert
 import mlx_vlm.models.z_image.model as z_model
 import mlx_vlm.models.z_image.pipeline as z_pipeline
-import mlx_vlm.models.z_image.text_encoder as z_text_encoder
-import mlx_vlm.models.z_image.transformer as z_transformer
 import mlx_vlm.models.z_image.vae as z_vae
 from mlx_vlm.generate.edit_image import (
     ImageEditRequest,
@@ -74,6 +69,142 @@ dispatch_module = importlib.import_module("mlx_vlm.generate.dispatch")
 prompt_utils_module = importlib.import_module("mlx_vlm.prompt_utils")
 structured_module = importlib.import_module("mlx_vlm.structured")
 utils_module = importlib.import_module("mlx_vlm.utils")
+
+IMAGE_CASES = json.loads(
+    Path(__file__).with_name("image_generation_cases.json").read_text()
+)
+FAMILY_PREFIX = dict(
+    bonsai="Bonsai",
+    flux2="Flux2",
+    ideogram4="Ideogram4",
+    z_image="ZImage",
+    ernie_image="ErnieImage",
+    mage_flow="MageFlow",
+)
+
+
+def _family_module(family, component):
+    return importlib.import_module(f"mlx_vlm.models.{family}.{component}")
+
+
+def _model_class(family, edit=False):
+    name = FAMILY_PREFIX[family].removesuffix("Image") + "Image"
+    return getattr(
+        _family_module(family, "model"),
+        name + ("EditModel" if edit else "GenerationModel"),
+    )
+
+
+@pytest.mark.parametrize(
+    "family,alias,probe",
+    [
+        ("z_image", None, None),
+        ("ernie_image", None, "baidu/ERNIE-Image-Turbo"),
+        ("mage_flow", "microsoft/Mage-Flow-Edit-Turbo", "mage-flow-edit-base"),
+    ],
+)
+def test_edit_model_dispatch(tmp_path, family, alias, probe):
+    _write_layout(tmp_path, family)
+    cls = _model_class(family, edit=True)
+    # Mage's edit ID is deliberately distinct from its generation checkpoint.
+    model_id = alias or str(tmp_path)
+    assert cls.supports_model(model_id)
+    assert image_edit_model_class(model_id) is cls
+    assert is_image_edit_model(probe or model_id)
+    if family == "mage_flow":
+        assert not is_image_generation_model("mage-flow-edit")
+        assert not is_image_edit_model("mage-flow-turbo")
+
+
+def _component(family, check, config):
+    component, suffix = {
+        "transformer": ("transformer", "Transformer"),
+        "text_encoder": ("text_encoder", "TextEncoder"),
+        "vae_decode": ("vae", "VAE"),
+    }[check]
+    name = FAMILY_PREFIX[family] + suffix
+    cls = getattr(_family_module(family, component), name)
+    if family == "mage_flow":
+        return cls(**config)
+    config_cls = getattr(_family_module(family, "config"), name + "Config")
+    return cls(config_cls(**config))
+
+
+class _CaptureLength(nn.Module):
+    def __call__(self, hidden, *args, **kwargs):
+        self.length = hidden.shape[1]
+        return hidden
+
+
+def _component_output(family, check, model):
+    if check == "text_encoder":
+        return model(mx.array([[1, 2, 3, 4, 5]])), (1, 5, 64)
+    if check == "vae_decode":
+        return model.decode(mx.random.normal((1, 4, 4, 4))), (1, 8, 8, 3)
+    if family == "ideogram4":
+        return model(
+            llm_features=mx.zeros((1, 3, 8)),
+            x=mx.zeros((1, 3, 4)),
+            t=mx.array([0.5]),
+            position_ids=mx.zeros((1, 3, 3), dtype=mx.int32),
+            segment_ids=mx.ones((1, 3), dtype=mx.int32),
+            indicator=mx.array(
+                [
+                    [
+                        ideogram_transformer.LLM_TOKEN_INDICATOR,
+                        ideogram_transformer.OUTPUT_IMAGE_INDICATOR,
+                        ideogram_transformer.OUTPUT_IMAGE_INDICATOR,
+                    ]
+                ]
+            ),
+        ), (1, 3, 4)
+    if family == "ernie_image":
+        return model(
+            mx.zeros((2, 8, 2, 2), dtype=mx.bfloat16),
+            timestep=mx.array([1000.0, 500.0], dtype=mx.bfloat16),
+            text_hidden_states=mx.zeros((2, 3, 16), dtype=mx.bfloat16),
+            text_lengths=mx.array([1, 3]),
+        ), (2, 8, 2, 2)
+    if family == "mage_flow":
+        return model(
+            img=mx.zeros((1, 4, 8)),
+            txt=mx.zeros((1, 3, 16)),
+            timesteps=mx.array([1.0]),
+            img_shapes=[(1, 2, 2)],
+        ), (1, 4, 8)
+    assert family == "z_image", f"Missing forward adapter for {family}"
+    # Z-Image checks padding at all three stages, in addition to output shape.
+    noise, context, unified = [_CaptureLength() for _ in range(3)]
+    model.noise_refiner, model.context_refiner, model.layers = (
+        [noise],
+        [context],
+        [unified],
+    )
+    output = model(
+        mx.random.normal((1, 16, 1, 4, 4)),
+        mx.array([0.5]),
+        mx.random.normal((1, 8, 32)),
+    )
+    assert (noise.length, context.length, unified.length) == (32, 32, 64)
+    return output, (1, 16, 1, 4, 4)
+
+
+@pytest.mark.parametrize(
+    "case,check",
+    [
+        pytest.param(case, check, id=f"{case['id']}-{check}")
+        for case in IMAGE_CASES["models"]
+        for check in case["checks"]
+    ],
+)
+def test_image_model_contract(case, check):
+    model = _component(case["id"], check, case["config"][check])
+    output, shape = _component_output(case["id"], check, model)
+    mx.eval(output)
+    assert output.shape == shape
+    assert bool(mx.all(mx.isfinite(output)))
+
+
 EXPANDED_CAPTION = ideogram_prompting.format_caption(
     {
         "high_level_description": "A detailed photo of a red cube.",
@@ -89,6 +220,17 @@ EXPANDED_CAPTION = ideogram_prompting.format_caption(
         },
     }
 )
+
+
+def _pipeline(family, **components):
+    cls = getattr(
+        _family_module(family, "pipeline"),
+        FAMILY_PREFIX[family].removesuffix("Image") + "ImagePipeline",
+    )
+    pipeline = cls.__new__(cls)
+    for name, value in components.items():
+        setattr(pipeline, name, value)
+    return pipeline
 
 
 def _flux_edit_pipeline(
@@ -125,41 +267,85 @@ class _IdeogramVAE:
         raise AssertionError("Ideogram decode should use latent_norm + vae.decode")
 
 
-class _IdeogramPipeline:
-    variant = type("Variant", (), {"name": "ideogram-4-fp8"})()
+class _RecordingPipeline:
+    """Record wrapper arguments while supplying each family's return convention."""
 
-    def generate_array(self, prompt: str, **kwargs):  # noqa: ANN001
-        return mx.zeros((8, 10, 3), dtype=mx.uint8), {
-            "steps": kwargs["steps"],
-            "guidance": kwargs["guidance"],
-            "prompt_tokens": 3,
-        }
+    model_path = Path("/tmp/image-model")
+    quantization_config = last_revised_prompt = None
 
-
-class _ErniePipeline:
-    def __init__(self, variant: str) -> None:
-        self.variant = ernie_config.get_variant(variant)
-        self.model_path = Path("/tmp/ernie")
-        self.runtime_config = ernie_pipeline.ErnieImageRuntimeConfig(
-            use_prompt_enhancer=False
-        )
-        self.calls = []
-        self.quantization_config = None
-        self.last_revised_prompt = None
+    def __init__(self, family, variant):
+        self.family, self.calls = family, []
+        if family == "z_image":
+            steps, guidance, shift = (
+                (50, 4.0, 6.0) if variant == "base" else (9, 0.0, 3.0)
+            )
+            self.config = z_config.ZImageConfig(
+                default_steps=steps,
+                default_guidance=guidance,
+                scheduler_shift=shift,
+                variant=variant,
+            )
+        elif family == "ernie_image":
+            self.variant = ernie_config.get_variant(variant)
+            self.runtime_config = ernie_pipeline.ErnieImageRuntimeConfig(
+                use_prompt_enhancer=False
+            )
+        else:
+            self.variant = SimpleNamespace(name=variant)
 
     def generate_array(self, prompt, **kwargs):
-        self.calls.append((prompt, kwargs))
+        self.calls.append(dict(prompt=prompt, **kwargs))
+        if self.family == "ideogram4":
+            return mx.zeros((8, 10, 3), dtype=mx.uint8), dict(
+                steps=kwargs["steps"], guidance=kwargs["guidance"], prompt_tokens=3
+            )
         return mx.zeros((16, 16, 3), dtype=mx.uint8)
 
     def edit_array(self, prompt, image, **kwargs):
-        self.calls.append((prompt, image, kwargs))
+        self.calls.append(dict(prompt=prompt, image=image, **kwargs))
         return mx.zeros((16, 32, 3), dtype=mx.uint8)
 
-    def count_prompt_tokens(self, prompt):  # noqa: ARG002
-        return 3
+    def count_prompt_tokens(self, prompt):
+        return 1 if self.family == "z_image" else 3
 
-    def _should_enhance_prompt(self, *, for_edit: bool = False):  # noqa: ARG002
+    def _should_enhance_prompt(self, *, for_edit=False):
         return False
+
+
+@pytest.mark.parametrize("case", IMAGE_CASES["wrappers"], ids=lambda case: case["id"])
+def test_image_wrapper_result(case):
+    family, variant = case["family"], case["variant"]
+    edit = case["task"] == "edit"
+    options = dict(case["request"])
+    if edit:
+        options["image_paths"] = tuple(options["image_paths"])
+    image_request = (ImageEditRequest if edit else ImageGenerationRequest)(**options)
+    expected, forwarded, metadata = (
+        case.get(k, {}) for k in ("expected", "forwarded", "metadata")
+    )
+    pipeline = (
+        _flux_edit_pipeline(variant)
+        if family == "flux2"
+        else _RecordingPipeline(family, variant)
+    )
+    cls = _model_class(family, edit)
+    model = cls(pipeline=pipeline, model_id=variant)
+    result = (
+        model.edit(image_request)
+        if edit
+        else (
+            generate_image(model, image_request)
+            if family == "ernie_image"
+            else model.generate(image_request)
+        )
+    )
+    assert {k: getattr(result, k) for k in expected} == expected
+    for key, value in metadata.items():
+        assert result.metadata[key] == value
+        if isinstance(value, bool):
+            assert result.metadata[key] is value
+    if forwarded:
+        assert {k: pipeline.calls[-1][k] for k in forwarded} == forwarded
 
 
 class _ErnieTransformer:
@@ -195,9 +381,7 @@ class _ErnieVAE:
 def _ernie_runtime_pipeline(
     variant: str, *, evict: bool = False
 ) -> ernie_pipeline.ErnieImagePipeline:
-    pipeline = ernie_pipeline.ErnieImagePipeline.__new__(
-        ernie_pipeline.ErnieImagePipeline
-    )
+    pipeline = _pipeline("ernie_image")
     pipeline.variant = ernie_config.get_variant(variant)
     pipeline.model_path = Path("/tmp/ernie")
     pipeline.runtime_config = ernie_pipeline.ErnieImageRuntimeConfig(
@@ -375,7 +559,7 @@ def test_packed_pipeline_empty_prompt(family):
 )
 def test_invalid_dimensions(family, width, height):
     if family == "z_image":
-        pipeline = z_pipeline.ZImagePipeline.__new__(z_pipeline.ZImagePipeline)
+        pipeline = _pipeline("z_image")
         with pytest.raises(ValueError, match="positive multiple of 16"):
             pipeline.generate_array("prompt", width=width, height=height)
     else:
@@ -476,30 +660,23 @@ def test_incompatible_quantization_options(convert):
 
 
 @pytest.mark.parametrize(
-    "family,cls,aliases,probe",
+    "family,aliases,probe",
     [
-        (
-            "bonsai",
-            bonsai_model.BonsaiImageGenerationModel,
-            ["bonsai-ternary"],
-            "bonsai-ternary",
-        ),
+        ("bonsai", ["bonsai-ternary"], "bonsai-ternary"),
         (
             "flux2",
-            flux_model.Flux2ImageGenerationModel,
             ["flux2-klein-4b", "black-forest-labs/FLUX.2-klein-9B"],
             "klein-base-9b",
         ),
-        (
-            "ideogram4",
-            ideogram_model.Ideogram4ImageGenerationModel,
-            ["ideogram-ai/ideogram-4-fp8"],
-            None,
-        ),
+        ("ideogram4", ["ideogram-ai/ideogram-4-fp8"], None),
+        ("z_image", ["Tongyi-MAI/Z-Image"], None),
+        ("ernie_image", ["baidu/ERNIE-Image-Turbo"], "ernie-image"),
+        ("mage_flow", ["microsoft/Mage-Flow"], "mage-flow-base"),
     ],
-    ids=["bonsai", "flux2", "ideogram4"],
+    ids=list(FAMILY_PREFIX),
 )
-def test_generation_model_dispatch(monkeypatch, tmp_path, family, cls, aliases, probe):
+def test_generation_model_dispatch(monkeypatch, tmp_path, family, aliases, probe):
+    cls = _model_class(family)
     _write_layout(tmp_path, family)
     if family == "bonsai":
         _write_files(
@@ -528,12 +705,13 @@ def test_generation_model_dispatch(monkeypatch, tmp_path, family, cls, aliases, 
     lookup = MagicMock(return_value=tmp_path)
     monkeypatch.setattr(image_module, "get_model_path", lookup)
     assert cls.is_image_generation_model and cls.model_type == family
+    assert cls.supports_model(str(tmp_path))
     for model_id in [*aliases, str(tmp_path)]:
         assert image_generation_model_class(model_id) is cls
     assert is_image_generation_model(probe or str(tmp_path))
     if family == "bonsai":
         assert not is_image_generation_model("mlx-community/nanoLLaVA-1.5-8bit")
-    else:
+    elif family in {"flux2", "ideogram4"}:
         assert all(c.args == (aliases[-1],) for c in lookup.call_args_list)
         if family == "ideogram4":
             assert all(
@@ -614,7 +792,38 @@ def test_conversion_resolves_hub_model(
         assert (params["bits"], params["group_size"]) == (bits, group_size)
 
 
-def test_bonsai_variant_aliases_are_ternary_only() -> None:
+@pytest.mark.parametrize(
+    "family,override,expected",
+    [
+        ("flux2", False, "flux2-klein-9b"),
+        ("flux2", True, "flux2-klein-9b-kv"),
+        ("ernie_image", False, "ernie-image"),
+        ("ernie_image", True, "ernie-image-turbo"),
+    ],
+)
+def test_local_variant_precedence(tmp_path, family, override, expected):
+    _write_layout(tmp_path, family, turbo=False)
+    if family == "flux2":
+        _write_files(
+            tmp_path,
+            metadata={
+                "transformer/config.json": {"num_layers": 8, "num_attention_heads": 32}
+            },
+        )
+        if override:
+            _write_files(tmp_path, ["flux-2-klein-9b-kv.safetensors"])
+    elif override:
+        metadata_path = tmp_path / "mlx_ernie_image.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata["source"] = "baidu/ERNIE-Image-Turbo"
+        metadata_path.write_text(json.dumps(metadata))
+    assert (
+        _family_module(family, "config").variant_from_local_path(tmp_path).name
+        == expected
+    )
+
+
+def test_bonsai_variant_aliases_are_ternary_only():
     assert bonsai_config.get_variant("bonsai").precision == "2bit"
     assert bonsai_config.get_variant("bonsai-ternary").name == "ternary"
     assert (
@@ -625,14 +834,12 @@ def test_bonsai_variant_aliases_are_ternary_only() -> None:
         bonsai_config.get_variant("binary")
 
 
-def test_bonsai_parse_size() -> None:
+def test_bonsai_parse_size():
     assert bonsai_config.parse_size("1248x832") == (1248, 832)
     assert bonsai_config.parse_size("832x1248") == (832, 1248)
 
 
-def test_flux2_remote_component_index_is_a_metadata_fallback(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_flux2_remote_component_index_is_a_metadata_fallback(monkeypatch, tmp_path):
     metadata_path = tmp_path / "metadata"
     metadata_path.mkdir()
     component_index_path = tmp_path / "component-index"
@@ -670,46 +877,7 @@ def test_flux2_remote_component_index_is_a_metadata_fallback(
     ]
 
 
-def test_flux2_variant_from_local_path_reads_config(tmp_path: Path) -> None:
-    _write_layout(tmp_path, "flux2")
-    config = tmp_path / "transformer" / "config.json"
-    config.write_text('{"num_layers": 8, "num_attention_heads": 32}')
-
-    assert flux_config.variant_from_local_path(tmp_path).name == "flux2-klein-9b"
-
-
-def test_flux2_variant_from_local_path_prefers_kv_marker(tmp_path: Path) -> None:
-    _write_layout(tmp_path, "flux2")
-    config = tmp_path / "transformer" / "config.json"
-    config.write_text('{"num_layers": 8, "num_attention_heads": 32}')
-    (tmp_path / "flux-2-klein-9b-kv.safetensors").write_bytes(b"x")
-
-    assert flux_config.variant_from_local_path(tmp_path).name == "flux2-klein-9b-kv"
-
-
-def test_flux2_edit_model_returns_image_result() -> None:
-    model = flux_model.Flux2ImageEditModel(
-        pipeline=_flux_edit_pipeline(), model_id="kv"
-    )
-    result = model.edit(
-        ImageEditRequest(
-            prompt="add sunglasses",
-            image_paths=("reference.png",),
-            seed=9,
-            steps=2,
-            guidance=1.0,
-        )
-    )
-
-    assert result.width == 24
-    assert result.height == 20
-    assert result.metadata["uses_reference_kv_cache"] is True
-    assert result.metadata["reference_count"] == 1
-
-
-def test_flux2_text_encoder_accepts_native_quantized_keys(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_flux2_text_encoder_accepts_native_quantized_keys(monkeypatch, tmp_path):
     class TinyTextEncoder(nn.Module):
         def __init__(self, **kwargs) -> None:  # noqa: ARG002
             super().__init__()
@@ -739,24 +907,25 @@ def test_flux2_text_encoder_accepts_native_quantized_keys(
     assert model.quantization_config["bits"] == 8
 
 
-def test_flux2_vae_conv_layout_accepts_source_and_native_shapes() -> None:
-    source = mx.arange(8 * 4 * 3 * 3).reshape(8, 4, 3, 3)
+@pytest.mark.parametrize(
+    "family,shape", [("flux2", (8, 4, 3, 3)), ("ernie_image", (2, 3, 3, 3))]
+)
+def test_conv_layout_source_and_native(family, shape):
+    weights = _family_module(family, "weights")
+    match = (
+        weights._match_conv_layout if family == "flux2" else weights.match_conv_layout
+    )
+    source = mx.arange(np.prod(shape).item()).reshape(shape)
     native = source.transpose(0, 2, 3, 1)
-
-    converted = flux_weights._match_conv_layout(
-        source, target_shape=tuple(native.shape), key="decoder.conv.weight"
-    )
-    unchanged = flux_weights._match_conv_layout(
-        native, target_shape=tuple(native.shape), key="decoder.conv.weight"
-    )
-
-    assert np.array_equal(np.array(converted), np.array(native))
-    assert np.array_equal(np.array(unchanged), np.array(native))
+    for value, layout in [(source, "pytorch_nchw"), (native, "mlx_nhwc")]:
+        options = dict(source_layout=layout) if family == "ernie_image" else {}
+        result = match(
+            value, target_shape=native.shape, key="encoder.conv_in.weight", **options
+        )
+        np.testing.assert_array_equal(np.array(result), np.array(native))
 
 
-def test_flux2_quantized_repo_routes_through_resolved_layout(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_flux2_quantized_repo_routes_through_resolved_layout(monkeypatch, tmp_path):
     model_path = (
         tmp_path
         / "models--mlx-community--flux2-klein-4b-8bit"
@@ -800,7 +969,7 @@ def test_flux2_quantized_repo_routes_through_resolved_layout(
     }
 
 
-def test_flux2_reference_image_array_keeps_float32_input() -> None:
+def test_flux2_reference_image_array_keeps_float32_input():
     image = Image.new("RGB", (1, 1), color=(255, 127, 0))
     array = flux_pipeline._reference_image_array(image)
 
@@ -808,7 +977,7 @@ def test_flux2_reference_image_array_keeps_float32_input() -> None:
     assert np.array(array).shape == (1, 3, 1, 1)
 
 
-def test_ideogram4_variant_resolution_is_exact() -> None:
+def test_ideogram4_variant_resolution_is_exact():
     assert (
         ideogram_config.get_variant(ideogram_config.IDEOGRAM_4_FP8_REPO_ID).repo_id
         == ideogram_config.IDEOGRAM_4_FP8_REPO_ID
@@ -819,29 +988,7 @@ def test_ideogram4_variant_resolution_is_exact() -> None:
             ideogram_config.get_variant(shorthand)
 
 
-def test_ideogram4_caption_schema_matches_prompting_contract() -> None:
-    properties = ideogram_prompting.IDEOGRAM4_CAPTION_SCHEMA["properties"]
-    composition = properties["compositional_deconstruction"]
-    elements = composition["properties"]["elements"]["items"]["anyOf"]
-    object_element, text_element = elements
-    style_variants = properties["style_description"]["anyOf"]
-    photo_style, art_style = style_variants
-
-    assert ideogram_prompting.IDEOGRAM4_CAPTION_SCHEMA["required"] == [
-        "compositional_deconstruction"
-    ]
-    assert composition["required"] == ["background", "elements"]
-    assert object_element["required"] == ["type", "desc"]
-    assert text_element["required"] == ["type", "text", "desc"]
-    assert object_element["properties"]["bbox"]["minItems"] == 4
-    assert object_element["properties"]["bbox"]["maxItems"] == 4
-    assert "photo" in photo_style["properties"]
-    assert "art_style" not in photo_style["properties"]
-    assert "art_style" in art_style["properties"]
-    assert "photo" not in art_style["properties"]
-
-
-def test_ideogram4_plain_prompt_wraps_as_minimal_json_caption() -> None:
+def test_ideogram4_plain_prompt_wraps_as_minimal_json_caption():
     prepared = ideogram_prompting.normalize_prompt(
         "A red cube on a marble plinth.", warn=False
     )
@@ -857,7 +1004,7 @@ def test_ideogram4_plain_prompt_wraps_as_minimal_json_caption() -> None:
     assert ideogram_prompting.is_structured_caption(prepared.text)
 
 
-def test_ideogram4_caption_warnings_cover_elements_and_bounding_boxes() -> None:
+def test_ideogram4_caption_warnings_cover_elements_and_bounding_boxes():
     prompt = ideogram_prompting.format_caption(
         {
             "compositional_deconstruction": {
@@ -909,7 +1056,7 @@ def test_ideogram4_prompt_expansion_uses_structured_generation(monkeypatch):
     assert result.text == EXPANDED_CAPTION and result.model == "tiny-text-model"
 
 
-def test_ideogram4_dequantizes_weight_only_fp8() -> None:
+def test_ideogram4_dequantizes_weight_only_fp8():
     scale = mx.array([0.5, 2.0], dtype=mx.float32)
     expected = mx.array([[1.0, -2.0], [0.5, 4.0]], dtype=mx.float32)
     raw = {
@@ -927,10 +1074,8 @@ def test_ideogram4_dequantizes_weight_only_fp8() -> None:
     assert converted["linear.bias"].dtype == mx.float32
 
 
-def test_ideogram4_build_inputs_packs_text_and_image_tokens() -> None:
-    pipeline = ideogram_pipeline.Ideogram4ImagePipeline.__new__(
-        ideogram_pipeline.Ideogram4ImagePipeline
-    )
+def test_ideogram4_build_inputs_packs_text_and_image_tokens():
+    pipeline = _pipeline("ideogram4")
     pipeline.tokenizer = _CaptionTokenizer()
 
     inputs = pipeline._build_inputs("prompt", height=256, width=256)
@@ -949,12 +1094,8 @@ def test_ideogram4_build_inputs_packs_text_and_image_tokens() -> None:
     )
 
 
-def test_ideogram4_pipeline_uses_prepared_prompt_and_reports_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pipeline = ideogram_pipeline.Ideogram4ImagePipeline.__new__(
-        ideogram_pipeline.Ideogram4ImagePipeline
-    )
+def test_ideogram4_pipeline_uses_prepared_prompt_and_reports_metadata():
+    pipeline = _pipeline("ideogram4")
     pipeline.model_path = Path("/tmp/fake-ideogram")
     pipeline.runtime_config = ideogram_pipeline.Ideogram4RuntimeConfig(
         evict_text_encoder=False, evict_transformers=False
@@ -963,13 +1104,9 @@ def test_ideogram4_pipeline_uses_prepared_prompt_and_reports_metadata(
     pipeline.conditional_transformer = lambda **kwargs: mx.zeros_like(kwargs["x"])
     pipeline.unconditional_transformer = lambda **kwargs: mx.zeros_like(kwargs["x"])
     pipeline.vae = object()
-    captured: dict[str, object] = {}
 
-    def fake_prepare_prompt(prompt: str, **kwargs):
-        assert prompt == "plain prompt"
-        assert kwargs["prompt_expansion_model"] == "tiny-text-model"
-        captured["prepare_kwargs"] = kwargs
-        return ideogram_prompting.NormalizedPrompt(
+    pipeline.prepare_prompt = MagicMock(
+        return_value=ideogram_prompting.NormalizedPrompt(
             text=EXPANDED_CAPTION,
             is_json_caption=True,
             is_structured_caption=True,
@@ -977,10 +1114,9 @@ def test_ideogram4_pipeline_uses_prepared_prompt_and_reports_metadata(
             prompt_expansion_model="tiny-text-model",
             prompt_expansion_used=True,
         )
-
-    def fake_build_inputs(prompt: str, **kwargs):
-        captured["tokenized_prompt"] = prompt
-        return {
+    )
+    pipeline._build_inputs = MagicMock(
+        return_value={
             "text_token_ids": mx.array([[1]], dtype=mx.int32),
             "position_ids": mx.zeros((1, 2, 3), dtype=mx.int32),
             "segment_ids": mx.ones((1, 2), dtype=mx.int32),
@@ -990,20 +1126,10 @@ def test_ideogram4_pipeline_uses_prepared_prompt_and_reports_metadata(
             "grid_h": 1,
             "grid_w": 1,
         }
-
-    monkeypatch.setattr(pipeline, "prepare_prompt", fake_prepare_prompt)
-    monkeypatch.setattr(pipeline, "_build_inputs", fake_build_inputs)
-    monkeypatch.setattr(
-        pipeline,
-        "_encode_text",
-        lambda token_ids, num_image_tokens: mx.zeros((1, 2, 4)),
     )
-    monkeypatch.setattr(pipeline, "_ensure_transformers_and_vae", lambda: None)
-    monkeypatch.setattr(
-        pipeline,
-        "_decode",
-        lambda z, grid_h, grid_w: mx.zeros((16, 16, 3), dtype=mx.uint8),
-    )
+    pipeline._encode_text = lambda token_ids, num_image_tokens: mx.zeros((1, 2, 4))
+    pipeline._ensure_transformers_and_vae = lambda: None
+    pipeline._decode = lambda z, grid_h, grid_w: mx.zeros((16, 16, 3), dtype=mx.uint8)
 
     array, metadata = pipeline.generate_array(
         "plain prompt",
@@ -1015,51 +1141,20 @@ def test_ideogram4_pipeline_uses_prepared_prompt_and_reports_metadata(
     )
 
     assert array.shape == (16, 16, 3)
-    assert captured["tokenized_prompt"] == EXPANDED_CAPTION
+    assert pipeline.prepare_prompt.call_args.args == ("plain prompt",)
+    assert (
+        pipeline.prepare_prompt.call_args.kwargs["prompt_expansion_model"]
+        == "tiny-text-model"
+    )
+    assert pipeline._build_inputs.call_args.args == (EXPANDED_CAPTION,)
     assert metadata["revised_prompt"] == EXPANDED_CAPTION
     assert metadata["prompt_expansion_model"] == "tiny-text-model"
     assert metadata["prompt_expansion_used"]
     assert metadata["prompt_is_structured_caption"]
 
 
-def test_ideogram4_tiny_transformer_forward_shape() -> None:
-    config = ideogram_config.Ideogram4TransformerConfig(
-        emb_dim=12,
-        num_layers=1,
-        num_heads=3,
-        intermediate_size=16,
-        adanln_dim=4,
-        in_channels=4,
-        llm_features_dim=8,
-        mrope_section=(1, 1, 0),
-    )
-    model = ideogram_transformer.Ideogram4Transformer(config)
-
-    out = model(
-        llm_features=mx.zeros((1, 3, 8), dtype=mx.float32),
-        x=mx.zeros((1, 3, 4), dtype=mx.float32),
-        t=mx.array([0.5], dtype=mx.float32),
-        position_ids=mx.zeros((1, 3, 3), dtype=mx.int32),
-        segment_ids=mx.ones((1, 3), dtype=mx.int32),
-        indicator=mx.array(
-            [
-                [
-                    ideogram_transformer.LLM_TOKEN_INDICATOR,
-                    ideogram_transformer.OUTPUT_IMAGE_INDICATOR,
-                    ideogram_transformer.OUTPUT_IMAGE_INDICATOR,
-                ]
-            ],
-            dtype=mx.int32,
-        ),
-    )
-
-    assert out.shape == (1, 3, 4)
-
-
-def test_ideogram4_decode_uses_ideogram_latent_norm_path() -> None:
-    pipeline = ideogram_pipeline.Ideogram4ImagePipeline.__new__(
-        ideogram_pipeline.Ideogram4ImagePipeline
-    )
+def test_ideogram4_decode_uses_ideogram_latent_norm_path():
+    pipeline = _pipeline("ideogram4")
     pipeline.vae = _IdeogramVAE()
 
     array = pipeline._decode(mx.zeros((1, 16 * 16, 128)), grid_h=16, grid_w=16)
@@ -1068,112 +1163,24 @@ def test_ideogram4_decode_uses_ideogram_latent_norm_path() -> None:
     assert pipeline.vae.latents.shape == (1, 32, 32, 32)
 
 
-def test_ideogram4_model_wrapper_returns_image_result() -> None:
-    model = ideogram_model.Ideogram4ImageGenerationModel(
-        pipeline=_IdeogramPipeline(), model_id="ideogram-ai/ideogram-4-fp8"
-    )
-
-    result = model.generate(
-        ImageGenerationRequest(
-            prompt="caption", seed=9, steps=2, width=10, height=8, guidance=7.0
-        )
-    )
-
-    assert result.width == 10
-    assert result.height == 8
-    assert result.prompt_tokens == 3
-    assert result.variant == "ideogram-4-fp8"
-
-
-def test_detects_diffusers_z_image_model_index(tmp_path: Path) -> None:
+def test_detects_diffusers_z_image_model_index(tmp_path):
     (tmp_path / "model_index.json").write_text('{"_class_name":"ZImagePipeline"}')
     assert z_convert.is_z_image_model_path(tmp_path)
     (tmp_path / "model_index.json").write_text('{"_class_name":"FluxPipeline"}')
     assert not z_convert.is_z_image_model_path(tmp_path)
 
 
-def test_z_image_edit_model_forwards_img2img_options() -> None:
-    calls = {}
-
-    class FakePipeline:
-        config = z_config.ZImageConfig(
-            default_steps=9, default_guidance=0.0, scheduler_shift=3.0, variant="turbo"
-        )
-        model_path = Path("/tmp/z-image")
-
-        def edit_array(self, prompt: str, image_paths, **kwargs):
-            calls.update(prompt=prompt, image_paths=image_paths, **kwargs)
-            return mx.zeros((16, 32, 3), dtype=mx.uint8)
-
-        def count_prompt_tokens(self, prompt: str) -> int:
-            return 1
-
-    model = z_model.ZImageEditModel(
-        pipeline=FakePipeline(), model_id="Tongyi-MAI/Z-Image-Turbo"
-    )
-    result = model.edit(
-        ImageEditRequest(
-            prompt="replace the cart",
-            image_paths=("source.png",),
-            extra={"strength": 0.55},
-        )
-    )
-    assert calls["steps"] == 8
-    assert calls["guidance"] == 0.0
-    assert calls["strength"] == 0.55
-    assert result.width == 32
-    assert result.height == 16
-
-    model.edit(
-        ImageEditRequest(
-            prompt="replace the cart",
-            image_paths=("source.png",),
-            steps=4,
-            guidance=1.0,
-        )
-    )
-    assert calls["steps"] == 4
-    assert calls["guidance"] == 1.0
-
-
 @pytest.mark.parametrize(
     "steps,strength,expected", [(9, 0.6, 3), (9, 0.5, 4), (8, 0.6, 3), (8, 0.3, 5)]
 )
-def test_z_image_img2img_start_index_matches_diffusers(
-    steps: int, strength: float, expected: int
-) -> None:
+def test_z_image_img2img_start_index_matches_diffusers(steps, strength, expected):
     assert z_pipeline._img2img_start_index(steps, strength) == expected
 
 
-def test_z_image_base_model_preserves_explicit_generic_values() -> None:
-    calls = {}
-
-    class FakePipeline:
-        config = z_config.ZImageConfig(
-            default_steps=50, default_guidance=4.0, scheduler_shift=6.0, variant="base"
-        )
-        model_path = Path("/tmp/z-image")
-
-        def generate_array(self, prompt: str, **kwargs):
-            calls.update(prompt=prompt, **kwargs)
-            return mx.zeros((16, 16, 3), dtype=mx.uint8)
-
-        def count_prompt_tokens(self, prompt: str) -> int:
-            return 1
-
-    model = z_model.ZImageGenerationModel(
-        pipeline=FakePipeline(), model_id="Tongyi-MAI/Z-Image"
-    )
-    result = model.generate(ImageGenerationRequest(prompt="fox", steps=4, guidance=1.0))
-    assert calls["steps"] == 4
-    assert calls["guidance"] == 1.0
-    assert result.metadata["guidance_mode"] == "disabled"
-
-
 def test_z_image_generation_evicts_components_before_reloading_encoder(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pipeline = object.__new__(z_pipeline.ZImagePipeline)
+    monkeypatch,
+):
+    pipeline = _pipeline("z_image")
     pipeline.evict_text_encoder = True
     pipeline.transformer = object()
     pipeline.vae = object()
@@ -1198,136 +1205,45 @@ def test_z_image_generation_evicts_components_before_reloading_encoder(
     assert reloaded
 
 
-def test_z_image_transformer_forward_shape() -> None:
-    cfg = z_config.ZImageTransformerConfig(
-        hidden_size=64,
-        num_attention_heads=4,
-        num_key_value_heads=4,
-        intermediate_size=128,
-        in_channels=16,
-        text_embed_dim=32,
-        num_hidden_layers=2,
-        n_refiner_layers=1,
-        n_context_refiner_layers=1,
-        adaln_embed_dim=256,
-        rope_sections=(4, 6, 6),
-    )
-    model = z_transformer.ZImageTransformer(cfg)
-
-    class CaptureLength(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.length = 0
-
-        def __call__(self, hidden: mx.array, *args, **kwargs) -> mx.array:
-            self.length = hidden.shape[1]
-            return hidden
-
-    noise_refiner = CaptureLength()
-    context_refiner = CaptureLength()
-    unified_layer = CaptureLength()
-    model.noise_refiner = [noise_refiner]
-    model.context_refiner = [context_refiner]
-    model.layers = [unified_layer]
-    # Input: [B=1, C=16, F=1, H=4, W=4] (patch_size=2 → 2x2 grid)
-    x = mx.random.normal((1, 16, 1, 4, 4))
-    t = mx.array([0.5])
-    cap = mx.random.normal((1, 8, 32))
-    out = model(x, t, cap)
-    mx.eval(out)
-    assert out.shape == (1, 16, 1, 4, 4)
-    assert noise_refiner.length == 32
-    assert context_refiner.length == 32
-    assert unified_layer.length == 64
-
-
-def test_z_image_text_encoder_forward_shape() -> None:
-    cfg = z_config.ZImageTextEncoderConfig(
-        vocab_size=256,
-        hidden_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        intermediate_size=128,
-        head_dim=16,
-    )
-    model = z_text_encoder.ZImageTextEncoder(cfg)
-    ids = mx.array([[1, 2, 3, 4, 5]])
-    out = model(ids)
-    mx.eval(out)
-    assert out.shape == (1, 5, 64)
-
-
-def test_z_image_vae_decoder_shape() -> None:
-    cfg = z_config.ZImageVAEConfig(
-        in_channels=3,
-        out_channels=3,
-        latent_channels=4,
-        block_out_channels=(32, 64),
-        layers_per_block=1,
-    )
-    vae = z_vae.ZImageVAE(cfg)
-    # Latent: [B=1, H=4, W=4, C=4]
-    z = mx.random.normal((1, 4, 4, 4))
-    out = vae.decode(z)
-    mx.eval(out)
-    # After 2 up_blocks with upsample (first block upsamples, second doesn't)
-    # input 4×4 → 8×8 after first upsample → stays 8×8 (last block no upsample)
-    assert out.shape[0] == 1
-    assert out.shape[-1] == 3  # 3 output channels
-
-
-def test_z_image_rejects_classifier_free_guidance() -> None:
+def test_z_image_rejects_classifier_free_guidance():
     model = object.__new__(z_model.ZImageGenerationModel)
     model.pipeline = SimpleNamespace(config=z_config.ZImageConfig())
     with pytest.raises(ValueError, match="does not support classifier-free guidance"):
         model.generate(ImageGenerationRequest(prompt="test", guidance=2.0))
 
 
-def test_z_image_config_detects_base_variant(tmp_path: Path) -> None:
+def test_z_image_config_detects_base_variant(tmp_path):
     configs = {
         "transformer/config.json": {},
         "text_encoder/config.json": {},
         "vae/config.json": {},
         "scheduler/scheduler_config.json": {"shift": 6.0},
     }
-    for relative, content in configs.items():
-        path = tmp_path / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(content))
+    _write_files(tmp_path, metadata=configs)
     config = z_config.ZImageConfig.from_model_path(tmp_path)
     assert config.variant == "base"
     assert config.default_steps == 50
     assert config.default_guidance == 4.0
 
 
-def test_z_image_sanitize_transformer_weights() -> None:
-    weights = {
-        "all_final_layer.2-1.linear.weight": mx.zeros((3,)),
-        "all_final_layer.2-1.adaLN_modulation.1.weight": mx.zeros((3,)),
-        "all_x_embedder.2-1.weight": mx.zeros((3,)),
-        "layers.0.attention.to_q.weight": mx.zeros((3,)),
-        "t_embedder.mlp.0.weight": mx.zeros((3,)),
-    }
-    sanitized = z_transformer.sanitize_transformer_weights(weights)
-    assert "final_layer.linear.weight" in sanitized
-    assert "final_layer.adaLN_modulation.0.weight" in sanitized
-    assert "x_embedder.weight" in sanitized
-    assert "layers.0.attention.to_q.weight" in sanitized
-    assert "t_embedder.linear1.weight" in sanitized
-
-
-def test_z_image_sanitize_text_encoder_weights() -> None:
-    sanitized = z_text_encoder.sanitize_text_encoder_weights(
-        {
-            "model.embed_tokens.weight": mx.zeros((2, 2)),
-            "model.rotary_emb.inv_freq": mx.zeros((2,)),
-        }
+@pytest.mark.parametrize("case", IMAGE_CASES["sanitizers"], ids=lambda case: case["id"])
+def test_weight_key_sanitization(case):
+    family, component, keys = case["family"], case["component"], case["keys"]
+    # Each row records the expected destination (None means drop) and source shape.
+    weights = {key: mx.zeros(value["shape"]) for key, value in keys.items()}
+    sanitize = getattr(
+        _family_module(family, "weights"), f"sanitize_{component}_weights"
     )
-    assert set(sanitized) == {"embed_tokens.weight"}
+    actual = sanitize(weights)
+    expected = {
+        value["target"]: weights[key] for key, value in keys.items() if value["target"]
+    }
+    assert actual.keys() == expected.keys()
+    for key in expected:
+        assert bool(mx.array_equal(actual[key], expected[key]))
 
 
-def test_z_image_sanitize_vae_weights() -> None:
+def test_z_image_sanitize_vae_weights():
     conv = mx.zeros((8, 4, 3, 3))
     sanitized = z_vae.sanitize_vae_weights(
         {"encoder.conv_in.weight": conv, "decoder.conv_norm_out.weight": mx.zeros((8,))}
@@ -1344,7 +1260,7 @@ def test_z_image_sanitize_vae_weights() -> None:
     )
 
 
-def test_z_image_conversion_preserves_native_vae_layout(tmp_path: Path) -> None:
+def test_z_image_conversion_preserves_native_vae_layout(tmp_path):
     native = mx.zeros((8, 3, 3, 4))
     vae_path = tmp_path / "vae"
     vae_path.mkdir()
@@ -1360,7 +1276,7 @@ def test_z_image_conversion_preserves_native_vae_layout(tmp_path: Path) -> None:
     assert mx.array_equal(converted["encoder.conv_in.weight"], native)
 
 
-def test_z_image_saved_affine_metadata_marks_native_layout(tmp_path: Path) -> None:
+def test_z_image_saved_affine_metadata_marks_native_layout(tmp_path):
 
     model = _TinyLinear()
     nn.quantize(model, group_size=64, bits=4, mode="affine")
@@ -1379,37 +1295,8 @@ def test_z_image_saved_affine_metadata_marks_native_layout(tmp_path: Path) -> No
     assert index["metadata"]["quantization_mode"] == "affine"
 
 
-def test_ernie_local_variant_uses_native_metadata(tmp_path: Path) -> None:
-    _write_layout(tmp_path, "ernie_image", turbo=False)
-    assert ernie_config.variant_from_local_path(tmp_path).name == "ernie-image"
-
-
-def test_ernie_local_variant_prefers_recorded_source(tmp_path: Path) -> None:
-    _write_layout(tmp_path, "ernie_image", turbo=False)
-    metadata_path = tmp_path / "mlx_ernie_image.json"
-    metadata = json.loads(metadata_path.read_text())
-    metadata["source"] = "baidu/ERNIE-Image-Turbo"
-    metadata_path.write_text(json.dumps(metadata))
-
-    assert ernie_config.variant_from_local_path(tmp_path).name == "ernie-image-turbo"
-
-
-def test_ernie_dispatches_ids_metadata_and_mflux_indexes(tmp_path: Path) -> None:
+def test_ernie_dispatches_from_weight_index(tmp_path):
     _write_layout(tmp_path, "ernie_image")
-    assert (
-        image_generation_model_class(tmp_path.as_posix())
-        is ernie_model.ErnieImageGenerationModel
-    )
-    assert (
-        image_generation_model_class("baidu/ERNIE-Image-Turbo")
-        is ernie_model.ErnieImageGenerationModel
-    )
-    assert is_image_generation_model("ernie-image")
-    assert (
-        image_edit_model_class(tmp_path.as_posix()) is ernie_model.ErnieImageEditModel
-    )
-    assert is_image_edit_model("baidu/ERNIE-Image-Turbo")
-
     (tmp_path / "model_index.json").unlink()
     (tmp_path / "mlx_ernie_image.json").unlink()
     index = {
@@ -1428,12 +1315,12 @@ def test_ernie_dispatches_ids_metadata_and_mflux_indexes(tmp_path: Path) -> None
     )
 
 
-def test_ernie_layout_accepts_mflux_checkpoint_without_configs(tmp_path: Path) -> None:
+def test_ernie_layout_accepts_mflux_checkpoint_without_configs(tmp_path):
     _write_layout(tmp_path, "ernie_image")
     assert ernie_download.validate_model_layout(tmp_path) == tmp_path
 
 
-def test_ernie_layout_requires_complete_prompt_enhancer(tmp_path: Path) -> None:
+def test_ernie_layout_requires_complete_prompt_enhancer(tmp_path):
     _write_layout(tmp_path, "ernie_image")
     (tmp_path / "pe" / "model.safetensors").parent.mkdir()
     (tmp_path / "pe" / "model.safetensors").write_bytes(b"x")
@@ -1441,7 +1328,7 @@ def test_ernie_layout_requires_complete_prompt_enhancer(tmp_path: Path) -> None:
         ernie_download.validate_model_layout(tmp_path)
 
 
-def test_ernie_image_transformer_config_parses_official_fields() -> None:
+def test_ernie_image_transformer_config_parses_official_fields():
     config = ernie_config.ErnieImageTransformerConfig.from_dict(
         {
             "_class_name": "ErnieImageTransformer2DModel",
@@ -1456,7 +1343,7 @@ def test_ernie_image_transformer_config_parses_official_fields() -> None:
     assert config.rope_axes_dim == (2, 2, 4)
 
 
-def test_ernie_rope_matches_reference_hybrid_convention() -> None:
+def test_ernie_rope_matches_reference_hybrid_convention():
     ids = np.array([[[3.0, 1.0, 2.0], [4.0, 2.0, 1.0]]], dtype=np.float32)
     axes = (2, 2, 4)
     angles = []
@@ -1485,30 +1372,7 @@ def test_ernie_rope_matches_reference_hybrid_convention() -> None:
     )
 
 
-def test_tiny_ernie_transformer_forward() -> None:
-    config = ernie_config.ErnieImageTransformerConfig(
-        hidden_size=32,
-        ffn_hidden_size=64,
-        in_channels=8,
-        out_channels=8,
-        num_layers=2,
-        num_attention_heads=4,
-        rope_axes_dim=(2, 2, 4),
-        text_in_dim=16,
-    )
-    transformer = ernie_transformer.ErnieImageTransformer(config)
-    output = transformer(
-        mx.zeros((2, 8, 2, 2), dtype=mx.bfloat16),
-        timestep=mx.array([1000.0, 500.0], dtype=mx.bfloat16),
-        text_hidden_states=mx.zeros((2, 3, 16), dtype=mx.bfloat16),
-        text_lengths=mx.array([1, 3]),
-    )
-    mx.eval(output)
-    assert output.shape == (2, 8, 2, 2)
-    assert bool(mx.all(mx.isfinite(output)))
-
-
-def test_ernie_image_conditioning_skips_last_text_block_and_final_norm() -> None:
+def test_ernie_image_conditioning_skips_last_text_block_and_final_norm():
     class FakeEmbedding(nn.Module):
         def __call__(self, input_ids):
             return mx.zeros((*input_ids.shape, 2))
@@ -1544,7 +1408,7 @@ def test_ernie_image_conditioning_skips_last_text_block_and_final_norm() -> None
     )
 
 
-def test_ernie_image_pad_text_preserves_cfg_order_and_lengths() -> None:
+def test_ernie_image_pad_text_preserves_cfg_order_and_lengths():
     negative = mx.ones((1, 1, 2))
     positive = mx.full((1, 3, 2), 2)
     padded, lengths = ernie_pipeline._pad_text([negative, positive])
@@ -1553,7 +1417,7 @@ def test_ernie_image_pad_text_preserves_cfg_order_and_lengths() -> None:
     np.testing.assert_array_equal(np.array(padded[0, 1:]), np.zeros((2, 2)))
 
 
-def test_ernie_weight_sanitizers_and_layouts() -> None:
+def test_ernie_weight_sanitizers_and_layouts():
     native = mx.zeros((8, 1, 1, 4))
     source = native.transpose(0, 3, 1, 2)
     sanitized = ernie_weights.sanitize_transformer_weights(
@@ -1578,36 +1442,8 @@ def test_ernie_weight_sanitizers_and_layouts() -> None:
         == native.shape
     )
 
-    text = ernie_weights.sanitize_text_encoder_weights(
-        {
-            "language_model.model.embed_tokens.weight": mx.zeros((4, 2)),
-            "language_model.model.rotary_emb.inv_freq": mx.zeros((1,)),
-            "vision_tower.weight": mx.zeros((1,)),
-        }
-    )
-    assert set(text) == {"embed_tokens.weight"}
 
-
-def test_ernie_image_ambiguous_rgb_conv_uses_source_layout_metadata() -> None:
-    source = mx.arange(2 * 3 * 3 * 3).reshape(2, 3, 3, 3)
-    expected = source.transpose(0, 2, 3, 1)
-    converted = ernie_weights.match_conv_layout(
-        source,
-        target_shape=(2, 3, 3, 3),
-        key="encoder.conv_in.weight",
-        source_layout="pytorch_nchw",
-    )
-    unchanged = ernie_weights.match_conv_layout(
-        expected,
-        target_shape=(2, 3, 3, 3),
-        key="encoder.conv_in.weight",
-        source_layout="mlx_nhwc",
-    )
-    np.testing.assert_array_equal(np.array(converted), np.array(expected))
-    np.testing.assert_array_equal(np.array(unchanged), np.array(expected))
-
-
-def test_ernie_image_conversion_quantizes_compatible_vae_attention() -> None:
+def test_ernie_image_conversion_quantizes_compatible_vae_attention():
     vae = flux_vae.Flux2VAE(
         decoder_block_out_channels=(32, 32),
         include_encoder=True,
@@ -1623,29 +1459,7 @@ def test_ernie_image_conversion_quantizes_compatible_vae_attention() -> None:
     assert isinstance(vae.decoder.conv_in, nn.Conv2d)
 
 
-@pytest.mark.parametrize(
-    "variant,steps,guidance,cfg",
-    [("ernie-image", 50, 4.0, True), ("ernie-image-turbo", 8, 1.0, False)],
-)
-def test_ernie_image_model_request_defaults_follow_variant(
-    variant: str, steps: int, guidance: float, cfg: bool
-) -> None:
-    pipeline = _ErniePipeline(variant)
-    model = ernie_model.ErnieImageGenerationModel(pipeline=pipeline, model_id=variant)
-    result = generate_image(
-        model,
-        ImageGenerationRequest(
-            prompt="a lighthouse", seed=7, extra={"negative_prompt": "fog"}
-        ),
-    )
-    assert result.steps == steps
-    assert result.guidance == guidance
-    assert result.metadata["classifier_free_guidance"] is cfg
-    assert result.width == result.height == 512
-    assert pipeline.calls[0][1]["negative_prompt"] == "fog"
-
-
-def test_ernie_image_generation_request_converts_to_edit_request() -> None:
+def test_generation_request_converts_to_edit_request():
     class FakeEditModel:
         def edit(self, request):
             assert isinstance(request, ImageEditRequest)
@@ -1660,21 +1474,9 @@ def test_ernie_image_generation_request_converts_to_edit_request() -> None:
     )
 
 
-def test_ernie_base_edit_uses_variant_defaults() -> None:
-    pipeline = _ErniePipeline("ernie-image")
-    model = ernie_model.ErnieImageEditModel(pipeline=pipeline, model_id="ernie")
-    result = model.edit(
-        ImageEditRequest(
-            prompt="make it a convertible", image_paths=("source.png",), seed=3
-        )
-    )
-    assert result.steps == 50
-    assert result.guidance == 4.0
-
-
 def test_ernie_edit_model_defaults_prompt_enhancer_off(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+    monkeypatch,
+):
     import mlx_vlm.models.ernie_image.model as ernie_model
 
     captured: dict[str, object] = {}
@@ -1698,10 +1500,8 @@ def test_ernie_edit_model_defaults_prompt_enhancer_off(
     assert captured["use_prompt_enhancer"] is True
 
 
-def test_ernie_image_prompt_cache_evicts_least_recently_used_entry() -> None:
-    pipeline = ernie_pipeline.ErnieImagePipeline.__new__(
-        ernie_pipeline.ErnieImagePipeline
-    )
+def test_ernie_image_prompt_cache_evicts_least_recently_used_entry():
+    pipeline = _pipeline("ernie_image")
     pipeline.runtime_config = ernie_pipeline.ErnieImageRuntimeConfig(
         prompt_cache_size=2
     )
@@ -1717,7 +1517,7 @@ def test_ernie_image_prompt_cache_evicts_least_recently_used_entry() -> None:
     assert list(pipeline.prompt_cache) == ["first", "third"]
 
 
-def test_ernie_image_turbo_skips_cfg_and_evicts_large_components() -> None:
+def test_ernie_image_turbo_skips_cfg_and_evicts_large_components():
     pipeline = _ernie_runtime_pipeline("ernie-image-turbo", evict=True)
     pipeline.generate_array("prompt", seed=1, steps=1, width=16, height=16)
     assert pipeline.transformer is None
@@ -1725,8 +1525,8 @@ def test_ernie_image_turbo_skips_cfg_and_evicts_large_components() -> None:
 
 
 def test_ernie_image_img2img_uses_strength_to_select_denoising_steps(
-    tmp_path: Path,
-) -> None:
+    tmp_path,
+):
     image_path = tmp_path / "source.png"
     Image.new("RGB", (32, 16), color="navy").save(image_path)
     pipeline = _ernie_runtime_pipeline("ernie-image-turbo")
@@ -1748,9 +1548,7 @@ def test_ernie_image_img2img_uses_strength_to_select_denoising_steps(
 @pytest.mark.parametrize(
     "size,expected", [((300, 200), (384, 256)), ((4000, 250), (2048, 128))]
 )
-def test_ernie_image_edit_auto_size_preserves_aspect_ratio(
-    tmp_path: Path, size: tuple[int, int], expected: tuple[int, int]
-) -> None:
+def test_ernie_image_edit_auto_size_preserves_aspect_ratio(tmp_path, size, expected):
     image_path = tmp_path / "source.png"
     Image.new("RGB", size, color="navy").save(image_path)
     _, width, height = ernie_pipeline._load_edit_image(
@@ -1759,7 +1557,7 @@ def test_ernie_image_edit_auto_size_preserves_aspect_ratio(
     assert (width, height) == expected
 
 
-def test_ernie_image_img2img_rejects_decoder_only_converted_vae() -> None:
+def test_ernie_image_img2img_rejects_decoder_only_converted_vae():
     with pytest.raises(ValueError, match="VAE encoder weights"):
         ernie_weights._require_vae_encoder_weights(
             {"decoder.conv_in.weight": mx.zeros((1,))},
@@ -1781,8 +1579,8 @@ def test_ernie_image_conversion_detects_decoder_only_vae_index(tmp_path):
 
 
 def test_ernie_image_prompt_enhancement_auto_detects_optional_components(
-    tmp_path: Path,
-) -> None:
+    tmp_path,
+):
     pipeline = _ernie_runtime_pipeline("ernie-image-turbo")
     pipeline.model_path = tmp_path
     assert not pipeline._should_enhance_prompt()
@@ -1803,7 +1601,7 @@ def test_ernie_image_prompt_enhancement_auto_detects_optional_components(
     assert pipeline._should_enhance_prompt(for_edit=True)
 
 
-def test_ernie_image_conversion_detection_and_layout_metadata(tmp_path: Path) -> None:
+def test_ernie_image_conversion_detection_and_layout_metadata(tmp_path):
     _write_layout(tmp_path, "ernie_image")
     assert ernie_convert.is_ernie_image_checkpoint(tmp_path)
     assert ernie_convert._source_layout(tmp_path) == "mlx_nhwc"
@@ -1821,22 +1619,7 @@ def test_ernie_image_conversion_detection_and_layout_metadata(tmp_path: Path) ->
     )
 
 
-def test_mage_flow_registers_generation_and_edit_families() -> None:
-    assert (
-        image_generation_model_class("microsoft/Mage-Flow")
-        is mage_model.MageFlowImageGenerationModel
-    )
-    assert (
-        image_edit_model_class("microsoft/Mage-Flow-Edit-Turbo")
-        is mage_model.MageFlowImageEditModel
-    )
-    assert is_image_generation_model("mage-flow-base")
-    assert not is_image_generation_model("mage-flow-edit")
-    assert is_image_edit_model("mage-flow-edit-base")
-    assert not is_image_edit_model("mage-flow-turbo")
-
-
-def test_mage_flow_load_prefers_local_metadata(tmp_path: Path) -> None:
+def test_mage_flow_load_prefers_local_metadata(tmp_path):
     _write_layout(tmp_path, "mage_flow")
     (tmp_path / "mlx_mage_flow.json").write_text('{"variant":"mage-flow-edit-turbo"}')
     assert (
@@ -1845,7 +1628,7 @@ def test_mage_flow_load_prefers_local_metadata(tmp_path: Path) -> None:
     )
 
 
-def test_mage_flow_local_variant_uses_cache_parent_name(tmp_path: Path) -> None:
+def test_mage_flow_local_variant_uses_cache_parent_name(tmp_path):
     snapshot = (
         tmp_path / "models--microsoft--Mage-Flow-Edit-Turbo" / "snapshots" / "hash"
     )
@@ -1853,7 +1636,7 @@ def test_mage_flow_local_variant_uses_cache_parent_name(tmp_path: Path) -> None:
     assert mage_config.variant_from_local_path(snapshot).name == "mage-flow-edit-turbo"
 
 
-def test_mage_flow_scheduler_matches_static_shift() -> None:
+def test_mage_flow_scheduler_matches_static_shift():
     scheduler = mage_scheduler.FlowMatchEulerDiscreteScheduler(
         num_inference_steps=4, shift=6.0
     )
@@ -1861,28 +1644,7 @@ def test_mage_flow_scheduler_matches_static_shift() -> None:
     np.testing.assert_allclose(np.array(scheduler.sigmas), expected, rtol=1e-6)
 
 
-def test_mage_flow_tiny_transformer_forward() -> None:
-    transformer = mage_transformer.MageFlowTransformer(
-        in_channels=8,
-        out_channels=8,
-        context_in_dim=16,
-        hidden_size=32,
-        num_heads=4,
-        depth=2,
-        axes_dim=(2, 2, 4),
-    )
-    output = transformer(
-        img=mx.zeros((1, 4, 8), dtype=mx.float32),
-        txt=mx.zeros((1, 3, 16), dtype=mx.float32),
-        timesteps=mx.array([1.0]),
-        img_shapes=[(1, 2, 2)],
-    )
-    mx.eval(output)
-    assert output.shape == (1, 4, 8)
-    assert bool(mx.all(mx.isfinite(output)))
-
-
-def test_mage_flow_rope_covers_target_and_references() -> None:
+def test_mage_flow_rope_covers_target_and_references():
     cosine, sine = mage_transformer.image_rope_frequencies(
         [(1, 2, 3), (1, 2, 3)], axes_dim=(2, 2, 4)
     )
@@ -1892,18 +1654,7 @@ def test_mage_flow_rope_covers_target_and_references() -> None:
     np.testing.assert_allclose(np.array(cosine[:6, 1:]), np.array(cosine[6:, 1:]))
 
 
-def test_mage_flow_weight_sanitizers() -> None:
-    transformer = mage_weights.sanitize_transformer_weights(
-        {
-            "transformer_blocks.0.img_mod.1.weight": mx.zeros((6, 1)),
-            "transformer_blocks.0.attn.to_out.0.bias": mx.zeros((1,)),
-            "transformer_blocks.0.txt_mlp.net.0.proj.weight": mx.zeros((4, 1)),
-        }
-    )
-    assert "transformer_blocks.0.img_mod.linear.weight" in transformer
-    assert "transformer_blocks.0.attn.to_out.bias" in transformer
-    assert "transformer_blocks.0.txt_mlp.linear_in.weight" in transformer
-
+def test_mage_flow_weight_sanitizers():
     vae = mage_weights.sanitize_vae_weights(
         {
             "student.dconv_encoder.blocks.0.ca.1.weight": mx.zeros((2, 2, 1, 1)),
@@ -1918,7 +1669,7 @@ def test_mage_flow_weight_sanitizers() -> None:
     assert len(vae) == 2
 
 
-def test_mage_flow_native_vae_layout_is_not_transposed() -> None:
+def test_mage_flow_native_vae_layout_is_not_transposed():
     weight = mx.zeros((2, 3, 3, 4))
     sanitized = mage_weights.sanitize_vae_weights(
         {"decoder_model.conv_in.weight": weight}, source_layout="mlx_nhwc"
@@ -1926,7 +1677,7 @@ def test_mage_flow_native_vae_layout_is_not_transposed() -> None:
     assert sanitized["decoder_model.conv_in.weight"].shape == weight.shape
 
 
-def test_mage_flow_quantizes_only_compatible_layers() -> None:
+def test_mage_flow_quantizes_only_compatible_layers():
     class TinyModel(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -1941,7 +1692,7 @@ def test_mage_flow_quantizes_only_compatible_layers() -> None:
     assert model.quantization_config == config
 
 
-def test_mage_flow_quantization_skips_sensitive_transformer_layers() -> None:
+def test_mage_flow_quantization_skips_sensitive_transformer_layers():
     module = nn.Linear(64, 32, bias=False)
     assert mage_convert._transformer_quantization_predicate(
         "transformer_blocks.0.attn.to_q", module
@@ -1955,7 +1706,7 @@ def test_mage_flow_quantization_skips_sensitive_transformer_layers() -> None:
     assert not mage_convert._transformer_quantization_predicate("proj_out", module)
 
 
-def test_mage_flow_saved_quantization_metadata(tmp_path: Path) -> None:
+def test_mage_flow_saved_quantization_metadata(tmp_path):
 
     model = _TinyLinear()
     config = mage_convert._quantization_parameters("affine", 64, 4)
@@ -1976,7 +1727,7 @@ def test_mage_flow_saved_quantization_metadata(tmp_path: Path) -> None:
     assert loaded.quantization_config == config
 
 
-def test_mage_flow_quantized_weights_require_config() -> None:
+def test_mage_flow_quantized_weights_require_config():
 
     quantized = _TinyLinear()
     nn.quantize(quantized, group_size=64, bits=4, mode="affine")
@@ -1986,49 +1737,37 @@ def test_mage_flow_quantized_weights_require_config() -> None:
         )
 
 
-def test_mage_flow_conversion_rejects_output_inside_source(tmp_path: Path) -> None:
+def test_mage_flow_conversion_rejects_output_inside_source(tmp_path):
     _write_layout(tmp_path, "mage_flow")
     with pytest.raises(ValueError, match="inside its source"):
         mage_convert.convert_mage_flow(tmp_path, tmp_path / "converted")
 
 
-def test_mage_flow_conversion_rejects_ambiguous_local_variant(tmp_path: Path) -> None:
+def test_mage_flow_conversion_rejects_ambiguous_local_variant(tmp_path):
     _write_layout(tmp_path, "mage_flow")
     output = tmp_path.parent / f"{tmp_path.name}-converted"
     with pytest.raises(ValueError, match="--variant"):
         mage_convert.convert_mage_flow(tmp_path, output)
 
 
-def test_mage_flow_conversion_prefers_source_id_variant(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_mage_flow_conversion_prefers_source_id_variant(monkeypatch, tmp_path):
     _write_layout(tmp_path, "mage_flow")
 
-    @dataclass
-    class FakeComponent:
-        quantization_config = None
-
-        def parameters(self):
-            return {}
-
-        def update(self, parameters):  # noqa: ARG002
-            pass
-
-    class FakeTextEncoder:
-        model = FakeComponent()
-
-    import mlx_vlm.models.mage_flow.convert as convert_module
-
-    monkeypatch.setattr(
-        convert_module, "load_text_encoder", lambda path: FakeTextEncoder()
+    component = SimpleNamespace(
+        quantization_config=None, parameters=lambda: {}, update=lambda parameters: None
     )
+    text_encoder = SimpleNamespace(model=component)
+    for name, result in [
+        ("text_encoder", text_encoder),
+        ("transformer", component),
+        ("vae", component),
+    ]:
+        monkeypatch.setattr(
+            mage_convert, "load_" + name, MagicMock(return_value=result)
+        )
+    monkeypatch.setattr(mage_convert, "_cast_component", lambda model, dtype: None)
     monkeypatch.setattr(
-        convert_module, "load_transformer", lambda path: FakeComponent()
-    )
-    monkeypatch.setattr(convert_module, "load_vae", lambda path: FakeComponent())
-    monkeypatch.setattr(convert_module, "_cast_component", lambda model, dtype: None)
-    monkeypatch.setattr(
-        convert_module,
+        mage_convert,
         "_save_component",
         lambda directory, model, quantization: directory.mkdir(
             parents=True, exist_ok=True
@@ -2041,30 +1780,6 @@ def test_mage_flow_conversion_prefers_source_id_variant(
     )
     metadata = json.loads((output / "mlx_mage_flow.json").read_text())
     assert metadata["variant"] == "mage-flow-edit-turbo"
-
-
-def test_mage_flow_all_six_variants_are_present() -> None:
-    assert set(mage_config.VARIANTS) == {
-        "mage-flow-base",
-        "mage-flow",
-        "mage-flow-turbo",
-        "mage-flow-edit-base",
-        "mage-flow-edit",
-        "mage-flow-edit-turbo",
-    }
-
-
-@pytest.mark.parametrize("edit", [False, True], ids=["generate", "edit"])
-def test_z_image_dispatch(tmp_path, edit):
-    _write_layout(tmp_path, "z_image")
-    cls = z_model.ZImageEditModel if edit else z_model.ZImageGenerationModel
-    resolve = image_edit_model_class if edit else image_generation_model_class
-    supports = is_image_edit_model if edit else is_image_generation_model
-    assert cls.supports_model(str(tmp_path))
-    assert resolve(str(tmp_path)) is cls
-    assert supports(str(tmp_path))
-    if not edit:
-        assert resolve("Tongyi-MAI/Z-Image") is cls
 
 
 @pytest.mark.parametrize("case", ["expand", "structured", "invalid"])

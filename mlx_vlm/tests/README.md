@@ -81,12 +81,21 @@ keeping response assertions, cancellation, tokenizer locking, and cache lifecycl
 checks explicit. No separate server fixture module is needed.
 
 `test_image_generation_models.py` owns the six image-generation families and
-keeps checkpoint writers, packed-pipeline doubles, and tiny quantization models
-in the same file. Reuse the parameterized discovery, dimension, download,
-conversion, and weight-loading checks with descriptive family IDs. Retain
-family-specific prompt, guidance, position, VAE, and numerical assertions next to
-the shared contracts. Image CLI routing and request forwarding live in
-`test_generate.py`; image HTTP endpoints stay in `test_server.py`.
+keeps checkpoint writers, pipeline doubles, and tiny quantization models in the
+same file. `image_generation_cases.json` supplies ordinary data for six component
+checks across four model families, eight generation/edit wrapper cases, and four
+weight-key sanitizer cases. Component configs and check names belong in `models`;
+requests, expected result fields, forwarded arguments, and metadata belong in
+`wrappers`. Sanitizer keys specify their source shape and expected destination
+(`null` means drop). Python constructs models, supplies tensor layouts and calling
+conventions, and checks the results. No references or executable expressions are
+needed in JSON.
+
+Reuse the parameterized discovery, dimension, download, conversion, and
+weight-loading checks with descriptive family IDs. Retain family-specific prompt,
+guidance, position, VAE, and numerical assertions next to the shared contracts,
+including Z-Image padding and Ernie conditioning. Image CLI routing and request
+forwarding live in `test_generate.py`; image HTTP endpoints stay in `test_server.py`.
 
 ## JSON model cases
 
