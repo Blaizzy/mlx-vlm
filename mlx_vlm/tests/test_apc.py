@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import ast
+import copy
 import importlib
 import inspect
-import json
 import logging
 import os
 import pkgutil
@@ -60,7 +60,6 @@ from mlx_vlm.apc_adapters import (
 from mlx_vlm.apc_storage import KVBlockHandle
 from mlx_vlm.generate.ar import _extend_cache, _make_cache
 from mlx_vlm.models import cache as C
-from mlx_vlm.models import qwen4_exp
 from mlx_vlm.models.cache import (
     ArraysCache,
     BatchKVCache,
@@ -92,8 +91,9 @@ from mlx_vlm.models.qwen4_exp.language import (
     Qwen4ExpAttention,
 )
 from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
-from mlx_vlm.models.z1t.config import ModelConfig as Z1TConfig
 from mlx_vlm.models.z1t.language import AFTConv, Z1TCache
+from mlx_vlm.tests.test_models import DATA as MODEL_CASES
+from mlx_vlm.tests.test_models import build_config
 from mlx_vlm.turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
 
 
@@ -1822,26 +1822,8 @@ def test_subclasses_inherit_specialized_memory_profile():
 def test_qsa_profiles_include_indexer_and_block_growth(
     make_cache, batch_size, mrope, seed_length
 ):
-    cases = json.loads(Path(__file__).with_name("model_cases.json").read_text())[
-        "cases"
-    ]
-    config = next(case for case in cases if case["id"] == "qwen4_exp")["config"][
-        "text_config"
-    ]
-    # Preserve the upstream indexer's dimensions while reusing the shared config.
-    config.update(
-        indexer_n_heads=2,
-        indexer_head_dim=8,
-        indexer_compress_ratio=2,
-        head_dim=8,
-        rope_parameters={
-            "rope_type": "default",
-            "mrope_section": [2, 1, 1],
-            "rope_theta": 10000,
-            "partial_rotary_factor": 1.0,
-        },
-    )
-    indexer = Qwen4ExpAttention(qwen4_exp.TextConfig(**config)).indexer
+    _, config = _apc_config("qwen4_exp", text_only=True)
+    indexer = Qwen4ExpAttention(config).indexer
     cache = make_cache()
 
     def advance(start, length):
@@ -2309,7 +2291,8 @@ def test_model_kv_profiles_bound_restored_prefill(make_cache, chunk_size):
 
 
 def test_z1t_prefill_memory_is_fixed():
-    layer = AFTConv(Z1TConfig(hidden_size=8, aft_heads=2, aft_ksize=4))
+    _, config = _apc_config("z1t")
+    layer = AFTConv(config)
     cache = Z1TCache()
     layer(mx.ones((1, 1, 8)), cache)
     cache = clone_cache_entry(cache, min_capacity_tokens=None, eval_targets=[])
@@ -2347,108 +2330,41 @@ def test_minimax_profiles_include_indexer_allocations(make_cache, batch_size):
     assert cache.nbytes <= estimate < 1.1 * cache.nbytes
 
 
-def _make_tiny_gemma4():
-    """Create a tiny Gemma 4 language model with mixed cache types.
-
-    Six hidden layers provide full sliding_window_pattern coverage.
-
-    sliding_window_pattern=3 → pattern: [sliding, sliding, full] repeated
-    With 6 layers: 4 RotatingKVCache + 2 KVCache → triggers exact mode.
-    """
-    from mlx_vlm.models import gemma4
-
-    text_config = gemma4.TextConfig(
-        model_type="gemma4_text",
-        hidden_size=32,
-        num_hidden_layers=6,
-        intermediate_size=64,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=16,
-        global_head_dim=16,
-        rms_norm_eps=1e-6,
-        vocab_size=64,
-        vocab_size_per_layer_input=64,
-        hidden_size_per_layer_input=8,
-        num_kv_shared_layers=0,
-        sliding_window=32,
-        sliding_window_pattern=3,
-        final_logit_softcapping=30.0,
+def _apc_config(name, *, text_only=False):
+    """Apply plain APC settings before config constructors derive layer layouts."""
+    profile = MODEL_CASES["apc"][name]
+    case = (
+        next(case for case in MODEL_CASES["cases"] if case["id"] == profile["case"])
+        if "case" in profile
+        else {"module": profile["module"], "config": {}}
     )
-    vision_config = gemma4.VisionConfig(
-        model_type="gemma4_vision",
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        head_dim=16,
-        rms_norm_eps=1e-6,
-        patch_size=16,
-        pooling_kernel_size=2,
-        default_output_length=4,
-        position_embedding_size=64,
-        use_clipped_linears=False,
-    )
-    config = gemma4.ModelConfig(
-        text_config=text_config,
-        vision_config=vision_config,
-        model_type="gemma4",
-        vocab_size=64,
-        image_token_id=63,
-    )
-    model = gemma4.Model(config)
-    return model.language_model
+    fields = copy.deepcopy(case["config"])
+
+    def merge(target, overrides):
+        for key, value in overrides.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                merge(target[key], value)
+            else:
+                target[key] = copy.deepcopy(value)
+
+    merge(fields, profile["config"])
+    module = importlib.import_module("mlx_vlm.models." + case["module"])
+    if text_only:
+        return module, build_config(module, fields["text_config"], "TextConfig")
+    return module, build_config(module, fields)
 
 
-def _make_tiny_qwen35():
-    """Create a tiny Qwen 3.5 language model with mixed cache types.
-
-    Four hidden layers provide full_attention_interval coverage.
-
-    full_attention_interval=4 → 3 out of 4 layers use ArraysCache (linear/SSM),
-    1 out of 4 uses KVCache (full attention) → triggers exact mode.
-    """
-    from mlx_vlm.models import qwen3_5
-
-    text_config = qwen3_5.TextConfig(
-        model_type="qwen3_5",
-        hidden_size=16,
-        intermediate_size=32,
-        linear_num_value_heads=2,
-        linear_num_key_heads=2,
-        linear_key_head_dim=8,
-        linear_value_head_dim=8,
-        linear_conv_kernel_dim=3,
-        num_hidden_layers=4,
-        num_attention_heads=2,
-        rms_norm_eps=1e-5,
-        vocab_size=64,
-        num_key_value_heads=2,
-        max_position_embeddings=128,
-        head_dim=8,
-        full_attention_interval=4,
-    )
-    config = qwen3_5.ModelConfig(
-        text_config=text_config,
-        vision_config=qwen3_5.VisionConfig(
-            model_type="qwen3_5",
-            depth=1,
-            hidden_size=16,
-            intermediate_size=32,
-            out_hidden_size=16,
-            num_heads=2,
-        ),
-        model_type="qwen3_5",
-    )
-    model = qwen3_5.LanguageModel(text_config, config)
-    return model
+def _apc_language_model(name):
+    module, config = _apc_config(name)
+    if name == "qwen3_5":
+        return module.LanguageModel(config.text_config, config)
+    return module.Model(config).language_model
 
 
-@pytest.mark.parametrize("model_factory", [_make_tiny_gemma4, _make_tiny_qwen35])
-def test_apc_exact_mode_detected_for_hybrid_models(model_factory):
+@pytest.mark.parametrize("model_name", ["gemma4", "qwen3_5"])
+def test_apc_exact_mode_detected_for_hybrid_models(model_name):
     """Hybrid models must route to exact mode, not block mode."""
-    lm = model_factory()
+    lm = _apc_language_model(model_name)
     assert model_apc_mode(lm) == "exact"
 
 
@@ -2542,29 +2458,9 @@ def test_lfm_mixed_prefill_keeps_logits_before_right_padding(
 ):
     from mlx_vlm.apc import make_warm_batch_exact_cache_multi
     from mlx_vlm.generate.ar import PromptProcessingBatch
-    from mlx_vlm.models.lfm2 import Model, ModelConfig
 
     mx.random.seed(19)
-    lm = Model(
-        ModelConfig(
-            model_type="lfm2",
-            vocab_size=128,
-            hidden_size=64,
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            max_position_embeddings=128,
-            norm_eps=1e-5,
-            conv_bias=False,
-            conv_L_cache=3,
-            block_dim=64,
-            block_ff_dim=128,
-            block_multiple_of=16,
-            block_ffn_dim_multiplier=1.0,
-            block_auto_adjust_ff_dim=True,
-            layer_types=["conv", "full_attention"],
-        )
-    ).language_model
+    lm = _apc_language_model("lfm2")
     manager = prefix_manager()
     manager._exact_cache_max = 8
     manager.checkpoint_interval_tokens = 16
@@ -2692,17 +2588,17 @@ def test_diffusion_prefills_only_divergent_suffix(prefix_manager, tier):
     assert recorder.input_lengths == [2, 1]
 
 
-@pytest.mark.parametrize("model_factory", [_make_tiny_gemma4, _make_tiny_qwen35])
+@pytest.mark.parametrize("model_name", ["gemma4", "qwen3_5"])
 @pytest.mark.parametrize("tier", ["memory", "disk"])
 @pytest.mark.parametrize("path", ["stream", "batch"])
 def test_hybrid_generation_restores_before_divergence(
-    prefix_manager, model_factory, tier, path
+    prefix_manager, model_name, tier, path
 ):
     from mlx_vlm.generate.ar import PromptProcessingBatch, generate_step
     from mlx_vlm.models.base import InputEmbeddingsFeatures
 
     mx.random.seed(13)
-    lm = model_factory()
+    lm = _apc_language_model(model_name)
     manager = prefix_manager(tier)
     manager.checkpoint_interval_tokens = 16
     coordinator = manager.coordinator(lm)
