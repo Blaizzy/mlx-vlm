@@ -1,16 +1,33 @@
+"""Cache lifecycle, quantization, recurrence, and batched attention masks."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
+from mlx_vlm.generate import generate_step
+from mlx_vlm.models.base import (
+    InputEmbeddingsFeatures,
+    LanguageModelOutput,
+    align_attention_mask_to_scores,
+    quantized_scaled_dot_product_attention,
+)
 from mlx_vlm.models.cache import (
     ArraysCache,
     BatchKVCache,
     BatchPoolingCache,
+    BatchQuantizedKVCache,
     BatchRotatingKVCache,
     CacheList,
     ChunkedKVCache,
     KVCache,
     PoolingCache,
     RotatingKVCache,
+    create_causal_mask,
 )
 from mlx_vlm.models.hy_v4.cache import HyV4KVCache
 
@@ -386,3 +403,257 @@ def test_chunked_kv_cache_trims_on_valid_length_not_buffer_width():
     assert window[-1] == n_tokens - 1
     assert window == list(range(window[0], window[0] + len(window)))
     assert cache.start_position <= cache.offset
+
+
+@pytest.mark.parametrize("max_kv_size", [None, 1024])
+def test_generation_forwards_max_kv_size(max_kv_size):
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = Mock(
+                side_effect=self.__call__, layers=[object(), object()]
+            )
+
+        def get_input_embeddings(self, input_ids, pixel_values=None, **kwargs):
+            return InputEmbeddingsFeatures(
+                inputs_embeds=mx.zeros((*input_ids.shape, 768))
+            )
+
+        def __call__(self, *args, **kwargs):
+            return LanguageModelOutput(logits=mx.random.normal((1, 1, 32000)))
+
+    cache = [
+        SimpleNamespace(offset=0, state=(mx.zeros((1, 8, 100, 64)),) * 2)
+        for _ in range(2)
+    ]
+    model = Model()
+    with patch("mlx_vlm.models.cache.make_prompt_cache", return_value=cache) as make:
+        list(
+            generate_step(
+                input_ids=mx.array([[1, 2, 3, 4, 5]]),
+                model=model,
+                pixel_values=mx.zeros((1, 3, 336, 336)),
+                mask=mx.ones((1, 5)),
+                kv_bits=4,
+                max_kv_size=max_kv_size,
+                max_tokens=1,
+            )
+        )
+    make.assert_called_once_with(model.language_model, max_kv_size=max_kv_size)
+
+
+@pytest.mark.parametrize("kv_bits", [None, 4])
+def test_gemma2_attention_with_quantized_cache(kv_bits):
+    from mlx_vlm.models.cache import KVCache, QuantizedKVCache
+    from mlx_vlm.models.gemma2.config import ModelConfig
+    from mlx_vlm.models.gemma2.language import Attention
+
+    args = ModelConfig(
+        model_type="gemma2",
+        hidden_size=128,
+        num_hidden_layers=1,
+        intermediate_size=256,
+        num_attention_heads=8,
+        head_dim=64,
+        rms_norm_eps=1e-6,
+        vocab_size=32,
+        num_key_value_heads=4,
+    )
+    attention = Attention(args)
+    assert attention.repeats > 1
+
+    cache = KVCache() if kv_bits is None else QuantizedKVCache(bits=kv_bits)
+    x = mx.random.normal((1, 6, args.hidden_size))
+
+    out = attention(x, mask=None, cache=cache)
+
+    assert out.shape == (1, 6, args.hidden_size)
+    assert not mx.any(mx.isnan(out))
+
+
+@pytest.mark.parametrize("kv_bits", [None, 4])
+def test_phi3small_block_sparse_attention_with_quantized_cache(kv_bits):
+    from mlx_vlm.models.cache import KVCache, QuantizedKVCache
+    from mlx_vlm.models.phi3small.config import ModelConfig
+    from mlx_vlm.models.phi3small.language import Attention
+
+    args = ModelConfig(
+        model_type="phi3small",
+        hidden_size=256,
+        dense_attention_every_n_layers=2,
+        ff_intermediate_size=512,
+        gegelu_limit=20.0,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        layer_norm_epsilon=1e-5,
+        vocab_size=32,
+        num_key_value_heads=2,
+    )
+    # layer 0 is a block-sparse layer, which is the hand-rolled path.
+    attention = Attention(args, layer_idx=0)
+    assert attention.block_sparse
+
+    cache = KVCache() if kv_bits is None else QuantizedKVCache(bits=kv_bits)
+    x = mx.random.normal((1, 6, args.hidden_size))
+
+    out = attention(x, mask=None, cache=cache)
+
+    assert out.shape == (1, 6, args.hidden_size)
+    assert not mx.any(mx.isnan(out))
+
+
+B, H, D = 2, 4, 64  # batch, heads, head_dim
+GROUP_SIZE = 32
+BITS = 8
+
+
+def _rand_kv(batch, seq_len):
+    """Return random (keys, values) tensors."""
+    k = mx.random.normal((batch, H, seq_len, D))
+    v = mx.random.normal((batch, H, seq_len, D))
+    return k, v
+
+
+def test_extend_handles_filtered_non_step_aligned_capacity():
+    c1 = BatchQuantizedKVCache([7, 7], group_size=GROUP_SIZE, bits=BITS)
+    k1, v1 = _rand_kv(2, 512)
+    c1.update_and_fetch(k1, v1)
+    mx.eval(c1.keys)
+
+    # Filtering rows can trim common left padding and leave a backing
+    # sequence length that is no longer aligned to the allocation step.
+    c1.filter(mx.array([0], mx.int32))
+    mx.eval(c1.keys)
+    assert c1.keys[0].shape[-2] == 505
+    assert c1._idx == 505
+
+    c2 = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
+    k2, v2 = _rand_kv(1, 500)
+    c2.update_and_fetch(k2, v2)
+    mx.eval(c2.keys)
+    assert c2.keys[0].shape[-2] == 512
+    assert c2._idx == 500
+
+    c1.extend(c2)
+    mx.eval(c1.keys)
+
+    assert c1.keys[0].shape[0] == 2
+    assert c1.keys[0].shape[-2] == 512
+    assert c1._idx == 505
+    assert c1.left_padding.tolist() == [0, 5]
+
+
+def test_state_roundtrip():
+    cache = BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS)
+    k, v = _rand_kv(B, 4)
+    cache.update_and_fetch(k, v)
+    mx.eval(cache.keys)
+
+    state = cache.state
+    assert len(state) == 4  # keys, values, offset, left_padding
+
+    cache2 = BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS)
+    cache2.state = state
+    assert cache2._idx == 4
+
+
+def test_empty_state():
+    cache = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
+    state = cache.state
+    assert state[0] is None
+    assert state[1] is None
+
+
+def test_finalize_noop_without_prepare():
+    cache = BatchQuantizedKVCache([1, 0], group_size=GROUP_SIZE, bits=BITS)
+    k, v = _rand_kv(B, 4)
+    cache.update_and_fetch(k, v)
+    before = cache.left_padding.tolist()
+    cache.finalize()
+    assert cache.left_padding.tolist() == before
+
+
+GROUP = 64
+
+
+def test_str_passthrough():
+    scores = mx.zeros((2, 8, 2, 4, 4))
+    assert align_attention_mask_to_scores("causal", scores) == "causal"
+
+
+def _quant_kv(B, n_kv, L, D, dtype=mx.float16):
+    keys = mx.random.normal((B, n_kv, L, D)).astype(dtype)
+    values = mx.random.normal((B, n_kv, L, D)).astype(dtype)
+    return (
+        mx.quantize(keys, group_size=GROUP, bits=BITS),
+        mx.quantize(values, group_size=GROUP, bits=BITS),
+    )
+
+
+def _run_sdpa(B, n_q, n_kv, L, K_cache, mask, D=GROUP):
+    """K_cache is total key length (offset + L); keys filled to K_cache."""
+    queries = mx.random.normal((B, n_q, L, D)).astype(mx.float16)
+    q_keys, q_values = _quant_kv(B, n_kv, K_cache, D)
+    out = quantized_scaled_dot_product_attention(
+        queries, q_keys, q_values, scale=D**-0.5, mask=mask, group_size=GROUP, bits=BITS
+    )
+    mx.eval(out)
+    assert out.shape == (B, n_q, L, D)
+    assert mx.isfinite(out).all()
+    return out
+
+
+HEAD_LAYOUTS = [
+    (2, 16, 8),  # Qwen3-0.6B-like GQA (server repro family)
+    (2, 32, 8),  # stronger GQA
+    (2, 16, 2),  # wider repeat
+    (2, 16, 1),  # MQA
+    (2, 8, 8),  # MHA n_repeats=1
+    (3, 16, 8),  # odd batch
+    (4, 16, 8),  # larger batch
+    (8, 16, 8),  # B == n_kv (latent mis-align case pre-fix)
+    (1, 16, 8),  # single row control
+]
+
+
+@pytest.mark.parametrize("B,n_q,n_kv", [(2, 16, 8), (3, 16, 8), (2, 16, 1)])
+def test_left_and_right_padding_together(B, n_q, n_kv):
+    L, offset = 16, 0
+    left = mx.array([2, 0] + [0] * (B - 2))
+    right = mx.array([0, 3] + [0] * (B - 2))
+    mask = create_causal_mask(
+        L, offset=offset, left_padding=left[:B], right_padding=right[:B]
+    )
+    _run_sdpa(B, n_q, n_kv, L, offset + L, mask)
+
+
+@pytest.mark.parametrize("window", [4, 8, 32])
+@pytest.mark.parametrize("B,n_q,n_kv", [(2, 16, 8), (2, 8, 8)])
+def test_sliding_window_causal_with_left_pad(window, B, n_q, n_kv):
+    L, offset = 24, 40
+    pads = mx.array([1, 0] if B == 2 else [1, 0] + [0] * (B - 2))
+    mask = create_causal_mask(
+        L, offset=offset, window_size=window, left_padding=pads[:B]
+    )
+    _run_sdpa(B, n_q, n_kv, L, offset + L, mask)
+
+
+@pytest.mark.parametrize("B,n_q,n_kv", [(2, 16, 8), (4, 32, 8)])
+def test_additive_float_mask(B, n_q, n_kv):
+    L = 12
+    causal = create_causal_mask(L, left_padding=mx.array([i % 2 for i in range(B)]))
+    mask = mx.where(
+        causal, mx.array(0.0, dtype=mx.float16), mx.array(-1e4, dtype=mx.float16)
+    )
+    _run_sdpa(B, n_q, n_kv, L, L, mask)
+
+
+def test_prepare_left_padding_on_empty_only():
+    cache = BatchQuantizedKVCache([0, 0], group_size=GROUP, bits=BITS)
+    cache.prepare(left_padding=[2, 1])
+    assert cache.left_padding.tolist() == [2, 1]
+    k = mx.random.normal((2, 2, 4, GROUP))
+    v = mx.random.normal((2, 2, 4, GROUP))
+    cache.update_and_fetch(k, v)
+    with pytest.raises(ValueError, match="empty"):
+        cache.prepare(left_padding=[1, 0])

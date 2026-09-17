@@ -4,6 +4,7 @@ import base64
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import mlx.core as mx
 import numpy as np
@@ -150,85 +151,45 @@ class FakeSTTModel:
 
 
 @pytest.mark.usefixtures("reset_audio_runtime")
-def test_audio_transcriptions_default_json(client, monkeypatch):
-    fake_model = FakeSTTModel({"text": "This is a test transcription."})
-    cache_calls = []
-
-    def fake_get_cached_model(model, **kwargs):
-        cache_calls.append((model, kwargs))
-        return fake_model, None, SimpleNamespace(model_type="audio")
-
-    monkeypatch.setattr(server, "get_cached_model", fake_get_cached_model)
+@pytest.mark.parametrize(
+    "endpoint, options, text, forwarded",
+    [
+        (
+            "transcriptions",
+            {"prompt": "prior context", "language": "en"},
+            "This is a test transcription.",
+            {"context": "prior context", "language": "en"},
+        ),
+        ("transcriptions", {"response_format": "text"}, "Plain text transcript.", {}),
+        ("translations", {}, "Translated transcript.", {"task": "translate"}),
+    ],
+    ids=["transcription-json", "transcription-text", "translation"],
+)
+def test_audio_transcription_request(
+    client, monkeypatch, endpoint, options, text, forwarded
+):
+    fake = FakeSTTModel({"text": text})
+    loader = Mock(return_value=(fake, None, SimpleNamespace(model_type="audio")))
+    monkeypatch.setattr(server, "get_cached_model", loader)
     monkeypatch.setattr(
         server_audio,
         "audio_read",
         lambda buffer, always_2d=False: (np.zeros(160, dtype=np.float32), 16000),
     )
     monkeypatch.setattr(server_audio, "audio_write", _fake_audio_write)
-
     response = client.post(
-        "/v1/audio/transcriptions",
+        "/v1/audio/" + endpoint,
         files={"file": ("test.wav", b"audio-bytes", "audio/wav")},
-        data={"model": "fake-stt", "prompt": "prior context", "language": "en"},
+        data={"model": "fake-stt", **options},
     )
-
     assert response.status_code == 200
-    assert response.json() == {"text": "This is a test transcription."}
-    assert fake_model.calls[0]["context"] == "prior context"
-    assert fake_model.calls[0]["language"] == "en"
-    assert cache_calls == [("fake-stt", {"model_kind": "audio_stt"})]
-
-
-@pytest.mark.usefixtures("reset_audio_runtime")
-def test_audio_transcriptions_text_response_format(client, monkeypatch):
-    fake_model = FakeSTTModel({"text": "Plain text transcript."})
-    monkeypatch.setattr(
-        server,
-        "get_cached_model",
-        lambda model, **kwargs: (fake_model, None, SimpleNamespace(model_type="audio")),
-    )
-    monkeypatch.setattr(
-        server_audio,
-        "audio_read",
-        lambda buffer, always_2d=False: (np.zeros(160, dtype=np.float32), 16000),
-    )
-    monkeypatch.setattr(server_audio, "audio_write", _fake_audio_write)
-
-    response = client.post(
-        "/v1/audio/transcriptions",
-        files={"file": ("test.wav", b"audio-bytes", "audio/wav")},
-        data={"model": "fake-stt", "response_format": "text"},
-    )
-
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/plain")
-    assert response.text == "Plain text transcript."
-
-
-@pytest.mark.usefixtures("reset_audio_runtime")
-def test_audio_translations_passes_translate_task(client, monkeypatch):
-    fake_model = FakeSTTModel({"text": "Translated transcript."})
-    monkeypatch.setattr(
-        server,
-        "get_cached_model",
-        lambda model, **kwargs: (fake_model, None, SimpleNamespace(model_type="audio")),
-    )
-    monkeypatch.setattr(
-        server_audio,
-        "audio_read",
-        lambda buffer, always_2d=False: (np.zeros(160, dtype=np.float32), 16000),
-    )
-    monkeypatch.setattr(server_audio, "audio_write", _fake_audio_write)
-
-    response = client.post(
-        "/v1/audio/translations",
-        files={"file": ("test.wav", b"audio-bytes", "audio/wav")},
-        data={"model": "fake-stt"},
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {"text": "Translated transcript."}
-    assert fake_model.calls[0]["task"] == "translate"
+    if options.get("response_format") == "text":
+        assert response.headers["content-type"].startswith("text/plain")
+        assert response.text == text
+    else:
+        assert response.json() == {"text": text}
+    assert {key: fake.calls[0][key] for key in forwarded} == forwarded
+    loader.assert_called_once_with("fake-stt", model_kind="audio_stt")
 
 
 @pytest.mark.usefixtures("reset_audio_runtime")

@@ -29,26 +29,31 @@ def test_rejects_text_without_an_atem_invocation():
 # Cohere
 
 
-def test_cohere_action_array_parses_to_openai_tool_calls():
-    result = cohere2_moe.parse_tool_call("""
-        [
-          {"tool_call_id": "1", "tool_name": "grep", "parameters": {"pattern": "<\\|channel>"}},
-          {"tool_call_id_id": "2", "tool_name": "read", "parameters": {"path": "file.py"}}
-        ]
-        """)
-
-    assert [call["name"] for call in result] == ["grep", "read"]
-    assert json.loads(result[0]["arguments"]) == {"pattern": "<|channel>"}
-    assert json.loads(result[1]["arguments"]) == {"path": "file.py"}
-
-
-def test_cohere_single_action_object_parses_to_openai_tool_call():
+@pytest.mark.parametrize("multiple", [False, True], ids=["object", "array"])
+def test_cohere_action_parses_to_openai_tool_calls(multiple):
+    pattern = "<|channel>" if multiple else "foo"
+    action = {
+        "tool_call_id": "1",
+        "tool_name": "grep",
+        "parameters": {"pattern": pattern},
+    }
+    second = {
+        "tool_call_id_id": "2",
+        "tool_name": "read",
+        "parameters": {"path": "file.py"},
+    }
     result = cohere2_moe.parse_tool_call(
-        '{"tool_call_id": "1", "tool_name": "grep", "parameters": {"pattern": "foo"}}'
+        json.dumps([action, second] if multiple else action).replace(
+            "<|channel>", r"<\|channel>"
+        )
     )
-
-    assert result["name"] == "grep"
-    assert json.loads(result["arguments"]) == {"pattern": "foo"}
+    calls = result if multiple else [result]
+    assert [call["name"] for call in calls] == (
+        ["grep", "read"] if multiple else ["grep"]
+    )
+    assert json.loads(calls[0]["arguments"]) == {"pattern": pattern}
+    if multiple:
+        assert json.loads(calls[1]["arguments"]) == {"path": "file.py"}
 
 
 # Gemma 4

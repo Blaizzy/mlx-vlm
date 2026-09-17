@@ -3,25 +3,30 @@
 import argparse
 import ast
 import contextlib
+import importlib
 import inspect
 import io
 import os
 import subprocess
 import sys
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import mlx.core as mx
 import pytest
 
-from mlx_vlm.generate import ar, common, dispatch
+image_generation = importlib.import_module("mlx_vlm.generate.image")
+video_generation = importlib.import_module("mlx_vlm.generate.video_generation")
+from mlx_vlm.generate import AudioGenerationResult, ar, common, dispatch
 from mlx_vlm.generate.ar import generate_step
 from mlx_vlm.generate.dispatch import parse_arguments
 from mlx_vlm.models.rfdetr.generate import _get_annotator, main
 from mlx_vlm.models.sam3 import generate as sam3_generate
 from mlx_vlm.tests.test_diffusion_models import FakeProcessor, make_diffusion_model
+from mlx_vlm.tests.test_video_generation import _result as _video_result
 
 # CLI arguments
 
@@ -110,17 +115,6 @@ def test_chat_verbose_flag_uses_boolean_optional_action():
     _assert_verbose_uses_boolean_optional_action(
         "mlx_vlm/chat.py", expected_default=True
     )
-
-
-def test_generate_verbose_flag_semantics():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--verbose", action=argparse.BooleanOptionalAction, default=False
-    )
-
-    assert parser.parse_args([]).verbose is False
-    assert parser.parse_args(["--verbose"]).verbose is True
-    assert parser.parse_args(["--no-verbose"]).verbose is False
 
 
 def _literal_values(node: ast.expr) -> tuple:
@@ -549,3 +543,396 @@ def test_diffusion_redrawer(alternate):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+def _text_cli_args(**overrides):
+    return Namespace(
+        **(
+            dict(
+                model="demo",
+                output_modality="text",
+                output=None,
+                size="512x512",
+                steps=4,
+                seed=None,
+                guidance=1.0,
+                adapter_path=None,
+                audio=None,
+                system=None,
+                top_p=1.0,
+                top_k=0,
+                min_p=0.0,
+                repetition_penalty=None,
+                repetition_context_size=20,
+                presence_penalty=None,
+                presence_context_size=20,
+                frequency_penalty=None,
+                frequency_context_size=20,
+                chat=False,
+                verbose=False,
+                eos_tokens=None,
+                max_kv_size=None,
+                kv_bits=None,
+                kv_group_size=64,
+                quantized_kv_start=512,
+                skip_special_tokens=False,
+                force_download=False,
+                trust_remote_code=False,
+                quantize_activations=False,
+                expert_cache_gb=None,
+                processor_kwargs={},
+                thinking_mode=None,
+                thinking_budget=None,
+                thinking_start_token="<think>",
+                thinking_end_token="</think>",
+                draft_model=None,
+                draft_block_size=None,
+            )
+            | overrides
+        )
+    )
+
+
+@contextlib.contextmanager
+def _text_cli(args, model, processor):
+    with (
+        patch.object(dispatch, "parse_arguments", return_value=args),
+        patch.object(dispatch, "load", return_value=(model, processor)),
+        patch.object(
+            dispatch, "apply_chat_template", return_value="prompt"
+        ) as template,
+        patch.object(
+            dispatch, "generate", return_value=SimpleNamespace(text="done")
+        ) as generate,
+    ):
+        yield template, generate
+
+
+def test_generate_cli_smoke(capsys):
+    args = _text_cli_args(
+        image=["image.png"],
+        video=None,
+        fps=2.0,
+        resize_shape=[224],
+        prompt=["Describe this image."],
+        max_tokens=12,
+        temperature=0.7,
+        revision="main",
+        prefill_step_size=128,
+        enable_thinking=True,
+        draft_kind="dflash",
+    )
+    model = SimpleNamespace(config=SimpleNamespace(model_type="demo"))
+    processor = SimpleNamespace()
+    with _text_cli(args, model, processor) as (mock_apply_chat_template, mock_generate):
+        dispatch.main()
+    assert mock_apply_chat_template.call_args.kwargs["enable_thinking"] is True
+    assert "thinking_mode" not in mock_apply_chat_template.call_args.kwargs
+    assert mock_generate.call_args.kwargs["enable_thinking"] is True
+    assert "thinking_mode" not in mock_generate.call_args.kwargs
+    assert mock_generate.call_args.kwargs["max_tokens"] == 12
+    assert mock_generate.call_args.kwargs["temperature"] == pytest.approx(0.7)
+    assert mock_generate.call_args.kwargs["prefill_step_size"] == 128
+    assert capsys.readouterr().out.strip() == "done"
+
+
+def test_generate_cli_forwards_video_to_template_and_generate(capsys):
+    args = _text_cli_args(
+        image=None,
+        video=["clip.mp4"],
+        fps=1.0,
+        resize_shape=None,
+        prompt=["Describe this video."],
+        max_tokens=8,
+        temperature=0.0,
+        kv_quant_scheme="uniform",
+        revision=None,
+        gen_kwargs={},
+        prefill_step_size=None,
+        enable_thinking=False,
+        draft_kind=None,
+    )
+    model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4"))
+    processor = SimpleNamespace(
+        video_processor=SimpleNamespace(),
+        process=lambda text=None, images=None, videos=None, **kwargs: None,
+    )
+    with _text_cli(args, model, processor) as (mock_apply_chat_template, mock_generate):
+        dispatch.main()
+    assert mock_apply_chat_template.call_args.kwargs["video"] == ["clip.mp4"]
+    assert mock_apply_chat_template.call_args.kwargs["fps"] == pytest.approx(1.0)
+    assert mock_generate.call_args.kwargs["video"] == ["clip.mp4"]
+    assert mock_generate.call_args.kwargs["fps"] == pytest.approx(1.0)
+    assert capsys.readouterr().out.strip() == "done"
+
+
+def test_generate_cli_video_frames_fallback_without_video_processor(capsys):
+    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
+    args = _text_cli_args(
+        image=None,
+        video=["clip.mp4"],
+        fps=1.0,
+        resize_shape=None,
+        prompt=["Describe this video."],
+        max_tokens=8,
+        temperature=0.0,
+        kv_quant_scheme="uniform",
+        revision=None,
+        gen_kwargs={},
+        prefill_step_size=None,
+        enable_thinking=False,
+        draft_kind=None,
+        video_max_frames=4,
+    )
+    model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4"))
+    processor = SimpleNamespace()
+    frames = [object() for _ in range(6)]
+    with (
+        patch.object(video_module, "sample_video_frames", return_value=(frames, 2.0)),
+        _text_cli(args, model, processor) as (mock_apply_chat_template, mock_generate),
+    ):
+        dispatch.main()
+    assert mock_apply_chat_template.call_args.kwargs["num_images"] == 4
+    assert "video" not in mock_apply_chat_template.call_args.kwargs
+    assert len(mock_generate.call_args.kwargs["image"]) == 4
+    assert mock_generate.call_args.kwargs["video"] is None
+    out = capsys.readouterr().out
+    assert "no native video support" in out
+    assert "4 of 6 sampled frames" in out
+
+
+def test_generate_image_cli_routes_before_vlm_load():
+    args = Namespace(
+        model="bonsai-ternary",
+        output_modality="image",
+        task="generate",
+        output="out.png",
+        size="512x512",
+        steps=4,
+        seed=7,
+        guidance=1.0,
+    )
+
+    with (
+        patch.object(dispatch, "parse_arguments", return_value=args),
+        patch.object(dispatch, "run_image_generation_cli") as mock_run_image,
+        patch.object(dispatch, "load") as mock_load,
+    ):
+        dispatch.main()
+
+    mock_run_image.assert_called_once_with(args)
+    mock_load.assert_not_called()
+
+
+@pytest.mark.parametrize("task", ["edit", "generate"])
+def test_image_cli_request_and_output(tmp_path, task):
+    edit = task == "edit"
+    output = tmp_path / ("edited.png" if edit else "image.png")
+    extras = (
+        {}
+        if edit
+        else dict(
+            gen_kwargs={"sampler_preset": "V4_TURBO_12"},
+            prompt_expansion_model="tiny-text-model",
+        )
+    )
+    args = Namespace(
+        model=(
+            "black-forest-labs/FLUX.2-klein-9b-kv"
+            if edit
+            else "ideogram-ai/ideogram-4-fp8"
+        ),
+        task=task,
+        prompt=["add", "sunglasses"] if edit else ["caption"],
+        image=["reference.png"] if edit else None,
+        output=str(output),
+        size="256x512" if edit else "256x256",
+        steps=2 if edit else 4,
+        seed=7,
+        guidance=1.0,
+        **extras,
+    )
+    result = SimpleNamespace(
+        path=output,
+        seed=7,
+        width=256,
+        height=512 if edit else 256,
+        steps=2 if edit else 12,
+        variant="flux2-klein-9b-kv" if edit else "ideogram-4-fp8",
+    )
+    with (
+        patch.object(image_generation, "load_image_model", return_value=object()),
+        patch.object(
+            image_generation, "generate_image", return_value=result
+        ) as generate,
+    ):
+        image_generation.run_image_generation_cli(args)
+    request = generate.call_args.args[1]
+    if edit:
+        assert request.prompt == "add sunglasses"
+        assert request.image_paths == ("reference.png",)
+        assert (request.width, request.height) == (256, 512)
+    else:
+        assert request.extra == dict(
+            sampler_preset="V4_TURBO_12", prompt_expansion_model="tiny-text-model"
+        )
+    assert generate.call_args.kwargs["task"] == task
+    assert generate.call_args.kwargs["output_path"] == output
+
+
+def test_audio_cli_uses_tts_template_and_shared_loader(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mlx_vlm.generate",
+            "--output-modality",
+            "audio",
+            "--output",
+            str(tmp_path / "out.wav"),
+            "--ref-audio",
+            "voice.wav",
+            "--prompt",
+            "Say hello.",
+        ],
+    )
+    model = SimpleNamespace(config=SimpleNamespace(model_type="minicpmo"))
+    monkeypatch.setattr(dispatch, "load", Mock(return_value=(model, object())))
+    template = Mock(return_value="formatted")
+    monkeypatch.setattr(dispatch, "apply_chat_template", template)
+    speech = Mock(
+        return_value=AudioGenerationResult(text="Hello.", path=tmp_path / "out.wav")
+    )
+    monkeypatch.setattr(dispatch, "generate_audio", speech)
+    dispatch.main()
+    assert template.call_args.kwargs["use_tts_template"] is True
+    assert speech.call_args.args[2] == "formatted"
+    assert speech.call_args.kwargs["ref_audio_path"] == "voice.wav"
+
+
+@pytest.mark.parametrize(
+    "flags, message",
+    [
+        ([], "--output is required"),
+        (["--output", "out.wav", "--chat"], "does not support --chat"),
+    ],
+)
+def test_invalid_audio_cli_fails_before_loading(monkeypatch, flags, message):
+    monkeypatch.setattr(
+        sys, "argv", ["mlx_vlm.generate", "--output-modality", "audio", *flags]
+    )
+    loader = Mock()
+    monkeypatch.setattr(dispatch, "load", loader)
+    with pytest.raises(ValueError, match=message):
+        dispatch.main()
+    loader.assert_not_called()
+
+
+def test_video_generation_cli_preserves_reference_order(tmp_path, capsys):
+    output_path = tmp_path / "generated.mp4"
+    args = Namespace(
+        model="MiniMaxAI/MiniMax-H3",
+        prompt=["A", "short", "film"],
+        image=None,
+        last_image=None,
+        reference=["image=character.png", "video=motion.mp4", "audio=voice.wav"],
+        audio=None,
+        video=None,
+        workflow=None,
+        size="64x32",
+        seed=7,
+        steps=2,
+        num_frames=124,
+        output=str(output_path),
+        revision="test-revision",
+        force_download=False,
+        gen_kwargs={"test": True},
+        verbose=True,
+    )
+    model = SimpleNamespace()
+    result = _video_result(output_path)
+
+    with (
+        patch.object(video_generation, "_VideoProgressBar") as mock_progress,
+        patch.object(
+            video_generation, "load_video_generation_model", return_value=model
+        ) as mock_load,
+        patch.object(
+            video_generation, "generate_video", return_value=result
+        ) as mock_generate,
+    ):
+        video_generation.run_video_generation_cli(args)
+
+    assert mock_load.call_args.kwargs["workflow"] == "ref2va"
+    request = mock_generate.call_args.args[1]
+    assert request.prompt == "A short film"
+    assert [(item.kind, str(item.path)) for item in request.references] == [
+        ("image", "character.png"),
+        ("video", "motion.mp4"),
+        ("audio", "voice.wav"),
+    ]
+    assert request.width == 64
+    assert request.height == 32
+    assert request.num_frames == 124
+    progress = mock_progress.return_value.__enter__.return_value
+    mock_progress.assert_called_once_with(steps=2, num_frames=124, disable=False)
+    progress.assert_any_call("load", 0, 2, 124)
+    assert request.progress_callback is progress
+    assert mock_generate.call_args.kwargs["output_path"] == output_path
+    output = capsys.readouterr().out
+    assert "workflow=ref2va" in output
+    assert "generation_fps=" in output
+
+
+@pytest.mark.parametrize(
+    ("image", "last_image", "expected_workflow"),
+    [(None, None, "t2va"), (["first.png"], None, "fl2va"), (None, "last.png", "fl2va")],
+)
+def test_video_generation_cli_infers_keyframe_workflow(
+    tmp_path, image, last_image, expected_workflow
+):
+    args = Namespace(
+        model="MiniMaxAI/MiniMax-H3",
+        prompt=["synthetic"],
+        image=image,
+        last_image=last_image,
+        reference=None,
+        audio=None,
+        video=None,
+        workflow=None,
+        size=None,
+        seed=7,
+        steps=None,
+        num_frames=None,
+        output=str(tmp_path / "generated.mp4"),
+        revision=None,
+        force_download=False,
+        gen_kwargs={},
+        verbose=False,
+    )
+
+    with (
+        patch.object(
+            video_generation,
+            "load_video_generation_model",
+            return_value=SimpleNamespace(),
+        ) as mock_load,
+        patch.object(video_generation, "generate_video", return_value=_video_result()),
+    ):
+        video_generation.run_video_generation_cli(args)
+
+    assert mock_load.call_args.kwargs["workflow"] == expected_workflow
+
+
+def test_generate_cli_routes_video_before_vlm_load():
+    args = Namespace(output_modality="video")
+
+    with (
+        patch.object(dispatch, "parse_arguments", return_value=args),
+        patch.object(dispatch, "run_video_generation_cli") as mock_run_video,
+        patch.object(dispatch, "load") as mock_load,
+    ):
+        dispatch.main()
+
+    mock_run_video.assert_called_once_with(args)
+    mock_load.assert_not_called()

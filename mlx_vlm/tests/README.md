@@ -20,18 +20,15 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_image_generation_models.py` | Bonsai, Flux2, Ideogram4, Z-Image, ERNIE Image, and Mage Flow generation/editing, components, loading, and conversion |
 | `test_diffusion_models.py` | LLaDA, Nemotron, and DiffusionGemma model/generation contracts, including sampling, prefill, caches, numerical parity, self-conditioning, vision, sanitization, and quantization policy |
 | `test_tool_parsers.py` | ATEM, Cohere, Gemma 4, GLM, Mistral, Pythonic parsing, and parser selection |
-| `test_apc.py` | Cache lookup, semantic keys, lifecycle, trace logging, and diagnostics |
-| `test_apc_adapters.py` | Cache adapters, component snapshots, and model cache-layout compatibility |
-| `test_apc_storage.py` | Memory budgets, disk eviction, persistence, and block handles |
-| `test_apc_prefix.py` | Exact and partial prefix reuse with dense and hybrid models |
-| `test_apc_quantized.py` | APC integration with quantized cache formats |
-| `test_apc_settings.py` | Server-facing APC settings and environment overrides |
-| `test_kv_cache_quantization.py` | Quantized cache lifecycle, batching, and attention masks |
+| `test_apc.py` | Cache lookup, semantic keys, adapters, model compatibility, exact/partial prefix reuse, quantized checkpoints, memory budgets, disk persistence, trace logging, and diagnostics |
+| `test_cache.py` | Cache lifecycle, recurrence, quantization, batching, and attention masks |
 | `test_turboquant.py` | TurboQuant cache integration, batched attention, and value kernels |
 | `test_weight_quantization.py` | FP8 and one-bit weight conversion and execution |
 | `test_moe_offload.py` | MoE checkpoint repacking, expert offload, output parity, and failure handling |
 | `test_qwen3_5.py` | Qwen3.5 patch layouts and ragged attention fallbacks |
-| `test_nemotron_voicechat.py` | VoiceChat runtime, streaming, and checkpoint conversion |
+| `test_audio_models.py` | MiniCPMO TTS, Qwen3 Omni, Nemotron Omni, and VoiceChat components, speech generation, streaming, and checkpoint conversion |
+| `test_video_generation_models.py` | MiniMax H3 packing, components, conditioning workflows, cached trajectories, numerical references, and conversion |
+| `test_video_generation.py` | Video model discovery, request/result adapters, progress, and audio/video muxing |
 | `test_processors.py` | Image/video/audio processors, including Mage VL timestamps, patch positions, and visual-embedding integration |
 | `test_speculative.py` | Drafter loading and compatibility, generation parity, verification, cache transactions, and quantized speculative state across model families |
 | `test_speculative_masks_static.py` | Gemma assistant mask offsets with fake dependencies, without importing MLX |
@@ -39,10 +36,29 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_audio_generation.py` | Audio generation, loading, downmixing, and resampling |
 | `test_server.py` | Chat/Responses/Anthropic APIs, image endpoints, batching/cancellation, runtime settings, and reranking |
 | `test_server_audio.py` | HTTP audio endpoints and realtime voice sessions |
-| `test_cli.py` | CLI arguments, diffusion display/visualizer behavior, detector display options, and CLI/library default parity |
+| `test_cli.py` | Text/image/audio/video CLI routing, arguments, diffusion display/visualizer behavior, detector display options, and CLI/library default parity |
+| `test_sample_utils.py` | Sampling distributions and shared contracts for AR/server positioned samplers |
 | `test_prompt_utils.py` | Prompt construction and reasoning-template arguments |
 | `test_trainer.py` | Training workflows, trainer utilities, MRoPE/gated-delta gradients, and MoE gradient/expert-replacement checks |
 | `test_utils.py` | General loading/conversion utilities and local Python model files |
+
+The suite has 36 test modules. APC settings and worker shutdown checks live in
+`test_server.py`; APC builders and parameterized cache-format checks live in
+`test_apc.py`. Quantized cache lifecycle checks share `test_cache.py`, while
+TurboQuant numerical and kernel checks remain in `test_turboquant.py`.
+
+Against `79c5402a`, this consolidation removes 908 Python lines, retains the two
+JSON case files, and preserves the exact full-suite coverage sets: 80,634 executed
+production lines and 12,715 branch outcomes. Validation reports 1,852 passed,
+five skipped, and 41 passing subtests. These are measured execution sets, not
+complete production coverage. The earlier pruning tradeoffs still apply.
+
+Audio model checks share tiny configuration defaults within `test_audio_models.py`.
+Optional audio dependencies and real VoiceChat checkpoint skips remain scoped to
+their individual tests. The speech-generation subprocess imports its tiny model
+from this same module. MiniMax H3 workflows share conditioning, pipeline/request
+construction, and canonical weight setup in `test_video_generation_models.py`;
+their numerical references and cached/uncached equality checks remain explicit.
 
 Other architecture-specific modules remain focused on their own models. The
 larger `test_processors.py`, `test_generate.py`, and `test_server.py` contain
@@ -111,8 +127,11 @@ leaves required-file checks to the existing layout tests.
 Reuse the parameterized discovery, dimension, download, conversion, and
 weight-loading checks with descriptive family IDs. Retain family-specific prompt,
 guidance, position, VAE, and numerical assertions next to the shared contracts,
-including Z-Image padding and Ernie conditioning. Image CLI routing and request
-forwarding live in `test_generate.py`; image HTTP endpoints stay in `test_server.py`.
+including Z-Image padding and Ernie conditioning. CLI routing and request
+forwarding for every output modality live in `test_cli.py`; image HTTP endpoints
+stay in `test_server.py`. Audio transcription formats and translation share a
+request runner in `test_server_audio.py`. Loading tests share checkpoint patches
+and model doubles in `test_utils.py`, with parameterized quantization policies.
 
 ## JSON model cases
 

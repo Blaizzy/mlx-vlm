@@ -1,7 +1,6 @@
 """Audio generation, loading, and sample-rate conversion."""
 
 import contextlib
-import sys
 import wave
 from io import BytesIO
 from types import SimpleNamespace
@@ -202,54 +201,6 @@ def test_save_audio_writes_valid_wav(tmp_path):
         assert wav.getnframes() == 2400
     with pytest.raises(ValueError, match=".wav"):
         save_audio(result, tmp_path / "speech.mp3")
-
-
-def test_audio_cli_uses_tts_template_and_shared_loader(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "mlx_vlm.generate",
-            "--output-modality",
-            "audio",
-            "--output",
-            str(tmp_path / "out.wav"),
-            "--ref-audio",
-            "voice.wav",
-            "--prompt",
-            "Say hello.",
-        ],
-    )
-    model = SimpleNamespace(config=SimpleNamespace(model_type="minicpmo"))
-    monkeypatch.setattr(dispatch, "load", Mock(return_value=(model, object())))
-    template = Mock(return_value="formatted")
-    monkeypatch.setattr(dispatch, "apply_chat_template", template)
-    speech = Mock(
-        return_value=AudioGenerationResult(text="Hello.", path=tmp_path / "out.wav")
-    )
-    monkeypatch.setattr(dispatch, "generate_audio", speech)
-    dispatch.main()
-    assert template.call_args.kwargs["use_tts_template"] is True
-    assert speech.call_args.args[2] == "formatted"
-    assert speech.call_args.kwargs["ref_audio_path"] == "voice.wav"
-
-
-@pytest.mark.parametrize(
-    "flags, message",
-    [
-        ([], "--output is required"),
-        (["--output", "out.wav", "--chat"], "does not support --chat"),
-    ],
-)
-def test_invalid_audio_cli_fails_before_loading(monkeypatch, flags, message):
-    monkeypatch.setattr(
-        sys, "argv", ["mlx_vlm.generate", "--output-modality", "audio", *flags]
-    )
-    loader = Mock()
-    monkeypatch.setattr(dispatch, "load", loader)
-    with pytest.raises(ValueError, match=message):
-        dispatch.main()
-    loader.assert_not_called()
 
 
 # Audio loading and resampling

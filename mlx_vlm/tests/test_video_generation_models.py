@@ -77,36 +77,32 @@ class _SyntheticTokenizer:
 
 
 class _SyntheticConditioner:
-    def encode_fl2va(self, prompt, images=None):
-        assert prompt == "synthetic"
-        assert not images
+    def __init__(self, workflow="t2va"):
+        self.workflow = workflow
+
+    def _encode(self, prompt, references):
+        assert (
+            prompt
+            == {
+                "t2va": "synthetic",
+                "fl2va": "synthetic-fl",
+                "ref2va": "synthetic-ref",
+            }[self.workflow]
+        )
+        assert len(references or []) == (self.workflow != "t2va")
         return MiniMaxH3ConditioningOutput(
             hidden_states=mx.arange(10, dtype=mx.float32).reshape(1, 2, 5) * 0.01,
-            token_tags=mx.array([1, 1], dtype=mx.int32),
+            token_tags=mx.array(
+                [1, 0 if self.workflow == "ref2va" else 1], dtype=mx.int32
+            ),
             input_ids=mx.array([[1, 2]], dtype=mx.int32),
         )
 
-
-class _SyntheticFLConditioner:
     def encode_fl2va(self, prompt, images=None):
-        assert prompt == "synthetic-fl"
-        assert len(images) == 1
-        return MiniMaxH3ConditioningOutput(
-            hidden_states=mx.arange(10, dtype=mx.float32).reshape(1, 2, 5) * 0.01,
-            token_tags=mx.array([1, 1], dtype=mx.int32),
-            input_ids=mx.array([[1, 2]], dtype=mx.int32),
-        )
+        return self._encode(prompt, images)
 
-
-class _SyntheticRefConditioner:
     def encode_ref2va(self, prompt, references):
-        assert prompt == "synthetic-ref"
-        assert len(references) == 1
-        return MiniMaxH3ConditioningOutput(
-            hidden_states=mx.arange(10, dtype=mx.float32).reshape(1, 2, 5) * 0.01,
-            token_tags=mx.array([1, 0], dtype=mx.int32),
-            input_ids=mx.array([[1, 2]], dtype=mx.int32),
-        )
+        return self._encode(prompt, references)
 
 
 class _SyntheticRefPipeline(MiniMaxH3Pipeline):
@@ -135,15 +131,25 @@ def _tiny_transformer_config() -> MiniMaxH3TransformerConfig:
     )
 
 
-def _load_canonical_synthetic_weights(model: MiniMaxH3Transformer) -> None:
+def _load_canonical_synthetic_weights(model, *, video=False):
     weights = []
     for offset, (key, parameter) in enumerate(sorted(tree_flatten(model.parameters()))):
-        size = math.prod(parameter.shape)
-        values = ((mx.arange(size) % 29).astype(mx.float32) - 14.0) * 0.005
-        values = values + ((offset % 7) - 3) * 0.001
-        values = values.reshape(parameter.shape)
-        if key.endswith("norm.weight"):
+        shape = parameter.shape
+        source_shape = (
+            (shape[0], shape[-1], *shape[1:-1])
+            if video and parameter.ndim == 5
+            else shape
+        )
+        values = ((mx.arange(math.prod(shape)) % 29).astype(mx.float32) - 14.0) * 0.005
+        values = (values + ((offset % 7) - 3) * 0.001).reshape(source_shape)
+        if (
+            ("norm" in key and key.endswith("weight"))
+            if video
+            else key.endswith("norm.weight")
+        ):
             values = 1.0 + values * 0.1
+        if video and parameter.ndim == 5:
+            values = values.transpose(0, 2, 3, 4, 1)
         weights.append((key, values))
     model.load_weights(weights, strict=True)
 
@@ -170,25 +176,8 @@ def _tiny_video_vae_config() -> MiniMaxH3VideoVAEConfig:
     )
 
 
-def _load_canonical_video_vae_weights(model: MiniMaxH3VideoVAE) -> None:
-    weights = []
-    for offset, (key, parameter) in enumerate(sorted(tree_flatten(model.parameters()))):
-        shape = parameter.shape
-        torch_shape = (
-            (shape[0], shape[-1], shape[1], shape[2], shape[3])
-            if parameter.ndim == 5
-            else shape
-        )
-        size = math.prod(shape)
-        values = ((mx.arange(size) % 29).astype(mx.float32) - 14.0) * 0.005
-        values = values + ((offset % 7) - 3) * 0.001
-        values = values.reshape(torch_shape)
-        if "norm" in key and key.endswith("weight"):
-            values = 1.0 + values * 0.1
-        if parameter.ndim == 5:
-            values = values.transpose(0, 2, 3, 4, 1)
-        weights.append((key, values))
-    model.load_weights(weights, strict=True)
+def _load_canonical_video_vae_weights(model):
+    _load_canonical_synthetic_weights(model, video=True)
 
 
 def _tiny_audio_vae_config() -> MiniMaxH3AudioVAEConfig:
@@ -975,7 +964,7 @@ def test_video_path_automatically_contributes_its_soundtrack(monkeypatch):
     transformer, video_vae, audio_vae = _tiny_pipeline_modules()
     pipeline = MiniMaxH3Pipeline(
         transformer=transformer,
-        conditioner=_SyntheticRefConditioner(),
+        conditioner=_SyntheticConditioner("ref2va"),
         video_vae=video_vae,
         audio_vae=audio_vae,
         partition="ref2va",
@@ -1007,27 +996,53 @@ def test_video_path_automatically_contributes_its_soundtrack(monkeypatch):
     assert prepared[0].waveform.shape == (2, 100)
 
 
-def test_tiny_t2va_pipeline_runs_joint_denoise_to_latents():
+def _workflow_pipeline(workflow="t2va", progress_callback=None):
     transformer, video_vae, audio_vae = _tiny_pipeline_modules()
-    pipeline = MiniMaxH3Pipeline(
+    if workflow == "ref2va":
+        transformer = MiniMaxH3Transformer(
+            replace(_tiny_transformer_config(), patch_size=(1, 2, 2))
+        )
+        _load_canonical_synthetic_weights(transformer)
+    factory = _SyntheticRefPipeline if workflow == "ref2va" else MiniMaxH3Pipeline
+    pipeline = factory(
         transformer=transformer,
-        conditioner=_SyntheticConditioner(),
+        conditioner=_SyntheticConditioner(workflow),
         video_vae=video_vae,
         audio_vae=audio_vae,
+        **({"partition": "ref2va"} if workflow == "ref2va" else {}),
     )
+    width = 32 if workflow == "t2va" else 64
+    media = {
+        "fl2va": {"image": mx.zeros((64, 64, 3), mx.uint8)},
+        "ref2va": {"references": [object()]},
+    }.get(workflow, {})
+    request = MiniMaxH3GenerationRequest(
+        prompt={
+            "t2va": "synthetic",
+            "fl2va": "synthetic-fl",
+            "ref2va": "synthetic-ref",
+        }[workflow],
+        height=width,
+        width=width,
+        num_frames=124,
+        num_inference_steps=2 if workflow == "t2va" else 3,
+        output_type="latent",
+        latents=mx.zeros(
+            (1, 1, video_latent_num_frames(124), width // 32, width // 32), mx.float32
+        ),
+        audio_latents=mx.zeros((2, 2, audio_latent_num_frames(124)), mx.float32),
+        progress_callback=progress_callback,
+        **media,
+    )
+    return pipeline, request
+
+
+def test_tiny_t2va_pipeline_runs_joint_denoise_to_latents():
     num_video_latents = video_latent_num_frames(124)
     num_audio_latents = audio_latent_num_frames(124)
     progress_events = []
-    request = MiniMaxH3GenerationRequest(
-        prompt="synthetic",
-        height=32,
-        width=32,
-        num_frames=124,
-        num_inference_steps=2,
-        output_type="latent",
-        latents=mx.zeros((1, 1, num_video_latents, 1, 1), mx.float32),
-        audio_latents=mx.zeros((2, 2, num_audio_latents), mx.float32),
-        progress_callback=lambda *event: progress_events.append(event),
+    pipeline, request = _workflow_pipeline(
+        progress_callback=lambda *event: progress_events.append(event)
     )
     with mx.stream(mx.cpu):
         output = pipeline.generate(request)
@@ -1065,66 +1080,9 @@ def test_tiny_t2va_pipeline_runs_joint_denoise_to_latents():
         )
 
 
-def test_tiny_fl2va_cached_trajectory_is_bitwise_identical():
-    transformer, video_vae, audio_vae = _tiny_pipeline_modules()
-    pipeline = MiniMaxH3Pipeline(
-        transformer=transformer,
-        conditioner=_SyntheticFLConditioner(),
-        video_vae=video_vae,
-        audio_vae=audio_vae,
-    )
-    num_video_latents = video_latent_num_frames(124)
-    num_audio_latents = audio_latent_num_frames(124)
-    request = MiniMaxH3GenerationRequest(
-        prompt="synthetic-fl",
-        image=mx.zeros((64, 64, 3), mx.uint8),
-        height=64,
-        width=64,
-        num_frames=124,
-        num_inference_steps=3,
-        output_type="latent",
-        latents=mx.zeros((1, 1, num_video_latents, 2, 2), mx.float32),
-        audio_latents=mx.zeros((2, 2, num_audio_latents), mx.float32),
-    )
-    with mx.stream(mx.cpu):
-        live = pipeline.generate(
-            replace(request, cache_adaln=False, drop_adaln_weights=False)
-        )
-        mx.eval(live.video, live.audio)
-        cached = pipeline.generate(request)
-        mx.eval(cached.video, cached.audio)
-
-    assert mx.array_equal(live.video, cached.video).item()
-    assert mx.array_equal(live.audio, cached.audio).item()
-    assert cached.metadata["adaln_weights_dropped"]
-
-
-def test_tiny_ref2va_pipeline_runs_conditioned_joint_denoise():
-    _, video_vae, audio_vae = _tiny_pipeline_modules()
-    transformer = MiniMaxH3Transformer(
-        replace(_tiny_transformer_config(), patch_size=(1, 2, 2))
-    )
-    _load_canonical_synthetic_weights(transformer)
-    pipeline = _SyntheticRefPipeline(
-        transformer=transformer,
-        conditioner=_SyntheticRefConditioner(),
-        video_vae=video_vae,
-        audio_vae=audio_vae,
-        partition="ref2va",
-    )
-    num_video_latents = video_latent_num_frames(124)
-    num_audio_latents = audio_latent_num_frames(124)
-    request = MiniMaxH3GenerationRequest(
-        prompt="synthetic-ref",
-        references=[object()],
-        height=64,
-        width=64,
-        num_frames=124,
-        num_inference_steps=3,
-        output_type="latent",
-        latents=mx.zeros((1, 1, num_video_latents, 2, 2), mx.float32),
-        audio_latents=mx.zeros((2, 2, num_audio_latents), mx.float32),
-    )
+@pytest.mark.parametrize("workflow", ["fl2va", "ref2va"])
+def test_conditioned_pipeline_cached_trajectory_is_bitwise_identical(workflow):
+    pipeline, request = _workflow_pipeline(workflow)
     with mx.stream(mx.cpu):
         live = pipeline.generate(
             replace(request, cache_adaln=False, drop_adaln_weights=False)
@@ -1132,9 +1090,9 @@ def test_tiny_ref2va_pipeline_runs_conditioned_joint_denoise():
         mx.eval(live.video, live.audio)
         output = pipeline.generate(request)
         mx.eval(output.video, output.audio)
-    assert output.video.shape == (1, 1, num_video_latents, 2, 2)
-    assert output.audio.shape == (2, 2, num_audio_latents)
-    assert output.metadata["partition"] == "ref2va"
+    assert output.video.shape == (1, 1, video_latent_num_frames(124), 2, 2)
+    assert output.audio.shape == (2, 2, audio_latent_num_frames(124))
+    assert output.metadata["partition"] == workflow
     assert mx.array_equal(live.video, output.video).item()
     assert mx.array_equal(live.audio, output.audio).item()
     assert output.metadata["adaln_weights_dropped"]

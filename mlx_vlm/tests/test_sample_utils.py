@@ -1,7 +1,9 @@
+import importlib
 import unittest
 
 import mlx.core as mx
 import numpy as np
+import pytest
 
 from mlx_vlm.sample_utils import (
     apply_min_p,
@@ -173,3 +175,23 @@ class TestValidationDoesNotCorruptCompile(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.parametrize(
+    "module_name", ["mlx_vlm.generate.ar", "mlx_vlm.server.generation"]
+)
+@pytest.mark.parametrize("top_p", [1.0, 0.95])
+def test_positioned_target_sampler_honors_top_k(module_name, top_p):
+    sampler = importlib.import_module(module_name)._PositionedTargetSampler(
+        temperature=1.0,
+        top_p=top_p,
+        top_k=2,
+        seed=42,
+    )
+    logits = mx.array([[0.0, 1.0, 2.0, 3.0]], dtype=mx.float32)
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    tokens = sampler.sample_target(
+        mx.repeat(logprobs, 32, axis=0), row_ids=[0] * 32, positions=list(range(32))
+    )
+    mx.eval(tokens)
+    assert set(tokens.tolist()) <= {2, 3}

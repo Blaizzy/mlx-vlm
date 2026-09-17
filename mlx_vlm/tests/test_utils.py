@@ -5,6 +5,7 @@ import json
 import logging
 import struct
 import textwrap
+from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
 from threading import Thread
@@ -200,162 +201,100 @@ def test_get_model_path_downloads_jsonl_tokenizers(monkeypatch, tmp_path):
     assert "*.jsonl" in captured["allow_patterns"]
 
 
-def test_quantize_module():
+@pytest.mark.parametrize(
+    "width, group, mode, predicate, expected_group, expected_bits, expected_mode, selected",
+    [
+        (64, 64, "affine", None, 64, 4, "affine", (True, True)),
+        (160, 64, "affine", {"fallback_group_size": 32}, 32, 4, "affine", (True, True)),
+        (160, 16, "nvfp4", {"fallback_group_size": 32}, 16, 4, "nvfp4", (True, True)),
+        (
+            128,
+            16,
+            "nvfp4",
+            {"group_size": 64, "bits": 8},
+            64,
+            8,
+            "affine",
+            (True, True),
+        ),
+        (
+            128,
+            32,
+            "mxfp4",
+            {"group_size": 64, "bits": 8},
+            64,
+            8,
+            "affine",
+            (True, True),
+        ),
+        (
+            96,
+            64,
+            "affine",
+            {"group_size": 32, "bits": 8},
+            64,
+            4,
+            "affine",
+            (False, False),
+        ),
+        (64, 32, "mxfp4", None, 32, 4, "mxfp4", (True, True)),
+        (64, 64, "affine", "skip_vision", 64, 4, "affine", (True, False)),
+    ],
+    ids=[
+        "basic",
+        "fallback-group",
+        "native-group",
+        "nvfp4-affine-override",
+        "mxfp4-affine-override",
+        "incompatible-group",
+        "mxfp4",
+        "skip-vision",
+    ],
+)
+def test_quantize_module(
+    width,
+    group,
+    mode,
+    predicate,
+    expected_group,
+    expected_bits,
+    expected_mode,
+    selected,
+):
     from mlx_vlm.quant_utils import quantize_model
 
-    class DummyModule(nn.Module):
-        def __init__(self, shape):
-            super().__init__()
-            self.language_model = nn.Linear(shape[1], shape[1])
-            self.vision_model = nn.Linear(shape[1], shape[1])
-
-    # Test basic quantization
-    module = DummyModule((10, 64))
-    config = {}
-    _, updated_config = quantize_model(
-        module, config, group_size=64, bits=4, mode="affine"
-    )
-
-    # Check quantization parameters
-    assert hasattr(module.language_model, "scales")
-    assert hasattr(module.vision_model, "scales")
-    assert module.language_model.scales.shape == (64, 1)
-    assert module.language_model.bits == 4
-    assert module.language_model.group_size == 64
-    assert module.vision_model.scales.shape == (64, 1)
-    assert module.vision_model.bits == 4
-    assert module.vision_model.group_size == 64
-
-    # Check config is updated correctly
-    assert updated_config["quantization"] == {
-        "group_size": 64,
-        "bits": 4,
-        "mode": "affine",
-    }
-
-    # A model-owned group override must be evaluated before the default-group
-    # divisibility gate. Qwen4-Exp's PLE rows are 160-wide: divisible by 32,
-    # but not by the converter's default 64.
-    module = DummyModule((10, 160))
-    config = {}
-
-    def group32_predicate(_path: str, _module: nn.Module):
-        return {"fallback_group_size": 32}
-
-    _, updated_config = quantize_model(
-        module,
-        config,
-        group_size=64,
-        bits=4,
-        mode="affine",
-        quant_predicate=group32_predicate,
-    )
-    assert module.language_model.group_size == 32
-    assert module.vision_model.group_size == 32
-    assert updated_config["quantization"]["language_model"]["group_size"] == 32
-    assert updated_config["quantization"]["language_model"]["bits"] == 4
-    assert updated_config["quantization"]["language_model"]["mode"] == "affine"
-
-    # A compatible requested group remains authoritative. In particular,
-    # NVFP4 must retain its required group-16 layout rather than taking the
-    # affine fallback used for 160-wide PLE rows.
-    module = DummyModule((10, 160))
-    config = {}
-    _, updated_config = quantize_model(
-        module,
-        config,
-        group_size=16,
-        bits=4,
-        mode="nvfp4",
-        quant_predicate=group32_predicate,
-    )
-    assert module.language_model.group_size == 16
-    assert module.language_model.mode == "nvfp4"
-    assert updated_config["quantization"]["language_model"] == {
-        "group_size": 16,
-        "bits": 4,
-        "mode": "nvfp4",
-    }
-
-    # Existing partial overrides retain their implicit affine mode when the
-    # requested checkpoint format uses a mode with fixed group and bit sizes.
-    def affine8_predicate(_path: str, _module: nn.Module):
-        return {"group_size": 64, "bits": 8}
-
-    for mode, requested_group_size in (("nvfp4", 16), ("mxfp4", 32)):
-        module = DummyModule((10, 128))
-        _, updated_config = quantize_model(
-            module,
-            {},
-            group_size=requested_group_size,
-            bits=4,
-            mode=mode,
-            quant_predicate=affine8_predicate,
+    module = nn.Module()
+    module.language_model = nn.Linear(width, width)
+    module.vision_model = nn.Linear(width, width)
+    kwargs = {}
+    if predicate is not None:
+        kwargs["quant_predicate"] = (
+            (lambda path, _: "vision_model" not in path)
+            if predicate == "skip_vision"
+            else (lambda *_: predicate)
         )
-        for name in ("language_model", "vision_model"):
-            quantized = getattr(module, name)
-            assert quantized.group_size == 64
-            assert quantized.bits == 8
-            assert quantized.mode == "affine"
-            assert updated_config["quantization"][name] == {"group_size": 64, "bits": 8}
-
-    # Only the explicit fallback protocol may bypass the requested group's
-    # divisibility check.
-    module = DummyModule((10, 96))
-    _, updated_config = quantize_model(
-        module,
-        {},
-        group_size=64,
-        bits=4,
-        mode="affine",
-        quant_predicate=lambda _path, _module: {"group_size": 32, "bits": 8},
+    _, config = quantize_model(
+        module, {}, group_size=group, bits=4, mode=mode, **kwargs
     )
-    assert not hasattr(module.language_model, "scales")
-    assert not hasattr(module.vision_model, "scales")
-    assert updated_config["quantization"] == {
-        "group_size": 64,
-        "bits": 4,
-        "mode": "affine",
-    }
-
-    # Test mxfp4 quantization
-    module = DummyModule((10, 64))
-    config = {}
-    _, updated_config = quantize_model(
-        module, config, group_size=32, bits=4, mode="mxfp4"
-    )
-    assert updated_config["quantization"] == {
-        "group_size": 32,
-        "bits": 4,
-        "mode": "mxfp4",
-    }
-
-    # Test skip_vision=True
-    module = DummyModule((10, 64))
-    config = {}
-
-    def skip_vision_predicate(path: str, _module: nn.Module):
-        return "vision_model" not in path
-
-    _, updated_config = quantize_model(
-        module,
-        config,
-        group_size=64,
-        bits=4,
-        mode="affine",
-        quant_predicate=skip_vision_predicate,
-    )
-
-    # Vision module should not be quantized
-    assert hasattr(module.language_model, "scales")
-    assert not hasattr(module.vision_model, "scales")
-
-    # Check config is updated correctly
-    assert updated_config["quantization"] == {
-        "group_size": 64,
-        "bits": 4,
-        "mode": "affine",
-    }
+    defaults = dict(group_size=group, bits=4, mode=mode)
+    assert {k: config["quantization"][k] for k in defaults} == defaults
+    for name, enabled in zip(("language_model", "vision_model"), selected):
+        layer = getattr(module, name)
+        assert hasattr(layer, "scales") == enabled
+        if enabled:
+            assert (layer.group_size, layer.bits, layer.mode) == (
+                expected_group,
+                expected_bits,
+                expected_mode,
+            )
+            assert layer.scales.shape == (width, width // expected_group)
+            if isinstance(predicate, dict):
+                expected = {"group_size": expected_group, "bits": expected_bits}
+                if "fallback_group_size" in predicate:
+                    expected["mode"] = expected_mode
+                assert config["quantization"][name] == expected
+    if not isinstance(predicate, dict) or not any(selected):
+        assert config["quantization"] == defaults
 
 
 def test_convert_preserves_existing_deepseek_v4_quantization():
@@ -612,54 +551,68 @@ def test_load_safetensors_reinterprets_f8_e8m0_header(tmp_path):
     assert restored["weight"]["dtype"] == "F8_E8M0"
 
 
-def test_load_model_uses_deepseek_v4_fp8_quantization_config():
-    class FakeConfig:
-        @classmethod
-        def from_dict(cls, config):
-            return cls()
+class _CheckpointConfig:
+    @classmethod
+    def from_dict(cls, config):
+        return cls()
 
-    class FakeDeepseekV4Model(nn.Module):
+
+class _CheckpointModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+    def load_weights(self, weights, strict=True):
+        self.loaded_weights, self.loaded_strict = weights, strict
+
+
+@contextmanager
+def _checkpoint_loading(config, model_class, weights, *, side_effect=None):
+    with (
+        patch("mlx_vlm.utils.load_config", return_value=config),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(
+                SimpleNamespace(ModelConfig=_CheckpointConfig, Model=model_class),
+                config["model_type"],
+            ),
+        ),
+        patch("mlx_vlm.utils.nn.quantize", side_effect=side_effect) as quantize,
+    ):
+        yield quantize
+
+
+def test_load_model_uses_deepseek_v4_fp8_quantization_config():
+
+    class FakeDeepseekV4Model(_CheckpointModel):
+
         def __init__(self, config):
-            super().__init__()
-            self.config = config
+            super().__init__(config)
             self.language_model = nn.Linear(2, 2, bias=False)
 
-        def load_weights(self, weights, strict=True):
-            self.loaded_weights = weights
-            self.loaded_strict = strict
-
-    fake_model_class = SimpleNamespace(
-        ModelConfig=FakeConfig, Model=FakeDeepseekV4Model
-    )
     quantization = {
         "group_size": 64,
         "bits": 8,
         "mode": "affine",
         "language_model.weight": {"group_size": 64, "bits": 8, "mode": "affine"},
     }
-
     with (
-        patch(
-            "mlx_vlm.utils.load_config",
-            return_value={
-                "model_type": "deepseek_v4",
-                "quantization_config": {"quant_method": "fp8"},
-            },
-        ),
-        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
-        patch("mlx_vlm.utils._load_safetensors", return_value={}),
-        patch(
-            "mlx_vlm.utils.get_model_and_args",
-            return_value=(fake_model_class, "deepseek_v4"),
-        ),
         patch(
             "mlx_vlm.models.deepseek_v4.language.make_quantization_config",
             return_value=quantization,
         ) as make_quantization_config,
-        patch("mlx_vlm.utils.nn.quantize") as quantize,
+        _checkpoint_loading(
+            {
+                "model_type": "deepseek_v4",
+                "quantization_config": {"quant_method": "fp8"},
+            },
+            FakeDeepseekV4Model,
+            {},
+        ) as quantize,
     ):
         model = load_model(Path("/tmp/model"), lazy=True)
-
     make_quantization_config.assert_called_once_with(model)
     quantize.assert_called_once()
     assert quantize.call_args.kwargs["group_size"] == 64
@@ -670,15 +623,10 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
 def test_load_model_matches_deepseek_v4_quantization_aliases():
     from mlx_vlm.models import deepseek_v4
 
-    class FakeConfig:
-        @classmethod
-        def from_dict(cls, config):
-            return cls()
+    class FakeDeepseekV4Model(_CheckpointModel):
 
-    class FakeDeepseekV4Model(nn.Module):
         def __init__(self, config):
-            super().__init__()
-            self.config = config
+            super().__init__(config)
             self.language_model = nn.Module()
             self.language_model.model = nn.Module()
             self.language_model.model.layers = [nn.Module()]
@@ -689,17 +637,10 @@ def test_load_model_matches_deepseek_v4_quantization_aliases():
             )
             self.language_model.lm_head = nn.Linear(64, 64, bias=False)
 
-        def load_weights(self, weights, strict=True):
-            self.loaded_weights = weights
-            self.loaded_strict = strict
-
         @staticmethod
         def quantization_path_aliases(path):
             return deepseek_v4.Model.quantization_path_aliases(path)
 
-    fake_model_class = SimpleNamespace(
-        ModelConfig=FakeConfig, Model=FakeDeepseekV4Model
-    )
     mxfp8 = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
     quantization = {
         "group_size": 32,
@@ -708,51 +649,31 @@ def test_load_model_matches_deepseek_v4_quantization_aliases():
         "layers.0.ffn.shared_experts.w1": mxfp8,
         "head": False,
     }
-
-    with (
-        patch(
-            "mlx_vlm.utils.load_config",
-            return_value={"model_type": "deepseek_v4", "quantization": quantization},
-        ),
-        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
-        patch("mlx_vlm.utils._load_safetensors", return_value={}),
-        patch(
-            "mlx_vlm.utils.get_model_and_args",
-            return_value=(fake_model_class, "deepseek_v4"),
-        ),
-        patch("mlx_vlm.utils.nn.quantize") as quantize,
-    ):
+    with _checkpoint_loading(
+        {"model_type": "deepseek_v4", "quantization": quantization},
+        FakeDeepseekV4Model,
+        {},
+    ) as quantize:
         load_model(Path("/tmp/model"), lazy=True)
-
     predicate = quantize.call_args.kwargs["class_predicate"]
-    fake_model = FakeDeepseekV4Model(FakeConfig())
+    fake_model = FakeDeepseekV4Model(_CheckpointConfig())
     shared_expert_spec = predicate(
         "language_model.model.layers.0.ffn.shared_experts.gate_proj",
         fake_model.language_model.model.layers[0].ffn.shared_experts.gate_proj,
     )
     head_spec = predicate("language_model.lm_head", fake_model.language_model.lm_head)
-
     assert shared_expert_spec == mxfp8
     assert head_spec == {}
 
 
 def test_load_model_transforms_fine_grained_fp8_by_format():
-    class FakeConfig:
-        @classmethod
-        def from_dict(cls, config):
-            return cls()
 
-    class FakeQwenModel(nn.Module):
+    class FakeQwenModel(_CheckpointModel):
+
         def __init__(self, config):
-            super().__init__()
-            self.config = config
+            super().__init__(config)
             self.proj = nn.Linear(128, 128, bias=False)
 
-        def load_weights(self, weights, strict=True):
-            self.loaded_weights = weights
-            self.loaded_strict = strict
-
-    fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeQwenModel)
     source_config = {
         "model_type": "future_compatible_model",
         "quantization_config": {
@@ -761,25 +682,15 @@ def test_load_model_transforms_fine_grained_fp8_by_format():
             "weight_block_size": [128, 128],
         },
     }
-
-    with (
-        patch("mlx_vlm.utils.load_config", return_value=source_config),
-        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
-        patch(
-            "mlx_vlm.utils._load_safetensors",
-            return_value={
-                "proj.weight": mx.zeros((128, 128), dtype=mx.uint8),
-                "proj.weight_scale_inv": mx.ones((1, 1), dtype=mx.bfloat16),
-            },
-        ),
-        patch(
-            "mlx_vlm.utils.get_model_and_args",
-            return_value=(fake_model_class, "future_compatible_model"),
-        ),
-        patch("mlx_vlm.utils.nn.quantize") as quantize,
-    ):
+    with _checkpoint_loading(
+        source_config,
+        FakeQwenModel,
+        {
+            "proj.weight": mx.zeros((128, 128), dtype=mx.uint8),
+            "proj.weight_scale_inv": mx.ones((1, 1), dtype=mx.bfloat16),
+        },
+    ) as quantize:
         model = load_model(Path("/tmp/model"), lazy=True)
-
     quantize.assert_called_once()
     assert quantize.call_args.kwargs["group_size"] == 32
     assert quantize.call_args.kwargs["bits"] == 8
@@ -791,29 +702,21 @@ def test_load_model_transforms_fine_grained_fp8_by_format():
 
 
 def test_load_model_quantizes_projector_with_scales_when_skip_vision():
-    class FakeConfig:
-        @classmethod
-        def from_dict(cls, config):
-            return cls()
 
     class FakeProjector(nn.Module):
+
         def __init__(self):
             super().__init__()
             self.linear_1 = nn.Linear(64, 64, bias=False)
 
-    class FakeModel(nn.Module):
+    class FakeModel(_CheckpointModel):
+
         def __init__(self, config):
-            super().__init__()
-            self.config = config
+            super().__init__(config)
             self.vision_tower = nn.Linear(64, 64, bias=False)
             self.multi_modal_projector = FakeProjector()
             self.language_model = nn.Linear(64, 64, bias=False)
 
-        def load_weights(self, weights, strict=True):
-            self.loaded_weights = weights
-            self.loaded_strict = strict
-
-    fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeModel)
     weights = {
         "language_model.weight": mx.zeros((64, 16), dtype=mx.uint32),
         "language_model.scales": mx.zeros((64, 1), dtype=mx.float16),
@@ -831,25 +734,17 @@ def test_load_model_quantizes_projector_with_scales_when_skip_vision():
         )
         selected["vision"] = predicate("vision_tower", model.vision_tower)
 
-    with (
-        patch(
-            "mlx_vlm.utils.load_config",
-            return_value={
-                "model_type": "kimi_vl",
-                "quantization": {"group_size": 64, "bits": 8},
-                "vision_config": {"skip_vision": True},
-            },
-        ),
-        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
-        patch("mlx_vlm.utils._load_safetensors", return_value=weights),
-        patch(
-            "mlx_vlm.utils.get_model_and_args",
-            return_value=(fake_model_class, "kimi_vl"),
-        ),
-        patch("mlx_vlm.utils.nn.quantize", side_effect=fake_quantize),
+    with _checkpoint_loading(
+        {
+            "model_type": "kimi_vl",
+            "quantization": {"group_size": 64, "bits": 8},
+            "vision_config": {"skip_vision": True},
+        },
+        FakeModel,
+        weights,
+        side_effect=fake_quantize,
     ):
         load_model(Path("/tmp/model"), lazy=True)
-
     assert selected == {"language": True, "projector": True, "vision": False}
 
 

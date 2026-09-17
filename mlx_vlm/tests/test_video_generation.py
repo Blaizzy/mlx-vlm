@@ -2,9 +2,8 @@ import importlib
 import json
 import shutil
 import subprocess
-from argparse import Namespace
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import mlx.core as mx
 import numpy as np
@@ -98,100 +97,6 @@ def test_h3_video_adapter_maps_ordered_references_and_outputs():
     assert calls[0].progress_callback is progress
 
 
-def test_video_generation_cli_preserves_reference_order(tmp_path, capsys):
-    output_path = tmp_path / "generated.mp4"
-    args = Namespace(
-        model="MiniMaxAI/MiniMax-H3",
-        prompt=["A", "short", "film"],
-        image=None,
-        last_image=None,
-        reference=["image=character.png", "video=motion.mp4", "audio=voice.wav"],
-        audio=None,
-        video=None,
-        workflow=None,
-        size="64x32",
-        seed=7,
-        steps=2,
-        num_frames=124,
-        output=str(output_path),
-        revision="test-revision",
-        force_download=False,
-        gen_kwargs={"test": True},
-        verbose=True,
-    )
-    model = SimpleNamespace()
-    result = _result(output_path)
-
-    with (
-        patch.object(video_module, "_VideoProgressBar") as mock_progress,
-        patch.object(
-            video_module, "load_video_generation_model", return_value=model
-        ) as mock_load,
-        patch.object(
-            video_module, "generate_video", return_value=result
-        ) as mock_generate,
-    ):
-        video_module.run_video_generation_cli(args)
-
-    assert mock_load.call_args.kwargs["workflow"] == "ref2va"
-    request = mock_generate.call_args.args[1]
-    assert request.prompt == "A short film"
-    assert [(item.kind, str(item.path)) for item in request.references] == [
-        ("image", "character.png"),
-        ("video", "motion.mp4"),
-        ("audio", "voice.wav"),
-    ]
-    assert request.width == 64
-    assert request.height == 32
-    assert request.num_frames == 124
-    progress = mock_progress.return_value.__enter__.return_value
-    mock_progress.assert_called_once_with(steps=2, num_frames=124, disable=False)
-    progress.assert_any_call("load", 0, 2, 124)
-    assert request.progress_callback is progress
-    assert mock_generate.call_args.kwargs["output_path"] == output_path
-    output = capsys.readouterr().out
-    assert "workflow=ref2va" in output
-    assert "generation_fps=" in output
-
-
-@pytest.mark.parametrize(
-    ("image", "last_image", "expected_workflow"),
-    [(None, None, "t2va"), (["first.png"], None, "fl2va"), (None, "last.png", "fl2va")],
-)
-def test_video_generation_cli_infers_keyframe_workflow(
-    tmp_path, image, last_image, expected_workflow
-):
-    args = Namespace(
-        model="MiniMaxAI/MiniMax-H3",
-        prompt=["synthetic"],
-        image=image,
-        last_image=last_image,
-        reference=None,
-        audio=None,
-        video=None,
-        workflow=None,
-        size=None,
-        seed=7,
-        steps=None,
-        num_frames=None,
-        output=str(tmp_path / "generated.mp4"),
-        revision=None,
-        force_download=False,
-        gen_kwargs={},
-        verbose=False,
-    )
-
-    with (
-        patch.object(
-            video_module, "load_video_generation_model", return_value=SimpleNamespace()
-        ) as mock_load,
-        patch.object(video_module, "generate_video", return_value=_result()),
-    ):
-        video_module.run_video_generation_cli(args)
-
-    assert mock_load.call_args.kwargs["workflow"] == expected_workflow
-
-
 def test_generate_video_string_request_routes_extra_kwargs():
     requests = []
     progress_events = []
@@ -256,20 +161,6 @@ def test_video_progress_bar_reports_effective_frames_per_second(monkeypatch):
     assert "Caching AdaLN" in bar.descriptions
     assert "Denoising video" in bar.descriptions
     assert bar.closed
-
-
-def test_generate_cli_routes_video_before_vlm_load():
-    args = Namespace(output_modality="video")
-
-    with (
-        patch.object(dispatch_module, "parse_arguments", return_value=args),
-        patch.object(dispatch_module, "run_video_generation_cli") as mock_run_video,
-        patch.object(dispatch_module, "load") as mock_load,
-    ):
-        dispatch_module.main()
-
-    mock_run_video.assert_called_once_with(args)
-    mock_load.assert_not_called()
 
 
 @pytest.mark.skipif(
