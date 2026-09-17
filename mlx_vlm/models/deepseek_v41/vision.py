@@ -3,33 +3,11 @@ from functools import lru_cache
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..deepseek_v4.vision import apply_rotary
+from ..deepseek_v4.vision import get_vision_cos_sin as _get_vision_cos_sin
 from .config import ModelConfig
 
-
-@lru_cache(8)
-def get_vision_cos_sin(n_h: int, n_w: int, dim: int, theta: float):
-    """2D RoPE tables, one row per patch."""
-    inv_freq = 1.0 / (theta ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim))
-    hpos = mx.broadcast_to(mx.arange(n_h)[:, None], (n_h, n_w))
-    wpos = mx.broadcast_to(mx.arange(n_w)[None, :], (n_h, n_w))
-    freqs = (
-        mx.stack([hpos, wpos], axis=-1).reshape(-1, 2, 1).astype(mx.float32) * inv_freq
-    )
-    freqs = freqs.reshape(n_h * n_w, -1)
-    return (
-        mx.cos(freqs)[:, None, :],
-        mx.sin(freqs)[:, None, :],
-    )
-
-
-def apply_rotary(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
-    """Rotary embedding over the last dim, split in halves."""
-    dtype = x.dtype
-    x = x.astype(mx.float32)
-    x1, x2 = mx.split(x, 2, axis=-1)
-    return mx.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1).astype(
-        dtype
-    )
+get_vision_cos_sin = lru_cache(8)(_get_vision_cos_sin)
 
 
 class PatchEmbed(nn.Module):
