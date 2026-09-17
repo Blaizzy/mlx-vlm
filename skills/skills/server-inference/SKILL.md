@@ -81,6 +81,6 @@ Match the model kind to the endpoint (an image endpoint needs a diffusion/image 
 ## Validation
 
 - For route/schema changes, run `uv run pytest mlx_vlm/tests/test_server.py -q`.
-- For structured output changes, include `uv run pytest mlx_vlm/tests/test_structured.py -q`.
-- For tool parser changes, add compact regressions to `TestProcessToolCalls` in `mlx_vlm/tests/test_server.py` and run the shared streaming tests in `test_responses_state.py`, plus any existing tests for affected parsers. Reuse consolidated tests instead of creating a new test file.
+- For structured output changes, include `uv run pytest mlx_vlm/tests/test_generate.py -q -k 'thinking_aware or json_schema'`.
+- For tool parser changes, add compact regressions to `TestProcessToolCalls` in `mlx_vlm/tests/test_server.py` and run the shared tool streaming tests in that module, plus any existing tests for affected parsers. Reuse consolidated tests instead of creating a new test file.
 - If the result is a user-facing bug report, switch to `Skill("mlx-vlm-skills:reproducible-github-issues")`.

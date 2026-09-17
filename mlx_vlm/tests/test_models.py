@@ -1,4 +1,6 @@
-"""Shared model contracts driven by the readable cases in model_cases.json."""
+"""JSON-driven model contracts and cached-image support declarations."""
+
+from __future__ import annotations
 
 import copy
 import importlib
@@ -571,3 +573,78 @@ def test_dense_model(name):
     config = DATA["dense"][name]
     model = module.Model(module.ModelConfig.from_dict(copy.deepcopy(config)))
     ModelChecks().forward_cache_test_runner(model, config["vocab_size"])
+
+
+@pytest.mark.parametrize(
+    "model_module",
+    [
+        "llava.llava",
+        "llava_bunny.llava_bunny",
+        "llava_next.llava_next",
+        "gemma3.gemma3",
+        "gemma4.gemma4",
+        "paligemma.paligemma",
+        "qwen2_5_vl.qwen2_5_vl",
+        "qwen2_vl.qwen2_vl",
+        "qwen3_vl.qwen3_vl",
+        "qwen3_5.qwen3_5",
+        "qwen3_vl_moe.qwen3_vl_moe",
+        "internvl_chat.internvl_chat",
+        "mistral3.mistral3",
+        "pixtral.pixtral",
+        "aya_vision.aya_vision",
+        "fastvlm.fastvlm",
+        "glm4v.glm4v",
+        "glm4v_moe.glm4v_moe",
+        "glm_ocr.glm_ocr",
+        "kimi_vl.kimi_vl",
+        "dots_ocr.dots_ocr",
+        "hunyuan_vl.hunyuan_vl",
+        "paddleocr_vl.paddleocr_vl",
+        "ernie4_5_moe_vl.ernie4_5_moe_vl",
+        "mllama.mllama",
+        "granite_vision.granite_vision",
+        "granite4_vision.granite4_vision",
+        "deepseek_vl_v2.deepseek_vl_v2",
+        "deepseek_v4.deepseek_v4",
+        "multi_modality.multi_modality",
+        "lfm2_vl.lfm2_vl",
+        "idefics2.idefics2",
+        "idefics3.idefics3",
+        "phi4mm.phi4mm",
+        "falcon_ocr.falcon_ocr",
+        "falcon_perception.falcon_perception",
+        "florence2.florence2",
+        "molmo.molmo",
+        "molmo2.molmo2",
+        "moondream3.moondream3",
+        "gemma3n.gemma3n",
+        "phi3_v.phi3_v",
+        "minicpmo.minicpmo",
+        "jina_vlm.jina_vlm",
+        "qwen3_omni_moe.thinker",
+    ],
+)
+def test_cached_image_features_in_source(model_module):
+    """Verify cached_image_features kwarg appears in get_input_embeddings source."""
+    try:
+        mod = importlib.import_module(f"mlx_vlm.models.{model_module}")
+    except Exception as e:
+        pytest.skip(f"Cannot import {model_module}: {e}")
+
+    # Find the class that has get_input_embeddings
+    target_cls = None
+    for name, obj in inspect.getmembers(mod, inspect.isclass):
+        if hasattr(obj, "get_input_embeddings") and obj.__module__ == mod.__name__:
+            target_cls = obj
+            break
+
+    assert (
+        target_cls is not None
+    ), f"No class with get_input_embeddings in {model_module}"
+
+    source = inspect.getsource(target_cls.get_input_embeddings)
+    assert "cached_image_features" in source, (
+        f"{model_module}.{target_cls.__name__}.get_input_embeddings "
+        f"missing cached_image_features check"
+    )

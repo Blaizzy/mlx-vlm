@@ -1,4 +1,6 @@
-"""Loading, conversion, and general model utilities."""
+"""Model loading, checkpoint conversion, weight sanitization, and shared utilities."""
+
+from __future__ import annotations
 
 import base64
 import json
@@ -18,6 +20,10 @@ import numpy as np
 import pytest
 
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
+from mlx_vlm.models.qwen3_5.config import ModelConfig as QwenModelConfig
+from mlx_vlm.models.qwen3_5.config import TextConfig as QwenTextConfig
+from mlx_vlm.models.qwen3_5.config import VisionConfig as QwenVisionConfig
+from mlx_vlm.models.qwen3_5.qwen3_5 import Model as QwenModel
 from mlx_vlm.utils import (
     DEFAULT_VIDEO_SAMPLING,
     StoppingCriteria,
@@ -1053,3 +1059,69 @@ def test_diffusion_gemma_load_config_preserves_generation_config(tmp_path):
     assert loaded["model_type"] == "diffusion_gemma"
     assert loaded["generation_config"] == generation_config
     assert ModelConfig.from_dict(loaded).generation_config == generation_config
+
+
+# Patch embedding layouts
+
+QWEN_PATCH_EMBED_KEY = "model.visual.patch_embed.proj.weight"
+QWEN_SANITIZED_KEY = "vision_tower.patch_embed.proj.weight"
+
+
+def _qwen_patch_model(
+    in_channels=3, temporal_patch_size=2, patch_size=4, hidden_size=8
+):
+    text_config = QwenTextConfig(
+        model_type="qwen3_5_text",
+        hidden_size=32,
+        intermediate_size=64,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=4,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        rms_norm_eps=1e-6,
+        vocab_size=64,
+        num_key_value_heads=1,
+        max_position_embeddings=128,
+        full_attention_interval=2,
+        head_dim=16,
+    )
+    vision_config = QwenVisionConfig(
+        model_type="qwen3_5",
+        depth=1,
+        hidden_size=hidden_size,
+        intermediate_size=16,
+        out_hidden_size=32,
+        num_heads=1,
+        in_channels=in_channels,
+        patch_size=patch_size,
+        temporal_patch_size=temporal_patch_size,
+        spatial_merge_size=1,
+        num_position_embeddings=4,
+    )
+    config = QwenModelConfig(
+        text_config=text_config, vision_config=vision_config, model_type="qwen3_5"
+    )
+    return QwenModel(config), vision_config
+
+
+def test_patch_embed_is_transposed_from_ncdhw_to_ndhwc():
+    """Qwen3.5 stores the Conv3d patch embed as NCDHW; MLX expects NDHWC."""
+    model, vision_config = _qwen_patch_model()
+    expected = model.vision_tower.patch_embed.proj.weight.shape
+
+    ncdhw = mx.zeros(
+        (
+            vision_config.hidden_size,
+            vision_config.in_channels,
+            vision_config.temporal_patch_size,
+            vision_config.patch_size,
+            vision_config.patch_size,
+        ),
+        dtype=mx.bfloat16,
+    )
+    sanitized = model.sanitize({QWEN_PATCH_EMBED_KEY: ncdhw})
+
+    assert sanitized[QWEN_SANITIZED_KEY].shape == expected

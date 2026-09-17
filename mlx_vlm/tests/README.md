@@ -16,16 +16,16 @@ Use a module path or `-k` to select a smaller group while developing.
 
 | Test module | Scope |
 | --- | --- |
-| `test_models.py` + `model_cases.json` | Shared language, vision, audio, projector, embedding, position, and native forward/cache contracts |
+| `test_models.py` + `model_cases.json` | Shared language, vision, audio, projector, embedding, position, native forward/cache contracts, and cached-image source checks |
 | `test_image_generation_models.py` | Bonsai, Flux2, Ideogram4, Z-Image, ERNIE Image, and Mage Flow generation/editing, components, loading, and conversion |
 | `test_diffusion_models.py` | LLaDA, Nemotron, and DiffusionGemma model/generation contracts, including sampling, prefill, caches, numerical parity, self-conditioning, vision, sanitization, and quantization policy |
 | `test_tool_parsers.py` | ATEM, Cohere, Gemma 4, GLM, Mistral, Pythonic parsing, and parser selection |
 | `test_apc.py` | Cache lookup, semantic keys, adapters, model compatibility, exact/partial prefix reuse, quantized checkpoints, memory budgets, disk persistence, trace logging, and diagnostics |
-| `test_cache.py` | Cache lifecycle, recurrence, quantization, batching, and attention masks |
+| `test_cache.py` | Cache lifecycle, recurrence, quantization, batching, attention masks, and vision-feature LRU behavior |
 | `test_turboquant.py` | TurboQuant cache integration, batched attention, and value kernels |
 | `test_weight_quantization.py` | FP8 and one-bit weight conversion and execution |
 | `test_moe_offload.py` | MoE checkpoint repacking, expert offload, output parity, and failure handling |
-| `test_qwen3_5.py` | Qwen3.5 patch layouts and ragged attention fallbacks |
+| `test_attention.py` | Absorbed MLA gates and numerical parity, Qwen3.5 ragged decode fallbacks, and PaddleOCR vision fast paths |
 | `test_audio_models.py` | MiniCPMO TTS, Qwen3 Omni, Nemotron Omni, and VoiceChat components, speech generation, streaming, and checkpoint conversion |
 | `test_video_generation_models.py` | MiniMax H3 packing, components, conditioning workflows, cached trajectories, numerical references, and conversion |
 | `test_video_generation.py` | Video model discovery, request/result adapters, progress, and audio/video muxing |
@@ -34,24 +34,46 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_speculative_masks_static.py` | Gemma assistant mask offsets with fake dependencies, without importing MLX |
 | `test_rope.py` | Rotary embeddings, multimodal position IDs, and batched offsets |
 | `test_audio_generation.py` | Audio generation, loading, downmixing, and resampling |
-| `test_server.py` | Chat/Responses/Anthropic APIs, image endpoints, batching/cancellation, runtime settings, and reranking |
+| `test_server.py` | Chat/Responses/Anthropic APIs, image endpoints, batching/cancellation, runtime settings, reranking, Responses normalization, and tool stream state |
 | `test_server_audio.py` | HTTP audio endpoints and realtime voice sessions |
 | `test_cli.py` | Text/image/audio/video CLI routing, arguments, diffusion display/visualizer behavior, detector display options, and CLI/library default parity |
 | `test_sample_utils.py` | Sampling distributions and shared contracts for AR/server positioned samplers |
 | `test_prompt_utils.py` | Prompt construction and reasoning-template arguments |
 | `test_trainer.py` | Training workflows, trainer utilities, MRoPE/gated-delta gradients, and MoE gradient/expert-replacement checks |
-| `test_utils.py` | General loading/conversion utilities and local Python model files |
+| `test_utils.py` | General loading/conversion utilities, local Python model files, and Qwen3.5 patch-weight layouts |
+| `test_generate.py` | Generation, stopping criteria, structured logits, and thinking-phase state |
+| `test_extraction_models.py` | GLiNER candidate pools, span/schema handling, checkpoint loading, and privacy tagging/quantized inference |
+| `test_pp_doclayout_v3.py` | Document-layout detection configs, sanitization, forward outputs, and postprocessing |
+| `test_tokenizer_utils.py` | Streaming detokenizers, decoder detection, and tokenizer wrappers |
+| `test_smoke.py` | Manual model-download runner, excluded from automated collection |
 
-The suite has 36 test modules. APC settings and worker shutdown checks live in
-`test_server.py`; APC builders and parameterized cache-format checks live in
-`test_apc.py`. Quantized cache lifecycle checks share `test_cache.py`, while
-TurboQuant numerical and kernel checks remain in `test_turboquant.py`.
+The suite has 30 test modules. Attention checks share `test_attention.py`;
+Qwen3.5 patch-weight sanitization lives with loading checks in `test_utils.py`.
+Responses normalization and tool-stream finalization share `test_server.py`;
+structured-output processors share `test_generate.py`. Vision LRU checks live in
+`test_cache.py`, while all 45 cached-image source checks live in `test_models.py`.
+Those source checks verify the keyword's presence, not runtime cache reuse.
+GLiNER and privacy-filter checks share `test_extraction_models.py`.
 
-Against `79c5402a`, this consolidation removes 908 Python lines, retains the two
-JSON case files, and preserves the exact full-suite coverage sets: 80,634 executed
-production lines and 12,715 branch outcomes. Validation reports 1,852 passed,
-five skipped, and 41 passing subtests. These are measured execution sets, not
-complete production coverage. The earlier pruning tradeoffs still apply.
+Against `f7de22df`, this consolidation removes 427 Python lines and six test
+files, retaining both JSON files. Full-suite execution sets are identical:
+80,634 production lines and 12,715 branch outcomes, with no lost or added paths.
+Validation reports 1,852 passed, five skipped, and 41 passing subtests.
+These are measured execution sets, not complete production coverage. The earlier
+pruning tradeoffs still apply. The suite now contains 26,770 Python lines plus
+2,142 readable JSON lines, or 28,912 combined.
+
+MoE offload remains separate and shrinks from 615 to 305 lines. Reuse its
+checkpoint/quantization/repacking and relative-parity helpers. Separate-projection
+and fused-expert checkpoints share a parameterized loader check; direct patching,
+threaded expert access, raw Mixtral-style sanitization, and malformed/disk-space
+failure checks remain explicit. String and Path checkpoint destinations are both
+exercised. All numerical tolerances and per-test hardware/dependency skips remain.
+
+APC settings and worker shutdown checks live in `test_server.py`; APC builders
+and parameterized cache-format checks live in `test_apc.py`. Quantized cache
+lifecycle checks share `test_cache.py`, while TurboQuant numerical and kernel
+checks remain in `test_turboquant.py`.
 
 Audio model checks share tiny configuration defaults within `test_audio_models.py`.
 Optional audio dependencies and real VoiceChat checkpoint skips remain scoped to

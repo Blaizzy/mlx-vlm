@@ -1,4 +1,4 @@
-"""HTTP protocols, generation workers, runtime settings, and model routing."""
+"""HTTP protocols, generation workers, runtime settings, model routing, and response state."""
 
 from __future__ import annotations
 
@@ -43,6 +43,7 @@ from mlx_vlm.models.cache import KVCache
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.server import GenerationArguments as Args
 from mlx_vlm.server import ResponseGenerator as Generator
+from mlx_vlm.server.responses_state import ToolCallStreamState, _response_items_to_chat
 from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 from mlx_vlm.tools.parsers import minicpm5
@@ -3196,3 +3197,117 @@ def test_generation_worker_closes_disk_after_final_store(tmp_path, fail):
     finally:
         if any(thread.is_alive() for thread in disk._workers):
             manager.close()
+
+
+@pytest.mark.parametrize(
+    "mixed_text", [False, True], ids=["image-after-call", "text-with-image"]
+)
+def test_function_output_preserves_visual_input(mixed_text):
+    image_url = (
+        "https://example.com/result.png"
+        if mixed_text
+        else "data:image/png;base64,ZmFrZS1pbWFnZQ=="
+    )
+    call_id = "call_analyze_image" if mixed_text else "call_view_image"
+    output = (
+        [
+            {"type": "input_text", "text": "Rendered result"},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]
+        if mixed_text
+        else [{"type": "input_image", "image_url": image_url, "detail": "high"}]
+    )
+    items = (
+        []
+        if mixed_text
+        else [
+            dict(
+                type="function_call", name="view_image", arguments="{}", call_id=call_id
+            )
+        ]
+    )
+    items.append(dict(type="function_call_output", call_id=call_id, output=output))
+    messages, images = _response_items_to_chat(items)
+    assert images == [image_url]
+    expected = [
+        _msg(
+            ("Rendered result\n" if mixed_text else "")
+            + "[Image output attached in the next message]",
+            role="tool",
+            tool_call_id=call_id,
+        ),
+        _msg([{"type": "image"}], role="user"),
+    ]
+    assert (messages if mixed_text else messages[-2:]) == expected
+    if not mixed_text:
+        prompt = apply_chat_template(
+            None, {"model_type": "qwen2_vl"}, messages, num_images=len(images)
+        )
+        assert prompt.index("Tool:") < prompt.index("<image>")
+        assert image_url not in prompt
+
+
+def test_message_image_stays_on_its_original_user_turn():
+    image_url = "https://example.com/first-turn.png"
+    items = [
+        _msg(
+            [
+                {"type": "input_text", "text": "First turn"},
+                {"type": "input_image", "image_url": image_url},
+            ],
+            type="message",
+        ),
+        _msg(
+            [{"type": "output_text", "text": "I see it."}],
+            role="assistant",
+            type="message",
+        ),
+        _msg([{"type": "input_text", "text": "Second turn"}], type="message"),
+    ]
+
+    messages, images = _response_items_to_chat(items)
+    normalized = apply_chat_template(
+        None,
+        {"model_type": "qwen2_vl"},
+        messages,
+        num_images=len(images),
+        return_messages=True,
+    )
+
+    assert images == [image_url]
+    assert any(part["type"] == "image" for part in normalized[0]["content"])
+    assert normalized[-1]["content"] == [
+        {"type": "text", "text": "Second turn", "content": "Second turn"}
+    ]
+
+
+def test_unknown_function_output_blocks_remain_text():
+    unknown = {"type": "custom_output", "value": {"answer": 42}}
+    messages, images = _response_items_to_chat(
+        [
+            {
+                "type": "function_call_output",
+                "call_id": "call_custom",
+                "output": [unknown],
+            }
+        ]
+    )
+
+    assert images == []
+    assert json.loads(messages[0]["content"]) == [unknown]
+
+
+@pytest.mark.parametrize(
+    "chunks,end_marker,expected",
+    [
+        (["Before ", "<tool_call>", '{"name": "a"}', " trailing"], "", "Before "),
+        (["A literal <tool"], "</tool_call>", "A literal <tool"),
+    ],
+    ids=["missing-end-marker", "unfinished-start-marker"],
+)
+def test_tool_stream_finalization(chunks, end_marker, expected):
+    state = ToolCallStreamState("<tool_call>", end_marker)
+    visible = [
+        state.feed(chunk, last=i == len(chunks) - 1) for i, chunk in enumerate(chunks)
+    ]
+    assert "".join(delta for delta in visible if delta) == expected

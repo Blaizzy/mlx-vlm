@@ -1,4 +1,4 @@
-"""Cache lifecycle, quantization, recurrence, and batched attention masks."""
+"""Cache lifecycle, quantization, recurrence, batched masks, and vision features."""
 
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ from mlx_vlm.models.cache import (
     create_causal_mask,
 )
 from mlx_vlm.models.hy_v4.cache import HyV4KVCache
+from mlx_vlm.vision_cache import VisionFeatureCache
 
 
 def _make_kv_cache(batch_size=1, length=3, factory=KVCache):
@@ -657,3 +658,35 @@ def test_prepare_left_padding_on_empty_only():
     cache.update_and_fetch(k, v)
     with pytest.raises(ValueError, match="empty"):
         cache.prepare(left_padding=[1, 0])
+
+
+class TestVisionFeatureCache:
+    def test_lru_eviction(self):
+        cache = VisionFeatureCache(max_size=2)
+        cache.put("a.jpg", mx.ones((1, 10, 64)))
+        cache.put("b.jpg", mx.ones((1, 10, 64)) * 2)
+        cache.put("c.jpg", mx.ones((1, 10, 64)) * 3)  # evicts a.jpg
+        assert cache.get("a.jpg") is None
+        assert cache.get("b.jpg") is not None
+        assert cache.get("c.jpg") is not None
+
+    def test_multi_image_key(self):
+        cache = VisionFeatureCache()
+        features = mx.ones((1, 560, 1536))
+        cache.put(["img1.jpg", "img2.jpg"], features)
+        assert cache.get(["img1.jpg", "img2.jpg"]) is not None
+        assert cache.get(["img2.jpg", "img1.jpg"]) is None  # order matters
+
+    def test_contains(self):
+        cache = VisionFeatureCache()
+        cache.put("a.jpg", mx.ones((1, 10, 64)))
+        assert "a.jpg" in cache
+        assert "b.jpg" not in cache
+
+    def test_overwrite_existing_key(self):
+        cache = VisionFeatureCache(max_size=2)
+        cache.put("a.jpg", mx.ones((1, 10, 64)))
+        cache.put("a.jpg", mx.ones((1, 10, 64)) * 5)
+        assert len(cache) == 1
+        result = cache.get("a.jpg")
+        assert mx.array_equal(result, mx.ones((1, 10, 64)) * 5)
