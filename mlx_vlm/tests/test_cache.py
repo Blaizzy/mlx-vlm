@@ -1418,6 +1418,14 @@ def test_model_cache_contract(names, managers, monkeypatch):
     assert manager.stats_snapshot()[counter] == 1
     if plan.strategy != "block":
         assert hit["warm_cache"] is not None
+    assert manager.stats_snapshot()["restored_tokens"] == 0
+    assert runner.materialize_single(hit, min_capacity_tokens=17) is not None
+    assert manager.stats_snapshot()["restored_tokens"] == 16
+    manager.reset_stats()
+    merged, _ = runner.merge_rows([hit], [16])
+    assert manager.stats_snapshot()["restored_tokens"] == (
+        16 if merged is not None else 0
+    )
     runner.release_hit(hit)
 
 
@@ -2824,3 +2832,55 @@ def test_packed_memory_profiles_include_spare_capacity(kind, batch_size, bits):
     assert current.source_bytes * batch_size == allocated
     if kind != "hybrid":
         assert allocated > cache.nbytes
+
+
+@parametrize("mode", ["block", "exact"])
+@parametrize("tier", ["memory", "disk"])
+@parametrize("restore", ["single", "batch", "failed-batch"])
+def test_restored_tokens_count_successful_restores(
+    mode, tier, restore, managers, monkeypatch
+):
+    manager = managers(tier, namespace="stats")
+    tokens = list(range(32))
+    row = [sample("ArraysCache", 32), sample("KVCache", 32)]
+    if mode == "exact":
+        assert manager.store_exact_cache(tokens, row)
+    else:
+        manager.release(manager.store_kv_blocks(tokens, [row[1].keys], [row[1].values]))
+    stats = manager.stats_snapshot()
+    assert stats["restored_tokens"] == 0
+    assert stats["stored_tokens"] == (32 if mode == "block" else 0)
+    if tier == "disk":
+        manager.close()
+        manager = managers(tier, namespace="stats")
+    caches = [ArraysCache(2), KVCache()] if mode == "exact" else [KVCache()]
+    runner = coordinate(manager, caches)
+    hit = runner.lookup(
+        tokens + [99],
+        extra_hash=0,
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda _: True,
+        prefix_has_media=lambda _: False,
+    )
+    assert hit is not None
+    before = manager.stats_snapshot()
+    assert before["matched_tokens"] > 0 and before["restored_tokens"] == 0
+    if restore == "single":
+        caches = runner.materialize_single(hit, min_capacity_tokens=33)
+    else:
+        if restore == "failed-batch":
+            builder = "exact" if mode == "exact" else "kv"
+            monkeypatch.setattr(
+                P, f"make_warm_batch_{builder}_cache_multi", lambda *a, **kw: (None, 0)
+            )
+        caches, _ = runner.merge_rows([hit, None], [hit["prefix_len"], 0])
+    runner.release_hit(hit)
+    stats = manager.stats_snapshot()
+    assert (caches is None) == (restore == "failed-batch")
+    assert stats["restored_tokens"] == (0 if caches is None else hit["prefix_len"])
+    assert stats["token_hit_rate"] == before["token_hit_rate"]
+    if tier == "disk":
+        assert stats["disk_hits"] > 0
+    manager.reset_stats()
+    assert manager.stats_snapshot()["restored_tokens"] == 0
+    assert manager.stats_snapshot()["stored_tokens"] == 0

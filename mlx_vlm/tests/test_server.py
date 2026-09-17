@@ -1090,7 +1090,7 @@ def test_anthropic_tool_result_normalization(client, image):
     ]
     expected = [
         _msg(
-            None,
+            "",
             "assistant",
             tool_calls=[
                 dict(

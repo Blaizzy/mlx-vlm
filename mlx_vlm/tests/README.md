@@ -20,12 +20,12 @@ Use a module path or `-k` to select a smaller group while developing.
 | Test module | Scope |
 | --- | --- |
 | `test_models.py` + `model_cases.json` | Shared language, vision, audio, projector, embedding, position and native forward/cache contracts; checkpoint loading, sanitization, and document layout |
-| `test_model_ops.py` | Attention kernels and numerical parity, rotary embeddings, weight quantization, and format conversion |
+| `test_model_ops.py` | Attention kernels and numerical parity, rotary embeddings, weight quantization, packed Hadamard checkpoints, and format conversion |
 | `test_cache.py` | Cache lifecycle, APC lookup and prefix reuse, adapters, memory budgets, disk persistence, TurboQuant, batched masks/attention, and vision-feature LRU behavior |
 | `test_processors.py` + `processor_cases.json` | Tokenizers and detokenizers, processor loading and media contracts, image/video utilities, prompt construction, and dynamically discovered tool parsers |
 | `test_audio_models.py` | Audio/omni model components, speech generation, streaming, checkpoint conversion, audio loading, downmixing, and resampling |
 | `test_video_generation_models.py` | Video model components, conditioning workflows, cached trajectories, numerical references, conversion, discovery, request/result adapters, and audio/video muxing |
-| `test_extraction_models.py` | GLiNER candidate pools, span/schema handling, checkpoint loading, and privacy tagging/quantized inference |
+| `test_extraction_models.py` | GLiNER candidate pools, span/schema handling, privacy tagging/quantized inference, and Sapiens2 vision extraction |
 | `test_image_generation_models.py` + `image_generation_cases.json` | Bonsai, Flux2, Ideogram4, Z-Image, ERNIE Image, and Mage Flow generation/editing, components, loading, and conversion |
 | `test_diffusion_models.py` | LLaDA, Nemotron, and DiffusionGemma models/generation, numerical parity, caches, vision, sanitization, and generation-config loading |
 | `test_speculative.py` | Drafter loading and compatibility, generation parity, verification, cache transactions, and quantized speculative state |
@@ -43,6 +43,29 @@ Speculative setup stays in `test_speculative.py`; only general JSON config
 construction is shared through `test_models.py`.
 
 ## Current validation
+
+The merge of `main` at `10db0927` preserves the consolidated **16-file layout**,
+JSON runners, and prior deletions. New upstream tests join the existing suites:
+APC restore accounting in `test_cache.py`, Qwen Omni DeepStack in
+`test_audio_models.py`, Sapiens2 in `test_extraction_models.py`, packed Hadamard
+checkpoints in `test_model_ops.py`, GLM head sanitization in `test_models.py`, and
+periodic cache evaluation in `test_generate.py`. The shared Anthropic runner now
+expects upstream's empty-string assistant content for tool calls. No existing
+test function was removed by this merge.
+
+The full suite passes **1,807 tests, four skips, and 41 subtests**. It contains
+**22,873 Python lines plus 3,256 JSON lines: 26,129 combined**. Formatting, lint,
+Python 3.10 syntax, JSON parsing, and whitespace checks pass.
+
+Production code matches `main` at `10db0927`, so both coverage runs use the same
+**153,776 statements and 40,444 branch outcomes**. The merged PR executes
+**82,142 statements (53.4167%) and 13,175 branch outcomes (32.5759%)**;
+`main` executes **102,954 statements (66.9506%) and 18,311 branch outcomes
+(45.2749%)**. Main passes 4,287 tests with nine skips and 162 subtests in the same
+environment. Both runs disable downloads and omit test code from coverage;
+the manual smoke runner is excluded on main. Earlier intentional pruning remains.
+
+## Previous image-contract validation
 
 The image-contract refactor against `31218fb1` keeps all existing scenarios and
 uses seven named runners for **43 JSON cases**: forward (6), wrapper (8), sanitize

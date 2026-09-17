@@ -64,6 +64,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | K2-Horizon | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/k2_horizon/README.md) |
 | Z1T-0 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/z1t/README.md) |
 | Spark-X2.5 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/spark2_5/README.md) |
+| Ternary Bonsai 2 | [Docs](mlx_vlm/models/prism_hadamard_qwen35/README.md) |
 
 ## Installation
 
@@ -918,6 +919,14 @@ Inspect and reset APC state:
 curl http://localhost:8080/v1/cache/stats
 curl -X POST http://localhost:8080/v1/cache/reset
 ```
+
+`restored_tokens` counts prefix tokens successfully materialized for generation
+across block and exact caches, in memory or on disk. A lookup alone does not
+increase it, nor does a failed batch restore. A successful restore remains counted
+if the request later fails or is cancelled.
+The previous `served_tokens` block-storage count is now `stored_tokens`;
+`token_hit_rate` retains its existing calculation,
+`matched_tokens / (matched_tokens + stored_tokens)`.
 
 Configure APC on a running server with `PATCH /v1/settings`. Use
 `GET /v1/settings` to discover supported settings and read their current values:

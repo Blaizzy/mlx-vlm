@@ -21,7 +21,7 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from mlx.utils import tree_map
+from mlx.utils import tree_flatten, tree_map
 
 from mlx_vlm.models.base import InputEmbeddingsFeatures
 from mlx_vlm.utils import (
@@ -963,3 +963,42 @@ def test_patch_embed_is_transposed_from_ncdhw_to_ndhwc():
     sanitized = model.sanitize({QWEN_PATCH_EMBED_KEY: ncdhw})
 
     assert sanitized[QWEN_SANITIZED_KEY].shape == expected
+
+
+def test_glm_quantized_head_sanitization_loads_strictly():
+    module = importlib.import_module("mlx_vlm.models.glm5_next")
+    model = module.Model(
+        module.ModelConfig(
+            text_config=tiny_config("glm", hidden_size=32),
+            vision_config=module.VisionConfig(
+                depth=1,
+                hidden_size=16,
+                intermediate_size=32,
+                out_hidden_size=32,
+                projection_intermediate_size=32,
+                num_heads=2,
+                image_size=8,
+                patch_size=2,
+            ),
+        )
+    )
+    nn.quantize(
+        model,
+        group_size=32,
+        bits=4,
+        class_predicate=lambda path, _: path.endswith("language_model.lm_head"),
+    )
+    checkpoint = dict(tree_flatten(model.parameters()))
+    head = {
+        f"lm_head.{suffix}": checkpoint.pop(f"language_model.lm_head.{suffix}")
+        for suffix in ("weight", "scales", "biases")
+    }
+    sanitized = model.sanitize(head)
+    assert sanitized.keys() == {
+        f"language_model.lm_head.{suffix}" for suffix in ("weight", "scales", "biases")
+    }
+    again = model.sanitize(sanitized)
+    assert again.keys() == sanitized.keys()
+    for key, value in sanitized.items():
+        assert mx.array_equal(again[key], value).item()
+    model.load_weights(list(model.sanitize(checkpoint | head).items()), strict=True)
