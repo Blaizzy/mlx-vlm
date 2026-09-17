@@ -237,6 +237,8 @@ def _mixed_batch(model, rows, prompts, prefix, warm_cache=None):
     bg.model = model
     bg.apc_manager = object()
     bg.apc = SimpleNamespace(
+        prepare_prefill=lambda *a, **k: None,
+        observe_cache=lambda *a, **k: None,
         merge_rows=lambda *a, **k: (
             ar._apc.make_warm_batch_exact_cache_multi(
                 [warm_cache, make_prompt_cache(model)], [prefix, 0]

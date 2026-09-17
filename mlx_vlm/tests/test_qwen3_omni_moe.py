@@ -1,6 +1,7 @@
 import unittest
 
 import mlx.core as mx
+import numpy as np
 
 from mlx_vlm.models.qwen3_omni_moe.config import (
     AudioConfig,
@@ -15,6 +16,7 @@ from mlx_vlm.models.qwen3_omni_moe.config import (
 from mlx_vlm.models.qwen3_omni_moe.qwen3_omni_moe import Model
 
 IMAGE_TOKEN = 60
+VIDEO_TOKEN = 61
 VISION_START = 63
 VISION_END = 59
 
@@ -153,6 +155,27 @@ def _image_inputs():
         dtype=mx.int32,
     )
     return input_ids, pixel_values, mx.array([[1, 4, 4]])
+
+
+def _image_video_inputs(video_first=False, video_steps=1, batch_size=1):
+    # Each spatial grid contributes four visual tokens after merging.
+    mx.random.seed(11)
+    pixel_values = mx.random.normal((batch_size * 16, 24))
+    pixel_values_videos = mx.random.normal((batch_size * video_steps * 16, 24))
+    image = [VISION_START] + [IMAGE_TOKEN] * 4 + [VISION_END]
+    video = [VISION_START] + [VIDEO_TOKEN] * (4 * video_steps) + [VISION_END]
+    input_ids = mx.array(
+        [
+            [1, 2]
+            + (video + image if video_first ^ bool(i % 2) else image + video)
+            + [3]
+            for i in range(batch_size)
+        ],
+        dtype=mx.int32,
+    )
+    image_grid = mx.array([[1, 4, 4]] * batch_size)
+    video_grid = mx.array([[video_steps, 4, 4]] * batch_size)
+    return input_ids, pixel_values, pixel_values_videos, image_grid, video_grid
 
 
 class Qwen3OmniMoeTest(unittest.TestCase):
@@ -308,6 +331,115 @@ class Qwen3OmniMoeTest(unittest.TestCase):
             self._assert_prefill_decode_match(
                 pre[:, prefix_len + i], step, prefix_len + i
             )
+
+    def test_image_and_video_deepstack_embeds_are_joined_by_position(self):
+        model = _tiny_vision_model()
+        thinker = model.thinker
+        dtype = thinker.vision_tower.patch_embed.proj.weight.dtype
+        for video_first in (False, True):
+            for video_steps in (1, 2):
+                for batch_size in (1, 2):
+                    with self.subTest(
+                        video_first=video_first,
+                        video_steps=video_steps,
+                        batch_size=batch_size,
+                    ):
+                        ids, pixels, videos, image_grid, video_grid = (
+                            _image_video_inputs(video_first, video_steps, batch_size)
+                        )
+                        features = thinker.get_input_embeddings(
+                            ids,
+                            pixel_values=pixels,
+                            image_grid_thw=image_grid,
+                            pixel_values_videos=videos,
+                            video_grid_thw=video_grid,
+                        )
+                        joint = features.deepstack_visual_embeds
+                        _, image_only = thinker.vision_tower(
+                            pixels.astype(dtype), image_grid
+                        )
+                        _, video_only = thinker.vision_tower(
+                            videos.astype(dtype), video_grid
+                        )
+                        mx.eval(joint, image_only, video_only)
+
+                        self.assertEqual(joint.shape, (*ids.shape, 2, 16))
+                        self.assertEqual(joint.dtype, features.inputs_embeds.dtype)
+                        flat = joint.reshape(-1, 2, 16)
+                        image_positions = mx.array(
+                            np.flatnonzero(np.array(ids == IMAGE_TOKEN).reshape(-1)),
+                            dtype=mx.uint32,
+                        )
+                        video_positions = mx.array(
+                            np.flatnonzero(np.array(ids == VIDEO_TOKEN).reshape(-1)),
+                            dtype=mx.uint32,
+                        )
+                        for layer, (img, vid) in enumerate(zip(image_only, video_only)):
+                            self.assertTrue(
+                                bool(
+                                    mx.allclose(
+                                        flat[image_positions, layer],
+                                        img.astype(joint.dtype),
+                                        atol=1e-6,
+                                    ).item()
+                                )
+                            )
+                            self.assertTrue(
+                                bool(
+                                    mx.allclose(
+                                        flat[video_positions, layer],
+                                        vid.astype(joint.dtype),
+                                        atol=1e-6,
+                                    ).item()
+                                )
+                            )
+                        text_positions = (ids != IMAGE_TOKEN) & (ids != VIDEO_TOKEN)
+                        self.assertFalse(
+                            bool(
+                                mx.any(
+                                    mx.where(text_positions[..., None, None], joint, 0)
+                                ).item()
+                            )
+                        )
+
+    def test_image_and_video_chunked_prefill_matches_full_prompt(self):
+        from mlx_vlm.models.cache import make_prompt_cache
+
+        for video_first in (False, True):
+            with self.subTest(video_first=video_first):
+                model = _tiny_vision_model()
+                ids, pixels, videos, image_grid, video_grid = _image_video_inputs(
+                    video_first, video_steps=2
+                )
+                kwargs = model.get_input_embeddings(
+                    ids,
+                    pixel_values=pixels,
+                    image_grid_thw=image_grid,
+                    pixel_values_videos=videos,
+                    video_grid_thw=video_grid,
+                ).to_dict()
+                embeds = kwargs.pop("inputs_embeds")
+                lm = model.language_model
+                full = lm(
+                    ids, inputs_embeds=embeds, cache=make_prompt_cache(lm), **kwargs
+                ).logits
+                cache = make_prompt_cache(lm)
+                chunks = [
+                    lm(
+                        ids[:, start:stop],
+                        inputs_embeds=embeds[:, start:stop],
+                        cache=cache,
+                        **kwargs,
+                    ).logits
+                    for start, stop in ((0, 5), (5, 12), (12, ids.shape[1]))
+                ]
+                self.assertTrue(
+                    bool(
+                        mx.allclose(
+                            mx.concatenate(chunks, axis=1), full, rtol=1e-4, atol=1e-4
+                        ).item()
+                    )
+                )
 
     def test_quant_predicate_forwarded_to_top_level_model(self):
         model = _tiny_model()
