@@ -369,7 +369,7 @@ def _anthropic_messages_to_internal(
             if tool_calls:
                 msg["tool_calls"] = tool_calls
                 if not content_text:
-                    msg["content"] = None
+                    msg["content"] = ""
             processed_messages.append(msg)
         processed_messages.extend(tool_results)
 

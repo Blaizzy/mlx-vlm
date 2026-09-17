@@ -3870,7 +3870,7 @@ def test_anthropic_messages_endpoint_converts_tool_result_inputs(client, monkeyp
     assert mock_template.call_args.args[2] == [
         {
             "role": "assistant",
-            "content": None,
+            "content": "",
             "tool_calls": [
                 {
                     "id": "toolu_1",
@@ -4001,7 +4001,7 @@ def test_anthropic_messages_endpoint_preserves_tool_result_images(client, monkey
     assert mock_template.call_args.args[2] == [
         {
             "role": "assistant",
-            "content": None,
+            "content": "",
             "tool_calls": [
                 {
                     "id": "toolu_1",
