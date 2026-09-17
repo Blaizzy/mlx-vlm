@@ -60,23 +60,31 @@ against `f7de22df`, retaining both JSON files. Its full-suite execution sets wer
 80,634 production lines and 12,715 branch outcomes, with no lost or added paths.
 That validation reported 1,852 passed, five skipped, and 41 passing subtests.
 These are measured execution sets, not complete production coverage. The earlier
-pruning tradeoffs still apply. The suite now contains 26,763 Python lines plus
-2,142 readable JSON lines, or 28,905 combined.
+pruning tradeoffs still apply. The suite now contains 26,754 Python lines plus
+2,142 readable JSON lines, or 28,896 combined.
 
 `test_tool_parsers.py` discovers modules under `mlx_vlm.tools.parsers` and imports
 them through `load_tool_module`. Add a literal native-format example to
 `WIRE_CALLS` for each new parser; the inventory check requires matching module,
 registry, and example names. Shared checks cover argument values/types, single and
 repeated extraction, unique IDs/indices, surrounding prose, template variants,
-processor inference, overrides, and priority over the JSON fallback. Add syntax
-variants to `test_parser_syntax` with the parser name, expected argument type,
-input, function name, and arguments. Gemma and Pythonic share this runner while
-retaining their string/dict output contracts. Keep error cases in the same file.
-The 13 formats now run 49 cases in 270
-lines (previously 22 cases in 277 lines), with all prior measured paths retained.
-The full suite reports 1,879 passed, five skipped, and 41 passing subtests;
-80,919 production lines and 12,819 branch outcomes execute, adding 285 lines and
-104 branch outcomes against `6ce9f04d`, with no lost paths.
+processor inference, overrides, and priority over the JSON fallback. Add wire
+variants to `WIRE_VARIANTS`; the same runner checks Mistral v3/v11, bare EOF calls,
+and single/repeated extraction with prose. Prose-only inputs, including text
+containing `call:`, also run through every parser.
+
+Add syntax variants to `test_parser_syntax` with the parser name, expected argument
+type, input, expected call or list of calls, and optional tool schema. Gemma,
+Pythonic, Cohere object/array payloads and escaping, and GLM newline handling share
+this runner while retaining their return-type assertions. Error cases use
+`test_invalid_calls`; no test function has a parser-specific implementation.
+The 13 formats run 46 cases in 261 lines. Folding three cases into the common
+runner reduces collection from 49 without dropping their assertions. Against
+`3d5c0510`, isolated execution sets remain 4,068 production lines and 247 branch
+outcomes; full-suite sets remain 80,919 lines and 12,819 branch outcomes, with no
+lost or added paths. The full suite reports 1,876 passed, five skipped, and 41
+passing subtests. Relative to `6ce9f04d`, parser coverage still adds 285 production
+lines and 104 branch outcomes, with no lost paths.
 
 MoE offload remains separate and shrinks from 615 to 305 lines. Reuse its
 checkpoint/quantization/repacking and relative-parity helpers. Separate-projection

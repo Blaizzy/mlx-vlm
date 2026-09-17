@@ -21,18 +21,22 @@ PARSER_NAMES = sorted(
     if not module.ispkg and not module.name.startswith("_")
 )
 WEATHER_ARGS = {"city": "Paris", "days": 3}
-WEATHER_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
-            },
-        },
-    }
-]
+
+
+def _weather_tools(**fields):
+    properties = {name: dict(type=kind) for name, kind in fields.items()}
+    return [
+        dict(
+            type="function",
+            function=dict(
+                name="get_weather",
+                parameters=dict(type="object", properties=properties),
+            ),
+        )
+    ]
+
+
+WEATHER_TOOLS = _weather_tools(city="string", days="integer")
 # Literal wire examples are independent of the parser's marker constants.
 WIRE_CALLS = {
     "atem": 'to=self<|message|><atem:function_calls><atem:invoke name="get_weather">'
@@ -66,8 +70,19 @@ WIRE_CALLS = {
 }
 
 
+WIRE_VARIANTS = {
+    "mistral": [
+        '[TOOL_CALLS] [{"name": "get_weather", "arguments": {"city": "Paris", "days": 3}}]'
+    ],
+}
+
+
 def _parse(name, text, tools=None):
     return load_tool_module(name).parse_tool_call(text, tools)
+
+
+def _call(name, **arguments):
+    return dict(name=name, arguments=arguments)
 
 
 def _arguments(call):
@@ -77,34 +92,43 @@ def _arguments(call):
 
 def test_every_parser_has_registration_and_wire_example():
     assert set(PARSER_NAMES) == {spec.name for spec in SPECS} == set(WIRE_CALLS)
+    assert set(WIRE_VARIANTS) <= set(PARSER_NAMES)
 
 
 @pytest.mark.parametrize("name", PARSER_NAMES)
 def test_parser_contract(name):
     parser = load_tool_module(name)
-    wire = WIRE_CALLS[name]
-    body = wire.removeprefix(parser.tool_call_start).removesuffix(parser.tool_call_end)
-    parsed = parser.parse_tool_call(body, WEATHER_TOOLS)
-    calls = parsed if isinstance(parsed, list) else [parsed]
-    assert len(calls) == 1
-    assert calls[0]["name"] == "get_weather"
-    assert _arguments(calls[0]) == WEATHER_ARGS
-    for count in (1, 2):
-        # Newlines delimit Mistral calls, which have no closing marker.
-        output = "Before\n" + "\n".join([wire] * count) + "\nAfter"
-        result = process_tool_calls(output, parser, WEATHER_TOOLS)
-        assert result.remaining_text.split() == ["Before", "After"]
-        assert len(result.calls) == count
-        assert len({call["id"] for call in result.calls}) == count
-        for index, call in enumerate(result.calls):
-            assert call["id"]
-            assert call["type"] == "function"
-            assert call["index"] == index
-            assert call["function"]["name"] == "get_weather"
-            assert json.loads(call["function"]["arguments"]) == WEATHER_ARGS
-    result = process_tool_calls("Ordinary assistant prose.", parser, WEATHER_TOOLS)
-    assert result.calls == []
-    assert result.remaining_text == "Ordinary assistant prose."
+    for wire in [WIRE_CALLS[name], *WIRE_VARIANTS.get(name, ())]:
+        body = wire.removeprefix(parser.tool_call_start).removesuffix(
+            parser.tool_call_end
+        )
+        parsed = parser.parse_tool_call(body, WEATHER_TOOLS)
+        calls = parsed if isinstance(parsed, list) else [parsed]
+        assert len(calls) == 1
+        assert calls[0]["name"] == "get_weather"
+        assert _arguments(calls[0]) == WEATHER_ARGS
+        for count, with_prose in [(1, False), (1, True), (2, True)]:
+            # A bare call exercises EOF; newlines delimit Mistral's repeated calls.
+            output = "\n".join([wire] * count)
+            if with_prose:
+                output = f"Before\n{output}\nAfter"
+            result = process_tool_calls(output, parser, WEATHER_TOOLS)
+            if with_prose:
+                assert result.remaining_text.split() == ["Before", "After"]
+            else:
+                assert result.remaining_text == ""
+            assert len(result.calls) == count
+            assert len({call["id"] for call in result.calls}) == count
+            for index, call in enumerate(result.calls):
+                assert call["id"]
+                assert call["type"] == "function"
+                assert call["index"] == index
+                assert call["function"]["name"] == "get_weather"
+                assert json.loads(call["function"]["arguments"]) == WEATHER_ARGS
+    for text in ("Ordinary assistant prose.", "Like call: prince"):
+        result = process_tool_calls(text, parser, tools=None)
+        assert result.calls == []
+        assert result.remaining_text == text
 
 
 @pytest.mark.parametrize("name", PARSER_NAMES)
@@ -145,116 +169,83 @@ def test_invalid_calls(name, text, error):
         _parse(name, text)
 
 
-@pytest.mark.parametrize("multiple", [False, True], ids=["object", "array"])
-def test_cohere_action_parses_to_openai_tool_calls(multiple):
-    pattern = "<|channel>" if multiple else "foo"
-    action = {
-        "tool_call_id": "1",
-        "tool_name": "grep",
-        "parameters": {"pattern": pattern},
-    }
-    second = {
-        "tool_call_id_id": "2",
-        "tool_name": "read",
-        "parameters": {"path": "file.py"},
-    }
-    result = _parse(
-        "cohere2_moe",
-        json.dumps([action, second] if multiple else action).replace(
-            "<|channel>", r"<\|channel>"
-        ),
-    )
-    calls = result if multiple else [result]
-    assert [call["name"] for call in calls] == (
-        ["grep", "read"] if multiple else ["grep"]
-    )
-    assert json.loads(calls[0]["arguments"]) == {"pattern": pattern}
-    if multiple:
-        assert json.loads(calls[1]["arguments"]) == {"path": "file.py"}
-
-
 @pytest.mark.parametrize(
-    "parser,argument_type,text,name,args",
+    "parser,argument_type,text,expected,tools",
     [
         (
             "gemma4",
             str,
             '<|tool_call>call:edit-file{path:<|"|>test.txt<|"|>,edits:[{newText:<|"|>orange<|"|>,oldText:<|"|>apple<|"|>}]}<tool_call|>',
-            "edit-file",
-            {"path": "test.txt", "edits": [{"newText": "orange", "oldText": "apple"}]},
+            _call(
+                "edit-file",
+                path="test.txt",
+                edits=[{"newText": "orange", "oldText": "apple"}],
+            ),
+            None,
         ),
-        ("gemma4", str, "get_weather{city:Austin}", "get_weather", {"city": "Austin"}),
+        (
+            "gemma4",
+            str,
+            "get_weather{city:Austin}",
+            _call("get_weather", city="Austin"),
+            None,
+        ),
         (
             "pythonic",
             dict,
             '[write_file(path="game.html", content="<canvas id="game">\n</canvas>")]',
-            "write_file",
-            {"path": "game.html", "content": '<canvas id="game">\n</canvas>'},
+            _call(
+                "write_file", path="game.html", content='<canvas id="game">\n</canvas>'
+            ),
+            None,
         ),
         (
             "pythonic",
             dict,
             "[configure(options={'position': [0, 1], 'enabled': True})]",
-            "configure",
-            {"options": {"position": [0, 1], "enabled": True}},
+            _call("configure", options={"position": [0, 1], "enabled": True}),
+            None,
+        ),
+        (
+            "cohere2_moe",
+            str,
+            '{"tool_call_id":"1","tool_name":"grep","parameters":{"pattern":"foo"}}',
+            _call("grep", pattern="foo"),
+            None,
+        ),
+        (
+            "cohere2_moe",
+            str,
+            r'[{"tool_call_id":"1","tool_name":"grep","parameters":{"pattern":"<\|channel>"}},'
+            '{"tool_call_id_id":"2","tool_name":"read","parameters":{"path":"file.py"}}]',
+            [_call("grep", pattern="<|channel>"), _call("read", path="file.py")],
+            None,
+        ),
+        (
+            "glm47",
+            dict,
+            "get_weather\n<arg_key>zip</arg_key>\n<arg_value>10001</arg_value>\n<arg_key>days</arg_key>\n<arg_value>3</arg_value>\n",
+            _call("get_weather", zip="10001", days=3),
+            _weather_tools(zip="string", days="integer"),
         ),
     ],
-    ids=["gemma-nested", "gemma-bare", "pythonic-html", "pythonic-nested"],
-)
-def test_parser_syntax(parser, argument_type, text, name, args):
-    result = _parse(parser, text)
-    assert isinstance(result["arguments"], argument_type)
-    assert {**result, "arguments": _arguments(result)} == dict(
-        name=name, arguments=args
-    )
-
-
-def test_gemma_ignores_non_call_prose():
-    result = process_tool_calls(
-        "Like call: prince", load_tool_module("gemma4"), tools=None
-    )
-    assert result.calls == []
-    assert result.remaining_text == "Like call: prince"
-
-
-def test_glm_tool_name_drops_the_trailing_newline():
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "zip": {"type": "string"},
-                        "days": {"type": "integer"},
-                    },
-                },
-            },
-        }
-    ]
-    result = _parse(
-        "glm47",
-        "get_weather\n<arg_key>zip</arg_key>\n<arg_value>10001</arg_value>\n<arg_key>days</arg_key>\n<arg_value>3</arg_value>\n",
-        tools,
-    )
-    assert result["name"] == "get_weather"
-
-
-@pytest.mark.parametrize(
-    "output",
-    [
-        '[TOOL_CALLS] [{"name": "get_weather", "arguments": {"city": "Paris", "days": 3}}]',
-        WIRE_CALLS["mistral"],
+    ids=[
+        "gemma-nested",
+        "gemma-bare",
+        "pythonic-html",
+        "pythonic-nested",
+        "cohere-object",
+        "cohere-array-escape",
+        "glm-newline",
     ],
-    ids=["v3", "v11"],
 )
-def test_mistral_process_tool_calls(output):
-    result = process_tool_calls(output, load_tool_module("mistral"), WEATHER_TOOLS)
-    assert result.remaining_text == ""
-    assert len(result.calls) == 1
-    assert result.calls[0]["function"]["name"] == "get_weather"
-    assert json.loads(result.calls[0]["function"]["arguments"]) == WEATHER_ARGS
+def test_parser_syntax(parser, argument_type, text, expected, tools):
+    result = _parse(parser, text, tools)
+    assert isinstance(result, type(expected))
+    calls = result if isinstance(result, list) else [result]
+    expected_calls = expected if isinstance(expected, list) else [expected]
+    assert all(isinstance(call["arguments"], argument_type) for call in calls)
+    assert [dict(call, arguments=_arguments(call)) for call in calls] == expected_calls
 
 
 @pytest.mark.parametrize(
