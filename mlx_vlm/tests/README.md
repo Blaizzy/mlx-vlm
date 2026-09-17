@@ -29,7 +29,7 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_audio_models.py` | MiniCPMO TTS, Qwen3 Omni, Nemotron Omni, and VoiceChat components, speech generation, streaming, and checkpoint conversion |
 | `test_video_generation_models.py` | MiniMax H3 packing, components, conditioning workflows, cached trajectories, numerical references, and conversion |
 | `test_video_generation.py` | Video model discovery, request/result adapters, progress, and audio/video muxing |
-| `test_processors.py` | Image/video/audio processors, including Mage VL timestamps, patch positions, and visual-embedding integration |
+| `test_processors.py` + `processor_cases.json` | Shared processor construction, checkpoint loading, image/video/audio contracts, timestamps, patch positions, and visual-embedding integration |
 | `test_speculative.py` | Drafter loading and compatibility, generation parity, verification, cache transactions, and quantized speculative state across model families |
 | `test_rope.py` | Rotary embeddings, multimodal position IDs, and batched offsets |
 | `test_audio_generation.py` | Audio generation, loading, downmixing, and resampling |
@@ -41,8 +41,35 @@ Use a module path or `-k` to select a smaller group while developing.
 | `test_generate.py` | Generation, sampling distributions, AR/server positioned samplers, stopping criteria, structured logits, and thinking-phase state |
 | `test_extraction_models.py` | GLiNER candidate pools, span/schema handling, checkpoint loading, and privacy tagging/quantized inference |
 | `test_pp_doclayout_v3.py` | Document-layout detection configs, sanitization, forward outputs, and postprocessing |
-| `test_tokenizer_utils.py` | Streaming detokenizers, decoder detection, and tokenizer wrappers |
+| `test_tokenizer_utils.py` | Streaming detokenizers, wrappers, shared tokenizer doubles, loader flags, Kimi conversion/serialization, and parser-token demotion |
 | `test_smoke.py` | Manual model-download runner, excluded from automated collection |
+
+`test_processors.py` contains **997 formatted lines**, down from 1,898 at
+`bfa15bb9`. An explicit JSON registry imports processors dynamically, shared family
+defaults build fresh smoke-test inputs, and one checkpoint runner verifies native
+routing, component types, configuration precedence and model attributes. The
+12 checkpoint cases preserve direct/automatic loading and the missing-template
+fallback. JSON contains configuration, shapes and expected values; calls and
+assertions remain in Python.
+
+Nine tokenizer loading/conversion cases and shared tokenizer doubles now live in
+`test_tokenizer_utils.py`. Processor media contracts retain Qwen token order,
+Gemma patch/audio masks, LFM resampling, Mage timestamps and embedding isolation,
+Kimi literal control tokens, and DiffusionGemma cross-thread materialization.
+Eleven formerly separate cases share related tests; their scenarios remain.
+There are no separate fixture modules or production changes.
+
+The file-size reduction includes relocation: **901 fewer processor lines**, offset
+by **346 additional tokenizer-test lines and 529 JSON lines**. The three files
+therefore go from **2,077 to 2,051 lines: 26 fewer combined**. Processor tests pass
+**117 cases with one optional PyTorch skip**; the tokenizer suite passes **22**.
+Full suite: **1,762 passed, four skipped, 39 passing subtests**. Compared with
+`bfa15bb9`, all **80,997 executed production lines and 12,836 branch outcomes**
+remain covered, with two added lines (Laguna's real chat-template property and
+Muse's public cleanup method). Coverage excludes tests, native kernels, skipped
+optional checks and subprocess execution. Black, isort, autoflake, pyflakes and
+whitespace checks pass. Current suite size is **23,143 Python + 3,072 JSON =
+26,215 lines**, across 27 test modules.
 
 `test_speculative.py` contains **1,399 formatted lines**, down from 2,027 at
 `a1bbdca6`. Reusable model constructors, checkpoint tensors, and transaction doubles
@@ -57,7 +84,7 @@ share one runner. Full suite: **1,773 passed, four skipped, 39 passing subtests*
 Both isolated (15,723 lines / 2,457 branches) and full-suite (80,997 / 12,836)
 production execution sets are unchanged, with zero lost or added paths. See
 [speculative_coverage.md](speculative_coverage.md) for exact size accounting,
-validation scope, and the earlier intentional pruning. Current suite size is
+validation scope, and the earlier intentional pruning. After that speculative refactor, suite size was
 **23,698 Python lines + 2,543 JSON lines = 26,241 combined**.
 
 `test_cli.py` contains **498 formatted lines**, down from 938 at `9383ef6c`

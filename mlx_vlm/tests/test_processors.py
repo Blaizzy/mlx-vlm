@@ -3,56 +3,30 @@
 import importlib
 import json
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack
+from copy import deepcopy
+from operator import attrgetter
 from pathlib import Path
-from types import SimpleNamespace
+from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
 import mlx.core as mx
 import numpy as np
 import pytest
 from PIL import Image
-from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
-from tokenizers.pre_tokenizers import Whitespace
-from transformers import AutoProcessor, PreTrainedTokenizerBase, PreTrainedTokenizerFast
+from transformers import AutoProcessor
 
-import mlx_vlm.models.aya_vision.processing_aya_vision as aya_vision
-import mlx_vlm.models.deepseek_v4.processing_deepseek_v4 as deepseek
-import mlx_vlm.models.diffusion_gemma.processing_diffusion_gemma as diffusion
-import mlx_vlm.models.dots_ocr.processing_dots_ocr as dots_ocr
-import mlx_vlm.models.ernie4_5_moe_vl.processing_ernie4_5_moe_vl as ernie
-import mlx_vlm.models.gemma4.processing_gemma4 as g4
-import mlx_vlm.models.gemma4_unified.processing_gemma4_unified as g4u
-import mlx_vlm.models.glm4v_moe.processing as glm4v_moe
-import mlx_vlm.models.glm_ocr.processing as glm_ocr
-import mlx_vlm.models.idefics3.processing_idefics3 as idefics3
-import mlx_vlm.models.kimi_k3.processing_kimi_k3 as kimi_k3
-import mlx_vlm.models.kimi_vl.processing_kimi_vl as kimi_vl
-import mlx_vlm.models.laguna.processing_laguna as laguna
-import mlx_vlm.models.lfm2_vl.processing_lfm2_vl as lfm
-import mlx_vlm.models.locateanything.image_processing_locateanything as locate_ip
-import mlx_vlm.models.locateanything.processing_locateanything as locateanything
-import mlx_vlm.models.mage_vl.config as mage_config
-import mlx_vlm.models.mage_vl.mage_vl as mage_model
-import mlx_vlm.models.mage_vl.processing_mage_vl as mage
-import mlx_vlm.models.mage_vl.vision as mage_vision
-import mlx_vlm.models.minicpmv4_6.processing_minicpmv4_6 as minicpm
-import mlx_vlm.models.mistral3.processing_mistral3 as mistral3
-import mlx_vlm.models.mllama.processing_mllama as mllama
-import mlx_vlm.models.molmo_point.processing_molmo_point as molmo_point
-import mlx_vlm.models.muse_glimmer.processing_muse_glimmer as muse_glimmer
-import mlx_vlm.models.paddleocr_vl.processing_paddleocr_vl as paddleocr_vl
-import mlx_vlm.models.pixtral.image_processing_pixtral as pixtral_ip
-import mlx_vlm.models.qwen3_omni_moe.processing_qwen3_omni_moe as omni
-import mlx_vlm.models.qwen3_vl.processing_qwen3_vl as qwen3
-import mlx_vlm.models.smolvlm.processing_smolvlm as smolvlm
-import mlx_vlm.models.step3p7.processing_step3p7 as step3p7
-import mlx_vlm.models.unlimited_ocr.processing_unlimitedocr as ocr
 from mlx_vlm.generate import GenerationResult, generate
 from mlx_vlm.generate.video import processor_handles_video
 from mlx_vlm.prompt_utils import apply_chat_template
-from mlx_vlm.tokenizer_utils import BPEStreamingDetokenizer
+from mlx_vlm.tests.test_tokenizer_utils import (
+    GemmaTokenizer,
+    KimiTokenizer,
+    ProcessorTokenizer,
+    RecordingTokenizer,
+    TinyDiffusionGemma4Tokenizer,
+    fast_tokenizer,
+)
 from mlx_vlm.utils import (
     StoppingCriteria,
     VideoMetadata,
@@ -60,34 +34,26 @@ from mlx_vlm.utils import (
     load_processor,
     prepare_inputs,
     resolve_video_sampling,
-    should_add_special_tokens,
 )
 
+equal = np.testing.assert_array_equal
+DATA = json.loads(Path(__file__).with_name("processor_cases.json").read_text())
+PROFILES = DATA["profiles"]
+# Importing the registry also installs each family's AutoProcessor routing patch.
+m, c = NS(), NS()
+for name, (path, cls) in DATA["modules"].items():
+    if "." not in path:
+        path += f".processing_{path}"
+    module = importlib.import_module("mlx_vlm.models." + path)
+    setattr(m, name, module)
+    if cls:
+        setattr(c, name, getattr(module, cls))
 
-class _RecordingTokenizer(PreTrainedTokenizerFast):
-    def __call__(self, text, **kwargs):
-        self.last_text = text
-        return super().__call__(text, **kwargs)
 
-
-class KimiTokenizer(PreTrainedTokenizerBase):
-    model_input_names = ["input_ids", "attention_mask"]
-
-    def __init__(self):
-        super().__init__()
-        self.encode_calls = []
-
-    def convert_tokens_to_ids(self, token):
-        return 0
-
-    def encode(self, text, **kwargs):
-        self.encode_calls.append((text, kwargs))
-        return [1, 2, 3]
-
-    def apply_chat_template(
-        self, conversation, tokenize=False, add_generation_prompt=True
-    ):
-        return "rendered"
+def _ignore_types(cls):
+    return patch.object(
+        cls, "check_argument_for_proper_class", return_value=None, create=True
+    )
 
 
 def _assert_shapes(data, **shapes):
@@ -98,46 +64,15 @@ def _message(*items):
     return [{"role": "user", "content": list(items)}]
 
 
-def _load_processor(cls, path, tokenizer=None, **kwargs):
-    with _loader_mocks(cls, tokenizer):
-        return cls.from_pretrained(path, **kwargs)
-
-
-def _fast_tokenizer(
-    tokens=("[UNK]", "[PAD]", "hello"),
-    *,
-    tokenizer_class=PreTrainedTokenizerFast,
-    split=True,
-    **kwargs,
-):
-    backend = Tokenizer(
-        WordLevel({t: i for i, t in enumerate(tokens)}, unk_token=tokens[0])
-    )
-    if split:
-        backend.pre_tokenizer = Whitespace()
-    return tokenizer_class(
-        tokenizer_object=backend, unk_token=tokens[0], pad_token=tokens[1], **kwargs
-    )
-
-
-def _gemma_image(cls=g4u.Gemma4UnifiedImageProcessor, max_soft_tokens=4):
-    return cls(
-        patch_size=2,
-        pooling_kernel_size=2,
-        max_soft_tokens=max_soft_tokens,
-        do_resize=False,
-        do_rescale=False,
-    )
+def _gemma_image(cls=m.g4u.Gemma4UnifiedImageProcessor, max_soft_tokens=4):
+    return cls(**PROFILES["gemma_image"], max_soft_tokens=max_soft_tokens)
 
 
 def _lfm_processor(image_processor=None):
-    return SimpleNamespace(
-        image_processor=image_processor or lfm.Lfm2VlNumpyImageProcessor(),
-        tokenizer=_Tokenizer(),
-        image_token="<image>",
-        image_start_token="<|image_start|>",
-        image_end_token="<|image_end|>",
-        image_thumbnail_token="<|img_thumbnail|>",
+    return NS(
+        image_processor=image_processor or m.lfm.Lfm2VlNumpyImageProcessor(),
+        tokenizer=ProcessorTokenizer(),
+        **PROFILES["lfm_tokens"],
         _merge_kwargs=lambda *a, **kw: {"text_kwargs": {}, "images_kwargs": {}},
     )
 
@@ -148,34 +83,10 @@ def _write_configs(path, **configs):
 
 
 def _assert_attrs(obj, **expected):
-    assert {key: getattr(obj, key) for key in expected} == expected
+    assert {key: attrgetter(key)(obj) for key in expected} == expected
 
 
-@contextmanager
-def _loader_mocks(cls, tokenizer=None):
-    with (
-        patch(
-            "transformers.AutoTokenizer.from_pretrained",
-            return_value=tokenizer or _Tokenizer(),
-        ) as loader,
-        patch.object(cls, "check_argument_for_proper_class", return_value=None),
-    ):
-        yield loader
-
-
-@pytest.mark.parametrize(
-    "model_type,module_path,class_name",
-    [
-        ("internvl_chat", "internvl_chat", "InternVLChatProcessor"),
-        ("molmo", "molmo.processing_molmo", "MolmoProcessor"),
-        ("kimi_vl", "kimi_vl.processing_kimi_vl", "KimiVLProcessor"),
-        ("kimi_k3", "kimi_k3.processing_kimi_k3", "KimiK3Processor"),
-        ("phi3_v", "phi3_v.processing_phi3_v", "Phi3VProcessor"),
-        ("hunyuan_vl", "hunyuan_vl.processing_hunyuan_vl", "HunYuanVLProcessor"),
-        ("ernie4_5_moe_vl", "ernie4_5_moe_vl", "Ernie4_5_VLProcessor"),
-        ("qwen4_exp", "qwen4_exp", "Qwen3VLProcessor"),
-    ],
-)
+@pytest.mark.parametrize("model_type,module_path,class_name", DATA["routes"])
 def test_auto_processor_routes_to_custom_loader(
     tmp_path, model_type, module_path, class_name
 ):
@@ -192,94 +103,6 @@ def test_auto_processor_routes_to_custom_loader(
     else:
         with pytest.raises(ValueError, match="Unrecognized processing class"):
             AutoProcessor.from_pretrained(tmp_path)
-
-
-class _Tokenizer:
-    model_input_names = ["input_ids", "attention_mask"]
-    bos_token, eos_token, pad_token = "<bos>", "<eos>", "<pad>"
-    pad_token_id = unk_token_id = 0
-    image_token, image_token_id = "<image>", 100
-    audio_token, audio_token_id = "<audio>", 101
-    video_token, video_token_id = "<video>", 102
-    boi_token, eoi_token = "<boi>", "<eoi>"
-    boa_token, eoa_token = "<boa>", "<eoa>"
-
-    def __init__(self, tokens=None, skip_spaces=False, pad=True, **attrs):
-        self.init_kwargs = {}
-        self.__dict__.update(attrs)
-        self.special_tokens = tokens
-        self.skip_spaces = skip_spaces
-        self.pad = pad
-
-    def convert_tokens_to_ids(self, token):
-        if isinstance(token, list):
-            return [self.convert_tokens_to_ids(t) for t in token]
-        return (self.special_tokens or {}).get(token, self.unk_token_id)
-
-    def encode(self, text, **kwargs):
-        if self.special_tokens is None:
-            return list(range(10))
-        ids, index = ([], 0)
-        while index < len(text):
-            for token in sorted(self.special_tokens, key=len, reverse=True):
-                if text.startswith(token, index):
-                    ids.append(self.special_tokens[token])
-                    index += len(token)
-                    break
-            else:
-                if not self.skip_spaces or not text[index].isspace():
-                    ids.append(1)
-                index += 1
-        return ids
-
-    def __call__(self, text, text_pair=None, return_token_type_ids=False, **kwargs):
-        self.last_text, self.last_kwargs = (text, kwargs)
-        rows = [self.encode(t) for t in ([text] if isinstance(text, str) else text)]
-        width = max(map(len, rows)) if self.pad else 0
-        result = {
-            "input_ids": [
-                row + [self.pad_token_id] * (width - len(row)) for row in rows
-            ],
-            "attention_mask": [
-                [1] * len(row) + [0] * (width - len(row)) for row in rows
-            ],
-        }
-        if return_token_type_ids:
-            result["token_type_ids"] = [[0] * width for row in rows]
-        return result
-
-    def add_special_tokens(self, tokens):
-        pass
-
-    def build_inputs_with_special_tokens(self, ids):
-        return ids
-
-
-class GemmaTokenizer(_Tokenizer):
-    def __init__(self):
-        super().__init__(
-            {"<|image|>": 100, "<|audio|>": 101, "<|video|>": 102},
-            image_token="<|image|>",
-            audio_token="<|audio|>",
-            video_token="<|video|>",
-            chat_template="mock",
-        )
-
-    def apply_chat_template(
-        self, messages, tokenize=False, add_generation_prompt=True, **kwargs
-    ):
-        parts = ["<bos>"]
-        for message in messages:
-            for item in message["content"]:
-                parts.append(
-                    item["text"]
-                    if item["type"] == "text"
-                    else getattr(self, item["type"] + "_token")
-                )
-        if add_generation_prompt:
-            parts.append("<assistant>")
-        rendered = "".join(parts)
-        return self(rendered) if tokenize else rendered
 
 
 class _ImageStub:
@@ -305,28 +128,21 @@ def _mock_ip(**extra):
     return _ImageStub({"pixel_values": np.zeros((1, 3, 224, 224), np.float32), **extra})
 
 
-def _tiled_ip(size, image_size, extra_grid=()):
-    grid = [[size * h, size * w] for h, w in [(1, 1), (1, 2), (2, 1), (2, 2)]]
-    return _ImageStub(
-        dict(
-            pixel_values=np.zeros((1, 5, 3, size, size), np.float32),
-            image_sizes=[image_size],
-        ),
-        image_grid_pinpoints=grid + list(extra_grid),
-        size={"height": size, "width": size},
+def _stub(name):
+    case = deepcopy(DATA["stubs"][name])
+    outputs = {
+        k: np.zeros(shape, np.float32) for k, shape in case.get("shapes", {}).items()
+    }
+    outputs.update(
+        {k: np.array(v, np.int64) for k, v in case.get("arrays", {}).items()}
     )
+    return _ImageStub({**outputs, **case.get("values", {})}, **case.get("attrs", {}))
 
 
 def _make_image(height=224, width=224):
     return Image.fromarray(
         np.random.randint(0, 255, (height, width, 3), dtype=np.uint8)
     )
-
-
-def _bare(cls, **attrs):
-    obj = cls.__new__(cls)
-    obj.__dict__.update(attrs)
-    return obj
 
 
 def _assert_all_mx(result, *media):
@@ -336,125 +152,37 @@ def _assert_all_mx(result, *media):
             assert isinstance(value, mx.array), f"{key}: {type(value).__name__}"
 
 
-SMOKE_PROCESSORS = {
-    "llava": "LlavaProcessor",
-    "llava_next": "LlavaNextProcessor",
-    "llava_onevision": "LlavaOnevisionProcessor",
-    "paligemma": "PaliGemmaProcessor",
-    "gemma3": "Gemma3Processor",
-    "gemma3n": "Gemma3nProcessor",
-    "smolvlm": "SmolVLMProcessor",
-    "mllama": "MllamaProcessor",
-    "qwen2_vl": "Qwen2VLProcessor",
-    "qwen2_5_vl": "Qwen2_5_VLProcessor",
-    "qwen3_vl": "Qwen3VLProcessor",
-    "qwen3_omni_moe": "Qwen3OmniMoeProcessor",
-    "idefics2": "Idefics2Processor",
-    "idefics3": "Idefics3Processor",
-    "aya_vision": "AyaVisionProcessor",
-    "llama4": "Llama4Processor",
-    "pixtral": "PixtralProcessor",
-    "mistral3": "Mistral3Processor",
-    "multi_modality": "MultiModalityProcessor",
-    "ernie4_5_moe_vl": "Ernie4_5_VLProcessor",
-}
+SMOKE_PROCESSORS = DATA["smoke"]
 
 
 def _make_processor(name):
+    case = SMOKE_PROCESSORS[name]
+    defaults = DATA["smoke_defaults"].get(case.get("family"), {})
+    case = deepcopy({**defaults, **case})
     module = importlib.import_module(f"mlx_vlm.models.{name}.processing_{name}")
-    cls = getattr(module, SMOKE_PROCESSORS[name])
-    ip, tok, kwargs = _mock_ip(), _Tokenizer(), {}
-    if name in ("llava", "llava_next"):
-        kwargs = dict(
-            patch_size=14,
-            vision_feature_select_strategy="default",
-            num_additional_image_tokens=1,
-        )
-        if name == "llava_next":
-            ip = _tiled_ip(224, (224, 224))
-    elif name == "llava_onevision":
-        ip = _tiled_ip(384, [768, 768], [[1536, 1536]])
-        kwargs = dict(
-            num_image_tokens=729,
-            vision_aspect_ratio="anyres_max_9",
-            vision_feature_select_strategy="full",
-        )
-    elif name == "paligemma":
-        ip.image_seq_length = 4
-        tok.add_tokens = lambda *a, **kw: None
-    elif name in ("gemma3", "gemma3n"):
-        ip, kwargs = (_mock_ip(num_crops=[0]), dict(image_seq_length=4))
-        if name == "gemma3n":
-            kwargs.update(feature_extractor=None, audio_seq_length=4)
-    elif name in ("smolvlm", "idefics2", "idefics3"):
-        kwargs["image_seq_len"] = 4
-        tok.image_boundary_token = "<fake_token_around_image>"
-        if name != "idefics2":
-            ip = _mock_ip(rows=[[0]], cols=[[0]])
-    elif name == "mllama":
-        tok = _Tokenizer(
-            {"<|image|>": 128256},
-            skip_spaces=True,
-            image_token="<|image|>",
-            image_token_id=128256,
-        )
-        ip = _mock_ip(
-            pixel_values=np.zeros((1, 4, 3, 560, 560), np.float32),
-            num_tiles=[[2]],
-            aspect_ratio_ids=np.array([[1]]),
-            aspect_ratio_mask=np.ones((1, 4), np.int64),
-        )
-    elif name in ("qwen2_vl", "qwen2_5_vl", "qwen3_vl"):
+    cls = getattr(module, case["class"])
+    ip = _stub(case["stub"]) if "stub" in case else _mock_ip(**case.get("outputs", {}))
+    tok = ProcessorTokenizer(**case.get("tokenizer", {}))
+    kwargs = dict(case.get("kwargs", {}))
+    if name == "paligemma":
+        ip.image_seq_length, tok.add_tokens = 4, lambda *a, **kw: None
+    if name.startswith("qwen") or name == "ernie4_5_moe_vl":
         ip = _mock_ip(image_grid_thw=np.array([[1, 16, 16]], np.int64))
-        tok = _Tokenizer(
-            image_token="<|image_pad|>",
-            video_token="<|video_pad|>",
-            vision_start_token="<|vs|>",
-            vision_end_token="<|ve|>",
-            vision_start_token_id=200,
-            vision_end_token_id=201,
+    if name == "qwen3_omni_moe":
+        kwargs.update(
+            video_processor=NS(model_input_names=[], merge_size=2),
+            feature_extractor=NS(model_input_names=[]),
         )
-    elif name == "qwen3_omni_moe":
-        tok = _Tokenizer(
-            image_token="<|image|>",
-            audio_token="<|audio|>",
-            video_token="<|video|>",
-            vision_bos_token="<|vb|>",
-            vision_eos_token="<|ve|>",
-            audio_bos_token="<|ab|>",
-            audio_eos_token="<|ae|>",
-        )
-        ip = _mock_ip(image_grid_thw=np.array([[1, 16, 16]], np.int64))
-        kwargs = dict(
-            video_processor=SimpleNamespace(model_input_names=[], merge_size=2),
-            feature_extractor=SimpleNamespace(model_input_names=[]),
-        )
-    elif name == "aya_vision":
-        ip = _mock_ip(num_patches=[1])
-    elif name == "llama4":
-        ip = _mock_ip(aspect_ratios=[(1, 1)])
-    elif name in ("pixtral", "mistral3"):
-        ip = _mock_ip(image_sizes=[[(224, 224)]])
-    elif name == "multi_modality":
-        kwargs["num_image_tokens"] = 4
-    elif name == "ernie4_5_moe_vl":
-        ip = _mock_ip(image_grid_thw=np.array([[1, 16, 16]], np.int64))
-    with patch.object(
-        cls, "check_argument_for_proper_class", return_value=None, create=True
-    ):
+    with _ignore_types(cls):
         return cls(image_processor=ip, tokenizer=tok, **kwargs)
 
 
 @pytest.mark.parametrize(
     "name,with_image",
     [
-        pytest.param(
-            name, with_image, id=f"{name}-{('image' if with_image else 'text')}"
-        )
-        for name in SMOKE_PROCESSORS
-        for with_image in (True, False)
-        if (name, with_image)
-        not in {("paligemma", False), ("qwen3_vl", False), ("mistral3", True)}
+        (name, mode == "image")
+        for name, case in SMOKE_PROCESSORS.items()
+        for mode in case.get("modes", ["image", "text"])
     ],
 )
 def test_processor_mlx_outputs(name, with_image):
@@ -481,66 +209,49 @@ def test_processor_mlx_outputs(name, with_image):
 
 def test_unlimited_ocr_default_chat_template_omits_trailing_space():
     Template = pytest.importorskip("jinja2").Template
-    p = object.__new__(ocr.UnlimitedOCRProcessor)
+    p = object.__new__(c.ocr)
     rendered = Template(p.default_chat_template).render(
-        messages=[
-            {"role": "user", "content": "<image>document parsing."},
-            {"role": "assistant", "content": "partial"},
-            {"role": "user", "content": "continue"},
-        ],
-        add_generation_prompt=True,
+        messages=DATA["ocr_messages"], add_generation_prompt=True
     )
     assert rendered == "<image>document parsing. partial continue"
 
 
-@pytest.mark.parametrize(
-    "cls,start,end",
-    [
-        (glm4v_moe.Glm46VMoEProcessor, "<|begin_of_box|>", "<|end_of_box|>"),
-        (aya_vision.AyaVisionProcessor, "<|START_RESPONSE|>", "<|END_RESPONSE|>"),
-        (aya_vision.AyaVisionOutputProcessor, "<|START_RESPONSE|>", "<|END_RESPONSE|>"),
-        (diffusion.DiffusionGemma4Processor, "", ""),
-    ],
-)
-def test_output_control_tokens(cls, start, end):
-    if cls is aya_vision.AyaVisionOutputProcessor:
-        from transformers.models.aya_vision.processing_aya_vision import (
-            AyaVisionProcessor,
+@pytest.mark.parametrize("name,start,end", DATA["cleanup"])
+def test_output_control_tokens(name, start, end):
+    cls = (
+        m.aya_vision.AyaVisionOutputProcessor
+        if name == "aya_output"
+        else getattr(c, name)
+    )
+    if name == "aya_output":
+        native = importlib.import_module(
+            "transformers.models.aya_vision.processing_aya_vision"
         )
-
-        assert issubclass(cls, AyaVisionProcessor)
+        assert issubclass(cls, native.AyaVisionProcessor)
     text = "Title: A calm river cruise\nKeywords: boat, river"
-    assert _bare(cls).clean_output(start + text + end) == text
+    assert cls.__new__(cls).clean_output(start + text + end) == text
 
 
-@pytest.mark.parametrize(
-    "cls,token,token_id",
-    [
-        (kimi_vl.KimiVLProcessor, "<|im_assistant|>", 163586),
-        (idefics3.Idefics3Processor, "<end_of_utterance>", 128258),
-    ],
-)
-def test_additional_eos_tokens(cls, token, token_id):
-    p = _make_processor("idefics3") if cls is idefics3.Idefics3Processor else _bare(cls)
-    p.tokenizer = _Tokenizer({token: token_id})
+@pytest.mark.parametrize("name,token,token_id", DATA["eos_tokens"])
+def test_additional_eos_tokens(name, token, token_id):
+    cls = getattr(c, name)
+    p = _make_processor(name) if name == "idefics3" else cls.__new__(cls)
+    p.tokenizer = ProcessorTokenizer({token: token_id})
     assert p.additional_eos_token_ids == [token_id]
 
 
 class TestGemma4UnifiedProcessor:
     def _processor(self, video=False):
-        video_processor = (
-            _gemma_image(g4u.Gemma4UnifiedVideoProcessor, max_soft_tokens=70)
-            if video
-            else None
-        )
-        p = g4u.Gemma4UnifiedProcessor(
+        video_cls = m.g4u.Gemma4UnifiedVideoProcessor
+        video_processor = _gemma_image(video_cls, 70) if video else None
+        p = c.g4u(
             image_processor=_gemma_image(),
             tokenizer=GemmaTokenizer(),
             video_processor=video_processor,
             image_seq_length=4,
         )
         assert "video_processor" in p.get_attributes()
-        assert isinstance(p.video_processor, g4u.Gemma4UnifiedVideoProcessor)
+        assert isinstance(p.video_processor, m.g4u.Gemma4UnifiedVideoProcessor)
         return p
 
     def test_merged_image_patches_and_positions(self):
@@ -553,9 +264,9 @@ class TestGemma4UnifiedProcessor:
 
     def test_video_padding_and_positions(self):
         video = np.zeros((2, 3, 4, 8), np.uint8)
-        data = _gemma_image(g4.Gemma4VideoProcessor, max_soft_tokens=70)(
-            [video], fps=[1.0]
-        )
+        p = _gemma_image(m.g4.Gemma4VideoProcessor, max_soft_tokens=70)
+        assert p.video_sampling_defaults() == {"max_frames": p.num_frames}
+        data = p([video], fps=[1.0])
         _assert_shapes(
             data, pixel_values_videos=(1, 2, 280, 12), video_position_ids=(1, 2, 280, 2)
         )
@@ -566,7 +277,7 @@ class TestGemma4UnifiedProcessor:
         assert np.all(positions[8:] == -1)
 
     def test_audio_chunk_masks(self):
-        extractor = g4u.Gemma4UnifiedAudioFeatureExtractor(
+        extractor = m.g4u.Gemma4UnifiedAudioFeatureExtractor(
             audio_samples_per_token=4, feature_size=4
         )
         result = extractor([np.arange(n, dtype=np.float32) for n in (6, 9)])
@@ -585,31 +296,17 @@ class TestGemma4UnifiedProcessor:
                 videos=[np.zeros((2, 3, 4, 8), np.uint8)],
                 fps=[1.0],
             )
-            _assert_shapes(
-                result, pixel_values_videos=(2, 70, 48), video_position_ids=(2, 70, 2)
-            )
-            assert isinstance(result["pixel_values_videos"], mx.array)
-            assert "<boi><|video|><|video|><eoi>" in p.tokenizer.last_text[0]
         else:
             messages = _message(
                 {"type": "image", "image": Image.new("RGB", (8, 8))},
                 {"type": "text", "text": "Describe this image in detail."},
             )
-            result = p.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="mlx",
-                enable_thinking=False,
-            )
-            _assert_shapes(
-                result, pixel_values=(1, 4, 48), image_position_ids=(1, 4, 2)
-            )
-            assert all(
-                isinstance(result[k], mx.array) for k in ("input_ids", "pixel_values")
-            )
-            assert "<boi>" + "<|image|>" * 4 + "<eoi>" in p.tokenizer.last_text[0]
+            result = p.apply_chat_template(messages, **PROFILES["chat_kwargs"])
+            assert isinstance(result["input_ids"], mx.array)
+        case = DATA["gemma_multimodal"][video]
+        _assert_shapes(result, **{k: tuple(v) for k, v in case["shapes"].items()})
+        assert isinstance(result[case["pixels"]], mx.array)
+        assert case["marker"] in p.tokenizer.last_text[0]
         assert mx.sum(result["mm_token_type_ids"] == (2 if video else 1)).item() == 4
 
     def test_video_placeholder_without_tokenizing(self):
@@ -632,10 +329,8 @@ class TestLlavaOnevisionProcessor:
             "<video> Describe", iter(()), iter([video]), (384, 384)
         )
         assert expanded.count("<video>") == 4 * 14 * 14 + 1
-
-    def test_excess_image_placeholders(self):
         with pytest.raises(ValueError):
-            _make_processor("llava_onevision")._expand_placeholders(
+            p._expand_placeholders(
                 "<image> <image>", iter([[384, 384]]), iter(()), (384, 384)
             )
 
@@ -676,53 +371,14 @@ def test_pali_gemma_tokenizer_kwargs_do_not_leak_into_image_processor():
     )
 
 
-def test_dots_vl_from_pretrained_uses_slow_image_processor(tmp_path):
-    _write_configs(
-        tmp_path, chat_template={"chat_template": "{{ messages[0].content }}"}
-    )
-    loader = Mock(return_value=_mock_ip())
-    with (
-        _loader_mocks(dots_ocr.DotsVLProcessor),
-        patch.dict(
-            "transformers.__dict__",
-            {"AutoImageProcessor": SimpleNamespace(from_pretrained=loader)},
-        ),
-    ):
-        p = dots_ocr.DotsVLProcessor.from_pretrained(tmp_path, use_fast=True)
-    loader.assert_called_once()
-    assert loader.call_args.kwargs["use_fast"] is False
-    assert isinstance(p.video_processor, dots_ocr.DotsDummyVideoProcessor)
-
-
 def test_minicpmv_video_marker_expands_to_frame_bounds():
-    tokenizer = _Tokenizer(
-        {
-            "<image>": 11,
-            "</image>": 12,
-            "<slice>": 13,
-            "</slice>": 14,
-            "<image_id>": 15,
-            "</image_id>": 16,
-            "<unk>": 99,
-            "<|image_pad|>": 101,
-            "<|video_pad|>": 102,
-            "<|listen|>": 99,
-            "\n": 2,
-        },
-        skip_spaces=True,
-        unk_token_id=99,
-        image_token="<|image_pad|>",
-        image_token_id=101,
-        video_token="<|video_pad|>",
-    )
-    options = dict(
-        slice_mode=False, use_image_id=False, scale_resolution=56, patch_size=14
-    )
-    with _loader_mocks(minicpm.MiniCPMVProcessor):
-        p = minicpm.MiniCPMVProcessor(
+    tokenizer = ProcessorTokenizer(**PROFILES["minicpm_tokenizer"])
+    options = dict(**PROFILES["minicpm_image"])
+    with _ignore_types(c.minicpm):
+        p = c.minicpm(
             tokenizer=tokenizer,
-            image_processor=minicpm.MiniCPMVImageProcessor(**options),
-            video_processor=minicpm.MiniCPMVVideoProcessor(**options),
+            image_processor=m.minicpm.MiniCPMVImageProcessor(**options),
+            video_processor=m.minicpm.MiniCPMVVideoProcessor(**options),
         )
     result = p(
         text=["<|video_pad|> Describe this."],
@@ -731,6 +387,8 @@ def test_minicpmv_video_marker_expands_to_frame_bounds():
         max_num_frames=2,
         padding=False,
     )
+    vp = p.video_processor
+    assert vp.video_sampling_defaults() == {"max_frames": vp.max_num_frames}
     assert len(result["pixel_values"][0]) == 2
     assert result["tgt_sizes"][0].shape == result["image_bound"][0].shape == (2, 2)
     assert result["num_frames_per_video"] == [[2]]
@@ -742,33 +400,9 @@ def test_minicpmv_video_marker_expands_to_frame_bounds():
 class TestGlmOcrProcessor:
     GEOMETRY = dict(patch_size=14, temporal_patch_size=2, merge_size=2)
 
-    def test_local_numpy_loader(self, tmp_path):
-        ip_config = dict(
-            **self.GEOMETRY,
-            size={"shortest_edge": 12544, "longest_edge": 9633792},
-            image_mean=[0.48145466, 0.4578275, 0.40821073],
-            image_std=[0.26862954, 0.26130258, 0.27577711],
-        )
-        _write_configs(
-            tmp_path,
-            processor_config=dict(
-                image_processor=ip_config, processor_class="GlmOcrProcessor"
-            ),
-        )
-        with (
-            patch(
-                "transformers.AutoTokenizer.from_pretrained",
-                return_value=_Tokenizer(image_token="<|image|>"),
-            ),
-            patch("mlx_vlm.models.base.load_chat_template"),
-        ):
-            p = glm_ocr.GlmOcrProcessor.from_pretrained(tmp_path)
-        assert isinstance(p.image_processor, glm_ocr.Glm46VImageProcessor)
-        _assert_attrs(p.image_processor, patch_size=14, max_pixels=9633792)
-
     @pytest.mark.parametrize("reference", [False, True], ids=["shape", "torch-parity"])
     def test_image_patches(self, reference):
-        p = glm_ocr.Glm46VImageProcessor(
+        p = m.glm_ocr.Glm46VImageProcessor(
             **self.GEOMETRY, min_pixels=784, max_pixels=50176
         )
         image = Image.new("RGB", (56, 28))
@@ -789,18 +423,14 @@ class TestGlmOcrProcessor:
                 value = expected[key]
                 if isinstance(value, torch.Tensor):
                     value = value.detach().cpu().numpy()
-                np.testing.assert_array_equal(value, actual[key])
+                equal(value, actual[key])
         else:
             assert actual["image_grid_thw"].tolist() == [[1, 2, 4]]
             assert actual["pixel_values"].shape == (8, 1176)
 
 
 @pytest.mark.parametrize(
-    "module,rows,cols,length",
-    [
-        (smolvlm, 3, 4, 81),
-        (idefics3, 2, 2, 4),
-    ],
+    "module,rows,cols,length", [(m.smolvlm, 3, 4, 81), (m.idefics3, 2, 2, 4)]
 )
 def test_tiled_image_prompt(module, rows, cols, length):
     for h, w in [(0, 0), (rows, cols)]:
@@ -814,27 +444,20 @@ def test_tiled_image_prompt(module, rows, cols, length):
 
 class TestMllamaProcessor:
     def test_cross_attention_mask_helpers(self):
-        mask = mllama.get_cross_attention_token_mask(
+        mask = m.mllama.get_cross_attention_token_mask(
             [1, 2, 128256, 3, 4, 128256, 5, 6], 128256
         )
         assert mask == [[2, 5], [5, 8]]
-        assert mllama.get_cross_attention_token_mask([1, 2, 3], 128256) == []
-        dense = mllama.convert_sparse_cross_attention_mask_to_dense(
+        assert m.mllama.get_cross_attention_token_mask([1, 2, 3], 128256) == []
+        dense = m.mllama.convert_sparse_cross_attention_mask_to_dense(
             [mask], [[2, 3]], 4, 8
         )
         assert dense.shape == (1, 8, 2, 4)
         assert dense[0, 2, 0, 0] == 1 and dense[0, 0, 0, 0] == 0
 
-    @pytest.mark.parametrize(
-        "text,expected",
-        [
-            ("Hello", "<bos>Hello"),
-            ("<|image|>Hello", "<|image|><bos>Hello"),
-            ("<bos>Hello", "<bos>Hello"),
-        ],
-    )
+    @pytest.mark.parametrize("text,expected", DATA["mllama_prompts"])
     def test_build_string_from_input(self, text, expected):
-        assert mllama.build_string_from_input(text, "<bos>", "<|image|>") == expected
+        assert m.mllama.build_string_from_input(text, "<bos>", "<|image|>") == expected
 
 
 class TestQwen3VLProcessor:
@@ -844,27 +467,26 @@ class TestQwen3VLProcessor:
             pixel_values=np.zeros((len(grids), 3, 224, 224), np.float32),
             image_grid_thw=np.array(grids, np.int64),
         )
-        p.tokenizer = _Tokenizer({}, pad=False)
+        p.tokenizer = ProcessorTokenizer({}, pad=False)
         return p
 
-    def test_surplus_tokens_follow_prompt_order(self):
-        text = "old <|image_pad|> new <|vs|><|image_pad|><|ve|>"
-        result = qwen3._drop_surplus_image_tokens(
-            text,
+    def test_surplus_tokens_follow_prompt_and_batch_order(self):
+        block = "<|vs|><|image_pad|><|ve|>"
+        kwargs = dict(
             image_token="<|image_pad|>",
             vision_start_token="<|vs|>",
             vision_end_token="<|ve|>",
             count=1,
         )
-        assert result == "old  new <|vs|><|image_pad|><|ve|>"
-
-    def test_surplus_tokens_stay_within_batch_entries(self):
+        assert (
+            m.qwen3._drop_surplus_image_tokens(
+                "old <|image_pad|> new " + block, **kwargs
+            )
+            == "old  new " + block
+        )
         p = self._capturing_processor([[1, 4, 4], [1, 4, 8]])
         p(
-            text=[
-                "first <|vs|><|image_pad|><|ve|>",
-                "stale <|vs|><|image_pad|><|ve|> current <|vs|><|image_pad|><|ve|>",
-            ],
+            text=["first " + block, "stale " + block + " current " + block],
             images=[_make_image(), _make_image()],
         )
         assert p.tokenizer.last_text == [
@@ -873,26 +495,15 @@ class TestQwen3VLProcessor:
         ]
 
     @pytest.mark.parametrize(
-        "grouped", [False, True], ids=["ambiguous-flat", "extra-grouped"]
+        "case", DATA["qwen_image_errors"], ids=["ambiguous-flat", "extra-grouped"]
     )
-    def test_invalid_image_counts(self, grouped):
+    def test_invalid_image_counts(self, case):
         p = self._capturing_processor([[1, 4, 4], [1, 4, 8], [1, 4, 12]])
         images = [_make_image() for _ in range(3)]
-        text = [
-            "first <|image_pad|>",
-            "stale <|image_pad|> first <|image_pad|> second <|image_pad|>",
-        ]
-        error = "Cannot unambiguously map"
-        if grouped:
-            images, text = (
-                [images[:2], images[2:]],
-                ["first <|image_pad|>", "second <|image_pad|>"],
-            )
-            error = (
-                "Text entry 0 contains 1 image placeholders, but 2 images were supplied"
-            )
-        with pytest.raises(ValueError, match=error):
-            p(text=text, images=images)
+        if case["grouped"]:
+            images = [images[:2], images[2:]]
+        with pytest.raises(ValueError, match=case["error"]):
+            p(text=case["text"], images=images)
 
     @pytest.mark.parametrize("layout", ["nested-pil", "flat-pil", "hwc-array"])
     def test_video_frame_layouts(self, layout):
@@ -902,25 +513,14 @@ class TestQwen3VLProcessor:
             "flat-pil": frames,
             "hwc-array": [np.zeros((4, 224, 224, 3), np.uint8)],
         }[layout]
-        p = qwen3.Qwen3VLVideoProcessor(
-            patch_size=14,
-            temporal_patch_size=2,
-            merge_size=2,
-            do_rescale=False,
-            do_normalize=False,
-        )
+        p = m.qwen3.Qwen3VLVideoProcessor(**PROFILES["qwen_video"])
         output = p(videos=video)
-        np.testing.assert_array_equal(output["video_grid_thw"], [[2, 16, 16]])
+        equal(output["video_grid_thw"], [[2, 16, 16]])
         assert output["pixel_values_videos"].shape == (512, 1176)
 
 
 def test_pixtral_image_preprocess_resizes_to_patch_multiple_and_pads():
-    image_processor = pixtral_ip.PixtralImageProcessor(
-        size={"longest_edge": 40},
-        patch_size=14,
-        image_mean=[0, 0, 0],
-        image_std=[1, 1, 1],
-    )
+    image_processor = m.pixtral_ip.PixtralImageProcessor(**PROFILES["pixtral_image"])
     wide = Image.fromarray(np.zeros((31, 55, 3), dtype=np.uint8))
     square = Image.fromarray(np.zeros((20, 20, 3), dtype=np.uint8))
     output = image_processor([[wide, square]])
@@ -928,76 +528,23 @@ def test_pixtral_image_preprocess_resizes_to_patch_multiple_and_pads():
     assert output["pixel_values"].shape == (2, 3, 28, 42)
 
 
-def test_mistral3_from_pretrained_uses_torch_free_pixtral_image_processor(tmp_path):
-    _write_configs(
-        tmp_path,
-        processor_config=dict(
-            patch_size=16,
-            spatial_merge_size=1,
-            image_token="[IMG]",
-            image_break_token="[IMG_BREAK]",
-            image_end_token="[IMG_END]",
-            image_processor=dict(
-                image_processor_type="PixtralImageProcessorFast",
-                patch_size=14,
-                size={"longest_edge": 64},
-            ),
-        ),
-        config=dict(
-            model_type="mistral3",
-            spatial_merge_size=2,
-            vision_config={"patch_size": 14},
-        ),
-    )
-    p = _load_processor(mistral3.Mistral3Processor, tmp_path, trust_remote_code=True)
-    assert isinstance(p.image_processor, pixtral_ip.PixtralImageProcessor)
-    _assert_attrs(p, patch_size=14, spatial_merge_size=2)
-    output = p(text=["[IMG]Describe"], images=[[_make_image()]])
-    _assert_all_mx(output, "pixel_values")
-    assert output["pixel_values"].shape[:2] == (1, 3)
-    assert all(int(size) % 28 == 0 for size in output["image_sizes"][0].tolist())
-
-
-def test_step3_v_l_from_pretrained_uses_fixed_tokenizer():
-    tokenizer = _Tokenizer(
-        chat_template="template",
-        vocab={"Got": 0, "Ġit": 1},
-        backend_tokenizer=SimpleNamespace(decoder="bad"),
-    )
-    with _loader_mocks(step3p7.Step3VLProcessor, tokenizer) as loader:
-        p = step3p7.Step3VLProcessor.from_pretrained(
-            "step-model", trust_remote_code=True
-        )
-    loader.assert_called_once_with(
-        "step-model", trust_remote_code=True, fix_mistral_regex=True
-    )
-    assert p.tokenizer is tokenizer
-    assert p.detokenizer_class is BPEStreamingDetokenizer
-    assert "ByteLevel" in repr(tokenizer.backend_tokenizer.decoder)
-    p.detokenizer = object()
-    for token in (0, 1):
-        p.detokenizer.add_token(token)
-    p.detokenizer.finalize()
-    assert p.detokenizer.text == "Got it"
-
-
 class TestErnie4_5VLProcessor:
     def test_helper_functions(self):
         for fn, inputs, expected in [
-            (ernie.round_by_factor, [100, 56, 42], [112, 56, 56]),
-            (ernie.ceil_by_factor, [100, 56, 57], [112, 56, 84]),
-            (ernie.floor_by_factor, [100, 56, 55], [84, 56, 28]),
+            (m.ernie.round_by_factor, [100, 56, 42], [112, 56, 56]),
+            (m.ernie.ceil_by_factor, [100, 56, 57], [112, 56, 84]),
+            (m.ernie.floor_by_factor, [100, 56, 55], [84, 56, 28]),
         ]:
             assert [fn(x, 28) for x in inputs] == expected
-        h, w = ernie.smart_resize(224, 224, factor=28)
+        h, w = m.ernie.smart_resize(224, 224, factor=28)
         assert h % 28 == w % 28 == 0
-        h, w = ernie.smart_resize(10, 10, factor=28, min_pixels=56 * 56)
+        h, w = m.ernie.smart_resize(10, 10, factor=28, min_pixels=56 * 56)
         assert h * w >= 56 * 56
-        h, w = ernie.smart_resize(10000, 10000, factor=28, max_pixels=28 * 28 * 1280)
+        h, w = m.ernie.smart_resize(10000, 10000, factor=28, max_pixels=28 * 28 * 1280)
         assert h * w <= 28 * 28 * 1280
 
     def test_image_processor(self):
-        p = ernie.ImageProcessor()
+        p = m.ernie.ImageProcessor()
         _assert_attrs(p, patch_size=14, merge_size=2, factor=28)
         (h, w), (gh, gw) = p.get_smart_resize(224, 224)
         assert h % 28 == w % 28 == 0 and (gh, gw) == (h // 14, w // 14)
@@ -1016,42 +563,12 @@ class TestErnie4_5VLProcessor:
         assert {"pixel_values", "image_grid_thw"} <= p(images=image).keys()
 
 
-class TestPaddleOCRVLProcessor:
-    def test_from_pretrained_loads_preprocessor_geometry(self, tmp_path):
-        geometry = dict(
-            min_pixels=64,
-            max_pixels=4096,
-            patch_size=16,
-            temporal_patch_size=2,
-            merge_size=4,
-            image_mean=[0.1, 0.2, 0.3],
-            image_std=[0.9, 0.8, 0.7],
-            do_convert_rgb=False,
-        )
-        _write_configs(
-            tmp_path,
-            config={"model_type": "paddleocr_vl"},
-            preprocessor_config=geometry,
-        )
-        p = _load_processor(
-            paddleocr_vl.PaddleOCRVLProcessor,
-            tmp_path,
-            _Tokenizer(image_token="<paddle-image>"),
-        )
-        assert p.image_token == "<paddle-image>"
-        _assert_attrs(p.image_processor, **geometry)
-
-    def test_load_image_processor_returns_none(self, tmp_path):
-        _write_configs(tmp_path, config={"model_type": "paddleocr_vl"})
-        assert load_image_processor(tmp_path) is None
-
-
 class TestLfm2VlProcessorPatch:
     @pytest.mark.parametrize(
         "batched", [False, True], ids=["tiles", "flat-image-batch"]
     )
     def test_marker_expansion(self, batched):
-        ip = lfm.Lfm2VlNumpyImageProcessor(max_num_patches=256, do_resize=False)
+        ip = m.lfm.Lfm2VlNumpyImageProcessor(max_num_patches=256, do_resize=False)
         assert ip.max_num_patches == 1024 and ip.do_resize
         p = _lfm_processor(ip)
         images = (
@@ -1061,7 +578,7 @@ class TestLfm2VlProcessorPatch:
         )
         suffixes = ["First", "Second", "Third"] if batched else ["Describe this image"]
         prompts = ["<image>" + text for text in suffixes]
-        result = lfm._patched_call(
+        result = m.lfm._patched_call(
             p, images=images, text=prompts if batched else prompts[0]
         )
         assert result["pixel_values"].shape == (3 if batched else 9, 1024, 768)
@@ -1085,62 +602,12 @@ class TestLfm2VlProcessorPatch:
             assert raw["spatial_shapes"].tolist() == [[32, 32]] * 8 + [[24, 42]]
 
     def test_scalar_image_rows_and_cols_are_supported(self):
-        ip = _ImageStub(
-            dict(
-                pixel_values=np.zeros((1, 16, 768), np.float32),
-                image_rows=np.array([np.int64(1)]),
-                image_cols=np.array([np.int64(1)]),
-                image_sizes=[[416, 576]],
-            ),
-            patch_size=16,
-            downsample_factor=2,
-            tile_size=512,
-            max_image_tokens=256,
-            min_image_tokens=64,
-            encoder_patch_size=16,
-            use_thumbnail=False,
-        )
-        result = lfm._patched_call(
-            _lfm_processor(ip), images=_make_image(), text="<image>Describe this image"
+        result = m.lfm._patched_call(
+            _lfm_processor(_stub("lfm_scalar")),
+            images=_make_image(),
+            text="<image>Describe this image",
         )
         assert {"input_ids", "attention_mask"} <= result.keys()
-
-    @pytest.mark.parametrize(
-        "override", [False, True], ids=["config-merge", "explicit-splitting"]
-    )
-    def test_from_pretrained(self, tmp_path, override):
-        geometry = dict(
-            resample=3,
-            do_resize=False,
-            max_image_tokens=128,
-            max_pixels_tolerance=1.5,
-            image_mean=[0.4] * 3,
-        )
-        _write_configs(
-            tmp_path,
-            processor_config=dict(
-                processor_class="Lfm2VlProcessor", use_image_special_tokens=True
-            ),
-        )
-        if not override:
-            _write_configs(
-                tmp_path,
-                preprocessor_config=dict(
-                    image_processor_type="Lfm2VlImageProcessorFast", **geometry
-                ),
-            )
-        with (
-            _loader_mocks(lfm.Lfm2VlProcessor),
-            patch.object(lfm, "Siglip2ImageProcessor", SimpleNamespace, create=True),
-            patch.object(lfm, "_SLOW_PROCESSOR_AVAILABLE", True),
-        ):
-            kwargs = {"do_image_splitting": False} if override else {}
-            ip = lfm.Lfm2VlProcessor.from_pretrained(tmp_path, **kwargs).image_processor
-        if override:
-            assert not ip.do_image_splitting and ip.use_thumbnail
-        else:
-            geometry.update(resample=Image.Resampling.BICUBIC, do_resize=True)
-            _assert_attrs(ip, **geometry)
 
     def test_resample_filter_follows_the_checkpoint(self):
         for kwargs, expected in [
@@ -1150,12 +617,12 @@ class TestLfm2VlProcessorPatch:
             ({"resample": Image.Resampling.LANCZOS}, 1),
             ({"resample": "nonsense"}, 3),
         ]:
-            assert lfm.Lfm2VlNumpyImageProcessor(**kwargs).resample is Image.Resampling(
-                expected
-            )
+            assert m.lfm.Lfm2VlNumpyImageProcessor(
+                **kwargs
+            ).resample is Image.Resampling(expected)
         image = _make_image(540, 960)
         outputs = [
-            lfm.Lfm2VlNumpyImageProcessor(resample=r)([image], return_tensors="np")[
+            m.lfm.Lfm2VlNumpyImageProcessor(resample=r)([image], return_tensors="np")[
                 "pixel_values"
             ]
             for r in (3, 2)
@@ -1171,7 +638,7 @@ class TestLfm2VlProcessorPatch:
         elif layout == "arrays":
             groups = [np.stack(group) for group in groups]
         with pytest.raises(ValueError, match="text \\[2, 2\\] and images \\[1, 3\\]"):
-            lfm._patched_call(
+            m.lfm._patched_call(
                 _lfm_processor(),
                 images=groups,
                 text=["<image><image>Prompt A", "<image><image>Prompt B"],
@@ -1179,252 +646,41 @@ class TestLfm2VlProcessorPatch:
 
 
 def test_molmo_point_processor_uses_image_processor_for_images():
-    fields = dict(
-        pixel_values=np.zeros((1, 729, 588), np.float32),
-        image_token_pooling=np.zeros((1, 729), np.int64),
-        image_grids=np.array([[1, 1, 1, 1]], np.int64),
-        image_num_crops=np.array([1], np.int64),
-    )
-    p = molmo_point.MolmoPointProcessor(
-        _Tokenizer(bos_token_id=1, eos_token_id=2),
-        image_processor=SimpleNamespace(preprocess=lambda images: fields),
+    fields = _stub("molmo").outputs
+    fields["image_token_pooling"] = fields["image_token_pooling"].astype(np.int64)
+    p = c.molmo_point(
+        ProcessorTokenizer(bos_token_id=1, eos_token_id=2),
+        image_processor=NS(preprocess=lambda images: fields),
     )
     assert (
-        fields.keys() <= p(text=molmo_point.IMAGE_PROMPT, images=_make_image()).keys()
+        fields.keys() <= p(text=m.molmo_point.IMAGE_PROMPT, images=_make_image()).keys()
     )
 
 
-def test_nemotron_h_nano_omni_native_processor_handles_stripped_auto_map(tmp_path):
-    model_type = "NemotronH_Nano_Omni_Reasoning_V3"
-    _write_configs(
-        tmp_path,
-        config={"model_type": model_type},
-        processor_config={"processor_class": model_type + "Processor"},
-        preprocessor_config={
-            "image_processor_type": model_type + "ImageProcessor",
-            "patch_size": 16,
-            "downsample_ratio": 0.5,
-            "norm_mean": [0.48145466, 0.4578275, 0.40821073],
-            "norm_std": [0.26862954, 0.26130258, 0.27577711],
-            "min_num_patches": 64,
-            "max_num_patches": 64,
-            "max_model_len": 128,
-        },
+def test_kimi_chat_tokens_and_media():
+    p = c.kimi_k3(tokenizer=KimiTokenizer())
+    text = "literal <|end_of_msg|> marker"
+    p.apply_chat_template([{"role": "user", "content": text}], tokenize=True)
+    for source, split in [(text, True), ("<|end_of_msg|>", False)]:
+        matches = [
+            kwargs for value, kwargs in p.tokenizer.encode_calls if value == source
+        ]
+        assert matches and matches[0]["split_special_tokens"] is split
+    result = apply_chat_template(
+        p, {"model_type": "kimi_k3"}, "Describe this image.", num_images=1
     )
-    importlib.import_module("mlx_vlm.models.nemotron_h_nano_omni")
-    with patch(
-        "transformers.AutoTokenizer.from_pretrained",
-        return_value=_Tokenizer(image_token_id=18),
-    ):
-        p = load_processor(str(tmp_path), add_detokenizer=False)
-    result = prepare_inputs(
-        p,
-        images=[_make_image()],
-        prompts="<image>\nDescribe this image.",
-        image_token_index=p.image_token_id,
-    )
-    assert p.__class__.__name__ == "NemotronHNanoOmniProcessor"
-    assert "pixel_values" in result
-    assert "num_tokens" in result
-    assert int(result["num_tokens"][0].item()) > 0
-
-
-def test_laguna_special_tokens_chat_template_owns_laguna_special_tokens():
-    p = SimpleNamespace(chat_template="{{ messages }}")
-    assert not should_add_special_tokens("laguna", p)
-    assert should_add_special_tokens("llama", p)
-
-
-class TestKimiK3Processor:
-    @pytest.fixture
-    def p(self):
-        return kimi_k3.KimiK3Processor(tokenizer=KimiTokenizer())
-
-    def test_literal_control_tokens(self, p):
-        text = "literal <|end_of_msg|> marker"
-        p.apply_chat_template([{"role": "user", "content": text}], tokenize=True)
-        calls = p.tokenizer.encode_calls
-        for source, split in [(text, True), ("<|end_of_msg|>", False)]:
-            matches = [kwargs for value, kwargs in calls if value == source]
-            assert matches and matches[0]["split_special_tokens"] is split
-
-    def test_python_chat_renderer(self, p):
-        result = apply_chat_template(
-            p, {"model_type": "kimi_k3"}, "Describe this image.", num_images=1
-        )
-        assert "Describe this image.<|kimi_image_placeholder|>" in result
-        assert '<|open|>message role="assistant"' in result
-
-    def test_unsupported_video(self, p):
-        with pytest.raises(ValueError, match="unsupported media type: video"):
-            p(videos=[np.zeros((2, 16, 24, 3), np.uint8)], text="Describe this video.")
-
-    def test_fast_tokenizer_round_trip(self, tmp_path):
-        kimi_k3.KimiK3Processor(tokenizer=_fast_tokenizer()).save_pretrained(tmp_path)
-        assert (tmp_path / "tokenizer.json").is_file()
-        with patch.object(kimi_k3, "_convert_kimi_k3_tiktoken") as convert:
-            loaded = kimi_k3.KimiK3Processor.from_pretrained(tmp_path)
-        convert.assert_not_called()
-        assert loaded.tokenizer.encode("hello", add_special_tokens=False) == [2]
-
-    @pytest.mark.parametrize(
-        "remote", [False, True], ids=["local-tiktoken", "remote-fast"]
-    )
-    def test_tokenizer_loading(self, tmp_path, remote):
-        tokenizer = KimiTokenizer()
-        _write_configs(
-            tmp_path,
-            tokenizer={},
-            tokenizer_config={"added_tokens_decoder": {}},
-            preprocessor_config=(
-                {"media_proc_cfg": {"patch_size": 18}} if remote else {}
-            ),
-        )
-        vocab = tmp_path / "tiktoken.model"
-        vocab.write_text("tiktoken ranks")
-        if not remote:
-            (tmp_path / "tokenizer.json").unlink()
-
-        def download(repo_id, filename, **kwargs):
-            assert repo_id == "moonshotai/Kimi-K3"
-            assert kwargs["revision"] == "model-revision"
-            assert filename in ("tokenizer.json", "preprocessor_config.json")
-            return tmp_path / filename
-
-        with (
-            patch("huggingface_hub.hf_hub_download", side_effect=download),
-            patch.object(
-                PreTrainedTokenizerFast, "from_pretrained", return_value=tokenizer
-            ) as fast,
-            patch.object(
-                kimi_k3, "_convert_kimi_k3_tiktoken", return_value=tokenizer
-            ) as convert,
-        ):
-            source = "moonshotai/Kimi-K3" if remote else tmp_path
-            kwargs = {"revision": "model-revision"} if remote else {}
-            loaded = kimi_k3.KimiK3Processor.from_pretrained(source, **kwargs)
-        assert isinstance(loaded, kimi_k3.KimiK3Processor)
-        if remote:
-            assert fast.call_args.args[0] == "moonshotai/Kimi-K3"
-            assert fast.call_args.kwargs["revision"] == "model-revision"
-            assert not fast.call_args.kwargs["trust_remote_code"]
-            assert loaded.image_processor.patch_size == 18
-            convert.assert_not_called()
-        else:
-            convert.assert_called_once_with(vocab, tmp_path / "tokenizer_config.json")
-            fast.assert_not_called()
-
-    def test_conversion_requires_tiktoken(self):
-        with (
-            patch("importlib.util.find_spec", return_value=None),
-            pytest.raises(ImportError, match="Install `tiktoken`.*tokenizer.json"),
-        ):
-            kimi_k3._convert_kimi_k3_tiktoken("tiktoken.model", "tokenizer_config.json")
-
-    def test_restores_all_control_slots(self):
-        supplied = {100: "[BOS]", 103: "<|open|>", 355: "[PAD]"}
-        config = {
-            "added_tokens_decoder": {
-                str(i): {"content": t} for i, t in supplied.items()
-            }
-        }
-        tokens = kimi_k3._kimi_k3_control_tokens(config, base_vocab_size=100)
-        assert len(tokens) == 256 and tokens[1] == "<|reserved_token_101|>"
-        assert {i: tokens[i - 100] for i in supplied} == supplied
-
-
-def test_laguna_from_pretrained_loads_fast_tokenizer_directly():
-    tokenizer = _fast_tokenizer(
-        ("<unk>", "<pad>", "<eos>", "prompt"),
-        eos_token="<eos>",
-        chat_template="template",
-    )
-    with patch.object(
-        laguna.PreTrainedTokenizerFast, "from_pretrained", return_value=tokenizer
-    ) as loader:
-        p = laguna.LagunaProcessor.from_pretrained(
-            "/tmp/model",
-            processor_kwargs={"local_files_only": True},
-            quantize_activations=True,
-            trust_remote_code=True,
-        )
-    assert p.tokenizer is tokenizer
-    args, kwargs = loader.call_args
-    assert args == ("/tmp/model",)
-    assert all(
-        kwargs[k]
-        for k in ("fix_mistral_regex", "local_files_only", "trust_remote_code")
-    )
-    assert not {"processor_kwargs", "quantize_activations"} & kwargs.keys()
-
-
-def test_qwen3_omni_moe_patch_intercepts_without_hf_video_processor(tmp_path):
-    tokenizer = _Tokenizer(
-        image_token="<|image_pad|>",
-        audio_token="<|audio_pad|>",
-        video_token="<|video_pad|>",
-        vision_bos_token="<|vision_start|>",
-        vision_eos_token="<|vision_end|>",
-        audio_bos_token="<|audio_bos|>",
-        audio_eos_token="<|audio_eos|>",
-    )
-    feature_extractor = type(
-        "FE", (), {"model_input_names": ["input_features"], "sampling_rate": 16000}
-    )()
-    _write_configs(tmp_path, config={"model_type": "qwen3_omni_moe"})
-    _write_configs(
-        tmp_path,
-        preprocessor_config={
-            "feature_extractor_type": "WhisperFeatureExtractor",
-            "image_processor_type": "Qwen2VLImageProcessor",
-            "processor_class": "Qwen3OmniMoeProcessor",
-        },
-    )
-    with (
-        patch("transformers.AutoTokenizer.from_pretrained", return_value=tokenizer),
-        patch(
-            "transformers.AutoFeatureExtractor.from_pretrained",
-            return_value=feature_extractor,
-        ),
-    ):
-        p = AutoProcessor.from_pretrained(str(tmp_path))
-    assert isinstance(p, omni.Qwen3OmniMoeProcessor)
-    assert type(p.video_processor).__name__ == "Qwen3VLVideoProcessor"
-
-
-class TestDeepseekV4Processor:
-    def test_loads_local_chat_template_jinja(self, tmp_path):
-        template = "{{ messages[0]['content'] }}"
-        (tmp_path / "chat_template.jinja").write_text(template)
-        assert deepseek.load_deepseek_v4_chat_template(tmp_path) == template
-
-    @pytest.mark.parametrize(
-        "auto", [False, True], ids=["explicit-template", "auto-loader"]
-    )
-    def test_from_pretrained(self, tmp_path, auto):
-        cls = deepseek.DeepseekV4Processor
-        _write_configs(tmp_path, config={"model_type": "deepseek_v4"})
-        tokenizer = _Tokenizer(
-            chat_template=None, apply_chat_template=lambda *a, **kw: "templated"
-        )
-        with _loader_mocks(cls, tokenizer):
-            p = (
-                AutoProcessor.from_pretrained(tmp_path)
-                if auto
-                else cls.from_pretrained("repo/name", chat_template="{{ explicit }}")
-            )
-        if auto:
-            assert isinstance(p, cls)
-        else:
-            assert p.chat_template == "{{ explicit }}"
+    assert "Describe this image.<|kimi_image_placeholder|>" in result
+    assert '<|open|>message role="assistant"' in result
+    with pytest.raises(ValueError, match="unsupported media type: video"):
+        p(videos=[np.zeros((2, 16, 24, 3), np.uint8)], text="Describe this video.")
 
 
 def test_locate_anything_save_pretrained_round_trips_custom_config(tmp_path):
     template = "{{ messages }}"
     geometry = dict(patch_size=28, merge_kernel_size=[2, 4], in_token_limit=1234)
-    tokenizer = _fast_tokenizer(chat_template=template)
-    p = locateanything.LocateAnythingProcessor(
-        image_processor=locate_ip.LocateAnythingImageProcessor(**geometry),
+    tokenizer = fast_tokenizer(chat_template=template)
+    p = c.locateanything(
+        image_processor=m.locate_ip.LocateAnythingImageProcessor(**geometry),
         tokenizer=tokenizer,
         chat_template=template,
     )
@@ -1439,63 +695,20 @@ def test_locate_anything_save_pretrained_round_trips_custom_config(tmp_path):
         assert configs[key]["chat_template"] == template
     assert {k: configs["preprocessor_config"][k] for k in geometry} == geometry
     with patch.object(
-        locateanything.AutoTokenizer, "from_pretrained", return_value=_fast_tokenizer()
+        m.locateanything.AutoTokenizer, "from_pretrained", return_value=fast_tokenizer()
     ):
-        loaded = locateanything.LocateAnythingProcessor.from_pretrained(tmp_path)
+        loaded = c.locateanything.from_pretrained(tmp_path)
     _assert_attrs(loaded.image_processor, **geometry)
     assert loaded.chat_template == loaded.tokenizer.chat_template == template
 
 
-def test_muse_glimmer_from_pretrained_attaches_model_config(tmp_path):
-    _write_configs(
-        tmp_path,
-        config=dict(
-            model_type="muse_glimmer",
-            text_config=dict(vocab_size=1234, eos_token_id=99),
-        ),
-    )
-    p = _load_processor(
-        muse_glimmer.MuseGlimmerProcessor,
-        tmp_path,
-        _Tokenizer(chat_template="{{ messages }}"),
-    )
-    _assert_attrs(
-        p.config,
-        model_type="muse_glimmer",
-        vocab_size=1234,
-        eos_token_id=99,
-        thinking_start_token="to=self<|message|>",
-        thinking_end_token="<|eom|>",
-    )
-
-
-class TestTrustRemoteCodePassthrough:
-    """Regression test for #1724 — an explicit trust_remote_code must not be overridden."""
-
-    def test_molmo_point_honors_explicit_false(self):
-        with (
-            patch("transformers.AutoTokenizer.from_pretrained") as from_pretrained,
-            patch.object(molmo_point, "load_chat_template"),
-        ):
-            molmo_point.MolmoPointProcessor.from_pretrained(
-                "/tmp/model", trust_remote_code=False
-            )
-        _, kwargs = from_pretrained.call_args
-        assert not kwargs["trust_remote_code"]
-
-
 def test_qwen3_vl_video_timestamp_video_prompt_falls_back_to_processor_fps():
     p = _make_processor("qwen3_vl")
-    p.tokenizer = _Tokenizer({"<|video_pad|>": 102}, video_token="<|video_pad|>")
-    p.image_processor = None
-    p.video_processor = _ImageStub(
-        dict(
-            pixel_values_videos=np.zeros((1, 4), np.float32),
-            video_grid_thw=np.array([[2, 2, 2]], np.int64),
-        ),
-        temporal_patch_size=2,
-        fps=2.0,
+    p.tokenizer = ProcessorTokenizer(
+        {"<|video_pad|>": 102}, video_token="<|video_pad|>"
     )
+    p.image_processor = None
+    p.video_processor = _stub("qwen_video")
     p.vision_start_token, p.vision_end_token = ("<|vision_start|>", "<|vision_end|>")
     p.vision_start_token_id, p.vision_end_token_id = (58, 59)
     p(
@@ -1512,42 +725,33 @@ class TestMageVLProcessor:
 
     VIDEO_BLOCK = "<|vision_start|><|video_pad|><|vision_end|>"
     IMAGE_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"
-    SHORT_METADATA = [VideoMetadata(total_num_frames=10, fps=30, frames_indices=[0, 9])]
-    CHAT_TEMPLATE = (
-        "{% for message in messages %}{% for item in message['content'] %}"
-        "{% if item['type'] == 'image' %}<|vision_start|><|image_pad|><|vision_end|>"
-        "{% elif item['type'] == 'video' %}<|vision_start|><|video_pad|><|vision_end|>"
-        "{% else %}{{ item['text'] }}{% endif %}{% endfor %}{% endfor %}"
-    )
-    IMAGE_CONFIG = dict(
-        patch_size=16,
-        temporal_patch_size=1,
-        merge_size=2,
-        min_pixels=1024,
-        max_pixels=8192,
-    )
+    CHAT_TEMPLATE = DATA["mage_chat_template"]
+    IMAGE_CONFIG = DATA["checkpoints"]["mage"]["preprocessor_config"]
 
-    @pytest.fixture
-    def p(self):
+    def processor(self):
         tokens = [
             "[UNK]",
             "[PAD]",
-            mage.IMAGE_PAD,
-            mage.VIDEO_PAD,
-            mage.VISION_START,
-            mage.VISION_END,
+            m.mage.IMAGE_PAD,
+            m.mage.VIDEO_PAD,
+            m.mage.VISION_START,
+            m.mage.VISION_END,
         ]
-        tokenizer = _fast_tokenizer(
+        tokenizer = fast_tokenizer(
             tokens,
-            tokenizer_class=_RecordingTokenizer,
+            tokenizer_class=RecordingTokenizer,
             split=False,
             additional_special_tokens=tokens[2:],
             chat_template=self.CHAT_TEMPLATE,
         )
-        return mage.MageVLProcessor(
-            image_processor=qwen3.Qwen3VLImageProcessor(**self.IMAGE_CONFIG),
+        return c.mage(
+            image_processor=m.qwen3.Qwen3VLImageProcessor(**self.IMAGE_CONFIG),
             tokenizer=tokenizer,
         )
+
+    @pytest.fixture
+    def p(self):
+        return self.processor()
 
     @staticmethod
     def frames(count=3, width=32, value=0):
@@ -1563,7 +767,7 @@ class TestMageVLProcessor:
         assert self.image_counts(output) == [1, 2]
         assert "patch_positions" not in output
         expected = p.image_processor(images)
-        np.testing.assert_array_equal(output["pixel_values"], expected["pixel_values"])
+        equal(output["pixel_values"], expected["pixel_values"])
 
     @pytest.mark.parametrize("prepare", [False, True], ids=["direct", "prepare-inputs"])
     def test_video_timestamps_positions_and_attention(self, p, prepare):
@@ -1571,19 +775,13 @@ class TestMageVLProcessor:
         metadata = dict(
             total_num_frames=indices[-1] + 1, fps=fps, frames_indices=indices
         )
-        if prepare:
-            output = prepare_inputs(
-                p,
-                videos=[self.frames()],
-                prompts=self.VIDEO_BLOCK,
-                video_metadata=[metadata],
-            )
-        else:
-            output = p(
-                text=self.VIDEO_BLOCK,
-                videos=[self.frames()],
-                video_metadata=[VideoMetadata(**metadata)],
-            )
+        call = prepare_inputs if prepare else p
+        kwargs = {
+            "prompts" if prepare else "text": self.VIDEO_BLOCK,
+            "videos": [self.frames()],
+            "video_metadata": [metadata if prepare else VideoMetadata(**metadata)],
+        }
+        output = call(*([p] if prepare else []), **kwargs)
         assert p.tokenizer.last_text == [
             "".join(f"<{i / fps:.1f} seconds>{self.IMAGE_BLOCK}" for i in indices)
         ]
@@ -1591,33 +789,24 @@ class TestMageVLProcessor:
         assert not {"pixel_values_videos", "video_grid_thw"} & output.keys()
         assert output["image_grid_thw"].tolist() == [[1, 2, 2]] * 3
         positions = np.array(output["patch_positions"]).reshape(3, 4, 3)
-        np.testing.assert_array_equal(positions[:, :, 0], [[i] * 4 for i in indices])
-        np.testing.assert_array_equal(
-            positions[1, :, 1:], [[0, 0], [0, 1], [1, 0], [1, 1]]
-        )
-        assert mage_vision.build_cu_seqlens(
+        equal(positions[:, :, 0], [[i] * 4 for i in indices])
+        equal(positions[1, :, 1:], [[0, 0], [0, 1], [1, 0], [1, 1]])
+        assert m.mage_vision.build_cu_seqlens(
             output["image_grid_thw"].tolist(), 12, 4
         ) == [0, 4, 8, 12]
 
-    @pytest.mark.parametrize(
-        "prompt,videos",
-        [(VIDEO_BLOCK * 2, [frames()]), (VIDEO_BLOCK, [frames(), frames()])],
-    )
-    def test_video_placeholder_mismatch_is_rejected(self, p, prompt, videos):
-        with pytest.raises(ValueError, match="placeholder"):
-            p(text=prompt, videos=videos)
-
-    @pytest.mark.parametrize(
-        "kwargs,error",
-        [
-            ({"video_metadata": []}, "one video_metadata"),
-            ({"video_metadata": SHORT_METADATA}, "frame count"),
-            ({"fps": 0}, "positive and finite"),
-        ],
-    )
-    def test_bad_metadata_is_rejected(self, p, kwargs, error):
+    @pytest.mark.parametrize("prompts,videos,kwargs,error", DATA["mage_errors"])
+    def test_invalid_video(self, p, prompts, videos, kwargs, error):
+        if "video_metadata" in kwargs and kwargs["video_metadata"]:
+            kwargs = {
+                "video_metadata": [VideoMetadata(**v) for v in kwargs["video_metadata"]]
+            }
         with pytest.raises(ValueError, match=error):
-            p(text=self.VIDEO_BLOCK, videos=[self.frames()], **kwargs)
+            p(
+                text=self.VIDEO_BLOCK * prompts,
+                videos=[self.frames()] * videos,
+                **kwargs,
+            )
 
     def test_shared_decoder_supports_odd_frame_counts(self, p, tmp_path):
         cv2 = pytest.importorskip("cv2")
@@ -1634,47 +823,14 @@ class TestMageVLProcessor:
         assert output["image_grid_thw"].shape == (3, 3)
         assert np.array(output["patch_positions"])[-1, 0] == 2
 
-    def test_numpy_processor_loads_through_auto_processor(self, p, tmp_path):
-        _write_configs(
-            tmp_path,
-            config={"model_type": "mage_vl"},
-            preprocessor_config=self.IMAGE_CONFIG,
-        )
-        with patch(
-            "transformers.AutoTokenizer.from_pretrained",
-            return_value=p.tokenizer,
-        ):
-            loaded = AutoProcessor.from_pretrained(tmp_path)
-        assert isinstance(loaded, mage.MageVLProcessor)
-        assert processor_handles_video(loaded)
-        sampling = resolve_video_sampling(loaded, {})
-        assert (sampling.min_frames, sampling.frame_factor, sampling.max_frames) == (
-            1,
-            1,
-            32,
-        )
-        assert self.image_counts(
-            loaded(text=self.VIDEO_BLOCK, videos=[self.frames()])
-        ) == [3]
-
     def test_mixed_video_pixels_affect_only_their_visual_embeddings(self, p):
-        common = dict(
-            hidden_size=64,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            intermediate_size=128,
-        )
-        config = mage_config.ModelConfig(
-            text_config=mage_config.TextConfig(
-                **common, num_key_value_heads=1, head_dim=32, vocab_size=32
-            ),
-            vision_config=mage_config.VisionConfig(
-                **common, out_hidden_size=64, text_hidden_size=64
-            ),
+        config = m.mage_config.ModelConfig(
+            text_config=m.mage_config.TextConfig(**PROFILES["mage_text"]),
+            vision_config=m.mage_config.VisionConfig(**PROFILES["mage_vision"]),
             image_token_id=2,
             video_token_id=3,
         )
-        model = mage_model.Model(config)
+        model = m.mage_model.Model(config)
         kwargs = {
             "text": self.IMAGE_BLOCK + self.VIDEO_BLOCK,
             "images": [Image.new("RGB", (32, 32), "red")],
@@ -1687,147 +843,26 @@ class TestMageVLProcessor:
         assert mx.all(mx.isfinite(a)).item() and mx.all(mx.isfinite(b)).item()
         a, b = np.array(a)[0], np.array(b)[0]
         visual_indices = np.flatnonzero(np.array(first["input_ids"])[0] == 2)
-        np.testing.assert_array_equal(a[visual_indices[0]], b[visual_indices[0]])
+        equal(a[visual_indices[0]], b[visual_indices[0]])
         assert not np.allclose(a[visual_indices[1:]], b[visual_indices[1:]])
-
-    def test_grid_coercion_accepts_processor_shapes(self):
-        raw = np.array([1, 4, 4])
-        assert mage_model._as_grid_list(raw) == [(1, 4, 4)]
-
-
-class TinyDiffusionGemma4Tokenizer(_Tokenizer):
-    TOOL_ATTRS = ("stc_token", "etc_token", "escape_token", "soc_token", "eoc_token")
-
-    def __init__(self):
-        super().__init__(
-            {
-                "<image>": 60,
-                "<video>": 61,
-                "<boi>": 62,
-                "<eoi>": 63,
-                "<pad>": 0,
-                "<eos>": 1,
-            },
-            skip_spaces=True,
-            image_token_id=60,
-            video_token_id=61,
-            eos_token_id=1,
-            unk_token_id=2,
-            audio_token=None,
-            audio_token_id=None,
-            boa_token=None,
-            eoa_token=None,
-        )
-        self.additional_special_tokens = []
-        for key in self.TOOL_ATTRS:
-            setattr(self, key, None)
-
-    @property
-    def all_special_ids(self):
-        tokens = self.additional_special_tokens + [
-            getattr(self, key)
-            for key in self.TOOL_ATTRS
-            if getattr(self, key) is not None
-        ]
-        return [self.convert_tokens_to_ids(token) for token in tokens]
-
-    def add_special_tokens(self, tokens):
-        for token in tokens.get("additional_special_tokens", []):
-            self.special_tokens[token] = self.video_token_id
-
-
-class TinyVideoProcessor:
-    model_input_names = ["pixel_values_videos"]
-
-    def __call__(self, videos, fps=None):
-        return {
-            "pixel_values_videos": np.zeros((2, 3, 4, 4), dtype=np.float32),
-            "num_frames_per_video": [2],
-            "num_soft_tokens_per_frame": [1],
-            "frame_timestamps": [[0.0, 1.0]],
-        }
+        assert m.mage_model._as_grid_list(np.array([1, 4, 4])) == [(1, 4, 4)]
 
 
 def tiny_diffusion_gemma_processor(image_processor=None):
-    return diffusion.DiffusionGemma4Processor(
+    return c.diffusion(
         image_processor=image_processor,
-        tokenizer=TinyDiffusionGemma4Tokenizer(),
-        video_processor=TinyVideoProcessor(),
+        tokenizer=TinyDiffusionGemma4Tokenizer(PROFILES["diffusion_tokenizer"]),
+        video_processor=_stub("diffusion_video"),
     )
 
 
 class TestDiffusionGemma4Processor:
-    def test_auto_processor_loads_multimodal_processor(self, tmp_path):
-        _write_configs(
-            tmp_path,
-            config={"model_type": "diffusion_gemma"},
-            processor_config=dict(
-                image_processor=dict(
-                    max_soft_tokens=140,
-                    patch_size=16,
-                    pooling_kernel_size=3,
-                ),
-                video_processor=dict(
-                    max_soft_tokens=70,
-                    num_frames=8,
-                ),
-            ),
-        )
-        tok = TinyDiffusionGemma4Tokenizer()
-        tok.chat_template = None
-        with _loader_mocks(g4.Gemma4Processor, tok):
-            p = AutoProcessor.from_pretrained(tmp_path)
-        assert isinstance(p, diffusion.DiffusionGemma4Processor)
-        assert isinstance(p.image_processor, g4.Gemma4ImageProcessor)
-        assert isinstance(p.video_processor, g4.Gemma4VideoProcessor)
-        assert (p.image_processor.max_soft_tokens, p.video_processor.num_frames) == (
-            140,
-            8,
-        )
-        assert p.get_attributes() == ["image_processor", "tokenizer", "video_processor"]
-
-    def test_demotes_tool_parser_tokens(self):
-        tok = TinyDiffusionGemma4Tokenizer()
-        tok.special_tokens.update(
-            {t: 70 + i for i, t in enumerate(diffusion._TOOL_PARSER_TOKENS)}
-        )
-        tok.special_tokens["<extra_special>"] = 90
-        tokens = ("<|tool_call>", "<tool_call|>", '<|"|>', "<|channel>", "<channel|>")
-        for attr, token in zip(tok.TOOL_ATTRS, tokens):
-            setattr(tok, attr, token)
-        tok.additional_special_tokens = ["<extra_special>"]
-        with patch.object(
-            g4.Gemma4Processor,
-            "from_pretrained",
-            return_value=SimpleNamespace(tokenizer=tok),
-        ):
-            p = diffusion.DiffusionGemma4Processor.from_pretrained("demo")
-        assert p.tokenizer is tok
-        assert tok.additional_special_tokens == [
-            "<extra_special>"
-        ] and tok.all_special_ids == [90]
-        assert all(getattr(tok, attr) is None for attr in tok.TOOL_ATTRS)
-        assert all(
-            tok.convert_tokens_to_ids(t) != tok.unk_token_id
-            for t in diffusion._TOOL_PARSER_TOKENS
-        )
-
     def test_generate_strips_channel_scaffolding(self):
         dispatch = importlib.import_module("mlx_vlm.generate.dispatch")
-        model = SimpleNamespace(
-            config=SimpleNamespace(model_type="diffusion_gemma", eos_token_id=999999)
-        )
+        model = NS(config=NS(model_type="diffusion_gemma", eos_token_id=999999))
         p = tiny_diffusion_gemma_processor()
         p.tokenizer.stopping_criteria = StoppingCriteria([999999], p.tokenizer)
-        chunk = GenerationResult(
-            text="<|channel>thought\n<channel|>Title: A calm river cruise",
-            token=1,
-            prompt_tokens=3,
-            generation_tokens=8,
-            total_tokens=11,
-            prompt_tps=10.0,
-            generation_tps=5.0,
-        )
+        chunk = GenerationResult(**PROFILES["generation_chunk"])
         with patch.object(dispatch, "stream_generate", return_value=iter([chunk])):
             assert generate(model, p, "").text == "Title: A calm river cruise"
 
@@ -1836,7 +871,7 @@ class TestDiffusionGemma4Processor:
             p = tiny_diffusion_gemma_processor()
             rendered = apply_chat_template(
                 p,
-                SimpleNamespace(model_type="diffusion_gemma"),
+                NS(model_type="diffusion_gemma"),
                 "Describe this video.",
                 video=["clip.mp4"],
             )
@@ -1872,27 +907,91 @@ class TestDiffusionGemma4Processor:
         assert mx.all(pixels[:2] == 0).item() and mx.all(pixels[2] == 1).item()
 
 
-@pytest.mark.parametrize(
-    "cls,cap",
-    [
-        (g4.Gemma4VideoProcessor, "num_frames"),
-        (minicpm.MiniCPMVVideoProcessor, "max_num_frames"),
-    ],
-)
-def test_video_frame_caps(cls, cap):
-    p = cls()
-    assert p.video_sampling_defaults() == {"max_frames": getattr(p, cap)}
-
-
-@pytest.mark.parametrize(
-    "raw,expected",
-    [
-        ("to=user<|message|>Final answer.<|return|>", "Final answer."),
-        (
-            "Two tabby cats sleep on a pink couch.",
-            "Two tabby cats sleep on a pink couch.",
-        ),
-    ],
-)
-def test_muse_clean_output(raw, expected):
-    assert muse_glimmer._extract_final_channel(raw) == expected
+@pytest.mark.parametrize("name", DATA["checkpoints"])
+def test_checkpoint_loading(tmp_path, name):
+    _write_configs(tmp_path, **DATA["checkpoints"][name])
+    family = "lfm" if name == "lfm_override" else name
+    cls = getattr(c, family, None)
+    tok = ProcessorTokenizer(
+        **DATA["loader_tokenizers"].get(name, {"chat_template": "{{ messages }}"})
+    )
+    kwargs = DATA["loader_kwargs"].get(name, {})
+    if name == "paddleocr_vl":
+        assert load_image_processor(tmp_path) is None
+    if name == "mage":
+        tok = TestMageVLProcessor().processor().tokenizer
+    elif name == "diffusion":
+        tok = TinyDiffusionGemma4Tokenizer(PROFILES["diffusion_tokenizer"])
+        tok.chat_template = None
+    elif name == "deepseek":
+        tok = ProcessorTokenizer(
+            chat_template=None, apply_chat_template=lambda *a, **kw: "templated"
+        )
+    with ExitStack() as stack:
+        enter = stack.enter_context
+        enter(patch("transformers.AutoTokenizer.from_pretrained", return_value=tok))
+        if name not in ("glm_ocr", "omni", "mage", "nemotron"):
+            base = c.g4 if name == "diffusion" else cls
+            enter(_ignore_types(base))
+        if name == "glm_ocr":
+            enter(patch("mlx_vlm.models.base.load_chat_template"))
+        elif family == "lfm":
+            enter(patch.object(m.lfm, "Siglip2ImageProcessor", NS, create=True))
+            enter(patch.object(m.lfm, "_SLOW_PROCESSOR_AVAILABLE", True))
+        elif name == "dots_ocr":
+            image_loader = Mock(return_value=_mock_ip())
+            enter(
+                patch.dict(
+                    "transformers.__dict__",
+                    {"AutoImageProcessor": NS(from_pretrained=image_loader)},
+                )
+            )
+        elif name == "omni":
+            fe = NS(model_input_names=["input_features"], sampling_rate=16000)
+            enter(
+                patch(
+                    "transformers.AutoFeatureExtractor.from_pretrained", return_value=fe
+                )
+            )
+        if name == "nemotron":
+            p = load_processor(str(tmp_path), add_detokenizer=False)
+        elif name in ("omni", "mage", "diffusion", "deepseek"):
+            p = AutoProcessor.from_pretrained(tmp_path)
+        else:
+            p = cls.from_pretrained(tmp_path, **kwargs)
+        if name == "deepseek":
+            explicit = cls.from_pretrained("repo/name", chat_template="{{ explicit }}")
+            assert explicit.chat_template == "{{ explicit }}"
+            template = "{{ messages[0]['content'] }}"
+            (tmp_path / "chat_template.jinja").write_text(template)
+            assert m.deepseek.load_deepseek_v4_chat_template(tmp_path) == template
+    assert isinstance(p, cls)
+    _assert_attrs(p, **DATA["loader_attributes"].get(name, {}))
+    for attr, expected in DATA["loader_components"].get(name, {}).items():
+        assert type(getattr(p, attr)).__name__ == expected
+    if name == "dots_ocr":
+        image_loader.assert_called_once()
+        assert image_loader.call_args.kwargs["use_fast"] is False
+    elif name == "diffusion":
+        assert p.get_attributes() == ["image_processor", "tokenizer", "video_processor"]
+    elif name == "mistral3":
+        out = p(text=["[IMG]Describe"], images=[[_make_image()]])
+        _assert_all_mx(out, "pixel_values")
+        assert out["pixel_values"].shape[:2] == (1, 3)
+        assert all(int(size) % 28 == 0 for size in out["image_sizes"][0].tolist())
+    elif name == "nemotron":
+        out = prepare_inputs(
+            p,
+            images=[_make_image()],
+            prompts="<image>\nDescribe this image.",
+            image_token_index=p.image_token_id,
+        )
+        assert "pixel_values" in out and int(out["num_tokens"][0].item()) > 0
+    elif name == "mage":
+        assert processor_handles_video(p)
+        _assert_attrs(
+            resolve_video_sampling(p, {}), min_frames=1, frame_factor=1, max_frames=32
+        )
+        assert TestMageVLProcessor.image_counts(
+            p(text=m.mage.VIDEO_PAD, videos=[TestMageVLProcessor.frames()])
+        ) == [3]
