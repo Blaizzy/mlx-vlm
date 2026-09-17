@@ -11,6 +11,7 @@ import mlx.nn as nn
 import pytest
 from mlx.utils import tree_flatten
 
+import mlx_vlm.speculative.utils as speculative
 from mlx_vlm.generate.ar import _make_cache, generate_step
 from mlx_vlm.models import fast_ops
 from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
@@ -1991,3 +1992,36 @@ def test_filter_batch_keeps_padding_and_positions():
     assert drafter._cache[0].left_padding.tolist() == [0, 2]
     assert drafter._cache[0].offset.tolist() == [2, 0]
     assert drafter._next_position.tolist() == [4, 6]
+
+
+@pytest.mark.parametrize("kind", ["mtp", "eagle3", "dflash"])
+def test_speculative_batch_dispatch(kind):
+    assert speculative.get_speculative_rounds_batch(kind) is getattr(
+        speculative, f"_{kind}_rounds_batch"
+    )
+
+
+def test_speculative_dispatch_errors_and_hidden_state():
+    with pytest.raises(ValueError):
+        speculative.get_speculative_rounds_batch("nope")
+    hidden = [mx.zeros((1, 1, 4)), mx.ones((1, 1, 4))]
+    assert (
+        speculative.speculative_hidden_state("mtp", NS(hidden_states=hidden))
+        is hidden[-1]
+    )
+
+
+def test_speculative_lifetime_counters_survive_reset():
+    from mlx_vlm.speculative import common
+
+    drafter = NS(accept_lens=[], draft_lens=[])
+    snapshot = common.speculative_stats_snapshot(drafter)
+    assert common.speculative_stats_since(drafter, snapshot) == (None, None, None)
+    common._record_speculative_round(drafter, 3, 7)
+    common._record_speculative_round(drafter, 2.5, 7)
+    drafter.accept_lens, drafter.draft_lens = [], []
+    common._record_speculative_round(drafter, 1.5, 7)
+    assert common.speculative_stats_since(drafter, snapshot) == (3, 7, 21)
+    snapshot = common.speculative_stats_snapshot(drafter)
+    common._record_speculative_round(drafter, 2, 7)
+    assert common.speculative_stats_since(drafter, snapshot) == (1, 2, 7)

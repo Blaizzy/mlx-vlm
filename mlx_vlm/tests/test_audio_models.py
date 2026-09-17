@@ -1348,3 +1348,25 @@ def test_prepare_artifact_can_link_weight_shards(tmp_path):
 
     assert (output / "model.safetensors.index.json").is_symlink()
     assert (output / shard_name).is_symlink()
+
+
+def test_streaming_session_buffers_arbitrary_chunk_boundaries():
+    from mlx_vlm.models.nemotron_voicechat.streaming import VoiceChatStreamingSession
+
+    stream = VoiceChatStreamingSession.__new__(VoiceChatStreamingSession)
+    stream._closed = False
+    stream.input_sample_rate = 16000
+    stream.frame_samples = 4
+    stream._pending_audio = mx.zeros((0,), dtype=mx.float32)
+    seen = []
+
+    def step(frame):
+        seen.append(frame.tolist())
+        return []
+
+    stream._step_audio_frame = step
+    assert stream.push_audio([0.0], sample_rate=16000) == []
+    assert stream.push_audio([1.0, 2.0, 3.0, 4.0], sample_rate=16000) == []
+    assert stream.push_audio([5.0, 6.0], sample_rate=16000) == []
+    assert seen == [[0.0, 1.0, 2.0, 3.0]]
+    assert stream._pending_audio.tolist() == [4.0, 5.0, 6.0]

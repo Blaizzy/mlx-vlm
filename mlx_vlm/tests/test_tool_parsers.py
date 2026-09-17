@@ -154,6 +154,9 @@ def test_parser_selection(name):
     "name,text,error",
     [
         ("atem", "not a tool call", "No ATEM function invocation"),
+        ("minicpm5", '<function name="lookup"><param name="value">unfinished', None),
+        ("minicpm5", '<function name=""></function>', None),
+        ("minicpm5", '<function name="lookup"><param>3</param></function>', None),
         ("gemma4", "just a normal model response, no tool call here", None),
         ("mistral", "not a tool call at all", None),
         (
@@ -259,3 +262,29 @@ def test_non_routable_inputs_return_none(template):
 def test_unknown_override_is_rejected():
     with pytest.raises(ValueError):
         _infer_tool_parser("anything", override="does_not_exist")
+
+
+MINICPM_CDATA_CALL = (
+    '<function name="write_file"><param name="content">'
+    "<![CDATA[  <html>\nA & B\n</html>  ]]></param>"
+    '<param name="version">123</param><param name="count">3</param>'
+    '<param name="enabled">True</param></function>'
+)
+
+
+def test_minicpm5_cdata_and_argument_types():
+    tools = [
+        dict(
+            function=dict(
+                name="write_file",
+                parameters={"properties": {"version": {"type": "string"}}},
+            )
+        )
+    ]
+    assert _parse("minicpm5", MINICPM_CDATA_CALL, tools) == _call(
+        "write_file",
+        content="  <html>\nA & B\n</html>  ",
+        version="123",
+        count=3,
+        enabled=True,
+    )
